@@ -1478,26 +1478,57 @@ diagnostics](cross-boundary-disclosure.md#kernel-console-diagnostics) requires.
 
 Three detectors feed the latch:
 
-**1. All-idle softlockup (BSP, every tick).** Detects "every CPU stalled in
-kernel mode" — the failure class userspace cannot observe, because no
-userspace runs when every CPU is wedged. `schedule()` stamps this CPU's
-last-non-idle-tick slot (`watchdog_mark_non_idle`; the per-CPU slab
-`LAST_NON_IDLE_TICK_PTR` names) whenever it dispatches a non-idle thread; `timer_tick`
-additionally stamps it when a tick that decides a reschedule (a slice
-expiry, or a fair thread's preemption for RT) finds preemption disabled and
-must suppress the dispatch — a non-idle `current` taking timer ticks inside
-a shootdown ack-wait is live, and without this stamp a map/unmap storm
-whose ack-waits cover every CPU's slice expiries starves all stamps and
-false-fires the detector (the dump's serial output then stalls the acks it
-misdiagnosed). The BSP `timer_tick` increments a global tick counter and
-fires if every CPU's last dispatch is older than
-`WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at `ticks_per_second()`).
+**1. All-idle softlockup (BSP, every tick).** Detects CPUs that do not dispatch work that is
+running or ready: every CPU stalled in kernel mode, the failure class userspace cannot observe,
+because no userspace runs when every CPU is wedged, and ready work no CPU takes. An idle system,
+whose every CPU runs its idle thread with nothing queued, is not a stall, however long it waits
+and whatever it waits on (a deadline, a device interrupt, or a message).
+
+`schedule()` stamps this CPU's last-non-idle-tick slot (`watchdog_mark_non_idle`; the per-CPU slab
+`LAST_NON_IDLE_TICK_PTR` names) whenever it dispatches a non-idle thread; `timer_tick` additionally
+stamps it when a tick that decides a reschedule (a slice expiry, or a fair thread's preemption for
+RT) finds preemption disabled and must suppress the dispatch — a non-idle `current` taking timer
+ticks inside a shootdown ack-wait is live, and without this stamp a map/unmap storm whose ack-waits
+cover every CPU's slice expiries starves all stamps and false-fires the detector (the dump's serial
+output then stalls the acks it misdiagnosed). The BSP `timer_tick` increments a global tick counter
+and, on every tick, samples whether the system is idle (`system_has_no_work`): every CPU's
+`current` is its idle thread and no run queue but the idle queue links a thread
+(`PerCpuScheduler::has_no_work`). A sample that finds it idle records the tick
+(`WATCHDOG_LAST_IDLE_TICK`, printed in the dump's header). The detector fires when the system has
+not been seen idle for `WATCHDOG_THRESHOLD_SECONDS` (3 s, converted to ticks at
+`ticks_per_second()`) and every CPU's last non-idle dispatch is that old (`all_idle_tick`, which
+is host-tested). The sample is taken on every tick, before the decision, so the stall clock
+restarts at the last idle tick: a thread that slept the threshold since the last dispatch, woken
+by the same BSP tick's `sleep_check_wakeups` just before the check, has not waited undispatched
+at all.
+
+The sample takes no lock: it reads each scheduler's `current`, `idle`, and `non_empty` atomics
+Relaxed, dereferences no TCB, and stops at the first CPU with work, so a wedged scheduler-lock
+holder cannot stall the BSP tick and the sample never contends a CPU's lock. It is therefore not
+one snapshot across the CPUs (only every CPU's scheduler lock, taken on every BSP tick, would make
+it one), so its windows are these:
+
+- *False negatives.* A sample that misses a ready thread in transit (in a window § ThreadState
+  Transitions lists between a `Ready` commit and its link; between two run queues during a
+  migration or an idle pull; or between `schedule()`'s dequeue and its `current` store, a dispatch
+  that stamps)
+  reads the system idle and restarts the clock, so a stall is reported only once a whole threshold
+  passes with no such sample; a thread left on a run queue stays visible to every sample. A lost
+  wake that leaves every thread blocked reads as an idle system: it is the owed-wake detector's (2
+  below) when one of its rules matches, and is reported by neither otherwise. A thread whose state
+  is `Ready` but which no run queue links (a broken enqueue) reads the same way. A CPU wedged on
+  its idle thread (inside a deferred reclaim) with nothing queued anywhere is reported only once
+  work becomes ready and waits the threshold undispatched.
+- *False positives.* A non-idle `current` that takes no stamping tick for the threshold
+  (interrupts masked that long) reads as stalled, and so does ready work whose CPU the host does
+  not run for the threshold (an oversubscribed guest's descheduled vCPU).
 
 **2. Owed-wake detector (BSP, every `DETECTOR_SCAN_INTERVAL_MS`, 0.5 s).** Detects a single
 `Blocked` thread whose wake is provably owed but never arrived — the lost-wakeup wedge signature
-(#375), invisible to the all-idle check whenever any other thread keeps any CPU busy. Walks the
-live-thread registry reading each thread's fields under its `sched_lock`, try-locked (a thread whose
-lock is held is skipped for that scan), with no IPC-object dereference. Three rules: expired
+(#375), which the all-idle check never reports: while other threads run some CPU still
+dispatches, and a system whose every thread is blocked is idle to it. Walks the live-thread
+registry reading each thread's fields under its `sched_lock`, try-locked (a thread whose lock is
+held is skipped for that scan), with no IPC-object dereference. Three rules: expired
 `sleep_deadline` past the 8 s grace window (`WEDGE_GRACE_SECONDS`, unscaled; rules 2 and 3 also
 require the park to be older than it; a healthy sleeper is claimed, and its deadline cleared, within
 one BSP tick); `wake_in_flight` stuck set (a waker claimed the thread but its `enqueue_and_wake`
@@ -1601,15 +1632,19 @@ thread stranded in a wedged CPU's run queue — were invisible before this enume
 
 **Cost:** per tick per CPU, one `current_tick()` read plus one Relaxed
 heartbeat store (APs add one Relaxed load + compare for the BSP check); one
-Relaxed counter increment per BSP tick and an O(`cpu_count`) early-exit
-loop; the registry scan and AP-stamp sweep run only on the 0.5 s cadence;
-one plain stamp store per park commit; three Relaxed stores per syscall (the
-dispatcher's `syscall_nr` stamp on the running TCB at entry and exit, which
+Relaxed counter increment per BSP tick and two O(`cpu_count`) early-exit
+loops (the idle sample, which stops at the first CPU with work, and, once the
+system has not been seen idle for the threshold, the dispatch-stamp scan, which
+stops at the first CPU with a recent dispatch); the registry scan and AP-stamp
+sweep run only on the 0.5 s cadence; one plain stamp store per park commit;
+three Relaxed stores per syscall (the dispatcher's `syscall_nr` stamp on the
+running TCB at entry and exit, which
 feeds the lock-holder line, and its per-CPU `note_cpu_syscall` stamp at
 entry, which feeds the per-CPU dump line). Zero dump overhead when healthy.
 
-**Catches:** all-CPUs-idle with work queued (lost-wake bugs); cross-CPU
-`context_saved` deadlock; every TCB incorrectly `Blocked`; a single thread
+**Catches:** all-CPUs-idle with work queued (a lost reschedule: a thread
+linked on a run queue no CPU dispatches); every CPU stalled with a non-idle
+`current`; cross-CPU `context_saved` deadlock; a single thread
 wedged `Blocked` while the system stays busy (owed-wake rules); a BSP or AP
 wedged interrupts-off while at least one other CPU still ticks (heartbeat
 cross-checks).
@@ -1620,7 +1655,9 @@ its counter stops). Only an NMI / always-on S-mode timer hardlockup
 detector closes that; tracked as issue #33. A `Blocked` thread whose waker
 genuinely never claimed it (no deadline, no `wake_in_flight`, no
 `wake_pending`) is indistinguishable from a legitimate indefinite wait by
-TCB scalars alone and is also not flagged.
+TCB scalars alone and is also not flagged; when every thread is so blocked, the
+system is idle to the all-idle detector, whose remaining windows are listed
+under it above.
 
 **Defers to an in-flight TLB shootdown:** a synchronous shootdown holds every
 participating CPU (initiator preempt-disabled in `wait_for_ack`; peers spinning

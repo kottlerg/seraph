@@ -7,31 +7,85 @@
 //! (`driver_binding::resources`; docs/driver-binding.md § Binding).
 //!
 //! For a function that presents the `VirtIO` register layout, devmgr delivers
-//! one `Mmio` resource per distinct BAR the layout's register regions name,
-//! in ascending BAR index (the order of
-//! [`RegisterLayout::bars`](crate::RegisterLayout::bars)), each naming its
-//! PCI BAR; then the function's wired interrupt line when it has one, with
-//! the mode the driver passes to `SYS_IRQ_REGISTER`; then the end round's
-//! service endpoint, devmgr query cap, and DMA capability. [`DeliveredDevice`]
-//! reads that list into the shape the transport maps, and refuses any other.
+//! the BARs the layout's register regions name, in ascending BAR index (the
+//! order of [`RegisterLayout::bars`](crate::RegisterLayout::bars)), each as
+//! one `Mmio` resource from its start or, around the pages holding the
+//! function's MSI-X table and Pending Bit Array, which no driver is
+//! delivered, as several, each naming its PCI BAR and its offset in it; then
+//! the device's interrupt when it has one: its wired line with the mode the
+//! driver passes to `SYS_IRQ_REGISTER`, or MSI-X vector 0, whose table entry
+//! devmgr has programmed; then the end round's service endpoint, devmgr
+//! query cap, and DMA capability. [`DeliveredDevice`] reads that list into
+//! the shape the transport maps, and refuses any other.
 
 use driver_binding::resources::{self, InterruptKind, Resource, ResourceList};
 
-use crate::MAX_VIRTIO_BARS;
+use crate::{BarRange, MAX_VIRTIO_RANGES};
 
-/// What devmgr delivered a `VirtIO` PCI driver: its BAR caps, its interrupt
-/// line, and its endpoints; `0` marks an absent cap.
+/// The interrupt devmgr delivered a `VirtIO` driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceInterrupt
+{
+    /// The device's wired line: its `Interrupt` cap and the mode the driver
+    /// passes to `SYS_IRQ_REGISTER`. The device reports each interrupt in its
+    /// ISR status, and the binding owes an acknowledgement per delivery.
+    Wired
+    {
+        cap: u64, mode: u64
+    },
+    /// MSI-X vector 0, the device's only vector: its message target's
+    /// `Interrupt` cap, registered with mode 0. The device reports nothing in
+    /// its ISR status under MSI-X (`VirtIO` 1.2 § 4.1.4.5), and the target is
+    /// never masked and owes no acknowledgement.
+    MsiX
+    {
+        cap: u64
+    },
+}
+
+impl DeviceInterrupt
+{
+    /// The `Interrupt` cap.
+    #[must_use]
+    pub const fn cap(&self) -> u64
+    {
+        match *self
+        {
+            Self::Wired { cap, .. } | Self::MsiX { cap } => cap,
+        }
+    }
+
+    /// The mode the driver passes to `SYS_IRQ_REGISTER` for the cap.
+    #[must_use]
+    pub const fn mode(&self) -> u64
+    {
+        match *self
+        {
+            Self::Wired { mode, .. } => mode,
+            Self::MsiX { .. } => 0,
+        }
+    }
+
+    /// What the driver logs at bind for the interrupt it was given.
+    #[must_use]
+    pub const fn describe(&self) -> &'static str
+    {
+        match *self
+        {
+            Self::Wired { .. } => "wired line",
+            Self::MsiX { .. } => "MSI-X, 1 vector",
+        }
+    }
+}
+
+/// What devmgr delivered a `VirtIO` PCI driver: its BAR ranges, its
+/// interrupt, and its endpoints; `0` marks an absent endpoint cap.
 pub struct DeliveredDevice
 {
-    bar_caps: [u64; MAX_VIRTIO_BARS],
-    bar_indices: [u64; MAX_VIRTIO_BARS],
-    bar_count: usize,
-    /// The device's wired-line `Interrupt` cap, `0` when devmgr delivered
-    /// none.
-    pub irq: u64,
-    /// The mode the driver passes to `SYS_IRQ_REGISTER` for [`Self::irq`];
-    /// 0 with no line.
-    pub irq_mode: u64,
+    ranges: [BarRange; MAX_VIRTIO_RANGES],
+    range_count: usize,
+    /// The device's interrupt, `None` when devmgr delivered none.
+    pub interrupt: Option<DeviceInterrupt>,
     /// The driver's service endpoint.
     pub service: u64,
     /// The per-device badged SEND on the private driver endpoint of the
@@ -50,9 +104,10 @@ pub struct DeliveredDevice
 impl DeliveredDevice
 {
     /// Read a complete resource list. Returns `None` when the list has no
-    /// end round or no service endpoint, delivers no BAR or more than
-    /// [`MAX_VIRTIO_BARS`], an `Mmio` range that is no PCI BAR, an `IoPort`,
-    /// more than one interrupt, or an interrupt other than a wired line.
+    /// end round or no service endpoint, delivers no BAR range or more than
+    /// [`MAX_VIRTIO_RANGES`], an `Mmio` range that is no PCI BAR's, an
+    /// `IoPort`, more than one interrupt, or an interrupt other than a wired
+    /// line or MSI-X vector 0 (`VirtIO` over PCI signals by no other).
     #[must_use]
     pub fn from_list(list: &ResourceList) -> Option<Self>
     {
@@ -62,43 +117,54 @@ impl DeliveredDevice
             return None;
         }
         let mut device = Self {
-            bar_caps: [0; MAX_VIRTIO_BARS],
-            bar_indices: [0; MAX_VIRTIO_BARS],
-            bar_count: 0,
-            irq: 0,
-            irq_mode: 0,
+            ranges: [BarRange::default(); MAX_VIRTIO_RANGES],
+            range_count: 0,
+            interrupt: None,
             service: endpoints.service,
             devmgr_query: endpoints.devmgr_query,
             dma: endpoints.dma,
         };
         for resource in list.resources()
         {
-            match *resource
+            let interrupt = match *resource
             {
                 Resource::Mmio {
                     cap,
                     bar: Some(bar),
+                    bytes,
+                    offset,
                     ..
-                } if device.bar_count < MAX_VIRTIO_BARS =>
+                } if device.range_count < MAX_VIRTIO_RANGES =>
                 {
-                    device.bar_caps[device.bar_count] = cap;
-                    device.bar_indices[device.bar_count] = u64::from(bar);
-                    device.bar_count += 1;
+                    device.ranges[device.range_count] = BarRange {
+                        cap,
+                        bar,
+                        offset,
+                        bytes,
+                    };
+                    device.range_count += 1;
+                    continue;
                 }
                 Resource::Interrupt {
                     cap,
                     kind: InterruptKind::Wired,
                     mode,
                     ..
-                } if device.irq == 0 =>
-                {
-                    device.irq = cap;
-                    device.irq_mode = mode;
-                }
+                } => DeviceInterrupt::Wired { cap, mode },
+                Resource::Interrupt {
+                    cap,
+                    kind: InterruptKind::MsiX,
+                    vector: 0,
+                    ..
+                } => DeviceInterrupt::MsiX { cap },
                 _ => return None,
+            };
+            if device.interrupt.replace(interrupt).is_some()
+            {
+                return None;
             }
         }
-        (device.bar_count > 0).then_some(device)
+        (device.range_count > 0).then_some(device)
     }
 
     /// Request and read the resource list from `creator`, the driver's
@@ -125,20 +191,13 @@ impl DeliveredDevice
         device
     }
 
-    /// The BAR caps, in delivery order.
+    /// The delivered BAR ranges, in delivery order; a driver places them in
+    /// its register window with
+    /// [`RegisterLayout::place`](crate::RegisterLayout::place).
     #[must_use]
-    pub fn bar_caps(&self) -> &[u64]
+    pub fn ranges(&self) -> &[BarRange]
     {
-        &self.bar_caps[..self.bar_count]
-    }
-
-    /// The PCI BAR index of each cap, parallel to
-    /// [`bar_caps`](Self::bar_caps); a driver checks it with
-    /// [`RegisterLayout::matches_delivered`](crate::RegisterLayout::matches_delivered).
-    #[must_use]
-    pub fn bar_indices(&self) -> &[u64]
-    {
-        &self.bar_indices[..self.bar_count]
+        &self.ranges[..self.range_count]
     }
 }
 
@@ -179,20 +238,44 @@ mod tests
         })
     }
 
+    fn range(cap: u64, bar: u8, offset: u64, bytes: u64) -> BarRange
+    {
+        BarRange {
+            cap,
+            bar,
+            offset,
+            bytes,
+        }
+    }
+
     #[test]
-    fn bars_line_and_endpoints_are_read_in_delivery_order()
+    fn ranges_line_and_endpoints_are_read_in_delivery_order()
     {
         let mode = syscall_abi::IRQ_MODE_LEVEL | syscall_abi::IRQ_MODE_ACTIVE_LOW;
         let device = DeliveredDevice::from_list(&list(&[
             Round::mmio(10, Some(1), 0x1000, 0x1000),
-            Round::mmio(11, Some(4), 0x8000, 0x4000),
-            Round::interrupts(InterruptKind::Wired, 0, mode, &[12]).expect("one line"),
+            Round::mmio(11, Some(4), 0x8000, 0x2000),
+            Round::mmio_at(12, Some(4), 0xB000, 0x1000, 0x3000),
+            Round::interrupts(InterruptKind::Wired, 0, mode, &[13]).expect("one line"),
             end(20),
         ]))
         .expect("a VirtIO device's list");
-        assert_eq!(device.bar_caps(), &[10, 11]);
-        assert_eq!(device.bar_indices(), &[1, 4]);
-        assert_eq!((device.irq, device.irq_mode), (12, mode));
+        assert_eq!(
+            device.ranges(),
+            &[
+                range(10, 1, 0, 0x1000),
+                range(11, 4, 0, 0x2000),
+                range(12, 4, 0x3000, 0x1000)
+            ]
+        );
+        assert_eq!(
+            device.interrupt,
+            Some(DeviceInterrupt::Wired { cap: 13, mode })
+        );
+        assert_eq!(
+            device.interrupt.map(|i| (i.cap(), i.mode())),
+            Some((13, mode))
+        );
         assert_eq!(
             (device.service, device.devmgr_query, device.dma),
             (20, 21, 22)
@@ -200,12 +283,26 @@ mod tests
     }
 
     #[test]
-    fn a_device_with_no_line_has_no_irq()
+    fn msix_vector_0_is_read_with_mode_0()
+    {
+        let vector = Round::interrupts(InterruptKind::MsiX, 0, 0, &[14]).expect("one vector");
+        let device = DeliveredDevice::from_list(&list(&[
+            Round::mmio(10, Some(4), 0, 0x4000),
+            vector,
+            end(20),
+        ]))
+        .expect("a VirtIO device's list");
+        assert_eq!(device.interrupt, Some(DeviceInterrupt::MsiX { cap: 14 }));
+        assert_eq!(device.interrupt.map(|i| (i.cap(), i.mode())), Some((14, 0)));
+    }
+
+    #[test]
+    fn a_device_with_no_interrupt_has_none()
     {
         let device =
             DeliveredDevice::from_list(&list(&[Round::mmio(10, Some(0), 0, 0x1000), end(20)]))
                 .expect("a VirtIO device's list");
-        assert_eq!((device.irq, device.irq_mode), (0, 0));
+        assert_eq!(device.interrupt, None);
     }
 
     #[test]
@@ -213,6 +310,9 @@ mod tests
     {
         let bar = || Round::mmio(10, Some(0), 0, 0x1000);
         let line = || Round::interrupts(InterruptKind::Wired, 0, 0, &[12]).expect("one line");
+        let msix = |vector, caps: &[u64]| {
+            Round::interrupts(InterruptKind::MsiX, vector, 0, caps).expect("vectors")
+        };
         // Incomplete: no end round.
         assert!(DeliveredDevice::from_list(&list(&[bar()])).is_none());
         // No service endpoint.
@@ -229,16 +329,22 @@ mod tests
             DeliveredDevice::from_list(&list(&[bar(), Round::io_port(13, 0x60, 1), end(20)]))
                 .is_none()
         );
-        // Two lines.
+        // Two lines; a line beside a vector.
         assert!(DeliveredDevice::from_list(&list(&[bar(), line(), line(), end(20)])).is_none());
-        // A message-signaled vector.
+        assert!(
+            DeliveredDevice::from_list(&list(&[bar(), line(), msix(0, &[14]), end(20)])).is_none()
+        );
+        // Two MSI-X vectors, or a vector other than 0.
+        assert!(DeliveredDevice::from_list(&list(&[bar(), msix(0, &[14, 15]), end(20)])).is_none());
+        assert!(DeliveredDevice::from_list(&list(&[bar(), msix(1, &[14]), end(20)])).is_none());
+        // An MSI vector.
         let msi = Round::interrupts(InterruptKind::Msi, 0, 0, &[14]).expect("one vector");
         assert!(DeliveredDevice::from_list(&list(&[bar(), msi, end(20)])).is_none());
-        // More BARs than the layout names.
-        let many: Vec<Round> = (0..=MAX_VIRTIO_BARS)
+        // More ranges than a delivery holds.
+        let many: Vec<Round> = (0..=MAX_VIRTIO_RANGES)
             .map(|i| {
-                let bar = u8::try_from(i).expect("a BAR index");
-                Round::mmio(30 + u64::from(bar), Some(bar), 0, 0x1000)
+                let page = u64::try_from(i).expect("a small index");
+                Round::mmio_at(30 + page, Some(0), page * 0x1000, 0x1000, page * 0x1000)
             })
             .chain([end(20)])
             .collect();

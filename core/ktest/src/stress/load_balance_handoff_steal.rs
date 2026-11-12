@@ -50,8 +50,9 @@
 //!
 //! A regression surfaces as a **kernel** guard firing (the
 //! `PerCpuScheduler::enqueue` `queued_on >= 0` single-link tripwire in debug
-//! builds, a torn dispatch faulting at `rip=0`, or the all-idle watchdog) —
-//! raised by the kernel, not by this test, before these assertions are reached.
+//! builds, a torn dispatch faulting at `rip=0`, or the all-idle watchdog
+//! reporting a thread left queued undispatched) — raised by the kernel, not by
+//! this test, before these assertions are reached.
 //!
 //! ## Pass criterion
 //!

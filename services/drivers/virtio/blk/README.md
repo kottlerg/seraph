@@ -30,13 +30,16 @@ The driver carries a declaration in the ELF note section `.note.seraph.driver` (
 and `1AF4:1042`, class `block`, interrupt required, DMA, VirtIO status reset, boot tier), and
 devmgr binds it to each matching device ([driver-binding.md](../../../../docs/driver-binding.md)).
 Devmgr spawns the driver, creates its service endpoint, and delivers the resource list of
-`driver_binding::resources`: an `Mmio` cap for every BAR the device's VirtIO register regions
-name, each with its PCI BAR index and clipped to the pages the regions reach, the IRQ with its
-line's `SYS_IRQ_REGISTER` mode, then the end round with the service endpoint, a per-device
-badged devmgr query endpoint, and the device's DMA capability (read by
-`virtio_core::bootstrap::DeliveredDevice`).
-The driver maps the BARs into one
-register window and reaches each region through its own BAR's mapping. Once
+`driver_binding::resources`: an `Mmio` cap for every range of the BARs the device's VirtIO
+register regions name, each with its PCI BAR index and its offset in the BAR, clipped to the pages
+the regions reach and less any page holding the device's MSI-X table or Pending Bit Array, the
+interrupt (one MSI-X vector, which the declaration asks for, or the wired line with its
+`SYS_IRQ_REGISTER` mode), then the end round with the service endpoint, a per-device badged devmgr
+query endpoint, and the device's DMA capability (read by
+`virtio_core::bootstrap::DeliveredDevice`). The driver maps the ranges into one register window
+and reaches each region through its own BAR's mapping. Under MSI-X it routes the requestq to vector
+0 and configuration changes to `NO_VECTOR`, and exits if the device refuses either; it logs the
+interrupt it was given (`interrupt: MSI-X, 1 vector` or `interrupt: wired line`). Once
 its device is set up, immediately before its service loop, the driver reports
 `DRIVER_READY` on the devmgr query endpoint; devmgr serves the driver's
 endpoint only after that report, so a driver that exits in its device setup
@@ -225,19 +228,20 @@ when the client releases it or dies
 § DMA-Safe Teardown).
 
 The driver keeps one request in flight and waits for the completion of
-that chain, polling and parking on the completion notification, for at most
-50 seconds. An interrupt-service thread, the only waiter on the
-notification bound to the device's line, signals the completion
-notification: it runs virtio-core's `isr::serve_interrupts`, which reads
-the ISR and acknowledges every delivery at once, a request in flight or
-not, as a driver on a shared line must
+that chain, checking the used ring and parking on the completion
+notification, for at most 50 seconds. An interrupt-service thread, the only
+waiter on the notification bound to the device's interrupt, signals the
+completion notification: it runs virtio-core's `isr::serve_interrupts`. On
+the wired line that reads the ISR and acknowledges every delivery at once,
+a request in flight or not, as a driver on a shared line must
 ([driver-model.md](../../docs/driver-model.md) rule 5), and reads the ISR
 on a bounded timeout too, so an interrupt whose edge was lost is still
-seen. The depth of 1 is the design: the service loop receives one
-request, waits for its completion, and replies before it receives the next,
-so the virtqueue is sized to one three-descriptor chain (four descriptors,
-one ring page). A device whose queue cannot hold three descriptors is
-refused at setup: the driver logs and exits.
+seen; on an MSI-X vector it relays each delivery. The depth of 1 is the
+design: the service loop receives one request, waits for its completion,
+and replies before it receives the next, so the virtqueue is sized to one
+three-descriptor chain (four descriptors, one ring page). A device whose
+queue cannot hold three descriptors is refused at setup: the driver logs and
+exits.
 
 A request the device loses, by timing out or by publishing a used-ring element the virtqueue refuses
 (an id heading no outstanding chain) or one naming another chain, may still be in flight, so its

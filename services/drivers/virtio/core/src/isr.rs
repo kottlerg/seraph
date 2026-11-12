@@ -9,15 +9,21 @@
 //! promptly, whether or not it has a request in flight
 //! (services/drivers/docs/driver-model.md rule 5). Each `VirtIO` driver runs
 //! [`serve_interrupts`] on a thread of its own, as the only waiter on the
-//! notification bound to its line, and its request or read path waits on a
-//! second notification the loop signals. A thread of its own, rather than the
-//! service loop, acknowledges, because the service loop blocks in `ipc_recv`,
-//! which has no timeout: a wait set over the service endpoint and the
-//! notification can report a sender that has since left, and the receive
+//! notification bound to its interrupt, and its request or read path waits on
+//! a second notification the loop signals (the console driver also signals
+//! its client's). A thread of its own, rather than
+//! the service loop, acknowledges, because the service loop blocks in
+//! `ipc_recv`, which has no timeout: a wait set over the service endpoint and
+//! the notification can report a sender that has since left, and the receive
 //! then blocks with the binding owing.
+//!
+//! An MSI-X vector is the device's alone and owes no acknowledgement; the
+//! loop then only relays each delivery to the waiting path, so a driver
+//! waits the same way on either kind.
 
 use ipc::recv_guard::{RecvFailureStage, RecvGuard};
 
+use crate::bootstrap::DeviceInterrupt;
 use crate::pci::PciTransport;
 
 /// How long, in milliseconds, [`serve_interrupts`] waits for a delivery
@@ -62,9 +68,17 @@ pub const fn isr_step(delivered: bool, isr: u8) -> IsrStep
     }
 }
 
-/// Serve the device's line forever: wait on `irq_notification` for at most
-/// [`ISR_POLL_MS`], read the ISR (which clears this device's assertion),
-/// then act on [`isr_step`]: acknowledge `irq_cap` and signal `signal`.
+/// Serve the device's interrupt `interrupt`, bound to `irq_notification`,
+/// forever, calling `signal` for each interrupt the waiting path has to look
+/// at.
+///
+/// For the wired line: wait on `irq_notification` for at most
+/// [`ISR_POLL_MS`], read the ISR (which clears this device's assertion), then
+/// act on [`isr_step`]: acknowledge the line's cap and call `signal`. For
+/// an MSI-X vector, which signals only this device, is never masked, and
+/// owes no acknowledgement, and under which the device sets no ISR bit
+/// (`VirtIO` 1.2 § 4.1.4.5): wait with no bound and call `signal` per
+/// delivery.
 ///
 /// A failed wait goes through a [`RecvGuard`] with `diag` as its hook: the
 /// backoff, the log at the start of a failure streak, and the exit once a
@@ -72,16 +86,24 @@ pub const fn isr_step(delivered: bool, isr: u8) -> IsrStep
 /// driver rather than spinning or leaving the line masked.
 pub fn serve_interrupts(
     transport: &PciTransport,
+    interrupt: DeviceInterrupt,
     irq_notification: u64,
-    irq_cap: u64,
-    signal: u64,
+    mut signal: impl FnMut(),
     diag: fn(RecvFailureStage, i64),
 ) -> !
 {
     let mut guard = RecvGuard::new(diag);
     loop
     {
-        let delivered = match syscall::notification_wait_timeout(irq_notification, ISR_POLL_MS)
+        let waited = match interrupt
+        {
+            DeviceInterrupt::Wired { .. } =>
+            {
+                syscall::notification_wait_timeout(irq_notification, ISR_POLL_MS)
+            }
+            DeviceInterrupt::MsiX { .. } => syscall::notification_wait(irq_notification),
+        };
+        let delivered = match waited
         {
             // Ok(0) is a timeout: notification_send rejects zero-bit sends.
             Ok(bits) =>
@@ -95,14 +117,21 @@ pub fn serve_interrupts(
                 continue;
             }
         };
-        let step = isr_step(delivered, transport.read_isr());
+        let step = match interrupt
+        {
+            DeviceInterrupt::Wired { .. } => isr_step(delivered, transport.read_isr()),
+            DeviceInterrupt::MsiX { .. } => IsrStep {
+                ack: false,
+                signal: delivered,
+            },
+        };
         if step.ack
         {
-            let _ = syscall::irq_ack(irq_cap);
+            let _ = syscall::irq_ack(interrupt.cap());
         }
         if step.signal
         {
-            let _ = syscall::notification_send(signal, 1);
+            signal();
         }
     }
 }

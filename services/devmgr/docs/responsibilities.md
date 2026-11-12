@@ -125,22 +125,26 @@ devmgr's responsibilities are:
 
   - an `Mmio` cap per MMIO BAR: for a function that presents the VirtIO
     register layout, each BAR the layout names, clipped to the pages its
-    regions reach, and for any other function every MMIO BAR, whole. I/O BARs
-    are not delivered;
+    regions reach, and for any other function every MMIO BAR, whole. For a
+    function devmgr may give MSI-X the pages holding its MSI-X table and
+    Pending Bit Array are cut out, so a BAR may be up to three caps, each
+    naming its offset in its BAR; devmgr keeps the table's pages and writes
+    every table entry itself. I/O BARs are not delivered;
   - for a declaration that takes an interrupt, its own derivation of its
     line's held `Interrupt` cap with `RIGHTS_IRQ_NOTIFY` only, so devices that
     share an `INTx` line are all served and no driver holds Mint; a device with
     no line is not bound when its declaration requires one. A declaration that
     asks for vectors (nonzero `msi_vectors`) and for DMA gets message-signaled
     vectors in place of the line: MSI-X (`min(requested, table size)` vectors,
-    table entries 0 onwards, with the table and PBA BARs delivered), else MSI
-    (one vector), else the line. Each vector is one `Interrupt` resource
-    (kind `Msi` or `MsiX`, mode 0) devmgr mints with `SYS_IRQ_MSG_ALLOC`; a
-    bind delivers at most 70 resources (`MAX_BOUND_RESOURCES`, 6 BARs and 64
-    vectors). On riscv64 behind the RISC-V IOMMU devmgr maps each target's
-    IMSIC interrupt file into the device's domain with `MAP_MSI` before it
-    enables the vectors; VT-d refuses `MAP_MSI`, and VT-d interrupt remapping
-    is design intent ([#325](https://github.com/kottlerg/seraph/issues/325)).
+    table entries 0 onwards, each entry's message written and unmasked by
+    devmgr), else MSI (one vector), else the line. Each vector is one
+    `Interrupt` resource (kind `Msi` or `MsiX`, mode 0) devmgr mints with
+    `SYS_IRQ_MSG_ALLOC`; a bind delivers at most 72 resources
+    (`MAX_BOUND_RESOURCES`, 8 BAR ranges and 64 vectors). On riscv64
+    behind the RISC-V IOMMU devmgr maps each target's IMSIC interrupt file
+    into the device's domain with `MAP_MSI` before it enables the vectors;
+    VT-d refuses `MAP_MSI`, and VT-d interrupt remapping is design intent
+    ([#325](https://github.com/kottlerg/seraph/issues/325)).
     [docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
     § Message-Signaled Interrupts owns the rule;
   - for a DMA declaration, the device's DMA capability, after its grant

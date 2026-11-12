@@ -827,6 +827,19 @@ impl PerCpuScheduler
         self.non_empty.load(Ordering::Relaxed) & !(1 << IDLE_QUEUE) != 0
     }
 
+    /// Whether this CPU has no work: it runs its idle thread and no run queue
+    /// other than [`IDLE_QUEUE`] links a thread. Lockless and Relaxed, and
+    /// dereferences no TCB: a snapshot for the softlockup watchdog's per-tick
+    /// idle sample (`sched::system_has_no_work`), which re-decides it on every
+    /// BSP tick. A thread between two of its loads (mid-dispatch, mid-link, or
+    /// mid-migration) can be missed by one sample;
+    /// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog states
+    /// what that costs.
+    pub fn has_no_work(&self) -> bool
+    {
+        core::ptr::eq(self.current(), self.idle()) && !self.has_queued_thread()
+    }
+
     /// Remove `tcb` from the run queue of level `priority`. No-op if not found.
     ///
     /// Used by `dealloc_object(Thread)`, `commit_state_under_all_locks`,
@@ -1387,6 +1400,38 @@ mod tests
         assert!(!sched.has_queued_thread());
         assert!(enq(&sched, p_fair, syscall::PRIORITY_MIN));
         assert!(sched.has_queued_thread());
+    }
+
+    // The defect caught: a CPU wedged with a thread other than its idle one
+    // as `current` and nothing queued, or a CPU on its idle thread with a
+    // thread queued it never dispatches, read as having no work, which hides
+    // the stall from the softlockup watchdog's all-idle detector.
+    #[test]
+    fn a_cpu_has_no_work_only_on_its_idle_thread_with_nothing_queued()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb();
+        let mut user = make_tcb();
+        let p_idle = &mut *idle as *mut _;
+        let p_user = &mut *user as *mut _;
+        sched.set_idle(p_idle);
+
+        sched.set_current(p_idle);
+        assert!(sched.has_no_work());
+
+        assert!(enq(&sched, p_user, syscall::PRIORITY_MIN));
+        assert!(!sched.has_no_work());
+        assert_eq!(deq(&sched), p_user);
+
+        sched.set_current(p_user);
+        assert!(!sched.has_no_work());
+        // The running thread's CPU links its idle thread on the idle queue,
+        // which is not work.
+        assert!(enq(&sched, p_idle, IDLE_PRIORITY));
+        assert!(!sched.has_no_work());
+        assert_eq!(deq(&sched), p_idle);
+        sched.set_current(p_idle);
+        assert!(sched.has_no_work());
     }
 
     #[test]

@@ -19,9 +19,7 @@
 //! Needs no SMP: the child is unpinned, and on a single CPU it runs as a
 //! timer-preempted peer. The call timeout, the sleep past it, and the report
 //! bound go through `crate::scaled_bound`, so at a wide CPU count the stop
-//! still lands inside the call's bound. The sleep is taken in slices shorter
-//! than the kernel's all-idle watchdog threshold, since nothing else runs
-//! while the client is stopped.
+//! still lands inside the call's bound.
 
 use syscall::{
     cap_copy, cap_create_endpoint, cap_create_notification, cap_delete, ipc_buffer_set,
@@ -45,12 +43,6 @@ const CALL_TIMEOUT_MS: u64 = 200;
 const PAST_DEADLINE_MS: u64 = 400;
 /// Bound on each wait for the client's report, before `crate::scaled_bound`.
 const REPORT_MS: u64 = 5000;
-/// Longest single sleep of the stopped wait. While the client is stopped
-/// nothing else runs, so one sleep of the whole scaled wait (3.2 s at 128
-/// CPUs) idles every CPU past the kernel's all-idle watchdog threshold
-/// (`WATCHDOG_THRESHOLD_SECONDS`, 3 s), which fails the boot. Each wake
-/// between slices is a non-idle dispatch.
-const SLEEP_SLICE_MS: u64 = 1000;
 
 static mut CLIENT_STACK: ChildStack = ChildStack::ZERO;
 static mut CLIENT_IPC_PAGE: IpcPage = IpcPage::ZERO;
@@ -112,13 +104,7 @@ pub fn run(ctx: &TestContext) -> TestResult
         return Err("integration::ipc_call_timeout_stop: the client's call never queued");
     }
     thread_stop(client.th).map_err(|_| "integration::ipc_call_timeout_stop: thread_stop failed")?;
-    let mut left = crate::scaled_bound(PAST_DEADLINE_MS);
-    while left > 0
-    {
-        let slice = left.min(SLEEP_SLICE_MS);
-        let _ = thread_sleep(slice);
-        left -= slice;
-    }
+    let _ = thread_sleep(crate::scaled_bound(PAST_DEADLINE_MS));
     thread_start(client.th)
         .map_err(|_| "integration::ipc_call_timeout_stop: thread_start failed")?;
     let acc = wait_for(done, BIT_OK | BIT_BAD)?;

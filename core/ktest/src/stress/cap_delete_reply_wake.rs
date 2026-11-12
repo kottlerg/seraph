@@ -46,12 +46,14 @@
 //! `Stopped`) — this cell drives **only** the server dealloc. The kernel
 //! contract therefore guarantees the client wakes with `Interrupted`, so the
 //! controller **requires** `BIT_CLIENT_WOKE` every cycle. A lost wake never
-//! arrives: the controller's `notification_wait` blocks, every CPU goes idle,
-//! and the softlockup watchdog fires (its registry walk names the stranded
-//! `BlockedOnReply` client and the server it is parked on). The hang is raised
-//! by the kernel, not by a test assertion — `BIT_SERVER_ARMED` proves the race
-//! armed, and a wake on every cycle proves the liveness path actually ran on
-//! every cycle rather than passing vacuously.
+//! arrives: the controller's `notification_wait` blocks and every CPU goes
+//! idle, which the kernel's softlockup watchdog does not report (an idle
+//! system is not a stall, and a `BlockedOnReply` client matches no owed-wake
+//! rule), so the boot hangs until the harness's timeout fails it
+//! (`run-parallel` classifies it HANG). The failure is the hang, not a test
+//! assertion — `BIT_SERVER_ARMED` proves the race armed, and a wake on every
+//! cycle proves the liveness path actually ran on every cycle rather than
+//! passing vacuously.
 //!
 //! ## Pass criterion
 //!
@@ -87,7 +89,7 @@ const BIT_CLIENT_WOKE: u64 = 1 << 1;
 /// `done` bit the client raises when its `ipc_call` returns anything OTHER
 /// than `Interrupted`: the dealloc wake delivered a wrong disposition (e.g.
 /// stale `ipc_msg` bytes surfaced as a successful reply — the #361 clobber).
-/// Immediate FAIL with a named error instead of a watchdog hang.
+/// Immediate FAIL with a named error instead of a hang.
 const BIT_CLIENT_BAD: u64 = 1 << 2;
 
 /// `done` bit the client raises immediately before its `ipc_call`, so the
@@ -263,12 +265,11 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::cap_delete_reply_wake: cap_delete server th failed")?;
 
         // LIVENESS GATE: the client MUST wake. A lost reply-wake never sends
-        // BIT_CLIENT_WOKE, so this `notification_wait` blocks, every CPU goes
-        // idle, and the softlockup watchdog fires — the FAIL signal, raised by
-        // the kernel (its registry walk names the stranded BlockedOnReply
-        // client), not by a test assertion. DISPOSITION GATE: a wake that
-        // surfaces anything but `Interrupted` raises BIT_CLIENT_BAD instead —
-        // fail fast with a named error.
+        // BIT_CLIENT_WOKE, so this `notification_wait` blocks and the boot
+        // hangs until the harness's timeout — the FAIL signal, not a test
+        // assertion. DISPOSITION GATE: a wake that surfaces anything but
+        // `Interrupted` raises BIT_CLIENT_BAD instead — fail fast with a named
+        // error.
         while acc & (BIT_CLIENT_WOKE | BIT_CLIENT_BAD) == 0
         {
             let bits = notification_wait(done)

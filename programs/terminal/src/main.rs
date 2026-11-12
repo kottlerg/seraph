@@ -24,6 +24,9 @@
 //! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
 //! job-control/multi-session (#29) and the real interactive shell (#112).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod input;
 mod output;
 
@@ -218,7 +221,14 @@ fn pump_stream<R: std::io::Read>(mut reader: R, tx: &Sender<Msg>)
             Ok(0) | Err(_) => break,
             Ok(n) =>
             {
-                if tx.send(Msg::Output(buf[..n].to_vec())).is_err()
+                // A count past the buffer breaks the `Read` contract; it ends
+                // the relay as a read error does.
+                let Some(run) = buf.get(..n)
+                else
+                {
+                    break;
+                };
+                if tx.send(Msg::Output(run.to_vec())).is_err()
                 {
                     break;
                 }

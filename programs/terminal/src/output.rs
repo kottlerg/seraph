@@ -121,12 +121,10 @@ fn fb_set_attrs(cap: u64, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
 /// the cap differ.
 fn write_chunked(cap: u64, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mut u64, label: &str)
 {
-    let mut rest = bytes;
-    while !rest.is_empty()
+    for chunk in bytes.chunks(PAYLOAD_MAX)
     {
-        let n = rest.len().min(PAYLOAD_MAX);
-        let msg = IpcMessage::builder(opcode | ((n as u64) << 16))
-            .bytes(0, &rest[..n])
+        let msg = IpcMessage::builder(opcode | ((chunk.len() as u64) << 16))
+            .bytes(0, chunk)
             .build();
         // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer.
         match unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
@@ -147,6 +145,5 @@ fn write_chunked(cap: u64, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mu
                 return;
             }
         }
-        rest = &rest[n..];
     }
 }

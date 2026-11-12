@@ -196,7 +196,7 @@ cargo xtask run --test-devices
 ```
 
 The svctest recipe also stages the test class files of `sysroot/config/devmgr/tests/` into
-`sysroot/config/devmgr/classes/`, which devmgr's class-file pass reads, and boots with
+`sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
 `--test-devices`, which attaches `edu` and four QEMU `pci-testdev` functions that no other launch
 attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
 

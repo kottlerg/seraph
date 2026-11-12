@@ -238,10 +238,13 @@ impl DmaGrant
     /// them (riscv64): hold the page out of the device's IOVA space
     /// ([`DmaTable::hold_interrupt_file`]), then have the IOMMU driver map it
     /// in the device's domain at its own address (`MAP_MSI`), once per file.
-    /// An unconfined device reaches every file already. Returns whether the
-    /// device reaches the file; `false`, logged, when the table refuses the
-    /// page or the driver's `MAP_MSI` fails, the page then let go of.
-    pub fn reach_interrupt_file(&self, file: u64) -> bool
+    /// An unconfined device reaches every file already. Returns `Some(true)`
+    /// when this call mapped the file, which the domain then keeps for its
+    /// life (`UNMAP` refuses it; only its `BLOCK` removes it), and
+    /// `Some(false)` when the device reached it already; `None`, logged,
+    /// when the table refuses the page or the driver's `MAP_MSI` fails, the
+    /// page then let go of.
+    pub fn reach_interrupt_file(&self, file: u64) -> Option<bool>
     {
         let held = {
             let mut table = lock(&self.shared.table);
@@ -250,13 +253,13 @@ impl DmaGrant
                 Some(Confinement::Domain { handle, .. }) => table
                     .hold_interrupt_file(self.device_badge, file)
                     .map(|newly| newly.then_some(handle)),
-                _ => return !self.confined,
+                _ => return (!self.confined).then_some(false),
             }
         };
         let handle = match held
         {
             Ok(Some(handle)) => handle,
-            Ok(None) => return true,
+            Ok(None) => return Some(false),
             Err(e) =>
             {
                 std::os::seraph::log!(
@@ -265,7 +268,7 @@ impl DmaGrant
                     file,
                     e
                 );
-                return false;
+                return None;
             }
         };
         let mapped = self
@@ -282,9 +285,9 @@ impl DmaGrant
                 code
             );
             lock(&self.shared.table).release_interrupt_file(self.device_badge, file);
-            return false;
+            return None;
         }
-        true
+        Some(true)
     }
 
     /// Withdraw the device's DMA: revoke every copy of its DMA capability

@@ -516,7 +516,10 @@ from the entry's `Interrupt` cap with `SYS_CAP_INFO`, and unmask it. devmgr sets
 Interrupt Disable in both cases. Each vector is one `Interrupt` resource, whose copy carries
 `RIGHTS_IRQ_NOTIFY` only and which the driver binds with `SYS_IRQ_REGISTER` in mode 0. A step that
 fails at the bind (a mint, an interrupt file, a table BAR, the configuration page) falls back:
-MSI-X to MSI when the function has it, else to the wired line, and MSI to the wired line. When it
+MSI-X to MSI when the function has it, else to the wired line, and MSI to the wired line. A step
+that fails after it mapped an interrupt file is the exception: the domain keeps the file until it
+is blocked (`UNMAP` refuses it), so a fallback would leave the device reaching a hart's file no
+target of its own sits on, and devmgr refuses the bind instead, which blocks the domain. When it
 withdraws the driver devmgr clears MSI Enable and MSI-X Enable beside Interrupt Disable, before the
 declared reset, and a target is freed once no cap to it remains.
 

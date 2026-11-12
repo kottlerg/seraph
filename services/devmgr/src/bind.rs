@@ -931,7 +931,16 @@ fn carve_pci_device(
     }
     // After the DMA grant: on riscv64 a message-signaled target's interrupt
     // file enters the device's IOMMU domain before its vectors are enabled.
-    let given = give_interrupt(name, pci_dev, decl, carve, &mut dev);
+    let Ok(given) = give_interrupt(name, pci_dev, decl, carve, &mut dev)
+    else
+    {
+        std::os::seraph::log!(
+            warn: "{}: interrupt files mapped for vectors not given; not bound",
+            name
+        );
+        dev.release();
+        return None;
+    };
     if given.is_none() && decl.interrupt.need == InterruptNeed::Required
     {
         std::os::seraph::log!(
@@ -1112,13 +1121,20 @@ fn grant_dma(
 /// ([`give_msix`]), one MSI vector ([`give_msi`]), the wired line
 /// ([`give_wired`]). Returns the kind given; `None` for a driver that takes
 /// no interrupt and for a device none can be had for.
+///
+/// # Errors
+/// [`Widened`] when a message-signaled step failed after it mapped an
+/// interrupt file into the device's IOMMU domain: the domain keeps the
+/// file until it is blocked, so the device would reach a hart's file no
+/// target of its own sits on. Nothing further is tried; the caller refuses
+/// the bind, whose release blocks the domain.
 fn give_interrupt(
     name: &str,
     pci_dev: &pci::PciDevice,
     decl: &DriverDecl,
     carve: &mut Carve,
     dev: &mut PciDeviceCaps,
-) -> Option<InterruptKind>
+) -> Result<Option<InterruptKind>, Widened>
 {
     let mut plan = Some(firmware::pci::interrupt_plan(
         decl.interrupt,
@@ -1130,24 +1146,26 @@ fn give_interrupt(
     {
         let (given, vectors) = match step
         {
-            InterruptPlan::None => return None,
+            InterruptPlan::None => return Ok(None),
             InterruptPlan::Wired => (
                 give_wired(pci_dev, carve.irq_range, dev).then_some(InterruptKind::Wired),
                 1,
             ),
             InterruptPlan::Msi => (
-                give_msi(name, pci_dev, carve.irq_range, dev).then_some(InterruptKind::Msi),
+                given_messages(give_msi(name, pci_dev, carve.irq_range, dev))?
+                    .then_some(InterruptKind::Msi),
                 1,
             ),
             InterruptPlan::MsiX(vectors) => (
-                give_msix(name, pci_dev, vectors, carve, dev).then_some(InterruptKind::MsiX),
+                given_messages(give_msix(name, pci_dev, vectors, carve, dev))?
+                    .then_some(InterruptKind::MsiX),
                 vectors,
             ),
         };
         if let Some(kind) = given
         {
             std::os::seraph::log!("{}: {:?} interrupt, {} vector(s)", name, kind, vectors);
-            return given;
+            return Ok(given);
         }
         plan = firmware::pci::fallback(step, pci_dev.msi);
         if let Some(next) = plan
@@ -1155,7 +1173,47 @@ fn give_interrupt(
             std::os::seraph::log!(warn: "{}: {:?} not given; trying {:?}", name, step, next);
         }
     }
-    None
+    Ok(None)
+}
+
+/// A message-signaled step that failed after it mapped an interrupt file
+/// into the device's IOMMU domain ([`give_interrupt`]).
+struct Widened;
+
+/// Why a message-signaled step gave no vector.
+#[derive(Clone, Copy)]
+enum NotGiven
+{
+    /// The step left the device's IOMMU domain as it found it.
+    Clean,
+    /// The step mapped an interrupt file the domain keeps ([`Widened`]).
+    Widened,
+}
+
+/// Whether a message-signaled step's `outcome` gave its vectors; `Err` for
+/// one that failed after it widened the device's domain.
+fn given_messages(outcome: Result<(), NotGiven>) -> Result<bool, Widened>
+{
+    match outcome
+    {
+        Ok(()) => Ok(true),
+        Err(NotGiven::Clean) => Ok(false),
+        Err(NotGiven::Widened) => Err(Widened),
+    }
+}
+
+/// The failure of a message-signaled step after its targets were minted,
+/// `widened` telling whether the minting mapped an interrupt file.
+fn not_given(widened: bool) -> NotGiven
+{
+    if widened
+    {
+        NotGiven::Widened
+    }
+    else
+    {
+        NotGiven::Clean
+    }
 }
 
 /// Give the driver the device's wired line: its own single-line cap
@@ -1216,21 +1274,22 @@ fn messages_translated() -> bool
 /// and read each one's message; where the device's IOMMU domain translates
 /// its messages ([`messages_translated`]), make the interrupt file each one
 /// targets reachable by the device through its DMA grant `dma`
-/// ([`dma::DmaGrant::reach_interrupt_file`]). `None`, logged under `name`,
-/// with every target it minted deleted, when a mint, a read, or a file
-/// fails.
+/// ([`dma::DmaGrant::reach_interrupt_file`]). Returns the targets and
+/// whether a file was newly mapped for them. On failure, logged under
+/// `name`, every target it minted is deleted, and the error tells whether a
+/// file was mapped before the failure ([`NotGiven::Widened`]).
 fn mint_messages(
     name: &str,
     count: u8,
     irq_range: &IrqRangeAllocator,
     dma: Option<&dma::DmaGrant>,
-) -> Option<Vec<Message>>
+) -> Result<(Vec<Message>, bool), NotGiven>
 {
     let mut messages: Vec<Message> = Vec::new();
     if messages.try_reserve_exact(usize::from(count)).is_err()
     {
         std::os::seraph::log!(warn: "{}: no memory to mint interrupt targets", name);
-        return None;
+        return Err(NotGiven::Clean);
     }
     for _ in 0..count
     {
@@ -1260,49 +1319,54 @@ fn mint_messages(
                     e
                 );
                 delete_messages(&messages);
-                return None;
+                return Err(NotGiven::Clean);
             }
         }
     }
+    let mut widened = false;
     if messages_translated()
         && let Some(dma) = dma
-        && !messages
-            .iter()
-            .all(|m| dma.reach_interrupt_file(m.address & !(PAGE_SIZE - 1)))
     {
-        std::os::seraph::log!(
-            warn: "{}: an interrupt file its targets sit on is not reachable by the device",
-            name
-        );
-        delete_messages(&messages);
-        return None;
+        for m in &messages
+        {
+            let Some(newly) = dma.reach_interrupt_file(m.address & !(PAGE_SIZE - 1))
+            else
+            {
+                std::os::seraph::log!(
+                    warn: "{}: an interrupt file its targets sit on is not reachable by the device",
+                    name
+                );
+                delete_messages(&messages);
+                return Err(not_given(widened));
+            };
+            widened |= newly;
+        }
     }
-    Some(messages)
+    Ok((messages, widened))
 }
 
 /// Give the driver one MSI vector: mint a target, program its message into
 /// the function's MSI capability and enable it with one vector
-/// ([`FunctionConfig::program_msi`]). Returns whether it was given; `false`,
-/// logged, with the target deleted, when the function has no MSI capability,
-/// the mint fails, the message does not fit the capability
-/// ([`Msi::fits`]), or the configuration page cannot be mapped.
+/// ([`FunctionConfig::program_msi`]).
+///
+/// # Errors
+/// Logged, with the target deleted, when the function has no MSI
+/// capability, the mint fails, the message does not fit the capability
+/// ([`Msi::fits`]), or the configuration page cannot be mapped; the
+/// [`NotGiven`] tells whether an interrupt file was mapped for it.
 fn give_msi(
     name: &str,
     pci_dev: &pci::PciDevice,
     irq_range: &IrqRangeAllocator,
     dev: &mut PciDeviceCaps,
-) -> bool
+) -> Result<(), NotGiven>
 {
-    let Some(msi) = pci_dev.msi
+    let msi = pci_dev.msi.ok_or(NotGiven::Clean)?;
+    let (messages, widened) = mint_messages(name, 1, irq_range, dev.dma.as_ref())?;
+    let Some(m) = messages.first().copied()
     else
     {
-        return false;
-    };
-    let Some(m) = mint_messages(name, 1, irq_range, dev.dma.as_ref())
-        .and_then(|messages| messages.first().copied())
-    else
-    {
-        return false;
+        return Err(not_given(widened));
     };
     if !msi.fits(m.address, m.data)
     {
@@ -1313,12 +1377,12 @@ fn give_msi(
             m.data
         );
         delete_messages(&[m]);
-        return false;
+        return Err(not_given(widened));
     }
     if !dev.config.program_msi(msi, m.address, m.data)
     {
         delete_messages(&[m]);
-        return false;
+        return Err(not_given(widened));
     }
     dev.push(Resource::Interrupt {
         cap: m.cap,
@@ -1326,7 +1390,7 @@ fn give_msi(
         vector: 0,
         mode: 0,
     });
-    true
+    Ok(())
 }
 
 /// Give the driver `vectors` MSI-X vectors, table entries 0 onwards: deliver
@@ -1334,23 +1398,21 @@ fn give_msi(
 /// ([`msix_bar`]), mint a target per vector, and enable MSI-X with every
 /// table entry masked ([`FunctionConfig::enable_msix`]); the driver writes
 /// each entry's message, read from its `Interrupt` cap, and unmasks it.
-/// Returns whether they were given; `false`, logged, with the targets
-/// deleted and any BAR delivered for the table taken back, when the function
-/// has no MSI-X capability, a BAR cannot be delivered, a mint fails, or the
-/// capability or table cannot be mapped.
+///
+/// # Errors
+/// Logged, with the targets deleted and any BAR delivered for the table
+/// taken back, when the function has no MSI-X capability, a BAR cannot be
+/// delivered, a mint fails, or the capability or table cannot be mapped;
+/// the [`NotGiven`] tells whether an interrupt file was mapped for them.
 fn give_msix(
     name: &str,
     pci_dev: &pci::PciDevice,
     vectors: u8,
     carve: &mut Carve,
     dev: &mut PciDeviceCaps,
-) -> bool
+) -> Result<(), NotGiven>
 {
-    let Some(msix) = pci_dev.msix
-    else
-    {
-        return false;
-    };
+    let msix = pci_dev.msix.ok_or(NotGiven::Clean)?;
     let delivered = dev.count;
     let table = msix_bar(
         name,
@@ -1365,13 +1427,16 @@ fn give_msix(
     else
     {
         dev.truncate(delivered);
-        return false;
+        return Err(NotGiven::Clean);
     };
-    let Some(messages) = mint_messages(name, vectors, carve.irq_range, dev.dma.as_ref())
-    else
+    let (messages, widened) = match mint_messages(name, vectors, carve.irq_range, dev.dma.as_ref())
     {
-        dev.truncate(delivered);
-        return false;
+        Ok(minted) => minted,
+        Err(e) =>
+        {
+            dev.truncate(delivered);
+            return Err(e);
+        }
     };
     if !dev
         .config
@@ -1379,7 +1444,7 @@ fn give_msix(
     {
         delete_messages(&messages);
         dev.truncate(delivered);
-        return false;
+        return Err(not_given(widened));
     }
     for (vector, m) in (0..=u8::MAX).zip(&messages)
     {
@@ -1390,7 +1455,7 @@ fn give_msix(
             mode: 0,
         });
     }
-    true
+    Ok(())
 }
 
 /// The cap and delivered bytes of BAR register `bar` of `pci_dev`, which

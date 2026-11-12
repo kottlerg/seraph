@@ -199,9 +199,9 @@ fn start_pinned_child(
             },
         )
     };
-    // SAFETY: stack_idx is unique per child; the children live for the whole
+    // stack_idx is unique per child; the children live for the whole
     // cell and are reaped after both report done.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack_idx]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack_idx)?;
     // SAFETY: the stack is `super::STRESS_STACKS[stack_idx]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(&child, entry, stack, arg, cpu) }
@@ -481,13 +481,13 @@ extern "C" fn poster_entry(arg: u64) -> !
             core::hint::spin_loop();
         }
 
-        POST_SEQ.store(2 * c + 1, Ordering::Release);
+        POST_SEQ.store(c.saturating_mul(2).saturating_add(1), Ordering::Release);
         if event_post(eq, u64::from(c)).is_err()
         {
             fail(6);
             break 'rounds;
         }
-        POST_SEQ.store(2 * c + 2, Ordering::Release);
+        POST_SEQ.store(c.saturating_mul(2).saturating_add(2), Ordering::Release);
 
         if notification_send(gate, 1u64 << (c % 2)).is_err()
         {

@@ -151,8 +151,14 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         // Distinct for cpus >= 3: offsets 0,1,2 never collide mod n.
         let victim_cpu = super::rotation_slot(cycle, CYCLES, cpu_mod);
-        let stop_cpu = (victim_cpu + 1) % cpu_mod;
-        let start_cpu = (victim_cpu + 2) % cpu_mod;
+        let stop_cpu = victim_cpu
+            .saturating_add(1)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::stop_resume_race: cpu modulus is zero")?;
+        let start_cpu = victim_cpu
+            .saturating_add(2)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::stop_resume_race: cpu modulus is zero")?;
 
         // Arm the barrier closed before the racers can read it.
         RELEASE.store(0, Ordering::Release);
@@ -259,7 +265,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             ALL_READY,
             "stress::stop_resume_race: victim and racers never all reported ready",
         )?;
-        armed_cycles += 1;
+        armed_cycles = armed_cycles.saturating_add(1);
 
         // Fire both racers at the same instant. Do NOT yield here — that would
         // narrow the stop-drain / resume overlap.
@@ -370,7 +376,7 @@ fn wait_for_release()
         {
             break;
         }
-        spins += 1;
+        spins = spins.saturating_add(1);
         core::hint::spin_loop();
     }
 }

@@ -154,7 +154,7 @@ fn edit_flags(th: u64, edit: impl FnOnce(u64) -> u64) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::single_step: thread_read_regs failed")?;
-    super::edit_rflags(&mut regs, edit);
+    super::edit_rflags(&mut regs, edit)?;
     // SAFETY: the frame was read from this child, fault-blocked; only the
     // trap flag changes, which decides whether the next instruction traps,
     // and nothing of the thread's memory or control flow.

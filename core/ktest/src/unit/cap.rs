@@ -466,7 +466,7 @@ pub fn revoke_large_subtree(ctx: &TestContext) -> TestResult
     // Only the root remains; deleting it restores the slot-count baseline.
     let used_before_delete = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
         .map_err(|_| "cap_info(USED) after revokes failed")?;
-    if used_before_delete != used0 + 1
+    if Some(used_before_delete) != used0.checked_add(1)
     {
         return Err("slot count not restored after batched revokes");
     }
@@ -566,7 +566,7 @@ pub fn move_large_subtree(ctx: &TestContext) -> TestResult
 
         let used = cap_info(ctx.cspace_cap, syscall_abi::CAP_INFO_CSPACE_USED)
             .map_err(|_| "cap_info(USED) after revoke failed")?;
-        if used != used0 + 1
+        if Some(used) != used0.checked_add(1)
         {
             return Err("slot count not restored after revoke of the moved slot");
         }
@@ -779,25 +779,27 @@ pub fn lookup_bounds(ctx: &TestContext) -> TestResult
     let invalid = SyscallError::InvalidCapability as i64;
     // cast_possible_truncation: the assert above keeps every value within u32.
     #[allow(clippy::cast_possible_truncation)]
-    let (first_indirect, first_double, first_triple, ceiling) = (
-        FIRST_INDIRECT as u32,
-        FIRST_DOUBLE as u32,
-        FIRST_TRIPLE as u32,
-        SLOT_CEILING as u32,
+    let (below_ceiling, past_ceiling) = (
+        [
+            1,
+            (FIRST_INDIRECT - 1) as u32,
+            FIRST_INDIRECT as u32,
+            (FIRST_INDIRECT + 1) as u32,
+            (FIRST_DOUBLE - 1) as u32,
+            FIRST_DOUBLE as u32,
+            (FIRST_TRIPLE - 1) as u32,
+            FIRST_TRIPLE as u32,
+            (SLOT_CEILING - 1) as u32,
+        ],
+        // The index field is the handle's low 32 bits, so `u32::MAX` is its top.
+        [
+            0,
+            SLOT_CEILING as u32,
+            (SLOT_CEILING + 1) as u32,
+            u32::MAX - 1,
+            u32::MAX,
+        ],
     );
-    let below_ceiling = [
-        1,
-        first_indirect - 1,
-        first_indirect,
-        first_indirect + 1,
-        first_double - 1,
-        first_double,
-        first_triple - 1,
-        first_triple,
-        ceiling - 1,
-    ];
-    // The index field is the handle's low 32 bits, so `u32::MAX` is its top.
-    let past_ceiling = [0, ceiling, ceiling + 1, u32::MAX - 1, u32::MAX];
     for generation in [0u32, CAP_GEN_MASK]
     {
         for index in past_ceiling

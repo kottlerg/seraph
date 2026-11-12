@@ -91,7 +91,7 @@ const FAULT_BADGE: u64 = 0xA5_7A5E;
 /// CPU waits for a host core.
 const MAX_POLLS: u32 = 2000;
 
-/// Write a machine-code stub into a fresh frame-pool page and map it
+/// Write the machine-code stub `code` into a fresh frame-pool page and map it
 /// executable at [`STUB_VA`] in `aspace`. Returns the frame's Memory cap.
 ///
 /// The page is written through a temporary writable mapping in ktest's own
@@ -101,12 +101,12 @@ const MAX_POLLS: u32 = 2000;
 /// callers then run it. Under QEMU a missing synchronisation does not fail,
 /// so the `SYS_SYSTEM_INFO(InstructionCacheSyncs)` count must rise across
 /// the map: the check that the path was taken.
-fn install_stub(
-    ctx: &TestContext,
-    aspace: u64,
-    emit: impl FnOnce(&mut [u8]) -> usize,
-) -> Result<u64, &'static str>
+fn install_stub(ctx: &TestContext, aspace: u64, code: &[u8]) -> Result<u64, &'static str>
 {
+    if u64::try_from(code.len()).map_or(true, |len| len > syscall_abi::PAGE_SIZE)
+    {
+        return Err("retype::stub: stub larger than a page");
+    }
     let frame =
         crate::frame_pool::alloc().ok_or("retype::stub: frame_pool::alloc returned None")?;
     // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
@@ -118,11 +118,10 @@ fn install_stub(
         unsafe { crate::frame_pool::free(frame) };
         return Err("retype::stub: scratch mem_map failed");
     }
-    let mut bytes = [0u8; 32];
-    let len = emit(&mut bytes);
-    for (i, b) in bytes[..len].iter().enumerate()
+    for (i, b) in code.iter().enumerate()
     {
-        // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above; i < 32.
+        // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above; i is
+        // below the stub's length, which the check above keeps within a page.
         unsafe { (STUB_SCRATCH_VA as *mut u8).add(i).write_volatile(*b) };
     }
     // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
@@ -323,7 +322,7 @@ fn aspace_stop_running(ctx: &TestContext) -> TestResult
     phase.stub = Some(install_stub(
         ctx,
         phase.aspace,
-        crate::arch::code_stub::emit_spin,
+        &crate::arch::code_stub::spin(),
     )?);
     phase.thread = cap_create_thread(memory, phase.aspace, phase.cspace, 0, 0)
         .map_err(|_| "retype::aspace_stop: cap_create_thread (spin) failed")?;
@@ -400,9 +399,7 @@ pub fn aspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
         .map_err(|_| "retype::aspace_self_delete: cap_create_cspace failed")?;
     let child_as = cap_copy(aspace, cspace, RIGHTS_ALL)
         .map_err(|_| "retype::aspace_self_delete: cap_copy(aspace) failed")?;
-    let frame = install_stub(ctx, aspace, |buf| {
-        crate::arch::code_stub::emit_self_delete(buf, child_as)
-    })?;
+    let frame = install_stub(ctx, aspace, &crate::arch::code_stub::self_delete(child_as))?;
     let thread = cap_create_thread(memory, aspace, cspace, 0, 0)
         .map_err(|_| "retype::aspace_self_delete: cap_create_thread failed")?;
     // SAFETY: the thread is bound to the `aspace` this test created, not
@@ -511,7 +508,13 @@ pub fn pt_budget_exhaustion_returns_oom(ctx: &TestContext) -> TestResult
     let mut got_oom = false;
     for i in 0..16u64
     {
-        let va = TEST_VA_BASE + i * 0x4000_0000; // 1 GiB stride
+        // 1 GiB stride
+        let Some(va) = region_va(i, 0x4000_0000)
+        else
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::pt_budget: region address out of range");
+        };
         // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
         // mapping at `va` there (past the scratch band once the stride leaves
         // it) holds no Rust object or IPC page of ktest.
@@ -561,7 +564,12 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     let stride: u64 = 0x4000_0000; // 1 GiB stride forces fresh level-2 entries.
     for i in 0..mappings
     {
-        let va = TEST_VA_BASE + i as u64 * stride;
+        let Some(va) = region_va(i as u64, stride)
+        else
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::deep_pt: region address out of range");
+        };
         // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
         // mapping change at `va` there (past the scratch band once the stride
         // leaves it) touches no Rust object or IPC page of ktest.
@@ -575,7 +583,12 @@ pub fn deep_pt_walk_consumes_pool(ctx: &TestContext) -> TestResult
     // Unmap each page so the AS is clean before deletion.
     for i in 0..mappings
     {
-        let va = TEST_VA_BASE + i as u64 * stride;
+        let Some(va) = region_va(i as u64, stride)
+        else
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::deep_pt: region address out of range");
+        };
         // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
         // mapping change at `va` there (past the scratch band once the stride
         // leaves it) touches no Rust object or IPC page of ktest.
@@ -698,7 +711,12 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     // Map the whole burst (peak concurrency): budget drops as PTs allocate.
     for i in 0..N
     {
-        let va = TEST_VA_BASE + i * STRIDE;
+        let Some(va) = region_va(i, STRIDE)
+        else
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::concurrent_regions: region address out of range");
+        };
         // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
         // mapping change at `va` there (past the scratch band once the stride
         // leaves it) touches no Rust object or IPC page of ktest.
@@ -719,7 +737,12 @@ pub fn concurrent_regions_release_pt_budget_on_unmap(ctx: &TestContext) -> TestR
     // Reclaiming-unmap each region; the budget must climb back to baseline.
     for i in 0..N
     {
-        let va = TEST_VA_BASE + i * STRIDE;
+        let Some(va) = region_va(i, STRIDE)
+        else
+        {
+            cap_delete(aspace).ok();
+            return Err("retype::concurrent_regions: region address out of range");
+        };
         // SAFETY: `aspace` is a fresh AddressSpace no ktest code runs in, so a
         // mapping change at `va` there (past the scratch band once the stride
         // leaves it) touches no Rust object or IPC page of ktest.
@@ -850,7 +873,7 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
     {
         match cap_copy(probe, cspace, 1)
         {
-            Ok(_) => ok_before += 1,
+            Ok(_) => ok_before = ok_before.saturating_add(1),
             Err(e) =>
             {
                 err_at_pool = e;
@@ -868,7 +891,7 @@ pub fn cspace_pool_exhaust_then_augment(ctx: &TestContext) -> TestResult
     {
         match cap_copy(probe, cspace, 1)
         {
-            Ok(_) => ok_after += 1,
+            Ok(_) => ok_after = ok_after.saturating_add(1),
             Err(e) =>
             {
                 err_after = e;
@@ -915,8 +938,9 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     // `L2_SIZE`, published in the ABI. Taken before any capability exists,
     // so the refusal needs no cleanup.
     let next_leaf_slot = u32::try_from(syscall_abi::CSPACE_SLOTS_PER_PAGE)
-        .map(|leaf| INDIRECT_SLOT + leaf)
-        .map_err(|_| "retype::indirect: CSPACE_SLOTS_PER_PAGE exceeds a slot index")?;
+        .ok()
+        .and_then(|leaf| INDIRECT_SLOT.checked_add(leaf))
+        .ok_or("retype::indirect: CSPACE_SLOTS_PER_PAGE exceeds a slot index")?;
 
     let memory = ctx.memory_base;
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
@@ -934,7 +958,11 @@ pub fn cspace_indirect_region(ctx: &TestContext) -> TestResult
     // Deep placement first (while the pool is coldest): fund it only if the
     // source cap has comfortable headroom, otherwise skip-pass the deep
     // half — CI guests with small RAM still exercise the small crossing.
-    let deep = baseline > (deep_pool_pages + 4096) * PAGE;
+    let deep_need = deep_pool_pages
+        .checked_add(4096)
+        .and_then(|pages| pages.checked_mul(PAGE))
+        .ok_or("retype::indirect: deep pool size out of range")?;
+    let deep = baseline > deep_need;
     if deep
     {
         if cap_create_cspace(memory, cspace, deep_pool_pages).is_err()
@@ -1047,7 +1075,11 @@ pub fn cspace_double_indirect_region(ctx: &TestContext) -> TestResult
     let memory = ctx.memory_base;
     let baseline = cap_info(memory, CAP_INFO_MEMORY_AVAILABLE)
         .map_err(|_| "retype::double: cap_info(baseline) failed")?;
-    if baseline <= (pool_pages + 4096) * PAGE
+    let need = pool_pages
+        .checked_add(4096)
+        .and_then(|pages| pages.checked_mul(PAGE))
+        .ok_or("retype::double: pool size out of range")?;
+    if baseline <= need
     {
         crate::log("ktest: retype::cspace_double_indirect_region SKIP (low memory)");
         return Ok(());
@@ -1210,7 +1242,7 @@ pub fn cspace_dir_page_survives_failed_grow(ctx: &TestContext) -> TestResult
         {
             break;
         }
-        landed += 1;
+        landed = landed.saturating_add(1);
     }
     cap_delete(probe).ok();
     cap_delete(cspace).ok();
@@ -1250,9 +1282,9 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
         while pool_pages
             .saturating_sub(dirs)
             .saturating_sub(DIRECT_LEAVES)
-            > dirs * DIR_FANOUT
+            > dirs.saturating_mul(DIR_FANOUT)
         {
-            dirs += 1;
+            dirs = dirs.saturating_add(1);
         }
         dirs
     }
@@ -1272,7 +1304,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     {
         if cap_create_cspace(memory, cspace, 1).is_err()
         {
-            augment_failures += 1;
+            augment_failures = augment_failures.saturating_add(1);
         }
     }
     let Ok(budget) = cap_info(cspace, CAP_INFO_CSPACE_BUDGET)
@@ -1299,7 +1331,7 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     {
         match cap_copy(probe, cspace, 1)
         {
-            Ok(_) => copies += 1,
+            Ok(_) => copies = copies.saturating_add(1),
             Err(e) =>
             {
                 terminal = e;
@@ -1337,6 +1369,14 @@ pub fn cspace_augment_many(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// The scratch VA of region `i`, `stride` bytes above region `i - 1` from
+/// `TEST_VA_BASE`; `None` when it does not fit a `u64`.
+fn region_va(i: u64, stride: u64) -> Option<u64>
+{
+    i.checked_mul(stride)
+        .and_then(|offset| TEST_VA_BASE.checked_add(offset))
+}
+
 /// Map `frame` once at each of `regions` scratch VAs `stride` apart from
 /// `TEST_VA_BASE` in `aspace`; returns how many maps failed.
 fn map_regions(frame: u64, aspace: u64, regions: u64, stride: u64) -> u32
@@ -1344,12 +1384,18 @@ fn map_regions(frame: u64, aspace: u64, regions: u64, stride: u64) -> u32
     let mut failures = 0u32;
     for i in 0..regions
     {
+        let Some(va) = region_va(i, stride)
+        else
+        {
+            failures = failures.saturating_add(1);
+            continue;
+        };
         // SAFETY: `TEST_VA_BASE + i * stride` is a scratch VA (crate docs
         // § Scratch VAs), so the span holds no Rust object or IPC page of
         // ktest.
-        if unsafe { mem_map(frame, aspace, TEST_VA_BASE + i * stride, 0, 1, MAP_WRITABLE) }.is_err()
+        if unsafe { mem_map(frame, aspace, va, 0, 1, MAP_WRITABLE) }.is_err()
         {
-            failures += 1;
+            failures = failures.saturating_add(1);
         }
     }
     failures
@@ -1361,12 +1407,18 @@ fn reclaim_regions(aspace: u64, regions: u64, stride: u64) -> u32
     let mut failures = 0u32;
     for i in 0..regions
     {
+        let Some(va) = region_va(i, stride)
+        else
+        {
+            failures = failures.saturating_add(1);
+            continue;
+        };
         // SAFETY: `TEST_VA_BASE + i * stride` is a scratch VA (crate docs
         // § Scratch VAs), so the span holds no Rust object or IPC page of
         // ktest.
-        if unsafe { mem_unmap_reclaim(aspace, TEST_VA_BASE + i * stride, 1) }.is_err()
+        if unsafe { mem_unmap_reclaim(aspace, va, 1) }.is_err()
         {
-            failures += 1;
+            failures = failures.saturating_add(1);
         }
     }
     failures
@@ -1422,7 +1474,7 @@ pub fn aspace_augment_many(ctx: &TestContext) -> TestResult
     {
         if cap_create_aspace(memory, aspace, 1).is_err()
         {
-            augment_failures += 1;
+            augment_failures = augment_failures.saturating_add(1);
         }
     }
     let Ok(budget) = cap_info(aspace, CAP_INFO_ASPACE_PT_BUDGET)
@@ -1699,7 +1751,11 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
     }
     // A probe the worker's CPU could acknowledge between two of its syscalls,
     // just before or just after the call, is not counted against the call.
-    let margin = 8 * LAT_GAP_US.load(Ordering::Relaxed) + 10;
+    let margin = LAT_GAP_US
+        .load(Ordering::Relaxed)
+        .checked_mul(8)
+        .and_then(|gap| gap.checked_add(10))
+        .ok_or("retype::pool_latency: probe margin out of range")?;
 
     let mut max_wait = 0u64;
     // The issue and acknowledgement times of the first probe issued `margin`
@@ -1719,9 +1775,9 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
         let start = LAT_START.load(Ordering::Acquire);
         if start != 0 && t1 >= start
         {
-            max_wait = max_wait.max(t1 - t0);
+            max_wait = max_wait.max(t1.wrapping_sub(t0));
         }
-        if start != 0 && t0 >= start + margin && first_after_start.is_none()
+        if start != 0 && t0 >= start.saturating_add(margin) && first_after_start.is_none()
         {
             first_after_start = Some((t0, t1));
         }
@@ -1834,7 +1890,10 @@ fn split_latency_source(ctx: &TestContext) -> Result<u64, &'static str>
     {
         return Err("retype::pool_latency: memory_base has fewer pages available than the source");
     }
-    memory_split(ctx.memory_base, size - need)
+    let keep = size
+        .checked_sub(need)
+        .ok_or("retype::pool_latency: the source is larger than memory_base")?;
+    memory_split(ctx.memory_base, keep)
         .map_err(|_| "retype::pool_latency: memory_split(memory_base) failed")
 }
 
@@ -2048,7 +2107,7 @@ pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
             // one reported. Only a conclusive attempt counts against
             // SEED_ATTEMPTS.
             let mut max_wait_us = 0;
-            let mut conclusive = 0;
+            let mut conclusive = 0u32;
             for _ in 0..SEED_ATTEMPT_LIMIT
             {
                 let m = seed_once(ctx, frame.0, op, source)?;
@@ -2062,7 +2121,7 @@ pub fn pool_seeding_takes_interrupts(ctx: &TestContext) -> TestResult
                 }
                 if !inconclusive
                 {
-                    conclusive += 1;
+                    conclusive = conclusive.saturating_add(1);
                     if conclusive == SEED_ATTEMPTS
                     {
                         break;

@@ -41,29 +41,29 @@ pub fn run(ctx: &TestContext) -> TestResult
 
     let mut chain = [0u64; DEPTH];
     let mut built = 0;
-    while built < DEPTH
+    while let Some(slot) = chain.get_mut(built)
     {
         let Ok(cs) = cap_create_cspace(memory, 0, PAGES_PER_CSPACE)
         else
         {
-            for &cs in &chain[..built]
+            for &cs in chain.iter().take(built)
             {
                 cap_delete(cs).ok();
             }
             return Err("integration::cspace_nested_teardown: cap_create_cspace failed");
         };
-        chain[built] = cs;
-        built += 1;
+        *slot = cs;
+        built = built.saturating_add(1);
     }
 
     // Move each CSpace's capability into its predecessor, deepest first, so
     // every CSpace but the first is referenced only by its predecessor's slot.
-    for i in (1..DEPTH).rev()
+    for (pred_idx, (&pred, &cur)) in chain.iter().zip(chain.iter().skip(1)).enumerate().rev()
     {
-        if cap_move(chain[i], chain[i - 1], 0).is_err()
+        if cap_move(cur, pred, 0).is_err()
         {
             // The CSpaces already moved go down with their holders.
-            for &cs in &chain[..=i]
+            for &cs in chain.iter().take(pred_idx).chain(&[pred, cur])
             {
                 cap_delete(cs).ok();
             }

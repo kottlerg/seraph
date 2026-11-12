@@ -147,12 +147,15 @@ pub const fn entry_stack_pointer(sp: u64) -> u64
 /// Rewrite the `rflags` slot of the register file `regs` (as
 /// `thread_read_regs` returns it, at least [`TRAP_FRAME_BYTES`] long) through
 /// `edit`: the trap-flag edit of the x86-64 cells that step a thread.
-fn edit_rflags(regs: &mut [u8], edit: impl FnOnce(u64) -> u64)
+///
+/// # Errors
+///
+/// A fixed message, with `regs` unchanged, when `regs` ends before the slot.
+fn edit_rflags(regs: &mut [u8], edit: impl FnOnce(u64) -> u64) -> Result<(), &'static str>
 {
     let at = syscall_abi::REGS_X86_64_FLAGS_OFFSET;
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[at..at + 8]);
-    regs[at..at + 8].copy_from_slice(&edit(u64::from_le_bytes(word)).to_le_bytes());
+    let rflags = crate::spawn::reg_word(regs, at)?;
+    crate::spawn::set_reg_word(regs, at, edit(rflags))
 }
 
 /// Byte offset of the syscall-number register (`rax`) in the kernel
@@ -191,7 +194,7 @@ pub fn illegal_instruction() -> !
 #[must_use]
 pub const fn breakpoint_reported_ip(addr: u64) -> u64
 {
-    addr + 1
+    addr.wrapping_add(1)
 }
 
 /// Bytes a handler advances the instruction pointer by to resume past the

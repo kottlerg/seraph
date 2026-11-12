@@ -428,7 +428,9 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   scans must cover slots populated after `aspace_cap` (e.g. narrow
   `IoPort` caps carved by `ioport::bind_port_range` on `x86_64`).
 - `PASS_COUNT` / `FAIL_COUNT` — atomic counters updated by `run_test!`.
-- `log(msg)` / `log_u64(prefix, value)` — heap-free logging utilities.
+- `log(msg)` / `log_u64(prefix, value)` / `log_args(format_args!(…))` —
+  heap-free logging utilities; `log_args` composes a line with `core::fmt` in
+  a stack `Line` of 128 bytes, cut at a character boundary.
 - `UNSCALED_CPUS` / `scaled_bound(base)` / `scaled_polls(base)` — the
   widest CPU count at which ktest's wall-clock bounds and budgets apply as
   written, and a failing bound (a `u32` poll count, for
@@ -450,8 +452,12 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
 - `ChildStack` / `IpcPage` — a child's static 16 KiB stack and page-aligned
   IPC buffer page, declared per test (or, for most stress cells, taken from
   the shared `stress::STRESS_STACKS`) and handed to one thread at a time (the
-  rule in their rustdoc). `ChildStack::used_bytes` reads how deep a stack's
-  deleted threads went, for a cell whose stack only its own child used.
+  rule in their rustdoc). `ChildStack::top_at(addr_of!(STACKS), i)` and
+  `IpcPage::addr_at(addr_of_mut!(PAGES), i)` take element `i` of a `static
+  mut` array of them, failing for an index past its end (`elem_ptr` and
+  `elem_ptr_mut` do the same for any array). `ChildStack::used_bytes` reads
+  how deep a stack's deleted threads went, for a cell whose stack only its own
+  child used.
 - `spawn::redirect_to_entry(regs, entry)` — points a register file read
   from a stopped or fault-blocked child at an `extern "C"` entry, with the stack pointer
   aligned for the entry ABI, for the `thread_write_regs` redirect tests.
@@ -459,7 +465,11 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   the top of the child's stack instead, abandoning the frames it stopped in:
   a cell that redirects one child round after round uses it, since each
   redirect on the stopped stack pointer leaves a call chain behind, and
-  enough rounds overflow the `ChildStack` into the statics below it.
+  enough rounds overflow the `ChildStack` into the statics below it. Both
+  fail, leaving the register file unchanged, when it is too short to hold
+  the registers they write; `spawn::reg_word(regs, at)` and
+  `spawn::set_reg_word(regs, at, value)` read and write one 8-byte register
+  word the same way.
 - `SCRATCH_LOW_BASE` and the crate docs' § Scratch VAs — the VA bands tests
   map, unmap, and reprotect pages of ktest's own address space in, which hold
   none of ktest's own memory; the SAFETY comments of those calls cite them.

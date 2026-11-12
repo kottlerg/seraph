@@ -460,7 +460,7 @@ fn start_suspended_resume_body(
     crate::spawn::redirect_to_entry(
         &mut reg_buf[..],
         suspended_redirect_entry as *const () as u64,
-    );
+    )?;
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at
     // `suspended_redirect_entry`, an `extern "C"` entry that never returns,
@@ -586,7 +586,7 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     // Redirect the child to phase2_entry: its instruction pointer, and its
     // stack pointer aligned for the entry ABI.
     let phase2_ptr = phase2_entry as *const () as u64;
-    crate::spawn::redirect_to_entry(&mut reg_buf[..], phase2_ptr);
+    crate::spawn::redirect_to_entry(&mut reg_buf[..], phase2_ptr)?;
 
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at `phase2_entry`,
@@ -750,7 +750,7 @@ pub fn sched_split_after_slot_reuse(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread::sched_split_after_slot_reuse: cap_info(used after split) failed")?;
     // Baseline predates the derive: one reused slot consumed, two children
     // installed — a net of two over the baseline.
-    if used_split != used_before + 2
+    if Some(used_split) != used_before.checked_add(2)
     {
         return Err(
             "thread::sched_split_after_slot_reuse: split must consume one slot and add two",
@@ -1540,7 +1540,10 @@ fn balance_spawn_spinners(
 
     for i in 0..n
     {
-        BALANCE_OBSERVED_CPU[i].store(u32::MAX, Ordering::Relaxed);
+        BALANCE_OBSERVED_CPU
+            .get(i)
+            .ok_or("balance: spinner index out of range")?
+            .store(u32::MAX, Ordering::Relaxed);
         let sig = cap_create_notification(ctx.memory_base)
             .map_err(|_| "balance: cap_create_notification failed")?;
         let child = crate::spawn::new_child(ctx).map_err(|_| "balance: spawn::new_child failed")?;
@@ -1548,8 +1551,7 @@ fn balance_spawn_spinners(
             cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "balance: cap_copy failed")?;
 
         // Initial pinning to `initial_cpu` forces the first enqueue there.
-        // SAFETY: per-spinner stack slot, no aliasing.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(STACK_BALANCE_SPINNERS[i]) });
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(STACK_BALANCE_SPINNERS), i)?;
         let args = BalanceArgs {
             idx: i,
             sig: child_sig,
@@ -1570,7 +1572,9 @@ fn balance_spawn_spinners(
         }
         .map_err(|_| "balance: configure_and_start_pinned failed")?;
 
-        triples[i] = (child, sig);
+        *triples
+            .get_mut(i)
+            .ok_or("balance: spinner index out of range")? = (child, sig);
     }
 
     // Once started, relax (or fully clear) the affinity. Active migration
@@ -1920,9 +1924,9 @@ extern "C" fn balance_spinner_entry(arg: u64) -> !
     loop
     {
         let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX) as u32;
-        if idx < BALANCE_MAX_SPINNERS
+        if let Some(observed) = BALANCE_OBSERVED_CPU.get(idx)
         {
-            BALANCE_OBSERVED_CPU[idx].store(cpu, Ordering::Relaxed);
+            observed.store(cpu, Ordering::Relaxed);
         }
         if BALANCE_SHOULD_EXIT.load(Ordering::Relaxed) != 0
         {

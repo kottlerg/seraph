@@ -118,9 +118,9 @@ impl Parts
         // Ending the handlers first lets their threads exit before the
         // endpoints go; a handler left blocked is released by the delete of
         // its endpoint (its receive returns InvalidCapability or Interrupted).
-        for (i, badged) in self.badged.iter().enumerate()
+        for (badged, handler) in self.badged.iter().zip(&self.handlers)
         {
-            if let (Some(cap), Some(_)) = (badged, self.handlers[i])
+            if let (Some(cap), Some(_)) = (badged, handler)
             {
                 raw_ipc_call(*cap, QUIT_LABEL, 0, 0).ok();
             }
@@ -166,32 +166,38 @@ pub fn run(ctx: &TestContext) -> TestResult
 fn race(ctx: &TestContext, parts: &mut Parts) -> TestResult
 {
     MISMATCHES.store(0, Ordering::Release);
-    for i in 0..2
+    for (i, ((((served, ep_slot), badged_slot), handler_slot), &handler_badge)) in SERVED
+        .iter()
+        .zip(parts.eps.iter_mut())
+        .zip(parts.badged.iter_mut())
+        .zip(parts.handlers.iter_mut())
+        .zip(BADGES.iter())
+        .enumerate()
     {
-        SERVED[i].store(0, Ordering::Release);
+        served.store(0, Ordering::Release);
         let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "stress::fault_bind_race: cap_create_endpoint failed")?;
-        parts.eps[i] = Some(ep);
-        let badged = cap_derive_badge(ep, RIGHTS_ALL, BADGES[i])
+        *ep_slot = Some(ep);
+        let badged = cap_derive_badge(ep, RIGHTS_ALL, handler_badge)
             .map_err(|_| "stress::fault_bind_race: cap_derive_badge failed")?;
-        parts.badged[i] = Some(badged);
+        *badged_slot = Some(badged);
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::fault_bind_race: create handler failed")?;
-        parts.handlers[i] = Some(th);
+        *handler_slot = Some(th);
         // SAFETY: one publish per handler index, before that handler starts.
         let arg = unsafe {
             HANDLER_ARGS.publish(
                 i,
                 HandlerArgs {
                     ep,
-                    badge: BADGES[i],
+                    badge: handler_badge,
                     index: i,
                 },
             )
         };
-        // SAFETY: `HANDLER_STACKS[i]` is this handler's own stack; the
-        // address is taken without forming a reference.
-        let top = ChildStack::top(unsafe { core::ptr::addr_of!(HANDLER_STACKS[i]) });
+        // `HANDLER_STACKS[i]` is this handler's own stack; the address is
+        // taken without forming a reference.
+        let top = ChildStack::top_at(core::ptr::addr_of!(HANDLER_STACKS), i)?;
         start_pinned(th, handler_entry, top, arg, HANDLER_CPU)?;
     }
     let badged = [
@@ -231,10 +237,10 @@ fn round(ctx: &TestContext, parts: &mut Parts, badged: [u64; 2]) -> TestResult
     start_pinned(th, faulter_entry, top, 0, FAULTER_CPU)?;
 
     // Wait for the first delivery so the races below meet a faulting thread.
-    let mut polls = 0;
+    let mut polls = 0u32;
     while SERVED[0].load(Ordering::Acquire) == served_before
     {
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls > crate::scaled_polls(WAIT_POLLS)
         {
             return Err("stress::fault_bind_race: faulter's first fault never served");
@@ -244,7 +250,7 @@ fn round(ctx: &TestContext, parts: &mut Parts, badged: [u64; 2]) -> TestResult
 
     for n in 0..REBINDS
     {
-        let target = badged[(n & 1) as usize ^ 1];
+        let target = if n & 1 == 0 { badged[1] } else { badged[0] };
         // A refusal means the faulter already died, which no step before
         // the unbind below causes; report it.
         thread_set_fault_handler(th, target, FAULT_CLASS_ALL)
@@ -329,6 +335,12 @@ extern "C" fn handler_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `race` published for this handler.
     let args: HandlerArgs = unsafe { child_args(arg) };
+    let Some(served) = SERVED.get(args.index)
+    else
+    {
+        // The controller's check that every handler served a fault reports it.
+        thread_exit()
+    };
     loop
     {
         match raw_ipc_recv(args.ep)
@@ -339,7 +351,7 @@ extern "C" fn handler_entry(arg: u64) -> !
                 {
                     MISMATCHES.fetch_add(1, Ordering::AcqRel);
                 }
-                SERVED[args.index].fetch_add(1, Ordering::AcqRel);
+                served.fetch_add(1, Ordering::AcqRel);
                 // A reply that fails found the fault cancelled (its faulter
                 // killed), which this test causes by design.
                 raw_ipc_reply(FAULT_REPLY_RESUME, 0, 0).ok();

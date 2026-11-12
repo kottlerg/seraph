@@ -153,7 +153,7 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
-        completed += 1;
+        completed = completed.saturating_add(1);
     }
     notification_wait(done).ok();
 

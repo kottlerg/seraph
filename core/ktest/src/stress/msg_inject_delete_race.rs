@@ -141,7 +141,12 @@ fn aperture_of(ctx: &TestContext, address: u64) -> Option<(u64, u64, u64)>
     let info = unsafe { &*(ctx.init_info_va as *const InitInfo) };
     crate::init_info::descriptors(info)
         .iter()
-        .find(|d| d.cap_type == CapType::Mmio && address >= d.aux0 && address - d.aux0 < d.aux1)
+        .find(|d| {
+            d.cap_type == CapType::Mmio
+                && address
+                    .checked_sub(d.aux0)
+                    .is_some_and(|offset| offset < d.aux1)
+        })
         .map(|d| (d.aux0, d.aux1, d.slot))
 }
 
@@ -164,10 +169,13 @@ fn map_file(
 ) -> Result<u64, &'static str>
 {
     if let Some(m) = *current
-        && address >= m.base
-        && address - m.base < m.pages * PAGE
+        && let Some(offset) = address.checked_sub(m.base)
+        && let Some(span) = m.pages.checked_mul(PAGE)
+        && offset < span
     {
-        return Ok(FILE_VA + (address - m.base));
+        return FILE_VA
+            .checked_add(offset)
+            .ok_or("stress::msg_inject_delete_race: the file VA overflows");
     }
     unmap_file(ctx, current);
     let (base, size, slot) = aperture_of(ctx, address)
@@ -189,7 +197,12 @@ fn map_file(
         return Err("stress::msg_inject_delete_race: mapping the IMSIC aperture failed");
     }
     *current = Some(Mapped { base, pages, cap });
-    Ok(FILE_VA + (address - base))
+    let offset = address
+        .checked_sub(base)
+        .ok_or("stress::msg_inject_delete_race: the address lies below its aperture")?;
+    FILE_VA
+        .checked_add(offset)
+        .ok_or("stress::msg_inject_delete_race: the file VA overflows")
 }
 
 /// Unmap and drop the aperture `current` names, if any.
@@ -234,7 +247,8 @@ fn race(ctx: &TestContext, authority: u64) -> TestResult
     let mut mapped = None;
     let raced = started.and_then(|()| {
         (1..=CYCLES).try_fold(0u32, |armed, round| {
-            round_once(ctx, authority, round, &mut mapped).map(|hit| armed + u32::from(hit))
+            round_once(ctx, authority, round, &mut mapped)
+                .map(|hit| armed.saturating_add(u32::from(hit)))
         })
     });
     WRITE_VA.store(0, Ordering::Release);
@@ -267,10 +281,10 @@ fn race(ctx: &TestContext, authority: u64) -> TestResult
 /// Wait (bounded) until the injector has made `count` writes in all.
 fn await_writes(count: u64) -> TestResult
 {
-    let mut polls = 0;
+    let mut polls = 0u32;
     while WRITES.load(Ordering::Acquire) < count
     {
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls > crate::scaled_polls(WAIT_POLLS)
         {
             return Err("stress::msg_inject_delete_race: the injector stopped writing");
@@ -285,10 +299,10 @@ fn park() -> TestResult
 {
     PARKED.store(0, Ordering::Release);
     WRITE_VA.store(0, Ordering::Release);
-    let mut polls = 0;
+    let mut polls = 0u32;
     while PARKED.load(Ordering::Acquire) == 0
     {
-        polls += 1;
+        polls = polls.saturating_add(1);
         if polls > crate::scaled_polls(WAIT_POLLS)
         {
             return Err("stress::msg_inject_delete_race: the injector never parked");
@@ -349,7 +363,11 @@ fn race_delete(
     }
     IDENTITY.store(identity, Ordering::Release);
     WRITE_VA.store(va, Ordering::Release);
-    await_writes(WRITES.load(Ordering::Acquire) + LEADING_WRITES)?;
+    await_writes(
+        WRITES
+            .load(Ordering::Acquire)
+            .saturating_add(LEADING_WRITES),
+    )?;
     // 0 to 4095 spins (a multiplicative hash of the round), so the delete
     // lands at varying points in the write sequence.
     for _ in 0..(round.wrapping_mul(2_654_435_761) >> 20)
@@ -362,7 +380,7 @@ fn race_delete(
     // Everything delivered up to the delete's return is drained; nothing may
     // follow it.
     let _ = notification_try_wait(sig);
-    await_writes(after + TRAILING_WRITES)?;
+    await_writes(after.saturating_add(TRAILING_WRITES))?;
     park()?;
     if notification_try_wait(sig).is_ok_and(|bits| bits != 0)
     {
@@ -370,7 +388,7 @@ fn race_delete(
     }
     // A write counted after `before` and before `after`, other than one that
     // was already under way at `before`, began and ended inside the delete.
-    Ok(after > before + 1)
+    Ok(after > before.saturating_add(1))
 }
 
 /// Injector: while [`WRITE_VA`] is nonzero, write [`IDENTITY`] to it and count

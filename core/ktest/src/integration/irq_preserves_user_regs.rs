@@ -73,26 +73,32 @@ static mut STACK1: ChildStack = ChildStack::ZERO;
 
 extern "C" fn spinner_entry(id: u64) -> !
 {
-    let idx = usize::from(id & 1 != 0);
-    let other = idx ^ 1;
-    // PATTERN is a read-only static; the index is 0 or 1.
-    let pattern = &PATTERN[idx];
+    // PATTERN is a read-only static; each spinner takes its own pattern and
+    // progress slot, and watches its sibling's.
+    let (pattern, own, sibling) = if id & 1 != 0
+    {
+        (&PATTERN[1], &PROGRESS[1], &PROGRESS[0])
+    }
+    else
+    {
+        (&PATTERN[0], &PROGRESS[0], &PROGRESS[1])
+    };
     let budget_us = crate::scaled_bound(TIME_BUDGET_US);
     let start_us = system_info(SystemInfoType::ElapsedUs as u64).unwrap_or(0);
     let mut c: u64 = 0;
     while c < MAX_CHUNKS
     {
-        let sibling_before = PROGRESS[other].load(Ordering::Acquire);
+        let sibling_before = sibling.load(Ordering::Acquire);
         if crate::arch::callee_saved::spin_check(pattern, CHUNK_ITERS) != 0
         {
             MISMATCHES.fetch_add(1, Ordering::AcqRel);
             break;
         }
-        c += 1;
-        PROGRESS[idx].store(c, Ordering::Release);
+        c = c.saturating_add(1);
+        own.store(c, Ordering::Release);
         // The sibling advanced a chunk while this thread held the CPU ⇒ the timer
         // time-sliced them on the one CPU ⇒ the ring-3 IRQ frame path ran.
-        if PROGRESS[other].load(Ordering::Acquire) != sibling_before
+        if sibling.load(Ordering::Acquire) != sibling_before
         {
             PREEMPT_OBSERVED.store(1, Ordering::Release);
         }
@@ -140,7 +146,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     while DONE.load(Ordering::Acquire) < 2 && waited_ms < done_wait_ms
     {
         let _ = thread_sleep(10); // 10 ms
-        waited_ms += 10;
+        waited_ms = waited_ms.saturating_add(10);
     }
 
     let done = DONE.load(Ordering::Acquire);

@@ -252,7 +252,12 @@ fn syscall_delivery(ctx: &TestContext, th: u64, ep_up: u64) -> TestResult
     expect_upcall(ctx, ep_up, 0x5150_0001, UPCALL_POINT_SYSCALL)?;
     let before = YIELDS.load(Ordering::Acquire);
     reply_resume(ctx)?;
-    wait_for(&YIELDS, before + 1)
+    wait_for(
+        &YIELDS,
+        before
+            .checked_add(1)
+            .ok_or("integration::thread_upcall: yield count overflows")?,
+    )
 }
 
 /// Phase 3: a post during a delivery, and a post to a stopped thread.
@@ -311,7 +316,7 @@ fn any_instruction(ctx: &TestContext, parts: &mut Parts, ep_up: u64, sig: u64) -
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::thread_upcall: thread_read_regs failed")?;
-    spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64);
+    spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64)?;
     // SAFETY: the frame was read from this child, so its stack pointer lies on
     // the child's own `ChildStack`; `redirect_to_entry` pointed it at
     // `recovery_entry`, an `extern "C"` entry that never returns, with the
@@ -405,7 +410,7 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::thread_upcall: thread_read_regs (fault) failed")?;
-    spawn::redirect_to_entry(&mut regs[..], fault_yield_entry as *const () as u64);
+    spawn::redirect_to_entry(&mut regs[..], fault_yield_entry as *const () as u64)?;
     // SAFETY: as in phase 5; `fault_yield_entry` never returns.
     unsafe { thread_write_regs(th, &regs[..BUF]) }
         .map_err(|_| "integration::thread_upcall: thread_write_regs (fault) failed")?;
@@ -425,7 +430,12 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
     }
     thread_start(th).map_err(|_| "integration::thread_upcall: thread_start failed")?;
     let before = FAULT_YIELDS.load(Ordering::Acquire);
-    wait_for(&FAULT_YIELDS, before + 1)?;
+    wait_for(
+        &FAULT_YIELDS,
+        before
+            .checked_add(1)
+            .ok_or("integration::thread_upcall: fault-yield count overflows")?,
+    )?;
     thread_post_upcall(th, 0x5150_0009, 0)
         .map_err(|_| "integration::thread_upcall: post after a dropped upcall failed")?;
     expect_upcall(ctx, ep_up, 0x5150_0009, UPCALL_POINT_SYSCALL)?;
@@ -438,15 +448,24 @@ fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> 
 {
     for (k, ep) in eps.into_iter().enumerate()
     {
-        let index = 8 + k;
-        let cookie = 0x5150_0020 + k as u64;
+        let (Some(index), Some(cookie), Some(call_ep), Some(stage), Some(result)) = (
+            k.checked_add(8),
+            0x5150_0020u64.checked_add(k as u64),
+            CALL_EP.get(k),
+            CALL_STAGE.get(k),
+            CALL_RESULT.get(k),
+        )
+        else
+        {
+            return Err("integration::thread_upcall: call arm index out of range");
+        };
         let th = spawn_child(ctx, parts, index)?;
         bind_upcall(th, ep_up)?;
         let slot = cap_copy(ep, child_cs(parts, index)?, RIGHTS_EP_SEND)
             .map_err(|_| "integration::thread_upcall: cap_copy endpoint failed")?;
-        CALL_EP[k].store(slot, Ordering::Release);
+        call_ep.store(slot, Ordering::Release);
         start_child(parts, index, call_entry, k as u64)?;
-        wait_for(&CALL_STAGE[k], 1)?;
+        wait_for(stage, 1)?;
         if k == 1
         {
             // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.
@@ -466,8 +485,8 @@ fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> 
         }
         expect_upcall(ctx, ep_up, cookie, UPCALL_POINT_SYSCALL)?;
         reply_resume(ctx)?;
-        wait_for(&CALL_STAGE[k], 2)?;
-        if CALL_RESULT[k].load(Ordering::Acquire) != RESULT_INTERRUPTED
+        wait_for(stage, 2)?;
+        if result.load(Ordering::Acquire) != RESULT_INTERRUPTED
         {
             return Err("integration::thread_upcall: an interrupted call did not fail Interrupted");
         }
@@ -554,7 +573,10 @@ fn upcall_only_posts(ctx: &TestContext, cap: u64, ep_up: u64) -> TestResult
 /// started by [`start_child`].
 fn spawn_child(ctx: &TestContext, parts: &mut Parts, index: usize) -> Result<u64, &'static str>
 {
-    let child = parts.children[index]
+    let child = parts
+        .children
+        .get_mut(index)
+        .ok_or("integration::thread_upcall: child index out of range")?
         .insert(spawn::new_child(ctx).map_err(|_| "integration::thread_upcall: spawn failed")?);
     Ok(child.th)
 }
@@ -562,8 +584,10 @@ fn spawn_child(ctx: &TestContext, parts: &mut Parts, index: usize) -> Result<u64
 /// The `CSpace` of child `index`.
 fn child_cs(parts: &Parts, index: usize) -> Result<u64, &'static str>
 {
-    Ok(parts.children[index]
-        .as_ref()
+    Ok(parts
+        .children
+        .get(index)
+        .and_then(Option::as_ref)
         .ok_or("integration::thread_upcall: no child")?
         .cs)
 }
@@ -572,12 +596,12 @@ fn child_cs(parts: &Parts, index: usize) -> Result<u64, &'static str>
 fn start_child(parts: &Parts, index: usize, entry: extern "C" fn(u64) -> !, arg: u64)
 -> TestResult
 {
-    let child = parts.children[index]
-        .as_ref()
+    let child = parts
+        .children
+        .get(index)
+        .and_then(Option::as_ref)
         .ok_or("integration::thread_upcall: no child")?;
-    // SAFETY: stack `index` belongs to this child, deleted before this test
-    // returns.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(STACKS[index]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(STACKS), index)?;
     // SAFETY: the stack is `STACKS[index]`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, arg) }
@@ -663,9 +687,19 @@ extern "C" fn call_entry(k: u64) -> !
     // cast_possible_truncation: k is 0 or 1, the index start_child passed.
     #[allow(clippy::cast_possible_truncation)]
     let k = k as usize;
-    // SAFETY: page `k` belongs to this child alone (one calling child per
-    // page, each run once), and no reference to it is formed.
-    let buf = unsafe { core::ptr::addr_of_mut!(CALL_PAGES[k]) }.cast::<u64>();
+    let (Some(page), Some(stage), Some(result), Some(call_ep)) = (
+        crate::elem_ptr_mut(core::ptr::addr_of_mut!(CALL_PAGES), k),
+        CALL_STAGE.get(k),
+        CALL_RESULT.get(k),
+        CALL_EP.get(k),
+    )
+    else
+    {
+        syscall::thread_exit()
+    };
+    // Page `k` belongs to this child alone (one calling child per page, each
+    // run once), and no reference to it is formed.
+    let buf = page.cast::<u64>();
     // SAFETY: `buf` is this thread's own page-aligned IPC page, registered by
     // one thread at a time; no Rust object lives in it, and the thread
     // reaches it only through the raw `buf` pointer.
@@ -673,12 +707,12 @@ extern "C" fn call_entry(k: u64) -> !
     {
         syscall::thread_exit()
     }
-    CALL_STAGE[k].store(1, Ordering::Release);
-    let ep = CALL_EP[k].load(Ordering::Acquire);
+    stage.store(1, Ordering::Release);
+    let ep = call_ep.load(Ordering::Acquire);
     // SAFETY: `buf` was registered as this thread's IPC buffer above.
     let called = unsafe { ipc::ipc_call(ep, &IpcMessage::new(0), buf) };
-    CALL_RESULT[k].store(result_word(called.map(|_| 0)), Ordering::Release);
-    CALL_STAGE[k].store(2, Ordering::Release);
+    result.store(result_word(called.map(|_| 0)), Ordering::Release);
+    stage.store(2, Ordering::Release);
     loop
     {
         core::hint::spin_loop();

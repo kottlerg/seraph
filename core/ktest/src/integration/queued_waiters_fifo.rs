@@ -237,7 +237,8 @@ fn head_expires(p: &mut Phase, ctx: &TestContext) -> TestResult
     // if that time lies short of A's earliest deadline. A start too slow for
     // that, or an expiry A already reported, leaves the order unknown.
     let b_settled_ms = elapsed_us()?.saturating_sub(before_a) / 1000;
-    if p.returned(Waiter::A) || b_settled_ms + EXPIRE_SLACK_MS >= crate::scaled_bound(EXPIRE_MS)
+    if p.returned(Waiter::A)
+        || b_settled_ms.saturating_add(EXPIRE_SLACK_MS) >= crate::scaled_bound(EXPIRE_MS)
     {
         return Err(INCONCLUSIVE);
     }
@@ -311,10 +312,14 @@ impl Phase
     {
         let index = waiter.index();
         // Stored before anything can fail, so teardown reaps it.
-        let child = self.children[index].insert(
-            spawn::new_child(ctx)
-                .map_err(|_| "integration::queued_waiters_fifo: spawn child failed")?,
-        );
+        let child = self
+            .children
+            .get_mut(index)
+            .ok_or("integration::queued_waiters_fifo: child index out of range")?
+            .insert(
+                spawn::new_child(ctx)
+                    .map_err(|_| "integration::queued_waiters_fifo: spawn child failed")?,
+            );
         let cs = child.cs;
         let c_obj = cap_copy(self.obj_cap, cs, RIGHTS_ALL)
             .map_err(|_| "integration::queued_waiters_fifo: cap_copy object failed")?;
@@ -336,8 +341,7 @@ impl Phase
                 },
             )
         };
-        // SAFETY: stack `index` is this child's; reaped before the next phase.
-        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CHILD_STACKS[index]) });
+        let stack = ChildStack::top_at(core::ptr::addr_of!(CHILD_STACKS), index)?;
         // SAFETY: the stack is `CHILD_STACKS[index]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(child, child_entry, stack, arg) }

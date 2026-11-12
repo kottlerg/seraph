@@ -108,7 +108,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut result = spawn_children(ctx, cs, &mut children, &mut created)
         .and_then(|()| timed_waits_take_their_timeout(ctx));
     // Deleting a holder cancels its sleep and removes its entry.
-    for &th in &children[..created]
+    for &th in children.iter().take(created)
     {
         if cap_delete(th).is_err() && result.is_ok()
         {
@@ -152,8 +152,10 @@ fn spawn_children(
         }
         let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
             .map_err(|_| "stress::sleep_list_wide: create child failed")?;
-        children[i] = th;
-        *created = i + 1;
+        *children
+            .get_mut(i)
+            .ok_or("stress::sleep_list_wide: child index out of range")? = th;
+        *created = i.saturating_add(1);
         let entry: extern "C" fn(u64) -> ! = if i < HOLDERS
         {
             holder_entry
@@ -162,11 +164,15 @@ fn spawn_children(
         {
             waker_entry
         };
-        // SAFETY: element i is this child's alone (see STACKS).
-        let base = unsafe { core::ptr::addr_of!(STACKS[i]) } as u64;
-        // SAFETY: `base + 4096` tops `STACKS[i]`, this child's own stack, on
+        // element i is this child's alone (see STACKS).
+        let base = crate::elem_ptr(core::ptr::addr_of!(STACKS), i)
+            .ok_or("stress::sleep_list_wide: stack index out of range")? as u64;
+        let top = base
+            .checked_add(4096)
+            .ok_or("stress::sleep_list_wide: stack top overflows")?;
+        // SAFETY: `top` tops `STACKS[i]`, this child's own stack, on
         // which no other live thread runs.
-        unsafe { spawn::configure_and_start_thread(th, entry, base + 4096, i as u64) }
+        unsafe { spawn::configure_and_start_thread(th, entry, top, i as u64) }
             .map_err(|_| "stress::sleep_list_wide: start child failed")?;
     }
     await_count(
@@ -251,7 +257,7 @@ extern "C" fn waker_entry(arg: u64) -> !
 {
     for round in 0..ROUNDS
     {
-        if thread_sleep(1 + (arg + round) % 4).is_err()
+        if thread_sleep((arg.saturating_add(round) % 4).saturating_add(1)).is_err()
         {
             BAD.fetch_add(1, Ordering::AcqRel);
         }

@@ -27,18 +27,6 @@ use crate::{ChildStack, TestContext, TestResult};
 const NUM_WORKERS: usize = 64;
 const ITERS_PER_WORKER: u64 = 1000;
 const ALL_BITS: u64 = u64::MAX;
-const fn worker_bits() -> [u64; NUM_WORKERS]
-{
-    let mut bits = [0u64; NUM_WORKERS];
-    let mut i = 0;
-    while i < NUM_WORKERS
-    {
-        bits[i] = 1u64 << i;
-        i += 1;
-    }
-    bits
-}
-const WORKER_BIT: [u64; NUM_WORKERS] = worker_bits();
 
 /// Per-worker arguments, handed to `worker_entry` by address.
 #[derive(Clone, Copy)]
@@ -96,8 +84,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
 
-        // SAFETY: stress tests run sequentially; each worker uses a distinct stack.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        // stress tests run sequentially; each worker uses a distinct stack.
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
         // stack is this child's own, on which no other live thread runs (`ChildStack`'s
         // rule, as noted where the stack is chosen).
@@ -145,7 +133,7 @@ extern "C" fn worker_entry(arg: u64) -> !
         done: done_slot,
         bit_index,
     } = unsafe { child_args(arg) };
-    let bit = WORKER_BIT[bit_index.min(NUM_WORKERS - 1)];
+    let bit = 1u64 << bit_index.min(NUM_WORKERS - 1);
 
     for _ in 0..ITERS_PER_WORKER
     {

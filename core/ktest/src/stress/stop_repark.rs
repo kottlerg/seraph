@@ -385,10 +385,10 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_repark: create thread failed")?,
     );
-    // SAFETY: stress stacks 0 and 1 belong to this test's waiter and sender;
+    // stress stacks 0 and 1 belong to this test's waiter and sender;
     // stress tests run sequentially, and a phase reuses them only after the
     // previous phase's children exited and were deleted.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -401,7 +401,7 @@ fn create_thread(
 /// until it has entered a new wait. Returns the rounds that timed out.
 fn rounds(waiter: u64) -> Result<u32, &'static str>
 {
-    let mut starved = 0;
+    let mut starved = 0u32;
     for cycle in 0..CYCLES
     {
         thread_stop(waiter).map_err(|e| {
@@ -423,7 +423,7 @@ fn rounds(waiter: u64) -> Result<u32, &'static str>
         })?;
         if !await_entry(entered)
         {
-            starved += 1;
+            starved = starved.saturating_add(1);
         }
         // 0 to 1023 spins after the entry, so the stop lands around the
         // sender's delivery.
@@ -452,7 +452,7 @@ fn await_entry(entered: u32) -> bool
         }
         if spins < ENTRY_SPINS
         {
-            spins += 1;
+            spins = spins.saturating_add(1);
             core::hint::spin_loop();
         }
         else
@@ -488,16 +488,17 @@ fn final_check(kind: Kind, sources: [u64; SOURCES]) -> TestResult
     for _ in 0..crate::scaled_polls(FINAL_POLLS)
     {
         let mut done = true;
-        for (index, &source) in sources.iter().enumerate()
+        for (((&source, value), delivered), base_count) in
+            sources.iter().zip(VALUES).zip(&DELIVERED).zip(base)
         {
-            if DELIVERED[index].load(Ordering::Acquire) != base[index]
+            if delivered.load(Ordering::Acquire) != base_count
             {
                 continue;
             }
             done = false;
             // A queue the waiter no longer drains fills up; the verdict
             // below reports that.
-            if let Err(e) = deliver(kind, source, VALUES[index])
+            if let Err(e) = deliver(kind, source, value)
                 && e != SyscallError::QueueFull as i64
             {
                 log_error("ktest: stress::stop_repark final delivery error=", e);
@@ -530,11 +531,11 @@ fn finish(kind: Kind, sources: [u64; SOURCES]) -> TestResult
         {
             return Ok(());
         }
-        for (index, &source) in sources.iter().enumerate()
+        for (&source, value) in sources.iter().zip(VALUES)
         {
             // A failed delivery here (a full queue, say) is only a missed
             // wake-up; the next poll delivers again.
-            let _ = deliver(kind, source, VALUES[index]);
+            let _ = deliver(kind, source, value);
         }
         thread_sleep(1).map_err(|_| "stress::stop_repark: exit poll sleep failed")?;
     }
@@ -593,18 +594,19 @@ extern "C" fn waiter_entry(arg: u64) -> !
     let ChildArgs { kind, sources } = unsafe { spawn::child_args(arg) };
     while QUIT.load(Ordering::Acquire) == 0
     {
-        for (index, &source) in sources.iter().enumerate()
+        for (((&source, value), delivered), interrupted) in
+            sources.iter().zip(VALUES).zip(&DELIVERED).zip(&INTERRUPTED)
         {
             WAITS_ENTERED.fetch_add(1, Ordering::AcqRel);
             match wait(kind, source)
             {
-                Ok(value) if value == VALUES[index] =>
+                Ok(got) if got == value =>
                 {
-                    DELIVERED[index].fetch_add(1, Ordering::AcqRel);
+                    delivered.fetch_add(1, Ordering::AcqRel);
                 }
                 Err(e) if e == SyscallError::Interrupted as i64 =>
                 {
-                    INTERRUPTED[index].fetch_add(1, Ordering::AcqRel);
+                    interrupted.fetch_add(1, Ordering::AcqRel);
                 }
                 other =>
                 {
@@ -668,7 +670,14 @@ fn serve(kind: Kind, sources: [u64; SOURCES], entered: u32)
     {
         return;
     }
-    if let Err(e) = deliver(kind, sources[index], VALUES[index])
+    let (Some(&source), Some(&value)) = (sources.get(index), VALUES.get(index))
+    else
+    {
+        // No source for the index: the controller's check fails on the record.
+        BAD_SENDS.record(u64::MAX);
+        return;
+    };
+    if let Err(e) = deliver(kind, source, value)
     {
         BAD_SENDS.record_error(e);
     }

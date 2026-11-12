@@ -109,8 +109,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
 
-        // SAFETY: stress tests run sequentially; each producer gets its own stack.
-        let stack_top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[i]) });
+        // Stress tests run sequentially; each producer gets its own stack.
+        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&child, producer_entry, stack_top, arg) }
@@ -139,11 +139,15 @@ pub fn run(ctx: &TestContext) -> TestResult
         {
             return Err("concurrent_event_producers: seq out of range");
         }
-        if per_producer[producer_id][seq]
+        let seen = per_producer
+            .get_mut(producer_id)
+            .and_then(|row| row.get_mut(seq))
+            .ok_or("concurrent_event_producers: (producer, seq) out of range")?;
+        if *seen
         {
             return Err("concurrent_event_producers: duplicate (producer, seq)");
         }
-        per_producer[producer_id][seq] = true;
+        *seen = true;
     }
 
     // Wait for all producers to signal done.

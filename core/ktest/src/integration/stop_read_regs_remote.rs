@@ -216,7 +216,7 @@ fn redirect(child: &SpawnedChild, round: u32) -> TestResult
     ROUND.store(round, Ordering::Release);
     let target = redirected_entry as *const () as u64;
     let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
-    crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top);
+    crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top)?;
     // SAFETY: `redirect_to_entry_at` pointed the frame at `redirected_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the
     // abandoned frames, with the stack pointer at the entry ABI's alignment
@@ -284,7 +284,7 @@ fn await_within(bound_us: u64, done: impl Fn() -> bool) -> Result<bool, &'static
         }
         if polls < BUSY_POLLS
         {
-            polls += 1;
+            polls = polls.saturating_add(1);
             core::hint::spin_loop();
         }
         else

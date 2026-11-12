@@ -275,7 +275,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 {
     for (i, spec) in CASES.iter().enumerate()
     {
-        let page = CASE_VA_BASE + 2 * PAGE_SIZE * i as u64;
+        let page = (i as u64)
+            .checked_mul(2 * PAGE_SIZE)
+            .and_then(|span| CASE_VA_BASE.checked_add(span))
+            .ok_or("fault_syscall_buffer: case page past the address space")?;
         run_case(ctx, spec, page).inspect_err(|_| crate::log(spec.name))?;
     }
     Ok(())
@@ -366,7 +369,10 @@ impl Case
             unsafe { crate::frame_pool::free(mem) };
             return Err("fault_syscall_buffer: mem_map failed");
         }
-        self.frames[slot] = Some((va, mem));
+        *self
+            .frames
+            .get_mut(slot)
+            .ok_or("fault_syscall_buffer: frame slot out of range")? = Some((va, mem));
         if flags & MAP_WRITABLE != 0
         {
             // SAFETY: the page at `va` is mapped writable just above and holds
@@ -387,6 +393,9 @@ fn run_case(ctx: &TestContext, spec: &Spec, page: u64) -> TestResult
     let mut case = Case::new(ctx)?;
     let (ep, done, ws) = (case.ep, case.done, case.ws);
 
+    let buf = page
+        .checked_add(spec.offset)
+        .ok_or("fault_syscall_buffer: call buffer past the address space")?;
     // The first unmapped byte the copy reaches, which the fault must name.
     let fault_va = match spec.premap
     {
@@ -395,14 +404,15 @@ fn run_case(ctx: &TestContext, spec: &Spec, page: u64) -> TestResult
             case.map(0, page, flags)?;
             if flags & MAP_WRITABLE != 0
             {
-                page + PAGE_SIZE
+                page.checked_add(PAGE_SIZE)
+                    .ok_or("fault_syscall_buffer: case page past the address space")?
             }
             else
             {
                 page
             }
         }
-        None => page + spec.offset,
+        None => buf,
     };
 
     let helper = if spec.call == Call::Getrandom
@@ -442,7 +452,7 @@ fn run_case(ctx: &TestContext, spec: &Spec, page: u64) -> TestResult
                     spec.answer,
                     Answer::RedirectDecline | Answer::RedirectResume
                 ),
-                buf: page + spec.offset,
+                buf,
                 len: spec.len,
                 done: c_done,
                 helper: c_helper,
@@ -484,11 +494,9 @@ fn run_case(ctx: &TestContext, spec: &Spec, page: u64) -> TestResult
 }
 
 /// The instruction pointer `regs`, a register file, holds.
-fn frame_ip(regs: &[u8]) -> u64
+fn frame_ip(regs: &[u8]) -> Result<u64, &'static str>
 {
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&regs[crate::arch::IP_OFFSET..crate::arch::IP_OFFSET + 8]);
-    u64::from_le_bytes(word)
+    crate::spawn::reg_word(regs, crate::arch::IP_OFFSET)
 }
 
 /// Check that `msg` is the kernel's fault message for the copy of `spec` at
@@ -525,7 +533,7 @@ fn check_fault(msg: &IpcMessage, spec: &Spec, fault_va: u64, regs: &[u8]) -> Tes
     {
         return Err("fault_syscall_buffer: the fault's present bit is wrong for the page");
     }
-    if msg.word(3) != frame_ip(regs)
+    if msg.word(3) != frame_ip(regs)?
     {
         return Err("fault_syscall_buffer: the fault's instruction pointer is not the frame's");
     }
@@ -573,7 +581,7 @@ fn answer_fault(
         Answer::Decline => FAULT_REPLY_KILL,
         Answer::RedirectDecline | Answer::RedirectResume =>
         {
-            crate::spawn::redirect_to_entry(regs, landing as *const () as u64);
+            crate::spawn::redirect_to_entry(regs, landing as *const () as u64)?;
             // SAFETY: the frame resumes the fault-blocked child, bound to
             // ktest's address space, at `landing` on its own stack
             // (`redirect_to_entry`), code the child may run there.

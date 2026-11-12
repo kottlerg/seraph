@@ -453,10 +453,10 @@ fn create_thread(
         cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
             .map_err(|_| "stress::stop_fault_sender: create thread failed")?,
     );
-    // SAFETY: stress stacks 0, 1, and 2 belong to this test's faulter,
+    // stress stacks 0, 1, and 2 belong to this test's faulter,
     // handler, and syncer; stress tests run sequentially, and the faulter's
     // stack is reused only after the thread on it exited and was deleted.
-    let top = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[stack]) });
+    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -608,11 +608,11 @@ fn stop_and_restart(th: u64, handler: u64, tally: &mut Tally) -> Result<Option<u
     let in_fault = ATTEMPTS.load(Ordering::Acquire) != PROGRESS.load(Ordering::Acquire);
     if in_fault
     {
-        tally.stopped_in_fault += 1;
+        tally.stopped_in_fault = tally.stopped_in_fault.saturating_add(1);
     }
     if RESUMED.load(Ordering::Acquire) != resumed
     {
-        tally.reply_during_stop += 1;
+        tally.reply_during_stop = tally.reply_during_stop.saturating_add(1);
     }
     let before = PROGRESS.load(Ordering::Acquire);
     if let Err(e) = thread_start(th)
@@ -634,7 +634,7 @@ fn stop_and_restart(th: u64, handler: u64, tally: &mut Tally) -> Result<Option<u
         {
             if in_fault
             {
-                tally.survived_in_fault += 1;
+                tally.survived_in_fault = tally.survived_in_fault.saturating_add(1);
             }
             Ok(None)
         }
@@ -678,7 +678,7 @@ fn await_faulter(
             }
             if elapsed_us()?.saturating_sub(start) > ROUND_WAIT_US
             {
-                tally.starved += 1;
+                tally.starved = tally.starved.saturating_add(1);
                 return Ok(Wait::Expired);
             }
         }
@@ -715,7 +715,7 @@ fn faulter_died(ctx: &TestContext, parts: &mut Parts, tally: &mut Tally, reason:
                     cancelled fault",
         );
     }
-    tally.killed += 1;
+    tally.killed = tally.killed.saturating_add(1);
     call_handler(parts, SYNC_LABEL)?;
     // SAFETY: `RESERVED_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
@@ -809,7 +809,7 @@ fn finish(parts: &mut Parts, tally: &mut Tally) -> TestResult
             .map_err(|_| "stress::stop_fault_sender: the faulter did not exit")?;
         if reason == EXIT_FAULT_BASE + crate::arch::PAGE_FAULT_STORE_VECTOR
         {
-            tally.killed += 1;
+            tally.killed = tally.killed.saturating_add(1);
         }
         else if reason != EXIT_VOLUNTARY
         {

@@ -83,7 +83,7 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         result = funded_by_destination(ctx, copies[1]);
     }
-    for &c in &copies[..made]
+    for &c in copies.iter().take(made)
     {
         cap_delete(c).ok();
     }
@@ -103,9 +103,12 @@ fn many_copies(root: u64, copies: &mut [u64; COPIES], made: &mut usize) -> TestR
         {
             copies[0]
         };
-        copies[*made] = cap_derive(src, RIGHTS_ALL)
+        let copy = cap_derive(src, RIGHTS_ALL)
             .map_err(|_| "integration::range_copy_lineage: a copy was refused")?;
-        *made += 1;
+        *copies
+            .get_mut(*made)
+            .ok_or("integration::range_copy_lineage: copy index out of range")? = copy;
+        *made = made.saturating_add(1);
     }
     // The root goes; its copies keep the lineage.
     cap_delete(root).map_err(|_| "integration::range_copy_lineage: cap_delete(root) failed")?;
@@ -161,7 +164,7 @@ fn outlives_funder(ctx: &TestContext, source: u64, cs: u64, frame: u64) -> TestR
     {
         return Err("integration::range_copy_lineage: a copy outliving its funder is unusable");
     }
-    if base_after != base_before + PAGE
+    if Some(base_after) != base_before.checked_add(PAGE)
     {
         return Err("integration::range_copy_lineage: the kept arena page did not return");
     }

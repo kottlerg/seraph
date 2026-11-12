@@ -161,7 +161,10 @@ pub fn run(ctx: &TestContext) -> TestResult
         // Different CPU from the server: the dealloc-free and the client's
         // wake-enqueue must run on different cores to exercise the cross-CPU
         // strand. With cpus >= 2, `(slot + 1) % cpus != slot`.
-        let client_cpu = (server_cpu + 1) % cpu_mod;
+        let client_cpu = server_cpu
+            .saturating_add(1)
+            .checked_rem(cpu_mod)
+            .ok_or("stress::cap_delete_reply_wake: no CPUs")?;
 
         let ep = cap_create_endpoint(ctx.memory_base)
             .map_err(|_| "stress::cap_delete_reply_wake: cap_create_endpoint failed")?;
@@ -256,7 +259,7 @@ pub fn run(ctx: &TestContext) -> TestResult
             BIT_SERVER_ARMED,
             "stress::cap_delete_reply_wake: server never reported armed",
         )?;
-        armed_cycles += 1;
+        armed_cycles = armed_cycles.saturating_add(1);
 
         // Delete the server Thread cap. This drives `dealloc_object(Thread)`,
         // which owes the orphaned client its deferred `Interrupted` wake.
@@ -283,7 +286,7 @@ pub fn run(ctx: &TestContext) -> TestResult
                  result (garbage reply — #361 disposition clobber)",
             );
         }
-        woke_cycles += 1;
+        woke_cycles = woke_cycles.saturating_add(1);
 
         // ── Per-cycle cleanup. ──────────────────────────────────────────────
         // The server Thread cap is already deleted; reap the rest. The client

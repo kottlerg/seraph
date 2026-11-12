@@ -312,9 +312,13 @@ fn spawn_child(
     objects: &Objects,
 ) -> Result<u64, &'static str>
 {
-    let child = parts.children[index].insert(
-        spawn::new_child(ctx).map_err(|_| "integration::fault_class_bindings: spawn failed")?,
-    );
+    let child = parts
+        .children
+        .get_mut(index)
+        .ok_or("integration::fault_class_bindings: child index out of range")?
+        .insert(
+            spawn::new_child(ctx).map_err(|_| "integration::fault_class_bindings: spawn failed")?,
+        );
     let child_sig = cap_copy(objects.sig, child.cs, RIGHTS_NTF_NOTIFY)
         .map_err(|_| "integration::fault_class_bindings: cap_copy notification failed")?;
     RECOVERY_SIG.store(child_sig, Ordering::Release);
@@ -324,12 +328,12 @@ fn spawn_child(
 /// Configure and start child `index` at `entry`.
 fn start_child(parts: &Parts, index: usize, entry: extern "C" fn(u64) -> !) -> TestResult
 {
-    let child = parts.children[index]
-        .as_ref()
+    let child = parts
+        .children
+        .get(index)
+        .and_then(Option::as_ref)
         .ok_or("integration::fault_class_bindings: no child")?;
-    // SAFETY: stack `index` belongs to this child, deleted before this test
-    // returns.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(STACKS[index]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(STACKS), index)?;
     // SAFETY: the stack is `STACKS[index]`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, 0) }
@@ -396,7 +400,7 @@ fn expect_exit(th: u64, vector: u64) -> TestResult
 {
     let reason = spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))
         .map_err(|_| "integration::fault_class_bindings: child never exited")?;
-    if reason != EXIT_FAULT_BASE + vector
+    if Some(reason) != EXIT_FAULT_BASE.checked_add(vector)
     {
         return Err("integration::fault_class_bindings: child exited with the wrong reason");
     }
@@ -422,7 +426,7 @@ fn resume_into_recovery(ctx: &TestContext, th: u64, sig: u64) -> TestResult
     let mut regs = [0u8; BUF];
     thread_read_regs(th, &mut regs[..BUF])
         .map_err(|_| "integration::fault_class_bindings: thread_read_regs failed")?;
-    spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64);
+    spawn::redirect_to_entry(&mut regs[..], recovery_entry as *const () as u64)?;
     // SAFETY: the frame was read from this child, so its stack pointer lies
     // on the child's own `ChildStack`; `redirect_to_entry` pointed it at
     // `recovery_entry`, an `extern "C"` entry that never returns, with the

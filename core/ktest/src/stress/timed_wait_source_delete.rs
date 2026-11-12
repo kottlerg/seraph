@@ -125,7 +125,7 @@ fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
     {
         match one_cycle(ctx, done, cycle, cpus)
         {
-            Ok(true) => interrupted += 1,
+            Ok(true) => interrupted = interrupted.saturating_add(1),
             Ok(false) =>
             {}
             Err(e) =>
@@ -210,7 +210,15 @@ fn race(
     let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
     // The waiter alternates between CPU 0, which runs the timer, and a CPU
     // other than the controller's 1 (CPU 0 again on a 2-CPU run).
-    let waiter_cpu = if (cycle >> 1) & 1 == 0 { 0 } else { 2 % cpus };
+    let waiter_cpu = if (cycle >> 1) & 1 == 0
+    {
+        0
+    }
+    else
+    {
+        2u32.checked_rem(cpus)
+            .ok_or("stress::timed_wait_source_delete: CpuCount is zero")?
+    };
     // SAFETY: entry 0 < 1; the previous cycle's waiter was deleted before
     // this cycle began.
     let arg = unsafe {

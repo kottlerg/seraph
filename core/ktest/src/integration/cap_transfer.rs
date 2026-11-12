@@ -126,11 +126,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Transferred cap handles live on the returned IpcMessage.
     let caps = msg.caps();
     crate::log_u64("cap_transfer: cap_count=", caps.len() as u64);
-    if caps.len() != 1
+    let &[recv_sig] = caps
+    else
     {
         return Err("integration::cap_transfer: expected exactly 1 transferred cap");
-    }
-    let recv_sig = caps[0];
+    };
     crate::log_u64("cap_transfer: recv_sig slot=", recv_sig);
 
     // Verify the transferred cap is usable.

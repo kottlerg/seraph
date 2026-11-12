@@ -166,7 +166,10 @@ fn split_in(ctx: &TestContext, cs: u64) -> Result<Funded, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
-    let piece = memory_split(ctx.memory_base, size - 2 * PAGE)
+    let split_at = size
+        .checked_sub(2 * PAGE)
+        .ok_or("integration::arena_reclaim: memory_base smaller than two pages")?;
+    let piece = memory_split(ctx.memory_base, split_at)
         .map_err(|_| "integration::arena_reclaim: memory_split(memory_base) failed")?;
     let in_cs =
         cap_move(piece, cs, 0).map_err(|_| "integration::arena_reclaim: cap_move(piece) failed")?;
@@ -455,7 +458,11 @@ fn split_piece(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
 {
     let size = cap_info(ctx.memory_base, CAP_INFO_MEMORY_SIZE)
         .map_err(|_| "integration::arena_reclaim: cap_info(memory_base) failed")?;
-    memory_split(ctx.memory_base, size - pages * PAGE)
+    let split_at = pages
+        .checked_mul(PAGE)
+        .and_then(|bytes| size.checked_sub(bytes))
+        .ok_or("integration::arena_reclaim: piece larger than memory_base")?;
+    memory_split(ctx.memory_base, split_at)
         .map_err(|_| "integration::arena_reclaim: memory_split(memory_base) failed")
 }
 
@@ -522,13 +529,17 @@ fn finish_kept(
     {
         return Err("integration::arena_reclaim: the bodies were not placed and moved out");
     }
-    if held > (pages - 2) * PAGE
+    let kept_limit = pages
+        .checked_sub(2)
+        .and_then(|rest| rest.checked_mul(PAGE))
+        .ok_or("integration::arena_reclaim: piece smaller than two pages")?;
+    if held > kept_limit
     {
         return Err(
             "integration::arena_reclaim: fewer than two of the piece's arena pages were kept",
         );
     }
-    if whole != pages * PAGE
+    if Some(whole) != pages.checked_mul(PAGE)
     {
         return Err("integration::arena_reclaim: the piece's kept pages never came back");
     }

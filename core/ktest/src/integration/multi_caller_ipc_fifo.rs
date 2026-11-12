@@ -203,14 +203,19 @@ fn start_caller(
     done: u64,
 ) -> Result<SpawnedChild, &'static str>
 {
-    let child = spawn::new_child_at(ctx, ctx.sched_control_cap, CALLER_LEVELS[index])
+    let level = *CALLER_LEVELS
+        .get(index)
+        .ok_or("multi_caller_ipc_fifo: caller index out of range")?;
+    let child = spawn::new_child_at(ctx, ctx.sched_control_cap, level)
         .map_err(|_| "multi_caller_ipc_fifo: new_child_at caller failed")?;
     let ep_child = cap_copy(ep, child.cs, RIGHTS_EP_SEND_GRANT)
         .map_err(|_| "multi_caller_ipc_fifo: copy the endpoint failed")?;
     let done_child = cap_copy(done, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "multi_caller_ipc_fifo: copy the done notification failed")?;
     // Labels 1, 2, 3 for callers A, B, C.
-    let label = index as u64 + 1;
+    let label = (index as u64)
+        .checked_add(1)
+        .ok_or("multi_caller_ipc_fifo: caller index out of range")?;
     // SAFETY: entry `index` is this caller's alone, and it has not started.
     let arg = unsafe {
         CALLER_ARGS.publish(
@@ -222,9 +227,7 @@ fn start_caller(
             },
         )
     };
-    // SAFETY: takes the element's raw address without forming a reference to
-    // the `static mut`.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(CALLER_STACKS[index]) });
+    let stack = ChildStack::top_at(core::ptr::addr_of!(CALLER_STACKS), index)?;
     // SAFETY: the stack is this caller's own `ChildStack`, on which no other
     // live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(&child, caller_entry, stack, arg, CALLER_CPU) }
@@ -270,12 +273,19 @@ extern "C" fn caller_entry(arg: u64) -> !
         label,
     } = unsafe { spawn::child_args(arg) };
 
+    let Some(bit_index) = label.checked_sub(1)
+    else
+    {
+        thread_exit()
+    };
     // cast_possible_truncation: `label` is 1, 2, or 3.
     #[allow(clippy::cast_possible_truncation)]
-    let page = (label - 1) as usize;
-    // SAFETY: takes the element's raw address without forming a reference to
-    // the `static mut`.
-    let buf_addr = crate::IpcPage::addr(unsafe { core::ptr::addr_of_mut!(CALLER_IPC_PAGES[page]) });
+    let page = bit_index as usize;
+    let Ok(buf_addr) = crate::IpcPage::addr_at(core::ptr::addr_of_mut!(CALLER_IPC_PAGES), page)
+    else
+    {
+        thread_exit()
+    };
     // SAFETY: `CALLER_IPC_PAGES[page]` is this caller's own IPC page, used by one
     // thread at a time (`IpcPage`'s rule); no Rust object lives in it, and the
     // child reaches it only through the raw `buf_addr` pointer.
@@ -288,7 +298,7 @@ extern "C" fn caller_entry(arg: u64) -> !
     if unsafe { ipc::ipc_call(ep_slot, &IpcMessage::new(label), buf_addr as *mut u64) }.is_ok()
     {
         // OR the bit for this caller's label (label 1→bit0, 2→bit1, 3→bit2).
-        let bit = 1u64 << (label - 1);
+        let bit = 1u64 << bit_index;
         notification_send(done_slot, bit).ok();
     }
     /* else: no bit set — server detects the missing bit */

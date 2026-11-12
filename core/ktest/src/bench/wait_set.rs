@@ -69,7 +69,7 @@ pub(super) fn bench_wait_set(ctx: &crate::TestContext, iters: u32)
             max = delta;
         }
         total = total.saturating_add(delta);
-        completed += 1;
+        completed = completed.saturating_add(1);
     }
 
     cap_delete(sig).ok();

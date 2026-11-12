@@ -20,8 +20,6 @@
 //! state is atomics alone and takes the time as an argument, so it is
 //! host-tested.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 use core::sync::atomic::{AtomicU64, Ordering};

@@ -27,8 +27,6 @@
 //! fsbench: arch=x86_64 size=4096 path=frame  iters=256 cycles_min=...
 //! ```
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // fsbench is a benchmark harness: panics on failure so faults surface
 // in the log. `expect`/`unwrap` are the intended idiom here.
 #![allow(clippy::expect_used, clippy::unwrap_used)]

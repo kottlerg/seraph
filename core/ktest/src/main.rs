@@ -46,8 +46,6 @@
 //! `# Safety` contracts of `syscall::mem_map` and its siblings. Tests run one
 //! at a time; children reach a scratch page only as their test directs.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 #![no_main]
 

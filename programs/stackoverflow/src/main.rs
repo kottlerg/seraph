@@ -12,9 +12,6 @@
 //! Driven by `services/svctest`'s `stack_overflow_phase`, which spawns this
 //! binary, waits for exit, and asserts the non-zero fault reason.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 fn main()
 {
     overflow(0);

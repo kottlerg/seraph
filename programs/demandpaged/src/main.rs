@@ -37,9 +37,6 @@
 //!
 //! Driven by `services/svctest`'s pager phase.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use std::os::seraph::{
     register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
 };

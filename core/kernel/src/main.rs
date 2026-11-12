@@ -16,8 +16,6 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 #[cfg(not(test))]
 use core::panic::PanicInfo;

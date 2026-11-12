@@ -29,8 +29,6 @@
 // the intended idiom here (coding-standards §D permits them in test
 // code and §E permits narrowly-justified blanket allows).
 #![allow(clippy::expect_used, clippy::unwrap_used)]
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 
 mod bootstrap;
 mod ipc_util;

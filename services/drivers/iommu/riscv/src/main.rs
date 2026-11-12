@@ -17,9 +17,6 @@
 //! exits without reporting ready, so devmgr runs DMA unconfined. See
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};

@@ -13,8 +13,6 @@
 //! creator), typed error-code constants, label modules, and the shared
 //! policy and code tables listed in `shared/ipc/README.md`.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 // When built as a std dep via `rustc-dep-of-std`, we switch to `no_core`
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
 // as abi/syscall and shared/syscall.

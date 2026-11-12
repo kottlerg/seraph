@@ -22,9 +22,6 @@
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels, serial_errors, serial_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};

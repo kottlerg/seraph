@@ -53,8 +53,6 @@
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core so
 // this crate can sit inside std's dep graph. Mirrors abi/process-abi. Normal
 // builds (no feature) retain `#![no_std]`.
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]

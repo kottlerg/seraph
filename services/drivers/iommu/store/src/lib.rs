@@ -22,9 +22,6 @@
 //! past its death, since devmgr spawns it `CREATE_DMA_HOLD` and never
 //! releases the hold.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 use iommu_core::table::{TABLE_WORDS, TableStore};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;

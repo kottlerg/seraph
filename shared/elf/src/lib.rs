@@ -17,8 +17,6 @@
 //! and `parse_stack_note_streaming` fetch further bytes through a
 //! caller-supplied reader.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 // cast_possible_truncation: this crate targets 64-bit only (x86-64, riscv64);
 // ELF64 u64 fields fit in usize on these platforms.

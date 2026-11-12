@@ -14,9 +14,6 @@
 //! remapping table's entries ([`remap`]).
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 extern crate alloc;
 
 pub mod queue;

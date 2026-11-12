@@ -20,9 +20,6 @@
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 pub mod class;
 pub mod parse;
 pub mod restart_budget;

@@ -24,9 +24,6 @@
 //! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
 //! job-control/multi-session (#29) and the real interactive shell (#112).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
-
 mod input;
 mod output;
 

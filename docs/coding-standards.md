@@ -35,10 +35,10 @@ The following individual lints are additionally mandatory:
 - `clippy::unwrap_used`
 - `clippy::expect_used`
 - `clippy::undocumented_unsafe_blocks`
-- From `clippy::restriction`: `as_pointer_underscore`, `as_underscore`,
+- From `clippy::restriction`: `arithmetic_side_effects`, `as_pointer_underscore`, `as_underscore`,
   `assertions_on_result_states`, `dbg_macro`, `default_union_representation`,
   `empty_enum_variants_with_brackets`, `empty_structs_with_brackets`, `fn_to_numeric_cast_any`,
-  `get_unwrap`, `infinite_loop`, `iter_over_hash_type`, `mem_forget`,
+  `get_unwrap`, `indexing_slicing`, `infinite_loop`, `iter_over_hash_type`, `mem_forget`,
   `mixed_read_write_in_expression`, `precedence_bits`, `pub_without_shorthand`,
   `renamed_function_params`, `rest_pat_in_fully_bound_structs`, `self_named_module_files`,
   `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `todo`, `try_err`, `unimplemented`,
@@ -53,27 +53,17 @@ The following individual lints are additionally mandatory:
 `mod.rs` form of a module with children, and `separated_literal_suffix` the unseparated
 literal suffix (`0u8`).
 
-`cargo xtask build` runs Clippy with all warnings treated as errors. Code that does
-not pass this configuration is non-compliant. Configuration lives in `[workspace.lints]`
-in the root `Cargo.toml`; all member crates opt in via `[lints] workspace = true`. The one
-exception is the staged roll-out below.
+`cargo xtask build` runs Clippy with all warnings treated as errors. Code that does not pass this
+configuration is non-compliant. Configuration lives in `[workspace.lints]` in the root
+`Cargo.toml`; all member crates opt in via `[lints] workspace = true`. A crate-root or module-root
+lint level MUST NOT enable a Clippy lint: a Clippy lint the project enforces is enforced in
+`[workspace.lints]`, for every crate.
 
-`clippy::indexing_slicing` and `clippy::arithmetic_side_effects` are being made mandatory by a
-staged roll-out, crate by crate. A crate whose sites are fixed enables both at its crate root,
-`#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]`, which the build's
-warnings-as-errors makes binding for that crate. `core/kernel` is taken by subsystem: the same
-inner attribute at the root module of a subsystem (`core/kernel/src/<subsystem>/mod.rs`) binds
-that subsystem until every subsystem is fixed and the line moves to the kernel's crate root. The
-crates are taken in this order: those that parse external input, the remaining `abi/`, `shared/`
-and `runtime/` crates, the userspace services, drivers and programs, `core/boot` and
-`core/kernel` by subsystem, and the harness and host crates. The roll-out ends by moving both
-lints to `[workspace.lints]` and removing every crate-root and module-root level for them. A
-crate-root or module-root level that enables a lint is permitted for these two lints only, and
-only until then. A site is fixed by a checked, wrapping or saturating operation
-chosen for the meaning the code already has, a `get` with an error path the function already
-returns, or a restructuring that removes the index; a fix that sends an out-of-range input down a
-different path carries a host test of that input (§ D). A site none of these can express is a
-suppression under § E.
+A site that `indexing_slicing` or `arithmetic_side_effects` reports is fixed by a checked, wrapping
+or saturating operation chosen for the meaning the code already has, a `get` with an error path
+the function already returns, or a restructuring that removes the index; a fix that sends an
+out-of-range input down a different path carries a host test of that input (§ D). A site none of
+these can express is a suppression under § E.
 
 ### Markdown
 

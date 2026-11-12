@@ -19,8 +19,6 @@
 //! it. Names are at most [`NAME_MAX`] bytes. A full bytewise match is
 //! required — no prefix or glob matching.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;

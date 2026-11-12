@@ -26,8 +26,6 @@
 //! with or consumed by this crate; consolidating hash primitives is out of
 //! scope here.
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 pub mod sha512;

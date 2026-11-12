@@ -71,8 +71,6 @@
 //! (every architecture implements the full surface; a no-op's rustdoc says
 //! why).
 
-// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 
 mod arch;

@@ -1424,7 +1424,7 @@ mod tests
                 Err(BootError::InvalidMemoryMap(_))
             ));
         }
-        assert!(check_descriptor_size(full).is_ok());
-        assert!(check_descriptor_size(full + 8).is_ok());
+        check_descriptor_size(full).unwrap();
+        check_descriptor_size(full + 8).unwrap();
     }
 }

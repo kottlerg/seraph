@@ -1782,7 +1782,7 @@ mod tests
 
         fn string_off(&mut self, name: &[u8]) -> u32
         {
-            let off = self.strings.len() as u32;
+            let off = u32::try_from(self.strings.len()).unwrap();
             self.strings.extend_from_slice(name);
             self.strings.push(0);
             off
@@ -1792,7 +1792,7 @@ mod tests
         {
             let nameoff = self.string_off(name);
             self.token(FDT_PROP);
-            self.token(data.len() as u32);
+            self.token(u32::try_from(data.len()).unwrap());
             self.token(nameoff);
             self.structs.extend_from_slice(data);
             self.pad4();
@@ -1802,9 +1802,9 @@ mod tests
         {
             self.token(FDT_END);
             let off_struct: u32 = 40;
-            let size_struct = self.structs.len() as u32;
+            let size_struct = u32::try_from(self.structs.len()).unwrap();
             let off_strings = off_struct + size_struct;
-            let size_strings = self.strings.len() as u32;
+            let size_strings = u32::try_from(self.strings.len()).unwrap();
             let total = off_strings + size_strings;
 
             let mut blob = Vec::with_capacity(total as usize);
@@ -1997,7 +1997,7 @@ mod tests
     fn bad_magic_is_rejected()
     {
         let mut blob = tree(None, |b| cpu_node(b, b"cpu@0", 0, &[]));
-        blob[0..4].copy_from_slice(&0xdead_beef_u32.to_be_bytes());
+        blob[0..4].copy_from_slice(&0xdead_beefu32.to_be_bytes());
         // SAFETY: blob is a valid in-memory buffer of at least 40 bytes.
         assert!(unsafe { Fdt::from_raw(blob.as_ptr() as u64) }.is_none());
     }
@@ -2194,9 +2194,8 @@ mod tests
             cpu_node(b, b"cpu@0", 7, &[]);
             cpu_node(b, b"cpu@1", 9, &[]);
         });
-        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
         let base = blob.as_ptr() as u64;
-        // SAFETY: as above.
+        // SAFETY: blob is a valid in-memory FDT built by FdtBuilder.
         let entries = unsafe { parse_cpu_count(base) };
         assert_eq!(entries, 2);
         let mut ids = vec![0u32; crate::firmware::cpu_id_capacity(entries)];
@@ -2221,7 +2220,7 @@ mod tests
     #[test]
     fn rng_seed_extracted_and_scrubbed()
     {
-        let seed: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_add(1));
+        let seed: [u8; 32] = core::array::from_fn(|i| u8::try_from(i).unwrap().wrapping_add(1));
         let mut blob = tree_with_rng_seed(&seed);
         let mut out = [0u8; 32];
         // SAFETY: blob is a valid, writable in-memory FDT.
@@ -2484,8 +2483,8 @@ mod tests
             size_strings: 16,
         };
         assert_eq!(fdt.read_struct_u32(12), None);
-        assert!(fdt.struct_slice(12, 4).is_empty());
-        assert!(fdt.string_at(12).is_empty());
+        assert_eq!(fdt.struct_slice(12, 4), []);
+        assert_eq!(fdt.string_at(12), []);
         assert_eq!(fdt.prop_data_addr(12, 4), None);
     }
 

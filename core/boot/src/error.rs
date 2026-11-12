@@ -176,6 +176,18 @@ impl core::fmt::Display for BootError
     }
 }
 
+/// Print a fatal boot error message via the console and halt.
+///
+/// Never returns.
+pub fn fatal_error(err: &BootError) -> !
+{
+    bprintln!("SERAPH BOOT FATAL: {err}");
+    loop
+    {
+        core::hint::spin_loop(); // halt; no recovery from fatal boot error
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -206,7 +218,7 @@ mod tests
         ];
         for v in variants
         {
-            assert!(!v.message().is_empty(), "empty message for {:?}", v);
+            assert!(!v.message().is_empty(), "empty message for {v:?}");
         }
     }
 
@@ -271,20 +283,8 @@ mod tests
         ];
         for v in no_detail
         {
-            assert!(v.detail().is_none(), "expected None detail for {:?}", v);
+            assert!(v.detail().is_none(), "expected None detail for {v:?}");
         }
-    }
-}
-
-/// Print a fatal boot error message via the console and halt.
-///
-/// Never returns.
-pub fn fatal_error(err: &BootError) -> !
-{
-    bprintln!("SERAPH BOOT FATAL: {err}");
-    loop
-    {
-        core::hint::spin_loop(); // halt; no recovery from fatal boot error
     }
 }
 

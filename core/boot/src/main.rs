@@ -2550,10 +2550,10 @@ mod tests
         };
         let mut ranges = [empty; 2];
         let mut len = 0;
-        assert!(push_reclaim_range(&mut ranges, &mut len, empty).is_ok());
+        push_reclaim_range(&mut ranges, &mut len, empty).unwrap();
         assert_eq!(len, 0);
-        assert!(push_reclaim_range(&mut ranges, &mut len, one).is_ok());
-        assert!(push_reclaim_range(&mut ranges, &mut len, one).is_ok());
+        push_reclaim_range(&mut ranges, &mut len, one).unwrap();
+        push_reclaim_range(&mut ranges, &mut len, one).unwrap();
         assert!(matches!(
             push_reclaim_range(&mut ranges, &mut len, one),
             Err(BootError::ReclaimRangesOverflow)

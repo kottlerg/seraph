@@ -30,5 +30,6 @@ pub use current::{
     PAGE_FAULT_LOAD_VECTOR, PAGE_FAULT_STORE_VECTOR, ROUTABLE_HIGH_IRQ_IDS, SP_OFFSET,
     SYSCALL_NR_OFFSET, TRAP_FRAME_BYTES, UNROUTABLE_IRQ_IDS, breakpoint_reported_ip, callee_saved,
     code_stub, cycles_now, entry_stack_pointer, fpu, fresh_range_root, illegal_instruction,
-    init_io_ports, run_integration, run_unit, serial, shutdown, software_breakpoint,
+    init_io_ports, msi_message_plausible, run_integration, run_unit, serial, shutdown,
+    software_breakpoint,
 };

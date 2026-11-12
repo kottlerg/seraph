@@ -93,6 +93,9 @@ fn repack(ctx: &Context, arch: Arch) -> Result<()>
 /// kill QEMU.
 fn boot(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
 {
+    // Picked here, right before QEMU binds it, to keep the window in which
+    // another process could take it short.
+    let port = crate::util::debug_port_or_free(args.port)?;
     let (firmware_code, firmware_vars) = match args.arch
     {
         Arch::X86_64 => (find_ovmf_code()?, None),
@@ -120,15 +123,14 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
         riscv_mmu: RiscvMmu::Sv48,
         x86_paging: X86Paging::Four,
         iommu: Iommu::Attached,
-        debug_port: Some(args.port),
+        debug_port: Some(port),
         test_devices: false,
     };
     let qemu_args = build_qemu_argv(&spec)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
 
     step(&format!(
-        "debug port test: booting with the debug port on 127.0.0.1:{}",
-        args.port
+        "debug port test: booting with the debug port on 127.0.0.1:{port}"
     ));
     let mut child = Command::new(&qemu_binary)
         .args(&qemu_args)
@@ -170,8 +172,8 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
             )
         })
         .and_then(|()| {
-            let stream = TcpStream::connect(("127.0.0.1", args.port))
-                .with_context(|| format!("connecting to 127.0.0.1:{}", args.port))?;
+            let stream = TcpStream::connect(("127.0.0.1", port))
+                .with_context(|| format!("connecting to 127.0.0.1:{port}"))?;
             stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
             exchange(&mut Link::new(stream))
         });

@@ -16,6 +16,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod ioapic;
+pub mod msi;
 pub mod paging;
 pub mod platform;
 pub mod speculation;
@@ -74,8 +75,8 @@ pub fn sbi_forward(_extension: u64, _function: u64, _a0: u64, _a1: u64, _a2: u64
     Err(())
 }
 
-/// Allocate the x86-64 per-CPU tables (per-AP GDT/TSS, AP IST stacks, and the
-/// NMI-backtrace request slab) for `cpu_count` CPUs. Called once on the BSP in Phase 4, from
+/// Allocate the x86-64 per-CPU tables (per-AP GDT/TSS, AP IST stacks, the NMI-backtrace
+/// request slab, and each CPU's device-vector row) for `cpu_count` CPUs. Called once on the BSP in Phase 4, from
 /// `sched::init_per_cpu_storage`, before Phase 5 and SMP bring-up.
 #[cfg(not(test))]
 pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
@@ -83,6 +84,7 @@ pub fn init_ap_percpu_storage(cpu_count: usize, allocator: &mut crate::mm::Buddy
     gdt::init_ap_storage(cpu_count, allocator);
     ap_trampoline::init_ap_ist_storage(cpu_count, allocator);
     interrupts::init_nmi_backtrace_storage(cpu_count, allocator);
+    ioapic::init_vector_storage(cpu_count, allocator);
 }
 
 // MMIO regions that must be direct-mapped during Phase 3 page-table setup are

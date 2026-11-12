@@ -148,27 +148,28 @@ impl<S: Copy> SpanTable<S>
             .try_reserve(1)
             .map_err(|_| CarveError::NoMemory)?;
 
-        let span = self.spans[i];
+        let span = *self.spans.get(i).ok_or(CarveError::NotCovered)?;
         if base > span.base
         {
             let (lower, upper) = split(&span, base).map_err(|_| CarveError::Split)?;
-            self.spans[i] = Span {
+            *self.spans.get_mut(i).ok_or(CarveError::NotCovered)? = Span {
                 slot: lower,
                 base: span.base,
                 end: base,
             };
+            // `i` indexes an existing span, so `i + 1` is at most the length.
+            i = i.saturating_add(1);
             self.spans.insert(
-                i + 1,
+                i,
                 Span {
                     slot: upper,
                     base,
                     end: span.end,
                 },
             );
-            i += 1;
         }
 
-        let span = self.spans[i];
+        let span = *self.spans.get(i).ok_or(CarveError::NotCovered)?;
         let cut = round_up(end, granule).map_or(span.end, |c| c.min(span.end));
         if cut < span.end
         {
@@ -176,7 +177,7 @@ impl<S: Copy> SpanTable<S>
             {
                 Ok((carved, rest)) =>
                 {
-                    self.spans[i] = Span {
+                    *self.spans.get_mut(i).ok_or(CarveError::NotCovered)? = Span {
                         slot: rest,
                         base: cut,
                         end: span.end,

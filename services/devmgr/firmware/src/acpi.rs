@@ -17,6 +17,7 @@
 use syscall_abi::{IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL};
 
 use super::EcamLocation;
+use crate::bytes::{read_u8, read_u16, read_u32, read_u64};
 
 // ── Layout constants ──────────────────────────────────────────────────
 
@@ -61,40 +62,6 @@ const MADT_TYPE_SOURCE_OVERRIDE: u8 = 2;
 /// each), GSI (u32), MPS INTI flags (u16).
 const MADT_SOURCE_OVERRIDE_LEN: usize = 10;
 
-// ── Byte-read helpers ─────────────────────────────────────────────────
-
-fn read_u8(buf: &[u8], off: usize) -> u8
-{
-    buf.get(off).copied().unwrap_or(0)
-}
-
-fn read_u32(buf: &[u8], off: usize) -> u32
-{
-    if off + 4 > buf.len()
-    {
-        return 0;
-    }
-    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-fn read_u64(buf: &[u8], off: usize) -> u64
-{
-    if off + 8 > buf.len()
-    {
-        return 0;
-    }
-    u64::from_le_bytes([
-        buf[off],
-        buf[off + 1],
-        buf[off + 2],
-        buf[off + 3],
-        buf[off + 4],
-        buf[off + 5],
-        buf[off + 6],
-        buf[off + 7],
-    ])
-}
-
 // ── RSDP / XSDT walkers ───────────────────────────────────────────────
 
 /// Read the XSDT physical address from the mapped RSDP slice.
@@ -104,7 +71,7 @@ fn read_u64(buf: &[u8], off: usize) -> u64
 #[must_use]
 pub fn rsdp_xsdt_phys(rsdp_bytes: &[u8]) -> Option<u64>
 {
-    if rsdp_bytes.len() < RSDP_LEN || &rsdp_bytes[..8] != RSDP_SIG
+    if rsdp_bytes.len() < RSDP_LEN || rsdp_bytes.get(..8) != Some(RSDP_SIG.as_slice())
     {
         return None;
     }
@@ -143,11 +110,7 @@ pub fn sdt_length(sdt_header: &[u8]) -> Option<u32>
 #[must_use]
 pub fn sdt_signature(sdt_header: &[u8]) -> [u8; 4]
 {
-    if sdt_header.len() < 4
-    {
-        return [0; 4];
-    }
-    [sdt_header[0], sdt_header[1], sdt_header[2], sdt_header[3]]
+    sdt_header.first_chunk::<4>().copied().unwrap_or([0; 4])
 }
 
 /// Iterate the per-entry 64-bit table pointers in an XSDT.
@@ -158,7 +121,8 @@ pub fn iter_xsdt_entries(xsdt_bytes: &[u8]) -> impl Iterator<Item = u64> + '_
     let clamped_len = len.min(xsdt_bytes.len());
     let body_bytes = clamped_len.saturating_sub(entries_off);
     let entry_count = body_bytes / 8;
-    (0..entry_count).map(move |i| read_u64(xsdt_bytes, entries_off + i * 8))
+    (0..entry_count)
+        .map(move |i| read_u64(xsdt_bytes, entries_off.saturating_add(i.saturating_mul(8))))
 }
 
 // ── FADT → PM1a ────────────────────────────────────────────────────────
@@ -201,11 +165,7 @@ pub fn fadt_century_index(fadt_bytes: &[u8]) -> Option<u8>
         return None;
     }
     let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
-    if total_len <= FADT_OFF_CENTURY
-    {
-        return None;
-    }
-    let index = fadt_bytes[FADT_OFF_CENTURY];
+    let index = *fadt_bytes.get(..total_len)?.get(FADT_OFF_CENTURY)?;
     if index == 0 { None } else { Some(index) }
 }
 
@@ -278,8 +238,12 @@ pub fn mcfg_ecams(mcfg_bytes: &[u8]) -> impl Iterator<Item = EcamLocation> + '_
     {
         0
     };
-    (0..entry_count)
-        .filter_map(move |i| mcfg_entry_ecam(mcfg_bytes, MCFG_ENTRIES_OFF + i * MCFG_ENTRY_SIZE))
+    (0..entry_count).filter_map(move |i| {
+        mcfg_entry_ecam(
+            mcfg_bytes,
+            MCFG_ENTRIES_OFF.saturating_add(i.saturating_mul(MCFG_ENTRY_SIZE)),
+        )
+    })
 }
 
 /// Decode the MCFG allocation entry at `off`: base (u64), segment (u16),
@@ -288,14 +252,14 @@ pub fn mcfg_ecams(mcfg_bytes: &[u8]) -> impl Iterator<Item = EcamLocation> + '_
 fn mcfg_entry_ecam(mcfg_bytes: &[u8], off: usize) -> Option<EcamLocation>
 {
     let base = read_u64(mcfg_bytes, off);
-    let segment = u16::from_le_bytes([read_u8(mcfg_bytes, off + 8), read_u8(mcfg_bytes, off + 9)]);
-    let start_bus = read_u8(mcfg_bytes, off + 10);
-    let end_bus = read_u8(mcfg_bytes, off + 11);
+    let segment = read_u16(mcfg_bytes, off.saturating_add(8));
+    let start_bus = read_u8(mcfg_bytes, off.saturating_add(10));
+    let end_bus = read_u8(mcfg_bytes, off.saturating_add(11));
     if base == 0 || end_bus < start_bus
     {
         return None;
     }
-    let bus_count = u64::from(end_bus) - u64::from(start_bus) + 1;
+    let bus_count = u64::from(end_bus.checked_sub(start_bus)?).saturating_add(1);
     let size = bus_count << 20;
     let phys_base = base.checked_add(u64::from(start_bus) << 20)?;
     phys_base.checked_add(size)?;
@@ -342,19 +306,19 @@ fn madt_structures(madt_bytes: &[u8]) -> Option<impl Iterator<Item = (u8, usize,
     }
     let mut off = MADT_ENTRIES_OFF;
     Some(core::iter::from_fn(move || {
-        if off + 2 > end
+        if off.saturating_add(2) > end
         {
             return None;
         }
         let kind = read_u8(madt_bytes, off);
-        let len = usize::from(read_u8(madt_bytes, off + 1));
-        if len < 2 || off + len > end
+        let len = usize::from(read_u8(madt_bytes, off.saturating_add(1)));
+        if len < 2 || off.saturating_add(len) > end
         {
             off = end;
             return None;
         }
         let at = off;
-        off += len;
+        off = off.saturating_add(len);
         Some((kind, at, len))
     }))
 }
@@ -374,12 +338,9 @@ pub fn madt_source_overrides(madt_bytes: &[u8])
                 kind == MADT_TYPE_SOURCE_OVERRIDE && len >= MADT_SOURCE_OVERRIDE_LEN
             })
             .map(|(_, at, _)| SourceOverride {
-                source: read_u8(madt_bytes, at + 3),
-                gsi: read_u32(madt_bytes, at + 4),
-                flags: u16::from_le_bytes([
-                    read_u8(madt_bytes, at + 8),
-                    read_u8(madt_bytes, at + 9),
-                ]),
+                source: read_u8(madt_bytes, at.saturating_add(3)),
+                gsi: read_u32(madt_bytes, at.saturating_add(4)),
+                flags: read_u16(madt_bytes, at.saturating_add(8)),
             }),
     )
 }
@@ -405,8 +366,8 @@ pub fn madt_io_apics(madt_bytes: &[u8]) -> Option<impl Iterator<Item = IoApic> +
         madt_structures(madt_bytes)?
             .filter(|&(kind, _, len)| kind == MADT_TYPE_IO_APIC && len >= MADT_IO_APIC_LEN)
             .map(|(_, at, _)| IoApic {
-                id: read_u8(madt_bytes, at + 2),
-                gsi_base: read_u32(madt_bytes, at + 8),
+                id: read_u8(madt_bytes, at.saturating_add(2)),
+                gsi_base: read_u32(madt_bytes, at.saturating_add(8)),
             }),
     )
 }
@@ -448,12 +409,12 @@ pub fn madt_well_formed(madt_bytes: &[u8]) -> bool
     let mut off = MADT_ENTRIES_OFF;
     while off < end
     {
-        let len = usize::from(read_u8(madt_bytes, off + 1));
-        if off + 2 > end || len < 2 || off + len > end
+        let len = usize::from(read_u8(madt_bytes, off.saturating_add(1)));
+        if off.saturating_add(2) > end || len < 2 || off.saturating_add(len) > end
         {
             return false;
         }
-        off += len;
+        off = off.saturating_add(len);
     }
     true
 }
@@ -569,10 +530,10 @@ pub fn table_window(
     {
         return None;
     }
-    let held = len.min(region_size - off);
-    let first_page = off / page_size;
-    let in_window = off - first_page * page_size;
-    let page_count = (in_window + held).div_ceil(page_size);
+    let held = len.min(region_size.saturating_sub(off));
+    let first_page = off.checked_div(page_size)?;
+    let in_window = off.checked_rem(page_size)?;
+    let page_count = in_window.checked_add(held)?.div_ceil(page_size);
     Some(TableWindow {
         first_page,
         page_count,

@@ -99,13 +99,14 @@ impl<T> Classes<T>
         {
             return None;
         }
+        let index = self.entries.len();
         self.entries.push(Entry {
             name: *name,
             served: Served::new(),
             configured: false,
             boot_only: false,
         });
-        Some(self.entries.len() - 1)
+        Some(index)
     }
 
     /// The served list of class `name`, interning the name when it is new.

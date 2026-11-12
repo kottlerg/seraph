@@ -244,7 +244,10 @@ fn race(ctx: &TestContext, line: u64) -> TestResult
         "stress::irq_route_delete_race: armed_binding=",
         u64::from(armed[2]),
     );
-    if armed.iter().zip(armed_floors()).any(|(&got, floor)| got < floor)
+    if armed
+        .iter()
+        .zip(armed_floors())
+        .any(|(&got, floor)| got < floor)
     {
         return Err(
             "stress::irq_route_delete_race: fewer rounds of some kind armed the race than its floor",
@@ -545,9 +548,12 @@ extern "C" fn deleter_entry(_arg: u64) -> !
         {
             core::hint::spin_loop();
         }
-        // Then 0 to 4095 spins (a multiplicative hash of the round), so the
-        // delete lands at varying points between two raises.
-        for _ in 0..(round.wrapping_mul(2_654_435_761) >> 20)
+        // Then 0 to 255 spins (the top bits of a multiplicative hash of the
+        // round), a few microseconds at most, so the delete begins while the
+        // lead raise runs, at a varying point of it: its removal of the
+        // binding then meets the raise's delivery, before or after the
+        // delivery reads it.
+        for _ in 0..(round.wrapping_mul(2_654_435_761) >> 24)
         {
             core::hint::spin_loop();
         }

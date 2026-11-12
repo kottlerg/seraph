@@ -31,7 +31,7 @@ pub fn bootstrap_loop(bootstrap_ep: u64, state: &Mutex<BootstrapState>) -> !
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("worker has no registered IPC buffer");
+        std::os::seraph::log!(error: "worker has no registered IPC buffer");
         syscall::thread_exit();
     }
 
@@ -102,7 +102,7 @@ pub fn active_loop(active: &ActiveState, bootstrap_state: &Mutex<BootstrapState>
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("active worker has no registered IPC buffer");
+        std::os::seraph::log!(error: "active worker has no registered IPC buffer");
         syscall::thread_exit();
     }
 
@@ -185,7 +185,7 @@ fn handle_create_from_file(
         // A call refused before delivery transfers no cap, so both are still
         // ours; after delivery the handles are stale and each delete fails
         // closed.
-        std::os::seraph::log!("active worker: CREATE_FROM_FILE ipc_call failed");
+        std::os::seraph::log!(warn: "active worker: CREATE_FROM_FILE ipc_call failed");
         let _ = syscall::cap_delete(file_cap);
         let _ = syscall::cap_delete(badged_creator);
         abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
@@ -194,7 +194,7 @@ fn handle_create_from_file(
     if create_reply.label != 0
     {
         std::os::seraph::log!(
-            "active worker: CREATE_FROM_FILE failed (code={})",
+            warn: "active worker: CREATE_FROM_FILE failed (code={})",
             create_reply.label
         );
         abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
@@ -203,14 +203,14 @@ fn handle_create_from_file(
 
     if create_reply.caps().is_empty()
     {
-        std::os::seraph::log!("active worker: CREATE_FROM_FILE reply missing process handle");
+        std::os::seraph::log!(warn: "active worker: CREATE_FROM_FILE reply missing process handle");
         abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
     }
 
     if !crate::driver::start_and_release(create_reply.caps(), ipc_buf)
     {
-        std::os::seraph::log!("active worker: START_PROCESS failed");
+        std::os::seraph::log!(warn: "active worker: START_PROCESS failed");
         abandon_bootstrap(bootstrap_state, badge, bootstrap_handle);
         return false;
     }

@@ -112,7 +112,7 @@ impl FatState
         if cluster < 2
         {
             std::os::seraph::log!(
-                "WARNING: cluster_to_sector({cluster}) — reserved cluster \
+                warn: "cluster_to_sector({cluster}) — reserved cluster \
                  reached; caller should filter"
             );
         }
@@ -162,25 +162,28 @@ pub fn parse_bpb(sector_data: &[u8], block_size: u32, state: &mut FatState) -> b
         Ok(geom) => geom,
         Err(fat_parse::BpbError::BadSignature) =>
         {
-            std::os::seraph::log!("invalid boot signature");
+            std::os::seraph::log!(warn: "invalid boot signature");
             return false;
         }
         Err(fat_parse::BpbError::ZeroDivisor) =>
         {
-            std::os::seraph::log!("invalid BPB: bytes_per_sector or sectors_per_cluster is zero");
+            std::os::seraph::log!(
+                warn: "invalid BPB: bytes_per_sector or sectors_per_cluster is zero"
+            );
             return false;
         }
         Err(fat_parse::BpbError::UnsupportedSectorSize) =>
         {
             std::os::seraph::log!(
-                "unsupported BPB: bytes_per_sector is not the device block size {block_size}"
+                warn: "unsupported BPB: bytes_per_sector is not the device block size {block_size}"
             );
             return false;
         }
         Err(fat_parse::BpbError::BadGeometry) =>
         {
             std::os::seraph::log!(
-                "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, data-region \
+                warn: "invalid BPB: inconsistent geometry (no FAT copy or reserved sector, \
+                 data-region \
                  start overflows, cluster count exceeds the FAT, or FAT32 root outside the data \
                  region)"
             );
@@ -189,7 +192,7 @@ pub fn parse_bpb(sector_data: &[u8], block_size: u32, state: &mut FatState) -> b
         Err(fat_parse::BpbError::Fat12) =>
         {
             std::os::seraph::log!(
-                "unsupported BPB: fewer than {} clusters (FAT12)",
+                warn: "unsupported BPB: fewer than {} clusters (FAT12)",
                 fat_parse::FAT16_MIN_CLUSTERS
             );
             return false;
@@ -221,12 +224,12 @@ pub fn parse_bpb(sector_data: &[u8], block_size: u32, state: &mut FatState) -> b
     }
 
     std::os::seraph::log!(
-        "sectors_per_cluster={:#018x}",
+        debug: "sectors_per_cluster={:#018x}",
         u64::from(state.sectors_per_cluster)
     );
-    std::os::seraph::log!("total_clusters={:#018x}", u64::from(geom.total_clusters));
+    std::os::seraph::log!(debug: "total_clusters={:#018x}", u64::from(geom.total_clusters));
     std::os::seraph::log!(
-        "data_start_sector={:#018x}",
+        debug: "data_start_sector={:#018x}",
         u64::from(state.data_start_sector)
     );
 

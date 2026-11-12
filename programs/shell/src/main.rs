@@ -62,7 +62,7 @@ fn main()
     // the namespace root so external children inherit it.
     if let Err(e) = std::env::set_current_dir("/")
     {
-        std::os::seraph::log!("shell: set_current_dir(\"/\") failed: {e}");
+        std::os::seraph::log!(warn: "shell: set_current_dir(\"/\") failed: {e}");
     }
 
     let (tx, rx) = channel::<Event>();

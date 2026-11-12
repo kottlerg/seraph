@@ -136,7 +136,7 @@ impl EvictionState
         else
         {
             std::os::seraph::log!(
-                "eviction enqueue: no memory; dropped req (open={:#x}, cookie={}, slot={})",
+                warn: "eviction enqueue: no memory; dropped req (open={:#x}, cookie={}, slot={})",
                 req.open_id,
                 req.cookie,
                 req.slot_idx
@@ -231,7 +231,7 @@ fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
         "page already released"
     };
     std::os::seraph::log!(
-        "{} (label={}); {} (open={:#x}, slot={})",
+        warn: "{} (label={}); {} (open={:#x}, slot={})",
         what,
         label,
         action,

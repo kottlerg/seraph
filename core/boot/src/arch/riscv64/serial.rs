@@ -115,6 +115,11 @@ pub unsafe fn serial_init()
 {
     // SAFETY: single-threaded boot phase; no concurrent access to static mut.
     let base = unsafe { UART_BASE_ADDR } as *mut u8;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every operation reaches a 16550 register at a constant offset below 8 from the \
+                  UART base the caller's contract maps"
+    )]
     // SAFETY: UART_BASE_ADDR is a valid MMIO mapping; register offsets within 16550 UART range; volatile ensures ordering.
     unsafe {
         // IER = 0: disable all interrupts.
@@ -140,13 +145,17 @@ pub unsafe fn serial_write_byte(byte: u8)
     // SAFETY: single-threaded boot phase; no concurrent access to static mut.
     let base = unsafe { UART_BASE_ADDR } as *mut u8;
 
+    // SAFETY: UART_LSR is a constant offset within the 16550 register range at `base`.
+    let lsr = unsafe { base.add(UART_LSR) };
     // Spin on LSR bit 5 (THRE — Transmit Holding Register Empty).
     // SAFETY: UART_BASE_ADDR is a valid MMIO mapping; LSR offset within 16550 UART range; volatile ensures ordering.
-    while unsafe { core::ptr::read_volatile(base.add(UART_LSR)) } & 0x20 == 0
+    while unsafe { core::ptr::read_volatile(lsr) } & 0x20 == 0
     {}
 
+    // SAFETY: UART_TX is a constant offset within the 16550 register range at `base`.
+    let tx = unsafe { base.add(UART_TX) };
     // SAFETY: UART_BASE_ADDR is a valid MMIO mapping; TX offset within 16550 UART range; THRE bit set; volatile ensures ordering.
     unsafe {
-        core::ptr::write_volatile(base.add(UART_TX), byte);
+        core::ptr::write_volatile(tx, byte);
     }
 }

@@ -224,8 +224,15 @@ impl FramebufferWriter
 
                 // SAFETY: pixel is within the framebuffer; offset is bounded
                 // by stride * height (caller ensures valid mapping).
+                let p = unsafe { self.base.add(offset) };
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every operation reaches one of the four bytes of the pixel at `p`, \
+                              at a constant offset below 4"
+                )]
+                // SAFETY: `p` is the first byte of a 4-byte pixel inside the mapped,
+                // writable framebuffer, so `p` through `p + 3` are that pixel's bytes.
                 unsafe {
-                    let p = self.base.add(offset);
                     match self.format
                     {
                         PixelFormat::Rgbx8 =>
@@ -277,10 +284,13 @@ impl FramebufferWriter
         let kept_bytes = kept_rows.saturating_mul(row_bytes);
 
         // Copy rows 1..total_rows → 0..total_rows-1.
+        // SAFETY: `new` guarantees at least one character row, so row 1's start is at most the
+        // framebuffer's end.
+        let src = unsafe { self.base.add(row_bytes) };
         // SAFETY: src and dst are both within the framebuffer allocation; the
         // copy is a single forward memmove of (total_rows-1)*row_bytes bytes.
         unsafe {
-            core::ptr::copy(self.base.add(row_bytes), self.base, kept_bytes);
+            core::ptr::copy(src, self.base, kept_bytes);
         }
 
         // Zero the last row.
@@ -288,8 +298,10 @@ impl FramebufferWriter
         for i in 0..row_bytes
         {
             // SAFETY: last_row_start + i is within the framebuffer.
+            let byte = unsafe { self.base.add(last_row_start.saturating_add(i)) };
+            // SAFETY: `byte` is inside the mapped, writable framebuffer.
             unsafe {
-                core::ptr::write_volatile(self.base.add(last_row_start.saturating_add(i)), 0);
+                core::ptr::write_volatile(byte, 0);
             }
         }
 

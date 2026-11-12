@@ -44,13 +44,13 @@ fn main() -> !
     let Some(bootstrap) = caps::request_bootstrap(info, ipc_buf)
     else
     {
-        std::os::seraph::log!("bootstrap failed, exiting");
+        std::os::seraph::log!(error: "bootstrap failed, exiting");
         syscall::thread_exit();
     };
 
     if bootstrap.service_ep == 0
     {
-        std::os::seraph::log!("no service endpoint, exiting");
+        std::os::seraph::log!(error: "no service endpoint, exiting");
         syscall::thread_exit();
     }
 
@@ -64,7 +64,7 @@ fn main() -> !
     }
     else
     {
-        std::os::seraph::log!("ready (degraded: no shutdown actuator)");
+        std::os::seraph::log!(warn: "ready (degraded: no shutdown actuator)");
     }
 
     let self_thread = info.self_thread;
@@ -130,7 +130,7 @@ fn main() -> !
 pub(crate) fn await_reset(op: &str)
 {
     std::thread::sleep(RESET_GRACE);
-    std::os::seraph::log!("{op} did not take effect");
+    std::os::seraph::log!(error: "{op} did not take effect");
 }
 
 /// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
@@ -141,11 +141,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }

@@ -102,14 +102,14 @@ fn fb_set_attrs(cap: u64, fg: [u8; 3], bg: [u8; 3], ipc_buf: *mut u64) -> bool
         Ok(reply) =>
         {
             std::os::seraph::log!(
-                "terminal: framebuffer FB_SET_ATTRS returned label={:#x}",
+                warn: "terminal: framebuffer FB_SET_ATTRS returned label={:#x}",
                 reply.label
             );
             false
         }
         Err(_) =>
         {
-            std::os::seraph::log!("terminal: framebuffer FB_SET_ATTRS ipc_call failed");
+            std::os::seraph::log!(warn: "terminal: framebuffer FB_SET_ATTRS ipc_call failed");
             false
         }
     }
@@ -135,12 +135,15 @@ fn write_chunked(cap: u64, opcode: u64, success: u64, bytes: &[u8], ipc_buf: *mu
             {}
             Ok(reply) =>
             {
-                std::os::seraph::log!("terminal: {label} driver returned label={:#x}", reply.label);
+                std::os::seraph::log!(
+                    warn: "terminal: {label} driver returned label={:#x}",
+                    reply.label
+                );
                 return;
             }
             Err(_) =>
             {
-                std::os::seraph::log!("terminal: {label} ipc_call failed mid-write");
+                std::os::seraph::log!(warn: "terminal: {label} ipc_call failed mid-write");
                 return;
             }
         }

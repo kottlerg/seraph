@@ -43,9 +43,10 @@ read it to find the document a task needs.
   - On green, say so in one line and run the pre-merge review as the `pr-review` skill
     describes. On red, show the failing job's tail (`gh run view <run-id> --log-failed`).
 - After a review run, whoever ran it gives both verdict lines verbatim to the one it reports to:
-  a worker to its orchestrator, a standalone session to the maintainer. An orchestrator passes
-  them on only when asked, or when a line is why something blocks, and otherwise reports as the
-  `.claude/agents/orchestrator.md` § Reporting to the maintainer says.
+  a worker records them in its status line for its orchestrator
+  (`.claude/agents/worker.md` § Reporting), a standalone session gives them to the maintainer.
+  An orchestrator passes them on only when asked, or when a line is why something blocks, and
+  otherwise reports as the `.claude/agents/orchestrator.md` § Reporting to the maintainer says.
 - Hand searches and specified mechanical work to the `Explore` and `scribe` agents, as
   `.claude/agents/worker.md` § Delegation describes, and keep every judgement about the code.
 - A commit message follows [docs/conventions.md](../docs/conventions.md) § Commit Messages and

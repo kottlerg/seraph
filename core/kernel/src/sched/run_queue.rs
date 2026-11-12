@@ -62,16 +62,27 @@ const fn queue_index(level: u8) -> usize
 {
     if level == IDLE_PRIORITY
     {
-        IDLE_QUEUE
+        return IDLE_QUEUE;
     }
-    else if level < RT_PRIORITY_MIN
+    match level.checked_sub(RT_PRIORITY_MIN)
     {
-        FAIR_QUEUE
+        // An RT level's queue is its offset above the fair queue; a u8 offset
+        // is far below the saturation point.
+        Some(rt) => (rt as usize).saturating_add(FAIR_QUEUE + 1),
+        None => FAIR_QUEUE,
     }
-    else
-    {
-        FAIR_QUEUE + 1 + (level - RT_PRIORITY_MIN) as usize
-    }
+}
+
+/// Halt for a link at a priority that names no run queue: one at or above
+/// `NUM_PRIORITY_LEVELS`. Host test builds panic instead, so a test can
+/// observe the stop.
+#[cold]
+fn no_run_queue() -> !
+{
+    #[cfg(not(test))]
+    crate::fatal("enqueue: priority names no run queue");
+    #[cfg(test)]
+    panic!("enqueue: priority names no run queue");
 }
 
 /// A level whose threads link on run queue `index`: the inverse of
@@ -90,8 +101,9 @@ const fn queue_level(index: usize) -> u8
     }
     else
     {
-        // index < NUM_RUN_QUEUES <= 32, so the narrowing is lossless.
-        RT_PRIORITY_MIN + (index - FAIR_QUEUE - 1) as u8
+        // index < NUM_RUN_QUEUES <= 32, so the narrowing is lossless and the
+        // sum stays below NUM_PRIORITY_LEVELS.
+        RT_PRIORITY_MIN.saturating_add(index.saturating_sub(FAIR_QUEUE + 1) as u8)
     }
 }
 
@@ -504,6 +516,9 @@ impl PerCpuScheduler
     /// `!already_queued` denylist read under the TCB's held `sched_lock`)
     /// assert the result instead.
     ///
+    /// A `priority` at or above `NUM_PRIORITY_LEVELS` names no run queue and
+    /// halts the kernel.
+    ///
     /// # Safety
     /// The caller holds `self.lock`, or is the single-threaded boot path that
     /// links or dispatches init before any other CPU can reach this queue.
@@ -553,10 +568,6 @@ impl PerCpuScheduler
                 unsafe { (*tcb).thread_id },
             );
         }
-        debug_assert!(
-            p < NUM_PRIORITY_LEVELS,
-            "priority {p} out of range [0, {NUM_PRIORITY_LEVELS})"
-        );
 
         // Global single-link guard (#244/#289); the `queued_on` tag, the debug
         // panic, and the lossless release skip are specified in
@@ -596,14 +607,22 @@ impl PerCpuScheduler
             return false;
         }
 
-        self.increment_load();
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
+        // A priority at or above `NUM_PRIORITY_LEVELS` names no queue. Every
+        // caller reads `false` as the lossless skip of a TCB that stays linked,
+        // so a link that cannot be made halts instead.
+        let Some(queue) = queues.get_mut(q)
+        else
+        {
+            no_run_queue()
+        };
+        self.increment_load();
         match end
         {
-            QueueEnd::Tail => queues[q].enqueue(tcb),
-            QueueEnd::Head => queues[q].enqueue_head(tcb),
+            QueueEnd::Tail => queue.enqueue(tcb),
+            QueueEnd::Head => queue.enqueue_head(tcb),
         }
         // Tag the link under the owning scheduler.lock so any subsequent enqueue
         // (this or another CPU) observes it via the guard above. `priority` is a
@@ -657,11 +676,13 @@ impl PerCpuScheduler
             return self.idle();
         }
         // Highest set bit gives the highest non-empty run queue.
-        let q = 31 - ne.leading_zeros() as usize;
+        let q = ne.ilog2() as usize;
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        let Some(tcb) = queues[q].dequeue()
+        let Some((queue, tcb)) = queues
+            .get_mut(q)
+            .and_then(|queue| queue.dequeue().map(|tcb| (queue, tcb)))
         else
         {
             // Invariant: the `non_empty` bit is set iff the queue is
@@ -682,7 +703,7 @@ impl PerCpuScheduler
                 "dequeue: TCB magic corrupt at {tcb:?} (queue={q}) — use-after-free?",
             );
         }
-        if queues[q].is_empty()
+        if queue.is_empty()
         {
             // Release: a later Acquire load that sees this bit cleared has
             // also seen the dequeue store above.
@@ -745,7 +766,9 @@ impl PerCpuScheduler
         }
         let level = self.current_level.load(Ordering::Relaxed);
         let quantum = super::quantum_ticks(level);
-        let remaining = slice_remaining.min(quantum) - 1;
+        // Every level's quantum is at least one tick, so the subtraction
+        // never saturates.
+        let remaining = slice_remaining.min(quantum).saturating_sub(1);
         if remaining == 0
         {
             return TickOutcome::Expired { quantum };
@@ -868,14 +891,19 @@ impl PerCpuScheduler
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
         let queues = unsafe { &mut *self.queues.get() };
-        let removed = queues[q].remove(tcb);
+        let Some(queue) = queues.get_mut(q)
+        else
+        {
+            return false;
+        };
+        let removed = queue.remove(tcb);
         if removed
         {
             // Clear the single-link tag: the TCB is no longer on any queue.
             // SAFETY: tcb is a valid TCB; owning scheduler.lock held.
             unsafe { (*tcb).queued_on.store(-1, Ordering::Relaxed) };
             self.decrement_load();
-            if queues[q].is_empty()
+            if queue.is_empty()
             {
                 self.non_empty.fetch_and(!(1 << q), Ordering::Release);
             }
@@ -903,8 +931,10 @@ impl PerCpuScheduler
         let mut ne = self.non_empty.load(Ordering::Relaxed);
         while ne != 0
         {
-            let q = 31 - ne.leading_zeros() as usize;
-            if let Some(tcb) = queues[q].find_first_where(&mut pred)
+            let q = ne.ilog2() as usize;
+            if let Some(tcb) = queues
+                .get(q)
+                .and_then(|queue| queue.find_first_where(&mut pred))
             {
                 return Some((tcb, queue_level(q)));
             }
@@ -1606,6 +1636,18 @@ mod tests
         assert!(rm(&sched, pa, 4));
         assert!(enq(&sched, pa, 9));
         assert_ne!(sched.non_empty.load(Ordering::Relaxed) & bit(9), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "enqueue: priority names no run queue")]
+    fn enqueue_at_priority_with_no_queue_stops()
+    {
+        // A `false` return would read to the caller as the skip of a TCB that
+        // stays linked, leaving this one Ready on no queue: the link stops.
+        let sched = PerCpuScheduler::new();
+        let mut a = make_tcb();
+        let pa = &mut *a as *mut _;
+        let _ = enq(&sched, pa, NUM_PRIORITY_LEVELS as u8);
     }
 
     // ── Locate-and-relocate (relocate_ready_priority) ────────────────────────

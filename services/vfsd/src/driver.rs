@@ -69,7 +69,7 @@ pub fn spawn_fatfs_driver(
 {
     if caps.bootstrap_ep == 0
     {
-        std::os::seraph::log!("spawn_fatfs: worker thread not initialised");
+        std::os::seraph::log!(warn: "spawn_fatfs: worker thread not initialised");
         let _ = syscall::cap_delete(partition_ep);
         return None;
     }
@@ -114,11 +114,11 @@ pub fn teardown_driver(endpoint: u64)
 {
     if let Err(code) = syscall::cap_revoke_all(endpoint)
     {
-        std::os::seraph::log!("driver teardown: cap_revoke_all failed: code={code}");
+        std::os::seraph::log!(warn: "driver teardown: cap_revoke_all failed: code={code}");
     }
     if let Err(code) = syscall::cap_delete(endpoint)
     {
-        std::os::seraph::log!("driver teardown: cap_delete failed: code={code}");
+        std::os::seraph::log!(warn: "driver teardown: cap_delete failed: code={code}");
     }
 }
 
@@ -173,7 +173,7 @@ fn start_driver(
     let mount_reply = unsafe { ipc::ipc_call(send, &mount_msg, ipc_buf) }.ok()?;
     if mount_reply.label != 0
     {
-        std::os::seraph::log!("fatfs FS_MOUNT probe failed (label={})", mount_reply.label);
+        std::os::seraph::log!(warn: "fatfs FS_MOUNT probe failed (label={})", mount_reply.label);
         return None;
     }
 
@@ -304,7 +304,7 @@ fn spawn_via_module(
         // A call refused before delivery transfers no cap, so both are still
         // vfsd's; after delivery the handles are stale and each delete fails
         // closed.
-        std::os::seraph::log!("fatfs CREATE_PROCESS ipc_call failed");
+        std::os::seraph::log!(warn: "fatfs CREATE_PROCESS ipc_call failed");
         let _ = syscall::cap_delete(module_copy);
         let _ = syscall::cap_delete(badged_creator);
         pool.abandon_bootstrap(badge, handle);
@@ -312,28 +312,28 @@ fn spawn_via_module(
     };
     if create_reply.label != 0
     {
-        std::os::seraph::log!("fatfs CREATE_PROCESS failed");
+        std::os::seraph::log!(warn: "fatfs CREATE_PROCESS failed");
         pool.abandon_bootstrap(badge, handle);
         return false;
     }
 
     if create_reply.caps().is_empty()
     {
-        std::os::seraph::log!("fatfs CREATE_PROCESS reply missing caps");
+        std::os::seraph::log!(warn: "fatfs CREATE_PROCESS reply missing caps");
         pool.abandon_bootstrap(badge, handle);
         return false;
     }
 
     if !start_and_release(create_reply.caps(), ipc_buf)
     {
-        std::os::seraph::log!("fatfs START_PROCESS failed");
+        std::os::seraph::log!(warn: "fatfs START_PROCESS failed");
         pool.abandon_bootstrap(badge, handle);
         return false;
     }
 
     if !handle.wait()
     {
-        std::os::seraph::log!("fatfs bootstrap delivery failed");
+        std::os::seraph::log!(warn: "fatfs bootstrap delivery failed");
         return false;
     }
 
@@ -364,7 +364,9 @@ fn spawn_via_vfs(
             Ok(p) => p,
             Err(e) =>
             {
-                std::os::seraph::log!("fatfs spawn: NS_LOOKUP /services/fs/fatfs failed: {e}");
+                std::os::seraph::log!(
+                    warn: "fatfs spawn: NS_LOOKUP /services/fs/fatfs failed: {e}"
+                );
                 let _ = syscall::cap_delete(badged_creator);
                 delete_bootstrap_caps(bootstrap.blk, bootstrap.service);
                 return false;
@@ -387,7 +389,7 @@ fn spawn_via_vfs(
 
     if !handle.wait()
     {
-        std::os::seraph::log!("fatfs spawn failed");
+        std::os::seraph::log!(warn: "fatfs spawn failed");
         return false;
     }
 

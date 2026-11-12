@@ -64,13 +64,13 @@ fn main() -> !
         bootstrap_class_sends(info.creator_endpoint, ipc_buf)
     else
     {
-        std::os::seraph::log!("terminal: a devmgr.class seed is missing; exiting");
+        std::os::seraph::log!(error: "terminal: a devmgr.class seed is missing; exiting");
         syscall::thread_exit();
     };
     let Some(input_cap) = query_device(input_class, ipc_buf)
     else
     {
-        std::os::seraph::log!("terminal: no input device; exiting");
+        std::os::seraph::log!(error: "terminal: no input device; exiting");
         syscall::thread_exit();
     };
     // The framebuffer is the primary output but optional: a headless boot has
@@ -78,12 +78,12 @@ fn main() -> !
     let fb_cap = query_device(fb_class, ipc_buf);
     if fb_cap.is_none()
     {
-        std::os::seraph::log!("terminal: framebuffer unavailable; serial-only output");
+        std::os::seraph::log!(warn: "terminal: framebuffer unavailable; serial-only output");
     }
     let Some(serial_cap) = query_device(serial_class, ipc_buf)
     else
     {
-        std::os::seraph::log!("terminal: no serial device; exiting");
+        std::os::seraph::log!(error: "terminal: no serial device; exiting");
         syscall::thread_exit();
     };
 
@@ -132,7 +132,7 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) 
             Ok(child) => child,
             Err(e) =>
             {
-                std::os::seraph::log!("terminal: spawn {child_path} failed: {e}");
+                std::os::seraph::log!(error: "terminal: spawn {child_path} failed: {e}");
                 syscall::thread_exit();
             }
         };
@@ -159,7 +159,7 @@ fn run(child_path: &str, rx: &Receiver<Msg>, tx: &Sender<Msg>, sink: &mut Sink) 
                 Ok(Msg::ChildExited) => break,
                 Err(_) =>
                 {
-                    std::os::seraph::log!("terminal: input channel closed; exiting");
+                    std::os::seraph::log!(error: "terminal: input channel closed; exiting");
                     syscall::thread_exit();
                 }
             }
@@ -186,7 +186,7 @@ fn discipline(bytes: &[u8], line: &mut Vec<u8>, sink: &mut Sink, mut stdin: Opti
                 if let Some(si) = stdin.as_deref_mut()
                     && (si.write_all(line).is_err() || si.flush().is_err())
                 {
-                    std::os::seraph::log!("terminal: write to child stdin failed");
+                    std::os::seraph::log!(warn: "terminal: write to child stdin failed");
                 }
                 line.clear();
             }

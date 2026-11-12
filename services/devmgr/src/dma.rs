@@ -78,7 +78,7 @@ impl DmaService
         let Some(ep) = crate::create_service_endpoint()
         else
         {
-            std::os::seraph::log!("DMA endpoint not created");
+            std::os::seraph::log!(warn: "DMA endpoint not created");
             return None;
         };
         let shared = Arc::new(Shared {
@@ -103,7 +103,7 @@ impl DmaService
             })
             .is_err()
         {
-            std::os::seraph::log!("DMA thread not started");
+            std::os::seraph::log!(warn: "DMA thread not started");
             let _ = syscall::cap_delete(ep);
             return None;
         }
@@ -134,14 +134,14 @@ impl DmaService
             .register(device_badge, confinement, reserved)
             .is_err()
         {
-            std::os::seraph::log!("DMA table full; device {} not given DMA", device_badge);
+            std::os::seraph::log!(warn: "DMA table full; device {} not given DMA", device_badge);
             return None;
         }
         let Ok(cap) =
             syscall::cap_derive_badge(self.ep, syscall::RIGHTS_EP_SEND_GRANT, device_badge)
         else
         {
-            std::os::seraph::log!("DMA capability not derived for device {}", device_badge);
+            std::os::seraph::log!(warn: "DMA capability not derived for device {}", device_badge);
             lock(&self.shared.table).withdraw(device_badge);
             return None;
         };
@@ -195,7 +195,7 @@ impl DmaGrant
         if syscall::cap_revoke_all(self.cap).is_err()
         {
             std::os::seraph::log!(
-                "DMA capability of device {} not fully revoked",
+                warn: "DMA capability of device {} not fully revoked",
                 self.device_badge
             );
         }
@@ -215,7 +215,7 @@ impl DmaGrant
         };
         if self.confined && !blocked
         {
-            std::os::seraph::log!("device {} not blocked in the IOMMU", self.device_badge);
+            std::os::seraph::log!(warn: "device {} not blocked in the IOMMU", self.device_badge);
         }
         Withdrawal {
             device_badge: self.device_badge,
@@ -281,7 +281,7 @@ impl Withdrawal
         if !self.mappings.is_empty()
         {
             std::os::seraph::log!(
-                "device {}: {} DMA mappings' frames kept for the boot",
+                warn: "device {}: {} DMA mappings' frames kept for the boot",
                 self.device_badge,
                 self.mappings.len()
             );
@@ -296,7 +296,7 @@ fn serve(ep: u64, shared: &Shared)
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("DMA thread has no IPC buffer; DMA requests go unserved");
+        std::os::seraph::log!(warn: "DMA thread has no IPC buffer; DMA requests go unserved");
         return;
     }
     let mut guard = RecvGuard::new(crate::recv_diag);

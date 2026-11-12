@@ -430,13 +430,15 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_
     let Ok(mut buf) = sector_buffer()
     else
     {
-        std::os::seraph::log!("`FSInfo` access: no memory for a sector buffer");
+        std::os::seraph::log!(warn: "`FSInfo` access: no memory for a sector buffer");
         state.fsinfo_sector = u32::MAX;
         return;
     };
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
-        std::os::seraph::log!("`FSInfo` sector read failed; allocator falls back to FAT scan");
+        std::os::seraph::log!(
+            warn: "`FSInfo` sector read failed; allocator falls back to FAT scan"
+        );
         state.fsinfo_sector = u32::MAX;
         return;
     }
@@ -446,7 +448,8 @@ pub fn load_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc_
     if lead != FSI_LEAD_SIG || structsig != FSI_STRUCT_SIG || trail != FSI_TRAIL_SIG
     {
         std::os::seraph::log!(
-            "`FSInfo` signature mismatch (lead={lead:#x} struct={structsig:#x} trail={trail:#x}); ignoring hints"
+            warn: "`FSInfo` signature mismatch (lead={lead:#x} struct={structsig:#x} \
+             trail={trail:#x}); ignoring hints"
         );
         state.fsinfo_sector = u32::MAX;
         return;
@@ -475,18 +478,18 @@ pub fn flush_fsinfo(state: &mut FatState, cache: &PageCache, block_dev: u64, ipc
     let Ok(mut buf) = sector_buffer()
     else
     {
-        std::os::seraph::log!("`FSInfo` access: no memory for a sector buffer");
+        std::os::seraph::log!(warn: "`FSInfo` access: no memory for a sector buffer");
         return;
     };
     if !cache.read_sector(u64::from(state.fsinfo_sector), block_dev, &mut buf, ipc_buf)
     {
-        std::os::seraph::log!("`FSInfo` flush: sector read failed");
+        std::os::seraph::log!(warn: "`FSInfo` flush: sector read failed");
         return;
     }
     buf[488..492].copy_from_slice(&state.free_count_hint.to_le_bytes());
     buf[492..496].copy_from_slice(&state.next_free_hint.to_le_bytes());
     if !cache.write_sector(u64::from(state.fsinfo_sector), block_dev, &buf, ipc_buf)
     {
-        std::os::seraph::log!("`FSInfo` flush: sector write failed");
+        std::os::seraph::log!(warn: "`FSInfo` flush: sector write failed");
     }
 }

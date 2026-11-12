@@ -225,7 +225,7 @@ impl DeathSet
         }
         self.ws_cap.set(new);
         delete_object(old, self.ws_grant.replace(new_grant));
-        std::os::seraph::log!("main wait set widened to {members} members");
+        std::os::seraph::log!(debug: "main wait set widened to {members} members");
         Ok(())
     }
 
@@ -314,7 +314,7 @@ fn create_queue(
     if made > 0
     {
         std::os::seraph::log!(
-            "death queue {} created with {observers} observer nodes",
+            debug: "death queue {} created with {observers} observer nodes",
             made + 1
         );
     }

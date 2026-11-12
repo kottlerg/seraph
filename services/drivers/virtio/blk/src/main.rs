@@ -113,7 +113,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<DriverCaps>
     let device = unsafe { DeliveredDevice::receive(creator, ipc_buf) }?;
     if device.dma == 0
     {
-        std::os::seraph::log!("no DMA capability delivered");
+        std::os::seraph::log!(error: "no DMA capability delivered");
         return None;
     }
 
@@ -137,7 +137,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
 {
     if !layout.matches_delivered(caps.bars.bar_indices())
     {
-        std::os::seraph::log!("delivered BARs do not match the device's register regions");
+        std::os::seraph::log!(error: "delivered BARs do not match the device's register regions");
         syscall::thread_exit();
     }
     let window_pages = layout.window_pages();
@@ -147,13 +147,13 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
     let Ok(window) = reserve_pages(window_pages)
     else
     {
-        std::os::seraph::log!("BAR reserve_pages failed");
+        std::os::seraph::log!(error: "BAR reserve_pages failed");
         syscall::thread_exit();
     };
     let window_va = window.va_start();
     if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, window_pages)
     {
-        std::os::seraph::log!("BAR PT-budget funding failed");
+        std::os::seraph::log!(error: "BAR PT-budget funding failed");
         syscall::thread_exit();
     }
     let mut bar_va = window_va;
@@ -170,7 +170,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         // (`mmio_map` § Safety).
         if unsafe { syscall::mmio_map(caps.self_aspace, bar_cap, bar_va, 0) }.is_err()
         {
-            std::os::seraph::log!("BAR mmio_map failed");
+            std::os::seraph::log!(error: "BAR mmio_map failed");
             syscall::thread_exit();
         }
         bar_va += aperture.pages * PAGE_SIZE;
@@ -196,18 +196,18 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_ep, &request, ipc_buf) })
     else
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO ipc_call failed");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO ipc_call failed");
         syscall::thread_exit();
     };
     if reply.label != 0
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO returned error");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO returned error");
         syscall::thread_exit();
     }
     let words = reply.words();
     if words.len() < 3
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO reply truncated (header)");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply truncated (header)");
         syscall::thread_exit();
     }
     // A word past the field's width is a mismatch, not a value to truncate.
@@ -217,12 +217,12 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     if kind != Some(ipc::device_info_kind::VIRTIO_PCI)
         || version != Some(virtio_core::VIRTIO_PCI_INFO_VERSION)
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO reply kind/version mismatch");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply kind/version mismatch");
         syscall::thread_exit();
     }
     if byte_len != VirtioPciStartupInfo::SIZE
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO reply byte_len mismatch");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply byte_len mismatch");
         syscall::thread_exit();
     }
     // Unpack payload words into a byte buffer, then deserialise.
@@ -230,7 +230,7 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     let payload_words = byte_len.div_ceil(8);
     if words.len() < 3 + payload_words
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO reply truncated (payload)");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO reply truncated (payload)");
         syscall::thread_exit();
     }
     for (i, chunk) in buf.chunks_mut(8).enumerate()
@@ -241,7 +241,7 @@ fn query_device_info(devmgr_ep: u64, ipc_buf: *mut u64) -> VirtioPciStartupInfo
     let Some(info) = VirtioPciStartupInfo::from_bytes(&buf)
     else
     {
-        std::os::seraph::log!("QUERY_DEVICE_INFO from_bytes failed");
+        std::os::seraph::log!(error: "QUERY_DEVICE_INFO from_bytes failed");
         syscall::thread_exit();
     };
     info
@@ -257,7 +257,7 @@ fn report_ready(devmgr_ep: u64, ipc_buf: *mut u64)
     // SAFETY: ipc_buf is the registered IPC buffer.
     if let Err(e) = unsafe { ipc::report_driver_ready(devmgr_ep, ipc_buf) }
     {
-        std::os::seraph::log!("DRIVER_READY failed ({e:?}); exiting");
+        std::os::seraph::log!(error: "DRIVER_READY failed ({e:?}); exiting");
         syscall::thread_exit();
     }
 }
@@ -310,7 +310,7 @@ fn init_device(transport: &PciTransport) -> Geometry
 {
     if !reset_device(transport)
     {
-        std::os::seraph::log!("device reset unacknowledged");
+        std::os::seraph::log!(error: "device reset unacknowledged");
         syscall::thread_exit();
     }
     transport.set_status(STATUS_ACKNOWLEDGE);
@@ -329,7 +329,7 @@ fn init_device(transport: &PciTransport) -> Geometry
     let Some(features) = features
     else
     {
-        std::os::seraph::log!("feature negotiation failed");
+        std::os::seraph::log!(error: "feature negotiation failed");
         syscall::thread_exit();
     };
 
@@ -349,13 +349,13 @@ fn init_device(transport: &PciTransport) -> Geometry
     let Some((capacity, blk_size)) = config()
     else
     {
-        std::os::seraph::log!("device configuration region too short for the geometry");
+        std::os::seraph::log!(error: "device configuration region too short for the geometry");
         syscall::thread_exit();
     };
     let Some(geometry) = Geometry::new(capacity, blk_size)
     else
     {
-        std::os::seraph::log!("unsupported logical block size {blk_size:?}");
+        std::os::seraph::log!(error: "unsupported logical block size {blk_size:?}");
         syscall::thread_exit();
     };
     geometry
@@ -371,7 +371,7 @@ fn configure_queue_size(transport: &PciTransport) -> u16
     let queue_size = QUEUE_SIZE.min(max_size);
     if queue_size < 3
     {
-        std::os::seraph::log!("device requestq of {queue_size} descriptors holds no request chain");
+        std::os::seraph::log!(error: "device requestq of {queue_size} descriptors holds no request chain");
         syscall::thread_exit();
     }
     transport.queue_set_size(queue_size);
@@ -388,7 +388,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     let Some(ring_memory) = request_memory_caps(caps.memmgr_ep, ring_pages, ipc_buf)
     else
     {
-        std::os::seraph::log!("failed to allocate ring memory caps");
+        std::os::seraph::log!(error: "failed to allocate ring memory caps");
         syscall::thread_exit();
     };
     // The ring mapping lives for the driver process's lifetime; the
@@ -397,7 +397,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     let Ok(ring_range) = reserve_pages(ring_pages)
     else
     {
-        std::os::seraph::log!("ring reserve_pages failed");
+        std::os::seraph::log!(error: "ring reserve_pages failed");
         syscall::thread_exit();
     };
     let ring_va = ring_range.va_start();
@@ -416,13 +416,13 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     };
     if mapped.is_err()
     {
-        std::os::seraph::log!("ring mem_map failed");
+        std::os::seraph::log!(error: "ring mem_map failed");
         syscall::thread_exit();
     }
     let Ok(ring_bytes) = usize::try_from(ring_pages * PAGE_SIZE)
     else
     {
-        std::os::seraph::log!("{ring_pages} ring pages past the address width");
+        std::os::seraph::log!(error: "{ring_pages} ring pages past the address width");
         syscall::thread_exit();
     };
     // SAFETY: ring_va is mapped writable, ring_pages * PAGE_SIZE bytes.
@@ -432,7 +432,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let ring_addr = unsafe {
         virtio_core::dma::map_or_exit(caps.dma_ep, ring_memory, ipc_buf, |e| {
-            std::os::seraph::log!("ring memory not mapped for the device ({e:?})");
+            std::os::seraph::log!(error: "ring memory not mapped for the device ({e:?})");
         })
     };
     (ring_addr, ring_pages, ring_va)
@@ -474,7 +474,7 @@ fn setup_virtqueue(
     let queue_notify_off = transport.queue_notify_off();
     if !transport.doorbell_in_region(queue_notify_off)
     {
-        std::os::seraph::log!("queue doorbell outside the notification region");
+        std::os::seraph::log!(error: "queue doorbell outside the notification region");
         syscall::thread_exit();
     }
 
@@ -499,7 +499,7 @@ fn setup_virtqueue(
     let Some(vq) = vq
     else
     {
-        std::os::seraph::log!("device offers no usable requestq (queue size {queue_size})");
+        std::os::seraph::log!(error: "device offers no usable requestq (queue size {queue_size})");
         syscall::thread_exit();
     };
 
@@ -513,7 +513,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     let Some(data_memory) = request_memory_caps(caps.memmgr_ep, 1, ipc_buf)
     else
     {
-        std::os::seraph::log!("failed to allocate data memory cap");
+        std::os::seraph::log!(error: "failed to allocate data memory cap");
         syscall::thread_exit();
     };
     // The data mapping lives for the driver process's lifetime; the
@@ -522,7 +522,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     let Ok(data_range) = reserve_pages(1)
     else
     {
-        std::os::seraph::log!("data reserve_pages failed");
+        std::os::seraph::log!(error: "data reserve_pages failed");
         syscall::thread_exit();
     };
     let data_va = data_range.va_start();
@@ -541,7 +541,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     };
     if mapped.is_err()
     {
-        std::os::seraph::log!("data mem_map failed");
+        std::os::seraph::log!(error: "data mem_map failed");
         syscall::thread_exit();
     }
 
@@ -552,7 +552,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let data_addr = unsafe {
         virtio_core::dma::map_or_exit(caps.dma_ep, data_memory, ipc_buf, |e| {
-            std::os::seraph::log!("data page not mapped for the device ({e:?})");
+            std::os::seraph::log!(error: "data page not mapped for the device ({e:?})");
         })
     };
     IoLayout { data_va, data_addr }
@@ -624,11 +624,11 @@ fn isr_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("interrupt wait failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "interrupt wait failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("interrupt wait wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "interrupt wait wedged (err={err}); exiting");
         }
     }
 }
@@ -641,11 +641,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
     {
         ipc::recv_guard::RecvFailureStage::First =>
         {
-            std::os::seraph::log!("ipc_recv failing (err={err}); backing off");
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
         }
         ipc::recv_guard::RecvFailureStage::Fatal =>
         {
-            std::os::seraph::log!("ipc_recv wedged (err={err}); exiting");
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
         }
     }
 }
@@ -817,7 +817,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
         Ok(addr) => addr,
         Err(e) =>
         {
-            std::os::seraph::log!("data segment not mapped for the device ({e:?})");
+            std::os::seraph::log!(warn: "data segment not mapped for the device ({e:?})");
             reply_with(ipc::blk_errors::DEVICE_FAULT, ipc_buf);
             return;
         }
@@ -840,7 +840,7 @@ fn handle_transfer(msg: &IpcMessage, ipc_buf: *mut u64, rt: &mut BlkRuntime, dir
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if let Err(e) = unsafe { virtio_core::dma::unmap(rt.dma_ep, data_addr, ipc_buf) }
     {
-        std::os::seraph::log!("data segment not unmapped for the device ({e:?})");
+        std::os::seraph::log!(warn: "data segment not unmapped for the device ({e:?})");
     }
     reply_with(outcome.reply_label(), ipc_buf);
 }
@@ -906,10 +906,10 @@ fn quiesce_device(rt: &mut BlkRuntime)
 {
     if !reset_device(rt.transport)
     {
-        std::os::seraph::log!("request lost and device reset unacknowledged; exiting");
+        std::os::seraph::log!(error: "request lost and device reset unacknowledged; exiting");
         syscall::thread_exit();
     }
-    std::os::seraph::log!("request lost; device reset, failing all further I/O");
+    std::os::seraph::log!(warn: "request lost; device reset, failing all further I/O");
     rt.device_faulted = true;
 }
 
@@ -1095,7 +1095,7 @@ fn create_notification(what: &str) -> u64
     let Some(notification) = notification
     else
     {
-        std::os::seraph::log!("failed to create the {what}");
+        std::os::seraph::log!(error: "failed to create the {what}");
         syscall::thread_exit();
     };
     notification
@@ -1124,14 +1124,14 @@ fn main() -> !
     std::os::seraph::log!("starting");
     if caps.memmgr_ep == 0
     {
-        std::os::seraph::log!("no memmgr endpoint");
+        std::os::seraph::log!(error: "no memmgr endpoint");
         syscall::thread_exit();
     }
 
     // Query devmgr for VirtIO PCI capability locations via IPC.
     if caps.devmgr_ep == 0
     {
-        std::os::seraph::log!("no devmgr query endpoint");
+        std::os::seraph::log!(error: "no devmgr query endpoint");
         syscall::thread_exit();
     }
     let pci_info = query_device_info(caps.devmgr_ep, ipc_buf);
@@ -1140,7 +1140,7 @@ fn main() -> !
     let Some(layout) = pci_info.register_layout()
     else
     {
-        std::os::seraph::log!("device presents no complete set of register regions");
+        std::os::seraph::log!(error: "device presents no complete set of register regions");
         syscall::thread_exit();
     };
     let window_va = map_register_window(&caps, &layout);
@@ -1165,14 +1165,14 @@ fn main() -> !
     // Set up IRQ-driven completion: create a notification and bind it to the IRQ.
     if caps.irq_slot == 0
     {
-        std::os::seraph::log!("no IRQ cap, cannot operate");
+        std::os::seraph::log!(error: "no IRQ cap, cannot operate");
         syscall::thread_exit();
     }
     let irq_notification = create_notification("IRQ notification");
     let completion = create_notification("completion notification");
     if syscall::irq_register(caps.irq_slot, irq_notification, caps.irq_mode).is_err()
     {
-        std::os::seraph::log!("irq_register failed");
+        std::os::seraph::log!(error: "irq_register failed");
         syscall::thread_exit();
     }
     // The interrupt-service thread acknowledges every delivery from here on,
@@ -1185,7 +1185,7 @@ fn main() -> !
         completion,
     )
     {
-        std::os::seraph::log!("failed to start the interrupt-service thread");
+        std::os::seraph::log!(error: "failed to start the interrupt-service thread");
         syscall::thread_exit();
     }
     // Unmask the interrupt at the controller (I/O APIC / APLIC).
@@ -1202,7 +1202,7 @@ fn main() -> !
     // Enter service loop.
     if caps.service_ep == 0
     {
-        std::os::seraph::log!("no service endpoint, entering idle loop");
+        std::os::seraph::log!(warn: "no service endpoint, entering idle loop");
         loop
         {
             let _ = syscall::thread_yield();

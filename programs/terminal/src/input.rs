@@ -33,7 +33,7 @@ pub fn keyboard_loop(input_cap: u64, tx: &Sender<Msg>)
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("terminal: keyboard thread has no IPC buffer");
+        std::os::seraph::log!(error: "terminal: keyboard thread has no IPC buffer");
         return;
     }
     loop
@@ -43,12 +43,15 @@ pub fn keyboard_loop(input_cap: u64, tx: &Sender<Msg>)
         let Ok(reply) = (unsafe { ipc::ipc_call(input_cap, &req, ipc_buf) })
         else
         {
-            std::os::seraph::log!("terminal: INPUT_READ_EVENTS ipc_call failed");
+            std::os::seraph::log!(error: "terminal: INPUT_READ_EVENTS ipc_call failed");
             return;
         };
         if reply.label != input_errors::SUCCESS
         {
-            std::os::seraph::log!("terminal: INPUT_READ_EVENTS error label={:#x}", reply.label);
+            std::os::seraph::log!(
+                error: "terminal: INPUT_READ_EVENTS error label={:#x}",
+                reply.label
+            );
             return;
         }
         // The count is an external (wire) value; clamp it to the ABI maximum so
@@ -86,7 +89,7 @@ pub fn serial_loop(serial_cap: u64, tx: &Sender<Msg>)
     let ipc_buf = std::os::seraph::current_ipc_buf();
     if ipc_buf.is_null()
     {
-        std::os::seraph::log!("terminal: serial RX thread has no IPC buffer");
+        std::os::seraph::log!(error: "terminal: serial RX thread has no IPC buffer");
         return;
     }
 
@@ -99,7 +102,7 @@ pub fn serial_loop(serial_cap: u64, tx: &Sender<Msg>)
         })
     else
     {
-        std::os::seraph::log!("terminal: serial RX notification create failed");
+        std::os::seraph::log!(error: "terminal: serial RX notification create failed");
         return;
     };
     if let Ok(notif_send) = syscall::cap_derive(notif, syscall::RIGHTS_ALL)
@@ -123,12 +126,15 @@ pub fn serial_loop(serial_cap: u64, tx: &Sender<Msg>)
             let Ok(reply) = (unsafe { ipc::ipc_call(serial_cap, &req, ipc_buf) })
             else
             {
-                std::os::seraph::log!("terminal: SERIAL_READ_BYTES ipc_call failed");
+                std::os::seraph::log!(error: "terminal: SERIAL_READ_BYTES ipc_call failed");
                 return;
             };
             if reply.label & 0xFFFF != serial_errors::SUCCESS
             {
-                std::os::seraph::log!("terminal: SERIAL_READ_BYTES error label={:#x}", reply.label);
+                std::os::seraph::log!(
+                    error: "terminal: SERIAL_READ_BYTES error label={:#x}",
+                    reply.label
+                );
                 return;
             }
             // Count rides bits 16-31 of the reply label; bytes are packed in the

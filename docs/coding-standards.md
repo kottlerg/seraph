@@ -57,8 +57,20 @@ literal suffix (`0u8`), and `tests_outside_test_module` every test in the `#[cfg
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does not pass this
 configuration is non-compliant. Configuration lives in `[workspace.lints]` in the root
 `Cargo.toml`; all member crates opt in via `[lints] workspace = true`. A crate-root or module-root
-lint level MUST NOT enable a Clippy lint: a Clippy lint the project enforces is enforced in
-`[workspace.lints]`, for every crate.
+lint level MUST NOT enable a Clippy lint, except as a staged roll-out below permits: a Clippy lint
+the project enforces is enforced in `[workspace.lints]`, for every crate.
+
+`clippy::multiple_unsafe_ops_per_block` is being made mandatory by a staged roll-out. A crate whose
+sites are fixed enables it at its crate root, `#![warn(clippy::multiple_unsafe_ops_per_block)]`,
+which the build's warnings-as-errors makes binding for that crate. `core/kernel` is taken by
+subsystem: the same inner attribute at the root module of a subsystem
+(`core/kernel/src/<subsystem>/mod.rs`) binds that subsystem until every subsystem is fixed and the
+line moves to the kernel's crate root. The crates are taken in this order: `core/boot`,
+`core/kernel` by subsystem, the `abi/`, `shared/` and `runtime/` crates, the userspace services,
+drivers and programs, and the harness and host crates. The roll-out ends by moving the lint to
+`[workspace.lints]` and removing every crate-root and module-root level for it; a crate-root or
+module-root level that enables it is permitted only until then. A site is fixed as § Unsafe Code
+says.
 
 `cargo xtask test` runs Clippy over test code before it runs the tests: the test configuration
 (`cargo clippy --tests`) of every package it tests, once for each architecture's Linux target
@@ -228,6 +240,26 @@ correct. They are not error handling.
 ### Unsafe Code
 
 - Unsafe blocks MUST be as small as possible — wrap only the lines that require it.
+- An unsafe block MUST hold one unsafe operation (a raw-pointer dereference, a call of an unsafe
+  function or method, an access to a mutable static, an inline-assembly invocation, or a read of
+  a union field), so that each operation has a SAFETY comment of its own;
+  `clippy::multiple_unsafe_ops_per_block` checks this (§ Clippy). A block that holds several is
+  split, and each new block carries its own SAFETY comment.
+- Several operations MAY share one block when one invariant is the whole justification of each,
+  so that the SAFETY comment any one of them would carry alone states that invariant and nothing
+  else, and when each is an access to memory or registers the invariant names, at a place it
+  fixes, or the offset of a pointer by a constant to such a place: a run of field accesses through
+  pointers to the objects one held lock serialises, or of accesses at constant offsets to the
+  registers of one device under one mapping. An operation that needs a fact of its own takes a
+  block of its own: a pointer offset by a computed value, whose bound is that fact; a call whose
+  `# Safety` contract asks more than the invariant, the call of a function pointer loaded through
+  a raw pointer among them; and an operation that relies on an earlier one of the block, such as
+  a slice formed over memory the block has just zeroed. The shared block carries
+  `#[expect(clippy::multiple_unsafe_ops_per_block, reason = "...")]` on the statement or
+  expression that holds it, above its `// SAFETY:` comment, since
+  `clippy::undocumented_unsafe_blocks` reads the comment only directly above the block. The
+  `reason` names the shared invariant and is the rationale § E requires; the SAFETY comment shows
+  that the invariant holds.
 - Every unsafe block MUST be preceded by a `// SAFETY:` comment explaining why the
   operation is sound: what invariants hold, what has been checked, and why safe Rust
   cannot express it.
@@ -241,6 +273,16 @@ correct. They are not error handling.
 // SAFETY: `ptr` is non-null and correctly aligned, and we hold the exclusive
 // lock on this region for the duration of this call.
 let value = unsafe { ptr.read() };
+
+#[expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "every write is to a COM1 register, which the caller's contract gives this function"
+)]
+// SAFETY: the caller runs in ring 0 and calls this once, before any other COM1 access.
+unsafe {
+    outb(COM1 + 1, 0x00); // disable all interrupts
+    outb(COM1 + 3, 0x80); // DLAB = 1 (access divisor latch)
+}
 ```
 
 ---

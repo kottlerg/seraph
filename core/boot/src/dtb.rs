@@ -299,16 +299,29 @@ impl Fdt
         {
             return None;
         }
-        // SAFETY: magic validated; remaining header fields within blob.
-        let total_size = u32::from_be(unsafe { core::ptr::read_unaligned(hdr.add(1)) });
-        // SAFETY: header fields within validated blob.
-        let off_struct = u32::from_be(unsafe { core::ptr::read_unaligned(hdr.add(2)) });
-        // SAFETY: header fields within validated blob.
-        let off_strings = u32::from_be(unsafe { core::ptr::read_unaligned(hdr.add(3)) });
-        // SAFETY: header fields within validated blob.
-        let size_strings = u32::from_be(unsafe { core::ptr::read_unaligned(hdr.add(8)) });
-        // SAFETY: header fields within validated blob.
-        let size_struct = u32::from_be(unsafe { core::ptr::read_unaligned(hdr.add(9)) });
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every operation reaches a header word at a constant index below 10, inside \
+                      the 40 bytes the caller's contract gives"
+        )]
+        // SAFETY: the caller guarantees an identity-mapped blob of at least 40 bytes at `base`;
+        // each index is a constant below 10, so each offset and each read stays in the header.
+        let [
+            total_size,
+            off_struct,
+            off_strings,
+            size_strings,
+            size_struct,
+        ] = unsafe {
+            [
+                core::ptr::read_unaligned(hdr.add(1)),
+                core::ptr::read_unaligned(hdr.add(2)),
+                core::ptr::read_unaligned(hdr.add(3)),
+                core::ptr::read_unaligned(hdr.add(8)),
+                core::ptr::read_unaligned(hdr.add(9)),
+            ]
+        }
+        .map(u32::from_be);
 
         // Bounds: struct and strings blocks must fit inside total_size.
         if off_struct.checked_add(size_struct)? > total_size
@@ -375,9 +388,15 @@ impl Fdt
         let max_len = self.size_strings.saturating_sub(nameoff) as usize;
         let start = addr as *const u8;
         let mut len = 0;
-        // SAFETY: nameoff validated above; pointer arithmetic within strings block.
-        while len < max_len && unsafe { *start.add(len) } != 0
+        while len < max_len
         {
+            // SAFETY: nameoff + len < size_strings, so the offset stays inside the strings block.
+            let byte = unsafe { start.add(len) };
+            // SAFETY: `byte` is inside the strings block, which the blob maps readable.
+            if unsafe { *byte } == 0
+            {
+                break;
+            }
             // `len` is below `max_len`, so it is far below `usize::MAX`.
             len = len.saturating_add(1);
         }
@@ -1095,7 +1114,9 @@ fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
     while len < max
     {
         // SAFETY: base_addr + len is within struct block bounds (len < max ≤ size_struct).
-        let b = unsafe { core::ptr::read((base_addr as *const u8).add(len)) };
+        let byte = unsafe { (base_addr as *const u8).add(len) };
+        // SAFETY: `byte` is inside the struct block, which the blob maps readable.
+        let b = unsafe { core::ptr::read(byte) };
         // `len` is below `max`, so it is far below `usize::MAX`.
         len = len.saturating_add(1);
         if b == 0
@@ -1717,16 +1738,22 @@ pub unsafe fn parse_rng_seed(dtb_addr: u64, out: &mut [u8; 32]) -> usize
     let src = addr as *const u8;
     for (i, slot) in out.iter_mut().take(len).enumerate()
     {
-        // SAFETY: [addr, addr+prop_len) validated within the struct block.
-        *slot = unsafe { core::ptr::read(src.add(i)) };
+        // SAFETY: i < len ≤ prop_len, and [addr, addr+prop_len) is validated within the struct
+        // block, so the offset stays inside it.
+        let byte = unsafe { src.add(i) };
+        // SAFETY: `byte` is inside the validated property, which the blob maps readable.
+        *slot = unsafe { core::ptr::read(byte) };
     }
     // Scrub the full property in place (the whole seed, not just the copied
     // prefix), so nothing leaks through the userspace-visible DTB.
     let dst = addr as *mut u8;
     for i in 0..prop_len as usize
     {
-        // SAFETY: same validated range; the DTB is writable pre-ExitBootServices.
-        unsafe { core::ptr::write_volatile(dst.add(i), 0u8) };
+        // SAFETY: i < prop_len, inside the same validated range.
+        let byte = unsafe { dst.add(i) };
+        // SAFETY: `byte` is inside the validated property; the DTB is writable
+        // pre-ExitBootServices.
+        unsafe { core::ptr::write_volatile(byte, 0u8) };
     }
     len
 }

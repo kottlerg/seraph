@@ -383,7 +383,7 @@ GSIs on x86-64, the APLIC's sources on RISC-V), then one per message-signaled ta
 (`irq::message_capacity`: a slot of each boot CPU's delivery space,
 `interrupts::message_slots_per_cpu`), with a free-id pool for the targets. It is sized from the
 boot CPU count and, on RISC-V, the IMSIC identity count, both set in Phase 4, for every target
-the CPUs can deliver, since the buddy is sealed at Phase 7 and the table cannot grow after it.
+the CPUs can deliver, whether or not it is ever minted.
 
 Right after its per-CPU install, the BSP reports its extended-state save-area size
 (`fpu::report_save_area`), which sizes every Thread slot (`sched::thread_slot`) and the

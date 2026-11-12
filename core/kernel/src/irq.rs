@@ -738,8 +738,8 @@ const fn table_bytes(space: IdSpace) -> usize
 /// Called once on the BSP at Phase 5, after the interrupt controllers are
 /// discovered (`arch::current::interrupts::init`) and the boot CPU count is
 /// known (Phase 4), and before any source is routed. The table lives for the
-/// kernel's lifetime: the buddy is sealed at Phase 7, so the table is sized
-/// here for every target the boot CPUs can deliver.
+/// kernel's lifetime and is sized here for every target the boot CPUs can
+/// deliver.
 #[cfg(not(test))]
 pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 {

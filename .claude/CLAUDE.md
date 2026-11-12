@@ -104,6 +104,36 @@ read it to find the document a task needs.
 - File a genuine deferral (a different review surface, or an expansion too large to absorb) as a
   GitHub Issue, with the maintainer's approval, before the task closes.
 
+## Design decisions
+
+- Whoever drives the work owns it technically: the orchestrator of a batch owns the batch's
+  changes, the codebase, the standards and the documentation; a worker owns its PR; a session
+  working alone owns its task. The owner makes the technical decisions, reads the code behind
+  them, judges their quality and defends them. A technical choice is not handed to the
+  maintainer, or down to a worker, because it is hard.
+- Decide a major question (a mechanism, a lifetime, an interface, where a cost falls) from a
+  blank sheet: state the project's principles the question touches, lay out every design those
+  principles allow, including ones no Issue, plan or existing code proposes, and choose the best
+  final state.
+- Sunk work, rework, design time and the size of the change are not reasons for a choice. State
+  them as costs beside the choice; they do not enter it.
+- An option set that an Issue, a plan or a worker presents is input, not the limit of the
+  answer. Before choosing among such options, ask what the existing structure already provides
+  and what a design started today would look like.
+- Read an Issue, a plan or an acceptance item for its intent. The project moves on after one is
+  written, so its specifics (a mechanism, a file name, a number, a wording) may no longer be
+  possible, relevant, or the best way to reach its goal. Check each against the code and the
+  documents as they are now and work within the spirit of the Issue. When a specific no longer
+  holds, say so and decide the best way to meet the goal. A change to an acceptance item's
+  wording is a change to the Issue and is reported as one.
+- A major change goes before the maintainer for approval before it is built or merged: a major
+  design decision, a change to a standard, and a change to what a rule in `docs/` or an
+  instruction file requires. That is an approval and management gate, not a request to decide.
+  It is put as one owned pick with its reasons, its downsides, what it replaces, and what was
+  read, what was estimated and what was not verified; never as a menu.
+- The maintainer directs the workload and is the escalation point. Everything else technical is
+  decided by its owner and reported.
+
 ## Conflicts
 
 - When an instruction, plan, or change conflicts with a documented invariant or with this file,

@@ -30,6 +30,20 @@ Read docs/limits.md, docs/testing.md and `xtask/README.md` by section; they are 
 source files you will change, or judge, whole: a summary or an excerpt of kernel code is not a
 basis for a change to it.
 
+You own your PR technically, as `.claude/CLAUDE.md` § Design decisions says: its mechanism, its
+tests, its documents and their quality are your decisions, made from the code you have read and
+defended in the PR body. Decide a major question from a blank sheet, by the best final state
+under the project's principles, with sunk work, rework and design time left out of the choice.
+The mechanism an Issue names, and the options you first think of, are input. An Issue is read
+for its intent: check its specifics (mechanism, file names, numbers, wording) against the tree
+as it is now, and when one no longer holds, say so and meet the goal the best way; a change to
+an acceptance item's wording goes to the one you report to, who edits the Issue. A decision
+larger than your PR (it changes another component's contract, a standard, an Issue's acceptance,
+or what a document requires) goes to the one you report to: orchestrated, the orchestrator,
+never the maintainer; standalone, the maintainer. Bring it as one pick with its reasons, its
+downsides and what you read, never as a bare list of options, and never with "proceeding on the
+smallest one meanwhile" as its default.
+
 After your context is compacted, this file still applies, and the harness reloads
 `.claude/CLAUDE.md` from disk. Nothing else you read is kept. Before your next decision, re-read
 the skill file you were following, the Issue, and your PR's body, which is the state of your

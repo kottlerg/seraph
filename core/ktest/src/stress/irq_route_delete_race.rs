@@ -31,10 +31,16 @@
 //! each round, the controller, pinned to CPU 0, creates a notification,
 //! derives a copy of the line, routes the line through it (`SYS_IRQ_ROUTE`)
 //! and binds it to the notification, and deletes the notification's only
-//! capability, so the binding holds its last reference. It then repeatedly acknowledges (`SYS_IRQ_ACK`; each delivery
-//! masks the line again) and raises the interrupt, so deliveries follow one
-//! another, while a deleter pinned to CPU 1 waits a varying delay and deletes
-//! the copy, which frees the notification with the binding. On every other
+//! capability, so the binding holds its last reference. It then repeatedly
+//! acknowledges (`SYS_IRQ_ACK`; each delivery masks the line again) and
+//! raises the interrupt, so deliveries follow one another, while a deleter
+//! pinned to CPU 1 waits for a varying number of those raises to begin, then
+//! a varying delay, and deletes the copy, which frees the notification with
+//! the binding. Counting raises rather than time puts the delete among the
+//! deliveries however long a raise takes: under KVM with the IOMMU attached,
+//! QEMU emulates the I/O APIC outside the host kernel, and each
+//! acknowledgement's unmask and each delivery's mask is many times slower
+//! than with the in-kernel one. On every other
 //! round the deleter first rebinds the copy to a spare notification
 //! (`SYS_IRQ_REGISTER`), which drops the round's notification's last
 //! reference and frees it while the line is still bound, and then deletes
@@ -55,10 +61,16 @@
 //! the keeper's binding must still be served: once it acknowledges, a raise
 //! signals it.
 //!
+//! A round arms the race when one of its raises overlaps the deleter's delete
+//! (with its rebind, on a rebound round): the delete was not done when the
+//! raise began and had begun when it ended. The overlap is judged per raise
+//! rather than sampled once per acknowledgement and raise, so a delete
+//! shorter than one acknowledgement still counts when a raise meets it.
+//!
 //! Required: the kernel survives every round, every rebind succeeds, every
-//! keeper is served after its round's delete, and in some rounds of each kind
-//! the controller began a raise while the deleter's rebind or delete was
-//! running (the race armed). The UART interrupt is disabled again when the
+//! keeper is served after its round's delete, and in at least a quarter of
+//! the rounds of each kind (direct, rebound, binding) the race armed
+//! ([`MIN_ARMED_DIVISOR`]). The UART interrupt is disabled again when the
 //! cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
@@ -87,6 +99,12 @@ const DELETER_CPU: u32 = 1;
 const MAX_RAISES: u32 = 20_000;
 /// Raises after the delete was seen, so deliveries also meet a removed binding.
 const TRAILING_RAISES: u32 = 16;
+/// Raises the deleter waits for before its delay, at most: 1 to this many,
+/// varying by round ([`lead`]).
+const LEAD_RAISES: u32 = 4;
+/// Each kind of round must arm the race in at least its rounds divided by
+/// this: a quarter of them ([`armed_floors`]).
+const MIN_ARMED_DIVISOR: u32 = 4;
 /// Wait for the delivery probe's signal, in ms, through [`crate::scaled_bound`].
 const PROBE_TIMEOUT_MS: u64 = 1000;
 /// Polls (1 ms each) for the deleter's exit, through [`crate::scaled_polls`].
@@ -108,6 +126,9 @@ static DELETING: AtomicU32 = AtomicU32::new(0);
 static REBIND_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Last round whose delete the deleter finished.
 static DELETED: AtomicU32 = AtomicU32::new(0);
+/// Raises the controller has begun in the current round; reset before the
+/// round is published. The deleter waits for its round's lead of them.
+static RAISED: AtomicU32 = AtomicU32::new(0);
 /// Set by the controller to end the deleter.
 static QUIT: AtomicU32 = AtomicU32::new(0);
 
@@ -223,11 +244,26 @@ fn race(ctx: &TestContext, line: u64) -> TestResult
         "stress::irq_route_delete_race: armed_binding=",
         u64::from(armed[2]),
     );
-    if armed.contains(&0)
+    if armed.iter().zip(armed_floors()).any(|(&got, floor)| got < floor)
     {
-        return Err("stress::irq_route_delete_race: no raise overlapped a delete of some kind");
+        return Err(
+            "stress::irq_route_delete_race: fewer rounds of some kind armed the race than its floor",
+        );
     }
     Ok(())
+}
+
+/// The fewest rounds of each kind (direct, rebound, binding) that must arm the
+/// race: the kind's rounds divided by [`MIN_ARMED_DIVISOR`]. Rebound rounds are
+/// the even ones of [`CYCLES`], direct rounds the odd ones.
+const fn armed_floors() -> [u32; 3]
+{
+    let notified = CYCLES.wrapping_div(2).wrapping_div(MIN_ARMED_DIVISOR);
+    [
+        notified,
+        notified,
+        BINDING_CYCLES.wrapping_div(MIN_ARMED_DIVISOR),
+    ]
 }
 
 /// The notification rounds, then the binding rounds; returns how many rounds
@@ -278,7 +314,8 @@ fn rebound(round: u32) -> bool
 }
 
 /// The rounds; returns, for direct deletes and deletes after a rebind, how
-/// many began a raise while the rebind or the delete was running.
+/// many armed the race: a raise overlapped the rebind or the delete
+/// ([`raise_sampled`]).
 fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
 {
     let mut armed = [0u32; 2];
@@ -305,21 +342,16 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
         }
         DOOMED.store(copy, Ordering::Release);
         REBIND.store(u32::from(rebound(round)), Ordering::Release);
+        RAISED.store(0, Ordering::Release);
         ROUND.store(round, Ordering::Release);
         let mut raises = 0u32;
         let mut overlapped = false;
         while DELETED.load(Ordering::Acquire) != round && raises < MAX_RAISES
         {
-            // Sampled before the raise, so a raise counts as overlapping only
-            // when it began while the delete was running (begun, not done).
-            let during = DELETING.load(Ordering::Acquire) == round
-                && DELETED.load(Ordering::Acquire) != round;
             // Unmask before each raise, since each delivery masks the line;
             // after the delete the ack fails.
             irq_ack(copy).ok();
-            raise_tx_interrupt();
-            raises = raises.saturating_add(1);
-            overlapped |= during;
+            overlapped |= raise_sampled(round, &mut raises);
         }
         if overlapped
         {
@@ -340,6 +372,32 @@ fn rounds(ctx: &TestContext, line: u64) -> Result<[u32; 2], &'static str>
         await_delete(round)?;
     }
     Ok(armed)
+}
+
+/// Raise the line once in `round`, the acknowledgements before it made, and
+/// count the raise in `raises` and, as it begins, in [`RAISED`]. Returns
+/// whether the raise and the round's delete (with its rebind, on a rebound
+/// round) overlapped: the delete was not done when the raise began, and had
+/// begun when it ended.
+fn raise_sampled(round: u32, raises: &mut u32) -> bool
+{
+    let not_done = DELETED.load(Ordering::Acquire) != round;
+    *raises = raises.saturating_add(1);
+    RAISED.store(*raises, Ordering::Release);
+    raise_tx_interrupt();
+    not_done && DELETING.load(Ordering::Acquire) == round
+}
+
+/// Raises the deleter waits for in `round` before its delay: 1 to
+/// [`LEAD_RAISES`], so the delete begins once deliveries follow one another,
+/// at a varying one of them. Taken from bits of a multiplicative hash of the
+/// round that the deleter's delay does not use, so the lead varies apart from
+/// the delay and from the round's kind ([`rebound`]).
+fn lead(round: u32) -> u32
+{
+    (round.wrapping_mul(2_654_435_761) >> 8)
+        .wrapping_rem(LEAD_RAISES)
+        .saturating_add(1)
 }
 
 /// Wait for `round`'s delete (bounded), so the handle is never reused while
@@ -388,7 +446,7 @@ fn binding_rounds(ctx: &TestContext, line: u64, first: u32) -> Result<u32, &'sta
 /// One binding round: a kept copy of the line, holding its route, bound to
 /// `ntfs[0]` (the keeper) and a doomed copy bound to `ntfs[1]`, whose cap the deleter
 /// deletes while the controller raises; then the kept binding must be served.
-/// Returns whether a raise began while the delete was running.
+/// Returns whether a raise overlapped the delete ([`raise_sampled`]).
 fn binding_round(line: u64, round: u32, ntfs: [u64; 2]) -> Result<bool, &'static str>
 {
     let kept = cap_derive(line, RIGHTS_ALL)
@@ -425,20 +483,17 @@ fn race_binding_delete(
     }
     DOOMED.store(doomed, Ordering::Release);
     REBIND.store(0, Ordering::Release);
+    RAISED.store(0, Ordering::Release);
     ROUND.store(round, Ordering::Release);
     let mut raises = 0u32;
     let mut overlapped = false;
     while DELETED.load(Ordering::Acquire) != round && raises < MAX_RAISES
     {
-        let during =
-            DELETING.load(Ordering::Acquire) == round && DELETED.load(Ordering::Acquire) != round;
         // Both bindings owe after each delivery; the doomed one's ack fails
         // once its cap is deleted.
         irq_ack(kept).ok();
         irq_ack(doomed).ok();
-        raise_tx_interrupt();
-        raises = raises.saturating_add(1);
-        overlapped |= during;
+        overlapped |= raise_sampled(round, &mut raises);
     }
     if DELETED.load(Ordering::Acquire) == round
     {
@@ -464,9 +519,9 @@ fn race_binding_delete(
     }
 }
 
-/// Deleter: per published round, wait a varying delay, then rebind the
-/// round's Interrupt cap to the spare when the round asks, and delete it; exit
-/// on `QUIT`.
+/// Deleter: per published round, wait for the round's lead of raises
+/// ([`lead`]) and a varying delay, then rebind the round's Interrupt cap to
+/// the spare when the round asks, and delete it; exit on `QUIT`.
 extern "C" fn deleter_entry(_arg: u64) -> !
 {
     let mut seen = 0u32;
@@ -483,8 +538,15 @@ extern "C" fn deleter_entry(_arg: u64) -> !
             continue;
         }
         seen = round;
-        // 0 to 4095 spins (a multiplicative hash of the round), so the delete
-        // lands at varying points in the raise sequence.
+        // The round's lead of raises first, so the delete lands among the
+        // deliveries however long each raise takes; the controller raises
+        // until the delete is done, so they come.
+        while RAISED.load(Ordering::Acquire) < lead(round) && QUIT.load(Ordering::Acquire) == 0
+        {
+            core::hint::spin_loop();
+        }
+        // Then 0 to 4095 spins (a multiplicative hash of the round), so the
+        // delete lands at varying points between two raises.
         for _ in 0..(round.wrapping_mul(2_654_435_761) >> 20)
         {
             core::hint::spin_loop();

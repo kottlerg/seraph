@@ -841,4 +841,14 @@ mod tests
         assert_eq!(pool.push_reserved(&mut a, last).unwrap_err(), last);
         assert_eq!(pool.run_count(), u64::from(i) + 1);
     }
+
+    #[test]
+    fn grant_entries_clamps_a_count_past_the_array_to_every_entry()
+    {
+        let grant = Grant {
+            entries: [(1, 2, 3); MAX_GRANT_RUNS],
+            count: MAX_GRANT_RUNS + 1,
+        };
+        assert_eq!(grant.entries().len(), MAX_GRANT_RUNS);
+    }
 }

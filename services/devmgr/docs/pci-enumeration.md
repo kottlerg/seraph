@@ -134,13 +134,16 @@ For each matched device, devmgr:
    in ascending BAR index, each sized to the pages the regions in it reach.
    The scan (`firmware::scan`) takes, for each type, the first structure in
    the capability list that lies wholly inside one of the device's MMIO BARs
-   (VirtIO 1.2 § 4.1.4.1), skipping a later structure of a type already
-   located, one in an I/O BAR, one naming a reserved BAR index, and one
-   reaching past its BAR's end. A function left with no
-   region of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
-   block or input device), or with a common region shorter than the 0x38
-   bytes of registers the transport addresses in it (`COMMON_CFG_LEN`),
-   presents no layout; it is refused, logged, when
+   and that the transport can use (`virtio_core::structure_usable`; VirtIO
+   1.2 § 4.1.4.1), skipping a later structure of a type already located, one
+   in an I/O BAR, one naming a reserved BAR index, one reaching past its
+   BAR's end, a common structure shorter than the 0x38 bytes of registers
+   the transport addresses in it (`COMMON_CFG_LEN`) or at an offset not
+   4-aligned (§ 4.1.4.3.1), and a notification structure whose offset or
+   `notify_off_multiplier` is not 2-aligned (§ 4.1.4.4.1), since either
+   would make a register access misaligned. A function left with no region
+   of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
+   block or input device) presents no layout; it is refused, logged, when
    its driver declares the VirtIO status reset, and bound as any other
    function otherwise.
 2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided

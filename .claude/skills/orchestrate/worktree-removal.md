@@ -8,8 +8,11 @@ batch spawned and the record lists (the state, or the log for a worker that
 `cargo xtask orch worker <name> --remove` has taken out of the state), in two places:
 
 - **At a worker's retirement:** after its last PR merges (or its gate report, when it has no PR
-  left to merge) and nothing is left for it. A worktree parked on a `park/<name>` branch stays
-  until wind-down.
+  left to merge) and nothing is left for it. A worktree parked on a `park/<name>` branch for a
+  composition check is removed once nothing is left for its worker: the check has handed back
+  and leaves it no PR, having found no defect or recorded each on an open Issue. A defect that
+  becomes the worker's next PR keeps the worktree until that PR merges and the composition
+  check its merge owes, when it owes one, hands back the same way.
 - **At wind-down:** every worktree the record lists that is still present, after confirming no
   active worker owns it.
 
@@ -18,7 +21,10 @@ Before removing one, check both conditions, and skip and report a worktree that 
 - The records are in your checkout: `target/xtask/review/pr<N>/` holds the records of every run
   the worker reported. They exist nowhere else once the worktree is gone.
 - Nothing is unsaved or unpushed: `git -C <path> status --porcelain` prints nothing, and after
-  `git fetch origin`, `git -C <path> rev-list HEAD --not --remotes=origin` prints nothing.
+  `git fetch origin`, `git -C <path> rev-list HEAD --not --remotes=origin` prints nothing. A
+  commit it prints that changes no file, which `git -C <path> diff --quiet <commit>^ <commit>`
+  shows by exiting 0, is a park or keep-alive commit and not unsaved work, provided every
+  commit it prints is one.
 
 Remove with `git worktree remove --force --force <path>` (the harness locks agent worktrees, and
 a locked worktree refuses a single `--force`), run `git worktree prune` once after a sweep, and

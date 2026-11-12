@@ -41,23 +41,36 @@ The following individual lints are additionally mandatory:
   `get_unwrap`, `indexing_slicing`, `infinite_loop`, `iter_over_hash_type`, `mem_forget`,
   `mixed_read_write_in_expression`, `precedence_bits`, `pub_without_shorthand`,
   `renamed_function_params`, `rest_pat_in_fully_bound_structs`, `self_named_module_files`,
-  `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `todo`, `try_err`, `unimplemented`,
-  `unnecessary_rest_pattern`, `unnecessary_safety_comment`, `unnecessary_safety_doc`,
-  `unnecessary_self_imports`, and `unneeded_field_pattern`.
+  `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`,
+  `try_err`, `unimplemented`, `unnecessary_rest_pattern`, `unnecessary_safety_comment`,
+  `unnecessary_safety_doc`, `unnecessary_self_imports`, and `unneeded_field_pattern`.
 - From `clippy::nursery`: `as_ptr_cast_mut`, `collection_is_never_read`,
   `debug_assert_with_mut_call`, `fallible_impl_from`, `literal_string_with_formatting_args`,
   `read_zero_byte_vec`, `significant_drop_in_scrutinee`, `trailing_empty_array`,
   `transmute_undefined_repr`, and `uninhabited_references`.
 
 `pub_without_shorthand` keeps the `pub(crate)` form, `self_named_module_files` the
-`mod.rs` form of a module with children, and `separated_literal_suffix` the unseparated
-literal suffix (`0u8`).
+`mod.rs` form of a module with children, `separated_literal_suffix` the unseparated
+literal suffix (`0u8`), and `tests_outside_test_module` every test in the `#[cfg(test)]` module of
+§ D Form.
 
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does not pass this
 configuration is non-compliant. Configuration lives in `[workspace.lints]` in the root
 `Cargo.toml`; all member crates opt in via `[lints] workspace = true`. A crate-root or module-root
 lint level MUST NOT enable a Clippy lint: a Clippy lint the project enforces is enforced in
 `[workspace.lints]`, for every crate.
+
+`cargo xtask test` runs Clippy over test code before it runs the tests: the test configuration
+(`cargo clippy --tests`) of every package it tests, once for each architecture's Linux target
+(`x86_64-unknown-linux-gnu` and `riscv64gc-unknown-linux-gnu`), so test code gated on either
+architecture is linted on any host, with all warnings treated as errors. Test code is held to the
+configuration above except for four lints, which that pass allows: `unwrap_used`, `expect_used`,
+`indexing_slicing` and `arithmetic_side_effects`. In a test, an unwrapped error, an out-of-range
+index and an overflow each fail the test, which is how a test reports a defect; the lints exist to
+keep those outcomes out of production code (§ Error Handling). The list `TEST_RELAXED_LINTS` in
+`xtask/src/commands/test.rs` is the one place the relaxation is stated, and a test does not
+suppress these lints at its own site. The pass sees the code outside the test modules too, as
+the test configuration compiles it; the build's pass lints that code without the relaxation.
 
 A site that `indexing_slicing` or `arithmetic_side_effects` reports is fixed by a checked, wrapping
 or saturating operation chosen for the meaning the code already has, a `get` with an error path
@@ -448,7 +461,8 @@ mod tests
 - Tests MUST be independent, order-independent, and deterministic — no randomness, no timing,
   no external or shared mutable state.
 - In test code, `assert!`, `assert_eq!`, `assert_ne!`, `unwrap()`, and `expect()` are all
-  permitted.
+  permitted, and indexing and arithmetic need no checked form (§ Clippy names the lints relaxed
+  for test code).
 
 ### What Must Be Tested
 
@@ -539,9 +553,10 @@ formatter behavior MUST:
 
 Blanket or module-wide suppressions are forbidden without explicit justification.
 
-A suppression whose lint fires only in some build configurations (for example host test
-builds, where an item's only callers are compiled out) is permitted; its rationale MUST name
-the configuration in which the lint fires. Where § C permits that configuration's predicate
+Test code is linted (§ Clippy), and a suppression in it follows this section like one in
+production code. A suppression whose lint fires only in some build configurations (for example
+host test builds, where an item's only callers are compiled out) is permitted; its rationale MUST
+name the configuration in which the lint fires. Where § C permits that configuration's predicate
 (for example `test`), the suppression MUST be gated on it, either with
 `#[cfg_attr(<predicate>, allow(...))]` or by sitting on an item that is itself gated on the
 predicate. Where § C forbids the predicate at the site (a `target_arch` predicate outside an
@@ -561,7 +576,8 @@ capacity: usize,
 
 `cargo xtask build` is the single mandatory build command; it runs Clippy with the
 mandated lint groups and treats all warnings as errors. The command's options are listed
-in [xtask/README.md](../xtask/README.md) § `cargo xtask build`.
+in [xtask/README.md](../xtask/README.md) § `cargo xtask build`. `cargo xtask test` runs Clippy
+over test code the same way (§ Clippy) before it runs the unit tests.
 
 ---
 

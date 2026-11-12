@@ -355,11 +355,18 @@ cargo xtask clean [--all]
 
 ### `cargo xtask test`
 
-Run Seraph unit tests on the host target.
+Lint the test code, then run Seraph unit tests on the host target.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
 ```
+
+The lint pass runs `cargo clippy --tests` over the selected packages, once for
+`x86_64-unknown-linux-gnu` and once for `riscv64gc-unknown-linux-gnu`, with all warnings treated as
+errors, so test code gated on either architecture is linted on any host. Each pass only checks: it
+builds `std` from source for its target (`-Zbuild-std=std,panic_unwind,test`), needs no rustup
+target, and links nothing. It allows the lints `TEST_RELAXED_LINTS` in `src/commands/test.rs`
+names, as [docs/coding-standards.md](../docs/coding-standards.md) § Clippy states.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
@@ -1265,7 +1272,7 @@ printed line: each CI job is its own host.
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
 | [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
 | [services/gdbstub/README.md](../services/gdbstub/README.md) | The GDB stub `--debug-target` stages and `test-gdb` drives |
-| [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` enforces; the Markdown and file-header rules `lint-docs` checks |
+| [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` and `test` enforce; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |
 

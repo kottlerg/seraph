@@ -125,13 +125,14 @@ unsafe fn walk_locked(mut f: impl FnMut(*mut ThreadControlBlock)) -> bool
     unsafe {
         let mut hare = THREAD_REGISTRY_HEAD;
         let mut tortoise = THREAD_REGISTRY_HEAD;
-        let mut steps = 0usize;
+        // The tortoise steps on every second step of the hare.
+        let mut tortoise_steps = true;
         while !hare.is_null()
         {
             f(hare);
             hare = (*hare).registry_next;
-            steps += 1;
-            if steps & 1 == 0
+            tortoise_steps = !tortoise_steps;
+            if tortoise_steps
             {
                 tortoise = (*tortoise).registry_next;
             }

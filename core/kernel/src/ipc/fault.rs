@@ -260,14 +260,18 @@ pub unsafe fn report_unbound_kill(tcb: *mut ThreadControlBlock)
 pub unsafe fn has_handler(tcb: *mut ThreadControlBlock, kind: u64) -> bool
 {
     // SAFETY: tcb validated by caller; the binding fields are atomics.
-    !unsafe { (*tcb).fault_handlers[class_of_kind(kind)].load(Ordering::Acquire) }.is_null()
+    let handlers = unsafe { &(*tcb).fault_handlers };
+    handlers
+        .get(class_of_kind(kind))
+        .is_some_and(|h| !h.load(Ordering::Acquire).is_null())
 }
 
 /// Read `tcb`'s fault-handler binding for `class` once, pin its endpoint, and
 /// open a delivery through it.
 ///
 /// Returns the bound `EndpointObject`, with a reference the caller owns and
-/// MUST release, and the badge bound with it; `None` when no handler is bound.
+/// MUST release, and the badge bound with it; `None` when no handler is bound
+/// or `class` names no class.
 /// The pair is read under `tcb`'s `sched_lock`, the lock [`publish_bindings`]
 /// publishes it under for both binders, so the badge is the one
 /// bound with this endpoint, and the reference is taken while the binding's
@@ -300,8 +304,12 @@ unsafe fn pin_binding(
     // wakeable.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        let ep = core::ptr::NonNull::new((*tcb).fault_handlers[class].load(Ordering::Acquire));
-        let badge = (*tcb).fault_badges[class].load(Ordering::Relaxed);
+        let binding = (*tcb)
+            .fault_handlers
+            .get(class)
+            .zip((*tcb).fault_badges.get(class));
+        let ep = binding.and_then(|(h, _)| core::ptr::NonNull::new(h.load(Ordering::Acquire)));
+        let badge = binding.map_or(0, |(_, b)| b.load(Ordering::Relaxed));
         if let Some(ep) = ep
         {
             ep.as_ref().header.inc_ref();
@@ -358,17 +366,18 @@ pub unsafe fn pin_bindings(
     // reference, so it is live for inc_ref.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        for (class, slot) in out.iter_mut().enumerate()
+        let bound = (*tcb).fault_handlers.iter().zip(&(*tcb).fault_badges);
+        for ((slot, selected), (handler, badge)) in out.iter_mut().zip(selected).zip(bound)
         {
-            if !selected[class]
+            if !selected
             {
                 continue;
             }
-            let ep = (*tcb).fault_handlers[class].load(Ordering::Acquire);
+            let ep = handler.load(Ordering::Acquire);
             if !ep.is_null()
             {
                 (*ep).header.inc_ref();
-                *slot = (ep, (*tcb).fault_badges[class].load(Ordering::Relaxed));
+                *slot = (ep, badge.load(Ordering::Relaxed));
             }
         }
         (*tcb).sched_lock.unlock_raw(saved);
@@ -401,15 +410,18 @@ pub unsafe fn publish_bindings(
     // binding pairs are written under this lock.
     unsafe {
         let saved = (*tcb).sched_lock.lock_raw();
-        for (class, &(ep, badge)) in new.iter().enumerate()
+        let bound = (*tcb).fault_handlers.iter().zip(&(*tcb).fault_badges);
+        let classes = new.iter().zip(selected).zip(old.iter_mut()).zip(bound);
+        for (class, (((&(ep, badge), selected), old_ep), (handler, badge_cell))) in
+            classes.enumerate()
         {
-            if !selected[class]
+            if !selected
             {
                 continue;
             }
-            let old_badge = (*tcb).fault_badges[class].swap(badge, Ordering::Relaxed);
-            old[class] = (*tcb).fault_handlers[class].swap(ep, Ordering::AcqRel);
-            let changed = !core::ptr::eq(old[class], ep) || old_badge != badge;
+            let old_badge = badge_cell.swap(badge, Ordering::Relaxed);
+            *old_ep = handler.swap(ep, Ordering::AcqRel);
+            let changed = !core::ptr::eq(*old_ep, ep) || old_badge != badge;
             if changed && delivery_in_flight(tcb, class)
             {
                 redeliver = Some(class);

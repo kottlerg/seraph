@@ -55,9 +55,13 @@ pub const fn extended_pages(extended_bytes: u64) -> u64
 
 /// Bytes of a Thread slot whose save area is `extended_bytes`: the guard,
 /// the kernel stack, the wrapper and TCB page, and the save area's pages.
+/// Saturates at `u64::MAX`, a size no Memory cap can supply, so a save area
+/// too large to address fails the retype.
 pub const fn slot_bytes(extended_bytes: u64) -> u64
 {
-    EXTENDED_OFFSET + extended_pages(extended_bytes) * PAGE_SIZE as u64
+    extended_pages(extended_bytes)
+        .saturating_mul(PAGE_SIZE as u64)
+        .saturating_add(EXTENDED_OFFSET)
 }
 
 /// The save-area size the boot CPU reported, in bytes; zero before the
@@ -72,9 +76,10 @@ pub fn set_extended_bytes(bytes: u64)
 }
 
 /// Bytes of the per-thread save area's pages, which thread creation zeroes.
+/// Saturates as [`slot_bytes`] does; a slot that size is never retyped.
 pub fn extended_area_bytes() -> u64
 {
-    extended_pages(EXTENDED_BYTES.load(Ordering::Relaxed)) * PAGE_SIZE as u64
+    extended_pages(EXTENDED_BYTES.load(Ordering::Relaxed)).saturating_mul(PAGE_SIZE as u64)
 }
 
 /// Bytes every Thread retype debits from its source Memory cap.
@@ -112,5 +117,14 @@ mod tests
     fn the_largest_riscv_area_composes_into_whole_pages()
     {
         assert_eq!(slot_bytes(262_448), (BASE + 65) * PAGE);
+    }
+
+    // The defect caught: a save area whose page-rounded size passes `u64`
+    // wrapped to a small slot size, so a retype debited too few bytes.
+    #[test]
+    fn an_area_too_large_to_address_saturates_the_slot()
+    {
+        assert_eq!(slot_bytes(u64::MAX), u64::MAX);
+        assert_eq!(slot_bytes(u64::MAX - EXTENDED_OFFSET), u64::MAX);
     }
 }

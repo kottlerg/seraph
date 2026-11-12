@@ -29,8 +29,8 @@ use boot_protocol::{INIT_MAX_SEGMENTS, InitSegment, SegmentFlags};
 /// # Errors
 ///
 /// A static description when the biased RELRO range, a segment end, or a
-/// split tail's physical address overflows `u64`, or when a split would
-/// exceed `INIT_MAX_SEGMENTS`.
+/// split tail's physical address overflows `u64`, or when `count` or a split
+/// would exceed `INIT_MAX_SEGMENTS`.
 pub fn apply_relro(
     segments: &mut [InitSegment; INIT_MAX_SEGMENTS],
     count: &mut u32,
@@ -51,10 +51,14 @@ pub fn apply_relro(
         .and_then(|v| v.checked_add(0xFFF))
         .ok_or(overflow)?
         & !0xFFF;
-    let n = *count as usize;
-    for i in 0..n
+    // The live segments, and the free slots a split's tail takes in order.
+    let (live, free) = segments
+        .split_at_mut_checked(*count as usize)
+        .ok_or("Phase 9: init segment count exceeds INIT_MAX_SEGMENTS")?;
+    let mut free = free.iter_mut();
+    for slot in live
     {
-        let seg = segments[i];
+        let seg = *slot;
         if !matches!(seg.flags, SegmentFlags::ReadWrite)
         {
             continue;
@@ -66,29 +70,33 @@ pub fn apply_relro(
         }
         if seg_end <= ro_end
         {
-            segments[i].flags = SegmentFlags::Read;
+            slot.flags = SegmentFlags::Read;
         }
         else
         {
             // The segment table is the boot protocol's fixed
             // `[InitSegment; INIT_MAX_SEGMENTS]`, so a split past it is a clean error.
-            if *count as usize >= INIT_MAX_SEGMENTS
+            let Some(tail) = free.next()
+            else
             {
                 return Err("Phase 9: RELRO split exceeds INIT_MAX_SEGMENTS");
-            }
+            };
             // Split at the page-aligned range end: in-page offsets stay
             // preserved because head_size shifts phys and virt equally.
-            // ro_end > seg.virt_addr held above, so head_size is in range.
-            let head_size = ro_end - seg.virt_addr;
-            segments[i].size = head_size;
-            segments[i].flags = SegmentFlags::Read;
-            segments[*count as usize] = InitSegment {
+            // seg.virt_addr < ro_end < seg_end held above, so neither
+            // difference wraps.
+            let head_size = ro_end.wrapping_sub(seg.virt_addr);
+            *tail = InitSegment {
                 phys_addr: seg.phys_addr.checked_add(head_size).ok_or(overflow)?,
                 virt_addr: ro_end,
-                size: seg.size - head_size,
+                size: seg.size.wrapping_sub(head_size),
                 flags: SegmentFlags::ReadWrite,
             };
-            *count += 1;
+            slot.size = head_size;
+            slot.flags = SegmentFlags::Read;
+            // A tail took a free slot, so the count stays within
+            // INIT_MAX_SEGMENTS.
+            *count = count.saturating_add(1);
         }
     }
     Ok(())
@@ -104,8 +112,18 @@ fn resolve_target(segments: &[InitSegment], offset: u64) -> Option<u64>
     segments
         .iter()
         .filter(|seg| matches!(seg.flags, SegmentFlags::ReadWrite))
-        .find(|seg| offset >= seg.virt_addr && end <= seg.virt_addr + seg.size)
-        .map(|seg| seg.phys_addr + (offset - seg.virt_addr))
+        .find(|seg| {
+            offset >= seg.virt_addr
+                && seg
+                    .virt_addr
+                    .checked_add(seg.size)
+                    .is_some_and(|seg_end| end <= seg_end)
+        })
+        .and_then(|seg| {
+            offset
+                .checked_sub(seg.virt_addr)
+                .and_then(|d| seg.phys_addr.checked_add(d))
+        })
 }
 
 /// Apply init's `RELATIVE` relocations: for each record, write
@@ -165,7 +183,8 @@ pub fn apply(
         unsafe {
             core::ptr::write_unaligned(crate::mm::paging::phys_to_virt(phys) as *mut u64, value);
         }
-        applied += 1;
+        // At most the table's records, far below the saturation point.
+        applied = applied.saturating_add(1);
     }
     Ok(applied)
 }
@@ -284,5 +303,32 @@ mod tests
         assert!(apply_relro(&mut segs, &mut count, 0, 0x4000, 0x1000).is_ok());
         assert!(matches!(segs[0].flags, SegmentFlags::ReadWrite));
         assert_eq!(count, 1);
+    }
+
+    // Defect caught: a split written past the table, or a count past the
+    // table read as segments, instead of a clean error.
+    #[test]
+    fn relro_refuses_a_full_table_and_a_count_past_it()
+    {
+        let full = [seg(0x3000, 0x20_0000, 0x3000, SegmentFlags::ReadWrite); INIT_MAX_SEGMENTS];
+        let (mut segs, mut count) = seg_table(&full);
+        assert!(apply_relro(&mut segs, &mut count, 0, 0x3000, 0x800).is_err());
+        let (mut segs, _) = seg_table(&full);
+        let mut past = INIT_MAX_SEGMENTS as u32 + 1;
+        assert!(apply_relro(&mut segs, &mut past, 0, 0x3000, 0x800).is_err());
+    }
+
+    // Defect caught: a target whose segment's physical end passes the address
+    // space, resolved to a wrapped physical address.
+    #[test]
+    fn rejects_target_whose_physical_address_wraps()
+    {
+        let segs = [seg(
+            0x2000,
+            u64::MAX - 0xFFF,
+            0x2000,
+            SegmentFlags::ReadWrite,
+        )];
+        assert_eq!(resolve_target(&segs, 0x3000), None);
     }
 }

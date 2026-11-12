@@ -77,8 +77,8 @@ fn acc_for(cpu: usize) -> Option<&'static Acc>
 
 /// Fold a cycle-counter sample for `cpu` into its buffer. Interrupt-safe:
 /// allocation-free and lock-free.
-// cast_possible_truncation: both casts narrow values already masked below
-// ACC_WORDS / 64; both targets are 64-bit so usize == u64.
+// cast_possible_truncation: `n as usize` is lossless (both targets are 64-bit,
+// so usize == u64), and `(n & 63) as u32` narrows a value masked below 64.
 #[allow(clippy::cast_possible_truncation)]
 pub fn sample(cpu: usize, source: Source, cycle: u64)
 {
@@ -88,13 +88,17 @@ pub fn sample(cpu: usize, source: Source, cycle: u64)
         return;
     };
     let n = acc.count.fetch_add(1, Ordering::Relaxed);
-    let idx = (n % ACC_WORDS as u64) as usize;
+    let Some(word) = acc.words.get((n as usize) % ACC_WORDS)
+    else
+    {
+        return;
+    };
     // Non-crypto compression: distinguish the sample by sequence and source so
     // identical cycle deltas at different events do not cancel under XOR.
     let mixed = cycle.rotate_left((n & 63) as u32)
         ^ n.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (source as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    acc.words[idx].fetch_xor(mixed, Ordering::Relaxed);
+    word.fetch_xor(mixed, Ordering::Relaxed);
 }
 
 /// Serialise CPU `cpu`'s accumulator — staging words, sample count, and the
@@ -104,16 +108,18 @@ pub fn sample(cpu: usize, source: Source, cycle: u64)
 fn collect(cpu: usize) -> Option<[u8; (ACC_WORDS + 2) * 8]>
 {
     let acc = acc_for(cpu)?;
-    let mut buf = [0u8; (ACC_WORDS + 2) * 8];
-    for i in 0..ACC_WORDS
-    {
-        let w = acc.words[i].load(Ordering::Relaxed);
-        buf[i * 8..][..8].copy_from_slice(&w.to_le_bytes());
-    }
+    let words = acc.words.each_ref().map(|w| w.load(Ordering::Relaxed));
     let count = acc.count.load(Ordering::Relaxed);
-    buf[ACC_WORDS * 8..][..8].copy_from_slice(&count.to_le_bytes());
     let cycle = crate::arch::current::entropy::read_cycle_counter();
-    buf[(ACC_WORDS + 1) * 8..][..8].copy_from_slice(&cycle.to_le_bytes());
+    let mut buf = [0u8; (ACC_WORDS + 2) * 8];
+    for (bytes, value) in buf
+        .as_chunks_mut::<8>()
+        .0
+        .iter_mut()
+        .zip(words.into_iter().chain([count, cycle]))
+    {
+        *bytes = value.to_le_bytes();
+    }
     Some(buf)
 }
 

@@ -118,18 +118,34 @@ pub fn direct_map_base() -> u64
 /// Fixed by hardware: an x86-64 PDE leaf and an Sv39 level-1 megapage each map 2 MiB.
 pub const LARGE_PAGE_SIZE: u64 = 2 * 1024 * 1024;
 
-/// Convert a physical address to its direct-map virtual address.
+/// Convert a physical address to its direct-map virtual address. Phase 3
+/// checks that the direct map of every physical address it maps ends below
+/// the kernel image (`check_direct_map_below_image`), so the sum does not wrap
+/// for any address the map covers.
 #[inline(always)]
 pub fn phys_to_virt(phys: u64) -> u64
 {
-    direct_map_base() + phys
+    direct_map_base().wrapping_add(phys)
 }
 
-/// Convert a direct-map virtual address back to a physical address.
+/// Convert a direct-map virtual address back to a physical address: the
+/// inverse of [`phys_to_virt`], which does not wrap for a direct-map address.
 #[inline(always)]
 pub fn virt_to_phys(virt: u64) -> u64
 {
-    virt - direct_map_base()
+    virt.wrapping_sub(direct_map_base())
+}
+
+/// Round `val` up to a multiple of [`LARGE_PAGE_SIZE`], saturating at the
+/// highest multiple below `u64::MAX`.
+const fn large_page_up(val: u64) -> u64
+{
+    const MASK: u64 = LARGE_PAGE_SIZE - 1;
+    match val.checked_add(MASK)
+    {
+        Some(v) => v & !MASK,
+        None => !MASK,
+    }
 }
 
 // ── Error and flags types ─────────────────────────────────────────────────────
@@ -441,18 +457,30 @@ impl PoolState
             {
                 return Err(PagingError::OutOfFrames);
             }
-            let pa = self.carve_pa_base + (self.carve_next * 4096) as u64;
-            self.carve_next += 1;
+            // A carve frame past the end of the address space is no frame.
+            let pa = frame_offset(self.carve_next)
+                .and_then(|offset| self.carve_pa_base.checked_add(offset))
+                .ok_or(PagingError::OutOfFrames)?;
+            // Below carve_capacity, so the count never saturates.
+            self.carve_next = self.carve_next.saturating_add(1);
             return Ok((self.dm_base.wrapping_add(pa), pa));
         }
         if self.next >= self.pool_capacity
         {
             return Err(PagingError::OutOfFrames);
         }
-        let offset = (self.next * 4096) as u64;
-        let va = self.pool_va_base + offset;
-        let pa = self.pool_pa_base + offset;
-        self.next += 1;
+        // A pool frame past the end of the address space is no frame.
+        let offset = frame_offset(self.next).ok_or(PagingError::OutOfFrames)?;
+        let va = self
+            .pool_va_base
+            .checked_add(offset)
+            .ok_or(PagingError::OutOfFrames)?;
+        let pa = self
+            .pool_pa_base
+            .checked_add(offset)
+            .ok_or(PagingError::OutOfFrames)?;
+        // Below pool_capacity, so the count never saturates.
+        self.next = self.next.saturating_add(1);
         Ok((va, pa))
     }
 
@@ -490,7 +518,10 @@ impl PoolState
     /// meaningless for arbitrary physical addresses.
     pub fn phys_to_virt(&self, phys: u64) -> u64
     {
-        let seed_end = self.pool_pa_base + (self.pool_capacity * 4096) as u64;
+        // The seed is the kernel image's BSS pool, so its end does not
+        // saturate.
+        let seed_end = frame_offset(self.pool_capacity)
+            .map_or(u64::MAX, |bytes| self.pool_pa_base.saturating_add(bytes));
         if self.carve_capacity == 0 || (self.pool_pa_base..seed_end).contains(&phys)
         {
             phys.wrapping_add(self.kv_minus_kp)
@@ -500,6 +531,13 @@ impl PoolState
             self.dm_base.wrapping_add(phys)
         }
     }
+}
+
+/// Byte offset of the `index`th 4 KiB frame of a pool or carve, `None` when it
+/// passes the end of the address space.
+fn frame_offset(index: usize) -> Option<u64>
+{
+    (index as u64).checked_mul(4096)
 }
 
 // ── Carve bootstrap ───────────────────────────────────────────────────────────
@@ -519,7 +557,8 @@ pub fn carve_bootstrap_end(chunks: (u64, u64)) -> u64
 #[must_use]
 pub fn carve_frames_below(base: u64, frames: usize, end: u64) -> usize
 {
-    ((end.saturating_sub(base) / PAGE_SIZE as u64) as usize).min(frames)
+    const PAGE: u64 = PAGE_SIZE as u64;
+    ((end.saturating_sub(base) / PAGE) as usize).min(frames)
 }
 
 /// Switch `pool` to the carve `(base, frames, dm_base)` (see
@@ -549,12 +588,13 @@ pub fn map_carve_rest(
         dm_base,
         carve_frames_below(base, frames, rest.0),
     );
-    let mut phys = rest.0;
-    while phys < rest.1
+    for phys in (rest.0..rest.1).step_by(LARGE_PAGE_SIZE as usize)
     {
         map_chunk(pool, phys)?;
-        phys += LARGE_PAGE_SIZE;
-        pool.extend_carve_mapped(carve_frames_below(base, frames, phys));
+        // The chunk's end, which saturates only for a chunk that ends the
+        // address space and then counts every carve frame below it.
+        let mapped_end = phys.saturating_add(LARGE_PAGE_SIZE);
+        pool.extend_carve_mapped(carve_frames_below(base, frames, mapped_end));
     }
     Ok(())
 }
@@ -574,15 +614,14 @@ pub fn span_table_bound(start: u64, end: u64, leaf_shift: u32) -> u64
     {
         return 0;
     }
-    let mut total = 0;
+    // end > start here, so `last >= start` and each level's count is at least
+    // one; every count is far below the saturation point.
+    let last = end.saturating_sub(1);
     // A table one level above a leaf reaches 512 leaves.
-    let mut shift = leaf_shift + 9;
-    while shift <= 48
-    {
-        total += ((end - 1) >> shift) - (start >> shift) + 1;
-        shift += 9;
-    }
-    total
+    (leaf_shift.saturating_add(9)..=48)
+        .step_by(9)
+        .map(|shift| ((last >> shift).saturating_sub(start >> shift)).saturating_add(1))
+        .fold(0, u64::saturating_add)
 }
 
 /// Upper bound on the frames stage 2 of [`init_kernel_page_tables`] draws from
@@ -606,14 +645,16 @@ pub fn stage2_table_bound(
     hole: Option<u64>,
 ) -> u64
 {
+    // Every term is a table count of a 64-bit address space, far below the
+    // saturation point; a saturated span end only over-counts.
     let mut frames = span_table_bound(dm_base, dm_base.saturating_add(direct_top), 21);
     if hole.is_some_and(|h| h < direct_top)
     {
-        frames += 1;
+        frames = frames.saturating_add(1);
     }
     for &(base, size) in mmio_regions
     {
-        frames += if base < direct_top
+        let tables = if base < direct_top
         {
             1
         }
@@ -622,15 +663,17 @@ pub fn stage2_table_bound(
             let va = dm_base.saturating_add(base);
             span_table_bound(va, va.saturating_add(size), 12)
         };
+        frames = frames.saturating_add(tables);
     }
     if let Some((base, size)) = fb
     {
         let va = dm_base.saturating_add(base);
-        frames += span_table_bound(va, va.saturating_add(size), 12);
+        frames = frames.saturating_add(span_table_bound(va, va.saturating_add(size), 12));
     }
     if trampoline != 0
     {
-        frames += span_table_bound(trampoline, trampoline + PAGE_SIZE as u64, 12);
+        let end = trampoline.saturating_add(PAGE_SIZE as u64);
+        frames = frames.saturating_add(span_table_bound(trampoline, end, 12));
     }
     frames
 }
@@ -680,7 +723,7 @@ impl DirectMapLayout<'_>
         span_overlaps_regions(chunk, LARGE_PAGE_SIZE, self.mmio)
             || self
                 .hole
-                .is_some_and(|h| (chunk..chunk + LARGE_PAGE_SIZE).contains(&h))
+                .is_some_and(|h| (chunk..chunk.saturating_add(LARGE_PAGE_SIZE)).contains(&h))
     }
 
     /// Flags of the 4 KiB page at `page`, or `None` for the hole.
@@ -696,9 +739,12 @@ impl DirectMapLayout<'_>
 /// `hole_direct_map_page`).
 pub fn fill_split_table<E>(table: &mut [E; 512], chunk: u64, leaf: impl Fn(u64) -> E)
 {
-    for (i, entry) in table.iter_mut().enumerate()
+    // A chunk is 2 MiB-aligned, so even the last chunk of the address space,
+    // whose end saturates, holds all 512 pages below that end.
+    let pages = (chunk..chunk.saturating_add(LARGE_PAGE_SIZE)).step_by(PAGE_SIZE);
+    for (entry, page) in table.iter_mut().zip(pages)
     {
-        *entry = leaf(chunk + (i * PAGE_SIZE) as u64);
+        *entry = leaf(page);
     }
 }
 
@@ -721,8 +767,8 @@ fn handoff_guard_for(entry_sp: u64, base_mark: impl FnOnce(u64) -> u64) -> Optio
         PAGE_SIZE as u64,
         boot_protocol::layout::HANDOFF_STACK_BYTES as u64,
     );
-    (base >= PAGE_SIZE as u64 && base_mark(base) == boot_protocol::layout::HANDOFF_STACK_BASE_MARK)
-        .then(|| base - PAGE_SIZE as u64)
+    base.checked_sub(PAGE_SIZE as u64)
+        .filter(|_| base_mark(base) == boot_protocol::layout::HANDOFF_STACK_BASE_MARK)
 }
 
 /// Physical address of the handoff stack's guard page, which the direct map
@@ -842,7 +888,7 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
 
     // Compute the highest physical address to determine direct map extent.
     let max_phys = compute_max_physical_address(info);
-    let max_phys_rounded = (max_phys + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1);
+    let max_phys_rounded = large_page_up(max_phys);
 
     let dm_base = direct_map_base();
     check_direct_map_below_image(info, dm_base);
@@ -851,12 +897,13 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     // RISC-V, whose APLIC, IMSIC and UART take their device memory type from the
     // platform PMAs). Bases come from `BootInfo.kernel_mmio` directly because
     // `crate::platform::capture_kernel_mmio` does not run until Phase 4.
-    let mut mmio_regions = [(0u64, 0u64); crate::arch::current::platform::MMIO_DIRECT_MAP_REGIONS];
+    let mut mmio_slots = [(0u64, 0u64); crate::arch::current::platform::MMIO_DIRECT_MAP_REGIONS];
     let mmio_count = crate::arch::current::platform::collect_mmio_direct_map_regions(
         &info.kernel_mmio,
-        &mut mmio_regions,
+        &mut mmio_slots,
     );
-    let mmio_regions = &mmio_regions[..mmio_count];
+    // The count is at most the slots it filled; a larger one filled them all.
+    let mmio_regions = mmio_slots.get(..mmio_count).unwrap_or(&mmio_slots);
     // The handoff stack's guard, left out of the direct map.
     let hole = find_handoff_guard();
     let layout = DirectMapLayout {
@@ -878,11 +925,12 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     );
     let carve = crate::mm::init::find_boot_table_carve(info, carve_frames)
         .ok_or(BootTableError::NoTableCarve)?;
-    let carve_end = carve + carve_frames * PAGE_SIZE as u64;
-    let carve_chunks = (
-        carve & !(LARGE_PAGE_SIZE - 1),
-        (carve_end + LARGE_PAGE_SIZE - 1) & !(LARGE_PAGE_SIZE - 1),
-    );
+    // The carve is a free RAM piece that holds its frames, so its end does
+    // not saturate.
+    let carve_end = carve_frames
+        .saturating_mul(PAGE_SIZE as u64)
+        .saturating_add(carve);
+    let carve_chunks = (carve & !(LARGE_PAGE_SIZE - 1), large_page_up(carve_end));
 
     // ── Stage 1, from the BSS seed ────────────────────────────────────────────
     // Only the carve's first chunks: they hold the frames that map the rest
@@ -928,14 +976,12 @@ pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
     // Direct physical map of [0, max_phys_rounded) in 2 MiB pages, except a
     // chunk holding a kernel MMIO page or the hole (`map_direct_chunk`). The
     // carve's own chunks are mapped already.
-    let mut phys: u64 = 0;
-    while phys < max_phys_rounded
+    for phys in (0..max_phys_rounded).step_by(LARGE_PAGE_SIZE as usize)
     {
         if phys < carve_chunks.0 || phys >= carve_chunks.1
         {
             map_direct_chunk(root_va, dm_base, phys, layout, &mut pool)?;
         }
-        phys += LARGE_PAGE_SIZE;
     }
 
     // Framebuffer, when it lies above the RAM ceiling.
@@ -1064,7 +1110,9 @@ fn map_direct_chunk(
         return map_direct_pages(root_va, dm_base, (phys, LARGE_PAGE_SIZE), layout, pool);
     }
     let rw = direct_map_page_flags(phys, &[]);
-    arch_paging::map_large_page(root_va, dm_base + phys, phys, rw, pool)
+    // The direct map ends below the kernel image
+    // (`check_direct_map_below_image`), so the address does not wrap.
+    arch_paging::map_large_page(root_va, dm_base.wrapping_add(phys), phys, rw, pool)
 }
 
 /// Map the 2 MiB direct-map chunks `[chunks.0, chunks.1)` ([`map_direct_chunk`]).
@@ -1077,11 +1125,9 @@ fn map_direct_chunks(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    let mut phys = chunks.0;
-    while phys < chunks.1
+    for phys in (chunks.0..chunks.1).step_by(LARGE_PAGE_SIZE as usize)
     {
         map_direct_chunk(root_va, dm_base, phys, layout, pool)?;
-        phys += LARGE_PAGE_SIZE;
     }
     Ok(())
 }
@@ -1098,16 +1144,20 @@ fn map_direct_pages(
     pool: &mut PoolState,
 ) -> Result<(), PagingError>
 {
-    let page_mask = !(PAGE_SIZE as u64 - 1);
-    let mut page = phys & page_mask;
-    let end = (phys + len + PAGE_SIZE as u64 - 1) & page_mask;
-    while page < end
+    const OFFSET_MASK: u64 = PAGE_SIZE as u64 - 1;
+    // A span past the end of the address space is cut at it.
+    let end = phys
+        .saturating_add(len)
+        .checked_add(OFFSET_MASK)
+        .map_or(!OFFSET_MASK, |v| v & !OFFSET_MASK);
+    for page in (phys & !OFFSET_MASK..end).step_by(PAGE_SIZE)
     {
         if let Some(flags) = layout.page_flags(page)
         {
-            arch_paging::map_page(root_va, dm_base + page, page, flags, pool)?;
+            // The direct map ends below the kernel image
+            // (`check_direct_map_below_image`), so the address does not wrap.
+            arch_paging::map_page(root_va, dm_base.wrapping_add(page), page, flags, pool)?;
         }
-        page += PAGE_SIZE as u64;
     }
     Ok(())
 }
@@ -1120,9 +1170,11 @@ fn framebuffer_above(info: &BootInfo, max_phys_rounded: u64) -> Option<(u64, u64
 {
     let fb_phys = info.framebuffer.physical_base;
     (fb_phys != 0 && fb_phys >= max_phys_rounded).then(|| {
+        // The product of two `u32` values fits a `u64`, so it never
+        // saturates.
         (
             fb_phys,
-            u64::from(info.framebuffer.stride) * u64::from(info.framebuffer.height),
+            u64::from(info.framebuffer.stride).saturating_mul(u64::from(info.framebuffer.height)),
         )
     })
 }
@@ -1176,12 +1228,10 @@ fn map_kernel_image(root_va: u64, info: &BootInfo, pool: &mut PoolState)
                      flags: PageFlags,
                      pool: &mut PoolState|
      -> Result<(), PagingError> {
-        let mut virt = virt_start;
-        while virt < virt_end
+        for virt in (virt_start..virt_end).step_by(PAGE_SIZE)
         {
             let pa = virt.wrapping_sub(kv).wrapping_add(kp);
             arch_paging::map_page(root_va, virt, pa, flags, pool)?;
-            virt += PAGE_SIZE as u64;
         }
         Ok(())
     };
@@ -1262,11 +1312,9 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
         executable: false,
         uncacheable: false,
     };
-    let mut virt = lo;
-    while virt < hi
+    for virt in (lo..hi).step_by(PAGE_SIZE)
     {
         arch_paging::map_page(root_va, virt, virt, rw, pool)?;
-        virt += PAGE_SIZE as u64;
     }
 
     Ok(())
@@ -1289,9 +1337,10 @@ fn map_boot_stack(root_va: u64, info: &BootInfo, pool: &mut PoolState) -> Result
 /// [`HANDOFF_STACK_BYTES`]: boot_protocol::layout::HANDOFF_STACK_BYTES
 fn handoff_stack_window(entry_sp: u64) -> (u64, u64)
 {
-    let stack = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
-    let lo = crate::stack_depth::handoff_base(entry_sp, PAGE_SIZE as u64, stack);
-    (lo, lo + 2 * stack)
+    const STACK: u64 = boot_protocol::layout::HANDOFF_STACK_BYTES as u64;
+    let lo = crate::stack_depth::handoff_base(entry_sp, PAGE_SIZE as u64, STACK);
+    // A window past the end of the address space is cut at it.
+    (lo, lo.saturating_add(2 * STACK))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1873,5 +1922,43 @@ mod tests
         assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
         pool.extend_carve_mapped(3);
         assert_eq!(pool.alloc_frame(), Ok((0x10_2000, 0x10_2000)));
+    }
+
+    // Defect caught: a pool or carve frame whose address wraps past the end of
+    // the address space to a low frame, handed out as a page table.
+    #[test]
+    fn a_frame_past_the_end_of_the_address_space_is_refused()
+    {
+        let top = u64::MAX & !0xFFF;
+        let mut pool = PoolState::new_for_test(top, 2);
+        assert_eq!(pool.alloc_frame(), Ok((top, top)));
+        assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
+        pool.switch_to_carve(top, 2, 0, 2);
+        assert_eq!(pool.alloc_frame(), Ok((top, top)));
+        assert_eq!(pool.alloc_frame(), Err(PagingError::OutOfFrames));
+    }
+
+    // Defect caught: a rounding that wraps to 0 for an address in the last
+    // large page, so the direct map would cover nothing.
+    #[test]
+    fn large_page_rounding_saturates_at_the_last_large_page()
+    {
+        assert_eq!(large_page_up(0), 0);
+        assert_eq!(large_page_up(1), LARGE_PAGE_SIZE);
+        assert_eq!(large_page_up(LARGE_PAGE_SIZE), LARGE_PAGE_SIZE);
+        assert_eq!(large_page_up(u64::MAX), !(LARGE_PAGE_SIZE - 1));
+    }
+
+    // Defect caught: a split table whose leaves skip or repeat a page, or wrap
+    // to low addresses for the last chunk of the address space.
+    #[test]
+    fn a_split_table_maps_each_page_of_its_chunk_in_order()
+    {
+        let mut table = [0u64; 512];
+        let chunk = 0u64.wrapping_sub(LARGE_PAGE_SIZE);
+        fill_split_table(&mut table, chunk, |page| page);
+        assert_eq!(table[0], chunk);
+        assert_eq!(table[511], u64::MAX & !0xFFF);
+        assert!(table.windows(2).all(|w| w[1] == w[0] + PAGE_SIZE as u64));
     }
 }

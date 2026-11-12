@@ -355,7 +355,7 @@ fn read_and_validate_header(
 {
     let block_size = query_block_size(blk_ep, ipc_buf).ok_or(GptError::IoError)?;
     let mut block = [0u8; MAX_BLOCK_SIZE];
-    let block = &mut block[..block_size];
+    let block = block.get_mut(..block_size).ok_or(GptError::IoError)?;
     if !read_block_sector(blk_ep, 1, block, scratch_cap, scratch_va, ipc_buf)
     {
         return Err(GptError::IoError);

@@ -49,7 +49,7 @@ impl Breakpoint
     #[must_use]
     pub fn original(&self) -> &[u8]
     {
-        &self.saved[..self.len]
+        self.saved.get(..self.len).unwrap_or_default()
     }
 }
 
@@ -88,7 +88,12 @@ impl Breakpoints
             return;
         }
         let mut bytes = [0u8; MAX_BREAKPOINT_BYTES];
-        bytes[..saved.len()].copy_from_slice(saved);
+        let Some(dst) = bytes.get_mut(..saved.len())
+        else
+        {
+            return;
+        };
+        dst.copy_from_slice(saved);
         self.inserted.push(Breakpoint {
             addr,
             len: saved.len(),
@@ -143,6 +148,17 @@ mod tests
         assert!(b.remove(0x2000).is_none());
         assert_eq!(b.take_all().len(), 1);
         assert!(!b.contains(0x1000));
+    }
+
+    #[test]
+    fn a_breakpoint_whose_length_exceeds_its_buffer_has_no_original_bytes()
+    {
+        let b = Breakpoint {
+            addr: 0x1000,
+            len: MAX_BREAKPOINT_BYTES + 1,
+            saved: [0xAA; MAX_BREAKPOINT_BYTES],
+        };
+        assert!(b.original().is_empty());
     }
 
     #[test]

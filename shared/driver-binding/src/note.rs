@@ -54,11 +54,14 @@ impl<const N: usize> DriverNote<N>
             "driver note: N is not the descriptor's padded length"
         );
         let mut bytes = [0u8; N];
+        let mut dst: &mut [u8] = &mut bytes;
         let mut i = 0;
-        while i < N
+        while let [d, rest @ ..] = dst
         {
-            bytes[i] = desc.byte(i);
-            i += 1;
+            *d = desc.byte(i);
+            // `i` counts the `N` bytes of `bytes`, so it cannot saturate.
+            i = i.saturating_add(1);
+            dst = rest;
         }
         Self {
             namesz: 7,

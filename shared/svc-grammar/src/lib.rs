@@ -16,6 +16,8 @@
 //!
 //! `no_std`, no allocation: every [`Entry`] borrows the caller's text.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 /// One `key = value` line of a file.
@@ -41,8 +43,7 @@ pub struct MissingEquals(pub usize);
 /// error stops there.
 pub fn entries(contents: &str) -> impl Iterator<Item = Result<Entry<'_>, MissingEquals>>
 {
-    contents.lines().enumerate().filter_map(|(index, raw)| {
-        let line = index + 1;
+    contents.lines().zip(1..).filter_map(|(raw, line)| {
         let text = raw.trim();
         if text.is_empty() || text.starts_with('#')
         {

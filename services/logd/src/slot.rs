@@ -249,7 +249,7 @@ impl SlotTable
     pub fn next_seq(seq: &mut u64) -> u64
     {
         let s = *seq;
-        *seq += 1;
+        *seq = s.saturating_add(1);
         s
     }
 
@@ -333,7 +333,8 @@ impl SlotTable
         let slot = self.get_or_create(badge);
         let n = name.len().min(MAX_NAME_LEN);
         slot.name.clear();
-        slot.name.extend_from_slice(&name[..n]);
+        slot.name
+            .extend_from_slice(name.get(..n).unwrap_or_default());
     }
 
     /// Append one history line from the init-logd handover into the

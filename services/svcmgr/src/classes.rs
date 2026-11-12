@@ -72,7 +72,13 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
     // Fallible, as every copy svcmgr makes of configuration text is.
     let mut path = String::new();
     if path
-        .try_reserve_exact(CLASSES_DIR.len() + 1 + class.len() + CLASS_FILE_SUFFIX.len())
+        .try_reserve_exact(
+            CLASSES_DIR
+                .len()
+                .saturating_add(1)
+                .saturating_add(class.len())
+                .saturating_add(CLASS_FILE_SUFFIX.len()),
+        )
         .is_err()
     {
         log!(warn: "class {class}: no memory for its path; not configured");

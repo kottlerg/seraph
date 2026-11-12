@@ -11,6 +11,8 @@
 //! its bookkeeping lives in a self-hosted arena of pages carved from its own
 //! pool (`memmgr-free-pool`).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![no_std]
 #![no_main]
 // cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
@@ -229,13 +231,20 @@ impl WordStore for MappedWords
     {
         // SAFETY: the caller's contract puts word `i` in a page `index_grow`
         // mapped writable at `PROCESS_INDEX_VA + page * PAGE_SIZE`.
-        unsafe { core::ptr::read((PROCESS_INDEX_VA + i * 8) as *const u64) }
+        unsafe {
+            core::ptr::read(PROCESS_INDEX_VA.saturating_add(i.saturating_mul(8)) as *const u64)
+        }
     }
 
     unsafe fn write(&mut self, i: u64, v: u64)
     {
         // SAFETY: as in `read`.
-        unsafe { core::ptr::write((PROCESS_INDEX_VA + i * 8) as *mut u64, v) };
+        unsafe {
+            core::ptr::write(
+                PROCESS_INDEX_VA.saturating_add(i.saturating_mul(8)) as *mut u64,
+                v,
+            );
+        };
     }
 }
 
@@ -289,11 +298,13 @@ fn self_aspace() -> u64
 /// deterministic default base.
 fn ledger_init(self_aspace_cap: u64)
 {
-    let low_base = match syscall::random_u64()
-    {
-        Ok(r) => META_ARENA_BASE_DEFAULT + ((r & ((1 << META_ARENA_SLOTS_LOG2) - 1)) << 12),
-        Err(_) => META_ARENA_BASE_DEFAULT,
-    };
+    let low_base =
+        match syscall::random_u64()
+        {
+            Ok(r) => META_ARENA_BASE_DEFAULT
+                .saturating_add((r & ((1 << META_ARENA_SLOTS_LOG2) - 1)) << 12),
+            Err(_) => META_ARENA_BASE_DEFAULT,
+        };
     // SAFETY: single-threaded; called once before any other ledger use.
     unsafe { SELF_ASPACE = self_aspace_cap };
     let l = ledger_mut();
@@ -408,12 +419,16 @@ fn unmapped(cap: u64, pages: u64) -> bool
     let mut first = 0;
     while first < pages
     {
-        let window = (pages - first).min(syscall::CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES);
+        // The loop condition keeps `first` below `pages`.
+        let window = pages
+            .saturating_sub(first)
+            .min(syscall::CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES);
         if syscall::cap_info_memory_mappings(cap, first, window) != Ok(0)
         {
             return false;
         }
-        first += window;
+        // `window` is at most `pages - first`, so `first` stays within `pages`.
+        first = first.saturating_add(window);
     }
     true
 }
@@ -613,7 +628,7 @@ fn ensure_index(l: &mut MemLedger)
     {
         return;
     }
-    let va = PROCESS_INDEX_VA + l.index.pages() * PAGE_SIZE;
+    let va = PROCESS_INDEX_VA.saturating_add(l.index.pages().saturating_mul(PAGE_SIZE));
     if va >= PROCESS_INDEX_END
     {
         return;
@@ -671,8 +686,8 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
         };
         Some(FreeRun {
             cap_slot: tail,
-            page_count: run.page_count - 1,
-            phys_base: run.phys_base + PAGE_SIZE,
+            page_count: run.page_count.saturating_sub(1),
+            phys_base: run.phys_base.saturating_add(PAGE_SIZE),
         })
     }
     else
@@ -810,11 +825,13 @@ fn bootstrap_from_init(
 
     // Map the phys-table memory cap at a per-boot drawn scratch VA (ASLR,
     // #39; degrades to the deterministic default on a failed draw).
-    let phys_table_va = match syscall::random_u64()
-    {
-        Ok(r) => PHYS_TABLE_TEMP_VA + ((r & ((1 << PHYS_TABLE_TEMP_SLOTS_LOG2) - 1)) << 12),
-        Err(_) => PHYS_TABLE_TEMP_VA,
-    };
+    let phys_table_va =
+        match syscall::random_u64()
+        {
+            Ok(r) => PHYS_TABLE_TEMP_VA
+                .saturating_add((r & ((1 << PHYS_TABLE_TEMP_SLOTS_LOG2) - 1)) << 12),
+            Err(_) => PHYS_TABLE_TEMP_VA,
+        };
     let phys_table_cap = round.caps[1];
     // SAFETY: `phys_table_va` lies in memmgr's private phys-table scratch
     // window, which nothing else maps and where no image, stack, or IPC page
@@ -847,14 +864,14 @@ fn bootstrap_from_init(
     let mut in_use = [BootInUse::default(); mb::MAX_IN_USE];
     for (i, entry) in in_use.iter_mut().enumerate().take(in_use_count)
     {
-        let base = mb::IN_USE_BASE_IDX + i * mb::IN_USE_WORDS;
+        let base = mb::IN_USE_BASE_IDX.saturating_add(i.saturating_mul(mb::IN_USE_WORDS));
         // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the mapped page.
         let (cap_slot, page_count, phys_base, kind) = unsafe {
             (
                 core::ptr::read_volatile(phys_ptr.add(base)),
-                core::ptr::read_volatile(phys_ptr.add(base + 1)),
-                core::ptr::read_volatile(phys_ptr.add(base + 2)),
-                core::ptr::read_volatile(phys_ptr.add(base + 3)),
+                core::ptr::read_volatile(phys_ptr.add(base.saturating_add(1))),
+                core::ptr::read_volatile(phys_ptr.add(base.saturating_add(2))),
+                core::ptr::read_volatile(phys_ptr.add(base.saturating_add(3))),
             )
         };
         *entry = BootInUse {
@@ -1034,20 +1051,27 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
             // their outers go back to the pool below, so the descriptors must
             // come off too or process-death reclaim would double-pool the caps.
             pop_frames(l, rec, i);
-            rollback_grant(l, &grant, &inner[..i]);
+            rollback_grant(l, &grant, inner.get(..i).unwrap_or_default());
             reply_label(ipc_buf, memmgr_errors::QUOTA);
             return;
         };
-        region_ids[i] = region_id;
+        // `i` indexes a grant entry, so it is below `MAX_GRANT_RUNS`.
+        if let Some(slot) = region_ids.get_mut(i)
+        {
+            *slot = region_id;
+        }
         let Some(d) = derive_for_caller(outer, req.badge)
         else
         {
-            pop_frames(l, rec, i + 1);
-            rollback_grant(l, &grant, &inner[..i]);
+            pop_frames(l, rec, i.saturating_add(1));
+            rollback_grant(l, &grant, inner.get(..i).unwrap_or_default());
             reply_label(ipc_buf, memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT);
             return;
         };
-        inner[i] = d;
+        if let Some(slot) = inner.get_mut(i)
+        {
+            *slot = d;
+        }
     }
 
     // Build the reply:
@@ -1059,12 +1083,13 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     // the caller requests the rest.
     let count = grant.count;
     let mut builder = IpcMessage::builder(memmgr_errors::SUCCESS).word(0, count as u64);
-    for (i, &(_, pages, _)) in grant.entries().iter().enumerate()
+    for (i, (&(_, pages, _), &region_id)) in grant.entries().iter().zip(&region_ids).enumerate()
     {
-        builder = builder.word(1 + i, u64::from(pages));
-        builder = builder.word(1 + count + i, region_ids[i]);
+        // `i < count <= MAX_GRANT_RUNS`, so the word indices are small.
+        builder = builder.word(i.saturating_add(1), u64::from(pages));
+        builder = builder.word(count.saturating_add(1).saturating_add(i), region_id);
     }
-    for &slot in &inner[..count]
+    for &slot in inner.get(..count).unwrap_or_default()
     {
         builder = builder.cap(slot);
     }
@@ -1079,7 +1104,7 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         // stranded in memmgr's CSpace and the frames stay accounted to a
         // caller that never received them.
         pop_frames(l, rec, count);
-        rollback_grant(l, &grant, &inner[..count]);
+        rollback_grant(l, &grant, inner.get(..count).unwrap_or_default());
     }
 }
 
@@ -1106,7 +1131,7 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     recheck_deferred(l);
     for i in 0..count
     {
-        let _ = l.release_frame_by_region(rec, req.word(1 + i), quiescent);
+        let _ = l.release_frame_by_region(rec, req.word(i.saturating_add(1)), quiescent);
     }
     // Restore contiguity across the released runs, so a release-heavy churn
     // (ruststd returning Thread-retype slabs on join/reap) does not fragment
@@ -1274,8 +1299,8 @@ fn handle_donate_memory_caps(badge: u64, caps: &[u64], ipc_buf: *mut u64, procmg
         // deleted past this point). Count it on ownership, not on pool
         // residency: pool_total must equal the live owned set whether the run
         // reaches the pool or stays out of circulation.
-        accepted_caps += 1;
-        accepted_pages += run.page_count;
+        accepted_caps = accepted_caps.saturating_add(1);
+        accepted_pages = accepted_pages.saturating_add(run.page_count);
         pool_total_add(run.page_count);
         insert_run(l, run);
     }
@@ -1686,7 +1711,7 @@ fn map_client_chunk(
     prot: u64,
 ) -> Result<(), i64>
 {
-    let mut rounds = 0;
+    let mut rounds: u32 = 0;
     loop
     {
         // SAFETY: `aspace_cap` is a client address space procmgr delegated
@@ -1713,7 +1738,7 @@ fn map_client_chunk(
         {
             return Err(e);
         }
-        rounds += 1;
+        rounds = rounds.saturating_add(1);
     }
 }
 
@@ -1916,7 +1941,7 @@ fn ingest_pool(boot: &InitBootstrap)
     let l = ledger_mut();
     for i in 0..boot.memory_count
     {
-        let cap_slot = boot.memory_base + i;
+        let cap_slot = boot.memory_base.saturating_add(i);
         // Every RAM Memory cap memmgr ingests from init MUST carry the full
         // pool-frame rights ([`POOL_FRAME_RIGHTS`]: WRITE | EXECUTE | RETYPE | PHYS).
         // The kernel stamps these on usable RAM at Phase-7 mint

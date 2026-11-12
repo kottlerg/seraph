@@ -73,18 +73,18 @@ pub fn resolve(devmgr_registry: u64, self_aspace: u64, ipc_buf: *mut u64) -> Opt
         0,
         ipc_buf,
     )?;
-    let caps = reply.caps();
-    if caps.len() < 2
+    let &[pm1a_ioport_cap, kbc_ioport_cap, ..] = reply.caps()
+    else
     {
         std::os::seraph::log!(warn: "resolve failed (QUERY_SHUTDOWN_DEVICE missing caps)");
         return None;
-    }
+    };
 
     Some(Actuator {
         pm1a_port,
         slp_typa,
-        pm1a_ioport_cap: caps[0],
-        kbc_ioport_cap: caps[1],
+        pm1a_ioport_cap,
+        kbc_ioport_cap,
     })
 }
 
@@ -260,6 +260,13 @@ where
         return None;
     };
     let map_vaddr = range.va_start();
+    let Some(table_vaddr) = map_vaddr.checked_add(geometry.offset)
+    else
+    {
+        unreserve_pages(range);
+        let _ = syscall::cap_delete(view.memory_cap);
+        return None;
+    };
     // SAFETY: `range` is a fresh reservation of `geometry.pages` pages from
     // the per-process arena, owned here: VA no Rust object or IPC page
     // occupies.
@@ -281,9 +288,7 @@ where
         // requirement. `f` takes the slice for any lifetime and its result
         // `R` cannot borrow from it, so no reference to the bytes outlives
         // the mapping.
-        let bytes = unsafe {
-            core::slice::from_raw_parts((map_vaddr + geometry.offset) as *const u8, geometry.len)
-        };
+        let bytes = unsafe { core::slice::from_raw_parts(table_vaddr as *const u8, geometry.len) };
         let out = f(bytes);
         // SAFETY: `bytes`, the only reference into the mapping, is dead once
         // `f` returns (its result cannot borrow from it), and the span is

@@ -21,6 +21,9 @@
 //! See `services/vfsd/README.md` for the design and
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod driver;
 mod partition;
 mod role_guids;
@@ -546,11 +549,15 @@ fn try_forward_lookup_fallthrough(
     // Cast is range-safe: name_len lives in bits 16..32 of the label.
     let name_len = ((recv.label >> 16) & 0xFFFF) as usize;
     let data_bytes = recv.data_bytes();
-    if name_len == 0 || data_bytes.len() < 8 + name_len
+    if name_len == 0
     {
         return false;
     }
-    let name = &data_bytes[8..8 + name_len];
+    let Some(name) = data_bytes.get(8..).and_then(|d| d.get(..name_len))
+    else
+    {
+        return false;
+    };
 
     let backend = rt
         .root_backend
@@ -675,7 +682,8 @@ fn try_forward_readdir_fallthrough(
 
     // Enumerate the fall-through directory, skipping names shadowed by a
     // local child, until the `(idx - local_count)`-th survivor.
-    let target = idx - local_count;
+    // `idx < local_count` returned above, so the difference does not saturate.
+    let target = idx.saturating_sub(local_count);
     let mut matched = 0u32;
     let mut probe = 0u32;
     loop
@@ -703,15 +711,23 @@ fn try_forward_readdir_fallthrough(
         let name_len = reply.word(1) as usize;
         let data = reply.data_bytes();
         // Reply layout: word 0 = kind, word 1 = name_len, name at byte 16.
-        if name_len == 0 || data.len() < 16 + name_len
+        let name = if name_len == 0
+        {
+            None
+        }
+        else
+        {
+            data.get(16..).and_then(|d| d.get(..name_len))
+        };
+        let Some(name) = name
+        else
         {
             // Malformed upstream reply: terminate enumeration cleanly.
             let end = IpcMessage::new(ipc::fs_labels::END_OF_DIR);
             // SAFETY: ipc_buf is the thread-registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&end, ipc_buf) };
             return true;
-        }
-        let name = &data[16..16 + name_len];
+        };
         let shadowed = {
             let backend = rt
                 .root_backend
@@ -727,9 +743,9 @@ fn try_forward_readdir_fallthrough(
                 let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
                 return true;
             }
-            matched += 1;
+            matched = matched.saturating_add(1);
         }
-        probe += 1;
+        probe = probe.saturating_add(1);
     }
 }
 
@@ -906,7 +922,9 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
     let path_bytes = recv.data_bytes();
     // Path bytes start at word 2 (byte offset 16) under the new wire shape.
     let path_src_start = 2 * 8;
-    let Some(path) = path_bytes.get(path_src_start..path_src_start + path_len)
+    let Some(path) = path_bytes
+        .get(path_src_start..)
+        .and_then(|d| d.get(..path_len))
     else
     {
         // The data words carry fewer path bytes than `data[1]` claims;

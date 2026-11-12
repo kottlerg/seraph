@@ -78,7 +78,10 @@ pub fn slot(arch: Arch, regnum: usize) -> Option<Slot>
             5 => field(x86_64::RDI, 8),
             6 => field(x86_64::RBP, 8),
             7 => field(x86_64::RSP, 8),
-            8..=15 => field(x86_64::R8 + (regnum - 8) * 8, 8),
+            8..=15 => field(
+                x86_64::R8.saturating_add(regnum.saturating_sub(8).saturating_mul(8)),
+                8,
+            ),
             16 => field(x86_64::RIP, 8),
             17 => field(x86_64::RFLAGS, 4),
             18 | 19 => Slot::Field {
@@ -91,7 +94,11 @@ pub fn slot(arch: Arch, regnum: usize) -> Option<Slot>
         Arch::Riscv64 => match regnum
         {
             0 => Slot::Zero,
-            1..=31 => field(syscall_abi::REGS_RISCV64_X1_OFFSET + (regnum - 1) * 8, 8),
+            1..=31 => field(
+                syscall_abi::REGS_RISCV64_X1_OFFSET
+                    .saturating_add(regnum.saturating_sub(1).saturating_mul(8)),
+                8,
+            ),
             32 => field(syscall_abi::REGS_RISCV64_IP_OFFSET, 8),
             _ => Slot::Unavailable,
         },
@@ -121,15 +128,19 @@ pub fn encode_register(arch: Arch, file: &[u8], regnum: usize, w: &mut PacketWri
         {
             let mut value = [0u8; 16];
             let n = bytes.min(size);
-            if let Some(src) = file.get(offset..offset + n)
+            if let (Some(src), Some(dst)) = (
+                file.get(offset..offset.saturating_add(n)),
+                value.get_mut(..n),
+            )
             {
-                value[..n].copy_from_slice(src);
+                dst.copy_from_slice(src);
             }
-            w.hex(&value[..size]);
+            w.hex(value.get(..size).unwrap_or_default());
         }
         Some(Slot::Zero) =>
         {
-            w.hex(&[0u8; 16][..size]);
+            let zeros = [0u8; 16];
+            w.hex(zeros.get(..size).unwrap_or_default());
         }
         Some(Slot::Unavailable) | None =>
         {
@@ -178,10 +189,11 @@ pub fn write_register(
         .ok_or(WriteError::NoSuchRegister)?
         .bytes;
     let mut bytes = [0u8; 16];
-    if value.len() != size * 2 || value.contains(&b'x')
+    let hex_len = size.saturating_mul(2);
+    if value.len() != hex_len || value.contains(&b'x')
     {
         // `xx` marks bytes GDB does not know; such a value changes nothing.
-        return if value.len() == size * 2
+        return if value.len() == hex_len
         {
             Ok(())
         }
@@ -196,9 +208,10 @@ pub fn write_register(
         bytes: n,
         writable: true,
     }) = slot(arch, regnum)
-        && let Some(dst) = file.get_mut(offset..offset + n)
+        && let Some(dst) = file.get_mut(offset..offset.saturating_add(n))
+        && let Some(src) = bytes.get(..n)
     {
-        dst.copy_from_slice(&bytes[..n]);
+        dst.copy_from_slice(src);
     }
     Ok(())
 }
@@ -210,15 +223,20 @@ pub fn write_register(
 /// register block in hex.
 pub fn write_registers(arch: Arch, block: &[u8], file: &mut [u8]) -> Result<(), WriteError>
 {
-    if block.len() != arch.register_block_len() * 2
+    if block.len() != arch.register_block_len().saturating_mul(2)
     {
         return Err(WriteError::BadValue);
     }
-    let mut at = 0;
+    let mut rest = block;
     for (regnum, reg) in arch.registers().iter().enumerate()
     {
-        write_register(arch, regnum, &block[at..at + reg.bytes * 2], file)?;
-        at += reg.bytes * 2;
+        let Some((hex, tail)) = rest.split_at_checked(reg.bytes.saturating_mul(2))
+        else
+        {
+            return Err(WriteError::BadValue);
+        };
+        write_register(arch, regnum, hex, file)?;
+        rest = tail;
     }
     Ok(())
 }
@@ -238,7 +256,7 @@ fn pc_offset(arch: Arch) -> usize
 pub fn pc(arch: Arch, file: &[u8]) -> u64
 {
     let offset = pc_offset(arch);
-    file.get(offset..offset + 8)
+    file.get(offset..offset.saturating_add(8))
         .and_then(|b| b.try_into().ok())
         .map_or(0, u64::from_le_bytes)
 }
@@ -248,7 +266,7 @@ pub fn pc(arch: Arch, file: &[u8]) -> u64
 pub fn set_pc(arch: Arch, file: &mut [u8], value: u64)
 {
     let offset = pc_offset(arch);
-    if let Some(field) = file.get_mut(offset..offset + 8)
+    if let Some(field) = file.get_mut(offset..offset.saturating_add(8))
     {
         field.copy_from_slice(&value.to_le_bytes());
     }

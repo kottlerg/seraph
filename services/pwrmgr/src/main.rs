@@ -18,6 +18,9 @@
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+
 mod arch;
 mod caps;
 

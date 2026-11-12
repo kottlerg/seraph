@@ -17,6 +17,8 @@
 //! way. See
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 pub mod arena;
@@ -107,14 +109,18 @@ pub fn regions_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool
 #[must_use]
 pub fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
 {
-    let chunk_bytes = u64::from(DEMAND_CHUNK_PAGES) * PAGE_SIZE;
+    const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
     // page_base >= region.va_base: region_for matched `va`, and va_base is
     // page-aligned, so the page containing `va` cannot precede it.
-    let chunk_idx = (page_base - region.va_base) / chunk_bytes;
-    let chunk_base = region.va_base + chunk_idx * chunk_bytes;
-    let region_end = region.va_base + region.len;
-    let chunk_end = (chunk_base + chunk_bytes).min(region_end);
-    let chunk_pages = ((chunk_end - chunk_base) / PAGE_SIZE) as u32;
+    let chunk_idx = page_base.saturating_sub(region.va_base) / CHUNK_BYTES;
+    // The region lies within the address space, so its end and the chunk sums stay below
+    // `u64::MAX`.
+    let chunk_base = region
+        .va_base
+        .saturating_add(chunk_idx.saturating_mul(CHUNK_BYTES));
+    let region_end = region.va_base.saturating_add(region.len);
+    let chunk_end = chunk_base.saturating_add(CHUNK_BYTES).min(region_end);
+    let chunk_pages = (chunk_end.saturating_sub(chunk_base) / PAGE_SIZE) as u32;
     (chunk_base, chunk_pages)
 }
 

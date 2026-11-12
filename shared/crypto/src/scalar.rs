@@ -27,19 +27,16 @@ pub(crate) const L: [u8; 32] = [
 /// malleability.
 pub(crate) fn is_canonical(s: &[u8; 32]) -> bool
 {
-    let mut i = 31i32;
-    while i >= 0
+    for (sb, lb) in s.iter().zip(L.iter()).rev()
     {
-        let idx = i as usize;
-        if s[idx] < L[idx]
+        if sb < lb
         {
             return true;
         }
-        if s[idx] > L[idx]
+        if sb > lb
         {
             return false;
         }
-        i -= 1;
     }
     // s == L exactly: not canonical.
     false
@@ -49,11 +46,9 @@ pub(crate) fn is_canonical(s: &[u8; 32]) -> bool
 pub(crate) fn reduce_512(h: &[u8; 64]) -> [u8; 32]
 {
     let mut x = [0i64; 64];
-    let mut i = 0;
-    while i < 64
+    for (xi, hi) in x.iter_mut().zip(h)
     {
-        x[i] = i64::from(h[i]);
-        i += 1;
+        *xi = i64::from(*hi);
     }
     let mut r = [0u8; 32];
     mod_l(&mut r, &mut x);
@@ -65,46 +60,48 @@ pub(crate) fn reduce_512(h: &[u8; 64]) -> [u8; 32]
 /// multiples of L twice. Operates in signed radix-2^8 limbs.
 fn mod_l(r: &mut [u8; 32], x: &mut [i64; 64])
 {
-    let mut i = 63usize;
-    while i >= 32
+    for base in (0..32usize).rev()
     {
+        let hi = base.wrapping_add(32);
         let mut carry = 0i64;
-        let base = i - 32;
-        let mut j = base;
-        while j < i - 12
+        let xi = x.get(hi).copied().unwrap_or(0);
+        // Limbs `base` .. `hi` - 12 absorb x[hi] times L; the next limb takes the final carry.
+        let mut limbs = x.iter_mut().skip(base);
+        for (xj, lj) in limbs.by_ref().take(20).zip(L.iter())
         {
-            x[j] += carry - 16 * x[i] * i64::from(L[j - base]);
-            carry = (x[j] + 128) >> 8;
-            x[j] -= carry << 8;
-            j += 1;
+            let prod = 16i64.wrapping_mul(xi).wrapping_mul(i64::from(*lj));
+            *xj = xj.wrapping_add(carry.wrapping_sub(prod));
+            carry = xj.wrapping_add(128) >> 8;
+            *xj = xj.wrapping_sub(carry << 8);
         }
-        // j == i - 12 here.
-        x[j] += carry;
-        x[i] = 0;
-        i -= 1;
+        if let Some(xj) = limbs.next()
+        {
+            *xj = xj.wrapping_add(carry);
+        }
+        if let Some(xi) = x.get_mut(hi)
+        {
+            *xi = 0;
+        }
     }
 
+    let top = x[31];
     let mut carry = 0i64;
-    let mut j = 0;
-    while j < 32
+    for (xj, lj) in x.iter_mut().zip(L.iter()).take(32)
     {
-        x[j] += carry - (x[31] >> 4) * i64::from(L[j]);
-        carry = x[j] >> 8;
-        x[j] &= 255;
-        j += 1;
+        *xj = xj.wrapping_add(carry.wrapping_sub((top >> 4).wrapping_mul(i64::from(*lj))));
+        carry = *xj >> 8;
+        *xj &= 255;
     }
-    let mut j = 0;
-    while j < 32
+    for (xj, lj) in x.iter_mut().zip(L.iter())
     {
-        x[j] -= carry * i64::from(L[j]);
-        j += 1;
+        *xj = xj.wrapping_sub(carry.wrapping_mul(i64::from(*lj)));
     }
-    let mut i = 0;
-    while i < 32
+    let mut carry_in = 0i64;
+    for (xi, ri) in x.iter_mut().zip(r.iter_mut())
     {
-        x[i + 1] += x[i] >> 8;
-        r[i] = (x[i] & 255) as u8;
-        i += 1;
+        let v = xi.wrapping_add(carry_in);
+        carry_in = v >> 8;
+        *ri = (v & 255) as u8;
     }
 }
 

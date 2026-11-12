@@ -20,6 +20,8 @@
 //! state is atomics alone and takes the time as an argument, so it is
 //! host-tested.
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +65,10 @@ impl FaultBound
     /// been settled when it ended cancelled ([`Self::settled`]).
     pub fn arm(&self, now_ms: u64) -> u64
     {
-        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let generation = self
+            .generation
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         self.armed_at_ms.store(now_ms, Ordering::Relaxed);
         // Release: a watchdog that reads this generation reads its start.
         self.armed.store(generation, Ordering::Release);

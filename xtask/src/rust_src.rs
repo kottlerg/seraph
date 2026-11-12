@@ -677,39 +677,54 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 }
 
 /// The workspace crates std depends on when built for seraph: the dependency
-/// name, its path under the project root, and any extra key placed between
-/// `path` and `features` in its `library/std/Cargo.toml` line.
-const STD_WORKSPACE_DEPS: [(&str, &str, &str); 13] = [
-    ("syscall-abi", "abi/syscall", ""),
-    ("syscall", "shared/syscall", ""),
-    ("ipc", "shared/ipc", ""),
-    ("log", "shared/log", ""),
-    ("process-abi", "abi/process-abi", ""),
-    ("process-layout", "shared/process-layout", ""),
-    ("shmem", "shared/shmem", ""),
-    ("namespace-protocol", "shared/namespace-protocol", ""),
-    ("registry-client", "shared/registry-client", ""),
+/// name, its path under the project root, and its package name when that
+/// differs from the dependency name (written as the `package` key of its
+/// `library/std/Cargo.toml` line).
+const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 13] = [
+    ("syscall-abi", "abi/syscall", None),
+    ("syscall", "shared/syscall", None),
+    ("ipc", "shared/ipc", None),
+    ("log", "shared/log", None),
+    ("process-abi", "abi/process-abi", None),
+    ("process-layout", "shared/process-layout", None),
+    ("shmem", "shared/shmem", None),
+    ("namespace-protocol", "shared/namespace-protocol", None),
+    ("registry-client", "shared/registry-client", None),
     (
         "argv-env",
         "runtime/ruststd/argv-env",
-        ", package = \"ruststd-argv-env\"",
+        Some("ruststd-argv-env"),
     ),
     (
         "death-queues",
         "runtime/ruststd/death-queues",
-        ", package = \"ruststd-death-queues\"",
+        Some("ruststd-death-queues"),
     ),
     (
         "heap-fit",
         "runtime/ruststd/heap-fit",
-        ", package = \"ruststd-heap-fit\"",
+        Some("ruststd-heap-fit"),
     ),
     (
         "spin-wait",
         "runtime/ruststd/spin-wait",
-        ", package = \"ruststd-spin-wait\"",
+        Some("ruststd-spin-wait"),
     ),
 ];
+
+/// The package names of the workspace crates std depends on when built for
+/// seraph ([`STD_WORKSPACE_DEPS`]).
+///
+/// Lints are capped on every crate a `-Z build-std` build compiles as a
+/// dependency of std, so the `StdUser` lint pass checks each of these as a
+/// workspace member as well: a crate no workspace member depends on is
+/// checked nowhere else.
+pub(crate) fn std_workspace_packages() -> impl Iterator<Item = &'static str>
+{
+    STD_WORKSPACE_DEPS
+        .iter()
+        .map(|(name, _, package)| package.unwrap_or(name))
+}
 
 /// Add target-conditional path dependencies on the workspace crates
 /// [`STD_WORKSPACE_DEPS`] names to `library/std/Cargo.toml` when building for
@@ -728,15 +743,16 @@ fn apply_std_cargo_deps_overlay(rust_src: &Path, project_root: &Path) -> Result<
          # way. Regenerated whenever the mirror's content stamp changes.\n\
          [target.'cfg(target_os = \"seraph\")'.dependencies]\n",
     );
-    for (name, rel, extra) in STD_WORKSPACE_DEPS
+    for (name, rel, package) in STD_WORKSPACE_DEPS
     {
         let path = project_root
             .join(rel)
             .canonicalize()
             .with_context(|| format!("canonicalising {rel}"))?;
+        let package = package.map_or_else(String::new, |p| format!(", package = \"{p}\""));
         writeln!(
             block,
-            "{name} = {{ path = \"{}\"{extra}, features = [\"rustc-dep-of-std\"] }}",
+            "{name} = {{ path = \"{}\"{package}, features = [\"rustc-dep-of-std\"] }}",
             path.display()
         )?;
     }
@@ -1414,5 +1430,32 @@ mod tests
             .find(|(key, _)| *key == "CARGO_INCREMENTAL")
             .and_then(|(_, value)| value);
         assert_eq!(incremental, Some(std::ffi::OsStr::new("0")));
+    }
+
+    /// Each std dependency's package name is the one its manifest declares,
+    /// and the crate is a workspace member, so the `StdUser` lint pass's
+    /// `-p` of it names a package `cargo check` selects.
+    #[test]
+    fn each_std_workspace_package_is_the_workspace_member_at_its_path()
+    {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the project root");
+        let workspace = fs::read_to_string(root.join("Cargo.toml")).expect("the root manifest");
+        let packages: Vec<&str> = std_workspace_packages().collect();
+        assert_eq!(packages.len(), STD_WORKSPACE_DEPS.len());
+        for ((_, rel, _), package) in STD_WORKSPACE_DEPS.iter().zip(packages)
+        {
+            assert!(
+                workspace.contains(&format!("    \"{rel}\",\n")),
+                "{rel} is not a workspace member"
+            );
+            let manifest =
+                fs::read_to_string(root.join(rel).join("Cargo.toml")).expect("the crate manifest");
+            assert!(
+                manifest.contains(&format!("\nname = \"{package}\"\n")),
+                "{rel}/Cargo.toml does not name the package {package}"
+            );
+        }
     }
 }

@@ -68,11 +68,9 @@ pub(crate) fn add(p: &mut Point, q: &Point)
 /// Conditional swap of two points when `swap == 1`.
 fn cswap(p: &mut Point, q: &mut Point, swap: u8)
 {
-    let mut i = 0;
-    while i < 4
+    for (pi, qi) in p.iter_mut().zip(q.iter_mut())
     {
-        field::cswap(&mut p[i], &mut q[i], swap);
-        i += 1;
+        field::cswap(pi, qi, swap);
     }
 }
 
@@ -81,16 +79,18 @@ pub(crate) fn scalar_mul(q: &Point, s: &[u8; 32]) -> Point
 {
     let mut p = IDENTITY;
     let mut q = *q;
-    let mut i = 256usize;
-    while i > 0
+    // Bits from the most significant (bit 255) down to bit 0.
+    for byte in s.iter().rev()
     {
-        i -= 1;
-        let bit = (s[i >> 3] >> (i & 7)) & 1;
-        cswap(&mut p, &mut q, bit);
-        let pc = p;
-        add(&mut q, &pc);
-        add(&mut p, &pc);
-        cswap(&mut p, &mut q, bit);
+        for shift in (0..8).rev()
+        {
+            let bit = (byte >> shift) & 1;
+            cswap(&mut p, &mut q, bit);
+            let pc = p;
+            add(&mut q, &pc);
+            add(&mut p, &pc);
+            cswap(&mut p, &mut q, bit);
+        }
     }
     p
 }

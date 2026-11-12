@@ -29,6 +29,8 @@
 // Under `rustc-dep-of-std` (build-std), use the core facade and no_core
 // so this crate can sit inside std's dep graph. Mirrors abi/syscall and
 // shared/ipc. Normal userspace builds (no feature) retain `#![no_std]`.
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
@@ -835,22 +837,39 @@ pub fn tls_block_layout(memsz: u64, align: u64) -> (u64, u64, u64)
         // multiple of the larger alignment. The block allocation itself is
         // u64-aligned (8 bytes) so the TCB self-pointer is a valid aligned
         // 8-byte slot.
-        let tdata_aligned = (memsz + align - 1) & !(align - 1);
+        let tdata_aligned = align_up_or_max(memsz, align);
         let tcb_size: u64 = 16;
         let block_align = align.max(8);
-        (tdata_aligned + tcb_size, block_align, tdata_aligned)
+        (
+            tdata_aligned.saturating_add(tcb_size),
+            block_align,
+            tdata_aligned,
+        )
     }
     #[cfg(target_arch = "riscv64")]
     {
         // Variant I: tp = block start. No TCB header.
         let tls_align = if align < 8 { 8 } else { align };
-        let block = (memsz + tls_align - 1) & !(tls_align - 1);
-        (block, tls_align, 0)
+        (align_up_or_max(memsz, tls_align), tls_align, 0)
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
     {
         let _ = (memsz, align);
         (0, 1, 0)
+    }
+}
+
+/// Round `value` up to a multiple of the power of two `align` (at least 1), or
+/// `u64::MAX` when that multiple is `2^64` or past it: an oversized `PT_TLS`
+/// then gives a block the loaders' [`PROCESS_MAIN_TLS_MAX_PAGES`] bound
+/// refuses and no heap allocation satisfies.
+fn align_up_or_max(value: u64, align: u64) -> u64
+{
+    let mask = align.saturating_sub(1);
+    match value.checked_add(mask)
+    {
+        Some(bumped) => bumped & !mask,
+        None => u64::MAX,
     }
 }
 
@@ -904,5 +923,18 @@ mod tests
         );
         assert_eq!(resolve_stack_pages(Some(MAX_PROCESS_STACK_PAGES + 1)), None);
         assert_eq!(resolve_stack_pages(Some(0)), None);
+    }
+
+    // Defect guarded: a `PT_TLS` memsz near `u64::MAX` whose rounding wraps to
+    // a small block the loader would accept and overrun.
+    #[test]
+    fn oversized_tls_memsz_saturates_the_block()
+    {
+        assert_eq!(align_up_or_max(0, 8), 0);
+        assert_eq!(align_up_or_max(9, 8), 16);
+        assert_eq!(align_up_or_max(5, 0), 5);
+        assert_eq!(align_up_or_max(u64::MAX - 3, 8), u64::MAX);
+        let (block, _, _) = tls_block_layout(u64::MAX - 3, 8);
+        assert_eq!(block, u64::MAX);
     }
 }

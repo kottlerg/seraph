@@ -95,7 +95,7 @@ impl<W: WordStore> ProcessIndex<W>
     #[must_use]
     pub const fn buckets(&self) -> u64
     {
-        self.level + self.split
+        self.level.saturating_add(self.split)
     }
 
     /// Bucket pages given so far; the next [`ProcessIndex::add_page`] covers
@@ -112,7 +112,8 @@ impl<W: WordStore> ProcessIndex<W>
     pub const fn wants_page(&self) -> bool
     {
         self.capacity == 0
-            || (self.buckets() >= self.capacity && self.count + 1 > MAX_LOAD * self.buckets())
+            || (self.buckets() >= self.capacity
+                && self.count.saturating_add(1) > MAX_LOAD.saturating_mul(self.buckets()))
     }
 
     /// Give the index the next page of bucket storage (words `[capacity,
@@ -124,12 +125,12 @@ impl<W: WordStore> ProcessIndex<W>
     /// every word in that range for the index's life.
     pub unsafe fn add_page<S: SlotStore>(&mut self, arena: &mut Arena<S>)
     {
-        for i in self.capacity..self.capacity + BUCKETS_PER_PAGE
+        for i in self.capacity..self.capacity.saturating_add(BUCKETS_PER_PAGE)
         {
             // SAFETY: the caller's contract covers word `i`.
             unsafe { self.words.write(i, NODE_NULL) };
         }
-        self.capacity += BUCKETS_PER_PAGE;
+        self.capacity = self.capacity.saturating_add(BUCKETS_PER_PAGE);
         self.grow(arena);
     }
 
@@ -157,10 +158,10 @@ impl<W: WordStore> ProcessIndex<W>
     fn bucket_of(&self, badge: u64) -> u64
     {
         let h = hash(badge);
-        let b = h & (self.level - 1);
+        let b = h & self.level.saturating_sub(1);
         if b < self.split
         {
-            h & (2 * self.level - 1)
+            h & self.level.saturating_mul(2).saturating_sub(1)
         }
         else
         {
@@ -207,7 +208,8 @@ impl<W: WordStore> ProcessIndex<W>
         let b = self.bucket_of(rec.badge);
         arena.set_next(idx, self.head(b));
         self.set_head(b, idx);
-        self.count += 1;
+        // Each indexed record holds its own slot, so the count stays below the slot count.
+        self.count = self.count.saturating_add(1);
         self.grow(arena);
         true
     }
@@ -242,7 +244,8 @@ impl<W: WordStore> ProcessIndex<W>
                     arena.set_next(prev, slot.next);
                 }
                 arena.set_next(cur, NODE_NULL);
-                self.count -= 1;
+                // The record being unlinked was counted, so `count` is above zero.
+                self.count = self.count.saturating_sub(1);
                 return Some(cur);
             }
             prev = cur;
@@ -254,7 +257,7 @@ impl<W: WordStore> ProcessIndex<W>
     /// Split buckets while the load exceeds [`MAX_LOAD`] and storage allows.
     fn grow<S: SlotStore>(&mut self, arena: &mut Arena<S>)
     {
-        while self.count > MAX_LOAD * self.buckets() && self.buckets() < self.capacity
+        while self.count > MAX_LOAD.saturating_mul(self.buckets()) && self.buckets() < self.capacity
         {
             self.split_one(arena);
         }
@@ -265,8 +268,8 @@ impl<W: WordStore> ProcessIndex<W>
     fn split_one<S: SlotStore>(&mut self, arena: &mut Arena<S>)
     {
         let old = self.split;
-        let new = self.level + self.split;
-        let mask = 2 * self.level - 1;
+        let new = self.level.saturating_add(self.split);
+        let mask = self.level.saturating_mul(2).saturating_sub(1);
         let mut keep = NODE_NULL;
         let mut moved = NODE_NULL;
         let mut cur = self.head(old);
@@ -292,10 +295,11 @@ impl<W: WordStore> ProcessIndex<W>
         }
         self.set_head(old, keep);
         self.set_head(new, moved);
-        self.split += 1;
+        // `split` is below `level`, so the increment stays within `level`.
+        self.split = self.split.saturating_add(1);
         if self.split == self.level
         {
-            self.level *= 2;
+            self.level = self.level.saturating_mul(2);
             self.split = 0;
         }
     }

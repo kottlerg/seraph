@@ -46,6 +46,8 @@
 //! pure and host-tested — see
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
+// Staged roll-out of these two lints: docs/coding-standards.md § Clippy.
+#![warn(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
@@ -199,7 +201,7 @@ impl VfsdRootBackend
         // The components past the last existing node are the new ones.
         let mut names: Vec<Vec<u8>> = Vec::new();
         names.try_reserve_exact(new_nodes).ok()?;
-        for component in path_components(path).skip(component_count - new_nodes)
+        for component in path_components(path).skip(component_count.saturating_sub(new_nodes))
         {
             let mut name = Vec::new();
             name.try_reserve_exact(component.len()).ok()?;
@@ -288,7 +290,8 @@ impl VfsdRootBackend
             existing = existing.and_then(|idx| self.find_child(idx, component));
             if existing.is_none()
             {
-                new_nodes += 1;
+                // `new_nodes` counts components, so it is below `usize::MAX`.
+                new_nodes = new_nodes.saturating_add(1);
             }
         }
         if let Some(last) = existing
@@ -298,7 +301,7 @@ impl VfsdRootBackend
             return None;
         }
         // Every index, the root's included, stays below `NONE`.
-        let total = self.nodes.len().checked_add(1 + new_nodes)?;
+        let total = self.nodes.len().checked_add(new_nodes.saturating_add(1))?;
         (total <= NONE as usize).then_some(new_nodes)
     }
 
@@ -329,7 +332,7 @@ impl VfsdRootBackend
             let node = self.node(cur)?;
             chain.try_reserve(1).ok()?;
             chain.push(cur);
-            len += 1 + node.name.len();
+            len = len.saturating_add(node.name.len().saturating_add(1));
             cur = node.parent;
         }
         if idx == 0
@@ -396,7 +399,7 @@ impl VfsdRootBackend
         let mut cur = self.node(idx).map_or(NONE, |n| n.first_child);
         while let Some(n) = self.node(cur)
         {
-            count += 1;
+            count = count.saturating_add(1);
             cur = n.next_sibling;
         }
         count
@@ -409,7 +412,7 @@ impl VfsdRootBackend
         match idx
         {
             0 => Some(&self.root),
-            i => self.nodes.get(i as usize - 1),
+            i => (i as usize).checked_sub(1).and_then(|k| self.nodes.get(k)),
         }
     }
 
@@ -418,7 +421,9 @@ impl VfsdRootBackend
         match idx
         {
             0 => Some(&mut self.root),
-            i => self.nodes.get_mut(i as usize - 1),
+            i => (i as usize)
+                .checked_sub(1)
+                .and_then(|k| self.nodes.get_mut(k)),
         }
     }
 
@@ -426,7 +431,7 @@ impl VfsdRootBackend
     /// pool below `NONE`.
     fn next_index(&self) -> Option<u32>
     {
-        u32::try_from(self.nodes.len() + 1).ok()
+        u32::try_from(self.nodes.len().saturating_add(1)).ok()
     }
 
     fn find_child(&self, parent: u32, name: &[u8]) -> Option<u32>
@@ -514,7 +519,7 @@ impl NamespaceBackend for VfsdRootBackend
                     NamespaceRights::NONE,
                 ));
             }
-            visible += 1;
+            visible = visible.saturating_add(1);
             cur = n.next_sibling;
         }
         Ok(None)

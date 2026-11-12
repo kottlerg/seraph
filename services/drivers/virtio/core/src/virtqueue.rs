@@ -282,7 +282,8 @@ impl SplitVirtqueue
             prev_flags = flags;
         }
 
-        // Record the chain before the device can complete it.
+        // Record the chain before publishing it, so no early return leaves a
+        // published chain unrecorded.
         *self.chain_len.get_mut(usize::from(head))? = chain_len;
 
         // Add head to available ring.

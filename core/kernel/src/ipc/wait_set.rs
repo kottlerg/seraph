@@ -172,6 +172,13 @@ impl WaitSetMember
     }
 }
 
+/// The slot after `at` in a ring whose slots are `0..=last`: `at + 1`, or 0
+/// after `last`.
+fn ring_step(at: u16, last: u16) -> u16
+{
+    at.checked_add(1).filter(|&next| next <= last).unwrap_or(0)
+}
+
 // ── WaitSetState ─────────────────────────────────────────────────────────────
 
 /// Kernel state backing a `WaitSet` capability.
@@ -292,10 +299,11 @@ impl WaitSetState
         unsafe { core::slice::from_raw_parts_mut(self.members, usize::from(self.capacity)) }
     }
 
-    /// Ring length: `capacity + 1` slots.
-    fn ring_len(&self) -> u16
+    /// The ring slot after `at`: the ring's `capacity + 1` slots are
+    /// `0..=capacity` ([`ring_step`]).
+    fn ring_next(&self, at: u16) -> u16
     {
-        self.capacity + 1
+        ring_step(at, self.capacity)
     }
 
     /// Return true if the ready ring has pending entries.
@@ -305,8 +313,8 @@ impl WaitSetState
         self.ready_head != self.ready_tail
     }
 
-    /// Queue `member_idx` on the ready ring, unless it already has an entry
-    /// or its slot is vacant.
+    /// Queue `member_idx` on the ready ring, unless it already has an entry,
+    /// its slot is vacant, or it names no slot.
     ///
     /// A member holds at most one entry, so a member that stays busy cannot
     /// fill the ring past the other members' entries, and the ring, which
@@ -318,19 +326,25 @@ impl WaitSetState
     #[inline]
     fn push_ready(&mut self, member_idx: u16)
     {
-        let m = &self.members()[usize::from(member_idx)];
+        let (head, tail, ring) = (self.ready_head, self.ready_tail, self.ready_ring);
+        let next = self.ring_next(tail);
+        let Some(m) = self.members_mut().get_mut(usize::from(member_idx))
+        else
+        {
+            return;
+        };
         if m.queued || !m.is_occupied()
         {
             return;
         }
-        let next = (self.ready_tail + 1) % self.ring_len();
-        debug_assert!(next != self.ready_head, "wait set ready ring full");
-        if next != self.ready_head
+        debug_assert!(next != head, "wait set ready ring full");
+        if next != head
         {
-            // SAFETY: ready_tail < ring_len; the ring has ring_len slots.
-            unsafe { *self.ready_ring.add(usize::from(self.ready_tail)) = member_idx };
+            // SAFETY: tail is a ring slot (`0..=capacity`); the ring has
+            // `capacity + 1` slots.
+            unsafe { *ring.add(usize::from(tail)) = member_idx };
+            m.queued = true;
             self.ready_tail = next;
-            self.members_mut()[usize::from(member_idx)].queued = true;
         }
     }
 
@@ -338,8 +352,8 @@ impl WaitSetState
     /// source `ready` reports no longer ready (an endpoint whose queued sender
     /// was stopped or destroyed after its call pushed the entry, or a
     /// notification a direct waiter drained), and any that names a vacant
-    /// slot. A skipped member's `queued` flag is cleared, so its next arrival
-    /// queues it again.
+    /// slot or names no slot. A skipped member's `queued` flag is cleared, so
+    /// its next arrival queues it again.
     ///
     /// The member returned is queued again at the tail, behind every other
     /// queued member, so a member with work left after this return is served
@@ -353,18 +367,28 @@ impl WaitSetState
     {
         while self.has_ready()
         {
-            // SAFETY: ready_head < ring_len; the ring has ring_len slots.
+            // SAFETY: ready_head is a ring slot (`0..=capacity`); the ring has
+            // `capacity + 1` slots.
             let entry = unsafe { *self.ready_ring.add(usize::from(self.ready_head)) };
-            self.ready_head = (self.ready_head + 1) % self.ring_len();
-            let m = &mut self.members_mut()[usize::from(entry)];
+            self.ready_head = self.ring_next(self.ready_head);
+            let (tail, next_tail, ring) = (
+                self.ready_tail,
+                self.ring_next(self.ready_tail),
+                self.ready_ring,
+            );
+            let Some(m) = self.members_mut().get_mut(usize::from(entry))
+            else
+            {
+                continue;
+            };
             if m.is_occupied() && ready(m)
             {
                 let badge = m.badge;
                 // The pop above freed a slot, so the re-queue always fits; the
                 // member keeps its one entry and its `queued` flag.
-                // SAFETY: ready_tail < ring_len; the ring has ring_len slots.
-                unsafe { *self.ready_ring.add(usize::from(self.ready_tail)) = entry };
-                self.ready_tail = (self.ready_tail + 1) % self.ring_len();
+                // SAFETY: tail is a ring slot; the ring has `capacity + 1` slots.
+                unsafe { *ring.add(usize::from(tail)) = entry };
+                self.ready_tail = next_tail;
                 return Some(badge);
             }
             m.queued = false;
@@ -377,27 +401,32 @@ impl WaitSetState
     /// entry names a distinct occupied member.
     fn vacate_member(&mut self, idx: usize)
     {
-        if self.members()[idx].queued
+        let Some(m) = self.members_mut().get_mut(idx)
+        else
         {
-            let len = self.ring_len();
+            return;
+        };
+        let queued = m.queued;
+        *m = WaitSetMember::vacant();
+        if queued
+        {
             let (mut read, mut write) = (self.ready_head, self.ready_head);
             while read != self.ready_tail
             {
-                // SAFETY: read and write are < ring_len; the ring has ring_len
-                // slots.
+                // SAFETY: read and write are ring slots (`0..=capacity`); the
+                // ring has `capacity + 1` slots.
                 unsafe {
                     let entry = *self.ready_ring.add(usize::from(read));
                     if usize::from(entry) != idx
                     {
                         *self.ready_ring.add(usize::from(write)) = entry;
-                        write = (write + 1) % len;
+                        write = self.ring_next(write);
                     }
                 }
-                read = (read + 1) % len;
+                read = self.ring_next(read);
             }
             self.ready_tail = write;
         }
-        self.members_mut()[idx] = WaitSetMember::vacant();
     }
 
     // ── Readiness model ───────────────────────────────────────────────────
@@ -414,8 +443,12 @@ impl WaitSetState
     fn on_arrival(&mut self, member_idx: u16, threads_parked: bool) -> Option<u64>
     {
         self.push_ready(member_idx);
-        let m = &self.members()[usize::from(member_idx)];
-        threads_parked.then_some(if m.is_occupied() { m.badge } else { 0 })
+        let badge = self
+            .members()
+            .get(usize::from(member_idx))
+            .filter(|m| m.is_occupied())
+            .map_or(0, |m| m.badge);
+        threads_parked.then_some(badge)
     }
 
     /// Install `member` in the first vacant slot. If `ready` reports its
@@ -429,19 +462,23 @@ impl WaitSetState
         threads_parked: bool,
     ) -> Option<(u16, Option<u64>)>
     {
-        let idx = self.members().iter().position(|m| !m.is_occupied())?;
-        self.members_mut()[idx] = WaitSetMember {
+        let (idx, slot) = self
+            .members_mut()
+            .iter_mut()
+            .enumerate()
+            .find(|(_, m)| !m.is_occupied())?;
+        *slot = WaitSetMember {
             source_ptr: member.source_ptr,
             source_tag: member.source_tag,
             queued: false,
             badge: member.badge,
         };
-        self.member_count += 1;
+        let (badge, is_ready) = (slot.badge, ready(slot));
+        // A vacant slot was found, so the count stays within `capacity`.
+        self.member_count = self.member_count.saturating_add(1);
         // cast_possible_truncation: idx < capacity, a u16.
         #[allow(clippy::cast_possible_truncation)]
         let idx = idx as u16;
-        let m = &self.members()[usize::from(idx)];
-        let (badge, is_ready) = (m.badge, ready(m));
         if !is_ready
         {
             return Some((idx, None));
@@ -454,7 +491,8 @@ impl WaitSetState
     fn remove_member(&mut self, idx: usize)
     {
         self.vacate_member(idx);
-        self.member_count -= 1;
+        // Callers name an occupied member, so the count is at least 1.
+        self.member_count = self.member_count.saturating_sub(1);
     }
 
     /// The badge a wait returns without parking, or `None` when no member is
@@ -467,14 +505,16 @@ impl WaitSetState
         {
             return Some(badge);
         }
-        let idx = (0..usize::from(self.capacity)).find(|&i| {
-            let m = &self.members()[i];
-            m.is_occupied() && ready(m)
-        })?;
+        let (idx, badge) = self
+            .members()
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.is_occupied() && ready(m))
+            .map(|(idx, m)| (idx, m.badge))?;
         // cast_possible_truncation: idx < capacity, a u16.
         #[allow(clippy::cast_possible_truncation)]
         self.push_ready(idx as u16);
-        Some(self.members()[idx].badge)
+        Some(badge)
     }
 }
 
@@ -821,9 +861,8 @@ pub unsafe fn wait_set_drop(
     // notification_send / event_queue_post / endpoint_call can reach
     // waitset_notify for this wait set; nothing else writes the members of a
     // set whose refcount is 0.
-    for idx in 0..usize::from(ws_ref.capacity)
+    for slot in ws_ref.members()
     {
-        let slot = &ws_ref.members()[idx];
         if !slot.is_occupied()
         {
             continue;
@@ -1041,7 +1080,37 @@ mod tests
         drain(&mut ws);
     }
 
+    // Defect guarded: the ring index past the last slot did not return to 0,
+    // or the step overflowed at the largest `u16` capacity.
+    #[test]
+    fn ring_next_wraps_after_the_last_slot()
+    {
+        let mut fx = Fixture::<3, 4>::new();
+        let ws = fx.set();
+        assert_eq!([0, 1, 2, 3].map(|at| ws.ring_next(at)), [1, 2, 3, 0]);
+        assert_eq!(ring_step(u16::MAX - 1, u16::MAX), u16::MAX);
+        assert_eq!(ring_step(u16::MAX, u16::MAX), 0);
+    }
+
+    // Defect guarded: a member index that names no slot panicked on the
+    // member array's bounds check in the arrival path, under the set's lock.
+    #[test]
+    fn an_arrival_for_no_slot_queues_nothing()
+    {
+        let mut fx = Fixture::<2, 3>::new();
+        let mut ws = fx.set();
+        assert_eq!(ws.on_arrival(2, true), Some(0));
+        assert!(!ws.has_ready());
+        ws.vacate_member(2);
+        assert!(ws.members().iter().all(WaitSetMember::is_occupied));
+
+        ws.push_ready(1);
+        assert_eq!(ws.pop_ready(always_ready), Some(101));
+        drain(&mut ws);
+    }
+
     /// The readiness predicate of a set whose every source is ready.
+
     fn always_ready(_: &WaitSetMember) -> bool
     {
         true
@@ -1365,10 +1434,10 @@ mod tests
             let mut at = ws.ready_head;
             while at != ws.ready_tail
             {
-                // SAFETY: at < ring_len; the ring has ring_len slots.
+                // SAFETY: at is a ring slot; the ring has `capacity + 1` slots.
                 let idx = usize::from(unsafe { *ws.ready_ring.add(usize::from(at)) });
                 in_ring[idx] += 1;
-                at = (at + 1) % ws.ring_len();
+                at = ws.ring_next(at);
             }
             let occupied = ws.members().iter().filter(|m| m.is_occupied()).count();
             assert_eq!(usize::from(ws.member_count), occupied);

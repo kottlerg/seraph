@@ -291,18 +291,30 @@ pub fn isolate_irq_id(ctx: &TestContext, id: u32) -> Option<u64>
 
 // ── SYS_IRQ_MSG_ALLOC ─────────────────────────────────────────────────────────
 
-/// Most mints `irq_msg_exhaustion_and_reuse` makes before it stops looking for
-/// the end: past the kernel's cap on message targets (16384).
-const MSG_MINT_LIMIT: u32 = 20_000;
+/// Slots of one CPU's delivery space no architecture exceeds: an x86-64 CPU has
+/// 217 device vectors, a riscv64 hart's IMSIC file at most 2047 identities.
+/// `irq_msg_exhaustion_and_reuse` stops looking for the end past this many
+/// mints per CPU.
+const MSG_SLOTS_PER_CPU_MAX: u64 = 2048;
 
 /// Pages `irq_msg_exhaustion_and_reuse` adds to the test's `CSpace` at a time
 /// when a mint finds it full.
 const MSG_AUGMENT_PAGES: u64 = 32;
 
-/// Most pages `irq_msg_exhaustion_and_reuse` adds to the test's `CSpace`: the
-/// slots (`CSPACE_SLOTS_PER_PAGE` a page) and arena chunks (128 bytes each) of
-/// 16384 minted caps fit in about 810 pages.
-const MSG_DONATION_PAGES: u64 = 1024;
+/// Most mints `irq_msg_exhaustion_and_reuse` makes, and most pages it adds to
+/// the test's `CSpace` for them: a slot (`CSPACE_SLOTS_PER_PAGE` a page) and an
+/// arena body (`CSPACE_BODIES_PER_PAGE` a page) per minted cap, and one
+/// augment's worth besides.
+fn msg_exhaustion_bounds() -> Result<(u64, u64), &'static str>
+{
+    let cpus = syscall::system_info(syscall_abi::SystemInfoType::CpuCount as u64)
+        .map_err(|_| "hw::irq_msg_exhaustion_and_reuse: system_info(CpuCount) failed")?;
+    let mints = cpus * MSG_SLOTS_PER_CPU_MAX;
+    let pages = mints.div_ceil(syscall_abi::CSPACE_SLOTS_PER_PAGE)
+        + mints.div_ceil(syscall_abi::CSPACE_BODIES_PER_PAGE)
+        + MSG_AUGMENT_PAGES;
+    Ok((mints, pages))
+}
 
 /// A derived copy of the first cap in the test's `CSpace` that mints a
 /// message-signaled target, carrying every right of it, and nothing minted.
@@ -482,21 +494,31 @@ pub fn irq_msg_register(ctx: &TestContext) -> TestResult
     result
 }
 
-/// Minting until `QuotaExceeded` exhausts the message targets; deleting a
-/// minted cap frees its target for the next mint, and revoking the authority
-/// deletes every cap minted through it and frees their targets. The test's own
-/// `CSpace` is augmented from its Memory cap whenever a mint finds it full
-/// (`OutOfMemory`), so the targets, not the slots, run out first.
+/// Minting until `QuotaExceeded` exhausts the message targets, and what ran
+/// out is the CPUs' slots, not the kernel's table: a wired line cannot then be
+/// routed either (`QuotaExceeded`), since no CPU has a slot left for it.
+/// Deleting a minted cap frees its target for the next mint, and revoking the
+/// authority deletes every cap minted through it and frees their targets. The
+/// test's own `CSpace` is augmented from its Memory cap whenever a mint finds it
+/// full (`OutOfMemory`), so the targets, not the `CSpace`, run out first.
 pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
 {
+    let (mint_limit, donation_limit) = msg_exhaustion_bounds()?;
     let authority = msg_authority(ctx)?;
+    // The line and the notification are made before the mints fill the
+    // `CSpace`.
+    let line = isolate_irq_id(ctx, crate::arch::ROUTABLE_HIGH_IRQ_IDS[0]);
+    let sig = cap_create_notification(ctx.memory_base);
     let result = (|| -> TestResult {
+        let line = line.ok_or("hw::irq_msg_exhaustion_and_reuse: cannot isolate a line")?;
+        let sig =
+            sig.map_err(|_| "hw::irq_msg_exhaustion_and_reuse: cap_create_notification failed")?;
         let mut last = 0;
         let mut minted = 0;
         let mut donated = 0;
         loop
         {
-            if minted == MSG_MINT_LIMIT
+            if minted == mint_limit
             {
                 return Err("hw::irq_msg_exhaustion_and_reuse: targets never ran out");
             }
@@ -508,7 +530,7 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
                     minted += 1;
                 }
                 Err(e) if e == SyscallError::QuotaExceeded as i64 => break,
-                Err(e) if e == SyscallError::OutOfMemory as i64 && donated < MSG_DONATION_PAGES =>
+                Err(e) if e == SyscallError::OutOfMemory as i64 && donated < donation_limit =>
                 {
                     syscall::cap_create_cspace(ctx.memory_base, ctx.cspace_cap, MSG_AUGMENT_PAGES)
                         .map_err(|_| "hw::irq_msg_exhaustion_and_reuse: CSpace augment failed")?;
@@ -523,8 +545,12 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
         }
         crate::log_u64(
             "ktest: hw::irq_msg_exhaustion_and_reuse targets minted=",
-            u64::from(minted),
+            minted,
         );
+        if irq_register(line, sig, 0) != Err(SyscallError::QuotaExceeded as i64)
+        {
+            return Err("hw::irq_msg_exhaustion_and_reuse: mints stopped while a slot was free");
+        }
         syscall::cap_delete(last)
             .map_err(|_| "hw::irq_msg_exhaustion_and_reuse: cap_delete failed")?;
         let probe = irq_msg_alloc(authority)
@@ -545,6 +571,14 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
         syscall::cap_delete(again).ok();
         Ok(())
     })();
+    if let Some(line) = line
+    {
+        syscall::cap_delete(line).ok();
+    }
+    if let Ok(sig) = sig
+    {
+        syscall::cap_delete(sig).ok();
+    }
     syscall::cap_revoke(authority).ok();
     syscall::cap_delete(authority).ok();
     result

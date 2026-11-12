@@ -262,8 +262,8 @@ pub fn sys_irq_register(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns the new cap handle; `InvalidCapability` for a handle that names no
 /// `Interrupt` cap; `InsufficientRights` when it lacks `RIGHTS_IRQ_MINT`;
-/// `QuotaExceeded` when no target is free (every target the routing table
-/// holds is minted, or no CPU has a free slot); `OutOfMemory` when the caller's
+/// `QuotaExceeded` when no target is free (no CPU has a free slot; the routing
+/// table holds a target per slot); `OutOfMemory` when the caller's
 /// arena cannot fund the object; `InvalidState` when the authority's slot is
 /// pinned by an in-flight revoke, move, or transfer; and the error of a full
 /// `CSpace`.

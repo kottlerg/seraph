@@ -40,10 +40,11 @@
 //! The table has one entry per line the discovered interrupt controllers
 //! implement (`arch::current::interrupts::irq_line_count`: on x86-64 the GSIs the
 //! I/O APICs cover, on riscv64 the APLIC's sources), then one per message target
-//! ([`message_capacity`]: a slot of each CPU's delivery space, capped at
-//! [`MAX_MESSAGE_TARGETS`]), allocated once at Phase 5 by [`init_table`]. A line
-//! at or above the line count is refused by [`register`], and a mint past the
-//! message capacity by [`alloc_message`].
+//! ([`message_capacity`]: one per slot of every boot CPU's delivery space),
+//! allocated once at Phase 5 by [`init_table`]. Every message target holds a slot
+//! from its mint to its free, so the table holds every target the CPUs can
+//! deliver, and a mint fails only when no CPU a message can reach has a free
+//! slot. A line at or above the line count is refused by [`register`].
 //!
 //! # Sharing
 //! A wired line is a source with up to [`MAX_IRQ_BINDINGS`] bindings. A binding
@@ -477,30 +478,23 @@ impl<S: AsRef<[u32]> + AsMut<[u32]>> LineSet<S>
 /// (module doc § Sources).
 pub const MESSAGE_ID_BASE: u32 = crate::arch::current::ROOT_IRQ_COUNT;
 
-/// Most message targets the table holds, whatever the CPU count: the cap on
-/// [`message_capacity`]. Sized for per-queue devices at one vector per CPU and
-/// queue (an `NVMe` controller or a NIC takes one per CPU it serves); 16384 is
-/// 64 such devices on 256 CPUs, at 52 bytes each (`table_bytes`: a route, two
-/// routed-source set entries and a pool entry), 832 KiB.
-pub const MAX_MESSAGE_TARGETS: u32 = 16384;
-
 /// The message targets a table holds on `cpu_count` CPUs whose delivery spaces
-/// hold `slots_per_cpu` slots each: one per slot, capped at
-/// [`MAX_MESSAGE_TARGETS`]. Wired lines take slots of the same spaces, so a mint
-/// can still find no free slot below the capacity
-/// ([`RouteError::Exhausted`]).
+/// hold `slots_per_cpu` slots each: one per slot, since a minted target holds
+/// its slot until it is freed, so no mint finds a free slot past it. Wired lines
+/// take slots of the same spaces, so a mint can still find no free slot below
+/// the capacity ([`RouteError::Exhausted`]).
+///
+/// The count is clamped to the message ids a `u32` holds past
+/// [`MESSAGE_ID_BASE`], which also keeps the table's entry count (the wired
+/// lines, at most `MESSAGE_ID_BASE`, and the targets) in a `u32`. No boot
+/// reaches the clamp: `MAX_CPUS` CPUs at the AIA's 2047 identities each are
+/// about 2^24 slots.
 #[must_use]
 pub const fn message_capacity(cpu_count: u32, slots_per_cpu: u32) -> u32
 {
     let slots = cpu_count.saturating_mul(slots_per_cpu);
-    if slots < MAX_MESSAGE_TARGETS
-    {
-        slots
-    }
-    else
-    {
-        MAX_MESSAGE_TARGETS
-    }
+    let ids = u32::MAX - MESSAGE_ID_BASE;
+    if slots < ids { slots } else { ids }
 }
 
 /// Whether `id` names a message target rather than a wired line.
@@ -737,12 +731,15 @@ const fn table_bytes(space: IdSpace) -> usize
 /// Allocate the routing table, the routed-source set and the message pool for
 /// `line_count` lines and the message targets of the boot CPUs
 /// ([`message_capacity`] of `arch::current::interrupts::message_slots_per_cpu`)
-/// from the buddy allocator, zero-filled, and publish them.
+/// as one zero-filled run of pages (`sched::alloc_zeroed_slab`, which may span
+/// several buddy blocks, so no CPU count is capped by the largest one), and
+/// publish them. Halts the boot, naming the table, when no run is long enough.
 ///
 /// Called once on the BSP at Phase 5, after the interrupt controllers are
 /// discovered (`arch::current::interrupts::init`) and the boot CPU count is
 /// known (Phase 4), and before any source is routed. The table lives for the
-/// kernel's lifetime.
+/// kernel's lifetime: the buddy is sealed at Phase 7, so the table is sized
+/// here for every target the boot CPUs can deliver.
 #[cfg(not(test))]
 pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
 {
@@ -755,20 +752,12 @@ pub fn init_table(line_count: u32, allocator: &mut crate::mm::BuddyAllocator)
     };
     let entries = space.entries();
     let messages = space.messages as usize;
-    let pages = table_bytes(space).div_ceil(crate::mm::PAGE_SIZE).max(1);
-    let order = pages.next_power_of_two().trailing_zeros() as usize;
-    if order > crate::mm::buddy::MAX_ORDER
-    {
-        crate::fatal("irq: routing table exceeds the largest buddy block");
-    }
-    let phys = allocator
-        .alloc(order)
-        .unwrap_or_else(|| crate::fatal("irq: out of memory for the routing table"));
-    // A buddy block is page-aligned, so the routes at its base are aligned.
-    let routes_base = crate::mm::paging::phys_to_virt(phys) as *mut IrqRoute;
-    let bytes = (1usize << order) * crate::mm::PAGE_SIZE;
-    // SAFETY: the block covers `bytes` of mapped, kernel-owned RAM just allocated.
-    unsafe { core::ptr::write_bytes(routes_base.cast::<u8>(), 0, bytes) };
+    // A slab is page-aligned, so the routes at its base are aligned.
+    let routes_base = crate::sched::alloc_zeroed_slab::<IrqRoute>(
+        table_bytes(space),
+        allocator,
+        "IRQ_ROUTING_TABLE",
+    );
     // SAFETY: the allocation holds `entries` routes followed by two `u32` arrays
     // of `entries` entries and one of `messages` (`table_bytes`), zero-filled,
     // which is the empty entry and the empty set; the `u32` arrays start at a
@@ -1145,8 +1134,9 @@ unsafe fn unbind(
 }
 
 /// Table entry `index` as the `u32` the routed-source set holds: the table's
-/// entry count is the sum of two `u32` counts that `init_table` bounds below
-/// `u32::MAX` ([`MAX_MESSAGE_TARGETS`] past the Interrupt id space).
+/// entry count is the line count, at most the Interrupt id space's width
+/// ([`MESSAGE_ID_BASE`]), plus the message targets, at most the ids past it
+/// ([`message_capacity`]), so at most `u32::MAX`.
 #[cfg(not(test))]
 fn entry_u32(index: usize) -> u32
 {
@@ -1164,8 +1154,10 @@ fn entry_u32(index: usize) -> u32
 /// the target, unbound, until [`free_message`].
 ///
 /// # Errors
-/// [`RouteError::Exhausted`] when every message target the table holds is
-/// minted, or no CPU has a free slot. Nothing changes on error.
+/// [`RouteError::Exhausted`] when no CPU the controller can deliver a message
+/// to has a free slot. The table holds a target for every slot of every CPU
+/// ([`message_capacity`]), so its free ids run out only when the slots have.
+/// Nothing changes on error.
 ///
 /// Outside interrupt context (it takes the routing lock).
 #[cfg(not(test))]
@@ -1884,12 +1876,17 @@ mod tests
     }
 
     // Defect caught: a message id inside the root Interrupt capability's range,
-    // which a split could name and bind as a wired line.
+    // which a split could name and bind as a wired line, or a capacity whose
+    // last id overflows a u32.
     #[test]
     fn message_ids_lie_past_the_interrupt_id_space()
     {
         assert_eq!(MESSAGE_ID_BASE, crate::arch::current::ROOT_IRQ_COUNT);
-        assert!(MESSAGE_ID_BASE.checked_add(MAX_MESSAGE_TARGETS).is_some());
+        assert!(
+            MESSAGE_ID_BASE
+                .checked_add(message_capacity(u32::MAX, u32::MAX))
+                .is_some()
+        );
     }
 
     // Defect caught: an offset minted twice, a full pool not reported, or a
@@ -1918,16 +1915,27 @@ mod tests
         assert_eq!(pool.take(), None);
     }
 
-    // Defect caught: the table sized past the cap on a large machine, or below
-    // the slots a small one has.
+    // Defect caught: the table sized below the slots the CPUs have, so a mint
+    // fails while a CPU has a free slot.
     #[test]
-    fn message_capacity_is_one_per_slot_up_to_the_cap()
+    fn message_capacity_is_one_per_slot_of_every_cpu()
     {
         assert_eq!(message_capacity(4, 217), 868);
         assert_eq!(message_capacity(1, 255), 255);
-        assert_eq!(message_capacity(8192, 2047), MAX_MESSAGE_TARGETS);
-        assert_eq!(message_capacity(u32::MAX, u32::MAX), MAX_MESSAGE_TARGETS);
+        assert_eq!(message_capacity(128, 217), 27_776);
+        assert_eq!(message_capacity(8192, 2047), 8192 * 2047);
         assert_eq!(message_capacity(0, 217), 0);
+    }
+
+    // Defect caught: a product past the id space wrapping to a small table, or
+    // a capacity naming ids past u32.
+    #[test]
+    fn message_capacity_stops_at_the_message_id_space()
+    {
+        let ids = u32::MAX - MESSAGE_ID_BASE;
+        assert_eq!(message_capacity(u32::MAX, u32::MAX), ids);
+        assert_eq!(message_capacity(ids, 1), ids);
+        assert_eq!(message_capacity(ids - 1, 1), ids - 1);
     }
 
     // Defect caught: the table's byte count missing the pool, so the pool's

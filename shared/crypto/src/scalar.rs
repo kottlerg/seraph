@@ -134,10 +134,10 @@ mod tests
     {
         // A value below L (top byte 0) reduces to itself.
         let mut v = [0u8; 32];
-        let mut i = 0;
+        let mut i: u8 = 0;
         while i < 31
         {
-            v[i] = (i as u8).wrapping_mul(7).wrapping_add(3);
+            v[usize::from(i)] = i.wrapping_mul(7).wrapping_add(3);
             i += 1;
         }
         v[31] = 0x00;

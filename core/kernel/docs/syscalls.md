@@ -2453,7 +2453,10 @@ differences. Its CPU and slot were taken at its mint, so its first binding route
 takes one binding, in mode 0 (a device's message is an edge). It is never masked: each message
 ORs bit 0 into the bound notification and completes at the local APIC (x86-64) or needs no
 completion (the IMSIC claim, RISC-V), and its `SYS_IRQ_ACK` changes nothing; a driver that must
-hold its device's messages off masks them at the device (the MSI-X vector control bit). Removing
+hold its device's messages off does so at the device, through the device's own interrupt controls,
+since devmgr alone writes the MSI-X table and its per-vector masks
+([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
+§ Message-Signaled Interrupts). Removing
 its binding frees no slot: the target stays the capability's until the capability is gone.
 
 On x86-64 the line's I/O APIC redirection entry is programmed with the recorded mode: bit 15 set

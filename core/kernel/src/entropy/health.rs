@@ -137,8 +137,8 @@ mod tests
         for _ in 0..(STARTUP_BYTES / 8 + 4)
         {
             x = x
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
             h.push_word(x);
         }
         assert!(!h.failed(), "varied source must not trip a health test");
@@ -166,14 +166,7 @@ mod tests
         // trips) yet 0x00 recurs far past the APT cutoff within one window.
         for i in 0..APT_WINDOW
         {
-            let byte = if i % RCT_CUTOFF == RCT_CUTOFF - 1
-            {
-                0x01
-            }
-            else
-            {
-                0x00
-            };
+            let byte = u8::from(i % RCT_CUTOFF == RCT_CUTOFF - 1);
             h.push(byte);
         }
         assert!(h.failed(), "dominant value must trip the APT");

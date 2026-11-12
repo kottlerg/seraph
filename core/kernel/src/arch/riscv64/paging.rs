@@ -1972,9 +1972,9 @@ mod tests
         // ppn[3:0] must carry the 64 KiB size encoding.
         assert_eq!(first.0 & (0xF << 10), NAPOT_64K_PPN);
         // Every member is bit-identical.
-        for i in 16..32
+        for entry in &t[16..32]
         {
-            assert_eq!(t[i].0, first.0);
+            assert_eq!(entry.0, first.0);
         }
         // Untouched outside the group.
         assert_eq!(t[15].0, 0);
@@ -1986,9 +1986,9 @@ mod tests
     {
         let mut t = table_with_run(0, 16, 0x1_0000, MMIO_FLAGS);
         try_promote_napot_64k(&mut t, va_at(0));
-        for i in 0..16
+        for (i, entry) in t.iter().enumerate().take(16)
         {
-            assert_eq!(leaf_phys(t[i], va_at(i)), 0x1_0000 + i as u64 * 4096);
+            assert_eq!(leaf_phys(*entry, va_at(i)), 0x1_0000 + i as u64 * 4096);
         }
     }
 

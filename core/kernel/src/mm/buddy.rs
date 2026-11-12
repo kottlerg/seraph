@@ -439,9 +439,6 @@ impl<W: PhysWindow> BuddyAllocator<W>
     /// the post-handoff ownership rule is in docs/userspace-memory-model.md
     /// § Ownership Boundaries. Called once, at the end of the drain, while the
     /// free list is empty.
-    // dead_code: the sole caller, `cap::drain_and_install_seed`, is
-    // `cfg(not(test))`, so host test builds never call `seal`.
-    #[cfg_attr(test, allow(dead_code))]
     pub fn seal(&mut self)
     {
         self.sealed = true;
@@ -1014,7 +1011,7 @@ mod tests
         assert_eq!(alloc.free_page_count(), 0);
     }
 
-    /// Pages in one MAX_ORDER block.
+    /// Pages in one `MAX_ORDER` block.
     const M: u64 = 1 << MAX_ORDER;
 
     // Defect caught: a per-CPU slab larger than one buddy block halting the

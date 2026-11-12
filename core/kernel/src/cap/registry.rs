@@ -444,9 +444,9 @@ mod tests
     extern crate alloc;
 
     /// A registry with `chunks` heap-backed chunks installed.
-    fn registry(chunks: usize) -> Box<CSpaceRegistry>
+    fn registry(chunks: usize) -> CSpaceRegistry
     {
-        let reg = Box::new(CSpaceRegistry::new());
+        let reg = CSpaceRegistry::new();
         let table: Vec<AtomicPtr<RegistryEntry>> = (0..chunks)
             .map(|_| AtomicPtr::new(core::ptr::null_mut()))
             .collect();
@@ -477,7 +477,7 @@ mod tests
     {
         let reg = registry(0);
         assert_eq!(reg.alloc(), None);
-        assert!(reg.register(0, tenant(1)).is_err());
+        reg.register(0, tenant(1)).unwrap_err();
         assert_eq!(reg.lookup(0, 1), None);
     }
 
@@ -589,7 +589,7 @@ mod tests
     {
         let reg = registry(1);
         let beyond = ENTRIES_PER_CHUNK as u32;
-        assert!(reg.register(beyond, tenant(1)).is_err());
+        reg.register(beyond, tenant(1)).unwrap_err();
         assert_eq!(reg.epoch(beyond), 0);
         assert_eq!(reg.lookup(beyond, 1), None);
         reg.retire(beyond, 5);

@@ -507,7 +507,7 @@ mod tests
 
     fn ptr(t: &mut Box<ThreadControlBlock>) -> *mut ThreadControlBlock
     {
-        &mut **t as *mut ThreadControlBlock
+        &raw mut **t
     }
 
     fn unlinked(t: &ThreadControlBlock) -> bool

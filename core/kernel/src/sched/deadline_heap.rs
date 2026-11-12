@@ -316,17 +316,17 @@ mod tests
 {
     use super::*;
 
-    /// A heap over `keys.len()` boxed nodes; returns the nodes so the test
-    /// can remove specific ones.
-    fn filled(keys: &[u64]) -> (DeadlineHeap, Vec<Box<DeadlineNode>>)
+    /// A heap over `keys.len()` nodes; returns the nodes so the test can
+    /// remove specific ones. The vector is never grown, so its nodes keep their
+    /// addresses while the heap links them.
+    fn filled(keys: &[u64]) -> (DeadlineHeap, Vec<DeadlineNode>)
     {
         let mut heap = DeadlineHeap::new();
-        let mut nodes: Vec<Box<DeadlineNode>> =
-            keys.iter().map(|_| Box::new(DeadlineNode::new())).collect();
+        let mut nodes: Vec<DeadlineNode> = keys.iter().map(|_| DeadlineNode::new()).collect();
         for (node, &key) in nodes.iter_mut().zip(keys)
         {
-            // SAFETY: the boxed node is unlinked and outlives the heap use.
-            unsafe { heap.insert(&raw mut **node, key) };
+            // SAFETY: the node is unlinked and outlives the heap use.
+            unsafe { heap.insert(&raw mut *node, key) };
         }
         (heap, nodes)
     }
@@ -388,7 +388,7 @@ mod tests
         let mut removed = vec![false; nodes.len()];
         for i in (0..nodes.len()).step_by(3)
         {
-            let n: *mut DeadlineNode = &raw mut *nodes[i];
+            let n: *mut DeadlineNode = &raw mut nodes[i];
             // SAFETY: n is a live boxed node; the test owns the heap.
             unsafe {
                 if (*n).is_linked()
@@ -415,7 +415,7 @@ mod tests
     fn a_removed_node_reinserts_with_a_new_key()
     {
         let (mut heap, mut nodes) = filled(&[50, 40, 30]);
-        let n: *mut DeadlineNode = &raw mut *nodes[0];
+        let n: *mut DeadlineNode = &raw mut nodes[0];
         // SAFETY: test owns the heap and the node.
         unsafe {
             heap.remove(n);

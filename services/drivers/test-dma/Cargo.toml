@@ -1,6 +1,6 @@
-# TODO(#165): remove with the devmgr enumeration redesign. Test-only driver
-# for QEMU's `edu` DMA device, so svctest can check that a mapped transfer
-# arrives and that the IOMMU stops one at a withdrawn device address.
+# Test-only driver for QEMU's `edu` DMA device, so svctest can check that a
+# mapped transfer arrives and that the IOMMU stops one at a withdrawn device
+# address.
 [package]
 name = "test-dma"
 version.workspace = true

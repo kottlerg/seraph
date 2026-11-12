@@ -1,0 +1,8 @@
+# test-dma: the test-only `test-dma` fixture on QEMU's `edu` device.
+#
+# The fixture checks no badge bit; a class names at least one verb bit, so
+# the SEND carries bit 63. svcmgr publishes it seed-only as
+# `devmgr.class.test-dma`, which only svctest seeds. Test-only: this
+# directory is not scanned; the svctest recipe copies the file into
+# /config/devmgr/classes/ (docs/testing.md).
+verbs = 63

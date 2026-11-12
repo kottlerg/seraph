@@ -100,8 +100,7 @@ sysroot/
 │   ├── drivers/              # device drivers (virtio-blk, virtio-input,
 │   │                         # virtio-console, serial, framebuffer,
 │   │                         # cmos-rtc | goldfish-rtc, iommu-vtd |
-│   │                         # iommu-riscv, and the test-only
-│   │                         # test-orphan, test-fault, and test-dma)
+│   │                         # iommu-riscv, and the test-only test-dma)
 │   └── fs/                   # filesystem drivers (fatfs)
 ├── programs/                 # program binaries and the test fixtures the
 │                             # harnesses spawn
@@ -115,6 +114,8 @@ sysroot/
     ├── usertest              # programs-surface orchestrator
     ├── crasher               # svcmgr restart-path fixture
     ├── debug-echo            # debug-port fixture (test-debug-port)
+    ├── drivers/              # test-only drivers bound only on demand
+    │   └── test-fault        # fault-injection driver, bound by BIND_DRIVERS
     └── programs/
         ├── hello             # per-program tester for /programs/hello
         ├── stdiotest         # per-program tester for /programs/stdiotest
@@ -124,20 +125,19 @@ sysroot/
 `/services/` and `/programs/` MUST NOT contain test harnesses or per-program
 testers; those live under `/tests/`. Dropping `/tests/` does not by itself
 give a non-test distro, because test-only artifacts also install under
-`/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, and `/data/`.
-Under `/services/drivers/` are
-[`test-orphan`](../services/drivers/test-orphan/README.md) and
-[`test-fault`](../services/drivers/test-fault/README.md), test-only
-fault-injection drivers, and [`test-dma`](../services/drivers/test-dma/README.md), the test-only
-driver of the `edu` DMA test device, installed there until the devmgr enumeration
-redesign ([#165](https://github.com/kottlerg/seraph/issues/165)) removes
-them. Under `/programs/` are the test fixtures the harnesses and per-program
+`/services/drivers/`, `/programs/`, `/config/svcmgr/tests/`, `/config/devmgr/tests/`, and `/data/`.
+Under `/services/drivers/` is [`test-dma`](../services/drivers/test-dma/README.md), the test-only
+driver of the `edu` DMA test device. Under `/tests/drivers/` is
+[`test-fault`](../services/drivers/test-fault/README.md), a test-only fault-injection driver that
+no drivers-directory pass at boot reads: devmgr binds it only through `BIND_DRIVERS`. Under
+`/programs/` are the test fixtures the harnesses and per-program
 testers spawn: `capexhaust`, `crashme`, `deadline`, `debugger`, `demandpaged`, `fsbench`,
 `pipefault`, `pipestress`, `relrofault`, `stackoverflow`, `stdiotest`, `threadchurn`, and
 `threadstack`. Which consumer spawns or drives each one is owned by [services/svctest/README.md §
 Fixtures](../services/svctest/README.md#fixtures) for `svctest` phases and by each fixture's README
 (`programs/<name>/README.md`) for every per-program tester that drives it. Under
-`/config/svcmgr/tests/` are the harness recipes (see [Gating](#gating)). Under `/data/` are
+`/config/svcmgr/tests/` are the harness recipes, and under `/config/devmgr/tests/` the test
+device class files the svctest recipe stages (see [Gating](#gating)). Under `/data/` are
 `/data/test.txt`, a fixture shared by `svctest` and the `shell` tester, and the build-synthesised
 `svctest`-only fixtures `/data/svctest/large.bin` and `/data/svctest/bench.bin`.
 
@@ -170,6 +170,15 @@ rootfs/config/svcmgr/
     └── gdbstub.svc           # GDB stub template; staged, naming its target,
                               # by run and run-parallel --debug-target, and
                               # by test-gdb
+
+rootfs/config/devmgr/
+├── classes/                  # device class files, scanned
+└── tests/                    # NOT scanned
+    ├── test-dma.class
+    ├── test-fault.class
+    ├── serial-deny.class
+    ├── input-deny.class
+    └── framebuffer-deny.class
 ```
 
 To enable a harness for a boot, copy its recipe from
@@ -181,9 +190,15 @@ re-mirror prunes the hand-staged recipe):
 ```sh
 cargo xtask build
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/services/
+cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 cargo xtask mkdisk --repack-only
-cargo xtask run
+cargo xtask run --test-devices
 ```
+
+The svctest recipe also stages the test class files of `sysroot/config/devmgr/tests/` into
+`sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
+`--test-devices`, which attaches `edu` and four QEMU `pci-testdev` functions that no other launch
+attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
 
 `ktest` is gated separately: it lives in the bootloader-loaded bundle,
 not in `svcmgr`'s recipe set. To run `ktest`, swap which binary backs
@@ -456,8 +471,10 @@ riscv64) × profile (debug, release) × harness (ktest, svctest, usertest).
 Fixed per CI run: vCPU count (4), guest memory (512 MiB), device set
 (virtio-blk + virtio-keyboard + virtio-rng + serial + the machine's RTC, the machine's IOMMU
 with the virtio-blk and virtio-keyboard devices behind it — `intel-iommu` on x86_64,
-`riscv-iommu-pci` at 00:01.0 on riscv64 — plus QEMU's `edu` DMA test device, which svctest's DMA
-confinement phase drives, and, on x86_64, `vmgenid,guid=auto`; CI boots headless, so no
+`riscv-iommu-pci` at 00:01.0 on riscv64 — and, on x86_64, `vmgenid,guid=auto`; the svctest cells
+also attach the test devices (`--test-devices`): QEMU's `edu` DMA test device, which svctest's DMA
+confinement phase drives, and four `pci-testdev` functions, which its on-demand-bind phase drives
+through the test-only test-fault driver; CI boots headless, so no
 framebuffer; this is the main set of Driver coverage below; the no-IOMMU boot, `--iommu absent`,
 the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-debug-port` and
 `test-gdb`, are device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release
@@ -520,8 +537,10 @@ surface.
     cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
   - filesystem: FAT, through the fatfs driver, on every partition `mkdisk` writes: svctest's
     filesystem phases;
-  - and the devices the harnesses drive: QEMU's `edu`, which the test-only test-dma driver drives
-    in svctest's DMA confinement phase, and, on x86_64, `vmgenid`, the generation source the
+  - and the devices the harnesses drive, which only the svctest launches attach
+    (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
+    confinement phase, four `pci-testdev` functions, which the test-only test-fault driver serves
+    in svctest's on-demand-bind phase, and, on x86_64, `vmgenid`, the generation source the
     kernel's snapshot detection reads: `test-vmgenid`.
 
   The canonical boots are headless, so the main set holds no framebuffer. Every code PR's CI cells
@@ -860,7 +879,7 @@ own diff is on.
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
 | test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), and svctest's DMA confinement check, which drives it (by definition alone: `dma_confinement_phase`) | no-iommu |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
-| serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, `services/drivers/test-fault/`, and `services/drivers/test-orphan/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
+| serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
@@ -973,18 +992,21 @@ owes some of the cells runs those boots, and the release host runs run all four.
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/services/
+cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
-cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420
+cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
+    --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only --split-data
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
-    --second-disk disk-data.img
+    --second-disk disk-data.img --test-devices
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
-    --second-disk disk-data.img --second-disk-shared-line
+    --second-disk disk-data.img --second-disk-shared-line --test-devices
 cargo xtask mkdisk --arch <arch> --repack-only
 cp disk.img target/xtask/second-disk.img
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 420 \
-    --second-disk target/xtask/second-disk.img --second-disk-block-size 8192
+    --second-disk target/xtask/second-disk.img --second-disk-block-size 8192 \
+    --test-devices
 ```
 
 **Framebuffer cell.** One svctest boot, on each architecture, keeps QEMU std VGA with no display
@@ -1005,10 +1027,11 @@ is the framebuffer device cell (Device surfaces above).
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
     sysroot/config/svcmgr/services/
+cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only
 cargo xtask run-parallel --arch <arch> --parallel 1 --runs 1 --timeout 360 \
-    --display framebuffer --fail-also 'framebuffer case skipped'
+    --display framebuffer --test-devices --fail-also 'framebuffer case skipped'
 ```
 
 **Debug-port cell.** Two boots, on each architecture, each of which attaches the debug port's
@@ -1053,7 +1076,8 @@ is bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
-cargo xtask run-parallel --arch <arch> --iommu absent --parallel 1 --runs 1 --timeout 540
+cargo xtask run-parallel --arch <arch> --iommu absent --parallel 1 --runs 1 --timeout 540 \
+    --test-devices
 ```
 
 **Documentation-only and comment-only changes.** A diff that, Markdown

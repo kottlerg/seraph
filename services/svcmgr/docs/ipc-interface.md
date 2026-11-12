@@ -60,8 +60,8 @@ no change to the encoding.
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
 svcmgr mints the `devmgr.registry` publish cap
-(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.test` publish caps
-(`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY` or `TEST_LABEL_AUTHORITY`), the
+(`REGISTRY_QUERY_AUTHORITY`), the `devmgr.shutdown` and `devmgr.bind` publish caps
+(`REGISTRY_QUERY_AUTHORITY` plus `SHUTDOWN_DEVICE_AUTHORITY` or `BIND_AUTHORITY`), the
 `MINT_CLASS_SEND` cap (`CLASS_AUTHORITY`) with which it configures devmgr's device classes
 ([service-definitions.md § Device class files](service-definitions.md#device-class-files)), and
 the `SET_DRIVERS_DIR` cap (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source, and publishes
@@ -111,7 +111,7 @@ bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
-`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.test`,
+`svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
 `vfsd.mount`, `vfsd.deny`, `logd.query`) into its own registry, configures devmgr's device
 classes and publishes each as `devmgr.class.<class>`, and installs devmgr's
 `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
@@ -201,19 +201,21 @@ publisher MUST NOT publish a verb-bit cap through this label.
 ### Label 4: `QUERY_ENDPOINT`
 
 Look up a name in the discovery registry; reply transfers a
-freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint.
+freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint. `QUERY_ENDPOINT` never yields
+`GRANT`, for any name.
 
 Only public names resolve. A name whose cap carries authority is published
 seed-only and answers `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`,
-the four `devmgr.*` names, `vfsd.mount`, `logd.query`, and each provider name whose badge
-carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today
+the four `devmgr.*` names (`devmgr.bind` included), `vfsd.mount`, `logd.query`, and each
+provider name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today
 `pwrmgr.shutdown`). `vfsd.deny` carries no authority but is seed-only too: it
 is svctest's test twin, reached only through svctest's recipe. A
 seed-only name reaches a process only through a recipe's `seed = ...` line,
 which svcmgr resolves itself, so its authority stays with the recipes that
-seed it ([service-definitions.md § `seed`](service-definitions.md#seed)). The
-public names are `svcmgr`, `pwrmgr.deny`, `timed`, and any name published
-through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
+seed it ([service-definitions.md § `seed`](service-definitions.md#seed)). A seed is `SEND` except
+`devmgr.bind`, which is `SEND|GRANT`, since `BIND_DRIVERS` moves a directory cap and the kernel
+requires `GRANT` for that. The public names are `svcmgr`, `pwrmgr.deny`, `timed`, and any name
+published through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 
 **Request:**
 

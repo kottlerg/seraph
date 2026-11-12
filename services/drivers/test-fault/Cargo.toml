@@ -1,6 +1,7 @@
-# TODO(#165): remove with the devmgr enumeration redesign. Test-only
-# fault-injection driver that reports ready and dies on request, or never
-# reports ready, so svctest can exercise devmgr's settle bound and the
+# Test-only fault-injection driver for QEMU's `pci-testdev`, bound on demand
+# (`BIND_DRIVERS`), that reports ready and dies on request, never reports
+# ready, or fails its bootstrap, by the BAR 2 of its device, so svctest can
+# exercise devmgr's on-demand bind, settle bound, mid-bootstrap teardown, and
 # withdrawal of a served driver.
 [package]
 name = "test-fault"
@@ -14,6 +15,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# The driver's declaration note and the resource list devmgr delivers it.
+driver-binding = { path = "../../../shared/driver-binding" }
 ipc = { path = "../../../shared/ipc" }
 syscall = { path = "../../../shared/syscall" }
 

@@ -14,8 +14,9 @@
 //! domain's other ranges, and only then calls the backend. It keeps each
 //! mapped cap while its range is installed and deletes it at the range's
 //! `UNMAP`, the domain's `BLOCK`, or at once when it refuses the request. A
-//! firmware-reserved range `MAP_RESERVED` installs at its own address carries
-//! no cap and stands until the domain's `BLOCK`. A unit whose backend reports
+//! firmware-reserved range `MAP_RESERVED` installs at its own address, and an
+//! interrupt file's page `MAP_MSI` installs at its own, carry no cap and stand
+//! until the domain's `BLOCK`. A unit whose backend reports
 //! a timeout is treated as failed: every later request on it is refused with
 //! `HARDWARE_TIMEOUT`.
 //!
@@ -50,6 +51,11 @@ pub const MAX_DOMAINS: usize = 256;
 /// it (`devmgr_firmware::dma::MAX_MAPPINGS_PER_DEVICE`); the driver's own
 /// bound keeps a caller that does not from growing its record without end.
 pub const MAX_RANGES_PER_DOMAIN: usize = 64;
+/// Interrupt files one domain reaches at once (`MAP_MSI`), apart from its
+/// ranges: one per message-signalled vector at most, and a device has at
+/// most 64 (`driver_binding::decl::MAX_MSI_VECTORS`). `docs/limits.md`
+/// classifies the bound.
+pub const MAX_MSI_FILES_PER_DOMAIN: usize = 64;
 /// How often, in milliseconds, [`poll_faults`] reads the units' fault
 /// records. A tuning value that bounds no capacity: a unit that records
 /// faults faster than this drains them overflows its few records, and the
@@ -153,14 +159,27 @@ pub trait Lock<T>
     fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R;
 }
 
-/// One installed range of a domain, and the cap over its frames the driver
-/// keeps while it stands: `None` for a firmware-reserved range
-/// (`MAP_RESERVED`), which no cap covers and no `UNMAP` withdraws.
+/// What an installed range of a domain is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind
+{
+    /// A `MAP` range, and the cap over its frames the driver keeps while it
+    /// stands.
+    Mapped(u64),
+    /// A firmware-reserved range (`MAP_RESERVED`), which no cap covers and
+    /// no `UNMAP` withdraws.
+    Reserved,
+    /// An interrupt file's page (`MAP_MSI`), which no cap covers and no
+    /// `UNMAP` withdraws.
+    MsiFile,
+}
+
+/// One installed range of a domain.
 struct Range
 {
     iova: u64,
     len: u64,
-    cap: Option<u64>,
+    kind: Kind,
 }
 
 impl Range
@@ -168,6 +187,16 @@ impl Range
     fn overlaps(&self, iova: u64, len: u64) -> bool
     {
         self.iova < iova + len && iova < self.iova + self.len
+    }
+
+    /// The cap the driver keeps for the range: a `MAP` range's only.
+    fn cap(&self) -> Option<u64>
+    {
+        match self.kind
+        {
+            Kind::Mapped(cap) => Some(cap),
+            Kind::Reserved | Kind::MsiFile => None,
+        }
     }
 }
 
@@ -321,6 +350,10 @@ impl<B: Backend, C: CapOps> Service<B, C>
                 .map_reserved(msg.word(1), msg.word(2), msg.word(3))
                 .err()
                 .unwrap_or(iommu_errors::SUCCESS),
+            iommu_labels::MAP_MSI => self
+                .map_msi(msg.word(1), msg.word(2))
+                .err()
+                .unwrap_or(iommu_errors::SUCCESS),
             iommu_labels::UNMAP => self.unmap(msg.word(1), msg.word(2)),
             iommu_labels::BLOCK => self.block(msg.word(1)),
             iommu_labels::QUERY_UNIT => match self.query(msg.word(1))
@@ -443,7 +476,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return Err(invalid);
         }
-        self.install(index, iova, mem.phys, mem.len, access, Some(cap))
+        self.install(index, iova, mem.len, Kind::Mapped(cap), (mem.phys, access))
     }
 
     /// Install the firmware-reserved range of `len` bytes at `base` in the
@@ -451,21 +484,36 @@ impl<B: Backend, C: CapOps> Service<B, C>
     fn map_reserved(&mut self, handle: u64, base: u64, len: u64) -> Result<(), u64>
     {
         let index = self.domain_index(handle)?;
-        self.install(index, base, base, len, Access::ReadWrite, None)
+        self.install(index, base, len, Kind::Reserved, (base, Access::ReadWrite))
     }
 
-    /// Install `len` bytes from `phys` at `iova` in the domain at `index`,
-    /// once the range is checked page-aligned, nonempty, within the unit's
-    /// width, clear of the domain's other ranges, and within the domain's
-    /// bound, recording it with `cap`.
+    /// Install the interrupt file's page at `file` in the domain `handle` at
+    /// its own address, with no cap ([`Backend::map_msi`]).
+    fn map_msi(&mut self, handle: u64, file: u64) -> Result<(), u64>
+    {
+        let index = self.domain_index(handle)?;
+        self.install(
+            index,
+            file,
+            PAGE_SIZE,
+            Kind::MsiFile,
+            (file, Access::ReadWrite),
+        )
+    }
+
+    /// Install `len` bytes at `iova` in the domain at `index`, once the range
+    /// is checked page-aligned, nonempty, within the unit's width, clear of
+    /// the domain's other ranges, and within the domain's bound for its
+    /// `kind`, recording it as `kind`. A [`Kind::MsiFile`] page is installed
+    /// by [`Backend::map_msi`]; any other range from the physical address and
+    /// with the access of `frames` by [`Backend::map`].
     fn install(
         &mut self,
         index: usize,
         iova: u64,
-        phys: u64,
         len: u64,
-        access: Access,
-        cap: Option<u64>,
+        kind: Kind,
+        frames: (u64, Access),
     ) -> Result<(), u64>
     {
         let invalid = iommu_errors::INVALID_REQUEST;
@@ -483,7 +531,22 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return Err(iommu_errors::ADDRESS_IN_USE);
         }
-        if record.ranges.len() >= MAX_RANGES_PER_DOMAIN
+        let is_file = |r: &Range| r.kind == Kind::MsiFile;
+        let (held, bound) = if kind == Kind::MsiFile
+        {
+            (
+                record.ranges.iter().filter(|r| is_file(r)).count(),
+                MAX_MSI_FILES_PER_DOMAIN,
+            )
+        }
+        else
+        {
+            (
+                record.ranges.iter().filter(|r| !is_file(r)).count(),
+                MAX_RANGES_PER_DOMAIN,
+            )
+        };
+        if held >= bound
         {
             return Err(iommu_errors::OUT_OF_RESOURCES);
         }
@@ -492,11 +555,17 @@ impl<B: Backend, C: CapOps> Service<B, C>
             .ranges
             .try_reserve(1)
             .map_err(|_| iommu_errors::OUT_OF_RESOURCES)?;
-        let mapped = self
-            .backend
-            .map(&mut self.domains[index].domain, iova, phys, len, access);
-        mapped.map_err(|e| self.backend_failure(unit, e))?;
-        self.domains[index].ranges.push(Range { iova, len, cap });
+        let domain = &mut self.domains[index].domain;
+        let installed = if kind == Kind::MsiFile
+        {
+            self.backend.map_msi(domain, iova)
+        }
+        else
+        {
+            self.backend.map(domain, iova, frames.0, len, frames.1)
+        };
+        installed.map_err(|e| self.backend_failure(unit, e))?;
+        self.domains[index].ranges.push(Range { iova, len, kind });
         Ok(())
     }
 
@@ -516,7 +585,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
         {
             return iommu_errors::NO_MAPPING;
         };
-        if self.domains[index].ranges[at].cap.is_none()
+        if self.domains[index].ranges[at].cap().is_none()
         {
             return iommu_errors::INVALID_REQUEST;
         }
@@ -532,7 +601,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return self.backend_failure(unit, e);
         }
         let range = self.domains[index].ranges.swap_remove(at);
-        if let Some(cap) = range.cap
+        if let Some(cap) = range.cap()
         {
             self.caps.delete(cap);
         }
@@ -556,7 +625,7 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return self.backend_failure(unit, e);
         }
         let record = self.domains.swap_remove(index);
-        for cap in record.ranges.into_iter().filter_map(|r| r.cap)
+        for cap in record.ranges.iter().filter_map(Range::cap)
         {
             self.caps.delete(cap);
         }
@@ -669,6 +738,9 @@ mod tests
         enabled: Vec<usize>,
         fail_unit: Option<(usize, BackendError)>,
         fail_next: Option<BackendError>,
+        /// Refuse every `map_msi`, as a family whose MSIs its DMA
+        /// translation does not reach does.
+        refuse_msi: bool,
         attached: Vec<(usize, u16, u32)>,
         blocked: Vec<u32>,
         pending: Vec<Fault>,
@@ -678,6 +750,7 @@ mod tests
     {
         did: u32,
         ranges: Vec<(u64, u64, u64, Access)>,
+        files: Vec<u64>,
     }
 
     impl Fake
@@ -715,6 +788,7 @@ mod tests
             Ok(FakeDomain {
                 did,
                 ranges: Vec::new(),
+                files: Vec::new(),
             })
         }
 
@@ -732,6 +806,17 @@ mod tests
             Ok(())
         }
 
+        fn map_msi(&mut self, d: &mut FakeDomain, file: u64) -> Result<(), BackendError>
+        {
+            self.fail()?;
+            if self.refuse_msi
+            {
+                return Err(BackendError::Invalid);
+            }
+            d.files.push(file);
+            Ok(())
+        }
+
         fn unmap(&mut self, d: &mut FakeDomain, iova: u64, _len: u64) -> Result<(), BackendError>
         {
             self.fail()?;
@@ -744,6 +829,7 @@ mod tests
             self.fail()?;
             self.blocked.push(d.did);
             d.ranges.clear();
+            d.files.clear();
             Ok(())
         }
 
@@ -1223,6 +1309,132 @@ mod tests
         assert_eq!(s.handle(&block).label, iommu_errors::SUCCESS);
         // Only the mapped cap is deleted: the reserved range carried none.
         assert_eq!(deleted(&s), [3]);
+    }
+
+    fn map_msi(s: &mut Service<Fake, FakeCaps>, d: u64, file: u64) -> u64
+    {
+        s.handle(&req(iommu_labels::MAP_MSI, &[d, file], &[])).label
+    }
+
+    /// The supervisor-level IMSIC file of hart 3 on QEMU `virt`.
+    const FILE: u64 = 0x2800_3000;
+
+    #[test]
+    fn an_interrupt_file_is_installed_at_its_own_address_with_no_cap()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::SUCCESS);
+        assert_eq!(s.domains[0].domain.files, [FILE]);
+        assert!(s.domains[0].domain.ranges.is_empty());
+        let r = &s.domains[0].ranges[0];
+        assert_eq!((r.iova, r.len, r.kind), (FILE, PAGE_SIZE, Kind::MsiFile));
+        // A cap sent with it is not kept.
+        let with_cap = req(iommu_labels::MAP_MSI, &[d, FILE + PAGE_SIZE], &[6]);
+        assert_eq!(s.handle(&with_cap).label, iommu_errors::SUCCESS);
+        assert_eq!(deleted(&s), [6]);
+    }
+
+    #[test]
+    fn a_misused_interrupt_file_is_refused_before_the_backend()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        let width_end = 1u64 << 39;
+        for (domain, file) in [
+            (d + 1, FILE),          // no such domain
+            (d, FILE + 4),          // unaligned
+            (d, width_end),         // past the unit's width
+            (d, u64::MAX & !0xfff), // wraps
+        ]
+        {
+            assert_eq!(map_msi(&mut s, domain, file), iommu_errors::INVALID_REQUEST);
+        }
+        assert!(s.domains[0].domain.files.is_empty());
+        assert!(s.domains[0].ranges.is_empty());
+    }
+
+    #[test]
+    fn an_interrupt_file_and_a_range_may_not_overlap()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(
+            map(&mut s, d, FILE - PAGE_SIZE, RW, 3),
+            iommu_errors::SUCCESS
+        );
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::ADDRESS_IN_USE);
+        assert_eq!(map_msi(&mut s, d, FILE + PAGE_SIZE), iommu_errors::SUCCESS);
+        assert_eq!(
+            map_msi(&mut s, d, FILE + PAGE_SIZE),
+            iommu_errors::ADDRESS_IN_USE
+        );
+        assert_eq!(
+            map_reserved(&mut s, d, FILE + PAGE_SIZE, PAGE_SIZE),
+            iommu_errors::ADDRESS_IN_USE
+        );
+        assert_eq!(s.domains[0].domain.files, [FILE + PAGE_SIZE]);
+    }
+
+    #[test]
+    fn an_interrupt_file_is_not_unmapped_and_goes_with_the_domains_block()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::SUCCESS);
+        assert_eq!(map(&mut s, d, 0x10_0000, RW, 3), iommu_errors::SUCCESS);
+        let unmap = req(iommu_labels::UNMAP, &[d, FILE], &[]);
+        assert_eq!(s.handle(&unmap).label, iommu_errors::INVALID_REQUEST);
+        assert_eq!(s.domains[0].domain.files, [FILE]);
+        let block = req(iommu_labels::BLOCK, &[d], &[]);
+        assert_eq!(s.handle(&block).label, iommu_errors::SUCCESS);
+        assert_eq!(s.backend.blocked, [1]);
+        // Only the mapped cap is deleted: the file carried none.
+        assert_eq!(deleted(&s), [3]);
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::INVALID_REQUEST);
+    }
+
+    #[test]
+    fn a_family_that_does_not_take_interrupt_files_refuses_them_and_records_none()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        s.backend.refuse_msi = true;
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::INVALID_REQUEST);
+        assert!(s.domains[0].ranges.is_empty());
+        // The unit is not failed: the refusal is not a timeout.
+        assert_eq!(map(&mut s, d, FILE, RW, 3), iommu_errors::SUCCESS);
+    }
+
+    #[test]
+    fn a_unit_that_times_out_on_an_interrupt_file_refuses_every_later_request()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        s.backend.fail_next = Some(BackendError::Timeout);
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::HARDWARE_TIMEOUT);
+        assert!(s.domains[0].ranges.is_empty());
+        assert_eq!(map_msi(&mut s, d, FILE), iommu_errors::HARDWARE_TIMEOUT);
+    }
+
+    #[test]
+    fn interrupt_files_have_a_bound_of_their_own_beside_the_ranges()
+    {
+        let mut s = service();
+        let d = domain(&mut s);
+        for i in 0..MAX_MSI_FILES_PER_DOMAIN as u64
+        {
+            assert_eq!(map_msi(&mut s, d, FILE + i * PAGE_SIZE), 0);
+        }
+        let next = FILE + MAX_MSI_FILES_PER_DOMAIN as u64 * PAGE_SIZE;
+        assert_eq!(map_msi(&mut s, d, next), iommu_errors::OUT_OF_RESOURCES);
+        // The files take nothing from the ranges' bound.
+        for i in 0..MAX_RANGES_PER_DOMAIN as u64
+        {
+            assert_eq!(map(&mut s, d, 0x10_0000 + i * 0x2000, RW, 3), 0);
+        }
+        let next = 0x10_0000 + MAX_RANGES_PER_DOMAIN as u64 * 0x2000;
+        assert_eq!(map(&mut s, d, next, RW, 3), iommu_errors::OUT_OF_RESOURCES);
     }
 
     #[test]

@@ -382,6 +382,14 @@ impl Backend for Vtd
         mapped.map_err(table_error)
     }
 
+    /// Refused: a write to the interrupt address range (`0xFEEx_xxxx`) is
+    /// an interrupt request, which VT-d does not translate through a
+    /// domain's second-level tables (interrupt remapping governs it).
+    fn map_msi(&mut self, _domain: &mut VtdDomain, _file: u64) -> Result<(), BackendError>
+    {
+        Err(BackendError::Invalid)
+    }
+
     fn unmap(&mut self, domain: &mut VtdDomain, iova: u64, len: u64) -> Result<(), BackendError>
     {
         domain

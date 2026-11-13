@@ -140,11 +140,15 @@ fn write_stub(ctx: &TestContext, frame: u64) -> TestResult
         .map_err(|_| "integration::single_step: scratch mem_map failed")?;
     for (at, bytes) in STUB
     {
+        // SAFETY: `at` is below STUB_LEN, inside KT_STUB's page.
+        let run = unsafe { (KT_STUB as *mut u8).add(*at) };
         for (i, b) in bytes.iter().enumerate()
         {
-            // SAFETY: KT_STUB's page is mapped writable just above; at + i is
-            // below STUB_LEN, inside the page.
-            unsafe { (KT_STUB as *mut u8).add(*at).add(i).write_volatile(*b) };
+            // SAFETY: at + i is below STUB_LEN, inside KT_STUB's page.
+            let dst = unsafe { run.add(i) };
+            // SAFETY: KT_STUB's page is mapped writable just above, and `dst`
+            // is a byte of it.
+            unsafe { dst.write_volatile(*b) };
         }
     }
     // SAFETY: KT_STUB is a scratch VA; no reference into the page is live.

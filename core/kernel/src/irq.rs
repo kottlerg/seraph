@@ -838,9 +838,11 @@ fn route_of(id: u32) -> Option<&'static IrqRoute>
     }
     let base = TABLE_BASE.load(Ordering::Acquire);
     // SAFETY: `init_table` publishes the line count after the base (Release),
-    // and both before any line is routed; `id` is below the count, so the entry
-    // lies in the table, which lives for the kernel's lifetime.
-    Some(unsafe { &*base.add(id as usize) })
+    // and both before any line is routed; `id` is below the count, so the
+    // offset stays inside the table.
+    let entry = unsafe { base.add(id as usize) };
+    // SAFETY: `entry` lies in the table, which lives for the kernel's lifetime.
+    Some(unsafe { &*entry })
 }
 
 /// CPU `cpu`'s delivery gate, or `None` for a CPU past the boot CPUs (or before
@@ -853,10 +855,12 @@ fn gate(cpu: usize) -> Option<&'static DeliveryGate>
     {
         return None;
     }
-    // SAFETY: the slab holds a zero-initialised gate (an atomic, for which zero
-    // is a valid value) for each boot CPU, and `cpu` is below their count; the
-    // slab is never freed.
-    Some(unsafe { &*base.add(cpu) })
+    // SAFETY: the slab holds a gate for each boot CPU, and `cpu` is below their
+    // count, so the offset stays inside it.
+    let slot = unsafe { base.add(cpu) };
+    // SAFETY: `slot` holds a zero-initialised gate (an atomic, for which zero
+    // is a valid value); the slab is never freed.
+    Some(unsafe { &*slot })
 }
 
 // ── Initialisation ───────────────────────────────────────────────────────────

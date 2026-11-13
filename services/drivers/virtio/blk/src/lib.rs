@@ -15,6 +15,7 @@
 //! live where a host test can pin them.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use ipc::blk_errors;
 

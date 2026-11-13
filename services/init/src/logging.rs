@@ -129,6 +129,9 @@ pub fn set_ipc_logging(cap: u64, ipc_buf: *mut u64)
     // SAFETY: single main thread; log thread only reads its own argument.
     unsafe {
         INIT_LOG_SEND = cap;
+    }
+    // SAFETY: single main thread; log thread only reads its own argument.
+    unsafe {
         MAIN_IPC_BUF = ipc_buf;
     }
 }

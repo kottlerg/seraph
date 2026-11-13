@@ -497,16 +497,16 @@ pub unsafe fn write_satp_no_fence(root_phys: u64)
     // PCID 0's cached entries across this transition is correct and avoids a
     // flush. Without PCID a CR3 write always flushes, so this degrades to the
     // flushing form (functionally equivalent to `activate`).
-    // SAFETY: root_phys is a valid kernel root per caller contract.
-    unsafe {
-        if crate::mm::tag_allocator::tagging_enabled()
-        {
-            activate_tagged(root_phys, 0);
-        }
-        else
-        {
-            activate(root_phys);
-        }
+    if crate::mm::tag_allocator::tagging_enabled()
+    {
+        // SAFETY: root_phys is a valid kernel root per caller contract; PCID 0
+        // is the kernel's.
+        unsafe { activate_tagged(root_phys, 0) };
+    }
+    else
+    {
+        // SAFETY: root_phys is a valid kernel root per caller contract.
+        unsafe { activate(root_phys) };
     }
 }
 
@@ -615,10 +615,10 @@ pub unsafe fn enable_nx()
     /// No-Execute Enable bit.
     const NXE: u64 = 1 << 11;
 
-    // SAFETY: rdmsr/wrmsr execute at ring 0; IA32_EFER read/write is architecture-defined MSR operation.
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: rdmsr executes at ring 0; reading IA32_EFER is an architecture-defined MSR operation.
     unsafe {
-        let lo: u32;
-        let hi: u32;
         core::arch::asm!(
             "rdmsr",
             in("ecx") IA32_EFER,
@@ -626,7 +626,11 @@ pub unsafe fn enable_nx()
             out("edx") hi,
             options(nostack, nomem),
         );
-        let efer = (u64::from(hi) << 32) | u64::from(lo) | NXE;
+    }
+    let efer = (u64::from(hi) << 32) | u64::from(lo) | NXE;
+    // SAFETY: wrmsr executes at ring 0; setting NXE in IA32_EFER, read above, is an
+    // architecture-defined MSR operation.
+    unsafe {
         core::arch::asm!(
             "wrmsr",
             in("ecx") IA32_EFER,
@@ -1657,9 +1661,10 @@ unsafe fn walk_to_4k_leaf(
 unsafe fn read_entry(table_va: u64, index: usize) -> PageTableEntry
 {
     debug_assert!(index < 512);
-    // SAFETY: per the caller contract the entry lies inside a readable,
-    // aligned table.
-    unsafe { (table_va as *const PageTableEntry).add(index).read() }
+    // SAFETY: index is below 512, so the entry lies inside the table (caller contract).
+    let entry = unsafe { (table_va as *const PageTableEntry).add(index) };
+    // SAFETY: per the caller contract the table is readable and aligned.
+    unsafe { entry.read() }
 }
 
 // ── Shootdown-elision classification ──────────────────────────────────────────

@@ -194,6 +194,11 @@ impl FramebufferWriter
                 let lit = bits.rotate_left(col_idx) & 0x8000 != 0;
                 let [b0, b1, b2, b3] = self.pixel_bytes(if lit { self.fg } else { self.bg });
 
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every write is to one of the four bytes of the pixel at `p`, \
+                              which lie inside the framebuffer mapping"
+                )]
                 // SAFETY: the cell's scanline lies below row *
                 // GLYPH_HEIGHT + GLYPH_HEIGHT <= max_rows * GLYPH_HEIGHT <=
                 // height, and its pixel `col_idx` ends at most (col + 1) *
@@ -249,6 +254,11 @@ impl FramebufferWriter
         let mut p = self.base;
         for _ in 0..pixels
         {
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every write is to one of the four bytes of the pixel at `p`, which lie \
+                          inside the framebuffer mapping"
+            )]
             // SAFETY: p is within the framebuffer mapping; pixels * 4 <= stride * height.
             unsafe {
                 core::ptr::write_volatile(p, b0);
@@ -276,11 +286,15 @@ impl FramebufferWriter
         let last_row_start = self.last_row_start;
 
         // Copy rows 1..max_rows → 0..max_rows-1.
-        // SAFETY: max_rows * row_bytes <= height * stride (max_rows =
-        // height / GLYPH_HEIGHT), so src, dst, and the last_row_start-byte
-        // memmove all lie inside the framebuffer mapping.
+        // SAFETY: max_rows >= 1 and max_rows * row_bytes <= height * stride
+        // (max_rows = height / GLYPH_HEIGHT), so row 1 starts inside the
+        // framebuffer mapping or one past its end.
+        let second_row = unsafe { self.base.add(row_bytes) };
+        // SAFETY: row_bytes + last_row_start = max_rows * row_bytes <= height
+        // * stride, so src, dst, and the last_row_start-byte memmove all lie
+        // inside the writable framebuffer mapping; `copy` allows the overlap.
         unsafe {
-            core::ptr::copy(self.base.add(row_bytes), self.base, last_row_start);
+            core::ptr::copy(second_row, self.base, last_row_start);
         }
 
         // Fill the freed last row with the background colour.
@@ -293,9 +307,12 @@ impl FramebufferWriter
             // stays a tight per-byte loop.
             for i in 0..row_bytes
             {
-                // SAFETY: last_row_start + i is within the framebuffer.
+                // SAFETY: i < row_bytes, and the last row's row_bytes bytes end
+                // inside the framebuffer mapping.
+                let byte = unsafe { last_row.add(i) };
+                // SAFETY: `byte` lies inside the writable framebuffer mapping.
                 unsafe {
-                    core::ptr::write_volatile(last_row.add(i), 0);
+                    core::ptr::write_volatile(byte, 0);
                 }
             }
         }
@@ -306,6 +323,11 @@ impl FramebufferWriter
             // `row_bytes = GLYPH_HEIGHT * stride` is a multiple of 4 (4 bytes/pixel).
             for _ in 0..(row_bytes / 4)
             {
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every write is to one of the four bytes of the pixel at `p`, \
+                              which lie inside the framebuffer mapping"
+                )]
                 // SAFETY: p stays within the last row (row_bytes wide).
                 unsafe {
                     core::ptr::write_volatile(p, b0);
@@ -380,10 +402,9 @@ mod tests
         // A blank glyph in cell (0, 0), then the glyph in cell (1, 0) with its
         // leftmost (bit 15) and rightmost (bit 7) pixels lit on every scanline.
         // SAFETY: the writer's buffer is alive and exactly stride * height.
-        unsafe {
-            w.draw_glyph_bitmap(&[0u16; GLYPH_HEIGHT as usize]);
-            w.draw_glyph_bitmap(&[0x8080u16; GLYPH_HEIGHT as usize]);
-        }
+        unsafe { w.draw_glyph_bitmap(&[0u16; GLYPH_HEIGHT as usize]) };
+        // SAFETY: the writer's buffer is alive and exactly stride * height.
+        unsafe { w.draw_glyph_bitmap(&[0x8080u16; GLYPH_HEIGHT as usize]) };
         let stride = stride as usize;
         let lit = |y: usize, x: usize| {
             let at = y * stride + x * 4;

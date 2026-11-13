@@ -34,6 +34,10 @@ pub fn serial_init(info: &InitInfo, thread_cap: u64)
     {
         return;
     }
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a COM1 register, which ioport_bind above bound to this thread"
+    )]
     // SAFETY: single-threaded init; COM1 hardware programming sequence.
     // Ports are bound to this thread via ioport_bind above.
     unsafe {

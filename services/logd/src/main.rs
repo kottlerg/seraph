@@ -25,6 +25,7 @@
     reason = "targets 64-bit only; u64/usize conversions lossless"
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 mod handover;
 mod slot;

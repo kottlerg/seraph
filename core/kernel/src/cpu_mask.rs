@@ -115,8 +115,12 @@ impl AtomicCpuMask
     {
         for i in 0..len
         {
-            // SAFETY: caller contract: `len` reserved words at `words`.
-            unsafe { words.add(i).write(AtomicU64::new(0)) };
+            // SAFETY: caller contract: `len` reserved words at `words`, and
+            // i < len, so the offset stays inside them.
+            let word = unsafe { words.add(i) };
+            // SAFETY: `word` is one of the reserved words, valid and aligned by
+            // the caller contract.
+            unsafe { word.write(AtomicU64::new(0)) };
         }
         Self { words, len }
     }

@@ -13,8 +13,6 @@
 
 // cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
 #![allow(clippy::cast_possible_truncation)]
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
-#![warn(clippy::multiple_unsafe_ops_per_block)]
 // Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
 // test configuration is exempt from the second set, as from `unwrap_used`.
 #![warn(

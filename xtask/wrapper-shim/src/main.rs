@@ -39,6 +39,7 @@
 //!   toolchain mirror's root.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::env;
 use std::ffi::OsString;

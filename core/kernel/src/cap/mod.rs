@@ -26,8 +26,6 @@
 //! to the init process. Boot module ELF images get their own full-rights, reclaimable
 //! Memory caps in [`mint_module_memory_caps`] (see `docs/capability-model.md` § Memory).
 
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
-#![warn(clippy::multiple_unsafe_ops_per_block)]
 // Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
 // test configuration is exempt from the second set, as from `unwrap_used`.
 #![warn(

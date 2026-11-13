@@ -110,9 +110,12 @@ pub unsafe fn apic_id_for(cpu: usize) -> u32
         !base.is_null(),
         "apic_id_for: CPU_APIC_IDS slab not allocated"
     );
-    // SAFETY: cpu < CPU_COUNT by caller contract; the slab holds CPU_COUNT
-    // u32 slots, read-only after init_apic_ids.
-    unsafe { *base.add(cpu) }
+    // SAFETY: cpu < CPU_COUNT by caller contract and the slab holds CPU_COUNT
+    // u32 slots, so the offset stays inside it.
+    let slot = unsafe { base.add(cpu) };
+    // SAFETY: `slot` is a slot of the slab, filled by init_apic_ids and
+    // read-only after it.
+    unsafe { *slot }
 }
 
 // ── Field offsets (must match #[repr(C)] layout) ──────────────────────────────
@@ -296,14 +299,17 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
     );
 
     let pc_ptr = crate::sched::alloc_per_cpu_slab::<PerCpuData>(PER_CPU_SLAB, cpu_count, allocator);
-    // SAFETY: the slab covers cpu_count PerCpuData entries; initialise each in
-    // place. PerCpuData::new() is all-zero (matching the slab's zero-fill); the
-    // explicit write documents the contract and mirrors the scheduler slab.
-    unsafe {
-        for cpu in 0..cpu_count
-        {
-            core::ptr::write(pc_ptr.add(cpu), PerCpuData::new());
-        }
+    // Initialise each entry in place. PerCpuData::new() is all-zero (matching
+    // the slab's zero-fill); the explicit write documents the contract and
+    // mirrors the scheduler slab.
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: cpu < cpu_count and the slab covers cpu_count PerCpuData
+        // entries, so the offset stays inside it.
+        let slot = unsafe { pc_ptr.add(cpu) };
+        // SAFETY: `slot` is an entry of the slab, which nothing else reaches
+        // before PER_CPU_PTR publishes it below.
+        unsafe { core::ptr::write(slot, PerCpuData::new()) };
     }
     PER_CPU_PTR.store(pc_ptr, Ordering::Release);
 
@@ -344,12 +350,12 @@ pub unsafe fn init_bsp()
 {
     let ptr = per_cpu_ptr(0);
     // SAFETY: single-threaded boot phase; no concurrent access to `per_cpu_ptr(0)`'s entry.
-    unsafe {
-        (*ptr).cpu_id = 0;
-        // Store BSP TSS pointer so set_rsp0() can find the TSS via GS-relative
-        // access on x86-64 (on RISC-V tss_ptr remains 0 — not used by the arch).
-        (*ptr).tss_ptr = crate::arch::current::gdt::bsp_tss_ptr();
-    }
+    unsafe { (*ptr).cpu_id = 0 };
+    // Store BSP TSS pointer so set_rsp0() can find the TSS via GS-relative
+    // access on x86-64 (on RISC-V tss_ptr remains 0 — not used by the arch).
+    // SAFETY: as for `cpu_id`: single-threaded boot, no concurrent access to
+    // the entry.
+    unsafe { (*ptr).tss_ptr = crate::arch::current::gdt::bsp_tss_ptr() };
     // SAFETY: ptr is valid; arch init sets GS-base / tp to this address.
     unsafe {
         crate::arch::current::cpu::install_percpu(ptr as u64);
@@ -441,6 +447,10 @@ pub unsafe fn set_guard_epoch_flushed(epoch: u64)
 pub fn preempt_disable()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to this CPU's own preempt_count, which only this CPU touches"
+    )]
     // SAFETY: preempt_count is exclusively owned by this CPU after init; no
     // concurrent access from other CPUs.
     unsafe {
@@ -457,6 +467,10 @@ pub fn preempt_disable()
 pub fn preempt_enable()
 {
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to this CPU's own preempt_count, which only this CPU touches"
+    )]
     // SAFETY: same as preempt_disable — per-CPU exclusive access.
     unsafe {
         let ptr = core::ptr::addr_of_mut!((*per_cpu_ptr(cpu)).preempt_count);
@@ -498,7 +512,7 @@ pub unsafe fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock
     // SAFETY: cpu < CPU_COUNT by caller contract; AtomicPtr permits concurrent
     // access through a shared reference, and the PER_CPU slab is alive for the
     // program lifetime.
-    unsafe { &*core::ptr::addr_of!((*per_cpu_ptr(cpu)).fpu_owner) }
+    unsafe { &(*per_cpu_ptr(cpu)).fpu_owner }
 }
 
 // ── Tagged-TLB context-switch flush counters ─────────────────────────────────

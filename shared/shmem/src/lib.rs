@@ -31,6 +31,7 @@
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -295,13 +296,14 @@ impl SpscHeader
     pub unsafe fn init(ptr: *mut Self, capacity: u32)
     {
         assert!(capacity.is_power_of_two(), "SPSC capacity must be pow2");
-        // SAFETY: pointer validity promised by the caller.
-        unsafe {
-            (*ptr).head.store(0, Ordering::Relaxed);
-            (*ptr).tail.store(0, Ordering::Relaxed);
-            (*ptr).capacity.store(capacity, Ordering::Relaxed);
-            (*ptr).closed.store(0, Ordering::Relaxed);
-        }
+        // SAFETY: the caller promises `ptr` is valid, writable and aligned,
+        // and the header's fields are atomics, so a shared reference admits
+        // the stores below.
+        let header = unsafe { &*ptr };
+        header.head.store(0, Ordering::Relaxed);
+        header.tail.store(0, Ordering::Relaxed);
+        header.capacity.store(capacity, Ordering::Relaxed);
+        header.closed.store(0, Ordering::Relaxed);
     }
 
     /// Mark the ring closed. Called by whichever peer drops first.
@@ -372,13 +374,13 @@ pub unsafe fn spsc_pair<'a>(
     capacity: u32,
 ) -> Option<(SpscWriter<'a>, SpscReader<'a>)>
 {
-    // SAFETY: caller contract.
-    unsafe {
-        Some((
-            SpscWriter::from_raw(region_vaddr, capacity)?,
-            SpscReader::from_raw(region_vaddr, capacity)?,
-        ))
-    }
+    // SAFETY: this function's contract is `SpscWriter::from_raw`'s, and it
+    // creates the region's only writer.
+    let writer = unsafe { SpscWriter::from_raw(region_vaddr, capacity) }?;
+    // SAFETY: this function's contract is `SpscReader::from_raw`'s, and it
+    // creates the region's only reader.
+    let reader = unsafe { SpscReader::from_raw(region_vaddr, capacity) }?;
+    Some((writer, reader))
 }
 
 /// Check `capacity` against the ring header at `region_vaddr` and return
@@ -455,9 +457,13 @@ impl SpscWriter<'_>
         for (offset, &byte) in (0..n).zip(data)
         {
             let slot = tail.wrapping_add(offset) & self.mask;
-            // SAFETY: slot < capacity; buf..buf+capacity is the ring body.
+            // SAFETY: `slot <= mask < capacity`, and buf..buf+capacity is the
+            // ring body, so the offset stays inside it.
+            let dst = unsafe { self.buf.add(slot as usize) };
+            // SAFETY: `from_raw`'s contract keeps the ring body mapped and
+            // writable for `'a`, and `dst` lies inside it.
             unsafe {
-                *self.buf.add(slot as usize) = byte;
+                *dst = byte;
             }
         }
         self.header
@@ -527,9 +533,13 @@ impl SpscReader<'_>
         for (offset, out) in (0..n).zip(dst.iter_mut())
         {
             let slot = head.wrapping_add(offset) & self.mask;
-            // SAFETY: slot < capacity; buf..buf+capacity is the ring body.
+            // SAFETY: `slot <= mask < capacity`, and buf..buf+capacity is the
+            // ring body, so the offset stays inside it.
+            let src = unsafe { self.buf.add(slot as usize) };
+            // SAFETY: `from_raw`'s contract keeps the ring body mapped and
+            // readable for `'a`, and `src` lies inside it.
             unsafe {
-                *out = *self.buf.add(slot as usize);
+                *out = *src;
             }
         }
         self.header
@@ -600,10 +610,10 @@ mod tests
         let mut r = region(CAP * 4);
         let va = &raw mut r as u64;
         // SAFETY: `r` is a live, aligned header plus `CAP` body bytes.
-        unsafe {
-            assert!(SpscWriter::from_raw(va, CAP).is_none());
-            assert!(SpscReader::from_raw(va, CAP).is_none());
-        }
+        assert!(unsafe { SpscWriter::from_raw(va, CAP) }.is_none());
+        // SAFETY: as above; the writer was refused, so no half of the region
+        // exists.
+        assert!(unsafe { SpscReader::from_raw(va, CAP) }.is_none());
     }
 
     #[test]

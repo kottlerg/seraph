@@ -16,6 +16,7 @@
 
 #![cfg_attr(not(test), no_std)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 // The receivers' shared line and name widths: real-logd keeps the same per
 // sender, so a name or line survives the handover unclipped.

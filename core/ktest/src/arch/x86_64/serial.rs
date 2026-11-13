@@ -44,6 +44,11 @@ pub unsafe fn init(_info: &InitInfo, _aspace_cap: u64, thread_cap: u64) -> bool
 /// I/O port access to COM1 must be permitted (via `ioport_bind`).
 unsafe fn serial_hw_init()
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a COM1 register, which the caller's contract binds to this \
+                  thread"
+    )]
     // SAFETY: COM1 port range bound to this thread.
     unsafe {
         outb(COM1 + 1, 0x00); // disable all interrupts
@@ -87,6 +92,10 @@ const IER_THRI: u8 = 0x02;
 /// [`init`] has returned `true`.
 pub fn raise_tx_interrupt()
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to COM1's IER, which `init` bound to this thread"
+    )]
     // SAFETY: serial_hw_init completed; I/O port access permitted.
     unsafe {
         outb(COM1 + 1, 0x00);

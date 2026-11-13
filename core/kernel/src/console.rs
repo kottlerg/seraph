@@ -239,18 +239,17 @@ impl core::fmt::Write for SerialWriter
 {
     fn write_str(&mut self, s: &str) -> core::fmt::Result
     {
-        // SAFETY: a `SerialWriter` is constructed only after `console::init`
-        // (see the type's rustdoc); writing a byte to an initialised port has no
-        // other precondition.
-        unsafe {
-            for byte in s.bytes()
+        for byte in s.bytes()
+        {
+            if byte == b'\n'
             {
-                if byte == b'\n'
-                {
-                    serial_write_byte(b'\r');
-                }
-                serial_write_byte(byte);
+                // SAFETY: a `SerialWriter` is constructed only after
+                // `console::init` (see the type's rustdoc); writing a byte to an
+                // initialised port has no other precondition.
+                unsafe { serial_write_byte(b'\r') };
             }
+            // SAFETY: as for the `\r` above: the port is initialised.
+            unsafe { serial_write_byte(byte) };
         }
         Ok(())
     }

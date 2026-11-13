@@ -20,7 +20,7 @@ General-purpose userspace applications, utilities, and the test fixtures the har
 | [`stdiotest/`](stdiotest/README.md) | Stdin↔stdout proof |
 | [`terminal/`](terminal/README.md) | Terminal: relays a byte stream between hardware drivers and a child's stdio |
 | [`threadchurn/`](threadchurn/README.md) | CSpace-slot and memmgr-pool reclaim fixture for the usertest `threadchurn` tester |
-| [`threadstack/`](threadstack/README.md) | Guarded demand-stack fixture for the usertest `threadstack` tester |
+| [`threadstack/`](threadstack/README.md) | Guarded thread-stack fixture, demand-paged and pinned, for the usertest `threadstack` tester |
 
 ---
 

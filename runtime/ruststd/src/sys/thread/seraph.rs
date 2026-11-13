@@ -4,10 +4,11 @@
 // runtime/ruststd/src/sys/thread/seraph.rs
 
 //! Thread spawning backed by the Seraph kernel's Thread/Notification primitives.
-//! A demand-paged process gives each thread a guarded demand-paged stack
-//! (`GUARD_PAGES` below at least `os::seraph::DEFAULT_DEMAND_STACK_PAGES`; see
-//! `alloc_stack`); a non-demand-paged process, or a failed reservation, falls
-//! back to an eager page-aligned heap stack without a guard. Per-thread IPC
+//! Every spawned thread's stack has `GUARD_PAGES` unmapped pages below it (see
+//! `alloc_stack`): a demand-paged process gives each thread a guarded
+//! demand-paged stack of at least `os::seraph::DEFAULT_DEMAND_STACK_PAGES`, and
+//! a process with no pager a guarded stack mapped at spawn (`EagerStack`). A
+//! stack that cannot be had fails the spawn. Per-thread IPC
 //! buffers are page-aligned heap allocations. Join synchronises on a
 //! Notification cap; the child thread signals just before calling
 //! SYS_THREAD_EXIT, and join then reclaims the child's kernel object, caps, and
@@ -55,21 +56,31 @@ pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
-/// Guard pages below a demand-paged thread stack: `process_abi`'s
+/// Guard pages below every spawned thread's stack: `process_abi`'s
 /// `STACK_GUARD_PAGES`, the farthest a store can land below the stack's
 /// lowest written byte, so no overflow's first store passes the guard. The
-/// guard is reserved but unregistered: a stack overflow faults in this hole,
-/// the pager declines the unregistered address, and the thread — and the
-/// whole process, via the address-space death-observer — is killed instead of
-/// silently corrupting adjacent memory.
+/// guard is reserved but neither registered with a pager nor mapped: a stack
+/// overflow faults in this hole, which the pager declines or, in a process
+/// with no pager, no handler takes, and the thread — and the whole process,
+/// via the address-space death-observer — is killed instead of silently
+/// corrupting adjacent memory.
 const GUARD_PAGES: u64 = process_abi::STACK_GUARD_PAGES as u64;
+
+/// Attempts [`EagerStack::map`] makes to map an eager stack, each after
+/// topping up the address space's page-table pool, while the kernel reports
+/// the pool exhausted. Another thread's mapping can draw a top-up before the
+/// map that needed it, so one attempt is not enough under concurrent spawns.
+/// Four top-ups is the bound memmgr sets on the same loop for a demand chunk
+/// (services/memmgr/docs/memory-pool.md § Client page-table funding).
+const EAGER_MAP_ROUNDS: u32 = 4;
 
 /// General-allocation headroom of the process's `CSpace` a spawn keeps: a
 /// spawn first tops the `CSpace` up when its headroom is below this plus a
 /// page's slots (`CSPACE_SLOTS_PER_PAGE`, which
 /// `syscall_abi::cspace_topup_pages` holds for the body arena), or its growth
-/// budget below a page. One spawn takes a few slots for good (the Thread cap
-/// and its done notification) and a few more while it runs (the Thread slab,
+/// budget below a page. One spawn takes a few slots for good (the Thread cap,
+/// its done notification, and, in a process with no pager, its stack's
+/// grant) and a few more while it runs (the Thread slab,
 /// a pool-page refill, a further death queue and its grant, a heap grow's at
 /// most `MSG_CAP_SLOTS_MAX` caps), about ten in all, so the mark leaves room
 /// for a whole spawn with margin.
@@ -113,7 +124,8 @@ struct SpawnArgs {
 /// The reclaimable resources a spawned thread owns. Moved as a unit between the
 /// `Thread` handle (joinable), the reaper registry (detached), and the reclaim
 /// path. Has no `Drop` glue — every field is a cap slot, a raw heap pointer, a
-/// `Copy` `Layout`, a `StackAlloc` (whose variants own no `Drop` resources), or
+/// `Copy` `Layout`, a `StackAlloc` (whose variants own no `Drop` glue: a
+/// reservation, cap slots, and plain integers), or
 /// a plain `u64` — so it is freed only via the explicit
 /// [`ThreadResources::reclaim`].
 struct ThreadResources {
@@ -190,14 +202,15 @@ unsafe impl Send for Thread {}
 // SAFETY: &Thread exposes no interior mutability; `join` consumes by value.
 unsafe impl Sync for Thread {}
 
-/// How a spawned thread's stack is backed.
+/// A spawned thread's stack. Either kind has `GUARD_PAGES` pages directly below
+/// its lowest usable byte that nothing maps, so an overflow faults there and
+/// the fault kills the process.
 enum StackAlloc {
-    /// Eager heap allocation: a non-demand-paged process, or a demand-paged one
-    /// whose reservation failed. No guard.
-    Heap { base: *mut u8, layout: Layout },
-    /// Guarded demand-paged stack: a large reserved VA window, lazily grown,
-    /// with unregistered guard pages below that fault fatally on overflow.
+    /// A demand-paged process's stack: a reserved VA window whose usable pages
+    /// the pager backs on first touch, above guard pages it declines.
     Demand(crate::os::seraph::GuardedStack),
+    /// The stack of a process with no pager, mapped at spawn ([`EagerStack`]).
+    Eager(EagerStack),
 }
 
 impl StackAlloc {
@@ -205,55 +218,161 @@ impl StackAlloc {
     /// SysV ABI (the stack grows down).
     fn sp(&self) -> u64 {
         match self {
-            StackAlloc::Heap { base, layout } => {
-                let top = (*base as usize).saturating_add(layout.size());
-                (top & !15) as u64
-            }
             StackAlloc::Demand(g) => g.usable_top() & !15,
+            StackAlloc::Eager(e) => e.usable_top() & !15,
         }
     }
 }
 
-/// Allocate a spawned thread's stack. A demand-paged process gets a guarded
-/// demand stack; on any failure — or for a non-demand-paged process, whose
-/// guard-page fault would have no pager to make it fatal — it falls back to the
-/// eager-heap path, preserving liveness.
+/// A guarded stack mapped in full at spawn, for a process with no pager: one
+/// page reservation of `GUARD_PAGES` guard pages below `usable_pages` usable
+/// ones, the usable pages mapped read-write from one contiguous memmgr grant and
+/// the guard left unmapped. A process with no pager has no virtual-memory
+/// handler, so a fault on the guard takes the outcome of a fault with none
+/// bound and kills the thread, and with it the process
+/// (docs/fault-handling.md § Reply, § Crash Reports), as the pager's refusal
+/// of a demand stack's guard does.
+struct EagerStack {
+    /// The whole reservation, guard pages lowest.
+    range: crate::sys::reserve::ReservedRange,
+    /// The grant mapped over the usable pages, held until they are unmapped.
+    cap: u64,
+    /// memmgr's id of the grant, which returns its run to the pool.
+    region_id: u64,
+    usable_pages: u64,
+    /// The process's own address space, which maps the usable pages.
+    aspace: u64,
+}
+
+impl EagerStack {
+    /// Reserve and map an eager stack of `usable_pages` above `GUARD_PAGES`
+    /// guard pages in the calling process, through memmgr (`memmgr_ep`).
+    ///
+    /// # Errors
+    /// Returns an error when the reservation or the grant fails, or the map
+    /// fails for a reason other than an exhausted page-table pool or after
+    /// [`EAGER_MAP_ROUNDS`] attempts; everything the call took is released
+    /// first.
+    fn map(memmgr_ep: u64, aspace: u64, usable_pages: u64) -> io::Result<EagerStack> {
+        use crate::sys::alloc::seraph::{fund_aspace_pt_budget, slab_request_pages};
+        use crate::sys::reserve::{reserve_pages, unreserve_pages};
+
+        if memmgr_ep == 0 {
+            return Err(io::Error::other("seraph: no memmgr to back a thread stack"));
+        }
+        let total = GUARD_PAGES
+            .checked_add(usable_pages)
+            .ok_or_else(|| io::Error::other("seraph: invalid stack geometry"))?;
+        let range = reserve_pages(total)
+            .map_err(|_| io::Error::other("seraph: stack VA reservation failed"))?;
+        let Some((cap, _, region_id)) = slab_request_pages(memmgr_ep, usable_pages) else {
+            unreserve_pages(range);
+            return Err(io::Error::other("seraph: stack frame grant failed"));
+        };
+        let stack = EagerStack { range, cap, region_id, usable_pages, aspace };
+        // The address space's page-table pool is shared by every mapping of
+        // the process, so a top-up cannot be reserved for this span: another
+        // thread's mapping can draw it before this map runs. The map, not the
+        // top-up's own budget check, says whether the span is covered, so the
+        // top-up is repeated while the kernel reports the pool exhausted.
+        let mut rounds = 0;
+        let mapped = loop {
+            let _ = fund_aspace_pt_budget(aspace, usable_pages);
+            // SAFETY: the usable pages lie in `range`, a fresh reservation
+            // this call owns, so no Rust object or IPC buffer page lies in
+            // them.
+            let result = unsafe {
+                syscall::mem_map(
+                    cap,
+                    aspace,
+                    stack.usable_base(),
+                    0,
+                    usable_pages,
+                    syscall_abi::MAP_WRITABLE,
+                )
+            };
+            rounds += 1;
+            match result {
+                Err(e) if e == SyscallError::OutOfMemory as i64 && rounds < EAGER_MAP_ROUNDS => {}
+                other => break other.is_ok(),
+            }
+        };
+        if !mapped {
+            // A map refused part-way leaves the pages before the failing one
+            // mapped, so the release unmaps the span before it frees anything.
+            stack.release();
+            return Err(io::Error::other("seraph: thread stack mem_map failed"));
+        }
+        Ok(stack)
+    }
+
+    /// Lowest usable byte: the first page above the guard.
+    fn usable_base(&self) -> u64 {
+        self.range.va_start() + GUARD_PAGES * PAGE_SIZE
+    }
+
+    /// Top of the usable region, the top of the reservation.
+    fn usable_top(&self) -> u64 {
+        self.usable_base() + self.usable_pages * PAGE_SIZE
+    }
+
+    /// Unmap the usable pages, then release the reservation, delete the grant's
+    /// cap, and return its run to memmgr. When the unmap fails, some pages may
+    /// still be mapped, so the reservation, the cap and the run stay the
+    /// process's for its lifetime rather than pass to a later reservation or
+    /// back to memmgr's pool while mapped here. Call only once no thread runs
+    /// on the stack.
+    fn release(self) {
+        // SAFETY: the span is this stack's usable pages, which no thread runs
+        // on (the caller's contract), so no live Rust object or IPC buffer
+        // page lies in them.
+        let unmapped =
+            unsafe { syscall::mem_unmap(self.aspace, self.usable_base(), self.usable_pages) };
+        if unmapped.is_err() {
+            return;
+        }
+        crate::sys::reserve::unreserve_pages(self.range);
+        let _ = syscall::cap_delete(self.cap);
+        crate::sys::alloc::seraph::slab_release_fresh(self.region_id);
+    }
+}
+
+/// Allocate a spawned thread's stack, guarded either way. A demand-paged
+/// process gets a guarded demand stack of the requested size (at least
+/// `DEFAULT_MIN_STACK_SIZE`, in whole pages) or `DEFAULT_DEMAND_STACK_PAGES`,
+/// whichever is larger; a process with no pager gets an [`EagerStack`] of the
+/// requested size alone, since each of its pages costs a frame at spawn.
+///
+/// # Errors
+/// Returns the reservation's error: a demand-paged process whose demand stack
+/// cannot be reserved does not take an eager stack instead, which would run
+/// the thread on a smaller stack than the one its process's other threads get.
 fn alloc_stack(
     info: &crate::os::seraph::StartupInfo,
     requested_bytes: usize,
 ) -> io::Result<StackAlloc> {
+    let floor = crate::cmp::max(requested_bytes, DEFAULT_MIN_STACK_SIZE);
+    let requested_pages = floor.div_ceil(PAGE_SIZE_USIZE) as u64;
     if info.pager_endpoint_cap != 0 {
-        let floor = crate::cmp::max(requested_bytes, DEFAULT_MIN_STACK_SIZE);
-        let requested_pages = floor.div_ceil(PAGE_SIZE_USIZE) as u64;
         let usable_pages =
             crate::cmp::max(requested_pages, crate::os::seraph::DEFAULT_DEMAND_STACK_PAGES);
-        if let Ok(g) = crate::os::seraph::reserve_guarded_stack(usable_pages, GUARD_PAGES) {
-            return Ok(StackAlloc::Demand(g));
-        }
+        crate::os::seraph::reserve_guarded_stack(usable_pages, GUARD_PAGES).map(StackAlloc::Demand)
+    } else {
+        EagerStack::map(info.memmgr_endpoint, info.self_aspace, requested_pages)
+            .map(StackAlloc::Eager)
     }
-    let stack_size = crate::cmp::max(requested_bytes, DEFAULT_MIN_STACK_SIZE);
-    let stack_size = (stack_size + PAGE_SIZE_USIZE - 1) & !(PAGE_SIZE_USIZE - 1);
-    let layout = Layout::from_size_align(stack_size, PAGE_SIZE_USIZE)
-        .map_err(|_| io::Error::other("seraph: stack layout too large"))?;
-    // SAFETY: `layout` has a non-zero size and power-of-two alignment.
-    let base = unsafe { alloc(layout) };
-    if base.is_null() {
-        return Err(io::Error::other("seraph: stack allocation failed"));
-    }
-    Ok(StackAlloc::Heap { base, layout })
 }
 
-/// Release a stack allocation: a heap stack is `dealloc`'d; a demand stack is
-/// unregistered (memmgr unmaps and reclaims its backing frames) and its VA
-/// released once memmgr has answered (`unregister_guarded_stack`). Call only
-/// when the thread no longer uses the stack — on the error unwind in
-/// [`Thread::new`] (before start) or in [`Thread::join`] (after the thread has
-/// left user-mode).
+/// Release a stack: a demand stack is unregistered (memmgr unmaps and reclaims
+/// its backing frames) and its VA released once memmgr has answered
+/// (`unregister_guarded_stack`); an eager stack is unmapped and its VA and
+/// grant released ([`EagerStack::release`]). Call only when the thread no
+/// longer uses the stack — on the error unwind in [`Thread::new`] (before
+/// start) or in [`Thread::join`] (after the thread has left user-mode).
 fn free_stack(stack: StackAlloc) {
     match stack {
-        // SAFETY: `base` came from `alloc(layout)` in `alloc_stack`.
-        StackAlloc::Heap { base, layout } => unsafe { dealloc(base, layout) },
         StackAlloc::Demand(g) => crate::os::seraph::unregister_guarded_stack(g),
+        StackAlloc::Eager(e) => e.release(),
     }
 }
 
@@ -422,7 +541,7 @@ impl Thread {
         let _ = syscall::cap_delete(thread_slab);
 
         // SP at the top of the usable stack region, 16-byte aligned for SysV
-        // ABI; the stack grows down toward the guard (demand) or heap base.
+        // ABI; the stack grows down toward its guard.
         let sp = stack.sp();
         let entry_addr = thread_entry as extern "C" fn(u64) -> ! as usize as u64;
 

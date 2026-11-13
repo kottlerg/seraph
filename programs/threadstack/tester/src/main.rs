@@ -4,7 +4,8 @@
 // programs/threadstack/tester/src/main.rs
 
 //! Per-program tester for `/programs/threadstack`. Spawns it in eight modes
-//! (demand-paged by the system default) and asserts, capability-natively
+//! demand-paged (the system default), then in three pinned, with no pager, and
+//! asserts, capability-natively
 //! (stdout marker is the verdict;
 //! the kernel's fault-class exit reason is corroborating mechanism only):
 //!
@@ -30,6 +31,13 @@
 //!     loader mapped for it; same verdict as `grow`.
 //!   * `main-guard` — the main thread overflows past its demand growth range
 //!     into the guard; same verdict as `guard`.
+//!   * `eager-grow`, pinned — a worker recurses into the eager stack mapped at
+//!     its spawn and joins; same verdict as `grow`.
+//!   * `guard`, pinned — a worker recurses past its eager stack into the
+//!     unmapped guard, whose fault no pager takes; same verdict as `guard`.
+//!   * `eager-bigframe`, pinned — `bigframe` sized to the eager stack, the
+//!     frame's lowest byte in the parked worker's mapped stack; same verdict as
+//!     `guard`, which only an unmapped guard below the stack delivers.
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 
@@ -41,6 +49,7 @@
 )]
 
 use std::io::Read;
+use std::os::seraph::process::CommandExt;
 use std::process::{Command, Stdio};
 
 /// Base exit reason for a fault-induced death (`abi/syscall` `EXIT_FAULT_BASE`).
@@ -53,15 +62,42 @@ fn fail(msg: &str) -> !
     std::process::exit(1);
 }
 
-/// Spawn `/programs/threadstack <mode>` (demand-paged by the system default),
-/// capture stdout, and return `(stdout, ExitStatus)`.
-fn run(mode: &str) -> (String, std::process::ExitStatus)
+/// How the tester has procmgr create the fixture.
+#[derive(Clone, Copy)]
+enum Paging
 {
-    let mut child = Command::new("/programs/threadstack")
-        .arg(mode)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn /programs/threadstack");
+    /// Demand-paged, the system default: a spawned thread's stack is a guarded
+    /// demand stack.
+    Demand,
+    /// Pinned (`CommandExt::pinned`), with no pager: a spawned thread's stack
+    /// is mapped at spawn above its guard.
+    Pinned,
+}
+
+impl Paging
+{
+    /// The suffix a FAIL line names the run by.
+    fn label(self) -> &'static str
+    {
+        match self
+        {
+            Paging::Demand => "",
+            Paging::Pinned => " (pinned)",
+        }
+    }
+}
+
+/// Spawn `/programs/threadstack <mode>` as `paging` says, capture stdout, and
+/// return `(stdout, ExitStatus)`.
+fn run(mode: &str, paging: Paging) -> (String, std::process::ExitStatus)
+{
+    let mut command = Command::new("/programs/threadstack");
+    command.arg(mode).stdout(Stdio::piped());
+    if let Paging::Pinned = paging
+    {
+        command.pinned(true);
+    }
+    let mut child = command.spawn().expect("spawn /programs/threadstack");
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut bytes = Vec::new();
     stdout
@@ -71,11 +107,12 @@ fn run(mode: &str) -> (String, std::process::ExitStatus)
     (String::from_utf8_lossy(&bytes).into_owned(), status)
 }
 
-/// Run a growth `mode` (`grow`, `nested-grow`, or `main-grow`), whose fixture must recurse
-/// deep into a demand stack and exit cleanly.
-fn check_grow(mode: &str)
+/// Run a growth `mode` (`grow`, `nested-grow`, `main-grow`, or `eager-grow`), whose fixture
+/// must recurse deep into its stack and exit cleanly.
+fn check_grow(mode: &str, paging: Paging)
 {
-    let (out, status) = run(mode);
+    let (out, status) = run(mode, paging);
+    let mode = format!("{mode}{}", paging.label());
     if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
     {
         fail(&format!("{mode} unexpectedly reported SURVIVED"));
@@ -91,17 +128,18 @@ fn check_grow(mode: &str)
     }
 }
 
-/// Run an overflow `mode` (`guard`, `bigframe`, `splitframe`, `span`, or
-/// `main-guard`), whose fixture must reach the overflow point and then be
-/// killed by the guard's fault.
+/// Run an overflow `mode` (`guard`, `bigframe`, `splitframe`, `span`,
+/// `main-guard`, or `eager-bigframe`), whose fixture must reach the overflow
+/// point and then be killed by the guard's fault.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ExitStatus::code() is i32, but exit reasons are non-negative (clean 0, fault \
               0x1000+vector); the u64 cast preserves the value"
 )]
-fn check_overflow(mode: &str)
+fn check_overflow(mode: &str, paging: Paging)
 {
-    let (out, status) = run(mode);
+    let (out, status) = run(mode, paging);
+    let mode = format!("{mode}{}", paging.label());
     if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
     {
         fail(&format!("{mode}: guard did not fault — overflow survived"));
@@ -131,13 +169,16 @@ fn check_overflow(mode: &str)
 
 fn main()
 {
-    check_grow("grow");
-    check_overflow("guard");
-    check_overflow("bigframe");
-    check_overflow("splitframe");
-    check_overflow("span");
-    check_grow("nested-grow");
-    check_grow("main-grow");
-    check_overflow("main-guard");
+    check_grow("grow", Paging::Demand);
+    check_overflow("guard", Paging::Demand);
+    check_overflow("bigframe", Paging::Demand);
+    check_overflow("splitframe", Paging::Demand);
+    check_overflow("span", Paging::Demand);
+    check_grow("nested-grow", Paging::Demand);
+    check_grow("main-grow", Paging::Demand);
+    check_overflow("main-guard", Paging::Demand);
+    check_grow("eager-grow", Paging::Pinned);
+    check_overflow("guard", Paging::Pinned);
+    check_overflow("eager-bigframe", Paging::Pinned);
     println!("[threadstack-tester] PASS");
 }

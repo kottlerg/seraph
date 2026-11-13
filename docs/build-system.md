@@ -137,11 +137,10 @@ its first, 2032-byte adjustment and its second adjustment of up to a page,
 which no probe touches), and the probe of a vector frame lies a page below
 its fixed area, so two consecutive stack stores can lie up to 14312 bytes
 apart. Every main-thread stack that `shared/process-layout` places and every
-demand-paged thread stack std spawns therefore keeps a guard of four pages
+thread stack std spawns therefore keeps a guard of four pages
 (`process_abi::STACK_GUARD_PAGES`; [`threadstack`](../programs/threadstack/README.md)'s
 `splitframe` and `span` modes check it), where x86-64, whose `call` pushes
-the return address, needs one. std's heap-fallback thread stack keeps none
-([#1026](https://github.com/kottlerg/seraph/issues/1026)). The two floors:
+the return address, needs one. The two floors:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,

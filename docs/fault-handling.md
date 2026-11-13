@@ -836,7 +836,10 @@ Stack growth is built on it: the runtime registers each spawned thread's stack, 
 regions above an unregistered guard, so a stack costs frames only as it grows and an overflow
 faults on an address the pager declines (see
 [Userspace Memory Model § Bootstrap Cross-Boundary VAs](userspace-memory-model.md#bootstrap-cross-boundary-vas)
-and [ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)).
+and [ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)). A
+process with no pager maps each spawned thread's stack at spawn instead, above a guard it leaves
+unmapped, and an overflow into that guard is a page fault no pager forwards, which kills the
+process ([Crash Reports](#crash-reports)).
 
 A kernel copy into or out of a caller-supplied buffer on a page of a demand region the pager has
 not yet backed takes the same path through the restartable syscalls: the pager backs the page and

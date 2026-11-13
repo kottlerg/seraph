@@ -1351,11 +1351,14 @@ pub(crate) fn reserve_guarded_stack(
         .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
     let usable_base = range.va_start() + guard_pages * syscall_abi::PAGE_SIZE;
     // Fund this address space's page-table growth budget for the usable region
-    // only — the guard is never backed.
-    if !fund_aspace_pt_budget(info.self_aspace, usable_pages) {
-        unreserve_pages(range);
-        return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
-    }
+    // only — the guard is never backed — so the stack's first faults stay off
+    // the pager's own funding path. Best effort: the funding is not reserved
+    // for the stack, since another thread's mapping may draw it first, and the
+    // pager funds the pool itself when a fault finds it exhausted
+    // (services/memmgr/docs/memory-pool.md § Client page-table funding). A
+    // shortfall, such as a concurrent spawn's stack drawing the pool between
+    // this top-up and its check, therefore does not fail the spawn.
+    let _ = fund_aspace_pt_budget(info.self_aspace, usable_pages);
     // SAFETY: current_ipc_buf returns the registered IPC buffer page.
     if !unsafe { register_rw_region(memmgr_ep, ipc_buf, usable_base, usable_pages) } {
         unreserve_pages(range);

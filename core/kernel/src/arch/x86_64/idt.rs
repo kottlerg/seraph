@@ -53,10 +53,16 @@
 //!   is configured in the TSS. Vector 3 (`#BP`) has no `set` call: `init()`
 //!   installs it directly, with DPL 3, so a user `int3` reaches it.
 
-// cast_possible_truncation: every narrowing cast here is bounded — the IDTR limit
-// (256 * 16 - 1 fits u16), the masked/shifted handler-offset splits in
-// `IdtEntry::new`, and the device-range vector-to-u8 cast in `irq_dispatch`.
-#![allow(clippy::cast_possible_truncation)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_possible_truncation,
+        reason = "every narrowing cast here is bounded — the IDTR limit (256 * 16 - 1 fits u16), \
+                  the masked/shifted handler-offset splits in `IdtEntry::new`, and the \
+                  device-range vector-to-u8 cast in `irq_dispatch`; the code it covers is compiled \
+                  out of the host test build, so the lint fires outside it alone"
+    )
+)]
 
 use super::gdt::KERNEL_CS;
 use super::trap_frame::TrapFrame;

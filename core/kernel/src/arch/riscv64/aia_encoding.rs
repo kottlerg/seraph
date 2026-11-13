@@ -149,8 +149,10 @@ impl SourceRoute
         {
             return None;
         }
-        // Each field is a u32 `pack` placed in its own bit range.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "each field is a u32 `pack` placed in its own bit range"
+        )]
         Some(Self {
             cpu: ((word >> 32) & 0x3FFF_FFFF) as u32,
             eid: word as u32,

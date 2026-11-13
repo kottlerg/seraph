@@ -51,10 +51,12 @@
 //! GPR slots and the dedicated `rip`/`rflags` fields; `sysretq` returns
 //! through the `rip`/`rflags` fields.
 
-// cast_sign_loss: `set_return` stores the i64 syscall result into rax as raw
-// u64 bits; the sign reinterpretation is intentional.
-// cast_lossless: u16→u64 segment register widening.
-#![allow(clippy::cast_sign_loss, clippy::cast_lossless)]
+#![expect(
+    clippy::cast_sign_loss,
+    reason = "`set_return` stores the i64 syscall result into rax as raw u64 bits; the sign \
+              reinterpretation is intentional"
+)]
+#![expect(clippy::cast_lossless, reason = "u16→u64 segment register widening")]
 
 /// Full user-mode register snapshot saved on the kernel stack at every
 /// kernel entry (syscall, exception, or interrupt from ring-3).

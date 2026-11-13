@@ -651,13 +651,12 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let ep_idx = tf.arg(0);
     let label = tf.arg(1);
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
-    let data_count = (syscall::ipc_call_data_count(tf.arg(2)) as usize).min(MSG_DATA_WORDS_MAX);
+    // A count no usize holds is above either bound, so it clamps to the bound.
+    let data_count = usize::try_from(syscall::ipc_call_data_count(tf.arg(2)))
+        .map_or(MSG_DATA_WORDS_MAX, |n| n.min(MSG_DATA_WORDS_MAX));
     let timeout_ms = syscall::ipc_call_timeout_ms(tf.arg(2));
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
-    let cap_count = (tf.arg(3) as usize).min(MSG_CAP_SLOTS_MAX);
+    let cap_count =
+        usize::try_from(tf.arg(3)).map_or(MSG_CAP_SLOTS_MAX, |n| n.min(MSG_CAP_SLOTS_MAX));
 
     // SAFETY: current_tcb() valid from syscall context.
     let tcb = unsafe { current_tcb() };
@@ -688,8 +687,6 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
     // EndpointObject; EndpointObject.state is valid.
     let ep_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
         (*ep_obj).state
     };
@@ -909,8 +906,6 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: slot validated; object pointer is valid Endpoint.
     let ep_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let ep_obj = obj_ptr.cast::<crate::cap::object::EndpointObject>();
         (*ep_obj).state
     };
@@ -1146,19 +1141,24 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// failure sentinel. With no caller bound, the payload and capability checks
 /// still run, so their errors keep precedence over `InvalidCapability`
 /// (core/kernel/docs/syscalls.md § `SYS_IPC_REPLY`).
-// too_many_lines: a single logical operation (claim + payload + cap pre-alloc
-// + reply dispatch, with a fault-reply fast path); splitting would obscure
-// the all-or-nothing reply atomicity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a single logical operation (claim + payload + cap pre-alloc + reply dispatch, with a \
+              fault-reply fast path); splitting would obscure the all-or-nothing reply atomicity"
+)]
 #[cfg(not(test))]
 pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let label = tf.arg(0);
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Seraph targets 64-bit only; usize == u64 on all supported targets"
+    )]
     let data_count = (tf.arg(1) as usize).min(MSG_DATA_WORDS_MAX);
-    // cast_possible_truncation: Seraph targets 64-bit only; usize == u64 on all supported targets.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Seraph targets 64-bit only; usize == u64 on all supported targets"
+    )]
     let cap_count = (tf.arg(2) as usize).min(MSG_CAP_SLOTS_MAX);
 
     // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
@@ -1448,8 +1448,6 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: slot validated; object pointer is valid Notification.
     let sig_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
         (*sig_obj).state
     };
@@ -1519,8 +1517,6 @@ pub fn sys_notification_wait(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: slot validated; object pointer is valid Notification.
     let sig_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let sig_obj = obj_ptr.cast::<crate::cap::object::NotificationObject>();
         (*sig_obj).state
     };
@@ -1634,8 +1630,6 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: slot validated; object pointer is valid EventQueue.
     let eq_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let eq_obj = obj_ptr.cast::<crate::cap::object::EventQueueObject>();
         (*eq_obj).state
     };
@@ -1708,8 +1702,6 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: slot validated; object pointer is valid EventQueue.
     let eq_state = unsafe {
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?.as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let eq_obj = obj_ptr.cast::<crate::cap::object::EventQueueObject>();
         (*eq_obj).state
     };
@@ -1838,10 +1830,12 @@ fn set_event_return(tf: UserFrame, entry: crate::ipc::event_queue::EventEntry)
 /// Returns `SyscallError::InvalidArgument` if the wait set is full
 /// or the source is already registered in a wait set.
 #[cfg(not(test))]
-// too_many_lines: this function performs a single logical operation (cap resolution + wait set
-// registration) that requires dispatching over three source types; splitting it would
-// obscure the all-or-nothing atomicity contract.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "this function performs a single logical operation (cap resolution + wait set \
+              registration) that requires dispatching over three source types; splitting it would \
+              obscure the all-or-nothing atomicity contract"
+)]
 pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
@@ -1868,8 +1862,6 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
             .object
             .ok_or(SyscallError::InvalidCapability)?
             .as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let ws_obj = obj_ptr.cast::<crate::cap::object::WaitSetObject>();
         (*ws_obj).state
     };
@@ -1912,8 +1904,10 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
     {
         WaitSetSourceTag::Endpoint =>
         {
-            // cast_ptr_alignment: kernel allocator guarantees object alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "kernel allocator guarantees object alignment"
+            )]
             let ep = nospec::select_ptr(
                 src.tag_mask(CapTag::Endpoint),
                 source_ptr,
@@ -1969,8 +1963,10 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
         }
         WaitSetSourceTag::Notification =>
         {
-            // cast_ptr_alignment: kernel allocator guarantees object alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "kernel allocator guarantees object alignment"
+            )]
             let sig = nospec::select_ptr(
                 src.tag_mask(CapTag::Notification),
                 source_ptr,
@@ -2039,8 +2035,10 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
         }
         WaitSetSourceTag::EventQueue =>
         {
-            // cast_ptr_alignment: kernel allocator guarantees object alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "kernel allocator guarantees object alignment"
+            )]
             let eq = nospec::select_ptr(
                 src.tag_mask(CapTag::EventQueue),
                 source_ptr,
@@ -2130,8 +2128,6 @@ unsafe fn wait_set_source(
     // Each arm reads `src.object_of(<its tag>)`, the object selected by the
     // tag as data, so an arm a mispredicted tag match reaches reads through
     // null, never an object of another type.
-    // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-    #[allow(clippy::cast_ptr_alignment)]
     let (state, tag, header, right) = match src.tag
     {
         CapTag::Endpoint =>
@@ -2186,10 +2182,11 @@ unsafe fn wait_set_source(
 /// Clears the back-pointer on the source. Stale entries for the removed
 /// member are silently skipped by subsequent `SYS_WAIT_SET_WAIT` calls.
 #[cfg(not(test))]
-// too_many_lines: one logical operation (cap resolution plus the per-source
-// back-pointer clear under the documented lock order) whose source arms share
-// the lock bookkeeping.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one logical operation (cap resolution plus the per-source back-pointer clear under \
+              the documented lock order) whose source arms share the lock bookkeeping"
+)]
 pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::ipc::wait_set::WaitSetSourceTag;
@@ -2215,8 +2212,6 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
             .object
             .ok_or(SyscallError::InvalidCapability)?
             .as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let ws_obj = obj_ptr.cast::<crate::cap::object::WaitSetObject>();
         (*ws_obj).state
     };
@@ -2244,8 +2239,10 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
     {
         WaitSetSourceTag::Endpoint =>
         {
-            // cast_ptr_alignment: kernel allocator guarantees object alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "kernel allocator guarantees object alignment"
+            )]
             let ep = nospec::select_ptr(
                 src.tag_mask(CapTag::Endpoint),
                 source_ptr,
@@ -2286,8 +2283,10 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
         }
         WaitSetSourceTag::Notification =>
         {
-            // cast_ptr_alignment: kernel allocator guarantees object alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "kernel allocator guarantees object alignment"
+            )]
             let sig = nospec::select_ptr(
                 src.tag_mask(CapTag::Notification),
                 source_ptr,
@@ -2331,8 +2330,10 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
         }
         WaitSetSourceTag::EventQueue =>
         {
-            // cast_ptr_alignment: kernel allocator guarantees object alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "kernel allocator guarantees object alignment"
+            )]
             let eq = nospec::select_ptr(
                 src.tag_mask(CapTag::EventQueue),
                 source_ptr,
@@ -2417,8 +2418,6 @@ pub fn sys_wait_set_wait(tf: UserFrame) -> Result<u64, SyscallError>
             .object
             .ok_or(SyscallError::InvalidCapability)?
             .as_ptr();
-        // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
-        #[allow(clippy::cast_ptr_alignment)]
         let ws_obj = obj_ptr.cast::<crate::cap::object::WaitSetObject>();
         (*ws_obj).state
     };

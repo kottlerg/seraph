@@ -33,8 +33,10 @@
 //! core/kernel/docs/capability-internals.md § Storage: Hybrid Radix
 //! Directory.
 
-// cast_possible_truncation: usize→u32 slot index bounded by MAX_SLOTS_STRUCTURAL.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "usize→u32 slot index bounded by MAX_SLOTS_STRUCTURAL"
+)]
 
 // `alloc` is needed by the host-test stubs (CSpace::grow heap fallback,
 // CSpace::Drop heap reclaim, dummy-object factory). Production CSpace is

@@ -86,9 +86,11 @@ pub const fn handle(cpu: usize, vector: u8) -> Option<u16>
     {
         return None;
     }
-    // Below HANDLE_COUNT by the bounds above and the const assertion on REMAP_CPU_LIMIT, so
-    // neither operation wraps and the handle fits 16 bits.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "below HANDLE_COUNT by the bounds above and the const assertion on \
+                  REMAP_CPU_LIMIT, so neither operation wraps and the handle fits 16 bits"
+    )]
     Some(cpu.wrapping_mul(DEVICE_VECTOR_COUNT).wrapping_add(offset) as u16)
 }
 

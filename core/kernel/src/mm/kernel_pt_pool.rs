@@ -168,18 +168,25 @@ pub(crate) fn remaining_pages() -> usize
 
 // Test stubs — pool is unused under host tests (no buddy, no direct map).
 #[cfg(test)]
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "host tests have no buddy or direct map, so no test calls this stub"
+)]
 pub(crate) unsafe fn init(_seed_pages: usize) {}
 #[cfg(test)]
-// dead_code: host tests have no buddy or direct map, so no test calls this stub.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "host tests have no buddy or direct map, so no test calls this stub"
+)]
 pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     None
 }
 #[cfg(test)]
-// dead_code: host tests have no buddy or direct map, so no test calls this stub.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "host tests have no buddy or direct map, so no test calls this stub"
+)]
 pub(crate) fn remaining_pages() -> usize
 {
     0

@@ -42,15 +42,32 @@
 //! - To get higher resolution (periodic mode): reduce divide ratio and
 //!   recalculate.
 
-// cast_possible_truncation: the APIC initial count fits the 32-bit register;
-// the PIT reload value (~11 932) fits u16 and is written as two u8 halves.
-// cast_lossless: u32→u64 widening in TSC/APIC math and the u8 TIMER_VECTOR
-// widened to u32 are lossless.
-// inline_always: read_tsc is a tiny asm stub; always-inline is appropriate here.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_lossless,
-    clippy::inline_always
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_possible_truncation,
+        reason = "the APIC initial count fits the 32-bit register; the PIT reload value (~11 932) \
+                  fits u16 and is written as two u8 halves; the code it covers is compiled out of \
+                  the host test build, so the lint fires outside it alone"
+    )
+)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_lossless,
+        reason = "u32→u64 widening in TSC/APIC math and the u8 TIMER_VECTOR widened to u32 are \
+                  lossless; the code it covers is compiled out of the host test build, so the lint \
+                  fires outside it alone"
+    )
+)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::inline_always,
+        reason = "read_tsc is a tiny asm stub; always-inline is appropriate here; the code it \
+                  covers is compiled out of the host test build, so the lint fires outside it \
+                  alone"
+    )
 )]
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -388,7 +405,8 @@ pub unsafe fn init(period_us: u64)
         // Configure APIC timer: periodic mode, vector TIMER_VECTOR.
         #[expect(
             clippy::multiple_unsafe_ops_per_block,
-            reason = "every access is to a register of this CPU's local APIC timer, at a constant offset"
+            reason = "every access is to a register of this CPU's local APIC timer, at a constant \
+                      offset"
         )]
         // SAFETY: APIC registers are valid; single-threaded init context.
         unsafe {
@@ -455,7 +473,8 @@ pub unsafe fn init_ap(period_us: u64)
     let initial_count = (tps.saturating_mul(period_us) / 1_000_000).max(1);
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
-        reason = "every access is to a register of this CPU's local APIC timer, at a constant offset"
+        reason = "every access is to a register of this CPU's local APIC timer, at a constant \
+                  offset"
     )]
     // SAFETY: APIC MMIO registers are valid (LAPIC software-enabled, caller's
     // contract).

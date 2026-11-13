@@ -108,13 +108,15 @@ const _: () = {
 /// a non-null `ancestor`; there is no other construction path.
 unsafe fn source_header(state_ptr: *mut u8) -> *mut crate::cap::object::KernelObjectHeader
 {
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the retype slot is allocated to the alignment of its wrapper (`EndpointObject` / \
+                  `NotificationObject` / `EventQueueObject`), each of which begins with a \
+                  `KernelObjectHeader` (8-byte aligned); the state body is 24 bytes past that \
+                  start so subtracting 24 lands on the wrapper start"
+    )]
     // SAFETY: state_ptr is the inner-body pointer; the wrapper (with header at
     // offset 0) precedes it by SOURCE_WRAPPER_BYTES inside the same retype slot.
-    // cast_ptr_alignment: the retype slot is allocated to the alignment of its
-    // wrapper (`EndpointObject` / `NotificationObject` / `EventQueueObject`), each of
-    // which begins with a `KernelObjectHeader` (8-byte aligned); the state body
-    // is 24 bytes past that start so subtracting 24 lands on the wrapper start.
-    #[allow(clippy::cast_ptr_alignment)]
     unsafe {
         state_ptr
             .sub(SOURCE_WRAPPER_BYTES)
@@ -500,8 +502,7 @@ impl WaitSetState
         let (badge, is_ready) = (slot.badge, ready(slot));
         // A vacant slot was found, so the count stays within `capacity`.
         self.member_count = self.member_count.saturating_add(1);
-        // cast_possible_truncation: idx < capacity, a u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation, reason = "idx < capacity, a u16")]
         let idx = idx as u16;
         if !is_ready
         {
@@ -535,8 +536,7 @@ impl WaitSetState
             .enumerate()
             .find(|(_, m)| m.is_occupied() && ready(m))
             .map(|(idx, m)| (idx, m.badge))?;
-        // cast_possible_truncation: idx < capacity, a u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation, reason = "idx < capacity, a u16")]
         self.push_ready(idx as u16);
         Some(badge)
     }
@@ -564,11 +564,13 @@ impl WaitSetState
 #[cfg(not(test))]
 pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
 {
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "WaitSetState lives 24 B (the WaitSetObject wrapper) past an 8-aligned retype \
+                  slot base, so it is 8-aligned, which covers its largest field alignment (`*mut \
+                  ThreadControlBlock`, `u64`)"
+    )]
     // SAFETY: caller guarantees ws_opaque is a valid *mut WaitSetState.
-    // cast_ptr_alignment: WaitSetState lives 24 B (the WaitSetObject wrapper)
-    // past an 8-aligned retype slot base, so it is 8-aligned, which covers its
-    // largest field alignment (`*mut ThreadControlBlock`, `u64`).
-    #[allow(clippy::cast_ptr_alignment)]
     let ws = unsafe { &mut *ws_opaque.cast::<WaitSetState>() };
 
     // SAFETY: lock is owned by ws; matched unlock_raw at every return path.
@@ -943,11 +945,12 @@ pub unsafe fn wait_set_drop(
 unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
 {
     use core::sync::atomic::Ordering;
-    // cast_ptr_alignment: each source_ptr addresses a ConcreteType constructed
-    // 24 B (the wrapper size) past a size-class-aligned retype slot base, so it
-    // is 8-aligned, which covers align_of::<ConcreteType>(). The casts below
-    // restore that type.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "each source_ptr addresses a ConcreteType constructed 24 B (the wrapper size) \
+                  past a size-class-aligned retype slot base, so it is 8-aligned, which covers \
+                  align_of::<ConcreteType>(). The casts below restore that type"
+    )]
     match tag
     {
         WaitSetSourceTag::Endpoint =>
@@ -988,11 +991,12 @@ unsafe fn source_is_ready(source_ptr: *mut u8, tag: WaitSetSourceTag) -> bool
 /// `source_ptr` must be a valid pointer to the appropriate state struct.
 unsafe fn clear_source_backpointer(source_ptr: *mut u8, tag: WaitSetSourceTag)
 {
-    // cast_ptr_alignment: each source_ptr addresses a ConcreteType constructed
-    // 24 B (the wrapper size) past a size-class-aligned retype slot base, so it
-    // is 8-aligned, which covers align_of::<ConcreteType>(). The casts below
-    // restore that type.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "each source_ptr addresses a ConcreteType constructed 24 B (the wrapper size) \
+                  past a size-class-aligned retype slot base, so it is 8-aligned, which covers \
+                  align_of::<ConcreteType>(). The casts below restore that type"
+    )]
     match tag
     {
         WaitSetSourceTag::Endpoint =>

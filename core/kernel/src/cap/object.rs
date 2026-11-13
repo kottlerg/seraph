@@ -432,9 +432,6 @@ impl MemoryObject
     pub unsafe fn note_slot_filled(object: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract; the header is at offset 0 of MemoryObject.
-        // cast_ptr_alignment: a MemoryObject is 8-byte aligned wherever it is
-        // placed, and holds the header at offset 0.
-        #[allow(clippy::cast_ptr_alignment)]
         let memory = unsafe { &*object.as_ptr().cast::<MemoryObject>() };
         memory.slot_count.fetch_add(1, Ordering::AcqRel);
     }
@@ -449,8 +446,6 @@ impl MemoryObject
     pub unsafe fn note_slot_released(object: NonNull<KernelObjectHeader>)
     {
         // SAFETY: caller contract; the header is at offset 0 of MemoryObject.
-        // cast_ptr_alignment: as in `note_slot_filled`.
-        #[allow(clippy::cast_ptr_alignment)]
         let memory = unsafe { &*object.as_ptr().cast::<MemoryObject>() };
         let before = memory.slot_count.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(before > 0, "MemoryObject slot_count underflow");
@@ -691,9 +686,6 @@ impl RangeLineage
 ///
 /// # Safety
 /// `hdr` is a live `Mmio`, `IoPort`, or `Interrupt` object.
-// cast_ptr_alignment: each object is constructed in place at a
-// size-class-aligned retype offset; the header sits at offset 0.
-#[allow(clippy::cast_ptr_alignment)]
 unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
 {
     // SAFETY: caller contract (a live header).
@@ -977,9 +969,6 @@ impl MmioObject
     /// count is zero), so no map can be recording into it; only its lineage
     /// count may still be touched by other CPUs. No lock is held, and the CPU
     /// is stable (`release_ref`'s preconditions).
-    // cast_possible_truncation: a region's page count fits usize on the 64-bit
-    // targets the kernel supports.
-    #[allow(clippy::cast_possible_truncation)]
     #[cfg(not(test))]
     unsafe fn withdraw_mappings(&self, stack: &mut CascadeStack)
     {
@@ -1814,9 +1803,11 @@ impl AddressSpaceObject
     /// constructed in place directly after its object, at offset
     /// `size_of::<AddressSpaceObject>()` of the page (`sys_cap_create_aspace`,
     /// `boot_retype_aspace`). Pointer arithmetic only; nothing is read.
-    // cast_ptr_alignment: the result is the page-aligned start of the wrapper
-    // page, which the object's alignment divides.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the result is the page-aligned start of the wrapper page, which the object's \
+                  alignment divides"
+    )]
     pub fn containing(aspace: *mut crate::mm::address_space::AddressSpace) -> *mut Self
     {
         aspace
@@ -2284,9 +2275,11 @@ impl CSpaceKernelObject
     #[cfg(not(test))]
     pub fn alloc_mmio_spill(&self) -> Result<NonNull<MmioSpill>, syscall::SyscallError>
     {
-        // cast_ptr_alignment: a chunk is CHUNK_BYTES-aligned within its page,
-        // which satisfies MmioSpill's alignment.
-        #[allow(clippy::cast_ptr_alignment)]
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "a chunk is CHUNK_BYTES-aligned within its page, which satisfies MmioSpill's \
+                      alignment"
+        )]
         let chunk = self.alloc_chunk()?.cast::<MmioSpill>();
         // SAFETY: the chunk is CHUNK_BYTES (MmioSpill fits, asserted with its
         // definition), chunk-aligned, and exclusively ours.
@@ -2691,9 +2684,6 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &
 ///
 /// # Safety
 /// `ptr` must be a valid `Thread`, `CSpaceObj`, or `AddressSpace` object.
-// cast_ptr_alignment: each concrete object is constructed in place at its own
-// alignment; the header sits at offset 0 of every one.
-#[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
 unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObjectHeader
 {
@@ -2857,9 +2847,11 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
 /// then runs `dealloc_object`'s ordinary stop-and-drain — or its self net
 /// when the draining thread is that thread. `cpu` is the local CPU index
 /// (`< MAX_CPUS`) and its scheduler is initialised.
-// cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
-// stored by this function (header at offset 0, 8-byte aligned).
-#[allow(clippy::cast_ptr_alignment)]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "the `*mut u8` head only ever holds an object pointer stored by this function (header \
+              at offset 0, 8-byte aligned)"
+)]
 #[cfg(not(test))]
 pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObjectHeader>)
 {
@@ -2910,9 +2902,11 @@ pub(crate) unsafe fn push_deferred_reclaim(cpu: usize, ptr: NonNull<KernelObject
 /// `release_ref` is caught by the Thread arm's self net, which
 /// marks it `Exited`, re-queues the object, and returns, so the epilogue's
 /// post-drain `Exited` check schedules it away.
-// cast_ptr_alignment: the `*mut u8` head only ever holds an object pointer
-// stored by push_deferred_reclaim (header at offset 0, 8-byte aligned).
-#[allow(clippy::cast_ptr_alignment)]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "the `*mut u8` head only ever holds an object pointer stored by push_deferred_reclaim \
+              (header at offset 0, 8-byte aligned)"
+)]
 #[cfg(not(test))]
 pub unsafe fn drain_deferred_reclaim(cpu: usize)
 {
@@ -3004,9 +2998,11 @@ unsafe fn defer_self_teardown(ptr: NonNull<KernelObjectHeader>, what: &str)
 /// `tcb` is the dying, valid TCB; `blocked_on` is the source state its
 /// binding names under `bound_state` (a source-blocking state), whose lock the
 /// caller holds together with `tcb`'s `sched_lock`.
-// cast_ptr_alignment: blocked_on_object stores a type-erased pointer to the
-// source state bound_state names, whose allocation guarantees its alignment.
-#[allow(clippy::cast_ptr_alignment)]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "blocked_on_object stores a type-erased pointer to the source state bound_state \
+              names, whose allocation guarantees its alignment"
+)]
 #[cfg(not(test))]
 unsafe fn unlink_dying_waiter(
     tcb: *mut crate::sched::thread::ThreadControlBlock,
@@ -3155,9 +3151,12 @@ impl CascadeStack
     {
         // Sign-extend the CASCADE_LINK_BITS-bit word, then restore the three
         // alignment bits: `(word << 8) >> 5`, arithmetic.
-        // cast_possible_wrap, cast_sign_loss: the casts reinterpret the bits
-        // for the arithmetic shift; no value is converted.
-        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_possible_wrap,
+            clippy::cast_sign_loss,
+            reason = "the casts reinterpret the bits for the arithmetic shift; no value is \
+                      converted"
+        )]
         let va = (((word << (64 - CASCADE_LINK_BITS)) as i64) >> (61 - CASCADE_LINK_BITS)) as u64;
         NonNull::new(va as *mut KernelObjectHeader)
     }
@@ -3186,9 +3185,10 @@ impl CascadeStack
     /// header is used across this call.
     unsafe fn write_link(obj: NonNull<KernelObjectHeader>, word: u64)
     {
-        // cast_possible_truncation: each cast keeps exactly the bits its
-        // field holds.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "each cast keeps exactly the bits its field holds"
+        )]
         let (lo, hi) = (
             word as u32,
             [(word >> 32) as u8, (word >> 40) as u8, (word >> 48) as u8],
@@ -3331,9 +3331,6 @@ unsafe fn free_body<T>(ptr: NonNull<KernelObjectHeader>, stack: &mut CascadeStac
         unsafe { free_arena_chunk(ptr.as_ptr().cast::<u8>(), stack) };
         return;
     }
-    // cast_ptr_alignment: any other ancestor is a MemoryObject (header at
-    // offset 0).
-    #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: as above.
     let ancestor_memory = unsafe { &*ancestor.as_ptr().cast::<MemoryObject>() };
     let body_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
@@ -3423,9 +3420,6 @@ unsafe fn release_range_object<T>(
 /// `src` is the live object of a slot tagged `tag`, pinned by the caller,
 /// `hidden_tag` equals `tag as usize`, and `dest` is a live `CSpace` the
 /// caller pins.
-// cast_ptr_alignment: each object is constructed in place at a
-// size-class-aligned retype offset; the header sits at offset 0.
-#[allow(clippy::cast_ptr_alignment)]
 #[cfg(not(test))]
 pub unsafe fn object_for_new_slot(
     tag: crate::cap::slot::CapTag,
@@ -3623,8 +3617,6 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
     };
     let anc_ptr = first.ancestor;
     debug_assert!(group.iter().all(|record| record.ancestor == anc_ptr));
-    // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-    #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: the records' references keep their Memory object live until the
     // releases at the end.
     let anc_memory = unsafe { &*anc_ptr.cast::<MemoryObject>() };
@@ -3747,19 +3739,23 @@ unsafe fn reclaim_cspace_donations(
 /// # Safety
 ///
 /// Same contract as [`dealloc_object`].
-// cast_ptr_alignment: every concrete object is constructed in place at a
-// size-class-aligned offset of a page-aligned retype slab (`retype_allocate`),
-// which satisfies align_of::<ConcreteType>(). The NonNull<KernelObjectHeader>
-// points to the first field (header at offset 0), so the pointer retains the
-// concrete type's alignment even when stored as KernelObjectHeader*.
-// too_many_lines: structural dispatch over all object types; splitting further
-// would obscure the type hierarchy without reducing complexity.
-// items_after_statements: each arm imports the retype helpers it uses beside
-// that use, after the arm's own statements.
-#[allow(
+#[expect(
     clippy::cast_ptr_alignment,
+    reason = "every concrete object is constructed in place at a size-class-aligned offset of a \
+              page-aligned retype slab (`retype_allocate`), which satisfies \
+              align_of::<ConcreteType>(). The NonNull<KernelObjectHeader> points to the first \
+              field (header at offset 0), so the pointer retains the concrete type's alignment \
+              even when stored as KernelObjectHeader*"
+)]
+#[expect(
     clippy::too_many_lines,
-    clippy::items_after_statements
+    reason = "structural dispatch over all object types; splitting further would obscure the type \
+              hierarchy without reducing complexity"
+)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "each arm imports the retype helpers it uses beside that use, after the arm's own \
+              statements"
 )]
 #[cfg(not(test))]
 unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack: &mut CascadeStack)
@@ -4002,9 +3998,6 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // outside the all-locks region; the wake's target CPU is recomputed at
                 // the deferred wake site below (#351).
                 let server_reply_wake: Option<*mut crate::sched::thread::ThreadControlBlock>;
-                // needless_range_loop: explicit indexing reads clearer for the
-                // parallel scheduler_for(cpu) accesses across all CPUs.
-                #[allow(clippy::needless_range_loop)]
                 // All scheduler locks are acquired in ascending order to prevent
                 // deadlock; each lock_raw is paired with its unlock_raw.
                 {

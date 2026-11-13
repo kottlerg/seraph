@@ -267,9 +267,11 @@ pub fn elapsed_us() -> Option<u64>
 ///
 /// Requires [`init`] to have run (the discovered timebase converts µs to
 /// ticks); there is no pre-init fallback because no pre-init caller exists.
-// Required by the arch interface (core/kernel/docs/arch-interface.md § `timer`);
-// no riscv64 caller exists.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "required by the arch interface (core/kernel/docs/arch-interface.md § `timer`); no \
+              riscv64 caller exists"
+)]
 #[cfg(not(test))]
 pub fn delay_us(us: u64)
 {
@@ -283,7 +285,9 @@ pub fn delay_us(us: u64)
 }
 
 /// No-op test stub.
-// Test stub of an arch-interface item (core/kernel/docs/arch-interface.md § `timer`).
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "test stub of an arch-interface item (core/kernel/docs/arch-interface.md § `timer`)"
+)]
 #[cfg(test)]
 pub fn delay_us(_us: u64) {}

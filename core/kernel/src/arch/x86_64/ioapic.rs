@@ -80,9 +80,10 @@
 //!   holder nor a binding remains, and unmasked by `interrupts::unmask` (from
 //!   `SYS_IRQ_ACK`).
 
-// cast_possible_truncation: u64→usize APIC MMIO address arithmetic; bounded by APIC layout.
-// cast_lossless: u8→u32 vector widening casts.
-#![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "u64→usize APIC MMIO address arithmetic; bounded by APIC layout"
+)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -274,8 +275,10 @@ pub fn assign_vector(cpu: usize, slot: Slot) -> Option<u8>
     let row = vector_row(cpu)?;
     let start = row.cursor.load(Ordering::Relaxed) as usize;
     let (vector, next) = assign_vector_in(&row.slots, slot, start)?;
-    // `next` is below DEVICE_VECTOR_COUNT (217), which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`next` is below DEVICE_VECTOR_COUNT (217), which fits u32"
+    )]
     row.cursor.store(next as u32, Ordering::Relaxed);
     Some(vector)
 }
@@ -294,8 +297,10 @@ pub fn release_vector(cpu: usize, vector: u8)
     };
     let cursor = row.cursor.load(Ordering::Relaxed) as usize;
     let cursor = release_vector_in(&row.slots, index, cursor);
-    // The cursor is below DEVICE_VECTOR_COUNT (217), which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the cursor is below DEVICE_VECTOR_COUNT (217), which fits u32"
+    )]
     row.cursor.store(cursor as u32, Ordering::Relaxed);
 }
 

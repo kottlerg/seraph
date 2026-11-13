@@ -67,8 +67,10 @@ pub unsafe fn carve_page(head: &AtomicU64, page: *mut u8)
 pub unsafe fn push_chunk(head: &AtomicU64, chunk: *mut u8)
 {
     let next = head.load(Ordering::Relaxed);
-    // cast_ptr_alignment: a chunk is CHUNK_BYTES-aligned within its page.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "a chunk is CHUNK_BYTES-aligned within its page"
+    )]
     // SAFETY: caller contract.
     unsafe {
         chunk.cast::<u64>().write_volatile(next);
@@ -90,8 +92,10 @@ pub unsafe fn pop_chunk(head: &AtomicU64) -> Option<*mut u8>
         return None;
     }
     let chunk = top as *mut u8;
-    // cast_ptr_alignment: a chunk is CHUNK_BYTES-aligned within its page.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "a chunk is CHUNK_BYTES-aligned within its page"
+    )]
     // SAFETY: the chunk is on the list (caller contract), so its first word is
     // the link to the next.
     let link = unsafe { chunk.cast::<u64>().read_volatile() };

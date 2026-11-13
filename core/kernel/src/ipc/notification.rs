@@ -63,6 +63,11 @@ pub struct NotificationState
     pub lock: crate::sync::Spinlock,
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the fields that are not `Send`, the waiter queue and the wait-set back-pointer, \
+              are read and written only under the notification's `lock`"
+)]
 // SAFETY: the waiter queue and the wait-set back-pointer fields are read and
 // written only under `lock`; `bits` and `has_observer` are atomics used under
 // the Dekker protocol documented on `has_observer`. Moving the state between

@@ -991,8 +991,9 @@ extern "C" fn handler_entry(arg: u64) -> !
 /// and the fault declined, so the faulter does not re-fault for good.
 fn service_fault(args: &HandlerArgs, buf: *mut u64)
 {
-    // SAFETY: `args.aspace` is an address space this test created, not ktest's
-    // own, so the call changes nothing ktest runs on.
+    // SAFETY: `args.aspace` is ktest's own address space (`setup` passes
+    // `ctx.aspace_cap`), and `RESERVED_VA` is a scratch VA (crate docs
+    // § Scratch VAs), so the span holds no Rust object or IPC page of ktest.
     let mapped = unsafe { mem_map(args.frame, args.aspace, RESERVED_VA, 0, 1, MAP_WRITABLE) };
     let disposition = match mapped
     {

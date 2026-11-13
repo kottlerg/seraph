@@ -587,10 +587,12 @@ fn serve_region_rounds(
 ///
 /// The bootstrap protocol is:
 ///
-/// * Round 1 (fixed, 4 caps, 3 data words)
-///   - caps: `[registry_ep, irq_range, rsdp_memory, dtb_memory]`
-///     (zero-slots pass through where the kernel minted none)
-///   - data: `[rsdp_page_base, dtb_page_base, dtb_size]`
+/// * Round 1 (variable, 1 to 4 caps, 4 data words)
+///   - caps: `registry_ep`, then those of `irq_range`, `rsdp_memory` and
+///     `dtb_memory` that are present, in that order (an absent one is left
+///     off, not sent as a zero slot)
+///   - data: `[presence bitmap (bit 0 IRQ, 1 RSDP, 2 DTB), rsdp_page_base,
+///     dtb_page_base, dtb_size]`
 /// * Round 2+ (variable, ≤4 caps, up to `MSG_DATA_WORDS_MAX` data words)
 ///   - `data[0]` = round kind (`APERTURE` / `ACPI_REGION` / `RAM_EXTENT` /
 ///     `MODULE`)

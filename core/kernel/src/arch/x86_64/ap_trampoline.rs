@@ -340,6 +340,10 @@ unsafe fn write_u32(tramp_virt: u64, offset: usize, val: u32)
 {
     let p = tramp_virt.wrapping_add(offset as u64) as *mut u8;
     let b = val.to_le_bytes();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a byte of one field at `p`, at a constant offset from it"
+    )]
     // SAFETY: `tramp_virt` is a valid writable virtual address within the direct map
     // (enforced by the caller), and `offset` is within the trampoline page bounds.
     unsafe {
@@ -359,6 +363,10 @@ unsafe fn write_u16(tramp_virt: u64, offset: usize, val: u16)
 {
     let p = tramp_virt.wrapping_add(offset as u64) as *mut u8;
     let b = val.to_le_bytes();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a byte of one field at `p`, at a constant offset from it"
+    )]
     // SAFETY: `tramp_virt` is a valid writable virtual address within the direct map
     // (enforced by the caller), and `offset` is within the trampoline page bounds.
     unsafe {
@@ -376,6 +384,10 @@ unsafe fn write_u64(tramp_virt: u64, offset: usize, val: u64)
 {
     let p = tramp_virt.wrapping_add(offset as u64) as *mut u8;
     let b = val.to_le_bytes();
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a byte of one field at `p`, at a constant offset from it"
+    )]
     // SAFETY: tramp_virt is valid direct-map address; offset within page; writes within bounds.
     unsafe {
         core::ptr::write_volatile(p.add(0), b[0]);
@@ -419,13 +431,16 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     // Patch: real-mode far-jmp target at 0x20 → [u32: AP_PAGE+0x90, u16: 0x0008]
     // cast_possible_truncation: ap_page is a SIPI vector << 12, always < 1 MiB; fits u32
     #[allow(clippy::cast_possible_truncation)]
-    // SAFETY: virt is direct-map address; write_u32/u16 write within page bounds.
+    // SAFETY: virt is direct-map address; write_u32 writes within page bounds.
     unsafe {
         write_u32(
             virt,
             TRAMP_PATCH_RM_FAR_JMP,
             ap_page.wrapping_add(0x90) as u32,
         );
+    }
+    // SAFETY: virt is direct-map address; write_u16 writes within page bounds.
+    unsafe {
         write_u16(virt, TRAMP_PATCH_RM_FAR_JMP + 4, 0x0008);
     }
 
@@ -475,13 +490,16 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     // Patch: LM64 far-jmp target at 0xF8 → [u32: AP_PAGE+0x100, u16: 0x0010]
     // cast_possible_truncation: ap_page is always < 1 MiB; fits u32
     #[allow(clippy::cast_possible_truncation)]
-    // SAFETY: virt is direct-map address; writes within page bounds.
+    // SAFETY: virt is direct-map address; write_u32 writes within page bounds.
     unsafe {
         write_u32(
             virt,
             TRAMP_PATCH_LM64_FAR_JMP,
             ap_page.wrapping_add(0x100) as u32,
         );
+    }
+    // SAFETY: virt is direct-map address; write_u16 writes within page bounds.
+    unsafe {
         write_u16(virt, TRAMP_PATCH_LM64_FAR_JMP + 4, 0x0010);
     }
 }
@@ -516,6 +534,11 @@ pub unsafe fn setup_ap_params(
     let virt = super::paging::direct_map_base().wrapping_add(ap_trampoline_phys);
     let base = virt.wrapping_add(TRAMP_PARAMS as u64);
 
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every call writes a field of the trampoline page's parameter block, at a \
+                  constant offset from its base, through the direct map"
+    )]
     // SAFETY: base is direct-map address; writes within parameter block bounds.
     unsafe {
         write_u32(base, PARAM_ROOT, root_phys);
@@ -594,6 +617,11 @@ pub unsafe fn start_ap(
             ist1_top,
             ist2_top,
         );
+    }
+    // SAFETY: this function's contract (Phase 3-8 active, setup_trampoline
+    // called) covers interrupts::start_ap's, and setup_ap_params above wrote
+    // this AP's parameters.
+    unsafe {
         super::interrupts::start_ap(apic_id, trampoline_pa);
     }
     true

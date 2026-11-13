@@ -579,9 +579,14 @@ const IA32_KERNEL_GS_BASE: u32 = 0xC000_0102;
 #[cfg(not(test))]
 pub unsafe fn install_percpu(addr: u64)
 {
-    // SAFETY: IA32_GS_BASE is a valid MSR on all x86-64 CPUs; ring 0.
+    // SAFETY: IA32_GS_BASE is a valid MSR on all x86-64 CPUs; ring 0; addr
+    // names this CPU's PerCpuData (caller's contract).
     unsafe {
         write_msr(IA32_GS_BASE, addr);
+    }
+    // SAFETY: IA32_KERNEL_GS_BASE is a valid MSR on all x86-64 CPUs; ring 0;
+    // 0 is the user GS base before the first ring-3 entry.
+    unsafe {
         write_msr(IA32_KERNEL_GS_BASE, 0);
     }
 }
@@ -631,9 +636,12 @@ pub fn current_cpu() -> u32
 #[inline]
 pub unsafe fn set_kernel_trap_stack(stack_top: u64)
 {
-    // SAFETY: caller guarantees stack_top is a valid kernel stack pointer.
+    // SAFETY: ring 0; caller guarantees stack_top is a valid kernel stack pointer.
     unsafe {
         super::gdt::set_rsp0(stack_top);
+    }
+    // SAFETY: as for set_rsp0: ring 0, stack_top a valid kernel stack pointer.
+    unsafe {
         super::syscall::set_kernel_rsp(stack_top);
     }
 }

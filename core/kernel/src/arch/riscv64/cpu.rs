@@ -272,16 +272,17 @@ pub fn current_cpu() -> u32
     #[cfg(not(test))]
     {
         let tp: u64;
-        // SAFETY: reading tp is always safe; install_percpu ensures it points
-        // to a valid PerCpuData with cpu_id at offset 0.
+        // SAFETY: reading tp is always safe.
         unsafe {
             core::arch::asm!(
                 "mv {}, tp",
                 out(reg) tp,
                 options(nostack, nomem),
             );
-            *(tp as *const u32)
         }
+        // SAFETY: install_percpu ensures tp points to a valid PerCpuData with
+        // cpu_id at offset 0.
+        unsafe { *(tp as *const u32) }
     }
     #[cfg(test)]
     {

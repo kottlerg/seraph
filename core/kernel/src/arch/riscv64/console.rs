@@ -76,11 +76,15 @@ pub unsafe fn rebase_serial(new_base: u64)
 pub unsafe fn serial_init(phys_base: u64)
 {
     // SAFETY: single-threaded Phase 1; called exactly once.
-    unsafe {
-        UART_PHYS = phys_base;
-        UART_BASE = phys_base;
-    }
+    unsafe { UART_PHYS = phys_base };
+    // SAFETY: as for UART_PHYS: single-threaded Phase 1, called once.
+    unsafe { UART_BASE = phys_base };
     let base = phys_base as *mut u8;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a register of the UART at `base`, at a constant offset, \
+                  which the caller's contract makes accessible"
+    )]
     // SAFETY: UART MMIO region is valid at base; volatile writes configure the 16550.
     unsafe {
         // IER = 0: disable all interrupts.
@@ -106,13 +110,17 @@ pub unsafe fn serial_write_byte(byte: u8)
     // SAFETY: UART_BASE is valid (set by serial_init or rebase_serial).
     let base = unsafe { UART_BASE } as *mut u8;
 
+    // SAFETY: LSR is the register at offset 5 of the UART's register window.
+    let lsr = unsafe { base.add(UART_LSR) };
     // Spin on LSR bit 5 (THRE — Transmit Holding Register Empty).
     // SAFETY: UART MMIO region is valid; LSR is a status register at offset 5.
-    while unsafe { core::ptr::read_volatile(base.add(UART_LSR)) } & 0x20 == 0
+    while unsafe { core::ptr::read_volatile(lsr) } & 0x20 == 0
     {}
 
+    // SAFETY: TX is the register at offset 0 of the UART's register window.
+    let tx = unsafe { base.add(UART_TX) };
     // SAFETY: UART MMIO region is valid; writing to TX register transmits the byte.
     unsafe {
-        core::ptr::write_volatile(base.add(UART_TX), byte);
+        core::ptr::write_volatile(tx, byte);
     }
 }

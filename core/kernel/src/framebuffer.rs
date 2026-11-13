@@ -243,8 +243,15 @@ impl FramebufferWriter
 
                 // SAFETY: pixel is within the framebuffer; offset is bounded
                 // by stride * height (caller ensures valid mapping).
+                let p = unsafe { self.base.add(offset) };
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every write is to one of the four bytes of the pixel at `p`, at a \
+                              constant offset from it, inside the framebuffer mapping"
+                )]
+                // SAFETY: the pixel's four bytes at `p` lie within the
+                // framebuffer, which the caller keeps mapped and writable.
                 unsafe {
-                    let p = self.base.add(offset);
                     match self.format
                     {
                         PixelFormat::Rgbx8 =>
@@ -294,10 +301,14 @@ impl FramebufferWriter
         let last_row_start = (last_row as usize).wrapping_mul(row_bytes);
 
         // Copy rows 1..max_rows → 0..max_rows-1.
+        // SAFETY: `new` refuses a framebuffer with no cell row, so one row's
+        // `row_bytes` lie within the framebuffer's `stride * height` bytes and
+        // the offset ends inside the allocation or one past its end.
+        let second_row = unsafe { self.base.add(row_bytes) };
         // SAFETY: src and dst are both within the framebuffer allocation; the
         // copy is a single forward memmove of (max_rows-1)*row_bytes bytes.
         unsafe {
-            core::ptr::copy(self.base.add(row_bytes), self.base, last_row_start);
+            core::ptr::copy(second_row, self.base, last_row_start);
         }
 
         // Zero the last row.
@@ -305,9 +316,12 @@ impl FramebufferWriter
         let last = unsafe { self.base.add(last_row_start) };
         for i in 0..row_bytes
         {
-            // SAFETY: the last row's `row_bytes` bytes lie within the framebuffer.
+            // SAFETY: i < row_bytes, and the last row's `row_bytes` bytes lie
+            // within the framebuffer.
+            let byte = unsafe { last.add(i) };
+            // SAFETY: `byte` lies in the last row, inside the framebuffer.
             unsafe {
-                core::ptr::write_volatile(last.add(i), 0);
+                core::ptr::write_volatile(byte, 0);
             }
         }
 
@@ -408,11 +422,11 @@ mod tests
         // SAFETY: buf is writable for stride * height bytes.
         let mut fb = unsafe { FramebufferWriter::new(&info) }.expect("one cell row is usable");
         // SAFETY: as above.
-        unsafe {
-            fb.write_byte(b'#');
-            fb.write_byte(b'\n');
-            fb.write_byte(b'\n');
-        }
+        unsafe { fb.write_byte(b'#') };
+        // SAFETY: as above.
+        unsafe { fb.write_byte(b'\n') };
+        // SAFETY: as above.
+        unsafe { fb.write_byte(b'\n') };
         assert_eq!((fb.row, fb.col), (0, 0));
         assert!(buf.iter().all(|&b| b == 0));
     }

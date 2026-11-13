@@ -195,10 +195,13 @@ fn eid_row(cpu: usize) -> Option<&'static [SlotEntry]>
     }
     let row_len = IMSIC_IDS.load(Ordering::Relaxed) as usize + 1;
     let start = cpu.checked_mul(row_len)?;
-    // SAFETY: the slab holds `row_len` zero-initialised entries (an atomic, for
-    // which zero is a valid value and a free slot) for each of the boot CPUs,
-    // and `cpu` is below their count; the slab is never freed.
-    Some(unsafe { core::slice::from_raw_parts(base.add(start), row_len) })
+    // SAFETY: the slab holds `row_len` entries for each of the boot CPUs, and
+    // `cpu` is below their count, so row `cpu` starts inside it.
+    let row = unsafe { base.add(start) };
+    // SAFETY: `row` is followed by `row_len` zero-initialised entries (an
+    // atomic, for which zero is a valid value and a free slot) of the slab,
+    // which is never freed.
+    Some(unsafe { core::slice::from_raw_parts(row, row_len) })
 }
 
 /// Halt the boot unless the hart with hart id `hart` can be an APLIC MSI target:
@@ -257,15 +260,17 @@ pub unsafe fn init_bsp(bsp_hart: u32)
 
     // SAFETY: the domain's window was checked above to hold every register
     // written here; the direct map covers it (below the RAM ceiling).
-    unsafe {
-        aplic_write(APLIC_DOMAINCFG, DOMAINCFG_DM);
-        for source in 1..=sources
-        {
-            aplic_write(APLIC_CLRIENUM, source);
-            aplic_write(sourcecfg_offset(source), 0);
-        }
-        aplic_write(APLIC_DOMAINCFG, DOMAINCFG_IE | DOMAINCFG_DM);
+    unsafe { aplic_write(APLIC_DOMAINCFG, DOMAINCFG_DM) };
+    for source in 1..=sources
+    {
+        // SAFETY: as for `domaincfg`: `clrienum` lies in the checked window.
+        unsafe { aplic_write(APLIC_CLRIENUM, source) };
+        // SAFETY: `source` is at most `sources`, whose `sourcecfg` registers
+        // the window checked above holds.
+        unsafe { aplic_write(sourcecfg_offset(source), 0) };
     }
+    // SAFETY: as for the first `domaincfg` write.
+    unsafe { aplic_write(APLIC_DOMAINCFG, DOMAINCFG_IE | DOMAINCFG_DM) };
     if aplic_read(APLIC_DOMAINCFG) & DOMAINCFG_DM == 0
     {
         crate::fatal("riscv64: the APLIC domain does not support MSI delivery mode");
@@ -293,18 +298,23 @@ pub unsafe fn init_hart(hart: u32)
         .step_by(2)
         .zip((ISEL_EIE0..).step_by(2))
         .take(words);
-    // SAFETY: caller contract; each select names a register Ssaia defines for
-    // a file of this identity count.
-    unsafe {
-        imsic_write(ISEL_EIDELIVERY, 0);
-        imsic_write(ISEL_EITHRESHOLD, 0);
-        for (eip, eie) in selects
-        {
-            imsic_write(eip, 0);
-            imsic_write(eie, u64::MAX);
-        }
-        imsic_write(ISEL_EIDELIVERY, 1);
+    // SAFETY: caller contract; `eidelivery` is a register Ssaia defines for
+    // every file.
+    unsafe { imsic_write(ISEL_EIDELIVERY, 0) };
+    // SAFETY: caller contract; `eithreshold` is a register Ssaia defines for
+    // every file.
+    unsafe { imsic_write(ISEL_EITHRESHOLD, 0) };
+    for (eip, eie) in selects
+    {
+        // SAFETY: caller contract; `eip` is one of the `words` pending-bit
+        // registers Ssaia defines for a file of this identity count.
+        unsafe { imsic_write(eip, 0) };
+        // SAFETY: caller contract; `eie` is one of the `words` enable-bit
+        // registers Ssaia defines for a file of this identity count.
+        unsafe { imsic_write(eie, u64::MAX) };
     }
+    // SAFETY: as for the first `eidelivery` write.
+    unsafe { imsic_write(ISEL_EIDELIVERY, 1) };
 }
 
 // ── Routing ───────────────────────────────────────────────────────────────────
@@ -405,13 +415,13 @@ pub fn route(source: u32, mode: u32) -> Result<crate::irq::Target, crate::irq::R
         level: aplic_mode_is_level(source_mode),
     };
     word.store(route.pack(), Ordering::Relaxed);
+    // SAFETY: `clrienum` lies in the window init_bsp checked.
+    unsafe { aplic_write(APLIC_CLRIENUM, source) };
     // SAFETY: an implemented source's registers lie in the window init_bsp
     // checked.
-    unsafe {
-        aplic_write(APLIC_CLRIENUM, source);
-        aplic_write(sourcecfg_offset(source), source_mode);
-        aplic_write(target_offset(source), target);
-    }
+    unsafe { aplic_write(sourcecfg_offset(source), source_mode) };
+    // SAFETY: as for `sourcecfg`: the source is implemented.
+    unsafe { aplic_write(target_offset(source), target) };
     Ok(taken)
 }
 
@@ -429,12 +439,11 @@ pub fn unroute(source: u32)
     {
         return;
     };
+    // SAFETY: `clrienum` lies in the window init_bsp checked.
+    unsafe { aplic_write(APLIC_CLRIENUM, source) };
     // SAFETY: an implemented source's registers lie in the window init_bsp
     // checked.
-    unsafe {
-        aplic_write(APLIC_CLRIENUM, source);
-        aplic_write(sourcecfg_offset(source), 0);
-    }
+    unsafe { aplic_write(sourcecfg_offset(source), 0) };
     let word = route_word.swap(0, Ordering::Relaxed);
     if let Some(route) = SourceRoute::unpack(word)
     {
@@ -505,14 +514,13 @@ pub fn mask(source: u32)
     if implemented(source)
     {
         // SAFETY: an implemented source; the register lies in the checked window.
-        // The fence has no operands and changes no register or memory; it is
-        // left without `nomem` so the compiler keeps later stores after it.
-        unsafe {
-            aplic_write(APLIC_CLRIENUM, source);
-            // `fence o,w`: the APLIC write above is performed before this
-            // hart's later memory writes.
-            core::arch::asm!("fence o,w", options(nostack, preserves_flags));
-        }
+        unsafe { aplic_write(APLIC_CLRIENUM, source) };
+        // `fence o,w`: the APLIC write above is performed before this hart's
+        // later memory writes.
+        // SAFETY: the fence has no operands and changes no register or memory;
+        // it is left without `nomem` so the compiler keeps later stores after
+        // it.
+        unsafe { core::arch::asm!("fence o,w", options(nostack, preserves_flags)) };
     }
 }
 
@@ -532,19 +540,18 @@ pub fn unmask(source: u32)
     {
         return;
     };
-    // SAFETY: an implemented source; the registers lie in the checked window.
-    // The fence has no operands and changes no register or memory; it is
-    // left without `nomem` so the compiler keeps later loads after it.
-    unsafe {
-        aplic_write(APLIC_SETIENUM, source);
-        if route.level
-        {
-            aplic_write(APLIC_SETIPNUM_LE, source);
-        }
-        // `fence o,r`: the APLIC writes above are performed before this hart's
-        // later memory reads.
-        core::arch::asm!("fence o,r", options(nostack, preserves_flags));
+    // SAFETY: an implemented source; the register lies in the checked window.
+    unsafe { aplic_write(APLIC_SETIENUM, source) };
+    if route.level
+    {
+        // SAFETY: as for `setienum`: the register lies in the checked window.
+        unsafe { aplic_write(APLIC_SETIPNUM_LE, source) };
     }
+    // `fence o,r`: the APLIC writes above are performed before this hart's
+    // later memory reads.
+    // SAFETY: the fence has no operands and changes no register or memory; it
+    // is left without `nomem` so the compiler keeps later loads after it.
+    unsafe { core::arch::asm!("fence o,r", options(nostack, preserves_flags)) };
 }
 
 /// Claim the executing hart's highest-priority pending identity (`stopei`) and

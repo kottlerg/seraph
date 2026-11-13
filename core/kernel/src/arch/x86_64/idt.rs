@@ -489,11 +489,11 @@ pub(super) unsafe extern "C" fn common_exception_handler(
             // (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`); its observers are
             // posted below. Reached only on the terminal path; normal
             // thread_exit never lands here.
-            // SAFETY: tcb validated non-null; address_space may be null for
-            // kernel threads, which record_aspace_terminal_fault handles; no
-            // death_lock is held.
-            let aspace_post =
-                unsafe { crate::sched::record_aspace_terminal_fault((*tcb).address_space, reason) };
+            // SAFETY: tcb validated non-null.
+            let aspace = unsafe { (*tcb).address_space };
+            // SAFETY: address_space may be null for kernel threads, which
+            // record_aspace_terminal_fault handles; no death_lock is held.
+            let aspace_post = unsafe { crate::sched::record_aspace_terminal_fault(aspace, reason) };
 
             // SAFETY: tcb validated non-null.
             let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
@@ -1202,9 +1202,14 @@ extern "C" fn nm_handler()
         let prev_area = unsafe { (*prev).extended.area };
         if !prev_area.is_null()
         {
-            // SAFETY: ring 0; prev_area satisfies XSAVE alignment and size.
+            // SAFETY: ring 0; the live regs belong to prev, saved below,
+            // and the restore below then loads tcb's.
             unsafe {
                 super::fpu::cr0_clear_ts();
+            }
+            // SAFETY: prev_area satisfies XSAVE alignment and size, and the
+            // live regs belong to prev, their owner.
+            unsafe {
                 super::fpu::save_to(prev_area);
             }
         }
@@ -1225,10 +1230,14 @@ extern "C" fn nm_handler()
         return;
     }
 
-    // SAFETY: ring 0; area is a valid XSAVE buffer; we hold logical
-    // ownership of the live regs (prev was swapped out atomically).
+    // SAFETY: ring 0; the restore below loads tcb's state, the thread that
+    // runs next.
     unsafe {
         super::fpu::cr0_clear_ts();
+    }
+    // SAFETY: area is a valid XSAVE buffer; we hold logical ownership of the
+    // live regs (prev was swapped out atomically).
+    unsafe {
         super::fpu::restore_from(area);
     }
     // Publish new ownership. Release pairs with the Acquire load in

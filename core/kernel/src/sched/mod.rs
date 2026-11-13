@@ -13,6 +13,23 @@
 
 // cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
 #![allow(clippy::cast_possible_truncation)]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 pub mod deadline_heap;
 pub mod run_queue;
@@ -2092,7 +2109,10 @@ unsafe fn watchdog_read_source(
             let queued = unsafe { waiters.contains(t) };
             SourceSnapshot::WaitSet { queued }
         }
-        _ => SourceSnapshot::None,
+        IpcThreadState::None | IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
+        {
+            SourceSnapshot::None
+        }
     }
 }
 
@@ -2373,22 +2393,29 @@ pub fn sleep_check_wakeups()
             let ipc_state = (*tcb).ipc_state;
             let blocked_on = (*tcb).blocked_on_object;
             let park_seq = (*tcb).park_seq.load(core::sync::atomic::Ordering::Relaxed);
-            debug_assert!(
-                matches!(ipc_state, thread::IpcThreadState::None)
-                    || (matches!(
-                        ipc_state,
-                        thread::IpcThreadState::BlockedOnNotification
-                            | thread::IpcThreadState::BlockedOnEventQueue
-                            | thread::IpcThreadState::BlockedOnSend
-                            | thread::IpcThreadState::BlockedOnRecv
-                            | thread::IpcThreadState::BlockedOnReply
-                            | thread::IpcThreadState::BlockedOnWaitSet
-                    ) && !blocked_on.is_null()),
-                "sleep_check_wakeups: tid={} popped with binding {:?}/{:p}",
-                (*tcb).thread_id,
-                ipc_state,
-                blocked_on
-            );
+            #[expect(
+                clippy::pointer_format,
+                reason = "the source address is printed only in an assertion message, which the \
+                          panic handler writes through the serial-only `console::panic_write_fmt`"
+            )]
+            {
+                debug_assert!(
+                    matches!(ipc_state, thread::IpcThreadState::None)
+                        || (matches!(
+                            ipc_state,
+                            thread::IpcThreadState::BlockedOnNotification
+                                | thread::IpcThreadState::BlockedOnEventQueue
+                                | thread::IpcThreadState::BlockedOnSend
+                                | thread::IpcThreadState::BlockedOnRecv
+                                | thread::IpcThreadState::BlockedOnReply
+                                | thread::IpcThreadState::BlockedOnWaitSet
+                        ) && !blocked_on.is_null()),
+                    "sleep_check_wakeups: tid={} popped with binding {:?}/{:p}",
+                    (*tcb).thread_id,
+                    ipc_state,
+                    blocked_on
+                );
+            }
             // A plain sleeper (no IPC source object) has no competing waker,
             // so claim it here: set wake_in_flight = 1 under the lock so a
             // concurrent dealloc_object(Thread) that lost the list race waits
@@ -2592,7 +2619,9 @@ pub fn sleep_check_wakeups()
             // of a listed park removes its entry. Never claim here: no
             // wake_in_flight pin and no source lock arbitrates such a
             // binding, so a claim could race its real waker.
-            _ => false,
+            crate::sched::thread::IpcThreadState::BlockedOnNotification
+            | crate::sched::thread::IpcThreadState::BlockedOnEventQueue
+            | crate::sched::thread::IpcThreadState::BlockedOnFault => false,
         };
 
         if claimed
@@ -3303,11 +3332,10 @@ pub unsafe fn idle_stack_top_for(cpu_id: usize) -> u64
 pub unsafe fn scheduler_for(id: usize) -> &'static PerCpuScheduler
 {
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    if id >= cpu_count
-    {
-        crate::kprintln!("scheduler_for: id={id} >= CPU_COUNT={cpu_count}");
-        panic!("scheduler_for: id out of range");
-    }
+    assert!(
+        id < cpu_count,
+        "scheduler_for: id={id} out of range (CPU_COUNT={cpu_count})"
+    );
     // SAFETY: id < CPU_COUNT (checked above); init, which the caller
     // guarantees ran, runs after init_per_cpu_storage.
     let sched_ptr = unsafe { scheduler_ptr(id) };
@@ -4214,12 +4242,13 @@ pub(crate) unsafe fn running_thread_stopped(this_cpu: usize) -> bool
     }
     // SAFETY: `current` cannot be freed while it is still installed on this
     // CPU, so cur is a valid TCB.
-    let state_ptr = unsafe { &raw const (*cur).state };
-    // The probe is a volatile read so a spin re-reads it, and the answer is
-    // confirmed under the lock.
-    // SAFETY: state_ptr points to a field of a valid TCB, aligned and
+    let state_ptr = unsafe { &raw const (*cur).state }.cast::<u8>();
+    // The probe is a volatile read of the state's discriminant byte
+    // (`ThreadState` is `#[repr(u8)]`) so a spin re-reads it, and the answer
+    // is confirmed under the lock.
+    // SAFETY: state_ptr points to the one byte of a field of a valid TCB,
     // initialised.
-    if unsafe { core::ptr::read_volatile(state_ptr) } != thread::ThreadState::Exited
+    if unsafe { core::ptr::read_volatile(state_ptr) } != thread::ThreadState::Exited as u8
     {
         return false;
     }
@@ -5584,7 +5613,9 @@ fn idle_pull_tick(
                 {
                     IdlePullStep::Remember(cpu)
                 }
-                other => other,
+                other @ (IdlePullStep::Pull(..)
+                | IdlePullStep::Remember(_)
+                | IdlePullStep::Forget) => other,
             }
         };
     }
@@ -6290,7 +6321,11 @@ pub unsafe fn enqueue_ready_thread(
         {
             thread::ThreadState::Exited => Some(ReadyLink::Exited),
             thread::ThreadState::Ready if (*tcb).start_seq == start_seq => None,
-            _ => Some(ReadyLink::Superseded),
+            thread::ThreadState::Ready
+            | thread::ThreadState::Created
+            | thread::ThreadState::Running
+            | thread::ThreadState::Blocked
+            | thread::ThreadState::Stopped => Some(ReadyLink::Superseded),
         }
     };
     if let Some(refusal) = refusal
@@ -6603,11 +6638,10 @@ pub unsafe fn schedule(requeue: Requeue)
 
     let cpu = crate::arch::current::cpu::current_cpu() as usize;
     let cpu_count = CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
-    if cpu >= cpu_count
-    {
-        crate::kprintln!("schedule: current_cpu()={cpu} >= CPU_COUNT={cpu_count}");
-        panic!("schedule: current_cpu out of range");
-    }
+    assert!(
+        cpu < cpu_count,
+        "schedule: current_cpu()={cpu} out of range (CPU_COUNT={cpu_count})"
+    );
     // SAFETY: cpu < CPU_COUNT validated above; scheduler slab initialised by init().
     let sched_ptr = unsafe { scheduler_ptr(cpu) };
     // SAFETY: the slot holds this CPU's initialised scheduler. A shared reference:

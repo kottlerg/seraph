@@ -210,6 +210,11 @@ impl KernelObjectHeader
     /// [`crate::cap::transfer::check_transfer_ref_limits`] checked first. Every
     /// other new capability slot, a `SYS_CAP_MOVE` destination included, takes
     /// its reference through [`Self::try_inc_ref`] instead.
+    #[expect(
+        clippy::pointer_format,
+        reason = "the object address is printed only in an assertion message, which the panic \
+                  handler writes through the serial-only `console::panic_write_fmt`"
+    )]
     pub fn inc_ref(&self)
     {
         let prev = self.ref_count.fetch_add(1, Ordering::Relaxed);
@@ -301,6 +306,11 @@ impl KernelObjectHeader
     /// that point. The decrement is a Release, and the one that reaches 0 is
     /// followed by an Acquire fence, so that freer observes every write the
     /// other owners made before releasing theirs.
+    #[expect(
+        clippy::pointer_format,
+        reason = "the object addresses are printed only in an assertion message, which the panic \
+                  handler writes through the serial-only `console::panic_write_fmt`"
+    )]
     pub fn dec_ref(&self) -> u32
     {
         let prev = self.ref_count.fetch_sub(1, Ordering::Release);
@@ -705,7 +715,17 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
             // SAFETY: caller contract; the tag names an `Interrupt`, header at offset 0.
             unsafe { &(*hdr.as_ptr().cast::<InterruptObject>()).lineage }
         }
-        _ => crate::fatal("lineage_of: not a range-capability object"),
+        ObjectType::Memory
+        | ObjectType::SchedControl
+        | ObjectType::Thread
+        | ObjectType::AddressSpace
+        | ObjectType::CSpaceObj
+        | ObjectType::Endpoint
+        | ObjectType::Notification
+        | ObjectType::EventQueue
+        | ObjectType::WaitSet
+        | ObjectType::SbiControl
+        | ObjectType::ArenaPage => crate::fatal("lineage_of: not a range-capability object"),
     }
 }
 
@@ -2703,7 +2723,17 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
                 core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<AddressSpaceObject>()).deferred_next)
             }
         }
-        _ => crate::fatal("deferred reclaim: object type carries no link"),
+        ObjectType::Memory
+        | ObjectType::Mmio
+        | ObjectType::Interrupt
+        | ObjectType::IoPort
+        | ObjectType::SchedControl
+        | ObjectType::Endpoint
+        | ObjectType::Notification
+        | ObjectType::EventQueue
+        | ObjectType::WaitSet
+        | ObjectType::SbiControl
+        | ObjectType::ArenaPage => crate::fatal("deferred reclaim: object type carries no link"),
     }
 }
 
@@ -2776,7 +2806,17 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
             // pinned idle thread's drain, per the contract).
             unsafe { push_deferred_reclaim(cpu, obj) };
         }
-        _ =>
+        ObjectType::Memory
+        | ObjectType::Mmio
+        | ObjectType::Interrupt
+        | ObjectType::IoPort
+        | ObjectType::SchedControl
+        | ObjectType::Endpoint
+        | ObjectType::Notification
+        | ObjectType::EventQueue
+        | ObjectType::WaitSet
+        | ObjectType::SbiControl
+        | ObjectType::ArenaPage =>
         {
             // SAFETY: refcount 0; no other references exist; no lock held
             // (contract).
@@ -3044,7 +3084,8 @@ unsafe fn unlink_dying_waiter(
             // SAFETY: tcb is a valid TCB (contract); the source lock is held.
             unsafe { waiters.remove(tcb) };
         }
-        _ =>
+        // Not a source-blocking state: no wait queue holds the thread.
+        IpcThreadState::None | IpcThreadState::BlockedOnReply | IpcThreadState::BlockedOnFault =>
         {}
     }
 }
@@ -3470,7 +3511,17 @@ pub unsafe fn object_for_new_slot(
                         .fetch_sub(1, Ordering::AcqRel);
                 })
         }
-        _ =>
+        CapTag::Null
+        | CapTag::Memory
+        | CapTag::AddressSpace
+        | CapTag::Endpoint
+        | CapTag::Notification
+        | CapTag::EventQueue
+        | CapTag::Thread
+        | CapTag::CSpace
+        | CapTag::WaitSet
+        | CapTag::SchedControl
+        | CapTag::SbiControl =>
         {
             // A new slot is the reference userspace can multiply, so it is
             // refused at the ceiling (`REF_COUNT_LIMIT`).

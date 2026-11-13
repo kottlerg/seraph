@@ -513,10 +513,15 @@ pub unsafe fn populate_buddy(alloc: &mut BuddyAllocator)
     {
         let span_top = DIRECT_MAP_TOP.load(Ordering::Relaxed);
         let extent = fdt_extent(dtb_phys, span_top, || {
-            let ptr = super::paging::phys_to_virt(dtb_phys) as *const [u8; FDT_SIZE_PREFIX];
-            // SAFETY: `fdt_extent` calls this only when the header lies below
-            // `span_top`, which the active direct map covers.
-            unsafe { core::ptr::read_volatile(ptr) }
+            // Byte by byte: nothing guarantees the blob's base a wider
+            // alignment.
+            let prefix = super::paging::phys_to_virt(dtb_phys) as *const u8;
+            core::array::from_fn(|i| {
+                // SAFETY: `fdt_extent` calls this only when the header lies
+                // below `span_top`, which the active direct map covers, and
+                // `i < FDT_SIZE_PREFIX`.
+                unsafe { core::ptr::read_volatile(prefix.wrapping_add(i)) }
+            })
         })
         .unwrap_or_else(|e| dtb_fatal(dtb_phys, &e));
         DTB_EXTENT[0].store(extent.0, Ordering::Relaxed);

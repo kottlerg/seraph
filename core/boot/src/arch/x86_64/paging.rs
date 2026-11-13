@@ -30,10 +30,13 @@ use crate::paging::{MapError, PageFlags, PageTableBuilder};
 static NEGOTIATED_LEVELS: AtomicU8 = AtomicU8::new(PagingDepth::Four as u8);
 
 /// The paging depth the bootloader builds tables for and installs at handoff.
+#[expect(
+    clippy::unreachable,
+    reason = "the decode of NEGOTIATED_LEVELS cannot fail: its initialiser and its one store, in \
+              negotiate_paging, write only PagingDepth discriminants"
+)]
 pub(crate) fn negotiated_depth() -> PagingDepth
 {
-    // The store site only writes PagingDepth discriminants, so the decode
-    // cannot fail.
     match PagingDepth::from_levels(NEGOTIATED_LEVELS.load(Ordering::Relaxed))
     {
         Some(depth) => depth,

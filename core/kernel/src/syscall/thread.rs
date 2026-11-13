@@ -11,11 +11,16 @@
 //! 3. Add a dispatch arm to `core/kernel/src/syscall/mod.rs`.
 //! 4. Add a userspace wrapper to `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: the u64→usize casts of trap-frame byte counts
-// are lossless (Seraph is 64-bit only). Value args with a range contract
-// (priority levels, split points, CPU IDs) are narrowed with `try_from` and
-// rejected when out of range.
-#![allow(clippy::cast_possible_truncation)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_possible_truncation,
+        reason = "the u64→usize casts of trap-frame byte counts are lossless (Seraph is 64-bit \
+                  only). Value args with a range contract (priority levels, split points, CPU IDs) \
+                  are narrowed with `try_from` and rejected when out of range; the casts are in \
+                  the cfg(not(test)) handlers, so the lint fires outside the host test build alone"
+    )
+)]
 
 #[cfg(not(test))]
 use super::UserFrame;
@@ -78,8 +83,6 @@ pub fn sys_thread_configure(tf: UserFrame) -> Result<u64, SyscallError>
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Thread; pointer is valid.
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -226,9 +229,7 @@ pub fn sys_thread_start(tf: UserFrame) -> Result<u64, SyscallError>
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -462,9 +463,7 @@ pub fn sys_thread_stop(tf: UserFrame) -> Result<u64, SyscallError>
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -847,10 +846,8 @@ unsafe fn slot_names_thread(
     // tag, generation and rights.
     let pin = unsafe { super::lookup_cap(cspace, thread_idx, ThreadRights::CONTROL) }.ok()?;
     let obj = pin.object?;
-    // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
     // SAFETY: `pin` keeps the object live, and a Thread slot's object is a
     // ThreadObject.
-    #[allow(clippy::cast_ptr_alignment)]
     let names = unsafe { core::ptr::eq((*obj.as_ptr().cast::<ThreadObject>()).tcb, target_tcb) };
     names.then_some(pin)
 }
@@ -1135,9 +1132,11 @@ unsafe fn keep_wake(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: Ca
 ///
 /// # Safety
 /// As for [`cancel_ipc_block`].
-// too_many_lines: flat dispatch over every `IpcThreadState` variant; splitting
-// adds no clarity (each arm is independent and short).
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat dispatch over every `IpcThreadState` variant; splitting adds no clarity (each \
+              arm is independent and short)"
+)]
 #[cfg(not(test))]
 unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: CancelMode)
 -> bool
@@ -1271,8 +1270,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             };
             if let Some(held) = held
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let ep = blocked_on.cast::<EndpointState>();
                 #[expect(
                     clippy::multiple_unsafe_ops_per_block,
@@ -1363,8 +1365,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             };
             if let Some(held) = held
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let ep = blocked_on.cast::<EndpointState>();
                 #[expect(
                     clippy::multiple_unsafe_ops_per_block,
@@ -1416,8 +1421,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             // Ownership, #317).
             if !blocked_on.is_null()
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
                 // SAFETY: tcb is valid (contract).
                 let lock = unsafe { &(*tcb).sched_lock };
@@ -1529,8 +1537,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             // disposition — leave it untouched.
             if !blocked_on.is_null()
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let server = blocked_on.cast::<crate::sched::thread::ThreadControlBlock>();
                 // SAFETY: tcb is valid (contract).
                 let lock = unsafe { &(*tcb).sched_lock };
@@ -1603,8 +1614,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             };
             if let Some(held) = held
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let sig = blocked_on.cast::<NotificationState>();
                 // SAFETY: `held` holds sig.lock on the live notification the
                 // binding names, which serialises its waiter queue.
@@ -1660,8 +1674,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             };
             if let Some(held) = held
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let eq = blocked_on.cast::<EventQueueState>();
                 // SAFETY: `held` holds eq.lock on the live event queue the
                 // binding names, which serialises its waiter queue.
@@ -1711,8 +1728,11 @@ unsafe fn cancel_park(tcb: *mut crate::sched::thread::ThreadControlBlock, mode: 
             };
             if let Some(held) = held
             {
-                // cast_ptr_alignment: blocked_on_object stores type-erased pointer; original allocation guarantees alignment.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "blocked_on_object stores type-erased pointer; original allocation \
+                              guarantees alignment"
+                )]
                 let ws = blocked_on.cast::<WaitSetState>();
                 // SAFETY: `held` holds ws.lock on the live wait set the
                 // binding names, which serialises its waiter queue.
@@ -1829,9 +1849,7 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -1857,8 +1875,6 @@ pub fn sys_thread_set_fault_handler(tf: UserFrame) -> Result<u64, SyscallError>
         Some(slot) =>
         {
             let obj = slot.object.ok_or(SyscallError::InvalidCapability)?;
-            // cast_ptr_alignment: header at offset 0 of EndpointObject; allocator guarantees alignment.
-            #[allow(clippy::cast_ptr_alignment)]
             let p = obj.as_ptr().cast::<EndpointObject>();
             (p, slot.badge)
         }
@@ -1983,9 +1999,7 @@ unsafe fn thread_with_rights(
     // SAFETY: cspace valid per contract; lookup_cap checks tag and rights.
     let pin = unsafe { super::lookup_cap(cspace, idx, rights) }?;
     let obj = pin.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
     // SAFETY: tag confirmed Thread; `pin` keeps the ThreadObject live.
-    #[allow(clippy::cast_ptr_alignment)]
     let tcb = unsafe { (*obj.as_ptr().cast::<ThreadObject>()).tcb };
     if tcb.is_null()
     {
@@ -2240,9 +2254,7 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace validated; lookup_cap checks the tag.
     let sched_slot = unsafe { super::lookup_cap(caller_cspace, sched_idx, SchedRights::NONE) }?;
     let sched_obj = sched_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: header at offset 0 of SchedControlObject; allocator guarantees alignment.
     // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
-    #[allow(clippy::cast_ptr_alignment)]
     let sched = unsafe { &*(sched_obj.as_ptr().cast::<SchedControlObject>()) };
     if priority < sched.min || priority > sched.max
     {
@@ -2255,9 +2267,7 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -2381,9 +2391,7 @@ pub fn sys_sched_split(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: caller_cspace validated; lookup_cap checks the tag (presence-only).
         let slot = unsafe { super::lookup_cap(caller_cspace, sched_handle, SchedRights::NONE) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
         // SAFETY: tag confirmed SchedControl; pointer is a valid SchedControlObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let sc = unsafe { &*(obj_ptr.as_ptr().cast::<SchedControlObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
@@ -2514,9 +2522,7 @@ pub fn sys_thread_set_affinity(tf: UserFrame) -> Result<u64, SyscallError>
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -2686,9 +2692,7 @@ impl AspacePin
         let thread_slot =
             unsafe { super::lookup_cap(caller_cspace, thread_idx, ThreadRights::CONTROL) }?;
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; thread_slot pins the object.
-        #[allow(clippy::cast_ptr_alignment)]
         let target_tcb = unsafe { (*obj.as_ptr().cast::<ThreadObject>()).tcb };
         if target_tcb.is_null()
         {
@@ -2704,9 +2708,6 @@ impl AspacePin
     /// The pinned address space.
     fn aspace(&self) -> &crate::mm::address_space::AddressSpace
     {
-        // cast_ptr_alignment: the header is at offset 0 of the page-aligned
-        // AddressSpaceObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let obj = self
             .0
             .as_ptr()
@@ -2919,9 +2920,7 @@ pub fn sys_thread_read_regs(tf: UserFrame) -> Result<u64, RestartableError>
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };
@@ -3044,9 +3043,7 @@ pub fn sys_thread_write_regs(tf: UserFrame) -> Result<u64, RestartableError>
 
     let target_tcb = {
         let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
         // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-        #[allow(clippy::cast_ptr_alignment)]
         let to = unsafe { &*(obj.as_ptr().cast::<ThreadObject>()) };
         to.tcb
     };

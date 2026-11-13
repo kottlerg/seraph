@@ -208,10 +208,12 @@ impl TrapFrame
     /// trap dispatcher advances an unchanged `sepc` past the `ecall` after a
     /// completed syscall, and leaves a rewritten one (a fault handler's
     /// `SYS_THREAD_WRITE_REGS`) to stand.
-    // unused_self: the method is the riscv64 half of a cross-architecture
-    // `TrapFrame` method (core/kernel/docs/arch-interface.md § `trap_frame`),
-    // whose x86-64 half writes `rip`; riscv64 needs no write.
-    #[allow(clippy::unused_self)]
+    #[expect(
+        clippy::unused_self,
+        reason = "the method is the riscv64 half of a cross-architecture `TrapFrame` method \
+                  (core/kernel/docs/arch-interface.md § `trap_frame`), whose x86-64 half writes \
+                  `rip`; riscv64 needs no write"
+    )]
     pub fn complete_rewound_syscall(&mut self, _at: u64) {}
 
     /// Validate and sanitize a user-supplied register snapshot before it is

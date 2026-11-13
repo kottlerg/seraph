@@ -26,11 +26,17 @@
 //! 4. Add a dispatch arm in `core/kernel/src/syscall/mod.rs`.
 //! 5. Add a userspace wrapper in `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: user-supplied u64 trap-frame args are narrowed to the
-// ABI's u32 IRQ ids, keeping the low 32 bits (upper bits are discarded). The
-// remaining narrowings (u64->usize on 64-bit targets, the IoPort u32->u16
-// halves) are lossless or range-checked beside the cast.
-#![allow(clippy::cast_possible_truncation)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_possible_truncation,
+        reason = "user-supplied u64 trap-frame args are narrowed to the ABI's u32 IRQ ids, keeping \
+                  the low 32 bits (upper bits are discarded). The remaining narrowings (u64->usize \
+                  on 64-bit targets, the IoPort u32->u16 halves) are lossless or range-checked \
+                  beside the cast; the casts are in the cfg(not(test)) handlers, so the lint fires \
+                  outside the host test build alone"
+    )
+)]
 
 #[cfg(not(test))]
 use super::UserFrame;
@@ -80,7 +86,6 @@ pub fn sys_irq_ack(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
     // constructed in place at a size-class-aligned retype offset, and
     // `irq_slot`'s pin keeps it live for this call.
-    #[allow(clippy::cast_ptr_alignment)]
     let io = unsafe { &*obj.as_ptr().cast::<InterruptObject>() };
     if io.count != 1
     {
@@ -166,8 +171,10 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
-    // IRQ_MODE_MASK is two bits, so a mode that passed the check fits a u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "IRQ_MODE_MASK is two bits, so a mode that passed the check fits a u32"
+    )]
     let mode = mode as u32;
 
     // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
@@ -188,7 +195,6 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
     // constructed in place at a size-class-aligned retype offset, and
     // `irq_slot`'s pin keeps it live for this call.
-    #[allow(clippy::cast_ptr_alignment)]
     let io = unsafe { &*irq_obj.as_ptr().cast::<InterruptObject>() };
     if io.count != 1
     {
@@ -214,7 +220,6 @@ pub fn sys_irq_register(tf: UserFrame) -> Result<u64, SyscallError>
     let sig_obj = sig_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // SAFETY: tag confirmed Notification; the object is a NotificationObject
     // constructed in place at a size-class-aligned retype offset.
-    #[allow(clippy::cast_ptr_alignment)]
     let sig_state = unsafe { (*sig_obj.as_ptr().cast::<NotificationObject>()).state };
 
     // Bind the cap's object to the notification, on a line routed by
@@ -445,8 +450,10 @@ pub fn sys_irq_route(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
-    // IRQ_MODE_MASK is two bits, so a mode that passed the check fits a u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "IRQ_MODE_MASK is two bits, so a mode that passed the check fits a u32"
+    )]
     let mode = mode as u32;
 
     // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
@@ -466,7 +473,6 @@ pub fn sys_irq_route(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tag confirmed Interrupt; the object is an InterruptObject
     // constructed in place at a size-class-aligned retype offset, and
     // `irq_slot`'s pin keeps it live for this call.
-    #[allow(clippy::cast_ptr_alignment)]
     let io = unsafe { &*irq_obj.as_ptr().cast::<InterruptObject>() };
     if io.count != 1
         || crate::irq::is_message(io.start)
@@ -628,9 +634,6 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cspace is the current thread's CSpace pointer from its TCB; lookup_cap
     // rejects a null cspace and checks tag and rights.
     let mmio_slot = unsafe { super::lookup_cap(cspace, mmio_idx, MmioRights::MAP) }?;
-    // cast_ptr_alignment: tag confirmed Mmio; the MmioObject is constructed in
-    // place at a size-class-aligned retype offset, header at offset 0.
-    #[allow(clippy::cast_ptr_alignment)]
     let mmio_obj = mmio_slot
         .object
         .ok_or(SyscallError::InvalidCapability)?
@@ -668,8 +671,6 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     let as_slot = unsafe { super::lookup_cap(cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = as_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-        #[allow(clippy::cast_ptr_alignment)]
         let aso = obj.as_ptr().cast::<AddressSpaceObject>();
         // SAFETY: tag confirmed AddressSpace; aso is a valid AddressSpaceObject.
         let as_inner = unsafe { (*aso).address_space };
@@ -798,10 +799,7 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             let obj = th_slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed Thread; the object is a ThreadObject
             // constructed in place at a size-class-aligned retype offset.
-            #[allow(clippy::cast_ptr_alignment)]
-            unsafe {
-                (*obj.as_ptr().cast::<ThreadObject>()).tcb
-            }
+            unsafe { (*obj.as_ptr().cast::<ThreadObject>()).tcb }
         };
         if target_tcb.is_null()
         {
@@ -819,7 +817,6 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
             let obj = port_slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; the object is an IoPortObject built in
             // place (from SEED at boot, or from an arena by a split or a copy).
-            #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*obj.as_ptr().cast::<IoPortObject>() };
             (obj.as_ptr() as usize, u32::from(po.base), po.port_count())
         };
@@ -948,11 +945,6 @@ pub fn sys_ioport_bind(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns the two child handles in the primary and secondary return
 /// registers.
-// too_many_lines: splitting an MMIO cap requires validating the original,
-// building two child objects, wiring both into the derivation tree, and
-// freeing the original — each step has its own bookkeeping and no meaningful
-// split-point between them.
-#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1000,9 +992,6 @@ pub fn sys_mmio_split(tf: UserFrame) -> Result<u64, SyscallError>
         let slot = unsafe { super::lookup_cap(caller_cspace, mmio_handle, MmioRights::MAP) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Mmio; pointer is valid MmioObject.
-        // cast_ptr_alignment: the MmioObject is constructed in place at a
-        // size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
         let mo = unsafe { &*(obj_ptr.as_ptr().cast::<MmioObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
@@ -1099,8 +1088,6 @@ pub fn sys_mmio_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns the two child handles in the primary and secondary return
 /// registers.
-// too_many_lines: mirrors sys_mmio_split exactly; the shape is unavoidable.
-#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1136,9 +1123,6 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
         let slot = unsafe { super::lookup_cap(caller_cspace, irq_handle, IrqRights::NOTIFY) }?;
         let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed Interrupt; pointer is valid InterruptObject.
-        // cast_ptr_alignment: the InterruptObject is constructed in place at a
-        // size-class-aligned retype offset.
-        #[allow(clippy::cast_ptr_alignment)]
         let io = unsafe { &*(obj_ptr.as_ptr().cast::<InterruptObject>()) };
         // SAFETY: caller_cspace validated non-null; id() reads discriminator.
         let cspace_id = unsafe { (*caller_cspace).id() };
@@ -1220,8 +1204,6 @@ pub fn sys_irq_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Returns the two child handles in the primary and secondary return
 /// registers.
-// too_many_lines: mirrors sys_irq_split exactly; the shape is unavoidable.
-#[allow(clippy::too_many_lines)]
 #[cfg(not(test))]
 pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1275,9 +1257,6 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
             let slot = unsafe { super::lookup_cap(caller_cspace, port_handle, IoPortRights::USE) }?;
             let obj_ptr = slot.object.ok_or(SyscallError::InvalidCapability)?;
             // SAFETY: tag confirmed IoPort; pointer is valid IoPortObject.
-            // cast_ptr_alignment: the IoPortObject is constructed in place at a
-            // size-class-aligned retype offset.
-            #[allow(clippy::cast_ptr_alignment)]
             let po = unsafe { &*(obj_ptr.as_ptr().cast::<IoPortObject>()) };
             // SAFETY: caller_cspace validated non-null; id() reads discriminator.
             let cspace_id = unsafe { (*caller_cspace).id() };

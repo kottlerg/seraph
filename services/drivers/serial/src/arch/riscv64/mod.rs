@@ -36,9 +36,8 @@ fn register(base: u64, offset: u64) -> u64
     base.saturating_add(offset)
 }
 
-/// Reserve a VA page, map the UART's `Mmio` range, `registers`, into it, and
-/// enable the receive-data interrupt when `enable_rx_irq` is set. The
-/// reservation lives for the process's lifetime. `self_thread` is unused on
+/// Reserve a VA page and map the UART's `Mmio` range, `registers`, into it.
+/// The reservation lives for the process's lifetime. `self_thread` is unused on
 /// RISC-V. Returns `false` if `registers` is not a page-aligned `Mmio` range
 /// of at most one page holding the registers, or reservation or mapping
 /// fails.
@@ -49,12 +48,7 @@ fn register(base: u64, offset: u64) -> u64
 /// base to the page end, so a range of at most one page keeps the
 /// whole-region mapping inside the one-page reservation
 /// (`syscall::mmio_map`'s contract).
-pub unsafe fn serial_init(
-    _self_thread: u64,
-    self_aspace: u64,
-    registers: &Resource,
-    enable_rx_irq: bool,
-) -> bool
+pub unsafe fn serial_init(_self_thread: u64, self_aspace: u64, registers: &Resource) -> bool
 {
     let Resource::Mmio {
         cap: mmio_cap,
@@ -91,16 +85,24 @@ pub unsafe fn serial_init(
     {
         return false;
     }
-    if enable_rx_irq
-    {
-        // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
-        // left IER cleared; without this the NS16550 never raises its APLIC
-        // source. Skipped when the driver holds no IRQ cap (RX then polls).
-        // SAFETY: base_va was just mapped via mmio_map; IER is within the page.
-        unsafe { core::ptr::write_volatile(register(base_va, UART_IER) as *mut u8, 0x01) };
-    }
     UART_BASE.store(base_va, Ordering::Release);
     true
+}
+
+/// Enable the Received Data Available interrupt (ERBFI). Earlier boot stages
+/// left IER cleared; without this the NS16550 never raises its APLIC source.
+/// The driver calls it only when it holds the UART's IRQ cap; without the
+/// cap, RX polls. No-ops if [`serial_init`] never mapped the UART.
+pub fn serial_enable_rx_interrupt()
+{
+    let base = UART_BASE.load(Ordering::Acquire);
+    if base == 0
+    {
+        return;
+    }
+    // SAFETY: `base` is the page `serial_init` mapped the UART into, held for
+    // the process's lifetime; IER is within the page.
+    unsafe { core::ptr::write_volatile(register(base, UART_IER) as *mut u8, 0x01) };
 }
 
 /// Read one byte from the UART if the receive register holds data, else

@@ -64,10 +64,12 @@ use syscall::SyscallError;
 /// `orig_obj_ptr` must be the object it resolved to (refcount > 0).
 /// `child1_ptr` and `child2_ptr` must be freshly-allocated arena-backed bodies
 /// of tag `tag`, each with refcount 1, not yet inserted into any `CSpace`.
-// too_many_arguments: the split tail genuinely needs the original cap's
-// coordinates (cspace, id, slot, tag, rights, object) plus both children;
-// bundling them into a struct would only move the argument list, not shrink it.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the split tail genuinely needs the original cap's coordinates (cspace, id, slot, \
+              tag, rights, object) plus both children; bundling them into a struct would only move \
+              the argument list, not shrink it"
+)]
 pub(crate) unsafe fn install_split_children(
     caller_cspace: *mut CSpace,
     cspace_id: CSpaceId,

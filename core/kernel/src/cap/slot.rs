@@ -191,8 +191,10 @@ impl Rights
     /// still keeps every right.
     pub fn from_mask(mask: u64) -> Rights
     {
-        // cast_possible_truncation: the mask keeps the 16 low bits only.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the mask keeps the 16 low bits only"
+        )]
         let word = (mask & u64::from(u16::MAX)) as u16;
         Rights(word)
     }
@@ -260,9 +262,11 @@ impl<K: CapKind> TypedRights<K>
     /// capability types (`SchedControl`).
     pub const NONE: Self = Self(0, PhantomData);
 
-    // Bridge from the ABI's u64 rights constants. The assert makes an ABI bit
-    // outside the 16-bit slot word a compile error, so the cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Bridge from the ABI's u64 rights constants. The assert makes an ABI bit outside \
+                  the 16-bit slot word a compile error, so the cast is exact"
+    )]
     const fn from_abi(bits: u64) -> Self
     {
         assert!(bits <= u16::MAX as u64);

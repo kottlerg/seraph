@@ -299,9 +299,11 @@ const CR4_UMIP: u64 = 1 << 11;
 /// Must execute at ring 0. The IDT need not be loaded: CPUID gates every bit
 /// this sets and `CR4.FSGSBASE` is only cleared, so the CR4 write cannot fault,
 /// and the BSP calls this before `idt::init`.
-// similar_names: smep_present and smap_present are distinct CPU security features.
 #[cfg(not(test))]
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "smep_present and smap_present are distinct CPU security features"
+)]
 pub unsafe fn enable_smep_smap()
 {
     // CPUID leaf 7, sub-leaf 0.
@@ -403,10 +405,7 @@ pub unsafe fn enable_pcid() -> bool
 /// # Safety
 /// Must execute at ring 0 during early boot, after the console is live so the
 /// diagnostic is visible, and before any subsystem that assumes the baseline.
-// too_many_lines: a flat, exhaustive feature-check table; splitting it would
-// only obscure the one-line-per-required-feature structure.
 #[cfg(not(test))]
-#[allow(clippy::too_many_lines)]
 pub unsafe fn verify_baseline()
 {
     /// `CR0.WP` (supervisor write-protect).

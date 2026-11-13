@@ -183,8 +183,6 @@ impl FrameMap
         {
             return None;
         }
-        // Lossless: the mask keeps the low `CHUNK_SHIFT - 12` bits.
-        #[allow(clippy::cast_possible_truncation)]
         let slot = ((phys >> 12) as usize) & (FRAMES_PER_CHUNK - 1);
         // SAFETY: a non-null chunk holds FRAMES_PER_CHUNK counters
         // (install_chunk's contract) and slot is in range.

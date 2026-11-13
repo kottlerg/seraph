@@ -671,7 +671,7 @@ fn platform_wired(
         CrsResource::Interrupt {
             line, mode, isa, ..
         } => Some((line, mode, isa)),
-        _ => None,
+        CrsResource::Mmio { .. } | CrsResource::IoPort { .. } => None,
     })?;
     let (gsi, mode) = arch::current::platform_line(carve.irq_range, line, mode, isa);
     match carve.irq_range.exclusive_line(gsi, mode)
@@ -1831,7 +1831,12 @@ impl PciDeviceCaps
                     kind: InterruptKind::Msi | InterruptKind::MsiX,
                     ..
                 } => release_message(self.remap.as_deref(), *cap),
-                _ =>
+                Resource::Interrupt {
+                    kind: InterruptKind::Wired,
+                    ..
+                }
+                | Resource::Mmio { .. }
+                | Resource::IoPort { .. } =>
                 {
                     let _ = syscall::cap_delete(resource.cap());
                 }

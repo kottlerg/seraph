@@ -18,6 +18,23 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 mod arch;
 mod bind;
@@ -375,6 +392,75 @@ struct RegistryState
     bind_dir_cap: u64,
 }
 
+// A class name a `MINT_CLASS_SEND` request can carry is one a declaration
+// can name: devmgr interns both into the same `ClassName`.
+const _: () =
+    assert!(ipc::devmgr_labels::MAX_CLASS_NAME_BYTES == driver_binding::decl::MAX_CLASS_BYTES);
+
+impl RegistryState
+{
+    /// `MINT_CLASS_SEND` handler, past its gate and version check: intern the
+    /// class `msg` names and mark it configured, and boot-only when asked and
+    /// the drivers-directory pass has not begun ([`Self::pass_begun`]); then
+    /// derive from `registry_ep` the SEND badged with the class's slot and the
+    /// request's verb bits. `Err` with the reply label otherwise:
+    /// `INVALID_REQUEST` for a bad verb mask, flag, or name, a late boot-only
+    /// mark, a full class table, or a failed derivation.
+    fn mint_class_send(&mut self, registry_ep: u64, msg: &IpcMessage) -> Result<u64, u64>
+    {
+        let invalid = ipc::devmgr_errors::INVALID_REQUEST;
+        let verbs = msg.word(1);
+        let flags = msg.word(2);
+        // Checked before the class is interned, so a refused request leaves the
+        // table as it was.
+        if verbs == 0
+            || verbs & !ipc::VERB_BIT_MASK != 0
+            || flags & !ipc::devmgr_labels::CLASS_BOOT_ONLY != 0
+        {
+            return Err(invalid);
+        }
+        let name = ipc::class_name_of(msg, 3)
+            .and_then(ClassName::class)
+            .ok_or(invalid)?;
+        let boot_only = flags & ipc::devmgr_labels::CLASS_BOOT_ONLY != 0;
+        let slot = self
+            .served
+            .classes
+            .configure(&name, boot_only, self.pass_begun)
+            .map_err(|_| invalid)?;
+        let badge = ipc::devmgr_labels::class_badge::encode(slot, verbs).ok_or(invalid)?;
+        syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, badge).map_err(|_| invalid)
+    }
+
+    /// `SET_DRIVERS_DIR`'s state change: keep `cap` as the drivers-directory
+    /// cap and post the drivers-directory pass, when no cap is kept yet.
+    /// Returns whether it did; on `false` the caller releases `cap`.
+    fn install_drivers_dir(&mut self, cap: u64) -> bool
+    {
+        if self.drivers_dir_cap != 0
+        {
+            return false;
+        }
+        self.drivers_dir_cap = cap;
+        self.pass_begun = true;
+        Registry::post(self, |j| &mut j.drivers_dir)
+    }
+
+    /// `BIND_DRIVERS`'s state change: keep `cap` as the directory of an
+    /// on-demand pass and post it, when the drivers directory is installed
+    /// and no earlier request's pass is posted. Returns whether it did; on
+    /// `false` the caller releases `cap`.
+    fn post_bind(&mut self, cap: u64) -> bool
+    {
+        if self.drivers_dir_cap == 0 || self.bind_dir_cap != 0
+        {
+            return false;
+        }
+        self.bind_dir_cap = cap;
+        Registry::post(self, |j| &mut j.bind)
+    }
+}
+
 /// The device registry: the state the registry's workers serve queries
 /// from and the control thread fills, and the read-only authority the
 /// workers serve from beside it.
@@ -539,11 +625,15 @@ impl Registry
             }
             let (driver, why) = match state
             {
-                DriverState::Ready => match self.serve_ready(spawned)
+                DriverState::Ready =>
                 {
-                    None => continue,
-                    Some(refused) => refused,
-                },
+                    let refused = self.lock().served.serve_ready(spawned);
+                    match refused
+                    {
+                        None => continue,
+                        Some(refused) => refused,
+                    }
+                }
                 DriverState::Dead => (
                     spawned.driver,
                     "driver died before its batch settled; not served",
@@ -556,47 +646,6 @@ impl Registry
             std::os::seraph::log!(warn: "{}: {}", name.as_str(), why);
             driver.withdraw(ipc_buf);
         }
-    }
-
-    /// Append the ready driver `spawned` to what it is served as, in one
-    /// hold of the lock. Returns the driver and why it is not served when it
-    /// is not: the IOMMU confining its device has failed, or there is no room
-    /// for it.
-    fn serve_ready(&self, mut spawned: SpawnedDriver) -> Option<(ServedDriver, &'static str)>
-    {
-        let mut state = self.lock();
-        let served = &mut state.served;
-        let confined = spawned
-            .driver
-            .dev_caps
-            .as_ref()
-            .is_some_and(bind::PciDeviceCaps::confined);
-        if confined && served.iommu_failed()
-        {
-            return Some((spawned.driver, "its device's IOMMU is gone; withdrawn"));
-        }
-        let list = match spawned.serves
-        {
-            Serves::Class(class) => served.classes.intern(&class),
-            Serves::Iommu => Some(&mut served.iommu),
-        };
-        let Some(list) = list
-        else
-        {
-            return Some((spawned.driver, "no room for the driver's class; destroyed"));
-        };
-        if list.try_reserve(1).is_err()
-        {
-            return Some((spawned.driver, "no room to serve the driver; destroyed"));
-        }
-        if spawned.driver.dev_caps.is_none()
-        {
-            let _ = syscall::cap_delete(spawned.driver.process_handle);
-            spawned.driver.process_handle = 0;
-        }
-        // Room was reserved just above, so the push holds.
-        let _ = list.push(spawned.badge, spawned.driver);
-        None
     }
 
     /// Withdraw the served driver the death `post` names, if any: one a batch
@@ -640,15 +689,11 @@ impl Registry
     /// lock.
     fn fail_iommu(&self, ipc_buf: *mut u64)
     {
-        let (client, first) = {
-            let mut state = self.lock();
-            let Some(client) = state.served.iommu_client.clone()
-            else
-            {
-                return;
-            };
-            let first = !core::mem::replace(&mut state.served.iommu_dependants_withdrawn, true);
-            (client, first)
+        let failed = self.lock().served.note_iommu_failed();
+        let Some((client, first)) = failed
+        else
+        {
+            return;
         };
         // Outside the lock: a first failure starts a drain thread.
         client.fail();
@@ -776,16 +821,7 @@ impl Registry
                     reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
                     return;
                 }
-                let minted = {
-                    let mut state = self.lock();
-                    let state = &mut *state;
-                    mint_class_send(
-                        &mut state.served.classes,
-                        self.endpoint,
-                        msg,
-                        state.pass_begun,
-                    )
-                };
+                let minted = self.lock().mint_class_send(self.endpoint, msg);
                 match minted
                 {
                     Ok(send) =>
@@ -851,19 +887,7 @@ impl Registry
             reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
             return;
         };
-        let installed = {
-            let mut state = self.lock();
-            if state.drivers_dir_cap == 0
-            {
-                state.drivers_dir_cap = new_cap;
-                state.pass_begun = true;
-                Self::post(&mut state, |j| &mut j.drivers_dir)
-            }
-            else
-            {
-                false
-            }
-        };
+        let installed = self.lock().install_drivers_dir(new_cap);
         if installed
         {
             std::os::seraph::log!("devmgr: SET_DRIVERS_DIR cap installed");
@@ -912,18 +936,7 @@ impl Registry
             refuse(ipc::devmgr_errors::INVALID_REQUEST);
             return;
         };
-        let posted = {
-            let mut state = self.lock();
-            if state.drivers_dir_cap == 0 || state.bind_dir_cap != 0
-            {
-                false
-            }
-            else
-            {
-                state.bind_dir_cap = dir_cap;
-                Self::post(&mut state, |j| &mut j.bind)
-            }
-        };
+        let posted = self.lock().post_bind(dir_cap);
         if !posted
         {
             refuse(ipc::devmgr_errors::INVALID_REQUEST);
@@ -960,47 +973,6 @@ fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, i
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
-}
-
-// A class name a `MINT_CLASS_SEND` request can carry is one a declaration
-// can name: devmgr interns both into the same `ClassName`.
-const _: () =
-    assert!(ipc::devmgr_labels::MAX_CLASS_NAME_BYTES == driver_binding::decl::MAX_CLASS_BYTES);
-
-/// `MINT_CLASS_SEND` handler, past its gate and version check: intern the
-/// class `msg` names in `classes` and mark it configured, and boot-only when
-/// asked and `pass_begun` is not set, the drivers-directory pass not having
-/// begun; then derive from `registry_ep` the SEND badged with the class's
-/// slot and the request's verb bits. `Err` with the reply label otherwise:
-/// `INVALID_REQUEST` for a bad verb mask, flag, or name, a late boot-only
-/// mark, a full class table, or a failed derivation.
-fn mint_class_send(
-    classes: &mut Classes<ServedDriver>,
-    registry_ep: u64,
-    msg: &IpcMessage,
-    pass_begun: bool,
-) -> Result<u64, u64>
-{
-    let invalid = ipc::devmgr_errors::INVALID_REQUEST;
-    let verbs = msg.word(1);
-    let flags = msg.word(2);
-    // Checked before the class is interned, so a refused request leaves the
-    // table as it was.
-    if verbs == 0
-        || verbs & !ipc::VERB_BIT_MASK != 0
-        || flags & !ipc::devmgr_labels::CLASS_BOOT_ONLY != 0
-    {
-        return Err(invalid);
-    }
-    let name = ipc::class_name_of(msg, 3)
-        .and_then(ClassName::class)
-        .ok_or(invalid)?;
-    let boot_only = flags & ipc::devmgr_labels::CLASS_BOOT_ONLY != 0;
-    let slot = classes
-        .configure(&name, boot_only, pass_begun)
-        .map_err(|_| invalid)?;
-    let badge = ipc::devmgr_labels::class_badge::encode(slot, verbs).ok_or(invalid)?;
-    syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, badge).map_err(|_| invalid)
 }
 
 /// The instance ordinal a `QUERY_DEVICE` request selects: `data[1]` when sent, else 0, the first instance.
@@ -1840,6 +1812,54 @@ impl ServedDrivers
     fn iommu_failed(&self) -> bool
     {
         self.iommu_client.as_ref().is_some_and(|c| c.failed())
+    }
+
+    /// Append the ready driver `spawned` to what it is served as. Returns the
+    /// driver and why it is not served when it is not: the IOMMU confining
+    /// its device has failed, or there is no room for it.
+    fn serve_ready(&mut self, mut spawned: SpawnedDriver) -> Option<(ServedDriver, &'static str)>
+    {
+        let confined = spawned
+            .driver
+            .dev_caps
+            .as_ref()
+            .is_some_and(bind::PciDeviceCaps::confined);
+        if confined && self.iommu_failed()
+        {
+            return Some((spawned.driver, "its device's IOMMU is gone; withdrawn"));
+        }
+        let list = match spawned.serves
+        {
+            Serves::Class(class) => self.classes.intern(&class),
+            Serves::Iommu => Some(&mut self.iommu),
+        };
+        let Some(list) = list
+        else
+        {
+            return Some((spawned.driver, "no room for the driver's class; destroyed"));
+        };
+        if list.try_reserve(1).is_err()
+        {
+            return Some((spawned.driver, "no room to serve the driver; destroyed"));
+        }
+        if spawned.driver.dev_caps.is_none()
+        {
+            let _ = syscall::cap_delete(spawned.driver.process_handle);
+            spawned.driver.process_handle = 0;
+        }
+        // Room was reserved just above, so the push holds.
+        let _ = list.push(spawned.badge, spawned.driver);
+        None
+    }
+
+    /// Record that the IOMMU driver failed: the client it is called through,
+    /// and whether this is the first failure recorded, whose caller withdraws
+    /// the confined devices' drivers. `None` when no client is recorded.
+    fn note_iommu_failed(&mut self) -> Option<(Arc<iommu::IommuClient>, bool)>
+    {
+        let client = self.iommu_client.clone()?;
+        let first = !core::mem::replace(&mut self.iommu_dependants_withdrawn, true);
+        Some((client, first))
     }
 
     /// Take out the served driver whose device badge is `badge`, leaving a

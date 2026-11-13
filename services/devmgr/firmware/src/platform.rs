@@ -544,7 +544,7 @@ mod tests
             .map(|r| match r
             {
                 PlatformResource::Wired { mode, .. } => mode,
-                _ => u64::MAX,
+                PlatformResource::Mmio { .. } | PlatformResource::IoPort { .. } => u64::MAX,
             })
             .collect();
         assert_eq!(
@@ -615,7 +615,12 @@ mod tests
                 parse_table(&format!("oem_table_id = A\n{c}\n")).map_err(|e| match e
                 {
                     TableError::InvalidValue(l, _) => l,
-                    _ => 0,
+                    TableError::TooLarge
+                    | TableError::MissingEquals(_)
+                    | TableError::UnknownKey(_)
+                    | TableError::DuplicateKey(_)
+                    | TableError::MissingKey(_)
+                    | TableError::NoMemory => 0,
                 }),
                 Err(2),
                 "{c}"

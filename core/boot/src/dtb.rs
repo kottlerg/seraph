@@ -1176,8 +1176,8 @@ fn prop_contains(data: &[u8], target: &[u8]) -> bool
 ///
 /// The leading base segment (`rv64imafdc…`) can never equal a multi-letter
 /// extension name, so no special-casing is needed. Shared by the DTB
-/// `riscv,isa` fallback here and the ACPI RHCT ISA-string node parser in
-/// [`crate::arch::riscv64`].
+/// `riscv,isa` fallback here and the ACPI RHCT ISA-string node parser,
+/// `parse_rhct` in [`crate::acpi`].
 pub(crate) fn isa_string_has_ext(data: &[u8], ext: &[u8]) -> bool
 {
     let isa = match data.iter().position(|&b| b == 0)

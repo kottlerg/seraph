@@ -90,7 +90,8 @@ fn read_array<const N: usize>(buf: &[u8], off: usize) -> Option<[u8; N]>
 
 /// Read a little-endian u16 at byte `off` within `buf`. Returns 0 on short read.
 ///
-/// Only the RHCT walker below consumes u16 fields.
+/// Read by the RHCT walker, the MADT AIA entries (`madt_aia`), and the DMAR
+/// walk in `walk_aperture_seed`, which runs on every architecture.
 pub(crate) fn read_u16(buf: &[u8], off: usize) -> u16
 {
     read_array(buf, off).map_or(0, u16::from_le_bytes)

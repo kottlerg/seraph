@@ -773,9 +773,10 @@ and the crash badges, bit 63) and from a handler the target bound itself (§ Lab
 A debugger that rebinds the target's threads sends the watch with its first request. When the attach
 succeeds, procmgr keeps the watch as the target's debugger, replacing, and deleting, the one an
 earlier attach left; a watch that is not a Thread cap, or that a refused attach carried, is deleted.
-An attach whose reply cannot deliver its caps (the caller's `CSpace` cannot take them, or the caller
-is gone) has not succeeded: procmgr deletes the caps derived for it and the watch, and keeps the
-earlier one.
+procmgr holds the watch before it sends the reply, so a debugger that binds the target's threads and
+dies as soon as it has its reply is found gone by the next check below. An attach whose reply cannot
+deliver its caps (the caller's `CSpace` cannot take them, or the caller is gone) has not succeeded:
+procmgr deletes the caps derived for it and the watch, and keeps the earlier one.
 procmgr reads the watched thread's state on every pass of its reaper, which a process's death
 wakes, before it serves any request, and after every `DESTROY_PROCESS`: once the thread has exited,
 or its cap went with its process's teardown, procmgr logs `debugger gone; crash bindings restored`

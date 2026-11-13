@@ -248,10 +248,10 @@ before it starts, naming the load read and its limit or what is in the way. Stat
 the PR body's `## Validation` section reports, that its command was admitted. Tell the command
 what the run is:
 
-- A build (`cargo xtask build`, `cargo xtask clean`), and a boot of 4 vCPUs or fewer, a run
-  docs/testing.md § Coverage tiers owes included: no option, and no grant. The command admits a
-  build under a load of 32, and a boot under a load of 16 with fewer than 3 QEMUs running and
-  none of more than 4 vCPUs.
+- A build (`cargo xtask build`, `cargo xtask clean`, `cargo xtask test`), and a boot of 4 vCPUs
+  or fewer, a run docs/testing.md § Coverage tiers owes included: no option, and no grant. The
+  command admits a build under a load of 32, and a boot under a load of 16 with fewer than 3
+  QEMUs running and none of more than 4 vCPUs.
 - A boot of more than 4 vCPUs, and any timing-sensitive measurement: the exclusive grant
   (orchestrated), passed as `--grant <holder>` with the holder the grant names, and `--timing`
   for a measurement. The command admits it only with no QEMU running and the load under 10.

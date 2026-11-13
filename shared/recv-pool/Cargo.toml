@@ -17,7 +17,6 @@ doctest = false
 [dependencies]
 ipc = { path = "../ipc" }
 syscall = { path = "../syscall" }
-syscall-abi = { path = "../../abi/syscall" }
 
 [lints]
 workspace = true

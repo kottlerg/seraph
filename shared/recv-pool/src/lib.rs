@@ -14,23 +14,21 @@
 //! the first by construction: a handler receives the [`IpcBuf`] of the thread
 //! running it, and an `IpcBuf` cannot leave that thread. Each worker's loop
 //! is guarded as `docs/ipc-design.md` § Receive-Failure Policy says
-//! ([`RecvGuard`]).
+//! ([`RecvGuard`]). A worker whose thread has no registered IPC buffer page
+//! (the runtime's registration of the page failed) logs it and exits its
+//! thread without receiving; the process and the other workers go on, so the
+//! hook, whose [`RecvFailureStage::Fatal`] means the process exits, is not
+//! told.
 //!
 //! The crate spawns `std` threads, so it compiles only for seraph.
 
 #![cfg(target_os = "seraph")]
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ipc::IpcMessage;
 use ipc::recv_guard::{RecvFailureStage, RecvGuard};
-use syscall_abi::SyscallError;
-
-/// The error a worker passes its diagnostic hook, at
-/// [`RecvFailureStage::Fatal`], when its thread has no registered IPC buffer
-/// page (the runtime's registration of the page failed): the worker exits its
-/// thread without receiving. The process and the other workers go on.
-pub const NO_IPC_BUFFER: i64 = SyscallError::InvalidAddress as i64;
 
 /// The calling thread's registered IPC buffer page.
 ///
@@ -77,26 +75,15 @@ struct Shared<H>
 {
     /// RECV on the endpoint the workers receive on.
     endpoint: u64,
-    /// The `RecvGuard` diagnostic hook, also told of a worker with no IPC
-    /// buffer ([`NO_IPC_BUFFER`]).
+    /// The `RecvGuard` diagnostic hook.
     diag: fn(RecvFailureStage, i64),
     handler: H,
-    gate: Mutex<Gate>,
-    /// Signalled when a worker starts and when the gate opens.
-    changed: Condvar,
-}
-
-/// The workers' start: how many were spawned and have started, and whether
-/// they may receive.
-struct Gate
-{
-    /// Workers spawned so far.
-    spawned: usize,
-    /// Workers that have started running their code.
-    started: usize,
     /// `false` until [`RecvPool::open`]; a worker waits for it before its
     /// first receive.
-    open: bool,
+    open: Mutex<bool>,
+    /// Signalled, with `open` held, when a worker starts and when the gate
+    /// opens.
+    changed: Condvar,
 }
 
 /// A pool of threads receiving on one endpoint.
@@ -149,11 +136,7 @@ where
                 endpoint,
                 diag,
                 handler,
-                gate: Mutex::new(Gate {
-                    spawned: 0,
-                    started: 0,
-                    open: false,
-                }),
+                open: Mutex::new(false),
                 changed: Condvar::new(),
             }),
         }
@@ -171,21 +154,20 @@ where
     {
         let mut failed = None;
         let mut running: usize = 0;
+        // This call's own workers count themselves started here, so a spawn
+        // on another thread of the same pool neither holds nor releases it.
+        let started = Arc::new(AtomicUsize::new(0));
         for i in 0..count
         {
             let shared = Arc::clone(&self.shared);
+            let mine = Arc::clone(&started);
             match std::thread::Builder::new()
                 .name(format!("{name}-{i}"))
-                .spawn(move || serve(&shared))
+                .spawn(move || serve(&shared, Some(&mine)))
             {
-                Ok(_) =>
-                {
-                    // Both count threads of this one spawn loop, so neither
-                    // saturates.
-                    running = running.saturating_add(1);
-                    let mut gate = self.lock_gate();
-                    gate.spawned = gate.spawned.saturating_add(1);
-                }
+                // Counts this call's threads, at most `count`, so it does
+                // not saturate.
+                Ok(_) => running = running.saturating_add(1),
                 Err(error) =>
                 {
                     failed = Some(error);
@@ -194,7 +176,9 @@ where
             }
         }
         let mut gate = self.lock_gate();
-        while gate.started < gate.spawned
+        // A worker counts itself with `open` held and then signals, so the
+        // check under the lock misses no start.
+        while started.load(Ordering::Relaxed) < running
         {
             gate = self
                 .shared
@@ -210,10 +194,10 @@ where
         }
     }
 
-    fn lock_gate(&self) -> MutexGuard<'_, Gate>
+    fn lock_gate(&self) -> MutexGuard<'_, bool>
     {
         self.shared
-            .gate
+            .open
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -221,7 +205,7 @@ where
     /// Open the gate: every worker, spawned or still to be spawned, receives.
     pub fn open(&self)
     {
-        self.lock_gate().open = true;
+        *self.lock_gate() = true;
         self.shared.changed.notify_all();
     }
 
@@ -229,22 +213,24 @@ where
     pub fn serve_on_current(self) -> !
     {
         self.open();
-        serve(&self.shared)
+        serve(&self.shared, None)
     }
 }
 
-/// A worker: count itself started, wait for the gate, then receive and
-/// handle requests for the life of the process.
-fn serve<H>(shared: &Shared<H>) -> !
+/// A worker: count itself in `started` (the count of the [`RecvPool::spawn`]
+/// call that spawned it, `None` for [`RecvPool::serve_on_current`]), wait for
+/// the gate, then receive and handle requests for the life of the process.
+fn serve<H>(shared: &Shared<H>, started: Option<&AtomicUsize>) -> !
 where
     H: Fn(&IpcMessage, IpcBuf),
 {
-    let mut gate = shared.gate.lock().unwrap_or_else(PoisonError::into_inner);
-    // `started` counts the threads of one spawn loop, so it does not
-    // saturate.
-    gate.started = gate.started.saturating_add(1);
+    let mut gate = shared.open.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(started) = started
+    {
+        started.fetch_add(1, Ordering::Relaxed);
+    }
     shared.changed.notify_all();
-    while !gate.open
+    while !*gate
     {
         gate = shared
             .changed
@@ -256,7 +242,9 @@ where
     let Some(buf) = IpcBuf::current()
     else
     {
-        (shared.diag)(RecvFailureStage::Fatal, NO_IPC_BUFFER);
+        std::os::seraph::log!(
+            warn: "receive worker has no IPC buffer page; its thread exits, the other workers serve"
+        );
         syscall::thread_exit();
     };
 

@@ -57,8 +57,8 @@ Setting `default-members = ["xtask"]` in the workspace root `Cargo.toml` means
 bare `cargo build` and `cargo run` operate only on the host-target xtask
 binary. Components targeting the kernel, bootloader, or std-userspace triples
 must be built via `cargo xtask build` so the correct custom target JSON and
-`-Zbuild-std` flags are passed and, for the bootloader, `RUSTFLAGS` is set
-(§ Custom Targets).
+`-Zbuild-std` flags are passed and, for the bootloader and the riscv64 kernel,
+`RUSTFLAGS` is set (§ Custom Targets).
 
 [`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot
 protocol ABI; both the bootloader and kernel depend on it. The kernel-entry contract the
@@ -151,6 +151,15 @@ under another (a worktree under `.claude/worktrees/`) receives a flag once
 for each config file that lists it; `RUSTFLAGS` is used in place of them
 all, and a build-script link arg is emitted once, so the bootloader link is
 the same from any checkout.
+
+The riscv64 kernel build, and its Clippy pass, also run with `RUSTFLAGS` set,
+to `-Zunstable-options -Zemit-stack-sizes` (`RISCV64_KERNEL_RUSTFLAGS` in
+`xtask/src/commands/build.rs`), so that `-Z emit-stack-sizes` reaches the
+`-Z build-std` crates as well. `RUSTFLAGS` replaces the `[build] rustflags`
+of `.cargo/config.toml` there too: a flag added to that array reaches the
+riscv64 kernel only when it is added to `RISCV64_KERNEL_RUSTFLAGS` as well,
+and a `RUSTFLAGS` set in the calling environment does not reach the
+bootloader or the riscv64 kernel.
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace

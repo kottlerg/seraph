@@ -75,8 +75,10 @@ pub fn place_cpu_ids(
     {
         record_cpu_id(id, out, &mut filled, &mut truncated);
     }
-    // filled is at most out.len(), at most MAX_CPUS, which fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "filled is at most out.len(), at most MAX_CPUS, which fits in u32"
+    )]
     let cpu_count = filled as u32;
     (cpu_count, truncated)
 }

@@ -296,23 +296,38 @@ unsafe fn pin_binding(
     class: usize,
 ) -> Option<(core::ptr::NonNull<EndpointObject>, u64)>
 {
-    // SAFETY: tcb is the running thread (contract); lock_raw is paired with
-    // the unlock_raw below. A non-null fault_handlers entry read under
-    // sched_lock names an endpoint the binding references, so it is live for
-    // inc_ref.
-    // The markers are this thread's own until its delivery makes it
-    // wakeable.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let binding = (*tcb)
+    // SAFETY: tcb is the running thread (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw is paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads a binding array of tcb, which the held sched_lock serialises"
+    )]
+    // SAFETY: tcb is the running thread, and its binding pair is read under
+    // the held sched_lock it is published under.
+    let binding = unsafe {
+        (*tcb)
             .fault_handlers
             .get(class)
-            .zip((*tcb).fault_badges.get(class));
-        let ep = binding.and_then(|(h, _)| core::ptr::NonNull::new(h.load(Ordering::Acquire)));
-        let badge = binding.map_or(0, |(_, b)| b.load(Ordering::Relaxed));
-        if let Some(ep) = ep
-        {
-            ep.as_ref().header.inc_ref();
+            .zip((*tcb).fault_badges.get(class))
+    };
+    let ep = binding.and_then(|(h, _)| core::ptr::NonNull::new(h.load(Ordering::Acquire)));
+    let badge = binding.map_or(0, |(_, b)| b.load(Ordering::Relaxed));
+    if let Some(ep) = ep
+    {
+        // SAFETY: a non-null fault_handlers entry read under sched_lock names
+        // an endpoint the binding references, so it is live for inc_ref.
+        unsafe { ep.as_ref() }.header.inc_ref();
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access writes a fault-delivery marker of tcb, which the held \
+                      sched_lock serialises"
+        )]
+        // SAFETY: tcb is the running thread; the markers are its own until
+        // its delivery makes it wakeable, and are written under the held
+        // sched_lock.
+        unsafe {
             (*tcb)
                 .fault_outcome
                 .store(FAULT_OUTCOME_PENDING, Ordering::Release);
@@ -323,9 +338,10 @@ unsafe fn pin_binding(
                 (*tcb).fault_delivery_class = class as u8;
             }
         }
-        (*tcb).sched_lock.unlock_raw(saved);
-        ep.map(|ep| (ep, badge))
     }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    ep.map(|ep| (ep, badge))
 }
 
 /// Whether a fault delivery through `tcb`'s binding for `class` is in
@@ -337,6 +353,11 @@ unsafe fn pin_binding(
 #[cfg(not(test))]
 pub unsafe fn delivery_in_flight(tcb: *mut ThreadControlBlock, class: usize) -> bool
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads a fault-delivery marker of tcb, which the held sched_lock \
+                  serialises"
+    )]
     // SAFETY: the caller holds tcb.sched_lock, under which in_fault_delivery
     // and fault_delivery_class are written; fault_outcome is atomic.
     unsafe {
@@ -361,27 +382,34 @@ pub unsafe fn pin_bindings(
 ) -> [Binding; FAULT_CLASSES]
 {
     let mut out: [Binding; FAULT_CLASSES] = [(core::ptr::null_mut(), 0); FAULT_CLASSES];
-    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw. A
-    // non-null endpoint read under sched_lock is held by the binding's
-    // reference, so it is live for inc_ref.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let bound = (*tcb).fault_handlers.iter().zip(&(*tcb).fault_badges);
-        for ((slot, selected), (handler, badge)) in out.iter_mut().zip(selected).zip(bound)
+    // SAFETY: tcb valid per contract.
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads a binding array of tcb, which the held sched_lock serialises"
+    )]
+    // SAFETY: tcb valid per contract; the binding pairs are read under the
+    // held sched_lock they are published under.
+    let bound = unsafe { (*tcb).fault_handlers.iter().zip(&(*tcb).fault_badges) };
+    for ((slot, selected), (handler, badge)) in out.iter_mut().zip(selected).zip(bound)
+    {
+        if !selected
         {
-            if !selected
-            {
-                continue;
-            }
-            let ep = handler.load(Ordering::Acquire);
-            if !ep.is_null()
-            {
-                (*ep).header.inc_ref();
-                *slot = (ep, badge.load(Ordering::Relaxed));
-            }
+            continue;
         }
-        (*tcb).sched_lock.unlock_raw(saved);
+        let ep = handler.load(Ordering::Acquire);
+        if !ep.is_null()
+        {
+            // SAFETY: a non-null endpoint read under sched_lock is held by the
+            // binding's reference, so it is live for inc_ref.
+            unsafe { (*ep).header.inc_ref() };
+            *slot = (ep, badge.load(Ordering::Relaxed));
+        }
     }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
     out
 }
 
@@ -406,29 +434,36 @@ pub unsafe fn publish_bindings(
 {
     let mut old = [core::ptr::null_mut(); FAULT_CLASSES];
     let mut redeliver = None;
-    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw; the
-    // binding pairs are written under this lock.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let bound = (*tcb).fault_handlers.iter().zip(&(*tcb).fault_badges);
-        let classes = new.iter().zip(selected).zip(old.iter_mut()).zip(bound);
-        for (class, (((&(ep, badge), selected), old_ep), (handler, badge_cell))) in
-            classes.enumerate()
+    // SAFETY: tcb valid per contract.
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reaches a binding array of tcb, which the held sched_lock \
+                  serialises"
+    )]
+    // SAFETY: tcb valid per contract; the binding pairs are written under the
+    // held sched_lock.
+    let bound = unsafe { (*tcb).fault_handlers.iter().zip(&(*tcb).fault_badges) };
+    let classes = new.iter().zip(selected).zip(old.iter_mut()).zip(bound);
+    for (class, (((&(ep, badge), selected), old_ep), (handler, badge_cell))) in classes.enumerate()
+    {
+        if !selected
         {
-            if !selected
-            {
-                continue;
-            }
-            let old_badge = badge_cell.swap(badge, Ordering::Relaxed);
-            *old_ep = handler.swap(ep, Ordering::AcqRel);
-            let changed = !core::ptr::eq(*old_ep, ep) || old_badge != badge;
-            if changed && delivery_in_flight(tcb, class)
-            {
-                redeliver = Some(class);
-            }
+            continue;
         }
-        (*tcb).sched_lock.unlock_raw(saved);
+        let old_badge = badge_cell.swap(badge, Ordering::Relaxed);
+        *old_ep = handler.swap(ep, Ordering::AcqRel);
+        let changed = !core::ptr::eq(*old_ep, ep) || old_badge != badge;
+        // SAFETY: tcb is valid and its sched_lock is held.
+        if changed && unsafe { delivery_in_flight(tcb, class) }
+        {
+            redeliver = Some(class);
+        }
     }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
     (old, redeliver)
 }
 
@@ -666,11 +701,14 @@ unsafe fn deliver_once(
     {
         // A handler was waiting; enqueue it so it can service the fault.
         // SAFETY: woken_handler returned by endpoint_call; valid TCB.
-        unsafe {
-            debug_assert_eq!((*woken_handler).magic, crate::sched::thread::TCB_MAGIC);
-            let target_cpu = crate::sched::select_target_cpu(woken_handler);
-            crate::sched::enqueue_and_wake(woken_handler, target_cpu);
-        }
+        let magic = unsafe { (*woken_handler).magic };
+        debug_assert_eq!(magic, crate::sched::thread::TCB_MAGIC);
+        // SAFETY: woken_handler is a valid TCB, pinned by the wake_in_flight
+        // claim endpoint_call took.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_handler) };
+        // SAFETY: woken_handler is valid and claimed, target_cpu came from
+        // select_target_cpu, and no scheduler lock is held.
+        unsafe { crate::sched::enqueue_and_wake(woken_handler, target_cpu) };
     }
     // else: no handler waiting; we are queued on the endpoint's send queue as
     // BlockedOnSend + in_fault_delivery, to be picked up by a later recv.
@@ -701,6 +739,10 @@ unsafe fn deliver_once(
     // nothing that owed it (the #352-class leaked wake). The Kill fallback
     // keeps release behavior fail-closed.
     #[cfg(debug_assertions)]
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads a field of tcb, the running thread's own TCB"
+    )]
     // SAFETY: tcb still valid after resume.
     unsafe {
         let park = (*tcb).park_episode.load(Ordering::Relaxed);
@@ -714,12 +756,15 @@ unsafe fn deliver_once(
     }
     // Close the delivery under the lock pin_binding opened it under, so a
     // binder's in-flight check never reads a torn marker.
-    // SAFETY: tcb still valid; lock_raw paired with the unlock_raw.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        (*tcb).in_fault_delivery = false;
-        (*tcb).sched_lock.unlock_raw(saved);
-    }
+    // SAFETY: tcb still valid.
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    // SAFETY: tcb still valid; in_fault_delivery is written under the held
+    // sched_lock.
+    unsafe { (*tcb).in_fault_delivery = false };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
     outcome
 }
 
@@ -805,21 +850,38 @@ unsafe fn in_flight_park(
     class: usize,
 ) -> Option<(ThreadState, IpcThreadState, *mut u8, u32)>
 {
-    // SAFETY: tcb valid per contract; lock_raw paired with unlock_raw; the
-    // Scheduling fields are read under sched_lock, their owner.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let snap = delivery_in_flight(tcb, class).then(|| {
+    // SAFETY: tcb valid per contract.
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    // SAFETY: tcb is valid and its sched_lock is held.
+    let in_flight = unsafe { delivery_in_flight(tcb, class) };
+    let snap = if in_flight
+    {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a Scheduling field of tcb, which the held sched_lock \
+                      serialises"
+        )]
+        // SAFETY: tcb valid per contract; the Scheduling fields are read under
+        // sched_lock, their owner.
+        let fields = unsafe {
             (
                 (*tcb).state,
                 (*tcb).ipc_state,
                 (*tcb).blocked_on_object,
                 (*tcb).park_seq.load(Ordering::Relaxed),
             )
-        });
-        (*tcb).sched_lock.unlock_raw(saved);
-        snap
+        };
+        Some(fields)
     }
+    else
+    {
+        None
+    };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    snap
 }
 
 /// Claim `tcb`'s fault park, snapshotted as `(ipc_state, blocked_on,
@@ -867,11 +929,11 @@ unsafe fn claim_fault_park(
     if won
     {
         // SAFETY: the claim is won and the wake_in_flight pin keeps tcb
-        // allocated until enqueue_and_wake clears it; no lock is held.
-        unsafe {
-            let target_cpu = crate::sched::select_target_cpu(tcb);
-            crate::sched::enqueue_and_wake(tcb, target_cpu);
-        }
+        // allocated until enqueue_and_wake clears it.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+        // SAFETY: tcb is valid and claimed, target_cpu came from
+        // select_target_cpu, and no lock is held.
+        unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
     }
     won
 }
@@ -909,23 +971,31 @@ unsafe fn claim_queued_fault(
     // original allocation guarantees alignment.
     #[allow(clippy::cast_ptr_alignment)]
     let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
-    // SAFETY: `held` holds ep.lock on the live endpoint the binding names, and
-    // tcb's sched_lock.
-    unsafe {
-        let unlinked = crate::ipc::endpoint::unlink_from_wait_queue(
-            tcb,
-            &mut (*ep).send_head,
-            &mut (*ep).send_tail,
-        );
-        if unlinked
-        {
-            (*ep).refresh_send_ready();
-            stamp_redeliver(tcb);
-            (*tcb).wake_in_flight.store(1, Ordering::Release);
-        }
-        held.unlock();
-        unlinked
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reaches a send-queue field of the endpoint, which the held ep.lock \
+                  serialises"
+    )]
+    // SAFETY: `held` holds ep.lock on the live endpoint the binding names.
+    let (send_head, send_tail) = unsafe { (&mut (*ep).send_head, &mut (*ep).send_tail) };
+    // SAFETY: ep.lock is held, and tcb is a valid TCB.
+    let unlinked =
+        unsafe { crate::ipc::endpoint::unlink_from_wait_queue(tcb, send_head, send_tail) };
+    if unlinked
+    {
+        // SAFETY: `held` holds ep.lock on the live endpoint.
+        let ep = unsafe { &*ep };
+        // SAFETY: ep.lock is held.
+        unsafe { ep.refresh_send_ready() };
+        // SAFETY: `held` holds tcb's sched_lock, and the unlink under ep.lock
+        // is the park's exclusive claim.
+        unsafe { stamp_redeliver(tcb) };
+        // SAFETY: tcb is a valid TCB the caller pins.
+        unsafe { (*tcb).wake_in_flight.store(1, Ordering::Release) };
     }
+    // SAFETY: `held` came from lock_bound_source and both its locks are held.
+    unsafe { held.unlock() };
+    unlinked
 }
 
 /// Claim a received fault delivery (`BlockedOnFault` on the handler TCB
@@ -945,15 +1015,27 @@ unsafe fn claim_received_fault(tcb: *mut ThreadControlBlock, blocked_on: *mut u8
     // original allocation guarantees alignment.
     #[allow(clippy::cast_ptr_alignment)]
     let server = blocked_on.cast::<ThreadControlBlock>();
-    // SAFETY: tcb valid; lock_raw paired with unlock_raw. The server is live
-    // for the CAS by the CLOSURE LEMMA, behind the re-read of the binding under
-    // this client's sched_lock.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let won = (*tcb).state == ThreadState::Blocked
+    // SAFETY: tcb valid per contract.
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads a Scheduling field of tcb, which the held sched_lock \
+                  serialises"
+    )]
+    // SAFETY: tcb valid; the binding is re-read under this client's
+    // sched_lock, its owner.
+    let bound = unsafe {
+        (*tcb).state == ThreadState::Blocked
             && (*tcb).ipc_state == IpcThreadState::BlockedOnFault
             && core::ptr::eq((*tcb).blocked_on_object, blocked_on)
-            && (*server)
+    };
+    // SAFETY: the server is live for the CAS by the CLOSURE LEMMA, behind the
+    // re-read of the binding above under this client's sched_lock.
+    let won = bound
+        && unsafe {
+            (*server)
                 .reply_tcb
                 .compare_exchange(
                     tcb,
@@ -961,14 +1043,17 @@ unsafe fn claim_received_fault(tcb: *mut ThreadControlBlock, blocked_on: *mut u8
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .is_ok();
-        if won
-        {
-            stamp_redeliver(tcb);
-        }
-        (*tcb).sched_lock.unlock_raw(saved);
-        won
+                .is_ok()
+        };
+    if won
+    {
+        // SAFETY: tcb's sched_lock is held, and the CAS win is the park's
+        // exclusive claim.
+        unsafe { stamp_redeliver(tcb) };
     }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    won
 }
 
 /// Stamp a won fault-park claim for redelivery and retire the park binding.
@@ -978,12 +1063,22 @@ unsafe fn claim_received_fault(tcb: *mut ThreadControlBlock, blocked_on: *mut u8
 #[cfg(not(test))]
 unsafe fn stamp_redeliver(tcb: *mut ThreadControlBlock)
 {
-    // SAFETY: caller contract; the binding pair is written under sched_lock.
+    // SAFETY: tcb is a valid TCB whose park claim the caller holds
+    // (contract).
     unsafe {
         (*tcb)
             .fault_outcome
             .store(FAULT_OUTCOME_REDELIVER, Ordering::Release);
-        crate::sched::thread::stamp_deposit_episode(tcb);
+    }
+    // SAFETY: the caller holds the park's exclusive claim (contract).
+    unsafe { crate::sched::thread::stamp_deposit_episode(tcb) };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access writes the park binding of tcb, which the held sched_lock \
+                  serialises"
+    )]
+    // SAFETY: caller contract; the binding pair is written under sched_lock.
+    unsafe {
         (*tcb).ipc_state = IpcThreadState::None;
         (*tcb).blocked_on_object = core::ptr::null_mut();
     }

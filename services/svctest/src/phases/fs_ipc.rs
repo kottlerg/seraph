@@ -753,9 +753,11 @@ pub fn fs_write_cache_coherence_phase(_: &Caps)
     std::os::seraph::log!("fs_write_cache_coherence phase passed");
 }
 
-// too_many_lines: three scoped write-invariant checks (rights attenuation,
-// empty-file dedupe, FAT chain past EOC) sharing the phase's directory caps.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "three scoped write-invariant checks (rights attenuation, empty-file dedupe, FAT \
+              chain past EOC) sharing the phase's directory caps"
+)]
 pub fn fs_write_invariants_phase(_: &Caps)
 {
     use namespace_protocol::rights;

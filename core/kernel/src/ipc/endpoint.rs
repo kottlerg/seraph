@@ -206,9 +206,9 @@ unsafe fn rollback_uncommitted_call(
     parked_state: IpcThreadState,
 )
 {
-    // SAFETY: server / caller valid per caller contract.
-    unsafe {
-        let cleared = (*server)
+    // SAFETY: server is a valid TCB per the caller contract.
+    let cleared = unsafe {
+        (*server)
             .reply_tcb
             .compare_exchange(
                 caller,
@@ -216,18 +216,30 @@ unsafe fn rollback_uncommitted_call(
                 core::sync::atomic::Ordering::AcqRel,
                 core::sync::atomic::Ordering::Acquire,
             )
-            .is_ok();
-        if cleared
-        {
+            .is_ok()
+    };
+    if cleared
+    {
+        // SAFETY: caller is a valid TCB per the caller contract, and the CAS
+        // win is its episode's exclusive claim.
+        unsafe {
             crate::sched::thread::stamp_cancelled_deposit(
                 caller,
                 crate::sched::thread::ParkKind::of_blocked(parked_state),
             );
-            crate::ipc::cancel_timed_entry(caller);
+        }
+        // SAFETY: the CAS just claimed caller's park episode, which has not
+        // woken; the sleep-list lock nests under the held endpoint lock.
+        unsafe { crate::ipc::cancel_timed_entry(caller) };
+        // SAFETY: caller is a valid TCB per the caller contract.
+        unsafe {
             (*caller)
                 .wake_in_flight
                 .store(0, core::sync::atomic::Ordering::Release);
         }
+    }
+    // SAFETY: caller is a valid TCB per the caller contract.
+    unsafe {
         (*caller)
             .context_saved
             .store(1, core::sync::atomic::Ordering::Relaxed);
@@ -261,6 +273,14 @@ unsafe fn rollback_uncommitted_call(
 /// # Safety
 /// `ep` and `caller` must be valid, and `caller` must be the running thread.
 /// Call with no scheduler lock and no `ep.lock` held.
+// too_many_lines: one rendezvous under one ep.lock hold, whose two arms (bind
+// a waiting server, or park on the send queue) each commit the caller's park
+// before the lock is released; the TCB accesses take one unsafe operation per
+// block (docs/coding-standards.md § Unsafe Code).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one rendezvous whose arms commit the caller's park under one ep.lock hold"
+)]
 #[cfg(not(test))]
 pub unsafe fn endpoint_call(
     ep: *mut EndpointState,
@@ -301,11 +321,20 @@ pub unsafe fn endpoint_call(
                 "endpoint_call: server not Blocked"
             );
         }
-        // SAFETY: server dequeued from recv_head; ipc_msg / reply_tcb are
-        // data fields written under ep.lock. State transitions are
-        // committed by enqueue_and_wake.
+        // SAFETY: server dequeued from recv_head; ipc_msg is a data field
+        // written under ep.lock. State transitions are committed by
+        // enqueue_and_wake.
         unsafe {
             (*server).ipc_msg = *msg;
+        }
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to an atomic field of caller, the running thread's valid TCB \
+                      by this function's contract"
+        )]
+        // SAFETY: caller is the running thread's valid TCB (this function's
+        // contract), and each field written is an atomic.
+        unsafe {
             // Clear context_saved BEFORE the caller becomes wakeable. Every
             // reply-wake claimant reaches the caller through `reply_tcb`
             // (endpoint_reply, dealloc's BlockedOnReply detach and server arm,
@@ -337,6 +366,15 @@ pub unsafe fn endpoint_call(
             (*caller)
                 .sleep_deadline
                 .store(deadline, core::sync::atomic::Ordering::Relaxed);
+        }
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to an atomic field of server, a live TCB dequeued under the \
+                      held ep.lock"
+        )]
+        // SAFETY: server was dequeued from recv_head under the held ep.lock,
+        // so it is a live TCB this call has claimed; each field is an atomic.
+        unsafe {
             // The server reached the recv queue through endpoint_recv, which
             // released any binding it still held, so the slot is empty.
             debug_assert!(
@@ -396,10 +434,14 @@ pub unsafe fn endpoint_call(
     // SAFETY: caller validated by syscall layer.
     unsafe {
         (*caller).ipc_msg = *msg;
-        enqueue(&mut ep.send_head, &mut ep.send_tail, caller);
-        // Publish the send-queue level before the wait-set notify below.
-        ep.refresh_send_ready();
     }
+    // SAFETY: caller is the running thread, on no wait queue; ep.lock held.
+    unsafe {
+        enqueue(&mut ep.send_head, &mut ep.send_tail, caller);
+    }
+    // Publish the send-queue level before the wait-set notify below.
+    // SAFETY: ep.lock held.
+    unsafe { ep.refresh_send_ready() };
     // cast_ptr_alignment: the cast is to `*mut u8` (alignment 1), so it cannot
     // misalign; `blocked_on_object` is restored to `EndpointState` only by readers
     // keyed on `ipc_state`.
@@ -418,17 +460,23 @@ pub unsafe fn endpoint_call(
     {
         // Refused park (stop won, a pending upcall, or a stray coalesced wake
         // — each cancels the call); unlink from the send queue.
-        // SAFETY: ep.lock held.
+        // SAFETY: ep.lock held; caller is a valid TCB.
         unsafe {
             let _ = unlink_from_wait_queue(caller, &mut ep.send_head, &mut ep.send_tail);
-            ep.refresh_send_ready();
-            // ep.lock has been held continuously since the enqueue above, so
-            // this teardown is the episode's sole owner: stamp so the stopped
-            // caller's restart resumes via the disposition.
-            crate::sched::thread::stamp_cancelled_deposit(
-                caller,
-                crate::sched::thread::ParkKind::of_sender(caller),
-            );
+        }
+        // SAFETY: ep.lock held.
+        unsafe { ep.refresh_send_ready() };
+        // ep.lock has been held continuously since the enqueue above, so
+        // this teardown is the episode's sole owner: stamp so the stopped
+        // caller's restart resumes via the disposition.
+        // SAFETY: caller is the running thread, which owns its own
+        // in_fault_delivery, and this teardown holds its park claim.
+        let kind = unsafe { crate::sched::thread::ParkKind::of_sender(caller) };
+        // SAFETY: as above, this teardown is the episode's exclusive claimant
+        // (a failed park commit's binding teardown under the held ep.lock).
+        unsafe { crate::sched::thread::stamp_cancelled_deposit(caller, kind) };
+        // SAFETY: caller is a valid TCB; context_saved is an atomic.
+        unsafe {
             (*caller)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);
@@ -501,17 +549,21 @@ unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
     {
         return;
     }
-    // SAFETY: the swap won the caller's episode, and its wake_in_flight pin
-    // keeps the TCB allocated until enqueue_and_wake clears it.
-    unsafe {
-        crate::sched::thread::stamp_cancelled_deposit(
-            caller,
-            crate::sched::thread::ParkKind::of_sender(caller),
-        );
-        crate::ipc::cancel_timed_entry(caller);
-        let target_cpu = crate::sched::select_target_cpu(caller);
-        crate::sched::enqueue_and_wake(caller, target_cpu);
-    }
+    // SAFETY: the swap won the caller's episode, so this thread holds its park
+    // claim, and its wake_in_flight pin keeps the TCB allocated until
+    // enqueue_and_wake clears it.
+    let kind = unsafe { crate::sched::thread::ParkKind::of_sender(caller) };
+    // SAFETY: the swap is the episode's exclusive claim; the pin keeps caller
+    // allocated.
+    unsafe { crate::sched::thread::stamp_cancelled_deposit(caller, kind) };
+    // SAFETY: the swap just claimed caller's park episode, which has not
+    // woken; no sleep-list lock is held (contract).
+    unsafe { crate::ipc::cancel_timed_entry(caller) };
+    // SAFETY: the wake_in_flight pin keeps caller a valid TCB.
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    // SAFETY: caller is valid (pinned), target_cpu came from
+    // select_target_cpu, and no scheduler lock is held (contract).
+    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
 }
 
 /// Dequeue the first live sender on `ep` and bind it to `server` for the
@@ -603,12 +655,17 @@ unsafe fn bind_next_sender(
         // before releasing the wake-in-flight gate — after the release a
         // dying caller's dealloc may free the TCB. The refusal already
         // removed a timed call's entry. Then skip this dead sender.
-        // SAFETY: caller validated; ep.lock held.
+        // SAFETY: caller validated; ep.lock held, and the send-queue dequeue
+        // is the episode's exclusive claim.
         unsafe {
             crate::sched::thread::stamp_cancelled_deposit(
                 caller,
                 crate::sched::thread::ParkKind::of_blocked(parked),
             );
+        }
+        // SAFETY: caller is a valid TCB dequeued under ep.lock;
+        // wake_in_flight is an atomic.
+        unsafe {
             (*caller)
                 .wake_in_flight
                 .store(0, core::sync::atomic::Ordering::Release);
@@ -696,16 +753,23 @@ pub unsafe fn endpoint_recv(
         // A stop-won or upcall refusal stamps INTERRUPTED so the server's
         // resume reports the cancellation instead of publishing a stale
         // ipc_msg; a coalesced-wake refusal leaves the deposit standing.
-        // SAFETY: ep.lock held.
+        // SAFETY: ep.lock held; server is a valid TCB.
         unsafe {
             unlink_from_wait_queue(server, &mut ep.recv_head, &mut ep.recv_tail);
-            if committed == crate::sched::ParkCommit::RefusedStop
-            {
+        }
+        if committed == crate::sched::ParkCommit::RefusedStop
+        {
+            // SAFETY: the rollback under the continuously held ep.lock is
+            // the episode's exclusive claimant.
+            unsafe {
                 crate::sched::thread::stamp_park_deposit(
                     server,
                     crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
                 );
             }
+        }
+        // SAFETY: server is a valid TCB; context_saved is an atomic.
+        unsafe {
             (*server)
                 .context_saved
                 .store(1, core::sync::atomic::Ordering::Relaxed);

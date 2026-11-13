@@ -65,9 +65,11 @@ pub unsafe fn discover_uart(st: *mut EfiSystemTable)
         // SAFETY: rsdp obtained from UEFI config table; identity-mapped during boot.
         if let Some(base) = unsafe { find_spcr_base(rsdp_ptr as u64) }
         {
-            // SAFETY: single-threaded boot phase; no concurrent access to static mut;
-            // usize is 64-bit on all supported UEFI targets; no truncation.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "usize is 64-bit on all supported UEFI targets, so the cast is exact"
+            )]
+            // SAFETY: single-threaded boot phase; no concurrent access to static mut.
             unsafe {
                 UART_BASE_ADDR = base as usize;
             };
@@ -83,8 +85,11 @@ pub unsafe fn discover_uart(st: *mut EfiSystemTable)
         // SAFETY: dtb_addr obtained from UEFI config table; identity-mapped and accessible during boot.
         if let Some(base) = unsafe { find_dtb_uart_base(dtb_addr) }
         {
-            // SAFETY: single-threaded boot phase; no concurrent access to static mut; usize is 64-bit on all supported UEFI targets; no truncation.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "usize is 64-bit on all supported UEFI targets, so the cast is exact"
+            )]
+            // SAFETY: single-threaded boot phase; no concurrent access to static mut.
             unsafe {
                 UART_BASE_ADDR = base as usize;
             };

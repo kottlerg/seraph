@@ -60,8 +60,10 @@ extern "C" fn notification_pong_entry(arg: u64) -> !
     thread_exit()
 }
 
-// similar_names: ping/pong are intentionally paired names for the two directions.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "ping/pong are intentionally paired names for the two directions"
+)]
 pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
 {
     const RIGHTS_NOTIFY: u64 = syscall_abi::RIGHTS_NTF_NOTIFY;

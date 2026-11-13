@@ -116,10 +116,11 @@ struct IpcBufPage([u64; 512]);
 // Used only by phase 4's single child (phases run sequentially).
 static mut CHILD_IPC_BUF: IpcBufPage = IpcBufPage([0u64; 512]);
 
-// too_many_lines: six flat sequential phases, one per parking surface; each
-// is independent and short, and splitting would scatter the shared
-// done/acc bit plumbing.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "six flat sequential phases, one per parking surface; each is independent and short, \
+              and splitting would scatter the shared done/acc bit plumbing"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let done = cap_create_notification(ctx.memory_base)

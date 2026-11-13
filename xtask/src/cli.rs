@@ -318,11 +318,12 @@ fn parse_build_component(text: &str) -> Result<BuildComponent, String>
 
 // ── Run ───────────────────────────────────────────────────────────────────────
 
-// struct_excessive_bools: each bool is an independent command-line switch
-// (`--gdb`, `--headless`, `--verbose`, `--second-disk-shared-line`,
-// `--test-devices`) that clap maps one-to-one; they are not states of one
-// machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line switch (`--gdb`, `--headless`, `--verbose`, \
+              `--second-disk-shared-line`, `--test-devices`) that clap maps one-to-one; they are \
+              not states of one machine"
+)]
 #[derive(Parser)]
 pub struct RunArgs
 {
@@ -732,11 +733,12 @@ pub const DEFAULT_PASS_REGEX: &str = "ALL TESTS PASSED";
 /// Default `run-parallel --fail-grace-secs`.
 pub const DEFAULT_FAIL_GRACE_SECS: u64 = 10;
 
-// struct_excessive_bools: each bool is an independent command-line switch
-// (`--debug-listen`, `--hold-on-hang`, `--second-disk-shared-line`,
-// `--test-devices`) that clap maps one-to-one; they are not states of one
-// machine.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is an independent command-line switch (`--debug-listen`, `--hold-on-hang`, \
+              `--second-disk-shared-line`, `--test-devices`) that clap maps one-to-one; they are \
+              not states of one machine"
+)]
 #[derive(Parser)]
 pub struct RunParallelArgs
 {

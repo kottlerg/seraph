@@ -64,9 +64,10 @@ const _: () = assert!(INDIRECT_SLOT_INDEX >> 32 == 0);
 /// A slot past the direct region's `DIRECT_LEAVES` × `CSPACE_SLOTS_PER_PAGE`
 /// slots, under the first directory page: 20 slots into the third leaf past
 /// the direct region.
-// cast_possible_truncation: the assert above keeps INDIRECT_SLOT_INDEX
-// within u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the assert above keeps INDIRECT_SLOT_INDEX within u32"
+)]
 const INDIRECT_SLOT: u32 = INDIRECT_SLOT_INDEX as u32;
 
 /// Pool pages a `CSpace` with no grown leaf spends to cover slot `index`
@@ -120,9 +121,12 @@ fn install_stub(ctx: &TestContext, aspace: u64, code: &[u8]) -> Result<u64, &'st
     }
     for (i, b) in code.iter().enumerate()
     {
-        // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above; i is
-        // below the stub's length, which the check above keeps within a page.
-        unsafe { (STUB_SCRATCH_VA as *mut u8).add(i).write_volatile(*b) };
+        // SAFETY: i is below the stub's length, which the check above keeps
+        // within a page, so the byte lies in STUB_SCRATCH_VA..+PAGE.
+        let dst = unsafe { (STUB_SCRATCH_VA as *mut u8).add(i) };
+        // SAFETY: STUB_SCRATCH_VA..+PAGE is mapped writable just above, and
+        // `dst` is a byte of it.
+        unsafe { dst.write_volatile(*b) };
     }
     // SAFETY: `STUB_SCRATCH_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.

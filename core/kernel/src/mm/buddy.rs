@@ -1032,10 +1032,9 @@ mod tests
     {
         let mut alloc = Alloc::new();
         // SAFETY: SparseWindow backs every header slot.
-        unsafe {
-            alloc.add_region(BASE, BASE + pages(M));
-            alloc.add_region(BASE + pages(2 * M), BASE + pages(4 * M));
-        }
+        unsafe { alloc.add_region(BASE, BASE + pages(M)) };
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(2 * M), BASE + pages(4 * M)) };
         let base = alloc.alloc_contiguous((2 * M) as usize).expect("run");
         assert_eq!(base, BASE + pages(2 * M));
         assert_eq!(alloc.alloc(MAX_ORDER), Some(BASE));
@@ -1047,10 +1046,9 @@ mod tests
     {
         let mut alloc = Alloc::new();
         // SAFETY: SparseWindow backs every header slot.
-        unsafe {
-            alloc.add_region(BASE, BASE + pages(M));
-            alloc.add_region(BASE + pages(2 * M), BASE + pages(3 * M));
-        }
+        unsafe { alloc.add_region(BASE, BASE + pages(M)) };
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(2 * M), BASE + pages(3 * M)) };
         assert_eq!(alloc.alloc_contiguous((M + 1) as usize), None);
         assert_eq!(alloc.free_page_count() as u64, 2 * M);
         assert!(alloc.alloc(MAX_ORDER).is_some());
@@ -1120,10 +1118,9 @@ mod tests
         let mut alloc = Alloc::new();
         let high = BASE + pages(1 << 12);
         // SAFETY: SparseWindow backs every header slot.
-        unsafe {
-            alloc.add_region(high, high + pages(5000));
-            alloc.add_region(BASE + pages(3), BASE + pages(100));
-        }
+        unsafe { alloc.add_region(high, high + pages(5000)) };
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(3), BASE + pages(100)) };
         let taken = alloc.alloc(0).expect("alloc");
         let free_before = alloc.free_page_count() as u64;
 
@@ -1151,10 +1148,9 @@ mod tests
         let mut alloc = Alloc::new();
         let high = BASE + pages(1 << 12);
         // SAFETY: SparseWindow backs every header slot.
-        unsafe {
-            alloc.add_region(high, high + pages(5000));
-            alloc.add_region(BASE + pages(3), BASE + pages(100));
-        }
+        unsafe { alloc.add_region(high, high + pages(5000)) };
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(3), BASE + pages(100)) };
         // Page 3, the lower region's only order-0 block, so it moves that
         // extent's base without splitting it.
         let taken = alloc.alloc(0).expect("alloc");
@@ -1193,8 +1189,9 @@ mod tests
             {
                 let mut alloc = Alloc::new();
                 // SAFETY: SparseWindow backs every header slot.
+                unsafe { alloc.add_region(BASE + pages(offset), BASE + pages(offset + len)) };
+                // SAFETY: SparseWindow backs every header slot.
                 unsafe {
-                    alloc.add_region(BASE + pages(offset), BASE + pages(offset + len));
                     alloc.add_region(
                         BASE + pages(offset + len + 9),
                         BASE + pages(offset + len + 40),
@@ -1237,11 +1234,11 @@ mod tests
     {
         let mut alloc = Alloc::new();
         // SAFETY: SparseWindow backs every header slot.
-        unsafe {
-            alloc.add_region(BASE, BASE + pages(1));
-            alloc.add_region(BASE + pages(2), BASE + pages(3));
-            alloc.add_region(BASE + pages(4), BASE + pages(5));
-        }
+        unsafe { alloc.add_region(BASE, BASE + pages(1)) };
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(2), BASE + pages(3)) };
+        // SAFETY: SparseWindow backs every header slot.
+        unsafe { alloc.add_region(BASE + pages(4), BASE + pages(5)) };
         let mut out = [(0u64, 0u64); 2];
         assert_eq!(
             alloc.drain_coalesced(out.len(), |i, base, size| out[i] = (base, size)),

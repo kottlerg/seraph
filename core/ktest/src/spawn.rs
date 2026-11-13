@@ -68,12 +68,13 @@ impl<T: Copy, const N: usize> ArgBlock<T, N>
     pub unsafe fn publish(&self, index: usize, value: T) -> u64
     {
         debug_assert!(index < N, "ArgBlock::publish: index out of range");
-        // SAFETY: index < N; exclusive access per the caller contract.
-        unsafe {
-            let entry = self.0.get().cast::<T>().add(index);
-            entry.write(value);
-            entry as u64
-        }
+        // SAFETY: index < N per the caller contract, so the entry lies inside
+        // the block's array.
+        let entry = unsafe { self.0.get().cast::<T>().add(index) };
+        // SAFETY: `entry` is entry `index` of the array, which no child reads
+        // per the caller contract, so the write is exclusive.
+        unsafe { entry.write(value) };
+        entry as u64
     }
 }
 

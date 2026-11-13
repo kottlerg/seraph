@@ -21,9 +21,6 @@ pub fn epoch_to_ymdhms(secs: u64) -> (u32, u32, u32, u32, u32, u32)
 /// [`epoch_to_ymdhms`], `None` when an intermediate overflows. Every step but
 /// the era's year term is bounded by the era's 146 097 days, so only an
 /// out-of-range year reaches `None`.
-// cast_possible_truncation: the second of the day (< 86 400) and the day of
-// the era (< 146 097) fit u32.
-#[allow(clippy::cast_possible_truncation)]
 fn civil_from_secs(secs: u64) -> Option<(u32, u32, u32, u32, u32, u32)>
 {
     let days = secs / 86_400;

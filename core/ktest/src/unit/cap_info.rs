@@ -49,20 +49,26 @@ const TAG_SIGNAL: u8 = 4;
 const TAG_CSPACE: u8 = 9;
 
 // Memory RETYPE bit, cast to the 32-bit rights half of the packed
-// CAP_INFO_TAG_RIGHTS value. The ABI guarantees every rights bit fits u32.
-#[allow(clippy::cast_possible_truncation)]
+// CAP_INFO_TAG_RIGHTS value.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the ABI guarantees every rights bit fits u32"
+)]
 const RIGHTS_RETYPE_BIT: u32 = syscall_abi::RIGHTS_MEM_RETYPE as u32;
 
 /// Decode a `CAP_INFO_TAG_RIGHTS` packed return: `(tag << 32) | rights`.
 fn unpack_tag_rights(value: u64) -> (u8, u32)
 {
-    // The kernel guarantees the high 32 bits hold an 8-bit tag (zero-extended)
-    // and the low 32 bits hold the rights bitmask. The casts are exact and
-    // truncating only the deliberately-zero upper bits.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the kernel guarantees the high 32 bits hold an 8-bit tag (zero-extended), so the \
+                  cast drops only deliberately-zero upper bits"
+    )]
     let tag = (value >> 32) as u8;
-    // The low 32 bits are the rights bitmask; the cast drops only the tag half.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the low 32 bits are the rights bitmask; the cast drops only the tag half"
+    )]
     let rights = value as u32;
     (tag, rights)
 }
@@ -511,9 +517,11 @@ pub fn creation_masks_match_abi(ctx: &TestContext) -> TestResult
 /// Rights word of `cap` (via `CAP_INFO_TAG_RIGHTS`) equals `expected` exactly.
 fn check_mask(cap: u64, expected: u64, what: &'static str) -> TestResult
 {
-    // The ABI constants are u64 with all bits in the low 32 (asserted by the
-    // abi host tests); the rights half of the packed value is u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "The ABI constants are u64 with all bits in the low 32 (asserted by the abi host \
+                  tests); the rights half of the packed value is u32"
+    )]
     let expected32 = expected as u32;
     let value = cap_info(cap, CAP_INFO_TAG_RIGHTS).map_err(|_| what)?;
     let (_tag, rights) = unpack_tag_rights(value);

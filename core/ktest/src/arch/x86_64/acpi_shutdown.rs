@@ -120,12 +120,14 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
         let _ = unsafe { syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages) };
         return None;
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "PM1a_CNT_BLK is an x86 I/O port address, at most 0xFFFF; the upper 16 bits of the \
+                  32-bit field are zero"
+    )]
     // SAFETY: find_table_in_acpi_regions mapped the region, and the check
     // above keeps [table_vaddr, table_vaddr + FADT_END) inside it, which
     // covers PM1a_CNT_BLK (offset 64, 4 bytes).
-    // cast_possible_truncation: PM1a_CNT_BLK is an x86 I/O port address, at
-    // most 0xFFFF; the upper 16 bits of the 32-bit field are zero.
-    #[allow(clippy::cast_possible_truncation)]
     let pm1a = unsafe { read_u32_at(table_vaddr, FADT_OFF_PM1A_CNT_BLK) } as u16;
     // SAFETY: as above; DSDT (offset 40, 4 bytes) lies below FADT_END.
     let dsdt32 = unsafe { read_u32_at(table_vaddr, FADT_OFF_DSDT) };
@@ -390,8 +392,14 @@ unsafe fn read_u32_at(vaddr: u64, off: usize) -> u32
 {
     // SAFETY: caller guarantees vaddr is mapped for off+4 bytes.
     let p = unsafe { (vaddr as *const u8).add(off) };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a byte at a constant offset below 4 from `p`, inside the span \
+                  the caller's contract maps"
+    )]
     // SAFETY: reading 4 consecutive bytes from a valid mapped address.
-    u32::from_le_bytes(unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] })
+    let bytes = unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] };
+    u32::from_le_bytes(bytes)
 }
 
 /// Read a little-endian u64 at byte offset `off` from virtual address `vaddr`.
@@ -402,8 +410,13 @@ unsafe fn read_u64_at(vaddr: u64, off: usize) -> u64
 {
     // SAFETY: caller guarantees vaddr is mapped for off+8 bytes.
     let p = unsafe { (vaddr as *const u8).add(off) };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a byte at a constant offset below 8 from `p`, inside the span \
+                  the caller's contract maps"
+    )]
     // SAFETY: reading 8 consecutive bytes from a valid mapped address.
-    u64::from_le_bytes(unsafe {
+    let bytes = unsafe {
         [
             *p,
             *p.add(1),
@@ -414,5 +427,6 @@ unsafe fn read_u64_at(vaddr: u64, off: usize) -> u64
             *p.add(6),
             *p.add(7),
         ]
-    })
+    };
+    u64::from_le_bytes(bytes)
 }

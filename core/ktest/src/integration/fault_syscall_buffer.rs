@@ -76,13 +76,14 @@ static MEM_SOURCE: [u8; MEM_LEN] = [0x3C; MEM_LEN];
 static mut MEM_TARGET: [u8; MEM_LEN] = [0; MEM_LEN];
 
 /// Bytes of a register frame, the register syscalls' buffer length.
-// cast_possible_truncation: the frame is a few hundred bytes.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the frame is a few hundred bytes"
+)]
 const FRAME_BYTES: usize = crate::arch::TRAP_FRAME_BYTES as usize;
 
 /// Bytes of a page, for zeroing a mapped one.
-// cast_possible_truncation: a page is 4 KiB.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "a page is 4 KiB")]
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 /// Wait-set badges of the endpoint and the report notification.
@@ -697,8 +698,11 @@ extern "C" fn caller_entry(arg: u64) -> !
             };
             r.is_ok()
                 && (0..a.len).all(|i| {
-                    // SAFETY: MEM_TARGET is read through a raw pointer, i < its length.
-                    unsafe { target.add(i).read_volatile() == MEM_PATTERN }
+                    // SAFETY: i < MEM_TARGET's length, so the byte lies inside it.
+                    let byte = unsafe { target.add(i) };
+                    // SAFETY: MEM_TARGET is read through a raw pointer, at a
+                    // byte inside it.
+                    unsafe { byte.read_volatile() == MEM_PATTERN }
                 })
         }
     };
@@ -721,8 +725,10 @@ extern "C" fn landing(_: u64) -> !
 fn landed(va: u64, len: usize) -> bool
 {
     (0..len).any(|i| {
+        // SAFETY: i < len, so the byte lies inside the span.
+        let byte = unsafe { (va as *const u8).add(i) };
         // SAFETY: the span is mapped (the call that wrote it returned), and
         // the read is volatile through a raw pointer.
-        unsafe { ((va as *const u8).add(i)).read_volatile() != 0 }
+        unsafe { byte.read_volatile() != 0 }
     })
 }

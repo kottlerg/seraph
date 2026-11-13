@@ -1893,9 +1893,11 @@ extern "C" fn blocker_entry(arg: u64) -> !
 /// bit-per-CPU encoding is always non-zero for any valid CPU id, so the wake
 /// always lands; a stale-CPU run fails as "Ready-thread migration did not
 /// land on CPU 1" instead of as a timeout.
-// cast_possible_truncation: a CPU id fits in u32, and the `u64::MAX` fallback
-// only feeds `wrapping_shl`, which masks the count modulo 64 anyway.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a CPU id fits in u32, and the `u64::MAX` fallback only feeds `wrapping_shl`, which \
+              masks the count modulo 64 anyway"
+)]
 extern "C" fn report_cpu_entry(sig_slot: u64) -> !
 {
     let cpu = system_info(SystemInfoType::CurrentCpu as u64).unwrap_or(u64::MAX);
@@ -1914,8 +1916,7 @@ extern "C" fn report_cpu_entry(sig_slot: u64) -> !
 /// current CPU id into the per-index slot of [`BALANCE_OBSERVED_CPU`]. When
 /// [`BALANCE_SHOULD_EXIT`] is set, the spinner sends `0xC0FE` on its
 /// notification cap and exits.
-// cast_possible_truncation: CPU ids fit in u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "CPU ids fit in u32")]
 extern "C" fn balance_spinner_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the `BALANCE_ARGS` entry the parent published before
@@ -1945,8 +1946,10 @@ extern "C" fn balance_spinner_entry(arg: u64) -> !
 /// Publishes the latest observed CPU id into [`MIGRATE_OBSERVED_CPU`] on
 /// every iteration. Exits when [`MIGRATE_SHOULD_EXIT`] is set, notifying
 /// the parent first so it can complete `notification_wait`.
-// cast_possible_truncation: CPU ids fit comfortably in u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "CPU ids fit comfortably in u32"
+)]
 extern "C" fn migrate_spinner_entry(sig_slot: u64) -> !
 {
     loop

@@ -1004,9 +1004,10 @@ fn elapsed_us() -> Result<u64, &'static str>
 /// The racer's result word for `error`.
 fn error_word(error: SyscallError) -> u64
 {
-    // cast_sign_loss: the error word is compared and logged, never used as
-    // a count.
-    #[allow(clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the error word is compared and logged, never used as a count"
+    )]
     let word = error as i64 as u64;
     word
 }
@@ -1119,9 +1120,10 @@ extern "C" fn racer_entry(arg: u64) -> !
             Race::Stop => thread_stop(waiter),
             Race::ThreadDelete => cap_delete(waiter),
         };
-        // cast_sign_loss: an error word is stored for comparison and the
-        // failure report only.
-        #[allow(clippy::cast_sign_loss)]
+        #[expect(
+            clippy::cast_sign_loss,
+            reason = "an error word is stored for comparison and the failure report only"
+        )]
         let word = result.map_or_else(|e| e as u64, |()| RESULT_OK);
         RACER_RESULT.store(word, Ordering::Release);
         done = armed;

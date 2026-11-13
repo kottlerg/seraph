@@ -94,14 +94,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     own_space(ctx)?;
     let mut frames = Frames::alloc()?;
     let result = other_space(ctx, &mut frames);
-    // SAFETY: KT_DATA and KT_SHARED are scratch VAs (crate docs § Scratch
-    // VAs), so the spans hold no Rust object or IPC page of ktest; a failure
-    // above may have left them unmapped, which the unmaps tolerate.
-    unsafe {
-        mem_unmap(ctx.aspace_cap, KT_DATA, 2).ok();
-        mem_unmap(ctx.aspace_cap, KT_TEXT, 1).ok();
-        mem_unmap(ctx.aspace_cap, KT_SHARED, 1).ok();
-    }
+    // A failure above may have left any of these spans unmapped, which the
+    // unmaps tolerate.
+    // SAFETY: KT_DATA is a scratch VA (crate docs § Scratch VAs), so its two
+    // pages hold no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, KT_DATA, 2) }.ok();
+    // SAFETY: KT_TEXT is a scratch VA (crate docs § Scratch VAs), so the page
+    // holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, KT_TEXT, 1) }.ok();
+    // SAFETY: KT_SHARED is a scratch VA (crate docs § Scratch VAs), so the
+    // page holds no Rust object or IPC page of ktest.
+    unsafe { mem_unmap(ctx.aspace_cap, KT_SHARED, 1) }.ok();
     // B was deleted by other_space, or is unreachable on its failure paths
     // only through a leaked cap; either way its mappings are gone or kept
     // with the frames, which `release` returns only on success.
@@ -265,24 +268,30 @@ fn map_attenuated(cap: u64, rights: u64, b: u64, va: u64, prot: u64) -> TestResu
 fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u64; 6])
 -> TestResult
 {
-    // SAFETY: KT_DATA and KT_DATA + PAGE are scratch VAs (crate docs § Scratch
-    // VAs), so the spans hold no Rust object or IPC page of ktest.
-    unsafe {
-        mem_map(d0, ctx.aspace_cap, KT_DATA, 0, 1, MAP_WRITABLE)
-            .and_then(|()| mem_map(d1, ctx.aspace_cap, KT_DATA + PAGE, 0, 1, MAP_WRITABLE))
-    }
-    .map_err(|_| "integration::thread_memory: ktest data mem_map failed")?;
+    // SAFETY: KT_DATA is a scratch VA (crate docs § Scratch VAs), so the span
+    // holds no Rust object or IPC page of ktest.
+    unsafe { mem_map(d0, ctx.aspace_cap, KT_DATA, 0, 1, MAP_WRITABLE) }
+        .and_then(|()| {
+            // SAFETY: KT_DATA + PAGE is a scratch VA (crate docs § Scratch
+            // VAs), so the span holds no Rust object or IPC page of ktest.
+            unsafe { mem_map(d1, ctx.aspace_cap, KT_DATA + PAGE, 0, 1, MAP_WRITABLE) }
+        })
+        .map_err(|_| "integration::thread_memory: ktest data mem_map failed")?;
     // SAFETY: `b` is an address space this test created, not ktest's own.
-    unsafe {
-        mem_map(d0, b, B_DATA, 0, 1, MAP_WRITABLE)
-            .and_then(|()| mem_map(d1, b, B_DATA + PAGE, 0, 1, MAP_WRITABLE))
-    }
-    .map_err(|_| "integration::thread_memory: B data mem_map failed")?;
+    unsafe { mem_map(d0, b, B_DATA, 0, 1, MAP_WRITABLE) }
+        .and_then(|()| {
+            // SAFETY: `b` is an address space this test created, not ktest's
+            // own.
+            unsafe { mem_map(d1, b, B_DATA + PAGE, 0, 1, MAP_WRITABLE) }
+        })
+        .map_err(|_| "integration::thread_memory: B data mem_map failed")?;
     for (i, addr) in (KT_DATA..KT_DATA + 2 * PAGE).enumerate()
     {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the pattern keeps the low byte on purpose"
+        )]
         // SAFETY: KT_DATA..+2 pages is mapped writable just above.
-        // cast_possible_truncation: the pattern keeps the low byte on purpose.
-        #[allow(clippy::cast_possible_truncation)]
         unsafe {
             (addr as *mut u8).write_volatile(i as u8 ^ 0x5A);
         };
@@ -295,8 +304,11 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u6
         .map_err(|_| "integration::thread_memory: ktest text mem_map failed")?;
     for (i, byte) in TEXT_OLD.iter().enumerate()
     {
-        // SAFETY: KT_TEXT's page is mapped writable just above; i < 8.
-        unsafe { ((KT_TEXT as *mut u8).add(i)).write_volatile(*byte) };
+        // SAFETY: i < 8, so the byte lies inside KT_TEXT's page.
+        let dst = unsafe { (KT_TEXT as *mut u8).add(i) };
+        // SAFETY: KT_TEXT's page is mapped writable just above, and `dst` is
+        // a byte of it.
+        unsafe { dst.write_volatile(*byte) };
     }
     // SAFETY: KT_TEXT is a scratch VA (crate docs § Scratch VAs).
     unsafe { mem_unmap(ctx.aspace_cap, KT_TEXT, 1) }
@@ -359,8 +371,10 @@ fn data_copies(th: u64) -> TestResult
     }
     for (i, byte) in got.iter().enumerate()
     {
-        // cast_possible_truncation: the pattern keeps the low byte on purpose.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the pattern keeps the low byte on purpose"
+        )]
         let want = (PAGE - 100)
             .checked_add(i as u64)
             .ok_or("integration::thread_memory: pattern offset overflows")?

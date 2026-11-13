@@ -10,8 +10,9 @@
 //! firmware table addresses, exits UEFI boot services, populates `BootInfo`,
 //! and jumps to the kernel entry point. See `core/boot/docs/boot-flow.md` for the step-by-step design.
 
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+// Staged roll-outs of these lints: docs/coding-standards.md § Clippy.
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
@@ -50,6 +51,8 @@ const MAX_MODULES: usize = boot_protocol::MAX_BOOT_MODULES;
 
 /// `\EFI\seraph\kernel` as a NUL-terminated UTF-16 path for
 /// `EFI_FILE_PROTOCOL.Open()`.
+// rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
+// spread one per line.
 #[rustfmt::skip]
 static KERNEL_PATH: [u16; 19] = [
     b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
@@ -61,6 +64,8 @@ static KERNEL_PATH: [u16; 19] = [
 /// `\EFI\seraph\nokaslr` as a NUL-terminated UTF-16 path — the presence of
 /// this file disables KASLR for deterministic debugging (staged by
 /// `cargo xtask mkdisk --no-kaslr`).
+// rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
+// spread one per line.
 #[rustfmt::skip]
 static NOKASLR_PATH: [u16; 20] = [
     b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
@@ -73,6 +78,8 @@ static NOKASLR_PATH: [u16; 20] = [
 /// this file makes the first attempt of steps 6 and 7 redo whatever its
 /// map's size, so a boot runs the redo path ([`MapRedo`]; staged by
 /// `cargo xtask test-map-redo`).
+// rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
+// spread one per line.
 #[rustfmt::skip]
 static MAPREDO_PATH: [u16; 20] = [
     b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
@@ -82,6 +89,8 @@ static MAPREDO_PATH: [u16; 20] = [
 ];
 
 /// `\EFI\seraph\bootstrap.bundle` as a NUL-terminated UTF-16 path.
+// rustfmt::skip keeps the UTF-16 code units in rows of five, which rustfmt would
+// spread one per line.
 #[rustfmt::skip]
 static BUNDLE_PATH: [u16; 29] = [
     b'\\' as u16, b'E' as u16, b'F' as u16, b'I' as u16, b'\\' as u16,
@@ -360,10 +369,13 @@ struct BootAllocations
 /// Returns a `usize` (UEFI `EFI_STATUS`) to satisfy the UEFI ABI, but in
 /// practice never returns — the boot sequence either jumps to the kernel or
 /// halts on error.
-// UEFI entry point — must be a public non-unsafe `extern "efiapi"` function per the UEFI spec;
-// the raw-pointer parameters are the firmware-supplied image handle and system table, trusted
-// per the UEFI calling contract and passed only to the unsafe callees below.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "UEFI entry point: must be a public non-unsafe `extern \"efiapi\"` function per the \
+              UEFI spec; the raw-pointer parameters are the firmware-supplied image handle and \
+              system table, trusted per the UEFI calling contract and passed only to the unsafe \
+              callees below"
+)]
 #[unsafe(no_mangle)]
 pub extern "efiapi" fn efi_main(image: EfiHandle, st: *mut EfiSystemTable) -> usize
 {
@@ -583,9 +595,11 @@ unsafe fn step2_load_bundle(ctx: &UefiContext) -> Result<BundleLoad, BootError>
             "\\EFI\\seraph\\bootstrap.bundle",
         )?
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "usize is 64-bit on every UEFI target Seraph supports, so the cast is exact"
+    )]
     // SAFETY: file is a valid open file handle.
-    // cast_possible_truncation: usize is 64-bit on every UEFI target Seraph supports.
-    #[allow(clippy::cast_possible_truncation)]
     let len = unsafe { file_size(file)? } as usize;
     if len == 0
     {
@@ -622,9 +636,12 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
     // SAFETY: esp_root is a valid directory handle; path is null-terminated UTF-16.
     let kernel_file =
         unsafe { open_file(ctx.esp_root, KERNEL_PATH.as_ptr(), "\\EFI\\seraph\\kernel")? };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "file size is a u64 from UEFI; usize is 64-bit on all supported targets, so the \
+                  cast is exact"
+    )]
     // SAFETY: kernel_file is a valid open file handle.
-    // File size is a u64 from UEFI; usize is 64-bit on all supported targets so cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
     let kernel_file_sz = unsafe { file_size(kernel_file)? } as usize;
     let buf_pages = kernel_file_sz.div_ceil(4096);
     // SAFETY: bs is valid.
@@ -661,10 +678,13 @@ unsafe fn step3_load_kernel(ctx: &UefiContext) -> Result<KernelLoad, BootError>
 
 // ── Step 4: Parse bundle, pre-parse init ELF, collect modules ────────────────
 
-/// The `len` bytes of `bytes` from `start`, or `None` when the body ends past
-/// the end of `bytes` or its end overflows `usize`.
-fn bundle_body(bytes: &[u8], start: usize, len: usize) -> Option<&[u8]>
+/// The `len` bytes of `bytes` from `start`, a bundle entry's `offset` and
+/// `size`, or `None` when the body ends past the end of `bytes` or its start,
+/// length or end does not fit `usize`.
+fn bundle_body(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]>
 {
+    let start = usize::try_from(start).ok()?;
+    let len = usize::try_from(len).ok()?;
     bytes.get(start..start.checked_add(len)?)
 }
 
@@ -683,10 +703,12 @@ unsafe fn step4_parse_bundle(
 {
     bprintln!("[--------] boot: step 4/10: parse bundle (init + modules)");
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "usize is 64-bit on every UEFI target Seraph supports, so the len cast is exact"
+    )]
     // SAFETY: bundle_load.phys names a valid identity-mapped UEFI allocation
-    // of `pages * 4096 >= len` bytes; we read exactly `len` bytes. usize is
-    // 64-bit on every UEFI target Seraph supports, so the len cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
+    // of `pages * 4096 >= len` bytes; we read exactly `len` bytes.
     let bytes = unsafe {
         core::slice::from_raw_parts(bundle_load.phys as *const u8, bundle_load.len as usize)
     };
@@ -732,14 +754,7 @@ unsafe fn step4_parse_bundle(
             return Err(BootError::InvalidBundle("bundle truncated"));
         };
         let name = bundle::name_str(&entry.name);
-        // usize is 64-bit on every UEFI target Seraph supports; parse_header
-        // already bounds-checked offset+size against `bytes.len()`.
-        #[allow(clippy::cast_possible_truncation)]
-        let body_start = entry.offset as usize;
-        // usize is 64-bit on every UEFI target Seraph supports, so the size cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
-        let body_len = entry.size as usize;
-        let Some(body) = bundle_body(bytes, body_start, body_len)
+        let Some(body) = bundle_body(bytes, entry.offset, entry.size)
         else
         {
             return Err(BootError::InvalidBundle("bundle body past file end"));
@@ -1055,11 +1070,13 @@ unsafe fn step5c_fetch_boot_entropy(ctx: &UefiContext, firm: &FirmwareInfo, out:
     let mut dtb_seed = [0u8; 32];
     // SAFETY: firm.device_tree is 0 or an identity-mapped writable FDT.
     let n = unsafe { dtb::parse_rng_seed(firm.device_tree, &mut dtb_seed) };
-    // n ≤ 32 (dtb_seed length), so `drawn` is the first n bytes and every cast
-    // below is exact.
     let drawn = dtb_seed.get(..n).unwrap_or_default();
     let split = drawn.split_at_checked(16).filter(|_| drawn.len() >= 24);
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "n is at most 32 (dtb_seed length), so `drawn` is the first n bytes and every \
+                  cast below is exact"
+    )]
     if let Some((key, pool)) = split
     {
         let mut kb = [0u8; 16];
@@ -1254,10 +1271,12 @@ unsafe fn knob_present(ctx: &UefiContext, path: &[u16], name: &'static str) -> b
 /// # Safety
 /// `ctx.bs` must be valid pre-exit; all addresses in `kernel` and `init` must
 /// come from their respective `step3`/`step4*` outputs.
-// too_many_arguments: step 6 sizes its allocations from every earlier step's
-// output (the bundle, kernel and init loads, the CPU topology, the firmware
-// tables for the seed counts), plus the retry's slack.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "step 6 sizes its allocations from every earlier step's output (the bundle, kernel \
+              and init loads, the CPU topology, the firmware tables for the seed counts), plus the \
+              retry's slack"
+)]
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
     bundle: &BundleLoad,
@@ -1742,9 +1761,11 @@ fn step6_and_7_spans(
     map_buffer: (u64, usize),
 ) -> [(u64, usize); 10]
 {
-    // cast_possible_truncation: the pool is sized by table_frame_bound, a few
-    // hundred frames, far below usize::MAX on every target.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the pool is sized by table_frame_bound, a few hundred frames, far below \
+                  usize::MAX on every target"
+    )]
     let pool_pages = pool.1 as usize;
     [
         (allocs.boot_info_phys, 1),
@@ -1820,14 +1841,16 @@ unsafe fn step8_exit_boot_services(
 /// # Safety
 /// All physical allocations named in `allocs` must remain identity-mapped and
 /// writable. `uefi_map` must be the exited-boot memory map from step 7.
-// BootInfo population is the fan-in point for every earlier step: bundle,
-// kernel, init, modules, firmware, cpu topology, boot entropy, KASLR
-// decision, framebuffer, boot allocations, the memory map, and the page-table
-// frame pool all contribute distinct fields. Bundling them would only rename
-// the argument list into an ad-hoc struct. The too_many_lines allowance
-// covers the inline reclaim-array build below, which sits between aperture
-// derivation and the BootInfo write.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "BootInfo population is the fan-in point for every earlier step: bundle, kernel, \
+              init, modules, firmware, cpu topology, boot entropy, KASLR decision, framebuffer, \
+              boot allocations, the memory map, and the page-table frame pool all contribute \
+              distinct fields, and bundling them would only rename the argument list into an \
+              ad-hoc struct; the inline reclaim-array build, which sits between aperture \
+              derivation and the BootInfo write, makes the body long"
+)]
 unsafe fn step9_populate_boot_info(
     bundle: &BundleLoad,
     kernel: &KernelLoad,
@@ -2023,22 +2046,28 @@ unsafe fn step9_populate_boot_info(
     };
     push_reclaim(allocs.boot_info_phys, 1, 0)?;
     push_reclaim(allocs.modules_phys, 1, 0)?;
-    // The entry array is a few pages per thousand descriptors, far below
-    // u32::MAX pages.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the entry array is a few pages per thousand descriptors, far below u32::MAX \
+                  pages"
+    )]
     {
         push_reclaim(allocs.mem_entries_phys, allocs.mem_entries_pages as u32, 0)?;
     }
-    // The aperture array and the seed buffers are a few pages at most, far
-    // below u32::MAX pages.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the aperture array and the seed buffers are a few pages at most, far below \
+                  u32::MAX pages"
+    )]
     {
         push_reclaim(allocs.apertures_phys, allocs.apertures_pages as u32, 0)?;
         push_reclaim(allocs.seeds_phys, allocs.seeds_pages as u32, 0)?;
         push_reclaim(allocs.heuristic_phys, allocs.heuristic_pages as u32, 0)?;
     }
-    // The map buffer is a whole-page allocation far below u32::MAX pages.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the map buffer is a whole-page allocation far below u32::MAX pages"
+    )]
     {
         push_reclaim(
             uefi_map.buffer_phys,
@@ -2048,9 +2077,11 @@ unsafe fn step9_populate_boot_info(
     }
     for &(base, pages) in page_table.reclaim_spans()
     {
-        // The page-table pool is a few hundred pages at most, far below
-        // u32::MAX pages, and the LA57 toggle span is one page.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the page-table pool is a few hundred pages at most, far below u32::MAX \
+                      pages, and the LA57 toggle span is one page"
+        )]
         {
             push_reclaim(base, pages as u32, 0)?;
         }
@@ -2091,9 +2122,11 @@ unsafe fn step9_populate_boot_info(
         );
         if bundle_cursor < module_base
         {
-            // The gap lies inside the bundle allocation, and no UEFI allocation
-            // reaches u32::MAX pages (16 TiB), so the cast is exact.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the gap lies inside the bundle allocation, and no UEFI allocation \
+                          reaches u32::MAX pages (16 TiB), so the cast is exact"
+            )]
             let gap_pages = (module_base.saturating_sub(bundle_cursor) / 4096) as u32;
             push_reclaim(bundle_cursor, gap_pages, 0)?;
         }
@@ -2101,15 +2134,20 @@ unsafe fn step9_populate_boot_info(
     }
     if bundle_cursor < bundle_end
     {
-        // The tail lies inside the bundle allocation (see the gap cast above).
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the tail lies inside the bundle allocation, and no UEFI allocation reaches \
+                      u32::MAX pages (16 TiB), so the cast is exact"
+        )]
         let tail_pages = (bundle_end.saturating_sub(bundle_cursor) / 4096) as u32;
         push_reclaim(bundle_cursor, tail_pages, 0)?;
     }
     // CPU-id pages: the kernel reads them through Phase 8 (SMP bringup), before
     // init, the first user of a reclaimed page, runs.
-    // The array is a few pages at most (`MAX_CPUS` u32s), far below u32::MAX.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the array is a few pages at most (`MAX_CPUS` u32s), far below u32::MAX"
+    )]
     {
         push_reclaim(cpus.ids_phys, cpus.ids_pages as u32, 0)?;
     }
@@ -2603,8 +2641,8 @@ mod tests
         assert_eq!(len, 2);
     }
 
-    // Defect caught: a body whose offset plus size wraps `usize` or ends past
-    // the file passing as a slice of it (or panicking).
+    // Defect caught: a body whose offset plus size wraps `usize`, or ends past
+    // the file, passing as a slice of it (or panicking).
     #[test]
     fn a_bundle_body_past_the_file_or_overflowing_is_refused()
     {
@@ -2613,7 +2651,11 @@ mod tests
         assert_eq!(bundle_body(&bytes, 4, 0), Some(&bytes[4..4]));
         assert_eq!(bundle_body(&bytes, 2, 3), None);
         assert_eq!(bundle_body(&bytes, 5, 0), None);
-        assert_eq!(bundle_body(&bytes, usize::MAX, 2), None);
+        assert_eq!(
+            bundle_body(&bytes, u64::try_from(usize::MAX).unwrap(), 2),
+            None
+        );
+        assert_eq!(bundle_body(&bytes, u64::MAX, 0), None);
     }
 
     // Defect caught: a framebuffer whose span wraps the address space seeding

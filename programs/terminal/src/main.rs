@@ -25,6 +25,7 @@
 //! job-control/multi-session (#29) and the real interactive shell (#112).
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 mod input;
 mod output;

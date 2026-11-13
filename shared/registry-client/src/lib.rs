@@ -37,6 +37,7 @@
 #![cfg_attr(not(any(feature = "rustc-dep-of-std", test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 // Without `#![no_std]`, the prelude is implicit. With `no_core`, it is
 // not — we must re-alias the workspace-core stub as `core` and pull

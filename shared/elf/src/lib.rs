@@ -19,6 +19,7 @@
 
 #![cfg_attr(not(test), no_std)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![expect(
     clippy::cast_possible_truncation,
     reason = "this crate targets 64-bit only (x86-64, riscv64), so ELF64 u64 fields fit in usize"

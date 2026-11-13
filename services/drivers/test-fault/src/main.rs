@@ -29,6 +29,7 @@
 //! svctest watches the held memory return to memmgr in both fault cases.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use driver_binding::decl::{Declaration, Interrupt, Match, Reset, Tier};
 use driver_binding::resources::{Resource, ResourceList};

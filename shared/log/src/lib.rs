@@ -37,6 +37,7 @@
 #![cfg_attr(all(not(feature = "rustc-dep-of-std"), not(test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;

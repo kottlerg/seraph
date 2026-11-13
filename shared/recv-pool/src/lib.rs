@@ -20,6 +20,7 @@
 
 #![cfg(target_os = "seraph")]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 

@@ -27,6 +27,7 @@
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![expect(
     clippy::cast_possible_truncation,
     reason = "userspace targets are 64-bit only, so u64 to usize is lossless; u32 capability slot \
@@ -4114,23 +4115,35 @@ impl IpcMessage
         let mut data = [0u64; MSG_DATA_WORDS_MAX];
         for (i, slot) in data.iter_mut().take(word_count).enumerate()
         {
-            // SAFETY: caller guarantees `ipc_buf` is valid, page-aligned,
-            // and mapped. `i < word_count <= MSG_DATA_WORDS_MAX`, so
-            // offset is in-bounds of the 4 KiB buffer. Volatile required
-            // for kernel-shared memory.
-            *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(i)) };
+            // SAFETY: `i < word_count <= MSG_DATA_WORDS_MAX`, so the offset
+            // stays inside the 4 KiB buffer the caller's contract names.
+            let word = unsafe { ipc_buf.add(i) };
+            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+            // page-aligned IPC buffer, and `word` lies inside it. Volatile
+            // because the kernel writes the page.
+            *slot = unsafe { core::ptr::read_volatile(word) };
         }
         // Cap metadata: cap_count at word[MSG_DATA_WORDS_MAX], delivered
-        // cap handles at word[MSG_DATA_WORDS_MAX + 1 ..].
-        // SAFETY: same invariants; MSG_DATA_WORDS_MAX + 1 + MSG_CAP_SLOTS_MAX
-        // = 64 + 1 + 4 = 69 < 512 (4 KiB / 8 B).
-        let cap_count_raw = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_DATA_WORDS_MAX)) };
+        // cap handles at word[MSG_CAP_HANDLES_WORD ..].
+        // SAFETY: `syscall_abi` asserts that the cap block, which follows
+        // word `MSG_DATA_WORDS_MAX`, ends inside the 4 KiB buffer.
+        let cap_count_word = unsafe { ipc_buf.add(MSG_DATA_WORDS_MAX) };
+        // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+        // page-aligned IPC buffer, and `cap_count_word` lies inside it.
+        let cap_count_raw = unsafe { core::ptr::read_volatile(cap_count_word) };
         let cap_count = (cap_count_raw as usize).min(MSG_CAP_SLOTS_MAX);
         let mut cap_slots = [0u64; MSG_CAP_SLOTS_MAX];
+        // SAFETY: `syscall_abi` asserts that the cap block, which starts at
+        // word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
+        let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
         for (i, slot) in cap_slots.iter_mut().take(cap_count).enumerate()
         {
-            // SAFETY: offset bounded as above.
-            *slot = unsafe { core::ptr::read_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD).add(i)) };
+            // SAFETY: `i < cap_count <= MSG_CAP_SLOTS_MAX`, the cap block's
+            // length, so the offset stays inside the block.
+            let word = unsafe { cap_block.add(i) };
+            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+            // page-aligned IPC buffer, and `word` lies inside it.
+            *slot = unsafe { core::ptr::read_volatile(word) };
         }
         Self {
             label,
@@ -4162,15 +4175,23 @@ impl IpcMessage
             // SAFETY: `words()` is a bounds-checked sub-slice of the
             // `MSG_DATA_WORDS_MAX`-word `data` array, so
             // `i < MSG_DATA_WORDS_MAX` and the offset is within the
-            // 4 KiB buffer. Caller guarantees pointer validity.
-            unsafe { core::ptr::write_volatile(ipc_buf.add(i), val) };
+            // 4 KiB buffer.
+            let word = unsafe { ipc_buf.add(i) };
+            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+            // page-aligned IPC buffer, and `word` lies inside it.
+            unsafe { core::ptr::write_volatile(word, val) };
         }
+        // SAFETY: `syscall_abi` asserts that the cap block, which starts at
+        // word `MSG_CAP_HANDLES_WORD`, ends inside the 4 KiB buffer.
+        let cap_block = unsafe { ipc_buf.add(MSG_CAP_HANDLES_WORD) };
         for (i, &handle) in self.caps().iter().enumerate()
         {
-            // SAFETY: `caps()` holds at most MSG_CAP_SLOTS_MAX handles, and
-            // `syscall_abi` asserts the cap block ends inside the 4 KiB
-            // buffer. Caller guarantees pointer validity.
-            unsafe { core::ptr::write_volatile(ipc_buf.add(MSG_CAP_HANDLES_WORD).add(i), handle) };
+            // SAFETY: `caps()` holds at most MSG_CAP_SLOTS_MAX handles, the
+            // cap block's length, so the offset stays inside the block.
+            let word = unsafe { cap_block.add(i) };
+            // SAFETY: the caller guarantees `ipc_buf` is its mapped,
+            // page-aligned IPC buffer, and `word` lies inside it.
+            unsafe { core::ptr::write_volatile(word, handle) };
         }
     }
 }

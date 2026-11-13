@@ -22,6 +22,7 @@
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 mod driver;
 mod partition;

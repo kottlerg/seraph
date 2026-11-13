@@ -75,6 +75,11 @@ pub fn serial_init(info: &InitInfo, _thread_cap: u64)
     let uart_offset = UART_PHYS.saturating_sub(base);
     let uart_va = SERIAL_VA.saturating_add(uart_offset);
     UART_MMIO_CAP.store(slot, Ordering::Release);
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a register of the UART, at a constant offset inside the \
+                  aperture mapped at SERIAL_VA"
+    )]
     // SAFETY: UART MMIO programming before any other thread exists (init-logd
     // starts later). The full aperture is mapped at SERIAL_VA; UART sits at
     // uart_offset inside it.
@@ -121,10 +126,13 @@ pub fn serial_write_byte(byte: u8)
         return;
     }
     let p = base as *mut u8;
+    // SAFETY: LSR is the UART's register at offset 5, inside the aperture
+    // serial_init mapped.
+    let lsr = unsafe { p.add(5) };
     // SAFETY: a nonzero UART_BASE names the UART inside the aperture
     // serial_init mapped, which stays mapped until serial_release, run by the
     // last writer as it exits; reading LSR is side-effect free.
-    while unsafe { core::ptr::read_volatile(p.add(5)) } & 0x20 == 0
+    while unsafe { core::ptr::read_volatile(lsr) } & 0x20 == 0
     {}
     // SAFETY: as above; writing the data register.
     unsafe { core::ptr::write_volatile(p, byte) };

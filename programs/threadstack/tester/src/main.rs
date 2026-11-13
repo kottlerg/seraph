@@ -33,6 +33,7 @@
               abort the tester, and the panic's non-zero exit is its FAIL verdict"
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::io::Read;
 use std::process::{Command, Stdio};

@@ -23,6 +23,7 @@
 //! releases the hold.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use iommu_core::table::{TABLE_WORDS, TableStore};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};

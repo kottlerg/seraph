@@ -19,6 +19,7 @@
 //! [`devmgr_labels::QUERY_DEVICE`], so they never learn the transport.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 mod decode;
 mod input;

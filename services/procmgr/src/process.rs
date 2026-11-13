@@ -894,14 +894,12 @@ impl CopyWindows
         {
             return;
         }
-        // SAFETY: the windows are this value's own reservations, each mapped
-        // at most `mapped` pages by `map`; nothing references them.
-        let (src, dst) = unsafe {
-            (
-                syscall::mem_unmap(self.self_aspace, self.src_va(), self.mapped),
-                syscall::mem_unmap(self.self_aspace, self.dst_va(), self.mapped),
-            )
-        };
+        // SAFETY: the source window is this value's own reservation, mapped
+        // at most `mapped` pages by `map`; nothing references it.
+        let src = unsafe { syscall::mem_unmap(self.self_aspace, self.src_va(), self.mapped) };
+        // SAFETY: the destination window is this value's own reservation,
+        // mapped at most `mapped` pages by `map`; nothing references it.
+        let dst = unsafe { syscall::mem_unmap(self.self_aspace, self.dst_va(), self.mapped) };
         self.stuck |= src.is_err() || dst.is_err();
         self.mapped = 0;
     }
@@ -1068,18 +1066,22 @@ fn copy_argv_chunk(
     // SAFETY: both windows map `chunk_pages` pages just above, `src`
     // read-only and `dst` writable for procmgr alone (the child is not
     // running and maps no page of the child's run yet), and they do not
-    // overlap. The caller's bytes are read only by this raw copy, never
-    // through a reference, since the caller may write them concurrently; the
-    // slice covers only the child's window, which nothing else writes while
-    // it lives, until the next `map`.
-    let dst_bytes = unsafe {
+    // overlap; `blob_bytes` is at most `chunk_bytes`, the windows' length.
+    // The caller's bytes are read only by this raw copy, never through a
+    // reference, since the caller may write them concurrently.
+    unsafe {
         core::ptr::copy_nonoverlapping(
             windows.src_va() as *const u8,
             windows.dst_va() as *mut u8,
             blob_bytes,
         );
-        core::slice::from_raw_parts_mut(windows.dst_va() as *mut u8, chunk_bytes)
-    };
+    }
+    // SAFETY: the destination window maps `chunk_bytes` writable bytes for
+    // procmgr alone; the slice covers only the child's window, which nothing
+    // else writes while it lives, until the next `map`, and the copy above
+    // left no pointer into it in use.
+    let dst_bytes =
+        unsafe { core::slice::from_raw_parts_mut(windows.dst_va() as *mut u8, chunk_bytes) };
     // The page tail past the blobs carries no earlier owner's bytes.
     // `blob_bytes` is at most `chunk_bytes`, the window length, so the split
     // always succeeds.
@@ -3606,19 +3608,19 @@ fn stream_segment_bytes(
             vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);
             return Err(procmgr_errors::IO_ERROR);
         };
-        // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
+        // SAFETY: `mapping.va()` covers PAGE_SIZE bytes, and
         // `cache_page_range` checked `range.start + range.len() <= PAGE_SIZE`,
-        // and `chunk_len <= range.len()`, so the source span lies in the
-        // mapping, which is dropped only after the copy. The page is the fs
-        // driver's cache page, which the driver may write while procmgr reads
-        // it, so no Rust reference is formed over it: the bytes are copied by
-        // raw pointer into procmgr's own `dst`, which does not overlap it.
+        // so the offset stays inside the mapping.
+        let src = unsafe { (mapping.va() as *const u8).add(range.start) };
+        // SAFETY: `mapping.va()` covers PAGE_SIZE bytes mapped read-only;
+        // `chunk_len <= range.len()`, so the source span from `src` lies in
+        // the mapping, which is dropped only after the copy. The page is the
+        // fs driver's cache page, which the driver may write while procmgr
+        // reads it, so no Rust reference is formed over it: the bytes are
+        // copied by raw pointer into procmgr's own `dst`, which does not
+        // overlap it.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                (mapping.va() as *const u8).add(range.start),
-                dst.as_mut_ptr(),
-                chunk_len,
-            );
+            core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr(), chunk_len);
         }
         drop(mapping);
         vfs_release_memory(ctx.file_cap, ctx.ipc_buf, cookie);

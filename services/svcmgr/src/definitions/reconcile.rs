@@ -131,6 +131,18 @@ impl ServiceTable
     }
 }
 
+/// Whether `name` is a service recipe's file name: it ends in `.svc`, compared
+/// case-sensitively.
+#[expect(
+    clippy::case_sensitive_file_extension_comparisons,
+    reason = "`.svc` filenames are ASCII by convention; a case-insensitive compare would obscure \
+              typos rather than tolerate them"
+)]
+fn is_recipe_name(name: &str) -> bool
+{
+    name.ends_with(".svc")
+}
+
 /// Top-level entry called from `dispatch_ipc` on `HANDOVER_COMPLETE`.
 ///
 /// Walks `/config/svcmgr/services/`, parses every `.svc` file, and routes each
@@ -181,11 +193,7 @@ pub fn reconcile_and_launch(
         {
             continue;
         };
-        // `.svc` filenames are ASCII by convention; a case-insensitive
-        // compare would obscure typos rather than tolerate them.
-        #[allow(clippy::case_sensitive_file_extension_comparisons)]
-        let is_svc = name.ends_with(".svc");
-        if !is_svc
+        if !is_recipe_name(name)
         {
             continue;
         }

@@ -93,7 +93,11 @@ fn try_attach(
 /// once from `_start` after the IPC buffer is registered. Each direction
 /// is independent: any combination of zero/non-zero memory caps is
 /// tolerated.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "stdio_init takes the memory, data-signal and space-signal caps of each of three \
+              streams plus the address space, one argument per cap"
+)]
 pub fn stdio_init(
     stdin_memory: u64,
     stdin_data_sig: u64,

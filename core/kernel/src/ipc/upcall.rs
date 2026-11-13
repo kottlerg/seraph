@@ -51,10 +51,18 @@ pub unsafe fn post(
     any_instruction: bool,
 ) -> Result<(), SyscallError>
 {
+    // SAFETY: target valid per contract.
+    let sched_lock = unsafe { &(*target).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to the state, the upcall binding or an upcall field of target, \
+                  which the held sched_lock serialises"
+    )]
     // SAFETY: target valid per contract; the upcall fields, the state and the
     // binding are read and written under its sched_lock.
-    let masked = unsafe {
-        let saved = (*target).sched_lock.lock_raw();
+    let (refusal, masked) = unsafe {
         let refusal = if matches!((*target).state, ThreadState::Created | ThreadState::Exited)
             || (*target).fault_handlers[CLASS_UPCALL]
                 .load(Ordering::Acquire)
@@ -75,14 +83,14 @@ pub unsafe fn post(
             (*target).upcall_pending.store(true, Ordering::Release);
             None
         };
-        let masked = (*target).upcall_masked.load(Ordering::Relaxed);
-        (*target).sched_lock.unlock_raw(saved);
-        if let Some(e) = refusal
-        {
-            return Err(e);
-        }
-        masked
+        (refusal, (*target).upcall_masked.load(Ordering::Relaxed))
     };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    if let Some(e) = refusal
+    {
+        return Err(e);
+    }
     if masked
     {
         return Ok(());
@@ -103,11 +111,12 @@ pub unsafe fn post(
         // call.
         if unsafe { crate::syscall::thread::cancel_for_upcall(target) }
         {
-            // SAFETY: target valid; its park was claimed by the cancel above.
-            unsafe {
-                let cpu = crate::sched::select_target_cpu(target);
-                crate::sched::enqueue_and_wake(target, cpu);
-            }
+            // SAFETY: target valid; its park was claimed by the cancel above,
+            // whose wake_in_flight keeps it allocated.
+            let cpu = unsafe { crate::sched::select_target_cpu(target) };
+            // SAFETY: target valid and claimed, cpu came from
+            // select_target_cpu, and no lock is held.
+            unsafe { crate::sched::enqueue_and_wake(target, cpu) };
             return Ok(());
         }
         // SAFETY: as above.
@@ -140,16 +149,19 @@ pub unsafe fn post(
 #[cfg(not(test))]
 unsafe fn cancellable_park(tcb: *mut ThreadControlBlock) -> Option<u32>
 {
-    // SAFETY: tcb valid; state, park_seq, and the upcall fields are read under
-    // its sched_lock.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let park = ((*tcb).state == ThreadState::Blocked
-            && crate::syscall::thread::upcall_may_cancel(tcb))
-        .then(|| (*tcb).park_seq.load(Ordering::Relaxed));
-        (*tcb).sched_lock.unlock_raw(saved);
-        park
-    }
+    // SAFETY: tcb valid (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    // SAFETY: tcb valid; state is read under its sched_lock.
+    let blocked = unsafe { (*tcb).state == ThreadState::Blocked };
+    // SAFETY: tcb is valid and its sched_lock is held.
+    let cancellable = blocked && unsafe { crate::syscall::thread::upcall_may_cancel(tcb) };
+    // SAFETY: tcb valid; park_seq is read under its sched_lock.
+    let park = cancellable.then(|| unsafe { (*tcb).park_seq.load(Ordering::Relaxed) });
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    park
 }
 
 /// The CPU `tcb` is `current` on at the scan, if any. A snapshot: the thread
@@ -162,14 +174,15 @@ unsafe fn running_cpu(tcb: *mut ThreadControlBlock) -> Option<usize>
 {
     let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
     (0..cpu_count).find(|&cpu| {
-        // SAFETY: cpu < cpu_count; scheduler state read under its lock.
-        unsafe {
-            let s = crate::sched::scheduler_for(cpu);
-            let f = s.lock.lock_raw();
-            let is_cur = core::ptr::eq(s.current(), tcb);
-            s.lock.unlock_raw(f);
-            is_cur
-        }
+        // SAFETY: cpu < cpu_count, and every online CPU's scheduler is
+        // initialised.
+        let s = unsafe { crate::sched::scheduler_for(cpu) };
+        // SAFETY: lock_raw paired with the unlock_raw below.
+        let f = unsafe { s.lock.lock_raw() };
+        let is_cur = core::ptr::eq(s.current(), tcb);
+        // SAFETY: paired with the lock_raw above.
+        unsafe { s.lock.unlock_raw(f) };
+        is_cur
     })
 }
 
@@ -181,14 +194,16 @@ unsafe fn running_cpu(tcb: *mut ThreadControlBlock) -> Option<usize>
 #[cfg(not(test))]
 pub unsafe fn set_mask(tcb: *mut ThreadControlBlock, masked: bool) -> bool
 {
+    // SAFETY: tcb is the running thread (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
     // SAFETY: tcb is the running thread; the mask is written under its
     // sched_lock, the lock a post and the park commit read it under.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let previous = (*tcb).upcall_masked.swap(masked, Ordering::Relaxed);
-        (*tcb).sched_lock.unlock_raw(saved);
-        previous
-    }
+    let previous = unsafe { (*tcb).upcall_masked.swap(masked, Ordering::Relaxed) };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    previous
 }
 
 /// Take the pending upcall of `tcb` for a delivery at `point`, clearing it:
@@ -203,16 +218,33 @@ pub unsafe fn set_mask(tcb: *mut ThreadControlBlock, masked: bool) -> bool
 #[cfg(not(test))]
 unsafe fn take(tcb: *mut ThreadControlBlock, point: u64) -> Option<u64>
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access reads an atomic upcall field of tcb, the running thread's own TCB"
+    )]
     // SAFETY: tcb valid; the lock-free check decides nothing, the take
     // re-reads under the sched_lock the post wrote under.
-    unsafe {
-        if !(*tcb).upcall_pending.load(Ordering::Acquire)
+    let idle = unsafe {
+        !(*tcb).upcall_pending.load(Ordering::Acquire)
             || (*tcb).upcall_masked.load(Ordering::Relaxed)
-        {
-            return None;
-        }
-        let saved = (*tcb).sched_lock.lock_raw();
-        let taken = ((*tcb).state == ThreadState::Running
+    };
+    if idle
+    {
+        return None;
+    }
+    // SAFETY: tcb valid (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to the state or an upcall field of tcb, which the held \
+                  sched_lock serialises"
+    )]
+    // SAFETY: tcb valid; the state and the upcall fields are read and written
+    // under the held sched_lock the post wrote under.
+    let taken = unsafe {
+        ((*tcb).state == ThreadState::Running
             && (*tcb).upcall_pending.load(Ordering::Relaxed)
             && !(*tcb).upcall_masked.load(Ordering::Relaxed)
             && (point == syscall::UPCALL_POINT_SYSCALL
@@ -220,10 +252,11 @@ unsafe fn take(tcb: *mut ThreadControlBlock, point: u64) -> Option<u64>
         .then(|| {
             (*tcb).upcall_pending.store(false, Ordering::Relaxed);
             (*tcb).upcall_cookie.load(Ordering::Relaxed)
-        });
-        (*tcb).sched_lock.unlock_raw(saved);
-        taken
-    }
+        })
+    };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    taken
 }
 
 /// Deliver the pending upcalls of `tcb` at `point` with `frame` as the
@@ -261,11 +294,10 @@ unsafe fn deliver(
         // syscalls while the thread is upcall-blocked, as the fault paths do,
         // and restore it after.
         // SAFETY: tcb is the running thread; it alone writes its trap_frame.
-        let saved_tf = unsafe {
-            let saved = (*tcb).trap_frame.load(Ordering::Relaxed);
-            (*tcb).trap_frame.store(frame, Ordering::Relaxed);
-            saved
-        };
+        let saved_tf = unsafe { (*tcb).trap_frame.load(Ordering::Relaxed) };
+        // SAFETY: as for the load above.
+        unsafe { (*tcb).trap_frame.store(frame, Ordering::Relaxed) };
+
         // SAFETY: trap_frame names the live frame; no lock held (contract).
         // The outcome is not acted on: every disposition resumes the thread.
         let _ = unsafe { fault::fault_dispatch(tcb, &info) };

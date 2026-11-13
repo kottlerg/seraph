@@ -20,6 +20,8 @@
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 pub mod class;
 pub mod parse;
 pub mod restart_budget;

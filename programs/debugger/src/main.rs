@@ -32,10 +32,13 @@
 //! memory writes. Driven by its per-program tester (`tester/`), which
 //! `usertest` runs.
 
-// A test fixture, where unwrap and expect are permitted
-// (docs/coding-standards.md § Error Handling): a failed step must abort the
-// fixture, and the panic's non-zero exit is its FAIL verdict for the tester.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "a test fixture, where unwrap and expect are permitted (docs/coding-standards.md § \
+              Error Handling): a failed step must abort the fixture, and the panic's non-zero exit \
+              is its FAIL verdict for the tester"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::io::{BufRead, BufReader};
 use std::os::seraph::process::ChildExt;
@@ -217,9 +220,11 @@ fn gdb_target() -> !
         };
     }
     let _worker = std::thread::spawn(|| {
-        // infinite_loop: the worker steps until the process exits, and a
-        // `thread::spawn` closure returns a value type, not `!`.
-        #[expect(clippy::infinite_loop)]
+        #[expect(
+            clippy::infinite_loop,
+            reason = "the worker steps until the process exits, and a `thread::spawn` closure \
+                      returns a value type, not `!`"
+        )]
         loop
         {
             gdb_target_worker_step();

@@ -35,6 +35,8 @@
 //! Crash window discussion lives in
 //! `services/fs/fat/docs/crash-safety.md`.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod alloc;
 mod backend;
 mod bpb;
@@ -67,8 +69,7 @@ use namespace_protocol::{
 use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE, RIGHTS_MEM_MAP};
 
 /// [`PAGE_SIZE`] as a `usize`, for buffer and offset arithmetic.
-// cast_possible_truncation: PAGE_SIZE is 4096.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "PAGE_SIZE is 4096")]
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
@@ -89,10 +90,12 @@ fn main() -> !
     std::os::seraph::log::register_name(b"fatfs");
     let info = startup_info();
 
-    // IPC buffer is registered by `std::os::seraph::_start` and page-aligned
-    // by the boot protocol; `info.ipc_buffer` carries the same VA as a
-    // `*mut u8` we reinterpret as `*mut u64`.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer is registered by `std::os::seraph::_start` and page-aligned by the \
+                  boot protocol; `info.ipc_buffer` carries the same VA as a `*mut u8` we \
+                  reinterpret as `*mut u64`"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some(caps) = bootstrap_caps(info, ipc_buf)
@@ -267,10 +270,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// sweep and its table update, and `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
 /// hold it for the whole dispatch. Lock contention with the worker is only material during
 /// cache-pressure releases.
-// too_many_lines: the loop is one dispatch over every label the driver serves,
-// each arm a call into its handler; splitting it would scatter the dispatch
-// table across functions.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the loop is one dispatch over every label the driver serves, each arm a call into \
+              its handler; splitting it would scatter the dispatch table across functions"
+)]
 fn service_loop(
     caps: &FatCaps,
     state: &mut FatState,
@@ -665,12 +669,16 @@ fn handle_read(
 /// derivation, and outstanding-page tracking on that open. The file's size
 /// and first cluster come from `node`, the node table's current view, so a
 /// write or truncate through any cap on the node is seen at once.
-// too_many_arguments: the request, its node and open, and each piece of
-// driver state the memory-cap read touches (FAT state, open table, cache,
-// block device, IPC buffer, eviction state). too_many_lines: the read is one
-// sequence (validate, resolve the sector, pin a cache page, mint and record
-// the cap, reply) whose steps share the slot state.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the read is one sequence (validate, resolve the sector, pin a cache page, mint and \
+              record the cap, reply) whose steps share the slot state"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node and open, and each piece of driver state the memory-cap read \
+              touches (FAT state, open table, cache, block device, IPC buffer, eviction state)"
+)]
 fn read_memory_for_open(
     msg: &IpcMessage,
     node: &backend::FatNode,
@@ -902,10 +910,11 @@ fn pick_eviction_candidate(files: &mut OpenTable) -> Option<EvictReq>
 /// `CSpace` cannot grow or the table is full, before that step is retried
 /// once. A reply the client cannot take (it died mid-call, or its `CSpace` is
 /// full) moves no cap, so the open is released at once.
-// too_many_arguments: the request, its node and rights, and the driver state
-// an open touches (node table, open table and its sweep schedule, endpoint
-// caps, cache, IPC buffer).
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node and rights, and the driver state an open touches (node table, \
+              open table and its sweep schedule, endpoint caps, cache, IPC buffer)"
+)]
 fn handle_open_node_cap(
     node_id: NodeId,
     rights: NamespaceRights,
@@ -1106,9 +1115,11 @@ fn sweep_dead_opens(files: &mut OpenTable, sweeps: &mut SweepSchedule, cache: &P
 /// `FS_READ_MEMORY` against an open cap: the page is tracked on that open
 /// and its cooperative release goes to that open's release SEND. Delegates
 /// to [`read_memory_for_open`].
-// too_many_arguments: the request, its node and open, plus the driver state
-// `read_memory_for_open` needs, which this handler forwards.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its node and open, plus the driver state `read_memory_for_open` needs, \
+              which this handler forwards"
+)]
 fn handle_read_memory_open_cap(
     node_id: NodeId,
     open_id: u64,
@@ -1342,10 +1353,12 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 /// cluster or a chain link lies outside the data region; otherwise the
 /// errors of [`allocate_cluster`] and [`FatError::Io`] for a failed FAT or
 /// data sector read or write.
-// too_many_arguments: the engine takes the file's extent, the write, and the
-// driver state it writes through (FAT state, cache, block device, IPC
-// buffer), shared by two callers with different request shapes.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the engine takes the file's extent, the write, and the driver state it writes \
+              through (FAT state, cache, block device, IPC buffer), shared by two callers with \
+              different request shapes"
+)]
 fn write_file_bytes(
     start_cluster: u32,
     file_size: u32,
@@ -1546,10 +1559,12 @@ fn handle_write(
 /// scratch VA unmapped before the actual writes. The Memory cap is moved
 /// back to the caller in the reply. Badge = file node cap or open cap (must
 /// carry `WRITE`), `node_id` the node either names.
-// too_many_lines: the memory-cap write is one sequence (validate the request
-// and the carried cap, map it, copy, unmap, write, patch the entry, reply)
-// whose every exit returns the carried cap to the caller in its reply.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the memory-cap write is one sequence (validate the request and the carried cap, map \
+              it, copy, unmap, write, patch the entry, reply) whose every exit returns the carried \
+              cap to the caller in its reply"
+)]
 fn handle_write_memory(
     node_id: NodeId,
     msg: &IpcMessage,
@@ -1594,9 +1609,11 @@ fn handle_write_memory(
     }
 
     let offset = msg.word(0);
-    // cast_possible_truncation: fatfs builds only for 64-bit targets, where
-    // `usize` holds every `u64`; both values are range-checked below.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fatfs builds only for 64-bit targets, where `usize` holds every `u64`; both \
+                  values are range-checked below"
+    )]
     let (byte_count, memory_data_offset) = (msg.word(1) as usize, msg.word(2) as usize);
     if byte_count == 0
         || PAGE_BYTES
@@ -1614,10 +1631,11 @@ fn handle_write_memory(
         reply_with(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    // cast_possible_truncation: `CAP_INFO_TAG_RIGHTS` packs the `CapTag` byte
-    // above the 32 rights bits (abi/syscall), so the low byte of the shifted
-    // value is the tag.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`CAP_INFO_TAG_RIGHTS` packs the `CapTag` byte above the 32 rights bits \
+                  (abi/syscall), so the low byte of the shifted value is the tag"
+    )]
     let tag = (tag_rights >> 32) as u8;
     let cap_rights = tag_rights & 0xFFFF_FFFF;
     if u64::from(tag) != u64::from(syscall::CAP_TAG_MEMORY)
@@ -1771,9 +1789,11 @@ fn self_aspace_cap() -> Option<u64>
 /// cap (must carry `MUTATE_DIR`). `label[16..32]` = name length, name
 /// from word 0. `parent_rights` is the caller's effective rights on
 /// the parent dir; the returned child cap is attenuated by it.
-// too_many_arguments: a thin entry point that forwards the request and the
-// driver state to `create_entry_common` with the file kind.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a thin entry point that forwards the request and the driver state to \
+              `create_entry_common` with the file kind"
+)]
 fn handle_create_node_cap(
     node_id: NodeId,
     parent_rights: NamespaceRights,
@@ -1799,9 +1819,11 @@ fn handle_create_node_cap(
 }
 
 /// `FS_MKDIR`: create a new directory in a directory.
-// too_many_arguments: a thin entry point that forwards the request and the
-// driver state to `create_entry_common` with the directory kind.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a thin entry point that forwards the request and the driver state to \
+              `create_entry_common` with the directory kind"
+)]
 fn handle_mkdir_node_cap(
     node_id: NodeId,
     parent_rights: NamespaceRights,
@@ -1843,12 +1865,17 @@ fn new_entry_rights_ceiling(kind: NewEntryKind) -> NamespaceRights
     }
 }
 
-// too_many_arguments: the request, the parent node and its rights, the entry
-// kind, and the driver state creation writes through. too_many_lines: creation
-// is one sequence (settle the child's rights, validate the name, refuse a taken
-// one, allocate, insert the entry, mint the child cap, reply) whose steps share
-// the parent cluster and the new entry's state.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, the parent node and its rights, the entry kind, and the driver state \
+              creation writes through"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "creation is one sequence (settle the child's rights, validate the name, refuse a \
+              taken one, allocate, insert the entry, mint the child cap, reply) whose steps share \
+              the parent cluster and the new entry's state"
+)]
 fn create_entry_common(
     node_id: NodeId,
     parent_rights: NamespaceRights,
@@ -2158,9 +2185,11 @@ fn handle_rename_node_cap(
             return;
         }
     };
-    // cast_possible_truncation: fatfs builds only for 64-bit targets, where
-    // `usize` holds every `u64`; both lengths are bounded below.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fatfs builds only for 64-bit targets, where `usize` holds every `u64`; both \
+                  lengths are bounded below"
+    )]
     let (src_len, dst_len) = (msg.word(0) as usize, msg.word(1) as usize);
     // Words 0 and 1 hold the lengths (16 bytes); the names follow from word
     // 2. Both lengths are client words: a name past the data is refused.

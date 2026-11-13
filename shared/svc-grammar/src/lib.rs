@@ -17,6 +17,7 @@
 //! `no_std`, no allocation: every [`Entry`] borrows the caller's text.
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 /// One `key = value` line of a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

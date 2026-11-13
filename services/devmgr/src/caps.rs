@@ -411,9 +411,11 @@ fn absorb_module_round(
 
 /// Unpack one framebuffer-info round. Zero caps; data words carry the
 /// geometry. A `physical_base == 0` leaves `caps.fb_info = None`.
-// The round packs two fields per data word (`w | h << 32`,
-// `stride | format << 32`); the truncating casts extract each field.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the round packs two fields per data word (`w | h << 32`, `stride | format << 32`); \
+              the truncating casts extract each field"
+)]
 fn absorb_framebuffer_info_round(
     round_data: &[u64; syscall_abi::MSG_DATA_WORDS_MAX],
     caps: &mut DevmgrCaps,

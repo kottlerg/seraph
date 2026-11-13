@@ -18,6 +18,8 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]) by re-reading hardware on
 //! every request.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use cmos_rtc::{Calendar, CmosRegs, epoch_us};
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, devmgr_labels, rtc_errors, rtc_labels};
@@ -231,8 +233,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"cmos-rtc");
     let info = startup_info();
 
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some((ioport_cap, device)) = bootstrap(info.creator_endpoint, ipc_buf)

@@ -25,6 +25,7 @@
 //! and [handover-protocol.md](../../docs/handover-protocol.md).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 pub mod handover;
 pub mod history;

@@ -305,12 +305,12 @@ mod live
         // before it was advanced, so the flush drops each one's stale entry.
         let epoch = GUARD_EPOCH.load(Ordering::Acquire);
         // SAFETY: ring 0 / S-mode with interrupts disabled (caller contract);
-        // dropping every cached translation is always safe; the record is
-        // this CPU's, which the flush above covers.
-        unsafe {
-            crate::arch::current::paging::flush_all_contexts();
-            crate::percpu::set_guard_epoch_flushed(epoch);
-        }
+        // dropping every cached translation is always safe.
+        unsafe { crate::arch::current::paging::flush_all_contexts() };
+        // SAFETY: interrupts disabled and this CPU's per-CPU pointer installed
+        // (caller contract); the record is this CPU's, which the flush above
+        // covers.
+        unsafe { crate::percpu::set_guard_epoch_flushed(epoch) };
     }
 
     /// Map the page at `phys`, holed by [`hole`], into the direct map again,

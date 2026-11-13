@@ -15,6 +15,8 @@
 //! only after that report. Implements the one-label RTC driver contract
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]).
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};
 use std::os::seraph::{reserve_pages, startup_info};
@@ -159,8 +161,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"goldfish-rtc");
     let info = startup_info();
 
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some((mmio_cap, device)) = bootstrap(info.creator_endpoint, ipc_buf)

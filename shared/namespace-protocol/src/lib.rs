@@ -17,15 +17,21 @@
 //! `docs/namespace-model.md`.
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 pub mod badge;
@@ -105,8 +111,10 @@ impl EntryName
         let mut bytes = [0u8; MAX_NAME_LEN];
         // `None` when `name` is longer than the `MAX_NAME_LEN`-byte buffer.
         bytes.get_mut(..name.len())?.copy_from_slice(name);
-        // Cast is range-safe: `name.len() <= MAX_NAME_LEN` (255), fits u8.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "range-safe: `name.len() <= MAX_NAME_LEN` (255), which fits u8"
+        )]
         let len = name.len() as u8;
         Some(Self {
             bytes,
@@ -381,8 +389,10 @@ pub(crate) fn decode_caller_requested(raw_req: u64) -> NamespaceRights
     }
     else
     {
-        // Cast is range-safe: masking to RIGHTS_MASK (24 bits) fits u32.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "range-safe: masking to RIGHTS_MASK (24 bits) fits u32"
+        )]
         let bits = (raw_req as u32) & RIGHTS_MASK;
         NamespaceRights::from_raw(bits)
     }

@@ -12,6 +12,7 @@
 //! [`session::Kernel`] with syscalls.
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 pub mod breakpoints;
 pub mod control;

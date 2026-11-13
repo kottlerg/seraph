@@ -21,6 +21,8 @@
 //! See `services/vfsd/README.md` for the design and
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod driver;
 mod partition;
 mod role_guids;
@@ -113,23 +115,25 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
 
 // ── Entry point ────────────────────────────────────────────────────────────
 
-// clippy::too_many_lines: vfsd's main is the in-order startup
-// transcript — bootstrap caps, worker pool, GPT scratch alloc, disk
-// discovery, namespace endpoint create, runtime leak,
-// namespace-thread spawn, service-thread fanout, then the calling
-// thread's own service loop. Each step depends on the prior step's
-// locals; splitting introduces threading those locals through helper
-// arguments without buying any structural clarity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "vfsd's main is the in-order startup transcript — bootstrap caps, worker pool, GPT \
+              scratch alloc, disk discovery, namespace endpoint create, runtime leak, \
+              namespace-thread spawn, service-thread fanout, then the calling thread's own service \
+              loop. Each step depends on the prior step's locals; splitting introduces threading \
+              those locals through helper arguments without buying any structural clarity"
+)]
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"vfsd");
     let info = startup_info();
 
-    // IPC buffer is registered by `std::os::seraph::_start` and page-aligned
-    // by the boot protocol; `info.ipc_buffer` carries the same VA as a
-    // `*mut u8` we reinterpret as `*mut u64` (4 KiB page alignment ≫ u64).
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer is registered by `std::os::seraph::_start` and page-aligned by the \
+                  boot protocol; `info.ipc_buffer` carries the same VA as a `*mut u8` we \
+                  reinterpret as `*mut u64` (4 KiB page alignment ≫ u64)"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some(mut caps) = bootstrap_caps(info, ipc_buf)
@@ -702,9 +706,11 @@ fn try_forward_readdir_fallthrough(
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             return true;
         }
-        // Cast is range-safe: name_len rides word 1, bounded by the
-        // protocol's max name length.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "cast is range-safe: name_len rides word 1, bounded by the protocol's max \
+                      name length"
+        )]
         let name_len = reply.word(1) as usize;
         let data = reply.data_bytes();
         // Reply layout: word 0 = kind, word 1 = name_len, name at byte 16.
@@ -889,10 +895,12 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 /// real work. When the requested role is [`MountRole::Root`], vfsd
 /// additionally auto-mounts the EFI System Partition at `/esp` and the
 /// data partition at `/data`.
-// cast_possible_truncation: the role byte is the low byte of data[0] by wire
-// contract, and the path length is checked against 1..=MAX_MOUNT_PATH_LEN
-// right after its cast, so neither `as` loses a value the handler accepts.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the role byte is the low byte of data[0] by wire contract, and the path length is \
+              checked against 1..=MAX_MOUNT_PATH_LEN right after its cast, so neither `as` loses a \
+              value the handler accepts"
+)]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
     let role_byte = recv.word(0) as u8;
@@ -1049,14 +1057,15 @@ pub(crate) fn do_mount(
 /// internally-triggered (`auto_mount_role`) mounts. Takes a type-GUID
 /// directly so callers without a [`MountRole`] (the `/esp` and `/data`
 /// auto-mounts) can reuse the transaction body.
-// too_many_lines: the mount-and-publish transaction runs inline. The
-// install pre-check, partition registration with virtio-blk, fatfs spawn,
-// synthetic-root install, and namespace-root cap minting share the
-// `partition_ep` / `fatfs` / `driver_ep` locals, and every failure arm after
-// the spawn tears the driver down through `fatfs.endpoint`; folding a subset
-// into helpers would thread those locals through and hide which arm releases
-// what.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the mount-and-publish transaction runs inline. The install pre-check, partition \
+              registration with virtio-blk, fatfs spawn, synthetic-root install, and \
+              namespace-root cap minting share the `partition_ep` / `fatfs` / `driver_ep` locals, \
+              and every failure arm after the spawn tears the driver down through \
+              `fatfs.endpoint`; folding a subset into helpers would thread those locals through \
+              and hide which arm releases what"
+)]
 fn do_mount_internal(
     rt: &VfsdRuntime,
     ipc_buf: *mut u64,

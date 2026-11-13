@@ -16,11 +16,10 @@
 //! the slot index's 32 bits. The registry holds no lock and makes no
 //! syscall: ruststd serialises it and does the binding and the reclaiming.
 
-// When this crate is compiled as a std dep via rustc-dep-of-std, the
-// crate root is `no_core` and the prelude reaches only the root module;
-// submodules import it themselves. Harmless no-op otherwise.
+// When this crate is compiled as a std dep via rustc-dep-of-std, it is
+// `no_core`, so no module gets the prelude implicitly; this one imports it
+// by hand. The import is absent otherwise.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 use alloc::vec::Vec;
@@ -37,8 +36,10 @@ pub const fn correlator(slot: u32, generation: u32) -> u64
 #[must_use]
 pub const fn split(correlator: u64) -> (u32, u32)
 {
-    // The high and low halves of a u64 each fit a u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the high and low halves of a u64 each fit a u32"
+    )]
     let parts = ((correlator >> 32) as u32, correlator as u32);
     parts
 }

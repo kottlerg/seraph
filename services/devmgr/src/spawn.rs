@@ -364,11 +364,13 @@ fn resource_round(resource: &Resource, copy: u64) -> Option<Round>
 /// [`DriverSpawn::Unbootstrapped`] with them when a round or the death
 /// observer's bind failed after the start; and [`DriverSpawn::Failed`], the
 /// child torn down, on any failure before the start.
-// too_many_lines: one spawn transaction: derive the per-child caps, create
-// and start the child, and serve its rounds against one shared IPC buffer;
-// every derived slot must be released on a partial failure, and the linear
-// presentation matches the bootstrap protocol one-to-one.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one spawn transaction: derive the per-child caps, create and start the child, and \
+              serve its rounds against one shared IPC buffer; every derived slot must be released \
+              on a partial failure, and the linear presentation matches the bootstrap protocol \
+              one-to-one"
+)]
 pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn<HeldChild>
 {
     // Release the source ELF cap on every exit before the create call
@@ -645,10 +647,11 @@ pub struct IommuSpawnConfig<'a>
 /// with physical addresses, of its table pages and of every frame `MAP`
 /// installs. Both observers carry the correlator `device_badge`. Returns as
 /// [`spawn_bound_driver`] does, with the process handle alone.
-// too_many_lines: one spawn transaction, as `spawn_bound_driver`: every derived
-// cap owns a slot released on a later failure, and the rounds follow the
-// bootstrap protocol one to one.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one spawn transaction, as `spawn_bound_driver`: every derived cap owns a slot \
+              released on a later failure, and the rounds follow the bootstrap protocol one to one"
+)]
 pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
 {
     let mut module_guard = ModuleCapGuard::new(config.module_cap);

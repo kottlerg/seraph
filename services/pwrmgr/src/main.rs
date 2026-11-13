@@ -18,6 +18,8 @@
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod arch;
 mod caps;
 
@@ -36,9 +38,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"pwrmgr");
     let info = startup_info();
 
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB) by the boot
-    // protocol, satisfying u64 alignment.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer is page-aligned (4 KiB) by the boot protocol, satisfying u64 alignment"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some(bootstrap) = caps::request_bootstrap(info, ipc_buf)

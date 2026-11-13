@@ -66,8 +66,10 @@ pub const MAX_MSI_FILES_PER_DOMAIN: usize = 64;
 pub const FAULT_POLL_MS: u64 = 100;
 /// Entries one interrupt remapping table holds at most
 /// (`iommu_labels::MAX_REMAP_ENTRIES`).
-// cast_possible_truncation: the label's bound is 2^16, which fits.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the label's bound is 2^16, which fits"
+)]
 pub const MAX_REMAP_ENTRIES: u32 = iommu_labels::MAX_REMAP_ENTRIES as u32;
 /// The lowest vector a remapping entry may deliver: vectors below 16 are
 /// reserved for exceptions on x86-64 and invalid for a fixed interrupt.

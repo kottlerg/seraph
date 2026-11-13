@@ -72,6 +72,16 @@ drivers and programs, and the harness and host crates. The roll-out ends by movi
 module-root level that enables it is permitted only until then. A site is fixed as § Unsafe Code
 says.
 
+`clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
+suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions
+are in that form enables both at its crate root,
+`#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]`. The crates are taken
+in this order: the `abi/`, `shared/` and `runtime/` crates, the userspace services, drivers and
+programs, the harness and host crates, `core/boot`, and `core/kernel`. The roll-out ends by moving
+both lints to `[workspace.lints]` and removing every crate-root level for them. Until then a crate
+without the line still carries `#[allow]` suppressions, and a suppression added or changed in it
+takes the § E form.
+
 `cargo xtask test` runs Clippy over test code before it runs the tests: the test configuration
 (`cargo clippy --tests`) of every package it tests, once for each architecture's Linux target
 (`x86_64-unknown-linux-gnu` and `riscv64gc-unknown-linux-gnu`), so test code gated on either
@@ -426,7 +436,10 @@ in the same change.
 - `#[cfg(target_arch = ...)]` MUST appear only at arch-module declaration
   sites (for example, on `mod x86_64;` in `arch/mod.rs`). Items inside
   `arch/<target>/` inherit the parent's cfg gate and MUST NOT carry their
-  own `cfg(target_arch)` attribute.
+  own `cfg(target_arch)` attribute. The one exception is a lint suppression
+  whose lint fires on one architecture only,
+  `#[cfg_attr(target_arch = "...", expect(...))]` (§ E): it changes no
+  compiled code and is permitted at any site outside `arch/<target>/`.
 - Inline assembly MUST be isolated to dedicated functions or modules; never inlined
   alongside logic.
 - Every inline assembly block MUST comment what it does, what registers it clobbers,
@@ -588,27 +601,44 @@ form.
 Any suppression of compiler warnings, Clippy lints, static analysis checks, or
 formatter behavior MUST:
 
-- Be as narrowly scoped as possible (prefer item-level `#[allow(...)]` over
-  module-level `#![allow(...)]`).
-- Include a rationale comment immediately preceding the attribute, explaining why the
-  rule is inapplicable at this site.
+- Be as narrowly scoped as possible (prefer item-level `#[expect(...)]` over
+  module-level `#![expect(...)]`).
+- Carry a rationale explaining why the rule is inapplicable at this site.
 
 Blanket or module-wide suppressions are forbidden without explicit justification.
 
+A lint is suppressed with `#[expect(<lint>, reason = "<rationale>")]`, MUST NOT be suppressed
+with `#[allow(...)]`, and its `reason` carries the rationale; a comment immediately preceding the
+attribute MAY extend it. An `#[expect]` whose lint no longer fires at the site fails the build,
+so a suppression that is no longer needed is removed. A suppression with no `reason` field (a
+formatter skip such as `#[rustfmt::skip]`) carries its rationale in a comment immediately
+preceding it. Clippy's `allow_attributes` and `allow_attributes_without_reason` check this form
+(§ Clippy).
+
 Test code is linted (§ Clippy), and a suppression in it follows this section like one in
-production code. A suppression whose lint fires only in some build configurations (for example
-host test builds, where an item's only callers are compiled out) is permitted; its rationale MUST
-name the configuration in which the lint fires. Where § C permits that configuration's predicate
-(for example `test`), the suppression MUST be gated on it, either with
-`#[cfg_attr(<predicate>, allow(...))]` or by sitting on an item that is itself gated on the
-predicate. Where § C forbids the predicate at the site (a `target_arch` predicate outside an
-arch-module declaration site), an unconditional item-level suppression is the narrowest
-permitted form.
+production code. A suppression whose lint fires only in some build configurations (a feature, one
+architecture, the test configuration where an item's only callers are compiled out) is
+permitted; its rationale MUST name the configuration in which the lint fires, and it MUST be
+gated on that configuration's predicate, either with `#[cfg_attr(<predicate>, expect(...))]` or
+by sitting on an item that is itself gated on the predicate, since an `#[expect]` fails a linted
+build in which its lint does not fire. A lint that fires on one architecture only takes
+`#[cfg_attr(target_arch = "<arch>", expect(<lint>, reason = "..."))]`, which § C permits at any
+site; inside `arch/<target>/` the module's own gate suffices and the attribute is unconditional.
+
+A suppression in code that is compiled with no lint check takes the same form: the `std` overlay
+under `runtime/ruststd/src/`, and the code a workspace crate compiles only under its
+`rustc-dep-of-std` feature, which only the `std` build enables, with lints capped. No build checks
+that its lint still fires there, so the review of a change to that code does.
 
 ```rust
-// `capacity` is part of the public contract on all target architectures; the
-// field is unused on x86_64 but MUST NOT be removed.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "riscv64",
+    expect(
+        dead_code,
+        reason = "`capacity` is part of the public contract on every architecture; \
+                  no riscv64 code reads it, and it MUST NOT be removed"
+    )
+)]
 capacity: usize,
 ```
 

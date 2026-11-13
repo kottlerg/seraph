@@ -198,23 +198,28 @@ without a fault. On riscv64 a `call` writes nothing to the stack and a split pro
 ([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)); the guard's
 four pages are wider than that, so no overflow's first store passes it. The usable size is the
 larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB, rounded up to whole
-pages) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the reservation, the page-table
-funding, or the registration fails, the spawn fails with the error; it never runs the thread on a
-stack without a guard.
+pages) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). The spawn tops up the address space's
+page-table pool for the usable pages first, as best effort: another thread's mapping can draw the
+top-up before the stack's first fault, and memmgr funds the pool itself when a fault finds it
+exhausted (memmgr's
+[Client page-table funding](../../services/memmgr/docs/memory-pool.md#client-page-table-funding)).
+If the reservation or the registration fails, the spawn fails with the error; it never runs the
+thread on a stack without a guard.
 
 In a process with no pager (`pager_endpoint_cap` zero: procmgr, and every process created
 `CREATE_PINNED`, such as the DMA-device and IOMMU drivers devmgr starts) the stack is an eager
 stack: a page reservation of the same `GUARD_PAGES` guard pages below the usable pages, whose
-usable pages are mapped read-write at spawn from one contiguous memmgr grant, after the
-reservation's page-table growth is funded; the guard stays unmapped. The usable size is the
+usable pages are mapped read-write at spawn from one contiguous memmgr grant; the guard stays
+unmapped. The spawn tops up the page-table pool before the map, and again before each further
+attempt while the map fails with `OutOfMemory`, up to `EAGER_MAP_ROUNDS` (4) attempts, since
+another thread's mapping can draw a top-up first. The usable size is the
 requested stack size alone (at least `DEFAULT_MIN_STACK_SIZE`, rounded up to whole pages), since
 each page costs a frame at spawn. Such a process has no virtual-memory handler, so an overflow
 whose first touch lands in the guard faults with no handler to take it, and the fault ends the
 whole process
 ([docs/fault-handling.md § Crash Reports](../../docs/fault-handling.md#crash-reports)).
 The stack probes and the guard's width hold for it as for a demand stack. If the reservation, the
-grant, the page-table funding, or the map fails, the spawn releases what it took and fails with the
-error.
+grant, or the map fails, the spawn releases what it took and fails with the error.
 
 Before starting the thread, the spawn copies the spawning thread's fault-handler bindings onto it
 (`SYS_THREAD_INHERIT_FAULT_HANDLER`), the pager of a demand-paged process among them, and a

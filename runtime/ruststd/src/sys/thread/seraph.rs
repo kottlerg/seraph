@@ -66,6 +66,14 @@ const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 /// corrupting adjacent memory.
 const GUARD_PAGES: u64 = process_abi::STACK_GUARD_PAGES as u64;
 
+/// Attempts [`EagerStack::map`] makes to map an eager stack, each after
+/// topping up the address space's page-table pool, while the kernel reports
+/// the pool exhausted. Another thread's mapping can draw a top-up before the
+/// map that needed it, so one attempt is not enough under concurrent spawns.
+/// Four top-ups is the bound memmgr sets on the same loop for a demand chunk
+/// (services/memmgr/docs/memory-pool.md § Client page-table funding).
+const EAGER_MAP_ROUNDS: u32 = 4;
+
 /// General-allocation headroom of the process's `CSpace` a spawn keeps: a
 /// spawn first tops the `CSpace` up when its headroom is below this plus a
 /// page's slots (`CSPACE_SLOTS_PER_PAGE`, which
@@ -241,8 +249,10 @@ impl EagerStack {
     /// guard pages in the calling process, through memmgr (`memmgr_ep`).
     ///
     /// # Errors
-    /// Returns an error when the reservation, the grant, the page-table
-    /// funding, or the map fails; everything the call took is released first.
+    /// Returns an error when the reservation or the grant fails, or the map
+    /// fails for a reason other than an exhausted page-table pool or after
+    /// [`EAGER_MAP_ROUNDS`] attempts; everything the call took is released
+    /// first.
     fn map(memmgr_ep: u64, aspace: u64, usable_pages: u64) -> io::Result<EagerStack> {
         use crate::sys::alloc::seraph::{fund_aspace_pt_budget, slab_request_pages};
         use crate::sys::reserve::{reserve_pages, unreserve_pages};
@@ -260,13 +270,18 @@ impl EagerStack {
             return Err(io::Error::other("seraph: stack frame grant failed"));
         };
         let stack = EagerStack { range, cap, region_id, usable_pages, aspace };
-        let failure = if !fund_aspace_pt_budget(aspace, usable_pages) {
-            Some("seraph: page-table budget funding failed")
-        } else {
+        // The address space's page-table pool is shared by every mapping of
+        // the process, so a top-up cannot be reserved for this span: another
+        // thread's mapping can draw it before this map runs. The map, not the
+        // top-up's own budget check, says whether the span is covered, so the
+        // top-up is repeated while the kernel reports the pool exhausted.
+        let mut rounds = 0;
+        let mapped = loop {
+            let _ = fund_aspace_pt_budget(aspace, usable_pages);
             // SAFETY: the usable pages lie in `range`, a fresh reservation
             // this call owns, so no Rust object or IPC buffer page lies in
             // them.
-            let mapped = unsafe {
+            let result = unsafe {
                 syscall::mem_map(
                     cap,
                     aspace,
@@ -276,13 +291,17 @@ impl EagerStack {
                     syscall_abi::MAP_WRITABLE,
                 )
             };
-            mapped.is_err().then_some("seraph: thread stack mem_map failed")
+            rounds += 1;
+            match result {
+                Err(e) if e == SyscallError::OutOfMemory as i64 && rounds < EAGER_MAP_ROUNDS => {}
+                other => break other.is_ok(),
+            }
         };
-        if let Some(msg) = failure {
+        if !mapped {
             // A map refused part-way leaves the pages before the failing one
             // mapped, so the release unmaps the span before it frees anything.
             stack.release();
-            return Err(io::Error::other(msg));
+            return Err(io::Error::other("seraph: thread stack mem_map failed"));
         }
         Ok(stack)
     }

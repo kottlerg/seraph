@@ -13,6 +13,25 @@
 // Staged roll-outs of these lints: docs/coding-standards.md § Clippy.
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+// `fn_params_excessive_bools`, a pedantic lint, is on already; `clippy.toml`
+// sets its threshold to zero and the `large_stack_frames` threshold. The test
+// configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
 
@@ -491,13 +510,14 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     scrub(&mut boot_entropy.seed);
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
-        reason = "every write is to a field of a live local of this function, through a pointer \
-                  to that field"
+        reason = "every write is to a field, or an element of an array field, of a live local of \
+                  this function, through a pointer to it"
     )]
     // SAFETY: all are live locals; volatile so the stores are not elided as
     // dead ahead of the values going out of scope.
     unsafe {
-        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr), [0u64; 2]);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr[0]), 0u64);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.kaslr[1]), 0u64);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(boot_entropy.len), 0u32);
         core::ptr::write_volatile(core::ptr::addr_of_mut!(kaslr.dm_rand), 0u64);
     }
@@ -1734,6 +1754,11 @@ unsafe fn steps6_and_7_sized_to_the_map(
 /// buffer fitting the entry array or not (`fits`): one that fits stands,
 /// except the first while the `mapredo` knob is present ([`MapRedo`]), which
 /// is redone so the boot runs the redo path.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`fits` is data: whether the attempt's map buffer fits its entry array \
+              (map_buffer_fits), which the function combines with the knob's rule"
+)]
 fn attempt_stands(fits: bool, attempt: usize, knob: MapRedo) -> bool
 {
     fits && !knob_redoes(attempt, knob)

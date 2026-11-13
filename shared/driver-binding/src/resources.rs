@@ -509,7 +509,12 @@ impl PlatformDelivery
                 mode,
                 ..
             } => Some((cap, mode)),
-            _ => None,
+            Resource::Interrupt {
+                kind: InterruptKind::Msi | InterruptKind::MsiX,
+                ..
+            }
+            | Resource::Mmio { .. }
+            | Resource::IoPort { .. } => None,
         });
         Some(Self {
             registers,
@@ -772,7 +777,7 @@ mod tests
             .map(|r| match *r
             {
                 Resource::Interrupt { cap, vector, .. } => (cap, vector),
-                _ => panic!("only interrupts"),
+                Resource::Mmio { .. } | Resource::IoPort { .. } => panic!("only interrupts"),
             })
             .collect();
         assert_eq!(vectors, [(30, 0), (31, 1), (32, 2), (33, 3), (34, 4)]);

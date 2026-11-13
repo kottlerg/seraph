@@ -127,7 +127,14 @@ impl BootError
             | BootError::InvalidElf(s)
             | BootError::InvalidBundle(s)
             | BootError::InvalidMemoryMap(s) => Some(s),
-            _ => None,
+            BootError::UefiError(_)
+            | BootError::WxViolation
+            | BootError::OutOfMemory
+            | BootError::ExitBootServicesFailed
+            | BootError::PagingModeUnsupported
+            | BootError::MemoryMapKeptGrowing(_)
+            | BootError::ReclaimRangesOverflow
+            | BootError::MapAddressRange => None,
         }
     }
 

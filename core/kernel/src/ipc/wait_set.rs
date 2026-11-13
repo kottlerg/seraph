@@ -232,6 +232,11 @@ pub struct WaitSetState
     pub waiters: crate::ipc::WaitQueue,
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the fields that are not `Send` are read and written only under the wait set's \
+              `lock`"
+)]
 // SAFETY: WaitSetState is internally synchronised by `WaitSetState.lock`; the
 // inline arrays it points at belong to the same retype slot.
 unsafe impl Send for WaitSetState {}

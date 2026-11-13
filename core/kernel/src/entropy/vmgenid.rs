@@ -12,8 +12,8 @@
 //! identical streams until a reseed; the GUID is the detection channel that
 //! forces that reseed before any post-resume output.
 //!
-//! Detection is per-draw and per-CPU through [`read_guid`] (a 16-byte
-//! volatile read through the direct map); the detection model is specified
+//! Detection is per-draw and per-CPU through [`read_guid`] (a volatile read
+//! of the 16 GUID bytes through the direct map); the detection model is specified
 //! in [entropy.md](../../docs/entropy.md) § Whole-VM-snapshot detection (VMGENID).
 //! The BSP timer tick additionally polls the GUID purely for observability
 //! ([`poll_log`]); the draw path never depends on it, and it takes no lock
@@ -71,7 +71,8 @@ pub fn read_guid() -> Option<[u8; 16]>
     Some(read_at(va))
 }
 
-/// Volatile 16-byte read of the GUID at kernel VA `va`.
+/// Volatile read of the 16 GUID bytes at kernel VA `va`, one byte at a time:
+/// the GUID is a byte string, and nothing guarantees `va` a wider alignment.
 ///
 /// The hypervisor rewrites the GUID only while the vCPUs are paused, so a
 /// torn read cannot occur in practice; if one ever did, the per-draw compare
@@ -79,10 +80,13 @@ pub fn read_guid() -> Option<[u8; 16]>
 #[inline]
 fn read_at(va: u64) -> [u8; 16]
 {
-    // SAFETY: `va` was derived by `init` from a BootInfo physical address
-    // validated against the physical memory span; the direct map covers it
-    // for the kernel's lifetime.
-    unsafe { core::ptr::read_volatile(va as *const [u8; 16]) }
+    let guid = va as *const u8;
+    core::array::from_fn(|i| {
+        // SAFETY: `va` was derived by `init` from a BootInfo physical address
+        // whose 16 bytes were validated against the physical memory span; the
+        // direct map covers them for the kernel's lifetime, and `i < 16`.
+        unsafe { core::ptr::read_volatile(guid.wrapping_add(i)) }
+    })
 }
 
 fn split(guid: &[u8; 16]) -> (u64, u64)

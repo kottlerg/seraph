@@ -922,8 +922,15 @@ unsafe fn claim_fault_park(
             // SAFETY: tcb valid; no lock held (contract); blocked_on non-null.
             unsafe { claim_received_fault(tcb, blocked_on) }
         }
-        // Not a fault park: nothing to cancel.
-        _ => return true,
+        // Not a fault park this claim can take (a fault binding with no
+        // endpoint among them): nothing to cancel.
+        IpcThreadState::BlockedOnFault
+        | IpcThreadState::None
+        | IpcThreadState::BlockedOnRecv
+        | IpcThreadState::BlockedOnReply
+        | IpcThreadState::BlockedOnNotification
+        | IpcThreadState::BlockedOnEventQueue
+        | IpcThreadState::BlockedOnWaitSet => return true,
     };
     if won
     {

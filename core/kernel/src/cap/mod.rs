@@ -30,6 +30,23 @@
     clippy::cast_possible_truncation,
     reason = "u64→usize/u32/u16 capability field extractions bounded by capability space"
 )]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 // `alloc` is only required by the test build (heap-backed CSpace stub +
 // `nonnull_from_box` test helper). Production has no `GlobalAlloc`.

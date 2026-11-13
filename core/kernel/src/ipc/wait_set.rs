@@ -466,6 +466,11 @@ impl WaitSetState
     /// just before): queue the member unless it is already queued, and, if
     /// `threads_parked`, return the badge to wake the longest-waiting thread
     /// with.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`threads_parked` is data: whether the wait set's waiter queue holds a thread, \
+                  read under `lock`, for which the transition returns a wake"
+    )]
     fn on_arrival(&mut self, member_idx: u16, threads_parked: bool) -> Option<u64>
     {
         self.push_ready(member_idx);
@@ -481,6 +486,11 @@ impl WaitSetState
     /// source ready, queue it, and, if `threads_parked`, also return the badge
     /// to wake the longest-waiting thread with. Returns the slot index and that
     /// wake, or `None` when every slot is occupied.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`threads_parked` is data: whether the wait set's waiter queue holds a thread, \
+                  read under `lock`, for which the transition returns a wake"
+    )]
     fn install(
         &mut self,
         member: &WaitSetMember,

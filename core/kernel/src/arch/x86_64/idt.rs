@@ -1053,14 +1053,16 @@ const DEVICE_STUB_STRIDE: usize = 16;
 #[unsafe(naked)]
 unsafe extern "C" fn device_irq_stubs()
 {
-    // AT&T syntax, so `$seraph_device_vector` is the assembler symbol's value as
-    // an immediate; the `.set` counter gives each repetition its vector.
+    // The `.set` counter gives each repetition its vector; `offset` makes the
+    // assembler symbol's value an immediate, where a bare symbol in Intel
+    // syntax is a memory operand. No register is clobbered: the stub only
+    // pushes the two words and jumps.
     core::arch::naked_asm!(
         ".p2align 4",
         ".set seraph_device_vector, {first}",
         ".rept {count}",
-        "pushq $0",
-        "pushq $seraph_device_vector",
+        "push 0",
+        "push offset seraph_device_vector",
         "jmp {tramp}",
         ".p2align 4",
         ".set seraph_device_vector, seraph_device_vector + 1",
@@ -1068,7 +1070,6 @@ unsafe extern "C" fn device_irq_stubs()
         first = const super::ioapic::DEVICE_VECTOR_BASE,
         count = const super::ioapic::DEVICE_VECTOR_COUNT,
         tramp = sym common_irq_trampoline,
-        options(att_syntax),
     );
 }
 
@@ -1443,6 +1444,11 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
 /// # Safety
 /// `tcb` is the current user thread and has a bound handler; `frame` is the live
 /// `#PF` [`TrapFrame`] on the current kernel stack; no lock is held.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`present` is data: the P bit of the `#PF` error code, which the function encodes as \
+              `FAULT_ACCESS_PRESENT` in the fault message"
+)]
 #[cfg(not(test))]
 unsafe fn redirect_user_page_fault(
     tcb: *mut crate::sched::thread::ThreadControlBlock,

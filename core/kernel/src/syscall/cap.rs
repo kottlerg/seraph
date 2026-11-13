@@ -749,6 +749,11 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     reason = "create and augment modes share the source-cap resolution and carve; each failure \
               arm's rollback reads beside its step"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the new `CSpace` (2104 B) built by the inlined `CSpace::new` before it is written \
+              into the retyped slot; on the 16 KiB kernel stack of the calling thread"
+)]
 pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::alloc_cspace_id;
@@ -1055,6 +1060,12 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     clippy::too_many_lines,
     reason = "the TCB is constructed field by field in place, and the registration, revalidation, \
               and rollback must stay in one sequence"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `ThreadControlBlock` value (1128 B, a 576 B `Message` in it) written into the \
+              new thread's slot, with its `Message::default()`; on the 16 KiB kernel stack of \
+              the calling thread"
 )]
 pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -2657,7 +2668,7 @@ pub fn sys_cap_move(tf: UserFrame) -> Result<u64, SyscallError>
     let step = match begun?
     {
         MoveStep::Pending(mv) => move_cap_drive(mv),
-        step => step,
+        step @ (MoveStep::Done { .. } | MoveStep::Lost(_) | MoveStep::Abandoned { .. }) => step,
     };
     match step
     {

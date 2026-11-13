@@ -30,23 +30,6 @@
     clippy::cast_possible_truncation,
     reason = "u64→usize/u32/u16 capability field extractions bounded by capability space"
 )]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 // `alloc` is only required by the test build (heap-backed CSpace stub +
 // `nonnull_from_box` test helper). Production has no `GlobalAlloc`.
@@ -1659,6 +1642,12 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 ///
 /// Preconditions: called exactly once, single-threaded, after Phase 4
 /// (per-CPU storage allocated) and Phase 3 (direct map active).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `CSpaceLayout` it returns (3464 B, 3400 B of it the `module_names` table), \
+              received from `populate_cspace`; Phase 7, on the 64 KiB boot handoff stack, and \
+              the host tests on the test thread's"
+)]
 pub fn init_capability_system(
     mmio_apertures: crate::platform::ValidatedApertures,
     boot_info_phys: u64,
@@ -1861,6 +1850,12 @@ fn complete_extent_descriptors(
     clippy::too_many_lines,
     reason = "one logical pass over all boot-time resource types; splitting would require \
               threading shared state (cspace) through multiple helper functions"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `CSpaceLayout` it returns (3464 B) and the `module_names` table it is built \
+              from (3400 B); Phase 7, on the 64 KiB boot handoff stack, and the host tests on \
+              the test thread's"
 )]
 fn populate_cspace(
     cspace: &mut CSpace,
@@ -2469,7 +2464,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// `CapDescriptor.aux0`/`aux1` to learn the underlying physical range.
 fn mint_reclaim_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
-    mint_reclaim_pass(cspace, boot_info, layout, false, "reclaim");
+    mint_reclaim_pass(cspace, boot_info, layout, ReclaimPass::Phase7);
 }
 
 /// Mint reclaimable `Memory` capabilities for entries flagged
@@ -2493,14 +2488,61 @@ pub(crate) fn mint_late_reclaim_memory_caps(
     layout: &mut CSpaceLayout,
 )
 {
-    mint_reclaim_pass(cspace, boot_info, layout, true, "late reclaim");
+    mint_reclaim_pass(cspace, boot_info, layout, ReclaimPass::Late);
 }
 
-/// Shared implementation backing both reclaim passes. `late` selects
-/// which subset to process: `false` mints all entries with the LATE flag
-/// clear, `true` mints only entries with the LATE flag set. `label`
-/// prefixes the diagnostic line so the two passes are distinguishable
-/// in the boot log.
+/// One of the two reclaim passes, which mint disjoint subsets of
+/// `boot_info.reclaim_ranges`.
+#[derive(Clone, Copy)]
+enum ReclaimPass
+{
+    /// Phase 7: every range without [`boot_protocol::RECLAIM_FLAG_LATE`].
+    Phase7,
+    /// Phase 8, after SMP bringup: only the ranges with
+    /// [`boot_protocol::RECLAIM_FLAG_LATE`].
+    Late,
+}
+
+impl ReclaimPass
+{
+    /// Whether the pass mints a range whose flags are `flags`.
+    const fn takes(self, flags: u32) -> bool
+    {
+        let late = flags & boot_protocol::RECLAIM_FLAG_LATE != 0;
+        match self
+        {
+            Self::Phase7 => !late,
+            Self::Late => late,
+        }
+    }
+
+    /// The prefix of the pass's boot-log line, which tells the two passes
+    /// apart.
+    const fn label(self) -> &'static str
+    {
+        match self
+        {
+            Self::Phase7 => "reclaim",
+            Self::Late => "late reclaim",
+        }
+    }
+
+    /// The halt message when the root `CSpace` has no slot for a range's cap.
+    const fn no_slot_message(self) -> &'static str
+    {
+        match self
+        {
+            Self::Phase7 => "Phase 7: cannot allocate Memory capability for reclaimed boot scratch",
+            Self::Late =>
+            {
+                "Phase 8: cannot allocate Memory capability for late-reclaimed boot scratch"
+            }
+        }
+    }
+}
+
+/// Shared implementation backing both reclaim passes: mints the ranges
+/// `pass` takes ([`ReclaimPass::takes`]) and logs a line under its label.
 ///
 /// The pass mints over the ranges as the bootloader left them; the kernel
 /// still reads the `BootInfo` page and the reclaim array through Phase 9, so
@@ -2516,8 +2558,7 @@ fn mint_reclaim_pass(
     cspace: &mut CSpace,
     boot_info: &BootInfo,
     layout: &mut CSpaceLayout,
-    late: bool,
-    label: &str,
+    pass: ReclaimPass,
 )
 {
     use init_protocol::CapType;
@@ -2576,8 +2617,7 @@ fn mint_reclaim_pass(
         {
             continue;
         }
-        let is_late = range.flags & boot_protocol::RECLAIM_FLAG_LATE != 0;
-        if is_late != late
+        if !pass.takes(range.flags)
         {
             continue;
         }
@@ -2645,19 +2685,7 @@ fn mint_reclaim_pass(
             lock: core::sync::atomic::AtomicU32::new(0),
             slot_count: core::sync::atomic::AtomicU32::new(0),
         });
-        let slot = insert_or_fatal(
-            cspace,
-            MemRights::BOOT_RAM,
-            ptr,
-            if late
-            {
-                "Phase 8: cannot allocate Memory capability for late-reclaimed boot scratch"
-            }
-            else
-            {
-                "Phase 7: cannot allocate Memory capability for reclaimed boot scratch"
-            },
-        );
+        let slot = insert_or_fatal(cspace, MemRights::BOOT_RAM, ptr, pass.no_slot_message());
         push_descriptor(
             &mut layout.descriptor_count,
             CapDescriptor {
@@ -2681,7 +2709,7 @@ fn mint_reclaim_pass(
         let total_after = crate::mm::with_frame_allocator(|alloc| alloc.total_page_count());
         crate::kprintln!(
             "{}: minted {} Memory caps over {} scratch pages (total accounted {} → {})",
-            label,
+            pass.label(),
             count,
             pages_total,
             total_before,
@@ -2689,7 +2717,7 @@ fn mint_reclaim_pass(
         );
     }
     #[cfg(test)]
-    let _ = (total_before, pages_total, label);
+    let _ = (total_before, pages_total);
 }
 
 /// Pages the reclaim array can span: at most [`boot_protocol::MAX_RECLAIM_RANGES`]
@@ -3079,6 +3107,31 @@ fn insert_or_fatal<K: slot::CapKind>(
 mod tests
 {
     use super::*;
+
+    // ── reclaim passes ────────────────────────────────────────────────────────
+
+    #[test]
+    fn reclaim_passes_split_ranges_by_the_late_flag_alone()
+    {
+        let late = boot_protocol::RECLAIM_FLAG_LATE;
+        // Reserved bits set beside the flag change neither pass's choice.
+        let reserved = !late;
+        for flags in [0, late, reserved, late | reserved]
+        {
+            let is_late = flags & late != 0;
+            assert_eq!(
+                ReclaimPass::Late.takes(flags),
+                is_late,
+                "the late pass takes exactly the flagged ranges ({flags:#x})"
+            );
+            assert_eq!(
+                ReclaimPass::Phase7.takes(flags),
+                !is_late,
+                "Phase 7 takes exactly the unflagged ranges ({flags:#x})"
+            );
+        }
+        assert_ne!(ReclaimPass::Phase7.label(), ReclaimPass::Late.label());
+    }
 
     // ── published slot runs ───────────────────────────────────────────────────
 

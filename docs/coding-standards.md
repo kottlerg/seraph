@@ -38,12 +38,13 @@ The following individual lints are additionally mandatory:
 - From `clippy::restriction`: `arithmetic_side_effects`, `as_pointer_underscore`, `as_underscore`,
   `assertions_on_result_states`, `dbg_macro`, `default_union_representation`,
   `empty_enum_variants_with_brackets`, `empty_structs_with_brackets`, `fn_to_numeric_cast_any`,
-  `get_unwrap`, `indexing_slicing`, `infinite_loop`, `iter_over_hash_type`, `mem_forget`,
-  `mixed_read_write_in_expression`, `pointer_format`, `precedence_bits`, `pub_without_shorthand`,
-  `renamed_function_params`, `rest_pat_in_fully_bound_structs`, `self_named_module_files`,
-  `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`,
-  `try_err`, `unimplemented`, `unnecessary_rest_pattern`, `unnecessary_safety_comment`,
-  `unnecessary_safety_doc`, `unnecessary_self_imports`, and `unneeded_field_pattern`.
+  `get_unwrap`, `indexing_slicing`, `infinite_loop`, `inline_asm_x86_att_syntax`,
+  `iter_over_hash_type`, `mem_forget`, `mixed_read_write_in_expression`, `pointer_format`,
+  `precedence_bits`, `pub_without_shorthand`, `renamed_function_params`,
+  `rest_pat_in_fully_bound_structs`, `self_named_module_files`, `separated_literal_suffix`,
+  `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`, `try_err`, `unimplemented`,
+  `unnecessary_rest_pattern`, `unnecessary_safety_comment`, `unnecessary_safety_doc`,
+  `unnecessary_self_imports`, and `unneeded_field_pattern`.
 - From `clippy::nursery`: `as_ptr_cast_mut`, `collection_is_never_read`,
   `debug_assert_with_mut_call`, `fallible_impl_from`, `literal_string_with_formatting_args`,
   `non_send_fields_in_send_ty`, `read_zero_byte_vec`, `significant_drop_in_scrutinee`,
@@ -59,7 +60,8 @@ mandatory, checks a rule this document states, and a site the rule permits carri
 `#[expect(<lint>, reason = "...")]` (§ E) whose reason gives what the rule asks of it. The rules of
 `panic`, `unreachable`, `unwrap_in_result` and `panic_in_result_fn` are in § Error Handling, of
 `fn_params_excessive_bools` in § Function Design, of `non_send_fields_in_send_ty` in
-§ Concurrency, and of `pointer_format` in § Cross-Boundary Data Hygiene. The others:
+§ Concurrency, of `pointer_format` in § Cross-Boundary Data Hygiene, and of
+`inline_asm_x86_att_syntax` in § C. The others:
 
 - `wildcard_enum_match_arm`: a match on an enum the tree defines names every variant it handles,
   the variants of a shared arm included, so that adding a variant fails the build at every match
@@ -507,6 +509,9 @@ in the same change.
   alongside logic.
 - Every inline assembly block MUST comment what it does, what registers it clobbers,
   and what constraints it assumes.
+- x86-64 inline assembly (`asm!`, `naked_asm!` and `global_asm!`) MUST use the Intel syntax,
+  the default of Rust's inline assembly, and MUST NOT pass `options(att_syntax)`; the
+  `inline_asm_x86_att_syntax` lint checks it.
 - When adding a new architecture, do not diverge from the interface contract without
   updating every implementation.
 

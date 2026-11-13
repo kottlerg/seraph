@@ -329,9 +329,9 @@ pub fn tss_desc(tss_addr: u64) -> (u64, u64)
 ///
 /// Called once during boot. Parameters:
 /// - `kernel_stack_top`: initial RSP0 (ring-0 stack top for TSS).
-/// - `ist1_top`: top of the 8 KiB IST stack shared by the double-fault and
+/// - `ist1_top`: top of the IST stack shared by the double-fault and
 ///   machine-check gates.
-/// - `ist2_top`: top of the 8 KiB NMI IST stack.
+/// - `ist2_top`: top of the NMI IST stack.
 ///
 /// # Safety
 /// Must execute at ring 0 from a single-threaded context. The `GDT` and `TSS`

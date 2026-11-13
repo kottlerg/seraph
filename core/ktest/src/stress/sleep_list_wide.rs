@@ -71,16 +71,16 @@ const TIMED_WAIT_MIN_US: u64 = 40_000;
 /// CPUs.
 const WAIT_POLLS: u32 = 10_000;
 
-/// A child's stack: children only loop on one syscall.
-#[repr(C, align(16))]
-struct SmallStack([u8; 4096]);
+/// A child's stack, one page above its guard: children only loop on one
+/// syscall.
+type SmallStack = crate::GuardedStack<1>;
 
 /// Every child's stack, holders first.
 const CHILDREN: usize = HOLDERS + WAKERS;
 
 // Each child uses only its own element; children are deleted before
 // this cell returns and stress cells run sequentially.
-static mut STACKS: [SmallStack; CHILDREN] = [const { SmallStack([0; 4096]) }; CHILDREN];
+static mut STACKS: [SmallStack; CHILDREN] = [const { SmallStack::ZERO }; CHILDREN];
 
 /// Holders that have entered their sleep.
 static HELD: AtomicU32 = AtomicU32::new(0);
@@ -165,11 +165,8 @@ fn spawn_children(
             waker_entry
         };
         // element i is this child's alone (see STACKS).
-        let base = crate::elem_ptr(core::ptr::addr_of!(STACKS), i)
-            .ok_or("stress::sleep_list_wide: stack index out of range")? as u64;
-        let top = base
-            .checked_add(4096)
-            .ok_or("stress::sleep_list_wide: stack top overflows")?;
+        let top = SmallStack::top_at(core::ptr::addr_of!(STACKS), i)
+            .map_err(|_| "stress::sleep_list_wide: stack index out of range")?;
         // SAFETY: `top` tops `STACKS[i]`, this child's own stack, on
         // which no other live thread runs.
         unsafe { spawn::configure_and_start_thread(th, entry, top, i as u64) }

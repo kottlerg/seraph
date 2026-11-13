@@ -16,6 +16,9 @@
     "position-independent-executables": true,
     "static-position-independent-executables": true,
     "plt-by-default": false,
+    "stack-probes": {
+        "kind": "inline"
+    },
     "code-model": "small",
     "relocation-model": "pic",
     "pre-link-args": {

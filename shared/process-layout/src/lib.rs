@@ -71,7 +71,11 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-use process_abi::{MAX_PROCESS_STACK_PAGES, STACK_GUARD_PAGES};
+use process_abi::MAX_PROCESS_STACK_PAGES;
+/// Unmapped guard pages below every stack a layout places, init's included;
+/// re-exported for the kernel, which places init's stack and does not depend
+/// on `process-abi`.
+pub use process_abi::STACK_GUARD_PAGES;
 
 /// Page size shared by every layout computation in this crate.
 const PAGE_SIZE: u64 = 4096;
@@ -209,8 +213,9 @@ pub const INIT_INFO_WINDOW: VaWindow = VaWindow {
     slots_log2: 21,
 };
 
-/// Window for init's stack guard page (kernel-chosen, per boot). Same draw
-/// semantics as [`STACK_GUARD_WINDOW`], with `INIT_STACK_PAGES` mapped pages.
+/// Window for the lowest of init's stack guard pages (kernel-chosen, per
+/// boot). Same draw semantics as [`STACK_GUARD_WINDOW`]: `STACK_GUARD_PAGES`
+/// unmapped guard pages from the draw, then `INIT_STACK_PAGES` mapped pages.
 pub const INIT_STACK_GUARD_WINDOW: VaWindow = VaWindow {
     base: 0x0000_002C_4000_0000,
     slots_log2: 21,

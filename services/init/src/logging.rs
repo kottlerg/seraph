@@ -60,7 +60,19 @@ use logd_codec::history::{ENTRY_MAX_BYTES, EntryKind, HistoryCursor, HistoryRing
 const LOG_THREAD_IPC_BUF_VA: u64 = crate::INIT_IPC_BUF_VA + crate::PAGE_SIZE;
 
 /// init log-thread stack base.
+///
+/// The `process_abi::STACK_GUARD_PAGES` pages below it are its guard: init
+/// maps nothing there, so a frame that overflows the stack faults
+/// (docs/build-system.md § Custom Targets gives the span the guard covers).
 const LOG_THREAD_STACK_VA: u64 = 0x0000_0000_D000_0000;
+
+/// Lowest page of the log-thread stack's guard.
+const LOG_THREAD_GUARD_VA: u64 =
+    LOG_THREAD_STACK_VA - process_abi::STACK_GUARD_PAGES as u64 * crate::PAGE_SIZE;
+
+// The guard lies above every other fixed VA of init's private plan, the
+// highest of which below the stack is the log-thread IPC buffer page.
+const _: () = assert!(LOG_THREAD_IPC_BUF_VA + crate::PAGE_SIZE <= LOG_THREAD_GUARD_VA);
 
 /// Number of stack pages for the log thread (16 KiB). It bounds no log
 /// capacity: [`SENDERS`] and [`HISTORY`] live in BSS, not on this stack.

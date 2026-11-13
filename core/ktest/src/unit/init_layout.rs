@@ -12,7 +12,7 @@
 //! trap-frame build end-to-end.
 
 use init_protocol::INIT_STACK_PAGES;
-use process_layout::{IMAGE_WINDOW, INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
+use process_layout::{IMAGE_WINDOW, INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, STACK_GUARD_PAGES};
 use syscall_abi::PAGE_SIZE;
 
 use crate::{TestContext, TestResult};
@@ -41,22 +41,26 @@ pub fn init_info_va_in_window(ctx: &TestContext) -> TestResult
 
 /// The stack pointer of a live stack frame lies inside the span reachable
 /// from the init-stack-guard window: above the lowest possible mapped stack
-/// byte and below the highest possible stack top (the maximum guard draw
-/// plus `INIT_STACK_PAGES` mapped pages). Proves `sched::enter`'s cached
-/// stack top matches the Phase 9 stack mapping.
+/// byte (the lowest guard draw plus `STACK_GUARD_PAGES` guard pages) and
+/// below the highest possible stack top (the window's end plus the guard and
+/// `INIT_STACK_PAGES` mapped pages). Proves `sched::enter`'s cached stack top
+/// matches the Phase 9 stack mapping.
 pub fn sp_in_init_stack_window(_ctx: &TestContext) -> TestResult
 {
     let probe = 0u64;
     let sp = core::ptr::addr_of!(probe) as u64;
-    let lowest = INIT_STACK_GUARD_WINDOW.base + PAGE_SIZE;
+    let reserve = u64::from(STACK_GUARD_PAGES)
+        .checked_add(INIT_STACK_PAGES as u64)
+        .and_then(|pages| pages.checked_mul(PAGE_SIZE))
+        .ok_or("init-stack reservation overflows")?;
+    let lowest = u64::from(STACK_GUARD_PAGES)
+        .checked_mul(PAGE_SIZE)
+        .and_then(|guard| INIT_STACK_GUARD_WINDOW.base.checked_add(guard))
+        .ok_or("init-stack window base overflows")?;
     let highest = INIT_STACK_GUARD_WINDOW
         .base
         .checked_add(INIT_STACK_GUARD_WINDOW.span())
-        .and_then(|top| {
-            (INIT_STACK_PAGES as u64)
-                .checked_mul(PAGE_SIZE)
-                .and_then(|stack| top.checked_add(stack))
-        })
+        .and_then(|top| top.checked_add(reserve))
         .ok_or("init-stack window span overflows")?;
     if sp < lowest || sp >= highest
     {

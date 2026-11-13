@@ -59,15 +59,16 @@ use crate::{ChildStack, TestContext, run_integration_test};
 
 /// Number of shared child stacks, and so the maximum children a stress cell
 /// runs on [`STRESS_STACKS`] stacks at once.
-/// `sleep_list_wide` carries its own 256 × 4 KiB child stacks (1 MiB more
-/// BSS), so it runs 256 concurrent children, past this cap.
+/// `sleep_list_wide` carries its own 256 × 4 KiB child stacks, each above its
+/// 16 KiB guard (256 × 20 KiB = 5 MiB more BSS), so it runs 256 concurrent
+/// children, past this cap.
 ///
 /// 64 matches the width of the `u64` notification bitmask used by tests that
 /// allocate one bit per worker (`concurrent_notification`, `retype_concurrent`,
 /// `cap_revoke_under_use`). Bumping past 64 requires refactoring those
 /// tests to use an atomic-counter ledger instead of one bit per worker.
-/// 64 × 16 KiB `ChildStack` = 1 MiB BSS — fits comfortably in ktest's
-/// segment caps.
+/// 64 × 32 KiB `ChildStack` (16 KiB of stack and its 16 KiB guard) = 2 MiB
+/// BSS — fits comfortably in ktest's segment caps.
 const MAX_STRESS_THREADS: usize = 64;
 
 /// Shared child stacks for stress tests. Tests run sequentially so stacks

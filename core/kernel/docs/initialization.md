@@ -754,7 +754,9 @@ calls `sched::enter()`.
       permissions
    d. Mint a reclaimable Memory cap per stack page into the root CSpace
       so init can donate the pages to memmgr on reap
-   e. Guard page (unmapped) sits immediately below the stack; stack overflows fault
+   e. `STACK_GUARD_PAGES` (4) guard pages (unmapped) sit immediately below the stack, so an
+      overflow faults, by a frame larger than a page included
+      ([docs/build-system.md](../../../docs/build-system.md) § Custom Targets)
 5. Create init's TCB:
    a. Retype init's Thread slot from SEED_MEMORY in the layout SYS_CAP_CREATE_THREAD uses
       (`sched::thread_slot`): a guard page, unmapped from the direct map with no shootdown,

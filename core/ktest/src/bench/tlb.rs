@@ -49,7 +49,8 @@ use crate::{ChildStack, spawn};
 /// Ceiling on the worker count. CPU 0 is ktest's own; pin children to
 /// 1..=`MAX_PINNED`. 7 covers up to an 8-vCPU host with headroom over
 /// the 4-vCPU QEMU configuration ktest currently boots under, and
-/// keeps `SHOOTDOWN_STACKS` BSS at 7 × 16 KiB = 112 KiB.
+/// keeps `SHOOTDOWN_STACKS` BSS at 7 × 32 KiB (each `ChildStack` with its
+/// guard) = 224 KiB.
 const MAX_PINNED: usize = 7;
 static mut SHOOTDOWN_STACKS: [ChildStack; MAX_PINNED] = [const { ChildStack::ZERO }; MAX_PINNED];
 

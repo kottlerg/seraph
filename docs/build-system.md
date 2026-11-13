@@ -112,6 +112,17 @@ code model to `small` when it went PIE): `relocation-model: pic`, the
 same `-pie …` link args, producing `ET_DYN` images with `RELATIVE`-only
 relocations that loaders place at a randomized base and whose
 `PT_GNU_RELRO` region they seal read-only after relocation (ASLR, #39).
+They emit inline stack probes (`"stack-probes": {"kind": "inline"}`) as the
+other triples do, and every stack of their binaries keeps a guard of
+`process_abi::STACK_GUARD_PAGES` (four) pages: init's main stack, which the
+kernel places, init's log-thread stack, memmgr's main stack, which init
+places through `shared/process-layout`, and ktest's child stacks. On riscv64 a
+`call` writes nothing to the stack and a split prologue leaves up to 6120
+bytes below its return-address save unwritten, and with no vector extension
+a callee's first store lies at most a page below its entry, so two
+consecutive stack stores lie at most 10216 bytes apart; ktest's
+`integration::child_stack_guard` checks that an overflowing frame faults in
+a child stack's guard.
 
 The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
 carry the same PIE treatment (plus `tls-model: local-exec`, keeping TLS
@@ -129,10 +140,7 @@ apart. Every main-thread stack that `shared/process-layout` places and every
 thread stack std spawns therefore keeps a guard of four pages
 (`process_abi::STACK_GUARD_PAGES`; [`threadstack`](../programs/threadstack/README.md)'s
 `splitframe` and `span` modes check it), where x86-64, whose `call` pushes
-the return address, needs one. Stacks placed otherwise keep less: init's main
-stack, which the kernel places, and the stacks the `lowuser` services place
-themselves keep one page or none ([#1018](https://github.com/kottlerg/seraph/issues/1018)).
-The two floors:
+the return address, needs one. The two floors:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,

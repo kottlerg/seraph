@@ -359,8 +359,8 @@ pub fn redirect_to_entry(regs: &mut [u8], entry: u64) -> Result<(), &'static str
 /// stopped in are dead, and starting the entry at the top keeps the child's
 /// stack one call chain deep whatever the round count. Continuing from the
 /// stopped stack pointer instead adds a chain each round; once the rounds'
-/// chains pass the `ChildStack`'s size, the child writes into the statics
-/// below it.
+/// chains pass the `ChildStack`'s size, the child overflows into the stack's
+/// guard and faults.
 ///
 /// # Errors
 ///

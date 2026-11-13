@@ -19,6 +19,7 @@ pub mod cap_generation_wide;
 pub mod cap_move_into_fresh_cspace_then_ipc;
 pub mod cap_transfer;
 pub mod cap_transfer_large;
+pub mod child_stack_guard;
 pub mod cross_cspace_revoke_no_alias;
 pub mod cspace_nested_teardown;
 pub mod death_notification_late_bind;
@@ -209,6 +210,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_kills_thread",
         fault_kills_thread::run(ctx)
+    );
+    run_integration_test!(
+        "integration::child_stack_guard",
+        child_stack_guard::run(ctx)
     );
     run_integration_test!(
         "integration::fault_pager_roundtrip",

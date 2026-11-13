@@ -44,6 +44,10 @@ pub unsafe fn rebase_serial(_new_base: u64) {}
 /// call, and that I/O port access is permitted in the current privilege level.
 pub unsafe fn serial_init(_phys_base: u64)
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a register of COM1, at a constant port offset from its base"
+    )]
     // SAFETY: caller guarantees ring 0 and at-most-once initialization.
     unsafe {
         outb(COM1 + 1, 0x00); // disable all interrupts

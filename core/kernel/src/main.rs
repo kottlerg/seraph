@@ -16,6 +16,8 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
+// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![cfg_attr(
     test,
     expect(
@@ -68,19 +70,50 @@ use boot_protocol::BootInfo;
 
 mod arch;
 mod bounded_wait;
+#[expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are not \
+              fixed yet"
+)]
 mod cap;
 mod console;
 mod cpu_mask;
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are \
+                  not fixed yet"
+    )
+)]
 mod entropy;
 mod framebuffer;
+#[expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are not \
+              fixed yet"
+)]
 mod ipc;
 pub mod irq;
+#[expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are not \
+              fixed yet"
+)]
 mod mm;
 mod percpu;
 mod platform;
 mod sched;
 mod stack_depth;
 mod sync;
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are \
+                  not fixed yet"
+    )
+)]
 mod syscall;
 mod uaccess;
 mod validate;
@@ -358,7 +391,7 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 {
     let bi = mm::paging::phys_to_virt(boot_info_phys) as *const BootInfo;
     // SAFETY: caller contract; reads the one pointer field of the page.
-    let ids_phys = unsafe { core::ptr::addr_of!((*bi).cpu_ids).read() } as u64;
+    let ids_phys = unsafe { (*bi).cpu_ids } as u64;
     let len = (count as usize).min(boot_protocol::MAX_CPUS);
     // SAFETY: caller contract and Phase 0's check: `len` u32s at `ids_phys`
     // lie in RAM the direct map covers, and nothing writes them.
@@ -426,17 +459,18 @@ unsafe fn kernel_entry_post_rebase(
     // Rebase MMIO-based console devices to the direct physical map.
     // On RISC-V the UART is MMIO and must be accessed via the direct map after
     // the page table switch; on x86-64 the UART is I/O-mapped (no-op).
-    // SAFETY: kernel page tables active with direct physical map covering all
-    // RAM but the handoff stack's guard page, and the UART MMIO region;
-    // framebuffer physical base from validated BootInfo.
-    unsafe {
-        let uart_phys = arch::current::console::uart_phys_base();
-        if uart_phys != 0
-        {
-            arch::current::console::rebase_serial(mm::paging::phys_to_virt(uart_phys));
-        }
-        console::rebase_framebuffer(fb_phys);
+    let uart_phys = arch::current::console::uart_phys_base();
+    if uart_phys != 0
+    {
+        // SAFETY: the single boot thread; kernel page tables active with the
+        // direct physical map covering all RAM but the handoff stack's guard
+        // page, and the UART MMIO region.
+        unsafe { arch::current::console::rebase_serial(mm::paging::phys_to_virt(uart_phys)) };
     }
+    // SAFETY: init_kernel_page_tables returned successfully in Phase 3 and the
+    // direct physical map is active; framebuffer physical base from validated
+    // BootInfo.
+    unsafe { console::rebase_framebuffer(fb_phys) };
     kprintln!("Phase 3: Kernel Page Tables");
     // The direct-map base is a KASLR secret and the console mirrors to the
     // userspace-visible framebuffer; report_kaslr already logged it on the
@@ -531,12 +565,14 @@ unsafe fn kernel_entry_post_rebase(
     // riscv64 `interrupts::init` checks the BSP's hart id against the IMSIC
     // layout.
     #[cfg(not(test))]
-    // SAFETY: single-threaded boot; the ids are read through the direct map
-    // from the CPU-id pages the validated BootInfo names, unscrubbed until
-    // Phase 9; init_storage allocated the id slab; init_apic_ids writes it once
-    // before SMP is active.
-    unsafe {
-        percpu::init_apic_ids(boot_cpu_ids(boot_info_phys, boot_cpu_count));
+    {
+        // SAFETY: Phase 3 has completed; the ids are read through the direct
+        // map from the CPU-id pages the validated BootInfo names, unscrubbed
+        // until Phase 9, and nothing writes them.
+        let cpu_ids = unsafe { boot_cpu_ids(boot_info_phys, boot_cpu_count) };
+        // SAFETY: single-threaded boot; init_storage allocated the id slab;
+        // init_apic_ids writes it once before SMP is active.
+        unsafe { percpu::init_apic_ids(cpu_ids) };
     }
 
     // ── Phase 5: architecture hardware initialization ─────────────────────────
@@ -614,11 +650,13 @@ unsafe fn kernel_entry_post_rebase(
     // is absent this is a no-op and the kernel keeps the full-flush
     // context-switch path. Must precede any tagged activate (Phase 9 / scheduler).
     #[cfg(not(test))]
-    // SAFETY: BSP, ring 0 / S-mode; kernel root active; `allocator` is the live
-    // frame allocator; called once before any tagged activate.
-    unsafe {
-        let hw_tags = arch::current::paging::enable_tagged_tlb();
-        mm::tag_allocator::enable(hw_tags, boot_cpu_count as usize, allocator);
+    {
+        // SAFETY: BSP, ring 0 / S-mode; kernel root active; called once before
+        // any tagged activate.
+        let hw_tags = unsafe { arch::current::paging::enable_tagged_tlb() };
+        // SAFETY: BSP, single-threaded boot; `allocator` is the live frame
+        // allocator; called once before any tagged activate.
+        unsafe { mm::tag_allocator::enable(hw_tags, boot_cpu_count as usize, allocator) };
     }
     kprintln!("tagged-tlb ok");
     // SAFETY: IDT installed and interrupts initialized above; syscall entry
@@ -650,15 +688,17 @@ unsafe fn kernel_entry_post_rebase(
         // only copy and one scrub covers it. The length is clamped because
         // the Phase-0 validator does not check it.
         let bi = mm::paging::phys_to_virt(boot_info_phys) as *mut BootInfo;
-        // SAFETY: the direct map covers all RAM since Phase 3 but the
-        // kernel-stack guard pages (`mm::stack_guard`), and the `BootInfo`
-        // page is none of them; boot_info_phys was validated in Phase 0.
-        // Single-threaded boot, and no live BootInfo
-        // reference aliases the page; the shared borrow taken here ends before
-        // the scrub below writes through `bi`.
-        unsafe {
-            let seed: &[u8; 32] = &*core::ptr::addr_of!((*bi).boot_entropy_seed);
-            let len = (*bi).boot_entropy_len as usize;
+        {
+            // SAFETY: the direct map covers all RAM since Phase 3 but the
+            // kernel-stack guard pages (`mm::stack_guard`), and the `BootInfo`
+            // page is none of them; boot_info_phys was validated in Phase 0.
+            // Single-threaded boot, and no live BootInfo
+            // reference aliases the page; the shared borrow taken here ends
+            // before the scrub below writes through `bi`.
+            let seed: &[u8; 32] = unsafe { &(*bi).boot_entropy_seed };
+            // SAFETY: as for `seed`: a field of the validated BootInfo page,
+            // which the direct map reaches and nothing writes during the read.
+            let len = unsafe { (*bi).boot_entropy_len } as usize;
             entropy::init(seed.get(..len).unwrap_or(seed), vmgenid_paddr);
         }
 
@@ -669,6 +709,11 @@ unsafe fn kernel_entry_post_rebase(
         // read only layout-free BootInfo fields. Phase 9's reclaim scrub zeroes
         // the whole page again before init runs; this earlier scrub keeps the
         // secrets from outliving their last consumer.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every write is to a field of the BootInfo page, which the direct map reaches \
+                      and which no reference aliases on the single boot thread"
+        )]
         // SAFETY: as above. Volatile stores so the scrub of this donated page
         // cannot be elided as a dead store.
         unsafe {
@@ -898,10 +943,13 @@ unsafe fn kernel_entry_post_rebase(
         // reserved for init's later userspace pooled maps.
         for seg in init_segments(&init_image)
         {
-            // SAFETY: init_as_ptr is freshly retyped above; segment data
-            // lives in bootloader-loaded memory accessible via the direct
-            // physical map (Phase 3).
-            unsafe { (*init_as_ptr).map_segment(seg) }
+            // SAFETY: init_as_ptr is the AddressSpace freshly retyped above,
+            // which nothing frees or reaches mutably during Phase 9.
+            let init_as = unsafe { &*init_as_ptr };
+            // SAFETY: `seg` is a bootloader-provided segment of the init
+            // image; its data lives in bootloader-loaded memory accessible via
+            // the direct physical map (Phase 3).
+            unsafe { init_as.map_segment(seg) }
                 .unwrap_or_else(|()| fatal("Phase 9: failed to map init segment"));
         }
         // The bootloader loaded init's segments, and the PIE rebase above
@@ -1088,8 +1136,12 @@ unsafe fn kernel_entry_post_rebase(
                     pg,
                     "Phase 9: InitInfo window wraps",
                 );
-                // SAFETY: init_as_ptr valid; phys is part of the contiguous extent.
-                unsafe { (*init_as_ptr).map_page(map_va, phys, flags) }
+                // SAFETY: init_as_ptr is the AddressSpace retyped above, which
+                // nothing frees or reaches mutably during Phase 9.
+                let init_as = unsafe { &*init_as_ptr };
+                // SAFETY: map_va lies in init's InitInfo window, in the user
+                // half; phys is a page of the contiguous extent.
+                unsafe { init_as.map_page(map_va, phys, flags) }
                     .unwrap_or_else(|()| fatal("Phase 9: failed to map InitInfo page"));
             }
             let info_base = mm::paging::phys_to_virt(block_phys) as *mut u8;
@@ -1186,6 +1238,11 @@ unsafe fn kernel_entry_post_rebase(
 
             // Patch the just-written InitInfo header with the self-
             // referential cap slot range.
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "both writes are to fields of the InitInfo header at `info_base`, which \
+                          the single boot thread owns"
+            )]
             // SAFETY: info_base mapped writable through the direct map;
             // header lives at offset 0; single-threaded boot.
             // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
@@ -1247,9 +1304,12 @@ unsafe fn kernel_entry_post_rebase(
                 virt = virt
                     .checked_sub(PAGE_BYTES)
                     .unwrap_or_else(|| fatal("Phase 9: init stack window wraps"));
+                // SAFETY: init_as_ptr is the AddressSpace retyped above, which
+                // nothing frees or reaches mutably during Phase 9.
+                let init_as = unsafe { &*init_as_ptr };
                 // SAFETY: virt in user range; phys freshly allocated.
                 unsafe {
-                    (*init_as_ptr)
+                    init_as
                         .map_page(virt, phys, rw_flags)
                         .unwrap_or_else(|()| fatal("Phase 9: failed to map init stack page"));
                 }
@@ -1298,6 +1358,11 @@ unsafe fn kernel_entry_post_rebase(
         };
 
         // Patch InitInfo with the just-minted stack cap slot range.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "both writes are to fields of the InitInfo header at `info_page_virt`, which \
+                      the single boot thread owns"
+        )]
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
         // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
@@ -1314,6 +1379,11 @@ unsafe fn kernel_entry_post_rebase(
         // reserved total is the complement against installed RAM.
         let system_ram = mm::init::system_ram_bytes();
         let kernel_reserved = system_ram.saturating_sub(cap::owns_memory_minted_bytes());
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "both writes are to fields of the InitInfo header at `info_page_virt`, which \
+                      the single boot thread owns"
+        )]
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
         // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
@@ -1487,6 +1557,11 @@ unsafe fn kernel_entry_post_rebase(
                         magic: sched::thread::TCB_MAGIC,
                     },
                 );
+            }
+            // SAFETY: thread_obj_ptr is the wrapper page's base, kstack_top, in
+            // the freshly-retyped slab, exclusively owned; the TCB written
+            // above follows the ThreadObject, so the two do not overlap.
+            unsafe {
                 core::ptr::write(
                     thread_obj_ptr,
                     ThreadObject {
@@ -1498,12 +1573,14 @@ unsafe fn kernel_entry_post_rebase(
                         deferred_next: core::ptr::null_mut(),
                     },
                 );
-                // Thread the init TCB onto the live-thread registry (watchdog
-                // enumeration of Blocked waiters, #351; object-teardown stop
-                // walk). Removed by `dealloc_object(Thread)` if init's Thread
-                // cap is ever deleted/revoked.
-                sched::thread_registry::register(tcb_ptr);
             }
+            // Thread the init TCB onto the live-thread registry (watchdog
+            // enumeration of Blocked waiters, #351; object-teardown stop
+            // walk). Removed by `dealloc_object(Thread)` if init's Thread
+            // cap is ever deleted/revoked.
+            // SAFETY: tcb_ptr is the TCB written above, freshly constructed
+            // and not yet on the registry.
+            unsafe { sched::thread_registry::register(tcb_ptr) };
             seed.header.inc_ref();
 
             // SAFETY: thread_obj_ptr in-place; header at offset 0.
@@ -1566,6 +1643,11 @@ unsafe fn kernel_entry_post_rebase(
         };
 
         // Patch thread_cap and cspace_cap in the InitInfo page.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "both writes are to fields of the InitInfo header at `info_page_virt`, which \
+                      the single boot thread owns"
+        )]
         // SAFETY: info_page_virt points to a kernel-writable page (mapped
         // read-only in userspace but writable via the direct physical map);
         // single-threaded boot; the write is within the InitInfo struct bounds.
@@ -1587,9 +1669,16 @@ unsafe fn kernel_entry_post_rebase(
         {
             fatal("Phase 9: ROOT_CSPACE missing");
         }
+        // SAFETY: init_cspace_ptr is non-null (checked above) and names the
+        // root CSpace, wired in Phase 7 and held by init's self-cap.
+        let id = unsafe { (*init_cspace_ptr).id() };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every write is to a field of init's TCB, which the single boot thread owns \
+                      until init is enqueued"
+        )]
         // SAFETY: init_tcb was just retyped above and is valid; single-threaded boot.
         unsafe {
-            let id = (*init_cspace_ptr).id();
             (*init_tcb).cspace = init_cspace_ptr;
             (*init_tcb).cspace_id = id;
             (*init_tcb).cspace_epoch = cap::registry_epoch(id);
@@ -1605,13 +1694,16 @@ unsafe fn kernel_entry_post_rebase(
         unsafe { cap::scrub_reclaim_ranges(boot_info_phys) };
 
         // Enqueue init on the BSP scheduler at INIT_PRIORITY.
-        // SAFETY: scheduler initialized in Phase 8. No other thread exists yet,
-        // and the idle APs reach CPU 0's queue only through the load balancer,
-        // which runs from `timer_tick` and so not before `sched::enter` ends the
-        // boot transient (`BOOT_TRANSIENT_ACTIVE`), after its dequeue of init.
-        unsafe {
-            let sched = sched::scheduler_for(0);
-            let linked = sched.enqueue(init_tcb, sched::INIT_PRIORITY);
+        {
+            // SAFETY: CPU 0 is below CPU_COUNT, and its scheduler was
+            // initialized in Phase 8.
+            let sched = unsafe { sched::scheduler_for(0) };
+            // SAFETY: init_tcb is the valid TCB built above. No other thread
+            // exists yet, and the idle APs reach CPU 0's queue only through the
+            // load balancer, which runs from `timer_tick` and so not before
+            // `sched::enter` ends the boot transient (`BOOT_TRANSIENT_ACTIVE`),
+            // after its dequeue of init: this is the single-threaded boot path.
+            let linked = unsafe { sched.enqueue(init_tcb, sched::INIT_PRIORITY) };
             debug_assert!(linked, "boot: init enqueue skipped");
         }
 
@@ -1949,6 +2041,10 @@ unsafe fn panic_context_dump()
         }
         return;
     }
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a field of the live TCB at `cur`, each always valid to read"
+    )]
     // SAFETY: cur non-null; thread_id / trap_frame / kernel_stack_top are
     // always valid to read on a live TCB.
     let (tid, tf, stack_top) = unsafe {
@@ -1975,22 +2071,21 @@ unsafe fn panic_context_dump()
         // (`#NM`, the NMI, `#DF`, `#MC`) reads the last publishing entry's
         // frame, which may be stale or overwritten.
         // SAFETY: a non-null trap_frame names a frame on this thread's kernel
-        // stack, and this is that thread's own CPU; arg/instruction_pointer
-        // are plain field reads of that frame, and `syscall_nr` is a Relaxed
-        // load of the TCB's stamp.
+        // stack, and this is that thread's own CPU, so nothing writes the
+        // frame while it is read; arg/instruction_pointer are plain field
+        // reads of it.
+        let frame = unsafe { &*tf };
+        let ip = frame.instruction_pointer();
         // The syscall number is the dispatcher's stamp on the TCB: the frame's
         // number register is overwritten by a returned result on x86-64.
-        let (ip, nr, a0, a1, a2) = unsafe {
-            (
-                (*tf).instruction_pointer(),
-                (*cur)
-                    .syscall_nr
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                (*tf).arg(0),
-                (*tf).arg(1),
-                (*tf).arg(2),
-            )
+        // SAFETY: cur non-null; `syscall_nr` is a Relaxed load of the live
+        // TCB's stamp.
+        let nr = unsafe {
+            (*cur)
+                .syscall_nr
+                .load(core::sync::atomic::Ordering::Relaxed)
         };
+        let (a0, a1, a2) = (frame.arg(0), frame.arg(1), frame.arg(2));
         // SAFETY: panic path; lock-bypassing serial write.
         unsafe {
             console::panic_write_fmt(format_args!(

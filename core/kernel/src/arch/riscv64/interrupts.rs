@@ -441,6 +441,11 @@ unsafe fn clear_sip_ssip()
 #[allow(clippy::too_many_lines)]
 extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a field of this hart's live trap frame, which trap_entry \
+                  passes and nothing else accesses before the reads end"
+    )]
     // SAFETY: trap_entry passes this hart's live, valid frame; these reads
     // end here, before anything can block (the same holds for every frame
     // access in this function: each is a single read or write, or a call that
@@ -503,24 +508,25 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         // into the live CSR and the trapping instruction would re-trap
         // forever. Returns without advancing sepc so the trapping
         // instruction is re-executed.
-        // SAFETY: current_tcb returns this CPU's running thread; valid
-        // here because we entered from a U-mode FP/V instruction.
-        let area = unsafe {
-            let tcb = crate::syscall::current_tcb();
-            if tcb.is_null()
-            {
-                core::ptr::null()
-            }
-            else
-            {
-                (*tcb).extended.area.cast_const()
-            }
+        // SAFETY: current_tcb returns this CPU's running thread.
+        let tcb = unsafe { crate::syscall::current_tcb() };
+        let area = if tcb.is_null()
+        {
+            core::ptr::null()
+        }
+        else
+        {
+            // SAFETY: a non-null tcb is this CPU's running thread, valid here
+            // because we entered from a U-mode FP/V instruction.
+            unsafe { (*tcb).extended.area.cast_const() }
         };
+        // SAFETY: trap_entry passes this hart's live frame; the reference
+        // lives only for the call below, which cannot block.
+        let live = unsafe { &mut *frame };
         // SAFETY: ring-0 trap context; lazy_restore_fp_v handles the null
-        // area branch internally (no restore, just FS/VS promotion). The
-        // frame reference lives only for the call, which cannot block.
+        // area branch internally (no restore, just FS/VS promotion).
         unsafe {
-            super::fpu::lazy_restore_fp_v(area, &mut *frame);
+            super::fpu::lazy_restore_fp_v(area, live);
         }
     }
     else if cause_code == 8
@@ -537,6 +543,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         // SYS_THREAD_WRITE_REGS may redirect a blocked thread to a new
         // instruction pointer, which must not be incremented. The frame is
         // re-read after the dispatch, which may have blocked.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to `sepc` of this hart's live trap frame, after the \
+                      dispatch returned"
+        )]
         // SAFETY: single accesses of the live frame (see the top).
         unsafe {
             if exit == crate::syscall::SyscallExit::Complete && (*frame).sepc == sepc_before
@@ -553,6 +564,9 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         // SAFETY: reading CSRs is safe in S-mode.
         unsafe {
             core::arch::asm!("csrr {}, satp", out(reg) satp_val, options(nostack, nomem));
+        }
+        // SAFETY: as for satp: a CSR read in S-mode.
+        unsafe {
             core::arch::asm!("csrr {}, sstatus", out(reg) sstatus_val, options(nostack, nomem));
         }
 
@@ -662,12 +676,12 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 // (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`); its observers
                 // are posted below. Reached only on the terminal path; normal
                 // thread_exit never lands here.
-                // SAFETY: tcb validated non-null; address_space may be null for
-                // kernel threads, which record_aspace_terminal_fault handles; no
-                // death_lock is held.
-                let aspace_post = unsafe {
-                    crate::sched::record_aspace_terminal_fault((*tcb).address_space, reason)
-                };
+                // SAFETY: tcb validated non-null.
+                let aspace = unsafe { (*tcb).address_space };
+                // SAFETY: address_space may be null for kernel threads, which
+                // record_aspace_terminal_fault handles; no death_lock is held.
+                let aspace_post =
+                    unsafe { crate::sched::record_aspace_terminal_fault(aspace, reason) };
 
                 // SAFETY: tcb validated non-null.
                 let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
@@ -1261,52 +1275,64 @@ pub unsafe fn init()
 #[cfg(not(test))]
 pub unsafe fn init_ap()
 {
-    // SAFETY: caller (kernel_entry_ap) ensures execution in S-mode on the AP hart;
-    // the CSR operations on stvec, sscratch, sstatus, sie and scounteren are
-    // S-mode privileged instructions on per-hart registers. The vlenb read in
-    // `fpu::check_ap_vlenb` is of an unprivileged read-only CSR, which needs
-    // sstatus.VS on (`fpu::read_vlenb` promotes it) and, on a hart without V,
-    // traps to the fatal handler, so it runs after the stvec install and the
-    // sscratch clear, with tp already installed by `percpu::init_ap` (the
-    // caller runs it first). The one shared state read is the boot hart's cached
-    // vlenb, written once at BSP init before any AP starts; that check may
-    // halt the boot.
+    // The CSR operations below on stvec, sscratch, sstatus, sie and scounteren
+    // are S-mode privileged instructions on per-hart registers; the caller
+    // (kernel_entry_ap) ensures execution in S-mode on the AP hart.
+
+    // Clear SIE FIRST to prevent any stray interrupt from firing before
+    // stvec and sscratch are configured. Firmware may leave SIE=1. The
+    // write touches no memory; `nomem` is omitted as for
+    // `cpu::disable_interrupts`.
+    // SAFETY: S-mode on this AP (caller contract); sstatus is per-hart.
     unsafe {
-        // Clear SIE FIRST to prevent any stray interrupt from firing before
-        // stvec and sscratch are configured. Firmware may leave SIE=1. The
-        // write touches no memory; `nomem` is omitted as for
-        // `cpu::disable_interrupts`.
         core::arch::asm!(
             "csrc sstatus, {mask}",
             mask = in(reg) (1u64 << 1) | (1u64 << 8) | (1u64 << 18),
             options(nostack, preserves_flags),
         );
+    }
 
-        // Install stvec — per-hart CSR, must be written on every hart.
-        install_trap_vector();
+    // Install stvec — per-hart CSR, must be written on every hart.
+    // SAFETY: S-mode on this AP (caller contract), which runs on the kernel
+    // page tables the trampoline's satp loaded, so the direct physical map is
+    // active.
+    unsafe { install_trap_vector() };
 
-        // Force sstatus.FS = sstatus.VS = 00 (Off) on this AP, mirroring
-        // the BSP invariant. Per-hart CSR; must be re-established here.
-        super::fpu::enable_fpu_vector();
+    // Force sstatus.FS = sstatus.VS = 00 (Off) on this AP, mirroring
+    // the BSP invariant. Per-hart CSR; must be re-established here.
+    // SAFETY: S-mode on this AP (caller contract).
+    unsafe { super::fpu::enable_fpu_vector() };
 
-        // Clear sscratch so trap_entry identifies S-mode traps correctly.
-        core::arch::asm!("csrw sscratch, zero", options(nostack, nomem));
+    // Clear sscratch so trap_entry identifies S-mode traps correctly.
+    // SAFETY: S-mode on this AP (caller contract); sscratch is per-hart.
+    unsafe { core::arch::asm!("csrw sscratch, zero", options(nostack, nomem)) };
 
-        // Every save area is sized from the boot hart's vlenb; halt the boot
-        // on a hart whose vector registers are a different width. After the
-        // sscratch clear: on a hart without V the vlenb read traps, and the
-        // trap must take the S-mode path to the fatal handler.
-        super::fpu::check_ap_vlenb();
+    // Every save area is sized from the boot hart's vlenb; halt the boot
+    // on a hart whose vector registers are a different width. After the
+    // sscratch clear: on a hart without V the vlenb read traps, and the
+    // trap must take the S-mode path to the fatal handler.
+    // SAFETY: S-mode on this AP, after the stvec install and the sscratch
+    // clear above, with tp already installed by `percpu::init_ap` (the caller
+    // runs it first). The vlenb read is of an unprivileged read-only CSR,
+    // which needs sstatus.VS on (`fpu::read_vlenb` promotes it); the one
+    // shared state read is the boot hart's cached vlenb, written once at BSP
+    // init before any AP starts; the check may halt the boot.
+    unsafe { super::fpu::check_ap_vlenb() };
 
-        // Enable SSIP, STIP, SEIP in sie (SIE is still 0; these only take
-        // effect when SIE is re-enabled by the idle loop or sret).
+    // Enable SSIP, STIP, SEIP in sie (SIE is still 0; these only take
+    // effect when SIE is re-enabled by the idle loop or sret).
+    // SAFETY: S-mode on this AP (caller contract); sie is per-hart.
+    unsafe {
         core::arch::asm!(
             "csrs sie, {mask}",
             mask = in(reg) (1u64 << 1) | (1u64 << 9) | (1u64 << 5),
             options(nostack, nomem),
         );
+    }
 
-        // Allow U-mode performance-counter reads (per-hart; same as BSP init).
+    // Allow U-mode performance-counter reads (per-hart; same as BSP init).
+    // SAFETY: S-mode on this AP (caller contract); scounteren is per-hart.
+    unsafe {
         core::arch::asm!(
             "csrs scounteren, {cy}",
             cy = in(reg) 1u64,

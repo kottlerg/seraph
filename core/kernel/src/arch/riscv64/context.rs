@@ -282,13 +282,15 @@ pub unsafe fn first_entry_to_user(
     tf: *const super::trap_frame::TrapFrame,
 ) -> !
 {
-    // SAFETY: aspace is a valid AddressSpace marked active on this CPU; tf is
-    // valid; the direct map (and thus the boot stack) is present in the new
-    // space, so activate()'s satp switch and its `ret` are safe before sret.
-    unsafe {
-        (*aspace).activate();
-        return_to_user(tf)
-    }
+    // SAFETY: aspace is a valid AddressSpace marked active on this CPU.
+    let space = unsafe { &*aspace };
+    // SAFETY: S-mode; the direct map (and thus the boot stack) is present in
+    // the new space, so activate()'s satp switch and its `ret` are safe before
+    // sret.
+    unsafe { space.activate() };
+    // SAFETY: tf points to the init thread's TrapFrame with sepc and sp set
+    // (caller contract), and its address space is now active.
+    unsafe { return_to_user(tf) }
 }
 
 // ── return_to_user ────────────────────────────────────────────────────────────

@@ -14,7 +14,11 @@
 // llvm-objcopy. See core/boot/src/arch/riscv64/header.S and
 // core/boot/linker/riscv64-uefi.ld. The assembly is emitted at crate top-level
 // regardless of where the `global_asm!` invocation lives; placing it inside
-// this arch module keeps `#[cfg(target_arch)]` discipline clean.
+// this arch module keeps `#[cfg(target_arch)]` discipline clean. The host
+// tests' riscv64 binary (`cargo xtask test`) links against the C runtime, whose
+// `_start` the header's entry point would duplicate, so a test build leaves it
+// out.
+#[cfg(not(test))]
 core::arch::global_asm!(include_str!("header.S"));
 
 pub mod acpi_kernel_mmio;

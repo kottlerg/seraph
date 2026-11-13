@@ -92,10 +92,12 @@ Key properties shared by the kernel-triple JSONs
   --no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args, link
   with `rust-lld`. Inline stack probes (`"stack-probes": {"kind": "inline"}`):
   on x86-64 a frame larger than one page touches each page in turn and faults
-  on a kernel stack's guard page instead of stepping over it; on riscv64 LLVM
-  probes the two parts of a split prologue separately, so a frame larger than
-  a page can still pass the one-page guard
-  ([#1017](https://github.com/kottlerg/seraph/issues/1017);
+  on a kernel stack's guard page instead of stepping over it. On riscv64 the
+  probes leave up to a page of a frame unwritten and a `call` writes nothing
+  to the stack, so the guard rests instead on the kernel frame bound: the
+  riscv64 kernel builds with `-Z emit-stack-sizes`, and `cargo xtask build`
+  fails when a function of the image has a frame above 2032 bytes
+  ([coding-standards.md](coding-standards.md) § Kernel Stack Frames;
   [core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md)
   § Kernel Stack Guards). The kernel is a static-PIE (`ET_DYN`) image; the
   bootloader chooses its load bias (KASLR, #252) and applies its

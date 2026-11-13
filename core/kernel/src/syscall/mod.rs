@@ -25,6 +25,8 @@ pub mod hw;
 pub mod ipc;
 pub mod mem;
 pub mod sbi;
+#[cfg(not(test))]
+pub mod scratch;
 pub mod sysinfo;
 pub mod thread;
 

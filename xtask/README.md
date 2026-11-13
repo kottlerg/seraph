@@ -30,6 +30,7 @@ xtask/
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
 │   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
@@ -74,6 +75,14 @@ Every cargo command of the build runs with `CARGO_INCREMENTAL=0`, as CI's jobs b
 build of a commit orders its binaries' statics as CI's does (see
 [Build Profiles](../docs/build-system.md#build-profiles)); its addresses can still be offset from
 CI's ([docs/testing.md](../docs/testing.md#troubleshooting) § Troubleshooting).
+
+A riscv64 kernel build runs with `RUSTFLAGS="-Zunstable-options -Zemit-stack-sizes"`, which
+reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. After the link,
+and before the image is installed, the build reads the image's `.stack_sizes` section and fails,
+naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MAX` (2032 bytes,
+`src/stack_sizes.rs`), the kernel frame bound of
+[docs/coding-standards.md](../docs/coding-standards.md) § Kernel Stack Frames. It fails as well
+when the image has no such section. No other build has the check.
 
 ---
 

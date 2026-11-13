@@ -749,11 +749,6 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     reason = "create and augment modes share the source-cap resolution and carve; each failure \
               arm's rollback reads beside its step"
 )]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the new `CSpace` (2104 B) built by the inlined `CSpace::new` before it is written \
-              into the retyped slot; on the 16 KiB kernel stack of the calling thread"
-)]
 pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::alloc_cspace_id;
@@ -905,8 +900,9 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     };
 
     // Construct CSpace in place.
-    // SAFETY: cs_ptr lives inside the wrapper page, exclusively owned.
-    unsafe { core::ptr::write(cs_ptr, CSpace::new(id)) };
+    // SAFETY: cs_ptr lives inside the wrapper page, exclusively owned, and is
+    // aligned for a CSpace (asserted above).
+    unsafe { CSpace::write_new(cs_ptr, id) };
 
     // Construct the wrapper in place; the back-pointer indexes into the
     // same page.
@@ -2356,17 +2352,20 @@ pub fn sys_cap_revoke(tf: UserFrame) -> Result<u64, SyscallError>
     // Revoke the subtree in batches of up to MAX_REVOKE_EDITS constant-time
     // tree edits (`core/kernel/docs/capability-internals.md` § Revocation Algorithm).
     // Per batch: revalidate the root and run one batch under the lock, then
-    // snapshot the dealloc list to a stack-local array so the lock is
-    // released before calling `dealloc_object` (which may acquire the frame
-    // allocator and other inner locks — see the safety doc on
-    // `dealloc_object`).
+    // snapshot the dealloc list to this CPU's syscall scratch buffer
+    // (`syscall::scratch`) so the lock is released before calling
+    // `dealloc_object` (which may acquire the frame allocator and other inner
+    // locks — see the safety doc on `dealloc_object`).
     //
     // The root is pinned (`CapabilitySlot::pinned`) for the whole multi-batch
     // operation and unpinned under the lock on every exit path
     // (`core/kernel/docs/capability-internals.md` § Revocation Algorithm).
-    let mut snapshot: [Option<core::ptr::NonNull<crate::cap::object::KernelObjectHeader>>;
-        crate::cap::derivation::MAX_REVOKE_EDITS] =
-        [None; crate::cap::derivation::MAX_REVOKE_EDITS];
+    // SAFETY: a syscall handler, which holds `snapshot` only until it returns
+    // and neither parks nor yields meanwhile: `dealloc_object` opens interrupt
+    // windows with preemption disabled at most, and a revoke that ends its
+    // own thread is switched away from by the syscall epilogue, after this
+    // returns.
+    let snapshot = unsafe { super::scratch::revoke_snapshot() };
     let mut first_batch = true;
     let mut batches: u32 = 0;
     loop

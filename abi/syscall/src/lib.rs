@@ -1450,9 +1450,9 @@ pub const REGS_RISCV64_X1_OFFSET: usize = 0;
 // ── Thread memory (SYS_THREAD_READ_MEM / SYS_THREAD_WRITE_MEM) ──────────────
 
 /// Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` call
-/// copies. The kernel stages the bytes in a buffer on its own stack, so the
-/// bound is that buffer's size; a debugger loops for a larger range
-/// (`docs/limits.md`).
+/// copies. The kernel stages the bytes in its per-CPU syscall scratch
+/// buffer, so the bound is that buffer's size; a debugger loops for a larger
+/// range (`docs/limits.md`).
 pub const MAX_THREAD_MEM_COPY: usize = 4096;
 
 /// `SYS_THREAD_WRITE_MEM` flag: permit the write to a page the thread's

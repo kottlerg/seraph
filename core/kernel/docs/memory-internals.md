@@ -712,19 +712,31 @@ incoming thread's floor (`SavedState::stack_floor`) at its stack-pointer swap, s
 sees one stack with another's floor; the boot sets the handoff stack's and each AP's idle
 stack's before their first switch ([arch-interface.md](arch-interface.md) § `context`).
 
-A frame larger than a page could step over a single guard page, so the kernel targets emit
-inline stack probes ([build-system.md](../../../docs/build-system.md) § Custom Targets). On
-x86-64 a function whose frame passes a page touches each page of it in turn, from the top
-down, so every frame meets the guard. On riscv64 the guarantee is weaker: LLVM splits a large
-prologue into a first stack-pointer adjustment within the 12-bit immediate, whose local area
-below the register saves is never written, and the rest, and probes each part separately. The
-span nothing writes can then reach the first adjustment (under 2 KiB) plus 4 KiB, so a frame
-larger than a page can still pass the one-page guard
-([#1017](https://github.com/kottlerg/seraph/issues/1017)). `sys_thread_read_mem`,
-`sys_thread_write_mem` and `kernel_entry_post_rebase` have such frames; no measured path
-overflows into them (`KERNEL_STACK_PAGES` and `HANDOFF_STACK_BYTES` in
-[limits.md](../../../docs/limits.md)). Phase 8 halts unless the handoff stack's guard (when
-Phase 3 found one) and every idle stack's guard are unmapped.
+A frame larger than a page could step over a single guard page. Each architecture keeps
+every overflow on the guard by its own means:
+
+- On x86-64 the kernel targets emit inline stack probes
+  ([build-system.md](../../../docs/build-system.md) § Custom Targets): a function whose
+  frame passes a page touches each page of it in turn, from the top down, and every `call`
+  pushes its return address, so the stack is written at least once in every page it
+  descends through, and every frame meets the guard.
+- On riscv64 the probes do not give that: a `call` writes nothing to the stack, LLVM
+  splits a large prologue into a first stack-pointer adjustment within the 12-bit
+  immediate, whose local area below the register saves is never written, and the rest, and
+  a leaf frame of up to a page is not probed at all. The span between two stores can then
+  pass 10 KiB. Instead, every function of the riscv64 kernel image has a frame of at most
+  2032 bytes ([coding-standards.md](../../../docs/coding-standards.md) § Kernel Stack
+  Frames), which `cargo xtask build` checks on every riscv64 kernel image. A function
+  stores only inside its own frame, and one that calls saves its return address there, so
+  two consecutive stack stores are less than 4064 bytes apart and no 4 KiB guard page lies
+  between them, whatever LLVM's prologue layout. The bound holds without probes; the
+  assembly paths (the trap entry and its floor check above, `context::switch`) have fixed
+  frames well below it. Syscalls that hold kilobytes of data at once hold them in the
+  per-CPU syscall scratch buffer (`syscall::scratch`), not on the stack, and boot builds
+  its large structures in place, in the memory they are handed over in.
+
+Phase 8 halts unless the handoff stack's guard (when Phase 3 found one) and every idle
+stack's guard are unmapped.
 
 ### Kernel Stack Depth
 

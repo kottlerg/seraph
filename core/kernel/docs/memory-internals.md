@@ -719,7 +719,8 @@ down, so every frame meets the guard. On riscv64 the guarantee is weaker: LLVM s
 prologue into a first stack-pointer adjustment within the 12-bit immediate, whose local area
 below the register saves is never written, and the rest, and probes each part separately. The
 span nothing writes can then reach the first adjustment (under 2 KiB) plus 4 KiB, so a frame
-larger than a page can still pass the one-page guard. `sys_thread_read_mem`,
+larger than a page can still pass the one-page guard
+([#1017](https://github.com/kottlerg/seraph/issues/1017)). `sys_thread_read_mem`,
 `sys_thread_write_mem` and `kernel_entry_post_rebase` have such frames; no measured path
 overflows into them (`KERNEL_STACK_PAGES` and `HANDOFF_STACK_BYTES` in
 [limits.md](../../../docs/limits.md)). Phase 8 halts unless the handoff stack's guard (when

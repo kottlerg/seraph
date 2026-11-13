@@ -87,7 +87,8 @@ Key properties shared by the kernel-triple JSONs
   on a kernel stack's guard page instead of stepping over it; on riscv64 LLVM
   probes the two parts of a split prologue separately, so a frame larger than
   a page can still pass the one-page guard
-  ([core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md)
+  ([#1017](https://github.com/kottlerg/seraph/issues/1017);
+  [core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md)
   § Kernel Stack Guards). The kernel is a static-PIE (`ET_DYN`) image; the
   bootloader chooses its load bias (KASLR, #252) and applies its
   `RELATIVE` relocations before handoff.

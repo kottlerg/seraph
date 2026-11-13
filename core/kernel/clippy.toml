@@ -13,5 +13,5 @@ max-fn-params-bools = 0
 # (core/kernel/docs/memory-internals.md § Kernel Stack Guards). The kernel
 # targets emit inline stack probes (docs/build-system.md § Custom Targets): on
 # x86-64 a frame that passes a page still meets its stack's guard page; on
-# riscv64 one can still pass it, as § Kernel Stack Guards states.
+# riscv64 one can still pass it, as § Kernel Stack Guards states (#1017).
 stack-size-threshold = 4096

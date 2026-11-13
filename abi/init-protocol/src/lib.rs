@@ -238,10 +238,12 @@ pub struct InitInfo
     // ── Root IRQ range + firmware-table caps (added in protocol v5) ─────
     /// Handle of the root `Interrupt` range capability.
     ///
-    /// Covers the full valid IRQ range for the target arch (x86-64: GSI
-    /// 0..256; RISC-V: APLIC sources 0..N). Userspace splits this cap
-    /// with `SYS_IRQ_SPLIT` to produce single-IRQ sub-caps for device
-    /// drivers.
+    /// Covers the target arch's whole Interrupt id space (x86-64: GSIs
+    /// 0..32768, `MAX_IOAPICS` I/O APICs of 256 pins each; RISC-V: the APLIC's
+    /// 1024-id space, sources 1..1023); the cap's `CapDescriptor` `aux1` gives
+    /// the count, and `SYS_IRQ_REGISTER` refuses an id no discovered
+    /// controller implements. Userspace splits this cap with `SYS_IRQ_SPLIT`
+    /// to produce single-IRQ sub-caps for device drivers.
     pub irq_range_cap: u64,
 
     /// Handle of the read-only `Memory` cap covering the 4 KiB page

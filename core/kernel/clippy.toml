@@ -11,8 +11,9 @@ max-fn-params-bools = 0
 # 16 KiB of `KERNEL_STACK_PAGES` (core/kernel/src/sched/mod.rs). Every thread
 # and idle stack is that size, the x86-64 IST stacks and the riscv64 overflow
 # stack are sized from it, and the boot handoff stack is 64 KiB
-# (core/kernel/docs/memory-internals.md § Kernel Stack Guards). The kernel
-# targets emit inline stack probes (docs/build-system.md § Custom Targets): on
-# x86-64 a frame that passes a page still meets its stack's guard page; on
-# riscv64 one can still pass it, as § Kernel Stack Guards states (#1017).
+# (core/kernel/docs/memory-internals.md § Kernel Stack Guards). The threshold
+# is an early, estimated signal. The guard pages rest on the inline stack
+# probes on x86-64 (docs/build-system.md § Custom Targets) and, on riscv64, on
+# the 2032-byte kernel frame bound that `cargo xtask build` checks on the
+# compiled image (docs/coding-standards.md § Kernel Stack Frames).
 stack-size-threshold = 4096

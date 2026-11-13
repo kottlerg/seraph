@@ -348,6 +348,34 @@ unsafe {
 
 ---
 
+### Kernel Stack Frames
+
+Every function of the riscv64 kernel image MUST have a fixed stack frame of at most 2032 bytes
+(`RISCV64_KERNEL_FRAME_MAX` in `xtask/src/stack_sizes.rs`). On riscv64 a `call` writes nothing to
+the stack, and a larger frame's split prologue leaves up to 6120 bytes below its return-address
+save unwritten (the rest of its first, 2032-byte adjustment and up to a page of the second, which
+no probe touches), so a larger frame can step over a kernel stack's one-page guard without
+touching it. With every frame within the
+bound, two consecutive stack stores are less than 4064 bytes apart and no guard page lies between
+them; 2032 bytes is also the largest frame LLVM allocates in one adjustment, so no frame within
+the bound is split.
+[memory-internals.md § Kernel Stack Guards](../core/kernel/docs/memory-internals.md#kernel-stack-guards)
+states the guarantee for each architecture.
+
+- A value too large for the bound is not built on the stack. It is written in place into the
+  memory it is handed over in, held in a static or in the per-CPU syscall scratch buffer
+  (`core/kernel/src/syscall/scratch.rs`) when its context makes that storage exclusive, or
+  split into smaller values held by different functions.
+- `cargo xtask build` builds the riscv64 kernel with `-Z emit-stack-sizes` and fails, naming each
+  function and its frame, when the image's `.stack_sizes` section records a frame above the
+  bound, in debug and release builds alike. Clippy's `large_stack_frames` (§ Clippy) estimates
+  frames before code generation and is an earlier, coarser signal; the build's check is the
+  rule's test.
+- The bound binds the kernel's riscv64 image only. On x86-64 a `call` pushes its return address
+  and the probes touch every page a frame spans, so a frame of any size meets the guard.
+
+---
+
 ### Concurrency
 
 - Shared mutable state MUST be protected by an explicit synchronisation primitive. Use

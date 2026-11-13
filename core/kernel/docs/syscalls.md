@@ -1952,8 +1952,9 @@ debugger stops the thread (and the space's other threads) for a view no store of
 mid-copy ([docs/fault-handling.md § Debugging](../../../docs/fault-handling.md#debugging)). The
 kernel pins the address space while the thread is not `Exited`, then, under the space's page-table
 lock, checks that every page of `[va, va + len)` is mapped by a 4 KiB user leaf of normal memory and
-copies the range into a buffer on its own stack, all of it or none; the lock keeps an unmap from
-running between the check and the copy. It then copies the buffer to `buf_ptr`. Pages are read
+copies the range into the CPU's syscall scratch buffer (`syscall::scratch`), all of it or none; the
+lock keeps an unmap from running between the check and the copy. It then copies the scratch buffer
+to `buf_ptr`. Pages are read
 through the kernel's mapping of their frames, so the thread's own read permission does not gate the
 read (an execute-only page reads). A page that is not present fails the call: the kernel does not
 fault a page in, and the target's pager is not asked. Device memory (an uncacheable mapping, such as
@@ -1991,7 +1992,8 @@ Copy bytes from a caller-supplied buffer into the address space a thread execute
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
 
-The kernel copies the buffer onto its own stack first, then pins the address space as
+The kernel copies the buffer into the CPU's syscall scratch buffer (`syscall::scratch`) first,
+then pins the address space as
 `SYS_THREAD_READ_MEM` does and, under the space's page-table lock, checks every page of
 `[va, va + len)` before it writes any: each MUST be mapped by a 4 KiB user leaf of normal memory
 whose frame lies below the top of RAM, and either writable by the thread, or read-only with

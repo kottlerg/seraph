@@ -2773,29 +2773,26 @@ fn thread_mem_args(tf: UserFrame) -> Result<(u64, u64, usize), SyscallError>
 /// arg2 = Destination buffer (caller's user VA).
 /// arg3 = Byte count, `1..=MAX_THREAD_MEM_COPY`.
 ///
-/// The thread need not be stopped. The bytes are staged in a kernel buffer
-/// under the target space's page-table lock, then copied out. Returns the
-/// count.
+/// The thread need not be stopped. The bytes are staged in the CPU's syscall
+/// scratch buffer (`syscall::scratch`) under the target space's page-table
+/// lock, then copied out. Returns the count.
 ///
 /// # Errors
 /// As in core/kernel/docs/syscalls.md § `SYS_THREAD_READ_MEM` (60), and a
 /// [`RestartableError::Faulted`] copy to the buffer, which re-executes the
 /// whole call on the caller's resume.
 #[cfg(not(test))]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "`bounce`, the `MAX_THREAD_MEM_COPY` (4 KiB) staging buffer, on the 16 KiB kernel \
-              stack of the calling thread, whose measured peak at `KERNEL_STACK_PAGES` includes \
-              it"
-)]
 pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 {
     use crate::mm::address_space::UserCopy;
 
     let (va, buf, len) = thread_mem_args(tf)?;
-    let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
-    // `thread_mem_args` bounds `len` by the bounce buffer's size.
-    let staged = bounce.get_mut(..len).ok_or(SyscallError::InvalidArgument)?;
+    // SAFETY: a syscall handler, which holds `staged` only until it returns
+    // and neither parks nor yields meanwhile (a faulted user copy returns,
+    // and the call is re-executed from its start).
+    let stage = unsafe { super::scratch::thread_mem() };
+    // `thread_mem_args` bounds `len` by the buffer's size.
+    let staged = stage.get_mut(..len).ok_or(SyscallError::InvalidArgument)?;
     {
         let pin = AspacePin::of_thread(tf.arg(0))?;
         // SAFETY: pin keeps the space allocated; [va, va + len) is in the
@@ -2823,24 +2820,19 @@ pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 /// arg4 = Flags: `THREAD_MEM_TEXT` permits a page the thread's mapping makes
 ///        read-only.
 ///
-/// The bytes are copied in from the caller first, then written under the
-/// target space's page-table lock, all or nothing. Every successful write
-/// then synchronises instruction fetch on every CPU before the call returns
-/// (`mm::icache`): a written page is executable in the target, or, when
-/// writable there, its frame may be mapped executable elsewhere, which no
-/// leaf of the target shows. Returns 0.
+/// The bytes are copied in from the caller to the CPU's syscall scratch
+/// buffer (`syscall::scratch`) first, then written under the target space's
+/// page-table lock, all or nothing. Every successful write then synchronises
+/// instruction fetch on every CPU before the call returns (`mm::icache`): a
+/// written page is executable in the target, or, when writable there, its
+/// frame may be mapped executable elsewhere, which no leaf of the target
+/// shows. Returns 0.
 ///
 /// # Errors
 /// As in core/kernel/docs/syscalls.md § `SYS_THREAD_WRITE_MEM` (61), and a
 /// [`RestartableError::Faulted`] copy from the buffer, which re-executes the
 /// whole call on the caller's resume.
 #[cfg(not(test))]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "`bounce`, the `MAX_THREAD_MEM_COPY` (4 KiB) staging buffer, on the 16 KiB kernel \
-              stack of the calling thread, whose measured peak at `KERNEL_STACK_PAGES` includes \
-              it"
-)]
 pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
 {
     use crate::mm::address_space::{TextWrite, UserCopy};
@@ -2859,9 +2851,12 @@ pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
     {
         TextWrite::Refused
     };
-    let mut bounce = [0u8; syscall::MAX_THREAD_MEM_COPY];
-    // `thread_mem_args` bounds `len` by the bounce buffer's size.
-    let staged = bounce.get_mut(..len).ok_or(SyscallError::InvalidArgument)?;
+    // SAFETY: a syscall handler, which holds `staged` only until it returns
+    // and neither parks nor yields meanwhile (a faulted user copy returns,
+    // and the call is re-executed from its start).
+    let stage = unsafe { super::scratch::thread_mem() };
+    // `thread_mem_args` bounds `len` by the buffer's size.
+    let staged = stage.get_mut(..len).ok_or(SyscallError::InvalidArgument)?;
     // Copy in before the target is touched, so a fault re-executes a call
     // that has changed nothing.
     // SAFETY: staged is valid for len writes; buf is the validated user

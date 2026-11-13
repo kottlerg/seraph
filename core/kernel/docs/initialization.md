@@ -280,7 +280,8 @@ address, the reason, and the span's end.
    row, sized from the IMSIC's identity count, halting when the bootloader reported no
    supervisor-level IMSIC or a count outside 63..=2047 (`sched::init_storage`); then the entropy
    subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and self-test sample slab
-   (`entropy::init_storage`)
+   (`entropy::init_storage`); then the per-CPU syscall scratch buffers, 4 KiB each
+   (`syscall::scratch::init_storage`)
 5. Allocate the frame map table: a chunk table with one slot per GiB of the DRAM span,
    and one 1 MiB chunk of per-frame user-mapping counts for each GiB that holds RAM
    (`mm::frame_map::init`; see [memory-internals.md](memory-internals.md) § Frame Map Table)
@@ -534,7 +535,10 @@ Phase 7.
       sanctioned SBI right, for init to forward sanctioned SBI extensions and
       attenuate per-consumer copies.
    g. Memory capabilities for the boot module images, via
-      `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry).
+      `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry), which
+      also writes each module's name entry, and the entry count, into the
+      `InitInfo` header's module-name table in place in the region step 1
+      reserved
    h. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
       for its segments, InitInfo pages, and stack pages are added in Phase 9)
 
@@ -733,8 +737,9 @@ calls `sched::enter()`.
       (page-aligned base and size, full rights, `owns_memory = true`, the
       range added to the buddy ledger by `register_owned_range`) so init can
       donate the frames to memmgr on reap
-   c. Write the InitInfo header in front of the CapDescriptor array Phases 7 and 8 left in the
-      contiguous region Phase 7 reserved, map every page of the region read-only at the chosen
+   c. Write the InitInfo header's other fields in place in front of the CapDescriptor array
+      Phases 7 and 8 left in the contiguous region Phase 7 reserved (no copy of the header is
+      built on the stack), map every page of the region read-only at the chosen
       InitInfo VA (`choose_init_layout().init_info_va`), mint a reclaimable Memory cap per
       page into the root CSpace, and record the page count in the header's
       `init_info_memory_count`

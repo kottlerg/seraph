@@ -166,8 +166,10 @@ pub const INIT_INFO_MAX_PAGES: usize = 64;
 /// consecutive slots; both are `u64`, the width of a capability handle. Every
 /// handover cap sits in a never-recycled slot, so its handle is its bare slot
 /// index and the caps of a range are `base..base + count`. The fields are laid
-/// out with no implicit padding: the kernel writes the struct by value, so a
-/// padding byte would carry kernel stack contents into init's page.
+/// out with no implicit padding, so every byte of the header is a field's: the
+/// kernel writes the fields in place into a zeroed page, and a header ever
+/// written by value would carry a padding byte's kernel stack contents into
+/// init's page.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct InitInfo

@@ -45,6 +45,7 @@ mod host_lock;
 mod qemu;
 mod qmp;
 mod rust_src;
+mod stack_sizes;
 mod symbolize;
 mod sysroot;
 mod tasklist;

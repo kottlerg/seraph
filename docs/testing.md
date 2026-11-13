@@ -624,8 +624,8 @@ or body):
   CPU-scaled kernel reserve); and the element types of the per-CPU arrays and slabs, today
   `PerCpuData`, `PerCpuScheduler`, `ThreadControlBlock` (through `MaybeUninit`), `TssWithIopb`,
   `TagState`, `CpuRng`, `Acc`, `Sample`, `CpuDiag`, `TlbShootdownRequest`, `VectorRow`,
-  `SlotEntry` (the riscv64 IMSIC identity rows, and each `VectorRow`'s entries), and
-  `DeliveryGate`
+  `SlotEntry` (the riscv64 IMSIC identity rows, and each `VectorRow`'s entries), `DeliveryGate`,
+  and `SyscallScratch` (the per-CPU syscall scratch buffer)
   (`git grep -n -E 'alloc_(zeroed|per_cpu)_slab::<|; MAX_CPUS\]' <head>` lists the arrays and
   slabs, and also the slabs that are not per-CPU: the single-slot entropy pool, the tag pool, the
   reschedule-pending CPU set, and the RAM-sized chunk tables of `frame_map::init` and
@@ -704,7 +704,7 @@ S="$S|init_storage|init_per_cpu_storage"
 S="$S|PerCpuSlab|alloc_per_cpu_slab"
 S="$S|kernel_reserve_pages|boot_cpu_count|PerCpuData|PerCpuScheduler|ThreadControlBlock"
 S="$S|TssWithIopb|TagState|CpuRng|Acc|Sample|CpuDiag|TlbShootdownRequest|VectorRow|CpuTopology"
-S="$S|SlotEntry|DeliveryGate"
+S="$S|SlotEntry|DeliveryGate|SyscallScratch"
 S="$S|parse_cpu_topology|parse_madt_topology|madt_topology|record_cpu_id|parse_cpu_count"
 S="$S|madt_cpu_ids|place_cpu_ids|place_hart_ids|cpu_topology_capacity|cpu_id_capacity"
 S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"

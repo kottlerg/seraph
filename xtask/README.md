@@ -1217,7 +1217,7 @@ needs no separate upkeep; `orch log` appends a line for an event that changes no
 | `orchestrator` | Records the agent id workers report to. Without an id, prints the recorded one and changes nothing. |
 | `worker` | Sets the named fields of a worker, creating the worker when it is new, and with `--status` the time of that report, which `state` prints beside it; fields it does not name keep their value. A phase is one of `planning`, `coding`, `review`, `gate`, `merged`, `retired`, `dead`. `--remove` drops the worker. |
 | `grant set` | Records the exclusive grant and takes its holder out of the queue, and writes the grant to the host lock, where every boot not under it is refused ([Host launch rules](#host-launch-rules)). Refuses while a grant is outstanding. |
-| `grant clear` | Ends the grant, in the state and in the host lock. |
+| `grant clear` | Ends the grant, in the host lock first, even one the state does not record, and then in the state. |
 | `grant queue`, `grant unqueue` | Add or drop a request for the grant; a holder has at most one. |
 | `order` | Replaces the merge order; no argument clears it. |
 | `question add`, `question close` | Record a question the maintainer has open, with the file that holds its detail, or close it. An id is open at most once. |
@@ -1317,9 +1317,9 @@ shares (in `target/xtask/host/` outside a git checkout):
   taken belongs to no live process, and the next admission removes it, so a killed command
   leaves nothing to clean up, and its QEMUs keep the host held while they run.
 - `grant.json`: the exclusive grant. `cargo xtask orch grant set` writes it, `orch grant clear`
-  and `orch end` remove it. While it exists, a boot is refused unless it passes `--grant
-  <holder>` naming its holder, and the holder's boots still meet the rules above. Builds are not
-  affected.
+  (whatever the batch state records) and `orch end` remove it. While it exists, a boot is refused
+  unless it passes `--grant <holder>` naming its holder, and the holder's boots still meet the
+  rules above. Builds are not affected.
 
 The options:
 

@@ -26,6 +26,8 @@
 //! to the init process. Boot module ELF images get their own full-rights, reclaimable
 //! Memory caps in [`mint_module_memory_caps`] (see `docs/capability-model.md` § Memory).
 
+// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 // cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
 #![allow(clippy::cast_possible_truncation)]
 
@@ -132,11 +134,10 @@ pub unsafe fn take_root_cspace() -> *mut CSpace
 {
     let ptr_loc = core::ptr::addr_of_mut!(ROOT_CSPACE);
     // SAFETY: single-threaded boot; no concurrent access.
-    unsafe {
-        let prev = *ptr_loc;
-        *ptr_loc = core::ptr::null_mut();
-        prev
-    }
+    let prev = unsafe { *ptr_loc };
+    // SAFETY: single-threaded boot; no concurrent access.
+    unsafe { *ptr_loc = core::ptr::null_mut() };
+    prev
 }
 
 /// Borrow the root `CSpace` mutably.
@@ -724,6 +725,11 @@ pub(crate) fn seed_header_nn() -> NonNull<object::KernelObjectHeader>
 unsafe fn install_seed_memory(base: u64)
 {
     let p = core::ptr::addr_of_mut!(SEED_MEMORY);
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `SEED_MEMORY`, which the single-threaded boot \
+                  gives this function alone"
+    )]
     // SAFETY: single-threaded boot; the seed is not published anywhere
     // until after this call, so no other reader exists.
     unsafe {
@@ -1299,9 +1305,11 @@ pub(crate) unsafe fn boot_retype_aspace(
 
     seed.header.inc_ref();
 
+    // SAFETY: aso_ptr just constructed and valid; no other reference to it exists yet.
+    let aso = unsafe { &mut *aso_ptr };
     // SAFETY: aso_ptr just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*aso_ptr).add_donation(
+        aso.add_donation(
             seed_header_nn(),
             memory_base,
             offset,
@@ -1404,9 +1412,11 @@ pub(crate) unsafe fn boot_retype_cspace(
     unsafe { (*cs_ptr).set_kobj(cs_kobj_ptr) };
     seed.header.inc_ref();
 
+    // SAFETY: wrapper just constructed and valid; no other reference to it exists yet.
+    let cs_kobj = unsafe { &mut *cs_kobj_ptr };
     // SAFETY: wrapper just constructed; offset/init_pages from a successful retype.
     let res = unsafe {
-        (*cs_kobj_ptr).add_donation(
+        cs_kobj.add_donation(
             seed_header_nn(),
             memory_base,
             offset,
@@ -1603,9 +1613,12 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
         );
         crate::fatal("cap: boot capabilities exceed the InitInfo descriptor capacity");
     }
-    // SAFETY: single-threaded boot; `*count` is in bounds (checked above) and
-    // the only writer index; no reference to the slot is live.
-    unsafe { descriptor_array().add(*count).write(desc) };
+    // SAFETY: single-threaded boot; `*count` is in bounds (checked above), so
+    // the offset stays within the descriptor array.
+    let slot = unsafe { descriptor_array().add(*count) };
+    // SAFETY: `slot` is the in-bounds, only-writer index (checked above); no
+    // reference to the slot is live.
+    unsafe { slot.write(desc) };
     // Below the capacity (checked above), so the bump cannot saturate.
     *count = count.saturating_add(1);
 }
@@ -2690,8 +2703,11 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
 
     let info = phys_to_virt(boot_info_phys) as *const BootInfo;
     // SAFETY: the BootInfo page is mapped through the direct map (caller
-    // contract); the slice header is copied out and no reference is formed.
-    let slice = unsafe { core::ptr::addr_of!((*info).reclaim_ranges).read() };
+    // contract); no reference is formed.
+    let slice_ptr = unsafe { core::ptr::addr_of!((*info).reclaim_ranges) };
+    // SAFETY: `slice_ptr` points into the mapped BootInfo page; the slice header
+    // is copied out and no reference is formed.
+    let slice = unsafe { slice_ptr.read() };
     let count = slice.count as usize;
     if count == 0 || slice.entries.is_null()
     {
@@ -2721,9 +2737,11 @@ pub(crate) unsafe fn scrub_reclaim_ranges(boot_info_phys: u64)
 
     for i in 0..count
     {
-        // SAFETY: i < count, within the bootloader-recorded array, which the
+        // SAFETY: i < count, within the bootloader-recorded array.
+        let entry = unsafe { entries.add(i) };
+        // SAFETY: `entry` is within the bootloader-recorded array, which the
         // loop never zeroes (pages of [span_lo, span_hi) are deferred below).
-        let range = unsafe { entries.add(i).read_unaligned() };
+        let range = unsafe { entry.read_unaligned() };
         // SAFETY: a recorded range, which nothing reads after this call
         // (caller contract).
         let scrubbed = unsafe { scrub_outside_span(range, span_lo, span_hi, &mut span_covered) };
@@ -2871,28 +2889,43 @@ fn nonnull_from_box<T>(b: Box<T>) -> NonNull<KernelObjectHeader>
 #[cfg(not(test))]
 pub(crate) unsafe fn lock_cspace_pair(a: *mut CSpace, b: *mut CSpace) -> (u64, u64)
 {
-    // SAFETY: caller contract.
-    unsafe {
-        use core::cmp::Ordering;
-        match a.cmp(&b)
+    use core::cmp::Ordering;
+    match a.cmp(&b)
+    {
+        Ordering::Less =>
         {
-            Ordering::Less =>
-            {
-                let sa = (*a).lock.lock_raw();
-                let sb = (*b).lock.lock_raw();
-                (sa, sb)
-            }
-            Ordering::Greater =>
-            {
-                let sb = (*b).lock.lock_raw();
-                let sa = (*a).lock.lock_raw();
-                (sa, sb)
-            }
-            Ordering::Equal =>
-            {
-                let sa = (*a).lock.lock_raw();
-                (sa, 0)
-            }
+            // SAFETY: caller contract: `a` is a valid `CSpace` pointer.
+            let lock_a = unsafe { &(*a).lock };
+            // SAFETY: the saved flags go back to the caller, whose contract
+            // passes them to `unlock_cspace_pair` exactly once.
+            let sa = unsafe { lock_a.lock_raw() };
+            // SAFETY: caller contract: `b` is a valid `CSpace` pointer.
+            let lock_b = unsafe { &(*b).lock };
+            // SAFETY: as for `sa`.
+            let sb = unsafe { lock_b.lock_raw() };
+            (sa, sb)
+        }
+        Ordering::Greater =>
+        {
+            // SAFETY: caller contract: `b` is a valid `CSpace` pointer.
+            let lock_b = unsafe { &(*b).lock };
+            // SAFETY: the saved flags go back to the caller, whose contract
+            // passes them to `unlock_cspace_pair` exactly once.
+            let sb = unsafe { lock_b.lock_raw() };
+            // SAFETY: caller contract: `a` is a valid `CSpace` pointer.
+            let lock_a = unsafe { &(*a).lock };
+            // SAFETY: as for `sb`.
+            let sa = unsafe { lock_a.lock_raw() };
+            (sa, sb)
+        }
+        Ordering::Equal =>
+        {
+            // SAFETY: caller contract: `a` is a valid `CSpace` pointer.
+            let lock_a = unsafe { &(*a).lock };
+            // SAFETY: the saved flags go back to the caller, whose contract
+            // passes them to `unlock_cspace_pair` exactly once.
+            let sa = unsafe { lock_a.lock_raw() };
+            (sa, 0)
         }
     }
 }
@@ -2909,25 +2942,40 @@ pub(crate) unsafe fn lock_cspace_pair(a: *mut CSpace, b: *mut CSpace) -> (u64, u
 #[cfg(not(test))]
 pub(crate) unsafe fn unlock_cspace_pair(a: *mut CSpace, b: *mut CSpace, saved_a: u64, saved_b: u64)
 {
-    // SAFETY: caller contract.
-    unsafe {
-        use core::cmp::Ordering;
-        match a.cmp(&b)
+    use core::cmp::Ordering;
+    match a.cmp(&b)
+    {
+        Ordering::Equal =>
         {
-            Ordering::Equal =>
-            {
-                (*a).lock.unlock_raw(saved_a);
-            }
-            Ordering::Less =>
-            {
-                (*b).lock.unlock_raw(saved_b);
-                (*a).lock.unlock_raw(saved_a);
-            }
-            Ordering::Greater =>
-            {
-                (*a).lock.unlock_raw(saved_a);
-                (*b).lock.unlock_raw(saved_b);
-            }
+            // SAFETY: caller contract: `a` is a valid `CSpace` pointer.
+            let lock_a = unsafe { &(*a).lock };
+            // SAFETY: caller contract: `saved_a` came from the single
+            // acquisition of the same-pointer pair.
+            unsafe { lock_a.unlock_raw(saved_a) };
+        }
+        Ordering::Less =>
+        {
+            // SAFETY: caller contract: `b` is a valid `CSpace` pointer.
+            let lock_b = unsafe { &(*b).lock };
+            // SAFETY: caller contract: `saved_b` came from `b`'s acquisition,
+            // the later one, released first.
+            unsafe { lock_b.unlock_raw(saved_b) };
+            // SAFETY: caller contract: `a` is a valid `CSpace` pointer.
+            let lock_a = unsafe { &(*a).lock };
+            // SAFETY: caller contract: `saved_a` came from `a`'s acquisition.
+            unsafe { lock_a.unlock_raw(saved_a) };
+        }
+        Ordering::Greater =>
+        {
+            // SAFETY: caller contract: `a` is a valid `CSpace` pointer.
+            let lock_a = unsafe { &(*a).lock };
+            // SAFETY: caller contract: `saved_a` came from `a`'s acquisition,
+            // the later one, released first.
+            unsafe { lock_a.unlock_raw(saved_a) };
+            // SAFETY: caller contract: `b` is a valid `CSpace` pointer.
+            let lock_b = unsafe { &(*b).lock };
+            // SAFETY: caller contract: `saved_b` came from `b`'s acquisition.
+            unsafe { lock_b.unlock_raw(saved_b) };
         }
     }
 }

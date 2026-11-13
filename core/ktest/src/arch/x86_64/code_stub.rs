@@ -26,8 +26,10 @@ pub fn self_delete(handle: u64) -> [u8; 19]
     // mov eax, SYS_CAP_DELETE ; movabs rdi, handle ; syscall ; jmp .
     // The handle takes the full 64-bit immediate: its generation sits above
     // the 32-bit index.
-    // cast_possible_truncation: syscall numbers fit 32 bits.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "syscall numbers fit 32 bits"
+    )]
     let [n0, n1, n2, n3] = (SYS_CAP_DELETE as u32).to_le_bytes();
     let [h0, h1, h2, h3, h4, h5, h6, h7] = handle.to_le_bytes();
     let [s0, s1] = SPIN;

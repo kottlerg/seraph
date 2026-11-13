@@ -34,8 +34,10 @@ use crate::run_test;
 ///
 /// To add a new test: implement a `pub fn test_name(ctx: &TestContext) -> TestResult`
 /// in the appropriate submodule, then add a `run_test!` call here.
-// too_many_lines: run_all is a flat dispatch table; splitting it adds no clarity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "run_all is a flat dispatch table; splitting it adds no clarity"
+)]
 pub fn run_all(ctx: &TestContext)
 {
     // ── Boot handover state (first, before any test maps memory) ──────────────

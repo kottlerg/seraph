@@ -19,8 +19,10 @@
 /// Load `pattern` into f0..f31 and lane 0 of v0..v31, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
 /// count.
-// too_many_lines: 32 F loads, 32 V broadcasts, and 64 register stores dominate the body.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "32 F loads, 32 V broadcasts, and 64 register stores dominate the body"
+)]
 pub fn preempt_capture(pattern: u64, iters: u64) -> u64
 {
     // 32 × f64 + 32 × v[lane0] = 64 lanes worth of state to verify.
@@ -233,8 +235,6 @@ pub fn preempt_capture(pattern: u64, iters: u64) -> u64
 /// `sig_ready` (`SYS_NOTIFICATION_SEND`), block on `sig_resume`
 /// (`SYS_NOTIFICATION_WAIT`, no timeout), then capture the registers on
 /// whichever CPU the thread resumes; returns the mismatched-lane count.
-// too_many_lines: 32 FP loads + 32 FP stores dominate the body.
-#[allow(clippy::too_many_lines)]
 pub fn notification_rendezvous_capture(
     pattern: u64,
     spin: u64,
@@ -364,8 +364,6 @@ pub fn notification_rendezvous_capture(
 /// on `ep` with `msg_label` and no data or caps, then capture the registers on
 /// whichever CPU the thread resumes after the reply; returns the
 /// mismatched-lane count. The caller has registered its IPC buffer.
-// too_many_lines: 32 FP loads, the ecall, and 32 FP stores dominate the body.
-#[allow(clippy::too_many_lines)]
 pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
 {
     let mut buf = [0u64; 32];

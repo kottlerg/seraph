@@ -306,9 +306,11 @@ fn demand_paging_teardown_phase(_: &Caps)
     std::os::seraph::log!("demand_paging_teardown phase passed");
 }
 
-// cast_sign_loss: ExitStatus::code() is i32 but exit reasons are non-negative
-// (fault 0x1000+vec, killed 0x2000); the u64 cast is safe.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() is i32 but exit reasons are non-negative (fault 0x1000+vec, \
+              killed 0x2000); the u64 cast is safe"
+)]
 fn demand_paging_segfault_phase(_: &Caps)
 {
     use std::process::Command;
@@ -332,9 +334,11 @@ fn demand_paging_segfault_phase(_: &Caps)
     std::os::seraph::log!("demand_paging_segfault phase passed (exit_reason={raw:#x})");
 }
 
-// cast_sign_loss: ExitStatus::code() is i32 but exit reasons are non-negative
-// (fault 0x1000+vec, killed 0x2000); the u64 cast is safe.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() is i32 but exit reasons are non-negative (fault 0x1000+vec, \
+              killed 0x2000); the u64 cast is safe"
+)]
 fn demand_paging_pinned_phase(_: &Caps)
 {
     use std::process::Command;

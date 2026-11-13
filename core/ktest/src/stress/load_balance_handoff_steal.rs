@@ -169,9 +169,11 @@ static SERVER_ARGS: spawn::ArgBlock<ServerArgs, NUM_PAIRS> = spawn::ArgBlock::ne
     idx: 0,
 });
 
-// too_many_lines: spawn (servers + clients) + drain + teardown + the
-// anti-vacuous guard are one linear scenario; splitting adds no clarity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "spawn (servers + clients) + drain + teardown + the anti-vacuous guard are one linear \
+              scenario; splitting adds no clarity"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)
@@ -483,8 +485,6 @@ extern "C" fn server_entry(arg: u64) -> !
 /// Sample the CPU the calling thread is on as a one-hot `u32` mask bit, or 0 if
 /// the query fails. The CPU index is masked mod 32, so indices above 31 alias;
 /// `run` asserts the migration guard only at `cpus <= MIGRATION_GUARD_MAX_CPUS`.
-// cast_possible_truncation: the masked CPU index is < 32.
-#[allow(clippy::cast_possible_truncation)]
 fn sample_cpu_bit() -> u32
 {
     match system_info(SystemInfoType::CurrentCpu as u64)

@@ -278,8 +278,7 @@ extern "C" fn caller_entry(arg: u64) -> !
     {
         thread_exit()
     };
-    // cast_possible_truncation: `label` is 1, 2, or 3.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation, reason = "`label` is 1, 2, or 3")]
     let page = bit_index as usize;
     let Ok(buf_addr) = crate::IpcPage::addr_at(core::ptr::addr_of_mut!(CALLER_IPC_PAGES), page)
     else

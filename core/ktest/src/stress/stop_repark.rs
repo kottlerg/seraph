@@ -610,8 +610,7 @@ extern "C" fn waiter_entry(arg: u64) -> !
                 }
                 other =>
                 {
-                    // cast_sign_loss: the raw result word is only logged.
-                    #[allow(clippy::cast_sign_loss)]
+                    #[expect(clippy::cast_sign_loss, reason = "the raw result word is only logged")]
                     let word = other.unwrap_or_else(|e| e as u64);
                     BAD_WAITS.record(word);
                 }

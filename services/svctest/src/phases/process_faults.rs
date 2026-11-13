@@ -24,10 +24,12 @@ pub fn phases() -> &'static [Phase]
     ]
 }
 
-// cast_sign_loss: ExitStatus::code() returns i32; exit_reason is always
-// non-negative in practice (kernel-set 0, clean-exit 0, fault 0x1000+vec,
-// killed 0x2000). Casting to u64 is safe.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() returns i32; exit_reason is always non-negative in practice \
+              (kernel-set 0, clean-exit 0, fault 0x1000+vec, killed 0x2000). Casting to u64 is \
+              safe"
+)]
 pub fn stack_overflow_phase(_: &Caps)
 {
     use std::process::Command;
@@ -83,8 +85,11 @@ pub fn stack_overflow_phase(_: &Caps)
 /// `PT_GNU_RELRO` enforcement (#39): a write into `.data.rel.ro` must fault.
 /// The fixture writes through a pointer to a relocated static; a clean exit
 /// means the loader left the RELRO pages writable.
-// cast_sign_loss: see stack_overflow_phase.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "an exit reason is non-negative (fault 0x1000+vec, killed 0x2000), so the u64 cast \
+              is lossless"
+)]
 pub fn relro_write_phase(_: &Caps)
 {
     use std::process::Command;

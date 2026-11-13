@@ -264,8 +264,7 @@ fn await_worker_on(moved: u64, index: usize, cpu: u32) -> TestResult
 /// Spin, reading this worker's CPU every [`CPU_CHECK_SPINS`] spins and, when
 /// it changed, publishing it in [`WORKER_CPU`] and sending this worker's bit
 /// on `moved` (both read from the [`SpinnerArgs`] entry at `arg`).
-// cast_possible_truncation: a CPU index fits u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "a CPU index fits u32")]
 extern "C" fn spinner_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the `SPINNER_ARGS.publish` value for this worker;

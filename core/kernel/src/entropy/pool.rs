@@ -40,11 +40,16 @@ pub fn absorb(data: &[u8])
     {
         return;
     }
+    // SAFETY: `saved` is passed verbatim to the `unlock_raw` below.
+    let saved = unsafe { POOL_LOCK.lock_raw() };
     // SAFETY: `ptr` was published by `install` over buddy-allocated storage
-    // sized for one `Prng`; the lock serialises all pool access.
+    // sized for one `Prng`; the pool lock, held here, serialises all pool
+    // access.
     unsafe {
-        let saved = POOL_LOCK.lock_raw();
         (*ptr).absorb(data);
+    }
+    // SAFETY: `saved` is the value the `lock_raw` above returned.
+    unsafe {
         POOL_LOCK.unlock_raw(saved);
     }
 }
@@ -61,14 +66,19 @@ pub fn try_absorb(data: &[u8]) -> bool
     {
         return true;
     }
-    // SAFETY: as in `absorb`; the lock serialises all pool access.
+    // SAFETY: on `Some`, `saved` is passed verbatim to the `unlock_raw` below.
+    let Some(saved) = (unsafe { POOL_LOCK.try_lock_raw() })
+    else
+    {
+        return false;
+    };
+    // SAFETY: as in `absorb`; the pool lock, held here, serialises all pool
+    // access.
     unsafe {
-        let Some(saved) = POOL_LOCK.try_lock_raw()
-        else
-        {
-            return false;
-        };
         (*ptr).absorb(data);
+    }
+    // SAFETY: `saved` is the value the `try_lock_raw` above returned.
+    unsafe {
         POOL_LOCK.unlock_raw(saved);
     }
     true
@@ -83,10 +93,15 @@ pub fn draw_seed(out: &mut [u8])
 {
     let ptr = POOL_PTR.load(Ordering::Acquire);
     debug_assert!(!ptr.is_null(), "entropy pool drawn before install");
-    // SAFETY: as in `absorb`; the lock serialises all pool access.
+    // SAFETY: `saved` is passed verbatim to the `unlock_raw` below.
+    let saved = unsafe { POOL_LOCK.lock_raw() };
+    // SAFETY: as in `absorb`; the pool lock, held here, serialises all pool
+    // access.
     unsafe {
-        let saved = POOL_LOCK.lock_raw();
         (*ptr).fill(out);
+    }
+    // SAFETY: `saved` is the value the `lock_raw` above returned.
+    unsafe {
         POOL_LOCK.unlock_raw(saved);
     }
 }
@@ -102,14 +117,19 @@ pub fn try_draw_seed(out: &mut [u8]) -> bool
 {
     let ptr = POOL_PTR.load(Ordering::Acquire);
     debug_assert!(!ptr.is_null(), "entropy pool drawn before install");
-    // SAFETY: as in `absorb`; the lock serialises all pool access.
+    // SAFETY: on `Some`, `saved` is passed verbatim to the `unlock_raw` below.
+    let Some(saved) = (unsafe { POOL_LOCK.try_lock_raw() })
+    else
+    {
+        return false;
+    };
+    // SAFETY: as in `absorb`; the pool lock, held here, serialises all pool
+    // access.
     unsafe {
-        let Some(saved) = POOL_LOCK.try_lock_raw()
-        else
-        {
-            return false;
-        };
         (*ptr).fill(out);
+    }
+    // SAFETY: `saved` is the value the `try_lock_raw` above returned.
+    unsafe {
         POOL_LOCK.unlock_raw(saved);
     }
     true

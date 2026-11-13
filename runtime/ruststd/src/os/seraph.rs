@@ -1259,11 +1259,11 @@ fn own_image_is_position_independent() -> bool {
 /// Register the main thread's demand-growth range with the pager: the pages of
 /// a [`DEFAULT_DEMAND_STACK_PAGES`]-page stack ending at `stack_top` below the
 /// `committed_pages` the loader mapped (`process_layout::main_stack_growth`).
-/// The page below the range stays unregistered as the guard, inside the
-/// reservation the creator's layout leaves below every stack top, so an
-/// overflow past it faults on an address the pager declines. On an error the
-/// stack keeps only its committed pages, the next page below which the pager
-/// declines in the same way.
+/// At least `process_abi::STACK_GUARD_PAGES` pages below the range stay
+/// unregistered as the guard, inside the reservation the creator's layout
+/// leaves below every stack top, so an overflow past it faults on an address
+/// the pager declines. On an error the stack keeps only its committed pages,
+/// the pages below which the pager declines in the same way.
 ///
 /// For a demand-paged process only: a pinned one has no pager to back the
 /// range.
@@ -1316,7 +1316,7 @@ pub(crate) struct GuardedStack {
 
 impl GuardedStack {
     /// Top of the usable region — the initial stack pointer (the stack grows
-    /// down from here toward the guard page).
+    /// down from here toward the guard).
     pub(crate) fn usable_top(&self) -> u64 {
         self.usable_base + self.usable_pages * syscall_abi::PAGE_SIZE
     }
@@ -1351,7 +1351,7 @@ pub(crate) fn reserve_guarded_stack(
         .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
     let usable_base = range.va_start() + guard_pages * syscall_abi::PAGE_SIZE;
     // Fund this address space's page-table growth budget for the usable region
-    // only — the guard page is never backed.
+    // only — the guard is never backed.
     if !fund_aspace_pt_budget(info.self_aspace, usable_pages) {
         unreserve_pages(range);
         return Err(crate::io::Error::other("seraph: page-table budget funding failed"));

@@ -55,12 +55,14 @@ pub const DEFAULT_MIN_STACK_SIZE: usize = 64 * 1024;
 
 const PAGE_SIZE_USIZE: usize = PAGE_SIZE as usize;
 
-/// Guard pages below a demand-paged thread stack. The guard is reserved but
-/// unregistered: a stack overflow faults in this hole, the pager declines the
-/// unregistered address, and the thread — and the whole process, via the
-/// address-space death-observer — is killed instead of silently corrupting
-/// adjacent memory.
-const GUARD_PAGES: u64 = 1;
+/// Guard pages below a demand-paged thread stack: `process_abi`'s
+/// `STACK_GUARD_PAGES`, the farthest a store can land below the stack's
+/// lowest written byte, so no overflow's first store passes the guard. The
+/// guard is reserved but unregistered: a stack overflow faults in this hole,
+/// the pager declines the unregistered address, and the thread — and the
+/// whole process, via the address-space death-observer — is killed instead of
+/// silently corrupting adjacent memory.
+const GUARD_PAGES: u64 = process_abi::STACK_GUARD_PAGES as u64;
 
 /// General-allocation headroom of the process's `CSpace` a spawn keeps: a
 /// spawn first tops the `CSpace` up when its headroom is below this plus a
@@ -191,10 +193,10 @@ unsafe impl Sync for Thread {}
 /// How a spawned thread's stack is backed.
 enum StackAlloc {
     /// Eager heap allocation: a non-demand-paged process, or a demand-paged one
-    /// whose reservation failed. No guard page.
+    /// whose reservation failed. No guard.
     Heap { base: *mut u8, layout: Layout },
     /// Guarded demand-paged stack: a large reserved VA window, lazily grown,
-    /// with an unregistered guard page below that faults fatally on overflow.
+    /// with unregistered guard pages below that fault fatally on overflow.
     Demand(crate::os::seraph::GuardedStack),
 }
 
@@ -420,7 +422,7 @@ impl Thread {
         let _ = syscall::cap_delete(thread_slab);
 
         // SP at the top of the usable stack region, 16-byte aligned for SysV
-        // ABI; the stack grows down toward the guard page (demand) or heap base.
+        // ABI; the stack grows down toward the guard (demand) or heap base.
         let sp = stack.sp();
         let entry_addr = thread_entry as extern "C" fn(u64) -> ! as usize as u64;
 

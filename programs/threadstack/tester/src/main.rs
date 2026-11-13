@@ -3,7 +3,7 @@
 
 // programs/threadstack/tester/src/main.rs
 
-//! Per-program tester for `/programs/threadstack`. Spawns it in six modes
+//! Per-program tester for `/programs/threadstack`. Spawns it in eight modes
 //! (demand-paged by the system default) and asserts, capability-natively
 //! (stdout marker is the verdict;
 //! the kernel's fault-class exit reason is corroborating mechanism only):
@@ -16,13 +16,20 @@
 //!     carry a fault-class exit reason (`>= EXIT_FAULT_BASE`).
 //!   * `bigframe` — a worker calls a function whose one frame is larger than
 //!     its usable stack and writes only the frame's lowest byte, past the
-//!     guard page; same verdict as `guard`, which only stack probes deliver.
+//!     guard; same verdict as `guard`, which only stack probes deliver.
+//!   * `splitframe` — a worker near its usable base calls a split frame that
+//!     calls a page-sized leaf, whose one write lies about 10 KiB below the
+//!     last; same verdict as `guard`, which only a guard of more than two
+//!     pages delivers.
+//!   * `span` — a worker near its usable base makes two stores 14312 bytes
+//!     apart, the std target's bound; same verdict as `guard`, which only a
+//!     guard of four pages delivers.
 //!   * `nested-grow` — a thread spawned by a spawned thread recurses deep into
 //!     its demand-paged stack and joins; same verdict as `grow`.
 //!   * `main-grow` — the main thread recurses far past the stack pages the
 //!     loader mapped for it; same verdict as `grow`.
 //!   * `main-guard` — the main thread overflows past its demand growth range
-//!     into the guard page; same verdict as `guard`.
+//!     into the guard; same verdict as `guard`.
 //!
 //! See [docs/testing.md](../../../docs/testing.md) for the protocol.
 
@@ -103,8 +110,9 @@ fn check_grow(mode: &str)
     }
 }
 
-/// Run an overflow `mode` (`guard`, `bigframe`, or `main-guard`), whose fixture
-/// must reach the overflow point and then be killed by the guard-page fault.
+/// Run an overflow `mode` (`guard`, `bigframe`, `splitframe`, `span`, or
+/// `main-guard`), whose fixture must reach the overflow point and then be
+/// killed by the guard's fault.
 #[expect(
     clippy::cast_sign_loss,
     reason = "ExitStatus::code() is i32, but exit reasons are non-negative (clean 0, fault \
@@ -115,9 +123,7 @@ fn check_overflow(mode: &str)
     let (out, status) = run(mode);
     if out.lines().any(|l| l.trim() == "SURVIVED (BUG)")
     {
-        fail(&format!(
-            "{mode}: guard page did not fault — overflow survived"
-        ));
+        fail(&format!("{mode}: guard did not fault — overflow survived"));
     }
     if !out.lines().any(|l| l.contains("about to overflow"))
     {
@@ -147,6 +153,8 @@ fn main()
     check_grow("grow");
     check_overflow("guard");
     check_overflow("bigframe");
+    check_overflow("splitframe");
+    check_overflow("span");
     check_grow("nested-grow");
     check_grow("main-grow");
     check_overflow("main-guard");

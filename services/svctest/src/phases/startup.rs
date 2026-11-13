@@ -164,16 +164,17 @@ pub fn stack_envelope_phase(_: &Caps)
         info.stack_pages
     );
     // ASLR (#39): the creator draws the stack placement from the stack-guard
-    // window; the guard page sits MAX_PROCESS_STACK_PAGES + 1 pages below the
-    // top. Strict by design — a degraded-entropy boot (defaults outside the
-    // window) fails here loudly.
+    // window; the guard's lowest page sits
+    // STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES pages below the top. Strict
+    // by design — a degraded-entropy boot (defaults outside the window) fails
+    // here loudly.
     assert!(
         info.stack_top_vaddr.is_multiple_of(4096),
         "stack_top_vaddr {:#x} is not page-aligned",
         info.stack_top_vaddr
     );
     let stack_guard = u64::from(process_abi::MAX_PROCESS_STACK_PAGES)
-        .checked_add(1)
+        .checked_add(u64::from(process_abi::STACK_GUARD_PAGES))
         .and_then(|pages| pages.checked_mul(4096))
         .and_then(|span| info.stack_top_vaddr.checked_sub(span))
         .expect("stack_top_vaddr below the guard and maximum stack span");

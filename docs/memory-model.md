@@ -136,7 +136,7 @@ the binary format. The general convention is:
   2^38 (layout ceiling) ┤
                         │  Program image (PIE load-bias window; a procmgr
                         │    child's image may run past 2^38 in a wider half)
-                        │  Main-thread stack (guard page below), handover page,
+                        │  Main-thread stack (guard below), handover page,
                         │    IPC buffer, main-thread TLS
                         │  Page-reservation arena   ┐ Sv39, or size unknown
                         │  Byte heap (grows upward) ┘

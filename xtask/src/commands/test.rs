@@ -18,13 +18,14 @@
 //! emulator, so a test gated on `target_arch = "riscv64"` runs on an x86-64
 //! host. The host-only crates ([`HOST_ONLY`]) are left out of that run.
 
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Result, bail};
 
 use crate::cli::{TestArgs, TestComponent};
 use crate::context::Context as BuildContext;
-use crate::util::{require_tool, run_cmd, step};
+use crate::util::{require_tool, run_cmd, run_cmd_capture, step};
 
 /// The targets the test lint pass checks: the Linux target of each
 /// architecture Seraph supports.
@@ -47,6 +48,16 @@ const EMULATOR: &str = "qemu-riscv64";
 /// The riscv64 C library's root, where [`EMULATOR`] finds the test binaries'
 /// dynamic linker (`-L`). Debian, Ubuntu and Arch install it there.
 const EMULATED_SYSROOT: &str = "/usr/riscv64-linux-gnu";
+
+/// The test binaries' dynamic linker, under [`EMULATED_SYSROOT`]: what
+/// [`EMULATOR`] loads to run them.
+const EMULATED_LOADER: &str = "lib/ld-linux-riscv64-lp64d.so.1";
+
+/// The C runtime's start file every test binary links, which
+/// [`EMULATED_LINKER`] finds only when the C library's development files
+/// are installed. Where they live differs by distribution, so the linker is
+/// asked (`-print-file-name`).
+const EMULATED_START_FILE: &str = "crt1.o";
 
 /// The workspace crates that only ever run on the build host, left out of the
 /// emulated test run.
@@ -104,22 +115,35 @@ fn packages(component: TestComponent) -> &'static [&'static str]
 }
 
 /// Fail with the packages to install when a tool or the C library the
-/// emulated test run needs is missing.
+/// emulated test run needs is missing: the dynamic linker the emulator
+/// loads, and the start file the cross compiler links.
 fn require_emulation() -> Result<()>
 {
-    require_tool(EMULATED_LINKER)?;
+    let linker = require_tool(EMULATED_LINKER)?;
     require_tool(EMULATOR)?;
-    let loader = std::path::Path::new(EMULATED_SYSROOT).join("lib");
-    if !loader.is_dir()
+    let loader = Path::new(EMULATED_SYSROOT).join(EMULATED_LOADER);
+    let start_file = run_cmd_capture(
+        Command::new(linker).arg(format!("-print-file-name={EMULATED_START_FILE}")),
+    )?;
+    if !c_library_found(loader.is_file(), &start_file)
     {
         bail!(
-            "{} not found: the riscv64 C library the emulated test run links and loads \
-             against is missing (Debian / Ubuntu: libc6-dev-riscv64-cross; Arch: \
-             riscv64-linux-gnu-glibc)",
+            "the riscv64 C library the emulated test run links and loads against is missing \
+             ({} or the linker's {EMULATED_START_FILE}); install it (Debian / Ubuntu: \
+             libc6-dev-riscv64-cross; Arch: riscv64-linux-gnu-glibc)",
             loader.display()
         );
     }
     Ok(())
+}
+
+/// Whether the riscv64 C library is installed: its dynamic linker exists,
+/// and the cross compiler's `-print-file-name` answer for the start file is
+/// a path, which it prints only when it found the file (otherwise it prints
+/// the bare name back).
+fn c_library_found(loader_exists: bool, start_file_lookup: &str) -> bool
+{
+    loader_exists && Path::new(start_file_lookup.trim()).is_absolute()
 }
 
 /// The `cargo test` arguments of the emulated run over `packages`: every
@@ -225,6 +249,20 @@ mod tests
         }
         let kernel = emulated_args(packages(TestComponent::Kernel));
         assert!(!kernel.contains(&"--exclude"), "{kernel:?}");
+    }
+
+    #[test]
+    fn the_c_library_is_found_only_with_its_loader_and_a_located_start_file()
+    {
+        assert!(c_library_found(true, "/usr/riscv64-linux-gnu/usr/lib/crt1.o\n"));
+        assert!(
+            !c_library_found(true, "crt1.o\n"),
+            "the linker prints the bare name of a file it did not find"
+        );
+        assert!(!c_library_found(
+            false,
+            "/usr/riscv64-linux-gnu/usr/lib/crt1.o"
+        ));
     }
 
     #[test]

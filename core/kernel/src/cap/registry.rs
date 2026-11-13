@@ -168,7 +168,9 @@ impl CSpaceRegistry
         }
         // SAFETY: a non-null table holds `slots` live entries for the
         // registry's life (install_table's contract); index is below it.
-        Some(unsafe { &*table.add(index) })
+        let slot = unsafe { table.add(index) };
+        // SAFETY: slot is inside the table (above), so it names a live entry.
+        Some(unsafe { &*slot })
     }
 
     /// Initialise `entries` as never-used entries and install them as the
@@ -191,9 +193,10 @@ impl CSpaceRegistry
         };
         for i in 0..ENTRIES_PER_CHUNK
         {
-            // SAFETY: in bounds of the caller's ENTRIES_PER_CHUNK slots, which
-            // are exclusively owned here.
-            unsafe { entries.add(i).write(RegistryEntry::new()) };
+            // SAFETY: in bounds of the caller's ENTRIES_PER_CHUNK slots.
+            let entry = unsafe { entries.add(i) };
+            // SAFETY: the slot is exclusively owned here (caller contract).
+            unsafe { entry.write(RegistryEntry::new()) };
         }
         slot.store(entries, Ordering::Release);
         // Lossless: cap + ENTRIES_PER_CHUNK is at most the table's id count,
@@ -223,7 +226,9 @@ impl CSpaceRegistry
         // SAFETY: a non-null chunk holds ENTRIES_PER_CHUNK live entries for
         // the registry's life (install_chunk's contract); the offset is in
         // range.
-        Some(unsafe { &*chunk.add(id % ENTRIES_PER_CHUNK) })
+        let entry = unsafe { chunk.add(id % ENTRIES_PER_CHUNK) };
+        // SAFETY: entry is inside the chunk (above), so it names a live entry.
+        Some(unsafe { &*entry })
     }
 
     /// Hand out an unused id: the most recently retired one, else the next

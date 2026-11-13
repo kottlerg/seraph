@@ -686,15 +686,26 @@ impl RangeLineage
 #[allow(clippy::cast_ptr_alignment)]
 unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
 {
-    // SAFETY: caller contract; header at offset 0 of each concrete type.
-    unsafe {
-        match hdr.as_ref().obj_type
+    // SAFETY: caller contract (a live header).
+    let obj_type = unsafe { hdr.as_ref() }.obj_type;
+    match obj_type
+    {
+        ObjectType::Mmio =>
         {
-            ObjectType::Mmio => &(*hdr.as_ptr().cast::<MmioObject>()).lineage,
-            ObjectType::IoPort => &(*hdr.as_ptr().cast::<IoPortObject>()).lineage,
-            ObjectType::Interrupt => &(*hdr.as_ptr().cast::<InterruptObject>()).lineage,
-            _ => crate::fatal("lineage_of: not a range-capability object"),
+            // SAFETY: caller contract; the tag names an `Mmio`, header at offset 0.
+            unsafe { &(*hdr.as_ptr().cast::<MmioObject>()).lineage }
         }
+        ObjectType::IoPort =>
+        {
+            // SAFETY: caller contract; the tag names an `IoPort`, header at offset 0.
+            unsafe { &(*hdr.as_ptr().cast::<IoPortObject>()).lineage }
+        }
+        ObjectType::Interrupt =>
+        {
+            // SAFETY: caller contract; the tag names an `Interrupt`, header at offset 0.
+            unsafe { &(*hdr.as_ptr().cast::<InterruptObject>()).lineage }
+        }
+        _ => crate::fatal("lineage_of: not a range-capability object"),
     }
 }
 
@@ -965,11 +976,13 @@ impl MmioObject
                 "withdraw_mappings: a record was being filled at refcount zero"
             );
             let va = m.va.load(Ordering::Relaxed);
-            // SAFETY: the record's reference keeps the address space live; the
-            // span is the user range SYS_MMIO_MAP validated when it mapped it.
-            unsafe {
-                (*(*aso.as_ptr()).address_space).unmap_region_if_phys(va, pages, self.base);
-            }
+            // SAFETY: the record's reference keeps the address space object live.
+            let aspace_ptr = unsafe { (*aso.as_ptr()).address_space };
+            // SAFETY: the record's reference keeps the address space live.
+            let aspace = unsafe { &*aspace_ptr };
+            // SAFETY: the span is the user range SYS_MMIO_MAP validated when it
+            // mapped it.
+            unsafe { aspace.unmap_region_if_phys(va, pages, self.base) };
             // SAFETY: the record held this reference; no lock is held and the
             // CPU is stable (contract).
             unsafe { release_ref(aso.cast::<KernelObjectHeader>()) };
@@ -1581,17 +1594,16 @@ impl PagePool
         let page = crate::mm::paging::phys_to_virt(page_phys) as *mut RecordPage;
         // SAFETY: lock held; a published record page stays mapped in the
         // direct map and exclusively owned by this pool until teardown.
-        let cell = unsafe {
-            let used = (*page).used;
-            // A full page has no record at `used`.
-            let records = &mut (*page).records;
-            let slot = records.get_mut(used)?;
-            *slot = record;
-            let cell = core::ptr::addr_of_mut!(slot.holes);
-            // Below RECORDS_PER_PAGE (the slot exists), so it never saturates.
-            (*page).used = used.saturating_add(1);
-            cell
-        };
+        let used = unsafe { (*page).used };
+        // SAFETY: as above.
+        let records = unsafe { &mut (*page).records };
+        // A full page has no record at `used`.
+        let slot = records.get_mut(used)?;
+        *slot = record;
+        let cell = core::ptr::addr_of_mut!(slot.holes);
+        // Below RECORDS_PER_PAGE (the slot exists), so it never saturates.
+        // SAFETY: as above.
+        unsafe { (*page).used = used.saturating_add(1) };
         // Re-publish the head with Release so the appended record and the
         // new `used` are visible to a reader that Acquire-loads the head
         // (`reclaim_donations`), as they are for an inline record's ancestor
@@ -1612,15 +1624,17 @@ impl PagePool
     {
         let page = crate::mm::paging::phys_to_virt(page_phys) as *mut RecordPage;
         // SAFETY: the page is exclusively owned and page-aligned (caller's
-        // contract) and holds one RecordPage (fit asserted at compile
-        // time).
-        let cell = unsafe {
-            core::ptr::write_bytes(page.cast::<u8>(), 0, crate::mm::PAGE_SIZE);
-            (*page).next_phys = self.record_head_phys.load(Ordering::Acquire);
-            (*page).used = 1;
-            (*page).records[0] = record;
-            core::ptr::addr_of_mut!((*page).records[0].holes)
-        };
+        // contract), so it is valid for the whole-page write.
+        unsafe { core::ptr::write_bytes(page.cast::<u8>(), 0, crate::mm::PAGE_SIZE) };
+        // SAFETY: the page is exclusively owned and holds one RecordPage (fit
+        // asserted at compile time), now zeroed.
+        unsafe { (*page).next_phys = self.record_head_phys.load(Ordering::Acquire) };
+        // SAFETY: as above.
+        unsafe { (*page).used = 1 };
+        // SAFETY: as above.
+        unsafe { (*page).records[0] = record };
+        // SAFETY: as above.
+        let cell = unsafe { core::ptr::addr_of_mut!((*page).records[0].holes) };
         self.record_head_phys.store(page_phys, Ordering::Release);
         cell
     }
@@ -1667,7 +1681,9 @@ impl PagePool
             let page = crate::mm::paging::phys_to_virt(page_phys) as *mut RecordPage;
             // SAFETY: caller's contract; the page stays intact until its
             // record 0 is freed below, after every read of it.
-            let (next, used) = unsafe { ((*page).next_phys, (*page).used) };
+            let next = unsafe { (*page).next_phys };
+            // SAFETY: as above.
+            let used = unsafe { (*page).used };
             debug_assert!((1..=RECORDS_PER_PAGE).contains(&used));
             // The page is trusted kernel state and a corrupt record is not
             // survivable; the clamp only keeps the access inside the page.
@@ -1925,8 +1941,10 @@ unsafe fn pool_pop(head_phys: &AtomicU64) -> u64
 unsafe fn pool_push_tagged(head_phys: &AtomicU64, phys: u64, cell: HolesCell)
 {
     let virt = crate::mm::paging::phys_to_virt(phys);
+    // SAFETY: caller guarantees `phys` is a page-sized block, so its second word is in bounds.
+    let cell_slot = unsafe { (virt as *mut u64).add(1) };
     // SAFETY: caller guarantees `phys` is exclusively owned and unaliased.
-    unsafe { core::ptr::write_volatile((virt as *mut u64).add(1), cell as u64) };
+    unsafe { core::ptr::write_volatile(cell_slot, cell as u64) };
     // SAFETY: forwarded from the caller's contract.
     unsafe { pool_push(head_phys, phys) };
 }
@@ -1941,8 +1959,10 @@ unsafe fn pool_push_tagged(head_phys: &AtomicU64, phys: u64, cell: HolesCell)
 unsafe fn pool_page_cell(phys: u64) -> HolesCell
 {
     let virt = crate::mm::paging::phys_to_virt(phys);
+    // SAFETY: caller contract: `phys` is a page-sized block, so its second word is in bounds.
+    let cell_slot = unsafe { (virt as *const u64).add(1) };
     // SAFETY: caller contract.
-    unsafe { core::ptr::read_volatile((virt as *const u64).add(1)) as HolesCell }
+    unsafe { core::ptr::read_volatile(cell_slot) as HolesCell }
 }
 
 /// Push a page onto the pool free-list. Caller must hold the pool lock and
@@ -2127,7 +2147,9 @@ unsafe fn free_arena_chunk(chunk: *mut u8, stack: &mut CascadeStack)
         // page, so the wrapper is live. Only the two atomics a chunk free
         // uses are borrowed, never the whole wrapper: its teardown may be
         // writing `cspace` or its header's cascade link meanwhile.
-        let (lock, free) = unsafe { (&(*owner).cs_pool.lock, &(*owner).arena_free) };
+        let lock = unsafe { &(*owner).cs_pool.lock };
+        // SAFETY: as above.
+        let free = unsafe { &(*owner).arena_free };
         pool_lock(lock);
         // SAFETY: pool lock held; the chunk is this arena's (contract).
         unsafe { crate::cap::arena::push_chunk(free, chunk) };
@@ -2277,8 +2299,8 @@ impl CSpaceKernelObject
                 // SAFETY: the page just left the free list; nothing wrote it.
                 let record = unsafe { pool_page_cell(phys) } as u64;
                 // SAFETY: pool lock held; the page just left the free list,
-                // so it is exclusively the arena's; its chunk 0 takes the
-                // header, the rest go on the free list.
+                // so it is exclusively the arena's, page-aligned and writable;
+                // its chunk 0 takes the header.
                 unsafe {
                     core::ptr::write(
                         page,
@@ -2291,10 +2313,15 @@ impl CSpaceKernelObject
                             record: AtomicU64::new(record),
                         },
                     );
-                    self.arena_pages.store(page, Ordering::Release);
-                    crate::cap::arena::carve_page(&self.arena_free, page.cast::<u8>());
-                    chunk = crate::cap::arena::pop_chunk(&self.arena_free);
                 }
+                self.arena_pages.store(page, Ordering::Release);
+                // SAFETY: pool lock held, which serialises `arena_free`; the page's
+                // chunks 1 and up are referenced by nothing else, and go on the
+                // free list.
+                unsafe { crate::cap::arena::carve_page(&self.arena_free, page.cast::<u8>()) };
+                // SAFETY: pool lock held, which serialises `arena_free`; every chunk
+                // on the list was put there by `carve_page` or `push_chunk`.
+                chunk = unsafe { crate::cap::arena::pop_chunk(&self.arena_free) };
             }
         }
         if let Some(c) = chunk
@@ -2368,10 +2395,10 @@ impl CSpaceKernelObject
                 // SAFETY: the cell is a field of a record of this pool, which
                 // stays intact until the donations are reclaimed after this
                 // pass; only this pass writes it.
-                unsafe {
-                    page.next.store(*cell, Ordering::Relaxed);
-                    *cell = cur;
-                }
+                let kept_head = unsafe { *cell };
+                page.next.store(kept_head, Ordering::Relaxed);
+                // SAFETY: as above.
+                unsafe { *cell = cur };
                 page.kept_next.store(kept, Ordering::Relaxed);
                 kept = cur;
             }
@@ -2477,14 +2504,15 @@ pub fn alloc_port_binding_table(
 pub unsafe fn free_port_binding_table(table: *mut crate::cap::ioport_bindings::IoPortBindings)
 {
     use crate::mm::paging::virt_to_phys;
-    // SAFETY: caller contract; the table names the funder its pages came from.
-    let (funder, parts, cells) = unsafe {
-        (
-            &*((*table).funder() as *const CSpaceKernelObject),
-            (*table).bitmap.parts,
-            (*table).page_cells(),
-        )
-    };
+    // SAFETY: caller contract; the table is valid and names the funder its pages
+    // came from.
+    let funder_addr = unsafe { (*table).funder() };
+    // SAFETY: the funder is live (contract).
+    let funder = unsafe { &*(funder_addr as *const CSpaceKernelObject) };
+    // SAFETY: caller contract; the table is valid and nothing else references it.
+    let parts = unsafe { (*table).bitmap.parts };
+    // SAFETY: caller contract; the table is valid and nothing else references it.
+    let cells = unsafe { (*table).page_cells() };
     for (part, &cell) in parts.iter().zip(&cells[1..])
     {
         // SAFETY: a part page this table took, with its cell; unreferenced
@@ -2614,13 +2642,12 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &
         return;
     }
     // SAFETY: tcb is valid here — about to be marked Exited, not yet freed.
-    let (tid, tf) = unsafe {
-        (
-            (*tcb).thread_id,
-            (*tcb)
-                .trap_frame
-                .load(core::sync::atomic::Ordering::Relaxed),
-        )
+    let tid = unsafe { (*tcb).thread_id };
+    // SAFETY: tcb is valid here — about to be marked Exited, not yet freed.
+    let tf = unsafe {
+        (*tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed)
     };
     if tf.is_null()
     {
@@ -2630,7 +2657,9 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &
         return;
     }
     // SAFETY: tf non-null; it is the caller's saved userspace frame.
-    let (rip, nr) = unsafe { ((*tf).instruction_pointer(), (*tf).syscall_nr()) };
+    let rip = unsafe { (*tf).instruction_pointer() };
+    // SAFETY: tf non-null; it is the caller's saved userspace frame.
+    let nr = unsafe { (*tf).syscall_nr() };
     crate::kprintln!(
         "sched: self-teardown deferred reclaim ({what}): tid={tid} user_rip=0x{rip:x} \
          syscall_nr={nr}"
@@ -2649,23 +2678,32 @@ fn log_self_teardown(tcb: *mut crate::sched::thread::ThreadControlBlock, what: &
 unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObjectHeader
 {
     // SAFETY: header at offset 0 of every concrete object; caller contract.
-    unsafe {
-        match (*ptr.as_ptr()).obj_type
+    let obj_type = unsafe { (*ptr.as_ptr()).obj_type };
+    match obj_type
+    {
+        ObjectType::Thread =>
         {
-            ObjectType::Thread =>
-            {
-                core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<ThreadObject>()).deferred_next)
-            }
-            ObjectType::CSpaceObj =>
-            {
+            // SAFETY: a valid Thread object (contract); the field address is taken
+            // without creating a reference.
+            unsafe { core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<ThreadObject>()).deferred_next) }
+        }
+        ObjectType::CSpaceObj =>
+        {
+            // SAFETY: a valid CSpaceObj object (contract); the field address is taken
+            // without creating a reference.
+            unsafe {
                 core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<CSpaceKernelObject>()).deferred_next)
             }
-            ObjectType::AddressSpace =>
-            {
+        }
+        ObjectType::AddressSpace =>
+        {
+            // SAFETY: a valid AddressSpace object (contract); the field address is
+            // taken without creating a reference.
+            unsafe {
                 core::ptr::addr_of_mut!((*ptr.as_ptr().cast::<AddressSpaceObject>()).deferred_next)
             }
-            _ => crate::fatal("deferred reclaim: object type carries no link"),
         }
+        _ => crate::fatal("deferred reclaim: object type carries no link"),
     }
 }
 
@@ -2865,7 +2903,9 @@ pub unsafe fn drain_deferred_reclaim(cpu: usize)
         // stable until freed.
         let nn = unsafe { NonNull::new_unchecked(node) };
         // SAFETY: nn is a linkable object pushed by push_deferred_reclaim.
-        let next = unsafe { *deferred_link(nn) };
+        let link = unsafe { deferred_link(nn) };
+        // SAFETY: `link` points at nn's link field, valid and aligned, stable until freed.
+        let next = unsafe { *link };
         // SAFETY: refcount 0 and no slot references it (dealloc_object's
         // contract); re-enters the object's arm from a context bound to
         // nothing queued here, running the full free.
@@ -2936,54 +2976,76 @@ unsafe fn unlink_dying_waiter(
 {
     use crate::sched::thread::IpcThreadState;
 
-    // SAFETY: blocked_on is the live source of the named type, and its lock
-    // is held (contract), which serialises every queue edit below.
-    unsafe {
-        match bound_state
+    // blocked_on is the live source of the named type, and its lock is held
+    // (contract), which serialises every queue edit below.
+    match bound_state
+    {
+        IpcThreadState::BlockedOnNotification =>
         {
-            IpcThreadState::BlockedOnNotification =>
+            let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
+            // SAFETY: blocked_on is the live NotificationState bound_state names, its
+            // lock held (contract), which serialises every edit of its wait queue.
+            let waiters = unsafe { &mut (*sig).waiters };
+            // SAFETY: tcb is a valid TCB (contract); the source lock is held.
+            if unsafe { waiters.remove(tcb) }
             {
-                let sig = blocked_on.cast::<crate::ipc::notification::NotificationState>();
-                if (*sig).waiters.remove(tcb)
-                {
-                    (*sig).refresh_observer();
-                }
+                // SAFETY: as for `waiters`.
+                unsafe { (*sig).refresh_observer() };
             }
-            IpcThreadState::BlockedOnSend =>
-            {
-                let ep = &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+        }
+        IpcThreadState::BlockedOnSend =>
+        {
+            // SAFETY: blocked_on is the live EndpointState bound_state names, its
+            // lock held (contract).
+            let ep = unsafe { &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>() };
+            // SAFETY: ep.lock is held (contract); tcb and the queue ends are valid.
+            unsafe {
                 crate::ipc::endpoint::unlink_from_wait_queue(
                     tcb,
                     &mut ep.send_head,
                     &mut ep.send_tail,
-                );
-                // Republish send-queue level (#285-adjacent): this unlink can
-                // empty the queue, and the wait-set self-heal reads the shadow
-                // locklessly.
-                ep.refresh_send_ready();
-            }
-            IpcThreadState::BlockedOnRecv =>
-            {
-                let ep = &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
+                )
+            };
+            // Republish send-queue level (#285-adjacent): this unlink can
+            // empty the queue, and the wait-set self-heal reads the shadow
+            // locklessly.
+            // SAFETY: ep.lock is held (contract).
+            unsafe { ep.refresh_send_ready() };
+        }
+        IpcThreadState::BlockedOnRecv =>
+        {
+            // SAFETY: blocked_on is the live EndpointState bound_state names, its
+            // lock held (contract).
+            let ep = unsafe { &mut *blocked_on.cast::<crate::ipc::endpoint::EndpointState>() };
+            // SAFETY: ep.lock is held (contract); tcb and the queue ends are valid.
+            unsafe {
                 crate::ipc::endpoint::unlink_from_wait_queue(
                     tcb,
                     &mut ep.recv_head,
                     &mut ep.recv_tail,
-                );
-            }
-            IpcThreadState::BlockedOnEventQueue =>
-            {
-                let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
-                (*eq).waiters.remove(tcb);
-            }
-            IpcThreadState::BlockedOnWaitSet =>
-            {
-                let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
-                (*ws).waiters.remove(tcb);
-            }
-            _ =>
-            {}
+                )
+            };
         }
+        IpcThreadState::BlockedOnEventQueue =>
+        {
+            let eq = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
+            // SAFETY: blocked_on is the live EventQueueState bound_state names, its
+            // lock held (contract), which serialises every edit of its wait queue.
+            let waiters = unsafe { &mut (*eq).waiters };
+            // SAFETY: tcb is a valid TCB (contract); the source lock is held.
+            unsafe { waiters.remove(tcb) };
+        }
+        IpcThreadState::BlockedOnWaitSet =>
+        {
+            let ws = blocked_on.cast::<crate::ipc::wait_set::WaitSetState>();
+            // SAFETY: blocked_on is the live WaitSetState bound_state names, its
+            // lock held (contract), which serialises every edit of its wait queue.
+            let waiters = unsafe { &mut (*ws).waiters };
+            // SAFETY: tcb is a valid TCB (contract); the source lock is held.
+            unsafe { waiters.remove(tcb) };
+        }
+        _ =>
+        {}
     }
 }
 
@@ -3067,12 +3129,9 @@ impl CascadeStack
     {
         // SAFETY: caller contract; the queued object's link fields are this
         // stack's alone, so nothing writes them concurrently.
-        let (lo, hi) = unsafe {
-            (
-                (*obj.as_ptr()).ref_count.load(Ordering::Relaxed),
-                (*obj.as_ptr()).cascade_link_hi,
-            )
-        };
+        let lo = unsafe { (*obj.as_ptr()).ref_count.load(Ordering::Relaxed) };
+        // SAFETY: as above.
+        let hi = unsafe { (*obj.as_ptr()).cascade_link_hi };
         u64::from(lo)
             | (u64::from(hi[0]) << 32)
             | (u64::from(hi[1]) << 40)
@@ -3094,10 +3153,11 @@ impl CascadeStack
             [(word >> 32) as u8, (word >> 40) as u8, (word >> 48) as u8],
         );
         // SAFETY: caller contract.
-        unsafe {
-            (*obj.as_ptr()).ref_count.store(lo, Ordering::Relaxed);
-            core::ptr::addr_of_mut!((*obj.as_ptr()).cascade_link_hi).write(hi);
-        }
+        unsafe { (*obj.as_ptr()).ref_count.store(lo, Ordering::Relaxed) };
+        // SAFETY: caller contract.
+        let link_hi = unsafe { core::ptr::addr_of_mut!((*obj.as_ptr()).cascade_link_hi) };
+        // SAFETY: caller contract; `link_hi` is valid and aligned for the write.
+        unsafe { link_hi.write(hi) };
     }
 
     /// Queue `obj` for teardown.
@@ -3129,10 +3189,11 @@ impl CascadeStack
         // SAFETY: `top` was queued by `push`, whose contract keeps it live,
         // its link fields this stack's alone, and unreferenced but for the
         // `owner` back-pointer it allows until it is popped here.
-        unsafe {
-            self.top = Self::decode(Self::read_link(top));
-            Self::write_link(top, 0);
-        }
+        let word = unsafe { Self::read_link(top) };
+        self.top = Self::decode(word);
+        // SAFETY: as above; `top` is popped here, so the link fields are the
+        // caller's alone and no reference to its header is used across this call.
+        unsafe { Self::write_link(top, 0) };
         Some(top)
     }
 }
@@ -3170,20 +3231,31 @@ unsafe fn release_death_observers(
     stack: &mut CascadeStack,
 )
 {
-    // SAFETY: the caller took the chain, so it owns every node; each lives in
-    // its queue, which the node's reference keeps live until the dec_ref
-    // below, issued after the node is back in the pool. A queue at zero has no
-    // capability or binding left, so it is unreferenced for the push.
-    unsafe {
-        crate::sched::thread::for_each_observer(first, |node| {
-            let eq = (*node).eq;
-            crate::ipc::event_queue::event_queue_return_observer((*eq).state, node);
-            if (*eq).header.dec_ref() == 0
-            {
-                stack.push(NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()));
-            }
-        });
-    }
+    let release = |node: *mut crate::sched::thread::DeathObserver| {
+        // SAFETY: the caller took the chain, so it owns every node; `node` is valid
+        // until this closure returns for it.
+        let eq = unsafe { (*node).eq };
+        // SAFETY: each node lives in its queue, which the node's reference keeps
+        // live until the dec_ref below, issued after the node is back in the pool.
+        let eq_state = unsafe { (*eq).state };
+        // SAFETY: `node` came from this queue's `event_queue_take_observer` and is on
+        // no owner chain; the node's reference keeps `eq` live, and the caller holds
+        // no lock.
+        unsafe { crate::ipc::event_queue::event_queue_return_observer(eq_state, node) };
+        // SAFETY: the node's reference keeps the queue live until this dec_ref.
+        if unsafe { (*eq).header.dec_ref() } == 0
+        {
+            // SAFETY: eq is non-null: the node named it.
+            let eq_header = unsafe { NonNull::new_unchecked(eq.cast::<KernelObjectHeader>()) };
+            // SAFETY: a queue at zero has no capability or binding left, so it is
+            // unreferenced for the push.
+            unsafe { stack.push(eq_header) };
+        }
+    };
+    // SAFETY: the caller took the chain, so it owns every node and holds no lock; each
+    // node is valid until `release` returns for it, and nothing else changes the links
+    // during the walk.
+    unsafe { crate::sched::thread::for_each_observer(first, release) };
 }
 
 /// Free the body of an object of concrete type `T`: drop it in place and
@@ -3509,16 +3581,21 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
     let offset_of = |page: *mut ArenaPage| virt_to_phys(page as u64).wrapping_sub(anc_memory.base);
     for record in group.iter_mut()
     {
-        // SAFETY: every page on the list is held (contract) and lies in this
-        // donation's span (its record cell named this record).
-        record.holes = unsafe {
-            crate::cap::arena::sort_list(
-                record.holes,
-                &|page: *mut ArenaPage| (*page).next.load(Ordering::Relaxed),
-                &|page: *mut ArenaPage, to| (*page).next.store(to, Ordering::Relaxed),
-                &offset_of,
-            )
+        let next_of = |page: *mut ArenaPage| {
+            // SAFETY: every page on the list is held (contract) and lies in this
+            // donation's span (its record cell named this record).
+            unsafe { (*page).next.load(Ordering::Relaxed) }
         };
+        let set_next = |page: *mut ArenaPage, to| {
+            // SAFETY: every page on the list is held (contract) and lies in this
+            // donation's span (its record cell named this record).
+            unsafe { (*page).next.store(to, Ordering::Relaxed) }
+        };
+        // SAFETY: every page on the list is held (contract) and lies in this
+        // donation's span (its record cell named this record), so each is valid
+        // for `next_of`, `set_next`, and `offset_of`.
+        record.holes =
+            unsafe { crate::cap::arena::sort_list(record.holes, &next_of, &set_next, &offset_of) };
     }
     let kept = |sorted: *mut ArenaPage| {
         let mut cur = sorted;
@@ -3555,9 +3632,11 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
         // SAFETY: one record's reference, released once, after every run.
         if unsafe { &*anc_ptr }.dec_ref() == 0
         {
+            // SAFETY: anc_ptr is non-null: it named the live Memory object above.
+            let anc_header = unsafe { NonNull::new_unchecked(anc_ptr) };
             // SAFETY: refcount reached 0; no live cap holds it, and the
             // donations' bytes have been returned to it above.
-            unsafe { stack.push(NonNull::new_unchecked(anc_ptr)) };
+            unsafe { stack.push(anc_header) };
         }
     }
 }
@@ -3680,10 +3759,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         {
             // Withdraw every mapping made through this capability's object
             // before its bytes go (docs/capability-model.md § Mmio).
+            // SAFETY: ptr points to a live MmioObject; header at offset 0.
+            let mmio = unsafe { &*ptr.as_ptr().cast::<MmioObject>() };
             // SAFETY: refcount 0, so no slot or pin names the object and no map
             // records into it; no lock is held; the CPU is stable
             // (dealloc_object's contract).
-            unsafe { (*ptr.as_ptr().cast::<MmioObject>()).withdraw_mappings(stack) };
+            unsafe { mmio.withdraw_mappings(stack) };
             // SAFETY: a refcount-0 Mmio object; no lock held.
             unsafe { release_range_object::<MmioObject>(ptr, stack) };
         }
@@ -3717,13 +3798,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             if let Some(notification) = notification
             {
                 // SAFETY: the binding's reference, which `unregister` handed
-                // over, keeps the object live until this decrement; at zero
-                // nothing else references it.
-                unsafe {
-                    if notification.as_ref().dec_ref() == 0
-                    {
-                        stack.push(notification);
-                    }
+                // over, keeps the object live until this decrement.
+                if unsafe { notification.as_ref() }.dec_ref() == 0
+                {
+                    // SAFETY: the reference just released was the last; at zero
+                    // nothing else references the object.
+                    unsafe { stack.push(notification) };
                 }
             }
             // SAFETY: a refcount-0 Interrupt object whose binding is removed; no
@@ -3874,9 +3954,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // needless_range_loop: explicit indexing reads clearer for the
                 // parallel scheduler_for(cpu) accesses across all CPUs.
                 #[allow(clippy::needless_range_loop)]
-                // SAFETY: tcb validated non-null; all scheduler locks are acquired in
-                // ascending order to prevent deadlock; lock_raw paired with unlock_raw.
-                unsafe {
+                // All scheduler locks are acquired in ascending order to prevent
+                // deadlock; each lock_raw is paired with its unlock_raw.
+                {
                     use crate::sched::thread::ThreadState;
                     let cpu_count = crate::sched::CPU_COUNT
                         .load(core::sync::atomic::Ordering::Relaxed)
@@ -3887,14 +3967,23 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // same per-TCB lock; released right after the CPU locks below, before the
                     // UAF gate. Order per core/kernel/docs/scheduling-internals.md § Lock
                     // Hierarchy rule 4.
-                    let tcb_sched_saved = (*tcb).sched_lock.lock_raw();
+                    // SAFETY: tcb validated non-null and live; only the lock field is
+                    // borrowed, and it is a lock.
+                    let tcb_sched_lock = unsafe { &(*tcb).sched_lock };
+                    // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
+                    // below.
+                    let tcb_sched_saved = unsafe { tcb_sched_lock.lock_raw() };
 
                     // Acquire all scheduler locks in ascending CPU order to
                     // prevent ABBA deadlock. Each CPU's saved interrupt-flag
                     // word is stashed in its own scheduler (under that lock).
                     for cpu in 0..cpu_count
                     {
-                        crate::sched::scheduler_for(cpu).lock_saving_flags();
+                        // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
+                        let sched = unsafe { crate::sched::scheduler_for(cpu) };
+                        // SAFETY: the locks are taken in ascending CPU order and paired
+                        // with `unlock_saved_flags` below.
+                        unsafe { sched.lock_saving_flags() };
                     }
 
                     // Read priority inside the all-locks region. This dealloc and
@@ -3902,16 +3991,24 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // region; `sys_thread_set_priority` writes it under the per-TCB
                     // `sched_lock` this dealloc also holds (outer), so the read is
                     // serialised against that writer.
-                    let prio = (*tcb).priority;
+                    // SAFETY: tcb validated non-null and live; sched_lock and every
+                    // scheduler lock held.
+                    let prio = unsafe { (*tcb).priority };
 
                     // Mark Exited under all locks — no schedule() on any CPU
                     // can see this thread as Ready/Running after this point.
-                    (*tcb).state = ThreadState::Exited;
+                    // SAFETY: tcb validated non-null and live; sched_lock and every
+                    // scheduler lock held.
+                    unsafe { (*tcb).state = ThreadState::Exited };
 
                     // Remove from whichever queue it's actually in.
                     for cpu in 0..cpu_count
                     {
-                        crate::sched::scheduler_for(cpu).remove_from_queue(tcb, prio);
+                        // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
+                        let sched = unsafe { crate::sched::scheduler_for(cpu) };
+                        // SAFETY: this CPU's scheduler lock is held (taken above); tcb is a
+                        // valid TCB.
+                        unsafe { sched.remove_from_queue(tcb, prio) };
                     }
 
                     // A dying server orphans any reply-bound client: claim the reply slot
@@ -3921,64 +4018,86 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // Drain Protocol, step 5.
                     server_reply_wake = {
                         use core::sync::atomic::Ordering;
-                        let bound = (*tcb).reply_tcb.load(Ordering::Acquire);
+                        // SAFETY: tcb validated non-null and live; the all-CPU locks are held.
+                        let bound = unsafe { (*tcb).reply_tcb.load(Ordering::Acquire) };
                         if bound.is_null()
                         {
                             None
                         }
-                        else if (*tcb)
-                            .reply_tcb
-                            .compare_exchange(
-                                bound,
-                                core::ptr::null_mut(),
-                                Ordering::AcqRel,
-                                Ordering::Acquire,
-                            )
-                            .is_ok()
+                        else
                         {
-                            // Keep the client TCB alive against a concurrent
-                            // dealloc(client) until the deferred enqueue_and_wake
-                            // clears it (#160 wake-in-flight gate). A BlockedOnReply
-                            // client already carries wake_in_flight = 1 from
-                            // endpoint_call/recv; refresh it unconditionally so the
-                            // gate also covers the BlockedOnFault entry path.
-                            (*bound).wake_in_flight.store(1, Ordering::Release);
-                            // Deposit the resume disposition (read on resume per the
-                            // DEPOSIT model). A fault-blocked client cancels to Kill
-                            // (the fault helper terminates it on resume); a syscall
-                            // caller returns Interrupted. Reading ipc_state here is a
-                            // read of a value stable until our own wake (we hold the
-                            // sole claim via the reply_tcb CAS).
-                            let was_fault = (*bound).ipc_state
-                                == crate::sched::thread::IpcThreadState::BlockedOnFault;
-                            if was_fault
+                            // SAFETY: tcb validated non-null and live; the all-CPU locks are
+                            // held.
+                            let claimed = unsafe {
+                                (*tcb)
+                                    .reply_tcb
+                                    .compare_exchange(
+                                        bound,
+                                        core::ptr::null_mut(),
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            };
+                            if claimed
                             {
-                                (*bound).fault_outcome.store(
-                                    crate::ipc::fault::FAULT_OUTCOME_KILL,
-                                    Ordering::Release,
-                                );
-                                // CAS win = episode claim; fault disposition is
-                                // the KILL above.
-                                crate::sched::thread::stamp_deposit_episode(bound);
+                                // Keep the client TCB alive against a concurrent
+                                // dealloc(client) until the deferred enqueue_and_wake
+                                // clears it (#160 wake-in-flight gate). A BlockedOnReply
+                                // client already carries wake_in_flight = 1 from
+                                // endpoint_call/recv; refresh it unconditionally so the
+                                // gate also covers the BlockedOnFault entry path.
+                                // SAFETY: bound is the client claimed by the reply_tcb CAS
+                                // above, which keeps it valid.
+                                unsafe { (*bound).wake_in_flight.store(1, Ordering::Release) };
+                                // Deposit the resume disposition (read on resume per the
+                                // DEPOSIT model). A fault-blocked client cancels to Kill
+                                // (the fault helper terminates it on resume); a syscall
+                                // caller returns Interrupted. Reading ipc_state here is a
+                                // read of a value stable until our own wake (we hold the
+                                // sole claim via the reply_tcb CAS).
+                                // SAFETY: bound is valid, as above.
+                                let bound_ipc_state = unsafe { (*bound).ipc_state };
+                                let was_fault = bound_ipc_state
+                                    == crate::sched::thread::IpcThreadState::BlockedOnFault;
+                                if was_fault
+                                {
+                                    // SAFETY: bound is valid, as above.
+                                    unsafe {
+                                        (*bound).fault_outcome.store(
+                                            crate::ipc::fault::FAULT_OUTCOME_KILL,
+                                            Ordering::Release,
+                                        );
+                                    }
+                                    // CAS win = episode claim; fault disposition is
+                                    // the KILL above.
+                                    // SAFETY: the reply_tcb CAS win gives this exclusive claim
+                                    // on bound's park episode; exactly one stamp.
+                                    unsafe { crate::sched::thread::stamp_deposit_episode(bound) };
+                                }
+                                else
+                                {
+                                    // The reply_tcb CAS win is the episode claim:
+                                    // the orphaned caller's resume returns
+                                    // Interrupted via the disposition. Only
+                                    // sys_ipc_call parks are reply-bound, so the
+                                    // disposition is the whole mechanism.
+                                    // SAFETY: the reply_tcb CAS win gives this exclusive claim
+                                    // on bound's park episode; exactly one stamp.
+                                    unsafe {
+                                        crate::sched::thread::stamp_park_deposit(
+                                            bound,
+                                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                                        );
+                                    }
+                                }
+                                Some(bound)
                             }
                             else
                             {
-                                // The reply_tcb CAS win is the episode claim:
-                                // the orphaned caller's resume returns
-                                // Interrupted via the disposition. Only
-                                // sys_ipc_call parks are reply-bound, so the
-                                // disposition is the whole mechanism.
-                                crate::sched::thread::stamp_park_deposit(
-                                    bound,
-                                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                                );
+                                // Concurrent cancel beat us.
+                                None
                             }
-                            Some(bound)
-                        }
-                        else
-                        {
-                            // Concurrent cancel beat us.
-                            None
                         }
                     };
 
@@ -3989,9 +4108,18 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // tcb.sched_lock).
                     for cpu in (0..cpu_count).rev()
                     {
-                        crate::sched::scheduler_for(cpu).unlock_saved_flags();
+                        // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
+                        let sched = unsafe { crate::sched::scheduler_for(cpu) };
+                        // SAFETY: this CPU's lock was taken by `lock_saving_flags` above and
+                        // is released once.
+                        unsafe { sched.unlock_saved_flags() };
                     }
-                    (*tcb).sched_lock.unlock_raw(tcb_sched_saved);
+                    // SAFETY: tcb validated non-null and live; only the lock field is
+                    // borrowed, again, after the region's accesses to the TCB.
+                    let tcb_sched_lock = unsafe { &(*tcb).sched_lock };
+                    // SAFETY: `tcb_sched_saved` is the value `lock_raw` returned for this
+                    // lock above.
+                    unsafe { tcb_sched_lock.unlock_raw(tcb_sched_saved) };
 
                     // UAF gate: a TCB that is `current` on any CPU MUST NOT be
                     // reclaimed until every CPU has switched away from it AND
@@ -3999,7 +4127,7 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // `wait_until_off_cpu`.
                     // SAFETY: tcb is Exited and unlinked from every run queue
                     // (all-locks region above); not the running thread here.
-                    crate::sched::wait_until_off_cpu(tcb);
+                    unsafe { crate::sched::wait_until_off_cpu(tcb) };
 
                     // After eager FPU save (#108), no fpu_owner sweep is
                     // needed: `nm_handler` only ever names the currently
@@ -4026,19 +4154,29 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                     // § Cross-CPU TCB Ownership. Only the client's sched_lock is
                     // taken (the server's was released with the all-CPU locks
                     // above), so there is no two-TCB-sched_lock nesting.
-                    // SAFETY: bound kept valid by wake_in_flight = 1 above.
-                    unsafe {
-                        // The reply_tcb CAS above ended a timed call's
-                        // episode; its sleep-list entry goes first, so no pop
-                        // finds the binding this nulls.
-                        crate::ipc::cancel_timed_entry(bound);
-                        let bs = (*bound).sched_lock.lock_raw();
-                        if core::ptr::eq((*bound).blocked_on_object, tcb.cast::<u8>())
-                        {
-                            (*bound).blocked_on_object = core::ptr::null_mut();
-                        }
-                        (*bound).sched_lock.unlock_raw(bs);
+                    // The reply_tcb CAS above ended a timed call's
+                    // episode; its sleep-list entry goes first, so no pop
+                    // finds the binding this nulls.
+                    // SAFETY: bound kept valid by wake_in_flight = 1 above; its park
+                    // episode was claimed by the reply_tcb CAS and it is not yet woken.
+                    unsafe { crate::ipc::cancel_timed_entry(bound) };
+                    // SAFETY: bound kept valid by wake_in_flight = 1 above; only the
+                    // lock field is borrowed.
+                    let bound_lock = unsafe { &(*bound).sched_lock };
+                    // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
+                    // below.
+                    let bs = unsafe { bound_lock.lock_raw() };
+                    // SAFETY: bound kept valid by wake_in_flight = 1 above; its sched_lock
+                    // is held.
+                    let bound_blocked_on = unsafe { (*bound).blocked_on_object };
+                    if core::ptr::eq(bound_blocked_on, tcb.cast::<u8>())
+                    {
+                        // SAFETY: bound kept valid by wake_in_flight = 1 above; its
+                        // sched_lock is held.
+                        unsafe { (*bound).blocked_on_object = core::ptr::null_mut() };
                     }
+                    // SAFETY: `bs` is the value `lock_raw` returned for this lock above.
+                    unsafe { bound_lock.unlock_raw(bs) };
                     // Recompute the wake target HERE (post-gates), under the
                     // client's current state, EXCLUDING this dealloc CPU. This
                     // CPU stays inside this teardown through the wake-in-flight
@@ -4097,14 +4235,23 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // binding still observed there names a source not yet freed,
                 // so a concurrent last-capability delete of the source cannot
                 // free it under this unlink.
-                // SAFETY: tcb is valid (not yet freed); blocked_on_object
-                // and ipc_state are always valid on an initialized TCB.
-                unsafe {
+                // tcb is valid (not yet freed); blocked_on_object and ipc_state
+                // are always valid on an initialized TCB.
+                {
                     use crate::sched::thread::IpcThreadState;
-                    let sched_saved = (*tcb).sched_lock.lock_raw();
-                    let blocked_obj = (*tcb).blocked_on_object;
-                    let bound_state = (*tcb).ipc_state;
-                    (*tcb).sched_lock.unlock_raw(sched_saved);
+                    // SAFETY: tcb is valid (not yet freed); only the lock field is
+                    // borrowed, and it is a lock.
+                    let sched_lock = unsafe { &(*tcb).sched_lock };
+                    // SAFETY: the flags `lock_raw` returns are passed to the
+                    // `unlock_raw` below.
+                    let sched_saved = unsafe { sched_lock.lock_raw() };
+                    // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                    let blocked_obj = unsafe { (*tcb).blocked_on_object };
+                    // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                    let bound_state = unsafe { (*tcb).ipc_state };
+                    // SAFETY: `sched_saved` is the value `lock_raw` returned for this
+                    // lock above.
+                    unsafe { sched_lock.unlock_raw(sched_saved) };
                     if !blocked_obj.is_null()
                     {
                         match bound_state
@@ -4115,21 +4262,30 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                             | IpcThreadState::BlockedOnEventQueue
                             | IpcThreadState::BlockedOnWaitSet =>
                             {
-                                if let Some(held) = crate::ipc::lock_bound_source(
-                                    tcb,
-                                    bound_state,
-                                    blocked_obj,
-                                    None,
-                                )
+                                // SAFETY: tcb is a valid TCB; no IPC source lock, sched_lock,
+                                // per-CPU scheduler lock, or SLEEP_LIST_LOCK is held here;
+                                // bound_state is a source-blocking state.
+                                let bound_source = unsafe {
+                                    crate::ipc::lock_bound_source(
+                                        tcb,
+                                        bound_state,
+                                        blocked_obj,
+                                        None,
+                                    )
+                                };
+                                if let Some(held) = bound_source
                                 {
                                     // SAFETY: `held` holds the live source's
                                     // lock and tcb's sched_lock.
-                                    unlink_dying_waiter(tcb, bound_state, blocked_obj);
+                                    unsafe { unlink_dying_waiter(tcb, bound_state, blocked_obj) };
                                     // Retire the binding inside the hold, so
                                     // no later reader passes its re-read once
                                     // the source no longer queues tcb.
-                                    (*tcb).blocked_on_object = core::ptr::null_mut();
-                                    held.unlock();
+                                    // SAFETY: tcb is valid; `held` holds its sched_lock.
+                                    unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
+                                    // SAFETY: `held` came from lock_bound_source and both its
+                                    // locks are still held.
+                                    unsafe { held.unlock() };
                                 }
                             }
                             IpcThreadState::BlockedOnReply =>
@@ -4148,29 +4304,46 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                                 use core::sync::atomic::Ordering;
                                 let server =
                                     blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                let saved = (*tcb).sched_lock.lock_raw();
-                                if core::ptr::eq((*tcb).blocked_on_object, blocked_obj)
+                                // SAFETY: tcb is valid (not yet freed); only the lock field is
+                                // borrowed, again, after the source unlink above.
+                                let sched_lock = unsafe { &(*tcb).sched_lock };
+                                // SAFETY: the flags `lock_raw` returns are passed to the
+                                // `unlock_raw` below.
+                                let saved = unsafe { sched_lock.lock_raw() };
+                                // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                                let still_bound = unsafe { (*tcb).blocked_on_object };
+                                if core::ptr::eq(still_bound, blocked_obj)
                                 {
                                     // Win ⇒ we cancelled the reply wake; clear
                                     // wake_in_flight so the #160 gate below does not
                                     // wait for a wake that will never fire. Lose ⇒ a
                                     // reply is in flight and its enqueue_and_wake
                                     // clears the flag; the gate waits for it.
-                                    let cancelled = (*server)
-                                        .reply_tcb
-                                        .compare_exchange(
-                                            tcb,
-                                            core::ptr::null_mut(),
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_ok();
+                                    // SAFETY: the client's sched_lock is held and the
+                                    // `blocked_on == server` re-read above succeeded, so the
+                                    // CLOSURE LEMMA pins the server alive across the CAS.
+                                    let cancelled = unsafe {
+                                        (*server)
+                                            .reply_tcb
+                                            .compare_exchange(
+                                                tcb,
+                                                core::ptr::null_mut(),
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                            )
+                                            .is_ok()
+                                    };
                                     if cancelled
                                     {
-                                        (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                        // SAFETY: tcb is valid (not yet freed).
+                                        unsafe {
+                                            (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                        }
                                     }
                                 }
-                                (*tcb).sched_lock.unlock_raw(saved);
+                                // SAFETY: `saved` is the value `lock_raw` returned for this
+                                // lock above.
+                                unsafe { sched_lock.unlock_raw(saved) };
                             }
                             IpcThreadState::BlockedOnFault =>
                             {
@@ -4183,31 +4356,56 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                                 use core::sync::atomic::Ordering;
                                 let server =
                                     blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                let saved = (*tcb).sched_lock.lock_raw();
-                                if core::ptr::eq((*tcb).blocked_on_object, blocked_obj)
+                                // SAFETY: tcb is valid (not yet freed); only the lock field is
+                                // borrowed, again, after the source unlink above.
+                                let sched_lock = unsafe { &(*tcb).sched_lock };
+                                // SAFETY: the flags `lock_raw` returns are passed to the
+                                // `unlock_raw` below.
+                                let saved = unsafe { sched_lock.lock_raw() };
+                                // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                                let still_bound = unsafe { (*tcb).blocked_on_object };
+                                if core::ptr::eq(still_bound, blocked_obj)
                                 {
-                                    let cancelled = (*server)
-                                        .reply_tcb
-                                        .compare_exchange(
-                                            tcb,
-                                            core::ptr::null_mut(),
-                                            Ordering::AcqRel,
-                                            Ordering::Acquire,
-                                        )
-                                        .is_ok();
+                                    // SAFETY: the client's sched_lock is held and the
+                                    // `blocked_on == server` re-read above succeeded, so the
+                                    // CLOSURE LEMMA pins the server alive across the CAS.
+                                    let cancelled = unsafe {
+                                        (*server)
+                                            .reply_tcb
+                                            .compare_exchange(
+                                                tcb,
+                                                core::ptr::null_mut(),
+                                                Ordering::AcqRel,
+                                                Ordering::Acquire,
+                                            )
+                                            .is_ok()
+                                    };
                                     if cancelled
                                     {
-                                        (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                        // SAFETY: tcb is valid (not yet freed).
+                                        unsafe {
+                                            (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                        }
                                     }
                                 }
-                                (*tcb).sched_lock.unlock_raw(saved);
+                                // SAFETY: `saved` is the value `lock_raw` returned for this
+                                // lock above.
+                                unsafe { sched_lock.unlock_raw(saved) };
                             }
                             IpcThreadState::None =>
                             {}
                         }
-                        let sched_saved = (*tcb).sched_lock.lock_raw();
-                        (*tcb).blocked_on_object = core::ptr::null_mut();
-                        (*tcb).sched_lock.unlock_raw(sched_saved);
+                        // SAFETY: tcb is valid (not yet freed); only the lock field is
+                        // borrowed, again, after the source unlink above.
+                        let sched_lock = unsafe { &(*tcb).sched_lock };
+                        // SAFETY: the flags `lock_raw` returns are passed to the
+                        // `unlock_raw` below.
+                        let sched_saved = unsafe { sched_lock.lock_raw() };
+                        // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                        unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
+                        // SAFETY: `sched_saved` is the value `lock_raw` returned for this
+                        // lock above.
+                        unsafe { sched_lock.unlock_raw(sched_saved) };
                     }
                 }
 
@@ -4220,20 +4418,22 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // after the unlink above (which removed this thread from the
                 // endpoint's send queue if it was a queued faulter) so the
                 // endpoint dealloc cannot observe this thread still on its queue.
-                // SAFETY: tcb valid (not yet freed); the bindings are atomics;
-                // no lock is held here; a binding's reference that was the
-                // endpoint's last leaves it unreferenced for the push.
-                unsafe {
-                    for slot in &(*tcb).fault_handlers
+                // SAFETY: tcb valid (not yet freed); the bindings are atomics.
+                let fault_handlers = unsafe { &(*tcb).fault_handlers };
+                for slot in fault_handlers
+                {
+                    let ep = slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+                    // SAFETY: ep is non-null in the second operand, and the binding's
+                    // reference on the endpoint, still held, keeps it live.
+                    if !ep.is_null() && unsafe { (*ep).header.dec_ref() } == 0
                     {
-                        let ep =
-                            slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
-                        if !ep.is_null() && (*ep).header.dec_ref() == 0
-                        {
-                            stack.push(core::ptr::NonNull::new_unchecked(
-                                ep.cast::<KernelObjectHeader>(),
-                            ));
-                        }
+                        // SAFETY: ep is non-null.
+                        let ep_header = unsafe {
+                            core::ptr::NonNull::new_unchecked(ep.cast::<KernelObjectHeader>())
+                        };
+                        // SAFETY: no lock is held here; the binding's reference was the
+                        // endpoint's last, leaving it unreferenced for the push.
+                        unsafe { stack.push(ep_header) };
                     }
                 }
 
@@ -4304,20 +4504,33 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // `CSpace`, whose pool funded it, frees the tables of its
                 // threads under each one's lock before it reclaims its pool, so
                 // a free inside the hold always finds that pool live.
-                // SAFETY: tcb validated non-null; lock_raw/unlock_raw paired;
-                // a non-null table was installed by sys_ioport_bind, and the
+                // A non-null table was installed by sys_ioport_bind, and the
                 // thread is off every CPU, so no TSS load reads it.
-                unsafe {
-                    let saved = (*tcb).sched_lock.lock_raw();
-                    let table = (*tcb)
-                        .iopb
-                        .cast::<crate::cap::ioport_bindings::IoPortBindings>();
-                    (*tcb).iopb = core::ptr::null_mut();
+                {
+                    // SAFETY: tcb validated non-null and live; only the lock field is
+                    // borrowed, and it is a lock.
+                    let sched_lock = unsafe { &(*tcb).sched_lock };
+                    // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
+                    // below.
+                    let saved = unsafe { sched_lock.lock_raw() };
+                    // SAFETY: tcb validated non-null; sched_lock held.
+                    let table = unsafe {
+                        (*tcb)
+                            .iopb
+                            .cast::<crate::cap::ioport_bindings::IoPortBindings>()
+                    };
+                    // SAFETY: tcb validated non-null; sched_lock held.
+                    unsafe { (*tcb).iopb = core::ptr::null_mut() };
                     if !table.is_null()
                     {
-                        free_port_binding_table(table);
+                        // SAFETY: a non-null table came from sys_ioport_bind's
+                        // `alloc_port_binding_table` and nothing references it any more; its
+                        // funder is live, as the thread is registered and its `sched_lock`
+                        // is held.
+                        unsafe { free_port_binding_table(table) };
                     }
-                    (*tcb).sched_lock.unlock_raw(saved);
+                    // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
+                    unsafe { sched_lock.unlock_raw(saved) };
                 }
 
                 // The per-thread XSAVE / FP-save area is the pages after the
@@ -4344,10 +4557,13 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // liveness debug assertions, so its store must not be
                 // reordered or elided.
                 // SAFETY: tcb is valid; we are about to free it.
-                unsafe {
-                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).magic), 0);
-                    core::ptr::write_volatile(core::ptr::addr_of_mut!((*tcb).priority), 0xFF);
-                }
+                let magic = unsafe { core::ptr::addr_of_mut!((*tcb).magic) };
+                // SAFETY: `magic` addresses a field of the valid tcb, aligned for the store.
+                unsafe { core::ptr::write_volatile(magic, 0) };
+                // SAFETY: tcb is valid; we are about to free it.
+                let priority = unsafe { core::ptr::addr_of_mut!((*tcb).priority) };
+                // SAFETY: `priority` addresses a field of the valid tcb, aligned for the store.
+                unsafe { core::ptr::write_volatile(priority, 0xFF) };
 
                 // SAFETY: tcb lives in-place inside the retype slot;
                 // refcount has reached 0, no scheduler holds it.
@@ -4389,13 +4605,11 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // returns to the cap, then free the slot.
             // SAFETY: thread creation holed the slot's guard, and the thread
             // is dead; this arm holds no lock (`dealloc_object_one`'s
-            // contract), after SMP bringup. The object was retyped from
-            // `ancestor_memory` at `offset` with `raw_bytes`, and is dropped
-            // above; nothing references it.
-            unsafe {
-                crate::mm::stack_guard::close(block_phys);
-                retype_free(ancestor_memory, offset, raw_bytes);
-            }
+            // contract), after SMP bringup.
+            unsafe { crate::mm::stack_guard::close(block_phys) };
+            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+            // with `raw_bytes`, and is dropped above; nothing references it.
+            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
 
             let ancestor_nn =
                 // SAFETY: ancestor_ptr non-null.
@@ -4440,13 +4654,16 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // when their own last caps go. If the running thread is
                 // itself stopped — bound here, or by a concurrent teardown
                 // — the free is deferred off-CPU (see push_deferred_reclaim).
-                // SAFETY: as_ptr uniquely owned (refcount 0); no scheduler,
-                // IPC, or registry lock is held here.
-                let stopped = unsafe {
-                    crate::sched::stop_threads_bound_to(|tcb| {
-                        core::ptr::eq((*tcb).address_space, as_ptr)
-                    })
+                let bound_here = |tcb: *mut crate::sched::thread::ThreadControlBlock| {
+                    // SAFETY: stop_threads_bound_to hands `bound` only valid TCB pointers, and
+                    // this only reads `address_space` through it.
+                    let tcb_aspace = unsafe { (*tcb).address_space };
+                    core::ptr::eq(tcb_aspace, as_ptr)
                 };
+                // SAFETY: as_ptr uniquely owned (refcount 0); no scheduler,
+                // IPC, or registry lock is held here; `bound_here` only reads
+                // through the TCB pointer it is given.
+                let stopped = unsafe { crate::sched::stop_threads_bound_to(bound_here) };
                 // SAFETY: as_ptr valid; every bound thread is Exited and
                 // off every run queue; no scheduler lock held.
                 if stopped || !unsafe { crate::sched::wait_until_aspace_inactive(as_ptr) }
@@ -4482,9 +4699,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // Table): no CPU has it loaded and no bound thread can run
                 // (both established above), so none of its leaves is used
                 // again.
-                // SAFETY: as_ptr is valid and being reclaimed; nothing maps
-                // into it any more (refcount 0, no slot references it).
-                unsafe { (*as_ptr).release_mapped_frames() };
+                // SAFETY: as_ptr is valid and being reclaimed.
+                let space = unsafe { &*as_ptr };
+                // SAFETY: the address space is being reclaimed; nothing maps
+                // into it any more (refcount 0, no slot references it), and
+                // every bound thread is stopped and off-CPU.
+                unsafe { space.release_mapped_frames() };
 
                 // Release the terminal-fault observers' EventQueue references.
                 // Every bound thread is stopped and off-CPU (above), so no
@@ -4573,11 +4793,16 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // own CSpace, or a concurrent teardown stopped it — nothing
                 // is freed now: the object is queued for off-CPU reclaim
                 // and the syscall epilogue schedules the thread away.
-                // SAFETY: cs_ptr uniquely owned (refcount 0); no scheduler,
-                // IPC, or registry lock is held here.
-                let stopped = unsafe {
-                    crate::sched::stop_threads_bound_to(|tcb| core::ptr::eq((*tcb).cspace, cs_ptr))
+                let bound_here = |tcb: *mut crate::sched::thread::ThreadControlBlock| {
+                    // SAFETY: stop_threads_bound_to hands `bound` only valid TCB pointers, and
+                    // this only reads `cspace` through it.
+                    let tcb_cspace = unsafe { (*tcb).cspace };
+                    core::ptr::eq(tcb_cspace, cs_ptr)
                 };
+                // SAFETY: cs_ptr uniquely owned (refcount 0); no scheduler,
+                // IPC, or registry lock is held here; `bound_here` only reads
+                // through the TCB pointer it is given.
+                let stopped = unsafe { crate::sched::stop_threads_bound_to(bound_here) };
                 if stopped
                 {
                     // SAFETY: refcount 0, no slot references the object; the
@@ -4637,6 +4862,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // The wrapper's second run, which returns the pool, comes
                 // after the objects the slots queue below: `cspace` null marks
                 // it, and pushing the wrapper first puts it beneath them.
+                // SAFETY: ptr is the live wrapper; refcount 0, so no capability or pin
+                // reaches it, and it was popped, so it is on no stack, and nothing else
+                // writes `cspace`.
+                unsafe {
+                    (*ptr.as_ptr().cast::<CSpaceKernelObject>()).cspace = core::ptr::null_mut();
+                };
                 // SAFETY: refcount 0, so no capability or pin reaches the
                 // wrapper, and it was popped, so it is on no stack. Between the
                 // runs another CPU reaches it only through an arena page's
@@ -4644,38 +4875,40 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // `arena_free` alone, never the whole wrapper, `cspace`, or the
                 // header (`free_arena_chunk`), as `CascadeStack::push` allows;
                 // this arm uses neither after the push.
-                unsafe {
-                    (*ptr.as_ptr().cast::<CSpaceKernelObject>()).cspace = core::ptr::null_mut();
-                    stack.push(ptr);
-                }
+                unsafe { stack.push(ptr) };
 
                 // Dec-ref all objects referenced by non-null slots, queueing
                 // each one this leaves unreferenced, a nested CSpace
                 // included, on the cascade stack: a chain of CSpaces each
                 // holding the last reference to the next is torn down
                 // iteratively, not one recursion per level.
-                // SAFETY: cs_ptr non-null; for_each_object handles iteration;
-                // each slot's object is live until its reference is released,
-                // so a Memory object is uncounted while live and once, as its
-                // fill counted it; each slot's reference is released once, and
-                // one that was its object's last leaves the object referenced
-                // by no slot, pin, or kernel owner and on no stack; a nested
-                // `CSpace` wrapper among them stays reachable only through its
-                // arena pages' `owner`, which `CascadeStack::push` allows.
-                unsafe {
-                    (*cs_ptr).for_each_object(|obj_ptr| {
-                        // The slot stops naming its object here, as a freed
-                        // slot does in `CSpace::free_slot`.
-                        if obj_ptr.as_ref().obj_type == ObjectType::Memory
-                        {
-                            MemoryObject::note_slot_released(obj_ptr);
-                        }
-                        if obj_ptr.as_ref().dec_ref() == 0
-                        {
-                            stack.push(obj_ptr);
-                        }
-                    });
-                }
+                let release = |obj_ptr: NonNull<KernelObjectHeader>| {
+                    // SAFETY: for_each_object yields only live objects, each live until
+                    // its reference is released below.
+                    let obj_type = unsafe { obj_ptr.as_ref() }.obj_type;
+                    // The slot stops naming its object here, as a freed
+                    // slot does in `CSpace::free_slot`.
+                    if obj_type == ObjectType::Memory
+                    {
+                        // SAFETY: the object is a live Memory object that the released slot
+                        // names, so it is uncounted while live and once, as its fill
+                        // counted it.
+                        unsafe { MemoryObject::note_slot_released(obj_ptr) };
+                    }
+                    // SAFETY: the object is live until this reference is released.
+                    if unsafe { obj_ptr.as_ref() }.dec_ref() == 0
+                    {
+                        // SAFETY: the slot's reference is released once, and this one was
+                        // its object's last, leaving the object referenced by no slot, pin,
+                        // or kernel owner and on no stack; a nested `CSpace` wrapper among
+                        // them stays reachable only through its arena pages' `owner`, which
+                        // `CascadeStack::push` allows.
+                        unsafe { stack.push(obj_ptr) };
+                    }
+                };
+                // SAFETY: cs_ptr non-null and live; for_each_object handles iteration.
+                let cs = unsafe { &*cs_ptr };
+                cs.for_each_object(release);
 
                 // Drop the inline CSpace before reclaiming its storage; its
                 // own `Drop` is a no-op for retype-backed (pool pages flow
@@ -4740,26 +4973,31 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // Drain blocked senders and receivers, each woken with its park
                 // stamped cancelled (INTERRUPTED; KILL for a queued faulter), so
                 // sys_ipc_call / sys_ipc_recv return Interrupted.
-                // SAFETY: state validated non-null. The drain runs under ep.lock:
-                // a concurrent dealloc(waiter) BlockedOnSend/Recv unlink takes the
-                // same lock, so it cannot mutate these queues or free a waiter
-                // mid-walk, and the per-waiter wake_in_flight = 1 set here (the
-                // #160 discipline) makes any dealloc(waiter) that already left the
-                // queue wait at its wake-in-flight gate for our enqueue_and_wake
-                // rather than free the TCB under it. Holding ep.lock across
+                // The drain runs under ep.lock: a concurrent dealloc(waiter)
+                // BlockedOnSend/Recv unlink takes the same lock, so it cannot
+                // mutate these queues or free a waiter mid-walk, and the
+                // per-waiter wake_in_flight = 1 set here (the #160 discipline)
+                // makes any dealloc(waiter) that already left the queue wait at
+                // its wake-in-flight gate for our enqueue_and_wake rather than
+                // free the TCB under it. Holding ep.lock across
                 // enqueue_and_wake follows core/kernel/docs/scheduling-internals.md § Lock
                 // Hierarchy rule 1.
-                unsafe {
-                    let ep = &mut *state;
-                    let saved = ep.lock.lock_raw();
+                {
+                    // SAFETY: state validated non-null; EndpointState live.
+                    let ep = unsafe { &mut *state };
+                    // SAFETY: the returned flags are passed verbatim to the `unlock_raw` below.
+                    let saved = unsafe { ep.lock.lock_raw() };
                     // Wake senders. enqueue_and_wake commits the state
                     // transitions under sched_lock; we only detach the
                     // intrusive list pointers here.
                     let mut tcb = ep.send_head;
                     while !tcb.is_null()
                     {
-                        let next = (*tcb).ipc_wait_next;
-                        (*tcb).ipc_wait_next = None;
+                        // SAFETY: tcb is a queued sender, kept live by ep.lock (held), which a
+                        // concurrent dealloc(waiter) unlink also takes.
+                        let next = unsafe { (*tcb).ipc_wait_next };
+                        // SAFETY: as above; ep.lock held.
+                        unsafe { (*tcb).ipc_wait_next = None };
                         // The whole-queue detach under ep.lock is the episode
                         // claim. A queued fault sender (its handler never
                         // received) takes the kill outcome, not a resume, when
@@ -4770,54 +5008,81 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                         // instead of failing the no-deposit episode tripwire.
                         // Covers the unbind-drops-last-ref liveness case
                         // (fault-handling.md § Liveness rule 3).
-                        crate::sched::thread::stamp_cancelled_deposit(
-                            tcb,
-                            crate::sched::thread::ParkKind::of_sender(tcb),
-                        );
+                        // SAFETY: tcb is a valid TCB whose park claim this drain holds: it was
+                        // detached from the queue under ep.lock.
+                        let kind = unsafe { crate::sched::thread::ParkKind::of_sender(tcb) };
+                        // SAFETY: tcb is a valid TCB whose park episode this drain has claimed
+                        // under ep.lock; exactly one stamp per episode.
+                        unsafe { crate::sched::thread::stamp_cancelled_deposit(tcb, kind) };
                         // A timed call's entry ends with its episode.
-                        crate::ipc::cancel_timed_entry(tcb);
+                        // SAFETY: tcb is a valid TCB whose park episode was just claimed under
+                        // ep.lock and is not yet woken; no sleep-list lock is held.
+                        unsafe { crate::ipc::cancel_timed_entry(tcb) };
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.
-                        (*tcb)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        let target_cpu = crate::sched::select_target_cpu(tcb);
-                        crate::sched::enqueue_and_wake(tcb, target_cpu);
+                        // SAFETY: tcb is a valid TCB; ep.lock held.
+                        unsafe {
+                            (*tcb)
+                                .wake_in_flight
+                                .store(1, core::sync::atomic::Ordering::Release);
+                        }
+                        // SAFETY: tcb is a valid, initialised TCB.
+                        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+                        // SAFETY: tcb is a valid TCB; target_cpu came from select_target_cpu,
+                        // so it is below CPU_COUNT and initialised by sched::init.
+                        unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
                         tcb = next.unwrap_or(core::ptr::null_mut());
                     }
                     ep.send_head = core::ptr::null_mut();
                     ep.send_tail = core::ptr::null_mut();
                     // Keep the send-ready shadow consistent with send_head even
                     // on the dealloc drain path (#285-adjacent).
-                    ep.refresh_send_ready();
+                    // SAFETY: ep.lock is held, serialising with all send_head writers.
+                    unsafe { ep.refresh_send_ready() };
                     // Wake receivers.
                     let mut tcb = ep.recv_head;
                     while !tcb.is_null()
                     {
-                        let next = (*tcb).ipc_wait_next;
-                        (*tcb).ipc_wait_next = None;
+                        // SAFETY: tcb is a queued receiver, kept live by ep.lock (held), which a
+                        // concurrent dealloc(waiter) unlink also takes.
+                        let next = unsafe { (*tcb).ipc_wait_next };
+                        // SAFETY: as above; ep.lock held.
+                        unsafe { (*tcb).ipc_wait_next = None };
                         // The queue detach under ep.lock is the episode claim:
                         // stamp INTERRUPTED so the woken server's recv resume
                         // returns the error instead of publishing a stale
                         // ipc_msg into its userspace buffer as a success.
-                        crate::sched::thread::stamp_park_deposit(
-                            tcb,
-                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                        );
+                        // SAFETY: tcb is a valid TCB whose park episode this drain has claimed
+                        // under ep.lock; exactly one stamp per episode.
+                        unsafe {
+                            crate::sched::thread::stamp_park_deposit(
+                                tcb,
+                                crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                            );
+                        }
                         // A timed receive's entry goes with the waiter.
-                        crate::ipc::cancel_timed_entry(tcb);
+                        // SAFETY: tcb is a valid TCB whose park episode was just claimed under
+                        // ep.lock and is not yet woken; no sleep-list lock is held.
+                        unsafe { crate::ipc::cancel_timed_entry(tcb) };
                         // Claim for wake under ep.lock (#160). Cleared by
                         // enqueue_and_wake.
-                        (*tcb)
-                            .wake_in_flight
-                            .store(1, core::sync::atomic::Ordering::Release);
-                        let target_cpu = crate::sched::select_target_cpu(tcb);
-                        crate::sched::enqueue_and_wake(tcb, target_cpu);
+                        // SAFETY: tcb is a valid TCB; ep.lock held.
+                        unsafe {
+                            (*tcb)
+                                .wake_in_flight
+                                .store(1, core::sync::atomic::Ordering::Release);
+                        }
+                        // SAFETY: tcb is a valid, initialised TCB.
+                        let target_cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+                        // SAFETY: tcb is a valid TCB; target_cpu came from select_target_cpu,
+                        // so it is below CPU_COUNT and initialised by sched::init.
+                        unsafe { crate::sched::enqueue_and_wake(tcb, target_cpu) };
                         tcb = next.unwrap_or(core::ptr::null_mut());
                     }
                     ep.recv_head = core::ptr::null_mut();
                     ep.recv_tail = core::ptr::null_mut();
-                    ep.lock.unlock_raw(saved);
+                    // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
+                    unsafe { ep.lock.unlock_raw(saved) };
                 }
             }
 
@@ -4920,14 +5185,17 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // rule 5), so a concurrent dealloc(waiter) BlockedOnNotification
                 // unlink (which takes sig.lock and spins on wake_in_flight)
                 // cannot free a TCB before its enqueue_and_wake commits.
-                // SAFETY: state validated non-null; sig.lock held across the
-                // claims and wakes, with no scheduler or sleep-list lock held.
-                unsafe {
-                    let sig = &mut *state;
-                    let saved = sig.lock.lock_raw();
-                    crate::ipc::interrupt_all_waiters(&mut sig.waiters);
+                {
+                    // SAFETY: state validated non-null; NotificationState live.
+                    let sig = unsafe { &mut *state };
+                    // SAFETY: the returned flags are passed verbatim to the `unlock_raw` below.
+                    let saved = unsafe { sig.lock.lock_raw() };
+                    // SAFETY: sig.lock held, taken above and released only after, and no
+                    // scheduler or sleep-list lock held.
+                    unsafe { crate::ipc::interrupt_all_waiters(&mut sig.waiters) };
                     sig.refresh_observer();
-                    sig.lock.unlock_raw(saved);
+                    // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
+                    unsafe { sig.lock.unlock_raw(saved) };
                 }
 
                 // A timer batch that popped a timed waiter of this notification
@@ -5005,7 +5273,10 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             else
             {
                 // SAFETY: state non-null; EventQueueState live.
-                unsafe { ((*state).capacity, (*state).observer_count) }
+                let capacity = unsafe { (*state).capacity };
+                // SAFETY: state non-null; EventQueueState live.
+                let observer_count = unsafe { (*state).observer_count };
+                (capacity, observer_count)
             };
 
             if !state.is_null()
@@ -5102,12 +5373,11 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // `wait_set_drop` has returned and released every source/ws
                 // IPC lock (see scheduling-internals.md § Lock Hierarchy),
                 // however many members the caller-sized set held.
-                // SAFETY: state non-null and live; each zeroed header has no
-                // capability or membership left, so it is unreferenced for
-                // the push.
-                unsafe {
-                    crate::ipc::wait_set::wait_set_drop(state, |source| stack.push(source));
-                }
+                // SAFETY: each zeroed header has no capability or membership
+                // left, so it is unreferenced for the push.
+                let on_zero = |source| unsafe { stack.push(source) };
+                // SAFETY: state non-null and live.
+                unsafe { crate::ipc::wait_set::wait_set_drop(state, on_zero) };
             }
 
             debug_assert!(
@@ -5432,11 +5702,12 @@ mod tests
         for (slot, aso) in spaces.iter_mut().zip(asos.iter_mut())
         {
             let p = slot.as_mut_ptr();
-            // SAFETY: only the header is ever touched (record_mapping's inc_ref).
-            unsafe {
-                core::ptr::addr_of_mut!((*p).header)
-                    .write(KernelObjectHeader::new(ObjectType::AddressSpace));
-            }
+            // SAFETY: `p` points to the live `MaybeUninit` slot; only the header is ever touched
+            // (record_mapping's inc_ref), and the field address is taken without a reference.
+            let header = unsafe { core::ptr::addr_of_mut!((*p).header) };
+            // SAFETY: `header` is valid and aligned for a write of the header, and nothing else
+            // accesses it.
+            unsafe { header.write(KernelObjectHeader::new(ObjectType::AddressSpace)) };
             *aso = p;
         }
         let mut chunks = Vec::new();
@@ -5472,11 +5743,12 @@ mod tests
         let mut extra: core::mem::MaybeUninit<AddressSpaceObject> =
             core::mem::MaybeUninit::uninit();
         let extra = extra.as_mut_ptr();
-        // SAFETY: as above.
-        unsafe {
-            core::ptr::addr_of_mut!((*extra).header)
-                .write(KernelObjectHeader::new(ObjectType::AddressSpace));
-        }
+        // SAFETY: `extra` points to uninitialised storage of an `AddressSpaceObject` that is live
+        // for this function; the field address is taken without creating a reference.
+        let extra_header = unsafe { core::ptr::addr_of_mut!((*extra).header) };
+        // SAFETY: `extra_header` is valid and aligned for a write of the header, and nothing else
+        // accesses it.
+        unsafe { extra_header.write(KernelObjectHeader::new(ObjectType::AddressSpace)) };
         // Every record is taken but one: N fills the third chunk but one, so
         // first take the last free record.
         let free_left = MMIO_INLINE_MAPPINGS + 3 * MMIO_SPILL_RECORDS - N;
@@ -5640,7 +5912,9 @@ mod tests
     {
         // SAFETY: `raw` is a live `alloc_models` object; the header is
         // addressed without creating a reference.
-        unsafe { NonNull::new_unchecked(core::ptr::addr_of_mut!((*raw).header)) }
+        let header = unsafe { core::ptr::addr_of_mut!((*raw).header) };
+        // SAFETY: `header` is the address of a field of a live object, so it is non-null.
+        unsafe { NonNull::new_unchecked(header) }
     }
 
     /// Reclaim the objects [`alloc_models`] returned.

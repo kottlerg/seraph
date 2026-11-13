@@ -29,6 +29,9 @@
 //! detector, self-test, and draw API are hardware-coupled and compiled only
 //! for the kernel target.
 
+// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+#![warn(clippy::multiple_unsafe_ops_per_block)]
+
 pub mod health;
 pub mod keccak;
 pub mod reseed_policy;
@@ -66,12 +69,16 @@ mod imp
 
         let rng_ptr =
             crate::sched::alloc_per_cpu_slab::<CpuRng>(super::cpurng::CPURNG_SLAB, n, allocator);
-        // SAFETY: slab covers n slots; CpuRng::new() is const, overwriting the
-        // (already valid) zero-fill in place.
-        unsafe {
-            for cpu in 0..n
-            {
-                core::ptr::write(rng_ptr.add(cpu), CpuRng::new());
+        for cpu in 0..n
+        {
+            // SAFETY: the slab covers n slots and cpu < n, so the offset stays
+            // inside it.
+            let slot = unsafe { rng_ptr.add(cpu) };
+            // SAFETY: `slot` is a slab slot, aligned for `CpuRng`; the write
+            // replaces its (already valid) zero-fill in place with the const
+            // `CpuRng::new()`.
+            unsafe {
+                core::ptr::write(slot, CpuRng::new());
             }
         }
         CPURNG_PTR.store(rng_ptr, Ordering::Release);
@@ -234,8 +241,12 @@ mod imp
     {
         let base = CPURNG_PTR.load(Ordering::Acquire);
         debug_assert!(!base.is_null(), "entropy draw before init_storage");
-        // SAFETY: caller contract — slab sized to CPU_COUNT, exclusive access.
-        unsafe { &mut *base.add(cpu) }
+        // SAFETY: caller contract: the slab is sized to CPU_COUNT and
+        // cpu < CPU_COUNT, so the offset stays inside it.
+        let slot = unsafe { base.add(cpu) };
+        // SAFETY: caller contract: `slot` holds this CPU's initialised
+        // generator, and the caller has exclusive access to it.
+        unsafe { &mut *slot }
     }
 
     /// Fill `out` with cryptographically-secure random bytes from the calling

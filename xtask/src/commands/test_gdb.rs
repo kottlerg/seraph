@@ -357,7 +357,9 @@ fn lists_thread(text: &str, id: u32) -> bool
 fn expect(output: &str) -> Result<()>
 {
     let threads = section(output, "@@break");
-    let before = &output[..output.find("@@break").unwrap_or(0)];
+    let before = output
+        .split_once("@@break")
+        .map_or("", |(before, _)| before);
     if !lists_thread(before, 1) || !lists_thread(before, 2)
     {
         bail!("info threads did not list two threads");

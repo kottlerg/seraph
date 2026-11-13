@@ -103,7 +103,7 @@ fn launch(
         Some(path) => Some(SecondDisk {
             path,
             block_size: second_disk_block_size(path, args.second_disk_block_size)?,
-            shared_line: args.second_disk_shared_line,
+            line: args.second_disk_line(),
         }),
         None => None,
     };
@@ -148,12 +148,30 @@ fn launch(
         Arch::X86_64 => "x86_64, UEFI",
         Arch::Riscv64 => "riscv64, TCG, UEFI",
     };
-    launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, args.verbose)
+    let output = if args.verbose
+    {
+        QemuOutput::Verbatim
+    }
+    else
+    {
+        QemuOutput::Filtered
+    };
+    launch_qemu(args.arch.qemu_binary(), &qemu_args, desc, output)
 }
 
-fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Result<()>
+/// How QEMU's serial output reaches the host terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QemuOutput
 {
-    let banner = if verbose
+    /// Filtered until the boot line (`[--------] boot:`).
+    Filtered,
+    /// Forwarded verbatim from the first byte (`--verbose`).
+    Verbatim,
+}
+
+fn launch_qemu(binary: &str, args: &[String], desc: &str, output: QemuOutput) -> Result<()>
+{
+    let banner = if output == QemuOutput::Verbatim
     {
         format!("Starting QEMU ({desc})")
     }
@@ -184,7 +202,7 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Resu
         .stdout
         .take()
         .context("QEMU stdout was piped but unavailable")?;
-    forward_qemu_stdout(stdout, verbose)?;
+    forward_qemu_stdout(stdout, output)?;
     let status: ExitStatus = child.wait().context("waiting for QEMU to exit")?;
 
     if !status.success()
@@ -196,13 +214,13 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, verbose: bool) -> Resu
 
 /// Read QEMU's stdout to EOF, forwarding it to the host stdout through
 /// the control-sequence filter and (in default mode) the marker gate.
-fn forward_qemu_stdout<R: Read>(mut from: R, verbose: bool) -> Result<()>
+fn forward_qemu_stdout<R: Read>(mut from: R, output: QemuOutput) -> Result<()>
 {
     let out = std::io::stdout();
     let locked = out.lock();
     let sink = FilterWriter::new(locked);
 
-    if verbose
+    if output == QemuOutput::Verbatim
     {
         let mut s = sink;
         copy(&mut from, &mut s).context("forwarding QEMU stdout")?;

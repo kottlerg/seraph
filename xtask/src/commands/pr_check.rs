@@ -211,9 +211,9 @@ fn unmarked(line: &str) -> &str
     let mut rest = line.trim_start();
     loop
     {
-        let digits = rest.chars().take_while(char::is_ascii_digit).count();
-        let numbered = (digits > 0)
-            .then(|| &rest[digits..])
+        let numbered = rest
+            .strip_prefix(|c: char| c.is_ascii_digit())
+            .map(|r| r.trim_start_matches(|c: char| c.is_ascii_digit()))
             .and_then(|r| r.strip_prefix(". ").or_else(|| r.strip_prefix(") ")));
         let inner = [">", "- ", "* ", "+ ", "[ ] ", "[x] ", "[X] "]
             .iter()
@@ -971,9 +971,10 @@ pub fn states_documentation_only(pat: &Patterns, body: &str) -> bool
     let text = lines.join("\n");
     let text = pat.placeholder.replace_all(&text, "");
     text.lines().any(|line| {
-        pat.delta_statement
-            .find_iter(line)
-            .any(|found| !pat.negation.is_match(&line[..found.start()]))
+        pat.delta_statement.find_iter(line).any(|found| {
+            line.get(..found.start())
+                .is_some_and(|before| !pat.negation.is_match(before))
+        })
     })
 }
 

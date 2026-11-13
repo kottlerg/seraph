@@ -9,6 +9,45 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 
+/// A Cargo build profile: the debug build or the `--release` build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile
+{
+    /// The unoptimised build (Cargo's `dev` profile).
+    Debug,
+    /// The `--release` build.
+    Release,
+}
+
+impl Profile
+{
+    /// Name of Cargo's output directory for the profile (`debug`/`release`).
+    pub fn dir_name(self) -> &'static str
+    {
+        match self
+        {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+
+    /// Cargo profile *selector* name (`dev`/`release`) for `--config` keys.
+    ///
+    /// Distinct from [`Profile::dir_name`], which returns the output-directory
+    /// name (`debug`/`release`). The cargo profile is literally named `dev`; no
+    /// profile is named `debug`, so a per-package `--config` key MUST use this
+    /// name — `profile.debug.package.*` would be a silent no-op. Do not fold
+    /// this into [`Profile::dir_name`].
+    pub fn cargo_profile(self) -> &'static str
+    {
+        match self
+        {
+            Self::Debug => "dev",
+            Self::Release => "release",
+        }
+    }
+}
+
 /// Resolved project paths used by every command.
 pub struct Context
 {
@@ -89,9 +128,8 @@ impl Context
     ///
     /// Cargo outputs the `dev` profile to `debug/`; all other profiles use the
     /// profile name as the directory name.
-    pub fn cargo_output_dir(&self, triple: &str, release: bool) -> PathBuf
+    pub fn cargo_output_dir(&self, triple: &str, profile: Profile) -> PathBuf
     {
-        let profile_dir = if release { "release" } else { "debug" };
-        self.target_dir.join(triple).join(profile_dir)
+        self.target_dir.join(triple).join(profile.dir_name())
     }
 }

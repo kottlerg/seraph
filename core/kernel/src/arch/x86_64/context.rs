@@ -344,15 +344,17 @@ pub unsafe fn first_entry_to_user(
         // switch_and_enter_user has bit 63 clear, so it flushes PCID `tag`
         // (correct for the first use of the tag), and the recorded sync makes
         // init's next activate elide.
-        // SAFETY: tagging enabled; aspace is active on this CPU (the scheduler
-        // marked it), so it cannot be its own eviction victim; the per-CPU slab
-        // is initialised and cpu/tag are in range.
-        let tag = crate::mm::tag_allocator::claim(unsafe { &*aspace });
+        // SAFETY: aspace is a valid AddressSpace (caller's contract); it is
+        // active on this CPU (the scheduler marked it), so claim cannot pick it
+        // as its own eviction victim.
+        let space = unsafe { &*aspace };
+        let tag = crate::mm::tag_allocator::claim(space);
         let cpu = super::cpu::current_cpu() as usize;
-        // SAFETY: see above.
+        let tag_gen = space.tag_gen.load(Ordering::Acquire);
+        let tlb_gen = space.tlb_gen.load(Ordering::Acquire);
+        // SAFETY: tagging enabled; the per-CPU slab is initialised, cpu is the
+        // current CPU and tag (from claim) is below num_tags.
         unsafe {
-            let tag_gen = (*aspace).tag_gen.load(Ordering::Acquire);
-            let tlb_gen = (*aspace).tlb_gen.load(Ordering::Acquire);
             crate::mm::tag_allocator::set_tag_state(cpu, tag, tag_gen, tlb_gen);
         }
         root | u64::from(tag)

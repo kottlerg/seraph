@@ -223,11 +223,18 @@ pub fn init_ap_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocat
         crate::sched::alloc_per_cpu_slab::<TssWithIopb>(AP_TSS_SLAB, cpu_count, allocator);
     // Initialise IOPB regions to 0xFF (all ports denied) for slots not yet
     // touched by init_ap. iopb_offset is u16 inside a packed struct, so use
-    // write_unaligned. SAFETY: tss_ptr covers cpu_count entries.
-    unsafe {
-        for cpu in 0..cpu_count
-        {
-            let slot = tss_ptr.add(cpu);
+    // write_unaligned.
+    for cpu in 0..cpu_count
+    {
+        // SAFETY: tss_ptr covers cpu_count entries.
+        let slot = unsafe { tss_ptr.add(cpu) };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a field of the one TSS slot `slot`, which no AP uses yet"
+        )]
+        // SAFETY: slot is a live entry of the fresh slab, which no AP uses yet;
+        // every write stays within its field.
+        unsafe {
             let iopb = core::ptr::addr_of_mut!((*slot).iopb);
             core::ptr::write_bytes(iopb.cast::<u8>(), 0xFF, IOPB_SIZE);
             let term = core::ptr::addr_of_mut!((*slot).terminator);
@@ -457,15 +464,18 @@ pub unsafe fn set_rsp0(stack_top: u64)
 {
     let tss_ptr: u64;
     // SAFETY: gs:[32] == PerCpuData::tss_ptr (PERCPU_TSS_PTR_OFFSET=32); valid
-    // after percpu::init_bsp() / init_ap() sets GS-base and tss_ptr. TSS pointer
-    // is valid and aligned; accessed at ring 0 with interrupts disabled during
-    // context switch or from single-threaded boot context.
+    // after percpu::init_bsp() / init_ap() sets GS-base and tss_ptr.
     unsafe {
         core::arch::asm!(
             "mov {}, gs:[32]",
             out(reg) tss_ptr,
             options(nostack, readonly, preserves_flags),
         );
+    }
+    // SAFETY: tss_ptr is this CPU's TSS, valid and aligned; accessed at ring 0
+    // with interrupts disabled during context switch or from single-threaded
+    // boot context.
+    unsafe {
         (*(tss_ptr as *mut Tss)).rsp0 = stack_top;
     }
 }
@@ -504,6 +514,10 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // Packed-struct field writes via raw-pointer offsets — packed structs
     // forbid `&mut` to fields that aren't naturally aligned, but raw
     // pointer writes are sound.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of this AP's own TSS slot `tss_ptr_mut`"
+    )]
     // SAFETY: tss_ptr_mut is unaliased; field writes stay within the struct.
     unsafe {
         let tss_inner = core::ptr::addr_of_mut!((*tss_ptr_mut).tss);
@@ -542,17 +556,17 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     debug_assert!(!gdt_base.is_null(), "init_ap: AP_GDT_PTR not initialised");
     // SAFETY: cpu_id < CPU_COUNT asserted; gdt_base slab covers cpu_count entries.
     let gdt_ptr_mut = unsafe { gdt_base.add(cpu_id as usize) };
-    // SAFETY: gdt_ptr_mut is unaliased; writes stay within the array.
-    unsafe {
-        (*gdt_ptr_mut)[0] = 0; // null
-        (*gdt_ptr_mut)[1] = code_desc_64(0); // 0x08 kernel CS
-        (*gdt_ptr_mut)[2] = data_desc_64(0); // 0x10 kernel DS
-        (*gdt_ptr_mut)[3] = data_desc_64(3); // 0x18 user DS
-        (*gdt_ptr_mut)[4] = code_desc_64(3); // 0x20 user CS
-        let (tss_lo, tss_hi) = tss_desc(tss_addr);
-        (*gdt_ptr_mut)[5] = tss_lo; // 0x28 TSS low
-        (*gdt_ptr_mut)[6] = tss_hi; // 0x30 TSS high
-    }
+    // SAFETY: gdt_ptr_mut is this AP's slot, unaliased during bringup; the
+    // reference ends before the slot is loaded below.
+    let gdt = unsafe { &mut *gdt_ptr_mut };
+    gdt[0] = 0; // null
+    gdt[1] = code_desc_64(0); // 0x08 kernel CS
+    gdt[2] = data_desc_64(0); // 0x10 kernel DS
+    gdt[3] = data_desc_64(3); // 0x18 user DS
+    gdt[4] = code_desc_64(3); // 0x20 user CS
+    let (tss_lo, tss_hi) = tss_desc(tss_addr);
+    gdt[5] = tss_lo; // 0x28 TSS low
+    gdt[6] = tss_hi; // 0x30 TSS high
 
     let gdt_ptr: *const [u64; 7] = gdt_ptr_mut.cast_const();
 
@@ -656,13 +670,15 @@ unsafe fn current_tss() -> *mut TssWithIopb
 #[cfg(not(test))]
 unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::AtomicU16
 {
+    // SAFETY: caller contract.
+    let field = unsafe { core::ptr::addr_of_mut!((*tss).tss.iopb_offset) };
     // cast_ptr_alignment: `TssWithIopb` is `align(2)` and `iopb_offset` sits
     // at an even offset, so the field is 2-byte aligned.
     #[allow(clippy::cast_ptr_alignment)]
-    // SAFETY: caller contract; the field is a naturally aligned u16 (above),
-    // and every access to it after boot goes through this atomic view.
+    // SAFETY: the field is live (caller contract) and a naturally aligned u16
+    // (above), and every access to it after boot goes through this atomic view.
     unsafe {
-        &*core::ptr::addr_of_mut!((*tss).tss.iopb_offset).cast::<core::sync::atomic::AtomicU16>()
+        &*field.cast::<core::sync::atomic::AtomicU16>()
     }
 }
 
@@ -689,10 +705,11 @@ pub unsafe fn load_iopb(iopb: Option<&ThreadIopb>)
 {
     // SAFETY: caller contract.
     let tss = unsafe { current_tss() };
-    // SAFETY: tss points to the current CPU's TssWithIopb; interrupts disabled
-    // by caller, so this CPU does not reload it concurrently; other CPUs only
-    // store `iopb_offset`, atomically.
-    let tss_iopb = unsafe { &mut *core::ptr::addr_of_mut!((*tss).iopb) };
+    // SAFETY: tss points to the current CPU's live TssWithIopb (contract).
+    let iopb_ptr = unsafe { core::ptr::addr_of_mut!((*tss).iopb) };
+    // SAFETY: interrupts disabled by caller, so this CPU does not reload the
+    // bitmap concurrently; other CPUs only store `iopb_offset`, atomically.
+    let tss_iopb = unsafe { &mut *iopb_ptr };
     match iopb
     {
         Some(src) =>
@@ -745,9 +762,10 @@ pub fn invalidate_all_iopbs()
     {
         for cpu in 1..AP_TSS_COUNT.load(Ordering::Relaxed)
         {
-            // SAFETY: the slab holds AP_TSS_COUNT live entries for the kernel's
-            // lifetime.
-            unsafe { iopb_offset_of(slab.add(cpu)) }.store(IOPB_OFFSET_INVALID, Ordering::Relaxed);
+            // SAFETY: the slab holds AP_TSS_COUNT entries.
+            let tss = unsafe { slab.add(cpu) };
+            // SAFETY: every slab entry is live for the kernel's lifetime.
+            unsafe { iopb_offset_of(tss) }.store(IOPB_OFFSET_INVALID, Ordering::Relaxed);
         }
     }
     core::sync::atomic::fence(Ordering::SeqCst);
@@ -784,15 +802,30 @@ pub unsafe fn reload_invalidated_iopb() -> bool
     }
     // The bitmap and its pointer are owned by the thread's sched_lock, which
     // the withdrawal walk holds while it rebuilds them.
-    // SAFETY: tcb is the running thread; lock_raw/unlock_raw paired.
-    unsafe {
-        let saved = (*tcb).sched_lock.lock_raw();
-        let iopb = (*tcb).iopb;
-        let reloaded = !iopb.is_null();
-        load_iopb(if reloaded { Some(&*iopb) } else { None });
-        (*tcb).sched_lock.unlock_raw(saved);
-        reloaded
+    // SAFETY: tcb is the running thread, live while it runs.
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: no lock is held (contract); the flags go to the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    // SAFETY: tcb is live, and its sched_lock, held, serialises the pointer
+    // against the withdrawal walk.
+    let iopb = unsafe { (*tcb).iopb };
+    let reloaded = !iopb.is_null();
+    let bitmap = if reloaded
+    {
+        // SAFETY: a non-null iopb is the thread's live bitmap, which no CPU
+        // rebuilds while its sched_lock is held.
+        Some(unsafe { &*iopb })
     }
+    else
+    {
+        None
+    };
+    // SAFETY: interrupts disabled (#GP context and the held lock); GS-base is
+    // valid; the bitmap's parts are not written while the lock is held.
+    unsafe { load_iopb(bitmap) };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+    reloaded
 }
 
 /// Set to 0, permitting them, the bits of the ports in `[base, base + count)`

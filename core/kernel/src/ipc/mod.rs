@@ -20,9 +20,6 @@
 //! waiters share: [`claim_waiter`], [`arm_timed_park`], and
 //! [`interrupt_all_waiters`].
 
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-
 use crate::sched::thread::ThreadControlBlock;
 
 /// FIFO of the threads parked on a notification, event queue, or wait set: a

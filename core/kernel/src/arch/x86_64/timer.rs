@@ -249,13 +249,16 @@ unsafe fn calibrate_apic_timer() -> u64
     // window at the count write instead, and both calibrated rates would read
     // low by that skew.
     // SAFETY: port I/O at ring 0.
-    unsafe {
-        let gate = inb(PIT_GATE);
-        outb(PIT_GATE, gate & 0xFC); // speaker data off; channel 2 gate off
-    }
+    let gate = unsafe { inb(PIT_GATE) };
+    // SAFETY: port I/O at ring 0; the write keeps port 0x61's other bits as read.
+    unsafe { outb(PIT_GATE, gate & 0xFC) }; // speaker data off; channel 2 gate off
 
     // Program PIT channel 2: mode 0 (interrupt on terminal count), binary.
     // Command byte: channel=10 (ch2), access=11 (lo+hi byte), mode=000, BCD=0.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is a step of the one PIT channel 2 programming sequence"
+    )]
     // SAFETY: PIT ports (0x42, 0x43) are standard legacy hardware; ring 0 I/O access.
     unsafe {
         outb(PIT_CMD, 0b1011_0000);
@@ -267,6 +270,9 @@ unsafe fn calibrate_apic_timer() -> u64
     // SAFETY: APIC MMIO registers are valid; single-threaded calibration context.
     unsafe {
         apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
+    }
+    // SAFETY: as for the divide register; the initial count starts the timer.
+    unsafe {
         apic_write(APIC_TIMER_INITIAL, 0xFFFF_FFFF);
     }
 
@@ -275,10 +281,9 @@ unsafe fn calibrate_apic_timer() -> u64
     // measurement window as close to gate-enable as possible.
     let tsc_start = read_tsc();
     // SAFETY: port 0x61 (PIT gate control) is standard legacy hardware; ring 0 I/O access.
-    unsafe {
-        let gate = inb(PIT_GATE);
-        outb(PIT_GATE, gate | 0x01);
-    }
+    let gate = unsafe { inb(PIT_GATE) };
+    // SAFETY: as for the read; the write keeps port 0x61's other bits as read.
+    unsafe { outb(PIT_GATE, gate | 0x01) };
 
     // Spin until PIT output (bit 5 of port 0x61) goes high, bounded in TSC ticks: the TSC is
     // not yet calibrated, but it always reads, and `PIT_POLL_BUDGET_TSC_TICKS` covers the
@@ -360,12 +365,14 @@ pub unsafe fn init(period_us: u64)
         // Configure the LVT for TSC-deadline mode, then arm the first
         // deadline. The divide and initial-count registers are meaningless
         // in this mode and are left untouched.
-        // SAFETY: APIC registers are valid; single-threaded init context;
-        // wrmsr to IA32_TSC_DEADLINE is valid once the LVT mode change is
-        // serialized by the mfence.
+        // SAFETY: APIC registers are valid; single-threaded init context.
         unsafe {
             apic_write(APIC_LVT_TIMER, LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
-            mfence();
+        }
+        mfence();
+        // SAFETY: ring 0; wrmsr to IA32_TSC_DEADLINE is valid once the LVT
+        // mode change is serialized by the mfence.
+        unsafe {
             cpu::write_msr(IA32_TSC_DEADLINE, read_tsc().wrapping_add(period_tsc));
         }
         crate::kprintln!("timer: mode = TSC-deadline");
@@ -379,6 +386,10 @@ pub unsafe fn init(period_us: u64)
         let initial_count = (tps.saturating_mul(period_us) / 1_000_000).max(1);
 
         // Configure APIC timer: periodic mode, vector TIMER_VECTOR.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a register of this CPU's local APIC timer, at a constant offset"
+        )]
         // SAFETY: APIC registers are valid; single-threaded init context.
         unsafe {
             apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
@@ -415,14 +426,20 @@ pub unsafe fn init_ap(period_us: u64)
     if TSC_DEADLINE_MODE.load(Ordering::Relaxed)
     {
         let period_tsc = PERIOD_TSC_TICKS.load(Ordering::Relaxed);
-        // SAFETY: this AP's APIC registers are valid; IDT and timer ISR are
-        // initialized; the mfence serializes the LVT mode change before the
-        // per-core deadline MSR write. Enabling interrupts is safe as the
-        // timer handler is registered.
+        // SAFETY: this AP's APIC registers are valid (LAPIC software-enabled,
+        // caller's contract).
         unsafe {
             apic_write(APIC_LVT_TIMER, LVT_TIMER_TSC_DEADLINE | TIMER_VECTOR as u32);
-            mfence();
+        }
+        mfence();
+        // SAFETY: ring 0; the mfence serializes the LVT mode change before the
+        // per-core deadline MSR write.
+        unsafe {
             cpu::write_msr(IA32_TSC_DEADLINE, read_tsc().wrapping_add(period_tsc));
+        }
+        // SAFETY: IDT and timer ISR are initialized, so enabling interrupts is
+        // safe as the timer handler is registered.
+        unsafe {
             interrupts::enable();
         }
         return;
@@ -436,12 +453,20 @@ pub unsafe fn init_ap(period_us: u64)
         return;
     }
     let initial_count = (tps.saturating_mul(period_us) / 1_000_000).max(1);
-    // SAFETY: APIC MMIO registers are valid; IDT and timer ISR are initialized.
-    // Enabling interrupts is safe as timer handler is registered.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a register of this CPU's local APIC timer, at a constant offset"
+    )]
+    // SAFETY: APIC MMIO registers are valid (LAPIC software-enabled, caller's
+    // contract).
     unsafe {
         apic_write(APIC_TIMER_DIVIDE, DIVIDE_BY_16);
         apic_write(APIC_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);
         apic_write(APIC_TIMER_INITIAL, initial_count as u32);
+    }
+    // SAFETY: IDT and timer ISR are initialized, so enabling interrupts is
+    // safe as the timer handler is registered.
+    unsafe {
         interrupts::enable();
     }
 }

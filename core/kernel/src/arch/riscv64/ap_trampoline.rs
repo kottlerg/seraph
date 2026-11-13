@@ -244,6 +244,11 @@ pub unsafe fn setup_ap_params(
 )
 {
     let base = phys_to_virt(trampoline_pa).wrapping_add(PARAMS_OFFSET as u64) as *mut u64;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a word of the trampoline page's parameter block, at a \
+                  constant offset from its base, through the direct map"
+    )]
     // SAFETY: direct map active; 4 × u64 at offset 0x40 lie within the 4 KiB page.
     unsafe {
         base.add(PARAM_SATP / 8).write_volatile(satp);

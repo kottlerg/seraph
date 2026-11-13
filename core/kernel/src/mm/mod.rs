@@ -10,9 +10,6 @@
 //! is owned by the typed-memory cap surface (`crate::cap::retype`); the
 //! kernel does not run a `GlobalAlloc`.
 
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-
 pub mod address_space;
 pub mod buddy;
 pub mod frame_map;

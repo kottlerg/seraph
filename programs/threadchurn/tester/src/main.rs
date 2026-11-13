@@ -83,6 +83,9 @@ fn run(paging: Paging)
     }
     if !status.success()
     {
-        fail(&format!("fixture{label} exited non-zero: {:?}", status.code()));
+        fail(&format!(
+            "fixture{label} exited non-zero: {:?}",
+            status.code()
+        ));
     }
 }

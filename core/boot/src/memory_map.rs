@@ -63,9 +63,11 @@ impl Iterator for RawDescriptors<'_>
         {
             return None;
         }
-        // cast_possible_truncation: buffer_phys is a UEFI physical address;
-        // on all supported UEFI targets (x86_64, riscv64) usize == u64.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "buffer_phys is a UEFI physical address; on all supported UEFI targets \
+                      (x86_64, riscv64) usize == u64"
+        )]
         let ptr =
             (self.map.buffer_phys as usize).checked_add(self.offset)? as *const EfiMemoryDescriptor;
         self.offset = next_offset;

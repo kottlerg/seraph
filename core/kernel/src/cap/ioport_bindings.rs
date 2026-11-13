@@ -103,7 +103,13 @@ impl IoPortBindings
             // SAFETY: caller contract.
             unsafe { (*part).fill(0xFF) };
         }
-        // SAFETY: caller contract; the fields are plain data.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every write is to a field of `*table`, the writable page the caller's \
+                      contract gives this function"
+        )]
+        // SAFETY: caller contract: `table` points at a writable page that
+        // nothing else references; the fields are plain data.
         unsafe {
             core::ptr::addr_of_mut!((*table).bitmap).write(ThreadIopb { parts });
             core::ptr::addr_of_mut!((*table).funder).write(funder);
@@ -239,24 +245,32 @@ pub unsafe fn withdraw_everywhere(object: usize)
         return;
     }
     let mut changed = false;
+    let withdraw_from = |tcb: *mut crate::sched::thread::ThreadControlBlock| {
+        // SAFETY: `for_each` passes a registered TCB, which cannot be freed
+        // while the visit runs.
+        let sched_lock = unsafe { &(*tcb).sched_lock };
+        // SAFETY: `saved` is passed verbatim to the `unlock_raw` below.
+        let saved = unsafe { sched_lock.lock_raw() };
+        // `iopb` and the table's bytes are owned by this lock; the Thread
+        // arm of dealloc_object nulls the pointer under it before freeing.
+        // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+        // IoPortBindings page (sys_ioport_bind).
+        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: `tcb` is registered, so live; its sched_lock, held, owns
+        // `iopb`.
+        let table = unsafe { (*tcb).iopb.cast::<IoPortBindings>() };
+        // SAFETY: a non-null `iopb` is the thread's live table, and the held
+        // sched_lock excludes every other access to it.
+        if !table.is_null() && unsafe { (*table).withdraw(object) }
+        {
+            changed = true;
+        }
+        // SAFETY: `saved` is the value the `lock_raw` above returned.
+        unsafe { sched_lock.unlock_raw(saved) };
+    };
     // SAFETY: the closure registers nothing and waits on no other CPU; it
     // takes only each thread's sched_lock, ordered after the registry lock.
-    unsafe {
-        crate::sched::thread_registry::for_each(|tcb| {
-            let saved = (*tcb).sched_lock.lock_raw();
-            // `iopb` and the table's bytes are owned by this lock; the Thread
-            // arm of dealloc_object nulls the pointer under it before freeing.
-            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-            // IoPortBindings page (sys_ioport_bind).
-            #[allow(clippy::cast_ptr_alignment)]
-            let table = (*tcb).iopb.cast::<IoPortBindings>();
-            if !table.is_null() && (*table).withdraw(object)
-            {
-                changed = true;
-            }
-            (*tcb).sched_lock.unlock_raw(saved);
-        });
-    }
+    unsafe { crate::sched::thread_registry::for_each(withdraw_from) };
     if changed
     {
         crate::arch::current::gdt::invalidate_all_iopbs();
@@ -279,29 +293,39 @@ pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
     {
         return;
     }
+    let free_bound_table = |tcb: *mut crate::sched::thread::ThreadControlBlock| {
+        // SAFETY: `for_each` passes a registered TCB, which cannot be freed
+        // while the visit runs.
+        if !core::ptr::eq(unsafe { (*tcb).cspace }, cspace)
+        {
+            return;
+        }
+        // SAFETY: as above.
+        let sched_lock = unsafe { &(*tcb).sched_lock };
+        // SAFETY: `saved` is passed verbatim to the `unlock_raw` below.
+        let saved = unsafe { sched_lock.lock_raw() };
+        // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
+        // IoPortBindings page (sys_ioport_bind).
+        #[allow(clippy::cast_ptr_alignment)]
+        // SAFETY: `tcb` is live; its sched_lock, held, owns `iopb`.
+        let table = unsafe { (*tcb).iopb.cast::<IoPortBindings>() };
+        // SAFETY: as above; the table is detached under the lock a bind
+        // installs it and the Thread arm of dealloc_object frees it under.
+        unsafe { (*tcb).iopb = core::ptr::null_mut() };
+        if !table.is_null()
+        {
+            // SAFETY: the table came from `alloc_port_binding_table` and is
+            // detached, so nothing references it. The thread is stopped and
+            // off every CPU, so no TSS load reads the table; its funder, the
+            // dying CSpace, is live.
+            unsafe { crate::cap::object::free_port_binding_table(table) };
+        }
+        // SAFETY: `saved` is the value the `lock_raw` above returned.
+        unsafe { sched_lock.unlock_raw(saved) };
+    };
     // SAFETY: the closure takes only each thread's sched_lock, ordered after
     // the registry lock, and the pool lock inside it; it waits on no other CPU.
-    unsafe {
-        crate::sched::thread_registry::for_each(|tcb| {
-            if !core::ptr::eq((*tcb).cspace, cspace)
-            {
-                return;
-            }
-            let saved = (*tcb).sched_lock.lock_raw();
-            // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-            // IoPortBindings page (sys_ioport_bind).
-            #[allow(clippy::cast_ptr_alignment)]
-            let table = (*tcb).iopb.cast::<IoPortBindings>();
-            (*tcb).iopb = core::ptr::null_mut();
-            if !table.is_null()
-            {
-                // The thread is stopped and off every CPU, so no TSS load
-                // reads the table; its funder, the dying CSpace, is live.
-                crate::cap::object::free_port_binding_table(table);
-            }
-            (*tcb).sched_lock.unlock_raw(saved);
-        });
-    }
+    unsafe { crate::sched::thread_registry::for_each(free_bound_table) };
 }
 
 #[cfg(test)]
@@ -327,18 +351,22 @@ mod tests
             *p = core::ptr::from_mut(&mut **b);
         }
         let layout = std::alloc::Layout::new::<IoPortBindings>();
-        // SAFETY: a fresh allocation of the table's layout and fresh parts,
-        // initialised in place before use; the parts outlive the table.
-        let table = unsafe {
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "`alloc` returns a block aligned for `layout`, which is the table's own"
-            )]
-            let p = std::alloc::alloc(layout).cast::<IoPortBindings>();
-            assert!(!p.is_null());
-            IoPortBindings::init_in_place(p, parts, 0x5000, [0; TABLE_PAGES]);
-            Box::from_raw(p)
-        };
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "`alloc_zeroed` returns a block aligned for `layout`, which is the table's own"
+        )]
+        // SAFETY: `layout` is the table's own, which has a non-zero size.
+        let p = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<IoPortBindings>();
+        assert!(!p.is_null());
+        // SAFETY: `p` is a fresh allocation of the table's layout and `parts`
+        // are fresh blocks, initialised in place before use; the parts outlive
+        // the table.
+        unsafe { IoPortBindings::init_in_place(p, parts, 0x5000, [0; TABLE_PAGES]) };
+        // SAFETY: `p` came from the global allocator with the table's layout.
+        // The block was zeroed, which is a valid value of every field
+        // (`records` included, which `init_in_place` leaves as it finds it),
+        // and `init_in_place` set the others.
+        let table = unsafe { Box::from_raw(p) };
         Table {
             table,
             _parts: parts_box,

@@ -354,17 +354,24 @@ pub fn sys_irq_msg_alloc(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { release_ref(object) };
         return Err(e);
     }
-    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+    // SAFETY: caller_cspace validated non-null above; it is the running
+    // thread's own CSpace, live while the thread runs.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: caller_cspace is live (as above), and its held lock serialises
+    // the slot freelist and tags.
     let insert_res = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace).insert_cap_slot_and_handle(
+        (*caller_cspace).insert_cap_slot_and_handle(
             CapTag::Interrupt,
             IrqRights::NOTIFY.erase(),
             object,
-        );
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
+        )
     };
+    // SAFETY: caller_cspace is live (as above).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let (new_idx, new_handle) = match insert_res
     {
         Ok(v) => v,
@@ -630,7 +637,9 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
         .as_ptr()
         .cast::<MmioObject>();
     // SAFETY: `mmio_slot` pins the MmioObject for the whole call.
-    let (mmio_phys, mmio_size) = unsafe { ((*mmio_obj).base, (*mmio_obj).size) };
+    let mmio_phys = unsafe { (*mmio_obj).base };
+    // SAFETY: `mmio_slot` pins the MmioObject for the whole call.
+    let mmio_size = unsafe { (*mmio_obj).size };
 
     // Size must be at least one page and page-aligned.
     if mmio_size == 0 || mmio_size & 0xFFF != 0
@@ -690,26 +699,34 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Record the mapping before mapping a page, so the object's teardown
     // finds every page this call maps, including after a partial failure.
-    // SAFETY: `mmio_slot` pins the Mmio object and `as_slot` the address
-    // space for the whole call.
+    // SAFETY: `mmio_slot` pins the Mmio object for the whole call.
+    let mmio = unsafe { &*mmio_obj };
     // A record past the object's inline ones is funded by the caller's CSpace
     // (core/kernel/docs/capability-internals.md § Mmio Mappings).
-    // SAFETY: as above; the caller's own CSpace is live while it runs.
-    unsafe {
-        (*mmio_obj).record_mapping(aso_raw, virt_base, || {
-            crate::cap::object::arena_of(cspace)?.alloc_mmio_spill()
-        })
-    }?;
+    let new_spill = || {
+        // SAFETY: cspace is the caller's own CSpace, live while it runs.
+        unsafe { crate::cap::object::arena_of(cspace) }?.alloc_mmio_spill()
+    };
+    // SAFETY: `as_slot` pins the address space object aso_raw for the whole
+    // call, and `mmio_slot` pins this object; a spill chunk is a fresh one
+    // from the caller's arena.
+    unsafe { mmio.record_mapping(aso_raw, virt_base, new_spill) }?;
 
     // Map each page.
     let virts = (virt_base..virt_end).step_by(PAGE_SIZE);
     let frames = (mmio_phys..mmio_end).step_by(PAGE_SIZE);
     for (virt, phys) in virts.zip(frames)
     {
-        // SAFETY: virt in user range (validated above); phys from a
-        // kernel-provisioned Mmio boot object; aso_raw is valid and wraps
-        // as_ptr.
-        unsafe { (*as_ptr).map_page_pooled(virt, phys, page_flags, grant, &*aso_raw) }
+        // SAFETY: as_ptr is the AddressSpace of the AddressSpaceObject
+        // `as_slot` pins for the call.
+        let aspace = unsafe { &*as_ptr };
+        // SAFETY: aso_raw is the AddressSpaceObject `as_slot` pins for the
+        // call.
+        let aso = unsafe { &*aso_raw };
+        // SAFETY: virt in user range (validated above); phys is a 4 KiB-aligned
+        // frame of a kernel-provisioned Mmio boot object; aso wraps aspace,
+        // both resolved from the same capability.
+        unsafe { aspace.map_page_pooled(virt, phys, page_flags, grant, aso) }
             .map_err(|()| SyscallError::OutOfMemory)?;
     }
 
@@ -821,51 +838,81 @@ pub fn sys_ioport_bind(tf: UserFrame) -> Result<u64, SyscallError>
         // frees their tables, each under the same lock, so a table installed
         // here is one that teardown frees, and its pool is live while it is
         // taken.
-        // SAFETY: target_tcb validated non-null; under its sched_lock, iopb is
-        // null or the bitmap of a live table installed by a bind, and the
-        // thread's cspace is live while the thread is not Exited (above);
-        // lock_raw/unlock_raw paired, interrupts disabled between.
-        let bound = unsafe {
-            let saved = (*target_tcb).sched_lock.lock_raw();
-            let bound = if (*target_tcb).state == crate::sched::thread::ThreadState::Exited
-                || (*target_tcb).cspace.is_null()
+        // SAFETY: target_tcb validated non-null, and `th_slot` pins its
+        // Thread object for the call.
+        let lock = unsafe { &(*target_tcb).sched_lock };
+        // SAFETY: lock_raw pairs with the unlock_raw on each path below;
+        // interrupts stay disabled between.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: target_tcb is live (as above), and its held sched_lock owns
+        // `state`.
+        let exited = unsafe { (*target_tcb).state } == crate::sched::thread::ThreadState::Exited;
+        let bound = if exited || {
+            // SAFETY: target_tcb is live (as above); `cspace` is set at
+            // creation and read-only after it.
+            unsafe { (*target_tcb).cspace }.is_null()
+        }
+        {
+            Err(SyscallError::InvalidCapability)
+        }
+        else
+        {
+            // SAFETY: target_tcb is live (as above), and its held sched_lock
+            // owns `iopb`, which is null or the bitmap of a live table
+            // installed by a bind.
+            let mut table = unsafe { (*target_tcb).iopb }.cast::<IoPortBindings>();
+            if table.is_null()
             {
-                Err(SyscallError::InvalidCapability)
-            }
-            else
-            {
-                let mut table = (*target_tcb).iopb.cast::<IoPortBindings>();
-                if table.is_null()
+                // SAFETY: target_tcb is live (as above); `cspace` is set at
+                // creation and read-only after it.
+                let target_cspace = unsafe { (*target_tcb).cspace };
+                // SAFETY: target_cspace is the bound CSpace of a thread that
+                // is not Exited (checked above) and whose sched_lock is held,
+                // so it stays live while the reference is used.
+                match unsafe { crate::cap::object::arena_of(target_cspace) }
+                    .and_then(crate::cap::object::alloc_port_binding_table)
                 {
-                    match crate::cap::object::arena_of((*target_tcb).cspace)
-                        .and_then(crate::cap::object::alloc_port_binding_table)
+                    Ok(fresh) =>
                     {
-                        Ok(fresh) =>
-                        {
+                        // SAFETY: target_tcb is live (as above), and its held
+                        // sched_lock owns `iopb`.
+                        unsafe {
                             (*target_tcb).iopb = fresh.cast::<crate::arch::current::ThreadIopb>();
-                            table = fresh;
                         }
-                        Err(e) =>
-                        {
-                            (*target_tcb).sched_lock.unlock_raw(saved);
-                            return Err(e);
-                        }
+                        table = fresh;
+                    }
+                    Err(e) =>
+                    {
+                        // SAFETY: target_tcb is live (as above).
+                        let lock = unsafe { &(*target_tcb).sched_lock };
+                        // SAFETY: paired with the lock_raw above.
+                        unsafe { lock.unlock_raw(saved) };
+                        return Err(e);
                     }
                 }
-                let r = (*table)
-                    .bind(port_object, port_base, port_count)
-                    .map_err(|_| SyscallError::QuotaExceeded);
-                // Binding the running thread: reload this CPU's TSS IOPB so in/out
-                // instructions work without a context switch.
-                if r.is_ok() && target_tcb == caller_tcb
-                {
-                    gdt::load_iopb(Some(&(*table).bitmap));
-                }
-                r
-            };
-            (*target_tcb).sched_lock.unlock_raw(saved);
-            bound
+            }
+            // SAFETY: table is the live binding table installed in `iopb`,
+            // whose bytes the held sched_lock owns.
+            let r = unsafe { (*table).bind(port_object, port_base, port_count) }
+                .map_err(|_| SyscallError::QuotaExceeded);
+            // Binding the running thread: reload this CPU's TSS IOPB so in/out
+            // instructions work without a context switch.
+            if r.is_ok() && target_tcb == caller_tcb
+            {
+                // SAFETY: table is live, its bytes owned by the held sched_lock.
+                let bitmap = unsafe { &(*table).bitmap };
+                // SAFETY: interrupts are disabled by the held sched_lock;
+                // syscall context, so GS-base names this CPU's PerCpuData with
+                // its TSS; the bitmap's parts are live and no other CPU writes
+                // them while the thread's sched_lock is held.
+                unsafe { gdt::load_iopb(Some(bitmap)) };
+            }
+            r
         };
+        // SAFETY: target_tcb is live (as above).
+        let lock = unsafe { &(*target_tcb).sched_lock };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
 
         bound?;
         // A target running on another CPU loaded its bitmap before this bind:

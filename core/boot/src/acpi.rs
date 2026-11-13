@@ -90,10 +90,8 @@ fn read_array<const N: usize>(buf: &[u8], off: usize) -> Option<[u8; N]>
 
 /// Read a little-endian u16 at byte `off` within `buf`. Returns 0 on short read.
 ///
-/// Only the RHCT walker below consumes u16 fields; on x86-64 that walker
-/// has no caller, so this helper is dead there (the module is compiled on
-/// every architecture).
-#[allow(dead_code)]
+/// Read by the RHCT walker, the MADT AIA entries (`madt_aia`), and the DMAR
+/// walk in `walk_aperture_seed`, which runs on every architecture.
 pub(crate) fn read_u16(buf: &[u8], off: usize) -> u16
 {
     read_array(buf, off).map_or(0, u16::from_le_bytes)
@@ -349,8 +347,9 @@ pub(crate) unsafe fn parse_vmgenid_paddr(rsdp_addr: u64) -> u64
 //
 // Only the riscv64 arch extractor calls this walker; the module is compiled
 // on every architecture (arch dispatch happens at the caller), so the whole
-// section is dead code on x86-64. The single allow on `parse_hart_caps` covers
-// it: rustc treats an allowed item as live, and with it everything it reaches.
+// section is dead code on x86-64. The one expectation on `parse_hart_caps`
+// covers it: rustc treats an item whose `dead_code` is expected as live, and
+// with it everything it reaches.
 
 // RHCT layout after the 36-byte SDT header:
 //  36: flags(u32)  40: time_base_frequency(u64)
@@ -438,9 +437,14 @@ fn parse_rhct(table: &[u8]) -> (u64, u64)
 /// # Safety
 /// `rsdp_addr` must be zero or the physical address of a valid,
 /// identity-mapped ACPI RSDP whose referenced tables are identity-mapped.
-// dead_code: the only caller is core/boot/src/arch/riscv64/acpi_kernel_mmio.rs;
-// the module is compiled on every arch.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "x86_64",
+    expect(
+        dead_code,
+        reason = "the only caller is core/boot/src/arch/riscv64/acpi_kernel_mmio.rs, so x86-64 \
+                  has none; this module is compiled on every architecture"
+    )
+)]
 pub unsafe fn parse_hart_caps(rsdp_addr: u64) -> (u64, u64)
 {
     // SAFETY: caller contract.
@@ -590,8 +594,10 @@ fn madt_cpu_ids(table: &[u8]) -> impl Iterator<Item = u32> + '_
         //   off+8: hart_id(u64)  off+16: acpi_proc_uid(u32)  …
         MADT_TYPE_RINTC if e.len() >= 20 && read_u32(e, 4) & 0x1 != 0 =>
         {
-            // hart_id from MADT RINTC is u64 but only the lower 32 bits are used.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "hart_id from MADT RINTC is u64 but only the lower 32 bits are used"
+            )]
             let hart_id = read_u64(e, 8) as u32;
             Some(hart_id)
         }
@@ -858,9 +864,11 @@ pub unsafe fn count_aperture_seed(rsdp_addr: u64) -> (usize, usize)
 /// # Safety
 /// `rsdp_addr` must be the physical address of a valid, identity-mapped
 /// ACPI RSDP. A zero `rsdp_addr` returns zero counts without reading.
-// too_many_lines: linear walk over MADT, MCFG, and DMAR with per-entry push dispatch;
-// the cases are flat and inline-local, splitting them loses the walk's shape.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear walk over MADT, MCFG, and DMAR with per-entry push dispatch; the cases are \
+              flat and inline-local, splitting them loses the walk's shape"
+)]
 unsafe fn walk_aperture_seed(
     rsdp_addr: u64,
     out: &mut [MmioAperture],

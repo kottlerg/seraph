@@ -806,15 +806,19 @@ impl CSpace
             {
                 let dir3 =
                     self.root_dir(|cs| &cs.triple, rel / F3, sentinel_dir3(), sentinel_dir2())?;
-                // SAFETY: dir3, then dir2, are the live pages just ensured,
-                // under this CSpace's lock (grow's caller holds it).
-                unsafe {
-                    let dir2 = self.child_dir(
+                // SAFETY: dir3 is the live page just ensured, under this CSpace's lock (grow's
+                // caller holds it).
+                let dir2 = unsafe {
+                    self.child_dir(
                         dir3,
                         (rel / F2) % DIR_FANOUT,
                         sentinel_dir2(),
                         sentinel_dir(),
-                    )?;
+                    )
+                }?;
+                // SAFETY: dir2 is the live page just ensured, under this CSpace's lock (grow's
+                // caller holds it).
+                unsafe {
                     self.child_dir(
                         dir2,
                         (rel / DIR_FANOUT) % DIR_FANOUT,
@@ -1041,10 +1045,9 @@ impl CSpace
             let rel = rel & in_range;
             let dir2 = load_at(&self.double, rel / F2, Ordering::Acquire);
             // SAFETY: see above.
-            let page = unsafe {
-                let dir = load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT);
-                load_entry(dir, rel % DIR_FANOUT)
-            };
+            let dir = unsafe { load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT) };
+            // SAFETY: see above.
+            let page = unsafe { load_entry(dir, rel % DIR_FANOUT) };
             nospec::select_ptr(in_range, page, sentinel_leaf())
         }
         else
@@ -1057,11 +1060,11 @@ impl CSpace
             let rel = rel & in_range;
             let dir3 = load_at(&self.triple, rel / F3, Ordering::Acquire);
             // SAFETY: see above.
-            let page = unsafe {
-                let dir2 = load_entry(dir3, (rel / F2) % DIR_FANOUT);
-                let dir = load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT);
-                load_entry(dir, rel % DIR_FANOUT)
-            };
+            let dir2 = unsafe { load_entry(dir3, (rel / F2) % DIR_FANOUT) };
+            // SAFETY: see above.
+            let dir = unsafe { load_entry(dir2, (rel / DIR_FANOUT) % DIR_FANOUT) };
+            // SAFETY: see above.
+            let page = unsafe { load_entry(dir, rel % DIR_FANOUT) };
             nospec::select_ptr(in_range, page, sentinel_leaf())
         }
     }
@@ -1626,13 +1629,14 @@ impl Drop for CSpace
                         continue;
                     }
                     // SAFETY: see above.
-                    unsafe {
-                        for e in &(*dir3).entries
-                        {
-                            free_dir_level2(e.swap(sentinel_dir2(), Ordering::AcqRel));
-                        }
-                        drop(Box::from_raw(dir3));
+                    let entries = unsafe { &(*dir3).entries };
+                    for e in entries
+                    {
+                        // SAFETY: see above.
+                        unsafe { free_dir_level2(e.swap(sentinel_dir2(), Ordering::AcqRel)) };
                     }
+                    // SAFETY: see above.
+                    drop(unsafe { Box::from_raw(dir3) });
                 }
             }
         }
@@ -1652,18 +1656,22 @@ unsafe fn free_dir_leaves(dir: *mut DirLeaves)
     {
         return;
     }
-    // SAFETY: the caller's contract.
-    unsafe {
-        for leaf in &(*dir).entries
+    // SAFETY: the caller's contract: `dir` came from `Box::into_raw` and is owned by the dropping
+    // `CSpace`.
+    let entries = unsafe { &(*dir).entries };
+    for leaf in entries
+    {
+        let p = leaf.swap(sentinel_leaf(), Ordering::AcqRel);
+        if p != sentinel_leaf()
         {
-            let p = leaf.swap(sentinel_leaf(), Ordering::AcqRel);
-            if p != sentinel_leaf()
-            {
-                drop(Box::from_raw(p));
-            }
+            // SAFETY: the caller's contract: every non-sentinel entry came from `Box::into_raw`
+            // and is owned by the dropping `CSpace`.
+            drop(unsafe { Box::from_raw(p) });
         }
-        drop(Box::from_raw(dir));
     }
+    // SAFETY: the caller's contract: `dir` came from `Box::into_raw` and is owned by the dropping
+    // `CSpace`; its entries are freed above.
+    drop(unsafe { Box::from_raw(dir) });
 }
 
 /// Host-test heap reclaim of a level-2 directory page and everything under
@@ -1678,14 +1686,18 @@ unsafe fn free_dir_level2(dir: *mut DirLevel2)
     {
         return;
     }
-    // SAFETY: the caller's contract.
-    unsafe {
-        for e in &(*dir).entries
-        {
-            free_dir_leaves(e.swap(sentinel_dir(), Ordering::AcqRel));
-        }
-        drop(Box::from_raw(dir));
+    // SAFETY: the caller's contract: `dir` came from `Box::into_raw` and is owned by the dropping
+    // `CSpace`.
+    let entries = unsafe { &(*dir).entries };
+    for e in entries
+    {
+        // SAFETY: the caller's contract: every non-sentinel entry came from `Box::into_raw` and is
+        // owned by the dropping `CSpace`.
+        unsafe { free_dir_leaves(e.swap(sentinel_dir(), Ordering::AcqRel)) };
     }
+    // SAFETY: the caller's contract: `dir` came from `Box::into_raw` and is owned by the dropping
+    // `CSpace`; its entries are freed above.
+    drop(unsafe { Box::from_raw(dir) });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

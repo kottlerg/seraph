@@ -541,10 +541,9 @@ unsafe fn try_alloc_page_block(
                 let remainder = block_end.wrapping_sub(rest_pages.wrapping_mul(p));
                 // SAFETY: remainder is page-aligned and inside the block being
                 // unlinked, which no object occupies.
-                unsafe {
-                    write_u64_at(memory.base, remainder, rest_pages);
-                    write_u64_at(memory.base, node_next_word(remainder), block_next);
-                }
+                unsafe { write_u64_at(memory.base, remainder, rest_pages) };
+                // SAFETY: as above; the next word is at offset remainder+8.
+                unsafe { write_u64_at(memory.base, node_next_word(remainder), block_next) };
                 remainder
             };
             // SAFETY: lock held; prev is the head or a node validated by this
@@ -660,10 +659,9 @@ impl PageCursor
         {
             let head = alloc.page_free_head.load(Ordering::Acquire);
             // SAFETY: caller contract: offset is ours and page-aligned.
-            unsafe {
-                write_u64_at(memory.base, offset, pages);
-                write_u64_at(memory.base, node_next_word(offset), head);
-            }
+            unsafe { write_u64_at(memory.base, offset, pages) };
+            // SAFETY: as above; the next word is at offset+8.
+            unsafe { write_u64_at(memory.base, node_next_word(offset), head) };
             alloc.page_free_head.store(offset, Ordering::Release);
             return;
         }
@@ -693,20 +691,18 @@ impl PageCursor
                     .saturating_add(pages)
                     .saturating_add(after_pages);
                 // SAFETY: prev_off is a node this walk validated; lock held.
-                unsafe {
-                    write_u64_at(memory.base, prev_off, total);
-                    write_u64_at(memory.base, node_next_word(prev_off), after_next);
-                }
+                unsafe { write_u64_at(memory.base, prev_off, total) };
+                // SAFETY: as above; the next word is at offset prev_off+8.
+                unsafe { write_u64_at(memory.base, node_next_word(prev_off), after_next) };
                 self.prev_pages = total;
             }
             _ =>
             {
                 let total = pages.saturating_add(after_pages);
                 // SAFETY: caller contract: offset is ours and page-aligned.
-                unsafe {
-                    write_u64_at(memory.base, offset, total);
-                    write_u64_at(memory.base, node_next_word(offset), after_next);
-                }
+                unsafe { write_u64_at(memory.base, offset, total) };
+                // SAFETY: as above; the next word is at offset+8.
+                unsafe { write_u64_at(memory.base, node_next_word(offset), after_next) };
                 // SAFETY: lock held; prev is the head or a validated node.
                 unsafe { set_page_link(alloc, memory, &self.prev, offset) };
                 self.prev = PagePrev::InCap(offset);

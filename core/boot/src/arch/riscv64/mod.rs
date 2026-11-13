@@ -26,13 +26,13 @@ pub mod serial;
 pub use handoff::{perform_handoff, trampoline_page_range};
 pub use paging::{BootPageTable, negotiate_paging};
 
-use crate::elf::EM_RISCV;
 use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
 use crate::uefi::{
     EFI_SUCCESS, EfiBootServices, EfiGuid, EfiStatus, EfiSystemTable, allocate_pages,
 };
 use boot_protocol::KernelMmio;
+use elf::EM_RISCV;
 
 /// `EFI_RISCV_BOOT_PROTOCOL_GUID`
 /// `{CCD15FEC-6F73-4EEC-8395-3E69E4B940BF}`
@@ -181,7 +181,11 @@ pub unsafe fn discover_boot_hart_id(st: *mut EfiSystemTable) -> u64
 /// already obtained via [`discover_boot_hart_id`]. Hart IDs are `u64` in
 /// the SBI ABI but fit in `u32` for every platform Seraph targets; the
 /// lower 32 bits are taken.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "hart IDs are u64 in the SBI ABI but fit in u32 for every platform Seraph targets; \
+              the lower 32 bits are taken"
+)]
 pub fn bsp_hardware_id(boot_hart_id: u64) -> u32
 {
     boot_hart_id as u32

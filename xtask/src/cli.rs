@@ -44,7 +44,8 @@ pub enum CliCommand
     /// Remove the sysroot (and optionally cargo target/).
     Clean(CleanArgs),
 
-    /// Run Seraph unit tests on the host.
+    /// Lint the test code, then run Seraph unit tests on the host and, built
+    /// for riscv64, under QEMU's user-mode emulator (see xtask/README.md).
     Test(TestArgs),
 
     /// Launch N QEMU instances in parallel against an already-built image,

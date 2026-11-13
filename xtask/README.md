@@ -355,7 +355,7 @@ cargo xtask clean [--all]
 
 ### `cargo xtask test`
 
-Lint the test code, then run Seraph unit tests on the host target.
+Lint the test code, then run Seraph unit tests on the host target and under riscv64 emulation.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
@@ -370,6 +370,15 @@ names, as [docs/coding-standards.md](../docs/coding-standards.md) § Clippy stat
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
+
+Then the tests of the selected packages, the host-only `xtask` and `seraph-wrapper-shim` left
+out (`HOST_ONLY`), build for `riscv64gc-unknown-linux-gnu` with `std` from source, link with
+`riscv64-linux-gnu-gcc`, and run under QEMU's user-mode emulator
+(`qemu-riscv64 -L /usr/riscv64-linux-gnu`), so a test gated on riscv64 runs on an x86_64 host.
+That build uses an unwinding `dev` profile (`CARGO_PROFILE_DEV_PANIC=unwind`), since the test
+harness cannot link with a `std` built for `panic=abort`. The command fails, naming the packages
+to install, when the emulator, the cross compiler or its C library is missing
+([docs/build-system.md](../docs/build-system.md) § Toolchain).
 
 ---
 

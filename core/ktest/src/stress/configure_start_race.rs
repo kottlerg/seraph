@@ -258,7 +258,9 @@ fn stack_top(index: usize) -> Result<u64, &'static str>
     // threads; stress tests run sequentially, and every thread on them
     // exits or is deleted before this test returns. Only the address is
     // taken here.
-    ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index)
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only
+    // through `addr_of!`.
+    unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index) }
 }
 
 /// Create the helper in ktest's own `CSpace` (so the round handles the

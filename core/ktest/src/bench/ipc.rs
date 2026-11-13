@@ -138,7 +138,8 @@ fn run_round_trips(
             },
         )
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_IPC_STACK));
+    // SAFETY: `BENCH_IPC_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_IPC_STACK)) };
 
     // SAFETY: the stack is `BENCH_IPC_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).

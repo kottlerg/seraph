@@ -13,8 +13,10 @@ font = { workspace = true }
 syscall = { workspace = true }
 text = { workspace = true }
 
-# Only the riscv64 interrupt controller orders its MMIO through `mmio`.
-[target.'cfg(target_arch = "riscv64")'.dependencies]
+# Only the riscv64 interrupt controller (`arch/riscv64/aia.rs`) orders its MMIO
+# through `mmio`. The host tests compile that module out, so the dependency is
+# the bare-metal kernel's alone (`target_os = "none"`, the kernel targets').
+[target.'cfg(all(target_arch = "riscv64", target_os = "none"))'.dependencies]
 mmio = { workspace = true }
 
 [[bin]]

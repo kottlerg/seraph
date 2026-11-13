@@ -178,7 +178,8 @@ fn run_children(
 {
     let spinner_done = cap_copy(done, spinner.cs, RIGHTS_NOTIFY)
         .map_err(|_| "idle_pull_starved_ready: cap_copy spinner_done failed")?;
-    let spinner_stack = ChildStack::top(core::ptr::addr_of!(SPINNER_STACK));
+    // SAFETY: `SPINNER_STACK` is a static stack, reached only through `addr_of!`.
+    let spinner_stack = unsafe { ChildStack::top(core::ptr::addr_of!(SPINNER_STACK)) };
     // SAFETY: the stack is `SPINNER_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -229,7 +230,8 @@ fn pull_round(
         .map_err(|_| "idle_pull_starved_ready: spawn::new_child_at (low) failed")?;
     let low_done = cap_copy(done, low.cs, RIGHTS_NOTIFY)
         .map_err(|_| "idle_pull_starved_ready: cap_copy low_done failed")?;
-    let low_stack = ChildStack::top(core::ptr::addr_of!(LOW_STACK));
+    // SAFETY: `LOW_STACK` is a static stack, reached only through `addr_of!`.
+    let low_stack = unsafe { ChildStack::top(core::ptr::addr_of!(LOW_STACK)) };
     // SAFETY: the stack is `LOW_STACK`, this test's own `ChildStack`, on which
     // no other live thread runs (`ChildStack`'s rule): the previous round's
     // child has exited and been deleted.

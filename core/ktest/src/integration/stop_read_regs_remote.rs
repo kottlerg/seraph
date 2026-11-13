@@ -124,7 +124,8 @@ fn scenario(ctx: &TestContext) -> TestResult
     }
     let child = spawn::new_child(ctx)
         .map_err(|_| "integration::stop_read_regs_remote: spawn::new_child failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     let ran =
@@ -215,7 +216,8 @@ fn redirect(child: &SpawnedChild, round: u32) -> TestResult
     }
     ROUND.store(round, Ordering::Release);
     let target = redirected_entry as *const () as u64;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top)?;
     // SAFETY: `redirect_to_entry_at` pointed the frame at `redirected_entry`,
     // an `extern "C"` entry that never returns and needs nothing of the

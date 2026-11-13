@@ -466,7 +466,8 @@ fn run_case(ctx: &TestContext, spec: &Spec, page: u64) -> TestResult
             },
         )
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CALLER_STACK));
+    // SAFETY: `CALLER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CALLER_STACK)) };
     // SAFETY: the stack is `CALLER_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(caller, caller_entry, stack_top, arg) }
@@ -620,7 +621,8 @@ fn start_helper(ctx: &TestContext) -> Result<crate::spawn::SpawnedChild, &'stati
     let c_park = cap_copy(park, helper.cs, RIGHTS_ALL);
     cap_delete(park).ok();
     let c_park = c_park.map_err(|_| "fault_syscall_buffer: cap_copy(park) failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(HELPER_STACK));
+    // SAFETY: `HELPER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(HELPER_STACK)) };
     // SAFETY: the stack is `HELPER_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&helper, helper_entry, stack_top, c_park) }

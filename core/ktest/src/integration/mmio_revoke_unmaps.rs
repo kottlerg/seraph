@@ -90,7 +90,8 @@ fn check(ctx: &TestContext, held: u64) -> TestResult
         cap_delete(granted).ok();
         Err(why)
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     READS.store(0, Ordering::Relaxed);
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
     let started = if cpus >= 2

@@ -236,7 +236,8 @@ fn race(ctx: &TestContext, authority: u64) -> TestResult
     QUIT.store(0, Ordering::Release);
     let injector = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
         .map_err(|_| "stress::msg_inject_delete_race: create injector failed")?;
-    let top = ChildStack::top(core::ptr::addr_of!(INJECTOR_STACK));
+    // SAFETY: `INJECTOR_STACK` is a static stack, reached only through `addr_of!`.
+    let top = unsafe { ChildStack::top(core::ptr::addr_of!(INJECTOR_STACK)) };
     // SAFETY: `injector_entry` is an `extern "C" fn(u64) -> !` and
     // `INJECTOR_STACK` is this injector's own stack for its lifetime.
     let started = unsafe { thread_configure(injector, injector_entry as *const () as u64, top, 0) }

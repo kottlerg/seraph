@@ -159,7 +159,9 @@ fn start_mappers(ctx: &TestContext, done: u64, mappers: &mut Mappers) -> TestRes
         va_slot.store(child_va(i)?, core::sync::atomic::Ordering::Release);
 
         // Each child uses a distinct stack index.
-        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack_top =
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(child, mapper_entry, stack_top, arg) }

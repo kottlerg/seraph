@@ -1727,18 +1727,13 @@ fn probe_worker(ctx: &TestContext, frame: u64) -> Result<Measured, &'static str>
             .map_err(|_| "retype::pool_latency: create the worker failed")?,
         cs: 0,
     };
+    // SAFETY: `LAT_STACK` is a static stack, reached only through `addr_of!`.
+    let lat_stack = unsafe { crate::ChildStack::top(core::ptr::addr_of!(LAT_STACK)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
     // `LAT_STACK` is this test's own stack, on which no other live thread runs
     // (the cases run one at a time and reap the worker before returning).
-    unsafe {
-        thread_configure(
-            worker.th,
-            latency_worker as *const () as u64,
-            crate::ChildStack::top(core::ptr::addr_of!(LAT_STACK)),
-            0,
-        )
-    }
-    .map_err(|_| "retype::pool_latency: configure the worker failed")?;
+    unsafe { thread_configure(worker.th, latency_worker as *const () as u64, lat_stack, 0) }
+        .map_err(|_| "retype::pool_latency: configure the worker failed")?;
     thread_set_affinity(worker.th, WORKER_CPU)
         .map_err(|_| "retype::pool_latency: pin the worker failed")?;
     thread_start(worker.th).map_err(|_| "retype::pool_latency: start the worker failed")?;

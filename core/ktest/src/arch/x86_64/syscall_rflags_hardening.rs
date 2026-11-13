@@ -193,7 +193,9 @@ fn getrandom_with_ac_set(dst: &mut [u8]) -> (i64, u64)
 ///
 /// # Safety
 /// `stack` must point at a `ChildStack` no other live thread runs on (the
-/// contract of `spawn::configure_and_start`).
+/// contract of `spawn::configure_and_start`), and meet `ChildStack::top`'s
+/// contract: a static stack, reached through `addr_of!` and never a
+/// reference.
 unsafe fn run_child(
     ctx: &TestContext,
     entry: extern "C" fn(u64) -> !,
@@ -202,13 +204,13 @@ unsafe fn run_child(
 {
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "syscall_rflags_hardening: spawn::new_child failed")?;
+    // SAFETY: the caller's contract makes `stack` a static stack no
+    // reference covers.
+    let stack_top = unsafe { ChildStack::top(stack) };
     // SAFETY: the caller's contract dedicates `stack` to this child.
-    let reason =
-        unsafe { crate::spawn::configure_and_start(&child, entry, ChildStack::top(stack), 0) }
-            .map_err(|_| "syscall_rflags_hardening: configure_and_start failed")
-            .and_then(|()| {
-                crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS))
-            });
+    let reason = unsafe { crate::spawn::configure_and_start(&child, entry, stack_top, 0) }
+        .map_err(|_| "syscall_rflags_hardening: configure_and_start failed")
+        .and_then(|()| crate::spawn::wait_until_exited(child.th, crate::scaled_polls(MAX_POLLS)));
     child.delete_thread().ok();
     child.delete_cspace().ok();
     reason

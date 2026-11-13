@@ -165,7 +165,8 @@ fn spawn_children(
             waker_entry
         };
         // element i is this child's alone (see STACKS).
-        let top = SmallStack::top_at(core::ptr::addr_of!(STACKS), i)
+        // SAFETY: `STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let top = unsafe { SmallStack::top_at(core::ptr::addr_of!(STACKS), i) }
             .map_err(|_| "stress::sleep_list_wide: stack index out of range")?;
         // SAFETY: `top` tops `STACKS[i]`, this child's own stack, on
         // which no other live thread runs.

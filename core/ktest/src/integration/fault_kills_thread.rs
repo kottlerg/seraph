@@ -46,7 +46,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "integration::fault_kills_thread: spawn::new_child failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, fault_child, stack_top, 0) }

@@ -125,7 +125,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p1 done failed")?;
     let arg = publish_client_args(c_ep, c_done, BIT_P1_READY, BIT_P1_OK, BIT_P1_BAD);
     // Phase 1's client is the sole user of CLIENT_STACK until reaped.
-    let stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
+    // SAFETY: `CLIENT_STACK` is a static stack, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top(core::ptr::addr_of!(CLIENT_STACK)) };
     // SAFETY: the stack is `CLIENT_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(&client, client_entry, stack, arg) }
@@ -177,7 +178,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         )
     };
     // Phase 2's server is the sole user of SERVER_STACK.
-    let s_stack = ChildStack::top(core::ptr::addr_of!(SERVER_STACK));
+    // SAFETY: `SERVER_STACK` is a static stack, reached only through `addr_of!`.
+    let s_stack = unsafe { ChildStack::top(core::ptr::addr_of!(SERVER_STACK)) };
     // SAFETY: the stack is `SERVER_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(&server, server_entry, s_stack, s_arg) }
@@ -191,7 +193,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "integration::ipc_call_interrupted_stop_start: cap_copy p2 done failed")?;
     let c2_arg = publish_client_args(p2c_ep, p2c_done, 0, BIT_P2_OK, BIT_P2_BAD);
     // Phase 1's client was reaped above; CLIENT_STACK is free again.
-    let c2_stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
+    // SAFETY: `CLIENT_STACK` is a static stack, reached only through `addr_of!`.
+    let c2_stack = unsafe { ChildStack::top(core::ptr::addr_of!(CLIENT_STACK)) };
     // SAFETY: the stack is `CLIENT_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(&client2, client_entry, c2_stack, c2_arg) }

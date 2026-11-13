@@ -160,7 +160,8 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg) }
@@ -236,7 +237,8 @@ pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
+    // SAFETY: `RECV_BLOCKS_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK)) };
     // SAFETY: the stack is `RECV_BLOCKS_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, queued_caller_entry, stack_top, child_arg) }
@@ -352,7 +354,8 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK));
+    // SAFETY: `DATA_WORDS_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(DATA_WORDS_STACK)) };
     // SAFETY: the stack is `DATA_WORDS_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, data_caller_entry, stack_top, child_arg) }
@@ -435,7 +438,8 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CAP_XFER_STACK));
+    // SAFETY: `CAP_XFER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CAP_XFER_STACK)) };
     // SAFETY: the stack is `CAP_XFER_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -525,7 +529,8 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(BADGE_STACK));
+    // SAFETY: `BADGE_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BADGE_STACK)) };
     // SAFETY: the stack is `BADGE_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, badge_caller_entry, stack_top, child_arg) }
@@ -592,7 +597,8 @@ pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
     };
 
     // Reuse the caller_entry (sends 0xCAFE, expects reply 0xBEEF).
-    let stack_top = ChildStack::top(core::ptr::addr_of!(UNBADGED_STACK));
+    // SAFETY: `UNBADGED_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(UNBADGED_STACK)) };
     // SAFETY: the stack is `UNBADGED_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, caller_entry, stack_top, child_arg) }
@@ -894,7 +900,8 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK));
+    // SAFETY: `SNAPSHOT_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(SNAPSHOT_STACK)) };
     // SAFETY: the stack is `SNAPSHOT_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1065,7 +1072,8 @@ pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestRes
         th: child_th,
         cs: child_cs,
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK));
+    // SAFETY: `REPLY_OOM_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(REPLY_OOM_STACK)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).
@@ -1362,7 +1370,8 @@ pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
             },
         )
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(DUP_REPLY_STACK));
+    // SAFETY: `DUP_REPLY_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(DUP_REPLY_STACK)) };
     // SAFETY: the stack is `DUP_REPLY_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1505,7 +1514,8 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
             },
         )
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_REPLY_STACK));
+    // SAFETY: `STALE_REPLY_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STALE_REPLY_STACK)) };
     // SAFETY: the stack is `STALE_REPLY_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1592,7 +1602,8 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
         )
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(FOUR_CAPS_STACK));
+    // SAFETY: `FOUR_CAPS_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(FOUR_CAPS_STACK)) };
     // SAFETY: the stack is `FOUR_CAPS_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1793,6 +1804,8 @@ fn recv_reserve_drive(threads: [u64; 2], args: [u64; 2], reports: [u64; 2]) -> T
     let [victim_th, caller_th] = threads;
     let [victim_arg, caller_arg] = args;
     let [result, done] = reports;
+    // SAFETY: `RECV_RESERVE_VICTIM_STACK` is a static stack, reached only through `addr_of!`.
+    let victim_stack = unsafe { ChildStack::top(core::ptr::addr_of!(RECV_RESERVE_VICTIM_STACK)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
     // the stack is `RECV_RESERVE_VICTIM_STACK`, the victim's own, on which no
     // other live thread runs (`ChildStack`'s rule).
@@ -1800,10 +1813,12 @@ fn recv_reserve_drive(threads: [u64; 2], args: [u64; 2], reports: [u64; 2]) -> T
         crate::spawn::configure_and_start_thread(
             victim_th,
             recv_reserve_victim_entry,
-            ChildStack::top(core::ptr::addr_of!(RECV_RESERVE_VICTIM_STACK)),
+            victim_stack,
             victim_arg,
         )?;
     }
+    // SAFETY: `RECV_RESERVE_CALLER_STACK` is a static stack, reached only through `addr_of!`.
+    let caller_stack = unsafe { ChildStack::top(core::ptr::addr_of!(RECV_RESERVE_CALLER_STACK)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
     // the stack is `RECV_RESERVE_CALLER_STACK`, the caller's own, on which no
     // other live thread runs (`ChildStack`'s rule).
@@ -1811,7 +1826,7 @@ fn recv_reserve_drive(threads: [u64; 2], args: [u64; 2], reports: [u64; 2]) -> T
         crate::spawn::configure_and_start_thread(
             caller_th,
             recv_reserve_caller_entry,
-            ChildStack::top(core::ptr::addr_of!(RECV_RESERVE_CALLER_STACK)),
+            caller_stack,
             caller_arg,
         )?;
     }
@@ -2055,7 +2070,8 @@ fn start_wait_child(
             },
         )
     };
-    let stack_top = ChildStack::top_at(core::ptr::addr_of!(WAIT_STACKS), slot)?;
+    // SAFETY: `WAIT_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top_at(core::ptr::addr_of!(WAIT_STACKS), slot) }?;
     // SAFETY: the stack is `WAIT_STACKS[slot]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, entry, stack_top, arg) }

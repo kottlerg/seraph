@@ -105,7 +105,8 @@ fn body(ctx: &TestContext, parts: &mut Parts) -> TestResult
     RECOVERY_SIG.store(child_sig, Ordering::Release);
     crate::bind_fault_handler(child.th, first, BADGE_FIRST)
         .map_err(|_| "integration::trap_redelivery: bind failed")?;
-    let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, step_child, stack, 0) }

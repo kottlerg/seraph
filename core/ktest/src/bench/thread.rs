@@ -31,7 +31,8 @@ pub(super) fn bench_thread_lifecycle(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_LIFECYCLE_STACK));
+    // SAFETY: `BENCH_LIFECYCLE_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_LIFECYCLE_STACK)) };
 
     let mut min = u64::MAX;
     let mut max = 0u64;
@@ -151,7 +152,8 @@ pub(super) fn bench_context_switch(ctx: &crate::TestContext, iters: u32)
     {
         return;
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_CTXSWITCH_STACK));
+    // SAFETY: `BENCH_CTXSWITCH_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_CTXSWITCH_STACK)) };
     // SAFETY: the stack is `BENCH_CTXSWITCH_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     if unsafe {

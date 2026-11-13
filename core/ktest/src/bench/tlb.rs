@@ -170,7 +170,9 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
         };
         // Bench tier runs sequentially; this is the only use of
         // SHOOTDOWN_STACKS[i].
-        let Ok(stack_top) = ChildStack::top_at(core::ptr::addr_of!(SHOOTDOWN_STACKS), i)
+        // SAFETY: `SHOOTDOWN_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let Ok(stack_top) =
+            (unsafe { ChildStack::top_at(core::ptr::addr_of!(SHOOTDOWN_STACKS), i) })
         else
         {
             child.delete_thread().ok();
@@ -632,7 +634,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
 
         // Bench tier runs sequentially; this is the only use of
         // CONC_STACKS[i].
-        let Ok(stack_top) = ChildStack::top_at(core::ptr::addr_of!(CONC_STACKS), i)
+        // SAFETY: `CONC_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let Ok(stack_top) = (unsafe { ChildStack::top_at(core::ptr::addr_of!(CONC_STACKS), i) })
         else
         {
             child.delete_thread().ok();

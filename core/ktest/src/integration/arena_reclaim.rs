@@ -140,7 +140,8 @@ fn run_bound(ctx: &TestContext, cs: u64, done: u64, entry: extern "C" fn(u64) ->
     let th = cap_create_thread(ctx.memory_base, ctx.aspace_cap, cs, 0, 0)
         .map_err(|_| "integration::arena_reclaim: cap_create_thread failed")?;
     let mut guard = crate::spawn::SpawnedChild { th, cs: 0 };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(SPLITTER_STACK));
+    // SAFETY: `SPLITTER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(SPLITTER_STACK)) };
     // SAFETY: the stack is `SPLITTER_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule): the bound
     // threads run one after the other, each waited for here.

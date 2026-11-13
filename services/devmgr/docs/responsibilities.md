@@ -115,7 +115,8 @@ devmgr's responsibilities are:
   segment, bus, device, function order, and binds each to its most specific
   match: an exact vendor and device key outranks a class key, two equally
   specific matches are a conflict that devmgr logs and binds neither of, and a
-  declaration's instance limit counts the devices bound to it in that order.
+  declaration's instance limit counts the devices bound to a driver of its
+  name in that order.
   A device is bound at most once a boot, so a drivers-directory declaration
   never takes a device a boot module's driver holds. The bind
   (`services/devmgr/src/bind.rs`) gives the driver its own service endpoint

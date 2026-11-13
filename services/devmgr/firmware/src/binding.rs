@@ -317,11 +317,18 @@ impl<T> MatchTable<T>
         }
     }
 
-    /// Count one more device bound to the declaration at `index`; an index
-    /// past the table is ignored.
+    /// Count one more device bound to a driver of the name of the
+    /// declaration at `index`: every declaration of that name advances, since
+    /// an instance limit counts a driver name's devices, not one
+    /// declaration's; an index past the table is ignored.
     pub fn note_bound(&mut self, index: usize)
     {
-        if let Some(candidate) = self.candidates.get_mut(index)
+        let Some(name) = self.candidates.get(index).map(|c| c.decl.name)
+        else
+        {
+            return;
+        };
+        for candidate in self.candidates.iter_mut().filter(|c| c.decl.name == name)
         {
             candidate.bound = candidate.bound.saturating_add(1);
         }
@@ -396,7 +403,12 @@ mod tests
 
     fn decl(matches: &[Match<'_>], limit: Option<u16>) -> DriverDecl
     {
-        decl_with(matches, limit, Tier::Auxiliary, false)
+        named("d", matches, limit)
+    }
+
+    fn named(name: &str, matches: &[Match<'_>], limit: Option<u16>) -> DriverDecl
+    {
+        decl_with(name, matches, limit, Tier::Auxiliary, false)
     }
 
     #[expect(
@@ -404,11 +416,17 @@ mod tests
         reason = "`phys` is the declaration's `phys_access` field, stored in the declaration it \
                   builds"
     )]
-    fn decl_with(matches: &[Match<'_>], limit: Option<u16>, tier: Tier, phys: bool) -> DriverDecl
+    fn decl_with(
+        name: &str,
+        matches: &[Match<'_>],
+        limit: Option<u16>,
+        tier: Tier,
+        phys: bool,
+    ) -> DriverDecl
     {
         decode(
             encode(&Declaration {
-                name: "d",
+                name,
                 class: Some("c"),
                 matches,
                 instance_limit: limit,
@@ -616,7 +634,8 @@ mod tests
             .unwrap();
         let fallback = table
             .add(
-                decl(
+                named(
+                    "fallback",
                     &[Match::PciClass {
                         code: 0x07_0000,
                         mask: 0xFF_0000,
@@ -640,6 +659,47 @@ mod tests
         }
         assert_eq!(chosen, [Choice::Bind(one), Choice::Bind(fallback)]);
         assert_eq!(table.candidates()[one].bound, 1);
+    }
+
+    /// Defect caught: a bind counted only against the declaration chosen, so
+    /// a second declaration of the same limited driver name in one pass
+    /// bound it past its limit.
+    #[test]
+    fn an_instance_limit_counts_every_declaration_of_the_name_in_a_pass()
+    {
+        let mut table = MatchTable::new();
+        let by_id = table
+            .add(
+                decl(
+                    &[Match::PciId {
+                        vendor: 1,
+                        device: 2,
+                    }],
+                    Some(1),
+                ),
+                Source::BootModule,
+                (),
+                0,
+            )
+            .unwrap();
+        let by_class = table
+            .add(
+                decl(
+                    &[Match::PciClass {
+                        code: 0x07_0000,
+                        mask: 0xFF_0000,
+                    }],
+                    Some(1),
+                ),
+                Source::DriversDir,
+                (),
+                0,
+            )
+            .unwrap();
+        assert_eq!(table.choose(&pci(1, 2, 0x07_8000)), Choice::Bind(by_id));
+        table.note_bound(by_id);
+        assert_eq!(table.candidates()[by_class].bound, 1);
+        assert_eq!(table.choose(&pci(3, 4, 0x07_8000)), Choice::Unmatched);
     }
 
     #[test]
@@ -739,7 +799,7 @@ mod tests
     fn the_boot_tier_and_physical_access_are_granted_only_within_the_source_bounds()
     {
         let m = [Match::IommuFamily("dmar")];
-        let boot_phys = decl_with(&m, None, Tier::Boot, true);
+        let boot_phys = decl_with("d", &m, None, Tier::Boot, true);
         assert_eq!(
             grants(&boot_phys, Source::BootModule, true),
             Grants {
@@ -789,7 +849,7 @@ mod tests
             device: 2,
         }];
         // `decl_with` declares class `c`.
-        let declared = decl_with(&m, None, Tier::Auxiliary, false);
+        let declared = decl_with("d", &m, None, Tier::Auxiliary, false);
         let mut classless = declared;
         classless.class = None;
         let mut classes = Classes::<()>::new();

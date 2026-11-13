@@ -9,7 +9,9 @@
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
 //! usable region with an unregistered guard of `process_abi::STACK_GUARD_PAGES`
 //! (4) pages below it, and its main thread's stack grows on demand below the
-//! pages the loader mapped, above a guard of its own. Eight modes, by argv:
+//! pages the loader mapped, above a guard of its own. Spawned pinned (no
+//! pager), its threads get an eager stack instead: the requested pages mapped
+//! at spawn above an unmapped guard of the same four pages. Ten modes, by argv:
 //!
 //!   * `grow` — spawn a worker that recurses deep enough to fault in many
 //!     demand-paged stack pages (but stays inside the usable region), `join`
@@ -54,9 +56,18 @@
 //!     Exits `SUCCESS`.
 //!   * `main-guard` — the main thread recurses unbounded, past its demand
 //!     growth range into the guard below it. Same verdict as `guard`.
+//!   * `eager-grow` — for a pinned run: a worker asking for 16 pages of stack
+//!     recurses about 41 KiB into the eager stack it gets, is joined, and the
+//!     process prints `PASS`. Exits `SUCCESS`.
+//!   * `eager-bigframe` — for a pinned run: `bigframe` with workers asking for
+//!     16 pages of stack and a frame of 23 pages, the eager stack, its guard,
+//!     and 3 pages, whose lowest byte lies in the parked worker's mapped eager
+//!     stack. Same verdict as `guard`; a stack with no guard below it, over
+//!     mapped memory, lets the frame return and the process print
+//!     `SURVIVED (BUG)`.
 //!
-//! Idiomatic `std` only — no direct Seraph cap awareness. The demand-paged
-//! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
+//! Idiomatic `std` only — no direct Seraph cap awareness. The stack
+//! machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
@@ -103,6 +114,24 @@ const GUARD_PAGES: usize = 4;
 /// so the frame's lowest byte lies 3 pages below the guard, near the top of
 /// the stack reserved just below.
 const BIG_FRAME_BYTES: usize = (USABLE_STACK_PAGES + GUARD_PAGES + 3) * 4096;
+
+/// Stack size every `bigframe`, `eager-grow`, and `eager-bigframe` worker
+/// asks for: std's default minimum (`DEFAULT_MIN_STACK_SIZE`), 16 pages. A
+/// demand-paged process raises it to its 512-page demand stack; a process with
+/// no pager maps exactly these pages at spawn, above the same guard.
+const EAGER_STACK_PAGES: usize = 16;
+
+/// `EAGER_STACK_PAGES` in bytes, the size `spawn_worker` asks for.
+const EAGER_STACK_BYTES: usize = EAGER_STACK_PAGES * 4096;
+
+/// `eager-grow` recursion depth: 10 frames of a little over a page, about
+/// 41 KiB, inside the 16-page eager stack with room for the frames above.
+const EAGER_GROW_DEPTH: u64 = 10;
+
+/// `eager-bigframe` frame size: the eager stack, its guard, and 3 pages, so
+/// the frame's lowest byte lies 3 pages below the guard, near the top of the
+/// eager stack reserved just below.
+const EAGER_BIG_FRAME_BYTES: usize = (EAGER_STACK_PAGES + GUARD_PAGES + 3) * 4096;
 
 /// Locals of `split_frame`: with its return-address save, a frame of 6128
 /// bytes, which riscv64 LLVM allocates as 2032 bytes and then 4096, writing
@@ -153,9 +182,17 @@ fn main() -> ExitCode
     {
         guard()
     }
+    else if std::env::args().any(|a| a == "eager-bigframe")
+    {
+        bigframe(eager_big_frame)
+    }
+    else if std::env::args().any(|a| a == "eager-grow")
+    {
+        eager_grow()
+    }
     else if std::env::args().any(|a| a == "bigframe")
     {
-        bigframe()
+        bigframe(big_frame)
     }
     else if std::env::args().any(|a| a == "splitframe")
     {
@@ -244,6 +281,41 @@ fn grow() -> ExitCode
     ExitCode::SUCCESS
 }
 
+/// Spawn `f` on a worker asking for `EAGER_STACK_BYTES` of stack. A refused
+/// spawn prints `spawn failed` and exits with code 4, which no tester
+/// verdict accepts.
+fn spawn_worker<T: Send + 'static>(
+    f: impl FnOnce() -> T + Send + 'static,
+) -> std::thread::JoinHandle<T>
+{
+    match std::thread::Builder::new()
+        .stack_size(EAGER_STACK_BYTES)
+        .spawn(f)
+    {
+        Ok(handle) => handle,
+        Err(e) =>
+        {
+            println!("spawn failed: {e}");
+            let _ = std::io::stdout().flush();
+            std::process::exit(4);
+        }
+    }
+}
+
+fn eager_grow() -> ExitCode
+{
+    let worker = spawn_worker(|| recurse(EAGER_GROW_DEPTH, Direction::Down));
+    let Ok(checksum) = worker.join()
+    else
+    {
+        println!("eager-grow worker panicked");
+        return ExitCode::from(3);
+    };
+    println!("eager-grow checksum {}", std::hint::black_box(checksum));
+    println!("PASS");
+    ExitCode::SUCCESS
+}
+
 fn nested_grow() -> ExitCode
 {
     // The middle thread spawns the recursing one: the grandchild's binding is
@@ -323,7 +395,33 @@ fn big_frame() -> u8
     unsafe { low.read_volatile() }
 }
 
-fn bigframe() -> ExitCode
+/// [`big_frame`] for the eager stack of a process with no pager: write and
+/// read back the lowest byte of an `EAGER_BIG_FRAME_BYTES` frame, leaving the
+/// rest untouched.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the frame is the fixture: `buf`, `EAGER_BIG_FRAME_BYTES` (23 pages), is larger \
+              than a pinned process's 16-page eager thread stack and its guard, so its stack \
+              probes reach the guard"
+)]
+fn eager_big_frame() -> u8
+{
+    let mut buf = std::mem::MaybeUninit::<[u8; EAGER_BIG_FRAME_BYTES]>::uninit();
+    let low = std::hint::black_box(buf.as_mut_ptr()).cast::<u8>();
+    // SAFETY: `low` points to the first byte of this frame's own buffer, valid
+    // for writes.
+    unsafe { low.write_volatile(0x5A) };
+    // SAFETY: `low` points to the first byte of this frame's own buffer, which
+    // the write above initialised, so it is valid for reads.
+    unsafe { low.read_volatile() }
+}
+
+/// Run `frame`, a frame larger than its worker's stack and guard that writes
+/// only its lowest byte, on a worker whose stack the reservation arena places
+/// directly above a parked worker's: `bigframe` with [`big_frame`],
+/// `eager-bigframe` with [`eager_big_frame`].
+fn bigframe(frame: fn() -> u8) -> ExitCode
 {
     println!("about to overflow");
     let _ = std::io::stdout().flush();
@@ -333,15 +431,16 @@ fn bigframe() -> ExitCode
     // until the parked worker runs maps the top of its stack, and the page
     // table covering it, so the big frame's write lands on a page memmgr backs
     // without a fault rather than on a page table this address space has not
-    // funded.
+    // funded. An eager stack is mapped whole at spawn, so for it the wait
+    // changes nothing.
     let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
     let (release, parked) = std::sync::mpsc::channel::<()>();
-    let below = std::thread::spawn(move || {
+    let below = spawn_worker(move || {
         let _ = ready_tx.send(());
         let _ = parked.recv();
     });
     let _ = ready.recv();
-    let worker = std::thread::spawn(big_frame);
+    let worker = spawn_worker(frame);
     // The probes fault on the guard and procmgr tears this process down,
     // so `join` never returns. Reaching past it means the frame skipped the
     // guard — report it loudly.

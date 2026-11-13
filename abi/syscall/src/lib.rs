@@ -454,8 +454,10 @@ pub const CAP_INFO_IRQ_MSG_ADDRESS: u64 = 15;
 
 /// Interrupt only — the message data a device writes with
 /// [`CAP_INFO_IRQ_MSG_ADDRESS`]: on `x86_64` the target vector in fixed
-/// delivery and edge trigger, on riscv64 the interrupt identity in the
-/// target hart's IMSIC file. The same errors as [`CAP_INFO_IRQ_MSG_ADDRESS`].
+/// delivery and edge trigger with interrupt remapping off, and the
+/// remappable format's subhandle, 0, with it on (`SYS_IRQ_REMAP`); on riscv64
+/// the interrupt identity in the target hart's IMSIC file. The same errors as
+/// [`CAP_INFO_IRQ_MSG_ADDRESS`].
 pub const CAP_INFO_IRQ_MSG_DATA: u64 = 16;
 
 /// Interrupt only — the interrupt remapping entry the source the capability
@@ -649,8 +651,7 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
-    /// another thread already waits on).
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
     /// interrupted by an upcall, the object it was blocked on was destroyed,

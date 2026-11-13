@@ -46,8 +46,9 @@
 //! # Modification notes
 //! - Device IRQs need no per-device code here: every device vector
 //!   (`ioapic::DEVICE_VECTOR_BASE..=ioapic::DEVICE_VECTOR_LAST`) has a generated stub
-//!   (`device_irq_stubs`), and `irq_dispatch` maps the vector to the GSI the I/O APIC
-//!   routing assigned it.
+//!   (`device_irq_stubs`), and `irq_dispatch` passes the vector's slot entry in this
+//!   CPU's row (`ioapic::slot_for_vector`) to `irq::dispatch_device_irq`, which names
+//!   an I/O-APIC-routed line, a message-signaled target, or no source.
 //! - To change IST assignments: change the `ist` argument of that vector's
 //!   `set(vector, stub, ist)` call in `init()` and ensure the matching IST stack
 //!   is configured in the TSS. Vector 3 (`#BP`) has no `set` call: `init()`

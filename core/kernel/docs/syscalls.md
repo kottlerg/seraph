@@ -269,8 +269,7 @@ pub enum SyscallError
     QueueFull = -13,
     // -14 retired (`DmaUnsafe`, removed with `SYS_DMA_GRANT`); never reuse.
     /// The target object is not in the required state for this operation
-    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`, or a wait set
-    /// another thread already waits on).
+    /// (e.g. thread not `Stopped` for `read_regs`/`write_regs`).
     InvalidState = -15,
     /// A blocking operation was cancelled: the thread was stopped or
     /// interrupted by an upcall, the object it was blocked on was destroyed,

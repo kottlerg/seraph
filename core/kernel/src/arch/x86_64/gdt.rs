@@ -80,7 +80,10 @@ pub struct Tss
     _ist7: u64,
     _reserved2: u64,
     _reserved3: u16,
-    /// I/O permission bitmap offset (104 = no IOPB).
+    /// I/O permission bitmap offset: [`IOPB_OFFSET_VALID`] (104, the offset of
+    /// `TssWithIopb::iopb`) while this CPU's bitmap is current, which makes the
+    /// bitmap live, and [`IOPB_OFFSET_INVALID`] (past the TSS limit, every
+    /// ring-3 port access denied) after [`invalidate_all_iopbs`].
     pub iopb_offset: u16,
 }
 

@@ -608,6 +608,11 @@ impl Console
     /// interrupt from now on, replacing (and deleting) an earlier one.
     /// Refused when no interrupt is bound, since nothing would signal it,
     /// or when no notification came.
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "the `rx_notify` guard is held over the delete of the replaced cap, so the \
+                  interrupt-service thread never signals a slot that is deleted or reused"
+    )]
     fn register_rx_notify(&mut self, notification: u64) -> IpcMessage
     {
         if !self.interrupts || notification == 0

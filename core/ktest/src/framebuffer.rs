@@ -65,12 +65,10 @@ struct FbState
 fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u64>
 {
     let end = phys.checked_add(size)?;
-    let covering = crate::init_info::descriptors(info).iter().find(|d| {
-        d.cap_type == CapType::Mmio
-            && phys >= d.aux0
-            && d.aux0
-                .checked_add(d.aux1)
-                .is_some_and(|aperture_end| end <= aperture_end)
+    let (covering, aperture_end) = crate::init_info::descriptors(info).iter().find_map(|d| {
+        let aperture_end = d.aux0.checked_add(d.aux1)?;
+        (d.cap_type == CapType::Mmio && phys >= d.aux0 && end <= aperture_end)
+            .then_some((d, aperture_end))
     })?;
 
     let mut cap = covering.slot;
@@ -85,19 +83,18 @@ fn carve_framebuffer_cap(info: &InitInfo, phys: u64, size: u64) -> Option<u64>
         cap = upper;
     }
 
-    // `cap` now starts at `phys`. Split off the framebuffer-sized head and
-    // discard any upper remainder. Any split error is treated as the region
-    // already being exactly `size`, and the cap is used as-is; the error code
-    // is not inspected.
-    match syscall::mmio_split(cap, size)
+    // `cap` now spans `[phys, aperture_end)`. When that is exactly the
+    // framebuffer, use it as-is; otherwise split off the framebuffer-sized
+    // head and discard the upper remainder. A failed split carves nothing:
+    // the caller maps every page of the returned cap, so a cap larger than
+    // `size` would map past the bound it checked.
+    if aperture_end == end
     {
-        Ok((head, rest)) =>
-        {
-            let _ = syscall::cap_delete(rest);
-            Some(head)
-        }
-        Err(_) => Some(cap),
+        return Some(cap);
     }
+    let (head, rest) = syscall::mmio_split(cap, size).ok()?;
+    let _ = syscall::cap_delete(rest);
+    Some(head)
 }
 
 // ── Initialisation ───────────────────────────────────────────────────────────

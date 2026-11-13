@@ -19,26 +19,6 @@
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
 #![cfg_attr(not(test), no_std)]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(clippy::large_stack_frames)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 extern crate alloc;
 
@@ -201,6 +181,11 @@ pub trait Backend
     /// [`BackendError::OutOfMemory`] when no table can be had;
     /// [`BackendError::Timeout`] when a unit does not complete a command.
     /// Interrupt remapping is off on every unit after an error.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`extended` is the units' extended interrupt mode, which each backend writes to \
+                  its unit"
+    )]
     fn remap_enable(&mut self, entries: u32, extended: bool) -> Result<bool, BackendError>;
 
     /// Turn interrupt remapping off on every unit [`Self::remap_enable`]

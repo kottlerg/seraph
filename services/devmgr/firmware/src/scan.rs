@@ -317,6 +317,10 @@ fn probe_bar_registers(cfg: &impl ConfigSpace, dev: &mut PciDevice)
 
 /// Append one BAR to the device's BAR list. At most [`MAX_BARS`] registers
 /// exist, so the list cannot overflow.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`is_mmio` is the BAR's space bit, stored in the BAR list"
+)]
 fn record_bar(dev: &mut PciDevice, bar_idx: u8, phys: u64, size: u64, is_mmio: bool)
 {
     let i = dev.bar_count;

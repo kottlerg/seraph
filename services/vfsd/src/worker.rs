@@ -219,6 +219,10 @@ fn handle_create_from_file(
 }
 
 /// Write a result into a per-request channel and wake the waiter.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`ok` is the result it stores in the channel"
+)]
 fn notification_channel(channel: &Channel, ok: bool)
 {
     let mut st = channel.0.lock().unwrap_or_else(PoisonError::into_inner);

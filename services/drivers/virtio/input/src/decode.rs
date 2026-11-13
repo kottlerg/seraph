@@ -84,6 +84,10 @@ impl ModifierState
         }
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`pressed` is the key state the function records"
+    )]
     fn set_held(&mut self, bit: u8, pressed: bool)
     {
         if pressed
@@ -163,6 +167,10 @@ impl ModifierState
 }
 
 /// Resolve a keycode to a keysym given the current Shift and Caps state.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`shift` and `caps` are the key state the keysym is resolved under"
+)]
 fn keysym_for(code: u16, shift: bool, caps: bool) -> Option<u32>
 {
     // Modifier keys are reported as their own keysym events.

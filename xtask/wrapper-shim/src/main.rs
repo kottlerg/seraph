@@ -38,9 +38,6 @@
 //! - `SERAPH_SHIM_MIRROR_SYSROOT` — absolute path to the seraph
 //!   toolchain mirror's root.
 
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};

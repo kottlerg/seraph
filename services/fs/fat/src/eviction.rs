@@ -203,6 +203,10 @@ fn pop_blocking(state: &EvictionState) -> EvictReq
 /// Log a non-ack release outcome, and whether the worker revoked the page
 /// or found it already cleaned up by the client's release or its open's
 /// release.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`owned` is whether the worker revoked the page, which the line reports"
+)]
 fn log_outcome(req: &EvictReq, outcome: Release, owned: bool)
 {
     let what = match outcome

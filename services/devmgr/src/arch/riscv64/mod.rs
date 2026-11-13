@@ -114,6 +114,11 @@ pub fn carve_io_ports(_caps: &mut DevmgrCaps, _base: u16, _count: u16) -> Option
 /// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
 /// `line`: the APLIC source and the mode its description gives; no
 /// ISA routing exists on riscv64.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`_isa` is the resource descriptor's ISA flag, which riscv64 has no ISA routing to \
+              read"
+)]
 pub fn platform_line(_irq_range: &IrqRangeAllocator, line: u32, mode: u64, _isa: bool)
 -> (u32, u64)
 {

@@ -125,6 +125,11 @@ impl<T> Classes<T>
     ///
     /// # Errors
     /// [`ConfigureError`].
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`boot_only` is the request's boot-only mark, stored on the class, and \
+                  `pass_begun` the registry's pass state, compared to refuse a late mark"
+    )]
     pub fn configure(
         &mut self,
         name: &ClassName,

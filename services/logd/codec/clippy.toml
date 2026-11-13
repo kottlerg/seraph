@@ -3,6 +3,10 @@
 # file restates every setting of the root clippy.toml, with the frame
 # threshold of the stack the crate's code runs on.
 
+# Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
+# that is data carries an `#[expect]` naming the value.
+max-fn-params-bools = 0
+
 # 4096 bytes, a quarter of the smallest stack the crate's code runs on: init
 # links it, and init's threads run on 16 KiB (INIT_STACK_PAGES,
 # abi/init-protocol/src/lib.rs).

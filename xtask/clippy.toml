@@ -3,6 +3,10 @@
 # file restates every setting of the root clippy.toml, with the frame
 # threshold of the stack the host crates' code runs on.
 
+# Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
+# that is data carries an `#[expect]` naming the value.
+max-fn-params-bools = 0
+
 # 524288 bytes, a quarter of the smallest stack the host crates' code runs
 # on: the 2 MiB the Rust standard library gives a spawned thread on the host
 # by default, on which each test also runs (the main thread has 8 MiB).

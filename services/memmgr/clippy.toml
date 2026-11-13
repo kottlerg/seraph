@@ -3,6 +3,10 @@
 # file restates every setting of the root clippy.toml, with the frame
 # threshold of the stack memmgr's code runs on.
 
+# Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
+# that is data carries an `#[expect]` naming the value.
+max-fn-params-bools = 0
+
 # 12288 bytes, a quarter of the 48 KiB stack memmgr declares
 # (`process_abi::stack_pages!(12)`, services/memmgr/src/main.rs), on which
 # all of its code, its free-pool crate's included, runs.

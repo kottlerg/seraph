@@ -112,16 +112,11 @@ pub fn table_frame_bound(levels: usize, ranges: impl IntoIterator<Item = (u64, u
         {
             continue;
         }
-        // A range past the end of the address space maps nothing: `map`
-        // refuses it.
-        let Some((base, span)) = page_span(virt, size)
+        let Some((base, last)) = bound_pages(virt, size)
         else
         {
             continue;
         };
-        // `size` is non-zero, so `span` is at least one page and `last` lies
-        // within the range.
-        let last = base.saturating_add(span.saturating_sub(1));
         // One shift per level below the root: 21, 30, 39, ...
         for shift in (21u32..).step_by(9).take(levels.saturating_sub(1))
         {
@@ -134,6 +129,30 @@ pub fn table_frame_bound(levels: usize, ranges: impl IntoIterator<Item = (u64, u
         }
     }
     frames
+}
+
+/// The first and last page [`table_frame_bound`] counts for a non-empty range
+/// `(virt, size)`: every page `map` maps for it, and every page of its
+/// [`page_span`], which `build_initial_tables` maps for an identity region.
+/// `None` only for a range `map` refuses before it maps a page.
+///
+/// The span's last page holds the range's last byte; it is at or above the
+/// last page `map` walks (`virt` plus `size` rounded up to a page, less a
+/// page), so it bounds both. A range whose last byte is the last of the
+/// address space still has that page, though its rounded-up end, which
+/// `page_span` checks, overflows. When the last byte itself lies past the
+/// end, `page_span` refuses the range (`build_initial_tables` refuses such an
+/// identity region), and the bound counts the pages `map` walks for it.
+fn bound_pages(virt: u64, size: u64) -> Option<(u64, u64)>
+{
+    let base = virt & !PAGE_ALIGN_MASK;
+    if let Some(last_byte) = virt.checked_add(size.checked_sub(1)?)
+    {
+        return Some((base, last_byte & !PAGE_ALIGN_MASK));
+    }
+    let walked = size.checked_add(PAGE_ALIGN_MASK)? & !PAGE_ALIGN_MASK;
+    let last = virt.checked_add(walked.checked_sub(PAGE_ALIGN_MASK + 1)?)?;
+    Some((base, last & !PAGE_ALIGN_MASK))
 }
 
 /// Convert a [`MapError`] to a [`BootError`].
@@ -346,6 +365,25 @@ mod tests
     fn partial_last_page_rounds_up()
     {
         assert_eq!(page_span(0x4000, 0x1001), Some((0x4000, 0x2000)));
+    }
+
+    /// Defect caught: a range that ends at the last page of the address space,
+    /// which `map` maps though its rounded-up end overflows, counted for no
+    /// table, so the builder takes tables the pool holds no room for.
+    #[test]
+    fn a_range_ending_at_the_top_page_is_counted()
+    {
+        let top = [(0xFFFF_FFFF_FFFF_F000, 0x1000)];
+        for levels in [3, 4, 5]
+        {
+            // The root and one table per level below it.
+            assert_eq!(table_frame_bound(levels, top), levels as u64);
+        }
+        // An unaligned range whose last byte is the address space's last.
+        assert_eq!(table_frame_bound(4, [(0xFFFF_FFFF_FFFF_F800, 0x800)]), 4);
+        // A range whose last byte lies past the end: the pages `map` walks,
+        // here the one page holding its start.
+        assert_eq!(table_frame_bound(4, [(0xFFFF_FFFF_FFFF_F800, 0x1000)]), 4);
     }
 
     /// Defect caught: a range running past the end of the address space

@@ -1982,8 +1982,9 @@ fn ingest_pool(boot: &InitBootstrap)
         // Every RAM Memory cap memmgr ingests from init MUST carry the full
         // pool-frame rights ([`POOL_FRAME_RIGHTS`]: WRITE | EXECUTE | RETYPE | PHYS).
         // The kernel stamps these on usable RAM at Phase-7 mint
-        // (`core/kernel/src/cap/mod.rs`), and init's `finalize_memmgr` forwards
-        // caps through `cap_derive(_, RIGHTS_ALL)` which preserves them. If the
+        // (`core/kernel/src/cap/mod.rs`), and init's `finalize_memmgr` moves
+        // each cap into memmgr's CSpace (`cap_move`), which keeps its rights
+        // and leaves memmgr's slot the only one naming it. If the
         // first cap lacks them, memmgr cannot derive the writable/executable
         // inner a consumer needs (nor retype on its behalf) and the pool
         // contract is broken — fail fast at boot rather than surface as an

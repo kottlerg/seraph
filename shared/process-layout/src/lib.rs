@@ -71,7 +71,7 @@ extern crate rustc_std_workspace_core as core;
 #[cfg(feature = "rustc-dep-of-std")]
 use core::prelude::rust_2024::*;
 
-use process_abi::MAX_PROCESS_STACK_PAGES;
+use process_abi::{MAX_PROCESS_STACK_PAGES, STACK_GUARD_PAGES};
 
 /// Page size shared by every layout computation in this crate.
 const PAGE_SIZE: u64 = 4096;
@@ -101,9 +101,10 @@ pub const DEFAULT_IPC_BUFFER_VA: u64 = DEFAULT_MAIN_TLS_VA + MAX_WINDOW_REGION_P
 pub const DEFAULT_PROCESS_INFO_VA: u64 = DEFAULT_IPC_BUFFER_VA + PAGE_SIZE;
 
 /// Default top of the main-thread user stack (degraded fallback).
-/// `stack_pages` pages are mapped immediately below this, with one unmapped
-/// guard page beneath them. The top lies a full stack reservation
-/// (`1 + MAX_PROCESS_STACK_PAGES` pages) above the end of the `ProcessInfo`
+/// `stack_pages` pages are mapped immediately below this, with at least
+/// `STACK_GUARD_PAGES` unmapped guard pages beneath them. The top lies a full
+/// stack reservation (`STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages)
+/// above the end of the `ProcessInfo`
 /// default's region tail (the `ProcessInfo` page and its argv/env region,
 /// [`MAX_WINDOW_REGION_PAGES`] pages), so no accepted stack or argv/env
 /// region reaches another default.
@@ -111,8 +112,9 @@ pub const DEFAULT_STACK_TOP: u64 =
     DEFAULT_PROCESS_INFO_VA + MAX_WINDOW_REGION_PAGES * PAGE_SIZE + STACK_RESERVATION_BYTES;
 
 /// Bytes of the main-thread stack reservation: `MAX_PROCESS_STACK_PAGES`
-/// stack pages and the guard page below them.
-const STACK_RESERVATION_BYTES: u64 = (1 + MAX_PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
+/// stack pages and the `STACK_GUARD_PAGES` guard pages below them.
+const STACK_RESERVATION_BYTES: u64 =
+    (STACK_GUARD_PAGES as u64 + MAX_PROCESS_STACK_PAGES as u64) * PAGE_SIZE;
 
 /// A fixed randomisation window: `2^slots_log2` page-aligned candidate
 /// addresses starting at `base`.
@@ -191,11 +193,11 @@ pub const PROCESS_INFO_WINDOW: VaWindow = VaWindow {
     slots_log2: 21,
 };
 
-/// Window for the main-thread stack **guard page**. The drawn address is the
-/// unmapped guard; the stack top is
-/// `draw + (1 + MAX_PROCESS_STACK_PAGES) * 4096`, so the maximum stack always
-/// fits between the guard and the top with the guard page unmapped below the
-/// stack base.
+/// Window for the main-thread stack **guard**. The drawn address is the lowest
+/// page of the unmapped guard; the stack top is
+/// `draw + (STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES) * 4096`, so the
+/// maximum stack always fits between the guard and the top with the
+/// `STACK_GUARD_PAGES` guard pages unmapped below the stack base.
 pub const STACK_GUARD_WINDOW: VaWindow = VaWindow {
     base: 0x0000_0027_C000_0000,
     slots_log2: 21,
@@ -237,7 +239,8 @@ pub const IMAGE_MAX_SPAN: u64 = image_max_span(FIXED_IMAGE_ZONE_END);
 
 /// Largest region, in pages, hanging off any window draw: the gap each
 /// window's 9 GiB stride leaves after its 8 GiB draw span (1 GiB). It bounds
-/// the main-thread stack reservation (`1 + MAX_PROCESS_STACK_PAGES`), the
+/// the main-thread stack reservation
+/// (`STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES`), the
 /// main-thread TLS block (`PROCESS_MAIN_TLS_MAX_PAGES`), and the `ProcessInfo`
 /// page with its argv/env region (`1 + ARGV_ENV_MAX_PAGES`), which the asserts
 /// below pin to it; all three cost VA only, since a loader maps what the
@@ -388,9 +391,10 @@ pub const fn growth_zones(user_va_top: u64) -> AddressSpaceZones
 // fixed tier. Region ordering and stack-guard gaps then hold for all draws.
 const _: () = {
     // Region tails fit the stride gap they hang into: the stack reservation
-    // (`1 + MAX_PROCESS_STACK_PAGES`, guard page included), the TLS block, and
-    // the `ProcessInfo` page with the argv/env region directly after it.
-    assert!((MAX_PROCESS_STACK_PAGES as u64) < MAX_WINDOW_REGION_PAGES);
+    // (`STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES`, the guard included), the
+    // TLS block, and the `ProcessInfo` page with the argv/env region directly
+    // after it.
+    assert!(STACK_RESERVATION_BYTES <= MAX_WINDOW_REGION_PAGES * PAGE_SIZE);
     assert!(process_abi::PROCESS_MAIN_TLS_MAX_PAGES <= MAX_WINDOW_REGION_PAGES);
     assert!(process_abi::ARGV_ENV_REGION_OFFSET == PAGE_SIZE);
     assert!(process_abi::ARGV_ENV_MAX_PAGES < MAX_WINDOW_REGION_PAGES);
@@ -534,9 +538,10 @@ pub fn choose_process_layout(entropy: Option<&[u8; LAYOUT_ENTROPY_BYTES]>) -> Pr
 /// its `committed_pages` loader-mapped ones.
 ///
 /// Every layout [`choose_process_layout`] returns leaves the
-/// `1 + MAX_PROCESS_STACK_PAGES` pages below `stack_top` to the stack, so a
-/// range of at most `MAX_PROCESS_STACK_PAGES` usable pages keeps at least one
-/// page below it free of every other surface, the guard. `None` when the
+/// `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages below `stack_top` to the
+/// stack, so a range of at most `MAX_PROCESS_STACK_PAGES` usable pages keeps at
+/// least `STACK_GUARD_PAGES` pages below it free of every other surface, the
+/// guard. `None` when the
 /// committed pages already cover `usable_pages`, when `usable_pages` exceeds
 /// `MAX_PROCESS_STACK_PAGES`, or when `stack_top` is not page-aligned or is
 /// lower than the `usable_pages`-page stack's size.
@@ -618,9 +623,16 @@ mod tests
         [0x5A; LAYOUT_ENTROPY_BYTES],
     ];
 
+    /// The main-thread stack reservation the layout must leave below every
+    /// stack top: the largest declarable stack and its whole guard.
+    fn reservation_bytes() -> u64
+    {
+        (u64::from(MAX_PROCESS_STACK_PAGES) + u64::from(STACK_GUARD_PAGES)) * PAGE_SIZE
+    }
+
     fn regions(layout: &ProcessLayout) -> [(u64, u64); 4]
     {
-        let stack_reserve = (1 + u64::from(MAX_PROCESS_STACK_PAGES)) * PAGE_SIZE;
+        let stack_reserve = reservation_bytes();
         [
             (
                 layout.tls_base,
@@ -632,7 +644,7 @@ mod tests
                 layout.process_info_va,
                 (1 + process_abi::ARGV_ENV_MAX_PAGES) * PAGE_SIZE,
             ),
-            // Includes the guard page below the stack base.
+            // Includes the guard pages below the stack base.
             (layout.stack_top - stack_reserve, stack_reserve),
         ]
     }
@@ -685,7 +697,7 @@ mod tests
             assert!(PROCESS_INFO_WINDOW.contains(layout.process_info_va));
             assert!(MAIN_TLS_WINDOW.contains(layout.tls_base));
             assert!(IPC_BUFFER_WINDOW.contains(layout.ipc_buffer_va));
-            let stack_reserve = (1 + u64::from(MAX_PROCESS_STACK_PAGES)) * PAGE_SIZE;
+            let stack_reserve = reservation_bytes();
             assert!(STACK_GUARD_WINDOW.contains(layout.stack_top - stack_reserve));
 
             assert!(layout.stack_top < LAYOUT_VA_CEILING);
@@ -823,12 +835,13 @@ mod tests
     }
 
     // Defect guarded: a growth range that overlaps the committed pages, leaves
-    // a hole below them, or reaches the page below the stack reservation, which
-    // would leave the stack no unregistered guard page.
+    // a hole below them, or reaches into the `STACK_GUARD_PAGES` pages at the
+    // bottom of the stack reservation, which would leave the stack less than
+    // its whole unregistered guard.
     #[test]
     fn main_stack_growth_sits_below_the_commit_inside_the_reservation()
     {
-        let stack_reserve = (1 + u64::from(MAX_PROCESS_STACK_PAGES)) * PAGE_SIZE;
+        let stack_reserve = reservation_bytes();
         let entropies = [
             Some(&PATTERNS[0]),
             Some(&PATTERNS[1]),
@@ -846,8 +859,9 @@ mod tests
                 assert_eq!(pages, usable - committed);
                 assert_eq!(base + pages * PAGE_SIZE, top - committed * PAGE_SIZE);
                 assert_eq!(base % PAGE_SIZE, 0);
-                // The guard page below the range stays inside the reservation.
-                assert!(base - PAGE_SIZE >= top - stack_reserve);
+                // The whole guard below the range stays inside the reservation.
+                let guard = u64::from(STACK_GUARD_PAGES) * PAGE_SIZE;
+                assert!(base - guard >= top - stack_reserve);
             }
         }
     }

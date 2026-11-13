@@ -3,8 +3,8 @@
 
 // programs/stackoverflow/src/main.rs
 
-//! Stack-overflow fixture for the main-thread stack guard page: recursion
-//! without bound until the main thread's stack overflows onto its guard page
+//! Stack-overflow fixture for the main-thread stack guard: recursion
+//! without bound until the main thread's stack overflows onto its guard
 //! and the thread is killed with a page-fault exit reason. The stack it
 //! overflows is described in `programs/stackoverflow/README.md` and
 //! docs/userspace-memory-model.md § Bootstrap Cross-Boundary VAs.
@@ -30,7 +30,7 @@ fn main()
 fn overflow(depth: usize)
 {
     // One full page of stack per frame guarantees that overflow reaches
-    // the guard page in a bounded number of recursions: about one per page
+    // the guard in a bounded number of recursions: about one per page
     // of the `std::os::seraph::DEFAULT_DEMAND_STACK_PAGES` stack, plus one
     // for the guard. `black_box` prevents the optimiser from eliding the
     // buffer or the tail call.

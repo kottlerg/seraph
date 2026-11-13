@@ -7,9 +7,9 @@
 //!
 //! Spawned demand-paged (the system default; no opt-in needed), so threads this
 //! process spawns get a guarded demand-paged stack: a large lazily-grown
-//! usable region with an unregistered guard page below it, and its main thread's
-//! stack grows on demand below the pages the loader mapped, above a guard page
-//! of its own. Six modes, by argv:
+//! usable region with an unregistered guard of `process_abi::STACK_GUARD_PAGES`
+//! (4) pages below it, and its main thread's stack grows on demand below the
+//! pages the loader mapped, above a guard of its own. Eight modes, by argv:
 //!
 //!   * `grow` — spawn a worker that recurses deep enough to fault in many
 //!     demand-paged stack pages (but stays inside the usable region), `join`
@@ -22,7 +22,7 @@
 //!     stack is served, not which thread's binding was copied. Exits
 //!     `SUCCESS`.
 //!   * `guard` — spawn a worker that recurses unbounded, past the usable
-//!     region into the guard page. The pager declines the unregistered fault,
+//!     region into the guard. The pager declines the unregistered fault,
 //!     the kernel kills the worker, and (via the address-space death-observer)
 //!     procmgr tears the whole process down — so this process never exits
 //!     cleanly. If the overflow somehow survives, print `SURVIVED (BUG)` and
@@ -32,15 +32,28 @@
 //!     worker, whose stack the reservation arena places directly above the
 //!     first's, that calls a function whose single frame is larger than its
 //!     whole usable stack and writes only the frame's lowest byte. That byte
-//!     lies past the guard page, near the top of the first worker's
-//!     registered stack, so only the target's stack probes, touching each
-//!     page of the frame in turn, fault on the guard. Same verdict as
-//!     `guard`: the process must be killed.
+//!     lies past the guard, near the top of the first worker's registered
+//!     stack, so only the target's stack probes, touching each page of the
+//!     frame in turn, fault on the guard. Same verdict as `guard`: the
+//!     process must be killed.
+//!   * `splitframe` — the same two workers; the second descends its stack,
+//!     writing every page, to within a page of its usable base, and there
+//!     calls `split_frame`, a frame of 6128 bytes with a return-address save,
+//!     which calls `page_leaf`, a leaf of 4080 bytes of locals that writes
+//!     only its lowest byte. On riscv64 the split prologue and the leaf leave
+//!     about 10 KiB between the save and that byte unwritten, so a guard of
+//!     two pages or fewer lets the byte land in the first worker's stack.
+//!     Same verdict as `guard`.
+//!   * `span` — the same descent, then two stores 14312 bytes apart, the
+//!     largest distance between two consecutive stack stores of the std
+//!     target (`process_abi::STACK_GUARD_PAGES`), so a guard of three pages
+//!     or fewer lets the second land in the first worker's stack. Same
+//!     verdict as `guard`.
 //!   * `main-grow` — the main thread itself recurses as deep as `grow`'s
 //!     worker, far past the pages the loader mapped for it, and prints `PASS`.
 //!     Exits `SUCCESS`.
 //!   * `main-guard` — the main thread recurses unbounded, past its demand
-//!     growth range into the guard page below it. Same verdict as `guard`.
+//!     growth range into the guard below it. Same verdict as `guard`.
 //!
 //! Idiomatic `std` only — no direct Seraph cap awareness. The demand-paged
 //! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
@@ -58,10 +71,53 @@ const FRAME_BYTES: usize = 4096;
 /// main thread's default 8 committed pages.
 const GROW_DEPTH: u64 = 200;
 
-/// `bigframe` frame size: the default 2 MiB (512-page) usable demand stack plus
-/// 4 pages, so the frame's lowest byte lies at least 3 pages below the one
-/// guard page, near the top of the stack reserved just below.
-const BIG_FRAME_BYTES: usize = (512 + 4) * 4096;
+/// Usable pages of a spawned thread's demand stack: std's default 2 MiB
+/// (`DEFAULT_DEMAND_STACK_PAGES`), which every worker here gets.
+const USABLE_STACK_PAGES: usize = 512;
+
+/// Guard pages below a spawned thread's demand stack
+/// (`process_abi::STACK_GUARD_PAGES`).
+const GUARD_PAGES: usize = 4;
+
+/// `bigframe` frame size: the usable demand stack, its guard, and 3 pages,
+/// so the frame's lowest byte lies 3 pages below the guard, near the top of
+/// the stack reserved just below.
+const BIG_FRAME_BYTES: usize = (USABLE_STACK_PAGES + GUARD_PAGES + 3) * 4096;
+
+/// Locals of `split_frame`: with its return-address save, a frame of 6128
+/// bytes, which riscv64 LLVM allocates as 2032 bytes and then 4096, writing
+/// only the save and probing neither part.
+const SPLIT_FRAME_LOCALS: usize = 6112;
+
+/// Locals of `page_leaf`: a leaf frame of 4080 bytes, which riscv64 LLVM
+/// allocates in one adjustment with no probe.
+const LEAF_LOCALS: usize = 4080;
+
+/// The std target's bound on the distance between two consecutive stack
+/// stores: 6120 bytes below a return-address save (a split frame's first
+/// 2032-byte part less the save, and its unprobed 4096), then 8192 below the
+/// callee's entry (a vector frame's probe one page below a page of fixed
+/// locals).
+const STD_STORE_SPAN: usize = 6120 + 8192;
+
+/// Bytes of each frame's buffer in the coarse descent (`descend_pages`).
+const DESCENT_PAGE_BYTES: usize = 4096;
+
+/// Bytes of each frame's buffer in the fine descent (`descend_fine`).
+const DESCENT_FINE_BYTES: usize = 256;
+
+/// The coarse descent hands over to the fine one once its frame's buffer is
+/// less than this far above the usable base: more than a coarse step above
+/// the fine descent's stop.
+const FINE_FROM: usize = 3 * 4096;
+
+/// The fine descent calls the overflow once its frame's buffer is less than
+/// this far above the usable base. Each fine step is less than 512 bytes, so
+/// the overflow's caller sits between about 500 and 1024 bytes above the base:
+/// low enough that each overflow's deeper store passes a guard one page
+/// smaller than the one it needs, and high enough that the overflow's first
+/// writes land in the usable stack, which the dry run checks.
+const FINE_STOP: usize = 1024;
 
 fn main() -> ExitCode
 {
@@ -80,6 +136,14 @@ fn main() -> ExitCode
     else if std::env::args().any(|a| a == "bigframe")
     {
         bigframe()
+    }
+    else if std::env::args().any(|a| a == "splitframe")
+    {
+        over_the_guard(split_frame)
+    }
+    else if std::env::args().any(|a| a == "span")
+    {
+        over_the_guard(span_overflow)
     }
     else if std::env::args().any(|a| a == "nested-grow")
     {
@@ -109,7 +173,7 @@ enum Direction
     /// `nested-grow`, and `main-grow`).
     Down,
     /// Count `depth` up, never reaching the base case at runtime (used by
-    /// `guard` and `main-guard` to overflow into the guard page).
+    /// `guard` and `main-guard` to overflow into the guard).
     Up,
 }
 
@@ -185,9 +249,9 @@ fn guard() -> ExitCode
     let _ = std::io::stdout().flush();
 
     // Count up from 1; the `depth == 0` base case is never reached before the
-    // stack overflows into the guard page.
+    // stack overflows into the guard.
     let worker = std::thread::spawn(|| recurse(1, Direction::Up));
-    // The worker recurses into the guard page and faults; the kernel kills it
+    // The worker recurses into the guard and faults; the kernel kills it
     // and procmgr tears this process down, so `join` never returns. Reaching
     // past it means the guard failed to fault — report it loudly.
     let _ = worker.join();
@@ -223,9 +287,9 @@ fn main_guard() -> ExitCode
 #[inline(never)]
 #[expect(
     clippy::large_stack_frames,
-    reason = "the frame is the fixture: `buf`, `BIG_FRAME_BYTES` (2 MiB and 4 pages), is larger \
-              than the spawned thread's 2 MiB demand stack that holds it, so its stack probes \
-              reach the guard page"
+    reason = "the frame is the fixture: `buf`, `BIG_FRAME_BYTES` (2 MiB and 7 pages), is larger \
+              than the spawned thread's 2 MiB demand stack and its guard, so its stack probes \
+              reach the guard"
 )]
 fn big_frame() -> u8
 {
@@ -245,7 +309,7 @@ fn bigframe() -> ExitCode
     let _ = std::io::stdout().flush();
 
     // The parked worker's stack is reserved first, so the arena places the
-    // big-frame worker's stack (guard page lowest) directly above it. Waiting
+    // big-frame worker's stack (guard lowest) directly above it. Waiting
     // until the parked worker runs maps the top of its stack, and the page
     // table covering it, so the big frame's write lands on a page memmgr backs
     // without a fault rather than on a page table this address space has not
@@ -258,7 +322,7 @@ fn bigframe() -> ExitCode
     });
     let _ = ready.recv();
     let worker = std::thread::spawn(big_frame);
-    // The probes fault on the guard page and procmgr tears this process down,
+    // The probes fault on the guard and procmgr tears this process down,
     // so `join` never returns. Reaching past it means the frame skipped the
     // guard — report it loudly.
     let _ = worker.join();
@@ -266,4 +330,191 @@ fn bigframe() -> ExitCode
     let _ = below.join();
     println!("SURVIVED (BUG)");
     ExitCode::SUCCESS
+}
+
+/// Run `overflow` on a worker whose stack the reservation arena places
+/// directly above a parked worker's, as `bigframe` does, from a stack pointer
+/// within a page of the worker's usable base. A dry run first descends to the
+/// same depth and writes just below it, then returns: it shows the overflow
+/// starts inside the usable stack, so only the overflow's deeper store can
+/// reach the guard.
+fn over_the_guard(overflow: fn() -> u8) -> ExitCode
+{
+    // As in `bigframe`: the parked worker runs first, so the top of its stack
+    // and the page table covering it are mapped.
+    let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
+    let (release, parked) = std::sync::mpsc::channel::<()>();
+    let below = std::thread::spawn(move || {
+        let _ = ready_tx.send(());
+        let _ = parked.recv();
+    });
+    let _ = ready.recv();
+    let worker = std::thread::spawn(move || {
+        let floor = usable_base();
+        let dry = descend_pages(floor, dry_bottom);
+        // The dry run returned, so the descent and the overflow's first
+        // writes stay inside the usable stack.
+        println!("dry run {}", std::hint::black_box(dry));
+        println!("about to overflow");
+        let _ = std::io::stdout().flush();
+        descend_pages(floor, overflow)
+    });
+    // The overflow's deeper store faults on the guard and procmgr tears this
+    // process down, so `join` never returns. Reaching past it means the store
+    // passed the guard — report it loudly.
+    let _ = worker.join();
+    let _ = release.send(());
+    let _ = below.join();
+    println!("SURVIVED (BUG)");
+    ExitCode::SUCCESS
+}
+
+/// The calling thread's usable stack base: its top is the page boundary at or
+/// above this frame, and the stack is `USABLE_STACK_PAGES` pages. A top
+/// misjudged by a page or more (entry frames above this one larger than a
+/// page) puts the computed base below the real one; the dry run's descent
+/// then faults on the guard before `about to overflow` is printed, which
+/// fails the tester.
+#[inline(never)]
+fn usable_base() -> usize
+{
+    let here = 0u8;
+    let here = std::ptr::from_ref(std::hint::black_box(&here)).addr();
+    let top = here.next_multiple_of(4096);
+    top.saturating_sub(USABLE_STACK_PAGES * 4096)
+}
+
+/// Descend the stack one written page per frame until this frame's buffer is
+/// less than `FINE_FROM` above `floor`, then continue with [`descend_fine`].
+#[inline(never)]
+fn descend_pages(floor: usize, at_bottom: fn() -> u8) -> u8
+{
+    let mut buf = [0u8; DESCENT_PAGE_BYTES];
+    buf.fill(0xAB);
+    let buf = std::hint::black_box(&buf);
+    let next = if std::ptr::from_ref(buf).addr().saturating_sub(floor) >= FINE_FROM
+    {
+        // Through a `black_box`'d pointer, as in `recurse`, so the descent is a
+        // real call chain.
+        let f: fn(usize, fn() -> u8) -> u8 = descend_pages;
+        std::hint::black_box(f)(floor, at_bottom)
+    }
+    else
+    {
+        descend_fine(floor, at_bottom)
+    };
+    next.wrapping_add(buf[0])
+}
+
+/// Descend the stack in written frames of `DESCENT_FINE_BYTES` until this
+/// frame's buffer is less than `FINE_STOP` above `floor`, then call
+/// `at_bottom`.
+#[inline(never)]
+fn descend_fine(floor: usize, at_bottom: fn() -> u8) -> u8
+{
+    let mut buf = [0u8; DESCENT_FINE_BYTES];
+    buf.fill(0xCD);
+    let buf = std::hint::black_box(&buf);
+    let next = if std::ptr::from_ref(buf).addr().saturating_sub(floor) >= FINE_STOP
+    {
+        let f: fn(usize, fn() -> u8) -> u8 = descend_fine;
+        std::hint::black_box(f)(floor, at_bottom)
+    }
+    else
+    {
+        at_bottom()
+    };
+    next.wrapping_add(buf[0])
+}
+
+/// The dry run's bottom: a written frame reaching deeper than the first
+/// writes of either overflow (the return-address save, or the first store),
+/// each within 16 bytes of the caller's stack pointer.
+#[inline(never)]
+fn dry_bottom() -> u8
+{
+    let mut buf = [0u8; 64];
+    buf.fill(0xEF);
+    std::hint::black_box(&buf)[0]
+}
+
+/// Let a pointer escape to code the compiler cannot see, so a frame holds the
+/// whole buffer it points into, without writing anything:
+/// `std::hint::black_box` would store the pointer in the frame, a write the
+/// overflows must not make, and a call would make a leaf save its return
+/// address.
+macro_rules! escape {
+    ($p:expr) => {
+        // SAFETY: the template is empty, so the asm reads, writes, and changes
+        // nothing; without `nomem` the compiler assumes it may access memory
+        // through the pointer.
+        unsafe { core::arch::asm!("/* {0} */", in(reg) $p, options(nostack, preserves_flags)) }
+    };
+}
+
+/// `splitframe`'s overflow: a frame of 6128 bytes that saves its return
+/// address and calls [`page_leaf`], writing none of its locals. riscv64 LLVM
+/// allocates it as 2032 bytes, with the save at the top, and then 4096
+/// unprobed.
+#[inline(never)]
+fn split_frame() -> u8
+{
+    let mut buf = std::mem::MaybeUninit::<[u8; SPLIT_FRAME_LOCALS]>::uninit();
+    // The address escapes, so the frame holds the whole buffer and the leaf is
+    // not a tail call.
+    escape!(buf.as_mut_ptr());
+    page_leaf().wrapping_add(1)
+}
+
+/// A leaf of 4080 bytes of locals that writes and reads back only its lowest
+/// byte. riscv64 LLVM allocates its frame in one unprobed adjustment, so the
+/// byte lies 4080 bytes below its entry with nothing written in between.
+#[inline(never)]
+fn page_leaf() -> u8
+{
+    let mut buf = std::mem::MaybeUninit::<[u8; LEAF_LOCALS]>::uninit();
+    let low = buf.as_mut_ptr().cast::<u8>();
+    escape!(low);
+    // SAFETY: `low` points to the first byte of this frame's own buffer, valid
+    // for writes.
+    unsafe { low.write_volatile(0x5A) };
+    // SAFETY: `low` points to the first byte of this frame's own buffer, which
+    // the write above initialised, so it is valid for reads.
+    unsafe { low.read_volatile() }
+}
+
+/// `span`'s overflow: a store just below the stack pointer, then one
+/// `STD_STORE_SPAN` bytes below that, with nothing written in between, as the
+/// std target's deepest compiled chain leaves them.
+#[inline(never)]
+fn span_overflow() -> u8
+{
+    // SAFETY: both stores are to the stack below the stack pointer, which holds
+    // no live value: the first to the usable stack, which the dry run wrote,
+    // and the second to the guard, whose fault ends the process, or, past a
+    // guard too small for it, to the parked worker's stack, which this test
+    // reports. Neither changes a register but the scratch one declared.
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!(
+            "sb zero, -16(sp)",
+            "sub {t}, sp, {d}",
+            "sb zero, 0({t})",
+            d = in(reg) STD_STORE_SPAN + 16,
+            t = out(reg) _,
+        );
+    }
+    // SAFETY: as above.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "mov byte ptr [rsp - 16], 0",
+            "mov {t}, rsp",
+            "sub {t}, {d}",
+            "mov byte ptr [{t}], 0",
+            d = in(reg) STD_STORE_SPAN + 16,
+            t = out(reg) _,
+        );
+    }
+    0
 }

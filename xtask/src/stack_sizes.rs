@@ -20,9 +20,11 @@ use object::{Object as _, ObjectSection as _, ObjectSymbol as _, SymbolKind};
 /// The largest fixed frame, in bytes, of a function in the riscv64 kernel
 /// image (docs/coding-standards.md § Kernel Stack Frames).
 ///
-/// A riscv64 `call` writes nothing to the stack, and LLVM's stack probes
-/// leave up to a page of a frame unwritten, so a frame larger than a page
-/// can step over a stack's guard page. Each function stores only inside its
+/// A riscv64 `call` writes nothing to the stack, and a larger frame's split
+/// prologue leaves up to 6120 bytes below its return-address save unwritten
+/// (the rest of its first, 2032-byte adjustment and up to a page of the
+/// second, which no stack probe touches), so such a frame can step over a
+/// stack's guard page. Each function stores only inside its
 /// own frame, and a function that calls saves its return address in its own,
 /// so with every frame at most this size two consecutive stack stores are
 /// less than `2 * 2032 = 4064` bytes apart and no 4 KiB guard page lies

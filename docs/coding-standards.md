@@ -379,8 +379,10 @@ unsafe {
 
 Every function of the riscv64 kernel image MUST have a fixed stack frame of at most 2032 bytes
 (`RISCV64_KERNEL_FRAME_MAX` in `xtask/src/stack_sizes.rs`). On riscv64 a `call` writes nothing to
-the stack and the inline stack probes leave up to a page of a frame unwritten, so a larger frame
-can step over a kernel stack's one-page guard without touching it. With every frame within the
+the stack, and a larger frame's split prologue leaves up to 6120 bytes below its return-address
+save unwritten (the rest of its first, 2032-byte adjustment and up to a page of the second, which
+no probe touches), so a larger frame can step over a kernel stack's one-page guard without
+touching it. With every frame within the
 bound, two consecutive stack stores are less than 4064 bytes apart and no guard page lies between
 them; 2032 bytes is also the largest frame LLVM allocates in one adjustment, so no frame within
 the bound is split.

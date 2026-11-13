@@ -92,9 +92,11 @@ Key properties shared by the kernel-triple JSONs
   --no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args, link
   with `rust-lld`. Inline stack probes (`"stack-probes": {"kind": "inline"}`):
   on x86-64 a frame larger than one page touches each page in turn and faults
-  on a kernel stack's guard page instead of stepping over it. On riscv64 the
-  probes leave up to a page of a frame unwritten and a `call` writes nothing
-  to the stack, so the guard rests instead on the kernel frame bound: the
+  on a kernel stack's guard page instead of stepping over it. On riscv64 a
+  `call` writes nothing to the stack and a split prologue leaves up to 6120
+  bytes below its return-address save unwritten (the rest of its first,
+  2032-byte adjustment and up to a page of the second, which no probe
+  touches), so the guard rests instead on the kernel frame bound: the
   riscv64 kernel builds with `-Z emit-stack-sizes`, and `cargo xtask build`
   fails when a function of the image has a frame above 2032 bytes
   ([coding-standards.md](coding-standards.md) § Kernel Stack Frames;

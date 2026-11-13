@@ -13,8 +13,15 @@
 // not run again over the fixes. Its reviewers report defects only
 // (docs/conventions.md § Findings).
 //
-// Scope (one agent) lists the range, its first-parent units (one per merged
-// PR), and each unit's files. Review runs one `pr-reviewer` per shard of the
+// Scope reads the range, its first-parent units (one per merged PR), each
+// unit's files, and the open Issues from `cargo xtask release-scope`
+// (xtask/README.md), never from an agent's own reading of git: one agent
+// returns the command's summary and one each of its pages, so no agent's
+// output grows with the range, and the script recomputes the digest each
+// carries and checks every list against the summary's count and digest. A
+// scope that does not match, its units against the range's first-parent
+// commits included, ends the run with an error in every mode, before any
+// plan or verdict. Review runs one `pr-reviewer` per shard of the
 // code files two or more units touched (no other code file is reviewed line by
 // line), one lens over every Markdown document and instruction file the range
 // touched, and the whole-range lenses, in parallel. Verify puts every defect
@@ -37,13 +44,14 @@
 // clone, is listed, not counted.
 //
 // args: { mode: 'scope' | 'full' | 'audit', from: string, version: string,
-//         host_runs?: string, max_agents?: number }
+//         host_runs?: string, max_agents?: number, tree?: string }
 //   from         the previous release tag (or any commit) the range starts at.
 //   version      the target version `X.Y.Z`; `vX.Y.Z` must be the current
 //                milestone (docs/conventions.md § Milestones).
 //   mode 'full'  reviews the whole range `from..HEAD` and audits it.
 //   mode 'scope' stops after Scope and returns the agent plan, its agent
-//                count before verification, and sample prompts (one agent).
+//                count before verification, and sample prompts (the scope's
+//                agents only: one for the summary and one per page).
 //   mode 'audit' runs the release audit alone at the head (Release Production
 //                step 5): Scope, then the `release-auditor`.
 //   host_runs    path of the release host-run report; the audit requires it
@@ -53,6 +61,10 @@
 //                verification stops verifying, leaves the rest unverified,
 //                and is `RELEASE BLOCKED` until the maintainer decides how to
 //                go on.
+//   tree         scope mode only: the absolute path of the working tree the
+//                scope is read in, instead of the session's. It lets a branch
+//                that changes this script or `cargo xtask release-scope` run
+//                its scope before it merges.
 //
 // The agent types below resolve from the definitions the session loaded at its
 // start, so the session that runs this workflow must have started after
@@ -60,9 +72,7 @@
 // checked-out branch.
 //
 // Every stage takes the diff from the local tree (`git diff`), never from
-// `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps. The
-// script checks every returned file list against the count the scope agent
-// reads from the same local diff, and aborts rather than review a partial list.
+// `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps.
 
 export const meta = {
     name: 'release-review',
@@ -86,6 +96,7 @@ const MODE = args && MODES.includes(args.mode) ? args.mode : null
 const FROM = args ? text_arg(args.from) : null
 const VERSION = args ? text_arg(args.version) : null
 const HOST_RUNS = args ? text_arg(args.host_runs) : null
+const TREE = args ? text_arg(args.tree) : null
 const DEFAULT_MAX_AGENTS = 250
 const MAX_AGENTS =
     args && Number.isInteger(args.max_agents) && args.max_agents > 0
@@ -96,6 +107,9 @@ if (MODE === null) return { error: "args.mode must be 'full', 'scope', or 'audit
 if (FROM === null) return { error: 'args.from must name the previous release tag' }
 if (VERSION === null || !/^[0-9]+\.[0-9]+\.[0-9]+$/.test(VERSION)) {
     return { error: 'args.version must be the target version X.Y.Z' }
+}
+if (TREE !== null && (MODE !== 'scope' || !TREE.startsWith('/'))) {
+    return { error: 'args.tree is an absolute path, and only scope mode takes it' }
 }
 
 const TAG = 'v' + VERSION
@@ -128,103 +142,86 @@ const PATH_DESCRIPTION =
     'no absolute prefix.'
 const PATHS = { type: 'array', items: { type: 'string', description: PATH_DESCRIPTION } }
 
-const SCOPE_SCHEMA = {
+// The objects `cargo xtask release-scope` prints (xtask/README.md): its
+// summary, and a page of one of its three lists.
+const DIGEST = { type: 'string', description: 'The `digest` field exactly as printed.' }
+const COUNT = { type: 'integer' }
+
+const SUMMARY_SCHEMA = {
     type: 'object',
     required: [
-        'head', 'from_sha', 'repo_root', 'tree_at_head', 'from_ancestor', 'range_files',
-        'range_file_count', 'units', 'version_at_head', 'version_at_from', 'milestones',
-        'open_issues',
+        'head', 'from_sha', 'repo_root', 'tree_at_head', 'from_ancestor', 'version_at_head',
+        'version_at_from', 'page_entries', 'range_file_count', 'range_file_pages',
+        'range_files_digest', 'unit_count', 'unit_pages', 'units_digest', 'open_issue_count',
+        'open_issue_pages', 'open_issues_digest', 'unit_file_entries', 'milestones', 'digest',
     ],
     properties: {
-        head: { type: 'string', description: 'Full SHA of `git rev-parse HEAD`.' },
-        from_sha: { type: 'string', description: 'Full SHA `from` resolves to.' },
-        repo_root: {
-            type: 'string',
-            description: 'Absolute path printed by `git rev-parse --show-toplevel`.',
-        },
-        tree_at_head: { type: 'boolean', description: '`git status --porcelain` prints nothing.' },
-        from_ancestor: {
-            type: 'boolean',
-            description: '`git merge-base --is-ancestor <from_sha> <head>` exits 0.',
-        },
-        range_files: {
-            type: 'array',
-            description:
-                'One entry per path `git diff --name-only --no-renames <from_sha> <head>` prints.',
-            items: {
-                type: 'object',
-                required: ['path', 'changed', 'at_head', 'kind'],
-                properties: {
-                    path: { type: 'string', description: PATH_DESCRIPTION },
-                    changed: {
-                        type: 'integer',
-                        description: 'Added plus deleted lines (0 where numstat prints `-`).',
-                    },
-                    at_head: {
-                        type: 'boolean',
-                        description: '`git cat-file -e <head>:<path>` succeeds.',
-                    },
-                    kind: { enum: ['code', 'markdown', 'rules', 'other'] },
-                },
-            },
-        },
-        range_file_count: {
-            type: 'integer',
-            description:
-                'The number `git diff --name-only --no-renames <from_sha> <head> | wc -l` prints.',
-        },
-        units: {
-            type: 'array',
-            description:
-                'One entry per commit `git log --first-parent <from_sha>..<head>` lists.',
-            items: {
-                type: 'object',
-                required: ['sha', 'pr', 'title', 'files', 'file_count'],
-                properties: {
-                    sha: { type: 'string', description: 'Full SHA of the first-parent commit.' },
-                    pr: {
-                        type: 'integer',
-                        description: 'N when the subject is `Merge pull request #N ...`, else 0.',
-                    },
-                    title: {
-                        type: 'string',
-                        description: 'The PR title (a merge\'s first body line), else the subject.',
-                    },
-                    files: {
-                        ...PATHS,
-                        description:
-                            'Every path `git diff --name-only --no-renames <sha>^1 <sha>` prints.',
-                    },
-                    file_count: {
-                        type: 'integer',
-                        description: 'The number that list holds, as `wc -l` counts it.',
-                    },
-                },
-            },
-        },
-        version_at_head: {
-            type: 'string',
-            description: '`[workspace.package] version` of the root `Cargo.toml` at the head.',
-        },
-        version_at_from: {
-            type: 'string',
-            description: '`[workspace.package] version` of the root `Cargo.toml` at from_sha.',
-        },
-        milestones: {
-            type: 'array',
-            items: { type: 'string' },
-            description: 'The title of every open milestone.',
-        },
-        open_issues: {
-            type: 'array',
-            description: 'Every open Issue of the repository, by number and title.',
-            items: {
-                type: 'object',
-                required: ['number', 'title'],
-                properties: { number: { type: 'integer' }, title: { type: 'string' } },
-            },
-        },
+        head: { type: 'string' },
+        from_sha: { type: 'string' },
+        repo_root: { type: 'string' },
+        tree_at_head: { type: 'boolean' },
+        from_ancestor: { type: 'boolean' },
+        version_at_head: { type: 'string' },
+        version_at_from: { type: 'string' },
+        page_entries: COUNT,
+        range_file_count: COUNT,
+        range_file_pages: COUNT,
+        range_files_digest: DIGEST,
+        unit_count: COUNT,
+        unit_pages: COUNT,
+        units_digest: DIGEST,
+        open_issue_count: COUNT,
+        open_issue_pages: COUNT,
+        open_issues_digest: DIGEST,
+        unit_file_entries: COUNT,
+        milestones: { type: 'array', items: { type: 'string' } },
+        digest: DIGEST,
     },
+}
+
+const page_schema = (item) => ({
+    type: 'object',
+    required: ['list', 'head', 'from_sha', 'page', 'pages', 'page_entries', 'items', 'digest'],
+    properties: {
+        list: { enum: ['files', 'units', 'issues'] },
+        head: { type: 'string' },
+        from_sha: { type: 'string' },
+        page: COUNT,
+        pages: COUNT,
+        page_entries: COUNT,
+        items: { type: 'array', description: 'Every item, in the printed order.', items: item },
+        digest: DIGEST,
+    },
+})
+
+const PAGE_SCHEMAS = {
+    files: page_schema({
+        type: 'object',
+        required: ['path', 'changed', 'at_head', 'kind'],
+        properties: {
+            path: { type: 'string' },
+            changed: COUNT,
+            at_head: { type: 'boolean' },
+            kind: { enum: ['code', 'markdown', 'rules', 'other'] },
+        },
+    }),
+    units: page_schema({
+        type: 'object',
+        required: ['sha', 'pr', 'title', 'file_count', 'offset', 'files'],
+        properties: {
+            sha: { type: 'string' },
+            pr: COUNT,
+            title: { type: 'string' },
+            file_count: COUNT,
+            offset: COUNT,
+            files: { type: 'array', items: { type: 'string' } },
+        },
+    }),
+    issues: page_schema({
+        type: 'object',
+        required: ['number', 'title'],
+        properties: { number: COUNT, title: { type: 'string' } },
+    }),
 }
 
 const FINDING_SCHEMA = {
@@ -355,8 +352,9 @@ function component_of(path) {
 // MAX_SHARD_FILES files and about MAX_SHARD_LINES changed lines. A file is
 // never split, so a file whose own range diff exceeds MAX_SHARD_LINES is a
 // shard of its own at that size: its reviewer reads one file whole, which the
-// composition question needs. Group order follows the scope agent's file order, so the same
-// scope yields the same shards on resume.
+// composition question needs. Group order follows the order in which
+// `release-scope` prints the range files, so the same scope yields the same
+// shards on resume.
 function shards_of(files) {
     const groups = new Map()
     for (const f of files) {
@@ -404,46 +402,236 @@ const short = (sha) => sha.slice(0, 8)
 
 phase('Scope')
 
-const SCOPE_PROMPT = [
-    'Scope the release candidate for ' + TAG + ': the range from the previous release `' + FROM +
-        '` to the checked-out head.',
+// The digest `cargo xtask release-scope` prints: FNV-1a 64 over a sequence of
+// fields, each its UTF-8 bytes and then a NUL byte, as 16 hex digits. The
+// self-test digests the vector the command's test
+// `the_digest_of_the_shared_vector_is_pinned` digests and pins the same value,
+// so the two implementations cannot drift apart unnoticed.
+const FNV_OFFSET = BigInt('0xcbf29ce484222325')
+const FNV_PRIME = BigInt('0x100000001b3')
+const MASK_64 = BigInt('0xffffffffffffffff')
+
+function utf8(s) {
+    const out = []
+    for (const ch of s) {
+        const c = ch.codePointAt(0)
+        if (c < 0x80) out.push(c)
+        else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63))
+        else if (c < 0x10000) {
+            out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63))
+        } else {
+            out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63),
+                0x80 | (c & 63))
+        }
+    }
+    return out
+}
+
+function digest(fields) {
+    let h = FNV_OFFSET
+    for (const field of fields) {
+        for (const b of [...utf8(String(field)), 0]) h = ((h ^ BigInt(b)) * FNV_PRIME) & MASK_64
+    }
+    return h.toString(16).padStart(16, '0')
+}
+
+if (digest(['seraph', '', 'é→1']) !== 'cd2f6e72302ab053') {
+    return { error: 'the script\'s digest does not match the one cargo xtask release-scope prints' }
+}
+
+// The fields each object is digested over, in the command's order.
+const file_fields = (f) => [f.path, f.changed, f.at_head, f.kind]
+const unit_fields = (u) => [u.sha, u.pr, u.title, u.files.length, ...u.files]
+const chunk_fields = (c) =>
+    [c.sha, c.pr, c.title, c.file_count, c.offset, c.files.length, ...c.files]
+const issue_fields = (i) => [i.number, i.title]
+const ITEM_FIELDS = { files: file_fields, units: chunk_fields, issues: issue_fields }
+const list_digest = (name, items, fields) => digest([name, ...items.flatMap(fields)])
+const page_digest = (p) =>
+    digest([
+        p.list, p.head, p.from_sha, p.page, p.pages, p.page_entries,
+        ...p.items.flatMap(ITEM_FIELDS[p.list]),
+    ])
+const summary_digest = (s) =>
+    digest([
+        'summary', s.head, s.from_sha, s.repo_root, s.tree_at_head, s.from_ancestor,
+        s.version_at_head, s.version_at_from, s.page_entries,
+        s.range_file_count, s.range_file_pages, s.range_files_digest,
+        s.unit_count, s.unit_pages, s.units_digest,
+        s.open_issue_count, s.open_issue_pages, s.open_issues_digest,
+        s.unit_file_entries, s.milestones.length, ...s.milestones,
+    ])
+
+// The most entries one page holds, so one agent's output stays bounded
+// whatever the range's size.
+const PAGE_ENTRIES = 200
+const SCOPE_COMMAND =
+    'cargo xtask release-scope --from ' + FROM + ' --page-entries ' + PAGE_ENTRIES
+
+const transport_prompt = (command, what) => [
+    'Scope the release candidate for ' + TAG + ': ' + what + '.',
     '',
-    'Run, at the working tree root: `git rev-parse --show-toplevel`, `git rev-parse HEAD` (the ' +
-        'head), `git status --porcelain`, `git rev-parse ' + FROM + '^{commit}` (from_sha), ' +
-        '`git merge-base --is-ancestor <from_sha> <head>`, `git diff --name-only --no-renames ' +
-        '<from_sha> <head>` (the range file list; count its lines with `wc -l`), `git diff ' +
-        '--numstat --no-renames <from_sha> <head>` (its line counts), and `git log ' +
-        '--first-parent --format=\'%H %s\' <from_sha>..<head>` (the units). For each unit run ' +
-        '`git diff --name-only --no-renames <sha>^1 <sha>` (its files; count with `wc -l`) and ' +
-        '`git log -1 --format=%b <sha>` (a merge\'s first body line is the PR title). Read ' +
-        '`[workspace.package] version` from `git show <head>:Cargo.toml` and `git show ' +
-        '<from_sha>:Cargo.toml`. Run `gh api \'repos/{owner}/{repo}/milestones?state=open&' +
-        'per_page=100\' --jq \'.[].title\'` and `gh issue list --state open --limit 500 --json ' +
-        'number,title`. Take every list from the local tree: never `gh pr diff` or the `files` ' +
-        'field of `gh pr view`, which GitHub caps.',
+    'Run `' + (TREE ? 'cd ' + TREE + ' && ' : '') + command + '` at the working tree ' +
+        'root. Its standard output is one JSON object ' +
+        '(cargo\'s progress goes to standard error). Return that object as the structured ' +
+        'output: every field exactly as printed, every list complete and in the printed order, ' +
+        'every string unchanged. Run no other command, and do not derive, correct, or abridge ' +
+        'a value: the workflow checks the object against the digest it carries. When the ' +
+        'command fails, return its error message as `head` and leave every other field empty ' +
+        'or zero.',
     '',
-    'Return, per the schema, every path repository-relative exactly as git prints it, every ' +
-        'list complete however long:',
-    '- head, from_sha, repo_root; tree_at_head: the status printed nothing; from_ancestor: the ' +
-        'ancestry check exited 0.',
-    '- range_files: one entry per range path with changed = added plus deleted lines, at_head, ' +
-        'and kind = code (Rust, assembly, linker scripts, build inputs, anything a build ' +
-        'embeds), markdown, rules (under `.claude/` or `.github/`), or other; range_file_count.',
-    '- units: one per first-parent commit, with its PR number (0 when its subject is not ' +
-        '`Merge pull request #N ...`), title, files, and file_count.',
-    '- version_at_head, version_at_from, milestones (every open milestone title), open_issues.',
-    '',
-    'Only scope; do not review. Structured output only.',
+    'Structured output only.',
 ].join('\n')
 
-const scope = await run(SCOPE_PROMPT, {
-    agentType: INVESTIGATOR, label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA,
-})
-if (!scope) return { error: 'Scope agent returned no result; nothing was reviewed.' }
-if (!scope.tree_at_head) return { error: 'The working tree at ' + scope.head + ' is not clean.' }
+// One agent returns one object; an object that does not match its digest is
+// asked for again once, and then the scope fails. A failed command's message
+// arrives as `head` and is logged.
+const SHA = /^[0-9a-f]{40}$/
+async function transported(prompt, label, schema, intact) {
+    for (const attempt of [1, 2]) {
+        const out = await run(prompt, {
+            agentType: INVESTIGATOR, label: attempt === 1 ? label : label + ':retry',
+            phase: 'Scope', schema,
+        }).catch(() => null)
+        if (out && intact(out)) return out
+        const why = !out
+            ? 'no result'
+            : SHA.test(String(out.head))
+                ? 'the object does not match its digest, or is not the one asked for'
+                : 'the command failed: ' + String(out.head).slice(0, 300)
+        log(label + ': ' + why + (attempt === 1 ? '; asking again' : ''))
+    }
+    return null
+}
+
+const summary = await transported(
+    transport_prompt(SCOPE_COMMAND, 'the summary of the range from `' + FROM + '` to the ' +
+        'checked-out head'),
+    'scope', SUMMARY_SCHEMA, (s) => s.digest === summary_digest(s),
+)
+if (!summary) return { error: 'the scope summary did not arrive intact; nothing was reviewed' }
+if (TREE && summary.repo_root.replace(/\/+$/, '') !== TREE.replace(/\/+$/, '')) {
+    return { error: 'the scope was read in ' + summary.repo_root + ', not in ' + TREE }
+}
+if (summary.page_entries !== PAGE_ENTRIES) {
+    return { error: 'the scope summary was cut at ' + summary.page_entries + ' entries a page' }
+}
+
+const PAGED = [
+    { list: 'files', pages: summary.range_file_pages },
+    { list: 'units', pages: summary.unit_pages },
+    { list: 'issues', pages: summary.open_issue_pages },
+]
+const page_jobs = PAGED.flatMap(({ list, pages }) =>
+    Array.from({ length: pages }, (_, i) => ({ list, page: i + 1, pages })))
+// A page belongs to this summary when it matches its digest and its header
+// states the summary's range and page size and the page asked for.
+const page_matches = (job) => (p) =>
+    p.digest === page_digest(p) && p.list === job.list && p.page === job.page &&
+    p.pages === job.pages && p.head === summary.head && p.from_sha === summary.from_sha &&
+    p.page_entries === PAGE_ENTRIES
+const pages = await parallel(page_jobs.map((job) => () => transported(
+    transport_prompt(
+        SCOPE_COMMAND + ' --head ' + summary.head + ' --page ' + job.list + ':' + job.page,
+        'page ' + job.page + ' of ' + job.pages + ' of its ' + job.list + ' list',
+    ),
+    'scope:' + job.list + '#' + job.page, PAGE_SCHEMAS[job.list], page_matches(job),
+)))
+const missing_pages = page_jobs.filter((_, i) => !pages[i]).map((j) => j.list + '#' + j.page)
+if (missing_pages.length) {
+    return {
+        error: 'the scope pages ' + missing_pages.join(', ') + ' did not arrive intact; ' +
+            'nothing was reviewed',
+    }
+}
+const items_of = (list) =>
+    pages.filter((p) => p.list === list).sort((a, b) => a.page - b.page).flatMap((p) => p.items)
+
+// Join each unit's chunks: a chunk at offset 0 opens a unit, any other
+// continues the unit before it at the offset that unit's files reached.
+const units = []
+for (const c of items_of('units')) {
+    const last = units[units.length - 1]
+    if (c.offset === 0) {
+        units.push({
+            sha: c.sha, pr: c.pr, title: c.title, file_count: c.file_count, files: [...c.files],
+        })
+    } else if (last && last.sha === c.sha && last.files.length === c.offset) {
+        last.files.push(...c.files)
+    } else {
+        return { error: 'the scope pages split unit ' + c.sha + ' out of order' }
+    }
+}
+const range_files = items_of('files')
+const open_issues = items_of('issues')
+const range = FROM + ' (' + summary.from_sha + ')..' + summary.head
+
+// A short, empty, or altered list is an error: each list must hold the
+// summary's count and digest to the summary's digest of the whole list, which
+// the command computed from git and gh. The units are the range's first-parent
+// commits, in their order, each with every file its own diff names.
+const unit_entry_count = units.reduce((n, u) => n + u.files.length, 0)
+if (
+    units.length !== summary.unit_count ||
+    list_digest('units', units, unit_fields) !== summary.units_digest
+) {
+    return {
+        error: 'the scope\'s units do not match the ' + summary.unit_count + ' first-parent ' +
+            'commits of ' + range + ': ' + units.length + ' units arrived, or a commit or its ' +
+            'files differ; no plan was made',
+    }
+}
+const short_unit = units.find((u) => u.files.length !== u.file_count)
+if (short_unit || unit_entry_count !== summary.unit_file_entries) {
+    return {
+        error: 'the scope\'s units hold ' + unit_entry_count + ' files of ' +
+            summary.unit_file_entries + (short_unit ? ' (unit ' + short_unit.sha + ')' : '') +
+            '; the shard rule cannot be applied',
+    }
+}
+if (
+    range_files.length !== summary.range_file_count ||
+    list_digest('files', range_files, file_fields) !== summary.range_files_digest
+) {
+    return {
+        error: 'the scope returned ' + range_files.length + ' range files for a range of ' +
+            summary.range_file_count + ' files, or a file differs',
+    }
+}
+if (
+    open_issues.length !== summary.open_issue_count ||
+    list_digest('issues', open_issues, issue_fields) !== summary.open_issues_digest
+) {
+    return {
+        error: 'the scope returned ' + open_issues.length + ' open Issues of ' +
+            summary.open_issue_count + ', or an Issue differs (an Issue filed, closed, or ' +
+            'renamed while the scope ran changes the list: run again)',
+    }
+}
+
+const scope = {
+    head: summary.head,
+    from_sha: summary.from_sha,
+    repo_root: summary.repo_root,
+    tree_at_head: summary.tree_at_head,
+    from_ancestor: summary.from_ancestor,
+    range_files,
+    range_file_count: summary.range_file_count,
+    units,
+    unit_file_entries: summary.unit_file_entries,
+    version_at_head: summary.version_at_head,
+    version_at_from: summary.version_at_from,
+    milestones: summary.milestones,
+    open_issues,
+}
+const scope_agents = agent_calls
+if (!scope.tree_at_head) {
+    return { error: 'The working tree is not clean, or not checked out at ' + scope.head + '.' }
+}
 if (!scope.from_ancestor) {
     return { error: FROM + ' (' + scope.from_sha + ') is not an ancestor of ' + scope.head }
 }
+if (scope.range_file_count === 0) return { error: 'the range ' + range + ' is empty' }
 
 // The current milestone is the lowest-versioned open one (docs/conventions.md
 // § Milestones); the run reviews the release that milestone names.
@@ -462,7 +650,7 @@ if (current_milestone !== TAG) {
     }
 }
 
-// Every path the agents return joins by string equality below, so normalize
+// Every path a reviewer returns joins by string equality below, so normalize
 // the forms an agent may emit despite the schema description.
 const root_prefix = scope.repo_root.replace(/\/+$/, '') + '/'
 const normalize = (p) => {
@@ -470,29 +658,6 @@ const normalize = (p) => {
     if (s.startsWith(root_prefix)) s = s.slice(root_prefix.length)
     while (s.startsWith('./')) s = s.slice(2)
     return s
-}
-for (const f of scope.range_files) f.path = normalize(f.path)
-for (const u of scope.units) u.files = u.files.map(normalize)
-
-// Count checks: a short list would leave files unreviewed or the shard rule
-// misapplied, so every list must hold exactly the count read from the local diff.
-const range_paths = new Set(scope.range_files.map((f) => f.path))
-if (!Number.isInteger(scope.range_file_count) || scope.range_file_count <= 0) {
-    return { error: 'the range ' + scope.from_sha + '..' + scope.head + ' is empty or uncounted' }
-}
-if (range_paths.size !== scope.range_file_count || scope.range_files.length !== range_paths.size) {
-    return {
-        error: 'scope returned ' + scope.range_files.length + ' range files for a range of ' +
-            scope.range_file_count + ' files',
-    }
-}
-for (const u of scope.units) {
-    if (new Set(u.files).size !== u.file_count || u.files.length !== u.file_count) {
-        return {
-            error: 'scope returned ' + u.files.length + ' files for unit ' + short(u.sha) +
-                ' of ' + u.file_count + '; the shard rule cannot be applied',
-        }
-    }
 }
 
 const unit_label = (u) => (u.pr ? '#' + u.pr : short(u.sha))
@@ -759,15 +924,17 @@ const lens_prompt = (lens) =>
             'make up each one. Structured output only.',
     ].join('\n')
 
-// The agents the run makes before Verify, and after it; Verify adds two per
-// defect that can block, which no plan can know.
+// The agents the run makes before Verify (the scope's and the reviewers), and
+// after it; Verify adds two per defect that can block, which no plan can know.
 const review_agents = shards.length + lenses.length
-const fixed_agents = 1 + review_agents + AFTER_VERIFY
+const fixed_agents = scope_agents + review_agents + AFTER_VERIFY
 
 const plan = {
     units: scope.units.length,
+    unit_file_entries: scope.unit_file_entries,
     range_files: scope.range_files.length,
     multi_pr_files: multi.length,
+    multi_pr_code_files: shard_files.length,
     skipped,
     shards: shards.map((s) => ({
         label: s.label,
@@ -778,6 +945,7 @@ const plan = {
     lenses: lenses.map((l) => l.name),
     documents: documents.length,
     bumped,
+    scope_agents,
     review_agents,
     agents_without_verify: fixed_agents,
     verify_agents_per_defect: VERIFY_LENSES.length,
@@ -869,7 +1037,7 @@ phase('Review')
 const seen = []
 const ledgered = []
 let ceiling_reached = false
-// The agents the run has committed to: every one the plan counts (scope, the
+// The agents the run has committed to: every one the plan counts (the scope's, the
 // reviewers whether started or not, and those after Verify), and each pair of
 // refuters as it is granted, so the ceiling holds however the runtime orders
 // the reviewers and the refuters.

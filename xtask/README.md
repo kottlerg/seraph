@@ -41,8 +41,8 @@ xtask/
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, test_crash_report, test_debug_port, test_gdb, test_kaslr,
 │   │                           #   test_map_redo, test_terminal,
-│   │                           #   test_vmgenid, lint_docs, pr_check, review, issue, orch,
-│   │                           #   hook, host)
+│   │                           #   test_vmgenid, lint_docs, pr_check, review, release_scope,
+│   │                           #   issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -1075,6 +1075,68 @@ refuters split, in its `findings`) enters only once the maintainer's decision is
 it as `ruling`. Only run records are read
 (`<mode>-<head>[-<n>].json`); a pull request without records adds nothing. The count goes to
 stderr, so stdout holds the JSON alone.
+
+### `cargo xtask release-scope`
+
+Print the scope of a release review as JSON, for the `release-review` workflow
+(`.claude/workflows/release-review.js`), which has no file or process access of its own and
+reads the scope through agents that return this command's output.
+
+```
+cargo xtask release-scope --from <previous tag> [--head <rev>] [--page-entries <n>]
+cargo xtask release-scope --from <previous tag> --head <sha> [--page-entries <n>] \
+    --page (files|units|issues):<n>
+```
+
+The range runs from `--from` to `--head` (`HEAD` by default). Without `--page` the command prints
+the summary: `head` and `from_sha` (full SHAs), `repo_root`, `tree_at_head` (the working tree is
+clean and checked out at the head), `from_ancestor`, `version_at_head` and `version_at_from`
+(`[workspace.package] version` of the root `Cargo.toml`), `milestones` (the open milestones'
+titles), `page_entries`, and for each of its three lists the count, the page count, and the
+digest of the whole list (`range_file_count`, `range_file_pages`, `range_files_digest`;
+`unit_count`, `unit_pages`, `units_digest`; `open_issue_count`, `open_issue_pages`,
+`open_issues_digest`), `unit_file_entries` (the files of all units together), and `digest`.
+
+The three lists:
+
+- `files`: one entry per path `git diff --numstat --no-renames <from> <head>` prints, with
+  `changed` (added plus deleted lines, 0 for a binary file), `at_head`, and `kind`: `rules` under
+  `.claude/` or `.github/`, `markdown` for any other `.md` file, `other` for the repository
+  metadata files (`LICENSE`, `.gitignore`, `.gitattributes`, `.gitkeep`, `.editorconfig`,
+  `.clang-format`), and `code` for every other file.
+- `units`: one per commit `git log --first-parent <from>..<head>` lists, in its order, with `sha`,
+  `pr` (N when the subject is `Merge pull request #N ...`, else 0), `title` (a merge's first
+  non-empty body line, else the subject), and `files`, every path
+  `git diff --name-only --no-renames <sha>^1 <sha>` prints.
+- `issues`: every open Issue by `number` and `title`, in ascending number. The command refuses a
+  list of 1000 or more, which `gh` may have truncated.
+
+With `--page <list>:<n>` it prints page `n` (1-based) of one list instead: `list`, `head`,
+`from_sha`, `page`, `pages`, `page_entries`, `items`, and `digest`. A page holds at most
+`--page-entries` entries (200 by default): a range file, an open Issue, or one file of a unit, a
+unit with no file counting one. A unit's file list is split where a page fills, so each unit item
+carries `file_count` (the unit's whole count) and `offset` (where its `files` start in the unit's
+list); joining the items of all pages in order restores every unit.
+
+Each `digest` is FNV-1a 64 over a sequence of fields, each field's UTF-8 bytes followed by a NUL
+byte, printed as 16 hexadecimal digits; a boolean is `true` or `false` and a number is in decimal.
+The fields:
+
+| Digest | Fields, in order |
+|---|---|
+| a whole list | the list's name, then each entry's fields |
+| a page | `list`, `head`, `from_sha`, `page`, `pages`, `page_entries`, then each item's fields |
+| the summary | `summary`, `head`, `from_sha`, `repo_root`, `tree_at_head`, `from_ancestor`, `version_at_head`, `version_at_from`, `page_entries`, the count, page count and digest of `files`, `units` and `issues` in that order, `unit_file_entries`, the number of milestones, then each milestone |
+| a range file | `path`, `changed`, `at_head`, `kind` |
+| a unit (whole list) | `sha`, `pr`, `title`, the number of files, then each file |
+| a unit item (page) | `sha`, `pr`, `title`, `file_count`, `offset`, the number of `files`, then each file |
+| an open Issue | `number`, `title` |
+
+The workflow recomputes every digest: a page or summary an agent truncated or altered fails its
+own digest, and a list joined from its pages must match the summary's count and digest, so a
+short, empty, or altered unit list ends the run with an error instead of a plan. The command's
+test `the_digest_of_the_shared_vector_is_pinned` and the workflow's self-test pin the digest of
+the same fields to the same value.
 
 ### `cargo xtask issue-edit`
 

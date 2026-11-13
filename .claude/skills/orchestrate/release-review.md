@@ -12,11 +12,13 @@ are on the checked-out branch; say so to the maintainer if the session is older.
 - `git fetch origin` and check out `origin/master`, clean. The first call is
   `Workflow({name: "release-review", args: {mode: "scope", from: "<previous tag>", version:
   "<X.Y.Z>"}})`: it returns the plan and the agent count before verification, which grows by
-  two per defect that can block. Send the count to the maintainer with the ceiling you propose
-  (`max_agents`, 250 by default), then ask for the same call with `mode: "full"` and that
-  `max_agents`. When the script changed since the session loaded it, the call passes
-  `scriptPath` with the file's path instead of `name`. The release review runs once; it is not
-  run again over the fixes.
+  two per defect that can block. The scope is read from `cargo xtask release-scope` and checked
+  against the range; a call that returns an `error` instead of a plan made none, and the error
+  goes to the maintainer before any other call. Send the count to the maintainer with the
+  ceiling you propose (`max_agents`, 250 by default), then ask for the same call with
+  `mode: "full"` and that `max_agents`. When the script changed since the session loaded it,
+  the call passes `scriptPath` with the file's path instead of `name`. The release review runs
+  once; it is not run again over the fixes.
 - The supervisor saves each run's report as
   `target/xtask/review/release-v<X.Y.Z>/<mode>-<head>.md`, the returned object as
   `<mode>-<head>.json` beside it, and the `notes` field as `notes-<head>.md`. Both verdict

@@ -82,9 +82,11 @@ Key properties shared by the kernel-triple JSONs
 - RISC-V: RV64IMAC plus Svinval/Svpbmt/Svnapot, soft-float, medium code model, lp64 ABI.
 - Both: `panic-strategy: abort`, `relocation-model: pic`, `-pie
   --no-dynamic-linker -Bsymbolic -z max-page-size=4096` link args, link
-  with `rust-lld`. Inline stack probes (`"stack-probes": {"kind": "inline"}`),
-  so a frame larger than one page touches each page in turn and faults on a
-  kernel stack's guard page instead of stepping over it
+  with `rust-lld`. Inline stack probes (`"stack-probes": {"kind": "inline"}`):
+  on x86-64 a frame larger than one page touches each page in turn and faults
+  on a kernel stack's guard page instead of stepping over it; on riscv64 LLVM
+  probes the two parts of a split prologue separately, so a frame larger than
+  a page can still pass the one-page guard
   ([core/kernel/docs/memory-internals.md](../core/kernel/docs/memory-internals.md)
   § Kernel Stack Guards). The kernel is a static-PIE (`ET_DYN`) image; the
   bootloader chooses its load bias (KASLR, #252) and applies its

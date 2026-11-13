@@ -713,9 +713,16 @@ sees one stack with another's floor; the boot sets the handoff stack's and each 
 stack's before their first switch ([arch-interface.md](arch-interface.md) § `context`).
 
 A frame larger than a page could step over a single guard page, so the kernel targets emit
-inline stack probes ([build-system.md](../../../docs/build-system.md) § Custom Targets): a
-function whose frame passes a page touches each page of it in turn, from the top down, and
-the first touch of the guard faults. Phase 8 halts unless the handoff stack's guard (when
+inline stack probes ([build-system.md](../../../docs/build-system.md) § Custom Targets). On
+x86-64 a function whose frame passes a page touches each page of it in turn, from the top
+down, so every frame meets the guard. On riscv64 the guarantee is weaker: LLVM splits a large
+prologue into a first stack-pointer adjustment within the 12-bit immediate, whose local area
+below the register saves is never written, and the rest, and probes each part separately. The
+span nothing writes can then reach the first adjustment (under 2 KiB) plus 4 KiB, so a frame
+larger than a page can still pass the one-page guard. `sys_thread_read_mem`,
+`sys_thread_write_mem` and `kernel_entry_post_rebase` have such frames; no measured path
+overflows into them (`KERNEL_STACK_PAGES` and `HANDOFF_STACK_BYTES` in
+[limits.md](../../../docs/limits.md)). Phase 8 halts unless the handoff stack's guard (when
 Phase 3 found one) and every idle stack's guard are unmapped.
 
 ### Kernel Stack Depth

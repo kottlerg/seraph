@@ -498,13 +498,12 @@ pub unsafe fn reparent_children(node: SlotId, new_parent: Option<SlotId>, max_ed
 ///
 /// Frees never exceed edits, so this also bounds the BSS dealloc-output
 /// buffer (`MAX_REVOKE_EDITS` entries × 8 bytes = 2 KiB). The caller copies
-/// the output buffer to a stack-local array of the same bound (so the
-/// DERIVATION write lock can be released before the dealloc loop), so
-/// keeping `MAX_REVOKE_EDITS` small enough to fit on a 16 KiB kernel stack
-/// with breathing room is the binding constraint. Subtrees larger than one
-/// batch are handled by calling [`revoke_subtree_batch`] repeatedly until
-/// it reports no more work; the batch size bounds lock hold time and stack
-/// cost per call, not the revocable subtree size.
+/// the output buffer to an array of the same bound in its CPU's syscall
+/// scratch buffer (`syscall::scratch`, so the DERIVATION write lock can be
+/// released before the dealloc loop), which is sized for it. Subtrees larger
+/// than one batch are handled by calling [`revoke_subtree_batch`] repeatedly
+/// until it reports no more work; the batch size bounds lock hold time and
+/// the snapshot's size, not the revocable subtree size.
 pub const MAX_REVOKE_EDITS: usize = 256;
 
 /// Output buffer for [`revoke_subtree_batch`]. `static mut` because the

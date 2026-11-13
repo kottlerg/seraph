@@ -19,5 +19,8 @@ RUST_TARGET_PATH = { value = "xtask/targets", relative = true }
 
 # Bootloader flags are set by `cargo xtask` (`RUSTFLAGS`) and
 # core/boot/build.rs, not here; see docs/build-system.md § Custom Targets.
+# The riscv64 kernel build also runs with `RUSTFLAGS`, which replaces this
+# array: a flag added here must also be added to `RISCV64_KERNEL_RUSTFLAGS`
+# in xtask/src/commands/build.rs to reach the riscv64 kernel.
 [build]
 rustflags = ["-Zunstable-options"]

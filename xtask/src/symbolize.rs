@@ -400,7 +400,7 @@ pub(crate) mod fixture
     /// Link address of the fixture's functions' base for a user PIE.
     pub(crate) const USER_BASE: u64 = 0;
     /// Link address of the fixture's functions' base for a kernel image.
-    pub(super) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
+    pub(crate) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 
     // The fixture's layout, as offsets from its base: `outer` at 0x100..0x140,
     // with `inner` inlined into it at 0x110..0x120 from a call on line 11;
@@ -585,7 +585,7 @@ pub(crate) mod fixture
     /// An ELF image of `arch` whose functions sit at link addresses from
     /// `base`, with [`SYMBOLS`] in its symbol table and `debug` as its debug
     /// sections: name, contents, and ELF section flags.
-    pub(super) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
+    pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
     {
         let mut obj = Object::new(BinaryFormat::Elf, arch, Endianness::Little);
         let text = obj.section_id(StandardSection::Text);

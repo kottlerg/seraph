@@ -295,6 +295,22 @@ const fn sentinel_dir3() -> *mut DirLevel3
     (&raw const SENTINEL_DIR3).cast_mut()
 }
 
+/// Write `sentinel` into each of the `N` entries of the array at `array`,
+/// one entry at a time.
+///
+/// # Safety
+/// `array` is valid for writes of the array and aligned for it.
+unsafe fn fill_sentinel<T, const N: usize>(array: *mut [AtomicPtr<T>; N], sentinel: *mut T)
+{
+    let first = array.cast::<AtomicPtr<T>>();
+    for i in 0..N
+    {
+        // SAFETY: i < N, so the entry lies inside the array, which the
+        // caller's contract makes valid for writes and aligned.
+        unsafe { first.wrapping_add(i).write(AtomicPtr::new(sentinel)) };
+    }
+}
+
 /// A page type a root or directory entry names, with the sentinel an entry
 /// names while the page is unallocated.
 trait Unallocated
@@ -492,35 +508,87 @@ unsafe impl Sync for CSpace {}
 
 impl CSpace
 {
-    /// Create an empty `CSpace`. No pages are allocated until the first slot
-    /// is requested. The pool source defaults to null (the host-test heap
-    /// path); call [`Self::set_kobj`] to switch to a retype pool.
+    /// Construct an empty `CSpace` at `dst`. No pages are allocated until the
+    /// first slot is requested. The pool source defaults to null (the
+    /// host-test heap path); call [`Self::set_kobj`] to switch to a retype
+    /// pool.
+    ///
+    /// The fields are written in place, one by one, so the `CSpace` (2104 B,
+    /// 2 KiB of it the 256 level-one directory pointers) is never built on
+    /// the caller's stack, and the callers' frames stay within the riscv64
+    /// kernel frame bound (docs/coding-standards.md § Kernel Stack Frames).
+    ///
+    /// # Safety
+    /// `dst` is valid for writes of a `CSpace` and aligned for it. Its
+    /// previous contents are overwritten without being dropped.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every operation is a projection to, or a write of, one field of `*dst`, under \
+                  the one contract above"
+    )]
+    pub unsafe fn write_new(dst: *mut Self, id: CSpaceId)
+    {
+        // Every field of `Self` is written below: this pattern names each, so
+        // a field added without a write here fails to build.
+        let _: fn(&Self) = |cs| {
+            #[expect(
+                clippy::unneeded_field_pattern,
+                reason = "naming every field is the point: `..` would accept a field that \
+                          `write_new` leaves unwritten"
+            )]
+            let Self {
+                id: _,
+                direct: _,
+                indirect: _,
+                double: _,
+                triple: _,
+                next_leaf: _,
+                allocated_slots: _,
+                pool_exhaustions: _,
+                free_head: _,
+                free_tail: _,
+                free_count: _,
+                lock: _,
+                kobj: _,
+                #[cfg(test)]
+                    test_page_budget: _,
+            } = cs;
+        };
+        // SAFETY: each pointer is a field of `*dst`, which the caller's
+        // contract makes valid for writes and aligned.
+        unsafe {
+            (&raw mut (*dst).id).write(id);
+            fill_sentinel(&raw mut (*dst).direct, sentinel_leaf());
+            fill_sentinel(&raw mut (*dst).indirect, sentinel_dir());
+            fill_sentinel(&raw mut (*dst).double, sentinel_dir2());
+            fill_sentinel(&raw mut (*dst).triple, sentinel_dir3());
+            (&raw mut (*dst).next_leaf).write(0);
+            (&raw mut (*dst).allocated_slots).write(0);
+            (&raw mut (*dst).pool_exhaustions).write(0);
+            (&raw mut (*dst).free_head).write(None);
+            (&raw mut (*dst).free_tail).write(None);
+            (&raw mut (*dst).free_count).write(0);
+            (&raw mut (*dst).lock).write(crate::sync::Spinlock::new());
+            (&raw mut (*dst).kobj).write(AtomicPtr::new(core::ptr::null_mut()));
+            #[cfg(test)]
+            (&raw mut (*dst).test_page_budget).write(None);
+        }
+    }
+
+    /// An empty `CSpace`, built by [`Self::write_new`], for the host tests.
+    #[cfg(test)]
     #[expect(
         clippy::large_stack_frames,
-        reason = "the returned `CSpace` (2104 B, 2 KiB of it the 256 level-one directory \
-                  pointers) and the arrays its fields are built from; its callers build it on \
-                  the 16 KiB kernel stack of `SYS_CAP_CREATE_CSPACE` or the 64 KiB boot \
-                  handoff stack (Phase 7), and the host tests on the test thread's"
+        reason = "the returned `CSpace` (2104 B) and the `MaybeUninit` it is built in, on the \
+                  host test thread's stack; the kernel builds a `CSpace` only in place"
     )]
     pub fn new(id: CSpaceId) -> Self
     {
-        Self {
-            id,
-            direct: core::array::from_fn(|_| AtomicPtr::new(sentinel_leaf())),
-            indirect: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir())),
-            double: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir2())),
-            triple: core::array::from_fn(|_| AtomicPtr::new(sentinel_dir3())),
-            next_leaf: 0,
-            allocated_slots: 0,
-            pool_exhaustions: 0,
-            free_head: None,
-            free_tail: None,
-            free_count: 0,
-            lock: crate::sync::Spinlock::new(),
-            kobj: AtomicPtr::new(core::ptr::null_mut()),
-            #[cfg(test)]
-            test_page_budget: None,
-        }
+        let mut cs = core::mem::MaybeUninit::<Self>::uninit();
+        // SAFETY: `cs` is valid for writes of a `CSpace` and aligned for it.
+        unsafe { Self::write_new(cs.as_mut_ptr(), id) };
+        // SAFETY: `write_new` wrote every field.
+        unsafe { cs.assume_init() }
     }
 
     /// Wire this `CSpace` to a `CSpaceKernelObject`'s slot-page pool.

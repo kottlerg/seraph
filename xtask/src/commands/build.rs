@@ -15,6 +15,7 @@ use crate::arch::Arch;
 use crate::cli::{BuildArgs, BuildComponent};
 use crate::context::{Context as BuildContext, Profile};
 use crate::rust_src;
+use crate::stack_sizes;
 use crate::sysroot;
 use crate::util::{find_llvm_objcopy, run_cmd, step};
 
@@ -785,9 +786,10 @@ fn build_group(
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let env = profile_env(args.arch, profile);
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, env, seraph.as_ref())?;
         clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
@@ -797,6 +799,7 @@ fn build_group(
     {
         cmd.args(debug_config_flags(args, pkg));
     }
+    cmd.envs(env.iter().copied());
     if let Some(s) = seraph.as_ref()
     {
         s.apply_env(&mut cmd);
@@ -815,6 +818,7 @@ fn build_group(
                 cargo_out.display()
             );
         }
+        check_frame_bound(args.arch, profile, &cargo_out)?;
         for dst in install_paths(ctx, spec)
         {
             if let Some(parent) = dst.parent()
@@ -895,15 +899,17 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     };
 
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let env = profile_env(args.arch, spec.profile);
     if !args.skip_lints
     {
-        clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
+        clippy_check_ext(ctx, &flags_ref, env, seraph.as_ref())?;
         clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
     cmd.arg("build").args(&flags_ref);
     cmd.args(debug_config_flags(args, spec.name));
+    cmd.envs(env.iter().copied());
     if let Some(s) = seraph.as_ref()
     {
         // Routes RUSTC + RUSTC_WORKSPACE_WRAPPER through the shim,
@@ -928,6 +934,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
             cargo_out.display()
         );
     }
+    check_frame_bound(args.arch, spec.profile, &cargo_out)?;
 
     for dst in install_paths(ctx, spec)
     {
@@ -939,6 +946,46 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         step(&format!("{}: {}", spec.name, dst.display()));
     }
 
+    Ok(())
+}
+
+/// `RUSTFLAGS` for the riscv64 kernel build and its lint pass: the
+/// workspace's `-Zunstable-options`, since `RUSTFLAGS` replaces the config
+/// file's `rustflags`, and `-Zemit-stack-sizes`, which writes the
+/// `.stack_sizes` section [`check_frame_bound`] reads. Through `RUSTFLAGS` the
+/// flag reaches the `-Z build-std` crates as well, whose functions the kernel
+/// image also holds.
+const RISCV64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zemit-stack-sizes";
+
+/// The environment a build of `profile` for `arch`, and its lint pass, run
+/// with.
+fn profile_env(arch: Arch, profile: BuildProfile) -> &'static [(&'static str, &'static str)]
+{
+    if arch == Arch::Riscv64 && profile == BuildProfile::Kernel
+    {
+        &[("RUSTFLAGS", RISCV64_KERNEL_RUSTFLAGS)]
+    }
+    else
+    {
+        &[]
+    }
+}
+
+/// Fail a riscv64 kernel build whose `image` has a frame above
+/// [`stack_sizes::RISCV64_KERNEL_FRAME_MAX`], before the image is installed.
+/// Other builds have no frame bound: on x86-64 the call's return-address push
+/// and the stack probes touch every page a frame spans.
+fn check_frame_bound(arch: Arch, profile: BuildProfile, image: &Path) -> Result<()>
+{
+    if arch == Arch::Riscv64 && profile == BuildProfile::Kernel
+    {
+        stack_sizes::check_riscv64_kernel(image)?;
+        step(&format!(
+            "Frame bound: every frame of {} is at most {} B",
+            image.display(),
+            stack_sizes::RISCV64_KERNEL_FRAME_MAX
+        ));
+    }
     Ok(())
 }
 

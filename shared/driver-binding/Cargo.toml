@@ -9,7 +9,8 @@ publish.workspace = true
 
 # no_std: the driver declaration a driver carries in `.note.seraph.driver`
 # and the resource list devmgr delivers it, encoded and decoded once for both
-# sides. Pure logic, host-tested.
+# sides, the driver's decoded list on its heap (`alloc`). Pure logic,
+# host-tested.
 [lib]
 doctest = false
 

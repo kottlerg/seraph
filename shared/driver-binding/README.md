@@ -3,8 +3,8 @@
 Driver declarations and the resource-list bootstrap of driver binding, encoded and decoded once
 for the driver and devmgr.
 
-`no_std` and host-tested; it depends on `shared/ipc`, `shared/syscall`, `abi/process-abi`, and
-`abi/syscall`. It provides:
+`no_std` with `alloc`, since a driver decodes its resource list onto its heap, and host-tested;
+it depends on `shared/ipc`, `shared/syscall`, `abi/process-abi`, and `abi/syscall`. It provides:
 
 - **The declaration** (`decl`): the source form a driver writes (`Declaration`), its compile-time
   encoding into the note descriptor (`encode`), and the decoded form devmgr reads (`DriverDecl`,
@@ -25,9 +25,9 @@ for the driver and devmgr.
   first vector, and the `SYS_IRQ_REGISTER` mode). The terminal end round carries the endpoint
   slots `SLOT_SERVICE`, `SLOT_DEVMGR_QUERY`, and `SLOT_DMA`, packed by
   `ipc::bootstrap::pack_slots`. devmgr builds each round with `Round` (`mmio`, `mmio_at`,
-  `io_port`, `interrupts`, `end`); a driver receives the list
-  with `receive`, which decodes each round into a `ResourceList` (`absorb`) and deletes every
-  delivered cap of a list it refuses. `PlatformDelivery::from_list` reads the list a platform
+  `io_port`, `interrupts`, `end`); a driver receives the list with `receive`, which decodes
+  each round into a `ResourceList` on its heap (`absorb`) and deletes every delivered cap of a
+  list it refuses or has no room for. `PlatformDelivery::from_list` reads the list a platform
   record's bind delivers: one register resource (`Mmio` or `IoPort`), an optional wired line,
   and the endpoints.
 

@@ -113,10 +113,17 @@ The std-userspace triples (`x86_64-seraph.json`, `riscv64a23-seraph.json`)
 carry the same PIE treatment (plus `tls-model: local-exec`, keeping TLS
 access GOT-free so no non-`RELATIVE` relocations appear), emit inline
 stack probes (`"stack-probes": {"kind": "inline"}`, so a frame larger than one page
-touches each page in turn and faults on a thread stack's guard page
+touches its pages in turn and faults on a thread stack's guard
 instead of skipping it), relax the kernel-side soft-float discipline,
 and pin a hard-microarchitecture floor for userspace SIMD / Vector
-codegen:
+codegen. On riscv64 the probes leave up to a page of a frame unwritten (a
+split prologue's first part, and a leaf of up to a page), a `call` writes
+nothing to the stack, and the probe of a vector frame lies a page below
+its fixed area, so two consecutive stack stores can lie up to 14312 bytes
+apart. Every userspace stack therefore keeps a guard of four pages
+(`process_abi::STACK_GUARD_PAGES`; [`threadstack`](../programs/threadstack/README.md)'s
+`splitframe` and `span` modes check it), where x86-64, whose `call` pushes
+the return address, needs one:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,

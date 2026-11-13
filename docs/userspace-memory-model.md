@@ -209,7 +209,7 @@ zone and the image window — TLS at `0x21_0000_0000`, IPC buffer at
 `0x27_C000_0000`, and, kernel-drawn for init, `InitInfo` at
 `0x2A_0000_0000` and the init stack guard at `0x2C_4000_0000`. The
 stride spacing makes region ordering, pairwise disjointness, and the
-unmapped guard page below every stack hold for all possible draws, so
+unmapped guard below every stack hold for all possible draws, so
 no collision checking or redraw is ever needed. Each window's 8 GiB draw
 span leaves a 1 GiB region tail in its stride (`MAX_WINDOW_REGION_PAGES`),
 which bounds the largest stack reservation and TLS block a loader accepts and
@@ -251,7 +251,10 @@ quality caveat.
 - **Main-thread stack.** The loader (procmgr or, for memmgr/procmgr,
   init) maps `ProcessInfo.stack_pages` pages ending at the chosen
   `ProcessInfo.stack_top_vaddr` and leaves the pages below them
-  unmapped, so a guard page lies below every stack. The page
+  unmapped, so a guard of at least `STACK_GUARD_PAGES` (4) pages lies
+  below every stack: on riscv64 two consecutive stack stores can lie
+  14312 bytes apart ([build-system.md](build-system.md) § Custom
+  Targets), and a smaller guard could lie wholly between them. The page
   count comes from the binary's optional `.note.seraph.stack` ELF note
   (declared via the `process_abi::stack_pages!` /
   `std::os::seraph::stack_pages!` macro; see
@@ -262,7 +265,7 @@ quality caveat.
   available RAM is the remaining gate on the resulting
   `REQUEST_MEMORY_CAPS` calls (memmgr tracks per-process frames in a
   RAM-bound arena, not a fixed quota). For an `ET_DYN` image the
-  creator leaves the `1 + MAX_PROCESS_STACK_PAGES` pages below
+  creator leaves the `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages below
   `stack_top_vaddr` to the stack: it maps no other surface there, the
   layout's draw windows keep every other bootstrap surface out of them
   for every draw, and the image's placement check keeps the image out
@@ -275,12 +278,13 @@ quality caveat.
   `std::os::seraph::_start` registers the pages below them, down to a 512-page
   (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB) stack, as a read-write demand
   region with the pager (`REGISTER_REGION`), so the stack grows on
-  first touch; the page below that range stays unregistered as the
-  guard, and an overflow past it faults on an address the pager
-  declines, killing the process. A binary whose note declares 512 pages
+  first touch; the reservation's pages below that range, at least
+  `STACK_GUARD_PAGES`, stay unregistered as the guard, and an overflow
+  past the range faults on an address the pager declines, killing the
+  process. A binary whose note declares 512 pages
   or more, a pinned process (no pager), an `ET_EXEC` image, and a
-  process whose registration fails keep the committed pages alone, the page below
-  which faults the same way. The growth range is the pager's demand
+  process whose registration fails keep the committed pages alone, the pages below
+  which fault the same way. The growth range is the pager's demand
   region like any other: its frames are reclaimed at process death.
 - **Main-thread IPC buffer.** The creator picks a per-process VA and
   writes it into `ProcessInfo.ipc_buffer_vaddr`.
@@ -297,7 +301,7 @@ addresses ride the entry register, and the stack/TLS/IPC VAs are
 `ProcessInfo` fields (`stack_top_vaddr`, `main_tls_vaddr`,
 `ipc_buffer_vaddr`). The only handover constants the ABI crates still
 declare are policy bounds — `DEFAULT_PROCESS_STACK_PAGES`,
-`MAX_PROCESS_STACK_PAGES`, `PROCESS_MAIN_TLS_MAX_PAGES`,
+`MAX_PROCESS_STACK_PAGES`, `STACK_GUARD_PAGES`, `PROCESS_MAIN_TLS_MAX_PAGES`,
 `INIT_STACK_PAGES`, `INIT_INFO_MAX_PAGES` — not layout addresses. The
 draw windows and the per-process degraded-fallback `DEFAULT_*` addresses
 live in `shared/process-layout`, whose windows the kernel's
@@ -451,7 +455,7 @@ which unregisters it with memmgr (`UNREGISTER_REGION`), so memmgr unmaps and
 reclaims the frames it backed, and releases the reservation only once memmgr has
 answered.
 Stacks grow the same way: a spawned thread's stack is a demand region above
-an unregistered guard page
+an unregistered guard of `STACK_GUARD_PAGES` pages
 ([ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)),
 and the main thread's grows below its committed pages
 ([Bootstrap Cross-Boundary VAs](#bootstrap-cross-boundary-vas)).

@@ -128,17 +128,32 @@ pub const PROCESS_ABI_VERSION: u32 = 24;
 /// (`std::os::seraph::stack_pages!` in std-built binaries).
 pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
+/// Unmapped guard pages below every userspace stack, in 4 KiB pages: the
+/// least the creator's layout leaves below a main-thread stack, and the guard
+/// std reserves below each spawned thread's.
+///
+/// Four pages, because a store can land that far below the stack's lowest
+/// written byte. On riscv64 a `call` writes nothing to the stack, and LLVM's
+/// inline stack probes leave up to a page of a frame unwritten, so two
+/// consecutive stores of the std target (`riscv64a23-seraph`, whose vector
+/// probe adds a page) can lie up to 14312 bytes apart: 6120 below the
+/// caller's return-address save, and 8192 below the callee's entry
+/// (docs/build-system.md § Custom Targets). x86-64 needs one page; the one
+/// value keeps one layout on both architectures. The guard costs VA only.
+pub const STACK_GUARD_PAGES: u32 = 4;
+
 /// Hard cap on the declared main-thread stack size, in 4 KiB pages.
 ///
 /// Loaders reject a binary whose note declares more than this; the pool's
 /// available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS`
 /// calls, and memmgr enforces no per-process quota (see
 /// `services/memmgr/docs/memory-pool.md` § Non-Goals). The value is the
-/// largest stack whose reservation (`1 +` this, the guard page included)
-/// fills the region tail `process-layout` leaves after each draw window
-/// (`MAX_WINDOW_REGION_PAGES`, 1 GiB), which it pins with a const assert.
-/// The ceiling costs VA only: a loader maps the pages a binary declares.
-pub const MAX_PROCESS_STACK_PAGES: u32 = (1 << 18) - 1;
+/// largest stack whose reservation (this and the [`STACK_GUARD_PAGES`] guard
+/// below it) fills the region tail `process-layout` leaves after each draw
+/// window (`MAX_WINDOW_REGION_PAGES`, 1 GiB), which it pins with a const
+/// assert. The ceiling costs VA only: a loader maps the pages a binary
+/// declares.
+pub const MAX_PROCESS_STACK_PAGES: u32 = (1 << 18) - STACK_GUARD_PAGES;
 
 /// Resolve a binary's main-thread stack size from its optional
 /// `.note.seraph.stack` value: [`DEFAULT_PROCESS_STACK_PAGES`] without a note,

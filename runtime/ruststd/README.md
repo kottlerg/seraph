@@ -179,27 +179,31 @@ allocator only manages VA space, and a release never loses freed VA. See
 
 `std::thread::spawn` gives each spawned thread its own stack, allocated by `sys/thread` as a
 consumer of the page-reservation surface above. In a demand-paged process
-(`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page reservation of one guard page below
-the usable pages. Only the usable pages are registered with memmgr through
+(`StartupInfo.pager_endpoint_cap` non-zero) the stack is a page reservation of a guard of
+`GUARD_PAGES` (`process_abi::STACK_GUARD_PAGES`, 4) pages below the usable pages. Only the usable
+pages are registered with memmgr through
 [`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), so memmgr
-backs each on first touch; the guard page stays unregistered. An overflow whose first touch lands in
-the guard page faults on an address the pager declines, and the fault ends the whole process, per
+backs each on first touch; the guard stays unregistered. An overflow whose first touch lands in
+the guard faults on an address the pager declines, and the fault ends the whole process, per
 [docs/fault-handling.md § Reply](../../docs/fault-handling.md#reply),
 [docs/process-lifecycle.md § Process Death](../../docs/process-lifecycle.md#process-death), and
 [Capability Model § "Kill process" pattern](../../docs/capability-model.md#kill-process-pattern).
 The std userspace targets emit inline stack probes
 ([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)), so a frame
-larger than one page touches each of its pages in turn and faults on the guard page rather than
-skipping it into an adjacent registered region, such as another thread's stack, which memmgr would
-back without a fault. The usable size is the larger of the requested stack size (at least
-`DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the
-reservation, the page-table funding, or the registration fails, or the process is not demand-paged,
-the stack is instead an eager byte-heap allocation of the requested size (at least 64 KiB, rounded
-up to whole pages) with no guard page. Before starting the thread, the spawn copies the spawning
-thread's fault-handler bindings onto it (`SYS_THREAD_INHERIT_FAULT_HANDLER`), the pager of a
-demand-paged process among them, and a refused copy fails the spawn with the error rather than
-starting a thread whose demand faults (its stack's, when the stack is demand-backed) no pager would
-serve. `join` frees the stack once the thread has left user mode: a demand stack through
+larger than one page touches its pages in turn and faults on the guard rather than skipping it
+into an adjacent registered region, such as another thread's stack, which memmgr would back
+without a fault. On riscv64 the probes leave up to a page of a frame unwritten and a `call` writes
+nothing to the stack, so two consecutive stack stores can lie up to 14312 bytes apart; the guard's
+four pages are wider than that, so no overflow's first store passes it. The usable size is the
+larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages
+(`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the reservation, the page-table funding, or the
+registration fails, or the process is not demand-paged, the stack is instead an eager byte-heap
+allocation of the requested size (at least 64 KiB, rounded up to whole pages) with no guard.
+Before starting the thread, the spawn copies the spawning thread's fault-handler bindings onto it
+(`SYS_THREAD_INHERIT_FAULT_HANDLER`), the pager of a demand-paged process among them, and a
+refused copy fails the spawn with the error rather than starting a thread whose demand faults (its
+stack's, when the stack is demand-backed) no pager would serve. `join` frees the stack once the
+thread has left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and,
 once memmgr has answered, release of its reservation (kept when no answer comes, since memmgr may
 still hold the region), a heap stack through `dealloc`. A detached thread's stack, or that
@@ -263,20 +267,22 @@ Subsequent foreign mappings go through the page-reservation allocator above. See
 
 The main-thread stack is the one bootstrap surface std extends. The loader maps the stack's
 committed pages (`ProcessInfo.stack_pages`) ending at `ProcessInfo.stack_top_vaddr`, inside the
-reservation of `1 + MAX_PROCESS_STACK_PAGES` pages the creator's layout leaves below every stack
-top, for every `ET_DYN` image. In a demand-paged process (`ProcessInfo.pager_endpoint_cap`
-non-zero) whose image is `ET_DYN` (read from its own ELF header, `__ehdr_start`) `_start` funds the
-address space's page-table budget for, and registers with memmgr through
+reservation of `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages the creator's layout leaves
+below every stack top, for every `ET_DYN` image. In a demand-paged process
+(`ProcessInfo.pager_endpoint_cap` non-zero) whose image is `ET_DYN` (read from its own ELF header,
+`__ehdr_start`) `_start` funds the address space's page-table budget for, and registers with
+memmgr through
 [`REGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-7-register_region), the
 pages below the committed ones down to a 512-page (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB) stack,
 the range `process_layout::main_stack_growth` computes, so the main thread's stack grows on first
-touch to the size a spawned thread's has. The page below the range stays unregistered as the
-guard: an overflow past it faults on an address the pager declines and ends the whole process,
-as an overflow of a spawned thread's stack does. A binary whose `stack_pages!` note declares 512
-pages or more, a pinned process, an `ET_EXEC` image (which the loaders place at its link
-addresses unchecked against the reservation), and a process whose funding or registration fails
-keep the committed pages alone, the page below which faults the same way. The range is never
-unregistered; memmgr reclaims its frames at process death.
+touch to the size a spawned thread's has. The reservation's pages below the range, at least
+`STACK_GUARD_PAGES`, stay unregistered as the guard: an overflow past the range faults on an
+address the pager declines and ends the whole process, as an overflow of a spawned thread's stack
+does. A binary whose `stack_pages!` note declares 512 pages or more, a pinned process, an
+`ET_EXEC` image (which the loaders place at its link addresses unchecked against the reservation),
+and a process whose funding or registration fails keep the committed pages alone, the pages below
+which fault the same way. The range is never unregistered; memmgr reclaims its frames at process
+death.
 
 ---
 
@@ -515,7 +521,7 @@ primitives.
 | Document | Content |
 |---|---|
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Three-surface VA model, frame-allocation contract |
-| [docs/build-system.md](../../docs/build-system.md) | Std userspace target specs, including the inline stack probes that reach a thread stack's guard page |
+| [docs/build-system.md](../../docs/build-system.md) | Std userspace target specs, including the inline stack probes that reach a thread stack's guard |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | ProcessInfo handover, `memmgr_endpoint_cap` discipline, process death |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | Pager fault reply: `FAULT_REPLY_FORWARD` declines an unregistered guard-page fault, which the exception handler declines in turn, killing the faulting thread as an unhandled fault |
 | [docs/capability-model.md](../../docs/capability-model.md) | "Kill process" pattern: a terminal fault on any thread tears down the whole process |

@@ -249,11 +249,15 @@ from this crate's layout or values fails the harness. The std macro lets
 std-using binaries declare a stack size without an extra Cargo dep on
 `process-abi`.
 
-`MAX_PROCESS_STACK_PAGES` (2^18 - 1 pages, just under 1 GiB) is a loader-side hard cap: loaders
+`MAX_PROCESS_STACK_PAGES` (2^18 - 4 pages, just under 1 GiB) is a loader-side hard cap: loaders
 refuse a binary whose note declares zero pages or more than it (`resolve_stack_pages`), rather
-than clamping. It is the largest stack whose reservation, guard page included, fills the region
-tail `shared/process-layout` leaves after each draw window, which that crate pins with a const
-assert, so the cap costs VA only. The pool's available RAM is the remaining gate on the
+than clamping. It is the largest stack whose reservation, its guard of `STACK_GUARD_PAGES` (4)
+pages included, fills the region tail `shared/process-layout` leaves after each draw window,
+which that crate pins with a const assert, so the cap costs VA only. Four pages is the guard
+every userspace stack keeps, the main thread's and std's spawned threads' alike: on riscv64 two
+consecutive stack stores of the std target can lie up to 14312 bytes apart
+([docs/build-system.md](../../docs/build-system.md) § Custom Targets), and a smaller guard could
+lie wholly between them. The pool's available RAM is the remaining gate on the
 resulting `REQUEST_MEMORY_CAPS` calls; memmgr enforces no per-process quota (see
 [services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Non-Goals).
 `PROCESS_MAIN_TLS_MAX_PAGES` (2^18 pages) bounds the main-thread TLS block the same way: loaders

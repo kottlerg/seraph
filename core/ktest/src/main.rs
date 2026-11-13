@@ -45,6 +45,12 @@
 //! is unmapped or remapped, so a mapping change at a scratch VA meets the
 //! `# Safety` contracts of `syscall::mem_map` and its siblings. Tests run one
 //! at a time; children reach a scratch page only as their test directs.
+//!
+//! The one mapping change outside the scratch VAs is [`GuardedStack::top`]'s:
+//! it unmaps the guard pages of a child-stack static, inside ktest's image.
+//! No code reads, writes or references a guard, so the unmap meets
+//! `syscall::mem_unmap`'s contract for a part of a live object reached only
+//! through raw pointers.
 
 #![no_std]
 #![no_main]
@@ -338,9 +344,13 @@ impl<const PAGES: usize> GuardedStack<PAGES>
         let flag = Self::guard_unmapped(ptr);
         if !flag.swap(true, Ordering::AcqRel)
         {
-            // SAFETY: the guard pages are the first `STACK_GUARD_PAGES`
-            // page-aligned pages of the static at `ptr`, which no Rust code
-            // reads or writes, so no live object or IPC page lies in the span.
+            // SAFETY: the span is the first `STACK_GUARD_PAGES` page-aligned
+            // pages of the static at `ptr`, its private `guard` field, part of
+            // a live object that `mem_unmap`'s contract allows in the span: no
+            // code reads or writes the field, and no reference covers it,
+            // since every use of a stack static goes through a raw pointer
+            // (`addr_of!`, as `top` and `top_at` take) and no code forms a
+            // reference to a whole `GuardedStack`. No IPC page lies in it.
             let unmapped = unsafe {
                 syscall::mem_unmap(
                     SELF_ASPACE.load(Ordering::Acquire),

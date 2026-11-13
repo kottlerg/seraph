@@ -29,7 +29,9 @@
 //! - a call that changes mappings of the caller's own address space
 //!   (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`, `SYS_MMIO_MAP`) must
 //!   change none that a live Rust object or the registered IPC buffer page
-//!   occupies;
+//!   occupies, where a part of a live object counts only when the program
+//!   accesses it after the call or a live reference covers it (a part reached
+//!   only through raw pointers that never touch the changed pages does not);
 //! - a call that sets the entry state of a thread of the caller's own address
 //!   space (`SYS_THREAD_CONFIGURE`, `SYS_THREAD_WRITE_REGS`) must start or
 //!   resume it only on code, a stack, and a TLS block the program dedicates to

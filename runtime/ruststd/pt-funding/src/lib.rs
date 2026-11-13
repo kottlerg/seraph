@@ -88,7 +88,10 @@ pub const fn pt_pages_for(region_pages: u64) -> u64
     let mut level = 0;
     while level < NON_ROOT_LEVELS
     {
-        let tables = region_pages.saturating_sub(1).div_ceil(span).saturating_add(1);
+        let tables = region_pages
+            .saturating_sub(1)
+            .div_ceil(span)
+            .saturating_add(1);
         total = total.saturating_add(tables);
         span = span.saturating_mul(ENTRIES_PER_TABLE);
         level = level.saturating_add(1);
@@ -199,10 +202,31 @@ mod tests
         // that starts on the last page of a top-level table's span needs
         // exactly it.
         let top = ENTRIES_PER_TABLE.pow(NON_ROOT_LEVELS);
-        for pages in [1, 2, 3, 511, 512, 513, 1024, 1025, 262_144, 262_145, 1 << 20]
+        for pages in [
+            1,
+            2,
+            3,
+            511,
+            512,
+            513,
+            1024,
+            1025,
+            262_144,
+            262_145,
+            1 << 20,
+        ]
         {
             let estimate = pt_pages_for(pages);
-            for start in [0, top - 512, top - 1, top, top + 1, top + 510, top + 511, 3 * top - 1]
+            for start in [
+                0,
+                top - 512,
+                top - 1,
+                top,
+                top + 1,
+                top + 510,
+                top + 511,
+                3 * top - 1,
+            ]
             {
                 assert!(
                     tables_touched(start, pages) <= estimate,

@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::{BuildArgs, BuildComponent};
-use crate::context::Context as BuildContext;
+use crate::context::{Context as BuildContext, Profile};
 use crate::rust_src;
 use crate::sysroot;
 use crate::util::{find_llvm_objcopy, run_cmd, step};
@@ -588,7 +588,7 @@ pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     }
 
     sysroot::record_arch(ctx, args.arch)?;
-    let profile = profile_name(args.release);
+    let profile = args.profile().dir_name();
     step(&format!("Build complete ({}, {})", args.arch, profile));
     Ok(())
 }
@@ -608,7 +608,7 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     step(&format!(
         "Building bootloader for {} ({})",
         args.arch,
-        profile_name(args.release)
+        args.profile().dir_name()
     ));
 
     let boot_triple = args.arch.boot_target_triple();
@@ -622,7 +622,7 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         "-Zbuild-std=core,alloc,compiler_builtins",
         "-Zbuild-std-features=compiler-builtins-mem",
     ];
-    if args.release
+    if args.profile() == Profile::Release
     {
         flags.push("--release");
     }
@@ -650,7 +650,9 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     {
         // RISC-V: cargo produces an ELF; convert to a flat PE32+ binary via
         // llvm-objcopy. The UEFI spec requires a PE32+ image on disk.
-        let elf_out = ctx.cargo_output_dir(boot_triple, args.release).join("boot");
+        let elf_out = ctx
+            .cargo_output_dir(boot_triple, args.profile())
+            .join("boot");
         if !elf_out.exists()
         {
             bail!("expected ELF output not found: {}", elf_out.display());
@@ -680,7 +682,7 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     {
         // x86_64 (and future PE-native archs): cargo produces a .efi PE directly.
         let cargo_out = ctx
-            .cargo_output_dir(boot_triple, args.release)
+            .cargo_output_dir(boot_triple, args.profile())
             .join("boot.efi");
         if !cargo_out.exists()
         {
@@ -748,7 +750,7 @@ fn build_group(
         names.join(", "),
         profile,
         args.arch,
-        profile_name(args.release)
+        args.profile().dir_name()
     ));
 
     let build_std_flag = format!("-Zbuild-std={build_std}");
@@ -766,7 +768,7 @@ fn build_group(
         build_std_flag,
         "-Zbuild-std-features=compiler-builtins-mem".into(),
     ]);
-    if args.release
+    if args.profile() == Profile::Release
     {
         flags.push("--release".into());
     }
@@ -787,7 +789,7 @@ fn build_group(
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
-        clippy_std_members(ctx, triple, build_std, args.release, seraph.as_ref())?;
+        clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -805,7 +807,7 @@ fn build_group(
     // Install each spec's binary from the shared cargo output directory.
     for spec in group
     {
-        let cargo_out = ctx.cargo_output_dir(triple, args.release).join(spec.name);
+        let cargo_out = ctx.cargo_output_dir(triple, args.profile()).join(spec.name);
         if !cargo_out.exists()
         {
             bail!(
@@ -857,7 +859,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         spec.name,
         spec.profile,
         args.arch,
-        profile_name(args.release)
+        args.profile().dir_name()
     ));
 
     let build_std_flag = format!("-Zbuild-std={build_std}");
@@ -871,7 +873,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
         build_std_flag,
         "-Zbuild-std-features=compiler-builtins-mem".into(),
     ];
-    if args.release
+    if args.profile() == Profile::Release
     {
         flags.push("--release".into());
     }
@@ -897,7 +899,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags_ref, &[], seraph.as_ref())?;
-        clippy_std_members(ctx, triple, build_std, args.release, seraph.as_ref())?;
+        clippy_std_members(ctx, triple, build_std, args.profile(), seraph.as_ref())?;
     }
 
     let mut cmd = cargo(&ctx.root);
@@ -918,7 +920,7 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
     }
     run_cmd(&mut cmd)?;
 
-    let cargo_out = ctx.cargo_output_dir(triple, args.release).join(spec.name);
+    let cargo_out = ctx.cargo_output_dir(triple, args.profile()).join(spec.name);
     if !cargo_out.exists()
     {
         bail!(
@@ -1081,7 +1083,7 @@ fn clippy_std_members(
     ctx: &BuildContext,
     triple: &str,
     build_std: &str,
-    release: bool,
+    profile: Profile,
     seraph: Option<&rust_src::SeraphToolchain>,
 ) -> Result<()>
 {
@@ -1089,14 +1091,14 @@ fn clippy_std_members(
     {
         return Ok(());
     }
-    let flags = std_member_lint_flags(triple, build_std, release);
+    let flags = std_member_lint_flags(triple, build_std, profile);
     let flags_ref: Vec<&str> = flags.iter().map(String::as_str).collect();
     clippy_check_ext(ctx, &flags_ref, &[], seraph)
 }
 
 /// The `cargo check` flags of [`clippy_std_members`]: the library of each
 /// std dependency, on `triple`, against the std `build_std` names.
-fn std_member_lint_flags(triple: &str, build_std: &str, release: bool) -> Vec<String>
+fn std_member_lint_flags(triple: &str, build_std: &str, profile: Profile) -> Vec<String>
 {
     let mut flags: Vec<String> = Vec::new();
     for package in rust_src::std_workspace_packages()
@@ -1111,7 +1113,7 @@ fn std_member_lint_flags(triple: &str, build_std: &str, release: bool) -> Vec<St
         format!("-Zbuild-std={build_std}"),
         "-Zbuild-std-features=compiler-builtins-mem".into(),
     ]);
-    if release
+    if profile == Profile::Release
     {
         flags.push("--release".into());
     }
@@ -1134,24 +1136,6 @@ fn copy_file(src: &Path, dst: &Path) -> Result<()>
     fs::copy(src, dst)
         .with_context(|| format!("copying {} -> {}", src.display(), dst.display()))?;
     Ok(())
-}
-
-/// Human-readable profile name matching Cargo's output directory naming.
-fn profile_name(release: bool) -> &'static str
-{
-    if release { "release" } else { "debug" }
-}
-
-/// Cargo profile *selector* name (`dev`/`release`) for `--config` keys.
-///
-/// Distinct from [`profile_name`], which returns the output-directory name
-/// (`debug`/`release`). The cargo profile is literally named `dev`; no profile
-/// is named `debug`, so a per-package `--config` key MUST use this name —
-/// `profile.debug.package.*` would be a silent no-op. Do not fold this into
-/// [`profile_name`].
-fn active_profile(release: bool) -> &'static str
-{
-    if release { "release" } else { "dev" }
 }
 
 /// Whether `--debug` selected `pkg` for debuginfo. [`BuildComponent::All`]
@@ -1177,7 +1161,7 @@ fn debug_config_flags(args: &BuildArgs, pkg: &str) -> Vec<String>
     {
         return Vec::new();
     }
-    let profile = active_profile(args.release);
+    let profile = args.profile().cargo_profile();
     vec![
         "--config".into(),
         format!("profile.{profile}.package.\"{pkg}\".debug=2"),
@@ -1208,7 +1192,7 @@ mod tests
     fn the_std_member_lint_pass_checks_the_crates_only_std_depends_on()
     {
         let triple = Arch::Riscv64.user_target_triple();
-        let flags = std_member_lint_flags(triple, "core,alloc,std,panic_abort", true);
+        let flags = std_member_lint_flags(triple, "core,alloc,std,panic_abort", Profile::Release);
         let selected: Vec<&str> = flags
             .windows(2)
             .filter(|pair| pair[0] == "-p")
@@ -1238,7 +1222,7 @@ mod tests
         }
         assert!(!flags.iter().any(|f| f == "--bin"));
         assert!(
-            !std_member_lint_flags(triple, "core,alloc,std,panic_abort", false)
+            !std_member_lint_flags(triple, "core,alloc,std,panic_abort", Profile::Debug)
                 .iter()
                 .any(|f| f == "--release")
         );

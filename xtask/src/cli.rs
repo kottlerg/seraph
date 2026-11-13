@@ -14,8 +14,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::arch::Arch;
 use crate::bundle::Harness;
+use crate::context::Profile;
 use crate::disk::BlockSize;
-use crate::qemu::{Iommu, RiscvMmu, X86Paging};
+use crate::qemu::{DiskLine, Iommu, RiscvMmu, X86Paging};
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -283,6 +284,22 @@ pub struct BuildArgs
     pub host: HostArgs,
 }
 
+impl BuildArgs
+{
+    /// The build profile `--release` selects.
+    pub fn profile(&self) -> Profile
+    {
+        if self.release
+        {
+            Profile::Release
+        }
+        else
+        {
+            Profile::Debug
+        }
+    }
+}
+
 /// A component `cargo xtask build` builds: the bootloader, every component,
 /// or one crate of the build's spec table (`SPECS` in
 /// `xtask/src/commands/build.rs`), by its crate name. The names are read from
@@ -424,6 +441,22 @@ pub struct RunArgs
     /// rules").
     #[command(flatten)]
     pub host: BootHostArgs,
+}
+
+impl RunArgs
+{
+    /// The second disk's `INTx` line `--second-disk-shared-line` selects.
+    pub fn second_disk_line(&self) -> DiskLine
+    {
+        if self.second_disk_shared_line
+        {
+            DiskLine::Shared
+        }
+        else
+        {
+            DiskLine::Own
+        }
+    }
 }
 
 // ── Mkdisk ────────────────────────────────────────────────────────────────────
@@ -902,6 +935,22 @@ pub struct RunParallelArgs
     /// rules").
     #[command(flatten)]
     pub host: BootHostArgs,
+}
+
+impl RunParallelArgs
+{
+    /// The second disk's `INTx` line `--second-disk-shared-line` selects.
+    pub fn second_disk_line(&self) -> DiskLine
+    {
+        if self.second_disk_shared_line
+        {
+            DiskLine::Shared
+        }
+        else
+        {
+            DiskLine::Own
+        }
+    }
 }
 
 // ── KtestTiming ───────────────────────────────────────────────────────────────

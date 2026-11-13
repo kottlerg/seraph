@@ -914,7 +914,12 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
             step(&format!("Ended the batch; its state is {}", kept.display()));
         }
         OrchCommand::Orchestrator { id: None } => println!("{}", orchestrator_id(&load(&dir)?)?),
-        command =>
+        command @ (OrchCommand::Orchestrator { id: Some(_) }
+        | OrchCommand::Worker(_)
+        | OrchCommand::Grant { .. }
+        | OrchCommand::Order { .. }
+        | OrchCommand::Question { .. }
+        | OrchCommand::Ruling { .. }) =>
         {
             let change_asked = state_change(command)?;
             let line = change(&dir, &change_asked, secs)?;
@@ -938,7 +943,16 @@ fn apply_to_host(ctx: &BuildContext, change: &Change) -> Result<()>
             host_lock::write_grant(&host_lock::lock_dir(ctx), &holder, commands)
         }
         Change::GrantClear => host_lock::clear_grant(&host_lock::lock_dir(ctx)),
-        _ => Ok(()),
+        Change::Orchestrator(_)
+        | Change::Worker { .. }
+        | Change::WorkerRemove(_)
+        | Change::Queue { .. }
+        | Change::Unqueue(_)
+        | Change::Order(_)
+        | Change::QuestionAdd { .. }
+        | Change::QuestionClose(_)
+        | Change::RulingAdd(_)
+        | Change::RulingDrop(_) => Ok(()),
     }
 }
 

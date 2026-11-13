@@ -234,6 +234,17 @@ impl From<BatchDisplay> for QemuDisplay
     }
 }
 
+/// The second disk's `INTx` line: its own slot's line, or the first disk's
+/// line (the `--second-disk-shared-line` launch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskLine
+{
+    /// The line of the second disk's own slot.
+    Own,
+    /// The first disk's line.
+    Shared,
+}
+
 /// A second disk for a QEMU launch: its image, the logical block size its
 /// device presents, and whether it shares the first disk's `INTx` line.
 pub struct SecondDisk<'a>
@@ -242,11 +253,12 @@ pub struct SecondDisk<'a>
     /// Logical and physical block size of the `virtio-blk-pci` device, in
     /// bytes.
     pub block_size: u32,
-    /// Place the device at `SHARED_LINE_SECOND_DISK_SLOT`, on the first
-    /// disk's `INTx` line on both machines, rather than at
-    /// `SECOND_DISK_SLOT`, on a line of its own, and launch both disks with
-    /// no MSI-X capability, so their driver is given the shared wired line.
-    pub shared_line: bool,
+    /// With [`DiskLine::Shared`], place the device at
+    /// `SHARED_LINE_SECOND_DISK_SLOT`, on the first disk's `INTx` line on
+    /// both machines, rather than at `SECOND_DISK_SLOT`, on a line of its
+    /// own, and launch both disks with no MSI-X capability, so their driver
+    /// is given the shared wired line.
+    pub line: DiskLine,
 }
 
 /// Specification for one QEMU launch.
@@ -360,7 +372,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             spec.disk_block_size,
             spec.second_disk.as_ref().map(|_| FIRST_DISK_SLOT),
             spec.iommu,
-            spec.second_disk.as_ref().is_some_and(|s| s.shared_line),
+            spec.second_disk.as_ref().map_or(DiskLine::Own, |s| s.line),
         ),
     ]);
 
@@ -374,9 +386,9 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
             blk_device(
                 "hd1",
                 second.block_size,
-                Some(second_disk_slot(second.shared_line)),
+                Some(second_disk_slot(second.line)),
                 spec.iommu,
-                second.shared_line,
+                second.line,
             ),
         ]);
     }
@@ -458,16 +470,14 @@ const FIRST_DISK_SLOT: u8 = 0x10;
 const SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 2;
 const SHARED_LINE_SECOND_DISK_SLOT: u8 = FIRST_DISK_SLOT + 4;
 
-/// The second disk's PCI slot: on the first disk's line when `shared_line`.
-const fn second_disk_slot(shared_line: bool) -> u8
+/// The second disk's PCI slot: on the first disk's line when `line` is
+/// [`DiskLine::Shared`].
+const fn second_disk_slot(line: DiskLine) -> u8
 {
-    if shared_line
+    match line
     {
-        SHARED_LINE_SECOND_DISK_SLOT
-    }
-    else
-    {
-        SECOND_DISK_SLOT
+        DiskLine::Shared => SHARED_LINE_SECOND_DISK_SLOT,
+        DiskLine::Own => SECOND_DISK_SLOT,
     }
 }
 
@@ -475,17 +485,22 @@ const fn second_disk_slot(shared_line: bool) -> u8
 /// logical and physical blocks (QEMU requires the physical size to be at
 /// least the logical), at PCI slot `slot` when one is given, behind the
 /// IOMMU when `iommu` attaches one, and with no MSI-X capability
-/// (`vectors=0`) when `wired_only`, so it signals on its `INTx` line alone.
+/// (`vectors=0`) when `line` is [`DiskLine::Shared`], so it signals on its
+/// `INTx` line alone.
 fn blk_device(
     drive: &str,
     block_size: u32,
     slot: Option<u8>,
     iommu: Iommu,
-    wired_only: bool,
+    line: DiskLine,
 ) -> String
 {
     let addr = slot.map_or_else(String::new, |slot| format!(",addr={slot:#04x}"));
-    let vectors = if wired_only { ",vectors=0" } else { "" };
+    let vectors = match line
+    {
+        DiskLine::Shared => ",vectors=0",
+        DiskLine::Own => "",
+    };
     format!(
         "virtio-blk-pci,drive={drive},disable-legacy=on{},logical_block_size={block_size},\
          physical_block_size={block_size}{addr}{vectors}",
@@ -1234,7 +1249,7 @@ mod tests
         spec.second_disk = Some(SecondDisk {
             path: Path::new("disk-data.img"),
             block_size: 8192,
-            shared_line: false,
+            line: DiskLine::Own,
         });
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(
@@ -1256,13 +1271,13 @@ mod tests
 
     /// The two disks' slots of a two-disk launch, the second placed on the
     /// shared line or not.
-    fn disk_slots(shared_line: bool) -> (u8, u8)
+    fn disk_slots(line: DiskLine) -> (u8, u8)
     {
         let mut spec = riscv_spec(1, 512);
         spec.second_disk = Some(SecondDisk {
             path: Path::new("disk-data.img"),
             block_size: 512,
-            shared_line,
+            line,
         });
         let argv = build_qemu_argv(&spec).unwrap();
         (
@@ -1286,7 +1301,7 @@ mod tests
     #[test]
     fn two_disks_land_on_distinct_intx_lines_on_both_machines()
     {
-        let (first, second) = disk_slots(false);
+        let (first, second) = disk_slots(DiskLine::Own);
         assert_ne!(ovmf_line(first), ovmf_line(second));
         assert_ne!(aplic_source(first), aplic_source(second));
         // q35 routes every slot past 24 to one line.
@@ -1296,7 +1311,7 @@ mod tests
     #[test]
     fn shared_line_disks_land_on_one_intx_line_on_both_machines()
     {
-        let (first, second) = disk_slots(true);
+        let (first, second) = disk_slots(DiskLine::Shared);
         assert_ne!(first, second);
         assert_eq!(ovmf_line(first), ovmf_line(second));
         assert_eq!(aplic_source(first), aplic_source(second));
@@ -1308,19 +1323,23 @@ mod tests
     #[test]
     fn only_shared_line_disks_drop_msix()
     {
-        for shared_line in [false, true]
+        for line in [DiskLine::Own, DiskLine::Shared]
         {
             let mut spec = riscv_spec(1, 512);
             spec.second_disk = Some(SecondDisk {
                 path: Path::new("disk-data.img"),
                 block_size: 512,
-                shared_line,
+                line,
             });
             let argv = build_qemu_argv(&spec).unwrap();
             for drive in ["hd0", "hd1"]
             {
                 let dev = blk_device_arg(&argv, drive).unwrap();
-                assert_eq!(dev.ends_with(",vectors=0"), shared_line, "{dev}");
+                assert_eq!(
+                    dev.ends_with(",vectors=0"),
+                    line == DiskLine::Shared,
+                    "{dev}"
+                );
             }
         }
         let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
@@ -1347,7 +1366,7 @@ mod tests
             spec.second_disk = Some(SecondDisk {
                 path: Path::new("second.img"),
                 block_size: size,
-                shared_line: false,
+                line: DiskLine::Own,
             });
             assert!(build_qemu_argv(&spec).is_err(), "second disk {size}");
         }
@@ -1370,7 +1389,7 @@ mod tests
             spec.second_disk = Some(SecondDisk {
                 path: Path::new("second.img"),
                 block_size: 512,
-                shared_line: false,
+                line: DiskLine::Own,
             });
             let argv = build_qemu_argv(&spec).unwrap();
             assert!(argv.iter().any(|a| a == iommu_device));

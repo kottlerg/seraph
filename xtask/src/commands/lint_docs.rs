@@ -320,16 +320,19 @@ fn prose_lines(text: &str) -> impl Iterator<Item = (usize, &str)>
             .chars()
             .next()
             .filter(|c| *c == '`' || *c == '~')
-            .map(|c| (c, trimmed.chars().take_while(|x| *x == c).count()));
+            .map(|c| {
+                let after = trimmed.trim_start_matches(c);
+                (c, trimmed.chars().take_while(|x| *x == c).count(), after)
+            });
         match (open, fence)
         {
-            (None, Some((c, n))) if n >= 3 && (c != '`' || !trimmed[n..].contains('`')) =>
+            (None, Some((c, n, after))) if n >= 3 && (c != '`' || !after.contains('`')) =>
             {
                 open = Some((c, n));
                 false
             }
-            (Some((oc, on)), Some((c, n)))
-                if c == oc && n >= on && trimmed[n..].trim().is_empty() =>
+            (Some((oc, on)), Some((c, n, after)))
+                if c == oc && n >= on && after.trim().is_empty() =>
             {
                 open = None;
                 false
@@ -577,7 +580,7 @@ fn normalize(path: &Path) -> Option<String>
                 parts.pop()?;
             }
             Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
-            _ =>
+            Component::Prefix(_) | Component::RootDir | Component::CurDir =>
             {}
         }
     }
@@ -888,8 +891,10 @@ fn check_direct_links(
         let docs_dir = format!("{dir}docs/");
         for doc in markdown.iter().filter(|f| is_authoritative(&f.path))
         {
-            let in_docs = doc.path.starts_with(&docs_dir)
-                && !doc.path[docs_dir.len()..].contains('/')
+            let in_docs = doc
+                .path
+                .strip_prefix(&docs_dir)
+                .is_some_and(|name| !name.contains('/'))
                 && doc.path != readme;
             if in_docs && !links.get(readme).is_some_and(|t| t.contains(&doc.path))
             {
@@ -1365,10 +1370,12 @@ fn glob_matches(glob: &str, name: &str) -> bool
     {
         None => glob == name,
         Some((head, rest)) => name.strip_prefix(head).is_some_and(|tail| {
-            tail.char_indices()
-                .map(|(i, _)| i)
-                .chain(std::iter::once(tail.len()))
-                .any(|i| glob_matches(rest, &tail[i..]))
+            // Every suffix of `tail`, itself first and the empty one last.
+            std::iter::successors(Some(tail), |suffix| {
+                let mut chars = suffix.chars();
+                chars.next().map(|_| chars.as_str())
+            })
+            .any(|suffix| glob_matches(rest, suffix))
         }),
     }
 }
@@ -1824,6 +1831,30 @@ mod tests
                 .iter()
                 .any(|m| m.contains("does not link `c/docs/o.md`"))
         );
+    }
+
+    #[test]
+    fn a_component_readme_owes_no_link_to_a_document_below_its_docs_directory()
+    {
+        let root = md("README.md", "[C](c/README.md) [N](c/docs/é/n.md)\n");
+        let c = md("c/README.md", "# C\n\n---\n\n## Summarized By\n\nNone\n");
+        let nested = md("c/docs/é/n.md", "# N\n\n---\n\n## Summarized By\n\nNone\n");
+        let diags = check_reachable(&pat(), &[&root, &c, &nested]);
+        assert!(
+            !diags.iter().any(|d| d.message.contains("does not link")),
+            "{:?}",
+            diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_glob_star_matches_runs_of_multi_byte_characters()
+    {
+        assert!(glob_matches("a*b", "aéb"));
+        assert!(glob_matches("*é", "xyé"));
+        assert!(glob_matches("é*", "é"));
+        assert!(glob_matches("*", ""));
+        assert!(!glob_matches("a*é", "aé b"));
     }
 
     #[test]

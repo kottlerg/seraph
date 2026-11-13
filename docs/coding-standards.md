@@ -39,20 +39,45 @@ The following individual lints are additionally mandatory:
   `assertions_on_result_states`, `dbg_macro`, `default_union_representation`,
   `empty_enum_variants_with_brackets`, `empty_structs_with_brackets`, `fn_to_numeric_cast_any`,
   `get_unwrap`, `indexing_slicing`, `infinite_loop`, `iter_over_hash_type`, `mem_forget`,
-  `mixed_read_write_in_expression`, `precedence_bits`, `pub_without_shorthand`,
+  `mixed_read_write_in_expression`, `pointer_format`, `precedence_bits`, `pub_without_shorthand`,
   `renamed_function_params`, `rest_pat_in_fully_bound_structs`, `self_named_module_files`,
   `separated_literal_suffix`, `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`,
   `try_err`, `unimplemented`, `unnecessary_rest_pattern`, `unnecessary_safety_comment`,
   `unnecessary_safety_doc`, `unnecessary_self_imports`, and `unneeded_field_pattern`.
 - From `clippy::nursery`: `as_ptr_cast_mut`, `collection_is_never_read`,
   `debug_assert_with_mut_call`, `fallible_impl_from`, `literal_string_with_formatting_args`,
-  `read_zero_byte_vec`, `significant_drop_in_scrutinee`, `trailing_empty_array`,
-  `transmute_undefined_repr`, and `uninhabited_references`.
+  `non_send_fields_in_send_ty`, `read_zero_byte_vec`, `significant_drop_in_scrutinee`,
+  `trailing_empty_array`, `transmute_undefined_repr`, and `uninhabited_references`.
 
 `pub_without_shorthand` keeps the `pub(crate)` form, `self_named_module_files` the
 `mod.rs` form of a module with children, `separated_literal_suffix` the unseparated
 literal suffix (`0u8`), and `tests_outside_test_module` every test in the `#[cfg(test)]` module of
 § D Form.
+
+Each of the lints below, those listed above and those the staged roll-out below is making
+mandatory, checks a rule this document states, and a site the rule permits carries an item-level
+`#[expect(<lint>, reason = "...")]` (§ E) whose reason gives what the rule asks of it. The rules of
+`panic`, `unreachable`, `unwrap_in_result` and `panic_in_result_fn` are in § Error Handling, of
+`fn_params_excessive_bools` in § Function Design, of `non_send_fields_in_send_ty` in
+§ Concurrency, and of `pointer_format` in § Cross-Boundary Data Hygiene. The others:
+
+- `wildcard_enum_match_arm`: a match on an enum the tree defines names every variant it handles,
+  the variants of a shared arm included, so that adding a variant fails the build at every match
+  that must decide what to do with it. A wildcard arm remains only over an enum defined outside
+  the tree, and its `#[expect]` says so.
+- `volatile_composites`: a volatile access reads or writes one primitive at a time (a field, an
+  element or a register) at the width the device, the protocol or the memory defines. An array or
+  a struct is accessed field by field or element by element, a scrub included.
+- `string_slice`: a `str` is split by a pattern method (`strip_prefix`, `split_once`,
+  `char_indices`) or by `str::get` with a path for `None`, not by a byte index. An index no such
+  form expresses carries an `#[expect]` that says why it lies on a character boundary.
+- `significant_drop_tightening`: a lock guard is dropped at its last use, by `drop` or by a
+  narrower scope. A guard held past it carries an `#[expect]` naming what the longer hold
+  serialises.
+- `large_stack_frames`: Clippy estimates a frame as the sum of the function's locals, an upper
+  bound on the compiled frame. A function whose estimate exceeds its crate's threshold (below)
+  moves its large local off the stack or is split; a frame that stays large carries an
+  `#[expect]` naming the large local, its size, and the stack that holds it.
 
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does not pass this
 configuration is non-compliant. Configuration lives in `[workspace.lints]` in the root
@@ -71,6 +96,26 @@ drivers and programs, and the harness and host crates. The roll-out ends by movi
 `[workspace.lints]` and removing every crate-root and module-root level for it; a crate-root or
 module-root level that enables it is permitted only until then. A site is fixed as § Unsafe Code
 says.
+
+`fn_params_excessive_bools`, `large_stack_frames`, `panic`, `panic_in_result_fn`,
+`significant_drop_tightening`, `string_slice`, `unreachable`, `unwrap_in_result`,
+`volatile_composites` and `wildcard_enum_match_arm` are being made mandatory by a staged roll-out
+taken the same way: a crate whose sites are fixed enables them at its crate root, and `core/kernel`
+at the root module of each subsystem whose sites are fixed, until the roll-out moves them to
+`[workspace.lints]` and removes every crate-root and module-root level for them. A site is fixed
+as the rule above that the lint checks says. Test code is exempt from `panic`,
+`panic_in_result_fn`, `string_slice`, `unreachable` and `unwrap_in_result`, so their level is
+`#![cfg_attr(not(test), warn(...))]`: a source-level level would override the test
+configuration's relaxation, to which the roll-out ends by adding them. Two of the lints take a
+setting from Clippy's configuration file, `clippy.toml`: `max-fn-params-bools = 0`, so that
+`fn_params_excessive_bools` reports every function with a `bool` parameter, and
+`stack-size-threshold`, the frame above which `large_stack_frames` reports. The threshold is a
+quarter of the smallest stack the crate's code runs on: 4096 bytes for `core/kernel`, whose thread
+and idle stacks are 16 KiB (`KERNEL_STACK_PAGES`), 32768 bytes for `core/boot`, which runs on the
+128 KiB stack the UEFI specification guarantees a boot-services image, and Clippy's default of
+512,000 bytes for every other crate. `core/boot` and `core/kernel` each add a `clippy.toml` with
+both settings when their sites are fixed, and the roll-out ends with the root `clippy.toml`. Until
+then a site added in a crate or subsystem whose sites are fixed follows the same rule.
 
 `clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
 suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions
@@ -207,8 +252,13 @@ Global symbols are prefixed with the component name to avoid collisions
 
 - Functions SHOULD do one thing. If a function needs a comment to separate phases, split it.
 - Functions SHOULD be under 50 lines. Functions over 100 lines require strong justification.
-- Boolean parameters that alter behaviour MUST NOT be used — prefer separate functions or
-  an explicit enum.
+- A `bool` parameter that chooses what the function does MUST NOT be used: the choice is an
+  enum whose variants name the behaviours, or separate functions where every caller fixes the
+  choice. A `bool` parameter that is data, a value the function stores, encodes, compares or
+  reports (a bit of a register or of a message word, a field of a record, an outcome it
+  records), is permitted and carries `#[expect(clippy::fn_params_excessive_bools, reason =
+  "...")]` naming the value, since the lint reports every `bool` parameter (§ Clippy) and cannot
+  tell the two apart.
 
 ---
 
@@ -219,8 +269,15 @@ Global symbols are prefixed with the component name to avoid collisions
 - All fallible operations MUST return `Result`. Callers MUST handle errors explicitly.
 - `unwrap()` and `expect()` MUST NOT be used in production code paths. Permitted in tests
   and in `const` contexts where the value is statically guaranteed.
-- `panic!` MUST NOT be used in production code. A kernel panic is a last resort for
-  unrecoverable states only, not a substitute for error handling.
+- `panic!` and `unreachable!` MUST NOT be used in production code. A failure the caller can act
+  on is an error the function returns, and a condition whose failure means the code is wrong is
+  an assertion (§ Assertions). In a function that returns `Result` or `Option`, a check whose
+  failure the function can report is that error, not an assertion or an `expect`. A panic is the
+  last resort for an unrecoverable state neither form expresses, such as a match arm the code's
+  invariants exclude; the site carries `#[expect(clippy::panic, reason = "...")]` (or
+  `clippy::unreachable`) whose reason names that state. `clippy::panic`, `clippy::unreachable`,
+  `clippy::panic_in_result_fn` and `clippy::unwrap_in_result` check this (§ Clippy); test code
+  reports a defect by panicking and is exempt as § Clippy and § E state.
 - Error types are defined per-subsystem and carry enough context for the caller to decide
   without inspecting internal state.
 
@@ -339,6 +396,9 @@ unsafe {
   Such a field MAY be a bare `T` when a rustdoc names that owner: the field's own for a
   thread-control-block field, whose owners differ field by field; for any other object, the
   object's rustdoc, or the field's own, names the lock that owns it.
+- An `unsafe impl Send` for a type with fields that are not `Send` carries
+  `#[expect(clippy::non_send_fields_in_send_ty, reason = "...")]` naming the lock, or the owner
+  rule above, that serialises those fields; its SAFETY comment shows that the rule holds.
 - Prefer message passing over shared memory; shared memory is a deliberate optimisation,
   not the default.
 - Lock ordering MUST be documented and consistent. When acquiring multiple locks, always
@@ -390,7 +450,11 @@ fields, fault and exception messages, exit and death reasons, `SYS_CAP_INFO` /
   [docs/console-model.md](console-model.md) § Ownership across the boot lifecycle
   defines, with the known sites listed in
   [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
-  § Kernel console diagnostics. They MUST NOT reach a userspace IPC or log channel.
+  § Kernel console diagnostics. They MUST NOT reach a userspace IPC or log channel. Each format
+  of a kernel pointer (`{:p}`, or `{:?}` of a raw pointer) carries
+  `#[expect(clippy::pointer_format, reason = "...")]` naming the serial-only sink it prints
+  through, such as a panic or assertion message, which the panic handler prints through
+  `console::panic_write_fmt`.
 
 New or changed cross-boundary outputs MUST be classified in the kernel
 cross-boundary disclosure inventory (`core/kernel/docs/cross-boundary-disclosure.md`)
@@ -606,6 +670,14 @@ formatter behavior MUST:
 - Carry a rationale explaining why the rule is inapplicable at this site.
 
 Blanket or module-wide suppressions are forbidden without explicit justification.
+
+A crate that exists only to test reports a defect by panicking: a booted harness (`svctest`,
+`usertest`), a per-program tester, and a test fixture or benchmark program under `programs/`. Its
+crate root MAY suppress, of `unwrap_used`, `expect_used`, `panic`, `unreachable`,
+`unwrap_in_result` and `panic_in_result_fn`, those that fire in it, with one
+`#![expect(.., reason = "...")]` whose reason names the crate's role and how it reports a
+failure. That is the justified module-wide suppression the rule above admits; any other
+suppression in such a crate is item-level.
 
 A lint is suppressed with `#[expect(<lint>, reason = "<rationale>")]`, MUST NOT be suppressed
 with `#[allow(...)]`, and its `reason` carries the rationale; a comment immediately preceding the

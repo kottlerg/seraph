@@ -89,6 +89,10 @@ pub struct EventQueueState
     pub lock: crate::sync::Spinlock,
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the fields that are not `Send` are read and written only under the queue's `lock`"
+)]
 // SAFETY: every field except `count` is read and written only under `eq.lock`;
 // `count` is additionally Acquire-read locklessly by `wait_set::source_is_ready`
 // against the Release stores below (see the `count` field doc).

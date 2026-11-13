@@ -22,6 +22,23 @@
 
 // Staged roll-out of this lint: docs/coding-standards.md § Clippy.
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 use crate::sched::thread::ThreadControlBlock;
 
@@ -526,7 +543,9 @@ pub(crate) unsafe fn source_lock_of(
             IpcThreadState::BlockedOnWaitSet => Some(core::ptr::addr_of!(
                 (*blocked_on.cast::<wait_set::WaitSetState>()).lock
             )),
-            _ => None,
+            IpcThreadState::None
+            | IpcThreadState::BlockedOnReply
+            | IpcThreadState::BlockedOnFault => None,
         }
     }
 }

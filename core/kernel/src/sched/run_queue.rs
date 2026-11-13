@@ -209,6 +209,11 @@ impl RunQueue
             reason = "every access reads a field of `tcb`, a live TCB whose fields the owning \
                       scheduler lock, held by the caller, keeps stable"
         )]
+        #[expect(
+            clippy::pointer_format,
+            reason = "the TCB address is printed only in an assertion message, which the panic \
+                      handler writes through the serial-only `console::panic_write_fmt`"
+        )]
         // SAFETY: tcb is a valid live TCB pointer; the caller holds
         // the owning scheduler.lock so these fields are stable.
         unsafe {
@@ -260,6 +265,11 @@ impl RunQueue
             clippy::multiple_unsafe_ops_per_block,
             reason = "every access reads a field of `tcb`, a live TCB whose fields the owning \
                       scheduler lock, held by the caller, keeps stable"
+        )]
+        #[expect(
+            clippy::pointer_format,
+            reason = "the TCB address is printed only in an assertion message, which the panic \
+                      handler writes through the serial-only `console::panic_write_fmt`"
         )]
         // SAFETY: tcb is a valid live TCB pointer; the caller holds the owning
         // scheduler.lock so these fields are stable.
@@ -474,6 +484,11 @@ pub struct PerCpuScheduler
     pub deferred_reclaim_head: AtomicPtr<u8>,
 }
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "the run queues, the field that is not `Send`, are reached only under the \
+              scheduler's `lock`"
+)]
 // SAFETY: the run queues are reached only under `lock` (the `unsafe` methods'
 // contract; before APs start, core/kernel/docs/initialization.md § Phase 8:
 // Scheduler and SMP Bringup, only the boot CPU touches the scheduler slab);
@@ -570,6 +585,11 @@ impl PerCpuScheduler
         // undocumented_unsafe_blocks: the unsafe blocks sit inside `debug_assert!`
         // arguments, where no per-block SAFETY comment can be placed; the comment
         // above covers both.
+        #[expect(
+            clippy::pointer_format,
+            reason = "the TCB address is printed only in an assertion message, which the panic \
+                      handler writes through the serial-only `console::panic_write_fmt`"
+        )]
         #[allow(clippy::undocumented_unsafe_blocks)]
         {
             debug_assert!(
@@ -591,8 +611,22 @@ impl PerCpuScheduler
         let prior_link = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
         if prior_link >= 0
         {
-            // Diagnostic reads of `tcb`, valid by the caller's contract.
+            // Diagnostic reads of `tcb`, valid by the caller's contract. They
+            // are made only once the double link is found, and each is an
+            // `unsafe` read with its own SAFETY comment, which the lazily
+            // evaluated message arguments of an `assert!` cannot carry; so the
+            // report is a `panic!` inside the check.
             #[cfg(debug_assertions)]
+            #[expect(
+                clippy::pointer_format,
+                reason = "the TCB address is printed only in a panic message, which the panic \
+                          handler writes through the serial-only `console::panic_write_fmt`"
+            )]
+            #[expect(
+                clippy::panic,
+                reason = "a debug-build tripwire for a TCB linked on two run queues, a state the \
+                          invariant that a Ready thread is linked once excludes"
+            )]
             {
                 // SAFETY: tcb valid; `thread_id` is immutable.
                 let tid = unsafe { (*tcb).thread_id };
@@ -717,6 +751,11 @@ impl PerCpuScheduler
         // tcb is from the run queue; magic field is always readable on valid TCB.
         // undocumented_unsafe_blocks: the unsafe block sits inside a `debug_assert!`
         // argument, where no per-block SAFETY comment can be placed.
+        #[expect(
+            clippy::pointer_format,
+            reason = "the TCB address is printed only in an assertion message, which the panic \
+                      handler writes through the serial-only `console::panic_write_fmt`"
+        )]
         #[allow(clippy::undocumented_unsafe_blocks)]
         {
             debug_assert!(

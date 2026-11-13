@@ -284,7 +284,11 @@ pub enum IpcThreadState
 /// core/kernel/docs/scheduling-internals.md § `ThreadState` Transitions. `Exited`
 /// is terminal; the TCB is freed only by `dealloc_object(Thread)` when the
 /// Thread object's last capability goes.
+///
+/// `#[repr(u8)]` makes the value one byte whose discriminant a volatile probe
+/// reads alone (`sched::running_thread_stopped`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ThreadState
 {
     /// Allocated but not yet started.
@@ -1228,6 +1232,11 @@ pub struct ThreadControlBlock
 /// Expected value of `ThreadControlBlock::magic` for a live TCB.
 pub const TCB_MAGIC: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
+#[expect(
+    clippy::non_send_fields_in_send_ty,
+    reason = "each field that is not `Send` is reached only under the owner that \
+              core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership names for it"
+)]
 // SAFETY: a TCB carries no thread affinity; every cross-CPU access to its
 // fields follows the owning lock or atomic discipline of the field's group
 // (core/kernel/docs/scheduling-internals.md § Cross-CPU TCB Ownership).

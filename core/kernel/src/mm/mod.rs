@@ -10,6 +10,24 @@
 //! is owned by the typed-memory cap surface (`crate::cap::retype`); the
 //! kernel does not run a `GlobalAlloc`.
 
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
+
 pub mod address_space;
 pub mod buddy;
 pub mod frame_map;

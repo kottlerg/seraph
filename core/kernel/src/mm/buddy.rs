@@ -33,9 +33,6 @@
 //! ownership rule is specified in docs/userspace-memory-model.md § Ownership
 //! Boundaries.
 
-// cast_possible_truncation: u64→usize page-count casts bounded by physical address ranges.
-#![allow(clippy::cast_possible_truncation)]
-
 use core::marker::PhantomData;
 
 /// Size of a single physical page in bytes.
@@ -134,7 +131,6 @@ pub struct BuddyAllocator<W: PhysWindow = DirectMap>
     /// Read only by the `free_range` `debug_assert`, so it is write-only in a
     /// release build (the tripwire is debug-only by design — a misaccounted
     /// page must not brick a release boot; CI's debug matrix enforces it).
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     sealed: bool,
     /// The window through which free-block headers are reached.
     window: PhantomData<W>,
@@ -617,8 +613,10 @@ impl<W: PhysWindow> BuddyAllocator<W>
             run_end = cursor
                 .checked_add((PAGE_SIZE as u64) << header.order)
                 .unwrap_or(NONE);
-            // cast_possible_truncation: a header's order is at most MAX_ORDER.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a header's order is at most MAX_ORDER"
+            )]
             // SAFETY: the block left its free list in `drain_sorted` and the
             // allocator still owns it; its header was read above, so
             // rewriting it loses nothing.
@@ -1020,7 +1018,9 @@ mod tests
     fn a_contiguous_request_past_one_block_takes_a_run_and_returns_its_tail()
     {
         let mut alloc = with_region(3 * M);
-        let base = alloc.alloc_contiguous((M + 1) as usize).expect("run");
+        let base = alloc
+            .alloc_contiguous(usize::try_from(M + 1).unwrap())
+            .expect("run");
         assert_eq!(base, BASE);
         assert_eq!(alloc.free_page_count() as u64, 3 * M - (M + 1));
         // The tail past the request is allocatable again, right after it.
@@ -1035,7 +1035,9 @@ mod tests
         unsafe { alloc.add_region(BASE, BASE + pages(M)) };
         // SAFETY: SparseWindow backs every header slot.
         unsafe { alloc.add_region(BASE + pages(2 * M), BASE + pages(4 * M)) };
-        let base = alloc.alloc_contiguous((2 * M) as usize).expect("run");
+        let base = alloc
+            .alloc_contiguous(usize::try_from(2 * M).unwrap())
+            .expect("run");
         assert_eq!(base, BASE + pages(2 * M));
         assert_eq!(alloc.alloc(MAX_ORDER), Some(BASE));
         assert_eq!(alloc.free_page_count(), 0);
@@ -1049,7 +1051,10 @@ mod tests
         unsafe { alloc.add_region(BASE, BASE + pages(M)) };
         // SAFETY: SparseWindow backs every header slot.
         unsafe { alloc.add_region(BASE + pages(2 * M), BASE + pages(3 * M)) };
-        assert_eq!(alloc.alloc_contiguous((M + 1) as usize), None);
+        assert_eq!(
+            alloc.alloc_contiguous(usize::try_from(M + 1).unwrap()),
+            None
+        );
         assert_eq!(alloc.free_page_count() as u64, 2 * M);
         assert!(alloc.alloc(MAX_ORDER).is_some());
         assert!(alloc.alloc(MAX_ORDER).is_some());
@@ -1075,7 +1080,9 @@ mod tests
     fn a_contiguous_request_of_exactly_one_largest_block_leaves_the_other_whole()
     {
         let mut alloc = with_region(2 * M);
-        let first = alloc.alloc_contiguous(M as usize).expect("one block");
+        let first = alloc
+            .alloc_contiguous(usize::try_from(M).unwrap())
+            .expect("one block");
         assert_eq!(alloc.free_page_count() as u64, M);
         // The other block is whole: one more largest-block request takes it.
         let second = alloc.alloc(MAX_ORDER).expect("the other block");
@@ -1100,7 +1107,10 @@ mod tests
         // allocator once had; every page must stay allocatable.
         const BLOCKS: u64 = 5000;
         let mut alloc = with_region(BLOCKS << MAX_ORDER);
-        assert_eq!(alloc.free_page_count(), (BLOCKS as usize) << MAX_ORDER);
+        assert_eq!(
+            alloc.free_page_count(),
+            usize::try_from(BLOCKS).unwrap() << MAX_ORDER
+        );
         let mut seen = std::collections::HashSet::new();
         while let Some(block) = alloc.alloc(MAX_ORDER)
         {

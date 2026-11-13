@@ -26,8 +26,10 @@
 //! to the init process. Boot module ELF images get their own full-rights, reclaimable
 //! Memory caps in [`mint_module_memory_caps`] (see `docs/capability-model.md` § Memory).
 
-// cast_possible_truncation: u64→usize/u32/u16 capability field extractions bounded by capability space.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "u64→usize/u32/u16 capability field extractions bounded by capability space"
+)]
 
 // `alloc` is only required by the test build (heap-backed CSpace stub +
 // `nonnull_from_box` test helper). Production has no `GlobalAlloc`.
@@ -52,22 +54,26 @@ pub mod slot;
 pub mod split;
 pub mod transfer;
 
-// unused_imports: convenience re-exports of the cap subsystem's public types;
-// not every symbol has an in-crate consumer.
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "convenience re-exports of the cap subsystem's public types; not every symbol has an \
+              in-crate consumer"
+)]
 pub use cspace::{CSpace, CapError, L2_SIZE};
-// unused_imports: same rationale as the `cspace` re-export above.
-#[allow(unused_imports)]
 pub use derivation::DERIVATION_LOCK;
-// unused_imports: same rationale as the `cspace` re-export above.
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "same rationale as the `cspace` re-export above"
+)]
 pub use object::{
     AddressSpaceObject, CSpaceKernelObject, EndpointObject, InterruptObject, IoPortObject,
     KernelObjectHeader, MemoryObject, MmioObject, NotificationObject, ObjectType, SbiControlObject,
     SchedControlObject, ThreadObject,
 };
-// unused_imports: same rationale as the `cspace` re-export above.
-#[allow(unused_imports)]
+#[expect(
+    unused_imports,
+    reason = "same rationale as the `cspace` re-export above"
+)]
 pub use slot::{
     AsRights, CSpaceId, CapKind, CapTag, CapabilitySlot, CsRights, EpRights, EqRights,
     IoPortRights, IrqRights, MemRights, MmioRights, NtfRights, Rights, SbiRights, SchedRights,
@@ -326,8 +332,6 @@ pub fn sum_memory_available_bytes(cspace: &cspace::CSpace) -> u64
         let obj_type = unsafe { obj_nn.as_ref().obj_type };
         if obj_type == object::ObjectType::Memory
         {
-            // cast_ptr_alignment: header at offset 0; MemoryObject is repr(C).
-            #[allow(clippy::cast_ptr_alignment)]
             // SAFETY: obj_type confirms MemoryObject layout; pointer live.
             let memory = unsafe { &*obj_nn.as_ptr().cast::<object::MemoryObject>() };
             // A ledger of RAM bytes: no machine's RAM reaches the saturation.
@@ -938,10 +942,12 @@ fn reserve_init_backing(counts: &DescriptorCounts)
         // SAFETY: the header fits the region's first page, so the array start
         // lies inside the region.
         let array = unsafe { block.add(core::mem::size_of::<init_protocol::InitInfo>()) };
-        // cast_ptr_alignment: the region is page-aligned and the header's size
-        // is a multiple of the descriptor alignment (asserted at
-        // INIT_INFO_DESCRIPTOR_CAPACITY), so the array start is aligned.
-        #[allow(clippy::cast_ptr_alignment)]
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "the region is page-aligned and the header's size is a multiple of the \
+                      descriptor alignment (asserted at INIT_INFO_DESCRIPTOR_CAPACITY), so the \
+                      array start is aligned"
+        )]
         DESCRIPTOR_ARRAY.store(
             array.cast::<CapDescriptor>(),
             core::sync::atomic::Ordering::Relaxed,
@@ -1250,9 +1256,10 @@ pub(crate) unsafe fn boot_retype_aspace(
     let root_pt_phys = wrapper_phys.wrapping_add(PAGE_BYTES);
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
-    // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
-    // struct's alignment is at most 8.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "wrapper_virt is page-aligned (4096), the wrapper struct's alignment is at most 8"
+    )]
     let aso_ptr = wrapper_virt.cast::<AddressSpaceObject>();
     let as_offset = core::mem::size_of::<AddressSpaceObject>();
     const {
@@ -1265,12 +1272,11 @@ pub(crate) unsafe fn boot_retype_aspace(
                 <= PAGE_SIZE
         );
     }
-    // cast_ptr_alignment: as_offset is a multiple of align_of::<AddressSpace>()
-    // (asserted above) and wrapper_virt is page-aligned.
-    // similar_names: aso_ptr / aspace_ptr both name pointers in the same
-    // wrapper page; the disambiguating prefixes (`aso` vs `aspace`) are
-    // intentional to mirror the wrapper-vs-body roles.
-    #[allow(clippy::cast_ptr_alignment, clippy::similar_names)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "as_offset is a multiple of align_of::<AddressSpace>() (asserted above) and \
+                  wrapper_virt is page-aligned"
+    )]
     // SAFETY: wrapper_virt page-aligned; as_offset stays inside page 0.
     let aspace_ptr = unsafe { wrapper_virt.add(as_offset) }.cast::<AddressSpace>();
 
@@ -1372,9 +1378,10 @@ pub(crate) unsafe fn boot_retype_cspace(
     let wrapper_phys = memory_base.wrapping_add(offset);
     let wrapper_virt = phys_to_virt(wrapper_phys) as *mut u8;
 
-    // cast_ptr_alignment: wrapper_virt is page-aligned (4096), the wrapper
-    // struct's alignment is at most 8.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "wrapper_virt is page-aligned (4096), the wrapper struct's alignment is at most 8"
+    )]
     let cs_kobj_ptr = wrapper_virt.cast::<CSpaceKernelObject>();
     let cs_offset = core::mem::size_of::<CSpaceKernelObject>();
     const {
@@ -1387,9 +1394,11 @@ pub(crate) unsafe fn boot_retype_cspace(
                 <= PAGE_SIZE
         );
     }
-    // cast_ptr_alignment: cs_offset is a multiple of align_of::<CSpace>()
-    // (asserted above) and wrapper_virt is page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "cs_offset is a multiple of align_of::<CSpace>() (asserted above) and \
+                  wrapper_virt is page-aligned"
+    )]
     // SAFETY: wrapper_virt page-aligned; cs_offset stays inside page 0.
     let cs_ptr = unsafe { wrapper_virt.add(cs_offset) }.cast::<CSpace>();
 
@@ -1831,9 +1840,11 @@ fn complete_extent_descriptors(
 /// the arch-specific root `IoPort` on x86-64 and `SbiControl` on
 /// RISC-V). Returns a [`CSpaceLayout`] describing the slot ranges and
 /// per-cap descriptors.
-// too_many_lines: one logical pass over all boot-time resource types; splitting
-// would require threading shared state (cspace) through multiple helper functions.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one logical pass over all boot-time resource types; splitting would require \
+              threading shared state (cspace) through multiple helper functions"
+)]
 fn populate_cspace(
     cspace: &mut CSpace,
     ram_extents: usize,
@@ -2478,11 +2489,12 @@ pub(crate) fn mint_late_reclaim_memory_caps(
 /// still reads the `BootInfo` page and the reclaim array through Phase 9, so
 /// the contents are cleared later, by [`scrub_reclaim_ranges`] right before
 /// init is enqueued, not here.
-// Linear sequence, run once in Phase 7 and once (the late pass) in Phase 8:
-// per-range overlap check, owned-range registration, MemoryObject mint,
-// descriptor push. The debug-only overlap assertion adds ~25 lines without a
-// natural extraction point.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Linear sequence, run once in Phase 7 and once (the late pass) in Phase 8: per-range \
+              overlap check, owned-range registration, MemoryObject mint, descriptor push. The \
+              debug-only overlap assertion adds ~25 lines without a natural extraction point"
+)]
 fn mint_reclaim_pass(
     cspace: &mut CSpace,
     boot_info: &BootInfo,

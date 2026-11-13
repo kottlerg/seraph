@@ -10,10 +10,15 @@
 //! the handler here as a `pub fn sys_mem_*` / `sys_memory_*`, then add a userspace wrapper
 //! to `shared/syscall/src/lib.rs`.
 
-// cast_possible_truncation: u64→usize casts extract page counts and offsets
-// from 64-bit trap frame args. Seraph is 64-bit only; all values fit in the
-// target type.
-#![allow(clippy::cast_possible_truncation)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_possible_truncation,
+        reason = "u64→usize casts extract page counts and offsets from 64-bit trap frame args. \
+                  Seraph is 64-bit only; all values fit in the target type; the casts are in the \
+                  cfg(not(test)) handlers, so the lint fires outside the host test build alone"
+    )
+)]
 
 #[cfg(not(test))]
 use super::UserFrame;
@@ -26,9 +31,11 @@ use syscall::SyscallError;
 ///
 /// Arguments, return, and errors: `core/kernel/docs/syscalls.md` § `SYS_MEM_MAP` (16).
 #[cfg(not(test))]
-// too_many_lines: single validation pass over cap rights, prot bits, and address
-// range; splitting would require threading shared state through helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "single validation pass over cap rights, prot bits, and address range; splitting \
+              would require threading shared state through helpers"
+)]
 pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MemoryObject};
@@ -97,8 +104,6 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     let memory_obj_nn = memory_slot.object.ok_or(SyscallError::InvalidCapability)?;
     // SAFETY: tag confirmed Memory; pointer remains valid for the whole syscall
     // (cap held by caller's CSpace; refcount > 0).
-    // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-    #[allow(clippy::cast_ptr_alignment)]
     let memory_ref = unsafe { &*(memory_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
     // The page permissions, decided now so that an executable mapping
@@ -194,8 +199,6 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-        #[allow(clippy::cast_ptr_alignment)]
         let aso = obj.as_ptr().cast::<AddressSpaceObject>();
         // SAFETY: aso is a valid pointer to an AddressSpaceObject.
         let as_inner = unsafe { (*aso).address_space };
@@ -401,8 +404,6 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
     let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-        #[allow(clippy::cast_ptr_alignment)]
         let aso = obj.as_ptr().cast::<AddressSpaceObject>();
         // SAFETY: tag confirmed AddressSpace; aso is a valid AddressSpaceObject.
         let as_inner = unsafe { (*aso).address_space };
@@ -549,8 +550,6 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
     let as_ptr = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
         // SAFETY: tag confirmed AddressSpace.
-        // cast_ptr_alignment: header at offset 0; allocator guarantees alignment.
-        #[allow(clippy::cast_ptr_alignment)]
         let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
         as_obj.address_space
     };
@@ -604,10 +603,11 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Arguments, semantics, return, and errors: `core/kernel/docs/syscalls.md`
 /// § `SYS_MEMORY_SPLIT` (33). The bump bound is read with `retype::current_bump`.
-// too_many_lines: one locked pass — pin, snapshot, validate, mint, insert,
-// link, mutate in place — that would otherwise thread the held locks
-// through helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one locked pass — pin, snapshot, validate, mint, insert, link, mutate in place — \
+              that would otherwise thread the held locks through helpers"
+)]
 #[cfg(not(test))]
 pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -671,8 +671,6 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
     }
     // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
     // so the object is live for the rest of the hold.
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
-    #[allow(clippy::cast_ptr_alignment)]
     let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     parent_ref.write_lock();
 
@@ -785,10 +783,8 @@ pub fn sys_memory_split(tf: UserFrame) -> Result<u64, SyscallError>
             // The parent still covers the tail's range, so the tail owns none of
             // it: clear the inherited flag so the dealloc returns only the
             // body's chunk to the arena and frees nothing into the buddy.
-            // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
             // SAFETY: tail_ptr is the MemoryObject minted above (header at offset
             // 0), uninserted and reachable from no other thread.
-            #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 (*tail_ptr.as_ptr().cast::<MemoryObject>())
                     .owns_memory
@@ -866,10 +862,11 @@ pub fn sys_memory_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 ///
 /// Inverse of [`sys_memory_split`]. Arguments, return, preconditions, and errors:
 /// `core/kernel/docs/syscalls.md` § `SYS_MEMORY_MERGE` (50).
-// too_many_lines: one locked pass — pin, snapshot, validate, unlink, mutate,
-// free — over two objects under three locks that would otherwise be
-// threaded through helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one locked pass — pin, snapshot, validate, unlink, mutate, free — over two objects \
+              under three locks that would otherwise be threaded through helpers"
+)]
 #[cfg(not(test))]
 pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -944,12 +941,8 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
     }
     // SAFETY: tag confirmed Memory; the slot is pinned under DERIVATION_LOCK,
     // so the object is live for the rest of the hold.
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
-    #[allow(clippy::cast_ptr_alignment)]
     let parent_ref = unsafe { &*(parent_obj_nn.as_ptr().cast::<MemoryObject>()) };
     // SAFETY: as for parent_ref.
-    // cast_ptr_alignment: MemoryObject (8-byte) behind KernelObjectHeader header.
-    #[allow(clippy::cast_ptr_alignment)]
     let tail_ref = unsafe { &*(tail_obj_nn.as_ptr().cast::<MemoryObject>()) };
 
     let (lock_first, lock_second) = if core::ptr::from_ref(parent_ref)

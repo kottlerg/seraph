@@ -35,10 +35,11 @@ use syscall::{MAX_GETRANDOM_LEN, SyscallError};
 /// - A [`RestartableError::Faulted`] copy, which the dispatcher delivers or
 ///   fails with `InvalidAddress`.
 #[cfg(not(test))]
-// cast_possible_truncation: the kernel targets 64-bit only, so `usize == u64`
-// and `tf.arg(1) as usize` is lossless; the length is range-checked against
-// MAX_GETRANDOM_LEN immediately below.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the kernel targets 64-bit only, so `usize == u64` and `tf.arg(1) as usize` is \
+              lossless; the length is range-checked against MAX_GETRANDOM_LEN immediately below"
+)]
 pub fn sys_getrandom(tf: UserFrame) -> Result<u64, RestartableError>
 {
     let buf_ptr = tf.arg(0);

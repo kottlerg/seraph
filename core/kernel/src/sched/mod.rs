@@ -11,8 +11,10 @@
 //! address space and enters user mode. `schedule()` provides preemptive
 //! context switching; timer preemption decrements `slice_remaining` per tick.
 
-// cast_possible_truncation: usize→u32 CPU index and u64→usize address bounded by MAX_CPUS.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "usize→u32 CPU index and u64→usize address bounded by MAX_CPUS"
+)]
 
 pub mod deadline_heap;
 pub mod run_queue;
@@ -1877,9 +1879,11 @@ enum BlockedOnSnapshot
 /// read under its own lock, try-locked (the inverse of the canonical order,
 /// so never waited on) and released before the return.
 #[cfg(not(test))]
-// cast_ptr_alignment: blocked_on_object is stored as *mut u8 but always points
-// at a properly-aligned IPC object whose concrete type is named by ipc_state.
-#[allow(clippy::cast_ptr_alignment)]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "blocked_on_object is stored as *mut u8 but always points at a properly-aligned IPC \
+              object whose concrete type is named by ipc_state"
+)]
 unsafe fn watchdog_read_blocked_on(
     t: *mut ThreadControlBlock,
     ipc: IpcThreadState,
@@ -2023,8 +2027,7 @@ enum SourceSnapshot
 /// # Safety
 /// The source is live, its lock is held, and `t` is a valid TCB.
 #[cfg(not(test))]
-// cast_ptr_alignment: as for watchdog_read_blocked_on.
-#[allow(clippy::cast_ptr_alignment)]
+#[expect(clippy::cast_ptr_alignment, reason = "as for watchdog_read_blocked_on")]
 unsafe fn watchdog_read_source(
     t: *mut ThreadControlBlock,
     ipc: IpcThreadState,
@@ -2312,11 +2315,12 @@ pub fn sleep_wakeups_quiesce()
 /// Every other claimer of a listed park removes its entry, so no other
 /// binding can be popped (core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep
 /// List Invariants).
-// too_many_lines: flat dispatch over every claimable `IpcThreadState`
-// (notification, event queue, the timed-cancel parks, plain sleep); each arm
-// is independent and short, and splitting would require duplicating the
-// batch snapshot plumbing.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "flat dispatch over every claimable `IpcThreadState` (notification, event queue, \
+              the timed-cancel parks, plain sleep); each arm is independent and short, and \
+              splitting would require duplicating the batch snapshot plumbing"
+)]
 #[cfg(not(test))]
 pub fn sleep_check_wakeups()
 {
@@ -2470,11 +2474,12 @@ pub fn sleep_check_wakeups()
             {
                 // BlockedOnNotification implies blocked_on_object is a
                 // *mut NotificationState (see `ipc::notification::notification_wait`).
-                // The kernel allocator guarantees NotificationState alignment;
-                // the cast_ptr_alignment lint is suppressed here because
-                // the pointer is type-erased as *mut u8 in the TCB to
-                // break a circular module import.
-                #[allow(clippy::cast_ptr_alignment)]
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "the kernel allocator guarantees NotificationState alignment; the \
+                              pointer is type-erased as *mut u8 in the TCB to break a circular \
+                              module import"
+                )]
                 let sig_state = blocked_on.cast::<crate::ipc::notification::NotificationState>();
                 // SAFETY: sig_state is kept alive by the dispatch sequence (its
                 // dealloc quiesces this batch).
@@ -2523,9 +2528,11 @@ pub fn sleep_check_wakeups()
             {
                 // BlockedOnEventQueue implies blocked_on_object is
                 // a *mut EventQueueState (see
-                // `ipc::event_queue::event_queue_recv`). cast_ptr_alignment
-                // suppressed for the same reason as the notification arm above.
-                #[allow(clippy::cast_ptr_alignment)]
+                // `ipc::event_queue::event_queue_recv`).
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "same reason as the notification arm above"
+                )]
                 let eq_state = blocked_on.cast::<crate::ipc::event_queue::EventQueueState>();
                 // SAFETY: eq_state is kept alive by the dispatch sequence (its
                 // dealloc quiesces this batch).
@@ -5628,8 +5635,6 @@ unsafe fn heaviest_other_cpu(this_cpu: usize, cpu_count: usize) -> Option<(usize
 {
     let mut heaviest = None;
     let mut max_load = 0u32;
-    // needless_range_loop: scheduler_ptr requires raw indexing.
-    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpu_count
     {
         if cpu == this_cpu
@@ -6592,9 +6597,11 @@ pub enum Requeue
 /// `current`) and restored by `restore_interrupts_from` with that lock's saved
 /// flags after `switch()` returns; `release_lock_only` between them advances the
 /// lock tickets without touching interrupt state.
-// too_many_lines: schedule() is the core scheduler critical path; splitting would
-// introduce indirection that obscures the single logical context-switch sequence.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "schedule() is the core scheduler critical path; splitting would introduce \
+              indirection that obscures the single logical context-switch sequence"
+)]
 #[cfg(not(test))]
 pub unsafe fn schedule(requeue: Requeue)
 {

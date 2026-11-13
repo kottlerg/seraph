@@ -59,268 +59,284 @@ fn current_hart() -> u32
 
 // ── Trap vector ───────────────────────────────────────────────────────────────
 
-/// Naked trap entry point installed in `stvec`.
-///
-/// Handles traps from both U-mode (ecall, page faults) and S-mode (timer,
-/// external interrupts). Saves all GPRs and CSRs to a [`TrapFrame`], calls
-/// `trap_dispatch`, then restores and executes `sret`.
-///
-/// ## Stack switching invariant
-///
-/// `sscratch` encodes the trap source:
-/// - S-mode: `sscratch = 0`
-/// - U-mode: `sscratch = &PER_CPU[cpu]` (this hart's `PerCpuData`)
-///
-/// On U-mode trap entry the handler swaps `t0` with `sscratch` (`csrrw t0, sscratch, t0`),
-/// installs the per-CPU pointer in `tp`, loads the kernel stack top from
-/// `PerCpuData::kernel_rsp` (written by `cpu::set_kernel_trap_stack`), and switches to it
-/// before building the [`TrapFrame`]. On a return to U-mode, `sscratch` is re-armed with
-/// `tp` (`&PER_CPU`) before `sret`.
-///
-/// `context::return_to_user` arms `sscratch` the same way before the first `sret` to U-mode.
-///
-/// ## Kernel stack overflow
-///
-/// An S-mode trap pushes its frame on the stack it interrupts. Before the first
-/// store the S-mode path compares the frame's base with the hart's
-/// `PerCpuData::kernel_stack_floor` (one load, one compare-and-branch): a frame
-/// that would land below the floor, in the guard page the direct map leaves
-/// unmapped under every kernel stack (`mm::stack_guard`), is an overflow. The
-/// path then switches to [`OVERFLOW_STACK`] and calls [`kernel_stack_overflow`],
-/// which halts with a diagnostic, instead of faulting again on the guard with
-/// each nested trap until the frames reach the memory below it. A floor of 0
-/// disables the check.
-///
-/// # Safety
-/// Installed only in `stvec` by `install_trap_vector`; never called from Rust. Requires
-/// `sscratch = 0` while in S-mode and `&PER_CPU` while in U-mode, `tp = &PER_CPU` in
-/// S-mode, and `PerCpuData::kernel_rsp` set to the running thread's kernel stack top
-/// before any return to U-mode.
-// too_many_lines: trap_entry is a single naked-asm block; the register
-// save/restore sequence cannot be meaningfully split.
-#[allow(clippy::too_many_lines)]
+// A naked function takes no `#[expect]` (E0736), so the `too_many_lines` expectation
+// sits on this module, which holds `trap_entry` alone.
 #[cfg(not(test))]
-#[unsafe(naked)]
-unsafe extern "C" fn trap_entry()
+mod entry
 {
-    // Frame layout: 35 × 8 = 280 bytes (size asserted in `trap_frame::tests`).
-    // Offsets: x1=0, x2=8, x3=16, x4=24, x5=32, …, x31=240,
-    //          sepc=248, scause=256, stval=264, sstatus=272.
-    //
-    // sscratch convention:
-    //   S-mode: sscratch = 0   (trap from S-mode, stack is already the kernel stack)
-    //   U-mode: sscratch = &PER_CPU[cpu_id]   (tp value, always non-zero)
-    //
-    // tp (x4) convention: always = &PER_CPU[cpu_id] in S-mode.
-    //   On U-mode entry the trap handler restores tp from sscratch and saves
-    //   the user's tp to TrapFrame[tp] via PerCpuData::scratch.
-    //   On U-mode return tp is overwritten with the user TLS value from the
-    //   TrapFrame; sscratch is set to &PER_CPU before that restore so the
-    //   next trap can recover tp.
-    core::arch::naked_asm!(
-        // ── Determine source privilege ──────────────────────────────────────────
-        // Atomically swap t0 (x5) with sscratch:
-        //   t0       = old sscratch (&PER_CPU if from U-mode, 0 if from S-mode)
-        //   sscratch = old t0 (saved here temporarily)
-        "csrrw t0, sscratch, t0",
-        "bnez t0, 1f",              // t0 != 0 → came from U-mode
+    #![expect(
+        clippy::too_many_lines,
+        reason = "trap_entry is a single naked-asm block; the register save/restore sequence \
+                  cannot be meaningfully split"
+    )]
 
-        // ── S-mode path ─────────────────────────────────────────────────────────
-        // t0 = 0; sscratch = old_t0; sp = kernel_sp (already correct)
-        // Load this hart's stack floor and allocate the TrapFrame below sp; a
-        // frame below the floor would land in the stack's guard page.
-        "ld t0, {floor}(x4)",
-        "addi sp, sp, -280",
-        "bltu sp, t0, 5f",
-        // Restore t0 = old_t0 and clear sscratch (the S-mode value).
-        "csrrw t0, sscratch, zero",
-        // Save t0 (x5) before reusing x5 as a temporary.
-        "sd x5, 32(sp)",
-        // Record original sp (= current sp + 280, the pre-allocation value).
-        "addi x5, sp, 280",
-        "sd x5, 8(sp)",
-        // tp (x4) = &PER_CPU in S-mode; save it to the frame before common path.
-        "sd x4, 24(sp)",
-        "j 2f",
+    use super::{
+        OVERFLOW_CLAIMED, OVERFLOW_STACK, OVERFLOW_STACK_BYTES, kernel_stack_overflow,
+        trap_dispatch,
+    };
 
-        // ── U-mode path ─────────────────────────────────────────────────────────
-        // t0 (x5) = &PER_CPU; sscratch = old t0 (user's t0); sp = user_sp
-        // x4 (tp) = user's tp (we must save it and replace with &PER_CPU)
-        "1:",
-        // Temporarily park user's tp in PerCpuData::scratch (offset 24 from t0).
-        // t0 = &PER_CPU, x4 = user_tp at this point.
-        "sd x4, 24(t0)",            // PerCpuData.scratch = user_tp (temporary)
-        // Install kernel per-CPU pointer into tp.
-        "mv x4, t0",                // tp = &PER_CPU (t0 is x5, x4 is tp)
-        // Load kernel stack top from PerCpuData::kernel_rsp (offset 8 from tp).
-        "ld t0, 8(x4)",             // t0 = kernel_stack_top
-        // Allocate TrapFrame at the top of the kernel stack.
-        "addi t0, t0, -280",        // t0 = TrapFrame base
-        // Save user sp (x2) into the frame before overwriting sp.
-        "sd x2, 8(t0)",
-        // Switch to kernel stack.
-        "mv sp, t0",                // sp = TrapFrame base
-        // Retrieve user's t0 from sscratch; clear sscratch (now in S-mode).
-        "csrrw t0, sscratch, x0",   // t0 = user_t0, sscratch = 0
-        "sd t0, 32(sp)",            // frame.t0 = user t0
-        // Retrieve user's tp from PerCpuData::scratch and save to the frame.
-        // x4 (tp) = &PER_CPU at this point; user_tp was parked at offset 24.
-        "ld t0, 24(x4)",            // t0 = user_tp (from PerCpuData.scratch)
-        "sd t0, 24(sp)",            // frame.tp = user_tp
-        // tp (x4) = &PER_CPU remains — common path must NOT save x4 again.
+    /// Naked trap entry point installed in `stvec`.
+    ///
+    /// Handles traps from both U-mode (ecall, page faults) and S-mode (timer,
+    /// external interrupts). Saves all GPRs and CSRs to a [`TrapFrame`](super::TrapFrame), calls
+    /// `trap_dispatch`, then restores and executes `sret`.
+    ///
+    /// ## Stack switching invariant
+    ///
+    /// `sscratch` encodes the trap source:
+    /// - S-mode: `sscratch = 0`
+    /// - U-mode: `sscratch = &PER_CPU[cpu]` (this hart's `PerCpuData`)
+    ///
+    /// On U-mode trap entry the handler swaps `t0` with `sscratch` (`csrrw t0, sscratch, t0`),
+    /// installs the per-CPU pointer in `tp`, loads the kernel stack top from
+    /// `PerCpuData::kernel_rsp` (written by `cpu::set_kernel_trap_stack`), and switches to it
+    /// before building the [`TrapFrame`](super::TrapFrame). On a return to U-mode, `sscratch`
+    /// is re-armed with `tp` (`&PER_CPU`) before `sret`.
+    ///
+    /// `context::return_to_user` arms `sscratch` the same way before the first `sret` to U-mode.
+    ///
+    /// ## Kernel stack overflow
+    ///
+    /// An S-mode trap pushes its frame on the stack it interrupts. Before the first
+    /// store the S-mode path compares the frame's base with the hart's
+    /// `PerCpuData::kernel_stack_floor` (one load, one compare-and-branch): a frame
+    /// that would land below the floor, in the guard page the direct map leaves
+    /// unmapped under every kernel stack (`mm::stack_guard`), is an overflow. The
+    /// path then switches to [`OVERFLOW_STACK`] and calls [`kernel_stack_overflow`],
+    /// which halts with a diagnostic, instead of faulting again on the guard with
+    /// each nested trap until the frames reach the memory below it. A floor of 0
+    /// disables the check.
+    ///
+    /// # Safety
+    /// Installed only in `stvec` by `install_trap_vector`; never called from Rust. Requires
+    /// `sscratch = 0` while in S-mode and `&PER_CPU` while in U-mode, `tp = &PER_CPU` in
+    /// S-mode, and `PerCpuData::kernel_rsp` set to the running thread's kernel stack top
+    /// before any return to U-mode.
+    #[unsafe(naked)]
+    pub(super) unsafe extern "C" fn trap_entry()
+    {
+        // Frame layout: 35 × 8 = 280 bytes (size asserted in `trap_frame::tests`).
+        // Offsets: x1=0, x2=8, x3=16, x4=24, x5=32, …, x31=240,
+        //          sepc=248, scause=256, stval=264, sstatus=272.
+        //
+        // sscratch convention:
+        //   S-mode: sscratch = 0   (trap from S-mode, stack is already the kernel stack)
+        //   U-mode: sscratch = &PER_CPU[cpu_id]   (tp value, always non-zero)
+        //
+        // tp (x4) convention: always = &PER_CPU[cpu_id] in S-mode.
+        //   On U-mode entry the trap handler restores tp from sscratch and saves
+        //   the user's tp to TrapFrame[tp] via PerCpuData::scratch.
+        //   On U-mode return tp is overwritten with the user TLS value from the
+        //   TrapFrame; sscratch is set to &PER_CPU before that restore so the
+        //   next trap can recover tp.
+        core::arch::naked_asm!(
+            // ── Determine source privilege ──────────────────────────────────────────
+            // Atomically swap t0 (x5) with sscratch:
+            //   t0       = old sscratch (&PER_CPU if from U-mode, 0 if from S-mode)
+            //   sscratch = old t0 (saved here temporarily)
+            "csrrw t0, sscratch, t0",
+            "bnez t0, 1f",              // t0 != 0 → came from U-mode
 
-        // ── Save remaining registers (x2, x4, x5 already saved above) ──────────
-        "2:",
-        "sd x1,   0(sp)",           // ra
-        // x2 (sp) saved above in both paths
-        "sd x3,  16(sp)",           // gp
-        // x4 (tp) saved by both paths above (kernel tp or user tp)
-        // x5 (t0) saved by both paths above
-        "sd x6,  40(sp)",
-        "sd x7,  48(sp)",
-        "sd x8,  56(sp)",
-        "sd x9,  64(sp)",
-        "sd x10, 72(sp)",           // a0
-        "sd x11, 80(sp)",
-        "sd x12, 88(sp)",
-        "sd x13, 96(sp)",
-        "sd x14,104(sp)",
-        "sd x15,112(sp)",
-        "sd x16,120(sp)",
-        "sd x17,128(sp)",           // a7 (syscall number)
-        "sd x18,136(sp)",
-        "sd x19,144(sp)",
-        "sd x20,152(sp)",
-        "sd x21,160(sp)",
-        "sd x22,168(sp)",
-        "sd x23,176(sp)",
-        "sd x24,184(sp)",
-        "sd x25,192(sp)",
-        "sd x26,200(sp)",
-        "sd x27,208(sp)",
-        "sd x28,216(sp)",
-        "sd x29,224(sp)",
-        "sd x30,232(sp)",
-        "sd x31,240(sp)",
-        // Save supervisor CSRs.
-        "csrr t0, sepc",
-        "sd   t0, 248(sp)",
-        "csrr t0, scause",
-        "sd   t0, 256(sp)",
-        "csrr t0, stval",
-        "sd   t0, 264(sp)",
-        "csrr t0, sstatus",
-        "sd   t0, 272(sp)",
+            // ── S-mode path ─────────────────────────────────────────────────────────
+            // t0 = 0; sscratch = old_t0; sp = kernel_sp (already correct)
+            // Load this hart's stack floor and allocate the TrapFrame below sp; a
+            // frame below the floor would land in the stack's guard page.
+            "ld t0, {floor}(x4)",
+            "addi sp, sp, -280",
+            "bltu sp, t0, 5f",
+            // Restore t0 = old_t0 and clear sscratch (the S-mode value).
+            "csrrw t0, sscratch, zero",
+            // Save t0 (x5) before reusing x5 as a temporary.
+            "sd x5, 32(sp)",
+            // Record original sp (= current sp + 280, the pre-allocation value).
+            "addi x5, sp, 280",
+            "sd x5, 8(sp)",
+            // tp (x4) = &PER_CPU in S-mode; save it to the frame before common path.
+            "sd x4, 24(sp)",
+            "j 2f",
 
-        // ── Dispatch ────────────────────────────────────────────────────────────
-        // tp (x4) = &PER_CPU throughout dispatch (compiler treats tp as reserved).
-        "mv a0, sp",
-        "call {dispatch}",
+            // ── U-mode path ─────────────────────────────────────────────────────────
+            // t0 (x5) = &PER_CPU; sscratch = old t0 (user's t0); sp = user_sp
+            // x4 (tp) = user's tp (we must save it and replace with &PER_CPU)
+            "1:",
+            // Temporarily park user's tp in PerCpuData::scratch (offset 24 from t0).
+            // t0 = &PER_CPU, x4 = user_tp at this point.
+            "sd x4, 24(t0)",            // PerCpuData.scratch = user_tp (temporary)
+            // Install kernel per-CPU pointer into tp.
+            "mv x4, t0",                // tp = &PER_CPU (t0 is x5, x4 is tp)
+            // Load kernel stack top from PerCpuData::kernel_rsp (offset 8 from tp).
+            "ld t0, 8(x4)",             // t0 = kernel_stack_top
+            // Allocate TrapFrame at the top of the kernel stack.
+            "addi t0, t0, -280",        // t0 = TrapFrame base
+            // Save user sp (x2) into the frame before overwriting sp.
+            "sd x2, 8(t0)",
+            // Switch to kernel stack.
+            "mv sp, t0",                // sp = TrapFrame base
+            // Retrieve user's t0 from sscratch; clear sscratch (now in S-mode).
+            "csrrw t0, sscratch, x0",   // t0 = user_t0, sscratch = 0
+            "sd t0, 32(sp)",            // frame.t0 = user t0
+            // Retrieve user's tp from PerCpuData::scratch and save to the frame.
+            // x4 (tp) = &PER_CPU at this point; user_tp was parked at offset 24.
+            "ld t0, 24(x4)",            // t0 = user_tp (from PerCpuData.scratch)
+            "sd t0, 24(sp)",            // frame.tp = user_tp
+            // tp (x4) = &PER_CPU remains — common path must NOT save x4 again.
 
-        // ── Restore sepc and sstatus ────────────────────────────────────────────
-        // Restore sstatus FIRST so SPP and SPIE match the saved trap context.
-        // Without this, a context switch during dispatch can leave sstatus.SPP
-        // from a different thread's trap, causing sret to return at the wrong
-        // privilege level.
-        "ld t0, 272(sp)",
-        "csrw sstatus, t0",
-        "ld t0, 248(sp)",
-        "csrw sepc, t0",
+            // ── Save remaining registers (x2, x4, x5 already saved above) ──────────
+            "2:",
+            "sd x1,   0(sp)",           // ra
+            // x2 (sp) saved above in both paths
+            "sd x3,  16(sp)",           // gp
+            // x4 (tp) saved by both paths above (kernel tp or user tp)
+            // x5 (t0) saved by both paths above
+            "sd x6,  40(sp)",
+            "sd x7,  48(sp)",
+            "sd x8,  56(sp)",
+            "sd x9,  64(sp)",
+            "sd x10, 72(sp)",           // a0
+            "sd x11, 80(sp)",
+            "sd x12, 88(sp)",
+            "sd x13, 96(sp)",
+            "sd x14,104(sp)",
+            "sd x15,112(sp)",
+            "sd x16,120(sp)",
+            "sd x17,128(sp)",           // a7 (syscall number)
+            "sd x18,136(sp)",
+            "sd x19,144(sp)",
+            "sd x20,152(sp)",
+            "sd x21,160(sp)",
+            "sd x22,168(sp)",
+            "sd x23,176(sp)",
+            "sd x24,184(sp)",
+            "sd x25,192(sp)",
+            "sd x26,200(sp)",
+            "sd x27,208(sp)",
+            "sd x28,216(sp)",
+            "sd x29,224(sp)",
+            "sd x30,232(sp)",
+            "sd x31,240(sp)",
+            // Save supervisor CSRs.
+            "csrr t0, sepc",
+            "sd   t0, 248(sp)",
+            "csrr t0, scause",
+            "sd   t0, 256(sp)",
+            "csrr t0, stval",
+            "sd   t0, 264(sp)",
+            "csrr t0, sstatus",
+            "sd   t0, 272(sp)",
 
-        // ── Restore sscratch and tp (privilege-dependent) ────────────────────────
-        // Check sstatus.SPP (bit 8): 0 = return to U-mode, 1 = return to S-mode.
-        // Reads the sstatus restored above (the trap context's SPP), not the CSR value
-        // left by dispatch.
-        "csrr t0, sstatus",
-        "srli t0, t0, 8",
-        "andi t0, t0, 1",
-        "bnez t0, 3f",
+            // ── Dispatch ────────────────────────────────────────────────────────────
+            // tp (x4) = &PER_CPU throughout dispatch (compiler treats tp as reserved).
+            "mv a0, sp",
+            "call {dispatch}",
 
-        // U-mode return: set sscratch = &PER_CPU for the next U-mode trap,
-        // then restore x4 from the TrapFrame (user TLS pointer).
-        "csrw sscratch, x4",
-        "ld x4,  24(sp)",
-        "j 4f",
+            // ── Restore sepc and sstatus ────────────────────────────────────────────
+            // Restore sstatus FIRST so SPP and SPIE match the saved trap context.
+            // Without this, a context switch during dispatch can leave sstatus.SPP
+            // from a different thread's trap, causing sret to return at the wrong
+            // privilege level.
+            "ld t0, 272(sp)",
+            "csrw sstatus, t0",
+            "ld t0, 248(sp)",
+            "csrw sepc, t0",
 
-        // S-mode return: do NOT restore x4 (tp). tp is kernel-reserved and
-        // already holds &PER_CPU[current_cpu]. The TrapFrame's x4 is stale
-        // if schedule() migrated this thread to a different CPU during the
-        // trap (e.g. timer preemption during a shootdown spin loop).
-        "3:",
+            // ── Restore sscratch and tp (privilege-dependent) ────────────────────────
+            // Check sstatus.SPP (bit 8): 0 = return to U-mode, 1 = return to S-mode.
+            // Reads the sstatus restored above (the trap context's SPP), not the CSR value
+            // left by dispatch.
+            "csrr t0, sstatus",
+            "srli t0, t0, 8",
+            "andi t0, t0, 1",
+            "bnez t0, 3f",
 
-        // ── Restore remaining registers ──────────────────────────────────────────
-        // x4 (tp): handled above — restored for U-mode, preserved for S-mode.
-        // x2 (sp): restored last since it changes the addressing base.
-        "4:",
-        "ld x1,   0(sp)",
-        // x2 restored last
-        "ld x3,  16(sp)",
-        // x4 already handled above
-        "ld x5,  32(sp)",
-        "ld x6,  40(sp)",
-        "ld x7,  48(sp)",
-        "ld x8,  56(sp)",
-        "ld x9,  64(sp)",
-        "ld x10, 72(sp)",
-        "ld x11, 80(sp)",
-        "ld x12, 88(sp)",
-        "ld x13, 96(sp)",
-        "ld x14,104(sp)",
-        "ld x15,112(sp)",
-        "ld x16,120(sp)",
-        "ld x17,128(sp)",
-        "ld x18,136(sp)",
-        "ld x19,144(sp)",
-        "ld x20,152(sp)",
-        "ld x21,160(sp)",
-        "ld x22,168(sp)",
-        "ld x23,176(sp)",
-        "ld x24,184(sp)",
-        "ld x25,192(sp)",
-        "ld x26,200(sp)",
-        "ld x27,208(sp)",
-        "ld x28,216(sp)",
-        "ld x29,224(sp)",
-        "ld x30,232(sp)",
-        "ld x31,240(sp)",
-        "ld x2,   8(sp)",           // restore sp last (user sp or original kernel sp)
-        "sret",
+            // U-mode return: set sscratch = &PER_CPU for the next U-mode trap,
+            // then restore x4 from the TrapFrame (user TLS pointer).
+            "csrw sscratch, x4",
+            "ld x4,  24(sp)",
+            "j 4f",
 
-        // ── Kernel stack overflow (never returns) ───────────────────────────────
-        // sp = the frame base below the floor; t0 = the floor; sscratch = the
-        // interrupted t0, abandoned. The first hart to get here takes the
-        // overflow stack; any other parks.
-        "5:",
-        "mv a3, t0",                // a3 = floor
-        "addi a2, sp, 280",         // a2 = the interrupted sp
-        "la t0, {claim}",
-        "li t1, 1",
-        // The kernel target enables A, but the naked-asm assembler is not
-        // handed it; enable it for this one instruction.
-        ".option push",
-        ".option arch, +a",
-        "amoswap.w.aq t1, t1, (t0)",
-        ".option pop",
-        "bnez t1, 6f",
-        "la sp, {overflow_stack}",
-        "li t1, {overflow_bytes}",
-        "add sp, sp, t1",
-        "csrw sscratch, zero",
-        "csrr a0, sepc",
-        "csrr a1, stval",
-        "call {overflow}",
-        "6:",
-        "wfi",
-        "j 6b",
+            // S-mode return: do NOT restore x4 (tp). tp is kernel-reserved and
+            // already holds &PER_CPU[current_cpu]. The TrapFrame's x4 is stale
+            // if schedule() migrated this thread to a different CPU during the
+            // trap (e.g. timer preemption during a shootdown spin loop).
+            "3:",
 
-        dispatch = sym trap_dispatch,
-        floor = const crate::percpu::PERCPU_KERNEL_STACK_FLOOR_OFFSET,
-        claim = sym OVERFLOW_CLAIMED,
-        overflow_stack = sym OVERFLOW_STACK,
-        overflow_bytes = const OVERFLOW_STACK_BYTES,
-        overflow = sym kernel_stack_overflow,
-    );
+            // ── Restore remaining registers ──────────────────────────────────────────
+            // x4 (tp): handled above — restored for U-mode, preserved for S-mode.
+            // x2 (sp): restored last since it changes the addressing base.
+            "4:",
+            "ld x1,   0(sp)",
+            // x2 restored last
+            "ld x3,  16(sp)",
+            // x4 already handled above
+            "ld x5,  32(sp)",
+            "ld x6,  40(sp)",
+            "ld x7,  48(sp)",
+            "ld x8,  56(sp)",
+            "ld x9,  64(sp)",
+            "ld x10, 72(sp)",
+            "ld x11, 80(sp)",
+            "ld x12, 88(sp)",
+            "ld x13, 96(sp)",
+            "ld x14,104(sp)",
+            "ld x15,112(sp)",
+            "ld x16,120(sp)",
+            "ld x17,128(sp)",
+            "ld x18,136(sp)",
+            "ld x19,144(sp)",
+            "ld x20,152(sp)",
+            "ld x21,160(sp)",
+            "ld x22,168(sp)",
+            "ld x23,176(sp)",
+            "ld x24,184(sp)",
+            "ld x25,192(sp)",
+            "ld x26,200(sp)",
+            "ld x27,208(sp)",
+            "ld x28,216(sp)",
+            "ld x29,224(sp)",
+            "ld x30,232(sp)",
+            "ld x31,240(sp)",
+            "ld x2,   8(sp)",           // restore sp last (user sp or original kernel sp)
+            "sret",
+
+            // ── Kernel stack overflow (never returns) ───────────────────────────────
+            // sp = the frame base below the floor; t0 = the floor; sscratch = the
+            // interrupted t0, abandoned. The first hart to get here takes the
+            // overflow stack; any other parks.
+            "5:",
+            "mv a3, t0",                // a3 = floor
+            "addi a2, sp, 280",         // a2 = the interrupted sp
+            "la t0, {claim}",
+            "li t1, 1",
+            // The kernel target enables A, but the naked-asm assembler is not
+            // handed it; enable it for this one instruction.
+            ".option push",
+            ".option arch, +a",
+            "amoswap.w.aq t1, t1, (t0)",
+            ".option pop",
+            "bnez t1, 6f",
+            "la sp, {overflow_stack}",
+            "li t1, {overflow_bytes}",
+            "add sp, sp, t1",
+            "csrw sscratch, zero",
+            "csrr a0, sepc",
+            "csrr a1, stval",
+            "call {overflow}",
+            "6:",
+            "wfi",
+            "j 6b",
+
+            dispatch = sym trap_dispatch,
+            floor = const crate::percpu::PERCPU_KERNEL_STACK_FLOOR_OFFSET,
+            claim = sym OVERFLOW_CLAIMED,
+            overflow_stack = sym OVERFLOW_STACK,
+            overflow_bytes = const OVERFLOW_STACK_BYTES,
+            overflow = sym kernel_stack_overflow,
+        );
+    }
 }
+
+#[cfg(not(test))]
+use entry::trap_entry;
 
 /// Bytes of [`OVERFLOW_STACK`]: room for `kernel_stack_overflow`'s report and
 /// `fatal`.
@@ -435,10 +451,11 @@ unsafe fn clear_sip_ssip()
 /// `fpu::switch_out_save`), so no reference may live across those points
 /// (core/kernel/docs/arch-interface.md § `trap_frame`).
 #[cfg(not(test))]
-// too_many_lines: the single scause dispatch (interrupt, syscall, user fault,
-// kernel fault) stays one function so the trap-frame ownership and SIE
-// discipline read in one place.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the single scause dispatch (interrupt, syscall, user fault, kernel fault) stays one \
+              function so the trap-frame ownership and SIE discipline read in one place"
+)]
 extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 {
     #[expect(
@@ -709,9 +726,11 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
                 crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             }
             // Unreachable for an exited thread, but guard against schedule returning.
-            // infinite_loop: the other paths of `trap_dispatch` return to the
-            // trap stub, so the function cannot be `-> !`; this branch never does.
-            #[expect(clippy::infinite_loop)]
+            #[expect(
+                clippy::infinite_loop,
+                reason = "the other paths of `trap_dispatch` return to the trap stub, so the \
+                          function cannot be `-> !`; this branch never does"
+            )]
             loop
             {
                 // SAFETY: wfi is a RISC-V instruction; waits for interrupt.
@@ -1356,8 +1375,10 @@ pub unsafe fn init_ap()
 pub unsafe fn init_ap() {}
 
 /// Disable supervisor interrupts. Returns previous SIE state.
-// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`).
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`)"
+)]
 pub fn disable() -> bool
 {
     let prev: u64;
@@ -1483,8 +1504,10 @@ unsafe fn sbi_send_ipi_to(target_hart_id: u32)
 ///
 /// # Safety
 /// Arch-dispatch parity only; never invoked on RISC-V in practice.
-// dead_code: arch-dispatch parity with x86_64; no caller on RISC-V.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "arch-dispatch parity with x86_64; no caller on RISC-V"
+)]
 #[cfg(not(test))]
 pub unsafe fn send_nmi_to(_target_hart_id: u32)
 {

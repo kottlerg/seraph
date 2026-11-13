@@ -184,9 +184,11 @@ const PBMT_IO: u64 = 0b10 << 61;
 #[repr(transparent)]
 pub struct PageTableEntry(pub u64);
 
-// verbose_bit_mask: `phys & 0xFFF == 0` is idiomatic for alignment assertions;
-// trailing_zeros() alternative is less readable here.
-#[allow(clippy::verbose_bit_mask)]
+#[expect(
+    clippy::verbose_bit_mask,
+    reason = "`phys & 0xFFF == 0` is idiomatic for alignment assertions; the `trailing_zeros()` \
+              alternative is less readable here"
+)]
 impl PageTableEntry
 {
     /// Construct a non-leaf entry pointing to a child table at `phys`.
@@ -544,8 +546,10 @@ pub fn map_large_page(
 
 /// Return the child table physical address from `entry`, allocating and
 /// zeroing a new pool frame when the entry is not present.
-// similar_names: frame_va and frame_pa are a VA/PA pair — the similarity is intentional.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "frame_va and frame_pa are a VA/PA pair — the similarity is intentional"
+)]
 fn walk_or_alloc(entry: &mut PageTableEntry, pool: &mut PoolState) -> Result<u64, PagingError>
 {
     if entry.is_present()
@@ -1380,9 +1384,11 @@ unsafe fn walk_leaves(
 /// caller, the Phase 8 boot path, runs on the BSP before `sched::enter` and
 /// cannot migrate.
 #[cfg(not(test))]
-// similar_names: root_va and root_pa are a VA/PA pair — the similarity is
-// intentional and follows the pattern used elsewhere in this file.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "root_va and root_pa are a VA/PA pair — the similarity is intentional and follows the \
+              pattern used elsewhere in this file"
+)]
 pub unsafe fn unmap_identity_page(pa: u64)
 {
     use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};

@@ -567,10 +567,11 @@ impl PerCpuScheduler
         let q = queue_index(priority);
         // Debug: detect use-after-free via magic cookie.
         // tcb is guaranteed valid by the caller; magic and thread_id are always readable.
-        // undocumented_unsafe_blocks: the unsafe blocks sit inside `debug_assert!`
-        // arguments, where no per-block SAFETY comment can be placed; the comment
-        // above covers both.
-        #[allow(clippy::undocumented_unsafe_blocks)]
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "the unsafe blocks sit inside `debug_assert!` arguments, where no per-block \
+                      SAFETY comment can be placed; the comment above covers both"
+        )]
         {
             debug_assert!(
                 unsafe { (*tcb).magic == super::thread::TCB_MAGIC },
@@ -715,9 +716,11 @@ impl PerCpuScheduler
         };
         // Debug: detect use-after-free via magic cookie.
         // tcb is from the run queue; magic field is always readable on valid TCB.
-        // undocumented_unsafe_blocks: the unsafe block sits inside a `debug_assert!`
-        // argument, where no per-block SAFETY comment can be placed.
-        #[allow(clippy::undocumented_unsafe_blocks)]
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "the unsafe block sits inside a `debug_assert!` argument, where no per-block \
+                      SAFETY comment can be placed"
+        )]
         {
             debug_assert!(
                 unsafe { (*tcb).magic == super::thread::TCB_MAGIC },

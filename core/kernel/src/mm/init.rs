@@ -14,8 +14,10 @@
 //! links live in the free pages and so need the direct map
 //! (core/kernel/docs/initialization.md § Phase 2 and § Phase 3).
 
-// cast_possible_truncation: u64→usize physical address arithmetic; bounded by memory map sizes.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "u64→usize physical address arithmetic; bounded by memory map sizes"
+)]
 
 use core::mem::size_of;
 
@@ -139,10 +141,11 @@ pub fn dram_bounds() -> (u64, u64)
 /// Must be called before Phase 3 activates the kernel page tables; the
 /// `memory_map.entries` pointer is a physical address covered by the
 /// bootloader's identity map, which is replaced in Phase 3.
-// too_many_lines: a flat, sequential memory-map dump; the per-type tallying,
-// run-merging, and summary print read as one unit and gain nothing from
-// being split across helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a flat, sequential memory-map dump; the per-type tallying, run-merging, and \
+              summary print read as one unit and gain nothing from being split across helpers"
+)]
 pub fn print_memory_map(info: &BootInfo)
 {
     kprintln!("Memory map:");

@@ -44,15 +44,14 @@
 //! kernel image, and the carve's by the machine, so no amount of RAM exhausts
 //! either ([`BOOT_TABLE_POOL_SIZE`]).
 
-// cast_possible_truncation: u64→usize memory-map entry count; 64-bit targets
-// only, so the cast is exact.
-// cast_lossless: u32→u64 widening of the framebuffer stride × height byte count.
-// inline_always: phys_to_virt/virt_to_phys are called on every memory access path; always-inline
-//   avoids call overhead in these hot helpers.
-#![allow(
+#![expect(
     clippy::cast_possible_truncation,
-    clippy::cast_lossless,
-    clippy::inline_always
+    reason = "u64→usize memory-map entry count; 64-bit targets only, so the cast is exact"
+)]
+#![expect(
+    clippy::inline_always,
+    reason = "phys_to_virt/virt_to_phys are called on every memory access path; always-inline \
+              avoids call overhead in these hot helpers"
 )]
 
 use boot_protocol::BootInfo;
@@ -190,16 +189,15 @@ impl From<PagingError> for BootTableError
 /// On x86-64, `readable` has no effect (all present pages are readable);
 /// it is included for cross-architecture symmetry with RISC-V which
 /// has an explicit R bit.
-// struct_excessive_bools: PageFlags is a cross-arch PTE flag set; each bool is a distinct
-// architectural attribute. A bitfield enum would need extra decode logic at every call site.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "PageFlags is a cross-arch PTE flag set; each bool is a distinct architectural \
+              attribute. A bitfield enum would need extra decode logic at every call site"
+)]
 #[derive(Clone, Copy, Debug)]
 pub struct PageFlags
 {
     /// Page is readable (relevant on RISC-V; has no dedicated bit on x86-64).
-    // allow: x86-64 ignores this field; it is read by
-    // core/kernel/src/arch/riscv64/paging.rs (`PageTableEntry::new_page`).
-    #[allow(dead_code)]
     pub readable: bool,
     /// Page is writable.
     pub writable: bool,
@@ -396,9 +394,11 @@ impl PoolState
     ///
     /// Call once, during single-threaded boot: every `PoolState` built from
     /// `BootInfo` starts at frame 0 and hands out the same `BOOT_TABLE_POOL` frames.
-    // similar_names: pool_va_base and pool_pa_base are the VA and PA of the same pool region.
     #[cfg(not(test))]
-    #[allow(clippy::similar_names)]
+    #[expect(
+        clippy::similar_names,
+        reason = "pool_va_base and pool_pa_base are the VA and PA of the same pool region"
+    )]
     pub fn new(info: &BootInfo) -> Self
     {
         // BOOT_TABLE_POOL is in BSS; single-threaded boot access.
@@ -866,9 +866,11 @@ pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), BootTableError>
     Ok(())
 }
 
-// similar_names: root_va/root_pa and other va/pa pairs are VA/PA of the same frame.
 #[cfg(not(test))]
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "root_va/root_pa and other va/pa pairs are VA/PA of the same frame"
+)]
 pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
 {
     // Enable NX on x86-64 before we install tables with NX entries; a no-op

@@ -52,9 +52,22 @@
 //!   and [`message_address`] and [`message_data`] give the message a device writes to
 //!   raise one.
 
-// cast_possible_truncation: u64→usize/u8 APIC address arithmetic; bounded by APIC layout.
-// cast_lossless: u8→u32 vector casts are always widening.
-#![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_possible_truncation,
+        reason = "u64→usize/u8 APIC address arithmetic; bounded by APIC layout; the code it covers \
+                  is compiled out of the host test build, so the lint fires outside it alone"
+    )
+)]
+#![cfg_attr(
+    not(test),
+    expect(
+        clippy::cast_lossless,
+        reason = "u8→u32 vector casts are always widening; the code it covers is compiled out of \
+                  the host test build, so the lint fires outside it alone"
+    )
+)]
 
 #[cfg(not(test))]
 use super::{cpu, fpu, gdt, idt};
@@ -736,9 +749,11 @@ pub unsafe fn init_ap() {}
 /// Disable interrupts and return the previous IF state.
 ///
 /// Returns `true` if interrupts were enabled before the call.
-// dead_code: required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`);
-// no in-tree caller.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "required by the arch interface (core/kernel/docs/arch-interface.md § `interrupts`); \
+              no in-tree caller"
+)]
 pub fn disable() -> bool
 {
     let rflags: u64;
@@ -863,9 +878,11 @@ fn remap() -> crate::irq::Remap
 ///
 /// # Errors
 /// None on x86-64.
-// unnecessary_wraps: the Result is the cross-arch contract `irq::set_remap`
-// calls; riscv64's implementation returns `NotSupported`.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is the cross-arch contract `irq::set_remap` calls; riscv64's \
+              implementation returns `NotSupported`"
+)]
 #[cfg(not(test))]
 pub fn set_remap(remap: crate::irq::Remap) -> Result<(), crate::irq::RemapError>
 {
@@ -946,9 +963,11 @@ pub fn remap_entry(target: crate::irq::Target) -> Result<u64, crate::irq::RemapE
 ///
 /// # Errors
 /// None on x86-64.
-// unnecessary_wraps: the Result is the cross-arch contract `SYS_CAP_INFO`
-// calls; riscv64's implementation returns `NotSupported`.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Result is the cross-arch contract `SYS_CAP_INFO` calls; riscv64's implementation \
+              returns `NotSupported`"
+)]
 #[cfg(not(test))]
 pub fn remap_handles() -> Result<u64, crate::irq::RemapError>
 {
@@ -988,8 +1007,10 @@ pub unsafe fn route_device_irq(
     }
     let destination =
         crate::irq::next_target_cpu(can_take_source).ok_or(crate::irq::RouteError::Exhausted)?;
-    // The destination is below CPU_COUNT, which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the destination is below CPU_COUNT, which fits u32"
+    )]
     let cpu = destination as u32;
     let vector = super::ioapic::assign_vector(destination, crate::irq::Slot::Line(irq))
         .ok_or(crate::irq::RouteError::Exhausted)?;
@@ -1104,8 +1125,10 @@ pub fn alloc_message_target() -> Result<crate::irq::Target, crate::irq::RouteErr
         crate::irq::next_target_cpu(can_take_source).ok_or(crate::irq::RouteError::Exhausted)?;
     let vector = super::ioapic::assign_vector(cpu, crate::irq::Slot::Unbound)
         .ok_or(crate::irq::RouteError::Exhausted)?;
-    // The CPU is below CPU_COUNT, which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the CPU is below CPU_COUNT, which fits u32"
+    )]
     let cpu = cpu as u32;
     Ok(crate::irq::Target {
         cpu,
@@ -1167,8 +1190,10 @@ pub fn message_data(target: crate::irq::Target) -> u32
     {
         return super::remap::MESSAGE_DATA;
     }
-    // A device vector is below 256 (`ioapic::DEVICE_VECTOR_LAST`).
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a device vector is below 256 (`ioapic::DEVICE_VECTOR_LAST`)"
+    )]
     let vector = target.slot as u8;
     super::msi::data(vector)
 }

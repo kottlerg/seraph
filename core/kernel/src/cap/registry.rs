@@ -199,9 +199,11 @@ impl CSpaceRegistry
             unsafe { entry.write(RegistryEntry::new()) };
         }
         slot.store(entries, Ordering::Release);
-        // Lossless: cap + ENTRIES_PER_CHUNK is at most the table's id count,
-        // which MAX_ID_CHUNKS keeps below u32::MAX.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "Lossless: cap + ENTRIES_PER_CHUNK is at most the table's id count, which \
+                      MAX_ID_CHUNKS keeps below u32::MAX"
+        )]
         self.capacity
             .store((cap + ENTRIES_PER_CHUNK) as u32, Ordering::Release);
         Ok(())
@@ -404,8 +406,10 @@ impl Default for CSpaceRegistry
 pub fn chunks_for_ram(ram_bytes: u64) -> usize
 {
     let pages = ram_bytes.div_ceil(crate::mm::PAGE_SIZE as u64);
-    // Lossless on the 64-bit kernel.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "Lossless on the 64-bit kernel"
+    )]
     (pages as usize)
         .div_ceil(ENTRIES_PER_CHUNK)
         .clamp(1, MAX_ID_CHUNKS)

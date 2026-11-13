@@ -130,9 +130,10 @@ pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
 /// Unmapped guard pages below a userspace stack, in 4 KiB pages: the least
 /// the creator's layout (`process-layout`) leaves below a main-thread stack,
-/// and the guard std reserves below each demand-paged thread stack it spawns.
-/// Init's own stacks and the stacks the `lowuser` services place themselves
-/// keep less (#1018).
+/// the guard std reserves below each demand-paged thread stack it spawns,
+/// and the guard below each stack the `lowuser` binaries use (init's main
+/// stack, which the kernel places, init's log-thread stack, and ktest's
+/// child stacks).
 ///
 /// Four pages, because a store can land that far below the stack's lowest
 /// written byte. On riscv64 a `call` writes nothing to the stack, and a split
@@ -143,7 +144,9 @@ pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 /// page of fixed locals) can lie up to 14312 bytes apart: 6120 below the
 /// caller's return-address save, and 8192 below the callee's entry
 /// (docs/build-system.md § Custom Targets). x86-64 needs one page; the one
-/// value keeps one layout on both architectures. The guard costs VA only.
+/// value keeps one layout on both architectures. A guard the layout leaves
+/// unmapped costs VA only; ktest's child stacks are static, so their guard
+/// frames stay allocated once unmapped.
 pub const STACK_GUARD_PAGES: u32 = 4;
 
 /// Hard cap on the declared main-thread stack size, in 4 KiB pages.

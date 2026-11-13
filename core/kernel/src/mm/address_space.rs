@@ -2083,8 +2083,8 @@ mod init_layout_tests
     fn fallback_info_region_fits_between_the_image_zone_and_the_stack_guard()
     {
         let page = PAGE_SIZE as u64;
-        let guard =
-            DEFAULT_INIT_STACK_TOP - (u64::from(STACK_GUARD_PAGES) + INIT_STACK_PAGES as u64) * page;
+        let guard = DEFAULT_INIT_STACK_TOP
+            - (u64::from(STACK_GUARD_PAGES) + INIT_STACK_PAGES as u64) * page;
         let info_end = DEFAULT_INIT_INFO_VA + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
         assert!(info_end <= guard);
         const { assert!(DEFAULT_INIT_INFO_VA >= process_layout::FIXED_IMAGE_ZONE_END) };

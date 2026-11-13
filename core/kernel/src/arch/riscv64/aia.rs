@@ -352,8 +352,10 @@ fn take_identity(slot: Slot) -> Option<crate::irq::Target>
     let row = eid_row(cpu)?;
     let eid = lowest_free_eid(row)?;
     row.get(eid as usize)?.store(slot);
-    // A CPU index is below MAX_CPUS, which u32 holds.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a CPU index is below MAX_CPUS, which u32 holds"
+    )]
     let cpu = cpu as u32;
     Some(crate::irq::Target { cpu, slot: eid })
 }
@@ -638,7 +640,5 @@ fn imsic_claim() -> u32
         );
     }
     // stopei bits 26:16 hold the identity (11 bits).
-    #[allow(clippy::cast_possible_truncation)]
-    let eid = ((top >> 16) & 0x7FF) as u32;
-    eid
+    ((top >> 16) & 0x7FF) as u32
 }

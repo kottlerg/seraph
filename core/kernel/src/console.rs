@@ -322,8 +322,13 @@ pub unsafe fn panic_write_fmt(args: core::fmt::Arguments)
 /// `console::init` must have been called before this function. Safe
 /// to call from inside an NMI handler regardless of whether
 /// `CONSOLE_LOCK` is held by the interrupted code.
-// dead_code: only the x86-64 NMI handler calls this; RISC-V has no S-mode NMI surface.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "riscv64",
+    expect(
+        dead_code,
+        reason = "only the x86-64 NMI handler calls this; RISC-V has no S-mode NMI surface"
+    )
+)]
 #[cfg(not(test))]
 pub unsafe fn nmi_write_fmt(args: core::fmt::Arguments)
 {

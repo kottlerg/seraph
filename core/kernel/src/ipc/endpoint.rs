@@ -306,11 +306,12 @@ pub unsafe fn endpoint_call(
         // entry goes with it, under ep.lock.
         // SAFETY: server was just dequeued under ep.lock.
         unsafe { crate::ipc::cancel_timed_entry(server) };
-        // undocumented_unsafe_blocks: the two unsafe reads sit inside debug_assert!
-        // arguments, where a per-block SAFETY comment cannot be placed. Both are
-        // sound: server was just dequeued from recv_head under ep.lock and is a live
-        // TCB.
-        #[allow(clippy::undocumented_unsafe_blocks)]
+        #[expect(
+            clippy::undocumented_unsafe_blocks,
+            reason = "the two unsafe reads sit inside debug_assert! arguments, where a per-block \
+                      SAFETY comment cannot be placed. Both are sound: server was just dequeued \
+                      from recv_head under ep.lock and is a live TCB"
+        )]
         {
             debug_assert!(
                 unsafe { (*server).magic == crate::sched::thread::TCB_MAGIC },
@@ -442,10 +443,6 @@ pub unsafe fn endpoint_call(
     // Publish the send-queue level before the wait-set notify below.
     // SAFETY: ep.lock held.
     unsafe { ep.refresh_send_ready() };
-    // cast_ptr_alignment: the cast is to `*mut u8` (alignment 1), so it cannot
-    // misalign; `blocked_on_object` is restored to `EndpointState` only by readers
-    // keyed on `ipc_state`.
-    #[allow(clippy::cast_ptr_alignment)]
     let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
     // SAFETY: caller is the current CPU's running thread (this fn's contract);
     // held ep.lock excludes send-queue writes.
@@ -732,10 +729,6 @@ pub unsafe fn endpoint_recv(
     unsafe {
         enqueue(&mut ep.recv_head, &mut ep.recv_tail, server);
     }
-    // cast_ptr_alignment: the cast is to `*mut u8` (alignment 1), so it cannot
-    // misalign; `blocked_on_object` is restored to `EndpointState` only by readers
-    // keyed on `ipc_state`.
-    #[allow(clippy::cast_ptr_alignment)]
     let blocked_on = core::ptr::from_mut::<EndpointState>(ep).cast::<u8>();
     // SAFETY: server is the current CPU's running thread (this fn's contract);
     // held ep.lock excludes recv-queue writes.

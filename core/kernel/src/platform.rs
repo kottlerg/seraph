@@ -13,8 +13,10 @@
 //! The Phase 6 checks and failure modes are specified in
 //! `core/kernel/docs/initialization.md` § Phase 6.
 
-// cast_possible_truncation: u64→usize address arithmetic bounded by platform memory layout.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "u64→usize address arithmetic bounded by platform memory layout"
+)]
 
 use boot_protocol::{BootInfo, KernelMmio, MemoryMapEntry, MemoryType, MmioAperture};
 use core::cell::UnsafeCell;
@@ -132,9 +134,6 @@ pub unsafe fn validate_mmio_apertures(boot_info_phys: u64) -> ValidatedApertures
 /// `#[cfg(not(test))]`, so nothing calls this in test builds; it returns no
 /// apertures without exercising the production validation path.
 #[cfg(test)]
-// missing_safety_doc: host-test stub; the production `validate_mmio_apertures` carries the
-// `# Safety` contract.
-#[allow(clippy::missing_safety_doc)]
 pub unsafe fn validate_mmio_apertures(_boot_info_phys: u64) -> ValidatedApertures
 {
     ValidatedApertures::empty()

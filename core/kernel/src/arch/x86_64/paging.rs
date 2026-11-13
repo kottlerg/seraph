@@ -27,9 +27,10 @@
 //! - Level 1: bits \[29:21\] → PD index   (512 entries × 2 MiB each)
 //! - Level 0: bits \[20:12\] → PT index   (512 entries × 4 KiB each)
 
-// similar_names: root_va/root_pa and repeated e shadowing are intentional page-table idioms.
-// cast_possible_truncation: u64→u32 EFER register splits; values are bounded by shift width.
-#![allow(clippy::similar_names, clippy::cast_possible_truncation)]
+#![expect(
+    clippy::similar_names,
+    reason = "root_va/root_pa and repeated e shadowing are intentional page-table idioms"
+)]
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -88,9 +89,11 @@ const PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 #[repr(transparent)]
 pub struct PageTableEntry(pub u64);
 
-// verbose_bit_mask: `phys & 0xFFF == 0` is the idiomatic alignment assertion form;
-// the trailing_zeros() alternative is less readable for power-of-2 alignment checks.
-#[allow(clippy::verbose_bit_mask)]
+#[expect(
+    clippy::verbose_bit_mask,
+    reason = "`phys & 0xFFF == 0` is the idiomatic alignment assertion form; the \
+              `trailing_zeros()` alternative is less readable for power-of-2 alignment checks"
+)]
 impl PageTableEntry
 {
     /// Construct a non-leaf (table pointer) entry pointing to `phys`.
@@ -911,10 +914,6 @@ const INVPCID_TYPE_SINGLE: u64 = 1;
 ///
 /// First qword: PCID in bits \[11:0\], bits \[63:12\] reserved (must be zero).
 /// Second qword: the linear address (ignored for type 1).
-///
-/// `dead_code`: the fields are consumed by `invpcid` through a pointer in inline
-/// asm, which the lint cannot see as a read.
-#[allow(dead_code)]
 #[repr(C, align(16))]
 struct InvpcidDescriptor
 {

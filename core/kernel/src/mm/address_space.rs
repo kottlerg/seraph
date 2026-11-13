@@ -339,9 +339,11 @@ pub fn page_spans(va: u64, len: usize) -> impl Iterator<Item = PageSpan>
         let base = cursor & !OFFSET_MASK;
         // A saturated page end is past `end`, so the minimum is `end`.
         let next = base.saturating_add(PAGE_SIZE as u64).min(end);
-        // cast_possible_truncation: each value is below PAGE_SIZE or len.
-        // `va <= cursor < next`, so neither difference wraps.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "each value is below PAGE_SIZE or len. `va <= cursor < next`, so neither \
+                      difference wraps"
+        )]
         let span = PageSpan {
             page: base,
             in_page: (cursor & OFFSET_MASK) as usize,
@@ -954,10 +956,11 @@ impl AddressSpace
     /// # Safety
     /// `segment` must be a valid, bootloader-provided `InitSegment`.
     #[cfg(not(test))]
-    // cast_possible_truncation: the u64→usize in-page offset (at most 0xFFF) and
-    // segment size (an init ELF segment, bounded by the user address-space size)
-    // feed the page-count arithmetic.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the u64→usize in-page offset (at most 0xFFF) and segment size (an init ELF \
+                  segment, bounded by the user address-space size) feed the page-count arithmetic"
+    )]
     pub unsafe fn map_segment(&self, segment: &InitSegment) -> Result<(), ()>
     {
         let flags = match segment.flags

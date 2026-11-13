@@ -253,9 +253,6 @@ pub unsafe fn withdraw_everywhere(object: usize)
         let saved = unsafe { sched_lock.lock_raw() };
         // `iopb` and the table's bytes are owned by this lock; the Thread
         // arm of dealloc_object nulls the pointer under it before freeing.
-        // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-        // IoPortBindings page (sys_ioport_bind).
-        #[allow(clippy::cast_ptr_alignment)]
         // SAFETY: `tcb` is registered, so live; its sched_lock, held, owns
         // `iopb`.
         let table = unsafe { (*tcb).iopb.cast::<IoPortBindings>() };
@@ -304,9 +301,6 @@ pub unsafe fn free_tables_bound_to(cspace: *mut crate::cap::cspace::CSpace)
         let sched_lock = unsafe { &(*tcb).sched_lock };
         // SAFETY: `saved` is passed verbatim to the `unlock_raw` below.
         let saved = unsafe { sched_lock.lock_raw() };
-        // cast_ptr_alignment: a non-null `iopb` heads a page-aligned
-        // IoPortBindings page (sys_ioport_bind).
-        #[allow(clippy::cast_ptr_alignment)]
         // SAFETY: `tcb` is live; its sched_lock, held, owns `iopb`.
         let table = unsafe { (*tcb).iopb.cast::<IoPortBindings>() };
         // SAFETY: as above; the table is detached under the lock a bind

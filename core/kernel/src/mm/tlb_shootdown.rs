@@ -299,8 +299,10 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
         // serviced_len < ACK_BATCH here: it is reset on reaching it below.
         if let Some(entry) = serviced.get_mut(serviced_len)
         {
-            // cast_possible_truncation: slot < cpu_count <= MAX_CPUS, which fits u32.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "slot < cpu_count <= MAX_CPUS, which fits u32"
+            )]
             {
                 *entry = slot as u32;
             }

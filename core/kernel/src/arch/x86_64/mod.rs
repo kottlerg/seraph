@@ -53,8 +53,10 @@ pub const HAS_SBI: bool = false;
 /// a split can name the other ids, `SYS_IRQ_REGISTER` refuses them, and the Interrupt
 /// teardown leaves the routing untouched for them. A GSI an I/O APIC reports above this
 /// space is logged at boot and not routable.
-// cast_possible_truncation: MAX_IOAPICS is 128, so the product (32768) fits u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_IOAPICS is 128, so the product (32768) fits u32"
+)]
 pub const ROOT_IRQ_COUNT: u32 = boot_protocol::MAX_IOAPICS as u32 * ioapic::IOAPIC_MAX_PINS;
 
 /// A thread's I/O permission bitmap and its page-sized parts (re-exported from

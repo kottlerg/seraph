@@ -517,8 +517,10 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
 
 /// `SYS_THREAD_YIELD` (21): voluntarily yield the CPU.
 #[cfg(not(test))]
-// unnecessary_wraps: all dispatch arms must return Result<u64, SyscallError>; signature is fixed.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "all dispatch arms must return Result<u64, SyscallError>; signature is fixed"
+)]
 fn sys_yield(_tf: UserFrame) -> Result<u64, SyscallError>
 {
     // SAFETY: called from syscall handler on a valid kernel stack.
@@ -593,9 +595,11 @@ fn sys_exit(_tf: UserFrame) -> Result<u64, SyscallError>
 /// the process's resources are torn down by procmgr (see
 /// docs/process-lifecycle.md § Process Death).
 #[cfg(not(test))]
-// cast_possible_truncation: arg0 carries a u32 exit code zero-extended to u64
-// by the `process_exit` wrapper; truncating back to u32 is the intended decode.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "arg0 carries a u32 exit code zero-extended to u64 by the `process_exit` wrapper; \
+              truncating back to u32 is the intended decode"
+)]
 fn sys_process_exit(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let reason = syscall::encode_exit_code(tf.arg(0) as u32);
@@ -798,9 +802,7 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Extract target TCB from the Thread cap.
     let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: header at offset 0 of ThreadObject; allocator guarantees alignment.
     // SAFETY: tag confirmed Thread; pointer is valid ThreadObject.
-    #[allow(clippy::cast_ptr_alignment)]
     let target_tcb = unsafe { (*obj.as_ptr().cast::<crate::cap::object::ThreadObject>()).tcb };
 
     // Look up the EventQueue cap (POST right required).
@@ -808,8 +810,6 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, EqRights::POST) }?;
 
     let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
-    #[allow(clippy::cast_ptr_alignment)]
     let eq = eq_obj
         .as_ptr()
         .cast::<crate::cap::object::EventQueueObject>();
@@ -968,11 +968,7 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Extract the inner AddressSpace from the AddressSpace cap.
     let aspace_obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: the header pointer names an AddressSpaceObject
-    // constructed in place at the start of its page-aligned wrapper page, so
-    // the cast target's 8-byte alignment holds.
     // SAFETY: tag confirmed AddressSpace; pointer is valid AddressSpaceObject.
-    #[allow(clippy::cast_ptr_alignment)]
     let as_ptr = unsafe {
         (*aspace_obj
             .as_ptr()
@@ -989,8 +985,6 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     let eq_slot = unsafe { lookup_cap(cspace, eq_cap_idx, EqRights::POST) }?;
 
     let eq_obj = eq_slot.object.ok_or(SyscallError::InvalidCapability)?;
-    // cast_ptr_alignment: header at offset 0 of EventQueueObject; allocator guarantees alignment.
-    #[allow(clippy::cast_ptr_alignment)]
     let eq = eq_obj
         .as_ptr()
         .cast::<crate::cap::object::EventQueueObject>();
@@ -1243,10 +1237,11 @@ pub(crate) unsafe fn lookup_cap<K: crate::cap::slot::CapKind>(
 /// # Safety
 /// As for [`pin_slot`].
 #[cfg(not(test))]
-// needless_bitwise_bool: the checks combine with `&` and `|`, not `&&` and
-// `||`, so each is evaluated as a value with no branch a misprediction could
-// take past it.
-#[allow(clippy::needless_bitwise_bool)]
+#[expect(
+    clippy::needless_bitwise_bool,
+    reason = "the checks combine with `&` and `|`, not `&&` and `||`, so each is evaluated as a \
+              value with no branch a misprediction could take past it"
+)]
 unsafe fn pin_checked(
     cspace: *mut crate::cap::cspace::CSpace,
     handle: u64,

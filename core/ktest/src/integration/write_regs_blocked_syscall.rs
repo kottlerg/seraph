@@ -56,7 +56,7 @@
 //! is cancelled by the stop and resumed elsewhere), and the child, once
 //! deleted, has used at most half its `ChildStack`: a redirect that left the
 //! abandoned frames in place would grow the stack a frame a round, past its
-//! base into the statics below it.
+//! base into its guard, where the child faults.
 //!
 //! Needs **≥ 2 CPUs**.
 

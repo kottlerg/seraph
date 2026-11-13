@@ -456,7 +456,8 @@ fn create_thread(
     // stress stacks 0, 1, and 2 belong to this test's faulter,
     // handler, and syncer; stress tests run sequentially, and the faulter's
     // stack is reused only after the thread on it exited and was deleted.
-    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let top = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack) }?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).

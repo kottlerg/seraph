@@ -46,11 +46,12 @@
 //! `# Safety` contracts of `syscall::mem_map` and its siblings. Tests run one
 //! at a time; children reach a scratch page only as their test directs.
 //!
-//! The one mapping change outside the scratch VAs is [`GuardedStack::top`]'s:
+//! The one mapping change to ktest's own memory is [`GuardedStack::top`]'s:
 //! it unmaps the guard pages of a child-stack static, inside ktest's image.
 //! No code reads, writes or references a guard, so the unmap meets
 //! `syscall::mem_unmap`'s contract for a part of a live object reached only
-//! through raw pointers.
+//! through raw pointers. Besides the scratch VAs, the only other mapping
+//! changes are the framebuffer and serial MMIO mappings above.
 
 #![no_std]
 #![no_main]
@@ -291,7 +292,9 @@ pub struct GuardedStack<const PAGES: usize>
 /// entry points, not any capacity of the system under test.
 ///
 /// Declare one as `static mut CHILD_STACK: ChildStack = ChildStack::ZERO` in
-/// any test module that spawns a child thread. Pass `ChildStack::top(ptr)` to
+/// any test module that spawns a child thread, reach it only through
+/// `core::ptr::addr_of!(CHILD_STACK)`, never a reference, and pass
+/// `ChildStack::top` of that pointer (under its `# Safety`) to
 /// `thread_configure` as the initial stack pointer.
 ///
 /// A test that needs a child thread declares its own static stacks, or, as most
@@ -320,13 +323,17 @@ impl<const PAGES: usize> GuardedStack<PAGES>
 
     /// The flag at the top of the stack at `ptr` that records its guard's
     /// unmap; its address is the stack top.
-    fn guard_unmapped<'a>(ptr: *const Self) -> &'a AtomicBool
+    ///
+    /// # Safety
+    ///
+    /// As [`top`](Self::top).
+    unsafe fn guard_unmapped(ptr: *const Self) -> &'static AtomicBool
     {
         let flag = ptr.wrapping_add(1).cast::<u8>().wrapping_sub(16);
-        // SAFETY: `flag` lies in the stack's last page, 16 bytes below its
-        // end, inside the static `ptr` points to, which lives for the boot. No
-        // thread's stack reaches it (a thread runs below it), so only this
-        // atomic accesses the byte, and a zero byte is a valid `false`.
+        // SAFETY: `ptr` is a static stack (the caller's contract), so `flag`
+        // lies in its last page, 16 bytes below its end, and lives for the
+        // boot. No thread's stack reaches it (a thread runs below it), so only
+        // this atomic accesses the byte, and a zero byte is a valid `false`.
         unsafe { &*flag.cast::<AtomicBool>() }
     }
 
@@ -338,19 +345,27 @@ impl<const PAGES: usize> GuardedStack<PAGES>
     /// The first call for a stack unmaps its guard pages. A failed unmap is
     /// fatal to the run: it logs and halts, so no test runs on a stack
     /// without its guard.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is the address of a `GuardedStack` that a `static` holds (the
+    /// static itself, an element of a static array, or a field of a static),
+    /// taken with `addr_of!`, and the program forms no reference to that
+    /// `GuardedStack` or to anything that contains it. The guard's unmap then
+    /// meets `syscall::mem_unmap`'s contract, and the flag lives for the boot.
     #[must_use]
-    pub fn top(ptr: *const Self) -> u64
+    pub unsafe fn top(ptr: *const Self) -> u64
     {
-        let flag = Self::guard_unmapped(ptr);
+        // SAFETY: the caller's contract is `guard_unmapped`'s.
+        let flag = unsafe { Self::guard_unmapped(ptr) };
         if !flag.swap(true, Ordering::AcqRel)
         {
             // SAFETY: the span is the first `STACK_GUARD_PAGES` page-aligned
-            // pages of the static at `ptr`, its private `guard` field, part of
-            // a live object that `mem_unmap`'s contract allows in the span: no
-            // code reads or writes the field, and no reference covers it,
-            // since every use of a stack static goes through a raw pointer
-            // (`addr_of!`, as `top` and `top_at` take) and no code forms a
-            // reference to a whole `GuardedStack`. No IPC page lies in it.
+            // pages of the static `GuardedStack` at `ptr`, its private `guard`
+            // field: part of a live object that `mem_unmap`'s contract allows
+            // in the span, since no code reads or writes the field and, by
+            // this function's contract, no reference covers it. No IPC page
+            // lies in it.
             let unmapped = unsafe {
                 syscall::mem_unmap(
                     SELF_ASPACE.load(Ordering::Acquire),
@@ -371,17 +386,25 @@ impl<const PAGES: usize> GuardedStack<PAGES>
     /// (`core::ptr::addr_of!(STACKS)`), the bounds-checked form of
     /// `top(addr_of!(STACKS[index]))`.
     ///
+    /// # Safety
+    ///
+    /// `stacks` is the address of an array of stacks that a `static` holds,
+    /// taken with `addr_of!`, and the program forms no reference to the array
+    /// or to anything that contains it: [`top`](Self::top)'s contract for
+    /// each element.
+    ///
     /// # Errors
     ///
     /// A fixed message when `index` is past the array's end.
-    pub fn top_at<const N: usize>(
+    pub unsafe fn top_at<const N: usize>(
         stacks: *const [Self; N],
         index: usize,
     ) -> Result<u64, &'static str>
     {
-        elem_ptr(stacks, index)
-            .map(Self::top)
-            .ok_or("ktest: child stack index past its array")
+        let stack = elem_ptr(stacks, index).ok_or("ktest: child stack index past its array")?;
+        // SAFETY: `stack` is an element of the static array at `stacks`, which
+        // the caller's contract keeps free of references.
+        Ok(unsafe { Self::top(stack) })
     }
 
     /// Bytes of the stack at `ptr` its threads have used: from the top down

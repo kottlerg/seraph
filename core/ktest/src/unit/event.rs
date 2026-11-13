@@ -155,7 +155,8 @@ pub fn recv_blocks_until_post(ctx: &TestContext) -> TestResult
     // exited, and this one has not started.
     let child_arg = unsafe { RECV_BLOCKS_ARGS.publish(0, (child_eq, child_sync)) };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK));
+    // SAFETY: `RECV_BLOCKS_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(RECV_BLOCKS_STACK)) };
     // SAFETY: the stack is `RECV_BLOCKS_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -309,7 +310,8 @@ pub fn recv_timeout_payload_zero_wins(ctx: &TestContext) -> TestResult
     // its queue slot.
     let child_arg = child_eq;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK));
+    // SAFETY: `TIMEOUT_ZERO_PAYLOAD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(TIMEOUT_ZERO_PAYLOAD_STACK)) };
     // SAFETY: the stack is `TIMEOUT_ZERO_PAYLOAD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -341,7 +343,8 @@ pub fn recv_timeout_payload_nonzero_wins(ctx: &TestContext) -> TestResult
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = child_eq;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK));
+    // SAFETY: `TIMEOUT_NONZERO_PAYLOAD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(TIMEOUT_NONZERO_PAYLOAD_STACK)) };
     // SAFETY: the stack is `TIMEOUT_NONZERO_PAYLOAD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -372,7 +375,8 @@ pub fn recv_timeout_zero_blocks_forever(ctx: &TestContext) -> TestResult
     let child_eq = cap_copy(eq, child.cs, syscall::RIGHTS_ALL).map_err(|_| "cap_copy eq failed")?;
     let child_arg = child_eq;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK));
+    // SAFETY: `TIMEOUT_FOREVER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(TIMEOUT_FOREVER_STACK)) };
     // SAFETY: the stack is `TIMEOUT_FOREVER_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {

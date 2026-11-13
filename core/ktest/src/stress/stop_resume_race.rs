@@ -175,7 +175,9 @@ pub fn run(ctx: &TestContext) -> TestResult
             .map_err(|_| "stress::stop_resume_race: cap_copy victim done failed")?;
         // SAFETY: stack index 0 is the victim's; sequential cycles never alias
         // (victim.delete_thread() drains the spinner before the next cycle).
-        let victim_stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let victim_stack =
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 0) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe {
@@ -207,9 +209,9 @@ pub fn run(ctx: &TestContext) -> TestResult
                 },
             )
         };
-        // SAFETY: stack index 1 is the stopper's; sequential cycles never alias.
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
         let stopper_stack =
-            ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 1) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe {
@@ -241,9 +243,9 @@ pub fn run(ctx: &TestContext) -> TestResult
                 },
             )
         };
-        // SAFETY: stack index 2 is the starter's; sequential cycles never alias.
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
         let starter_stack =
-            ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 2) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[2]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe {

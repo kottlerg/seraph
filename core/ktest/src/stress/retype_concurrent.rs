@@ -85,7 +85,9 @@ pub fn run(ctx: &TestContext) -> TestResult
         };
 
         // stress tests run sequentially; each worker uses a distinct stack.
-        let stack_top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack_top =
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i) }?;
         // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
         // stack is this child's own, on which no other live thread runs (`ChildStack`'s
         // rule, as noted where the stack is chosen).

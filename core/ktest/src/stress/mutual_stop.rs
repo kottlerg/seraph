@@ -378,7 +378,8 @@ fn start(
         // stress stacks 0 and 1 belong to this test's two children;
         // stress tests run sequentially and both are deleted before this
         // test returns.
-        let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index)?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let top = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index) }?;
         // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
         // stack is this child's own, on which no other live thread runs (`ChildStack`'s
         // rule, as noted where the stack is chosen).

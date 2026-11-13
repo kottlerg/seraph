@@ -160,7 +160,8 @@ fn expect_gp(ctx: &TestContext, ep: u64, which: u64, cpu: u32) -> TestResult
         .map_err(|_| "integration::umip_descriptor_reads_fault: spawn::new_child failed")?;
     crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "integration::umip_descriptor_reads_fault: thread_set_fault_handler failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // The previous child's read address must not stand in for this one's.
     READ_IP.store(0, Ordering::Release);
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`, on which

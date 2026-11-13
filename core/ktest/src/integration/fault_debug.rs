@@ -98,7 +98,8 @@ fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64)
     REPORT_SIG.store(child_sig, Ordering::Release);
     crate::bind_fault_handler_classes(child.th, ep, BADGE, FAULT_CLASS_EXCEPTION)
         .map_err(|_| "integration::fault_debug: bind (exception) failed")?;
-    let stack = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, breakpoint_entry, stack, 0) }

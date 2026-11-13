@@ -254,7 +254,8 @@ fn start_waiter(
         .map_err(|_| "stress::timed_wait_reuse: cap_copy event queue failed")?;
     // SAFETY: stack index 0 is this test's only child; stress tests run
     // sequentially and the child is deleted before this test returns.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 0) }?;
     // SAFETY: entry 0 < 1; the previous run's waiter was deleted before that
     // run returned.
     let arg = unsafe {

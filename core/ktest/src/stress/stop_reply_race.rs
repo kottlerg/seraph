@@ -673,7 +673,8 @@ fn spawn_client(
     };
     // SAFETY: stack index 1 is the client's; each cycle reaps its client
     // before the next starts.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 1) }?;
     // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(client, client_entry, stack, arg, cpu) }
@@ -715,7 +716,8 @@ fn spawn_server(
     };
     // SAFETY: stack index 0 is the server's; each cycle reaps its server
     // before the next starts.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 0) }?;
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(server, server_entry, stack, arg, cpu) }
@@ -757,7 +759,8 @@ fn spawn_stopper(
     };
     // SAFETY: stack index 2 is the stopper's; each cycle reaps its stopper
     // before the next starts.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[2]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 2) }?;
     // SAFETY: the stack is `super::STRESS_STACKS[2]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(stopper, stopper_entry, stack, arg, cpu) }

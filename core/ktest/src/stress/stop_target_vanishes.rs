@@ -430,7 +430,8 @@ fn create_thread(
     // target; stress tests run sequentially, each phase's children exit or
     // are deleted before the next phase's are created, and a delete round's
     // target is deleted (ended wherever it was) before its successor is.
-    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let top = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack) }?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).

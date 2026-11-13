@@ -744,11 +744,11 @@ pub fn cap_create_thread(
 /// or the registered IPC buffer page of any of its threads: the call replaces
 /// whatever the span maps, changing those bytes outside the compiler's
 /// knowledge. A part of a live object counts only when the program reads or
-/// writes it after the call or a live reference covers it: a part the program
-/// reaches only through raw pointers that never touch the span, such as an
-/// unused guard field of a static, may lie in it. A call on another address
-/// space changes nothing the calling program runs on, and neither does a
-/// refusal other than `OutOfMemory`: the
+/// writes it after the call or a live reference or `Box` covers it: a part
+/// the program reaches only through raw pointers that never touch the span,
+/// such as an unused guard field of a static, may lie in it. A call on
+/// another address space changes nothing the calling program runs on, and
+/// neither does a refusal other than `OutOfMemory`: the
 /// kernel checks every argument before it maps a page, but maps page by page
 /// and returns `OutOfMemory` with the pages before the failing one already
 /// mapped, so the contract covers the whole span even for a call that fails.
@@ -805,9 +805,9 @@ pub unsafe fn mem_map(
 /// or the registered IPC buffer page of any of its threads: an access to an
 /// unmapped page faults where the compiler assumes the object valid. A part
 /// of a live object counts only when the program reads or writes it after
-/// the call or a live reference covers it: a part the program reaches only
-/// through raw pointers that never touch the span, such as an unused guard
-/// field of a static (ktest's `GuardedStack`), may lie in it.
+/// the call or a live reference or `Box` covers it: a part the program
+/// reaches only through raw pointers that never touch the span, such as an
+/// unused guard field of a static (ktest's `GuardedStack`), may lie in it.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
@@ -874,8 +874,8 @@ pub unsafe fn mem_unmap_reclaim(aspace_cap: u64, virt: u64, page_count: u64) -> 
 /// or the registered IPC buffer page of any of its threads whose accesses the
 /// new permissions would refuse: an access the compiler assumes valid would
 /// fault. A part of a live object counts only when the program accesses it
-/// after the call or a live reference covers it: a part the program reaches
-/// only through raw pointers that never touch the span may lie in it.
+/// after the call or a live reference or `Box` covers it: a part the program
+/// reaches only through raw pointers that never touch the span may lie in it.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,

@@ -52,7 +52,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     crate::bind_fault_handler(child.th, ep, FAULT_BADGE)
         .map_err(|_| "fault_handler_declines_kills: thread_set_fault_handler failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, fault_child, stack_top, 0) }

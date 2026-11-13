@@ -107,8 +107,10 @@ pub fn preempt_isolation(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_create_thread b for fpu::preempt_isolation failed")?;
     let mut child_b = crate::spawn::SpawnedChild { th: th_b, cs: cs_b };
 
-    let stack_a = ChildStack::top(core::ptr::addr_of!(STACK_A));
-    let stack_b = ChildStack::top(core::ptr::addr_of!(STACK_B));
+    // SAFETY: `STACK_A` is a static stack, reached only through `addr_of!`.
+    let stack_a = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_A)) };
+    // SAFETY: `STACK_B` is a static stack, reached only through `addr_of!`.
+    let stack_b = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_B)) };
 
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
@@ -268,7 +270,8 @@ pub fn preempt_isolation_cross_cpu(ctx: &TestContext) -> TestResult
     thread_set_affinity(th, 0)
         .map_err(|_| "initial thread_set_affinity(0) for preempt_isolation_cross_cpu failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CROSS));
+    // SAFETY: `STACK_CROSS` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_CROSS)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).

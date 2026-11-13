@@ -368,7 +368,9 @@ fn run_round(
     };
     // SAFETY: the caller's stack index is this round's only user of it; the
     // previous round's caller was deleted before this one was spawned.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[CALLER_STACK]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack =
+        unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), CALLER_STACK) }?;
     // SAFETY: entry 0 is the round's caller's alone; the previous round's
     // caller was deleted before this one was spawned.
     let arg = unsafe {
@@ -494,8 +496,9 @@ fn start_server(ctx: &TestContext, round: &mut Round, kind: u32, cycle: u32) -> 
     // SAFETY: entry 0 is the round's server's alone; the previous round's
     // server was deleted before this one starts.
     let arg = unsafe { SERVER_ARGS.publish(0, args) };
-    // SAFETY: the server's stack index is this round's only user of it.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[SERVER_STACK]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack =
+        unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), SERVER_STACK) }?;
     if let Some(server) = round.server.as_ref()
     {
         // SAFETY: the stack is `super::STRESS_STACKS[SERVER_STACK]`, this test's own `ChildStack`,

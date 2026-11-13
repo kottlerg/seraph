@@ -76,7 +76,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "integration::thread_lifecycle: cap_copy (block→child) failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the single blocker has not been started yet.
     let blocker_arg = unsafe {
         BLOCKER_ARGS.publish(

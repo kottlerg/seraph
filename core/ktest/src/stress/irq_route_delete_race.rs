@@ -303,7 +303,8 @@ fn race(ctx: &TestContext, line: u64, cpus: u64) -> TestResult
     SPARE.store(spare, Ordering::Release);
     let deleter = cap_create_thread(ctx.memory_base, ctx.aspace_cap, ctx.cspace_cap, 0, 0)
         .map_err(|_| "stress::irq_route_delete_race: create deleter failed")?;
-    let top = ChildStack::top(core::ptr::addr_of!(DELETER_STACK));
+    // SAFETY: `DELETER_STACK` is a static stack, reached only through `addr_of!`.
+    let top = unsafe { ChildStack::top(core::ptr::addr_of!(DELETER_STACK)) };
     // SAFETY: `deleter_entry` is an `extern "C" fn(u64) -> !` and
     // `DELETER_STACK` is this deleter's own stack for its lifetime.
     let started =

@@ -92,7 +92,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             },
         )
     };
-    let stack = ChildStack::top(core::ptr::addr_of!(CLIENT_STACK));
+    // SAFETY: `CLIENT_STACK` is a static stack, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top(core::ptr::addr_of!(CLIENT_STACK)) };
     // SAFETY: the stack is `CLIENT_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(&client, client_entry, stack, arg) }

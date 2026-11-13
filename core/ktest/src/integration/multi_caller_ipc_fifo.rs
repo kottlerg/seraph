@@ -227,7 +227,8 @@ fn start_caller(
             },
         )
     };
-    let stack = ChildStack::top_at(core::ptr::addr_of!(CALLER_STACKS), index)?;
+    // SAFETY: `CALLER_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(CALLER_STACKS), index) }?;
     // SAFETY: the stack is this caller's own `ChildStack`, on which no other
     // live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(&child, caller_entry, stack, arg, CALLER_CPU) }
@@ -240,7 +241,8 @@ fn start_barrier(ctx: &TestContext) -> Result<SpawnedChild, &'static str>
 {
     let child = spawn::new_child_at(ctx, ctx.sched_control_cap, BARRIER_LEVEL)
         .map_err(|_| "multi_caller_ipc_fifo: new_child_at barrier failed")?;
-    let stack = ChildStack::top(core::ptr::addr_of!(BARRIER_STACK));
+    // SAFETY: `BARRIER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top(core::ptr::addr_of!(BARRIER_STACK)) };
     // SAFETY: the stack is `BARRIER_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(&child, barrier_entry, stack, 0, CALLER_CPU) }

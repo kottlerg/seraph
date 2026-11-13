@@ -162,7 +162,8 @@ fn swap_rounds(
         };
         // Stress tests run sequentially; only this test uses these
         // STRESS_STACKS slots during its run.
-        let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own
         // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start_pinned(child, worker_entry, stack, arg, *slot) }

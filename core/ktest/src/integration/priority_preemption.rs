@@ -122,7 +122,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: spawn::new_child_at (hog) failed")?;
     let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy hog_done failed")?;
-    let hog_stack = ChildStack::top(core::ptr::addr_of!(HOG_STACK));
+    // SAFETY: `HOG_STACK` is a static stack, reached only through `addr_of!`.
+    let hog_stack = unsafe { ChildStack::top(core::ptr::addr_of!(HOG_STACK)) };
     // SAFETY: the stack is `HOG_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start_pinned(&hog, hog_entry, hog_stack, hog_done, 0) }
@@ -137,7 +138,8 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "priority_preemption: spawn::new_child_at (elevated) failed")?;
     let elevated_done = cap_copy(done, elevated.cs, RIGHTS_NOTIFY)
         .map_err(|_| "priority_preemption: cap_copy elevated_done failed")?;
-    let elevated_stack = ChildStack::top(core::ptr::addr_of!(ELEVATED_STACK));
+    // SAFETY: `ELEVATED_STACK` is a static stack, reached only through `addr_of!`.
+    let elevated_stack = unsafe { ChildStack::top(core::ptr::addr_of!(ELEVATED_STACK)) };
 
     let budget_us = crate::scaled_bound(PREEMPT_BUDGET_US);
     let t_made_runnable = system_info(SystemInfoType::ElapsedUs as u64)

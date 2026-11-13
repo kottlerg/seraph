@@ -49,7 +49,8 @@ pub fn run(ctx: &TestContext) -> TestResult
 /// Start the faulting child and check that it exits with the fault reason.
 fn start_and_check(child: &crate::spawn::SpawnedChild) -> TestResult
 {
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(child, fault_child, stack_top, 0) }

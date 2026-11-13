@@ -373,7 +373,9 @@ fn start(
         // stress stacks 0 to 2 belong to this test's three children;
         // stress tests run sequentially and every child is deleted before
         // this test returns.
-        let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index)?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack =
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), index) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[index]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start_pinned(child, entry, stack, arg, cpu) }

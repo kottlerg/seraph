@@ -1,10 +1,13 @@
 # clippy.toml — Clippy settings for the bootloader crate.
-# docs/coding-standards.md § Clippy states both settings and their derivation.
+# docs/coding-standards.md § Clippy states the rule each setting serves; the
+# figures and the stack the frame threshold derives from are the bootloader's.
 
 # Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
 # that is data carries an `#[expect]` naming the value.
 max-fn-params-bools = 0
 
-# A quarter of the 128 KiB stack the UEFI specification guarantees a
-# boot-services image (core/boot/docs/uefi-environment.md).
+# 32768 bytes, a quarter of the smallest stack the bootloader's code runs on:
+# the 128 KiB the UEFI specification guarantees an image during boot services,
+# on x64 and RISC-V. Every Rust frame of the bootloader runs on that firmware
+# stack (core/boot/docs/uefi-environment.md § Stack).
 stack-size-threshold = 32768

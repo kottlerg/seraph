@@ -5,9 +5,9 @@
 
 //! Seraph x86-64 CMOS / MC146818-compatible RTC driver.
 //!
-//! Bound by devmgr to the ACPI namespace device of `_HID` `PNP0B00`, it
-//! receives the resource list (`driver_binding::resources`): an `IoPort`
-//! cap on the range the device's `_CRS` names, which holds the CMOS
+//! Bound by devmgr to the ACPI namespace device whose `_HID` or a `_CID` is
+//! `PNP0B00`, `PNP0B01` or `PNP0B02`, it receives the resource list
+//! (`driver_binding::resources`): an `IoPort` cap on the range the device's `_CRS` names, which holds the CMOS
 //! index/data ports `0x70`–`0x71`, a RECV cap on the driver's service
 //! endpoint, and its devmgr query cap. It reads the century register's
 //! index, which devmgr attaches to the record from the FADT `CENTURY` field,
@@ -34,11 +34,20 @@ const CMOS_DATA: u16 = 0x71;
 // ── Declaration ────────────────────────────────────────────────────────────
 
 // What devmgr binds this driver to and how it starts it
-// (docs/driver-binding.md § Driver Declarations).
+// (docs/driver-binding.md § Driver Declarations): every ACPI identifier of a
+// CMOS-compatible RTC, as `_HID` or `_CID`, the set devmgr attaches the
+// FADT's century index to.
 driver_binding::driver_declaration!(driver_binding::decl::Declaration {
     name: "cmos-rtc",
     class: Some("rtc"),
-    matches: &[driver_binding::decl::Match::AcpiHid("PNP0B00")],
+    matches: &[
+        driver_binding::decl::Match::AcpiHid("PNP0B00"),
+        driver_binding::decl::Match::AcpiHid("PNP0B01"),
+        driver_binding::decl::Match::AcpiHid("PNP0B02"),
+        driver_binding::decl::Match::AcpiCid("PNP0B00"),
+        driver_binding::decl::Match::AcpiCid("PNP0B01"),
+        driver_binding::decl::Match::AcpiCid("PNP0B02"),
+    ],
     instance_limit: Some(1),
     interrupt: driver_binding::decl::Interrupt::NONE,
     dma: false,

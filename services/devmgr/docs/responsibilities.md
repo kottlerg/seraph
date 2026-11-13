@@ -54,7 +54,8 @@ devmgr's responsibilities are:
   [docs/pci-enumeration.md](pci-enumeration.md) step 4), then the service
   endpoint and the driver's devmgr query cap (below). The serial driver
   matches an SPCR interface type 0x00 or 0x12 or `_HID` `PNP0501`, the
-  framebuffer driver the `boot-framebuffer` key, `cmos-rtc` `_HID` `PNP0B00`,
+  framebuffer driver the `boot-framebuffer` key, `cmos-rtc` `_HID` or `_CID`
+  `PNP0B00`, `PNP0B01` or `PNP0B02`,
   and `goldfish-rtc` the platform key `google,goldfish-rtc`. devmgr attaches
   the FADT's `CENTURY` index to the record carrying `PNP0B00`, `PNP0B01`, or
   `PNP0B02` as device info (`ipc::device_info_kind::RTC_CENTURY`, a one-byte

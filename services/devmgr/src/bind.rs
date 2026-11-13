@@ -562,7 +562,12 @@ fn carve_platform_device(
     carve: &mut Carve,
 ) -> Option<PlatformDeviceCaps>
 {
-    let mut dev = PlatformDeviceCaps::empty();
+    let Some(mut dev) = PlatformDeviceCaps::empty()
+    else
+    {
+        std::os::seraph::log!(warn: "{}: no memory for the device's resources; not bound", name);
+        return None;
+    };
     for resource in record.resources()
     {
         let carved = match resource
@@ -696,48 +701,36 @@ fn platform_wired(
 /// and no reset: withdrawing its driver revokes the driver's copies.
 pub struct PlatformDeviceCaps
 {
-    resources: [Resource; MAX_BOUND_RESOURCES],
-    count: usize,
+    /// Room for [`MAX_BOUND_RESOURCES`] reserved on the heap at
+    /// [`Self::empty`], so a push never allocates and the caps move through
+    /// the bind and the registry as a few words.
+    resources: Vec<Resource>,
     pub device_badge: u64,
 }
 
 impl PlatformDeviceCaps
 {
-    /// Nothing carved yet.
-    fn empty() -> Self
+    /// Nothing carved yet; `None` when the room for the resources cannot be
+    /// reserved.
+    fn empty() -> Option<Self>
     {
-        Self {
-            resources: [Resource::IoPort {
-                cap: 0,
-                base: 0,
-                count: 0,
-            }; MAX_BOUND_RESOURCES],
-            count: 0,
+        Some(Self {
+            resources: bound_resources()?,
             device_badge: 0,
-        }
+        })
     }
 
     /// Record a carved resource; `false`, the cap deleted, when
     /// [`MAX_BOUND_RESOURCES`] are already held.
     fn push(&mut self, resource: Resource) -> bool
     {
-        if let Some(slot) = self.resources.get_mut(self.count)
-        {
-            *slot = resource;
-            self.count = self.count.saturating_add(1);
-            true
-        }
-        else
-        {
-            let _ = syscall::cap_delete(resource.cap());
-            false
-        }
+        push_bound(&mut self.resources, resource)
     }
 
     /// The delivered resources, in delivery order.
     pub fn resources(&self) -> &[Resource]
     {
-        self.resources.get(..self.count).unwrap_or(&[])
+        &self.resources
     }
 
     /// Take the device from its driver, live or dead: revoke every copy
@@ -758,6 +751,32 @@ impl PlatformDeviceCaps
         {
             let _ = syscall::cap_delete(resource.cap());
         }
+    }
+}
+
+/// An empty resource list with room for [`MAX_BOUND_RESOURCES`], the most a
+/// bound driver is delivered; `None` when the room cannot be reserved.
+fn bound_resources() -> Option<Vec<Resource>>
+{
+    let mut resources = Vec::new();
+    resources.try_reserve_exact(MAX_BOUND_RESOURCES).ok()?;
+    Some(resources)
+}
+
+/// Append `resource` to `resources`, a list from [`bound_resources`], within
+/// its reserved room; `false`, the resource's cap deleted, when
+/// [`MAX_BOUND_RESOURCES`] are already held.
+fn push_bound(resources: &mut Vec<Resource>, resource: Resource) -> bool
+{
+    if resources.len() < MAX_BOUND_RESOURCES
+    {
+        resources.push(resource);
+        true
+    }
+    else
+    {
+        let _ = syscall::cap_delete(resource.cap());
+        false
     }
 }
 
@@ -926,7 +945,12 @@ fn carve_pci_device(
         firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, &pci_dev.virtio_info);
     let spans = msix.map(|m| m.withheld());
     let withheld = spans.as_ref().map_or(&[][..], |w| w.as_slice());
-    let mut dev = PciDeviceCaps::empty(carve.caps.self_aspace);
+    let Some(mut dev) = PciDeviceCaps::empty(carve.caps.self_aspace)
+    else
+    {
+        std::os::seraph::log!(warn: "{}: no memory for the device's resources; not bound", name);
+        return None;
+    };
     if carve_bars(name, pci_dev, withheld, carve.caps, &mut dev).is_none()
     {
         dev.release();
@@ -1716,8 +1740,10 @@ enum StopReset
 /// token of a driver procmgr holds the memory of.
 pub struct PciDeviceCaps
 {
-    resources: [Resource; MAX_BOUND_RESOURCES],
-    count: usize,
+    /// Room for [`MAX_BOUND_RESOURCES`] reserved on the heap at
+    /// [`Self::empty`], so a push never allocates and the caps move through
+    /// the bind and the registry as a few words.
+    resources: Vec<Resource>,
     /// The device's DMA capability, kept by devmgr, and its mappings
     /// ([`dma::DmaGrant`]); `None` for a driver that declares no DMA.
     pub dma: Option<dma::DmaGrant>,
@@ -1744,16 +1770,12 @@ pub struct PciDeviceCaps
 
 impl PciDeviceCaps
 {
-    /// Nothing carved yet.
-    fn empty(aspace: u64) -> Self
+    /// Nothing carved yet; `None` when the room for the resources cannot be
+    /// reserved.
+    fn empty(aspace: u64) -> Option<Self>
     {
-        Self {
-            resources: [Resource::IoPort {
-                cap: 0,
-                base: 0,
-                count: 0,
-            }; MAX_BOUND_RESOURCES],
-            count: 0,
+        Some(Self {
+            resources: bound_resources()?,
             dma: None,
             config: FunctionConfig { cap: 0, aspace },
             msix_table: 0,
@@ -1761,7 +1783,7 @@ impl PciDeviceCaps
             device_badge: 0,
             release_token: 0,
             remap: None,
-        }
+        })
     }
 
     /// Record a carved resource. A function's BARs are delivered as at most
@@ -1770,22 +1792,14 @@ impl PciDeviceCaps
     /// [`MAX_BOUND_RESOURCES`] holds.
     fn push(&mut self, resource: Resource)
     {
-        if let Some(slot) = self.resources.get_mut(self.count)
-        {
-            *slot = resource;
-            self.count = self.count.saturating_add(1);
-        }
-        else
-        {
-            let _ = syscall::cap_delete(resource.cap());
-        }
+        let _ = push_bound(&mut self.resources, resource);
     }
 
     /// The delivered resources, in delivery order: the BARs, then the
     /// interrupt's vectors.
     pub fn resources(&self) -> &[Resource]
     {
-        self.resources.get(..self.count).unwrap_or(&[])
+        &self.resources
     }
 
     /// Whether the device was given message-signaled vectors.

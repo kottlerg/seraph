@@ -176,15 +176,13 @@ fn kind_of(path: &str) -> &'static str
 fn pr_of(subject: &str) -> Option<u64>
 {
     let rest = subject.strip_prefix("Merge pull request #")?;
-    let digits_end = rest
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(rest.len());
-    let after = &rest[digits_end..];
-    if digits_end == 0 || !(after.is_empty() || after.starts_with(' '))
+    let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+    let digits = rest.strip_suffix(after)?;
+    if digits.is_empty() || !(after.is_empty() || after.starts_with(' '))
     {
         return None;
     }
-    rest[..digits_end].parse().ok()
+    digits.parse().ok()
 }
 
 /// A unit's PR number and title from its subject and body: a pull request's
@@ -303,25 +301,29 @@ fn unit_pages(units: &[Unit], per_page: usize) -> Vec<Vec<UnitChunk<'_>>>
                 offset: 0,
                 files: &unit.files,
             });
-            room -= 1;
+            room = room.saturating_sub(1);
             continue;
         }
-        let mut offset = 0;
-        while offset < unit.files.len()
+        let mut rest: &[String] = &unit.files;
+        let mut offset: usize = 0;
+        while !rest.is_empty()
         {
             if room == 0
             {
                 pages.push(std::mem::take(&mut current));
                 room = per_page;
             }
-            let take = room.min(unit.files.len() - offset);
+            let (files, tail) = rest
+                .split_at_checked(room.min(rest.len()))
+                .unwrap_or((rest, &[]));
             current.push(UnitChunk {
                 unit,
                 offset,
-                files: &unit.files[offset..offset + take],
+                files,
             });
-            offset += take;
-            room -= take;
+            offset = offset.saturating_add(files.len());
+            room = room.saturating_sub(files.len());
+            rest = tail;
         }
     }
     if !current.is_empty()

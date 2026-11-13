@@ -1336,8 +1336,9 @@ unsafe fn kernel_entry_post_rebase(
                     "Phase 9: init stack Memory caps are not in consecutive slots",
                 );
             }
-            // The guard page (one page below the stack) is intentionally left
-            // unmapped: accessing it will fault, catching stack overflows.
+            // The `STACK_GUARD_PAGES` guard pages below the stack are left
+            // unmapped, so an overflow faults (mm::address_space's
+            // `INIT_STACK_RESERVE`).
             (base_slot, STACK_PAGES as u32)
         };
 

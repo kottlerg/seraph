@@ -92,7 +92,7 @@ const A_STACK: usize = 1;
 const B_STACK: usize = 2;
 
 /// Bytes in one child stack, for the entries' stack check.
-const STACK_BYTES: u64 = core::mem::size_of::<ChildStack>() as u64;
+const STACK_BYTES: u64 = ChildStack::BYTES as u64;
 
 /// Bound on each of a round's waits on the helper, in microseconds: for it
 /// to report itself ready, and for its configure to return.

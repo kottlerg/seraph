@@ -18,6 +18,9 @@
     "position-independent-executables": true,
     "static-position-independent-executables": true,
     "plt-by-default": false,
+    "stack-probes": {
+        "kind": "inline"
+    },
     "pre-link-args": {
         "ld.lld": [
             "--gc-sections",

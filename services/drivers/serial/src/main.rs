@@ -274,16 +274,13 @@ fn main() -> !
     // `device.registers` is the register window devmgr delivered, whose cap
     // the call maps (riscv64) or binds (x86-64) only after checking its kind
     // and size.
-    if !unsafe {
-        arch::current::serial_init(
-            info.self_thread,
-            info.self_aspace,
-            &device.registers,
-            irq.cap != 0,
-        )
-    }
+    if !unsafe { arch::current::serial_init(info.self_thread, info.self_aspace, &device.registers) }
     {
         syscall::thread_exit();
+    }
+    if irq.cap != 0
+    {
+        arch::current::serial_enable_rx_interrupt();
     }
 
     // SAFETY: ipc_buf is the registered IPC buffer page.

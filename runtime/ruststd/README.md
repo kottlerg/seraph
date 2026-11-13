@@ -197,10 +197,25 @@ without a fault. On riscv64 a `call` writes nothing to the stack and a split pro
 14312 bytes apart
 ([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)); the guard's
 four pages are wider than that, so no overflow's first store passes it. The usable size is the
-larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages
-(`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the reservation, the page-table funding, or the
-registration fails, or the process is not demand-paged, the stack is instead an eager byte-heap
-allocation of the requested size (at least 64 KiB, rounded up to whole pages) with no guard.
+larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB, rounded up to whole
+pages) and 512 pages (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the reservation, the page-table
+funding, or the registration fails, the spawn fails with the error; it never runs the thread on a
+stack without a guard.
+
+In a process with no pager (`pager_endpoint_cap` zero: procmgr, and every process created
+`CREATE_PINNED`, such as the DMA-device and IOMMU drivers devmgr starts) the stack is an eager
+stack: a page reservation of the same `GUARD_PAGES` guard pages below the usable pages, whose
+usable pages are mapped read-write at spawn from one contiguous memmgr grant, after the
+reservation's page-table growth is funded; the guard stays unmapped. The usable size is the
+requested stack size alone (at least `DEFAULT_MIN_STACK_SIZE`, rounded up to whole pages), since
+each page costs a frame at spawn. Such a process has no virtual-memory handler, so an overflow
+whose first touch lands in the guard faults with no handler to take it, and the fault ends the
+whole process
+([docs/fault-handling.md § Crash Reports](../../docs/fault-handling.md#crash-reports)).
+The stack probes and the guard's width hold for it as for a demand stack. If the reservation, the
+grant, the page-table funding, or the map fails, the spawn releases what it took and fails with the
+error.
+
 Before starting the thread, the spawn copies the spawning thread's fault-handler bindings onto it
 (`SYS_THREAD_INHERIT_FAULT_HANDLER`), the pager of a demand-paged process among them, and a
 refused copy fails the spawn with the error rather than starting a thread whose demand faults (its
@@ -208,7 +223,10 @@ stack's, when the stack is demand-backed) no pager would serve. `join` frees the
 thread has left user mode: a demand stack through
 [`UNREGISTER_REGION`](../../services/memmgr/docs/ipc-interface.md#label-9-unregister_region) and,
 once memmgr has answered, release of its reservation (kept when no answer comes, since memmgr may
-still hold the region), a heap stack through `dealloc`. A detached thread's stack, or that
+still hold the region); an eager stack by unmapping its usable pages, then releasing its
+reservation, deleting the grant's cap, and returning the grant's run to memmgr's pool (all kept for
+the process's lifetime when the unmap fails, since pages may still be mapped). A spawn that fails
+after taking its stack frees it the same way. A detached thread's stack, or that
 of a joined thread whose join wait failed with an error other than `Interrupted` (its private
 completion notification gone), is freed the same way by the next spawn, join, or detach in the
 process after the kernel posts that thread's death (or at once by that detach or join, when the

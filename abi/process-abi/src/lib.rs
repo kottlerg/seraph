@@ -110,7 +110,7 @@ pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
 /// Unmapped guard pages below a userspace stack, in 4 KiB pages: the least
 /// the creator's layout (`process-layout`) leaves below a main-thread stack,
-/// and the guard std reserves below each demand-paged thread stack it spawns.
+/// and the guard std reserves below each thread stack it spawns.
 /// Init's own stacks and the stacks the `lowuser` services place themselves
 /// keep less (#1018).
 ///

@@ -10,9 +10,7 @@
 //! leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
-//! arch module. `arch/mod.rs` also compiles this file into host test builds
-//! of the other architectures, so `cargo xtask test` (run on an `x86_64`
-//! host) runs its tests.
+//! arch module.
 
 use crate::mm::paging::{LeafGrant, PagingError};
 

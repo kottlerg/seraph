@@ -36,27 +36,6 @@
 //! entry for the forged handle, and the probe can observe only that the write
 //! is not delivered, since QEMU records no requester for the fault.
 
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(clippy::large_stack_frames)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
-
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -208,6 +187,10 @@ impl Driver
     }
 
     /// Copy `PROBE_LEN` bytes from `src` to `dst` ([`Driver::transfer_bytes`]).
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`to_memory` is the direction bit of the edu DMA command register"
+    )]
     fn transfer(&self, src: u64, dst: u64, to_memory: bool) -> bool
     {
         self.transfer_bytes(src, dst, PROBE_LEN as u64, to_memory)
@@ -216,6 +199,10 @@ impl Driver
     /// Copy `len` bytes from `src` to `dst`, from the device's buffer to
     /// memory when `to_memory`, and wait for the device to complete it;
     /// `false` when it does not within [`TRANSFER_TIMEOUT`].
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`to_memory` is the direction bit of the edu DMA command register"
+    )]
     fn transfer_bytes(&self, src: u64, dst: u64, len: u64, to_memory: bool) -> bool
     {
         self.write64(DMA_SRC, src);

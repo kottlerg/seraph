@@ -16,28 +16,6 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
-// Staged roll-outs of these lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-// `fn_params_excessive_bools`, a pedantic lint, is on already; `clippy.toml`
-// sets its threshold to zero and the `large_stack_frames` threshold. The test
-// configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 #![cfg_attr(
     test,
     expect(

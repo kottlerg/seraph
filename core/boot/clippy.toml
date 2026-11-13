@@ -1,6 +1,7 @@
 # clippy.toml — Clippy settings for the bootloader crate.
-# docs/coding-standards.md § Clippy states the rule each setting serves; the
-# figures and the stack the frame threshold derives from are the bootloader's.
+# docs/coding-standards.md § Clippy states the rule each setting serves; this
+# file restates every setting of the root clippy.toml, with the frame
+# threshold of the stack the bootloader's code runs on.
 
 # Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
 # that is data carries an `#[expect]` naming the value.

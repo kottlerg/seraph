@@ -660,6 +660,11 @@ impl<F: FnMut(CrsResource)> Emit<F>
 }
 
 /// `IRQ_MODE_*` bits from the level and polarity flags.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`level` and `active_low` are the descriptor's trigger and polarity flags, encoded \
+              into the `IRQ_MODE_*` bits"
+)]
 const fn irq_mode(level: bool, active_low: bool) -> u64
 {
     let mut mode = 0;

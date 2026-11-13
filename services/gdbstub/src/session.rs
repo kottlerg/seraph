@@ -1197,6 +1197,10 @@ mod tests
         }
 
         /// A thread spawned by `parent`, whose binding it copies.
+        #[expect(
+            clippy::fn_params_excessive_bools,
+            reason = "`registered` is the field of the simulated thread it records"
+        )]
         fn spawn(&mut self, parent: Option<usize>, registered: bool) -> usize
         {
             let badge = parent.and_then(|p| self.threads[p].badge);

@@ -18,26 +18,6 @@
 //! `shared/ansi/README.md` § Scope.
 
 #![no_std]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 /// Windows 10 console (Campbell) 16-colour palette: ANSI colour index →
 /// 24-bit RGB. Indices `0..=7` are the normal set, `8..=15` the bright set.
@@ -191,6 +171,11 @@ impl AnsiParser
     /// Apply one SGR parameter to the colour state. An unseen parameter
     /// (`seen == false`) is treated as `0` (reset). Unrecognised codes are
     /// ignored.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`seen` is whether the SGR parameter was present, the parser's `acc_seen` field, \
+                  which an absent parameter reads as 0"
+    )]
     fn apply_param(&mut self, value: u16, seen: bool)
     {
         let code = if seen { value } else { 0 };

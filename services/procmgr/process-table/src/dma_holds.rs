@@ -195,6 +195,10 @@ mod tests
 {
     use super::*;
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`dma_hold` and `started` are fields of the entry it builds"
+    )]
     fn entry(badge: u64, dma_hold: bool, started: bool) -> ProcessEntry
     {
         ProcessEntry {

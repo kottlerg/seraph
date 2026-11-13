@@ -199,6 +199,11 @@ impl Tally
     /// Count `round`, of kind `kind`, which armed or overlapped the race when
     /// `hit`. A held round that frees its notification is not observed and
     /// not counted.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`hit` is whether the round armed or overlapped the race, the outcome the tally \
+                  counts"
+    )]
     fn count(&mut self, round: u32, kind: usize, hit: bool) -> TestResult
     {
         let (runs, hits) = match (held(round), observed(round))

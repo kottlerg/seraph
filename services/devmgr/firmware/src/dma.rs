@@ -388,6 +388,11 @@ impl Device
     /// bytes overlap none of the device's mappings, none of its reserved
     /// ranges, and, when `interrupt_range` is set, no byte of
     /// [`INTERRUPT_RANGE`].
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`interrupt_range` is the domain's `Confinement::Domain` field, compared to keep \
+                  the IOVA out of `INTERRUPT_RANGE`"
+    )]
     fn free_iova(&self, len: u64, limit: u64, interrupt_range: bool) -> Option<u64>
     {
         let len = len.checked_next_multiple_of(PAGE_SIZE)?;

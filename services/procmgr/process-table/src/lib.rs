@@ -35,25 +35,6 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(
-    clippy::fn_params_excessive_bools,
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 pub mod crash_registrant;
 pub mod create_blobs;
@@ -1659,6 +1640,10 @@ mod tests
     /// Register a thread bound under `bound` from `sender`, rebound under a
     /// fresh crash badge when `rebound`, as `register_thread` does; returns
     /// the record and the binding the thread is left with.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`rebound` is the outcome of the rebind the helper records"
+    )]
     fn register(
         table: &mut ProcessTable,
         sender: u64,

@@ -20,26 +20,6 @@
 //! The impure launch/restart machinery that consumes a parsed [`Definition`]
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(
-    clippy::fn_params_excessive_bools,
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
-
 pub mod class;
 pub mod parse;
 pub mod restart_budget;
@@ -66,6 +46,11 @@ pub fn cwd_rights(subtree_rights: Option<u32>) -> u32
 /// the [`HANDOVER_AUTHORITY`](ipc::svcmgr_labels::HANDOVER_AUTHORITY) verb
 /// bit, which init alone mints.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`handover_done` is whether an earlier handover was honoured, which the check \
+              compares"
+)]
 pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 {
     badge & ipc::svcmgr_labels::HANDOVER_AUTHORITY != 0 && !handover_done
@@ -276,6 +261,10 @@ mod tests
     }
 
     /// A recipe named `name`, declaring a shutdown actuator when `actuator`.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`actuator` is the recipe's shutdown-actuator field"
+    )]
     fn recipe(name: &str, actuator: bool) -> Definition
     {
         let mut contents = String::from(

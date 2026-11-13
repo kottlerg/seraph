@@ -58,6 +58,10 @@ impl InterruptRemap
 {
     /// Write the entry of the source `cap` names for requests from `source`,
     /// level-triggered when `level` is set.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`level` is the remapping entry's trigger-mode bit"
+    )]
     fn write(&self, cap: u64, level: bool, source: u16) -> Result<(), NotRemapped>
     {
         let entry = syscall::cap_info(cap, CAP_INFO_IRQ_REMAP_ENTRY).map_err(|e| {

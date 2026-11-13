@@ -36,26 +36,6 @@
 )]
 #![cfg_attr(all(not(feature = "rustc-dep-of-std"), not(test)), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -112,6 +92,11 @@ pub const LOG_CALL_UNANSWERED_TIMEOUT_MS: u32 = 10;
 static RECEIVER_UNANSWERED: AtomicBool = AtomicBool::new(false);
 
 /// The bound on a log call while [`RECEIVER_UNANSWERED`] reads `unanswered`.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`unanswered` is the value of `RECEIVER_UNANSWERED`, which the function maps to a \
+              bound"
+)]
 fn call_bound(unanswered: bool) -> u32
 {
     if unanswered
@@ -126,6 +111,11 @@ fn call_bound(unanswered: bool) -> u32
 
 /// [`RECEIVER_UNANSWERED`] after a log call with `outcome`, from `unanswered`
 /// before it: cleared by an answer, set by a timeout, kept by any other error.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`unanswered` is the value of `RECEIVER_UNANSWERED`, which the function maps to its \
+              next value"
+)]
 fn unanswered_after<T>(unanswered: bool, outcome: &Result<T, i64>) -> bool
 {
     match outcome

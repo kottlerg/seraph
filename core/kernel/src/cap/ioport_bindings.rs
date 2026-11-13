@@ -353,17 +353,19 @@ mod tests
         let layout = std::alloc::Layout::new::<IoPortBindings>();
         #[expect(
             clippy::cast_ptr_alignment,
-            reason = "`alloc` returns a block aligned for `layout`, which is the table's own"
+            reason = "`alloc_zeroed` returns a block aligned for `layout`, which is the table's own"
         )]
         // SAFETY: `layout` is the table's own, which has a non-zero size.
-        let p = unsafe { std::alloc::alloc(layout) }.cast::<IoPortBindings>();
+        let p = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<IoPortBindings>();
         assert!(!p.is_null());
         // SAFETY: `p` is a fresh allocation of the table's layout and `parts`
         // are fresh blocks, initialised in place before use; the parts outlive
         // the table.
         unsafe { IoPortBindings::init_in_place(p, parts, 0x5000, [0; TABLE_PAGES]) };
-        // SAFETY: `p` came from the global allocator with the table's layout,
-        // and `init_in_place` initialised it.
+        // SAFETY: `p` came from the global allocator with the table's layout.
+        // The block was zeroed, which is a valid value of every field
+        // (`records` included, which `init_in_place` leaves as it finds it),
+        // and `init_in_place` set the others.
         let table = unsafe { Box::from_raw(p) };
         Table {
             table,

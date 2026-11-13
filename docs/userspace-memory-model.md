@@ -252,7 +252,7 @@ quality caveat.
   init) maps `ProcessInfo.stack_pages` pages ending at the chosen
   `ProcessInfo.stack_top_vaddr` and leaves the pages below them
   unmapped, so a guard of at least `STACK_GUARD_PAGES` (4) pages lies
-  below every stack: on riscv64 two consecutive stack stores can lie
+  below every main-thread stack it maps: on riscv64 two consecutive stack stores can lie
   14312 bytes apart ([build-system.md](build-system.md) § Custom
   Targets), and a smaller guard could lie wholly between them. The page
   count comes from the binary's optional `.note.seraph.stack` ELF note

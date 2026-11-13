@@ -116,14 +116,19 @@ stack probes (`"stack-probes": {"kind": "inline"}`, so a frame larger than one p
 touches its pages in turn and faults on a thread stack's guard
 instead of skipping it), relax the kernel-side soft-float discipline,
 and pin a hard-microarchitecture floor for userspace SIMD / Vector
-codegen. On riscv64 the probes leave up to a page of a frame unwritten (a
-split prologue's first part, and a leaf of up to a page), a `call` writes
-nothing to the stack, and the probe of a vector frame lies a page below
+codegen. On riscv64 a `call` writes nothing to the stack, a split prologue
+leaves up to 6120 bytes below its return-address save unwritten (the rest of
+its first, 2032-byte adjustment and its second adjustment of up to a page,
+which no probe touches), and the probe of a vector frame lies a page below
 its fixed area, so two consecutive stack stores can lie up to 14312 bytes
-apart. Every userspace stack therefore keeps a guard of four pages
+apart. Every main-thread stack that `shared/process-layout` places and every
+demand-paged thread stack std spawns therefore keeps a guard of four pages
 (`process_abi::STACK_GUARD_PAGES`; [`threadstack`](../programs/threadstack/README.md)'s
 `splitframe` and `span` modes check it), where x86-64, whose `call` pushes
-the return address, needs one:
+the return address, needs one. Stacks placed otherwise keep less: init's main
+stack, which the kernel places, and the stacks the `lowuser` services place
+themselves keep one page or none ([#1018](https://github.com/kottlerg/seraph/issues/1018)),
+and std's heap-fallback thread stack none. The two floors:
 
 - `x86_64-seraph.json` — **x86-64-v3** psABI feature level: SSE2/3/SSSE3/
   SSE4.1/4.2, AVX, AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C, POPCNT, CX16, LAHF/SAHF,

@@ -192,8 +192,10 @@ The std userspace targets emit inline stack probes
 ([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)), so a frame
 larger than one page touches its pages in turn and faults on the guard rather than skipping it
 into an adjacent registered region, such as another thread's stack, which memmgr would back
-without a fault. On riscv64 the probes leave up to a page of a frame unwritten and a `call` writes
-nothing to the stack, so two consecutive stack stores can lie up to 14312 bytes apart; the guard's
+without a fault. On riscv64 a `call` writes nothing to the stack and a split prologue leaves up to
+6120 bytes below its return-address save unwritten, so two consecutive stack stores can lie up to
+14312 bytes apart
+([docs/build-system.md § Custom Targets](../../docs/build-system.md#custom-targets)); the guard's
 four pages are wider than that, so no overflow's first store passes it. The usable size is the
 larger of the requested stack size (at least `DEFAULT_MIN_STACK_SIZE`, 64 KiB) and 512 pages
 (`DEFAULT_DEMAND_STACK_PAGES`, 2 MiB). If the reservation, the page-table funding, or the

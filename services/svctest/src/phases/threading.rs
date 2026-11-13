@@ -136,9 +136,11 @@ pub fn stdio_spawned_phase(_: &Caps)
     std::os::seraph::log!("stdio_spawned phase passed");
 }
 
-// cast_possible_truncation: every cast to u8 in the phase takes an index
-// masked to its low byte, so none drops a bit.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every cast to u8 in the phase takes an index masked to its low byte, so none drops a \
+              bit"
+)]
 pub fn alloc_spawned_phase(_: &Caps)
 {
     const BIG: usize = 600 * 1024;

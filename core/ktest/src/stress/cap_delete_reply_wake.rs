@@ -135,10 +135,12 @@ const CLIENT_ARGS: usize = 1;
 static CHILD_ARGS: spawn::ArgBlock<ChildArgs, 2> =
     spawn::ArgBlock::new(ChildArgs { ep: 0, done: 0 });
 
-// too_many_lines: one stress cell's setup, cycle loop, and teardown; the two
-// child starts' `unsafe` wrappers push it past the limit, and splitting would
-// thread each cycle's caps and stacks through helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one stress cell's setup, cycle loop, and teardown; the two child starts' `unsafe` \
+              wrappers push it past the limit, and splitting would thread each cycle's caps and \
+              stacks through helpers"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)

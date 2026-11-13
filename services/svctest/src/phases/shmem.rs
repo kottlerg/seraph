@@ -27,9 +27,10 @@ pub fn shmem_phase(_: &Caps)
         header: SpscHeader,
         body: [u8; CAP],
     }
-    // cast_possible_truncation: `CAP` is 64, which fits the u32 capacity
-    // field.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`CAP` is 64, which fits the u32 capacity field"
+    )]
     let mut buf = Buf {
         header: SpscHeader {
             head: core::sync::atomic::AtomicU32::new(0),
@@ -41,11 +42,13 @@ pub fn shmem_phase(_: &Caps)
     };
 
     let region_vaddr = &raw mut buf as u64;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`CAP` is 64, which fits u32"
+    )]
     // SAFETY: `buf` is an aligned header plus `CAP` body bytes and lives for
     // the whole phase; the header is pre-initialised by the `Buf` literal
     // above, so Init's job is already done.
-    // cast_possible_truncation: `CAP` is 64, which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
     let (mut writer, mut reader): (SpscWriter<'_>, SpscReader<'_>) =
         unsafe { shmem::spsc_pair(region_vaddr, CAP as u32) }
             .expect("spsc_pair refused the ring's own capacity");

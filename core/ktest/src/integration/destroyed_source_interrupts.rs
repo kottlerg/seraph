@@ -229,8 +229,7 @@ fn create_source(ctx: &TestContext, source: Source) -> Result<(u64, Option<u64>)
 /// The shift of child `index`'s `done` bits.
 fn shift(index: usize) -> u32
 {
-    // cast_possible_truncation: index < MAX_CHILDREN.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation, reason = "index < MAX_CHILDREN")]
     let index = index as u32;
     index.saturating_mul(CHILD_SHIFT)
 }

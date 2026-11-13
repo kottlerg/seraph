@@ -66,9 +66,11 @@ pub fn ns_readdir(dir_cap: u64, idx: u64, ipc_buf: *mut u64)
         return Err(reply.label);
     }
     let kind = reply.word(0);
-    // Name length is bounded by namespace_protocol::MAX_NAME_LEN (255);
-    // truncating to usize is safe on every supported target.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "name length is bounded by namespace_protocol::MAX_NAME_LEN (255); truncating to \
+                  usize is safe on every supported target"
+    )]
     let len = reply.word(1) as usize;
     let bytes = reply.data_bytes();
     // Name bytes start at byte 16 (after words 0 and 1).

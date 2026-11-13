@@ -339,12 +339,14 @@ impl BootPageTable
             .and_then(|offset| self.pool_phys.checked_add(offset))?;
         // `pool_used` is below `pool_frames`, so it is far below `u64::MAX`.
         self.pool_used = self.pool_used.saturating_add(1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "PAGE_SIZE is 4096, fits in usize on all targets"
+        )]
         // SAFETY: frame is a page of the pool `new` allocated, below its end,
         // identity-mapped under UEFI and not yet handed out. Zeroing ensures
         // all entries have P=0 (not present); absent entries are never walked
         // by the hardware regardless of other bits.
-        // cast_possible_truncation: PAGE_SIZE is 4096, fits in usize on all targets.
-        #[allow(clippy::cast_possible_truncation)]
         unsafe {
             core::ptr::write_bytes(frame as *mut u8, 0, PAGE_SIZE as usize);
         }

@@ -36,10 +36,6 @@
 
 use crate::error::BootError;
 
-// Both constants are re-exported here for arch-mod consumers; only one is
-// referenced per target arch build.
-#[allow(unused_imports)]
-pub use elf::{EM_RISCV, EM_X86_64};
 // The image kind, consumed by the KASLR layout decision in main.rs.
 pub use elf::ElfKind;
 
@@ -221,10 +217,15 @@ fn rebase(base: u64, addr: u64, origin: u64) -> Option<u64>
 unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
 -> Result<(), BootError>
 {
-    // p_offset / p_filesz → usize: 64-bit targets only; cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p_offset to usize: 64-bit targets only, so the cast is exact"
+    )]
     let file_off = seg.offset as usize;
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p_filesz to usize: 64-bit targets only, so the cast is exact"
+    )]
     let file_sz = seg.filesz as usize;
     let src = file_off
         .checked_add(file_sz)
@@ -235,7 +236,11 @@ unsafe fn copy_segment(data: &[u8], seg: &elf::LoadSegment, dst_phys: u64)
         .memsz
         .checked_sub(seg.filesz)
         .ok_or(BootError::InvalidElf("LOAD segment: p_memsz < p_filesz"))?;
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "bss_len is p_memsz - p_filesz to usize: 64-bit targets only, so the cast is \
+                  exact"
+    )]
     let bss_sz = bss_len as usize;
     let bss_addr = dst_phys
         .checked_add(seg.filesz)
@@ -335,8 +340,10 @@ pub unsafe fn load_kernel(
 
     // One contiguous allocation for the whole image, placed wherever the
     // firmware has free RAM within the arch's bound.
-    // span_bytes → usize: 64-bit on all supported UEFI targets; cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "span_bytes to usize: 64-bit on all supported UEFI targets, so the cast is exact"
+    )]
     let page_count = (span.span_bytes as usize).div_ceil(4096);
     // SAFETY: `bs` is valid boot services per the function's safety contract.
     let span_base = unsafe { crate::arch::current::allocate_kernel_span(bs, page_count)? };
@@ -383,8 +390,10 @@ pub unsafe fn load_kernel(
         {
             Some(table) =>
             {
-                // rela_table guarantees the table bytes are inside `data`.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rela_table guarantees the table bytes are inside `data`"
+                )]
                 let bytes = table
                     .file_offset
                     .checked_add(table.size)
@@ -455,8 +464,10 @@ pub unsafe fn relocate_kernel(
     let link_virt = info.virtual_base;
     if info.rela_size > 0
     {
-        // rela_size → usize: 64-bit targets only; bounded by the image's size.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "rela_size to usize: 64-bit targets only, and bounded by the image's size"
+        )]
         // SAFETY: rela_phys/rela_size name table bytes inside the span
         // allocation (resolved by load_kernel), identity-mapped and unaliased.
         let table = unsafe {
@@ -534,10 +545,12 @@ pub unsafe fn relocate_kernel(
 ///
 /// `bs` must be a valid pointer to UEFI boot services and boot services must
 /// not yet have been exited.
-// too_many_lines: one linear pre-parse pass (validate, per-segment
-// allocate/copy/zero, PIE table + RELRO location); splitting would thread
-// the segment array and UEFI handle through every helper.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear pre-parse pass (validate, per-segment allocate/copy/zero, PIE table + \
+              RELRO location); splitting would thread the segment array and UEFI handle through \
+              every helper"
+)]
 pub unsafe fn load_init(
     bs: *mut crate::uefi::EfiBootServices,
     data: &[u8],
@@ -576,10 +589,11 @@ pub unsafe fn load_init(
         // W^X is checked before any frame is allocated for the segment.
         let flags = init_segment_flags(&seg)?;
 
-        // p_vaddr & 0xFFF fits in usize (≤ 4095). p_memsz → usize: 64-bit only.
-        #[allow(clippy::cast_possible_truncation)]
         let in_page_off = (seg.vaddr & 0xFFF) as usize;
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "p_memsz to usize: 64-bit targets only, so the cast is exact"
+        )]
         let memsz = seg.memsz as usize;
         let page_count = in_page_off
             .checked_add(memsz)
@@ -608,10 +622,15 @@ pub unsafe fn load_init(
             ))?;
 
         // Copy file data at the correct in-page offset.
-        // p_offset and p_filesz → usize: 64-bit targets only; cast is exact.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "p_offset to usize: 64-bit targets only, so the cast is exact"
+        )]
         let file_off = seg.offset as usize;
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "p_filesz to usize: 64-bit targets only, so the cast is exact"
+        )]
         let file_sz = seg.filesz as usize;
         if file_sz > 0
         {
@@ -692,8 +711,10 @@ pub unsafe fn load_init(
         }
     };
 
-    // count ≤ INIT_MAX_SEGMENTS (≤ 8), well within u32 range.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "count is at most INIT_MAX_SEGMENTS (8), well within u32 range"
+    )]
     Ok(InitImage {
         entry_point: elf::entry_point(&ehdr),
         segments,

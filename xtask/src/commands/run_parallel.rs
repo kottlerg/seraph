@@ -213,7 +213,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
         )),
         None => None,
     };
-    let second_shared_line = args.second_disk_shared_line;
+    let second_line = args.second_disk_line();
     let next_run = Arc::new(AtomicU32::new(1));
     let mut outcomes: Vec<RunOutcome> = Vec::with_capacity(args.runs as usize);
 
@@ -248,7 +248,14 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let test_devices = args.test_devices;
             let display = QemuDisplay::from(args.display);
             let debug_listen = args.debug_listen;
-            let hold_on_hang = args.hold_on_hang;
+            let on_hang = if args.hold_on_hang
+            {
+                OnHang::Hold
+            }
+            else
+            {
+                OnHang::Kill
+            };
             let timeout = Duration::from_secs(args.timeout);
             let fail_grace = Duration::from_secs(args.fail_grace_secs);
             let pass_re = pass_re.clone();
@@ -304,7 +311,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     second_disk: second_src.as_ref().map(|&(_, block_size)| SecondDisk {
                         path: &second_dst,
                         block_size,
-                        shared_line: second_shared_line,
+                        line: second_line,
                     }),
                     firmware_code_path: &firmware_code,
                     firmware_vars_path: vars_path_for_qemu.as_deref(),
@@ -361,12 +368,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                 let forwarder = spawn_stdout_forwarder(qemu_stdout, log_file, slot)?;
 
                 let (exit_rc, hung) = wait_with_timeout(
-                    &mut child,
-                    timeout,
-                    &log_path,
-                    &fail_re,
-                    fail_grace,
-                    hold_on_hang,
+                    &mut child, timeout, &log_path, &fail_re, fail_grace, on_hang,
                 )?;
                 // Drain the forwarder before reading the log so classify()
                 // sees the complete byte stream even when the watchdog
@@ -622,6 +624,16 @@ fn join_forwarder(handle: JoinHandle<Result<()>>, run_id: u32)
     }
 }
 
+/// What a hard-timeout expiry does to the QEMU instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OnHang
+{
+    /// Kill the instance.
+    Kill,
+    /// Leave the instance running for a debugger (`--hold-on-hang`).
+    Hold,
+}
+
 /// Block until `child` exits or a watchdog deadline elapses, `SIGKILLing` it
 /// on the deadline.
 ///
@@ -639,7 +651,7 @@ fn join_forwarder(handle: JoinHandle<Result<()>>, run_id: u32)
 /// disambiguates — a grace kill carries the `--fail` marker in the final
 /// log read, so it resolves to `FAIL`, not `HANG`.
 ///
-/// With `hold_on_hang`, a hard-timeout expiry (no `--fail` marker seen)
+/// With [`OnHang::Hold`], a hard-timeout expiry (no `--fail` marker seen)
 /// does not kill the instance: the attach instructions are printed and the
 /// call blocks until QEMU is terminated externally, preserving the wedged
 /// guest for a debugger. Grace-window kills (a crash already diagnosed in
@@ -650,7 +662,7 @@ fn wait_with_timeout(
     log_path: &Path,
     fail_re: &Regex,
     fail_grace: Duration,
-    hold_on_hang: bool,
+    on_hang: OnHang,
 ) -> Result<(i32, bool)>
 {
     let deadline = Instant::now()
@@ -678,7 +690,7 @@ fn wait_with_timeout(
         let effective = grace_deadline.map_or(deadline, |g| g.min(deadline));
         if Instant::now() >= effective
         {
-            if hold_on_hang && grace_deadline.is_none()
+            if on_hang == OnHang::Hold && grace_deadline.is_none()
             {
                 eprintln!(
                     "run-parallel: HANG at timeout; holding QEMU (pid {}) for inspection.\n\

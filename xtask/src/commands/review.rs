@@ -808,8 +808,8 @@ fn merged_prs(subjects: &str) -> Vec<u64>
         .lines()
         .filter_map(|line| {
             let rest = line.strip_prefix("Merge pull request #")?;
-            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-            let after = &rest[digits.len()..];
+            let after = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            let digits = rest.strip_suffix(after)?;
             (after.is_empty() || after.starts_with(' '))
                 .then(|| digits.parse().ok())
                 .flatten()

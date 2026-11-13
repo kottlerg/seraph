@@ -26,10 +26,23 @@
 #![feature(thread_local)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// panic family is suppressed crate-wide below, as § E permits a test harness.
+#![warn(
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(not(test), warn(clippy::string_slice))]
 #![expect(
     clippy::expect_used,
+    clippy::panic,
+    clippy::panic_in_result_fn,
+    clippy::unwrap_in_result,
     clippy::unwrap_used,
-    reason = "svctest is a test harness whose phases report a defect by panicking, which the \
+    reason = "svctest is a test harness whose phases report a defect by panicking (a `panic!`, \
+              an `unwrap` or `expect`, a check in a function that returns `Result`), which the \
               panic hook turns into the run's fail marker, as a failed host test does; the build \
               lints the harness without the test configuration's relaxation of these lints, and \
               every phase relies on it, so the suppression is crate-wide"

@@ -712,10 +712,11 @@ incoming thread's floor (`SavedState::stack_floor`) at its stack-pointer swap, s
 sees one stack with another's floor; the boot sets the handoff stack's and each AP's idle
 stack's before their first switch ([arch-interface.md](arch-interface.md) § `context`).
 
-A frame larger than a page below the stack pointer can step over a single guard page;
-the kernel's frames are far smaller ([limits.md](../../../docs/limits.md)
-`KERNEL_STACK_PAGES`). Phase 8 halts unless the handoff stack's guard (when Phase 3 found
-one) and every idle stack's guard are unmapped.
+A frame larger than a page could step over a single guard page, so the kernel targets emit
+inline stack probes ([build-system.md](../../../docs/build-system.md) § Custom Targets): a
+function whose frame passes a page touches each page of it in turn, from the top down, and
+the first touch of the guard faults. Phase 8 halts unless the handoff stack's guard (when
+Phase 3 found one) and every idle stack's guard are unmapped.
 
 ### Kernel Stack Depth
 

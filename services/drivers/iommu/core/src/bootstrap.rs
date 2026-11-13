@@ -168,6 +168,10 @@ impl Units
 /// exceed [`MAX_SCOPES`] or the pages are outside 1 to
 /// [`MAX_REGISTER_PAGES`].
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`include_pci_all` is the unit's INCLUDE_PCI_ALL flag, encoded into a round word"
+)]
 pub fn unit_round_words(
     segment: u16,
     include_pci_all: bool,
@@ -350,6 +354,10 @@ mod tests
     use super::*;
     use syscall_abi::MSG_CAP_SLOTS_MAX;
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`done` is the round's `done` field, stored in the round it builds"
+    )]
     fn round(caps: &[u64], words: &[u64], done: bool) -> BootstrapRound
     {
         let mut r = BootstrapRound {

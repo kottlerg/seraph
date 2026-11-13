@@ -22,27 +22,6 @@
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
 
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(clippy::large_stack_frames)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
-
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels, serial_errors, serial_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};

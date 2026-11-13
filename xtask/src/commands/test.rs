@@ -65,12 +65,18 @@ const HOST_ONLY: [&str; 2] = ["xtask", "seraph-wrapper-shim"];
 
 /// The lints the test lint pass allows, and the one place the relaxation of
 /// lints for test code is stated (`docs/coding-standards.md` § Clippy). In a
-/// test, an unwrapped error, an out-of-range index and an overflow each fail
-/// the test, which is how a test reports a defect.
-const TEST_RELAXED_LINTS: [&str; 4] = [
+/// test, an unwrapped error, an explicit panic, a panic in a function that
+/// returns `Result`, an out-of-range index, a slice off a character boundary
+/// and an overflow each fail the test, which is how a test reports a defect.
+const TEST_RELAXED_LINTS: [&str; 9] = [
     "clippy::unwrap_used",
     "clippy::expect_used",
+    "clippy::unwrap_in_result",
+    "clippy::panic",
+    "clippy::unreachable",
+    "clippy::panic_in_result_fn",
     "clippy::indexing_slicing",
+    "clippy::string_slice",
     "clippy::arithmetic_side_effects",
 ];
 
@@ -141,6 +147,11 @@ fn require_emulation() -> Result<()>
 /// and the cross compiler's `-print-file-name` answer for the start file is
 /// a path, which it prints only when it found the file (otherwise it prints
 /// the bare name back).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`loader_exists` is whether the C library's loader is installed, a host fact the \
+              function combines with the start-file lookup"
+)]
 fn c_library_found(loader_exists: bool, start_file_lookup: &str) -> bool
 {
     loader_exists && Path::new(start_file_lookup.trim()).is_absolute()

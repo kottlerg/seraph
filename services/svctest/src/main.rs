@@ -24,17 +24,6 @@
 
 #![feature(alloc_error_hook)]
 #![feature(thread_local)]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// panic family is suppressed crate-wide below, as § E permits a test harness.
-#![warn(
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(not(test), warn(clippy::string_slice))]
 #![expect(
     clippy::expect_used,
     clippy::panic,

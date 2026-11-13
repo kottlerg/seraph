@@ -18,26 +18,6 @@
 //! `no_std`, no allocation, no dependencies; RV64GC encodings.
 
 #![no_std]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 /// `c.ebreak` (0x9002), little-endian: the breakpoint a debugger plants at the
 /// successor. Two bytes, so it never reaches past the successor's first

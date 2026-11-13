@@ -48,6 +48,11 @@ pub enum ItemRemoval
 impl ItemRemoval
 {
     /// The choice the `--allow-removal` flag selects.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`allow_removal` is the value of `--allow-removal`, which the constructor encodes \
+                  as the policy"
+    )]
     pub fn from_flag(allow_removal: bool) -> Self
     {
         if allow_removal
@@ -77,6 +82,11 @@ pub enum MilestoneChoice
 
 impl MilestoneChoice
 {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`unscheduled` is the value of `--unscheduled`, which the constructor encodes \
+                  with `--milestone` into the choice"
+    )]
     fn from_args(milestone: Option<&str>, unscheduled: bool) -> Self
     {
         match (milestone, unscheduled)

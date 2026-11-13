@@ -5,9 +5,6 @@
 
 //! Cargo build script: selects the kernel linker script for the active target.
 
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy.
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-
 fn main()
 {
     #[expect(

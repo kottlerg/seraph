@@ -161,6 +161,10 @@ fn start_process(process_handle: u64, ipc_buf: *mut u64, ok_msg: &str, fail_msg:
 
 /// Serve one bootstrap round from init to the named child. Logs `context`
 /// and returns `false` on failure; [`serve_checked`] keeps the error code.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's done flag, which the reply encodes for the child"
+)]
 fn serve(
     bootstrap_ep: u64,
     badge: u64,
@@ -179,6 +183,10 @@ fn serve(
 /// and refused, so the named child's request is still pending;
 /// `bootstrap_errors::INVALID` otherwise, including a failed reply that has
 /// already woken the child with an error).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's done flag, which the reply encodes for the child"
+)]
 fn serve_checked(
     bootstrap_ep: u64,
     badge: u64,

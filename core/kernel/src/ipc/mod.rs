@@ -546,13 +546,16 @@ mod tests
     use crate::sched::thread::ThreadControlBlock;
 
     /// The TCBs and wait queues of one test, used only on the test's thread.
-    /// Both vectors are built once and never grown, so no TCB or queue moves
-    /// while linked, and both live as long as the fixture, so every TCB a queue
-    /// links stays valid; with no other thread, every operation runs as under
-    /// its source lock. The methods name TCBs and queues by index.
+    /// Each TCB is a heap allocation whose pointer is taken once, from
+    /// `Box::into_raw`, and freed only when the fixture drops, so every TCB a
+    /// queue links stays valid and no reference to it is formed while a queue
+    /// holds its pointer. A queue's address is stored in its TCBs' tags but
+    /// only compared, never dereferenced, so the queues are held by value.
+    /// With no other thread, every operation runs as under its source lock.
+    /// The methods name TCBs and queues by index.
     struct Fixture
     {
-        tcbs: Vec<ThreadControlBlock>,
+        tcbs: Vec<*mut ThreadControlBlock>,
         queues: Vec<WaitQueue>,
     }
 
@@ -561,14 +564,16 @@ mod tests
         fn new(tcbs: usize, queues: usize) -> Self
         {
             Self {
-                tcbs: (0..tcbs).map(|_| make_tcb()).collect(),
+                tcbs: (0..tcbs)
+                    .map(|_| Box::into_raw(Box::new(make_tcb())))
+                    .collect(),
                 queues: (0..queues).map(|_| WaitQueue::new()).collect(),
             }
         }
 
-        fn tcb(&mut self, t: usize) -> *mut ThreadControlBlock
+        fn tcb(&self, t: usize) -> *mut ThreadControlBlock
         {
-            &raw mut self.tcbs[t]
+            self.tcbs[t]
         }
 
         /// The index of the TCB `p` points at, or `None` for null.
@@ -581,7 +586,7 @@ mod tests
             let i = self
                 .tcbs
                 .iter()
-                .position(|t| core::ptr::eq(&raw const *t, p));
+                .position(|&t| core::ptr::eq(t, p));
             assert!(
                 i.is_some(),
                 "a queue returned a TCB the fixture does not own"
@@ -591,7 +596,7 @@ mod tests
 
         fn push(&mut self, q: usize, t: usize)
         {
-            assert!(unlinked(&self.tcbs[t]), "TCB {t} is already queued");
+            assert!(self.unlinked(t), "TCB {t} is already queued");
             let tcb = self.tcb(t);
             // SAFETY: tcb is a live TCB of the fixture, on no queue (asserted
             // above).
@@ -605,7 +610,7 @@ mod tests
             self.index_of(head)
         }
 
-        fn contains(&mut self, q: usize, t: usize) -> bool
+        fn contains(&self, q: usize, t: usize) -> bool
         {
             let tcb = self.tcb(t);
             // SAFETY: tcb is a live TCB of the fixture.
@@ -638,9 +643,28 @@ mod tests
 
         fn unlinked(&self, t: usize) -> bool
         {
-            unlinked(&self.tcbs[t])
+            let tcb = self.tcb(t);
+            // SAFETY: tcb is a live TCB of the fixture, and no queue operation
+            // runs while the shared reference lives.
+            unlinked(unsafe { &*tcb })
         }
     }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            for &tcb in &self.tcbs
+            {
+                // SAFETY: tcb came from Box::into_raw in Fixture::new and is
+                // freed only here, once; the queues, dropped after it, have no
+                // destructor and never read a TCB again.
+
+                drop(unsafe { Box::from_raw(tcb) });
+            }
+        }
+    }
+
 
     fn make_tcb() -> ThreadControlBlock
     {
@@ -648,7 +672,6 @@ mod tests
         // (`ipc_wait_next` reads as None, the prev link and tag as null).
         unsafe { core::mem::zeroed() }
     }
-
 
     fn unlinked(t: &ThreadControlBlock) -> bool
     {

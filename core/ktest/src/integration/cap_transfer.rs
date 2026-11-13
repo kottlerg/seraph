@@ -111,7 +111,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     let mut child = crate::spawn::SpawnedChild { th, cs };
     crate::log("cap_transfer: child thread created");
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).

@@ -131,7 +131,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     CHILD_EP.store(child_ep, Ordering::Release);
     CHILD_DONE.store(child_done, Ordering::Release);
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK));
+    // SAFETY: `STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK)) };
     // Pin to CPU 0 initially: the child must run there long enough to
     // become `fpu_owner` on CPU 0 before it blocks in SYS_IPC_CALL.
     // SAFETY: the stack is `STACK`, this test's own `ChildStack`,

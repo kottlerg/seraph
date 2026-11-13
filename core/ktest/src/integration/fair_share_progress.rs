@@ -136,7 +136,8 @@ fn run_children(
 {
     let hog_done = cap_copy(done, hog.cs, RIGHTS_NOTIFY)
         .map_err(|_| "fair_share_progress: cap_copy hog_done failed")?;
-    let hog_stack = ChildStack::top(core::ptr::addr_of!(HOG_STACK));
+    // SAFETY: `HOG_STACK` is a static stack, reached only through `addr_of!`.
+    let hog_stack = unsafe { ChildStack::top(core::ptr::addr_of!(HOG_STACK)) };
     // SAFETY: the stack is `HOG_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start_pinned(hog, hog_entry, hog_stack, hog_done, 0) }
@@ -150,7 +151,8 @@ fn run_children(
         .map_err(|_| "fair_share_progress: spawn::new_child_at (low) failed")?;
     let low_done = cap_copy(done, low.cs, RIGHTS_NOTIFY)
         .map_err(|_| "fair_share_progress: cap_copy low_done failed")?;
-    let low_stack = ChildStack::top(core::ptr::addr_of!(LOW_STACK));
+    // SAFETY: `LOW_STACK` is a static stack, reached only through `addr_of!`.
+    let low_stack = unsafe { ChildStack::top(core::ptr::addr_of!(LOW_STACK)) };
 
     let budget_us = crate::scaled_bound(PROGRESS_BUDGET_US);
     let t_started = system_info(SystemInfoType::ElapsedUs as u64)

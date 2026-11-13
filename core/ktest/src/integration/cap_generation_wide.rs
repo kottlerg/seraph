@@ -199,7 +199,8 @@ fn stale_call_in_child(ctx: &TestContext, ep: u64, done: u64, stale: u64) -> Tes
     let _child = SpawnedChild { th, cs: 0 };
     // SAFETY: the single child has not been started yet.
     let arg = unsafe { STALE_CALL_ARGS.publish(0, StaleCallArgs { ep, done, stale }) };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_CALL_STACK));
+    // SAFETY: `STALE_CALL_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STALE_CALL_STACK)) };
     // SAFETY: the stack is `STALE_CALL_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start_thread(th, stale_call_entry, stack_top, arg) }

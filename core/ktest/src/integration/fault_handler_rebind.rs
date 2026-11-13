@@ -276,7 +276,8 @@ fn start_faulter(
     RECOVERY_SIG.store(child_sig, Ordering::Release);
     crate::bind_fault_handler(child.th, objects.first, BADGE_FIRST)
         .map_err(|_| "integration::fault_handler_rebind: bind failed")?;
-    let stack = ChildStack::top_at(core::ptr::addr_of!(FAULTER_STACKS), index)?;
+    // SAFETY: `FAULTER_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(FAULTER_STACKS), index) }?;
     // SAFETY: the stack is `FAULTER_STACKS[index]`, this test's own
     // `ChildStack`, on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, child_sig) }

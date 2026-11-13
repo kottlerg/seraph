@@ -458,6 +458,8 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   IPC buffer page. A `ChildStack` is a `GuardedStack`: the
   `STACK_GUARD_PAGES` pages below the stack are its guard, which
   `ChildStack::top` unmaps on the stack's first use, so an overflow faults.
+  `top` and `top_at` are `unsafe`: their pointer is `addr_of!` of a static
+  stack, and no code forms a reference to one, which the guard's unmap needs.
   Each is declared per test (or, for most stress cells, taken from
   the shared `stress::STRESS_STACKS`) and handed to one thread at a time (the
   rule in their rustdoc). `ChildStack::top_at(addr_of!(STACKS), i)` and

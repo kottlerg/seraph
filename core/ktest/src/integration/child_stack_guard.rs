@@ -64,7 +64,9 @@ pub fn run(ctx: &TestContext) -> TestResult
     // SAFETY: the projection only computes the field's address; it reads and
     // writes nothing.
     let stack = unsafe { core::ptr::addr_of!(FIXTURE.stack) };
-    let stack_top = ChildStack::top(stack);
+    // SAFETY: `stack` is the `ChildStack` field of the static `FIXTURE`,
+    // reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(stack) };
     // SAFETY: the stack is `FIXTURE.stack`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, overflow_child, stack_top, 0) }

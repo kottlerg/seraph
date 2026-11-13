@@ -315,7 +315,8 @@ fn start_child(parts: &Parts, index: usize, entry: extern "C" fn(u64) -> !) -> T
         .get(index)
         .and_then(Option::as_ref)
         .ok_or("integration::fault_forward: no child")?;
-    let stack = ChildStack::top_at(core::ptr::addr_of!(STACKS), index)?;
+    // SAFETY: `STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(STACKS), index) }?;
     // SAFETY: the stack is `STACKS[index]`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, 0) }

@@ -125,7 +125,8 @@ fn run_mode(ctx: &TestContext, mode: u32) -> TestResult
         return Err("integration::tlb_widen_retry: spawn::new_child failed");
     };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     if unsafe {

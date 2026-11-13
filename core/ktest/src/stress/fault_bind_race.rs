@@ -197,7 +197,8 @@ fn race(ctx: &TestContext, parts: &mut Parts) -> TestResult
         };
         // `HANDLER_STACKS[i]` is this handler's own stack; the address is
         // taken without forming a reference.
-        let top = ChildStack::top_at(core::ptr::addr_of!(HANDLER_STACKS), i)?;
+        // SAFETY: `HANDLER_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let top = unsafe { ChildStack::top_at(core::ptr::addr_of!(HANDLER_STACKS), i) }?;
         start_pinned(th, handler_entry, top, arg, HANDLER_CPU)?;
     }
     let badged = [
@@ -233,7 +234,8 @@ fn round(ctx: &TestContext, parts: &mut Parts, badged: [u64; 2]) -> TestResult
     thread_set_fault_handler(th, badged[0], FAULT_CLASS_ALL)
         .map_err(|_| "stress::fault_bind_race: initial bind failed")?;
     let served_before = SERVED[0].load(Ordering::Acquire);
-    let top = ChildStack::top(core::ptr::addr_of!(FAULTER_STACK));
+    // SAFETY: `FAULTER_STACK` is a static stack, reached only through `addr_of!`.
+    let top = unsafe { ChildStack::top(core::ptr::addr_of!(FAULTER_STACK)) };
     start_pinned(th, faulter_entry, top, 0, FAULTER_CPU)?;
 
     // Wait for the first delivery so the races below meet a faulting thread.

@@ -273,7 +273,8 @@ fn start_child(
             },
         )
     };
-    let stack = ChildStack::top_at(core::ptr::addr_of!(CHILD_STACKS), index)?;
+    // SAFETY: `CHILD_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(CHILD_STACKS), index) }?;
     // SAFETY: the stack is `CHILD_STACKS[index]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, entry, stack, arg) }

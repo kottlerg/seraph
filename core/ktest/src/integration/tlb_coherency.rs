@@ -92,7 +92,8 @@ pub fn run(ctx: &TestContext) -> TestResult
     unsafe { CHILD_C2P_SLOT = child_c2p };
 
     // ── 3. Configure + pin child to CPU 1, then start. ──────────────────────
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {

@@ -439,7 +439,8 @@ pub fn blocking_wait(ctx: &TestContext) -> TestResult
     let child_sig =
         cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "cap_copy for blocking test failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
@@ -569,7 +570,8 @@ pub fn wait_timeout_woken_before_expiry(ctx: &TestContext) -> TestResult
         .map_err(|_| "spawn::new_child for wait_timeout_woken_before_expiry failed")?;
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy sig for wait_timeout_woken_before_expiry failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(DELAYED_STACK));
+    // SAFETY: `DELAYED_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(DELAYED_STACK)) };
     // SAFETY: the stack is `DELAYED_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -786,7 +788,10 @@ fn arrive(
                 .ok_or(err)?
                 .insert(crate::spawn::new_child(ctx).map_err(|_| err)?);
             let c_ep = cap_copy(source, caller.cs, RIGHTS_EP_SEND_GRANT).map_err(|_| err)?;
-            let stack_top = ChildStack::top_at(core::ptr::addr_of!(SHARED_CALLER_STACKS), n)?;
+            // SAFETY: `SHARED_CALLER_STACKS` is a static array of stacks, reached only through
+            // `addr_of!`.
+            let stack_top =
+                unsafe { ChildStack::top_at(core::ptr::addr_of!(SHARED_CALLER_STACKS), n) }?;
             let entry = *entries.get(n).ok_or(err)?;
             // SAFETY: the stack is `SHARED_CALLER_STACKS[n]`, this test's own
             // `ChildStack`, on which no other live thread runs (`ChildStack`'s
@@ -811,7 +816,8 @@ fn start_shared_child(
         .map_err(|_| "wait_set: cap_copy(ws) for a waiter failed")?;
     let c_done = cap_copy(done, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "wait_set: cap_copy(done) for a waiter failed")?;
-    let stack_top = ChildStack::top_at(core::ptr::addr_of!(SHARED_STACKS), stack)?;
+    // SAFETY: `SHARED_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top_at(core::ptr::addr_of!(SHARED_STACKS), stack) }?;
     // SAFETY: `stack` < 2; the entry's previous child (a waiter of an earlier
     // test, phase, or run, deleted before it returned) has exited, and this
     // one has not started.
@@ -943,7 +949,8 @@ fn stale_run(ctx: &TestContext, s: &mut Stale) -> TestResult
     // SAFETY: the caller has not been started, and no other thread reads the
     // entry.
     let arg = unsafe { STALE_ARGS.publish(0, (c_ep, c_done)) };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STALE_STACK));
+    // SAFETY: `STALE_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STALE_STACK)) };
     // SAFETY: the stack is `STALE_STACK`, this test's own `ChildStack`, on
     // which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(caller, stale_caller, stack_top, arg) }

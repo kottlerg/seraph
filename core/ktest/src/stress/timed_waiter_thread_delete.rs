@@ -147,7 +147,8 @@ fn start_waiter(child: &spawn::SpawnedChild, cycle: u32, cpus: u32, sig: u64, eq
     LOOPS.store(0, Ordering::Release);
     // SAFETY: stack index 0 is this test's only live child; each cycle's
     // waiter is deleted (and off every CPU) before the next starts.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 0) }?;
     // The waiter alternates between CPU 0, which runs the timer, and a CPU
     // other than the controller's 1 (CPU 0 again on a 2-CPU run).
     let waiter_cpu = if (cycle / 3) & 1 == 0

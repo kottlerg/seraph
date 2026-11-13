@@ -1089,7 +1089,8 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     // exited, and this one has not started.
     let child_arg = unsafe { TEARDOWN_BATCH_ARGS.publish(0, (child_ep, child_done)) };
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(TEARDOWN_BATCH_STACK));
+    // SAFETY: `TEARDOWN_BATCH_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(TEARDOWN_BATCH_STACK)) };
     // SAFETY: the stack is `TEARDOWN_BATCH_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1217,7 +1218,8 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
     // SAFETY: index 0 < 1; this test's previous child on the entry has
     // exited, and this one has not started.
     let arg = unsafe { STOP_BLOCKED_ARGS.publish(0, (child_ready, child_block)) };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_BLOCKED_STACK));
+    // SAFETY: `STOP_BLOCKED_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STOP_BLOCKED_STACK)) };
     // SAFETY: the stack is `STOP_BLOCKED_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, stop_blocked_child_entry, stack_top, arg) }
@@ -1258,7 +1260,8 @@ pub fn cspace_delete_stops_bound_thread(ctx: &TestContext) -> TestResult
         crate::spawn::new_child(ctx).map_err(|_| "stop_bound: new_child (spin) failed")?;
     let child_ready = cap_copy(ready, child.cs, syscall_abi::RIGHTS_NTF_NOTIFY)
         .map_err(|_| "stop_bound: cap_copy ready (spin) failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STOP_SPINNING_STACK));
+    // SAFETY: `STOP_SPINNING_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STOP_SPINNING_STACK)) };
     // SAFETY: the stack is `STOP_SPINNING_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1355,7 +1358,8 @@ fn spawn_and_drop_spinner(ctx: &TestContext, ready: u64) -> Result<u64, &'static
         .map_err(|_| "guard_drop: cap_copy ready failed")?;
     let observer = cap_derive(child.th, syscall::RIGHTS_ALL)
         .map_err(|_| "guard_drop: cap_derive(thread) failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(GUARD_DROP_STACK));
+    // SAFETY: `GUARD_DROP_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(GUARD_DROP_STACK)) };
     // SAFETY: the stack is `GUARD_DROP_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     let started = unsafe {
@@ -1410,7 +1414,8 @@ pub fn cspace_self_delete_stops_caller(ctx: &TestContext) -> TestResult
     // SAFETY: index 0 < 1; this test's previous child on the entry has
     // exited, and this one has not started.
     let arg = unsafe { SELF_DELETE_ARGS.publish(0, (child_ready, own_cs)) };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(SELF_DELETE_STACK));
+    // SAFETY: `SELF_DELETE_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(SELF_DELETE_STACK)) };
     // SAFETY: the stack is `SELF_DELETE_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, self_delete_child_entry, stack_top, arg) }

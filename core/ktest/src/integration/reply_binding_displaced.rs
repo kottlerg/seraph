@@ -278,7 +278,8 @@ fn displace_fault(ctx: &TestContext, parts: &mut Parts, objects: &Objects, acc: 
         .map_err(|_| "integration::reply_binding_displaced: thread_set_fault_handler failed")?;
     // The faulter stack belongs to this test's faulter, deleted before this
     // test returns.
-    let stack = ChildStack::top(core::ptr::addr_of!(FAULTER_STACK));
+    // SAFETY: `FAULTER_STACK` is a static stack, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top(core::ptr::addr_of!(FAULTER_STACK)) };
     // SAFETY: the stack is `FAULTER_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(faulter, faulter_entry, stack, 0) }
@@ -399,7 +400,8 @@ fn start_caller(
             },
         )
     };
-    let stack = ChildStack::top_at(core::ptr::addr_of!(CALLER_STACKS), caller.index)?;
+    // SAFETY: `CALLER_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(CALLER_STACKS), caller.index) }?;
     // SAFETY: the stack is `CALLER_STACKS[caller.index]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start(child, caller.entry, stack, arg) }

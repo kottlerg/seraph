@@ -236,12 +236,15 @@ pub fn run(ctx: &TestContext) -> TestResult
             .checked_rem(cpu_mod)
             .ok_or("stress::load_balance_handoff_steal: no CPUs")?;
         // Server stacks occupy [NUM_PAIRS, 2*NUM_PAIRS); distinct per j.
-        let stack = ChildStack::top_at(
-            core::ptr::addr_of!(super::STRESS_STACKS),
-            NUM_PAIRS
-                .checked_add(j)
-                .ok_or("stress::load_balance_handoff_steal: server stack index overflows")?,
-        )?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack = unsafe {
+            ChildStack::top_at(
+                core::ptr::addr_of!(super::STRESS_STACKS),
+                NUM_PAIRS
+                    .checked_add(j)
+                    .ok_or("stress::load_balance_handoff_steal: server stack index overflows")?,
+            )
+        }?;
         // SAFETY: the stack is `super::STRESS_STACKS[NUM_PAIRS + j]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe {
@@ -303,7 +306,8 @@ pub fn run(ctx: &TestContext) -> TestResult
             )
         };
         // Client stacks occupy [0, NUM_PAIRS); distinct per i.
-        let stack = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i)?;
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), i) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[i]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start(&client, client_entry, stack, client_arg) }

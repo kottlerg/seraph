@@ -119,7 +119,8 @@ pub(super) fn bench_notification_roundtrip(ctx: &crate::TestContext, iters: u32)
             },
         )
     };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(BENCH_SIGNAL_STACK));
+    // SAFETY: `BENCH_SIGNAL_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(BENCH_SIGNAL_STACK)) };
 
     // SAFETY: the stack is `BENCH_SIGNAL_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).

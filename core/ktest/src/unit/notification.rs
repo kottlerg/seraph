@@ -54,7 +54,8 @@ pub fn send_wait_blocking(ctx: &TestContext) -> TestResult
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy notification into child CSpace failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
@@ -318,7 +319,8 @@ pub fn wait_high_bit_parked_wakeup(ctx: &TestContext) -> TestResult
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy notification into child CSpace failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(HIGH_BIT_CHILD_STACK));
+    // SAFETY: `HIGH_BIT_CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(HIGH_BIT_CHILD_STACK)) };
     // SAFETY: the stack is `HIGH_BIT_CHILD_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {

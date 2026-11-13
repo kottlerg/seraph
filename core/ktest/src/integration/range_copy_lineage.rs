@@ -189,7 +189,8 @@ fn move_out(ctx: &TestContext, cs: u64, copy: u64) -> Result<u64, &'static str>
         MOVER_COPY.store(copy, Ordering::Relaxed);
         MOVER_DEST.store(parent_cs, Ordering::Relaxed);
         MOVER_DONE.store(child_done, Ordering::Release);
-        let stack_top = ChildStack::top(core::ptr::addr_of!(MOVER_STACK));
+        // SAFETY: `MOVER_STACK` is a static stack, reached only through `addr_of!`.
+        let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(MOVER_STACK)) };
         // SAFETY: the stack is `MOVER_STACK`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { crate::spawn::configure_and_start(&guard, mover_entry, stack_top, 0) }

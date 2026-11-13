@@ -128,8 +128,10 @@ pub fn run(ctx: &TestContext) -> TestResult
     // Pin both to CPU 0 so the timer round-robins them on one CPU: each
     // preemption hands the registers to the sibling (with the other sentinel)
     // and back, exercising the frame save/restore under real clobbering.
-    let top0 = ChildStack::top(core::ptr::addr_of!(STACK0));
-    let top1 = ChildStack::top(core::ptr::addr_of!(STACK1));
+    // SAFETY: `STACK0` is a static stack, reached only through `addr_of!`.
+    let top0 = unsafe { ChildStack::top(core::ptr::addr_of!(STACK0)) };
+    // SAFETY: `STACK1` is a static stack, reached only through `addr_of!`.
+    let top1 = unsafe { ChildStack::top(core::ptr::addr_of!(STACK1)) };
     // SAFETY: the stack is `STACK0`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(&child0, spinner_entry, top0, 0, 0) }

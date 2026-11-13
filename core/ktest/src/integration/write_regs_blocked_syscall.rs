@@ -246,7 +246,8 @@ fn with_child(ctx: &TestContext, parts: &Parts) -> TestResult
         .map_err(|_| "integration::write_regs_blocked_syscall: spawn::new_child failed")?;
     let ran = publish_handles(&child, parts)
         .and_then(|()| {
-            let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+            // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+            let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
             // SAFETY: the stack is `CHILD_STACK`, this test's own `ChildStack`,
             // on which no other live thread runs (`ChildStack`'s rule).
             unsafe {
@@ -362,7 +363,8 @@ fn edit_and_restart(child: &SpawnedChild, round: u32, regs: &mut [u8; BUF]) -> T
         .ok_or("integration::write_regs_blocked_syscall: round count overflows")?;
     KIND.store(kind_of(next_round), Ordering::Release);
     let target = redirected_entry as *const () as u64;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(CHILD_STACK));
+    // SAFETY: `CHILD_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(CHILD_STACK)) };
     crate::spawn::redirect_to_entry_at(&mut regs[..], target, stack_top)?;
     let token = TOKEN_TAG | u64::from(round);
     crate::spawn::set_reg_word(&mut regs[..], ARG1_OFFSET, token)?;

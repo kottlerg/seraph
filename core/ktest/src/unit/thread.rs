@@ -198,7 +198,8 @@ pub fn configure_start(ctx: &TestContext) -> TestResult
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for configure_start failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE));
+    // SAFETY: `STACK_CONFIGURE` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE)) };
     // SAFETY: the stack is `STACK_CONFIGURE`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
@@ -249,7 +250,8 @@ pub fn stop_read_regs(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for stop_read_regs failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS));
+    // SAFETY: `STACK_STOP_REGS` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_STOP_REGS)) };
     let args = BlockerArgs {
         ready: child_ready,
         block: child_block,
@@ -321,7 +323,8 @@ pub fn stop_again_invalid_state(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for double-stop test failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DOUBLE_STOP));
+    // SAFETY: `STACK_DOUBLE_STOP` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_DOUBLE_STOP)) };
     let args = BlockerArgs {
         ready: child_ready,
         block: child_block,
@@ -422,7 +425,8 @@ fn start_suspended_resume_body(
         return Err("suspended start of an unconfigured thread was not refused");
     }
     let entry = suspended_entry as *const () as u64;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_START_SUSPENDED));
+    // SAFETY: `STACK_START_SUSPENDED` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_START_SUSPENDED)) };
     SUSPENDED_RAN.store(0, Ordering::Release);
     // SAFETY: `suspended_entry` is an `extern "C" fn(u64) -> !`, and the stack
     // is `STACK_START_SUSPENDED`, this test's own `ChildStack`, on which no
@@ -487,7 +491,8 @@ fn check_suspended(th: u64, entry: u64, child_sig: u64) -> TestResult
     {
         return Err("suspended thread is not Stopped (thread_stop did not return InvalidState)");
     }
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_START_SUSPENDED));
+    // SAFETY: `STACK_START_SUSPENDED` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_START_SUSPENDED)) };
     // SAFETY: the call is expected to be refused; were it accepted, it would
     // rewrite the frame of the child this test owns with the same entry and
     // its own stack.
@@ -559,7 +564,8 @@ pub fn write_regs_resume(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for write_regs_resume failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS));
+    // SAFETY: `STACK_WRITE_REGS` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_WRITE_REGS)) };
     let args = BlockerArgs {
         ready: child_ready,
         block: child_block,
@@ -799,7 +805,8 @@ pub fn sched_split_rollback_on_full_cspace(ctx: &TestContext) -> TestResult
     // SAFETY: the block is this test's own, and no child reads its entry: any
     // child an earlier run of this test started was deleted before it returned.
     let arg = unsafe { SPLIT_ROLLBACK_ARGS.publish(0, args) };
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_SPLIT_ROLLBACK));
+    // SAFETY: `STACK_SPLIT_ROLLBACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_SPLIT_ROLLBACK)) };
     // SAFETY: the stack is `STACK_SPLIT_ROLLBACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1160,7 +1167,8 @@ pub fn configure_running_thread_err(ctx: &TestContext) -> TestResult
     let child_block = cap_copy(block, child.cs, RIGHTS_WAIT)
         .map_err(|_| "cap_copy (block) for configure_running_thread_err failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR));
+    // SAFETY: `STACK_CONFIGURE_ERR` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_ERR)) };
     let args = BlockerArgs {
         ready: child_ready,
         block: child_block,
@@ -1276,7 +1284,8 @@ pub fn affinity_bind_cpu1(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy for affinity_bind_cpu1 failed")?;
 
     // Bind to CPU 1 before starting.
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_CPU1));
+    // SAFETY: `STACK_AFFINITY_CPU1` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_CPU1)) };
     // SAFETY: the stack is `STACK_AFFINITY_CPU1`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1385,7 +1394,8 @@ fn affinity_migrate_ready_queued_body(ctx: &TestContext) -> TestResult
         .map_err(|_| "thread_set_priority(1) for affinity_migrate_ready_queued failed")?;
 
     // Pin to CPU 0 initially so T's first enqueue lands on CPU 0's run queue.
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_READY));
+    // SAFETY: `STACK_AFFINITY_MIGRATE_READY` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_READY)) };
     // SAFETY: the stack is `STACK_AFFINITY_MIGRATE_READY`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1459,7 +1469,8 @@ pub fn affinity_migrate_running(ctx: &TestContext) -> TestResult
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NOTIFY)
         .map_err(|_| "cap_copy for affinity_migrate_running failed")?;
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_RUNNING));
+    // SAFETY: `STACK_AFFINITY_MIGRATE_RUNNING` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_MIGRATE_RUNNING)) };
     // SAFETY: the stack is `STACK_AFFINITY_MIGRATE_RUNNING`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1551,7 +1562,10 @@ fn balance_spawn_spinners(
             cap_copy(sig, child.cs, RIGHTS_NOTIFY).map_err(|_| "balance: cap_copy failed")?;
 
         // Initial pinning to `initial_cpu` forces the first enqueue there.
-        let stack_top = ChildStack::top_at(core::ptr::addr_of!(STACK_BALANCE_SPINNERS), i)?;
+        // SAFETY: `STACK_BALANCE_SPINNERS` is a static array of stacks, reached only through
+        // `addr_of!`.
+        let stack_top =
+            unsafe { ChildStack::top_at(core::ptr::addr_of!(STACK_BALANCE_SPINNERS), i) }?;
         let args = BalanceArgs {
             idx: i,
             sig: child_sig,
@@ -1747,7 +1761,8 @@ pub fn affinity_respected(ctx: &TestContext) -> TestResult
         .map_err(|_| "cap_copy for affinity_respected failed")?;
 
     // Bind to CPU 1 before starting.
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_RESPECTED));
+    // SAFETY: `STACK_AFFINITY_RESPECTED` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_AFFINITY_RESPECTED)) };
     // SAFETY: the stack is `STACK_AFFINITY_RESPECTED`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe {
@@ -1808,7 +1823,8 @@ pub fn default_affinity_runs(ctx: &TestContext) -> TestResult
     // Do NOT set affinity — leave it at default (AFFINITY_ANY).
     // Placement follows core/kernel/docs/scheduler.md § Thread Assignment.
 
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY));
+    // SAFETY: `STACK_DEFAULT_AFFINITY` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_DEFAULT_AFFINITY)) };
     // SAFETY: the stack is `STACK_DEFAULT_AFFINITY`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, sender_entry, stack_top, child_sig) }
@@ -2039,7 +2055,8 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
     thread_bind_notification(child.th, eq, CORRELATOR)
         .map_err(|_| "thread::bind_notification_fires_on_exit: thread_bind_notification failed")?;
 
-    let stack_top = crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK));
+    // SAFETY: `BIND_NOTIF_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK)) };
     // SAFETY: the stack is `BIND_NOTIF_STACK`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { crate::spawn::configure_and_start(&child, bind_notif_exit_entry, stack_top, 0) }
@@ -2094,7 +2111,8 @@ fn bind_nodes_on(ctx: &TestContext, eq: u64, nodes: u32) -> TestResult
         return Err("thread::bind_nodes: a bind past the pool did not return OutOfMemory");
     }
 
-    let stack_top = crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK));
+    // SAFETY: `BIND_NOTIF_STACK` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK)) };
     // SAFETY: the stack is `BIND_NOTIF_STACK`, which this test and
     // `bind_notification_fires_on_exit` use one at a time, each waiting for
     // its child to exit before returning; no other live thread runs on it.
@@ -2153,7 +2171,8 @@ pub fn configure_non_user_address_err(ctx: &TestContext) -> TestResult
 
     let mut child = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::configure_non_user_address_err: spawn::new_child failed")?;
-    let stack_top = ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_NON_USER));
+    // SAFETY: `STACK_CONFIGURE_NON_USER` is a static stack, reached only through `addr_of!`.
+    let stack_top = unsafe { ChildStack::top(core::ptr::addr_of!(STACK_CONFIGURE_NON_USER)) };
     let entry = blocker_entry as *const () as u64;
 
     let cases = [

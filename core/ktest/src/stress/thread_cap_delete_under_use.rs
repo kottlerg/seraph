@@ -374,7 +374,8 @@ fn create_thread(
     // before the controller sees the caller's report that ends the round, so
     // a stack is never reused while its previous target runs; the caller's is
     // reused only by the next phase's caller, after this one has exited.
-    let top = ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack)?;
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let top = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), stack) }?;
     // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and the
     // stack is this child's own, on which no other live thread runs (`ChildStack`'s
     // rule, as noted where the stack is chosen).

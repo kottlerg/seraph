@@ -251,8 +251,8 @@ fn setup(
         let s = objects.server.insert(s);
         let s_ep = cap_copy(ep, s.cs, RIGHTS_ALL)
             .map_err(|_| "stress::stop_park_race: cap_copy server ep failed")?;
-        // SAFETY: stack index 1 is the server's; phases run sequentially.
-        let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[1]) });
+        // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+        let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 1) }?;
         // SAFETY: the stack is `super::STRESS_STACKS[1]`, this test's own `ChildStack`,
         // on which no other live thread runs (`ChildStack`'s rule).
         unsafe { spawn::configure_and_start_pinned(s, server_entry, stack, s_ep, server_cpu) }
@@ -273,8 +273,8 @@ fn setup(
         Kind::Call => call_peer,
         Kind::Sleep => sleep_peer,
     };
-    // SAFETY: stack index 0 is the peer's; phases run sequentially.
-    let stack = ChildStack::top(unsafe { core::ptr::addr_of!(super::STRESS_STACKS[0]) });
+    // SAFETY: `STRESS_STACKS` is a static array of stacks, reached only through `addr_of!`.
+    let stack = unsafe { ChildStack::top_at(core::ptr::addr_of!(super::STRESS_STACKS), 0) }?;
     // SAFETY: the stack is `super::STRESS_STACKS[0]`, this test's own `ChildStack`,
     // on which no other live thread runs (`ChildStack`'s rule).
     unsafe { spawn::configure_and_start_pinned(p, entry, stack, p_source, 1) }

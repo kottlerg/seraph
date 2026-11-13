@@ -19,6 +19,9 @@
 //! 2. Add a handler function in the appropriate `syscall/` submodule.
 //! 3. Add a `match` arm in `dispatch_in_range` below.
 
+// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+#![warn(clippy::multiple_unsafe_ops_per_block)]
+
 pub mod cap;
 pub mod entropy;
 pub mod hw;
@@ -84,12 +87,17 @@ unsafe fn stamp_syscall_entry(nr: u64, frame: *mut TrapFrame)
         return;
     }
     // SAFETY: tcb is the running thread's live TCB (checked non-null above),
-    // and the running thread alone writes its own `syscall_nr` and
-    // `trap_frame` after configuration.
+    // and the running thread alone writes its own `syscall_nr` after
+    // configuration.
     unsafe {
         (*tcb)
             .syscall_nr
             .store(nr, core::sync::atomic::Ordering::Relaxed);
+    }
+    // SAFETY: tcb is the running thread's live TCB (checked non-null above),
+    // and the running thread alone writes its own `trap_frame` after
+    // configuration.
+    unsafe {
         (*tcb)
             .trap_frame
             .store(frame, core::sync::atomic::Ordering::Relaxed);
@@ -383,32 +391,44 @@ unsafe fn finish_syscall(exit: SyscallExit) -> SyscallExit
     // reschedules away and never returns to userspace. Protocol and invariants:
     // core/kernel/docs/thread-lifecycle-and-sleep.md § Self-teardown (the caller
     // is the freed thread).
-    // SAFETY: syscall context on the caller's kernel stack with interrupts
-    // disabled (the drain re-enables them only with preemption disabled), so
-    // this CPU and its `current` are stable across both checks.
-    unsafe {
-        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-        if !crate::sched::running_thread_stopped(this_cpu)
-        {
-            crate::cap::object::drain_deferred_reclaim(this_cpu);
-        }
-        if crate::sched::running_thread_stopped(this_cpu)
-        {
-            crate::sched::schedule(crate::sched::Requeue::IfRunnable);
-            crate::arch::current::cpu::halt_loop();
-        }
-        // The syscall delivery point of a pending upcall
-        // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds the
-        // syscall's result, and the thread is live. A restarted syscall is not
-        // a delivery point: its frame holds its arguments for the
-        // re-execution, whose own return delivers.
-        if exit == SyscallExit::Complete
-        {
-            crate::ipc::upcall::deliver_at_syscall();
-        }
-        let tcb = current_tcb();
-        if !tcb.is_null()
-        {
+    // Syscall context on the caller's kernel stack with interrupts disabled
+    // (the drain re-enables them only with preemption disabled), so this CPU
+    // and its `current` are stable across both checks.
+    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+    // SAFETY: the caller is the thread running on `this_cpu`, which cannot
+    // migrate with interrupts disabled, and holds no scheduler lock.
+    if !unsafe { crate::sched::running_thread_stopped(this_cpu) }
+    {
+        // SAFETY: the running thread is alive (not stopped, checked above) and
+        // on its own kernel stack.
+        unsafe { crate::cap::object::drain_deferred_reclaim(this_cpu) };
+    }
+    // SAFETY: as for the check above; the drain returns with this CPU and its
+    // `current` unchanged.
+    if unsafe { crate::sched::running_thread_stopped(this_cpu) }
+    {
+        // SAFETY: syscall context on the caller's valid kernel stack.
+        unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
+        crate::arch::current::cpu::halt_loop();
+    }
+    // The syscall delivery point of a pending upcall
+    // (docs/fault-handling.md § Asynchronous Upcalls): the frame holds the
+    // syscall's result, and the thread is live. A restarted syscall is not
+    // a delivery point: its frame holds its arguments for the
+    // re-execution, whose own return delivers.
+    if exit == SyscallExit::Complete
+    {
+        // SAFETY: syscall context on the caller's kernel stack, the frame
+        // holding the syscall's result, no lock held and interrupts disabled.
+        unsafe { crate::ipc::upcall::deliver_at_syscall() };
+    }
+    // SAFETY: kernel context with the scheduler initialised.
+    let tcb = unsafe { current_tcb() };
+    if !tcb.is_null()
+    {
+        // SAFETY: tcb is the running thread's live TCB (checked non-null), and
+        // the running thread alone writes its own `syscall_nr`.
+        unsafe {
             (*tcb)
                 .syscall_nr
                 .store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
@@ -689,14 +709,14 @@ fn sys_thread_sleep(tf: UserFrame) -> Result<u64, SyscallError>
             // restart the continuation completes and nothing rewrites the trap
             // frame afterwards, so the direct error return survives to
             // userspace, and the upcall is delivered at that return.
-            // SAFETY: tcb valid; no sleep-list entry was added. schedule is
-            // called from syscall context on a valid kernel stack.
+            // SAFETY: tcb valid; no sleep-list entry was added.
             unsafe {
                 (*tcb)
                     .sleep_deadline
                     .store(0, core::sync::atomic::Ordering::Relaxed);
-                crate::sched::schedule(crate::sched::Requeue::IfRunnable);
             }
+            // SAFETY: called from syscall context on a valid kernel stack.
+            unsafe { crate::sched::schedule(crate::sched::Requeue::IfRunnable) };
             return Err(SyscallError::Interrupted);
         }
     }
@@ -801,9 +821,11 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     // alone: eq.lock is never taken under a thread's sched_lock. A pool with
     // no free node still lets a bind onto an exited thread succeed below,
     // since that bind links nothing.
-    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call; no lock
-    // is held.
-    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer((*eq).state) };
+    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call.
+    let eq_state = unsafe { (*eq).state };
+    // SAFETY: eq_state is the state of the queue `eq_slot` pins for the call;
+    // no lock is held.
+    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer(eq_state) };
 
     // Serialise on the target thread's `sched_lock` against the death
     // transition (`set_state_under_all_locks`) and the post-death observer
@@ -820,9 +842,14 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     //
     // Deliver outside the lock — `post_one_death_event` posts to the event
     // queue and may wake a receiver.
-    // SAFETY: target_tcb is a valid TCB from a validated Thread cap; lock_raw
-    // pairs with an unlock_raw on every path below.
-    let saved = unsafe { (*target_tcb).sched_lock.lock_raw() };
+    // SAFETY: target_tcb is a valid TCB from a validated Thread cap.
+    let lock = unsafe { &(*target_tcb).sched_lock };
+    // SAFETY: lock_raw pairs with an unlock_raw on every path below.
+    let saved = unsafe { lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both reads are of target_tcb fields that its held sched_lock serialises"
+    )]
     // SAFETY: state and exit_reason are plain TCB fields read under sched_lock.
     let (already_exited, retained_reason) = unsafe {
         (
@@ -832,13 +859,17 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     };
     if already_exited || node.is_null()
     {
+        // SAFETY: target_tcb is a valid TCB from a validated Thread cap.
+        let lock = unsafe { &(*target_tcb).sched_lock };
         // SAFETY: paired with the lock_raw above.
-        unsafe { (*target_tcb).sched_lock.unlock_raw(saved) };
+        unsafe { lock.unlock_raw(saved) };
         if !node.is_null()
         {
+            // SAFETY: eq is pinned by `eq_slot`.
+            let eq_state = unsafe { (*eq).state };
             // SAFETY: node came from this queue's pool and was never linked;
             // eq is pinned by `eq_slot`.
-            unsafe { crate::ipc::event_queue::event_queue_return_observer((*eq).state, node) };
+            unsafe { crate::ipc::event_queue::event_queue_return_observer(eq_state, node) };
         }
         if !already_exited
         {
@@ -855,23 +886,31 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: eq is pinned by `eq_slot`; header at offset 0.
     if let Err(e) = unsafe { (*eq).header.try_inc_ref() }
     {
-        // SAFETY: paired with the lock_raw above; the node was never linked
-        // and eq is pinned by `eq_slot`.
-        unsafe {
-            (*target_tcb).sched_lock.unlock_raw(saved);
-            crate::ipc::event_queue::event_queue_return_observer((*eq).state, node);
-        }
+        // SAFETY: target_tcb is a valid TCB from a validated Thread cap.
+        let lock = unsafe { &(*target_tcb).sched_lock };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
+        // SAFETY: eq is pinned by `eq_slot`.
+        let eq_state = unsafe { (*eq).state };
+        // SAFETY: the node was never linked and eq is pinned by `eq_slot`.
+        unsafe { crate::ipc::event_queue::event_queue_return_observer(eq_state, node) };
         return Err(e);
     }
-    // SAFETY: lock held; node is this queue's, unlinked, and lives in the
-    // queue's retype slot, which the reference just taken keeps live until
-    // the thread's teardown returns the node and releases it (dealloc_object,
-    // Thread arm).
-    unsafe {
-        (*node).correlator = correlator;
-        (*target_tcb).death_observers.push(node);
-        (*target_tcb).sched_lock.unlock_raw(saved);
-    }
+    // SAFETY: node is this queue's and unlinked, so only this thread reaches
+    // it, and lives in the queue's retype slot, which the reference just taken
+    // keeps live until the thread's teardown returns the node and releases it
+    // (dealloc_object, Thread arm).
+    unsafe { (*node).correlator = correlator };
+    // SAFETY: target_tcb is a valid TCB from a validated Thread cap, and its
+    // held sched_lock owns `death_observers`, so this is the only reference.
+    let observers = unsafe { &mut (*target_tcb).death_observers };
+    // SAFETY: node is valid, unlinked, and outlives its membership (as above);
+    // the owner's sched_lock is held.
+    unsafe { observers.push(node) };
+    // SAFETY: target_tcb is a valid TCB from a validated Thread cap.
+    let lock = unsafe { &(*target_tcb).sched_lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     Ok(0)
 }
 
@@ -967,9 +1006,11 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     //
     // The node comes from the queue's pool under eq.lock alone, before
     // death_lock (the two are never nested).
-    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call; no lock
-    // is held.
-    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer((*eq).state) };
+    // SAFETY: eq is the EventQueueObject `eq_slot` pins for the call.
+    let eq_state = unsafe { (*eq).state };
+    // SAFETY: eq_state is the state of the queue `eq_slot` pins for the call;
+    // no lock is held.
+    let node = unsafe { crate::ipc::event_queue::event_queue_take_observer(eq_state) };
     // SAFETY: as_ptr is a valid AddressSpace from a validated AddressSpace cap;
     // eq is the EventQueueObject `eq_slot` pins for the call; node is null or
     // this queue's, unlinked.
@@ -978,8 +1019,10 @@ fn sys_aspace_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
     };
     if !matches!(bound, Ok(None)) && !node.is_null()
     {
+        // SAFETY: eq is pinned by `eq_slot`.
+        let eq_state = unsafe { (*eq).state };
         // SAFETY: the node was not linked; eq is pinned by `eq_slot`.
-        unsafe { crate::ipc::event_queue::event_queue_return_observer((*eq).state, node) };
+        unsafe { crate::ipc::event_queue::event_queue_return_observer(eq_state, node) };
     }
     match bound
     {
@@ -1224,44 +1267,48 @@ unsafe fn pin_checked(
     let index = syscall::cap_handle_index(handle);
     let generation = syscall::cap_handle_gen(handle);
     // SAFETY: cspace is the running thread's bound CSpace (contract), live for
-    // the call. Its lock serialises slot occupancy, and every slot free clears
-    // the slot under it before releasing the slot's reference, so an occupied
-    // slot read here names an object whose count is at least one, and the
-    // inc_ref below lands before any release can reach zero. lock_raw and
-    // unlock_raw are paired.
-    let snapshot = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let snapshot = (*cspace).slot(index).map(|slot| {
-            // `&` and `|`, not `&&` and `||`: each check is evaluated as a
-            // value, with no branch a misprediction could take past one of them.
-            let live = (slot.tag != CapTag::Null) & (slot.generation() == generation);
-            let typed = tag.is_none() | (tag == Some(slot.tag));
-            let held = slot.rights.contains(required);
-            let usable = nospec::mask_if(live & typed & held);
-            let hidden_tag = nospec::hide(slot.tag as usize);
-            let raw = slot
-                .object
-                .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
-            let object =
-                core::ptr::NonNull::new(nospec::select_ptr(usable, raw, core::ptr::null_mut()));
-            (
-                live,
-                typed,
-                held,
-                slot.tag,
-                slot.rights,
-                slot.badge,
-                object,
-                hidden_tag,
-            )
-        });
-        if let Some((true, true, true, _, _, _, Some(obj), _)) = snapshot
-        {
-            obj.as_ref().inc_ref();
-        }
-        (*cspace).lock.unlock_raw(saved);
-        snapshot
-    };
+    // the call.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the slot
+    // read.
+    let snapshot = unsafe { (*cspace).slot(index) }.map(|slot| {
+        // `&` and `|`, not `&&` and `||`: each check is evaluated as a
+        // value, with no branch a misprediction could take past one of them.
+        let live = (slot.tag != CapTag::Null) & (slot.generation() == generation);
+        let typed = tag.is_none() | (tag == Some(slot.tag));
+        let held = slot.rights.contains(required);
+        let usable = nospec::mask_if(live & typed & held);
+        let hidden_tag = nospec::hide(slot.tag as usize);
+        let raw = slot
+            .object
+            .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
+        let object =
+            core::ptr::NonNull::new(nospec::select_ptr(usable, raw, core::ptr::null_mut()));
+        (
+            live,
+            typed,
+            held,
+            slot.tag,
+            slot.rights,
+            slot.badge,
+            object,
+            hidden_tag,
+        )
+    });
+    if let Some((true, true, true, _, _, _, Some(obj), _)) = snapshot
+    {
+        // SAFETY: the slot was read occupied under the held lock, and every
+        // slot free clears the slot under that lock before releasing the
+        // slot's reference, so obj names a live object whose count is at least
+        // one, and this inc_ref lands before any release can reach zero.
+        unsafe { obj.as_ref() }.inc_ref();
+    }
+    // SAFETY: cspace is live for the call (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let (live, typed, held, tag, rights, badge, object, hidden_tag) =
         snapshot.ok_or(SyscallError::InvalidCapability)?;
     if !live || !typed

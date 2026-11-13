@@ -53,11 +53,13 @@ fn assert_baseline(label: &'static str, memory_cap: u64, baseline: u64) -> TestR
     Ok(())
 }
 
-// too_many_lines: the seven object-type cycles plus the mixed-batch
-// validator each need their own mint→mid-check→delete→assert sequence;
-// extracting a helper would require passing closures over the cap-create
-// wrappers (each with a distinct signature), buying nothing in clarity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the seven object-type cycles plus the mixed-batch validator each need their own \
+              mint→mid-check→delete→assert sequence; extracting a helper would require passing \
+              closures over the cap-create wrappers (each with a distinct signature), buying \
+              nothing in clarity"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;

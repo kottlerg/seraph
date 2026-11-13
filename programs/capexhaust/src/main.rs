@@ -30,6 +30,8 @@
 //! Driven by `services/svctest`'s `recv_wedge` phase, which spawns this
 //! binary, waits for exit, and asserts the exit code.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 /// `RecvGuard` diagnostic hook. The `First` line doubles as evidence that
 /// logging still works from a fully exhausted `CSpace` (`STREAM_BYTES`
 /// messages and their replies carry no caps).
@@ -91,8 +93,10 @@ fn main() -> !
 {
     std::os::seraph::log::register_name(b"capexhaust");
     let info = std::os::seraph::startup_info();
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // An Endpoint costs the kernel's raw retype debit, `ENDPOINT_RETYPE_BYTES`

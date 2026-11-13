@@ -179,13 +179,14 @@ pub unsafe fn notification_send(
             // Invariants, invariant 7).
             // SAFETY: waiter is the valid TCB just removed from the queue under
             // sig.lock.
-            unsafe {
-                debug_assert!(
-                    (*waiter).magic == crate::sched::thread::TCB_MAGIC,
-                    "notification_send: waiter TCB magic corrupt — use-after-free?"
-                );
-                crate::ipc::claim_waiter(waiter, delivered);
-            }
+            let magic = unsafe { (*waiter).magic };
+            debug_assert!(
+                magic == crate::sched::thread::TCB_MAGIC,
+                "notification_send: waiter TCB magic corrupt — use-after-free?"
+            );
+            // SAFETY: waiter was just removed from the queue under the held
+            // sig.lock.
+            unsafe { crate::ipc::claim_waiter(waiter, delivered) };
             sig.refresh_observer();
             Some(waiter)
         }

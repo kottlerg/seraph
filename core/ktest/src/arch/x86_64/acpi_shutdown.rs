@@ -120,12 +120,14 @@ fn locate_fadt_fields(info: &InitInfo) -> Option<(u16, u64)>
         let _ = unsafe { syscall::mem_unmap(info.aspace_cap, ACPI_MAP_BASE, pages) };
         return None;
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "PM1a_CNT_BLK is an x86 I/O port address, at most 0xFFFF; the upper 16 bits of the \
+                  32-bit field are zero"
+    )]
     // SAFETY: find_table_in_acpi_regions mapped the region, and the check
     // above keeps [table_vaddr, table_vaddr + FADT_END) inside it, which
     // covers PM1a_CNT_BLK (offset 64, 4 bytes).
-    // cast_possible_truncation: PM1a_CNT_BLK is an x86 I/O port address, at
-    // most 0xFFFF; the upper 16 bits of the 32-bit field are zero.
-    #[allow(clippy::cast_possible_truncation)]
     let pm1a = unsafe { read_u32_at(table_vaddr, FADT_OFF_PM1A_CNT_BLK) } as u16;
     // SAFETY: as above; DSDT (offset 40, 4 bytes) lies below FADT_END.
     let dsdt32 = unsafe { read_u32_at(table_vaddr, FADT_OFF_DSDT) };

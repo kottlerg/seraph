@@ -28,8 +28,10 @@ pub fn spin() -> [u8; 4]
 #[must_use]
 pub fn self_delete(handle: u64) -> [u8; 32]
 {
-    // cast_possible_truncation: syscall numbers fit 32 bits.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "syscall numbers fit 32 bits"
+    )]
     let (lui, addi) = li32(17, SYS_CAP_DELETE as u32); // a7 = nr
     let words = [
         lui,

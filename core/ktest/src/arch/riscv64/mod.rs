@@ -237,8 +237,10 @@ pub fn shutdown(info: &InitInfo)
 /// have set `scounteren.CY = 1`.
 ///
 /// Returns raw cycle counts; use deltas only.
-// inline_always: the counter read must be inlined to avoid call overhead in cycle benchmarks.
-#[allow(clippy::inline_always)]
+#[expect(
+    clippy::inline_always,
+    reason = "the counter read must be inlined to avoid call overhead in cycle benchmarks"
+)]
 #[inline(always)]
 pub fn cycles_now() -> u64
 {

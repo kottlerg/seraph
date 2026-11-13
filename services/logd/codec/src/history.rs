@@ -203,15 +203,12 @@ impl<const BYTES: usize> HistoryRing<BYTES>
         let mut header = [0u8; RECORD_HEADER_BYTES];
         header[0..8].copy_from_slice(&badge.to_le_bytes());
         header[8..16].copy_from_slice(&us.to_le_bytes());
-        // At most ENTRY_MAX_BYTES, which the const assert above fits in a
-        // u16.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "at most ENTRY_MAX_BYTES, which the const assert above fits in a u16"
+        )]
         header[16..18].copy_from_slice(&(line.len() as u16).to_le_bytes());
-        // Masked to the three-bit level field, so it fits a byte.
-        #[allow(clippy::cast_possible_truncation)]
-        {
-            header[18] = (level & LEVEL_MASK) as u8;
-        }
+        header[18] = (level & LEVEL_MASK) as u8;
         header[19] = kind.byte();
         self.write_at(self.tail, &header);
         self.write_at(Self::wrap(self.tail, RECORD_HEADER_BYTES), line);

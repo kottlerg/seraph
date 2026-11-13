@@ -36,6 +36,8 @@
 //! entry for the forged handle, and the probe can observe only that the write
 //! is not delivered, since QEMU records no requester for the fault.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -567,9 +569,11 @@ impl Driver
 /// target sits on, which its domain does not map (bit 12 flipped: the
 /// paired hart's supervisor file, 4 KiB apart, or a page past the files).
 #[cfg(target_arch = "riscv64")]
-// unnecessary_wraps: the signature is the x86_64 variant's, which has no
-// forged address with remapping off.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the signature is the x86_64 variant's, which has no forged address with remapping \
+              off"
+)]
 fn forged_address(address: u64) -> Option<u64>
 {
     Some(address ^ PAGE_SIZE)
@@ -626,8 +630,10 @@ fn main() -> !
 {
     std::os::seraph::log::register_name(b"test-dma");
     let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some((bar_cap, bar_pages, irq, eps)) = receive(info.creator_endpoint, ipc_buf)

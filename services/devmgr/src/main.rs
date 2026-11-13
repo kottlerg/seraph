@@ -16,6 +16,8 @@
 //! and driver authority, and `docs/device-management.md` for the system-scope
 //! design.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod arch;
 mod bind;
 mod caps;
@@ -47,10 +49,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"devmgr");
     let info = startup_info();
 
-    // IPC buffer is registered by `std::os::seraph::_start` and
+    // The IPC buffer is registered by `std::os::seraph::_start` and
     // page-aligned by the boot protocol. It is the control thread's: every
     // registry worker receives on its own page.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(clippy::cast_ptr_alignment, reason = "the IPC buffer is page-aligned")]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     refuse_translatable_aspace(info.self_aspace);
@@ -285,9 +287,6 @@ const REGISTRY_WORKERS: usize = 4;
 /// order: the drivers-directory pass and settle, then the on-demand pass and
 /// settle. Each job, once done, is counted settled ([`Registry::finish_job`]),
 /// which releases the queries waiting for it.
-// too_many_arguments: the jobs consume every table a bind and its settle
-// batch carve from or record into, as the passes they run do.
-#[allow(clippy::too_many_arguments)]
 fn run_jobs(
     registry: &Registry,
     records: &mut bind::Records,
@@ -714,9 +713,6 @@ impl Registry
 {
     /// Serve one registry request on a worker whose IPC buffer page is
     /// `ipc_buf`, replying before it returns.
-    // One match over every label, each arm carrying its own reply handling;
-    // splitting it would scatter the dispatch table.
-    #[allow(clippy::too_many_lines)]
     fn handle(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let badge = msg.badge;
@@ -1928,9 +1924,11 @@ fn settle_batch(
 /// ([`bind::boot_pass`]), from the declared boot modules `modules`. The
 /// registry's workers start only after it, so every client sees the settled
 /// drivers.
-// too_many_arguments: the boot pass takes the records, the boot modules, and
-// every table a bind and its settle batch carve from or record into.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the boot pass takes the records, the boot modules, and every table a bind and its \
+              settle batch carve from or record into"
+)]
 fn spawn_boot_drivers(
     records: &mut bind::Records,
     modules: Vec<(driver_binding::decl::DriverDecl, u64)>,

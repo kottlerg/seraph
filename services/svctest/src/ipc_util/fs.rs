@@ -6,10 +6,6 @@
 //! Raw `fs_labels::*` IPC helpers. Each wraps one wire transaction with
 //! a typed signature so phase call sites read as intent.
 
-// svctest is an integration test harness; helpers panic on protocol
-// violation so faults surface in the log. Matches main.rs's allow.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
-
 use crate::ipc_util::ns::ns_lookup;
 
 /// Walk the per-test `/data/svctest` directory from the std-overlay
@@ -134,9 +130,10 @@ pub fn fs_read_bytes(
     {
         return Err(reply.label);
     }
-    // cast_possible_truncation: both Seraph targets are 64-bit, so usize
-    // holds every u64 byte count.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both Seraph targets are 64-bit, so usize holds every u64 byte count"
+    )]
     let n = reply.word(0) as usize;
     // A reply shorter than its length word is a server defect, not an error
     // status: it panics rather than reach a caller that tolerates an `Err`.

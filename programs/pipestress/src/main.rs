@@ -9,6 +9,8 @@
 //! allows — the shape that races a parent draining the pipe against the
 //! death-bridge flipping `peer_dead`. Idiomatic Rust, no Seraph cap awareness.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 fn main()
 {
     let token = std::env::args().nth(1).unwrap_or_default();

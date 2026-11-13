@@ -144,9 +144,6 @@ impl EventRing
         // 8-byte aligned (page-aligned base + 8-byte stride). Volatile: the
         // buffer was written by the device; poll_used's acquire fence ordered
         // that write before this read.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            core::ptr::read_volatile(addr as *const VirtioInputEvent)
-        }
+        unsafe { core::ptr::read_volatile(addr as *const VirtioInputEvent) }
     }
 }

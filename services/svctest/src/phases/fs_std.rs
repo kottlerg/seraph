@@ -380,13 +380,12 @@ pub fn std_metadata_phase(_: &Caps)
     std::os::seraph::log!("std_metadata phase passed");
 }
 
-// suspicious_open_options, nonsensical_open_options, ineffective_open_options:
-// the phase builds the invalid `OpenOptions` combinations these lints catch,
-// to assert std rejects each with `InvalidInput`.
-#[allow(
+#[expect(
     clippy::suspicious_open_options,
     clippy::nonsensical_open_options,
-    clippy::ineffective_open_options
+    clippy::ineffective_open_options,
+    reason = "the phase builds the invalid `OpenOptions` combinations these lints catch, to assert \
+              std rejects each with `InvalidInput`"
 )]
 pub fn std_open_options_invalid_phase(_: &Caps)
 {

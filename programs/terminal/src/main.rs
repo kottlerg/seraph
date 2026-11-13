@@ -24,6 +24,8 @@
 //! Remaining deferrals are documented in `README.md`: signals/cooked-raw/
 //! job-control/multi-session (#29) and the real interactive shell (#112).
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod input;
 mod output;
 
@@ -56,8 +58,10 @@ fn main() -> !
 {
     std::os::seraph::log::register_name(b"terminal");
     let info = std::os::seraph::startup_info();
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some([input_class, fb_class, serial_class]) =

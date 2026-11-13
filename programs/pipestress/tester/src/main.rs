@@ -24,10 +24,13 @@
 //! Output goes to stdout only: the usertest orchestrator drains stdout to
 //! EOF before stderr, so unbounded stderr would deadlock against it.
 
-// A per-program tester is test code, where unwrap and expect are permitted
-// (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait
-// must abort the tester, and the panic's non-zero exit is its FAIL verdict.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "a per-program tester is test code, where unwrap and expect are permitted \
+              (docs/coding-standards.md § Error Handling): a failed spawn, read, or wait must \
+              abort the tester, and the panic's non-zero exit is its FAIL verdict"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::io::Read;
 use std::process::{Command, Stdio};

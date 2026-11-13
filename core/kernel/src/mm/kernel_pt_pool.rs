@@ -105,13 +105,13 @@ pub(crate) unsafe fn init(seed_pages: usize)
         {
             break;
         };
-        // SAFETY: `pa` is freshly drawn from the buddy; direct map
-        // covers it since Phase 3. Single-threaded init; no LOCK needed.
-        unsafe {
-            let head = FREE_LIST_HEAD;
-            *(phys_to_virt(pa) as *mut u64) = head;
-            FREE_LIST_HEAD = pa;
-        }
+        // SAFETY: single-threaded init (contract); no LOCK needed.
+        let head = unsafe { FREE_LIST_HEAD };
+        // SAFETY: `pa` is freshly drawn from the buddy; direct map covers it
+        // since Phase 3.
+        unsafe { *(phys_to_virt(pa) as *mut u64) = head };
+        // SAFETY: single-threaded init (contract); no LOCK needed.
+        unsafe { FREE_LIST_HEAD = pa };
         // At most seed_pages, so the count never saturates.
         installed = installed.saturating_add(1);
     }
@@ -128,21 +128,22 @@ pub(crate) unsafe fn init(seed_pages: usize)
 pub(crate) fn alloc_pt_page() -> Option<u64>
 {
     acquire();
-    // SAFETY: LOCK held; FREE_LIST_HEAD exclusively owned for the
-    // duration of this block.
-    let pa = unsafe {
-        let head = FREE_LIST_HEAD;
-        if head == 0
-        {
-            None
-        }
-        else
-        {
-            let next = *(phys_to_virt(head) as *const u64);
-            FREE_LIST_HEAD = next;
-            Some(head)
-        }
+    // SAFETY: LOCK held; FREE_LIST_HEAD exclusively owned while it is.
+    let head = unsafe { FREE_LIST_HEAD };
+    let pa = if head == 0
+    {
+        None
+    }
+    else
+    {
+        // SAFETY: head is a free pool page, which the direct map covers; its
+        // link word belongs to the free list, which the held LOCK owns.
+        let next = unsafe { *(phys_to_virt(head) as *const u64) };
+        // SAFETY: LOCK held; FREE_LIST_HEAD exclusively owned while it is.
+        unsafe { FREE_LIST_HEAD = next };
+        Some(head)
     };
+
     release();
     if pa.is_some()
     {

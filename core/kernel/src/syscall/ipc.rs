@@ -284,17 +284,24 @@ fn prevalidate_transfer_slots(cs: &CSpace, handles: &[u64]) -> Result<(), Syscal
 #[cfg(not(test))]
 unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u64]) -> Result<(), SyscallError>
 {
-    // SAFETY: caller contract; the lock is released below.
-    let saved = unsafe { (*cs).lock.lock_raw() };
-    // SAFETY: caller contract; the CSpace lock is held, so the slots validated
-    // here stay occupied, and each occupied slot's object live, for the
-    // ceiling check, which re-resolves every slot under the same hold.
-    let r = unsafe {
-        prevalidate_transfer_slots(&*cs, handles)
-            .and_then(|()| crate::cap::transfer::check_transfer_ref_limits(&*cs, handles))
-    };
-    // SAFETY: saved came from the lock_raw call above.
-    unsafe { (*cs).lock.unlock_raw(saved) };
+    // SAFETY: caller contract: cs is the running thread's live CSpace.
+    let lock = unsafe { &(*cs).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: caller contract: cs is live.
+    let cs_ref = unsafe { &*cs };
+    let r = prevalidate_transfer_slots(cs_ref, handles).and_then(|()| {
+        // SAFETY: caller contract: cs is live.
+        let cs_ref = unsafe { &*cs };
+        // SAFETY: the CSpace lock is held, so the slots validated above stay
+        // occupied, and each occupied slot's object live, for the ceiling
+        // check, which re-resolves every slot under the same hold.
+        unsafe { crate::cap::transfer::check_transfer_ref_limits(cs_ref, handles) }
+    });
+    // SAFETY: caller contract: cs is live.
+    let lock = unsafe { &(*cs).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     r
 }
 
@@ -348,13 +355,20 @@ unsafe fn transfer_caps(
 
     crate::cap::DERIVATION_LOCK.write_lock();
 
-    // SAFETY: both TCBs are valid per the caller contract.
-    let resolved = unsafe {
-        (
-            crate::cap::lookup_cspace((*src_tcb).cspace_id, (*src_tcb).cspace_epoch),
-            crate::cap::lookup_cspace((*dst_tcb).cspace_id, (*dst_tcb).cspace_epoch),
-        )
-    };
+    // SAFETY: src_tcb is valid per the caller contract; cspace_id is
+    // read-only after creation.
+    let src_id = unsafe { (*src_tcb).cspace_id };
+    // SAFETY: src_tcb is valid per the caller contract; cspace_epoch is
+    // read-only after creation.
+    let src_epoch = unsafe { (*src_tcb).cspace_epoch };
+    let src_resolved = crate::cap::lookup_cspace(src_id, src_epoch);
+    // SAFETY: dst_tcb is valid per the caller contract; cspace_id is
+    // read-only after creation.
+    let dst_id = unsafe { (*dst_tcb).cspace_id };
+    // SAFETY: dst_tcb is valid per the caller contract; cspace_epoch is
+    // read-only after creation.
+    let dst_epoch = unsafe { (*dst_tcb).cspace_epoch };
+    let resolved = (src_resolved, crate::cap::lookup_cspace(dst_id, dst_epoch));
     let (Some(src_cspace), Some(dst_cspace)) = resolved
     else
     {
@@ -375,18 +389,21 @@ unsafe fn transfer_caps(
     // object's reference ceiling so no move refuses its destination's
     // reference. Failing here keeps the all-or-nothing contract (nothing has
     // moved yet) and the per-move failure branch below genuinely unreachable.
-    // SAFETY: both pointers registry-resolved under the lock; both locks held.
-    let prepared = unsafe {
-        prevalidate_transfer_slots(&*src_cspace, src_handles)
-            .and_then(|()| {
-                crate::cap::transfer::check_transfer_ref_limits(&*src_cspace, src_handles)
-            })
-            .and_then(|()| {
-                (*dst_cspace)
-                    .pre_allocate(cap_count)
-                    .map_err(SyscallError::from)
-            })
-    };
+    // SAFETY: src_cspace is registry-resolved under DERIVATION_LOCK, so live.
+    let src_ref = unsafe { &*src_cspace };
+    let prepared = prevalidate_transfer_slots(src_ref, src_handles)
+        .and_then(|()| {
+            // SAFETY: src_cspace is registry-resolved under DERIVATION_LOCK,
+            // so live.
+            let src_ref = unsafe { &*src_cspace };
+            // SAFETY: src_cspace's lock is held (lock_cspace_pair above).
+            unsafe { crate::cap::transfer::check_transfer_ref_limits(src_ref, src_handles) }
+        })
+        .and_then(|()| {
+            // SAFETY: dst_cspace is registry-resolved under DERIVATION_LOCK,
+            // so live, and its held lock serialises its slots.
+            unsafe { (*dst_cspace).pre_allocate(cap_count) }.map_err(SyscallError::from)
+        });
     if let Err(e) = prepared
     {
         // SAFETY: saved1 and saved2 came from the lock_cspace_pair call above.
@@ -519,10 +536,9 @@ unsafe fn deliver_call_caps(
     .unwrap_or(0);
     // SAFETY: server_tcb is pinned and not yet enqueued (so it cannot be
     // running); finalizing its ipc_msg cap results is race-free.
-    unsafe {
-        (*server_tcb).ipc_msg.cap_slots = dst_handles;
-        (*server_tcb).ipc_msg.cap_count = transferred;
-    }
+    unsafe { (*server_tcb).ipc_msg.cap_slots = dst_handles };
+    // SAFETY: as for the cap_slots write above.
+    unsafe { (*server_tcb).ipc_msg.cap_count = transferred };
 }
 
 /// Open a `sys_ipc_call` park episode: reset the reply disposition and
@@ -540,13 +556,10 @@ unsafe fn open_call_episode(tcb: *mut crate::sched::thread::ThreadControlBlock)
 {
     // SAFETY: tcb is the running caller; fields are unclaimable until
     // endpoint_call publishes them.
-    unsafe {
-        crate::sched::thread::open_park_episode(tcb);
-        #[cfg(debug_assertions)]
-        (*tcb)
-            .park_episode
-            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
+    unsafe { crate::sched::thread::open_park_episode(tcb) };
+    #[cfg(debug_assertions)]
+    // SAFETY: tcb is the running caller's valid TCB.
+    unsafe { &(*tcb).park_episode }.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Consume the reply disposition the park episode's wake-claim winner
@@ -577,19 +590,18 @@ unsafe fn consume_call_disposition(
     // episode at its claim site; a stale or missing stamp means this resume
     // was produced by nothing that owed it (#352-class leaked wake).
     #[cfg(debug_assertions)]
-    // SAFETY: tcb valid per caller contract.
-    unsafe {
-        let park = (*tcb)
-            .park_episode
-            .load(core::sync::atomic::Ordering::Relaxed);
-        let deposit = (*tcb)
-            .deposit_episode
-            .load(core::sync::atomic::Ordering::Relaxed);
+    {
+        // SAFETY: tcb valid per caller contract.
+        let park = unsafe { &(*tcb).park_episode }.load(core::sync::atomic::Ordering::Relaxed);
+        // SAFETY: tcb valid per caller contract.
+        let deposit =
+            unsafe { &(*tcb).deposit_episode }.load(core::sync::atomic::Ordering::Relaxed);
         debug_assert!(
             deposit == park,
             "sys_ipc_call: spurious resume tid={} park_episode={park} \
              deposit_episode={deposit} disposition={disposition}",
-            (*tcb).thread_id,
+            // SAFETY: tcb valid per caller contract.
+            unsafe { (*tcb).thread_id },
         );
     }
     if disposition == crate::sched::thread::PARK_DISPOSITION_REPLY
@@ -754,13 +766,17 @@ pub fn sys_ipc_call(tf: UserFrame) -> Result<u64, SyscallError>
             deliver_call_caps(tcb, woken_server, &msg);
         }
         // Enqueue the server and yield so it can run.
+        debug_assert_eq!(
+            // SAFETY: woken_server returned by endpoint_call; is valid TCB.
+            unsafe { (*woken_server).magic },
+            crate::sched::thread::TCB_MAGIC
+        );
         // SAFETY: woken_server returned by endpoint_call; is valid TCB.
-        unsafe {
-            debug_assert_eq!((*woken_server).magic, crate::sched::thread::TCB_MAGIC);
-            let target_cpu = crate::sched::select_target_cpu(woken_server);
-            debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-            crate::sched::enqueue_and_wake(woken_server, target_cpu);
-        }
+        let target_cpu = unsafe { crate::sched::select_target_cpu(woken_server) };
+        debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+        // SAFETY: woken_server is a valid TCB; target_cpu came from
+        // select_target_cpu.
+        unsafe { crate::sched::enqueue_and_wake(woken_server, target_cpu) };
     }
     // else: No server; caller is blocked on send queue. Yield to another thread.
 
@@ -914,14 +930,19 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // take reserved slots meanwhile; `transfer_caps`'s locked
     // `pre_allocate` then grows again, and a failure of that grow fails the
     // transfer, which degrades to zero-cap delivery.
-    // SAFETY: cspace_ptr validated above; lock_raw/unlock_raw paired.
-    unsafe {
-        let saved = (*cspace_ptr).lock.lock_raw();
-        let r = (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX);
-        (*cspace_ptr).lock.unlock_raw(saved);
-        r
-    }
-    .map_err(|e| {
+    // SAFETY: cspace_ptr validated above: the running thread's own CSpace,
+    // live while it runs.
+    let lock = unsafe { &(*cspace_ptr).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace_ptr is live (as above), and its held lock serialises its
+    // slots.
+    let r = unsafe { (*cspace_ptr).pre_allocate(MSG_CAP_SLOTS_MAX) };
+    // SAFETY: cspace_ptr is live (as above).
+    let lock = unsafe { &(*cspace_ptr).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
+    r.map_err(|e| {
         log_recv_preallocate_failure(tcb, &e);
         SyscallError::from(e)
     })?;
@@ -1089,16 +1110,19 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
     unsafe {
         (*caller).ipc_msg = fail_msg;
     }
-    // SAFETY: caller is a valid parked TCB; enqueue_and_wake transitions to
-    // Ready (caller contract).
+    // SAFETY: caller is a valid parked TCB whose episode the invoking path
+    // has exclusively claimed (caller contract).
     unsafe {
         crate::sched::thread::stamp_park_deposit(
             caller,
             crate::sched::thread::PARK_DISPOSITION_REPLY,
         );
-        let target_cpu = crate::sched::select_target_cpu(caller);
-        crate::sched::enqueue_and_wake(caller, target_cpu);
     }
+    // SAFETY: caller is a valid TCB (caller contract).
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    // SAFETY: caller is a valid parked TCB; target_cpu came from
+    // select_target_cpu; enqueue_and_wake transitions it to Ready.
+    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
 }
 
 /// `SYS_IPC_REPLY` (1): reply to a blocked caller.
@@ -1214,19 +1238,20 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::ipc::fault::FAULT_OUTCOME_RESUME
         };
-        // SAFETY: caller pinned by the claim; transitions to Ready under
-        // sched.lock in enqueue_and_wake. Episode stamp: claim = the
-        // reply_tcb CAS won inside endpoint_reply.
-        unsafe {
-            (*caller)
-                .fault_outcome
-                .store(outcome, core::sync::atomic::Ordering::Release);
-            crate::sched::thread::stamp_deposit_episode(caller);
-            debug_assert_eq!((*caller).magic, crate::sched::thread::TCB_MAGIC);
-            let target_cpu = crate::sched::select_target_cpu(caller);
-            debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-            crate::sched::enqueue_and_wake(caller, target_cpu);
-        }
+        // SAFETY: caller pinned by the claim.
+        unsafe { &(*caller).fault_outcome }.store(outcome, core::sync::atomic::Ordering::Release);
+        // SAFETY: caller pinned by the claim; the episode's exclusive claim is
+        // the reply_tcb CAS won inside endpoint_reply.
+        unsafe { crate::sched::thread::stamp_deposit_episode(caller) };
+        // SAFETY: caller pinned by the claim.
+        debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
+        // SAFETY: caller pinned by the claim.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+        debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+        // SAFETY: caller pinned by the claim; target_cpu came from
+        // select_target_cpu; it transitions to Ready under sched.lock in
+        // enqueue_and_wake.
+        unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
         return Ok(0);
     }
 
@@ -1249,26 +1274,35 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
             // under, so a slot consumed meanwhile is still caught. The caller's
             // CSpace is resolved through the registry
             // (core/kernel/docs/capability-internals.md § Move).
-            // SAFETY: caller is pinned by the won claim, so its `cspace_id` and
-            // `cspace_epoch` are read from a live TCB; the CSpace pointer is
-            // registry-resolved under the derivation lock; lock_raw/unlock_raw
-            // paired.
-            unsafe {
-                crate::cap::DERIVATION_LOCK.write_lock();
-                let r = match crate::cap::lookup_cspace((*caller).cspace_id, (*caller).cspace_epoch)
+            crate::cap::DERIVATION_LOCK.write_lock();
+            // SAFETY: caller is pinned by the won claim, so its TCB is live;
+            // cspace_id is read-only after creation.
+            let cspace_id = unsafe { (*caller).cspace_id };
+            // SAFETY: caller is pinned by the won claim, so its TCB is live;
+            // cspace_epoch is read-only after creation.
+            let cspace_epoch = unsafe { (*caller).cspace_epoch };
+            let r = match crate::cap::lookup_cspace(cspace_id, cspace_epoch)
+            {
+                Some(cs) =>
                 {
-                    Some(cs) =>
-                    {
-                        let saved = (*cs).lock.lock_raw();
-                        let r = (*cs).pre_allocate(cap_count);
-                        (*cs).lock.unlock_raw(saved);
-                        r.map_err(SyscallError::from)
-                    }
-                    None => Err(SyscallError::InvalidCapability),
-                };
-                crate::cap::DERIVATION_LOCK.write_unlock();
-                r
-            }
+                    // SAFETY: cs is registry-resolved under the derivation
+                    // lock, so live.
+                    let lock = unsafe { &(*cs).lock };
+                    // SAFETY: lock_raw pairs with the unlock_raw below.
+                    let saved = unsafe { lock.lock_raw() };
+                    // SAFETY: cs is live (as above), and its held lock
+                    // serialises its slots.
+                    let r = unsafe { (*cs).pre_allocate(cap_count) };
+                    // SAFETY: cs is live (as above).
+                    let lock = unsafe { &(*cs).lock };
+                    // SAFETY: paired with the lock_raw above.
+                    unsafe { lock.unlock_raw(saved) };
+                    r.map_err(SyscallError::from)
+                }
+                None => Err(SyscallError::InvalidCapability),
+            };
+            crate::cap::DERIVATION_LOCK.write_unlock();
+            r
         });
     if let Err(e) = staged
     {
@@ -1321,17 +1355,23 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     // stamp's Release orders the ipc_msg write before the resume's reads.
     // SAFETY: caller is pinned by the claim; ipc_msg is owned by the claim's
     // winner while the caller is parked.
+    unsafe { (*caller).ipc_msg = msg };
+    // SAFETY: caller is pinned by the claim, whose winner is the episode's
+    // only depositor.
     unsafe {
-        (*caller).ipc_msg = msg;
         crate::sched::thread::stamp_park_deposit(
             caller,
             crate::sched::thread::PARK_DISPOSITION_REPLY,
         );
-        debug_assert_eq!((*caller).magic, crate::sched::thread::TCB_MAGIC);
-        let target_cpu = crate::sched::select_target_cpu(caller);
-        debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-        crate::sched::enqueue_and_wake(caller, target_cpu);
     }
+    // SAFETY: caller is pinned by the claim.
+    debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
+    // SAFETY: caller is pinned by the claim.
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+    // SAFETY: caller is pinned by the claim; target_cpu came from
+    // select_target_cpu.
+    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
     Ok(0)
 }
 
@@ -1369,9 +1409,11 @@ unsafe fn stage_reply_payload(
     {
         // SAFETY: buf validated by read_cap_handles.
         let handles = unsafe { read_cap_handles(buf, cap_count) }?;
-        // SAFETY: server is the running thread; its bound CSpace outlives the
-        // syscall, and no CSpace lock is held.
-        unsafe { prevalidate_sender_caps((*server).cspace, leading(&handles, cap_count)) }?;
+        // SAFETY: server is the running thread's valid TCB (caller contract).
+        let cspace = unsafe { (*server).cspace };
+        // SAFETY: cspace is the running thread's bound CSpace, which outlives
+        // the syscall, and no CSpace lock is held.
+        unsafe { prevalidate_sender_caps(cspace, leading(&handles, cap_count)) }?;
         msg.cap_slots = handles;
         msg.cap_count = cap_count;
     }
@@ -1417,19 +1459,20 @@ pub fn sys_notification_send(tf: UserFrame) -> Result<u64, SyscallError>
 
     if let Some(waiter) = woken
     {
+        debug_assert!(
+            // SAFETY: waiter returned by notification_send; is valid TCB.
+            unsafe { (*waiter).magic } == crate::sched::thread::TCB_MAGIC,
+            "sys_notification_send: woken waiter magic corrupt"
+        );
         // SAFETY: waiter returned by notification_send; is valid TCB.
-        unsafe {
-            debug_assert!(
-                (*waiter).magic == crate::sched::thread::TCB_MAGIC,
-                "sys_notification_send: woken waiter magic corrupt"
-            );
-            let target_cpu = crate::sched::select_target_cpu(waiter);
-            debug_assert!(
-                target_cpu < crate::sched::MAX_CPUS,
-                "sys_notification_send: target_cpu {target_cpu} out of range"
-            );
-            crate::sched::enqueue_and_wake(waiter, target_cpu);
-        }
+        let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
+        debug_assert!(
+            target_cpu < crate::sched::MAX_CPUS,
+            "sys_notification_send: target_cpu {target_cpu} out of range"
+        );
+        // SAFETY: waiter is a valid TCB; target_cpu came from
+        // select_target_cpu.
+        unsafe { crate::sched::enqueue_and_wake(waiter, target_cpu) };
     }
 
     Ok(0)
@@ -1606,12 +1649,13 @@ pub fn sys_event_post(tf: UserFrame) -> Result<u64, SyscallError>
         {
             // A waiter was woken; enqueue it.
             // SAFETY: woken returned by event_queue_post; is valid TCB.
-            unsafe {
-                debug_assert_eq!((*woken).magic, crate::sched::thread::TCB_MAGIC);
-                let target_cpu = crate::sched::select_target_cpu(woken);
-                debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-                crate::sched::enqueue_and_wake(woken, target_cpu);
-            }
+            debug_assert_eq!(unsafe { (*woken).magic }, crate::sched::thread::TCB_MAGIC);
+            // SAFETY: woken returned by event_queue_post; is valid TCB.
+            let target_cpu = unsafe { crate::sched::select_target_cpu(woken) };
+            debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+            // SAFETY: woken is a valid TCB; target_cpu came from
+            // select_target_cpu.
+            unsafe { crate::sched::enqueue_and_wake(woken, target_cpu) };
             Ok(0)
         }
         Ok(None) => Ok(0),
@@ -1733,12 +1777,14 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: tcb still valid after resume.
     if unsafe { crate::sched::thread::consume_park_interrupted(tcb) }
     {
-        // SAFETY: tcb validated above.
-        unsafe {
-            (*tcb).wakeup_value = 0;
-            (*tcb).wakeup_tag = 0;
-            (*tcb).timed_out = false;
-        }
+        // SAFETY: tcb validated above; the resuming syscall clears its wake
+        // fields with no lock, before the thread can park again (the fields'
+        // ownership rule).
+        unsafe { (*tcb).wakeup_value = 0 };
+        // SAFETY: as for wakeup_value above.
+        unsafe { (*tcb).wakeup_tag = 0 };
+        // SAFETY: as for wakeup_value above.
+        unsafe { (*tcb).timed_out = false };
         return Err(SyscallError::Interrupted);
     }
 
@@ -1746,18 +1792,22 @@ pub fn sys_event_recv(tf: UserFrame) -> Result<u64, SyscallError>
     // entry in `wakeup_value` and `wakeup_tag`, or the sleep-list timer arm set
     // `timed_out = true`. Both paths remove any sleep-list entry (and its
     // deadline) as part of claiming the wake.
-    // SAFETY: tcb still valid after resume.
-    let (entry, timed_out) = unsafe {
-        let e = crate::ipc::event_queue::EventEntry {
-            payload: (*tcb).wakeup_value,
-            tag: (*tcb).wakeup_tag,
-        };
-        let t = (*tcb).timed_out;
-        (*tcb).wakeup_value = 0;
-        (*tcb).wakeup_tag = 0;
-        (*tcb).timed_out = false;
-        (e, t)
-    };
+    // SAFETY: tcb still valid after resume; the waker's writes precede the
+    // wake.
+    let payload = unsafe { (*tcb).wakeup_value };
+    // SAFETY: as for wakeup_value above.
+    let tag = unsafe { (*tcb).wakeup_tag };
+    let entry = crate::ipc::event_queue::EventEntry { payload, tag };
+    // SAFETY: as for wakeup_value above.
+    let timed_out = unsafe { (*tcb).timed_out };
+    // SAFETY: tcb still valid after resume; the resuming syscall clears its
+    // wake fields with no lock, before the thread can park again (the fields'
+    // ownership rule).
+    unsafe { (*tcb).wakeup_value = 0 };
+    // SAFETY: as for wakeup_value above.
+    unsafe { (*tcb).wakeup_tag = 0 };
+    // SAFETY: as for wakeup_value above.
+    unsafe { (*tcb).timed_out = false };
 
     if timed_out
     {
@@ -1852,129 +1902,195 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
     // back-pointer and call into waitset_notify with an unregistered
     // member, or skip the notify when the source is in fact ready.
     //
-    // SAFETY: source_ptr extracted from validated cap; member_idx returned
-    // from waitset_add. Lock acquired and released for each branch; a shared
-    // helper is not used because the source types differ and the field
-    // accesses do not share a trait. Each arm casts `source_ptr` selected by
-    // its own tag (`PinnedCap::tag_mask`), so an arm a mispredicted match
-    // reaches casts null, never a state of another type; the arm's tag is the
-    // slot's, so the select returns `source_ptr` itself.
-    let member_idx_result = unsafe {
-        match source_tag
+    // Lock acquired and released for each branch; a shared helper is not used
+    // because the source types differ and the field accesses do not share a
+    // trait. Each arm casts `source_ptr` selected by its own tag
+    // (`PinnedCap::tag_mask`), so an arm a mispredicted match reaches casts
+    // null, never a state of another type; the arm's tag is the slot's, so the
+    // select returns `source_ptr` itself, the state of the source `src` pins.
+    let member_idx_result = match source_tag
+    {
+        WaitSetSourceTag::Endpoint =>
         {
-            WaitSetSourceTag::Endpoint =>
+            // cast_ptr_alignment: kernel allocator guarantees object alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let ep = nospec::select_ptr(
+                src.tag_mask(CapTag::Endpoint),
+                source_ptr,
+                core::ptr::null_mut(),
+            )
+            .cast::<crate::ipc::endpoint::EndpointState>();
+            // SAFETY: ep is the state of the Endpoint `src` pins.
+            let lock = unsafe { &(*ep).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: ep is live (as above), and its held lock serialises
+            // wait_set.
+            let res = if unsafe { (*ep).wait_set }.is_null()
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment.
-                #[allow(clippy::cast_ptr_alignment)]
-                let ep = nospec::select_ptr(
-                    src.tag_mask(CapTag::Endpoint),
-                    source_ptr,
-                    core::ptr::null_mut(),
-                )
-                .cast::<crate::ipc::endpoint::EndpointState>();
-                let saved = (*ep).lock.lock_raw();
-                let res = if (*ep).wait_set.is_null()
+                // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins
+                // and source_ptr that of the source `src` pins; the source's
+                // lock is held and no scheduler lock.
+                match unsafe {
+                    crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                }
                 {
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                    Ok(idx) =>
                     {
-                        Ok(idx) =>
-                        {
+                        #[expect(
+                            clippy::multiple_unsafe_ops_per_block,
+                            reason = "both writes are to ep fields its held lock serialises"
+                        )]
+                        // SAFETY: ep is live (as above), and its held lock
+                        // serialises the wait-set back-pointer fields.
+                        unsafe {
                             (*ep).wait_set = ws_state.cast::<u8>();
                             (*ep).wait_set_member_idx = idx;
-                            // +1 cap-level ref pins this source for as long
-                            // as the wait set holds the member.
-                            (*source_header).inc_ref();
-                            Ok(idx)
                         }
-                        Err(()) => Err(SyscallError::InvalidArgument),
-                    }
-                }
-                else
-                {
-                    Err(SyscallError::InvalidArgument)
-                };
-                (*ep).lock.unlock_raw(saved);
-                res
-            }
-            WaitSetSourceTag::Notification =>
-            {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment.
-                #[allow(clippy::cast_ptr_alignment)]
-                let sig = nospec::select_ptr(
-                    src.tag_mask(CapTag::Notification),
-                    source_ptr,
-                    core::ptr::null_mut(),
-                )
-                .cast::<crate::ipc::notification::NotificationState>();
-                let saved = (*sig).lock.lock_raw();
-                let res = if (*sig).wait_set.is_null()
-                {
-                    // Publish the observer before waitset_add reads `bits`
-                    // (Dekker add half, pairing with the fence in
-                    // notification_send; core/kernel/docs/scheduling-internals.md
-                    // § Atomic Ordering Invariants). Either the add's readiness
-                    // check sees a concurrent send's bits, or that send sees
-                    // has_observer == 1, waits on sig.lock until this
-                    // registration is complete, and reaches waitset_notify.
-                    (*sig)
-                        .has_observer
-                        .store(1, core::sync::atomic::Ordering::Relaxed);
-                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    if let Ok(idx) =
-                        crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
-                    {
-                        (*sig).wait_set = ws_state.cast::<u8>();
-                        (*sig).wait_set_member_idx = idx;
-                        (*source_header).inc_ref();
+                        // +1 cap-level ref pins this source for as long
+                        // as the wait set holds the member.
+                        // SAFETY: source_header is the header of the source
+                        // `src` pins.
+                        unsafe { (*source_header).inc_ref() };
                         Ok(idx)
                     }
-                    else
-                    {
-                        // No member was installed: has_observer again
-                        // reflects the direct waiters alone.
-                        (*sig).refresh_observer();
-                        Err(SyscallError::InvalidArgument)
+                    Err(()) => Err(SyscallError::InvalidArgument),
+                }
+            }
+            else
+            {
+                Err(SyscallError::InvalidArgument)
+            };
+            // SAFETY: ep is live (as above).
+            let lock = unsafe { &(*ep).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            res
+        }
+        WaitSetSourceTag::Notification =>
+        {
+            // cast_ptr_alignment: kernel allocator guarantees object alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let sig = nospec::select_ptr(
+                src.tag_mask(CapTag::Notification),
+                source_ptr,
+                core::ptr::null_mut(),
+            )
+            .cast::<crate::ipc::notification::NotificationState>();
+            // SAFETY: sig is the state of the Notification `src` pins.
+            let lock = unsafe { &(*sig).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: sig is live (as above), and its held lock serialises
+            // wait_set.
+            let res = if unsafe { (*sig).wait_set }.is_null()
+            {
+                // Publish the observer before waitset_add reads `bits`
+                // (Dekker add half, pairing with the fence in
+                // notification_send; core/kernel/docs/scheduling-internals.md
+                // § Atomic Ordering Invariants). Either the add's readiness
+                // check sees a concurrent send's bits, or that send sees
+                // has_observer == 1, waits on sig.lock until this
+                // registration is complete, and reaches waitset_notify.
+                // SAFETY: sig is live (as above).
+                unsafe { &(*sig).has_observer }.store(1, core::sync::atomic::Ordering::Relaxed);
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins
+                // and source_ptr that of the source `src` pins; the source's
+                // lock is held and no scheduler lock.
+                if let Ok(idx) = unsafe {
+                    crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                }
+                {
+                    #[expect(
+                        clippy::multiple_unsafe_ops_per_block,
+                        reason = "both writes are to sig fields its held lock serialises"
+                    )]
+                    // SAFETY: sig is live (as above), and its held lock
+                    // serialises the wait-set back-pointer fields.
+                    unsafe {
+                        (*sig).wait_set = ws_state.cast::<u8>();
+                        (*sig).wait_set_member_idx = idx;
                     }
+                    // SAFETY: source_header is the header of the source `src`
+                    // pins.
+                    unsafe { (*source_header).inc_ref() };
+                    Ok(idx)
                 }
                 else
                 {
+                    // No member was installed: has_observer again
+                    // reflects the direct waiters alone.
+                    // SAFETY: sig is live (as above), and its held lock
+                    // serialises the waiters and wait_set fields it reads.
+                    unsafe { (*sig).refresh_observer() };
                     Err(SyscallError::InvalidArgument)
-                };
-                (*sig).lock.unlock_raw(saved);
-                res
+                }
             }
-            WaitSetSourceTag::EventQueue =>
+            else
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment.
-                #[allow(clippy::cast_ptr_alignment)]
-                let eq = nospec::select_ptr(
-                    src.tag_mask(CapTag::EventQueue),
-                    source_ptr,
-                    core::ptr::null_mut(),
-                )
-                .cast::<crate::ipc::event_queue::EventQueueState>();
-                let saved = (*eq).lock.lock_raw();
-                let res = if (*eq).wait_set.is_null()
+                Err(SyscallError::InvalidArgument)
+            };
+            // SAFETY: sig is live (as above).
+            let lock = unsafe { &(*sig).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            res
+        }
+        WaitSetSourceTag::EventQueue =>
+        {
+            // cast_ptr_alignment: kernel allocator guarantees object alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let eq = nospec::select_ptr(
+                src.tag_mask(CapTag::EventQueue),
+                source_ptr,
+                core::ptr::null_mut(),
+            )
+            .cast::<crate::ipc::event_queue::EventQueueState>();
+            // SAFETY: eq is the state of the EventQueue `src` pins.
+            let lock = unsafe { &(*eq).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: eq is live (as above), and its held lock serialises
+            // wait_set.
+            let res = if unsafe { (*eq).wait_set }.is_null()
+            {
+                // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins
+                // and source_ptr that of the source `src` pins; the source's
+                // lock is held and no scheduler lock.
+                match unsafe {
+                    crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                }
                 {
-                    match crate::ipc::wait_set::waitset_add(ws_state, source_ptr, source_tag, badge)
+                    Ok(idx) =>
                     {
-                        Ok(idx) =>
-                        {
+                        #[expect(
+                            clippy::multiple_unsafe_ops_per_block,
+                            reason = "both writes are to eq fields its held lock serialises"
+                        )]
+                        // SAFETY: eq is live (as above), and its held lock
+                        // serialises the wait-set back-pointer fields.
+                        unsafe {
                             (*eq).wait_set = ws_state.cast::<u8>();
                             (*eq).wait_set_member_idx = idx;
-                            (*source_header).inc_ref();
-                            Ok(idx)
                         }
-                        Err(()) => Err(SyscallError::InvalidArgument),
+                        // SAFETY: source_header is the header of the source
+                        // `src` pins.
+                        unsafe { (*source_header).inc_ref() };
+                        Ok(idx)
                     }
+                    Err(()) => Err(SyscallError::InvalidArgument),
                 }
-                else
-                {
-                    Err(SyscallError::InvalidArgument)
-                };
-                (*eq).lock.unlock_raw(saved);
-                res
             }
+            else
+            {
+                Err(SyscallError::InvalidArgument)
+            };
+            // SAFETY: eq is live (as above).
+            let lock = unsafe { &(*eq).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            res
         }
     };
     member_idx_result?;
@@ -2014,52 +2130,50 @@ unsafe fn wait_set_source(
     // Each arm reads `src.object_of(<its tag>)`, the object selected by the
     // tag as data, so an arm a mispredicted tag match reaches reads through
     // null, never an object of another type.
-    // SAFETY: src pins the object (contract) and the arm's tag names the
-    // wrapper type, whose `state` field is read; the arm's tag is the slot's,
-    // so `object_of` returns the pinned object.
     // cast_ptr_alignment: kernel allocator guarantees object alignment; header is at the start of the allocation.
     #[allow(clippy::cast_ptr_alignment)]
-    let (state, tag, header, right) = unsafe {
-        match src.tag
+    let (state, tag, header, right) = match src.tag
+    {
+        CapTag::Endpoint =>
         {
-            CapTag::Endpoint =>
-            {
-                let header = src.object_of(CapTag::Endpoint);
-                (
-                    (*header.cast::<crate::cap::object::EndpointObject>())
-                        .state
-                        .cast::<u8>(),
-                    WaitSetSourceTag::Endpoint,
-                    header,
-                    EpRights::RECEIVE.erase(),
-                )
-            }
-            CapTag::Notification =>
-            {
-                let header = src.object_of(CapTag::Notification);
-                (
-                    (*header.cast::<crate::cap::object::NotificationObject>())
-                        .state
-                        .cast::<u8>(),
-                    WaitSetSourceTag::Notification,
-                    header,
-                    NtfRights::WAIT.erase(),
-                )
-            }
-            CapTag::EventQueue =>
-            {
-                let header = src.object_of(CapTag::EventQueue);
-                (
-                    (*header.cast::<crate::cap::object::EventQueueObject>())
-                        .state
-                        .cast::<u8>(),
-                    WaitSetSourceTag::EventQueue,
-                    header,
-                    EqRights::RECV.erase(),
-                )
-            }
-            _ => return Err(SyscallError::InvalidCapability),
+            let header = src.object_of(CapTag::Endpoint);
+            (
+                // SAFETY: src pins the object (contract) and the arm's tag
+                // names the wrapper type, whose `state` field is read; the
+                // arm's tag is the slot's, so `object_of` returns the pinned
+                // object.
+                unsafe { (*header.cast::<crate::cap::object::EndpointObject>()).state }
+                    .cast::<u8>(),
+                WaitSetSourceTag::Endpoint,
+                header,
+                EpRights::RECEIVE.erase(),
+            )
         }
+        CapTag::Notification =>
+        {
+            let header = src.object_of(CapTag::Notification);
+            (
+                // SAFETY: as in the Endpoint arm.
+                unsafe { (*header.cast::<crate::cap::object::NotificationObject>()).state }
+                    .cast::<u8>(),
+                WaitSetSourceTag::Notification,
+                header,
+                NtfRights::WAIT.erase(),
+            )
+        }
+        CapTag::EventQueue =>
+        {
+            let header = src.object_of(CapTag::EventQueue);
+            (
+                // SAFETY: as in the Endpoint arm.
+                unsafe { (*header.cast::<crate::cap::object::EventQueueObject>()).state }
+                    .cast::<u8>(),
+                WaitSetSourceTag::EventQueue,
+                header,
+                EqRights::RECV.erase(),
+            )
+        }
+        _ => return Err(SyscallError::InvalidCapability),
     };
     Ok((state, tag, header, right))
 }
@@ -2123,88 +2237,139 @@ pub fn sys_wait_set_remove(tf: UserFrame) -> Result<u64, SyscallError>
     // for the call, so the membership's reference is never the last one here:
     // the source is freed, if at all, when the pin drops after the unlock.
     //
-    // SAFETY: source_ptr extracted from validated cap. Each arm casts
-    // `source_ptr` selected by its own tag, as in `sys_wait_set_add`.
-    let remove_result = unsafe {
-        match source_tag
+    // Each arm casts `source_ptr` selected by its own tag, as in
+    // `sys_wait_set_add`, so its state pointer is that of the source `src`
+    // pins.
+    let remove_result = match source_tag
+    {
+        WaitSetSourceTag::Endpoint =>
         {
-            WaitSetSourceTag::Endpoint =>
+            // cast_ptr_alignment: kernel allocator guarantees object alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let ep = nospec::select_ptr(
+                src.tag_mask(CapTag::Endpoint),
+                source_ptr,
+                core::ptr::null_mut(),
+            )
+            .cast::<crate::ipc::endpoint::EndpointState>();
+            // SAFETY: ep is the state of the Endpoint `src` pins.
+            let lock = unsafe { &(*ep).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins; the
+            // source's lock is held and no scheduler lock.
+            let res = unsafe { crate::ipc::wait_set::waitset_remove(ws_state, source_ptr) };
+            if res.is_ok()
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment.
-                #[allow(clippy::cast_ptr_alignment)]
-                let ep = nospec::select_ptr(
-                    src.tag_mask(CapTag::Endpoint),
-                    source_ptr,
-                    core::ptr::null_mut(),
-                )
-                .cast::<crate::ipc::endpoint::EndpointState>();
-                let saved = (*ep).lock.lock_raw();
-                let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
-                if res.is_ok()
-                {
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "both writes are to ep fields its held lock serialises"
+                )]
+                // SAFETY: ep is live (as above), and its held lock serialises
+                // the wait-set back-pointer fields.
+                unsafe {
                     (*ep).wait_set = core::ptr::null_mut();
                     (*ep).wait_set_member_idx = 0;
-                    let remaining = (*source_header).dec_ref();
-                    debug_assert!(
-                        remaining > 0,
-                        "wait-set dec_ref drained source under the call's `src` pin"
-                    );
                 }
-                (*ep).lock.unlock_raw(saved);
-                res
+                // SAFETY: source_header is the header of the source `src` pins.
+                let remaining = unsafe { (*source_header).dec_ref() };
+                debug_assert!(
+                    remaining > 0,
+                    "wait-set dec_ref drained source under the call's `src` pin"
+                );
             }
-            WaitSetSourceTag::Notification =>
+            // SAFETY: ep is live (as above).
+            let lock = unsafe { &(*ep).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            res
+        }
+        WaitSetSourceTag::Notification =>
+        {
+            // cast_ptr_alignment: kernel allocator guarantees object alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let sig = nospec::select_ptr(
+                src.tag_mask(CapTag::Notification),
+                source_ptr,
+                core::ptr::null_mut(),
+            )
+            .cast::<crate::ipc::notification::NotificationState>();
+            // SAFETY: sig is the state of the Notification `src` pins.
+            let lock = unsafe { &(*sig).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins; the
+            // source's lock is held and no scheduler lock.
+            let res = unsafe { crate::ipc::wait_set::waitset_remove(ws_state, source_ptr) };
+            if res.is_ok()
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment.
-                #[allow(clippy::cast_ptr_alignment)]
-                let sig = nospec::select_ptr(
-                    src.tag_mask(CapTag::Notification),
-                    source_ptr,
-                    core::ptr::null_mut(),
-                )
-                .cast::<crate::ipc::notification::NotificationState>();
-                let saved = (*sig).lock.lock_raw();
-                let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
-                if res.is_ok()
-                {
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every access is to sig fields its held lock serialises"
+                )]
+                // SAFETY: sig is live (as above), and its held lock serialises
+                // the wait-set back-pointer fields and the waiters
+                // refresh_observer reads.
+                unsafe {
                     (*sig).wait_set = core::ptr::null_mut();
                     (*sig).wait_set_member_idx = 0;
                     // Keep has_observer set only while a direct waiter is queued.
                     (*sig).refresh_observer();
-                    let remaining = (*source_header).dec_ref();
-                    debug_assert!(
-                        remaining > 0,
-                        "wait-set dec_ref drained source under the call's `src` pin"
-                    );
                 }
-                (*sig).lock.unlock_raw(saved);
-                res
+                // SAFETY: source_header is the header of the source `src` pins.
+                let remaining = unsafe { (*source_header).dec_ref() };
+                debug_assert!(
+                    remaining > 0,
+                    "wait-set dec_ref drained source under the call's `src` pin"
+                );
             }
-            WaitSetSourceTag::EventQueue =>
+            // SAFETY: sig is live (as above).
+            let lock = unsafe { &(*sig).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            res
+        }
+        WaitSetSourceTag::EventQueue =>
+        {
+            // cast_ptr_alignment: kernel allocator guarantees object alignment.
+            #[allow(clippy::cast_ptr_alignment)]
+            let eq = nospec::select_ptr(
+                src.tag_mask(CapTag::EventQueue),
+                source_ptr,
+                core::ptr::null_mut(),
+            )
+            .cast::<crate::ipc::event_queue::EventQueueState>();
+            // SAFETY: eq is the state of the EventQueue `src` pins.
+            let lock = unsafe { &(*eq).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: ws_state is the state of the WaitSet `ws_slot` pins; the
+            // source's lock is held and no scheduler lock.
+            let res = unsafe { crate::ipc::wait_set::waitset_remove(ws_state, source_ptr) };
+            if res.is_ok()
             {
-                // cast_ptr_alignment: kernel allocator guarantees object alignment.
-                #[allow(clippy::cast_ptr_alignment)]
-                let eq = nospec::select_ptr(
-                    src.tag_mask(CapTag::EventQueue),
-                    source_ptr,
-                    core::ptr::null_mut(),
-                )
-                .cast::<crate::ipc::event_queue::EventQueueState>();
-                let saved = (*eq).lock.lock_raw();
-                let res = crate::ipc::wait_set::waitset_remove(ws_state, source_ptr);
-                if res.is_ok()
-                {
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "both writes are to eq fields its held lock serialises"
+                )]
+                // SAFETY: eq is live (as above), and its held lock serialises
+                // the wait-set back-pointer fields.
+                unsafe {
                     (*eq).wait_set = core::ptr::null_mut();
                     (*eq).wait_set_member_idx = 0;
-                    let remaining = (*source_header).dec_ref();
-                    debug_assert!(
-                        remaining > 0,
-                        "wait-set dec_ref drained source under the call's `src` pin"
-                    );
                 }
-                (*eq).lock.unlock_raw(saved);
-                res
+                // SAFETY: source_header is the header of the source `src` pins.
+                let remaining = unsafe { (*source_header).dec_ref() };
+                debug_assert!(
+                    remaining > 0,
+                    "wait-set dec_ref drained source under the call's `src` pin"
+                );
             }
+            // SAFETY: eq is live (as above).
+            let lock = unsafe { &(*eq).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            res
         }
     };
     remove_result.map_err(|()| SyscallError::InvalidCapability)?;

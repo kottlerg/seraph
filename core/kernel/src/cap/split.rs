@@ -89,10 +89,9 @@ pub(crate) unsafe fn install_split_children(
         // return both uninserted children to their arena.
         // SAFETY: both bodies are fresh (refcount 1) and were never inserted
         // anywhere (caller contract).
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
+        unsafe { dealloc_object(child1_ptr) };
+        // SAFETY: as above.
+        unsafe { dealloc_object(child2_ptr) };
         return Err(SyscallError::InvalidCapability);
     };
     let orig_node = SlotId::current(cspace_id, orig_idx_nz);
@@ -113,10 +112,9 @@ pub(crate) unsafe fn install_split_children(
         DERIVATION_LOCK.write_unlock();
         // SAFETY: both bodies are fresh (refcount 1) and were never inserted
         // anywhere.
-        unsafe {
-            dealloc_object(child1_ptr);
-            dealloc_object(child2_ptr);
-        }
+        unsafe { dealloc_object(child1_ptr) };
+        // SAFETY: as above.
+        unsafe { dealloc_object(child2_ptr) };
         return Err(SyscallError::InvalidState);
     };
     // SAFETY: caller contract (children fresh, refcount 1, uninserted);
@@ -186,11 +184,15 @@ pub(crate) unsafe fn install_split_children(
     // SAFETY: caller_cspace validated; orig_idx within CSpace bounds;
     // cspace.lock nests inside DERIVATION_LOCK
     // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy).
-    unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        (*caller_cspace).free_slot(orig_idx);
-        (*caller_cspace).lock.unlock_raw(saved);
-    }
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: as above; lock_raw/unlock_raw paired.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: as above; cspace.lock held.
+    unsafe { (*caller_cspace).free_slot(orig_idx) };
+    // SAFETY: as above.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
 
     DERIVATION_LOCK.write_unlock();
 
@@ -279,12 +281,10 @@ unsafe fn rollback_children(
 )
 {
     // SAFETY: caller contract.
-    let released = unsafe {
-        (
-            rollback_child(caller_cspace, cspace_id, child1),
-            rollback_child(caller_cspace, cspace_id, child2),
-        )
-    };
+    let released1 = unsafe { rollback_child(caller_cspace, cspace_id, child1) };
+    // SAFETY: caller contract.
+    let released2 = unsafe { rollback_child(caller_cspace, cspace_id, child2) };
+    let released = (released1, released2);
     DERIVATION_LOCK.write_unlock();
     // SAFETY: each flagged pointer reached refcount zero in rollback_child
     // and is referenced by no slot.
@@ -341,10 +341,9 @@ unsafe fn insert_and_link_children(
         // inserts above. A parent whose CSpace has since unregistered is a
         // dead link (see `truncate_dead_link`); the children then stay
         // clean roots, as `reparent_children` leaves them.
-        unsafe {
-            let _ = link_child(parent_id, SlotId::current(cspace_id, child1.slot));
-            let _ = link_child(parent_id, SlotId::current(cspace_id, child2.slot));
-        }
+        let _ = unsafe { link_child(parent_id, SlotId::current(cspace_id, child1.slot)) };
+        // SAFETY: as above.
+        let _ = unsafe { link_child(parent_id, SlotId::current(cspace_id, child2.slot)) };
     }
     Ok((child1, child2))
 }
@@ -406,32 +405,42 @@ unsafe fn insert_children(
     // Insert both children into the caller's CSpace under cspace.lock so the
     // freelist mutation cannot tear against a concurrent SYS_CAP_CREATE_*;
     // `insert_cap_slot_and_handle` mints each handle in the same hold.
-    // SAFETY: caller_cspace validated by the caller; lock_raw/unlock_raw paired.
-    let child1 = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace)
-            .insert_cap_slot_and_handle(tag, rights, child1_ptr)
+    let child1 = {
+        // SAFETY: caller_cspace validated by the caller.
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: as above; lock_raw/unlock_raw paired.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: as above; cspace.lock held.
+        let r = unsafe { (*caller_cspace).insert_cap_slot_and_handle(tag, rights, child1_ptr) }
             .map(|(slot, handle)| InsertedChild {
                 slot,
                 handle,
                 object: child1_ptr,
             });
-        (*caller_cspace).lock.unlock_raw(saved);
+        // SAFETY: as above.
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
         r
     }
     // Neither body has been stored: the caller frees both.
     .map_err(|e| (SyscallError::from(e), (true, true)))?;
-    // SAFETY: caller_cspace validated by the caller; lock_raw/unlock_raw paired.
-    let child2 = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        let r = (*caller_cspace)
-            .insert_cap_slot_and_handle(tag, rights, child2_ptr)
+    let child2 = {
+        // SAFETY: caller_cspace validated by the caller.
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: as above; lock_raw/unlock_raw paired.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: as above; cspace.lock held.
+        let r = unsafe { (*caller_cspace).insert_cap_slot_and_handle(tag, rights, child2_ptr) }
             .map(|(slot, handle)| InsertedChild {
                 slot,
                 handle,
                 object: child2_ptr,
             });
-        (*caller_cspace).lock.unlock_raw(saved);
+        // SAFETY: as above.
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: paired with lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
         r
     }
     .map_err(|e| {
@@ -498,12 +507,16 @@ unsafe fn rollback_child(
     unsafe { unlink_node(child_id) };
     // SAFETY: caller_cspace validated; cspace.lock nests inside
     // DERIVATION_LOCK (core/kernel/docs/scheduling-internals.md
-    // § Lock Hierarchy); lock_raw/unlock_raw paired.
-    unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
-        (*caller_cspace).free_slot(slot.get());
-        (*caller_cspace).lock.unlock_raw(saved);
-    }
+    // § Lock Hierarchy).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: as above; lock_raw/unlock_raw paired.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: as above; cspace.lock held.
+    unsafe { (*caller_cspace).free_slot(slot.get()) };
+    // SAFETY: as above.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     // SAFETY: child_ptr is a live object header (the slot referenced it
     // until the free above); the slot's reference is dropped exactly once.
     unsafe { (*child_ptr.as_ptr()).dec_ref() == 0 }

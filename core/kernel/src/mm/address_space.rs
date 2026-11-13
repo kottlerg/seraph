@@ -645,9 +645,15 @@ impl AddressSpace
         correlator: u64,
     ) -> Result<Option<u64>, syscall::SyscallError>
     {
-        // SAFETY: this validated by caller; lock_raw is paired with an
-        // unlock_raw on every path.
-        let saved = unsafe { (*this).death_lock.lock_raw() };
+        // SAFETY: this validated by caller.
+        let death_lock = unsafe { &(*this).death_lock };
+        // SAFETY: lock_raw is paired with an unlock_raw on every path.
+        let saved = unsafe { death_lock.lock_raw() };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a terminal-fault field of this, which the held death_lock \
+                      serialises"
+        )]
         // SAFETY: terminal_faulted/terminal_fault_reason read under death_lock.
         let (faulted, reason) =
             unsafe { ((*this).terminal_faulted, (*this).terminal_fault_reason) };
@@ -664,17 +670,24 @@ impl AddressSpace
             // The binding's reference is checked against REF_COUNT_LIMIT, as
             // the thread bind's is, and taken while the caller's pin holds
             // `eq`.
-            // SAFETY: lock held; node is eq's and unlinked (contract).
-            unsafe {
-                (*eq).header.try_inc_ref().map(|()| {
-                    (*node).correlator = correlator;
-                    (*this).death_observers.push(node);
-                    None
-                })
-            }
+            // SAFETY: eq is a live EventQueueObject the caller pins (contract).
+            let referenced = unsafe { (*eq).header.try_inc_ref() };
+            referenced.map(|()| {
+                // SAFETY: node is eq's and unlinked (contract); death_lock is
+                // held.
+                unsafe { (*node).correlator = correlator };
+                // SAFETY: this validated by caller; death_observers is
+                // serialised by the held death_lock.
+                let chain = unsafe { &mut (*this).death_observers };
+                // SAFETY: node is valid and on no list (contract), and the
+                // reference just taken keeps its queue, which holds it, alive
+                // for its membership; death_lock is held.
+                unsafe { chain.push(node) };
+                None
+            })
         };
         // SAFETY: paired with the lock_raw above.
-        unsafe { (*this).death_lock.unlock_raw(saved) };
+        unsafe { death_lock.unlock_raw(saved) };
         result
     }
 
@@ -695,19 +708,28 @@ impl AddressSpace
         reason: u64,
     ) -> *mut crate::sched::thread::DeathObserver
     {
+        // SAFETY: this validated by caller.
+        let death_lock = unsafe { &(*this).death_lock };
+        // SAFETY: lock_raw paired with the unlock_raw below.
+        let saved = unsafe { death_lock.lock_raw() };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a terminal-fault field or the observer chain of this, \
+                      which the held death_lock serialises"
+        )]
         // SAFETY: this validated by caller; fields read and written under
         // death_lock.
-        unsafe {
-            let saved = (*this).death_lock.lock_raw();
+        let first = unsafe {
             if !(*this).terminal_faulted
             {
                 (*this).terminal_faulted = true;
                 (*this).terminal_fault_reason = reason;
             }
-            let first = (*this).death_observers.first();
-            (*this).death_lock.unlock_raw(saved);
-            first
-        }
+            (*this).death_observers.first()
+        };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { death_lock.unlock_raw(saved) };
+        first
     }
 
     /// The retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), or
@@ -721,15 +743,24 @@ impl AddressSpace
     #[cfg(not(test))]
     pub unsafe fn retained_terminal_fault(this: *const Self) -> Option<u64>
     {
+        // SAFETY: this validated by caller.
+        let death_lock = unsafe { &(*this).death_lock };
+        // SAFETY: lock_raw paired with the unlock_raw below.
+        let saved = unsafe { death_lock.lock_raw() };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a terminal-fault field of this, which the held death_lock \
+                      serialises"
+        )]
         // SAFETY: this validated by caller; fields read under death_lock.
-        unsafe {
-            let saved = (*this).death_lock.lock_raw();
-            let retained = (*this)
+        let retained = unsafe {
+            (*this)
                 .terminal_faulted
-                .then_some((*this).terminal_fault_reason);
-            (*this).death_lock.unlock_raw(saved);
-            retained
-        }
+                .then_some((*this).terminal_fault_reason)
+        };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { death_lock.unlock_raw(saved) };
+        retained
     }
 
     /// Empty the observer chain for the address space's teardown, returning
@@ -746,14 +777,17 @@ impl AddressSpace
     pub unsafe fn take_death_observers(this: *mut Self)
     -> *mut crate::sched::thread::DeathObserver
     {
-        // SAFETY: this is valid (contract); death_lock is taken for the
-        // field-ownership rule though nothing can contend it here.
-        unsafe {
-            let saved = (*this).death_lock.lock_raw();
-            let taken = (*this).death_observers.take();
-            (*this).death_lock.unlock_raw(saved);
-            taken
-        }
+        // SAFETY: this is valid (contract).
+        let death_lock = unsafe { &(*this).death_lock };
+        // SAFETY: lock_raw paired with the unlock_raw below; death_lock is
+        // taken for the field-ownership rule though nothing can contend it
+        // here.
+        let saved = unsafe { death_lock.lock_raw() };
+        // SAFETY: this is valid; the chain is taken under death_lock.
+        let taken = unsafe { (*this).death_observers.take() };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { death_lock.unlock_raw(saved) };
+        taken
     }
 
     /// Map `virt` → `phys` as a 4 KiB page with the given permission flags,
@@ -1082,14 +1116,15 @@ impl AddressSpace
             // SAFETY: root_virt is valid; virt is in user range (caller's
             // contract); pt_lock is held, so the translation and the unmap see
             // the same entry.
-            unsafe {
-                if translate_user_page(self.root_virt, virt).is_some_and(|(p, _)| p == phys)
-                {
-                    unmap_user_page(self.root_virt, virt);
-                    // At most page_count, so the count never saturates.
-                    unmapped = unmapped.saturating_add(1);
-                    self.batch_cleared_frame(&mut batch, phys, virt_base, page_count);
-                }
+            let mapped = unsafe { translate_user_page(self.root_virt, virt) };
+            if mapped.is_some_and(|(p, _)| p == phys)
+            {
+                // SAFETY: as for the translation above, under the same
+                // pt_lock hold.
+                unsafe { unmap_user_page(self.root_virt, virt) };
+                // At most page_count, so the count never saturates.
+                unmapped = unmapped.saturating_add(1);
+                self.batch_cleared_frame(&mut batch, phys, virt_base, page_count);
             }
         }
         self.pt_unlock();
@@ -1182,35 +1217,38 @@ impl AddressSpace
         let current = crate::arch::current::cpu::current_cpu() as usize;
         if self.active_cpus.test_cpu(current, Ordering::Acquire)
         {
-            // SAFETY: ring 0 / S-mode; the per-VA invalidations are bracketed
-            // by the batch window; they clear the cleared leaves'
-            // translations, and a caller that freed page tables flushes the
-            // paging-structure caches itself (rustdoc above).
-            unsafe {
-                if let Some(pages) = ranged.clone()
+            if let Some(pages) = ranged.clone()
+            {
+                // SAFETY: ring 0 / S-mode; opens the batch window the per-VA
+                // invalidations below are bracketed by.
+                unsafe { inval_batch_begin() };
+                for virt in pages
                 {
-                    inval_batch_begin();
-                    for virt in pages
-                    {
-                        inval_page(virt);
-                    }
-                    inval_batch_end();
+                    // SAFETY: ring 0 / S-mode, inside the batch window; it
+                    // clears a cleared leaf's translation, and a caller that
+                    // freed page tables flushes the paging-structure caches
+                    // itself (rustdoc above).
+                    unsafe { inval_page(virt) };
                 }
-                else
-                {
-                    flush_tlb_all();
-                }
+                // SAFETY: ring 0 / S-mode; closes the batch window opened
+                // above.
+                unsafe { inval_batch_end() };
+            }
+            else
+            {
+                // SAFETY: ring 0 / S-mode; a full flush clears every
+                // translation.
+                unsafe { flush_tlb_all() };
             }
         }
         let remote = MaskSource::Mask(&self.active_cpus, Ordering::Acquire);
-        // SAFETY: root_phys is a valid root; the shootdown leaves current out
-        // of remote and returns at once when nothing else is active;
-        // preemption is disabled (contract). Tag 0 is the untagged path, and
-        // the full-flush sentinel ignores the tag, both correct cross-AS (see
-        // the Dekker exclusion above).
-        unsafe {
-            if ranged.is_some()
-            {
+        if ranged.is_some()
+        {
+            // SAFETY: root_phys is a valid root; the shootdown leaves current
+            // out of remote and returns at once when nothing else is active;
+            // preemption is disabled (contract). Tag 0 is the untagged path,
+            // correct cross-AS (see the Dekker exclusion above).
+            unsafe {
                 crate::mm::tlb_shootdown::shootdown_range(
                     self.root_phys,
                     &remote,
@@ -1219,10 +1257,12 @@ impl AddressSpace
                     0,
                 );
             }
-            else
-            {
-                crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0);
-            }
+        }
+        else
+        {
+            // SAFETY: as the range branch; the full-flush sentinel ignores the
+            // tag, correct cross-AS.
+            unsafe { crate::mm::tlb_shootdown::shootdown(self.root_phys, &remote, u64::MAX, 0) };
         }
     }
 
@@ -1323,19 +1363,20 @@ impl AddressSpace
                 use crate::arch::current::paging::{
                     inval_batch_begin, inval_batch_end, inval_page,
                 };
-                // SAFETY: ring 0 / S-mode; per-VA invalidations bracketed by
-                // the batch window; clears the TLB entries for every VA in the
-                // span, and the paging-structure-cache entries too where
-                // `VA_INVAL_DROPS_TABLE_CACHES`; elsewhere `ranged` implies no
-                // table was freed.
-                unsafe {
-                    inval_batch_begin();
-                    for virt in pages
-                    {
-                        inval_page(virt);
-                    }
-                    inval_batch_end();
+                // SAFETY: ring 0 / S-mode; opens the batch window the per-VA
+                // invalidations below are bracketed by.
+                unsafe { inval_batch_begin() };
+                for virt in pages
+                {
+                    // SAFETY: ring 0 / S-mode, inside the batch window; clears
+                    // the TLB entries for virt, and the paging-structure-cache
+                    // entries too where `VA_INVAL_DROPS_TABLE_CACHES`;
+                    // elsewhere `ranged` implies no table was freed.
+                    unsafe { inval_page(virt) };
                 }
+                // SAFETY: ring 0 / S-mode; closes the batch window opened
+                // above.
+                unsafe { inval_batch_end() };
             }
             else
             {
@@ -1393,7 +1434,9 @@ impl AddressSpace
     /// shootdown (`core/kernel/docs/memory-internals.md` § SMP TLB Shootdown).
     ///
     /// # Safety
-    /// `virt` must be in the user half and currently mapped.
+    /// `virt` must be in the user half. It need not be mapped: a concurrent
+    /// unmap can remove the page at any time, and the mapping is checked
+    /// under `pt_lock` as described above.
     #[cfg(not(test))]
     pub unsafe fn protect_page(
         &self,
@@ -1535,30 +1578,45 @@ impl AddressSpace
                     continue;
                 };
                 let frame = phys_to_virt(phys) as *mut u8;
-                // SAFETY: the check pass found the frame's leaf write-back and
-                // the frame below the top of RAM (thread_mem_page_check). A
+                // The check pass found the frame's leaf write-back and the
+                // frame below the top of RAM (thread_mem_page_check). A
                 // write-back user leaf names normal memory (a Memory
                 // capability's frame, or RAM the kernel mapped for init):
                 // SYS_MMIO_MAP installs device frames uncacheable, and
-                // protect_user_page keeps a leaf's memory type. The direct map covers every frame below the top of
-                // RAM but the kernel's stack guard pages, which no user leaf
-                // maps, so `frame` is a mapped write-back alias of it. The
-                // frame is mapped in this space, which pt_lock keeps mapped
-                // and so unfreed; in_page + n <= PAGE_SIZE, and the buffer
-                // offset + n <= len, by page_spans.
-                unsafe {
-                    match &mut copy
+                // protect_user_page keeps a leaf's memory type. The direct map
+                // covers every frame below the top of RAM but the kernel's
+                // stack guard pages, which no user leaf maps, so `frame` is a
+                // mapped write-back alias of it. The frame is mapped in this
+                // space, which pt_lock keeps mapped and so unfreed;
+                // in_page + n <= PAGE_SIZE, and the buffer offset + n <= len,
+                // by page_spans.
+                match &mut copy
+                {
+                    UserCopy::Read(dst) =>
                     {
-                        UserCopy::Read(dst) => core::ptr::copy_nonoverlapping(
-                            frame.add(span.in_page).cast_const(),
-                            dst.as_mut_ptr().add(span.offset),
-                            span.len,
-                        ),
-                        UserCopy::Write { src, .. } => core::ptr::copy_nonoverlapping(
-                            src.as_ptr().add(span.offset),
-                            frame.add(span.in_page),
-                            span.len,
-                        ),
+                        // SAFETY: in_page < PAGE_SIZE (page_spans), so the
+                        // offset stays in the frame's page.
+                        let from = unsafe { frame.add(span.in_page) };
+                        // SAFETY: offset + n <= len, the buffer's length
+                        // (page_spans), so the offset stays in dst.
+                        let to = unsafe { dst.as_mut_ptr().add(span.offset) };
+                        // SAFETY: from is n readable bytes of the mapped,
+                        // unfreed write-back frame and to n writable bytes of
+                        // dst (above).
+                        unsafe { core::ptr::copy_nonoverlapping(from.cast_const(), to, span.len) };
+                    }
+                    UserCopy::Write { src, .. } =>
+                    {
+                        // SAFETY: offset + n <= len, the buffer's length
+                        // (page_spans), so the offset stays in src.
+                        let from = unsafe { src.as_ptr().add(span.offset) };
+                        // SAFETY: in_page < PAGE_SIZE (page_spans), so the
+                        // offset stays in the frame's page.
+                        let to = unsafe { frame.add(span.in_page) };
+                        // SAFETY: from is n readable bytes of src and to n
+                        // writable bytes of the mapped, unfreed write-back
+                        // frame (above).
+                        unsafe { core::ptr::copy_nonoverlapping(from, to, span.len) };
                     }
                 }
             }
@@ -1652,10 +1710,10 @@ impl AddressSpace
         if owner_gen != tag_gen || synced < tlb_gen
         {
             // SAFETY: ring 0 / S-mode; tagging enabled.
-            unsafe {
-                flush_tag(tag);
-                tag_allocator::set_tag_state(cpu, tag, tag_gen, tlb_gen);
-            }
+            unsafe { flush_tag(tag) };
+            // SAFETY: as for tag_state above: the per-CPU slab is initialised;
+            // cpu is the current CPU and < cpu_count; tag < num_tags.
+            unsafe { tag_allocator::set_tag_state(cpu, tag, tag_gen, tlb_gen) };
             crate::percpu::record_ctxsw_flush(false);
         }
         else
@@ -1731,12 +1789,15 @@ impl AddressSpace
         // alignment and size are multiples of 8, asserted with
         // ACTIVE_CPU_WORDS_FIT).
         let after = unsafe { this.add(1) }.cast::<AtomicU64>();
+        // SAFETY: caller contract: `this` is valid, so the projection stays in
+        // its allocation.
+        let field = unsafe { core::ptr::addr_of_mut!((*this).active_cpus) };
+        // SAFETY: caller contract: the mask_words() words at `after` lie in the
+        // wrapper page, 8-byte aligned (above), and belong to this set alone.
+        let mask = unsafe { AtomicCpuMask::attach(after, crate::cpu_mask::mask_words()) };
         // SAFETY: caller contract: `this` is valid for writes and nothing else
-        // references it; the words at `after` belong to this set alone.
-        unsafe {
-            core::ptr::addr_of_mut!((*this).active_cpus)
-                .write(AtomicCpuMask::attach(after, crate::cpu_mask::mask_words()));
-        }
+        // references it.
+        unsafe { field.write(mask) };
     }
 }
 

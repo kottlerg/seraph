@@ -186,12 +186,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(50);
 /// ISR and acknowledged a wired line's delivery), and polls again. The
 /// notification keeps a signal sent before the wait, so a completion that
 /// lands between the poll and the wait ends the wait at once.
-// too_many_arguments: layout + direction + sector + data_addr + data_len
-// + three hardware handles (virtqueue, transport, completion notification) is
-// the minimal set this path needs; bundling for the lint would obscure
-// the per-call inputs (direction, sector, data_addr, data_len) that vary
-// per request.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "layout + direction + sector + data_addr + data_len + three hardware handles \
+              (virtqueue, transport, completion notification) is the minimal set this path needs; \
+              bundling for the lint would obscure the per-call inputs (direction, sector, \
+              data_addr, data_len) that vary per request"
+)]
 pub fn submit_and_wait(
     layout: &IoLayout,
     dir: IoDirection,

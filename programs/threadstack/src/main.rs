@@ -45,6 +45,8 @@
 //! Idiomatic `std` only — no direct Seraph cap awareness. The demand-paged
 //! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::io::Write;
 use std::process::ExitCode;
 

@@ -207,13 +207,15 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
 
     let ancestor = memory_obj_nn;
 
-    // SAFETY: ep_state_ptr / ep_obj_ptr point into the just-allocated region;
-    // alignment: the region is page-aligned (memory.base is page-aligned, and
-    // BIN_128 sub-page slots inherit 8-byte alignment from `bump_offset`'s
-    // initialisation at zero plus 128 B granularity, which exceeds the
-    // 8-byte alignment requirement of both structs).
+    // SAFETY: ep_state_ptr points into the just-allocated region; alignment:
+    // the region is page-aligned (memory.base is page-aligned, and BIN_128
+    // sub-page slots inherit 8-byte alignment from `bump_offset`'s
+    // initialisation at zero plus 128 B granularity, which exceeds the 8-byte
+    // alignment requirement of EndpointState).
+    unsafe { core::ptr::write(ep_state_ptr, EndpointState::new()) };
+    // SAFETY: ep_obj_ptr points into the just-allocated region, at its start,
+    // aligned as for the write above.
     unsafe {
-        core::ptr::write(ep_state_ptr, EndpointState::new());
         core::ptr::write(
             ep_obj_ptr,
             EndpointObject {
@@ -236,16 +238,23 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
     // and tag invariant cannot tear against a concurrent mutator on another
     // CPU (parent inserting caps via SYS_CAP_COPY, sibling thread also
     // creating caps, etc.).
-    // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
+    // SAFETY: cspace is the running thread's bound CSpace, validated non-null
+    // above.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the
+    // insert.
     let idx_res = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle_typed(
+        (*cspace).insert_cap_handle_typed(
             EpRights::SEND | EpRights::RECEIVE | EpRights::GRANT,
             nonnull,
-        );
-        (*cspace).lock.unlock_raw(saved);
-        r
+        )
     };
+    // SAFETY: cspace is live (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
 
     match idx_res
     {
@@ -254,12 +263,13 @@ pub fn sys_cap_create_endpoint(tf: UserFrame) -> Result<u64, SyscallError>
         {
             // CSpace slot allocation failed; roll back. Drop in place,
             // return the bytes, drop the lease.
-            // SAFETY: we just constructed both objects in place above;
-            // nothing else has observed them yet.
-            unsafe {
-                core::ptr::drop_in_place(ep_obj_ptr);
-                core::ptr::drop_in_place(ep_state_ptr);
-            }
+            // SAFETY: we just constructed the EndpointObject in place above;
+            // nothing else has observed it.
+            unsafe { core::ptr::drop_in_place(ep_obj_ptr) };
+            // SAFETY: we just constructed the EndpointState in place above;
+            // nothing else has observed it, and the wrapper's raw `state`
+            // pointer field does not drop it.
+            unsafe { core::ptr::drop_in_place(ep_state_ptr) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (none placed yet, or dropped above) and published nowhere.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -330,11 +340,13 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
 
     let ancestor = memory_obj_nn;
 
-    // SAFETY: pointers are inside the freshly-allocated retype slot;
+    // SAFETY: sig_state_ptr is inside the freshly-allocated retype slot;
     // size-class alignment (BIN_128 = 128 B granular) exceeds the 8-byte
-    // alignment requirement of both structs.
+    // alignment requirement of NotificationState.
+    unsafe { core::ptr::write(sig_state_ptr, NotificationState::new()) };
+    // SAFETY: sig_obj_ptr is the start of the freshly-allocated retype slot,
+    // aligned as for the write above.
     unsafe {
-        core::ptr::write(sig_state_ptr, NotificationState::new());
         core::ptr::write(
             sig_obj_ptr,
             NotificationObject {
@@ -350,13 +362,18 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: header at offset 0 of NotificationObject.
     let nonnull = unsafe { NonNull::new_unchecked(sig_obj_ptr.cast::<KernelObjectHeader>()) };
 
-    // SAFETY: cspace validated non-null; lock_raw/unlock_raw paired.
-    let idx_res = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle_typed(NtfRights::NOTIFY | NtfRights::WAIT, nonnull);
-        (*cspace).lock.unlock_raw(saved);
-        r
-    };
+    // SAFETY: cspace is the running thread's bound CSpace, validated non-null.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the
+    // insert.
+    let idx_res =
+        unsafe { (*cspace).insert_cap_handle_typed(NtfRights::NOTIFY | NtfRights::WAIT, nonnull) };
+    // SAFETY: cspace is live (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
 
     match idx_res
     {
@@ -365,11 +382,13 @@ pub fn sys_cap_create_notification(tf: UserFrame) -> Result<u64, SyscallError>
         {
             // CSpace slot allocation failed: roll back the in-place
             // construction.
-            // SAFETY: nothing else has observed these constructed objects.
-            unsafe {
-                core::ptr::drop_in_place(sig_obj_ptr);
-                core::ptr::drop_in_place(sig_state_ptr);
-            }
+            // SAFETY: the NotificationObject was constructed in place above
+            // and nothing else has observed it.
+            unsafe { core::ptr::drop_in_place(sig_obj_ptr) };
+            // SAFETY: the NotificationState was constructed in place above
+            // and nothing else has observed it; the wrapper's raw `state`
+            // pointer field does not drop it.
+            unsafe { core::ptr::drop_in_place(sig_state_ptr) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (none placed yet, or dropped above) and published nowhere.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -612,21 +631,26 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Record the donation covering all `init_pages`; the lower 2 pages
     // (wrapper + root PT) are reserved, `pool_pages` seed the pool.
-    // SAFETY: aso just constructed; offset/init_pages from a successful
-    // retype against `memory`.
-    let res = unsafe {
-        (*aso_ptr).add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
-    };
+    // SAFETY: aso_ptr holds the AddressSpaceObject just constructed in place,
+    // exclusively owned.
+    let aso = unsafe { &*aso_ptr };
+    // SAFETY: memory_obj_nn is a live MemoryObject on which the inc_ref above
+    // holds the pool's reference; offset/init_pages from a successful retype
+    // against `memory`, whose base is memory_base; no lock is held.
+    let res =
+        unsafe { aso.add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages) };
     if res.is_err()
     {
         // Roll back: drop the in-place objects, free the slab, dec_ref the
         // ancestor. AS has no Drop logic; the explicit drop_in_place is for
         // future-proofing.
-        // SAFETY: aso/aspace not observed externally yet.
-        unsafe {
-            core::ptr::drop_in_place(aso_ptr);
-            core::ptr::drop_in_place(aspace_ptr);
-        }
+        // SAFETY: the wrapper was constructed in place above and is not
+        // observed externally yet.
+        unsafe { core::ptr::drop_in_place(aso_ptr) };
+        // SAFETY: the AddressSpace was constructed in place above and is not
+        // observed externally yet; the wrapper's raw `address_space` pointer
+        // field does not drop it.
+        unsafe { core::ptr::drop_in_place(aspace_ptr) };
         // SAFETY: this call's own `retype_allocate` return, holding no live
         // object (none placed yet, or dropped above) and published nowhere.
         unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -646,13 +670,18 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
     {
         AsRights::MAP | AsRights::CONTROL
     };
-    // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
-    let idx_res = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle_typed(created_rights, nonnull);
-        (*cspace).lock.unlock_raw(saved);
-        r
-    };
+    // SAFETY: cspace is the running thread's bound CSpace, validated non-null
+    // above.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the
+    // insert.
+    let idx_res = unsafe { (*cspace).insert_cap_handle_typed(created_rights, nonnull) };
+    // SAFETY: cspace is live (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let idx = match idx_res
     {
         Ok(idx) => idx,
@@ -661,11 +690,13 @@ pub fn sys_cap_create_aspace(tf: UserFrame) -> Result<u64, SyscallError>
             // The cap never reached visibility; mirror the add_donation
             // rollback above (the donation record lives inside the wrapper
             // page being freed, so no external bookkeeping survives).
-            // SAFETY: aso/aspace not observed externally yet.
-            unsafe {
-                core::ptr::drop_in_place(aso_ptr);
-                core::ptr::drop_in_place(aspace_ptr);
-            }
+            // SAFETY: the wrapper was constructed in place above and is not
+            // observed externally yet.
+            unsafe { core::ptr::drop_in_place(aso_ptr) };
+            // SAFETY: the AddressSpace was constructed in place above and is
+            // not observed externally yet; the wrapper's raw `address_space`
+            // pointer field does not drop it.
+            unsafe { core::ptr::drop_in_place(aspace_ptr) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (none placed yet, or dropped above) and published nowhere.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -887,12 +918,14 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     // `SlotId::current`.
     if crate::cap::register_cspace(id, cs_ptr).is_err()
     {
-        // SAFETY: wrapper/cs not observed externally yet (registry
-        // rejected the entry; no slot in any CSpace points at `cs_ptr`).
-        unsafe {
-            core::ptr::drop_in_place(cs_kobj_ptr);
-            core::ptr::drop_in_place(cs_ptr);
-        }
+        // SAFETY: the wrapper was constructed in place above and is not
+        // observed externally yet (registry rejected the entry; no slot in
+        // any CSpace points at it).
+        unsafe { core::ptr::drop_in_place(cs_kobj_ptr) };
+        // SAFETY: the CSpace was constructed in place above and is not
+        // observed externally yet (no slot in any CSpace points at `cs_ptr`);
+        // the wrapper's raw `cspace` pointer field does not drop it.
+        unsafe { core::ptr::drop_in_place(cs_ptr) };
         // The id was drawn but never registered; return it or the
         // registry leaks one id per failed create.
         crate::cap::free_cspace_id(id);
@@ -908,18 +941,23 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
 
     // Record the donation covering all init_pages; reserve page 0 (wrapper),
     // pool seeds pages 1..init_pages (`pool_pages`).
-    // SAFETY: wrapper just constructed; offset/init_pages from a successful
-    // retype against `memory`.
-    let res = unsafe {
-        (*cs_kobj_ptr).add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages)
-    };
+    // SAFETY: cs_kobj_ptr holds the CSpaceKernelObject just constructed in
+    // place, exclusively owned.
+    let cs_kobj = unsafe { &*cs_kobj_ptr };
+    // SAFETY: memory_obj_nn is a live MemoryObject on which the inc_ref above
+    // holds the pool's reference; offset/init_pages from a successful retype
+    // against `memory`, whose base is memory_base; no lock is held.
+    let res =
+        unsafe { cs_kobj.add_donation(memory_obj_nn, memory_base, offset, init_pages, pool_pages) };
     if res.is_err()
     {
-        // SAFETY: wrapper/cs not observed externally yet.
-        unsafe {
-            core::ptr::drop_in_place(cs_kobj_ptr);
-            core::ptr::drop_in_place(cs_ptr);
-        }
+        // SAFETY: the wrapper was constructed in place above and is not
+        // observed externally yet.
+        unsafe { core::ptr::drop_in_place(cs_kobj_ptr) };
+        // SAFETY: the CSpace was constructed in place above and is not
+        // observed externally yet; the wrapper's raw `cspace` pointer field
+        // does not drop it.
+        unsafe { core::ptr::drop_in_place(cs_ptr) };
         crate::cap::unregister_cspace(id);
         crate::cap::free_cspace_id(id);
         // SAFETY: this call's own `retype_allocate` return, holding no live
@@ -934,16 +972,23 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: cs_kobj_ptr is in-place at offset 0; header at offset 0.
     let nonnull = unsafe { NonNull::new_unchecked(cs_kobj_ptr.cast::<KernelObjectHeader>()) };
 
-    // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
+    // SAFETY: cspace is the running thread's bound CSpace, validated non-null
+    // above.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the
+    // insert.
     let insert_res = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle_typed(
+        (*cspace).insert_cap_handle_typed(
             CsRights::INSERT | CsRights::DELETE | CsRights::DERIVE,
             nonnull,
-        );
-        (*cspace).lock.unlock_raw(saved);
-        r
+        )
     };
+    // SAFETY: cspace is live (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let idx = match insert_res
     {
         Ok(idx) => idx,
@@ -959,13 +1004,13 @@ pub fn sys_cap_create_cspace(tf: UserFrame) -> Result<u64, SyscallError>
             // when the source memory itself was dec_ref'd to zero.
             crate::cap::unregister_cspace(id);
             crate::cap::free_cspace_id(id);
-            // SAFETY: wrapper/cs not observed externally (no slot in any
-            // CSpace points at `nonnull`, and we just removed the registry
-            // entry).
-            unsafe {
-                core::ptr::drop_in_place(cs_kobj_ptr);
-                core::ptr::drop_in_place(cs_ptr);
-            }
+            // SAFETY: the wrapper was constructed in place above and is not
+            // observed externally (no slot in any CSpace points at `nonnull`).
+            unsafe { core::ptr::drop_in_place(cs_kobj_ptr) };
+            // SAFETY: the CSpace was constructed in place above and is not
+            // observed externally (we just removed the registry entry); the
+            // wrapper's raw `cspace` pointer field does not drop it.
+            unsafe { core::ptr::drop_in_place(cs_ptr) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (dropped above) and no longer reachable: its registry
             // entry is removed above.
@@ -1214,11 +1259,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
 
     let ancestor = memory_obj_nn;
 
-    // SAFETY: pointers are inside the freshly-allocated retype slot.
-    // Both the wrapper and the TCB land on page 5 of the slot, so they
-    // are 8-byte aligned (page-aligned, in fact). The kstack pages are
-    // painted above (`stack_depth::paint`), and `kstack_top` excludes the
-    // wrapper page.
+    // SAFETY: tcb_ptr is inside the freshly-allocated retype slot, exclusively
+    // owned here. The wrapper and the TCB land on page 5 of the slot, so they
+    // are 8-byte aligned. The kstack pages are painted above
+    // (`stack_depth::paint`), and `kstack_top` excludes the wrapper page.
     unsafe {
         core::ptr::write(
             tcb_ptr,
@@ -1291,6 +1335,11 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 magic: crate::sched::thread::TCB_MAGIC,
             },
         );
+    }
+    // SAFETY: thread_obj_ptr is the start of the slot's wrapper page (page 5),
+    // page-aligned, inside the freshly-allocated retype slot and exclusively
+    // owned here.
+    unsafe {
         core::ptr::write(
             thread_obj_ptr,
             ThreadObject {
@@ -1299,11 +1348,13 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
                 deferred_next: core::ptr::null_mut(),
             },
         );
-        // Register before the cap becomes visible: the TCB already names its
-        // CSpace and AddressSpace, and the teardown of either must find it
-        // (`sched::stop_threads_bound_to`). The rollback arm unregisters.
-        crate::sched::thread_registry::register(tcb_ptr);
     }
+    // Register before the cap becomes visible: the TCB already names its
+    // CSpace and AddressSpace, and the teardown of either must find it
+    // (`sched::stop_threads_bound_to`). The rollback arm unregisters.
+    // SAFETY: tcb_ptr holds the TCB just constructed above, which is not yet
+    // on the registry.
+    unsafe { crate::sched::thread_registry::register(tcb_ptr) };
 
     // SAFETY: ancestor is the MemoryObject's header at offset 0; this lease
     // bump is undone on rollback below or when the Thread cap is dealloc'd.
@@ -1323,25 +1374,35 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // names any more; any teardown starting now finds this thread in the walk
     // (docs/capability-model.md § "Kill process" pattern;
     // core/kernel/docs/scheduling-internals.md § Thread Registry).
-    // SAFETY: caller_cspace validated non-null above.
-    let bound = unsafe {
-        super::lookup_cap(caller_cspace, as_idx, AsRights::MAP).is_ok_and(|s| s.object == as_object)
-            && super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT)
-                .is_ok_and(|s| s.object == cs_object)
+    // SAFETY: caller_cspace is the running thread's bound CSpace, validated
+    // non-null above; no lock is held.
+    let as_bound = unsafe { super::lookup_cap(caller_cspace, as_idx, AsRights::MAP) }
+        .is_ok_and(|s| s.object == as_object);
+    let bound = as_bound && {
+        // SAFETY: as for the lookup above.
+        let cs_pin = unsafe { super::lookup_cap(caller_cspace, cs_idx, CsRights::INSERT) };
+        cs_pin.is_ok_and(|s| s.object == cs_object)
     };
     let idx_res: Result<u64, SyscallError> = if bound
     {
-        // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
-        unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            let r = (*caller_cspace).insert_cap_handle_typed(
+        // SAFETY: caller_cspace is the running thread's bound CSpace,
+        // validated non-null above.
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: lock_raw pairs with the unlock_raw below.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: caller_cspace is live (as above), and its held lock
+        // serialises the insert.
+        let r = unsafe {
+            (*caller_cspace).insert_cap_handle_typed(
                 ThreadRights::CONTROL | ThreadRights::OBSERVE | ThreadRights::UPCALL,
                 nonnull,
-            );
-            (*caller_cspace).lock.unlock_raw(saved);
-            r
-        }
-        .map_err(SyscallError::from)
+            )
+        };
+        // SAFETY: caller_cspace is live (as above).
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
+        r.map_err(SyscallError::from)
     }
     else
     {
@@ -1364,21 +1425,24 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
             // here), drop both in-place objects, return the slot bytes (the
             // whole slot, entry.raw_bytes) to the ancestor cap, and undo the
             // lease bump.
-            // SAFETY: tcb and wrapper were just constructed in place above;
-            // the registry is the only structure that has observed the TCB.
-            unsafe {
-                crate::sched::thread_registry::unregister(tcb_ptr);
-                core::ptr::drop_in_place(tcb_ptr);
-                core::ptr::drop_in_place(thread_obj_ptr);
-            }
-            // SAFETY: the guard was holed above and nothing runs on the
-            // stack; then this call's own `retype_allocate` return, holding
-            // no live object (dropped above) and no longer reachable: its
-            // registry entry is removed above.
-            unsafe {
-                crate::mm::stack_guard::close(block_phys);
-                retype_free(memory, offset, entry.raw_bytes);
-            }
+            // SAFETY: tcb_ptr holds the TCB constructed in place above, which
+            // nothing frees concurrently: the registry is the only structure
+            // that has observed it.
+            unsafe { crate::sched::thread_registry::unregister(tcb_ptr) };
+            // SAFETY: the TCB was constructed in place above and, unlinked
+            // from the registry, is observed by nothing.
+            unsafe { core::ptr::drop_in_place(tcb_ptr) };
+            // SAFETY: the wrapper was constructed in place above and is
+            // observed by nothing; its raw `tcb` pointer field does not drop
+            // the TCB again.
+            unsafe { core::ptr::drop_in_place(thread_obj_ptr) };
+            // SAFETY: no lock is held; the guard was holed above, nothing runs
+            // on the stack, and it is not holed again before this returns.
+            unsafe { crate::mm::stack_guard::close(block_phys) };
+            // SAFETY: this call's own `retype_allocate` return, holding no live
+            // object (dropped above) and no longer reachable: its registry
+            // entry is removed above.
+            unsafe { retype_free(memory, offset, entry.raw_bytes) };
             // SAFETY: matches the inc_ref above.
             unsafe { ancestor.as_ref().dec_ref() };
             Err(e)
@@ -1415,35 +1479,45 @@ fn pre_grow_for_explicit_slot(
     const PAGE: u64 = crate::mm::PAGE_SIZE as u64;
     loop
     {
-        // SAFETY: cs_ptr validated by the caller; lock_raw/unlock_raw paired.
-        let step = unsafe {
-            let saved = (*cs_ptr).lock.lock_raw();
-            let needed = (*cs_ptr).pages_to_cover(index);
-            let r = if needed == 0
+        // SAFETY: cs_ptr validated by the caller.
+        let lock = unsafe { &(*cs_ptr).lock };
+        // SAFETY: lock_raw pairs with the unlock_raw below.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: cs_ptr is live (as above), and its held lock serialises the
+        // directory read.
+        let needed = unsafe { (*cs_ptr).pages_to_cover(index) };
+        let step = if needed == 0
+        {
+            Ok(true)
+        }
+        else
+        {
+            // SAFETY: cs_ptr is live (as above), and its held lock serialises
+            // the read of its wrapper pointer.
+            let budget_pages = unsafe { (*cs_ptr).kobj_ptr() }.map_or(0, |k| {
+                // SAFETY: k is the wrapper whose page holds this live CSpace,
+                // so it lives as long as the CSpace; the budget is atomic.
+                let budget = unsafe { (*k).cspace_growth_budget_bytes.load(Ordering::Acquire) };
+                budget / PAGE
+            });
+            if budget_pages < needed
             {
-                Ok(true)
+                // Route through the canonical CapError mapping: the
+                // shortfall is refillable pool exhaustion.
+                Err(crate::cap::cspace::CapError::PoolExhausted.into())
             }
             else
             {
-                let budget_pages = (*cs_ptr).kobj_ptr().map_or(0, |k| {
-                    (*k).cspace_growth_budget_bytes.load(Ordering::Acquire) / PAGE
-                });
-                if budget_pages < needed
-                {
-                    // Route through the canonical CapError mapping: the
-                    // shortfall is refillable pool exhaustion.
-                    Err(crate::cap::cspace::CapError::PoolExhausted.into())
-                }
-                else
-                {
-                    (*cs_ptr)
-                        .grow_toward(index, MAX_GROW_LEAVES_PER_HOLD)
-                        .map_err(SyscallError::from)
-                }
-            };
-            (*cs_ptr).lock.unlock_raw(saved);
-            r
+                // SAFETY: cs_ptr is live (as above), and its held lock
+                // serialises the growth of its directory.
+                unsafe { (*cs_ptr).grow_toward(index, MAX_GROW_LEAVES_PER_HOLD) }
+                    .map_err(SyscallError::from)
+            }
         };
+        // SAFETY: cs_ptr is live (as above).
+        let lock = unsafe { &(*cs_ptr).lock };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
         match step
         {
             Ok(true) => return Ok(()),
@@ -1476,6 +1550,14 @@ fn pre_grow_for_explicit_slot(
 /// well-known slots in child `CSpaces` this way.
 ///
 /// Returns the new capability's handle in the destination `CSpace`.
+// too_many_lines: one ordered pass (resolve, pre-grow, pin, reference,
+// revalidate, insert, link) whose steps share the pins and the lock holds;
+// the destination lock's acquire and release take two statements each, one
+// unsafe operation per block (docs/coding-standards.md § Unsafe Code).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one ordered pass whose steps share the pins and the lock holds"
+)]
 #[cfg(not(test))]
 pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1602,9 +1684,18 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { release_src_ref(new_object) };
         return Err(e);
     }
-    // SAFETY: dest_cs_ptr validated above; lock_raw/unlock_raw paired.
+    // SAFETY: dest_cs_ptr is the live CSpace of the wrapper `dest_cs_slot`
+    // pins.
+    let lock = unsafe { &(*dest_cs_ptr).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to the destination CSpace, whose held lock serialises its slots"
+    )]
+    // SAFETY: dest_cs_ptr is live (as above), and its held lock serialises
+    // the insert, the badge write, and the handle read.
     let insert_res = unsafe {
-        let saved = (*dest_cs_ptr).lock.lock_raw();
         let r: Result<u32, crate::cap::cspace::CapError> = if dest_slot_idx == 0
         {
             (*dest_cs_ptr)
@@ -1627,14 +1718,15 @@ pub fn sys_cap_copy(tf: UserFrame) -> Result<u64, SyscallError>
         }
         // The index is non-zero: auto-allocation returns a non-zero slot and
         // the explicit path used a non-zero dest_slot_idx.
-        let r = r
-            .and_then(|idx| {
-                core::num::NonZeroU32::new(idx).ok_or(crate::cap::cspace::CapError::InvalidIndex)
-            })
-            .map(|nz| (nz, (*dest_cs_ptr).cap_handle(nz)));
-        (*dest_cs_ptr).lock.unlock_raw(saved);
-        r
+        r.and_then(|idx| {
+            core::num::NonZeroU32::new(idx).ok_or(crate::cap::cspace::CapError::InvalidIndex)
+        })
+        .map(|nz| (nz, (*dest_cs_ptr).cap_handle(nz)))
     };
+    // SAFETY: dest_cs_ptr is live (as above).
+    let lock = unsafe { &(*dest_cs_ptr).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let (new_idx_nz, new_handle) = match insert_res
     {
         Ok(v) => v,
@@ -1745,9 +1837,18 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { release_src_ref(new_object) };
         return Err(e);
     }
-    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+    // SAFETY: caller_cspace is the running thread's bound CSpace, validated
+    // non-null above.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to the caller's CSpace, whose held lock serialises its slots"
+    )]
+    // SAFETY: caller_cspace is live (as above), and its held lock serialises
+    // the insert, the badge write, and the handle read.
     let insert_res = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace).insert_cap(src_tag, effective_rights, new_object);
         if let Ok(idx) = r
             && src_badge != 0
@@ -1755,10 +1856,12 @@ pub fn sys_cap_derive(tf: UserFrame) -> Result<u64, SyscallError>
         {
             new_slot.badge = src_badge;
         }
-        let r = r.map(|idx| (idx, (*caller_cspace).cap_handle(idx)));
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
+        r.map(|idx| (idx, (*caller_cspace).cap_handle(idx)))
     };
+    // SAFETY: caller_cspace is live (as above).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let (new_idx_nz, new_handle) = match insert_res
     {
         Ok(v) => v,
@@ -1882,19 +1985,30 @@ pub fn sys_cap_derive_badge(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { release_src_ref(new_object) };
         return Err(e);
     }
-    // SAFETY: caller_cspace validated non-null above; lock_raw/unlock_raw paired.
+    // SAFETY: caller_cspace is the running thread's bound CSpace, validated
+    // non-null above.
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to the caller's CSpace, whose held lock serialises its slots"
+    )]
+    // SAFETY: caller_cspace is live (as above), and its held lock serialises
+    // the insert, the badge write, and the handle read.
     let insert_res = unsafe {
-        let saved = (*caller_cspace).lock.lock_raw();
         let r = (*caller_cspace).insert_cap(src_tag, effective_rights, new_object);
         if let Ok(idx) = r
             && let Some(new_slot) = (*caller_cspace).slot_mut(idx.get())
         {
             new_slot.badge = badge_value;
         }
-        let r = r.map(|idx| (idx, (*caller_cspace).cap_handle(idx)));
-        (*caller_cspace).lock.unlock_raw(saved);
-        r
+        r.map(|idx| (idx, (*caller_cspace).cap_handle(idx)))
     };
+    // SAFETY: caller_cspace is live (as above).
+    let lock = unsafe { &(*caller_cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
     let (new_idx_nz, new_handle) = match insert_res
     {
         Ok(v) => v,
@@ -1934,14 +2048,14 @@ fn log_self_cap_delete_refused(tcb: *mut crate::sched::thread::ThreadControlBloc
     {
         return;
     }
-    // SAFETY: tcb is the live caller; trap_frame is its in-flight syscall frame.
-    let (tid, tf) = unsafe {
-        (
-            (*tcb).thread_id,
-            (*tcb)
-                .trap_frame
-                .load(core::sync::atomic::Ordering::Relaxed),
-        )
+    // SAFETY: tcb is the live caller's TCB.
+    let tid = unsafe { (*tcb).thread_id };
+    // SAFETY: tcb is the live caller's TCB; trap_frame is its in-flight
+    // syscall frame.
+    let tf = unsafe {
+        (*tcb)
+            .trap_frame
+            .load(core::sync::atomic::Ordering::Relaxed)
     };
     if tf.is_null()
     {
@@ -2107,14 +2221,14 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
         // would tear the running thread down mid-syscall. Refuse here, before the
         // dec-ref/dealloc; the cap stays and is reclaimed normally when a different
         // thread later releases it. Logged once so the userspace site is symbolisable.
-        // SAFETY: obj_ptr is a live KernelObjectHeader (slot confirmed live above);
-        // tcb is the validated caller.
-        if unsafe {
-            (*obj_ptr.as_ptr()).obj_type == crate::cap::object::ObjectType::Thread
-                && core::ptr::eq(
-                    (*obj_ptr.as_ptr().cast::<crate::cap::object::ThreadObject>()).tcb,
-                    tcb,
-                )
+        // SAFETY: obj_ptr is a live KernelObjectHeader (slot confirmed live above).
+        let obj_type = unsafe { (*obj_ptr.as_ptr()).obj_type };
+        if obj_type == crate::cap::object::ObjectType::Thread && {
+            // SAFETY: obj_ptr is live (as above) and its type is Thread, so it
+            // heads a ThreadObject.
+            let obj_tcb =
+                unsafe { (*obj_ptr.as_ptr().cast::<crate::cap::object::ThreadObject>()).tcb };
+            core::ptr::eq(obj_tcb, tcb)
         }
         {
             log_self_cap_delete_refused(tcb, slot_idx);
@@ -2145,15 +2259,22 @@ pub fn sys_cap_delete(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: DERIVATION_LOCK held; node is a valid SlotId.
         unsafe { crate::cap::derivation::unlink_node(node) };
 
-        // SAFETY: caller_cspace validated; slot confirmed live above. Take the
-        // cspace lock strictly inside DERIVATION_LOCK so the freelist mutation
-        // cannot tear against a concurrent SYS_CAP_CREATE_* on the same cspace.
-        // Lock order per `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy.
-        unsafe {
-            let saved = (*caller_cspace).lock.lock_raw();
-            (*caller_cspace).free_slot(slot_idx);
-            (*caller_cspace).lock.unlock_raw(saved);
-        }
+        // Take the cspace lock strictly inside DERIVATION_LOCK so the freelist
+        // mutation cannot tear against a concurrent SYS_CAP_CREATE_* on the
+        // same cspace. Lock order per
+        // `core/kernel/docs/scheduling-internals.md` § Lock Hierarchy.
+        // SAFETY: caller_cspace is the running thread's bound CSpace, validated
+        // non-null above.
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: lock_raw pairs with the unlock_raw below.
+        let saved = unsafe { lock.lock_raw() };
+        // SAFETY: caller_cspace is live (as above); its held lock serialises
+        // the freelist mutation, and the slot was confirmed live above.
+        unsafe { (*caller_cspace).free_slot(slot_idx) };
+        // SAFETY: caller_cspace is live (as above).
+        let lock = unsafe { &(*caller_cspace).lock };
+        // SAFETY: paired with the lock_raw above.
+        unsafe { lock.unlock_raw(saved) };
 
         crate::cap::DERIVATION_LOCK.write_unlock();
         break obj_ptr;
@@ -2648,14 +2769,28 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
 
     let ancestor = memory_obj_nn;
 
-    // SAFETY: pointers are inside the freshly-allocated retype slot.
     // The ring lives inline; zero it first since retype memory is not
     // guaranteed clean (bump path returns uninitialised bytes; free-list
     // reuse may also return stale contents).
+    // SAFETY: ring_ptr points at the `ring_len` entries of the ring inside
+    // the freshly-allocated retype slot, exclusively owned by this call.
+    unsafe { core::ptr::write_bytes(ring_ptr, 0, ring_len) };
+    // SAFETY: ring_ptr is 8-byte aligned and points at the `capacity + 1`
+    // entries zeroed above, inside the retype slot, which outlives the state.
+    let eq_state = unsafe { EventQueueState::new(capacity, ring_ptr) };
+    // SAFETY: eq_state_ptr is inside the freshly-allocated retype slot,
+    // aligned for EventQueueState and exclusively owned by this call.
+    unsafe { core::ptr::write(eq_state_ptr, eq_state) };
+    // SAFETY: eq_state_ptr holds the state written above, and no other path
+    // can reach it yet.
+    let eq_state = unsafe { &mut *eq_state_ptr };
+    // SAFETY: called once, before the queue is reachable by any other path;
+    // nodes_ptr points at the `observers` nodes inside this queue's retype
+    // slot, and eq_obj_ptr is the object that wraps this state.
+    unsafe { eq_state.init_observer_pool(nodes_ptr, observers, eq_obj_ptr) };
+    // SAFETY: eq_obj_ptr is the start of the freshly-allocated retype slot,
+    // aligned for EventQueueObject and exclusively owned by this call.
     unsafe {
-        core::ptr::write_bytes(ring_ptr, 0, ring_len);
-        core::ptr::write(eq_state_ptr, EventQueueState::new(capacity, ring_ptr));
-        (*eq_state_ptr).init_observer_pool(nodes_ptr, observers, eq_obj_ptr);
         core::ptr::write(
             eq_obj_ptr,
             EventQueueObject {
@@ -2671,13 +2806,19 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: header at offset 0 of EventQueueObject.
     let nonnull = unsafe { NonNull::new_unchecked(eq_obj_ptr.cast::<KernelObjectHeader>()) };
 
-    // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
-    let idx_res = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle_typed(EqRights::POST | EqRights::RECV, nonnull);
-        (*cspace).lock.unlock_raw(saved);
-        r
-    };
+    // SAFETY: cspace is the running thread's bound CSpace, validated non-null
+    // above.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the
+    // insert.
+    let idx_res =
+        unsafe { (*cspace).insert_cap_handle_typed(EqRights::POST | EqRights::RECV, nonnull) };
+    // SAFETY: cspace is live (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
 
     match idx_res
     {
@@ -2688,12 +2829,13 @@ pub fn sys_cap_create_event_queue(tf: UserFrame) -> Result<u64, SyscallError>
             // back-pointer can exist. Drop the in-place state and wrapper,
             // return the slot bytes (which include the inline ring) to the
             // ancestor cap, and undo the lease bump.
-            // SAFETY: state and wrapper were just constructed in place above
-            // and have not been observed by any other thread.
-            unsafe {
-                core::ptr::drop_in_place(eq_state_ptr);
-                core::ptr::drop_in_place(eq_obj_ptr);
-            }
+            // SAFETY: the state was just constructed in place above and has
+            // not been observed by any other thread.
+            unsafe { core::ptr::drop_in_place(eq_state_ptr) };
+            // SAFETY: the wrapper was just constructed in place above and has
+            // not been observed by any other thread; its raw `state` pointer
+            // field does not drop the state dropped above.
+            unsafe { core::ptr::drop_in_place(eq_obj_ptr) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (none placed yet, or dropped above) and published nowhere.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -2769,13 +2911,17 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
 
     let ancestor = memory_obj_nn;
 
-    // SAFETY: pointers are inside the freshly-allocated retype slot, sized for
-    // `capacity` members and the ring by `wait_set_dispatch`.
+    // SAFETY: capacity is in range (checked by `wait_set_capacity` above);
+    // members_ptr and ring_ptr are inside the freshly-allocated retype slot,
+    // sized for `capacity` members and the ring by `wait_set_dispatch`,
+    // unaliased, and outliving the state.
+    let ws_state = unsafe { WaitSetState::new(capacity, members_ptr, ring_ptr) };
+    // SAFETY: ws_state_ptr is inside the freshly-allocated retype slot,
+    // aligned for WaitSetState and exclusively owned by this call.
+    unsafe { core::ptr::write(ws_state_ptr, ws_state) };
+    // SAFETY: ws_obj_ptr is the start of the freshly-allocated retype slot,
+    // aligned for WaitSetObject and exclusively owned by this call.
     unsafe {
-        core::ptr::write(
-            ws_state_ptr,
-            WaitSetState::new(capacity, members_ptr, ring_ptr),
-        );
         core::ptr::write(
             ws_obj_ptr,
             WaitSetObject {
@@ -2791,13 +2937,19 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: header at offset 0 of WaitSetObject.
     let nonnull = unsafe { NonNull::new_unchecked(ws_obj_ptr.cast::<KernelObjectHeader>()) };
 
-    // SAFETY: cspace validated non-null above; lock_raw/unlock_raw paired.
-    let idx_res = unsafe {
-        let saved = (*cspace).lock.lock_raw();
-        let r = (*cspace).insert_cap_handle_typed(WsRights::MODIFY | WsRights::WAIT, nonnull);
-        (*cspace).lock.unlock_raw(saved);
-        r
-    };
+    // SAFETY: cspace is the running thread's bound CSpace, validated non-null
+    // above.
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: lock_raw pairs with the unlock_raw below.
+    let saved = unsafe { lock.lock_raw() };
+    // SAFETY: cspace is live (as above), and its held lock serialises the
+    // insert.
+    let idx_res =
+        unsafe { (*cspace).insert_cap_handle_typed(WsRights::MODIFY | WsRights::WAIT, nonnull) };
+    // SAFETY: cspace is live (as above).
+    let lock = unsafe { &(*cspace).lock };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { lock.unlock_raw(saved) };
 
     match idx_res
     {
@@ -2805,11 +2957,13 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
         Err(e) =>
         {
             // Roll back: nothing else has observed these constructed objects.
-            // SAFETY: pointers are unique-ownership for this caller.
-            unsafe {
-                core::ptr::drop_in_place(ws_obj_ptr);
-                core::ptr::drop_in_place(ws_state_ptr);
-            }
+            // SAFETY: the wrapper was constructed in place above and is
+            // uniquely owned by this caller.
+            unsafe { core::ptr::drop_in_place(ws_obj_ptr) };
+            // SAFETY: the state was constructed in place above and is uniquely
+            // owned by this caller; the wrapper's raw `state` pointer field
+            // did not drop it.
+            unsafe { core::ptr::drop_in_place(ws_state_ptr) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (none placed yet, or dropped above) and published nowhere.
             unsafe { retype_free(memory, offset, entry.raw_bytes) };
@@ -2927,20 +3081,24 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             let index = syscall::cap_handle_index(slot_handle);
             let generation = syscall::cap_handle_gen(slot_handle);
             // SAFETY: caller_cspace is the running thread's bound CSpace, live
-            // for the call; lock_raw and unlock_raw are paired, and nothing
-            // between them takes another lock. `header` is the object the pin
-            // holds live.
-            let count = unsafe {
-                let saved = (*caller_cspace).lock.lock_raw();
-                let held = (*caller_cspace).slot(index).is_some_and(|s| {
-                    s.tag != CapTag::Null
-                        && s.generation() == generation
-                        && s.object == Some(header)
-                });
-                let count = held.then(|| header.as_ref().ref_count.load(Ordering::Acquire));
-                (*caller_cspace).lock.unlock_raw(saved);
-                count
-            };
+            // for the call.
+            let lock = unsafe { &(*caller_cspace).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below, and nothing
+            // between them takes another lock.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: caller_cspace is live (as above), and its held lock
+            // serialises the slot read.
+            let held = unsafe { (*caller_cspace).slot(index) }.is_some_and(|s| {
+                s.tag != CapTag::Null && s.generation() == generation && s.object == Some(header)
+            });
+            let count = held.then(|| {
+                // SAFETY: `header` is the object the pin holds live.
+                unsafe { header.as_ref() }.ref_count.load(Ordering::Acquire)
+            });
+            // SAFETY: caller_cspace is live (as above).
+            let lock = unsafe { &(*caller_cspace).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
             let count = count.ok_or(SyscallError::InvalidCapability)?;
             Ok(u64::from(count == 2))
         }
@@ -3074,7 +3232,9 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // SAFETY: target_tcb is the TCB of the Thread object `slot` pins
             // for the call, so a sibling's concurrent delete of the last Thread
             // cap cannot free it before this read.
-            let (state, exit_reason) = unsafe { ((*target_tcb).state, (*target_tcb).exit_reason) };
+            let state = unsafe { (*target_tcb).state };
+            // SAFETY: target_tcb is live (as above).
+            let exit_reason = unsafe { (*target_tcb).exit_reason };
             // SAFETY: paired with lock_raw above.
             unsafe { sched.lock.unlock_raw(saved) };
             let state_code = match state
@@ -3215,15 +3375,19 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // lock, so grows landing between the two reads skew the sum;
             // the value is advisory and the same triggers tolerate the
             // skew.
-            // SAFETY: cs_obj.cspace validated non-null; allocated_slots is
-            // mutated only under the CSpace lock, taken here; lock_raw /
-            // unlock_raw paired.
-            let allocated = unsafe {
-                let saved = (*target).lock.lock_raw();
-                let a = (*target).allocated_slots();
-                (*target).lock.unlock_raw(saved);
-                a
-            } as u64;
+            // SAFETY: cs_obj.cspace validated non-null; the pinned wrapper
+            // keeps the CSpace live.
+            let lock = unsafe { &(*target).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: target is live (as above); allocated_slots is mutated
+            // only under the CSpace lock, held here.
+            let allocated = unsafe { (*target).allocated_slots() };
+            // SAFETY: target is live (as above).
+            let lock = unsafe { &(*target).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
+            let allocated = allocated as u64;
             let budget = cs_obj.cspace_growth_budget_bytes.load(Ordering::Acquire);
             // Saturating, as the clamp to REACHABLE below makes exact.
             let backed = (budget / PAGE)
@@ -3247,15 +3411,19 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             {
                 return Err(SyscallError::InvalidCapability);
             }
-            // SAFETY: cs_obj.cspace validated non-null; the two usize fields
+            // SAFETY: cs_obj.cspace validated non-null; the pinned wrapper
+            // keeps the CSpace live.
+            let lock = unsafe { &(*target).lock };
+            // SAFETY: lock_raw pairs with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: target is live (as above); the two usize fields
             // populated_count derives from are mutated only under the CSpace
-            // lock, taken here; lock_raw / unlock_raw paired.
-            let used = unsafe {
-                let saved = (*target).lock.lock_raw();
-                let u = (*target).populated_count();
-                (*target).lock.unlock_raw(saved);
-                u
-            };
+            // lock, held here.
+            let used = unsafe { (*target).populated_count() };
+            // SAFETY: target is live (as above).
+            let lock = unsafe { &(*target).lock };
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
             Ok(used as u64)
         }
         CAP_INFO_CSPACE_BUDGET =>

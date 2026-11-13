@@ -15,6 +15,7 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 /// Page size of the mappings pwrmgr makes of a table's region.
 const PAGE_SIZE: u64 = 0x1000;

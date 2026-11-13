@@ -31,6 +31,8 @@
 //! (v0.0.1): no pipes/redirection, quoting/escaping, variable expansion,
 //! globbing, or job control.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::io::{BufRead, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};

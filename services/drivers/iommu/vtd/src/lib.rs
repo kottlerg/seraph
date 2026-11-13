@@ -14,6 +14,8 @@
 //! remapping table's entries ([`remap`]).
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 extern crate alloc;
 
 pub mod queue;

@@ -20,6 +20,9 @@
 //! waiters share: [`claim_waiter`], [`arm_timed_park`], and
 //! [`interrupt_all_waiters`].
 
+// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+#![warn(clippy::multiple_unsafe_ops_per_block)]
+
 use crate::sched::thread::ThreadControlBlock;
 
 /// FIFO of the threads parked on a notification, event queue, or wait set: a
@@ -64,6 +67,11 @@ impl WaitQueue
     /// `tcb` is a valid TCB on no wait queue; the source lock is held.
     pub unsafe fn push(&mut self, tcb: *mut ThreadControlBlock)
     {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to the wait-queue links or tag of tcb or of a TCB on this \
+                      queue, which the held source lock serialises"
+        )]
         // SAFETY: tcb valid per contract; tail, if set, and its successor (the
         // head) are live queued TCBs under the held lock.
         unsafe {
@@ -106,12 +114,12 @@ impl WaitQueue
         {
             return core::ptr::null_mut();
         }
-        // SAFETY: tail and its successor (the head) are live queued TCBs.
-        unsafe {
-            let head = (*self.tail).ipc_wait_next.unwrap_or_default();
-            self.unlink(head);
-            head
-        }
+        // SAFETY: tail is a live queued TCB under the held lock.
+        let head = unsafe { (*self.tail).ipc_wait_next.unwrap_or_default() };
+        // SAFETY: head, the tail's successor, is on this queue; the lock is
+        // held (contract).
+        unsafe { self.unlink(head) };
+        head
     }
 
     /// Whether `tcb` is on this queue. Reads only `tcb`'s tag.
@@ -167,6 +175,11 @@ impl WaitQueue
     /// `tcb` is on this queue; the source lock is held.
     unsafe fn unlink(&mut self, tcb: *mut ThreadControlBlock)
     {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to the wait-queue links or tag of tcb or of a TCB on this \
+                      queue, which the held source lock serialises"
+        )]
         // SAFETY: tcb and its neighbours are live queued TCBs under the lock.
         unsafe {
             let next = (*tcb).ipc_wait_next.unwrap_or_default();
@@ -213,9 +226,13 @@ pub(crate) unsafe fn claim_waiter(tcb: *mut ThreadControlBlock, value: u64)
         (*tcb)
             .wake_in_flight
             .store(1, core::sync::atomic::Ordering::Release);
-        (*tcb).wakeup_value = value;
-        cancel_timed_entry(tcb);
     }
+    // SAFETY: tcb is valid and claimed per the caller contract, so this
+    // claimant is the only writer of wakeup_value.
+    unsafe { (*tcb).wakeup_value = value };
+    // SAFETY: tcb's park episode was just claimed and has not woken; no
+    // sleep-list lock is held (the source lock is not one).
+    unsafe { cancel_timed_entry(tcb) };
 }
 
 /// Remove the sleep-list entry of a timed park whose episode the caller just
@@ -231,17 +248,19 @@ pub(crate) unsafe fn claim_waiter(tcb: *mut ThreadControlBlock, value: u64)
 #[cfg(not(test))]
 pub(crate) unsafe fn cancel_timed_entry(tcb: *mut ThreadControlBlock)
 {
-    // SAFETY: tcb is valid per the caller contract; SLEEP_LIST_LOCK is a leaf.
-    unsafe {
-        // Acquire: a 0 the timer pop stored (Release) orders its snapshot of
-        // the binding before the caller's later writes to it.
-        if (*tcb)
+    // Acquire: a 0 the timer pop stored (Release) orders its snapshot of the
+    // binding before the caller's later writes to it.
+    // SAFETY: tcb is valid per the caller contract.
+    let deadline = unsafe {
+        (*tcb)
             .sleep_deadline
             .load(core::sync::atomic::Ordering::Acquire)
-            != 0
-        {
-            crate::sched::sleep_list_remove(tcb);
-        }
+    };
+    if deadline != 0
+    {
+        // SAFETY: tcb is live, kept so by the caller's claim; SLEEP_LIST_LOCK
+        // is a leaf and not held (contract).
+        unsafe { crate::sched::sleep_list_remove(tcb) };
     }
 }
 
@@ -259,12 +278,14 @@ pub(crate) unsafe fn cancel_timed_entry(tcb: *mut ThreadControlBlock)
 pub(crate) unsafe fn arm_timed_park(tcb: *mut ThreadControlBlock, deadline: u64, wait: &str)
 {
     // SAFETY: tcb is the running caller per the contract.
-    let added = unsafe {
+    unsafe {
         (*tcb)
             .sleep_deadline
             .store(deadline, core::sync::atomic::Ordering::Relaxed);
-        crate::sched::sleep_list_add(tcb)
-    };
+    }
+    // SAFETY: tcb is the running parker's own live TCB; no sleep-list lock is
+    // held (contract).
+    let added = unsafe { crate::sched::sleep_list_add(tcb) };
     // Every canceller clears the deadline only after claiming the waiter under
     // the source lock, which the caller holds with tcb still queued.
     debug_assert!(
@@ -292,18 +313,23 @@ pub(crate) unsafe fn interrupt_all_waiters(queue: &mut WaitQueue)
         {
             return;
         }
-        // SAFETY: tcb was just popped under the source lock, which is its
-        // episode claim; the lock order source → sched_lock → run-queue lock
-        // allows the wake here.
+        // SAFETY: tcb was just popped under the held source lock, which is its
+        // episode claim.
+        unsafe { claim_waiter(tcb, 0) };
+        // SAFETY: the pop under the source lock is the episode's exclusive
+        // claim, and this is its one stamp.
         unsafe {
-            claim_waiter(tcb, 0);
             crate::sched::thread::stamp_park_deposit(
                 tcb,
                 crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
             );
-            let cpu = crate::sched::select_target_cpu(tcb);
-            crate::sched::enqueue_and_wake(tcb, cpu);
         }
+        // SAFETY: tcb is a valid TCB, pinned by the claim's wake_in_flight.
+        let cpu = unsafe { crate::sched::select_target_cpu(tcb) };
+        // SAFETY: tcb is valid and claimed, cpu came from select_target_cpu,
+        // and the lock order source → sched_lock → run-queue lock allows the
+        // wake here.
+        unsafe { crate::sched::enqueue_and_wake(tcb, cpu) };
     }
 }
 
@@ -329,12 +355,18 @@ impl BoundSource
     /// `self` came from [`lock_bound_source`], and both locks are still held.
     pub(crate) unsafe fn unlock(self)
     {
-        // SAFETY: both locks are held (caller contract); each unlock_raw is
-        // paired with the acquisition in lock_bound_source.
-        unsafe {
-            (*self.source_lock).unlock_raw(self.source_saved);
-            (*self.tcb).sched_lock.unlock_raw(self.sched_saved);
-        }
+        // SAFETY: source_lock is the lock of a source that is not freed while
+        // tcb's sched_lock is held, and both are held (caller contract).
+        let source_lock = unsafe { &*self.source_lock };
+        // SAFETY: the source lock is held; paired with the try_lock_raw in
+        // lock_bound_source.
+        unsafe { source_lock.unlock_raw(self.source_saved) };
+        // SAFETY: tcb is a valid TCB whose sched_lock is held (caller
+        // contract).
+        let sched_lock = unsafe { &(*self.tcb).sched_lock };
+        // SAFETY: sched_lock is held; paired with the lock_raw in
+        // lock_bound_source.
+        unsafe { sched_lock.unlock_raw(self.sched_saved) };
     }
 }
 
@@ -394,9 +426,16 @@ pub(crate) unsafe fn lock_bound_source(
     }
     loop
     {
-        // SAFETY: tcb is valid (contract); lock_raw is paired with an
-        // unlock_raw on every path, or handed to the returned BoundSource.
-        let sched_saved = unsafe { (*tcb).sched_lock.lock_raw() };
+        // SAFETY: tcb is valid (contract).
+        let sched_lock = unsafe { &(*tcb).sched_lock };
+        // SAFETY: lock_raw is paired with an unlock_raw on every path, or
+        // handed to the returned BoundSource.
+        let sched_saved = unsafe { sched_lock.lock_raw() };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a park-binding field of tcb, which the held sched_lock \
+                      serialises"
+        )]
         // SAFETY: the binding pair and park_seq are read under sched_lock,
         // which serialises their writers.
         let bound = unsafe {
@@ -420,11 +459,14 @@ pub(crate) unsafe fn lock_bound_source(
         else
         {
             // SAFETY: paired with the lock_raw above.
-            unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+            unsafe { sched_lock.unlock_raw(sched_saved) };
             return None;
         };
         // SAFETY: source_lock is the live source's lock (bound, above).
-        if let Some(source_saved) = unsafe { (*source_lock).try_lock_raw() }
+        let source_lock_ref = unsafe { &*source_lock };
+        // SAFETY: on Some, the saved flags go to the returned BoundSource,
+        // whose unlock passes them to unlock_raw.
+        if let Some(source_saved) = unsafe { source_lock_ref.try_lock_raw() }
         {
             return Some(BoundSource {
                 source_lock,
@@ -436,7 +478,7 @@ pub(crate) unsafe fn lock_bound_source(
         // Contended: back off with neither lock held, so a holder of the
         // source lock that needs this thread's sched_lock can finish.
         // SAFETY: paired with the lock_raw above.
-        unsafe { (*tcb).sched_lock.unlock_raw(sched_saved) };
+        unsafe { sched_lock.unlock_raw(sched_saved) };
         // A backoff, not a bound: the enclosing loop retries until it locks.
         for _ in 0..64
         {
@@ -462,6 +504,11 @@ pub(crate) unsafe fn source_lock_of(
 {
     use crate::sched::thread::IpcThreadState;
 
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every operation projects to the lock field of the state blocked_on points at, \
+                  whose type ipc_state names by the contract"
+    )]
     // SAFETY: blocked_on points at a live state of the named type (contract),
     // so each field projection stays in bounds of that allocation.
     unsafe {
@@ -498,16 +545,128 @@ mod tests
     use super::WaitQueue;
     use crate::sched::thread::ThreadControlBlock;
 
-    fn make_tcb() -> Box<ThreadControlBlock>
+    /// The TCBs and wait queues of one test, used only on the test's thread.
+    /// Each TCB is a heap allocation whose pointer is taken once, from
+    /// `Box::into_raw`, and freed only when the fixture drops, so every TCB a
+    /// queue links stays valid and no reference to it is formed while a queue
+    /// holds its pointer. A queue's address is stored in its TCBs' tags but
+    /// only compared, never dereferenced, so the queues are held by value.
+    /// With no other thread, every operation runs as under its source lock.
+    /// The methods name TCBs and queues by index.
+    struct Fixture
+    {
+        tcbs: Vec<*mut ThreadControlBlock>,
+        queues: Vec<WaitQueue>,
+    }
+
+    impl Fixture
+    {
+        fn new(tcbs: usize, queues: usize) -> Self
+        {
+            Self {
+                tcbs: (0..tcbs)
+                    .map(|_| Box::into_raw(Box::new(make_tcb())))
+                    .collect(),
+                queues: (0..queues).map(|_| WaitQueue::new()).collect(),
+            }
+        }
+
+        fn tcb(&self, t: usize) -> *mut ThreadControlBlock
+        {
+            self.tcbs[t]
+        }
+
+        /// The index of the TCB `p` points at, or `None` for null.
+        fn index_of(&self, p: *mut ThreadControlBlock) -> Option<usize>
+        {
+            if p.is_null()
+            {
+                return None;
+            }
+            let i = self.tcbs.iter().position(|&t| core::ptr::eq(t, p));
+            assert!(
+                i.is_some(),
+                "a queue returned a TCB the fixture does not own"
+            );
+            i
+        }
+
+        fn push(&mut self, q: usize, t: usize)
+        {
+            assert!(self.unlinked(t), "TCB {t} is already queued");
+            let tcb = self.tcb(t);
+            // SAFETY: tcb is a live TCB of the fixture, on no queue (asserted
+            // above).
+            unsafe { self.queues[q].push(tcb) };
+        }
+
+        fn pop(&mut self, q: usize) -> Option<usize>
+        {
+            // SAFETY: every TCB the queue links is a live TCB of the fixture.
+            let head = unsafe { self.queues[q].pop() };
+            self.index_of(head)
+        }
+
+        fn contains(&self, q: usize, t: usize) -> bool
+        {
+            let tcb = self.tcb(t);
+            // SAFETY: tcb is a live TCB of the fixture.
+            unsafe { self.queues[q].contains(tcb) }
+        }
+
+        fn remove(&mut self, q: usize, t: usize) -> bool
+        {
+            let tcb = self.tcb(t);
+            // SAFETY: tcb is a live TCB of the fixture.
+            unsafe { self.queues[q].remove(tcb) }
+        }
+
+        fn remove_if(
+            &mut self,
+            q: usize,
+            t: usize,
+            keep_claim: impl FnOnce(*mut ThreadControlBlock) -> bool,
+        ) -> bool
+        {
+            let tcb = self.tcb(t);
+            // SAFETY: tcb is a live TCB of the fixture.
+            unsafe { self.queues[q].remove_if(tcb, keep_claim) }
+        }
+
+        fn is_empty(&self, q: usize) -> bool
+        {
+            self.queues[q].is_empty()
+        }
+
+        fn unlinked(&self, t: usize) -> bool
+        {
+            let tcb = self.tcb(t);
+            // SAFETY: tcb is a live TCB of the fixture, and no queue operation
+            // runs while the shared reference lives.
+            unlinked(unsafe { &*tcb })
+        }
+    }
+
+    impl Drop for Fixture
+    {
+        fn drop(&mut self)
+        {
+            for &tcb in &self.tcbs
+            {
+                // SAFETY: tcb came from Box::into_raw in Fixture::new and is
+                // freed only here, once; the queues, dropped after it, have no
+                // destructor and never read a TCB again.
+
+                drop(unsafe { Box::from_raw(tcb) });
+            }
+        }
+    }
+
+    fn make_tcb() -> ThreadControlBlock
     {
         // SAFETY: an all-zero TCB is a valid inert value for queue-link tests
         // (`ipc_wait_next` reads as None, the prev link and tag as null).
-        Box::new(unsafe { core::mem::zeroed() })
-    }
-
-    fn ptr(t: &mut Box<ThreadControlBlock>) -> *mut ThreadControlBlock
-    {
-        &raw mut **t
+        unsafe { core::mem::zeroed() }
     }
 
     fn unlinked(t: &ThreadControlBlock) -> bool
@@ -522,22 +681,17 @@ mod tests
     #[test]
     fn pops_in_push_order()
     {
-        let (mut a, mut b, mut c) = (make_tcb(), make_tcb(), make_tcb());
-        let (pa, pb, pc) = (ptr(&mut a), ptr(&mut b), ptr(&mut c));
-        let mut q = WaitQueue::new();
-        assert!(q.is_empty());
-        // SAFETY: single-threaded test; every TCB outlives the queue.
-        unsafe {
-            q.push(pa);
-            q.push(pb);
-            q.push(pc);
-            assert_eq!(q.pop(), pa);
-            assert_eq!(q.pop(), pb);
-            assert_eq!(q.pop(), pc);
-            assert!(q.pop().is_null());
-        }
-        assert!(q.is_empty());
-        assert!(unlinked(&a) && unlinked(&b) && unlinked(&c));
+        let mut f = Fixture::new(3, 1);
+        assert!(f.is_empty(0));
+        f.push(0, 0);
+        f.push(0, 1);
+        f.push(0, 2);
+        assert_eq!(f.pop(0), Some(0));
+        assert_eq!(f.pop(0), Some(1));
+        assert_eq!(f.pop(0), Some(2));
+        assert_eq!(f.pop(0), None);
+        assert!(f.is_empty(0));
+        assert!(f.unlinked(0) && f.unlinked(1) && f.unlinked(2));
     }
 
     #[test]
@@ -545,122 +699,90 @@ mod tests
     {
         for victim in 0..3
         {
-            let mut t = [make_tcb(), make_tcb(), make_tcb()];
-            let p: Vec<_> = t.iter_mut().map(ptr).collect();
-            let mut q = WaitQueue::new();
-            // SAFETY: single-threaded test; every TCB outlives the queue.
-            unsafe {
-                for &x in &p
-                {
-                    q.push(x);
-                }
-                assert!(q.remove(p[victim]));
-                assert!(!q.contains(p[victim]));
-                assert!(unlinked(&*p[victim]));
-                for (i, &x) in p.iter().enumerate()
-                {
-                    if i != victim
-                    {
-                        assert_eq!(q.pop(), x, "order after removing index {victim}");
-                    }
-                }
-                assert!(q.is_empty());
+            let mut f = Fixture::new(3, 1);
+            for t in 0..3
+            {
+                f.push(0, t);
             }
+            assert!(f.remove(0, victim));
+            assert!(!f.contains(0, victim));
+            assert!(f.unlinked(victim));
+            for t in (0..3).filter(|&t| t != victim)
+            {
+                assert_eq!(f.pop(0), Some(t), "order after removing index {victim}");
+            }
+            assert!(f.is_empty(0));
         }
     }
 
     #[test]
     fn removing_the_only_waiter_empties_the_queue()
     {
-        let mut a = make_tcb();
-        let pa = ptr(&mut a);
-        let mut q = WaitQueue::new();
-        // SAFETY: single-threaded test; the TCB outlives the queue.
-        unsafe {
-            q.push(pa);
-            assert!(q.contains(pa));
-            assert!(q.remove(pa));
-            assert!(q.is_empty());
-            assert!(q.pop().is_null());
-        }
-        assert!(unlinked(&a));
+        let mut f = Fixture::new(1, 1);
+        f.push(0, 0);
+        assert!(f.contains(0, 0));
+        assert!(f.remove(0, 0));
+        assert!(f.is_empty(0));
+        assert_eq!(f.pop(0), None);
+        assert!(f.unlinked(0));
     }
 
     #[test]
     fn remove_and_contains_of_a_stranger()
     {
-        let (mut a, mut b) = (make_tcb(), make_tcb());
-        let (pa, pb) = (ptr(&mut a), ptr(&mut b));
-        let mut q = WaitQueue::new();
-        // SAFETY: single-threaded test; every TCB outlives the queue.
-        unsafe {
-            assert!(!q.remove(pa));
-            assert!(!q.contains(pa));
-            q.push(pa);
-            assert!(!q.remove(pb));
-            assert!(!q.contains(pb));
-            assert!(q.contains(pa));
-            assert_eq!(q.pop(), pa);
-        }
+        let mut f = Fixture::new(2, 1);
+        assert!(!f.remove(0, 0));
+        assert!(!f.contains(0, 0));
+        f.push(0, 0);
+        assert!(!f.remove(0, 1));
+        assert!(!f.contains(0, 1));
+        assert!(f.contains(0, 0));
+        assert_eq!(f.pop(0), Some(0));
     }
 
     #[test]
     fn another_queues_waiter_is_left_alone()
     {
-        let (mut a, mut b) = (make_tcb(), make_tcb());
-        let (pa, pb) = (ptr(&mut a), ptr(&mut b));
-        let (mut q1, mut q2) = (WaitQueue::new(), WaitQueue::new());
-        // SAFETY: single-threaded test; every TCB outlives the queues.
-        unsafe {
-            q1.push(pa);
-            q2.push(pb);
-            assert!(!q1.contains(pb) && !q2.contains(pa));
-            assert!(!q1.remove(pb));
-            assert!(q2.contains(pb));
-            assert_eq!(q2.pop(), pb);
-            assert!(!q2.contains(pb));
-            assert_eq!(q1.pop(), pa);
-        }
+        let mut f = Fixture::new(2, 2);
+        f.push(0, 0);
+        f.push(1, 1);
+        assert!(!f.contains(0, 1) && !f.contains(1, 0));
+        assert!(!f.remove(0, 1));
+        assert!(f.contains(1, 1));
+        assert_eq!(f.pop(1), Some(1));
+        assert!(!f.contains(1, 1));
+        assert_eq!(f.pop(0), Some(0));
     }
 
     #[test]
     fn remove_if_keeps_a_rejected_claim()
     {
-        let (mut a, mut b) = (make_tcb(), make_tcb());
-        let (pa, pb) = (ptr(&mut a), ptr(&mut b));
-        let mut q = WaitQueue::new();
-        // SAFETY: single-threaded test; every TCB outlives the queue.
-        unsafe {
-            q.push(pa);
-            q.push(pb);
-            assert!(!q.remove_if(pb, |_| false));
-            assert!(q.contains(pb));
-            assert!(q.remove_if(pb, |t| core::ptr::eq(t, pb)));
-            assert_eq!(q.pop(), pa);
-            assert!(q.is_empty());
-        }
+        let mut f = Fixture::new(2, 1);
+        let b = f.tcb(1);
+        f.push(0, 0);
+        f.push(0, 1);
+        assert!(!f.remove_if(0, 1, |_| false));
+        assert!(f.contains(0, 1));
+        assert!(f.remove_if(0, 1, |t| core::ptr::eq(t, b)));
+        assert_eq!(f.pop(0), Some(0));
+        assert!(f.is_empty(0));
     }
 
     #[test]
     fn push_after_removals_keeps_order()
     {
-        let mut t = [make_tcb(), make_tcb(), make_tcb(), make_tcb()];
-        let p: Vec<_> = t.iter_mut().map(ptr).collect();
-        let mut q = WaitQueue::new();
-        // SAFETY: single-threaded test; every TCB outlives the queue.
-        unsafe {
-            q.push(p[0]);
-            q.push(p[1]);
-            q.push(p[2]);
-            assert!(q.remove(p[2]));
-            q.push(p[3]);
-            assert!(q.remove(p[0]));
-            q.push(p[2]);
-            for &x in &[p[1], p[3], p[2]]
-            {
-                assert_eq!(q.pop(), x);
-            }
-            assert!(q.is_empty());
+        let mut f = Fixture::new(4, 1);
+        f.push(0, 0);
+        f.push(0, 1);
+        f.push(0, 2);
+        assert!(f.remove(0, 2));
+        f.push(0, 3);
+        assert!(f.remove(0, 0));
+        f.push(0, 2);
+        for t in [1, 3, 2]
+        {
+            assert_eq!(f.pop(0), Some(t));
         }
+        assert!(f.is_empty(0));
     }
 }

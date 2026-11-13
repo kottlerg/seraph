@@ -54,8 +54,15 @@ pub enum BootError
     /// No RISC-V paging mode the kernel supports passed the satp write-probe.
     /// Sv39 is the platform minimum (docs/platform-requirements.md), so this
     /// only fires on hardware below the RVA23 baseline. Constructed only by
-    /// the riscv64 negotiation path; x86-64 builds never produce it.
-    #[allow(dead_code)]
+    /// the riscv64 negotiation path.
+    #[cfg_attr(
+        all(target_arch = "x86_64", not(test)),
+        expect(
+            dead_code,
+            reason = "only the riscv64 paging negotiation constructs it; the x86-64 build has no \
+                      constructor, and the host tests construct every variant"
+        )
+    )]
     PagingModeUnsupported,
 
     /// The final map's buffer could hold more descriptors than the entry array

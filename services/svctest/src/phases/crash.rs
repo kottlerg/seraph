@@ -173,8 +173,10 @@ fn crashme(mode: &str) -> std::process::Child
 }
 
 /// Check that `child` died of a fault.
-// cast_sign_loss: exit reasons are non-negative; the cast preserves them.
-#[allow(clippy::cast_sign_loss)]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "exit reasons are non-negative; the cast preserves them"
+)]
 fn expect_fault_death(mut child: std::process::Child, what: &str)
 {
     let status = child.wait().expect("crash_endpoint: waiting for crashme");

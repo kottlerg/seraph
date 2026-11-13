@@ -125,10 +125,12 @@ static RACER_ARGS: spawn::ArgBlock<RacerArgs, 2> =
 const STOPPER_ARG: usize = 0;
 const STARTER_ARG: usize = 1;
 
-// too_many_lines: one stress cell's setup, cycle loop, and teardown; the three
-// child starts' `unsafe` wrappers push it past the limit, and splitting would
-// thread each cycle's caps and stacks through helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one stress cell's setup, cycle loop, and teardown; the three child starts' `unsafe` \
+              wrappers push it past the limit, and splitting would thread each cycle's caps and \
+              stacks through helpers"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)

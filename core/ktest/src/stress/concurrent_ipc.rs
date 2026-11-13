@@ -109,10 +109,11 @@ pub fn run(ctx: &TestContext) -> TestResult
             let msg = unsafe { ipc::ipc_recv(ep, ctx.ipc_buf) }
                 .map_err(|_| "concurrent_ipc: ipc_recv failed")?;
             let idx = msg.label;
-            // cast_possible_truncation: usize is 64 bits on every ktest target
-            // (x86_64, riscv64), so the u64 label widens losslessly; the range
-            // check follows.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 \
+                          label widens losslessly; the range check follows"
+            )]
             let idx_us = idx as usize;
             if idx_us > NUM_CALLERS
             {
@@ -185,8 +186,10 @@ extern "C" fn caller_entry(arg: u64) -> !
     } = unsafe { spawn::child_args(arg) };
     let done_bit = 1u64 << bit_index;
 
-    // cast_possible_truncation: `bit_index` is below `NUM_CALLERS`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`bit_index` is below `NUM_CALLERS`"
+    )]
     let page = bit_index as usize;
     let Ok(buf_addr) = crate::IpcPage::addr_at(core::ptr::addr_of_mut!(CALLER_IPC_PAGES), page)
     else

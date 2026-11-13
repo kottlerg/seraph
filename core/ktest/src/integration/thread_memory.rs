@@ -280,9 +280,11 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u6
     .map_err(|_| "integration::thread_memory: B data mem_map failed")?;
     for (i, addr) in (KT_DATA..KT_DATA + 2 * PAGE).enumerate()
     {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the pattern keeps the low byte on purpose"
+        )]
         // SAFETY: KT_DATA..+2 pages is mapped writable just above.
-        // cast_possible_truncation: the pattern keeps the low byte on purpose.
-        #[allow(clippy::cast_possible_truncation)]
         unsafe {
             (addr as *mut u8).write_volatile(i as u8 ^ 0x5A);
         };
@@ -359,8 +361,10 @@ fn data_copies(th: u64) -> TestResult
     }
     for (i, byte) in got.iter().enumerate()
     {
-        // cast_possible_truncation: the pattern keeps the low byte on purpose.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the pattern keeps the low byte on purpose"
+        )]
         let want = (PAGE - 100)
             .checked_add(i as u64)
             .ok_or("integration::thread_memory: pattern offset overflows")?

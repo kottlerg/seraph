@@ -761,8 +761,14 @@ pub unsafe fn allocate_pages(bs: *mut EfiBootServices, count: usize) -> Result<u
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-// Used only by the x86-64 `arch::current` allocation hooks; dead on riscv64.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "riscv64",
+    expect(
+        dead_code,
+        reason = "only the x86-64 `arch::current` allocation hooks call it, so riscv64 has no \
+                  caller"
+    )
+)]
 pub unsafe fn allocate_pages_max_addr(
     bs: *mut EfiBootServices,
     max_phys: u64,
@@ -787,8 +793,14 @@ pub unsafe fn allocate_pages_max_addr(
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-// Used only by the x86-64 LA57 toggle installation; dead on riscv64.
-#[allow(dead_code)]
+#[cfg_attr(
+    any(target_arch = "riscv64", test),
+    expect(
+        dead_code,
+        reason = "only the x86-64 LA57 toggle installation calls it, so riscv64 has no caller, \
+                  and host tests compile that installation with no caller"
+    )
+)]
 pub unsafe fn allocate_code_pages_max_addr(
     bs: *mut EfiBootServices,
     max_phys: u64,
@@ -804,8 +816,13 @@ pub unsafe fn allocate_code_pages_max_addr(
 ///
 /// # Safety
 /// `bs` must be valid boot services.
-// Reached only through the x86-64 max-address wrappers; dead on riscv64.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "riscv64",
+    expect(
+        dead_code,
+        reason = "only the x86-64 max-address wrappers call it, so riscv64 has no caller"
+    )
+)]
 unsafe fn allocate_typed_max_addr(
     bs: *mut EfiBootServices,
     memory_type: u32,
@@ -994,9 +1011,6 @@ pub unsafe fn get_memory_map(bs: *mut EfiBootServices) -> Result<MemoryMapResult
     // is readable.
     let get_memory_map_fn = unsafe { (*bs).get_memory_map };
     // SAFETY: buffer_phys is a valid allocated region of map_size bytes.
-    // cast_possible_truncation: buffer_phys is a UEFI physical address; on all supported
-    // targets (x86_64, riscv64) usize is 64-bit, so the cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
     let status = unsafe {
         get_memory_map_fn(
             core::ptr::addr_of_mut!(map_size),
@@ -1093,9 +1107,6 @@ pub unsafe fn exit_boot_services(
         // entry is readable.
         let get_memory_map_fn = unsafe { (*bs).get_memory_map };
         // SAFETY: buffer_phys is the existing allocated buffer of buffer_size bytes.
-        // cast_possible_truncation: buffer_phys is a UEFI u64 address; usize is 64-bit on all
-        // supported targets, so the cast to *mut is exact.
-        #[allow(clippy::cast_possible_truncation)]
         let status = unsafe {
             get_memory_map_fn(
                 core::ptr::addr_of_mut!(map_size),

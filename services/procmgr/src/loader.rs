@@ -202,10 +202,18 @@ pub fn derive_memory_for_prot(memory_cap: u64, prot: u64) -> Option<u64>
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
 /// without checking what procmgr holds there.
-// too_many_lines: one transaction owning the scratch span, the per-page cap
-// set, and the child mappings; splitting would thread the guard state through
-// helpers that all need the same aspace + cap context.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the segment's placement (first page, page count, protection, RELRO range), the two \
+              address spaces, the child's memmgr account, the IPC buffer and the fill callback are \
+              each a distinct input"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one transaction owning the scratch span, the per-page cap set, and the child \
+              mappings; splitting would thread the guard state through helpers that all need the \
+              same aspace + cap context"
+)]
 pub(crate) unsafe fn load_elf_segment_into_child(
     first_page_vaddr: u64,
     num_pages: u64,

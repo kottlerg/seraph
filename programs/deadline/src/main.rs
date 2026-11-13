@@ -18,10 +18,13 @@
 //!
 //! Driven by its per-program tester (`tester/`), which `usertest` runs.
 
-// A test fixture, where unwrap and expect are permitted
-// (docs/coding-standards.md § Error Handling): a failed step must abort the
-// fixture, and the panic's non-zero exit is its FAIL verdict for the tester.
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "a test fixture, where unwrap and expect are permitted (docs/coding-standards.md § \
+              Error Handling): a failed step must abort the fixture, and the panic's non-zero exit \
+              is its FAIL verdict for the tester"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -92,9 +95,11 @@ fn main()
             std::os::seraph::thread::current_thread_cap(),
             Ordering::Release,
         );
-        // infinite_loop: the worker spins until the process exits, and a
-        // `thread::spawn` closure returns a value type, not `!`.
-        #[expect(clippy::infinite_loop)]
+        #[expect(
+            clippy::infinite_loop,
+            reason = "the worker spins until the process exits, and a `thread::spawn` closure \
+                      returns a value type, not `!`"
+        )]
         loop
         {
             SPINS.fetch_add(1, Ordering::Relaxed);

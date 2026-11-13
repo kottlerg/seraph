@@ -782,6 +782,10 @@ fn exit_status_rc(status: std::process::ExitStatus) -> i32
 const RC_SIGSEGV: i32 = 128 + 11;
 const RC_SIGABRT: i32 = 128 + 6;
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`hung` is whether the watchdog killed the run, an outcome the function classifies"
+)]
 fn classify(
     exit_rc: i32,
     hung: bool,

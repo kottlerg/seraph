@@ -26,26 +26,6 @@
 //! own threads. So a `SYS_THREAD_WRITE_MEM` of the stub's writes another
 //! address space, which its `# Safety` contract does not constrain.
 
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(
-    clippy::fn_params_excessive_bools,
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
-
 mod arch;
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -1053,6 +1033,10 @@ impl Stub
         }
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`ok` is the outcome the reply reports"
+    )]
     fn reply_ok(&mut self, ok: bool, ipc_buf: *mut u64)
     {
         if ok

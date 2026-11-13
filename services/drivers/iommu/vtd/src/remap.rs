@@ -34,6 +34,10 @@ const IRTA_EIME: u64 = 1 << 11;
 /// 32-bit destination field (extended interrupt mode); without it the 8-bit
 /// xAPIC ID sits in bits 15:8 of the field.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`extended` is the IRTA EIME mode, which defines the destination field's format"
+)]
 pub const fn entry(entry: RemapEntry, extended: bool) -> [u64; 2]
 {
     let destination = if extended
@@ -56,6 +60,10 @@ pub const fn entry(entry: RemapEntry, extended: bool) -> [u64; 2]
 /// the size field (bits 3:0) holds `log2(entries) - 1`, and `extended` sets
 /// extended interrupt mode.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`extended` is the IRTA EIME bit the function encodes"
+)]
 pub const fn irta(base: u64, entries: u32, extended: bool) -> u64
 {
     let eime = if extended { IRTA_EIME } else { 0 };

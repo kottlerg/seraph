@@ -1276,6 +1276,10 @@ fn given_messages(outcome: Result<(), NotGiven>) -> Result<bool, Widened>
 
 /// The failure of a message-signaled step after its targets were minted,
 /// `widened` telling whether the minting mapped an interrupt file.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`widened` is the minting outcome the result reports"
+)]
 fn not_given(widened: bool) -> NotGiven
 {
     if widened
@@ -2199,6 +2203,11 @@ impl FunctionConfig
     /// one that does not, Interrupt Disable clear for a driver given the
     /// wired line (`wired`) and set for one that is not. Returns whether the
     /// configuration page could be mapped.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`dma` and `wired` are the Command register's Bus Master Enable and Interrupt \
+                  Disable values"
+    )]
     fn prepare_for_bind(&self, dma: bool, wired: bool) -> bool
     {
         self.mapped("bind", |va| {

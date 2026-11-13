@@ -70,6 +70,10 @@ pub struct BootstrapRound
 /// Each field is 8 bits, which holds the base labels, `MSG_CAP_SLOTS_MAX`
 /// and `MSG_DATA_WORDS_MAX`, so the widths bound no round.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the reply label's terminal bit, encoded as `DONE` or `MORE`"
+)]
 pub const fn pack_reply_label(done: bool, cap_count: usize, data_words: usize) -> u64
 {
     let base = if done { DONE } else { MORE };
@@ -487,6 +491,10 @@ fn delete_slots(caps: &[u64])
     reason = "the message builder, its copies and the built `msg` (an `IpcMessage`, 568 B each); \
               on its caller's stack, 16 KiB at the smallest (init's)"
 )]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's terminal flag, sent in the reply label"
+)]
 pub unsafe fn reply_round(
     done: bool,
     cap_slots: &[u64],
@@ -539,6 +547,10 @@ pub unsafe fn reply_error(code: u64, ipc_buf: *mut u64) -> Result<(), i64>
 /// # Errors
 /// * `Err(bootstrap_errors::NO_CHILD)` — unexpected badge.
 /// * `Err(bootstrap_errors::INVALID)` — protocol error.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`done` is the round's terminal flag, sent in the reply label"
+)]
 pub unsafe fn serve_round(
     bootstrap_ep: u64,
     expected_badge: u64,

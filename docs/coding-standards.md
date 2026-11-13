@@ -35,33 +35,38 @@ The following individual lints are additionally mandatory:
 - `clippy::unwrap_used`
 - `clippy::expect_used`
 - `clippy::undocumented_unsafe_blocks`
-- From `clippy::restriction`: `arithmetic_side_effects`, `as_pointer_underscore`, `as_underscore`,
+- From `clippy::restriction`: `allow_attributes`, `allow_attributes_without_reason`,
+  `arithmetic_side_effects`, `as_pointer_underscore`, `as_underscore`,
   `assertions_on_result_states`, `dbg_macro`, `default_union_representation`,
   `empty_enum_variants_with_brackets`, `empty_structs_with_brackets`, `fn_to_numeric_cast_any`,
   `get_unwrap`, `indexing_slicing`, `infinite_loop`, `inline_asm_x86_att_syntax`,
-  `iter_over_hash_type`, `mem_forget`, `mixed_read_write_in_expression`, `pointer_format`,
+  `iter_over_hash_type`, `mem_forget`, `mixed_read_write_in_expression`,
+  `multiple_unsafe_ops_per_block`, `panic`, `panic_in_result_fn`, `pointer_format`,
   `precedence_bits`, `pub_without_shorthand`, `renamed_function_params`,
   `rest_pat_in_fully_bound_structs`, `self_named_module_files`, `separated_literal_suffix`,
-  `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`, `try_err`, `unimplemented`,
-  `unnecessary_rest_pattern`, `unnecessary_safety_comment`, `unnecessary_safety_doc`,
-  `unnecessary_self_imports`, and `unneeded_field_pattern`.
+  `string_slice`, `suspicious_xor_used_as_pow`, `tests_outside_test_module`, `todo`, `try_err`,
+  `unimplemented`, `unnecessary_rest_pattern`, `unnecessary_safety_comment`,
+  `unnecessary_safety_doc`, `unnecessary_self_imports`, `unneeded_field_pattern`, `unreachable`,
+  `unwrap_in_result`, and `wildcard_enum_match_arm`.
 - From `clippy::nursery`: `as_ptr_cast_mut`, `collection_is_never_read`,
-  `debug_assert_with_mut_call`, `fallible_impl_from`, `literal_string_with_formatting_args`,
-  `non_send_fields_in_send_ty`, `read_zero_byte_vec`, `significant_drop_in_scrutinee`,
-  `trailing_empty_array`, `transmute_undefined_repr`, and `uninhabited_references`.
+  `debug_assert_with_mut_call`, `fallible_impl_from`, `large_stack_frames`,
+  `literal_string_with_formatting_args`, `non_send_fields_in_send_ty`, `read_zero_byte_vec`,
+  `significant_drop_in_scrutinee`, `significant_drop_tightening`, `trailing_empty_array`,
+  `transmute_undefined_repr`, `uninhabited_references`, and `volatile_composites`.
 
 `pub_without_shorthand` keeps the `pub(crate)` form, `self_named_module_files` the
 `mod.rs` form of a module with children, `separated_literal_suffix` the unseparated
 literal suffix (`0u8`), and `tests_outside_test_module` every test in the `#[cfg(test)]` module of
 § D Form.
 
-Each of the lints below, those listed above and those the staged roll-out below is making
-mandatory, checks a rule this document states, and a site the rule permits carries an item-level
+Each of the lints below, those listed above and `fn_params_excessive_bools` of `clippy::pedantic`,
+checks a rule this document states, and a site the rule permits carries an item-level
 `#[expect(<lint>, reason = "...")]` (§ E) whose reason gives what the rule asks of it. The rules of
 `panic`, `unreachable`, `unwrap_in_result` and `panic_in_result_fn` are in § Error Handling, of
-`fn_params_excessive_bools` in § Function Design, of `non_send_fields_in_send_ty` in
-§ Concurrency, of `pointer_format` in § Cross-Boundary Data Hygiene, and of
-`inline_asm_x86_att_syntax` in § C. The others:
+`fn_params_excessive_bools` in § Function Design, of `multiple_unsafe_ops_per_block` in
+§ Unsafe Code, of `allow_attributes` and `allow_attributes_without_reason` in § E, of
+`non_send_fields_in_send_ty` in § Concurrency, of `pointer_format` in § Cross-Boundary Data
+Hygiene, and of `inline_asm_x86_att_syntax` in § C. The others:
 
 - `wildcard_enum_match_arm`: a match on an enum the tree defines names every variant it handles,
   the variants of a shared arm included, so that adding a variant fails the build at every match
@@ -82,71 +87,39 @@ mandatory, checks a rule this document states, and a site the rule permits carri
   `#[expect]` naming the large local, its size, and the stack that holds it.
 
 `cargo xtask build` runs Clippy with all warnings treated as errors. Code that does not pass this
-configuration is non-compliant. Configuration lives in `[workspace.lints]` in the root
-`Cargo.toml`; all member crates opt in via `[lints] workspace = true`. A crate-root or module-root
-lint level MUST NOT enable a Clippy lint, except as a staged roll-out below permits: a Clippy lint
-the project enforces is enforced in `[workspace.lints]`, for every crate.
+configuration is non-compliant. Lint levels live in `[workspace.lints]` in the root `Cargo.toml`,
+and all member crates opt in via `[lints] workspace = true`; lint settings live in `clippy.toml`
+(below). A crate-root or module-root lint level MUST NOT enable a Clippy lint: a Clippy lint the
+project enforces is enforced in `[workspace.lints]`, for every crate.
 
-`clippy::multiple_unsafe_ops_per_block` is being made mandatory by a staged roll-out. A crate whose
-sites are fixed enables it at its crate root, `#![warn(clippy::multiple_unsafe_ops_per_block)]`,
-which the build's warnings-as-errors makes binding for that crate. `core/kernel` is taken by
-subsystem: the same inner attribute at the root module of a subsystem
-(`core/kernel/src/<subsystem>/mod.rs`) binds that subsystem until every subsystem is fixed and the
-line moves to the kernel's crate root. The crates are taken in this order: `core/boot`,
-`core/kernel` by subsystem, the `abi/`, `shared/` and `runtime/` crates, the userspace services,
-drivers and programs, and the harness and host crates. The roll-out ends by moving the lint to
-`[workspace.lints]` and removing every crate-root and module-root level for it; a crate-root or
-module-root level that enables it is permitted only until then. A site is fixed as § Unsafe Code
-says.
-
-`fn_params_excessive_bools`, `large_stack_frames`, `panic`, `panic_in_result_fn`,
-`significant_drop_tightening`, `string_slice`, `unreachable`, `unwrap_in_result`,
-`volatile_composites` and `wildcard_enum_match_arm` are being made mandatory by a staged roll-out
-taken the same way: a crate whose sites are fixed enables them at its crate root, and `core/kernel`
-at the root module of each subsystem whose sites are fixed, until the roll-out moves them to
-`[workspace.lints]` and removes every crate-root and module-root level for them. A site is fixed
-as the rule above that the lint checks says. Test code is exempt from `panic`,
-`panic_in_result_fn`, `string_slice`, `unreachable` and `unwrap_in_result`, so their level is
-`#![cfg_attr(not(test), warn(...))]`: a source-level level would override the test
-configuration's relaxation, to which the roll-out ends by adding them. Two of the lints take a
-setting from Clippy's configuration file, `clippy.toml`: `max-fn-params-bools = 0`, so that
-`fn_params_excessive_bools` reports every function with a `bool` parameter, and
-`stack-size-threshold`, the frame above which `large_stack_frames` reports. The threshold is a
-quarter of the smallest stack any of the crate's code runs on. The root `clippy.toml` sets 8192
-bytes, a quarter of the 32 KiB a process's main thread is given unless it declares its own stack
-(`DEFAULT_PROCESS_STACK_PAGES`, `abi/process-abi`): the stack a userspace crate's code can count
-on, since a `std` main thread's growth past it is not guaranteed. A crate whose smallest stack
-differs takes its threshold from a `clippy.toml` in its own directory, or in a directory above it
-whose crates all share that stack, and the file's comment names the stack: `core/boot` and
-`core/kernel`; the `abi/` and `shared/` crates and every other crate init links, which run on the
-16 KiB of a kernel stack or of init (`INIT_STACK_PAGES`); a service that declares a larger stack
-with `stack_pages!`; and the host crates under `xtask/`. A stack that a crate sizes for one entry
-function of its own, a test fixture, does not set the crate's threshold: the fixture's sizing
-answers for that function. Clippy reads only the nearest `clippy.toml`, searching upward from the
-crate's manifest directory, and merges none, so every other `clippy.toml` restates each setting
-of the root file, which a host test of `cargo xtask test` checks. `max-fn-params-bools` is set in
-the file of each crate whose sites are fixed, and the roll-out ends by adding it to the root file
-and to every file that restates it. Until then a site added in a crate or subsystem whose sites
-are fixed follows the same rule.
-
-`clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
-suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions
-are in that form enables both at its crate root,
-`#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]`. The crates are taken
-in this order: the `abi/`, `shared/` and `runtime/` crates, the userspace services, drivers and
-programs, the harness and host crates, `core/boot`, and `core/kernel`. The roll-out ends by moving
-both lints to `[workspace.lints]` and removing every crate-root level for them. Until then a crate
-without the line still carries `#[allow]` suppressions, and a suppression added or changed in it
-takes the § E form.
+Two of the lints take a setting from Clippy's configuration file, `clippy.toml`. The root
+`clippy.toml` sets `max-fn-params-bools = 0`, so that `fn_params_excessive_bools` reports every
+function with a `bool` parameter in every crate, and `stack-size-threshold`, the frame above which
+`large_stack_frames` reports. The threshold is a quarter of the smallest stack any of the crate's
+code runs on. The root `clippy.toml` sets 8192 bytes, a quarter of the 32 KiB a process's main
+thread is given unless it declares its own stack (`DEFAULT_PROCESS_STACK_PAGES`,
+`abi/process-abi`): the stack a userspace crate's code can count on, since a `std` main thread's
+growth past it is not guaranteed. A crate whose smallest stack differs takes its threshold from a
+`clippy.toml` in its own directory, or in a directory above it whose crates all share that stack,
+and the file's comment names the stack: `core/boot` and `core/kernel`; the `abi/` and `shared/`
+crates and every other crate init links, which run on the 16 KiB of a kernel stack or of init
+(`INIT_STACK_PAGES`); a service that declares a larger stack with `stack_pages!`; and the host
+crates under `xtask/`. A stack that a crate sizes for one entry function of its own, a test
+fixture, does not set the crate's threshold: the fixture's sizing answers for that function. Clippy
+reads only the nearest `clippy.toml`, searching upward from the crate's manifest directory, and
+merges none, so every other `clippy.toml` restates each setting of the root file,
+`max-fn-params-bools` with the root's value, which a host test of `cargo xtask test` checks.
 
 `cargo xtask test` runs Clippy over test code before it runs the tests: the test configuration
 (`cargo clippy --tests`) of every package it tests, once for each architecture's Linux target
 (`x86_64-unknown-linux-gnu` and `riscv64gc-unknown-linux-gnu`), so test code gated on either
 architecture is linted on any host, with all warnings treated as errors. Test code is held to the
-configuration above except for four lints, which that pass allows: `unwrap_used`, `expect_used`,
-`indexing_slicing` and `arithmetic_side_effects`. In a test, an unwrapped error, an out-of-range
-index and an overflow each fail the test, which is how a test reports a defect; the lints exist to
-keep those outcomes out of production code (§ Error Handling). The list `TEST_RELAXED_LINTS` in
+configuration above except for nine lints, which that pass allows: `unwrap_used`, `expect_used`,
+`unwrap_in_result`, `panic`, `unreachable`, `panic_in_result_fn`, `indexing_slicing`,
+`string_slice` and `arithmetic_side_effects`. In a test, an unwrapped error, an explicit panic, a
+panic in a function that returns `Result`, an out-of-range index, a slice off a character boundary
+and an overflow each fail the test, which is how a test reports a defect; the lints exist to keep
+those outcomes out of production code (§ Error Handling). The list `TEST_RELAXED_LINTS` in
 `xtask/src/commands/test.rs` is the one place the relaxation is stated, and a test does not
 suppress these lints at its own site. The pass sees the code outside the test modules too, as
 the test configuration compiles it; the build's pass lints that code without the relaxation.

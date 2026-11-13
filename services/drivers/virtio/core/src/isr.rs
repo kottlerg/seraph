@@ -60,6 +60,10 @@ pub struct IsrStep
 /// which is an interrupt no delivery reported: a lost edge on a line programmed
 /// edge-triggered, a lost wake on a level-triggered one.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`delivered` is the outcome of the wait, which the step records"
+)]
 pub const fn isr_step(delivered: bool, isr: u8) -> IsrStep
 {
     IsrStep {

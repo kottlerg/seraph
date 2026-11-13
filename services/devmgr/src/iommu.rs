@@ -302,6 +302,10 @@ impl IommuClient
     ///
     /// # Errors
     /// The driver's error label; remapping stays off.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`extended` is a word of the `REMAP_SETUP` message"
+    )]
     pub fn remap_setup(&self, entries: u64, extended: bool) -> Result<bool, u64>
     {
         let msg = Self::request(iommu_labels::REMAP_SETUP)
@@ -317,6 +321,10 @@ impl IommuClient
     ///
     /// # Errors
     /// The driver's error label; the entry is as it was.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`level` is a word of the `REMAP_SET` message"
+    )]
     pub fn remap_set(
         &self,
         handle: u16,

@@ -11,8 +11,6 @@
 //! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
 //! for the protocol.
 
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![expect(
     clippy::expect_used,
     reason = "usertest is a test harness: a broken invariant panics, and the run ends without its \

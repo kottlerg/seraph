@@ -3,6 +3,10 @@
 # file restates every setting of the root clippy.toml, with the frame
 # threshold of the stack init's code runs on.
 
+# Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
+# that is data carries an `#[expect]` naming the value.
+max-fn-params-bools = 0
+
 # 4096 bytes, a quarter of the 16 KiB init's main thread runs on
 # (INIT_STACK_PAGES, abi/init-protocol/src/lib.rs), as its log thread does
 # (LOG_THREAD_STACK_PAGES, services/init/src/logging.rs).

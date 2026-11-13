@@ -83,6 +83,11 @@ pub fn carve_io_ports(caps: &mut DevmgrCaps, base: u16, count: u16) -> Option<u6
 /// `line`, described with `mode`: for an ISA IRQ (`isa`), the GSI and mode
 /// the MADT's overrides route it to ([`firmware::acpi::isa_line`]); any other
 /// line is a GSI already.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`isa` is the resource descriptor's ISA flag, which marks the line as an ISA IRQ the \
+              MADT's overrides route"
+)]
 pub fn platform_line(irq_range: &IrqRangeAllocator, line: u32, mode: u64, isa: bool) -> (u32, u64)
 {
     match u8::try_from(line)

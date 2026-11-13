@@ -149,6 +149,11 @@ pub struct Grants
 /// (docs/driver-binding.md § Declaration Bounds). A drivers-directory driver
 /// runs at the auxiliary tier.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`iommu_record` is whether the bound record is an IOMMU record, compared to bound the \
+              physical-access grant"
+)]
 pub fn grants(decl: &DriverDecl, source: Source, iommu_record: bool) -> Grants
 {
     let boot = source == Source::BootModule;
@@ -394,6 +399,11 @@ mod tests
         decl_with(matches, limit, Tier::Auxiliary, false)
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`phys` is the declaration's `phys_access` field, stored in the declaration it \
+                  builds"
+    )]
     fn decl_with(matches: &[Match<'_>], limit: Option<u16>, tier: Tier, phys: bool) -> DriverDecl
     {
         decode(

@@ -87,6 +87,10 @@ const REPLY_MORE: u64 = 1 << 32;
 /// A reply label: `status` in bits 0-15, `count` in bits 16-31, `more` in
 /// bit 32.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`more` is the reply label's more-entries bit (bit 32)"
+)]
 pub const fn reply_label(status: u64, count: usize, more: bool) -> u64
 {
     (status & 0xFFFF) | (((count as u64) & 0xFFFF) << 16) | if more { REPLY_MORE } else { 0 }
@@ -321,6 +325,10 @@ impl SlotPage
 
     /// The reply: [`QUERY_OK`], the entries, and `more`.
     #[must_use]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`more` is the reply label's more-entries bit (bit 32)"
+    )]
     pub fn reply(&self, more: bool) -> IpcMessage
     {
         // `count <= SLOTS_PAGE`, so the entries' words fit `words`.
@@ -448,6 +456,10 @@ impl HistoryPage
 
     /// The reply: [`QUERY_OK`], the entries, and `more`.
     #[must_use]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`more` is the reply label's more-entries bit (bit 32)"
+    )]
     pub fn reply(&self, more: bool) -> IpcMessage
     {
         IpcMessage::builder(reply_label(QUERY_OK, self.count, more))

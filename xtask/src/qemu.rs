@@ -570,6 +570,11 @@ fn host_cpu_has_la57() -> bool
 /// QEMU drops a requested `la57=on` the host lacks with a warning only, so
 /// the guest would boot 4-level while the run claims 5. TCG emulates LA57 on
 /// any host.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`host_has_la57` is whether the host CPU reports LA57, a host fact the function \
+              compares with the request"
+)]
 fn check_x86_paging(paging: X86Paging, accel: Accel, host_has_la57: bool) -> Result<()>
 {
     if paging == X86Paging::Five && accel != Accel::Tcg && !host_has_la57
@@ -583,6 +588,11 @@ fn check_x86_paging(paging: X86Paging, accel: Accel, host_has_la57: bool) -> Res
     Ok(())
 }
 
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`host_has_la57` is whether the host CPU reports LA57, a host fact the function \
+              passes to `check_x86_paging`"
+)]
 fn extend_x86(
     args: &mut Vec<String>,
     spec: &QemuLaunchSpec,

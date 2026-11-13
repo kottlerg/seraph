@@ -171,6 +171,10 @@ pub struct Round
 
 impl Round
 {
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`done` is the round's terminal flag, stored in the round"
+    )]
     fn new(caps: &[u64], data: &[u64], done: bool) -> Self
     {
         // The counts never exceed the arrays, which is what `caps` and `data`
@@ -642,6 +646,11 @@ mod tests
         raw(sent.done(), sent.caps(), sent.data())
     }
 
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`done` is the received round's terminal flag, stored in the `BootstrapRound` it \
+                  builds"
+    )]
     fn raw(done: bool, caps: &[u64], data: &[u64]) -> BootstrapRound
     {
         let mut r = BootstrapRound {

@@ -62,6 +62,10 @@ pub enum Credit
 /// breakpoint the stop reports a hit of ([`rewound_pc`]), where a restart
 /// set the thread's pointer while this delivery waited.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`held` is whether the thread is already held, which the credit compares"
+)]
 pub fn credit(held: bool, regs_pc: Option<u64>, stop_ip: u64, set_back: Option<u64>) -> Credit
 {
     let at_stop = regs_pc.is_some_and(|pc| pc == stop_ip || Some(pc) == set_back);

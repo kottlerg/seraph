@@ -82,6 +82,11 @@ pub const fn command_with_memory_and_bus_master(command: u16) -> u16
 /// set when it is not, so a function whose driver takes no interrupt never
 /// asserts a line it may share. Every other bit of `command` is kept.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`dma` and `wired` are the Command register's Bus Master Enable and Interrupt Disable \
+              values"
+)]
 pub const fn command_for_bind(command: u16, dma: bool, wired: bool) -> u16
 {
     let mut value = command | COMMAND_MEMORY;
@@ -346,6 +351,10 @@ pub fn msix_entry_message(address: u64, data: u64) -> Option<[u32; 3]>
 /// The Vector Control value with the Mask Bit set (`masked`) or clear, every
 /// reserved bit of `control` kept.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`masked` is the MSI-X Vector Control Mask Bit the function encodes"
+)]
 pub const fn msix_vector_control(control: u32, masked: bool) -> u32
 {
     if masked
@@ -656,6 +665,11 @@ pub enum InterruptPlan
 /// is given Bus Master Enable; the wired line otherwise. Each step falls
 /// back to the next when it fails at the bind.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`dma` is the declaration's DMA field, compared since a message interrupt is a \
+              bus-master write"
+)]
 pub fn interrupt_plan(
     interrupt: driver_binding::decl::Interrupt,
     dma: bool,

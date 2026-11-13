@@ -27,25 +27,6 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
-#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-#![warn(
-    clippy::fn_params_excessive_bools,
-    clippy::large_stack_frames,
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 extern crate alloc;
 
@@ -1253,6 +1234,10 @@ const LFN_LAST_FLAG: u8 = 0x40;
 ///
 /// `None` when `seq` is 0 or past the slots of a [`MAX_LFN_CHARS`] name.
 #[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`is_last` is the last-slot bit the slot's sequence byte encodes"
+)]
 pub fn pack_lfn_slot(seq: u8, is_last: bool, chksum: u8, units: &[u16]) -> Option<[u8; 32]>
 {
     let base = usize::from(seq)

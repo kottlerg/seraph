@@ -47,6 +47,10 @@ pub enum Strictness
 impl Strictness
 {
     /// The strictness a command's `--strict` flag selects.
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "`strict` is the value of `--strict`, which the constructor encodes as the mode"
+    )]
     pub fn from_flag(strict: bool) -> Self
     {
         if strict

@@ -639,6 +639,11 @@ impl Caller
 
 /// Read a `pr-check --gate` run: whether it exited with success and what it
 /// printed. A run that printed no summary line did not reach its verdict.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`succeeded` is the gate command's exit outcome, which the function reads into a \
+              `Gate`"
+)]
 fn read_gate(succeeded: bool, stdout: &str, stderr: &str) -> Gate
 {
     if !stdout.lines().any(|line| line.starts_with("==> pr-check:"))
@@ -1375,6 +1380,10 @@ mod tests
             Worktree::git_in(&self.tree, args);
         }
 
+        #[expect(
+            clippy::fn_params_excessive_bools,
+            reason = "`active` is the value of the event's `active` field"
+        )]
         fn event(&self, agent_type: &str, active: bool) -> Value
         {
             json!({

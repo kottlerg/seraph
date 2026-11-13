@@ -583,10 +583,7 @@ mod tests
             {
                 return None;
             }
-            let i = self
-                .tcbs
-                .iter()
-                .position(|&t| core::ptr::eq(t, p));
+            let i = self.tcbs.iter().position(|&t| core::ptr::eq(t, p));
             assert!(
                 i.is_some(),
                 "a queue returned a TCB the fixture does not own"
@@ -664,7 +661,6 @@ mod tests
             }
         }
     }
-
 
     fn make_tcb() -> ThreadControlBlock
     {

@@ -38,6 +38,7 @@
 //! Driven by `services/svctest`'s pager phase.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::os::seraph::{
     register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
@@ -122,10 +123,14 @@ unsafe fn fill_and_verify(base: *mut u8) -> bool
     // is byte `k % PAGE` of page `k / PAGE`.
     for k in 0..REGION_BYTES
     {
+        // SAFETY: `k < REGION_BYTES`, so the offset stays inside the region
+        // the caller's contract names.
+        let byte = unsafe { base.add(k) };
         // SAFETY: [base, base + REGION_BYTES) is a registered demand-paged
-        // region; touches are backed by the pager on fault.
+        // region holding no Rust object; touches are backed by the pager on
+        // fault.
         unsafe {
-            *base.add(k) = pattern(k / PAGE, k % PAGE);
+            *byte = pattern(k / PAGE, k % PAGE);
         }
     }
 
@@ -133,8 +138,10 @@ unsafe fn fill_and_verify(base: *mut u8) -> bool
     // zero-fill) and were mapped writable.
     for k in 0..REGION_BYTES
     {
+        // SAFETY: `k < REGION_BYTES`, so the offset stays inside the region.
+        let byte = unsafe { base.add(k) };
         // SAFETY: same region, now fully backed.
-        let got = unsafe { *base.add(k) };
+        let got = unsafe { *byte };
         if got != pattern(k / PAGE, k % PAGE)
         {
             return false;
@@ -293,14 +300,19 @@ fn page_table_drain() -> ExitCode
     let base = target as *mut u8;
     for i in 0..PAGE
     {
+        // SAFETY: `i < PAGE`, so the offset stays inside the page `target`
+        // starts.
+        let byte = unsafe { base.add(i) };
         // SAFETY: `target` starts a page of the registered demand region;
         // the store is backed by the pager on fault.
-        unsafe { core::ptr::write_volatile(base.add(i), pattern(0, i)) };
+        unsafe { core::ptr::write_volatile(byte, pattern(0, i)) };
     }
     for i in 0..PAGE
     {
+        // SAFETY: `i < PAGE`, so the offset stays inside the page.
+        let byte = unsafe { base.add(i) };
         // SAFETY: the same page, now backed.
-        if unsafe { core::ptr::read_volatile(base.add(i)) } != pattern(0, i)
+        if unsafe { core::ptr::read_volatile(byte) } != pattern(0, i)
         {
             return ExitCode::from(3);
         }

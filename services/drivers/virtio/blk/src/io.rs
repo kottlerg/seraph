@@ -133,6 +133,11 @@ impl IoLayout
             IoDirection::Read => VIRTIO_BLK_T_IN,
             IoDirection::Write => VIRTIO_BLK_T_OUT,
         };
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every write is to a field of the request header at `header_va`, which \
+                      lies inside the mapped data page"
+        )]
         // SAFETY: header_va is within the mapped data page, properly aligned.
         unsafe {
             (*self.header_va()).req_type = req_type;

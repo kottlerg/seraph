@@ -16,6 +16,7 @@
 //! ([`rtc_labels::RTC_GET_EPOCH_TIME`]).
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use driver_binding::resources::{self, PlatformDelivery, Resource};
 use ipc::{IpcMessage, rtc_errors, rtc_labels};

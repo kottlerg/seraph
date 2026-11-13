@@ -31,6 +31,7 @@
 //! binary, waits for exit, and asserts the exit code.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 /// `RecvGuard` diagnostic hook. The `First` line doubles as evidence that
 /// logging still works from a fully exhausted `CSpace` (`STREAM_BYTES`

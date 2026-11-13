@@ -259,18 +259,37 @@ impl SplitVirtqueue
                 *self.links.get_mut(usize::from(prev))? = idx;
             }
             let flags = if writable { VRING_DESC_F_WRITE } else { 0 };
-            // SAFETY: idx and prev come from alloc_desc, so both are below
-            // queue_size and inside the DMA descriptor table. Volatile: prevents
-            // dead-store elimination and ensures the device sees writes in order.
+            // SAFETY: idx comes from alloc_desc, so it is below queue_size and
+            // the offset stays inside the descriptor table.
+            let desc = unsafe { self.desc_va.add(idx as usize) };
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every write is to a field of descriptor `desc`, which lies inside the \
+                          descriptor table `new`'s contract keeps valid"
+            )]
+            // SAFETY: `desc` lies inside the DMA descriptor table, which `new`'s
+            // contract keeps valid, aligned and writable for the queue's
+            // lifetime. Volatile: prevents dead-store elimination and ensures
+            // the device sees writes in order.
             unsafe {
-                let desc = self.desc_va.add(idx as usize);
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).addr), addr);
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).len), len);
                 core::ptr::write_volatile(core::ptr::addr_of_mut!((*desc).flags), flags);
+            }
 
-                if i > 0
-                {
-                    let prev_desc = self.desc_va.add(prev as usize);
+            if i > 0
+            {
+                // SAFETY: prev comes from alloc_desc, so it is below queue_size
+                // and the offset stays inside the descriptor table.
+                let prev_desc = unsafe { self.desc_va.add(prev as usize) };
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every write is to a field of descriptor `prev_desc`, which lies \
+                              inside the descriptor table `new`'s contract keeps valid"
+                )]
+                // SAFETY: `prev_desc` lies inside the DMA descriptor table, which
+                // `new`'s contract keeps valid, aligned and writable.
+                unsafe {
                     core::ptr::write_volatile(
                         core::ptr::addr_of_mut!((*prev_desc).flags),
                         prev_flags | VRING_DESC_F_NEXT,
@@ -287,31 +306,36 @@ impl SplitVirtqueue
         *self.chain_len.get_mut(usize::from(head))? = chain_len;
 
         // Add head to available ring.
-        // SAFETY: avail_va is valid; ring entry is within bounds.
-        unsafe {
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "VirtqAvail is 2-byte aligned; offset 4 from a 2-byte-aligned base \
-                          maintains u16 alignment"
-            )]
-            let ring_base = self.avail_va.cast::<u8>().add(4).cast::<u16>();
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "VirtqAvail is 2-byte aligned; offset 4 from a 2-byte-aligned base \
+                      maintains u16 alignment"
+        )]
+        // SAFETY: the ring entries start 4 bytes past the available ring's
+        // header, inside the `4 + 2 * queue_size` bytes `new`'s contract names.
+        let ring_base = unsafe { self.avail_va.cast::<u8>().add(4) }.cast::<u16>();
+        // SAFETY: `idx` is a field of the available ring header, which `new`'s
+        // contract keeps valid; no reference is formed.
+        let avail_idx = unsafe { core::ptr::addr_of_mut!((*self.avail_va).idx) };
 
-            // Read avail.idx with read_volatile — the field is shared with the
-            // device and was last updated via write_volatile; a non-volatile
-            // read could return a stale cached value on repeated add_chain calls.
-            let cur_idx = core::ptr::read_volatile(core::ptr::addr_of!((*self.avail_va).idx));
-            let ring_idx = cur_idx & self.ring_mask;
-            core::ptr::write_volatile(ring_base.add(ring_idx as usize), head);
+        // Read avail.idx with read_volatile — the field is shared with the
+        // device and was last updated via write_volatile; a non-volatile
+        // read could return a stale cached value on repeated add_chain calls.
+        // SAFETY: `avail_idx` points into the valid, aligned available ring.
+        let cur_idx = unsafe { core::ptr::read_volatile(avail_idx) };
+        let ring_idx = cur_idx & self.ring_mask;
+        // SAFETY: ring_idx <= ring_mask < queue_size, so the entry lies inside
+        // the ring's `queue_size` entries.
+        let ring_entry = unsafe { ring_base.add(ring_idx as usize) };
+        // SAFETY: `ring_entry` lies inside the valid, writable available ring.
+        unsafe { core::ptr::write_volatile(ring_entry, head) };
 
-            // Memory barrier: ensure descriptor writes are visible before
-            // updating the available index.
-            core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+        // Memory barrier: ensure descriptor writes are visible before
+        // updating the available index.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
 
-            core::ptr::write_volatile(
-                core::ptr::addr_of_mut!((*self.avail_va).idx),
-                cur_idx.wrapping_add(1),
-            );
-        }
+        // SAFETY: `avail_idx` points into the valid, writable available ring.
+        unsafe { core::ptr::write_volatile(avail_idx, cur_idx.wrapping_add(1)) };
 
         Some(head)
     }
@@ -331,9 +355,11 @@ impl SplitVirtqueue
     /// is left untouched.
     pub fn poll_used(&mut self) -> Result<Option<(u16, u32)>, VirtqueueError>
     {
-        // SAFETY: used_va is valid.
-        let used_idx =
-            unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*self.used_va).idx)) };
+        // SAFETY: `idx` is a field of the used ring header, which `new`'s
+        // contract keeps valid; no reference is formed.
+        let used_idx_ptr = unsafe { core::ptr::addr_of!((*self.used_va).idx) };
+        // SAFETY: `used_idx_ptr` points into the valid, aligned used ring.
+        let used_idx = unsafe { core::ptr::read_volatile(used_idx_ptr) };
 
         if self.last_used_idx == used_idx
         {
@@ -347,17 +373,20 @@ impl SplitVirtqueue
         // above it on RVWMO.
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
 
-        // SAFETY: used_va is valid; ring entry is within bounds.
-        let elem = unsafe {
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "VirtqUsed is 2-byte aligned; offset 4 from a 2-byte-aligned base \
-                          maintains u32 alignment for VirtqUsedElem"
-            )]
-            let ring_base = self.used_va.cast::<u8>().add(4).cast::<VirtqUsedElem>();
-            let ring_idx = self.last_used_idx & self.ring_mask;
-            core::ptr::read_volatile(ring_base.add(ring_idx as usize))
-        };
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "VirtqUsed is 2-byte aligned; offset 4 from a 2-byte-aligned base \
+                      maintains u32 alignment for VirtqUsedElem"
+        )]
+        // SAFETY: the ring elements start 4 bytes past the used ring's header,
+        // inside the `4 + 8 * queue_size` bytes `new`'s contract names.
+        let ring_base = unsafe { self.used_va.cast::<u8>().add(4) }.cast::<VirtqUsedElem>();
+        let ring_idx = self.last_used_idx & self.ring_mask;
+        // SAFETY: ring_idx <= ring_mask < queue_size, so the element lies
+        // inside the ring's `queue_size` elements.
+        let ring_elem = unsafe { ring_base.add(ring_idx as usize) };
+        // SAFETY: `ring_elem` lies inside the valid used ring.
+        let elem = unsafe { core::ptr::read_volatile(ring_elem) };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
@@ -583,17 +612,17 @@ mod tests
                 reason = "`used` is the start of a `Vec<u64>`, so 8-byte aligned, and offset 4 \
                           keeps the 4-byte alignment `VirtqUsedElem` needs"
             )]
+            // SAFETY: the ring elements start 4 bytes past the used ring's
+            // header, inside `used`, which used_ring_size sized.
+            let ring_base = unsafe { used.cast::<u8>().add(4) }.cast::<VirtqUsedElem>();
             // SAFETY: `used` is sized for queue_size elements via used_ring_size;
-            // ring_idx is in range for the queue sizes used here. Single-threaded.
-            unsafe {
-                let elem = used
-                    .cast::<u8>()
-                    .add(4)
-                    .cast::<VirtqUsedElem>()
-                    .add(ring_idx);
-                core::ptr::write(elem, VirtqUsedElem { id, len });
-                (*used).idx = used_idx;
-            }
+            // ring_idx is in range for the queue sizes used here.
+            let elem = unsafe { ring_base.add(ring_idx) };
+            // SAFETY: `elem` lies inside `used`, aligned (above). Single-threaded.
+            unsafe { core::ptr::write(elem, VirtqUsedElem { id, len }) };
+            // SAFETY: `used` is the start of the used ring, a live, aligned
+            // `Vec<u64>` buffer. Single-threaded.
+            unsafe { (*used).idx = used_idx };
         }
 
         fn desc(&self, idx: usize) -> VirtqDesc

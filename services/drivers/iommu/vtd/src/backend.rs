@@ -353,6 +353,11 @@ impl Vtd
     fn clear_entry(&mut self, table: u64, index: usize) -> Result<(), BackendError>
     {
         let entry = entry_words(self.store.table(table), index).ok_or(BackendError::Invalid)?;
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every write is to one of the two words of `entry`, which lie in the table \
+                      page `entry` borrows exclusively"
+        )]
         // SAFETY: both words lie in the table page `entry` borrows
         // exclusively.
         unsafe {
@@ -405,6 +410,11 @@ impl Vtd
     -> Result<(), BackendError>
     {
         let entry = entry_words(self.store.table(table), index).ok_or(BackendError::Invalid)?;
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every write is to one of the two words of `entry`, which lie in the table \
+                      page `entry` borrows exclusively"
+        )]
         // SAFETY: both words lie in the table page `entry` borrows
         // exclusively.
         unsafe {

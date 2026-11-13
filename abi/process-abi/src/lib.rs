@@ -40,6 +40,7 @@
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
@@ -879,22 +880,22 @@ pub unsafe fn tls_install_tcb(block_ptr: *mut u8, tls_base_offset: u64, tls_base
 {
     #[cfg(target_arch = "x86_64")]
     {
-        // SAFETY: caller guarantees block has capacity for a u64 at
-        // tls_base_offset. write_unaligned tolerates any address alignment.
-        unsafe {
-            // `tcb` is produced by offsetting a caller-allocated block.
-            // `tls_block_layout` guarantees the block is at least 8-byte aligned and
-            // `tls_base_offset = align_up(memsz, p_align)` preserves that alignment
-            // (p_align is at least 1; practical Rust TLS templates use p_align >= 8).
-            #[expect(
-                clippy::cast_ptr_alignment,
-                clippy::cast_possible_truncation,
-                reason = "the TLS block layout keeps `tcb` aligned and `write_unaligned` is used \
-                          regardless; Seraph is 64-bit only, so u64 to usize is lossless"
-            )]
-            let tcb = block_ptr.add(tls_base_offset as usize).cast::<u64>();
-            tcb.write_unaligned(tls_base_va);
-        }
+        // `tcb` is produced by offsetting a caller-allocated block.
+        // `tls_block_layout` guarantees the block is at least 8-byte aligned and
+        // `tls_base_offset = align_up(memsz, p_align)` preserves that alignment
+        // (p_align is at least 1; practical Rust TLS templates use p_align >= 8).
+        #[expect(
+            clippy::cast_ptr_alignment,
+            clippy::cast_possible_truncation,
+            reason = "the TLS block layout keeps `tcb` aligned and `write_unaligned` is used \
+                      regardless; Seraph is 64-bit only, so u64 to usize is lossless"
+        )]
+        // SAFETY: the caller guarantees the block holds at least
+        // `tls_base_offset + 8` bytes, so the offset stays inside it.
+        let tcb = unsafe { block_ptr.add(tls_base_offset as usize) }.cast::<u64>();
+        // SAFETY: the caller guarantees the block is writable and has room for
+        // a u64 at `tcb`. write_unaligned tolerates any address alignment.
+        unsafe { tcb.write_unaligned(tls_base_va) };
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

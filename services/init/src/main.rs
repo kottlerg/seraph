@@ -17,6 +17,7 @@
               offsets and counts are bounded by page size"
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use core::panic::PanicInfo;
 

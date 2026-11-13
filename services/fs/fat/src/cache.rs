@@ -484,15 +484,22 @@ impl PageCache
             return false;
         };
 
-        // SAFETY: refcount > 0 for the duration of these borrows. The
-        // cache page is single-process owned and mapped writable; the
-        // scratch memory-cap VA is process-static and mapped writable. All
-        // three are sector copies of `len` bytes (at most one page, and the
-        // sector lies inside its cache page) between pages this process owns
-        // and heap or caller buffers at least `len` long.
+        // Each copy below is a sector copy of `len` bytes (at most one page,
+        // and the sector lies inside its cache page) between a page this
+        // process owns and a heap or caller buffer at least `len` long.
+        // SAFETY: refcount > 0 for the duration of the borrow, so the cache
+        // page stays mapped; `previous` is a heap buffer of `len` bytes.
         unsafe {
             core::ptr::copy_nonoverlapping(sector_va as *const u8, previous.as_mut_ptr(), len);
+        }
+        // SAFETY: refcount > 0, and the cache page is single-process owned and
+        // mapped writable; `data` is at least `len` long (checked above).
+        unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), sector_va as *mut u8, len);
+        }
+        // SAFETY: the scratch memory-cap VA is process-static and mapped
+        // writable; `data` is at least `len` long (checked above).
+        unsafe {
             core::ptr::copy_nonoverlapping(data.as_ptr(), scratch.va as *mut u8, len);
         }
 

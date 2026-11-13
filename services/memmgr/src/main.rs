@@ -18,6 +18,7 @@
     reason = "targets 64-bit only; u64/usize conversions lossless"
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use free_pool::{
     ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
@@ -860,22 +861,33 @@ fn bootstrap_from_init(
     // Read the in-use bootstrap arenas from the phys-table page's in-use
     // section.
     // SAFETY: IN_USE_COUNT_IDX is within the mapped 4 KiB page.
-    let in_use_count = (unsafe { core::ptr::read_volatile(phys_ptr.add(mb::IN_USE_COUNT_IDX)) }
-        as usize)
-        .min(mb::MAX_IN_USE);
+    let in_use_count_word = unsafe { phys_ptr.add(mb::IN_USE_COUNT_IDX) };
+    // SAFETY: `in_use_count_word` is a word of the page mapped above.
+    let in_use_count =
+        (unsafe { core::ptr::read_volatile(in_use_count_word) } as usize).min(mb::MAX_IN_USE);
     let mut in_use = [BootInUse::default(); mb::MAX_IN_USE];
     for (i, entry) in in_use.iter_mut().enumerate().take(in_use_count)
     {
         let base = mb::IN_USE_BASE_IDX.saturating_add(i.saturating_mul(mb::IN_USE_WORDS));
-        // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the mapped page.
-        let (cap_slot, page_count, phys_base, kind) = unsafe {
-            (
-                core::ptr::read_volatile(phys_ptr.add(base)),
-                core::ptr::read_volatile(phys_ptr.add(base.saturating_add(1))),
-                core::ptr::read_volatile(phys_ptr.add(base.saturating_add(2))),
-                core::ptr::read_volatile(phys_ptr.add(base.saturating_add(3))),
-            )
-        };
+        // Each offset below is at most base + 3 < IN_USE_BASE_IDX + MAX_IN_USE *
+        // IN_USE_WORDS, within the mapped page; each read is of that word of
+        // the page mapped above.
+        // SAFETY: the offset `base` lies within the page (above).
+        let cap_slot_word = unsafe { phys_ptr.add(base) };
+        // SAFETY: `cap_slot_word` is a word of the mapped page.
+        let cap_slot = unsafe { core::ptr::read_volatile(cap_slot_word) };
+        // SAFETY: the offset `base + 1` lies within the page (above).
+        let page_count_word = unsafe { phys_ptr.add(base.saturating_add(1)) };
+        // SAFETY: `page_count_word` is a word of the mapped page.
+        let page_count = unsafe { core::ptr::read_volatile(page_count_word) };
+        // SAFETY: the offset `base + 2` lies within the page (above).
+        let phys_base_word = unsafe { phys_ptr.add(base.saturating_add(2)) };
+        // SAFETY: `phys_base_word` is a word of the mapped page.
+        let phys_base = unsafe { core::ptr::read_volatile(phys_base_word) };
+        // SAFETY: the offset `base + 3` lies within the page (above).
+        let kind_word = unsafe { phys_ptr.add(base.saturating_add(3)) };
+        // SAFETY: `kind_word` is a word of the mapped page.
+        let kind = unsafe { core::ptr::read_volatile(kind_word) };
         *entry = BootInUse {
             cap_slot,
             page_count: u32::try_from(page_count).unwrap_or(0),
@@ -888,6 +900,11 @@ fn bootstrap_from_init(
     // phys-table indices. They form the left side of the all-RAM-accounted
     // identity (`system_ram == kernel_reserved + pool_total`) surfaced via
     // `QUERY_POOL_STATUS`.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a word of the phys-table page at a constant index, which is \
+                  mapped above"
+    )]
     // SAFETY: both indices are within the mapped 4 KiB page.
     let (system_ram_bytes, kernel_reserved_bytes) = unsafe {
         (
@@ -1851,9 +1868,10 @@ fn pool_total_pages() -> u64
 
 fn pool_total_add(pages: u64)
 {
+    let total = pool_total_pages().saturating_add(pages);
     // SAFETY: memmgr is single-threaded; no concurrent access.
     unsafe {
-        POOL_TOTAL_PAGES = POOL_TOTAL_PAGES.saturating_add(pages);
+        POOL_TOTAL_PAGES = total;
     }
 }
 

@@ -1231,17 +1231,20 @@ impl ChildInfoCaps
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
 /// without checking what procmgr holds there.
-// similar_names: child_aspace/child_cspace are intentionally parallel.
-// too_many_arguments: each cluster is a small fixed-size bundle; collapsing
-// them into one struct shifts the verbosity to the call sites without
-// reducing the total parameter count. too_many_lines: this is the single
-// transaction that owns one temporary scratch mapping for the PI page —
-// splitting would require threading the partial state through helpers
-// that all need the same self_aspace + child_cspace + write context.
-#[allow(
+#[expect(
     clippy::similar_names,
+    reason = "child_aspace/child_cspace are intentionally parallel"
+)]
+#[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines
+    reason = "each cluster is a small fixed-size bundle; collapsing them into one struct shifts \
+              the verbosity to the call sites without reducing the total parameter count"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "this is the single transaction that owns one temporary scratch mapping for the PI \
+              page — splitting would require threading the partial state through helpers that all \
+              need the same self_aspace + child_cspace + write context"
 )]
 unsafe fn populate_child_info(
     self_aspace: u64,
@@ -1748,9 +1751,10 @@ unsafe fn finalize_main_tls(
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
 /// without checking what procmgr holds there.
-// too_many_arguments: each is a distinct creation input; see
-// prepare_main_tls_from_vfs.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct creation input; see prepare_main_tls_from_vfs"
+)]
 unsafe fn prepare_main_tls_from_bytes(
     self_aspace: u64,
     child_aspace: u64,
@@ -1805,9 +1809,11 @@ unsafe fn prepare_main_tls_from_bytes(
 /// `child_aspace` must name a child's address space, never procmgr's own:
 /// the function maps pages into it, at VAs the child's layout chooses,
 /// without checking what procmgr holds there.
-// too_many_arguments: each is a distinct creation input (caps, file handle,
-// IPC scratch, chosen layout); grouping them would not reduce coupling.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is a distinct creation input (caps, file handle, IPC scratch, chosen layout); \
+              grouping them would not reduce coupling"
+)]
 unsafe fn prepare_main_tls_from_vfs(
     self_aspace: u64,
     child_aspace: u64,
@@ -2039,10 +2045,15 @@ fn vfs_read_exact(file_cap: u64, ipc_buf: *mut u64, off: u64, dst: &mut [u8]) ->
 /// `procmgr_errors::OUT_OF_MEMORY` when a death observer cannot be bound,
 /// a caller-facing cap cannot be derived, or the table cannot grow: each is
 /// procmgr's own memory or slots running out.
-// similar_names: child_aspace/child_cspace are intentionally parallel.
-// too_many_arguments: grouping these into a struct would add complexity without
-// reducing call sites — this helper is called from exactly two places.
-#[allow(clippy::similar_names, clippy::too_many_arguments)]
+#[expect(
+    clippy::similar_names,
+    reason = "child_aspace/child_cspace are intentionally parallel"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "grouping these into a struct would add complexity without reducing call sites — this \
+              helper is called from exactly two places"
+)]
 fn finalize_creation(
     child_aspace: u64,
     child_cspace: u64,
@@ -2377,8 +2388,6 @@ pub fn thread_is_listed(cap: u64) -> bool
 /// Release one registered thread: revoke the caps `ATTACH_PROCESS` derived
 /// from procmgr's, then delete procmgr's. A slot the runtime already revoked
 /// fails both calls harmlessly, its handle's generation being stale.
-// needless_pass_by_value: the `sweep` callback hands each thread over by value.
-#[allow(clippy::needless_pass_by_value)]
 pub fn release_registered_thread(thread: process_table::RegisteredThread)
 {
     let _ = syscall::cap_revoke_all(thread.cap);
@@ -2678,11 +2687,20 @@ fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
 /// `MAP_FAILED` (a scratch or child mapping), or `INSUFFICIENT_RIGHTS` (a
 /// rights derivation) ([`loader::load_elf_segment_into_child`]); and the main
 /// TLS block's and [`populate_child_info`]'s other codes.
-// similar_names: aspace/cspace are intentionally parallel kernel object names.
-#[allow(
+#[expect(
     clippy::similar_names,
+    reason = "aspace/cspace are intentionally parallel kernel object names"
+)]
+#[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines
+    reason = "each argument is a distinct input the caller holds separately: the image, procmgr's \
+              own caps and tables, the child's universals, argv and env, death set and scheduling, \
+              and the IPC buffer"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "in-memory process creation is one transaction that owns the child's kernel objects \
+              and its segment loads; splitting it would thread the partial state through helpers"
 )]
 fn create_process_from_bytes(
     module_bytes: &[u8],
@@ -2998,10 +3016,11 @@ fn create_process_from_bytes(
 /// cannot be mapped, else `create_process_from_bytes`'s. The `CREATE_PROCESS`
 /// handler answers every one `OUT_OF_MEMORY`, as § Label 1 of
 /// `services/procmgr/docs/ipc-interface.md` names it.
-// too_many_arguments: each argument is a distinct capability, table or child
-// parameter the caller already holds separately; a struct bundling them would
-// serve this one call only.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct capability, table or child parameter the caller already \
+              holds separately; a struct bundling them would serve this one call only"
+)]
 pub fn create_process(
     module_memory_cap: u64,
     self_aspace: u64,
@@ -3662,13 +3681,17 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
 /// - `procmgr_errors::ARGV_ENV_STILL_MAPPED` (14) — a window the argv and env
 ///   were copied through would not unmap, so the child's memmgr record is
 ///   withheld.
-// clippy::too_many_lines: file-cap-based process creation is one transaction
-// that owns the lifetime of the ELF-header scratch memory cap, the child's kernel
-// objects, and the per-page streaming loop.
-#[allow(
-    clippy::similar_names,
+#[expect(
     clippy::too_many_lines,
-    clippy::too_many_arguments
+    reason = "file-cap-based process creation is one transaction that owns the lifetime of the \
+              ELF-header scratch memory cap, the child's kernel objects, and the per-page \
+              streaming loop"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct input: the request's file, size, argv and env, demand \
+              paging, parent relay and scheduling, and procmgr's context, tables, death set and IPC \
+              buffer"
 )]
 pub fn create_process_from_file(
     ctx: &crate::ProcmgrCtx,
@@ -4299,9 +4322,6 @@ fn notify_memmgr_died(memmgr_ep: u64, memmgr_badge: u64, ipc_buf: *mut u64)
 /// Note: the bound death-notification observers in the child thread's TCB
 /// and address space are released automatically when the objects are torn
 /// down by the cap-revokes below — no explicit unbind syscall is required.
-// needless_pass_by_value: consumes the entry's cap slots; passing by
-// reference would invite accidental double-free on subsequent reuse.
-#[allow(clippy::needless_pass_by_value)]
 pub fn teardown_entry(
     mut entry: ProcessEntry,
     exit_reason: u64,

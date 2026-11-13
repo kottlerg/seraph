@@ -10,6 +10,8 @@
 //! child's stdout cap to the system log endpoint with a per-service badge;
 //! nothing in this binary knows or cares.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 fn main()
 {
     println!("hello from seraph userspace");

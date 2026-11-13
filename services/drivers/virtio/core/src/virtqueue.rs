@@ -289,9 +289,11 @@ impl SplitVirtqueue
         // Add head to available ring.
         // SAFETY: avail_va is valid; ring entry is within bounds.
         unsafe {
-            // cast_ptr_alignment: VirtqAvail is 2-byte aligned; offset 4 from
-            // a 2-byte-aligned base maintains u16 alignment.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "VirtqAvail is 2-byte aligned; offset 4 from a 2-byte-aligned base \
+                          maintains u16 alignment"
+            )]
             let ring_base = self.avail_va.cast::<u8>().add(4).cast::<u16>();
 
             // Read avail.idx with read_volatile — the field is shared with the
@@ -347,9 +349,11 @@ impl SplitVirtqueue
 
         // SAFETY: used_va is valid; ring entry is within bounds.
         let elem = unsafe {
-            // cast_ptr_alignment: VirtqUsed is 2-byte aligned; offset 4 from
-            // a 2-byte-aligned base maintains u32 alignment for VirtqUsedElem.
-            #[allow(clippy::cast_ptr_alignment)]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "VirtqUsed is 2-byte aligned; offset 4 from a 2-byte-aligned base \
+                          maintains u32 alignment for VirtqUsedElem"
+            )]
             let ring_base = self.used_va.cast::<u8>().add(4).cast::<VirtqUsedElem>();
             let ring_idx = self.last_used_idx & self.ring_mask;
             core::ptr::read_volatile(ring_base.add(ring_idx as usize))
@@ -574,9 +578,13 @@ mod tests
         fn publish_used(&mut self, ring_idx: usize, id: u32, len: u32, used_idx: u16)
         {
             let used = self.used.as_mut_ptr().cast::<VirtqUsed>();
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "`used` is the start of a `Vec<u64>`, so 8-byte aligned, and offset 4 \
+                          keeps the 4-byte alignment `VirtqUsedElem` needs"
+            )]
             // SAFETY: `used` is sized for queue_size elements via used_ring_size;
             // ring_idx is in range for the queue sizes used here. Single-threaded.
-            #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let elem = used
                     .cast::<u8>()

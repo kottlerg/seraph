@@ -22,6 +22,8 @@
 //! hardware) can stand in for it, so the consumer never learns the
 //! transport.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use ipc::{IpcMessage, devmgr_labels, memmgr_errors, memmgr_labels, serial_errors, serial_labels};
 use std::os::seraph::{StartupInfo, reserve_pages, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -755,8 +757,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"virtio-console");
     let info = startup_info();
 
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // The GDB stub talks to its host through this driver, so a stub attached

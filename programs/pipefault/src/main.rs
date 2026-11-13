@@ -15,6 +15,8 @@
 //! this binary with `Stdio::piped()`, drains stdout, and asserts the
 //! prefix arrived followed by EOF (no hang) plus a fault `exit_reason`.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::io::Write;
 
 fn main()

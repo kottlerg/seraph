@@ -14,6 +14,8 @@
 //! declines the fault with the report's id as the reason. The mechanism and
 //! its limits are in services/crashd/docs/operation.md.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod arch;
 
 use std::sync::mpsc;
@@ -54,8 +56,10 @@ fn main() -> !
 {
     std::os::seraph::log::register_name(b"crashd");
     let info = std::os::seraph::startup_info();
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // A debug-authority holder must not be stopped by another, nor bound to

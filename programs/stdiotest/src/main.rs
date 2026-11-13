@@ -12,6 +12,8 @@
 //! started. This child blocks on `stdin().read_line(..)` until those bytes
 //! arrive, processes them, and emits the result through `println!`.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::io::BufRead;
 
 fn main()

@@ -12,6 +12,8 @@
 //! `docs/capability-model.md` on verb bits), so a holder of a SEND without
 //! the bit cannot read keystrokes.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use ipc::input_labels;
 
 /// Whether a request with label `label` from a caller badged `badge` may be

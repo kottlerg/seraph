@@ -22,6 +22,8 @@
 //! `/programs/fb-charset` invoked manually. Pure `std`: no driver or cap
 //! awareness; with no stdout attached the output silently drops.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::io::Write;
 
 fn main()

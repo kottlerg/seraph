@@ -14,6 +14,7 @@
 //! point — see [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 extern crate alloc;
 
@@ -365,8 +366,6 @@ pub fn lookup_partition_by_type_guid<'a>(
     {
         for p in parts.iter().filter(|p| &p.type_guid == type_guid)
         {
-            // clippy::cast_possible_truncation: explicit shift+mask narrows to 16 bits.
-            #[allow(clippy::cast_possible_truncation)]
             let priority = ((p.attributes >> 48) & 0xFFFF) as u16;
             let location = PartitionLocation {
                 disk,

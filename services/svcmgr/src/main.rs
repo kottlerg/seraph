@@ -23,8 +23,11 @@
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
 
-// cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "targets 64-bit only; u64/usize conversions lossless"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 mod arch;
 mod classes;
@@ -77,8 +80,10 @@ fn main() -> !
     // IPC buffer was registered by `std::os::seraph::_start`. The raw
     // pointer is all the new `ipc::ipc_call`/`ipc_recv`/`ipc_reply` and
     // `ipc::bootstrap::*` wrappers need.
-    // cast_ptr_alignment: IPC buffer is page-aligned by the boot protocol.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer is page-aligned by the boot protocol"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // State is created before the endowment is drained so `bootstrap_caps`

@@ -2952,7 +2952,9 @@ pub mod iommu_labels
     /// `SUCCESS` with `data[0]` = 1 when the destinations are 32-bit, 0
     /// when they are 8-bit; or an error code, with remapping off:
     /// `INVALID_REQUEST` for a size outside the bound, a table already set
-    /// up, or an IOMMU family or unit that does not remap interrupts.
+    /// up, units that translate more than one PCI segment (an entry names
+    /// its requester by a source ID with no segment), or an IOMMU family or
+    /// unit that does not remap interrupts.
     pub const REMAP_SETUP: u64 = 9;
     /// Make one entry of the remapping table deliver to a CPU's vector for
     /// one requester, replacing what it held; the reply follows the

@@ -836,6 +836,22 @@ impl Iommu
         })
     }
 
+    /// What keeps interrupt remapping off on this platform
+    /// (`dmar::remap_obstacle`): a VT-d unit not handed to the driver, or
+    /// units on more than one PCI segment. `None` for an IOMMU family other
+    /// than VT-d, which [`Self::io_apic_sources`] turns away first.
+    pub fn remap_obstacle(&self) -> Option<dmar::RemapObstacle>
+    {
+        let Topology::Dmar {
+            dmar, unit_index, ..
+        } = &self.topology
+        else
+        {
+            return None;
+        };
+        dmar::remap_obstacle(dmar, unit_index.iter().map(Option::is_some))
+    }
+
     /// The DMAR's flags and the source ID of each I/O APIC its units name,
     /// by I/O APIC ID (`crate::intremap::enable`); `None` for an IOMMU
     /// family other than VT-d. An I/O APIC whose path does not resolve is

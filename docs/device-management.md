@@ -566,8 +566,10 @@ On x86-64 with VT-d interrupt remapping on (§ IOMMU Discovery and Programming),
 write is delivered only through a remapping entry devmgr had the IOMMU driver write for the
 device's own requester ID: a remappable message naming an entry written for another requester, or
 an entry not present, is blocked, and so is every compatibility-format message. With remapping off
-(the DMAR offers none, an I/O APIC has no source ID in the DMAR, or the driver or the kernel refused
-the setup, each logged by devmgr), a device whose DMA engine writes to the interrupt range can raise
+(the DMAR offers none, a VT-d unit was not handed to the driver, the units translate more than one
+PCI segment, whose functions the one shared table, naming a requester with no segment, would not
+tell apart, an I/O APIC has no source ID in the DMAR, or the driver or the kernel refused the
+setup, each logged by devmgr), a device whose DMA engine writes to the interrupt range can raise
 any vector on any CPU whose APIC id is below `0xFF`, the exception vectors 16 to 31 included, behind
 an IOMMU or not; its driver cannot do so through the MSI-X table, which only devmgr writes. On
 riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt files its domain maps.

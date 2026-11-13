@@ -387,6 +387,58 @@ pub fn flags(dmar: &[u8]) -> Option<DmarFlags>
     })
 }
 
+/// What keeps VT-d interrupt remapping off for a DMAR ([`remap_obstacle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemapObstacle
+{
+    /// A unit was not handed to the IOMMU driver, which so never turns its
+    /// remapping on: the unit would read the remappable requests behind it
+    /// as compatibility-format ones, sending an I/O APIC's lines astray and
+    /// passing its devices' messages unchecked.
+    UnitNotHandedOver,
+    /// The units translate more than one PCI segment. The one remapping
+    /// table they share names an entry's requester by bus, device and
+    /// function alone, so a function on one segment would pass the check of
+    /// an entry written for the same-numbered function on another.
+    SegmentsDiffer,
+}
+
+impl RemapObstacle
+{
+    /// The reason, as devmgr logs it.
+    #[must_use]
+    pub const fn why(self) -> &'static str
+    {
+        match self
+        {
+            Self::UnitNotHandedOver => "a VT-d unit was not handed to the IOMMU driver",
+            Self::SegmentsDiffer => "the VT-d units translate more than one PCI segment",
+        }
+    }
+}
+
+/// What keeps interrupt remapping off for the DMAR `dmar`, `None` when
+/// nothing does. `handed` says, in [`drhd_units`] order, whether each unit
+/// was handed to the IOMMU driver; a unit past its end was not.
+#[must_use]
+pub fn remap_obstacle(dmar: &[u8], mut handed: impl Iterator<Item = bool>)
+-> Option<RemapObstacle>
+{
+    let mut segment = None;
+    for unit in drhd_units(dmar)
+    {
+        if handed.next() != Some(true)
+        {
+            return Some(RemapObstacle::UnitNotHandedOver);
+        }
+        if *segment.get_or_insert(unit.segment) != unit.segment
+        {
+            return Some(RemapObstacle::SegmentsDiffer);
+        }
+    }
+    None
+}
+
 impl DrhdUnit
 {
     /// The PCI functions and hierarchies the unit's scope names explicitly.
@@ -732,6 +784,42 @@ mod tests
         table[0..4].copy_from_slice(b"APIC");
         assert_eq!(flags(&table), None);
         assert_eq!(flags(b"DMAR"), None);
+    }
+
+    /// Defects caught: remapping was turned on with a unit the driver was
+    /// not handed (which then read remappable requests as compatibility
+    /// ones), and with units on two segments sharing one table whose entries
+    /// carry no segment.
+    #[test]
+    fn remapping_needs_every_unit_handed_over_on_one_segment()
+    {
+        let one_segment = dmar(
+            39,
+            &[
+                drhd(0, 0, 0, 0xfed9_0000, &[]),
+                drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_1000, &[]),
+            ],
+        );
+        assert_eq!(remap_obstacle(&one_segment, [true, true].into_iter()), None);
+        assert_eq!(
+            remap_obstacle(&one_segment, [true, false].into_iter()),
+            Some(RemapObstacle::UnitNotHandedOver)
+        );
+        assert_eq!(
+            remap_obstacle(&one_segment, [true].into_iter()),
+            Some(RemapObstacle::UnitNotHandedOver)
+        );
+        let two_segments = dmar(
+            39,
+            &[
+                drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 0, 0xfed9_0000, &[]),
+                drhd(DRHD_FLAG_INCLUDE_PCI_ALL, 0, 1, 0xfed9_1000, &[]),
+            ],
+        );
+        assert_eq!(
+            remap_obstacle(&two_segments, [true, true].into_iter()),
+            Some(RemapObstacle::SegmentsDiffer)
+        );
     }
 
     #[test]

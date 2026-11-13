@@ -23,6 +23,14 @@ components must be installed:
 
 Run `rustup show` in the repository root to confirm the toolchain is active.
 
+`cargo xtask test` runs the host tests a second time built for `riscv64gc-unknown-linux-gnu`,
+under QEMU's user-mode emulator, so it needs a Linux host with three more packages: the emulator
+(`qemu-riscv64`), the riscv64 Linux cross compiler that links the test binaries
+(`riscv64-linux-gnu-gcc`), and its C library under `/usr/riscv64-linux-gnu`. On Debian and Ubuntu
+they are `qemu-user`, `gcc-riscv64-linux-gnu` and `libc6-dev-riscv64-cross`; on Arch,
+`qemu-user`, `riscv64-linux-gnu-gcc` and `riscv64-linux-gnu-glibc`. The command fails, naming
+them, when one is missing.
+
 `cargo xtask symbolize` reads DWARF and symbol tables in Rust (the `addr2line` and `object` crates
 of xtask's dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
 through QEMU's gdbstub ([testing.md § Troubleshooting](testing.md#troubleshooting)) needs a host
@@ -383,7 +391,8 @@ explicit string stays so the 9.0 minimum holds.
 **Host unit tests** — Pure algorithmic modules (buddy allocator, capability
 tree, scheduler run queues) keep hardware dependencies behind trait boundaries. The kernel
 crate's root uses `#![cfg_attr(not(test), no_std)]`, so `cargo xtask test --component kernel`
-runs these modules on the host under the standard test harness.
+runs these modules on the host under the standard test harness, and again built for riscv64
+under QEMU's user-mode emulator, so each architecture's module runs its tests as `current`.
 
 **QEMU integration tests** — Code requiring real hardware (page tables, interrupts, context
 switching) is tested under QEMU by the [`core/ktest`](../core/ktest/README.md) harness, which
@@ -399,7 +408,10 @@ cargo xtask test --component kernel     # single crate
 Before it runs the tests, `cargo xtask test` lints the test code: Clippy over the test
 configuration of the selected crates for the Linux target of each architecture, with all warnings
 treated as errors ([coding-standards.md](coding-standards.md#clippy) § Clippy;
-[xtask/README.md](../xtask/README.md) § `cargo xtask test`).
+[xtask/README.md](../xtask/README.md) § `cargo xtask test`). After the host run, it builds the
+tests of the selected crates, `xtask` and its wrapper shim left out, for
+`riscv64gc-unknown-linux-gnu` and runs them under `qemu-riscv64`, so a test gated on riscv64 runs
+on an x86_64 host ([§ Toolchain](#toolchain) lists the packages that run needs).
 
 For test naming conventions and requirements (what must be tested, what should not), see
 [coding-standards.md](coding-standards.md#d-testing-invariants).
@@ -423,7 +435,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then `cargo xtask test`, which lints the test code before it runs the tests; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |

@@ -17,7 +17,6 @@ use crate::util::{run_cmd, step};
 /// Entry point for `cargo xtask clean`.
 pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
 {
-    crate::host_lock::admit_build(ctx, &args.host)?;
     if ctx.sysroot.exists()
     {
         step(&format!("Removing sysroot: {}", ctx.sysroot.display()));

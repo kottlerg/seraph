@@ -140,10 +140,25 @@ impl EventRing
     {
         // The page's mapping holds every buffer: no saturation.
         let addr = self.base_va.saturating_add(slot_offset(slot));
-        // SAFETY: slot < buf_count, so addr is within the mapped DMA page and
-        // 8-byte aligned (page-aligned base + 8-byte stride). Volatile: the
+        let event = addr as *const VirtioInputEvent;
+        // Each field is read on its own, at the width `VirtIO` 1.2 §5.8.6.2
+        // gives it.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every read is of a field of the event buffer at `event`, which lies inside \
+                      the mapped DMA page"
+        )]
+        // SAFETY: slot < buf_count, so the buffer at `event` is within the
+        // mapped DMA page and 8-byte aligned (page-aligned base + 8-byte
+        // stride), so each field is aligned to its own width. Volatile: the
         // buffer was written by the device; poll_used's acquire fence ordered
-        // that write before this read.
-        unsafe { core::ptr::read_volatile(addr as *const VirtioInputEvent) }
+        // that write before these reads. No reference is formed.
+        unsafe {
+            VirtioInputEvent {
+                event_type: core::ptr::read_volatile(&raw const (*event).event_type),
+                code: core::ptr::read_volatile(&raw const (*event).code),
+                value: core::ptr::read_volatile(&raw const (*event).value),
+            }
+        }
     }
 }

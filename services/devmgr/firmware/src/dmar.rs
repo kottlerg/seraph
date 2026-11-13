@@ -246,7 +246,7 @@ pub fn drhd_units(dmar: &[u8]) -> impl Iterator<Item = DrhdUnit> + '_
         {
             Some(u)
         }
-        _ => None,
+        Structure::Drhd(_) | Structure::Rmrr(_) => None,
     })
 }
 
@@ -257,7 +257,7 @@ pub fn rmrrs(dmar: &[u8]) -> impl Iterator<Item = Rmrr> + '_
     structures(dmar).filter_map(|s| match s
     {
         Structure::Rmrr(r) if r.limit >= r.base => Some(r),
-        _ => None,
+        Structure::Rmrr(_) | Structure::Drhd(_) => None,
     })
 }
 

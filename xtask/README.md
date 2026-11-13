@@ -355,7 +355,7 @@ cargo xtask clean [--all]
 
 ### `cargo xtask test`
 
-Lint the test code, then run Seraph unit tests on the host target.
+Lint the test code, then run Seraph unit tests on the host target and under riscv64 emulation.
 
 ```
 cargo xtask test [--component boot|protocol|kernel|init|all]
@@ -370,6 +370,18 @@ names, as [docs/coding-standards.md](../docs/coding-standards.md) § Clippy stat
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.
+
+Then the tests of the selected packages, the host-only `xtask` and `seraph-wrapper-shim` left
+out (`HOST_ONLY`), build for `riscv64gc-unknown-linux-gnu` with `std` from source, link with
+`riscv64-linux-gnu-gcc`, and run under QEMU's user-mode emulator
+(`qemu-riscv64 -L /usr/riscv64-linux-gnu`), so a test gated on riscv64 runs on an x86_64 host.
+That build uses an unwinding `dev` profile (`CARGO_PROFILE_DEV_PANIC=unwind`), since the test
+harness cannot link with a `std` built for `panic=abort`. The command fails, naming the packages
+to install, when the emulator, the cross compiler or its C library is missing
+([docs/build-system.md](../docs/build-system.md) § Toolchain).
+
+The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
+their `--wait-host` and `--host-override` options.
 
 ---
 
@@ -1202,9 +1214,9 @@ has no `hook` command exits with that code, so `.claude/settings.json` writes ea
 ## Host launch rules
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
-themselves, from `src/host_lock.rs`, before they start: `build` and `clean` as builds; `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
-and `test-gdb` as boots.
+themselves, from `src/host_lock.rs`, before they start: `build`, `clean` and `test` as builds
+(`CliCommand::build_host` in `src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`,
+`test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port` and `test-gdb` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
@@ -1280,7 +1292,9 @@ printed line: each CI job is its own host.
 
 ## Adding a new command
 
-1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `Args` struct.
+1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `Args` struct, and name it
+   in `CliCommand::build_host`: a command that compiles takes `HostArgs` and is admitted there as
+   a build.
 2. Create `src/commands/<name>.rs` with `pub fn run(ctx: &Context, args: &NameArgs) -> Result<()>`,
    or add a `pub fn run_<name>` to the module that holds its sibling commands (`pr_check`,
    `review`, and `issue` each hold two).

@@ -38,6 +38,23 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -739,7 +756,7 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
             bytes,
             ..
         } => Some((cap, bytes.div_ceil(PAGE_SIZE))),
-        _ => None,
+        Resource::Mmio { .. } | Resource::IoPort { .. } | Resource::Interrupt { .. } => None,
     });
     let (cap, pages) = bar?;
     let irq = list.resources().iter().find_map(|r| match *r
@@ -747,7 +764,7 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
         Resource::Interrupt {
             cap, kind, mode, ..
         } => Some((cap, kind, mode)),
-        _ => None,
+        Resource::Mmio { .. } | Resource::IoPort { .. } => None,
     });
     (eps.dma != 0 && eps.service != 0).then_some((cap, pages, irq, eps))
 }

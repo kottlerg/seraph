@@ -151,8 +151,9 @@ binding in place. Gated by `READ_AUTHORITY`.
 
 ## Interrupts
 
-RX is interrupt-driven. `serial_init` enables the receive-data interrupt in the
-UART's IER (every earlier boot stage left `IER = 0`), and the driver routes the
+RX is interrupt-driven. When the driver holds the UART's IRQ cap,
+`serial_enable_rx_interrupt` enables the receive-data interrupt in the UART's IER
+(every earlier boot stage left `IER = 0`), and the driver routes the
 UART interrupt to a client notification via `SERIAL_REGISTER_RX_NOTIFY`. The
 kernel masks the line on each fire; the next `SERIAL_READ_BYTES` re-arms it
 after draining, via

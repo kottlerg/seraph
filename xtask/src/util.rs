@@ -104,6 +104,12 @@ fn install_hint_for(name: &str) -> String
             macOS (Homebrew): brew install qemu\n  \
             FreeBSD:          pkg install qemu"
             .into(),
+        "qemu-riscv64" | "riscv64-linux-gnu-gcc" => "`cargo xtask test` runs the riscv64 \
+            host tests under QEMU user-mode emulation, linked by the riscv64 Linux cross \
+            compiler against its C library. Install with:\n  \
+            Debian / Ubuntu:  apt install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross\n  \
+            Arch:             pacman -S qemu-user riscv64-linux-gnu-gcc riscv64-linux-gnu-glibc"
+            .into(),
         "cargo" | "rustc" => "Install rustup (https://rustup.rs/); xtask requires the toolchain \
              pinned in rust-toolchain.toml. This usually means xtask itself was invoked \
              outside a rustup-managed environment."

@@ -54,6 +54,15 @@ jobs:
           --base origin/${{ github.base_ref }}
           --head ${{ github.event.pull_request.head.sha }}
 
+      # `cargo xtask test` also runs the tests built for riscv64 under QEMU's
+      # user-mode emulator, linked by the riscv64 Linux cross compiler against
+      # its C library (xtask/README.md § `cargo xtask test`).
+      - name: Install the riscv64 test emulation
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
+
       - name: cargo xtask test
         run: cargo xtask test
 

@@ -36,7 +36,7 @@ build breaks. Items with no neutral caller are not checked this way: `interrupts
 ```
 core/kernel/src/arch/
 ├── mod.rs          # The only #[cfg(target_arch)] site; aliases the active arch as `current`;
-│                   # defines the shared `ThreadKind`; host-test-builds riscv64's `encoding`
+│                   # defines the shared `ThreadKind`
 ├── nospec.rs       # Arch-neutral speculation-safe bounds over `current::speculation`
 ├── x86_64/
 │   ├── mod.rs      # Module declarations and arch constants (ARCH_NAME, …)
@@ -67,10 +67,9 @@ pub mod current;
 pub mod current;
 ```
 
-It also compiles riscv64's `encoding` module, pure register-map and encoding arithmetic that
-depends on nothing else in its arch module, into the host test builds of the other
-architectures (`#[cfg(all(test, not(target_arch = "riscv64")))]`), so `cargo xtask test`, run
-on an x86_64 host, runs its tests.
+Each architecture's tests run with its module as `current`: `cargo xtask test` runs the host
+tests on the host and again built for riscv64 under QEMU's user-mode emulator
+([xtask/README.md](../../../xtask/README.md) § `cargo xtask test`).
 
 The sections below document the **cross-architecture contract surface** — the functions,
 types, and module-level constants architecture-neutral code depends on, plus the items every

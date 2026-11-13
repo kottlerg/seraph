@@ -2646,7 +2646,8 @@ pub mod devmgr_dma_labels
     /// driver that confines the device did not remove the mapping, which
     /// stays standing), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
     pub const DMA_UNMAP: u64 = 2;
-    /// Report the IOMMU faults devmgr has taken for the caller's device.
+    /// Report the DMA translation faults devmgr has taken for the caller's
+    /// device; an interrupt-remapping fault is logged only.
     ///
     /// devmgr first takes the faults the IOMMU driver has recorded
     /// (`iommu_labels::TAKE_FAULTS`) and logs each, as it does periodically.

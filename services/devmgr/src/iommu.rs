@@ -61,7 +61,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use driver_binding::decl::{DriverDecl, Tier};
 use firmware::binding::{Choice, MatchTable, RecordKeys, Source};
-use firmware::dma::{Confinement, ReservedError, ReservedRange, has_iova_space, iova_limit, reserved_ranges};
+use firmware::dma::{
+    Confinement, ReservedError, ReservedRange, has_iova_space, iova_limit, reserved_ranges,
+};
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
 use iommu_core::Scope;
@@ -102,6 +104,19 @@ impl Family
         {
             Self::Vtd => "VT-d units",
             Self::Riscv => "RISC-V IOMMUs",
+        }
+    }
+
+    /// What the address word `address` of a fault of reason `reason` the
+    /// family's driver recorded names: a VT-d interrupt-remapping fault names
+    /// a remapping table handle (`dmar::fault_site`), every other fault an
+    /// IOVA.
+    fn fault_site(self, reason: u16, address: u64) -> dmar::FaultSite
+    {
+        match self
+        {
+            Self::Vtd => dmar::fault_site(reason, address),
+            Self::Riscv => dmar::FaultSite::Iova(address),
         }
     }
 
@@ -462,7 +477,9 @@ fn drain(ep: u64)
     }
 }
 
-/// The faults devmgr has taken for each device, by requester ID.
+/// The DMA translation faults devmgr has taken for each device, by requester
+/// ID: the count and the latest's IOVA. An interrupt-remapping fault is
+/// logged only ([`take_and_log`]).
 #[derive(Default)]
 struct FaultCounts(Vec<(u64, u64, u64)>);
 
@@ -892,7 +909,9 @@ impl Iommu
     }
 }
 
-/// Take `client`'s recorded faults and log each, recording it in `counts`.
+/// Take `client`'s recorded faults and log each, recording a DMA translation
+/// fault in `counts`; a VT-d interrupt-remapping fault names a remapping
+/// table handle, not an IOVA ([`Family::fault_site`]), and is logged only.
 ///
 /// `counts` stays locked from before the take until every fault taken is
 /// recorded, so a caller that reads `counts` after its own take sees every
@@ -914,18 +933,32 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
             taken.push((rid, reason, iova));
         }
     });
-    for (rid, reason, iova) in taken
+    let family = arch::current::IOMMU_FAMILY;
+    for &(rid, reason, address) in &taken
     {
+        if let dmar::FaultSite::Iova(iova) = family.fault_site(reason, address)
+        {
+            counts.record(rid, iova);
+        }
+    }
+    drop(counts);
+    for (rid, reason, address) in taken
+    {
+        let (what, value) = match family.fault_site(reason, address)
+        {
+            dmar::FaultSite::Iova(iova) => ("IOVA", iova),
+            dmar::FaultSite::InterruptHandle(handle) => ("interrupt remapping handle", handle),
+        };
         std::os::seraph::log!(
-            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} IOVA {:#x}",
+            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} {} {:#x}",
             rid >> 16,
             (rid >> 8) & 0xff,
             (rid >> 3) & 0x1f,
             rid & 7,
             reason,
-            iova
+            what,
+            value
         );
-        counts.record(rid, iova);
     }
 }
 

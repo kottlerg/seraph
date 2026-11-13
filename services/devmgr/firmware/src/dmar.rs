@@ -387,6 +387,38 @@ pub fn flags(dmar: &[u8]) -> Option<DmarFlags>
     })
 }
 
+/// The lowest VT-d fault reason of an interrupt-remapping fault, whose
+/// recorded address is the handle the blocked interrupt named, not an IOVA
+/// (`iommu_labels::TAKE_FAULTS`).
+pub const FAULT_REASON_INTERRUPT: u16 = 0x20;
+
+/// What the address word of a fault the IOMMU driver recorded names
+/// ([`fault_site`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaultSite
+{
+    /// A DMA translation fault at this IOVA, page-aligned.
+    Iova(u64),
+    /// A VT-d interrupt-remapping fault on the interrupt that named this
+    /// remapping table handle.
+    InterruptHandle(u64),
+}
+
+/// What the address word `address` of a VT-d fault of reason `reason` names.
+/// The RISC-V IOMMU's causes share these numbers but always name an IOVA.
+#[must_use]
+pub const fn fault_site(reason: u16, address: u64) -> FaultSite
+{
+    if reason >= FAULT_REASON_INTERRUPT
+    {
+        FaultSite::InterruptHandle(address)
+    }
+    else
+    {
+        FaultSite::Iova(address)
+    }
+}
+
 /// What keeps VT-d interrupt remapping off for a DMAR ([`remap_obstacle`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RemapObstacle
@@ -820,6 +852,17 @@ mod tests
             remap_obstacle(&two_segments, [true, true].into_iter()),
             Some(RemapObstacle::SegmentsDiffer)
         );
+    }
+
+    /// Defect caught: a VT-d interrupt-remapping fault's handle was logged
+    /// and recorded as the device's latest fault IOVA.
+    #[test]
+    fn a_vtd_interrupt_remapping_fault_names_a_handle_not_an_iova()
+    {
+        assert_eq!(fault_site(0x05, 0x20_0000), FaultSite::Iova(0x20_0000));
+        assert_eq!(fault_site(0x1f, 0x20_0000), FaultSite::Iova(0x20_0000));
+        assert_eq!(fault_site(0x20, 7), FaultSite::InterruptHandle(7));
+        assert_eq!(fault_site(0x26, 7), FaultSite::InterruptHandle(7));
     }
 
     #[test]

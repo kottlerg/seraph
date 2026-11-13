@@ -27,7 +27,9 @@ pub struct Fault
     /// The unit's fault reason code: VT-d's 8-bit fault reason, or the
     /// RISC-V IOMMU's 12-bit `CAUSE`.
     pub reason: u16,
-    /// The faulting IOVA, page-aligned.
+    /// The faulting IOVA, page-aligned; for a VT-d interrupt-remapping fault
+    /// (reason `0x20` and above), the remapping table handle the blocked
+    /// interrupt named instead (`iommu_labels::TAKE_FAULTS`).
     pub iova: u64,
 }
 

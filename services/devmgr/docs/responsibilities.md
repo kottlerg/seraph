@@ -387,9 +387,11 @@ devmgr's responsibilities are:
   DMA capability. The DMA endpoint's `devmgr_dma_labels::DMA_FAULTS` answers a
   device's own caller: devmgr takes and logs the IOMMU driver's recorded faults
   (`iommu_labels::TAKE_FAULTS`), and replies `data[0]` = `DMA_CONFINED` (1)
-  when an IOMMU confines the device, else 0, `data[1]` = faults taken for the
-  device over the boot, `data[2]` = the latest IOVA, page aligned, 0 with
-  none; `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
+  when an IOMMU confines the device, else 0, `data[1]` = DMA translation
+  faults taken for the device over the boot, `data[2]` = the latest's IOVA,
+  page aligned, 0 with none (a VT-d interrupt-remapping fault, whose
+  recorded address is a remapping table handle, is logged only);
+  `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
 
   The [`test-fault`](../../drivers/test-fault/README.md) fixture lives in
   `/tests/drivers/`, which no boot-time pass reads: it binds the QEMU

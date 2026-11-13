@@ -18,7 +18,6 @@
 // root module; submodules need their own import. Harmless no-op
 // otherwise.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 use syscall_abi::SyscallError;

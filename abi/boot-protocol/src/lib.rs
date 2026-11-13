@@ -20,6 +20,7 @@
 //! `core/boot/docs/kernel-handoff.md` for the CPU-state contract at kernel entry.
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 pub mod bundle;
 pub mod layout;

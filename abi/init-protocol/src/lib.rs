@@ -26,6 +26,7 @@
 //! - No dependencies outside `core`.
 
 #![no_std]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 // ── Protocol version ─────────────────────────────────────────────────────────
 

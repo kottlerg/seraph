@@ -14,9 +14,11 @@
 
 /// RISC-V `fence w,o`: prior main-memory writes ordered before subsequent
 /// I/O-region writes.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
+#[expect(
+    clippy::inline_always,
+    reason = "a barrier is one fence (or nothing) that must sit inline at the access it orders; \
+              an out-of-line call would cost more than the fence itself"
+)]
 #[inline(always)]
 pub fn dma_to_mmio_barrier()
 {
@@ -29,9 +31,11 @@ pub fn dma_to_mmio_barrier()
 
 /// RISC-V `fence o,o`: prior I/O-region writes ordered before subsequent
 /// I/O-region writes.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
+#[expect(
+    clippy::inline_always,
+    reason = "a barrier is one fence (or nothing) that must sit inline at the access it orders; \
+              an out-of-line call would cost more than the fence itself"
+)]
 #[inline(always)]
 pub fn mmio_to_mmio_barrier()
 {
@@ -44,9 +48,11 @@ pub fn mmio_to_mmio_barrier()
 
 /// RISC-V `fence i,r`: prior I/O-region reads ordered before subsequent
 /// main-memory reads.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
+#[expect(
+    clippy::inline_always,
+    reason = "a barrier is one fence (or nothing) that must sit inline at the access it orders; \
+              an out-of-line call would cost more than the fence itself"
+)]
 #[inline(always)]
 pub fn mmio_to_dma_barrier()
 {
@@ -59,9 +65,11 @@ pub fn mmio_to_dma_barrier()
 
 /// RISC-V `fence r,o`: prior main-memory reads ordered before subsequent
 /// I/O-region writes.
-// inline_always: a barrier is one fence (or nothing) that must sit inline at the
-// access it orders; an out-of-line call would cost more than the fence itself.
-#[allow(clippy::inline_always)]
+#[expect(
+    clippy::inline_always,
+    reason = "a barrier is one fence (or nothing) that must sit inline at the access it orders; \
+              an out-of-line call would cost more than the fence itself"
+)]
 #[inline(always)]
 pub fn dma_read_to_mmio_barrier()
 {

@@ -15,7 +15,6 @@
 // prelude is not auto-imported into submodules. Mirrors the
 // `shared/ipc/src/bootstrap.rs` shape; no-op on regular no_std builds.
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 /// Reply-label values used by the namespace protocol on error.

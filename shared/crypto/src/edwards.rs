@@ -11,9 +11,11 @@
 //! multiplication is a constant-shape conditional-swap ladder; constant time
 //! is not required for verification, but the swap form is simple and correct.
 
-// many_single_char_names: the addition formula uses the standard a..h
-// extended-coordinate working names; renaming would obscure the published math.
-#![allow(clippy::many_single_char_names)]
+#![expect(
+    clippy::many_single_char_names,
+    reason = "the addition formula uses the standard a..h extended-coordinate working names; \
+              renaming would obscure the published math"
+)]
 
 use crate::field::{self, Fe, GF0, GF1};
 

@@ -17,18 +17,26 @@
 // and rebind `core` to the `rustc_std_workspace_core` facade — same dance
 // as abi/syscall and shared/syscall.
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
-#![cfg_attr(feature = "rustc-dep-of-std", allow(internal_features))]
+#![cfg_attr(
+    feature = "rustc-dep-of-std",
+    expect(
+        internal_features,
+        reason = "`no_core` is an internal feature, needed to build as a dependency of std"
+    )
+)]
 #![cfg_attr(not(feature = "rustc-dep-of-std"), no_std)]
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
-// cast_possible_truncation: userspace targets 64-bit only; u64/usize conversions
-// are lossless. u32 casts on capability slot indices are bounded by CSpace capacity.
-#![allow(clippy::cast_possible_truncation)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "userspace targets are 64-bit only, so u64 to usize is lossless; u32 capability slot \
+              indices are bounded by CSpace capacity"
+)]
 
 #[cfg(feature = "rustc-dep-of-std")]
 extern crate rustc_std_workspace_core as core;
 
 #[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
@@ -89,7 +97,6 @@ pub mod procmgr_labels
     // defines a type and functions, imports the prelude the crate root
     // imports.
     #[cfg(feature = "rustc-dep-of-std")]
-    #[allow(unused_imports)]
     use core::prelude::rust_2024::*;
 
     /// Create a new process from a boot module Memory cap. Caps: `[module,
@@ -1152,7 +1159,6 @@ pub mod svcmgr_labels
     // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
     // defines functions, imports the prelude the crate root imports.
     #[cfg(feature = "rustc-dep-of-std")]
-    #[allow(unused_imports)]
     use core::prelude::rust_2024::*;
 
     /// The one name limit of the svcmgr protocol, in bytes: a service name
@@ -3427,12 +3433,6 @@ pub const STREAM_LABELS_VERSION: u32 = 3;
 ///   § `stream_labels::STREAM_BYTES`); a record carries its own.
 pub mod stream_labels
 {
-    // Under `rustc-dep-of-std` the crate is `no_core`, so this module, which
-    // defines a function, imports the prelude the crate root imports.
-    #[cfg(feature = "rustc-dep-of-std")]
-    #[allow(unused_imports)]
-    use core::prelude::rust_2024::*;
-
     /// Base label ID for stream-bytes messages (bits 0-15).
     pub const STREAM_BYTES: u64 = 10;
     /// Shift of the level field in a [`STREAM_BYTES`] label.

@@ -5,20 +5,18 @@
 
 //! x86-64 raw syscall entry: the `SYSCALL` instruction wrappers.
 
-// `no_core` (feature `rustc-dep-of-std`) disables the automatic prelude in
-// every module, not only the crate root; bring it in here as lib.rs does.
-#[cfg(feature = "rustc-dep-of-std")]
-#[allow(unused_imports)]
-use core::prelude::rust_2024::*;
-
 /// Issue a syscall with up to 2 arguments. Returns the primary return value.
 ///
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
 {
@@ -50,9 +48,13 @@ pub unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 {
@@ -85,9 +87,13 @@ pub unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64
 {
@@ -121,9 +127,13 @@ pub unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> 
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 {
@@ -167,9 +177,13 @@ pub unsafe fn syscall3(nr: u64, a0: u64, a1: u64, a2: u64) -> i64
 /// leave untouched everything the calling program runs on (see that contract's
 /// four conditions). Under it any argument value is admissible, and `nr` need
 /// not be a defined syscall.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall4_any(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 {
@@ -207,9 +221,13 @@ pub unsafe fn syscall4_any(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> (i64, u64)
 {
@@ -246,9 +264,13 @@ pub unsafe fn syscall5_ret2(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
 {
@@ -283,9 +305,13 @@ pub unsafe fn syscall2_ret3(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64)
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall2_ret4(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64, u64)
 {
@@ -321,9 +347,13 @@ pub unsafe fn syscall2_ret4(nr: u64, a0: u64, a1: u64) -> (i64, u64, u64, u64)
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall6_ret3(
     nr: u64,
@@ -365,9 +395,13 @@ pub unsafe fn syscall6_ret3(
 /// # Safety
 ///
 /// The raw-wrapper contract in [`crate::arch`] § Safety.
-// inline_always: syscall wrapper contains inline asm; must inline to call site.
-// cast_possible_wrap: u64 syscall number reinterpreted as i64 register value; bit pattern preserved.
-#[allow(clippy::inline_always, clippy::cast_possible_wrap)]
+#[expect(
+    clippy::inline_always,
+    clippy::cast_possible_wrap,
+    reason = "syscall wrapper contains inline asm and must inline to the call site; the u64 \
+              syscall number is reinterpreted as an i64 register value with its bit pattern \
+              preserved"
+)]
 #[inline(always)]
 pub unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64
 {

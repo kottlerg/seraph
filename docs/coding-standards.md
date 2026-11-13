@@ -109,13 +109,12 @@ as the rule above that the lint checks says. Test code is exempt from `panic`,
 configuration's relaxation, to which the roll-out ends by adding them. Two of the lints take a
 setting from Clippy's configuration file, `clippy.toml`: `max-fn-params-bools = 0`, so that
 `fn_params_excessive_bools` reports every function with a `bool` parameter, and
-`stack-size-threshold`, the frame above which `large_stack_frames` reports. The threshold is a
-quarter of the smallest stack the crate's code runs on: 4096 bytes for `core/kernel`, whose thread
-and idle stacks are 16 KiB (`KERNEL_STACK_PAGES`), 32768 bytes for `core/boot`, which runs on the
-128 KiB stack the UEFI specification guarantees a boot-services image, and Clippy's default of
-512,000 bytes for every other crate. `core/boot` and `core/kernel` each add a `clippy.toml` with
-both settings when their sites are fixed, and the roll-out ends with the root `clippy.toml`. Until
-then a site added in a crate or subsystem whose sites are fixed follows the same rule.
+`stack-size-threshold`, the frame above which `large_stack_frames` reports. For `core/boot` and
+`core/kernel` the threshold is a quarter of the smallest stack any of the crate's code runs on, and
+every other crate keeps Clippy's default of 512,000 bytes. `core/boot` and `core/kernel` each add
+a `clippy.toml` with both settings, and the stack the threshold derives from, when their sites are
+fixed, and the roll-out ends with the root `clippy.toml`. Until then a site added in a crate or
+subsystem whose sites are fixed follows the same rule.
 
 `clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
 suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions

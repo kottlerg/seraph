@@ -61,9 +61,15 @@ const FDT_BEGIN_NODE: u32 = 1;
 const FDT_END_NODE: u32 = 2;
 const FDT_PROP: u32 = 3;
 const FDT_NOP: u32 = 4;
-// `FDT_END` is named only by the test `FdtBuilder`, so `dead_code` fires only in non-test
-// builds; the walkers reach it, like any unknown token, through the `_ => break` arm.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "`FDT_END` is named only by the test `FdtBuilder`, so `dead_code` fires only in \
+                  non-test builds; the walkers reach it, like any unknown token, through the \
+                  `_ => break` arm"
+    )
+)]
 const FDT_END: u32 = 9;
 
 /// Maximum FDT node nesting depth the walkers track. Device trees in the wild
@@ -107,10 +113,7 @@ pub struct Fdt
 /// Data extracted from a single FDT node.
 ///
 /// The `irq_*` fields capture the node's `interrupts` property so the
-/// walker can expose raw interrupt specifiers to callers that need them;
-/// no current consumer does, but the field is part of the node's data
-/// shape and the walker would have to be edited either way to remove it.
-#[allow(dead_code)]
+/// walker can expose raw interrupt specifiers to callers that need them.
 #[derive(Clone, Copy)]
 pub struct FdtNode
 {
@@ -119,8 +122,20 @@ pub struct FdtNode
     /// Number of valid entries in [`reg_entries`].
     pub reg_count: usize,
     /// Interrupt specifiers from the `interrupts` property (raw u32 values).
+    #[expect(
+        dead_code,
+        reason = "no current consumer reads the node's raw interrupt specifiers, but they are \
+                  part of the node's data shape, and the walker would have to be edited either \
+                  way to remove them"
+    )]
     pub irq_entries: [u32; MAX_IRQ_ENTRIES],
     /// Number of valid entries in [`irq_entries`].
+    #[expect(
+        dead_code,
+        reason = "no current consumer reads the node's raw interrupt specifiers, but they are \
+                  part of the node's data shape, and the walker would have to be edited either \
+                  way to remove them"
+    )]
     pub irq_count: usize,
     /// Where the node's `ranges` property data lies in the struct block, as
     /// `(offset, length)`; `(0, 0)` when it has none. [`Fdt::pci_ranges`]
@@ -425,9 +440,11 @@ impl Fdt
     /// `compatible` property contains `compat` as one of its strings.
     ///
     /// `callback` returns `true` to continue or `false` to stop early.
-    // too_many_lines: DTB traversal state machine; splitting would fragment the
-    // node-tracking logic across functions without meaningful abstraction.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "DTB traversal state machine; splitting would fragment the node-tracking logic \
+                  across functions without meaningful abstraction"
+    )]
     pub(crate) fn walk_compatible<F>(&self, compat: &[u8], mut callback: F)
     where
         F: FnMut(FdtNode) -> bool,
@@ -595,9 +612,15 @@ impl Fdt
 
     /// Call `f` for each node whose `compatible` property contains `compat`.
     ///
-    /// Only called from `core/boot/src/arch/riscv64/serial.rs`; on x86-64 the DTB parser
-    /// is still compiled but no caller for this helper exists.
-    #[allow(dead_code)]
+    /// Only called from `core/boot/src/arch/riscv64/serial.rs`.
+    #[cfg_attr(
+        target_arch = "x86_64",
+        expect(
+            dead_code,
+            reason = "the only caller is core/boot/src/arch/riscv64/serial.rs, so x86-64 has \
+                      none; the DTB parser is compiled on every architecture"
+        )
+    )]
     pub fn for_each_compatible<F: FnMut(&FdtNode)>(&self, compat: &[u8], mut f: F)
     {
         self.walk_compatible(compat, |node| {
@@ -618,9 +641,11 @@ impl Fdt
     ///
     /// CPU nodes without a `status` property (or with `status = "okay"`) are
     /// counted as enabled. `status = "disabled"` is skipped.
-    // too_many_lines: DTB traversal state machine; splitting would fragment the
-    // node-tracking logic across functions without meaningful abstraction.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "DTB traversal state machine; splitting would fragment the node-tracking logic \
+                  across functions without meaningful abstraction"
+    )]
     pub fn walk_cpu_nodes<F>(&self, mut callback: F)
     where
         F: FnMut(u32, u64, Option<PagingMode>) -> bool,
@@ -834,9 +859,11 @@ impl Fdt
     /// only when something references it.
     ///
     /// `callback` returns `true` to continue or `false` to stop early.
-    // too_many_lines: DTB traversal state machine; splitting would fragment the
-    // node-tracking logic across functions without meaningful abstraction.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "DTB traversal state machine; splitting would fragment the node-tracking logic \
+                  across functions without meaningful abstraction"
+    )]
     pub(crate) fn walk_cpu_intc<F>(&self, mut callback: F)
     where
         F: FnMut(u32, u32) -> bool,
@@ -1103,9 +1130,11 @@ impl Fdt
 /// the struct block. Returns the offset after the name, or `None` when the
 /// 4-byte-aligned offset after it would overflow the u32 struct-block offset
 /// (a name ending at the top of a ~4 GiB struct block).
-// `len` (usize) is bounded by `max` which equals `size_struct.saturating_sub(start)` (u32),
-// so the `len as u32` cast below cannot truncate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`len` (usize) is bounded by `max` which equals `size_struct.saturating_sub(start)` \
+              (u32), so the `len as u32` cast cannot truncate"
+)]
 fn skip_node_name(fdt: &Fdt, start: u32) -> Option<u32>
 {
     let base_addr = block_addr(fdt.base, fdt.off_struct, start)?;
@@ -1147,8 +1176,8 @@ fn prop_contains(data: &[u8], target: &[u8]) -> bool
 ///
 /// The leading base segment (`rv64imafdc…`) can never equal a multi-letter
 /// extension name, so no special-casing is needed. Shared by the DTB
-/// `riscv,isa` fallback here and the ACPI RHCT ISA-string node parser in
-/// [`crate::arch::riscv64`].
+/// `riscv,isa` fallback here and the ACPI RHCT ISA-string node parser,
+/// `parse_rhct` in [`crate::acpi`].
 pub(crate) fn isa_string_has_ext(data: &[u8], ext: &[u8]) -> bool
 {
     let isa = match data.iter().position(|&b| b == 0)
@@ -1251,8 +1280,10 @@ pub unsafe fn place_hart_ids(dtb_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
              dropped"
         );
     }
-    // filled is at most out.len(), at most MAX_CPUS, which fits in u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "filled is at most out.len(), at most MAX_CPUS, which fits in u32"
+    )]
     let count = filled as u32;
     count
 }
@@ -1270,9 +1301,15 @@ pub unsafe fn place_hart_ids(dtb_addr: u64, bsp_id: u32, out: &mut [u32]) -> u32
 ///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
-// dead_code: the only caller is core/boot/src/arch/riscv64/dtb_kernel_mmio.rs;
-// the module is compiled on every arch.
-#[allow(dead_code)]
+#[cfg_attr(
+    all(target_arch = "x86_64", not(test)),
+    expect(
+        dead_code,
+        reason = "the only caller is core/boot/src/arch/riscv64/dtb_kernel_mmio.rs, so the x86-64 \
+                  build has none, and the host tests call it; this module is compiled on every \
+                  architecture"
+    )
+)]
 pub unsafe fn parse_hart_caps(dtb_addr: u64) -> (u64, u64)
 {
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.
@@ -1306,9 +1343,14 @@ pub unsafe fn parse_hart_caps(dtb_addr: u64) -> (u64, u64)
 ///
 /// # Safety
 /// `dtb_addr` must be the physical address of a valid, identity-mapped FDT.
-// dead_code: the only caller is core/boot/src/arch/riscv64/paging.rs;
-// the module is compiled on every arch.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "x86_64",
+    expect(
+        dead_code,
+        reason = "the only caller is core/boot/src/arch/riscv64/paging.rs, so x86-64 has none; \
+                  this module is compiled on every architecture"
+    )
+)]
 pub unsafe fn parse_boot_cpu_mmu_type(dtb_addr: u64, boot_hart_id: u64) -> Option<PagingMode>
 {
     // SAFETY: caller guarantees dtb_addr is identity-mapped DTB.

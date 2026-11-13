@@ -71,8 +71,11 @@ fn acc_for(cpu: usize) -> Option<&'static Acc>
         return None;
     }
     // SAFETY: slab published by `init_storage` is sized to CPU_COUNT; callers
-    // pass `cpu < CPU_COUNT`. Atomic fields give safe shared access.
-    Some(unsafe { &*base.add(cpu) })
+    // pass `cpu < CPU_COUNT`, so the offset stays inside it.
+    let slot = unsafe { base.add(cpu) };
+    // SAFETY: `slot` is a zero-filled slab row, a valid empty `Acc` for the
+    // kernel's lifetime. Atomic fields give safe shared access.
+    Some(unsafe { &*slot })
 }
 
 /// Fold a cycle-counter sample for `cpu` into its buffer. Interrupt-safe:

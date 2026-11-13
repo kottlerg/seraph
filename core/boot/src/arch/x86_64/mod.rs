@@ -29,11 +29,11 @@ pub mod serial;
 pub use handoff::{perform_handoff, trampoline_page_range};
 pub use paging::BootPageTable;
 
-use crate::elf::EM_X86_64;
 use crate::error::BootError;
 use crate::firmware::FirmwareInfo;
 use crate::uefi::{EfiBootServices, EfiSystemTable, allocate_pages_max_addr};
 use boot_protocol::KernelMmio;
+use elf::EM_X86_64;
 
 /// ELF machine type expected for x86-64 kernel binaries.
 pub const EXPECTED_ELF_MACHINE: u16 = EM_X86_64;
@@ -92,10 +92,11 @@ pub unsafe fn pre_serial_init(_st: *mut EfiSystemTable) {}
 /// # Safety
 /// `bs` must be valid boot services (before `ExitBootServices`), and the call
 /// must precede step 6.
-// unnecessary_wraps: Result signature is the cross-arch contract with the
-// riscv64 hook, whose probe can genuinely fail; x86-64 falls back to the
-// firmware's depth instead of failing.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Result signature is the cross-arch contract with the riscv64 hook, whose probe can \
+              genuinely fail; x86-64 falls back to the firmware's depth instead of failing"
+)]
 pub unsafe fn negotiate_paging(
     bs: *mut EfiBootServices,
     _dtb_addr: u64,

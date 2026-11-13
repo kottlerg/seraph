@@ -59,11 +59,14 @@ pub fn capture(cpu: usize)
     }
     let mut buf = [0u8; SAMPLE];
     super::fill_bytes(&mut buf);
-    // SAFETY: slab sized to CPU_COUNT; each CPU writes only its own row; the
-    // BSP reads after the APS_READY Acquire barrier.
+    // SAFETY: slab sized to CPU_COUNT and `cpu` is the calling CPU's index,
+    // below it, so the offset stays inside the slab.
+    let row = unsafe { base.add(cpu) };
+    // SAFETY: `row` is the calling CPU's own row, which only this CPU writes;
+    // the BSP reads after the APS_READY Acquire barrier.
     unsafe {
         core::ptr::write(
-            base.add(cpu),
+            row,
             Sample {
                 bytes: buf,
                 captured: true,

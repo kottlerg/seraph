@@ -592,11 +592,10 @@ pub unsafe fn revoke_subtree_batch(
             }
             // Hoist: g leaves head's child list and becomes root's first
             // child (head keeps its own list position).
+            // SAFETY: DERIVATION_LOCK held; g is live.
+            unsafe { unlink_node(g) };
             // SAFETY: DERIVATION_LOCK held; g and root are live.
-            let linked = unsafe {
-                unlink_node(g);
-                link_child(root, g)
-            };
+            let linked = unsafe { link_child(root, g) };
             debug_assert!(linked, "revoke hoist link dropped under DERIVATION_LOCK");
         }
         else
@@ -696,14 +695,19 @@ unsafe fn unlink_free_collect(id: SlotId) -> Option<NonNull<KernelObjectHeader>>
     // same cspace; it nests inside DERIVATION_LOCK
     // (core/kernel/docs/scheduling-internals.md § Lock Hierarchy).
     // SAFETY: cspace registry lookup validated; CSpace pointer lives as
-    // long as the registry entry; lock_raw/unlock_raw paired.
-    let saved = unsafe { (*cs_ptr).lock.lock_raw() };
+    // long as the registry entry.
+    let lock = unsafe { &(*cs_ptr).lock };
+    // SAFETY: lock_raw/unlock_raw paired.
+    let saved = unsafe { lock.lock_raw() };
     // SAFETY: lock held; aliasing prevented.
     let cs = unsafe { &mut *cs_ptr };
     let obj_ptr = cs.slot_mut(id.index.get()).and_then(|slot| slot.object);
     cs.free_slot(id.index.get());
+    // SAFETY: cspace registry lookup validated; CSpace pointer lives as
+    // long as the registry entry.
+    let lock = unsafe { &(*cs_ptr).lock };
     // SAFETY: paired with lock_raw above.
-    unsafe { (*cs_ptr).lock.unlock_raw(saved) };
+    unsafe { lock.unlock_raw(saved) };
 
     obj_ptr
 }

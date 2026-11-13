@@ -1200,37 +1200,36 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
 /// Answer `QUERY_PROCESS` for the addressed entry, from `state`, the table
 /// state the caller holds locked.
 ///
-/// Consults the kernel for the authoritative thread-lifecycle snapshot
-/// (`CAP_INFO_THREAD_STATE`) so a freshly-faulted child is reported as
-/// EXITED even before procmgr's own death-event drain has reaped the
-/// entry. Without this, the userspace death-eq drain races a parent's
-/// "wait then `QUERY_PROCESS`" sequence and produces a transient ALIVE
-/// answer for an already-dead child.
+/// Consults the kernel for the authoritative records, the main thread's
+/// lifecycle snapshot (`CAP_INFO_THREAD_STATE`) and the address space's
+/// terminal fault (`CAP_INFO_ASPACE_TERMINAL_FAULT`), so a child whose main
+/// thread exited or any of whose threads took a terminal fault is reported
+/// as EXITED even before procmgr's own death-event drain has reaped the
+/// entry (`process_table::QueryEntry::state`). Without this, the userspace
+/// death-eq drain races a parent's "wait then `QUERY_PROCESS`" sequence and
+/// produces a transient ALIVE answer for an already-dead child.
 fn resolve_query_state(badge: u64, state: &mut process::TableState) -> (u64, u64)
 {
     use ipc::procmgr_process_state;
     let process::TableState { table, recent } = state;
-    if let Some((started, thread_cap)) = table.query_by_badge(badge)
+    if let Some(entry) = table.query_by_badge(badge)
     {
-        // Kernel-authoritative override: if the thread has transitioned to
-        // Exited, report EXITED with the kernel-recorded reason regardless
-        // of whether `dispatch_death` has reaped the entry yet.
-        if let Ok(packed) = syscall::cap_info(thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        let main_thread =
+            syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
+        let terminal_fault = syscall::cap_info(
+            entry.aspace_cap,
+            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+        )
+        .ok();
+        match entry.state(
+            main_thread,
+            syscall_abi::THREAD_STATE_EXITED,
+            terminal_fault,
+        )
         {
-            let state_code = (packed >> 32) as u32;
-            let reason = packed & 0xFFFF_FFFF;
-            if state_code == syscall_abi::THREAD_STATE_EXITED
-            {
-                return (procmgr_process_state::EXITED, reason);
-            }
-        }
-        if started
-        {
-            (procmgr_process_state::ALIVE, 0u64)
-        }
-        else
-        {
-            (procmgr_process_state::CREATED, 0u64)
+            process::QueryState::Exited(reason) => (procmgr_process_state::EXITED, reason),
+            process::QueryState::Alive => (procmgr_process_state::ALIVE, 0u64),
+            process::QueryState::Created => (procmgr_process_state::CREATED, 0u64),
         }
     }
     else if let Some(reason) = recent.find(badge, now_ns())

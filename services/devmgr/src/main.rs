@@ -814,8 +814,13 @@ impl Registry
                         let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
                             .cap(send)
                             .build();
+                        // A reply that fails moves no cap: the SEND is
+                        // devmgr's still, and deleted, so no slot leaks.
                         // SAFETY: ipc_buf is this worker's registered IPC buffer.
-                        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+                        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+                        {
+                            let _ = syscall::cap_delete(send);
+                        }
                     }
                     Err(code) => reply_status(code, ipc_buf),
                 }
@@ -938,7 +943,8 @@ const IOMMU_DRIVERS: usize = 1;
 /// Reply to a device query with a `SEND_GRANT` badged `verb_bits` on the
 /// service endpoint of the served driver `lookup` names; `WITHDRAWN` when
 /// that driver was withdrawn, `absent` when no driver is served there, and
-/// `INVALID_REQUEST` when the derivation fails.
+/// `INVALID_REQUEST` when the derivation fails. A reply that fails moves no
+/// cap, so the derived one is deleted.
 fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, ipc_buf: *mut u64)
 {
     let driver = match lookup
@@ -957,7 +963,10 @@ fn reply_served(lookup: Lookup<'_, ServedDriver>, verb_bits: u64, absent: u64, i
         .cap(derived)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        let _ = syscall::cap_delete(derived);
+    }
 }
 
 /// The instance ordinal a `QUERY_DEVICE` request selects: `data[1]` when sent, else 0, the first instance.

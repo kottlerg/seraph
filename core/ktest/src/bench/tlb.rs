@@ -121,7 +121,8 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
     crate::log_u64("ktest: bench  cpus=", cpus);
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "cpus is < 256 on every supported platform"
+        reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 CPU count \
+                  converts losslessly; the result is then capped at MAX_PINNED"
     )]
     let pin_count = (cpus.saturating_sub(1) as usize).min(MAX_PINNED);
 
@@ -533,7 +534,8 @@ pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u3
     crate::log_u64("ktest: bench  cpus=", cpus);
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "cpus < 256 on every supported platform"
+        reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 CPU count \
+                  converts losslessly; the result is then capped at MAX_PINNED"
     )]
     let want = (cpus.saturating_sub(1) as usize).min(MAX_PINNED);
     if want == 0

@@ -93,20 +93,21 @@ extern "C" fn overflow_child(_arg: u64) -> !
 }
 
 /// A frame larger than the stack and its guard together, which stores to its
-/// lowest byte.
+/// lowest byte and to no other: the local is left uninitialised, so no fill
+/// walks up through the guard from below and faults whatever the probes do.
 #[expect(
     clippy::large_stack_frames,
-    clippy::large_stack_arrays,
     reason = "the frame overflows its 16 KiB `ChildStack` on purpose: the test is that it faults \
               in the guard"
 )]
 #[inline(never)]
 fn overflow()
 {
-    let mut frame = [0u8; OVERFLOW_BYTES];
-    let lowest = frame.as_mut_ptr();
-    // SAFETY: `lowest` points to the first byte of `frame`, a live local.
-    // With the probes the prologue has already faulted before this store.
+    let mut frame = core::mem::MaybeUninit::<[u8; OVERFLOW_BYTES]>::uninit();
+    let lowest = frame.as_mut_ptr().cast::<u8>();
+    // SAFETY: `lowest` points to the first byte of `frame`, a live local;
+    // writing a `u8` there needs no initialised value. With the probes the
+    // prologue has already faulted in the guard before this store.
     unsafe { lowest.write_volatile(1) };
     core::hint::black_box(&frame);
 }

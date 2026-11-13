@@ -28,6 +28,23 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 mod arch;
 
@@ -787,7 +804,11 @@ impl Stub
                     }
                     None => 0,
                 },
-                _ => 0,
+                Event::Ack
+                | Event::Nack
+                | Event::Interrupt
+                | Event::BadChecksum
+                | Event::Overflow => 0,
             };
             let kind = match event
             {
@@ -998,12 +1019,12 @@ impl Stub
             }
             Command::Continue { addr, signal } =>
             {
-                let plan = control::plan_resume(false, signal, self.current());
+                let plan = control::plan_continue(signal, self.current());
                 self.resume(plan, addr, ipc_buf);
             }
             Command::Step { addr, signal } =>
             {
-                let plan = control::plan_resume(true, signal, self.current());
+                let plan = control::plan_step(signal, self.current());
                 self.resume(plan, addr, ipc_buf);
             }
             Command::VContQuery => self.send(ipc_buf, |w| {

@@ -89,7 +89,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         match self.arena.get(rec).node
         {
             Node::Process(r) => Some(r),
-            _ => None,
+            Node::Free | Node::Run(_) | Node::Region(_) | Node::Frame(_) => None,
         }
     }
 

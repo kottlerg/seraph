@@ -223,5 +223,6 @@ fn notification_channel(channel: &Channel, ok: bool)
 {
     let mut st = channel.0.lock().unwrap_or_else(PoisonError::into_inner);
     *st = Some(ok);
+    drop(st);
     channel.1.notify_one();
 }

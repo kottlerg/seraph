@@ -305,6 +305,7 @@ pub fn handle_register(req: &IpcMessage, ipc_buf: *mut u64, deaths: &Mutex<Death
         logd_thread,
         donate_caps: Vec::with_capacity(32),
     });
+    drop(guard);
     reply(ipc_buf, procmgr_errors::SUCCESS);
 }
 

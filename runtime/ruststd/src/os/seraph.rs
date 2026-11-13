@@ -982,14 +982,20 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
 /// via `cap_create_aspace` augment-mode, so `mmio_map`/`mem_map` of the
 /// region draws its intermediate page tables from this caller-funded,
 /// memmgr-accounted budget rather than the fixed kernel PT reserve. Call
-/// once before mapping a region whose PT cost may exceed the AS's spare
-/// budget (every driver mapping discovered MMIO).
+/// before mapping a region whose PT cost may exceed the AS's spare budget
+/// (every driver mapping discovered MMIO). Only the pool's shortfall against
+/// the region's worst case is donated.
 ///
-/// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
-/// unreachable, the request/augment fails, or the budget still falls short
-/// after the funding rounds (another thread of the process drained it
-/// meanwhile); the subsequent map then fails with `OutOfMemory` rather than
-/// silently drawing on the reserve.
+/// The pool is shared by every mapping of the process, the pager's included,
+/// so the top-up is not reserved for the region: another thread's mapping can
+/// draw it first, and the map then fails with `OutOfMemory` rather than
+/// silently drawing on the reserve. A caller whose process maps from more than
+/// one thread tops up again and repeats such a map, a bounded number of times.
+///
+/// `region_pages == 0` is a no-op success. Returns `false` only when a top-up
+/// was needed and could not be had: memmgr is unreachable or refuses the grant,
+/// or the kernel refuses the donation. A pool that reads short after donations
+/// that were made is no failure.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
     pal_alloc::fund_aspace_pt_budget(self_aspace, region_pages)
@@ -1071,17 +1077,16 @@ pub fn register_demand_paged(pages: u64) -> crate::io::Result<ReservedRange> {
     }
     let range = reserve_pages(pages)
         .map_err(|_| crate::io::Error::other("seraph: VA reservation failed"))?;
-    // Fund this address space's page-table growth budget for the region. The
-    // pager maps frames into this AS on fault via `map_page_pooled`, which
-    // draws intermediate page tables from the AS's own retype-backed pool. The
-    // funding is not reserved for the region, since any other mapping of the
-    // process may draw it first; the pager funds the pool itself when a fault
-    // finds it exhausted (services/memmgr/docs/memory-pool.md § Client
-    // page-table funding), so this keeps the common fault off that path.
-    if !fund_aspace_pt_budget(info.self_aspace, pages) {
-        unreserve_pages(range);
-        return Err(crate::io::Error::other("seraph: page-table budget funding failed"));
-    }
+    // Top up this address space's page-table growth budget for the region, as
+    // best effort. The pager maps frames into this AS on fault via
+    // `map_page_pooled`, which draws intermediate page tables from the AS's
+    // own retype-backed pool. The funding is not reserved for the region,
+    // since any other mapping of the process may draw it first; the pager
+    // funds the pool itself when a fault finds it exhausted
+    // (services/memmgr/docs/memory-pool.md § Client page-table funding), so
+    // the top-up only keeps the common fault off that path, and its outcome
+    // does not decide the registration.
+    let _ = fund_aspace_pt_budget(info.self_aspace, pages);
     // SAFETY: current_ipc_buf returns the registered IPC buffer page.
     if !unsafe { register_rw_region(memmgr_ep, ipc_buf, range.va_start(), pages) } {
         unreserve_pages(range);
@@ -1287,10 +1292,10 @@ fn register_main_stack_growth(stack_top: u64, committed_pages: u32) -> crate::io
         return Err(const_error!(ErrorKind::Other, "seraph: no pager (memmgr unreachable)"));
     }
     // The pager maps the range's frames from this address space's page-table
-    // pool, which the loader's mappings did not fund for it.
-    if !fund_aspace_pt_budget(info.self_aspace, pages) {
-        return Err(const_error!(ErrorKind::Other, "seraph: page-table budget funding failed"));
-    }
+    // pool, which the loader's mappings did not fund for it. Best effort, as
+    // for every demand region (`register_demand_paged`): the pager funds the
+    // pool itself when a fault finds it exhausted.
+    let _ = fund_aspace_pt_budget(info.self_aspace, pages);
     // SAFETY: current_ipc_buf returns the registered IPC buffer page.
     if !unsafe { register_rw_region(info.memmgr_endpoint, ipc_buf, base, pages) } {
         return Err(const_error!(ErrorKind::Other, "seraph: REGISTER_REGION rejected"));
@@ -2111,10 +2116,18 @@ pub mod process {
             // SAFETY: `va` is the base of a window reserved just above from the
             // per-process reservation arena (`sys::reserve`), which hands out VA
             // no Rust object or IPC page occupies; this call owns it, and
-            // `chunk` is at most its size.
-            if unsafe { syscall::mem_map(rw, aspace, va, offset, chunk, syscall::MAP_WRITABLE) }
-                .is_err()
-            {
+            // `chunk` is at most its size. `aspace` is this process's own.
+            let mapped = unsafe {
+                crate::sys::alloc::seraph::mem_map_funded(
+                    rw,
+                    aspace,
+                    va,
+                    offset,
+                    chunk,
+                    syscall::MAP_WRITABLE,
+                )
+            };
+            if mapped.is_err() {
                 // The kernel maps page by page and stops at the first
                 // failure, so pages before it may be mapped: unmap the whole
                 // chunk (unmapping a page that was never mapped is harmless).

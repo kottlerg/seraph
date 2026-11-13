@@ -70,24 +70,12 @@ const HEAP_INITIAL_PAGES: u64 = 512;
 /// round-trip over many small follow-up allocations. 16 pages = 64 KiB.
 const GROW_MIN_PAGES: u64 = 16;
 
-/// Augment rounds a page-table funding path may make before giving up: the
-/// map retry alternates a map attempt with a one-page augment, the budget
-/// top-up alternates a budget read with a shortfall-sized augment, and each
-/// ends with one more attempt or read after its last augment.
-///
-/// The kernel keeps a donation's first page as its own donation bookkeeping
-/// once per record page (see `SYS_CAP_CREATE_ASPACE`), so a single
-/// donation can seed one page fewer than it carried. A record page opened by
-/// one round has room for the next round's record, so a second round covers
-/// the shortfall unless other threads of the process fill that page in
-/// between; the trailing budget check decides either way.
-const PT_FUND_ROUNDS: u32 = 2;
-
 /// Augment rounds `fund_cspace_slot_budget` makes before giving up. A CSpace
 /// donation also gives up a page once per record page of its bookkeeping
-/// (see `SYS_CAP_CREATE_CSPACE`), so, as for `PT_FUND_ROUNDS`, a second round
-/// covers that shortfall unless other threads of the process take the slots
-/// in between; the trailing headroom check decides either way.
+/// (see `SYS_CAP_CREATE_CSPACE`), so, as for the page-table pool's
+/// `pt_funding::PT_FUND_ROUNDS`, a second round covers that shortfall unless
+/// other threads of the process take the slots in between; the trailing
+/// headroom check decides either way.
 const CSPACE_FUND_ROUNDS: u32 = 2;
 
 // ── Spin mutex ──────────────────────────────────────────────────────────────
@@ -493,8 +481,13 @@ impl Heap {
                 let va = start_va + mapped * PAGE_SIZE;
                 // SAFETY: `va` and the cap's pages lie in the unmapped part of
                 // the heap zone the caller's contract names (`mapped` never
-                // exceeds `pages`).
-                if !unsafe { self.mem_map_with_augment_retry(cap_slot, va, pages_in_cap) } {
+                // exceeds `pages`), so no live Rust object or IPC page lies in
+                // them. The map runs under the heap lock: the top-ups it may
+                // make allocate nothing (`mem_map_funded`).
+                let map = unsafe {
+                    mem_map_funded(cap_slot, self.self_aspace, va, 0, pages_in_cap, MAP_WRITABLE)
+                };
+                if map.is_err() {
                     // SAFETY: the same span, which nothing but this failed map
                     // touched.
                     keep_failed =
@@ -523,46 +516,6 @@ impl Heap {
             self.mapped_end = region_base + region_bytes;
         }
         complete
-    }
-
-    /// `mem_map` wrapper that augments the AS's PT growth budget on
-    /// `OutOfMemory` and retries.
-    ///
-    /// `mem_map` returns `OutOfMemory` (-8) when the destination AS's PT
-    /// growth budget is exhausted (a new intermediate page-table page is
-    /// needed but the budget has none). We acquire a fresh Memory cap from
-    /// memmgr, augment the AS via `cap_create_aspace(memory_cap, self_aspace,
-    /// init_pages=1)`, and retry the map — augmenting up to `PT_FUND_ROUNDS`
-    /// times. If the map still fails the caller treats the grow as failed.
-    ///
-    /// # Safety
-    /// The contract of `syscall::mem_map` for `pages` pages at `va` in this
-    /// process's own address space.
-    unsafe fn mem_map_with_augment_retry(&self, memory_cap: u64, va: u64, pages: u64) -> bool {
-        const SYSCALL_OUT_OF_MEMORY: i64 = -8;
-        for _ in 0..PT_FUND_ROUNDS {
-            // SAFETY: the caller's contract covers the span.
-            match unsafe { syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) } {
-                Ok(()) => return true,
-                Err(SYSCALL_OUT_OF_MEMORY) => { /* fall through to augment + retry */ }
-                Err(_) => return false,
-            }
-            // Augment: request 1 page from memmgr, feed to cap_create_aspace
-            // in augment mode (target = self_aspace). Single page covers
-            // ~511 new PT-entries' worth of mappable VA. The AS's donation
-            // record holds its own ref on the augment's MemoryObject
-            // (`add_donation` in `sys_cap_create_aspace`), so the slab
-            // machinery reclaims the source cap slot.
-            if object_slab_retype(PAGE_SIZE, |aug| {
-                syscall::cap_create_aspace(aug, self.self_aspace, 1).ok()
-            })
-            .is_none()
-            {
-                return false;
-            }
-        }
-        // SAFETY: the caller's contract covers the span.
-        unsafe { syscall::mem_map(memory_cap, self.self_aspace, va, 0, pages, MAP_WRITABLE) }.is_ok()
     }
 }
 
@@ -654,10 +607,10 @@ fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
 }
 
 /// Register the heap floor `[heap_base, + HEAP_INITIAL_PAGES)` as a demand
-/// region with this process's pager, funding the page tables the pager's
-/// maps will need. Returns `false`, leaving the floor to be mapped eagerly,
-/// when the process has no pager (`ProcessInfo.pager_endpoint_cap` zero:
-/// pinned, or procmgr's binding failed) or funding or registration fails.
+/// region with this process's pager, topping up the page tables the pager's
+/// maps will need first. Returns `false`, leaving the floor to be mapped
+/// eagerly, when the process has no pager (`ProcessInfo.pager_endpoint_cap`
+/// zero: pinned, or procmgr's binding failed) or registration fails.
 /// Allocates nothing: it runs before the heap exists.
 fn register_demand_floor(memmgr_ep: u64, self_aspace: u64, heap_base: u64) -> bool {
     let has_pager =
@@ -669,9 +622,10 @@ fn register_demand_floor(memmgr_ep: u64, self_aspace: u64, heap_base: u64) -> bo
     // The page-table funding retypes from the object slab, whose refill path
     // `_start` otherwise wires after the heap.
     object_slab_init(memmgr_ep);
-    if !fund_aspace_pt_budget(self_aspace, HEAP_INITIAL_PAGES) {
-        return false;
-    }
+    // Best effort, as for every demand region (`register_demand_paged`): the
+    // pager funds the pool itself when a fault finds it exhausted, so the
+    // top-up only keeps the floor's first faults off that path.
+    let _ = fund_aspace_pt_budget(self_aspace, HEAP_INITIAL_PAGES);
     // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
     unsafe {
         crate::os::seraph::register_rw_region(memmgr_ep, ipc_buf, heap_base, HEAP_INITIAL_PAGES)
@@ -1219,48 +1173,80 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// onto the AS's PT pool with `cap_create_aspace` in augment mode, so the
 /// kernel draws the region's intermediate page tables from this
 /// caller-funded, memmgr-accounted budget rather than the fixed kernel PT
-/// reserve. Call once before `mmio_map`/`mem_map` of a region whose PT
-/// cost may exceed the AS's spare budget.
+/// reserve. The need is `pt_funding::pt_pages_for(region_pages)`, the
+/// worst case for a contiguous run, and only the pool's shortfall against
+/// it is donated, in at most `pt_funding::PT_FUND_ROUNDS` donations
+/// (`pt_funding::top_up`).
 ///
-/// `region_pages == 0` is a no-op success. Returns `false` if memmgr is
-/// unreachable, the request/augment fails, or the budget still falls short
-/// after `PT_FUND_ROUNDS` rounds (another thread of the process drained
-/// it meanwhile); the subsequent map then fails with `OutOfMemory` rather
-/// than silently drawing on the reserve.
+/// The pool is shared by every mapping of the process, the pager's
+/// included, so the top-up is not reserved for the region: another thread's
+/// mapping can draw it before the region's map runs. A map into the
+/// process's own address space therefore goes through [`mem_map_funded`],
+/// which tops up again while the map finds the pool exhausted, and a
+/// demand-region registration treats the top-up as best effort, since the
+/// pager funds the pool itself when a fault finds it exhausted
+/// (services/memmgr/docs/memory-pool.md § Client page-table funding).
+///
+/// `region_pages == 0` is a no-op success. Returns `false` only when a
+/// top-up was needed and could not be had: memmgr is unreachable or refuses
+/// the grant, or the kernel refuses the donation. A pool that reads short
+/// after donations that were made is no failure, since another thread's
+/// mapping drew it.
+///
+/// Allocates nothing, so the heap's grow can call it under the heap lock.
 pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
-    if region_pages == 0 {
-        return true;
-    }
-    // Worst-case fresh intermediate PT pages for a contiguous VA run of
-    // `region_pages`: one last-level table per 512 pages plus a boundary
-    // span, and the upper levels (PD/PDPT/root) with their spans (+4).
-    let pt_pages = region_pages.div_ceil(512) + 4;
-    let need_bytes = pt_pages * PAGE_SIZE;
-
-    // Reuse the existing PT growth budget. Demand-stack VAs are reused — the
-    // reserve allocator coalesces and re-hands a freed range — so a reused
-    // stack's intermediate page tables persist and the budget stabilises after
-    // the first few spawns. Funding only the shortfall (and nothing once the
-    // budget already covers the region) keeps a spawn/join loop from leaking a
-    // CSpace slot + PT pages on every spawn.
-    let budget = || {
+    // Funding only the shortfall, and nothing once the pool covers the
+    // region, keeps a spawn/join loop from leaking a CSpace slot and PT pages
+    // on every spawn: a reused VA range's intermediate page tables persist,
+    // so the pool stabilises after the first few spawns.
+    let budget_pages = || {
         syscall::cap_info(self_aspace, syscall_abi::CAP_INFO_ASPACE_PT_BUDGET).unwrap_or(0)
+            / PAGE_SIZE
     };
-    for _ in 0..PT_FUND_ROUNDS {
-        let have = budget();
-        if have >= need_bytes {
-            return true;
-        }
-        let shortfall_pages = (need_bytes - have).div_ceil(PAGE_SIZE).max(1);
-        if object_slab_retype(shortfall_pages * PAGE_SIZE, |frame| {
-            syscall::cap_create_aspace(frame, self_aspace, shortfall_pages).ok()
+    let donate = |pages: u64| {
+        object_slab_retype(pages * PAGE_SIZE, |frame| {
+            syscall::cap_create_aspace(frame, self_aspace, pages).ok()
         })
-        .is_none()
-        {
-            return false;
-        }
-    }
-    budget() >= need_bytes
+        .is_some()
+    };
+    pt_funding::top_up(pt_funding::pt_pages_for(region_pages), budget_pages, donate)
+}
+
+/// `syscall::mem_map` of `pages` pages of `memory_cap`, from page `offset`,
+/// at `va` in `aspace`, the calling process's own address space, with the
+/// page tables it needs funded: a map refused with `OutOfMemory` tops the
+/// pool up ([`fund_aspace_pt_budget`]) and is made again, up to
+/// `pt_funding::MAP_TOP_UPS` times (`pt_funding::map_with_top_ups`). The
+/// first map is made without a top-up, so a pool that already covers the
+/// span costs nothing more.
+///
+/// Every ruststd path that maps into its own address space maps through it.
+/// Allocates nothing.
+///
+/// # Errors
+/// The last map's error: `OutOfMemory` when a top-up could not be had or the
+/// pool was still exhausted after the last one, else the error of a map
+/// refused for another reason (`syscall::mem_map` § Errors).
+///
+/// # Safety
+/// The contract of `syscall::mem_map` for the span `[va, va + pages *
+/// PAGE_SIZE)` of the calling program's own address space, which covers the
+/// span even when the call fails: a refused map can leave pages before the
+/// failing one mapped.
+pub(crate) unsafe fn mem_map_funded(
+    memory_cap: u64,
+    aspace: u64,
+    va: u64,
+    offset: u64,
+    pages: u64,
+    prot: u64,
+) -> Result<(), i64> {
+    pt_funding::map_with_top_ups(
+        syscall_abi::SyscallError::OutOfMemory as i64,
+        // SAFETY: the caller's contract covers the span, for every map made.
+        || unsafe { syscall::mem_map(memory_cap, aspace, va, offset, pages, prot) },
+        || fund_aspace_pt_budget(aspace, pages),
+    )
 }
 
 /// General-allocation headroom of `self_cspace`: free slots the kernel lets a

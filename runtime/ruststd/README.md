@@ -36,6 +36,10 @@ ruststd/
 ├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement rule
 │   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
 │                               #   what stays free); a rustc-dep-of-std dep of overlaid std
+├── pt-funding/                 # `ruststd-pt-funding` crate: pure, host-tested page-table
+│   └── src/lib.rs              #   funding policy (a top-up's donations and outcome, the
+│                               #   map retry after an exhausted pool); a rustc-dep-of-std
+│                               #   dep of overlaid std
 ├── spin-wait/                  # `ruststd-spin-wait` crate: pure, host-tested contended-wait
 │   └── src/lib.rs              #   policy of the overlay's spin mutex and of a parking wait
 │                               #   with no Notification (spin, then sleep); a
@@ -164,8 +168,30 @@ reservation discharges the first by construction.
 Mapping a foreign Memory cap into a retype-backed `AddressSpace` first funds
 that AS's page-table growth budget: `fund_aspace_pt_budget(self_aspace, n)`
 acquires a memmgr-backed RETYPE Memory cap and augments the AS's PT pool via
-`cap_create_aspace`. It MUST be called after reserving VA and before
-`mem_map`/`mmio_map`, or the map fails with `OutOfMemory`.
+`cap_create_aspace`, donating only the pool's shortfall against the worst case
+for `n` pages. It MUST be called after reserving VA and before
+`mem_map`/`mmio_map`, or the map fails with `OutOfMemory`. It returns `false`
+only when a top-up could not be had (memmgr unreachable or refusing the grant,
+or the kernel refusing the donation).
+
+The pool is shared by every mapping of the process, the pager's included, so a
+top-up cannot be reserved for the span it was made for: another thread's mapping
+can draw it before that span's map runs, and the map then fails with
+`OutOfMemory`. The map, not a read of the pool, decides whether the span is
+covered. Every map std makes into its own address space (the heap's grow, an
+eager thread stack, a pipe's ring page, the `File` read and write frames, the
+spawner's argv/env window) therefore goes through one helper, `mem_map_funded`
+in `sys/alloc`: it maps first, and while the map fails with `OutOfMemory` tops
+the pool up and maps again, up to `MAP_TOP_UPS` (4) top-ups, the bound memmgr
+sets on the same loop for a demand chunk
+([Client page-table funding](../../services/memmgr/docs/memory-pool.md#client-page-table-funding)).
+A map that fails part-way leaves the pages before the failing one mapped, and
+the next map maps them again. The policy is the host-tested `ruststd-pt-funding`
+crate; the syscalls stay in the overlay. A demand-region registration
+(`register_demand_paged`, the main thread's stack growth, the heap's demand
+floor, a spawned thread's demand stack) maps nothing itself, so it tops the pool
+up as best effort and does not fail on the outcome: memmgr funds the pool itself
+when a fault finds it exhausted.
 
 The arena is carved out of the process's address space on first use, in the
 arena zone sized to the user half, at a base drawn per process from the
@@ -210,9 +236,10 @@ In a process with no pager (`pager_endpoint_cap` zero: procmgr, and every proces
 `CREATE_PINNED`, such as the DMA-device and IOMMU drivers devmgr starts) the stack is an eager
 stack: a page reservation of the same `GUARD_PAGES` guard pages below the usable pages, whose
 usable pages are mapped read-write at spawn from one contiguous memmgr grant; the guard stays
-unmapped. The spawn tops up the page-table pool before the map, and again before each further
-attempt while the map fails with `OutOfMemory`, up to `EAGER_MAP_ROUNDS` (4) attempts, since
-another thread's mapping can draw a top-up first. The usable size is the
+unmapped. The spawn maps the usable pages through `mem_map_funded` (§ Page reservations), which
+tops up the page-table pool and maps again while the map fails with `OutOfMemory`, up to
+`MAP_TOP_UPS` (4) top-ups, since another thread's mapping can draw a top-up first. The usable size
+is the
 requested stack size alone (at least `DEFAULT_MIN_STACK_SIZE`, rounded up to whole pages), since
 each page costs a frame at spawn. Such a process has no virtual-memory handler, so an overflow
 whose first touch lands in the guard faults with no handler to take it, and the fault ends the

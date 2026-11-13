@@ -107,9 +107,12 @@ impl FrameMap
         {
             return None;
         }
-        // SAFETY: a non-null table holds `slots` live entries for the kernel's
-        // lifetime (install_table's contract), and index is below it.
-        Some(unsafe { &*table.add(index) })
+        // SAFETY: a non-null table holds `slots` entries (install_table's
+        // contract), and index is below it.
+        let entry = unsafe { table.add(index) };
+        // SAFETY: entry is a live table entry for the kernel's lifetime
+        // (install_table's contract).
+        Some(unsafe { &*entry })
     }
 
     /// Install `counters` as the chunk covering GiB `index`; `false` when the
@@ -183,9 +186,12 @@ impl FrameMap
         // Lossless: the mask keeps the low `CHUNK_SHIFT - 12` bits.
         #[allow(clippy::cast_possible_truncation)]
         let slot = ((phys >> 12) as usize) & (FRAMES_PER_CHUNK - 1);
-        // SAFETY: a non-null chunk holds FRAMES_PER_CHUNK live counters for the
-        // kernel's lifetime (install_chunk's contract) and slot is in range.
-        Some(unsafe { &*chunk.add(slot) })
+        // SAFETY: a non-null chunk holds FRAMES_PER_CHUNK counters
+        // (install_chunk's contract) and slot is in range.
+        let counter = unsafe { chunk.add(slot) };
+        // SAFETY: counter is a live counter for the kernel's lifetime
+        // (install_chunk's contract).
+        Some(unsafe { &*counter })
     }
 
     /// Count one more user leaf mapping of the frame holding `phys`.

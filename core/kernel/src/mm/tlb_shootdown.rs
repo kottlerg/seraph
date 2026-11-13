@@ -149,14 +149,16 @@ pub fn init_storage(cpu_count: usize, allocator: &mut crate::mm::BuddyAllocator)
         // The run's first word is inside the slab of cpu_count * words_per_cpu
         // words, so the product never wraps.
         // SAFETY: the words slab holds `words_per_cpu` words per CPU, so this
-        // CPU's run lies inside it and belongs to this request alone, for the
-        // kernel's life.
-        req.pending_cpus = unsafe {
-            AtomicCpuMask::attach(words.add(cpu.wrapping_mul(words_per_cpu)), words_per_cpu)
-        };
-        // SAFETY: the slab covers cpu_count slots and nothing reads it before
-        // the Release publication below.
-        unsafe { core::ptr::write(base.add(cpu), req) };
+        // CPU's run lies inside it.
+        let run = unsafe { words.add(cpu.wrapping_mul(words_per_cpu)) };
+        // SAFETY: run is this CPU's `words_per_cpu`-word run of the words
+        // slab, which belongs to this request alone, for the kernel's life.
+        req.pending_cpus = unsafe { AtomicCpuMask::attach(run, words_per_cpu) };
+        // SAFETY: the slab covers cpu_count slots, so cpu's slot lies inside it.
+        let slot = unsafe { base.add(cpu) };
+        // SAFETY: slot is a slab slot that nothing reads before the Release
+        // publication below.
+        unsafe { core::ptr::write(slot, req) };
     }
     TLB_REQUESTS_PTR.store(base, Ordering::Release);
 }
@@ -234,54 +236,66 @@ pub unsafe fn service_shootdowns(my_cpu: usize)
         // (the initiating space may no longer be the tag loaded on this CPU);
         // `tag == 0` is the untagged path. A non-zero tag only exists when
         // tagging is enabled, so the tagged primitives' precondition holds.
-        // SAFETY: caller guarantees IPI-handler context; the flush primitives
+        // The caller guarantees IPI-handler context, and the flush primitives
         // are valid at ring 0 / S-mode. A per-VA flush preserves global kernel
         // entries that a full flush would discard.
-        unsafe {
-            if va == u64::MAX || root == 0
+        if va == u64::MAX || root == 0
+        {
+            // SAFETY: IPI-handler context at ring 0 / S-mode (caller contract).
+            unsafe { crate::arch::current::paging::flush_tlb_all() };
+        }
+        else if pages <= 1
+        {
+            if tag != 0
             {
-                crate::arch::current::paging::flush_tlb_all();
+                // SAFETY: IPI-handler context at ring 0 / S-mode (caller
+                // contract); a non-zero tag means tagging is enabled.
+                unsafe { crate::arch::current::paging::flush_page_tagged(va, tag) };
             }
-            else if pages <= 1
+            else if root == crate::mm::paging::kernel_root_table_pa()
             {
-                if tag != 0
-                {
-                    crate::arch::current::paging::flush_page_tagged(va, tag);
-                }
-                else if root == crate::mm::paging::kernel_root_table_pa()
-                {
-                    // A kernel mapping: cached under every address space
-                    // this CPU has run.
-                    crate::arch::current::paging::flush_kernel_page(va);
-                }
-                else
-                {
-                    crate::arch::current::paging::flush_page(va);
-                }
+                // A kernel mapping: cached under every address space
+                // this CPU has run.
+                // SAFETY: IPI-handler context at ring 0 / S-mode (caller
+                // contract).
+                unsafe { crate::arch::current::paging::flush_kernel_page(va) };
             }
             else
             {
-                if !batch_open
+                // SAFETY: IPI-handler context at ring 0 / S-mode (caller
+                // contract).
+                unsafe { crate::arch::current::paging::flush_page(va) };
+            }
+        }
+        else
+        {
+            if !batch_open
+            {
+                // SAFETY: IPI-handler context at ring 0 / S-mode (caller
+                // contract).
+                unsafe { crate::arch::current::paging::inval_batch_begin() };
+                batch_open = true;
+            }
+            for p in 0..pages
+            {
+                // The initiator's range lies in the address space
+                // (`shootdown_range`), so no page's address wraps.
+                let pva = va.wrapping_add(p.wrapping_mul(crate::mm::PAGE_SIZE as u64));
+                if tag != 0
                 {
-                    crate::arch::current::paging::inval_batch_begin();
-                    batch_open = true;
+                    // SAFETY: IPI-handler context at ring 0 / S-mode (caller
+                    // contract); a non-zero tag means tagging is enabled.
+                    unsafe { crate::arch::current::paging::inval_page_tagged(pva, tag) };
                 }
-                for p in 0..pages
+                else
                 {
-                    // The initiator's range lies in the address space
-                    // (`shootdown_range`), so no page's address wraps.
-                    let pva = va.wrapping_add(p.wrapping_mul(crate::mm::PAGE_SIZE as u64));
-                    if tag != 0
-                    {
-                        crate::arch::current::paging::inval_page_tagged(pva, tag);
-                    }
-                    else
-                    {
-                        crate::arch::current::paging::inval_page(pva);
-                    }
+                    // SAFETY: IPI-handler context at ring 0 / S-mode (caller
+                    // contract).
+                    unsafe { crate::arch::current::paging::inval_page(pva) };
                 }
             }
         }
+
         // serviced_len < ACK_BATCH here: it is reset on reaching it below.
         if let Some(entry) = serviced.get_mut(serviced_len)
         {

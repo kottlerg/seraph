@@ -916,14 +916,13 @@ impl WriteFrame
     }
 }
 
-/// Request a source frame from memmgr, fund this address space's page
-/// tables for it, and map it. A frame that fails to map was never shown to
-/// a driver, so its cap is deleted and its run returned.
+/// Request a source frame from memmgr and map it into this process's own
+/// address space `aspace`, funding the page tables the map needs
+/// (`mem_map_funded`). A frame that fails to map was never shown to a driver,
+/// so its cap is deleted and its run returned.
 fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
 {
-    use crate::sys::alloc::seraph::{
-        fund_aspace_pt_budget, slab_release_fresh, slab_request_pages,
-    };
+    use crate::sys::alloc::seraph::{mem_map_funded, slab_release_fresh, slab_request_pages};
 
     let (cap, _, region_id) = slab_request_pages(memmgr_ep, 1)
         .ok_or_else(|| io::Error::other("seraph fs: memmgr REQUEST_MEMORY_CAPS failed"))?;
@@ -932,24 +931,17 @@ fn acquire_write_frame(aspace: u64, memmgr_ep: u64) -> io::Result<WriteFrame>
         slab_release_fresh(region_id);
         io::Error::other("seraph fs: reserve_pages failed for write frame")
     })?;
-    let failure = if !fund_aspace_pt_budget(aspace, 1)
+    // SAFETY: `range` is a fresh reservation from the per-process arena,
+    // owned here: VA no Rust object or IPC page occupies.
+    let mapped =
+        unsafe { mem_map_funded(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE) };
+    if mapped.is_err()
     {
-        Some("seraph fs: page-table funding failed for write frame")
-    }
-    else
-    {
-        // SAFETY: `range` is a fresh reservation from the per-process arena,
-        // owned here: VA no Rust object or IPC page occupies.
-        let mapped =
-            unsafe { syscall::mem_map(cap, aspace, range.va_start(), 0, 1, syscall::MAP_WRITABLE) };
-        mapped.is_err().then_some("seraph fs: mem_map MAP_WRITABLE failed")
-    };
-    if let Some(msg) = failure
-    {
+        // A one-page map that fails maps nothing, so the reservation is free.
         crate::sys::reserve::unreserve_pages(range);
         let _ = syscall::cap_delete(cap);
         slab_release_fresh(region_id);
-        return Err(io::Error::other(msg));
+        return Err(io::Error::other("seraph fs: mem_map MAP_WRITABLE failed"));
     }
     Ok(WriteFrame { cap, region_id, range })
 }
@@ -1719,9 +1711,9 @@ impl File
         Ok(copy_len)
     }
 
-    /// Reserve a page, fund this address space's page tables for it, and map
-    /// the read frame `memory_cap` read-only there. On failure the frame cap
-    /// is deleted and `cookie` released.
+    /// Reserve a page and map the read frame `memory_cap` read-only there,
+    /// funding the page tables the map needs (`mem_map_funded`). On failure
+    /// the frame cap is deleted and `cookie` released.
     fn map_frame(
         &self,
         memory_cap: u64,
@@ -1739,24 +1731,27 @@ impl File
             }
         };
         let va = range.va_start();
-        let failure = if !crate::sys::alloc::seraph::fund_aspace_pt_budget(self.aspace, 1)
-        {
-            Some("seraph fs: page-table funding failed for read frame")
-        }
-        else
-        {
-            // SAFETY: `range` is a fresh reservation from the per-process
-            // arena, owned here: VA no Rust object or IPC page occupies.
-            let mapped =
-                unsafe { syscall::mem_map(memory_cap, self.aspace, va, 0, 1, syscall::MAP_READ) };
-            mapped.is_err().then_some("seraph fs: mem_map failed")
+        // SAFETY: `range` is a fresh reservation from the per-process arena,
+        // owned here: VA no Rust object or IPC page occupies. `self.aspace` is
+        // this process's own address space.
+        let mapped = unsafe {
+            crate::sys::alloc::seraph::mem_map_funded(
+                memory_cap,
+                self.aspace,
+                va,
+                0,
+                1,
+                syscall::MAP_READ,
+            )
         };
-        if let Some(msg) = failure
+        if mapped.is_err()
         {
+            // A one-page map that fails maps nothing, so the reservation is
+            // free.
             crate::sys::reserve::unreserve_pages(range);
             let _ = syscall::cap_delete(memory_cap);
             self.release_frame(cookie);
-            return Err(io::Error::other(msg));
+            return Err(io::Error::other("seraph fs: mem_map failed"));
         }
         Ok(range)
     }

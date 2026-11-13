@@ -102,6 +102,7 @@ members = [
     "runtime/ruststd/argv-env",
     "runtime/ruststd/death-queues",
     "runtime/ruststd/heap-fit",
+    "runtime/ruststd/pt-funding",
     "runtime/ruststd/spin-wait",
     "xtask",
     "xtask/wrapper-shim",

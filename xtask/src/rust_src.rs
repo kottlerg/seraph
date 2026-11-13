@@ -680,7 +680,7 @@ fn apply_all_overlays(mirror: &Path, overlay_root: &Path) -> Result<()>
 /// name, its path under the project root, and its package name when that
 /// differs from the dependency name (written as the `package` key of its
 /// `library/std/Cargo.toml` line).
-const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 13] = [
+const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 14] = [
     ("syscall-abi", "abi/syscall", None),
     ("syscall", "shared/syscall", None),
     ("ipc", "shared/ipc", None),
@@ -704,6 +704,11 @@ const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 13] = [
         "heap-fit",
         "runtime/ruststd/heap-fit",
         Some("ruststd-heap-fit"),
+    ),
+    (
+        "pt-funding",
+        "runtime/ruststd/pt-funding",
+        Some("ruststd-pt-funding"),
     ),
     (
         "spin-wait",

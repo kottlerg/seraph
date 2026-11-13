@@ -304,9 +304,16 @@ impl Pipe {
                 // SAFETY: parent_va is a page reserved above from the
                 // per-process reservation arena (`sys::reserve`), which hands
                 // out VA no Rust object or IPC page occupies, and this call
-                // owns it exclusively.
+                // owns it exclusively. `aspace` is this process's own.
                 let r = unsafe {
-                    syscall::mem_map(rw, aspace, parent_va, 0, 1, syscall::MAP_WRITABLE)
+                    crate::sys::alloc::seraph::mem_map_funded(
+                        rw,
+                        aspace,
+                        parent_va,
+                        0,
+                        1,
+                        syscall::MAP_WRITABLE,
+                    )
                 };
                 let _ = syscall::cap_delete(rw);
                 r

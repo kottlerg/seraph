@@ -2,6 +2,7 @@
     "permissions": {
         "allow": [
             "Bash(cargo xtask *)",
+            "Bash(cargo xtask issue-edit *)",
 
             "Bash(readelf *)",
             "Bash(nm *)",

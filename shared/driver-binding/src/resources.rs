@@ -313,7 +313,7 @@ pub enum ReceiveError
 pub struct ResourceList
 {
     /// In delivery order, at most [`MAX_RESOURCES`]; on the heap, grown by
-    /// each round, so the list moves as a few words.
+    /// each round to its exact length, so the list moves as a few words.
     resources: Vec<Resource>,
     endpoints: Option<Endpoints>,
 }
@@ -444,8 +444,10 @@ impl ResourceList
         {
             return Err(ListError::TooMany);
         }
+        // Exact, not doubling: the list stays within `MAX_RESOURCES` entries
+        // of heap, the cost docs/limits.md states for it.
         self.resources
-            .try_reserve(batch.len())
+            .try_reserve_exact(batch.len())
             .map_err(|_| ListError::NoMemory)?;
         self.resources.extend_from_slice(batch);
         Ok(false)
@@ -901,6 +903,7 @@ mod tests
         }
         assert_eq!(list.absorb(&received(&mmio)), Err(ListError::TooMany));
         assert_eq!(list.resources().len(), MAX_RESOURCES);
+        assert!(list.resources.capacity() <= MAX_RESOURCES);
     }
 
     fn ends(service: u64, devmgr_query: u64) -> Round

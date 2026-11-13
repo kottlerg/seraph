@@ -51,7 +51,10 @@ pub unsafe fn carve_page(head: &AtomicU64, page: *mut u8)
     {
         // SAFETY: offset < PAGE_SIZE keeps the chunk inside the page
         // (caller contract).
-        unsafe { push_chunk(head, page.add(offset)) };
+        let chunk = unsafe { page.add(offset) };
+        // SAFETY: the chunk is inside the page, whose chunks 1 and up nothing else references, and
+        // the caller serialises `head` (caller contract).
+        unsafe { push_chunk(head, chunk) };
     }
 }
 
@@ -90,11 +93,12 @@ pub unsafe fn pop_chunk(head: &AtomicU64) -> Option<*mut u8>
     // cast_ptr_alignment: a chunk is CHUNK_BYTES-aligned within its page.
     #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: the chunk is on the list (caller contract), so its first word is
-    // the link to the next; once popped it is the caller's alone.
-    unsafe {
-        head.store(chunk.cast::<u64>().read_volatile(), Ordering::Relaxed);
-        core::ptr::write_bytes(chunk, 0, CHUNK_BYTES);
-    }
+    // the link to the next.
+    let link = unsafe { chunk.cast::<u64>().read_volatile() };
+    head.store(link, Ordering::Relaxed);
+    // SAFETY: once popped the chunk is the caller's alone, and it is CHUNK_BYTES long (caller
+    // contract).
+    unsafe { core::ptr::write_bytes(chunk, 0, CHUNK_BYTES) };
     Some(chunk)
 }
 
@@ -371,23 +375,28 @@ mod tests
                 node.next = head;
                 head = core::ptr::from_mut(&mut **node);
             }
-            // SAFETY: every node is a live Box above; the list ends in null.
-            let mut cur = unsafe {
-                sort_list(
-                    head,
-                    &|p: *mut Node| (*p).next,
-                    &|p: *mut Node, q| (*p).next = q,
-                    &|p: *mut Node| (*p).key,
-                )
+            let next = |p: *mut Node| {
+                // SAFETY: every node is a live Box above.
+                unsafe { (*p).next }
             };
+            let set_next = |p: *mut Node, q| {
+                // SAFETY: every node is a live Box above.
+                unsafe { (*p).next = q };
+            };
+            let key = |p: *mut Node| {
+                // SAFETY: every node is a live Box above.
+                unsafe { (*p).key }
+            };
+            // SAFETY: every node is a live Box above; the list ends in null.
+            let mut cur = unsafe { sort_list(head, &next, &set_next, &key) };
             let mut got = Vec::new();
             while !cur.is_null()
             {
+                // SAFETY: `cur` is a live Box node above (non-null by the loop test).
+                let key = unsafe { (*cur).key };
+                got.push(key);
                 // SAFETY: as above.
-                unsafe {
-                    got.push((*cur).key);
-                    cur = (*cur).next;
-                }
+                cur = unsafe { (*cur).next };
             }
             let mut want: Vec<u64> = nodes.iter().map(|b| b.key).collect();
             want.sort_unstable();

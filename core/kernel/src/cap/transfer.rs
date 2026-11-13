@@ -312,7 +312,9 @@ unsafe fn stage_move(
     }
 
     // SAFETY: caller contract.
-    let (src_id, dst_id) = unsafe { ((*src_cspace).id(), (*dst_cspace).id()) };
+    let src_id = unsafe { (*src_cspace).id() };
+    // SAFETY: caller contract.
+    let dst_id = unsafe { (*dst_cspace).id() };
     Ok(CapMove {
         src: SlotId::current(src_id, src_idx_nz),
         src_gen,
@@ -382,12 +384,9 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
 unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveStep
 {
     // SAFETY: caller contract; `live` resolves through the registry.
-    let (src_live, dst_live) = unsafe {
-        (
-            live(mv.src, mv.src_gen, mv.object),
-            live(mv.dst, mv.dst_gen, mv.object),
-        )
-    };
+    let src_live = unsafe { live(mv.src, mv.src_gen, mv.object) };
+    // SAFETY: caller contract; `live` resolves through the registry.
+    let dst_live = unsafe { live(mv.dst, mv.dst_gen, mv.object) };
     match (src_live, dst_live)
     {
         (false, false) => MoveStep::Lost(SyscallError::InvalidCapability),
@@ -422,11 +421,10 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
             {
                 // Liveness backstop: leave the destination where the step
                 // re-linked it, as a derived child of the source.
-                // SAFETY: caller contract; both slots live.
-                unsafe {
-                    unpin(mv.src);
-                    unpin(mv.dst);
-                }
+                // SAFETY: caller contract; source slot live.
+                unsafe { unpin(mv.src) };
+                // SAFETY: caller contract; destination slot live.
+                unsafe { unpin(mv.dst) };
                 return MoveStep::Abandoned { handle: mv.handle };
             }
             step
@@ -499,10 +497,9 @@ unsafe fn move_cap_step(mv: &CapMove, src_lock: SourceLock) -> MoveStep
         return MoveStep::Pending(*mv);
     }
     // SAFETY: caller contract.
-    let freed = unsafe {
-        take_source_position(mv);
-        free_source(mv, src_lock)
-    };
+    unsafe { take_source_position(mv) };
+    // SAFETY: caller contract.
+    let freed = unsafe { free_source(mv, src_lock) };
     // Guard: a source whose `CSpace` no longer resolves in the registry
     // keeps its slot for that teardown's cascade to release, and `Done` then
     // reports no reference. IPC transfer and the later batches (`live`)
@@ -579,17 +576,27 @@ unsafe fn free_source(mv: &CapMove, src_lock: SourceLock) -> bool
     {
         return false;
     };
-    // SAFETY: registry-resolved live CSpace; lock_raw/unlock_raw paired.
-    unsafe {
-        match src_lock
+    match src_lock
+    {
+        SourceLock::Held =>
         {
-            SourceLock::Held => (*cs).free_slot(mv.src.index.get()),
-            SourceLock::Take =>
-            {
-                let saved = (*cs).lock.lock_raw();
-                (*cs).free_slot(mv.src.index.get());
-                (*cs).lock.unlock_raw(saved);
-            }
+            // SAFETY: registry-resolved live CSpace; the caller holds its lock.
+            unsafe { (*cs).free_slot(mv.src.index.get()) };
+        }
+        SourceLock::Take =>
+        {
+            // SAFETY: registry-resolved live CSpace.
+            let lock = unsafe { &(*cs).lock };
+            // SAFETY: `saved` is passed verbatim to the `unlock_raw` below.
+            let saved = unsafe { lock.lock_raw() };
+            // SAFETY: registry-resolved live CSpace; its lock, taken above, is
+            // held.
+            unsafe { (*cs).free_slot(mv.src.index.get()) };
+            // SAFETY: registry-resolved live CSpace; the lock is borrowed again
+            // after `free_slot`'s exclusive borrow of the whole `CSpace`.
+            let lock = unsafe { &(*cs).lock };
+            // SAFETY: `saved` is the value the `lock_raw` above returned.
+            unsafe { lock.unlock_raw(saved) };
         }
     }
     true
@@ -667,20 +674,19 @@ mod tests
         let sib = occupy(cs, id);
         let kids = occupy_many(cs, id, kids);
         // SAFETY: single-threaded test ownership of the leaked CSpace.
-        let src_handle = unsafe {
-            (*cs).slot_mut(src.index.get()).expect("src slot").object = Some(obj);
-            (*cs).cap_handle(src.index)
-        };
+        unsafe { (*cs).slot_mut(src.index.get()).expect("src slot").object = Some(obj) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        let src_handle = unsafe { (*cs).cap_handle(src.index) };
         DERIVATION_LOCK.write_lock();
         let mut linked = true;
         // SAFETY: DERIVATION_LOCK held; all slots live.
-        unsafe {
-            linked &= link_child(root, sib);
-            linked &= link_child(root, src);
-            for k in &kids
-            {
-                linked &= link_child(src, *k);
-            }
+        linked &= unsafe { link_child(root, sib) };
+        // SAFETY: DERIVATION_LOCK held; all slots live.
+        linked &= unsafe { link_child(root, src) };
+        for k in &kids
+        {
+            // SAFETY: DERIVATION_LOCK held; all slots live.
+            linked &= unsafe { link_child(src, *k) };
         }
         DERIVATION_LOCK.write_unlock();
         assert!(linked, "setup links must land");
@@ -934,15 +940,20 @@ mod tests
     {
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; all slots live.
-        unsafe {
-            unlink_node(dst);
-            assert!(link_child(root, dst));
-            assert!(reparent_children(src, Some(root), usize::MAX));
-            unlink_node(src);
-            let obj = (*cs).slot(src.index.get()).and_then(|s| s.object);
-            (*cs).free_slot(src.index.get());
-            obj.expect("object").as_ref().dec_ref();
-        }
+        unsafe { unlink_node(dst) };
+        // SAFETY: DERIVATION_LOCK held; all slots live.
+        assert!(unsafe { link_child(root, dst) });
+        // SAFETY: DERIVATION_LOCK held; all slots live.
+        assert!(unsafe { reparent_children(src, Some(root), usize::MAX) });
+        // SAFETY: DERIVATION_LOCK held; all slots live.
+        unsafe { unlink_node(src) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace; all slots live.
+        let obj = unsafe { (*cs).slot(src.index.get()).and_then(|s| s.object) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace; all slots live.
+        unsafe { (*cs).free_slot(src.index.get()) };
+        let obj = obj.expect("object");
+        // SAFETY: `obj` is the live object the source slot referenced; the leaked test object.
+        unsafe { obj.as_ref().dec_ref() };
         DERIVATION_LOCK.write_unlock();
     }
 
@@ -1042,12 +1053,13 @@ mod tests
         revoke_takes_source(a, root, src, dst);
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; dst live.
-        unsafe {
-            assert!(reparent_children(dst, Some(root), usize::MAX));
-            unlink_node(dst);
-            (*b).free_slot(dst.index.get());
-            obj.as_ref().dec_ref();
-        }
+        assert!(unsafe { reparent_children(dst, Some(root), usize::MAX) });
+        // SAFETY: DERIVATION_LOCK held; dst live.
+        unsafe { unlink_node(dst) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace; dst live.
+        unsafe { (*b).free_slot(dst.index.get()) };
+        // SAFETY: `obj` is the live leaked test object.
+        unsafe { obj.as_ref().dec_ref() };
         DERIVATION_LOCK.write_unlock();
 
         assert!(matches!(
@@ -1077,12 +1089,13 @@ mod tests
         // children into roots and unlinks dst.
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; dst live.
-        unsafe {
-            assert!(reparent_children(dst, None, usize::MAX));
-            unlink_node(dst);
-            (*b).free_slot(dst.index.get());
-            obj.as_ref().dec_ref();
-        }
+        assert!(unsafe { reparent_children(dst, None, usize::MAX) });
+        // SAFETY: DERIVATION_LOCK held; dst live.
+        unsafe { unlink_node(dst) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace; dst live.
+        unsafe { (*b).free_slot(dst.index.get()) };
+        // SAFETY: `obj` is the live leaked test object.
+        unsafe { obj.as_ref().dec_ref() };
         DERIVATION_LOCK.write_unlock();
 
         assert!(matches!(
@@ -1110,11 +1123,10 @@ mod tests
         let a = mk_registered_cspace(ID_A);
         let b = mk_registered_cspace(ID_B);
         // SAFETY: single-threaded test ownership of the leaked CSpace.
-        unsafe {
-            (*b).set_test_page_budget(1);
-            while (*b).allocate_slot().is_ok()
-            {}
-        }
+        unsafe { (*b).set_test_page_budget(1) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        while unsafe { (*b).allocate_slot() }.is_ok()
+        {}
         let obj = mk_object();
         let (_root, _src, _sib, _kids, handle) = mk_tree(a, ID_A, 1, obj);
 

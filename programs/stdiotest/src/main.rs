@@ -14,15 +14,28 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
-
-use std::io::BufRead;
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 fn main()
 {
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
     let mut line = String::new();
-    let n = match reader.read_line(&mut line)
+    let n = match std::io::stdin().read_line(&mut line)
     {
         Ok(n) => n,
         Err(e) =>

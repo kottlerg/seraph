@@ -26,6 +26,23 @@
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 mod handover;
 mod slot;
@@ -718,6 +735,7 @@ fn drain_deaths(logd: &Logd)
                 .table
                 .retire(death.correlator, Eviction::Death { exit_reason })
                 .map(|slot| slot.name.clone());
+            drop(state);
             (death.correlator, exit_reason, evicted, full)
         };
         if let Some(name) = evicted
@@ -835,6 +853,11 @@ fn reply_ack(ipc_buf: *mut u64)
 /// Each line is completed, rendered, and retained under the state lock, and
 /// written once the lock is released; the bytes after it are taken under the
 /// lock again.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the sender's `slot` and `seq` borrow through the guard to the end of the byte loop: \
+              the hold serialises the slot's partial line, its history and the sequence counter"
+)]
 fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     const STREAM_CHUNK_SIZE: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
@@ -891,6 +914,11 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 /// the reply label: `RECORD_ACCEPTED`, or `RECORD_REJECTED` for a payload
 /// longer than a record or than the message, or one `ipc::log_record` refuses,
 /// which is neither rendered nor retained.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the sender's `slot` and `seq` borrow through the guard to the record's retention: \
+              the hold serialises the slot's name, its history and the sequence counter"
+)]
 fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
 {
     let bytes = msg.data_bytes();
@@ -942,6 +970,11 @@ fn flush_partial(slot: &mut Slot, seq: &mut u64, out: &mut LineBuf)
 /// Long names truncated. No collision-suffix policy (procmgr's
 /// process badge is unique, so name collisions only happen if two
 /// processes intentionally pick the same display name).
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "the sender's `slot` borrows through the guard to the name's last write: the hold \
+              serialises the slot's name"
+)]
 fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 {
     let bytes = msg.data_bytes();

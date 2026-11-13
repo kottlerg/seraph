@@ -52,7 +52,7 @@ specifies.
 The tester also spawns the fixture pinned (`std::os::seraph::process::CommandExt::pinned`), with no
 pager. Each thread it spawns then gets the eager stack that the same section specifies: the pages
 the spawn asks for, mapped at spawn, above an unmapped guard of the same four pages, all of which
-`join` returns. The `eager-grow` and `eager-bigframe` workers, and the `bigframe` workers, ask for
+`join` returns. The `guard`, `bigframe`, `eager-grow`, and `eager-bigframe` workers ask for
 16 pages (`EAGER_STACK_PAGES`, std's default minimum); a demand-paged process raises that to its
 512-page demand stack, and a pinned one maps exactly those 16 pages.
 
@@ -69,8 +69,10 @@ thread. `bigframe` and `eager-bigframe` use one oversized frame instead, and `sp
 
 The mode is the first of `main-guard`, `main-grow`, `guard`, `eager-bigframe`, `eager-grow`,
 `bigframe`, `splitframe`, `span`, and `nested-grow` that some argv entry equals; otherwise it is
-`grow`. A worker spawn that std refuses prints `spawn failed: <error>` and exits with code 4, which
-no tester verdict accepts.
+`grow`. A worker spawn that std refuses fails every mode's verdict: the workers of `guard`,
+`bigframe`, `eager-grow`, and `eager-bigframe` print `spawn failed: <error>` and exit with code 4,
+and any other refused spawn panics, which aborts the process before it prints `PASS` or
+`about to overflow`.
 
 | Mode | Behavior | Stdout and exit |
 |---|---|---|

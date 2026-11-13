@@ -95,7 +95,7 @@ const GUARD_PAGES: usize = 4;
 /// the stack reserved just below.
 const BIG_FRAME_BYTES: usize = (USABLE_STACK_PAGES + GUARD_PAGES + 3) * 4096;
 
-/// Stack size every `bigframe`, `eager-grow`, and `eager-bigframe` worker
+/// Stack size every `guard`, `bigframe`, `eager-grow`, and `eager-bigframe` worker
 /// asks for: std's default minimum (`DEFAULT_MIN_STACK_SIZE`), 16 pages. A
 /// demand-paged process raises it to its 512-page demand stack; a process with
 /// no pager maps exactly these pages at spawn, above the same guard.
@@ -321,8 +321,10 @@ fn guard() -> ExitCode
     let _ = std::io::stdout().flush();
 
     // Count up from 1; the `depth == 0` base case is never reached before the
-    // stack overflows into the guard.
-    let worker = std::thread::spawn(|| recurse(1, Direction::Up));
+    // stack overflows into the guard. The marker is already out, so a refused
+    // spawn must not end the process with a fault, as the panic of a plain
+    // `std::thread::spawn` would: `spawn_worker` exits with code 4 instead.
+    let worker = spawn_worker(|| recurse(1, Direction::Up));
     // The worker recurses into the guard and faults; the kernel kills it
     // and procmgr tears this process down, so `join` never returns. Reaching
     // past it means the guard failed to fault — report it loudly.

@@ -26,6 +26,8 @@
 //! own threads. So a `SYS_THREAD_WRITE_MEM` of the stub's writes another
 //! address space, which its `# Safety` contract does not constrain.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod arch;
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
@@ -72,8 +74,10 @@ fn main()
 {
     std::os::seraph::log::register_name(b"gdbstub");
     let info = std::os::seraph::startup_info();
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // A debug-authority holder declares itself undebuggable before it spawns
@@ -856,9 +860,11 @@ impl Stub
     }
 
     /// Answer one packet.
-    // too_many_lines: one arm per command of the packet set, each a call or
-    // two; splitting the match would scatter the protocol's table.
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per command of the packet set, each a call or two; splitting the match \
+                  would scatter the protocol's table"
+    )]
     fn command(&mut self, body: &[u8], ipc_buf: *mut u64)
     {
         let Ok(command) = Command::parse(body)

@@ -158,10 +158,13 @@ impl EventQueueState
         self.observer_free = core::ptr::null_mut();
         for i in (0..count as usize).rev()
         {
-            // SAFETY: i < count; the node lies in the pool (contract), unaliased.
+            // SAFETY: i < count, so the offset stays in the pool of `count`
+            // nodes (contract).
+            let node = unsafe { nodes.add(i) };
+            // SAFETY: node lies in the pool (contract), aligned and unaliased.
             unsafe {
                 core::ptr::write(
-                    nodes.add(i),
+                    node,
                     crate::sched::thread::DeathObserver {
                         next: self.observer_free,
                         eq,
@@ -169,8 +172,8 @@ impl EventQueueState
                     },
                 );
             }
-            // SAFETY: as above; the node now heads the free list.
-            self.observer_free = unsafe { nodes.add(i) };
+            // The node now heads the free list.
+            self.observer_free = node;
         }
     }
 }
@@ -199,6 +202,11 @@ pub unsafe fn event_queue_take_observer(
     let node = eq.observer_free;
     if !node.is_null()
     {
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to the free-list link of node, which the held eq.lock \
+                      serialises"
+        )]
         // SAFETY: a free-list node is valid and owned by the list under eq.lock.
         unsafe {
             eq.observer_free = (*node).next;
@@ -227,6 +235,11 @@ pub unsafe fn event_queue_return_observer(
     let eq = unsafe { &mut *eq };
     // SAFETY: lock serialises the free list; paired with unlock_raw below.
     let saved = unsafe { eq.lock.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of node, a free node of this queue's pool, which \
+                  the held eq.lock serialises"
+    )]
     // SAFETY: node is this queue's and unlinked (contract).
     unsafe {
         (*node).next = eq.observer_free;
@@ -289,11 +302,12 @@ pub unsafe fn event_queue_post(
         // Invariants, invariant 7).
         // The tag word rides beside the claim's payload deposit; both are
         // written under eq.lock before the waker's enqueue_and_wake.
-        // SAFETY: waiter is the valid TCB just removed from the queue.
-        unsafe {
-            crate::ipc::claim_waiter(waiter, entry.payload);
-            (*waiter).wakeup_tag = entry.tag;
-        }
+        // SAFETY: waiter is the valid TCB just removed from the queue under
+        // the held eq.lock.
+        unsafe { crate::ipc::claim_waiter(waiter, entry.payload) };
+        // SAFETY: waiter is valid and claimed, so this waker is the only
+        // writer of its wakeup_tag.
+        unsafe { (*waiter).wakeup_tag = entry.tag };
         // SAFETY: paired with lock_raw above.
         unsafe { eq.lock.unlock_raw(saved) };
         return Ok(Some(waiter));
@@ -310,8 +324,10 @@ pub unsafe fn event_queue_post(
     // Enqueue into ring.
     // SAFETY: write_idx is a ring slot, `0..=capacity` (`ring_step` keeps it
     // there); ring is the retype slot's ring of `capacity + 1` entry slots.
+    let slot = unsafe { eq.ring.add(eq.write_idx as usize) };
+    // SAFETY: slot is an aligned, writable ring entry, serialised by eq.lock.
     unsafe {
-        *eq.ring.add(eq.write_idx as usize) = entry;
+        *slot = entry;
     }
     eq.write_idx = ring_step(eq.write_idx, eq.capacity);
     // Release: publishes the new level to the lockless `source_is_ready` reader.
@@ -342,7 +358,11 @@ fn pop_entry_locked(eq: &mut EventQueueState) -> Option<EventEntry>
     }
     // SAFETY: read_idx is a ring slot, `0..=capacity` (`ring_step` keeps it
     // there); ring is a valid allocation of `capacity + 1` entry slots.
-    let entry = unsafe { *eq.ring.add(eq.read_idx as usize) };
+    let slot = unsafe { eq.ring.add(eq.read_idx as usize) };
+    // SAFETY: slot is an aligned ring entry the post wrote, serialised by
+    // eq.lock.
+    let entry = unsafe { *slot };
+
     eq.read_idx = ring_step(eq.read_idx, eq.capacity);
     // Release: publishes the drained level (possibly →0) to the lockless
     // `source_is_ready` reader so it cannot see a stale non-empty.
@@ -555,11 +575,11 @@ mod tests
         assert_eq!(sorted.len(), 5);
         for n in list
         {
-            // SAFETY: n is a node of the live pool.
-            unsafe {
-                assert_eq!((*n).eq, obj);
-                assert_eq!((*n).correlator, 0);
-            }
+            // SAFETY: n is a node of the live pool, which nothing writes while
+            // the test reads it.
+            let node = unsafe { &*n };
+            assert_eq!(node.eq, obj);
+            assert_eq!(node.correlator, 0);
         }
     }
 

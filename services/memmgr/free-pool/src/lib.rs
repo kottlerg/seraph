@@ -18,6 +18,7 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 pub mod arena;
 pub mod deferred;
@@ -101,9 +102,11 @@ pub fn regions_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool
 /// clamped to the region end (the last chunk may be shorter). Chunks are
 /// fixed and non-overlapping, so each region page belongs to exactly one.
 /// Returns `(chunk_base, chunk_pages)` with `chunk_pages ∈ [1, DEMAND_CHUNK_PAGES]`.
-// cast_possible_truncation: chunk_pages is bounded by DEMAND_CHUNK_PAGES (16),
-// so the u64 -> u32 narrowing cannot truncate.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "chunk_pages is bounded by DEMAND_CHUNK_PAGES (16), so the u64 -> u32 narrowing \
+              cannot truncate"
+)]
 #[must_use]
 pub fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
 {

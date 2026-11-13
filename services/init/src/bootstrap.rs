@@ -517,10 +517,6 @@ fn rela_table_bytes<'a>(module_bytes: &'a [u8], table: &elf::RelaTable) -> Optio
 /// `target_aspace` must name a child's address space, never init's own: the
 /// function places pages into it at VAs the child's layout chooses, without
 /// checking what init holds there.
-// similar_names: the TLS template's bounds (`tdata_start` / `tdata_end`) and
-// its base in each address space (`tls_base` / `tls_base_va`) are pairs named
-// for what they share.
-#[allow(clippy::similar_names)]
 unsafe fn place_main_tls(
     arena: &mut BootArena,
     ehdr: &elf::Elf64Ehdr,
@@ -838,10 +834,12 @@ struct MemmgrCaps
 /// `target_aspace` must name a child's address space, never init's own: the
 /// function places pages into it at VAs the child's layout chooses, without
 /// checking what init holds there.
-// similar_names: memmgr's copies of its own objects are named by object and
-// holder (`mm_aspace_in_mm`, `mm_cspace_in_mm`); the names differ only in the
-// object kind, which is the distinction that matters.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "memmgr's copies of its own objects are named by object and holder \
+              (`mm_aspace_in_mm`, `mm_cspace_in_mm`); the names differ only in the object kind, \
+              which is the distinction that matters"
+)]
 unsafe fn populate_memmgr_info(
     arena: &mut BootArena,
     target_aspace: u64,
@@ -927,12 +925,16 @@ fn descriptor_for(info: &InitInfo, slot: u64) -> Option<&CapDescriptor>
 /// `mm_service_ep` is the full-rights cap on memmgr's service endpoint
 /// (created in init's `CSpace`); init keeps a copy and minted SENDs from it
 /// go in each spawned process's `ProcessInfo.memmgr_endpoint_cap`.
-// similar_names: memmgr's kernel objects are named by kind (`mm_aspace`,
-// `mm_cspace`). too_many_lines: memmgr's raw bring-up is one ordered sequence
-// (load the image, create its objects, mint its creator cap, populate its
-// `ProcessInfo`, place its stack and IPC buffer) whose steps share the caps
-// it creates.
-#[allow(clippy::similar_names, clippy::too_many_lines)]
+#[expect(
+    clippy::similar_names,
+    reason = "memmgr's kernel objects are named by kind (`mm_aspace`, `mm_cspace`)"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "memmgr's raw bring-up is one ordered sequence (load the image, create its objects, \
+              mint its creator cap, populate its `ProcessInfo`, place its stack and IPC buffer) \
+              whose steps share the caps it creates"
+)]
 pub fn bootstrap_memmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
@@ -1494,10 +1496,12 @@ struct ProcmgrCaps
 /// `target_aspace` must name a child's address space, never init's own: the
 /// function places pages into it at VAs the child's layout chooses, without
 /// checking what init holds there.
-// similar_names: procmgr's copies of its own objects are named by object and
-// holder (`pm_aspace_in_pm`, `pm_cspace_in_pm`); the names differ only in the
-// object kind, which is the distinction that matters.
-#[allow(clippy::similar_names)]
+#[expect(
+    clippy::similar_names,
+    reason = "procmgr's copies of its own objects are named by object and holder \
+              (`pm_aspace_in_pm`, `pm_cspace_in_pm`); the names differ only in the object kind, \
+              which is the distinction that matters"
+)]
 unsafe fn populate_procmgr_info(
     arena: &mut BootArena,
     target_aspace: u64,
@@ -1688,14 +1692,20 @@ pub fn mint_bootstrap_badge() -> Option<u64>
 ///
 /// Returns the [`ProcmgrBootstrap`] record so the caller can issue bootstrap
 /// rounds and subsequent `CREATE_PROCESS` calls.
-// too_many_lines: linear bootstrap workflow (CSpace setup, ELF load, TLS
-// prep, per-purpose cap derivation for log + registry + memmgr) reads
-// straight-through; extracting helpers would just shuffle state through
-// extra parameters.
-#[allow(
+#[expect(
     clippy::similar_names,
+    reason = "procmgr's kernel objects are named by kind (`pm_aspace`, `pm_cspace`)"
+)]
+#[expect(
     clippy::too_many_lines,
-    clippy::too_many_arguments
+    reason = "linear bootstrap workflow (CSpace setup, ELF load, TLS prep, per-purpose cap \
+              derivation for log + registry + memmgr) reads straight-through; extracting helpers \
+              would just shuffle state through extra parameters"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each endpoint and cap procmgr is bootstrapped with is a distinct input from a \
+              different bootstrap stage"
 )]
 pub fn bootstrap_procmgr(
     info: &InitInfo,

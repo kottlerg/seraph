@@ -204,6 +204,11 @@ impl RunQueue
         // rather than `debug_assert!` so it can read the debug-only
         // `last_enqueue` breadcrumb field, which is absent in release.
         #[cfg(debug_assertions)]
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a field of `tcb`, a live TCB whose fields the owning \
+                      scheduler lock, held by the caller, keeps stable"
+        )]
         // SAFETY: tcb is a valid live TCB pointer; the caller holds
         // the owning scheduler.lock so these fields are stable.
         unsafe {
@@ -251,6 +256,11 @@ impl RunQueue
     fn enqueue_head(&mut self, tcb: *mut ThreadControlBlock)
     {
         #[cfg(debug_assertions)]
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access reads a field of `tcb`, a live TCB whose fields the owning \
+                      scheduler lock, held by the caller, keeps stable"
+        )]
         // SAFETY: tcb is a valid live TCB pointer; the caller holds the owning
         // scheduler.lock so these fields are stable.
         unsafe {
@@ -581,20 +591,26 @@ impl PerCpuScheduler
         let prior_link = unsafe { (*tcb).queued_on.load(Ordering::Relaxed) };
         if prior_link >= 0
         {
+            // Diagnostic reads of `tcb`, valid by the caller's contract.
             #[cfg(debug_assertions)]
-            // SAFETY: tcb valid; diagnostic reads. `state`, `cpu_affinity`, and
-            // `last_enqueue` are stable under the caller-held `(*tcb).sched_lock`,
-            // `context_saved` is atomic, and `thread_id` is immutable.
-            unsafe {
-                let tid = (*tcb).thread_id;
-                let prior = (*tcb).last_enqueue;
+            {
+                // SAFETY: tcb valid; `thread_id` is immutable.
+                let tid = unsafe { (*tcb).thread_id };
+                // SAFETY: tcb valid; `last_enqueue` is stable under the
+                // caller-held `(*tcb).sched_lock`.
+                let prior = unsafe { (*tcb).last_enqueue };
                 // Surface the state/cs/affinity of the doubly-linked TCB and the
                 // current link CPU: a residual #289/#351 double-link is driven
                 // by a Blocked-while-linked or self-pinned (cs==0) condition, not
                 // just the bare queued_on tag.
-                let state = (*tcb).state;
-                let cs = (*tcb).context_saved.load(Ordering::Relaxed);
-                let aff = (*tcb).cpu_affinity;
+                // SAFETY: tcb valid; `state` is stable under the caller-held
+                // `(*tcb).sched_lock`.
+                let state = unsafe { (*tcb).state };
+                // SAFETY: tcb valid; `context_saved` is atomic.
+                let cs = unsafe { (*tcb).context_saved.load(Ordering::Relaxed) };
+                // SAFETY: tcb valid; `cpu_affinity` is stable under the
+                // caller-held `(*tcb).sched_lock`.
+                let aff = unsafe { (*tcb).cpu_affinity };
                 let link_cpu = crate::arch::current::cpu::current_cpu();
                 panic!(
                     "PerCpuScheduler::enqueue: tcb {tcb:p} tid={tid} already \
@@ -636,6 +652,11 @@ impl PerCpuScheduler
         // through the `#[track_caller]` chain to the wake/requeue call site.
         // Stripped in release; skipped in host tests (no per-CPU arch context).
         #[cfg(all(debug_assertions, not(test)))]
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every access is to a field of `tcb`, a valid TCB linked on this scheduler, \
+                      whose lock the caller holds"
+        )]
         // SAFETY: tcb is valid; the caller holds this scheduler's lock.
         unsafe {
             (*tcb).last_enqueue = Some(super::thread::EnqueueBreadcrumb {

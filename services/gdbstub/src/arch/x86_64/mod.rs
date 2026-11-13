@@ -26,9 +26,11 @@ pub const BREAKPOINT_PC_ADVANCE: u64 = 1;
 ///
 /// # Errors
 /// None on x86-64; the riscv64 route can refuse an instruction.
-// unnecessary_wraps: the arch-dispatch signature is shared with riscv64,
-// whose decoder refuses some instructions.
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the arch-dispatch signature is shared with riscv64, whose decoder refuses some \
+              instructions"
+)]
 pub fn prepare_step(_thread: u64, regs: &mut [u8]) -> Result<StepUndo, StepError>
 {
     update_flags(regs, |f| f | syscall_abi::X86_64_RFLAGS_TF);

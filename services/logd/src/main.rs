@@ -20,8 +20,11 @@
 //! until init-logd stops writing the UART ([`SELF_LOG_HOLD`]), then the
 //! gate's opening and the control loop.
 
-// cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "targets 64-bit only; u64/usize conversions lossless"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 mod handover;
 mod slot;
@@ -124,8 +127,10 @@ fn main() -> !
 {
     let startup = startup_info();
 
-    // IPC buffer is registered by `_start`; reinterpret as `*mut u64`.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer is registered by `_start`; reinterpret as `*mut u64`"
+    )]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
     // Every process's log output, a debug-authority holder's own included,

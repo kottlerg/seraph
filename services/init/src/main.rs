@@ -11,10 +11,12 @@
 
 #![no_std]
 #![no_main]
-// cast_possible_truncation: init targets 64-bit only; u64/usize conversions
-// are lossless. u32 casts on struct offsets and counts are bounded by page
-// size.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "init targets 64-bit only; u64/usize conversions are lossless. u32 casts on struct \
+              offsets and counts are bounded by page size"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use core::panic::PanicInfo;
 
@@ -199,23 +201,11 @@ pub(crate) fn find_module_by_name(info: &InitInfo, name: &[u8]) -> Option<u64>
     init_protocol::find_module_slot(info, name)
 }
 
-// dead_code: used by the x86_64 serial module but not riscv64.
-#[allow(dead_code)]
 pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u64>
 {
     descriptors(info)
         .iter()
         .find(|d| d.cap_type == wanted)
-        .map(|d| d.slot)
-}
-
-// dead_code: used by the riscv64 serial module but not x86_64.
-#[allow(dead_code)]
-pub(crate) fn find_cap(info: &InitInfo, wanted_type: CapType, wanted_aux0: u64) -> Option<u64>
-{
-    descriptors(info)
-        .iter()
-        .find(|d| d.cap_type == wanted_type && d.aux0 == wanted_aux0)
         .map(|d| d.slot)
 }
 
@@ -443,24 +433,23 @@ pub extern "C" fn _start(info_ptr: u64) -> !
     run(info_ptr)
 }
 
-// clippy::too_many_lines: init's top-level run() orchestrates the three
-// boot phases — bootstrap (map IPC buffer, create endpoints, bring up
-// procmgr, devmgr, vfsd), mount root plus config-driven mounts, then
-// svcmgr handover. Each phase dozens of let-bindings that hold in-flight
-// caps (endpoint_cap, log_ep, devmgr_registry_ep, vfsd_service_ep, ipc,
-// etc.) that later phases consume. Splitting means either threading all
-// those caps through 6+ helper arguments (just trades too_many_lines for
-// too_many_arguments) or building a mutable BootCtx whose lifetime equals
-// run()'s own, which adds a type for no behavioural gain. The body is
-// already factored through service::create_*_with_caps /
-// service::phase3_svcmgr_handover for the subsystem-specific work; what
-// remains is the fixed orchestration sequence.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "init's top-level run() orchestrates the three boot phases — bootstrap (map IPC \
+              buffer, create endpoints, bring up procmgr, devmgr, vfsd), mount root plus \
+              config-driven mounts, then svcmgr handover. Each phase dozens of let-bindings that \
+              hold in-flight caps (endpoint_cap, log_ep, devmgr_registry_ep, vfsd_service_ep, ipc, \
+              etc.) that later phases consume. Splitting means either threading all those caps \
+              through 6+ helper arguments (just trades too_many_lines for too_many_arguments) or \
+              building a mutable BootCtx whose lifetime equals run()'s own, which adds a type for \
+              no behavioural gain. The body is already factored through \
+              service::create_*_with_caps / service::phase3_svcmgr_handover for the \
+              subsystem-specific work; what remains is the fixed orchestration sequence"
+)]
 fn run(info_ptr: u64) -> !
 {
     // SAFETY: the kernel maps InitInfo at the kernel-chosen VA delivered in
-    // info_ptr. cast_ptr_alignment: that VA is page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    // info_ptr, which is page-aligned.
     let info: &InitInfo = unsafe { &*(info_ptr as *const InitInfo) };
 
     if info.version != INIT_PROTOCOL_VERSION
@@ -642,7 +631,6 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
     // INIT_IPC_BUF_VA is registered and page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = INIT_IPC_BUF_VA as *mut u64;
     logging::set_ipc_logging(init_log_send, ipc_buf);
     logging::register_name(b"init");
@@ -756,7 +744,6 @@ fn run(info_ptr: u64) -> !
     // it back via the RO cap derived above. See
     // `bootstrap::write_memmgr_aux_memory`.
     // TEMP_MAP_BASE is mapped writable, one page, page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
     let phys_dst = TEMP_MAP_BASE as *mut u64;
     // SAFETY: phys_dst points at the one mapped 4 KiB page.
     unsafe { bootstrap::write_memmgr_aux_memory(phys_dst, info, &mm_final) };

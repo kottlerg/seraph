@@ -444,8 +444,10 @@ fn populate_lfn(entry: &mut DirEntry, lfn: &LfnAccum)
     {
         return;
     };
-    // Cast is range-safe: `len <= MAX_LFN_UTF8 = 765 < u16::MAX`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "cast is range-safe: `len <= MAX_LFN_UTF8 = 765 < u16::MAX`"
+    )]
     {
         entry.lfn_len = len as u16;
     }
@@ -515,11 +517,13 @@ pub struct RemovedEntry
 /// `find_free_slot_run`); [`FatError::Io`] when a
 /// directory or FAT sector read or write fails, possibly after some LFN
 /// slots were written.
-// too_many_arguments: the parent directory, the new entry's name, kind, first
-// cluster, and size, and the driver state the insert writes through (FAT
-// state, cache, block device, IPC buffer); fatfs passes its driver state
-// unbundled throughout, and bundling it is a crate-wide refactor.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the parent directory, the new entry's name, kind, first cluster, and size, and the \
+              driver state the insert writes through (FAT state, cache, block device, IPC buffer); \
+              fatfs passes its driver state unbundled throughout, and bundling it is a crate-wide \
+              refactor"
+)]
 pub fn insert_entry(
     state: &mut FatState,
     parent_dir_cluster: u32,

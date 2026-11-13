@@ -8,6 +8,8 @@
 //! Gating, the surface checks, the fail rules, and the capability slots are
 //! defined in `services/crasher/README.md`.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::os::seraph::startup_info;
 use std::thread;
 use std::time::Duration;
@@ -125,8 +127,10 @@ fn bootstrap_caps(creator_ep: u64, ipc_buffer: *mut u8) -> (u64, u64, usize)
     {
         return (0, 0, 0);
     }
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer is page-aligned (4 KiB), satisfying u64 alignment"
+    )]
     let ipc_buf = ipc_buffer.cast::<u64>();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
     // boot protocol.
@@ -153,8 +157,10 @@ fn bootstrap_caps(creator_ep: u64, ipc_buffer: *mut u8) -> (u64, u64, usize)
 /// tracks.
 fn probe_svcmgr(svcmgr_cap: u64, ipc_buffer: *mut u8)
 {
-    // cast_ptr_alignment: IPC buffer is page-aligned (4 KiB), satisfying u64 alignment.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer is page-aligned (4 KiB), satisfying u64 alignment"
+    )]
     let ipc_buf = ipc_buffer.cast::<u64>();
     let probe_name = b"__probe__";
     let name_len = probe_name.len();

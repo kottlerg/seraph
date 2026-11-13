@@ -341,7 +341,6 @@ extern "C" fn log_thread_entry(arg: u64) -> !
     let log_ep = arg;
 
     // LOG_THREAD_IPC_BUF_VA is the registered IPC buffer, page-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
     let ipc_buf = LOG_THREAD_IPC_BUF_VA as *mut u64;
 
     log_receive_loop(log_ep, ipc_buf);

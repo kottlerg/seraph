@@ -21,6 +21,7 @@
 //! host-tested.
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use core::sync::atomic::{AtomicU64, Ordering};
 

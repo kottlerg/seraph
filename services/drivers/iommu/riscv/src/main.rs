@@ -17,6 +17,8 @@
 //! exits without reporting ready, so devmgr runs DMA unconfined. See
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -113,8 +115,10 @@ fn main() -> !
 {
     std::os::seraph::log::register_name(b"iommu-riscv");
     let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // SAFETY: ipc_buf is this thread's registered IPC buffer.

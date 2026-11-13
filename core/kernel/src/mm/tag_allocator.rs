@@ -424,7 +424,10 @@ mod glue
         // SAFETY: caller's contract.
         let p = unsafe { tag_state_ptr(cpu, tag) };
         // SAFETY: p is this CPU's own record; no other CPU writes it.
-        unsafe { ((*p).owner_gen, (*p).synced_tlb_gen) }
+        let owner_gen = unsafe { (*p).owner_gen };
+        // SAFETY: p is this CPU's own record; no other CPU writes it.
+        let synced_tlb_gen = unsafe { (*p).synced_tlb_gen };
+        (owner_gen, synced_tlb_gen)
     }
 
     /// Update `(cpu, tag)`'s synchronisation record.
@@ -437,10 +440,9 @@ mod glue
         // SAFETY: caller's contract.
         let p = unsafe { tag_state_ptr(cpu, tag) };
         // SAFETY: p is this CPU's own record; no other CPU writes it.
-        unsafe {
-            (*p).owner_gen = owner_gen;
-            (*p).synced_tlb_gen = synced_tlb_gen;
-        }
+        unsafe { (*p).owner_gen = owner_gen };
+        // SAFETY: p is this CPU's own record; no other CPU writes it.
+        unsafe { (*p).synced_tlb_gen = synced_tlb_gen };
     }
 
     // ── Enablement ──────────────────────────────────────────────────────────────

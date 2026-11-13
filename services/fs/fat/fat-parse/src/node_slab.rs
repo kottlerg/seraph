@@ -204,8 +204,10 @@ impl<K: Hash + Eq + Copy, T> NodeSlab<K, T>
     {
         let mut h = Fnv1a(FNV_OFFSET);
         key.hash(&mut h);
-        // Cast is range-safe: the result is masked to a bucket index.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "cast is range-safe: the result is masked to a bucket index"
+        )]
         let home = h.finish() as usize & mask;
         home
     }

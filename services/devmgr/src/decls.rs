@@ -102,14 +102,20 @@ impl Binary
 
 /// The declaration of a binary of `size` bytes that `read_at` reads,
 /// `read_at(offset, dst)` filling `dst` from byte `offset` and returning the
-/// bytes it copied. `name` labels the log line of a rejected declaration.
+/// bytes it copied. `name` labels the log line of a rejected declaration, and
+/// of one the heap has no room to read.
+///
+/// The header page and the note section are read into heap buffers, freed on
+/// return: on the stack, their 5 KiB would sit in the frame of every caller
+/// the function is inlined into, beside that caller's own spawn and listing
+/// locals, on devmgr's 32 KiB main-thread stack.
 fn read_decl(
     name: &str,
     size: u64,
     mut read_at: impl FnMut(u64, &mut [u8]) -> Option<usize>,
 ) -> Option<DriverDecl>
 {
-    let mut header = [0u8; HEADER_BYTES];
+    let mut header = zeroed(name, HEADER_BYTES)?;
     let header_len = usize::try_from(size).map_or(HEADER_BYTES, |s| s.min(HEADER_BYTES));
     let read = read_at(0, header.get_mut(..header_len)?)?;
     let (ehdr, _) = elf::validate_executable(
@@ -117,7 +123,7 @@ fn read_decl(
         arch::current::ELF_MACHINE,
     )
     .ok()?;
-    let mut section = [0u8; NOTE_SECTION_BYTES];
+    let mut section = zeroed(name, NOTE_SECTION_BYTES)?;
     let desc = elf::find_note_streaming(
         &ehdr,
         size,
@@ -136,6 +142,20 @@ fn read_decl(
             None
         }
     }
+}
+
+/// A heap buffer of `len` zero bytes for [`read_decl`]; `None`, logged with
+/// `name`, when the heap cannot hold it.
+fn zeroed(name: &str, len: usize) -> Option<Vec<u8>>
+{
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(len).is_err()
+    {
+        std::os::seraph::log!(warn: "{}: no memory to read the driver declaration", name);
+        return None;
+    }
+    buf.resize(len, 0);
+    Some(buf)
 }
 
 /// The boot modules init forwarded, told apart by their content

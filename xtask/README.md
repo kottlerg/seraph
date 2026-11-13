@@ -9,6 +9,7 @@ Build task runner for Seraph, invoked as `cargo xtask <command>`.
 ```
 xtask/
 ├── Cargo.toml
+├── clippy.toml                 # Clippy settings; frame threshold of a host thread's stack
 ├── README.md
 ├── baselines/
 │   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)

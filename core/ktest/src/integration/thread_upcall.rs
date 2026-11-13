@@ -390,6 +390,12 @@ fn cancel_during_block(ctx: &TestContext, parts: &mut Parts, ep_up: u64, never: 
 
 /// Phase 8: an upcall waits for a held fault, and a stop during an upcall
 /// delivery drops the upcall.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `fault` and the reply `IpcMessage` (568 B each), the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each) and the `regs` buffer (512 B); \
+              on init's 16 KiB stack"
+)]
 fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> TestResult
 {
     let th = spawn_child(ctx, parts, 6)?;
@@ -444,6 +450,11 @@ fn recursion(ctx: &TestContext, parts: &mut Parts, ep_up: u64, ep_vm: u64) -> Te
 
 /// Phase 9: a call queued on an endpoint (`eps[0]`), and a call awaiting its
 /// reply (`eps[1]`, whose message the controller receives).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received message and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 fn ipc_arms(ctx: &TestContext, parts: &mut Parts, ep_up: u64, eps: [u64; 2]) -> TestResult
 {
     for (k, ep) in eps.into_iter().enumerate()

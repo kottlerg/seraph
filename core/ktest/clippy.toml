@@ -1,0 +1,11 @@
+# clippy.toml — Clippy settings for the ktest crate.
+# docs/coding-standards.md § Clippy states the rule each setting serves; this
+# file restates every setting of the root clippy.toml, with the frame
+# threshold of the stack ktest's code runs on.
+
+# 4096 bytes, a quarter of the smallest stack ktest's code runs on: it runs as
+# init, on init's 16 KiB (INIT_STACK_PAGES, abi/init-protocol/src/lib.rs), and
+# its child threads run on 16 KiB `ChildStack`s (core/ktest/src/main.rs). The
+# 4 KiB `SmallStack`s of stress::sleep_list_wide are a fixture sized for that
+# test's own child entry, which does not set the threshold.
+stack-size-threshold = 4096

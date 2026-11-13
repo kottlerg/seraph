@@ -193,6 +193,12 @@ fn request_word(client: u64, round: u64, k: usize) -> u64
 
 /// One client: the gather call, then [`ROUNDS`] echo calls. Returns a
 /// description of each failure.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `gather` and `req` `IpcMessage`s (568 B each), the `reply` of each call and the \
+              `words` array (`ECHO_WORDS`, 128 B); on the stack of a spawned client thread, 64 KiB \
+              at the least"
+)]
 fn run_client(client: u64, send: u64) -> Vec<String>
 {
     let buf = std::os::seraph::current_ipc_buf();

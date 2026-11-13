@@ -48,6 +48,12 @@ static CALLER_ARGS: spawn::ArgBlock<CallerArgs, NUM_CALLERS> = spawn::ArgBlock::
     bit_index: 0,
 });
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `children` array (64 `SpawnedChild`, 16 B each, 1 KiB), the `reply` and the \
+              received `IpcMessage` (568 B each) and the `Result` temporaries of its \
+              `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let mut logged_at = crate::elapsed_us();

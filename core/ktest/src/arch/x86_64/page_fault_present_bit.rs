@@ -196,6 +196,12 @@ impl Access
 
 /// Receive the child's next fault on `ep`, check it is `access` at `va`, then
 /// resume the child (`child_th`) past the faulting instruction.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each), the `Result` temporaries \
+              of its `ipc_recv(..)?` (about 576 B each) and the `regs` buffer (256 B); on init's \
+              16 KiB stack"
+)]
 fn expect_fault(ctx: &TestContext, ep: u64, child_th: u64, va: u64, access: Access) -> TestResult
 {
     // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer.

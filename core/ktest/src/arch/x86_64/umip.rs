@@ -148,6 +148,12 @@ fn checked_cpu(k: u32, cpus: u32) -> Result<u32, &'static str>
 /// [`exit_entry`] and check it exits
 /// voluntarily. The child's caps are deleted on every path (the `SpawnedChild`
 /// guard).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each), the `Result` temporaries \
+              of its `ipc_recv(..)?` (about 576 B each) and the `regs` buffer (256 B); on init's \
+              16 KiB stack"
+)]
 fn expect_gp(ctx: &TestContext, ep: u64, which: u64, cpu: u32) -> TestResult
 {
     let mut child = crate::spawn::new_child(ctx)

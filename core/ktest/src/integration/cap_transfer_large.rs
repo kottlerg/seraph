@@ -85,6 +85,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     run_round(ctx, 1, Order::SenderQueuedFirst)
 }
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 fn run_round(ctx: &TestContext, round: usize, order: Order) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)

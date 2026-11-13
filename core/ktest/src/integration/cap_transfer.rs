@@ -53,6 +53,11 @@ static CHILD_ARGS: ArgBlock<ChildArgs, 1> = ArgBlock::new(ChildArgs {
     sync_sig: 0,
 });
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     crate::log("cap_transfer: entering run");

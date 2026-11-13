@@ -111,12 +111,23 @@ as the rule above that the lint checks says. Test code is exempt from `panic`,
 configuration's relaxation, to which the roll-out ends by adding them. Two of the lints take a
 setting from Clippy's configuration file, `clippy.toml`: `max-fn-params-bools = 0`, so that
 `fn_params_excessive_bools` reports every function with a `bool` parameter, and
-`stack-size-threshold`, the frame above which `large_stack_frames` reports. For `core/boot` and
-`core/kernel` the threshold is a quarter of the smallest stack any of the crate's code runs on, and
-every other crate keeps Clippy's default of 512,000 bytes. `core/boot` and `core/kernel` each add
-a `clippy.toml` with both settings, and the stack the threshold derives from, when their sites are
-fixed, and the roll-out ends with the root `clippy.toml`. Until then a site added in a crate or
-subsystem whose sites are fixed follows the same rule.
+`stack-size-threshold`, the frame above which `large_stack_frames` reports. The threshold is a
+quarter of the smallest stack any of the crate's code runs on. The root `clippy.toml` sets 8192
+bytes, a quarter of the 32 KiB a process's main thread is given unless it declares its own stack
+(`DEFAULT_PROCESS_STACK_PAGES`, `abi/process-abi`): the stack a userspace crate's code can count
+on, since a `std` main thread's growth past it is not guaranteed. A crate whose smallest stack
+differs takes its threshold from a `clippy.toml` in its own directory, or in a directory above it
+whose crates all share that stack, and the file's comment names the stack: `core/boot` and
+`core/kernel`; the `abi/` and `shared/` crates and every other crate init links, which run on the
+16 KiB of a kernel stack or of init (`INIT_STACK_PAGES`); a service that declares a larger stack
+with `stack_pages!`; and the host crates under `xtask/`. A stack that a crate sizes for one entry
+function of its own, a test fixture, does not set the crate's threshold: the fixture's sizing
+answers for that function. Clippy reads only the nearest `clippy.toml`, searching upward from the
+crate's manifest directory, and merges none, so every other `clippy.toml` restates each setting
+of the root file, which a host test of `cargo xtask test` checks. `max-fn-params-bools` is set in
+the file of each crate whose sites are fixed, and the roll-out ends by adding it to the root file
+and to every file that restates it. Until then a site added in a crate or subsystem whose sites
+are fixed follows the same rule.
 
 `clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
 suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions

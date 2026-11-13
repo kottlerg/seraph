@@ -33,6 +33,7 @@ authoring discipline.
 ```
 core/ktest/
 ├── Cargo.toml              # Workspace member; no_std binary
+├── clippy.toml             # Clippy settings; frame threshold of the 16 KiB stacks
 ├── README.md
 └── src/
     ├── main.rs             # _start, InitInfo intake, TestContext, run_test!, tier dispatch,
@@ -416,7 +417,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
 
 - `TestResult` — `Result<(), &'static str>` — no heap, no allocation.
 - `run_test!(name, body)` — macro that logs the test name, runs `body`,
-  records PASS or FAIL (with reason), and never panics.
+  records PASS or FAIL (with reason), and never panics. `body` runs in a
+  frame of its own (`run_isolated`, never inlined), so the stack a tier
+  needs is that of its deepest test, not one `run_all` frame holding the
+  locals of every test it registers.
 - `TestContext` — thin struct carrying `aspace_cap`, `cspace_cap`,
   `thread_cap` (ktest's own Thread cap, through which a test pins or
   reprioritises the harness thread), the IPC buffer pointer `ipc_buf`,

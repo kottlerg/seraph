@@ -127,6 +127,11 @@ static STALE_REPLY_ARGS: ArgBlock<EpDoneArgs, 1> = ep_done_block();
 ///
 /// A separate sync notification (`notify`) lets the server wait for the child to
 /// complete its post-reply verification before the test returns.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn call_reply_recv(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -202,6 +207,11 @@ pub fn call_reply_recv(ctx: &TestContext) -> TestResult
 /// call `ipc_call`, and block on the send queue before the server calls
 /// `ipc_recv`.  (Contrast with `call_reply_recv`, where the server blocks first
 /// and tests the recv-queue path.)
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn recv_finds_queued_caller(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -313,6 +323,11 @@ pub fn send_insufficient_rights_err(ctx: &TestContext) -> TestResult
 ///
 /// The child writes two data words into its IPC buffer before calling.
 /// The server receives them and verifies the values.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn call_with_data_words(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -388,6 +403,11 @@ pub fn call_with_data_words(ctx: &TestContext) -> TestResult
 ///
 /// The child creates a notification, passes it via the IPC cap transfer mechanism.
 /// The server receives it and verifies it can use the transferred cap.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -472,6 +492,11 @@ pub fn call_with_cap_transfer(ctx: &TestContext) -> TestResult
 ///
 /// The child calls via a badged endpoint cap (badge=0x1234). The server
 /// receives and verifies the badge value in the third return register.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -536,6 +561,11 @@ pub fn recv_delivers_badge(ctx: &TestContext) -> TestResult
 }
 
 /// `ipc_recv` returns badge=0 when the sender uses an unbadged cap.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn recv_unbadged_returns_zero(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -835,6 +865,11 @@ extern "C" fn badge_caller_entry(arg: u64) -> !
 /// contract (`ipc::IpcMessage`) in: receive a message with known words,
 /// scribble garbage directly over the IPC buffer (the worst case of any
 /// nested IPC activity), then verify the message's view is unchanged.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -972,6 +1007,12 @@ extern "C" fn snapshot_caller_entry(arg: u64) -> !
 /// The reply-failure wake this test pins is specified in
 /// core/kernel/docs/syscalls.md § `SYS_IPC_REPLY` and docs/ipc-design.md
 /// § Message Format.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the two received `msg`s, the replies `four_cap_message` returns and `cap_reply` \
+              builds and the builder values behind them (568 B each), and the `Result` temporaries \
+              of its `ipc_recv(..)?` calls (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn reply_oom_wakes_caller_with_transfer_failed(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1290,6 +1331,12 @@ pub fn call_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
 /// `InvalidArgument` at the server, and the waiting caller un-parks with
 /// the synthetic `IPC_REPLY_TRANSFER_FAILED` label instead of being
 /// stranded.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg`, the `cap_reply` `IpcMessage` and the builder values of its \
+              `.cap()` chain (568 B each), and the `Result` temporaries of its `ipc_recv(..)?` \
+              (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn reply_duplicate_cap_slot_rejected(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1406,6 +1453,12 @@ extern "C" fn dup_reply_caller_entry(arg: u64) -> !
 /// pre-validation — a distinct rejection cause from the duplicate-index
 /// branch `reply_duplicate_cap_slot_rejected` covers, routed through the
 /// same post-claim `deposit_transfer_failed_reply` wake.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg`, the `cap_reply` `IpcMessage` and the builder values of its \
+              `.cap()` chain (568 B each), and the `Result` temporaries of its `ipc_recv(..)?` \
+              (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1507,6 +1560,11 @@ pub fn reply_stale_cap_handle_rejected(ctx: &TestContext) -> TestResult
 /// `MSG_CAP_SLOTS_MAX` words from `MSG_CAP_HANDLES_WORD` on (layout:
 /// core/kernel/docs/syscalls.md § `SYS_IPC_CALL`), so a sender and kernel
 /// that disagreed on where a handle word sits would fail it.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1588,6 +1646,11 @@ pub fn call_four_caps_transfer(ctx: &TestContext) -> TestResult
 
 /// Child for `call_four_caps_transfer`: creates four notifications and
 /// sends all of them in one cap-bearing call, then signals completion.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request `msg` and the five builder values of its `.cap()` chain (568 B each) and \
+              the `Result` holding the reply (about 576 B); on its 16 KiB `ChildStack`"
+)]
 extern "C" fn four_caps_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this child.
@@ -1846,6 +1909,11 @@ extern "C" fn recv_reserve_victim_entry(arg: u64) -> !
 /// Caller for `recv_succeeds_on_exhausted_general_slots`, in ktest's own
 /// `CSpace`: mints `MSG_CAP_SLOTS_MAX` notifications, sends them in one call,
 /// and reports `0x1000 | <reply label>`, or `0xBAD` on failure.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request `msg` and the five builder values of its `.cap()` chain (568 B each) and \
+              the `Result` holding the reply (about 576 B); on its 16 KiB `ChildStack`"
+)]
 extern "C" fn recv_reserve_caller_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry the test published for this caller.

@@ -699,6 +699,11 @@ fn expect_registration_refused()
     let _ = syscall::cap_delete(endpoint);
 }
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s of its calls (568 B each) and the builder's \
+              copy; on the 32 KiB main-thread stack of svctest"
+)]
 pub fn crash_endpoint_phase(caps: &Caps)
 {
     let authority = caps.debug_authority;

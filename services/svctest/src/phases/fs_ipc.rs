@@ -279,6 +279,11 @@ pub fn fs_crossover_bench_phase(_: &Caps)
     std::os::seraph::log!("fs_crossover_bench phase passed");
 }
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `read_msg`, `unknown_msg` and `read_reply` `IpcMessage`s (568 B each) of its \
+              three calls and their replies; on the 32 KiB main-thread stack of svctest"
+)]
 pub fn fs_rights_attenuation_phase(_: &Caps)
 {
     use namespace_protocol::rights;
@@ -624,6 +629,11 @@ pub fn fs_request_bounds_phase(_: &Caps)
     std::os::seraph::log!("fs_request_bounds phase passed");
 }
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s of its calls (568 B each) and the builder \
+              copies; on the 32 KiB main-thread stack of svctest"
+)]
 pub fn fs_write_memory_phase(_: &Caps)
 {
     use syscall::MAP_WRITABLE;
@@ -757,6 +767,11 @@ pub fn fs_write_cache_coherence_phase(_: &Caps)
     clippy::too_many_lines,
     reason = "three scoped write-invariant checks (rights attenuation, empty-file dedupe, FAT \
               chain past EOC) sharing the phase's directory caps"
+)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s of its calls (568 B each) and the builder \
+              copies; on the 32 KiB main-thread stack of svctest"
 )]
 pub fn fs_write_invariants_phase(_: &Caps)
 {

@@ -315,6 +315,43 @@ pub fn lookup_cspace(id: CSpaceId, expected_epoch: u32) -> Option<*mut CSpace>
     CSPACE_REGISTRY.lookup(id, expected_epoch)
 }
 
+/// The registry identity of a thread's `CSpace` (its `cspace_id` and
+/// `cspace_epoch`), copied out of the TCB while the thread is known to be
+/// live, so a later path resolves the `CSpace` through the registry
+/// ([`lookup_cspace`]) without reading the TCB again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CSpaceIdentity
+{
+    pub id: CSpaceId,
+    pub epoch: u32,
+}
+
+impl CSpaceIdentity
+{
+    /// Copy `tcb`'s `CSpace` identity.
+    ///
+    /// # Safety
+    /// `tcb` must be a valid TCB for the duration of the call: the running
+    /// thread, or one the caller pins (a held queue lock, a won reply claim,
+    /// or a `wake_in_flight` pin). Both fields are read-only after creation.
+    #[cfg(not(test))]
+    pub unsafe fn of_thread(tcb: *const crate::sched::thread::ThreadControlBlock) -> Self
+    {
+        // SAFETY: tcb is valid (caller contract); cspace_id is read-only
+        // after creation.
+        let id = unsafe { (*tcb).cspace_id };
+        // SAFETY: as above; cspace_epoch is read-only after creation.
+        let epoch = unsafe { (*tcb).cspace_epoch };
+        Self { id, epoch }
+    }
+
+    /// Resolve this identity through the registry ([`lookup_cspace`]).
+    pub fn lookup(self) -> Option<*mut CSpace>
+    {
+        lookup_cspace(self.id, self.epoch)
+    }
+}
+
 /// Sum [`MemoryObject::available_bytes`] across every [`CapTag::Memory`] cap
 /// in `cspace`. Used by Phase 9 to print the boot-handover ledger so that
 /// "RAM granted to userspace as retypable bytes" can be reconciled against

@@ -150,7 +150,8 @@ syscall on either side. Nothing is allocated on the path.
 3. Acquire endpoint lock
 4. if the send queue is non-empty (bind_next_sender):
    // Fast path: a sender is waiting
-   a. sender_tcb = head of the send queue (dequeued)
+   a. sender_tcb = head of the send queue (dequeued); copy its staged
+      message (ipc_msg) and its CSpace identity (cspace_id, cspace_epoch)
    b. if the send queue is now empty: send_nonempty = 0
    c. Claim sender_tcb for the reply wake (wake_in_flight = 1)
    d. commit_reply_rebind_under_local_lock(sender_tcb, BlockedOnReply or
@@ -162,10 +163,13 @@ syscall on either side. Nothing is allocated on the path.
       published: the commit removes a timed call's entry, and the receive,
       whose dequeue claimed the episode, stamps the sender cancelled,
       clears its wake_in_flight, and retries from a with the next sender
-   e. Release endpoint lock
-   f. Copy the staged message from sender_tcb.ipc_msg (label/counts plus the
-      data words read at call time) into the server's trap frame and IPC
-      buffer page, and transfer capability slots
+   e. Release endpoint lock. From here sender_tcb is not read: once the
+      binding is published, a stop, a timed call's expiry, or a teardown can
+      claim it and wake the sender, which can exit and be freed
+   f. Copy the message copied in a (label/counts plus the data words read at
+      call time) into the server's trap frame and IPC buffer page, and
+      transfer capability slots from the CSpace the identity copied in a
+      names
    g. Return to server with message (no blocking)
 
 5. else (no sender yet):

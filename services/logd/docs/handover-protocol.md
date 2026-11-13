@@ -6,8 +6,12 @@ svcmgr launches and supervises real-logd, minting its bootstrap caps
 from the reserved log-sink sources init endows (see
 [`services/svcmgr/docs/service-definitions.md`](../../svcmgr/docs/service-definitions.md)).
 On its **first launch**, real-logd holds a single-use SEND cap on the
-master log endpoint (bootstrap `cap[1]`) and calls
-`log_labels::HANDOVER_PULL` repeatedly on it. Init-logd's receive loop,
+master log endpoint (bootstrap `cap[1]`, unbadged) and calls
+`log_labels::HANDOVER_PULL` repeatedly on it. Init-logd serves the two
+handover labels only on that unbadged SEND
+(`logd_codec::handover::drives_handover`); from a log sender's badged SEND
+it answers them as an unknown label, with an empty reply, so no sender can
+pull the drain or end init-logd. Init-logd's receive loop,
 on seeing the label, replies one chunk at a time until its captured
 state is drained (`DONE`). Real-logd then issues
 `log_labels::HANDOVER_RELEASE`; init-logd breaks its loop and calls

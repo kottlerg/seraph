@@ -475,13 +475,13 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }
-        else if label_id == HANDOVER_PULL
+        else if label_id == HANDOVER_PULL && handover::drives_handover(recv.badge)
         {
             let reply = drain.next_chunk(senders.slots(), history);
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf_raw) };
         }
-        else if label_id == HANDOVER_RELEASE
+        else if label_id == HANDOVER_RELEASE && handover::drives_handover(recv.badge)
         {
             // Real-logd's terminal release: the sole init-logd exit trigger,
             // independent of the data drain's progress. A name that changed
@@ -506,7 +506,9 @@ fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
         }
         else
         {
-            // Unknown label — reply empty so the sender unblocks.
+            // Unknown label, or a handover label from a log sender rather
+            // than real-logd's unbadged SEND: reply empty so the sender
+            // unblocks, the drain and the release untouched.
             // SAFETY: ipc_buf_raw is the log thread's registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&ipc::IpcMessage::new(0), ipc_buf_raw) };
         }

@@ -51,6 +51,21 @@ pub const RECORD_BYTES_WORD: usize = 4;
 // never clips one.
 const _: () = assert!(RECORD_MAX_BYTES <= (MSG_DATA_WORDS_MAX - RECORD_BYTES_WORD) * 8);
 
+/// The badge of the SEND real-logd drives the handover through: svcmgr
+/// derives it unbadged from the master log endpoint, while every log
+/// sender's SEND carries a nonzero badge (`ipc::log_badges`).
+pub const HANDOVER_SENDER_BADGE: u64 = 0;
+
+/// Whether a request that arrived with badge `badge` may drive the handover
+/// (`HANDOVER_PULL`, `HANDOVER_RELEASE`): only real-logd's unbadged SEND
+/// may, so a log sender can neither pull the drain nor end init-logd. Any
+/// other sender's handover label is answered as an unknown label.
+#[must_use]
+pub const fn drives_handover(badge: u64) -> bool
+{
+    badge == HANDOVER_SENDER_BADGE
+}
+
 /// `HANDOVER_RELEASE` reply status: released; init-logd exits.
 pub const RELEASE_ACK: u64 = 0;
 /// `HANDOVER_RELEASE` reply status: a display name changed after its slot was
@@ -415,6 +430,24 @@ impl<const N: usize> Default for NameResend<N>
 #[cfg(test)]
 mod tests
 {
+    /// Defect caught: init-logd served `HANDOVER_PULL` and
+    /// `HANDOVER_RELEASE` whatever the sender's badge, so a log sender could
+    /// pull the drain or end init-logd.
+    #[test]
+    fn only_the_unbadged_handover_send_drives_the_handover()
+    {
+        assert!(super::drives_handover(0));
+        for badge in [
+            ipc::log_badges::LOG_BADGE_INIT,
+            ipc::log_badges::LOG_BADGE_PROCMGR,
+            ipc::log_badges::LOG_BADGE_FIRST_CHILD,
+            u64::MAX,
+        ]
+        {
+            assert!(!super::drives_handover(badge));
+        }
+    }
+
     use super::*;
     use ipc::stream_labels::{LEVEL_INFO, LEVEL_WARN};
 

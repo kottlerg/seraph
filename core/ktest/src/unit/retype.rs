@@ -1938,13 +1938,13 @@ impl Drop for TeardownFixture
 
 /// Build the teardown fixture on `source`: `LAT_HOLES` pairs of one-page
 /// donations, one to `holes` and one to `kept`, then `LAT_DONATIONS` one-page
-/// donations to the target, a `CSpace` or (`aspace`) an address space created
-/// from `memory_base`, and a guard donation to `kept`; then delete `holes`,
-/// which leaves its pages free below the target's.
+/// donations to the target, an object of kind `target` created from
+/// `memory_base`, and a guard donation to `kept`; then delete `holes`, which
+/// leaves its pages free below the target's.
 fn build_teardown_fixture(
     ctx: &TestContext,
     source: u64,
-    aspace: bool,
+    target: TeardownTarget,
     fixture: &mut TeardownFixture,
 ) -> TestResult
 {
@@ -1959,24 +1959,18 @@ fn build_teardown_fixture(
             .and_then(|_| cap_create_cspace(source, fixture.kept, 1))
             .map_err(|_| "retype::pool_latency: a hole or neighbour donation failed")?;
     }
-    fixture.target = if aspace
+    fixture.target = match target
     {
-        cap_create_aspace(memory, 0, 2)
-    }
-    else
-    {
-        cap_create_cspace(memory, 0, 1)
+        TeardownTarget::AddressSpace => cap_create_aspace(memory, 0, 2),
+        TeardownTarget::CSpace => cap_create_cspace(memory, 0, 1),
     }
     .map_err(|_| "retype::pool_latency: create the target failed")?;
     for _ in 0..LAT_DONATIONS
     {
-        if aspace
+        match target
         {
-            cap_create_aspace(source, fixture.target, 1)
-        }
-        else
-        {
-            cap_create_cspace(source, fixture.target, 1)
+            TeardownTarget::AddressSpace => cap_create_aspace(source, fixture.target, 1),
+            TeardownTarget::CSpace => cap_create_cspace(source, fixture.target, 1),
         }
         .map_err(|_| "retype::pool_latency: a donation to the target failed")?;
     }
@@ -1986,10 +1980,18 @@ fn build_teardown_fixture(
     cap_delete(holes).map_err(|_| "retype::pool_latency: delete holes failed")
 }
 
-/// Delete a target carrying `LAT_DONATIONS` one-page donations above
-/// `LAT_HOLES` free one-page holes of their Memory object, on a worker CPU,
-/// while probing that CPU with TLB shootdowns.
-fn teardown_case(ctx: &TestContext, aspace: bool, call: &'static str) -> TestResult
+/// The kind of object a teardown case deletes.
+#[derive(Clone, Copy)]
+enum TeardownTarget
+{
+    CSpace,
+    AddressSpace,
+}
+
+/// Delete a target of kind `target` carrying `LAT_DONATIONS` one-page
+/// donations above `LAT_HOLES` free one-page holes of their Memory object, on
+/// a worker CPU, while probing that CPU with TLB shootdowns.
+fn teardown_case(ctx: &TestContext, target: TeardownTarget, call: &'static str) -> TestResult
 {
     if !latency_cpus_present()
     {
@@ -2003,7 +2005,7 @@ fn teardown_case(ctx: &TestContext, aspace: bool, call: &'static str) -> TestRes
             kept: 0,
             target: 0,
         };
-        build_teardown_fixture(ctx, source, aspace, &mut fixture)?;
+        build_teardown_fixture(ctx, source, target, &mut fixture)?;
         let measured = measure_call(ctx, frame.0, LAT_OP_DELETE, fixture.target, 0);
         // The fixture's drop deletes the target unless the worker's delete
         // consumed it, whether or not the measure itself succeeded.
@@ -2033,13 +2035,21 @@ fn teardown_case(ctx: &TestContext, aspace: bool, call: &'static str) -> TestRes
 /// throughout.
 pub fn cspace_teardown_takes_interrupts(ctx: &TestContext) -> TestResult
 {
-    teardown_case(ctx, false, "ktest: pool_latency call=cspace_delete")
+    teardown_case(
+        ctx,
+        TeardownTarget::CSpace,
+        "ktest: pool_latency call=cspace_delete",
+    )
 }
 
 /// As [`cspace_teardown_takes_interrupts`], for an address space.
 pub fn aspace_teardown_takes_interrupts(ctx: &TestContext) -> TestResult
 {
-    teardown_case(ctx, true, "ktest: pool_latency call=aspace_delete")
+    teardown_case(
+        ctx,
+        TeardownTarget::AddressSpace,
+        "ktest: pool_latency call=aspace_delete",
+    )
 }
 
 /// Measure one seeding call `op` from `source` and delete the pool it

@@ -241,11 +241,9 @@ pub fn text_span(data: &[u8]) -> Option<(u64, u64)>
 {
     let file = object::File::parse(data).ok()?;
     let mut span: Option<(u64, u64)> = None;
-    for segment in file.segments().filter(|segment| match segment.flags()
-    {
-        SegmentFlags::Elf { p_flags, .. } => p_flags.contains(object::elf::PF_X),
-        _ => false,
-    })
+    for segment in file
+        .segments()
+        .filter(|segment| is_executable_elf(segment.flags()))
     {
         let start = segment.address();
         let end = start.checked_add(segment.size())?;
@@ -255,6 +253,21 @@ pub fn text_span(data: &[u8]) -> Option<(u64, u64)>
         }
     }
     span
+}
+
+/// Whether `flags` are an ELF segment's and include `PF_X`.
+#[expect(
+    clippy::wildcard_enum_match_arm,
+    reason = "`object::SegmentFlags` is defined outside the tree and is `#[non_exhaustive]`; \
+              a segment of any other format is not an ELF segment"
+)]
+fn is_executable_elf(flags: SegmentFlags) -> bool
+{
+    match flags
+    {
+        SegmentFlags::Elf { p_flags, .. } => p_flags.contains(object::elf::PF_X),
+        _ => false,
+    }
 }
 
 /// The image address of runtime address `addr` in an image loaded at

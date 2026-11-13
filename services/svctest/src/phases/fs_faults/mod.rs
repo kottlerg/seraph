@@ -446,8 +446,7 @@ fn fill_rest_of_sector(dir: u64, used: usize)
 /// directory sector `lba`.
 fn first_entry_cluster(disk: &SharedDisk, lba: usize) -> u16
 {
-    let disk = lock(disk);
-    let slot = disk
+    let slot: [u8; 32] = *lock(disk)
         .sector(lba)
         .as_chunks::<32>()
         .0
@@ -614,11 +613,12 @@ impl OwnFatfs
         let (lba, off) = disk
             .find_root_sfn(&sfn)
             .expect("fs_block_faults: case directory entry not on disk");
-        let entry: &[u8; 32] = disk
+        let entry: [u8; 32] = *disk
             .sector(lba)
             .get(off..)
             .and_then(<[u8]>::first_chunk)
             .expect("fs_block_faults: case directory entry past its sector");
+        drop(disk);
         let cluster = u16::from_le_bytes([entry[26], entry[27]]);
         (cap, RamDisk::cluster_lba(cluster))
     }

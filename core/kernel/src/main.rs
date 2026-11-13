@@ -70,50 +70,19 @@ use boot_protocol::BootInfo;
 
 mod arch;
 mod bounded_wait;
-#[expect(
-    clippy::multiple_unsafe_ops_per_block,
-    reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are not \
-              fixed yet"
-)]
 mod cap;
 mod console;
 mod cpu_mask;
-#[cfg_attr(
-    not(test),
-    expect(
-        clippy::multiple_unsafe_ops_per_block,
-        reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are \
-                  not fixed yet"
-    )
-)]
 mod entropy;
 mod framebuffer;
-#[expect(
-    clippy::multiple_unsafe_ops_per_block,
-    reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are not \
-              fixed yet"
-)]
 mod ipc;
 pub mod irq;
-#[expect(
-    clippy::multiple_unsafe_ops_per_block,
-    reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are not \
-              fixed yet"
-)]
 mod mm;
 mod percpu;
 mod platform;
 mod sched;
 mod stack_depth;
 mod sync;
-#[cfg_attr(
-    not(test),
-    expect(
-        clippy::multiple_unsafe_ops_per_block,
-        reason = "staged roll-out (docs/coding-standards.md § Clippy): this subsystem's sites are \
-                  not fixed yet"
-    )
-)]
 mod syscall;
 mod uaccess;
 mod validate;

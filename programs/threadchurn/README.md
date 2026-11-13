@@ -22,7 +22,8 @@ threadchurn/
 └── tester/
     ├── Cargo.toml         # threadchurn-tester
     └── src/
-        └── main.rs        # Runs the fixture, checks its marker and exit status
+        └── main.rs        # Runs the fixture demand-paged and pinned, checks its marker and
+                           #   exit status
 ```
 
 ---
@@ -95,9 +96,14 @@ panicked worker panics the fixture, so it exits non-zero with no stdout marker.
 
 ## Tester
 
-The tester spawns `/programs/threadchurn` with a piped stdout, reads stdout to EOF, and waits
-for the child. It fails when any line contains `threadchurn: FAIL`, when no line contains
-`threadchurn: PASS`, or when the child exits non-zero, checked in that order. It prints
+The tester runs `/programs/threadchurn` twice: demand-paged, the system default, and then pinned
+(`std::os::seraph::process::CommandExt::pinned`), with no pager. In the pinned run each thread's
+stack is mapped at spawn from a memmgr grant
+([runtime/ruststd/README.md](../../runtime/ruststd/README.md) § Spawned-thread stacks), so a stack
+that a join or the reaper does not return trips the pool bound. For each run it spawns the fixture
+with a piped stdout, reads stdout to EOF, and waits for the child. It fails when any line contains
+`threadchurn: FAIL`, when no line contains `threadchurn: PASS`, or when the child exits non-zero,
+checked in that order; a pinned run's reason names it with ` (pinned)`. It prints
 `[threadchurn-tester] PASS` or `[threadchurn-tester] FAIL <reason>` to stdout and exits `0` or
 `1`; a failed spawn, read, or wait panics and also exits non-zero. The exit code is the verdict
 and the `PASS`/`FAIL` line is advisory, per [docs/testing.md](../../docs/testing.md#contract).

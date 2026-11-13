@@ -76,8 +76,11 @@ fn main() -> !
         syscall::thread_exit();
     };
     // The framebuffer is the primary output but optional: a headless boot has
-    // none, and the terminal then mirrors to serial only.
-    let fb_cap = query_device(fb_class, ipc_buf);
+    // none, and the terminal then mirrors to serial only. With that no-device
+    // path, a NO_DEVICE reply is terminal (`devmgr_errors::NO_DEVICE`), so the
+    // query is made once, and any refusal takes the serial-only path.
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let fb_cap = unsafe { ipc::query_device(fb_class, 0, ipc_buf) }.ok();
     if fb_cap.is_none()
     {
         std::os::seraph::log!(warn: "terminal: framebuffer unavailable; serial-only output");
@@ -268,8 +271,9 @@ fn bootstrap_class_sends(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 3]>
 }
 
 /// The first driver of the class whose class SEND is `class_send`
-/// (`QUERY_DEVICE` at ordinal 0), retrying briefly while the driver's
-/// on-disk spawn completes.
+/// (`QUERY_DEVICE` at ordinal 0), retrying a bounded number of times while
+/// the driver's on-disk spawn completes: for a class the terminal cannot run
+/// without, which `devmgr_errors::NO_DEVICE` lets a client retry.
 fn query_device(class_send: u64, ipc_buf: *mut u64) -> Option<u64>
 {
     for _ in 0..100

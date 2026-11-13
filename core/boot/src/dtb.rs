@@ -256,6 +256,11 @@ static REPORTED_TRUNCATED: AtomicBool = AtomicBool::new(false);
 /// [`MAX_DEPTH`] (`too_deep`) or dropped entries past a property's
 /// `MAX_*_ENTRIES` bound (`truncated`), each the first time a walk of this
 /// boot meets it.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`too_deep` and `truncated` are data: the outcomes of the walk, each of which the \
+              function reports once per boot"
+)]
 fn report_walk_limits(too_deep: bool, truncated: bool)
 {
     if too_deep && !REPORTED_TOO_DEEP.swap(true, Ordering::Relaxed)

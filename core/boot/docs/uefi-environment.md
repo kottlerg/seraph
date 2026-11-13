@@ -5,8 +5,8 @@ and memory allocation goes through UEFI firmware services. After `ExitBootServic
 UEFI boot services are permanently unavailable; the bootloader operates exclusively
 from pre-allocated memory.
 
-This document covers the UEFI protocols used, allocation strategy, memory map
-acquisition, `ExitBootServices`, and error handling.
+This document covers the UEFI protocols used, allocation strategy, the stack the
+bootloader runs on, memory map acquisition, `ExitBootServices`, and error handling.
 
 ---
 
@@ -118,6 +118,21 @@ deallocation before `ExitBootServices` is `FreePool` on the pool buffers firmwar
 from `LocateHandleBuffer` and GOP `QueryMode`. Every other allocation is made once and
 kept; the bootloader does not implement a heap, and the scratch it keeps past
 `ExitBootServices` is recorded in `BootInfo.reclaim_ranges` for the kernel to reclaim.
+
+---
+
+## Stack
+
+The bootloader runs on the stack the firmware enters `efi_main` on, before and after
+`ExitBootServices`, until step 10 switches to the kernel handoff stack it allocated
+([boot-flow.md](boot-flow.md)). It allocates no stack of its own. The UEFI specification
+guarantees an image 128 KiB or more of available stack space during boot services, in the
+calling convention it sets for each of x64 and RISC-V, so 128 KiB bounds the bootloader's
+deepest call chain. A quarter of it, 32768 bytes, is the bootloader's `large_stack_frames`
+threshold (`stack-size-threshold` in `core/boot/clippy.toml`;
+[docs/coding-standards.md](../../../docs/coding-standards.md) § Clippy). The firmware's stack
+lies in `EfiBootServicesData` memory, which the kernel zeroes before minting it to userspace
+([memory-map.md](memory-map.md)).
 
 ---
 

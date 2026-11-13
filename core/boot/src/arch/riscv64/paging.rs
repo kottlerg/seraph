@@ -33,10 +33,13 @@ use crate::{bprintln, uefi};
 static NEGOTIATED_MODE: AtomicU8 = AtomicU8::new(PagingMode::Sv48 as u8);
 
 /// The paging mode the bootloader builds tables for and installs at handoff.
+#[expect(
+    clippy::unreachable,
+    reason = "the decode of NEGOTIATED_MODE cannot fail: its initialiser and its one store, in \
+              negotiate_paging, write only PagingMode discriminants"
+)]
 pub(crate) fn negotiated_mode() -> PagingMode
 {
-    // The store site only writes PagingMode discriminants, so the decode
-    // cannot fail.
     match PagingMode::from_satp_mode(u64::from(NEGOTIATED_MODE.load(Ordering::Relaxed)))
     {
         Some(mode) => mode,

@@ -47,6 +47,23 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -224,6 +241,12 @@ fn main_guard() -> ExitCode
 /// between. The buffer's address escapes through `black_box`, so the compiler
 /// must allocate the whole frame rather than the one byte used.
 #[inline(never)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the frame is the fixture: `buf`, `BIG_FRAME_BYTES` (2 MiB and 4 pages), is larger \
+              than the spawned thread's 2 MiB demand stack that holds it, so its stack probes \
+              reach the guard page"
+)]
 fn big_frame() -> u8
 {
     let mut buf = std::mem::MaybeUninit::<[u8; BIG_FRAME_BYTES]>::uninit();

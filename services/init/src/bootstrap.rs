@@ -1239,6 +1239,11 @@ fn assert_init_arena_front_bounded(info: &InitInfo, init_arena_cap: u64)
 /// init's `CSpace` for the bootstrap round. Once memmgr has read the page and
 /// deleted `caps[1]`, its run is named by memmgr's slot alone and allocatable
 /// like any other.
+///
+/// Returns `None`, which the caller treats as a fatal bootstrap failure, when
+/// the rights of a RAM cap to forward cannot be read or lack
+/// `RIGHTS_MEM_RETYPE`, or when memmgr's thread cannot be configured or
+/// started.
 pub fn finalize_memmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,
@@ -1281,22 +1286,25 @@ pub fn finalize_memmgr(
         // Every RAM Memory cap init forwards to memmgr MUST carry
         // `MemRights::RETYPE`. The kernel stamps RETYPE on usable RAM at
         // Phase-7 mint (`core/kernel/src/cap/mod.rs`); init holds these
-        // caps unchanged. If this assertion ever fires, memmgr will be
-        // unable to retype memory caps into kernel objects and the typed-memory
-        // contract is broken. `cap_info` on a non-null slot never fails for
-        // the universal `TAG_RIGHTS` field; an Err here means the cap-
-        // routing graph is broken and the bootstrap invariant fails.
+        // caps unchanged. Without it memmgr could not retype memory caps
+        // into kernel objects and the typed-memory contract is broken.
+        // `cap_info` on a non-null slot never fails for the universal
+        // `TAG_RIGHTS` field; an Err here means the cap-routing graph is
+        // broken. Either failure fails the memmgr bootstrap, which the
+        // caller reports as fatal.
         let Ok(packed) = syscall::cap_info(src_slot, syscall::CAP_INFO_TAG_RIGHTS)
         else
         {
-            panic!("init: cap_info failed on RAM Memory cap before memmgr forward");
+            log("init: cap_info failed on RAM Memory cap before memmgr forward");
+            return None;
         };
         // Packed value is `(tag << 32) | rights`; `RIGHTS_MEM_RETYPE` is a
         // low-bit-position right so the u64 mask is exact.
-        assert!(
-            packed & syscall::RIGHTS_MEM_RETYPE != 0,
-            "init: RAM Memory cap missing RIGHTS_MEM_RETYPE before memmgr forward",
-        );
+        if packed & syscall::RIGHTS_MEM_RETYPE == 0
+        {
+            log("init: RAM Memory cap missing RIGHTS_MEM_RETYPE before memmgr forward");
+            return None;
+        }
         let Ok(dst_slot) = syscall::cap_move(src_slot, mm.mm_cspace, 0)
         else
         {

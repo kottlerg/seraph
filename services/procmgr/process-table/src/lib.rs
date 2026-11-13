@@ -37,6 +37,23 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 pub mod crash_registrant;
 pub mod create_blobs;
@@ -558,8 +575,11 @@ impl ProcessTable
             {
                 RestoreAction::Bind(thread.crash_badge)
             }
-            _ if from_debugger => RestoreAction::Unbind,
-            _ => RestoreAction::Leave,
+            Origin::Own | Origin::Owner(_) | Origin::Unknown if from_debugger =>
+            {
+                RestoreAction::Unbind
+            }
+            Origin::Own | Origin::Owner(_) | Origin::Unknown => RestoreAction::Leave,
         }
     }
 
@@ -1738,8 +1758,11 @@ mod tests
                         {
                             RestoreAction::Bind(crash)
                         }
-                        _ if from_debugger => RestoreAction::Unbind,
-                        _ => RestoreAction::Leave,
+                        Origin::Own | Origin::Owner(_) | Origin::Unknown if from_debugger =>
+                        {
+                            RestoreAction::Unbind
+                        }
+                        Origin::Own | Origin::Owner(_) | Origin::Unknown => RestoreAction::Leave,
                     };
                     assert_eq!(action, expected, "{case:?}");
                     match action

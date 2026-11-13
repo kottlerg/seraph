@@ -490,20 +490,23 @@ impl Session
                 self.restart(k, i, h.stop, stop);
                 None
             }
-            settled @ (Unclaimed::Adopt | Unclaimed::Redelivered) =>
+            Unclaimed::Adopt =>
             {
+                // An adopted stop's predecessors were not the thread's: a new
+                // thread's its bind cancelled, or a live one of a thread the
+                // stub cannot bind.
                 for old in self.replace_held(i, h, stop)
                 {
-                    // An adopted stop's predecessors were not the thread's: a
-                    // new thread's its bind cancelled, or a live one of a
-                    // thread the stub cannot bind. A redelivered one's the
-                    // kernel cancelled.
-                    let label = match settled
-                    {
-                        Unclaimed::Adopt => decline(&old),
-                        _ => syscall_abi::FAULT_REPLY_RESUME,
-                    };
-                    k.reply(old.receiver, label);
+                    k.reply(old.receiver, decline(&old));
+                }
+                (!h.reported).then_some(i)
+            }
+            Unclaimed::Redelivered =>
+            {
+                // A redelivered stop's predecessors the kernel cancelled.
+                for old in self.replace_held(i, h, stop)
+                {
+                    k.reply(old.receiver, syscall_abi::FAULT_REPLY_RESUME);
                 }
                 (!h.reported).then_some(i)
             }

@@ -178,7 +178,10 @@ impl<T> InitReap<T>
                 *armed = true;
                 Ok(())
             }
-            _ => Err(Refusal::Invalid(CapDisposition::Release)),
+            Self::Empty | Self::Collecting { .. } | Self::Reaped =>
+            {
+                Err(Refusal::Invalid(CapDisposition::Release))
+            }
         }
     }
 

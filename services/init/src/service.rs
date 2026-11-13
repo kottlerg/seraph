@@ -250,7 +250,12 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
                 hw.dtb_page_base = d.aux0;
                 hw.dtb_size = d.aux1;
             }
-            _ =>
+            CapType::Memory
+            | CapType::Interrupt
+            | CapType::Mmio
+            | CapType::IoPort
+            | CapType::SchedControl
+            | CapType::SbiControl =>
             {}
         }
     }

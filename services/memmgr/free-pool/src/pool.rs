@@ -98,7 +98,7 @@ pub(crate) fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<Fre
     match arena.get(idx).node
     {
         Node::Run(run) => Some(run),
-        _ => None,
+        Node::Free | Node::Region(_) | Node::Frame(_) | Node::Process(_) => None,
     }
 }
 

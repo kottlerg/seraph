@@ -81,7 +81,7 @@ disjoint surfaces:
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (the platform allocator behind `System` and the default global allocator) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
-| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, demand-paged spawned-thread stacks (heap-backed stacks and spawned-thread IPC buffers come from the byte heap) |
+| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, spawned-thread stacks, demand-paged or mapped at spawn (spawned-thread IPC buffers come from the byte heap) |
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo` page and `InitInfo` region, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
@@ -163,7 +163,7 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   from the zone's window (ASLR,
   [#39](https://github.com/kottlerg/seraph/issues/39)), degrading to the
   window base when the entropy draw fails. Everything placed through the
-  arena — demand-paged thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
+  arena — spawned-thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
   inherits the randomised base.
 - **Free runs.** Released ranges coalesce into a sorted run table, which
   each reservation first grows to hold one run more than the live
@@ -454,9 +454,11 @@ The process tears the range down with `std::os::seraph::unregister_demand_paged`
 which unregisters it with memmgr (`UNREGISTER_REGION`), so memmgr unmaps and
 reclaims the frames it backed, and releases the reservation only once memmgr has
 answered.
-Stacks grow the same way: a spawned thread's stack is a demand region above
-an unregistered guard of `STACK_GUARD_PAGES` pages
-([ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)),
+Stacks grow the same way: in a demand-paged process a spawned thread's stack
+is a demand region above an unregistered guard of `STACK_GUARD_PAGES` pages
+(in a process with no pager it is mapped at spawn above the same guard, left
+unmapped;
+[ruststd § Spawned-thread stacks](../runtime/ruststd/README.md#spawned-thread-stacks)),
 and the main thread's grows below its committed pages
 ([Bootstrap Cross-Boundary VAs](#bootstrap-cross-boundary-vas)).
 

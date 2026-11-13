@@ -110,10 +110,9 @@ pub const DEFAULT_PROCESS_STACK_PAGES: u32 = 8;
 
 /// Unmapped guard pages below a userspace stack, in 4 KiB pages: the least
 /// the creator's layout (`process-layout`) leaves below a main-thread stack,
-/// the guard std reserves below each demand-paged thread stack it spawns,
-/// and the guard below each stack the `lowuser` binaries use (init's main
-/// stack, which the kernel places, init's log-thread stack, and ktest's
-/// child stacks).
+/// the guard std reserves below each thread stack it spawns, and the guard
+/// below each stack the `lowuser` binaries use (init's main stack, which the
+/// kernel places, init's log-thread stack, and ktest's child stacks).
 ///
 /// Four pages, because a store can land that far below the stack's lowest
 /// written byte. On riscv64 a `call` writes nothing to the stack, and a split

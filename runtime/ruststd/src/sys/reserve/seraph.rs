@@ -15,7 +15,7 @@
 //!
 //! Used for foreign Memory mappings: MMIO from devmgr, DMA buffers from
 //! drivers, shmem backings, zero-copy file pages from fs drivers, ELF-load
-//! scratch in procmgr, and demand-paged thread stacks. The byte heap
+//! scratch in procmgr, and spawned-thread stacks. The byte heap
 //! (`#[global_allocator]`) is a disjoint surface owned by `sys::alloc::seraph`.
 //!
 //! Free runs: a table sorted by address, kept maximal by coalescing on every

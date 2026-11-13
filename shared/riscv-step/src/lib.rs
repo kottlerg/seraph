@@ -19,6 +19,7 @@
 
 #![no_std]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 /// `c.ebreak` (0x9002), little-endian: the breakpoint a debugger plants at the
 /// successor. Two bytes, so it never reaches past the successor's first

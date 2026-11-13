@@ -53,8 +53,11 @@ pub unsafe fn paint(base: u64, bytes: usize)
     let p = base as *mut u64;
     for i in 0..words
     {
-        // SAFETY: i < words, so the write stays inside the caller's span.
-        unsafe { p.add(i).write(STACK_PAINT) };
+        // SAFETY: i < words, so the offset stays inside the caller's span.
+        let word = unsafe { p.add(i) };
+        // SAFETY: `word` lies in the caller's span, which is writable, aligned
+        // and the caller's alone.
+        unsafe { word.write(STACK_PAINT) };
     }
 }
 
@@ -79,8 +82,14 @@ fn used_bytes_with(words: usize, mut word: impl FnMut(usize) -> u64) -> u64
 pub unsafe fn used_bytes(base: u64, bytes: usize) -> u64
 {
     let p = base as *const u64;
-    // SAFETY: each index is below `bytes / 8`, inside the caller's span.
-    used_bytes_with(bytes / WORD, |i| unsafe { p.add(i).read() })
+    used_bytes_with(bytes / WORD, |i| {
+        // SAFETY: each index is below `bytes / 8`, so the offset stays inside
+        // the caller's span.
+        let word = unsafe { p.add(i) };
+        // SAFETY: `word` lies in the caller's span, which is mapped, readable
+        // and aligned, and which no other CPU writes during the call.
+        unsafe { word.read() }
+    })
 }
 
 /// The handoff stack's base for an entry stack pointer: its top is `entry_sp`
@@ -225,10 +234,13 @@ fn idle_used_bytes(cpu: usize) -> u64
     let saved = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
     // SAFETY: ring 0; interrupt handlers are installed; preemption is disabled.
     unsafe { crate::arch::current::interrupts::enable() };
-    // SAFETY: an idle stack is the `bytes` bytes below its top, mapped through
-    // the direct map for the kernel's lifetime and 8-byte aligned.
-    let used = used_bytes_with(bytes / WORD, |i| unsafe {
-        crate::arch::current::cpu::load_word_racy(p.add(i))
+    let used = used_bytes_with(bytes / WORD, |i| {
+        // SAFETY: i < bytes / 8, so the offset stays inside the idle stack, the
+        // `bytes` bytes below its top.
+        let word = unsafe { p.add(i) };
+        // SAFETY: `word` lies in the idle stack, mapped through the direct map
+        // for the kernel's lifetime and 8-byte aligned.
+        unsafe { crate::arch::current::cpu::load_word_racy(word) }
     });
     // SAFETY: saved came from save_and_disable_interrupts above.
     unsafe { crate::arch::current::cpu::restore_interrupts(saved) };

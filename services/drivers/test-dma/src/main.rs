@@ -37,6 +37,7 @@
 //! is not delivered, since QEMU records no requester for the fault.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -345,6 +346,11 @@ impl Driver
         let raise_loop = std::thread::Builder::new().spawn(move || {
             while !loop_stop.load(Ordering::Acquire)
             {
+                #[expect(
+                    clippy::multiple_unsafe_ops_per_block,
+                    reason = "every write is to a register of the device's BAR 0, which `regs` \
+                              maps for the driver's life"
+                )]
                 // SAFETY: as in `Driver::write32`: `regs` maps BAR 0 for the
                 // driver's life, and both registers are 32-bit aligned in it.
                 unsafe {

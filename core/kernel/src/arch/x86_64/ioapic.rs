@@ -175,10 +175,11 @@ fn vector_row(cpu: usize) -> Option<&'static VectorRow>
     {
         return None;
     }
-    // SAFETY: the slab holds a zero-initialised VectorRow (all atomics, for which zero is
-    // a valid value, and zero is a free slot entry) for each boot CPU, and `cpu` is below
-    // their count; the slab is never freed.
-    Some(unsafe { &*base.add(cpu) })
+    // SAFETY: the slab holds a VectorRow for each boot CPU, and `cpu` is below their count.
+    let row = unsafe { base.add(cpu) };
+    // SAFETY: every row is zero-initialised (all atomics, for which zero is a valid value,
+    // and zero is a free slot entry); the slab is never freed.
+    Some(unsafe { &*row })
 }
 
 /// The device vector at `index` of a vector table.
@@ -431,13 +432,12 @@ fn gsi_limit_of(states: &[IoApicState], ceiling: u32) -> u32
 #[must_use]
 pub fn gsi_limit() -> u32
 {
-    // SAFETY: IOAPIC_COUNT and IOAPICS are written exactly once during init,
-    // before any reader; entries [0..count) are initialized.
+    // SAFETY: IOAPIC_COUNT is written exactly once during init, before any reader.
+    let count = unsafe { IOAPIC_COUNT };
+    // SAFETY: IOAPICS is written exactly once during init, before any reader;
+    // entries [0..count) are initialized.
     let states = unsafe {
-        core::slice::from_raw_parts(
-            core::ptr::addr_of!(IOAPICS).cast::<IoApicState>(),
-            IOAPIC_COUNT,
-        )
+        core::slice::from_raw_parts(core::ptr::addr_of!(IOAPICS).cast::<IoApicState>(), count)
     };
     gsi_limit_of(states, super::ROOT_IRQ_COUNT)
 }
@@ -459,8 +459,10 @@ fn lookup_ioapic_for_gsi(gsi: u32) -> Option<(u64, u32)>
     let base = core::ptr::addr_of!(IOAPICS).cast::<IoApicState>();
     for i in 0..count
     {
-        // SAFETY: i < count ≤ MAX_IOAPICS; entries [0..count) are initialized.
-        let s = unsafe { *base.add(i) };
+        // SAFETY: i < count ≤ MAX_IOAPICS.
+        let entry = unsafe { base.add(i) };
+        // SAFETY: entries [0..count) are initialized.
+        let s = unsafe { *entry };
         if let Some(pin) = gsi.checked_sub(s.gsi_base)
             && pin < s.pin_count
         {
@@ -489,6 +491,10 @@ const fn redirection_regs(pin: u32) -> (u32, u32)
 unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 {
     let base = super::paging::direct_map_base().wrapping_add(phys_base) as usize;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both accesses are to the IOREGSEL/IOWIN pair of the I/O APIC at `phys_base`"
+    )]
     // SAFETY: phys_base is a valid IOAPIC MMIO base mapped through the direct
     // map; IOREGSEL/IOWIN offsets are within IOAPIC register range; volatile
     // ensures proper ordering of register select and data writes.
@@ -505,6 +511,10 @@ unsafe fn ioapic_write(phys_base: u64, reg: u32, val: u32)
 unsafe fn ioapic_read(phys_base: u64, reg: u32) -> u32
 {
     let base = super::paging::direct_map_base().wrapping_add(phys_base) as usize;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both accesses are to the IOREGSEL/IOWIN pair of the I/O APIC at `phys_base`"
+    )]
     // SAFETY: see ioapic_write.
     unsafe {
         core::ptr::write_volatile(base.wrapping_add(IOREGSEL) as *mut u32, reg);
@@ -573,6 +583,9 @@ pub unsafe fn init()
             // entries to masked state; no concurrent access or IRQ delivery.
             unsafe {
                 ioapic_write(entry.phys_base, low_reg, REDIR_MASK);
+            }
+            // SAFETY: as for the low dword; the entry is masked now.
+            unsafe {
                 ioapic_write(entry.phys_base, high_reg, 0);
             }
         }
@@ -633,18 +646,25 @@ pub unsafe fn route(gsi: u32, vector: u8, destination: Destination, mode: u32)
     let (low, high) = redirection_entry(vector, mode, destination);
     let (low_reg, high_reg) = redirection_regs(pin);
 
+    // SAFETY: the flags go to the unlock_raw below.
+    let saved = unsafe { IOAPIC_LOCK.lock_raw() };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to pin `pin`'s redirection entry of the I/O APIC at `base`, \
+                  under the IOAPIC_LOCK held here"
+    )]
     // SAFETY: caller ensures init() has completed; entry remains masked
-    // until unmask(). IOAPIC_LOCK covers every select/window pair below.
+    // until unmask(). IOAPIC_LOCK, held, covers every select/window pair.
     unsafe {
-        let saved = IOAPIC_LOCK.lock_raw();
         if let Some(clear) = remote_irr_clear(ioapic_read(base, low_reg))
         {
             ioapic_write(base, low_reg, clear);
         }
         ioapic_write(base, low_reg, low);
         ioapic_write(base, high_reg, high);
-        IOAPIC_LOCK.unlock_raw(saved);
     }
+    // SAFETY: paired with the lock_raw above.
+    unsafe { IOAPIC_LOCK.unlock_raw(saved) };
 }
 
 /// Mask (suppress delivery of) the redirection entry for `gsi`.
@@ -660,14 +680,15 @@ pub unsafe fn mask(gsi: u32)
         return;
     };
     let (reg, _) = redirection_regs(pin);
-    // SAFETY: caller ensures init() has completed; setting the mask bit is
-    // architecture-defined. IOAPIC_LOCK covers the whole read-modify-write.
-    unsafe {
-        let saved = IOAPIC_LOCK.lock_raw();
-        let current = ioapic_read(base, reg);
-        ioapic_write(base, reg, current | REDIR_MASK);
-        IOAPIC_LOCK.unlock_raw(saved);
-    }
+    // SAFETY: the flags go to the unlock_raw below.
+    let saved = unsafe { IOAPIC_LOCK.lock_raw() };
+    // SAFETY: caller ensures init() has completed; IOAPIC_LOCK, held, covers
+    // the whole read-modify-write.
+    let current = unsafe { ioapic_read(base, reg) };
+    // SAFETY: as for the read; setting the mask bit is architecture-defined.
+    unsafe { ioapic_write(base, reg, current | REDIR_MASK) };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { IOAPIC_LOCK.unlock_raw(saved) };
 }
 
 /// Unmask (enable delivery of) the redirection entry for `gsi`.
@@ -683,15 +704,16 @@ pub unsafe fn unmask(gsi: u32)
         return;
     };
     let (reg, _) = redirection_regs(pin);
-    // SAFETY: caller ensures init() and route() have completed; clearing the
-    // mask bit enables IRQ delivery for a registered handler. IOAPIC_LOCK
-    // covers the whole read-modify-write.
-    unsafe {
-        let saved = IOAPIC_LOCK.lock_raw();
-        let current = ioapic_read(base, reg);
-        ioapic_write(base, reg, current & !REDIR_MASK);
-        IOAPIC_LOCK.unlock_raw(saved);
-    }
+    // SAFETY: the flags go to the unlock_raw below.
+    let saved = unsafe { IOAPIC_LOCK.lock_raw() };
+    // SAFETY: caller ensures init() and route() have completed; IOAPIC_LOCK,
+    // held, covers the whole read-modify-write.
+    let current = unsafe { ioapic_read(base, reg) };
+    // SAFETY: as for the read; clearing the mask bit enables IRQ delivery for a
+    // registered handler.
+    unsafe { ioapic_write(base, reg, current & !REDIR_MASK) };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { IOAPIC_LOCK.unlock_raw(saved) };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -696,7 +696,7 @@ impl PageCursor
                 unsafe { write_u64_at(memory.base, node_next_word(prev_off), after_next) };
                 self.prev_pages = total;
             }
-            _ =>
+            PagePrev::InCap(_) | PagePrev::Head =>
             {
                 let total = pages.saturating_add(after_pages);
                 // SAFETY: caller contract: offset is ours and page-aligned.

@@ -37,6 +37,7 @@
 //! fatal bootstrap failures `thread_exit` silently.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 mod arch;
 
@@ -146,51 +147,61 @@ fn handle_request(
         let byte_len = usize::try_from((msg.label >> 16) & 0xFFFF).unwrap_or(0);
         for &b in msg.data_bytes().iter().take(byte_len)
         {
-            // SAFETY: writer.base is a valid MMIO mapping for the
-            // framebuffer's geometry; the FramebufferWriter advances
-            // its own cursor within its declared geometry.
-            unsafe {
-                match b
+            // Each unsafe call below draws through `writer`, whose base is the
+            // framebuffer mapping `main` made for the framebuffer's geometry
+            // and never unmaps; the FramebufferWriter advances its own cursor
+            // within that geometry.
+            match b
+            {
+                // `\n` and `\r` short-circuit the decoder, but drop
+                // any in-flight UTF-8 sequence first — a half-
+                // assembled lead byte stranded by a newline would
+                // otherwise eat the next codepoint.
+                b'\n' =>
                 {
-                    // `\n` and `\r` short-circuit the decoder, but drop
-                    // any in-flight UTF-8 sequence first — a half-
-                    // assembled lead byte stranded by a newline would
-                    // otherwise eat the next codepoint.
-                    b'\n' =>
+                    decoder.reset();
+                    // SAFETY: the writer's framebuffer mapping stays valid and
+                    // writable (above).
+                    unsafe { writer.newline() };
+                }
+                b'\r' =>
+                {
+                    decoder.reset();
+                    writer.carriage_return();
+                }
+                // Backspace moves the cursor back one column; the terminal
+                // pairs it with an overwriting space for a destructive erase.
+                b'\x08' =>
+                {
+                    decoder.reset();
+                    writer.backspace();
+                }
+                _ =>
+                {
+                    let mut outcome = decoder.push(b);
+                    if outcome == DecodeOutcome::Truncated
                     {
-                        decoder.reset();
-                        writer.newline();
+                        // SAFETY: the writer's framebuffer mapping stays valid
+                        // and writable (above).
+                        unsafe { render_at(writer, REPLACEMENT_CODEPOINT) };
+                        outcome = decoder.push(b);
                     }
-                    b'\r' =>
+                    match outcome
                     {
-                        decoder.reset();
-                        writer.carriage_return();
-                    }
-                    // Backspace moves the cursor back one column; the terminal
-                    // pairs it with an overwriting space for a destructive erase.
-                    b'\x08' =>
-                    {
-                        decoder.reset();
-                        writer.backspace();
-                    }
-                    _ =>
-                    {
-                        let mut outcome = decoder.push(b);
-                        if outcome == DecodeOutcome::Truncated
+                        DecodeOutcome::Codepoint(cp) =>
                         {
-                            render_at(writer, REPLACEMENT_CODEPOINT);
-                            outcome = decoder.push(b);
+                            // SAFETY: the writer's framebuffer mapping stays
+                            // valid and writable (above).
+                            unsafe { render_at(writer, cp) };
                         }
-                        match outcome
+                        DecodeOutcome::Invalid | DecodeOutcome::Truncated =>
                         {
-                            DecodeOutcome::Codepoint(cp) => render_at(writer, cp),
-                            DecodeOutcome::Invalid | DecodeOutcome::Truncated =>
-                            {
-                                render_at(writer, REPLACEMENT_CODEPOINT);
-                            }
-                            DecodeOutcome::NeedMore =>
-                            {}
+                            // SAFETY: the writer's framebuffer mapping stays
+                            // valid and writable (above).
+                            unsafe { render_at(writer, REPLACEMENT_CODEPOINT) };
                         }
+                        DecodeOutcome::NeedMore =>
+                        {}
                     }
                 }
             }

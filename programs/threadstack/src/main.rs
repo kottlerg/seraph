@@ -46,6 +46,7 @@
 //! stack machinery lives entirely in `std::sys::thread` / `std::os::seraph`.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::io::Write;
 use std::process::ExitCode;
@@ -228,11 +229,11 @@ fn big_frame() -> u8
     let mut buf = std::mem::MaybeUninit::<[u8; BIG_FRAME_BYTES]>::uninit();
     let low = std::hint::black_box(buf.as_mut_ptr()).cast::<u8>();
     // SAFETY: `low` points to the first byte of this frame's own buffer, valid
-    // for writes and, once written, for reads.
-    unsafe {
-        low.write_volatile(0x5A);
-        low.read_volatile()
-    }
+    // for writes.
+    unsafe { low.write_volatile(0x5A) };
+    // SAFETY: `low` points to the first byte of this frame's own buffer, which
+    // the write above initialised, so it is valid for reads.
+    unsafe { low.read_volatile() }
 }
 
 fn bigframe() -> ExitCode

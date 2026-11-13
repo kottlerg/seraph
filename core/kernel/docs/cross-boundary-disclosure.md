@@ -352,7 +352,14 @@ value printed via `kprintln!` becomes userspace-recoverable. These values must b
 via the serial-only sinks (`kprintln_serial!` / `console::serial_write_fmt`; on the panic and NMI
 paths the lock-bypassing `console::panic_write_fmt` and `kprintln_nmi!` / `console::nmi_write_fmt`),
 never `kprintln!`, and never through any IPC or log channel. The panic handler's backtrace and the
-x86-64 NMI backtrace print their kernel addresses through those two sinks. The Phase-1 KASLR report
+x86-64 NMI backtrace print their kernel addresses through those two sinks, and so does the panic
+handler's message line: a panic or assertion message that formats a kernel pointer (the run-queue
+link and use-after-free checks print a TCB address, the sleep list's binding check a source
+address, and the reference-count checks an object address) reaches only `console::panic_write_fmt`,
+and each such format carries the `clippy::pointer_format` expectation that
+[docs/coding-standards.md](../../../docs/coding-standards.md) § Cross-Boundary Data Hygiene
+requires.
+The Phase-1 KASLR report
 prints address-free status lines (one for the image, one for the direct map) via `kprintln!` and the
 slide/bases only via `kprintln_serial!`; the Phase-9 init-thread report prints the thread id and
 priority on one `kprintln!` line and init's kernel stack top (a direct-map VA) on a separate

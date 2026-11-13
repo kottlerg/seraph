@@ -349,11 +349,18 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
         let area = unsafe { (*tcb).extended.area };
         if !area.is_null()
         {
-            // SAFETY: ring 0; area satisfies XSAVE alignment and size;
-            // we observed ownership, so the live regs belong to this TCB.
+            // SAFETY: ring 0; the live regs belong to this TCB (ownership
+            // observed), and TS is set again after the save below.
             unsafe {
                 cr0_clear_ts();
+            }
+            // SAFETY: area satisfies XSAVE alignment and size; we observed
+            // ownership, so the live regs belong to this TCB.
+            unsafe {
                 save_to(area);
+            }
+            // SAFETY: ring 0; CR0.TS=1 re-arms the lazy trap.
+            unsafe {
                 cr0_set_ts();
             }
             owner_slot.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Release);

@@ -22,6 +22,7 @@
 
 #![cfg_attr(not(test), no_std)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use ipc::bootstrap::{PackedSlots, SlotAccumulator, slot_round_count, slot_rounds};
 use syscall_abi::MSG_CAP_SLOTS_MAX;

@@ -33,6 +33,7 @@
               log; `expect` is its intended idiom"
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};

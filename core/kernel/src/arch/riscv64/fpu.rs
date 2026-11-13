@@ -283,21 +283,22 @@ pub unsafe fn switch_out_save(tcb: *mut crate::sched::thread::ThreadControlBlock
     // Also clear FS/VS in the trap frame so the next sret for this thread
     // resumes U-mode with FS = VS = Off — without this, trap_entry would
     // restore sstatus from the frame and undo the lazy-trap re-arm.
-    // SAFETY: trap_frame points at the TCB's on-kernel-stack trap frame
-    // and is non-null whenever extended.area is non-null (user threads). A
-    // switch-out from a U-mode trap (syscall, preemption, or fault block)
-    // leaves no live reference to this frame: trap_dispatch,
-    // redirect_user_fault, and the syscall dispatcher's `UserFrame` hold it as
-    // a raw pointer and derive a reference only for an access that cannot
-    // block (core/kernel/docs/arch-interface.md § `trap_frame`).
-    unsafe {
-        let tf = (*tcb)
+    // SAFETY: tcb validated by caller; trap_frame is an atomic field of it.
+    let tf = unsafe {
+        (*tcb)
             .trap_frame
-            .load(core::sync::atomic::Ordering::Relaxed);
-        if !tf.is_null()
-        {
-            (*tf).sstatus &= !(SSTATUS_FS_MASK | SSTATUS_VS_MASK);
-        }
+            .load(core::sync::atomic::Ordering::Relaxed)
+    };
+    if !tf.is_null()
+    {
+        // SAFETY: trap_frame points at the TCB's on-kernel-stack trap frame
+        // and is non-null whenever extended.area is non-null (user threads). A
+        // switch-out from a U-mode trap (syscall, preemption, or fault block)
+        // leaves no live reference to this frame: trap_dispatch,
+        // redirect_user_fault, and the syscall dispatcher's `UserFrame` hold it
+        // as a raw pointer and derive a reference only for an access that
+        // cannot block (core/kernel/docs/arch-interface.md § `trap_frame`).
+        unsafe { (*tf).sstatus &= !(SSTATUS_FS_MASK | SSTATUS_VS_MASK) };
     }
 }
 
@@ -350,12 +351,12 @@ pub unsafe fn lazy_restore_fp_v(area: *const u8, frame: &mut super::trap_frame::
     {
         // SAFETY: area is a valid save area pointer or zero-initialised
         // (slot-resident allocation zeroes the page).
-        unsafe {
-            restore_fp_from(area);
-            if vlenb() != 0
-            {
-                restore_v_from(area);
-            }
+        unsafe { restore_fp_from(area) };
+        if vlenb() != 0
+        {
+            // SAFETY: as for the F/D restore: the save area is valid or
+            // zero-initialised; `lazy_enable_fp_v_initial` set VS non-Off.
+            unsafe { restore_v_from(area) };
         }
     }
     // Mirror live FS/VS into the trap frame: restore_fp_from / restore_v_from

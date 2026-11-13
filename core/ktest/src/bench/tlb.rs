@@ -103,8 +103,10 @@ extern "C" fn shootdown_spinner_entry(arg: u64) -> !
     thread_exit()
 }
 
-// too_many_lines: setup + measure loop + cooperative teardown form one sequence.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "setup + measure loop + cooperative teardown form one sequence"
+)]
 pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 {
     const BENCH_VA: u64 = 0x1_6200_0000;
@@ -117,8 +119,11 @@ pub(super) fn bench_tlb_shootdown(ctx: &crate::TestContext, iters: u32)
 
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
     crate::log_u64("ktest: bench  cpus=", cpus);
-    // cast_possible_truncation: cpus is < 256 on every supported platform.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 CPU count \
+                  converts losslessly; the result is then capped at MAX_PINNED"
+    )]
     let pin_count = (cpus.saturating_sub(1) as usize).min(MAX_PINNED);
 
     // Reset the cross-bench flag so a re-run sees the worker shutdown
@@ -517,16 +522,21 @@ extern "C" fn conc_worker_entry(arg: u64) -> !
 }
 
 /// Concurrent-initiator TLB-shootdown latency bench (see module note above).
-// too_many_lines: setup + ready/go barrier + cooperative teardown form one sequence.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "setup + ready/go barrier + cooperative teardown form one sequence"
+)]
 pub(super) fn bench_tlb_shootdown_concurrent(ctx: &crate::TestContext, iters: u32)
 {
     log_bench_header("tlb_shootdown_concurrent", iters);
 
     let cpus = system_info(SystemInfoType::CpuCount as u64).unwrap_or(1);
     crate::log_u64("ktest: bench  cpus=", cpus);
-    // cast_possible_truncation: cpus < 256 on every supported platform.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "usize is 64 bits on every ktest target (x86_64, riscv64), so the u64 CPU count \
+                  converts losslessly; the result is then capped at MAX_PINNED"
+    )]
     let want = (cpus.saturating_sub(1) as usize).min(MAX_PINNED);
     if want == 0
     {

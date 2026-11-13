@@ -11,10 +11,14 @@
 //! program's real I/O surface; see [docs/testing.md](../../../docs/testing.md)
 //! for the protocol.
 
-// usertest is an integration test harness: panics on protocol violation
-// so faults surface in the log. `expect`/`unwrap` are the intended idiom
-// here (coding-standards §D permits them in test code).
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![expect(
+    clippy::expect_used,
+    reason = "usertest is a test harness: a broken invariant panics, and the run ends without its \
+              pass marker, which fails it as a failed host test does; the build lints the harness \
+              without the test configuration's relaxation of this lint, and the rule holds for \
+              the whole harness, so the suppression is crate-wide"
+)]
 
 use std::os::seraph::startup_info;
 use std::path::{Path, PathBuf};
@@ -193,8 +197,10 @@ fn bootstrap_pwrmgr_auth() -> u64
     {
         return 0;
     }
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by the
     // boot protocol.
@@ -216,8 +222,10 @@ fn shutdown(pwrmgr_auth: u64)
         return;
     }
     let info = startup_info();
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::SHUTDOWN);
     // SAFETY: ipc_buf is the registered IPC buffer.

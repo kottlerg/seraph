@@ -590,8 +590,10 @@ fn group(handle: u64, regs: &mut [u8; REGS_BUF]) -> bool
         };
         if let Some(len) = read
         {
-            // cast_possible_truncation: the read returned at most REGS_BUF.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "the read returned at most REGS_BUF"
+            )]
             let len = len as usize;
             if call(WRITE_REGS, Some(refused), || {
                 // A read longer than the buffer is no accepted result: it is

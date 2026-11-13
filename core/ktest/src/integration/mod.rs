@@ -72,8 +72,10 @@ use crate::run_integration_test;
 ///
 /// To add a new scenario: implement it in a new file in this directory, declare
 /// it with `pub mod` above, then add a `run_integration_test!` call here.
-// too_many_lines: run_all is a flat dispatch table; splitting it adds no clarity.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "run_all is a flat dispatch table; splitting it adds no clarity"
+)]
 pub fn run_all(ctx: &TestContext)
 {
     run_integration_test!("integration::thread_lifecycle", thread_lifecycle::run(ctx));

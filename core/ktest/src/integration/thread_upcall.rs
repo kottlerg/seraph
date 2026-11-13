@@ -684,8 +684,10 @@ extern "C" fn yield_entry(_arg: u64) -> !
 /// child `8 + k`, recording the result.
 extern "C" fn call_entry(k: u64) -> !
 {
-    // cast_possible_truncation: k is 0 or 1, the index start_child passed.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "k is 0 or 1, the index start_child passed"
+    )]
     let k = k as usize;
     let (Some(page), Some(stage), Some(result), Some(call_ep)) = (
         crate::elem_ptr_mut(core::ptr::addr_of_mut!(CALL_PAGES), k),

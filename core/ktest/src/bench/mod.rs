@@ -42,8 +42,10 @@ mod wait_set;
 /// Read the hardware cycle counter (`crate::arch::cycles_now`).
 ///
 /// Returns raw cycle counts. Units differ by architecture; use deltas only.
-// inline_always: the counter read must be inlined to avoid call overhead in cycle benchmarks.
-#[allow(clippy::inline_always)]
+#[expect(
+    clippy::inline_always,
+    reason = "the counter read must be inlined to avoid call overhead in cycle benchmarks"
+)]
 #[inline(always)]
 pub(super) fn cycles_now() -> u64
 {

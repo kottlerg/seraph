@@ -64,9 +64,10 @@ const _: () = assert!(INDIRECT_SLOT_INDEX >> 32 == 0);
 /// A slot past the direct region's `DIRECT_LEAVES` × `CSPACE_SLOTS_PER_PAGE`
 /// slots, under the first directory page: 20 slots into the third leaf past
 /// the direct region.
-// cast_possible_truncation: the assert above keeps INDIRECT_SLOT_INDEX
-// within u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the assert above keeps INDIRECT_SLOT_INDEX within u32"
+)]
 const INDIRECT_SLOT: u32 = INDIRECT_SLOT_INDEX as u32;
 
 /// Pool pages a `CSpace` with no grown leaf spends to cover slot `index`

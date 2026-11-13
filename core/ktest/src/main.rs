@@ -48,6 +48,7 @@
 
 #![no_std]
 #![no_main]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -255,8 +256,11 @@ pub struct TestContext
 /// or, for a thread it creates directly, by its own cleanup on every path. So
 /// the rule holds across test boundaries whether the earlier test passed or
 /// failed.
-// Field is CPU stack memory; only the hardware stack pointer accesses it, not Rust code.
-#[allow(dead_code)]
+#[expect(
+    dead_code,
+    reason = "the field is CPU stack memory; only the hardware stack pointer accesses it, not Rust \
+              code"
+)]
 #[repr(align(16))]
 pub struct ChildStack([u8; ChildStack::BYTES]);
 

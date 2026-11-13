@@ -339,9 +339,11 @@ mod entry
 use entry::trap_entry;
 
 /// Bytes of [`OVERFLOW_STACK`]: room for `kernel_stack_overflow`'s report and
-/// `fatal`.
+/// `fatal`. One kernel stack, [`crate::sched::KERNEL_STACK_PAGES`] pages, so no
+/// stack the kernel's code runs on is smaller than a thread's, the size the
+/// `large_stack_frames` threshold of `core/kernel/clippy.toml` derives from.
 #[cfg(not(test))]
-const OVERFLOW_STACK_BYTES: usize = 16 * 1024;
+const OVERFLOW_STACK_BYTES: usize = crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE;
 
 /// The stack a hart switches to when its S-mode trap entry finds a kernel
 /// stack overflow (`trap_entry` § Kernel stack overflow). One for all harts:
@@ -453,8 +455,9 @@ unsafe fn clear_sip_ssip()
 #[cfg(not(test))]
 #[expect(
     clippy::too_many_lines,
-    reason = "the single scause dispatch (interrupt, syscall, user fault, kernel fault) stays one \
-              function so the trap-frame ownership and SIE discipline read in one place"
+    reason = "the single scause dispatch (interrupt, syscall, and the hand-off of a user or \
+              kernel exception to `user_exception` or `kernel_exception`) stays one function so \
+              the trap-frame ownership and SIE discipline read in one place"
 )]
 extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 {
@@ -575,7 +578,6 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
     }
     else
     {
-        let cpu = super::cpu::current_cpu();
         let satp_val: u64;
         let sstatus_val: u64;
         // SAFETY: reading CSRs is safe in S-mode.
@@ -612,203 +614,15 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
 
         if is_userspace
         {
-            // SAFETY: current_tcb() returns this CPU's running thread; valid
-            // in exception context because we entered from a running user thread.
-            let tcb = unsafe { crate::syscall::current_tcb() };
-
-            // Redirect a kernel-unresolvable U-mode exception to the thread's
-            // bound fault handler, if any. Page faults (cause 12/13/15) carry
-            // `FAULT_KIND_VM`; every other U-mode exception carries
-            // `FAULT_KIND_EXCEPTION` (see `fault_info_for`). On a resume reply the
-            // trap returns and `sret` re-executes the faulting instruction (sepc
-            // is not advanced for faults) or continues from a handler-modified
-            // sepc.
-            // SAFETY: the shared reference lives only for the call, which reads
-            // the frame and cannot block.
-            let info = fault_info_for(cause_code, unsafe { &*frame });
-            // SAFETY: tcb is the running user thread; has_handler only reads the
-            // atomic binding of the fault's class.
-            let handler_bound =
-                !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb, info.kind) };
-            if handler_bound
-            {
-                // SAFETY: frame is the live trap frame on this kernel stack; the
-                // redirect points trap_frame at it for the handler's reg access
-                // and returns whether to resume.
-                if unsafe { redirect_user_fault(tcb, frame, &info) }
-                {
-                    return;
-                }
-                // Handler declined (Kill) — fall through to terminate the thread.
-            }
-            else
-            {
-                // SAFETY: tcb is the running user thread or null.
-                unsafe { crate::ipc::fault::report_unbound_kill(tcb) };
-            }
-
-            let tid = if tcb.is_null()
-            {
-                0u32
-            }
-            else
-            {
-                // SAFETY: tcb validated non-null.
-                unsafe { (*tcb).thread_id }
-            };
-
-            // The hart printing, re-read: a declined delivery blocked above and
-            // may have resumed this thread on another hart than the trap's.
-            crate::kprintln_serial!(
-                "USERSPACE FAULT: tid={} cpu={} cause={} (scause={:#x})",
-                tid,
-                super::cpu::current_cpu(),
-                riscv_exception_name(cause_code),
-                scause
-            );
-            // SAFETY: the shared reference lives only for these reads and the
-            // dump, none of which can block; a declined fault delivery that
-            // blocked has already returned.
-            let live = unsafe { &*frame };
-            crate::kprintln_serial!("  sepc={:#018x}  stval={:#018x}", live.sepc, live.stval);
-            dump_riscv_regs(live);
-
-            if !tcb.is_null()
-            {
-                // Commit Exited under all-CPU scheduler.locks. See
-                // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
-                // The reason (`EXIT_FAULT_BASE + cause_code`) is written in the
-                // same hold. A refusal means the thread is already `Exited` (an
-                // object-teardown stop recorded `EXIT_KILLED`, or a
-                // `dealloc_object(Thread)` committed `Exited`); the posts below
-                // still carry the fault class (no death walk posts `EXIT_KILLED`).
-                // An exception code is below 64, so the reason stays in the fault range.
-                let reason = syscall::EXIT_FAULT_BASE.saturating_add(cause_code);
-
-                // Terminal fault (no handler bound, or a Kill outcome: the handler
-                // replied KILL or the episode was cancelled; see docs/fault-handling.md
-                // § Delivery, Resume, and Kill): record it on the faulting thread's
-                // address space before the `Exited` commit, so a holder that reads
-                // the thread `Exited` also reads the space's terminal fault
-                // (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`); its observers
-                // are posted below. Reached only on the terminal path; normal
-                // thread_exit never lands here.
-                // SAFETY: tcb validated non-null.
-                let aspace = unsafe { (*tcb).address_space };
-                // SAFETY: address_space may be null for kernel threads, which
-                // record_aspace_terminal_fault handles; no death_lock is held.
-                let aspace_post =
-                    unsafe { crate::sched::record_aspace_terminal_fault(aspace, reason) };
-
-                // SAFETY: tcb validated non-null.
-                let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
-
-                // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
-                // SAFETY: tcb validated non-null; exit_under_all_locks has marked it Exited and no
-                // sched_lock is held.
-                unsafe {
-                    crate::sched::post_death_notification(tcb, reason);
-                }
-
-                // Notify the address-space observers recorded above with the
-                // fault class so procmgr can tear the whole process down.
-                // SAFETY: aspace_post comes from this path's record, and the
-                // thread has stayed on this hart since; it is now Exited and
-                // no lock is held.
-                unsafe {
-                    crate::sched::post_aspace_death_notification(&aspace_post);
-                }
-            }
-
-            // SAFETY: schedule(Requeue::IfRunnable) context-switches away; the exited thread
-            // is never re-enqueued.
-            unsafe {
-                crate::sched::schedule(crate::sched::Requeue::IfRunnable);
-            }
-            // Unreachable for an exited thread, but guard against schedule returning.
-            #[expect(
-                clippy::infinite_loop,
-                reason = "the other paths of `trap_dispatch` return to the trap stub, so the \
-                          function cannot be `-> !`; this branch never does"
-            )]
-            loop
-            {
-                // SAFETY: wfi is a RISC-V instruction; waits for interrupt.
-                unsafe {
-                    core::arch::asm!("wfi", options(nomem, nostack));
-                }
-            }
-        }
-        // An S-mode trap is taken by the kernel thread itself, so no other
-        // path reaches this frame; the reference lives for the trap's
-        // remaining, non-blocking work.
-        // SAFETY: frame is the live frame (see the top); nothing below
-        // blocks before `fatal` or the return.
-        let live = unsafe { &mut *frame };
-        // Spurious stale-TLB retry for the kernel: a load or store fault
-        // the kernel's tables already satisfy is an invalid entry this hart
-        // cached before a closed direct-map hole (`mm::stack_guard`).
-        // Flush it locally and re-execute. It runs before the user-copy
-        // fixup, so a stale entry for a copy's kernel-side buffer retries
-        // too; a user-half `stval` is never a kernel spurious fault.
-        let access = match cause_code
-        {
-            13 => Some(super::paging::KernelAccess::Load),
-            15 => Some(super::paging::KernelAccess::Store),
-            _ => None,
-        };
-        if let Some(access) = access
-        {
-            // SAFETY: S-mode.
-            if unsafe { super::paging::kernel_fault_is_spurious(live.stval, access) }
-            {
-                // SAFETY: S-mode; drops the stale entry for the retry.
-                unsafe { super::paging::flush_page(live.stval) };
-                return;
-            }
-        }
-
-        // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
-        // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
-        // region is an unmapped or read-only user buffer. Redirect to the fixup
-        // — which clears SUM and returns the bytes not copied — instead of
-        // panicking.
-        if let Some(access) = page_fault_access(cause_code)
-            && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
-        {
-            // A load or store fault the live tables already satisfy is a
-            // stale entry (a hart may cache an invalid one), as for a
-            // U-mode fault: flush it and retry the copy, so a page a fault
-            // handler has just mapped is not failed or delivered again
-            // (docs/fault-handling.md § Kernel Copies). A fetch fault at a
-            // copy's sepc names a kernel VA, which is never spurious.
-            // SAFETY: S-mode in the copying thread's context; its satp is
-            // still active (SIE is clear).
-            if unsafe { super::paging::user_fault_is_spurious(live.stval, access) }
-            {
-                // SAFETY: S-mode; drops the stale entry for the retry.
-                unsafe { super::paging::flush_page(live.stval) };
-                return;
-            }
-            live.sepc = fixup;
+            // SAFETY: U-mode origin: frame is the faulting thread's live frame on
+            // its kernel stack, SIE is clear, and no lock is held.
+            unsafe { user_exception(frame, cause_code, scause) };
             return;
         }
-
-        crate::kprintln!(
-            "KERNEL EXCEPTION: cpu={} cause={} (scause={:#x})",
-            cpu,
-            riscv_exception_name(cause_code),
-            scause
-        );
-        // `sepc`, `stval`, `satp` and the register file can hold kernel VAs
-        // or the kernel root's address, and `fatal` halts only this hart:
-        // serial only (core/kernel/docs/cross-boundary-disclosure.md
-        // § Kernel console diagnostics).
-        crate::kprintln_serial!("  sepc={:#x}  stval={:#x}", live.sepc, live.stval);
-        crate::kprintln!("  sstatus={:#x}", sstatus_val);
-        crate::kprintln_serial!("  satp={:#x}", satp_val);
-        dump_riscv_regs(live);
-        crate::fatal("unhandled kernel exception");
+        // SAFETY: S-mode origin: frame is the live frame of the kernel thread
+        // that trapped, which no other path reaches.
+        unsafe { kernel_exception(frame, cause_code, scause, sstatus_val, satp_val) };
+        return;
     }
 
     // Sanity check: if the trap was a U-mode ecall (scause == 8), the
@@ -840,6 +654,246 @@ extern "C" fn trap_dispatch(frame: *mut TrapFrame)
         );
         crate::fatal("TrapFrame sepc corruption");
     }
+}
+
+/// A U-mode exception the kernel cannot resolve: redirect it to the thread's
+/// bound fault handler, and return when the handler resumes the thread; else
+/// terminate the thread.
+///
+/// # Safety
+/// `frame` is the live trap frame of the running user thread on its kernel
+/// stack, SIE is clear, and no lock is held.
+#[cfg(not(test))]
+unsafe fn user_exception(frame: *mut TrapFrame, cause_code: u64, scause: u64)
+{
+    // SAFETY: current_tcb() returns this CPU's running thread; valid
+    // in exception context because we entered from a running user thread.
+    let tcb = unsafe { crate::syscall::current_tcb() };
+
+    // Redirect a kernel-unresolvable U-mode exception to the thread's
+    // bound fault handler, if any. Page faults (cause 12/13/15) carry
+    // `FAULT_KIND_VM`; every other U-mode exception carries
+    // `FAULT_KIND_EXCEPTION` (see `fault_info_for`). On a resume reply the
+    // trap returns and `sret` re-executes the faulting instruction (sepc
+    // is not advanced for faults) or continues from a handler-modified
+    // sepc.
+    // SAFETY: the shared reference lives only for the call, which reads
+    // the frame and cannot block.
+    let info = fault_info_for(cause_code, unsafe { &*frame });
+    // SAFETY: tcb is the running user thread; has_handler only reads the
+    // atomic binding of the fault's class.
+    let handler_bound = !tcb.is_null() && unsafe { crate::ipc::fault::has_handler(tcb, info.kind) };
+    if handler_bound
+    {
+        // SAFETY: frame is the live trap frame on this kernel stack; the
+        // redirect points trap_frame at it for the handler's reg access
+        // and returns whether to resume.
+        if unsafe { redirect_user_fault(tcb, frame, &info) }
+        {
+            return;
+        }
+        // Handler declined (Kill) — fall through to terminate the thread.
+    }
+    else
+    {
+        // SAFETY: tcb is the running user thread or null.
+        unsafe { crate::ipc::fault::report_unbound_kill(tcb) };
+    }
+
+    // SAFETY: tcb is the running user thread or null, frame its live trap
+    // frame (contract); no lock is held.
+    unsafe { terminate_faulted_thread(tcb, frame, cause_code, scause) }
+}
+
+/// Report the terminal U-mode exception `cause_code` of `tcb`, commit its
+/// exit with the fault's reason, post its death notifications, and switch
+/// away for good.
+///
+/// # Safety
+/// `tcb` is the running user thread or null, `frame` its live trap frame on
+/// its kernel stack; no lock is held.
+#[cfg(not(test))]
+unsafe fn terminate_faulted_thread(
+    tcb: *mut crate::sched::thread::ThreadControlBlock,
+    frame: *mut TrapFrame,
+    cause_code: u64,
+    scause: u64,
+) -> !
+{
+    let tid = if tcb.is_null()
+    {
+        0u32
+    }
+    else
+    {
+        // SAFETY: tcb validated non-null.
+        unsafe { (*tcb).thread_id }
+    };
+
+    // The hart printing, re-read: a declined delivery blocked above and
+    // may have resumed this thread on another hart than the trap's.
+    crate::kprintln_serial!(
+        "USERSPACE FAULT: tid={} cpu={} cause={} (scause={:#x})",
+        tid,
+        super::cpu::current_cpu(),
+        riscv_exception_name(cause_code),
+        scause
+    );
+    // SAFETY: the shared reference lives only for these reads and the
+    // dump, none of which can block; a declined fault delivery that
+    // blocked has already returned.
+    let live = unsafe { &*frame };
+    crate::kprintln_serial!("  sepc={:#018x}  stval={:#018x}", live.sepc, live.stval);
+    dump_riscv_regs(live);
+
+    if !tcb.is_null()
+    {
+        // Commit Exited under all-CPU scheduler.locks. See
+        // core/kernel/docs/thread-lifecycle-and-sleep.md § Lifecycle State Machine.
+        // The reason (`EXIT_FAULT_BASE + cause_code`) is written in the
+        // same hold. A refusal means the thread is already `Exited` (an
+        // object-teardown stop recorded `EXIT_KILLED`, or a
+        // `dealloc_object(Thread)` committed `Exited`); the posts below
+        // still carry the fault class (no death walk posts `EXIT_KILLED`).
+        // An exception code is below 64, so the reason stays in the fault range.
+        let reason = syscall::EXIT_FAULT_BASE.saturating_add(cause_code);
+
+        // Terminal fault (no handler bound, or a Kill outcome: the handler
+        // replied KILL or the episode was cancelled; see docs/fault-handling.md
+        // § Delivery, Resume, and Kill): record it on the faulting thread's
+        // address space before the `Exited` commit, so a holder that reads
+        // the thread `Exited` also reads the space's terminal fault
+        // (core/kernel/docs/syscalls.md § `SYS_CAP_INFO`); its observers
+        // are posted below. Reached only on the terminal path; normal
+        // thread_exit never lands here.
+        // SAFETY: tcb validated non-null.
+        let aspace = unsafe { (*tcb).address_space };
+        // SAFETY: address_space may be null for kernel threads, which
+        // record_aspace_terminal_fault handles; no death_lock is held.
+        let aspace_post = unsafe { crate::sched::record_aspace_terminal_fault(aspace, reason) };
+
+        // SAFETY: tcb validated non-null.
+        let _ = unsafe { crate::sched::exit_under_all_locks(tcb, reason) };
+
+        // Post death notification if bound (exit_reason = EXIT_FAULT_BASE + cause_code).
+        // SAFETY: tcb validated non-null; exit_under_all_locks has marked it Exited and no
+        // sched_lock is held.
+        unsafe {
+            crate::sched::post_death_notification(tcb, reason);
+        }
+
+        // Notify the address-space observers recorded above with the
+        // fault class so procmgr can tear the whole process down.
+        // SAFETY: aspace_post comes from this path's record, and the
+        // thread has stayed on this hart since; it is now Exited and
+        // no lock is held.
+        unsafe {
+            crate::sched::post_aspace_death_notification(&aspace_post);
+        }
+    }
+
+    // SAFETY: schedule(Requeue::IfRunnable) context-switches away; the exited thread
+    // is never re-enqueued.
+    unsafe {
+        crate::sched::schedule(crate::sched::Requeue::IfRunnable);
+    }
+    // Unreachable for an exited thread, but guard against schedule returning.
+    loop
+    {
+        // SAFETY: wfi is a RISC-V instruction; waits for interrupt.
+        unsafe {
+            core::arch::asm!("wfi", options(nomem, nostack));
+        }
+    }
+}
+
+/// An S-mode exception: retry a stale TLB entry, redirect a faulting user
+/// copy to its fixup, and otherwise report the exception and halt the hart.
+/// `sstatus_val` and `satp_val` are the CSRs read at the trap.
+///
+/// # Safety
+/// `frame` is the live trap frame of the kernel thread that trapped, which no
+/// other path reaches, and SIE is clear.
+#[cfg(not(test))]
+unsafe fn kernel_exception(
+    frame: *mut TrapFrame,
+    cause_code: u64,
+    scause: u64,
+    sstatus_val: u64,
+    satp_val: u64,
+)
+{
+    let cpu = super::cpu::current_cpu();
+    // An S-mode trap is taken by the kernel thread itself, so no other
+    // path reaches this frame; the reference lives for the trap's
+    // remaining, non-blocking work.
+    // SAFETY: frame is the live frame (contract); nothing below blocks
+    // before `fatal` or the return.
+    let live = unsafe { &mut *frame };
+    // Spurious stale-TLB retry for the kernel: a load or store fault
+    // the kernel's tables already satisfy is an invalid entry this hart
+    // cached before a closed direct-map hole (`mm::stack_guard`).
+    // Flush it locally and re-execute. It runs before the user-copy
+    // fixup, so a stale entry for a copy's kernel-side buffer retries
+    // too; a user-half `stval` is never a kernel spurious fault.
+    let access = match cause_code
+    {
+        13 => Some(super::paging::KernelAccess::Load),
+        15 => Some(super::paging::KernelAccess::Store),
+        _ => None,
+    };
+    if let Some(access) = access
+    {
+        // SAFETY: S-mode.
+        if unsafe { super::paging::kernel_fault_is_spurious(live.stval, access) }
+        {
+            // SAFETY: S-mode; drops the stale entry for the retry.
+            unsafe { super::paging::flush_page(live.stval) };
+            return;
+        }
+    }
+
+    // In-kernel user-copy fault recovery: an S-mode page fault (load=13,
+    // store=15, instruction=12) whose sepc lies in the `copy_user` faultable
+    // region is an unmapped or read-only user buffer. Redirect to the fixup
+    // — which clears SUM and returns the bytes not copied — instead of
+    // panicking.
+    if let Some(access) = page_fault_access(cause_code)
+        && let Some(fixup) = super::cpu::user_copy_fixup(live.sepc)
+    {
+        // A load or store fault the live tables already satisfy is a
+        // stale entry (a hart may cache an invalid one), as for a
+        // U-mode fault: flush it and retry the copy, so a page a fault
+        // handler has just mapped is not failed or delivered again
+        // (docs/fault-handling.md § Kernel Copies). A fetch fault at a
+        // copy's sepc names a kernel VA, which is never spurious.
+        // SAFETY: S-mode in the copying thread's context; its satp is
+        // still active (SIE is clear).
+        if unsafe { super::paging::user_fault_is_spurious(live.stval, access) }
+        {
+            // SAFETY: S-mode; drops the stale entry for the retry.
+            unsafe { super::paging::flush_page(live.stval) };
+            return;
+        }
+        live.sepc = fixup;
+        return;
+    }
+
+    crate::kprintln!(
+        "KERNEL EXCEPTION: cpu={} cause={} (scause={:#x})",
+        cpu,
+        riscv_exception_name(cause_code),
+        scause
+    );
+    // `sepc`, `stval`, `satp` and the register file can hold kernel VAs
+    // or the kernel root's address, and `fatal` halts only this hart:
+    // serial only (core/kernel/docs/cross-boundary-disclosure.md
+    // § Kernel console diagnostics).
+    crate::kprintln_serial!("  sepc={:#x}  stval={:#x}", live.sepc, live.stval);
+    crate::kprintln!("  sstatus={:#x}", sstatus_val);
+    crate::kprintln_serial!("  satp={:#x}", satp_val);
+    dump_riscv_regs(live);
+    crate::fatal("unhandled kernel exception");
 }
 
 /// Build the architecture-neutral [`FaultInfo`](crate::ipc::fault::FaultInfo) for

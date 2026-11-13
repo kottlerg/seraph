@@ -19,6 +19,25 @@
 // Staged roll-outs of these lints: docs/coding-standards.md § Clippy.
 #![warn(clippy::multiple_unsafe_ops_per_block)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+// `fn_params_excessive_bools`, a pedantic lint, is on already; `clippy.toml`
+// sets its threshold to zero and the `large_stack_frames` threshold. The test
+// configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 #![cfg_attr(
     test,
     expect(
@@ -402,6 +421,13 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
               memcpy into the callee's stack frame either way. Single boot-path copy; nothing on \
               the hot path"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the root `CSpaceLayout` (3464 B), the `InitInfo` header (3616 B), init's \
+              `ThreadControlBlock` (1128 B) and `init_image` (304 B), each counted once for \
+              each move and with the inlined phases' locals; on the 64 KiB boot handoff stack, \
+              whose measured boot peak is stated at `HANDOFF_STACK_BYTES`"
+)]
 #[cfg(not(test))]
 #[inline(never)]
 unsafe fn kernel_entry_post_rebase(
@@ -672,10 +698,15 @@ unsafe fn kernel_entry_post_rebase(
             reason = "every write is to a field of the BootInfo page, which the direct map reaches \
                       and which no reference aliases on the single boot thread"
         )]
-        // SAFETY: as above. Volatile stores so the scrub of this donated page
-        // cannot be elided as a dead store.
+        // SAFETY: as above; each seed byte's offset is below the seed array's
+        // length. Volatile stores, one per primitive, so the scrub of this
+        // donated page cannot be elided as a dead store.
         unsafe {
-            core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_seed), [0u8; 32]);
+            let seed: *mut [u8] = core::ptr::addr_of_mut!((*bi).boot_entropy_seed);
+            for i in 0..seed.len()
+            {
+                core::ptr::write_volatile(seed.cast::<u8>().add(i), 0u8);
+            }
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).boot_entropy_len), 0u32);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).kernel_virtual_base), 0u64);
             core::ptr::write_volatile(core::ptr::addr_of_mut!((*bi).direct_map_base), 0u64);

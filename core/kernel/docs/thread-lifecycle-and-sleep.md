@@ -62,9 +62,10 @@ touches these):
 - `core/kernel/src/ipc/{notification,event_queue,wait_set}.rs` — the claimers that call them.
 - `core/kernel/src/ipc/endpoint.rs` — `endpoint_call`, `endpoint_recv`, `endpoint_try_recv`,
   `endpoint_reply` (`reply_tcb` publish and claim).
-- `core/kernel/src/cap/object.rs` — the `ObjectType::Thread` arm of `dealloc_object_one`,
-  `push_deferred_reclaim`, `drain_deferred_reclaim` (§ Self-teardown), the sleep-list removal
-  and timer quiesce in its Notification and EventQueue arms, and the sleep-list removal in its
+- `core/kernel/src/cap/object.rs` — `dealloc_thread` (the `ObjectType::Thread` arm of
+  `dealloc_object_one`), `push_deferred_reclaim`, `drain_deferred_reclaim` (§ Self-teardown), the
+  sleep-list removal and timer quiesce in the Notification and EventQueue arms of
+  `dealloc_object_one`, and the sleep-list removal in its
   Endpoint arm's queue drains (no quiesce: the timer's endpoint and wait-set arms hold no pop-time
   source pointer, invariant 6).
 - The fault handlers in `core/kernel/src/arch/{x86_64/idt.rs,riscv64/interrupts.rs}` that drive
@@ -436,7 +437,7 @@ queued for deferred reclaim (`cap::object::release_ref`) — the running CPU's
 disabled, so the thread never reschedules). Running steps 8-20 inline would wedge
 that CPU (#341).
 
-`dealloc_object_one` detects this case
+`dealloc_thread` detects this case
 (`tcb == scheduler_for(this_cpu).current()`) and splits the protocol:
 
 - **Inline, on the dying thread:** steps 1-4 only, via

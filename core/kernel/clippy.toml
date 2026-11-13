@@ -1,0 +1,14 @@
+# clippy.toml — Clippy settings for the kernel crate.
+# docs/coding-standards.md § Clippy states the rule each setting serves; the
+# figures and the stack the frame threshold derives from are the kernel's.
+
+# Every `bool` parameter is reported: a behaviour flag is replaced, and a bool
+# that is data carries an `#[expect]` naming the value.
+max-fn-params-bools = 0
+
+# 4096 bytes, a quarter of the smallest stack the kernel's code runs on: the
+# 16 KiB of `KERNEL_STACK_PAGES` (core/kernel/src/sched/mod.rs). Every thread
+# and idle stack is that size, the x86-64 IST stacks and the riscv64 overflow
+# stack are sized from it, and the boot handoff stack is 64 KiB
+# (core/kernel/docs/memory-internals.md § Kernel Stack Guards).
+stack-size-threshold = 4096

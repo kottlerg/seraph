@@ -887,6 +887,12 @@ fn log_recv_preallocate_failure(
 /// If the message carried capabilities, their delivered handles in the server's
 /// `CSpace` are written to the IPC buffer at word `MSG_DATA_WORDS_MAX`.
 #[cfg(not(test))]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `Message` (576 B), read on both paths (the try-once binding's \
+              tuple and the woken receive's `ipc_msg` copy) and counted once for each move; on \
+              the 16 KiB kernel stack of the receiving thread"
+)]
 pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
 {
     let ep_idx = tf.arg(0);
@@ -2169,7 +2175,17 @@ unsafe fn wait_set_source(
                 EqRights::RECV.erase(),
             )
         }
-        _ => return Err(SyscallError::InvalidCapability),
+        CapTag::Null
+        | CapTag::Memory
+        | CapTag::AddressSpace
+        | CapTag::Interrupt
+        | CapTag::Mmio
+        | CapTag::Thread
+        | CapTag::CSpace
+        | CapTag::WaitSet
+        | CapTag::IoPort
+        | CapTag::SchedControl
+        | CapTag::SbiControl => return Err(SyscallError::InvalidCapability),
     };
     Ok((state, tag, header, right))
 }

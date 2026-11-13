@@ -536,6 +536,11 @@ unsafe fn ioapic_read(phys_base: u64, reg: u32) -> u32
 /// Must be called from a single-threaded context after Phase 3 completes and
 /// after `kernel_mmio` has been captured.
 #[cfg(not(test))]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "`buf`, the bootloader's I/O APIC table copied out of `BootInfo`: `MAX_IOAPICS` \
+              (128) 24 B entries, 3 KiB, on the 64 KiB boot handoff stack (Phase 5)"
+)]
 pub unsafe fn init()
 {
     let mut buf = [IoApicEntry::default(); MAX_IOAPICS];

@@ -332,7 +332,7 @@ touch to the size a spawned thread's has. The reservation's pages below the rang
 address the pager declines and ends the whole process, as an overflow of a spawned thread's stack
 does. A binary whose `stack_pages!` note declares 512 pages or more, a pinned process, an
 `ET_EXEC` image (which the loaders place at its link addresses unchecked against the reservation),
-and a process whose funding or registration fails keep the committed pages alone, the pages below
+and a process whose registration fails keep the committed pages alone, the pages below
 which fault the same way. The range is never unregistered; memmgr reclaims its frames at process
 death.
 

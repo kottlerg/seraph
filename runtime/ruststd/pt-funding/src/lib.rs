@@ -61,21 +61,39 @@ pub const PT_FUND_ROUNDS: u32 = 2;
 /// (services/memmgr/docs/memory-pool.md § Client page-table funding).
 pub const MAP_TOP_UPS: u32 = 4;
 
+/// Entries of one page table at every level, on both architectures.
+const ENTRIES_PER_TABLE: u64 = 512;
+
+/// Levels below the root at which a map takes tables from the pool, under the
+/// deepest paging the kernel runs: five-level paging (x86-64 `CR4.LA57`,
+/// riscv64 Sv57) has four. A shallower depth takes fewer, so the bound holds
+/// for every depth.
+const NON_ROOT_LEVELS: u32 = 4;
+
 /// Worst-case intermediate page-table pages a map of a contiguous VA run of
-/// `region_pages` pages needs: one last-level table per 512 pages plus one for
-/// a boundary span, and the upper levels with their spans (+4). Zero for an
-/// empty run.
+/// `region_pages` pages needs from the pool, under any paging depth the kernel
+/// runs. At each level below the root, whose tables each map `span` pages, a
+/// run of `n` pages touches at most `(n - 1).div_ceil(span) + 1` tables (the
+/// run that starts on the last page of a table's span); the bound is that sum
+/// over the [`NON_ROOT_LEVELS`] levels. Zero for an empty run.
 #[must_use]
 pub const fn pt_pages_for(region_pages: u64) -> u64
 {
     if region_pages == 0
     {
-        0
+        return 0;
     }
-    else
+    let mut total: u64 = 0;
+    let mut span = ENTRIES_PER_TABLE;
+    let mut level = 0;
+    while level < NON_ROOT_LEVELS
     {
-        region_pages.div_ceil(512).saturating_add(4)
+        let tables = region_pages.saturating_sub(1).div_ceil(span).saturating_add(1);
+        total = total.saturating_add(tables);
+        span = span.saturating_mul(ENTRIES_PER_TABLE);
+        level = level.saturating_add(1);
     }
+    total
 }
 
 /// Top an address space's page-table pool up to `need_pages`.
@@ -154,14 +172,51 @@ mod tests
     const OOM: i64 = -8;
     const INVALID: i64 = -3;
 
+    /// Tables a map of `pages` pages from page `start` touches at each level
+    /// below the root of five-level paging, counted from the first and last
+    /// page's table at each level.
+    fn tables_touched(start: u64, pages: u64) -> u64
+    {
+        let mut span = ENTRIES_PER_TABLE;
+        let mut total = 0;
+        for _ in 0..NON_ROOT_LEVELS
+        {
+            total += (start + pages - 1) / span - start / span + 1;
+            span *= ENTRIES_PER_TABLE;
+        }
+        total
+    }
+
     #[test]
-    fn the_estimate_covers_a_table_per_512_pages_and_the_upper_levels()
+    fn the_estimate_is_the_tables_of_the_worst_placed_run()
     {
         assert_eq!(pt_pages_for(0), 0);
-        assert_eq!(pt_pages_for(1), 5);
-        assert_eq!(pt_pages_for(512), 5);
-        assert_eq!(pt_pages_for(513), 6);
-        assert_eq!(pt_pages_for(u64::MAX), u64::MAX.div_ceil(512) + 4);
+        assert_eq!(pt_pages_for(1), 4);
+        assert_eq!(pt_pages_for(2), 8);
+        assert_eq!(pt_pages_for(513), 8);
+        assert_eq!(pt_pages_for(1025), 9);
+        // No run needs more than the estimate, wherever it starts, and the run
+        // that starts on the last page of a top-level table's span needs
+        // exactly it.
+        let top = ENTRIES_PER_TABLE.pow(NON_ROOT_LEVELS);
+        for pages in [1, 2, 3, 511, 512, 513, 1024, 1025, 262_144, 262_145, 1 << 20]
+        {
+            let estimate = pt_pages_for(pages);
+            for start in [0, top - 512, top - 1, top, top + 1, top + 510, top + 511, 3 * top - 1]
+            {
+                assert!(
+                    tables_touched(start, pages) <= estimate,
+                    "a {pages}-page run from page {start} needs more than {estimate}"
+                );
+            }
+            assert_eq!(tables_touched(top - 1, pages), estimate, "{pages} pages");
+        }
+    }
+
+    #[test]
+    fn the_estimate_saturates()
+    {
+        assert!(pt_pages_for(u64::MAX) >= u64::MAX.div_ceil(ENTRIES_PER_TABLE));
     }
 
     #[test]

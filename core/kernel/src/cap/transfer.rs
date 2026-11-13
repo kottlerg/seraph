@@ -368,7 +368,7 @@ pub fn move_cap_drive(mv: CapMove) -> MoveStep
                     release: None,
                 };
             }
-            other => return other,
+            settled @ (MoveStep::Lost(_) | MoveStep::Abandoned { .. }) => return settled,
         }
     }
 }

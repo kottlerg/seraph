@@ -613,12 +613,15 @@ impl Admission
         };
         let fd = file.as_raw_fd();
         // SAFETY: `fd` is the open descriptor `file` owns for the duration of
-        // this call; F_GETFD and F_SETFD read and write only its
-        // close-on-exec flag, and touch no memory.
-        let cleared = unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) >= 0
-        };
+        // this call; F_GETFD reads only its descriptor flags, and touches no
+        // memory.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let cleared = flags >= 0
+            // SAFETY: `fd` is the open descriptor `file` owns for the duration
+            // of this call; F_SETFD writes only its descriptor flags, here the
+            // ones F_GETFD returned with close-on-exec cleared, and touches no
+            // memory.
+            && unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } >= 0;
         if !cleared
         {
             bail!(

@@ -19,6 +19,7 @@
 //! 4. Re-export the module in `commands/mod.rs`.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![expect(
     clippy::multiple_crate_versions,
     reason = "duplicate transitive versions (bitflags, hashbrown, windows-sys, wit-bindgen) come \

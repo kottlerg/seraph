@@ -324,11 +324,18 @@ devmgr's responsibilities are:
   bootstrap fails, so the Bus Master Enable and Interrupt Disable writes, the
   endpoint revocation, and the BAR and configuration-page releases run; the
   fixture declares no reset and no DMA, so neither a reset nor a DMA release
-  runs there. No boot withdraws a DMA-capable PCI-bound driver. A boot serves
-  every such driver that reports ready, and devmgr withdraws one only on its
-  death or a failed settle, which a test boot cannot cause: only devmgr holds
-  a PCI-bound driver's process handle, and the only virtio-blk driver of a
-  test boot serves its root filesystem. Nor could a boot place a late device
+  runs there. Every `--test-devices` boot runs it on one DMA-capable
+  PCI-bound driver: svctest's `devmgr_msi_release` phase has the `test-dma`
+  fixture, bound to QEMU's `edu` device and declaring no reset, exit
+  (`ipc::test_dma_labels::FIXTURE_EXIT`), and devmgr withdraws it on its
+  death, so step 0 and the hold of step 5 run: behind an IOMMU the block lets
+  `RELEASE_HOLD` return the fixture's memory, and without one its reset is
+  never confirmed, so the memory stays quarantined. No boot withdraws any
+  other DMA-capable driver. A boot serves every such driver that reports
+  ready, and devmgr withdraws one only on its death or a failed settle, which
+  a test boot causes for no other: only devmgr holds a PCI-bound driver's
+  process handle, and the only virtio-blk driver of a test boot serves its
+  root filesystem. Nor could a boot place a late device
   write after a free, since the emulated devices complete a request on their
   own event loop, with nothing a guest can hold in flight. What every boot does
   run is the carve of each bound function's configuration page, the bind's

@@ -989,8 +989,10 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
 /// The pool is shared by every mapping of the process, the pager's included,
 /// so the top-up is not reserved for the region: another thread's mapping can
 /// draw it first, and the map then fails with `OutOfMemory` rather than
-/// silently drawing on the reserve. A caller whose process maps from more than
-/// one thread tops up again and repeats such a map, a bounded number of times.
+/// silently drawing on the reserve. A caller whose process is demand-paged or
+/// maps from more than one thread tops up again and repeats such a map, a
+/// bounded number of times; only a single-threaded process with no pager may
+/// map once.
 ///
 /// `region_pages == 0` is a no-op success. Returns `false` only when a top-up
 /// was needed and could not be had: memmgr is unreachable or refuses the grant,

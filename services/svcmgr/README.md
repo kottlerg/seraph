@@ -12,8 +12,9 @@ one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliatio
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
 (`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
-`vfsd.mount`, `vfsd.deny`, `logd.query`, a `devmgr.class.<class>` per device class file, and each
-provider's `provides` names like `pwrmgr.shutdown` / `timed`) into the registry itself — from the
+`vfsd.mount`, `vfsd.deny`, `logd.query`, a `devmgr.class.<stem>` per device class file (`<stem>` is
+the file's name without `.class`), and each provider's `provides` names like `pwrmgr.shutdown` /
+`timed`) into the registry itself — from the
 source caps init endows it with at handover, and from each provider's launch. Consumers resolve
 any name through their `.svc` `seed = ...` line at launch time, and the public names
 (`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
@@ -214,7 +215,7 @@ column). The handover endowment and
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.bind` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| BIND_AUTHORITY`-badged `SEND\|GRANT` on devmgr's registry endpoint, gating `BIND_DRIVERS`, which moves a directory cap (seeded by svctest only) | no |
-| `devmgr.class.<class>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](docs/service-definitions.md#device-class-files)) | no |
+| `devmgr.class.<stem>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](docs/service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |

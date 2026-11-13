@@ -605,9 +605,9 @@ label, `devmgr_labels::QUERY_DEVICE`, sent on a class SEND: a SEND on devmgr's r
 whose badge names a class and the verb bits the reply carries. The class and the verbs come from
 the badge, never the message, and a registry SEND without a class slot gets `UNAUTHORIZED`.
 svcmgr mints each class SEND (`devmgr_labels::MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`) from
-a class file and publishes it seed-only as `devmgr.class.<class>`
-([driver-binding.md](driver-binding.md) § Device Classes). The dependency ordering is fixed by
-init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
+a class file and publishes it seed-only as `devmgr.class.<stem>` (the class file's name without
+`.class`) ([driver-binding.md](driver-binding.md) § Device Classes). The dependency ordering is
+fixed by init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
 devmgr binds each PCI device the most specific driver declaration matches

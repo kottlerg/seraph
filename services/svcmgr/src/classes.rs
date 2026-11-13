@@ -66,7 +66,8 @@ pub fn configure(registry: &mut registry::Registry, devmgr_registry: u64, ipc_bu
 
 /// Configure the class the file `<CLASSES_DIR>/<class>.class` names and
 /// publish its SEND as `devmgr.class.<class>`, through `minter`, a
-/// `CLASS_AUTHORITY` SEND on devmgr's registry.
+/// `CLASS_AUTHORITY` SEND on devmgr's registry. `class` is the file's stem,
+/// which names the class configured only when the file sets no `class` key.
 fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ipc_buf: *mut u64)
 {
     // Fallible, as every copy svcmgr makes of configuration text is.

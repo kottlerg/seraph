@@ -113,9 +113,8 @@ definition is paired at reconciliation, on
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
 `vfsd.mount`, `vfsd.deny`, `logd.query`) into its own registry, configures devmgr's device
-classes and publishes each as `devmgr.class.<class>`, and installs devmgr's
-`/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event
-loop.
+classes and publishes each as `devmgr.class.<stem>` (the class file's name without `.class`), and
+installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event loop.
 
 ---
 

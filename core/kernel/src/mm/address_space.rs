@@ -1393,7 +1393,9 @@ impl AddressSpace
     /// shootdown (`core/kernel/docs/memory-internals.md` § SMP TLB Shootdown).
     ///
     /// # Safety
-    /// `virt` must be in the user half and currently mapped.
+    /// `virt` must be in the user half. It need not be mapped: a concurrent
+    /// unmap can remove the page at any time, and the mapping is checked
+    /// under `pt_lock` as described above.
     #[cfg(not(test))]
     pub unsafe fn protect_page(
         &self,

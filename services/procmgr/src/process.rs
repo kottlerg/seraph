@@ -2548,31 +2548,37 @@ pub fn check_debuggers(table: &mut ProcessTable) -> usize
     gone.len()
 }
 
-/// Keep `debugger`, the main-thread cap of the debugger an `ATTACH_PROCESS`
-/// carried, as the watch of the process `badge` names, replacing (and
-/// deleting) an earlier one. A cap that is not a Thread cap is deleted.
-pub fn watch_debugger(table: &mut ProcessTable, badge: u64, debugger: u64)
+/// Keep `watch`, the main-thread cap of the debugger an `ATTACH_PROCESS`
+/// carried (`0`: none), as the watch of `entry`, the attach's target, across
+/// `reply`, which sends the attach's reply and returns whether it was
+/// delivered; returns that. The watch is held before the reply is sent
+/// (`ProcessEntry::watch_across_reply`): a debugger can bind the target's
+/// threads and die as soon as it has its reply, and a watch kept only after
+/// the reply could find the debugger's cap already revoked, take it for no
+/// Thread cap, and keep none, so no check would restore the bindings. A
+/// delivered reply deletes the watch it replaced; a failed one deletes the
+/// new watch and keeps the earlier. A cap that is not a Thread cap is deleted
+/// before the reply, and no watch is kept. The caller holds the table lock
+/// throughout, so no check sees the watch of an attach whose reply then
+/// fails.
+pub fn watch_debugger(entry: &mut ProcessEntry, watch: u64, reply: impl FnOnce() -> bool) -> bool
 {
-    if syscall::cap_info(debugger, syscall_abi::CAP_INFO_THREAD_STATE).is_err()
+    let thread = if watch != 0
+        && syscall::cap_info(watch, syscall_abi::CAP_INFO_THREAD_STATE).is_err()
     {
-        let _ = syscall::cap_delete(debugger);
-        return;
+        let _ = syscall::cap_delete(watch);
+        0
     }
-    match table.find_mut_by_badge(badge)
+    else
     {
-        Some(entry) =>
-        {
-            let old = core::mem::replace(&mut entry.debugger, debugger);
-            if old != 0
-            {
-                let _ = syscall::cap_delete(old);
-            }
-        }
-        None =>
-        {
-            let _ = syscall::cap_delete(debugger);
-        }
+        watch
+    };
+    let outcome = entry.watch_across_reply(thread, |_| reply());
+    if outcome.stale != 0
+    {
+        let _ = syscall::cap_delete(outcome.stale);
     }
+    outcome.delivered
 }
 
 /// Unbind `thread`, a thread of the declared process `entry`

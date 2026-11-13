@@ -820,11 +820,7 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables)
                 .split_first()
                 .map_or((0, &[][..]), |(&c, rest)| (c, rest));
             release_caps(extra);
-            match handle_attach_process(req, ipc_buf, table)
-            {
-                Some(badge) if watch != 0 => process::watch_debugger(table, badge, watch),
-                _ => release_caps(&[watch]),
-            }
+            handle_attach_process(req, ipc_buf, table, watch);
         }
         procmgr_labels::LIST_PROCESSES =>
         {
@@ -939,13 +935,15 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
 /// registration order, those that are gone swept out first, so no exited
 /// thread is listed. The request's badge may be a thread crash badge, which
 /// names its process and, in the reply's named-thread word, that thread.
-/// Returns the target's process badge when the attach succeeded, the reply
-/// delivered, for the caller to keep the debugger watch `caps[0]` carried.
+/// `watch` is the debugger watch `caps[0]` carried (`0`: none), which this
+/// takes: an attach that succeeds keeps it as the target's, from before its
+/// reply is sent (`process::watch_debugger`), and every other deletes it.
 fn handle_attach_process(
     req: &IpcMessage,
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
-) -> Option<u64>
+    watch: u64,
+)
 {
     let (entry, named) = match process_table::attach_target(table, req.badge, req.word(0))
     {
@@ -958,8 +956,9 @@ fn handle_attach_process(
                 process_table::AttachRefusal::Unknown => procmgr_errors::INVALID_BADGE,
                 process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
             };
+            release_caps(&[watch]);
             reply_empty(ipc_buf, code);
-            return None;
+            return;
         }
     };
     let first = usize::try_from(req.word(1)).unwrap_or(usize::MAX);
@@ -979,8 +978,9 @@ fn handle_attach_process(
     let Ok((derived, n)) = page
     else
     {
+        release_caps(&[watch]);
         reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        return None;
+        return;
     };
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
         .word(0, (entry.threads.len() as u64).saturating_add(1))
@@ -998,16 +998,17 @@ fn handle_attach_process(
     {
         reply = reply.cap(cap);
     }
-    let badge = entry.badge();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
+    let reply = reply.build();
+    let send = || {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_ok()
+    };
+    if !process::watch_debugger(entry, watch, send)
     {
-        // The caller holds none of the caps, so the attach did not succeed
+        // The caller holds none of the caps, so the attach did not succeed,
         // and its watch is not kept.
         release_caps(derived.get(..n).unwrap_or_default());
-        return None;
     }
-    Some(badge)
 }
 
 /// Handle `LIST_PROCESSES` — reply with one page of live processes, in

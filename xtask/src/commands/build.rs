@@ -557,7 +557,6 @@ fn spec_for(component: BuildComponent) -> Option<&'static Spec>
 /// Entry point for `cargo xtask build`.
 pub fn run(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
-    crate::host_lock::admit_build(ctx, &args.host)?;
     sysroot::check_arch(ctx, args.arch)?;
     if !args.skip_lints
     {

@@ -11,7 +11,8 @@
 //! # Adding a new command
 //!
 //! 1. Add a variant to `cli::CliCommand` and a corresponding `Args` struct in
-//!    `cli.rs`.
+//!    `cli.rs`, and name it in `CliCommand::build_host`: a command that
+//!    compiles takes `HostArgs` and is admitted there as a build.
 //! 2. Create `commands/<name>.rs` with a `pub fn run(ctx, args) -> Result<()>`,
 //!    or add a `pub fn run_<name>` to the module that holds its sibling commands.
 //!    (`hook::run` returns nothing: a hook answers every event and never fails.)
@@ -91,6 +92,13 @@ fn main()
     // subprocess (cargo, QEMU) without killing xtask itself. Allows
     // TerminalGuard::drop and error propagation to run on Ctrl+C.
     if let Err(err) = term::signal::install()
+    {
+        eprintln!("error: {err:#}");
+        std::process::exit(1);
+    }
+
+    if let Some(host) = cli.command.build_host()
+        && let Err(err) = host_lock::admit_build(&ctx, host)
     {
         eprintln!("error: {err:#}");
         std::process::exit(1);

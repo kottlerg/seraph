@@ -185,6 +185,50 @@ pub enum CliCommand
     Hook(HookArgs),
 }
 
+impl CliCommand
+{
+    /// The host launch rules' options of a command the rules admit as a
+    /// build (`crate::host_lock::admit_build`), which `main` admits before it
+    /// runs the command; `None` for every other command. A command that boots
+    /// QEMU is admitted by its own entry point instead, which knows the size
+    /// of its boot.
+    ///
+    /// The match names every command, so a new one states here whether it
+    /// compiles on the shared host.
+    pub fn build_host(&self) -> Option<&HostArgs>
+    {
+        match self
+        {
+            Self::Build(args) => Some(&args.host),
+            Self::Clean(args) => Some(&args.host),
+            Self::Test(args) => Some(&args.host),
+            Self::Run(_)
+            | Self::RunParallel(_)
+            | Self::KtestTiming(_)
+            | Self::Symbolize(_)
+            | Self::Mkdisk(_)
+            | Self::ComposeBundle(_)
+            | Self::TestTerminal(_)
+            | Self::TestVmgenid(_)
+            | Self::TestKaslr(_)
+            | Self::TestCrashReport(_)
+            | Self::TestMapRedo(_)
+            | Self::TestDebugPort(_)
+            | Self::TestGdb(_)
+            | Self::LintDocs(_)
+            | Self::CommitCheck(_)
+            | Self::PrCheck(_)
+            | Self::ReviewCheck(_)
+            | Self::ReviewLedger(_)
+            | Self::IssueEdit(_)
+            | Self::IssueFile(_)
+            | Self::Orch(_)
+            | Self::Host(_)
+            | Self::Hook(_) => None,
+        }
+    }
+}
+
 // ── Host launch rules ─────────────────────────────────────────────────────────
 
 /// The host launch rules' options every command that loads the host takes
@@ -735,6 +779,11 @@ pub struct TestArgs
     /// Test a single component (default: all).
     #[arg(long, default_value = "all")]
     pub component: TestComponent,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: HostArgs,
 }
 
 /// Components that can be tested individually.
@@ -1395,5 +1444,34 @@ mod tests
         assert_eq!(parse_build_component("boot"), Ok(BuildComponent::Boot));
         assert_eq!(parse_build_component("all"), Ok(BuildComponent::All));
         parse_build_component("no-such-crate").unwrap_err();
+    }
+
+    /// The host options `main` admits a parsed command line with as a build.
+    fn build_host_of(argv: &[&str]) -> Option<HostArgs>
+    {
+        let cli = Cli::try_parse_from(argv).unwrap();
+        cli.command.build_host().cloned()
+    }
+
+    #[test]
+    fn each_command_that_compiles_is_admitted_as_a_build_with_its_host_options()
+    {
+        for command in ["build", "clean", "test"]
+        {
+            let host = build_host_of(&["xtask", command, "--wait-host", "30"])
+                .unwrap_or_else(|| panic!("`{command}` is not admitted as a build"));
+            assert_eq!(host.wait_host, Some(30), "{command}");
+            assert!(!host.host_override, "{command}");
+        }
+        let overridden = build_host_of(&["xtask", "test", "--host-override"]).unwrap();
+        assert!(overridden.host_override);
+    }
+
+    #[test]
+    fn a_boot_or_a_command_that_compiles_nothing_is_not_admitted_as_a_build()
+    {
+        assert!(build_host_of(&["xtask", "run"]).is_none());
+        assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
+        assert!(build_host_of(&["xtask", "host", "status"]).is_none());
     }
 }

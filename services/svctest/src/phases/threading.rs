@@ -515,9 +515,6 @@ struct MiddleWaiterState
     tokens: usize,
 }
 
-/// Wait until `queued` threads have queued on `cv`, failing after
-/// `FANOUT_BOUND`. A waiter counts itself under the lock before it waits, and
-/// the wait queues it before unlocking, so the count covers queued waiters only.
 /// Lock the middle-waiter state and count the calling thread as queued. The
 /// caller waits on the returned guard, so the count stays under the lock until
 /// the thread is queued on the condvar.
@@ -531,6 +528,9 @@ fn count_queued_waiter(lock: &Mutex<MiddleWaiterState>) -> MutexGuard<'_, Middle
     state
 }
 
+/// Wait until `queued` threads have queued on `cv`, failing after
+/// `FANOUT_BOUND`. A waiter counts itself under the lock before it waits, and
+/// the wait queues it before unlocking, so the count covers queued waiters only.
 fn await_queued(shared: &(Mutex<MiddleWaiterState>, Condvar), queued: usize)
 {
     let start = Instant::now();

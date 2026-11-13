@@ -86,6 +86,11 @@ unsafe fn serial_hw_init()
 {
     // SAFETY: UART_VA set by init after successful mmio_map.
     let base = unsafe { UART_VA } as *mut u8;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a 16550 register at a constant offset in the UART page \
+                  mapped at `UART_VA`"
+    )]
     // SAFETY: UART MMIO region is mapped and writable; volatile writes
     // configure the 16550 registers.
     unsafe {
@@ -115,6 +120,11 @@ pub fn raise_tx_interrupt()
 {
     // SAFETY: UART_VA set during init; IER is a register in the mapped region.
     let base = unsafe { UART_VA } as *mut u8;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a 16550 register at a constant offset in the UART page \
+                  mapped at `UART_VA`"
+    )]
     // SAFETY: as above; volatile writes program the 16550 IER.
     unsafe {
         core::ptr::write_volatile(base.add(IER), 0x00);
@@ -127,8 +137,10 @@ pub fn quiet_tx_interrupt()
 {
     // SAFETY: UART_VA set during init; IER is a register in the mapped region.
     let base = unsafe { UART_VA } as *mut u8;
-    // SAFETY: as above.
-    unsafe { core::ptr::write_volatile(base.add(IER), 0x00) };
+    // SAFETY: IER is at a constant offset inside the mapped UART page.
+    let ier = unsafe { base.add(IER) };
+    // SAFETY: `ier` is the IER register of the mapped UART.
+    unsafe { core::ptr::write_volatile(ier, 0x00) };
 }
 
 /// Write a single byte, spinning until the transmit buffer is empty.
@@ -139,11 +151,15 @@ pub fn write_byte(byte: u8)
     // SAFETY: UART_VA set during init; single-threaded.
     let base = unsafe { UART_VA } as *mut u8;
 
+    // SAFETY: LSR is at constant offset 5 inside the mapped UART page.
+    let lsr = unsafe { base.add(LSR) };
     // Spin on LSR bit 5 (THRE).
-    // SAFETY: LSR is a status register at offset 5 in the MMIO region.
-    while unsafe { core::ptr::read_volatile(base.add(LSR)) } & 0x20 == 0
+    // SAFETY: LSR is a status register in the MMIO region.
+    while unsafe { core::ptr::read_volatile(lsr) } & 0x20 == 0
     {}
 
+    // SAFETY: TX is at constant offset 0 inside the mapped UART page.
+    let tx = unsafe { base.add(TX) };
     // SAFETY: THRE set; writing to TX register transmits the byte.
-    unsafe { core::ptr::write_volatile(base.add(TX), byte) };
+    unsafe { core::ptr::write_volatile(tx, byte) };
 }

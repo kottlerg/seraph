@@ -182,6 +182,11 @@ pub unsafe fn init(info: &InitInfo, aspace_cap: u64)
         core::ptr::write_bytes(pixel_base as *mut u8, 0, clear_bytes);
     }
 
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `STATE`, which only ktest's single-threaded \
+                  framebuffer output path touches"
+    )]
     // SAFETY: single-threaded init; all values validated above.
     unsafe {
         STATE.base = pixel_base;
@@ -233,58 +238,79 @@ pub fn newline()
 /// Framebuffer must be mapped.
 unsafe fn newline_locked()
 {
-    // SAFETY: single-threaded cursor mutation; framebuffer is mapped.
-    unsafe {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `STATE`, which only ktest's single-threaded \
+                  framebuffer output path touches"
+    )]
+    // SAFETY: single-threaded cursor mutation.
+    let past_last_row = unsafe {
         STATE.col = 0;
         STATE.row = STATE.row.saturating_add(1);
-        if STATE.row >= STATE.max_rows
-        {
-            scroll();
-        }
+        STATE.row >= STATE.max_rows
+    };
+    if past_last_row
+    {
+        // SAFETY: the caller's contract maps the framebuffer.
+        unsafe { scroll() };
     }
 }
 
 /// Write a single byte of a UTF-8 stream to the framebuffer.
+///
+/// Called only by `write_str`, once `STATE.ready` shows the framebuffer
+/// mapped; the cursor stays bounded by `max_cols`/`max_rows`, derived from the
+/// display dimensions.
 fn write_byte(byte: u8)
 {
-    // SAFETY: single-threaded access to STATE; framebuffer is mapped and
-    // cursor is bounded by max_cols/max_rows derived from display dimensions.
-    unsafe {
-        match byte
+    match byte
+    {
+        b'\n' =>
         {
-            b'\n' =>
-            {
-                STATE.decoder = Utf8Decoder::new();
-                newline_locked();
-            }
-            b'\r' =>
-            {
+            // SAFETY: single-threaded access to STATE.
+            unsafe { STATE.decoder = Utf8Decoder::new() };
+            // SAFETY: `write_str` calls this only once the framebuffer is
+            // mapped.
+            unsafe { newline_locked() };
+        }
+        b'\r' =>
+        {
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access is to a field of `STATE`, which only ktest's \
+                          single-threaded framebuffer output path touches"
+            )]
+            // SAFETY: single-threaded access to STATE.
+            unsafe {
                 STATE.decoder = Utf8Decoder::new();
                 STATE.col = 0;
             }
-            _ =>
+        }
+        _ =>
+        {
+            // Copy the decoder out by value (it is `Copy`) so no
+            // reference to the `static mut` is formed, then write it back.
+            // SAFETY: single-threaded access to STATE.
+            let mut decoder = unsafe { STATE.decoder };
+            let mut outcome = decoder.push(byte);
+            if outcome == DecodeOutcome::Truncated
             {
-                // Copy the decoder out by value (it is `Copy`) so no
-                // reference to the `static mut` is formed, then write it back.
-                let mut decoder = STATE.decoder;
-                let mut outcome = decoder.push(byte);
-                if outcome == DecodeOutcome::Truncated
-                {
-                    draw_codepoint(REPLACEMENT_CODEPOINT);
-                    outcome = decoder.push(byte);
-                }
-                STATE.decoder = decoder;
-                match outcome
-                {
-                    DecodeOutcome::Codepoint(cp) => draw_codepoint(cp),
-                    DecodeOutcome::Invalid | DecodeOutcome::Truncated =>
-                    {
-                        draw_codepoint(REPLACEMENT_CODEPOINT);
-                    }
-                    DecodeOutcome::NeedMore =>
-                    {}
-                }
+                // SAFETY: `write_str` calls this only once the framebuffer is
+                // mapped, and the cursor stays within the display's bounds.
+                unsafe { draw_codepoint(REPLACEMENT_CODEPOINT) };
+                outcome = decoder.push(byte);
             }
+            // SAFETY: single-threaded access to STATE.
+            unsafe { STATE.decoder = decoder };
+            let cp = match outcome
+            {
+                DecodeOutcome::Codepoint(cp) => cp,
+                DecodeOutcome::Invalid | DecodeOutcome::Truncated => REPLACEMENT_CODEPOINT,
+                DecodeOutcome::NeedMore => return,
+            };
+            // SAFETY: `write_str` calls this only once the framebuffer is
+            // mapped, and the cursor stays within the display's bounds.
+            unsafe { draw_codepoint(cp) };
         }
     }
 }
@@ -313,6 +339,11 @@ unsafe fn draw_codepoint(cp: u32)
 /// Framebuffer must be mapped and cursor within bounds.
 unsafe fn draw_glyph_bitmap(bitmap: &[u16])
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `STATE`, which only ktest's single-threaded \
+                  framebuffer output path touches"
+    )]
     // SAFETY: single-threaded; STATE fields are valid after init.
     let (base, stride, col, row) = unsafe {
         (
@@ -353,8 +384,17 @@ unsafe fn draw_glyph_bitmap(bitmap: &[u16])
 
             // SAFETY: offset is within framebuffer bounds; pixel position is
             // bounded by max_cols/max_rows derived from display dimensions.
+            let p = unsafe { base.add(offset) };
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access is to a byte of the one 4-byte pixel at `p`, inside the \
+                          mapped framebuffer"
+            )]
+            // SAFETY: `p` is the first byte of a pixel inside the mapped
+            // framebuffer (the pixel's column is below the display width, and
+            // a row is `stride >= 4 * width` bytes); each offset is a constant
+            // below 4, so each write stays in that pixel.
             unsafe {
-                let p = base.add(offset);
                 core::ptr::write_volatile(p, intensity);
                 core::ptr::write_volatile(p.add(1), intensity);
                 core::ptr::write_volatile(p.add(2), intensity);
@@ -363,13 +403,20 @@ unsafe fn draw_glyph_bitmap(bitmap: &[u16])
         }
     }
 
-    // SAFETY: single-threaded cursor mutation; framebuffer is mapped.
-    unsafe {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `STATE`, which only ktest's single-threaded \
+                  framebuffer output path touches"
+    )]
+    // SAFETY: single-threaded cursor mutation.
+    let past_last_col = unsafe {
         STATE.col = STATE.col.saturating_add(1);
-        if STATE.col >= STATE.max_cols
-        {
-            newline_locked();
-        }
+        STATE.col >= STATE.max_cols
+    };
+    if past_last_col
+    {
+        // SAFETY: the caller's contract maps the framebuffer.
+        unsafe { newline_locked() };
     }
 }
 
@@ -379,6 +426,11 @@ unsafe fn draw_glyph_bitmap(bitmap: &[u16])
 /// Framebuffer must be mapped.
 unsafe fn scroll()
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `STATE`, which only ktest's single-threaded \
+                  framebuffer output path touches"
+    )]
     // SAFETY: single-threaded; STATE fields are valid after init.
     let (base, stride, max_rows) = unsafe {
         (
@@ -402,17 +454,30 @@ unsafe fn scroll()
     };
 
     // Copy rows 1..max_rows → 0..max_rows-1.
+    // SAFETY: the framebuffer holds `max_rows >= 1` rows of `row_bytes`, so
+    // the start of row 1 is inside it or one past its end.
+    let second_row = unsafe { base.add(row_bytes) };
     // SAFETY: both src and dst are within the framebuffer allocation.
     unsafe {
-        core::ptr::copy(base.add(row_bytes), base, last_start);
+        core::ptr::copy(second_row, base, last_start);
     }
 
     // Zero the last row.
+    // SAFETY: `last_start` is the start of the last row, inside the
+    // framebuffer.
+    let last_row = unsafe { base.add(last_start) };
     // SAFETY: last_start + row_bytes is within the framebuffer.
     unsafe {
-        core::ptr::write_bytes(base.add(last_start), 0, row_bytes);
+        core::ptr::write_bytes(last_row, 0, row_bytes);
     }
 
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a field of `STATE`, which only ktest's single-threaded \
+                  framebuffer output path touches"
+    )]
     // SAFETY: single-threaded cursor update.
-    unsafe { STATE.row = STATE.max_rows.saturating_sub(1) };
+    unsafe {
+        STATE.row = STATE.max_rows.saturating_sub(1);
+    }
 }

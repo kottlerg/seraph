@@ -21,14 +21,12 @@ pub fn descriptors(info: &InitInfo) -> &[CapDescriptor]
                   which abi/init-protocol asserts is a multiple of 8, the alignment the `u64` \
                   fields of `CapDescriptor` require"
     )]
+    // SAFETY: the kernel sets `cap_descriptors_offset` to an offset inside
+    // the same InitInfo region.
+    let ptr = unsafe { base.add(info.cap_descriptors_offset as usize) }.cast::<CapDescriptor>();
     // SAFETY: the kernel sets `cap_descriptors_offset` and
     // `cap_descriptor_count` to describe `cap_descriptor_count` valid
     // descriptors inside the same read-only InitInfo region, which stays
     // mapped for ktest's lifetime.
-    unsafe {
-        let ptr = base
-            .add(info.cap_descriptors_offset as usize)
-            .cast::<CapDescriptor>();
-        core::slice::from_raw_parts(ptr, info.cap_descriptor_count as usize)
-    }
+    unsafe { core::slice::from_raw_parts(ptr, info.cap_descriptor_count as usize) }
 }

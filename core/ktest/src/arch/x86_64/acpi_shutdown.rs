@@ -392,8 +392,14 @@ unsafe fn read_u32_at(vaddr: u64, off: usize) -> u32
 {
     // SAFETY: caller guarantees vaddr is mapped for off+4 bytes.
     let p = unsafe { (vaddr as *const u8).add(off) };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a byte at a constant offset below 4 from `p`, inside the span \
+                  the caller's contract maps"
+    )]
     // SAFETY: reading 4 consecutive bytes from a valid mapped address.
-    u32::from_le_bytes(unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] })
+    let bytes = unsafe { [*p, *p.add(1), *p.add(2), *p.add(3)] };
+    u32::from_le_bytes(bytes)
 }
 
 /// Read a little-endian u64 at byte offset `off` from virtual address `vaddr`.
@@ -404,8 +410,13 @@ unsafe fn read_u64_at(vaddr: u64, off: usize) -> u64
 {
     // SAFETY: caller guarantees vaddr is mapped for off+8 bytes.
     let p = unsafe { (vaddr as *const u8).add(off) };
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every read is of a byte at a constant offset below 8 from `p`, inside the span \
+                  the caller's contract maps"
+    )]
     // SAFETY: reading 8 consecutive bytes from a valid mapped address.
-    u64::from_le_bytes(unsafe {
+    let bytes = unsafe {
         [
             *p,
             *p.add(1),
@@ -416,5 +427,6 @@ unsafe fn read_u64_at(vaddr: u64, off: usize) -> u64
             *p.add(6),
             *p.add(7),
         ]
-    })
+    };
+    u64::from_le_bytes(bytes)
 }

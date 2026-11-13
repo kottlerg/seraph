@@ -11,6 +11,8 @@
 //! clock, and serves [`timed_labels::GET_WALL_TIME`] from `offset +
 //! system_info(ElapsedUs)` thereafter.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use ipc::{IpcMessage, rtc_errors, rtc_labels, timed_errors, timed_labels};
 use std::os::seraph::startup_info;
 use syscall_abi::SystemInfoType;
@@ -180,8 +182,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"timed");
     let info = startup_info();
 
-    // cast_ptr_alignment: the IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some(caps) = bootstrap_caps(info.creator_endpoint, ipc_buf)

@@ -18,6 +18,8 @@
 //! ABI and declares the same `input` class, which consumers query with
 //! [`devmgr_labels::QUERY_DEVICE`], so they never learn the transport.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod decode;
 mod input;
 
@@ -81,8 +83,10 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 const POLL_INTERVAL_MS: u64 = 20;
 
 /// [`PAGE_SIZE`] as a `usize`, for the byte count of a one-page fill.
-// cast_possible_truncation: PAGE_SIZE is 4096, which every `usize` holds.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "PAGE_SIZE is 4096, which every `usize` holds"
+)]
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
@@ -694,8 +698,10 @@ fn main() -> !
     std::os::seraph::log::register_name(b"virtio-input");
     let info = startup_info();
 
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some(caps) = bootstrap_caps(info, ipc_buf)

@@ -27,6 +27,7 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 extern crate alloc;
 
@@ -1407,9 +1408,11 @@ mod tests
     use super::*;
 
     /// Build a BPB sector 0 with a valid boot signature and the given fields.
-    // too_many_arguments: one argument per BPB field the tests vary, so each
-    // test states the geometry it exercises in one call.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one argument per BPB field the tests vary, so each test states the geometry it \
+                  exercises in one call"
+    )]
     fn bpb_sector(
         bytes_per_sector: u16,
         sectors_per_cluster: u8,

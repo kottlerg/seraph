@@ -777,8 +777,10 @@ pub fn lookup_bounds(ctx: &TestContext) -> TestResult
     const _: () = assert!(SLOT_CEILING < u32::MAX as u64 - 1);
 
     let invalid = SyscallError::InvalidCapability as i64;
-    // cast_possible_truncation: the assert above keeps every value within u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the assert above keeps every value within u32"
+    )]
     let (below_ceiling, past_ceiling) = (
         [
             1,

@@ -19,6 +19,7 @@
 //! `docs/device-management.md` § IOMMU Discovery and Programming.
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 extern crate alloc;
 

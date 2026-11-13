@@ -242,8 +242,10 @@ pub unsafe fn init(info: &init_protocol::InitInfo)
     // SAFETY: called from init() which is documented as single-threaded boot-time only.
     unsafe { split_frame_recursive(pool_tail, &mut count) };
 
-    // count is bounded by POOL_SIZE (64), so cast is safe.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "count is bounded by POOL_SIZE (64), so cast is safe"
+    )]
     let count_u32 = count as u32;
     // Mark all slots as available: the low `count` bits, none for a count of
     // zero (a shift by the full width).

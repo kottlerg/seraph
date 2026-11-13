@@ -235,8 +235,7 @@ fn await_workers_on(moved: u64, cpus: &[u32]) -> TestResult
 /// Read this worker's CPU and, when it changed, publish it in [`WORKER_CPU`]
 /// and send this worker's bit on `moved` (both from the [`WorkerArgs`] entry
 /// at `arg`); then yield, spin a little, and repeat.
-// cast_possible_truncation: a CPU index fits u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "a CPU index fits u32")]
 extern "C" fn worker_entry(arg: u64) -> !
 {
     // SAFETY: `arg` is the entry `swap_rounds` published for this worker.

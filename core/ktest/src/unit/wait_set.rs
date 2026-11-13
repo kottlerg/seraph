@@ -89,8 +89,10 @@ pub fn capacity_is_caller_sized(ctx: &TestContext) -> TestResult
     {
         return Err("wait_set::capacity: an out-of-range capacity was not refused");
     }
-    // cast_possible_truncation: WIDE_MEMBERS is a small literal.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "WIDE_MEMBERS is a small literal"
+    )]
     let ws = wait_set_create(ctx.memory_base, WIDE_MEMBERS as u32)
         .map_err(|_| "wait_set::capacity: wait_set_create(wide) failed")?;
     let mut sigs = [0u64; WIDE_MEMBERS + 1];
@@ -719,8 +721,7 @@ fn shared_run(ctx: &TestContext, member: SharedMember, sh: &mut Shared) -> TestR
             .ok_or("wait_set::shared_set_waiters: waiter index out of range")?
             .insert(spawned);
         start_shared_child(child, k, entry, ws, done)?;
-        // cast_possible_truncation: k < 2.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(clippy::cast_possible_truncation, reason = "k < 2")]
         let mask = waiter_bits(k as u32, BIT_READY);
         acc = collect(done, acc, mask)?;
     }

@@ -12,15 +12,22 @@
 //! Driven by `services/svctest`'s `stack_overflow_phase`, which spawns this
 //! binary, waits for exit, and asserts the non-zero fault reason.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 fn main()
 {
     overflow(0);
 }
 
-// unconditional_recursion: deliberate — the intent is to overflow the stack.
-// cast_possible_truncation: depth is used only as a never-read fill byte;
-// truncation to u8 is fine and keeps the per-frame footprint at one page.
-#[allow(unconditional_recursion, clippy::cast_possible_truncation)]
+#[expect(
+    unconditional_recursion,
+    reason = "deliberate — the intent is to overflow the stack"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "depth is used only as a never-read fill byte; truncation to u8 is fine and keeps the \
+              per-frame footprint at one page"
+)]
 #[inline(never)]
 fn overflow(depth: usize)
 {

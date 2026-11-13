@@ -12,5 +12,7 @@
 //! (`main.rs`) supplies the real MMIO mapping. [`authority::authorized`]
 //! is the service endpoint's verb-bit gate.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 pub mod authority;
 pub mod render;

@@ -587,10 +587,11 @@ fn serve_region_rounds(
 ///   - terminal round has `done = true`.
 ///
 /// The bootstrap layout mirrors `devmgr/src/caps.rs::bootstrap_caps`.
-// too_many_lines: devmgr's spawn and bootstrap round are one ordered sequence
-// whose cap derivations each later step consumes; splitting it would only
-// thread those slots through helpers.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "devmgr's spawn and bootstrap round are one ordered sequence whose cap derivations \
+              each later step consumes; splitting it would only thread those slots through helpers"
+)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u64,
@@ -1435,11 +1436,11 @@ fn end_endowment(bootstrap_ep: u64, child_badge: u64, ipc_buf: *mut u64)
 /// svcmgr-launched services (`logd`, `timed`, `pwrmgr`); svcmgr's
 /// pure-consumer launch path fires only for staged test recipes (svctest /
 /// usertest, and crasher co-staged with svctest).
-// too_many_arguments: the function carries both svcmgr's endowment and
-// procmgr's reap-handoff inputs, each from a different bootstrap stage.
-// too_many_lines: the handover is one ordered protocol (spawn, endowment
-// rounds, teardown registration, completion) that must run in sequence.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the function carries both svcmgr's endowment and procmgr's reap-handoff inputs, each \
+              from a different bootstrap stage"
+)]
 pub fn phase3_svcmgr_handover(
     info: &InitInfo,
     procmgr_ep: u64,

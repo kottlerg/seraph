@@ -41,9 +41,6 @@ pub fn reentry_main(role: &str)
     }
 }
 
-// cast_sign_loss: ExitStatus::code() is i32 but a voluntary exit reason is
-// non-negative (the encoded code in `[0, EXIT_FAULT_BASE)`); the u64 cast is safe.
-#[allow(clippy::cast_sign_loss)]
 pub fn exit_code_phase(_: &Caps)
 {
     use std::process::Command;

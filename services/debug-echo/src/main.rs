@@ -10,6 +10,8 @@
 //! The packets it answers, and the markers it logs, are specified in
 //! `services/debug-echo/README.md`.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::time::Duration;
 
 use gdb_rsp::command::Command;
@@ -43,8 +45,10 @@ fn main()
 {
     std::os::seraph::log::register_name(b"debug-echo");
     let info = std::os::seraph::startup_info();
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     let Some(debug_port_class) = bootstrap_seed(info.creator_endpoint, ipc_buf)

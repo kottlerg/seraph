@@ -15,6 +15,7 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 // The receivers' shared line and name widths: real-logd keeps the same per
 // sender, so a name or line survives the handover unclipped.

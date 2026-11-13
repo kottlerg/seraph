@@ -76,13 +76,14 @@ static MEM_SOURCE: [u8; MEM_LEN] = [0x3C; MEM_LEN];
 static mut MEM_TARGET: [u8; MEM_LEN] = [0; MEM_LEN];
 
 /// Bytes of a register frame, the register syscalls' buffer length.
-// cast_possible_truncation: the frame is a few hundred bytes.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the frame is a few hundred bytes"
+)]
 const FRAME_BYTES: usize = crate::arch::TRAP_FRAME_BYTES as usize;
 
 /// Bytes of a page, for zeroing a mapped one.
-// cast_possible_truncation: a page is 4 KiB.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "a page is 4 KiB")]
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 /// Wait-set badges of the endpoint and the report notification.

@@ -155,8 +155,10 @@ impl<T> OpenSlab<T>
     {
         self.slots.iter_mut().enumerate().filter_map(|(idx, slot)| {
             let generation = slot.generation;
-            // Cast is range-safe: the index is below MAX_ENTRIES < 2^24.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "cast is range-safe: the index is below MAX_ENTRIES < 2^24"
+            )]
             let id = identifier(idx as u32, generation);
             slot.entry.as_mut().map(|v| (id, v))
         })
@@ -190,8 +192,10 @@ impl<T> OpenSlab<T>
         {
             slot.generation = next;
             // Never allocates: `free` holds at least `slots.len()` capacity.
-            // Cast is range-safe: the index is below MAX_ENTRIES < 2^24.
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "cast is range-safe: the index is below MAX_ENTRIES < 2^24"
+            )]
             self.free.push(idx as u32);
         }
         Some(value)

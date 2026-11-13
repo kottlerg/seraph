@@ -37,6 +37,8 @@
 //!
 //! Driven by `services/svctest`'s pager phase.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use std::os::seraph::{
     register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
 };
@@ -78,9 +80,11 @@ fn main() -> ExitCode
     }
 }
 
-// cast_possible_truncation: the pattern byte is intentionally the low 8 bits of
-// a per-(page, byte) mix; truncation is the point.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the pattern byte is intentionally the low 8 bits of a per-(page, byte) mix; \
+              truncation is the point"
+)]
 fn pattern(page: usize, byte: usize) -> u8
 {
     (page as u8).wrapping_mul(31).wrapping_add(byte as u8)

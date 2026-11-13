@@ -108,9 +108,11 @@ impl InterruptRemap
     /// The entry was not written; logged.
     pub fn message(&self, cap: u64, rid: u64) -> Result<(), NotRemapped>
     {
-        // The source ID is the requester ID's low 16 bits; the segment
-        // selects the unit, and the table is every unit's.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the source ID is the requester ID's low 16 bits; the segment selects the \
+                      unit, and the table is every unit's"
+        )]
         let source = rid as u16;
         self.write(cap, false, source)
     }

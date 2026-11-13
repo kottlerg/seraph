@@ -261,8 +261,12 @@ impl WaitSetState
     {
         for i in 0..usize::from(capacity)
         {
-            // SAFETY: i < capacity; the slot lies in the array (contract).
-            unsafe { core::ptr::write(members.add(i), WaitSetMember::vacant()) };
+            // SAFETY: i < capacity, so the offset stays in the array of
+            // `capacity` members (contract).
+            let slot = unsafe { members.add(i) };
+            // SAFETY: slot lies in the array, writable, aligned and unaliased
+            // (contract).
+            unsafe { core::ptr::write(slot, WaitSetMember::vacant()) };
         }
         // SAFETY: the ring has capacity + 1 u16 slots (contract).
         unsafe { core::ptr::write_bytes(ready_ring, 0, usize::from(capacity) + 1) };
@@ -342,7 +346,10 @@ impl WaitSetState
         {
             // SAFETY: tail is a ring slot (`0..=capacity`); the ring has
             // `capacity + 1` slots.
-            unsafe { *ring.add(usize::from(tail)) = member_idx };
+            let slot = unsafe { ring.add(usize::from(tail)) };
+            // SAFETY: slot is a writable ring slot of this set (`new`'s
+            // contract); `&mut self` excludes another writer.
+            unsafe { *slot = member_idx };
             m.queued = true;
             self.ready_tail = next;
         }
@@ -369,7 +376,10 @@ impl WaitSetState
         {
             // SAFETY: ready_head is a ring slot (`0..=capacity`); the ring has
             // `capacity + 1` slots.
-            let entry = unsafe { *self.ready_ring.add(usize::from(self.ready_head)) };
+            let slot = unsafe { self.ready_ring.add(usize::from(self.ready_head)) };
+            // SAFETY: slot is an initialised ring slot of this set (`new`
+            // zeroes the ring).
+            let entry = unsafe { *slot };
             self.ready_head = self.ring_next(self.ready_head);
             let (tail, next_tail, ring) = (
                 self.ready_tail,
@@ -387,7 +397,10 @@ impl WaitSetState
                 // The pop above freed a slot, so the re-queue always fits; the
                 // member keeps its one entry and its `queued` flag.
                 // SAFETY: tail is a ring slot; the ring has `capacity + 1` slots.
-                unsafe { *ring.add(usize::from(tail)) = entry };
+                let slot = unsafe { ring.add(usize::from(tail)) };
+                // SAFETY: slot is a writable ring slot of this set (`new`'s
+                // contract); `&mut self` excludes another writer.
+                unsafe { *slot = entry };
                 self.ready_tail = next_tail;
                 return Some(badge);
             }
@@ -413,15 +426,21 @@ impl WaitSetState
             let (mut read, mut write) = (self.ready_head, self.ready_head);
             while read != self.ready_tail
             {
-                // SAFETY: read and write are ring slots (`0..=capacity`); the
-                // ring has `capacity + 1` slots.
-                unsafe {
-                    let entry = *self.ready_ring.add(usize::from(read));
-                    if usize::from(entry) != idx
-                    {
-                        *self.ready_ring.add(usize::from(write)) = entry;
-                        write = self.ring_next(write);
-                    }
+                // SAFETY: read is a ring slot (`0..=capacity`); the ring has
+                // `capacity + 1` slots.
+                let src = unsafe { self.ready_ring.add(usize::from(read)) };
+                // SAFETY: src is an initialised ring slot of this set (`new`
+                // zeroes the ring).
+                let entry = unsafe { *src };
+                if usize::from(entry) != idx
+                {
+                    // SAFETY: write is a ring slot (`0..=capacity`); the ring
+                    // has `capacity + 1` slots.
+                    let dst = unsafe { self.ready_ring.add(usize::from(write)) };
+                    // SAFETY: dst is a writable ring slot of this set (`new`'s
+                    // contract); `&mut self` excludes another writer.
+                    unsafe { *dst = entry };
+                    write = self.ring_next(write);
                 }
                 read = self.ring_next(read);
             }
@@ -564,12 +583,13 @@ pub unsafe fn waitset_notify(ws_opaque: *mut u8, member_idx: u16)
     // Claim the head waiter for wake before releasing ws.lock; dealloc's
     // BlockedOnWaitSet unlink takes ws.lock and spins on wake_in_flight
     // (#160), cleared by enqueue_and_wake.
-    // SAFETY: ws.lock held; the popped waiter is a valid parked TCB.
-    let (waiter, target_cpu) = unsafe {
-        let waiter = ws.waiters.pop();
-        crate::ipc::claim_waiter(waiter, badge);
-        (waiter, crate::sched::select_target_cpu(waiter))
-    };
+    // SAFETY: ws.lock held.
+    let waiter = unsafe { ws.waiters.pop() };
+    // SAFETY: waiter is the valid parked TCB just removed from the queue under
+    // the held ws.lock.
+    unsafe { crate::ipc::claim_waiter(waiter, badge) };
+    // SAFETY: waiter is a valid TCB, pinned by the claim's wake_in_flight.
+    let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
 
     // SAFETY: paired with lock_raw above.
     unsafe { ws.lock.unlock_raw(saved) };
@@ -764,11 +784,16 @@ pub unsafe fn waitset_add(
     };
     // Snapshot the wake; enqueue_and_wake runs after unlock per
     // core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 5.
-    // SAFETY: ws.lock held; claim the head waiter for wake (#160).
-    let deferred_wake = wake.map(|badge| unsafe {
-        let waiter = ws.waiters.pop();
-        crate::ipc::claim_waiter(waiter, badge);
-        (waiter, crate::sched::select_target_cpu(waiter))
+    // Claim the head waiter for wake (#160).
+    let deferred_wake = wake.map(|badge| {
+        // SAFETY: ws.lock held.
+        let waiter = unsafe { ws.waiters.pop() };
+        // SAFETY: waiter is the valid parked TCB just removed from the queue
+        // under the held ws.lock.
+        unsafe { crate::ipc::claim_waiter(waiter, badge) };
+        // SAFETY: waiter is a valid TCB, pinned by the claim's wake_in_flight.
+        let target_cpu = unsafe { crate::sched::select_target_cpu(waiter) };
+        (waiter, target_cpu)
     });
 
     // SAFETY: paired with lock_raw above.
@@ -968,37 +993,64 @@ unsafe fn clear_source_backpointer(source_ptr: *mut u8, tag: WaitSetSourceTag)
         WaitSetSourceTag::Endpoint =>
         {
             let ep = source_ptr.cast::<crate::ipc::endpoint::EndpointState>();
-            // SAFETY: ep is valid; acquire its lock for the back-pointer write.
+            // SAFETY: ep is valid.
+            let lock = unsafe { &(*ep).lock };
+            // SAFETY: lock_raw paired with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access writes a wait-set back-pointer field of the endpoint, which \
+                          the held endpoint lock serialises"
+            )]
+            // SAFETY: ep is valid; its lock is held for the back-pointer write.
             unsafe {
-                let saved = (*ep).lock.lock_raw();
                 (*ep).wait_set = core::ptr::null_mut();
                 (*ep).wait_set_member_idx = 0;
-                (*ep).lock.unlock_raw(saved);
             }
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
         }
         WaitSetSourceTag::Notification =>
         {
             let sig = source_ptr.cast::<crate::ipc::notification::NotificationState>();
-            // SAFETY: sig is valid; acquire its lock for the back-pointer write.
+            // SAFETY: sig is valid.
+            let lock = unsafe { &(*sig).lock };
+            // SAFETY: lock_raw paired with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access is to a field of the notification, which the held \
+                          notification lock serialises"
+            )]
+            // SAFETY: sig is valid; its lock is held for the back-pointer write.
             unsafe {
-                let saved = (*sig).lock.lock_raw();
                 (*sig).wait_set = core::ptr::null_mut();
                 (*sig).wait_set_member_idx = 0;
                 // Keep has_observer set only while a waiter is still queued.
                 (*sig).refresh_observer();
-                (*sig).lock.unlock_raw(saved);
             }
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
         }
         WaitSetSourceTag::EventQueue =>
         {
             let eq = source_ptr.cast::<crate::ipc::event_queue::EventQueueState>();
-            // SAFETY: eq is valid; acquire its lock for the back-pointer write.
+            // SAFETY: eq is valid.
+            let lock = unsafe { &(*eq).lock };
+            // SAFETY: lock_raw paired with the unlock_raw below.
+            let saved = unsafe { lock.lock_raw() };
+            #[expect(
+                clippy::multiple_unsafe_ops_per_block,
+                reason = "every access writes a wait-set back-pointer field of the event queue, \
+                          which the held event-queue lock serialises"
+            )]
+            // SAFETY: eq is valid; its lock is held for the back-pointer write.
             unsafe {
-                let saved = (*eq).lock.lock_raw();
                 (*eq).wait_set = core::ptr::null_mut();
                 (*eq).wait_set_member_idx = 0;
-                (*eq).lock.unlock_raw(saved);
             }
+            // SAFETY: paired with the lock_raw above.
+            unsafe { lock.unlock_raw(saved) };
         }
     }
 }
@@ -1434,7 +1486,10 @@ mod tests
             while at != ws.ready_tail
             {
                 // SAFETY: at is a ring slot; the ring has `capacity + 1` slots.
-                let idx = usize::from(unsafe { *ws.ready_ring.add(usize::from(at)) });
+                let slot = unsafe { ws.ready_ring.add(usize::from(at)) };
+                // SAFETY: slot is an initialised ring slot of the set.
+                let idx = usize::from(unsafe { *slot });
+
                 in_ring[idx] += 1;
                 at = ws.ring_next(at);
             }

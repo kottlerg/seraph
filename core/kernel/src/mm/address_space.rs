@@ -66,20 +66,22 @@ use syscall::SyscallError;
 // Init stack page count is part of the init protocol ABI; the init VA layout
 // (info page + stack top) is the kernel's per-boot choice, not an ABI constant.
 pub use init_protocol::INIT_STACK_PAGES;
-use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW};
+use process_layout::{INIT_INFO_WINDOW, INIT_STACK_GUARD_WINDOW, STACK_GUARD_PAGES};
 
 /// Degraded-fallback base of the read-only `InitInfo` region mapped into init,
 /// used only when the entropy pool is unavailable at the layout draw. The
 /// region spans up to `INIT_INFO_MAX_PAGES` contiguous pages from this address,
-/// which end at the fallback stack's guard page. A fixed VA below the 256 GiB
-/// Sv39 user top, so the fallback is valid on both architectures; it bounds no
-/// count.
+/// which end at the lowest of the fallback stack's guard pages. A fixed VA below
+/// the 256 GiB Sv39 user top, so the fallback is valid on both architectures;
+/// it bounds no count.
 pub const DEFAULT_INIT_INFO_VA: u64 = DEFAULT_INIT_STACK_TOP
-    - (1 + INIT_STACK_PAGES as u64 + init_protocol::INIT_INFO_MAX_PAGES as u64) * PAGE_SIZE as u64;
+    - INIT_STACK_RESERVE
+    - init_protocol::INIT_INFO_MAX_PAGES as u64 * PAGE_SIZE as u64;
 
 /// Degraded-fallback top of init's user stack. `INIT_STACK_PAGES` pages map
-/// immediately below, with one unmapped guard page beneath them. A fixed VA
-/// below the 256 GiB Sv39 user top, like `DEFAULT_INIT_INFO_VA`.
+/// immediately below, with `STACK_GUARD_PAGES` unmapped guard pages beneath
+/// them. A fixed VA below the 256 GiB Sv39 user top, like
+/// `DEFAULT_INIT_INFO_VA`.
 pub const DEFAULT_INIT_STACK_TOP: u64 = 0x3F_FFFF_E000;
 
 /// Bootstrap virtual addresses the kernel chooses for the init process.
@@ -104,9 +106,12 @@ pub struct InitLayout
 static INIT_LAYOUT_INFO_VA: AtomicU64 = AtomicU64::new(0);
 static INIT_LAYOUT_STACK_TOP: AtomicU64 = AtomicU64::new(0);
 
-/// Bytes from init's stack guard page to its stack top: the guard and the
-/// `INIT_STACK_PAGES` stack pages above it.
-const INIT_STACK_RESERVE: u64 = (1 + INIT_STACK_PAGES as u64) * PAGE_SIZE as u64;
+/// Bytes from the lowest of init's stack guard pages to its stack top: the
+/// `STACK_GUARD_PAGES` guard pages, as below every other placed userspace
+/// stack (docs/build-system.md § Custom Targets gives the span they cover),
+/// and the `INIT_STACK_PAGES` stack pages above them.
+const INIT_STACK_RESERVE: u64 =
+    (STACK_GUARD_PAGES as u64 + INIT_STACK_PAGES as u64) * PAGE_SIZE as u64;
 
 // The highest guard's stack top stays below the layout ceiling, so the stack
 // top `init_layout_from_entropy` derives never saturates.
@@ -116,9 +121,9 @@ const _: () = assert!(
 
 /// Build init's layout from 16 bytes of entropy: the LE `u64` at `[0..8]`
 /// draws the `InitInfo` base from `INIT_INFO_WINDOW`, the one at `[8..16]`
-/// draws the stack guard page from `INIT_STACK_GUARD_WINDOW`, and the stack
-/// top sits `INIT_STACK_PAGES` mapped pages above the guard (the guard page
-/// itself stays unmapped below the stack base).
+/// draws the lowest stack guard page from `INIT_STACK_GUARD_WINDOW`, and the
+/// stack top sits `STACK_GUARD_PAGES` guard pages and `INIT_STACK_PAGES` mapped
+/// pages above it (the guard pages stay unmapped below the stack base).
 fn init_layout_from_entropy(entropy: [u8; 16]) -> InitLayout
 {
     let mut word = [0u8; 8];
@@ -2057,26 +2062,29 @@ mod init_layout_tests
 
             assert!(INIT_INFO_WINDOW.contains(layout.init_info_va));
             assert_eq!(layout.init_stack_top % page, 0);
-            let stack_reserve = (1 + INIT_STACK_PAGES as u64) * page;
+            // The lowest guard page is the window's draw, with
+            // STACK_GUARD_PAGES guard pages between it and the stack base.
+            let stack_reserve = (STACK_GUARD_PAGES as u64 + INIT_STACK_PAGES as u64) * page;
             let guard = layout.init_stack_top - stack_reserve;
             assert!(INIT_STACK_GUARD_WINDOW.contains(guard));
             assert!(layout.init_stack_top < LAYOUT_VA_CEILING);
 
             // InitInfo region (INIT_INFO_MAX_PAGES) vs stack reservation
-            // (guard + INIT_STACK_PAGES): disjoint for every draw.
+            // (the guard pages + INIT_STACK_PAGES): disjoint for every draw.
             let info_end = layout.init_info_va + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
             assert!(info_end <= guard);
         }
     }
 
     // Defect caught: a fallback InitInfo region that, at the protocol's page
-    // ceiling, runs into the fallback stack's guard page or down into the
+    // ceiling, runs into the fallback stack's guard pages or down into the
     // fixed image zone.
     #[test]
     fn fallback_info_region_fits_between_the_image_zone_and_the_stack_guard()
     {
         let page = PAGE_SIZE as u64;
-        let guard = DEFAULT_INIT_STACK_TOP - (1 + INIT_STACK_PAGES as u64) * page;
+        let guard =
+            DEFAULT_INIT_STACK_TOP - (STACK_GUARD_PAGES as u64 + INIT_STACK_PAGES as u64) * page;
         let info_end = DEFAULT_INIT_INFO_VA + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
         assert!(info_end <= guard);
         const { assert!(DEFAULT_INIT_INFO_VA >= process_layout::FIXED_IMAGE_ZONE_END) };

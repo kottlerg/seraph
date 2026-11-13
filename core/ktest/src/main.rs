@@ -70,7 +70,9 @@
 )]
 
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+use process_layout::STACK_GUARD_PAGES;
 
 mod arch;
 mod bench;
@@ -273,7 +275,31 @@ pub struct TestContext
     pub init_info_va: u64,
 }
 
-/// 16 KiB stack for a child thread, aligned per the System V ABI.
+/// One 4 KiB page of a [`GuardedStack`].
+#[repr(C, align(4096))]
+pub struct StackPage([u8; 4096]);
+
+/// ktest's own address-space cap, through which [`GuardedStack::top`] unmaps
+/// a stack's guard; stored by `run` before any test starts.
+static SELF_ASPACE: AtomicU64 = AtomicU64::new(0);
+
+/// A stack for a child thread: `PAGES` pages, page-aligned, with the
+/// `STACK_GUARD_PAGES` guard pages every userspace stack keeps below them
+/// (docs/build-system.md § Custom Targets gives the span they cover).
+///
+/// [`top`](Self::top) unmaps the guard pages on the stack's first use, so a
+/// frame that overflows the stack faults in the guard instead of writing the
+/// statics below it. Rust code never reads or writes the guard. The topmost
+/// 16 bytes of the last page hold the flag that records the unmap; the
+/// thread's stack is the [`BYTES`](Self::BYTES) below them.
+#[repr(C, align(4096))]
+pub struct GuardedStack<const PAGES: usize>
+{
+    guard: [StackPage; STACK_GUARD_PAGES as usize],
+    stack: [StackPage; PAGES],
+}
+
+/// 16 KiB stack for a child thread, above its guard pages ([`GuardedStack`]).
 ///
 /// A test fixture: the size bounds only the call depth of ktest's own child
 /// entry points, not any capacity of the system under test.
@@ -293,30 +319,62 @@ pub struct TestContext
 /// or, for a thread it creates directly, by its own cleanup on every path. So
 /// the rule holds across test boundaries whether the earlier test passed or
 /// failed.
-#[expect(
-    dead_code,
-    reason = "the field is CPU stack memory; only the hardware stack pointer accesses it, not Rust \
-              code"
-)]
-#[repr(align(16))]
-pub struct ChildStack([u8; ChildStack::BYTES]);
+pub type ChildStack = GuardedStack<4>;
 
-impl ChildStack
+impl<const PAGES: usize> GuardedStack<PAGES>
 {
-    /// Size of one stack.
-    pub const BYTES: usize = 16384;
+    /// Bytes of the stack a thread runs on: every page above the guard but
+    /// the 16 bytes at the top that hold the unmap flag.
+    pub const BYTES: usize = PAGES * 4096 - 16;
 
-    pub const ZERO: ChildStack = ChildStack([0u8; ChildStack::BYTES]);
+    pub const ZERO: Self = Self {
+        guard: [const { StackPage([0; 4096]) }; STACK_GUARD_PAGES as usize],
+        stack: [const { StackPage([0; 4096]) }; PAGES],
+    };
 
-    /// Virtual address of the top of the stack at `ptr` (one past the last byte).
+    /// The flag at the top of the stack at `ptr` that records its guard's
+    /// unmap; its address is the stack top.
+    fn guard_unmapped<'a>(ptr: *const Self) -> &'a AtomicBool
+    {
+        let flag = ptr.wrapping_add(1).cast::<u8>().wrapping_sub(16);
+        // SAFETY: `flag` lies in the stack's last page, 16 bytes below its
+        // end, inside the static `ptr` points to, which lives for the boot. No
+        // thread's stack reaches it (a thread runs below it), so only this
+        // atomic accesses the byte, and a zero byte is a valid `false`.
+        unsafe { &*flag.cast::<AtomicBool>() }
+    }
+
+    /// Virtual address of the top of the stack at `ptr`, the value to pass as
+    /// the initial stack pointer (the stack grows downward). Takes a raw
+    /// pointer to avoid creating a reference to a `static mut`: pass
+    /// `core::ptr::addr_of!(STACK)` as the argument.
     ///
-    /// Thread stacks grow downward; this is the value to pass as the initial
-    /// stack pointer. Takes a raw pointer to avoid creating a reference to a
-    /// `static mut` — pass `core::ptr::addr_of!(STACK)` as the argument.
+    /// The first call for a stack unmaps its guard pages. A failed unmap is
+    /// fatal to the run: it logs and halts, so no test runs on a stack
+    /// without its guard.
     #[must_use]
     pub fn top(ptr: *const Self) -> u64
     {
-        ptr.wrapping_add(1) as u64
+        let flag = Self::guard_unmapped(ptr);
+        if !flag.swap(true, Ordering::AcqRel)
+        {
+            // SAFETY: the guard pages are the first `STACK_GUARD_PAGES`
+            // page-aligned pages of the static at `ptr`, which no Rust code
+            // reads or writes, so no live object or IPC page lies in the span.
+            let unmapped = unsafe {
+                syscall::mem_unmap(
+                    SELF_ASPACE.load(Ordering::Acquire),
+                    ptr as u64,
+                    u64::from(STACK_GUARD_PAGES),
+                )
+            };
+            if unmapped.is_err()
+            {
+                log("ktest: FATAL: cannot unmap a child stack's guard");
+                halt();
+            }
+        }
+        core::ptr::from_ref(flag) as u64
     }
 
     /// [`top`](Self::top) of element `index` of the stack array at `stacks`
@@ -340,21 +398,23 @@ impl ChildStack
     /// to the lowest non-zero byte, or 0 when none is. A stack slot that
     /// still holds zero reads as unused, so the count is a lower bound that
     /// can fall short of the true depth by at most the zero bytes below the
-    /// lowest written one. A count of [`Self::BYTES`] means a thread may
-    /// also have written below the stack, into the statics there. Takes a
-    /// raw pointer for the reason [`top`](Self::top) does.
+    /// lowest written one. Takes a raw pointer for the reason
+    /// [`top`](Self::top) does.
     ///
     /// # Safety
     ///
-    /// `ptr` points to a `ChildStack` that was zero at the boot's start
+    /// `ptr` points to a stack that was zero at the boot's start
     /// ([`ZERO`](Self::ZERO)), and no thread runs on it during the call:
     /// every thread that ran on it has exited or been deleted.
     #[must_use]
     pub unsafe fn used_bytes(ptr: *const Self) -> usize
     {
-        let base = ptr.cast::<u8>();
+        // SAFETY: `ptr` points to a live stack (the caller's contract); the
+        // projection only computes the field's address.
+        let base = unsafe { core::ptr::addr_of!((*ptr).stack) }.cast::<u8>();
         let lowest = (0..Self::BYTES).find(|&i| {
-            // SAFETY: i is below `BYTES`, so the byte lies inside the stack.
+            // SAFETY: i is below `BYTES`, so the byte lies inside the stack,
+            // above the guard.
             let byte = unsafe { base.add(i) };
             // SAFETY: `byte` is inside the stack, and the caller's contract
             // leaves no thread writing it.
@@ -599,6 +659,7 @@ extern "C" fn run(info_ptr: u64) -> !
     log("ktest: starting");
 
     let aspace_cap = info.aspace_cap;
+    SELF_ASPACE.store(aspace_cap, Ordering::Release);
 
     // Register the IPC buffer before any IPC syscall. All Tier 1 IPC tests
     // and integration tests depend on this.

@@ -44,6 +44,11 @@ use syscall::SyscallError;
 /// # Safety
 /// `target` must be a valid TCB the caller pins (its capability lookup); the
 /// caller holds no lock, in syscall context.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`any_instruction` is data: the `UPCALL_ANY_INSTRUCTION` bit of the caller's flags, \
+              which the pending upcall records in `upcall_any_instruction`"
+)]
 #[cfg(not(test))]
 pub unsafe fn post(
     target: *mut ThreadControlBlock,
@@ -191,6 +196,10 @@ unsafe fn running_cpu(tcb: *mut ThreadControlBlock) -> Option<usize>
 ///
 /// # Safety
 /// `tcb` must be the calling thread's TCB; no lock is held.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`masked` is data: the upcall mask the function stores in `upcall_masked`"
+)]
 #[cfg(not(test))]
 pub unsafe fn set_mask(tcb: *mut ThreadControlBlock, masked: bool) -> bool
 {

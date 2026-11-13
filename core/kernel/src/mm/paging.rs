@@ -871,6 +871,15 @@ pub fn init_kernel_page_tables(_info: &BootInfo) -> Result<(), BootTableError>
     clippy::similar_names,
     reason = "root_va/root_pa and other va/pa pairs are VA/PA of the same frame"
 )]
+#[cfg_attr(
+    target_arch = "x86_64",
+    expect(
+        clippy::large_stack_frames,
+        reason = "`mmio_slots`, `MMIO_DIRECT_MAP_REGIONS` (129) address and size pairs, 2064 B, \
+                  with the x86-64 table-building locals; Phase 3, on the 64 KiB boot handoff \
+                  stack. The riscv64 build stays under the threshold"
+    )
+)]
 pub fn init_kernel_page_tables(info: &BootInfo) -> Result<(), BootTableError>
 {
     // Enable NX on x86-64 before we install tables with NX entries; a no-op

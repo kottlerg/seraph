@@ -34,7 +34,8 @@ In scope:
 - `core/kernel/src/ipc/{mod,endpoint,notification,event_queue,wait_set}.rs`
 - `core/kernel/src/syscall/{thread,ipc}.rs`
 - `core/kernel/src/syscall/mod.rs` (`sys_thread_sleep`)
-- `core/kernel/src/cap/object.rs` (`dealloc_object_one` IPC-object and Thread arms)
+- `core/kernel/src/cap/object.rs` (`dealloc_object_one` IPC-object arms, and `dealloc_thread` for
+  its Thread arm)
 - `core/kernel/src/arch/{x86_64,riscv64}/{interrupts,timer,context,cpu}.rs`
 - `core/kernel/src/arch/x86_64/{gdt,ap_trampoline}.rs` (per-CPU storage and AP start; riscv64 uses
   `tp` and SBI HSM in `core/kernel/src/arch/riscv64/ap_trampoline.rs`)

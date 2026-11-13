@@ -1026,7 +1026,10 @@ unsafe fn timeout_may_cancel(
         {
             live == popped && live_seq == popped_seq
         }
-        _ => false,
+        IpcThreadState::None
+        | IpcThreadState::BlockedOnFault
+        | IpcThreadState::BlockedOnNotification
+        | IpcThreadState::BlockedOnEventQueue => false,
     }
 }
 
@@ -2640,9 +2643,12 @@ unsafe fn set_affinity_locked(
             crate::sched::set_reschedule_pending_for(old_cpu);
             Some(old_cpu)
         }
-        // Blocked / Stopped / Created / Exited: next enqueue routes via
-        // select_target_cpu, which reads the new affinity under sched_lock.
-        _ => None,
+        // The next enqueue routes via select_target_cpu, which reads the new
+        // affinity under sched_lock.
+        ThreadState::Created
+        | ThreadState::Blocked
+        | ThreadState::Stopped
+        | ThreadState::Exited => None,
     }
 }
 
@@ -2776,6 +2782,12 @@ fn thread_mem_args(tf: UserFrame) -> Result<(u64, u64, usize), SyscallError>
 /// [`RestartableError::Faulted`] copy to the buffer, which re-executes the
 /// whole call on the caller's resume.
 #[cfg(not(test))]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "`bounce`, the `MAX_THREAD_MEM_COPY` (4 KiB) staging buffer, on the 16 KiB kernel \
+              stack of the calling thread, whose measured peak at `KERNEL_STACK_PAGES` includes \
+              it"
+)]
 pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 {
     use crate::mm::address_space::UserCopy;
@@ -2823,6 +2835,12 @@ pub fn sys_thread_read_mem(tf: UserFrame) -> Result<u64, RestartableError>
 /// [`RestartableError::Faulted`] copy from the buffer, which re-executes the
 /// whole call on the caller's resume.
 #[cfg(not(test))]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "`bounce`, the `MAX_THREAD_MEM_COPY` (4 KiB) staging buffer, on the 16 KiB kernel \
+              stack of the calling thread, whose measured peak at `KERNEL_STACK_PAGES` includes \
+              it"
+)]
 pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
 {
     use crate::mm::address_space::{TextWrite, UserCopy};

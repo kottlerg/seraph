@@ -11,7 +11,7 @@
 //!
 //! 1. Enable SMEP + SMAP (fatal if CPU lacks support).
 //!    1a. Enable XSAVE and set CR0.TS for lazy FPU/SIMD restore.
-//! 2. Carve IST stacks (2 × 8 KiB) out of the [`BSP_IST_STACKS`] BSS array.
+//! 2. Carve IST stacks (2 × [`IST_STACK_SIZE`]) out of the [`BSP_IST_STACKS`] BSS array.
 //! 3. Load GDT + TSS with the IST stack pointers.
 //! 4. Load IDT.
 //!    4a. Switch to x2APIC mode when CPUID.01H:ECX[21] advertises it.
@@ -98,13 +98,15 @@ const APIC_LVT_PERF: usize = 0x340;
 /// Bit to mask an LVT entry (prevent delivery).
 const LVT_MASK: u32 = 1 << 16;
 
-/// IST stack size: 8 KiB. The stacks carry the NMI path (the watchdog backtrace in
-/// `idt::ipi_nmi_backtrace_handler`, or a hardware NMI's fatal diagnostics) on IST2 and the
-/// `#DF` / `#MC` fatal path on IST1. A static call-graph bound of those paths (frame sizes
-/// from the disassembly, every indirect formatting call taken as its deepest candidate)
-/// stays under 3.7 KiB in both the debug and the release build, so 8 KiB holds them with
-/// more than twice that depth to spare.
-const IST_STACK_SIZE: usize = 8192;
+/// IST stack size: one kernel stack, [`crate::sched::KERNEL_STACK_PAGES`] pages (16 KiB), so
+/// no stack the kernel's code runs on is smaller than a thread's, the size the
+/// `large_stack_frames` threshold of `core/kernel/clippy.toml` derives from. The stacks carry
+/// the NMI path (the watchdog backtrace in `idt::ipi_nmi_backtrace_handler`, or a hardware
+/// NMI's fatal diagnostics) on IST2 and the `#DF` / `#MC` fatal path on IST1. A static
+/// call-graph bound of those paths (frame sizes from the disassembly, every indirect formatting
+/// call taken as its deepest candidate) stays under 3.7 KiB in both the debug and the release
+/// build, a quarter of the stack.
+pub(super) const IST_STACK_SIZE: usize = crate::sched::KERNEL_STACK_PAGES * crate::mm::PAGE_SIZE;
 
 /// BSP IST stacks, in BSS. The BSP installs these at Phase-5 init.
 ///

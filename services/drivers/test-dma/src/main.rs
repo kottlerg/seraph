@@ -739,7 +739,7 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
             bytes,
             ..
         } => Some((cap, bytes.div_ceil(PAGE_SIZE))),
-        _ => None,
+        Resource::Mmio { .. } | Resource::IoPort { .. } | Resource::Interrupt { .. } => None,
     });
     let (cap, pages) = bar?;
     let irq = list.resources().iter().find_map(|r| match *r
@@ -747,7 +747,7 @@ fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIr
         Resource::Interrupt {
             cap, kind, mode, ..
         } => Some((cap, kind, mode)),
-        _ => None,
+        Resource::Mmio { .. } | Resource::IoPort { .. } => None,
     });
     (eps.dma != 0 && eps.service != 0).then_some((cap, pages, irq, eps))
 }

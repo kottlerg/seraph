@@ -70,7 +70,7 @@ fn role_bar_bytes(list: &ResourceList) -> Option<u64>
             bytes,
             ..
         } => Some(bytes),
-        _ => None,
+        Resource::Mmio { .. } | Resource::IoPort { .. } | Resource::Interrupt { .. } => None,
     })
 }
 

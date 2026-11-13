@@ -63,9 +63,10 @@ pub fn poll_until(
 
 /// `addr` as the `(low, high)` 32-bit halves a common-configuration register
 /// pair takes a 64-bit device address in (`VirtIO` 1.2 §4.1.4.3).
-// cast_possible_truncation: keeping the low half is the point, and the shift
-// leaves the high half at 32 bits.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "keeping the low half is the point, and the shift leaves the high half at 32 bits"
+)]
 #[must_use]
 pub fn split_address(addr: u64) -> (u32, u32)
 {
@@ -375,8 +376,6 @@ impl PciTransport
         // aligned, since RegisterLayout holds the region's offset and the
         // multiplier 2-aligned (structure_usable) and the window maps the BAR
         // page-aligned.
-        // cast_ptr_alignment: the doorbell is u16-aligned, as stated above.
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_volatile(addr, queue_idx);
         }
@@ -407,8 +406,6 @@ impl PciTransport
         {
             return None;
         }
-        // cast_ptr_alignment: addr is checked 4-byte aligned above.
-        #[allow(clippy::cast_ptr_alignment)]
         // SAFETY: the four bytes lie inside the device cfg region (checked
         // above), which is within its BAR's mapping, and addr is 4-byte
         // aligned (checked above).
@@ -464,10 +461,12 @@ impl PciTransport
 
         let driver_features = negotiate(device_features);
 
-        // cast_possible_truncation: the two `driver_feature_select` values take
-        // the low and the high 32 feature bits, so keeping the low half is the
-        // point, and the shift leaves the high half at 32 bits.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the two `driver_feature_select` values take the low and the high 32 feature \
+                      bits, so keeping the low half is the point, and the shift leaves the high \
+                      half at 32 bits"
+        )]
         {
             self.write_driver_features(0, driver_features as u32);
             self.write_driver_features(1, (driver_features >> 32) as u32);
@@ -494,12 +493,7 @@ impl PciTransport
         // (RegisterLayout), past every register this file addresses in it;
         // each register sits at a multiple of its width from the region's
         // start, which RegisterLayout holds 4-aligned (structure_usable).
-        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
-        // the BAR page-aligned.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            core::ptr::read_volatile(addr as *const u16)
-        }
+        unsafe { core::ptr::read_volatile(addr as *const u16) }
     }
 
     fn write_common_u16(&self, offset: u32, val: u16)
@@ -509,9 +503,6 @@ impl PciTransport
         // (RegisterLayout), past every register this file addresses in it;
         // each register sits at a multiple of its width from the region's
         // start, which RegisterLayout holds 4-aligned (structure_usable).
-        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
-        // the BAR page-aligned.
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_volatile(addr as *mut u16, val);
         }
@@ -525,12 +516,7 @@ impl PciTransport
         // (RegisterLayout), past every register this file addresses in it;
         // each register sits at a multiple of its width from the region's
         // start, which RegisterLayout holds 4-aligned (structure_usable).
-        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
-        // the BAR page-aligned.
-        #[allow(clippy::cast_ptr_alignment)]
-        unsafe {
-            core::ptr::read_volatile(addr as *const u32)
-        }
+        unsafe { core::ptr::read_volatile(addr as *const u32) }
     }
 
     fn write_common_u32(&self, offset: u32, val: u32)
@@ -540,9 +526,6 @@ impl PciTransport
         // (RegisterLayout), past every register this file addresses in it;
         // each register sits at a multiple of its width from the region's
         // start, which RegisterLayout holds 4-aligned (structure_usable).
-        // cast_ptr_alignment: as the SAFETY comment says, and the window maps
-        // the BAR page-aligned.
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             core::ptr::write_volatile(addr as *mut u32, val);
         }

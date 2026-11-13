@@ -34,12 +34,13 @@
 //! `do_reap` tears init's objects down in the order
 //! `docs/process-lifecycle.md` § Init reap specifies.
 
-// procmgr's request workers and its reaper share this state behind the
-// `STATE` lock (its crash decliner never reaches it). `expect` on `.lock()`
-// cannot fire: procmgr is built with `panic = "abort"`, so no holder unwinds
-// and the lock is never poisoned. A Vec inside the state avoids any unsafe
-// statics.
-#![allow(clippy::expect_used)]
+#![expect(
+    clippy::expect_used,
+    reason = "procmgr's request workers and its reaper share this state behind the `STATE` lock \
+              (its crash decliner never reaches it). `expect` on `.lock()` cannot fire: procmgr is \
+              built with `panic = \"abort\"`, so no holder unwinds and the lock is never poisoned. \
+              A Vec inside the state avoids any unsafe statics"
+)]
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

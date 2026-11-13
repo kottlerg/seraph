@@ -55,10 +55,12 @@ pub enum EntryKind
     Text,
     /// A log record from `STREAM_RECORD`: the entry's bytes are its payload
     /// (`ipc::log_record`), and these spans into them its field table.
-    // The field table is the stored form a reader selecting by a key's value
-    // reads (ipc-interface.md § History); `QUERY_HISTORY` sends the payload,
-    // which its client decodes, so nothing in logd reads the spans yet.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "the field table is the stored form a reader selecting by a key's value reads \
+                  (ipc-interface.md § History); `QUERY_HISTORY` sends the payload, which its \
+                  client decodes, so nothing in logd reads the spans yet"
+    )]
     Record
     {
         /// The message text.

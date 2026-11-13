@@ -187,9 +187,11 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
 }
 
 /// What a boot module's content is.
-// large_enum_variant: one value lives at a time, on the stack, for one module;
-// boxing the declaration would add an allocation that cannot fail softly.
-#[allow(clippy::large_enum_variant)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one value lives at a time, on the stack, for one module; boxing the declaration \
+              would add an allocation that cannot fail softly"
+)]
 enum Classified
 {
     Driver(DriverDecl),

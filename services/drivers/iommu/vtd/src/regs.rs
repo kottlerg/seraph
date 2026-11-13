@@ -134,12 +134,9 @@ pub struct Capability
 impl Capability
 {
     /// Decode a `CAP` value.
-    // cast_possible_truncation: every field is masked to at most 10 bits
-    // before its cast, so each value fits its target type (and `usize` is
-    // 64-bit on every target the driver builds for). The masks also keep
-    // every sum and product far from its type's bound, so no saturating
-    // operation below saturates.
-    #[allow(clippy::cast_possible_truncation)]
+    // Every field is masked to at most 10 bits before its cast, so each value
+    // fits its target type, and the masks keep every sum and product far from
+    // its type's bound, so no saturating operation below saturates.
     #[must_use]
     pub const fn decode(cap: u64) -> Self
     {

@@ -22,6 +22,8 @@
 //! past its death, since devmgr spawns it `CREATE_DMA_HOLD` and never
 //! releases the hold.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use iommu_core::table::{TABLE_WORDS, TableStore};
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use std::os::seraph::reserve_pages;

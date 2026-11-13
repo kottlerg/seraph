@@ -380,16 +380,24 @@ pub const fn call_episode(park_seq: u32) -> u32
 #[inline]
 pub unsafe fn stamp_park_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
 {
-    // SAFETY: tcb valid per caller contract; the exclusive claim makes these
-    // the episode's only deposit-side writes.
+    #[cfg(debug_assertions)]
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both accesses are to atomic fields of `tcb`, valid by the caller's contract"
+    )]
+    // SAFETY: tcb valid per caller contract; the exclusive claim makes this
+    // the episode's only deposit-side episode write.
     unsafe {
-        #[cfg(debug_assertions)]
         (*tcb).deposit_episode.store(
             (*tcb)
                 .park_episode
                 .load(core::sync::atomic::Ordering::Relaxed),
             core::sync::atomic::Ordering::Relaxed,
         );
+    }
+    // SAFETY: tcb valid per caller contract; the exclusive claim makes this
+    // the episode's only disposition write.
+    unsafe {
         (*tcb)
             .park_disposition
             .store(disposition, core::sync::atomic::Ordering::Release);
@@ -405,6 +413,10 @@ pub unsafe fn stamp_park_deposit(tcb: *mut ThreadControlBlock, disposition: u8)
 pub unsafe fn stamp_deposit_episode(tcb: *mut ThreadControlBlock)
 {
     #[cfg(debug_assertions)]
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "both accesses are to atomic fields of `tcb`, valid by the caller's contract"
+    )]
     // SAFETY: tcb valid per caller contract.
     unsafe {
         (*tcb).deposit_episode.store(
@@ -479,19 +491,24 @@ impl ParkKind
 #[inline]
 pub unsafe fn stamp_cancelled_deposit(tcb: *mut ThreadControlBlock, kind: ParkKind)
 {
-    // SAFETY: tcb valid and claim won per caller contract.
-    unsafe {
-        match kind
+    match kind
+    {
+        ParkKind::Fault =>
         {
-            ParkKind::Fault =>
-            {
+            // SAFETY: tcb valid and claim won per caller contract.
+            unsafe {
                 (*tcb).fault_outcome.store(
                     crate::ipc::fault::FAULT_OUTCOME_KILL,
                     core::sync::atomic::Ordering::Release,
                 );
-                stamp_deposit_episode(tcb);
             }
-            ParkKind::Call => stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED),
+            // SAFETY: the caller's exclusive-claim contract is this callee's.
+            unsafe { stamp_deposit_episode(tcb) };
+        }
+        ParkKind::Call =>
+        {
+            // SAFETY: the caller's exclusive-claim contract is this callee's.
+            unsafe { stamp_park_deposit(tcb, PARK_DISPOSITION_INTERRUPTED) }
         }
     }
 }
@@ -1233,8 +1250,13 @@ mod tests
     fn walk(first: *mut DeathObserver) -> Vec<u64>
     {
         let mut seen = Vec::new();
-        // SAFETY: every node is a live local of the calling test.
-        unsafe { for_each_observer(first, |n| seen.push((*n).correlator)) };
+        let record = |n: *mut DeathObserver| {
+            // SAFETY: every node is a live local of the calling test.
+            seen.push(unsafe { (*n).correlator });
+        };
+        // SAFETY: every node is a live local of the calling test, and the
+        // callback only reads.
+        unsafe { for_each_observer(first, record) };
         seen
     }
 
@@ -1272,15 +1294,15 @@ mod tests
 
         let mut free: *mut DeathObserver = core::ptr::null_mut();
         let mut visited = 0;
+        let relink = |n: *mut DeathObserver| {
+            // SAFETY: n is a live local node the walk hands over.
+            unsafe { (*n).next = free };
+            free = n;
+            visited += 1;
+        };
         // SAFETY: the nodes are live locals; the callback relinks only the
         // node it is given.
-        unsafe {
-            for_each_observer(first, |n| {
-                (*n).next = free;
-                free = n;
-                visited += 1;
-            });
-        }
+        unsafe { for_each_observer(first, relink) };
         assert_eq!(visited, 3);
         assert_eq!(walk(free), [10, 20, 30]);
     }

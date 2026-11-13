@@ -28,6 +28,8 @@
 //! drivers. Diagnostics are dropped; fatal bootstrap failures `thread_exit`
 //! silently.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod arch;
 
 use driver_binding::resources::{self, PlatformDelivery};
@@ -240,8 +242,10 @@ fn main() -> !
 {
     let info = startup_info();
 
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // logd writes every log line through this driver, so a debug-authority

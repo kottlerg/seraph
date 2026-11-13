@@ -21,6 +21,7 @@
 //! [coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants)).
 
 #![cfg_attr(not(test), no_std)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use ipc::bootstrap::{PackedSlots, SlotAccumulator, slot_round_count, slot_rounds};
 use syscall_abi::MSG_CAP_SLOTS_MAX;

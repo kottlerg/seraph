@@ -15,6 +15,8 @@
 //! partition registration (`REGISTER_PARTITION`), and the device geometry
 //! (`BLK_GET_GEOMETRY`) over IPC.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod io;
 
 use ipc::{IpcMessage, blk_labels, devmgr_labels, memmgr_errors, memmgr_labels};
@@ -78,8 +80,10 @@ driver_binding::driver_declaration!(driver_binding::decl::Declaration {
 const QUEUE_SIZE: u16 = 4;
 
 /// [`PAGE_SIZE`] as a `usize`, for the byte count of a one-page fill.
-// cast_possible_truncation: PAGE_SIZE is 4096, which every `usize` holds.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "PAGE_SIZE is 4096, which every `usize` holds"
+)]
 const PAGE_BYTES: usize = PAGE_SIZE as usize;
 
 // ── Driver caps from bootstrap protocol ────────────────────────────────────
@@ -1116,8 +1120,10 @@ fn main() -> !
     // IPC buffer was registered by `std::os::seraph::_start`; no need to
     // re-register. `info.ipc_buffer` is page-aligned by the boot protocol,
     // so reinterpreting as `*mut u64` satisfies alignment.
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned, stricter than u64.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // Bootstrap caps from devmgr. log + procmgr + stdio are wired by

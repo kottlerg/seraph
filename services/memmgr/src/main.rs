@@ -13,8 +13,11 @@
 
 #![no_std]
 #![no_main]
-// cast_possible_truncation: targets 64-bit only; u64/usize conversions lossless.
-#![allow(clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "targets 64-bit only; u64/usize conversions lossless"
+)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 
 use free_pool::{
     ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
@@ -274,9 +277,11 @@ static mut LEDGER: MemLedger = Ledger::new(
 /// page-table funding. Set once at boot.
 static mut SELF_ASPACE: u64 = 0;
 
-// static_mut_refs: `LEDGER` is reached only through this accessor, and memmgr
-// is single-threaded, so the one `&mut` each handler takes is never aliased.
-#[allow(static_mut_refs)]
+#[expect(
+    static_mut_refs,
+    reason = "`LEDGER` is reached only through this accessor, and memmgr is single-threaded, so \
+              the one `&mut` each handler takes is never aliased"
+)]
 fn ledger_mut() -> &'static mut MemLedger
 {
     // SAFETY: single-threaded service; each handler holds the only reference
@@ -850,7 +855,6 @@ fn bootstrap_from_init(
     }
     // phys_table_va is mapped RO, one page, page-aligned (4 KiB), so
     // u64 alignment is satisfied.
-    #[allow(clippy::cast_ptr_alignment)]
     let phys_ptr = phys_table_va as *const u64;
 
     // Read the in-use bootstrap arenas from the phys-table page's in-use
@@ -2124,8 +2128,10 @@ fn main(startup: &StartupInfo) -> !
         syscall::thread_exit();
     }
 
-    // IPC buffer is page-aligned and registered.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "IPC buffer is page-aligned and registered"
+    )]
     let ipc_buf = startup.ipc_buffer.cast::<u64>();
 
     let Some(boot) = bootstrap_from_init(startup.creator_endpoint, startup.self_aspace, ipc_buf)

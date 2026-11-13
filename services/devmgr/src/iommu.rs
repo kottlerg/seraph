@@ -74,11 +74,15 @@ use crate::{arch, caps, pci, settle, spawn};
 /// The IOMMU family an architecture's platforms carry, which decides the
 /// firmware table devmgr discovers the units in and the driver module it
 /// spawns over them (`arch::current::IOMMU_FAMILY`).
-// dead_code: each architecture's build constructs only its own family
-// (`arch::current::IOMMU_FAMILY`), so the other variant is never constructed
-// there; both stay, since devmgr's discovery handles each family on either
-// build.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "riscv64",
+    expect(
+        dead_code,
+        reason = "the riscv64 build never constructs `Vtd`, its family being `Riscv` \
+                  (`arch::current::IOMMU_FAMILY`); the variant stays, since devmgr's discovery \
+                  handles each family on either build"
+    )
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Family
 {
@@ -427,9 +431,11 @@ fn drain(ep: u64)
         return;
     }
     let reply = IpcMessage::new(iommu_errors::HARDWARE_TIMEOUT);
-    // infinite_loop: the thread returns early when it has no IPC buffer, so
-    // `drain` cannot be `-> !`; the drain loop itself never ends.
-    #[expect(clippy::infinite_loop)]
+    #[expect(
+        clippy::infinite_loop,
+        reason = "the thread returns early when it has no IPC buffer, so `drain` cannot be `-> !`; \
+                  the drain loop itself never ends"
+    )]
     loop
     {
         // SAFETY: ipc_buf is this thread's registered IPC buffer.
@@ -1099,9 +1105,11 @@ fn riscv_round(
 /// pools, from init's bootstrap, against which each device's reserved regions
 /// are checked; `None` when the set is not known in full, which refuses every
 /// device with a reserved region.
-// too_many_arguments: the IOMMU pass takes the boot modules, the pooled
-// extents, and every table a settle batch records into.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the IOMMU pass takes the boot modules, the pooled extents, and every table a settle \
+              batch records into"
+)]
 pub fn bring_up(
     devices: &[pci::PciDevice],
     modules: &mut Vec<(DriverDecl, u64)>,
@@ -1411,10 +1419,11 @@ enum Settled
 /// the guard `module.1` holds, at `tier`, over `rounds` with the client's
 /// endpoint as its service endpoint, in a settle batch of its own, its death
 /// watched on `death_eq` as well as devmgr's death queue, and settle it.
-// too_many_arguments: the spawn and its settle consume the declaration, the
-// client, the death watch, the batch's death queue, the catalog, and the
-// registry.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the spawn and its settle consume the declaration, the client, the death watch, the \
+              batch's death queue, the catalog, and the registry"
+)]
 fn spawn_and_settle(
     caps: &caps::DevmgrCaps,
     decl: &DriverDecl,

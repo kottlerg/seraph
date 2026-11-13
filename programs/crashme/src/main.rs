@@ -23,6 +23,8 @@
 //! what procmgr does with a debugger's binding. See
 //! programs/crashme/README.md.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 mod arch;
 
 use std::sync::mpsc;

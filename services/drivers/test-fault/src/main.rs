@@ -28,6 +28,8 @@
 //!
 //! svctest watches the held memory return to memmgr in both fault cases.
 
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+
 use driver_binding::decl::{Declaration, Interrupt, Match, Reset, Tier};
 use driver_binding::resources::{Resource, ResourceList};
 use ipc::{IpcMessage, test_fault_labels};
@@ -75,8 +77,10 @@ fn main() -> !
 {
     std::os::seraph::log::register_name(b"test-fault");
     let info = startup_info();
-    // cast_ptr_alignment: IPC buffer page is 4 KiB-aligned.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "the IPC buffer page is 4 KiB-aligned"
+    )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
     let creator = info.creator_endpoint;
     if creator == 0

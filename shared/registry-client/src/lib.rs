@@ -102,6 +102,12 @@ pub fn registry_cap() -> u64
 /// `ipc_buf` must point at the registered IPC buffer page for this
 /// thread.
 #[must_use]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copies, one per \
+              name word; on its caller's stack, 32 KiB at the smallest (a std process's main \
+              thread)"
+)]
 pub unsafe fn lookup(name: &[u8], ipc_buf: *mut u64) -> Option<u64>
 {
     let registry = REGISTRY_CAP.load(Ordering::Acquire);

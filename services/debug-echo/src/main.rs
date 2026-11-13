@@ -30,6 +30,7 @@
     )
 )]
 
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use gdb_rsp::command::Command;
@@ -83,7 +84,14 @@ fn main()
     };
     let rx_notify = register_rx_notify(port, ipc_buf);
     std::os::seraph::log!("{READY_MARKER}");
-    serve(port, rx_notify, ipc_buf);
+    // The guard, a temporary of this statement, lives as long as `serve`,
+    // which never returns.
+    serve(
+        &mut BUFFERS.lock().unwrap_or_else(PoisonError::into_inner),
+        port,
+        rx_notify,
+        ipc_buf,
+    );
 }
 
 /// Pull the bootstrap round; slot 0 is the recipe's
@@ -198,23 +206,41 @@ fn write(port: u64, bytes: &[u8], ipc_buf: *mut u64)
     }
 }
 
-/// The fixture's connection state: the reader, the acknowledgement mode, and
-/// the last reply, which a `-` asks for again.
-struct Session
+/// The fixture's packet buffers: the reader's, the last reply, which a `-`
+/// asks for again, the reply being built, and an echo query's unescaped data.
+struct Buffers
 {
     reader: PacketReader<PACKET_SIZE>,
-    acks: AckMode,
     last: [u8; PACKET_SIZE],
+    reply: [u8; PACKET_SIZE],
+    data: [u8; PACKET_SIZE],
+}
+
+/// The packet buffers, 16 KiB, in the image rather than on the 32 KiB
+/// main-thread stack the serve loop runs on. The serve loop holds the lock
+/// for the process's life; nothing else takes it.
+static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
+    reader: PacketReader::new(),
+    last: [0; PACKET_SIZE],
+    reply: [0; PACKET_SIZE],
+    data: [0; PACKET_SIZE],
+});
+
+/// The fixture's connection state: its buffers, the acknowledgement mode, and
+/// the length of the last reply.
+struct Session<'a>
+{
+    buffers: &'a mut Buffers,
+    acks: AckMode,
     last_len: usize,
 }
 
-/// Serve packets on the port forever.
-fn serve(port: u64, rx_notify: u64, ipc_buf: *mut u64) -> !
+/// Serve packets on the port forever, with the packet buffers `buffers`.
+fn serve(buffers: &mut Buffers, port: u64, rx_notify: u64, ipc_buf: *mut u64) -> !
 {
     let mut session = Session {
-        reader: PacketReader::new(),
+        buffers,
         acks: AckMode::default(),
-        last: [0; PACKET_SIZE],
         last_len: 0,
     };
     let mut buf = [0u8; MAX_MESSAGE_BYTES];
@@ -240,14 +266,19 @@ fn serve(port: u64, rx_notify: u64, ipc_buf: *mut u64) -> !
     }
 }
 
-impl Session
+impl Session<'_>
 {
     /// Take one received byte; acknowledge and answer what it completes.
     fn take(&mut self, byte: u8, port: u64, ipc_buf: *mut u64)
     {
-        let mut reply = [0u8; PACKET_SIZE];
+        let Buffers {
+            reader,
+            last,
+            reply,
+            data,
+        } = &mut *self.buffers;
         let (ack, answer) = {
-            let Some(event) = self.reader.push(byte)
+            let Some(event) = reader.push(byte)
             else
             {
                 return;
@@ -255,12 +286,12 @@ impl Session
             let ack = self.acks.response(&event);
             let answer = match event
             {
-                Event::Packet(body) => answer(body, &mut reply),
-                Event::Overflow => error_reply(2, &mut reply),
-                Event::Interrupt => stop_reply(2, &mut reply),
+                Event::Packet(body) => answer(body, reply, data),
+                Event::Overflow => error_reply(2, reply),
+                Event::Interrupt => stop_reply(2, reply),
                 Event::Nack =>
                 {
-                    if let Some(last) = self.last.get(..self.last_len)
+                    if let Some(last) = last.get(..self.last_len)
                     {
                         write(port, last, ipc_buf);
                     }
@@ -280,7 +311,7 @@ impl Session
             Answer::Packet(len) => (len, false),
             Answer::NoAckOk(len) => (len, true),
         };
-        let (Some(sent), Some(kept)) = (reply.get(..len), self.last.get_mut(..len))
+        let (Some(sent), Some(kept)) = (reply.get(..len), last.get_mut(..len))
         else
         {
             return;
@@ -306,12 +337,13 @@ enum Answer
     NoAckOk(usize),
 }
 
-/// Answer one packet body.
-fn answer(body: &[u8], out: &mut [u8]) -> Answer
+/// Answer one packet body into `out`; `data` takes an echo query's
+/// unescaped data.
+fn answer(body: &[u8], out: &mut [u8], data: &mut [u8]) -> Answer
 {
-    if let Some(data) = body.strip_prefix(ECHO_QUERY)
+    if let Some(escaped) = body.strip_prefix(ECHO_QUERY)
     {
-        return echo_reply(data, out);
+        return echo_reply(escaped, out, data);
     }
     match Command::parse(body)
     {
@@ -331,12 +363,11 @@ fn answer(body: &[u8], out: &mut [u8]) -> Answer
     }
 }
 
-/// The echo of `qSeraph.Echo:<data>`: the data, unescaped, then escaped
-/// again by the writer.
-fn echo_reply(escaped: &[u8], out: &mut [u8]) -> Answer
+/// The echo of `qSeraph.Echo:<data>`: the data, unescaped into `data`, then
+/// escaped again by the writer.
+fn echo_reply(escaped: &[u8], out: &mut [u8], data: &mut [u8]) -> Answer
 {
-    let mut data = [0u8; PACKET_SIZE];
-    match unescape(escaped, &mut data)
+    match unescape(escaped, data)
     {
         Ok(n) => packet(out, |w| {
             w.bytes(data.get(..n).unwrap_or_default());

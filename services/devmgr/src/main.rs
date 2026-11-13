@@ -18,6 +18,7 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(clippy::large_stack_frames)]
 // Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
 // test configuration is exempt from the second set, as from `unwrap_used`.
 #![warn(
@@ -728,6 +729,11 @@ impl Registry
 
     /// Log each class configured with no served driver and each served
     /// class no class request configured, read in one hold and logged after.
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the `found` table (64 entries of about 34 B, about 2.2 KiB) and its `into_iter` \
+                  copy; on the 32 KiB main-thread stack of devmgr"
+    )]
     fn log_mismatches(&self)
     {
         let mut found: [Option<(ClassName, Mismatch)>; MAX_CLASSES] = [None; MAX_CLASSES];

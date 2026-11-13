@@ -3728,6 +3728,14 @@ fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
               paging, parent relay and scheduling, and procmgr's context, tables, death set and IPC \
               buffer"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "no single large local: the estimate sums the structs and `Result`s of the load path \
+              (`image`, `universals`, `tls_template`, `child_objs`, `info_caps`); the compiled \
+              frame is under 3 KiB, about 4 KiB in `dispatch_ipc` where a release build inlines \
+              it; on the stack of the procmgr thread serving the request, 32 KiB at the smallest \
+              (the main thread's)"
+)]
 pub fn create_process_from_file(
     ctx: &crate::ProcmgrCtx,
     file_cap: u64,

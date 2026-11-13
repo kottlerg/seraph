@@ -111,12 +111,23 @@ as the rule above that the lint checks says. Test code is exempt from `panic`,
 configuration's relaxation, to which the roll-out ends by adding them. Two of the lints take a
 setting from Clippy's configuration file, `clippy.toml`: `max-fn-params-bools = 0`, so that
 `fn_params_excessive_bools` reports every function with a `bool` parameter, and
-`stack-size-threshold`, the frame above which `large_stack_frames` reports. For `core/boot` and
-`core/kernel` the threshold is a quarter of the smallest stack any of the crate's code runs on, and
-every other crate keeps Clippy's default of 512,000 bytes. `core/boot` and `core/kernel` each add
-a `clippy.toml` with both settings, and the stack the threshold derives from, when their sites are
-fixed, and the roll-out ends with the root `clippy.toml`. Until then a site added in a crate or
-subsystem whose sites are fixed follows the same rule.
+`stack-size-threshold`, the frame above which `large_stack_frames` reports. The threshold is a
+quarter of the smallest stack any of the crate's code runs on. The root `clippy.toml` sets 8192
+bytes, a quarter of the 32 KiB a process's main thread is given unless it declares its own stack
+(`DEFAULT_PROCESS_STACK_PAGES`, `abi/process-abi`): the stack a userspace crate's code can count
+on, since a `std` main thread's growth past it is not guaranteed. A crate whose smallest stack
+differs takes its threshold from a `clippy.toml` in its own directory, or in a directory above it
+whose crates all share that stack, and the file's comment names the stack: `core/boot` and
+`core/kernel`; the `abi/` and `shared/` crates and every other crate init links, which run on the
+16 KiB of a kernel stack or of init (`INIT_STACK_PAGES`); a service that declares a larger stack
+with `stack_pages!`; and the host crates under `xtask/`. A stack that a crate sizes for one entry
+function of its own, a test fixture, does not set the crate's threshold: the fixture's sizing
+answers for that function. Clippy reads only the nearest `clippy.toml`, searching upward from the
+crate's manifest directory, and merges none, so every other `clippy.toml` restates each setting
+of the root file, which a host test of `cargo xtask test` checks. `max-fn-params-bools` is set in
+the file of each crate whose sites are fixed, and the roll-out ends by adding it to the root file
+and to every file that restates it. Until then a site added in a crate or subsystem whose sites
+are fixed follows the same rule.
 
 `clippy::allow_attributes` and `clippy::allow_attributes_without_reason`, which check the
 suppression form of § E, are being made mandatory by a staged roll-out. A crate whose suppressions
@@ -361,6 +372,34 @@ unsafe {
 - In the kernel, prefer static or pool allocation on hot paths. Document why dynamic
   allocation is acceptable at each site where it appears.
 - Allocation MUST NOT occur inside interrupt handlers.
+
+---
+
+### Kernel Stack Frames
+
+Every function of the riscv64 kernel image MUST have a fixed stack frame of at most 2032 bytes
+(`RISCV64_KERNEL_FRAME_MAX` in `xtask/src/stack_sizes.rs`). On riscv64 a `call` writes nothing to
+the stack, and a larger frame's split prologue leaves up to 6120 bytes below its return-address
+save unwritten (the rest of its first, 2032-byte adjustment and up to a page of the second, which
+no probe touches), so a larger frame can step over a kernel stack's one-page guard without
+touching it. With every frame within the
+bound, two consecutive stack stores are less than 4064 bytes apart and no guard page lies between
+them; 2032 bytes is also the largest frame LLVM allocates in one adjustment, so no frame within
+the bound is split.
+[memory-internals.md § Kernel Stack Guards](../core/kernel/docs/memory-internals.md#kernel-stack-guards)
+states the guarantee for each architecture.
+
+- A value too large for the bound is not built on the stack. It is written in place into the
+  memory it is handed over in, held in a static or in the per-CPU syscall scratch buffer
+  (`core/kernel/src/syscall/scratch.rs`) when its context makes that storage exclusive, or
+  split into smaller values held by different functions.
+- `cargo xtask build` builds the riscv64 kernel with `-Z emit-stack-sizes` and fails, naming each
+  function and its frame, when the image's `.stack_sizes` section records a frame above the
+  bound, in debug and release builds alike. Clippy's `large_stack_frames` (§ Clippy) estimates
+  frames before code generation and is an earlier, coarser signal; the build's check is the
+  rule's test.
+- The bound binds the kernel's riscv64 image only. On x86-64 a `call` pushes its return address
+  and the probes touch every page a frame spans, so a frame of any size meets the guard.
 
 ---
 

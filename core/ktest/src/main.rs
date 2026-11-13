@@ -116,10 +116,28 @@ pub static PASS_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// Counts tests that returned `Err(...)`.
 pub static FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Run one test body in a stack frame of its own.
+///
+/// [`run_test!`] and [`run_integration_test!`] call every body through this
+/// function. Each body is a distinct closure type, so each gets its own
+/// instance, and `#[inline(never)]` keeps that instance out of the `run_all`
+/// that registers the test. The stack a test run needs is then the deepest
+/// single test, not one `run_all` frame holding the locals of every test
+/// inlined into it, which a release build makes over 10 KiB of init's 16 KiB
+/// stack.
+#[doc(hidden)]
+#[inline(never)]
+pub fn run_isolated(body: impl FnOnce() -> TestResult) -> TestResult
+{
+    body()
+}
+
 /// Run a named unit test and update the global pass/fail counters.
 ///
 /// `$name` must be a string literal (used with `concat!` for zero-cost
-/// log messages). `$body` is an expression evaluating to [`TestResult`].
+/// log messages). `$body` is an expression evaluating to [`TestResult`]; it
+/// runs in a closure through [`run_isolated`], so it cannot `return` from or
+/// `?` out of the caller.
 ///
 /// Prints `ktest: RUN <name>` before the body, then one line per test:
 /// `ktest: PASS <name>` or `ktest: FAIL <name>` followed by the failure
@@ -138,7 +156,7 @@ pub static FAIL_COUNT: AtomicUsize = AtomicUsize::new(0);
 macro_rules! run_test {
     ($name:literal, $body:expr) => {{
         $crate::log(concat!("ktest: RUN ", $name));
-        let result: $crate::TestResult = { $body };
+        let result: $crate::TestResult = $crate::run_isolated(|| $body);
         $crate::frame_pool::check_slots();
         match result
         {
@@ -172,7 +190,7 @@ macro_rules! run_test {
 macro_rules! run_integration_test {
     ($name:literal, $body:expr) => {{
         $crate::log(concat!("ktest: ", $name, " starting"));
-        let result: $crate::TestResult = { $body };
+        let result: $crate::TestResult = $crate::run_isolated(|| $body);
         $crate::frame_pool::check_slots();
         match result
         {

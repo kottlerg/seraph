@@ -60,6 +60,11 @@ fn assert_baseline(label: &'static str, memory_cap: u64, baseline: u64) -> TestR
               closures over the cap-create wrappers (each with a distinct signature), buying \
               nothing in clarity"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "no large local: the estimate sums the `Result` temporaries of its many `?` steps \
+              (16 to 24 B each), and the compiled frame is under 1 KiB; on init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let memory = ctx.memory_base;

@@ -62,6 +62,10 @@ fn derive_badged_creator(bootstrap_ep: u64) -> Option<(u64, u64)>
 /// callers the handle is no longer usable. Callers holding additional
 /// caps from the same CREATE reply (e.g. a separate thread cap)
 /// remain responsible for releasing those.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the builder, `ns_msg` and `reply` `IpcMessage`s (568 B each); on init's 16 KiB stack"
+)]
 fn configure_child_namespace(
     process_handle: u64,
     system_root_cap: u64,
@@ -597,6 +601,11 @@ fn serve_region_rounds(
     reason = "devmgr's spawn and bootstrap round are one ordered sequence whose cap derivations \
               each later step consumes; splitting it would only thread those slots through helpers"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each), the builder's copy and the \
+              temporaries of the bootstrap rounds' messages (568 B each); on init's 16 KiB stack"
+)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u64,
@@ -957,6 +966,11 @@ fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 }
 
 /// Create vfsd via procmgr and serve its bootstrap.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each), the builder's copy and the \
+              temporaries of the bootstrap rounds' messages (568 B each); on init's 16 KiB stack"
+)]
 pub fn create_vfsd_with_caps(
     info: &InitInfo,
     procmgr_ep: u64,
@@ -1070,6 +1084,11 @@ pub fn create_vfsd_with_caps(
 /// init's seed system-root cap on the child via `CONFIGURE_NAMESPACE`.
 ///
 /// Returns `(process_handle, child_badge)` on success.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `msg` and `reply` `IpcMessage`s (568 B each) and the builder's copy; on init's \
+              16 KiB stack"
+)]
 pub fn create_svcmgr_from_file(
     procmgr_ep: u64,
     bootstrap_ep: u64,
@@ -1612,6 +1631,11 @@ fn send_handover_complete(svcmgr_service_ep: u64, ipc_buf: *mut u64)
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
 /// SEND|GRANT.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `builder`, the built `msg` and the reply `IpcMessage`s (568 B each); on init's \
+              16 KiB stack"
+)]
 unsafe fn send_teardown_round(procmgr_ep: u64, slots: &[u64], ipc_buf: *mut u64)
 {
     if slots.is_empty()
@@ -1666,6 +1690,11 @@ const MODULE_COPY_RIGHTS: u64 = syscall::RIGHTS_ALL & !syscall::RIGHTS_MEM_PHYS;
 /// # Safety
 /// `ipc_buf` must be init's registered IPC buffer; `procmgr_ep` must carry
 /// `SEND|GRANT`.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `round1` `IpcMessage` (568 B), the reply and the builder copies of its donation \
+              rounds (568 B each); on init's 16 KiB stack"
+)]
 fn register_init_reap_objects(
     procmgr_ep: u64,
     info: &InitInfo,

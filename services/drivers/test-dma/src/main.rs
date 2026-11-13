@@ -38,6 +38,7 @@
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(clippy::large_stack_frames)]
 // Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
 // test configuration is exempt from the second set, as from `unwrap_used`.
 #![warn(
@@ -810,6 +811,11 @@ fn forge_reply(forge: Option<Forge>) -> IpcMessage
 
 /// Answer `INTERRUPT_PROBE`, `INTERRUPT_CHURN`, `DMA_PROBE` and `MSI_FORGE` until a
 /// `FIXTURE_EXIT`, then exit.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the `reply` `IpcMessage`s (568 B each) and the builder copies \
+              of the arms; on the 32 KiB main-thread stack of test-dma"
+)]
 fn serve(driver: &Driver, service_ep: u64, ipc_buf: *mut u64) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});

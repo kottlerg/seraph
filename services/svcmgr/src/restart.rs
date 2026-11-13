@@ -135,6 +135,11 @@ pub(crate) fn mint_debug_authority(ctx: &RestartCtx) -> u64
 /// They ride the create label's `CREATE_PRIORITY` / `CREATE_BAND_MAX`
 /// fields; a value above svcmgr's own band ceiling makes procmgr reject
 /// the create with `INVALID_ARGUMENT`.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each) and the builder's copy; on \
+              the 32 KiB main-thread stack of svcmgr"
+)]
 pub fn walk_and_create_from_file(
     path: &str,
     blobs: StartupBlobs<'_>,

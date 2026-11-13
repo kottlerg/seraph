@@ -45,6 +45,11 @@ static SENDER_ARGS: spawn::ArgBlock<SenderArgs, NUM_CHILDREN> = spawn::ArgBlock:
     bit_index: 0,
 });
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `derived` array (64 `u64`, 512 B) and the `children` array (64 `SpawnedChild`, \
+              16 B each, 1 KiB); on init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let root = cap_create_notification(ctx.memory_base)

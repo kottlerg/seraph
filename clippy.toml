@@ -1,0 +1,12 @@
+# clippy.toml — Clippy settings for every crate with no clippy.toml of its own.
+# docs/coding-standards.md § Clippy states the rule each setting serves.
+# Clippy reads only the nearest clippy.toml, searching upward from a crate's
+# manifest directory, and merges none: every other clippy.toml in the tree
+# restates each setting below, with its own stack-size-threshold, which a
+# host test of `cargo xtask test` checks.
+
+# 8192 bytes, a quarter of the 32 KiB stack a process's main thread is given
+# unless it declares its own: DEFAULT_PROCESS_STACK_PAGES
+# (abi/process-abi/src/lib.rs). A std main thread's growth past it is not
+# guaranteed, and a spawned std thread's stack is larger.
+stack-size-threshold = 8192

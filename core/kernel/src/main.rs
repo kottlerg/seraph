@@ -423,10 +423,12 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 )]
 #[expect(
     clippy::large_stack_frames,
-    reason = "the root `CSpaceLayout` (3464 B), the `InitInfo` header (3616 B), init's \
-              `ThreadControlBlock` (1128 B) and `init_image` (304 B), each counted once for \
-              each move and with the inlined phases' locals; on the 64 KiB boot handoff stack, \
-              whose measured boot peak is stated at `HANDOFF_STACK_BYTES`"
+    reason = "the lint's estimate sums every local of the inlined phases, init's \
+              `ThreadControlBlock` value (1128 B) and `init_image` (304 B) among them, with no \
+              overlap; the compiled frame is far smaller, and on riscv64 `cargo xtask build` \
+              checks it against the kernel frame bound (docs/coding-standards.md § Kernel Stack \
+              Frames); it runs on the 64 KiB boot handoff stack, whose measured boot peak is \
+              stated at `HANDOFF_STACK_BYTES`"
 )]
 #[cfg(not(test))]
 #[inline(never)]
@@ -526,6 +528,11 @@ unsafe fn kernel_entry_post_rebase(
     // user-cap drain, while the buddy still holds large contiguous blocks.
     #[cfg(not(test))]
     entropy::init_storage(boot_cpu_count, allocator);
+
+    // Allocate the per-CPU syscall scratch buffers, for the same reason, and
+    // before any syscall.
+    #[cfg(not(test))]
+    syscall::scratch::init_storage(boot_cpu_count, allocator);
 
     // Allocate the frame map table (per-frame user-mapping counts,
     // core/kernel/docs/memory-internals.md § Frame Map Table) before the
@@ -1137,46 +1144,46 @@ unsafe fn kernel_entry_post_rebase(
             }
             let info_base = mm::paging::phys_to_virt(block_phys) as *mut u8;
 
-            let info = InitInfo {
-                version: INIT_PROTOCOL_VERSION,
-                cap_descriptor_count: desc_count as u32,
-                aspace_cap: u64::from(init_aspace_cap_slot),
-                sched_control_cap: u64::from(cspace_layout.sched_control_slot),
-                memory_base: u64::from(cspace_layout.memory_base),
-                memory_count: u64::from(cspace_layout.memory_count),
-                segment_memory_base: u64::from(segment_memory_base),
-                segment_memory_count: u64::from(segment_memory_count),
-                hw_cap_base: u64::from(cspace_layout.hw_cap_base),
-                hw_cap_count: u64::from(cspace_layout.hw_cap_count),
-                cap_descriptors_offset: descriptors_offset,
-                thread_cap: 0, // patched below after Thread cap is minted
-                sbi_control_cap: u64::from(cspace_layout.sbi_control_slot),
-                cspace_cap: 0, // patched below after CSpace cap is minted
-                irq_range_cap: u64::from(cspace_layout.irq_range_slot),
-                acpi_rsdp_memory_cap: u64::from(cspace_layout.acpi_rsdp_memory_slot),
-                acpi_region_memory_base: u64::from(cspace_layout.acpi_region_memory_base),
-                acpi_region_memory_count: u64::from(cspace_layout.acpi_region_memory_count),
-                dtb_memory_cap: u64::from(cspace_layout.dtb_memory_slot),
-                init_stack_memory_base: 0,  // patched after stack mint
-                init_stack_memory_count: 0, // patched after stack mint
-                init_info_memory_base: 0,   // patched after self-mint below
-                init_info_memory_count: 0,  // patched after self-mint below
-                module_name_count: cspace_layout.module_name_count,
-                module_names: cspace_layout.module_names,
-                system_ram_bytes: 0, // patched below after all owns_memory mints
-                kernel_reserved_bytes: 0, // patched below after all owns_memory mints
-                framebuffer: init_framebuffer,
-            };
-
-            // Write InitInfo header (always fits in first page).
+            // Write the InitInfo header's fields in place (it always fits in
+            // the first page). Phase 7 zeroed the region and wrote the
+            // boot-module name table and its count into the header
+            // (`cap::mint_module_memory_caps`); those stay as written, and
+            // the fields patched below stay zero until then. No copy of the
+            // header is built on this stack.
             #[expect(
                 clippy::cast_ptr_alignment,
                 reason = "page alignment (4096) exceeds InitInfo alignment (8)"
             )]
-            // SAFETY: info_base is page-aligned; InitInfo fits in one page.
-            unsafe {
-                core::ptr::write(info_base.cast::<InitInfo>(), info);
-            }
+            let info_ptr = info_base.cast::<InitInfo>();
+            // SAFETY: info_base is the region's page-aligned start, mapped
+            // writable through the direct map, and the zeroed header is a
+            // valid InitInfo (every field an integer, an array of them or the
+            // pixel format, whose discriminant 0 is Rgbx8); single-threaded
+            // boot, and no other reference to the header is live while this
+            // one is.
+            let info = unsafe { &mut *info_ptr };
+            info.version = INIT_PROTOCOL_VERSION;
+            info.cap_descriptor_count = desc_count as u32;
+            info.cap_descriptors_offset = descriptors_offset;
+            info.aspace_cap = u64::from(init_aspace_cap_slot);
+            info.sched_control_cap = u64::from(cspace_layout.sched_control_slot);
+            info.memory_base = u64::from(cspace_layout.memory_base);
+            info.memory_count = u64::from(cspace_layout.memory_count);
+            info.segment_memory_base = u64::from(segment_memory_base);
+            info.segment_memory_count = u64::from(segment_memory_count);
+            info.hw_cap_base = u64::from(cspace_layout.hw_cap_base);
+            info.hw_cap_count = u64::from(cspace_layout.hw_cap_count);
+            info.sbi_control_cap = u64::from(cspace_layout.sbi_control_slot);
+            info.irq_range_cap = u64::from(cspace_layout.irq_range_slot);
+            info.acpi_rsdp_memory_cap = u64::from(cspace_layout.acpi_rsdp_memory_slot);
+            info.acpi_region_memory_base = u64::from(cspace_layout.acpi_region_memory_base);
+            info.acpi_region_memory_count = u64::from(cspace_layout.acpi_region_memory_count);
+            info.dtb_memory_cap = u64::from(cspace_layout.dtb_memory_slot);
+            info.framebuffer = init_framebuffer;
+            // Patched below: thread_cap and cspace_cap once those caps are
+            // minted, init_stack_memory_* after the stack mint,
+            // init_info_memory_* after the self-mint, and the memory
+            // accounting after every owns_memory mint.
 
             // Mint a reclaimable Memory cap per InitInfo page so init's
             // reap-handoff donates the pages back to memmgr after AS

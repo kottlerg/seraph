@@ -371,6 +371,12 @@ fn resource_round(resource: &Resource, copy: u64) -> Option<Round>
               on a partial failure, and the linear presentation matches the bootstrap protocol \
               one-to-one"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `derived` cap array (75 `u64`s, 600 B), the `create_msg`, `reply` and \
+              `start_msg` `IpcMessage`s (568 B each) and the bootstrap rounds' messages (568 B \
+              each); on the 32 KiB main-thread stack of devmgr"
+)]
 pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn<HeldChild>
 {
     // Release the source ELF cap on every exit before the create call

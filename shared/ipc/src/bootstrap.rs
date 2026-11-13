@@ -342,6 +342,12 @@ impl<const N: usize> SlotAccumulator<N>
 ///   differs from the count the label declares, or the label declares more
 ///   data words than a message carries. The caps such a reply delivered
 ///   are deleted.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the returned `BootstrapRound` \
+              (568 B) with its `caps` and `data` copies; on its caller's stack, 32 KiB at the \
+              smallest (a std process's main thread)"
+)]
 pub unsafe fn request_round(creator_ep: u64, ipc_buf: *mut u64) -> Result<BootstrapRound, u64>
 {
     let request = IpcMessage::new(REQUEST);
@@ -476,6 +482,11 @@ fn delete_slots(caps: &[u64])
 ///
 /// # Panics
 /// Panics when `data` is longer than `MSG_DATA_WORDS_MAX` words.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the message builder, its copies and the built `msg` (an `IpcMessage`, 568 B each); \
+              on its caller's stack, 16 KiB at the smallest (init's)"
+)]
 pub unsafe fn reply_round(
     done: bool,
     cap_slots: &[u64],

@@ -1150,6 +1150,12 @@ struct ReadStallHeld
 impl ReadStall
 {
     /// Start the file server and the create against it.
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the closure spawned for the `read-stall-fs` thread: its `req`, `opened` and \
+                  `reply` `IpcMessage`s (568 B each) and the builder copies; on that thread's \
+                  stack, 64 KiB at the least"
+    )]
     fn start() -> Self
     {
         use ipc::{IpcMessage, procmgr_labels};
@@ -1386,6 +1392,11 @@ fn phys_access_refused(procmgr: u64)
 /// `DEBUG_AUTHORITY`, with `UNAUTHORIZED`, whatever badge the request names:
 /// the authority check precedes the target lookup
 /// (`services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the 4 request `IpcMessage`s of its refused calls (568 B each) and their replies; on \
+              the 32 KiB main-thread stack of svctest"
+)]
 fn debug_authority_refused(procmgr: u64)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -1465,6 +1476,11 @@ fn hello_file() -> (u64, u64)
 /// spawn afterwards shows procmgr still serves. The phase then checks that
 /// procmgr destroys a child whose create reply it cannot deliver
 /// ([`undeliverable_reply_child_main`]).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the 7 request `IpcMessage`s of its refused calls (568 B each) and their replies; on \
+              the 32 KiB main-thread stack of svctest"
+)]
 pub fn procmgr_refusals_phase(_: &Caps)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -1580,6 +1596,12 @@ pub fn procmgr_refusals_phase(_: &Caps)
 /// NUL. [`create_process_argv_env_refusals`] covers the `CREATE_PROCESS`
 /// side. A spawn afterwards in [`procmgr_refusals_phase`] shows procmgr still
 /// serves.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the 5 request `IpcMessage`s of its refused calls (568 B each), their replies, and \
+              the `cells` array of 3 entries (about 48 B each); on the 32 KiB main-thread stack of \
+              svctest"
+)]
 fn argv_env_refusals()
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};

@@ -21,7 +21,7 @@
 //! deletable, and the slot count at its baseline. The per-outcome counts
 //! are logged, not asserted: they depend on timing.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_create_notification, cap_create_thread, cap_delete, cap_derive,
@@ -61,6 +61,11 @@ struct SiblingArgs
 
 static SIBLING_ARGS: ArgBlock<SiblingArgs, 1> = ArgBlock::new(SiblingArgs { orig: 0, done: 0 });
 
+/// The original's children of the current cycle, kept in the image rather
+/// than in the frame, which runs on init's 16 KiB stack (4.7 KiB of handles).
+/// Only the parent thread touches them.
+static CHILDREN_CAPS: [AtomicU64; CHILDREN] = [const { AtomicU64::new(0) }; CHILDREN];
+
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = syscall::system_info(SystemInfoType::CpuCount as u64)
@@ -77,11 +82,11 @@ pub fn run(ctx: &TestContext) -> TestResult
     {
         let orig = cap_derive(ctx.sched_control_cap, RIGHTS_ALL)
             .map_err(|_| "stress::split_delete_race: derive original failed")?;
-        let mut children = [0u64; CHILDREN];
-        for child in &mut children
+        for child in &CHILDREN_CAPS
         {
-            *child = cap_derive(orig, RIGHTS_ALL)
+            let cap = cap_derive(orig, RIGHTS_ALL)
                 .map_err(|_| "stress::split_delete_race: derive child failed")?;
+            child.store(cap, Ordering::Relaxed);
         }
 
         GO.store(0, Ordering::Release);
@@ -135,9 +140,10 @@ pub fn run(ctx: &TestContext) -> TestResult
 
         // Whoever consumed the original, its children now hang off the
         // sched cap and must still be deletable one by one.
-        for child in children
+        for child in &CHILDREN_CAPS
         {
-            cap_delete(child).map_err(|_| "stress::split_delete_race: delete child failed")?;
+            cap_delete(child.load(Ordering::Relaxed))
+                .map_err(|_| "stress::split_delete_race: delete child failed")?;
         }
         spawn::wait_until_exited(th, crate::scaled_polls(EXIT_POLLS))?;
         sibling

@@ -939,6 +939,15 @@ fn reserve_init_backing(counts: &DescriptorCounts)
         unsafe {
             core::ptr::write_bytes(block, 0, region_bytes as usize);
         }
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "the region is page-aligned, and page alignment (4096) exceeds the header's \
+                      (8)"
+        )]
+        INIT_INFO_HEADER.store(
+            block.cast::<init_protocol::InitInfo>(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         // SAFETY: the header fits the region's first page, so the array start
         // lies inside the region.
         let array = unsafe { block.add(core::mem::size_of::<init_protocol::InitInfo>()) };
@@ -960,11 +969,13 @@ fn reserve_init_backing(counts: &DescriptorCounts)
 #[cfg(not(test))]
 pub(crate) fn take_init_info_block() -> (u64, usize)
 {
-    // The block goes to init now, so the descriptor array is retired with it:
-    // a later `descriptor_array()` halts, naming the array's lifetime (its
-    // Phase 7 reservation to this Phase 9 hand-off), instead of writing into
-    // it.
+    // The block goes to init now, so the descriptor array and the header are
+    // retired with it: a later `descriptor_array()` or `init_info_header()`
+    // halts, naming their lifetime (the Phase 7 reservation to this Phase 9
+    // hand-off), instead of writing into them. Phase 9 writes the header's
+    // fields through the block address returned here.
     DESCRIPTOR_ARRAY.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
+    INIT_INFO_HEADER.store(core::ptr::null_mut(), core::sync::atomic::Ordering::Relaxed);
     let phys = INIT_INFO_BLOCK_PHYS.swap(0, core::sync::atomic::Ordering::Relaxed);
     debug_assert!(phys != 0, "InitInfo block consumed before it was reserved");
     (
@@ -1402,8 +1413,9 @@ pub(crate) unsafe fn boot_retype_cspace(
     // SAFETY: wrapper_virt page-aligned; cs_offset stays inside page 0.
     let cs_ptr = unsafe { wrapper_virt.add(cs_offset) }.cast::<CSpace>();
 
-    // SAFETY: cs_ptr lives in the wrapper page, exclusively owned.
-    unsafe { core::ptr::write(cs_ptr, CSpace::new(id)) };
+    // SAFETY: cs_ptr lives in the wrapper page, exclusively owned, and is
+    // aligned for a CSpace (asserted above).
+    unsafe { CSpace::write_new(cs_ptr, id) };
 
     // SAFETY: cs_kobj_ptr is page-aligned and exclusively owned.
     unsafe {
@@ -1502,27 +1514,57 @@ pub struct CSpaceLayout
     /// Number of valid entries in the `InitInfo` descriptor array for this
     /// layout. Use [`descriptors`] to obtain the slice.
     pub descriptor_count: usize,
-    /// Number of populated [`InitModuleName`] entries in
-    /// [`Self::module_names`]. Capped at
-    /// [`init_protocol::INIT_MAX_NAMED_MODULES`].
-    pub module_name_count: u32,
-    /// Module-name → cap-slot table mirroring
-    /// [`init_protocol::InitInfo::module_names`]. Populated by
-    /// `mint_module_memory_caps` and written verbatim into the
-    /// `InitInfo` header by Phase 9.
-    pub module_names: [init_protocol::InitModuleName; init_protocol::INIT_MAX_NAMED_MODULES],
 }
 
 /// Start of the `InitInfo` descriptor array: the reserved `InitInfo` block's
 /// bytes past the header, [`descriptor_capacity`] slots, set by
 /// `reserve_init_backing` at Phase 7. Phases 7 and 8 write every boot
 /// capability's descriptor there, the buddy drain's RAM extents first (in the
-/// slots their descriptors take), and Phase 9 writes the header in front of
-/// them, so no copy of the array exists; after hand-off it is init's, and
-/// `take_init_info_block` nulls this pointer.
+/// slots their descriptors take), and Phase 9 writes the header's fields in
+/// front of them, so no copy of the array exists; after hand-off it is init's,
+/// and `take_init_info_block` nulls this pointer.
 #[cfg(not(test))]
 static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// The `InitInfo` header at the start of the reserved `InitInfo` block, set
+/// with [`DESCRIPTOR_ARRAY`] and nulled with it. Phase 7 writes the
+/// boot-module name table into it in place (`mint_module_memory_caps`) and
+/// Phase 9 the header's other fields, so no copy of the header, or of its
+/// 3400 B name table, is built on the boot stack.
+#[cfg(not(test))]
+static INIT_INFO_HEADER: core::sync::atomic::AtomicPtr<init_protocol::InitInfo> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+/// Host-test stand-in for the `InitInfo` header, zeroed as Phase 7 zeroes the
+/// reserved block.
+#[cfg(test)]
+static mut TEST_INIT_INFO_HEADER: core::mem::MaybeUninit<init_protocol::InitInfo> =
+    core::mem::MaybeUninit::zeroed();
+
+/// The `InitInfo` header of the reserved block. Every field of
+/// [`init_protocol::InitInfo`] is an integer, an array of integers or the
+/// pixel format, whose discriminant 0 is `Rgbx8`, so the zeroed header is a
+/// valid value.
+fn init_info_header() -> *mut init_protocol::InitInfo
+{
+    #[cfg(not(test))]
+    {
+        let p = INIT_INFO_HEADER.load(core::sync::atomic::Ordering::Relaxed);
+        if p.is_null()
+        {
+            crate::fatal(
+                "cap: InitInfo header used before Phase 7 reserves it or after Phase 9 hands it \
+                 to init",
+            );
+        }
+        p
+    }
+    #[cfg(test)]
+    {
+        core::ptr::addr_of_mut!(TEST_INIT_INFO_HEADER).cast::<init_protocol::InitInfo>()
+    }
+}
 
 /// Host-test stand-in for the `InitInfo` descriptor array.
 #[cfg(test)]
@@ -1642,12 +1684,6 @@ fn push_descriptor(count: &mut usize, desc: CapDescriptor)
 ///
 /// Preconditions: called exactly once, single-threaded, after Phase 4
 /// (per-CPU storage allocated) and Phase 3 (direct map active).
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `CSpaceLayout` it returns (3464 B, 3400 B of it the `module_names` table), \
-              received from `populate_cspace`; Phase 7, on the 64 KiB boot handoff stack, and \
-              the host tests on the test thread's"
-)]
 pub fn init_capability_system(
     mmio_apertures: crate::platform::ValidatedApertures,
     boot_info_phys: u64,
@@ -1850,12 +1886,6 @@ fn complete_extent_descriptors(
     clippy::too_many_lines,
     reason = "one logical pass over all boot-time resource types; splitting would require \
               threading shared state (cspace) through multiple helper functions"
-)]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `CSpaceLayout` it returns (3464 B) and the `module_names` table it is built \
-              from (3400 B); Phase 7, on the 64 KiB boot handoff stack, and the host tests on \
-              the test thread's"
 )]
 fn populate_cspace(
     cspace: &mut CSpace,
@@ -2295,9 +2325,6 @@ fn populate_cspace(
         dtb_memory_slot,
         total_populated: cspace.populated_count(),
         descriptor_count: desc_count,
-        module_name_count: 0,
-        module_names: [init_protocol::INIT_MODULE_NAME_EMPTY;
-            init_protocol::INIT_MAX_NAMED_MODULES],
     }
 }
 
@@ -2307,12 +2334,13 @@ fn populate_cspace(
 /// reclaimable Memory cap (`owns_memory = true`, full byte ledger), per
 /// `docs/capability-model.md` § Memory; loaders map the ELF source read-only.
 /// The kernel additionally publishes a name → slot mapping in
-/// [`CSpaceLayout::module_names`] so init can match modules by their
-/// bundle entry identifier instead of relying on ordinal position.
+/// [`init_protocol::InitInfo::module_names`] so init can match modules by
+/// their bundle entry identifier instead of relying on ordinal position.
 ///
-/// Updates `layout.module_names` / `layout.module_name_count` and
-/// appends [`CapDescriptor`] entries for each module. Init looks
-/// modules up by name via the published `module_names` table.
+/// Appends a [`CapDescriptor`] entry for each module, and writes its name
+/// entry and the table's `module_name_count` in place into the reserved
+/// `InitInfo` header ([`init_info_header`]); Phase 9 leaves both as written
+/// here.
 fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
 {
     use boot_protocol::BootModule;
@@ -2323,6 +2351,14 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
     {
         return;
     }
+
+    let header = init_info_header();
+    // SAFETY: the header is the reserved block's zeroed first bytes (or the
+    // zeroed test stand-in), a valid `InitInfo` (`init_info_header`);
+    // single-threaded boot, and no other reference to the header is live
+    // until this function returns.
+    let names = unsafe { &mut (*header).module_names };
+    let mut name_count: u32 = 0;
 
     // SAFETY: boot_info.modules was validated by the bootloader; entries pointer
     // is in the direct physical map (active since Phase 3).
@@ -2408,9 +2444,7 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
         );
         // Publish a name → slot entry in the InitInfo header table so
         // init can resolve modules by name without scanning descriptors.
-        let Some(name) = layout
-            .module_names
-            .get_mut(layout.module_name_count as usize)
+        let Some(name) = names.get_mut(name_count as usize)
         else
         {
             crate::fatal("Phase 7: more boot modules than INIT_MAX_NAMED_MODULES");
@@ -2420,8 +2454,10 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
             name: module.name,
         };
         // Below INIT_MAX_NAMED_MODULES (the table's length, checked above).
-        layout.module_name_count = layout.module_name_count.saturating_add(1);
+        name_count = name_count.saturating_add(1);
     }
+    // SAFETY: as for `names` above, whose borrow has ended.
+    unsafe { (*header).module_name_count = name_count };
 
     layout.total_populated = cspace.populated_count();
 }
@@ -2459,7 +2495,8 @@ fn mint_module_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &m
 /// the descriptor table to discover the caps. There is no dedicated
 /// `reclaim_memory_base` / `reclaim_memory_count` pair on [`CSpaceLayout`]
 /// because reclaim caps carry no per-index meaning — unlike boot
-/// modules, which init resolves by name through [`CSpaceLayout::module_names`],
+/// modules, which init resolves by name through
+/// [`init_protocol::InitInfo::module_names`],
 /// reclaim caps are a homogeneous pool and userspace inspects each
 /// `CapDescriptor.aux0`/`aux1` to learn the underlying physical range.
 fn mint_reclaim_memory_caps(cspace: &mut CSpace, boot_info: &BootInfo, layout: &mut CSpaceLayout)
@@ -3107,6 +3144,68 @@ fn insert_or_fatal<K: slot::CapKind>(
 mod tests
 {
     use super::*;
+
+    // ── boot-module name table ────────────────────────────────────────────────
+
+    /// A `BootModule.name`: `name` NUL-padded.
+    fn module_name(name: &[u8]) -> [u8; boot_protocol::BOOT_MODULE_NAME_LEN]
+    {
+        let mut padded = [0u8; boot_protocol::BOOT_MODULE_NAME_LEN];
+        padded[..name.len()].copy_from_slice(name);
+        padded
+    }
+
+    // Defect guarded: a boot module's name entry, or the entry count, not
+    // written into the InitInfo header, where init resolves every boot module
+    // by name; or an entry naming a slot that holds no Memory cap.
+    #[test]
+    fn each_boot_module_is_published_by_name_in_the_init_info_header()
+    {
+        let modules = [
+            boot_protocol::BootModule {
+                name: module_name(b"procmgr"),
+                physical_base: 0x2000_0000,
+                size: 0x1800,
+            },
+            boot_protocol::BootModule {
+                name: module_name(b"memmgr"),
+                physical_base: 0x2001_0000,
+                size: 0x3000,
+            },
+        ];
+        // SAFETY: every `BootInfo` field is an integer, a raw pointer, an
+        // array of those, or a `repr(u32)` enum with a 0 variant, so the
+        // all-zero bit pattern is a valid value.
+        let mut info: BootInfo = unsafe { core::mem::zeroed() };
+        // `mint_module_memory_caps` reads the array through the direct map,
+        // so its "physical" address is the host address less the map's base.
+        info.modules.entries = (modules.as_ptr() as u64)
+            .wrapping_sub(crate::mm::paging::direct_map_base())
+            as *const boot_protocol::BootModule;
+        info.modules.count = modules.len() as u64;
+        let mut cspace = CSpace::new(0);
+        let mut layout = populate_cspace(
+            &mut cspace,
+            0,
+            &[],
+            crate::platform::ValidatedApertures::empty(),
+            &info,
+        );
+        mint_module_memory_caps(&mut cspace, &info, &mut layout);
+
+        // SAFETY: the test stand-in header, which nothing else writes.
+        let header = unsafe { &*init_info_header() };
+        assert_eq!(header.module_name_count, 2);
+        let procmgr = init_protocol::find_module_slot(header, b"procmgr").unwrap();
+        let memmgr = init_protocol::find_module_slot(header, b"memmgr").unwrap();
+        assert_ne!(procmgr, memmgr);
+        for slot in [procmgr, memmgr]
+        {
+            let tag = cspace.slot(slot as u32).map(|s| s.tag);
+            assert_eq!(tag, Some(slot::CapTag::Memory), "slot {slot}");
+        }
+        assert_eq!(init_protocol::find_module_slot(header, b"vfsd"), None);
+    }
 
     // ── reclaim passes ────────────────────────────────────────────────────────
 

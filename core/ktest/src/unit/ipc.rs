@@ -887,9 +887,12 @@ pub fn recv_snapshot_survives_buffer_clobber(ctx: &TestContext) -> TestResult
     // would produce.
     for i in 0..syscall_abi::MSG_DATA_WORDS_MAX
     {
-        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer; i is
-        // bounded by MSG_DATA_WORDS_MAX, well within the 4 KiB page.
-        unsafe { core::ptr::write_volatile(ctx.ipc_buf.add(i), 0xDEAD_BEEF_DEAD_BEEF) };
+        // SAFETY: i is bounded by MSG_DATA_WORDS_MAX, well within the 4 KiB
+        // IPC buffer page.
+        let slot = unsafe { ctx.ipc_buf.add(i) };
+        // SAFETY: ctx.ipc_buf is the registered per-thread IPC buffer, and
+        // `slot` is a word inside it.
+        unsafe { core::ptr::write_volatile(slot, 0xDEAD_BEEF_DEAD_BEEF) };
     }
 
     // Now consume the message. Must still see the sender's original words.
@@ -1727,9 +1730,9 @@ fn recv_reserve_drive(threads: [u64; 2], args: [u64; 2], reports: [u64; 2]) -> T
     let [victim_th, caller_th] = threads;
     let [victim_arg, caller_arg] = args;
     let [result, done] = reports;
-    // SAFETY: each entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
-    // each stack is that thread's own, on which no other live thread runs
-    // (`ChildStack`'s rule).
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
+    // the stack is `RECV_RESERVE_VICTIM_STACK`, the victim's own, on which no
+    // other live thread runs (`ChildStack`'s rule).
     unsafe {
         crate::spawn::configure_and_start_thread(
             victim_th,
@@ -1737,6 +1740,11 @@ fn recv_reserve_drive(threads: [u64; 2], args: [u64; 2], reports: [u64; 2]) -> T
             ChildStack::top(core::ptr::addr_of!(RECV_RESERVE_VICTIM_STACK)),
             victim_arg,
         )?;
+    }
+    // SAFETY: the entry is an `extern "C" fn(u64) -> !` of the entry ABI, and
+    // the stack is `RECV_RESERVE_CALLER_STACK`, the caller's own, on which no
+    // other live thread runs (`ChildStack`'s rule).
+    unsafe {
         crate::spawn::configure_and_start_thread(
             caller_th,
             recv_reserve_caller_entry,

@@ -49,6 +49,7 @@
 #![no_std]
 #![no_main]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -316,9 +317,13 @@ impl ChildStack
     pub unsafe fn used_bytes(ptr: *const Self) -> usize
     {
         let base = ptr.cast::<u8>();
-        // SAFETY: every offset is below `BYTES`, so inside the stack, and the
-        // caller's contract leaves no thread writing it.
-        let lowest = (0..Self::BYTES).find(|&i| unsafe { base.add(i).read() } != 0);
+        let lowest = (0..Self::BYTES).find(|&i| {
+            // SAFETY: i is below `BYTES`, so the byte lies inside the stack.
+            let byte = unsafe { base.add(i) };
+            // SAFETY: `byte` is inside the stack, and the caller's contract
+            // leaves no thread writing it.
+            unsafe { byte.read() != 0 }
+        });
         lowest.map_or(0, |i| Self::BYTES.saturating_sub(i))
     }
 }

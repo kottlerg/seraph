@@ -89,9 +89,14 @@ fn window_is_zero(ctx: &TestContext, cap: u64, offset: u64, pages: u64)
     unsafe { mem_map(cap, ctx.aspace_cap, PROBE_VA, offset, pages, MAP_READ) }
         .map_err(|_| ProbeError::Map)?;
     let base = PROBE_VA as *const u64;
-    // SAFETY: `[PROBE_VA, PROBE_VA + pages * PAGE_SIZE)` was mapped readable
-    // above; volatile reads form no Rust reference into the page.
-    let zero = (0..words).all(|i| unsafe { base.add(i).read_volatile() } == 0);
+    let zero = (0..words).all(|i| {
+        // SAFETY: i < words, so the word lies inside the
+        // `pages * PAGE_SIZE` bytes from `PROBE_VA`.
+        let word = unsafe { base.add(i) };
+        // SAFETY: `[PROBE_VA, PROBE_VA + pages * PAGE_SIZE)` was mapped
+        // readable above; volatile reads form no Rust reference into the page.
+        unsafe { word.read_volatile() == 0 }
+    });
     // SAFETY: `PROBE_VA` is a scratch VA (crate docs § Scratch VAs), so the
     // span holds no Rust object or IPC page of ktest.
     unsafe { mem_unmap(ctx.aspace_cap, PROBE_VA, pages) }.map_err(|_| ProbeError::Unmap)?;

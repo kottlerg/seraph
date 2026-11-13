@@ -25,6 +25,7 @@
 #![feature(alloc_error_hook)]
 #![feature(thread_local)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 #![expect(
     clippy::expect_used,
     clippy::unwrap_used,

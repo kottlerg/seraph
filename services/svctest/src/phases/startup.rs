@@ -128,6 +128,9 @@ pub fn env_phase(_: &Caps)
     // SAFETY: svctest is single-threaded at this point in main.
     unsafe {
         env::set_var("FOO", "bar");
+    }
+    // SAFETY: still single-threaded.
+    unsafe {
         env::set_var("BAZ", "qux");
     }
     assert_eq!(env::var("FOO").unwrap_or_default(), "bar");

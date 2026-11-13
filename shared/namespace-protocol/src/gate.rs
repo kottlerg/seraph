@@ -159,6 +159,13 @@ enum RightsRequirement
     AnyNonEmpty,
 }
 
+/// `bit` as the [`NonZeroU32`] of a [`RightsRequirement::Bits`] row.
+#[expect(
+    clippy::panic,
+    reason = "a zero rights bit in `RIGHTS_TABLE`, the only caller, whose constant initialiser \
+              evaluates this at compile time, so the panic fails the build and no run-time path \
+              reaches it"
+)]
 const fn nz(bit: u32) -> NonZeroU32
 {
     match NonZeroU32::new(bit)

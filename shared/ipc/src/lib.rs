@@ -28,6 +28,24 @@
 #![cfg_attr(feature = "rustc-dep-of-std", no_core)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
+// test configuration is exempt from the second set, as from `unwrap_used`.
+#![warn(
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 #![expect(
     clippy::cast_possible_truncation,
     reason = "userspace targets are 64-bit only, so u64 to usize is lossless; u32 capability slot \
@@ -4038,11 +4056,12 @@ impl IpcMessage
     #[must_use]
     pub fn word(&self, idx: usize) -> u64
     {
-        match self.data.get(idx)
-        {
-            Some(&word) => word,
-            None => panic!("IpcMessage::word: idx exceeds MSG_DATA_WORDS_MAX"),
-        }
+        assert!(
+            idx < MSG_DATA_WORDS_MAX,
+            "IpcMessage::word: idx exceeds MSG_DATA_WORDS_MAX"
+        );
+        // The assertion keeps `idx` inside `data`, so `get` always finds it.
+        self.data.get(idx).copied().unwrap_or_default()
     }
 
     /// Slice view of the populated data words: `&data[..word_count()]`.
@@ -4248,12 +4267,15 @@ impl IpcMessageBuilder
     #[must_use]
     pub fn word(mut self, idx: usize, val: u64) -> Self
     {
-        let Some(slot) = self.msg.data.get_mut(idx)
-        else
+        assert!(
+            idx < MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::word: idx exceeds MSG_DATA_WORDS_MAX"
+        );
+        // The assertion keeps `idx` inside `data`, so `get_mut` always finds it.
+        if let Some(slot) = self.msg.data.get_mut(idx)
         {
-            panic!("IpcMessageBuilder::word: idx exceeds MSG_DATA_WORDS_MAX");
-        };
-        *slot = val;
+            *slot = val;
+        }
         // `idx < MSG_DATA_WORDS_MAX`, far below `u8::MAX`, so neither the
         // cast nor the addition loses the count.
         let needed = (idx as u8).saturating_add(1);
@@ -4275,15 +4297,18 @@ impl IpcMessageBuilder
     #[must_use]
     pub fn words(mut self, start: usize, src: &[u64]) -> Self
     {
-        let Some((end, dst)) = start
-            .checked_add(src.len())
-            .filter(|&end| end <= MSG_DATA_WORDS_MAX)
-            .and_then(|end| Some((end, self.msg.data.get_mut(start..end)?)))
-        else
+        // A sum past `usize::MAX` saturates, and fails the assertion as well.
+        let end = start.saturating_add(src.len());
+        assert!(
+            end <= MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::words: range exceeds MSG_DATA_WORDS_MAX"
+        );
+        // `start <= end <= MSG_DATA_WORDS_MAX`, so `get_mut` always finds the
+        // range, which is `src.len()` words long.
+        if let Some(dst) = self.msg.data.get_mut(start..end)
         {
-            panic!("IpcMessageBuilder::words: range exceeds MSG_DATA_WORDS_MAX");
-        };
-        dst.copy_from_slice(src);
+            dst.copy_from_slice(src);
+        }
         let needed = end as u8;
         if self.msg.data_len < needed
         {
@@ -4305,17 +4330,20 @@ impl IpcMessageBuilder
     pub fn bytes(mut self, start_word: usize, src: &[u8]) -> Self
     {
         let word_count = src.len().div_ceil(8);
-        let Some((end, dst)) = start_word
-            .checked_add(word_count)
-            .filter(|&end| end <= MSG_DATA_WORDS_MAX)
-            .and_then(|end| Some((end, self.msg.data.get_mut(start_word..end)?)))
-        else
+        // A sum past `usize::MAX` saturates, and fails the assertion as well.
+        let end = start_word.saturating_add(word_count);
+        assert!(
+            end <= MSG_DATA_WORDS_MAX,
+            "IpcMessageBuilder::bytes: range exceeds MSG_DATA_WORDS_MAX"
+        );
+        // `start_word <= end <= MSG_DATA_WORDS_MAX`, so `get_mut` always finds
+        // the range.
+        if let Some(dst) = self.msg.data.get_mut(start_word..end)
         {
-            panic!("IpcMessageBuilder::bytes: range exceeds MSG_DATA_WORDS_MAX");
-        };
-        for (word, chunk) in dst.iter_mut().zip(src.chunks(8))
-        {
-            *word = u64::from_le_bytes(padded_word(chunk));
+            for (word, chunk) in dst.iter_mut().zip(src.chunks(8))
+            {
+                *word = u64::from_le_bytes(padded_word(chunk));
+            }
         }
         let needed = end as u8;
         if self.msg.data_len < needed
@@ -4337,12 +4365,17 @@ impl IpcMessageBuilder
     #[must_use]
     pub fn cap(mut self, handle: u64) -> Self
     {
-        let Some(slot) = self.msg.cap_slots.get_mut(usize::from(self.msg.cap_count))
-        else
+        let idx = usize::from(self.msg.cap_count);
+        assert!(
+            idx < MSG_CAP_SLOTS_MAX,
+            "IpcMessageBuilder::cap: MSG_CAP_SLOTS_MAX caps already appended"
+        );
+        // The assertion keeps `idx` inside `cap_slots`, so `get_mut` always
+        // finds it.
+        if let Some(slot) = self.msg.cap_slots.get_mut(idx)
         {
-            panic!("IpcMessageBuilder::cap: MSG_CAP_SLOTS_MAX caps already appended");
-        };
-        *slot = handle;
+            *slot = handle;
+        }
         // The count is below `MSG_CAP_SLOTS_MAX`, so this cannot saturate.
         self.msg.cap_count = self.msg.cap_count.saturating_add(1);
         self
@@ -4877,6 +4910,53 @@ mod tests
     fn empty_bytes_at_an_out_of_range_start_panics()
     {
         let _ = IpcMessage::builder(1).bytes(MSG_DATA_WORDS_MAX + 1, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "words: range exceeds MSG_DATA_WORDS_MAX")]
+    fn words_whose_end_overflows_usize_panic()
+    {
+        let _ = IpcMessage::builder(1).words(usize::MAX, &[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "bytes: range exceeds MSG_DATA_WORDS_MAX")]
+    fn bytes_whose_end_overflows_usize_panic()
+    {
+        let _ = IpcMessage::builder(1).bytes(usize::MAX, &[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "IpcMessageBuilder::word: idx exceeds MSG_DATA_WORDS_MAX")]
+    fn setting_a_word_past_the_data_bound_panics()
+    {
+        let _ = IpcMessage::builder(1).word(MSG_DATA_WORDS_MAX, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "IpcMessage::word: idx exceeds MSG_DATA_WORDS_MAX")]
+    fn reading_a_word_past_the_data_bound_panics()
+    {
+        let _ = IpcMessage::new(1).word(MSG_DATA_WORDS_MAX);
+    }
+
+    #[test]
+    fn caps_fill_every_slot_in_order()
+    {
+        let msg = (0..MSG_CAP_SLOTS_MAX as u64)
+            .fold(IpcMessage::builder(1), |b, handle| b.cap(handle + 10))
+            .build();
+        let expected: [u64; MSG_CAP_SLOTS_MAX] = core::array::from_fn(|i| i as u64 + 10);
+        assert_eq!(msg.caps(), expected.as_slice());
+    }
+
+    #[test]
+    #[should_panic(expected = "IpcMessageBuilder::cap: MSG_CAP_SLOTS_MAX caps already appended")]
+    fn a_cap_past_the_slot_bound_panics()
+    {
+        let full =
+            (0..MSG_CAP_SLOTS_MAX as u64).fold(IpcMessage::builder(1), IpcMessageBuilder::cap);
+        let _ = full.cap(99);
     }
 
     #[test]

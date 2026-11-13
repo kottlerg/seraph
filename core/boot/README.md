@@ -22,6 +22,7 @@ documented in [core/boot/docs/kernel-handoff.md](docs/kernel-handoff.md).
 core/boot/
 ├── Cargo.toml                  # boot crate (UEFI application)
 ├── build.rs                    # Passes the RISC-V UEFI linker script to the linker
+├── clippy.toml                 # Boot's clippy thresholds (fn-params bools, stack frame size)
 ├── linker/
 │   └── riscv64-uefi.ld         # Linker script for RISC-V PE/COFF pipeline
 ├── testdata/                   # QEMU virt AIA DTB, MADT and RHCT; the parsers' host-test input
@@ -120,7 +121,7 @@ See [core/boot/docs/riscv-uefi-boot.md](docs/riscv-uefi-boot.md) for details.
 |---|---|
 | [core/boot/docs/kernel-handoff.md](docs/kernel-handoff.md) | Kernel entry contract: CPU state, register contents, handoff sequence |
 | [core/boot/docs/boot-flow.md](docs/boot-flow.md) | Ten-step boot sequence, `BootInfo` population, kernel handoff |
-| [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, `ExitBootServices`, error handling |
+| [core/boot/docs/uefi-environment.md](docs/uefi-environment.md) | UEFI protocols, memory allocation, the stack, `ExitBootServices`, error handling |
 | [core/boot/docs/elf-loading.md](docs/elf-loading.md) | ELF validation, LOAD segment processing, boot module loading |
 | [core/boot/docs/firmware-parsing.md](docs/firmware-parsing.md) | ACPI and Device Tree extractors: CPU topology, kernel-facing MMIO bases, coarse MMIO apertures, the DTB rng-seed fallback, and the VMGENID GUID address |
 | [core/boot/docs/acpi.md](docs/acpi.md) | ACPI table-walk invariants (RSDP, XSDT, MADT, MCFG, SPCR, RHCT, SSDT) |

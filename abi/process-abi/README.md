@@ -257,8 +257,9 @@ which that crate pins with a const assert, so the cap costs VA only. Four pages 
 below every main-thread stack `shared/process-layout` places and every demand-paged thread stack
 std spawns: on riscv64 two consecutive stack stores of the std target can lie up to 14312 bytes
 apart ([docs/build-system.md](../../docs/build-system.md) § Custom Targets), and a smaller guard
-could lie wholly between them. Init's own stacks and the stacks the `lowuser` services place
-themselves keep less ([#1018](https://github.com/kottlerg/seraph/issues/1018)). The pool's
+could lie wholly between them. Every stack of the `lowuser` binaries keeps the same guard:
+init's main stack, which the kernel places, init's log-thread stack, and ktest's child stacks
+([docs/build-system.md](../../docs/build-system.md) § Custom Targets). The pool's
 available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS` calls; memmgr enforces
 no per-process quota (see
 [services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Non-Goals).

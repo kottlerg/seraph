@@ -2064,7 +2064,7 @@ mod init_layout_tests
             assert_eq!(layout.init_stack_top % page, 0);
             // The lowest guard page is the window's draw, with
             // STACK_GUARD_PAGES guard pages between it and the stack base.
-            let stack_reserve = (STACK_GUARD_PAGES as u64 + INIT_STACK_PAGES as u64) * page;
+            let stack_reserve = (u64::from(STACK_GUARD_PAGES) + INIT_STACK_PAGES as u64) * page;
             let guard = layout.init_stack_top - stack_reserve;
             assert!(INIT_STACK_GUARD_WINDOW.contains(guard));
             assert!(layout.init_stack_top < LAYOUT_VA_CEILING);
@@ -2084,7 +2084,7 @@ mod init_layout_tests
     {
         let page = PAGE_SIZE as u64;
         let guard =
-            DEFAULT_INIT_STACK_TOP - (STACK_GUARD_PAGES as u64 + INIT_STACK_PAGES as u64) * page;
+            DEFAULT_INIT_STACK_TOP - (u64::from(STACK_GUARD_PAGES) + INIT_STACK_PAGES as u64) * page;
         let info_end = DEFAULT_INIT_INFO_VA + init_protocol::INIT_INFO_MAX_PAGES as u64 * page;
         assert!(info_end <= guard);
         const { assert!(DEFAULT_INIT_INFO_VA >= process_layout::FIXED_IMAGE_ZONE_END) };

@@ -181,6 +181,7 @@ concurrent notification and queue events.
 | `cap_generation_wide.rs` | A slot recycled 256 times keeps the handle from 256 recycles earlier stale; a handle with an altered high half, a call transferring the stale handle, and a cap-bearing call or reply with no IPC buffer are refused (#637) |
 | `fpu_survives_ipc_call.rs` | The FPU register file survives a raw `SYS_IPC_CALL` round-trip across CPU migration |
 | `fault_kills_thread.rs` | A genuine userspace page fault kills the thread |
+| `child_stack_guard.rs` | A frame larger than a child's `ChildStack` and its guard together faults in the guard (the `lowuser` targets' inline stack probes) instead of storing below it |
 | `fault_pager_roundtrip.rs` | A userspace pager resolves a page fault and resumes the thread |
 | `fault_resume_modifies_pc.rs` | A fault handler edits the fault-blocked thread's registers and resumes it at a new instruction pointer |
 | `fault_handler_declines_kills.rs` | A fault handler replying `FAULT_REPLY_KILL` terminates the faulting thread as an unhandled fault |
@@ -454,7 +455,10 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   (through `delete_thread` / `delete_cspace`), so a test that fails early
   leaves no child running.
 - `ChildStack` / `IpcPage` — a child's static 16 KiB stack and page-aligned
-  IPC buffer page, declared per test (or, for most stress cells, taken from
+  IPC buffer page. A `ChildStack` is a `GuardedStack`: the
+  `STACK_GUARD_PAGES` pages below the stack are its guard, which
+  `ChildStack::top` unmaps on the stack's first use, so an overflow faults.
+  Each is declared per test (or, for most stress cells, taken from
   the shared `stress::STRESS_STACKS`) and handed to one thread at a time (the
   rule in their rustdoc). `ChildStack::top_at(addr_of!(STACKS), i)` and
   `IpcPage::addr_at(addr_of_mut!(PAGES), i)` take element `i` of a `static
@@ -469,7 +473,7 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   the top of the child's stack instead, abandoning the frames it stopped in:
   a cell that redirects one child round after round uses it, since each
   redirect on the stopped stack pointer leaves a call chain behind, and
-  enough rounds overflow the `ChildStack` into the statics below it. Both
+  enough rounds overflow the `ChildStack` into its guard. Both
   fail, leaving the register file unchanged, when it is too short to hold
   the registers they write; `spawn::reg_word(regs, at)` and
   `spawn::set_reg_word(regs, at, value)` read and write one 8-byte register

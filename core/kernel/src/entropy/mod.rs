@@ -29,9 +29,6 @@
 //! detector, self-test, and draw API are hardware-coupled and compiled only
 //! for the kernel target.
 
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
-#![warn(clippy::multiple_unsafe_ops_per_block)]
-
 pub mod health;
 pub mod keccak;
 pub mod reseed_policy;

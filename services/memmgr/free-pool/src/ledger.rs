@@ -495,11 +495,12 @@ mod tests
     fn ledger() -> Ledger<VecStore, VecWords>
     {
         let mut l = Ledger::new(VecStore::default(), VecWords::default());
-        // SAFETY: both test stores grow on write.
-        unsafe {
-            l.arena.add_page();
-            l.index.add_page(&mut l.arena);
-        }
+        // SAFETY: the test slot store grows on write, so it accepts every
+        // index of the page.
+        unsafe { l.arena.add_page() };
+        // SAFETY: the test word store grows on write, so it accepts every
+        // word of the page.
+        unsafe { l.index.add_page(&mut l.arena) };
         l
     }
 

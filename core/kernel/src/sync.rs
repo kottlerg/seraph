@@ -205,13 +205,14 @@ mod tests
     fn lock_unlock_sequence()
     {
         let sl = Spinlock::new();
-        // SAFETY: each saved value is passed verbatim to the matching unlock_raw.
-        unsafe {
-            let s1 = sl.lock_raw();
-            sl.unlock_raw(s1);
-            let s2 = sl.lock_raw();
-            sl.unlock_raw(s2);
-        }
+        // SAFETY: the saved value is passed verbatim to the unlock_raw below.
+        let s1 = unsafe { sl.lock_raw() };
+        // SAFETY: s1 is the value the matching lock_raw returned.
+        unsafe { sl.unlock_raw(s1) };
+        // SAFETY: the saved value is passed verbatim to the unlock_raw below.
+        let s2 = unsafe { sl.lock_raw() };
+        // SAFETY: s2 is the value the matching lock_raw returned.
+        unsafe { sl.unlock_raw(s2) };
         // No deadlock means the ticket counter advanced correctly.
     }
 
@@ -221,11 +222,10 @@ mod tests
         let sl = Spinlock::new();
         for _ in 0..10
         {
-            // SAFETY: the saved value is passed verbatim to unlock_raw.
-            unsafe {
-                let s = sl.lock_raw();
-                sl.unlock_raw(s);
-            }
+            // SAFETY: the saved value is passed verbatim to the unlock_raw below.
+            let s = unsafe { sl.lock_raw() };
+            // SAFETY: s is the value the matching lock_raw returned.
+            unsafe { sl.unlock_raw(s) };
         }
     }
 
@@ -233,27 +233,32 @@ mod tests
     fn try_lock_succeeds_when_free_and_rejects_when_held()
     {
         let sl = Spinlock::new();
-        // SAFETY: every acquisition's saved value is passed verbatim to unlock_raw.
-        unsafe {
-            let first = sl.try_lock_raw();
-            assert!(first.is_some(), "free lock must try-acquire");
-            assert!(
-                sl.try_lock_raw().is_none(),
-                "held lock must reject a try-acquire"
-            );
-            if let Some(s) = first
-            {
-                sl.unlock_raw(s);
-            }
-            // Released: a subsequent try-acquire and a blocking acquire both work.
-            let second = sl.try_lock_raw();
-            assert!(second.is_some(), "released lock must try-acquire again");
-            if let Some(s) = second
-            {
-                sl.unlock_raw(s);
-            }
-            let s3 = sl.lock_raw();
-            sl.unlock_raw(s3);
+        // SAFETY: on `Some`, the saved value is passed verbatim to unlock_raw
+        // below.
+        let first = unsafe { sl.try_lock_raw() };
+        assert!(first.is_some(), "free lock must try-acquire");
+        // SAFETY: the lock is held, so this returns `None`, which owes no
+        // unlock; a `Some` would fail the assertion.
+        let contended = unsafe { sl.try_lock_raw() };
+        assert!(contended.is_none(), "held lock must reject a try-acquire");
+        if let Some(s) = first
+        {
+            // SAFETY: s is the value the matching try_lock_raw returned.
+            unsafe { sl.unlock_raw(s) };
         }
+        // Released: a subsequent try-acquire and a blocking acquire both work.
+        // SAFETY: on `Some`, the saved value is passed verbatim to unlock_raw
+        // below.
+        let second = unsafe { sl.try_lock_raw() };
+        assert!(second.is_some(), "released lock must try-acquire again");
+        if let Some(s) = second
+        {
+            // SAFETY: s is the value the matching try_lock_raw returned.
+            unsafe { sl.unlock_raw(s) };
+        }
+        // SAFETY: the saved value is passed verbatim to the unlock_raw below.
+        let s3 = unsafe { sl.lock_raw() };
+        // SAFETY: s3 is the value the matching lock_raw returned.
+        unsafe { sl.unlock_raw(s3) };
     }
 }

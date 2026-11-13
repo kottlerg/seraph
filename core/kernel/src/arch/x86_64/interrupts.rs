@@ -152,8 +152,10 @@ fn x2apic_supported() -> bool
 unsafe fn enable_x2apic_this_cpu()
 {
     // SAFETY: IA32_APIC_BASE exists on every x86-64 local APIC; ring 0.
+    let base = unsafe { cpu::read_msr(IA32_APIC_BASE) };
+    // SAFETY: as for the read; the CPU advertises x2APIC (caller's contract),
+    // so setting EXTD beside the firmware's global enable is valid.
     unsafe {
-        let base = cpu::read_msr(IA32_APIC_BASE);
         cpu::write_msr(
             IA32_APIC_BASE,
             base | APIC_BASE_GLOBAL_ENABLE | APIC_BASE_X2APIC_ENABLE,
@@ -247,6 +249,9 @@ pub unsafe fn init()
     // advertises XSAVE; we fatal cleanly if the advertisement is absent.
     unsafe {
         fpu::enable_xsave();
+    }
+    // SAFETY: ring 0; no thread's state is live in the FP registers yet.
+    unsafe {
         fpu::cr0_set_ts();
     }
 
@@ -304,6 +309,10 @@ pub unsafe fn init()
 
     // 6. Mask all LVT entries to prevent unexpected interrupts before the
     //    timer is configured.
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a register of this CPU's local APIC, at a constant offset"
+    )]
     // SAFETY: direct map / x2APIC MSRs active; LVT mask writes are architecture-defined.
     unsafe {
         apic_write(APIC_LVT_TIMER, LVT_MASK);
@@ -392,9 +401,11 @@ pub fn nmi_backtrace_request(cpu: usize) -> Option<&'static core::sync::atomic::
     {
         return None;
     }
-    // SAFETY: cpu < cpu_count; the slab covers cpu_count zero-initialised
-    // AtomicU32 slots.
-    Some(unsafe { &*base.add(cpu) })
+    // SAFETY: cpu < cpu_count; the slab covers cpu_count slots.
+    let slot = unsafe { base.add(cpu) };
+    // SAFETY: every slot is a zero-initialised AtomicU32, live for the kernel's
+    // lifetime.
+    Some(unsafe { &*slot })
 }
 
 /// ICR delivery-mode + level encoding for an NMI IPI (`delivery_mode`=4 = NMI,
@@ -436,6 +447,10 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
     // SAFETY: APIC MMIO is valid; ICR_HIGH takes the destination in bits [31:24].
     unsafe {
         apic_write(APIC_ICR_HIGH, dest << 24);
+    }
+    // SAFETY: APIC MMIO is valid; cmd is a valid ICR command word (caller's
+    // contract), and writing ICR_LOW sends it to the destination set above.
+    unsafe {
         apic_write(APIC_ICR_LOW, cmd);
     }
 }
@@ -473,6 +488,11 @@ unsafe fn wait_icr_idle()
 #[cfg(not(test))]
 unsafe fn send_init_ipi(target_apic_id: u32)
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every call is a step of the one INIT assert/de-assert sequence to \
+                  `target_apic_id`"
+    )]
     // SAFETY: ICR writes follow the Intel SDM INIT assert/de-assert sequence.
     unsafe {
         apic_send_icr(target_apic_id, ICR_INIT_ASSERT);
@@ -492,6 +512,9 @@ unsafe fn send_sipi(target_apic_id: u32, vector: u8)
     // SAFETY: ICR SIPI write follows the Intel SDM STARTUP sequence.
     unsafe {
         apic_send_icr(target_apic_id, ICR_SIPI_BASE | vector as u32);
+    }
+    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
+    unsafe {
         wait_icr_idle();
     }
 }
@@ -633,6 +656,11 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
 pub unsafe fn start_ap(target_apic_id: u32, trampoline_phys: u64)
 {
     let vector = (trampoline_phys >> 12) as u8;
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every call is a step of the one Intel SDM INIT-SIPI-SIPI sequence to \
+                  `target_apic_id`"
+    )]
     // SAFETY: caller guarantees APIC is initialized, trampoline set up, and timer calibrated; INIT+SIPI sequence follows Intel SDM.
     unsafe {
         send_init_ipi(target_apic_id);
@@ -658,10 +686,16 @@ pub unsafe fn init_ap()
     // CR4.LA57 under 5-level paging); SMEP, SMAP, OSXSAVE, and TS are per-CPU
     // state that must be re-established on each hart.
     // SAFETY: ring-0 AP boot; IDT loaded by caller (kernel_entry_ap); CPUID
-    // gates each enable so a missing feature halts cleanly.
+    // gates the enable so a missing feature halts cleanly.
     unsafe {
         cpu::enable_smep_smap();
+    }
+    // SAFETY: as for SMEP/SMAP: ring-0 AP boot, IDT loaded, CPUID-gated.
+    unsafe {
         fpu::enable_xsave();
+    }
+    // SAFETY: ring 0; no thread's state is live in this CPU's FP registers yet.
+    unsafe {
         fpu::cr0_set_ts();
     }
 
@@ -676,6 +710,10 @@ pub unsafe fn init_ap()
         }
     }
 
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to a register of this CPU's local APIC, at a constant offset"
+    )]
     // SAFETY: AP has loaded GDT/IDT; direct map / x2APIC MSRs active; SVR and LVT writes are architecture-defined.
     unsafe {
         apic_write(

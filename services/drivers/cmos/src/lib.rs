@@ -14,6 +14,7 @@
 //! I/O ports.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 /// Seconds register.
 pub const REG_SECONDS: u8 = 0x00;

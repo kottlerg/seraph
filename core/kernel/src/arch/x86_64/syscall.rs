@@ -241,6 +241,10 @@ unsafe extern "C" fn syscall_entry()
 #[cfg(not(test))]
 pub unsafe fn init()
 {
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access is to one of this CPU's SYSCALL-configuration MSRs"
+    )]
     // SAFETY: ring 0; MSR writes.
     unsafe {
         let efer = cpu::read_msr(IA32_EFER);

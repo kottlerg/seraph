@@ -1416,6 +1416,11 @@ pub unsafe fn write_memmgr_aux_memory(
 {
     use ipc::memmgr_bootstrap as mb;
 
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every write is to a word of the phys-table page at a constant index, which \
+                  the caller's contract maps writable"
+    )]
     // SAFETY: the facts and in-use-count indices lie within the mapped page.
     unsafe {
         core::ptr::write_volatile(
@@ -1442,16 +1447,25 @@ pub unsafe fn write_memmgr_aux_memory(
         let base = i
             .saturating_mul(mb::IN_USE_WORDS)
             .saturating_add(mb::IN_USE_BASE_IDX);
-        // SAFETY: base + 3 < IN_USE_BASE_IDX + MAX_IN_USE * IN_USE_WORDS, within the page.
-        unsafe {
-            core::ptr::write_volatile(phys_dst.add(base), arena.cap_slot);
-            core::ptr::write_volatile(
-                phys_dst.add(base.saturating_add(1)),
-                u64::from(arena.page_count),
-            );
-            core::ptr::write_volatile(phys_dst.add(base.saturating_add(2)), arena.phys_base);
-            core::ptr::write_volatile(phys_dst.add(base.saturating_add(3)), arena.kind);
-        }
+        // Each offset below is at most base + 3 < IN_USE_BASE_IDX + MAX_IN_USE *
+        // IN_USE_WORDS, within the page; each write is to that word of the
+        // caller's writable mapping of the page.
+        // SAFETY: the offset `base` lies within the page (above).
+        let cap_slot = unsafe { phys_dst.add(base) };
+        // SAFETY: `cap_slot` is a word of the caller's writable page mapping.
+        unsafe { core::ptr::write_volatile(cap_slot, arena.cap_slot) };
+        // SAFETY: the offset `base + 1` lies within the page (above).
+        let page_count = unsafe { phys_dst.add(base.saturating_add(1)) };
+        // SAFETY: `page_count` is a word of the caller's writable page mapping.
+        unsafe { core::ptr::write_volatile(page_count, u64::from(arena.page_count)) };
+        // SAFETY: the offset `base + 2` lies within the page (above).
+        let phys_base = unsafe { phys_dst.add(base.saturating_add(2)) };
+        // SAFETY: `phys_base` is a word of the caller's writable page mapping.
+        unsafe { core::ptr::write_volatile(phys_base, arena.phys_base) };
+        // SAFETY: the offset `base + 3` lies within the page (above).
+        let kind = unsafe { phys_dst.add(base.saturating_add(3)) };
+        // SAFETY: `kind` is a word of the caller's writable page mapping.
+        unsafe { core::ptr::write_volatile(kind, arena.kind) };
     }
 }
 

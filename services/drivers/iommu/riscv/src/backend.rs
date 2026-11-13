@@ -590,12 +590,15 @@ impl Backend for Riscv
                 let mut words = [0u64; FAULT_RECORD_WORDS];
                 for (i, w) in words.iter_mut().enumerate()
                 {
+                    // SAFETY: `head` is below `FQ_ENTRIES` and `i` below
+                    // `FAULT_RECORD_WORDS`, so the record's word lies in the
+                    // fault-queue page's 512.
+                    let word = unsafe { queue.add(at.saturating_add(i)) };
                     // SAFETY: `queue` is the fault-queue page, mapped for the
-                    // driver's life; `head` is below `FQ_ENTRIES`, so the
-                    // record's words lie in the page's 512. The IOMMU writes
+                    // driver's life, and `word` lies in it. The IOMMU writes
                     // the page, so it is read through the raw pointer alone,
                     // with no reference to it formed.
-                    *w = unsafe { core::ptr::read_volatile(queue.add(at.saturating_add(i))) };
+                    *w = unsafe { core::ptr::read_volatile(word) };
                 }
                 if let Some(f) = regs::decode_fault(words)
                     && let Ok(bdf) = u16::try_from(f.device_id)

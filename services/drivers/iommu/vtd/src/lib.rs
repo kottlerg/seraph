@@ -15,6 +15,7 @@
 //! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 extern crate alloc;
 

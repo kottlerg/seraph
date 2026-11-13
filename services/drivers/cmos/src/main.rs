@@ -19,6 +19,7 @@
 //! every request.
 
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 use cmos_rtc::{Calendar, CmosRegs, epoch_us};
 use driver_binding::resources::{self, PlatformDelivery, Resource};
@@ -131,11 +132,10 @@ unsafe fn inb(port: u16) -> u8
 
 fn cmos_read(reg: u8) -> u8
 {
-    // SAFETY: CMOS_INDEX / CMOS_DATA are in the bound IoPort.
-    unsafe {
-        outb(CMOS_INDEX, reg);
-        inb(CMOS_DATA)
-    }
+    // SAFETY: CMOS_INDEX is in the IoPort range bound to this thread.
+    unsafe { outb(CMOS_INDEX, reg) };
+    // SAFETY: CMOS_DATA is in the IoPort range bound to this thread.
+    unsafe { inb(CMOS_DATA) }
 }
 
 /// [`CmosRegs`] over the CMOS index/data ports bound to this thread.

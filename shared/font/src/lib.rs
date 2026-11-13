@@ -16,6 +16,7 @@
 
 #![no_std]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
+#![warn(clippy::multiple_unsafe_ops_per_block)]
 
 /// Glyph width in pixels.
 pub const GLYPH_WIDTH: u32 = 9;

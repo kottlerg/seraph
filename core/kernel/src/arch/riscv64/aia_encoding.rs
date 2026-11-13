@@ -9,9 +9,7 @@
 //! (`aia` drives the controllers with them).
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
-//! arch module. `arch/mod.rs` also compiles this file into host test builds
-//! of the other architectures, so `cargo xtask test` (run on an `x86_64`
-//! host) runs its tests.
+//! arch module.
 
 /// Largest APLIC interrupt source the RISC-V Advanced Interrupt Architecture
 /// allows (sources 1..=1023; source 0 is reserved).

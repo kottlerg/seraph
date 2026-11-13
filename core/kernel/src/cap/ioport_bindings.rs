@@ -379,6 +379,12 @@ mod tests
     #[test]
     fn withdrawing_one_binding_keeps_ports_another_binding_grants()
     {
+        // The bitmap has no part on an architecture without port I/O
+        // (RISC-V), so there is nothing to check there.
+        if IOPB_PARTS == 0
+        {
+            return;
+        }
         let mut t = table();
         let t = &mut *t.table;
         t.bind(0xA000, 0x60, 8).unwrap();
@@ -401,6 +407,12 @@ mod tests
     #[test]
     fn a_binding_across_the_parts_is_permitted_and_withdrawn_in_both()
     {
+        // The bitmap has no part on an architecture without port I/O
+        // (RISC-V), so there is nothing to check there.
+        if IOPB_PARTS == 0
+        {
+            return;
+        }
         let mut t = table();
         let t = &mut *t.table;
         let edge = (IOPB_PART_BYTES * 8) as u32;

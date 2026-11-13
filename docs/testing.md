@@ -8,7 +8,9 @@ diagnose a failing boot.
 This document covers booted functional testing. Host-side `#[cfg(test)]` unit
 tests — their quality rules and the boundary between host-unit and booted
 testing — are governed by
-[coding-standards.md](coding-standards.md#d-testing-invariants).
+[coding-standards.md](coding-standards.md#d-testing-invariants). `cargo xtask test` runs them on
+the host and again built for riscv64 under QEMU's user-mode emulator, which needs the packages
+[build-system.md](build-system.md#toolchain) § Toolchain lists.
 
 ---
 

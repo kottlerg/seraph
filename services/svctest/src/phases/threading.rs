@@ -20,7 +20,7 @@ use std::io;
 use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -369,16 +369,13 @@ pub fn condvar_notify_all_fanout_phase(_: &Caps)
             let woke = woke.clone();
             thread::spawn(move || {
                 let (lock, cv) = &*shared;
-                let mut state = lock.lock().expect("mutex poisoned");
-                state.0 = state
-                    .0
-                    .checked_add(1)
-                    .expect("condvar waiter count overflowed");
                 // `wait_while` queues this thread before it unlocks the mutex,
                 // so a count the main thread reads under the lock counts only
                 // queued waiters.
-                let state = cv.wait_while(state, |s| !s.1).expect("mutex poisoned");
-                drop(state);
+                let woken = cv
+                    .wait_while(count_fanout_waiter(lock), |s| !s.1)
+                    .expect("mutex poisoned");
+                drop(woken);
                 let _ = woke.send(());
             })
         })
@@ -414,6 +411,19 @@ pub fn condvar_notify_all_fanout_phase(_: &Caps)
         w.join().expect("condvar waiter panicked");
     }
     std::os::seraph::log!("condvar_notify_all_fanout phase passed");
+}
+
+/// Lock the fan-out state and count the calling thread among its waiters. The
+/// caller waits on the returned guard, so the count stays under the lock until
+/// the thread is queued on the condvar.
+fn count_fanout_waiter(lock: &Mutex<(usize, bool)>) -> MutexGuard<'_, (usize, bool)>
+{
+    let mut state = lock.lock().expect("mutex poisoned");
+    state.0 = state
+        .0
+        .checked_add(1)
+        .expect("condvar waiter count overflowed");
+    state
 }
 
 /// `FANOUT_WAITERS` threads blocked on a `OnceLock` whose initialiser is
@@ -508,6 +518,19 @@ struct MiddleWaiterState
 /// Wait until `queued` threads have queued on `cv`, failing after
 /// `FANOUT_BOUND`. A waiter counts itself under the lock before it waits, and
 /// the wait queues it before unlocking, so the count covers queued waiters only.
+/// Lock the middle-waiter state and count the calling thread as queued. The
+/// caller waits on the returned guard, so the count stays under the lock until
+/// the thread is queued on the condvar.
+fn count_queued_waiter(lock: &Mutex<MiddleWaiterState>) -> MutexGuard<'_, MiddleWaiterState>
+{
+    let mut state = lock.lock().expect("mutex poisoned");
+    state.queued = state
+        .queued
+        .checked_add(1)
+        .expect("queued waiter count overflowed");
+    state
+}
+
 fn await_queued(shared: &(Mutex<MiddleWaiterState>, Condvar), queued: usize)
 {
     let start = Instant::now();
@@ -534,19 +557,14 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
     let untimed = |shared: Arc<(Mutex<MiddleWaiterState>, Condvar)>, woke: mpsc::Sender<()>| {
         thread::spawn(move || {
             let (lock, cv) = &*shared;
-            let mut state = lock.lock().expect("mutex poisoned");
-            state.queued = state
-                .queued
-                .checked_add(1)
-                .expect("queued waiter count overflowed");
-            let mut state = cv
-                .wait_while(state, |s| s.tokens == 0)
+            let mut woken = cv
+                .wait_while(count_queued_waiter(lock), |s| s.tokens == 0)
                 .expect("mutex poisoned");
-            state.tokens = state
+            woken.tokens = woken
                 .tokens
                 .checked_sub(1)
                 .expect("a waiter woke with no token to take");
-            drop(state);
+            drop(woken);
             let _ = woke.send(());
         })
     };
@@ -559,15 +577,10 @@ pub fn condvar_timed_middle_waiter_phase(_: &Caps)
         let shared = shared.clone();
         thread::spawn(move || {
             let (lock, cv) = &*shared;
-            let mut state = lock.lock().expect("mutex poisoned");
-            state.queued = state
-                .queued
-                .checked_add(1)
-                .expect("queued waiter count overflowed");
-            let (state, result) = cv
-                .wait_timeout_while(state, TIMED_WAIT, |s| s.tokens == 0)
+            let (woken, result) = cv
+                .wait_timeout_while(count_queued_waiter(lock), TIMED_WAIT, |s| s.tokens == 0)
                 .expect("mutex poisoned");
-            drop(state);
+            drop(woken);
             let _ = timed_tx.send(result.timed_out());
         })
     };
@@ -684,6 +697,9 @@ fn mutex_handoff_stress()
                     {
                         thread::yield_now();
                     }
+                    // Released only after the yield, so the others find the
+                    // lock held, spin out and park on it.
+                    drop(guard);
                 }
             })
         })
@@ -949,10 +965,9 @@ pub fn timeout_phase(_: &Caps)
 {
     let cv = Condvar::new();
     let m = Mutex::new(());
-    let guard = m.lock().expect("mutex poisoned");
     let t0 = Instant::now();
     let (_guard, result) = cv
-        .wait_timeout(guard, Duration::from_millis(50))
+        .wait_timeout(m.lock().expect("mutex poisoned"), Duration::from_millis(50))
         .expect("wait_timeout failed");
     let elapsed = t0.elapsed();
     assert!(result.timed_out(), "expected timeout but got early wake");
@@ -970,16 +985,18 @@ pub fn timeout_phase(_: &Caps)
     let _notifier = thread::spawn(move || {
         thread::sleep(Duration::from_millis(50));
         let (lock, cv) = &*pair2;
-        let mut flag = lock.lock().expect("mutex poisoned");
-        *flag = true;
+        *lock.lock().expect("mutex poisoned") = true;
         cv.notify_one();
     });
 
     let (lock, cv) = &*pair;
-    let flag = lock.lock().expect("mutex poisoned");
     let t0 = Instant::now();
     let (flag, result) = cv
-        .wait_timeout_while(flag, Duration::from_secs(1), |f| !*f)
+        .wait_timeout_while(
+            lock.lock().expect("mutex poisoned"),
+            Duration::from_secs(1),
+            |f| !*f,
+        )
         .expect("wait_timeout_while failed");
     let elapsed = t0.elapsed();
     assert!(*flag, "notifier flag not set on wake");

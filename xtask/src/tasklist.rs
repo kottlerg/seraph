@@ -26,12 +26,9 @@ fn after_marker(line: &str) -> Option<&str>
     {
         return Some(rest);
     }
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0
-    {
-        return None;
-    }
-    let rest = &rest[digits..];
+    let rest = rest
+        .strip_prefix(|c: char| c.is_ascii_digit())?
+        .trim_start_matches(|c: char| c.is_ascii_digit());
     rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") "))
 }
 

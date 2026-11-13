@@ -93,7 +93,9 @@ impl MilestoneChoice
         match self
         {
             MilestoneChoice::Milestone(title) => Some(title),
-            _ => None,
+            MilestoneChoice::Unscheduled
+            | MilestoneChoice::Missing
+            | MilestoneChoice::Conflicting => None,
         }
     }
 }

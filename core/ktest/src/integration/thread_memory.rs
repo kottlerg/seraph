@@ -183,8 +183,12 @@ fn own_space(ctx: &TestContext) -> TestResult
     // reference names while the call runs; any bytes are a valid [u8; 16].
     // Only this thread accesses OWN, and the child is never started.
     let write = unsafe { thread_write_mem(child.th, va, &new, 0) };
-    // SAFETY: OWN is read through a raw pointer, no reference outlives it.
-    let after = unsafe { core::ptr::addr_of!(OWN).read_volatile() };
+    let own = core::ptr::addr_of!(OWN).cast::<u8>();
+    let after: [u8; 16] = core::array::from_fn(|i| {
+        // SAFETY: OWN is read through a raw pointer, no reference outlives it;
+        // `i` indexes one of its 16 bytes.
+        unsafe { own.wrapping_add(i).read_volatile() }
+    });
     let ok = child.delete_thread().is_ok() & child.delete_cspace().is_ok();
     if read != Ok(16) || got != *b"thread_memory!!!"
     {

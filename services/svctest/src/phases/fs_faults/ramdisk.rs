@@ -383,6 +383,7 @@ fn transfer(
             }
         }
     }
+    drop(disk);
     // SAFETY: the same reserved page, accessed above only through a raw
     // copy; no Rust reference into it is live.
     let _ = unsafe { syscall::mem_unmap(aspace, va, 1) };

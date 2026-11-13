@@ -89,15 +89,38 @@ pub fn run(ctx: &TestContext) -> TestResult
         .map_err(|_| "aspace_fault_notification_late_bind: system_info(CpuCount) failed")?;
     if cpus < 2
     {
-        return round(ctx, false);
+        return round(ctx, Placement::Unpinned);
     }
     thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
         .map_err(|_| "aspace_fault_notification_late_bind: pin controller failed")?;
-    let result = (0..ROUNDS).try_for_each(|_| round(ctx, true));
+    let result = (0..ROUNDS).try_for_each(|_| round(ctx, Placement::Pinned));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "aspace_fault_notification_late_bind: restore controller affinity failed");
     result?;
     restore
+}
+
+/// Where a round runs its threads.
+#[derive(Clone, Copy)]
+enum Placement
+{
+    /// Neither thread is pinned, and the controller polls with
+    /// [`Polling::Sleeping`] (one CPU).
+    Unpinned,
+    /// The controller runs on [`CONTROLLER_CPU`], the faulting thread is
+    /// pinned to [`FAULT_CPU`], and the controller polls with
+    /// [`Polling::Dense`] (two or more CPUs).
+    Pinned,
+}
+
+/// How [`await_exit`] spaces its reads of the thread's state.
+#[derive(Clone, Copy)]
+enum Polling
+{
+    /// One read per 1 ms sleep, bounded by [`MAX_POLLS`] polls.
+    Sleeping,
+    /// Back-to-back reads, bounded by [`DENSE_BOUND_US`] of elapsed time.
+    Dense,
 }
 
 /// The caps one round holds, deleted on drop in the order a passing round
@@ -132,10 +155,9 @@ impl Drop for RoundCaps
     }
 }
 
-/// One fault in a fresh address space, its read-back, and a late bind.
-/// `pinned`: the controller runs on [`CONTROLLER_CPU`]; the thread is pinned
-/// to [`FAULT_CPU`] and polled densely.
-fn round(ctx: &TestContext, pinned: bool) -> TestResult
+/// One fault in a fresh address space, its read-back, and a late bind, with
+/// its threads placed as `placement` says.
+fn round(ctx: &TestContext, placement: Placement) -> TestResult
 {
     let mut caps = RoundCaps {
         eq: 0,
@@ -172,11 +194,16 @@ fn round(ctx: &TestContext, pinned: bool) -> TestResult
         thread_bind_notification(thread, thread_eq, CORR)
             .map_err(|_| "aspace_fault_notification_late_bind: thread_bind_notification failed")?;
     }
-    if pinned
+    let polling = match placement
     {
-        thread_set_affinity(thread, FAULT_CPU)
-            .map_err(|_| "aspace_fault_notification_late_bind: pin faulting thread failed")?;
-    }
+        Placement::Unpinned => Polling::Sleeping,
+        Placement::Pinned =>
+        {
+            thread_set_affinity(thread, FAULT_CPU)
+                .map_err(|_| "aspace_fault_notification_late_bind: pin faulting thread failed")?;
+            Polling::Dense
+        }
+    };
     // Entry PC is unmapped: the thread terminal-faults on its first instruction
     // fetch (no fault handler bound) with no aspace observer bound yet.
     // SAFETY: the thread is bound to the dedicated `aspace` created above, not
@@ -185,7 +212,7 @@ fn round(ctx: &TestContext, pinned: bool) -> TestResult
         .map_err(|_| "aspace_fault_notification_late_bind: thread_configure failed")?;
     thread_start(thread).map_err(|_| "aspace_fault_notification_late_bind: thread_start failed")?;
 
-    let (fault_reason, retained) = await_exit(thread, aspace, pinned)?;
+    let (fault_reason, retained) = await_exit(thread, aspace, polling)?;
     // It must be a real terminal fault, not a clean exit (reason 0).
     if fault_reason < EXIT_FAULT_BASE
     {
@@ -232,11 +259,9 @@ fn round(ctx: &TestContext, pinned: bool) -> TestResult
 
 /// Poll `thread` until it reads `Exited` and return its exit reason with the
 /// `CAP_INFO_ASPACE_TERMINAL_FAULT` read of `aspace` made right after that
-/// first `Exited` read. `dense`: the reads run back to back, bounded by
-/// [`DENSE_BOUND_US`] of elapsed time; otherwise one read per 1 ms sleep,
-/// bounded by [`MAX_POLLS`] polls. Both bounds go through
-/// [`crate::scaled_bound`].
-fn await_exit(thread: u64, aspace: u64, dense: bool) -> Result<(u64, u64), &'static str>
+/// first `Exited` read, spacing the reads as `polling` says. Both bounds go
+/// through [`crate::scaled_bound`].
+fn await_exit(thread: u64, aspace: u64, polling: Polling) -> Result<(u64, u64), &'static str>
 {
     let max_sleeps = crate::scaled_polls(MAX_POLLS);
     let dense_bound_us = crate::scaled_bound(DENSE_BOUND_US);
@@ -254,26 +279,26 @@ fn await_exit(thread: u64, aspace: u64, dense: bool) -> Result<(u64, u64), &'sta
             return Ok((packed & 0xFFFF_FFFF, retained));
         }
         polls = polls.wrapping_add(1);
-        let expired = if dense
+        let expired = match polling
         {
-            polls.is_multiple_of(CLOCK_CHECK_PERIOD)
-                && elapsed_us()?.saturating_sub(start_us) >= dense_bound_us
-        }
-        else
-        {
-            polls >= max_sleeps
+            Polling::Dense =>
+            {
+                polls.is_multiple_of(CLOCK_CHECK_PERIOD)
+                    && elapsed_us()?.saturating_sub(start_us) >= dense_bound_us
+            }
+            Polling::Sleeping => polls >= max_sleeps,
         };
         if expired
         {
             return Err("aspace_fault_notification_late_bind: thread never reached Exited");
         }
-        if dense
+        match polling
         {
-            core::hint::spin_loop();
-        }
-        else
-        {
-            thread_sleep(1).ok();
+            Polling::Dense => core::hint::spin_loop(),
+            Polling::Sleeping =>
+            {
+                thread_sleep(1).ok();
+            }
         }
     }
 }

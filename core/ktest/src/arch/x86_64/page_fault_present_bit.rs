@@ -189,7 +189,7 @@ impl Access
             {
                 Err("page_fault_present_bit: kernel-half fault reports PRESENT")
             }
-            _ => Ok(()),
+            Access::UserStore | Access::KernelLoad => Ok(()),
         }
     }
 }
@@ -216,10 +216,14 @@ fn expect_fault(ctx: &TestContext, ep: u64, child_th: u64, va: u64, access: Acce
     {
         return Err("page_fault_present_bit: fault IP is not the recorded probe instruction");
     }
-    // SAFETY: `ip` equals the address the child recorded of its own probe
-    // instruction, which lies in ktest's image, mapped readable in the address
-    // space this thread shares with the child.
-    let bytes = unsafe { core::ptr::read_volatile(ip as *const [u8; 2]) };
+    let probe = ip as *const u8;
+    let bytes: [u8; 2] = core::array::from_fn(|i| {
+        // SAFETY: `ip` equals the address the child recorded of its own probe
+        // instruction, which lies in ktest's image, mapped readable in the
+        // address space this thread shares with the child; `i` is one of the
+        // instruction's two bytes.
+        unsafe { probe.wrapping_add(i).read_volatile() }
+    });
     if bytes != access.encoding()
     {
         return Err("page_fault_present_bit: probe instruction encoding differs");

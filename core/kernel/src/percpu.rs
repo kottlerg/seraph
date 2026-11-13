@@ -121,40 +121,85 @@ pub unsafe fn apic_id_for(cpu: usize) -> u32
 // ── Field offsets (must match #[repr(C)] layout) ──────────────────────────────
 
 /// Byte offset of `PerCpuData::cpu_id`. GS-relative: `gs:[0]`.
-// Read as `gs:[0]` by the x86-64 `cpu::current_cpu` inline asm (assembly references
-// by numeric offset).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read as `gs:[0]` by the x86-64 `cpu::current_cpu` inline asm (assembly \
+                  references by numeric offset); the host tests read it, so the lint fires outside \
+                  the test build alone"
+    )
+)]
 pub const PERCPU_CPU_ID_OFFSET: usize = 0;
 /// Byte offset of `PerCpuData::kernel_rsp`. GS-relative: `gs:[8]`.
-// Used by the syscall_entry naked-asm stub (assembly references by numeric offset).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the syscall_entry naked-asm stub (assembly references by numeric \
+                  offset); the host tests read it, so the lint fires outside the test build alone"
+    )
+)]
 pub const PERCPU_KERNEL_RSP_OFFSET: usize = 8;
 /// Byte offset of `PerCpuData::user_rsp`. GS-relative: `gs:[16]`.
-// Used by the syscall_entry naked-asm stub (assembly references by numeric offset).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the syscall_entry naked-asm stub (assembly references by numeric \
+                  offset); the host tests read it, so the lint fires outside the test build alone"
+    )
+)]
 pub const PERCPU_USER_RSP_OFFSET: usize = 16;
 /// Byte offset of `PerCpuData::scratch`. GS-relative: `gs:[24]`.
-// Used by the syscall_entry naked-asm stub (assembly references by numeric offset).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "used by the syscall_entry naked-asm stub (assembly references by numeric \
+                  offset); the host tests read it, so the lint fires outside the test build alone"
+    )
+)]
 pub const PERCPU_SCRATCH_OFFSET: usize = 24;
 /// Byte offset of `PerCpuData::tss_ptr`. GS-relative: `gs:[32]`.
-// Read as `gs:[32]` by the x86-64 `gdt::set_rsp0` and `gdt::load_iopb` inline asm
-// (assembly references by numeric offset).
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "read as `gs:[32]` by the x86-64 `gdt::set_rsp0` and `gdt::load_iopb` inline asm \
+                  (assembly references by numeric offset); the host tests read it, so the lint \
+                  fires outside the test build alone"
+    )
+)]
 pub const PERCPU_TSS_PTR_OFFSET: usize = 32;
 /// Byte offset of `PerCpuData::preempt_count`. GS-relative: `gs:[40]`.
-// Not accessed from assembly or referenced by any code (`preempt_disable`/`preempt_enable`
-// reach the field by name); included for layout discipline.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "not accessed from assembly or referenced by any code \
+                  (`preempt_disable`/`preempt_enable` reach the field by name); included for \
+                  layout discipline; the host tests read it, so the lint fires outside the test \
+                  build alone"
+    )
+)]
 pub const PERCPU_PREEMPT_COUNT_OFFSET: usize = 40;
 /// Byte offset of `PerCpuData::fpu_owner`. GS-relative: `gs:[48]`.
-// Not accessed from assembly; included for layout discipline.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "not accessed from assembly; included for layout discipline; the host tests read \
+                  it, so the lint fires outside the test build alone"
+    )
+)]
 pub const PERCPU_FPU_OWNER_OFFSET: usize = 48;
 /// Byte offset of `PerCpuData::kernel_stack_floor`, `tp`-relative: the riscv64
 /// `trap_entry` and `context::switch` naked asm take it as a `const` operand.
-// Unused on x86-64, which reads no stack floor.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "x86_64",
+    expect(dead_code, reason = "unused on x86-64, which reads no stack floor")
+)]
 pub const PERCPU_KERNEL_STACK_FLOOR_OFFSET: usize =
     core::mem::offset_of!(PerCpuData, kernel_stack_floor);
 
@@ -502,10 +547,15 @@ pub fn preemption_disabled() -> bool
 /// # Safety
 /// `cpu` must be < `CPU_COUNT` (an online logical CPU index): the slab holds
 /// `CPU_COUNT` entries and the body does not check the bound.
-// dead_code: consumed only by arch/x86_64 (lazy-FPU owner cache + #NM handler);
-// present unconditionally so no architecture cfg-gate is needed here. RISC-V
-// uses eager FS/VS-dirty FPU tracking and never reads this slot.
-#[allow(dead_code)]
+#[cfg_attr(
+    target_arch = "riscv64",
+    expect(
+        dead_code,
+        reason = "consumed only by arch/x86_64 (lazy-FPU owner cache + #NM handler); present \
+                  unconditionally so no architecture cfg-gate is needed here. RISC-V uses eager \
+                  FS/VS-dirty FPU tracking and never reads this slot"
+    )
+)]
 #[cfg(not(test))]
 pub unsafe fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock>
 {

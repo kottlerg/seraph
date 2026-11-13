@@ -332,8 +332,7 @@ unsafe fn pin_binding(
                 .fault_outcome
                 .store(FAULT_OUTCOME_PENDING, Ordering::Release);
             (*tcb).in_fault_delivery = true;
-            // cast_possible_truncation: class < FAULT_CLASSES (3).
-            #[allow(clippy::cast_possible_truncation)]
+            #[expect(clippy::cast_possible_truncation, reason = "class < FAULT_CLASSES (3)")]
             {
                 (*tcb).fault_delivery_class = class as u8;
             }
@@ -974,9 +973,11 @@ unsafe fn claim_queued_fault(
     {
         return false;
     };
-    // cast_ptr_alignment: blocked_on_object stores a type-erased pointer; the
-    // original allocation guarantees alignment.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "blocked_on_object stores a type-erased pointer; the original allocation \
+                  guarantees alignment"
+    )]
     let ep = blocked_on.cast::<crate::ipc::endpoint::EndpointState>();
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
@@ -1018,9 +1019,11 @@ unsafe fn claim_queued_fault(
 #[cfg(not(test))]
 unsafe fn claim_received_fault(tcb: *mut ThreadControlBlock, blocked_on: *mut u8) -> bool
 {
-    // cast_ptr_alignment: blocked_on_object stores a type-erased pointer; the
-    // original allocation guarantees alignment.
-    #[allow(clippy::cast_ptr_alignment)]
+    #[expect(
+        clippy::cast_ptr_alignment,
+        reason = "blocked_on_object stores a type-erased pointer; the original allocation \
+                  guarantees alignment"
+    )]
     let server = blocked_on.cast::<ThreadControlBlock>();
     // SAFETY: tcb valid per contract.
     let sched_lock = unsafe { &(*tcb).sched_lock };

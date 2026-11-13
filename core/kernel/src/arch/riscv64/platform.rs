@@ -34,9 +34,11 @@ static CACHED_UART_SIZE: AtomicU64 = AtomicU64::new(0);
 /// may also lie inside an aperture, in which case this cap overlaps an aperture
 /// cap. It is surfaced here so init's serial scan finds a dedicated `Mmio`
 /// descriptor for it.
-// unnecessary_wraps: the Option is part of the cross-arch contract — x86-64's
-// `console_mmio` returns None (its console is a legacy I/O-port UART).
-#[allow(clippy::unnecessary_wraps)]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Option is part of the cross-arch contract — x86-64's `console_mmio` returns None \
+              (its console is a legacy I/O-port UART)"
+)]
 #[must_use]
 pub fn console_mmio() -> Option<(u64, u64)>
 {

@@ -80,9 +80,11 @@ fn acc_for(cpu: usize) -> Option<&'static Acc>
 
 /// Fold a cycle-counter sample for `cpu` into its buffer. Interrupt-safe:
 /// allocation-free and lock-free.
-// cast_possible_truncation: `n as usize` is lossless (both targets are 64-bit,
-// so usize == u64), and `(n & 63) as u32` narrows a value masked below 64.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`n as usize` is lossless (both targets are 64-bit, so usize == u64), and \
+              `(n & 63) as u32` narrows a value masked below 64"
+)]
 pub fn sample(cpu: usize, source: Source, cycle: u64)
 {
     let Some(acc) = acc_for(cpu)

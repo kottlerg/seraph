@@ -131,10 +131,12 @@ impl EvictionState
         if q.try_reserve(1).is_ok()
         {
             q.push_back(req);
+            drop(q);
             self.cv.notify_one();
         }
         else
         {
+            drop(q);
             std::os::seraph::log!(
                 warn: "eviction enqueue: no memory; dropped req (open={:#x}, cookie={}, slot={})",
                 req.open_id,
@@ -317,6 +319,7 @@ fn cooperative_release(endpoint: u64, cookie: u64) -> Release
             {
                 *st = Some(outcome);
             }
+            drop(st);
             chan_child.1.notify_all();
         });
     if spawned.is_err()
@@ -366,6 +369,12 @@ enum Endpoint
 /// so an open's release that deletes the slot's SEND meanwhile cannot free or
 /// reuse the slot the worker calls on. `None` means the page was already
 /// cleaned up.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "`file` borrows through the guard to the derive: the hold serialises the check that \
+              the page is outstanding and the derive of its open's release SEND against the main \
+              thread's release and close paths, which delete that SEND"
+)]
 fn live_release_endpoint(files: &Mutex<OpenTable>, req: &EvictReq) -> Option<Endpoint>
 {
     let files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
@@ -392,6 +401,12 @@ fn live_release_endpoint(files: &Mutex<OpenTable>, req: &EvictReq) -> Option<End
 /// whether the entry was still there (same open, cookie, cache slot, and
 /// ancestor cap), in which case the caller owns its cleanup; `false` means
 /// another path already cleaned it up.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "`file` borrows through the guard to the entry's removal: the hold serialises the \
+              removal against the main thread's release and close paths, so one path alone owns \
+              the page's cleanup"
+)]
 fn take_outstanding(files: &Mutex<OpenTable>, req: &EvictReq) -> bool
 {
     let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);

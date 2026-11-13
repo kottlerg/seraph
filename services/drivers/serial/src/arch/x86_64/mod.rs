@@ -29,8 +29,7 @@ const UART_PORTS: u64 = 8;
 static UART_PORT: AtomicU16 = AtomicU16::new(0);
 
 /// Bind the UART's `IoPort` range, `registers`, to `self_thread` so
-/// `out`/`in` against it do not fault, then enable the receive-data
-/// interrupt when `enable_rx_irq` is set. `self_aspace` is unused on x86-64.
+/// `out`/`in` against it do not fault. `self_aspace` is unused on x86-64.
 /// Returns `false` if `registers` is not an `IoPort` range of at least the
 /// eight ports a 16550 spans, or the bind fails.
 ///
@@ -38,12 +37,7 @@ static UART_PORT: AtomicU16 = AtomicU16::new(0);
 /// None on x86-64: the UART is reached through I/O ports and nothing is
 /// mapped. The function is `unsafe` for the arch-dispatch surface, whose
 /// riscv64 implementation maps the cap it is handed.
-pub unsafe fn serial_init(
-    self_thread: u64,
-    _self_aspace: u64,
-    registers: &Resource,
-    enable_rx_irq: bool,
-) -> bool
+pub unsafe fn serial_init(self_thread: u64, _self_aspace: u64, registers: &Resource) -> bool
 {
     let Resource::IoPort { cap, base, count } = *registers
     else
@@ -59,17 +53,25 @@ pub unsafe fn serial_init(
     {
         return false;
     }
-    if enable_rx_irq
-    {
-        // Enable Received Data Available interrupt (ERBFI). Earlier boot stages
-        // left IER cleared; without this the 16550 never asserts its IRQ line.
-        // Skipped when the driver holds no IRQ cap (RX then relies on polling).
-        // SAFETY: the UART's eight ports are bound to this thread by the
-        // ioport_bind above.
-        unsafe { outb(register(port, UART_IER), 0x01) };
-    }
     UART_PORT.store(port, Ordering::Release);
     true
+}
+
+/// Enable the Received Data Available interrupt (ERBFI). Earlier boot stages
+/// left IER cleared; without this the 16550 never asserts its IRQ line. The
+/// driver calls it only when it holds the UART's IRQ cap, on the thread
+/// [`serial_init`] bound the UART to; without the cap, RX relies on polling.
+/// No-ops if [`serial_init`] never bound the UART.
+pub fn serial_enable_rx_interrupt()
+{
+    let port = UART_PORT.load(Ordering::Acquire);
+    if port == 0
+    {
+        return;
+    }
+    // SAFETY: `port` is the UART's eight-port range, bound to this thread by
+    // `serial_init`'s ioport_bind.
+    unsafe { outb(register(port, UART_IER), 0x01) };
 }
 
 /// Read one byte from the UART if the receive register holds data, else

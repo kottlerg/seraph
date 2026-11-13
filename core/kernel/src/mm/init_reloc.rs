@@ -151,9 +151,10 @@ pub fn apply(
     {
         return Err("Phase 9: init .rela.dyn table malformed");
     }
-    // cast_possible_truncation: rela_size ≤ MAX_RELA_TABLE_SIZE (4 MiB),
-    // checked above; 64-bit targets only.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rela_size ≤ MAX_RELA_TABLE_SIZE (4 MiB), checked above; 64-bit targets only"
+    )]
     let table_len = rela_size as usize;
     // SAFETY: rela_phys/rela_size describe bootloader-loaded file bytes
     // inside an init segment (resolved by the bootloader through the
@@ -252,8 +253,10 @@ mod tests
     {
         let mut table = [seg(0, 0, 0, SegmentFlags::Read); INIT_MAX_SEGMENTS];
         table[..entries.len()].copy_from_slice(entries);
-        // entries.len() ≤ INIT_MAX_SEGMENTS = 8 in every test below.
-        #[allow(clippy::cast_possible_truncation)]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "entries.len() ≤ INIT_MAX_SEGMENTS = 8 in every test below"
+        )]
         let count = entries.len() as u32;
         (table, count)
     }

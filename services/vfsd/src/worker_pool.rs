@@ -300,6 +300,7 @@ pub fn submit_bootstrap(
         service,
         channel: channel.clone(),
     });
+    drop(st);
     Some(WorkHandle { channel })
 }
 

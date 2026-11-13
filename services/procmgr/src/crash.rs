@@ -296,6 +296,12 @@ fn log_taken_back()
 /// the decliner, so no fault waits on a receiver that holds nothing. A
 /// registration a check has already taken back, and any registration made
 /// after it, is left as it is.
+#[expect(
+    clippy::significant_drop_tightening,
+    reason = "REGISTRATION is held through `release`, as by every take-back: a registration, \
+              its undoing and the check each hold it throughout (the module's rule), so the \
+              take-back, the cap's deletion and the decliner's wake are one step"
+)]
 pub fn unregister(registered: &Registered)
 {
     let mut registration = lock_registration();

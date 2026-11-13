@@ -508,9 +508,11 @@ pub(crate) unsafe fn lock_bound_source(
 /// # Safety
 /// `blocked_on` must point at a live source state of the type `ipc_state`
 /// names. Only the lock field's address is computed; nothing is read.
-// cast_ptr_alignment: blocked_on_object stores a type-erased pointer to the
-// source state ipc_state names, whose allocation guarantees its alignment.
-#[allow(clippy::cast_ptr_alignment)]
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "blocked_on_object stores a type-erased pointer to the source state ipc_state names, \
+              whose allocation guarantees its alignment"
+)]
 #[cfg(not(test))]
 pub(crate) unsafe fn source_lock_of(
     ipc_state: crate::sched::thread::IpcThreadState,

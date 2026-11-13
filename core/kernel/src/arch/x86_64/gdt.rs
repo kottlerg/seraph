@@ -29,10 +29,15 @@
 //! - To add more IST stacks: add IST fields to the TSS, pass the stack tops
 //!   into `init`, and reference them in IDT gate descriptors.
 
-// cast_possible_truncation: usize→u16 GDT/TSS limit casts; values are bounded by
-// the struct sizes and array counts that are verified by the unit tests.
-// cast_lossless: u8→u64 DPL shifts; u8 always fits in u64.
-#![allow(clippy::cast_possible_truncation, clippy::cast_lossless)]
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "usize→u16 GDT/TSS limit casts; values are bounded by the struct sizes and array \
+              counts that are verified by the unit tests"
+)]
+#![expect(
+    clippy::cast_lossless,
+    reason = "u8→u64 DPL shifts; u8 always fits in u64"
+)]
 
 // ── Selector constants ────────────────────────────────────────────────────────
 
@@ -672,14 +677,9 @@ unsafe fn iopb_offset_of<'a>(tss: *mut TssWithIopb) -> &'a core::sync::atomic::A
 {
     // SAFETY: caller contract.
     let field = unsafe { core::ptr::addr_of_mut!((*tss).tss.iopb_offset) };
-    // cast_ptr_alignment: `TssWithIopb` is `align(2)` and `iopb_offset` sits
-    // at an even offset, so the field is 2-byte aligned.
-    #[allow(clippy::cast_ptr_alignment)]
     // SAFETY: the field is live (caller contract) and a naturally aligned u16
     // (above), and every access to it after boot goes through this atomic view.
-    unsafe {
-        &*field.cast::<core::sync::atomic::AtomicU16>()
-    }
+    unsafe { &*field.cast::<core::sync::atomic::AtomicU16>() }
 }
 
 /// Copy `iopb` into the TSS I/O Permission Bitmap for the current CPU and
@@ -841,8 +841,10 @@ pub unsafe fn reload_invalidated_iopb() -> bool
 ///
 /// # Panics
 /// Panics in debug mode if `base + count` fits a `u32` and is over 65536.
-// cast_possible_truncation: a port index within a part is below 65536.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a port index within a part is below 65536"
+)]
 pub fn permit_port_range(part: &mut [u8], first_port: u32, base: u32, count: u32)
 {
     let Some(end) = base.checked_add(count)

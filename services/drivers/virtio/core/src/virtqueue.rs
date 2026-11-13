@@ -386,19 +386,32 @@ impl SplitVirtqueue
         // SAFETY: ring_idx <= ring_mask < queue_size, so the element lies
         // inside the ring's `queue_size` elements.
         let ring_elem = unsafe { ring_base.add(ring_idx as usize) };
+        // Each field is read on its own, at the 32-bit width `VirtIO` 1.2
+        // §2.7.8 gives it.
+        #[expect(
+            clippy::multiple_unsafe_ops_per_block,
+            reason = "every read is of a field of used element `ring_elem`, which lies inside the \
+                      used ring `new`'s contract keeps valid"
+        )]
         // SAFETY: `ring_elem` lies inside the valid used ring, 4-byte aligned:
         // `new`'s contract aligns the ring to 4 bytes, and the elements start
-        // 4 bytes past it, 8 bytes apart.
-        let elem = unsafe { core::ptr::read_volatile(ring_elem) };
+        // 4 bytes past it, 8 bytes apart; each field is a 4-byte-aligned `u32`
+        // of it. No reference is formed.
+        let (id, len) = unsafe {
+            (
+                core::ptr::read_volatile(&raw const (*ring_elem).id),
+                core::ptr::read_volatile(&raw const (*ring_elem).len),
+            )
+        };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
 
         let head = self
-            .outstanding_head(elem.id)
-            .ok_or(VirtqueueError::UnknownHead { id: elem.id })?;
+            .outstanding_head(id)
+            .ok_or(VirtqueueError::UnknownHead { id })?;
         self.free_chain(head);
 
-        Ok(Some((head, elem.len)))
+        Ok(Some((head, len)))
     }
 
     /// The head index a device-written used-element `id` names, when it

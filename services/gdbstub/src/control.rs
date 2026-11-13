@@ -275,25 +275,29 @@ pub enum Plan
     Nothing,
 }
 
-/// The plan of a `c`, `C`, `s`, or `S` packet on the current thread
-/// `current`, passing `signal`. A step that passes a signal is a continue
-/// passing it: delivering the signal declines the thread's fault, which then
-/// takes its outcome with no handler bound, so the thread runs no single
-/// instruction to stop after.
+/// The plan of a `c` or `C` packet on the current thread `current`, passing
+/// `signal` (none when it is zero).
 #[must_use]
-pub fn plan_resume(step: bool, signal: Option<u8>, current: usize) -> Plan
+pub fn plan_continue(signal: Option<u8>, current: usize) -> Plan
 {
-    let signal = signal.filter(|&s| s != 0);
-    if step && signal.is_none()
-    {
-        Plan::Step { thread: current }
+    Plan::Continue {
+        thread: current,
+        signal: signal.filter(|&s| s != 0),
     }
-    else
+}
+
+/// The plan of an `s` or `S` packet on the current thread `current`, passing
+/// `signal`. A step that passes a signal is a continue passing it
+/// ([`plan_continue`]): delivering the signal declines the thread's fault,
+/// which then takes its outcome with no handler bound, so the thread runs no
+/// single instruction to stop after.
+#[must_use]
+pub fn plan_step(signal: Option<u8>, current: usize) -> Plan
+{
+    match signal.filter(|&s| s != 0)
     {
-        Plan::Continue {
-            thread: current,
-            signal,
-        }
+        None => Plan::Step { thread: current },
+        Some(_) => plan_continue(signal, current),
     }
 }
 
@@ -302,7 +306,7 @@ pub fn plan_resume(step: bool, signal: Option<u8>, current: usize) -> Plan
 /// "all" name. The first step action plans a step of its thread, the others
 /// held; otherwise the first continue action resumes every held thread,
 /// passing its signal to the thread it names. A step action that passes a
-/// signal is a continue, as in [`plan_resume`]; a stop action asks nothing.
+/// signal is a continue, as in [`plan_step`]; a stop action asks nothing.
 #[must_use]
 pub fn plan_vcont(
     actions: impl Iterator<Item = VContAction> + Clone,
@@ -317,13 +321,13 @@ pub fn plan_vcont(
         .find_map(|a| index(&a).map(|i| (i, a.signal)));
     if let Some((thread, signal)) = step
     {
-        return plan_resume(true, signal, thread);
+        return plan_step(signal, thread);
     }
     actions
         .filter(|a| a.resume == Resume::Continue)
         .find_map(|a| index(&a).map(|i| (i, a.signal)))
         .map_or(Plan::Nothing, |(thread, signal)| {
-            plan_resume(false, signal, thread)
+            plan_continue(signal, thread)
         })
 }
 
@@ -538,9 +542,16 @@ mod tests
             plan_vcont(both.into_iter(), 0, select),
             Plan::Step { thread: 2 }
         );
-        assert_eq!(plan_resume(true, Some(0), 4), Plan::Step { thread: 4 });
         assert_eq!(
-            plan_resume(true, Some(5), 4),
+            plan_continue(Some(0), 4),
+            Plan::Continue {
+                thread: 4,
+                signal: None
+            }
+        );
+        assert_eq!(plan_step(Some(0), 4), Plan::Step { thread: 4 });
+        assert_eq!(
+            plan_step(Some(5), 4),
             Plan::Continue {
                 thread: 4,
                 signal: Some(5)

@@ -114,8 +114,10 @@ const GDT_DATA: u64 = 0x00CF_9200_0000_FFFF;
 const CR4_PAE: u32 = 1 << 5;
 
 /// `CR4.LA57` (bit 12), 5-level paging.
-// cast_possible_truncation: the bit is 1 << 12, well inside u32.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the bit is 1 << 12, well inside u32"
+)]
 const CR4_LA57: u32 = boot_protocol::x86_paging::CR4_LA57 as u32;
 
 /// IST stack pair size: 8 KiB IST1 + 8 KiB IST2 = 16 KiB per AP.
@@ -429,8 +431,10 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     }
 
     // Patch: real-mode far-jmp target at 0x20 → [u32: AP_PAGE+0x90, u16: 0x0008]
-    // cast_possible_truncation: ap_page is a SIPI vector << 12, always < 1 MiB; fits u32
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ap_page is a SIPI vector << 12, always < 1 MiB; fits u32"
+    )]
     // SAFETY: virt is direct-map address; write_u32 writes within page bounds.
     unsafe {
         write_u32(
@@ -462,8 +466,10 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     }
 
     // Patch: GDTR base at 0x42 → AP_PAGE+0x48
-    // cast_possible_truncation: ap_page is always < 1 MiB; fits u32
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ap_page is always < 1 MiB; fits u32"
+    )]
     // SAFETY: virt is direct-map address; write within page bounds.
     unsafe {
         write_u32(
@@ -476,8 +482,10 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     // Patch: PM32 temporary stack address at 0x9F → AP_PAGE+0x200.
     // Must be above all trampoline code (which ends at 0x11B) to avoid the
     // `call +0` push clobbering code bytes. 0x200 is well within the 4 KiB page.
-    // cast_possible_truncation: ap_page is always < 1 MiB; fits u32
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ap_page is always < 1 MiB; fits u32"
+    )]
     // SAFETY: virt is direct-map address; write within page bounds.
     unsafe {
         write_u32(
@@ -488,8 +496,10 @@ pub unsafe fn setup_trampoline(ap_trampoline_phys: u64)
     }
 
     // Patch: LM64 far-jmp target at 0xF8 → [u32: AP_PAGE+0x100, u16: 0x0010]
-    // cast_possible_truncation: ap_page is always < 1 MiB; fits u32
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ap_page is always < 1 MiB; fits u32"
+    )]
     // SAFETY: virt is direct-map address; write_u32 writes within page bounds.
     unsafe {
         write_u32(

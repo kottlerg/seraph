@@ -103,8 +103,10 @@ pub unsafe fn validate_boot_info(boot_info: *const BootInfo) -> bool
 
     // 9. No overlap between the direct map (RAM + high framebuffer +
     //    kernel MMIO, per the shared ceiling) and the kernel image window.
-    // count → usize: 64-bit targets only; cast is exact.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "count → usize: 64-bit targets only; cast is exact"
+    )]
     // SAFETY: memory_map checked non-null with count > 0 above; the entry
     // array is identity-mapped by the bootloader.
     let entries = unsafe {

@@ -446,8 +446,10 @@ impl Slot
         {
             SLOT_TAG_LINE =>
             {
-                // A line word holds a u32 id above its tag.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a line word holds a u32 id above its tag"
+                )]
                 let id = (word >> 2) as u32;
                 Self::Line(id)
             }
@@ -1783,8 +1785,10 @@ pub fn next_target_cpu(eligible: impl Fn(usize) -> bool) -> Option<usize>
     let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
     let start = NEXT_TARGET_CPU.load(Ordering::Relaxed) as usize;
     let cpu = first_eligible_cpu(start, cpu_count.max(1), eligible)?;
-    // The successor is below the CPU count, which fits u32.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the successor is below the CPU count, which fits u32"
+    )]
     NEXT_TARGET_CPU.store(
         cpu.wrapping_add(1).checked_rem(cpu_count).unwrap_or(0) as u32,
         Ordering::Relaxed,

@@ -156,8 +156,10 @@ impl TagPool
     /// First free tag in `1..num_tags`, or `None` if the pool is full. Scans the
     /// bitmap a word at a time, so a nearly full pool of 2^16 tags costs 1024
     /// word reads, not 65536 bit tests.
-    // cast_possible_truncation: t < num_tags <= MAX_HW_TAGS, so t <= u16::MAX.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "t < num_tags <= MAX_HW_TAGS, so t <= u16::MAX"
+    )]
     fn find_free(&self) -> Option<u16>
     {
         self.in_use.iter().enumerate().find_map(|(w, &word)| {
@@ -174,8 +176,10 @@ impl TagPool
     /// The in-use tag with the smallest `claimed_at` strictly greater than
     /// `floor`, with that `claimed_at`. Used to iterate eviction candidates
     /// least-recently-claimed first while skipping candidates already tried.
-    // cast_possible_truncation: t < num_tags <= MAX_HW_TAGS, so t <= u16::MAX.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "t < num_tags <= MAX_HW_TAGS, so t <= u16::MAX"
+    )]
     fn oldest_used_above(&self, floor: u64) -> Option<(u16, u64)>
     {
         let mut best: Option<(u16, u64)> = None;

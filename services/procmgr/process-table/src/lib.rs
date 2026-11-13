@@ -37,6 +37,23 @@
 #![cfg_attr(not(test), no_std)]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 pub mod crash_registrant;
 pub mod create_blobs;
@@ -284,6 +301,55 @@ impl ProcessEntry
     {
         current.is_some_and(|b| self.is_crash_binding(b) || threads::is_debugger_badge(b))
     }
+
+    /// Keep `watch`, the debugger watch an `ATTACH_PROCESS` of this child
+    /// carried (`0`: none), as the child's debugger across `reply`, which
+    /// sends the attach's reply and returns whether it was delivered. The
+    /// watch is held before `reply` runs: once the caller holds its reply it
+    /// can bind the child's threads, and its watch thread can exit at once,
+    /// and the check that restores the crash bindings when that thread is
+    /// gone must then find the watch. A delivered reply leaves the watch held;
+    /// a failed one, which makes no attach, puts back the watch an earlier
+    /// attach left. A request with no watch changes none.
+    pub fn watch_across_reply(
+        &mut self,
+        watch: u64,
+        reply: impl FnOnce(&Self) -> bool,
+    ) -> WatchedReply
+    {
+        if watch == 0
+        {
+            return WatchedReply {
+                delivered: reply(self),
+                stale: 0,
+            };
+        }
+        let earlier = core::mem::replace(&mut self.debugger, watch);
+        if reply(self)
+        {
+            return WatchedReply {
+                delivered: true,
+                stale: earlier,
+            };
+        }
+        self.debugger = earlier;
+        WatchedReply {
+            delivered: false,
+            stale: watch,
+        }
+    }
+}
+
+/// What [`ProcessEntry::watch_across_reply`] leaves procmgr to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WatchedReply
+{
+    /// Whether the attach's reply was delivered.
+    pub delivered: bool,
+    /// The watch slot no entry holds any more, which procmgr deletes: the
+    /// earlier watch a delivered reply's replaced, or the new one after a
+    /// failed reply; `0` for none.
+    pub stale: u64,
 }
 
 /// What a restore of a process's crash bindings (`DETACH_PROCESS`, or its
@@ -558,8 +624,11 @@ impl ProcessTable
             {
                 RestoreAction::Bind(thread.crash_badge)
             }
-            _ if from_debugger => RestoreAction::Unbind,
-            _ => RestoreAction::Leave,
+            Origin::Own | Origin::Owner(_) | Origin::Unknown if from_debugger =>
+            {
+                RestoreAction::Unbind
+            }
+            Origin::Own | Origin::Owner(_) | Origin::Unknown => RestoreAction::Leave,
         }
     }
 
@@ -1397,6 +1466,60 @@ mod tests
     }
 
     #[test]
+    fn an_attach_holds_its_watch_while_its_reply_is_sent()
+    {
+        // A debugger that dies as soon as it has its reply is found gone only
+        // if its watch is held by then; the watch it replaced goes.
+        let mut entry = entry_with_badge(0x77);
+        entry.debugger = 93;
+        let outcome = entry.watch_across_reply(94, |e| e.debugger == 94);
+        assert_eq!(
+            outcome,
+            WatchedReply {
+                delivered: true,
+                stale: 93
+            },
+            "the watch was not held when the reply was sent"
+        );
+        assert_eq!(entry.debugger, 94);
+    }
+
+    #[test]
+    fn an_attach_whose_reply_fails_keeps_the_earlier_watch()
+    {
+        let mut entry = entry_with_badge(0x77);
+        entry.debugger = 93;
+        let outcome = entry.watch_across_reply(94, |_| false);
+        assert_eq!(
+            outcome,
+            WatchedReply {
+                delivered: false,
+                stale: 94
+            }
+        );
+        assert_eq!(entry.debugger, 93);
+    }
+
+    #[test]
+    fn an_attach_without_a_watch_leaves_the_held_one()
+    {
+        let mut entry = entry_with_badge(0x77);
+        entry.debugger = 93;
+        for delivered in [true, false]
+        {
+            let outcome = entry.watch_across_reply(0, |e| e.debugger == 93 && delivered);
+            assert_eq!(
+                outcome,
+                WatchedReply {
+                    delivered,
+                    stale: 0
+                }
+            );
+            assert_eq!(entry.debugger, 93);
+        }
+    }
+
+    #[test]
     fn a_registration_rebinds_procmgrs_binding_and_an_unwatched_debuggers_alone()
     {
         let debugger = ipc::procmgr_labels::DEBUGGER_BADGE_TAG | 3;
@@ -1738,8 +1861,11 @@ mod tests
                         {
                             RestoreAction::Bind(crash)
                         }
-                        _ if from_debugger => RestoreAction::Unbind,
-                        _ => RestoreAction::Leave,
+                        Origin::Own | Origin::Owner(_) | Origin::Unknown if from_debugger =>
+                        {
+                            RestoreAction::Unbind
+                        }
+                        Origin::Own | Origin::Owner(_) | Origin::Unknown => RestoreAction::Leave,
                     };
                     assert_eq!(action, expected, "{case:?}");
                     match action

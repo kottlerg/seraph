@@ -16,8 +16,9 @@
 
 #![cfg_attr(not(test), no_std)]
 #![cfg_attr(not(test), no_main)]
-// Staged roll-out of this lint: docs/coding-standards.md § Clippy.
+// Staged roll-outs of these lints: docs/coding-standards.md § Clippy.
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![cfg_attr(
     test,
     expect(
@@ -163,17 +164,10 @@ fn report_kaslr(_flags: u32, _image_base: u64, _dm_base: u64) {}
 /// `boot_info` is the physical address of a populated [`BootInfo`] structure,
 /// accessible before the kernel's own page tables are established because the
 /// bootloader identity-maps the `BootInfo` region.
-// too_many_lines: kernel_entry is the single-entry boot sequence; splitting it would
-// obscure the sequential phase structure without reducing actual complexity.
-// not_unsafe_ptr_arg_deref: boot_info is validated (null + alignment) before deref;
-// the function is `extern "C"` and cannot be marked unsafe per the ABI contract.
-// similar_names: kaslr_image_base/kaslr_dm_base copy the BootInfo
-// kernel_virtual_base/direct_map_base pair; the shared prefix keeps that
-// provenance visible.
-#[allow(
-    clippy::too_many_lines,
+#[expect(
     clippy::not_unsafe_ptr_arg_deref,
-    clippy::similar_names
+    reason = "boot_info is validated (null + alignment) before deref; the function is \
+              `extern \"C\"` and cannot be marked unsafe per the ABI contract"
 )]
 #[unsafe(no_mangle)]
 pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
@@ -381,37 +375,32 @@ unsafe fn boot_cpu_ids(boot_info_phys: u64, count: u32) -> &'static [u32]
 /// is the frame allocator, still empty, whose Phase-2 free ranges this
 /// function adds before anything allocates. Called exactly once,
 /// from the boot thread, and never returns.
-// too_many_arguments: the boot state read out of BootInfo before Phase 3 must
-// cross the `#[inline(never)]` boundary as explicit arguments.
-// too_many_lines: the same rationale as `kernel_entry`, whose body this
-// continues.
-// similar_names: boot_cpu_count/boot_info_phys name the BootInfo fields they
-// come from; the shared prefix keeps that provenance visible.
-// needless_range_loop: each indexed loop runs to a count it keeps in view: the
-// AP-startup loop uses cpu_idx as both the hw_ids index and the CPU ID; the
-// init-segment Memory-cap loop (i < segment_count) tests the index for the
-// first slot; the init-segment map loop takes the same i < segment_count form
-// as the cap loop after it.
-// cast_possible_truncation: every usize -> u32 cast is of a bounded value:
-// cpu_idx < boot_cpu_count (a u32); seg_count is segment_count (a u32) widened;
-// desc_count and info_pages are bounded by the InitInfo region ceiling Phase 7
-// enforces (init_protocol::INIT_INFO_MAX_PAGES, fatal past it);
-// size_of::<InitInfo>() and STACK_PAGES are small constants; the u64 -> usize
-// cast of the save-area byte count is lossless because usize is 64 bits on
-// every target.
-// large_types_passed_by_value: init_image (304 B) crosses the
-// by-value/by-reference threshold. The `#[inline(never)]` boundary is what
-// defeats the cross-rebase hoist; the by-value signature is incidental — the
-// ABI passes it via hidden-pointer and emits an explicit memcpy into the
-// callee's stack frame either way. Single boot-path copy; nothing on the hot
-// path.
-#[allow(
-    clippy::too_many_arguments,
+#[expect(
     clippy::too_many_lines,
-    clippy::cast_possible_truncation,
-    clippy::needless_range_loop,
+    reason = "the single boot sequence that `kernel_entry` begins, continued; splitting it would \
+              obscure the sequential phase structure without reducing actual complexity"
+)]
+#[expect(
     clippy::similar_names,
-    clippy::large_types_passed_by_value
+    reason = "boot_cpu_count/boot_info_phys name the BootInfo fields they come from; the shared \
+              prefix keeps that provenance visible"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "every usize -> u32 cast is of a bounded value: cpu_idx < boot_cpu_count (a u32); \
+              seg_count is segment_count (a u32) widened; desc_count and info_pages are bounded by \
+              the InitInfo region ceiling Phase 7 enforces (init_protocol::INIT_INFO_MAX_PAGES, \
+              fatal past it); size_of::<InitInfo>() and STACK_PAGES are small constants; the u64 \
+              -> usize cast of the save-area byte count is lossless because usize is 64 bits on \
+              every target"
+)]
+#[expect(
+    clippy::large_types_passed_by_value,
+    reason = "init_image (304 B) crosses the by-value/by-reference threshold. The \
+              `#[inline(never)]` boundary is what defeats the cross-rebase hoist; the by-value \
+              signature is incidental — the ABI passes it via hidden-pointer and emits an explicit \
+              memcpy into the callee's stack frame either way. Single boot-path copy; nothing on \
+              the hot path"
 )]
 #[cfg(not(test))]
 #[inline(never)]
@@ -1009,8 +998,10 @@ unsafe fn kernel_entry_post_rebase(
                     .insert_cap_typed(rights, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init segment Memory cap"));
                 cap::note_owns_memory_minted(size_aligned);
-                // seg_count is segment_count (a u32) widened, so i fits.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "seg_count is segment_count (a u32) widened, so i fits"
+                )]
                 cap::extend_slot_run_or_fatal(
                     &mut seg_base,
                     i as u32,
@@ -1147,9 +1138,11 @@ unsafe fn kernel_entry_post_rebase(
             };
 
             // Write InitInfo header (always fits in first page).
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "page alignment (4096) exceeds InitInfo alignment (8)"
+            )]
             // SAFETY: info_base is page-aligned; InitInfo fits in one page.
-            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
-            #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 core::ptr::write(info_base.cast::<InitInfo>(), info);
             }
@@ -1195,8 +1188,10 @@ unsafe fn kernel_entry_post_rebase(
                     .insert_cap_typed(MemRights::BOOT_RAM, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert InitInfo Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
-                // pg < info_pages, at most INIT_INFO_MAX_PAGES (Phase 7).
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "pg < info_pages, at most INIT_INFO_MAX_PAGES (Phase 7)"
+                )]
                 cap::extend_slot_run_or_fatal(
                     &mut info_memory_base_slot,
                     pg as u32,
@@ -1212,10 +1207,12 @@ unsafe fn kernel_entry_post_rebase(
                 reason = "both writes are to fields of the InitInfo header at `info_base`, which \
                           the single boot thread owns"
             )]
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "page alignment (4096) exceeds InitInfo alignment (8)"
+            )]
             // SAFETY: info_base mapped writable through the direct map;
             // header lives at offset 0; single-threaded boot.
-            // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
-            #[allow(clippy::cast_ptr_alignment)]
             unsafe {
                 let info_ptr = info_base.cast::<InitInfo>();
                 (*info_ptr).init_info_memory_base = u64::from(info_memory_base_slot);
@@ -1312,8 +1309,10 @@ unsafe fn kernel_entry_post_rebase(
                     .insert_cap_typed(MemRights::BOOT_RAM, fo_nn)
                     .unwrap_or_else(|_| fatal("Phase 9: cannot insert init stack Memory cap"));
                 cap::note_owns_memory_minted(mm::PAGE_SIZE as u64);
-                // i < STACK_PAGES, a small constant.
-                #[allow(clippy::cast_possible_truncation)]
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "i < STACK_PAGES, a small constant"
+                )]
                 cap::extend_slot_run_or_fatal(
                     &mut base_slot,
                     i as u32,
@@ -1332,10 +1331,12 @@ unsafe fn kernel_entry_post_rebase(
             reason = "both writes are to fields of the InitInfo header at `info_page_virt`, which \
                       the single boot thread owns"
         )]
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "page alignment (4096) exceeds InitInfo alignment (8)"
+        )]
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
             (*info_ptr).init_stack_memory_base = u64::from(init_stack_memory_base);
@@ -1353,10 +1354,12 @@ unsafe fn kernel_entry_post_rebase(
             reason = "both writes are to fields of the InitInfo header at `info_page_virt`, which \
                       the single boot thread owns"
         )]
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "page alignment (4096) exceeds InitInfo alignment (8)"
+        )]
         // SAFETY: info_page_virt mapped writable through the direct map;
         // header at offset 0; single-threaded boot.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
             (*info_ptr).system_ram_bytes = system_ram;
@@ -1617,11 +1620,13 @@ unsafe fn kernel_entry_post_rebase(
             reason = "both writes are to fields of the InitInfo header at `info_page_virt`, which \
                       the single boot thread owns"
         )]
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "page alignment (4096) exceeds InitInfo alignment (8)"
+        )]
         // SAFETY: info_page_virt points to a kernel-writable page (mapped
         // read-only in userspace but writable via the direct physical map);
         // single-threaded boot; the write is within the InitInfo struct bounds.
-        // cast_ptr_alignment: page alignment (4096) exceeds InitInfo alignment (8).
-        #[allow(clippy::cast_ptr_alignment)]
         unsafe {
             let info_ptr = info_page_virt.cast::<init_protocol::InitInfo>();
             (*info_ptr).thread_cap = u64::from(init_thread_cap_slot);
@@ -2116,9 +2121,10 @@ unsafe fn backtrace_scan(stack_top: u64)
     // A diagnostic output cap; it bounds no capacity.
     const MAX_HITS: usize = 24;
 
-    // cast_possible_truncation: usize is 64-bit on every Seraph target, so the
-    // stack-pointer value always fits.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "usize is 64-bit on every Seraph target, so the stack-pointer value always fits"
+    )]
     let sp = crate::arch::current::cpu::current_stack_pointer() as usize;
 
     let text_start = core::ptr::addr_of!(__text_start) as usize;

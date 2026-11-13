@@ -22,6 +22,23 @@
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic,
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 mod arch;
 mod crash;
@@ -620,7 +637,13 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             // exit is recorded like a reaped death's, so a `QUERY_PROCESS`
             // racing a death drain the destroy overtook still answers
             // `EXITED`.
-            let _ = process::destroy_process(badge, ctx.memmgr_ep, ipc_buf, &ctx.tables, true);
+            let _ = process::destroy_process(
+                badge,
+                ctx.memmgr_ep,
+                ipc_buf,
+                &ctx.tables,
+                process::ExitRecord::Record,
+            );
             reply_empty(ipc_buf, procmgr_errors::SUCCESS);
             // The destroyed process may have been the crash service or an
             // attached debugger.
@@ -647,11 +670,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
             // Badge identifies which process to query. Reply data:
             //   word 0 = state code (see `procmgr_process_state`)
             //   word 1 = exit_reason (only meaningful for `EXITED`)
-            let (state, exit_reason) = {
-                let mut state = ctx.tables.lock();
-                let process::TableState { table, recent } = &mut *state;
-                resolve_query_state(badge, table, recent)
-            };
+            let (state, exit_reason) = resolve_query_state(badge, &mut ctx.tables.lock());
             let reply = IpcMessage::builder(procmgr_errors::SUCCESS)
                 .word(0, state)
                 .word(1, exit_reason)
@@ -801,11 +820,7 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables)
                 .split_first()
                 .map_or((0, &[][..]), |(&c, rest)| (c, rest));
             release_caps(extra);
-            match handle_attach_process(req, ipc_buf, table)
-            {
-                Some(badge) if watch != 0 => process::watch_debugger(table, badge, watch),
-                _ => release_caps(&[watch]),
-            }
+            handle_attach_process(req, ipc_buf, table, watch);
         }
         procmgr_labels::LIST_PROCESSES =>
         {
@@ -920,13 +935,15 @@ fn handle_register_crash_service(req: &IpcMessage, ipc_buf: *mut u64)
 /// registration order, those that are gone swept out first, so no exited
 /// thread is listed. The request's badge may be a thread crash badge, which
 /// names its process and, in the reply's named-thread word, that thread.
-/// Returns the target's process badge when the attach succeeded, the reply
-/// delivered, for the caller to keep the debugger watch `caps[0]` carried.
+/// `watch` is the debugger watch `caps[0]` carried (`0`: none), which this
+/// takes: an attach that succeeds keeps it as the target's, from before its
+/// reply is sent (`process::watch_debugger`), and every other deletes it.
 fn handle_attach_process(
     req: &IpcMessage,
     ipc_buf: *mut u64,
     table: &mut process::ProcessTable,
-) -> Option<u64>
+    watch: u64,
+)
 {
     let (entry, named) = match process_table::attach_target(table, req.badge, req.word(0))
     {
@@ -939,8 +956,9 @@ fn handle_attach_process(
                 process_table::AttachRefusal::Unknown => procmgr_errors::INVALID_BADGE,
                 process_table::AttachRefusal::NotAttachable => procmgr_errors::NOT_ATTACHABLE,
             };
+            release_caps(&[watch]);
             reply_empty(ipc_buf, code);
-            return None;
+            return;
         }
     };
     let first = usize::try_from(req.word(1)).unwrap_or(usize::MAX);
@@ -960,8 +978,9 @@ fn handle_attach_process(
     let Ok((derived, n)) = page
     else
     {
+        release_caps(&[watch]);
         reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        return None;
+        return;
     };
     let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
         .word(0, (entry.threads.len() as u64).saturating_add(1))
@@ -979,16 +998,17 @@ fn handle_attach_process(
     {
         reply = reply.cap(cap);
     }
-    let badge = entry.badge();
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    if unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) }.is_err()
+    let reply = reply.build();
+    let send = || {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_ok()
+    };
+    if !process::watch_debugger(entry, watch, send)
     {
-        // The caller holds none of the caps, so the attach did not succeed
+        // The caller holds none of the caps, so the attach did not succeed,
         // and its watch is not kept.
         release_caps(derived.get(..n).unwrap_or_default());
-        return None;
     }
-    Some(badge)
 }
 
 /// Handle `LIST_PROCESSES` — reply with one page of live processes, in
@@ -1196,7 +1216,8 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
     let _ = unsafe { ipc::ipc_reply(&reply.build(), ipc_buf) };
 }
 
-/// Answer `QUERY_PROCESS` for the addressed entry.
+/// Answer `QUERY_PROCESS` for the addressed entry, from `state`, the table
+/// state the caller holds locked.
 ///
 /// Consults the kernel for the authoritative thread-lifecycle snapshot
 /// (`CAP_INFO_THREAD_STATE`) so a freshly-faulted child is reported as
@@ -1204,13 +1225,10 @@ fn handle_query_live_processes(req: &IpcMessage, ipc_buf: *mut u64, table: &proc
 /// entry. Without this, the userspace death-eq drain races a parent's
 /// "wait then `QUERY_PROCESS`" sequence and produces a transient ALIVE
 /// answer for an already-dead child.
-fn resolve_query_state(
-    badge: u64,
-    table: &process::ProcessTable,
-    recent: &mut process::RecentExits,
-) -> (u64, u64)
+fn resolve_query_state(badge: u64, state: &mut process::TableState) -> (u64, u64)
 {
     use ipc::procmgr_process_state;
+    let process::TableState { table, recent } = state;
     if let Some((started, thread_cap)) = table.query_by_badge(badge)
     {
         // Kernel-authoritative override: if the thread has transitioned to
@@ -1606,7 +1624,13 @@ fn refuse_unarmed_create(
     }
     let _ = syscall::cap_delete(result.thread_for_caller);
     let _ = syscall::cap_delete(result.process_handle);
-    let _ = process::destroy_process(result.badge, ctx.memmgr_ep, ipc_buf, &ctx.tables, false);
+    let _ = process::destroy_process(
+        result.badge,
+        ctx.memmgr_ep,
+        ipc_buf,
+        &ctx.tables,
+        process::ExitRecord::Omit,
+    );
     reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
 }
 
@@ -1676,7 +1700,13 @@ fn reply_create_result(
             let _ = syscall::cap_delete(token);
         }
         // No handle to this child survives, so nothing can query its exit.
-        let _ = process::destroy_process(result.badge, memmgr_ep, ipc_buf, tables, false);
+        let _ = process::destroy_process(
+            result.badge,
+            memmgr_ep,
+            ipc_buf,
+            tables,
+            process::ExitRecord::Omit,
+        );
     }
 }
 
@@ -1784,7 +1814,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         memmgr_badge: mms.badge(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
-        demand_paged: label & procmgr_labels::CREATE_PINNED == 0,
+        paging: process::Paging::of_label(label),
         self_memmgr_ep: ctx.memmgr_ep,
     };
 
@@ -1973,7 +2003,7 @@ fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx
         caps.creator,
         argv_env.as_ref(),
         &ctx.deaths,
-        label & procmgr_labels::CREATE_PINNED == 0,
+        process::Paging::of_label(label),
         caps.relay,
         sched,
     );

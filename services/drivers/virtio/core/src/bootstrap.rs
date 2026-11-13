@@ -159,7 +159,12 @@ impl DeliveredDevice
                     vector: 0,
                     ..
                 } => DeviceInterrupt::MsiX { cap },
-                _ => return None,
+                Resource::Mmio { bar: None, .. }
+                | Resource::IoPort { .. }
+                | Resource::Interrupt {
+                    kind: InterruptKind::Msi | InterruptKind::MsiX,
+                    ..
+                } => return None,
             };
             if device.interrupt.replace(interrupt).is_some()
             {

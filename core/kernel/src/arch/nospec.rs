@@ -44,9 +44,11 @@ const _: () = assert!(usize::BITS == u64::BITS);
 /// [`mask_index`] for a `u64` index (a syscall register value).
 #[inline]
 #[must_use]
-// cast_possible_truncation: `usize` is 64 bits wide on every kernel target
-// (asserted above), so `u64 as usize` and back are exact.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`usize` is 64 bits wide on every kernel target (asserted above), so `u64 as usize` \
+              and back are exact"
+)]
 pub fn mask_index_u64(index: u64, bound: u64) -> u64
 {
     mask_index(index as usize, bound as usize) as u64

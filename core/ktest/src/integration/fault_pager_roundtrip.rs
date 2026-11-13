@@ -45,6 +45,12 @@ const SENTINEL: u64 = 0xF00D_D00D_1234_5678;
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg`, the reply `IpcMessage` and the builder values of its `.cap()` \
+              chain (568 B each) and the `Result` temporaries of its `ipc_recv(..)?` (about 576 B \
+              each); on init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)

@@ -22,6 +22,8 @@
 //! [`MAX_RESOURCES`], or a round after the end round fails the decode, and the
 //! driver exits.
 
+use alloc::vec::Vec;
+
 use ipc::bootstrap::BootstrapRound;
 use syscall_abi::{IRQ_MODE_MASK, MSG_CAP_SLOTS_MAX};
 
@@ -280,7 +282,7 @@ impl Round
 
 // ── Decoder (driver) ────────────────────────────────────────────────────────
 
-/// Why a round did not decode.
+/// Why a round was not absorbed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListError
 {
@@ -292,13 +294,27 @@ pub enum ListError
     TooMany,
     /// A round after the end round.
     AfterEnd,
+    /// The heap had no room for the round's resources.
+    NoMemory,
+}
+
+/// Why [`receive`] returned no list. Every cap received so far is deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiveError
+{
+    /// A round's request failed with this `ipc::bootstrap::request_round`
+    /// error.
+    Request(u64),
+    /// A received round was not absorbed.
+    Absorb(ListError),
 }
 
 /// The resources a driver received, accumulated round by round.
 pub struct ResourceList
 {
-    resources: [Resource; MAX_RESOURCES],
-    count: usize,
+    /// In delivery order, at most [`MAX_RESOURCES`]; on the heap, grown by
+    /// each round to its exact length, so the list moves as a few words.
+    resources: Vec<Resource>,
     endpoints: Option<Endpoints>,
 }
 
@@ -317,12 +333,7 @@ impl ResourceList
     pub const fn new() -> Self
     {
         Self {
-            resources: [Resource::IoPort {
-                cap: 0,
-                base: 0,
-                count: 0,
-            }; MAX_RESOURCES],
-            count: 0,
+            resources: Vec::new(),
             endpoints: None,
         }
     }
@@ -425,16 +436,20 @@ impl ResourceList
 
     fn push(&mut self, batch: &[Resource]) -> Result<bool, ListError>
     {
-        let end = self
-            .count
+        if self
+            .resources
+            .len()
             .checked_add(batch.len())
-            .filter(|&end| end <= MAX_RESOURCES)
-            .ok_or(ListError::TooMany)?;
+            .is_none_or(|end| end > MAX_RESOURCES)
+        {
+            return Err(ListError::TooMany);
+        }
+        // Exact, not doubling: the list stays within `MAX_RESOURCES` entries
+        // of heap, the cost docs/limits.md states for it.
         self.resources
-            .get_mut(self.count..end)
-            .ok_or(ListError::TooMany)?
-            .copy_from_slice(batch);
-        self.count = end;
+            .try_reserve_exact(batch.len())
+            .map_err(|_| ListError::NoMemory)?;
+        self.resources.extend_from_slice(batch);
         Ok(false)
     }
 
@@ -442,9 +457,7 @@ impl ResourceList
     #[must_use]
     pub fn resources(&self) -> &[Resource]
     {
-        // `count` is set only in `new` (0) and `push`, which keeps it within
-        // `MAX_RESOURCES`.
-        self.resources.get(..self.count).unwrap_or(&[])
+        &self.resources
     }
 
     /// The endpoints of the end round; `None` until it is absorbed.
@@ -532,10 +545,11 @@ impl PlatformDelivery
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.
 ///
 /// # Errors
-/// The `ipc::bootstrap::request_round` error of a failed round, or
-/// `ipc::bootstrap_errors::INVALID` for a round that does not decode. On an
-/// error every cap received so far is deleted.
-pub unsafe fn receive(creator: u64, ipc_buf: *mut u64) -> Result<ResourceList, u64>
+/// [`ReceiveError::Request`] with the `ipc::bootstrap::request_round` error
+/// of a failed round, or [`ReceiveError::Absorb`] for a round that does not
+/// decode or that the heap has no room for. On an error every cap received so
+/// far is deleted.
+pub unsafe fn receive(creator: u64, ipc_buf: *mut u64) -> Result<ResourceList, ReceiveError>
 {
     let mut list = ResourceList::new();
     loop
@@ -547,7 +561,7 @@ pub unsafe fn receive(creator: u64, ipc_buf: *mut u64) -> Result<ResourceList, u
             Err(code) =>
             {
                 delete(list.caps());
-                return Err(code);
+                return Err(ReceiveError::Request(code));
             }
         };
         match list.absorb(&round)
@@ -555,11 +569,11 @@ pub unsafe fn receive(creator: u64, ipc_buf: *mut u64) -> Result<ResourceList, u
             Ok(true) => return Ok(list),
             Ok(false) =>
             {}
-            Err(_) =>
+            Err(error) =>
             {
                 delete(round.caps.iter().take(round.cap_count).copied());
                 delete(list.caps());
-                return Err(ipc::bootstrap_errors::INVALID);
+                return Err(ReceiveError::Absorb(error));
             }
         }
     }
@@ -889,6 +903,7 @@ mod tests
         }
         assert_eq!(list.absorb(&received(&mmio)), Err(ListError::TooMany));
         assert_eq!(list.resources().len(), MAX_RESOURCES);
+        assert!(list.resources.capacity() <= MAX_RESOURCES);
     }
 
     fn ends(service: u64, devmgr_query: u64) -> Round

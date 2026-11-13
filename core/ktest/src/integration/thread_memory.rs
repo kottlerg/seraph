@@ -365,6 +365,11 @@ fn map_all(ctx: &TestContext, b: u64, [d0, d1, text, shared, protect, lent]: [u6
 
 /// A read straddling B's two data pages, then a write of a whole
 /// `MAX_THREAD_MEM_COPY` across them, each checked from ktest's side.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `got` buffer (200 B) and the `new` buffer (`MAX_THREAD_MEM_COPY`, 4 KiB); on \
+              init's 16 KiB stack"
+)]
 fn data_copies(th: u64) -> TestResult
 {
     let start = B_DATA + PAGE - 100;
@@ -412,6 +417,11 @@ fn data_copies(th: u64) -> TestResult
 }
 
 /// The refusals, each leaving B's memory untouched.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `big` buffer (`MAX_THREAD_MEM_COPY` + 1, 4097 B) and the `buf` buffer (16 B); on \
+              init's 16 KiB stack"
+)]
 fn refusals(th: u64) -> TestResult
 {
     let mut buf = [0u8; 16];

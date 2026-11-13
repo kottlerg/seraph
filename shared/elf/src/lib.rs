@@ -804,6 +804,11 @@ pub fn find_note<'a>(
 /// the descriptor's byte range within `buf`, or `None` as [`find_note`] does,
 /// and also when a read fails, comes back short, or reaches past `file_size`;
 /// no read follows the first that fails or comes back short.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the section-name table buffer `strtab_buf` (`MAX_STREAMING_STRTAB`, 4 KiB); on its \
+              caller's stack, 32 KiB at the smallest (a std service's main thread)"
+)]
 pub fn find_note_streaming<F>(
     ehdr: &Elf64Ehdr,
     file_size: u64,
@@ -1454,6 +1459,11 @@ pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, El
 ///
 /// As [`rela_table`] (with `header_data` for `data`); a failed or short `read_at`, or an oversized
 /// `PT_DYNAMIC` segment, is [`ElfError::MalformedDynamic`].
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `PT_DYNAMIC` buffer `buf` (`MAX_STREAMING_DYNAMIC`, 4 KiB); on its caller's \
+              stack, 32 KiB at the smallest (a std service's main thread)"
+)]
 pub fn rela_table_metadata<F>(
     ehdr: &Elf64Ehdr,
     header_data: &[u8],

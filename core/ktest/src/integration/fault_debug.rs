@@ -85,6 +85,12 @@ pub fn run(ctx: &TestContext) -> TestResult
 
 /// A software breakpoint is delivered as `FAULT_EXC_BREAKPOINT` and
 /// resumed past.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each), the `Result` temporaries \
+              of its `ipc_recv(..)?` (about 576 B each) and the `regs` buffer (512 B); on init's \
+              16 KiB stack"
+)]
 fn breakpoint(ctx: &TestContext, child: &spawn::SpawnedChild, ep: u64, sig: u64) -> TestResult
 {
     let child_sig = cap_copy(sig, child.cs, RIGHTS_NTF_NOTIFY)

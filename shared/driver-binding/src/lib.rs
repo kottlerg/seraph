@@ -40,6 +40,10 @@
     )
 )]
 
+// The driver's decoded resource list lives on its heap
+// (`resources::ResourceList`); every driver is a std process.
+extern crate alloc;
+
 pub mod decl;
 pub mod note;
 pub mod resources;

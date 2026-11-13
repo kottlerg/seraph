@@ -38,6 +38,7 @@ syscall and no IPC, so both ends keep the IPC calls and the logic stays host-rea
 ```
 services/logd/codec/
 ├── Cargo.toml
+├── clippy.toml                 # Clippy settings; frame threshold of init's 16 KiB stack
 ├── README.md
 └── src/
     ├── lib.rs                  # Crate root

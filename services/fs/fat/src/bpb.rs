@@ -80,6 +80,12 @@ pub struct FatState
 impl FatState
 {
     /// Create a default state (pre-mount).
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the `FatState` it builds and returns by value, holding the 4 KiB \
+                  `cached_fat_data` array (about 4.2 KiB), and its copy; on its caller's stack, 32 \
+                  KiB at the smallest (fatfs's main thread)"
+    )]
     pub fn new() -> Self
     {
         Self {

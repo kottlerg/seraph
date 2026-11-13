@@ -20,6 +20,7 @@ Boot Order").
 ```
 memmgr/
 ├── Cargo.toml                  # Workspace member; no_std binary
+├── clippy.toml                 # Clippy settings; frame threshold of memmgr's 48 KiB stack
 ├── README.md
 ├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
 │                               # arena, free pool, deferred list, process

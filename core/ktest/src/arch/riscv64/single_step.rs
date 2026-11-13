@@ -157,6 +157,12 @@ fn write_stub(ctx: &TestContext, frame: u64) -> TestResult
 }
 
 /// Map the stub executable in B, start `th` at it, and step it.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `regs` register file (280 B), the temporaries of its two `read_regs(..)?` calls \
+              (each a `Result` holding a register file, about 288 B) and the `text` buffer \
+              (`STUB_LEN`); on init's 16 KiB stack"
+)]
 fn start_and_step(ctx: &TestContext, b: u64, frame: u64, th: u64, ep: u64) -> TestResult
 {
     // SAFETY: `b` is an address space this test created, not ktest's own.

@@ -405,6 +405,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, _err: i64)
 /// `HANDOVER_PULL` data drain and its terminal `HANDOVER_RELEASE`; an
 /// acknowledged release sets `HANDOVER_COMPLETE`, and the next loop
 /// iteration self-terminates the thread.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `recv`, the `reply` and the per-arm `IpcMessage::new` replies \
+              (`IpcMessage`s, 568 B each); on the log thread's 16 KiB stack"
+)]
 fn log_receive_loop(log_ep: u64, ipc_buf_raw: *mut u64) -> !
 {
     // SAFETY: the log thread runs this loop once and never returns from it,

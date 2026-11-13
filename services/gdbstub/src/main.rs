@@ -88,6 +88,15 @@ const POLL_MS: u64 = 10;
 /// The most bytes one serial-protocol message carries.
 const MAX_MESSAGE_BYTES: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
 
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::large_stack_frames,
+        reason = "`stub` (a `Stub` holding the 4 KiB `PacketReader<PACKET_SIZE>` buffer, about 4.2 \
+                  KiB) and the `IpcMessage` temporaries of its requests and replies (568 B each); \
+                  on the 32 KiB main-thread stack of gdbstub"
+    )
+)]
 fn main()
 {
     std::os::seraph::log::register_name(b"gdbstub");

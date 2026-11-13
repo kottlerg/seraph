@@ -593,6 +593,12 @@ fn unpack(arg: u64) -> (u64, u64)
 /// Server: receive the round's caller (arming the reply binding), report the
 /// binding armed, wait for `go` in a delete-first round, spin the round's
 /// delay, reply per the round's kind, and report the reply's result.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the `reply` `IpcMessage` (568 B each), the builder values of \
+              its arms' `.cap()` and `.word()` chains (568 B each) and the `Result` of its \
+              `ipc_recv` (about 576 B); on its 16 KiB `ChildStack`"
+)]
 extern "C" fn server_entry(arg: u64) -> !
 {
     // SAFETY: arg is SERVER_ARGS entry 0's address, published before the start.

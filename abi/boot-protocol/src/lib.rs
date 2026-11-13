@@ -596,6 +596,12 @@ impl KernelMmio
     /// ACPI tables absent). The kernel falls back to its hardcoded
     /// constants when the corresponding field is zero.
     #[must_use]
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the returned `KernelMmio` (about 3 KiB: 128 `IoApicEntry`s of 24 B) and its \
+                  temporaries; on the bootloader's stack, the UEFI boot-services stack of at \
+                  least 128 KiB (the kernel evaluates it only in a constant)"
+    )]
     pub const fn zero() -> Self
     {
         Self {

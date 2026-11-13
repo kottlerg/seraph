@@ -556,6 +556,12 @@ const fn stray_cap_calls(kept: usize) -> usize
 /// does not keep them, then check it still answers. Every call must also get
 /// its case's normal reply, so deleting the strays changes no label's
 /// behaviour.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `builder`, its built copy and the `reply` `IpcMessage`s (568 B each) of each \
+              case, and the `QUERY_POOL_STATUS` request; on the 32 KiB main-thread stack of \
+              svctest"
+)]
 pub fn stray_cap_flood_phase(_: &Caps)
 {
     let info = startup_info();

@@ -194,6 +194,11 @@ pub fn encode_slot(badge: u64, name: &[u8]) -> IpcMessage
 /// area after [`LINE_BYTES_WORD`] are clipped, and the declared length is the
 /// clipped length.
 #[must_use]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the builder (568 B) and the `IpcMessage` it returns by value (568 B); on its \
+              caller's stack, 16 KiB at the smallest (init's)"
+)]
 pub fn encode_line(badge: u64, us: u64, level: u64, line: &[u8]) -> IpcMessage
 {
     let line = clip_to_payload(line, LINE_BYTES_WORD);
@@ -213,6 +218,11 @@ pub fn encode_line(badge: u64, us: u64, level: u64, line: &[u8]) -> IpcMessage
 /// [`RECORD_BYTES_WORD`] holds whole; a longer one is clipped, and the
 /// receiver then refuses it.
 #[must_use]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the builder (568 B) and the `IpcMessage` it returns by value (568 B); on its \
+              caller's stack, 16 KiB at the smallest (init's)"
+)]
 pub fn encode_record(badge: u64, us: u64, level: u64, record: &[u8]) -> IpcMessage
 {
     let record = clip_to_payload(record, RECORD_BYTES_WORD);

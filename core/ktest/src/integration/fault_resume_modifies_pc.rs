@@ -51,6 +51,12 @@ static RECOVERY_SIG: AtomicU64 = AtomicU64::new(0);
 
 static mut CHILD_STACK: ChildStack = ChildStack::ZERO;
 
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each), the `Result` temporaries \
+              of its `ipc_recv(..)?` (about 576 B each) and the `reg_buf` buffer (512 B); on \
+              init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)

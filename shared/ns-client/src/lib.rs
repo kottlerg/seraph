@@ -147,6 +147,11 @@ struct WalkResult
 ///
 /// # Safety
 /// The contract of [`walk_to_file`] for `ipc_buf`.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy, one set per \
+              path component; on its caller's stack, 16 KiB at the smallest (init's)"
+)]
 unsafe fn walk(
     root_cap: u64,
     path: &[u8],

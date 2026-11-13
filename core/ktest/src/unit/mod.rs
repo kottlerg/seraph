@@ -38,6 +38,12 @@ use crate::run_test;
     clippy::too_many_lines,
     reason = "run_all is a flat dispatch table; splitting it adds no clarity"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "no large local: the estimate sums the temporaries of its 234 `run_test!` expansions \
+              (the logged names, the closure passed to `run_isolated` and its `TestResult`, about \
+              220 B each), and the compiled frame is under 1 KiB; on init's 16 KiB stack"
+)]
 pub fn run_all(ctx: &TestContext)
 {
     // ── Boot handover state (first, before any test maps memory) ──────────────

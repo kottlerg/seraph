@@ -191,6 +191,13 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
               arms into helpers would thread those locals through every helper without buying \
               structural clarity"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "no single large local: the estimate sums the dozens of `String`, `Vec` and `Option` \
+              accumulators (about 24 B each) and the temporaries of its entry loop, and the \
+              compiled frame is under 2 KiB; on its caller's stack, 32 KiB at the smallest \
+              (svcmgr's main thread)"
+)]
 pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
 {
     if name.is_empty() || name.len() > ipc::svcmgr_labels::NAME_MAX

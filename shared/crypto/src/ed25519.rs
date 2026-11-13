@@ -195,6 +195,11 @@ fn verify_vector(
 /// # Errors
 ///
 /// Returns a descriptive `&'static str` on the first failing case.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the scratch buffers `msg`, `bmsg` and its copy `bad_msg` (`MSG_SCRATCH`, 1 KiB \
+              each); on its caller's stack, 16 KiB at the smallest (init's, in the ktest run)"
+)]
 pub fn run_ed25519_kats() -> Result<(), &'static str>
 {
     let mut msg = [0u8; MSG_SCRATCH];

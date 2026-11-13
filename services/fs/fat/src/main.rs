@@ -697,6 +697,11 @@ fn handle_read(
     reason = "the request, its node and open, and each piece of driver state the memory-cap read \
               touches (FAT state, open table, cache, block device, IPC buffer, eviction state)"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `reply` `IpcMessage`s (568 B each) of its eight reply paths and the builder's \
+              copy; on the 32 KiB main-thread stack of fatfs"
+)]
 fn read_memory_for_open(
     msg: &IpcMessage,
     node: &backend::FatNode,

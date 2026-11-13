@@ -1729,6 +1729,12 @@ pub fn mint_bootstrap_badge() -> Option<u64>
     reason = "each endpoint and cap procmgr is bootstrapped with is a distinct input from a \
               different bootstrap stage"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "no single large local: the estimate sums the many small locals of the ELF load \
+              (`ehdr`, `layout`, `arena`, `pm_caps`, cap slots) and the `Option` temporaries of \
+              its steps, and the compiled frame is under 2 KiB; on init's 16 KiB stack"
+)]
 pub fn bootstrap_procmgr(
     info: &InitInfo,
     alloc: &mut MemoryAlloc,

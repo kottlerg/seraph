@@ -203,7 +203,9 @@ never claims more than its device and the system's policy give it:
   treat a driver's data as untrusted.
 - **DMA width.** The width limits the device's IOVA space and never widens it past what its
   remapping unit translates; devmgr knows no device's DMA width, so a driver declares its own.
-  A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole.
+  A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole. A
+  confined device's IOVA space starts at 1 MiB, so devmgr refuses to confine, and so to bind,
+  a device whose width leaves it no IOVA there (20 bits or fewer).
 - **Form.** Every field has a fixed bound (the match entries, the name's length, the vector
   count). A declaration that exceeds one, carries an unknown field kind, or fails to decode is
   rejected whole and logged. devmgr's reads of a candidate binary are bounded too: the ELF

@@ -61,7 +61,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use driver_binding::decl::{DriverDecl, Tier};
 use firmware::binding::{Choice, MatchTable, RecordKeys, Source};
-use firmware::dma::{Confinement, ReservedError, ReservedRange, iova_limit, reserved_ranges};
+use firmware::dma::{Confinement, ReservedError, ReservedRange, has_iova_space, iova_limit, reserved_ranges};
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
 use iommu_core::Scope;
@@ -696,9 +696,10 @@ impl Iommu
     /// and those ranges, unconfined with none when no unit translates it.
     /// Logged `Err` when it is refused: the RIMT renames its device ID, its
     /// unit is not programmed, the driver has failed, its reserved regions
-    /// overlap pooled memory, pass the unit's width, or are too many, or the
-    /// `ATTACH` or a reserved mapping fails; a device attached by then is
-    /// blocked again.
+    /// overlap pooled memory, pass the unit's width, or are too many, its IOVA
+    /// limit leaves no IOVA above `IOVA_BASE` (a declared DMA width of 20 bits
+    /// or less, `firmware::dma::has_iova_space`), or the `ATTACH` or a
+    /// reserved mapping fails; a device attached by then is blocked again.
     pub fn confine(
         &self,
         name: &str,
@@ -711,6 +712,16 @@ impl Iommu
         {
             return Ok((Confinement::Unconfined, Vec::new()));
         };
+        let limit = iova_limit(self.client.width(unit), dma_width);
+        if !has_iova_space(limit)
+        {
+            std::os::seraph::log!(
+                warn: "{}: DMA address width leaves no IOVA above {:#x}; refused",
+                name,
+                firmware::dma::IOVA_BASE
+            );
+            return Err(Refused);
+        }
         let reserved = self.reserved_ranges(name, pci_dev, unit)?;
         let rid =
             iommu_labels::requester_id(pci_dev.segment, pci_dev.bus, pci_dev.dev, pci_dev.func);
@@ -748,7 +759,6 @@ impl Iommu
                 r.base.saturating_add(r.len)
             );
         }
-        let limit = iova_limit(self.client.width(unit), dma_width);
         let interrupt_range = matches!(self.topology, Topology::Dmar { .. });
         Ok((
             Confinement::Domain {

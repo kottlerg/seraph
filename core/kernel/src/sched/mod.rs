@@ -15,23 +15,6 @@
     clippy::cast_possible_truncation,
     reason = "usize→u32 CPU index and u64→usize address bounded by MAX_CPUS"
 )]
-// Staged roll-out of these lints: docs/coding-standards.md § Clippy. The
-// test configuration is exempt from the second set, as from `unwrap_used`.
-#![warn(
-    clippy::significant_drop_tightening,
-    clippy::volatile_composites,
-    clippy::wildcard_enum_match_arm
-)]
-#![cfg_attr(
-    not(test),
-    warn(
-        clippy::panic,
-        clippy::panic_in_result_fn,
-        clippy::string_slice,
-        clippy::unreachable,
-        clippy::unwrap_in_result
-    )
-)]
 
 pub mod deadline_heap;
 pub mod run_queue;
@@ -116,6 +99,11 @@ pub fn quantum_ticks(level: u8) -> u32
 /// thread peak includes the 4 KiB buffer `SYS_THREAD_READ_MEM` and
 /// `SYS_THREAD_WRITE_MEM` stage their bytes in. The report gives the depth, not
 /// the path that reached it.
+///
+/// No stack the kernel's code runs on is smaller: the x86-64 IST stacks and the
+/// riscv64 overflow stack are this size, and the boot handoff stack is larger.
+/// `core/kernel/clippy.toml` sets the `large_stack_frames` threshold to a
+/// quarter of it, 4096 bytes (docs/coding-standards.md § Clippy).
 pub const KERNEL_STACK_PAGES: usize = 4;
 
 /// A kernel stack's size in bytes.
@@ -1016,6 +1004,11 @@ pub fn watchdog_mark_non_idle(cpu: usize)
 /// woke, before this check) is a stall only once it has waited `threshold`
 /// undispatched. The remaining windows are stated in
 /// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`idle_now` is data: this tick's idle sample, on which the function records `now` \
+              in `last_idle`"
+)]
 fn all_idle_tick<I>(
     now: u64,
     threshold: u64,

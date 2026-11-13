@@ -62,6 +62,10 @@ pub fn mask_index_u64(index: u64, bound: u64) -> u64
 /// constant inside that branch's arm and the mask no longer depends on the
 /// data. A mask taken inside such an arm compares a value passed through
 /// [`hide`] ahead of the branch instead.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`cond` is data: the condition the returned mask encodes, all-ones or zero"
+)]
 #[inline]
 #[must_use]
 pub fn mask_if(cond: bool) -> usize

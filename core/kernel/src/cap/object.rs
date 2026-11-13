@@ -3740,17 +3740,9 @@ unsafe fn reclaim_cspace_donations(
 ///
 /// Same contract as [`dealloc_object`].
 #[expect(
-    clippy::cast_ptr_alignment,
-    reason = "every concrete object is constructed in place at a size-class-aligned offset of a \
-              page-aligned retype slab (`retype_allocate`), which satisfies \
-              align_of::<ConcreteType>(). The NonNull<KernelObjectHeader> points to the first \
-              field (header at offset 0), so the pointer retains the concrete type's alignment \
-              even when stored as KernelObjectHeader*"
-)]
-#[expect(
     clippy::too_many_lines,
-    reason = "structural dispatch over all object types; splitting further would obscure the type \
-              hierarchy without reducing complexity"
+    reason = "structural dispatch over all object types, each arm the teardown of its type; the \
+              longest, the Thread arm, is `dealloc_thread`"
 )]
 #[expect(
     clippy::items_after_statements,
@@ -3927,744 +3919,9 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         // ── Thread ────────────────────────────────────────────────────────
         ObjectType::Thread =>
         {
-            let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
-
-            // SAFETY: ptr points to a ThreadObject; header at offset 0.
-            let obj = unsafe { &*(ptr.as_ptr().cast::<ThreadObject>()) };
-            let tcb = obj.tcb;
-
-            // Self-teardown guard (#341): a dealloc of the running thread's own
-            // Thread object (a self-targeting SYS_CAP_REVOKE, a teardown cascade, or
-            // the deferred reclaim of an object a batched move dropped; SYS_CAP_DELETE
-            // refuses a direct self thread-cap delete) cannot pass the drain gate
-            // below; see core/kernel/docs/thread-lifecycle-and-sleep.md
-            // § Self-teardown (the caller is the freed thread).
-            // The drain gate below spins until `tcb` is no
-            // longer `current` on any CPU — impossible for the running thread on
-            // its own CPU (the spin runs with preemption disabled, so it never
-            // reschedules), which wedges the CPU. Instead mark `Exited` + drain
-            // the run queues (no free), queue the object for off-CPU reclaim,
-            // and return: the syscall epilogue observes the `Exited` state and
-            // `schedule()`s away, and `drain_deferred_reclaim` re-enters this arm
-            // with the thread off-CPU, where the gate passes immediately.
-            if !tcb.is_null()
-            {
-                let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-                // SAFETY: this_cpu < MAX_CPUS; scheduler initialised. Reading our
-                // own CPU's `current` needs no lock — only this CPU writes it at
-                // dispatch, and we are that running thread.
-                let is_self = core::ptr::eq(tcb, unsafe {
-                    crate::sched::scheduler_for(this_cpu).current()
-                });
-                if is_self
-                {
-                    log_self_teardown(tcb, "Thread");
-                    // Self net. For SYS_CAP_DELETE this is unreachable —
-                    // sys_cap_delete refuses a self thread-cap delete before the
-                    // dec-ref. It guards every OTHER dealloc of the running
-                    // thread: a self-targeting cap_revoke, and the deferred
-                    // reclaim of a Thread object whose last reference a pin or
-                    // a batched move dropped (`release_ref`) when the
-                    // draining thread is that thread. Mark Exited + drain run
-                    // queues (no free), queue the object for off-CPU reclaim,
-                    // and return. The syscall epilogue observes Exited and
-                    // schedule()s away; drain_deferred_reclaim completes the
-                    // free off-CPU, where the existing gate passes immediately.
-                    // SAFETY: tcb valid; marks Exited + drains every run queue
-                    // under the all-CPU-locks discipline (mirrors `sys_exit`,
-                    // `SYS_THREAD_EXIT`).
-                    unsafe {
-                        // Committing Exited: a refusal means a teardown
-                        // already did.
-                        let _ = crate::sched::set_state_under_all_locks(
-                            tcb,
-                            crate::sched::thread::ThreadState::Exited,
-                        );
-                    }
-                    // SAFETY: object exclusively owned (refcount 0), now Exited
-                    // and drained; queue it for off-CPU reclaim on this CPU.
-                    unsafe { push_deferred_reclaim(this_cpu, ptr) };
-                    return;
-                }
-            }
-
-            if !tcb.is_null()
-            {
-                // Remove the TCB from every run queue before freeing, so no scheduler
-                // can dequeue a freed TCB after this dealloc completes. Drain protocol
-                // per core/kernel/docs/thread-lifecycle-and-sleep.md
-                // § `dealloc_object(Thread)` Drain Protocol: lock every CPU, commit
-                // Exited, drain queues, and snapshot any reply-bound client for a wake
-                // outside the all-locks region; the wake's target CPU is recomputed at
-                // the deferred wake site below (#351).
-                let server_reply_wake: Option<*mut crate::sched::thread::ThreadControlBlock>;
-                // All scheduler locks are acquired in ascending order to prevent
-                // deadlock; each lock_raw is paired with its unlock_raw.
-                {
-                    use crate::sched::thread::ThreadState;
-                    let cpu_count = crate::sched::CPU_COUNT
-                        .load(core::sync::atomic::Ordering::Relaxed)
-                        as usize;
-
-                    // Acquire (*tcb).sched_lock first (outermost) so the Exited write
-                    // serialises with schedule()'s dispatch flip and enqueue_and_wake on the
-                    // same per-TCB lock; released right after the CPU locks below, before the
-                    // UAF gate. Order per core/kernel/docs/scheduling-internals.md § Lock
-                    // Hierarchy rule 4.
-                    // SAFETY: tcb validated non-null and live; only the lock field is
-                    // borrowed, and it is a lock.
-                    let tcb_sched_lock = unsafe { &(*tcb).sched_lock };
-                    // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
-                    // below.
-                    let tcb_sched_saved = unsafe { tcb_sched_lock.lock_raw() };
-
-                    // Acquire all scheduler locks in ascending CPU order to
-                    // prevent ABBA deadlock. Each CPU's saved interrupt-flag
-                    // word is stashed in its own scheduler (under that lock).
-                    for cpu in 0..cpu_count
-                    {
-                        // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
-                        let sched = unsafe { crate::sched::scheduler_for(cpu) };
-                        // SAFETY: the locks are taken in ascending CPU order and paired
-                        // with `unlock_saved_flags` below.
-                        unsafe { sched.lock_saving_flags() };
-                    }
-
-                    // Read priority inside the all-locks region. This dealloc and
-                    // `set_state_under_all_locks` read it under their all-CPU-locks
-                    // region; `sys_thread_set_priority` writes it under the per-TCB
-                    // `sched_lock` this dealloc also holds (outer), so the read is
-                    // serialised against that writer.
-                    // SAFETY: tcb validated non-null and live; sched_lock and every
-                    // scheduler lock held.
-                    let prio = unsafe { (*tcb).priority };
-
-                    // Mark Exited under all locks — no schedule() on any CPU
-                    // can see this thread as Ready/Running after this point.
-                    // SAFETY: tcb validated non-null and live; sched_lock and every
-                    // scheduler lock held.
-                    unsafe { (*tcb).state = ThreadState::Exited };
-
-                    // Remove from whichever queue it's actually in.
-                    for cpu in 0..cpu_count
-                    {
-                        // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
-                        let sched = unsafe { crate::sched::scheduler_for(cpu) };
-                        // SAFETY: this CPU's scheduler lock is held (taken above); tcb is a
-                        // valid TCB.
-                        unsafe { sched.remove_from_queue(tcb, prio) };
-                    }
-
-                    // A dying server orphans any reply-bound client: claim the reply slot
-                    // (CAS), deposit only the resume disposition, and leave the client
-                    // Blocked for the gated enqueue_and_wake below, per
-                    // core/kernel/docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
-                    // Drain Protocol, step 5.
-                    server_reply_wake = {
-                        use core::sync::atomic::Ordering;
-                        // SAFETY: tcb validated non-null and live; the all-CPU locks are held.
-                        let bound = unsafe { (*tcb).reply_tcb.load(Ordering::Acquire) };
-                        if bound.is_null()
-                        {
-                            None
-                        }
-                        else
-                        {
-                            // SAFETY: tcb validated non-null and live; the all-CPU locks are
-                            // held.
-                            let claimed = unsafe {
-                                (*tcb)
-                                    .reply_tcb
-                                    .compare_exchange(
-                                        bound,
-                                        core::ptr::null_mut(),
-                                        Ordering::AcqRel,
-                                        Ordering::Acquire,
-                                    )
-                                    .is_ok()
-                            };
-                            if claimed
-                            {
-                                // Keep the client TCB alive against a concurrent
-                                // dealloc(client) until the deferred enqueue_and_wake
-                                // clears it (#160 wake-in-flight gate). A BlockedOnReply
-                                // client already carries wake_in_flight = 1 from
-                                // endpoint_call/recv; refresh it unconditionally so the
-                                // gate also covers the BlockedOnFault entry path.
-                                // SAFETY: bound is the client claimed by the reply_tcb CAS
-                                // above, which keeps it valid.
-                                unsafe { (*bound).wake_in_flight.store(1, Ordering::Release) };
-                                // Deposit the resume disposition (read on resume per the
-                                // DEPOSIT model). A fault-blocked client cancels to Kill
-                                // (the fault helper terminates it on resume); a syscall
-                                // caller returns Interrupted. Reading ipc_state here is a
-                                // read of a value stable until our own wake (we hold the
-                                // sole claim via the reply_tcb CAS).
-                                // SAFETY: bound is valid, as above.
-                                let bound_ipc_state = unsafe { (*bound).ipc_state };
-                                let was_fault = bound_ipc_state
-                                    == crate::sched::thread::IpcThreadState::BlockedOnFault;
-                                if was_fault
-                                {
-                                    // SAFETY: bound is valid, as above.
-                                    unsafe {
-                                        (*bound).fault_outcome.store(
-                                            crate::ipc::fault::FAULT_OUTCOME_KILL,
-                                            Ordering::Release,
-                                        );
-                                    }
-                                    // CAS win = episode claim; fault disposition is
-                                    // the KILL above.
-                                    // SAFETY: the reply_tcb CAS win gives this exclusive claim
-                                    // on bound's park episode; exactly one stamp.
-                                    unsafe { crate::sched::thread::stamp_deposit_episode(bound) };
-                                }
-                                else
-                                {
-                                    // The reply_tcb CAS win is the episode claim:
-                                    // the orphaned caller's resume returns
-                                    // Interrupted via the disposition. Only
-                                    // sys_ipc_call parks are reply-bound, so the
-                                    // disposition is the whole mechanism.
-                                    // SAFETY: the reply_tcb CAS win gives this exclusive claim
-                                    // on bound's park episode; exactly one stamp.
-                                    unsafe {
-                                        crate::sched::thread::stamp_park_deposit(
-                                            bound,
-                                            crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
-                                        );
-                                    }
-                                }
-                                Some(bound)
-                            }
-                            else
-                            {
-                                // Concurrent cancel beat us.
-                                None
-                            }
-                        }
-                    };
-
-                    // Release all CPU locks, then (*tcb).sched_lock last — BEFORE
-                    // the UAF gate, which spins with interrupts ENABLED (holding
-                    // an IRQ-disabling sched_lock across it would be inconsistent,
-                    // and a CPU switching away from `tcb` must be able to take
-                    // tcb.sched_lock).
-                    for cpu in (0..cpu_count).rev()
-                    {
-                        // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
-                        let sched = unsafe { crate::sched::scheduler_for(cpu) };
-                        // SAFETY: this CPU's lock was taken by `lock_saving_flags` above and
-                        // is released once.
-                        unsafe { sched.unlock_saved_flags() };
-                    }
-                    // SAFETY: tcb validated non-null and live; only the lock field is
-                    // borrowed, again, after the region's accesses to the TCB.
-                    let tcb_sched_lock = unsafe { &(*tcb).sched_lock };
-                    // SAFETY: `tcb_sched_saved` is the value `lock_raw` returned for this
-                    // lock above.
-                    unsafe { tcb_sched_lock.unlock_raw(tcb_sched_saved) };
-
-                    // UAF gate: a TCB that is `current` on any CPU MUST NOT be
-                    // reclaimed until every CPU has switched away from it AND
-                    // the in-flight register save has published; see
-                    // `wait_until_off_cpu`.
-                    // SAFETY: tcb is Exited and unlinked from every run queue
-                    // (all-locks region above); not the running thread here.
-                    unsafe { crate::sched::wait_until_off_cpu(tcb) };
-
-                    // After eager FPU save (#108), no fpu_owner sweep is
-                    // needed: `nm_handler` only ever names the currently
-                    // Running thread on its CPU, and `switch_out_save`
-                    // clears the slot on switch-out — so by the time the
-                    // not-`current`-anywhere and `context_saved` spins above
-                    // have completed, no CPU's owner slot can name this TCB.
-                }
-
-                // Wake the captured reply-bound client outside the all-locks
-                // region. The client is still Blocked (we deposited its
-                // disposition above but did NOT pre-set Ready), so the gated
-                // enqueue_and_wake links it under the client's own sched_lock —
-                // and if a concurrent dealloc(client) already won the reap, the
-                // gate observes Exited and aborts the link instead of resurrecting
-                // a freed TCB. wake_in_flight (set above) kept the client alive
-                // until here and is cleared on every enqueue_and_wake exit path.
-                if let Some(bound) = server_reply_wake
-                {
-                    // Null the claimed client's `blocked_on_object` (still naming
-                    // this dying server) under the client's sched_lock, before
-                    // enqueue_and_wake and while wake_in_flight still pins `bound`:
-                    // the CLOSURE LEMMA of core/kernel/docs/scheduling-internals.md
-                    // § Cross-CPU TCB Ownership. Only the client's sched_lock is
-                    // taken (the server's was released with the all-CPU locks
-                    // above), so there is no two-TCB-sched_lock nesting.
-                    // The reply_tcb CAS above ended a timed call's
-                    // episode; its sleep-list entry goes first, so no pop
-                    // finds the binding this nulls.
-                    // SAFETY: bound kept valid by wake_in_flight = 1 above; its park
-                    // episode was claimed by the reply_tcb CAS and it is not yet woken.
-                    unsafe { crate::ipc::cancel_timed_entry(bound) };
-                    // SAFETY: bound kept valid by wake_in_flight = 1 above; only the
-                    // lock field is borrowed.
-                    let bound_lock = unsafe { &(*bound).sched_lock };
-                    // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
-                    // below.
-                    let bs = unsafe { bound_lock.lock_raw() };
-                    // SAFETY: bound kept valid by wake_in_flight = 1 above; its sched_lock
-                    // is held.
-                    let bound_blocked_on = unsafe { (*bound).blocked_on_object };
-                    if core::ptr::eq(bound_blocked_on, tcb.cast::<u8>())
-                    {
-                        // SAFETY: bound kept valid by wake_in_flight = 1 above; its
-                        // sched_lock is held.
-                        unsafe { (*bound).blocked_on_object = core::ptr::null_mut() };
-                    }
-                    // SAFETY: `bs` is the value `lock_raw` returned for this lock above.
-                    unsafe { bound_lock.unlock_raw(bs) };
-                    // Recompute the wake target HERE (post-gates), under the
-                    // client's current state, EXCLUDING this dealloc CPU. This
-                    // CPU stays inside this teardown through the wake-in-flight
-                    // gate below, not in schedule(), so it cannot dispatch a
-                    // client linked onto it — the save-window pin would strand a
-                    // `context_saved==0` client here (#351; step 10 of
-                    // core/kernel/docs/thread-lifecycle-and-sleep.md
-                    // § `dealloc_object(Thread)` Drain Protocol). A peer
-                    // dispatches it safely via the schedule()
-                    // publication-barrier spin. Recomputing at wake time (rather
-                    // than snapshotting under the all-CPU locks above) also
-                    // closes the double-enqueue straddle: the target reflects
-                    // the state at link time, not two unbounded spins earlier
-                    // (#289).
-                    let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
-                    // SAFETY: bound kept valid by wake_in_flight = 1 above;
-                    // select_target_cpu_excluding is lock-free.
-                    let bcpu =
-                        unsafe { crate::sched::select_target_cpu_excluding(bound, Some(this_cpu)) };
-                    // The reply-wake is never self-pinned to the wedged
-                    // dealloc CPU unless hard affinity names it or it is the only
-                    // CPU.
-                    debug_assert!(
-                        bcpu != this_cpu
-                            || crate::sched::CPU_COUNT
-                                .load(core::sync::atomic::Ordering::Relaxed)
-                                == 1
-                            // SAFETY: bound valid (pinned by wake_in_flight).
-                            || unsafe { (*bound).cpu_affinity } != crate::sched::AFFINITY_ANY,
-                        "dealloc reply-wake self-pinned to dealloc cpu {this_cpu}",
-                    );
-                    // SAFETY: bound kept valid by wake_in_flight = 1 above.
-                    unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
-                }
-
-                // Drop any sleep-list entry before the IPC unlink, so a timer pop
-                // that wins the race still sees the full binding. Outside the
-                // all-locks region (no sched.lock → SLEEP_LIST_LOCK edge). See
-                // core/kernel/docs/thread-lifecycle-and-sleep.md
-                // § `dealloc_object(Thread)` Drain Protocol, step 11.
-                // SAFETY: tcb is valid (not yet freed).
-                unsafe { crate::sched::sleep_list_remove(tcb) };
-
-                // Unlink this thread from any IPC object it's blocked on.
-                // Without this, a notification/endpoint/event_queue retains a
-                // dangling waiter pointer to the freed TCB. A subsequent
-                // notification_send would return that pointer, and the caller
-                // would enqueue_and_wake a freed TCB — use-after-free.
-                // The binding pair is read and cleared under tcb's sched_lock:
-                // the abort arm of a wake that claimed tcb before its Exited
-                // mark writes the same pair under that lock (see
-                // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
-                // Ownership). A source is reached only through
-                // `ipc::lock_bound_source`, which re-reads the binding under
-                // tcb's sched_lock and try-locks the source under it: a
-                // binding still observed there names a source not yet freed,
-                // so a concurrent last-capability delete of the source cannot
-                // free it under this unlink.
-                // tcb is valid (not yet freed); blocked_on_object and ipc_state
-                // are always valid on an initialized TCB.
-                {
-                    use crate::sched::thread::IpcThreadState;
-                    // SAFETY: tcb is valid (not yet freed); only the lock field is
-                    // borrowed, and it is a lock.
-                    let sched_lock = unsafe { &(*tcb).sched_lock };
-                    // SAFETY: the flags `lock_raw` returns are passed to the
-                    // `unlock_raw` below.
-                    let sched_saved = unsafe { sched_lock.lock_raw() };
-                    // SAFETY: tcb is valid (not yet freed); sched_lock held.
-                    let blocked_obj = unsafe { (*tcb).blocked_on_object };
-                    // SAFETY: tcb is valid (not yet freed); sched_lock held.
-                    let bound_state = unsafe { (*tcb).ipc_state };
-                    // SAFETY: `sched_saved` is the value `lock_raw` returned for this
-                    // lock above.
-                    unsafe { sched_lock.unlock_raw(sched_saved) };
-                    if !blocked_obj.is_null()
-                    {
-                        match bound_state
-                        {
-                            IpcThreadState::BlockedOnNotification
-                            | IpcThreadState::BlockedOnSend
-                            | IpcThreadState::BlockedOnRecv
-                            | IpcThreadState::BlockedOnEventQueue
-                            | IpcThreadState::BlockedOnWaitSet =>
-                            {
-                                // SAFETY: tcb is a valid TCB; no IPC source lock, sched_lock,
-                                // per-CPU scheduler lock, or SLEEP_LIST_LOCK is held here;
-                                // bound_state is a source-blocking state.
-                                let bound_source = unsafe {
-                                    crate::ipc::lock_bound_source(
-                                        tcb,
-                                        bound_state,
-                                        blocked_obj,
-                                        None,
-                                    )
-                                };
-                                if let Some(held) = bound_source
-                                {
-                                    // SAFETY: `held` holds the live source's
-                                    // lock and tcb's sched_lock.
-                                    unsafe { unlink_dying_waiter(tcb, bound_state, blocked_obj) };
-                                    // Retire the binding inside the hold, so
-                                    // no later reader passes its re-read once
-                                    // the source no longer queues tcb.
-                                    // SAFETY: tcb is valid; `held` holds its sched_lock.
-                                    unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
-                                    // SAFETY: `held` came from lock_bound_source and both its
-                                    // locks are still held.
-                                    unsafe { held.unlock() };
-                                }
-                            }
-                            IpcThreadState::BlockedOnReply =>
-                            {
-                                // blocked_obj is the server TCB. CAS-clear the
-                                // server's reply slot iff this dying client is still
-                                // bound. Same #317 hazard as cancel_ipc_block: a
-                                // concurrent dealloc(server) could free the server
-                                // under this deref. Guard it with THIS dying client's
-                                // sched_lock + a `blocked_on == server` re-read — the
-                                // CLOSURE LEMMA pins the server alive across the CAS
-                                // (dealloc(server) nulls a claimed client's
-                                // blocked_on under the same client sched_lock before
-                                // retype_free). Only this client's sched_lock is held;
-                                // the reply_tcb CAS on the server is wait-free.
-                                use core::sync::atomic::Ordering;
-                                let server =
-                                    blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                // SAFETY: tcb is valid (not yet freed); only the lock field is
-                                // borrowed, again, after the source unlink above.
-                                let sched_lock = unsafe { &(*tcb).sched_lock };
-                                // SAFETY: the flags `lock_raw` returns are passed to the
-                                // `unlock_raw` below.
-                                let saved = unsafe { sched_lock.lock_raw() };
-                                // SAFETY: tcb is valid (not yet freed); sched_lock held.
-                                let still_bound = unsafe { (*tcb).blocked_on_object };
-                                if core::ptr::eq(still_bound, blocked_obj)
-                                {
-                                    // Win ⇒ we cancelled the reply wake; clear
-                                    // wake_in_flight so the #160 gate below does not
-                                    // wait for a wake that will never fire. Lose ⇒ a
-                                    // reply is in flight and its enqueue_and_wake
-                                    // clears the flag; the gate waits for it.
-                                    // SAFETY: the client's sched_lock is held and the
-                                    // `blocked_on == server` re-read above succeeded, so the
-                                    // CLOSURE LEMMA pins the server alive across the CAS.
-                                    let cancelled = unsafe {
-                                        (*server)
-                                            .reply_tcb
-                                            .compare_exchange(
-                                                tcb,
-                                                core::ptr::null_mut(),
-                                                Ordering::AcqRel,
-                                                Ordering::Acquire,
-                                            )
-                                            .is_ok()
-                                    };
-                                    if cancelled
-                                    {
-                                        // SAFETY: tcb is valid (not yet freed).
-                                        unsafe {
-                                            (*tcb).wake_in_flight.store(0, Ordering::Release);
-                                        }
-                                    }
-                                }
-                                // SAFETY: `saved` is the value `lock_raw` returned for this
-                                // lock above.
-                                unsafe { sched_lock.unlock_raw(saved) };
-                            }
-                            IpcThreadState::BlockedOnFault =>
-                            {
-                                // A dying fault-blocked thread: `blocked_obj` is its
-                                // handler (server) TCB. CAS-clear the handler's reply
-                                // slot so a later reply does not target this freed
-                                // faulter. Mirrors the BlockedOnReply arm including
-                                // the #317 client-sched_lock guard; the faulter never
-                                // resumes, so no disposition is recorded.
-                                use core::sync::atomic::Ordering;
-                                let server =
-                                    blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
-                                // SAFETY: tcb is valid (not yet freed); only the lock field is
-                                // borrowed, again, after the source unlink above.
-                                let sched_lock = unsafe { &(*tcb).sched_lock };
-                                // SAFETY: the flags `lock_raw` returns are passed to the
-                                // `unlock_raw` below.
-                                let saved = unsafe { sched_lock.lock_raw() };
-                                // SAFETY: tcb is valid (not yet freed); sched_lock held.
-                                let still_bound = unsafe { (*tcb).blocked_on_object };
-                                if core::ptr::eq(still_bound, blocked_obj)
-                                {
-                                    // SAFETY: the client's sched_lock is held and the
-                                    // `blocked_on == server` re-read above succeeded, so the
-                                    // CLOSURE LEMMA pins the server alive across the CAS.
-                                    let cancelled = unsafe {
-                                        (*server)
-                                            .reply_tcb
-                                            .compare_exchange(
-                                                tcb,
-                                                core::ptr::null_mut(),
-                                                Ordering::AcqRel,
-                                                Ordering::Acquire,
-                                            )
-                                            .is_ok()
-                                    };
-                                    if cancelled
-                                    {
-                                        // SAFETY: tcb is valid (not yet freed).
-                                        unsafe {
-                                            (*tcb).wake_in_flight.store(0, Ordering::Release);
-                                        }
-                                    }
-                                }
-                                // SAFETY: `saved` is the value `lock_raw` returned for this
-                                // lock above.
-                                unsafe { sched_lock.unlock_raw(saved) };
-                            }
-                            IpcThreadState::None =>
-                            {}
-                        }
-                        // SAFETY: tcb is valid (not yet freed); only the lock field is
-                        // borrowed, again, after the source unlink above.
-                        let sched_lock = unsafe { &(*tcb).sched_lock };
-                        // SAFETY: the flags `lock_raw` returns are passed to the
-                        // `unlock_raw` below.
-                        let sched_saved = unsafe { sched_lock.lock_raw() };
-                        // SAFETY: tcb is valid (not yet freed); sched_lock held.
-                        unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
-                        // SAFETY: `sched_saved` is the value `lock_raw` returned for this
-                        // lock above.
-                        unsafe { sched_lock.unlock_raw(sched_saved) };
-                    }
-                }
-
-                // Release this thread's fault-handler bindings, one per class.
-                // Each binding held an inc_ref on its endpoint object for its
-                // lifetime (see ThreadControlBlock::fault_handlers); drop it, and
-                // if this was its last reference enqueue the orphaned endpoint
-                // on the cascade stack (rather than recursing into
-                // `dealloc_object`, which the cascade exists to avoid). Done
-                // after the unlink above (which removed this thread from the
-                // endpoint's send queue if it was a queued faulter) so the
-                // endpoint dealloc cannot observe this thread still on its queue.
-                // SAFETY: tcb valid (not yet freed); the bindings are atomics.
-                let fault_handlers = unsafe { &(*tcb).fault_handlers };
-                for slot in fault_handlers
-                {
-                    let ep = slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
-                    // SAFETY: ep is non-null in the second operand, and the binding's
-                    // reference on the endpoint, still held, keeps it live.
-                    if !ep.is_null() && unsafe { (*ep).header.dec_ref() } == 0
-                    {
-                        // SAFETY: ep is non-null.
-                        let ep_header = unsafe {
-                            core::ptr::NonNull::new_unchecked(ep.cast::<KernelObjectHeader>())
-                        };
-                        // SAFETY: no lock is held here; the binding's reference was the
-                        // endpoint's last, leaving it unreferenced for the push.
-                        unsafe { stack.push(ep_header) };
-                    }
-                }
-
-                // Release the death observers' EventQueue references. The
-                // thread runs on no CPU (the gate above), so its death walk is
-                // over or never runs, and no binder can pin it (refcount 0).
-                // SAFETY: tcb valid (not yet freed) and unreachable by any
-                // other path.
-                let first = unsafe { (*tcb).death_observers.take() };
-                // SAFETY: the chain was just taken; no lock is held here.
-                unsafe { release_death_observers(first, stack) };
-
-                // Wake-in-flight gate (#160): a waker that popped this thread
-                // from a wait object (notification/endpoint/event_queue/wait_set)
-                // under that object's lock sets `wake_in_flight = 1` before
-                // releasing the lock and clears it in `enqueue_and_wake`. The
-                // unlink above acquired the same wait-object lock after any
-                // such waker released it, so this load cannot miss the set.
-                // A server whose receive dequeued this thread and found its
-                // rebind refused set the flag under `ep.lock` and retired the
-                // binding under this thread's `sched_lock`, so the unlink found
-                // no binding and skipped `ep.lock`; the binding re-read under
-                // that `sched_lock` orders this load after the set instead.
-                // Spin until the in-flight wake commits, so `retype_free` below
-                // cannot free the TCB out from under the waker's pending
-                // `enqueue_and_wake` (the residual #117/#160 use-after-free).
-                // Interrupts enabled + preemption disabled, mirroring the
-                // `context_saved` gate above, so the spin does not block
-                // incoming IPIs (FPU flush / TLB shootdown).
-                crate::percpu::preempt_disable();
-                // SAFETY: ring 0; restored below.
-                let wake_saved_int =
-                    unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
-                // SAFETY: ring 0; IDT loaded; preempt disabled.
-                unsafe { crate::arch::current::interrupts::enable() };
-                crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT);
-                // SAFETY: tcb is valid (not yet freed); wake_in_flight is always
-                // valid on an initialized TCB.
-                while unsafe {
-                    (*tcb)
-                        .wake_in_flight
-                        .load(core::sync::atomic::Ordering::Acquire)
-                } != 0
-                {
-                    core::hint::spin_loop();
-                }
-                crate::sched::spin_site_exit();
-                // SAFETY: wake_saved_int from save_and_disable_interrupts above.
-                unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
-                crate::percpu::preempt_enable();
-
-                // A timer batch that popped this thread keeps its pointer, with no
-                // reference, until it finishes: wait it out before the free (its
-                // claim finds the waiter by address). See
-                // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
-                // Invariants, invariant 9.
-                crate::sched::sleep_wakeups_quiesce();
-
-                // Release the per-thread port-binding table to its thread's
-                // CSpace's pool if one was
-                // bound via `sys_ioport_bind` (x86-64 only). RISC-V threads never
-                // set this field — there is no I/O port space — so `iopb` is
-                // always null and this is a no-op there. The pointer is taken
-                // under the thread's `sched_lock`: an `IoPort` teardown's
-                // withdrawal walk (`ioport_bindings::withdraw_everywhere`) reads
-                // the table under that lock while this TCB is still registered.
-                // The table goes back under the same hold: the thread's
-                // `CSpace`, whose pool funded it, frees the tables of its
-                // threads under each one's lock before it reclaims its pool, so
-                // a free inside the hold always finds that pool live.
-                // A non-null table was installed by sys_ioport_bind, and the
-                // thread is off every CPU, so no TSS load reads it.
-                {
-                    // SAFETY: tcb validated non-null and live; only the lock field is
-                    // borrowed, and it is a lock.
-                    let sched_lock = unsafe { &(*tcb).sched_lock };
-                    // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
-                    // below.
-                    let saved = unsafe { sched_lock.lock_raw() };
-                    // SAFETY: tcb validated non-null; sched_lock held.
-                    let table = unsafe {
-                        (*tcb)
-                            .iopb
-                            .cast::<crate::cap::ioport_bindings::IoPortBindings>()
-                    };
-                    // SAFETY: tcb validated non-null; sched_lock held.
-                    unsafe { (*tcb).iopb = core::ptr::null_mut() };
-                    if !table.is_null()
-                    {
-                        // SAFETY: a non-null table came from sys_ioport_bind's
-                        // `alloc_port_binding_table` and nothing references it any more; its
-                        // funder is live, as the thread is registered and its `sched_lock`
-                        // is held.
-                        unsafe { free_port_binding_table(table) };
-                    }
-                    // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
-                    unsafe { sched_lock.unlock_raw(saved) };
-                }
-
-                // The per-thread XSAVE / FP-save area is the pages after the
-                // wrapper page of the Thread retype slot
-                // (`sched::thread_slot::EXTENDED_OFFSET`); it
-                // is reclaimed wholesale by `retype_free` below as part of
-                // the same slot release, so no separate free is needed.
-
-                // Remove the TCB from the live-thread registry before
-                // poisoning/freeing it. Both registry walks hold the registry
-                // lock across every dereference, so unlinking strictly before
-                // the free guarantees neither the watchdog nor an object
-                // teardown observes a dangling node.
-                // SAFETY: tcb valid (not yet freed); the registry lock is the
-                // outermost lock and nothing is held here.
-                unsafe { crate::sched::thread_registry::unregister(tcb) };
-
-                // Poison the TCB so any use-after-free reads garbage
-                // instead of plausible values. Both stores are volatile:
-                // the lock-holder diagnostic may read the slot from another
-                // CPU through a stale `current` pointer
-                // (`sched::holder_info`) — a deliberate race the volatile
-                // pair keeps well-defined — and `magic` also gates the
-                // liveness debug assertions, so its store must not be
-                // reordered or elided.
-                // SAFETY: tcb is valid; we are about to free it.
-                let magic = unsafe { core::ptr::addr_of_mut!((*tcb).magic) };
-                // SAFETY: `magic` addresses a field of the valid tcb, aligned for the store.
-                unsafe { core::ptr::write_volatile(magic, 0) };
-                // SAFETY: tcb is valid; we are about to free it.
-                let priority = unsafe { core::ptr::addr_of_mut!((*tcb).priority) };
-                // SAFETY: `priority` addresses a field of the valid tcb, aligned for the store.
-                unsafe { core::ptr::write_volatile(priority, 0xFF) };
-
-                // SAFETY: tcb lives in-place inside the retype slot;
-                // refcount has reached 0, no scheduler holds it.
-                unsafe { core::ptr::drop_in_place(tcb) };
-            }
-
-            debug_assert!(
-                !ancestor_ptr.is_null(),
-                "Thread: every production cap is retype-backed"
-            );
-            use crate::cap::retype::{dispatch_for, retype_free};
-            let raw_bytes = dispatch_for(ObjectType::Thread, 0)
-                .map_or(crate::sched::thread_slot::thread_slot_bytes(), |e| {
-                    e.raw_bytes
-                });
-            // SAFETY: ancestor_ptr is non-null: every production object is
-            // retype-backed (`KernelObjectHeader::ancestor`).
-            let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
-            // The wrapper sits at the slot's `WRAPPER_OFFSET`, immediately
-            // after the guard and the kstack pages (`sched::thread_slot`).
-            let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
-            // Offsets inside the slot, which lies inside its ancestor's region.
-            let block_phys = wrapper_phys.wrapping_sub(crate::sched::thread_slot::WRAPPER_OFFSET);
-            let offset = block_phys.wrapping_sub(ancestor_memory.base);
-            // Count this thread's stack depth before the slot is freed.
-            // SAFETY: the kstack pages lie above the guard in the retype
-            // slot, mapped through the direct map; the thread is dead, so
-            // nothing runs on them.
-            unsafe {
-                crate::stack_depth::record_thread_stack(crate::mm::paging::phys_to_virt(
-                    block_phys.wrapping_add(crate::sched::thread_slot::STACK_OFFSET),
-                ));
-            }
-
-            // SAFETY: ptr is in-place ThreadObject.
-            unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
-
-            // Map the guard page back into the direct map before its memory
-            // returns to the cap, then free the slot.
-            // SAFETY: thread creation holed the slot's guard, and the thread
-            // is dead; this arm holds no lock (`dealloc_object_one`'s
-            // contract), after SMP bringup.
-            unsafe { crate::mm::stack_guard::close(block_phys) };
-            // SAFETY: the object was retyped from `ancestor_memory` at `offset`
-            // with `raw_bytes`, and is dropped above; nothing references it.
-            unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
-
-            let ancestor_nn =
-                // SAFETY: ancestor_ptr non-null.
-                unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
-            let new_rc = ancestor_memory.header.dec_ref();
-            if new_rc == 0
-            {
-                // SAFETY: refcount reached 0.
-                // SAFETY: the reference just released was its last.
-                unsafe { stack.push(ancestor_nn) };
-            }
+            // SAFETY: this function's contract is dealloc_thread's, and ptr
+            // names a ThreadObject (its header's type).
+            unsafe { dealloc_thread(ptr, header, stack) };
         }
 
         // ── AddressSpace ──────────────────────────────────────────────────
@@ -5460,6 +4717,765 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 unsafe { stack.push(ancestor_nn) };
             }
         }
+    }
+}
+
+/// Reclaim one already-zero-refcount `Thread` object for
+/// [`dealloc_object_one`]: stop the thread, release what it holds, and free
+/// its retype slot, pushing every object left unreferenced onto `stack`.
+///
+/// # Safety
+///
+/// Same contract as [`dealloc_object`]; `ptr` names a `ThreadObject` and
+/// `header` is its header.
+#[expect(
+    clippy::cast_ptr_alignment,
+    reason = "in the reply and fault arms `blocked_obj` names the server's ThreadControlBlock, \
+              which its creator placed at an 8-aligned offset of its Thread retype slot"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one Thread teardown in the order its locks fix: the self-teardown guard, the drain \
+              gate, the cancel of each IPC block state, and the slot free"
+)]
+#[expect(
+    clippy::items_after_statements,
+    reason = "each step imports the helpers it uses beside that use, after the step's own \
+              statements"
+)]
+#[cfg(not(test))]
+unsafe fn dealloc_thread(
+    ptr: core::ptr::NonNull<KernelObjectHeader>,
+    header: &KernelObjectHeader,
+    stack: &mut CascadeStack,
+)
+{
+    let ancestor_ptr = header.ancestor.load(Ordering::Acquire);
+
+    // SAFETY: ptr points to a ThreadObject; header at offset 0.
+    let obj = unsafe { &*(ptr.as_ptr().cast::<ThreadObject>()) };
+    let tcb = obj.tcb;
+
+    // Self-teardown guard (#341): a dealloc of the running thread's own
+    // Thread object (a self-targeting SYS_CAP_REVOKE, a teardown cascade, or
+    // the deferred reclaim of an object a batched move dropped; SYS_CAP_DELETE
+    // refuses a direct self thread-cap delete) cannot pass the drain gate
+    // below; see core/kernel/docs/thread-lifecycle-and-sleep.md
+    // § Self-teardown (the caller is the freed thread).
+    // The drain gate below spins until `tcb` is no
+    // longer `current` on any CPU — impossible for the running thread on
+    // its own CPU (the spin runs with preemption disabled, so it never
+    // reschedules), which wedges the CPU. Instead mark `Exited` + drain
+    // the run queues (no free), queue the object for off-CPU reclaim,
+    // and return: the syscall epilogue observes the `Exited` state and
+    // `schedule()`s away, and `drain_deferred_reclaim` re-enters this arm
+    // with the thread off-CPU, where the gate passes immediately.
+    if !tcb.is_null()
+    {
+        let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+        // SAFETY: this_cpu < MAX_CPUS; scheduler initialised. Reading our
+        // own CPU's `current` needs no lock — only this CPU writes it at
+        // dispatch, and we are that running thread.
+        let is_self = core::ptr::eq(tcb, unsafe {
+            crate::sched::scheduler_for(this_cpu).current()
+        });
+        if is_self
+        {
+            log_self_teardown(tcb, "Thread");
+            // Self net. For SYS_CAP_DELETE this is unreachable —
+            // sys_cap_delete refuses a self thread-cap delete before the
+            // dec-ref. It guards every OTHER dealloc of the running
+            // thread: a self-targeting cap_revoke, and the deferred
+            // reclaim of a Thread object whose last reference a pin or
+            // a batched move dropped (`release_ref`) when the
+            // draining thread is that thread. Mark Exited + drain run
+            // queues (no free), queue the object for off-CPU reclaim,
+            // and return. The syscall epilogue observes Exited and
+            // schedule()s away; drain_deferred_reclaim completes the
+            // free off-CPU, where the existing gate passes immediately.
+            // SAFETY: tcb valid; marks Exited + drains every run queue
+            // under the all-CPU-locks discipline (mirrors `sys_exit`,
+            // `SYS_THREAD_EXIT`).
+            unsafe {
+                // Committing Exited: a refusal means a teardown
+                // already did.
+                let _ = crate::sched::set_state_under_all_locks(
+                    tcb,
+                    crate::sched::thread::ThreadState::Exited,
+                );
+            }
+            // SAFETY: object exclusively owned (refcount 0), now Exited
+            // and drained; queue it for off-CPU reclaim on this CPU.
+            unsafe { push_deferred_reclaim(this_cpu, ptr) };
+            return;
+        }
+    }
+
+    if !tcb.is_null()
+    {
+        // Remove the TCB from every run queue before freeing, so no scheduler
+        // can dequeue a freed TCB after this dealloc completes. Drain protocol
+        // per core/kernel/docs/thread-lifecycle-and-sleep.md
+        // § `dealloc_object(Thread)` Drain Protocol: lock every CPU, commit
+        // Exited, drain queues, and snapshot any reply-bound client for a wake
+        // outside the all-locks region; the wake's target CPU is recomputed at
+        // the deferred wake site below (#351).
+        let server_reply_wake: Option<*mut crate::sched::thread::ThreadControlBlock>;
+        // All scheduler locks are acquired in ascending order to prevent
+        // deadlock; each lock_raw is paired with its unlock_raw.
+        {
+            use crate::sched::thread::ThreadState;
+            let cpu_count =
+                crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+
+            // Acquire (*tcb).sched_lock first (outermost) so the Exited write
+            // serialises with schedule()'s dispatch flip and enqueue_and_wake on the
+            // same per-TCB lock; released right after the CPU locks below, before the
+            // UAF gate. Order per core/kernel/docs/scheduling-internals.md § Lock
+            // Hierarchy rule 4.
+            // SAFETY: tcb validated non-null and live; only the lock field is
+            // borrowed, and it is a lock.
+            let tcb_sched_lock = unsafe { &(*tcb).sched_lock };
+            // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
+            // below.
+            let tcb_sched_saved = unsafe { tcb_sched_lock.lock_raw() };
+
+            // Acquire all scheduler locks in ascending CPU order to
+            // prevent ABBA deadlock. Each CPU's saved interrupt-flag
+            // word is stashed in its own scheduler (under that lock).
+            for cpu in 0..cpu_count
+            {
+                // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
+                let sched = unsafe { crate::sched::scheduler_for(cpu) };
+                // SAFETY: the locks are taken in ascending CPU order and paired
+                // with `unlock_saved_flags` below.
+                unsafe { sched.lock_saving_flags() };
+            }
+
+            // Read priority inside the all-locks region. This dealloc and
+            // `set_state_under_all_locks` read it under their all-CPU-locks
+            // region; `sys_thread_set_priority` writes it under the per-TCB
+            // `sched_lock` this dealloc also holds (outer), so the read is
+            // serialised against that writer.
+            // SAFETY: tcb validated non-null and live; sched_lock and every
+            // scheduler lock held.
+            let prio = unsafe { (*tcb).priority };
+
+            // Mark Exited under all locks — no schedule() on any CPU
+            // can see this thread as Ready/Running after this point.
+            // SAFETY: tcb validated non-null and live; sched_lock and every
+            // scheduler lock held.
+            unsafe { (*tcb).state = ThreadState::Exited };
+
+            // Remove from whichever queue it's actually in.
+            for cpu in 0..cpu_count
+            {
+                // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
+                let sched = unsafe { crate::sched::scheduler_for(cpu) };
+                // SAFETY: this CPU's scheduler lock is held (taken above); tcb is a
+                // valid TCB.
+                unsafe { sched.remove_from_queue(tcb, prio) };
+            }
+
+            // A dying server orphans any reply-bound client: claim the reply slot
+            // (CAS), deposit only the resume disposition, and leave the client
+            // Blocked for the gated enqueue_and_wake below, per
+            // core/kernel/docs/thread-lifecycle-and-sleep.md § `dealloc_object(Thread)`
+            // Drain Protocol, step 5.
+            server_reply_wake = {
+                use core::sync::atomic::Ordering;
+                // SAFETY: tcb validated non-null and live; the all-CPU locks are held.
+                let bound = unsafe { (*tcb).reply_tcb.load(Ordering::Acquire) };
+                if bound.is_null()
+                {
+                    None
+                }
+                else
+                {
+                    // SAFETY: tcb validated non-null and live; the all-CPU locks are
+                    // held.
+                    let claimed = unsafe {
+                        (*tcb)
+                            .reply_tcb
+                            .compare_exchange(
+                                bound,
+                                core::ptr::null_mut(),
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    };
+                    if claimed
+                    {
+                        // Keep the client TCB alive against a concurrent
+                        // dealloc(client) until the deferred enqueue_and_wake
+                        // clears it (#160 wake-in-flight gate). A BlockedOnReply
+                        // client already carries wake_in_flight = 1 from
+                        // endpoint_call/recv; refresh it unconditionally so the
+                        // gate also covers the BlockedOnFault entry path.
+                        // SAFETY: bound is the client claimed by the reply_tcb CAS
+                        // above, which keeps it valid.
+                        unsafe { (*bound).wake_in_flight.store(1, Ordering::Release) };
+                        // Deposit the resume disposition (read on resume per the
+                        // DEPOSIT model). A fault-blocked client cancels to Kill
+                        // (the fault helper terminates it on resume); a syscall
+                        // caller returns Interrupted. Reading ipc_state here is a
+                        // read of a value stable until our own wake (we hold the
+                        // sole claim via the reply_tcb CAS).
+                        // SAFETY: bound is valid, as above.
+                        let bound_ipc_state = unsafe { (*bound).ipc_state };
+                        let was_fault =
+                            bound_ipc_state == crate::sched::thread::IpcThreadState::BlockedOnFault;
+                        if was_fault
+                        {
+                            // SAFETY: bound is valid, as above.
+                            unsafe {
+                                (*bound).fault_outcome.store(
+                                    crate::ipc::fault::FAULT_OUTCOME_KILL,
+                                    Ordering::Release,
+                                );
+                            }
+                            // CAS win = episode claim; fault disposition is
+                            // the KILL above.
+                            // SAFETY: the reply_tcb CAS win gives this exclusive claim
+                            // on bound's park episode; exactly one stamp.
+                            unsafe { crate::sched::thread::stamp_deposit_episode(bound) };
+                        }
+                        else
+                        {
+                            // The reply_tcb CAS win is the episode claim:
+                            // the orphaned caller's resume returns
+                            // Interrupted via the disposition. Only
+                            // sys_ipc_call parks are reply-bound, so the
+                            // disposition is the whole mechanism.
+                            // SAFETY: the reply_tcb CAS win gives this exclusive claim
+                            // on bound's park episode; exactly one stamp.
+                            unsafe {
+                                crate::sched::thread::stamp_park_deposit(
+                                    bound,
+                                    crate::sched::thread::PARK_DISPOSITION_INTERRUPTED,
+                                );
+                            }
+                        }
+                        Some(bound)
+                    }
+                    else
+                    {
+                        // Concurrent cancel beat us.
+                        None
+                    }
+                }
+            };
+
+            // Release all CPU locks, then (*tcb).sched_lock last — BEFORE
+            // the UAF gate, which spins with interrupts ENABLED (holding
+            // an IRQ-disabling sched_lock across it would be inconsistent,
+            // and a CPU switching away from `tcb` must be able to take
+            // tcb.sched_lock).
+            for cpu in (0..cpu_count).rev()
+            {
+                // SAFETY: cpu < CPU_COUNT; scheduler initialised by sched::init.
+                let sched = unsafe { crate::sched::scheduler_for(cpu) };
+                // SAFETY: this CPU's lock was taken by `lock_saving_flags` above and
+                // is released once.
+                unsafe { sched.unlock_saved_flags() };
+            }
+            // SAFETY: tcb validated non-null and live; only the lock field is
+            // borrowed, again, after the region's accesses to the TCB.
+            let tcb_sched_lock = unsafe { &(*tcb).sched_lock };
+            // SAFETY: `tcb_sched_saved` is the value `lock_raw` returned for this
+            // lock above.
+            unsafe { tcb_sched_lock.unlock_raw(tcb_sched_saved) };
+
+            // UAF gate: a TCB that is `current` on any CPU MUST NOT be
+            // reclaimed until every CPU has switched away from it AND
+            // the in-flight register save has published; see
+            // `wait_until_off_cpu`.
+            // SAFETY: tcb is Exited and unlinked from every run queue
+            // (all-locks region above); not the running thread here.
+            unsafe { crate::sched::wait_until_off_cpu(tcb) };
+
+            // After eager FPU save (#108), no fpu_owner sweep is
+            // needed: `nm_handler` only ever names the currently
+            // Running thread on its CPU, and `switch_out_save`
+            // clears the slot on switch-out — so by the time the
+            // not-`current`-anywhere and `context_saved` spins above
+            // have completed, no CPU's owner slot can name this TCB.
+        }
+
+        // Wake the captured reply-bound client outside the all-locks
+        // region. The client is still Blocked (we deposited its
+        // disposition above but did NOT pre-set Ready), so the gated
+        // enqueue_and_wake links it under the client's own sched_lock —
+        // and if a concurrent dealloc(client) already won the reap, the
+        // gate observes Exited and aborts the link instead of resurrecting
+        // a freed TCB. wake_in_flight (set above) kept the client alive
+        // until here and is cleared on every enqueue_and_wake exit path.
+        if let Some(bound) = server_reply_wake
+        {
+            // Null the claimed client's `blocked_on_object` (still naming
+            // this dying server) under the client's sched_lock, before
+            // enqueue_and_wake and while wake_in_flight still pins `bound`:
+            // the CLOSURE LEMMA of core/kernel/docs/scheduling-internals.md
+            // § Cross-CPU TCB Ownership. Only the client's sched_lock is
+            // taken (the server's was released with the all-CPU locks
+            // above), so there is no two-TCB-sched_lock nesting.
+            // The reply_tcb CAS above ended a timed call's
+            // episode; its sleep-list entry goes first, so no pop
+            // finds the binding this nulls.
+            // SAFETY: bound kept valid by wake_in_flight = 1 above; its park
+            // episode was claimed by the reply_tcb CAS and it is not yet woken.
+            unsafe { crate::ipc::cancel_timed_entry(bound) };
+            // SAFETY: bound kept valid by wake_in_flight = 1 above; only the
+            // lock field is borrowed.
+            let bound_lock = unsafe { &(*bound).sched_lock };
+            // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
+            // below.
+            let bs = unsafe { bound_lock.lock_raw() };
+            // SAFETY: bound kept valid by wake_in_flight = 1 above; its sched_lock
+            // is held.
+            let bound_blocked_on = unsafe { (*bound).blocked_on_object };
+            if core::ptr::eq(bound_blocked_on, tcb.cast::<u8>())
+            {
+                // SAFETY: bound kept valid by wake_in_flight = 1 above; its
+                // sched_lock is held.
+                unsafe { (*bound).blocked_on_object = core::ptr::null_mut() };
+            }
+            // SAFETY: `bs` is the value `lock_raw` returned for this lock above.
+            unsafe { bound_lock.unlock_raw(bs) };
+            // Recompute the wake target HERE (post-gates), under the
+            // client's current state, EXCLUDING this dealloc CPU. This
+            // CPU stays inside this teardown through the wake-in-flight
+            // gate below, not in schedule(), so it cannot dispatch a
+            // client linked onto it — the save-window pin would strand a
+            // `context_saved==0` client here (#351; step 10 of
+            // core/kernel/docs/thread-lifecycle-and-sleep.md
+            // § `dealloc_object(Thread)` Drain Protocol). A peer
+            // dispatches it safely via the schedule()
+            // publication-barrier spin. Recomputing at wake time (rather
+            // than snapshotting under the all-CPU locks above) also
+            // closes the double-enqueue straddle: the target reflects
+            // the state at link time, not two unbounded spins earlier
+            // (#289).
+            let this_cpu = crate::arch::current::cpu::current_cpu() as usize;
+            // SAFETY: bound kept valid by wake_in_flight = 1 above;
+            // select_target_cpu_excluding is lock-free.
+            let bcpu = unsafe { crate::sched::select_target_cpu_excluding(bound, Some(this_cpu)) };
+            // The reply-wake is never self-pinned to the wedged
+            // dealloc CPU unless hard affinity names it or it is the only
+            // CPU.
+            debug_assert!(
+                bcpu != this_cpu
+                    || crate::sched::CPU_COUNT
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        == 1
+                    // SAFETY: bound valid (pinned by wake_in_flight).
+                    || unsafe { (*bound).cpu_affinity } != crate::sched::AFFINITY_ANY,
+                "dealloc reply-wake self-pinned to dealloc cpu {this_cpu}",
+            );
+            // SAFETY: bound kept valid by wake_in_flight = 1 above.
+            unsafe { crate::sched::enqueue_and_wake(bound, bcpu) };
+        }
+
+        // Drop any sleep-list entry before the IPC unlink, so a timer pop
+        // that wins the race still sees the full binding. Outside the
+        // all-locks region (no sched.lock → SLEEP_LIST_LOCK edge). See
+        // core/kernel/docs/thread-lifecycle-and-sleep.md
+        // § `dealloc_object(Thread)` Drain Protocol, step 11.
+        // SAFETY: tcb is valid (not yet freed).
+        unsafe { crate::sched::sleep_list_remove(tcb) };
+
+        // Unlink this thread from any IPC object it's blocked on.
+        // Without this, a notification/endpoint/event_queue retains a
+        // dangling waiter pointer to the freed TCB. A subsequent
+        // notification_send would return that pointer, and the caller
+        // would enqueue_and_wake a freed TCB — use-after-free.
+        // The binding pair is read and cleared under tcb's sched_lock:
+        // the abort arm of a wake that claimed tcb before its Exited
+        // mark writes the same pair under that lock (see
+        // core/kernel/docs/scheduling-internals.md § Cross-CPU TCB
+        // Ownership). A source is reached only through
+        // `ipc::lock_bound_source`, which re-reads the binding under
+        // tcb's sched_lock and try-locks the source under it: a
+        // binding still observed there names a source not yet freed,
+        // so a concurrent last-capability delete of the source cannot
+        // free it under this unlink.
+        // tcb is valid (not yet freed); blocked_on_object and ipc_state
+        // are always valid on an initialized TCB.
+        {
+            use crate::sched::thread::IpcThreadState;
+            // SAFETY: tcb is valid (not yet freed); only the lock field is
+            // borrowed, and it is a lock.
+            let sched_lock = unsafe { &(*tcb).sched_lock };
+            // SAFETY: the flags `lock_raw` returns are passed to the
+            // `unlock_raw` below.
+            let sched_saved = unsafe { sched_lock.lock_raw() };
+            // SAFETY: tcb is valid (not yet freed); sched_lock held.
+            let blocked_obj = unsafe { (*tcb).blocked_on_object };
+            // SAFETY: tcb is valid (not yet freed); sched_lock held.
+            let bound_state = unsafe { (*tcb).ipc_state };
+            // SAFETY: `sched_saved` is the value `lock_raw` returned for this
+            // lock above.
+            unsafe { sched_lock.unlock_raw(sched_saved) };
+            if !blocked_obj.is_null()
+            {
+                match bound_state
+                {
+                    IpcThreadState::BlockedOnNotification
+                    | IpcThreadState::BlockedOnSend
+                    | IpcThreadState::BlockedOnRecv
+                    | IpcThreadState::BlockedOnEventQueue
+                    | IpcThreadState::BlockedOnWaitSet =>
+                    {
+                        // SAFETY: tcb is a valid TCB; no IPC source lock, sched_lock,
+                        // per-CPU scheduler lock, or SLEEP_LIST_LOCK is held here;
+                        // bound_state is a source-blocking state.
+                        let bound_source = unsafe {
+                            crate::ipc::lock_bound_source(tcb, bound_state, blocked_obj, None)
+                        };
+                        if let Some(held) = bound_source
+                        {
+                            // SAFETY: `held` holds the live source's
+                            // lock and tcb's sched_lock.
+                            unsafe { unlink_dying_waiter(tcb, bound_state, blocked_obj) };
+                            // Retire the binding inside the hold, so
+                            // no later reader passes its re-read once
+                            // the source no longer queues tcb.
+                            // SAFETY: tcb is valid; `held` holds its sched_lock.
+                            unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
+                            // SAFETY: `held` came from lock_bound_source and both its
+                            // locks are still held.
+                            unsafe { held.unlock() };
+                        }
+                    }
+                    IpcThreadState::BlockedOnReply =>
+                    {
+                        // blocked_obj is the server TCB. CAS-clear the
+                        // server's reply slot iff this dying client is still
+                        // bound. Same #317 hazard as cancel_ipc_block: a
+                        // concurrent dealloc(server) could free the server
+                        // under this deref. Guard it with THIS dying client's
+                        // sched_lock + a `blocked_on == server` re-read — the
+                        // CLOSURE LEMMA pins the server alive across the CAS
+                        // (dealloc(server) nulls a claimed client's
+                        // blocked_on under the same client sched_lock before
+                        // retype_free). Only this client's sched_lock is held;
+                        // the reply_tcb CAS on the server is wait-free.
+                        use core::sync::atomic::Ordering;
+                        let server = blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
+                        // SAFETY: tcb is valid (not yet freed); only the lock field is
+                        // borrowed, again, after the source unlink above.
+                        let sched_lock = unsafe { &(*tcb).sched_lock };
+                        // SAFETY: the flags `lock_raw` returns are passed to the
+                        // `unlock_raw` below.
+                        let saved = unsafe { sched_lock.lock_raw() };
+                        // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                        let still_bound = unsafe { (*tcb).blocked_on_object };
+                        if core::ptr::eq(still_bound, blocked_obj)
+                        {
+                            // Win ⇒ we cancelled the reply wake; clear
+                            // wake_in_flight so the #160 gate below does not
+                            // wait for a wake that will never fire. Lose ⇒ a
+                            // reply is in flight and its enqueue_and_wake
+                            // clears the flag; the gate waits for it.
+                            // SAFETY: the client's sched_lock is held and the
+                            // `blocked_on == server` re-read above succeeded, so the
+                            // CLOSURE LEMMA pins the server alive across the CAS.
+                            let cancelled = unsafe {
+                                (*server)
+                                    .reply_tcb
+                                    .compare_exchange(
+                                        tcb,
+                                        core::ptr::null_mut(),
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            };
+                            if cancelled
+                            {
+                                // SAFETY: tcb is valid (not yet freed).
+                                unsafe {
+                                    (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                }
+                            }
+                        }
+                        // SAFETY: `saved` is the value `lock_raw` returned for this
+                        // lock above.
+                        unsafe { sched_lock.unlock_raw(saved) };
+                    }
+                    IpcThreadState::BlockedOnFault =>
+                    {
+                        // A dying fault-blocked thread: `blocked_obj` is its
+                        // handler (server) TCB. CAS-clear the handler's reply
+                        // slot so a later reply does not target this freed
+                        // faulter. Mirrors the BlockedOnReply arm including
+                        // the #317 client-sched_lock guard; the faulter never
+                        // resumes, so no disposition is recorded.
+                        use core::sync::atomic::Ordering;
+                        let server = blocked_obj.cast::<crate::sched::thread::ThreadControlBlock>();
+                        // SAFETY: tcb is valid (not yet freed); only the lock field is
+                        // borrowed, again, after the source unlink above.
+                        let sched_lock = unsafe { &(*tcb).sched_lock };
+                        // SAFETY: the flags `lock_raw` returns are passed to the
+                        // `unlock_raw` below.
+                        let saved = unsafe { sched_lock.lock_raw() };
+                        // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                        let still_bound = unsafe { (*tcb).blocked_on_object };
+                        if core::ptr::eq(still_bound, blocked_obj)
+                        {
+                            // SAFETY: the client's sched_lock is held and the
+                            // `blocked_on == server` re-read above succeeded, so the
+                            // CLOSURE LEMMA pins the server alive across the CAS.
+                            let cancelled = unsafe {
+                                (*server)
+                                    .reply_tcb
+                                    .compare_exchange(
+                                        tcb,
+                                        core::ptr::null_mut(),
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok()
+                            };
+                            if cancelled
+                            {
+                                // SAFETY: tcb is valid (not yet freed).
+                                unsafe {
+                                    (*tcb).wake_in_flight.store(0, Ordering::Release);
+                                }
+                            }
+                        }
+                        // SAFETY: `saved` is the value `lock_raw` returned for this
+                        // lock above.
+                        unsafe { sched_lock.unlock_raw(saved) };
+                    }
+                    IpcThreadState::None =>
+                    {}
+                }
+                // SAFETY: tcb is valid (not yet freed); only the lock field is
+                // borrowed, again, after the source unlink above.
+                let sched_lock = unsafe { &(*tcb).sched_lock };
+                // SAFETY: the flags `lock_raw` returns are passed to the
+                // `unlock_raw` below.
+                let sched_saved = unsafe { sched_lock.lock_raw() };
+                // SAFETY: tcb is valid (not yet freed); sched_lock held.
+                unsafe { (*tcb).blocked_on_object = core::ptr::null_mut() };
+                // SAFETY: `sched_saved` is the value `lock_raw` returned for this
+                // lock above.
+                unsafe { sched_lock.unlock_raw(sched_saved) };
+            }
+        }
+
+        // Release this thread's fault-handler bindings, one per class.
+        // Each binding held an inc_ref on its endpoint object for its
+        // lifetime (see ThreadControlBlock::fault_handlers); drop it, and
+        // if this was its last reference enqueue the orphaned endpoint
+        // on the cascade stack (rather than recursing into
+        // `dealloc_object`, which the cascade exists to avoid). Done
+        // after the unlink above (which removed this thread from the
+        // endpoint's send queue if it was a queued faulter) so the
+        // endpoint dealloc cannot observe this thread still on its queue.
+        // SAFETY: tcb valid (not yet freed); the bindings are atomics.
+        let fault_handlers = unsafe { &(*tcb).fault_handlers };
+        for slot in fault_handlers
+        {
+            let ep = slot.swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+            // SAFETY: ep is non-null in the second operand, and the binding's
+            // reference on the endpoint, still held, keeps it live.
+            if !ep.is_null() && unsafe { (*ep).header.dec_ref() } == 0
+            {
+                // SAFETY: ep is non-null.
+                let ep_header =
+                    unsafe { core::ptr::NonNull::new_unchecked(ep.cast::<KernelObjectHeader>()) };
+                // SAFETY: no lock is held here; the binding's reference was the
+                // endpoint's last, leaving it unreferenced for the push.
+                unsafe { stack.push(ep_header) };
+            }
+        }
+
+        // Release the death observers' EventQueue references. The
+        // thread runs on no CPU (the gate above), so its death walk is
+        // over or never runs, and no binder can pin it (refcount 0).
+        // SAFETY: tcb valid (not yet freed) and unreachable by any
+        // other path.
+        let first = unsafe { (*tcb).death_observers.take() };
+        // SAFETY: the chain was just taken; no lock is held here.
+        unsafe { release_death_observers(first, stack) };
+
+        // Wake-in-flight gate (#160): a waker that popped this thread
+        // from a wait object (notification/endpoint/event_queue/wait_set)
+        // under that object's lock sets `wake_in_flight = 1` before
+        // releasing the lock and clears it in `enqueue_and_wake`. The
+        // unlink above acquired the same wait-object lock after any
+        // such waker released it, so this load cannot miss the set.
+        // A server whose receive dequeued this thread and found its
+        // rebind refused set the flag under `ep.lock` and retired the
+        // binding under this thread's `sched_lock`, so the unlink found
+        // no binding and skipped `ep.lock`; the binding re-read under
+        // that `sched_lock` orders this load after the set instead.
+        // Spin until the in-flight wake commits, so `retype_free` below
+        // cannot free the TCB out from under the waker's pending
+        // `enqueue_and_wake` (the residual #117/#160 use-after-free).
+        // Interrupts enabled + preemption disabled, mirroring the
+        // `context_saved` gate above, so the spin does not block
+        // incoming IPIs (FPU flush / TLB shootdown).
+        crate::percpu::preempt_disable();
+        // SAFETY: ring 0; restored below.
+        let wake_saved_int = unsafe { crate::arch::current::cpu::save_and_disable_interrupts() };
+        // SAFETY: ring 0; IDT loaded; preempt disabled.
+        unsafe { crate::arch::current::interrupts::enable() };
+        crate::sched::spin_site_enter(crate::sched::SPIN_SITE_DEALLOC_WAKE_IN_FLIGHT);
+        // SAFETY: tcb is valid (not yet freed); wake_in_flight is always
+        // valid on an initialized TCB.
+        while unsafe {
+            (*tcb)
+                .wake_in_flight
+                .load(core::sync::atomic::Ordering::Acquire)
+        } != 0
+        {
+            core::hint::spin_loop();
+        }
+        crate::sched::spin_site_exit();
+        // SAFETY: wake_saved_int from save_and_disable_interrupts above.
+        unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
+        crate::percpu::preempt_enable();
+
+        // A timer batch that popped this thread keeps its pointer, with no
+        // reference, until it finishes: wait it out before the free (its
+        // claim finds the waiter by address). See
+        // core/kernel/docs/thread-lifecycle-and-sleep.md § Sleep List
+        // Invariants, invariant 9.
+        crate::sched::sleep_wakeups_quiesce();
+
+        // Release the per-thread port-binding table to its thread's
+        // CSpace's pool if one was
+        // bound via `sys_ioport_bind` (x86-64 only). RISC-V threads never
+        // set this field — there is no I/O port space — so `iopb` is
+        // always null and this is a no-op there. The pointer is taken
+        // under the thread's `sched_lock`: an `IoPort` teardown's
+        // withdrawal walk (`ioport_bindings::withdraw_everywhere`) reads
+        // the table under that lock while this TCB is still registered.
+        // The table goes back under the same hold: the thread's
+        // `CSpace`, whose pool funded it, frees the tables of its
+        // threads under each one's lock before it reclaims its pool, so
+        // a free inside the hold always finds that pool live.
+        // A non-null table was installed by sys_ioport_bind, and the
+        // thread is off every CPU, so no TSS load reads it.
+        {
+            // SAFETY: tcb validated non-null and live; only the lock field is
+            // borrowed, and it is a lock.
+            let sched_lock = unsafe { &(*tcb).sched_lock };
+            // SAFETY: the flags `lock_raw` returns are passed to the `unlock_raw`
+            // below.
+            let saved = unsafe { sched_lock.lock_raw() };
+            // SAFETY: tcb validated non-null; sched_lock held.
+            let table = unsafe {
+                (*tcb)
+                    .iopb
+                    .cast::<crate::cap::ioport_bindings::IoPortBindings>()
+            };
+            // SAFETY: tcb validated non-null; sched_lock held.
+            unsafe { (*tcb).iopb = core::ptr::null_mut() };
+            if !table.is_null()
+            {
+                // SAFETY: a non-null table came from sys_ioport_bind's
+                // `alloc_port_binding_table` and nothing references it any more; its
+                // funder is live, as the thread is registered and its `sched_lock`
+                // is held.
+                unsafe { free_port_binding_table(table) };
+            }
+            // SAFETY: `saved` is the value `lock_raw` returned for this lock above.
+            unsafe { sched_lock.unlock_raw(saved) };
+        }
+
+        // The per-thread XSAVE / FP-save area is the pages after the
+        // wrapper page of the Thread retype slot
+        // (`sched::thread_slot::EXTENDED_OFFSET`); it
+        // is reclaimed wholesale by `retype_free` below as part of
+        // the same slot release, so no separate free is needed.
+
+        // Remove the TCB from the live-thread registry before
+        // poisoning/freeing it. Both registry walks hold the registry
+        // lock across every dereference, so unlinking strictly before
+        // the free guarantees neither the watchdog nor an object
+        // teardown observes a dangling node.
+        // SAFETY: tcb valid (not yet freed); the registry lock is the
+        // outermost lock and nothing is held here.
+        unsafe { crate::sched::thread_registry::unregister(tcb) };
+
+        // Poison the TCB so any use-after-free reads garbage
+        // instead of plausible values. Both stores are volatile:
+        // the lock-holder diagnostic may read the slot from another
+        // CPU through a stale `current` pointer
+        // (`sched::holder_info`) — a deliberate race the volatile
+        // pair keeps well-defined — and `magic` also gates the
+        // liveness debug assertions, so its store must not be
+        // reordered or elided.
+        // SAFETY: tcb is valid; we are about to free it.
+        let magic = unsafe { core::ptr::addr_of_mut!((*tcb).magic) };
+        // SAFETY: `magic` addresses a field of the valid tcb, aligned for the store.
+        unsafe { core::ptr::write_volatile(magic, 0) };
+        // SAFETY: tcb is valid; we are about to free it.
+        let priority = unsafe { core::ptr::addr_of_mut!((*tcb).priority) };
+        // SAFETY: `priority` addresses a field of the valid tcb, aligned for the store.
+        unsafe { core::ptr::write_volatile(priority, 0xFF) };
+
+        // SAFETY: tcb lives in-place inside the retype slot;
+        // refcount has reached 0, no scheduler holds it.
+        unsafe { core::ptr::drop_in_place(tcb) };
+    }
+
+    debug_assert!(
+        !ancestor_ptr.is_null(),
+        "Thread: every production cap is retype-backed"
+    );
+    use crate::cap::retype::{dispatch_for, retype_free};
+    let raw_bytes = dispatch_for(ObjectType::Thread, 0)
+        .map_or(crate::sched::thread_slot::thread_slot_bytes(), |e| {
+            e.raw_bytes
+        });
+    // SAFETY: ancestor_ptr is non-null: every production object is
+    // retype-backed (`KernelObjectHeader::ancestor`).
+    let ancestor_memory = unsafe { &*ancestor_ptr.cast::<MemoryObject>() };
+    // The wrapper sits at the slot's `WRAPPER_OFFSET`, immediately
+    // after the guard and the kstack pages (`sched::thread_slot`).
+    let wrapper_phys = crate::mm::paging::virt_to_phys(ptr.as_ptr() as u64);
+    // Offsets inside the slot, which lies inside its ancestor's region.
+    let block_phys = wrapper_phys.wrapping_sub(crate::sched::thread_slot::WRAPPER_OFFSET);
+    let offset = block_phys.wrapping_sub(ancestor_memory.base);
+    // Count this thread's stack depth before the slot is freed.
+    // SAFETY: the kstack pages lie above the guard in the retype
+    // slot, mapped through the direct map; the thread is dead, so
+    // nothing runs on them.
+    unsafe {
+        crate::stack_depth::record_thread_stack(crate::mm::paging::phys_to_virt(
+            block_phys.wrapping_add(crate::sched::thread_slot::STACK_OFFSET),
+        ));
+    }
+
+    // SAFETY: ptr is in-place ThreadObject.
+    unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
+
+    // Map the guard page back into the direct map before its memory
+    // returns to the cap, then free the slot.
+    // SAFETY: thread creation holed the slot's guard, and the thread
+    // is dead; this arm holds no lock (`dealloc_object_one`'s
+    // contract), after SMP bringup.
+    unsafe { crate::mm::stack_guard::close(block_phys) };
+    // SAFETY: the object was retyped from `ancestor_memory` at `offset`
+    // with `raw_bytes`, and is dropped above; nothing references it.
+    unsafe { retype_free(ancestor_memory, offset, raw_bytes) };
+
+    let ancestor_nn =
+        // SAFETY: ancestor_ptr non-null.
+        unsafe { core::ptr::NonNull::new_unchecked(ancestor_ptr) };
+    let new_rc = ancestor_memory.header.dec_ref();
+    if new_rc == 0
+    {
+        // SAFETY: refcount reached 0.
+        // SAFETY: the reference just released was its last.
+        unsafe { stack.push(ancestor_nn) };
     }
 }
 

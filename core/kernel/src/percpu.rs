@@ -572,6 +572,11 @@ pub unsafe fn fpu_owner_for(cpu: usize) -> &'static AtomicPtr<ThreadControlBlock
 ///
 /// Single-writer: only the owning CPU's `activate` calls this, so `Relaxed` is
 /// sufficient.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`elided` is data: the outcome of the activation, which the function records in one \
+              of the two counters"
+)]
 #[cfg(not(test))]
 pub fn record_ctxsw_flush(elided: bool)
 {

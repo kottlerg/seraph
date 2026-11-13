@@ -120,10 +120,10 @@ const CR4_PAE: u32 = 1 << 5;
 )]
 const CR4_LA57: u32 = boot_protocol::x86_paging::CR4_LA57 as u32;
 
-/// IST stack pair size: 8 KiB IST1 + 8 KiB IST2 = 16 KiB per AP.
-const AP_IST_PAIR_SIZE: usize = 16384;
+/// IST stack pair size: IST1 and IST2, each [`super::interrupts::IST_STACK_SIZE`], per AP.
+const AP_IST_PAIR_SIZE: usize = 2 * super::interrupts::IST_STACK_SIZE;
 
-/// Per-AP IST stacks. Slot `cpu_idx` holds the 16 KiB pair (IST1 + IST2) for
+/// Per-AP IST stacks. Slot `cpu_idx` holds the pair (IST1 + IST2) for
 /// the AP with that id; slot 0 is unused (BSP has its own
 /// [`crate::arch::x86_64::interrupts`] `BSP_IST_STACKS` static).
 ///
@@ -310,16 +310,12 @@ const TRAMPOLINE_TEMPLATE: [u8; 0x11C] = {
 /// that does not fit the template fails the build.
 const fn place(template: &mut [u8], at: usize, bytes: &[u8])
 {
-    let Some((_, from_at)) = template.split_at_mut_checked(at)
-    else
-    {
-        panic!("trampoline template part starts past the template");
-    };
-    let Some((dst, _)) = from_at.split_at_mut_checked(bytes.len())
-    else
-    {
-        panic!("trampoline template part ends past the template");
-    };
+    assert!(
+        at <= template.len() && bytes.len() <= template.len().saturating_sub(at),
+        "trampoline template part does not fit the template"
+    );
+    let (_, from_at) = template.split_at_mut(at);
+    let (dst, _) = from_at.split_at_mut(bytes.len());
     dst.copy_from_slice(bytes);
 }
 
@@ -602,8 +598,8 @@ pub unsafe fn start_ap(
     // SAFETY: cpu_idx < CPU_COUNT (caller's contract; debug-asserted above); the IST
     // slab covers cpu_count entries.
     let ist_base = unsafe { ist_slab_base.add(cpu_idx as usize) } as u64;
-    let ist1_top = ist_base.wrapping_add(8192);
-    let ist2_top = ist_base.wrapping_add(16384);
+    let ist1_top = ist_base.wrapping_add(super::interrupts::IST_STACK_SIZE as u64);
+    let ist2_top = ist_base.wrapping_add(AP_IST_PAIR_SIZE as u64);
 
     // The PM32 stub loads CR3 with a 32-bit `mov cr3, eax`, so the kernel root
     // table must lie below 4 GiB; the boot protocol requires the bootloader to

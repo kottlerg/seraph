@@ -45,6 +45,11 @@ pub enum Action
 /// `now_us` is a monotonic microsecond timestamp, `0` when the timer is not
 /// yet calibrated — the time budget then never triggers (draw-count and
 /// first-use policy still apply).
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`seeded` and `guid_changed` are data: the pool's seeded state and whether the VM \
+              generation changed, the inputs the policy decides from"
+)]
 pub fn decide(
     seeded: bool,
     guid_changed: bool,

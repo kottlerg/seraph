@@ -671,6 +671,11 @@ enum RouteStep
 /// What a route request in `mode` through an object that does (`caller_holds`)
 /// or does not hold the route does to a line routed in `routed` (`None` when
 /// it is not routed). A request in another mode than the route's is refused.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`caller_holds` is data: whether the requesting object already holds the line's \
+              route, one input of the step the function decides"
+)]
 const fn route_step(
     routed: Option<u32>,
     caller_holds: bool,

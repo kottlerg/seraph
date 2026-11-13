@@ -495,6 +495,13 @@ impl CSpace
     /// Create an empty `CSpace`. No pages are allocated until the first slot
     /// is requested. The pool source defaults to null (the host-test heap
     /// path); call [`Self::set_kobj`] to switch to a retype pool.
+    #[expect(
+        clippy::large_stack_frames,
+        reason = "the returned `CSpace` (2104 B, 2 KiB of it the 256 level-one directory \
+                  pointers) and the arrays its fields are built from; its callers build it on \
+                  the 16 KiB kernel stack of `SYS_CAP_CREATE_CSPACE` or the 64 KiB boot \
+                  handoff stack (Phase 7), and the host tests on the test thread's"
+    )]
     pub fn new(id: CSpaceId) -> Self
     {
         Self {

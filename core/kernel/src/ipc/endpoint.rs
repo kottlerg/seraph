@@ -792,6 +792,12 @@ pub unsafe fn endpoint_recv(
 /// `ep` and `server` must be valid, and `server` must be the running thread.
 /// Call with no scheduler lock and no `ep.lock` held.
 #[cfg(not(test))]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `Message` (576 B), counted once for each move: the binding's \
+              tuple, its destructuring and the returned tuple; on the 16 KiB kernel stack of \
+              `SYS_IPC_RECV`"
+)]
 pub unsafe fn endpoint_try_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,

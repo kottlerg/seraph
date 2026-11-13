@@ -101,10 +101,13 @@ pub fn init_paging_mode(info: &boot_protocol::BootInfo)
 pub fn init_paging_mode(_info: &boot_protocol::BootInfo) {}
 
 /// The active paging mode published at kernel entry.
+#[expect(
+    clippy::unreachable,
+    reason = "the decode of PAGING_MODE cannot fail: its initialiser and its one store, in \
+              init_paging_mode, write only PagingMode discriminants"
+)]
 pub fn paging_mode() -> PagingMode
 {
-    // The store site only writes values produced by `PagingMode::from_satp_mode`,
-    // so the decode cannot fail.
     match PagingMode::from_satp_mode(u64::from(PAGING_MODE.load(Ordering::Relaxed)))
     {
         Some(mode) => mode,
@@ -2171,30 +2174,32 @@ mod tests
     const FRAME_A: u64 = 0x10_000;
     const FRAME_B: u64 = 0x20_000;
 
-    /// Raw leaf PTE bits: valid user page on `frame` with the given rights.
-    fn leaf(frame: u64, r: bool, w: bool, x: bool) -> u64
+    /// The rights of a test leaf, as the classification cases need them.
+    #[derive(Clone, Copy)]
+    enum Rights
     {
-        let mut pte = VALID | USER | ((frame >> 12) << 10);
-        if r
+        ReadOnly,
+        Writable,
+        Executable,
+    }
+
+    /// Raw leaf PTE bits: valid user page on `frame` with `rights`.
+    fn leaf(frame: u64, rights: Rights) -> u64
+    {
+        let pte = VALID | USER | ((frame >> 12) << 10) | READ;
+        match rights
         {
-            pte |= READ;
+            Rights::ReadOnly => pte,
+            Rights::Writable => pte | WRITE,
+            Rights::Executable => pte | EXECUTE,
         }
-        if w
-        {
-            pte |= WRITE;
-        }
-        if x
-        {
-            pte |= EXECUTE;
-        }
-        pte
     }
 
     #[test]
     fn classify_fresh_when_prior_invalid()
     {
         assert_eq!(
-            classify_user_map(0, leaf(FRAME_A, true, true, false)),
+            classify_user_map(0, leaf(FRAME_A, Rights::Writable)),
             MapOutcome::Fresh
         );
     }
@@ -2202,47 +2207,47 @@ mod tests
     #[test]
     fn classify_widen_when_adding_write_same_frame()
     {
-        let prior = leaf(FRAME_A, true, false, false); // R--
-        let new = leaf(FRAME_A, true, true, false); // RW-
+        let prior = leaf(FRAME_A, Rights::ReadOnly); // R--
+        let new = leaf(FRAME_A, Rights::Writable); // RW-
         assert_eq!(classify_user_map(prior, new), MapOutcome::Widen);
     }
 
     #[test]
     fn classify_widen_when_adding_exec_same_frame()
     {
-        let prior = leaf(FRAME_A, true, false, false); // R--
-        let new = leaf(FRAME_A, true, false, true); // R-X
+        let prior = leaf(FRAME_A, Rights::ReadOnly); // R--
+        let new = leaf(FRAME_A, Rights::Executable); // R-X
         assert_eq!(classify_user_map(prior, new), MapOutcome::Widen);
     }
 
     #[test]
     fn classify_widen_when_identical()
     {
-        let pte = leaf(FRAME_A, true, true, false);
+        let pte = leaf(FRAME_A, Rights::Writable);
         assert_eq!(classify_user_map(pte, pte), MapOutcome::Widen);
     }
 
     #[test]
     fn classify_replace_when_narrowing_write()
     {
-        let prior = leaf(FRAME_A, true, true, false); // RW-
-        let new = leaf(FRAME_A, true, false, false); // R--
+        let prior = leaf(FRAME_A, Rights::Writable); // RW-
+        let new = leaf(FRAME_A, Rights::ReadOnly); // R--
         assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
     }
 
     #[test]
     fn classify_replace_when_narrowing_exec()
     {
-        let prior = leaf(FRAME_A, true, false, true); // R-X
-        let new = leaf(FRAME_A, true, false, false); // R--
+        let prior = leaf(FRAME_A, Rights::Executable); // R-X
+        let new = leaf(FRAME_A, Rights::ReadOnly); // R--
         assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
     }
 
     #[test]
     fn classify_replace_when_frame_changes()
     {
-        let prior = leaf(FRAME_A, true, true, false);
-        let new = leaf(FRAME_B, true, true, false);
+        let prior = leaf(FRAME_A, Rights::Writable);
+        let new = leaf(FRAME_B, Rights::Writable);
         assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
     }
 }

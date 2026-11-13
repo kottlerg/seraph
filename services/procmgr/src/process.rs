@@ -638,18 +638,45 @@ pub struct UniversalCaps
     /// was given no baseline; children then receive zero, are created at
     /// the floor, and cannot set any priority.
     pub sched_baseline: u64,
-    /// Whether the child is demand-paged. Demand paging is the default; this
-    /// is false only when the caller set `procmgr_labels::CREATE_PINNED` (a
-    /// DMA driver that must be eager-mapped). When true, `finalize_creation`
-    /// delegates the child `AddressSpace` to memmgr, binds the child's
-    /// main-thread fault handler to it, and, once both took effect,
-    /// advertises the pager in `ProcessInfo` (`advertise_pager`).
-    pub demand_paged: bool,
+    /// Whether the child is demand-paged ([`Paging`]).
+    pub paging: Paging,
     /// Procmgr's own (procmgr-badged) SEND cap on memmgr's endpoint, used to
     /// issue the procmgr-only `DELEGATE_ASPACE`. Distinct from
     /// [`Self::memmgr_endpoint`] (the child's badged cap). Zero when memmgr is
     /// not reachable.
     pub self_memmgr_ep: u64,
+}
+
+/// Whether a child is demand-paged. Demand paging is the default; a child is
+/// pinned only when the caller set `procmgr_labels::CREATE_PINNED` (a DMA
+/// driver that must be eager-mapped). For a demand-paged child,
+/// `finalize_creation` delegates the child `AddressSpace` to memmgr, binds the
+/// child's main-thread fault handler to it, and, once both took effect,
+/// advertises the pager in `ProcessInfo` (`advertise_pager`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Paging
+{
+    /// Served by memmgr's default system pager.
+    Demand,
+    /// Eager-mapped, with no pager.
+    Pinned,
+}
+
+impl Paging
+{
+    /// The paging a create request's `label` asks for.
+    #[must_use]
+    pub const fn of_label(label: u64) -> Self
+    {
+        if label & ipc::procmgr_labels::CREATE_PINNED == 0
+        {
+            Self::Demand
+        }
+        else
+        {
+            Self::Pinned
+        }
+    }
 }
 
 /// TLS template metadata extracted from a child's `PT_TLS` segment,
@@ -2069,7 +2096,7 @@ fn finalize_creation(
     memmgr_send_cap: u64,
     memmgr_badge: u64,
     process_badge: u64,
-    demand_paged: bool,
+    paging: Paging,
     self_memmgr_ep: u64,
     parent_relay_cap: u64,
     band_max: u8,
@@ -2136,7 +2163,7 @@ fn finalize_creation(
     // page never names a pager the child does not have. Which processes are
     // exempt from the default pager is in docs/fault-handling.md § Default
     // System Pager.
-    if demand_paged
+    if paging == Paging::Demand
         && memmgr_send_cap != 0
         && self_memmgr_ep != 0
         && bind_pager(
@@ -2991,7 +3018,7 @@ fn create_process_from_bytes(
         child_memmgr_send,
         universals.memmgr_badge,
         process_badge,
-        universals.demand_paged,
+        universals.paging,
         universals.self_memmgr_ep,
         // Boot-module spawns (CREATE_PROCESS) have no parent death queue to
         // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
@@ -3704,7 +3731,7 @@ pub fn create_process_from_file(
     creator_endpoint: u64,
     argv_env: Option<&ArgvEnvRequest>,
     deaths: &Mutex<DeathSet>,
-    demand_paged: bool,
+    paging: Paging,
     parent_relay_cap: u64,
     sched: ChildSched,
 ) -> Result<CreateResult, u64>
@@ -4087,7 +4114,7 @@ pub fn create_process_from_file(
         memmgr_badge: mms.badge(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
-        demand_paged,
+        paging,
         self_memmgr_ep: ctx.memmgr_ep,
     };
     let reservation = next_process_badge(tables)?;
@@ -4151,7 +4178,7 @@ pub fn create_process_from_file(
         mms.cap(),
         mms.badge(),
         process_badge,
-        universals.demand_paged,
+        universals.paging,
         universals.self_memmgr_ep,
         parent_relay_cap,
         sched.band_max,
@@ -4200,9 +4227,9 @@ pub fn create_process_from_file(
 /// the reason the kernel records for a thread its teardown stops. The death
 /// forwarded to logd carries the same reason.
 ///
-/// With `record`, the exit is recorded in the recent-exits ring under the
-/// same lock that takes the entry, so a `QUERY_PROCESS` served on another
-/// worker finds the process either live or exited, never unknown.
+/// With [`ExitRecord::Record`], the exit is recorded in the recent-exits ring
+/// under the same lock that takes the entry, so a `QUERY_PROCESS` served on
+/// another worker finds the process either live or exited, never unknown.
 ///
 /// Idempotent: returns `None` if the badge is unknown (already destroyed).
 pub fn destroy_process(
@@ -4210,7 +4237,7 @@ pub fn destroy_process(
     memmgr_ep: u64,
     ipc_buf: *mut u64,
     tables: &Tables,
-    record: bool,
+    record: ExitRecord,
 ) -> Option<u64>
 {
     let (tail, exit_reason) = {
@@ -4225,9 +4252,10 @@ pub fn destroy_process(
                 }
                 _ => EXIT_KILLED,
             };
-        if record
+        match record
         {
-            state.recent.record(badge, exit_reason, crate::now_ns());
+            ExitRecord::Record => state.recent.record(badge, exit_reason, crate::now_ns()),
+            ExitRecord::Omit => (),
         }
         (
             teardown_entry(entry, exit_reason, &mut state.table),
@@ -4236,6 +4264,17 @@ pub fn destroy_process(
     };
     tail.finish(memmgr_ep, ipc_buf);
     Some(exit_reason)
+}
+
+/// Whether [`destroy_process`] records the destroyed process's exit in the
+/// recent-exits ring, for `QUERY_PROCESS`.
+#[derive(Clone, Copy)]
+pub enum ExitRecord
+{
+    /// Recorded: a handle to the process may still query its exit.
+    Record,
+    /// Not recorded: no handle to the process survives the destroy.
+    Omit,
 }
 
 /// Reap the process `badge` names after its death, with `exit_reason`, as

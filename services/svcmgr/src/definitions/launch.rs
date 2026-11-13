@@ -465,16 +465,22 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
     let process_handle = created.process_handle;
     let thread_cap = created.thread_cap;
 
-    if matches!(def.namespace, NamespaceShape::None)
+    // The subtree's path and rights, `None` for the universal namespace.
+    let subtree = match &def.namespace
     {
-        if def.cwd.is_some()
+        NamespaceShape::None =>
         {
-            std::os::seraph::log!(warn: "launch {}: cwd with namespace=none rejected", def.name);
-            destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
-            return false;
+            if def.cwd.is_some()
+            {
+                std::os::seraph::log!(warn: "launch {}: cwd with namespace=none rejected", def.name);
+                destroy_partial_child(process_handle, thread_cap, ctx.ipc_buf);
+                return false;
+            }
+            return true;
         }
-        return true;
-    }
+        NamespaceShape::Universal => None,
+        NamespaceShape::Subtree { path, rights } => Some((path, *rights)),
+    };
 
     let root_cap = std::os::seraph::root_dir_cap();
     if root_cap == 0
@@ -491,10 +497,9 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
         return false;
     };
 
-    let ns_cap = match &def.namespace
+    let ns_cap = match subtree
     {
-        NamespaceShape::None => unreachable!("guarded above"),
-        NamespaceShape::Universal =>
+        None =>
         {
             let Ok(c) = syscall::cap_copy(root_cap, info.self_cspace, syscall::RIGHTS_EP_SEND)
             else
@@ -505,9 +510,9 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
             };
             c
         }
-        NamespaceShape::Subtree { path, rights } =>
+        Some((path, rights)) =>
         {
-            match std::os::seraph::namespace_lookup_dir(root_cap, path, u64::from(*rights))
+            match std::os::seraph::namespace_lookup_dir(root_cap, path, u64::from(rights))
             {
                 Ok(c) => c,
                 Err(e) =>
@@ -526,15 +531,10 @@ fn configure_namespace(def: &Definition, created: &CreatedProcess, ctx: &Restart
 
     // cwd walk + CONFIGURE_NAMESPACE delivery + cap cleanup is shared
     // with the restart path so both paths install cwd identically.
-    let subtree_rights = match &def.namespace
-    {
-        NamespaceShape::Subtree { rights, .. } => Some(*rights),
-        _ => None,
-    };
     crate::restart::configure_namespace_caps(
         ns_cap,
         def.cwd.as_deref(),
-        cwd_rights(subtree_rights),
+        cwd_rights(subtree.map(|(_, rights)| rights)),
         root_cap,
         process_handle,
         thread_cap,

@@ -29,11 +29,28 @@
 
 #![expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "fsbench is a benchmark harness that panics on failure so faults surface in the \
-              log; `expect` is its intended idiom"
+              log; `expect` and `panic!` are its intended idiom"
 )]
 #![warn(clippy::allow_attributes, clippy::allow_attributes_without_reason)]
 #![warn(clippy::multiple_unsafe_ops_per_block)]
+#![warn(
+    clippy::fn_params_excessive_bools,
+    clippy::large_stack_frames,
+    clippy::significant_drop_tightening,
+    clippy::volatile_composites,
+    clippy::wildcard_enum_match_arm
+)]
+#![cfg_attr(
+    not(test),
+    warn(
+        clippy::panic_in_result_fn,
+        clippy::string_slice,
+        clippy::unreachable,
+        clippy::unwrap_in_result
+    )
+)]
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -158,14 +175,43 @@ fn read_frame(f: &mut File, size: u64, buf: &mut [u8]) -> u64
     consumed
 }
 
-fn measure(f: &mut File, size: u64, path: &str, buf: &mut [u8], iters: u32)
+/// The read path a measurement forces, by its buffer chunking.
+#[derive(Clone, Copy)]
+enum ReadPath
 {
-    let runner: fn(&mut File, u64, &mut [u8]) -> u64 = match path
+    /// `FS_READ`, through [`read_inline`].
+    Inline,
+    /// `FS_READ_FRAME`, through [`read_frame`].
+    Frame,
+}
+
+impl ReadPath
+{
+    /// The `path=` value of the output line.
+    const fn name(self) -> &'static str
     {
-        "inline" => read_inline,
-        "frame" => read_frame,
-        _ => unreachable!(),
-    };
+        match self
+        {
+            Self::Inline => "inline",
+            Self::Frame => "frame",
+        }
+    }
+
+    /// The reader that forces this path.
+    fn runner(self) -> fn(&mut File, u64, &mut [u8]) -> u64
+    {
+        match self
+        {
+            Self::Inline => read_inline,
+            Self::Frame => read_frame,
+        }
+    }
+}
+
+fn measure(f: &mut File, size: u64, read_path: ReadPath, buf: &mut [u8], iters: u32)
+{
+    let runner = read_path.runner();
+    let path = read_path.name();
 
     for _ in 0..WARMUP_ITERS
     {
@@ -271,8 +317,8 @@ fn main()
     let mut buf = vec![0u8; PAGE_SIZE_USIZE];
     for &size in SIZES
     {
-        measure(&mut f, size, "inline", &mut buf, iters);
-        measure(&mut f, size, "frame", &mut buf, iters);
+        measure(&mut f, size, ReadPath::Inline, &mut buf, iters);
+        measure(&mut f, size, ReadPath::Frame, &mut buf, iters);
     }
 
     std::os::seraph::log!("done");

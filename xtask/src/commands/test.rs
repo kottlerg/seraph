@@ -254,7 +254,10 @@ mod tests
     #[test]
     fn the_c_library_is_found_only_with_its_loader_and_a_located_start_file()
     {
-        assert!(c_library_found(true, "/usr/riscv64-linux-gnu/usr/lib/crt1.o\n"));
+        assert!(c_library_found(
+            true,
+            "/usr/riscv64-linux-gnu/usr/lib/crt1.o\n"
+        ));
         assert!(
             !c_library_found(true, "crt1.o\n"),
             "the linker prints the bare name of a file it did not find"

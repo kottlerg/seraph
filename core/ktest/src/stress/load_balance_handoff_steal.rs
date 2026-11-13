@@ -174,6 +174,11 @@ static SERVER_ARGS: spawn::ArgBlock<ServerArgs, NUM_PAIRS> = spawn::ArgBlock::ne
     reason = "spawn (servers + clients) + drain + teardown + the anti-vacuous guard are one linear \
               scenario; splitting adds no clarity"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `servers` and `clients` arrays (16 `SpawnedChild` each, 256 B each) and the \
+              `eps` array (16 `u64`, 128 B); on init's 16 KiB stack"
+)]
 pub fn run(ctx: &TestContext) -> TestResult
 {
     let cpus = system_info(SystemInfoType::CpuCount as u64)

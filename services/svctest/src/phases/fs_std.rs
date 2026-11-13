@@ -618,6 +618,11 @@ fn release_child_main() -> !
 /// `/b`'s, with a one-page frame (a read-only derivation of a page from
 /// memmgr). Each open's `FS_CLOSE` is counted and answered. Anything else is
 /// refused.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `reply` and the builder temporaries of its six reply arms (`IpcMessage`s, 568 B \
+              each); on the stack of the `fake_fs` thread, 64 KiB at the least"
+)]
 fn fake_fs_serve(ep: u64) -> FakeFsReport
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();

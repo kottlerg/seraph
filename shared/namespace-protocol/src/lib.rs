@@ -601,6 +601,12 @@ fn handle_readdir<B: NamespaceBackend>(backend: &mut B, msg: &ipc::IpcMessage) -
 /// visible indices coincide and `idx` is served directly; otherwise the
 /// scan restarts at backend index 0 on every request, so a full listing
 /// costs O(n²) backend calls.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `EntryName`s (about 264 B each) of the `readdir_entry` results and the returned \
+              `Result<Option<EntryName>, NsError>` temporaries; on its caller's stack, 32 KiB at \
+              the smallest (a std service's main thread)"
+)]
 fn nth_visible_entry<B: NamespaceBackend>(
     backend: &mut B,
     dir: NodeId,

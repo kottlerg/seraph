@@ -13,6 +13,7 @@ service manager.
 ```
 init/
 ├── Cargo.toml                  # Workspace member; no_std binary
+├── clippy.toml                 # Clippy settings; frame threshold of init's 16 KiB stack
 ├── README.md
 ├── docs/
 │   └── bootstrap.md            # Authoritative stage enumeration;

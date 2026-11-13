@@ -1,0 +1,12 @@
+# clippy.toml — Clippy settings for every crate under shared/.
+# docs/coding-standards.md § Clippy states the rule each setting serves; this
+# file restates every setting of the root clippy.toml, with the frame
+# threshold of the stack these crates' code runs on.
+
+# 4096 bytes, a quarter of the smallest stack the code of a shared/ crate may
+# run on: the 16 KiB of a kernel stack (KERNEL_STACK_PAGES,
+# core/kernel/src/sched/mod.rs) and of init's main thread (INIT_STACK_PAGES,
+# abi/init-protocol/src/lib.rs). The kernel, init and ktest link crates of
+# this directory, and one file covers them all, so a crate one of them starts
+# linking is already held to it.
+stack-size-threshold = 4096

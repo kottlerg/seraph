@@ -389,6 +389,12 @@ impl Case
 /// Run one case on the two pages from `page`: start the child bound to the
 /// harness as its fault handler, take the fault of its call's copy, answer it
 /// as the case says, and check the child's report.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` (an `IpcMessage`, 568 B), the `regs` register file \
+              (`TRAP_FRAME_BYTES`, under 300 B) and the `Result` temporaries of its many `?` \
+              steps; on init's 16 KiB stack"
+)]
 fn run_case(ctx: &TestContext, spec: &Spec, page: u64) -> TestResult
 {
     let mut case = Case::new(ctx)?;

@@ -1249,4 +1249,86 @@ mod tests
             }
         }
     }
+
+    /// The settings of one `clippy.toml`, `key = value` per line, comments and
+    /// blank lines skipped.
+    fn clippy_settings(path: &Path) -> Vec<(String, String)>
+    {
+        let text = fs::read_to_string(path).unwrap();
+        text.lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let (key, value) = line.split_once('=').expect("a `key = value` line");
+                (key.trim().to_owned(), value.trim().to_owned())
+            })
+            .collect()
+    }
+
+    /// Every `clippy.toml` (or `.clippy.toml`) under `dir`, outside the build
+    /// output and hidden directories.
+    fn clippy_files(dir: &Path, found: &mut Vec<PathBuf>)
+    {
+        for entry in fs::read_dir(dir).unwrap()
+        {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if path.is_dir()
+            {
+                if !name.starts_with('.') && name != "target" && name != "sysroot"
+                {
+                    clippy_files(&path, found);
+                }
+            }
+            else if name == "clippy.toml" || name == ".clippy.toml"
+            {
+                found.push(path);
+            }
+        }
+    }
+
+    /// Clippy reads only the nearest `clippy.toml` above a crate's manifest and
+    /// merges none (docs/coding-standards.md § Clippy), so every other one in
+    /// the tree restates each setting of the root file: `stack-size-threshold`
+    /// with the value of the stack its crates run on, every other setting with
+    /// the root's value.
+    #[test]
+    fn every_clippy_toml_restates_the_root_settings()
+    {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask sits under the project root");
+        let base = clippy_settings(&root.join("clippy.toml"));
+        assert!(
+            base.iter().any(|(key, _)| key == "stack-size-threshold"),
+            "the root clippy.toml sets no stack-size-threshold"
+        );
+        let mut files = Vec::new();
+        clippy_files(root, &mut files);
+        for known in [
+            "core/boot/clippy.toml",
+            "shared/clippy.toml",
+            "xtask/clippy.toml",
+        ]
+        {
+            assert!(files.contains(&root.join(known)), "{known} not found");
+        }
+        for file in files.iter().filter(|f| **f != root.join("clippy.toml"))
+        {
+            let own = clippy_settings(file);
+            for (key, value) in &base
+            {
+                let stated = own.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+                assert!(
+                    stated.is_some(),
+                    "{} does not restate {key}",
+                    file.display()
+                );
+                if key != "stack-size-threshold"
+                {
+                    assert_eq!(stated, Some(value), "{}: {key}", file.display());
+                }
+            }
+        }
+    }
 }

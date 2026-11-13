@@ -195,6 +195,11 @@ fn forward_of_kernel_copy(ctx: &TestContext, parts: &mut Parts, objects: &Object
 
 /// Phase 5: a rebind of the exception class while the forwarded delivery is
 /// queued there delivers it again under the new binding.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` and the reply `IpcMessage` (568 B each) and the `Result` \
+              temporaries of its `ipc_recv(..)?` (about 576 B each); on init's 16 KiB stack"
+)]
 fn rebind_after_forward(ctx: &TestContext, parts: &mut Parts, objects: &Objects) -> TestResult
 {
     let th = spawn_child(ctx, parts, 4, objects)?;
@@ -223,6 +228,12 @@ fn rebind_after_forward(ctx: &TestContext, parts: &mut Parts, objects: &Objects)
 
 /// Phase 1: the forward delivers the fault to the exception endpoint, where
 /// the thread stays fault-blocked until that handler resumes it.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the `first` and `forwarded` `IpcMessage`s (568 B each) and the `Result` temporaries \
+              of the `expect_fault_at(..)?` calls that return them (about 576 B each); on init's \
+              16 KiB stack"
+)]
 fn forward_to_bound(ctx: &TestContext, parts: &mut Parts, objects: &Objects) -> TestResult
 {
     let th = spawn_child(ctx, parts, 0, objects)?;
@@ -325,6 +336,11 @@ fn bind_exception(th: u64, objects: &Objects) -> TestResult
 
 /// Wait for a fault to reach an endpoint, check through the wait set that it
 /// is the one `ws_badge` names, and receive it there.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the received `msg` (568 B), the `Result` temporaries of its `ipc_recv(..)?` and the \
+              `Result` holding the returned message (about 576 B each); on init's 16 KiB stack"
+)]
 fn expect_fault_at(
     ctx: &TestContext,
     objects: &Objects,

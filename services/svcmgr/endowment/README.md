@@ -23,6 +23,7 @@ codec) and `abi/syscall` (`MSG_CAP_SLOTS_MAX`).
 ```
 services/svcmgr/endowment/
 ├── Cargo.toml
+├── clippy.toml                 # Clippy settings; frame threshold of init's 16 KiB stack
 ├── README.md
 └── src/
     └── lib.rs                  # Round kinds, presence bits, encoders and

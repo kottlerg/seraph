@@ -199,6 +199,12 @@ fn find_in_fat16_root(
 /// covers a failed directory or FAT read, a corrupt or cyclic chain, and
 /// no memory for a sector buffer as well as an absent name, so its callers
 /// reply `NOT_FOUND` in each case.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "`lfn` (an `LfnAccum`, about 530 B) and the `DirEntry` (about 790 B, its 765 B `lfn` \
+              buffer) that each match arm builds into the returned `Option`; on its caller's \
+              stack, 32 KiB at the smallest (fatfs's main thread)"
+)]
 pub fn find_in_directory_with_location(
     dir_cluster: u32,
     name: &[u8],

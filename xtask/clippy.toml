@@ -1,0 +1,9 @@
+# clippy.toml — Clippy settings for the host crates under xtask/.
+# docs/coding-standards.md § Clippy states the rule each setting serves; this
+# file restates every setting of the root clippy.toml, with the frame
+# threshold of the stack the host crates' code runs on.
+
+# 524288 bytes, a quarter of the smallest stack the host crates' code runs
+# on: the 2 MiB the Rust standard library gives a spawned thread on the host
+# by default, on which each test also runs (the main thread has 8 MiB).
+stack-size-threshold = 524288

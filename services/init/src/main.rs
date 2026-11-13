@@ -464,6 +464,13 @@ pub extern "C" fn _start(info_ptr: u64) -> !
               service::create_*_with_caps / service::phase3_svcmgr_handover for the \
               subsystem-specific work; what remains is the fixed orchestration sequence"
 )]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "no single large local: the estimate sums the many small cap and slot locals of \
+              init's startup sequence (`thread_caps`, `mm_boot_data`, the endpoint caps) and the \
+              `Option` temporaries of its steps, and the compiled frame is under 2 KiB; on init's \
+              16 KiB stack"
+)]
 fn run(info_ptr: u64) -> !
 {
     // SAFETY: the kernel maps InitInfo at the kernel-chosen VA delivered in

@@ -2469,6 +2469,11 @@ pub enum ReadyError
 /// [`ReadyError::Call`] when the call fails, and [`ReadyError::Refused`]
 /// with devmgr's reply label when devmgr does not accept the report. Either
 /// way devmgr serves no client the driver, which then exits.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std driver's main thread)"
+)]
 pub unsafe fn report_driver_ready(devmgr_ep: u64, ipc_buf: *mut u64) -> Result<(), ReadyError>
 {
     let request = IpcMessage::builder(devmgr_labels::DRIVER_READY)
@@ -2509,6 +2514,11 @@ pub enum ClassCallError
 /// [`ClassCallError`]: [`devmgr_errors::NO_DEVICE`] past the last served
 /// driver of the class, [`devmgr_errors::WITHDRAWN`] at a withdrawn one's
 /// ordinal, and the other refusals [`devmgr_labels::QUERY_DEVICE`] names.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std process's main thread)"
+)]
 pub unsafe fn query_device(
     class_send: u64,
     ordinal: u64,
@@ -2535,6 +2545,11 @@ pub unsafe fn query_device(
 /// [`ClassCallError`]; [`ClassCallError::Refused`] with
 /// [`devmgr_errors::INVALID_REQUEST`], unsent, for a name longer than
 /// [`devmgr_labels::MAX_CLASS_NAME_BYTES`].
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 16 KiB at the smallest (init's)"
+)]
 pub unsafe fn mint_class_send(
     registry: u64,
     class: &[u8],
@@ -2731,6 +2746,11 @@ pub enum DmaError
 /// # Errors
 /// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
 /// devmgr's reply label when devmgr refuses the mapping.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std driver's main thread)"
+)]
 pub unsafe fn dma_map(
     dma_ep: u64,
     memory_cap: u64,
@@ -2768,6 +2788,11 @@ pub unsafe fn dma_map(
 /// withdrawn or was never given DMA, `IOMMU_FAILED` when the IOMMU driver did
 /// not remove the mapping, which stays standing, or `LABEL_VERSION_MISMATCH`
 /// ([`devmgr_dma_labels::DMA_UNMAP`]).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std driver's main thread)"
+)]
 pub unsafe fn dma_unmap(dma_ep: u64, device_addr: u64, ipc_buf: *mut u64) -> Result<(), DmaError>
 {
     let request = IpcMessage::builder(devmgr_dma_labels::DMA_UNMAP)
@@ -2808,6 +2833,11 @@ pub struct DmaFaults
 /// [`DmaError::Call`] when the call fails, and [`DmaError::Refused`] with
 /// devmgr's reply label when devmgr refuses: `UNAUTHORIZED` when the device
 /// is withdrawn or was never given DMA, or `LABEL_VERSION_MISMATCH`.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std driver's main thread)"
+)]
 pub unsafe fn dma_faults(dma_ep: u64, ipc_buf: *mut u64) -> Result<DmaFaults, DmaError>
 {
     let request = IpcMessage::builder(devmgr_dma_labels::DMA_FAULTS)

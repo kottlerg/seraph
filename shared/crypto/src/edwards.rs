@@ -114,6 +114,12 @@ pub(crate) fn scalar_mul_base(s: &[u8; 32]) -> Point
 /// condition inverted to select `-A`: a y coordinate at or above p (step 1),
 /// a y with no square root (step 3), and x = 0 with the sign bit set (step 4)
 /// are refused.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the point `r` (`Point`, 512 B), the field elements `num`, `den`, `den2`, `den4`, \
+              `den6`, `t`, `chk` and the `tmp` copies of them (`Fe`, 128 B each); on its caller's \
+              stack, 16 KiB at the smallest (init's, through the ktest KAT run)"
+)]
 pub(crate) fn decompress_neg(pk: &[u8; 32]) -> Option<Point>
 {
     if !y_is_canonical(pk)

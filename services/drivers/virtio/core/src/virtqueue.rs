@@ -155,7 +155,8 @@ impl SplitVirtqueue
     /// - `avail_va` must point to `4 + 2 * queue_size` bytes of zeroed, DMA-capable memory,
     ///   aligned to `align_of::<VirtqAvail>()`.
     /// - `used_va` must point to `4 + 8 * queue_size` bytes of zeroed, DMA-capable memory,
-    ///   aligned to `align_of::<VirtqUsed>()`.
+    ///   aligned to `align_of::<VirtqUsedElem>()` (4 bytes, `VirtIO` 1.2 §2.7), which the ring's
+    ///   elements, 4 bytes past its header, need.
     /// - All three regions must not overlap and must remain valid for the virtqueue's lifetime.
     #[must_use]
     pub unsafe fn new(
@@ -375,8 +376,8 @@ impl SplitVirtqueue
 
         #[expect(
             clippy::cast_ptr_alignment,
-            reason = "VirtqUsed is 2-byte aligned; offset 4 from a 2-byte-aligned base \
-                      maintains u32 alignment for VirtqUsedElem"
+            reason = "`new`'s contract aligns the used ring to `VirtqUsedElem`'s 4 bytes, and \
+                      offset 4 from a 4-byte-aligned base keeps that alignment"
         )]
         // SAFETY: the ring elements start 4 bytes past the used ring's header,
         // inside the `4 + 8 * queue_size` bytes `new`'s contract names.
@@ -385,7 +386,9 @@ impl SplitVirtqueue
         // SAFETY: ring_idx <= ring_mask < queue_size, so the element lies
         // inside the ring's `queue_size` elements.
         let ring_elem = unsafe { ring_base.add(ring_idx as usize) };
-        // SAFETY: `ring_elem` lies inside the valid used ring.
+        // SAFETY: `ring_elem` lies inside the valid used ring, 4-byte aligned:
+        // `new`'s contract aligns the ring to 4 bytes, and the elements start
+        // 4 bytes past it, 8 bytes apart.
         let elem = unsafe { core::ptr::read_volatile(ring_elem) };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);

@@ -159,6 +159,11 @@ pub enum CliCommand
     /// xtask/README.md).
     ReviewLedger(ReviewLedgerArgs),
 
+    /// Print the scope of a release review as JSON, in pages of bounded
+    /// size with a digest each: the range's files, its first-parent units
+    /// and their files, and the open Issues (see xtask/README.md).
+    ReleaseScope(ReleaseScopeArgs),
+
     /// Replace a GitHub Issue's body from a file, refusing an empty body or
     /// one that lost task-list items, keeping a backup, and verifying the
     /// edit (see xtask/README.md).
@@ -221,6 +226,7 @@ impl CliCommand
             | Self::PrCheck(_)
             | Self::ReviewCheck(_)
             | Self::ReviewLedger(_)
+            | Self::ReleaseScope(_)
             | Self::IssueEdit(_)
             | Self::IssueFile(_)
             | Self::Orch(_)
@@ -1156,6 +1162,30 @@ pub struct ReviewLedgerArgs
     /// With `--release`, print only the entries for this file; repeatable.
     #[arg(long, requires = "release")]
     pub file: Vec<String>,
+}
+
+// ── ReleaseScope ──────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct ReleaseScopeArgs
+{
+    /// The previous release tag (or any commit) the range starts at.
+    #[arg(long)]
+    pub from: String,
+
+    /// The candidate head the range ends at.
+    #[arg(long, default_value = "HEAD")]
+    pub head: String,
+
+    /// The most entries one page holds: a range file, an open Issue, or a
+    /// file of a unit (a unit with no file counts one).
+    #[arg(long, default_value_t = 200, value_parser = clap::value_parser!(u64).range(1..))]
+    pub page_entries: u64,
+
+    /// Print page `<list>:<n>` (1-based) of `files`, `units`, or `issues`
+    /// instead of the summary.
+    #[arg(long, value_name = "LIST:N")]
+    pub page: Option<String>,
 }
 
 // ── IssueEdit / IssueFile ─────────────────────────────────────────────────────

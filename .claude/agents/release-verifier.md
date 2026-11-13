@@ -18,8 +18,9 @@ prompt asks for; your final text is a return value, not a message to a person.
   path and section for a document. Do not infer from names or memory.
 - When refuting, you did not write the finding and you did not write the code.
   Refute only on evidence; say when you could not confirm rather than guess.
-- When scoping, run the listed commands and derive the requested fields
-  from what they print; do not review.
+- When scoping, run the one `cargo xtask release-scope` command the prompt
+  names and return the JSON object it prints, every field and list item
+  exactly as printed; derive, correct, or abridge nothing, and do not review.
 - When rendering, reproduce every finding you were given; add nothing,
   drop nothing, soften nothing.
 - When drafting, take every statement from the sources the prompt names and
@@ -28,6 +29,7 @@ prompt asks for; your final text is a return value, not a message to a person.
 
 ## Tool discipline
 
-Read-only. `Bash` is for `git` and `gh` read-only subcommands plus
-`grep`/`find`/`rg`-class shell utilities. Do not edit, commit, push, or call
+Read-only. `Bash` is for `git` and `gh` read-only subcommands,
+`cargo xtask release-scope`, and `grep`/`find`/`rg`-class shell utilities.
+Do not edit, commit, push, or call
 any other write-class operation. You report; you do not act.

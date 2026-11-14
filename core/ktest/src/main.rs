@@ -201,9 +201,9 @@ macro_rules! run_integration_test {
 /// Context passed to all test functions.
 ///
 /// Carries the boot-provided resources tests need: ktest's own `AddressSpace`,
-/// `CSpace` and `Thread` caps, the first RAM Memory cap, the `SbiControl` and
-/// `SchedControl` caps, the IPC buffer pointer, and the `InitInfo` VA. Pass by
-/// shared reference to test functions.
+/// `CSpace` and `Thread` caps, the first RAM Memory cap, the `SbiControl`,
+/// `SchedControl` and `EntropyControl` caps, the IPC buffer pointer, and the
+/// `InitInfo` VA. Pass by shared reference to test functions.
 pub struct TestContext
 {
     /// ktest's own `AddressSpace` capability slot, provided by the kernel.
@@ -255,6 +255,11 @@ pub struct TestContext
     /// pass it (or a `sched_split` child) as the `SchedControl` argument to
     /// `SYS_THREAD_SET_PRIORITY`.
     pub sched_control_cap: u64,
+
+    /// Root `EntropyControl` cap (Contribute), kernel-minted in init's initial
+    /// cap set on both architectures and named by its descriptor alone; zero
+    /// when no descriptor names one. Tests of `SYS_ENTROPY_CONTRIBUTE` use it.
+    pub entropy_control_cap: u64,
 
     /// VA of the read-only `InitInfo` page, as delivered in the entry
     /// register — the kernel's per-boot `choose_init_layout` draw (ASLR,
@@ -704,6 +709,10 @@ extern "C" fn run(info_ptr: u64) -> !
         memory_base: info.memory_base,
         sbi_control_cap: info.sbi_control_cap,
         sched_control_cap: info.sched_control_cap,
+        entropy_control_cap: init_info::descriptors(info)
+            .iter()
+            .find(|d| d.cap_type == init_protocol::CapType::EntropyControl)
+            .map_or(0, |d| d.slot),
         init_info_va: info_ptr,
     };
 

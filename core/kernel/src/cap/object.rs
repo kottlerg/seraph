@@ -68,6 +68,7 @@ pub enum ObjectType
     /// The header of a `CSpace` body-arena page ([`ArenaPage`]); never in a
     /// capability slot.
     ArenaPage = 13,
+    EntropyControl = 14,
 }
 
 // ── KernelObjectHeader ────────────────────────────────────────────────────────
@@ -717,6 +718,7 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
         | ObjectType::EventQueue
         | ObjectType::WaitSet
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage => crate::fatal("lineage_of: not a range-capability object"),
     }
 }
@@ -1150,6 +1152,18 @@ pub struct SbiControlObject
     pub header: KernelObjectHeader,
 }
 
+/// Kernel object for entropy-contribution authority (`EntropyControl`
+/// capability).
+///
+/// There is exactly one `EntropyControl` object, created at boot. Grants the
+/// holder authority to mix bytes into the kernel entropy pool with
+/// `SYS_ENTROPY_CONTRIBUTE`; it carries no fields.
+#[repr(C)]
+pub struct EntropyControlObject
+{
+    pub header: KernelObjectHeader,
+}
+
 /// Kernel object for a thread control block (Thread capability).
 #[repr(C)]
 pub struct ThreadObject
@@ -1278,17 +1292,20 @@ const SEED_BATCH_PAGES: u64 = 64;
 /// caller's interrupt state, with preemption disabled throughout so that an
 /// interrupt taken here cannot switch the thread out. The page-pool seeding
 /// and reclaim walks call it between their batches, whose number a caller
-/// chooses, so that a syscall running one masks interrupts for one batch at a
-/// time: shootdown and wakeup IPIs are acknowledged, and the timer and the
-/// heartbeat tick, meanwhile (core/kernel/docs/capability-internals.md
-/// § Donation Records and § Teardown).
+/// chooses, and so does the retype free's clear of a dead object's bytes
+/// between its batches (`cap::retype`, § Freed bytes), so that a syscall
+/// running one masks interrupts for one batch at a time: shootdown and wakeup
+/// IPIs are acknowledged, and the timer and the heartbeat tick, meanwhile
+/// (core/kernel/docs/capability-internals.md § Donation Records and
+/// § Teardown).
 ///
-/// No lock may be held across it. Every pool is created after the timer is
-/// initialised, which enables interrupts with the trap vector in place, so
-/// every caller runs where interrupts may be taken; the idle drain, which
-/// runs with them enabled, keeps them enabled.
+/// No lock may be held across it. Every pool is created, and every retyped
+/// object freed, after the timer is initialised, which enables interrupts
+/// with the trap vector in place, so every caller runs where interrupts may
+/// be taken; the idle drain, which runs with them enabled, keeps them
+/// enabled.
 #[cfg(not(test))]
-fn interrupt_window()
+pub(crate) fn interrupt_window()
 {
     crate::percpu::preempt_disable();
     // SAFETY: kernel mode; the state is restored below.
@@ -1891,6 +1908,7 @@ const _: () = {
     assert!(size_of::<IoPortObject>() as u64 <= floor);
     assert!(size_of::<SchedControlObject>() as u64 <= floor);
     assert!(size_of::<SbiControlObject>() as u64 <= floor);
+    assert!(size_of::<EntropyControlObject>() as u64 <= floor);
     assert!(size_of::<ThreadObject>() as u64 <= floor);
     assert!(size_of::<AddressSpaceObject>() as u64 <= floor);
     assert!(size_of::<CSpaceKernelObject>() as u64 <= floor);
@@ -2749,6 +2767,7 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
         | ObjectType::EventQueue
         | ObjectType::WaitSet
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage => crate::fatal("deferred reclaim: object type carries no link"),
     }
 }
@@ -2832,6 +2851,7 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
         | ObjectType::EventQueue
         | ObjectType::WaitSet
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage =>
         {
             // SAFETY: refcount 0; no other references exist; no lock held
@@ -3541,7 +3561,8 @@ pub unsafe fn object_for_new_slot(
         | CapTag::CSpace
         | CapTag::WaitSet
         | CapTag::SchedControl
-        | CapTag::SbiControl =>
+        | CapTag::SbiControl
+        | CapTag::EntropyControl =>
         {
             // A new slot is the reference userspace can multiply, so it is
             // refused at the ceiling (`REF_COUNT_LIMIT`).
@@ -3665,23 +3686,32 @@ unsafe fn free_donation_group(group: &mut [DonationRecord], stack: &mut CascadeS
         // for `next_of`, `set_next`, and `offset_of`.
         record.holes =
             unsafe { crate::cap::arena::sort_list(record.holes, &next_of, &set_next, &offset_of) };
+        let mut cur = record.holes;
+        // SAFETY: every page on the list is held (contract).
+        while let Some(page) = unsafe { cur.as_ref() }
+        {
+            cur = page.next.load(Ordering::Relaxed);
+            // The page's lease on the Memory object is taken while the
+            // record's reference still holds it.
+            anc_memory.header.inc_ref();
+            page.header.ancestor.store(anc_ptr, Ordering::Release);
+        }
     }
+    // `retype_free_runs` produces the runs twice, so walking the kept pages
+    // has no side effect: their leases are taken above.
     let kept = |sorted: *mut ArenaPage| {
         let mut cur = sorted;
         core::iter::from_fn(move || {
             // SAFETY: every page on the list is held (contract).
             let page = unsafe { cur.as_ref() }?;
             cur = page.next.load(Ordering::Relaxed);
-            // The page's lease on the Memory object is taken while the
-            // record's reference still holds it.
-            anc_memory.header.inc_ref();
-            page.header.ancestor.store(anc_ptr, Ordering::Release);
             Some(offset_of(core::ptr::from_ref(page).cast_mut()))
         })
     };
     // SAFETY: the runs are the parts of the records' page-class retypes that
     // no kept page covers, in ascending order (the records are sorted by
-    // offset and their spans disjoint); the dead pool uses none of them.
+    // offset and their spans disjoint); the dead pool uses none of them, and no
+    // lock is held (contract).
     unsafe {
         crate::cap::retype::retype_free_runs(anc_memory, |free_run| {
             for record in &*group
@@ -3905,6 +3935,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: refcount 0, exclusively owned SbiControlObject (dealloc_object's
             // contract); no lock is held.
             unsafe { free_body::<SbiControlObject>(ptr, stack) };
+        }
+        ObjectType::EntropyControl =>
+        {
+            // SAFETY: refcount 0, exclusively owned EntropyControlObject
+            // (dealloc_object's contract); no lock is held.
+            unsafe { free_body::<EntropyControlObject>(ptr, stack) };
         }
 
         // ── Arena page kept past its CSpace ───────────────────────────────

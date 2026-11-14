@@ -151,9 +151,11 @@ takes back (see [Per-Process Tracking](#per-process-tracking)).
 
 Every page memmgr hands out reads zero: each run of a `REQUEST_MEMORY_CAPS` grant, and each run a
 demand fault maps (see [Demand faults](#demand-faults)). A pooled run can hold what its last owner
-wrote, and what the kernel left in it: a reclaimed frame keeps the bytes of the objects that were
-retyped from it, since the kernel credits a dead object's bytes back to its Memory object without
-clearing them. memmgr does not rely on any path that returns a run to the pool to clear it, so it
+wrote, and what the kernel left in it: the kernel zeroes a dead object's bytes when it frees them,
+but a frame objects were retyped from keeps the retype allocator's free-list links, region offsets
+and page counts
+([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md) § Kernel
+Object Memory). memmgr does not rely on any path that returns a run to the pool to clear it, so it
 clears each run once, at hand-out, after selection and before the run is accounted, derived, or
 mapped into the process.
 
@@ -186,15 +188,19 @@ and never reclaims them. Each entry records:
 
 - The badge (process identity).
 - The head of an intrusive list of the Memory cap slots memmgr has handed
-  to this process, cumulatively, since `REGISTER_PROCESS`.
+  to this process, cumulatively, since `REGISTER_PROCESS`, other than the
+  runs that back its demand regions: its grants, the page-table runs memmgr
+  donated to its address space, and, for a reserved record, the bootstrap
+  arenas.
 - The head of an intrusive list of the demand-paged regions the process has
-  registered (`REGISTER_REGION`).
+  registered (`REGISTER_REGION`), each with its chunk table, which holds the
+  runs that back the region ([Chunk table](#chunk-table)).
 - The delegated child `AddressSpace` cap, when demand-paged.
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
 
-The frame and region list nodes live in a self-hosted metadata arena (below),
+The frame, region, and chunk-table nodes live in a self-hosted metadata arena (below),
 not in the record, so per-process frame and region counts are bounded by RAM —
 not by a fixed constant. The arena is what makes the demand-paged thread-stack
 consumer (one region plus many lazily-grown frames per thread) viable: a fixed
@@ -221,7 +227,8 @@ RAM is exhausted.
 A demand-paged region is backed in chunks of `DEMAND_CHUNK_PAGES` (16) pages, aligned to the
 region's base and clamped to its end. On a fault in a region, memmgr backs the part of the
 faulting page's chunk that no earlier run backs: the largest span of the chunk that holds the
-faulting page and no page of a run memmgr mapped before. On a pool with a free run that covers the
+faulting page and no page of a run memmgr mapped before, which it reads from the chunk's entry in
+the region's chunk table ([Chunk table](#chunk-table)). On a pool with a free run that covers the
 span, that is the whole chunk on its first fault, backed by one run.
 
 memmgr first selects a run covering the span, as a `REQUIRE_CONTIGUOUS` request would, with the
@@ -234,10 +241,54 @@ for want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin
 only when the free pool holds no page, or when the split of a run larger than the span fails.
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the
-region's protection, and recorded on the process's entry with its mapped VA and no region id, so
+region's protection, and recorded on its chunk's entry with its mapped VA and no region id, so
 `UNREGISTER_REGION` unmaps and reclaims it and `PROCESS_DIED` reclaims it (see
-[Reclamation](#reclamation)). The pages move from a free run to the process's entry, so
-`pool_total` is unchanged.
+[Reclamation](#reclamation)). The pages move from a free run to the process, so `pool_total` is
+unchanged.
+
+---
+
+## Chunk table
+
+Each demand region carries a chunk table with one entry for each chunk a fault has backed. An
+entry records:
+
+- The backed mask: one bit per page of the chunk, set when a run backs the page.
+- The chunk's state: unbacked; resident, its pages backed by the runs on the entry's run list and
+  mapped in the process; evicting; or swapped.
+- A pin flag and a two-bit age.
+- A link: the head of the chunk's run list while it is resident or evicting, the handle of its
+  stored pages while it is swapped.
+
+The evicting and swapped states, the pin flag, and the age are the swap path's: memmgr reclaiming
+a cold chunk's runs under memory pressure and storing its pages, a fault restoring them. That path
+is design intent; not yet implemented ([#230](https://github.com/kottlerg/seraph/issues/230)).
+Today nothing evicts a chunk, so a fault finds its chunk unbacked or resident.
+
+The table is a radix tree of [Metadata Arena](#metadata-arena) slots rooted in the region's node.
+A directory node holds `DIR_FANOUT` (5) children: the slot indices that fit in the slot's largest
+payload, so a directory node does not enlarge the slot. A leaf holds one chunk's entry. The tree is
+indexed by the chunk's index in the region, its offset from the region's base in chunks, one
+base-5 digit per level. Its height is fixed by the region's chunk count, as the fewest directory
+levels that give every chunk a leaf: none for a region of one chunk, seven for a region of 2^14
+chunks (1 GiB), eighteen for one that fills a 57-bit address space's user half. A node exists only
+on the path to a chunk that has an entry. The table therefore costs slots in proportion to the
+chunks the process touched, at most one more than the height per chunk, not in proportion to the
+VA it registered.
+
+A fault reads the region's node and the chunk's path through the table, the height plus two slots,
+whatever runs the process or the region holds. Recording a run takes a slot for its descriptor
+and one for each node of the chunk's path that does not exist yet. memmgr secures those slots
+before it selects the run, holds them through any page-table funding the map needs, and records
+the run only once the map has succeeded: the descriptor goes onto the chunk's run list, its pages
+into the mask, and any missing node of the path into the tree, all in one step. A declined fault
+leaves the entry as it was.
+
+`UNREGISTER_REGION` and `PROCESS_DIED` free a region's table with a walk that keeps its pending
+nodes on a stack threaded through their own `next` links, which no table node uses otherwise. The
+walk needs no memory and no recursion. It rewrites each run's descriptor into a run node in place,
+which joins the free pool or the deferred list as any reclaimed frame does (see
+[Reclamation](#reclamation)), and returns every directory and leaf node to the arena's free list.
 
 ---
 
@@ -279,14 +330,16 @@ until `PROCESS_DIED`.
 
 ## Metadata Arena
 
-All of memmgr's bookkeeping — free runs, deferred runs, process records, and
-per-process frame and region descriptors — is nodes drawn from a self-hosted
-arena rather than fixed `.bss` arrays. memmgr is `no_std` and cannot bootstrap
+All of memmgr's bookkeeping — free runs, deferred runs, process records,
+per-process frame and region descriptors, and the regions' chunk tables — is
+nodes drawn from a self-hosted arena rather than fixed `.bss` arrays. memmgr
+is `no_std` and cannot bootstrap
 a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
-- Nodes are fixed-size `Slot`s (a tagged run/process/region/frame/free payload
-  plus a `next` index) reached by a `u64` index, so the index never bounds the
+- Nodes are fixed-size `Slot`s (a tagged run, process, region, frame,
+  chunk-directory, chunk, or free payload plus a `next` index) reached by a
+  `u64` index, so the index never bounds the
   arena before the address space does.
 - A free list threads the unused slots. Allocation pops the head; free pushes
   it back.
@@ -467,12 +520,13 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
 1. Recheck the deferred list.
 2. Remove the per-process record from the index. If absent (untracked
    badge), skip to step 5 — the death notification is idempotent.
-3. For each frame node in the record's frame list, rewrite the node into a
-   run of the retained Memory cap and insert it into the free pool at its
-   sorted position when the frame is quiescent, else onto the deferred list
-   (no fresh node, so the step cannot fail).
-4. Return every region node and the record's own node to the arena free
-   list.
+3. For each frame node in the record's frame list and on the run lists of
+   its regions' chunk tables, rewrite the node into a run of the retained
+   Memory cap and insert it into the free pool at its sorted position when
+   the frame is quiescent, else onto the deferred list (no fresh node, so
+   the step cannot fail).
+4. Return every chunk-table node, every region node, and the record's own
+   node to the arena free list.
 5. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
@@ -491,8 +545,8 @@ caller-owned grant. The caller usually cannot transfer the cap back — having
 retyped the region (e.g. into a Thread) and dropped its inner copy, it no
 longer holds one — so it names each region by the region id memmgr reported
 at grant. memmgr matches that id against the entry's frame list (grants only;
-demand-fault runs, which carry no id, are reclaimed by
-`UNREGISTER_REGION`), takes the frame off the record, returns it to the pool
+demand-fault runs, which carry no id and sit in their region's chunk table,
+are reclaimed by `UNREGISTER_REGION`), takes the frame off the record, returns it to the pool
 when it is quiescent and to the deferred list otherwise (the node becomes
 the run's node in either case), and coalesces the freed runs with their
 physical neighbours, leaving the entry's other records untouched. Unmatched
@@ -505,16 +559,17 @@ all are gone, so no other process reaches a pooled run and its next grantee
 can always split it, map it whole, and retype it.
 
 `UNREGISTER_REGION` from a live process is the mid-life counterpart for a
-demand-paged region: memmgr removes the region node and **actively unmaps** the
+demand-paged region: memmgr finds the region node and **actively unmaps** the
 whole region span from the delegated child `AddressSpace` in one
 `mem_unmap_reclaim` call, which also returns the emptied page tables to that
 address space's page-table budget (the process is still alive, so the mappings
-must be removed before the frames return to the pool). It then returns each
-backing frame's cap to the pool, or to the deferred list when the frame is not
-quiescent (each frame node becoming its run's node), and coalesces the freed
-runs with their physical neighbours. Frames the caller mapped itself are left
-untouched. This is the reclamation path the ruststd guarded-stack
-consumer uses on `join()`.
+must be removed before the frames return to the pool). It then removes the
+region node and frees its chunk table ([Chunk table](#chunk-table)), returning
+each backing run's cap to the pool, or to the deferred list when the run is not
+quiescent (each descriptor node becoming its run's node), and coalesces the
+freed runs with their physical neighbours. The entry's frame list, which holds
+the frames the caller mapped itself, is left untouched. This is the reclamation
+path the ruststd guarded-stack consumer uses on `join()`.
 
 ---
 

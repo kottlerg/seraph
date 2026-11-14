@@ -2,7 +2,9 @@
 
 Kernel randomness for kernel consumers and `SYS_GETRANDOM`: a multi-source
 entropy pool feeding per-CPU forward-secure CSPRNGs, with a small draw API,
-hardware-source health gating, and a boot-time power-on self-test.
+hardware-source health gating, a boot-time power-on self-test, and a
+capability-gated path, `SYS_ENTROPY_CONTRIBUTE`, through which userspace adds
+bytes to the pool.
 
 ---
 
@@ -21,11 +23,18 @@ erasure (below) makes returned bytes unrecoverable from post-fill state and
 makes successive fills independent, so a userspace observer of `getrandom`
 output learns nothing about prior or subsequent kernel draws (ASLR offsets,
 nonces, keys): forward secrecy holds across the kernel/userspace boundary, not
-only within the kernel. The userspace path adds no authority-bearing surface —
+only within the kernel. The draw path adds no authority-bearing surface —
 `SYS_GETRANDOM` is ambient and draw-only; it injects no entropy — and per-call
 length is capped (`MAX_GETRANDOM_LEN`) so a draw never holds interrupts off for
 an unbounded window
 ([syscalls.md § `SYS_GETRANDOM`](syscalls.md#sys_getrandom-55)).
+The one userspace path into the pool, `SYS_ENTROPY_CONTRIBUTE`, is
+authority-bearing, because it changes the pool: it requires an `EntropyControl`
+capability carrying `Contribute`
+([docs/capability-model.md § `EntropyControl`](../../../docs/capability-model.md#entropycontrol)),
+caps each call at `MAX_ENTROPY_CONTRIBUTE_LEN` bytes, and can only add to the
+pool (the contributed source class below;
+[syscalls.md § `SYS_ENTROPY_CONTRIBUTE`](syscalls.md#sys_entropy_contribute-65)).
 Because userspace keeps no RNG state, two processes (or a
 forked/cloned address space) cannot share or duplicate a seed: each diverges
 from its first draw by independently advancing the generator. Whole-VM-snapshot
@@ -49,7 +58,7 @@ mixed with timing jitter before any byte is drawn.
 
 ## Sources and graceful degradation
 
-Three source classes are mixed into the pool:
+Four source classes are mixed into the pool:
 
 - **Firmware boot seed** — a conditioned draw the bootloader passes to the
   kernel in [`BootInfo`](../../../abi/boot-protocol/src/lib.rs)
@@ -84,6 +93,19 @@ Three source classes are mixed into the pool:
 - **Timing jitter** — cycle-counter samples (`read_cycle_counter`: TSC on
   x86-64; the `time` CSR on riscv64) taken at distinct interrupt event classes.
   This is the always-available source.
+- **Contributed bytes** — bytes a userspace holder of the `EntropyControl`
+  capability passes through `SYS_ENTROPY_CONTRIBUTE`, at most
+  `MAX_ENTROPY_CONTRIBUTE_LEN` (256) per call: for example the output of a
+  hardware RNG only a userspace driver can reach. The handler copies them to
+  its kernel stack, absorbs them with `pool::absorb`, and wipes its copy. They
+  are given no entropy credit: a contribution never sets `SEEDED`, and is
+  refused with `WouldBlock` before the pool is seeded, so it never stands in
+  for the Phase 5 boot seed. The source is runtime-only and additive. An
+  absorb XORs its bytes into the rate and permutes, which maps the pool state
+  one-to-one, so bytes chosen without knowledge of that state, however weak or
+  hostile, cannot reduce what it hides. Which process holds the capability is
+  userspace policy
+  ([docs/capability-model.md § `EntropyControl`](../../../docs/capability-model.md#entropycontrol)).
 
 Where a VMGENID device is present (x86-64 under QEMU), the initial 16-byte
 generation GUID is additionally absorbed at Phase 5 — with `guid=auto` a free
@@ -134,6 +156,10 @@ answer; the permutation against the FIPS-202 zero-state vector (see Testing).
   interval/budget reseeds use the try-forms and defer one draw on contention,
   so a tight-loop `getrandom` caller cannot amplify cross-CPU interrupts-off
   tail latency on the pool leaf lock.
+- `SYS_ENTROPY_CONTRIBUTE` takes the lock through the blocking `absorb`, once
+  per call, for at most `MAX_ENTROPY_CONTRIBUTE_LEN` (256) bytes, two
+  permutations at the 136-byte rate. Only an `EntropyControl` holder can make
+  the call, so no process without that capability can hold the lock.
 
 Pool storage is a buddy-allocated slab published through an `AtomicPtr`
 (`install`); `absorb` is a no-op before installation, so early callers are safe.
@@ -160,7 +186,8 @@ The reseed policy is a pure, host-tested decision function
   (`jitter::collect` — the staging words, the sample count, and the
   instantaneous cycle counter, so every contribution carries fresh timing),
   draws `RESEED_BYTES` (32 — a 256-bit reseed) of fresh seed material, and
-  absorbs it; the seed buffer is then zeroed. Whenever VMGENID detection is
+  absorbs it; the seed buffer on the kernel stack is then cleared with volatile
+  stores the compiler cannot drop (`entropy::wipe`). Whenever VMGENID detection is
   armed, every mandatory reseed additionally absorbs the live GUID into the pool
   after the jitter fold and before the seed draw.
 - The draw interval bounds how much output depends on any single seed without
@@ -272,9 +299,11 @@ draws then come from that state. An AP's first consumer draw follows
 `sched::enter`, so its mandatory reseed carries the tick/IRQ jitter accrued
 since its capture.
 
-The riscv64 *runtime* hardware-RNG path — a virtio-rng/hwrng device owned by a
+The riscv64 *runtime* hardware-RNG path is a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
-levels to obtain entropy — is future work
+levels to obtain entropy. Its kernel side is the contributed source class
+(§ Sources); the driver, and the service that holds the `EntropyControl`
+capability and contributes the driver's bytes, are future work
 ([#396](https://github.com/kottlerg/seraph/issues/396)).
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at
@@ -341,6 +370,10 @@ validates the API once per boot.
   detection (`vmgenid::init`, absorbing the initial GUID) before the pool is
   marked seeded — so no draw ever precedes snapshot detection — capture the
   BSP's self-test sample, and mark its generator stale.
+- **Phase 7** (`cap::populate_cspace`): mint the root `EntropyControl`
+  capability, carrying `Contribute`, into init's `CSpace` on both architectures
+  ([docs/capability-model.md](../../../docs/capability-model.md#initial-capability-distribution)
+  § Initial Capability Distribution).
 - **Phase 8** (`init_ap`, each AP): capture that AP's self-test sample (the
   AP's generator seeds lazily from the already-seeded pool on that first
   draw), then mark it stale.
@@ -348,7 +381,8 @@ validates the API once per boot.
   CPUs.
 - **Runtime**: the scheduler timer tick and device-IRQ dispatch feed jitter
   samples into the per-CPU accumulators; the BSP tick additionally runs the
-  VMGENID observability poll.
+  VMGENID observability poll; and `SYS_ENTROPY_CONTRIBUTE` absorbs contributed
+  bytes into the pool.
 
 ## Testing
 
@@ -356,7 +390,10 @@ validates the API once per boot.
   Keccak-f[1600] zero-state vector; the NIST `SHAKE256("")` FIPS-202 vector and
   a multi-block squeeze; sponge determinism, seed-sensitivity, fill advancement,
   and forward-secrecy erasure; health-test cutoffs and stuck/biased-source
-  trips; the full reseed-policy decision matrix (boundaries included); and the
+  trips; the full reseed-policy decision matrix (boundaries included); the
+  `SYS_ENTROPY_CONTRIBUTE` argument checks in their order (`WouldBlock`
+  included, which no process can reach) and the wipe of its stack copy; the
+  Phase 7 mint of the `EntropyControl` capability and its descriptor; and the
   bootloader's VGIA scanner. The permutation, sponge, health tests, and reseed
   policy are pure and host-testable; the pool, per-CPU generators, jitter,
   VMGENID consumer, self-test, and draw API are hardware-coupled and built only
@@ -378,6 +415,12 @@ validates the API once per boot.
   256-draw interval on both architectures; svctest's `random-contention`
   phase drives four concurrent draw threads through repeated interval
   reseeds, exercising the non-spinning defer path under SMP.
+- **Guest contribution coverage**: ktest's `entropy::entropy_contribute_*`
+  tests, on both architectures, check that the boot-minted `EntropyControl`
+  capability carries `Contribute`, contribute through it and then draw, and
+  check each refusal path: a null or wrong-type handle, a derivation without
+  `Contribute`, a length past the cap, and a null, kernel-half or unmapped
+  buffer.
 - **Snapshot-resume test** (`cargo xtask test-vmgenid`, x86_64): boots with a
   fixed generation GUID, saves the guest via QMP migrate-to-file, restores it
   under a different GUID with `-incoming`, and asserts the kernel's

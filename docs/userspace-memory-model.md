@@ -81,7 +81,7 @@ disjoint surfaces:
 | Surface | Granularity | Owner | Used for |
 |---|---|---|---|
 | Byte heap | Bytes | `std::sys::seraph::alloc` (the platform allocator behind `System` and the default global allocator) | `Box`, `Vec`, `String`, all `alloc`/`std` collections |
-| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, spawned-thread stacks, demand-paged or mapped at spawn (spawned-thread IPC buffers come from the byte heap) |
+| Page reservations | 4 KiB pages | `std::sys::seraph` | Foreign Memory mappings: MMIO, DMA, shmem, zero-copy file pages, ELF-load scratch, spawned-thread stacks, demand-paged or mapped at spawn, and spawned-thread IPC buffers, mapped at spawn |
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo` page and `InitInfo` region, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
@@ -120,13 +120,8 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   call (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)). In a
   demand-paged process the floor is a demand region registered with the
   pager (`REGISTER_REGION`), so it costs VA, and frames only for the
-  pages first touched. A spawned thread's IPC buffer is a heap page, and
-  the kernel's IPC-buffer copies fail on an unbacked page instead of
-  faulting to the pager (a restartable syscall's copy faults to it;
-  [Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)), so
-  `Thread::new` touches that page before the thread registers it.
-  A process with no pager maps the floor eagerly through
-  `REQUEST_MEMORY_CAPS`. The floor's size is a `std::sys::seraph`
+  pages first touched. A process with no pager maps the floor eagerly
+  through `REQUEST_MEMORY_CAPS`. The floor's size is a `std::sys::seraph`
   implementation detail.
 - **Out-of-memory.** The platform `alloc` returns null, the allocation fails
   with `AllocError`, and the `alloc` crate aborts through `handle_alloc_error`
@@ -170,8 +165,13 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   from the zone's window (ASLR,
   [#39](https://github.com/kottlerg/seraph/issues/39)), degrading to the
   window base when the entropy draw fails. Everything placed through the
-  arena — spawned-thread stacks, MMIO, shmem, stdio/pipe rings, ELF scratch —
-  inherits the randomised base.
+  arena — spawned-thread stacks and IPC buffers, MMIO, shmem, stdio/pipe
+  rings, ELF scratch — inherits the randomised base.
+- **Spawned-thread IPC buffers.** A spawned thread's IPC buffer is a
+  one-page Memory grant the runtime maps in the reservation arena, never a
+  pager page, since the kernel's IPC-buffer copies are not restartable and
+  the page must stay mapped
+  ([Fault Handling § Kernel Copies](fault-handling.md#kernel-copies)).
 - **Free runs.** Released ranges coalesce into a sorted run table, which
   each reservation first grows to hold one run more than the live
   reservations (into the byte heap once its static table is full), so a

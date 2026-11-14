@@ -151,7 +151,11 @@ loads behind the branch execute with the out-of-bound value, so every bound betw
 user-supplied handle and the object it names is also enforced as data. The syscall handlers hold
 the same line past resolution: a right a handler tests beyond those its lookup requires, and a
 user-supplied value that selects a kernel array entry, a span of frames, a page-table walk, or a
-dispatch table entry, are enforced as data as well (the table below).
+dispatch table entry, are enforced as data as well (the table below). These bounds are the
+kernel's defence of the user-to-kernel boundary against bounds-check bypass on both
+architectures; the posture on the other transient-execution classes and on isolation between
+processes is [docs/capability-model.md](../../../docs/capability-model.md)
+§ Microarchitectural Isolation.
 
 The primitives are `arch::current::speculation::index_mask` and
 `arch::current::speculation::hide`. `index_mask(index, bound)` is all-ones when `index < bound`,
@@ -189,6 +193,7 @@ input is the index or span, whose value the branch does not fix.
 | `sys_aspace_query` | virtual address | the page-table walk into the kernel half of the root | the address is masked against `user_va_top` through `mask_index_u64`; a failed bound walks address 0 |
 | `sys_mem_map`, `sys_mem_unmap`, `sys_mem_protect`, `sys_mmio_map` | virtual range | the page-table walk of the map, unmap, or protect loop into the kernel half of the root | `mm::user_page_range` returns the checked range clamped to `user_va_top` through `mask_span_u64`, and the loop walks the range it returns; a failed bound gives the empty range at 0 |
 | `sys_thread_read_mem`, `sys_thread_write_mem` | target virtual address and length | the software walk of `copy_user_bytes` into the kernel half of the target's root | `thread_mem_args` clamps the span to `user_va_top` through `mask_span_u64`; a failed bound gives the empty span at 0 |
+| `sys_entropy_contribute` | copy length | the copy's stores of caller-chosen bytes past the 256-byte kernel-stack stage | the length is masked below `MAX_ENTROPY_CONTRIBUTE_LEN + 1` through `mask_index` before the copy; a failed bound gives the empty copy |
 | `sys_thread_set_affinity` | CPU index | the per-CPU scheduler entries `migrate_ready_thread` locks and links on | `set_affinity_locked` masks the CPU against `CPU_COUNT` through `mask_index`; a failed bound selects CPU 0 |
 | `sys_thread_set_priority` | priority level | the run queue the relocate links the thread on | the level is masked below `PRIORITY_MAX + 1` through `mask_index`; a failed bound selects level 0 |
 | `syscall::dispatch` | syscall number | a jump-table entry past the table | a number at or past `SYSCALL_NR_BOUND` (abi/syscall) is refused, and the table reads the number through `mask_index_u64` |
@@ -416,8 +421,12 @@ most `RECORDS_PER_PAGE` records of one Memory object, whose return costs one wal
 page free list (at most one node per page of the object, [docs/limits.md](../../../docs/limits.md)),
 an insertion per run, and the sort of the group and of its records' kept arena pages. The kept
 pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
-body at most. Neither the donation count nor any `init_pages` lengthens the window; the walk's
-total length still grows with the donation count. It runs to completion in whichever context drops
+body at most. Before taking the locks, the return zeroes the group's runs
+([memory-internals.md](memory-internals.md) § Kernel Object Memory), taking the pending interrupts
+after every 16 pages it zeroes, so the zeroing adds at most one 16-page batch of stores to a window.
+Neither the donation count nor any `init_pages` lengthens the window; the walk's
+total length still grows with the donation count and, through the zeroing, with the pages donated,
+the create-time slab's `init_pages` included. It runs to completion in whichever context drops
 the last reference: the deleting syscall, with interrupts masked on that CPU except in the windows;
 or, when the owner is handed to the per-CPU deferred-reclaim stack (a thread deleting an object it
 is itself bound to, a syscall pin or a batched capability move dropping the last reference, or an
@@ -425,9 +434,10 @@ Mmio object's mapping record releasing the address space at that object's teardo
 list is [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next
 syscall epilogue on that CPU, with interrupts masked except in the windows, or the idle thread's
 drain, with interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock
-Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how finely it donated, and
-can land on an unrelated thread's syscall, which is not preempted during it: the same memory
-donated as single pages costs one record per page. The standard runtime's map retry donates one
+Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how much it donated, which
+the zeroing visits once per page, and with how finely, and can land on an unrelated thread's
+syscall, which is not preempted during it: the same memory donated as single pages costs one record
+per page. The standard runtime's map retry donates one
 page per page-table shortfall (its budget top-up donates the shortfall in one call), so a
 process's count is of the order of its page-table page count, one per 2 MiB of mapped span.
 
@@ -506,9 +516,10 @@ alive.
 The cut sorts each donation's kept pages once and walks its span with them in order, so a teardown
 with `r` donation records and `h` kept pages costs `O(r + h log h)`, allocating nothing and on a
 fixed stack (the sort is a bottom-up merge through 64 sorted runs), plus one walk of each record's
-Memory object's page free list, as the return of a donation without kept pages costs ([§
-Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`: at most one
-per such body, and at most the `CSpace`'s arena pages, one per 31 bodies it funded. Each of those
+Memory object's page free list and the zeroing of every page it returns, `O(p)` for `p` donated
+pages, as the return of a donation without kept pages costs ([§ Teardown](#teardown)). `h` counts
+only pages holding a body that outlives the `CSpace`: at most one per such body, and at most the
+`CSpace`'s arena pages, one per 31 bodies it funded. Each of those
 pages returns later, in the call that frees its last chunk, as a one-page `retype_free`.
 
 ---
@@ -616,6 +627,7 @@ pub enum CapTag
     IoPort        = 11,  // x86-64 only; Phase 7 mints one root cap over the full 64K port space
     SchedControl  = 12,  // priority-band authority; carries [min, max], no rights bit
     SbiControl    = 13,  // SBI forwarding authority (RISC-V only)
+    EntropyControl = 14, // authority to contribute bytes to the entropy pool
 }
 ```
 
@@ -651,6 +663,7 @@ WaitSet       MODIFY=0 WAIT=1
 IoPort        USE=0
 SchedControl  (no rights bits: presence + [min, max] band is the authority)
 SbiControl    RESET=0 SUSPEND=1 CPPC=2 BASE=3 DBCN=4 PMU=5
+EntropyControl CONTRIBUTE=0
 ```
 
 Rights are checked at every syscall that uses a capability. The check is a single
@@ -1370,15 +1383,16 @@ specific slot numbers.
 | 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture; Notify and Mint rights) |
 | 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, as many as the map reports, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
 | 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
-| 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
-| 9 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
-| 10 | 9 | Init's own address space capability |
-| 11 | 9 | Reclaimable Memory capabilities for init's ELF segments |
-| 12 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
-| 13 | 9 | Reclaimable Memory capabilities for init's stack pages |
-| 14 | 9 | Init's own thread capability |
-| 15 | 9 | Init's own CSpace capability |
+| 7 | 7 | One EntropyControl capability carrying Contribute |
+| 8 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| 9 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
+| 10 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
+| 11 | 9 | Init's own address space capability |
+| 12 | 9 | Reclaimable Memory capabilities for init's ELF segments |
+| 13 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
+| 14 | 9 | Reclaimable Memory capabilities for init's stack pages |
+| 15 | 9 | Init's own thread capability |
+| 16 | 9 | Init's own CSpace capability |
 
 The kernel passes the slot numbers to init in the `InitInfo` block it maps into
 init's address space (its VA is init's first argument; see
@@ -1387,7 +1401,7 @@ lists each Phase 7 and Phase 8 slot with its type; header fields name the single
 caps and the base and count of several groups, including every Phase 9 group.
 
 The root CSpace is created with one reference, the kernel's hold on it while Phases 7 to 9
-populate it. Init's own CSpace capability (order 15) takes over that reference rather than
+populate it. Init's own CSpace capability (order 16) takes over that reference rather than
 adding one, and init's thread, like every thread, holds none on the CSpace it is bound to,
 so from Phase 9 on the root CSpace is an ordinary CSpace whose count is its capabilities and
 syscall pins: the deletion of its last capability, procmgr's at init's reap, frees it

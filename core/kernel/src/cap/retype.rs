@@ -64,6 +64,18 @@
 //! (`retype_allocate`'s bump bound; `retype_free`'s drain-reset) and
 //! `sys_memory_split`/`sys_memory_merge` mutate `memory.size` under the cap
 //! write lock. Lock order: cap-rwlock outer, allocator spinlock inner.
+//!
+//! ## Freed bytes
+//!
+//! A free returns a dead object's bytes to the region, and a later rollback
+//! or drain reset can leave them at or above the bump cursor, where
+//! `sys_mem_map` lets the cap's holder map them. [`retype_free`] and
+//! [`retype_free_runs`] therefore zero every byte they free before it rejoins
+//! the allocator ([`FreedClear`]), so no dead object's state (a kernel stack,
+//! a TCB, slot or page-table pointers) is ever readable through the cap
+//! (`core/kernel/docs/cross-boundary-disclosure.md` § Kernel state in donated
+//! memory). The only bytes the allocator writes after the clear are its own
+//! free-list words above: region offsets and page counts, no address.
 
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -311,6 +323,104 @@ unsafe fn write_u64_at(phys: u64, offset: u64, value: u64)
     // SAFETY: caller guarantees the address lies in the live, aligned,
     // unaliased test buffer.
     unsafe { core::ptr::write_volatile((phys + offset) as *mut u64, value) };
+}
+
+/// Bytes [`FreedClear`] zeroes between two interrupt windows: 16 pages, about
+/// a microsecond of stores on x86-64 under KVM, so a free of any size masks
+/// interrupts for its clear no longer than a 16-page free does.
+const CLEAR_BATCH_BYTES: u64 = 16 * PAGE_BYTES;
+
+/// Zeroes the bytes a free returns to `memory`'s region, before they rejoin
+/// its allocator (§ Freed bytes in the module documentation). It takes
+/// the interrupts pending on this CPU (`cap::object::interrupt_window`) each
+/// time it has zeroed [`CLEAR_BATCH_BYTES`] since the last window and has more
+/// to zero, so a free of any size keeps interrupts masked for one batch of
+/// stores at a time: a donation group of a dead pool, or a failed create's
+/// `init_pages` slab, is as long as its caller makes it. A free smaller than
+/// one batch opens no window.
+struct FreedClear<'a>
+{
+    memory: &'a MemoryObject,
+    /// Bytes zeroed since the last interrupt window.
+    since_window: u64,
+}
+
+impl<'a> FreedClear<'a>
+{
+    fn new(memory: &'a MemoryObject) -> Self
+    {
+        Self {
+            memory,
+            since_window: 0,
+        }
+    }
+
+    /// Zero `[offset, offset + bytes)` of the region.
+    ///
+    /// # Safety
+    ///
+    /// The range lies inside the region and is the caller's alone: no live
+    /// object, not on a free list, not reachable by any other CPU. No lock is
+    /// held, since an interrupt window may open.
+    unsafe fn clear(&mut self, offset: u64, bytes: u64)
+    {
+        // The range lies inside the region, so neither sum wraps.
+        let end = offset.wrapping_add(bytes);
+        let mut at = offset;
+        while at < end
+        {
+            if self.since_window >= CLEAR_BATCH_BYTES
+            {
+                #[cfg(not(test))]
+                crate::cap::object::interrupt_window();
+                self.since_window = 0;
+            }
+            // `at < end`, and `since_window` stays at or below one batch.
+            let len = end
+                .saturating_sub(at)
+                .min(CLEAR_BATCH_BYTES.saturating_sub(self.since_window));
+            // SAFETY: `[at, at + len)` lies inside the caller's range, which is
+            // the caller's alone (contract).
+            unsafe { zero_at(self.memory.base, at, len) };
+            at = at.wrapping_add(len);
+            self.since_window = self.since_window.wrapping_add(len);
+        }
+    }
+}
+
+/// Zero `len` bytes at `phys + offset` via the kernel direct map.
+///
+/// # Safety
+///
+/// The range lies inside a live Memory cap region and is not concurrently
+/// accessed.
+#[cfg(not(test))]
+unsafe fn zero_at(phys: u64, offset: u64, len: u64)
+{
+    // As in `read_u64_at`.
+    let virt = crate::mm::paging::phys_to_virt(phys.wrapping_add(offset));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "both supported targets are 64-bit, so usize holds any u64"
+    )]
+    let len = len as usize;
+    // SAFETY: caller guarantees the range is in the kernel direct map and not
+    // concurrently accessed.
+    unsafe { core::ptr::write_bytes(virt as *mut u8, 0, len) };
+}
+
+/// Host-test form of `zero_at`; see the host-test `read_u64_at`.
+///
+/// # Safety
+///
+/// The range lies inside the test's live buffer, not aliased by a live
+/// reference.
+#[cfg(test)]
+unsafe fn zero_at(phys: u64, offset: u64, len: u64)
+{
+    // SAFETY: caller guarantees the range lies in the live, unaliased test
+    // buffer.
+    unsafe { core::ptr::write_bytes((phys + offset) as *mut u8, 0, len as usize) };
 }
 
 /// True if `link` is a structurally valid sub-page free-list pointer for a
@@ -955,8 +1065,9 @@ pub fn current_bump(memory: &MemoryObject) -> u64
     memory.allocator.bump_offset.load(Ordering::Acquire)
 }
 
-/// Return `bytes` to `memory`'s region. Pushes the freed slot onto the
-/// matching free list and credits `available_bytes`.
+/// Return `bytes` to `memory`'s region. Zeroes the slot (§ Freed bytes in
+/// the module documentation), pushes it onto the matching free list or rolls
+/// the bump cursor back over it, and credits `available_bytes`.
 ///
 /// # Safety
 ///
@@ -968,7 +1079,9 @@ pub fn current_bump(memory: &MemoryObject) -> u64
 /// the page free list is address-ordered and coalescing, so the runs merge as
 /// one free of the whole would). The slot at `offset` must not contain a live
 /// kernel object — caller has dropped any state, drained wait queues, etc.,
-/// before calling.
+/// before calling — and nothing reads or writes it from then on. The caller
+/// holds no lock: the clear of a slot larger than one batch opens interrupt
+/// windows.
 #[track_caller]
 pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 {
@@ -984,6 +1097,13 @@ pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
         need,
         memory.size
     );
+
+    // Zero the slot while it is still the caller's alone, outside the locks:
+    // once it is on a free list or above the bump cursor, another free's
+    // rollback or drain reset can expose it to a mapping.
+    // SAFETY: the slot lies inside the region, holds no live object, and is
+    // not yet the allocator's; no lock is held (contract).
+    unsafe { FreedClear::new(memory).clear(offset, need) };
 
     // Read-lock the cap for the duration: the drain-reset below compares
     // `prev_avail + need` against `memory.size`, and a concurrent
@@ -1041,21 +1161,32 @@ pub unsafe fn retype_free(memory: &MemoryObject, offset: u64, bytes: u64)
 /// [`retype_free`], the rollback stops at the first page the runs do not
 /// cover, so a block freed before the call stays on the free list.
 ///
-/// `produce` runs under `memory`'s allocator lock and read guard: it takes no
-/// lock and calls no retype function.
+/// `produce` is called twice and hands the same runs both times: first with
+/// no lock held, to zero them (§ Freed bytes in the module documentation),
+/// then under `memory`'s allocator lock and read guard, to free them. It has
+/// no side effect, takes no lock, and calls no retype function.
 ///
 /// # Safety
 ///
 /// Each run meets [`retype_free`]'s contract: a page-aligned run of whole
 /// pages within one page-class allocation of `memory`, each page freed
 /// exactly once and holding no live kernel object. The runs ascend and do not
-/// overlap.
+/// overlap. The caller holds no lock.
 #[track_caller]
-pub unsafe fn retype_free_runs(
-    memory: &MemoryObject,
-    produce: impl FnOnce(&mut dyn FnMut(u64, u64)),
-)
+pub unsafe fn retype_free_runs(memory: &MemoryObject, produce: impl Fn(&mut dyn FnMut(u64, u64)))
 {
+    let mut clear = FreedClear::new(memory);
+    produce(&mut |offset, bytes| {
+        // The full check of each run is the freeing pass's, below; this one
+        // keeps the clear inside the region.
+        debug_assert!(
+            offset.saturating_add(bytes) <= memory.size,
+            "retype_free_runs: run 0x{offset:x}+0x{bytes:x} is out of range"
+        );
+        // SAFETY: each run lies inside the region, holds no live object, and
+        // is not yet the allocator's; no lock is held (contract).
+        unsafe { clear.clear(offset, bytes) };
+    });
     let p = PAGE_BYTES;
     // Read-locked as in retype_free, for the drain reset's size comparison.
     let _memory_guard = crate::cap::object::MemoryReadGuard::acquire(memory);
@@ -1335,7 +1466,7 @@ pub const fn event_queue_dispatch(capacity: u64, observers: u64) -> DispatchEntr
 ///
 /// Returns `None` for object types that cannot be retyped (`Memory` is
 /// retypable; `Mmio`/`Interrupt`/`IoPort`/`SchedControl`/
-/// `SbiControl` are boot-minted only).
+/// `SbiControl`/`EntropyControl` are boot-minted only).
 pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEntry>
 {
     match object_type
@@ -1396,6 +1527,7 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         | ObjectType::IoPort
         | ObjectType::SchedControl
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage => None,
     }
 }
@@ -1451,7 +1583,7 @@ mod tests
     }
 
     /// [`retype_free_runs`] of runs of an allocation a test made.
-    fn free_runs(memory: &MemoryObject, produce: impl FnOnce(&mut dyn FnMut(u64, u64)))
+    fn free_runs(memory: &MemoryObject, produce: impl Fn(&mut dyn FnMut(u64, u64)))
     {
         // SAFETY: as for `free`; the tests hand ascending, disjoint runs.
         unsafe { retype_free_runs(memory, produce) };
@@ -1664,6 +1796,7 @@ mod tests
         assert!(dispatch_for(ObjectType::IoPort, 0).is_none());
         assert!(dispatch_for(ObjectType::SchedControl, 0).is_none());
         assert!(dispatch_for(ObjectType::SbiControl, 0).is_none());
+        assert!(dispatch_for(ObjectType::EntropyControl, 0).is_none());
     }
 
     /// A Memory object over a zeroed host buffer of `pages` pages, every byte
@@ -2099,6 +2232,152 @@ mod tests
             retype_allocate(&memory, p),
             Err(SyscallError::OutOfMemory),
             "the walk stops at the malformed node"
+        );
+    }
+
+    /// Set `[offset, offset + bytes)` of a test region to `byte`, as a live
+    /// object's state would fill it.
+    fn fill(memory: &MemoryObject, offset: u64, bytes: u64, byte: u8)
+    {
+        assert!(offset + bytes <= memory.size);
+        // SAFETY: the range lies inside the test's live buffer (asserted), and
+        // no reference into the buffer is live.
+        unsafe { core::ptr::write_bytes((memory.base + offset) as *mut u8, byte, bytes as usize) };
+    }
+
+    /// The bytes `[offset, offset + bytes)` of a test region.
+    fn bytes_at(memory: &MemoryObject, offset: u64, bytes: u64) -> Vec<u8>
+    {
+        assert!(offset + bytes <= memory.size);
+        // SAFETY: the range lies inside the test's live buffer (asserted), and
+        // nothing writes it while the copy is taken.
+        unsafe { core::slice::from_raw_parts((memory.base + offset) as *const u8, bytes as usize) }
+            .to_vec()
+    }
+
+    fn all_zero(bytes: &[u8]) -> bool
+    {
+        bytes.iter().all(|&b| b == 0)
+    }
+
+    // Defect guarded: a dead object's bytes left as it wrote them, readable
+    // through the Memory cap once the bump cursor rolls back below them
+    // (#1110).
+    #[test]
+    fn a_slot_freed_at_the_frontier_reads_zero_and_its_neighbour_is_kept()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(3);
+        let low = retype_allocate(&memory, p).unwrap();
+        let high = retype_allocate(&memory, 2 * p).unwrap();
+        fill(&memory, low, p, 0x5A);
+        fill(&memory, high, 2 * p, 0xA5);
+        free(&memory, high, 2 * p);
+        assert_eq!(memory.allocator.bump_offset.load(Ordering::Acquire), high);
+        assert!(all_zero(&bytes_at(&memory, high, 2 * p)));
+        assert!(
+            bytes_at(&memory, low, p).iter().all(|&b| b == 0x5A),
+            "the clear stays inside the freed slot"
+        );
+    }
+
+    // Defect guarded: a freed slot parked on a free list keeping the dead
+    // object's bytes, which the drain reset then leaves above the cursor
+    // (#1110). Only the allocator's own link and header words survive.
+    #[test]
+    fn freed_slots_on_the_free_lists_read_zero_but_their_links_through_the_drain()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(4);
+        let a = retype_allocate(&memory, 96).unwrap();
+        let b = retype_allocate(&memory, 96).unwrap();
+        let pages = retype_allocate(&memory, 2 * p).unwrap();
+        let top = retype_allocate(&memory, p).unwrap();
+        fill(&memory, a, BIN_128, 0xA5);
+        fill(&memory, b, BIN_128, 0xA5);
+        fill(&memory, pages, 2 * p, 0xA5);
+        fill(&memory, top, p, 0xA5);
+
+        free(&memory, a, 96);
+        free(&memory, pages, 2 * p);
+        // The sub-page slot keeps its 8-byte link, the page block its 16-byte
+        // header, and nothing else.
+        assert!(all_zero(&bytes_at(&memory, a + 8, BIN_128 - 8)));
+        assert!(all_zero(&bytes_at(&memory, pages + 16, 2 * p - 16)));
+
+        free(&memory, b, 96);
+        free(&memory, top, p);
+        assert_eq!(
+            memory.allocator.bump_offset.load(Ordering::Acquire),
+            0,
+            "the last free drains the region"
+        );
+        let region = bytes_at(&memory, 0, memory.size);
+        assert!(
+            !region.contains(&0xA5),
+            "no byte a dead object wrote survives the drain"
+        );
+    }
+
+    // Defect guarded: the runs of a dead pool's donations returned with the
+    // pool's state in them, or the clear reaching a page the dead `CSpace`
+    // keeps for its surviving bodies (#1110).
+    #[test]
+    fn freed_runs_read_zero_and_a_kept_page_is_untouched()
+    {
+        let p = PAGE_SIZE as u64;
+        let (_buf, memory) = host_region(6);
+        let span = retype_allocate(&memory, 5 * p).unwrap();
+        let _guard = retype_allocate(&memory, p).unwrap();
+        fill(&memory, span, 5 * p, 0xA5);
+        free_runs(&memory, |run| {
+            run(span, p);
+            run(span + 2 * p, 3 * p);
+        });
+        assert!(all_zero(&bytes_at(&memory, span + 16, p - 16)));
+        assert!(all_zero(&bytes_at(&memory, span + 2 * p + 16, 3 * p - 16)));
+        assert!(
+            bytes_at(&memory, span + p, p).iter().all(|&b| b == 0xA5),
+            "the kept page is not cleared"
+        );
+    }
+
+    // Defect guarded: a clear split into interrupt-window batches that skips
+    // a stretch at a batch boundary, within one free or across the runs of
+    // one `retype_free_runs`.
+    #[test]
+    fn frees_longer_than_one_clear_batch_read_zero_whole()
+    {
+        let p = PAGE_SIZE as u64;
+        let batch = CLEAR_BATCH_BYTES / p;
+        let (_buf, memory) = host_region((4 * batch + 4) as usize);
+        let big = retype_allocate(&memory, (2 * batch + 1) * p).unwrap();
+        let span = retype_allocate(&memory, (2 * batch + 2) * p).unwrap();
+        let _guard = retype_allocate(&memory, p).unwrap();
+        fill(&memory, big, (2 * batch + 1) * p, 0xA5);
+        fill(&memory, span, (2 * batch + 2) * p, 0xA5);
+        free(&memory, big, (2 * batch + 1) * p);
+        assert!(all_zero(&bytes_at(
+            &memory,
+            big + 16,
+            (2 * batch + 1) * p - 16
+        )));
+        // Runs of `batch - 1` and `batch + 1` pages around a kept page cross
+        // the batch boundaries at different points.
+        let first = (batch - 1) * p;
+        let second = (batch + 1) * p;
+        free_runs(&memory, |run| {
+            run(span, first);
+            run(span + first + p, second);
+        });
+        let cleared = |from: u64, len: u64| all_zero(&bytes_at(&memory, from + 16, len - 16));
+        assert!(cleared(span, first));
+        assert!(cleared(span + first + p, second));
+        assert!(
+            bytes_at(&memory, span + first, p)
+                .iter()
+                .all(|&b| b == 0xA5),
+            "the page between the runs is not cleared"
         );
     }
 }

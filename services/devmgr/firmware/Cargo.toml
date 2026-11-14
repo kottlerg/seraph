@@ -8,6 +8,9 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The AML encodings and the resource-template decoder the static namespace
+# walk and the `_CRS` adapter are built on (its alloc-free modules only).
+aml = { path = "../../../shared/aml" }
 # `VirtioPciStartupInfo`, filled in by the configuration-space walk.
 virtio-core = { path = "../../drivers/virtio/core" }
 # The decoded driver declaration the match table compares and the class

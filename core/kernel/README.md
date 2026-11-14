@@ -128,7 +128,7 @@ core/kernel/
 │   └── syscall/                # Syscall dispatch
 │       ├── mod.rs              # Dispatch; yield/exit/sleep, IPC-buffer and notification binding
 │       ├── cap.rs              # Capability syscall implementations
-│       ├── entropy.rs          # SYS_GETRANDOM
+│       ├── entropy.rs          # SYS_GETRANDOM, SYS_ENTROPY_CONTRIBUTE
 │       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
 │       ├── ipc.rs              # IPC syscall implementations
 │       ├── mem.rs              # Memory syscall implementations
@@ -198,7 +198,8 @@ The kernel entropy subsystem: a multi-source pool feeding per-CPU forward-secure
 CSPRNGs, with hardware-source health gating, an interrupt-time jitter source, a
 kernel-internal draw API, and a boot-time power-on self-test. Kernel consumers
 call `fill_bytes`; userspace draws from the same generators through
-`SYS_GETRANDOM`. See [`docs/entropy.md`](docs/entropy.md).
+`SYS_GETRANDOM`, and a holder of an `EntropyControl` capability contributes bytes through
+`SYS_ENTROPY_CONTRIBUTE`. See [`docs/entropy.md`](docs/entropy.md).
 
 ### `ipc/`
 
@@ -233,9 +234,7 @@ See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
 it records the accepted residual of the x86-64 descriptor-table registers on a CPU without
-UMIP, and the open residual of a dead kernel object's bytes, which the holder of the Memory
-capability it was retyped from can map
-([#1110](https://github.com/kottlerg/seraph/issues/1110)).
+UMIP.
 
 ---
 

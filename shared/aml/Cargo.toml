@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "aml"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std + alloc pure logic: the ACPI Machine Language encoding helpers, the
+# resource-template decoder, the term parser and the namespace loader.
+# Host-tested over the checked-in QEMU tables (fixtures/); devmgr's firmware
+# crate links the alloc-free encoding and resource modules.
+[lib]
+test = true
+doctest = false
+
+[lints]
+workspace = true

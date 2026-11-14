@@ -27,19 +27,17 @@
 //! A pure runner like `test-terminal`: requires a populated `x86_64` sysroot
 //! with the default boot set (terminal + shell) and a repacked `disk.img`.
 
-use std::io::BufReader;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 
 use crate::arch::Arch;
 use crate::cli::TestVmgenidArgs;
 use crate::context::Context;
 use crate::firmware::find_ovmf_code;
+use crate::guest::Guest;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
     GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, build_qemu_argv,
@@ -83,195 +81,50 @@ const TIMEOUT: Duration = Duration::from_mins(3);
 /// Budget for the migrate-to-file completion poll.
 const MIGRATE_TIMEOUT: Duration = Duration::from_mins(2);
 
-/// One QEMU instance and the thread reading its serial output.
-///
-/// Dropping a `Guest` kills QEMU, reaps it, and joins the reader, so every
-/// exit path of [`run`], an early `?` return included, releases the
-/// process and the raw disk image's write lock it holds; `std::process::Child`
-/// does not kill on drop, and an orphaned QEMU would hold that lock past the
-/// run, blocking the next boot that opens the image. The error paths
-/// therefore return without an explicit shutdown.
-struct Guest
+/// Launch QEMU for one boot of the test with the generation GUID `guid`,
+/// restoring the state at `incoming` when one is given.
+fn launch(
+    qemu_binary: &Path,
+    ctx: &Context,
+    args: &TestVmgenidArgs,
+    sock_path: &Path,
+    guid: &str,
+    incoming: Option<&str>,
+) -> Result<Guest>
 {
-    child: Child,
-    lines: mpsc::Receiver<String>,
-    reader: Option<thread::JoinHandle<()>>,
-}
+    let disk_path = ctx.disk_image();
+    let firmware_code = find_ovmf_code()?;
+    let spec = QemuLaunchSpec {
+        arch: Arch::X86_64,
+        disk_path: &disk_path,
+        disk_block_size: crate::disk::logical_block_size(&disk_path)?,
+        second_disk: None,
+        firmware_code_path: &firmware_code,
+        firmware_vars_path: None,
+        cpus: args.cpus,
+        mem_mib: args.mem,
+        display: QemuDisplay::Headless,
+        gdb: GdbMode::Off,
+        qmp_socket: Some(sock_path),
+        vmgenid_guid: Some(guid),
+        incoming,
+        riscv_mmu: RiscvMmu::Sv48,
+        riscv_zkr: RiscvZkr::On,
+        x86_paging: X86Paging::Four,
+        iommu: Iommu::Attached,
+        debug_port: None,
+        test_devices: false,
+    };
+    let qemu_args = build_qemu_argv(&spec)?;
 
-impl Drop for Guest
-{
-    fn drop(&mut self)
-    {
-        self.teardown();
-    }
-}
-
-impl Guest
-{
-    /// Kill QEMU, reap it, and join the reader thread. Idempotent: a
-    /// second call (the drop after an explicit one) finds the child
-    /// reaped and the reader joined.
-    fn teardown(&mut self)
-    {
-        // Best-effort: both calls fail harmlessly when QEMU has already
-        // exited and been reaped (after `wait_exit`), and a drop has no
-        // caller to report to.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(r) = self.reader.take()
-        {
-            let _ = r.join();
-        }
-    }
-
-    /// Wrap a spawned child whose stdout is piped, starting the thread that
-    /// reads its serial lines.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the child's stdout was not piped; the child is then
-    /// killed and reaped before returning, so it is not orphaned.
-    fn from_child(mut child: Child) -> Result<Self>
-    {
-        let Some(stdout) = child.stdout.take()
-        else
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            bail!("QEMU stdout unavailable");
-        };
-
-        // Read serial on a worker thread so the caller can enforce timeouts
-        // via recv_timeout (std pipes have no read deadline).
-        let (tx, rx) = mpsc::channel::<String>();
-        let reader = thread::spawn(move || {
-            let buf = BufReader::new(stdout);
-            for line in std::io::BufRead::lines(buf)
-            {
-                let Ok(l) = line
-                else
-                {
-                    break;
-                };
-                if tx.send(l).is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        Ok(Self {
-            child,
-            lines: rx,
-            reader: Some(reader),
-        })
-    }
-
-    fn launch(
-        qemu_binary: &Path,
-        ctx: &Context,
-        args: &TestVmgenidArgs,
-        sock_path: &Path,
-        guid: &str,
-        incoming: Option<&str>,
-    ) -> Result<Self>
-    {
-        let disk_path = ctx.disk_image();
-        let firmware_code = find_ovmf_code()?;
-        let spec = QemuLaunchSpec {
-            arch: Arch::X86_64,
-            disk_path: &disk_path,
-            disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-            second_disk: None,
-            firmware_code_path: &firmware_code,
-            firmware_vars_path: None,
-            cpus: args.cpus,
-            mem_mib: args.mem,
-            display: QemuDisplay::Headless,
-            gdb: GdbMode::Off,
-            qmp_socket: Some(sock_path),
-            vmgenid_guid: Some(guid),
-            incoming,
-            riscv_mmu: RiscvMmu::Sv48,
-            riscv_zkr: RiscvZkr::On,
-            x86_paging: X86Paging::Four,
-            iommu: Iommu::Attached,
-            debug_port: None,
-            test_devices: false,
-        };
-        let qemu_args = build_qemu_argv(&spec)?;
-
-        let child = Command::new(qemu_binary)
-            .args(&qemu_args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .context("spawning qemu-system-x86_64")?;
-        Self::from_child(child)
-    }
-
-    /// Echo serial lines until every marker has appeared (in any order) or
-    /// `timeout` passes.
-    fn wait_for_markers(&mut self, markers: &[&str], timeout: Duration) -> Result<()>
-    {
-        let start = Instant::now();
-        let mut pending: Vec<&str> = markers.to_vec();
-        loop
-        {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero()
-            {
-                bail!("timed out waiting for markers: {pending:?}");
-            }
-            let Ok(line) = self.lines.recv_timeout(remaining)
-            else
-            {
-                bail!("serial stream ended waiting for markers: {pending:?}");
-            };
-            println!("{line}");
-            pending.retain(|m| !line.contains(m));
-            if pending.is_empty()
-            {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Kill QEMU and reap it now rather than at the end of scope (the
-    /// teardown is [`Guest::teardown`], which `Drop` runs).
-    fn shutdown(self)
-    {
-        drop(self);
-    }
-
-    /// Wait for the process to exit on its own (post-`quit`). On a timeout
-    /// or a `try_wait` error the process is killed and reaped as `self`
-    /// drops.
-    fn wait_exit(mut self, timeout: Duration) -> Result<()>
-    {
-        let start = Instant::now();
-        loop
-        {
-            if self
-                .child
-                .try_wait()
-                .context("waiting for QEMU exit")?
-                .is_some()
-            {
-                if let Some(r) = self.reader.take()
-                {
-                    let _ = r.join();
-                }
-                return Ok(());
-            }
-            if start.elapsed() >= timeout
-            {
-                bail!("QEMU did not exit within {}s after quit", timeout.as_secs());
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
+    let child = Command::new(qemu_binary)
+        .args(&qemu_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .context("spawning qemu-system-x86_64")?;
+    Guest::from_child(child)
 }
 
 pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
@@ -299,7 +152,7 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
     step("vmgenid test: boot A (source) — waiting for armed + READY markers");
     // Every `?` below drops the live `Guest`, which kills and reaps its QEMU
     // (see `Guest`).
-    let mut guest_a = Guest::launch(&qemu_binary, ctx, args, &sock_a, GUID_A, None)?;
+    let mut guest_a = launch(&qemu_binary, ctx, args, &sock_a, GUID_A, None)?;
     guest_a
         .wait_for_markers(&[ARMED_MARKER, READY_MARKER], TIMEOUT)
         .context("boot A")?;
@@ -312,7 +165,7 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
 
     // ── Boot B: new GUID, restore the state, assert detection ──────────────
     step("vmgenid test: boot B (restore with new GUID) — waiting for detection");
-    let mut guest_b = Guest::launch(&qemu_binary, ctx, args, &sock_b, GUID_B, Some(&incoming))?;
+    let mut guest_b = launch(&qemu_binary, ctx, args, &sock_b, GUID_B, Some(&incoming))?;
     guest_b
         .wait_for_markers(&[CHANGE_MARKER], TIMEOUT)
         .context("generation-change detection after restore")?;
@@ -331,67 +184,4 @@ pub fn run(ctx: &Context, args: &TestVmgenidArgs) -> Result<()>
 
     step("vmgenid snapshot-resume test: PASS (detection + post-resume liveness)");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests
-{
-    use super::*;
-
-    /// A `cat` stand-in for QEMU: it runs until its stdin reaches EOF, and
-    /// the test holds the write end in `child.stdin`. A broken teardown
-    /// therefore cannot leave it on the host: dropping the `Child` closes
-    /// that pipe and `cat` exits. It exits successfully only on that EOF.
-    fn stand_in(stdout: Stdio) -> Child
-    {
-        Command::new("cat")
-            .stdin(Stdio::piped())
-            .stdout(stdout)
-            .spawn()
-            .unwrap()
-    }
-
-    #[test]
-    fn teardown_kills_reaps_and_joins_a_live_guest()
-    {
-        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
-        guest.teardown();
-        // The status comes from the `Child` handle, cached by the reap: no
-        // pid lookup. `None` means the child was not reaped. A success
-        // status means it was never killed and only left on the stdin EOF
-        // that `Child::wait` causes.
-        let status = guest.child.try_wait().unwrap();
-        assert!(status.is_some_and(|s| !s.success()));
-        // A joined reader has returned and dropped its sender.
-        assert!(matches!(
-            guest.lines.try_recv(),
-            Err(mpsc::TryRecvError::Disconnected)
-        ));
-    }
-
-    #[test]
-    fn wait_exit_fails_on_a_live_guest_past_its_deadline()
-    {
-        // The stand-in cannot exit while the test holds its stdin, so the
-        // first poll finds it running and the zero deadline has passed.
-        let guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
-        assert!(guest.wait_exit(Duration::ZERO).is_err());
-    }
-
-    #[test]
-    fn wait_exit_succeeds_once_the_guest_has_exited()
-    {
-        // Reaped through the handle first, so the first poll sees the exit
-        // and no deadline is involved.
-        let mut guest = Guest::from_child(stand_in(Stdio::piped())).unwrap();
-        guest.child.kill().unwrap();
-        guest.child.wait().unwrap();
-        guest.wait_exit(Duration::ZERO).unwrap();
-    }
-
-    #[test]
-    fn from_child_rejects_a_child_without_piped_stdout()
-    {
-        assert!(Guest::from_child(stand_in(Stdio::null())).is_err());
-    }
 }

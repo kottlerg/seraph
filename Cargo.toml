@@ -51,6 +51,7 @@ members = [
     "abi/init-protocol",
     "abi/process-abi",
     "abi/syscall",
+    "shared/aml",
     "shared/ansi",
     "shared/crash-report",
     "shared/crypto",

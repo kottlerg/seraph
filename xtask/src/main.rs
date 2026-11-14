@@ -41,6 +41,7 @@ mod disk;
 mod firmware;
 mod fs_compat;
 mod gh;
+mod guest;
 mod host_lock;
 mod qemu;
 mod qmp;
@@ -105,6 +106,7 @@ fn main()
         CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
+        CliCommand::CaptureAcpi(args) => commands::capture_acpi::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),
         CliCommand::PrCheck(args) => commands::pr_check::run_pr_check(&ctx, args),

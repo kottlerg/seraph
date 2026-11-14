@@ -34,7 +34,8 @@ services/svctest/
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding;
         │                      # object-slab release; deferred reclaim; identity;
         │                      # physical base withheld; frames zeroed at hand-out
-        ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
+        ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,
+        │                      # spawned IPC buffers in the arena; stack note
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
@@ -54,7 +55,7 @@ services/svctest/
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
         │                      #   refused access; page-table drain; teardown; fault cost;
-        │                      #   faults on a fragmented pool
+        │                      #   faults on a fragmented pool; a sparse large region
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd

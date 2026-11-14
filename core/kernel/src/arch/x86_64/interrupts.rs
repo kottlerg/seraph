@@ -575,7 +575,7 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
     }
 }
 
-/// Send an NMI (vector 2) to a target CPU. Used by the synchronous-IPI watchdog's Phase C
+/// Send an NMI (vector 2) to a target CPU. Used by [`request_nmi_backtrace`]
 /// (core/kernel/docs/scheduling-internals.md § IPI Watchdog Ladder and
 /// § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`).
 ///
@@ -588,6 +588,70 @@ pub unsafe fn send_nmi_to(target_apic_id: u32)
     unsafe {
         apic_send_icr(target_apic_id, ICR_NMI);
     }
+}
+
+// ── NMI backtraces ────────────────────────────────────────────────────────────
+
+/// Number of NMI backtraces any CPU has finished printing: `idt::ipi_nmi_backtrace_handler`
+/// increments it after its last line, and [`dump_remote_frame`] waits for it to move. The
+/// count protocol is specified in core/kernel/docs/scheduling-internals.md
+/// § `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`.
+#[cfg(not(test))]
+pub static NMI_BACKTRACES_PRINTED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Wall-clock budget, in microseconds, for a CPU sent an NMI backtrace request to finish
+/// printing its frame ([`dump_remote_frame`]). The NMI is taken at once whatever the target's
+/// interrupt state, and the frame is five lines of serial output, so the budget only bounds
+/// the wait for a CPU that no NMI reaches: a tuning value that bounds no capacity.
+#[cfg(not(test))]
+const REMOTE_FRAME_BUDGET_US: u64 = 1_000_000;
+
+/// Ask CPU `cpu` to print its interrupted frame: add one to its NMI-backtrace request count
+/// and send it an NMI. Returns false, sending nothing, when `cpu` is past the boot CPUs or the
+/// request slab is not yet allocated. The senders are the synchronous-IPI watchdog's Phase C
+/// ([`wait_for_ack`]) and [`dump_remote_frame`].
+#[cfg(not(test))]
+pub fn request_nmi_backtrace(cpu: usize) -> bool
+{
+    let Some(pending) = nmi_backtrace_request(cpu)
+    else
+    {
+        return false;
+    };
+    pending.fetch_add(1, core::sync::atomic::Ordering::Release);
+    // SAFETY: `cpu` is below CPU_COUNT (`nmi_backtrace_request` checked it), and the APIC id
+    // slab is read-only after boot.
+    let apic_id = unsafe { crate::percpu::apic_id_for(cpu) };
+    // SAFETY: apic_id is the hardware LAPIC id of a boot CPU.
+    unsafe {
+        send_nmi_to(apic_id);
+    }
+    true
+}
+
+/// Have CPU `cpu`, which the softlockup watchdog's heartbeat checks found silent, print its
+/// own interrupted frame through an NMI ([`request_nmi_backtrace`]), and wait up to
+/// [`REMOTE_FRAME_BUDGET_US`] for a backtrace to finish printing, so the caller's report does
+/// not interleave with it. Returns whether one finished within the budget. Another sender's
+/// backtrace finishing in the window also ends the wait; the frame lines name their CPU.
+///
+/// The NMI handler's output does not wait for the console lock (`console::nmi_write_fmt`
+/// takes it by swap), so this wait, before the caller prints anything, is what keeps the
+/// two apart.
+#[cfg(not(test))]
+pub fn dump_remote_frame(cpu: usize) -> bool
+{
+    let before = NMI_BACKTRACES_PRINTED.load(core::sync::atomic::Ordering::Acquire);
+    if !request_nmi_backtrace(cpu)
+    {
+        return false;
+    }
+    crate::bounded_wait::spin_until(
+        || NMI_BACKTRACES_PRINTED.load(core::sync::atomic::Ordering::Acquire) != before,
+        super::timer::elapsed_us,
+        REMOTE_FRAME_BUDGET_US,
+    )
 }
 
 // ── Synchronous-IPI watchdog ──────────────────────────────────────────────────
@@ -637,17 +701,7 @@ pub unsafe fn wait_for_ack(mut cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>)
         }
         if !nmi_sent && elapsed_ms >= 750
         {
-            if let Some(pending) = nmi_backtrace_request(ctx.target_cpu)
-            {
-                pending.fetch_add(1, core::sync::atomic::Ordering::Release);
-                // SAFETY: target_cpu is an online CPU index; apic_id_for is
-                // read-only after init.
-                let apic_id = unsafe { crate::percpu::apic_id_for(ctx.target_cpu) };
-                // SAFETY: apic_id is a valid hardware LAPIC ID for an online CPU.
-                unsafe {
-                    send_nmi_to(apic_id);
-                }
-            }
+            request_nmi_backtrace(ctx.target_cpu);
             nmi_sent = true;
         }
         if !resent && elapsed_ms >= 250

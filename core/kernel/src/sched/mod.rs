@@ -1264,7 +1264,9 @@ fn owed_wake_scan()
 
 /// BSP side of the heartbeat cross-check: report an AP whose `timer_tick`
 /// heartbeat has gone silent past the grace window. An AP wedged with
-/// interrupts off cannot run its own detectors; this names it from the BSP.
+/// interrupts off cannot run its own detectors; this names it from the BSP,
+/// after having it print its own frame where the architecture can
+/// (`arch::current::interrupts::dump_remote_frame`).
 #[cfg(not(test))]
 fn ap_silence_check(cpu_count: usize)
 {
@@ -1294,11 +1296,14 @@ fn ap_silence_check(cpu_count: usize)
             .load(core::sync::atomic::Ordering::Relaxed);
         if hb != 0 && now_tick > hb.saturating_add(stall) && watchdog_claim_dump()
         {
+            // The silent CPU's own frame first, before this CPU prints.
+            let frame = crate::arch::current::interrupts::dump_remote_frame(cpu);
             crate::kprintln!(
-                "watchdog: cpu{} timer heartbeat stalled (last={} now={})",
+                "watchdog: cpu{} timer heartbeat stalled (last={} now={} own_frame={})",
                 cpu,
                 hb,
-                now_tick
+                now_tick,
+                frame
             );
             watchdog_dump("AP timer heartbeat stalled");
             return;
@@ -1310,7 +1315,8 @@ fn ap_silence_check(cpu_count: usize)
 /// non-BSP CPU: if the BSP's heartbeat is silent past the grace window, dump
 /// from here. A wedged BSP kills both the sleep-list waker and every
 /// BSP-hosted detector at once — total silence — so this is the only
-/// detector that can name that state (#375).
+/// detector that can name that state (#375). As in `ap_silence_check`, the
+/// silent CPU prints its own frame first where the architecture can.
 #[cfg(not(test))]
 fn bsp_stall_check(own_heartbeat: u64)
 {
@@ -1337,12 +1343,15 @@ fn bsp_stall_check(own_heartbeat: u64)
     }
     if watchdog_claim_dump()
     {
+        // The BSP's own frame first, before this CPU prints.
+        let frame = crate::arch::current::interrupts::dump_remote_frame(0);
         let cpu = crate::arch::current::cpu::current_cpu();
         crate::kprintln!(
-            "watchdog: cpu{} observes BSP heartbeat stalled (bsp={} now={})",
+            "watchdog: cpu{} observes BSP heartbeat stalled (bsp={} now={} own_frame={})",
             cpu,
             hb0,
-            own_heartbeat
+            own_heartbeat,
+            frame
         );
         watchdog_dump("BSP timer heartbeat stalled — sleep wakeups and BSP detectors dead");
     }

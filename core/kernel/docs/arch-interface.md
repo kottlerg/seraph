@@ -599,6 +599,12 @@ pub unsafe fn send_wakeup_ipi(target_hw_id: u32);
 /// a logged warning on RISC-V → `crate::fatal`) per
 /// the timing ladder described by `ctx`. Used by the shootdown initiator's wait.
 pub unsafe fn wait_for_ack(cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>);
+
+/// Have logical CPU `cpu`, which the softlockup watchdog's heartbeat checks found silent,
+/// print its own interrupted frame, and wait a bounded time for it; returns whether a frame
+/// was printed. x86-64 sends it an NMI backtrace request; RISC-V returns false (no S-mode
+/// NMI).
+pub fn dump_remote_frame(cpu: usize) -> bool;
 ```
 
 The `wait_for_ack` phases and their windows are specified in

@@ -84,7 +84,28 @@
 //! receive met a refused rebind; the kernel's debug assertions are the
 //! tripwire for a binding that outlives the endpoint, and the cell requires
 //! that the race armed (an action landed on a caller inside a call) and that
-//! some server receive was parked on the endpoint when it was deleted.
+//! at least [`MIN_PARKED`] server receives were parked on the endpoint when
+//! it was deleted.
+//!
+//! ## What the host must give
+//!
+//! In a served-call phase's [`CYCLES`] fixed rounds a server receive is
+//! parked when the endpoint is deleted only if CPU 3 runs at once with
+//! CPU 0: the controller deletes within a few microseconds of arming the
+//! server. A host that runs fewer of the guest's CPUs at a time than the
+//! guest has (one 4-CPU guest on two cores, or the burn-in's two on four)
+//! does so in few rounds or none. So, after the fixed rounds, while the
+//! phase has fewer than [`MIN_PARKED`] parked receives, it runs held rounds,
+//! up to [`MAX_EXTRA_ROUNDS`] of them: the controller arms the racer and the
+//! server as in a fixed round, then waits, polling in 1 ms sleeps that leave
+//! its host core to the others and bounded by [`ACK_WAIT_US`], for the server
+//! to publish that it is entering its receive ([`SERVER_ENTERED`]), sleeps
+//! [`HOLD_MS`] more so the receive parks, and deletes the endpoint. The
+//! racer's action lands during the hold, on a caller the server is serving or
+//! about to dequeue. The host must run the server from its publish into its
+//! park within the hold in [`MIN_PARKED`] of the held rounds, not run CPUs at
+//! once throughout; a delete that no longer meets a parked receive leaves
+//! the count below the floor after every held round and fails.
 //!
 //! Required, per phase: every wait returned `Interrupted` or
 //! `InvalidCapability` (nothing is ever delivered); every racer action returned
@@ -101,7 +122,9 @@
 //! freed source, so the cell's checks are that the kernel survives and that the
 //! race armed. A served-call wait may also return the server's reply (tallied
 //! as served, never required), and in the served-call stop phase, with no
-//! restart, no `Interrupted` is required.
+//! restart, no `Interrupted` is required. A served-call phase also requires
+//! [`MIN_PARKED`] server receives parked on a deleted endpoint, its held
+//! rounds included, and logs the held rounds it ran.
 //!
 //! Needs **≥ 3 CPUs**; the served-call phases need a fourth (for the server)
 //! and are skipped below it.
@@ -123,8 +146,21 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::stop_source_delete";
 
-/// Rounds per phase; each creates and deletes one source and one waiter.
+/// Fixed rounds per phase; each creates and deletes one source and one
+/// waiter.
 const CYCLES: u32 = 200;
+
+/// Server receives a served-call phase requires parked on the endpoint when
+/// it was deleted.
+const MIN_PARKED: u32 = 4;
+
+/// Bound on the held rounds a served-call phase runs after its fixed rounds
+/// while it has fewer than [`MIN_PARKED`] parked receives.
+const MAX_EXTRA_ROUNDS: u32 = 1000;
+
+/// A held round's sleep, in milliseconds, between the server's publish that
+/// it is entering its receive and the endpoint's delete.
+const HOLD_MS: u64 = 1;
 
 /// CPUs needed: one each for the controller, the waiter, and the racer.
 const MIN_CPUS: u64 = 3;
@@ -213,6 +249,9 @@ static SERVED: AtomicU32 = AtomicU32::new(0);
 static SERVER_ARMED: AtomicU32 = AtomicU32::new(0);
 static SERVER_DONE: AtomicU32 = AtomicU32::new(0);
 static SERVER_EXITED: AtomicU32 = AtomicU32::new(0);
+/// Served-call phases: server → controller, the round whose first receive
+/// the server is entering, stored just before it.
+static SERVER_ENTERED: AtomicU32 = AtomicU32::new(0);
 /// Served-call phases: receives that ended in `Interrupted` (parked on the
 /// endpoint when it was deleted).
 static SERVER_INTERRUPTED: AtomicU32 = AtomicU32::new(0);
@@ -351,6 +390,8 @@ struct Seen
     /// that were parked on the endpoint when it was deleted.
     served: u32,
     server_interrupted: u32,
+    /// Served-call phases: held rounds run after the fixed rounds.
+    extra_rounds: u32,
 }
 
 pub fn run(ctx: &TestContext) -> TestResult
@@ -464,6 +505,7 @@ fn log_seen(seen: &Seen)
         (" gone=", seen.gone),
         (" served=", seen.served),
         (" server_interrupted=", seen.server_interrupted),
+        (" extra_rounds=", seen.extra_rounds),
     ]
     {
         log_cell_u64(CELL, label, u64::from(value));
@@ -473,7 +515,7 @@ fn log_seen(seen: &Seen)
 /// Check a phase's tallies: nothing failed, and the race armed (a stop or a
 /// Thread delete landed on a waiter inside a wait; a stop phase's restarted
 /// waiters saw `Interrupted`; a served-call phase's server was parked on the
-/// endpoint at some delete).
+/// endpoint at [`MIN_PARKED`] deletes).
 fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
 {
     BAD_WAITS.check(
@@ -507,10 +549,10 @@ fn check(seen: &Seen, kind: Kind, race: Race) -> TestResult
             }
         }
     }
-    if kind == Kind::CallServed && seen.server_interrupted == 0
+    if kind == Kind::CallServed && seen.server_interrupted < MIN_PARKED
     {
         return Err(
-            "stress::stop_source_delete: no server receive was parked on a deleted endpoint",
+            "stress::stop_source_delete: too few server receives were parked on a deleted endpoint",
         );
     }
     Ok(())
@@ -533,6 +575,7 @@ fn phase(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str
         &SERVER_ARMED,
         &SERVER_DONE,
         &SERVER_EXITED,
+        &SERVER_ENTERED,
         &SERVER_INTERRUPTED,
     ]
     {
@@ -630,30 +673,61 @@ fn finish_racer() -> TestResult
     }
 }
 
-/// Run the phase's rounds, stopping at the first that fails. Returns the
-/// controller-side tallies.
+/// Run the phase's [`CYCLES`] fixed rounds and then, in a served-call phase
+/// with fewer than [`MIN_PARKED`] parked server receives, held rounds until
+/// it has them or has run [`MAX_EXTRA_ROUNDS`], stopping at the first round
+/// that fails. Returns the controller-side tallies.
 fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static str>
 {
     let mut seen = Seen::default();
     for cycle in 0..CYCLES
     {
-        let mut parts = RoundParts::default();
-        let result = round(ctx, kind, race, cycle, &mut parts, &mut seen);
-        let released = release_round(&parts);
-        result?;
-        released?;
+        run_round(ctx, kind, race, cycle, false, &mut seen)?;
+    }
+    if kind != Kind::CallServed
+    {
+        return Ok(seen);
+    }
+    // The server's count is stable here: each round waited for its
+    // `SERVER_DONE`, which the server stores after the count.
+    while SERVER_INTERRUPTED.load(Ordering::Acquire) < MIN_PARKED
+        && seen.extra_rounds < MAX_EXTRA_ROUNDS
+    {
+        let cycle = CYCLES.saturating_add(seen.extra_rounds);
+        run_round(ctx, kind, race, cycle, true, &mut seen)?;
+        seen.extra_rounds = seen.extra_rounds.saturating_add(1);
     }
     Ok(seen)
 }
 
+/// Run round `cycle` ([`round`]) and delete what remains of it.
+fn run_round(
+    ctx: &TestContext,
+    kind: Kind,
+    race: Race,
+    cycle: u32,
+    held: bool,
+    seen: &mut Seen,
+) -> TestResult
+{
+    let mut parts = RoundParts::default();
+    let result = round(ctx, kind, race, cycle, held, &mut parts, seen);
+    let released = release_round(&parts);
+    result?;
+    released
+}
+
 /// One round: create the source and a waiter on it, race the racer's action
 /// against the source's last-capability delete, and settle the waiter
-/// (restart it and wait for its exit after a stop).
+/// (restart it and wait for its exit after a stop). A `held` round (served
+/// call only) deletes the endpoint only once the server has published its
+/// entry into its receive and [`HOLD_MS`] more have passed.
 fn round(
     ctx: &TestContext,
     kind: Kind,
     race: Race,
     cycle: u32,
+    held: bool,
     parts: &mut RoundParts,
     seen: &mut Seen,
 ) -> TestResult
@@ -676,18 +750,44 @@ fn round(
     {
         SERVER_ARMED.store(cycle.saturating_add(1), Ordering::Release);
     }
-    // 0 to 1023 spins of the controller's own, against the racer's 0 to
-    // 1023 (a different hash), so the delete and the action land in both
-    // orders.
-    for _ in 0..((cycle ^ 0x5A5A).wrapping_mul(2_246_822_519) >> 22)
+    if held
     {
-        core::hint::spin_loop();
+        hold_for_server(cycle)?;
+    }
+    else
+    {
+        // 0 to 1023 spins of the controller's own, against the racer's 0 to
+        // 1023 (a different hash), so the delete and the action land in both
+        // orders.
+        for _ in 0..((cycle ^ 0x5A5A).wrapping_mul(2_246_822_519) >> 22)
+        {
+            core::hint::spin_loop();
+        }
     }
     let deleted = cap_delete(source);
     // The source's capability is gone whatever the delete returned.
     parts.source = None;
     deleted.map_err(|_| "stress::stop_source_delete: delete of the source failed")?;
     settle_round(kind, race, cycle, entered_before, done_before, parts, seen)
+}
+
+/// A held round's wait before the endpoint's delete: poll in 1 ms sleeps,
+/// which leave CPU 0's host core to the other CPUs, until the server
+/// publishes that it is entering round `cycle`'s receive (bounded by
+/// [`ACK_WAIT_US`]), then sleep [`HOLD_MS`] so the receive parks.
+fn hold_for_server(cycle: u32) -> TestResult
+{
+    let round = cycle.saturating_add(1);
+    let start = elapsed_us()?;
+    while SERVER_ENTERED.load(Ordering::Acquire) != round
+    {
+        if elapsed_us()?.saturating_sub(start) > crate::scaled_bound(ACK_WAIT_US)
+        {
+            return Err("stress::stop_source_delete: the server did not reach its receive");
+        }
+        let _ = thread_sleep(1);
+    }
+    thread_sleep(HOLD_MS).map_err(|_| "stress::stop_source_delete: hold sleep failed")
 }
 
 /// Create and start the round's waiter, and wait (bounded) for it to enter
@@ -1135,8 +1235,9 @@ extern "C" fn racer_entry(arg: u64) -> !
 }
 
 /// Served-call server: until told to quit, for each round it is armed for,
-/// spin a varying delay (a different hash from the racer's), then receive on
-/// the round's endpoint, replying at once to each caller it receives, until a
+/// spin a varying delay (a different hash from the racer's), publish that it
+/// is entering its receive ([`SERVER_ENTERED`]), then receive on the round's
+/// endpoint, replying at once to each caller it receives, until a
 /// receive meets the deleted endpoint (`Interrupted` if it was parked when the
 /// teardown drained it, `InvalidCapability` if the handle was gone at entry);
 /// then acknowledge the round. Any other result is recorded as unaccepted.
@@ -1169,6 +1270,8 @@ extern "C" fn server_entry(_arg: u64) -> !
         {
             core::hint::spin_loop();
         }
+        // A held round's controller deletes the endpoint only after this.
+        SERVER_ENTERED.store(armed, Ordering::Release);
         loop
         {
             // SAFETY: buf is this thread's registered IPC buffer.

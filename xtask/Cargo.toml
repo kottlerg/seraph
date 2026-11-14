@@ -25,18 +25,10 @@ fatfs = "0.3"
 uuid = "1"
 # Regex matching for run-parallel pass/fail classification.
 regex = "1"
-# Portable SIGINT / Ctrl+C handler. Wraps signal(2) on Unix and
-# SetConsoleCtrlHandler on Windows behind a single set_handler call.
-ctrlc = "3"
 # Unix termios / ioctl bindings for TerminalGuard. Used unconditionally
 # because libc compiles cleanly on every platform xtask runs on, with
 # unused Unix-only items naturally elided on Windows builds.
 libc = "0.2"
-# Portable PATH-lookup. Used to resolve qemu-system-* and llvm-objcopy
-# up-front so missing tools produce a clear error naming the tool and
-# pointing at the install package, rather than the OS's opaque
-# "No such file or directory" from Command::spawn.
-which = "8"
 # `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
 # GitHub CLI answers in JSON, and the review's run records are JSON files.
 serde_json = "1"

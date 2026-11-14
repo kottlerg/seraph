@@ -6,8 +6,9 @@
 //! Shared utilities: step printing, command execution, and tool
 //! discovery. (The terminal-state RAII guard moved to `term::guard`.)
 
+use std::ffi::OsStr;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -78,12 +79,79 @@ pub const CI_CARGO_ENV: [(&str, &str); 1] = [("CARGO_INCREMENTAL", "0")];
 /// directory" from `Command::spawn`.
 pub fn require_tool(name: &str) -> Result<PathBuf>
 {
-    which::which(name).map_err(|err| {
+    let path = std::env::var_os("PATH");
+    find_executable(
+        Path::new(name),
+        path.as_deref(),
+        std::env::consts::EXE_EXTENSION,
+    )
+    .ok_or_else(|| {
         anyhow::anyhow!(
-            "{name} not found on PATH ({err})\n{hint}",
+            "{name} not found on PATH\n{hint}",
             hint = install_hint_for(name),
         )
     })
+}
+
+/// The executable file `name` names, found as the host's process launcher
+/// finds it, or `None` when there is none.
+///
+/// A name with a directory part (`./gdb`, `/usr/bin/gdb`) names that file,
+/// returned absolute so a command run from another directory still finds it.
+/// A bare name is looked up in each directory of `path` (a `PATH` value) in
+/// order; an empty entry is skipped, not read as the current directory.
+/// `extension` is the host's executable extension
+/// (`std::env::consts::EXE_EXTENSION`: `exe` on Windows, empty elsewhere),
+/// which a name without it takes, as `Command` gives it. A match is a regular
+/// file (after symlinks) that, on Unix, has an execute permission bit set.
+fn find_executable(name: &Path, path: Option<&OsStr>, extension: &str) -> Option<PathBuf>
+{
+    let file = with_extension(name, extension);
+    if name.components().count() > 1
+    {
+        return is_executable(&file)
+            .then(|| std::path::absolute(&file).ok())
+            .flatten();
+    }
+    std::env::split_paths(path?)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .map(|dir| dir.join(&file))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// `name` with `.extension` appended, unless `extension` is empty or `name`
+/// already ends in it (compared ASCII-case-insensitively, as Windows names
+/// compare).
+fn with_extension(name: &Path, extension: &str) -> PathBuf
+{
+    let has_it = name
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(extension));
+    if extension.is_empty() || has_it
+    {
+        return name.to_path_buf();
+    }
+    let mut file = name.as_os_str().to_owned();
+    file.push(".");
+    file.push(extension);
+    PathBuf::from(file)
+}
+
+/// Whether `path` is a regular file with an execute permission bit set.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool
+{
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+/// Whether `path` is a regular file: a host without Unix permission bits
+/// marks an executable by its extension, which the lookup appends.
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool
+{
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
 fn install_hint_for(name: &str) -> String
@@ -210,5 +278,150 @@ mod tests
             assert_ne!(picked, held_port);
         }
         drop(held);
+    }
+
+    /// A fresh directory under the host's temporary directory, unique to
+    /// this process and call.
+    fn scratch_dir(tag: &str) -> PathBuf
+    {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "seraph-xtask-util-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a file at `path` with Unix permission bits `mode`.
+    #[cfg(unix)]
+    fn file_with_mode(path: &Path, mode: u32)
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    fn path_of(dirs: &[&Path]) -> std::ffi::OsString
+    {
+        std::env::join_paths(dirs).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_name_is_the_first_executable_file_on_path()
+    {
+        let root = scratch_dir("first");
+        let (plain, subdir, exec, later) = (
+            root.join("a"),
+            root.join("b"),
+            root.join("c"),
+            root.join("d"),
+        );
+        for dir in [&plain, &subdir, &exec, &later]
+        {
+            std::fs::create_dir(dir).unwrap();
+        }
+        // Skipped: a file without an execute bit, and a directory.
+        file_with_mode(&plain.join("tool"), 0o644);
+        std::fs::create_dir(subdir.join("tool")).unwrap();
+        // Found: the first executable file, not a later one.
+        file_with_mode(&exec.join("tool"), 0o755);
+        file_with_mode(&later.join("tool"), 0o755);
+        let path = path_of(&[&plain, &subdir, &exec, &later]);
+        assert_eq!(
+            find_executable(Path::new("tool"), Some(&path), ""),
+            Some(exec.join("tool"))
+        );
+        // An execute bit for others alone is still an execute bit.
+        file_with_mode(&plain.join("tool"), 0o601);
+        assert_eq!(
+            find_executable(Path::new("tool"), Some(&path), ""),
+            Some(plain.join("tool"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_path_entry_is_skipped()
+    {
+        let root = scratch_dir("empty");
+        file_with_mode(&root.join("tool"), 0o755);
+        let mut path = std::ffi::OsString::from(":");
+        path.push(root.as_os_str());
+        assert_eq!(
+            find_executable(Path::new("tool"), Some(&path), ""),
+            Some(root.join("tool"))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_tool_or_path_finds_nothing()
+    {
+        let root = scratch_dir("missing");
+        let path = path_of(&[&root]);
+        assert_eq!(find_executable(Path::new("tool"), Some(&path), ""), None);
+        assert_eq!(find_executable(Path::new("tool"), None, ""), None);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_with_a_directory_part_is_that_file_made_absolute()
+    {
+        let root = scratch_dir("dirpart");
+        file_with_mode(&root.join("tool"), 0o755);
+        file_with_mode(&root.join("data"), 0o644);
+        // PATH is not searched for such a name.
+        let empty = scratch_dir("dirpart-path");
+        let path = path_of(&[&empty]);
+        let absolute = root.join("tool");
+        assert_eq!(
+            find_executable(&absolute, Some(&path), ""),
+            Some(absolute.clone())
+        );
+        assert_eq!(find_executable(&root.join("data"), Some(&path), ""), None);
+        // A relative one resolves against the current directory.
+        let relative = Path::new(".").join("seraph-xtask-util-no-such-tool");
+        assert_eq!(find_executable(&relative, Some(&path), ""), None);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_dir_all(&empty).unwrap();
+    }
+
+    #[test]
+    fn the_host_extension_is_appended_unless_present()
+    {
+        assert_eq!(
+            with_extension(Path::new("qemu-system-x86_64"), ""),
+            Path::new("qemu-system-x86_64")
+        );
+        assert_eq!(
+            with_extension(Path::new("qemu-system-x86_64"), "exe"),
+            Path::new("qemu-system-x86_64.exe")
+        );
+        assert_eq!(
+            with_extension(Path::new("gdb.EXE"), "exe"),
+            Path::new("gdb.EXE")
+        );
+        assert_eq!(
+            with_extension(Path::new("gdb.bat"), "exe"),
+            Path::new("gdb.bat.exe")
+        );
+    }
+
+    #[test]
+    fn a_missing_tool_is_named_with_its_install_hint()
+    {
+        let err = require_tool("seraph-xtask-no-such-tool").unwrap_err();
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("seraph-xtask-no-such-tool not found on PATH"),
+            "{text}"
+        );
+        assert!(text.contains("Install seraph-xtask-no-such-tool"), "{text}");
     }
 }

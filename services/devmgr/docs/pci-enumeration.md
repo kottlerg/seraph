@@ -247,7 +247,10 @@ For each matched device, devmgr:
    pass, once `SET_DRIVERS_DIR` delivers the drivers directory), a DMA
    declaration's with `CREATE_PINNED` and `CREATE_DMA_HOLD`, so procmgr
    holds the driver's memory after its death until devmgr releases it, at
-   the priority of its declared tier as its source allows.
+   the priority of its declared tier as its source allows. A devmgr logging
+   at any level but info passes its own level as the driver's one env entry
+   (`SERAPH_LOG`, with `CREATE_ARGV_ENV`), so a driver logs at devmgr's level
+   ([init bootstrap](../../init/docs/bootstrap.md) § Log levels).
 6. Starts the driver (`START_PROCESS`). A driver whose bootstrap fails after
    this step is withdrawn from its device as a live driver.
 7. Serves the driver's bootstrap as the resource list of

@@ -2242,6 +2242,16 @@ pub fn sys_thread_set_priority(tf: UserFrame) -> Result<u64, SyscallError>
     {
         return Err(SyscallError::InvalidArgument);
     }
+    // Every later use, the run-queue level index among them, reads the level
+    // clamped as data, so a path past a mispredicted refusal links level 0,
+    // never a queue past the array (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening). The clamped level is at most
+    // `PRIORITY_MAX`, so the narrowing cannot fail.
+    let priority = u8::try_from(crate::arch::nospec::mask_index(
+        usize::from(priority),
+        usize::from(PRIORITY_MAX).saturating_add(1),
+    ))
+    .unwrap_or(0);
 
     // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
     let caller_tcb = unsafe { current_tcb() };
@@ -2605,8 +2615,19 @@ unsafe fn set_affinity_locked(
 
     // No active migration when affinity is cleared (any-CPU): the load
     // balancer or the next enqueue will place the thread.
-    let new_cpu = cpu_id as usize;
-    if cpu_id == AFFINITY_ANY || new_cpu == old_cpu
+    if cpu_id == AFFINITY_ANY
+    {
+        return None;
+    }
+
+    // The caller refused a `cpu_id` at or past `CPU_COUNT`. The per-CPU
+    // scheduler accesses below read the CPU clamped as data, so a path past a
+    // mispredicted refusal indexes CPU 0, never past the scheduler slab
+    // (core/kernel/docs/capability-internals.md § Speculative-Execution
+    // Hardening).
+    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
+    let new_cpu = crate::arch::nospec::mask_index(cpu_id as usize, cpu_count);
+    if new_cpu == old_cpu
     {
         return None;
     }
@@ -2615,7 +2636,6 @@ unsafe fn set_affinity_locked(
     // enqueue_and_wake, enqueue_ready_thread, schedule(), and the relocate /
     // migrate paths). A value >= CPU_COUNT indicates a corrupted TCB, which we
     // ignore here.
-    let cpu_count = crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed) as usize;
     if old_cpu >= cpu_count
     {
         return None;
@@ -2762,6 +2782,14 @@ fn thread_mem_args(tf: UserFrame) -> Result<(u64, u64, usize), SyscallError>
     {
         return Err(SyscallError::InvalidAddress);
     }
+    // The target span is clamped to the user half as data: `copy_user_bytes`
+    // walks the target's page tables at `va` in software, so on a path past a
+    // mispredicted refusal it walks the empty span at 0, never the kernel half
+    // of the root (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening). Architecturally the span is
+    // unchanged.
+    let (va, span) = crate::arch::nospec::mask_span_u64(va, len as u64, crate::mm::user_va_top());
+    let len = usize::try_from(span).unwrap_or(0);
     Ok((va, buf, len))
 }
 

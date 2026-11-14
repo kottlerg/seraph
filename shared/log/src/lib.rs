@@ -16,15 +16,15 @@
 //!   cap. Std's `_start` installs the cap procmgr seeded in
 //!   `ProcessInfo.log_send_cap`. No discovery roundtrip — the cap is
 //!   live from the first user instruction.
-//! * **Process-global level filter ([`set_max_level`], [`enabled`]):**
-//!   the most verbose level [`emit`] sends, which std's `_start` sets
-//!   from the process's `SERAPH_LOG` environment entry
-//!   (`services/logd/docs/ipc-interface.md` § Levels).
+//! * **Process-global level filter ([`set_max_level`], [`enabled`],
+//!   [`max_level`]):** the most verbose level [`emit`] sends, which std's
+//!   `_start` sets from the process's `SERAPH_LOG` environment entry
+//!   (`services/logd/docs/ipc-interface.md` § Levels); [`level_entry`]
+//!   writes that entry for a spawner to hand a child.
 //!
 //! The user-facing macro lives in the std overlay (it needs thread-
 //! local IPC-buffer access) and reaches [`emit`], or [`emit_record`] for a
-//! line with fields; std and svctest are the crate's consumers
-//! (`shared/log/README.md`).
+//! line with fields; `shared/log/README.md` names the crate's consumers.
 
 #![cfg_attr(feature = "rustc-dep-of-std", feature(no_core))]
 #![cfg_attr(
@@ -206,6 +206,51 @@ pub fn parse_level(name: &[u8]) -> Option<u64>
         b"trace" => Some(LEVEL_TRACE),
         _ => None,
     }
+}
+
+/// The process's level: the most verbose level [`emit`] sends, an
+/// `ipc::stream_labels::LEVEL_*` code from [`LEVEL_ERROR`] to [`LEVEL_TRACE`].
+#[must_use]
+pub fn max_level() -> u64
+{
+    MAX_LEVEL.load(Ordering::Relaxed)
+}
+
+/// The [`parse_level`] name of `level`; `None` for a code outside
+/// [`LEVEL_ERROR`] to [`LEVEL_TRACE`].
+fn level_name(level: u64) -> Option<&'static [u8]>
+{
+    match level
+    {
+        LEVEL_ERROR => Some(b"error"),
+        LEVEL_WARN => Some(b"warn"),
+        LEVEL_INFO => Some(b"info"),
+        LEVEL_DEBUG => Some(b"debug"),
+        LEVEL_TRACE => Some(b"trace"),
+        _ => None,
+    }
+}
+
+/// The longest entry [`level_entry`] writes: `SERAPH_LOG=error`, the longest
+/// name, and its terminating NUL.
+pub const LEVEL_ENTRY_MAX: usize = LEVEL_ENV_KEY.len() + 1 + b"error".len() + 1;
+
+/// Write the environment entry that sets a process's level to `level`,
+/// `SERAPH_LOG=<name>` and its terminating NUL, the form of one entry of an
+/// env blob (`services/logd/docs/ipc-interface.md` § Levels), into the start
+/// of `out`. Returns the entry's length, NUL included; `None`, writing
+/// nothing, for a code [`parse_level`] names no level for or an `out` shorter
+/// than the entry ([`LEVEL_ENTRY_MAX`] always suffices).
+pub fn level_entry(level: u64, out: &mut [u8]) -> Option<usize>
+{
+    let parts: [&[u8]; 4] = [LEVEL_ENV_KEY, b"=", level_name(level)?, b"\0"];
+    let len = parts.iter().map(|p| p.len()).sum();
+    let entry = out.get_mut(..len)?;
+    for (dst, &src) in entry.iter_mut().zip(parts.iter().copied().flatten())
+    {
+        *dst = src;
+    }
+    Some(len)
 }
 
 /// `level` as an order of verbosity: the codes [`LEVEL_ERROR`] to
@@ -606,6 +651,58 @@ mod tests
         assert_eq!(parse_level(b""), None);
     }
 
+    // Defect caught: an entry a child's `_start` would not parse back to the
+    // level its spawner meant, so the child logs at another level.
+    #[test]
+    fn a_level_entry_parses_back_to_its_level()
+    {
+        for level in [
+            LEVEL_ERROR,
+            LEVEL_WARN,
+            LEVEL_INFO,
+            LEVEL_DEBUG,
+            LEVEL_TRACE,
+        ]
+        {
+            let mut out = [0xAAu8; LEVEL_ENTRY_MAX + 4];
+            let n = level_entry(level, &mut out).expect("a level's entry");
+            assert!(n <= LEVEL_ENTRY_MAX);
+            let entry = &out[..n];
+            assert_eq!(entry.last(), Some(&0));
+            let body = &entry[..n - 1];
+            assert!(!body.contains(&0));
+            let value = body
+                .strip_prefix(LEVEL_ENV_KEY)
+                .and_then(|r| r.strip_prefix(b"="))
+                .expect("key=value");
+            assert_eq!(parse_level(value), Some(level));
+            // Nothing past the entry is written.
+            assert!(out[n..].iter().all(|&b| b == 0xAA));
+        }
+        let mut out = [0u8; LEVEL_ENTRY_MAX];
+        assert_eq!(level_entry(LEVEL_ERROR, &mut out), Some(LEVEL_ENTRY_MAX));
+        assert_eq!(&out[..], b"SERAPH_LOG=error\0");
+    }
+
+    // Defect caught: an entry written past a short buffer, or for a code that
+    // names no level.
+    #[test]
+    fn a_level_entry_needs_room_and_a_level()
+    {
+        let mut short = [0u8; LEVEL_ENTRY_MAX - 1];
+        assert_eq!(level_entry(LEVEL_ERROR, &mut short), None);
+        assert!(short.iter().all(|&b| b == 0));
+        let mut out = [0u8; LEVEL_ENTRY_MAX];
+        assert_eq!(level_entry(0, &mut out), None);
+        assert_eq!(level_entry(6, &mut out), None);
+        // A shorter name fits a buffer the longest does not.
+        let mut warn = [0u8; LEVEL_ENTRY_MAX - 1];
+        assert_eq!(
+            level_entry(LEVEL_WARN, &mut warn),
+            Some(LEVEL_ENTRY_MAX - 1)
+        );
+    }
+
     /// The one test that sets the process-global level, so no other test
     /// races it.
     #[test]
@@ -614,11 +711,16 @@ mod tests
         // The default is info.
         assert!(enabled(LEVEL_INFO) && enabled(LEVEL_ERROR));
         assert!(!enabled(LEVEL_DEBUG));
+        assert_eq!(max_level(), LEVEL_INFO);
         set_max_level(LEVEL_WARN);
+        assert_eq!(max_level(), LEVEL_WARN);
         assert!(enabled(LEVEL_ERROR) && enabled(LEVEL_WARN));
         assert!(!enabled(LEVEL_INFO) && !enabled(LEVEL_TRACE));
         // An unassigned code reads as info, as the receivers read it.
         assert!(!enabled(0) && !enabled(7));
+        // An unassigned code sets info.
+        set_max_level(0);
+        assert_eq!(max_level(), LEVEL_INFO);
         set_max_level(LEVEL_TRACE);
         assert!(enabled(LEVEL_TRACE) && enabled(0));
         set_max_level(LEVEL_INFO);

@@ -263,8 +263,8 @@ shell (#112), and future consumers — they reuse the runner by swapping the
 terminal's child and the expected strings. It subsumes the keysym-decode
 coverage of the former standalone input smoke test: the echoed `help` proves
 lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
-CI it runs as a second boot inside the `usertest` cell (after usertest's own
-run), rather than as a separate matrix dimension that would multiply with each
+CI it runs as a further boot inside the `usertest` cell (after usertest's own
+run and `test-log-level`), rather than as a separate matrix dimension that would multiply with each
 arch.
 
 ### Snapshot resume (`test-vmgenid`)
@@ -376,6 +376,23 @@ a boot that stages them; their faults leave only the kernel's `fault unhandled` 
 `USERSPACE FAULT` lines. A thread that never registered with procmgr is reported without registers
 or a stack walk
 ([crashd Operation § Limits](../services/crashd/docs/operation.md#limits)).
+
+### Log levels (`test-log-level`)
+
+The log level of each service init spawns comes from the boot bundle's log-level configuration,
+and a driver devmgr spawns and a fatfs instance vfsd spawns inherit their spawner's
+([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels). The
+committed configuration sets no level, so no default boot shows whether a level reaches its
+service. `cargo xtask test-log-level [--arch]` (both arches) composes the bundle with vfsd set to
+debug, repacks the disk images in the layout they have, and boots the current sysroot once through
+`run-parallel`. It passes when the boot reaches its harness's pass marker, vfsd's and fatfs's
+debug lines appear, and devmgr's and procmgr's do not; the staged bundle is always put back and
+the images repacked in that layout afterward. See
+[xtask/README.md § test-log-level](../xtask/README.md#cargo-xtask-test-log-level) for the
+command.
+
+In CI it runs as an extra boot inside each `usertest` cell (both arches, both profiles), after
+`test-crash-report`, on the cell's usertest staging and under the cell's `run-parallel` budget.
 
 ### Debug port (`test-debug-port`)
 

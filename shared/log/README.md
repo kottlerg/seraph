@@ -5,10 +5,14 @@ System log primitives for Seraph userspace. Three parts: no-allocation wire-form
 `ipc::stream_labels`, with the caller supplying its badged SEND cap, IPC buffer, and the line's
 level, and `build_record`, which stages a log record (`ipc::log_record`); a process-global cache
 (`install_badged_cap`, `ensure_badged_cap`) for the pre-installed badged log cap; and the
-process-global level filter (`set_max_level`, `enabled`, `parse_level`, `LEVEL_ENV_KEY`). The only
-installer of either is std's `_start`, which installs the cap procmgr seeds in
-`ProcessInfo.log_send_cap` and the level the process's `SERAPH_LOG` environment entry names; init
-does not use this crate and logs through its own path in `services/init/src/logging.rs`. `emit` is
+process-global level filter (`set_max_level`, `max_level`, `enabled`, `parse_level`,
+`LEVEL_ENV_KEY`), with `level_entry`, which writes the `SERAPH_LOG` entry `parse_level` reads back
+(`LEVEL_ENTRY_MAX` bytes at most). The only installer of either is std's `_start`, which installs
+the cap procmgr seeds in `ProcessInfo.log_send_cap` and the level the process's `SERAPH_LOG`
+environment entry names. init logs through its own path in `services/init/src/logging.rs` and uses
+this crate only for `level_entry`, writing the entries of the services it spawns
+([init bootstrap](../../services/init/docs/bootstrap.md) § Log levels); std's
+`std::os::seraph::log::inherited_level_entry` writes a process's own with it. `emit` is
 the entry point the std overlay's `seraph::log!` macro reaches through
 `std::os::seraph::log::__emit_at`, and drops a line more verbose than the filter's level;
 `emit_record` is the entry point of its form with fields, through
@@ -19,8 +23,9 @@ filter, and the wire encodings are specified in
 times out the process's later calls take the short `LOG_CALL_UNANSWERED_TIMEOUT_MS` bound until
 one is answered, so a log receiver that stops answering costs a sender one long wait and then a
 short one per line ([docs/limits.md](../../docs/limits.md) § Shared IPC and protocol crates). The
-crate's consumers are std and svctest, whose `log_client` phase drives the wire helpers against an
-endpoint of its own that never answers.
+crate's consumers are std; svctest, whose `log_client` phase drives the wire helpers against an
+endpoint of its own that never answers; init, for `level_entry`; and the host-tested
+`init-log-levels` crate, for `parse_level`.
 
 `no_std`; builds inside std's dependency graph through the `rustc-dep-of-std` feature.
 

@@ -28,6 +28,7 @@ pub mod test_crash_report;
 pub mod test_debug_port;
 pub mod test_gdb;
 pub mod test_kaslr;
+pub mod test_log_level;
 pub mod test_map_redo;
 pub mod test_terminal;
 pub mod test_vmgenid;

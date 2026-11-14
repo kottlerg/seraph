@@ -277,21 +277,22 @@ table-page store `iommu-store`
 ([services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md)). For each unit
 it discovers, devmgr carves an `Mmio` cap for the unit's register range through the same
 aperture-carving flow as any other device (for a RISC-V IOMMU, after turning on the function's
-memory decode and bus mastering through its configuration page) and moves it to that family's IOMMU
-driver, keeping no copy, with the unit's PCI segment and its scope resolved against the PCI
-topology. devmgr keeps the DMA endpoint, its `devmgr_dma_labels` contract, and per-device policy,
-and reaches the IOMMU driver over `ipc::iommu_labels` to attach a device to a domain of its own,
-install and withdraw mappings, block a device, and take the faults the units recorded, so drivers
-see the same protocol whichever IOMMU, or none, sits behind it. The kernel does not read or write
-IOMMU registers and holds no per-IOMMU state.
+memory decode and bus mastering through its configuration page) and delivers it to that family's
+IOMMU driver, with the unit's PCI segment and its scope resolved against the PCI topology,
+deleting its own once the spawn returns, so it keeps no copy. devmgr keeps the DMA endpoint, its
+`devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
+`ipc::iommu_labels` to attach a device to a domain of its own, install and withdraw mappings,
+block a device, and take the faults the units recorded, so drivers see the same protocol
+whichever IOMMU, or none, sits behind it. The kernel does not read or write IOMMU registers and
+holds no per-IOMMU state.
 
 At boot devmgr matches the IOMMU family record against the boot-module declarations and spawns
-the matched driver from its boot module (with its own bootstrap rounds, not the resource list)
-before any DMA-capable driver, in a settle batch of its own (`CREATE_PROCESS` with
-`CREATE_PINNED`, since the units walk its table pages, `CREATE_DMA_HOLD`, and
-`CREATE_PHYS_ACCESS`, since the units are programmed with physical
-addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
-every mapping). The driver programs each unit with empty tables and turns translation on, so from
+the matched driver from its boot module, delivering it the units in its resource list
+([driver-binding.md](driver-binding.md#matching) § Matching), before any DMA-capable driver, in
+a settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
+pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programmed with physical
+addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it
+on every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
 functions no driver binds included. devmgr never releases the driver's hold, and deletes its release
 token at the spawn: a unit may walk any of its table pages while translation is on, so they stay

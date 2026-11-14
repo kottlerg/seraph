@@ -394,7 +394,6 @@ dependencies = [
  "devmgr-firmware",
  "driver-binding",
  "elf",
- "iommu-core",
  "ipc",
  "namespace-protocol",
  "ns-client",
@@ -721,6 +720,7 @@ dependencies = [
 name = "iommu-core"
 version = "0.1.4"
 dependencies = [
+ "driver-binding",
  "ipc",
  "syscall",
  "syscall-abi",

@@ -5,23 +5,24 @@
 
 //! The RISC-V IOMMU driver (`iommu-riscv`).
 //!
-//! devmgr spawns it first at boot, before any DMA-capable driver, with one
-//! register cap per RISC-V IOMMU PCI function it found through the ACPI RIMT
-//! (`iommu_core::bootstrap`). The driver maps each IOMMU's register page,
-//! sets each up with empty command and fault queues and an empty device
-//! directory and turns translation on ([`backend::Riscv`]), so every device
-//! an IOMMU translates reaches nothing until devmgr attaches it; then it
-//! reports ready and serves `ipc::iommu_labels` for devmgr
-//! ([`iommu_core::service`]), with a second thread polling the fault queues.
-//! An IOMMU that cannot be set up returns every IOMMU to Bare and the driver
-//! exits without reporting ready, so devmgr runs DMA unconfined. See
-//! `docs/device-management.md` § IOMMU Discovery and Programming.
+//! devmgr spawns it first at boot, before any DMA-capable driver, and
+//! delivers it in its resource list the register page of each RISC-V IOMMU
+//! PCI function it found through the ACPI RIMT, with the devices the IOMMU
+//! translates (`iommu_core::delivery`). The driver maps each IOMMU's
+//! register page, sets each up with empty command and fault queues and an
+//! empty device directory and turns translation on ([`backend::Riscv`]), so
+//! every device an IOMMU translates reaches nothing until devmgr attaches
+//! it; then it reports ready and serves `ipc::iommu_labels` for devmgr
+//! ([`iommu_core::service`]), with a second thread polling the fault
+//! queues. An IOMMU that cannot be set up returns every IOMMU to Bare and
+//! the driver exits without reporting ready, so devmgr runs DMA unconfined.
+//! See `docs/device-management.md` § IOMMU Discovery and Programming.
 
 mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use iommu_core::bootstrap::Registers;
+use iommu_core::delivery::{Delivery, Registers};
 use iommu_core::service::{self, KernelCaps, Lock, Service};
 use iommu_store::{Flush, Store};
 use std::os::seraph::{reserve_pages, startup_info};
@@ -68,8 +69,8 @@ impl Lock<Service<Riscv, KernelCaps>> for Shared
 /// register page.
 fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
 {
-    // The bootstrap bounds `pages` to `MAX_REGISTER_PAGES`, so the product
-    // does not saturate.
+    // The delivery bounds `pages` to `MAX_UNIT_REGISTER_PAGES`, so the
+    // product does not saturate.
     if registers.pages.saturating_mul(syscall_abi::PAGE_SIZE) < iommu_riscv::regs::REGISTER_BYTES
     {
         std::os::seraph::log!(error: "register window: smaller than the register page");
@@ -117,12 +118,21 @@ fn main() -> !
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
-    let boot = match unsafe { iommu_core::bootstrap::receive(info.creator_endpoint, ipc_buf) }
+    let list = match unsafe { driver_binding::resources::receive(info.creator_endpoint, ipc_buf) }
+    {
+        Ok(list) => list,
+        Err(e) =>
+        {
+            std::os::seraph::log!(error: "bootstrap failed ({:?})", e);
+            syscall::thread_exit();
+        }
+    };
+    let boot = match Delivery::from_list(&list)
     {
         Ok(boot) => boot,
         Err(e) =>
         {
-            std::os::seraph::log!(error: "bootstrap failed ({:?})", e);
+            std::os::seraph::log!(error: "resource list refused ({:?})", e);
             syscall::thread_exit();
         }
     };

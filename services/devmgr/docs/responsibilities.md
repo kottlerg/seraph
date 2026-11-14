@@ -60,8 +60,9 @@ devmgr's responsibilities are:
   the FADT's `CENTURY` index to the record carrying `PNP0B00`, `PNP0B01`, or
   `PNP0B02` as device info (`ipc::device_info_kind::RTC_CENTURY`, a one-byte
   payload), which `cmos-rtc` reads with `QUERY_DEVICE_INFO`; with none it
-  takes the century 20. The IOMMU driver alone takes bootstrap rounds of its
-  own, matched against the IOMMU family record (below).
+  takes the century 20. The IOMMU driver, matched against the IOMMU family
+  record (below), takes the same resource list, with one unit round opening
+  each unit's resources.
   A DMA-capable driver programs its device only with the device addresses
   devmgr returns from `DMA_MAP` on the driver's DMA capability, never with a
   physical address (below, and
@@ -69,9 +70,10 @@ devmgr's responsibilities are:
   devmgr confines each DMA-capable device with the IOMMU driver of its
   architecture's family, `iommu-vtd` (VT-d) on x86-64 and `iommu-riscv` (the
   RISC-V IOMMU) on riscv64, which it spawns from its boot module before the
-  boot batch, in a settle batch of its own, with each unit's register `Mmio`
-  cap moved to it (devmgr keeps no copy), the unit's segment, and its scope
-  resolved against the PCI scan. A VT-d unit's cap is carved from the
+  boot batch, in a settle batch of its own, delivering it in its resource
+  list each unit's segment, its scope resolved against the PCI scan, and its
+  register `Mmio` cap, whose original devmgr deletes once the spawn returns
+  (devmgr keeps no copy). A VT-d unit's cap is carved from the
   apertures and its scope is the DMAR's, resolved against the scan's bridges;
   a RISC-V IOMMU is a PCI function the ACPI RIMT names, whose cap is the first
   page of its BAR 0, carved once devmgr has turned on the function's memory
@@ -599,7 +601,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 | Capability | Rights | Purpose |
 |---|---|---|
 | Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
-| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr moves to the IOMMU driver; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
+| Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping no copy; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps, each routed with `SYS_IRQ_ROUTE` when carved and kept for the boot, whose derivations are delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and pwrmgr's PM1a + 8042 reset ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
@@ -619,10 +621,10 @@ IOMMU register regions are not pre-minted as distinct capabilities.
 `devmgr` discovers VT-d units from the DMAR, carves an `Mmio` cap for each
 unit's register range through the same aperture-carving flow as any other
 device (the bootloader seeds an aperture over each, since no other table
-names those pages), and moves each to the VT-d IOMMU driver. It discovers
+names those pages), and delivers each to the VT-d IOMMU driver. It discovers
 the RISC-V IOMMUs from the RIMT, carves the first page of each one's BAR 0,
-which lies in a PCI window the bootloader seeds already, and moves each to the
-RISC-V IOMMU driver (see
+which lies in a PCI window the bootloader seeds already, and delivers each to
+the RISC-V IOMMU driver, keeping no copy of either (see
 [docs/device-management.md § IOMMU Discovery and Programming](../../../docs/device-management.md#iommu-discovery-and-programming)).
 
 ---

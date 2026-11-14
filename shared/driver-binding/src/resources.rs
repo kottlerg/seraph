@@ -14,18 +14,26 @@
 //! | [`kind::IO_PORT`] | 1 `IoPort` cap | base port, port count (non-zero) | no |
 //! | [`kind::INTERRUPT`] | 1 to `MSG_CAP_SLOTS_MAX` `Interrupt` caps, one per vector | [`InterruptKind`], first vector, `SYS_IRQ_REGISTER` mode | no |
 //! | [`kind::END`] | the present endpoint slots | presence word of the slots ([`SLOT_SERVICE`], [`SLOT_DEVMGR_QUERY`], [`SLOT_DMA`]), packed by `ipc::bootstrap::pack_slots` | yes |
+//! | [`kind::IOMMU_UNIT`] | none | PCI segment, flags ([`FLAG_INCLUDE_PCI_ALL`]), then one [`Scope`] word per function or bus range the unit names, at most [`MAX_UNIT_SCOPES`] | no |
 //!
 //! Resource rounds come first, in the device record's order, then the one
 //! terminal end round. A wired interrupt is one cap, vector 0; a
 //! message-signaled interrupt spans as many rounds as its vectors need, each
 //! naming its first vector. A round of any other shape, a resource past
-//! [`MAX_RESOURCES`], or a round after the end round fails the decode, and the
-//! driver exits.
+//! [`MAX_RESOURCES`], a unit past [`MAX_IOMMU_UNITS`], or a round after the
+//! end round fails the decode, and the driver exits.
+//!
+//! An IOMMU record's list is one group per remapping unit: the unit's
+//! `IOMMU_UNIT` round, then its resources (its register `Mmio` range, and its
+//! fault interrupt when it is given one), each group's resources ending at the
+//! next unit round or the end round. Only an IOMMU record's list carries unit
+//! rounds, and a delivery decode for any other record refuses a list that
+//! holds one ([`PlatformDelivery::from_list`]).
 
 use alloc::vec::Vec;
 
 use ipc::bootstrap::BootstrapRound;
-use syscall_abi::{IRQ_MODE_MASK, MSG_CAP_SLOTS_MAX};
+use syscall_abi::{IRQ_MODE_MASK, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 use crate::decl::MAX_MSI_VECTORS;
 
@@ -40,6 +48,8 @@ pub mod kind
     pub const INTERRUPT: u64 = 3;
     /// The endpoint slots; the terminal round.
     pub const END: u64 = 4;
+    /// One IOMMU remapping unit's segment and scope, opening its group.
+    pub const IOMMU_UNIT: u64 = 5;
 }
 
 /// The BAR word of an `Mmio` resource that is no PCI BAR.
@@ -72,9 +82,114 @@ pub const END_SLOTS: usize = 3;
 
 const _: () = assert!(END_SLOTS <= MSG_CAP_SLOTS_MAX);
 
-/// Most data words a round carries, `data[0]` included: an `Mmio` round's
-/// five.
-const MAX_ROUND_WORDS: usize = 5;
+/// Most data words a round carries, `data[0]` included: an IPC message's,
+/// which an `IOMMU_UNIT` round may fill.
+const MAX_ROUND_WORDS: usize = MSG_DATA_WORDS_MAX;
+
+/// Remapping units one IOMMU record's list carries, and so one IOMMU driver
+/// serves. devmgr hands over a platform's first units of a family up to this
+/// bound and refuses the DMA-capable functions of the rest.
+pub const MAX_IOMMU_UNITS: usize = 16;
+/// `IOMMU_UNIT` flag: the unit translates every function of its segment that
+/// no other unit's scope names.
+pub const FLAG_INCLUDE_PCI_ALL: u64 = 1 << 0;
+/// Data words of an `IOMMU_UNIT` round before its scope words: the kind, the
+/// segment, and the flags.
+const UNIT_HEADER_WORDS: usize = 3;
+/// Scope entries one unit carries: the data words an `IOMMU_UNIT` round has
+/// left after its header. devmgr does not hand over a unit whose resolved
+/// scope names more.
+pub const MAX_UNIT_SCOPES: usize = MSG_DATA_WORDS_MAX - UNIT_HEADER_WORDS;
+/// Pages a unit's register range may span. VT-d sizes a unit's register set
+/// as a power of two pages up to 2^15 in its firmware table, and a unit's
+/// registers occupy one page in practice; the bound keeps the IOMMU driver's
+/// register windows small. devmgr does not hand over a unit whose set is
+/// larger.
+pub const MAX_UNIT_REGISTER_PAGES: u64 = 16;
+
+// Every unit's register range and fault interrupt fit the resource bound.
+const _: () = assert!(MAX_IOMMU_UNITS * 2 <= MAX_RESOURCES);
+
+/// [`Scope`] word: a bus range rather than one function.
+const SCOPE_BUSES: u64 = 1 << 32;
+
+/// PCI functions an IOMMU unit's scope names: one function, by its bus,
+/// device, and function (bus in bits 8..16, device in bits 3..8, function in
+/// bits 0..3), or every function on a range of buses (a bridge's secondary
+/// through subordinate bus).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope
+{
+    /// One function.
+    Function(u16),
+    /// Every function on buses `first..=last`.
+    Buses
+    {
+        /// First bus of the range.
+        first: u8,
+        /// Last bus of the range, inclusive.
+        last: u8,
+    },
+}
+
+impl Scope
+{
+    /// The word an `IOMMU_UNIT` round carries for the scope.
+    #[must_use]
+    pub const fn encode(self) -> u64
+    {
+        match self
+        {
+            Self::Function(bdf) => bdf as u64,
+            Self::Buses { first, last } => SCOPE_BUSES | (first as u64) | ((last as u64) << 8),
+        }
+    }
+
+    /// The scope a word names; `None` for a word with bits outside the
+    /// encoding, or a bus range that ends before it starts.
+    #[must_use]
+    pub fn decode(word: u64) -> Option<Self>
+    {
+        if word & SCOPE_BUSES == 0
+        {
+            return u16::try_from(word).ok().map(Self::Function);
+        }
+        let rest = word & !SCOPE_BUSES;
+        let first = u8::try_from(rest & 0xff).ok()?;
+        let last = u8::try_from(rest >> 8).ok()?;
+        (first <= last).then_some(Self::Buses { first, last })
+    }
+
+    /// Whether the scope names the function `bdf`.
+    #[must_use]
+    pub fn covers(self, bdf: u16) -> bool
+    {
+        match self
+        {
+            Self::Function(f) => f == bdf,
+            Self::Buses { first, last } =>
+            {
+                let bus = bdf.to_be_bytes()[0];
+                (first..=last).contains(&bus)
+            }
+        }
+    }
+}
+
+/// One IOMMU remapping unit's PCI segment and the functions it translates,
+/// as its `IOMMU_UNIT` round carries them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IommuUnit
+{
+    /// The segment of every function the unit translates.
+    pub segment: u16,
+    /// Whether the unit translates every function of its segment that no
+    /// other unit's scope names.
+    pub include_pci_all: bool,
+    /// The functions and bus ranges the unit names explicitly, at most
+    /// [`MAX_UNIT_SCOPES`].
+    pub scopes: Vec<Scope>,
+}
 
 /// An interrupt resource's kind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,6 +363,40 @@ impl Round
         ))
     }
 
+    /// The `IOMMU_UNIT` round of `unit`, opening its group. Returns `None`
+    /// when its scopes number more than [`MAX_UNIT_SCOPES`].
+    #[must_use]
+    pub fn iommu_unit(unit: &IommuUnit) -> Option<Self>
+    {
+        if unit.scopes.len() > MAX_UNIT_SCOPES
+        {
+            return None;
+        }
+        let flags = if unit.include_pci_all
+        {
+            FLAG_INCLUDE_PCI_ALL
+        }
+        else
+        {
+            0
+        };
+        let mut round = Self::new(
+            &[],
+            &[kind::IOMMU_UNIT, u64::from(unit.segment), flags],
+            false,
+        );
+        for (dst, scope) in round
+            .data
+            .iter_mut()
+            .skip(UNIT_HEADER_WORDS)
+            .zip(&unit.scopes)
+        {
+            *dst = scope.encode();
+        }
+        round.data_words = UNIT_HEADER_WORDS.saturating_add(unit.scopes.len());
+        Some(round)
+    }
+
     /// The terminal round, carrying `endpoints`.
     #[must_use]
     pub fn end(endpoints: &Endpoints) -> Self
@@ -294,7 +443,8 @@ pub enum ListError
     UnknownKind(u64),
     /// A round of a known kind whose caps, words, or values do not fit it.
     Malformed(u64),
-    /// More than [`MAX_RESOURCES`] resources.
+    /// More than [`MAX_RESOURCES`] resources, or more than
+    /// [`MAX_IOMMU_UNITS`] units.
     TooMany,
     /// A round after the end round.
     AfterEnd,
@@ -319,7 +469,19 @@ pub struct ResourceList
     /// In delivery order, at most [`MAX_RESOURCES`]; on the heap, grown by
     /// each round to its exact length, so the list moves as a few words.
     resources: Vec<Resource>,
+    /// The `IOMMU_UNIT` rounds, in delivery order, at most
+    /// [`MAX_IOMMU_UNITS`]; empty for every list but an IOMMU record's.
+    units: Vec<UnitGroup>,
     endpoints: Option<Endpoints>,
+}
+
+/// One delivered unit and where its group starts.
+struct UnitGroup
+{
+    unit: IommuUnit,
+    /// The index in `resources` of the group's first resource: the count of
+    /// resources delivered before the unit round.
+    first: usize,
 }
 
 impl Default for ResourceList
@@ -338,6 +500,7 @@ impl ResourceList
     {
         Self {
             resources: Vec::new(),
+            units: Vec::new(),
             endpoints: None,
         }
     }
@@ -433,7 +596,14 @@ impl ResourceList
                 let decoded = decode_interrupts(caps, irq_kind, first, mode, &mut batch);
                 self.push(batch.get(..decoded.ok_or(bad)?).ok_or(bad)?)
             }
-            (kind::END | kind::MMIO | kind::IO_PORT | kind::INTERRUPT, _, _) => Err(bad),
+            (kind::IOMMU_UNIT, &[], &[_, segment, flags, ref scopes @ ..]) =>
+            {
+                self.push_unit(segment, flags, scopes, bad)
+            }
+            (kind::END | kind::MMIO | kind::IO_PORT | kind::INTERRUPT | kind::IOMMU_UNIT, _, _) =>
+            {
+                Err(bad)
+            }
             (other, _, _) => Err(ListError::UnknownKind(other)),
         }
     }
@@ -457,11 +627,86 @@ impl ResourceList
         Ok(false)
     }
 
-    /// The resources, in delivery order.
+    /// Record an `IOMMU_UNIT` round's unit, its group starting at the next
+    /// resource; `bad` for a segment past 16 bits, an unknown flag, or a
+    /// scope word that does not decode.
+    fn push_unit(
+        &mut self,
+        segment: u64,
+        flags: u64,
+        words: &[u64],
+        bad: ListError,
+    ) -> Result<bool, ListError>
+    {
+        let segment = u16::try_from(segment).map_err(|_| bad)?;
+        if flags & !FLAG_INCLUDE_PCI_ALL != 0 || words.len() > MAX_UNIT_SCOPES
+        {
+            return Err(bad);
+        }
+        if self.units.len() >= MAX_IOMMU_UNITS
+        {
+            return Err(ListError::TooMany);
+        }
+        let mut scopes = Vec::new();
+        scopes
+            .try_reserve_exact(words.len())
+            .map_err(|_| ListError::NoMemory)?;
+        for &word in words
+        {
+            scopes.push(Scope::decode(word).ok_or(bad)?);
+        }
+        self.units
+            .try_reserve_exact(1)
+            .map_err(|_| ListError::NoMemory)?;
+        self.units.push(UnitGroup {
+            unit: IommuUnit {
+                segment,
+                include_pci_all: flags & FLAG_INCLUDE_PCI_ALL != 0,
+                scopes,
+            },
+            first: self.resources.len(),
+        });
+        Ok(false)
+    }
+
+    /// The resources, in delivery order, the resources of every unit's group
+    /// included.
     #[must_use]
     pub fn resources(&self) -> &[Resource]
     {
         &self.resources
+    }
+
+    /// Whether the list holds an `IOMMU_UNIT` round: it is an IOMMU record's.
+    #[must_use]
+    pub fn holds_units(&self) -> bool
+    {
+        !self.units.is_empty()
+    }
+
+    /// The resources delivered before the first unit round: every resource
+    /// of a list without one.
+    #[must_use]
+    pub fn ungrouped(&self) -> &[Resource]
+    {
+        let end = self.units.first().map_or(self.resources.len(), |g| g.first);
+        self.resources.get(..end).unwrap_or(&[])
+    }
+
+    /// Each delivered IOMMU unit, in delivery order, with the resources of
+    /// its group.
+    pub fn iommu_units(&self) -> impl Iterator<Item = (&IommuUnit, &[Resource])> + '_
+    {
+        self.units.iter().enumerate().map(|(i, group)| {
+            let end = self
+                .units
+                .get(i.saturating_add(1))
+                .map_or(self.resources.len(), |next| next.first);
+            (
+                &group.unit,
+                self.resources.get(group.first..end).unwrap_or(&[]),
+            )
+        })
     }
 
     /// The endpoints of the end round; `None` until it is absorbed.
@@ -503,13 +748,14 @@ impl PlatformDelivery
 {
     /// Read a complete resource list. `None` when the list has no end round,
     /// no service or devmgr query endpoint, or no `Mmio` or `IoPort`
-    /// resource. Resources past the first register window and the first
-    /// wired line are left in the list, unused.
+    /// resource, or holds an IOMMU unit, being no platform record's.
+    /// Resources past the first register window and the first wired line
+    /// are left in the list, unused.
     #[must_use]
     pub fn from_list(list: &ResourceList) -> Option<Self>
     {
         let endpoints = list.endpoints()?;
-        if endpoints.service == 0 || endpoints.devmgr_query == 0
+        if endpoints.service == 0 || endpoints.devmgr_query == 0 || list.holds_units()
         {
             return None;
         }
@@ -638,7 +884,7 @@ mod tests
 {
     use super::*;
 
-    use syscall_abi::{IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, MSG_DATA_WORDS_MAX};
+    use syscall_abi::{IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL};
 
     /// The round a driver receives for `sent`, as `request_round` builds it.
     fn received(sent: &Round) -> BootstrapRound
@@ -981,6 +1227,178 @@ mod tests
             list.absorb(&received(&Round::io_port(10, 0x3F8, 8))),
             Ok(false)
         );
+        assert_eq!(PlatformDelivery::from_list(&list), None);
+    }
+
+    /// A unit of `segment` that translates the functions `scopes` names.
+    fn unit(segment: u16, scopes: &[Scope]) -> IommuUnit
+    {
+        IommuUnit {
+            segment,
+            include_pci_all: false,
+            scopes: scopes.to_vec(),
+        }
+    }
+
+    /// A unit of `segment` that translates every function no other unit
+    /// names.
+    fn catch_all(segment: u16) -> IommuUnit
+    {
+        IommuUnit {
+            include_pci_all: true,
+            ..unit(segment, &[])
+        }
+    }
+
+    #[test]
+    fn a_scope_word_round_trips()
+    {
+        for s in [
+            Scope::Function(0x0018),
+            Scope::Function(0xffff),
+            Scope::Buses { first: 2, last: 9 },
+            Scope::Buses {
+                first: 0,
+                last: 255,
+            },
+        ]
+        {
+            assert_eq!(Scope::decode(s.encode()), Some(s));
+        }
+    }
+
+    #[test]
+    fn a_malformed_scope_word_is_refused()
+    {
+        assert_eq!(Scope::decode(1 << 40), None);
+        assert_eq!(Scope::decode(SCOPE_BUSES | 9 | (2 << 8)), None);
+    }
+
+    #[test]
+    fn a_bus_range_covers_every_function_on_its_buses_only()
+    {
+        let s = Scope::Buses { first: 2, last: 3 };
+        assert!(s.covers(0x0200));
+        assert!(s.covers(0x03ff));
+        assert!(!s.covers(0x0100));
+        assert!(!s.covers(0x0400));
+    }
+
+    #[test]
+    fn each_unit_takes_the_resources_of_its_group()
+    {
+        let first = unit(
+            3,
+            &[Scope::Function(0x0008), Scope::Buses { first: 4, last: 5 }],
+        );
+        let second = catch_all(0);
+        let rounds = [
+            Round::iommu_unit(&first).expect("two scopes fit"),
+            Round::mmio(10, None, 0xFED9_0000, 0x1000),
+            Round::interrupts(InterruptKind::Msi, 0, 0, &[11]).expect("one vector"),
+            Round::iommu_unit(&second).expect("no scopes fit"),
+            Round::mmio(12, Some(0), 0x3000_0000, 0x1000),
+            ends(20, 21),
+        ];
+        let list = decoded(&rounds).expect("well-formed list");
+        assert!(list.holds_units());
+        assert_eq!(list.ungrouped(), []);
+        let units: Vec<_> = list.iommu_units().collect();
+        assert_eq!(units.len(), 2);
+        assert_eq!(units[0].0, &first);
+        assert_eq!(units[0].1, &list.resources()[..2]);
+        assert!(matches!(units[0].1[1], Resource::Interrupt { cap: 11, .. }));
+        assert_eq!(units[1].0, &second);
+        assert_eq!(units[1].1, &list.resources()[2..]);
+        assert_eq!(list.caps().collect::<Vec<_>>(), [10, 11, 12, 20, 21]);
+    }
+
+    #[test]
+    fn resources_before_the_first_unit_and_an_empty_group_are_kept_apart()
+    {
+        let rounds = [
+            Round::mmio(10, None, 0x1000, 0x1000),
+            Round::iommu_unit(&catch_all(0)).expect("fits"),
+            Round::iommu_unit(&catch_all(1)).expect("fits"),
+            Round::mmio(11, None, 0x2000, 0x1000),
+            ends(20, 21),
+        ];
+        let list = decoded(&rounds).expect("well-formed list");
+        assert_eq!(list.ungrouped(), &list.resources()[..1]);
+        let groups: Vec<usize> = list.iommu_units().map(|(_, r)| r.len()).collect();
+        assert_eq!(groups, [0, 1]);
+    }
+
+    #[test]
+    fn a_list_without_units_has_every_resource_ungrouped()
+    {
+        let list = decoded(&[Round::io_port(10, 0x3F8, 8), ends(20, 21)]).expect("well-formed");
+        assert!(!list.holds_units());
+        assert_eq!(list.ungrouped(), list.resources());
+        assert_eq!(list.iommu_units().count(), 0);
+    }
+
+    #[test]
+    fn a_unit_with_every_scope_a_round_holds_round_trips_and_one_more_is_not_encoded()
+    {
+        let full = unit(7, &vec![Scope::Function(1); MAX_UNIT_SCOPES]);
+        let round = Round::iommu_unit(&full).expect("the most scopes fit");
+        assert_eq!(round.data().len(), MSG_DATA_WORDS_MAX);
+        let list = decoded(&[round, ends(20, 21)]).expect("well-formed list");
+        assert_eq!(list.iommu_units().next().map(|(u, _)| u), Some(&full));
+        let over = unit(7, &vec![Scope::Function(1); MAX_UNIT_SCOPES + 1]);
+        assert!(Round::iommu_unit(&over).is_none());
+    }
+
+    #[test]
+    fn a_malformed_unit_round_is_refused_and_records_nothing()
+    {
+        let u = kind::IOMMU_UNIT;
+        let bad_scope = SCOPE_BUSES | 9 | (2 << 8);
+        let cases: &[(bool, &[u64], &[u64])] = &[
+            // A cap, terminal, a word short, a segment past 16 bits, an
+            // unknown flag, a scope word that does not decode.
+            (false, &[1], &[u, 0, 0]),
+            (true, &[], &[u, 0, 0]),
+            (false, &[], &[u, 0]),
+            (false, &[], &[u, 1 << 16, 0]),
+            (false, &[], &[u, 0, 2]),
+            (false, &[], &[u, 0, 0, bad_scope]),
+        ];
+        for &(done, caps, data) in cases
+        {
+            let mut list = ResourceList::new();
+            assert_eq!(
+                list.absorb(&raw(done, caps, data)),
+                Err(ListError::Malformed(u)),
+                "done {done} caps {caps:?} data {data:?}"
+            );
+            assert!(!list.holds_units());
+        }
+    }
+
+    #[test]
+    fn units_past_the_bound_are_refused()
+    {
+        let mut list = ResourceList::new();
+        let round = Round::iommu_unit(&catch_all(0)).expect("fits");
+        for _ in 0..MAX_IOMMU_UNITS
+        {
+            assert_eq!(list.absorb(&received(&round)), Ok(false));
+        }
+        assert_eq!(list.absorb(&received(&round)), Err(ListError::TooMany));
+        assert_eq!(list.iommu_units().count(), MAX_IOMMU_UNITS);
+    }
+
+    #[test]
+    fn platform_delivery_refuses_a_list_that_holds_a_unit()
+    {
+        let rounds = [
+            Round::iommu_unit(&catch_all(0)).expect("fits"),
+            Round::mmio(11, None, 0x10_1000, 0x1000),
+            ends(20, 21),
+        ];
+        let list = decoded(&rounds).expect("well-formed list");
         assert_eq!(PlatformDelivery::from_list(&list), None);
     }
 }

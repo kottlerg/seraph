@@ -15,8 +15,10 @@
 //! turns on the function's memory decode and bus mastering. It spawns, in a
 //! settle batch of its own, the boot-module driver whose declaration matches
 //! the family's record key ([`Family::key`]: `dmar` binds `iommu-vtd`,
-//! `rimt` binds `iommu-riscv`), handing it every unit (`iommu_core::bootstrap`);
-//! devmgr keeps no copy of a register cap. Once the driver reports ready
+//! `rimt` binds `iommu-riscv`), and delivers it every unit in its resource
+//! list (`driver_binding::resources`: each unit's segment and scope, then its
+//! register range); devmgr deletes its own register caps once the spawn
+//! returns, so it keeps no copy of one. Once the driver reports ready
 //! every function a unit translates is blocked until devmgr attaches it, so
 //! [`Iommu::confine`] attaches each DMA-capable device before its DMA grant
 //! and maps, at their own addresses, the regions the firmware reserves for it
@@ -59,14 +61,16 @@ use std::os::seraph::thread::BuilderExt;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
-use driver_binding::decl::{DriverDecl, Tier};
+use driver_binding::decl::DriverDecl;
+use driver_binding::resources::{
+    IommuUnit, MAX_IOMMU_UNITS, MAX_UNIT_REGISTER_PAGES, MAX_UNIT_SCOPES, Resource, Scope,
+};
 use firmware::binding::{Choice, MatchTable, RecordKeys, Source};
 use firmware::dma::{
     Confinement, ReservedError, ReservedRange, has_iova_space, iova_limit, reserved_ranges,
 };
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
-use iommu_core::Scope;
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::PAGE_SIZE;
 
@@ -996,23 +1000,74 @@ fn scope_word(r: Resolved) -> Scope
     }
 }
 
-/// Carve each DRHD's register cap and encode its unit round: the rounds,
-/// and the DMAR topology devmgr places devices against. A DRHD whose
+/// The remapping units devmgr hands the IOMMU driver, in unit-index order:
+/// each unit's register `Mmio` range, carrying devmgr's cap for it, and each
+/// unit with the index of its range in `registers`, which opens its group of
+/// the driver's resource list ([`spawn::BoundSpawnConfig::units`]).
+#[derive(Default)]
+struct Handed
+{
+    registers: Vec<Resource>,
+    units: Vec<(usize, IommuUnit)>,
+}
+
+impl Handed
+{
+    /// Room for one more unit; false when none can be allocated.
+    fn reserve(&mut self) -> bool
+    {
+        self.registers.try_reserve(1).is_ok() && self.units.try_reserve(1).is_ok()
+    }
+
+    /// Whether a unit whose register range spans `pages` pages and whose
+    /// scope is `scopes` can be handed over: one more unit within
+    /// [`MAX_IOMMU_UNITS`], its scope within what its unit round carries, and
+    /// its span within [`MAX_UNIT_REGISTER_PAGES`].
+    fn fits(&self, pages: u64, scopes: &[Scope]) -> bool
+    {
+        self.units.len() < MAX_IOMMU_UNITS
+            && scopes.len() <= MAX_UNIT_SCOPES
+            && (1..=MAX_UNIT_REGISTER_PAGES).contains(&pages)
+    }
+
+    /// Hand over `unit` with its register range `registers`; the unit's
+    /// index.
+    fn push(&mut self, registers: Resource, unit: IommuUnit) -> usize
+    {
+        let index = self.units.len();
+        self.units.push((self.registers.len(), unit));
+        self.registers.push(registers);
+        index
+    }
+
+    /// Delete devmgr's register caps: no driver was started over them, or
+    /// the driver's spawn has derived its own copies.
+    fn release(&self)
+    {
+        for r in &self.registers
+        {
+            let _ = syscall::cap_delete(r.cap());
+        }
+    }
+}
+
+/// Carve each DRHD's register cap and resolve its scope: the units handed
+/// over, and the DMAR topology devmgr places devices against. A DRHD whose
 /// register range no aperture covers, whose scope or register span exceeds
-/// what a round carries, or past the driver's unit bound is not handed over
-/// and its functions are refused.
-fn vtd_rounds(
+/// what its unit's group carries, or past the driver's unit bound is not
+/// handed over and its functions are refused.
+fn vtd_units(
     caps: &mut caps::DevmgrCaps,
     dmar_bytes: Vec<u8>,
     devices: &[pci::PciDevice],
-) -> (Vec<spawn::UnitRound>, Topology)
+) -> (Handed, Topology)
 {
     let bridges = bridges(devices);
-    let mut rounds = Vec::new();
+    let mut handed = Handed::default();
     let mut unit_index = Vec::new();
     for unit in dmar::drhd_units(&dmar_bytes)
     {
-        if unit_index.try_reserve(1).is_err() || rounds.try_reserve(1).is_err()
+        if unit_index.try_reserve(1).is_err() || !handed.reserve()
         {
             break;
         }
@@ -1030,24 +1085,26 @@ fn vtd_rounds(
                 }
             },
         );
-        let words = iommu_core::bootstrap::unit_round_words(
-            seg,
-            unit.include_pci_all,
-            unit.register_pages,
-            &scopes,
-        );
-        let handed = rounds.len() < iommu_core::bootstrap::MAX_UNITS;
-        let cap = words.as_ref().filter(|_| handed).and_then(|_| {
-            crate::carve_subrange(
-                caps,
-                unit.register_base,
-                unit.register_pages.checked_mul(PAGE_SIZE)?,
-            )
-        });
-        if let (Some(words), Some(cap)) = (words, cap)
+        let bytes = unit
+            .register_pages
+            .checked_mul(PAGE_SIZE)
+            .filter(|_| handed.fits(unit.register_pages, &scopes));
+        let cap = bytes.and_then(|bytes| crate::carve_subrange(caps, unit.register_base, bytes));
+        if let (Some(bytes), Some(cap)) = (bytes, cap)
         {
-            unit_index.push(Some(rounds.len()));
-            rounds.push(spawn::UnitRound { cap, words });
+            let registers = Resource::Mmio {
+                cap,
+                bar: None,
+                phys: unit.register_base,
+                bytes,
+                offset: 0,
+            };
+            let handed_unit = IommuUnit {
+                segment: seg,
+                include_pci_all: unit.include_pci_all,
+                scopes,
+            };
+            unit_index.push(Some(handed.push(registers, handed_unit)));
         }
         else
         {
@@ -1063,36 +1120,33 @@ fn vtd_rounds(
         unit_index,
         bridges,
     };
-    (rounds, topology)
+    (handed, topology)
 }
 
-/// Encode each RIMT PCI IOMMU's unit round and carve its register cap: the
-/// rounds, and the RIMT topology devmgr places devices against. An IOMMU
-/// the PCI scan did not find, without a memory BAR 0 of at least a page,
-/// whose scope exceeds what a round carries, whose memory decode and bus
-/// mastering devmgr cannot turn on, whose BAR no aperture covers, or past
-/// the driver's unit bound is not handed over and its functions are refused.
-fn riscv_rounds(
+/// Resolve each RIMT PCI IOMMU's scope and carve its register cap: the
+/// units handed over, and the RIMT topology devmgr places devices against.
+/// An IOMMU the PCI scan did not find, without a memory BAR 0 of at least a
+/// page, whose scope exceeds what its unit's group carries, whose memory
+/// decode and bus mastering devmgr cannot turn on, whose BAR no aperture
+/// covers, or past the driver's unit bound is not handed over and its
+/// functions are refused.
+fn riscv_units(
     caps: &mut caps::DevmgrCaps,
     rimt_bytes: Vec<u8>,
     devices: &[pci::PciDevice],
-) -> (Vec<spawn::UnitRound>, Topology)
+) -> (Handed, Topology)
 {
-    let mut rounds = Vec::new();
+    let mut handed = Handed::default();
     let mut unit_index = Vec::new();
     for iommu in rimt::pci_iommus(&rimt_bytes)
     {
-        if unit_index.try_reserve(1).is_err() || rounds.try_reserve(1).is_err()
+        if unit_index.try_reserve(1).is_err() || !handed.reserve()
         {
             break;
         }
-        let round = (rounds.len() < iommu_core::bootstrap::MAX_UNITS)
-            .then(|| riscv_round(caps, &rimt_bytes, iommu, devices))
-            .flatten();
-        if let Some(round) = round
+        if let Some((registers, unit)) = riscv_unit(caps, &handed, &rimt_bytes, iommu, devices)
         {
-            unit_index.push((iommu.node, Some(rounds.len())));
-            rounds.push(round);
+            unit_index.push((iommu.node, Some(handed.push(registers, unit))));
         }
         else
         {
@@ -1111,20 +1165,22 @@ fn riscv_rounds(
         rimt: rimt_bytes,
         unit_index,
     };
-    (rounds, topology)
+    (handed, topology)
 }
 
-/// The unit round of the PCI IOMMU `iommu`: its scope resolved against the
-/// scanned `devices`, and its BAR 0's first page, which holds every register,
-/// carved once devmgr has turned on the function's memory decode (for the
-/// registers) and bus mastering (the IOMMU reads its tables and queues by
-/// DMA); `None`, logged where the step logs, when any step fails.
-fn riscv_round(
+/// The PCI IOMMU `iommu` as a unit `handed` can take: its scope resolved
+/// against the scanned `devices`, and its BAR 0's first page, which holds
+/// every register, carved once devmgr has turned on the function's memory
+/// decode (for the registers) and bus mastering (the IOMMU reads its tables
+/// and queues by DMA); `None`, logged where the step logs, when any step
+/// fails or the unit does not fit.
+fn riscv_unit(
     caps: &mut caps::DevmgrCaps,
+    handed: &Handed,
     rimt_bytes: &[u8],
     iommu: rimt::PciIommu,
     devices: &[pci::PciDevice],
-) -> Option<spawn::UnitRound>
+) -> Option<(Resource, IommuUnit)>
 {
     let f = iommu.function;
     let dev = devices.iter().find(|d| {
@@ -1150,7 +1206,10 @@ fn riscv_round(
             scopes.push(scope_word(r));
         }
     });
-    let words = iommu_core::bootstrap::unit_round_words(iommu.segment, false, 1, &scopes)?;
+    if !handed.fits(1, &scopes)
+    {
+        return None;
+    }
     let config = crate::bind::carve_function_config("RISC-V IOMMU", dev, caps)?;
     let enabled = config.enable_memory_and_bus_master();
     // devmgr needs the function's configuration no further.
@@ -1159,8 +1218,21 @@ fn riscv_round(
     {
         return None;
     }
-    let cap = crate::carve_subrange(caps, *dev.bar_phys.get(bar)?, PAGE_SIZE)?;
-    Some(spawn::UnitRound { cap, words })
+    let phys = *dev.bar_phys.get(bar)?;
+    let cap = crate::carve_subrange(caps, phys, PAGE_SIZE)?;
+    let registers = Resource::Mmio {
+        cap,
+        bar: Some(0),
+        phys,
+        bytes: PAGE_SIZE,
+        offset: 0,
+    };
+    let unit = IommuUnit {
+        segment: iommu.segment,
+        include_pci_all: false,
+        scopes,
+    };
+    Some((registers, unit))
 }
 
 /// Discover the remapping units, spawn the IOMMU driver over them, and
@@ -1218,12 +1290,12 @@ pub fn bring_up(
         unconfined("IOMMU driver not started");
         return None;
     }
-    let (rounds, topology) = match family
+    let (handed, topology) = match family
     {
-        Family::Vtd => vtd_rounds(caps, table, devices),
-        Family::Riscv => riscv_rounds(caps, table, devices),
+        Family::Vtd => vtd_units(caps, table, devices),
+        Family::Riscv => riscv_units(caps, table, devices),
     };
-    if rounds.is_empty()
+    if handed.units.is_empty()
     {
         unconfined("no IOMMU unit can be programmed");
         return None;
@@ -1231,16 +1303,16 @@ pub fn bring_up(
     let Some((client, death_eq)) = start_death_watch()
     else
     {
-        release_rounds(&rounds);
+        handed.release();
         unconfined("no IOMMU driver endpoint or death watch");
         return None;
     };
     let settled = spawn_and_settle(
         caps,
         &decl,
-        grants.tier,
+        &grants,
         (module_cap, module_guard),
-        &rounds,
+        &handed,
         &client,
         death_eq,
         watch,
@@ -1248,6 +1320,9 @@ pub fn bring_up(
         registry,
         ipc_buf,
     );
+    // A started driver holds copies of the register caps derived from
+    // devmgr's; devmgr keeps none.
+    handed.release();
     match settled
     {
         Settled::Ready =>
@@ -1275,7 +1350,7 @@ pub fn bring_up(
         }
     }
     client.mark_ready();
-    let handed = rounds.len();
+    let handed = handed.units.len();
     let _ = client.widths.set(query_widths(&client, handed));
     registry.set_iommu(Arc::clone(&client));
     let faults = Arc::new(Mutex::new(FaultCounts::default()));
@@ -1402,15 +1477,6 @@ fn query_widths(client: &IommuClient, units: usize) -> Vec<u8>
     widths
 }
 
-/// Delete the register caps of `rounds`, which no driver was given.
-fn release_rounds(rounds: &[spawn::UnitRound])
-{
-    for r in rounds
-    {
-        let _ = syscall::cap_delete(r.cap);
-    }
-}
-
 /// Create the IOMMU driver's service endpoint and the client devmgr calls it
 /// through, and start the thread that watches for the driver's death: it
 /// waits on an event queue of its own, to which the driver's spawn binds a
@@ -1477,15 +1543,20 @@ enum Settled
     /// It was never started, so it turned no translation on.
     NotStarted,
     /// It was started but did not report ready: dead, destroyed at the
-    /// settle bound, or destroyed when a bootstrap round or an observer bind
-    /// failed after its start; it may have turned a unit's translation on.
+    /// settle bound, or destroyed when a resource-list round or an observer
+    /// bind failed after its start; it may have turned a unit's translation
+    /// on.
     NotReady,
 }
 
 /// Spawn the IOMMU driver `decl` from its module, the cap `module.0` that
-/// the guard `module.1` holds, at `tier`, over `rounds` with the client's
-/// endpoint as its service endpoint, in a settle batch of its own, its death
-/// watched on `death_eq` as well as devmgr's death queue, and settle it.
+/// the guard `module.1` holds, with `grants`, delivering it the `handed`
+/// units with the client's endpoint as its service endpoint, in a settle
+/// batch of its own, its death watched on `death_eq` as well as devmgr's
+/// death queue, and settle it. The driver is created held, since its units
+/// walk its table pages by DMA; devmgr, holding no register cap, cannot stop
+/// them, so it deletes the release token at the spawn and procmgr keeps the
+/// driver's pages held for the rest of the boot once it dies.
 #[expect(
     clippy::too_many_arguments,
     reason = "the spawn and its settle consume the declaration, the client, the death watch, the \
@@ -1494,9 +1565,9 @@ enum Settled
 fn spawn_and_settle(
     caps: &caps::DevmgrCaps,
     decl: &DriverDecl,
-    tier: Tier,
+    grants: &firmware::binding::Grants,
     module: (u64, spawn::ModuleCapGuard),
-    rounds: &[spawn::UnitRound],
+    handed: &Handed,
     client: &IommuClient,
     death_eq: u64,
     watch: &mut settle::DriverWatch,
@@ -1512,40 +1583,43 @@ fn spawn_and_settle(
     else
     {
         std::os::seraph::log!(warn: "IOMMU driver: no settle batch or badge; not spawned");
-        release_rounds(rounds);
         return Settled::NotStarted;
     };
-    // `spawn_iommu_driver` owns the module cap's lifecycle from here
+    // `spawn_bound_driver` owns the module cap's lifecycle from here
     // (consumed by CREATE_PROCESS, or released on failure).
     let (module_cap, mut module_guard) = module;
     module_guard.disarm();
-    let config = spawn::IommuSpawnConfig {
+    let config = spawn::BoundSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
-        module_cap,
-        units: rounds,
+        source: spawn::CreateSource::Module(module_cap),
+        resources: &handed.registers,
+        units: &handed.units,
+        dma_cap: None,
+        held: true,
+        phys_access: grants.phys_access,
         service_ep: client.ep,
         query_ep: batch.driver_ep(),
         death_eq: watch.death_eq(),
-        watch_eq: death_eq,
+        watch_eq: Some(death_eq),
         device_badge,
         // devmgr's DMA thread, at the boot drivers' level, calls the driver
         // on every map and unmap of the root-disk path; a boot-module
         // declaration of the boot tier is given it.
-        priority: match tier
-        {
-            Tier::Boot => ipc::sched_policy::BOOT_DRIVER_PRIORITY,
-            Tier::Auxiliary => ipc::sched_policy::AUX_DRIVER_PRIORITY,
-        },
+        priority: spawn::tier_priority(grants.tier),
     };
-    let process_handle = match spawn::spawn_iommu_driver(&config, ipc_buf)
+    let process_handle = match spawn::spawn_bound_driver(&config, ipc_buf)
     {
-        spawn::DriverSpawn::Bootstrapped(h) => h,
-        spawn::DriverSpawn::Unbootstrapped(h) =>
+        spawn::DriverSpawn::Bootstrapped(child) =>
         {
-            // Every unit round reached it only when the endpoint round or
-            // an observer bind failed; it may then be setting its units up.
-            spawn::destroy_child(h, ipc_buf);
+            let _ = syscall::cap_delete(child.release_token);
+            child.process_handle
+        }
+        spawn::DriverSpawn::Unbootstrapped(child) =>
+        {
+            // It may have taken its units' groups and be setting them up;
+            // its pages stay held.
+            spawn::destroy_held(child, ipc_buf);
             return Settled::NotReady;
         }
         spawn::DriverSpawn::Failed => return Settled::NotStarted,

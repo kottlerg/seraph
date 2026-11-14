@@ -8,9 +8,9 @@ drivers keep the `devmgr_dma_labels` contract whichever IOMMU sits behind it
 § IOMMU Discovery and Programming). It is x86-64 only, and ships as a boot module, since it must
 confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF note
 section `.note.seraph.driver` (IOMMU family `dmar`), which devmgr matches against the IOMMU family
-record in a pass of its own and starts with the IOMMU bootstrap rounds, not the resource list. The
-bootstrap, the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s; this
-crate is the VT-d `Backend`.
+record in a pass of its own, delivering it the units in its resource list. The delivery decode,
+the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s; this crate is the
+VT-d `Backend`.
 
 The driver runs the units in legacy translation mode:
 

@@ -10,9 +10,9 @@ contract whichever IOMMU sits behind it
 § IOMMU Discovery and Programming). It is riscv64 only, and ships as a boot module, since it must
 confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF note
 section `.note.seraph.driver` (IOMMU family `rimt`), which devmgr matches against the IOMMU family
-record in a pass of its own and starts with the IOMMU bootstrap rounds, not the resource list. The
-bootstrap, the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s, and the
-table pages [`iommu-store`](../store/README.md)'s; this crate is the RISC-V IOMMU `Backend`.
+record in a pass of its own, delivering it the units in its resource list. The delivery decode,
+the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s, and the table
+pages [`iommu-store`](../store/README.md)'s; this crate is the RISC-V IOMMU `Backend`.
 
 The driver runs each IOMMU with first-stage translation only, the second stage Bare, since the
 system runs no guests:

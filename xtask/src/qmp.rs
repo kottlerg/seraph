@@ -7,11 +7,13 @@
 //! Connects to QEMU's `-qmp unix:...` socket, completes the capabilities
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
-//! and `quit` (snapshot-resume test).
+//! and `quit` (snapshot-resume test), and `stop` + `pmemsave` (the ACPI table
+//! capture).
 //!
 //! Hand-rolled (no JSON dependency): the messages are fixed strings or
-//! `format!` templates, the one free-form value (the migrate URI)
-//! JSON-escaped by `json_string`, and responses are matched by substring.
+//! `format!` templates, the free-form values (the migrate URI, the memory
+//! dump's path) JSON-escaped by `json_string`, and responses are matched by
+//! substring.
 //! QMP messages are newline-delimited JSON.
 
 use std::fmt::Write as _;
@@ -172,6 +174,40 @@ pub fn migrate_to_file(socket: &Path, state_path: &Path, timeout: Duration) -> R
     }
 }
 
+/// Stop the guest's vCPUs, then save `size` bytes of its physical memory
+/// from `base` to `path` (`stop`, then `pmemsave`), and return once QEMU has
+/// written the file. The guest is left stopped; the caller [`quit`]s it.
+pub fn save_memory(socket: &Path, base: u64, size: u64, path: &Path) -> Result<()>
+{
+    let msg = pmemsave_command(base, size, path)?;
+    let mut client = Client::connect(socket)?;
+    client.send(r#"{"execute":"stop"}"#)?;
+    client.read_result().context("stop")?;
+    // QEMU answers once the whole file is written.
+    client
+        .reader
+        .get_ref()
+        .set_read_timeout(Some(PMEMSAVE_TIMEOUT))
+        .context("setting QMP read timeout")?;
+    client.send(&msg)?;
+    client.read_result().context("pmemsave")?;
+    Ok(())
+}
+
+/// How long `pmemsave` may take to write the guest's memory.
+const PMEMSAVE_TIMEOUT: Duration = Duration::from_mins(2);
+
+/// The QMP `pmemsave` command saving `size` bytes of guest physical memory
+/// from `base` to `path`, the path JSON-escaped into the command's string
+/// argument.
+fn pmemsave_command(base: u64, size: u64, path: &Path) -> Result<String>
+{
+    Ok(format!(
+        r#"{{"execute":"pmemsave","arguments":{{"val":{base},"size":{size},"filename":{}}}}}"#,
+        json_string(path_str(path)?)
+    ))
+}
+
 /// Ask QEMU to exit. The response read is best-effort: QEMU may close the
 /// socket before or instead of acknowledging.
 pub fn quit(socket: &Path) -> Result<()>
@@ -230,7 +266,7 @@ fn migrate_command(state_path: &Path) -> Result<String>
 fn path_str(path: &Path) -> Result<&str>
 {
     path.to_str()
-        .with_context(|| format!("state path {} is not UTF-8", path.display()))
+        .with_context(|| format!("path {} is not UTF-8", path.display()))
 }
 
 /// Quote `s` as one POSIX shell word: wrapped in single quotes, inside
@@ -300,6 +336,16 @@ mod tests
     }
 
     #[test]
+    fn pmemsave_command_json_escapes_the_path()
+    {
+        let cmd = pmemsave_command(0x8000_0000, 512 << 20, Path::new("/w/\"m\".bin")).unwrap();
+        assert_eq!(
+            cmd,
+            r#"{"execute":"pmemsave","arguments":{"val":2147483648,"size":536870912,"filename":"/w/\"m\".bin"}}"#
+        );
+    }
+
+    #[test]
     fn non_utf8_state_path_is_rejected()
     {
         use std::ffi::OsStr;
@@ -308,5 +354,6 @@ mod tests
         let path = Path::new(OsStr::from_bytes(b"/w/\xff.bin"));
         exec_save_uri(path).unwrap_err();
         exec_restore_uri(path).unwrap_err();
+        pmemsave_command(0, 1, path).unwrap_err();
     }
 }

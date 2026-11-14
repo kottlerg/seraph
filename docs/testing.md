@@ -10,7 +10,10 @@ tests — their quality rules and the boundary between host-unit and booted
 testing — are governed by
 [coding-standards.md](coding-standards.md#d-testing-invariants). `cargo xtask test` runs them on
 the host and again built for riscv64 under QEMU's user-mode emulator, which needs the packages
-[build-system.md](build-system.md#toolchain) § Toolchain lists.
+[build-system.md](build-system.md#toolchain) § Toolchain lists. The ACPI tables the
+[`shared/aml`](../shared/aml/README.md) host tests load are QEMU's, captured by
+`cargo xtask capture-acpi`. Firmware tables captured from real hardware are not tracked; a
+defect found on one is reduced to a hand-written test case.
 
 ---
 
@@ -1422,4 +1425,5 @@ note in full.
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
 [services/svctest/README.md](../services/svctest/README.md),
-[services/usertest/README.md](../services/usertest/README.md), [xtask/README.md](../xtask/README.md)
+[services/usertest/README.md](../services/usertest/README.md),
+[shared/aml/README.md](../shared/aml/README.md), [xtask/README.md](../xtask/README.md)

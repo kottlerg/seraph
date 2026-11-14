@@ -6,6 +6,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | Crate | Purpose |
 |---|---|
 | [`ansi/`](ansi/README.md) | Incremental ANSI SGR colour parser for the terminal output path |
+| [`aml/`](aml/README.md) | ACPI Machine Language encodings, resource-template decoder, term parser and namespace, host-tested over QEMU's tables |
 | [`crash-report/`](crash-report/README.md) | Crash-report block emitter and parser, shared by crashd and xtask |
 | [`crypto/`](crypto/README.md) | In-OS crypto primitives — SHA-512 hashing and Ed25519 signature verification, `no_std`, zero-dependency |
 | [`death-set/`](death-set/README.md) | Growable death-queue set and main wait set used by supervisor services |

@@ -1590,7 +1590,7 @@ pub fn phase3_svcmgr_handover(
 
     // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
     // endpoints plus the publish-role source caps (rootfs root, devmgr
-    // registry, the two vfsd SENDs), then one round per init-bootstrapped
+    // registry, the three vfsd SENDs), then one round per init-bootstrapped
     // substrate service carries that service's (name, thread_cap) for
     // death-supervision binding, and the terminal round carries the reserved
     // log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes

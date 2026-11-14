@@ -165,7 +165,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
 - Spawn svcmgr from `/services/svcmgr` with the `Universal` namespace
   policy (`create_svcmgr_from_file`), then serve it the handover
   endowment over the bootstrap-round protocol (`endow_svcmgr`):
-  - **`CAPS` rounds** (two for these six slots, each with a
+  - **`CAPS` rounds** (two for these seven slots, each with a
     rounds-left count) — svcmgr's service + bootstrap endpoints
     (full rights), plus the publish-role source caps: a `SEND` on the
     root filesystem's namespace endpoint (svcmgr publishes it as
@@ -174,7 +174,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     `devmgr.shutdown`, and `devmgr.bind` publish caps, the `CLASS_AUTHORITY`
     `MINT_CLASS_SEND` cap it configures devmgr's device classes with, and the
     `DRIVERS_DIR_AUTHORITY` `SET_DRIVERS_DIR` cap from it; see
-    [Publish authority](../../svcmgr/docs/ipc-interface.md#publish-authority)), and two
+    [Publish authority](../../svcmgr/docs/ipc-interface.md#publish-authority)), and three
     SENDs on vfsd's service endpoint init mints from `vfsd_service_ep`: one
     badged `MOUNT_AUTHORITY` alone (published seed-only as `vfsd.mount`), one
     badged `DENY_BADGE` (published seed-only as `vfsd.deny`), and one badged
@@ -261,7 +261,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
     a failure leaves the system without a wallclock — timed degrades to
     `WALL_CLOCK_UNAVAILABLE` (see [timed](../../timed/README.md)).
 
-  All four `devmgr.*` names, both `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
+  All four `devmgr.*` names, the three `vfsd.*` names, and `logd.query` are seed-only: svcmgr's
   `QUERY_ENDPOINT` refuses them, so each badge reaches only the recipes that seed the name
   ([svcmgr IPC interface § Label 4](../../svcmgr/docs/ipc-interface.md#label-4-query_endpoint)).
   `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except `devmgr.bind`'s

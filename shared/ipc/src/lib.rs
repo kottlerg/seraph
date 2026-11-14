@@ -1361,7 +1361,7 @@ pub mod svcmgr_labels
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
 /// four `devmgr.*` names, [`published_names::VFSD_MOUNT`],
-/// [`published_names::LOGD_QUERY`], and each provider
+/// [`published_names::VFSD_SWAP`], [`published_names::LOGD_QUERY`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND

@@ -41,8 +41,8 @@ and svcmgr decodes with.
 
 **First rounds — `CAPS` (`data[0] = 1`, not terminal):** a positional
 slot list, split into windows of `MSG_CAP_SLOTS_MAX` slots, one `CAPS`
-round per window (`ipc::bootstrap::slot_rounds`); the six slots below
-take two rounds (slots 0-3, then 4-5), and a longer list takes more with
+round per window (`ipc::bootstrap::slot_rounds`); the seven slots below
+take two rounds (slots 0-3, then 4-6), and a longer list takes more with
 no change to the encoding.
 
 | Field | Value |
@@ -66,7 +66,7 @@ svcmgr mints the `devmgr.registry` publish cap
 `MINT_CLASS_SEND` cap (`CLASS_AUTHORITY`) with which it configures devmgr's device classes
 ([service-definitions.md § Device class files](service-definitions.md#device-class-files)), and
 the `SET_DRIVERS_DIR` cap (`DRIVERS_DIR_AUTHORITY`) from the devmgr-registry source, and publishes
-the two vfsd SENDs as they arrive (their badges ride through to the
+the three vfsd SENDs as they arrive (their badges ride through to the
 seeding recipe unchanged). A version
 mismatch in `data[1]`, or a malformed `CAPS` round (including one past the
 rounds the list takes, one whose rounds-left word disagrees with them, one
@@ -241,7 +241,7 @@ published through [`PUBLISH_ENDPOINT`](#label-3-publish_endpoint).
 `svcmgr_labels::PUBLISH_AUTHORITY` is a verb-bit (the top bit of the
 caller's cap badge) gating `PUBLISH_ENDPOINT` for *external* publishers.
 svcmgr publishes the well-known names it owns (`rootfs.root`, `svcmgr`,
-the four `devmgr.*` names, the two `vfsd.*` names, `logd.query`, and each provider's
+the four `devmgr.*` names, the three `vfsd.*` names, `logd.query`, and each provider's
 `provides` names) directly into
 its own registry, so those need no badge. The gate exists for a future
 external publisher — devmgr holds a `PUBLISH_AUTHORITY`-badged SEND from

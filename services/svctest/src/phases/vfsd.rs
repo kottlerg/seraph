@@ -222,11 +222,20 @@ fn block_io(blk: u64, label: u64, lba: u64, page: &mut u64, what: &str) -> u64
     reply.label
 }
 
-/// The byte at offset `i` of the pattern written at `lba`: distinct per
-/// block, so a read that reached the wrong block shows.
+/// The byte at offset `i` of the pattern written at `lba`. The patterns of
+/// LBA 0 and of the last LBA differ, so a read that reached the wrong end
+/// shows; the poison [`poison`] writes before a read differs from the
+/// expected pattern at every byte, so a read that moved no data shows too.
 fn pattern(lba: u64, i: usize) -> u8
 {
     (lba ^ i as u64 ^ 0xA5).to_le_bytes()[0]
+}
+
+/// The pattern argument whose bytes all differ from those of `lba`'s
+/// pattern: bit 7 of each byte flips.
+fn poison(lba: u64) -> u64
+{
+    lba ^ 0x80
 }
 
 /// Fill the first `len` bytes at `va` with the pattern of `lba`.
@@ -357,7 +366,7 @@ fn swap_partition_phase(caps: &Caps)
     for lba in [0, last]
     {
         // SAFETY: as above.
-        unsafe { fill(va, len, u64::MAX) };
+        unsafe { fill(va, len, poison(lba)) };
         let label = block_io(
             first,
             ipc::blk_labels::BLK_READ_INTO_MEMORY,
@@ -415,7 +424,7 @@ fn swap_partition_phase(caps: &Caps)
         "{WHAT}: the second cap addresses a different range"
     );
     // SAFETY: as above.
-    unsafe { fill(va, len, u64::MAX) };
+    unsafe { fill(va, len, poison(0)) };
     let label = block_io(
         second,
         ipc::blk_labels::BLK_READ_INTO_MEMORY,

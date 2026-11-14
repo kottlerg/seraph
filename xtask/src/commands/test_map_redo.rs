@@ -12,8 +12,9 @@
 //! (`core/boot/docs/memory-map.md` § Sizing the Entry Array), which QEMU's
 //! firmware never makes it do. The `\EFI\seraph\mapredo` test knob makes the
 //! first attempt redo whatever its map's size. This command stages the knob,
-//! repacks `disk.img`, boots the current sysroot once through `run-parallel`,
-//! and always removes the knob and repacks again afterwards. It passes when
+//! repacks the disk images in the layout they have, boots the current sysroot
+//! once through `run-parallel`, and always removes the knob and repacks again
+//! in that layout afterwards. It passes when
 //! the boot reaches its harness's pass marker and its log holds the
 //! bootloader's knob line [`KNOB_LINE`] exactly once. A boot whose
 //! `run-parallel` outcome is a `QEMU-CRASH` is skipped, not failed, as
@@ -24,7 +25,7 @@
 //! `--test-devices` when that harness is svctest, whose devmgr phases drive
 //! the test devices.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use regex::Regex;
@@ -89,17 +90,18 @@ pub fn run(ctx: &Context, args: &TestMapRedoArgs) -> Result<()>
         {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", log.display())),
     }
+    // The layout is read before staging, so a failed staging repack cannot
+    // change the one the restore writes.
+    let layout = crate::disk::current_layout(ctx)?;
     stage_knob(ctx, Knob::MapRedo).context("staging the mapredo knob")?;
-    let booted = crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
-        .context("repacking disk.img with the mapredo knob")
-        .and_then(|()| boot(ctx, args, &dir));
+    let booted = crate::disk::create_disk_image(ctx, args.arch, layout)
+        .context("repacking the disk images with the mapredo knob")
+        .and_then(|()| boot(ctx, args, &dir, layout.second_image(ctx)));
     // Restore first, and surface its failure ahead of the boot's: a knob left
     // staged would redo steps 6 and 7 on every later boot of this sysroot.
     remove_knob(ctx, Knob::MapRedo)
-        .and_then(|()| {
-            crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
-        })
-        .context("removing the mapredo knob and repacking disk.img")?;
+        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
+        .context("removing the mapredo knob and repacking the disk images")?;
     booted?;
     step(&format!("map redo test: reading {}", log.display()));
     let bytes = std::fs::read(&log).with_context(|| format!("reading {}", log.display()))?;
@@ -118,18 +120,24 @@ pub fn run(ctx: &Context, args: &TestMapRedoArgs) -> Result<()>
     Ok(())
 }
 
-/// Boot the current sysroot once through `run-parallel`, saving the run's log
-/// into `dir`.
-fn boot(ctx: &Context, args: &TestMapRedoArgs, dir: &Path) -> Result<()>
+/// Boot the current sysroot once through `run-parallel`, with `data_image` as
+/// its second disk when the layout has one, saving the run's log into `dir`.
+fn boot(
+    ctx: &Context,
+    args: &TestMapRedoArgs,
+    dir: &Path,
+    data_image: Option<PathBuf>,
+) -> Result<()>
 {
-    let run = run_args(args, dir);
+    let run = run_args(args, dir, data_image);
     step("map redo test: booting the current sysroot with the mapredo knob staged");
     crate::commands::run_parallel::run(ctx, &run)
 }
 
 /// The `run-parallel` arguments of the boot: one run of `args`'s machine,
-/// its log saved into `dir`.
-fn run_args(args: &TestMapRedoArgs, dir: &Path) -> RunParallelArgs
+/// `data_image` attached as the second disk when there is one, its log saved
+/// into `dir`.
+fn run_args(args: &TestMapRedoArgs, dir: &Path, data_image: Option<PathBuf>) -> RunParallelArgs
 {
     RunParallelArgs {
         arch: args.arch,
@@ -152,7 +160,7 @@ fn run_args(args: &TestMapRedoArgs, dir: &Path) -> RunParallelArgs
         hold_on_hang: false,
         fail_grace_secs: DEFAULT_FAIL_GRACE_SECS,
         save_logs: Some(dir.to_path_buf()),
-        second_disk: None,
+        second_disk: data_image,
         second_disk_block_size: None,
         second_disk_shared_line: false,
         host: args.host.clone(),
@@ -207,9 +215,41 @@ mod tests
 
         let dir = Path::new("target/xtask/test-map-redo");
         let plain = TestMapRedoArgs::try_parse_from(["test-map-redo"]).unwrap();
-        assert!(!run_args(&plain, dir).test_devices);
+        assert!(!run_args(&plain, dir, None).test_devices);
         let asked = TestMapRedoArgs::try_parse_from(["test-map-redo", "--test-devices"]).unwrap();
-        assert!(run_args(&asked, dir).test_devices);
+        assert!(run_args(&asked, dir, None).test_devices);
+    }
+
+    // Defect caught: a split layout's boot attaching disk.img alone, so a
+    // staged svctest had no /data.
+    #[test]
+    fn a_split_layout_s_data_image_reaches_the_boot()
+    {
+        use clap::Parser as _;
+
+        use crate::disk::{BlockSize, DataPlacement, DiskLayout};
+
+        let ctx = Context {
+            root: PathBuf::from("/w"),
+            sysroot: PathBuf::from("/w/sysroot"),
+            target_dir: PathBuf::from("/w/target"),
+        };
+        let dir = Path::new("target/xtask/test-map-redo");
+        let args = TestMapRedoArgs::try_parse_from(["test-map-redo"]).unwrap();
+        let split = DiskLayout {
+            block_size: BlockSize::B4096,
+            data: DataPlacement::SecondImage,
+        };
+        let run = run_args(&args, dir, split.second_image(&ctx));
+        assert_eq!(run.second_disk, Some(ctx.data_disk_image()));
+        // The device's block size is read from the image, as for `run-parallel`.
+        assert_eq!(run.second_disk_block_size, None);
+        assert!(!run.second_disk_shared_line);
+        let single = DiskLayout::default();
+        assert_eq!(
+            run_args(&args, dir, single.second_image(&ctx)).second_disk,
+            None
+        );
     }
 
     // Defect caught: a knob that redoes a later attempt too passing the test.

@@ -4,13 +4,14 @@ Test-tier fixture that validates svcmgr's restart path by crashing on purpose. I
 opt-in: its recipe lives in `/config/svcmgr/tests/`, is co-staged with `svctest` in CI, and is
 never launched on a normal boot.
 
-On every spawn it checks that the recipe surfaces (argv, env, cwd, and bootstrap seeds)
-survived and logs `<surface> ok` for each. It then logs `alive` and probes the svcmgr seed with
-a `QUERY_ENDPOINT` for the unknown name `__probe__`, logging the reply label; any reply shows
-the cap is live. Finally it faults on purpose (a NULL write) so svcmgr respawns it under
-`restart = always`. A surface that fails to round-trip, such as one dropped on restart, is
-logged with a `FATAL:` prefix, which the `run-parallel` fail regex catches to fail the run. The
-deliberate `USERSPACE FAULT` does not count as a failure.
+On every spawn it checks that the recipe surfaces (argv, env, cwd, and bootstrap seeds) survived
+and logs `<surface> ok` for each. It then logs `alive` and probes the svcmgr seed with a
+`QUERY_ENDPOINT` for the unknown name `__probe__`, logging the reply label; any reply shows the
+cap is live, and a call that gets no reply is a failed round-trip. Finally it faults on purpose
+(a NULL write) so svcmgr respawns it under `restart = always`. A surface that fails to
+round-trip, such as one dropped on restart, is logged with a `FATAL:` prefix, which the
+`run-parallel` fail regex catches to fail the run. The deliberate `USERSPACE FAULT` does not
+count as a failure.
 
 ---
 

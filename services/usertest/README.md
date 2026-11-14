@@ -5,6 +5,11 @@ under `/tests/programs/`, spawns each, and reports a pass/fail verdict
 from the child's exit status, per the harness model in
 [docs/testing.md](../../docs/testing.md).
 
+Each tester runs with its stdout and stderr piped. `usertest` forwards every line of both to the
+boot log as `[<tester>:out]` or `[<tester>:err]`, and drains the two streams at once, stderr on a
+thread of its own, so a tester may write any amount to either while the other is open. It then
+waits for the tester's exit status.
+
 ---
 
 ## Source Layout

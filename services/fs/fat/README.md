@@ -38,6 +38,7 @@ Each label's wire shape and error set are specified in
 | Label | Unbadged? | Description |
 |---|---|---|
 | `FS_MOUNT` | yes | vfsd's BPB-validation probe at mount time |
+| `FS_UNMOUNT` | yes | vfsd's unmount: refused `BUSY` while an open is live unless forced, else every open released and the driver exits |
 | `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` | no | namespace dispatch |
 | `FS_OPEN` | no | mint a per-open cap and its liveness cap on a file cap |
 | `FS_READ` | no | inline read on a file cap or open cap |

@@ -525,6 +525,8 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `Elf64Ehdr.e_phnum`, `e_shnum` | `shared/elf/src/lib.rs` | `u16` | hardware spec (ELF64 header) | none | correct as is | None |
 | ed25519 `MSG_SCRATCH` | `shared/crypto/src/ed25519.rs` | 1024 | provably unreachable (largest RFC 8032 vector 1023 B) | 2 KiB stack | correct as is | None |
 | `Sha512.total_len` | `shared/crypto/src/sha512.rs` | `u128` | hardware spec (FIPS 180-4 length field) | 16 B | correct as is | None |
+| `chacha20poly1305::MAX_LEN` | `shared/crypto/src/chacha20poly1305.rs` | `(2^32 - 1) * 64` B = 274 877 906 880 B per sealed buffer | format spec (RFC 8439 § 2.8: the 32-bit block counter, block 0 taken by the Poly1305 key) | none | correct as is | None |
+| chacha20-poly1305 `KAT_SCRATCH` | `shared/crypto/src/chacha20poly1305.rs` | 384 B | provably unreachable (largest RFC 8439 vector 375 B) | 768 B stack | correct as is | None |
 | `FONT_9X20` | `shared/font/src/lib.rs` | 256 glyphs | hardware spec (CP437) | 10 KiB rodata | correct as is | None |
 | `FONT_9X20_EXT_COUNT` | `shared/font/src/lib.rs` | 20 | encoding artefact (code points the tree renders) | 800 B rodata | correct as is | Pin the map against the count |
 | `Utf8Decoder.buf` | `shared/text/src/utf8.rs` | 4 B | hardware spec (UTF-8 sequence length) | 5 B | correct as is | None |

@@ -1594,6 +1594,12 @@ const PRESSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 /// runtime's [`std::os::seraph::MEMORY_PRESSURE_BIT`].
 const PRESSURE_OWN_BIT: u64 = 1 << 5;
 
+/// How many times [`pressure_phase`] stops and starts the thread waiting in
+/// [`std::os::seraph::wait_memory_pressure`], and the sleep before each stop,
+/// which lets the thread reach its wait first.
+const PRESSURE_WAITER_STOPS: u32 = 3;
+const PRESSURE_WAITER_STOP_GAP: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// memmgr's `QUERY_POOL_STATUS` pool total, free total and pressure level
 /// (`data[2]`, `data[3]` and `data[7]`), the totals in pages.
 fn pool_pressure_status() -> (u64, u64, u64)
@@ -1678,9 +1684,13 @@ fn take_pages(pages: u64) -> Vec<(u64, u64)>
 ///    then takes grants until the free pool sits below the low threshold and
 ///    above the reserve: the second Notification receives its bit, the level
 ///    reads `Low`, and the runtime's Notification receives nothing.
-/// 4. svctest registers the runtime's Notification again and releases the
-///    grants: the runtime's receives its bit, the level reads `Normal`, and
-///    the second Notification receives nothing more.
+/// 4. svctest registers the runtime's Notification again, and a helper thread
+///    waits on it ([`std::os::seraph::wait_memory_pressure`]). svctest stops
+///    and starts the helper while it waits, which cancels the blocked wait
+///    with `Interrupted` (docs/fault-handling.md § Asynchronous Upcalls), and
+///    then releases the grants: the wait outlasts the stops and returns at
+///    the runtime's bit, the level reads `Normal`, and the second
+///    Notification receives nothing more.
 ///
 /// memmgr's low threshold and band are 1/16 and 1/128 of the pool
 /// (`PRESSURE_LOW_DIVISOR`, `PRESSURE_BAND_DIVISOR`) and its reserve 2/128;
@@ -1777,12 +1787,32 @@ pub fn pressure_phase(_: &Caps)
         ipc::memmgr_errors::SUCCESS,
         "REGISTER_PRESSURE restoring the runtime's"
     );
+    let (cap_tx, cap_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        cap_tx
+            .send(std::os::seraph::thread::current_thread_cap())
+            .expect("publishing the waiter's cap");
+        std::os::seraph::wait_memory_pressure(Some(PRESSURE_WAIT))
+    });
+    let waiter_cap = cap_rx.recv().expect("the waiter's cap");
+    for _ in 0..PRESSURE_WAITER_STOPS
+    {
+        std::thread::sleep(PRESSURE_WAITER_STOP_GAP);
+        if waiter.is_finished()
+        {
+            break;
+        }
+        syscall::thread_stop(waiter_cap).expect("stopping the waiter");
+        syscall::thread_start(waiter_cap).expect("starting the waiter");
+    }
     for (cap, id) in held
     {
         release_grant(cap, id);
     }
-    let level = std::os::seraph::wait_memory_pressure(Some(PRESSURE_WAIT))
-        .expect("wait on the runtime's Notification");
+    let level = waiter
+        .join()
+        .expect("joining the waiter")
+        .expect("wait on the runtime's Notification across stops of its thread");
     assert_eq!(level, MemoryPressure::Normal, "level after the release");
     assert_eq!(
         take_bits(own_sig),
@@ -1793,6 +1823,7 @@ pub fn pressure_phase(_: &Caps)
 
     std::os::seraph::log!(
         "memmgr_pressure: Normal -> Low at {low_free} of {total} pages free -> Normal, each \
-         change signalled to the registration in place"
+         change signalled to the registration in place, the last wait outlasting stops of its \
+         thread"
     );
 }

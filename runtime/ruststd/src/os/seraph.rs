@@ -1043,7 +1043,9 @@ pub fn memory_pressure_notification() -> Option<u64> {
 /// takes a change already signalled without blocking.
 ///
 /// Each change wakes one waiter of the process: a thread that waits here
-/// takes the bit from every other.
+/// takes the bit from every other. A stop of the waiting thread, or an
+/// upcall to it, does not end the wait: it waits again for what is left of
+/// `timeout` (`docs/fault-handling.md` § Asynchronous Upcalls).
 ///
 /// # Errors
 /// `Unsupported` when the process is not registered
@@ -1059,22 +1061,40 @@ pub fn wait_memory_pressure(
             "seraph: no memory-pressure registration",
         )
     })?;
-    let timeout_ms = match timeout {
-        None => 0,
-        Some(d) if d.is_zero() => syscall::WAIT_TRY_ONCE,
-        // A wait shorter than a millisecond rounds up, since 0 means no bound.
-        Some(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1).max(1),
+    let timed_out = || {
+        crate::io::Error::new(crate::io::ErrorKind::TimedOut, "seraph: no memory-pressure change")
     };
-    let bits = match syscall::notification_wait_timeout(sig, timeout_ms) {
-        Ok(bits) => bits,
-        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => 0,
-        Err(_) => return Err(crate::io::Error::other("seraph: memory-pressure wait failed")),
-    };
-    if bits == 0 {
-        return Err(crate::io::Error::new(
-            crate::io::ErrorKind::TimedOut,
-            "seraph: no memory-pressure change",
-        ));
+    let start = crate::time::Instant::now();
+    loop {
+        let timeout_ms = match timeout {
+            None => 0,
+            Some(d) => match d.checked_sub(start.elapsed()) {
+                // Whatever remains rounds up to whole milliseconds, since 0
+                // means no bound; `WAIT_TRY_ONCE` (`u64::MAX`) is kept apart.
+                Some(left) if !left.is_zero() => {
+                    u64::try_from(left.as_nanos().div_ceil(1_000_000))
+                        .unwrap_or(u64::MAX)
+                        .min(u64::MAX - 1)
+                }
+                // Nothing left: take a change already signalled, without
+                // blocking.
+                _ => syscall::WAIT_TRY_ONCE,
+            },
+        };
+        match syscall::notification_wait_timeout(sig, timeout_ms) {
+            // A zero-bit return is the timeout, which a wait with no bound
+            // has none of.
+            Ok(0) if timeout.is_none() => {}
+            Ok(0) => return Err(timed_out()),
+            Ok(_) => break,
+            Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => {
+                return Err(timed_out());
+            }
+            // A stop or an upcall cancelled the wait; the kernel restarts
+            // nothing, so wait again.
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
+            Err(_) => return Err(crate::io::Error::other("seraph: memory-pressure wait failed")),
+        }
     }
     memory_pressure()
         .ok_or_else(|| crate::io::Error::other("seraph: memory-pressure level unreadable"))

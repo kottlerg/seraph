@@ -606,7 +606,8 @@ pressure):
 - `memory_pressure_notification()` is the registered Notification, with every right, which memmgr
   sends `MEMORY_PRESSURE_BIT` on at each change of level; a server adds it to its wait set.
 - `wait_memory_pressure(timeout)` waits for the bit and returns the level then. Each change wakes
-  one waiter of the process.
+  one waiter of the process. A wait cancelled with `Interrupted` (a stop of the thread, or an
+  upcall to it) waits again for what is left of `timeout`.
 
 A process that registers another Notification itself replaces the runtime's, which memmgr then
 signals no more.

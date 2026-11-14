@@ -20,8 +20,9 @@ devmgr/
 │                                   #   IOMMUs, ID mappings), driver-declaration binding
 │                                   #   (PCI identity keys, match ranking, declaration
 │                                   #   bounds), the served-class table, bounded image reads,
-│                                   #   the AML `Device` walker, platform device records,
-│                                   #   the platform description table parser
+│                                   #   the AML `Device` walker (on `shared/aml`'s encodings
+│                                   #   and resource-template decoder), platform device
+│                                   #   records, the platform description table parser
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,

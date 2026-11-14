@@ -3,8 +3,8 @@
 
 // services/devmgr/firmware/src/aml.rs
 
-//! A static walk of a DSDT or SSDT's AML namespace, and the decoder for the
-//! resource templates it finds.
+//! A static walk of a DSDT or SSDT's AML namespace, and the adapter from the
+//! resource templates it finds to the resources devmgr carves caps for.
 //!
 //! devmgr reports every `Device` object whose `_HID`, `_CID`, `_UID`, and
 //! `_CRS` are `Name` objects as a device record
@@ -18,6 +18,19 @@
 //! the enclosing package continues after it. Every read is bounds-checked
 //! against the caller's slice, nesting is bounded by [`MAX_DEPTH`], and each
 //! step advances, so any byte string terminates without a panic. No alloc.
+//!
+//! The AML encodings (`PkgLength`, `NameString`, data objects, the EISA ID)
+//! and the resource-template decoder are those of the `aml` crate
+//! (`shared/aml`); the walk and [`crs_resources`] use only its alloc-free
+//! modules.
+
+use ::aml::encoding::{
+    self, EXT_BANK_FIELD, EXT_DEVICE, EXT_EVENT, EXT_FIELD, EXT_INDEX_FIELD, EXT_MUTEX,
+    EXT_OP_REGION, EXT_POWER_RES, EXT_PROCESSOR, EXT_THERMAL_ZONE, OP_ALIAS, OP_BUFFER, OP_ELSE,
+    OP_EXT_PREFIX, OP_EXTERNAL, OP_IF, OP_METHOD, OP_NAME, OP_PACKAGE, OP_SCOPE, OP_WHILE,
+    data_object_len, integer, name_string, package,
+};
+use ::aml::resource::{self, AddressWidth, Resource, SPACE_MEMORY};
 
 use crate::acpi::{SDT_HDR_LEN, sdt_length};
 
@@ -33,41 +46,6 @@ pub const MAX_DEPTH: usize = 16;
 pub const MAX_CRS_RESOURCES: usize = 8;
 
 const _: () = assert!(MAX_ID_BYTES == driver_binding::decl::MAX_ACPI_ID_BYTES);
-
-// ── Opcodes ───────────────────────────────────────────────────────────
-
-const OP_ZERO: u8 = 0x00;
-const OP_ONE: u8 = 0x01;
-const OP_ALIAS: u8 = 0x06;
-const OP_NAME: u8 = 0x08;
-const OP_BYTE: u8 = 0x0A;
-const OP_WORD: u8 = 0x0B;
-const OP_DWORD: u8 = 0x0C;
-const OP_STRING: u8 = 0x0D;
-const OP_QWORD: u8 = 0x0E;
-const OP_SCOPE: u8 = 0x10;
-const OP_BUFFER: u8 = 0x11;
-const OP_PACKAGE: u8 = 0x12;
-const OP_VAR_PACKAGE: u8 = 0x13;
-const OP_METHOD: u8 = 0x14;
-const OP_EXTERNAL: u8 = 0x15;
-const OP_EXT_PREFIX: u8 = 0x5B;
-const OP_IF: u8 = 0xA0;
-const OP_ELSE: u8 = 0xA1;
-const OP_WHILE: u8 = 0xA2;
-const OP_ONES: u8 = 0xFF;
-
-const EXT_MUTEX: u8 = 0x01;
-const EXT_EVENT: u8 = 0x02;
-const EXT_REVISION: u8 = 0x30;
-const EXT_OP_REGION: u8 = 0x80;
-const EXT_FIELD: u8 = 0x81;
-const EXT_DEVICE: u8 = 0x82;
-const EXT_PROCESSOR: u8 = 0x83;
-const EXT_POWER_RES: u8 = 0x84;
-const EXT_THERMAL_ZONE: u8 = 0x85;
-const EXT_INDEX_FIELD: u8 = 0x86;
-const EXT_BANK_FIELD: u8 = 0x87;
 
 // ── Types ─────────────────────────────────────────────────────────────
 
@@ -132,164 +110,12 @@ struct Collect<'a>
     dynamic: bool,
 }
 
-// ── Grammar helpers ───────────────────────────────────────────────────
-
-/// Bounds of the package whose `PkgLength` lead byte is at `lead`: the offset
-/// of the first body byte and the offset one past the package's end. The end
-/// must lie within `buf`.
-fn package(buf: &[u8], lead: usize) -> Option<(usize, usize)>
-{
-    let b0 = *buf.get(lead)?;
-    let extra = usize::from(b0 >> 6);
-    let len = if extra == 0
-    {
-        usize::from(b0 & 0x3F)
-    }
-    else
-    {
-        let mut v = usize::from(b0 & 0x0F);
-        for i in 0..extra
-        {
-            let b = *buf.get(lead.checked_add(1)?.checked_add(i)?)?;
-            v |= usize::from(b) << i.saturating_mul(8).saturating_add(4);
-        }
-        v
-    };
-    if len < extra.saturating_add(1)
-    {
-        return None;
-    }
-    let end = lead.checked_add(len)?;
-    if end > buf.len()
-    {
-        return None;
-    }
-    Some((lead.checked_add(1)?.checked_add(extra)?, end))
-}
-
-/// Size and last `NameSeg` of the `NameString` at `pos`. The last segment is
-/// `None` for a `NullName` or an empty multi-name.
-fn name_string(buf: &[u8], pos: usize) -> Option<(usize, Option<[u8; 4]>)>
-{
-    let mut p = pos;
-    match *buf.get(p)?
-    {
-        0x5C => p = p.saturating_add(1),
-        0x5E =>
-        {
-            while buf.get(p) == Some(&0x5E)
-            {
-                p = p.saturating_add(1);
-            }
-        }
-        _ =>
-        {}
-    }
-    let (segs, skip) = match *buf.get(p)?
-    {
-        0x00 => return Some((p.checked_add(1)?.checked_sub(pos)?, None)),
-        0x2E => (2, 1),
-        0x2F => (usize::from(*buf.get(p.saturating_add(1))?), 2),
-        _ => (1, 0),
-    };
-    p = p.saturating_add(skip);
-    let mut last = None;
-    for _ in 0..segs
-    {
-        let seg = buf.get(p..p.checked_add(4)?)?;
-        let (first, rest) = seg.split_first()?;
-        if !(first.is_ascii_uppercase() || *first == b'_')
-            || !rest
-                .iter()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_')
-        {
-            return None;
-        }
-        let &[s0, s1, s2, s3] = seg
-        else
-        {
-            return None;
-        };
-        last = Some([s0, s1, s2, s3]);
-        p = p.saturating_add(4);
-    }
-    Some((p.checked_sub(pos)?, last))
-}
-
-/// Little-endian integer of `n` bytes at `off`.
-fn le(buf: &[u8], off: usize, n: usize) -> Option<u64>
-{
-    let bytes = buf.get(off..off.checked_add(n)?)?;
-    Some(
-        bytes
-            .iter()
-            .rev()
-            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b)),
-    )
-}
-
-/// Integer `DataObject` at `pos`: its value and encoded size.
-fn integer(buf: &[u8], pos: usize) -> Option<(u64, usize)>
-{
-    match *buf.get(pos)?
-    {
-        OP_ZERO => Some((0, 1)),
-        OP_ONE => Some((1, 1)),
-        OP_ONES => Some((u64::MAX, 1)),
-        OP_BYTE => Some((le(buf, pos.saturating_add(1), 1)?, 2)),
-        OP_WORD => Some((le(buf, pos.saturating_add(1), 2)?, 3)),
-        OP_DWORD => Some((le(buf, pos.saturating_add(1), 4)?, 5)),
-        OP_QWORD => Some((le(buf, pos.saturating_add(1), 8)?, 9)),
-        _ => None,
-    }
-}
-
-/// Encoded size of the `DataRefObject` at `pos`.
-fn data_size(buf: &[u8], pos: usize) -> Option<usize>
-{
-    if let Some((_, size)) = integer(buf, pos)
-    {
-        return Some(size);
-    }
-    match *buf.get(pos)?
-    {
-        OP_STRING =>
-        {
-            let rest = buf.get(pos.saturating_add(1)..)?;
-            let nul = rest.iter().position(|b| *b == 0)?;
-            nul.checked_add(2)
-        }
-        OP_BUFFER | OP_PACKAGE | OP_VAR_PACKAGE =>
-        {
-            let (_, end) = package(buf, pos.saturating_add(1))?;
-            end.checked_sub(pos)
-        }
-        OP_EXT_PREFIX if buf.get(pos.saturating_add(1)) == Some(&EXT_REVISION) => Some(2),
-        _ => None,
-    }
-}
+// ── Values ────────────────────────────────────────────────────────────
 
 /// Decode a 32-bit EISA ID as AML stores it.
 fn eisa_id(value: u32) -> Option<Id>
 {
-    let s = value.swap_bytes();
-    let mut text = [0u8; 7];
-    for (i, shift) in [26u32, 21, 16].into_iter().enumerate()
-    {
-        let letter = u8::try_from((s >> shift) & 0x1F).ok()?;
-        if !(1..=26).contains(&letter)
-        {
-            return None;
-        }
-        *text.get_mut(i)? = letter.checked_add(0x40)?;
-    }
-    for (i, shift) in [12u32, 8, 4, 0].into_iter().enumerate()
-    {
-        let digit = u8::try_from((s >> shift) & 0xF).ok()?;
-        *text.get_mut(3usize.checked_add(i)?)? =
-            b"0123456789ABCDEF".get(usize::from(digit)).copied()?;
-    }
-    Id::new(&text)
+    Id::new(&encoding::eisa_id(value)?)
 }
 
 /// A `_HID`/`_CID` value at `pos`: an EISA-ID integer or a string.
@@ -299,13 +125,7 @@ fn id_value(buf: &[u8], pos: usize) -> Option<Id>
     {
         return eisa_id(u32::try_from(value).ok()?);
     }
-    if *buf.get(pos)? == OP_STRING
-    {
-        let rest = buf.get(pos.saturating_add(1)..)?;
-        let nul = rest.iter().position(|b| *b == 0)?;
-        return Id::new(rest.get(..nul)?);
-    }
-    None
+    Id::new(encoding::string(buf, pos)?.0)
 }
 
 // ── Walk ──────────────────────────────────────────────────────────────
@@ -447,7 +267,7 @@ impl<'a, F: FnMut(&AmlDevice<'a>)> Walker<F>
     {
         let (nl, last) = name_string(buf, pos.saturating_add(1))?;
         let value = pos.checked_add(1)?.checked_add(nl)?;
-        let size = data_size(buf, value)?;
+        let size = data_object_len(buf, value)?;
         if let (Some(c), Some(name)) = (dev.as_deref_mut(), last)
         {
             record(c, name, buf, value, size);
@@ -548,7 +368,7 @@ fn record_cids(c: &mut Collect<'_>, buf: &[u8], pos: usize)
     let mut p = body.saturating_add(1);
     for _ in 0..count
     {
-        let Some(size) = data_size(limited, p)
+        let Some(size) = data_object_len(limited, p)
         else
         {
             break;
@@ -657,6 +477,22 @@ impl<F: FnMut(CrsResource)> Emit<F>
         self.n = self.n.saturating_add(1);
         true
     }
+
+    /// Report an I/O port range if its length is non-zero.
+    fn port(&mut self, base: u16, count: u8) -> bool
+    {
+        count == 0
+            || self.push(CrsResource::IoPort {
+                base,
+                count: u16::from(count),
+            })
+    }
+
+    /// Report a memory range if its size is non-zero.
+    fn mem(&mut self, base: u64, size: u64) -> bool
+    {
+        size == 0 || self.push(CrsResource::Mmio { base, size })
+    }
 }
 
 /// `IRQ_MODE_*` bits from the level and polarity flags.
@@ -681,191 +517,91 @@ const fn irq_mode(level: bool, active_low: bool) -> u64
 
 /// Decode the resource template `crs` and call `visit` for each resource, in
 /// template order, at most [`MAX_CRS_RESOURCES`]. Stops at the End Tag, at a
-/// descriptor running past the slice, or at the bound. Returns how many it
-/// visited.
+/// descriptor running past the slice, or at the bound; skips a descriptor
+/// whose length does not fit its kind. Returns how many it visited.
+///
+/// Reported: the lines of an IRQ or Extended Interrupt descriptor, an I/O
+/// Port or Fixed I/O Port range, a 32-bit Fixed Memory range, a 32-bit
+/// Memory range whose minimum and maximum are equal, and a `DWord` or `QWord`
+/// memory range the device consumes. A zero-length range, and every other
+/// descriptor, is skipped.
 pub fn crs_resources(crs: &[u8], visit: impl FnMut(CrsResource)) -> usize
 {
     let mut em = Emit { visit, n: 0 };
-    let mut pos = 0;
-    while let Some(&tag) = crs.get(pos)
+    for descriptor in resource::descriptors(crs)
     {
-        let (kind, body, next) = if tag & 0x80 == 0
+        let ok = match descriptor
         {
-            let len = usize::from(tag & 7);
-            let body_at = pos.saturating_add(1);
-            let next = body_at.saturating_add(len);
-            let Some(body) = crs.get(body_at..next)
-            else
-            {
-                break;
-            };
-            ((tag >> 3) & 0xF, body, next)
-        }
-        else
-        {
-            let Some(len) = le(crs, pos.saturating_add(1), 2)
-            else
-            {
-                break;
-            };
-            let Ok(len) = usize::try_from(len)
-            else
-            {
-                break;
-            };
-            let body_at = pos.saturating_add(3);
-            let next = body_at.saturating_add(len);
-            let Some(body) = crs.get(body_at..next)
-            else
-            {
-                break;
-            };
-            (tag & 0x7F, body, next)
-        };
-        let ok = if tag & 0x80 == 0
-        {
-            if kind == 0xF
-            {
-                break;
-            }
-            small(&mut em, kind, body)
-        }
-        else
-        {
-            large(&mut em, kind, body)
+            Ok(r) => report(&mut em, &r),
+            Err(resource::Error::Malformed { .. }) => true,
+            Err(resource::Error::Truncated) => false,
         };
         if !ok
         {
             break;
         }
-        pos = next;
     }
     em.n
 }
 
-/// Decode a small descriptor; false when the bound is reached.
-fn small<F: FnMut(CrsResource)>(em: &mut Emit<F>, kind: u8, body: &[u8]) -> bool
+/// Report the resources of the descriptor `r`; false when the bound is
+/// reached.
+fn report<F: FnMut(CrsResource)>(em: &mut Emit<F>, r: &Resource<'_>) -> bool
 {
-    match (kind, body.len())
+    match *r
     {
-        (0x4, 2 | 3) =>
+        Resource::Irq(irq) =>
         {
-            let mask = le(body, 0, 2).unwrap_or(0);
-            let flags = body.get(2).copied();
-            let (level, active_low, shared) = flags.map_or((false, false, false), |f| {
-                (f & 1 == 0, f & (1 << 3) != 0, f & (1 << 4) != 0)
-            });
-            for bit in 0..16u32
-            {
-                if mask & (1 << bit) != 0
-                    && !em.push(CrsResource::Interrupt {
-                        line: bit,
-                        mode: irq_mode(level, active_low),
-                        shared,
+            let mode = irq_mode(irq.level(), irq.active_low());
+            (0..16u32)
+                .filter(|bit| irq.mask & (1 << bit) != 0)
+                .all(|line| {
+                    em.push(CrsResource::Interrupt {
+                        line,
+                        mode,
+                        shared: irq.shared(),
                         isa: true,
                     })
-                {
-                    return false;
-                }
-            }
-            true
+                })
         }
-        (0x8, 7) =>
+        Resource::ExtendedIrq(irq) =>
         {
-            let base = le(body, 1, 2).and_then(|v| u16::try_from(v).ok());
-            port(em, base, body.get(6).copied())
-        }
-        (0x9, 3) =>
-        {
-            let base = le(body, 0, 2).and_then(|v| u16::try_from(v & 0x3FF).ok());
-            port(em, base, body.get(2).copied())
-        }
-        _ => true,
-    }
-}
-
-/// Report an I/O port range if its length is non-zero.
-fn port<F: FnMut(CrsResource)>(em: &mut Emit<F>, base: Option<u16>, count: Option<u8>) -> bool
-{
-    match (base, count)
-    {
-        (Some(base), Some(count)) if count > 0 => em.push(CrsResource::IoPort {
-            base,
-            count: u16::from(count),
-        }),
-        _ => true,
-    }
-}
-
-/// Report a memory range if its size is non-zero.
-fn mem<F: FnMut(CrsResource)>(em: &mut Emit<F>, base: Option<u64>, size: Option<u64>) -> bool
-{
-    match (base, size)
-    {
-        (Some(base), Some(size)) if size > 0 => em.push(CrsResource::Mmio { base, size }),
-        _ => true,
-    }
-}
-
-/// Whether an Address descriptor body is a memory range the device consumes
-/// (resource type 0, general flags bit 0 set), not a window it produces.
-fn is_consumed_memory(body: &[u8]) -> bool
-{
-    body.first() == Some(&0) && body.get(1).is_some_and(|f| f & 1 != 0)
-}
-
-/// Decode a large descriptor; false when the bound is reached.
-fn large<F: FnMut(CrsResource)>(em: &mut Emit<F>, kind: u8, body: &[u8]) -> bool
-{
-    match (kind, body.len())
-    {
-        (0x06, 9) => mem(em, le(body, 1, 4), le(body, 5, 4)),
-        (0x05, 17) =>
-        {
-            let (min, max) = (le(body, 1, 4), le(body, 5, 4));
-            if min == max
-            {
-                mem(em, min, le(body, 13, 4))
-            }
-            else
-            {
-                true
-            }
-        }
-        (0x09, 6..) =>
-        {
-            let flags = body.first().copied().unwrap_or(0);
-            let count = usize::from(body.get(1).copied().unwrap_or(0));
-            let avail = body.len().saturating_sub(2) / 4;
-            for i in 0..count.min(avail)
-            {
-                let Some(line) = le(body, i.saturating_mul(4).saturating_add(2), 4)
-                    .and_then(|v| u32::try_from(v).ok())
-                else
-                {
-                    break;
-                };
-                if !em.push(CrsResource::Interrupt {
+            let mode = irq_mode(irq.level(), irq.active_low());
+            irq.lines().all(|line| {
+                em.push(CrsResource::Interrupt {
                     line,
-                    mode: irq_mode(flags & (1 << 1) == 0, flags & (1 << 2) != 0),
-                    shared: flags & (1 << 3) != 0,
+                    mode,
+                    shared: irq.shared(),
                     isa: false,
                 })
-                {
-                    return false;
-                }
-            }
+            })
+        }
+        Resource::Io { min, len, .. } => em.port(min, len),
+        Resource::FixedIo { base, len } => em.port(base, len),
+        Resource::FixedMemory32 { base, len, .. } => em.mem(u64::from(base), u64::from(len)),
+        Resource::Memory32 { min, max, len, .. } =>
+        {
+            min != max || em.mem(u64::from(min), u64::from(len))
+        }
+        Resource::Address(a) =>
+        {
+            let consumed_memory = a.space == SPACE_MEMORY
+                && a.consumer()
+                && matches!(a.width, AddressWidth::DWord | AddressWidth::QWord);
+            !consumed_memory || em.mem(a.min, a.length)
+        }
+        Resource::Memory24 { .. } | Resource::GenericRegister { .. } | Resource::Other { .. } =>
+        {
             true
         }
-        (0x07, 23..) if is_consumed_memory(body) => mem(em, le(body, 7, 4), le(body, 19, 4)),
-        (0x0A, 43..) if is_consumed_memory(body) => mem(em, le(body, 11, 8), le(body, 35, 8)),
-        _ => true,
     }
 }
 
 #[cfg(test)]
 mod tests
 {
+    use ::aml::encoding::{OP_BYTE, OP_DWORD, OP_ONE, OP_STRING, OP_WORD, OP_ZERO};
+
     use super::*;
 
     // ── Builders ──────────────────────────────────────────────────────
@@ -1071,53 +807,14 @@ mod tests
         table(&scope("_SB_", &[com1, rtc].concat()))
     }
 
-    // ── EISA, names, packages ─────────────────────────────────────────
+    // ── EISA ──────────────────────────────────────────────────────────
 
     #[test]
     fn eisa_decode()
     {
         assert_eq!(eisa_id(0x0105_D041).unwrap().as_bytes(), b"PNP0501");
-        assert_eq!(eisa_id(0x000B_D041).unwrap().as_bytes(), b"PNP0B00");
         assert_eq!(eisa_id(0), None);
-        assert_eq!(eisa_id(0x0105_D0FF), None);
         assert_eq!(eisa("PNP0501"), vec![OP_DWORD, 0x41, 0xD0, 0x05, 0x01]);
-    }
-
-    #[test]
-    fn package_forms()
-    {
-        for n in 1..=4
-        {
-            let mut b = pkg_n(5, n);
-            let lead = b.len();
-            b.extend([0; 5]);
-            assert_eq!(package(&b, 0), Some((lead, lead + 5)), "n={n}");
-        }
-        // Hand-checked two-byte form: lead 0x41, next 0x02 -> len 0x21.
-        assert_eq!(package(&[0x41, 0x02], 0), None);
-        let mut big = vec![0x41, 0x02];
-        big.resize(0x21, 0);
-        assert_eq!(package(&big, 0), Some((2, 0x21)));
-        // Past the end of the enclosing list.
-        assert_eq!(package(&[0x0A, 0, 0], 0), None);
-        assert_eq!(package(&[0x00], 0), None);
-    }
-
-    #[test]
-    fn name_string_forms()
-    {
-        assert_eq!(name_string(b"\\_SB_", 0), Some((5, Some(*b"_SB_"))));
-        assert_eq!(name_string(b"^^ABCD", 0), Some((6, Some(*b"ABCD"))));
-        let mut dual = vec![0x2E];
-        dual.extend(b"ABCDEFGH");
-        assert_eq!(name_string(&dual, 0), Some((9, Some(*b"EFGH"))));
-        let mut multi = vec![0x5C, 0x2F, 3];
-        multi.extend(b"AAAABBBBCCC1");
-        assert_eq!(name_string(&multi, 0), Some((15, Some(*b"CCC1"))));
-        assert_eq!(name_string(&[0x00], 0), Some((1, None)));
-        assert_eq!(name_string(b"1ABC", 0), None);
-        assert_eq!(name_string(b"AB", 0), None);
-        assert_eq!(name_string(b"\\", 0), None);
     }
 
     // ── Walk ──────────────────────────────────────────────────────────

@@ -409,15 +409,16 @@ devmgr's responsibilities are:
   withdraws the device and destroys the fixture mid-bootstrap).
 
   The instance ordinals of a class count its served drivers in spawn order
-  and are fixed once its batch settles. devmgr observes every driver's death
-  for the rest of the boot: its control thread waits on the death queue and
-  its job notification together, and a settle hands the deaths of drivers
-  outside its batch back to it. A served driver that dies is withdrawn as
-  above, so callers queued on its endpoint return (the endpoint's teardown
-  wakes them), and a tombstone holds its ordinal: its query replies
-  `devmgr_errors::WITHDRAWN` for the rest of the boot, and the ordinals after
-  it keep their drivers, so vfsd's probe of block ordinals, which continues
-  past a `WITHDRAWN` reply, skips no live disk.
+  and are fixed once its batch settles. devmgr observes the death of every
+  driver's main thread for the rest of the boot (a worker thread's terminal
+  fault is not observed; § Relationship to drivers): its control thread
+  waits on the death queue and its job notification together, and a settle
+  hands the deaths of drivers outside its batch back to it. A served driver
+  that dies is withdrawn as above, so callers queued on its endpoint return
+  (the endpoint's teardown wakes them), and a tombstone holds its ordinal:
+  its query replies `devmgr_errors::WITHDRAWN` for the rest of the boot, and
+  the ordinals after it keep their drivers, so vfsd's probe of block
+  ordinals, which continues past a `WITHDRAWN` reply, skips no live disk.
 
   The serving order follows from where each batch settles. devmgr's main
   thread is its control thread: it enumerates, spawns and settles every
@@ -629,10 +630,14 @@ RISC-V IOMMU driver (see
 
 ## Relationship to drivers
 
-devmgr is the sole authority for spawning device drivers; supervising (restarting) them
-is design intent; not yet implemented (#17, #262). After discovering a device, devmgr
-requests procmgr to create the driver process and then delegates the per-device
-capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
+devmgr is the sole authority for spawning device drivers. It observes the death of each driver's
+main thread and withdraws the driver. A terminal fault in a driver's worker thread drives procmgr's
+teardown of the driver, which posts no death, so devmgr does not withdraw that driver; routing it
+to devmgr is not yet implemented (#1102). Restarting a driver is design intent; not yet
+implemented (#1077; the supervision hierarchy is in
+[docs/supervision.md](../../../docs/supervision.md)). After
+discovering a device, devmgr requests procmgr to create the driver process and then delegates
+the per-device capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [`drivers/README.md`](../../drivers/README.md) for the driver model.
 
 ---
@@ -641,7 +646,8 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 
 [Device Tree Parsing](../../../core/boot/docs/dtb.md),
 [Capability Model](../../../docs/capability-model.md),
-[Device Management](../../../docs/device-management.md), [services/devmgr/README.md](../README.md),
+[Device Management](../../../docs/device-management.md),
+[Supervision](../../../docs/supervision.md), [services/devmgr/README.md](../README.md),
 [services/drivers/README.md](../../drivers/README.md),
 [services/drivers/cmos/README.md](../../drivers/cmos/README.md),
 [Driver Model](../../drivers/docs/driver-model.md),
@@ -656,5 +662,4 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
-[services/pwrmgr/README.md](../../pwrmgr/README.md),
-[Restart Protocol](../../svcmgr/docs/restart-protocol.md)
+[services/pwrmgr/README.md](../../pwrmgr/README.md)

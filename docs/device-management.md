@@ -626,13 +626,15 @@ gives the settle, the bound's derivation, and the serving order). `QUERY_DEVICE`
 class's drivers by an optional instance ordinal in `data[1]` (absent means the first): the
 ordinal counts the served drivers of that class in PCI segment, bus, device, function order, is
 not stable across boots, and is fixed once the class settles. devmgr
-observes every driver's death for the rest of the boot: a served driver that dies is withdrawn, its
-service endpoint revoked so callers queued on it return, and a tombstone holds its ordinal, whose
-query replies `devmgr_errors::WITHDRAWN` while the ordinals after it keep their drivers; a
-withdrawn serial, framebuffer, or RTC driver's query replies `WITHDRAWN` too. Past the last
-served driver of a class the reply is `devmgr_errors::NO_DEVICE`. vfsd queries every
-block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not `SUCCESS`, and holds
-every live disk; the terminal sends none, so it binds the first input instance.
+observes the death of every driver's main thread for the rest of the boot (a worker thread's
+terminal fault is not observed:
+[Supervision § Supervision Hierarchy](supervision.md#supervision-hierarchy)): a served driver
+that dies is withdrawn, its service endpoint revoked so callers queued on it return, and a
+tombstone holds its ordinal, whose query replies `devmgr_errors::WITHDRAWN` while the ordinals
+after it keep their drivers; a withdrawn serial, framebuffer, or RTC driver's query replies
+`WITHDRAWN` too. Past the last served driver of a class the reply is `devmgr_errors::NO_DEVICE`.
+vfsd queries every block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not
+`SUCCESS`, and holds every live disk; the terminal sends none, so it binds the first input instance.
 
 The debug port is a byte transport apart from the console's UART, which a debugger stub, the
 [GDB stub](../services/gdbstub/README.md), owns to speak to a host debugger: the first

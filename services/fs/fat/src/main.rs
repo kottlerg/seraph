@@ -1690,7 +1690,7 @@ fn handle_write_memory(
     // per-process arena for this handler alone, which runs only on the
     // dispatch thread; nothing else maps it and no Rust object lies in it.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             restricted_cap,
             self_aspace,
             va,

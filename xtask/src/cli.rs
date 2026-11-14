@@ -148,6 +148,13 @@ pub enum CliCommand
     /// merge gate too. Reads GitHub through `gh` (see xtask/README.md).
     PrCheck(PrCheckArgs),
 
+    /// Build two commits (by default the merge base with `origin/master` and
+    /// `HEAD`) for each architecture and profile in one scratch worktree, and
+    /// compare every installed image in the parts a loader reads; print each
+    /// image and part that differs and a verdict line, and fail when one
+    /// differs (see xtask/README.md).
+    CompareImages(CompareImagesArgs),
+
     /// Validate the saved run records of a pull request's pre-merge review
     /// (`target/xtask/review/pr<N>/`) against the record shape (see
     /// xtask/README.md).
@@ -208,6 +215,7 @@ impl CliCommand
             Self::Build(args) => Some(&args.host),
             Self::Clean(args) => Some(&args.host),
             Self::Test(args) => Some(&args.host),
+            Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::RunParallel(_)
             | Self::KtestTiming(_)
@@ -1134,6 +1142,36 @@ pub struct PrCheckArgs
     pub strict: bool,
 }
 
+// ── CompareImages ─────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct CompareImagesArgs
+{
+    /// The base commit (default: the merge base of the head with
+    /// `origin/master`, the base of the PR's own diff).
+    #[arg(long)]
+    pub base: Option<String>,
+
+    /// The head commit.
+    #[arg(long, default_value = "HEAD")]
+    pub head: String,
+
+    /// The architectures to build (default: both). Repeatable, or
+    /// comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    pub arch: Vec<Arch>,
+
+    /// The profiles to build (default: both). Repeatable, or
+    /// comma-separated.
+    #[arg(long, value_delimiter = ',')]
+    pub profile: Vec<Profile>,
+
+    /// The shared host's launch rules; `--wait-host` is passed on to each
+    /// build.
+    #[command(flatten)]
+    pub host: HostArgs,
+}
+
 // ── ReviewCheck / ReviewLedger ────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -1487,7 +1525,7 @@ mod tests
     #[test]
     fn each_command_that_compiles_is_admitted_as_a_build_with_its_host_options()
     {
-        for command in ["build", "clean", "test"]
+        for command in ["build", "clean", "test", "compare-images"]
         {
             let host = build_host_of(&["xtask", command, "--wait-host", "30"])
                 .unwrap_or_else(|| panic!("`{command}` is not admitted as a build"));

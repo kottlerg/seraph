@@ -403,7 +403,8 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` passes
 `-machine virt,aia=aplic-imsic` and
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,ssaia=on,smaia=on`
-plus the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
+plus the `--riscv-zkr` suffix (default `,zkr=on`) and the `--riscv-mmu` satp-mode suffix
+(default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
 `,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
 string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
@@ -411,7 +412,12 @@ ships (§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svi
 required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
 the first userspace mapping, and so is AIA (Ssaia, with the machine's APLIC and IMSIC), without
 which its interrupt initialisation halts the boot (see
-[platform-requirements.md](platform-requirements.md)). The named `-cpu rva23s64` model
+[platform-requirements.md](platform-requirements.md)). `zkr=on` gives the hart the Zkr entropy
+source, whose `seed` CSR the bundled OpenSBI grants S-mode when the hart implements it, so the
+kernel's pool seeds from it beside the firmware boot seed and the boot log shows
+`entropy: seeded from hardware RNG`; the source is optional, and `--riscv-zkr off` boots without
+it ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Sources and graceful
+degradation). The named `-cpu rva23s64` model
 (QEMU ≥ 10.0, 2025-04) adds the remaining RVA23 mandates; `xtask` does not expose it, and the
 explicit string stays so the 9.0 minimum holds.
 

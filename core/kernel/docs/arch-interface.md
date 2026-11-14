@@ -814,17 +814,20 @@ pub unsafe fn rebase_serial(new_base: u64);
 Hardware entropy primitives consumed by the kernel entropy subsystem
 (`crate::entropy`; see [`entropy.md`](entropy.md)). The hardware RNG is optional —
 neutral code gates every draw on `hw_rng_available` and always mixes the result
-with timing jitter — so an architecture without one (RISC-V under default
-firmware) satisfies the contract by reporting no source.
+with timing jitter — so a CPU without one (a RISC-V hart without `Zkr`, or
+whose firmware does not grant S-mode its `seed` CSR) satisfies the contract by
+reporting no source.
 
 ```rust
-/// Whether the CPU exposes a hardware RNG instruction. x86-64 reports RDRAND or
-/// RDSEED via CPUID; RISC-V returns false (no source under default firmware).
+/// Whether the CPU exposes a hardware RNG. x86-64 reports RDRAND or RDSEED via
+/// CPUID; RISC-V probes the `Zkr` `seed` CSR once by reading it, under an
+/// illegal-instruction fixup, and caches the answer.
 pub fn hw_rng_available() -> bool;
 
 /// Draw one 64-bit hardware-RNG word, or `None` if no source succeeded. x86-64
 /// prefers RDSEED (seed-grade) with an RDRAND fallback, each with bounded retry;
-/// RISC-V returns `None`.
+/// RISC-V builds the word from four 16-bit `seed` samples, retrying a not-ready
+/// source within a time budget, and a `DEAD` source reports no source from then on.
 pub fn hw_rng_u64() -> Option<u64>;
 
 /// Read a free-running cycle counter for jitter sampling; use deltas only

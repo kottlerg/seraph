@@ -9,15 +9,17 @@
 //!
 //! Both commits are built in one scratch worktree, by that commit's own
 //! `cargo xtask clean` and `cargo xtask build`, once per architecture and
-//! profile, and each built sysroot is moved to
-//! `target/xtask/compare-images/`. One path serves both sides because a build
-//! embeds absolute source paths (the panic locations of the `-Z build-std`
-//! crates under `target/seraph-toolchain/`), so two checkouts at different
-//! paths never build equal images. The scratch worktree's `target/` is a cache
-//! that later builds reuse.
+//! profile, and each built sysroot is moved beside it, in the same scratch
+//! directory; only the report is written to `target/xtask/compare-images/`.
+//! One path serves both sides because a build embeds absolute source paths
+//! (the panic locations of the `-Z build-std` crates under
+//! `target/seraph-toolchain/`), so two checkouts at different paths never
+//! build equal images. The scratch worktree's `target/` is a cache that later
+//! builds reuse. A repository has one scratch directory, which every checkout
+//! of it shares and one run at a time holds (`scratch_path`, `lock_scratch`).
 //!
 //! Each build is the commit's own: the scratch worktree lies in the user's
-//! cache directory (`tree_path`), outside the checkout, whose
+//! cache directory, outside the checkout, whose
 //! `.cargo/config.toml` Cargo would otherwise merge into both builds, and each
 //! nested `cargo xtask` runs without the variables the outer `cargo run` set
 //! (`removed_variables`), among them `RUSTUP_TOOLCHAIN`, which would pin both
@@ -660,28 +662,44 @@ fn removed_variables(root: &Path) -> Vec<String>
     names.into_iter().collect()
 }
 
-/// The scratch worktree of the checkout at `root`, in the user's cache
-/// directory `cache`: named for the checkout's path, so that each checkout
-/// has its own and keeps it, and outside the checkout, whose Cargo
-/// configuration a build in a directory below it would merge with the
-/// commit's own.
-fn tree_path(cache: &Path, root: &Path) -> PathBuf
+/// The scratch directory of the repository whose git common directory is
+/// `common`, in the user's cache directory `cache`: one per repository, so
+/// that every checkout of it shares one scratch worktree and its build
+/// cache, and outside every checkout, whose Cargo configuration a build in a
+/// directory below it would merge with the commit's own. The name keeps each
+/// ASCII letter, digit, `.` and `_` of the path and writes every other byte
+/// as `-` and two hex digits, so two paths never share a name.
+fn scratch_path(cache: &Path, common: &Path) -> PathBuf
 {
-    let name: String = root
-        .to_string_lossy()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || "._".contains(c)
-            {
-                c
-            }
-            else
-            {
-                '-'
-            }
-        })
-        .collect();
+    let mut name = String::new();
+    for byte in common.to_string_lossy().bytes()
+    {
+        if byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'
+        {
+            name.push(char::from(byte));
+        }
+        else
+        {
+            let _ = write!(name, "-{byte:02x}");
+        }
+    }
     cache.join("seraph-compare-images").join(name)
+}
+
+/// Hold the scratch directory `scratch` for this run: one run at a time uses
+/// a repository's scratch worktree, and a second waits for the first.
+fn lock_scratch(scratch: &Path) -> Result<fs::File>
+{
+    fs::create_dir_all(scratch).with_context(|| format!("creating {}", scratch.display()))?;
+    let path = scratch.join("lock");
+    let file = fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+    if let Err(fs::TryLockError::WouldBlock) = file.try_lock()
+    {
+        step("compare-images: waiting for another run to release the scratch worktree");
+    }
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(file)
 }
 
 /// The user's cache directory: `XDG_CACHE_HOME`, `.cache` in the home
@@ -905,8 +923,13 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
         None => git(root, &["merge-base", &head, "origin/master"])?,
     };
     let cells = cells(args);
-    let scratch = ctx.target_dir.join("xtask").join("compare-images");
-    let tree = tree_path(&cache_dir()?, root);
+    let common = git(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let scratch = scratch_path(&cache_dir()?, Path::new(&common));
+    let _held = lock_scratch(&scratch)?;
+    let tree = scratch.join("tree");
     prepare_tree(root, &tree)?;
     let nested = Nested {
         wait_host: args.host.wait_host,
@@ -922,7 +945,10 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
     }
     let report = render(&base, &head, &reports);
     let short = |sha: &str| sha.get(..12).unwrap_or(sha).to_owned();
-    let path = scratch.join(format!("report-{}-{}.txt", short(&base), short(&head)));
+    let reports_dir = ctx.target_dir.join("xtask").join("compare-images");
+    fs::create_dir_all(&reports_dir)
+        .with_context(|| format!("creating {}", reports_dir.display()))?;
+    let path = reports_dir.join(format!("report-{}-{}.txt", short(&base), short(&head)));
     fs::write(&path, &report).with_context(|| format!("writing {}", path.display()))?;
     print!("{report}");
     println!("report: {}", path.display());
@@ -1379,17 +1405,35 @@ rustflags = [\"-Zunstable-options\"]
     }
 
     #[test]
-    fn each_checkout_has_its_own_scratch_tree_in_the_cache()
+    fn each_repository_has_one_scratch_directory_in_the_cache()
     {
         let cache = Path::new("/cache");
         assert_eq!(
-            tree_path(cache, Path::new("/home/u/seraph")),
-            Path::new("/cache/seraph-compare-images/-home-u-seraph")
+            scratch_path(cache, Path::new("/home/u/seraph/.git")),
+            Path::new("/cache/seraph-compare-images/-2fhome-2fu-2fseraph-2f.git")
         );
+        // Two paths that a plain separator replacement would merge stay
+        // apart.
         assert_ne!(
-            tree_path(cache, Path::new("/home/u/seraph")),
-            tree_path(cache, Path::new("/home/u/seraph/.claude/worktrees/w1"))
+            scratch_path(cache, Path::new("/a/b-c/.git")),
+            scratch_path(cache, Path::new("/a/b/c/.git"))
         );
+    }
+
+    #[test]
+    fn a_second_run_waits_for_the_scratch_lock()
+    {
+        let scratch =
+            std::env::temp_dir().join(format!("xtask-compare-lock-{}", std::process::id()));
+        let held = lock_scratch(&scratch).unwrap();
+        let other = fs::File::open(scratch.join("lock")).unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        other.try_lock().unwrap();
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]

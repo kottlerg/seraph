@@ -352,6 +352,18 @@ impl Race
     }
 }
 
+/// When a round's controller deletes the source.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// After a varying spin of its own, racing the racer's action (and, on a
+    /// served call, the server's receive).
+    Raced,
+    /// Served call only: once the server has published its entry into its
+    /// receive, and [`HOLD_MS`] after that ([`hold_for_server`]).
+    Held,
+}
+
 /// What a round creates; each is deleted on every path (the waiter only if
 /// the racer has not deleted it).
 #[derive(Default)]
@@ -682,7 +694,7 @@ fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static st
     let mut seen = Seen::default();
     for cycle in 0..CYCLES
     {
-        run_round(ctx, kind, race, cycle, false, &mut seen)?;
+        run_round(ctx, kind, race, cycle, Timing::Raced, &mut seen)?;
     }
     if kind != Kind::CallServed
     {
@@ -694,7 +706,7 @@ fn rounds(ctx: &TestContext, kind: Kind, race: Race) -> Result<Seen, &'static st
         && seen.extra_rounds < MAX_EXTRA_ROUNDS
     {
         let cycle = CYCLES.saturating_add(seen.extra_rounds);
-        run_round(ctx, kind, race, cycle, true, &mut seen)?;
+        run_round(ctx, kind, race, cycle, Timing::Held, &mut seen)?;
         seen.extra_rounds = seen.extra_rounds.saturating_add(1);
     }
     Ok(seen)
@@ -706,12 +718,12 @@ fn run_round(
     kind: Kind,
     race: Race,
     cycle: u32,
-    held: bool,
+    timing: Timing,
     seen: &mut Seen,
 ) -> TestResult
 {
     let mut parts = RoundParts::default();
-    let result = round(ctx, kind, race, cycle, held, &mut parts, seen);
+    let result = round(ctx, kind, race, cycle, timing, &mut parts, seen);
     let released = release_round(&parts);
     result?;
     released
@@ -719,15 +731,14 @@ fn run_round(
 
 /// One round: create the source and a waiter on it, race the racer's action
 /// against the source's last-capability delete, and settle the waiter
-/// (restart it and wait for its exit after a stop). A `held` round (served
-/// call only) deletes the endpoint only once the server has published its
-/// entry into its receive and [`HOLD_MS`] more have passed.
+/// (restart it and wait for its exit after a stop). `timing` says when the
+/// controller deletes the source.
 fn round(
     ctx: &TestContext,
     kind: Kind,
     race: Race,
     cycle: u32,
-    held: bool,
+    timing: Timing,
     parts: &mut RoundParts,
     seen: &mut Seen,
 ) -> TestResult
@@ -750,7 +761,7 @@ fn round(
     {
         SERVER_ARMED.store(cycle.saturating_add(1), Ordering::Release);
     }
-    if held
+    if timing == Timing::Held
     {
         hold_for_server(cycle)?;
     }

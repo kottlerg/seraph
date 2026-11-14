@@ -355,7 +355,7 @@ pub unsafe fn hole_direct_map_page(
 /// 2 MiB leaf as `hole_direct_map_page` does; from then on only shadow-stack
 /// accesses write it. The caller flushes every CPU that may hold a writable
 /// translation of the page before a CPU runs on it as a shadow stack
-/// (memory-internals.md § Kernel Stack Guards). RISC-V refuses with
+/// (memory-internals.md § Shadow-Stack Pages). RISC-V refuses with
 /// `NotMapped`; the kernel runs on no shadow stack there and never asks
 /// (return-address-integrity.md).
 pub unsafe fn shadow_direct_map_page(
@@ -370,7 +370,7 @@ pub unsafe fn shadow_direct_map_page(
 /// flushes before it runs a thread whose stack the page becomes, or takes the
 /// riscv64 S-mode spurious-fault retry on any other use. An x86-64 CPU that
 /// kept a shadow stack's read-only translation takes the kernel spurious-write
-/// retry on its first store (memory-internals.md § Kernel Stack Guards).
+/// retry on its first store (memory-internals.md § Shadow-Stack Pages).
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64);
 
 /// Whether a CPU may cache a not-present entry, so that a page made present

@@ -1560,17 +1560,25 @@ const PF_ERR_PRESENT: u64 = 1 << 0;
 const PF_ERR_WRITE: u64 = 1 << 1;
 /// `#PF` error-code bit U/S: the access was made from user mode.
 const PF_ERR_USER: u64 = 1 << 2;
+/// `#PF` error-code bit RSVD: a paging entry has a reserved bit set.
+const PF_ERR_RSVD: u64 = 1 << 3;
+/// `#PF` error-code bit I/D: the access was an instruction fetch.
+const PF_ERR_FETCH: u64 = 1 << 4;
+/// `#PF` error-code bit PK: a protection-key violation.
+const PF_ERR_PK: u64 = 1 << 5;
 /// `#PF` error-code bit SS: the access was a shadow-stack access.
 const PF_ERR_SHADOW_STACK: u64 = 1 << 6;
 
 /// Whether a `#PF` with `error_code` at `va` can be a write through a stale
 /// read-only translation of a kernel page: a protection fault (P set) by an
-/// ordinary (SS clear) supervisor (U/S clear) write (W/R set) to a kernel-half
-/// address.
+/// ordinary (SS clear) supervisor (U/S clear) data (I/D clear) write (W/R set)
+/// to a kernel-half address, with no reserved-bit (RSVD) or protection-key
+/// (PK) violation, which no flush resolves.
 fn write_fault_may_be_stale(va: u64, error_code: u64) -> bool
 {
     let wanted = PF_ERR_PRESENT | PF_ERR_WRITE;
-    va >> 63 == 1 && error_code & (wanted | PF_ERR_USER | PF_ERR_SHADOW_STACK) == wanted
+    let excluded = PF_ERR_USER | PF_ERR_RSVD | PF_ERR_FETCH | PF_ERR_PK | PF_ERR_SHADOW_STACK;
+    va >> 63 == 1 && error_code & (wanted | excluded) == wanted
 }
 
 /// Whether the kernel 4 KiB leaf `pte` permits an ordinary supervisor write:
@@ -2123,8 +2131,9 @@ mod tests
     const KERNEL_VA: u64 = 0xffff_8000_0012_3000;
 
     // The defect caught: a retry for a fault that is no stale read-only
-    // translation (a missing page, a load, a user access, a shadow-stack
-    // access, or a user address), which would loop on a genuine fault.
+    // translation (a missing page, a load, a user access, a reserved-bit or
+    // protection-key violation, a fetch, a shadow-stack access, or a user
+    // address), which would loop on a genuine fault.
     #[test]
     fn only_an_ordinary_supervisor_write_to_a_present_kernel_page_may_be_stale()
     {
@@ -2133,6 +2142,9 @@ mod tests
         assert!(!write_fault_may_be_stale(KERNEL_VA, PF_ERR_WRITE));
         assert!(!write_fault_may_be_stale(KERNEL_VA, PF_ERR_PRESENT));
         assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_USER));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_RSVD));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_FETCH));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_PK));
         assert!(!write_fault_may_be_stale(
             KERNEL_VA,
             write | PF_ERR_SHADOW_STACK

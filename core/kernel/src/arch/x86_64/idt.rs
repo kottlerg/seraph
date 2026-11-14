@@ -1261,9 +1261,11 @@ extern "C" fn nm_handler()
 /// Builds the canonical [`TrapFrame`] (`tf_build_asm`; the hardware already
 /// pushed the error code, this stub pushes the vector), calls
 /// [`page_fault_handler`], then — reached when the fault was a resolved spurious
-/// stale-TLB fault, a userspace fault a bound handler resolved, or a kernel
-/// `copy_user` fault redirected to its fixup — writes back the (possibly edited)
-/// register state and `iretq`s (`tf_resume_asm`). For every terminal fault the
+/// stale-TLB fault (a user one, or a kernel write through a stale read-only
+/// translation), a userspace fault a bound handler resolved, or a kernel
+/// `copy_user` fault, whose copy the handler ended in place — writes back the
+/// (possibly edited) register state and `iretq`s (`tf_resume_asm`) to the same
+/// kernel `rip`, as a shadow stack requires. For every terminal fault the
 /// handler diverges (`common_exception_handler` never returns) and the resume
 /// tail is dead.
 #[cfg(not(test))]
@@ -1293,9 +1295,14 @@ unsafe extern "custom" fn isr_page_fault()
 /// faults are resolved by a local `invlpg` and a return-to-retry; the stub's
 /// `iretq` re-executes the faulting instruction. A genuine userspace fault whose
 /// thread has a bound fault handler is redirected to it
-/// ([`redirect_user_page_fault`]); a kernel fault inside the `copy_user` region is
-/// redirected to its fixup. Every other fault is handed to
-/// [`common_exception_handler`], which never returns.
+/// ([`redirect_user_page_fault`]). A ring-0 write through the read-only
+/// translation a CPU kept of a former shadow-stack page
+/// (`paging::kernel_write_fault_is_spurious`) is flushed and retried. A kernel
+/// fault inside the `copy_user` region ends the copy in place: `rax` gets the
+/// bytes not copied, `rcx` is set to 0, and `rip` is left as it was, since a
+/// ring-0 `iretq` to another address raises `#CP` while shadow stacks are on.
+/// Every other fault is handed to [`common_exception_handler`], which never
+/// returns.
 #[cfg(not(test))]
 extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
 {

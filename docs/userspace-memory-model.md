@@ -273,8 +273,8 @@ quality caveat.
   `REQUEST_MEMORY_CAPS` calls, with the memory max of the process's
   budget node where its creator set one; no default per-process ceiling
   exists ([memory-pool.md](../services/memmgr/docs/memory-pool.md)
-  § Distribution policy; the max is design intent, not yet implemented,
-  [#260](https://github.com/kottlerg/seraph/issues/260)). For an `ET_DYN` image the
+  § Distribution policy; a creator cannot set the max yet, since procmgr
+  passes none, [#260](https://github.com/kottlerg/seraph/issues/260)). For an `ET_DYN` image the
   creator leaves the `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages below
   `stack_top_vaddr` to the stack: it maps no other surface there, the
   layout's draw windows keep every other bootstrap surface out of them
@@ -404,6 +404,20 @@ memmgr serves frame requests over IPC. The contract:
   pool's free pages cover it, the reply is a **partial grant**: success with
   fewer pages than asked. When the free pages do not cover `want_pages`, the
   request fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
+- **Reserve refusal.** A caller whose budget node is outside the system
+  reserve may not take its pages: either shape fails with its out-of-memory
+  code, before any run is taken, when `want_pages` would leave fewer free
+  pages than the reserve, however many pages are free. `QUERY_POOL_STATUS`
+  reports the reserve beside the free pages
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy;
+  [ipc-interface.md](../services/memmgr/docs/ipc-interface.md) § Label 6).
+- **Budget refusal.** Either shape fails with `memmgr_errors::LIMIT`, before
+  any run is taken, when `want_pages` would take the subtree of the caller's
+  budget node, or of an ancestor, over its max
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy). The RAM may exist; the caller's budget refuses it,
+  and only a release or a raised max lets a repeat succeed.
 - **Caller loops.** A best-effort caller MUST compare the granted page total
   with `want_pages` and request the remainder again (or release what it
   cannot use); a single reply is not guaranteed to cover the request.

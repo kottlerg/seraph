@@ -574,52 +574,78 @@ fn demand_paging_sparse_region_phase(_: &Caps)
 /// Pages of the demand region [`demand_fault_fragmented_phase`] touches.
 const FRAGMENTED_REGION_PAGES: u64 = 64;
 
-/// Grant requests the drain of [`demand_fault_fragmented_phase`] may make: a
-/// test bound far above the free runs a boot holds.
+/// Grant requests each draw of [`fragment_pool`] may make: a test bound far
+/// above the free runs a boot holds.
 const FRAGMENT_MAX_DRAWS: usize = 4096;
 
-/// Free runs of one page fewer than a chunk that
-/// [`demand_fault_fragmented_phase`] leaves in the pool: 120 pages, room for
-/// its region and the page tables that map it.
-const FRAGMENT_HOLES: u64 = 8;
+/// Pages above the system reserve the fragmented pool keeps free for
+/// [`demand_fault_fragmented_phase`]: its region, the chunk span a fault admits
+/// beyond what one run backs, and the page tables that map the region.
+const FRAGMENT_HEADROOM_PAGES: u64 = FRAGMENTED_REGION_PAGES + 2 * DEMAND_CHUNK_PAGES;
+
+/// Pages of slack in the free target of [`fragment_pool`]'s cut: room for the
+/// holes its last draw takes back (a hole beside a remainder of its run too
+/// short to cut merges into a run of a chunk or more) and for other processes'
+/// grants meanwhile.
+const FRAGMENT_SLACK_PAGES: u64 = 1024;
 
 /// A demand fault on a pool that holds free pages but no free run of a
 /// chunk's size is backed from a smaller run, not declined
-/// (services/memmgr/docs/memory-pool.md § Demand faults). svctest registers a
-/// demand region and sets aside one contiguous grant (the carve), then draws
-/// every free run of a hole's size (`DEMAND_CHUNK_PAGES - 1` pages) or more
-/// whole, so the carve is the only such run once it is released. It cuts the
-/// carve, front first, into hole-sized grants and releases every other one,
-/// each between two it holds, so the pool holds [`FRAGMENT_HOLES`] runs of a
-/// hole's size and none of a chunk's. With the pool so fragmented, it reads
-/// and writes every page of the region: a declined fault would kill svctest.
-/// Every page must read zero before the write (§ Frame contents) and hold the
-/// write after. The grants are released after, and nothing between the drain
-/// and the release allocates or logs.
+/// (services/memmgr/docs/memory-pool.md § Demand faults). svctest is outside the
+/// system reserve, so it can take no free page of the reserve (§ Distribution
+/// policy), and the reserve's free pages too must lie in runs smaller than a
+/// chunk. svctest registers a demand region and fragments the pool
+/// ([`fragment_pool`]) until no free run covers a chunk and the free pages
+/// exceed the reserve by [`FRAGMENT_HEADROOM_PAGES`]. With the pool so
+/// fragmented, it reads and writes every page of the region: a declined fault
+/// would kill svctest. Every page must read zero before the write (§ Frame
+/// contents) and hold the write after. The grants are released after, and
+/// nothing between the first draw and the release allocates or logs.
 fn demand_fault_fragmented_phase(_: &Caps)
 {
     use super::memmgr::{
-        SCRUB_MARKER, nonzero_words, pool_free_and_largest, release_grant, words_mut,
+        SCRUB_MARKER, nonzero_words, pool_free_and_largest, pool_reserve, release_grant, words_mut,
     };
 
     let page = syscall_abi::PAGE_SIZE;
     let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
+    let reserve = pool_reserve() / page;
+    // The cut starts from `target` free pages and ends at the reserve, so it
+    // takes `target - reserve` pages, half of them holes. Once the holes are
+    // released, the draw of what the cut left uncut (at most the reserve) must
+    // still leave the reserve and the headroom free.
+    let target = reserve
+        .saturating_mul(3)
+        .saturating_add(FRAGMENT_HEADROOM_PAGES.saturating_mul(2))
+        .saturating_add(FRAGMENT_SLACK_PAGES);
+    let hole_cap = usize::try_from(
+        target
+            .saturating_sub(reserve)
+            .div_ceil(DEMAND_CHUNK_PAGES.saturating_sub(1).saturating_mul(2))
+            .saturating_add(1),
+    )
+    .expect("demand_fault_fragmented: hole count beyond usize");
     let region = std::os::seraph::register_demand_paged(FRAGMENTED_REGION_PAGES)
         .expect("demand_fault_fragmented: registering the region failed");
-    let pieces = usize::try_from(FRAGMENT_HOLES.saturating_mul(2).saturating_add(1))
-        .expect("demand_fault_fragmented: piece count beyond usize");
-    let mut held: Vec<(u64, u64)> = Vec::with_capacity(FRAGMENT_MAX_DRAWS.saturating_add(pieces));
-    let (drawn_pages, hole_count) = fragment_pool(&mut held, pieces);
+    let mut held: Vec<(u64, u64)> = Vec::with_capacity(
+        FRAGMENT_MAX_DRAWS
+            .saturating_mul(2)
+            .saturating_add(hole_cap)
+            .saturating_add(1),
+    );
+    let mut holes: Vec<(u64, u64)> = Vec::with_capacity(hole_cap);
+    let (drawn_pages, hole_count) = fragment_pool(&mut held, &mut holes, reserve, target);
     let (free, largest) = pool_free_and_largest();
     assert!(
         largest < chunk_bytes,
         "demand_fault_fragmented: the pool kept a run of {largest} bytes, a chunk or more"
     );
     assert!(
-        free >= FRAGMENTED_REGION_PAGES
-            .saturating_add(DEMAND_CHUNK_PAGES)
+        free >= reserve
+            .saturating_add(FRAGMENT_HEADROOM_PAGES)
             .saturating_mul(page),
-        "demand_fault_fragmented: {hole_count} holes left {free} free bytes, too few for the region"
+        "demand_fault_fragmented: {hole_count} holes left {free} free bytes, too few above the \
+         {reserve}-page reserve for the region"
     );
 
     // SAFETY: the span is a read-write demand region of this process, whose
@@ -650,48 +676,54 @@ fn demand_fault_fragmented_phase(_: &Caps)
     assert_ram_identity();
     std::os::seraph::log!(
         "demand_fault_fragmented: {grants} grants drew {drawn_pages} pages and {hole_count} holes \
-         left {free} free bytes in runs of at most {largest}; {FRAGMENTED_REGION_PAGES} demand \
-         pages backed"
+         left {free} free bytes in runs of at most {largest} over a {reserve}-page reserve; \
+         {FRAGMENTED_REGION_PAGES} demand pages backed"
     );
 }
 
-/// Fragment the pool for [`demand_fault_fragmented_phase`]: set aside the
-/// carve, draw every free run of a hole's size or more whole, then cut the
-/// carve into `pieces` hole-sized grants and release every other one. Every
-/// grant it keeps goes onto `held`, which has room for [`FRAGMENT_MAX_DRAWS`]
-/// and `pieces` more, so nothing here allocates. Returns the pages the drain
-/// drew and the holes released.
-fn fragment_pool(held: &mut Vec<(u64, u64)>, pieces: usize) -> (u64, usize)
+/// Fragment the pool for [`demand_fault_fragmented_phase`] so that no free run
+/// covers a chunk while the free pages exceed the reserve of `reserve` pages.
+/// memmgr refuses a grant to svctest that would leave fewer free pages than the
+/// reserve, so the holes svctest makes must hold the reserve's pages too:
+///
+/// 1. Draw from the largest runs until `target` pages are free.
+/// 2. Cut what is free into hole-sized grants (`DEMAND_CHUNK_PAGES - 1`
+///    pages), the smallest run that fits first and each run front first,
+///    keeping every other one as a hole, until a grant is refused at the
+///    reserve. A hole lies between two grants svctest holds, or at the end of
+///    its run beside a remainder too short to cut.
+/// 3. Release the holes.
+/// 4. Draw whole every free run of a chunk or more: what the cut left uncut,
+///    and a hole merged with its run's remainder.
+///
+/// Every grant kept goes onto `held` and every hole onto `holes`, which have
+/// room for every draw and the cut, so nothing here allocates. Returns the
+/// pages drawn and the holes released.
+fn fragment_pool(
+    held: &mut Vec<(u64, u64)>,
+    holes: &mut Vec<(u64, u64)>,
+    reserve: u64,
+    target: u64,
+) -> (u64, usize)
 {
     use super::memmgr::{pool_free_and_largest, release_grant, try_request_contiguous};
 
     let page = syscall_abi::PAGE_SIZE;
     let hole_pages = DEMAND_CHUNK_PAGES - 1;
     let hole = u32::try_from(hole_pages).expect("demand_fault_fragmented: hole beyond u32 pages");
-    // A held piece first, then a hole and a held piece per hole, so no hole
-    // touches a run outside the carve.
-    let carve_pages = u64::try_from(pieces)
-        .ok()
-        .and_then(|n| u32::try_from(hole_pages.saturating_mul(n)).ok())
-        .expect("demand_fault_fragmented: carve beyond u32 pages");
-    let mut holes: Vec<(u64, u64)> = Vec::with_capacity(pieces);
-    let carve = try_request_contiguous(carve_pages).unwrap_or_else(|label| {
-        panic!("demand_fault_fragmented: the {carve_pages}-page carve was refused ({label:#x})")
-    });
-
-    // Draw every free run of a hole's size or more, whole.
     let mut drawn_pages = 0u64;
-    let mut drained = false;
+
+    let mut reached = false;
     for _ in 0..FRAGMENT_MAX_DRAWS
     {
-        let (_, largest) = pool_free_and_largest();
-        if largest < hole_pages.saturating_mul(page)
+        let (free, largest) = pool_free_and_largest();
+        let take = (free / page).saturating_sub(target).min(largest / page);
+        if take < hole_pages
         {
-            drained = true;
+            reached = true;
             break;
         }
-        let take =
-            u32::try_from(largest / page).expect("demand_fault_fragmented: run beyond u32 pages");
+        let take = u32::try_from(take).expect("demand_fault_fragmented: run beyond u32 pages");
         // A request another process's draw beat to the run is refused; the
         // next query sees the pool as it is.
         if let Ok(grant) = try_request_contiguous(take)
@@ -701,37 +733,48 @@ fn fragment_pool(held: &mut Vec<(u64, u64)>, pieces: usize) -> (u64, usize)
         }
     }
     assert!(
-        drained,
-        "demand_fault_fragmented: the drain did not end within its bound"
+        reached,
+        "demand_fault_fragmented: the draw to {target} free pages did not end within its bound"
     );
 
-    // The carve is now the only run a hole-sized request fits: cut it front
-    // first, and release each hole once the piece after it is held.
-    release_grant(carve.0, carve.1);
-    if let Ok(first) = try_request_contiguous(hole)
+    while holes.len() < holes.capacity()
     {
-        held.push(first);
-        for _ in 0..FRAGMENT_HOLES
+        let Ok(piece) = try_request_contiguous(hole)
+        else
         {
-            let Ok(gap) = try_request_contiguous(hole)
-            else
-            {
-                break;
-            };
-            let Ok(next) = try_request_contiguous(hole)
-            else
-            {
-                held.push(gap);
-                break;
-            };
-            holes.push(gap);
-            held.push(next);
-        }
+            break;
+        };
+        held.push(piece);
+        drawn_pages = drawn_pages.saturating_add(hole_pages);
+        let Ok(gap) = try_request_contiguous(hole)
+        else
+        {
+            break;
+        };
+        holes.push(gap);
     }
     let hole_count = holes.len();
-    for (cap, id) in holes
+    for (cap, id) in holes.drain(..)
     {
         release_grant(cap, id);
+    }
+
+    for _ in 0..FRAGMENT_MAX_DRAWS
+    {
+        let (free, largest) = pool_free_and_largest();
+        let run = largest / page;
+        // A run memmgr would refuse at the reserve stays; the phase's check
+        // reports it.
+        if run < DEMAND_CHUNK_PAGES || (free / page).saturating_sub(run) < reserve
+        {
+            break;
+        }
+        let take = u32::try_from(run).expect("demand_fault_fragmented: run beyond u32 pages");
+        if let Ok(grant) = try_request_contiguous(take)
+        {
+            held.push(grant);
+            drawn_pages = drawn_pages.saturating_add(run);
+        }
     }
     (drawn_pages, hole_count)
 }

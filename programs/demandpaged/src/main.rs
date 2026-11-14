@@ -433,6 +433,7 @@ impl Samples
 /// runs on CPU 0 by the first timed sample.
 fn bench() -> ExitCode
 {
+    std::os::seraph::log::register_name(b"demandpaged");
     let chunks = match std::env::args()
         .skip_while(|a| a != "bench")
         .nth(1)

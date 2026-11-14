@@ -58,8 +58,8 @@ warm-up chunks, which block on memmgr too, leave it running there.
 | `fault` | The first store into a chunk of a region `register_demand_paged` registered: the fault's delivery to memmgr, memmgr's backing of the chunk (run selection, zeroing, the map), and the resume. The registration funds the region's page tables, so no sample funds any |
 | `grant` | `REQUEST_MEMORY_CAPS` for the chunk's pages with `REQUIRE_CONTIGUOUS`, the cap's map into a reservation with `mem_map_funded`, which funds page tables when the map is refused for want of them, and the first store into it |
 
-The mode logs one line per path, where `<arch>` is `x86_64` or `riscv64` and `<path>` is `fault`
-or `grant`:
+The mode logs under the name `demandpaged`, one line per path, where `<arch>` is `x86_64` or
+`riscv64` and `<path>` is `fault` or `grant`:
 
 ```text
 arch=<arch> path=<path> chunk_pages=16 chunks=<n> cycles_min=<n> cycles_mean=<n> cycles_max=<n>

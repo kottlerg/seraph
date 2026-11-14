@@ -270,20 +270,42 @@ The supported failure-handling primitives are:
   § Loss of the block device). The driver's exit is then an fs-driver
   crash, as above, unless the request was an `FS_UNMOUNT`, which
   replies success and ends as an unmount (§ Driver exit there).
-- **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
-  namespace endpoint cascades through the kernel derivation graph
-  and invalidates every cap ever derived from it: vfsd's retained
-  endpoint for the mount, the `MOUNT` caller's copy, and every node
-  cap minted for a lookup through that mount. This is the supported
-  primitive for "tear down a mount."
+- **Unmount.** `UNMOUNT`, on the `MOUNT_AUTHORITY` badge, removes a
+  mount below `/`. vfsd stops resolving lookups across it and sends the
+  driver `FS_UNMOUNT`; the driver refuses an unforced unmount `BUSY`
+  while a file is open, and the mount is kept. Otherwise vfsd tears the
+  driver down without relying on its answer: it revokes the partition
+  cap, revokes the driver's namespace endpoint, waits a bounded time for
+  the driver's death and destroys its process. The endpoint's revocation
+  cascades through the kernel derivation graph and invalidates every cap
+  derived from it: vfsd's caps for the mount, the `MOUNT` caller's copy,
+  and every node cap, open file and working directory a client holds
+  through the mount. This is the supported primitive for "tear down a
+  mount"; the sequence is owned by
+  [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)
+  § Unmount.
+- **Fall-through after an unmount.** The unmounted path resolves
+  through the root filesystem, as a skipped auto-mount does: lookups
+  and listings serve the root partition's directory of the same name,
+  or resolve the name as absent when the root partition has none (the
+  in-tree image has none for `/data` or `/esp`). Only lookups and
+  listings fall through a synthetic node, so nothing is created on the
+  root filesystem through one.
+- **Stale handles.** A call on a cap that died with its mount fails;
+  std reports it as `ErrorKind::StaleNetworkFileHandle`
+  ([`runtime/ruststd/README.md`](../runtime/ruststd/README.md)
+  § Namespace capabilities). A page-cache page a client mapped stays
+  mapped and readable, holding the bytes it held at the unmount, until
+  the client unmaps it: memmgr keeps the dead driver's frame while a
+  mapping of it remains
+  ([`services/memmgr/README.md`](../services/memmgr/README.md)
+  § Responsibilities).
 - **Per-cap revocation is not supported.** A terminal mount retains
   the driver's unbadged namespace endpoint and mints a fresh
   attenuated cap per lookup; there is no scheme to invalidate one
   issued node cap without cascading to its siblings. See
   [`services/vfsd/docs/namespace-composition.md`](../services/vfsd/docs/namespace-composition.md)
   §"Revocation".
-- **Unmount is not implemented.** The mount tree is permanent for
-  the lifetime of the vfsd process.
 
 ---
 

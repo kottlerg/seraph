@@ -410,6 +410,17 @@ spawner's `root_dir_cap()` (parent-inherit); explicit override via
 path and delivers the resulting cap as the child's initial
 `current_dir_cap`.
 
+A cap on an unmounted filesystem is dead: vfsd's `UNMOUNT` revokes the
+driver's endpoint, which frees every cap derived from it in every
+`CSpace`
+([`services/vfsd/docs/vfs-ipc-interface.md`](../../services/vfsd/docs/vfs-ipc-interface.md)
+§ Label 11). A `std::fs` call whose IPC fails on a cap that `cap_info`
+then finds empty (an open `File`, a `ReadDir`, or a relative path
+through the cwd cap) returns
+`ErrorKind::StaleNetworkFileHandle`; the caller resolves the path again,
+and a cwd under the mount is replaced with `set_current_dir`. A call that
+fails on a cap still live returns `ErrorKind::Other`.
+
 The cap-as-namespace model that defines this surface lives in
 [`docs/namespace-model.md`](../../docs/namespace-model.md); the wire
 protocol is in

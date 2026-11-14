@@ -1,7 +1,7 @@
 # vfsd Service Interface
 
 IPC interface vfsd exposes on its un-badged **service endpoint**.
-Two labels: `MOUNT` and `GET_SYSTEM_ROOT_CAP`. The namespace surface
+Three labels: `MOUNT`, `UNMOUNT` and `GET_SYSTEM_ROOT_CAP`. The namespace surface
 (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR` against the synthetic system
 root) lives on a separate endpoint and is specified in
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md);
@@ -41,12 +41,12 @@ At handover init endows svcmgr with two more SENDs on the endpoint, each
 badged and so not re-badgeable: one carrying `MOUNT_AUTHORITY` alone,
 which svcmgr publishes seed-only as `vfsd.mount`, and one carrying
 `DENY_BADGE` (`1`, no verb bit), published seed-only as `vfsd.deny`.
-svctest alone seeds both, to drive `MOUNT`'s refusal and rejection
-paths.
+svctest alone seeds both, to drive `MOUNT`'s and `UNMOUNT`'s refusal and
+rejection paths and to unmount and remount the data partition.
 
 | Badge bit | Constant | Gates | Holder |
 |---|---|---|---|
-| 63 | `vfsd_labels::MOUNT_AUTHORITY` | `MOUNT` | svcmgr's `vfsd.mount` |
+| 63 | `vfsd_labels::MOUNT_AUTHORITY` | `MOUNT`, `UNMOUNT` | svcmgr's `vfsd.mount` |
 | 62 | `vfsd_labels::SEED_AUTHORITY` | `GET_SYSTEM_ROOT_CAP` | init only |
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). Numeric
@@ -59,7 +59,8 @@ labels live in `ipc::vfsd_labels` in `shared/ipc`.
 Runtime explicit-mount surface (foreign-GUID disks, user-invoked
 mounts). vfsd self-mounts root, `/esp`, and `/data` at startup through
 the same resolution path; the only in-tree caller is svctest, whose
-cases drive the rejection paths below. The caller's badge MUST carry
+cases drive the rejection paths below and mount the data partition again
+after an `UNMOUNT`, at `/data` and elsewhere. The caller's badge MUST carry
 `MOUNT_AUTHORITY`: vfsd replies `UNAUTHORIZED` otherwise, before it
 reads the request.
 
@@ -129,9 +130,59 @@ the synthetic-root install fails: root already mounted, the path
 already a mount point, a path component the namespace protocol's name
 rule rejects, or no memory to grow the tree).
 
-Single-component mount paths only (`/`, `/<name>`). Multi-component
-paths are not surfaced through `NS_LOOKUP` and remain reachable only
-via the root mount's transparent delegation.
+A mount path may have several components: each component above the mount point becomes a
+synthetic intermediate, through which lookups of the root filesystem's entries of the same
+directory still fall through
+([`namespace-composition.md`](namespace-composition.md#synthetic-root-state)).
+
+---
+
+## Label 11: `UNMOUNT`
+
+Unmount the filesystem mounted at a path. Who may mount may unmount: the caller's badge MUST
+carry `MOUNT_AUTHORITY`, and vfsd replies `UNAUTHORIZED` otherwise, before it reads the request.
+`/` is never unmounted. The path is the mount point a `MOUNT` named, so `/esp` and `/data` are
+covered.
+
+vfsd stops resolving lookups across the mount, then sends the driver `FS_UNMOUNT`
+([fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md#label-19-fs_unmount) § Label 19),
+with `fs_labels::UNMOUNT_FORCE` when the request carries `UNMOUNT_FORCE`, bounded by a timeout.
+When the driver answers `BUSY` to an unforced request, the mount is kept: lookups cross it again
+and vfsd replies `BUSY` with the driver's count of live opens. Only opens count: a client whose
+cwd is under the mount, or that holds a node cap there, is not asked. Otherwise, whether the
+driver answered `SUCCESS`, anything else or nothing in time, vfsd tears the driver down: it
+revokes the partition cap, revokes and deletes the driver's service endpoint, waits a bounded
+time for the driver's death, destroys its process, and removes the mount's record
+([`namespace-composition.md`](namespace-composition.md#unmount) § Unmount). The path then falls
+through to the root filesystem: lookups and listings serve its directory of the same name, or
+find the name absent when it has none.
+
+Every cap a client holds on the mount (an open file, a node cap, a cwd) dies with the endpoint;
+a call on one fails, which std reports as `ErrorKind::StaleNetworkFileHandle`
+([runtime/ruststd/README.md](../../../runtime/ruststd/README.md#namespace-capabilities)
+§ Namespace capabilities). A cache page a client mapped stays mapped, readable and stale, until
+the client unmaps it
+([docs/storage.md](../../../docs/storage.md#failure-and-revocation-invariants)). A later
+`MOUNT` at the path installs on the same node.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `11`, with `vfsd_labels::UNMOUNT_FORCE` (bit 16) to unmount with files open |
+| `data[0]` | Caller's `ipc::VFSD_LABELS_VERSION` |
+| `data[1]` | Mount path length (1..=`MAX_MOUNT_PATH_LEN`, as for `MOUNT`) |
+| `data[2..]` | Mount path bytes packed little-endian |
+
+**Reply (success)**: `label = vfsd_errors::SUCCESS` (0), once the driver is gone.
+
+**Reply (busy)**: `label = vfsd_errors::BUSY` (11), `data[0]` = the driver's count of live
+opens; the mount is kept.
+
+**Reply (error)**: `label = vfsd_errors::*` (`UNAUTHORIZED` for a badge without
+`MOUNT_AUTHORITY` and for `/`, `LABEL_VERSION_MISMATCH` when `data[0]` differs from vfsd's
+`VFSD_LABELS_VERSION`, `NOT_FOUND` for an invalid path length, `NO_MOUNT` when no mount is at
+the path or its unmount is already under way).
 
 ---
 

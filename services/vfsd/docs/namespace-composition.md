@@ -65,8 +65,9 @@ has none. Only one install makes a node visible, so concurrent `MOUNT`s
 never walk for the same node, and the tree refuses a walked cap for a node
 that has one by then, which vfsd deletes.
 The in-tree mount set is the root mount (`/`) plus the single-component
-`/esp` and `/data` auto-mounts; the multi-component install path
-remains supported but is currently unexercised in production.
+`/esp` and `/data` auto-mounts; svctest's unmount phases exercise the
+multi-component install path by mounting the data partition at
+`/config/svcmgr/tests`.
 
 ### Mount record
 
@@ -93,9 +94,10 @@ address space, so a terminal fault in any of the driver's threads posts
 to it as well
 ([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
 § Label 1, **Death relay**). Both spawn paths, `CREATE_PROCESS` from the
-boot module and `CREATE_FROM_FILE`, set up both bindings. No vfsd thread
-reads the queue yet (design intent; not yet implemented: vfsd reacting
-to a driver's death).
+boot module and `CREATE_FROM_FILE`, set up both bindings. An unmount
+waits on the queue for the driver's death (§ Unmount); no vfsd thread
+reads it otherwise (design intent; not yet implemented: vfsd reacting to
+a driver's death).
 
 A record is in one of two states. While *mounted*, lookups cross it.
 Removing a mount below `/` takes two steps:
@@ -103,18 +105,50 @@ Removing a mount below `/` takes two steps:
 after which no lookup crosses it and no install may take the node, and
 `VfsdRootBackend::remove_mount` clears the record once the caller has
 torn the driver down, leaving the node vacant unless a mount below it
-keeps it visible as an intermediate. The root mount is never removed.
+keeps it visible as an intermediate.
+`VfsdRootBackend::restore_mount` instead moves a record being removed
+back to *mounted*, when the driver refuses the unmount. The root mount
+is never removed.
 `NS_LOOKUP`, `NS_READDIR`, the shadowing of fall-through entries, and a
 node's child count skip a node that is not visible, so the name of a
 vacant node, or of a node whose own mount is being removed with no
 mount below it, falls through to the root filesystem as an absent name
-does. vfsd does not yet remove a mount: no request or event reaches
-`begin_unmount` (design intent; not yet implemented).
+does. Only those two requests fall through: any other request on a
+synthetic node is answered `NotSupported`, so nothing is created on the
+root filesystem through one. The `UNMOUNT` request is the one caller of
+`begin_unmount` (§ Unmount).
 
 A `MOUNT` that fails after its driver started releases what its record
 would have held: it revokes and deletes the partition cap, revokes the
 driver's service endpoint (which stops the driver), and deletes the
 process handle and the death queue.
+
+### Unmount
+
+`UNMOUNT` ([`vfs-ipc-interface.md`](vfs-ipc-interface.md#label-11-unmount) § Label 11) removes
+the mount at a path in this order:
+
+1. `find` the path's node and `begin_unmount` it, so no lookup crosses the mount from here on. A
+   node with no mount, or one whose removal is under way, is refused, as is `/`.
+2. Send the driver `FS_UNMOUNT` on a SEND derived from the record's `endpoint`, bounded by a
+   timeout, with `UNMOUNT_FORCE` when the request carries it. A `BUSY` answer to an unforced
+   request ends the unmount: `restore_mount` puts the record back, and vfsd replies `BUSY`.
+3. Otherwise, whether the driver answered `SUCCESS` (it has released every open and exits),
+   anything else, or nothing in time, tear the driver down without relying on it: revoke and
+   delete the record's `partition`, so the driver reaches the disk no more; revoke and delete
+   its `endpoint`, which invalidates every cap derived from it (§ Revocation) and stops a driver
+   still receiving; wait, bounded, for the death on the record's `death_queue`; then send
+   `DESTROY_PROCESS` on the record's `process`, which a driver that exited takes as a no-op, and
+   delete the process handle and the death queue.
+4. `remove_mount` the record. When the node stays visible because a mount below it remains, it
+   is now a synthetic intermediate with no fall-through cap (`needs_fallthrough`); vfsd walks the
+   root mount for it as an install walks for the intermediates it makes visible. Then reply
+   `SUCCESS`.
+
+Only the request that began a node's removal ends it, so a concurrent `MOUNT` at the path is
+refused (`TABLE_FULL`) and a concurrent `UNMOUNT` of it finds the removal under way (`NO_MOUNT`)
+until then. The node stays in the tree with its index, and a later `MOUNT` at the path installs
+on it.
 
 ---
 
@@ -238,7 +272,7 @@ its siblings — is not supported by this scheme.
 
 vfsd holds two un-badged endpoints:
 
-- **Service endpoint** — `MOUNT` and `GET_SYSTEM_ROOT_CAP`.
+- **Service endpoint** — `MOUNT`, `UNMOUNT` and `GET_SYSTEM_ROOT_CAP`.
   Multi-threaded recv (`SERVICE_THREAD_COUNT` handlers) so that
   independent requests proceed while one handler waits on a fatfs
   spawn. The count is a concurrency knob, not a correctness bound: no
@@ -246,7 +280,10 @@ vfsd holds two un-badged endpoints:
   handler blocks on (the worker pool, procmgr's `CREATE_FROM_FILE`,
   whose `FS_READ`s go to the fs driver that minted the file cap, the
   `/services/fs/fatfs` walk the namespace dispatcher serves, and the
-  `FS_MOUNT` probe) never calls the service endpoint. A request past
+  `FS_MOUNT` probe) and what an `UNMOUNT` handler blocks on (the
+  driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
+  `DESTROY_PROCESS`, and the root-mount walk for a fall-through cap)
+  never calls the service endpoint. A request past
   the last free handler waits in the endpoint queue.
 - **Namespace endpoint** — `NS_LOOKUP`, `NS_STAT`, `NS_READDIR`.
   Single dispatcher thread; the `NamespaceBackend` methods are
@@ -284,11 +321,13 @@ Wire-label numbers for both surfaces live in `ipc::vfsd_labels` and
 A successful `install` stores the mount's record (§ Mount record) and
 any walked `fallthrough_cap`s (synthetic intermediates, plus the root
 mount's badged fall-through cap); the tree keeps them until the mount is
-removed, and the record's caps are vfsd's to release. vfsd removes no
-mount yet, so every mount and its record last until vfsd exits (design
-intent; not yet implemented: unmount, and the handling of a mounted
-device's loss). Per-process `system_root_cap` distribution (different
-processes seeing different roots) is not implemented.
+removed, and the record's caps are vfsd's to release. A mount below `/`
+lasts until an `UNMOUNT` removes it (§ Unmount), which releases the
+record's caps; the root mount, and a node's walked `fallthrough_cap`,
+last until vfsd exits. The handling of a mounted device's loss and of a
+driver's death is design intent; not yet implemented. Per-process
+`system_root_cap` distribution (different processes seeing different
+roots) is not implemented.
 
 ---
 
@@ -299,7 +338,7 @@ processes seeing different roots) is not implemented.
 | [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | NS_* wire surface and dispatch crate |
 | [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
 | [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_MEMORY, …) |
-| [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, GET_SYSTEM_ROOT_CAP) |
+| [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, UNMOUNT, GET_SYSTEM_ROOT_CAP) |
 
 ---
 

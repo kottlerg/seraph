@@ -270,8 +270,11 @@ quality caveat.
   `DEFAULT_PROCESS_STACK_PAGES`. Loaders refuse a binary whose note
   declares zero pages or more than `MAX_PROCESS_STACK_PAGES`; the pool's
   available RAM is the remaining gate on the resulting
-  `REQUEST_MEMORY_CAPS` calls (memmgr tracks per-process frames in a
-  RAM-bound arena, not a fixed quota). For an `ET_DYN` image the
+  `REQUEST_MEMORY_CAPS` calls, with the memory max of the process's
+  budget node where its creator set one; no default per-process ceiling
+  exists ([memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy; the max is design intent, not yet implemented,
+  [#260](https://github.com/kottlerg/seraph/issues/260)). For an `ET_DYN` image the
   creator leaves the `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages below
   `stack_top_vaddr` to the stack: it maps no other surface there, the
   layout's draw windows keep every other bootstrap surface out of them

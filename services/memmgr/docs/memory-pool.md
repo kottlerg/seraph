@@ -2,8 +2,9 @@
 
 Authoritative specification of memmgr's memory-cap pool: how memmgr
 ingests memory caps at boot, how it allocates them, how it tracks per-process
-ownership, how it reclaims on process death, and how it coalesces freed
-runs to sustain contiguous-allocation success.
+ownership, how it reclaims on process death, how it coalesces freed
+runs to sustain contiguous-allocation success, and how it bounds what each
+process may take.
 
 ---
 
@@ -614,6 +615,65 @@ preconditions above. A declined pair stays as two discrete runs.
 
 ---
 
+## Distribution policy
+
+The kernel sets no ceiling on a process's memory: a process holds what it has been granted through
+accounted, retyped Memory caps, and the kernel forbids no legitimate consumption
+([docs/memory-model.md](../../../docs/memory-model.md) § Frame Allocation is Fallible). Containing
+a process's memory is therefore the distributor's policy, and memmgr, which lends every page of
+userspace RAM, is the distributor. The kernel accounts; memmgr decides which charges it serves.
+
+**Budget nodes.** memmgr charges every page it lends to a process to a budget node, a memmgr object
+separate from the process record. A node has a parent link, an optional max in pages, and a charge
+counter for its subtree: the pages charged to the node and to every node below it. A process record
+points at a node; nothing assumes one node per process. The charge covers each grant, demand chunk
+and page-table donation memmgr accounts to the process ([Per-Process
+Tracking](#per-process-tracking)), and each such run on the deferred list until it rejoins the free
+pool ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
+index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
+process while a node below it is alive or a run charged to it is on the deferred list, and its
+charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
+process, die, and free its subtree's budget while the frames stay held.
+
+**Charging.** A charge is checked against the max of the node and of every ancestor. A request
+that would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
+system exhaustion, and a demand fault that would is declined with code 10, distinct from code 7, so
+a crash report tells a budget kill from an exhaustion kill. Lowering a max reclaims nothing and
+kills no process: it refuses new charges until the subtree's usage falls below it. A node without
+a max is limited only by its ancestors and the system reserve. No recipe, and nothing else in the
+default image, sets a max, so no default per-process ceiling exists.
+
+**System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
+take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
+reserve. It is a floor for the core and a limit on no process: memmgr's self-funding, which is
+charged to no node, and the reserve nodes draw on it. Reserve membership is an attribute each node
+takes when it is created, not one its children inherit. The nodes of memmgr's boot records
+(procmgr's, and memmgr's and init's own) and of init's children (devmgr, vfsd and svcmgr) are
+reserve nodes, and so is the node of a process created with procmgr's reserve creation flag, which
+procmgr honours only from a reserve creator, as it does `CREATE_PHYS_ACCESS`. A process a reserve
+creator creates without the flag is outside the reserve, so svcmgr's services, crashd among them,
+are outside it until svcmgr passes the flag for them; a recipe key that asks for it is
+[#1098](https://github.com/kottlerg/seraph/issues/1098). The reserve is `pool_total / 64`
+([docs/limits.md](../../../docs/limits.md) § memmgr).
+
+**Create-time ceiling.** procmgr registers each process with its creator's node as the parent (a
+child of init is a top-level node: init's own record holds only init's bootstrap arenas and parents
+no process) and, when the creator asks for one, a max in pages. memmgr clamps the max to what the
+parent and every ancestor have left, and refuses a reserve node under a parent outside the reserve.
+A process reads its node's usage, its max and its subtree's usage with `QUERY_MEMORY_USAGE`.
+
+**Server-side charges.** Memory a server spends on a client's behalf (procmgr's process-table
+entry, vfsd's and fatfs's per-client state) is charged to the server's node, not to the client's.
+A client can therefore make a server spend memory beyond the client's own max, bounded only by the
+server's node and the reserve. This is a known gap; charging that state to the client is
+[#1100](https://github.com/kottlerg/seraph/issues/1100).
+
+The budget nodes, the reserve, `LIMIT`, decline code 10 and `QUERY_MEMORY_USAGE` are design intent;
+not yet implemented ([#260](https://github.com/kottlerg/seraph/issues/260)). Live control of a
+running process's max is [#1097](https://github.com/kottlerg/seraph/issues/1097).
+
+---
+
 ## Failure Modes
 
 | Failure | Cause | Caller observation |
@@ -641,9 +701,6 @@ terminal fault tears down the whole process (see
   exiting (or calling `RELEASE_MEMORY_CAPS`) and the resulting coalesce.
 - **MMIO and IOMMU memory caps.** Out of scope; see
   [`docs/device-management.md`](../../../docs/device-management.md).
-- **Quota policy.** Per-process frame and region counts are bounded by RAM
-  (the metadata arena), not by a security policy. System-wide quota and
-  pressure mechanisms are out of scope for the first cut.
 
 ---
 

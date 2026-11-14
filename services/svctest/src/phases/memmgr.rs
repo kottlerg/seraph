@@ -308,6 +308,20 @@ pub(crate) fn pool_free_and_largest() -> (u64, u64)
     (reply.word(3), reply.word(5))
 }
 
+/// memmgr's system reserve (`QUERY_POOL_STATUS` `data[6]`), in bytes: the free
+/// bytes a grant to svctest, which is outside the reserve, may not take.
+pub(crate) fn pool_reserve() -> u64
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    reply.word(6)
+}
+
 /// svctest's own budget usage from memmgr's `QUERY_MEMORY_USAGE`, in pages:
 /// `(own, max, subtree)`.
 fn memory_usage() -> (u64, u64, u64)

@@ -928,11 +928,14 @@ pub mod memmgr_labels
     ///   `free_bytes` once a later reclamation's recheck finds it
     ///   unreachable. A caller polls `free_bytes` and `deferred_bytes`
     ///   together to confirm a dead process's pages were reclaimed.
+    /// * `data[5]` — `largest_free_bytes`: the largest single free run.
+    /// * `data[6]` — `reserve_bytes`: the system reserve, the free pages a
+    ///   charge to a budget node outside the reserve may not take.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory. `data[3]` and `data[4]` are appended fields — readers
+    /// "dark" memory. `data[3]` to `data[6]` are appended fields — readers
     /// needing only the identity may ignore them.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.

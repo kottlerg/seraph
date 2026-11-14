@@ -1593,6 +1593,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
     let free_bytes = l.pool.free_pages().saturating_mul(PAGE_SIZE);
     let deferred_bytes = l.deferred.pages().saturating_mul(PAGE_SIZE);
     let largest_bytes = l.pool.largest_pages(&l.arena).saturating_mul(PAGE_SIZE);
+    let reserve_bytes = reserve_pages(pool_total_pages()).saturating_mul(PAGE_SIZE);
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, boot.system_ram_bytes)
         .word(1, boot.kernel_reserved_bytes)
@@ -1600,6 +1601,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .word(3, free_bytes)
         .word(4, deferred_bytes)
         .word(5, largest_bytes)
+        .word(6, reserve_bytes)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

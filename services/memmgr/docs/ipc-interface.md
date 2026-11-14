@@ -440,6 +440,7 @@ counts only, no caps and no state change.
 | data[3] | `free_bytes` — subset of `pool_total_bytes` in free runs, lent to no process |
 | data[4] | `deferred_bytes` — subset of `pool_total_bytes` reclaimed but held out of the free runs while another process can still reach it |
 | data[5] | `largest_free_bytes` — the largest single free run, the most one `REQUIRE_CONTIGUOUS` grant can take; 0 when the pool is empty |
+| data[6] | `reserve_bytes` — the system reserve: the free pages a charge to a budget node outside the reserve may not take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -455,9 +456,11 @@ process's pages were reclaimed polls `data[3]` back to its pre-spawn
 baseline, and `data[4]` shows what is held instead. `largest_free_bytes`
 (`data[5]`) shows how fragmented the free runs are: below
 `DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
-backed from a smaller run (§ Kernel-origin fault message). `data[3]` to
-`data[5]` are appended after the identity terms; readers needing only the
-identity may ignore them.
+backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
+(`data[6]`) is `pool_total / 64` pages: a process outside the reserve has its
+grants refused, and its demand faults declined, once `data[3]` less the
+request would fall below it. `data[3]` to `data[6]` are appended after the
+identity terms; readers needing only the identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
 

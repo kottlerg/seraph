@@ -644,10 +644,10 @@ forwards to.
 | 4 | The region's protection refuses the access |
 | 5 | No delegated address space |
 | 6 | The metadata arena cannot grow for the slots recording the run takes: its descriptor, and the chunk's path in the region's chunk table |
-| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page is in the system reserve and the process's budget node is outside it, or the split of a run larger than the span to back failed |
+| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page is in the system reserve and the process's budget node is outside it, or the split of a run larger than the pages to back failed |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
-| 10 | The span to back, or the page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
+| 10 | The faulting page, or the page-table funding the map of its run needs beside that run, would take the subtree of the process's budget node, or of an ancestor, over its max ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted
@@ -655,8 +655,9 @@ identity is unaffected (the pages move from a free run to the chunk table;
 they were already owned). The runs memmgr donates to the process's page-table
 pool are recorded on the process record, like a grant, and reclaimed by
 `PROCESS_DIED` only. Both are charged to the process's budget node: memmgr
-admits the whole span before it selects the run, and each donation before it
-makes it.
+admits as much of the span as the node takes, at least the faulting page,
+before it selects the run, and each donation, beside the run whose map needs
+it, before it makes it ([`memory-pool.md`](memory-pool.md) § Demand faults).
 
 ---
 

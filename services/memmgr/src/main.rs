@@ -391,26 +391,45 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
         })
 }
 
-/// Admit a charge of `pages` to the budget node of `rec` against the max of
-/// the node and its ancestors and, for a node outside the reserve, against
-/// the system reserve (`free_pool::budget::admit`;
-/// services/memmgr/docs/memory-pool.md § Distribution policy). A refusal
-/// first rechecks the deferred runs, unless this turn of the receive loop
-/// already has, and, when one moved to the pool, which releases its charge and
-/// adds free pages, admits once more. Every charge to a process is admitted
-/// here before its run leaves the pool: a grant, a demand fault's run, and a
-/// page-table donation to its address space.
-fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> Result<(), ChargeError>
+/// Admit a charge of `pages` to the budget node of `rec`, beside `pending`
+/// pages that left the pool for it uncharged, against the max of the node and
+/// its ancestors and, for a node outside the reserve, against the system
+/// reserve (`free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
+/// § Distribution policy). A refusal first rechecks the deferred runs, unless
+/// this turn of the receive loop already has, and, when one moved to the pool,
+/// which releases its charge and adds free pages, admits once more. Every
+/// charge to a process is admitted here or by [`admissible`] before its run
+/// leaves the pool: a grant here, a demand fault's run by [`admissible`], and
+/// a page-table donation to its address space here, beside the demand run
+/// whose map needs it.
+fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<(), ChargeError>
 {
     let reserve = reserve_pages(pool_total_pages());
-    l.admit(rec, pages, reserve).or_else(|e| {
+    l.admit(rec, pages, pending, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
             return Err(e);
         }
         coalesce(l);
-        l.admit(rec, pages, reserve)
+        l.admit(rec, pages, pending, reserve)
     })
+}
+
+/// The most pages, up to `want`, that may be charged to the budget node of
+/// `rec` (`free_pool::budget::admissible`): `want` clamped to the headroom
+/// under the node's and its ancestors' max and, for a node outside the
+/// reserve, to the free pages above the system reserve. When that falls short
+/// of `want`, the deferred runs are rechecked first, as [`admit`] does.
+fn admissible(l: &mut MemLedger, rec: NodeIdx, want: u64) -> Result<u64, ChargeError>
+{
+    let reserve = reserve_pages(pool_total_pages());
+    let first = l.admissible(rec, want, reserve);
+    if first == Ok(want) || recheck_deferred(l) == 0
+    {
+        return first;
+    }
+    coalesce(l);
+    l.admissible(rec, want, reserve)
 }
 
 // ── Deferred reclamation ─────────────────────────────────────────────────────
@@ -1128,7 +1147,7 @@ fn select_admitted(
     {
         Fit::Contiguous
     };
-    match admit(l, rec, u64::from(want_pages))
+    match admit(l, rec, u64::from(want_pages), 0)
     {
         Ok(()) => select(l, want_pages, fit),
         Err(ChargeError::Limit) => Err(memmgr_errors::LIMIT),
@@ -1793,7 +1812,7 @@ enum FaultDecline
     /// The free pool holds no page to back the faulting page: it is empty,
     /// even after the deferred runs were rechecked, every free page it holds
     /// is in the system reserve and the process's budget node is outside it,
-    /// or the split of a run larger than the span to back failed.
+    /// or the split of a run larger than the pages to back failed.
     NoFreePage = 7,
     /// The run could not be recorded on its chunk in the region's chunk
     /// table.
@@ -1804,9 +1823,10 @@ enum FaultDecline
     /// when the failure was an exhausted pool; the high 32 bits of the reason
     /// word carry the magnitude of its `SyscallError`.
     MapFailed = 9,
-    /// Backing the span, or funding the page tables its map needs, would take
-    /// the subtree of the process's budget node, or of an ancestor, over its
-    /// max (services/memmgr/docs/memory-pool.md § Distribution policy).
+    /// Backing the faulting page, or funding the page tables the map of the
+    /// run backing it needs beside that run, would take the subtree of the
+    /// process's budget node, or of an ancestor, over its max
+    /// (services/memmgr/docs/memory-pool.md § Distribution policy).
     BudgetLimit = 10,
 }
 
@@ -1853,7 +1873,9 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// zeroed ([`scrub_run`]), and replies [`syscall_abi::FAULT_REPLY_RESUME`]; a
 /// fault on a page an earlier run backed is resumed without backing. When no
 /// free run covers that part, the largest free run backs the pages around the
-/// faulting one ([`fault_window`]), so a fault fails only when no page is free
+/// faulting one ([`fault_window`]), and the process's budget node bounds the
+/// span backed ([`select_fault_run`]), so a fault fails only when no page the
+/// process may take is free
 /// (services/memmgr/docs/memory-pool.md § Demand faults). Backing a chunk
 /// rather than a single page bounds cap-slot consumption (one cap per chunk on
 /// an unfragmented pool). The page tables the map needs come from the client
@@ -1877,20 +1899,27 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// holds (services/memmgr/docs/memory-pool.md § Chunk table). A declined
 /// fault's run is unmapped before it returns to the pool
 /// ([`release_unmapped_chunk`]).
-/// Admit a demand fault's span of `span_pages` to the budget node of `rec`
-/// ([`admit`]), then select the run that backs it: one covering the span, else
-/// the largest free run. The whole span is admitted before a run leaves the
-/// pool, though a fragmented pool may back less of it. A charge over a max is
-/// [`FaultDecline::BudgetLimit`]; one that would take the reserve, or a failed
-/// selection, is [`FaultDecline::NoFreePage`].
+/// Admit as much of a demand fault's span of `span_pages` as the budget node
+/// of `rec` takes ([`admissible`]): the span, clamped to the headroom under the
+/// max of the node and its ancestors and, for a node outside the reserve, to
+/// the free pages above the system reserve. Then select the run that backs
+/// those pages: one covering them, else the largest free run. The span is a
+/// fault-around preference, so the fault is declined only when not even the
+/// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
+/// [`FaultDecline::NoFreePage`] at the reserve or when the selection fails.
 fn select_fault_run(l: &mut MemLedger, rec: NodeIdx, span_pages: u32)
 -> Result<Grant, FaultDecline>
 {
-    match admit(l, rec, u64::from(span_pages))
+    match admissible(l, rec, u64::from(span_pages))
     {
-        Ok(()) => select(l, span_pages, Fit::Contiguous)
-            .or_else(|_| select(l, span_pages, Fit::UpTo))
-            .map_err(|_| FaultDecline::NoFreePage),
+        Ok(pages) =>
+        {
+            // At most `span_pages`, so it fits a `u32`.
+            let pages = u32::try_from(pages).unwrap_or(span_pages);
+            select(l, pages, Fit::Contiguous)
+                .or_else(|_| select(l, pages, Fit::UpTo))
+                .map_err(|_| FaultDecline::NoFreePage)
+        }
         Err(ChargeError::Limit) => Err(FaultDecline::BudgetLimit),
         Err(ChargeError::Reserve) => Err(FaultDecline::NoFreePage),
     }
@@ -2094,7 +2123,7 @@ fn map_client_chunk(
         {
             return Err(MapRefusal::Map(e));
         }
-        match fund_client_page_tables(l, rec, aspace_cap, held)
+        match fund_client_page_tables(l, rec, aspace_cap, held, u64::from(frame.page_count))
         {
             Ok(()) =>
             {}
@@ -2110,7 +2139,9 @@ fn map_client_chunk(
 /// two pages when no such run is free, or the process's budget admits only
 /// two) with augment-mode `cap_create_aspace`, and account the run to the
 /// client's record `rec` like a grant memmgr did not map
-/// ([`FRAME_VA_UNMAPPED`], no region id), charged to its budget node, so only
+/// ([`FRAME_VA_UNMAPPED`], no region id). The donation is admitted beside the
+/// `pending` pages of the demand run whose map needs it, which are charged
+/// only once the run is recorded, and is charged to the budget node, so only
 /// `PROCESS_DIED` reclaims it, once the address space's teardown has released
 /// the donation (services/memmgr/docs/memory-pool.md § Client page-table
 /// funding). memmgr keeps the run's cap as the reclaim anchor. A refused
@@ -2126,6 +2157,7 @@ fn fund_client_page_tables(
     rec: NodeIdx,
     aspace_cap: u64,
     held: u64,
+    pending: u64,
 ) -> Result<(), FundRefusal>
 {
     // One slot for this run's descriptor, and those held for the chunk.
@@ -2133,13 +2165,13 @@ fn fund_client_page_tables(
     {
         return Err(FundRefusal::Failed);
     }
-    let first = if admit(l, rec, u64::from(ASPACE_TOPUP_PAGES)).is_ok()
+    let first = if admit(l, rec, u64::from(ASPACE_TOPUP_PAGES), pending).is_ok()
     {
         ASPACE_TOPUP_PAGES
     }
     else
     {
-        match admit(l, rec, 2)
+        match admit(l, rec, 2, pending)
         {
             Ok(()) => 2,
             Err(ChargeError::Limit) => return Err(FundRefusal::Limit),

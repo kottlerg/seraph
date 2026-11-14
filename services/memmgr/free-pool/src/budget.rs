@@ -214,21 +214,25 @@ pub fn create<S: SlotStore>(arena: &mut Arena<S>, spec: NodeSpec) -> Result<Node
 }
 
 /// Whether `pages` more may be charged to the node `idx`, with `free` pages in
-/// the free pool and `reserve` of them in the system reserve.
+/// the free pool and `reserve` of them in the system reserve. `pending` pages
+/// already left the pool for the node and are not yet charged to it (a demand
+/// run whose map needs page-table funding first): they count against the max,
+/// and are already out of `free`.
 ///
 /// # Errors
-/// [`ChargeError::Limit`] when the charge exceeds the [`headroom`] of the
-/// node; [`ChargeError::Reserve`] when the node is outside the reserve and the
-/// charge would leave fewer than `reserve` free pages.
+/// [`ChargeError::Limit`] when `pages` and `pending` together exceed the
+/// [`headroom`] of the node; [`ChargeError::Reserve`] when the node is outside
+/// the reserve and the charge would leave fewer than `reserve` free pages.
 pub fn admit<S: SlotStore>(
     arena: &Arena<S>,
     idx: NodeIdx,
     pages: u64,
+    pending: u64,
     free: u64,
     reserve: u64,
 ) -> Result<(), ChargeError>
 {
-    if pages > headroom(arena, idx)
+    if pages.saturating_add(pending) > headroom(arena, idx)
     {
         return Err(ChargeError::Limit);
     }
@@ -238,6 +242,44 @@ pub fn admit<S: SlotStore>(
         return Err(ChargeError::Reserve);
     }
     Ok(())
+}
+
+/// The most pages, up to `want`, that may be charged to the node `idx`, with
+/// `free` pages in the free pool and `reserve` of them in the system reserve:
+/// `want`, clamped to the node's [`headroom`] and, for a node outside the
+/// reserve, to the free pages above the reserve. A demand fault backs that
+/// much of its span.
+///
+/// # Errors
+/// [`ChargeError::Limit`] when the headroom admits no page;
+/// [`ChargeError::Reserve`] when the node is outside the reserve and no free
+/// page lies above it. A `want` of 0 admits 0.
+pub fn admissible<S: SlotStore>(
+    arena: &Arena<S>,
+    idx: NodeIdx,
+    want: u64,
+    free: u64,
+    reserve: u64,
+) -> Result<u64, ChargeError>
+{
+    if want == 0
+    {
+        return Ok(0);
+    }
+    let mut pages = want.min(headroom(arena, idx));
+    if pages == 0
+    {
+        return Err(ChargeError::Limit);
+    }
+    if !node(arena, idx).is_some_and(|b| b.reserve())
+    {
+        pages = pages.min(free.saturating_sub(reserve));
+        if pages == 0
+        {
+            return Err(ChargeError::Reserve);
+        }
+    }
+    Ok(pages)
 }
 
 /// Charge `pages` to the node `idx`: its own count, and the subtree count of
@@ -381,13 +423,13 @@ mod tests
         let top = create(&mut a, under(NODE_NULL, 10)).unwrap();
         let other = create(&mut a, NodeSpec::TOP).unwrap();
         let leaf = create(&mut a, under(top, NO_MAX)).unwrap();
-        assert_eq!(admit(&a, leaf, 10, 100, 0), Ok(()));
-        assert_eq!(admit(&a, leaf, 11, 100, 0), Err(ChargeError::Limit));
+        assert_eq!(admit(&a, leaf, 10, 0, 100, 0), Ok(()));
+        assert_eq!(admit(&a, leaf, 11, 0, 100, 0), Err(ChargeError::Limit));
         charge(&mut a, leaf, 8);
-        assert_eq!(admit(&a, leaf, 2, 100, 0), Ok(()));
-        assert_eq!(admit(&a, leaf, 3, 100, 0), Err(ChargeError::Limit));
+        assert_eq!(admit(&a, leaf, 2, 0, 100, 0), Ok(()));
+        assert_eq!(admit(&a, leaf, 3, 0, 100, 0), Err(ChargeError::Limit));
         // A sibling top-level node is not limited by another's max.
-        assert_eq!(admit(&a, other, 50, 100, 0), Ok(()));
+        assert_eq!(admit(&a, other, 50, 0, 100, 0), Ok(()));
     }
 
     #[test]
@@ -399,9 +441,9 @@ mod tests
         set_max(&mut a, n, 4);
         assert_eq!(node(&a, n).map(|b| (b.own, b.subtree)), Some((8, 8)));
         assert_eq!(headroom(&a, n), 0);
-        assert_eq!(admit(&a, n, 1, 100, 0), Err(ChargeError::Limit));
+        assert_eq!(admit(&a, n, 1, 0, 100, 0), Err(ChargeError::Limit));
         uncharge(&mut a, n, 5);
-        assert_eq!(admit(&a, n, 1, 100, 0), Ok(()));
+        assert_eq!(admit(&a, n, 1, 0, 100, 0), Ok(()));
     }
 
     #[test]
@@ -411,10 +453,10 @@ mod tests
         let core = create(&mut a, NodeSpec::TOP_RESERVE).unwrap();
         let client = create(&mut a, NodeSpec::TOP).unwrap();
         // 20 free, 4 reserved: an ordinary client may leave 4 free, no fewer.
-        assert_eq!(admit(&a, client, 16, 20, 4), Ok(()));
-        assert_eq!(admit(&a, client, 17, 20, 4), Err(ChargeError::Reserve));
-        assert_eq!(admit(&a, core, 20, 20, 4), Ok(()));
-        // Membership is inherited: a reserve child under a reserve parent.
+        assert_eq!(admit(&a, client, 16, 0, 20, 4), Ok(()));
+        assert_eq!(admit(&a, client, 17, 0, 20, 4), Err(ChargeError::Reserve));
+        assert_eq!(admit(&a, core, 20, 0, 20, 4), Ok(()));
+        // A child created as a reserve node under a reserve parent.
         let child = create(
             &mut a,
             NodeSpec {
@@ -424,8 +466,48 @@ mod tests
             },
         )
         .unwrap();
-        assert_eq!(admit(&a, child, 20, 20, 4), Ok(()));
+        assert_eq!(admit(&a, child, 20, 0, 20, 4), Ok(()));
         assert_eq!(reserve_pages(6400), 100);
+    }
+
+    #[test]
+    fn pending_pages_count_against_the_max_but_not_against_the_free_pool()
+    {
+        let mut a = arena();
+        let n = create(&mut a, under(NODE_NULL, 20)).unwrap();
+        // A 16-page run left the pool uncharged: four more fit under the max,
+        // five do not.
+        assert_eq!(admit(&a, n, 4, 16, 100, 0), Ok(()));
+        assert_eq!(admit(&a, n, 5, 16, 100, 0), Err(ChargeError::Limit));
+        // `free` already excludes the pending run: 10 free and 6 reserved
+        // leave room for 4.
+        let client = create(&mut a, NodeSpec::TOP).unwrap();
+        assert_eq!(admit(&a, client, 4, 16, 10, 6), Ok(()));
+        assert_eq!(admit(&a, client, 5, 16, 10, 6), Err(ChargeError::Reserve));
+    }
+
+    #[test]
+    fn admissible_clamps_to_the_headroom_and_the_free_pages_above_the_reserve()
+    {
+        let mut a = arena();
+        let n = create(&mut a, under(NODE_NULL, 20)).unwrap();
+        charge(&mut a, n, 15);
+        // Five pages of headroom: a 16-page want backs five.
+        assert_eq!(admissible(&a, n, 16, 100, 0), Ok(5));
+        assert_eq!(admissible(&a, n, 3, 100, 0), Ok(3));
+        charge(&mut a, n, 5);
+        assert_eq!(admissible(&a, n, 1, 100, 0), Err(ChargeError::Limit));
+        // Outside the reserve, the free pages above it bound the want.
+        let client = create(&mut a, NodeSpec::TOP).unwrap();
+        assert_eq!(admissible(&a, client, 16, 25, 20), Ok(5));
+        assert_eq!(
+            admissible(&a, client, 16, 20, 20),
+            Err(ChargeError::Reserve)
+        );
+        // A reserve node may take the reserve.
+        let core = create(&mut a, NodeSpec::TOP_RESERVE).unwrap();
+        assert_eq!(admissible(&a, core, 16, 20, 20), Ok(16));
+        assert_eq!(admissible(&a, core, 0, 0, 20), Ok(0));
     }
 
     #[test]

@@ -241,18 +241,20 @@ faulting page and no page of a run memmgr mapped before, which it reads from the
 the region's chunk table ([Chunk table](#chunk-table)). On a pool with a free run that covers the
 span, that is the whole chunk on its first fault, backed by one run.
 
-memmgr first admits the whole span against the process's budget node, as a grant is admitted
-([Allocation](#allocation)): a span over the max of the node or of an ancestor is declined with
-code 10, and one that would take the system reserve from a node outside it with code 7. It then
-selects a run covering the span, as a `REQUIRE_CONTIGUOUS` request would, with the
-deferred recheck before it fails (see [Reclamation](#reclamation)). When no free run covers the
-span, it takes the largest free run whole, which needs no split, and maps it over the part of the
-span around the faulting page: from the faulting page up, moved down only as far as needed to stay
-inside the span. A later fault on a page of the span the run did not cover is backed the same way,
-so the chunk fills in parts, each part one run and one frame record. A fault is therefore declined
-for want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message)
-only when the free pool holds no page, when every free page is in the system reserve and the
-process's node is outside it, or when the split of a run larger than the span fails.
+The span is a fault-around preference, and the process's budget node bounds it. memmgr first
+admits as much of the span as the node takes ([Distribution policy](#distribution-policy)): the
+span, clamped to what the max of the node and of every ancestor leaves, and, for a node outside the
+system reserve, to the free pages above the reserve. A fault is declined with code 10 only when the
+max admits not even the faulting page, and with code 7 when the reserve does not. It then selects
+a run covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the deferred
+recheck before it fails (see [Reclamation](#reclamation)). When no free run covers them, it takes
+the largest free run whole, which needs no split, and maps it over the part of the span around the
+faulting page: from the faulting page up, moved down only as far as needed to stay inside the
+span. A later fault on a page of the span the run did not cover is backed the same way, so the
+chunk fills in parts, each part one run and one frame record. A fault is therefore declined for
+want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only
+when the free pool holds no page, when every free page is in the system reserve and the process's
+node is outside it, or when the split of a run larger than the pages to back fails.
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
@@ -319,7 +321,9 @@ first. So memmgr does not depend on it. When the map of a run fails with `OutOfM
 funds the pool itself and maps the run again, at most four times:
 
 1. It admits four pages against the process's budget node, or two when four would take the
-   subtree of the node or of an ancestor over its max, or would take the system reserve. It then
+   subtree of the node or of an ancestor over its max, or would take the system reserve. The demand
+   run whose map needs the funding is charged only once it is recorded, so the donation is
+   admitted against the max beside that run's pages. It then
    selects a contiguous run of the admitted size from the free pool, or of two when no four-page
    run is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
    donates a single page.
@@ -337,12 +341,12 @@ run is quiescent by then, or waits on the deferred list until it is (see
 `pool_total` is unchanged.
 
 A fault whose funding the budget refuses, because not even two pages fit under the max of the
-process's node or of an ancestor, is declined with code 10. A fault whose map still fails, because
-the free pool cannot fund the pool or the map fails for another reason, is declined with code 9
-([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message). A failed map can leave the
-first pages of the run mapped. memmgr unmaps the run's span before it returns the run to the free
-pool, so no page of a pooled run stays mapped in the process. When that unmap fails, the run stays
-recorded on the process's entry until `PROCESS_DIED`.
+process's node or of an ancestor beside the run being mapped, is declined with code 10. A fault
+whose map still fails, because the free pool cannot fund the pool or the map fails for another
+reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault
+message). A failed map can leave the first pages of the run mapped. memmgr unmaps the run's span
+before it returns the run to the free pool, so no page of a pooled run stays mapped in the process.
+When that unmap fails, the run stays recorded on the process's entry until `PROCESS_DIED`.
 
 ---
 

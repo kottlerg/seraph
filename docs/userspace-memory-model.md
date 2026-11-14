@@ -401,6 +401,14 @@ memmgr serves frame requests over IPC. The contract:
   pool's free pages cover it, the reply is a **partial grant**: success with
   fewer pages than asked. When the free pages do not cover `want_pages`, the
   request fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
+- **Reserve refusal.** A caller whose budget node is outside the system
+  reserve may not take its pages: either shape fails with its out-of-memory
+  code, before any run is taken, when `want_pages` would leave fewer free
+  pages than the reserve, however many pages are free. `QUERY_POOL_STATUS`
+  reports the reserve beside the free pages
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy;
+  [ipc-interface.md](../services/memmgr/docs/ipc-interface.md) § Label 6).
 - **Budget refusal.** Either shape fails with `memmgr_errors::LIMIT`, before
   any run is taken, when `want_pages` would take the subtree of the caller's
   budget node, or of an ancestor, over its max

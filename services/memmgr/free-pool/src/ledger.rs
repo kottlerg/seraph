@@ -194,16 +194,42 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         budget::node(&self.arena, self.record(rec)?.budget)
     }
 
-    /// Whether `pages` more may be charged to the budget node of `rec`, with
+    /// Whether `pages` more may be charged to the budget node of `rec`, beside
+    /// `pending` pages taken from the pool for it and not yet charged, with
     /// `reserve` of the pool's free pages in the system reserve
     /// ([`budget::admit`]). A record that does not exist admits nothing.
     ///
     /// # Errors
     /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
-    pub fn admit(&self, rec: NodeIdx, pages: u64, reserve: u64) -> Result<(), ChargeError>
+    pub fn admit(
+        &self,
+        rec: NodeIdx,
+        pages: u64,
+        pending: u64,
+        reserve: u64,
+    ) -> Result<(), ChargeError>
     {
         let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
-        budget::admit(&self.arena, node, pages, self.pool.free_pages(), reserve)
+        budget::admit(
+            &self.arena,
+            node,
+            pages,
+            pending,
+            self.pool.free_pages(),
+            reserve,
+        )
+    }
+
+    /// The most pages, up to `want`, that may be charged to the budget node of
+    /// `rec`, with `reserve` of the pool's free pages in the system reserve
+    /// ([`budget::admissible`]). A record that does not exist admits nothing.
+    ///
+    /// # Errors
+    /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
+    pub fn admissible(&self, rec: NodeIdx, want: u64, reserve: u64) -> Result<u64, ChargeError>
+    {
+        let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
+        budget::admissible(&self.arena, node, want, self.pool.free_pages(), reserve)
     }
 
     /// Set the max of the budget node of `rec` ([`budget::set_max`]).
@@ -1371,14 +1397,14 @@ mod tests
             .unwrap();
         assert!(l.push_grant(child, 1, 6, 0x1000, UNMAPPED).is_some());
         // The ancestor's max limits the child, which has none of its own.
-        assert_eq!(l.admit(child, 4, 0), Ok(()));
-        assert_eq!(l.admit(child, 5, 0), Err(ChargeError::Limit));
-        assert_eq!(l.admit(parent, 5, 0), Err(ChargeError::Limit));
+        assert_eq!(l.admit(child, 4, 0, 0), Ok(()));
+        assert_eq!(l.admit(child, 5, 0, 0), Err(ChargeError::Limit));
+        assert_eq!(l.admit(parent, 5, 0, 0), Err(ChargeError::Limit));
         // Lowering the child's max below its usage keeps the usage and
         // refuses every new charge.
         l.set_max(child, 2);
         assert_eq!(usage(&l, child), (6, 6));
-        assert_eq!(l.admit(child, 1, 0), Err(ChargeError::Limit));
+        assert_eq!(l.admit(child, 1, 0, 0), Err(ChargeError::Limit));
         assert_eq!(l.budget(child).map(|b| b.max), Some(2));
     }
 
@@ -1390,7 +1416,7 @@ mod tests
         let core = l.insert_process(1, NodeSpec::TOP_RESERVE).unwrap();
         let client = l.insert_process(2, NodeSpec::TOP).unwrap();
         let take = |l: &mut Ledger<VecStore, VecWords>, rec, pages: u32| {
-            l.admit(rec, u64::from(pages), reserve)?;
+            l.admit(rec, u64::from(pages), 0, reserve)?;
             let grant = l
                 .pool
                 .select(&mut l.arena, pages, crate::Fit::Contiguous, |cap, _| {

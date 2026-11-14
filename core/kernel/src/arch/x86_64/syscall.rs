@@ -129,7 +129,7 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// (`percpu::init_ap` on each AP) and parked by the exit `swapgs`.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn syscall_entry()
+unsafe extern "custom" fn syscall_entry()
 {
     // TrapFrame field offsets (trap_frame.rs):
     //   rax=0, rbx=8, rcx=16, rdx=24, rsi=32, rdi=40, rbp=48,

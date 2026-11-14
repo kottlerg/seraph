@@ -48,8 +48,9 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    // The range lies wholly in the user range, above `USER_VA_FLOOR`.
-    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`; the
+    // walk below covers the range clamped as data (`mm::user_page_range`).
+    let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
     // Bytes the range spans; `virt_end` lies above `virt_base`, so the
     // difference does not wrap.
     let mapping_size = virt_end.wrapping_sub(virt_base);
@@ -359,8 +360,13 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    // The range lies wholly in the user range, above `USER_VA_FLOOR`.
-    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`; the
+    // walk below covers the range clamped as data (`mm::user_page_range`).
+    let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
+    // The page count the region teardown walks, from the clamped range: it is
+    // `page_count` architecturally, and 0 on a path past a mispredicted check.
+    let page_count =
+        usize::try_from(virt_end.wrapping_sub(virt_base) / PAGE_SIZE as u64).unwrap_or(0);
 
     // ── Capability lookup ─────────────────────────────────────────────────────
 
@@ -449,8 +455,9 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    // The range lies wholly in the user range, above `USER_VA_FLOOR`.
-    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`; the
+    // walk below covers the range clamped as data (`mm::user_page_range`).
+    let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
 
     // Parse new protection bits (MAP_WRITABLE / MAP_EXECUTABLE share the Memory
     // rights bit positions; asserted in abi/syscall).

@@ -2782,6 +2782,14 @@ fn thread_mem_args(tf: UserFrame) -> Result<(u64, u64, usize), SyscallError>
     {
         return Err(SyscallError::InvalidAddress);
     }
+    // The target span is clamped to the user half as data: `copy_user_bytes`
+    // walks the target's page tables at `va` in software, so on a path past a
+    // mispredicted refusal it walks the empty span at 0, never the kernel half
+    // of the root (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening). Architecturally the span is
+    // unchanged.
+    let (va, span) = crate::arch::nospec::mask_span_u64(va, len as u64, crate::mm::user_va_top());
+    let len = usize::try_from(span).unwrap_or(0);
     Ok((va, buf, len))
 }
 

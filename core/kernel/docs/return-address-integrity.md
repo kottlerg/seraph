@@ -224,7 +224,7 @@ shadow stacks on or off.
   supervisor, never executable (`PageTableEntry::new_shadow_stack_page`). Ordinary stores to it
   fault, and shadow-stack accesses succeed, since every table entry above the leaf is
   writable. The 2 MiB direct-map leaf is split first, from the guard-page reserve of
-  `mm/stack_guard.rs` ([memory-internals.md](memory-internals.md) § Kernel Stack Guards). A
+  `mm/stack_guard.rs` ([memory-internals.md](memory-internals.md) § Shadow-Stack Pages). A
   Thread's page gets the encoding in `stack_guard::hole`, under the same hold as its guard,
   and every online CPU drops its translation of the page before thread creation continues (a
   kernel-page shootdown), so no CPU keeps a writable alias of a live shadow stack. Thread
@@ -290,7 +290,8 @@ shadow stacks on or off.
 
 ## Verification Record
 
-The four facts the riscv64 implementation depends on, each verified as stated. Probes were
+The four facts the riscv64 implementation depends on (checks 1 to 4), and the x86-64
+mechanism on hardware (check 5), each verified as stated. Probes were
 throwaway and are not in the tree.
 
 1. **The pinned toolchain does not emit Zicfiss instructions.** A two-function `no_core` crate
@@ -345,6 +346,13 @@ throwaway and are not in the tree.
    Optional Extensions, Expansion Options, and states that RVA23S64 has the same unprivileged
    options as RVA23U64. It lists Zimop and Zcmop among the RVA23U64 mandatory extensions, which
    RVA23S64 includes.
+5. **KVM gives a guest supervisor shadow stacks, and the x86-64 mechanism enforces them.**
+   `cargo xtask test-cet` ([docs/testing.md](../../../docs/testing.md) § CET shadow stacks) ran
+   on an Intel Core i9-12900K under Linux 7.3 KVM with QEMU 11.1.3, at 4 vCPUs. With
+   `-cpu host,cet-ss=on,enforce` QEMU started, the kernel printed `shadow stacks: on`, and
+   ktest passed. In a second boot, a return address of `syscall::dispatch` overwritten on the
+   ordinary stack through QEMU's gdbstub raised `#CP` with error code 1 (`NEAR-RET`) at the
+   first attempt.
 
 Sources read: the CFI chapters of the RISC-V ISA manual (`src/unpriv/cfi.adoc` and
 `src/priv/cfi.adoc` of `riscv/riscv-isa-manual`), the Firmware Features extension of the SBI

@@ -357,6 +357,20 @@ logged after the drivers-directory settle. A drivers-directory declaration whose
 request marked boot-only is logged and not bound; a boot-only mark after the drivers-directory
 pass began is refused `INVALID_REQUEST`. devmgr's class table holds at most 64 classes.
 
+A consumer learns that a class changed through a second label on its class SEND,
+`WATCH_CLASS`, refused `UNAUTHORIZED` like `QUERY_DEVICE` to a SEND without a class slot.
+A class SEND carries no grant right, so devmgr creates the watch's Notification itself and
+replies with a copy that carries the wait right only, with the ordinals the class has served
+so far, withdrawn ones included. devmgr signals the Notification, without blocking, in the
+hold of its registry lock that serves a new driver of the class and in each that withdraws
+one, so a consumer that registers and then probes `QUERY_DEVICE` from its last known ordinal
+misses no change. A consumer that cannot run without a class's driver waits on the watch
+while the class serves none, and never polls `QUERY_DEVICE`. A class holds at most
+`MAX_CLASS_WATCHERS` = 8 watches, and a registration past it is refused `WATCHERS_FULL`. A
+watch lasts while its consumer holds a copy of the Notification: devmgr drops it, the next
+time it signals the class or finds the class full, once its own copy is the only reference
+left, as it is after the consumer deletes its copy or exits.
+
 The class's protocol (its labels, message layouts, and verb bit positions) is the contract
 between its drivers and its consumers, and is the one artefact both compile against. It is
 per class, never per driver, and neither devmgr nor svcmgr reads it. The existing protocols
@@ -369,7 +383,9 @@ edits no existing crate.
 
 Hotplug adds no binding path: an enumerator that learns of an added device appends its
 record and runs a bind pass over it; one that learns of a removed device withdraws its
-driver, which leaves a tombstone at its ordinal. The event sources are specified in
+driver, which leaves a tombstone at its ordinal. Either change signals the class's watches
+(§ Device Classes), so a consumer learns of it without probing. The event sources are
+specified in
 [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md); devmgr handles no hotplug
 event yet ([#939](https://github.com/kottlerg/seraph/issues/939)).
 

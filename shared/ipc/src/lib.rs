@@ -2014,7 +2014,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 18;
+pub const DEVMGR_LABELS_VERSION: u32 = 19;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2056,6 +2056,37 @@ pub mod devmgr_labels
     /// The handler logs nothing: logd is a caller, blocked in this call
     /// outside its log loop, so a log line here would deadlock.
     pub const QUERY_DEVICE: u64 = 20;
+    /// Watch a device class: register a Notification devmgr signals,
+    /// without blocking, each time the class gains a served driver (a new
+    /// ordinal) and each time one of its drivers is withdrawn.
+    ///
+    /// Served on a class SEND ([`MINT_CLASS_SEND`]) alone, which carries no
+    /// grant right: devmgr creates the Notification and keeps it, so a
+    /// caller moves no cap. A SEND badged otherwise gets
+    /// [`super::devmgr_errors::UNAUTHORIZED`]. Request: `data[0]` = caller's
+    /// compiled [`super::DEVMGR_LABELS_VERSION`]. Reply
+    /// ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = the Notification,
+    /// with the wait right only; `data[0]` = the ordinals the class has
+    /// served when the watch is registered, withdrawn ones included, which
+    /// is the ordinal the class's next driver takes. A change after the
+    /// registration signals [`WATCH_CLASS_CHANGED`], so a caller that
+    /// registers and then probes [`QUERY_DEVICE`] misses none; the bits
+    /// accumulate until the caller waits, so several changes can wake it
+    /// once.
+    ///
+    /// A class holds at most [`MAX_CLASS_WATCHERS`] watches; a registration
+    /// past it gets [`super::devmgr_errors::WATCHERS_FULL`]. A watch lasts
+    /// while the caller holds a copy of its Notification: once devmgr's own
+    /// copy is the only reference left (the caller deleted its copies, or
+    /// exited), devmgr drops the watch the next time it signals the class or
+    /// finds the class full. `INVALID_REQUEST` when devmgr cannot create the
+    /// Notification. The handler logs nothing, as [`QUERY_DEVICE`]'s does
+    /// not.
+    pub const WATCH_CLASS: u64 = 23;
+    /// The bit devmgr signals on a [`WATCH_CLASS`] Notification.
+    pub const WATCH_CLASS_CHANGED: u64 = 1;
+    /// The most [`WATCH_CLASS`] watches one class holds.
+    pub const MAX_CLASS_WATCHERS: usize = 8;
     /// Query a device's startup-info payload from devmgr's catalog.
     ///
     /// Served only while a driver's spawn batch settles, on that batch's
@@ -2312,8 +2343,8 @@ pub mod devmgr_labels
     /// [`QUERY_DEVICE`] replies carry, moved down from
     /// [`crate::VERB_BIT_MASK`] into bits 16..=21. No other bit is set, so a
     /// class badge carries none of the registry's authority bits and reaches
-    /// `QUERY_DEVICE` alone, and no registry SEND of an authority bit reads
-    /// as a class badge.
+    /// `QUERY_DEVICE` and `WATCH_CLASS` alone, and no registry SEND of an
+    /// authority bit reads as a class badge.
     pub mod class_badge
     {
         use core::prelude::rust_2024::*;
@@ -2558,7 +2589,8 @@ pub unsafe fn report_driver_ready(devmgr_ep: u64, ipc_buf: *mut u64) -> Result<(
     }
 }
 
-/// Why a [`query_device`] or [`mint_class_send`] call returned no cap.
+/// Why a [`query_device`], [`watch_class`], [`await_device`], or
+/// [`mint_class_send`] call returned no cap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassCallError
 {
@@ -2599,6 +2631,131 @@ pub unsafe fn query_device(
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
     let reply = unsafe { ipc_call(class_send, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
     class_call_cap(&reply)
+}
+
+/// A [`devmgr_labels::WATCH_CLASS`] watch: the Notification devmgr signals,
+/// which its holder deletes to end the watch, and the ordinals the class had
+/// served when it was registered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClassWatch
+{
+    /// The Notification, with the wait right only.
+    pub note: u64,
+    /// The ordinals the class had served, withdrawn ones included.
+    pub ordinals: u64,
+}
+
+/// Send [`devmgr_labels::WATCH_CLASS`] on the class SEND `class_send` and
+/// return the watch. Logs nothing, so logd calls it too.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`ClassCallError`]: [`devmgr_errors::WATCHERS_FULL`] for a class that
+/// holds its most watches, and the other refusals
+/// [`devmgr_labels::WATCH_CLASS`] names.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the request and reply `IpcMessage`s (568 B each) and the builder's copy; on its \
+              caller's stack, 32 KiB at the smallest (a std process's main thread)"
+)]
+pub unsafe fn watch_class(class_send: u64, ipc_buf: *mut u64)
+-> Result<ClassWatch, ClassCallError>
+{
+    let request = IpcMessage::builder(devmgr_labels::WATCH_CLASS)
+        .word(0, u64::from(DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let reply = unsafe { ipc_call(class_send, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
+    let note = class_call_cap(&reply)?;
+    Ok(ClassWatch {
+        note,
+        ordinals: reply.word(0),
+    })
+}
+
+/// The driver at the lowest ordinal of the class whose class SEND is
+/// `class_send` that is not withdrawn: [`query_device`] at ordinals 0, 1,
+/// ..., passing each [`devmgr_errors::WITHDRAWN`] reply. Logs nothing.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// The first [`query_device`] error that is not `WITHDRAWN`:
+/// [`devmgr_errors::NO_DEVICE`] when the class serves no live driver.
+pub unsafe fn first_device(class_send: u64, ipc_buf: *mut u64) -> Result<u64, ClassCallError>
+{
+    let mut ordinal = 0u64;
+    loop
+    {
+        // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+        match unsafe { query_device(class_send, ordinal, ipc_buf) }
+        {
+            Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN)) =>
+            {
+                ordinal = ordinal
+                    .checked_add(1)
+                    .ok_or(ClassCallError::Refused(devmgr_errors::NO_DEVICE))?;
+            }
+            other => return other,
+        }
+    }
+}
+
+/// [`first_device`], waiting for the class to serve a live driver: register
+/// a [`devmgr_labels::WATCH_CLASS`] watch, then probe, and while the class
+/// serves none wait on the watch and probe again. `waiting` is called
+/// before each wait. Each wait ends after `wait_ms` milliseconds (`0`:
+/// never) with the last probe's error. A refused watch leaves one probe.
+/// The watch is deleted before the call returns. Logs nothing, so logd
+/// calls it too.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// [`first_device`]'s, or [`ClassCallError::Call`] with the wait's error.
+pub unsafe fn await_device(
+    class_send: u64,
+    wait_ms: u64,
+    ipc_buf: *mut u64,
+    mut waiting: impl FnMut(),
+) -> Result<u64, ClassCallError>
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    let watch = unsafe { watch_class(class_send, ipc_buf) }.ok();
+    let found = loop
+    {
+        // SAFETY: as above.
+        let found = unsafe { first_device(class_send, ipc_buf) };
+        let Some(watch) = watch
+        else
+        {
+            break found;
+        };
+        if found != Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE))
+        {
+            break found;
+        }
+        waiting();
+        match syscall::notification_wait_timeout(watch.note, wait_ms)
+        {
+            // The wait's bound passed with no signal.
+            Ok(0) => break found,
+            Ok(_) =>
+            {}
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
+            {}
+            Err(e) => break Err(ClassCallError::Call(e)),
+        }
+    };
+    if let Some(watch) = watch
+    {
+        let _ = syscall::cap_delete(watch.note);
+    }
+    found
 }
 
 /// Send [`devmgr_labels::MINT_CLASS_SEND`] on `registry`, a registry SEND
@@ -3965,7 +4122,8 @@ pub mod devmgr_errors
     pub const INVALID_REQUEST: u64 = 1;
     /// Caller's badge lacks what the handler requires: an authority bit
     /// (e.g. `CLASS_AUTHORITY` for `MINT_CLASS_SEND`), or, for
-    /// `QUERY_DEVICE`, a class slot (`devmgr_labels::class_badge`).
+    /// `QUERY_DEVICE` and `WATCH_CLASS`, a class slot
+    /// (`devmgr_labels::class_badge`).
     pub const UNAUTHORIZED: u64 = 2;
     /// Caller's compiled `DEVMGR_LABELS_VERSION`, carried in `data[0]` of
     /// every devmgr request, does not match the receiver's: the caller was
@@ -3981,14 +4139,15 @@ pub mod devmgr_errors
     /// the settle bound, etc.), or (c) binds no driver of the class on this
     /// machine. A query received while the drivers-directory pass or its
     /// settle runs waits until both are done and gets no case (a) reply.
-    /// Case (a) is transient: it ends once `SET_DRIVERS_DIR` arrives, so a
-    /// client that cannot proceed without the device MAY retry with a
-    /// bounded number of attempts. Cases (b) and (c) are sticky for the
-    /// boot, since a single attempt is made, and a client cannot tell (a)
-    /// from them: a client with a no-device path (timed) MUST treat the
-    /// reply as terminal and take that path, and no client MAY retry
-    /// without a bound. Also returned by `QUERY_ACPI_TABLE` (table not
-    /// found) and `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
+    /// Case (a) ends once `SET_DRIVERS_DIR` arrives, and (b) and (c) end
+    /// only when a later bind pass serves a driver of the class
+    /// (`BIND_DRIVERS`), which a client cannot foresee: a client with a
+    /// no-device path (timed) MUST treat the reply as terminal and take
+    /// that path, and a client that cannot proceed without the device
+    /// waits on a `WATCH_CLASS` watch and queries again when it is
+    /// signalled ([`super::await_device`]), never polling `QUERY_DEVICE`.
+    /// Also returned by `QUERY_ACPI_TABLE` (table not found) and
+    /// `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
     pub const NO_DEVICE: u64 = 4;
     /// The driver the query names was served and has since died, so devmgr
     /// withdrew it: its service endpoint is revoked, and callers queued on
@@ -3998,6 +4157,9 @@ pub mod devmgr_errors
     /// continues at the next one). Sticky for the boot: devmgr restarts no
     /// driver.
     pub const WITHDRAWN: u64 = 5;
+    /// The class holds `devmgr_labels::MAX_CLASS_WATCHERS` watches and
+    /// none of them is gone (`WATCH_CLASS`).
+    pub const WATCHERS_FULL: u64 = 6;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

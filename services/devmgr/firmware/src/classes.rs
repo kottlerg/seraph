@@ -12,7 +12,8 @@
 //! bounded table the first time a class request (`MINT_CLASS_SEND`) names it
 //! or it serves a driver of that class, and a class keeps its slot, the
 //! index a class SEND's badge carries, for the boot, since the table only
-//! grows. No source lists the classes.
+//! grows. No source lists the classes. Each class holds the watchers devmgr
+//! signals when the class changes ([`Watchers`]).
 
 extern crate alloc;
 
@@ -21,17 +22,20 @@ use alloc::vec::Vec;
 use driver_binding::decl::ClassName;
 
 use crate::served::{Lookup, Served};
+use crate::watchers::{WatchError, Watchers};
 
 /// The most device classes the table holds; past it [`Classes::intern`]
 /// finds no room, so a class request for a new class is refused and the
 /// ready driver of a new class is withdrawn, logged.
 pub const MAX_CLASSES: usize = 64;
 
-/// One class: its name, its served drivers, and its configuration.
+/// One class: its name, its served drivers, its watchers, and its
+/// configuration.
 struct Entry<T>
 {
     name: ClassName,
     served: Served<T>,
+    watchers: Watchers,
     /// A class request named it.
     configured: bool,
     /// A class request marked its drivers boot-bundle only.
@@ -103,6 +107,7 @@ impl<T> Classes<T>
         self.entries.push(Entry {
             name: *name,
             served: Served::new(),
+            watchers: Watchers::new(),
             configured: false,
             boot_only: false,
         });
@@ -170,6 +175,35 @@ impl<T> Classes<T>
     pub fn get_slot(&self, slot: usize) -> Option<&Served<T>>
     {
         self.entries.get(slot).map(|e| &e.served)
+    }
+
+    /// Add the watcher `cap` to the class at `slot` ([`Watchers::add`],
+    /// which drops the watchers `gone` holds for when the class is full),
+    /// and return the ordinals the class has served
+    /// ([`Served::ordinals`]), read with the registration.
+    ///
+    /// # Errors
+    /// [`WatchError`]; `cap` then stays the caller's.
+    pub fn watch(
+        &mut self,
+        slot: usize,
+        cap: u64,
+        gone: impl FnMut(u64) -> bool,
+    ) -> Result<usize, WatchError>
+    {
+        let entry = self.entries.get_mut(slot).ok_or(WatchError::NoClass)?;
+        entry.watchers.add(cap, gone)?;
+        Ok(entry.served.ordinals())
+    }
+
+    /// Signal the watchers of class `name`, when it is in the table
+    /// ([`Watchers::signal`]).
+    pub fn signal(&mut self, name: &ClassName, signal: impl FnMut(u64) -> bool)
+    {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.name == *name)
+        {
+            entry.watchers.signal(signal);
+        }
     }
 
     /// Every class's served list, in the order the classes were interned.
@@ -281,6 +315,53 @@ mod tests
         );
         assert!(!classes.is_boot_only("rtc"));
         assert!(classes.get("rtc").is_none());
+    }
+
+    #[test]
+    fn a_watch_reads_the_ordinals_with_the_registration_and_a_signal_reaches_its_class()
+    {
+        let mut classes = Classes::new();
+        assert_eq!(classes.configure(&class("block"), false, false), Ok(0));
+        assert_eq!(classes.configure(&class("input"), false, false), Ok(1));
+        assert_eq!(classes.watch(0, 10, |_| false), Ok(0));
+        let block = classes.intern(&class("block")).unwrap();
+        block.try_reserve(2).unwrap();
+        block.push(1, "disk0").unwrap();
+        block.push(2, "disk1").unwrap();
+        block.withdraw(1);
+        // A withdrawn ordinal still counts: the next driver takes ordinal 2.
+        assert_eq!(classes.watch(0, 11, |_| false), Ok(2));
+        assert_eq!(classes.watch(1, 20, |_| false), Ok(0));
+        assert_eq!(classes.watch(2, 30, |_| false), Err(WatchError::NoClass));
+
+        let mut signalled = Vec::new();
+        classes.signal(&class("block"), |cap| {
+            signalled.push(cap);
+            true
+        });
+        assert_eq!(signalled, [10, 11]);
+        signalled.clear();
+        classes.signal(&class("rtc"), |cap| {
+            signalled.push(cap);
+            true
+        });
+        assert_eq!(signalled, Vec::<u64>::new());
+    }
+
+    #[test]
+    fn a_full_class_refuses_a_watcher_and_others_are_unaffected()
+    {
+        let mut classes = Classes::<()>::new();
+        classes.configure(&class("serial"), false, false).unwrap();
+        classes.configure(&class("input"), false, false).unwrap();
+        for cap in 0..crate::watchers::MAX_CLASS_WATCHERS as u64
+        {
+            assert_eq!(classes.watch(0, cap, |_| false), Ok(0));
+        }
+        assert_eq!(classes.watch(0, 99, |_| false), Err(WatchError::Full));
+        assert_eq!(classes.watch(1, 99, |_| false), Ok(0));
+        // A watcher found gone makes room.
+        assert_eq!(classes.watch(0, 100, |cap| cap == 3), Ok(0));
     }
 
     #[test]

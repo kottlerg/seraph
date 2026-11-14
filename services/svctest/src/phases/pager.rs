@@ -62,6 +62,11 @@
 //! A ninth phase, **fragmented**, leaves the pool free pages in runs of one
 //! page fewer than a demand chunk and no run of a chunk's size, and touches a
 //! demand region: memmgr must back each fault from a smaller run.
+//!
+//! A tenth phase, **sparse region**, registers a region of 2^14 chunks, whose
+//! chunk table in memmgr has seven directory levels, and touches a spread of
+//! its chunks and its last one: each fault must find its chunk's entry, back
+//! it, and leave every other chunk's data in place.
 
 use std::os::seraph::process::CommandExt;
 use std::os::seraph::startup_info;
@@ -107,6 +112,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "demand_fault_fragmented",
             run: demand_fault_fragmented_phase,
+        },
+        Phase {
+            name: "demand_paging_sparse_region",
+            run: demand_paging_sparse_region_phase,
         },
     ]
 }
@@ -462,6 +471,103 @@ fn demand_fault_cost_phase(_: &Caps)
     std::os::seraph::log!(
         "demand_fault_cost: mean ns per {DEMAND_CHUNK_PAGES}-page chunk fault over \
          {COST_CHUNKS} faults, per round: {means_ns:?}"
+    );
+}
+
+/// Chunks of the region [`demand_paging_sparse_region_phase`] registers: 2^14
+/// (1 GiB of VA), so memmgr's chunk table for it has seven directory levels of
+/// five children each (services/memmgr/docs/memory-pool.md § Chunk table).
+const SPARSE_CHUNKS: u64 = 1 << 14;
+
+/// Chunks [`demand_paging_sparse_region_phase`] touches before its last one,
+/// one in each equal stretch of the region.
+const SPARSE_TOUCHES: u64 = 64;
+
+/// A demand fault on a large region is served from the faulting chunk's
+/// entry in memmgr's chunk table, whatever the region's size. svctest
+/// registers a region of [`SPARSE_CHUNKS`] chunks, writes one word to a page
+/// of one chunk in each of [`SPARSE_TOUCHES`] stretches of it, each at
+/// another position in its stretch and page in its chunk, and to the last
+/// page of the region, so the chunks' paths through the table differ at
+/// every level. Each write must read back after all of them, and a page next
+/// to a written one, which the same fault backed, must read zero. A declined
+/// fault would kill svctest.
+fn demand_paging_sparse_region_phase(_: &Caps)
+{
+    let page = syscall_abi::PAGE_SIZE;
+    let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(page);
+    let stretch = SPARSE_CHUNKS.checked_div(SPARSE_TOUCHES).unwrap_or(1);
+    let region =
+        std::os::seraph::register_demand_paged(SPARSE_CHUNKS.saturating_mul(DEMAND_CHUNK_PAGES))
+            .expect("demand_paging_sparse_region: registering the region failed");
+    let base = region.va_start();
+    let region_end = base.saturating_add(SPARSE_CHUNKS.saturating_mul(chunk_bytes));
+    // The word for touch `i`: a spread chunk and page for each, and the
+    // region's last page for the one past them.
+    let word_va = |i: u64| {
+        if i == SPARSE_TOUCHES
+        {
+            return region_end.saturating_sub(page);
+        }
+        let chunk = i
+            .saturating_mul(stretch)
+            .saturating_add(i.saturating_mul(37).checked_rem(stretch).unwrap_or(0));
+        // Pages 0 to 14 of the chunk, so the page after the word's is in it.
+        let page_in_chunk = i
+            .checked_rem(DEMAND_CHUNK_PAGES.saturating_sub(1))
+            .unwrap_or(0);
+        base.saturating_add(chunk.saturating_mul(chunk_bytes))
+            .saturating_add(page_in_chunk.saturating_mul(page))
+    };
+    let tag = |i: u64| 0x5EED_0000_0000_0000 | i;
+    for i in 0..=SPARSE_TOUCHES
+    {
+        // SAFETY: the word lies in a read-write demand region of this
+        // process, whose first write to it backs its chunk; no Rust reference
+        // points into the region.
+        unsafe { core::ptr::write_volatile(word_va(i) as *mut u64, tag(i)) };
+    }
+    let mut wrong = 0u64;
+    let mut dirty = 0u64;
+    for i in 0..=SPARSE_TOUCHES
+    {
+        let va = word_va(i);
+        // SAFETY: as above; the page is backed by the write.
+        if unsafe { core::ptr::read_volatile(va as *const u64) } != tag(i)
+        {
+            wrong = wrong.saturating_add(1);
+        }
+        // The page before the region's last one, and the page after each
+        // other word's, lie in the chunk the write backed.
+        let next = if i == SPARSE_TOUCHES
+        {
+            va.saturating_sub(page)
+        }
+        else
+        {
+            va.saturating_add(page)
+        };
+        // SAFETY: as above; `next` lies in the same chunk of the region.
+        if unsafe { core::ptr::read_volatile(next as *const u64) } != 0
+        {
+            dirty = dirty.saturating_add(1);
+        }
+    }
+    // SAFETY: no Rust reference and no IPC buffer lies in the region.
+    unsafe { std::os::seraph::unregister_demand_paged(region) }
+        .expect("demand_paging_sparse_region: unregistering the region failed");
+    assert_eq!(
+        wrong, 0,
+        "demand_paging_sparse_region: {wrong} written words did not read back"
+    );
+    assert_eq!(
+        dirty, 0,
+        "demand_paging_sparse_region: {dirty} pages beside a written word read nonzero"
+    );
+    assert_ram_identity();
+    std::os::seraph::log!(
+        "demand_paging_sparse_region phase passed ({} chunks touched of {SPARSE_CHUNKS})",
+        SPARSE_TOUCHES.saturating_add(1)
     );
 }
 

@@ -152,8 +152,9 @@ architecture and in every paging mode, so the user range a mapping may cover is
 ([syscalls.md](../core/kernel/docs/syscalls.md)), and the kernel installs no user page below it,
 init's included. A kernel load through a null pointer at an offset below the floor therefore
 never reads memory a process chose: a misspeculated use of the null object a failed capability
-lookup folds to ([capability-internals.md](../core/kernel/docs/capability-internals.md)
-§ Speculative-Execution Hardening), or of an empty kernel link. SMAP and a clear `sstatus.SUM`
+lookup, or a failed rights test past it, folds to
+([capability-internals.md](../core/kernel/docs/capability-internals.md) § Speculative-Execution
+Hardening), or of an empty kernel link. SMAP and a clear `sstatus.SUM`
 stop the architectural access (§ Kernel Isolation — SMEP and SMAP); the floor does not depend on
 their stopping a transient one. It is larger than every capability object and the TCB, which the
 kernel asserts at compile time, with room for a larger kernel structure or an index added to the

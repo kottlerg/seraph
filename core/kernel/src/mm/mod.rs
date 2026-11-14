@@ -79,17 +79,28 @@ pub fn check_user_base(virt_base: u64) -> Result<(), syscall::SyscallError>
     Ok(())
 }
 
-/// The exclusive end of the `page_count` pages from `virt_base` that a memory
+/// The `(base, end)` of the `page_count` pages from `virt_base` that a memory
 /// syscall (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`,
 /// `SYS_MMIO_MAP`) names, once the range is checked to lie wholly in the user
 /// range.
+///
+/// The range returned is the checked one clamped to the user half as data
+/// (`nospec::mask_span_u64` against `user_va_top()`): architecturally it is
+/// `(virt_base, virt_base + page_count pages)`, and on a path past a
+/// mispredicted check it is empty, so a page-table walk over it never reaches
+/// the kernel half of the root (core/kernel/docs/capability-internals.md
+/// § Speculative-Execution Hardening). A caller walks the range returned, not
+/// its arguments.
 ///
 /// # Errors
 /// - `InvalidAddress`: the base fails [`check_user_base`], or the range ends
 ///   past `user_va_top()`.
 /// - `InvalidArgument`: `page_count` is zero, or the range's size or end
 ///   overflows.
-pub fn user_range_end(virt_base: u64, page_count: usize) -> Result<u64, syscall::SyscallError>
+pub fn user_page_range(
+    virt_base: u64,
+    page_count: usize,
+) -> Result<(u64, u64), syscall::SyscallError>
 {
     use syscall::SyscallError;
 
@@ -106,7 +117,14 @@ pub fn user_range_end(virt_base: u64, page_count: usize) -> Result<u64, syscall:
     {
         return Err(SyscallError::InvalidAddress);
     }
-    Ok(virt_end)
+    // `virt_end` lies above `virt_base`, so the difference does not wrap, and
+    // the clamped span's end is at most `user_va_top()`.
+    let (base, len) = crate::arch::nospec::mask_span_u64(
+        virt_base,
+        virt_end.wrapping_sub(virt_base),
+        user_va_top(),
+    );
+    Ok((base, base.wrapping_add(len)))
 }
 
 /// Physical frame allocator, populated as the first act of Phase 3
@@ -184,7 +202,7 @@ where
 #[cfg(test)]
 mod tests
 {
-    use super::{PAGE_SIZE, check_user_base, in_user_range, user_range_end, user_va_top};
+    use super::{PAGE_SIZE, check_user_base, in_user_range, user_page_range, user_va_top};
     use syscall::{SyscallError, USER_VA_FLOOR};
 
     const PAGE: u64 = PAGE_SIZE as u64;
@@ -224,35 +242,38 @@ mod tests
     #[test]
     fn a_range_overlapping_the_floor_is_refused_and_one_at_it_is_taken()
     {
-        assert_eq!(user_range_end(0, 1), Err(SyscallError::InvalidAddress));
+        assert_eq!(user_page_range(0, 1), Err(SyscallError::InvalidAddress));
         assert_eq!(
-            user_range_end(USER_VA_FLOOR - PAGE, 1),
+            user_page_range(USER_VA_FLOOR - PAGE, 1),
             Err(SyscallError::InvalidAddress)
         );
         // A span that starts below the floor and ends above it.
         assert_eq!(
-            user_range_end(USER_VA_FLOOR - PAGE, 2),
+            user_page_range(USER_VA_FLOOR - PAGE, 2),
             Err(SyscallError::InvalidAddress)
         );
-        assert_eq!(user_range_end(USER_VA_FLOOR, 1), Ok(USER_VA_FLOOR + PAGE));
+        assert_eq!(
+            user_page_range(USER_VA_FLOOR, 1),
+            Ok((USER_VA_FLOOR, USER_VA_FLOOR + PAGE))
+        );
     }
 
     #[test]
     fn a_range_is_bounded_by_the_top_and_refuses_zero_and_overflow()
     {
         let last = user_va_top() - PAGE;
-        assert_eq!(user_range_end(last, 1), Ok(user_va_top()));
-        assert_eq!(user_range_end(last, 2), Err(SyscallError::InvalidAddress));
+        assert_eq!(user_page_range(last, 1), Ok((last, user_va_top())));
+        assert_eq!(user_page_range(last, 2), Err(SyscallError::InvalidAddress));
         assert_eq!(
-            user_range_end(USER_VA_FLOOR, 0),
+            user_page_range(USER_VA_FLOOR, 0),
             Err(SyscallError::InvalidArgument)
         );
         assert_eq!(
-            user_range_end(USER_VA_FLOOR, usize::MAX),
+            user_page_range(USER_VA_FLOOR, usize::MAX),
             Err(SyscallError::InvalidArgument)
         );
         assert_eq!(
-            user_range_end(last, usize::MAX / PAGE_SIZE),
+            user_page_range(last, usize::MAX / PAGE_SIZE),
             Err(SyscallError::InvalidArgument)
         );
     }

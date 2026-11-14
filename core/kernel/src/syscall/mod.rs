@@ -1089,6 +1089,10 @@ pub(crate) struct PinnedCap
     /// of every handler branch on `tag`: the value [`Self::tag_mask`] compares,
     /// which no such branch lets the compiler fold.
     hidden_tag: usize,
+    /// `rights` as a `usize`, passed through `nospec::hide` at resolution,
+    /// ahead of every handler branch on `rights`: the value
+    /// [`Self::rights_mask`] compares.
+    hidden_rights: usize,
 }
 
 #[cfg(not(test))]
@@ -1130,6 +1134,31 @@ impl PinnedCap
     {
         self.hidden_tag
     }
+
+    /// All-ones when the slot held every right in `rights` at resolution,
+    /// else zero, computed from the rights hidden at resolution.
+    ///
+    /// For a right a handler tests after resolution, beyond those its lookup
+    /// required: the handler folds this mask into the pointer its accesses
+    /// past the refusal go through (`nospec::select_ptr`), so a path a
+    /// mispredicted refusal reaches dereferences null. The comparison stays
+    /// data wherever the call sits, a branch on [`Self::rights`] dominating it
+    /// included (core/kernel/docs/capability-internals.md
+    /// § Speculative-Execution Hardening).
+    #[must_use]
+    pub fn rights_mask(&self, rights: crate::cap::slot::Rights) -> usize
+    {
+        held_rights_mask(self.hidden_rights, rights)
+    }
+}
+
+/// All-ones when `held`, a rights word passed through `nospec::hide`, holds
+/// every right in `rights`, else zero (`nospec::mask_if`): the comparison of
+/// [`PinnedCap::rights_mask`].
+fn held_rights_mask(held: usize, rights: crate::cap::slot::Rights) -> usize
+{
+    let wanted = usize::from(rights.0);
+    crate::arch::nospec::mask_if(held & wanted == wanted)
 }
 
 #[cfg(not(test))]
@@ -1276,6 +1305,7 @@ unsafe fn pin_checked(
         let held = slot.rights.contains(required);
         let usable = nospec::mask_if(live & typed & held);
         let hidden_tag = nospec::hide(slot.tag as usize);
+        let hidden_rights = nospec::hide(usize::from(slot.rights.0));
         let raw = slot
             .object
             .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
@@ -1289,7 +1319,7 @@ unsafe fn pin_checked(
             slot.rights,
             slot.badge,
             object,
-            hidden_tag,
+            (hidden_tag, hidden_rights),
         )
     });
     if let Some((true, true, true, _, _, _, Some(obj), _)) = snapshot
@@ -1304,7 +1334,7 @@ unsafe fn pin_checked(
     let lock = unsafe { &(*cspace).lock };
     // SAFETY: paired with the lock_raw above.
     unsafe { lock.unlock_raw(saved) };
-    let (live, typed, held, tag, rights, badge, object, hidden_tag) =
+    let (live, typed, held, tag, rights, badge, object, (hidden_tag, hidden_rights)) =
         snapshot.ok_or(SyscallError::InvalidCapability)?;
     if !live || !typed
     {
@@ -1320,6 +1350,7 @@ unsafe fn pin_checked(
         badge,
         object,
         hidden_tag,
+        hidden_rights,
     })
 }
 
@@ -1388,5 +1419,25 @@ mod exit_code_tests
         assert_eq!(encode_exit_code(u32::MAX), EXIT_FAULT_BASE - 1);
         assert_ne!(encode_exit_code(u32::MAX), EXIT_VOLUNTARY);
         assert!(encode_exit_code(u32::MAX) < EXIT_FAULT_BASE);
+    }
+}
+
+#[cfg(test)]
+mod rights_mask_tests
+{
+    use super::held_rights_mask;
+    use crate::cap::slot::Rights;
+
+    #[test]
+    fn rights_mask_is_all_ones_only_when_every_wanted_right_is_held()
+    {
+        // WRITE | EXECUTE held: either alone, both, and none pass.
+        let held = 0b0110;
+        assert_eq!(held_rights_mask(held, Rights(0b0010)), usize::MAX);
+        assert_eq!(held_rights_mask(held, Rights(0b0110)), usize::MAX);
+        assert_eq!(held_rights_mask(held, Rights::NONE), usize::MAX);
+        // One wanted right missing fails the whole request, not just that bit.
+        assert_eq!(held_rights_mask(held, Rights(0b1010)), 0);
+        assert_eq!(held_rights_mask(0, Rights(0b0001)), 0);
     }
 }

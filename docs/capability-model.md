@@ -32,7 +32,11 @@ The CSpace has the following properties:
   slot's occupancy and generation, and the type and the rights its lookup
   requires) are enforced as data, not by a conditional branch alone:
   a misspeculated resolution yields no object, never another slot's, an object
-  of another type, or one whose slot lacks those rights (mechanism:
+  of another type, or one whose slot lacks those rights. The same holds past
+  resolution: a right a handler tests beyond those its lookup requires gates
+  the object it backs as data, and a user-supplied value that selects a kernel
+  array entry, a span of frames, a page-table walk, or a dispatch table entry
+  is bounded as data before that load (mechanism:
   [core/kernel/docs/capability-internals.md](../core/kernel/docs/capability-internals.md)
   § Speculative-Execution Hardening)
 

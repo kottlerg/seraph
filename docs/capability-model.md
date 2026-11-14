@@ -77,13 +77,16 @@ scaling, and DRAM rows. The system draws the line as follows.
   ([#1085](https://github.com/kottlerg/seraph/issues/1085)). Until then the x86-64 boundary
   rests on the defences above.
 - **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a
-  context switch, does not schedule SMT siblings by trust, and partitions no cache. It grants
-  every process one high-resolution counter, ungated: ring 3 reads the timestamp counter (the
-  kernel does not set `CR4.TSD`), and U-mode reads the cycle counter (the kernel sets
-  `scounteren.CY`). It grants user mode no other counter: it does not set `CR4.PCE`, and it sets
-  no `scounteren` bit beyond `CY` (performance-counter access is design intent, not yet
-  implemented, [#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the
-  gating of that counter, need security domains
+  context switch, does not schedule SMT siblings by trust, partitions no cache, and gates no
+  counter by process. On riscv64 it sets `scounteren.CY`, so U-mode reads the cycle counter, and
+  leaves every other `scounteren` bit as the firmware set it, so U-mode also reads each counter
+  whose bit the firmware set (`TM`, for the `time` counter, for example). On x86-64 it never
+  sets `CR4.TSD` or `CR4.PCE`: each AP starts with both clear, and the boot CPU keeps the
+  firmware's values, so ring 3 reads the timestamp counter unless the firmware set `CR4.TSD`, and
+  reads the performance counters only where the firmware set `CR4.PCE`. Capability-mediated
+  performance-counter access is design intent, not yet implemented
+  ([#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the gating of the
+  counters, need security domains
   ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only
   policy treats every address space as its own domain, which in a microkernel puts a predictor
   barrier on most IPC switches, and one control applied alone (SMT sibling parking, for

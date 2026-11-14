@@ -145,10 +145,13 @@ enforced at the lookup level (see
 ### Speculative-Execution Hardening
 
 The rule is [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces:
-resolving a handle holds under speculative execution. A bound enforced only by a conditional
-branch does not hold on a mispredicted path, where the loads behind the branch execute with the
-out-of-bound value, so every bound between a user-supplied handle and the object it names is also
-enforced as data.
+resolving a handle, and the handler's use of it past resolution, hold under speculative execution.
+A bound enforced only by a conditional branch does not hold on a mispredicted path, where the
+loads behind the branch execute with the out-of-bound value, so every bound between a
+user-supplied handle and the object it names is also enforced as data. The syscall handlers hold
+the same line past resolution: a right a handler tests beyond those its lookup requires, and a
+user-supplied value that selects a kernel array entry, a span of frames, a page-table walk, or a
+dispatch table entry, are enforced as data as well (the table below).
 
 The primitives are `arch::current::speculation::index_mask` and
 `arch::current::speculation::hide`. `index_mask(index, bound)` is all-ones when `index < bound`,
@@ -158,17 +161,19 @@ compiler cannot prove the mask redundant inside the arm of the guarding branch a
 it is not `pure`, so it is not moved into such an arm either. `hide` passes a value through an
 empty, non-`pure` assembly block, giving a copy the compiler cannot relate to the original.
 `arch::nospec` builds the arch-neutral forms on the two: `index_mask`, `mask_index`,
-`mask_index_u64`, `mask_if` (all-ones when a condition holds), `hide`, and `select_ptr` (one of two
-pointers chosen by a mask).
+`mask_index_u64`, `mask_span_u64` (a byte span kept when it lies inside an object, else emptied),
+`mask_if` (all-ones when a condition holds), `hide`, and `select_ptr` (one of two pointers chosen by
+a mask).
 
 A mask's output is opaque but its input is not. A condition that a dominating branch has already
 tested is a constant inside that branch's arm, so a condition mask (`mask_if`) taken there on the
 same condition is all-ones whatever the data. Every condition mask is therefore computed either
-ahead of the branch it backs, or, inside an arm of a dispatch on a slot's tag, from the tag
-`pin_checked` passed through `hide` at resolution (`PinnedCap::tag_mask`), which no later branch
-on the tag lets the compiler fold. An index mask (`index_mask`, or a `mask_index*` form) taken
-inside the arm of the bounds branch it backs stays data, since its input is the index, whose value
-the branch does not fix.
+ahead of the branch it backs, or from a value `pin_checked` passed through `hide` at resolution,
+which no later branch on it lets the compiler fold: inside an arm of a dispatch on a slot's tag,
+from the hidden tag (`PinnedCap::tag_mask`), and for a right tested after resolution, from the
+hidden rights (`PinnedCap::rights_mask`). An index mask (`index_mask`, or a `mask_index*` or
+`mask_span_u64` form) taken inside the arm of the bounds branch it backs stays data, since its
+input is the index or span, whose value the branch does not fix.
 
 | Site | User-controlled value | Load it would steer | Hardening |
 |---|---|---|---|
@@ -177,8 +182,15 @@ the branch does not fix.
 | Leaf and directory pointers | handle index | a null leaf or directory dereferenced at an offset below one page | no pointer is null: unallocated entries name `SENTINEL_LEAF`, `SENTINEL_DIR`, `SENTINEL_DIR2`, or `SENTINEL_DIR3`, so the path has no null test |
 | `syscall::pin_checked` (`pin_slot`, `lookup_cap`) | handle | the handler's typed accesses of a slot's object | occupancy, generation, type, and the rights the lookup requires are computed as values and folded into the object through `mask_if`, ahead of the branches that refuse them: on a path past a failed check, the object is null |
 | `sys_cap_info`, `wait_set_source`, the `sys_wait_set_add` and `sys_wait_set_remove` source dispatch, `object_for_new_slot` | the slot's tag | a cast to the wrong object or state type | each tag arm casts the pointer selected by its own tag against the hidden tag (`PinnedCap::object_of`, `PinnedCap::tag_mask`, or `object_for_new_slot`'s `hidden_tag`) |
-| `sys_wait_set_add` member right | the source's rights | the source's state and header, locked and written | the member right is folded into the source pointers through `mask_if` ahead of the refusal |
+| `sys_wait_set_add` member right | the source's rights | the source's state and header, locked and written | the member right's mask (`PinnedCap::rights_mask`) selects the source pointers; past a failed test they are null |
+| `sys_mem_map` and `sys_mem_protect` Write and Execute | the protection requested against the Memory cap's rights | the page-table walk of the map or protect loop | the requested rights' mask (`PinnedCap::rights_mask`) selects the address-space object the loop walks; past a failed test it is null |
+| `sys_cap_info`, `CAP_INFO_MEMORY_PHYS_BASE` | the queried cap's rights, or the credential handle | the Memory object's `base`, read from a cap held without `PHYS` | the queried cap's `PHYS` mask (`PinnedCap::rights_mask`), or the credential's resolution, whose lookup folds `PHYS` into its object, selects the queried object; past a failed test it is null |
+| `sys_mem_map` offset, and the `sys_cap_info` `CAP_INFO_MEMORY_MAPPINGS` window | page offset and count | the frame-map counters of frames past the Memory object (`FramePins::pin` and the mapping loop; `frame_map::mappings_in`) | the byte span is clamped to the object through `mask_span_u64`; a failed bound gives the empty span |
+| `sys_aspace_query` | virtual address | the page-table walk into the kernel half of the root | the address is masked against `user_va_top` through `mask_index_u64`; a failed bound walks address 0 |
+| `sys_thread_set_affinity` | CPU index | the per-CPU scheduler entries `migrate_ready_thread` locks and links on | `set_affinity_locked` masks the CPU against `CPU_COUNT` through `mask_index`; a failed bound selects CPU 0 |
+| `sys_thread_set_priority` | priority level | the run queue the relocate links the thread on | the level is masked below `PRIORITY_MAX + 1` through `mask_index`; a failed bound selects level 0 |
 | `syscall::dispatch` | syscall number | a jump-table entry past the table | a number at or past `SYSCALL_NR_BOUND` (abi/syscall) is refused, and the table reads the number through `mask_index_u64` |
+| `sys_system_info` and `sys_cap_info` dispatch | info kind, or field selector | a jump-table entry past the dispatch's table | a value at or past `SYSTEM_INFO_BOUND` or `CAP_INFO_FIELD_BOUND` is refused, and the dispatch reads it through `mask_index_u64` |
 
 The sentinels are four statics in `cap/cspace.rs`. `SENTINEL_LEAF` is an all-`Null` `CSpacePage`
 (4032 bytes) with no interior mutability, so it is placed in read-only data. `SENTINEL_DIR` is one
@@ -198,9 +210,12 @@ null at a small offset. No address space maps a page below `USER_VA_FLOOR` (64 K
 capability object and the TCB fit under (`cap::object` asserts it at compile time), so that load
 never reads memory a process chose, whether or not SMAP or a clear `SUM` stop it (see
 [docs/memory-model.md § Userspace Layout](../../../docs/memory-model.md#userspace-layout)). A
-rights bit a handler tests after resolution, beyond those its lookup requires, is a branch only,
-`sys_wait_set_add`'s member right aside (folded, above); those sites, and the user-supplied
-indexes that select a kernel array entry outside the capability path, are recorded on #270.
+right a handler tests after resolution, beyond those its lookup requires, is folded the same way:
+`pin_checked` passes the slot's rights through `hide` into the `PinnedCap`, and the handler selects
+through `PinnedCap::rights_mask` the object its accesses past the refusal go through, so a path
+past a mispredicted refusal reaches null. The table lists every such right and every
+user-supplied value outside the capability path that selects a kernel array entry, a span of
+frames, a page-table walk, or a dispatch table entry.
 
 ### Free Slot Tracking
 

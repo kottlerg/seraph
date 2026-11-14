@@ -261,13 +261,15 @@ The supported failure-handling primitives are:
   unaffected.
 - **Block device revocation.** An fs driver learns that its block
   device capability was revoked at its first block request afterwards:
-  it answers that request `IO_ERROR` and exits. Until a request reaches
-  the device, an idle driver, or one serving requests from its page
-  cache, serves on. A failed block call through a capability still
-  live, or an error reply, fails only its request
+  it answers that request as for any failed block access (`IO_ERROR`,
+  or what the label's section names) and exits. Until a request
+  reaches the device, an idle driver, or one serving requests from its
+  page cache, serves on. A failed block call through a capability
+  still live, or an error reply, fails only its request
   ([`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md)
   § Loss of the block device). The driver's exit is then an fs-driver
-  crash, as above.
+  crash, as above, unless the request was an `FS_UNMOUNT`, which
+  replies success and ends as an unmount (§ Driver exit there).
 - **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
   namespace endpoint cascades through the kernel derivation graph
   and invalidates every cap ever derived from it: vfsd's retained

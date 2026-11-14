@@ -276,6 +276,45 @@ const fn idle_block_layout(block: u64, order: usize) -> Option<(u64, u64, u64)>
     Some((guard, stack_base, spare))
 }
 
+/// The first of the `cpu_pages` shadow-stack pages a CPU keeps from its idle
+/// block (`arch::current::shadow_stack::CPU_PAGES`), given the idle stack's
+/// top `stack_top`: the spare pages directly below the guard, so the rest of
+/// the spare still goes back to the buddy as one range. The block's spare
+/// holds them: [`init_per_cpu_storage`] asserts it.
+const fn idle_shadow_pages(stack_top: u64, cpu_pages: usize) -> u64
+{
+    stack_top
+        .wrapping_sub(KERNEL_STACK_BYTES)
+        .wrapping_sub(PAGE_SIZE as u64)
+        .wrapping_sub((cpu_pages as u64).wrapping_mul(PAGE_SIZE as u64))
+}
+
+/// The direct-map address of the shadow-stack pages of the CPU whose idle
+/// stack's top is `stack_top`, with shadow stacks on: the pages
+/// `init_per_cpu_storage` kept and laid out
+/// (`arch::current::shadow_stack::init_cpu_pages`).
+#[cfg(not(test))]
+fn idle_cpu_shadow_pages(stack_top: u64) -> u64
+{
+    idle_shadow_pages(stack_top, crate::arch::current::shadow_stack::CPU_PAGES)
+}
+
+/// The direct-map address of CPU `cpu`'s shadow-stack pages, with shadow
+/// stacks on: as `idle_cpu_shadow_pages`, from the idle stack top Phase 4
+/// recorded, so it is valid from Phase 4 on, before `init` builds the idle
+/// TCBs.
+///
+/// # Safety
+/// `cpu < CPU_COUNT`, and `init_per_cpu_storage` (Phase 4) has run.
+#[cfg(not(test))]
+pub unsafe fn cpu_shadow_pages(cpu: usize) -> u64
+{
+    // SAFETY: the caller's contract is `idle_stack_top_slot`'s.
+    let slot = unsafe { idle_stack_top_slot(cpu) };
+    // SAFETY: Phase 4 wrote the slot, which is never rewritten.
+    idle_cpu_shadow_pages(unsafe { *slot })
+}
+
 /// Number of CPUs, published once during boot by `init_storage` (Phase 4) and read lock-free
 /// by the scheduler, the IPI paths, and `SYS_SYSTEM_INFO(CpuCount)`.
 pub static CPU_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -2770,6 +2809,30 @@ fn idle_thread_entry(_cpu_id: u64) -> !
 
 // ── init ──────────────────────────────────────────────────────────────────────
 
+/// The initial context of CPU `cpu`'s idle thread, whose kernel stack ends at
+/// `stack_top`: entry [`idle_thread_entry`], the stack's floor, and with
+/// shadow stacks on the CPU's idle shadow stack (`idle_cpu_shadow_pages`).
+#[cfg(not(test))]
+fn idle_saved_state(cpu: usize, stack_top: u64) -> crate::arch::current::context::SavedState
+{
+    let mut saved = new_state(
+        idle_thread_entry as *const () as u64,
+        stack_top,
+        cpu as u64,
+        crate::arch::ThreadKind::Kernel,
+    );
+    crate::arch::current::context::set_stack_floor(&mut saved, kernel_stack_floor(stack_top));
+    if crate::arch::current::shadow_stack::enabled()
+    {
+        // The idle shadow stack `init_per_cpu_storage` laid out.
+        crate::arch::current::context::set_shadow_stack(
+            &mut saved,
+            crate::arch::current::shadow_stack::idle_stack(idle_cpu_shadow_pages(stack_top)),
+        );
+    }
+    saved
+}
+
 /// Initialise per-CPU scheduler state and idle threads for `cpu_count` CPUs.
 ///
 /// The idle kernel stacks are allocated earlier, in [`init_per_cpu_storage`]
@@ -2805,13 +2868,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
         let stack_top = unsafe { *top_slot };
 
         // Build idle TCB.
-        let mut saved = new_state(
-            idle_thread_entry as *const () as u64,
-            stack_top,
-            cpu as u64,
-            crate::arch::ThreadKind::Kernel,
-        );
-        crate::arch::current::context::set_stack_floor(&mut saved, kernel_stack_floor(stack_top));
+        let saved = idle_saved_state(cpu, stack_top);
 
         // Initialise this CPU's idle TCB in place inside the dynamic slab.
         // SAFETY: single-threaded boot init; the slot for this cpu is
@@ -3001,6 +3058,39 @@ const _: () = assert!(
     "CPU_DIAG slab overflows"
 );
 
+/// Give one CPU's shadow-stack pages at `shadow_phys`, the top of its idle
+/// block's spare (`idle_shadow_pages`), their initial contents and the
+/// shadow-stack encoding in the direct map. Phase 4, boot CPU only, with
+/// shadow stacks on.
+#[cfg(not(test))]
+fn make_cpu_shadow_pages(shadow_phys: u64)
+{
+    // SAFETY: the pages are this CPU's idle block's spare, kept by the
+    // caller, owned here and still ordinary memory; the idle thread first
+    // runs at `idle_thread_entry` (`init` gives its TCB that entry).
+    unsafe {
+        crate::arch::current::shadow_stack::init_cpu_pages(
+            phys_to_virt(shadow_phys),
+            idle_thread_entry as *const () as u64,
+        );
+    }
+    for page in 0..crate::arch::current::shadow_stack::CPU_PAGES as u64
+    {
+        // SAFETY: Phase 4, only the boot CPU runs; the page is this CPU's,
+        // written above, and nothing but its shadow stack writes it from
+        // here on.
+        let made = unsafe {
+            crate::mm::stack_guard::shadow_on_boot_cpu(
+                shadow_phys.wrapping_add(page.wrapping_mul(PAGE_SIZE as u64)),
+            )
+        };
+        if made.is_err()
+        {
+            crate::fatal("init_per_cpu_storage: cannot make a CPU's shadow-stack page");
+        }
+    }
+}
+
 #[cfg(not(test))]
 fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
 {
@@ -3034,6 +3124,25 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
     // cross-CPU flush. `init` reads the tops back from this slab.
     let tops_ptr = alloc_per_cpu_slab::<u64>(IDLE_STACK_TOPS_SLAB, n, allocator);
     let block_order = idle_block_order();
+    // With shadow stacks on, each CPU keeps the top of its block's spare for
+    // its shadow stacks (`idle_shadow_pages`); the spare holds them.
+    const {
+        assert!(
+            (1usize << idle_block_order())
+                .checked_sub(KERNEL_STACK_PAGES + 1 + crate::arch::current::shadow_stack::CPU_PAGES)
+                .is_some(),
+            "an idle block's spare cannot hold a CPU's shadow-stack pages"
+        );
+    }
+    let shadow_on = crate::arch::current::shadow_stack::enabled();
+    let shadow_bytes = if shadow_on
+    {
+        (crate::arch::current::shadow_stack::CPU_PAGES * PAGE_SIZE) as u64
+    }
+    else
+    {
+        0
+    };
     for cpu in 0..n
     {
         let block = allocator
@@ -3041,9 +3150,16 @@ fn init_per_cpu_storage(cpu_count: u32, allocator: &mut BuddyAllocator)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: out of memory for idle stack"));
         let (guard, stack_phys, spare) = idle_block_layout(block, block_order)
             .unwrap_or_else(|| crate::fatal("init_per_cpu_storage: idle stack block too small"));
+        // The const assertion above bounds the shadow pages by the spare.
+        let freed = spare.wrapping_sub(shadow_bytes);
         // SAFETY: the pages below the guard are this fresh block's, never
-        // reached, and the buddy is unsealed until Phase 7.
-        unsafe { allocator.free_range(block, spare) };
+        // reached, and the buddy is unsealed until Phase 7; the shadow-stack
+        // pages kept are the top `shadow_bytes` of them.
+        unsafe { allocator.free_range(block, freed) };
+        if shadow_on
+        {
+            make_cpu_shadow_pages(block.wrapping_add(freed));
+        }
         // SAFETY: Phase 4, only the boot CPU runs; the guard is this block's
         // page, which nothing reaches through the direct map from here on.
         if unsafe { crate::mm::stack_guard::hole_on_boot_cpu(guard) }.is_err()
@@ -7919,6 +8035,16 @@ pub unsafe fn enter() -> !
     unsafe {
         crate::arch::current::cpu::set_kernel_trap_stack(kernel_stack_top);
     }
+    // Point the shadow-stack token register at init's shadow stack for the
+    // same reason, with shadow stacks on (x86-64 `IA32_PL0_SSP`; a no-op
+    // otherwise): `switch` loads it at every later switch-in.
+    // SAFETY: ring 0 / S-mode with interrupts disabled above, on the BSP,
+    // which runs init next.
+    unsafe {
+        crate::arch::current::shadow_stack::load_thread_token(
+            crate::arch::current::context::shadow_stack_token(&init_tcb.saved_state),
+        );
+    }
 
     // Build the initial user-mode TrapFrame on the init thread's kernel stack.
     // The frame sits just below kernel_stack_top.
@@ -8617,7 +8743,7 @@ mod idle_pull_tests
 #[cfg(test)]
 mod idle_block_tests
 {
-    use super::{KERNEL_STACK_PAGES, cpu_after, idle_block_layout};
+    use super::{KERNEL_STACK_PAGES, cpu_after, idle_block_layout, idle_shadow_pages};
     use crate::mm::PAGE_SIZE;
 
     // The defect caught: a stack that does not end at the block's top, a guard
@@ -8646,6 +8772,25 @@ mod idle_block_tests
         let block = 0u64.wrapping_sub(8 * PAGE_SIZE as u64);
         assert_eq!(idle_block_layout(block, 3), None);
         assert_eq!(idle_block_layout(0, 64), None);
+    }
+
+    // The defect caught: shadow-stack pages that are not the top of the
+    // block's spare (reaching the guard or the stack, or leaving a gap the
+    // freed range does not cover), found from the idle stack's top.
+    #[test]
+    fn a_cpus_shadow_pages_are_the_top_of_its_idle_blocks_spare()
+    {
+        let page = PAGE_SIZE as u64;
+        let block = 0x8_0000u64;
+        let (guard, stack, spare) = idle_block_layout(block, 3).unwrap();
+        let top = stack + KERNEL_STACK_PAGES as u64 * page;
+        for cpu_pages in [0usize, 1, 3]
+        {
+            let shadow = idle_shadow_pages(top, cpu_pages);
+            assert_eq!(shadow + cpu_pages as u64 * page, guard);
+            assert!(shadow >= block);
+            assert_eq!(shadow - block, spare - cpu_pages as u64 * page);
+        }
     }
 
     // The defect caught: a cursor that steps past the last CPU, or a division

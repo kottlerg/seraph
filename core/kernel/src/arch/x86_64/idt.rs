@@ -1396,14 +1396,28 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
         }
     }
 
+    // A kernel write through the read-only translation this CPU kept of a
+    // shadow stack the direct map has since made ordinary memory again: flush
+    // it and retry. Ahead of the copy recovery, since a copy's kernel side can
+    // be such a page.
+    // SAFETY: ring 0.
+    if !from_user && unsafe { super::paging::kernel_write_fault_is_spurious(cr2, error_code) }
+    {
+        // SAFETY: ring 0; drops this CPU's stale entry for the kernel page.
+        unsafe { super::paging::flush_kernel_page(cr2) };
+        return;
+    }
+
     // In-kernel user-copy fault recovery: a fault taken at CPL 0 whose RIP lies in
     // the `copy_user` faultable region is an unmapped or read-only user buffer.
-    // Redirect to the fixup — which closes the SMAP window and returns the bytes
-    // not copied — instead of panicking. A userspace fault that reaches here (no
-    // handler, or handler declined) has a RIP outside the kernel copy region, so
-    // this is a no-op for it.
+    // End the copy where it stands — the routine then closes the SMAP window and
+    // returns the bytes not copied — instead of panicking.
+    // The return RIP is left as it was: a ring-0 `iretq` to another address
+    // raises #CP while shadow stacks are on. A userspace fault that reaches here
+    // (no handler, or handler declined) has a RIP outside the kernel copy region,
+    // so this is a no-op for it.
     // SAFETY: tf is valid; rip is read-only here.
-    if let Some(fixup) = super::cpu::user_copy_fixup(unsafe { (*tf).rip })
+    if super::cpu::in_user_copy(unsafe { (*tf).rip })
     {
         // A copy fault the live tables already satisfy is a stale TLB entry,
         // as for a user-mode fault above: flush it and retry the copy, so a
@@ -1422,10 +1436,14 @@ extern "C" fn page_fault_handler(tf: *mut TrapFrame, error_code: u64)
                 return;
             }
         }
-        // SAFETY: tf is the live frame; rewriting rip redirects iretq to the fixup.
-        unsafe {
-            (*tf).rip = fixup;
-        }
+        // The bytes not copied (`rep movsb`'s count at the fault, at least 1)
+        // become the return value, and a zero count makes the resumed
+        // instruction copy nothing more.
+        // SAFETY: tf is the live frame on this stack; the stub restores rax and
+        // rcx from it before the iretq.
+        let frame = unsafe { &mut *tf };
+        frame.rax = frame.rcx;
+        frame.rcx = 0;
         return;
     }
 

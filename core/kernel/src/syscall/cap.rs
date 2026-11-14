@@ -1198,23 +1198,40 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     //   pages 1..4 (16 KiB) — kstack
     //   page 5              — ThreadObject followed by TCB (at size_of::<ThreadObject>())
     //   pages 6..           — per-thread FPU/SIMD/V save area, one page or more
+    //   last page           — with shadow stacks on, the shadow stack
     let entry = dispatch_for(ObjectType::Thread, 0).ok_or(SyscallError::InvalidArgument)?;
     let extended_bytes = crate::sched::thread_slot::extended_area_bytes();
     debug_assert_eq!(
-        Some(entry.raw_bytes),
-        EXTENDED_OFFSET.checked_add(extended_bytes)
+        entry.raw_bytes,
+        crate::sched::thread_slot::thread_slot_bytes()
     );
     let offset = retype_allocate(memory, entry.raw_bytes)?;
     let block_phys = region_phys(memory, offset);
     let block_virt = phys_to_virt(block_phys);
 
+    // The thread's shadow stack, laid out while the page is ordinary memory,
+    // to enter at the trampoline its first switch-in jumps to.
+    let shadow_phys = crate::sched::thread_slot::shadow_page(block_phys);
+    let shadow_stack = shadow_phys.map(|phys| {
+        // SAFETY: the page is this call's fresh slot's last, owned here and
+        // writable through the direct map until the hole below.
+        unsafe {
+            crate::arch::current::shadow_stack::init_stack(
+                phys_to_virt(phys),
+                crate::sched::user_thread_trampoline as *const () as u64,
+            )
+        }
+    });
+
     // Unmap the guard page below the stack from the direct map, so an
-    // overflow faults instead of writing below the slot.
+    // overflow faults instead of writing below the slot, and make the shadow
+    // stack's page one.
     // SAFETY: after SMP bringup, with no lock held; the guard is this call's
-    // fresh slot page, which nothing reaches until the reclaim closes it; the
-    // returned epoch is stamped in the new TCB's guard_epoch below, before
-    // the thread can be enqueued.
-    let Ok(guard_epoch) = (unsafe { crate::mm::stack_guard::hole(block_phys) })
+    // fresh slot page, which nothing reaches until the reclaim closes it, and
+    // the shadow page another, which nothing but the thread's shadow stack
+    // writes until then; the returned epoch is stamped in the new TCB's
+    // guard_epoch below, before the thread can be enqueued.
+    let Ok(guard_epoch) = (unsafe { crate::mm::stack_guard::hole(block_phys, shadow_phys) })
     else
     {
         // SAFETY: this call's own `retype_allocate` return, holding no object.
@@ -1243,8 +1260,8 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
     // path is needed.
     let extended_area = slot_field::<u8>(block_virt, EXTENDED_OFFSET);
     // SAFETY: extended_area points at the freshly-retyped save-area pages,
-    // `extended_bytes` of them at the end of the slot, exclusively owned by
-    // this TCB construction.
+    // `extended_bytes` of them below the shadow-stack page or at the end of
+    // the slot, exclusively owned by this TCB construction.
     unsafe {
         core::ptr::write_bytes(extended_area, 0u8, extended_bytes as usize);
     }
@@ -1269,6 +1286,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
         crate::arch::ThreadKind::User,
     );
     crate::arch::current::context::set_stack_floor(&mut saved, kstack_virt);
+    if let Some(stack) = shadow_stack
+    {
+        crate::arch::current::context::set_shadow_stack(&mut saved, stack);
+    }
 
     let ancestor = memory_obj_nn;
 
@@ -1449,9 +1470,10 @@ pub fn sys_cap_create_thread(tf: UserFrame) -> Result<u64, SyscallError>
             // observed by nothing; its raw `tcb` pointer field does not drop
             // the TCB again.
             unsafe { core::ptr::drop_in_place(thread_obj_ptr) };
-            // SAFETY: no lock is held; the guard was holed above, nothing runs
-            // on the stack, and it is not holed again before this returns.
-            unsafe { crate::mm::stack_guard::close(block_phys) };
+            // SAFETY: no lock is held; the guard was holed and the shadow
+            // stack made above, the thread never ran, and neither page is
+            // passed to `hole` again before this returns.
+            unsafe { crate::mm::stack_guard::close(block_phys, shadow_phys) };
             // SAFETY: this call's own `retype_allocate` return, holding no live
             // object (dropped above) and no longer reachable: its registry
             // entry is removed above.

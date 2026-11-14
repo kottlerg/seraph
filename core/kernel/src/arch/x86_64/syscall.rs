@@ -117,12 +117,14 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 0. Swaps to the kernel GS base (`swapgs`).
 /// 1. Saves R11 (user RFLAGS) to `gs:[24]` (`PerCpuData::scratch`).
 /// 2. Saves user RSP (via R11) to `gs:[16]` (`PerCpuData::user_rsp`).
-/// 3. Switches to `gs:[8]` (`PerCpuData::kernel_rsp`).
+/// 3. Switches to `gs:[8]` (`PerCpuData::kernel_rsp`), and with shadow stacks
+///    on (`shadow_stack::enabled`) to the thread's shadow stack (`setssbsy`).
 /// 4. Allocates a 168-byte [`TrapFrame`] on the kernel stack.
 /// 5. Saves all GPRs and CPU-state fields into the frame.
 /// 6. Calls `crate::syscall::dispatch`.
-/// 7. Restores registers, disables interrupts, swaps back to the user GS base,
-///    and executes `sysretq`.
+/// 7. Disables interrupts, releases the shadow stack's token (`clrssbsy`)
+///    with shadow stacks on, restores registers, swaps back to the user GS
+///    base, and executes `sysretq`.
 ///
 /// `IA32_KERNEL_GS_BASE` must hold this CPU's `PerCpuData` pointer while user
 /// code runs: installed in `IA32_GS_BASE` by `percpu::init_bsp` in Phase 5
@@ -146,6 +148,13 @@ unsafe extern "custom" fn syscall_entry()
         "mov r11, rsp",
         "mov gs:[16], r11",
         "mov rsp, gs:[8]",
+        // With shadow stacks on, SYSCALL left SSP 0: take the thread's
+        // supervisor token (IA32_PL0_SSP), marking it busy, before the first
+        // call. RFLAGS is already saved, so the compare clobbers nothing.
+        "cmp byte ptr [rip + {shadow}], 0",
+        "je 2f",
+        "setssbsy",
+        "2:",
 
         // ── Phase 2: allocate TrapFrame and save all registers ────────────
         "sub rsp, 168",
@@ -189,6 +198,18 @@ unsafe extern "custom" fn syscall_entry()
         "mov rax, [rsp + 120]",
         "cmp rax, qword ptr [rip + {canonical_limit}]",
         "jae 3f",
+        // No interrupt may arrive from here to sysretq: its stub would see a
+        // ring-0 frame and run on the user GS base after the swap below, and,
+        // with shadow stacks on, would push to SSP 0 after the release below.
+        // sysretq restores the user's IF from R11.
+        "cli",
+        // With shadow stacks on, release the thread's supervisor token, which
+        // SSP names again now that every call has returned; SSP becomes 0.
+        "cmp byte ptr [rip + {shadow}], 0",
+        "je 4f",
+        "rdsspq rax",
+        "clrssbsy [rax]",
+        "4:",
         // sysretq: RIP←RCX, RFLAGS←R11, RSP stays as set.
         "mov rax, [rsp +   0]",     // return value (dispatch set tf.rax)
         "mov rbx, [rsp +   8]",
@@ -207,10 +228,6 @@ unsafe extern "custom" fn syscall_entry()
         "mov r15, [rsp + 112]",
         // Switch to user RSP last (TrapFrame still on kernel stack until here).
         "mov rsp, [rsp + 136]",     // rsp = user RSP
-        // No interrupt may arrive between the swap and sysretq: its stub would
-        // see a ring-0 frame and run on the user GS base. sysretq restores the
-        // user's IF from R11.
-        "cli",
         "swapgs",
         "sysretq",
 
@@ -227,6 +244,7 @@ unsafe extern "custom" fn syscall_entry()
         dispatch = sym crate::syscall::dispatch,
         terminate = sym super::idt::common_exception_handler,
         canonical_limit = sym super::paging::USER_CANONICAL_LIMIT,
+        shadow = sym super::shadow_stack::ENABLED,
     );
 }
 

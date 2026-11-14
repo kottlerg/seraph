@@ -5519,12 +5519,18 @@ unsafe fn dealloc_thread(
     // SAFETY: ptr is in-place ThreadObject.
     unsafe { core::ptr::drop_in_place(ptr.as_ptr().cast::<ThreadObject>()) };
 
-    // Map the guard page back into the direct map before its memory
-    // returns to the cap, then free the slot.
-    // SAFETY: thread creation holed the slot's guard, and the thread
-    // is dead; this arm holds no lock (`dealloc_object_one`'s
-    // contract), after SMP bringup.
-    unsafe { crate::mm::stack_guard::close(block_phys) };
+    // Map the guard page, and the shadow-stack page when the slot has one,
+    // back into the direct map read-write before their memory returns to
+    // the cap, then free the slot.
+    // SAFETY: thread creation holed the slot's guard and made its shadow
+    // stack, and the thread is dead; this arm holds no lock
+    // (`dealloc_object_one`'s contract), after SMP bringup.
+    unsafe {
+        crate::mm::stack_guard::close(
+            block_phys,
+            crate::sched::thread_slot::shadow_page(block_phys),
+        );
+    }
     // SAFETY: the object was retyped from `ancestor_memory` at `offset`
     // with `raw_bytes`, and is dropped above; nothing references it.
     unsafe { retype_free(ancestor_memory, offset, raw_bytes) };

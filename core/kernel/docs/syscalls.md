@@ -3417,6 +3417,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` copies |
+| `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |
 | `BOOT_PROTOCOL_VERSION` | 21 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

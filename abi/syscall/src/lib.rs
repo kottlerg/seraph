@@ -1014,7 +1014,8 @@ pub const RIGHTS_MEM_MAP_RX: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_EXECUTE;
 
 // AddressSpace ──
 
-/// `AddressSpace`: may map into this address space.
+/// `AddressSpace`: may map into this address space, and read and clear its
+/// pages' accessed bits (`SYS_ASPACE_HARVEST`).
 pub const RIGHTS_AS_MAP: u64 = 1 << 0;
 
 /// `AddressSpace`: may read/inspect mappings (`SYS_ASPACE_QUERY`, which

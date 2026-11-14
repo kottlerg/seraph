@@ -418,12 +418,19 @@ failure while
 a caller is pending — the data-path errors above included — consumes the
 pending reply and wakes the caller with the `IPC_REPLY_TRANSFER_FAILED` label
 and zero caps while the server receives the error (see
-[ipc-design.md](../../../docs/ipc-design.md) § Message Format). A fault reply skips
-cap processing entirely, and the label alone carries the disposition; a `FAULT_REPLY_KILL`
+[ipc-design.md](../../../docs/ipc-design.md) § Message Format). A fault reply moves no
+capability, and the label alone carries the disposition; a `FAULT_REPLY_KILL`
 or `FAULT_REPLY_FORWARD` reply's data word 0, when sent, is read as the handler's decline reason
 for the kernel's kill diagnostic or the forwarded message, and an unreadable word is dropped
 rather than failing the reply (see
-[fault-handling.md § Reply](../../../docs/fault-handling.md#reply)).
+[fault-handling.md § Reply](../../../docs/fault-handling.md#reply)). A `FAULT_REPLY_REDIRECT`
+reply's one cap handle names, in the server's CSpace, the Endpoint the fault is delivered to next,
+with that cap's badge and the reply's data word 0 (dropped as above when unreadable) as the
+redirected message's data word 4; the cap is not moved. That reply fails with `InvalidArgument`
+for a `cap_count` other than one (the clamp above applies first) or no IPC buffer page registered,
+`InvalidAddress` for an unmapped one, and `InvalidCapability` for a stale handle or a cap other
+than an Endpoint; the reply still consumes the pending fault, which takes the unhandled outcome
+(the thread is killed, or its restartable syscall fails with `InvalidAddress`).
 
 ---
 
@@ -1530,13 +1537,16 @@ or, with `THREAD_START_SUSPENDED`, a configured `Created` thread to `Stopped`.
 Starting a thread whose fault episode a stop cancelled (before any reply claimed it), or whose
 handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a delivery other
 than a virtual-memory one, of one with no exception handler bound, or of the fault of a
-restartable syscall's user copy), kills it as an unhandled
+restartable syscall's user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), kills it as
+an unhandled
 fault, which posts its death and address-space observers, or, for the fault of a restartable
 syscall's user copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
-Resume, and Kill). An upcall delivery (`FAULT_KIND_UPCALL`) is no fault: one a stop cancelled,
-or that the claiming reply declined (`FAULT_REPLY_KILL`, or `FAULT_REPLY_FORWARD`, which is a
-decline for an upcall), drops the upcall, and the start resumes the thread at its registers
+Resume, and Kill). Starting one whose claiming reply was a `FAULT_REPLY_REDIRECT` that named an
+endpoint delivers the fault to that endpoint. An upcall delivery (`FAULT_KIND_UPCALL`) is no fault:
+one a stop cancelled, or that the claiming reply declined (`FAULT_REPLY_KILL`, or
+`FAULT_REPLY_FORWARD`, which is a decline for an upcall), drops the upcall, and the start resumes
+the thread at its registers
 ([docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls).
 A stopped thread whose blocked syscall a waker claimed before the stop is restarted only once that
@@ -1604,11 +1614,13 @@ fault first keeps that reply's outcome: when next started it resumes its faultin
 `FAULT_REPLY_RESUME`, takes the unhandled outcome on `FAULT_REPLY_KILL`, and on
 `FAULT_REPLY_FORWARD` delivers the fault through its exception class when the reply answered the
 virtual-memory class's delivery of a fault other than a kernel copy's and an exception handler is
-bound, and otherwise takes the unhandled outcome (see
+bound, and otherwise takes the unhandled outcome; on `FAULT_REPLY_REDIRECT` it delivers the fault to
+the endpoint the reply named, or takes the unhandled outcome when the reply named none (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). A target blocked in an upcall delivery (`FAULT_KIND_UPCALL`) is killed in
 neither case: a stop that cancels the delivery drops the upcall, any reply that claimed it first
-settles it, and the thread resumes at its registers when next started (for a delivery at the
+settles it (a redirect that named an endpoint by delivering the upcall there when the thread is
+next started), and the thread resumes at its registers when next started (for a delivery at the
 syscall point, its syscall returns its own result;
 [docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is

@@ -1393,7 +1393,7 @@ pub const FAULT_REPLY_FORWARD: u64 = 2;
 
 /// Data word of a forwarded fault message ([`FAULT_REPLY_FORWARD`]) that
 /// carries the forwarder's data word 0; a delivery that no handler forwarded
-/// carries four data words, and a forwarded one five.
+/// or redirected carries four data words, and a forwarded one five.
 pub const FAULT_FORWARD_REASON_WORD: usize = 4;
 
 /// Fault reply label: the handler hands the fault to another endpoint. The

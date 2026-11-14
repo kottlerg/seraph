@@ -853,8 +853,8 @@ fn admit_command(ctx: &Context, host: &HostArgs, request: &Request) -> Result<Ad
 }
 
 /// Admit a build (a command `CliCommand::build_host` names: `build`, `clean`,
-/// `test`) on the host's load and its timing holders. Holds nothing once
-/// admitted.
+/// `test`, `compare-images`) on the host's load and its timing holders. Holds
+/// nothing once admitted.
 pub fn admit_build(ctx: &Context, host: &HostArgs) -> Result<()>
 {
     admit_command(ctx, host, &Request::Build).map(drop)

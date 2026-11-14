@@ -107,6 +107,7 @@ fn main()
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),
         CliCommand::PrCheck(args) => commands::pr_check::run_pr_check(&ctx, args),
+        CliCommand::CompareImages(args) => commands::compare_images::run(&ctx, args),
         CliCommand::ReviewCheck(args) => commands::review::run_check(&ctx, args),
         CliCommand::ReviewLedger(args) => commands::review::run_ledger(&ctx, args),
         CliCommand::ReleaseScope(args) => commands::release_scope::run(&ctx, args),

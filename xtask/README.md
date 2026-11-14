@@ -39,8 +39,8 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
-│   │                           #   test, test_crash_report, test_debug_port, test_gdb, test_kaslr,
-│   │                           #   test_map_redo, test_terminal,
+│   │                           #   test, compare_images, test_crash_report, test_debug_port,
+│   │                           #   test_gdb, test_kaslr, test_map_redo, test_terminal,
 │   │                           #   test_vmgenid, lint_docs, pr_check, review, release_scope,
 │   │                           #   issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -394,6 +394,64 @@ to install, when the emulator, the cross compiler or its C library is missing
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
 their `--wait-host` and `--host-override` options.
+
+---
+
+### `cargo xtask compare-images`
+
+Build two commits for each architecture and profile, and compare every file the build installs in
+the parts a loader reads: the evidence for the Identical images class of
+[docs/testing.md](../docs/testing.md) § Coverage tiers, Inert changes.
+
+```
+cargo xtask compare-images [--base REV] [--head REV] [--arch x86_64|riscv64]... \
+    [--profile debug|release]...
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--base` | `git merge-base <head> origin/master` | The base commit: by default the base of the PR's own diff |
+| `--head` | `HEAD` | The head commit |
+| `--arch` | both | The architectures to build; repeatable, or comma-separated |
+| `--profile` | both | The profiles to build; repeatable, or comma-separated |
+
+Both commits are built in one scratch worktree, `target/xtask/compare-images/tree`, which the
+command adds with `git worktree add --detach` and reuses: it checks each commit out there, removes
+every untracked file but `target/`, and runs that commit's own `cargo xtask clean` and
+`cargo xtask build --skip-lints --arch <a> [--release]` once per cell, moving each built sysroot to
+`target/xtask/compare-images/<base|head>/<arch>-<profile>/`. One path serves both commits because a
+build embeds absolute source paths (the panic locations of the `-Z build-std` crates under
+`target/seraph-toolchain/`), so builds in two checkouts never compare equal. The scratch
+worktree's `target/` is kept as a cache, so a later comparison rebuilds only what changed; the
+first one builds every cell from scratch.
+
+Each file of a cell's two sysroots is compared by its format:
+
+| File | Compared parts |
+|---|---|
+| ELF image | The type, machine, flags, and entry of the file header; each program header but its file offset, with the bytes of each `PT_LOAD` segment past the file header (whose section-table fields locate data no loader maps); each section that is allocated or is a note, its type, flags, address, size, and bytes, since the loaders read `.note.seraph.*` sections by name |
+| PE image (`boot.efi`) | The headers, the COFF link time stamp and the checksum masked; each section, the debug directory and the data its entries point to masked: the linker writes the time of the link there, and no UEFI loader and no code of the image reads them |
+| The bootloader bundle | Its header, its entry names in order, and each entry's parts as an image, named `entry <name>: <part>`; an entry's offset and size move with bytes no loader maps and are not compared |
+| Any other file, or an image whose headers do not parse | Its bytes, as the part `contents` |
+
+A file in one sysroot only is reported as `added` or `removed`. The symbol tables, the debug
+information, `.comment`, and a file's size are not compared. The disk image is not compared
+either: `xtask/src/disk.rs` packs it from the compared files, and a change to that code is under
+`xtask/`, which the class leaves to the coverage screens.
+
+The command prints, for each cell, its file count and each difference as `<path>: <part>`, then
+the verdict line, and writes the same text to
+`target/xtask/compare-images/report-<base>-<head>.txt`, each commit by its first 12 hex digits:
+
+```
+compare-images: IDENTICAL base <sha> head <sha> cells <arch>-<profile>,...
+```
+
+The cells are listed in the order built:
+`x86_64-debug,x86_64-release,riscv64-debug,riscv64-release` for a run of all four. The verdict is
+`DIFFERENT (<count>)` when any part differs, and the command then fails. The command is admitted
+as a build under the [Host launch rules](#host-launch-rules), and passes its `--wait-host` on to
+each build and clean it runs, which are admitted on their own.
 
 ---
 
@@ -1298,9 +1356,10 @@ has no `hook` command exits with that code, so `.claude/settings.json` writes ea
 ## Host launch rules
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
-themselves, from `src/host_lock.rs`, before they start: `build`, `clean` and `test` as builds
-(`CliCommand::build_host` in `src/cli.rs` names them); `run`, `run-parallel`, `test-terminal`,
-`test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port` and `test-gdb` as boots.
+themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
+`compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
+and `test-gdb` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

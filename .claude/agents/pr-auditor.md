@@ -192,7 +192,17 @@ claims.
    it and has a non-inert line, whether or not a line meets any surface.
    Outside those cases no run is owed: a non-inert change to a file under
    `core/kernel/`, `core/boot/`, or `services/` that meets none of the
-   surfaces owes none. A run's surface is the one that owes it,
+   surfaces owes none. When the body holds the PR's lines inert by that
+   section's Identical images, read the report of `cargo xtask
+   compare-images` that the body names
+   (`target/xtask/compare-images/report-<base>-<head>.txt`; you do not
+   build). FAIL when the report is missing; when its verdict line is not
+   `IDENTICAL`, or names other cells than the four (x86_64 and riscv64, each
+   debug and release); when its base is not the merge base of its head with
+   `origin/master`; or when its head does not cover the PR head, that is,
+   when the PR's own diff at the two heads differs in a change that
+   section's list does not make inert. The class leaves every line under
+   `xtask/` to the screens above. A run's surface is the one that owes it,
    as When the runs are owed defines it; for the runs a concurrency-fix
    purpose owes, it is every non-inert line of the PR's own diff. The body's
    `## Validation` MUST report each owed run with its `--runs` count, its

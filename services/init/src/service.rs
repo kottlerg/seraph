@@ -1247,8 +1247,9 @@ pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u64,
     pub svcmgr_bootstrap_ep: u64,
-    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). svcmgr
-    /// derives the published `rootfs.root` SEND from it.
+    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). init derives
+    /// the endowed `rootfs.root` SEND from it in `endow_svcmgr`, and
+    /// svcmgr publishes that SEND as received.
     pub rootfs_root_cap: u64,
     pub devmgr_registry_ep: u64,
     /// vfsd's un-badged service endpoint. init mints the endowed

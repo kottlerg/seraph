@@ -365,8 +365,11 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
     let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
     // The page count the region teardown walks, from the clamped range: it is
     // `page_count` architecturally, and 0 on a path past a mispredicted check.
-    let page_count =
-        usize::try_from(virt_end.wrapping_sub(virt_base) / PAGE_SIZE as u64).unwrap_or(0);
+    let page_count = virt_end
+        .wrapping_sub(virt_base)
+        .checked_div(PAGE_SIZE as u64)
+        .and_then(|pages| usize::try_from(pages).ok())
+        .unwrap_or(0);
 
     // ── Capability lookup ─────────────────────────────────────────────────────
 

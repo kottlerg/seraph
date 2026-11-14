@@ -853,7 +853,9 @@ The bound primitives the speculation-safe paths are built on (the rule is
 [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces; its use is
 [capability-internals.md](capability-internals.md) § Speculative-Execution Hardening).
 Architecture-neutral code calls them through `arch::nospec`, which adds `mask_index`,
-`mask_index_u64`, `mask_span_u64`, `mask_if`, and `select_ptr` over them.
+`mask_index_u64`, `mask_span_u64`, `mask_if`, and `select_ptr` over them. The module also holds
+the boot-time enumeration of the CPU's transient-execution vulnerabilities
+([transient-execution.md](transient-execution.md)).
 
 ```rust
 /// All-ones when `index < bound`, zero otherwise, computed without a branch, so
@@ -868,6 +870,12 @@ pub fn index_mask(index: usize, bound: usize) -> usize;
 /// cannot relate to `value`, taken where it is written, so a later branch on
 /// `value` does not let it fold a comparison of the copy.
 pub fn hide(value: usize) -> usize;
+
+/// Derive the boot CPU's transient-execution vulnerability table and log it.
+/// Called once on the BSP in Phase 1, after the baseline check. x86-64 reads
+/// CPUID and `IA32_ARCH_CAPABILITIES` (transient-execution.md); RISC-V does
+/// nothing, since the RVA23 floor defines no such enumeration.
+pub fn enumerate_vulnerabilities();
 ```
 
 ---

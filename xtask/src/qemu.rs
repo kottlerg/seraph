@@ -137,6 +137,37 @@ impl X86Paging
     }
 }
 
+/// Whether an x86-64 guest CPU offers CET supervisor shadow stacks.
+///
+/// Pins the guest CPU's `cet-ss` property on every accelerator, so whether
+/// the kernel runs on shadow stacks is the run's choice and never the host's:
+/// `-cpu host` would otherwise pass `CET_SS` through wherever the host's KVM
+/// offers it. The default leaves them off; the cet cell boots them on
+/// (`cargo xtask test-cet`, docs/testing.md "Coverage tiers").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum X86ShadowStack
+{
+    /// No `CET_SS` in the guest's CPUID (`cet-ss=off`) — the default.
+    Off,
+    /// `CET_SS` in the guest's CPUID, or no boot (`cet-ss=on,enforce`):
+    /// QEMU refuses to start when the accelerator cannot provide it, which
+    /// TCG never can, rather than booting without it.
+    On,
+}
+
+impl X86ShadowStack
+{
+    /// `-cpu` property suffix that pins the guest's `CET_SS` bit.
+    fn cpu_cet_ss_prop(self) -> &'static str
+    {
+        match self
+        {
+            Self::Off => ",cet-ss=off",
+            Self::On => ",cet-ss=on,enforce",
+        }
+    }
+}
+
 /// The DMA test device a test launch attaches (`--test-devices`): QEMU's
 /// `edu` (PCI `1234:11e8`), its DMA mask widened from the default 28 bits to
 /// 32, so its DMA engine reaches the interrupt addresses svctest's
@@ -353,6 +384,9 @@ pub struct QemuLaunchSpec<'a>
     pub riscv_zkr: RiscvZkr,
     /// Guest paging depth; `x86_64` only, ignored on riscv64.
     pub x86_paging: X86Paging,
+    /// Whether the guest CPU offers CET shadow stacks; `x86_64` only, ignored
+    /// on riscv64.
+    pub x86_shadow_stack: X86ShadowStack,
     /// Whether the machine's IOMMU is attached; every launch site attaches it
     /// unless the run asks for the no-IOMMU variant (`--iommu absent`).
     pub iommu: Iommu,
@@ -657,7 +691,13 @@ fn extend_x86(
 ) -> Result<()>
 {
     check_x86_paging(spec.x86_paging, accel, host_has_la57)?;
-    let la57 = spec.x86_paging.cpu_la57_prop();
+    // The `-cpu` properties every accelerator's model takes: the paging
+    // depth and the shadow-stack feature, each pinned to the run's request.
+    let props = format!(
+        "{}{}",
+        spec.x86_paging.cpu_la57_prop(),
+        spec.x86_shadow_stack.cpu_cet_ss_prop()
+    );
     let iommu = spec.iommu == Iommu::Attached;
     // VT-d interrupt remapping needs the I/O APIC emulated outside KVM,
     // which QEMU otherwise refuses.
@@ -698,7 +738,7 @@ fn extend_x86(
             // -cpu host inherits the development host's microarchitecture;
             // the kernel asserts x86-64-v3 in early init, so the host must
             // advertise AVX2/BMI2/FMA (Haswell+ / Excavator+).
-            args.extend(["-enable-kvm".into(), "-cpu".into(), format!("host{la57}")]);
+            args.extend(["-enable-kvm".into(), "-cpu".into(), format!("host{props}")]);
         }
         Accel::Hvf =>
         {
@@ -708,7 +748,7 @@ fn extend_x86(
                 "-accel".into(),
                 "hvf".into(),
                 "-cpu".into(),
-                format!("host{la57}"),
+                format!("host{props}"),
             ]);
         }
         Accel::Whpx =>
@@ -720,7 +760,7 @@ fn extend_x86(
                 "-accel".into(),
                 "whpx".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{la57}"),
+                format!("max,migratable=no{props}"),
             ]);
         }
         Accel::Nvmm =>
@@ -729,7 +769,7 @@ fn extend_x86(
                 "-accel".into(),
                 "nvmm".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{la57}"),
+                format!("max,migratable=no{props}"),
             ]);
         }
         Accel::Tcg =>
@@ -742,7 +782,7 @@ fn extend_x86(
                 "-accel".into(),
                 "tcg,thread=multi".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{la57}"),
+                format!("max,migratable=no{props}"),
             ]);
         }
     }
@@ -1069,6 +1109,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
             x86_paging: X86Paging::Four,
+            x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
@@ -1207,6 +1248,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
             x86_paging: X86Paging::Four,
+            x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
@@ -1236,6 +1278,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
             x86_paging,
+            x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
@@ -1317,7 +1360,34 @@ mod tests
             {
                 let mut argv = Vec::new();
                 extend_x86(&mut argv, &x86_spec(paging), accel, true).unwrap();
-                assert!(cpu_arg(&argv).ends_with(prop), "{accel:?} {paging:?}");
+                assert!(cpu_arg(&argv).contains(prop), "{accel:?} {paging:?}");
+            }
+        }
+    }
+
+    // The defect caught: a CPU model that leaves `cet-ss` to the host, so an
+    // ordinary boot on a host whose KVM offers `CET_SS` runs on shadow stacks
+    // and its outcome depends on the host, or a request for them that boots
+    // without them.
+    #[test]
+    fn x86_cpu_pins_cet_ss_to_the_request_on_every_accelerator()
+    {
+        for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
+        {
+            for (shadow_stack, props) in [
+                (X86ShadowStack::Off, ",la57=off,cet-ss=off"),
+                (X86ShadowStack::On, ",la57=off,cet-ss=on,enforce"),
+            ]
+            {
+                let mut spec = x86_spec(X86Paging::Four);
+                spec.x86_shadow_stack = shadow_stack;
+                let mut argv = Vec::new();
+                extend_x86(&mut argv, &spec, accel, true).unwrap();
+                assert!(
+                    cpu_arg(&argv).ends_with(props),
+                    "{accel:?} {shadow_stack:?}: {}",
+                    cpu_arg(&argv)
+                );
             }
         }
     }

@@ -16,7 +16,7 @@ use crate::arch::Arch;
 use crate::bundle::Harness;
 use crate::context::Profile;
 use crate::disk::BlockSize;
-use crate::qemu::{DiskLine, Iommu, RiscvMmu, RiscvZkr, X86Paging};
+use crate::qemu::{DiskLine, Iommu, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack};
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -485,6 +485,14 @@ pub struct RunArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Whether the guest x86-64 CPU offers CET supervisor shadow stacks
+    /// (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss`
+    /// property, so the host's CPU never decides it. `on` boots the kernel on
+    /// shadow stacks, or refuses to boot when the accelerator cannot offer
+    /// them; the cet cell (`cargo xtask test-cet`) is where they are tested.
+    #[arg(long, default_value = "off")]
+    pub x86_shadow_stack: X86ShadowStack,
 
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
     /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu
@@ -1040,6 +1048,14 @@ pub struct RunParallelArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Whether the guest x86-64 CPU offers CET supervisor shadow stacks
+    /// (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss`
+    /// property, so the host's CPU never decides it. `on` boots the kernel on
+    /// shadow stacks, or refuses to boot when the accelerator cannot offer
+    /// them; the cet cell (`cargo xtask test-cet`) is where they are tested.
+    #[arg(long, default_value = "off")]
+    pub x86_shadow_stack: X86ShadowStack,
 
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
     /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu

@@ -12,7 +12,10 @@
 //! CET shadow stacks (`CET_SS`), under KVM, can run the enabled path. The
 //! guest CPU is `-cpu host,cet-ss=on,enforce`: QEMU refuses to start when KVM
 //! cannot give the guest the feature, and the command then fails, naming
-//! it. It never passes on a host that did not run the shadow stacks.
+//! it. It never passes on a host that did not run the shadow stacks. Every
+//! other launch pins the feature off ([`X86ShadowStack`]), so this command
+//! is where shadow stacks are booted: the cet cell (docs/testing.md
+//! "Coverage tiers").
 //!
 //! Two boots of the current sysroot, which must hold the composed ktest
 //! bundle (`cargo xtask compose-bundle --harness ktest`):
@@ -45,15 +48,11 @@ use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, build_qemu_argv,
-    validate_sysroot_for_launch,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    build_qemu_argv, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, stop_thread};
 use crate::util::{require_tool, step};
-
-/// The QEMU CPU properties that give the guest shadow stacks, or stop QEMU
-/// from starting when the host cannot.
-const CET_PROPERTIES: &str = ",cet-ss=on,enforce";
 
 /// The kernel's line once shadow stacks are on (`kernel_entry_post_rebase`).
 const ON_MARKER: &str = "shadow stacks: on";
@@ -114,8 +113,8 @@ pub fn run(ctx: &Context, args: &TestCetArgs) -> Result<()>
     Ok(())
 }
 
-/// A QEMU on the current sysroot with the CET properties, its stderr kept in
-/// a file so a refused feature can be named.
+/// A QEMU on the current sysroot with shadow stacks on, its stderr kept in a
+/// file so a refused feature can be named.
 struct Launch
 {
     guest: Guest,
@@ -148,29 +147,8 @@ fn launch(ctx: &Context, args: &TestCetArgs, gdb: GdbMode<'_>, name: &str) -> Re
     let dir = ctx.target_dir.join("xtask");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let stderr = dir.join(format!("cet-{name}-{}.stderr", std::process::id()));
-    let spec = QemuLaunchSpec {
-        arch: Arch::X86_64,
-        disk_path: &disk_path,
-        disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-        second_disk: None,
-        firmware_code_path: &firmware_code,
-        firmware_vars_path: None,
-        cpus: args.cpus,
-        mem_mib: args.mem,
-        display: QemuDisplay::Headless,
-        gdb,
-        qmp_socket: None,
-        vmgenid_guid: Some("auto"),
-        incoming: None,
-        riscv_mmu: RiscvMmu::Sv48,
-        riscv_zkr: RiscvZkr::On,
-        x86_paging: X86Paging::Four,
-        iommu: Iommu::Attached,
-        debug_port: None,
-        test_devices: false,
-    };
-    let mut qemu_args = build_qemu_argv(&spec)?;
-    with_cet(&mut qemu_args)?;
+    let block_size = crate::disk::logical_block_size(&disk_path)?;
+    let qemu_args = build_qemu_argv(&cet_spec(&disk_path, block_size, &firmware_code, args, gdb))?;
     let qemu_binary = require_tool(Arch::X86_64.qemu_binary())?;
     let stderr_file =
         std::fs::File::create(&stderr).with_context(|| format!("creating {}", stderr.display()))?;
@@ -185,6 +163,40 @@ fn launch(ctx: &Context, args: &TestCetArgs, gdb: GdbMode<'_>, name: &str) -> Re
         guest: Guest::from_child(child)?,
         stderr,
     })
+}
+
+/// The launch of both boots: the composed system on a guest CPU with shadow
+/// stacks on.
+fn cet_spec<'a>(
+    disk_path: &'a Path,
+    disk_block_size: u32,
+    firmware_code: &'a Path,
+    args: &TestCetArgs,
+    gdb: GdbMode<'a>,
+) -> QemuLaunchSpec<'a>
+{
+    QemuLaunchSpec {
+        arch: Arch::X86_64,
+        disk_path,
+        disk_block_size,
+        second_disk: None,
+        firmware_code_path: firmware_code,
+        firmware_vars_path: None,
+        cpus: args.cpus,
+        mem_mib: args.mem,
+        display: QemuDisplay::Headless,
+        gdb,
+        qmp_socket: None,
+        vmgenid_guid: Some("auto"),
+        incoming: None,
+        riscv_mmu: RiscvMmu::Sv48,
+        riscv_zkr: RiscvZkr::On,
+        x86_paging: X86Paging::Four,
+        x86_shadow_stack: X86ShadowStack::On,
+        iommu: Iommu::Attached,
+        debug_port: None,
+        test_devices: false,
+    }
 }
 
 /// Boot 1: ktest to its pass marker, on shadow stacks.
@@ -289,18 +301,6 @@ fn corrupt_one_return(sock: &Path, at: u64) -> Result<(u64, u64)>
 fn corrupted(ret: u64) -> u64
 {
     ret ^ 0x10
-}
-
-/// `args` with the CET properties appended to its `-cpu` model.
-fn with_cet(args: &mut [String]) -> Result<()>
-{
-    let model = args
-        .iter_mut()
-        .skip_while(|a| *a != "-cpu")
-        .nth(1)
-        .context("the QEMU command line has no -cpu model")?;
-    model.push_str(CET_PROPERTIES);
-    Ok(())
 }
 
 /// The line of QEMU's stderr that refuses the shadow-stack feature, if any.
@@ -411,22 +411,24 @@ mod tests
         text.lines().map(str::to_owned).collect()
     }
 
-    // The defect caught: a command line whose CPU model lacks the CET
-    // properties, so the guest boots without shadow stacks and the test
-    // checks nothing, or one that names them on the wrong option.
+    // The defect caught: a launch that leaves shadow stacks at the launchers'
+    // default (off), so the guest boots without them and the test checks
+    // nothing.
     #[test]
-    fn the_cet_properties_go_on_the_cpu_model()
+    fn both_boots_ask_for_shadow_stacks()
     {
-        let mut args: Vec<String> = ["-enable-kvm", "-cpu", "host,la57=off", "-m", "512"]
-            .map(String::from)
-            .to_vec();
-        with_cet(&mut args).unwrap();
-        assert_eq!(args[2], "host,la57=off,cet-ss=on,enforce");
-        assert_eq!(args[4], "512");
-        let mut none: Vec<String> = vec!["-m".into(), "512".into()];
-        with_cet(&mut none).unwrap_err();
-        let mut cut: Vec<String> = vec!["-cpu".into()];
-        with_cet(&mut cut).unwrap_err();
+        use clap::Parser as _;
+
+        let args = TestCetArgs::try_parse_from(["test-cet"]).unwrap();
+        let spec = cet_spec(
+            Path::new("disk.img"),
+            512,
+            Path::new("code.fd"),
+            &args,
+            GdbMode::Off,
+        );
+        assert_eq!(spec.x86_shadow_stack, X86ShadowStack::On);
+        assert_eq!(spec.arch, Arch::X86_64);
     }
 
     // The defect caught: a host that cannot enforce the feature passing, or

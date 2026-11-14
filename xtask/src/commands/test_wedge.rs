@@ -43,8 +43,8 @@ use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, build_qemu_argv,
-    prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::qemu_gdb::{Span, Stub, field_hex, function_path, le_hex};
 use crate::util::{require_tool, step};
@@ -177,6 +177,7 @@ fn boot_once(ctx: &Context, args: &TestWedgeArgs, image: &Image, victim: Victim)
         riscv_mmu: RiscvMmu::Sv48,
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
+        x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: false,

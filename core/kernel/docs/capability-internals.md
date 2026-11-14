@@ -421,7 +421,8 @@ body at most. Before taking the locks, the return zeroes the group's runs
 ([memory-internals.md](memory-internals.md) § Kernel Object Memory), taking the pending interrupts
 after every 16 pages it zeroes, so the zeroing adds at most one 16-page batch of stores to a window.
 Neither the donation count nor any `init_pages` lengthens the window; the walk's
-total length still grows with the donation count. It runs to completion in whichever context drops
+total length still grows with the donation count and, through the zeroing, with the pages donated,
+the create-time slab's `init_pages` included. It runs to completion in whichever context drops
 the last reference: the deleting syscall, with interrupts masked on that CPU except in the windows;
 or, when the owner is handed to the per-CPU deferred-reclaim stack (a thread deleting an object it
 is itself bound to, a syscall pin or a batched capability move dropping the last reference, or an
@@ -429,9 +430,10 @@ Mmio object's mapping record releasing the address space at that object's teardo
 list is [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next
 syscall epilogue on that CPU, with interrupts masked except in the windows, or the idle thread's
 drain, with interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock
-Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how finely it donated, and
-can land on an unrelated thread's syscall, which is not preempted during it: the same memory
-donated as single pages costs one record per page. The standard runtime's map retry donates one
+Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how much it donated, which
+the zeroing visits once per page, and with how finely, and can land on an unrelated thread's
+syscall, which is not preempted during it: the same memory donated as single pages costs one record
+per page. The standard runtime's map retry donates one
 page per page-table shortfall (its budget top-up donates the shortfall in one call), so a
 process's count is of the order of its page-table page count, one per 2 MiB of mapped span.
 
@@ -510,9 +512,10 @@ alive.
 The cut sorts each donation's kept pages once and walks its span with them in order, so a teardown
 with `r` donation records and `h` kept pages costs `O(r + h log h)`, allocating nothing and on a
 fixed stack (the sort is a bottom-up merge through 64 sorted runs), plus one walk of each record's
-Memory object's page free list, as the return of a donation without kept pages costs ([§
-Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`: at most one
-per such body, and at most the `CSpace`'s arena pages, one per 31 bodies it funded. Each of those
+Memory object's page free list and the zeroing of every page it returns, `O(p)` for `p` donated
+pages, as the return of a donation without kept pages costs ([§ Teardown](#teardown)). `h` counts
+only pages holding a body that outlives the `CSpace`: at most one per such body, and at most the
+`CSpace`'s arena pages, one per 31 bodies it funded. Each of those
 pages returns later, in the call that frees its last chunk, as a one-page `retype_free`.
 
 ---

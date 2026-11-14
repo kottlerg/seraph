@@ -166,9 +166,11 @@ The clear runs before the free takes the object's locks, in batches of 16 pages 
 pending on the CPU taken between batches, so the clear masks interrupts for one batch at a time
 whatever the free's size. The only kernel-written bytes left in free space are the allocator's own
 free-list words, written after the clear: a free sub-page slot's first 8 bytes (the next slot's
-offset) and a free page run's first 16 bytes (its page count and the next run's offset), each list
-ending at an all-ones sentinel. They are region offsets and counts, which carry no address, and the
-drain reset leaves them in place.
+offset) and the 16-byte header (page count and next run's offset) at the start of every block freed
+onto the page list, each list ending at an all-ones sentinel. When a freed block joins the free run
+above it, that run's header stays inside the merged run until its pages are retyped again.
+They are region offsets and counts, which carry no address, and the drain reset leaves them in
+place.
 
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail

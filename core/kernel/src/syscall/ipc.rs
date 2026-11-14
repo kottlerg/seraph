@@ -2200,7 +2200,8 @@ unsafe fn wait_set_source(
         | CapTag::WaitSet
         | CapTag::IoPort
         | CapTag::SchedControl
-        | CapTag::SbiControl => return Err(SyscallError::InvalidCapability),
+        | CapTag::SbiControl
+        | CapTag::EntropyControl => return Err(SyscallError::InvalidCapability),
     };
     Ok((state, tag, header, right))
 }

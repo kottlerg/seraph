@@ -45,6 +45,70 @@ capability".
 
 ---
 
+## Microarchitectural Isolation
+
+Capability isolation is architectural: capabilities decide which objects a process can name and
+what it can do to them. They do not decide what a process can infer from the hardware state that
+processes and the kernel share below the architecture: branch predictors, caches and internal
+buffers, the execution resources of SMT siblings, timers and performance counters, frequency
+scaling, and DRAM rows. The system draws the line as follows.
+
+- **User-to-kernel boundary** — the kernel MUST defend it against every transient-execution class
+  known on the floor silicon
+  ([platform-requirements.md](platform-requirements.md) § Platform / silicon-era floor), always:
+  every defence is on by default and has no off switch, and a defence that only some CPUs need
+  is selected by enumerating the running CPU. The boundary protects every process at once and
+  does not depend on whether the processes on a machine distrust each other. The defences in
+  place are:
+  - on both architectures, the data bounds of § Capability Spaces (**Bounded under
+    speculation**): the checks between a user-supplied handle or value and the kernel load it
+    selects hold on a mispredicted path
+    ([core/kernel/docs/capability-internals.md](../core/kernel/docs/capability-internals.md)
+    § Speculative-Execution Hardening);
+  - on x86-64, an `lfence` after every entry-side `swapgs` decision (`entry_swapgs_asm`,
+    `paranoid_entry_asm`), and the mitigations the floor silicon applies in silicon;
+  - on riscv64, the data bounds alone: the RVA23 floor defines no speculation barrier and no
+    speculation control for the kernel to enumerate or drive.
+
+  On x86-64, enumerating the running CPU's vulnerabilities (`IA32_ARCH_CAPABILITIES` and CPUID)
+  and applying the entry and exit mitigations a vulnerable CPU needs (buffer clearing,
+  branch-predictor and return-prediction controls), for the classes the floor silicon does not
+  mitigate in silicon, is design intent, not yet implemented
+  ([#1085](https://github.com/kottlerg/seraph/issues/1085)). Until then the x86-64 boundary
+  rests on the defences above.
+- **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a
+  context switch, does not schedule SMT siblings by trust, partitions no cache, and gates no
+  counter by process. On riscv64 it sets `scounteren.CY`, so U-mode reads the cycle counter, and
+  leaves every other `scounteren` bit as the firmware set it, so U-mode also reads each counter
+  whose bit the firmware set (`TM`, for the `time` counter, for example). On x86-64 it never
+  sets `CR4.TSD` or `CR4.PCE`: each AP starts with both clear, and the boot CPU keeps the
+  firmware's values, so ring 3 reads the timestamp counter unless the firmware set `CR4.TSD`, and
+  reads the performance counters only where the firmware set `CR4.PCE`. Setting these controls
+  on every CPU from the kernel alone, whatever the firmware left, is design intent, not yet
+  implemented ([#1118](https://github.com/kottlerg/seraph/issues/1118)). Capability-mediated
+  performance-counter access is design intent, not yet implemented
+  ([#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the gating of the
+  counters, need security domains
+  ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only
+  policy treats every address space as its own domain, which in a microkernel puts a predictor
+  barrier on most IPC switches, and one control applied alone (SMT sibling parking, for
+  example) gives no guarantee that can be stated. Cross-domain isolation is design intent, not
+  yet implemented ([#1086](https://github.com/kottlerg/seraph/issues/1086)).
+- **SMT** — stays on. The kernel brings up and schedules every logical CPU, SMT siblings
+  included, as an independent CPU. Siblings are not an isolation boundary: threads of different
+  processes run on the siblings of one core at once, and contention for the resources the
+  siblings share is a channel between them
+  ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § SMT Awareness).
+- **Accepted and unmitigated** — cache-based side channels outside the transient-execution
+  classes above, frequency-scaling (DVFS) channels of the Hertzbleed class, and Rowhammer, at
+  both boundaries. The system applies no mitigation for them.
+
+Capability isolation therefore does not keep a secret from a co-resident hostile process: until
+security domains exist, a hostile process can attack a co-resident process through shared
+microarchitectural state.
+
+---
+
 ## Capability Handle Format
 
 A capability handle — the value userspace passes to and receives from the kernel —

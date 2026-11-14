@@ -6,6 +6,8 @@
 //! x86-64 serial UART for ktest: COM1 (I/O port 0x3F8) through an `IoPort` cap
 //! and `ioport_bind`. `crate::serial` owns the ready flag and the line framing.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use init_protocol::InitInfo;
 
 /// COM1 base I/O port.
@@ -14,25 +16,36 @@ const COM1: u16 = 0x3F8;
 /// COM1 register width — 8 ports starting at [`COM1`].
 const COM1_PORTS: u16 = 8;
 
+/// The `IoPort` cap covering exactly COM1's ports, which [`init`] carves and
+/// keeps in ktest's `CSpace`; 0 before it.
+static COM1_CAP: AtomicU64 = AtomicU64::new(0);
+
 /// Initialise COM1 serial output; returns whether the UART is ready.
 ///
 /// Carves a narrow `IoPort` cap covering exactly COM1's 8 ports from the root
-/// cap (via [`super::ioport::bind_port_range`]) and binds it to the thread
-/// `thread_cap` names, then programs the UART to 115200 8N1. `InitInfo` is
-/// consumed centrally by [`super::ioport::init`]; serial only needs the narrow
-/// COM1 bind, so `_info` and `_aspace_cap` are unused here.
+/// cap (via [`super::ioport::carve_port_range`]), keeps it ([`COM1_CAP`]) for
+/// [`grant_tx_interrupt`], and binds it to the thread `thread_cap` names, then
+/// programs the UART to 115200 8N1. `InitInfo` is consumed centrally by
+/// [`super::ioport::init`]; serial only needs the narrow COM1 bind, so `_info`
+/// and `_aspace_cap` are unused here.
 ///
 /// # Safety
 /// Must be called once, from the main thread, after `InitInfo` is mapped and
 /// [`super::init_io_ports`] has run.
 pub unsafe fn init(_info: &InitInfo, _aspace_cap: u64, thread_cap: u64) -> bool
 {
-    if !super::ioport::bind_port_range(thread_cap, COM1, COM1_PORTS)
+    let Some(cap) = super::ioport::carve_port_range(COM1, COM1_PORTS)
+    else
     {
-        return false; // no IoPort cap, or carve/bind failed
+        return false; // no IoPort cap, or the carve failed
+    };
+    if syscall::ioport_bind(thread_cap, cap).is_err()
+    {
+        return false;
     }
+    COM1_CAP.store(cap, Ordering::Release);
 
-    // SAFETY: bind_port_range succeeded; I/O port access for [COM1,
+    // SAFETY: the bind succeeded; I/O port access for [COM1,
     // COM1+COM1_PORTS) is permitted on this thread.
     unsafe { serial_hw_init() };
     true
@@ -88,19 +101,30 @@ const IER_THRI: u8 = 0x02;
 /// level, which a level-triggered entry delivers at every unmask until
 /// [`quiet_tx_interrupt`] lowers it.
 ///
-/// Called only on the main thread (the only one bound to COM1's ports) once
-/// [`init`] has returned `true`.
+/// Called only once [`init`] has returned `true`, on a thread bound to COM1's
+/// ports: the main thread, which [`init`] binds, or one
+/// [`grant_tx_interrupt`] has bound.
 pub fn raise_tx_interrupt()
 {
     #[expect(
         clippy::multiple_unsafe_ops_per_block,
-        reason = "every write is to COM1's IER, which `init` bound to this thread"
+        reason = "every write is to COM1's IER, which `init` or `grant_tx_interrupt` bound to \
+                  this thread"
     )]
     // SAFETY: serial_hw_init completed; I/O port access permitted.
     unsafe {
         outb(COM1 + 1, 0x00);
         outb(COM1 + 1, IER_THRI);
     }
+}
+
+/// Let the thread `thread_cap` names call [`raise_tx_interrupt`]: bind it to
+/// COM1's ports through the cap [`init`] kept. Returns whether the bind
+/// succeeded; false before [`init`] has.
+pub fn grant_tx_interrupt(thread_cap: u64) -> bool
+{
+    let cap = COM1_CAP.load(Ordering::Acquire);
+    cap != 0 && syscall::ioport_bind(thread_cap, cap).is_ok()
 }
 
 /// Disable every COM1 interrupt source (IER = 0), the state [`init`] leaves.

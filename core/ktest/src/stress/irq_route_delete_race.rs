@@ -50,9 +50,14 @@
 //! victim's Interrupt cap against the deliveries the same way, so a delivery
 //! walks the binding in the object being freed. After each delete the
 //! keeper's binding must still be served: once it acknowledges, a raise
-//! signals it. That raise must not signal the victim: the victim's binding,
-//! bound last, is linked ahead of the keeper's, so a delivery that walked the
-//! line after the delete and still found it would signal the victim first.
+//! signals it. The victim's binding, bound last, was linked ahead of the
+//! keeper's, and `irq::unregister` clears a removed binding's notification and
+//! link once it is unlinked, so a walk that still reaches it signals nothing
+//! and stops short of the keeper: the keeper check fails. That raise must not
+//! signal the victim either. The controller takes the victim's bits once the
+//! delete is done, so a bit after the keeper's raise came from a delivery the
+//! delete did not wait out, or from a removed binding that still named the
+//! victim.
 //!
 //! ## Two schedules
 //!
@@ -823,16 +828,17 @@ fn race_binding_delete(
             "stress::irq_route_delete_race: the kept binding was not served after the delete",
         );
     }
-    // That delivery walked the line after the change, and the doomed binding,
-    // bound last, was linked ahead of the kept one: had the change left it
-    // linked, the walk would have signalled the victim before the keeper.
-    // [`race_delete`] took the victim's bits once the change was done, so any
-    // bit now came from a delivery that began after the change and still
-    // reached the binding it removed.
+    // The doomed binding, bound last, was linked ahead of the kept one, and
+    // `irq::unregister` clears its notification and link once it is unlinked:
+    // a walk that still reached it would have signalled nothing and stopped
+    // short of the keeper, which the check above catches. [`race_delete`] took
+    // the victim's bits once the change was done, so any bit now came from a
+    // delivery the change did not wait out, or from a removed binding that
+    // still named the victim.
     match notification_try_wait(ntfs[1])
     {
         Ok(bits) if bits != 0 => Err(
-            "stress::irq_route_delete_race: a delivery after the delete reached the removed binding",
+            "stress::irq_route_delete_race: the victim was signalled after its binding's delete",
         ),
         _ => Ok(ran),
     }

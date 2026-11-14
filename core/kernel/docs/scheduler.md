@@ -615,6 +615,11 @@ Hot-path cost per CPU per tick:
 On systems with Simultaneous Multi-Threading (Hyper-Threading on Intel, SMT on AMD),
 multiple logical CPUs share physical execution resources on the same core.
 
+SMT siblings are not an isolation boundary. The scheduler places threads of different processes
+on the siblings of one core at once, and contention for the resources the siblings share is a
+channel between them; the scheduler does no core scheduling by trust. The system's posture is
+[docs/capability-model.md](../../../docs/capability-model.md) § Microarchitectural Isolation.
+
 SMT topology awareness is design intent, not yet implemented
 ([#267](https://github.com/kottlerg/seraph/issues/267)). The kernel records no physical-core
 or sibling topology, and `try_pull_balance`, `try_pull_idle` and `select_target_cpu` place

@@ -28,6 +28,8 @@ Out of scope (owned elsewhere, referenced here):
 - The mechanism of W^X, NX, SMEP/SMAP, the RISC-V U-bit/`SUM` isolation, and tagged-TLB tagging —
   [memory-model.md](memory-model.md).
 - IOMMU discovery and the DMA safety model — [device-management.md](device-management.md).
+- The microarchitectural isolation posture (transient execution, SMT, shared-state channels) —
+  [capability-model.md](capability-model.md) § Microarchitectural Isolation.
 - Console / serial ownership across boot — [console-model.md](console-model.md).
 - The UEFI handoff, firmware tables, and `BootInfo` surface — [bootstrap.md](bootstrap.md) and
   [abi/boot-protocol/README.md](../abi/boot-protocol/README.md).
@@ -115,7 +117,9 @@ Each feature is classified per architecture as one of:
 - **In-silicon transient-execution mitigations** (MDS, L1TF, and the rest of the ~2019 set) — a
   consequence of the platform floor. Their per-vulnerability enforcement is a hardening concern and
   is vendor-specific (Intel enumerates via `IA32_ARCH_CAPABILITIES`; AMD differs), so it is not part
-  of the cross-vendor boot-gate.
+  of the cross-vendor boot-gate. What the kernel defends beyond them, and what it leaves
+  unmitigated, is the posture of [capability-model.md](capability-model.md)
+  § Microarchitectural Isolation.
 - **2 MiB large pages** — used for the kernel direct map.
 - **UEFI firmware and ACPI 2.0+ (XSDT, MADT)** — the boot and hardware-discovery path. There is no
   BIOS or RSDT fallback.

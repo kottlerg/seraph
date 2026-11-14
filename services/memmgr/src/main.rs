@@ -21,7 +21,7 @@
 use free_pool::{
     ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
     NO_REGION_ID, NODE_NULL, Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore,
-    WordStore, arena::Slot, chunk_for, region_grants,
+    WordStore, arena::Slot, chunk_for, fault_window, region_grants,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -127,6 +127,7 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 // reservation-arena zones) are free in its address space. memmgr's private
 // windows, in address order, all below `MAIN_TLS_WINDOW.base`:
 //
+//   scrub window        [SCRUB_VA, + 2 MiB)                 a run being cleared
 //   phys-table scratch  [PHYS_TABLE_TEMP_VA, + 8 GiB)      one page, per-boot drawn
 //   process index       [PROCESS_INDEX_VA, PROCESS_INDEX_END)  bucket heads
 //   metadata arena      [drawn base, META_ARENA_LOW_END)    arena pages, then
@@ -137,6 +138,19 @@ const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 // the shared 2^38 layout ceiling (x86-64 4- or 5-level, Sv48, Sv57); under Sv39 the
 // kernel refuses the map and the arena ends at the low zone, which outlasts
 // the RAM such a machine can hold.
+
+/// Base of the scrub window, where memmgr maps a run to zero it before it
+/// hands the run out ([`scrub_run`]; services/memmgr/docs/memory-pool.md
+/// § Frame contents). Deterministic: the window holds a run only while memmgr
+/// clears it, and nothing but memmgr can read memmgr's address space.
+const SCRUB_VA: u64 = 0x0000_0001_0000_0000;
+
+/// Pages of the scrub window: the span of one leaf page table on every
+/// paging mode (2 MiB), at a base aligned to it, so the window needs one leaf
+/// table, which the kernel funds once and keeps, since a plain `mem_unmap`
+/// leaves page tables in place. A run larger than the window is cleared one
+/// window at a time.
+const SCRUB_WINDOW_PAGES: u64 = 512;
 
 /// Degraded-fallback scratch VA in memmgr's address space for mapping the
 /// bootstrap phys-table memory cap, and the base of its per-boot draw
@@ -182,6 +196,8 @@ const META_ARENA_HIGH_END: u64 = 1 << 56;
 // Zone-map invariants: each window ends before the next begins, and the
 // arena's worst-case base draw leaves its low zone non-empty.
 const _: () = {
+    assert!(SCRUB_VA.is_multiple_of(SCRUB_WINDOW_PAGES * PAGE_SIZE));
+    assert!(SCRUB_VA + SCRUB_WINDOW_PAGES * PAGE_SIZE <= PHYS_TABLE_TEMP_VA);
     assert!(PHYS_TABLE_TEMP_VA + (1 << (PHYS_TABLE_TEMP_SLOTS_LOG2 + 12)) <= PROCESS_INDEX_VA);
     assert!(PROCESS_INDEX_END <= META_ARENA_BASE_DEFAULT);
     assert!(META_ARENA_BASE_DEFAULT + (1 << (META_ARENA_SLOTS_LOG2 + 12)) < META_ARENA_LOW_END);
@@ -522,7 +538,7 @@ fn return_taken(l: &mut MemLedger, cap_slot: u64, pages: u32, phys_base: u64)
 const ASPACE_TOPUP_PAGES: u32 = 4;
 
 /// Page-table top-ups one map attempts before giving up: a self-map
-/// ([`map_self_page`]) or a demand chunk's map into a client
+/// ([`map_self`]) or a demand chunk's map into a client
 /// ([`map_client_chunk`]).
 const PT_FUND_ROUNDS: u32 = 4;
 
@@ -550,9 +566,47 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
     false
 }
 
+/// Map `pages` pages of the Memory cap `cap`, from its page `offset`,
+/// read-write at `va` in memmgr's own address space, funding its page tables
+/// from the pool when the kernel reports the page-table pool exhausted, at
+/// most [`PT_FUND_ROUNDS`] times. Returns the last map error otherwise.
+///
+/// # Safety
+/// `[va, va + pages * PAGE_SIZE)` MUST be unmapped VA of memmgr's private
+/// zones (the zone map above), where no image, stack, or IPC page lies.
+unsafe fn map_self(l: &mut MemLedger, cap: u64, va: u64, offset: u64, pages: u64)
+-> Result<(), i64>
+{
+    let mut last = SyscallError::OutOfMemory as i64;
+    for _ in 0..=PT_FUND_ROUNDS
+    {
+        // SAFETY: the caller's contract makes the span unmapped VA of
+        // memmgr's private zones, so the map changes nothing memmgr runs on.
+        match unsafe {
+            syscall::mem_map(
+                cap,
+                self_aspace(),
+                va,
+                offset,
+                pages,
+                MAP_READ | MAP_WRITABLE,
+            )
+        }
+        {
+            Ok(()) => return Ok(()),
+            Err(e) if e == SyscallError::OutOfMemory as i64 => last = e,
+            Err(e) => return Err(e),
+        }
+        if !fund_self_page_tables(l)
+        {
+            return Err(last);
+        }
+    }
+    Err(last)
+}
+
 /// Map the one-page Memory cap `cap` read-write at `va` in memmgr's own
-/// address space, funding its page tables from the pool when the kernel
-/// reports the page-table pool exhausted.
+/// address space ([`map_self`]).
 ///
 /// # Safety
 /// `va` MUST be the next unmapped page of the arena layout or of the index
@@ -560,23 +614,52 @@ fn fund_self_page_tables(l: &mut MemLedger) -> bool
 /// maps yet and where no image, stack, or IPC page lies.
 unsafe fn map_self_page(l: &mut MemLedger, cap: u64, va: u64) -> bool
 {
-    for _ in 0..=PT_FUND_ROUNDS
+    // SAFETY: the caller's contract is `map_self`'s for the one page.
+    unsafe { map_self(l, cap, va, 0, 1) }.is_ok()
+}
+
+/// Zero the `pages` pages of the run `cap` names before it leaves memmgr, a
+/// grant entry or a demand run (services/memmgr/docs/memory-pool.md § Frame
+/// contents): map it window by window at [`SCRUB_VA`] ([`map_self`]), clear
+/// the window, and unmap it again, leaving its page table in place. Every
+/// hand-out passes through here, so no frame reaches a process with what an
+/// earlier owner, or the kernel, left in it, whatever path returned it to the
+/// pool. Returns the error of a map or unmap that failed; the run is then not
+/// all clear, and the caller keeps it from the requester.
+fn scrub_run(l: &mut MemLedger, cap: u64, pages: u64) -> Result<(), i64>
+{
+    let mut first = 0;
+    while first < pages
     {
-        // SAFETY: the caller's contract makes `va` an unmapped page of
-        // memmgr's private zones, so the map changes nothing memmgr runs on.
-        match unsafe { syscall::mem_map(cap, self_aspace(), va, 0, 1, MAP_READ | MAP_WRITABLE) }
+        // The loop condition keeps `first` below `pages`.
+        let window = pages.saturating_sub(first).min(SCRUB_WINDOW_PAGES);
+        // SAFETY: the scrub window is memmgr's own zone (the zone map above),
+        // which every pass leaves unmapped, so the map changes nothing memmgr
+        // runs on.
+        if let Err(e) = unsafe { map_self(l, cap, SCRUB_VA, first, window) }
         {
-            Ok(()) => return true,
-            Err(e) if e == SyscallError::OutOfMemory as i64 =>
-            {}
-            Err(_) => return false,
+            // A map that ran out of page tables part way left the pages before
+            // the failing one mapped: unmap them, so the run memmgr keeps is
+            // mapped nowhere.
+            // SAFETY: as for the unmap below.
+            let _ = unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, window) };
+            return Err(e);
         }
-        if !fund_self_page_tables(l)
-        {
-            return false;
-        }
+        // `window` is at most `SCRUB_WINDOW_PAGES`, so the byte count is 2 MiB
+        // at most.
+        let bytes = window.saturating_mul(PAGE_SIZE) as usize;
+        // SAFETY: `[SCRUB_VA, SCRUB_VA + bytes)` was mapped read-write just
+        // above and nothing refers to it. The unmap below is inline assembly
+        // without `nomem`, which the compiler must assume reads memory, so the
+        // stores are made before it.
+        unsafe { core::ptr::write_bytes(SCRUB_VA as *mut u8, 0, bytes) };
+        // SAFETY: the span is the scrub window mapped above; nothing memmgr
+        // runs on lies in it.
+        unsafe { syscall::mem_unmap(self_aspace(), SCRUB_VA, window) }?;
+        // `window` is at most `pages - first`.
+        first = first.saturating_add(window);
     }
-    false
+    Ok(())
 }
 
 /// Map one pool frame as the next arena page and carve it into free slots.
@@ -1053,6 +1136,19 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
             return;
         }
     };
+
+    // Zero every run before it leaves memmgr (services/memmgr/docs/
+    // memory-pool.md § Frame contents). A run that cannot be cleared stays
+    // with memmgr: the grant goes back whole, before anything is accounted.
+    for &(outer, pages, _) in grant.entries()
+    {
+        if scrub_run(l, outer, u64::from(pages)).is_err()
+        {
+            rollback_grant(l, &grant, &[]);
+            reply_label(ipc_buf, memmgr_errors::QUOTA);
+            return;
+        }
+    }
 
     // Account each peeled outer to the caller's record under a fresh region
     // id, then derive the inner copy that ships in the reply. On any failure,
@@ -1550,12 +1646,15 @@ enum FaultDecline
     NoAspace = 5,
     /// The metadata arena could not grow for the chunk's frame descriptor.
     NoArenaSlot = 6,
-    /// The free pool holds no contiguous run of the chunk's size.
-    NoContiguousRun = 7,
-    /// The chunk's frame descriptor could not be recorded.
+    /// The free pool holds no page to back the faulting page: it is empty,
+    /// even after the deferred runs were rechecked, or the split of a run
+    /// larger than the span to back failed.
+    NoFreePage = 7,
+    /// The run's frame descriptor could not be recorded.
     FrameRecord = 8,
-    /// `mem_map` of the chunk into the process failed, after memmgr funded
-    /// the process's page-table pool as often as [`PT_FUND_ROUNDS`] allows
+    /// A map of the run failed: into memmgr's scrub window to zero it
+    /// ([`scrub_run`]), or into the process, after memmgr funded the
+    /// address space's page-table pool as often as [`PT_FUND_ROUNDS`] allows
     /// when the failure was an exhausted pool; the high 32 bits of the reason
     /// word carry the magnitude of its `SyscallError`.
     MapFailed = 9,
@@ -1598,16 +1697,19 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// (`services/memmgr/docs/ipc-interface.md` § Badge Discipline). Words are
 /// `[kind, faulting_va, access, ip]` (same document, § Kernel-origin fault
 /// message (`FAULT_LABEL`)). On a VM fault whose address lies in a registered
-/// region of a process with a delegated address space, memmgr backs the
-/// [`chunk_for`] chunk containing the faulting page — one contiguous Memory cap
-/// mapped across up to `DEMAND_CHUNK_PAGES` pages — and replies
-/// [`syscall_abi::FAULT_REPLY_RESUME`]; a fault on a page an earlier chunk
-/// backed is resumed without backing. Backing a chunk rather than a single page
-/// bounds cap-slot consumption (one cap per chunk). The page tables the map
-/// needs come from the client address space's own pool; when that pool is
-/// exhausted, memmgr funds it and maps again ([`map_client_chunk`]), so a
-/// region's fault does not depend on the client having funded the pool in
-/// advance. Every other VM case —
+/// region of a process with a delegated address space, memmgr backs the part
+/// of the [`chunk_for`] chunk containing the faulting page that no earlier run
+/// backs, with one contiguous Memory cap of up to `DEMAND_CHUNK_PAGES` pages,
+/// zeroed ([`scrub_run`]), and replies [`syscall_abi::FAULT_REPLY_RESUME`]; a
+/// fault on a page an earlier run backed is resumed without backing. When no
+/// free run covers that part, the largest free run backs the pages around the
+/// faulting one ([`fault_window`]), so a fault fails only when no page is free
+/// (services/memmgr/docs/memory-pool.md § Demand faults). Backing a chunk
+/// rather than a single page bounds cap-slot consumption (one cap per chunk on
+/// an unfragmented pool). The page tables the map needs come from the client
+/// address space's own pool; when that pool is exhausted, memmgr funds it and
+/// maps again ([`map_client_chunk`]), so a region's fault does not depend on
+/// the client having funded the pool in advance. Every other VM case —
 /// unknown process, address outside every region, an access the region's
 /// protection does not grant ([`region_grants`]), no delegated AS, or any
 /// allocation/map failure — replies [`syscall_abi::FAULT_REPLY_FORWARD`],
@@ -1616,11 +1718,11 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// [`syscall_abi::FAULT_REPLY_KILL`]; each with the [`FaultDecline`] that
 /// refused it in data word 0 ([`decline_fault`]).
 ///
-/// The chunk is accounted to the process record (reclaimed on `PROCESS_DIED` /
+/// The run is accounted to the process record (reclaimed on `PROCESS_DIED` /
 /// `UNREGISTER_REGION` like any issued cap), and so is each page-table run
 /// memmgr donates for it (reclaimed on `PROCESS_DIED`); `pool_total` is
 /// unchanged because the pages were already owned — they move from a free run
-/// to the record. A declined fault's chunk is unmapped before it returns to
+/// to the record. A declined fault's run is unmapped before it returns to
 /// the pool ([`release_unmapped_chunk`]).
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
@@ -1658,41 +1760,66 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::NoAspace, 0);
         return;
     }
-    // Already backed by an earlier chunk: another thread's fault on the same
-    // chunk was served first, and its mapping satisfies this granted access.
-    // Resume.
-    if l.frame_covering(rec, page_base, FRAME_VA_UNMAPPED)
+    // The part of the faulting page's chunk no earlier run backs. None: the
+    // page itself is backed, because another thread's fault on it was served
+    // first, and that mapping satisfies this granted access. Resume.
+    let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
+    let chunk_end = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
+    let Some((span_start, span_end)) =
+        l.unbacked_span(rec, page_base, chunk_base, chunk_end, FRAME_VA_UNMAPPED)
+    else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
         return;
-    }
+    };
+    // The span lies in the chunk, so its page count is at most
+    // `DEMAND_CHUNK_PAGES`, and at least 1, the faulting page.
+    let span_pages = u32::try_from(span_end.saturating_sub(span_start) / PAGE_SIZE).unwrap_or(1);
 
-    // Back the whole chunk containing the faulting page with one Memory cap,
-    // after securing the slot its descriptor takes.
-    let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
+    // Back the span with one Memory cap, after securing the slot its
+    // descriptor takes: one run covering the span, else, on a fragmented pool,
+    // the largest free run, mapped over the part of the span around the
+    // faulting page (services/memmgr/docs/memory-pool.md § Demand faults).
     if !ensure_slots(l, 1)
     {
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
     }
-    let Ok(grant) = select(l, chunk_pages, Fit::Contiguous)
+    let Ok(grant) =
+        select(l, span_pages, Fit::Contiguous).or_else(|_| select(l, span_pages, Fit::UpTo))
     else
     {
-        decline_fault(ipc_buf, FaultDecline::NoContiguousRun, 0);
+        decline_fault(ipc_buf, FaultDecline::NoFreePage, 0);
         return;
     };
     let (outer, pages, phys) = grant.entries[0];
-    // `chunk_base` is the chunk's mapped VA, so UNREGISTER_REGION can find and
-    // unmap it.
+    // The run's mapped VA, so UNREGISTER_REGION can find and unmap it.
     let frame = FrameDesc {
         cap_slot: outer,
         page_count: pages,
         phys_base: phys,
-        va: chunk_base,
+        va: fault_window(span_start, span_end, page_base, pages),
         region_id: NO_REGION_ID,
     };
 
-    // Map first, then account the chunk to the record: a page-table top-up
+    // Zero the run before the process can read it (services/memmgr/docs/
+    // memory-pool.md § Frame contents). It is mapped nowhere yet, so a
+    // failure returns it to the pool as it is.
+    if let Err(e) = scrub_run(l, outer, u64::from(pages))
+    {
+        insert_run(
+            l,
+            FreeRun {
+                cap_slot: outer,
+                page_count: u64::from(pages),
+                phys_base: phys,
+            },
+        );
+        decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs());
+        return;
+    }
+
+    // Map first, then account the run to the record: a page-table top-up
     // during the map records its own frame on the record, which must not land
     // above an already-pushed chunk that a failure would then pop.
     if let Err(e) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot)

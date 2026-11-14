@@ -405,6 +405,12 @@ memmgr serves frame requests over IPC. The contract:
 - **Caller maps.** Every returned Memory cap is mapped at a caller-
   chosen VA via `mem_map` (which already accepts a multi-page
   `page_count` argument).
+- **Zeroed frames.** Every page of a returned Memory cap, and every page a
+  demand fault backs, reads zero: memmgr zeroes each run when it hands the
+  run out, whatever path returned it to the pool, so no process receives
+  what an earlier owner or the kernel left in a frame
+  ([`services/memmgr/docs/memory-pool.md`](../services/memmgr/docs/memory-pool.md#frame-contents)
+  § Frame contents). The kernel zeroes RAM only once, at boot.
 - **Caller releases.** `RELEASE_MEMORY_CAPS` returns a granted region to the
   pool mid-life, named by the opaque region id memmgr reported at grant (the caller
   need not still hold the cap — it may have retyped the region, deleted the
@@ -452,8 +458,9 @@ access rather than up front — is a userspace-pager policy built on the
 fault-handler protocol ([Fault Handling](fault-handling.md)), not a kernel
 feature. memmgr implements it as the pager: a process reserves and
 registers a range via `std::os::seraph::register_demand_paged`, and on each
-first-touch fault memmgr backs the chunk of the registered region that
-contains the faulting page (up to `DEMAND_CHUNK_PAGES` pages; see
+first-touch fault memmgr backs, with zeroed pages, the part of the faulting
+page's chunk of the registered region (up to `DEMAND_CHUNK_PAGES` pages) that no
+earlier run backs (see
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md)).
 The process tears the range down with `std::os::seraph::unregister_demand_paged`,
 which unregisters it with memmgr (`UNREGISTER_REGION`), so memmgr unmaps and

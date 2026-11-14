@@ -325,6 +325,13 @@ stack pages at Phase 9. The drain hands its extents out with their headers in pl
 zeroes all of them, the seed reserve included, before minting any, as above, so
 the Memory caps userspace retypes and maps start from zeroed RAM.
 
+After boot the kernel does not clear the bytes a dead kernel object returns to the Memory object it
+was retyped from, so a frame reclaimed from a process can hold a dead object's kernel state, kernel
+pointers among it, as well as what the process wrote. memmgr zeroes every run before it hands the
+run to another process, as a grant or as a demand fault's backing
+([services/memmgr/docs/memory-pool.md](../../../services/memmgr/docs/memory-pool.md) § Frame
+contents), so neither reaches the next owner.
+
 ## Kernel console diagnostics
 
 The kernel's `kprint!` / `kprintln!` macros (`core/kernel/src/console.rs`) and the

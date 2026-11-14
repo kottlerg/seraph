@@ -154,7 +154,7 @@ Best-effort replies may use the full reply-side capacity.
 |---|---|---|
 | 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
 | 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, or deriving the caller's copy failed |
-| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
+| 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
@@ -551,13 +551,17 @@ so this is the process's memmgr badge), and data words `[kind, faulting_va, acce
 (see [docs/fault-handling.md](../../../docs/fault-handling.md)). For a
 `FAULT_KIND_VM` fault whose `faulting_va` lies in a registered region of a
 process with a delegated address space, and whose `access` the region's
-protection grants, memmgr backs the contiguous chunk of the region containing
-the page — one Memory cap mapped across up to `DEMAND_CHUNK_PAGES` pages —
-with the region's protection, and replies `FAULT_REPLY_RESUME` to retry the
-access; a fault on a page an earlier chunk already backed (another thread's
-fault on the same chunk, delivered before the mapping) is resumed without
-backing. Backing a chunk rather than a single page keeps cap-slot consumption
-to one cap per chunk, so a deep demand stack cannot exhaust memmgr's CSpace;
+protection grants, memmgr backs the part of the region's chunk containing
+the page that no earlier run backs — one zeroed Memory cap mapped across up to
+`DEMAND_CHUNK_PAGES` pages — with the region's protection, and replies
+`FAULT_REPLY_RESUME` to retry the access; a fault on a page an earlier run
+already backed (another thread's fault on the same chunk, delivered before the
+mapping) is resumed without backing. When no free run covers that part, the
+largest free run backs the pages around the faulting one, so the fault is
+declined for want of RAM only when no page is free
+([`memory-pool.md`](memory-pool.md#demand-faults) § Demand faults). Backing a
+chunk rather than a single page keeps cap-slot consumption to one cap per chunk
+on an unfragmented pool, so a deep demand stack cannot exhaust memmgr's CSpace;
 stacks grow contiguously, so a chunk's pages are consumed as the stack
 descends. The page tables the map needs come from the process address space's own page-table
 pool. When the kernel reports that pool exhausted, memmgr funds it from its free pool, accounted
@@ -584,10 +588,10 @@ forwards to.
 | 3 | `faulting_va` lies in no registered region |
 | 4 | The region's protection refuses the access |
 | 5 | No delegated address space |
-| 6 | The metadata arena cannot grow for the chunk's frame descriptor |
-| 7 | No contiguous free run of the chunk's size |
-| 8 | The chunk's frame descriptor cannot be recorded |
-| 9 | `mem_map` of the chunk into the process failed, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the chunk the failed map left mapped |
+| 6 | The metadata arena cannot grow for the run's frame descriptor |
+| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, or the split of a run larger than the span to back failed |
+| 8 | The run's frame descriptor cannot be recorded |
+| 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 
 Demand chunks are tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim them and the all-RAM-accounted

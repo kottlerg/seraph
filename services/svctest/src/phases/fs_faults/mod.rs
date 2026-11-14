@@ -11,11 +11,13 @@
 //! where it left the entry's 8.3 slot: live when the failure came before
 //! that slot's write, and as the device holds the slot when that write
 //! failed (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE`
-//! and § Label 16: `FS_RENAME`), and a directory grows only into a cluster
-//! already zeroed (services/fs/fat/docs/crash-safety.md § Write ordering).
-//! Each case lives in its own directory, and its faults are armed on that
-//! directory's single sector, on its file's data sector, or on the cluster
-//! the directory grows into.
+//! and § Label 16: `FS_RENAME`), and a directory grows, and `FS_MKDIR`
+//! claims a cluster, only once the cluster is written
+//! (services/fs/fat/docs/crash-safety.md § Write ordering). A write past a
+//! file's end over a removed file's clusters reads zeros in its gap (§ Label
+//! 4: `FS_WRITE`). Each case lives in its own directory, and its faults are
+//! armed on that directory's single sector, on its file's data sector, or on
+//! the cluster the directory grows into or `FS_MKDIR` takes.
 
 mod ramdisk;
 
@@ -52,6 +54,8 @@ const SLOTS_PER_SECTOR: usize = 16;
 const LFN_CHARS: usize = 13;
 /// The FAT16 end-of-chain value fatfs writes.
 const FAT16_EOC: u16 = 0xFFFF;
+/// Bytes one inline `FS_WRITE` carries and one `FS_READ` asks for.
+const CHUNK: usize = 504;
 
 /// Every case of the module docs, against one svctest-owned fatfs.
 pub fn fs_block_faults_phase(_: &Caps)
@@ -70,6 +74,8 @@ pub fn fs_block_faults_phase(_: &Caps)
     remove_kept_unread_when_lfn_write_dropped(&fs, &disk);
     write_dropped_leaves_cache_unchanged(&fs, &disk);
     dir_growth_links_only_zeroed_cluster(&fs, &disk);
+    sparse_write_reads_zeros_in_its_gap(&fs, &disk);
+    mkdir_dropped_dot_write_claims_no_cluster(&fs, &disk);
 
     fs.stop();
     std::os::seraph::log!("fs_block_faults phase passed");
@@ -488,6 +494,116 @@ fn dir_growth_links_only_zeroed_cluster(fs: &OwnFatfs, disk: &SharedDisk)
         dir,
         b"GHOST2.TXT",
         "G1: second stale entry after the growth",
+    );
+    let _ = syscall::cap_delete(dir);
+}
+
+/// A file takes a removed file's clusters, which still hold its bytes, and
+/// is written past its end: `FS_READ` returns zeros for every byte between
+/// the old end and the write, in the old last cluster and in the clusters
+/// the write took for the gap.
+fn sparse_write_reads_zeros_in_its_gap(fs: &OwnFatfs, disk: &SharedDisk)
+{
+    const STALE: u8 = 0xA5;
+    const TAIL: &[u8] = b"tail";
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let (dir, lba) = fs.case_dir(disk, b"S1");
+
+    // A removed file's three clusters, full of STALE, are the next ones
+    // the allocator takes.
+    let (holder, _) =
+        fs_create(fs.root, b"S1STALE.BIN", ipc_buf).expect("S1: stale holder FS_CREATE");
+    let stale = vec![STALE; 3 * ramdisk::SECTOR];
+    let mut at = 0u64;
+    for part in stale.chunks(CHUNK)
+    {
+        fs_write_inline(holder, at, part, ipc_buf).expect("S1: stale holder FS_WRITE");
+        at = at
+            .checked_add(part.len() as u64)
+            .expect("S1: stale holder offset");
+    }
+    let (root_lba, root_off) = lock(disk)
+        .find_root_sfn(b"S1STALE BIN")
+        .expect("S1: stale holder entry not on disk");
+    let stale_cluster = slot_cluster(disk, root_lba, root_off / 32);
+    fs_remove(fs.root, b"S1STALE.BIN", ipc_buf).expect("S1: stale holder FS_REMOVE");
+    let _ = syscall::cap_delete(holder);
+
+    // CONTENT at 0, then TAIL two sectors on: the gap runs from CONTENT's
+    // end through the first cluster's tail and the whole second cluster.
+    let file = create_with_content(dir, b"S1.BIN");
+    assert_eq!(
+        first_entry_cluster(disk, lba),
+        stale_cluster,
+        "S1: the file did not take the removed file's first cluster"
+    );
+    let mut want = CONTENT.to_vec();
+    want.resize(2 * ramdisk::SECTOR + 7, 0);
+    let tail_at = want.len();
+    want.extend_from_slice(TAIL);
+    fs_write_inline(file, tail_at as u64, TAIL, ipc_buf).expect("S1: sparse FS_WRITE");
+
+    let mut got = Vec::new();
+    while got.len() < want.len()
+    {
+        let part = fs_read_bytes(file, got.len() as u64, CHUNK as u64, ipc_buf)
+            .expect("S1: FS_READ after the sparse write");
+        assert!(!part.is_empty(), "S1: FS_READ ended before the file's size");
+        got.extend_from_slice(&part);
+    }
+    let first_wrong = got.iter().zip(&want).enumerate().find(|(_, (g, w))| g != w);
+    assert_eq!(
+        first_wrong, None,
+        "S1: (byte, (read, written)) of the sparse-written file"
+    );
+    assert_eq!(got.len(), want.len(), "S1: the file's size");
+    let _ = syscall::cap_delete(file);
+    let _ = syscall::cap_delete(dir);
+}
+
+/// The cluster `FS_MKDIR` takes is a removed file's, and the write of its
+/// `.` and `..` entries is dropped: the request fails with the cluster still
+/// free, and a retry takes it.
+fn mkdir_dropped_dot_write_claims_no_cluster(fs: &OwnFatfs, disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let (holder, _) =
+        fs_create(fs.root, b"K1STALE.BIN", ipc_buf).expect("K1: stale holder FS_CREATE");
+    fs_write_inline(holder, 0, CONTENT, ipc_buf).expect("K1: stale holder FS_WRITE");
+    let (root_lba, root_off) = lock(disk)
+        .find_root_sfn(b"K1STALE BIN")
+        .expect("K1: stale holder entry not on disk");
+    let stale_cluster = slot_cluster(disk, root_lba, root_off / 32);
+    fs_remove(fs.root, b"K1STALE.BIN", ipc_buf).expect("K1: stale holder FS_REMOVE");
+    let _ = syscall::cap_delete(holder);
+    let stale_lba = RamDisk::cluster_lba(stale_cluster);
+
+    lock(disk).arm(stale_lba, 0, Fault::DropWrite);
+    let got = fs_mkdir(fs.root, b"K1", ipc_buf).map(|(cap, _)| {
+        let _ = syscall::cap_delete(cap);
+    });
+    assert_fired(disk, "K1");
+    assert_eq!(
+        got,
+        Err(fs_errors::IO_ERROR),
+        "K1: a mkdir whose dot-entries write was dropped"
+    );
+    assert_eq!(
+        lock(disk).fat_entry(stale_cluster),
+        0,
+        "K1: the failed mkdir left its cluster allocated"
+    );
+    expect_missing(fs.root, b"K1", "K1: directory after the failed mkdir");
+
+    let (dir, lba) = fs.case_dir(disk, b"K1");
+    assert_eq!(
+        lba, stale_lba,
+        "K1: the retried mkdir did not take the freed cluster"
+    );
+    assert_eq!(
+        lock(disk).fat_entry(stale_cluster),
+        FAT16_EOC,
+        "K1: the new directory's cluster ends its chain"
     );
     let _ = syscall::cap_delete(dir);
 }

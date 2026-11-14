@@ -882,10 +882,10 @@ pub fn directory_is_empty(
     }
 }
 
-/// Populate a freshly-allocated directory cluster with the `.` and
-/// `..` entries, and zero the rest of it. Called by `FS_MKDIR` after
-/// [`crate::alloc::allocate_cluster`] gives it the cluster, which still
-/// holds an earlier owner's bytes.
+/// Populate a new directory cluster with the `.` and `..` entries, and
+/// zero the rest of it. Called by `FS_MKDIR` on the cluster
+/// [`find_free_cluster`] found, which still holds an earlier owner's bytes
+/// and stays free in the FAT until [`claim_cluster`] marks it after this.
 pub fn write_dot_entries(
     state: &mut FatState,
     new_dir_cluster: u32,
@@ -919,8 +919,8 @@ pub fn write_dot_entries(
         return Err(FatError::Io);
     }
     // Zero out the rest of the cluster so a stale neighbour sector
-    // (allocate_cluster reuses freed clusters) does not surface as
-    // ghost entries.
+    // (the allocator reuses freed clusters) does not surface as ghost
+    // entries.
     let zeros = sector_buffer()?;
     for lba in sectors
     {

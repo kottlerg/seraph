@@ -737,9 +737,13 @@ and `integration::thread_memory` drives the memory calls' copies, text writes, a
 ## Crash Reports
 
 The crash service is a userspace handler of the exception class that reports a process dying on a
-fault to the system log, then ends the faulting thread as the kernel would have: it declines the
-fault (`FAULT_REPLY_KILL`), so the thread dies with the same exit reason and the same death flow
-([Process Lifecycle § Process Death](process-lifecycle.md#process-death)). The service, its report,
+fault to the system log, then ends the faulting thread as the kernel would have, except a page
+fault the pager declined for want of memory, which it may hold until memory is freed or a bounded
+time passes, then resume or decline. It ends the thread by declining the fault
+(`FAULT_REPLY_KILL`), so the thread dies with the same exit reason and the same death flow
+([Process Lifecycle § Process Death](process-lifecycle.md#process-death)). The hold is design
+intent; not yet implemented: the crash service reports and declines a fault declined for want of
+memory as it does any other. The service, its report,
 and its limits are in [services/crashd/README.md](../services/crashd/README.md) and
 [crashd Operation](../services/crashd/docs/operation.md); the report's
 format, the contract the host-side symbolizer reads, in

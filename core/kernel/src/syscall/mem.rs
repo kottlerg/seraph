@@ -613,12 +613,19 @@ pub fn sys_aspace_harvest(tf: UserFrame) -> Result<u64, crate::uaccess::Restarta
     // walk covers the range clamped as data (`mm::user_page_range`).
     let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
     // The page count the walk covers, from the clamped range: `page_count`
-    // architecturally, and 0 on a path past a mispredicted check.
-    let page_count = virt_end
-        .wrapping_sub(virt_base)
-        .checked_div(crate::mm::PAGE_SIZE as u64)
-        .and_then(|pages| usize::try_from(pages).ok())
-        .unwrap_or(0);
+    // architecturally, and 0 on a path past a mispredicted range check. The
+    // `MAX_HARVEST_PAGES` bound above is a branch, so the count is bounded
+    // again as data: a walk past a mispredicted bound sets no bit past the
+    // stack bitmap (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening).
+    let page_count = crate::arch::nospec::mask_index(
+        virt_end
+            .wrapping_sub(virt_base)
+            .checked_div(crate::mm::PAGE_SIZE as u64)
+            .and_then(|pages| usize::try_from(pages).ok())
+            .unwrap_or(0),
+        BITMAP_MAX * 8 + 1,
+    );
     let mut storage = [0u8; BITMAP_MAX];
     let Some(bitmap) = storage.get_mut(..page_count.div_ceil(8))
     else

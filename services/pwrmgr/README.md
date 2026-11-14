@@ -60,6 +60,12 @@ issued.
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.
 
+pwrmgr observing svcmgr, which cannot observe its own death, and powering
+the platform off when svcmgr dies is design intent; not yet implemented
+(#262) (see
+[docs/supervision.md](../../docs/supervision.md#observing-svcmgr)
+§ Observing svcmgr).
+
 ---
 
 ## Cap flow
@@ -162,6 +168,7 @@ between the two trees.
 | Document | Content |
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System-wide service inventory; pwrmgr's role |
+| [docs/supervision.md](../../docs/supervision.md) | Supervision hierarchy; pwrmgr as svcmgr's observer |
 | [docs/testing.md](../../docs/testing.md) | Cross-harness completion convention; harnesses request pwrmgr shutdown when they finish |
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |

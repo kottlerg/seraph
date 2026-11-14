@@ -34,8 +34,8 @@ use crate::context::Context;
 use crate::disk::DiskLayout;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, SecondDisk, X86Paging, build_qemu_argv,
-    prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, SecondDisk, X86Paging,
+    build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
 
@@ -124,6 +124,7 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
         vmgenid_guid: Some("auto"),
         incoming: None,
         riscv_mmu: RiscvMmu::Sv48,
+        riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
         iommu: Iommu::Attached,
         debug_port: Some(port),

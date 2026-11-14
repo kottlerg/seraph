@@ -71,7 +71,7 @@ core/kernel/
 │   │       ├── ap_trampoline.rs # AP startup trampoline (SBI HSM hart_start)
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │       ├── console.rs      # Early serial (ns16550 MMIO UART) output
-│   │       ├── entropy.rs      # No S-mode hardware RNG; cycle counter for jitter
+│   │       ├── entropy.rs      # Zkr seed CSR hardware RNG; cycle counter for jitter
 │   │       └── speculation.rs  # Branchless bound mask (sltu/neg) and opaque identity
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs

@@ -445,9 +445,42 @@ mod tests
 {
     use super::*;
 
+    use crypto_testkit::differential;
+    use crypto_testkit::sha512::{self as reference, Input};
+
     #[test]
     fn kats_pass()
     {
         assert_eq!(run_sha512_kats(), Ok(()));
+    }
+
+    /// The seed of the generated messages; any fixed value serves.
+    const SEED: u64 = 0x5e4a_9512;
+
+    #[test]
+    fn one_shot_and_incremental_digests_agree_with_the_reference()
+    {
+        let inputs = reference::generated(SEED, 64);
+        let one_shot = differential::compare(
+            "sha512 one-shot",
+            inputs.iter(),
+            |i: &&Input| sha512(&i.data),
+            |i| reference::reference(&i.data),
+        );
+        assert!(one_shot.agrees(), "{one_shot}");
+        let incremental = differential::compare(
+            "sha512 incremental",
+            inputs.iter(),
+            |i: &&Input| {
+                let mut hasher = Sha512::new();
+                for piece in i.pieces()
+                {
+                    hasher.update(piece);
+                }
+                hasher.finalize()
+            },
+            |i| reference::reference(&i.data),
+        );
+        assert!(incremental.agrees(), "{incremental}");
     }
 }

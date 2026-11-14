@@ -22,7 +22,8 @@ ipc = { path = "../ipc" }
 process-abi = { path = "../../abi/process-abi" }
 # `cap_delete` of the caps a refused resource list delivered.
 syscall = { path = "../syscall" }
-# `MSG_CAP_SLOTS_MAX` and the `SYS_IRQ_REGISTER` mode mask.
+# `MSG_CAP_SLOTS_MAX`, `MSG_DATA_WORDS_MAX` and the `SYS_IRQ_REGISTER` mode
+# mask.
 syscall-abi = { path = "../../abi/syscall" }
 
 [lints]

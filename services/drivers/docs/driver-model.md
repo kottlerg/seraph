@@ -19,12 +19,12 @@ when it exits on its own.
    [docs/build-system.md](../../../docs/build-system.md#custom-targets) § Custom Targets.
 3. A driver receives its device capabilities from [devmgr](../../devmgr/README.md) at spawn.
    It MUST NOT assume any capabilities beyond what devmgr delegates. A driver devmgr binds to a
-   PCI or platform device record carries a declaration in the ELF note section
-   `.note.seraph.driver` (`driver_binding::driver_declaration!`) and receives the resource list
-   of `driver_binding::resources` (a platform driver decodes it with
-   `driver_binding::resources::PlatformDelivery`); only the IOMMU driver takes bootstrap rounds
-   of its own; [docs/driver-binding.md](../../../docs/driver-binding.md) is the
-   design.
+   device record carries a declaration in the ELF note section `.note.seraph.driver`
+   (`driver_binding::driver_declaration!`) and receives the resource list of
+   `driver_binding::resources` (a platform driver decodes it with
+   `driver_binding::resources::PlatformDelivery`, the IOMMU driver with `iommu_core`'s
+   `Delivery`); a driver refuses a list that holds a unit round unless it is the IOMMU driver;
+   [docs/driver-binding.md](../../../docs/driver-binding.md) is the design.
 4. A driver serves client requests on the service endpoint devmgr creates and delivers in its
    bootstrap; devmgr keeps the endpoint and mints client SEND caps to it through the
    class-keyed `QUERY_DEVICE`, sent on a class SEND that svcmgr publishes as

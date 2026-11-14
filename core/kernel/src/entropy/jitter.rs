@@ -6,8 +6,9 @@
 //! Per-CPU jitter entropy accumulator.
 //!
 //! Timing jitter is the always-available entropy source and the only
-//! runtime source on platforms without a hardware RNG (riscv64, where any
-//! firmware boot seed is absorbed at boot only; see
+//! runtime source on platforms without a hardware RNG (a riscv64 hart without
+//! a readable `Zkr` `seed` CSR, where any firmware boot seed is absorbed at
+//! boot only; see
 //! [entropy.md](../../docs/entropy.md) § Sources and graceful degradation). Each
 //! CPU folds cycle-counter samples — taken at distinct event classes (per-tick,
 //! per-IRQ) — into a small per-CPU buffer at interrupt time: allocation-free

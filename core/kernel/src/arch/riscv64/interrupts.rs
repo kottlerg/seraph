@@ -23,7 +23,8 @@
 //! - Other U-mode exceptions → spurious-TLB retry, the bound fault handler, or thread
 //!   termination
 //! - Other S-mode exceptions → the kernel spurious-TLB retry (load/store), the
-//!   `copy_user` fixup, else diagnostics + `fatal()`
+//!   `copy_user` fixup, the Zkr `seed` probe's fixup (illegal instruction), else
+//!   diagnostics + `fatal()`
 //!
 //! # Device interrupts
 //! The controller is AIA, whose mechanism [`super::aia`] holds: each routed APLIC
@@ -808,7 +809,8 @@ unsafe fn terminate_faulted_thread(
 }
 
 /// An S-mode exception: retry a stale TLB entry, redirect a faulting user
-/// copy to its fixup, and otherwise report the exception and halt the hart.
+/// copy or a trapped `seed` CSR read to its fixup, and otherwise report the
+/// exception and halt the hart.
 /// `sstatus_val` and `satp_val` are the CSRs read at the trap.
 ///
 /// # Safety
@@ -875,6 +877,17 @@ unsafe fn kernel_exception(
             unsafe { super::paging::flush_page(live.stval) };
             return;
         }
+        live.sepc = fixup;
+        return;
+    }
+
+    // Zkr entropy-source probe: an illegal-instruction trap (cause 2) at the
+    // `seed` CSR access is a hart without Zkr, or one whose firmware left
+    // `mseccfg.SSEED` clear. Resume at the access's fixup, which reports the
+    // source absent, instead of halting.
+    if cause_code == 2
+        && let Some(fixup) = super::entropy::seed_fault_fixup(live.sepc)
+    {
         live.sepc = fixup;
         return;
     }

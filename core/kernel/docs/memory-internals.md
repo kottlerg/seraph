@@ -176,7 +176,9 @@ code's comments refer here rather than restate it:
 - **Install.** `AddressSpace::map_page` and `map_page_pooled` raise the new frame's count before
   the leaf is written, so the count covers the leaf from the moment any CPU can walk it. These
   two functions back every user mapping: `SYS_MEM_MAP`, `SYS_MMIO_MAP`, and the Phase-9
-  bootstrap maps of init's address space.
+  bootstrap maps of init's address space. Both refuse a page outside the user range
+  `[USER_VA_FLOOR, user_va_top)` before the count is raised, so no path installs a leaf below the
+  floor ([docs/memory-model.md § Userspace Layout](../../../docs/memory-model.md#userspace-layout)).
 - **Replace.** A map over a present leaf lowers the replaced frame's count after the rewrite's
   TLB invalidation (the remote shootdown when the rewrite needs one) has completed.
 - **Remove.** `unmap_page` lowers the count after its remote shootdown. The span paths

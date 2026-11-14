@@ -277,21 +277,22 @@ table-page store `iommu-store`
 ([services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md)). For each unit
 it discovers, devmgr carves an `Mmio` cap for the unit's register range through the same
 aperture-carving flow as any other device (for a RISC-V IOMMU, after turning on the function's
-memory decode and bus mastering through its configuration page) and moves it to that family's IOMMU
-driver, keeping no copy, with the unit's PCI segment and its scope resolved against the PCI
-topology. devmgr keeps the DMA endpoint, its `devmgr_dma_labels` contract, and per-device policy,
-and reaches the IOMMU driver over `ipc::iommu_labels` to attach a device to a domain of its own,
-install and withdraw mappings, block a device, and take the faults the units recorded, so drivers
-see the same protocol whichever IOMMU, or none, sits behind it. The kernel does not read or write
-IOMMU registers and holds no per-IOMMU state.
+memory decode and bus mastering through its configuration page) and delivers it to that family's
+IOMMU driver, with the unit's PCI segment and its scope resolved against the PCI topology,
+deleting its own once the spawn returns, so it keeps no copy. devmgr keeps the DMA endpoint, its
+`devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over
+`ipc::iommu_labels` to attach a device to a domain of its own, install and withdraw mappings,
+block a device, and take the faults the units recorded, so drivers see the same protocol
+whichever IOMMU, or none, sits behind it. The kernel does not read or write IOMMU registers and
+holds no per-IOMMU state.
 
 At boot devmgr matches the IOMMU family record against the boot-module declarations and spawns
-the matched driver from its boot module (with its own bootstrap rounds, not the resource list)
-before any DMA-capable driver, in a settle batch of its own (`CREATE_PROCESS` with
-`CREATE_PINNED`, since the units walk its table pages, `CREATE_DMA_HOLD`, and
-`CREATE_PHYS_ACCESS`, since the units are programmed with physical
-addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it on
-every mapping). The driver programs each unit with empty tables and turns translation on, so from
+the matched driver from its boot module, delivering it the units in its resource list
+([driver-binding.md](driver-binding.md#matching) § Matching), before any DMA-capable driver, in
+a settle batch of its own (`CREATE_PROCESS` with `CREATE_PINNED`, since the units walk its table
+pages, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS`, since the units are programmed with physical
+addresses (§ Physical Addresses), at `BOOT_DRIVER_PRIORITY`, since devmgr's DMA thread calls it
+on every mapping). The driver programs each unit with empty tables and turns translation on, so from
 its ready report every function a unit translates reaches nothing until devmgr attaches it, the
 functions no driver binds included. devmgr never releases the driver's hold, and deletes its release
 token at the spawn: a unit may walk any of its table pages while translation is on, so they stay
@@ -626,13 +627,15 @@ gives the settle, the bound's derivation, and the serving order). `QUERY_DEVICE`
 class's drivers by an optional instance ordinal in `data[1]` (absent means the first): the
 ordinal counts the served drivers of that class in PCI segment, bus, device, function order, is
 not stable across boots, and is fixed once the class settles. devmgr
-observes every driver's death for the rest of the boot: a served driver that dies is withdrawn, its
-service endpoint revoked so callers queued on it return, and a tombstone holds its ordinal, whose
-query replies `devmgr_errors::WITHDRAWN` while the ordinals after it keep their drivers; a
-withdrawn serial, framebuffer, or RTC driver's query replies `WITHDRAWN` too. Past the last
-served driver of a class the reply is `devmgr_errors::NO_DEVICE`. vfsd queries every
-block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not `SUCCESS`, and holds
-every live disk; the terminal sends none, so it binds the first input instance.
+observes the death of every driver's main thread for the rest of the boot (a worker thread's
+terminal fault is not observed:
+[Supervision § Supervision Hierarchy](supervision.md#supervision-hierarchy)): a served driver
+that dies is withdrawn, its service endpoint revoked so callers queued on it return, and a
+tombstone holds its ordinal, whose query replies `devmgr_errors::WITHDRAWN` while the ordinals
+after it keep their drivers; a withdrawn serial, framebuffer, or RTC driver's query replies
+`WITHDRAWN` too. Past the last served driver of a class the reply is `devmgr_errors::NO_DEVICE`.
+vfsd queries every block ordinal from 0, passing a `WITHDRAWN` one, until another reply is not
+`SUCCESS`, and holds every live disk; the terminal sends none, so it binds the first input instance.
 
 The debug port is a byte transport apart from the console's UART, which a debugger stub, the
 [GDB stub](../services/gdbstub/README.md), owns to speak to a host debugger: the first
@@ -710,7 +713,8 @@ specified in [`docs/storage.md`](storage.md).
 [Architecture Overview](architecture.md), [Capability Model](capability-model.md),
 [Console Model](console-model.md),
 [Memory Model](memory-model.md), [Platform Requirements](platform-requirements.md),
-[Storage](storage.md), [services/devmgr/README.md](../services/devmgr/README.md),
+[Storage](storage.md),
+[Supervision](supervision.md), [services/devmgr/README.md](../services/devmgr/README.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/cmos/README.md](../services/drivers/cmos/README.md),

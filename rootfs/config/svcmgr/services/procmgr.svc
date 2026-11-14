@@ -1,11 +1,10 @@
 # procmgr — process manager (CREATE_PROCESS / CREATE_FROM_FILE / etc).
 #
 # Bootstrapped by init via raw `cap_create_*` syscalls. Procmgr is
-# the chooser for every subsequent process creation; svcmgr has a
-# documented future raw-syscall fallback to reconstruct procmgr from
-# its boot module (not implemented today). `restart = never` +
-# `critical = yes` matches the current shape: on unrecoverable
-# death svcmgr issues `pwrmgr_labels::SHUTDOWN`.
+# the chooser for every subsequent process creation, and is in the
+# core set (docs/supervision.md): it never restarts, and its death is
+# system death. `restart = never` + `critical = yes`: on its death
+# svcmgr issues `pwrmgr_labels::SHUTDOWN`.
 binary    = /services/procmgr
 restart   = never
 critical  = yes

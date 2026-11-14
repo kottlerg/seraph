@@ -12,5 +12,10 @@ doctest = false
 
 [dependencies]
 
+[dev-dependencies]
+# Host-only test infrastructure: the Wycheproof loader and vectors, and the
+# differential harness with its reference implementations.
+crypto-testkit = { path = "testkit" }
+
 [lints]
 workspace = true

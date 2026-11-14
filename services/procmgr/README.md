@@ -391,11 +391,10 @@ Boundaries Between memmgr and procmgr" for the full split.
 svcmgr monitors services and requests restarts via procmgr's IPC
 interface. svcmgr holds no process-creation capabilities: every process
 other than init (kernel-created) and init's raw-bootstrap set (memmgr and
-procmgr) is created through procmgr. A raw-syscall fallback that lets
-svcmgr recreate procmgr if procmgr itself crashes is design intent; not
-yet implemented (#26) (see
-[services/svcmgr/docs/restart-protocol.md](../svcmgr/docs/restart-protocol.md#procmgr-fallback)
-§ procmgr Fallback).
+procmgr) is created through procmgr. procmgr is in the core set: svcmgr
+does not restart it, and its death powers the system off (see
+[docs/supervision.md](../../docs/supervision.md#core-set-and-system-death)
+§ Core Set and System Death).
 
 ---
 
@@ -405,6 +404,7 @@ yet implemented (#26) (see
 |---|---|
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Boot order, ProcessInfo handover, process-death flow |
+| [docs/supervision.md](../../docs/supervision.md) | Core set: procmgr's death is system death |
 | [docs/userspace-memory-model.md](../../docs/userspace-memory-model.md) | Memory ownership, memory-cap contract, page-reservation contract |
 | [docs/capability-model.md](../../docs/capability-model.md) | CSpace, AddressSpace, Thread caps |
 | [services/memmgr/README.md](../memmgr/README.md) | Sister tier-1 service for the memory-cap pool |
@@ -420,6 +420,7 @@ yet implemented (#26) (see
 [Capability Model](../../docs/capability-model.md),
 [Namespace Model](../../docs/namespace-model.md),
 [Process Lifecycle](../../docs/process-lifecycle.md),
+[Supervision](../../docs/supervision.md),
 [Userspace Memory Model](../../docs/userspace-memory-model.md),
 [runtime/ruststd/README.md](../../runtime/ruststd/README.md),
 [services/init/README.md](../init/README.md), [services/memmgr/README.md](../memmgr/README.md)

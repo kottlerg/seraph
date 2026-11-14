@@ -1,20 +1,26 @@
 # iommu/core
 
 The family-independent half of every IOMMU driver (`iommu-core`), a library each family's
-driver binary links: the bootstrap devmgr serves it, the `ipc::iommu_labels` service with its
-per-domain checks, the polled fault queue, the `TableStore` the family's translation structures
-are built in, and the `Backend` trait the family implements. A family's driver is its `main` and
-its `Backend`: VT-d's is [`iommu-vtd`](../vtd/README.md) and the RISC-V IOMMU's is
-[`iommu-riscv`](../riscv/README.md), both building their tables in the pages of
-[`iommu-store`](../store/README.md). The split, and devmgr's side of it, are specified in
+driver binary links: what the driver takes from the resource list devmgr delivers it, the
+`ipc::iommu_labels` service with its per-domain checks, the polled fault queue, the `TableStore`
+the family's translation structures are built in, and the `Backend` trait the family implements.
+A family's driver is its `main` and its `Backend`: VT-d's is [`iommu-vtd`](../vtd/README.md)
+and the RISC-V IOMMU's is [`iommu-riscv`](../riscv/README.md), both building their tables in the
+pages of [`iommu-store`](../store/README.md). The split, and devmgr's side of it, are specified in
 [docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming.
 
-- **Bootstrap.** One round per remapping unit, in unit-index order: the unit's register `Mmio`
-  cap, its PCI segment, whether it translates every function of its segment no other unit names,
-  the pages its registers span, and its scope, each function or bridged bus range devmgr resolved
-  from the firmware's description of it. Then a terminal round with the driver's service endpoint
-  and its devmgr query cap. The driver reads no firmware table.
+- **Delivery.** The driver receives the resource list of `driver_binding::resources`
+  ([docs/driver-binding.md](../../../../docs/driver-binding.md#matching) § Matching): one group
+  per remapping unit, in unit-index order, each the unit's round (its PCI segment, whether it
+  translates every function of its segment no other unit names, and its scope, each function or
+  bridged bus range devmgr resolved from the firmware's description of it), then the unit's
+  register `Mmio` range and, when devmgr gives it one, its fault interrupt; then the end round
+  with the driver's service endpoint and its devmgr query cap. `Delivery::from_list` refuses any
+  other shape: no unit or more than `MAX_IOMMU_UNITS`, a resource before the first unit, a unit
+  without exactly one register range of 1 to `MAX_UNIT_REGISTER_PAGES` whole pages, an `IoPort`,
+  more than one interrupt per unit, a missing endpoint, or a DMA capability. The driver reads no
+  firmware table.
 - **Service.** Every request carries `IOMMU_LABELS_VERSION`. Before the backend runs, the service
   checks the unit or domain the request names, that an `ATTACH`'s requester ID is one the unit
   translates (the first unit whose scope names it, else its segment's catch-all unit), that a
@@ -71,7 +77,7 @@ iommu/core/
 └── src/
     ├── lib.rs           # Crate root: the Backend trait, its errors, Access, a unit's limits,
     │                    #   a remapping entry
-    ├── bootstrap.rs     # Unit and endpoint rounds, scope words, the unit lookup
+    ├── delivery.rs      # What the driver takes from its resource list, the unit lookup
     ├── faults.rs        # The bounded queue of polled faults
     ├── service.rs       # iommu_labels handling, domain records, the receive and poll loops
     └── table.rs         # The TableStore every family's tables are built in

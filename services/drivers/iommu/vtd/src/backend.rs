@@ -442,7 +442,7 @@ impl Vtd
     }
 
     /// Unit `unit`. [`Service`](iommu_core::Service) passes only a unit the
-    /// bootstrap delivered, so the [`BackendError::Invalid`] is never
+    /// resource list delivered, so the [`BackendError::Invalid`] is never
     /// returned.
     fn unit(&self, unit: usize) -> Result<&Unit, BackendError>
     {

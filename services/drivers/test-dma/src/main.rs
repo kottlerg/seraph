@@ -735,12 +735,17 @@ type ListedIrq = (u64, InterruptKind, u64);
 /// Request the resource list from `creator`, the driver's creator endpoint:
 /// the cap of BAR 0 with the pages it spans, the first interrupt resource
 /// (`None` when there is none), and the end round's endpoints. `None` when
-/// the list does not decode, carries no BAR 0, or carries no DMA capability.
+/// the list does not decode, holds an IOMMU unit (an IOMMU record's list),
+/// carries no BAR 0, or carries no DMA capability.
 fn receive(creator: u64, ipc_buf: *mut u64) -> Option<(u64, u64, Option<ListedIrq>, Endpoints)>
 {
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let list = unsafe { driver_binding::resources::receive(creator, ipc_buf) }.ok()?;
     let eps = list.endpoints()?;
+    if list.holds_units()
+    {
+        return None;
+    }
     let bar = list.resources().iter().find_map(|r| match *r
     {
         Resource::Mmio {

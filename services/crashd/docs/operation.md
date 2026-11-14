@@ -118,7 +118,8 @@ and holding a crashed process stopped for a debugger are design intent; not yet 
 
 ## Summarized By
 
-[Fault Handling](../../../docs/fault-handling.md), [Testing](../../../docs/testing.md),
+[Fault Handling](../../../docs/fault-handling.md),
+[Supervision](../../../docs/supervision.md), [Testing](../../../docs/testing.md),
 [services/crashd/README.md](../README.md),
 [services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md),
 [services/drivers/serial/README.md](../../drivers/serial/README.md),

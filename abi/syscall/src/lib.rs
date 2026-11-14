@@ -48,6 +48,15 @@ use core::prelude::rust_2024::*;
 /// in every paging mode.
 pub const PAGE_SIZE: u64 = 0x1000;
 
+/// Lowest user virtual address a mapping may cover: 64 KiB, on both
+/// architectures and in every paging mode. No page below it is ever mapped in
+/// any address space; `SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT` and
+/// `SYS_MMIO_MAP` refuse a range that starts below it with `InvalidAddress`.
+/// Why it exists and how it is sized: docs/memory-model.md § Userspace Layout.
+pub const USER_VA_FLOOR: u64 = 0x1_0000;
+
+const _: () = assert!(USER_VA_FLOOR.is_multiple_of(PAGE_SIZE));
+
 // ── Capability handle encoding ────────────────────────────────────────────────
 
 /// Number of low bits in a capability handle that hold the `CSpace` slot index.

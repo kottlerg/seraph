@@ -291,10 +291,93 @@ pub fn run_ed25519_kats() -> Result<(), &'static str>
 mod tests
 {
     use super::*;
+    use crypto_testkit::differential;
+    use crypto_testkit::ed25519::{self as reference, Input, Verdict};
+    use crypto_testkit::wycheproof::{self, eddsa};
 
     #[test]
     fn kats_pass()
     {
         assert_eq!(run_ed25519_kats(), Ok(()));
+    }
+
+    /// The seed of the generated inputs; any fixed value serves.
+    const SEED: u64 = 0x5e4a_ed25;
+
+    fn verdict(result: Result<(), VerifyError>) -> Verdict
+    {
+        match result
+        {
+            Ok(()) => Verdict::Accept,
+            Err(VerifyError::NonCanonicalS) => Verdict::NonCanonicalS,
+            Err(VerifyError::BadPublicKey) => Verdict::BadPublicKey,
+            Err(VerifyError::Mismatch) => Verdict::Mismatch,
+        }
+    }
+
+    fn ours(input: &Input) -> Verdict
+    {
+        verdict(ed25519_verify(
+            &input.public_key,
+            &input.message,
+            &input.signature,
+        ))
+    }
+
+    /// A Wycheproof case's key and signature at the lengths the API takes;
+    /// `None` for any other length, which the API's types refuse.
+    fn sized(group: &eddsa::Group, case: &eddsa::Case) -> Option<([u8; 32], [u8; 64])>
+    {
+        let key = <[u8; 32]>::try_from(group.public_key.pk.as_slice()).ok()?;
+        let signature = <[u8; 64]>::try_from(case.sig.as_slice()).ok()?;
+        Some((key, signature))
+    }
+
+    /// Every Wycheproof Ed25519 case: valid ones verify, invalid ones are
+    /// refused, and an acceptable one (a small- or mixed-order key) verifies
+    /// exactly when the cofactorless equation holds, which the reference
+    /// judges.
+    #[test]
+    fn verify_passes_every_wycheproof_case()
+    {
+        let file = wycheproof::load::<eddsa::Group>(&wycheproof::ED25519).unwrap();
+        let report = wycheproof::run(
+            &file,
+            "wycheproof ed25519",
+            |group, case| {
+                sized(group, case)
+                    .is_some_and(|(key, sig)| ed25519_verify(&key, &case.msg, &sig).is_ok())
+            },
+            |group, case| {
+                sized(group, case).is_some_and(|(key, sig)| {
+                    reference::reference(&key, &case.msg, &sig) == Verdict::Accept
+                })
+            },
+        );
+        assert!(report.agrees(), "{report}");
+    }
+
+    #[test]
+    fn verify_agrees_with_the_reference_on_generated_inputs()
+    {
+        let report = differential::compare(
+            "ed25519 generated",
+            reference::generated(SEED, 128),
+            ours,
+            Input::reference,
+        );
+        assert!(report.agrees(), "{report}");
+    }
+
+    #[test]
+    fn verify_agrees_with_the_reference_on_the_edge_cases()
+    {
+        let report = differential::compare(
+            "ed25519 edge cases",
+            reference::edge_cases(),
+            ours,
+            Input::reference,
+        );
+        assert!(report.agrees(), "{report}");
     }
 }

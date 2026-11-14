@@ -24,18 +24,26 @@
 //! parses as a call, and a data object the first walk declared hides a
 //! method of the same name in an enclosing scope.
 //!
-//! The first walk reads in table order too, so a reference it meets before
-//! the definition of the data object it names resolves, in that walk, to a
-//! method of that name in an enclosing scope defined earlier, and reads as a
-//! call of it. When that reading ends the term list with a fault whose end
-//! is not known, the data object is not declared, and the second walk reads
-//! the same call. Otherwise the first walk goes on to declare the data
-//! object, and the second reads the name as a reference to it. Where the
-//! walks read a term differently, the first may declare a name the second
-//! never defines. A node is never removed: a
-//! placeholder the second walk does not define, by a fault or by such a
-//! reading, keeps [`Data::Uninitialized`], so every reference resolved to it
-//! stays valid.
+//! Where a method call may stand, each walk reads a name as a call when the
+//! name, resolved from the term's scope and through any alias, is a method
+//! or a method's `External` ([`Namespace::method_args`]), and as a reference
+//! otherwise. A walk resolves it in the namespace as it stands when that
+//! walk reaches the term: in the first walk it holds the earlier tables'
+//! names and what the walk has declared so far in table order, and in the
+//! second every name the first walk declared. So a reference the first walk
+//! meets before the definition of the data object it names can read, in
+//! that walk, as a call of a method of that name defined earlier in an
+//! enclosing scope. The second walk reads it as a reference when the data
+//! object is declared by then in a scope the search reaches before the
+//! method's, as it is when the first walk declared it there, and as the same
+//! call when the search still finds the method. A fault that ends the term
+//! list holding the definition, before the definition is reached, keeps the
+//! first walk from declaring it; a definition in a list no fault ends, an
+//! enclosing list or a later `Scope` among them, is reached. Where the walks
+//! read a term differently, the first may declare a name the second never
+//! defines. A node is never removed: a placeholder the second walk does not
+//! define, by a fault or by such a reading, keeps [`Data::Uninitialized`],
+//! so every reference resolved to it stays valid.
 //!
 //! A fault ends only the term list it is found in: a term whose end its
 //! `PkgLength` gives is skipped and the list continues after it, and any

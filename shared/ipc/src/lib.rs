@@ -88,7 +88,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 14;
+pub const PROCMGR_LABELS_VERSION: u32 = 15;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -102,7 +102,9 @@ pub mod procmgr_labels
     /// creator_endpoint?, argv_env?, death_relay?]`, `argv_env` present iff
     /// [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data words
     /// `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as for
-    /// [`CREATE_FROM_FILE`]. Label layout as for [`CREATE_FROM_FILE`].
+    /// [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
+    /// the next data word (word 0, or word 4 after the header). Label layout
+    /// and reply as for [`CREATE_FROM_FILE`].
     /// Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
     /// the returned badged `process_handle` — procmgr's CREATE path
@@ -127,11 +129,18 @@ pub mod procmgr_labels
     /// * bit `28` — [`CREATE_DMA_HOLD`]
     /// * bit `29` — [`CREATE_ARGV_ENV`]
     /// * bit `30` — [`CREATE_PHYS_ACCESS`]
-    /// * bits `[31..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `31` — [`CREATE_MEMORY_MAX`]
+    /// * bit `32` — [`CREATE_RESERVE`]
+    /// * bits `[33..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
     /// * `words 1..5` — the [`ArgvEnvHeader`] (only when [`CREATE_ARGV_ENV`] is set)
+    /// * the next word — the child's memory max in pages (only when
+    ///   [`CREATE_MEMORY_MAX`] is set): word 1, or word 5 after the header
+    ///
+    /// Reply: `data[0]` is the max the child's memmgr budget node took after
+    /// memmgr's clamp, `u64::MAX` for none.
     ///
     /// Caps: `[file_cap, creator_endpoint?, argv_env?, death_relay?]`. The
     /// `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`] is set, and
@@ -241,11 +250,32 @@ pub mod procmgr_labels
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
     /// (**physical-address flag**).
     pub const CREATE_PHYS_ACCESS: u64 = 1 << 30;
-    /// Still-reserved bits `[31..64]` of a create label. Procmgr rejects
+    /// Label flag (bit 31) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
+    /// request carries a memory max for the child, in pages, in one data word
+    /// after the others: after the [`ArgvEnvHeader`] when [`CREATE_ARGV_ENV`]
+    /// is set, so at word 0 or 4 of `CREATE_PROCESS` and at word 1 or 5 of
+    /// `CREATE_FROM_FILE`. procmgr registers the child's memmgr budget node
+    /// with that max (`memmgr_labels::REGISTER_MAX`), which memmgr clamps to
+    /// what the creator's node and every ancestor have left; the create reply
+    /// carries the max the node took in `data[0]`. A request that sets the
+    /// flag without delivering the word is refused (`INVALID_ARGUMENT`).
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
+    /// `CREATE_PROCESS` (**Memory max and reserve**).
+    pub const CREATE_MEMORY_MAX: u64 = 1 << 31;
+    /// Label flag (bit 32) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// make the child's memmgr budget node a system-reserve node
+    /// (`memmgr_labels::REGISTER_RESERVE`). Honoured only from a creator
+    /// whose own node is a reserve node; procmgr refuses it from any other
+    /// creator (`INVALID_ARGUMENT`). A child of an un-badged creator (init)
+    /// is a reserve node with or without it. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+    /// (**Memory max and reserve**).
+    pub const CREATE_RESERVE: u64 = 1 << 32;
+    /// Still-reserved bits `[33..64]` of a create label. Procmgr rejects
     /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
     /// addition is provably additive: existing senders are known to send
     /// zeros.
-    pub const CREATE_RESERVED_MASK: u64 = !((1 << 31) - 1);
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 33) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 

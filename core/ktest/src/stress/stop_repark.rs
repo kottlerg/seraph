@@ -45,7 +45,11 @@
 //! and after the cancellation. After the rounds, with the sender paused, the
 //! controller delivers to A and to B until the waiter has consumed a delivery
 //! on each (bounded by [`FINAL_POLLS`]): a lost wake or a stranded waiter
-//! makes no progress on one of them.
+//! makes no progress on one of them. A failed final check logs the rounds'
+//! tallies and probes the waiter ([`probe_waiter`]) before the children end,
+//! so the log names where it was stranded; and a wait that returned a wrong
+//! result is reported in its place, since it sends the waiter on to the
+//! source the check no longer delivers to.
 //!
 //! Required, per phase: every wait returned its own source's bits or payload
 //! or `Interrupted`; every delivery by the sender succeeded; the waiter
@@ -233,6 +237,36 @@ fn phases(ctx: &TestContext) -> TestResult
 /// delivered on during the rounds, and some stop cancelled a wait.
 fn report(seen: &Seen) -> TestResult
 {
+    log_seen(seen);
+    check_bad_waits()?;
+    BAD_SENDS.check(CELL, "stress::stop_repark: a delivery by the sender failed")?;
+    if seen.delivered.contains(&0)
+    {
+        return Err(
+            "stress::stop_repark: the waiter consumed no delivery on a source during the \
+             rounds",
+        );
+    }
+    if seen.interrupted.iter().all(|&n| n == 0)
+    {
+        return Err("stress::stop_repark: no stop interrupted a wait (never armed)");
+    }
+    Ok(())
+}
+
+/// Fail, logging the count and a witness, if a wait returned neither its
+/// source's delivery nor `Interrupted`.
+fn check_bad_waits() -> TestResult
+{
+    BAD_WAITS.check(
+        CELL,
+        "stress::stop_repark: a wait returned neither its source's delivery nor Interrupted",
+    )
+}
+
+/// Log what a phase's rounds saw.
+fn log_seen(seen: &Seen)
+{
     for (label, value) in [
         ("ktest: stress::stop_repark delivered_a=", seen.delivered[0]),
         ("ktest: stress::stop_repark delivered_b=", seen.delivered[1]),
@@ -249,23 +283,64 @@ fn report(seen: &Seen) -> TestResult
     {
         crate::log_u64(label, u64::from(value));
     }
-    BAD_WAITS.check(
-        CELL,
-        "stress::stop_repark: a wait returned neither its source's delivery nor Interrupted",
-    )?;
-    BAD_SENDS.check(CELL, "stress::stop_repark: a delivery by the sender failed")?;
-    if seen.delivered.contains(&0)
+}
+
+/// After a failed final check, log where the waiter is and what one more
+/// stop and restart of it does, so the failure's log names the strand: the
+/// counters' totals, which the entry count's parity places on a source (the
+/// `n`th wait, counting from 1, is on source `(n - 1) % 2`), the stop's and
+/// the start's results (`InvalidState` from the stop means the waiter was
+/// left `Stopped`), and, once restarted, whether it enters another wait
+/// (bounded by [`EXIT_POLLS`]) and how the stranded wait returned: an
+/// interrupt on its source means it was parked where no delivery reached
+/// it, a delivery means its wake was claimed but never made, and no new
+/// entry means it is not dispatched.
+fn probe_waiter(waiter: u64)
+{
+    let log_counts = |stage: &str| {
+        let counts = [
+            (" waits_entered=", WAITS_ENTERED.load(Ordering::Acquire)),
+            (" delivered_a=", DELIVERED[0].load(Ordering::Acquire)),
+            (" delivered_b=", DELIVERED[1].load(Ordering::Acquire)),
+            (" interrupted_a=", INTERRUPTED[0].load(Ordering::Acquire)),
+            (" interrupted_b=", INTERRUPTED[1].load(Ordering::Acquire)),
+        ];
+        for (label, value) in counts
+        {
+            crate::log_args(format_args!("ktest: {CELL} {stage}{label}{value}"));
+        }
+    };
+    log_counts("stranded");
+    let entered = WAITS_ENTERED.load(Ordering::Acquire);
+    let stopped = thread_stop(waiter);
+    log_result("probe stop", stopped);
+    let started = thread_start(waiter);
+    log_result("probe start", started);
+    let mut moved = false;
+    for _ in 0..crate::scaled_polls(EXIT_POLLS)
     {
-        return Err(
-            "stress::stop_repark: the waiter consumed no delivery on a source during the \
-             rounds",
-        );
+        if WAITS_ENTERED.load(Ordering::Acquire) != entered
+        {
+            moved = true;
+            break;
+        }
+        if thread_sleep(1).is_err()
+        {
+            break;
+        }
     }
-    if seen.interrupted.iter().all(|&n| n == 0)
-    {
-        return Err("stress::stop_repark: no stop interrupted a wait (never armed)");
-    }
-    Ok(())
+    crate::log_args(format_args!(
+        "ktest: {CELL} probe entered another wait={moved}"
+    ));
+    log_counts("restarted");
+}
+
+/// Log a probe call's result: 0, or its error word.
+fn log_result(stage: &str, result: Result<(), i64>)
+{
+    #[expect(clippy::cast_sign_loss, reason = "the raw error word is only logged")]
+    let word = result.err().map_or(0, |e| e as u64);
+    crate::log_args(format_args!("ktest: {CELL} {stage}={word}"));
 }
 
 /// One phase: create the sources and the children, run the rounds, pause
@@ -298,9 +373,21 @@ fn phase(ctx: &TestContext, kind: Kind) -> Result<Seen, &'static str>
         };
         let paused = pause_sender();
         let checked = final_check(kind, sources);
+        if checked.is_err()
+        {
+            log_seen(&seen);
+            probe_waiter(waiter);
+        }
         let ended = finish(kind, sources);
         ran?;
         paused?;
+        if checked.is_err()
+        {
+            // A wait that returned a wrong result sends the waiter on to the
+            // source the check no longer delivers to, so the check fails
+            // after it; name the wrong result instead.
+            check_bad_waits()?;
+        }
         checked?;
         ended?;
         Ok(seen)

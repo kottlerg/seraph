@@ -303,7 +303,7 @@ impl<'a> Iterator for RenderedFields<'a>
             (
                 RenderedValue { raw, quoted: true },
                 // `rest` starts with the closing quote.
-                rest.strip_prefix('"').unwrap_or(rest),
+                rest.trim_prefix('"'),
             )
         }
         else

@@ -6,8 +6,9 @@
 //! Central entropy pool.
 //!
 //! A single forward-secure sponge that accumulates entropy from every source
-//! (firmware boot seed, hardware RNG, timing jitter, and the VMGENID GUID
-//! where present) and hands seed material to the per-CPU generators. Guarded
+//! (firmware boot seed, hardware RNG, timing jitter, the VMGENID GUID where
+//! present, and the bytes `SYS_ENTROPY_CONTRIBUTE` passes) and hands seed
+//! material to the per-CPU generators. Guarded
 //! by a leaf spinlock; its locking and non-exposure invariants are specified
 //! in `core/kernel/docs/entropy.md` § Central pool and multi-source mixing.
 //!

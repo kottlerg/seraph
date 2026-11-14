@@ -652,7 +652,9 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     // The range lies wholly in the user range, checked before the mapping is
     // recorded, so a refusal changes nothing.
     let page_count = (mmio_size / PAGE_BYTES) as usize;
-    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
+    // The walk below covers the range clamped as data
+    // (`mm::user_page_range`).
+    let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
     // The region's physical end. A device region the kernel provisioned
     // cannot pass the end of the address space; the check refuses one that
     // would rather than wrap it.

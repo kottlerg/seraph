@@ -53,6 +53,7 @@ members = [
     "shared/ansi",
     "shared/crash-report",
     "shared/crypto",
+    "shared/crypto/testkit",
     "shared/death-set",
     "shared/driver-binding",
     "shared/elf",

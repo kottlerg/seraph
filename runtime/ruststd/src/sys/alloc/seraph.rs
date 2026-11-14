@@ -150,7 +150,7 @@ impl<T> crate::ops::Deref for SpinGuard<'_, T> {
     fn deref(&self) -> &T {
         // SAFETY: this guard holds the lock, so no other reference to the
         // value exists.
-        unsafe { &*self.mutex.value.get() }
+        unsafe { self.mutex.value.as_ref_unchecked() }
     }
 }
 
@@ -158,7 +158,7 @@ impl<T> crate::ops::DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: this guard holds the lock, so no other reference to the
         // value exists.
-        unsafe { &mut *self.mutex.value.get() }
+        unsafe { self.mutex.value.as_mut_unchecked() }
     }
 }
 

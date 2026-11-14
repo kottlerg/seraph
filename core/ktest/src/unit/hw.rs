@@ -97,6 +97,57 @@ pub fn mmio_map(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// `mmio_map` at VA 0, and at the page below `USER_VA_FLOOR`, fails with
+/// `InvalidAddress`.
+///
+/// Maps through a derived copy of the `Mmio` capability for the probe
+/// register page (`crate::arch::MMIO_PROBE_PHYS`). The copy has its own
+/// object, so the boot capability and its mappings (the riscv64 serial
+/// console's) are untouched, and the copy's delete withdraws anything the call
+/// mapped. Skipped if the boot config has no probe `Mmio`.
+pub fn mmio_map_below_floor_err(ctx: &TestContext) -> TestResult
+{
+    const REFUSED: Result<(), i64> = Err(SyscallError::InvalidAddress as i64);
+    // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+    // ktest's lifetime.
+    let info = unsafe { &*(ctx.init_info_va as *const init_protocol::InitInfo) };
+    let Some(boot_cap) = crate::init_info::descriptors(info)
+        .iter()
+        .find(|d| {
+            d.cap_type == init_protocol::CapType::Mmio && d.aux0 == crate::arch::MMIO_PROBE_PHYS
+        })
+        .map(|d| d.slot)
+    else
+    {
+        crate::log("ktest: hw::mmio_map_below_floor_err SKIP (no probe Mmio cap)");
+        return Ok(());
+    };
+    let copy = syscall::cap_derive(boot_cap, syscall::RIGHTS_ALL)
+        .map_err(|_| "hw::mmio_map_below_floor_err: cap_derive failed")?;
+
+    // SAFETY: the span starts below `USER_VA_FLOOR`, which the kernel refuses
+    // (the test's premise), so the call maps nothing.
+    let at_zero = unsafe { syscall::mmio_map(ctx.aspace_cap, copy, 0, 0) };
+    let below = syscall_abi::USER_VA_FLOOR - syscall_abi::PAGE_SIZE;
+    // SAFETY: as above.
+    let below_floor = unsafe { syscall::mmio_map(ctx.aspace_cap, copy, below, 0) };
+    syscall::cap_delete(copy).ok();
+
+    if at_zero != REFUSED
+    {
+        return Err(
+            "hw::mmio_map_below_floor_err: mmio_map at VA 0 did not fail with InvalidAddress",
+        );
+    }
+    if below_floor != REFUSED
+    {
+        return Err(
+            "hw::mmio_map_below_floor_err: mmio_map below the floor did not fail with InvalidAddress",
+        );
+    }
+    Ok(())
+}
+
 // ── SYS_IRQ_REGISTER / SYS_IRQ_ACK ───────────────────────────────────────────
 
 /// `irq_register` binds a notification to an interrupt; `irq_ack` re-enables delivery.

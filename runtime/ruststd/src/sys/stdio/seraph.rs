@@ -68,7 +68,7 @@ fn pipe_for(idx: usize) -> Option<&'static Pipe> {
     // the slots before flipping the flag (Release). We hold a shared
     // reference that lasts the process lifetime; no further writes
     // occur after init.
-    let slots = unsafe { &*STDIO.0.get() };
+    let slots = unsafe { STDIO.0.as_ref_unchecked() };
     slots.get(idx).and_then(|s| s.as_ref())
 }
 
@@ -113,7 +113,7 @@ pub fn stdio_init(
     // SAFETY: single writer; runs before `STDIO_READY` is observed by
     // any other code path.
     unsafe {
-        let slots = &mut *STDIO.0.get();
+        let slots = STDIO.0.as_mut_unchecked();
         slots[IDX_STDIN] = try_attach(
             stdin_memory,
             stdin_data_sig,
@@ -278,7 +278,7 @@ pub fn close_all() {
     }
     // SAFETY: a shared borrow, like `pipe_for`'s; nothing writes the slots
     // after `stdio_init`.
-    let slots = unsafe { &*STDIO.0.get() };
+    let slots = unsafe { STDIO.0.as_ref_unchecked() };
     for pipe in slots.iter().flatten() {
         pipe.close();
     }

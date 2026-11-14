@@ -1742,7 +1742,7 @@ pub mod ns_labels
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const FS_LABELS_VERSION: u32 = 5;
+pub const FS_LABELS_VERSION: u32 = 6;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
@@ -1926,6 +1926,28 @@ pub mod fs_labels
     /// cap). Every refusal deletes the carried SEND. Specified in
     /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
     pub const FS_OPEN: u64 = 18;
+    /// Unmount: the driver ends its service and exits.
+    ///
+    /// Request: un-badged, on the driver's service endpoint, as [`FS_MOUNT`];
+    /// `data[0]` = caller's compiled [`super::FS_LABELS_VERSION`]; the
+    /// [`UNMOUNT_FORCE`] flag in the label's flag bits. The driver releases
+    /// every open whose client is gone; when live opens remain and the
+    /// request is not forced, it replies `fs_errors::BUSY` with `data[0]` =
+    /// the live opens and keeps serving. Otherwise it releases every open,
+    /// as [`FS_CLOSE`] would, replies `fs_errors::SUCCESS`, and exits with
+    /// [`EXIT_UNMOUNTED`]. Specified in
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 19: `FS_UNMOUNT`.
+    pub const FS_UNMOUNT: u64 = 19;
+    /// [`FS_UNMOUNT`] flag: unmount with live opens, releasing them.
+    pub const UNMOUNT_FORCE: u64 = 1 << 16;
+    /// Exit code of a driver that replied to [`FS_UNMOUNT`] and exited: the
+    /// exit reason its death observers receive is
+    /// `syscall_abi::encode_exit_code` of it. Specified, with
+    /// [`EXIT_DEVICE_GONE`], in `services/fs/docs/fs-driver-protocol.md`
+    /// § Driver exit.
+    pub const EXIT_UNMOUNTED: u32 = 0;
+    /// Exit code of a driver that found its block device capability revoked.
+    pub const EXIT_DEVICE_GONE: u32 = 1;
 }
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
@@ -3859,6 +3881,9 @@ pub mod fs_errors
     /// `FS_WRITE` on a directory cap) or because the operation is
     /// permitted only on files.
     pub const IS_A_DIRECTORY: u64 = 12;
+    /// `FS_UNMOUNT` without `UNMOUNT_FORCE` refused: live opens remain;
+    /// `data[0]` carries their count.
+    pub const BUSY: u64 = 13;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

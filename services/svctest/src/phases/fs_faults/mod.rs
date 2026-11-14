@@ -18,17 +18,26 @@
 //! 4: `FS_WRITE`). Each case lives in its own directory, and its faults are
 //! armed on that directory's single sector, on its file's data sector, or on
 //! the cluster the directory grows into or `FS_MKDIR` takes.
+//!
+//! The driver's end is covered on the same device: a device that fails
+//! every request leaves the driver serving, and one whose block capability
+//! is revoked ends it once the request in flight is answered
+//! (services/fs/docs/fs-driver-protocol.md § Loss of the block device).
+//! `FS_UNMOUNT` is refused `BUSY` while an open is live, and with
+//! `UNMOUNT_FORCE` releases the opens and ends the driver (§ Label 19:
+//! `FS_UNMOUNT`). Every case that ends a driver ends its own.
 
 mod ramdisk;
 
 use std::sync::Arc;
 
-use ipc::{IpcMessage, fs_errors, procmgr_errors, procmgr_labels};
+use ipc::{IpcMessage, fs_errors, fs_labels, procmgr_errors, procmgr_labels};
 use namespace_protocol::{NamespaceRights, NodeId, NsError};
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
-    fs_create, fs_mkdir, fs_read_bytes, fs_remove, fs_rename, fs_write_inline,
+    fs_close, fs_create, fs_mkdir, fs_open_live, fs_read_bytes, fs_read_memory, fs_remove,
+    fs_rename, fs_write_inline,
 };
 use crate::ipc_util::ns::ns_lookup;
 use crate::runner::Phase;
@@ -56,12 +65,14 @@ const LFN_CHARS: usize = 13;
 const FAT16_EOC: u16 = 0xFFFF;
 /// Bytes one inline `FS_WRITE` carries and one `FS_READ` asks for.
 const CHUNK: usize = 504;
+/// How long a case waits for a driver it expects to exit.
+const EXIT_WAIT_MS: u64 = 10_000;
 
 /// Every case of the module docs, against one svctest-owned fatfs.
 pub fn fs_block_faults_phase(_: &Caps)
 {
     let disk = RamDisk::formatted();
-    let fs = OwnFatfs::start(&disk);
+    let mut fs = OwnFatfs::start(&disk);
 
     rename_undone_when_sfn_write_dropped(&fs, &disk);
     rename_undone_when_lfn_write_dropped(&fs, &disk);
@@ -76,9 +87,155 @@ pub fn fs_block_faults_phase(_: &Caps)
     dir_growth_links_only_zeroed_cluster(&fs, &disk);
     sparse_write_reads_zeros_in_its_gap(&fs, &disk);
     mkdir_dropped_dot_write_claims_no_cluster(&fs, &disk);
-
+    error_replies_keep_driver_serving(&fs, &disk);
+    revoked_block_cap_ends_driver(&mut fs, &disk);
     fs.stop();
+
+    unmount_busy_while_open_live();
+    unmount_forced_releases_opens();
     std::os::seraph::log!("fs_block_faults phase passed");
+}
+
+/// A device that fails every request answers each of fatfs's block calls
+/// with an error reply: the write fails `IO_ERROR`, the driver keeps
+/// serving, and once the device serves again so does the write.
+fn error_replies_keep_driver_serving(fs: &OwnFatfs, disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let (dir, _) = fs.case_dir(disk, b"E1");
+    let file = create_with_content(dir, b"E1.BIN");
+
+    lock(disk).fail_all();
+    let got = fs_write_inline(file, 0, CONTENT, ipc_buf);
+    lock(disk).serve_all();
+    assert_eq!(
+        got,
+        Err(fs_errors::IO_ERROR),
+        "E1: a write the failing device refused"
+    );
+    fs.expect_serving("E1: after an error reply");
+    assert_eq!(
+        fs_write_inline(file, 0, CONTENT, ipc_buf),
+        Ok(CONTENT.len() as u64),
+        "E1: a write once the device serves again"
+    );
+    let _ = syscall::cap_delete(file);
+    let _ = syscall::cap_delete(dir);
+}
+
+/// The device goes away: every capability derived from its endpoint,
+/// fatfs's block capability among them, is revoked. The write that finds
+/// the capability revoked is answered `IO_ERROR`, and the driver then exits
+/// with `fs_labels::EXIT_DEVICE_GONE`.
+fn revoked_block_cap_ends_driver(fs: &mut OwnFatfs, disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let (dir, _) = fs.case_dir(disk, b"D1");
+    let file = create_with_content(dir, b"D1.BIN");
+
+    fs.remove_device();
+    assert_eq!(
+        fs_write_inline(file, 0, CONTENT, ipc_buf),
+        Err(fs_errors::IO_ERROR),
+        "D1: a write after the device was revoked"
+    );
+    fs.expect_exit(
+        fs_labels::EXIT_DEVICE_GONE,
+        "D1: the driver after its device was revoked",
+    );
+    let _ = syscall::cap_delete(file);
+    let _ = syscall::cap_delete(dir);
+}
+
+/// `FS_UNMOUNT` without `UNMOUNT_FORCE` while one open is live is refused
+/// `BUSY` with a count of 1, an open whose client is gone not counted, and
+/// the open keeps working; an `FS_UNMOUNT` of another `FS_LABELS_VERSION` is
+/// refused before anything else. Once the open is closed, `FS_UNMOUNT`
+/// succeeds and the driver exits with `fs_labels::EXIT_UNMOUNTED`.
+fn unmount_busy_while_open_live()
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let disk = RamDisk::formatted();
+    let fs = OwnFatfs::start(&disk);
+    let live = create_with_content(fs.root, b"U1LIVE.TXT");
+    let dead = create_with_content(fs.root, b"U1DEAD.TXT");
+    let (open, liveness) = fs_open_live(live, 0, ipc_buf).expect("U1: FS_OPEN of the live open");
+    let (dead_open, dead_liveness) =
+        fs_open_live(dead, 0, ipc_buf).expect("U1: FS_OPEN of the dead open");
+    // The dead open's client is gone once no copy of its liveness cap is
+    // left outside the driver.
+    let _ = syscall::cap_delete(dead_liveness);
+
+    assert_eq!(
+        fs.unmount(0, ipc::FS_LABELS_VERSION.wrapping_add(1)).0,
+        fs_errors::LABEL_VERSION_MISMATCH,
+        "U1: FS_UNMOUNT of another protocol version"
+    );
+    assert_eq!(
+        fs.unmount(0, ipc::FS_LABELS_VERSION),
+        (fs_errors::BUSY, 1),
+        "U1: (label, live opens) of FS_UNMOUNT with one live open"
+    );
+    fs.expect_serving("U1: after BUSY");
+    assert_eq!(
+        fs_read_bytes(open, 0, CONTENT.len() as u64, ipc_buf).as_deref(),
+        Ok(CONTENT),
+        "U1: a read through the open after BUSY"
+    );
+    assert_eq!(
+        fs_close(open, ipc_buf),
+        fs_errors::SUCCESS,
+        "U1: FS_CLOSE of the live open"
+    );
+    assert_eq!(
+        fs.unmount(0, ipc::FS_LABELS_VERSION).0,
+        fs_errors::SUCCESS,
+        "U1: FS_UNMOUNT with no live open"
+    );
+    fs.expect_exit(fs_labels::EXIT_UNMOUNTED, "U1: the driver after FS_UNMOUNT");
+    for cap in [open, liveness, dead_open, live, dead]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    fs.stop();
+}
+
+/// `FS_UNMOUNT` with `UNMOUNT_FORCE` while an open is live and holds a
+/// page succeeds: before its reply the driver revokes the open's liveness
+/// cap and the page cap, and it then exits with `fs_labels::EXIT_UNMOUNTED`.
+fn unmount_forced_releases_opens()
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let disk = RamDisk::formatted();
+    let fs = OwnFatfs::start(&disk);
+    let file = create_with_content(fs.root, b"U2.TXT");
+    let (open, liveness) = fs_open_live(file, 0, ipc_buf).expect("U2: FS_OPEN");
+    let (page, _) = fs_read_memory(open, 0, 1, ipc_buf).expect("U2: FS_READ_MEMORY");
+    assert_ne!(page, 0, "U2: FS_READ_MEMORY returned no page");
+
+    assert_eq!(
+        fs.unmount(fs_labels::UNMOUNT_FORCE, ipc::FS_LABELS_VERSION)
+            .0,
+        fs_errors::SUCCESS,
+        "U2: forced FS_UNMOUNT with a live open"
+    );
+    assert!(
+        !cap_live(liveness),
+        "U2: the open's liveness cap outlived the forced unmount"
+    );
+    assert!(
+        !cap_live(page),
+        "U2: the open's page cap outlived the forced unmount"
+    );
+    fs.expect_exit(
+        fs_labels::EXIT_UNMOUNTED,
+        "U2: the driver after a forced FS_UNMOUNT",
+    );
+    for cap in [page, liveness, open, file]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    fs.stop();
 }
 
 /// The source's only LFN write is dropped, and the device would fail a read
@@ -610,6 +767,13 @@ fn mkdir_dropped_dot_write_claims_no_cluster(fs: &OwnFatfs, disk: &SharedDisk)
 
 // ── Case helpers ───────────────────────────────────────────────────────────
 
+/// Whether `cap` still names a capability in this `CSpace`: one its
+/// deriver revoked does not.
+fn cap_live(cap: u64) -> bool
+{
+    syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok()
+}
+
 /// LFN slots fatfs writes for `name`, which is not a strict 8.3 name.
 fn lfn_slots(name: &[u8]) -> usize
 {
@@ -735,9 +899,13 @@ struct OwnFatfs
     service: u64,
     /// Full-rights cap on the volume's root directory.
     root: u64,
+    /// Event queue bound to the driver's main thread: its exit reason.
+    deaths: u64,
     block_ep: u64,
     block_stop: u64,
-    server: std::thread::JoinHandle<()>,
+    block_gone: u64,
+    /// The block server, until the device is stopped or removed.
+    server: Option<std::thread::JoinHandle<()>>,
 }
 
 impl OwnFatfs
@@ -754,6 +922,9 @@ impl OwnFatfs
         let block_stop =
             syscall::cap_derive_badge(block_ep, syscall::RIGHTS_EP_SEND, ramdisk::STOP_BADGE)
                 .expect("fs_block_faults: block stop SEND derive failed");
+        let block_gone =
+            syscall::cap_derive_badge(block_ep, syscall::RIGHTS_EP_SEND, ramdisk::GONE_BADGE)
+                .expect("fs_block_faults: block gone SEND derive failed");
         let server_disk = Arc::clone(disk);
         let server = std::thread::Builder::new()
             .name("fs_faults_blk".into())
@@ -766,7 +937,8 @@ impl OwnFatfs
         let creator_ep = new_endpoint();
         let creator = syscall::cap_derive_badge(creator_ep, syscall::RIGHTS_EP_SEND, CREATOR_BADGE)
             .expect("fs_block_faults: creator SEND derive failed");
-        let process = spawn_fatfs(creator);
+        let deaths = new_death_queue();
+        let process = spawn_fatfs(creator, deaths);
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
         unsafe {
             ipc::bootstrap::serve_round(
@@ -802,10 +974,67 @@ impl OwnFatfs
             process,
             service,
             root,
+            deaths,
             block_ep,
             block_stop,
-            server,
+            block_gone,
+            server: Some(server),
         }
+    }
+
+    /// Send `FS_UNMOUNT` with the label flags `flags` and `version` in
+    /// `data[0]`; returns the reply's label and `data[0]`.
+    fn unmount(&self, flags: u64, version: u32) -> (u64, u64)
+    {
+        let ipc_buf = std::os::seraph::current_ipc_buf();
+        let send = syscall::cap_derive(self.service, syscall::RIGHTS_EP_SEND)
+            .expect("fs_block_faults: service SEND derive failed");
+        let msg = IpcMessage::builder(fs_labels::FS_UNMOUNT | flags)
+            .word(0, u64::from(version))
+            .build();
+        // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(send, &msg, ipc_buf) }
+            .expect("fs_block_faults: FS_UNMOUNT ipc_call failed");
+        let _ = syscall::cap_delete(send);
+        (reply.label, reply.word(0))
+    }
+
+    /// Take the device away: the block server revokes every capability
+    /// derived from its endpoint, the driver's among them, and stops.
+    fn remove_device(&mut self)
+    {
+        let ipc_buf = std::os::seraph::current_ipc_buf();
+        // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+        unsafe { ipc::ipc_call(self.block_gone, &IpcMessage::new(0), ipc_buf) }
+            .expect("fs_block_faults: removing the block device failed");
+        self.server
+            .take()
+            .expect("fs_block_faults: the block device was already stopped")
+            .join()
+            .expect("fs_block_faults: block server thread panicked");
+    }
+
+    /// The driver's main thread has not exited.
+    fn expect_serving(&self, what: &str)
+    {
+        assert_eq!(
+            syscall::event_try_recv_death(self.deaths),
+            Err(syscall_abi::SyscallError::WouldBlock as i64),
+            "{what}: the driver exited"
+        );
+    }
+
+    /// The driver's main thread exits, within [`EXIT_WAIT_MS`], with the
+    /// voluntary exit `code`.
+    fn expect_exit(&self, code: u32, what: &str)
+    {
+        let death = syscall::event_recv_entry(self.deaths, EXIT_WAIT_MS)
+            .map(|entry| syscall::DeathEvent::from_entry(entry).exit_reason);
+        assert_eq!(
+            death,
+            Ok(syscall_abi::encode_exit_code(code)),
+            "{what}: exit reason"
+        );
     }
 
     /// `FS_MKDIR` `name` in the root; returns the directory's cap and the
@@ -833,7 +1062,8 @@ impl OwnFatfs
         (cap, RamDisk::cluster_lba(cluster))
     }
 
-    /// Destroy the driver, then stop and join the block server.
+    /// Destroy the driver, whether or not it has exited, then stop and join
+    /// the block server unless the device was removed.
     fn stop(self)
     {
         let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -849,17 +1079,22 @@ impl OwnFatfs
             matches!(destroyed, Ok(ref r) if r.label == procmgr_errors::SUCCESS),
             "fs_block_faults: DESTROY_PROCESS of the driver failed"
         );
-        // SAFETY: as above.
-        unsafe { ipc::ipc_call(self.block_stop, &IpcMessage::new(0), ipc_buf) }
-            .expect("fs_block_faults: stopping the block server failed");
-        self.server
-            .join()
-            .expect("fs_block_faults: block server thread panicked");
+        if let Some(server) = self.server
+        {
+            // SAFETY: as above.
+            unsafe { ipc::ipc_call(self.block_stop, &IpcMessage::new(0), ipc_buf) }
+                .expect("fs_block_faults: stopping the block server failed");
+            server
+                .join()
+                .expect("fs_block_faults: block server thread panicked");
+        }
         for cap in [
             self.process,
             self.root,
             self.service,
+            self.deaths,
             self.block_stop,
+            self.block_gone,
             self.block_ep,
         ]
         {
@@ -876,10 +1111,20 @@ fn new_endpoint() -> u64
     .expect("fs_block_faults: endpoint creation failed")
 }
 
+/// An event queue with room for the one death its one binding posts.
+fn new_death_queue() -> u64
+{
+    let bytes = syscall_abi::event_queue_retype_bytes(1, 1);
+    std::os::seraph::object_slab_retype(bytes, |slab| {
+        syscall::event_queue_create_observed(slab, 1, 1).ok()
+    })
+    .expect("fs_block_faults: death queue creation failed")
+}
+
 /// Create and start a fatfs process with `creator` as its creator endpoint
-/// (`CREATE_FROM_FILE`, services/procmgr/docs/ipc-interface.md); returns
-/// its process handle.
-fn spawn_fatfs(creator: u64) -> u64
+/// (`CREATE_FROM_FILE`, services/procmgr/docs/ipc-interface.md), its main
+/// thread bound to `deaths` before it starts; returns its process handle.
+fn spawn_fatfs(creator: u64, deaths: u64) -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let (file, size) = std::os::seraph::namespace_lookup_file(
@@ -909,6 +1154,8 @@ fn spawn_fatfs(creator: u64) -> u64
             other.len()
         ),
     };
+    syscall::thread_bind_notification(thread, deaths, 0)
+        .expect("fs_block_faults: binding the driver's death failed");
     let _ = syscall::cap_delete(thread);
     // SAFETY: as above.
     let started = unsafe {

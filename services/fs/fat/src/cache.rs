@@ -66,7 +66,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{mem_map_funded, reserve_pages};
 use std::sync::{Mutex, OnceLock, PoisonError};
-use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
+use syscall_abi::{MAP_WRITABLE, PAGE_SIZE, SyscallError};
 
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
 
@@ -970,10 +970,10 @@ fn fill_via_block_dev(
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
+    let Some(reply) = (unsafe { block_call(block_dev, &msg, ipc_buf) })
     else
     {
-        // Cap was moved out and never returned (kernel-level failure).
+        // The call failed, and the cap may have gone with the request.
         // Mark the slot as having no cap so it won't be reused for fills.
         slot.memory_cap.store(0, Ordering::Release);
         return false;
@@ -1007,7 +1007,7 @@ fn writeback_via_block_dev(
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
+    let Some(reply) = (unsafe { block_call(block_dev, &msg, ipc_buf) })
     else
     {
         scratch.cap.store(0, Ordering::Release);
@@ -1038,7 +1038,7 @@ fn read_one_via_block_dev(
         .cap(cap)
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) })
+    let Some(reply) = (unsafe { block_call(block_dev, &msg, ipc_buf) })
     else
     {
         scratch.cap.store(0, Ordering::Release);
@@ -1047,6 +1047,56 @@ fn read_one_via_block_dev(
     let returned = reply.caps().first().copied().unwrap_or(0);
     scratch.cap.store(returned, Ordering::Release);
     reply.label == blk_errors::SUCCESS && returned != 0
+}
+
+/// Set once a block call finds the block device capability revoked
+/// ([`block_call`]); never cleared, since a revoked capability does not
+/// come back.
+static DEVICE_GONE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the block device capability was found revoked: the driver has
+/// lost its device for good and exits once it has replied to the request
+/// in flight (services/fs/docs/fs-driver-protocol.md § Loss of the block
+/// device).
+pub fn device_gone() -> bool
+{
+    DEVICE_GONE.load(Ordering::Acquire)
+}
+
+/// Every request fatfs sends its block device: `msg` on `block_dev`, or
+/// `None` when the call fails or the device is gone ([`device_gone`]).
+///
+/// A failed call is told apart by the block capability itself. Once it
+/// names nothing (`InvalidCapability` from `SYS_CAP_INFO`), its holder
+/// revoked it: the device is gone for good, so the failure is logged once,
+/// [`device_gone`] turns true, and every later block call fails without a
+/// syscall. A failed call through a capability that still names its
+/// endpoint, and an error reply, are transient: the caller answers its
+/// request `IO_ERROR`, as for any failed block access.
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+pub unsafe fn block_call(block_dev: u64, msg: &IpcMessage, ipc_buf: *mut u64)
+-> Option<IpcMessage>
+{
+    if device_gone()
+    {
+        return None;
+    }
+    // SAFETY: the caller guarantees `ipc_buf` is this thread's registered IPC
+    // buffer page.
+    let err = match unsafe { ipc::ipc_call(block_dev, msg, ipc_buf) }
+    {
+        Ok(reply) => return Some(reply),
+        Err(err) => err,
+    };
+    if syscall::cap_info(block_dev, syscall::CAP_INFO_TAG_RIGHTS)
+        == Err(SyscallError::InvalidCapability as i64)
+    {
+        std::os::seraph::log!(error: "block device capability revoked (call err={err}); exiting");
+        DEVICE_GONE.store(true, Ordering::Release);
+    }
+    None
 }
 
 /// The pages of system RAM memmgr reports (`QUERY_POOL_STATUS` `data[0]`), or

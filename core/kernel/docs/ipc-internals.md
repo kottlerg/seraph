@@ -210,13 +210,18 @@ released.
    canceller, or the timer's expiry, owns the caller's wake) means no
    caller: still read the data words and pre-validate the reply cap slots,
    return the first error they raise, else InvalidCapability
-2. If caller_tcb is BlockedOnFault (a fault reply, whose caps the kernel
-   ignores): record RESUME, DECLINED for a FAULT_REPLY_KILL label, or,
-   for a FAULT_REPLY_FORWARD label, FORWARDED when caller_tcb's delivery
-   is of the VM class and DECLINED otherwise, in caller_tcb.fault_outcome;
-   for DECLINED or FORWARDED, deposit the label and data word 0 (the
-   decline reason, when sent and readable) in caller_tcb's ipc_msg; stamp
-   the episode, and go to step 6
+2. If caller_tcb is BlockedOnFault (a fault reply, `reply_to_fault`,
+   whose caps the kernel ignores but a REDIRECT reply's one): record
+   RESUME, DECLINED for a FAULT_REPLY_KILL label, FORWARDED for a
+   FAULT_REPLY_FORWARD label when caller_tcb's delivery is of the VM class
+   (DECLINED otherwise), or, for a FAULT_REPLY_REDIRECT label, REDIRECTED
+   once `stage_redirect` has taken a reference on the Endpoint the reply's
+   one cap names into caller_tcb.fault_redirect (REDIRECT_REFUSED, with
+   the reply returning the error, when it names none), in
+   caller_tcb.fault_outcome; for DECLINED, FORWARDED, or REDIRECTED,
+   deposit the label and data word 0 (the decline reason or the redirect
+   word, when sent and readable, by `deposit_reply_word`), with the named
+   cap's badge for REDIRECTED, in caller_tcb's ipc_msg; stamp the episode, and go to step 6
 3. Read the data words and pre-validate the reply cap slots; when caps are
    attached, pre-allocate the slots in the caller's CSpace (resolved
    through the registry from caller_tcb's cspace_id/epoch); on any of these
@@ -270,7 +275,7 @@ same `(*tcb).sched_lock`, which carries it to the refusing parker (see
 |---|---|---|
 | `sys_ipc_reply` normal arm | `reply_tcb` CAS won in `endpoint_reply` | episode + REPLY (after cap-result writes) |
 | `sys_ipc_reply` payload, cap-validation, pre-allocation, or cap-transfer refusal arm (`deposit_transfer_failed_reply`) | same CAS | episode + REPLY (the synthetic `IPC_REPLY_TRANSFER_FAILED` message, with no reply staged; the server receives the error) |
-| `sys_ipc_reply` fault arm | same CAS | episode only (`fault_outcome` carries RESUME, DECLINED, or FORWARDED; a DECLINED or FORWARDED reply's label and reason word go to `ipc_msg`) |
+| `sys_ipc_reply` fault arm (`reply_to_fault`) | same CAS | episode only (`fault_outcome` carries RESUME, DECLINED, FORWARDED, REDIRECTED, or REDIRECT_REFUSED; a DECLINED, FORWARDED, or REDIRECTED reply's label and word go to `ipc_msg`) |
 | `release_unreplied_caller` (`SYS_IPC_RECV` entry, a caller bound by an earlier unreplied receive) | `reply_tcb.swap(null)` non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `release_displaced_caller` after a try-once receive's rebind (`endpoint_try_recv`, a caller bound by an earlier unreplied receive) | the rebind's `reply_tcb.swap(sender)` returning non-null | episode + INTERRUPTED (faulter: episode + KILL) |
 | `cancel_for_timeout` (the sleep-list timer's expiry of a timed `SYS_IPC_CALL`, `SYS_IPC_RECV`, or `SYS_WAIT_SET_WAIT` park): the `cancel_ipc_block` BlockedOnSend, BlockedOnReply, BlockedOnRecv, and WaitSet arms, never a fault park | the claim of the same arm, gated on the popped park (`ipc_state` and `park_seq` unchanged; for a call, the same `call_episode` in its send or reply park) | episode + TIMED_OUT, with `wake_in_flight = 1` set in the claim's hold (kept, on the BlockedOnReply arm) for the timer's own `enqueue_and_wake`; the woken syscall returns `WouldBlock` ([thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Sleep List Invariants, invariant 6) |
@@ -303,10 +308,11 @@ resume), release builds fail closed with
 `Interrupted` rather than surfacing stale `ipc_msg` bytes as a success.
 `fault_dispatch`'s resume fails closed the same way: REDELIVER makes the delivery again under the
 binding current then, FORWARDED makes it again through the exception class (a decline for a
-kernel copy's fault), and any other `fault_outcome` than RESUME, a PENDING left by an unstamped
-wake included, is the unhandled outcome: it kills the thread, or, for the fault of a restartable
-syscall's user copy (`copy_fault_dispatch`), fails that syscall with `InvalidAddress`, or, for an
-upcall delivery, drops the upcall and resumes the thread (the `fault_outcome` row of
+kernel copy's fault), REDIRECTED makes it again to the endpoint in `fault_redirect`, and any other
+`fault_outcome` than RESUME, a PENDING left by an unstamped wake included, is the unhandled outcome:
+it kills the thread, or, for the fault of a restartable syscall's user copy
+(`copy_fault_dispatch`), fails that syscall with `InvalidAddress`, or, for an upcall
+delivery, drops the upcall and resumes the thread (the `fault_outcome` row of
 [scheduling-internals.md § Atomic Ordering Invariants](scheduling-internals.md#atomic-ordering-invariants)).
 
 **Resume (non-call parks — fail-open).** Each non-call parking syscall

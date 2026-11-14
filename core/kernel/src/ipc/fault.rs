@@ -25,6 +25,11 @@
 //! binding current when the faulting thread next runs; with none bound then,
 //! the fault takes the unhandled outcome.
 //!
+//! A handler's [`syscall::FAULT_REPLY_REDIRECT`] reply names an endpoint, which
+//! the reply leaves in the faulting thread's
+//! [`ThreadControlBlock::fault_redirect`]; [`fault_dispatch`] delivers the
+//! fault there next, in flight under the class of the delivery redirected.
+//!
 //! Delivery reuses the synchronous-IPC machinery: the faulting thread takes the
 //! caller role (parked in [`IpcThreadState::BlockedOnFault`] rather than
 //! `BlockedOnReply`) and the handler services it with the ordinary receive /
@@ -62,10 +67,24 @@ pub const FAULT_OUTCOME_DECLINED: u8 = 4;
 /// [`CLASS_EXCEPTION`] binding, with the reason word the reply deposited in
 /// the faulting thread's `ipc_msg` (docs/fault-handling.md § Reply).
 pub const FAULT_OUTCOME_FORWARDED: u8 = 5;
+/// [`ThreadControlBlock::fault_outcome`] value: the handler replied
+/// [`syscall::FAULT_REPLY_REDIRECT`] naming an endpoint, which the reply left
+/// in [`ThreadControlBlock::fault_redirect`] with the badge of the cap it
+/// named and its word in the faulting thread's `ipc_msg`; [`fault_dispatch`]
+/// delivers the fault there next (docs/fault-handling.md § Reply).
+pub const FAULT_OUTCOME_REDIRECTED: u8 = 6;
+/// [`ThreadControlBlock::fault_outcome`] value: the handler replied
+/// [`syscall::FAULT_REPLY_REDIRECT`] naming no endpoint it holds, so the
+/// fault is unhandled ([`KillCause::RedirectRefused`]).
+pub const FAULT_OUTCOME_REDIRECT_REFUSED: u8 = 7;
 
 /// [`deliver_once`]'s result when no binding was found: never a
 /// `fault_outcome` value, it reports [`KillCause::BindingCleared`].
 const DELIVERY_UNBOUND: u8 = u8::MAX;
+
+// A forward's reason and a redirect's word share data word 4, the word after
+// the four every fault message carries, so a delivery carries at most one.
+const _: () = assert!(syscall::FAULT_FORWARD_REASON_WORD == syscall::FAULT_REDIRECT_WORD);
 
 /// Number of fault classes a thread binds separately
 /// (docs/fault-handling.md § Fault-Handler Binding), and the length of the
@@ -184,6 +203,9 @@ pub enum KillCause
     /// No handler was bound for the fault's class when the architecture
     /// handler checked; nothing was delivered.
     NoHandler,
+    /// A handler replied [`syscall::FAULT_REPLY_REDIRECT`] without naming an
+    /// endpoint it holds.
+    RedirectRefused,
 }
 
 /// Print, on the kernel serial console, why the user-mode fault of the thread
@@ -219,6 +241,10 @@ pub fn report_user_kill(tid: u32, cause: KillCause)
         KillCause::NoHandler =>
         {
             crate::kprintln_serial!("fault unhandled: tid={tid} no handler bound");
+        }
+        KillCause::RedirectRefused =>
+        {
+            crate::kprintln_serial!("fault unhandled: tid={tid} handler redirect refused");
         }
     }
 }
@@ -278,12 +304,8 @@ pub unsafe fn has_handler(tcb: *mut ThreadControlBlock, kind: u64) -> bool
 /// own reference still holds the object: the binder releases the old binding's
 /// reference only after it unlocks.
 ///
-/// With a binding found, the same hold arms the in-flight markers:
-/// `fault_outcome = Pending`, so a stale prior disposition cannot be mistaken
-/// for this fault's (the single wake-claim winner overwrites it), and
-/// `in_fault_delivery`, so a dequeuing `endpoint_recv` parks the thread
-/// `BlockedOnFault` (not `BlockedOnReply`), with `fault_delivery_class`
-/// naming the class. All are written under the lock the binding is, so a
+/// With a binding found, the same hold arms the in-flight markers
+/// ([`arm_delivery`]). They are written under the lock the binding is, so a
 /// binder finds in its own hold whether a delivery through the binding it
 /// replaces is in flight ([`delivery_in_flight`]).
 ///
@@ -319,33 +341,72 @@ unsafe fn pin_binding(
         // SAFETY: a non-null fault_handlers entry read under sched_lock names
         // an endpoint the binding references, so it is live for inc_ref.
         unsafe { ep.as_ref() }.header.inc_ref();
-        #[expect(
-            clippy::multiple_unsafe_ops_per_block,
-            reason = "every access writes a fault-delivery marker of tcb, which the held \
-                      sched_lock serialises"
-        )]
-        // SAFETY: tcb is the running thread; the markers are its own until
-        // its delivery makes it wakeable, and are written under the held
-        // sched_lock.
-        unsafe {
-            (*tcb)
-                .fault_outcome
-                .store(FAULT_OUTCOME_PENDING, Ordering::Release);
-            (*tcb).in_fault_delivery = true;
-            #[expect(clippy::cast_possible_truncation, reason = "class < FAULT_CLASSES (3)")]
-            {
-                (*tcb).fault_delivery_class = class as u8;
-            }
-        }
+        // SAFETY: tcb is the running thread, whose sched_lock is held;
+        // class < FAULT_CLASSES (contract).
+        unsafe { arm_delivery(tcb, class) };
     }
     // SAFETY: paired with the lock_raw above.
     unsafe { sched_lock.unlock_raw(saved) };
     ep.map(|ep| (ep, badge))
 }
 
+/// Open a redirected delivery of `class` on `tcb`: arm its in-flight markers
+/// under `tcb`'s `sched_lock`, as [`pin_binding`] arms them for a delivery
+/// through a binding, so a change of `class`'s binding cancels this delivery
+/// as it cancels one made through that binding.
+///
+/// # Safety
+/// `tcb` must be the current CPU's running thread, with no lock held;
+/// `class < FAULT_CLASSES`.
+#[cfg(not(test))]
+unsafe fn open_redirect(tcb: *mut ThreadControlBlock, class: usize)
+{
+    // SAFETY: tcb is the running thread (contract).
+    let sched_lock = unsafe { &(*tcb).sched_lock };
+    // SAFETY: lock_raw is paired with the unlock_raw below.
+    let saved = unsafe { sched_lock.lock_raw() };
+    // SAFETY: tcb is the running thread, whose sched_lock is held;
+    // class < FAULT_CLASSES (contract).
+    unsafe { arm_delivery(tcb, class) };
+    // SAFETY: paired with the lock_raw above.
+    unsafe { sched_lock.unlock_raw(saved) };
+}
+
+/// Arm `tcb`'s in-flight markers for a delivery of `class`:
+/// `fault_outcome = Pending`, so a stale prior disposition cannot be mistaken
+/// for this delivery's (the single wake-claim winner overwrites it), and
+/// `in_fault_delivery`, so a dequeuing `endpoint_recv` parks the thread
+/// `BlockedOnFault` (not `BlockedOnReply`), with `fault_delivery_class`
+/// naming the class.
+///
+/// # Safety
+/// `tcb` must be the current CPU's running thread, whose `sched_lock` the
+/// caller holds; `class < FAULT_CLASSES`.
+#[cfg(not(test))]
+unsafe fn arm_delivery(tcb: *mut ThreadControlBlock, class: usize)
+{
+    #[expect(
+        clippy::multiple_unsafe_ops_per_block,
+        reason = "every access writes a fault-delivery marker of tcb, which the held sched_lock \
+                  serialises"
+    )]
+    // SAFETY: tcb is the running thread; the markers are its own until its
+    // delivery makes it wakeable, and are written under the held sched_lock.
+    unsafe {
+        (*tcb)
+            .fault_outcome
+            .store(FAULT_OUTCOME_PENDING, Ordering::Release);
+        (*tcb).in_fault_delivery = true;
+        #[expect(clippy::cast_possible_truncation, reason = "class < FAULT_CLASSES (3)")]
+        {
+            (*tcb).fault_delivery_class = class as u8;
+        }
+    }
+}
+
 /// Whether a fault delivery through `tcb`'s binding for `class` is in
-/// flight: opened by [`pin_binding`] and given no disposition yet by a wake
-/// claim.
+/// flight: opened by [`pin_binding`], or by [`open_redirect`] for a redirect
+/// of a delivery of `class`, and given no disposition yet by a wake claim.
 ///
 /// # Safety
 /// `tcb` must be a valid TCB whose `sched_lock` the caller holds.
@@ -498,9 +559,14 @@ pub unsafe fn release_endpoints(eps: [*mut EndpointObject; FAULT_CLASSES])
 /// its handler forwarded ([`FAULT_OUTCOME_FORWARDED`]) is made again through
 /// the [`CLASS_EXCEPTION`] binding, which every later pass of the fault uses,
 /// with the forwarder's reason as data word 4; with that binding cleared the
-/// fault takes the outcome of the forwarder's own decline. Every pass parks,
-/// and only a binding change or the one forward re-runs one, so the loop is
-/// iterative and bounded by the binder's changes.
+/// fault takes the outcome of the forwarder's own decline. A delivery its
+/// handler redirected ([`FAULT_OUTCOME_REDIRECTED`]) is made again to the
+/// endpoint the reply named ([`take_redirect`]), in flight under the class of
+/// the delivery redirected, so a change of that class's binding cancels it
+/// and the next pass goes back to that binding. Every pass parks, and only a
+/// binding change, the one forward, or a handler's redirecting reply re-runs
+/// one, so the loop is iterative and bounded by the binder's changes and the
+/// handlers' replies.
 ///
 /// # Preconditions
 /// - `tcb.trap_frame` already points at the canonical register frame the handler
@@ -520,7 +586,9 @@ pub unsafe fn fault_dispatch(tcb: *mut ThreadControlBlock, info: &FaultInfo) -> 
 /// [`fault_dispatch`] for the fault of a restartable syscall's user copy
 /// (docs/fault-handling.md § Kernel Copies): a forward of it is a decline,
 /// so the syscall fails with `InvalidAddress` and no exception handler sees a
-/// fault the thread survives (docs/fault-handling.md § Reply).
+/// fault the thread survives (docs/fault-handling.md § Reply). A redirect of
+/// it is delivered, and a resume from the endpoint it names restarts the
+/// syscall.
 ///
 /// # Safety
 /// As for [`fault_dispatch`].
@@ -557,15 +625,16 @@ unsafe fn dispatch(
 {
     let mut class = class_of_kind(info.kind);
     let mut forwarded = Forward::None;
+    let mut route = Route::Binding;
     loop
     {
         // SAFETY: this fn's contract and preconditions are deliver_once's;
-        // class < FAULT_CLASSES.
-        match unsafe { deliver_once(tcb, info, class, forwarded) }
+        // class < FAULT_CLASSES; a Redirect route's reference was taken from
+        // fault_redirect by take_redirect and is handed over here.
+        match unsafe { deliver_once(tcb, info, class, forwarded, route) }
         {
             FAULT_OUTCOME_RESUME => return FaultOutcome::Resume,
-            FAULT_OUTCOME_REDELIVER =>
-            {}
+            FAULT_OUTCOME_REDELIVER => route = Route::Binding,
             FAULT_OUTCOME_FORWARDED if forwarding == Forwarding::Declined =>
             {
                 // SAFETY: tcb resumed by the wake of the forwarding reply.
@@ -576,6 +645,21 @@ unsafe fn dispatch(
                 // SAFETY: tcb resumed by the wake of the forwarding reply.
                 forwarded = Forward::Reason(unsafe { reply_reason(tcb) });
                 class = CLASS_EXCEPTION;
+                route = Route::Binding;
+            }
+            FAULT_OUTCOME_REDIRECTED =>
+            {
+                // SAFETY: tcb resumed by the wake of the redirecting reply.
+                let Some(redirect) = (unsafe { take_redirect(tcb) })
+                else
+                {
+                    return FaultOutcome::Kill(KillCause::Cancelled);
+                };
+                route = redirect;
+            }
+            FAULT_OUTCOME_REDIRECT_REFUSED =>
+            {
+                return FaultOutcome::Kill(KillCause::RedirectRefused);
             }
             FAULT_OUTCOME_DECLINED =>
             {
@@ -608,8 +692,56 @@ enum Forward
     Reason(Option<u64>),
 }
 
-/// The reason word the declining or forwarding fault reply deposited in
-/// `tcb`'s `ipc_msg`, if the reply carried one.
+/// Where [`deliver_once`] makes its delivery.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+enum Route
+{
+    /// Through the binding of the pass's class.
+    Binding,
+    /// To the endpoint a redirecting reply named, with the badge of the cap
+    /// it named and the redirector's word.
+    Redirect
+    {
+        /// The endpoint, with a reference the pass owns and releases before
+        /// its park.
+        ep: core::ptr::NonNull<EndpointObject>,
+        /// The derivation badge of the cap the reply named.
+        badge: u64,
+        /// The redirector's data word 0, `0` when its reply carried none.
+        word: u64,
+    },
+}
+
+/// Take the redirect the reply that resumed `tcb` left: the endpoint from
+/// [`ThreadControlBlock::fault_redirect`], whose reference passes to the
+/// returned route, and the badge and word from `tcb`'s `ipc_msg`. `None`
+/// when no endpoint is left, which no reply that committed
+/// [`FAULT_OUTCOME_REDIRECTED`] produces.
+///
+/// # Safety
+/// `tcb` is the current CPU's running thread, resumed by the wake of a reply
+/// that committed [`FAULT_OUTCOME_REDIRECTED`], which wrote `fault_redirect`
+/// and `ipc_msg` as the winner of the episode's reply claim before the wake.
+#[cfg(not(test))]
+unsafe fn take_redirect(tcb: *mut ThreadControlBlock) -> Option<Route>
+{
+    // SAFETY: tcb is the running thread (contract); the field is atomic.
+    let ep = unsafe { &(*tcb).fault_redirect }.swap(core::ptr::null_mut(), Ordering::Acquire);
+    let ep = core::ptr::NonNull::new(ep);
+    debug_assert!(
+        ep.is_some(),
+        "fault_dispatch: redirect outcome with no endpoint"
+    );
+    // SAFETY: the contract above; nothing writes ipc_msg after the claim.
+    let badge = unsafe { (*tcb).ipc_msg.badge };
+    // SAFETY: as above.
+    let word = unsafe { reply_reason(tcb) }.unwrap_or(0);
+    ep.map(|ep| Route::Redirect { ep, badge, word })
+}
+
+/// The reason word the declining, forwarding or redirecting fault reply
+/// deposited in `tcb`'s `ipc_msg`, if the reply carried one.
 ///
 /// # Safety
 /// `tcb` is the current CPU's running thread, resumed by the wake of that
@@ -623,11 +755,14 @@ unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
     (reply.data_count > 0).then(|| reply.data[0])
 }
 
-/// Make one delivery of `info` through `tcb`'s binding for `class` and block
+/// Make one delivery of `info` by `route`, through `tcb`'s binding for
+/// `class` or to a redirect's endpoint in flight under `class`, and block
 /// until it is given a disposition, which is returned as its `fault_outcome`
 /// value, or return [`DELIVERY_UNBOUND`] when no binding was found. A
-/// `forwarded` delivery carries the forwarder's reason (`0` for none) as data
-/// word [`syscall::FAULT_FORWARD_REASON_WORD`].
+/// redirected delivery carries the redirector's word as data word
+/// [`syscall::FAULT_REDIRECT_WORD`]; a `forwarded` delivery through a binding
+/// carries the forwarder's reason (`0` for none) as data word
+/// [`syscall::FAULT_FORWARD_REASON_WORD`].
 ///
 /// Mirrors [`crate::syscall::ipc::sys_ipc_call`] but commits the
 /// [`IpcThreadState::BlockedOnFault`] state and reads the disposition from
@@ -635,7 +770,8 @@ unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
 ///
 /// The binding is read once, under `tcb`'s `sched_lock`, and its endpoint is
 /// pinned for the delivery ([`pin_binding`]); with none bound the result is
-/// [`DELIVERY_UNBOUND`] and nothing is delivered. The pin is released after
+/// [`DELIVERY_UNBOUND`] and nothing is delivered. A redirect's endpoint is
+/// pinned by the reference its route carries. The pin is released after
 /// the delivery and before the park's `schedule()` (the pin-before-park rule,
 /// core/kernel/docs/scheduling-internals.md § Lock Hierarchy rule 10): a
 /// release that drops the endpoint's last reference runs its teardown, whose
@@ -643,23 +779,44 @@ unsafe fn reply_reason(tcb: *mut ThreadControlBlock) -> Option<u64>
 /// queued there.
 ///
 /// # Safety
-/// As for [`fault_dispatch`]; `class < FAULT_CLASSES`.
+/// As for [`fault_dispatch`]; `class < FAULT_CLASSES`; a
+/// [`Route::Redirect`]'s endpoint reference is the caller's, handed over.
 #[cfg(not(test))]
 unsafe fn deliver_once(
     tcb: *mut ThreadControlBlock,
     info: &FaultInfo,
     class: usize,
     forwarded: Forward,
+    route: Route,
 ) -> u8
 {
-    // SAFETY: tcb is the current CPU's running thread; no lock is held; the
-    // class index is below FAULT_CLASSES (this fn's contract).
-    let Some((ep_obj, badge)) = (unsafe { pin_binding(tcb, class) })
-    else
+    let (ep_obj, badge, fifth) = match route
     {
-        return DELIVERY_UNBOUND;
+        Route::Binding =>
+        {
+            // SAFETY: tcb is the current CPU's running thread; no lock is
+            // held; the class index is below FAULT_CLASSES (this fn's
+            // contract).
+            let Some((ep, badge)) = (unsafe { pin_binding(tcb, class) })
+            else
+            {
+                return DELIVERY_UNBOUND;
+            };
+            let reason = match forwarded
+            {
+                Forward::Reason(reason) => Some(reason.unwrap_or(0)),
+                Forward::None => None,
+            };
+            (ep, badge, reason)
+        }
+        Route::Redirect { ep, badge, word } =>
+        {
+            // SAFETY: as for pin_binding above.
+            unsafe { open_redirect(tcb, class) };
+            (ep, badge, Some(word))
+        }
     };
-    // SAFETY: ep_obj is pinned by the reference pin_binding took.
+    // SAFETY: ep_obj is pinned by the delivery's reference.
     let ep_state = unsafe { ep_obj.as_ref().state };
 
     // Open the park episode (the fault protocol's disposition stays in
@@ -680,10 +837,10 @@ unsafe fn deliver_once(
     msg.data[2] = info.d2;
     msg.data[3] = info.ip;
     msg.data_count = 4;
-    if let Forward::Reason(reason) = forwarded
+    if let Some(word) = fifth
     {
-        msg.data[syscall::FAULT_FORWARD_REASON_WORD] = reason.unwrap_or(0);
-        msg.data_count = syscall::FAULT_FORWARD_REASON_WORD + 1;
+        msg.data[syscall::FAULT_REDIRECT_WORD] = word;
+        msg.data_count = syscall::FAULT_REDIRECT_WORD + 1;
     }
 
     // SAFETY: ep_state is a valid EndpointState (this delivery's pin keeps it
@@ -715,7 +872,8 @@ unsafe fn deliver_once(
     // Drop the delivery's pin before parking (rule 10): the park's binding now
     // keeps this thread reachable, and a release that frees the endpoint runs
     // its teardown here, which claims this thread if it is still queued.
-    // SAFETY: the reference pin_binding took is owned here; fault delivery on
+    // SAFETY: the delivery's reference (pin_binding's, or the one the redirect
+    // route handed over) is owned here; fault delivery on
     // the faulting thread with interrupts disabled, before its park, is the
     // stable-CPU context release_ref's # Safety lists; no lock is held.
     unsafe { crate::cap::object::release_ref(ep_obj.cast::<KernelObjectHeader>()) };

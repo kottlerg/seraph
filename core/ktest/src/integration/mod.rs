@@ -35,6 +35,7 @@ pub mod fault_handler_declines_kills;
 pub mod fault_handler_rebind;
 pub mod fault_kills_thread;
 pub mod fault_pager_roundtrip;
+pub mod fault_redirect;
 pub mod fault_resume_modifies_pc;
 pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
@@ -233,6 +234,7 @@ pub fn run_all(ctx: &TestContext)
         fault_handler_declines_kills::run(ctx)
     );
     run_integration_test!("integration::fault_forward", fault_forward::run(ctx));
+    run_integration_test!("integration::fault_redirect", fault_redirect::run(ctx));
     run_integration_test!(
         "integration::fault_handler_rebind",
         fault_handler_rebind::run(ctx)

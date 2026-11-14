@@ -56,7 +56,6 @@ pub struct Patterns
     closing_ref: Regex,
     refs_ref: Regex,
     refs_number: Regex,
-    refs_keyword: Regex,
     attribution: Regex,
     planning_label: Regex,
     subject_form: Regex,
@@ -96,7 +95,6 @@ impl Patterns
                 r"(?i)\brefs\s*:?\s*#\d+(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+(?:and[ \t]+)?)#\d+)*",
             )?,
             refs_number: Regex::new(r"#(\d+)")?,
-            refs_keyword: Regex::new(r"(?i)\brefs\b")?,
             attribution: Regex::new(
                 r"(?i)claude\.ai/|claude-session|co-authored-by:\s*claude|generated with \[?claude",
             )?,
@@ -581,18 +579,21 @@ fn check_refs_unread(pat: &Patterns, body: &str) -> Vec<Diag>
     for (index, line) in body.lines().enumerate()
     {
         let number = index.saturating_add(1);
-        let Some(keyword) = pat.refs_keyword.find(line)
+        // Only a line that holds a `Refs` list: the word alone (a rule name
+        // such as `pr-refs-rolling`, a `refs/heads/` path, `Refs` in prose)
+        // starts none, and its numbers are prose.
+        let Some(list) = pat.refs_ref.find(line)
         else
         {
             continue;
         };
-        // A `#N` of this repository after the `Refs` keyword that no list
-        // took: the list ended before it, at text between the numbers. A
-        // number before the keyword is prose, which no list could hold.
+        // A `#N` of this repository after the list's start that the list did
+        // not take: the list ended before it, at text between the numbers. A
+        // number before the list is prose, which no list could hold.
         let unread: Vec<String> = pat
             .issue_ref
             .captures_iter(line)
-            .filter(|found| found.get(0).is_some_and(|all| all.start() >= keyword.end()))
+            .filter(|found| found.get(0).is_some_and(|all| all.start() >= list.start()))
             .filter(|found| found.get(1).is_none() && found.get(3).is_none())
             .filter_map(|found| found.get(2)?.as_str().parse::<u64>().ok())
             .filter(|issue| !read.iter().any(|r| r.line == number && r.issue == *issue))
@@ -2005,6 +2006,10 @@ mod tests
             "Refs #11, #12 and #13",
             "Refs #11, owner/repo#12",
             "Refs #11\n\n**#12, `Refs` lists.** Prose.",
+            // The word with no list after it: a rule name, a path, prose.
+            "Refs #11\n\n- [x] `pr-refs-rolling` reports a rolling Issue (#12)",
+            "Refs #11\n\npushed to refs/heads/master (#12)",
+            "Refs #11\n\n`Refs` lists are read in full (#12)",
         ]
         {
             let body = BODY.replace("Refs #11", line);

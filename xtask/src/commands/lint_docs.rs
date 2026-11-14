@@ -1105,7 +1105,7 @@ fn screen_names(line: &str) -> Option<Vec<String>>
     }
     let quote = rest.chars().next().filter(|c| *c == '\'' || *c == '"')?;
     let value = rest.strip_prefix(quote)?.strip_suffix(quote)?;
-    let value = value.strip_prefix(&format!("${var}|")).unwrap_or(value);
+    let value = value.trim_prefix(&format!("${var}|"));
     Some(
         split_alternation(value)
             .into_iter()

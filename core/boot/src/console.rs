@@ -63,7 +63,7 @@ impl ConsoleCell
         // SAFETY: `busy` was clear and this call set it, so no other
         // reference into `state` is live: every access goes through
         // `try_with`, and an overlapping call returned above.
-        let result = f(unsafe { &mut *self.state.get() });
+        let result = f(unsafe { self.state.as_mut_unchecked() });
         self.busy.store(false, Ordering::Release);
         Some(result)
     }

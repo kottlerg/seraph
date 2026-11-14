@@ -294,7 +294,8 @@ for the snapshot-detection design.
 
 Same boot requirements as `test-terminal` (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI it runs as
-an additional boot inside the x86_64 `usertest` cell, after `test-terminal`.
+an additional boot inside the x86_64 `usertest` cell, after `test-terminal` and
+`test-wedge`.
 
 ### KASLR randomization (`test-kaslr`)
 
@@ -452,6 +453,41 @@ It needs a host GDB that debugs the guest architecture (`gdb` built with every t
 below). See [xtask/README.md § test-gdb](../xtask/README.md#cargo-xtask-test-gdb) for the
 command.
 
+### Interrupts-off wedge (`test-wedge`)
+
+The softlockup watchdog's heartbeat cross-checks report a CPU wedged in the kernel with interrupts
+masked while another CPU still ticks, and on x86_64 the wedged CPU prints its own frame from the
+NMI the observer sends it (see
+[scheduling-internals.md § Softlockup Watchdog](../core/kernel/docs/scheduling-internals.md#softlockup-watchdog)).
+No harness can make that state: ktest and the other harnesses run in user mode, which cannot mask
+interrupts, and the kernel carries no test hooks. `cargo xtask test-wedge [--arch]` (both arches)
+makes it at the hardware boundary instead, as `test-terminal` injects input, so the production
+kernel is what runs:
+
+1. Boot the current sysroot's default boot with QEMU's gdbstub on a unix socket, wait for the
+   terminal's `terminal: READY for injection` marker, and read the KASLR slide (`kaslr: slide=`)
+   and the hardware id of each logical CPU (the kernel's `smp:` lines) from the serial stream.
+2. Stop the VM over the GDB remote serial protocol and read the chosen CPU's program counter. Only
+   a CPU whose program counter follows the idle loop's halt instruction (`hlt` on x86_64, `wfi`
+   on riscv64), inside the idle loop, is moved: there the idle thread holds no lock. Any other
+   state resumes the VM and tries again, up to 100 times.
+3. Move the CPU's program counter to the kernel's `halt_loop`, which masks interrupts and halts
+   for good, and resume the VM.
+4. Wait for the watchdog's report and check it: the detector's line naming the wedged CPU, its
+   `=== WATCHDOG:` header, and `=== END WATCHDOG ===`. On x86_64 the wedged CPU's
+   `NMI BACKTRACE` frame must come before the observer's line, with its `rip` inside `halt_loop`,
+   and the observer's line must end with `own_frame=true`; on riscv64 no frame is printed and the
+   line ends with `own_frame=false`.
+
+The command boots twice: the first boot wedges the highest-numbered AP, which the BSP reports, and
+the second wedges the BSP, which an AP reports. A gdbstub that cannot be reached, a CPU never found
+in the idle halt, or a missing report line fails it. The host computes the verdict and kills
+QEMU, as for `test-terminal`. See
+[xtask/README.md § test-wedge](../xtask/README.md#cargo-xtask-test-wedge) for the command.
+
+In CI it runs as a further boot pair inside each `usertest` cell (both arches, both profiles),
+after `test-terminal`, on the default boot `test-terminal` restored.
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -479,9 +515,9 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
-then on x86_64 the `test-vmgenid` save/restore boot pair.
-The terminal test boot has *no* shutdown-invoking harness: `test-terminal`
-computes the verdict host-side and kills QEMU itself.
+then the `test-wedge` boot pair, then on x86_64 the `test-vmgenid` save/restore boot pair.
+The terminal and wedge test boots have *no* shutdown-invoking harness: `test-terminal` and
+`test-wedge` compute the verdict host-side and kill QEMU themselves.
 
 ---
 
@@ -698,6 +734,9 @@ or body):
   initialisers;
 - IPI send and receive: `send_wakeup_ipi`, `send_tlb_shootdown_ipi`, `send_init_ipi`, `send_sipi`,
   `send_nmi_to`, `sbi_send_ipi_to`, `sbi_hart_mask`, `wait_for_ack`, `IpiWaitCtx`, the
+  NMI backtrace request and the watchdog's wait for it (`nmi_backtrace_request`,
+  `request_nmi_backtrace`, `dump_remote_frame`, `NMI_BACKTRACES_PRINTED`, and
+  `REMOTE_FRAME_BUDGET_US`), the
   `IPI_VECTOR_*` constants, the x86_64 `ipi_*` stubs and handlers in `idt.rs`, the x86_64 ICR and
   x2APIC primitives and the mode they set (`apic_send_icr`, `wait_icr_idle`,
   `enable_x2apic_this_cpu`, `X2APIC_ENABLED`, `x2apic_supported`, `x2apic_enabled`,
@@ -762,6 +801,8 @@ S="$S|allocate_cpu_ids|cpus\.count|cpus\.ids_phys|info\.cpu_count|boot_cpu_ids"
 S="$S|step5_discover_cpu_topology|start_ap|discover_boot_hart_id|bsp_hardware_id"
 S="$S|sbi_hart_start|kernel_entry_ap|init_ap(_[a-z_]+)?|send_(wakeup|tlb_shootdown|init)_ipi"
 S="$S|send_sipi|send_nmi_to|sbi_send_ipi_to|sbi_hart_mask|wait_for_ack|IpiWaitCtx"
+S="$S|nmi_backtrace_request|request_nmi_backtrace|dump_remote_frame|NMI_BACKTRACES_PRINTED"
+S="$S|REMOTE_FRAME_BUDGET_US"
 S="$S|IPI_VECTOR_[A-Z_]+|ipi_[a-z_]+_(stub|handler)|apic_send_icr|wait_icr_idle"
 S="$S|enable_x2apic_this_cpu|X2APIC_ENABLED|x2apic_supported|x2apic_enabled"
 S="$S|x2apic_wrmsr_fence|ICR_IDLE_BUDGET_US|WaitTimer|spin_until|MAX_SPINS_PER_UNIT"

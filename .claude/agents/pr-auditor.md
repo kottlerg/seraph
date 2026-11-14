@@ -186,7 +186,9 @@ claims.
    test case whose work grows with the CPU count does), the memory
    variation only when one meets the Memory surface definition, each
    device cell only when one lies on a device surface that section's
-   table says owes that cell, and the whole boundary
+   table says owes that cell (a line that names a listed type only in an
+   import, a re-export, a signature, or a type annotation does not), and
+   the whole boundary
    set (riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs)
    whenever the PR states a concurrency-fix purpose as Repeat count defines
    it and has a non-inert line, whether or not a line meets any surface.

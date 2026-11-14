@@ -155,7 +155,7 @@ impl Condvar {
         self.queue_lock.lock();
         // SAFETY: `queue_lock` is held, so this is the only reference to the
         // queue until the unlock below.
-        let result = f(unsafe { &mut *self.queue.get() });
+        let result = f(unsafe { self.queue.as_mut_unchecked() });
         // SAFETY: this thread locked `queue_lock` above.
         unsafe { self.queue_lock.unlock() };
         result

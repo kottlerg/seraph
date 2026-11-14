@@ -1321,7 +1321,7 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
 /// any intermediate is not a directory.
 fn walk_root_mount_path(root_mount_cap: u64, path: &[u8], ipc_buf: *mut u64) -> Option<u64>
 {
-    let stripped = path.strip_prefix(b"/").unwrap_or(path);
+    let stripped = path.trim_prefix(b"/");
     if stripped.is_empty()
     {
         return None;

@@ -392,7 +392,7 @@ pub fn try_startup_info() -> Option<&'static StartupInfo> {
     if STARTUP_READY.load(Ordering::Acquire) {
         // SAFETY: `STARTUP_READY` is only set by `_start` after writing the
         // cell, with Release ordering matched by our Acquire load above.
-        Some(unsafe { (*STARTUP.0.get()).assume_init_ref() })
+        Some(unsafe { STARTUP.0.as_ref_unchecked().assume_init_ref() })
     } else {
         None
     }
@@ -525,7 +525,7 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     };
 
     // SAFETY: single writer; we are the only code running at this point.
-    unsafe { (*STARTUP.0.get()).write(startup) };
+    unsafe { STARTUP.0.as_mut_unchecked().write(startup) };
     STARTUP_READY.store(true, Ordering::Release);
 
     // Wire the object-slab refill path against memmgr before anything maps:

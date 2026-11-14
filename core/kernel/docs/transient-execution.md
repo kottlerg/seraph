@@ -151,7 +151,9 @@ Security Issues by CPU". It is vendored verbatim and compiled into the kernel
   Indirect target selection has three columns with one CVE, told apart by the variant the header
   names. Only the cBPF variant reaches the kernel from user mode, through kernel direct branches
   in the same predictor mode. The IBPB variant crosses an IBPB between processes, and the
-  guest-host variant is a VMM's. Their columns give at most `OtherBoundary`.
+  guest-host variant is a VMM's. Their columns give at most `OtherBoundary`. The RRSBA column
+  (CVE-2022-28693) is not a class: a CPU that a row lists with a status other than
+  `Not Affected` in it has the `rsb_alternate` behaviour (§ Predictor behaviours).
 - **Cells.** `Not Affected` is `NotAffected`. A status that names software (`Software`,
   `MCU+Software`, `Hardware+Software`, `MCU_BIOS+Software`) is `Kernel`. A status of microcode,
   hardware or BIOS alone (`MCU`, `Hardware+MCU`, `MCU_BIOS+BIOS`) is `Firmware`. Any other status
@@ -168,7 +170,8 @@ AMD publishes no machine-readable list, so the per-family table is taken from AM
 technical guidance:
 
 - `spectre_v1` and `spectre_v2`: `Kernel` on every family.
-- `spec_store_bypass`: affected on every family, then capped by the boundary rules.
+- `spec_store_bypass`: affected on Family 15h and later (AMD's 2018 SSB statement, AMD's SSBD
+  white paper), then capped by the boundary rules.
 - `retbleed` (branch type confusion): `Kernel` on every family but 19h. BTC-TG states that
   Family 19h is not affected and does not set `BTC_NO`. BTC-TG lists Families 15h and 17h as
   affected, and AMD gives no statement on older parts.
@@ -254,7 +257,7 @@ CPU of another vendor has both.
 | Behaviour | Log name | Meaning | Intel | AMD |
 |---|---|---|---|---|
 | `IbpbLeavesRsb` | `ibpb_leaves_rsb` | An IBPB does not keep a `RET` after it from being predicted by an RSB entry created before it | `eibrs_pbrsb` is not `NotAffected`: Intel defines post-barrier RSB predictions across an IBPB as well as a VM exit | No `IBPB_RET` (`CPUID Fn8000_0008 EBX[30]`): AMD-SB-1040 states that an IBPB may not prevent return predictions from pre-IBPB targets on Zen to Zen 3 |
-| `RsbAlternate` | `rsb_alternate` | A `RET` that finds the RSB empty may be predicted by an alternate predictor, such as the branch target buffer | `retbleed` is not `NotAffected` (the list's RSBA column, or `RSBA`), or `IA32_ARCH_CAPABILITIES.RRSBA` (bit 19) | No part: AMD states that its processors do not put `RET`-based predictions in BTB-type structures (STMS, mitigation V2-1) |
+| `RsbAlternate` | `rsb_alternate` | A `RET` that finds the RSB empty may be predicted by an alternate predictor, such as the branch target buffer | `retbleed` is not `NotAffected` (the list's RSBA column, or `RSBA`), the list's RRSBA column gives it (§ Intel), or `IA32_ARCH_CAPABILITIES.RRSBA` (bit 19) | No part: AMD states that its processors do not put `RET`-based predictions in BTB-type structures (STMS, mitigation V2-1) |
 
 The behaviours select a fill after an IBPB the kernel issues and on a context switch in the
 retpoline build. Neither selects a fill on entry from user mode. Intel states that an RSB

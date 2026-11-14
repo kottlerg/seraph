@@ -92,20 +92,21 @@ Every Issue MUST carry at least one **Subsystem** label and at least one **Class
 ### Milestones
 
 Each `Y` bump (`v0.1.0`, `v0.2.0`, …) and each `Z` patch (`v0.1.1`, …), shipped or planned, has
-a GitHub milestone. The current milestone is the lowest-versioned open one. An Issue a release
-will absorb (a defect, a cleanup, scheduled work of any class) MUST carry a milestone from
-creation: the current milestone, or the later release it is planned for. A follow-up Issue the
-pre-merge review files (§ Follow-up Issues) MUST carry the current milestone: it records
+a GitHub milestone. The current milestone is the lowest-versioned open one. Only an Issue that
+cannot be worked on now MAY stay unassigned: it needs hardware the project does not have, it is
+not possible yet, or whether it belongs in the project is itself undecided. Its body MUST state
+which. Every other Issue carries a milestone from creation: the current milestone, or a later
+one when it depends on an Issue of that milestone, which its body names. The size of a milestone
+and the date of a release are not reasons for a later milestone or for none. A follow-up Issue
+the pre-merge review files (§ Follow-up Issues) MUST carry the current milestone: it records
 findings on work the current release contains, and step 8 of § Release Production settles it
 when the release closes. A rolling Issue belongs to that one milestone: step 8 closes it, and it
-is never moved to a later milestone. Only future-state work no release has scheduled (a design
-umbrella, an unscheduled feature) MAY stay unassigned; it is assigned when it is scheduled. The
-rule applies to open Issues filed before it: the maintainer assigns each a milestone or confirms
-it as unscheduled work. An Issue that closes without a milestone, or under one other than the
-current milestone, MUST be assigned the current milestone when it closes, apart from a rolling
-Issue, which step 8 of § Release Production closes in its own milestone; step 8 decides the
-release a closed Issue settles on. A pull request MUST NOT carry a
-milestone; milestones are assigned to Issues only.
+is never moved to a later milestone. The rule applies to open Issues filed before it: the
+maintainer assigns each a milestone or confirms which of the three reasons keeps it unassigned.
+An Issue that closes without a milestone, or under one other than the current milestone, MUST
+be assigned the current milestone when it closes, apart from a rolling Issue, which step 8 of
+§ Release Production closes in its own milestone; step 8 decides the release a closed Issue
+settles on. A pull request MUST NOT carry a milestone; milestones are assigned to Issues only.
 
 ### Commit and PR cross-references
 

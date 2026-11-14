@@ -111,8 +111,11 @@ Some decisions are not yours: widening the task beyond § Scope and branches, a 
 finding, a decision larger than your PR (§ Authorities), filing an Issue. Put each to the
 orchestrator as one pick with its reasons, its downsides and what you read, and keep working on
 everything that does not depend on the answer, on your pick. Hand back for it only when nothing
-else is left. Draft an Issue body in the scratchpad and name its path; filing is the
-orchestrator's.
+else is left. Draft an Issue body in the scratchpad and name its path with the milestone it
+takes under docs/conventions.md § Milestones: the current one, a later one only when it depends
+on an Issue of that milestone (the body names it), or none only when it cannot be worked on now,
+the body then carrying the `No milestone: <reason>` line `cargo xtask issue-file` checks. Filing
+is the orchestrator's.
 
 Asked by the orchestrator for a status line (a grant watch), record it as above; the
 orchestrator reads it at its next tick.

@@ -5,10 +5,11 @@ title: ''
 labels: bug
 ---
 
-<!-- Set the milestone: the current one (the lowest-versioned open milestone) or the later
-release this defect is planned for; a rolling follow-up Issue
-(`<scope>: defects found by review`) takes the current one
-(docs/conventions.md § Milestones). -->
+<!-- Set the milestone: the current one (the lowest-versioned open milestone), or a later one
+when this defect's fix depends on an Issue of that milestone, named in the body; unset only
+when it cannot be worked on now, with a line `No milestone: hardware`, `not-possible` or
+`undecided` saying why. A rolling follow-up Issue (`<scope>: defects found by review`) takes
+the current one (docs/conventions.md § Milestones). -->
 
 ## Summary
 

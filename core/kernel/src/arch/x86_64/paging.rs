@@ -56,6 +56,11 @@ const PWT: u64 = 1 << 3;
 /// with PWT it selects strong UC (PAT entry 3) under the power-on default PAT,
 /// which the kernel does not reprogram.
 const PCD: u64 = 1 << 4;
+/// Accessed (A) — the processor sets it on the first access through a leaf;
+/// the kernel pre-sets it in every leaf it builds, as on RISC-V, so a leaf the
+/// kernel installs or rewrites reads accessed until `SYS_ASPACE_HARVEST`
+/// clears it ([`harvest_user_accessed`]).
+const ACCESSED: u64 = 1 << 5;
 /// Page Size (PS) — set in a PDE/PDPTE to make it a large-page leaf.
 const LARGE_PAGE: u64 = 1 << 7;
 /// No-Execute — blocks instruction fetch; requires `IA32_EFER.NXE` = 1.
@@ -114,7 +119,7 @@ impl PageTableEntry
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
-        let mut bits = PRESENT | (phys & PHYS_MASK);
+        let mut bits = PRESENT | ACCESSED | (phys & PHYS_MASK);
         if flags.writable
         {
             bits |= WRITABLE;
@@ -139,7 +144,7 @@ impl PageTableEntry
     pub fn new_large_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0x1F_FFFF == 0, "large page PA not 2 MiB-aligned");
-        let mut bits = PRESENT | LARGE_PAGE | (phys & PHYS_MASK);
+        let mut bits = PRESENT | ACCESSED | LARGE_PAGE | (phys & PHYS_MASK);
         if flags.writable
         {
             bits |= WRITABLE;
@@ -1270,6 +1275,153 @@ unsafe fn walk_leaves(
             let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
             // SAFETY: child is a live table at child_level (this call's contract).
             unsafe { walk_leaves(child, child_level, va, entry_end, on_leaf) };
+        }
+        va = entry_end;
+    }
+}
+
+// ── Accessed-bit harvest ──────────────────────────────────────────────────────
+
+/// The leaf `slot` as an atomic word. The processor sets a leaf's A and D bits
+/// with locked updates whatever lock the kernel holds, so a harvest updates the
+/// word atomically and loses none of them.
+#[cfg(not(test))]
+fn leaf_word(slot: &mut PageTableEntry) -> &AtomicU64
+{
+    // SAFETY: `PageTableEntry` is `repr(transparent)` over `u64`, so `slot` is
+    // a valid, 8-byte-aligned `u64` for the borrow's lifetime, and every
+    // concurrent access to a leaf's A and D bits is atomic (see above).
+    unsafe { AtomicU64::from_ptr(core::ptr::from_mut(slot).cast::<u64>()) }
+}
+
+/// Clear the accessed bit (A) of every present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)` in the page table rooted at
+/// `root_virt`, and pass the VA of each leaf whose A was set to
+/// `on_accessed`, in VA order.
+///
+/// Flushes no TLB: a CPU that still caches the leaf completes accesses without
+/// setting A again, so the next harvest under-reports that page
+/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
+/// caller must hold the address space's `pt_lock`, and the span must lie in
+/// the user half.
+#[cfg(not(test))]
+pub unsafe fn harvest_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_accessed: &mut dyn FnMut(u64),
+)
+{
+    // SAFETY: root_virt is the direct-map VA of a valid root, and pt_lock is
+    // held (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |slot, va| {
+            if slot.is_present()
+                && leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed) & ACCESSED != 0
+            {
+                on_accessed(va);
+            }
+        });
+    }
+}
+
+/// Set the accessed bit (A) of every present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `accessed` names:
+/// the undo of a [`harvest_user_accessed`] whose bitmap could not be
+/// delivered. A page unmapped since is skipped.
+///
+/// # Safety
+/// As [`harvest_user_accessed`].
+#[cfg(not(test))]
+pub unsafe fn mark_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    accessed: &dyn Fn(u64) -> bool,
+)
+{
+    // SAFETY: as for harvest_user_accessed (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |slot, va| {
+            if slot.is_present() && accessed(va)
+            {
+                leaf_word(slot).fetch_or(ACCESSED, Ordering::Relaxed);
+            }
+        });
+    }
+}
+
+/// Pass the slot of each page VA of
+/// `[virt_base, virt_base + page_count * 4 KiB)` that a present page table
+/// covers, with the VA, to `on_slot`, in VA order.
+///
+/// # Safety
+/// As [`harvest_user_accessed`].
+#[cfg(not(test))]
+unsafe fn for_each_leaf_slot(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_slot: &mut dyn FnMut(&mut PageTableEntry, u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+
+    // The caller's span lies in the user half, so neither operation saturates.
+    let virt_end = virt_base.saturating_add((page_count as u64).saturating_mul(PAGE_SIZE as u64));
+    // SAFETY: root_virt is the direct-map VA of a valid root (caller's contract).
+    let root = unsafe { table_at(root_virt) };
+    // SAFETY: root is a live table at the root level; pt_lock is held.
+    unsafe { walk_leaf_slots(root, root_level(), virt_base, virt_end, on_slot) };
+}
+
+/// Pass the slot of each page VA of `[lo, hi)` under `table` (a table at
+/// `level`) that a present page table covers, with the VA, to `on_slot`.
+/// Large-page leaves are skipped, as in [`unmap_user_region_pooled`]. Bounded
+/// recursion: `level <= 4`.
+///
+/// # Safety
+/// `table` must be a live table at `level` whose reachable child frames are
+/// live; the caller must hold the address space's `pt_lock`.
+#[cfg(not(test))]
+unsafe fn walk_leaf_slots(
+    table: &mut [PageTableEntry; 512],
+    level: usize,
+    lo: u64,
+    hi: u64,
+    on_slot: &mut dyn FnMut(&mut PageTableEntry, u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    let Some(child_level) = level.checked_sub(1)
+    else
+    {
+        for va in (lo..hi).step_by(PAGE_SIZE)
+        {
+            if let Some(slot) = entry_mut(table, 0, va)
+            {
+                on_slot(slot, va);
+            }
+        }
+        return;
+    };
+
+    let mut va = lo;
+    while va < hi
+    {
+        let entry_end = hi.min(next_level_boundary(level, va));
+        if let Some(e) = entry(table, level, va)
+            && names_table(e, level)
+        {
+            // SAFETY: a present non-leaf entry points at a live child table.
+            let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+            // SAFETY: child is a live table at child_level (this call's contract).
+            unsafe { walk_leaf_slots(child, child_level, va, entry_end, on_slot) };
         }
         va = entry_end;
     }

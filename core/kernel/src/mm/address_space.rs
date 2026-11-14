@@ -370,6 +370,21 @@ fn span_pages(base: u64, page_count: usize) -> Option<core::iter::StepBy<core::o
     Some((base..end).step_by(PAGE_SIZE))
 }
 
+/// The byte of a `SYS_ASPACE_HARVEST` bitmap, and the bit in it, that report
+/// the page at `va` of a range starting at page-aligned `virt_base`: page `i`
+/// is bit `i % 8` of byte `i / 8`. `None` only when the page index does not
+/// fit a `usize`, which no harvested range reaches.
+pub fn harvest_bit(virt_base: u64, va: u64) -> Option<(usize, u8)>
+{
+    let page = va
+        .wrapping_sub(virt_base)
+        .checked_div(PAGE_SIZE as u64)
+        .and_then(|page| usize::try_from(page).ok())?;
+    let byte = page.checked_div(8)?;
+    let bit = page.checked_rem(8)?;
+    Some((byte, 1u8 << bit))
+}
+
 /// Whether `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM` may copy a page
 /// whose user leaf grants `leaf` and names the frame at `phys`, through the
 /// direct map, which covers RAM below `ram_top`.
@@ -1512,6 +1527,74 @@ impl AddressSpace
         Ok(())
     }
 
+    /// Read and clear the accessed bit of every mapped page of
+    /// `[virt_base, virt_base + page_count * PAGE_SIZE)`, under `pt_lock`, and
+    /// set bit `i % 8` of `bitmap[i / 8]` for each page `i` of the range whose
+    /// bit was set; an unmapped page's bit is left as it is. Returns the number
+    /// of pages reported. Flushes no TLB
+    /// ([memory-internals.md](../../docs/memory-internals.md) § Accessed Bits).
+    ///
+    /// # Safety
+    /// The range must lie in the user half, and `bitmap` must hold at least
+    /// `page_count.div_ceil(8)` bytes.
+    #[cfg(not(test))]
+    pub unsafe fn harvest_accessed(
+        &self,
+        virt_base: u64,
+        page_count: usize,
+        bitmap: &mut [u8],
+    ) -> u64
+    {
+        use crate::arch::current::paging::harvest_user_accessed;
+
+        let mut accessed = 0u64;
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+        // SAFETY: root_virt is valid, pt_lock is held, and the range is in the
+        // user half (caller's contract).
+        unsafe {
+            harvest_user_accessed(self.root_virt, virt_base, page_count, &mut |va| {
+                if let Some((index, bit)) = harvest_bit(virt_base, va)
+                    && let Some(byte) = bitmap.get_mut(index)
+                {
+                    *byte |= bit;
+                }
+                // At most `page_count` pages are reported.
+                accessed = accessed.saturating_add(1);
+            });
+        }
+        self.pt_unlock();
+        crate::percpu::preempt_enable();
+        accessed
+    }
+
+    /// Set the accessed bit again on every page of
+    /// `[virt_base, virt_base + page_count * PAGE_SIZE)` that `bitmap` reports
+    /// (as [`harvest_accessed`](Self::harvest_accessed) wrote it) and that is
+    /// still mapped: the undo of a harvest whose bitmap the caller could not
+    /// take, so the call changes nothing visible.
+    ///
+    /// # Safety
+    /// As [`harvest_accessed`](Self::harvest_accessed).
+    #[cfg(not(test))]
+    pub unsafe fn restore_accessed(&self, virt_base: u64, page_count: usize, bitmap: &[u8])
+    {
+        use crate::arch::current::paging::mark_user_accessed;
+
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+        // SAFETY: as for harvest_accessed (caller's contract).
+        unsafe {
+            mark_user_accessed(self.root_virt, virt_base, page_count, &|va| {
+                harvest_bit(virt_base, va)
+                    .and_then(|(index, bit)| Some(bitmap.get(index)? & bit != 0))
+                    .unwrap_or(false)
+            });
+        }
+        self.pt_unlock();
+        crate::percpu::preempt_enable();
+    }
+
     /// Translate a user virtual address to its mapped physical address.
     ///
     /// Performs a read-only page table walk. Returns `Some((phys_addr,
@@ -1930,6 +2013,20 @@ mod thread_mem_tests
         assert_eq!(span_pages(page, 0).unwrap().count(), 0);
         assert!(span_pages(!(page - 1), 1).is_none());
         assert!(span_pages(0, usize::MAX).is_none());
+    }
+
+    // Defect caught: a harvest bitmap whose bit order differs from the
+    // documented layout (page i is bit i % 8 of byte i / 8, LSB first), so a
+    // pager reads another page's accessed bit.
+    #[test]
+    fn harvest_bit_numbers_pages_lsb_first_from_the_range_base()
+    {
+        let page = PAGE_SIZE as u64;
+        let base = 0x40 * page;
+        assert_eq!(harvest_bit(base, base), Some((0, 1)));
+        assert_eq!(harvest_bit(base, base + 7 * page), Some((0, 0x80)));
+        assert_eq!(harvest_bit(base, base + 8 * page), Some((1, 1)));
+        assert_eq!(harvest_bit(base, base + 4095 * page), Some((511, 0x80)));
     }
 
     // Defect caught: a text write that skips the flag or the shared-frame

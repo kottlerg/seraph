@@ -573,6 +573,119 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
     Err(SyscallError::NotSupported)
 }
 
+// ── SYS_ASPACE_HARVEST ────────────────────────────────────────────────────────
+
+/// `SYS_ASPACE_HARVEST` (66): read and clear the accessed bit of each mapped
+/// page of a range into a caller bitmap.
+///
+/// Arguments, return, and errors: `core/kernel/docs/syscalls.md`
+/// § `SYS_ASPACE_HARVEST` (66); the accessed-bit model:
+/// `core/kernel/docs/memory-internals.md` § Accessed Bits.
+///
+/// Restartable (core/kernel/docs/syscalls.md § Restartable Syscalls): when the
+/// bitmap copy faults, the harvested pages get their accessed bit back before
+/// the fault reaches the dispatcher, so the call has changed nothing visible
+/// and re-executes on resume.
+#[cfg(not(test))]
+pub fn sys_aspace_harvest(tf: UserFrame) -> Result<u64, crate::uaccess::RestartableError>
+{
+    use crate::cap::object::AddressSpaceObject;
+    use crate::cap::slot::AsRights;
+    use crate::syscall::current_tcb;
+    use syscall::MAX_HARVEST_PAGES;
+
+    /// Bytes of the largest bitmap: one bit per page.
+    const BITMAP_MAX: usize = MAX_HARVEST_PAGES.div_ceil(8) as usize;
+
+    let aspace_idx = tf.arg(0);
+    let virt_base = tf.arg(1);
+    let pages = tf.arg(2);
+    let bitmap_ptr = tf.arg(3);
+
+    // ── Validation ────────────────────────────────────────────────────────────
+
+    if pages > MAX_HARVEST_PAGES
+    {
+        return Err(SyscallError::InvalidArgument.into());
+    }
+    let page_count = usize::try_from(pages).map_err(|_| SyscallError::InvalidArgument)?;
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`; the
+    // walk covers the range clamped as data (`mm::user_page_range`).
+    let (virt_base, virt_end) = crate::mm::user_page_range(virt_base, page_count)?;
+    // The page count the walk covers, from the clamped range: `page_count`
+    // architecturally, and 0 on a path past a mispredicted check.
+    let page_count = virt_end
+        .wrapping_sub(virt_base)
+        .checked_div(crate::mm::PAGE_SIZE as u64)
+        .and_then(|pages| usize::try_from(pages).ok())
+        .unwrap_or(0);
+    let mut storage = [0u8; BITMAP_MAX];
+    let Some(bitmap) = storage.get_mut(..page_count.div_ceil(8))
+    else
+    {
+        return Err(SyscallError::InvalidArgument.into());
+    };
+    // The bitmap must be non-null and lie wholly in the user half.
+    let user_va_top = crate::mm::user_va_top();
+    if bitmap_ptr == 0
+        || bitmap_ptr
+            .checked_add(bitmap.len() as u64)
+            .is_none_or(|end| end > user_va_top)
+    {
+        return Err(SyscallError::InvalidAddress.into());
+    }
+
+    // ── Capability lookup ─────────────────────────────────────────────────────
+
+    // SAFETY: current_tcb() returns current thread; interrupt context ensures it is set.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability.into());
+    }
+    // SAFETY: tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*tcb).cspace };
+    if caller_cspace.is_null()
+    {
+        return Err(SyscallError::InvalidCapability.into());
+    }
+    // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
+    let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
+    let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    let aso = obj.as_ptr().cast::<AddressSpaceObject>();
+    // SAFETY: tag confirmed AddressSpace; aso is a valid AddressSpaceObject.
+    let as_ptr = unsafe { (*aso).address_space };
+    // SAFETY: as_ptr is the AddressSpace of the AddressSpaceObject
+    // `aspace_slot` pins for the call.
+    let aspace = unsafe { &*as_ptr };
+
+    // ── Harvest, then copy out ────────────────────────────────────────────────
+
+    // SAFETY: the range is in the user half (validated above) and `bitmap`
+    // holds `page_count.div_ceil(8)` bytes.
+    let accessed = unsafe { aspace.harvest_accessed(virt_base, page_count, bitmap) };
+    // The span was range-validated above; a fault on it reaches the dispatcher
+    // as a restartable fault.
+    // SAFETY: bitmap is valid for its length; bitmap_ptr is the validated span.
+    let copied = unsafe {
+        crate::uaccess::copy_to_user_restartable(bitmap_ptr, bitmap.as_ptr(), bitmap.len())
+    };
+    if let Err(fault) = copied
+    {
+        // SAFETY: as for harvest_accessed; `bitmap` is what it wrote.
+        unsafe { aspace.restore_accessed(virt_base, page_count, bitmap) };
+        return Err(fault);
+    }
+    Ok(accessed)
+}
+
+// Test stub.
+#[cfg(test)]
+pub fn sys_aspace_harvest(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
 // ── SYS_MEMORY_SPLIT ───────────────────────────────────────────────────────────
 
 /// `SYS_MEMORY_SPLIT` (33): carve a virgin tail off a Memory cap.

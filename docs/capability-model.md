@@ -973,6 +973,7 @@ The kernel does not provide:
 [Device Management](device-management.md), [IPC Design](ipc-design.md),
 [Memory Model](memory-model.md), [Namespace Model](namespace-model.md),
 [Process Lifecycle](process-lifecycle.md), [Storage](storage.md),
+[Supervision](supervision.md),
 [programs/capexhaust/README.md](../programs/capexhaust/README.md),
 [programs/threadstack/README.md](../programs/threadstack/README.md),
 [runtime/ruststd/README.md](../runtime/ruststd/README.md),

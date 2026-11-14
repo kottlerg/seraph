@@ -1,16 +1,17 @@
 # iommu/vtd
 
 The VT-d IOMMU driver (`iommu-vtd`): the separate driver process that programs Intel VT-d remapping
-units for devmgr. devmgr discovers each unit through the ACPI DMAR, moves the unit's register range
-to this driver, and drives it over `ipc::iommu_labels` from behind its DMA endpoint, so device
-drivers keep the `devmgr_dma_labels` contract whichever IOMMU sits behind it
+units for devmgr. devmgr discovers each unit through the ACPI DMAR, delivers the unit's register
+range to this driver in its resource list, keeping no copy, and drives it over `ipc::iommu_labels`
+from behind its DMA endpoint, so device drivers keep the `devmgr_dma_labels` contract whichever
+IOMMU sits behind it
 ([docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming). It is x86-64 only, and ships as a boot module, since it must
 confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF note
 section `.note.seraph.driver` (IOMMU family `dmar`), which devmgr matches against the IOMMU family
-record in a pass of its own and starts with the IOMMU bootstrap rounds, not the resource list. The
-bootstrap, the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s; this
-crate is the VT-d `Backend`.
+record in a pass of its own, delivering it the units in its resource list. The delivery decode,
+the request checks, and the fault queue are [`iommu-core`](../core/README.md)'s; this crate is the
+VT-d `Backend`.
 
 The driver runs the units in legacy translation mode:
 

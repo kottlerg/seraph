@@ -22,14 +22,19 @@ it depends on `shared/ipc`, `shared/syscall`, `abi/process-abi`, and `abi/syscal
   device. Each non-terminal round carries one resource, its kind in `data[0]`: `Mmio` (the cap,
   its PCI BAR index or none, physical base, bytes, and offset in the BAR), `IoPort` (the cap,
   base, and count), or `Interrupt` (one cap per vector, its kind `Wired`, `Msi`, or `MsiX`, the
-  first vector, and the `SYS_IRQ_REGISTER` mode). The terminal end round carries the endpoint
-  slots `SLOT_SERVICE`, `SLOT_DEVMGR_QUERY`, and `SLOT_DMA`, packed by
-  `ipc::bootstrap::pack_slots`. devmgr builds each round with `Round` (`mmio`, `mmio_at`,
-  `io_port`, `interrupts`, `end`); a driver receives the list with `receive`, which decodes
-  each round into a `ResourceList` on its heap (`absorb`) and deletes every delivered cap of a
-  list it refuses or has no room for. `PlatformDelivery::from_list` reads the list a platform
-  record's bind delivers: one register resource (`Mmio` or `IoPort`), an optional wired line,
-  and the endpoints.
+  first vector, and the `SYS_IRQ_REGISTER` mode). The IOMMU record's list also carries an
+  `IommuUnit` round, with no cap, before each remapping unit's resources: the unit's PCI
+  segment, whether it translates every function of its segment no other unit names, and its
+  scope (`Scope`, at most `MAX_UNIT_SCOPES`), opening the group of resources that are that
+  unit's, at most `MAX_IOMMU_UNITS` units. The terminal end round carries the endpoint slots
+  `SLOT_SERVICE`, `SLOT_DEVMGR_QUERY`, and `SLOT_DMA`, packed by `ipc::bootstrap::pack_slots`.
+  devmgr builds each round with `Round` (`mmio`, `mmio_at`, `io_port`, `interrupts`,
+  `iommu_unit`, `end`); a driver receives the list with `receive`, which decodes each round into
+  a `ResourceList` on its heap (`absorb`) and deletes every delivered cap of a list it refuses
+  or has no room for. `iommu_units` yields each unit with its group, and `holds_units` tells a
+  driver bound to any other record to refuse the list. `PlatformDelivery::from_list` reads the
+  list a platform record's bind delivers: one register resource (`Mmio` or `IoPort`), an
+  optional wired line, and the endpoints.
 
 The crate names standards and the system's own structure only: no driver, device, or device
 class appears in it, so it does not grow with the drivers a deployment ships

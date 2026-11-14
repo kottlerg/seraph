@@ -104,7 +104,8 @@ pub struct DeliveredDevice
 impl DeliveredDevice
 {
     /// Read a complete resource list. Returns `None` when the list has no
-    /// end round or no service endpoint, delivers no BAR range or more than
+    /// end round or no service endpoint, holds an IOMMU unit (an IOMMU
+    /// record's list), delivers no BAR range or more than
     /// [`MAX_VIRTIO_RANGES`], an `Mmio` range that is no PCI BAR's, an
     /// `IoPort`, more than one interrupt, or an interrupt other than a wired
     /// line or MSI-X vector 0 (`VirtIO` over PCI signals by no other).
@@ -112,7 +113,7 @@ impl DeliveredDevice
     pub fn from_list(list: &ResourceList) -> Option<Self>
     {
         let endpoints = list.endpoints()?;
-        if endpoints.service == 0
+        if endpoints.service == 0 || list.holds_units()
         {
             return None;
         }
@@ -214,7 +215,7 @@ mod tests
 {
     use super::*;
 
-    use driver_binding::resources::{Endpoints, Round};
+    use driver_binding::resources::{Endpoints, IommuUnit, Round};
     use ipc::bootstrap::BootstrapRound;
     use syscall_abi::{MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
@@ -348,6 +349,14 @@ mod tests
         // An MSI vector.
         let msi = Round::interrupts(InterruptKind::Msi, 0, 0, &[14]).expect("one vector");
         assert!(DeliveredDevice::from_list(&list(&[bar(), msi, end(20)])).is_none());
+        // An IOMMU unit, even before a well-formed device's resources.
+        let unit = Round::iommu_unit(&IommuUnit {
+            segment: 0,
+            include_pci_all: true,
+            scopes: Vec::new(),
+        })
+        .expect("no scopes");
+        assert!(DeliveredDevice::from_list(&list(&[unit, bar(), end(20)])).is_none());
         // More ranges than a delivery holds.
         let many: Vec<Round> = (0..=MAX_VIRTIO_RANGES)
             .map(|i| {

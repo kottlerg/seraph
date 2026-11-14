@@ -2387,6 +2387,36 @@ mod tests
         assert!(!pte_permits_user_access(invalid, UserAccess::Load));
     }
 
+    #[test]
+    fn svade_update_sets_accessed_for_a_load_or_fetch()
+    {
+        let harvested = VALID | USER | READ | EXECUTE | DIRTY;
+        assert_eq!(
+            svade_update(harvested, UserAccess::Load),
+            Some(harvested | ACCESSED)
+        );
+        assert_eq!(
+            svade_update(harvested, UserAccess::Fetch),
+            Some(harvested | ACCESSED)
+        );
+        assert_eq!(svade_update(harvested | ACCESSED, UserAccess::Load), None);
+    }
+
+    #[test]
+    fn svade_update_sets_accessed_and_dirty_for_a_store()
+    {
+        let rw = VALID | USER | READ | WRITE;
+        assert_eq!(
+            svade_update(rw, UserAccess::Store),
+            Some(rw | ACCESSED | DIRTY)
+        );
+        assert_eq!(
+            svade_update(rw | ACCESSED, UserAccess::Store),
+            Some(rw | ACCESSED | DIRTY)
+        );
+        assert_eq!(svade_update(rw | ACCESSED | DIRTY, UserAccess::Store), None);
+    }
+
     // ── Shootdown-elision classification ───────────────────────────────────────
 
     use crate::mm::paging::MapOutcome;

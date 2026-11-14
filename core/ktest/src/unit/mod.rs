@@ -335,6 +335,22 @@ pub fn run_all(ctx: &TestContext)
         "mm::init_segment_caps_aligned",
         mm::init_segment_caps_aligned(ctx)
     );
+    run_test!(
+        "mm::aspace_harvest_reports_touched_pages",
+        mm::aspace_harvest_reports_touched_pages(ctx)
+    );
+    run_test!(
+        "mm::aspace_harvest_refusals",
+        mm::aspace_harvest_refusals(ctx)
+    );
+    run_test!(
+        "mm::aspace_harvest_bitmap_fault_restores",
+        mm::aspace_harvest_bitmap_fault_restores(ctx)
+    );
+    run_test!(
+        "mm::aspace_harvest_kernel_copy_sets_accessed",
+        mm::aspace_harvest_kernel_copy_sets_accessed(ctx)
+    );
 
     // ── Notification syscalls ───────────────────────────────────────────────────────
     run_test!("notification::send", notification::send(ctx));

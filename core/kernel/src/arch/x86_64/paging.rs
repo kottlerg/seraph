@@ -2112,6 +2112,19 @@ mod tests
     }
 
     #[test]
+    fn new_leaves_read_accessed_until_a_harvest_clears_it()
+    {
+        let flags = PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable: false,
+        };
+        assert!(PageTableEntry::new_page(0x3000, flags).0 & ACCESSED != 0);
+        assert!(PageTableEntry::new_large_page(0x20_0000, flags).0 & ACCESSED != 0);
+    }
+
+    #[test]
     fn phys_addr_masks_out_flag_bits()
     {
         let pte = PageTableEntry::new_table(0xDEAD_B000);

@@ -47,7 +47,8 @@ pub mod caps_slot
     pub const SERVICE: usize = 0;
     /// svcmgr's own bootstrap endpoint (RECV). Required.
     pub const BOOTSTRAP: usize = 1;
-    /// The SEND on the root filesystem's namespace endpoint (`rootfs.root`).
+    /// The SEND on vfsd's synthetic root, derived from init's system-root
+    /// cap (`rootfs.root`).
     pub const ROOTFS_ROOT: usize = 2;
     /// The badge-0 `SEND|GRANT` source on devmgr's registry endpoint.
     pub const DEVMGR_REGISTRY: usize = 3;
@@ -92,7 +93,7 @@ pub struct CapsRound
     pub service_ep: u64,
     /// svcmgr's own bootstrap endpoint (RECV).
     pub bootstrap_ep: u64,
-    /// SEND on the root filesystem's namespace endpoint, or `0`.
+    /// SEND on vfsd's synthetic root (`rootfs.root`), or `0`.
     pub rootfs_root: u64,
     /// Badge-0 `SEND|GRANT` source on devmgr's registry endpoint, or `0`.
     pub devmgr_registry: u64,

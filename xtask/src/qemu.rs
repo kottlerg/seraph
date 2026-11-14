@@ -261,6 +261,23 @@ pub struct SecondDisk<'a>
     pub line: DiskLine,
 }
 
+impl<'a> SecondDisk<'a>
+{
+    /// The image at `path` on a line of its own, its device at the block
+    /// size the image's GPT is laid out in.
+    ///
+    /// # Errors
+    /// Fails as [`crate::disk::logical_block_size`] does.
+    pub fn of_image(path: &'a Path) -> Result<Self>
+    {
+        Ok(Self {
+            path,
+            block_size: crate::disk::logical_block_size(path)?,
+            line: DiskLine::Own,
+        })
+    }
+}
+
 /// Specification for one QEMU launch.
 ///
 /// `firmware_code_path` is the readonly pflash (OVMF on x86, `RISCV_VIRT_CODE`

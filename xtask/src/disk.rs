@@ -127,6 +127,18 @@ pub struct DiskLayout
     pub data: DataPlacement,
 }
 
+impl DiskLayout
+{
+    /// The image a boot of this layout attaches as its second disk:
+    /// `disk-data.img` when the layout puts the data partition there, so the
+    /// boot has its `/data`.
+    #[must_use]
+    pub fn second_image(self, ctx: &BuildContext) -> Option<PathBuf>
+    {
+        (self.data == DataPlacement::SecondImage).then(|| ctx.data_disk_image())
+    }
+}
+
 /// One FAT partition of an image: its GPT name, type and unique GUIDs, size,
 /// and the host directory it is populated from (skipped when absent).
 struct Volume
@@ -928,6 +940,31 @@ mod tests
                 assert_eq!(image_layout(&main, &data_image).unwrap(), layout);
                 assert_eq!(data_image.is_file(), data == DataPlacement::SecondImage);
             }
+        }
+    }
+
+    // Defect caught: a split layout booted without its data disk, so the
+    // boot had no /data.
+    #[test]
+    fn only_a_split_layout_boots_a_second_image()
+    {
+        let ctx = BuildContext {
+            root: PathBuf::from("/w"),
+            sysroot: PathBuf::from("/w/sysroot"),
+            target_dir: PathBuf::from("/w/target"),
+        };
+        for block_size in [BlockSize::B512, BlockSize::B4096]
+        {
+            let split = DiskLayout {
+                block_size,
+                data: DataPlacement::SecondImage,
+            };
+            assert_eq!(split.second_image(&ctx), Some(ctx.data_disk_image()));
+            let single = DiskLayout {
+                block_size,
+                data: DataPlacement::MainImage,
+            };
+            assert_eq!(single.second_image(&ctx), None);
         }
     }
 

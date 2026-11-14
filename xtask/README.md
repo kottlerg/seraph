@@ -256,8 +256,9 @@ author the partitions above; `build` and `compose-bundle` author them at 512 byt
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
 `run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, and `test-map-redo`
 repack the images in the layout they find: `disk.img`'s block size, and the data partition on
-`disk-data.img` when that image is there. Their boots attach `disk.img` alone unless the command
-takes `--second-disk`.
+`disk-data.img` when that image is there. The four test commands boot that layout, attaching
+`disk-data.img` as the second disk when it holds the data partition; `run` and `run-parallel`
+attach a second disk only as `--second-disk` names it.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \

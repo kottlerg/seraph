@@ -38,7 +38,7 @@ use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    GdbMode, Iommu, QemuLaunchSpec, build_qemu_argv, prepare_riscv_firmware,
+    GdbMode, Iommu, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
     validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
@@ -79,6 +79,7 @@ impl Guest
         args: &TestKaslrArgs,
         firmware_code: &Path,
         firmware_vars: Option<&Path>,
+        data_image: Option<&Path>,
     ) -> Result<Self>
     {
         let disk_path = ctx.disk_image();
@@ -86,7 +87,7 @@ impl Guest
             arch: args.arch,
             disk_path: &disk_path,
             disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-            second_disk: None,
+            second_disk: data_image.map(SecondDisk::of_image).transpose()?,
             firmware_code_path: firmware_code,
             firmware_vars_path: firmware_vars,
             cpus: args.cpus,
@@ -210,6 +211,11 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
     // Held until the command returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
+    // Every boot attaches the images of this layout, and the knob boot's
+    // repacks keep it. Read before staging, so a failed staging repack cannot
+    // change the one the restore writes.
+    let layout = crate::disk::current_layout(ctx)?;
+    let data_image = layout.second_image(ctx);
 
     // Resolve firmware once; riscv64 needs a writable vars pflash.
     let (code, vars) = match args.arch
@@ -225,7 +231,14 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
 
     let scrape = |label: &str| -> Result<Layout> {
         step(&format!("kaslr test: {label}"));
-        let mut guest = Guest::launch(&qemu_binary, ctx, args, &code, vars_ref)?;
+        let mut guest = Guest::launch(
+            &qemu_binary,
+            ctx,
+            args,
+            &code,
+            vars_ref,
+            data_image.as_deref(),
+        )?;
         let res = guest.scrape_layout(TIMEOUT);
         guest.shutdown();
         res.with_context(|| label.to_string())
@@ -250,9 +263,6 @@ pub fn run(ctx: &Context, args: &TestKaslrArgs) -> Result<()>
 
     // ── Knob: deterministic layout ──────────────────────────────────────────
     // Stage the knob, always restore it, even on failure.
-    // The layout is read before staging, so a failed staging repack cannot
-    // change the one the restore writes.
-    let layout = crate::disk::current_layout(ctx)?;
     stage_knob(ctx, Knob::NoKaslr).context("staging nokaslr knob")?;
     let knob_result = crate::disk::create_disk_image(ctx, args.arch, layout)
         .context("repacking disk with knob")

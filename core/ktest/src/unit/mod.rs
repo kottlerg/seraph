@@ -805,6 +805,18 @@ pub fn run_all(ctx: &TestContext)
         "entropy::getrandom_reseed_interval_stream",
         entropy::getrandom_reseed_interval_stream(ctx)
     );
+    run_test!(
+        "entropy::entropy_contribute_then_draw",
+        entropy::entropy_contribute_then_draw(ctx)
+    );
+    run_test!(
+        "entropy::entropy_contribute_cap_refusals",
+        entropy::entropy_contribute_cap_refusals(ctx)
+    );
+    run_test!(
+        "entropy::entropy_contribute_arg_refusals",
+        entropy::entropy_contribute_arg_refusals(ctx)
+    );
 
     // ── Init bootstrap layout (ASLR, #39) ─────────────────────────────────────
     run_test!(

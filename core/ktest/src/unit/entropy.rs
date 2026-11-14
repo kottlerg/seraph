@@ -3,13 +3,18 @@
 
 // core/ktest/src/unit/entropy.rs
 
-//! Tier 1 tests for the entropy syscall surface (`SYS_GETRANDOM`).
+//! Tier 1 tests for the entropy syscall surface (`SYS_GETRANDOM` and
+//! `SYS_ENTROPY_CONTRIBUTE`).
 
 use crate::{TestContext, TestResult};
 use syscall_abi::SyscallError;
 
 /// A canonical user-half virtual address that ktest never maps.
 const UNMAPPED_USER_VA: u64 = 0x3E_3000_0000;
+
+/// An address in the kernel half on both architectures, above the user-half
+/// top of every paging mode.
+const KERNEL_HALF_VA: u64 = 0xFFFF_8000_0000_0000;
 
 /// Test VA (5 GiB), below ktest's PIE image, `InitInfo`, and stack windows
 /// (`shared/process-layout`), so it overlaps no ktest image or startup mapping.
@@ -127,6 +132,138 @@ pub fn getrandom_reseed_interval_stream(_ctx: &TestContext) -> TestResult
             return Err("getrandom repeated the previous draw across the reseed interval");
         }
         prev = buf;
+    }
+    Ok(())
+}
+
+/// ktest's `EntropyControl` cap. Phase 7 mints it into init on both
+/// architectures, so its absence is a failure, not a skip.
+fn entropy_cap(ctx: &TestContext) -> Result<u64, &'static str>
+{
+    match ctx.entropy_control_cap
+    {
+        0 => Err("entropy_contribute: no EntropyControl descriptor in InitInfo"),
+        cap => Ok(cap),
+    }
+}
+
+/// The kernel's `EntropyControl` cap carries exactly `Contribute`, and a
+/// contribution through it succeeds at the length cap, below it, and empty;
+/// `getrandom` then still fills a whole buffer with non-zero bytes.
+pub fn entropy_contribute_then_draw(ctx: &TestContext) -> TestResult
+{
+    let cap = entropy_cap(ctx)?;
+    let info = syscall::cap_info(cap, syscall_abi::CAP_INFO_TAG_RIGHTS)
+        .map_err(|_| "entropy_contribute: cap_info on the EntropyControl cap failed")?;
+    if (info >> 32) as u8 != init_protocol::CapType::EntropyControl as u8
+    {
+        return Err("entropy_contribute: the descriptor's slot is not an EntropyControl cap");
+    }
+    if info & 0xFFFF_FFFF != syscall_abi::RIGHTS_ENTROPY_CONTRIBUTE
+    {
+        return Err("entropy_contribute: the root EntropyControl cap's rights are not Contribute");
+    }
+
+    let bytes = [0x5Au8; syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN];
+    syscall::entropy_contribute(cap, &bytes)
+        .map_err(|_| "entropy_contribute: a contribution at the length cap failed")?;
+    syscall::entropy_contribute(cap, &bytes[..17])
+        .map_err(|_| "entropy_contribute: a 17-byte contribution failed")?;
+    syscall::entropy_contribute(cap, &[])
+        .map_err(|_| "entropy_contribute: an empty contribution failed")?;
+
+    let mut buf = [0u8; 32];
+    let n = syscall::getrandom(&mut buf)
+        .map_err(|_| "entropy_contribute: getrandom failed after a contribution")?;
+    if n != buf.len() as u64
+    {
+        return Err("entropy_contribute: getrandom returned a short count after a contribution");
+    }
+    // A seeded CSPRNG producing 32 zero bytes has probability ~2^-256.
+    if buf.iter().all(|&b| b == 0)
+    {
+        return Err("entropy_contribute: getrandom left the buffer all-zero after a contribution");
+    }
+    Ok(())
+}
+
+/// `SYS_ENTROPY_CONTRIBUTE` refuses a handle naming no capability or another
+/// type's with `InvalidCapability`, and a derived `EntropyControl` cap without
+/// `Contribute` with `InsufficientRights`. The capability is checked first: a
+/// bad handle with an over-cap length is still `InvalidCapability`.
+pub fn entropy_contribute_cap_refusals(ctx: &TestContext) -> TestResult
+{
+    let cap = entropy_cap(ctx)?;
+    let buf = [0u8; 16];
+    let invalid_cap = Err(SyscallError::InvalidCapability as i64);
+
+    if syscall::entropy_contribute(0, &buf) != invalid_cap
+    {
+        return Err("entropy_contribute: a null handle must return InvalidCapability");
+    }
+    if syscall::entropy_contribute(ctx.sched_control_cap, &buf) != invalid_cap
+    {
+        return Err("entropy_contribute: a SchedControl cap must return InvalidCapability");
+    }
+    // SAFETY: the kernel refuses the call for its handle before it reads the
+    // buffer, so nothing past `buf`'s 16 bytes is read.
+    let r = unsafe {
+        syscall::entropy_contribute_raw(0, buf.as_ptr(), syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN + 1)
+    };
+    if r != invalid_cap
+    {
+        return Err(
+            "entropy_contribute: a null handle with an over-cap length must return \
+             InvalidCapability",
+        );
+    }
+
+    let weak = syscall::cap_derive(cap, 0)
+        .map_err(|_| "entropy_contribute: deriving a rightless EntropyControl cap failed")?;
+    let r = syscall::entropy_contribute(weak, &buf);
+    syscall::cap_delete(weak)
+        .map_err(|_| "entropy_contribute: deleting the rightless derivation failed")?;
+    if r != Err(SyscallError::InsufficientRights as i64)
+    {
+        return Err("entropy_contribute: a cap without Contribute must return InsufficientRights");
+    }
+    Ok(())
+}
+
+/// `SYS_ENTROPY_CONTRIBUTE` refuses a length past `MAX_ENTROPY_CONTRIBUTE_LEN`
+/// with `InvalidArgument`, and a null, kernel-half, or unmapped buffer with
+/// `InvalidAddress`, the last without faulting the kernel.
+pub fn entropy_contribute_arg_refusals(ctx: &TestContext) -> TestResult
+{
+    let cap = entropy_cap(ctx)?;
+    let buf = [0u8; 16];
+
+    // SAFETY: a length above MAX_ENTROPY_CONTRIBUTE_LEN is refused before the
+    // kernel reads the buffer, so nothing past `buf`'s 16 bytes is read.
+    let r = unsafe {
+        syscall::entropy_contribute_raw(cap, buf.as_ptr(), syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN + 1)
+    };
+    if r != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err(
+            "entropy_contribute: len > MAX_ENTROPY_CONTRIBUTE_LEN must return InvalidArgument",
+        );
+    }
+
+    for (va, failure) in [
+        (0, "entropy_contribute: a null buffer must return InvalidAddress"),
+        (KERNEL_HALF_VA, "entropy_contribute: a kernel-half buffer must return InvalidAddress"),
+        (UNMAPPED_USER_VA, "entropy_contribute: an unmapped buffer must return InvalidAddress"),
+    ]
+    {
+        // SAFETY: the kernel refuses each span: the null and kernel-half ones
+        // by its range check, and the unmapped one, which no fault handler of
+        // ktest's backs, by its faulted copy; nothing is read or absorbed.
+        let r = unsafe { syscall::entropy_contribute_raw(cap, va as *const u8, 16) };
+        if r != Err(SyscallError::InvalidAddress as i64)
+        {
+            return Err(failure);
+        }
     }
     Ok(())
 }

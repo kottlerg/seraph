@@ -139,8 +139,8 @@ On `ECALL` from U-mode:
 
 ### Restartable Syscalls
 
-`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, and
-`SYS_THREAD_WRITE_MEM` are restartable: a fault
+`SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`,
+`SYS_THREAD_READ_MEM`, and `SYS_THREAD_WRITE_MEM` are restartable: a fault
 of the kernel's copy to or from the caller's buffer is handled as
 [docs/fault-handling.md § Kernel Copies](../../../docs/fault-handling.md#kernel-copies)
 specifies. With a fault handler bound to the caller, the fault is delivered as `FAULT_KIND_VM`
@@ -207,9 +207,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  62  SYS_IRQ_MSG_ALLOC
                                  63  SYS_IRQ_ROUTE
                                  64  SYS_IRQ_REMAP
+                                 65  SYS_ENTROPY_CONTRIBUTE
 ```
 
-**Implementation status.** Every number 0–64 has a handler; unallocated numbers
+**Implementation status.** Every number 0–65 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -3229,6 +3230,41 @@ unreachable in practice).
 Callers fill larger buffers by looping in `MAX_GETRANDOM_LEN`-byte chunks; the per-call
 cap bounds the per-call interrupt-off window of the kernel draw (see
 [entropy.md](entropy.md) § Draw API and consumers).
+
+---
+
+### `SYS_ENTROPY_CONTRIBUTE` (65)
+
+Mix a user buffer into the kernel entropy pool (see [entropy.md](entropy.md) § Sources and
+graceful degradation, the contributed source class). The kernel copies the bytes to its stack,
+absorbs them into the central pool, and wipes its copy. It gives them no entropy credit and never
+marks the pool seeded on their account.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `entropy_cap` | `EntropyControl` capability carrying `Contribute` |
+| 1 | `buf` | Source buffer VA (must lie wholly in the user half) |
+| 2 | `len` | Bytes to contribute (`1..=MAX_ENTROPY_CONTRIBUTE_LEN`, 256; `0` is a no-op) |
+
+**Return:** `rax`/`a0`: 0 on success; negative `SyscallError` on failure. A call absorbs all
+`len` bytes or none.
+
+**Capability requirement:** `entropy_cap` must be an `EntropyControl` cap holding `Contribute`
+([capability-model.md](../../../docs/capability-model.md) § `EntropyControl`). A contribution
+changes the pool, a kernel-managed resource, so unlike `SYS_GETRANDOM` the call is not ambient.
+
+**Errors**, checked in this order: `InvalidCapability` (the handle names no `EntropyControl`
+cap); `InsufficientRights` (the cap lacks `Contribute`); `InvalidArgument`
+(`len > MAX_ENTROPY_CONTRIBUTE_LEN`); `InvalidAddress` (null buffer, or a span not wholly within
+the user half); `WouldBlock` (pool not yet seeded; unreachable from userspace, since the pool is
+seeded in Phase 5, before any process runs); `InvalidAddress` (a fault on the span that is
+unhandled; restartable, § Restartable Syscalls).
+
+Callers contribute larger buffers by looping in `MAX_ENTROPY_CONTRIBUTE_LEN`-byte chunks; the
+per-call cap bounds the stack copy and the interrupts-off hold of the pool lock (see
+[entropy.md](entropy.md) § Central pool and multi-source mixing).
 
 ---
 

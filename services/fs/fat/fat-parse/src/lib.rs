@@ -528,6 +528,51 @@ pub fn file_position(
     })
 }
 
+/// One sector's share of a file write ([`sector_write`]), which writes the
+/// file's bytes from its old size, or from the payload's offset when that is
+/// lower, to the payload's end: zeros up to the offset, then the payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectorWrite
+{
+    /// Zero bytes written first, from the byte's offset in its sector.
+    pub zeros: usize,
+    /// Payload bytes written after them.
+    pub data: usize,
+    /// The sector holds bytes below the file's old size that the share does
+    /// not cover, so it is read before it is written. Otherwise it is written
+    /// from a zeroed buffer: every byte it holds outside the share lies past
+    /// the file's new end.
+    pub read_first: bool,
+}
+
+/// The share of the sector holding file byte `at` (at `pos`, its
+/// [`file_position`]) in a write of the file's bytes from `at` to `end`,
+/// where the payload starts at `offset` and the file held `old_size` bytes
+/// before the write. Bytes from `at` below `offset` are the gap between the
+/// old end and the payload, written as zeros. `None` when `at` is not below
+/// `end`, or `pos` does not place `at` in its sector.
+#[must_use]
+pub fn sector_write(
+    pos: &FilePosition,
+    at: u64,
+    offset: u64,
+    end: u64,
+    old_size: u64,
+) -> Option<SectorWrite>
+{
+    let left = u64::try_from(pos.left_in_sector).ok()?;
+    let share = end.checked_sub(at).filter(|&n| n > 0)?.min(left);
+    let zeros = offset.saturating_sub(at).min(share);
+    let sector_start = at.checked_sub(u64::try_from(pos.offset_in_sector).ok()?)?;
+    let keeps_head = pos.offset_in_sector > 0 && sector_start < old_size;
+    let keeps_tail = share < left && at.checked_add(share)? < old_size;
+    Some(SectorWrite {
+        zeros: usize::try_from(zeros).ok()?,
+        data: usize::try_from(share.checked_sub(zeros)?).ok()?,
+        read_first: keeps_head || keeps_tail,
+    })
+}
+
 // ── Directory entry ─────────────────────────────────────────────────────────
 
 /// Maximum FAT long-file-name length, in UCS-2 code units.
@@ -1973,6 +2018,88 @@ mod tests
     {
         assert_eq!(file_position(10, 0, 512), None);
         assert_eq!(file_position(10, 8, 0), None);
+    }
+
+    /// The share of the sector holding `at` on a volume of one 512-byte
+    /// sector per cluster.
+    fn share(at: u64, offset: u64, end: u64, old_size: u64) -> Option<SectorWrite>
+    {
+        sector_write(&file_position(at, 1, 512)?, at, offset, end, old_size)
+    }
+
+    #[test]
+    fn sector_write_zero_fills_the_gap_before_the_payload()
+    {
+        // A 23-byte file written at 1031..1035: its first sector keeps bytes
+        // 0..23 and zeros the rest, the next is all zeros, the third holds
+        // 7 zeros then the payload; none past the first is read.
+        let first = SectorWrite {
+            zeros: 489,
+            data: 0,
+            read_first: true,
+        };
+        assert_eq!(share(23, 1031, 1035, 23), Some(first));
+        let gap = SectorWrite {
+            zeros: 512,
+            data: 0,
+            read_first: false,
+        };
+        assert_eq!(share(512, 1031, 1035, 23), Some(gap));
+        let last = SectorWrite {
+            zeros: 7,
+            data: 4,
+            read_first: false,
+        };
+        assert_eq!(share(1024, 1031, 1035, 23), Some(last));
+    }
+
+    #[test]
+    fn sector_write_reads_only_a_sector_holding_bytes_it_keeps()
+    {
+        // In place, below the old size on both sides.
+        let inside = SectorWrite {
+            zeros: 0,
+            data: 10,
+            read_first: true,
+        };
+        assert_eq!(share(100, 100, 110, 400), Some(inside));
+        // From the sector's start, the old size inside the share.
+        let over_end = SectorWrite {
+            zeros: 0,
+            data: 10,
+            read_first: false,
+        };
+        assert_eq!(share(512, 512, 522, 520), Some(over_end));
+        // From the sector's start, the old size past the share.
+        let keeps_tail = SectorWrite {
+            zeros: 0,
+            data: 10,
+            read_first: true,
+        };
+        assert_eq!(share(512, 512, 522, 600), Some(keeps_tail));
+        // The whole sector.
+        let whole = SectorWrite {
+            zeros: 0,
+            data: 512,
+            read_first: false,
+        };
+        assert_eq!(share(512, 512, 2048, 4096), Some(whole));
+        // An append at the old size, mid-sector, keeps the bytes before it.
+        let append = SectorWrite {
+            zeros: 0,
+            data: 5,
+            read_first: true,
+        };
+        assert_eq!(share(700, 700, 705, 700), Some(append));
+    }
+
+    #[test]
+    fn sector_write_refuses_an_empty_share_or_a_misplaced_position()
+    {
+        assert_eq!(share(100, 100, 100, 0), None);
+        assert_eq!(share(200, 100, 150, 0), None);
+        let pos = file_position(600, 1, 512).unwrap();
+        assert_eq!(sector_write(&pos, 50, 50, 60, 0), None);
     }
 
     #[test]

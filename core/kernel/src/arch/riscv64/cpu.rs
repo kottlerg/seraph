@@ -342,7 +342,8 @@ pub unsafe fn disable_unswitched_user_state()
     let read_back = (access.trapped == 0).then_some(access.read_back);
     match check_sstateen0(read_back)
     {
-        Ok(()) => {}
+        Ok(()) =>
+        {}
         Err(SstateenError::Inaccessible) => crate::fatal(
             "Ssstateen: sstateen0 not accessible from S-mode (no Ssstateen, or the firmware \
              left mstateen0.SE0 clear) — required (RVA23)",

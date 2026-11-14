@@ -130,7 +130,9 @@ Each feature is classified per architecture as one of:
 - **x2APIC mode** — used when present (and required to address more than 255 CPUs); the kernel
   falls back to xAPIC MMIO.
 - **AES-NI and SHA-NI** — crypto acceleration (design intent; not yet enabled).
-- **CET (shadow stack / IBT)** — control-flow integrity (design intent; not yet enabled).
+- **CET shadow stack (SHSTK)** — supervisor shadow stacks, return-address integrity for the
+  kernel (design intent; not yet enabled;
+  [core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC
   timer is the fallback.
 - **UMIP** (`CR4.UMIP`) — set on every CPU when present, so ring-3 `SGDT`, `SIDT`, `SLDT`, `SMSW`,
@@ -160,6 +162,9 @@ Each feature is classified per architecture as one of:
   paranoid NMI / `#DB` / `#DF` / `#MC` entry depends on ring 3 being unable to set a
   kernel-half GS base; without `FSGSBASE` ring 3 can change it only by loading a GDT selector,
   whose base is 0 (see [arch-interface.md](../core/kernel/docs/arch-interface.md) § `cpu`).
+- **CET indirect-branch tracking (IBT)** — not used: forward-edge control-flow integrity is not
+  pursued
+  ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **Legacy BIOS / multiboot** — boot is UEFI-only.
 - **Secure Boot, TPM, RTC** — not boot dependencies.
 
@@ -242,6 +247,13 @@ Each feature is classified per architecture as one of:
   (`mseccfg.SSEED`, which OpenSBI sets on such a hart), which the kernel learns by probing the
   CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **GOP framebuffer, PCIe ECAM** — as on x86-64.
+- **Zicfiss** — supervisor shadow stacks, return-address integrity for the kernel, enabled
+  through the SBI Firmware Features extension; an RVA23 option, not mandatory. Used only when
+  the firmware tables advertise it for every hart, so a machine on which only some harts have it
+  runs unprotected; a secondary hart whose firmware then refuses the enable, after the boot
+  hart's succeeded, halts the boot, since its description is wrong (design intent;
+  not yet enabled, and not buildable until the toolchain emits the shadow-stack instructions;
+  [core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 
 ### Unsupported
 
@@ -249,6 +261,8 @@ Each feature is classified per architecture as one of:
   does not boot.
 - **Legacy / embedded RISC-V profiles** — outside the RVA23 floor.
 - **Port-mapped I/O** — RISC-V has no port I/O; all device access is MMIO.
+- **Zicfilp landing pads** — not used: forward-edge control-flow integrity is not pursued
+  ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **Cache-block-management instructions (Zicbom/Zicboz/Zicbop)** — not used; the kernel assumes
   cache-coherent DMA. (Distinct from Svpbmt: the PBMT memory type governs how a hart's own
   accesses to a mapping behave, not DMA cache coherence.)
@@ -344,6 +358,7 @@ required-vs-opportunistic rule are architecture-neutral and unchanged.
 [Page Tables](../core/boot/docs/page-tables.md),
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
+[Return-Address Integrity](../core/kernel/docs/return-address-integrity.md),
 [Architecture Overview](architecture.md), [Build System](build-system.md),
 [Fault Handling](fault-handling.md), [Memory Model](memory-model.md),
 [shared/riscv-step/README.md](../shared/riscv-step/README.md)

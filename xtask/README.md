@@ -238,12 +238,13 @@ fails if the bundle is missing. The bundle is composed by
 harness). `mkdisk` always removes the `\EFI\seraph\mapredo` test knob, which
 only [`test-map-redo`](#cargo-xtask-test-map-redo) stages, for its own boot.
 
-`disk.img` carries three GPT partitions: the EFI System Partition
+`disk.img` carries four GPT partitions: the EFI System Partition
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
-excluding `esp/` and `data/`), and an arch-neutral `SERAPH_DATA`
-partition (from `sysroot/data/`). The data partition is authored
-unconditionally; `mkdisk --split-data` authors it alone on a second image,
-`disk-data.img` beside `disk.img`, which then carries the other two, for a
+excluding `esp/` and `data/`), an arch-neutral `SERAPH_DATA`
+partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-neutral
+`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of `disk.img`. The
+data partition is authored unconditionally; `mkdisk --split-data` authors it alone on a second
+image, `disk-data.img` beside `disk.img`, which then carries the ESP, root and swap, for a
 boot that attaches the pair (`run --second-disk disk-data.img`), and every
 other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
 the data partition at `/data`, on whichever disk holds it; the data tree
@@ -273,7 +274,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
-| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`; omit to author all three on `disk.img` and remove a stale `disk-data.img` |
+| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
 
 Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
 recipe; a plain repack would prune it):

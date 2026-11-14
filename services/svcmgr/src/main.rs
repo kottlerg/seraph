@@ -160,11 +160,14 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         caps.rootfs_root,
         ipc::published_names::ROOTFS_ROOT,
     );
-    // vfsd.mount / vfsd.deny — SENDs on vfsd's service endpoint, endowed
-    // pre-badged by init (`MOUNT_AUTHORITY`, and the no-authority
-    // `DENY_BADGE`). Seed-only: svctest alone seeds them.
+    // vfsd.mount / vfsd.deny / vfsd.swap — SENDs on vfsd's service
+    // endpoint, endowed pre-badged by init (`MOUNT_AUTHORITY`, the
+    // no-authority `DENY_BADGE`, and `SWAP_AUTHORITY`). Seed-only: svctest
+    // alone seeds the first two; the swap service's recipe is to seed
+    // `vfsd.swap`, which svctest's seeds while no swap service exists.
     publish_endowed_send(registry, caps.vfsd_mount, ipc::published_names::VFSD_MOUNT);
     publish_endowed_send(registry, caps.vfsd_deny, ipc::published_names::VFSD_DENY);
+    publish_endowed_send(registry, caps.vfsd_swap, ipc::published_names::VFSD_SWAP);
 
     // svcmgr — SEND on svcmgr's own service endpoint (crasher seeds it),
     // badged so no consumer holds an unbadged source it could re-badge with

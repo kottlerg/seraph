@@ -182,7 +182,7 @@ fn elf_parts(data: &[u8]) -> Option<Vec<Part>>
     {
         let flags = section.sh_flags(endian);
         let kind = section.sh_type(endian);
-        if !flags.contains(SHF_ALLOC) && kind != SHT_NOTE
+        if flags & u64::from(SHF_ALLOC) == 0 && kind != SHT_NOTE
         {
             continue;
         }
@@ -1444,6 +1444,29 @@ rustflags = [\"-Zunstable-options\"]
         );
     }
 
+    /// The value of `attempt` once it succeeds, after a dropped lock has
+    /// ended. A process another test of this binary spawns shares this
+    /// process's descriptors until it execs, and with them the locks their
+    /// open files hold, so a lock can outlive its drop by that window; the
+    /// bounded wait covers it. An attempt that never succeeds fails the test
+    /// with its last error.
+    fn after_release<T, E: std::fmt::Debug>(mut attempt: impl FnMut() -> Result<T, E>) -> T
+    {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop
+        {
+            match attempt()
+            {
+                Ok(value) => return value,
+                Err(error) =>
+                {
+                    assert!(std::time::Instant::now() < deadline, "{error:?}");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_second_run_waits_for_the_scratch_lock()
     {
@@ -1459,10 +1482,11 @@ rustflags = [\"-Zunstable-options\"]
         let error = lock_scratch(&scratch, &|| true).unwrap_err();
         assert!(error.to_string().contains("interrupted"), "{error}");
         drop(held);
-        other.try_lock().unwrap();
+        after_release(|| other.try_lock());
         drop(other);
-        // A free lock is taken before the interrupt flag is read.
-        drop(lock_scratch(&scratch, &|| true).unwrap());
+        // A free lock is taken before the interrupt flag is read: a run that
+        // read the flag first would fail every attempt.
+        drop(after_release(|| lock_scratch(&scratch, &|| true)));
         fs::remove_dir_all(&scratch).unwrap();
     }
 

@@ -40,7 +40,8 @@ services/svctest/
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
-        │                      # death queues; logd death forward; init reap
+        │                      # large-module create; death queues; logd death
+        │                      # forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
@@ -56,6 +57,8 @@ services/svctest/
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
         │                      #   refused access; page-table drain; teardown; fault cost;
         │                      #   faults on a fragmented pool; a sparse large region
+        ├── budget.rs          # Create-time memory max: clamp, grants to it, LIMIT, decline 10,
+        │                      #   pages back after the destroy; reserve and max refusals
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -117,10 +120,10 @@ drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`cap
 `caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and
 `pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
 vfsd phases (`caps[4]`, `caps[5]`), the `logd_death_forward` and `logd_concurrent` phases
-(`caps[6]`), and the `crash_endpoint` phase (`caps[14]`) instead fail their assertions. The
-seed-only phase thus fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so
-that phase's own zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the
-same zero cap, and the run ends idle.
+(`caps[6]`), the vfsd swap-partition phase (`caps[14]`), and the `crash_endpoint` phase
+(`caps[15]`) instead fail their assertions. The seed-only phase thus fails the run on a zero
+`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
+reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -132,7 +135,7 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
 to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`, and
-`caps[12]` to `caps[14]`), the last being the debug-authority cap the recipe's
+`caps[12]` to `caps[15]`), the last being the debug-authority cap the recipe's
 `debug_authority = yes` grants; [service-definitions.md §
 `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's cap shape and the zero slot
 an unresolved name leaves. With no creator endpoint, every slot stays zero.
@@ -153,7 +156,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[11]` | `devmgr.class.serial-deny` | drivers deny phase: a `serial` class SEND without the driver's verb bits |
 | `caps[12]` | `devmgr.class.input-deny` | drivers deny phase: an `input` class SEND without the driver's verb bits |
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits |
-| `caps[14]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |
+| `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
+| `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; svctest declares itself undebuggable at startup |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
@@ -194,15 +198,20 @@ on `caps[4]` to `MOUNT` of the root role at `/` and of the data role at `/esp`, 
 mounted, in each of six rounds (vfsd checks the mount point before it registers a partition or
 spawns a driver, so a rejection that started a spawn first would change a later reply); a
 `NOT_FOUND` reply to a `MOUNT` whose path length exceeds the path bytes it carries; and that the
-mounted filesystems still answer afterwards. The two vfsd seeds ride in a second bootstrap round, so
-every svctest boot receives a seed list longer than one round, and the svcmgr second-seed-round
-phase fails the run when either arrives empty. `caps[6]` is a SEND on the master log endpoint badged
-`LOG_QUERY_AUTHORITY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries); the
-`logd_death_forward` phase reads its dead child's retired slot and history through it, and requires
-`QUERY_DENIED` for a query on svctest's own log cap. Every seed is seed-only in svcmgr's registry.
-The no-authority `pwrmgr.deny` cap is public, so svctest resolves it through `QUERY_ENDPOINT` on its
-per-process `service_registry_cap` and spends no seed slot on it; it drives the pwrmgr cap-deny
-phase, which requires an `UNAUTHORIZED` reply to `SHUTDOWN`.
+mounted filesystems still answer afterwards. `caps[14]` is a SEND on the same endpoint badged
+`SWAP_AUTHORITY`; the `vfsd_swap_partition` phase, which runs after the short-path phase, requires
+`UNAUTHORIZED` to `GET_SWAP_PARTITION` on `caps[4]` and `caps[5]`, and on `caps[14]` a hand-out of
+a cap that addresses exactly the swap partition, a second hand-out revoking the first. The
+`vfsd.mount` and `vfsd.deny` seeds ride in a second bootstrap round, so every svctest boot
+receives a seed list longer than one round, and the svcmgr second-seed-round phase fails the run
+when either arrives empty.
+`caps[6]` is a SEND on the master log endpoint badged `LOG_QUERY_AUTHORITY` ([logd IPC
+interface](../logd/docs/ipc-interface.md) § Queries); the `logd_death_forward` phase reads its dead
+child's retired slot and history through it, and requires `QUERY_DENIED` for a query on svctest's
+own log cap. Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
+public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
+and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
+reply to `SHUTDOWN`.
 
 ---
 

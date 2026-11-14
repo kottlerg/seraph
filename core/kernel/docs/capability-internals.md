@@ -405,13 +405,13 @@ which returns its pool, comes after their teardowns and every cascade they start
 Arena](#body-arena)). Every release a teardown makes pushes the object it orphans: an ancestor
 Memory object's retype lease, a donation's lease, the references a dying `CSpace`'s slots hold (a
 nested `CSpace` among them), a caller-sized wait set's member references, a thread's fault-handler
-binding, and the queue references of an owner's chain of death-observer nodes. The call pops and
-tears down the most recent object until the stack is empty, and no teardown calls `dealloc_object`
-itself, so a chain of `CSpace`s each holding the last reference to the next, or a `CSpace` releasing
-thousands of objects, is torn down iteratively with constant stack use, and no arm runs inside
-another's lock scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer
-arm has released it; a wait set's sources are torn down after `wait_set_drop` has released every
-source lock).
+binding and fault redirect, and the queue references of an owner's chain of death-observer nodes.
+The call pops and tears down the most recent object until the stack is empty, and no teardown calls
+`dealloc_object` itself, so a chain of `CSpace`s each holding the last reference to the next, or a
+`CSpace` releasing thousands of objects, is torn down iteratively with constant stack use, and no
+arm runs inside another's lock scope (a nested `CSpace`'s derivation drain takes the derivation
+lock after the outer arm has released it; a wait set's sources are torn down after
+`wait_set_drop` has released every source lock).
 
 The walk holds no lock across groups (each group's return takes only its Memory object's locks,
 its read lock and its retype-allocator lock), and takes the interrupts pending on its CPU after
@@ -736,8 +736,9 @@ costs a 72-byte slot, a retype child of at least 128 bytes, or a 24-byte observe
 them hold at least 48 GiB against one object, and reaching it refuses instead of corrupting. Every
 other reference is taken unchecked, in the 2^31 of headroom between the limit and `u32::MAX`,
 because each kind is bounded by an object count rather than by a request. Per thread: its syscall
-pins (a few), its fault-handler binding (one), the lease of a retype it has in flight that passed
-`retype_allocate`'s check just before the count reached the limit (one), and the destinations of an
+pins (a few), its fault-handler binding (one), its fault redirect (one), the lease of a retype it
+has in flight that passed `retype_allocate`'s check just before the count reached the limit (one),
+and the destinations of an
 IPC transfer it has in flight that passed the message check (at most `MSG_CAP_SLOTS_MAX`, four);
 fewer than 16 in all. Per other object: wait-set membership (one per source), Mmio mapping records
 (each 16 bytes of a caller-funded body or spill chunk, so 2^31 of them hold 32 GiB), SEED leases
@@ -783,6 +784,10 @@ The principal kernel-internal owners:
   delivery and before its park (the pin-before-park rule), so a concurrent rebind or unbind
   cannot free the endpoint mid-delivery; a release that drops the last reference runs the
   endpoint's teardown, whose send-queue drain kills the faulter if it is still queued there.
+- **Fault redirect.** A `FAULT_REPLY_REDIRECT` reply takes a reference on the Endpoint it names
+  into the faulting thread's `fault_redirect` field (one per thread), held until the thread's next
+  delivery takes it (as a fault delivery does a binding's) or the thread's destruction releases
+  it ([fault-handling.md § Reply](../../../docs/fault-handling.md#reply)).
 - **Death-observer bindings.** `SYS_THREAD_BIND_NOTIFICATION` and
   `SYS_ASPACE_BIND_NOTIFICATION` take a reference on the bound EventQueue, under the owner's
   lock (the thread's `sched_lock`, the address space's `death_lock`), held for the binding's

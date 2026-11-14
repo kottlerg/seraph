@@ -83,6 +83,12 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 /// teardown) holds that lock throughout, so the `started` check and its
 /// transition, and the install-once namespace and cwd-override slots, are
 /// each one step no other thread interleaves.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "`reserve`, `started`, `dma_hold` and `no_debug` are independent facts set at \
+              different points of the child's life (creation, start, create flag, declaration), \
+              not states of one machine"
+)]
 pub struct ProcessEntry
 {
     /// The child's process badge: the table key, the correlator of its death
@@ -138,6 +144,10 @@ pub struct ProcessEntry
     /// request's scheduling fields against this value (see
     /// [`resolve_spawn_sched`]).
     pub band_max: u8,
+    /// Whether the child's memmgr budget node is a system-reserve node, so
+    /// the child may ask `CREATE_RESERVE` for its own children
+    /// ([`child_budget`]).
+    pub reserve: bool,
     /// The child's entry point, its ELF entry relocated by the load bias,
     /// where `start_process` starts the main thread.
     pub entry_point: u64,
@@ -833,52 +843,199 @@ impl ProcessTable
         })
     }
 
-    /// memmgr badge of the live entry whose badge matches, for the
-    /// creator-class check of [`child_memmgr_flags`]. `None` if the badge is
-    /// unknown.
+    /// The creator a create request badged `badge` comes from: the
+    /// un-badged creator ([`Creator::UNBADGED`]) for badge `0`, else the live
+    /// entry whose badge matches. `None` for any other badge: a process
+    /// already reaped (its own procmgr cap or its process handle, which a
+    /// holder can still send on), a verb-badged cap, or a release token.
+    /// procmgr refuses a create from such a badge: its child would have no
+    /// creator's node to sit under, and so would escape every memory max.
     #[must_use]
-    pub fn memmgr_badge_by_badge(&self, badge: u64) -> Option<u64>
+    pub fn creator_of(&self, badge: u64) -> Option<Creator>
     {
-        self.find_by_badge(badge).map(|e| e.memmgr_badge)
-    }
-
-    /// Band ceiling of the live entry whose badge matches, for
-    /// creator-band resolution on nested spawns. `None` if the badge is
-    /// unknown (already reaped, or a badge minted outside the table).
-    #[must_use]
-    pub fn band_max_by_badge(&self, badge: u64) -> Option<u8>
-    {
-        self.find_by_badge(badge).map(|e| e.band_max)
+        if badge == 0
+        {
+            return Some(Creator::UNBADGED);
+        }
+        self.find_by_badge(badge).map(|e| Creator {
+            band_max: e.band_max,
+            memmgr_badge: e.memmgr_badge,
+            reserve: e.reserve,
+            unbadged: false,
+        })
     }
 }
 
-// ── Spawn physical-address class ─────────────────────────────────────────────
+// ── Spawn budget and physical-address class ─────────────────────────────────
 
-/// The `memmgr_labels::REGISTER_PROCESS` flags of a child a create request
-/// labelled `label` makes, for the creator badged `creator_badge` on
-/// procmgr, whose memmgr badge is `creator_memmgr_badge` (`None` when the
-/// table holds no entry for it).
-///
-/// `procmgr_labels::CREATE_PHYS_ACCESS` asks for a phys-class child
-/// (`memmgr_labels::REGISTER_PHYS_CLASS`). Only a creator that may read
-/// physical addresses itself may ask: an un-badged one (badge `0`: init, or
-/// svcmgr's mint source) or one memmgr registered phys-class, whose memmgr
-/// badge carries `memmgr_labels::PHYS_CLASS_BADGE_BIT`. Returns `None` when
-/// any other creator asks, which procmgr refuses with `INVALID_ARGUMENT`.
-#[must_use]
-pub fn child_memmgr_flags(
-    label: u64,
-    creator_badge: u64,
-    creator_memmgr_badge: Option<u64>,
-) -> Option<u64>
+/// What a create request's child takes from its creator
+/// ([`ProcessTable::creator_of`]): its spawn ceiling, its memmgr budget
+/// node's parent, and whether it may be phys-class or a reserve node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Creator
 {
-    if label & ipc::procmgr_labels::CREATE_PHYS_ACCESS == 0
+    /// The creator's band ceiling, which bounds the child's band
+    /// ([`resolve_spawn_sched`]).
+    pub band_max: u8,
+    /// The creator's memmgr badge, under whose budget node the child's node
+    /// is registered; `0` registers a top-level node.
+    pub memmgr_badge: u64,
+    /// Whether the creator's budget node is a system-reserve node.
+    pub reserve: bool,
+    /// Whether the creator is un-badged (badge `0`): init, or svcmgr's mint
+    /// source.
+    pub unbadged: bool,
+}
+
+impl Creator
+{
+    /// The un-badged creator (badge `0`): init, which creates devmgr, vfsd
+    /// and svcmgr, or a create svcmgr sends on its un-badged mint source.
+    /// Its ceiling is the full baseline band, its children are top-level
+    /// reserve nodes (init's own record parents no process), and it may ask
+    /// for a phys-class child.
+    pub const UNBADGED: Creator = Creator {
+        band_max: ipc::sched_policy::BASELINE_PRIORITY_MAX,
+        memmgr_badge: 0,
+        reserve: true,
+        unbadged: true,
+    };
+
+    /// Whether the creator may ask for a phys-class child: an un-badged one,
+    /// or one memmgr registered phys-class, whose memmgr badge carries
+    /// `memmgr_labels::PHYS_CLASS_BADGE_BIT`.
+    #[must_use]
+    pub fn phys_class(&self) -> bool
     {
-        return Some(0);
+        self.unbadged || self.memmgr_badge & ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT != 0
     }
-    let creator_is_phys = creator_badge == 0
-        || creator_memmgr_badge.is_some_and(|b| b & ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT != 0);
-    creator_is_phys.then_some(ipc::memmgr_labels::REGISTER_PHYS_CLASS)
+}
+
+/// How a child registers with memmgr (`memmgr_labels::REGISTER_PROCESS`):
+/// its class, its budget node's parent, reserve membership, and max.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildBudget
+{
+    /// A phys-class child (`REGISTER_PHYS_CLASS`).
+    pub phys: bool,
+    /// A system-reserve node (`REGISTER_RESERVE`).
+    pub reserve: bool,
+    /// The memmgr badge of the parent node's process (`data[2]`); `0` for a
+    /// top-level node.
+    pub parent: u64,
+    /// The max in pages the creator asked for (`REGISTER_MAX`, `data[3]`);
+    /// `None` for no max.
+    pub max: Option<u64>,
+}
+
+impl ChildBudget
+{
+    /// The `REGISTER_PROCESS` flags word (`data[1]`).
+    #[must_use]
+    pub fn register_flags(&self) -> u64
+    {
+        use ipc::memmgr_labels::{REGISTER_MAX, REGISTER_PHYS_CLASS, REGISTER_RESERVE};
+        let mut flags = 0;
+        if self.phys
+        {
+            flags |= REGISTER_PHYS_CLASS;
+        }
+        if self.reserve
+        {
+            flags |= REGISTER_RESERVE;
+        }
+        if self.max.is_some()
+        {
+            flags |= REGISTER_MAX;
+        }
+        flags
+    }
+}
+
+/// Why [`child_budget`] or [`decode_memory_max`] refused a create request,
+/// which procmgr answers with `INVALID_ARGUMENT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BudgetRefusal
+{
+    /// `CREATE_PHYS_ACCESS` from a creator that is not phys-class.
+    PhysAccess,
+    /// `CREATE_RESERVE` from a creator whose node is outside the reserve.
+    Reserve,
+    /// `CREATE_MEMORY_MAX` without its data word delivered.
+    MissingMax,
+}
+
+/// The memmgr registration of the child a create request labelled `label`
+/// makes for `creator`, with the max `max` the request carries
+/// ([`decode_memory_max`]).
+///
+/// The child's node sits under the creator's (top-level for the un-badged
+/// creator). `procmgr_labels::CREATE_PHYS_ACCESS` asks for a phys-class
+/// child, honoured only from a phys-class creator ([`Creator::phys_class`]).
+/// `procmgr_labels::CREATE_RESERVE` asks for a reserve node, honoured only
+/// from a creator whose own node is a reserve node; a child of the un-badged
+/// creator is a reserve node with or without it.
+///
+/// # Errors
+/// [`BudgetRefusal::PhysAccess`] or [`BudgetRefusal::Reserve`] when the
+/// creator may not ask for what the label asks.
+pub fn child_budget(
+    label: u64,
+    max: Option<u64>,
+    creator: &Creator,
+) -> Result<ChildBudget, BudgetRefusal>
+{
+    use ipc::procmgr_labels::{CREATE_PHYS_ACCESS, CREATE_RESERVE};
+    let phys = label & CREATE_PHYS_ACCESS != 0;
+    if phys && !creator.phys_class()
+    {
+        return Err(BudgetRefusal::PhysAccess);
+    }
+    let asks_reserve = label & CREATE_RESERVE != 0;
+    if asks_reserve && !creator.reserve
+    {
+        return Err(BudgetRefusal::Reserve);
+    }
+    Ok(ChildBudget {
+        phys,
+        reserve: asks_reserve || creator.unbadged,
+        parent: creator.memmgr_badge,
+        max,
+    })
+}
+
+/// The memory max a create request labelled `label` carries, whose data
+/// words after the fixed ones start at `first_word` (0 for `CREATE_PROCESS`,
+/// 1 for `CREATE_FROM_FILE`): `None` without `procmgr_labels::CREATE_MEMORY_MAX`,
+/// else the word after the argv/env header when `CREATE_ARGV_ENV` is set, or
+/// at `first_word` without it.
+///
+/// # Errors
+/// [`BudgetRefusal::MissingMax`] when the request did not deliver that word,
+/// so no max is read from the zero tail past the delivered words.
+pub fn decode_memory_max(
+    req: &ipc::IpcMessage,
+    first_word: usize,
+) -> Result<Option<u64>, BudgetRefusal>
+{
+    use ipc::procmgr_labels::{ARGV_ENV_HEADER_WORDS, CREATE_ARGV_ENV, CREATE_MEMORY_MAX};
+    if req.label & CREATE_MEMORY_MAX == 0
+    {
+        return Ok(None);
+    }
+    let word = if req.label & CREATE_ARGV_ENV == 0
+    {
+        first_word
+    }
+    else
+    {
+        first_word.saturating_add(ARGV_ENV_HEADER_WORDS)
+    };
+    if word >= req.word_count()
+    {
+        return Err(BudgetRefusal::MissingMax);
+    }
+    Ok(Some(req.word(word)))
 }
 
 // ── Debug authority ─────────────────────────────────────────────────────────
@@ -1281,6 +1438,7 @@ mod tests
             namespace_override: 0,
             cwd_override: 0,
             band_max: 0,
+            reserve: false,
             entry_point: 0,
             tls_base_va: 0,
             stack_top_vaddr: 0,
@@ -2112,7 +2270,7 @@ mod tests
         let alias = 0x0000_0009_0000_0020;
         assert!(table.find_mut_by_badge(alias).is_none());
         assert!(table.query_by_badge(alias).is_none());
-        assert!(table.band_max_by_badge(alias).is_none());
+        assert!(table.creator_of(alias).is_none());
         assert!(table.take_by_badge(alias).is_none());
         assert_eq!(table.len(), 1);
     }
@@ -2240,45 +2398,178 @@ mod tests
         assert_eq!(recent.find(17, 2_000), None);
     }
 
-    #[test]
-    fn a_phys_class_child_needs_an_unbadged_or_phys_class_creator()
+    /// A reserve creator found in the table, whose memmgr badge is `memmgr_badge`.
+    fn entry_creator(memmgr_badge: u64) -> Creator
     {
-        use ipc::memmgr_labels::{PHYS_CLASS_BADGE_BIT, REGISTER_PHYS_CLASS};
-        use ipc::procmgr_labels::{CREATE_PHYS_ACCESS, CREATE_PINNED};
-        let phys = CREATE_PHYS_ACCESS | CREATE_PINNED;
-        // No phys flag: an ordinary child for any creator.
-        assert_eq!(child_memmgr_flags(CREATE_PINNED, 16, Some(5)), Some(0));
-        // Un-badged creator (init) and a phys-class creator (devmgr).
-        assert_eq!(child_memmgr_flags(phys, 0, None), Some(REGISTER_PHYS_CLASS));
-        assert_eq!(
-            child_memmgr_flags(phys, 16, Some(PHYS_CLASS_BADGE_BIT | 5)),
-            Some(REGISTER_PHYS_CLASS)
-        );
-        // An ordinary creator, and a badge the table does not hold.
-        assert_eq!(child_memmgr_flags(phys, 16, Some(5)), None);
-        assert_eq!(child_memmgr_flags(phys, 16, None), None);
+        Creator {
+            band_max: 5,
+            memmgr_badge,
+            reserve: true,
+            unbadged: false,
+        }
     }
 
     #[test]
-    fn memmgr_badge_by_badge_reports_the_entry_and_absence()
+    fn a_phys_class_child_needs_an_unbadged_or_phys_class_creator()
+    {
+        use ipc::memmgr_labels::PHYS_CLASS_BADGE_BIT;
+        use ipc::procmgr_labels::{CREATE_PHYS_ACCESS, CREATE_PINNED};
+        let phys = CREATE_PHYS_ACCESS | CREATE_PINNED;
+        let ordinary = entry_creator(5);
+        // No phys flag: an ordinary child for any creator.
+        assert_eq!(
+            child_budget(CREATE_PINNED, None, &ordinary).map(|b| b.phys),
+            Ok(false)
+        );
+        // Un-badged creator (init) and a phys-class creator (devmgr).
+        assert_eq!(
+            child_budget(phys, None, &Creator::UNBADGED).map(|b| b.phys),
+            Ok(true)
+        );
+        let devmgr = entry_creator(PHYS_CLASS_BADGE_BIT | 5);
+        assert_eq!(child_budget(phys, None, &devmgr).map(|b| b.phys), Ok(true));
+        // An ordinary creator.
+        assert_eq!(
+            child_budget(phys, None, &ordinary),
+            Err(BudgetRefusal::PhysAccess)
+        );
+    }
+
+    #[test]
+    fn a_child_node_sits_under_its_creator_and_reserve_needs_a_reserve_creator()
+    {
+        use ipc::procmgr_labels::CREATE_RESERVE;
+        // init's children: top-level reserve nodes, asked or not.
+        for label in [0, CREATE_RESERVE]
+        {
+            assert_eq!(
+                child_budget(label, None, &Creator::UNBADGED),
+                Ok(ChildBudget {
+                    phys: false,
+                    reserve: true,
+                    parent: 0,
+                    max: None,
+                })
+            );
+        }
+        // A reserve creator's child is outside the reserve unless it asks.
+        let svcmgr = entry_creator(0x51);
+        assert_eq!(
+            child_budget(0, None, &svcmgr).map(|b| (b.reserve, b.parent)),
+            Ok((false, 0x51))
+        );
+        assert_eq!(
+            child_budget(CREATE_RESERVE, None, &svcmgr).map(|b| (b.reserve, b.parent)),
+            Ok((true, 0x51))
+        );
+        // A creator outside the reserve may not ask.
+        let client = Creator {
+            reserve: false,
+            ..entry_creator(0x52)
+        };
+        assert_eq!(
+            child_budget(CREATE_RESERVE, None, &client),
+            Err(BudgetRefusal::Reserve)
+        );
+        assert_eq!(
+            child_budget(0, Some(9), &client),
+            Ok(ChildBudget {
+                phys: false,
+                reserve: false,
+                parent: 0x52,
+                max: Some(9),
+            })
+        );
+    }
+
+    #[test]
+    fn register_flags_name_the_class_the_reserve_and_the_max()
+    {
+        use ipc::memmgr_labels::{REGISTER_MAX, REGISTER_PHYS_CLASS, REGISTER_RESERVE};
+        let budget = ChildBudget {
+            phys: false,
+            reserve: false,
+            parent: 0,
+            max: None,
+        };
+        assert_eq!(budget.register_flags(), 0);
+        let full = ChildBudget {
+            phys: true,
+            reserve: true,
+            parent: 7,
+            max: Some(0),
+        };
+        assert_eq!(
+            full.register_flags(),
+            REGISTER_PHYS_CLASS | REGISTER_RESERVE | REGISTER_MAX
+        );
+    }
+
+    #[test]
+    fn the_memory_max_word_follows_the_fixed_words_and_the_argv_env_header()
+    {
+        use ipc::IpcMessage;
+        use ipc::procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_FROM_FILE, CREATE_MEMORY_MAX, CREATE_PROCESS,
+        };
+        // No flag: no max, whatever the words.
+        let plain = IpcMessage::builder(CREATE_FROM_FILE)
+            .word(0, 4096)
+            .word(1, 7)
+            .build();
+        assert_eq!(decode_memory_max(&plain, 1), Ok(None));
+        // CREATE_PROCESS: word 0, or word 4 after the header.
+        let module = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX)
+            .word(0, 33)
+            .build();
+        assert_eq!(decode_memory_max(&module, 0), Ok(Some(33)));
+        let module_argv = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX | CREATE_ARGV_ENV)
+            .words(0, &[1, 2, 3, 4, 44])
+            .build();
+        assert_eq!(decode_memory_max(&module_argv, 0), Ok(Some(44)));
+        // CREATE_FROM_FILE: word 1, or word 5 after the header.
+        let file = IpcMessage::builder(CREATE_FROM_FILE | CREATE_MEMORY_MAX)
+            .words(0, &[4096, 55])
+            .build();
+        assert_eq!(decode_memory_max(&file, 1), Ok(Some(55)));
+        let file_argv = IpcMessage::builder(CREATE_FROM_FILE | CREATE_MEMORY_MAX | CREATE_ARGV_ENV)
+            .words(0, &[4096, 1, 2, 3, 4, 66])
+            .build();
+        assert_eq!(decode_memory_max(&file_argv, 1), Ok(Some(66)));
+        // The flag without its word delivered.
+        let missing = IpcMessage::builder(CREATE_FROM_FILE | CREATE_MEMORY_MAX | CREATE_ARGV_ENV)
+            .words(0, &[4096, 1, 2, 3, 4])
+            .build();
+        assert_eq!(
+            decode_memory_max(&missing, 1),
+            Err(BudgetRefusal::MissingMax)
+        );
+        let none = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX).build();
+        assert_eq!(decode_memory_max(&none, 0), Err(BudgetRefusal::MissingMax));
+    }
+
+    #[test]
+    fn creator_of_reports_the_unbadged_creator_an_entry_and_absence()
     {
         let mut table = ProcessTable::new();
         let mut entry = entry_with_badge(16);
         entry.memmgr_badge = 0x77;
+        entry.band_max = 9;
+        entry.reserve = true;
         assert_eq!(table.insert(entry), Ok(()));
-        assert_eq!(table.memmgr_badge_by_badge(16), Some(0x77));
-        assert_eq!(table.memmgr_badge_by_badge(99), None);
-    }
-
-    #[test]
-    fn band_max_by_badge_reports_ceiling_and_absence()
-    {
-        let mut table = ProcessTable::new();
-        let mut entry = entry_with_badge(16);
-        entry.band_max = 21;
-        assert_eq!(table.insert(entry), Ok(()));
-        assert_eq!(table.band_max_by_badge(16), Some(21));
-        assert_eq!(table.band_max_by_badge(99), None);
+        assert_eq!(table.creator_of(0), Some(Creator::UNBADGED));
+        assert_eq!(
+            table.creator_of(16),
+            Some(Creator {
+                band_max: 9,
+                memmgr_badge: 0x77,
+                reserve: true,
+                unbadged: false,
+            })
+        );
+        // A reaped process's badge, and a verb-badged cap's.
+        assert_eq!(table.creator_of(99), None);
+        assert_eq!(table.creator_of(ipc::procmgr_labels::DEBUG_AUTHORITY), None);
     }
 
     #[test]

@@ -29,6 +29,7 @@ members = [
     "services/vfsd",
     "services/vfsd/gpt",
     "services/vfsd/root-backend",
+    "services/vfsd/swap",
     "services/drivers/cmos",
     "services/drivers/framebuffer",
     "services/drivers/goldfish-rtc",

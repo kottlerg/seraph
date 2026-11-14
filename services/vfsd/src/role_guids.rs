@@ -4,7 +4,8 @@
 // services/vfsd/src/role_guids.rs
 
 //! vfsd's GPT partition type-GUID table: the Seraph root GUID, selected at
-//! compile time for the target arch, plus the ESP and Seraph data GUIDs.
+//! compile time for the target arch, plus the ESP, Seraph data, and Seraph
+//! swap GUIDs.
 //!
 //! [`boot_protocol::role_guids`] mints both arch-specific root GUIDs.
 //! vfsd is compiled for exactly one arch, so the constant resolves
@@ -30,3 +31,7 @@ pub const EFI_SYSTEM_PARTITION: [u8; 16] = [
 /// `/data` after `/esp` when present; otherwise `/data` resolves through
 /// the root-fs fall-through.
 pub const SERAPH_DATA: [u8; 16] = boot_protocol::role_guids::SERAPH_DATA;
+
+/// The Seraph swap partition type-GUID (arch-neutral). Never mounted: vfsd
+/// hands a cap on the partition to the `GET_SWAP_PARTITION` caller alone.
+pub const SERAPH_SWAP: [u8; 16] = boot_protocol::role_guids::SERAPH_SWAP;

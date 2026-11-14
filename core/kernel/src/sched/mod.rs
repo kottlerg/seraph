@@ -2857,6 +2857,7 @@ pub unsafe fn init(cpu_count: u32) -> u32
                     fault_badges: [const { core::sync::atomic::AtomicU64::new(0) };
                         crate::ipc::fault::FAULT_CLASSES],
                     fault_outcome: core::sync::atomic::AtomicU8::new(0),
+                    fault_redirect: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                     in_fault_delivery: false,
                     fault_delivery_class: 0,
                     upcall_pending: core::sync::atomic::AtomicBool::new(false),

@@ -113,9 +113,10 @@ merges none, so every other `clippy.toml` restates each setting of the root file
 `cargo xtask test` runs Clippy over test code before it runs the tests: the test configuration
 (`cargo clippy --tests`) of every package it tests, once for each architecture's Linux target
 (`x86_64-unknown-linux-gnu` and `riscv64gc-unknown-linux-gnu`), so test code gated on either
-architecture is linted on any host, with all warnings treated as errors. Test code is held to the
-configuration above except for nine lints, which that pass allows: `unwrap_used`, `expect_used`,
-`unwrap_in_result`, `panic`, `unreachable`, `panic_in_result_fn`, `indexing_slicing`,
+architecture is linted on any host, with all warnings treated as errors. `xtask`, which builds only
+against the prebuilt `std` (§ Dependencies), is linted for the host target alone. Test code is held
+to the configuration above except for nine lints, which that pass allows: `unwrap_used`,
+`expect_used`, `unwrap_in_result`, `panic`, `unreachable`, `panic_in_result_fn`, `indexing_slicing`,
 `string_slice` and `arithmetic_side_effects`. In a test, an unwrapped error, an explicit panic, a
 panic in a function that returns `Result`, an out-of-range index, a slice off a character boundary
 and an overflow each fail the test, which is how a test reports a defect; the lints exist to keep
@@ -140,6 +141,16 @@ rather than Markdown source. Cells and link text SHOULD stay short. `cargo xtask
 ([xtask/README.md](../xtask/README.md)) checks the limit.
 Paragraphs are separated by exactly one blank line.
 Hard line breaks MUST NOT be used for visual layout only.
+
+### Dependencies
+
+No crate from a registry is a dependency anywhere in the workspace: a `Cargo.toml` MUST NOT name
+one as a dependency of any kind. Code the pinned toolchain ships (std and the crates its sysroot
+and `rust-src` carry) is inside the trust boundary, as it already is for the OS, whose std embeds
+vendored `libc`, `hashbrown` and `rustc_demangle`. A host crate reaches a crate of the sysroot by
+`extern crate` under `#![feature(rustc_private)]`, with no Cargo entry; such a crate builds only
+against the prebuilt `std`, never beside a `std` built from source (`-Zbuild-std`), and only on a
+host whose `std` carries that crate ([build-system.md](build-system.md#toolchain) § Toolchain).
 
 ---
 

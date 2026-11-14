@@ -598,8 +598,9 @@ surface.
     message writes the riscv-iommu translates, its MSI delivery and MSI forge phases;
   - clock: the machine's RTC (the CMOS RTC on `q35`, the Goldfish RTC on `virt`), through the
     cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
-  - filesystem: FAT, through the fatfs driver, on every partition `mkdisk` writes: svctest's
-    filesystem phases;
+  - filesystem: FAT, through the fatfs driver, on the partitions `mkdisk` formats (the ESP, root
+    and data partitions; the swap partition is raw and no fatfs serves it): svctest's filesystem
+    phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
     confinement and MSI delivery, forge, churn, and release phases, four `pci-testdev` functions,

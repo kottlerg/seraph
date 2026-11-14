@@ -6,10 +6,11 @@
 //! The part of an IOMMU driver that does not depend on the IOMMU family.
 //!
 //! devmgr spawns one IOMMU driver per family (VT-d on x86-64; the RISC-V
-//! IOMMU), hands it each remapping unit's register cap and the PCI functions
-//! the unit translates in the bootstrap rounds [`bootstrap`] specifies, and
-//! drives it over `ipc::iommu_labels`. This crate holds what every family
-//! shares: the bootstrap decode and the units' scopes ([`bootstrap`]), the
+//! IOMMU), delivers it each remapping unit's register cap and the PCI
+//! functions the unit translates in its resource list
+//! (`driver_binding::resources`), and drives it over `ipc::iommu_labels`.
+//! This crate holds what every family shares: what the driver takes from
+//! that list and the unit lookup over the units' scopes ([`delivery`]), the
 //! request handling with its version check, reply framing, and per-domain
 //! bookkeeping, which bounds each request and catches overlap and misuse
 //! before the family's code runs ([`service`]), the queue of polled faults
@@ -22,12 +23,13 @@
 
 extern crate alloc;
 
-pub mod bootstrap;
+pub mod delivery;
 pub mod faults;
 pub mod service;
 pub mod table;
 
-pub use bootstrap::{Bootstrap, Registers, Scope, Units};
+pub use delivery::{Delivery, DeliveryError, Registers, Units};
+pub use driver_binding::resources::{IommuUnit, Scope};
 pub use faults::{Fault, FaultQueue};
 pub use service::{CapOps, KernelCaps, Lock, MAX_REMAP_ENTRIES, MemoryCap, Service};
 pub use table::TableStore;
@@ -86,7 +88,7 @@ pub struct RemapEntry
 /// translation structures of its units.
 ///
 /// [`Service`] calls every method with its request already checked: the unit
-/// index names a unit the bootstrap delivered, a domain is one this backend
+/// index names a unit the resource list delivered, a domain is one this backend
 /// attached and has not blocked, and a range or an interrupt file's page is
 /// page-aligned, nonempty, within the unit's width, and clear of every other
 /// range of the domain, and a remapping entry's handle lies below the

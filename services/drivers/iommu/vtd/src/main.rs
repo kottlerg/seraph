@@ -5,9 +5,10 @@
 
 //! The VT-d IOMMU driver (`iommu-vtd`).
 //!
-//! devmgr spawns it first at boot, before any DMA-capable driver, with one
-//! register cap per VT-d remapping unit it found in the ACPI DMAR
-//! (`iommu_core::bootstrap`). The driver maps each unit's registers,
+//! devmgr spawns it first at boot, before any DMA-capable driver, and
+//! delivers it in its resource list one register range per VT-d remapping
+//! unit it found in the ACPI DMAR, with the functions the unit translates
+//! (`iommu_core::delivery`). The driver maps each unit's registers,
 //! programs every unit with an empty root table and turns translation on
 //! ([`backend::Vtd`]), so every function a unit translates reaches nothing
 //! until devmgr attaches it; then it reports ready and serves
@@ -22,7 +23,7 @@ mod backend;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use iommu_core::bootstrap::Registers;
+use iommu_core::delivery::{Delivery, Registers};
 use iommu_core::service::{self, KernelCaps, Lock, Service};
 use iommu_store::{Flush, Store};
 use iommu_vtd::regs;
@@ -136,12 +137,21 @@ fn main() -> !
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
-    let boot = match unsafe { iommu_core::bootstrap::receive(info.creator_endpoint, ipc_buf) }
+    let list = match unsafe { driver_binding::resources::receive(info.creator_endpoint, ipc_buf) }
+    {
+        Ok(list) => list,
+        Err(e) =>
+        {
+            std::os::seraph::log!(error: "bootstrap failed ({:?})", e);
+            syscall::thread_exit();
+        }
+    };
+    let boot = match Delivery::from_list(&list)
     {
         Ok(boot) => boot,
         Err(e) =>
         {
-            std::os::seraph::log!(error: "bootstrap failed ({:?})", e);
+            std::os::seraph::log!(error: "resource list refused ({:?})", e);
             syscall::thread_exit();
         }
     };
@@ -159,7 +169,7 @@ fn main() -> !
         .registers
         .iter()
         .zip(&mapped)
-        // The bootstrap bounds `pages` to `MAX_REGISTER_PAGES`, so the
+        // The delivery bounds `pages` to `MAX_UNIT_REGISTER_PAGES`, so the
         // product does not saturate.
         .map(|(r, &va)| Unit::new(va, r.pages.saturating_mul(PAGE_SIZE)))
         .collect();

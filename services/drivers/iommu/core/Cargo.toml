@@ -13,6 +13,9 @@ name = "iommu_core"
 path = "src/lib.rs"
 
 [dependencies]
+# The resource list devmgr delivers the driver, its IOMMU units and their
+# scope encoding.
+driver-binding = { path = "../../../../shared/driver-binding" }
 ipc = { path = "../../../../shared/ipc" }
 syscall = { path = "../../../../shared/syscall" }
 syscall-abi = { path = "../../../../abi/syscall" }

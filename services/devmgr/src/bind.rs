@@ -23,7 +23,7 @@
 //! wired line, and, for a function that presents the `VirtIO` register
 //! layout, that layout).
 
-use driver_binding::decl::{DriverDecl, InterruptNeed, Reset, Tier};
+use driver_binding::decl::{DriverDecl, InterruptNeed, Reset};
 use driver_binding::resources::{InterruptKind, Resource};
 use firmware::aml::CrsResource;
 use firmware::binding::{
@@ -503,16 +503,16 @@ fn bind_platform(
         bootstrap_ep: carve.caps.self_bootstrap_ep,
         source,
         resources: dev_caps.resources(),
+        units: &[],
         dma_cap: None,
+        held: false,
+        phys_access: grants.phys_access,
         service_ep,
         query_ep: pass.batch.driver_ep(),
         death_eq: pass.death_eq,
+        watch_eq: None,
         device_badge: dev_caps.device_badge,
-        priority: match grants.tier
-        {
-            Tier::Boot => ipc::sched_policy::BOOT_DRIVER_PRIORITY,
-            Tier::Auxiliary => ipc::sched_policy::AUX_DRIVER_PRIORITY,
-        },
+        priority: spawn::tier_priority(grants.tier),
     };
     match spawn::spawn_bound_driver(&config, ipc_buf)
     {
@@ -857,19 +857,19 @@ fn bind_pci(
         bootstrap_ep: carve.caps.self_bootstrap_ep,
         source,
         resources: dev_caps.resources(),
+        units: &[],
         dma_cap: dev_caps.dma.as_ref().map(dma::DmaGrant::cap),
+        held: dev_caps.dma.is_some(),
+        phys_access: grants.phys_access,
         service_ep,
         query_ep: pass.batch.driver_ep(),
         death_eq: pass.death_eq,
+        watch_eq: None,
         // Index-derived, not random like the cross-boundary service badges
         // (#249): it names the device's catalog slot, which the driver
         // enforces per registered device.
         device_badge: dev_caps.device_badge,
-        priority: match grants.tier
-        {
-            Tier::Boot => ipc::sched_policy::BOOT_DRIVER_PRIORITY,
-            Tier::Auxiliary => ipc::sched_policy::AUX_DRIVER_PRIORITY,
-        },
+        priority: spawn::tier_priority(grants.tier),
     };
     // `spawn_bound_driver` owns the binary copy from here (consumed by the
     // create call, or released on failure).

@@ -116,7 +116,8 @@ fn main() -> !
             }
         }
     }
-    let Some(eps) = list.endpoints()
+    // A list holding an IOMMU unit is an IOMMU record's, not this device's.
+    let Some(eps) = list.endpoints().filter(|_| !list.holds_units())
     else
     {
         syscall::thread_exit();

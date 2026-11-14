@@ -31,11 +31,6 @@ use syscall::SyscallError;
 ///
 /// Arguments, return, and errors: `core/kernel/docs/syscalls.md` § `SYS_MEM_MAP` (16).
 #[cfg(not(test))]
-#[expect(
-    clippy::too_many_lines,
-    reason = "single validation pass over cap rights, prot bits, and address range; splitting \
-              would require threading shared state through helpers"
-)]
 pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 {
     use crate::cap::object::{AddressSpaceObject, MemoryObject};
@@ -53,35 +48,11 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    // Virtual address must be page-aligned.
-    if virt_base & 0xFFF != 0
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
-
-    // Virtual address must be in the user half (< `user_va_top()`).
-    if virt_base >= crate::mm::user_va_top()
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
-
-    // Reject zero-length mappings.
-    if page_count == 0
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-
-    // Guard against overflow in the virtual range.
-    let mapping_size = page_count
-        .checked_mul(PAGE_SIZE)
-        .ok_or(SyscallError::InvalidArgument)?;
-    let virt_end = virt_base
-        .checked_add(mapping_size as u64)
-        .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > crate::mm::user_va_top()
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`.
+    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
+    // Bytes the range spans; `virt_end` lies above `virt_base`, so the
+    // difference does not wrap.
+    let mapping_size = virt_end.wrapping_sub(virt_base);
 
     // ── Capability lookup ─────────────────────────────────────────────────────
 
@@ -132,7 +103,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         .checked_mul(PAGE_SIZE)
         .ok_or(SyscallError::InvalidArgument)? as u64;
     let byte_end = byte_offset
-        .checked_add(mapping_size as u64)
+        .checked_add(mapping_size)
         .ok_or(SyscallError::InvalidArgument)?;
     if byte_end > memory_size
     {
@@ -145,7 +116,7 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         .checked_add(byte_offset)
         .ok_or(SyscallError::InvalidArgument)?;
     let phys_end = phys_base
-        .checked_add(mapping_size as u64)
+        .checked_add(mapping_size)
         .ok_or(SyscallError::InvalidArgument)?;
 
     // Retype/map boundary (docs/capability-model.md § Typed Memory). Pin the
@@ -362,28 +333,8 @@ pub fn sys_mem_unmap(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    if virt_base & 0xFFF != 0
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
-    if virt_base >= crate::mm::user_va_top()
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
-    if page_count == 0
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-    let mapping_size = page_count
-        .checked_mul(PAGE_SIZE)
-        .ok_or(SyscallError::InvalidArgument)?;
-    let virt_end = virt_base
-        .checked_add(mapping_size as u64)
-        .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > crate::mm::user_va_top()
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`.
+    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
 
     // ── Capability lookup ─────────────────────────────────────────────────────
 
@@ -472,28 +423,8 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
 
     // ── Validation ────────────────────────────────────────────────────────────
 
-    if virt_base & 0xFFF != 0
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
-    if virt_base >= crate::mm::user_va_top()
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
-    if page_count == 0
-    {
-        return Err(SyscallError::InvalidArgument);
-    }
-    let mapping_size = page_count
-        .checked_mul(PAGE_SIZE)
-        .ok_or(SyscallError::InvalidArgument)?;
-    let virt_end = virt_base
-        .checked_add(mapping_size as u64)
-        .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > crate::mm::user_va_top()
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
+    // The range lies wholly in the user range, above `USER_VA_FLOOR`.
+    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
 
     // Parse new protection bits (MAP_WRITABLE / MAP_EXECUTABLE share the Memory
     // rights bit positions; asserted in abi/syscall).

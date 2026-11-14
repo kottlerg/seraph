@@ -1194,6 +1194,11 @@ RISC-V).
 
 ## Memory Syscalls
 
+The user range a mapping syscall accepts is `[USER_VA_FLOOR, user_va_top)`: `USER_VA_FLOOR`
+(64 KiB, `abi/syscall`) keeps the lowest pages of every address space unmapped (see
+[docs/memory-model.md § Userspace Layout](../../../docs/memory-model.md#userspace-layout)), and
+`user_va_top` is the top of the user half (`SystemInfoType::UserVaTop`).
+
 ### `SYS_MEM_MAP` (16)
 
 Map pages from a physical memory capability into an address space.
@@ -1243,14 +1248,13 @@ followed by a mappings count that includes it (see
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
-**Errors:** `InvalidAddress` (unaligned `virt`, non-canonical address, or mapping
-range leaves the user half), `InvalidArgument` (zero page count, size/offset overflow,
-`offset_pages` + `page_count` past the end of the memory cap's region, or `offset_pages`
-below the page-rounded retype bump cursor),
-`InvalidCapability` (also: `memory_cap` revoked or deleted while the call runs),
-`InsufficientRights` (requested prot exceeds cap rights), `WxViolation` (both WRITE and
-EXECUTE requested), `OutOfMemory`
-(page table allocation failure, or a frame already named by `u32::MAX` user mappings).
+**Errors:** `InvalidAddress` (unaligned `virt`, non-canonical address, `virt` below
+`USER_VA_FLOOR`, or mapping range leaves the user half), `InvalidArgument` (zero page count,
+size/offset overflow, `offset_pages` + `page_count` past the end of the memory cap's region, or
+`offset_pages` below the page-rounded retype bump cursor), `InvalidCapability` (also:
+`memory_cap` revoked or deleted while the call runs), `InsufficientRights` (requested prot
+exceeds cap rights), `WxViolation` (both WRITE and EXECUTE requested), `OutOfMemory` (page table
+allocation failure, or a frame already named by `u32::MAX` user mappings).
 
 ---
 
@@ -1275,8 +1279,8 @@ threads in `aspace_cap` (see [memory-internals.md](memory-internals.md) § SMP T
 
 **Capability requirement:** `aspace_cap` must have Map rights.
 
-**Errors:** `InvalidAddress` (unaligned `virt`, or range leaves the user half),
-`InvalidArgument` (zero page count or size/range overflow), `InvalidCapability`,
+**Errors:** `InvalidAddress` (unaligned `virt`, `virt` below `USER_VA_FLOOR`, or range leaves the
+user half), `InvalidArgument` (zero page count or size/range overflow), `InvalidCapability`,
 `InsufficientRights` (cap lacks Map).
 
 ---
@@ -1316,11 +1320,11 @@ writable alias of an executable frame makes the code visible this way (see
 
 **Capability requirements:** `memory_cap` (Map), `aspace_cap` (Map).
 
-**Errors:** `InvalidAddress` (unaligned `virt`, range leaves the user half, or a page
-in the range is not mapped), `InvalidArgument` (zero page count, size/range overflow,
-or no free frame during the page-table walk), `WxViolation` (both WRITE and EXECUTE
-requested), `InvalidCapability`, `InsufficientRights` (requested perms exceed
-`memory_cap` rights, or a page's mapping capability lacks WRITE or EXECUTE the request asks for).
+**Errors:** `InvalidAddress` (unaligned `virt`, `virt` below `USER_VA_FLOOR`, range leaves the
+user half, or a page in the range is not mapped), `InvalidArgument` (zero page count, size/range
+overflow, or no free frame during the page-table walk), `WxViolation` (both WRITE and EXECUTE
+requested), `InvalidCapability`, `InsufficientRights` (requested perms exceed `memory_cap`
+rights, or a page's mapping capability lacks WRITE or EXECUTE the request asks for).
 
 ---
 
@@ -1389,7 +1393,7 @@ rather than the default writeback caching (see
 |---|---|---|
 | 0 | `aspace_cap` | Address space capability (Map rights) |
 | 1 | `mmio_cap` | MMIO region capability (Map rights) |
-| 2 | `virt` | Virtual address to map at (page-aligned) |
+| 2 | `virt` | Virtual address to map at (page-aligned, user range) |
 | 3 | `flags` | Reserved (cache-mode overrides, etc.); ignored today |
 
 **Return:** `rax`/`a0`: 0 on success; `SyscallError` on failure.
@@ -1413,11 +1417,11 @@ object is freed); a retry at the same `virt` reuses the record.
 
 **Capability requirements:** `aspace_cap` (Map), `mmio_cap` (Map).
 
-**Errors:** `InvalidAddress` (unaligned or non-canonical `virt`, or range leaves the
-user half), `InvalidCapability`, `InsufficientRights` (a cap lacks Map), `InvalidArgument`
-(MMIO region size zero or not page-aligned, or size overflow), `OutOfMemory` (page table
-allocation failure, or the caller's `CSpace` pool cannot fund a spill chunk for a mapping past the
-inline records).
+**Errors:** `InvalidAddress` (unaligned or non-canonical `virt`, `virt` below `USER_VA_FLOOR`, or
+range leaves the user half), `InvalidCapability`, `InsufficientRights` (a cap lacks Map),
+`InvalidArgument` (MMIO region size zero or not page-aligned, or size overflow), `OutOfMemory`
+(page table allocation failure, or the caller's `CSpace` pool cannot fund a spill chunk for a
+mapping past the inline records).
 
 ---
 

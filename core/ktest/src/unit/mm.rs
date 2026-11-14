@@ -37,7 +37,7 @@ use syscall::{
     MAP_READ, MAP_WRITABLE, RIGHTS_ALL, aspace_query, cap_copy, cap_create_cspace, cap_delete,
     cap_derive, cap_info, mem_map, mem_unmap,
 };
-use syscall_abi::{CAP_INFO_MEMORY_SIZE, PAGE_SIZE};
+use syscall_abi::{CAP_INFO_MEMORY_SIZE, PAGE_SIZE, SyscallError, USER_VA_FLOOR};
 
 use crate::{TestContext, TestResult};
 
@@ -462,6 +462,58 @@ pub fn mem_map_kernel_half_err(ctx: &TestContext) -> TestResult
     if err.is_ok()
     {
         return Err("mem_map into kernel address space should fail");
+    }
+    Ok(())
+}
+
+/// No mapping covers a page below `USER_VA_FLOOR`: `mem_map` at VA 0, at the
+/// page below the floor, and over a span from that page across the floor, and
+/// `mem_unmap` and `mem_protect` at VA 0, each fail with `InvalidAddress`.
+///
+/// The span is two pages of a one-page frame, which the kernel would refuse
+/// with `InvalidArgument` past the range check; `InvalidAddress` shows the
+/// floor refused it.
+pub fn mem_map_below_floor_err(ctx: &TestContext) -> TestResult
+{
+    const REFUSED: Result<(), i64> = Err(SyscallError::InvalidAddress as i64);
+    let below = USER_VA_FLOOR - PAGE_SIZE;
+    let memory_cap =
+        crate::frame_pool::alloc().ok_or("mem_map_below_floor_err: frame pool exhausted")?;
+
+    // SAFETY: each span starts below `USER_VA_FLOOR`, which the kernel refuses
+    // (the test's premise), so no call maps, unmaps, or reprotects a page.
+    let at_zero = unsafe { mem_map(memory_cap, ctx.aspace_cap, 0, 0, 1, MAP_WRITABLE) };
+    // SAFETY: as above.
+    let below_floor = unsafe { mem_map(memory_cap, ctx.aspace_cap, below, 0, 1, MAP_WRITABLE) };
+    // SAFETY: as above.
+    let across_floor = unsafe { mem_map(memory_cap, ctx.aspace_cap, below, 0, 2, MAP_WRITABLE) };
+    // SAFETY: as above.
+    let unmap_zero = unsafe { mem_unmap(ctx.aspace_cap, 0, 1) };
+    // SAFETY: as above.
+    let protect_zero = unsafe { syscall::mem_protect(memory_cap, ctx.aspace_cap, 0, 1, 0) };
+
+    // SAFETY: memory_cap was allocated from pool and never successfully mapped.
+    unsafe { crate::frame_pool::free(memory_cap) };
+
+    if at_zero != REFUSED
+    {
+        return Err("mem_map at VA 0 should fail with InvalidAddress");
+    }
+    if below_floor != REFUSED
+    {
+        return Err("mem_map of the page below USER_VA_FLOOR should fail with InvalidAddress");
+    }
+    if across_floor != REFUSED
+    {
+        return Err("mem_map across USER_VA_FLOOR should fail with InvalidAddress");
+    }
+    if unmap_zero != REFUSED
+    {
+        return Err("mem_unmap at VA 0 should fail with InvalidAddress");
+    }
+    if protect_zero != REFUSED
+    {
+        return Err("mem_protect at VA 0 should fail with InvalidAddress");
     }
     Ok(())
 }

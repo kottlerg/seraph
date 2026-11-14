@@ -815,10 +815,14 @@ impl AddressSpace
     ///   every address space records its create-time donation before it is
     ///   published (`AddressSpaceObject::require_create_donation`).
     ///
+    /// # Errors
+    /// `Err(())` when `virt` lies outside the user range
+    /// ([`in_user_range`](crate::mm::in_user_range): below `USER_VA_FLOOR` or
+    /// at or above `user_va_top()`), with nothing changed; when the frame's
+    /// mapping count is saturated; or when no page-table frame is left.
+    ///
     /// # Safety
-    /// `virt` must be in the user half of the active paging mode (see
-    /// `docs/memory-model.md` § Virtual Address Space Layout). `phys` must be
-    /// a valid 4 KiB-aligned physical address.
+    /// `phys` must be a valid 4 KiB-aligned physical address.
     #[cfg(not(test))]
     pub unsafe fn map_page(
         &self,
@@ -829,6 +833,12 @@ impl AddressSpace
     {
         use crate::arch::current::paging::{flush_page, map_user_page, translate_user_page};
 
+        // No user leaf is ever installed outside the user range: below
+        // `USER_VA_FLOOR`, a kernel load through a null pointer would read it.
+        if !crate::mm::in_user_range(virt)
+        {
+            return Err(());
+        }
         // Count the new leaf before it is installed
         // (core/kernel/docs/memory-internals.md § Frame Map Table).
         crate::mm::frame_map::raise(phys)?;
@@ -891,6 +901,9 @@ impl AddressSpace
     /// The `aso` MUST wrap *this* `AddressSpace`. `sys_mem_map` enforces this
     /// implicitly because it resolves both via the same capability.
     ///
+    /// # Errors
+    /// As [`map_page`]'s, with the page-table frames drawn from `aso`'s pool.
+    ///
     /// # Safety
     /// Same contract as [`map_page`].
     #[cfg(not(test))]
@@ -905,6 +918,11 @@ impl AddressSpace
     {
         use crate::arch::current::paging::{flush_page, map_user_page_pooled, translate_user_page};
 
+        // The user range bounds every leaf, as in `map_page`.
+        if !crate::mm::in_user_range(virt)
+        {
+            return Err(());
+        }
         // Count the new leaf before it is installed, as `map_page` does.
         crate::mm::frame_map::raise(phys)?;
         crate::percpu::preempt_disable();

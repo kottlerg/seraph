@@ -59,9 +59,11 @@ Multi-component mount paths install through the tree by walking
 components, creating synthetic intermediates on demand, and storing the
 mount record on the final node. After install the caller
 (`do_mount`) walks the root mount component-by-component via
-`NS_LOOKUP` to populate the `fallthrough_cap` of each intermediate on
-the path that has none, a vacant node the install turned into an
-intermediate included.
+`NS_LOOKUP` to populate the `fallthrough_cap` of each intermediate the
+install made visible (a node it created, or a vacant node it reused) that
+has none. Only one install makes a node visible, so concurrent `MOUNT`s
+never walk for the same node, and the tree refuses a walked cap for a node
+that has one by then, which vfsd deletes.
 The in-tree mount set is the root mount (`/`) plus the single-component
 `/esp` and `/data` auto-mounts; the multi-component install path
 remains supported but is currently unexercised in production.

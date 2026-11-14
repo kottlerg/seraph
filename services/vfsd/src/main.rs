@@ -1232,8 +1232,8 @@ fn do_mount_internal(
         driver_ep
     };
 
-    // Install the mount; capture any synthetic intermediates created
-    // along the path so we can populate their fall-through caps after
+    // Install the mount; capture the synthetic intermediates the install
+    // made visible so we can populate their fall-through caps after
     // releasing the lock (the walk needs IPC and we must not block
     // other namespace traffic on it).
     let install_result = {
@@ -1307,14 +1307,16 @@ fn revoke_partition(partition: u64)
     log_cap_delete("partition cap", partition);
 }
 
-/// For each newly-created synthetic intermediate, walk the root mount
-/// to the corresponding directory and record the resulting cap as
-/// that intermediate's `fallthrough_cap`.
+/// For each synthetic intermediate the install made visible, walk the
+/// root mount to the corresponding directory and record the resulting
+/// cap as that intermediate's `fallthrough_cap`.
 ///
 /// A walk that fails (root mount not yet installed, or the path does
 /// not exist in the root filesystem) leaves `fallthrough_cap = 0`;
 /// subsequent unmatched lookups against that intermediate then reply
-/// `NotFound` instead of forwarding. Every skip is logged.
+/// `NotFound` instead of forwarding. A walked cap the tree refuses,
+/// because the node no longer needs one by the time the walk ends, is
+/// deleted. Every skip is logged.
 fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates: &[u32])
 {
     for &node_idx in intermediates
@@ -1343,11 +1345,19 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
         }
         if let Some(cap) = walk_root_mount_path(root_mount_cap, &path, ipc_buf)
         {
-            let mut backend = rt
+            let stored = rt
                 .root_backend
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            backend.set_fallthrough_cap(node_idx, cap);
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_fallthrough_cap(node_idx, cap);
+            if !stored
+            {
+                std::os::seraph::log!(
+                    warn: "MOUNT: fallthrough skip node_idx={node_idx}: the node no longer \
+                     needs one",
+                );
+                log_cap_delete("unneeded fallthrough cap", cap);
+            }
         }
         else
         {

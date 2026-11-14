@@ -188,11 +188,14 @@ pub struct VfsdRootBackend
 
 /// Outcome of a successful [`VfsdRootBackend::install`] call.
 ///
-/// Carries the indices of the synthetic intermediates on the installed
-/// path that need a `fallthrough_cap` ([`VfsdRootBackend::needs_fallthrough`]:
-/// the ones the install created, and any that has none) so the caller
-/// can compute and install it via [`VfsdRootBackend::set_fallthrough_cap`]
-/// after walking the root mount component-by-component.
+/// Carries the indices of the synthetic intermediates the install made
+/// visible (a node it created, or a vacant node it reused) that need a
+/// `fallthrough_cap` ([`VfsdRootBackend::needs_fallthrough`]) so the
+/// caller can compute and install it via
+/// [`VfsdRootBackend::set_fallthrough_cap`] after walking the root mount
+/// component-by-component. Only one install can make a node visible while
+/// it stays so, which keeps two concurrent `MOUNT`s from walking for one
+/// node.
 pub struct InstallResult
 {
     new_intermediates: Vec<u32>,
@@ -253,8 +256,9 @@ impl VfsdRootBackend
     /// badge from it); the root mount passes a *badged* SEND on the root
     /// fs (the fall-through forwarder pre-composes the caller's rights).
     ///
-    /// Returns `Some(InstallResult)` listing the path's intermediates
-    /// that need a fall-through cap; the caller is expected to compute
+    /// Returns `Some(InstallResult)` listing the intermediates this
+    /// install made visible that need a fall-through cap; the caller is
+    /// expected to compute
     /// and store each one's `fallthrough_cap` via
     /// [`Self::set_fallthrough_cap`].
     ///
@@ -329,8 +333,12 @@ impl VfsdRootBackend
             {
                 self.node_mut(next)?.slot = Slot::Mounted(mount);
             }
-            else
+            else if self.node(next)?.live == 0
             {
+                // The node holds no live mount at or below it yet, so this
+                // install makes it visible: a node just created, or a
+                // vacant one reused. An intermediate already visible was
+                // listed by the install that made it so.
                 new_intermediates.push(next);
             }
             current = next;
@@ -344,9 +352,9 @@ impl VfsdRootBackend
     /// Whether the node at `idx` is a synthetic intermediate without a
     /// fall-through cap: a node other than the root, holding no mount
     /// lookups cross, with a mount below it, and no `fallthrough_cap`.
-    /// An install lists such nodes on its path; a node whose own mount
-    /// [`Self::begin_unmount`] stopped while a mount below it stays
-    /// becomes one when it had no fall-through cap before.
+    /// An install lists such a node when it makes it visible; a node
+    /// whose own mount [`Self::begin_unmount`] stopped while a mount
+    /// below it stays becomes one when it had no fall-through cap before.
     #[must_use]
     pub fn needs_fallthrough(&self, idx: u32) -> bool
     {
@@ -478,13 +486,24 @@ impl VfsdRootBackend
 
     /// Set a synthetic intermediate's `fallthrough_cap`. Called by the
     /// MOUNT path after walking the root mount to the corresponding
-    /// directory. An index outside the pool is ignored.
-    pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u64)
+    /// directory.
+    ///
+    /// Stores `cap` and returns `true` only while the node still
+    /// [`Self::needs_fallthrough`]. Returns `false`, changing nothing, for
+    /// an index outside the pool or a node that no longer needs one (it
+    /// has a fall-through cap, holds a mount, or has no mount below it):
+    /// the caller then still owns `cap` and deletes it, so a cap is never
+    /// overwritten.
+    #[must_use]
+    pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u64) -> bool
     {
-        if let Some(node) = self.node_mut(node_idx)
+        if !self.needs_fallthrough(node_idx)
         {
-            node.fallthrough_cap = cap;
+            return false;
         }
+        self.node_mut(node_idx)
+            .map(|node| node.fallthrough_cap = cap)
+            .is_some()
     }
 
     /// The absolute path of the node at `idx`: it begins with `/` and
@@ -944,7 +963,7 @@ mod tests
         );
         // It became an intermediate with no fall-through cap.
         assert!(b.needs_fallthrough(a));
-        b.set_fallthrough_cap(a, CAP);
+        assert!(b.set_fallthrough_cap(a, CAP));
         assert!(!b.needs_fallthrough(a));
     }
 
@@ -1046,10 +1065,10 @@ mod tests
         assert_eq!(paths, vec![b"/a".to_vec(), b"/a/b".to_vec()]);
         for &idx in result.as_slice()
         {
-            b.set_fallthrough_cap(idx, CAP);
+            assert!(b.set_fallthrough_cap(idx, CAP));
         }
-        // A sibling under intermediates that have their fall-through caps
-        // reports none.
+        // A sibling under intermediates that are already visible reports
+        // none.
         assert_eq!(
             b.install(b"/a/b/d", mount(CAP)).map(|r| r.as_slice().len()),
             Some(0)
@@ -1231,9 +1250,48 @@ mod tests
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
-        b.set_fallthrough_cap(a, CAP);
+        assert!(b.set_fallthrough_cap(a, CAP));
         assert_eq!(b.fallthrough_of(a), CAP);
-        b.set_fallthrough_cap(UNUSED_IDX, CAP);
+        assert!(!b.set_fallthrough_cap(UNUSED_IDX, CAP));
         assert_eq!(b.fallthrough_of(UNUSED_IDX), 0);
+    }
+
+    #[test]
+    fn set_fallthrough_cap_never_overwrites_a_cap()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert!(b.set_fallthrough_cap(a, CAP));
+        assert!(!b.set_fallthrough_cap(a, CAP + 1));
+        assert_eq!(b.fallthrough_of(a), CAP);
+    }
+
+    #[test]
+    fn set_fallthrough_cap_refuses_a_terminal_and_a_vacant_node()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
+        let esp = b.find(b"/esp").expect("installed");
+        assert!(!b.set_fallthrough_cap(esp, CAP + 1));
+        b.begin_unmount(esp).unwrap();
+        assert!(b.remove_mount(esp).is_some());
+        assert!(!b.set_fallthrough_cap(esp, CAP + 1));
+        assert_eq!(b.fallthrough_of(esp), 0);
+    }
+
+    #[test]
+    fn concurrent_installs_below_one_intermediate_list_it_once()
+    {
+        // Two MOUNTs below a new intermediate: the second install comes
+        // before the first has walked for the intermediate's fall-through
+        // cap, so the node still has none, and still only the first lists
+        // it.
+        let mut b = VfsdRootBackend::new();
+        let first = b.install(b"/a/b", mount(CAP)).expect("install fits");
+        let a = b.find(b"/a").expect("installed");
+        assert_eq!(first.as_slice(), &[a]);
+        assert!(b.needs_fallthrough(a));
+        let second = b.install(b"/a/c", mount(CAP + 1)).expect("install fits");
+        assert_eq!(second.as_slice().len(), 0);
     }
 }

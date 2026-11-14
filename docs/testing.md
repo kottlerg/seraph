@@ -304,9 +304,10 @@ arches) drives this host-side against the ktest bundle:
    the joint `(slide, dm_base)` differs between the two boots. A single-dimension
    collision is ~1/1000, so the compare is joint and retries boot B once — a
    false failure is ~1e-8.
-2. Stage the `\EFI\seraph\nokaslr` override knob, repack `disk.img`, boot once,
-   and assert the deterministic layout (slide 0, image at its link base, direct
-   map at the mode floor); the KASLR-enabled image is always restored afterward.
+2. Stage the `\EFI\seraph\nokaslr` override knob, repack the disk images in the
+   layout they have, boot once, and assert the deterministic layout (slide 0,
+   image at its link base, direct map at the mode floor); the KASLR-enabled
+   images are always restored in that layout afterward.
 
 See [xtask/README.md § test-kaslr](../xtask/README.md#cargo-xtask-test-kaslr) for
 the command and [memory-model.md](memory-model.md) for the randomized layout.
@@ -326,10 +327,10 @@ outgrows the entry array step 6 sized, which QEMU's firmware never makes it do (
 [memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)).
 `cargo xtask test-map-redo [--arch]` (both arches) stages the
 `\EFI\seraph\mapredo` test knob, which makes the first attempt redo whatever
-its map's size, repacks `disk.img`, and boots the current sysroot once through
-`run-parallel`. It passes when the boot reaches its harness's pass marker and
-the bootloader logged the knob's redo exactly once; the knob is always removed
-and `disk.img` repacked afterward. See
+its map's size, repacks the disk images in the layout they have, and boots the
+current sysroot once through `run-parallel`. It passes when the boot reaches its
+harness's pass marker and the bootloader logged the knob's redo exactly once;
+the knob is always removed and the images repacked in that layout afterward. See
 [xtask/README.md § test-map-redo](../xtask/README.md#cargo-xtask-test-map-redo)
 for the command.
 
@@ -383,7 +384,8 @@ No guest-side check can show that bytes cross it, since its far end is the host.
 `cargo xtask test-debug-port [--arch]` (both arches) checks the transport host-side:
 
 1. Stage the [`debug-echo`](../services/debug-echo/README.md) fixture's recipe from
-   `/config/svcmgr/tests/` into `/config/svcmgr/services/` and repack `disk.img`.
+   `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and repack the disk images in the
+   layout they have.
 2. Boot the current sysroot once with the debug port, and wait for the fixture's
    `READY on the debug port` line on the serial stream.
 3. Connect to the port and drive one GDB remote serial protocol exchange, framed at both ends by
@@ -391,7 +393,8 @@ No guest-side check can show that bytes cross it, since its far end is the host.
    must be refused with `-`, the interrupt byte, `QStartNoAckMode`, then in no-ack mode a binary
    echo of every byte value through the escapes and a packet past the fixture's buffer, which must
    be refused with `E02`.
-4. Kill QEMU, remove the recipe, and repack `disk.img` again, whatever the outcome.
+4. Kill QEMU, remove the recipe, and repack the images in that layout again, whatever the
+   outcome.
 
 The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
 shutdown. See [xtask/README.md § test-debug-port](../xtask/README.md#cargo-xtask-test-debug-port)

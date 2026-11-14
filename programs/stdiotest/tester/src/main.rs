@@ -7,6 +7,11 @@
 //! and stdout, writes a single line, then asserts the expected three-line
 //! reply (byte count, uppercase echo, `PASS`) appears and the child exits
 //! cleanly. See [docs/testing.md](../../../docs/testing.md).
+//!
+//! First it writes [`STDERR_BLOCK_BYTES`] to its own stderr while its stdout
+//! is open, which the usertest orchestrator must drain while it waits on
+//! stdout (services/usertest/README.md); an orchestrator that does not leaves
+//! this tester blocked on a full pipe ring and the run hangs.
 
 #![expect(
     clippy::expect_used,
@@ -20,8 +25,24 @@ use std::process::{Command, Stdio};
 
 const PROBE: &str = "hello-stdio\n";
 
+/// Bytes written to stderr before the stdout check: twice the 2048-byte pipe
+/// ring (`RING_CAPACITY` in `runtime/ruststd/src/sys/pipe/seraph.rs`), so
+/// the writes cannot complete unless the reader drains them.
+const STDERR_BLOCK_BYTES: usize = 4096;
+
+/// Length of each stderr line, its newline included.
+const STDERR_LINE_BYTES: usize = 1024;
+
 fn main()
 {
+    let line = "e".repeat(STDERR_LINE_BYTES - 1);
+    let mut stderr = std::io::stderr().lock();
+    for _ in 0..STDERR_BLOCK_BYTES / STDERR_LINE_BYTES
+    {
+        writeln!(stderr, "{line}").expect("write the stderr block");
+    }
+    drop(stderr);
+
     let mut child = Command::new("/programs/stdiotest")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

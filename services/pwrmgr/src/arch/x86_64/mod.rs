@@ -271,7 +271,7 @@ where
     // the per-process arena, owned here: VA no Rust object or IPC page
     // occupies.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             view.memory_cap,
             self_aspace,
             map_vaddr,
@@ -289,18 +289,23 @@ where
         // `R` cannot borrow from it, so no reference to the bytes outlives
         // the mapping.
         let bytes = unsafe { core::slice::from_raw_parts(table_vaddr as *const u8, geometry.len) };
-        let out = f(bytes);
-        // SAFETY: `bytes`, the only reference into the mapping, is dead once
-        // `f` returns (its result cannot borrow from it), and the span is
-        // this call's own reservation.
-        let _ = unsafe { syscall::mem_unmap(self_aspace, map_vaddr, geometry.pages) };
-        out
+        f(bytes)
     }
     else
     {
         None
     };
-    unreserve_pages(range);
+    // A failed map can leave the pages before the failing one mapped, so the
+    // span is unmapped on either path, and the range stays reserved for
+    // pwrmgr's lifetime when the unmap fails, so no later reservation lands
+    // on a page still mapped there.
+    // SAFETY: the span is this call's own reservation, and no reference into
+    // it is live: `bytes`, the only one, made only when the map succeeded, is
+    // dead once `f` returns (its result cannot borrow from it).
+    if unsafe { syscall::mem_unmap(self_aspace, map_vaddr, geometry.pages) }.is_ok()
+    {
+        unreserve_pages(range);
+    }
     let _ = syscall::cap_delete(view.memory_cap);
     out
 }

@@ -528,6 +528,17 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     unsafe { (*STARTUP.0.get()).write(startup) };
     STARTUP_READY.store(true, Ordering::Release);
 
+    // Wire the object-slab refill path against memmgr before anything maps:
+    // a funded map (`mem_map_funded`: a child's stdio ring pages below, the
+    // heap floor) tops the page-table pool up from memory the slab requests,
+    // and allocates nothing, so it can run before the heap exists. Cap-create
+    // syscalls retype out of a slab Memory cap acquired lazily on first use.
+    // Zero `memmgr_endpoint_cap` (memmgr itself, init, or something earlier in
+    // the chain) leaves the path unwired.
+    if info.memmgr_endpoint_cap != 0 {
+        pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
+    }
+
     // Wire the three stdio pipes before the heap bootstrap. Each
     // direction takes (memory_cap, data_notification_cap, space_notification_cap);
     // zero memory caps are tolerated (writes silently drop / reads
@@ -603,10 +614,6 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
             ) };
             syscall::process_exit(STARTUP_FAIL_HEAP);
         }
-        // Wire the object-slab refill path against the same memmgr endpoint.
-        // Cap-create syscalls retype memory out of a slab Memory cap acquired
-        // lazily on first use.
-        pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
     }
 
     // In a demand-paged process, let the main-thread stack grow on demand below
@@ -979,20 +986,20 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
 /// retype-backed `AddressSpace`.
 ///
 /// Requests Memory backing from memmgr and retypes it onto the AS's PT pool
-/// via `cap_create_aspace` augment-mode, so `mmio_map`/`mem_map` of the
-/// region draws its intermediate page tables from this caller-funded,
-/// memmgr-accounted budget rather than the fixed kernel PT reserve. Call
-/// before mapping a region whose PT cost may exceed the AS's spare budget
-/// (every driver mapping discovered MMIO). Only the pool's shortfall against
+/// via `cap_create_aspace` augment-mode, so a map of the region draws its
+/// intermediate page tables from this caller-funded, memmgr-accounted budget
+/// rather than the fixed kernel PT reserve. Only the pool's shortfall against
 /// the region's worst case is donated.
 ///
 /// The pool is shared by every mapping of the process, the pager's included,
 /// so the top-up is not reserved for the region: another thread's mapping can
 /// draw it first, and the map then fails with `OutOfMemory` rather than
-/// silently drawing on the reserve. A caller whose process is demand-paged or
-/// maps from more than one thread tops up again and repeats such a map, a
-/// bounded number of times; only a single-threaded process with no pager may
-/// map once.
+/// silently drawing on the reserve. A map into the process's own address
+/// space therefore goes through [`mem_map_funded`] or [`mmio_map_funded`],
+/// which top up and map again while the map finds the pool exhausted, rather
+/// than calling this first and mapping once. This call alone serves a top-up
+/// that no map of the caller's follows, such as one ahead of a demand region
+/// the pager maps.
 ///
 /// `region_pages == 0` is a no-op success. Returns `false` only when a top-up
 /// was needed and could not be had: memmgr is unreachable or refuses the grant,
@@ -1001,6 +1008,74 @@ pub fn memmgr_pool_free_bytes() -> Option<u64> {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
     pal_alloc::fund_aspace_pt_budget(self_aspace, region_pages)
+}
+
+/// Map `pages` pages of the Memory cap `memory_cap`, from its page `offset`,
+/// at `va` in `self_aspace`, the calling process's own address space, with
+/// protection `prot` (`syscall::mem_map`'s arguments), funding the page tables
+/// the map needs.
+///
+/// The first map is made as it stands, so a page-table pool that already
+/// covers the span costs nothing more. A map refused with `OutOfMemory` tops
+/// the pool up ([`fund_aspace_pt_budget`] for `pages`) and is made again, up
+/// to four top-ups, since another thread's mapping or the pager can draw a
+/// top-up before the map runs. Every map std makes into its own address space
+/// goes through the same loop.
+///
+/// # Errors
+/// The last map's error: `OutOfMemory` when a top-up could not be had or the
+/// pool was still exhausted after the last one, else the error of a map
+/// refused for another reason (`syscall::mem_map` § Errors).
+///
+/// # Safety
+/// The contract of `syscall::mem_map` for the span `[va, va + pages *
+/// PAGE_SIZE)` of the calling program's own address space, which covers the
+/// span even when the call fails: a refused map can leave pages before the
+/// failing one mapped.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub unsafe fn mem_map_funded(
+    memory_cap: u64,
+    self_aspace: u64,
+    va: u64,
+    offset: u64,
+    pages: u64,
+    prot: u64,
+) -> Result<(), i64> {
+    // SAFETY: the caller's contract is this function's own.
+    unsafe { pal_alloc::mem_map_funded(memory_cap, self_aspace, va, offset, pages, prot) }
+}
+
+/// Map the `Mmio` region `mmio_cap`, `pages` pages long, at `va` in
+/// `self_aspace`, the calling process's own address space
+/// (`syscall::mmio_map`), funding the page tables the map needs as
+/// [`mem_map_funded`] does: made as it stands first, then topped up for
+/// `pages` pages and made again while it is refused with `OutOfMemory`, up to
+/// four top-ups. A refused `mmio_map` keeps the mapping's record and the pages
+/// it mapped, and the next map at the same `va` reuses them.
+///
+/// `pages` only sizes the top-ups; the map covers the whole region the cap
+/// names.
+///
+/// # Errors
+/// The last map's error: `OutOfMemory` when a top-up could not be had or a
+/// pool was still exhausted after the last one (the page-table pool, or the
+/// `CSpace` pool a mapping past the region's inline records draws on, which
+/// no page-table top-up refills), else the error of a map refused for another
+/// reason (`syscall::mmio_map` § Errors).
+///
+/// # Safety
+/// The contract of `syscall::mmio_map` for the span the region covers at `va`
+/// in the calling program's own address space, which covers the span even
+/// when the call fails.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub unsafe fn mmio_map_funded(
+    self_aspace: u64,
+    mmio_cap: u64,
+    va: u64,
+    pages: u64,
+) -> Result<(), i64> {
+    // SAFETY: the caller's contract is this function's own.
+    unsafe { pal_alloc::mmio_map_funded(self_aspace, mmio_cap, va, pages) }
 }
 
 /// Free slots of `self_cspace` a general capability allocation may still
@@ -1034,9 +1109,15 @@ pub fn cspace_slot_headroom(self_cspace: u64) -> u64 {
 /// burst of cap acquisitions (a cache filling its slots) or periodically to
 /// hold headroom above a low-water mark.
 ///
-/// `slots == 0` still keeps the arena's page. Returns `false` if memmgr is
-/// unreachable, the request/augment fails, or the headroom still falls
-/// short after the funding rounds.
+/// The headroom is shared by every capability allocation of the process, so
+/// another thread's allocations can take the donated slots before the
+/// caller's burst; an allocation that then finds the headroom spent fails
+/// with the refillable `OutOfMemory`.
+///
+/// `slots == 0` still keeps the arena's page. Returns `false` only when a
+/// top-up was needed and could not be had: memmgr is unreachable or refuses
+/// the grant, or the kernel refuses the donation. A headroom that reads short
+/// after donations that were made is no failure.
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     pal_alloc::fund_cspace_slot_budget(self_cspace, slots)

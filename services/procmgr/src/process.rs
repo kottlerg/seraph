@@ -891,8 +891,16 @@ impl CopyWindows
         // value owns, `pages` is at most its size, and no Rust object or IPC
         // page lies in it; the only accesses to it are the raw-pointer reads
         // of `copy_argv_chunk`, while it is mapped.
-        let src_mapped =
-            unsafe { syscall::mem_map(src, aspace, src_va, offset, pages, syscall::MAP_FROM_CAP) };
+        let src_mapped = unsafe {
+            std::os::seraph::mem_map_funded(
+                src,
+                aspace,
+                src_va,
+                offset,
+                pages,
+                syscall::MAP_FROM_CAP,
+            )
+        };
         let mapped = if let Err(code) = src_mapped
         {
             Err(WindowMapError::Src(code))
@@ -902,7 +910,14 @@ impl CopyWindows
             // SAFETY: as for the source window, with the raw-pointer writes
             // of `copy_argv_chunk`.
             let dst_mapped = unsafe {
-                syscall::mem_map(dst, aspace, dst_va, offset, pages, syscall::MAP_WRITABLE)
+                std::os::seraph::mem_map_funded(
+                    dst,
+                    aspace,
+                    dst_va,
+                    offset,
+                    pages,
+                    syscall::MAP_WRITABLE,
+                )
             };
             dst_mapped.map_err(|_| WindowMapError::Dst)
         };

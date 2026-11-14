@@ -70,14 +70,6 @@ const HEAP_INITIAL_PAGES: u64 = 512;
 /// round-trip over many small follow-up allocations. 16 pages = 64 KiB.
 const GROW_MIN_PAGES: u64 = 16;
 
-/// Augment rounds `fund_cspace_slot_budget` makes before giving up. A CSpace
-/// donation also gives up a page once per record page of its bookkeeping
-/// (see `SYS_CAP_CREATE_CSPACE`), so, as for the page-table pool's
-/// `pt_funding::PT_FUND_ROUNDS`, a second round covers that shortfall unless
-/// other threads of the process take the slots in between; the trailing
-/// headroom check decides either way.
-const CSPACE_FUND_ROUNDS: u32 = 2;
-
 // ── Spin mutex ──────────────────────────────────────────────────────────────
 
 /// A spinlock that owns the state it serialises: the state is reachable only
@@ -567,6 +559,11 @@ pub fn heap_bootstrap(memmgr_ep: u64, self_aspace: u64) -> bool {
 /// unbootstrapped state, so it serves no allocation; pages the failed attempt
 /// mapped stay mapped and accounted until the process exits.
 fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
+    // Both floors fund page tables before the heap exists (a demand floor's
+    // top-up, an eager floor's funded map), retyping from the object slab,
+    // whose refill path must be wired first. `_start` has already wired it;
+    // a second store of the same endpoint is harmless.
+    object_slab_init(memmgr_ep);
     // The base draw happens before the allocator exists: the raw getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
     // the IPC wrappers `grow_exact` uses. A failed draw degrades to the
@@ -619,9 +616,6 @@ fn register_demand_floor(memmgr_ep: u64, self_aspace: u64, heap_base: u64) -> bo
     if !has_pager || ipc_buf.is_null() {
         return false;
     }
-    // The page-table funding retypes from the object slab, whose refill path
-    // `_start` otherwise wires after the heap.
-    object_slab_init(memmgr_ep);
     // Best effort, as for every demand region (`register_demand_paged`): the
     // pager funds the pool itself when a fault finds it exhausted, so the
     // top-up only keeps the floor's first faults off that path.
@@ -728,9 +722,10 @@ static SLAB_BIN_512: ObjectSlab = empty_slab();
 /// memmgr endpoint shared by every slab path. Set once at process start.
 static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 
-/// Set the memmgr endpoint backing the object-slab refill path. The heap
-/// bootstrap sets it before funding a demand floor's page tables, and `_start`
-/// sets it again (to the same endpoint) after `heap_bootstrap`.
+/// Set the memmgr endpoint backing the object-slab refill path. `_start` sets
+/// it before stdio attaches its pipes, since a funded map tops the page-table
+/// pool up through the slab, and the heap bootstrap sets it again (to the same
+/// endpoint) before installing the floor.
 pub fn object_slab_init(memmgr_ep: u64) {
     SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
 }
@@ -1173,16 +1168,17 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
 /// onto the AS's PT pool with `cap_create_aspace` in augment mode, so the
 /// kernel draws the region's intermediate page tables from this
 /// caller-funded, memmgr-accounted budget rather than the fixed kernel PT
-/// reserve. The need is `pt_funding::pt_pages_for(region_pages)`, the
+/// reserve. The need is `pool_funding::pt_pages_for(region_pages)`, the
 /// worst case for a contiguous run, and only the pool's shortfall against
-/// it is donated, in at most `pt_funding::PT_FUND_ROUNDS` donations
-/// (`pt_funding::top_up`).
+/// it is donated, in at most `pool_funding::FUND_ROUNDS` donations
+/// (`pool_funding::top_up`).
 ///
 /// The pool is shared by every mapping of the process, the pager's
 /// included, so the top-up is not reserved for the region: another thread's
 /// mapping can draw it before the region's map runs. A map into the
-/// process's own address space therefore goes through [`mem_map_funded`],
-/// which tops up again while the map finds the pool exhausted, and a
+/// process's own address space therefore goes through [`mem_map_funded`] or
+/// [`mmio_map_funded`], which top up again while the map finds the pool
+/// exhausted, and a
 /// demand-region registration treats the top-up as best effort, since the
 /// pager funds the pool itself when a fault finds it exhausted
 /// (services/memmgr/docs/memory-pool.md § Client page-table funding).
@@ -1209,18 +1205,20 @@ pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
         })
         .is_some()
     };
-    pt_funding::top_up(pt_funding::pt_pages_for(region_pages), budget_pages, donate)
+    let need = pool_funding::pt_pages_for(region_pages);
+    pool_funding::top_up(|| need.saturating_sub(budget_pages()), donate)
 }
 
 /// `syscall::mem_map` of `pages` pages of `memory_cap`, from page `offset`,
 /// at `va` in `aspace`, the calling process's own address space, with the
 /// page tables it needs funded: a map refused with `OutOfMemory` tops the
 /// pool up ([`fund_aspace_pt_budget`]) and is made again, up to
-/// `pt_funding::MAP_TOP_UPS` times (`pt_funding::map_with_top_ups`). The
+/// `pool_funding::MAP_TOP_UPS` times (`pool_funding::map_with_top_ups`). The
 /// first map is made without a top-up, so a pool that already covers the
 /// span costs nothing more.
 ///
-/// Every ruststd path that maps into its own address space maps through it.
+/// Every ruststd path that maps Memory into its own address space maps
+/// through it, and `std::os::seraph::mem_map_funded` offers it to services.
 /// Allocates nothing.
 ///
 /// # Errors
@@ -1233,7 +1231,7 @@ pub fn fund_aspace_pt_budget(self_aspace: u64, region_pages: u64) -> bool {
 /// PAGE_SIZE)` of the calling program's own address space, which covers the
 /// span even when the call fails: a refused map can leave pages before the
 /// failing one mapped.
-pub(crate) unsafe fn mem_map_funded(
+pub unsafe fn mem_map_funded(
     memory_cap: u64,
     aspace: u64,
     va: u64,
@@ -1241,10 +1239,43 @@ pub(crate) unsafe fn mem_map_funded(
     pages: u64,
     prot: u64,
 ) -> Result<(), i64> {
-    pt_funding::map_with_top_ups(
+    pool_funding::map_with_top_ups(
         syscall_abi::SyscallError::OutOfMemory as i64,
         // SAFETY: the caller's contract covers the span, for every map made.
         || unsafe { syscall::mem_map(memory_cap, aspace, va, offset, pages, prot) },
+        || fund_aspace_pt_budget(aspace, pages),
+    )
+}
+
+/// `syscall::mmio_map` of the `Mmio` region `mmio_cap`, `pages` pages long,
+/// at `va` in `aspace`, the calling process's own address space, with the
+/// page tables it needs funded as [`mem_map_funded`] funds them: a map refused
+/// with `OutOfMemory` tops the pool up for `pages` pages and is made again, up
+/// to `pool_funding::MAP_TOP_UPS` times. A refused `mmio_map` keeps the
+/// mapping's record and the pages it mapped, and the next one at the same `va`
+/// reuses them.
+///
+/// `pages` only sizes the top-ups: no `SYS_CAP_INFO` selector reports an
+/// `Mmio` region's size, and the map covers the whole region whatever `pages`
+/// says. Allocates nothing.
+///
+/// # Errors
+/// The last map's error: `OutOfMemory` when a top-up could not be had or the
+/// map still found a pool exhausted after the last one (the page-table pool,
+/// or the `CSpace` pool that a mapping past the region's inline records draws
+/// on and no page-table top-up refills), else the error of a map refused for
+/// another reason (`syscall::mmio_map` § Errors).
+///
+/// # Safety
+/// The contract of `syscall::mmio_map` for the span the region covers at `va`
+/// in the calling program's own address space, which covers the span even
+/// when the call fails.
+pub unsafe fn mmio_map_funded(aspace: u64, mmio_cap: u64, va: u64, pages: u64) -> Result<(), i64> {
+    pool_funding::map_with_top_ups(
+        syscall_abi::SyscallError::OutOfMemory as i64,
+        // SAFETY: the caller's contract covers the span, for every map made.
+        // `flags` is reserved and the kernel ignores it.
+        || unsafe { syscall::mmio_map(aspace, mmio_cap, va, 0) },
         || fund_aspace_pt_budget(aspace, pages),
     )
 }
@@ -1278,30 +1309,31 @@ pub fn cspace_general_headroom(self_cspace: u64) -> u64 {
 /// mark, so a service never meets the hard `OutOfMemory` of an exhausted
 /// `CSpace`.
 ///
-/// `slots == 0` still keeps the arena's page. Returns `false` if memmgr is
-/// unreachable, the request/augment fails (the object slab's own cap needs
-/// one free general slot), or the headroom still falls short after
-/// `CSPACE_FUND_ROUNDS` rounds.
+/// The headroom is shared by every capability allocation of the process, so
+/// the top-up is not reserved for the caller's burst: another thread's
+/// allocations can take the donated slots first, and the caller's own
+/// allocation then decides, failing with the refillable `OutOfMemory`. The
+/// donations follow `pool_funding::top_up`: the shortfall each round reads,
+/// in at most `pool_funding::FUND_ROUNDS` donations.
+///
+/// `slots == 0` still keeps the arena's page. Returns `false` only when a
+/// top-up was needed and could not be had: memmgr is unreachable or refuses
+/// the grant, or the kernel refuses the donation (the object slab's own cap
+/// needs one free general slot). A headroom that reads short after donations
+/// that were made is no failure, since another thread's allocations took it.
 pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     let short = || {
         let budget =
             syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
         syscall_abi::cspace_topup_pages(cspace_general_headroom(self_cspace), budget, slots)
     };
-    for _ in 0..CSPACE_FUND_ROUNDS {
-        let pages = short();
-        if pages == 0 {
-            return true;
-        }
-        if object_slab_retype(pages * PAGE_SIZE, |frame| {
+    let donate = |pages: u64| {
+        object_slab_retype(pages * PAGE_SIZE, |frame| {
             syscall::cap_create_cspace(frame, self_cspace, pages).ok()
         })
-        .is_none()
-        {
-            return false;
-        }
-    }
-    short() == 0
+        .is_some()
+    };
+    pool_funding::top_up(short, donate)
 }
 
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-

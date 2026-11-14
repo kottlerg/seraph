@@ -183,11 +183,6 @@ fn main() -> !
     };
     let base_va = range.va_start();
 
-    if !std::os::seraph::fund_aspace_pt_budget(info.self_aspace, 1)
-    {
-        std::os::seraph::log!(error: "PT-budget funding failed");
-        syscall::thread_exit();
-    }
     // SAFETY: `range` is a fresh one-page reservation from the per-process
     // arena, owned for the process's lifetime, and `bootstrap` admits only a
     // page-aligned range of at most one page, whose cap devmgr carves to the
@@ -195,7 +190,7 @@ fn main() -> !
     // object or IPC page occupies. `read_epoch_ns` reaches the mapping only
     // through raw `read_volatile`, never a reference, and the reservation
     // stays held for the process's lifetime (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(info.self_aspace, mmio_cap, base_va, 0) }.is_err()
+    if unsafe { std::os::seraph::mmio_map_funded(info.self_aspace, mmio_cap, base_va, 1) }.is_err()
     {
         std::os::seraph::log!(error: "mmio_map failed");
         syscall::thread_exit();

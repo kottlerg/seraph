@@ -159,11 +159,6 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         syscall::thread_exit();
     };
     let window_va = window.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, window_pages)
-    {
-        std::os::seraph::log!(error: "BAR PT-budget funding failed");
-        syscall::thread_exit();
-    }
     for (range, &offset) in ranges.iter().zip(&placed)
     {
         let Some(range_va) = window_va.checked_add(offset)
@@ -172,6 +167,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
             std::os::seraph::log!(error: "BAR range past the address space");
             syscall::thread_exit();
         };
+        let range_pages = range.bytes.div_ceil(PAGE_SIZE);
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
         // from the per-process arena, and `place` put this range's pages at
         // `offset` inside its BAR's share of it, overlapping no other
@@ -180,7 +176,10 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         // volatile accessors, never a reference, and the reservation is
         // never returned, so the VA stays reserved for the driver's lifetime
         // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, range_va, 0) }.is_err()
+        let mapped = unsafe {
+            std::os::seraph::mmio_map_funded(caps.self_aspace, range.cap, range_va, range_pages)
+        };
+        if mapped.is_err()
         {
             std::os::seraph::log!(error: "BAR mmio_map failed");
             syscall::thread_exit();
@@ -384,7 +383,7 @@ fn allocate_and_map_rings(queue_size: u16, caps: &DriverCaps, ipc_buf: *mut u64)
     // owned here for the mapping's life: VA no Rust object or IPC page
     // occupies.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             ring_memory,
             caps.self_aspace,
             ring_va,
@@ -525,7 +524,7 @@ fn setup_io_buffer(caps: &DriverCaps, ipc_buf: *mut u64) -> IoLayout
     // owned here for the mapping's life: VA no Rust object or IPC page
     // occupies.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             data_memory,
             caps.self_aspace,
             data_va,

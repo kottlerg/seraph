@@ -64,6 +64,10 @@ pub fn phases() -> &'static [Phase]
             name: "phys_base_withheld",
             run: phys_base_withheld_phase,
         },
+        Phase {
+            name: "memmgr_frame_scrub",
+            run: frame_scrub_phase,
+        },
     ]
 }
 
@@ -78,6 +82,10 @@ pub fn reentry_main(role: &str)
     if role == RECLAIM_CHILD_ROLE
     {
         reclaim_child_main();
+    }
+    if role == SCRUB_CHILD_ROLE
+    {
+        scrub_child_main();
     }
 }
 
@@ -238,29 +246,36 @@ fn memmgr_call(msg: &ipc::IpcMessage, what: &str) -> ipc::IpcMessage
         .unwrap_or_else(|e| panic!("memmgr {what} ipc_call failed: {e:?}"))
 }
 
-/// Request a one-page grant from memmgr: `(grant cap, region id)`.
-fn request_one_page() -> (u64, u64)
+/// Request a contiguous grant of `pages` pages from memmgr:
+/// `Ok((grant cap, region id))`, or `Err` with memmgr's error label.
+pub(crate) fn try_request_contiguous(pages: u32) -> Result<(u64, u64), u64>
 {
-    let want = 1 | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
+    let want = u64::from(pages) | (u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, want)
         .build();
     let reply = memmgr_call(&req, "REQUEST_MEMORY_CAPS");
-    assert_eq!(
-        reply.label,
-        ipc::memmgr_errors::SUCCESS,
-        "REQUEST_MEMORY_CAPS status"
-    );
+    if reply.label != ipc::memmgr_errors::SUCCESS
+    {
+        return Err(reply.label);
+    }
     let grant = *reply
         .caps()
         .first()
         .expect("REQUEST_MEMORY_CAPS returned no cap");
     // One cap: data[1] is its page count, data[2] its region id.
-    (grant, reply.word(2))
+    Ok((grant, reply.word(2)))
+}
+
+/// Request a one-page grant from memmgr: `(grant cap, region id)`.
+fn request_one_page() -> (u64, u64)
+{
+    try_request_contiguous(1)
+        .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"))
 }
 
 /// Drop the grant cap and hand its region back to memmgr.
-fn release_one_page(grant: u64, region_id: u64)
+pub(crate) fn release_grant(grant: u64, region_id: u64)
 {
     syscall::cap_delete(grant).expect("cap_delete of grant");
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
@@ -273,6 +288,20 @@ fn release_one_page(grant: u64, region_id: u64)
         ipc::memmgr_errors::SUCCESS,
         "RELEASE_MEMORY_CAPS status"
     );
+}
+
+/// memmgr's `QUERY_POOL_STATUS` free total (`data[3]`) and largest free run
+/// (`data[5]`), in bytes.
+pub(crate) fn pool_free_and_largest() -> (u64, u64)
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    (reply.word(3), reply.word(5))
 }
 
 /// A `DONATE_MEMORY_CAPS` from a client other than procmgr is refused with
@@ -297,7 +326,7 @@ pub fn donate_unauthorized_phase(_: &Caps)
         reply.word(1)
     );
 
-    release_one_page(grant, region_id);
+    release_grant(grant, region_id);
     std::os::seraph::log!("non-procmgr donation refused with UNAUTHORIZED");
 }
 
@@ -1020,7 +1049,7 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     );
     for (cap, id) in draws
     {
-        release_one_page(cap, id);
+        release_grant(cap, id);
     }
 
     // SAFETY: `va` is the page mapped above, in this process's own address
@@ -1057,8 +1086,8 @@ pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
     let kept = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP_RW)
         .expect("frame_reclaim_held_cap_release: cap_derive of the grant failed");
     let baseline = settled_deferred_bytes();
-    // `release_one_page` deletes the grant itself; the derived cap stays.
-    release_one_page(grant, region_id);
+    // `release_grant` deletes the grant itself; the derived cap stays.
+    release_grant(grant, region_id);
     let held = deferred_bytes();
     assert!(
         held >= baseline
@@ -1076,7 +1105,7 @@ pub fn frame_reclaim_held_cap_release_phase(_: &Caps)
     );
     for (cap, id) in draws
     {
-        release_one_page(cap, id);
+        release_grant(cap, id);
     }
 
     syscall::cap_delete(kept).expect("frame_reclaim_held_cap_release: cap_delete of the kept cap");
@@ -1201,8 +1230,280 @@ pub fn phys_base_withheld_phase(_: &Caps)
         std::os::seraph::object_slab_release(slab_grant);
     }
 
-    release_one_page(grant, region_id);
+    release_grant(grant, region_id);
     std::os::seraph::log!(
         "phys_base_withheld: grant carries a region id, PHYS_BASE and ASPACE_QUERY refused"
+    );
+}
+
+/// Role token for [`scrub_child_main`].
+const SCRUB_CHILD_ROLE: &str = "scrub-child";
+
+/// Pages a `scrub-child` fills in its grant and again in its demand region,
+/// and the size of each grant [`frame_scrub_phase`] draws after its death.
+const SCRUB_PAGES: u32 = 64;
+
+/// Contiguous grants of [`SCRUB_PAGES`] pages svctest draws after the death.
+const SCRUB_DRAWS: usize = 4;
+
+/// Pages of the demand region svctest reads after the death.
+const SCRUB_DEMAND_PAGES: u64 = 256;
+
+/// One-page grants svctest draws after it released a page it filled.
+const SCRUB_PAGE_DRAWS: usize = 8;
+
+/// The word a previous owner leaves in every word of the pages it fills.
+pub(crate) const SCRUB_MARKER: u64 = 0x5C2B_F2A3_E0FF_A11D;
+
+/// The words of `pages` pages at `va`.
+///
+/// # Safety
+/// `[va, va + pages * PAGE_SIZE)` is mapped readable, or lies in a demand
+/// region of this process, whose first read of each page backs it; it stays
+/// so while the slice lives, and no `&mut` points into it.
+pub(crate) unsafe fn words<'a>(va: u64, pages: u64) -> &'a [u64]
+{
+    let len = usize::try_from(pages.saturating_mul(syscall_abi::PAGE_SIZE) / 8)
+        .expect("page span exceeds the address space");
+    // SAFETY: the caller's contract makes the span valid for reads for the
+    // slice's life, page-aligned and so aligned for u64.
+    unsafe { core::slice::from_raw_parts(va as *const u64, len) }
+}
+
+/// The words of `pages` pages at `va`, writable.
+///
+/// # Safety
+/// As [`words`], with the span mapped writable (or a writable demand region),
+/// and no other reference into it while the slice lives.
+pub(crate) unsafe fn words_mut<'a>(va: u64, pages: u64) -> &'a mut [u64]
+{
+    let len = usize::try_from(pages.saturating_mul(syscall_abi::PAGE_SIZE) / 8)
+        .expect("page span exceeds the address space");
+    // SAFETY: the caller's contract makes the span valid for writes and
+    // unaliased for the slice's life, page-aligned and so aligned for u64.
+    unsafe { core::slice::from_raw_parts_mut(va as *mut u64, len) }
+}
+
+/// The words of `words` that are not zero, and how many of those hold
+/// [`SCRUB_MARKER`].
+pub(crate) fn nonzero_words(words: &[u64]) -> (usize, usize)
+{
+    (
+        words.iter().filter(|w| **w != 0).count(),
+        words.iter().filter(|w| **w == SCRUB_MARKER).count(),
+    )
+}
+
+/// Map the grant `cap` of `pages` pages read-write into a fresh reservation,
+/// returning it.
+fn map_grant(cap: u64, pages: u64, what: &str) -> std::os::seraph::ReservedRange
+{
+    let range = std::os::seraph::reserve_pages(pages)
+        .unwrap_or_else(|_| panic!("{what}: reserving {pages} pages failed"));
+    // SAFETY: `range` is a fresh reservation from the per-process arena, owned
+    // here: VA no Rust object or IPC page occupies.
+    unsafe {
+        std::os::seraph::mem_map_funded(
+            cap,
+            startup_info().self_aspace,
+            range.va_start(),
+            0,
+            pages,
+            syscall::MAP_READ | syscall::MAP_WRITABLE,
+        )
+    }
+    .unwrap_or_else(|e| panic!("{what}: mapping a {pages}-page grant failed ({e})"));
+    range
+}
+
+/// Unmap a range [`map_grant`] mapped and release its reservation.
+fn unmap_grant(range: std::os::seraph::ReservedRange, what: &str)
+{
+    // SAFETY: `range` is the span `map_grant` mapped in this process's own
+    // address space, and no Rust reference points into it.
+    unsafe {
+        syscall::mem_unmap(
+            startup_info().self_aspace,
+            range.va_start(),
+            range.page_count(),
+        )
+    }
+    .unwrap_or_else(|e| panic!("{what}: mem_unmap failed ({e})"));
+    std::os::seraph::unreserve_pages(range);
+}
+
+/// Draw `draws` contiguous grants of `pages` pages, holding each until all
+/// are drawn so no two are the same run, and count the nonzero and marker
+/// words they hold ([`nonzero_words`]); the grants are released after.
+fn scan_grants(pages: u32, draws: usize, what: &str) -> (usize, usize)
+{
+    let mut held = Vec::with_capacity(draws);
+    let (mut nonzero, mut marker) = (0usize, 0usize);
+    for _ in 0..draws
+    {
+        let (cap, id) = try_request_contiguous(pages)
+            .unwrap_or_else(|label| panic!("{what}: REQUEST_MEMORY_CAPS status {label:#x}"));
+        let range = map_grant(cap, u64::from(pages), what);
+        // SAFETY: `map_grant` mapped the span readable; nothing else refers
+        // to it, and the slice dies before the unmap.
+        let (n, m) = nonzero_words(unsafe { words(range.va_start(), u64::from(pages)) });
+        unmap_grant(range, what);
+        nonzero = nonzero.saturating_add(n);
+        marker = marker.saturating_add(m);
+        held.push((cap, id));
+    }
+    for (cap, id) in held
+    {
+        release_grant(cap, id);
+    }
+    (nonzero, marker)
+}
+
+/// Trigger rechecks until memmgr's free total is back to `target` bytes, or
+/// the poll bound passes: other processes' allocations meanwhile can keep it
+/// below, which only makes the draws after it less likely to meet the runs a
+/// death returned, never makes them read a previous owner's words.
+fn await_free_at_least(target: u64)
+{
+    // A test wait bound: it limits only how long the phase polls.
+    const MAX_POLL: u32 = 64;
+    for _ in 0..MAX_POLL
+    {
+        recheck_deferred();
+        if pool_free_and_largest().0 >= target
+        {
+            return;
+        }
+        let _ = syscall::thread_yield();
+    }
+}
+
+/// A `scrub-child`: fill a contiguous grant of [`SCRUB_PAGES`] pages and a
+/// demand region of as many with [`SCRUB_MARKER`], then exit holding both, so
+/// memmgr reclaims them on the death. Exit codes: 2 = the grant request
+/// failed, 3 = reserving its VA failed, 4 = mapping it failed, 5 = registering
+/// the demand region failed.
+fn scrub_child_main() -> !
+{
+    let pages = u64::from(SCRUB_PAGES);
+    let Ok((grant, _)) = try_request_contiguous(SCRUB_PAGES)
+    else
+    {
+        std::process::exit(2)
+    };
+    let Ok(range) = std::os::seraph::reserve_pages(pages)
+    else
+    {
+        std::process::exit(3)
+    };
+    // SAFETY: `range` is a fresh reservation from the per-process arena, owned
+    // here: VA no Rust object or IPC page occupies.
+    let mapped = unsafe {
+        std::os::seraph::mem_map_funded(
+            grant,
+            startup_info().self_aspace,
+            range.va_start(),
+            0,
+            pages,
+            syscall::MAP_READ | syscall::MAP_WRITABLE,
+        )
+    };
+    if mapped.is_err()
+    {
+        std::process::exit(4);
+    }
+    // SAFETY: the span was mapped read-write just above, and nothing else
+    // refers to it.
+    unsafe { words_mut(range.va_start(), pages) }.fill(SCRUB_MARKER);
+    let Ok(region) = std::os::seraph::register_demand_paged(pages)
+    else
+    {
+        std::process::exit(5)
+    };
+    // SAFETY: the span is a read-write demand region of this process, whose
+    // first write of each page backs it, and nothing else refers to it.
+    unsafe { words_mut(region.va_start(), pages) }.fill(SCRUB_MARKER);
+    std::process::exit(0)
+}
+
+/// No frame memmgr hands out holds what an earlier owner left in it
+/// (services/memmgr/docs/memory-pool.md § Frame contents), whatever path
+/// returned it to the pool.
+///
+/// The death path: a `scrub-child` fills a contiguous grant and a demand
+/// region of [`SCRUB_PAGES`] pages each with [`SCRUB_MARKER`] and exits
+/// holding both, so memmgr reclaims them when it dies. Once memmgr's free
+/// total is back, svctest draws [`SCRUB_DRAWS`] contiguous grants of the same
+/// size, which best fit takes from the runs the death returned, and reads a
+/// fresh demand region of [`SCRUB_DEMAND_PAGES`] pages.
+///
+/// The release path through the deferred list: svctest fills a one-page grant,
+/// releases it while it still maps it, so memmgr defers it, then unmaps it so
+/// a recheck pools it, and draws [`SCRUB_PAGE_DRAWS`] one-page grants.
+///
+/// Every word of every page drawn must be zero; a failure counts the words
+/// that hold the marker.
+pub fn frame_scrub_phase(_: &Caps)
+{
+    let before = pool_free_and_largest().0;
+    let status = std::process::Command::new("/tests/svctest")
+        .arg(SCRUB_CHILD_ROLE)
+        .status()
+        .expect("memmgr_frame_scrub: spawning scrub-child failed");
+    assert!(
+        status.success(),
+        "memmgr_frame_scrub: scrub-child exited {status} (2 = grant, 3 = reserve, 4 = map, \
+         5 = demand region)"
+    );
+    await_free_at_least(before);
+
+    let (grant_nonzero, grant_marker) =
+        scan_grants(SCRUB_PAGES, SCRUB_DRAWS, "memmgr_frame_scrub: death draws");
+    let region = std::os::seraph::register_demand_paged(SCRUB_DEMAND_PAGES)
+        .expect("memmgr_frame_scrub: registering the demand region failed");
+    // SAFETY: the span is a read-write demand region of this process, whose
+    // first read of each page backs it; the slice dies before the unregister.
+    let (demand_nonzero, demand_marker) =
+        nonzero_words(unsafe { words(region.va_start(), SCRUB_DEMAND_PAGES) });
+    // SAFETY: no Rust reference and no IPC buffer lies in the region.
+    unsafe { std::os::seraph::unregister_demand_paged(region) }
+        .expect("memmgr_frame_scrub: unregistering the demand region failed");
+
+    let (page, region_id) = request_one_page();
+    let mapped = map_grant(page, 1, "memmgr_frame_scrub: released page");
+    // SAFETY: `map_grant` mapped the page read-write, and nothing else refers
+    // to it.
+    unsafe { words_mut(mapped.va_start(), 1) }.fill(SCRUB_MARKER);
+    let baseline = settled_deferred_bytes();
+    let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, 1)
+        .word(1, region_id)
+        .build();
+    let reply = memmgr_call(&release, "RELEASE_MEMORY_CAPS (mapped)");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "memmgr_frame_scrub: RELEASE_MEMORY_CAPS status"
+    );
+    unmap_grant(mapped, "memmgr_frame_scrub: released page");
+    syscall::cap_delete(page).expect("memmgr_frame_scrub: cap_delete of the released page");
+    await_deferred_at_most(
+        baseline,
+        "memmgr_frame_scrub: released page after its unmap",
+    );
+    let (page_nonzero, page_marker) =
+        scan_grants(1, SCRUB_PAGE_DRAWS, "memmgr_frame_scrub: release draws");
+
+    assert!(
+        grant_nonzero == 0 && demand_nonzero == 0 && page_nonzero == 0,
+        "memmgr_frame_scrub: frames handed out held an earlier owner's words: {grant_nonzero} \
+         nonzero ({grant_marker} the dead child's marker) in the grants and {demand_nonzero} \
+         ({demand_marker}) in the demand region drawn after its death, {page_nonzero} \
+         ({page_marker}) in the grants drawn after a release"
+    );
+    std::os::seraph::log!(
+        "memmgr_frame_scrub: {} grant pages and {SCRUB_DEMAND_PAGES} demand pages after a death, \
+         {SCRUB_PAGE_DRAWS} grant pages after a release, all zero",
+        u64::from(SCRUB_PAGES).saturating_mul(SCRUB_DRAWS as u64)
     );
 }

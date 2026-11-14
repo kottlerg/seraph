@@ -126,20 +126,39 @@ extension, as § Verification Record cites them.
   requirement excludes no hardware inside the floor.
 - **Enable.** The kernel asks M-mode for supervisor shadow stacks with SBI FWFT `SET` of
   `SHADOW_STACK` (feature 2) to 1, with the `LOCK` flag so nothing can clear it before the hart
-  resets, on every hart before its first shadow-stacked code runs; firmware sets `menvcfg.SSE`.
-  An error reply (`SBI_ERR_NOT_SUPPORTED` from a firmware whose hart lacks Zicfiss, or the reply
-  of a firmware without FWFT) leaves the feature off on every hart, and the kernel runs with the
-  instructions as no-ops. Shadow stacks are either on for every hart or for none. The kernel
-  keeps `senvcfg.SSE` clear, so U-mode cannot access `ssp` and runs Zicfiss instructions as
-  no-ops. `SYS_SBI_CALL` keeps refusing the FWFT extension (`syscall/sbi.rs`), since a forwarded
-  FWFT call would reach this setting.
+  resets; firmware sets `menvcfg.SSE`. `ssp` cannot be written before the enable (with
+  `menvcfg.SSE` clear an access to it is an illegal instruction), and every `sspush` after it
+  stores at `ssp`, so the `SET` and the write of `ssp` are one assembly sequence with no call
+  between them, made with interrupts disabled, after the hart's first shadow stack has its SS
+  leaf (below):
+  - The boot hart enables after Phase 3 and the boot-stack rebase, inline in
+    `kernel_entry_post_rebase`, not in a function it calls. Before Phase 3 no direct map, and so
+    no SS leaf, exists. A function entered before the enable would check its return against a
+    shadow stack it never pushed to; `kernel_entry_post_rebase` never returns, so no frame that
+    began before the enable runs its `sspopchk`.
+  - A secondary hart enables in its startup assembly, before its first call, on the shadow
+    stack the boot hart prepared for its idle stack.
+  - Shadow stacks are on for every hart or for none, since a thread migrates between harts with
+    a live call chain. The boot hart's reply decides: after an error reply
+    (`SBI_ERR_NOT_SUPPORTED` from a firmware whose hart lacks Zicfiss, or the reply of a
+    firmware without FWFT) no hart asks, and the kernel runs with the instructions as no-ops. A
+    secondary hart whose `SET` fails after the boot hart's succeeded halts the boot, as a
+    secondary hart with a different vector length does
+    ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § riscv64
+    Classification).
+
+  The kernel keeps `senvcfg.SSE` clear, so U-mode cannot access `ssp` and runs Zicfiss
+  instructions as no-ops. `SYS_SBI_CALL` keeps refusing the FWFT extension (`syscall/sbi.rs`),
+  since a forwarded FWFT call would reach this setting.
 - **Shadow-stack memory.** Each kernel stack gets a shadow stack: one 4 KiB page per Thread,
   carved from the Thread retype slot (`sched/thread_slot.rs`), and one per idle stack and for the
   handoff stack. Its direct-map leaf becomes an SS page (`R=0`, `W=1`, `X=0`), so no ordinary
   writable alias of it exists; the split of the 2 MiB direct-map leaf reuses the guard-page
-  reserve of `mm/stack_guard.rs`. With `menvcfg.SSE` clear that encoding is reserved, so the
-  kernel installs SS leaves only after the FWFT call succeeded. Ordinary loads may read an SS
-  page; ordinary stores, fetches, and cache-block operations fault.
+  reserve of `mm/stack_guard.rs`. With `menvcfg.SSE` clear that encoding is reserved, and any
+  access to the page faults. The boot hart installs the handoff shadow stack's leaf just before
+  its enable, when nothing accesses the page; on an error reply it restores the leaf as ordinary
+  memory. Every other SS leaf is installed only once shadow stacks are on. Ordinary loads may
+  read an SS page; ordinary stores, fetches, and cache-block operations fault.
 - **`ssp`.** The trap entry (`arch/riscv64/interrupts.rs`) runs on the interrupted thread's
   shadow stack, as it runs on its kernel stack; the context switch (`arch/riscv64/context.rs`)
   saves the outgoing thread's `ssp` and loads the incoming one's.
@@ -151,8 +170,10 @@ extension, as § Verification Record cites them.
   `zimop=on,zcmop=on,zicfiss=on`. QEMU names `zimop` and `zcmop` from 9.1 and `zicfiss` from
   9.2, so the QEMU minimum rises from 9.0 to 9.2.
 - **Test.** A ktest cell corrupts a saved return address between `sspush` and `sspopchk` and
-  expects the software-check exception. No test relies on a fault of a shadow-stack access
-  outside an SS page, which TCG does not raise (check 3).
+  expects the software-check exception. TCG does not fault a shadow-stack access outside an SS
+  page (check 3), so CI cannot catch an `ssp` that points at ordinary memory, which halts the
+  kernel on hardware: a ktest cell checks instead that the running thread's `ssp` lies within an
+  SS leaf of its own shadow stack.
 
 ---
 

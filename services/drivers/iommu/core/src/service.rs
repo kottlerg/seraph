@@ -315,12 +315,20 @@ impl<B: Backend, C: CapOps> Service<B, C>
     }
 
     /// Poll the units' fault records into the queue. Returns the faults the
-    /// queue dropped since the last poll for want of room.
+    /// queue dropped for want of room since the last call, counting those
+    /// dropped by a `TAKE_FAULTS` request's own poll, and resets the count.
     pub fn poll(&mut self) -> u64
+    {
+        self.collect_faults();
+        self.faults.take_dropped()
+    }
+
+    /// Poll the units' fault records into the queue, leaving the count of
+    /// faults it drops for [`Self::poll`] to report.
+    fn collect_faults(&mut self)
     {
         let faults = &mut self.faults;
         self.backend.poll_faults(&mut |f| faults.push(f));
-        self.faults.take_dropped()
     }
 
     /// Answer one request, taking ownership of the caps it carries: a
@@ -828,10 +836,11 @@ impl<B: Backend, C: CapOps> Service<B, C>
     }
 
     /// Poll the units, so the reply holds every fault recorded so far, and
-    /// take the oldest queued faults into the reply.
+    /// take the oldest queued faults into the reply. The poll leaves the
+    /// count of faults it drops in the queue, for [`poll_faults`] to report.
     fn take_faults(&mut self) -> IpcMessage
     {
-        self.poll();
+        self.collect_faults();
         let mut pairs = [[0u64; 2]; iommu_labels::MAX_FAULTS_PER_REPLY];
         let mut slots = pairs.iter_mut();
         let units = &self.units;
@@ -1475,6 +1484,32 @@ mod tests
         let first = s.handle(&take);
         assert_eq!(first.word(0), iommu_labels::MAX_FAULTS_PER_REPLY as u64);
         assert_eq!(s.handle(&take).words()[..1], [1]);
+    }
+
+    #[test]
+    fn a_fault_dropped_by_a_takes_poll_is_reported_by_the_next_poll()
+    {
+        let mut s = service();
+        let fault = |i: u64| Fault {
+            unit: 0,
+            bdf: 1,
+            reason: 1,
+            iova: i << 12,
+        };
+        for i in 0..crate::faults::FAULT_QUEUE_CAPACITY as u64
+        {
+            s.backend.pending.push(fault(i));
+        }
+        assert_eq!(s.poll(), 0);
+        // The queue is full, so the take's own poll drops this fault.
+        s.backend.pending.push(fault(u64::MAX >> 12));
+        let take = req(iommu_labels::TAKE_FAULTS, &[], &[]);
+        assert_eq!(
+            s.handle(&take).word(0),
+            iommu_labels::MAX_FAULTS_PER_REPLY as u64
+        );
+        assert_eq!(s.poll(), 1);
+        assert_eq!(s.poll(), 0);
     }
 
     fn map_reserved(s: &mut Service<Fake, FakeCaps>, d: u64, base: u64, len: u64) -> u64

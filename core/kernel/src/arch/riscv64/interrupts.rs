@@ -113,7 +113,7 @@ mod entry
     /// S-mode, and `PerCpuData::kernel_rsp` set to the running thread's kernel stack top
     /// before any return to U-mode.
     #[unsafe(naked)]
-    pub(super) unsafe extern "C" fn trap_entry()
+    pub(super) unsafe extern "custom" fn trap_entry()
     {
         // Frame layout: 35 × 8 = 280 bytes (size asserted in `trap_frame::tests`).
         // Offsets: x1=0, x2=8, x3=16, x4=24, x5=32, …, x31=240,

@@ -524,6 +524,13 @@ in the same change.
 - x86-64 inline assembly (`asm!`, `naked_asm!` and `global_asm!`) MUST use the Intel syntax,
   the default of Rust's inline assembly, and MUST NOT pass `options(att_syntax)`; the
   `inline_asm_x86_att_syntax` lint checks it.
+- A naked function that Rust code never calls MUST be declared `unsafe extern "custom"`: an entry
+  point the hardware enters through a vector table or an entry register (an IDT gate,
+  `IA32_LSTAR`, `stvec`), and a routine only assembly reaches, by `jmp` or `call`. Its calling
+  convention is the one its assembly states, which no Rust ABI string names, and the compiler
+  refuses a Rust call of a `custom`-ABI function. Its address is taken by coercion to an
+  `unsafe extern "custom" fn()` pointer, and assembly names it with `sym`. A naked function that
+  Rust code calls keeps the `extern` ABI its callers use. No lint checks the declaration.
 - When adding a new architecture, do not diverge from the interface contract without
   updating every implementation.
 

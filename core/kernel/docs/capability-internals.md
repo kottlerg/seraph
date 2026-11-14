@@ -417,7 +417,10 @@ most `RECORDS_PER_PAGE` records of one Memory object, whose return costs one wal
 page free list (at most one node per page of the object, [docs/limits.md](../../../docs/limits.md)),
 an insertion per run, and the sort of the group and of its records' kept arena pages. The kept
 pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
-body at most. Neither the donation count nor any `init_pages` lengthens the window; the walk's
+body at most. Before taking the locks, the return zeroes the group's runs
+([memory-internals.md](memory-internals.md) § Kernel Object Memory), taking the pending interrupts
+after every 16 pages it zeroes, so the zeroing adds at most one 16-page batch of stores to a window.
+Neither the donation count nor any `init_pages` lengthens the window; the walk's
 total length still grows with the donation count. It runs to completion in whichever context drops
 the last reference: the deleting syscall, with interrupts masked on that CPU except in the windows;
 or, when the owner is handed to the per-CPU deferred-reclaim stack (a thread deleting an object it

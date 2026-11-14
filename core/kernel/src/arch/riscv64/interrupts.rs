@@ -809,7 +809,8 @@ unsafe fn terminate_faulted_thread(
 }
 
 /// An S-mode exception: retry a stale TLB entry, redirect a faulting user
-/// copy or a trapped `seed` CSR read to its fixup, and otherwise report the
+/// copy, a trapped `seed` CSR read or a trapped `sstateen0` access to its
+/// fixup, and otherwise report the
 /// exception and halt the hart.
 /// `sstatus_val` and `satp_val` are the CSRs read at the trap.
 ///
@@ -887,6 +888,17 @@ unsafe fn kernel_exception(
     // source absent, instead of halting.
     if cause_code == 2
         && let Some(fixup) = super::entropy::seed_fault_fixup(live.sepc)
+    {
+        live.sepc = fixup;
+        return;
+    }
+
+    // Ssstateen probe: an illegal-instruction trap at an `sstateen0` access is
+    // a hart without Ssstateen, or one whose firmware left `mstateen0.SE0`
+    // clear. Resume at the accesses' fixup, which reports the trap so
+    // `cpu::disable_unswitched_user_state` halts the boot by name.
+    if cause_code == 2
+        && let Some(fixup) = super::cpu::sstateen0_fault_fixup(live.sepc)
     {
         live.sepc = fixup;
         return;

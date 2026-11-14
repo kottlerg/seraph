@@ -765,8 +765,11 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // system requires: V (Vector) plus the Zba/Zbb/Zbs bitmanip set for
     // userspace, the supervisor paging extensions Svpbmt/Svinval/Svnapot, and
     // the AIA CSRs Ssaia (and Smaia, which the firmware's machine-level IMSIC
-    // use needs), that the kernel's boot gate refuses to run without (explicit
-    // `=on` pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
+    // use needs), and Smstateen, whose S-mode part Ssstateen gives the kernel
+    // the `sstateen0` it writes on every hart (the firmware, OpenSBI, grants
+    // S-mode the CSR when the hart has Smstateen, which the rv64 model leaves
+    // off), that the kernel's boot gate refuses to run without (explicit `=on`
+    // pins against QEMU default drift). RVA23 also mandates Zfa, Zfhmin,
     // Zihintntl, Zicond, Zimop, Zcmop, Zcb, Zvfhmin, Zvbb, Zvkt, Zkt — those
     // land as QEMU coverage broadens. Which QEMU versions this string targets,
     // and why the named `-cpu rva23s64` model is not used, are specified in
@@ -783,7 +786,7 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
         "-cpu".into(),
         format!(
             "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
-             ssaia=on,smaia=on{}{}",
+             ssaia=on,smaia=on,smstateen=on{}{}",
             spec.riscv_zkr.cpu_zkr_prop(),
             spec.riscv_mmu.cpu_satp_props()
         ),
@@ -1124,6 +1127,15 @@ mod tests
         let cpu = cpu_arg(&argv);
         assert!(cpu.contains(",ssaia=on"));
         assert!(cpu.contains(",smaia=on"));
+    }
+
+    #[test]
+    fn riscv_cpu_presents_state_enables()
+    {
+        // The kernel writes sstateen0 on every hart and halts the boot when
+        // the hart has no Ssstateen; QEMU's rv64 model leaves Smstateen off.
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).contains(",smstateen=on"));
     }
 
     #[test]

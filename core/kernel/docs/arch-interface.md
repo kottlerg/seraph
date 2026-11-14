@@ -729,6 +729,16 @@ pub unsafe fn verify_baseline();
 /// fetch is coherent with stores.
 pub fn sync_instruction_fetch();
 
+/// Disable, for user mode, every state the kernel does not save and restore on
+/// a context switch. Called once per CPU after its trap vector and per-CPU
+/// pointer are installed: the BSP in Phase 5 after `percpu::init_bsp`, each AP
+/// in `kernel_entry_ap` after `interrupts::init_ap`. RISC-V writes `sstateen0`
+/// with no state enabled and halts the boot, naming Ssstateen, when the access
+/// traps (no Ssstateen, or the firmware left `mstateen0.SE0` clear) or the value
+/// does not read back; x86-64 does nothing, since the extended state ring 3
+/// reaches is the XCR0 set the XSAVE switch saves.
+pub unsafe fn disable_unswitched_user_state();
+
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU
 /// before any per-CPU access.
 pub unsafe fn install_percpu(addr: u64);

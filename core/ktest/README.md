@@ -304,10 +304,11 @@ the report waits of `integration::fault_debug` and `integration::single_step`, t
 polls of `thread::load_balancer_redistributes_skewed`, the death-entry waits of
 `thread::bind_notification_nodes_come_from_the_queue`; the exit and come-up polls of
 `configure_start_race`, `mutual_stop`, `stop_fault_sender`, `stop_owed_wake`, `stop_repark`,
-`stop_target_vanishes` and `split_delete_race`, the final-delivery polls of `stop_repark`, the
-controller polls of `sleep_list_wide`, the first-fault and death polls of `fault_bind_race`, and the
-delivery probe, keeper wait, delete and exit polls of `irq_route_delete_race`, and the delivery
-probe and the write, park and exit polls of `msg_inject_delete_race`; the report waits
+`stop_target_vanishes` and `split_delete_race`, the final-delivery and failure-probe polls of
+`stop_repark`, the controller polls of `sleep_list_wide`, the first-fault and death polls of
+`fault_bind_race`, and the delivery probe, keeper wait, delete and exit polls of
+`irq_route_delete_race`, and the delivery probe and the write, park and exit polls of
+`msg_inject_delete_race`; the report waits
 of the timed-wait IPC cells (`ipc::recv_try_once_takes_queued_caller`, whose try-once retries
 are scaled too, `ipc::recv_try_once_keeps_reply_binding` and
 `ipc::call_timeout_late_reply_refused`, whose call attempts and server receive and go waits are

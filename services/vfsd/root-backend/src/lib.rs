@@ -35,11 +35,21 @@
 //! `fallthrough_cap` is the root mount cap captured when
 //! `MOUNT path="/"` succeeds.
 //!
+//! Every mount, the root mount included, keeps its [`Mount`] record on
+//! the node it is mounted on, with its state. A mount below `/` is
+//! removed in two steps: [`VfsdRootBackend::begin_unmount`] stops every
+//! lookup from crossing it, and [`VfsdRootBackend::remove_mount`] clears
+//! its record once its driver is torn down. A node no mount holds and
+//! below which nothing is mounted is *vacant*: lookups, listings, and
+//! shadowing skip it, so its name falls through to the root filesystem
+//! as an absent one does. The root mount is never removed.
+//!
 //! The tree grows on the heap, one node per installed path component
-//! that does not yet exist, and nodes are never freed (vfsd has no
-//! unmount), so a node's pool index, which is its `NodeId`, is stable
-//! for the life of the process. A component follows the namespace
-//! protocol's name rule ([`validate_name`], at most
+//! that does not yet exist, and nodes are never freed: a removed mount
+//! leaves its node vacant, and a later install reuses it, so a node's
+//! pool index, which is its `NodeId`, is stable for the life of the
+//! process. A component follows the namespace protocol's name rule
+//! ([`validate_name`], at most
 //! [`MAX_NAME_LEN`](namespace_protocol::MAX_NAME_LEN) bytes).
 //!
 //! The tree holds cap slot numbers but makes no syscall, so the crate is
@@ -63,13 +73,67 @@ use namespace_protocol::{
 /// nodes.
 const NONE: u32 = u32::MAX;
 
+/// The record of one mount: what vfsd holds to reach its driver and to
+/// tear it down. The tree stores the record and makes no syscall on it;
+/// the meaning of each slot is vfsd's
+/// (`services/vfsd/docs/namespace-composition.md` § Mount record).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mount
+{
+    /// The cap the tree resolves the mount through. Below `/`, the
+    /// *unbadged* SEND on the driver's namespace endpoint: each
+    /// `NS_LOOKUP` that crosses the mount mints a freshly-attenuated
+    /// badged SEND from it (see `EntryTarget::External`), and it is never
+    /// handed out directly. For `/`, the *badged* SEND on the root fs that
+    /// unmatched lookups on the synthetic root forward to.
+    pub cap: u64,
+    /// The driver's service endpoint as vfsd created it, from which every
+    /// cap on that endpoint derives.
+    pub endpoint: u64,
+    /// procmgr's process handle for the driver.
+    pub process: u64,
+    /// `RECV` on the event queue the driver's deaths post to.
+    pub death_queue: u64,
+    /// The `REGISTER_PARTITION` reply cap, from which the driver's
+    /// partition cap derives.
+    pub partition: u64,
+    /// The index, in vfsd's disk list, of the disk that holds the
+    /// mounted partition.
+    pub disk: usize,
+}
+
+/// Why [`VfsdRootBackend::begin_unmount`] refused a node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnmountError
+{
+    /// The node is the synthetic root: the root mount is never removed.
+    Root,
+    /// No mount is on the node, or the index is outside the pool.
+    NotMounted,
+    /// The mount's removal has already begun.
+    InProgress,
+}
+
+/// What a node holds besides its links.
+#[derive(Clone, Copy)]
+enum Slot
+{
+    /// No mount: a synthetic intermediate, or a vacant node.
+    Empty,
+    /// A mount that lookups cross.
+    Mounted(Mount),
+    /// A mount whose removal has begun: no lookup crosses it, and no
+    /// install may take the node until [`VfsdRootBackend::remove_mount`].
+    Unmounting(Mount),
+}
+
 /// One node in the synthetic-root tree.
 ///
-/// A node is either a *terminal* (a mount point installed by `MOUNT`,
-/// `terminal_endpoint != 0`) or a *synthetic intermediate* (created on
-/// demand to host a multi-component mount path, `terminal_endpoint == 0`).
-/// Both forms may carry a `fallthrough_cap` addressing the
-/// corresponding directory in the root filesystem; the synthetic
+/// A node holding a mounted [`Slot`] is a *terminal* (a mount point); a
+/// node with no mount but a mount somewhere below it is a *synthetic
+/// intermediate*, which hosts a multi-component mount path; any other
+/// node is vacant. Every node may carry a `fallthrough_cap` addressing
+/// the corresponding directory in the root filesystem; the synthetic
 /// root's `fallthrough_cap` is the root mount cap itself.
 struct TreeNode
 {
@@ -78,13 +142,12 @@ struct TreeNode
     parent: u32,
     first_child: u32,
     next_sibling: u32,
-    /// Unbadged SEND on the mounted driver's namespace endpoint,
-    /// captured at MOUNT time. Non-zero on terminal (mount-point)
-    /// nodes, zero on synthetic intermediates. Each `NS_LOOKUP` that
-    /// crosses this mount mints a freshly-attenuated badged SEND from
-    /// it (see `EntryTarget::External`); the endpoint is held here and
-    /// never handed out directly.
-    terminal_endpoint: u64,
+    /// The mount on this node, if any, with its state.
+    slot: Slot,
+    /// Mounts in [`Slot::Mounted`] state in this node's subtree, the node
+    /// itself included. A node other than the root is visible (lookups,
+    /// listings, and shadowing see it) exactly when this is non-zero.
+    live: u32,
     /// Badged SEND on the root mount's namespace endpoint addressing
     /// the directory at the path corresponding to this node, used to
     /// forward unmatched `NS_LOOKUP` requests so root-fs entries
@@ -93,6 +156,19 @@ struct TreeNode
     /// root filesystem, or the root mount has not been installed yet).
     /// On `NodeId::ROOT` this field carries the root mount cap.
     fallthrough_cap: u64,
+}
+
+impl TreeNode
+{
+    /// The mount lookups cross on this node, if one is mounted.
+    fn mounted(&self) -> Option<&Mount>
+    {
+        match &self.slot
+        {
+            Slot::Mounted(mount) => Some(mount),
+            Slot::Empty | Slot::Unmounting(_) => None,
+        }
+    }
 }
 
 /// In-process synthetic root for vfsd.
@@ -112,10 +188,14 @@ pub struct VfsdRootBackend
 
 /// Outcome of a successful [`VfsdRootBackend::install`] call.
 ///
-/// Carries the indices of any synthetic intermediates created to host
-/// the path so the caller can compute and install their
-/// `fallthrough_cap` via [`VfsdRootBackend::set_fallthrough_cap`]
-/// after walking the root mount component-by-component.
+/// Carries the indices of the synthetic intermediates the install made
+/// visible (a node it created, or a vacant node it reused) that need a
+/// `fallthrough_cap` ([`VfsdRootBackend::needs_fallthrough`]) so the
+/// caller can compute and install it via
+/// [`VfsdRootBackend::set_fallthrough_cap`] after walking the root mount
+/// component-by-component. Only one install can make a node visible while
+/// it stays so, which keeps two concurrent `MOUNT`s from walking for one
+/// node.
 pub struct InstallResult
 {
     new_intermediates: Vec<u32>,
@@ -123,7 +203,8 @@ pub struct InstallResult
 
 impl InstallResult
 {
-    /// Pool indices of the synthetic intermediates the install created.
+    /// Pool indices of the intermediates this install made visible that
+    /// need a fall-through cap, root first.
     #[must_use]
     pub fn as_slice(&self) -> &[u32]
     {
@@ -153,36 +234,40 @@ impl VfsdRootBackend
                 parent: NONE,
                 first_child: NONE,
                 next_sibling: NONE,
-                terminal_endpoint: 0,
+                slot: Slot::Empty,
+                live: 0,
                 fallthrough_cap: 0,
             },
             nodes: Vec::new(),
         }
     }
 
-    /// Install one mount-point entry.
+    /// Install one mount.
     ///
     /// Walks `path`'s components, creating synthetic intermediates on
-    /// demand, and stores `cap` on the final node's `terminal_endpoint`.
-    /// The empty path (`/`) instead stores `cap` as the synthetic
-    /// root's `fallthrough_cap` (the root mount).
+    /// demand, and stores `mount` on the final node, which lookups then
+    /// cross through `mount.cap`. The empty path (`/`) instead stores
+    /// `mount` on the synthetic root and `mount.cap` as its
+    /// `fallthrough_cap` (the root mount).
     ///
-    /// `cap`'s kind is the caller's responsibility and differs by role:
-    /// a terminal mount passes the peer driver's *unbadged* namespace
-    /// endpoint (each crossing `NS_LOOKUP` mints an attenuated badge
-    /// from it); the root mount passes a *badged* SEND on the root fs
-    /// (the fall-through forwarder pre-composes the caller's rights).
+    /// `mount.cap`'s kind is the caller's responsibility and differs by
+    /// role: a terminal mount passes the peer driver's *unbadged*
+    /// namespace endpoint (each crossing `NS_LOOKUP` mints an attenuated
+    /// badge from it); the root mount passes a *badged* SEND on the root
+    /// fs (the fall-through forwarder pre-composes the caller's rights).
     ///
-    /// Returns `Some(InstallResult)` listing newly-created
-    /// intermediate indices on success; the caller is expected to
-    /// compute and store each intermediate's `fallthrough_cap` via
+    /// Returns `Some(InstallResult)` listing the intermediates this
+    /// install made visible that need a fall-through cap; the caller is
+    /// expected to compute
+    /// and store each one's `fallthrough_cap` via
     /// [`Self::set_fallthrough_cap`].
     ///
     /// Returns `None`, leaving the tree unchanged, on a component that
-    /// fails [`validate_name`], an attempt to mount on top of an
-    /// already-terminal node, a re-install of the root mount (see
-    /// [`Self::can_install`]), or a failure to allocate the new nodes.
-    pub fn install(&mut self, path: &[u8], cap: u64) -> Option<InstallResult>
+    /// fails [`validate_name`], an attempt to mount on a node that holds
+    /// a mount (one being removed included), a re-install of the root
+    /// mount (see [`Self::can_install`]), or a failure to allocate the
+    /// new nodes.
+    pub fn install(&mut self, path: &[u8], mount: Mount) -> Option<InstallResult>
     {
         // Validate the whole path, and allocate every node and name the
         // walk creates, before mutating anything.
@@ -190,7 +275,9 @@ impl VfsdRootBackend
         let component_count = path_components(path).count();
         if component_count == 0
         {
-            self.root.fallthrough_cap = cap;
+            self.root.fallthrough_cap = mount.cap;
+            self.root.slot = Slot::Mounted(mount);
+            self.root.live = self.root.live.saturating_add(1);
             return Some(InstallResult {
                 new_intermediates: Vec::new(),
             });
@@ -208,7 +295,7 @@ impl VfsdRootBackend
         }
         let mut new_intermediates = Vec::new();
         new_intermediates
-            .try_reserve_exact(new_nodes.saturating_sub(1))
+            .try_reserve_exact(component_count.saturating_sub(1))
             .ok()?;
         self.nodes.try_reserve(new_nodes).ok()?;
 
@@ -219,43 +306,137 @@ impl VfsdRootBackend
         while let Some(component) = components.next()
         {
             let is_last = components.peek().is_none();
-            if let Some(child) = self.find_child(current, component)
+            let next = if let Some(child) = self.find_child(current, component)
             {
-                if is_last && let Some(node) = self.node_mut(child)
-                {
-                    node.terminal_endpoint = cap;
-                }
-                current = child;
-                continue;
+                child
             }
-            // `plan_install` counted this component among the new ones,
-            // and the loop above prepared its name.
-            let name = names.next()?;
-            let new_idx = self.next_index()?;
-            let parent_first_child = self.node(current)?.first_child;
-            self.nodes.push(TreeNode {
-                name,
-                parent: current,
-                first_child: NONE,
-                next_sibling: parent_first_child,
-                terminal_endpoint: if is_last { cap } else { 0 },
-                fallthrough_cap: 0,
-            });
-            self.node_mut(current)?.first_child = new_idx;
-            if !is_last
+            else
             {
-                new_intermediates.push(new_idx);
+                // `plan_install` counted this component among the new
+                // ones, and the loop above prepared its name.
+                let name = names.next()?;
+                let new_idx = self.next_index()?;
+                let parent_first_child = self.node(current)?.first_child;
+                self.nodes.push(TreeNode {
+                    name,
+                    parent: current,
+                    first_child: NONE,
+                    next_sibling: parent_first_child,
+                    slot: Slot::Empty,
+                    live: 0,
+                    fallthrough_cap: 0,
+                });
+                self.node_mut(current)?.first_child = new_idx;
+                new_idx
+            };
+            if is_last
+            {
+                self.node_mut(next)?.slot = Slot::Mounted(mount);
             }
-            current = new_idx;
+            else if self.node(next)?.live == 0
+            {
+                // The node holds no live mount at or below it yet, so this
+                // install makes it visible: a node just created, or a
+                // vacant one reused. An intermediate already visible was
+                // listed by the install that made it so.
+                new_intermediates.push(next);
+            }
+            current = next;
         }
+        self.adjust_live(current, u32::saturating_add);
+        // `retain` keeps the reserved capacity and does not allocate.
+        new_intermediates.retain(|&idx| self.needs_fallthrough(idx));
         Some(InstallResult { new_intermediates })
+    }
+
+    /// Whether the node at `idx` is a synthetic intermediate without a
+    /// fall-through cap: a node other than the root, holding no mount
+    /// lookups cross, with a mount below it, and no `fallthrough_cap`.
+    /// An install lists such a node when it makes it visible; a node
+    /// whose own mount [`Self::begin_unmount`] stopped while a mount
+    /// below it stays becomes one when it had no fall-through cap before.
+    #[must_use]
+    pub fn needs_fallthrough(&self, idx: u32) -> bool
+    {
+        idx != 0
+            && self
+                .node(idx)
+                .is_some_and(|n| n.live != 0 && n.mounted().is_none() && n.fallthrough_cap == 0)
+    }
+
+    /// The pool index of the existing node `path` names (`0` for `/`),
+    /// vacant nodes included, or `None` when a component names no node.
+    #[must_use]
+    pub fn find(&self, path: &[u8]) -> Option<u32>
+    {
+        path_components(path).try_fold(0u32, |idx, component| self.find_child(idx, component))
+    }
+
+    /// Begin removing the mount on the node at `idx`: from now on no
+    /// lookup crosses it, its name falls through to the root filesystem
+    /// unless a mount below it keeps the node visible as an intermediate,
+    /// and no install may take the node until [`Self::remove_mount`].
+    /// Returns the mount's record.
+    ///
+    /// # Errors
+    ///
+    /// [`UnmountError::Root`] for the synthetic root,
+    /// [`UnmountError::NotMounted`] for a node holding no mount or an
+    /// index outside the pool, and [`UnmountError::InProgress`] when the
+    /// mount's removal has already begun. A refusal changes nothing.
+    pub fn begin_unmount(&mut self, idx: u32) -> Result<Mount, UnmountError>
+    {
+        if idx == 0
+        {
+            return Err(UnmountError::Root);
+        }
+        let node = self.node_mut(idx).ok_or(UnmountError::NotMounted)?;
+        let mount = match node.slot
+        {
+            Slot::Mounted(mount) => mount,
+            Slot::Unmounting(_) => return Err(UnmountError::InProgress),
+            Slot::Empty => return Err(UnmountError::NotMounted),
+        };
+        node.slot = Slot::Unmounting(mount);
+        self.adjust_live(idx, u32::saturating_sub);
+        Ok(mount)
+    }
+
+    /// Finish removing the mount whose removal [`Self::begin_unmount`]
+    /// began on the node at `idx`: clear its record, which is returned,
+    /// and leave the node in the tree with its index, for a later install
+    /// to reuse. `None`, changing nothing, when no removal has begun on
+    /// the node.
+    pub fn remove_mount(&mut self, idx: u32) -> Option<Mount>
+    {
+        let node = self.node_mut(idx)?;
+        let Slot::Unmounting(mount) = node.slot
+        else
+        {
+            return None;
+        };
+        node.slot = Slot::Empty;
+        Some(mount)
+    }
+
+    /// Apply `step` to the live-mount count of the node at `idx` and of
+    /// each of its ancestors, the root included, as a mount on that node
+    /// starts or stops being crossed.
+    fn adjust_live(&mut self, idx: u32, step: fn(u32, u32) -> u32)
+    {
+        let mut cur = idx;
+        while let Some(node) = self.node_mut(cur)
+        {
+            node.live = step(node.live, 1);
+            cur = node.parent;
+        }
     }
 
     /// Whether [`Self::install`] would accept `path` against the current
     /// tree: the root is not yet mounted (for `/`), every component
-    /// passes [`validate_name`], the final node is not already a mount
-    /// point, and the pool can index every node the install would
-    /// create. The MOUNT path checks this before it registers a
+    /// passes [`validate_name`], the final node holds no mount (one being
+    /// removed included), and the pool can index every node the install
+    /// would create. The MOUNT path checks this before it registers a
     /// partition or spawns a driver, so a mount `install` would reject
     /// acquires nothing; only an allocation failure in `install` itself
     /// remains to be handled after the spawn.
@@ -275,7 +456,7 @@ impl VfsdRootBackend
         {
             // Root mount: reject a second one rather than overwrite the
             // cap and leak the running root fs driver.
-            return (self.root.fallthrough_cap == 0).then_some(0);
+            return matches!(self.root.slot, Slot::Empty).then_some(0);
         }
 
         // `existing` is the node the walk is at while every component so
@@ -293,9 +474,9 @@ impl VfsdRootBackend
             }
         }
         if let Some(last) = existing
-            && self.node(last)?.terminal_endpoint != 0
+            && !matches!(self.node(last)?.slot, Slot::Empty)
         {
-            // Path is already a mount point.
+            // Path is already a mount point, or one being removed.
             return None;
         }
         // Every index, the root's included, stays below `NONE`.
@@ -305,13 +486,24 @@ impl VfsdRootBackend
 
     /// Set a synthetic intermediate's `fallthrough_cap`. Called by the
     /// MOUNT path after walking the root mount to the corresponding
-    /// directory. An index outside the pool is ignored.
-    pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u64)
+    /// directory.
+    ///
+    /// Stores `cap` and returns `true` only while the node still
+    /// [`Self::needs_fallthrough`]. Returns `false`, changing nothing, for
+    /// an index outside the pool or a node that no longer needs one (it
+    /// has a fall-through cap, holds a mount, or has no mount below it):
+    /// the caller then still owns `cap` and deletes it, so a cap is never
+    /// overwritten.
+    #[must_use]
+    pub fn set_fallthrough_cap(&mut self, node_idx: u32, cap: u64) -> bool
     {
-        if let Some(node) = self.node_mut(node_idx)
+        if !self.needs_fallthrough(node_idx)
         {
-            node.fallthrough_cap = cap;
+            return false;
         }
+        self.node_mut(node_idx)
+            .map(|node| node.fallthrough_cap = cap)
+            .is_some()
     }
 
     /// The absolute path of the node at `idx`: it begins with `/` and
@@ -370,13 +562,14 @@ impl VfsdRootBackend
         self.node(idx).map(|_| idx)
     }
 
-    /// Whether the directory at pool index `idx` has a child matching
-    /// `name`. Used by the namespace dispatcher to decide whether to
-    /// fall through to `fallthrough_cap`.
+    /// Whether the directory at pool index `idx` has a visible child
+    /// matching `name`, one that is a mount point or has a mount below it.
+    /// Used by the namespace dispatcher to decide whether to fall through
+    /// to `fallthrough_cap`; a vacant child's name falls through.
     #[must_use]
     pub fn has_local_child(&self, idx: u32, name: &[u8]) -> bool
     {
-        self.find_child(idx, name).is_some()
+        self.find_visible_child(idx, name).is_some()
     }
 
     /// Fall-through cap stored on the node at pool index `idx`, or `0`.
@@ -386,10 +579,10 @@ impl VfsdRootBackend
         self.node(idx).map_or(0, |n| n.fallthrough_cap)
     }
 
-    /// Number of children of the directory at pool index `idx`.
-    /// `NS_READDIR` enumerates these synthetic children first; the
-    /// dispatcher's fall-through readdir serves higher indices from the
-    /// node's `fallthrough_cap`.
+    /// Number of visible children of the directory at pool index `idx`
+    /// (vacant ones are not counted). `NS_READDIR` enumerates these
+    /// synthetic children first; the dispatcher's fall-through readdir
+    /// serves higher indices from the node's `fallthrough_cap`.
     #[must_use]
     pub fn local_child_count(&self, idx: u32) -> u32
     {
@@ -397,7 +590,10 @@ impl VfsdRootBackend
         let mut cur = self.node(idx).map_or(NONE, |n| n.first_child);
         while let Some(n) = self.node(cur)
         {
-            count = count.saturating_add(1);
+            if n.live != 0
+            {
+                count = count.saturating_add(1);
+            }
             cur = n.next_sibling;
         }
         count
@@ -432,6 +628,7 @@ impl VfsdRootBackend
         u32::try_from(self.nodes.len().saturating_add(1)).ok()
     }
 
+    /// The child of `parent` named `name`, vacant or not.
     fn find_child(&self, parent: u32, name: &[u8]) -> Option<u32>
     {
         let mut cur = self.node(parent)?.first_child;
@@ -444,6 +641,14 @@ impl VfsdRootBackend
             cur = n.next_sibling;
         }
         None
+    }
+
+    /// The child of `parent` named `name` when it is visible: a mount
+    /// point, or a node with a mount below it.
+    fn find_visible_child(&self, parent: u32, name: &[u8]) -> Option<u32>
+    {
+        self.find_child(parent, name)
+            .filter(|&idx| self.node(idx).is_some_and(|n| n.live != 0))
     }
 }
 
@@ -463,7 +668,7 @@ impl NamespaceBackend for VfsdRootBackend
         {
             return Err(NsError::NotADirectory);
         };
-        let Some(child_idx) = self.find_child(parent_idx, name)
+        let Some(child_idx) = self.find_visible_child(parent_idx, name)
         else
         {
             return Err(NsError::NotFound);
@@ -473,13 +678,13 @@ impl NamespaceBackend for VfsdRootBackend
         {
             return Err(NsError::NotFound);
         };
-        let target = if child.terminal_endpoint != 0
+        let target = if let Some(mount) = child.mounted()
         {
             // Terminal mount: cross into the peer fs by minting a fresh
             // attenuated badge on its endpoint at its root. vfsd mounts
             // whole filesystems, so the peer node is always the root.
             EntryTarget::External {
-                endpoint: child.terminal_endpoint,
+                endpoint: mount.cap,
                 node: NodeId::ROOT,
             }
         }
@@ -507,6 +712,13 @@ impl NamespaceBackend for VfsdRootBackend
         let mut visible = 0u32;
         while let Some(n) = self.node(cur)
         {
+            if n.live == 0
+            {
+                // Vacant: its name, if the fall-through directory holds
+                // it, is listed from there.
+                cur = n.next_sibling;
+                continue;
+            }
             if visible == idx
             {
                 // Matches the NONE `lookup` reports: no synthetic node is
@@ -583,14 +795,200 @@ mod tests
     /// A pool index no install below creates.
     const UNUSED_IDX: u32 = 30;
 
+    /// A mount record resolved through `cap`, its other slots distinct
+    /// values derived from it, so a test can tell two records apart.
+    fn mount(cap: u64) -> Mount
+    {
+        Mount {
+            cap,
+            endpoint: cap + 100,
+            process: cap + 200,
+            death_queue: cap + 300,
+            partition: cap + 400,
+            disk: 1,
+        }
+    }
+
+    /// Install `path` at `cap` and begin its unmount, returning its node.
+    fn unmounting(b: &mut VfsdRootBackend, path: &[u8], cap: u64) -> u32
+    {
+        assert!(b.install(path, mount(cap)).is_some());
+        let idx = b.find(path).expect("installed path has a node");
+        assert_eq!(b.begin_unmount(idx), Ok(mount(cap)));
+        idx
+    }
+
+    #[test]
+    fn unmount_returns_the_record_install_stored()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = unmounting(&mut b, b"/esp", CAP);
+        assert_eq!(b.remove_mount(idx), Some(mount(CAP)));
+    }
+
+    #[test]
+    fn the_root_mount_cannot_be_unmounted()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/", mount(CAP)).is_some());
+        assert_eq!(b.find(b"/"), Some(0));
+        assert_eq!(b.begin_unmount(0), Err(UnmountError::Root));
+        assert_eq!(b.root_mount_cap(), CAP);
+        assert_eq!(b.fallthrough_of(0), CAP);
+    }
+
+    #[test]
+    fn unmount_of_a_node_without_a_mount_is_refused()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert_eq!(b.begin_unmount(a), Err(UnmountError::NotMounted));
+        assert_eq!(b.begin_unmount(UNUSED_IDX), Err(UnmountError::NotMounted));
+        assert_eq!(b.begin_unmount(NONE), Err(UnmountError::NotMounted));
+        // The refusal left the intermediate visible.
+        assert!(b.has_local_child(0, b"a"));
+    }
+
+    #[test]
+    fn a_second_unmount_of_one_mount_is_refused()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = unmounting(&mut b, b"/esp", CAP);
+        assert_eq!(b.begin_unmount(idx), Err(UnmountError::InProgress));
+        // The refusal did not count the mount out twice: a sibling stays
+        // visible.
+        assert!(b.install(b"/data", mount(CAP)).is_some());
+        assert_eq!(b.local_child_count(0), 1);
+    }
+
+    #[test]
+    fn an_unmounting_mount_point_is_not_crossed_and_its_name_falls_through()
+    {
+        let mut b = VfsdRootBackend::new();
+        let _ = unmounting(&mut b, b"/esp", CAP);
+        assert_eq!(
+            b.lookup(NodeId::ROOT, b"esp").err(),
+            Some(NsError::NotFound)
+        );
+        assert!(!b.has_local_child(0, b"esp"));
+        assert_eq!(b.local_child_count(0), 0);
+        assert_eq!(b.readdir_entry(NodeId::ROOT, 0), Ok(None));
+    }
+
+    #[test]
+    fn a_mount_point_is_not_installable_until_its_removal_finishes()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = unmounting(&mut b, b"/esp", CAP);
+        assert!(!b.can_install(b"/esp"));
+        assert!(b.install(b"/esp", mount(CAP + 1)).is_none());
+        assert!(b.remove_mount(idx).is_some());
+        assert!(b.can_install(b"/esp"));
+    }
+
+    #[test]
+    fn remove_mount_finishes_only_a_begun_unmount()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
+        let idx = b.find(b"/esp").expect("installed");
+        assert_eq!(b.remove_mount(idx), None);
+        assert_eq!(b.remove_mount(UNUSED_IDX), None);
+        b.lookup(NodeId::ROOT, b"esp").unwrap();
+        let idx = unmounting(&mut b, b"/data", CAP);
+        assert!(b.remove_mount(idx).is_some());
+        assert_eq!(b.remove_mount(idx), None);
+    }
+
+    #[test]
+    fn a_remount_reuses_the_node_and_crosses_to_the_new_driver()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = unmounting(&mut b, b"/esp", CAP);
+        assert!(b.remove_mount(idx).is_some());
+        assert!(b.install(b"/esp", mount(CAP + 1)).is_some());
+        assert_eq!(b.find(b"/esp"), Some(idx));
+        let view = b.lookup(NodeId::ROOT, b"esp").expect("remounted");
+        assert_eq!(
+            view.target,
+            EntryTarget::External {
+                endpoint: CAP + 1,
+                node: NodeId::ROOT,
+            }
+        );
+    }
+
+    #[test]
+    fn an_intermediate_with_no_mount_below_is_vacant()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = unmounting(&mut b, b"/a/b", CAP);
+        assert!(b.remove_mount(idx).is_some());
+        assert_eq!(b.lookup(NodeId::ROOT, b"a").err(), Some(NsError::NotFound));
+        assert_eq!(b.local_child_count(0), 0);
+        assert_eq!(b.readdir_entry(NodeId::ROOT, 0), Ok(None));
+    }
+
+    #[test]
+    fn readdir_skips_a_vacant_child_between_visible_ones()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/x", mount(CAP)).is_some());
+        let _ = unmounting(&mut b, b"/y", CAP);
+        assert!(b.install(b"/z", mount(CAP)).is_some());
+        let mut names = Vec::new();
+        for i in 0..2
+        {
+            let entry = b.readdir_entry(NodeId::ROOT, i).expect("root resolves");
+            names.push(entry.expect("entry present").as_bytes().to_vec());
+        }
+        names.sort();
+        assert_eq!(names, vec![b"x".to_vec(), b"z".to_vec()]);
+        assert_eq!(b.readdir_entry(NodeId::ROOT, 2), Ok(None));
+    }
+
+    #[test]
+    fn an_unmounted_node_with_a_mount_below_stays_an_intermediate()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/a", mount(CAP)).is_some());
+        assert!(b.install(b"/a/b", mount(CAP + 1)).is_some());
+        let a = b.find(b"/a").expect("installed");
+        assert!(!b.needs_fallthrough(a));
+        b.begin_unmount(a).unwrap();
+        let view = b.lookup(NodeId::ROOT, b"a").expect("still visible");
+        assert_eq!(
+            view.target,
+            EntryTarget::Local(NodeId::from_raw_truncated(u64::from(a)))
+        );
+        // It became an intermediate with no fall-through cap.
+        assert!(b.needs_fallthrough(a));
+        assert!(b.set_fallthrough_cap(a, CAP));
+        assert!(!b.needs_fallthrough(a));
+    }
+
+    #[test]
+    fn a_vacant_node_reused_as_an_intermediate_is_reported_for_its_fallthrough()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = unmounting(&mut b, b"/a", CAP);
+        assert!(b.remove_mount(a).is_some());
+        let result = b.install(b"/a/b", mount(CAP)).expect("install fits");
+        assert_eq!(result.as_slice(), &[a]);
+        assert!(matches!(
+            b.lookup(NodeId::ROOT, b"a").map(|v| v.target),
+            Ok(EntryTarget::Local(_))
+        ));
+    }
+
     #[test]
     fn a_second_root_mount_is_rejected_and_keeps_the_first()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/", CAP).is_some());
+        assert!(b.install(b"/", mount(CAP)).is_some());
         assert!(!b.can_install(b"/"));
         assert!(!b.can_install(b"///"));
-        assert!(b.install(b"///", CAP + 1).is_none());
+        assert!(b.install(b"///", mount(CAP + 1)).is_none());
         assert_eq!(b.root_mount_cap(), CAP);
     }
 
@@ -598,9 +996,9 @@ mod tests
     fn mounting_on_an_existing_mount_point_is_rejected()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
         assert!(!b.can_install(b"/esp"));
-        assert!(b.install(b"/esp", CAP + 1).is_none());
+        assert!(b.install(b"/esp", mount(CAP + 1)).is_none());
         assert_eq!(b.local_child_count(0), 1);
     }
 
@@ -611,10 +1009,10 @@ mod tests
         let mut path = vec![b'/'];
         path.extend(core::iter::repeat_n(b'a', MAX_NAME_LEN + 1));
         assert!(!b.can_install(&path));
-        assert!(b.install(&path, CAP).is_none());
+        assert!(b.install(&path, mount(CAP)).is_none());
         assert_eq!(b.local_child_count(0), 0);
         path.truncate(1 + MAX_NAME_LEN);
-        assert!(b.install(&path, CAP).is_some());
+        assert!(b.install(&path, mount(CAP)).is_some());
         let entry = b
             .readdir_entry(NodeId::ROOT, 0)
             .expect("root resolves")
@@ -627,8 +1025,8 @@ mod tests
     {
         let mut b = VfsdRootBackend::new();
         assert!(!b.can_install(b"/a/../b"));
-        assert!(b.install(b"/a/./b", CAP).is_none());
-        assert!(b.install(b"/a\0", CAP).is_none());
+        assert!(b.install(b"/a/./b", mount(CAP)).is_none());
+        assert!(b.install(b"/a\0", mount(CAP)).is_none());
         assert_eq!(b.local_child_count(0), 0);
     }
 
@@ -638,7 +1036,10 @@ mod tests
         let mut b = VfsdRootBackend::new();
         for i in 0..200
         {
-            assert!(b.install(format!("/m{i}/leaf").as_bytes(), CAP).is_some());
+            assert!(
+                b.install(format!("/m{i}/leaf").as_bytes(), mount(CAP))
+                    .is_some()
+            );
         }
         assert_eq!(b.local_child_count(0), 200);
         let view = b.lookup(NodeId::ROOT, b"m199").expect("last mount found");
@@ -654,7 +1055,7 @@ mod tests
     fn a_multi_component_install_reports_its_new_intermediates()
     {
         let mut b = VfsdRootBackend::new();
-        let result = b.install(b"/a/b/c", CAP).expect("install fits");
+        let result = b.install(b"/a/b/c", mount(CAP)).expect("install fits");
         let mut paths: Vec<Vec<u8>> = result
             .as_slice()
             .iter()
@@ -662,9 +1063,14 @@ mod tests
             .collect();
         paths.sort();
         assert_eq!(paths, vec![b"/a".to_vec(), b"/a/b".to_vec()]);
-        // A sibling under the existing intermediate creates only its leaf.
+        for &idx in result.as_slice()
+        {
+            assert!(b.set_fallthrough_cap(idx, CAP));
+        }
+        // A sibling under intermediates that are already visible reports
+        // none.
         assert_eq!(
-            b.install(b"/a/b/d", CAP).map(|r| r.as_slice().len()),
+            b.install(b"/a/b/d", mount(CAP)).map(|r| r.as_slice().len()),
             Some(0)
         );
     }
@@ -682,7 +1088,9 @@ mod tests
             path.push_str(&component);
         }
         let mut b = VfsdRootBackend::new();
-        let result = b.install(path.as_bytes(), CAP).expect("install fits");
+        let result = b
+            .install(path.as_bytes(), mount(CAP))
+            .expect("install fits");
         let deepest = *result.as_slice().last().expect("seven intermediates");
         let expected = &path.as_bytes()[..7 * (1 + MAX_NAME_LEN)];
         assert_eq!(b.path_of(deepest).as_deref(), Some(expected));
@@ -692,16 +1100,16 @@ mod tests
     fn an_existing_intermediate_can_become_a_mount_point()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/a/b", CAP).is_some());
+        assert!(b.install(b"/a/b", mount(CAP)).is_some());
         assert!(b.can_install(b"/a"));
-        assert!(b.install(b"/a", CAP).is_some());
+        assert!(b.install(b"/a", mount(CAP)).is_some());
         assert!(!b.can_install(b"/a"));
     }
 
     /// Pool index of the intermediate `/a` an install of `/a/b` creates.
     fn intermediate_a(b: &mut VfsdRootBackend) -> u32
     {
-        let result = b.install(b"/a/b", CAP).expect("install fits");
+        let result = b.install(b"/a/b", mount(CAP)).expect("install fits");
         result.as_slice()[0]
     }
 
@@ -709,7 +1117,7 @@ mod tests
     fn lookup_of_a_mount_point_crosses_to_the_peer_root()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
         let view = b.lookup(NodeId::ROOT, b"esp").expect("mount point found");
         assert_eq!(
             view.target,
@@ -736,7 +1144,7 @@ mod tests
     fn lookup_of_a_missing_name_is_not_found()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
         assert_eq!(
             b.lookup(NodeId::ROOT, b"data").err(),
             Some(NsError::NotFound)
@@ -755,8 +1163,8 @@ mod tests
     fn readdir_lists_each_child_then_ends()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/esp", CAP).is_some());
-        assert!(b.install(b"/data", CAP).is_some());
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
+        assert!(b.install(b"/data", mount(CAP)).is_some());
         let mut names = Vec::new();
         for i in 0..2
         {
@@ -826,7 +1234,7 @@ mod tests
     fn local_child_count_outside_the_pool_is_zero()
     {
         let mut b = VfsdRootBackend::new();
-        assert!(b.install(b"/esp", CAP).is_some());
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
         assert_eq!(b.local_child_count(UNUSED_IDX), 0);
     }
 
@@ -842,9 +1250,48 @@ mod tests
     {
         let mut b = VfsdRootBackend::new();
         let a = intermediate_a(&mut b);
-        b.set_fallthrough_cap(a, CAP);
+        assert!(b.set_fallthrough_cap(a, CAP));
         assert_eq!(b.fallthrough_of(a), CAP);
-        b.set_fallthrough_cap(UNUSED_IDX, CAP);
+        assert!(!b.set_fallthrough_cap(UNUSED_IDX, CAP));
         assert_eq!(b.fallthrough_of(UNUSED_IDX), 0);
+    }
+
+    #[test]
+    fn set_fallthrough_cap_never_overwrites_a_cap()
+    {
+        let mut b = VfsdRootBackend::new();
+        let a = intermediate_a(&mut b);
+        assert!(b.set_fallthrough_cap(a, CAP));
+        assert!(!b.set_fallthrough_cap(a, CAP + 1));
+        assert_eq!(b.fallthrough_of(a), CAP);
+    }
+
+    #[test]
+    fn set_fallthrough_cap_refuses_a_terminal_and_a_vacant_node()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
+        let esp = b.find(b"/esp").expect("installed");
+        assert!(!b.set_fallthrough_cap(esp, CAP + 1));
+        b.begin_unmount(esp).unwrap();
+        assert!(b.remove_mount(esp).is_some());
+        assert!(!b.set_fallthrough_cap(esp, CAP + 1));
+        assert_eq!(b.fallthrough_of(esp), 0);
+    }
+
+    #[test]
+    fn concurrent_installs_below_one_intermediate_list_it_once()
+    {
+        // Two MOUNTs below a new intermediate: the second install comes
+        // before the first has walked for the intermediate's fall-through
+        // cap, so the node still has none, and still only the first lists
+        // it.
+        let mut b = VfsdRootBackend::new();
+        let first = b.install(b"/a/b", mount(CAP)).expect("install fits");
+        let a = b.find(b"/a").expect("installed");
+        assert_eq!(first.as_slice(), &[a]);
+        assert!(b.needs_fallthrough(a));
+        let second = b.install(b"/a/c", mount(CAP + 1)).expect("install fits");
+        assert_eq!(second.as_slice().len(), 0);
     }
 }

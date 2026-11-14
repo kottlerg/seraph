@@ -1018,11 +1018,6 @@ fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 }
 
 /// Create vfsd via procmgr and serve its bootstrap.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each), the builder's copy and the \
-              temporaries of the bootstrap rounds' messages (568 B each); on init's 16 KiB stack"
-)]
 pub fn create_vfsd_with_caps(
     info: &InitInfo,
     procmgr_ep: u64,
@@ -1229,7 +1224,13 @@ pub fn create_svcmgr_from_file(
     // defined-but-unregistered services, and applies per-service
     // namespace attenuation from each `.svc` recipe when configuring
     // the child. svcmgr therefore holds the universal root.
-    if !configure_child_namespace(process_handle, system_root_cap, info.cspace_cap, None, ipc_buf)
+    if !configure_child_namespace(
+        process_handle,
+        system_root_cap,
+        info.cspace_cap,
+        None,
+        ipc_buf,
+    )
     {
         return None;
     }

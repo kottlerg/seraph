@@ -258,8 +258,9 @@ reserve node, and from any other replies `INVALID_ARGUMENT` before any resource 
 so init's children are, and procmgr records each child's membership for the check on its own
 creates. procmgr trusts the un-badged creator as it does for `CREATE_PHYS_ACCESS`: svcmgr never
 creates on its mint source, and a create there would make a top-level reserve node with no max,
-which is what svcmgr's own node is. No creator in the tree sets either flag: no process has a max,
-and svcmgr starts its services outside the reserve.
+which is what svcmgr's own node is. Only svctest's test phases set either flag; in the default
+image no process has a max of its own, no default per-process max exists, and svcmgr starts its
+services outside the reserve.
 
 **Scheduling fields.** Bits `[18..23]` (`CREATE_PRIORITY`) and `[23..28]`
 (`CREATE_BAND_MAX`) of the label window — shared by `CREATE_PROCESS` and

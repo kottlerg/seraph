@@ -66,6 +66,10 @@ syscall-abi = { path = "../abi/syscall" }
 # The `test-fault` fixture's role BAR lengths, which the qemu tests check the
 # test launch's `pci-testdev` functions against.
 ipc = { path = "../shared/ipc" }
+# init's log-level parser, which test-log-level's tests run its configuration
+# through, and the level codes it returns.
+init-log-levels = { path = "../services/init/log-levels" }
+log = { path = "../shared/log" }
 
 # Windows console-mode bindings for TerminalGuard. Only pulled in for
 # Windows builds; Linux/macOS/BSD builds skip this crate entirely.

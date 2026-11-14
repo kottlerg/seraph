@@ -212,6 +212,15 @@ mod tests
         }
     }
 
+    // Defect caught: a committed configuration that moves some service off
+    // info, or that init reports as malformed at every boot.
+    #[test]
+    fn the_committed_configuration_sets_nothing()
+    {
+        let committed = include_str!("../../log-levels.conf");
+        assert_eq!(parse_ok(committed), Levels::default());
+    }
+
     // Defect caught: a setting read for the wrong service, or not read.
     #[test]
     fn each_service_s_setting_sets_its_level_alone()

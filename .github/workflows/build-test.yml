@@ -84,7 +84,7 @@ jobs:
         # back-to-back fatfs/sysroot state accumulation across harnesses
         # and lets a failing tier surface as a single named cell. The
         # usertest cell additionally runs the terminal interactive test as
-        # a second boot — it needs the QMP `test-terminal` runner (not
+        # a further boot — it needs the QMP `test-terminal` runner (not
         # run-parallel), and colocating it (both programs-surface) avoids a
         # matrix dimension that would multiply with every arch. See
         # docs/testing.md.
@@ -253,7 +253,13 @@ jobs:
             # saved.
             cargo xtask test-crash-report --expect reports \
               --log target/xtask/run-parallel-saved/${{ matrix.arch }}-4cpu-1.log
-            # Second boot: the terminal interactive test (keyboard input
+            # Second boot: the log-level configuration test (#936). Composes the
+            # bundle with vfsd set to debug, boots the usertest staging above
+            # under the cell's budget, and checks that vfsd's and fatfs's debug
+            # lines appear and devmgr's and procmgr's do not; the staged bundle
+            # is put back afterwards.
+            cargo xtask test-log-level --arch ${{ matrix.arch }} --timeout "$budget"
+            # Third boot: the terminal interactive test (keyboard input
             # through the terminal). It needs the QMP `test-terminal` runner
             # (host-side key injection) and so cannot ride run-parallel;
             # colocated here (both programs-surface) to avoid a separate
@@ -264,7 +270,7 @@ jobs:
             cargo xtask mkdisk --arch ${{ matrix.arch }}
             cargo xtask test-terminal --arch ${{ matrix.arch }}
             if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              # Third boot pair: the VMGENID snapshot-resume test (#395).
+              # Fourth boot pair: the VMGENID snapshot-resume test (#395).
               # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
               # host-side QMP migrate/restore, so it cannot ride
               # run-parallel. Reuses the default interactive boot the

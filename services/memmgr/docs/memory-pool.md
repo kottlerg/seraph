@@ -544,10 +544,11 @@ whose reaching capability, object, or mapping never goes, held by a process that
 stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
-memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches neither a
-derivation the grantee made and handed out, which its `CSpace`'s teardown leaves a derivation
-root, nor any mapping already made, and it would drop the reference a driver holds on a frame its
-device may still write. The frame waits instead, until its holder drops the capability.
+memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches no mapping
+already made, and it would cut off every holder below the intermediary, a holder of a derivation
+the grantee made and handed out included, since the grantee's `CSpace` teardown leaves that
+derivation under the intermediary, and among them a driver whose device may still write the frame.
+The frame waits instead, until its holder drops the capability.
 
 On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
 `CREATE_DMA_HOLD` process until its creator releases it, the frames staying on

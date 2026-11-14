@@ -1159,7 +1159,9 @@ clean revoke; the reparent walk that deletion and the range splits run on the
 consumed slot's children cuts and logs the same way and completes; the teardown
 drain, which has no caller to report to, cuts and logs the same way and
 continues, as it does for an unlink that makes no progress (a node whose own
-links do not lead back to the list it heads). A truncation abandons the live
+links do not lead back to the list it heads), and it unlinks a dying node
+abandoned behind such a cut from the parent that no longer lists it ([Teardown
+Drain](#teardown-drain)). A truncation abandons the live
 nodes chained behind the dead link without clearing their parent pointers:
 they keep naming the vanished `CSpace`, and only the registry epoch check keeps
 such a pointer fail-closed (it resolves to nothing — the node behaves as a
@@ -1250,9 +1252,14 @@ none leaves a slot the drain has already taken out of the forest, where the dest
 an empty position and become a root. The drain itself, delete, revoke, and the splits resolve a
 draining `CSpace` as before, since they edit its slots.
 
-At the end no live slot names the dying `CSpace`, the invariant `free_cspace_id` relies on to
-recycle the id. A link that fails to resolve is contained by truncation (see
-[Revocation Algorithm](#revocation-algorithm)). More ascents than the `CSpace` has slots can only be
+At the end no live slot of a consistent forest names the dying `CSpace`, the invariant
+`free_cspace_id` relies on to recycle the id. A link that fails to resolve is contained by
+truncation, and the registry epoch check keeps fail-closed the parent pointers of the nodes it
+abandons (see [Revocation Algorithm](#revocation-algorithm)). A dying slot abandoned that way still
+names a parent whose list it is no longer on; the drain meets it as a parent that heads no list,
+which in a consistent forest no slot's parent is, and unlinks the slot from that parent, logs it,
+and drains it as a top, since an ascent would reach a region that never holds it and the scan would
+examine the slot again without end. More ascents than the `CSpace` has slots can only be
 a cycle of parent links, since no edit puts a slot under one of its own descendants; the drain
 unlinks the slot it stands on from its parent, which breaks the cycle, and logs it.
 

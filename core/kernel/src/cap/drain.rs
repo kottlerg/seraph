@@ -127,9 +127,12 @@ impl Dying
 ///
 /// A link that fails to resolve, or an unlink that makes no progress, is
 /// contained as everywhere else: the list hanging from it is truncated
-/// ([`truncate_dead_link`]) and logged, and the drain continues. More ascents
-/// than the `CSpace` has slots can only be a cycle of parent links; the slot
-/// it stands on is unlinked from its parent, which breaks the cycle.
+/// ([`truncate_dead_link`]) and logged, and the drain continues. A dying slot
+/// left behind such a cut still names its old parent while no longer on its
+/// list; met as a parent that heads no list, it is unlinked from that parent
+/// and logged, and drained as a top. More ascents than the `CSpace` has slots
+/// can only be a cycle of parent links; the slot it stands on is unlinked from
+/// its parent, which breaks the cycle.
 ///
 /// Returns `true` once every slot is out of the forest (the caller then
 /// unregisters the `CSpace` in the same hold); `false` when the budget ran
@@ -270,8 +273,26 @@ unsafe fn step(
     if let Some(p) = parent
         && dying.holds(p)
         // SAFETY: DERIVATION_LOCK held (caller contract).
-        && unsafe { resolve_slot_mut(p) }.is_some()
+        && let Some(p_head) = unsafe { resolve_slot_mut(p) }.map(|s| s.deriv_first_child)
     {
+        if p_head.is_none()
+        {
+            // `x` names `p` as its parent, but `p` heads no list, so `x` is
+            // not on it: `x` was left behind a list a dead link truncated
+            // (corruption). Ascending would reach a region that never holds
+            // `x`, and the scan would examine `x` again without end. Unlink
+            // `x` from its parent, which makes it a top.
+            #[cfg(not(test))]
+            crate::kprintln!(
+                "cap: stale derivation parent at cspace {} slot {} in teardown drain; unlinking",
+                dying.id,
+                x_index.get()
+            );
+            // SAFETY: DERIVATION_LOCK held (caller contract).
+            unsafe { unlink_node(x) };
+            *ascents = 0;
+            return Some(x_index);
+        }
         if *ascents < ascent_limit
         {
             // Below `ascent_limit`: does not saturate.
@@ -758,6 +779,57 @@ mod tests
         assert!(
             isolated(c),
             "a child of a top whose parent died becomes a clean root"
+        );
+        assert_eq!(links(f0).map(|l| l.1), Some(None), "the region left f0");
+        crate::cap::unregister_cspace(ID_D);
+        crate::cap::unregister_cspace(ID_F);
+    }
+
+    // Defect guarded: a dying slot left behind a truncated list, still naming
+    // a dying parent that no longer lists it, which the scan re-examined and
+    // ascended from without end.
+    #[test]
+    fn a_dying_slot_behind_a_truncated_list_is_drained()
+    {
+        const ID_F: CSpaceId = 3316;
+        const ID_D: CSpaceId = 3317;
+        const ID_X: CSpaceId = 3318;
+        let f_cs = mk_registered_cspace(ID_F);
+        let d_cs = mk_registered_cspace(ID_D);
+        let x_cs = mk_registered_cspace(ID_X);
+        // Behind a top's dead head: x0 → [xd, s1], s1 → c1.
+        let x0 = occupy(d_cs, ID_D);
+        let s1 = occupy(d_cs, ID_D);
+        let xd = occupy(x_cs, ID_X);
+        let c1 = occupy(f_cs, ID_F);
+        // Behind a dead grandchild inside a region: f0 → t → h → [xg, s2],
+        // s2 → c2.
+        let f0 = occupy(f_cs, ID_F);
+        let t = occupy(d_cs, ID_D);
+        let h = occupy(d_cs, ID_D);
+        let s2 = occupy(d_cs, ID_D);
+        let xg = occupy(x_cs, ID_X);
+        let c2 = occupy(f_cs, ID_F);
+        assert!(link_all(&[
+            (x0, s1),
+            (x0, xd),
+            (s1, c1),
+            (f0, t),
+            (t, h),
+            (h, s2),
+            (h, xg),
+            (s2, c2)
+        ]));
+        crate::cap::unregister_cspace(ID_X);
+
+        let mut st = DrainState::new();
+        let run = drain_all(d_cs, ID_D, &mut st, MAX_DRAIN_EDITS);
+
+        assert!(run.done, "a slot behind a cut must not pin the drain");
+        assert!([x0, s1, t, h, s2].iter().all(|&s| isolated(s)));
+        assert!(
+            isolated(c1) && isolated(c2),
+            "a child of a slot cut off from its lineage becomes a clean root"
         );
         assert_eq!(links(f0).map(|l| l.1), Some(None), "the region left f0");
         crate::cap::unregister_cspace(ID_D);

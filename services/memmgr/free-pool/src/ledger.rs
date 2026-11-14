@@ -56,7 +56,7 @@ pub enum BackError
     Outside,
     /// The arena has fewer free slots outside its reserve than the run's
     /// descriptor and the chunk's path in the table need
-    /// ([`Ledger::chunk_slots`]).
+    /// ([`Ledger::back_slots`]).
     NoSlot,
     /// The chunk's entry refused the run ([`ChunkEntry::back`]).
     Chunk(ChunkError),
@@ -351,7 +351,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// for the run's descriptor, and one for each node of the chunk's path in
     /// the table that does not exist yet.
     #[must_use]
-    pub fn chunk_slots(&self, reg: NodeIdx, page_base: u64) -> u64
+    pub fn back_slots(&self, reg: NodeIdx, page_base: u64) -> u64
     {
         let path = self.region_node(reg).map_or(0, |node| {
             chunk::missing_slots(
@@ -375,7 +375,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// [`BackError::Chunk`] when the chunk's entry refuses the run (it leaves
     /// the chunk, covers a backed page, or the chunk is evicting or swapped),
     /// and [`BackError::NoSlot`] when the arena has fewer free slots than
-    /// [`Ledger::chunk_slots`].
+    /// [`Ledger::back_slots`].
     pub fn back_chunk(&mut self, reg: NodeIdx, frame: FrameDesc) -> Result<(), BackError>
     {
         let mut node = self.region_node(reg).ok_or(BackError::NoRegion)?;
@@ -921,8 +921,8 @@ mod tests
         // directory nodes, its leaf, and the run's slot. Chunk 63 has its
         // path and needs only the run's.
         let far = BASE + 40 * CHUNK;
-        assert_eq!(l.chunk_slots(reg, far), 4);
-        assert_eq!(l.chunk_slots(reg, BASE + 63 * CHUNK), 1);
+        assert_eq!(l.back_slots(reg, far), 4);
+        assert_eq!(l.back_slots(reg, BASE + 63 * CHUNK), 1);
         let taken = fill_arena_but(&mut l, 3);
         assert_eq!(l.back_chunk(reg, at(far)), Err(BackError::NoSlot));
         assert_eq!(l.arena.free_count(), 3);

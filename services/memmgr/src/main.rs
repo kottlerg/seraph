@@ -1797,7 +1797,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // covering the span, else, on a fragmented pool, the largest free run,
     // mapped over the part of the span around the faulting page
     // (services/memmgr/docs/memory-pool.md § Demand faults).
-    let need = l.chunk_slots(reg, page_base);
+    let need = l.back_slots(reg, page_base);
     if !ensure_slots(l, need)
     {
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);

@@ -5,6 +5,11 @@ title: ''
 labels: design
 ---
 
+<!-- Set the milestone: the current one (the lowest-versioned open milestone), or a later one
+when this question depends on an Issue of that milestone, named in the body; unset only when it
+cannot be worked on now, with a line `No milestone: hardware`, `not-possible` or `undecided`
+saying why (docs/conventions.md § Milestones). -->
+
 ## Problem
 
 <!-- What's open. What triggered the question. -->

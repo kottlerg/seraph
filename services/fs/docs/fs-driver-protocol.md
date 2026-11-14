@@ -886,7 +886,7 @@ serves on.
 
 ## Driver exit
 
-A driver exits on its own in two cases, each with its own exit code, a
+A driver ends its service in two cases, each with its own exit code, a
 `fs_labels` constant. Its death observers receive the exit reason
 `syscall_abi::encode_exit_code(code)`
 ([abi/syscall/src/lib.rs](../../../abi/syscall/src/lib.rs) § Exit reason
@@ -895,11 +895,24 @@ constants).
 | Code | Constant | Cause |
 |---|---|---|
 | `0` | `EXIT_UNMOUNTED` | The driver replied success to [`FS_UNMOUNT`](#label-19-fs_unmount) |
-| `1` | `EXIT_DEVICE_GONE` | The driver found its block device capability revoked ([§ Loss of the block device](#loss-of-the-block-device)) |
+| `1` | `EXIT_DEVICE_GONE` | A block request found the block device capability revoked ([§ Loss of the block device](#loss-of-the-block-device)) |
 
-The reason `0` also ends a driver whose bootstrap round or page-cache
-setup failed, before any `FS_MOUNT`; any other end of a driver is a fault
-or a kill.
+An `FS_UNMOUNT` whose `FSInfo` write is the request that finds the
+capability revoked still replies success and exits with `EXIT_UNMOUNTED`:
+the `FSInfo` fields are hints, and every open was released before the
+write.
+
+A driver also ends on its own before or outside its service, with codes
+that are not `fs_labels` constants:
+
+- the reason `0` when its bootstrap round, its page-cache setup, or the
+  spawn of its eviction worker fails, before it serves any request;
+- ruststd's startup-failure codes (`0x0F01..=0x0F02`), before `main`;
+- `EXIT_RECV_WEDGE` (`0x0F10`), when its receive loop wedges
+  ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure
+  Policy).
+
+Any other end of a driver is a fault or a kill.
 
 ---
 

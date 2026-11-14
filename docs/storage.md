@@ -259,10 +259,12 @@ The supported failure-handling primitives are:
   death and does not respawn a driver; the mount stays installed
   against the dead endpoint. Other mounts and the block driver are
   unaffected.
-- **Block device revocation.** An fs driver whose block device
-  capability is revoked answers the request in flight `IO_ERROR` and
-  exits; a failed block call through a capability still live, or an
-  error reply, fails only its request
+- **Block device revocation.** An fs driver learns that its block
+  device capability was revoked at its first block request afterwards:
+  it answers that request `IO_ERROR` and exits. Until a request reaches
+  the device, an idle driver, or one serving requests from its page
+  cache, serves on. A failed block call through a capability still
+  live, or an error reply, fails only its request
   ([`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md)
   § Loss of the block device). The driver's exit is then an fs-driver
   crash, as above.

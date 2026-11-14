@@ -142,7 +142,11 @@ fn elf_parts(data: &[u8]) -> Option<Vec<Part>>
         )
         .into_bytes(),
     )];
-    for (index, segment) in header.program_headers(endian, data).ok()?.iter().enumerate()
+    for (index, segment) in header
+        .program_headers(endian, data)
+        .ok()?
+        .iter()
+        .enumerate()
     {
         let mut bytes = format!(
             "type {:#x} flags {:#x} vaddr {:#x} paddr {:#x} filesz {:#x} memsz {:#x} align {:#x}\n",
@@ -193,9 +197,13 @@ fn elf_parts(data: &[u8]) -> Option<Vec<Part>>
 fn pe_parts(data: &[u8]) -> Option<Vec<Part>>
 {
     let file = PeFile64::parse(data).ok()?;
-    let header_bytes =
-        usize::try_from(file.nt_headers().optional_header.size_of_headers.get(object::LittleEndian))
-            .ok()?;
+    let header_bytes = usize::try_from(
+        file.nt_headers()
+            .optional_header
+            .size_of_headers
+            .get(object::LittleEndian),
+    )
+    .ok()?;
     let signature = usize::try_from(read_u32(data, PE_LFANEW_OFFSET)?).ok()?;
     let mut headers = data.get(..header_bytes)?.to_vec();
     for offset in [PE_TIME_STAMP_OFFSET, PE_CHECKSUM_OFFSET]
@@ -315,7 +323,10 @@ fn bundle_parts(data: &[u8]) -> Option<Vec<Part>>
         let name = raw_name.split(|&b| b == 0).next().unwrap_or(raw_name);
         let name = String::from_utf8_lossy(name).into_owned();
         let offset = read_u64(data, at.checked_add(bundle_fmt::ENTRY_NAME_LEN)?)?;
-        let size = read_u64(data, at.checked_add(bundle_fmt::ENTRY_NAME_LEN)?.checked_add(8)?)?;
+        let size = read_u64(
+            data,
+            at.checked_add(bundle_fmt::ENTRY_NAME_LEN)?.checked_add(8)?,
+        )?;
         let start = usize::try_from(offset).ok()?;
         let body = data.get(start..start.checked_add(usize::try_from(size).ok()?)?)?;
         parts.extend(
@@ -346,7 +357,8 @@ pub fn part_differences(base: &[Part], head: &[Part]) -> Vec<String>
     {
         match head_parts.get(name.as_str())
         {
-            Some(other) if other == bytes => {}
+            Some(other) if other == bytes =>
+            {}
             Some(_) => out.push(name.clone()),
             None => out.push(format!("{name} (removed)")),
         }
@@ -400,12 +412,14 @@ pub fn pair_paths(base: &[String], head: &[String]) -> Vec<Presence>
     let head_set: BTreeSet<&String> = head.iter().collect();
     base_set
         .union(&head_set)
-        .map(|path| match (base_set.contains(path), head_set.contains(path))
-        {
-            (true, true) => Presence::Both((*path).clone()),
-            (true, false) => Presence::Base((*path).clone()),
-            (false, _) => Presence::Head((*path).clone()),
-        })
+        .map(
+            |path| match (base_set.contains(path), head_set.contains(path))
+            {
+                (true, true) => Presence::Both((*path).clone()),
+                (true, false) => Presence::Base((*path).clone()),
+                (false, _) => Presence::Head((*path).clone()),
+            },
+        )
         .collect()
 }
 
@@ -540,7 +554,9 @@ fn prepare_tree(root: &Path, tree: &Path) -> Result<()>
     {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    let path = tree.to_str().context("the scratch worktree's path is not UTF-8")?;
+    let path = tree
+        .to_str()
+        .context("the scratch worktree's path is not UTF-8")?;
     git(root, &["worktree", "add", "--detach", path, "HEAD"])?;
     Ok(())
 }
@@ -555,7 +571,10 @@ fn build_side(
     wait_host: Option<u64>,
 ) -> Result<()>
 {
-    step(&format!("compare-images: building the {} {commit}", side.dir_name()));
+    step(&format!(
+        "compare-images: building the {} {commit}",
+        side.dir_name()
+    ));
     git(tree, &["checkout", "--detach", "--force", commit])?;
     git(tree, &["clean", "-ffdx", "-e", "/target"])?;
     for cell in cells
@@ -575,8 +594,7 @@ fn build_side(
         }
         if let Some(parent) = dst.parent()
         {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         fs::rename(tree.join("sysroot"), &dst)
             .with_context(|| format!("moving the sysroot to {}", dst.display()))?;
@@ -673,10 +691,20 @@ fn cells(args: &CompareImagesArgs) -> Vec<Cell>
 pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
 {
     let root = ctx.root.as_path();
-    let head = git(root, &["rev-parse", "--verify", &format!("{}^{{commit}}", args.head)])?;
+    let head = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", args.head),
+        ],
+    )?;
     let base = match &args.base
     {
-        Some(base) => git(root, &["rev-parse", "--verify", &format!("{base}^{{commit}}")])?,
+        Some(base) => git(
+            root,
+            &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+        )?,
         None => git(root, &["merge-base", &head, "origin/master"])?,
     };
     let cells = cells(args);
@@ -788,20 +816,28 @@ mod tests
         out.extend_from_slice(&names);
         let shoff = out.len();
         out.extend_from_slice(&[0u8; 64]);
-        let mut header = |name: usize, kind: u32, flags: u64, addr: usize, at: usize, size: usize| {
-            let mut sh = [0u8; 64];
-            sh[0..4].copy_from_slice(&u32::try_from(name).unwrap().to_le_bytes());
-            sh[4..8].copy_from_slice(&kind.to_le_bytes());
-            sh[8..16].copy_from_slice(&flags.to_le_bytes());
-            sh[16..24].copy_from_slice(&(addr as u64).to_le_bytes());
-            sh[24..32].copy_from_slice(&(at as u64).to_le_bytes());
-            sh[32..40].copy_from_slice(&(size as u64).to_le_bytes());
-            out.extend_from_slice(&sh);
-        };
+        let mut header =
+            |name: usize, kind: u32, flags: u64, addr: usize, at: usize, size: usize| {
+                let mut sh = [0u8; 64];
+                sh[0..4].copy_from_slice(&u32::try_from(name).unwrap().to_le_bytes());
+                sh[4..8].copy_from_slice(&kind.to_le_bytes());
+                sh[8..16].copy_from_slice(&flags.to_le_bytes());
+                sh[16..24].copy_from_slice(&(addr as u64).to_le_bytes());
+                sh[24..32].copy_from_slice(&(at as u64).to_le_bytes());
+                sh[32..40].copy_from_slice(&(size as u64).to_le_bytes());
+                out.extend_from_slice(&sh);
+            };
         for (index, sec) in ordered.iter().enumerate()
         {
             let addr = if sec.flags & 2 != 0 { placed[index] } else { 0 };
-            header(name_at[index], sec.kind, sec.flags, addr, placed[index], sec.data.len());
+            header(
+                name_at[index],
+                sec.kind,
+                sec.flags,
+                addr,
+                placed[index],
+                sec.data.len(),
+            );
         }
         header(shstrtab_name, 3, 0, 0, shstrtab_at, names.len());
         let shnum = u16::try_from(ordered.len()).unwrap() + 2;
@@ -848,7 +884,10 @@ mod tests
         // The longer unmapped section moves the section table, so the
         // header's `e_shoff`, which the segment maps, differs too.
         let base = elf(0x100, &sample(b"\x90\xc3", b"rustc 1"));
-        let head = elf(0x100, &sample(b"\x90\xc3", b"rustc 1, and a longer comment"));
+        let head = elf(
+            0x100,
+            &sample(b"\x90\xc3", b"rustc 1, and a longer comment"),
+        );
         assert_ne!(base, head);
         assert_eq!(differences(&base, &head), Vec::<String>::new());
     }
@@ -934,7 +973,8 @@ mod tests
         put(&mut out, opt + 112 + 6 * 8, &0x2000u32.to_le_bytes());
         put(&mut out, opt + 112 + 6 * 8 + 4, &28u32.to_le_bytes());
         // The section table.
-        let sections: [(&[u8], u32, u32); 2] = [(b".text", 0x1000, 0x400), (b".rdata", 0x2000, 0x600)];
+        let sections: [(&[u8], u32, u32); 2] =
+            [(b".text", 0x1000, 0x400), (b".rdata", 0x2000, 0x600)];
         for (index, (name, rva, raw)) in sections.iter().enumerate()
         {
             let at = opt + 240 + index * 40;
@@ -963,7 +1003,11 @@ mod tests
     {
         let base = pe(0x6af7_bde5, &[1; 16], b"\x90\xc3");
         let head = pe(0x6af8_0000, &[2; 16], b"\x90\xc3");
-        assert!(image_parts(&base).iter().any(|p| p.name == "section .rdata"));
+        assert!(
+            image_parts(&base)
+                .iter()
+                .any(|p| p.name == "section .rdata")
+        );
         assert_eq!(differences(&base, &head), Vec::<String>::new());
     }
 
@@ -1022,7 +1066,10 @@ mod tests
     #[test]
     fn any_other_file_is_compared_by_its_bytes()
     {
-        assert_eq!(differences(b"name = procmgr\n", b"name = memmgr\n"), [CONTENTS]);
+        assert_eq!(
+            differences(b"name = procmgr\n", b"name = memmgr\n"),
+            [CONTENTS]
+        );
         // A file with an image's magic whose headers do not parse falls
         // back to its bytes.
         assert_eq!(differences(b"\x7fELF\x02", b"\x7fELF\x01"), [CONTENTS]);
@@ -1034,7 +1081,10 @@ mod tests
         let part = |name: &str, byte: u8| Part::new(name, vec![byte]);
         let base = [part(".text", 1), part(".text", 2)];
         let head = [part(".text", 1), part(".text", 3), part(".text", 4)];
-        assert_eq!(part_differences(&base, &head), [".text #2", ".text #3 (added)"]);
+        assert_eq!(
+            part_differences(&base, &head),
+            [".text #2", ".text #3 (added)"]
+        );
     }
 
     #[test]
@@ -1042,7 +1092,10 @@ mod tests
     {
         let names = |list: &[&str]| list.iter().map(|s| String::from(*s)).collect::<Vec<_>>();
         assert_eq!(
-            pair_paths(&names(&["a", "services/init"]), &names(&["b", "services/init"])),
+            pair_paths(
+                &names(&["a", "services/init"]),
+                &names(&["b", "services/init"])
+            ),
             [
                 Presence::Base(String::from("a")),
                 Presence::Head(String::from("b")),
@@ -1061,16 +1114,20 @@ mod tests
             differences: Vec::new(),
         };
         let identical = render("b1", "h1", std::slice::from_ref(&same));
-        assert!(identical.ends_with("compare-images: IDENTICAL base b1 head h1 cells x86_64-debug\n"));
+        assert!(
+            identical.ends_with("compare-images: IDENTICAL base b1 head h1 cells x86_64-debug\n")
+        );
         let differs = CellReport {
             cell: cell(Arch::Riscv64, Profile::Release),
             files: 3,
             differences: vec![String::from("esp/EFI/seraph/kernel: .text")],
         };
         let report = render("b1", "h1", &[same, differs]);
-        assert!(report.contains(
-            "riscv64-release: 3 files, 1 differences\n  esp/EFI/seraph/kernel: .text\n"
-        ));
+        assert!(
+            report.contains(
+                "riscv64-release: 3 files, 1 differences\n  esp/EFI/seraph/kernel: .text\n"
+            )
+        );
         assert!(report.ends_with(
             "compare-images: DIFFERENT (1) base b1 head h1 cells x86_64-debug,riscv64-release\n"
         ));

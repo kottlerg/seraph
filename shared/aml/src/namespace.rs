@@ -580,7 +580,7 @@ impl Namespace
     }
 
     /// Unlink `id` from its parent and free it and its subtree.
-    pub(crate) fn remove(&mut self, id: NodeId) -> Result<(), FaultKind>
+    fn remove(&mut self, id: NodeId) -> Result<(), FaultKind>
     {
         if id == NodeId::ROOT
         {
@@ -836,6 +836,17 @@ impl Namespace
             return Err(FaultKind::Exists);
         }
         self.add_child(parent, last, Object::Data(Data::Uninitialized), owner)
+    }
+
+    /// The placeholder [`Namespace::declare`] created for `name` from
+    /// `scope` on behalf of `owner`, while it still holds
+    /// [`Data::Uninitialized`].
+    pub(crate) fn placeholder(&self, scope: NodeId, name: &Name, owner: Owner) -> Option<NodeId>
+    {
+        let (parent, last) = self.parent_of(scope, name).ok()?;
+        let node = self.child(parent, last)?;
+        let n = self.node(node)?;
+        (n.owner == owner && n.object == Object::Data(Data::Uninitialized)).then_some(node)
     }
 
     /// The node under which `name`, declared from `scope`, is placed, and

@@ -80,18 +80,24 @@ segment, is a path from the scope it starts at; a relative name of one segment i
 that scope and then in each enclosing scope up to the root.
 
 `load_table` walks a DSDT or SSDT's term list in order, twice. Both walks enter the bodies of
-`Scope`, `Device`, `Processor`, `PowerResource` and `ThermalZone`. The first declares every name
+`Scope`, `Device`, `Processor`, `PowerResource` and `ThermalZone`. The first declares the names
 the table defines at load: it creates the `Device`, `Processor`, `PowerResource` and
 `ThermalZone` objects, each `Method` with the span of its body, which `method_code` parses on
-first use, each `External`, and a placeholder for each name that `Name`, `Alias`, `Mutex`,
-`Event`, `OperationRegion`, `DataRegion` and the field definitions declare. The second defines:
-it parses every term but those bodies again, now that the table's names are all in the
-namespace, so a reference to a name defined later in the same table resolves as the table
-defines it (a call to a method parses as a call, and a data object of the scope hides a method
-of an enclosing scope); it gives each placeholder its object (a `Name`'s data folded to a
-constant); and it keeps every other term as module-level code, in order, for an evaluator to
-run. A placeholder the second walk does not define is removed. The namespace keeps a copy of
-each table.
+first use, each `External`, and a placeholder holding an uninitialized data object for each name
+that `Name`, `Alias`, `Mutex`, `Event`, `OperationRegion`, `DataRegion` and the field
+definitions declare. The second defines: it parses every term but those bodies again, now that
+the table's names are in the namespace, so a call to a method defined later in the table parses
+as a call, and a data object the first walk declared hides a method of the same name in an
+enclosing scope; it gives each of the table's placeholders that a definition names its object
+(a `Name`'s data folded to a constant); and it keeps every other term as module-level code, in
+order, for an evaluator to run. The namespace keeps a copy of each table.
+
+The first walk reads in table order too, so a reference it meets before the definition of the
+data object it names still resolves without it: to a method of that name in an enclosing scope,
+which the reference then calls in both walks. Where the two walks read a term differently, the
+first may declare a name the second never defines. A load never removes a node: a placeholder
+the second walk does not define, by a fault or by such a reading, stays an uninitialized data
+object, so every reference resolved to it stays valid.
 
 A fault ends only the term list it is found in: a term whose end its `PkgLength` gives is
 skipped and the list continues after it, and any other fault ends the list, whose enclosing

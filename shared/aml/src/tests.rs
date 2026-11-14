@@ -1218,9 +1218,11 @@ fn a_data_object_defined_later_in_its_scope_hides_an_outer_method()
             ]),
         ),
         &method("BASE", 1, &ret(&[ARG0])),
-        // A buffer sized by Local0 parses but is not constant: the first
-        // walk's placeholder for it is removed.
+        // A buffer sized by Local0 parses but is not constant: BADN stays an
+        // uninitialized data object, and the alias resolved to it stays valid
+        // when a later table creates nodes.
         &name_obj("BADN", &buffer(&[LOCAL0], &[])),
+        &cat(&[&[0x06], &name("BADN"), &name("BADA")]),
     ]);
     let mut ns = Namespace::new().unwrap();
     let r = ns.load_table(&table(&aml)).unwrap();
@@ -1234,9 +1236,46 @@ fn a_data_object_defined_later_in_its_scope_hides_an_outer_method()
     assert_eq!(ns.expr(reg.offset).unwrap().op, Op::NameRef);
     assert_eq!(ns.expr(reg.length).unwrap().int(), Some(0x10));
     assert_eq!(data(&ns, "\\DEV0.BASE"), Data::Integer(0x1000));
-    assert!(ns.find("\\BADN").is_none());
-    // DEV0, REG0, DEV0.BASE and \BASE.
-    assert_eq!(r.objects, 4, "{r:?}");
+    // DEV0, REG0, DEV0.BASE, \BASE, BADN and BADA.
+    assert_eq!(r.objects, 6, "{r:?}");
+    let badn = ns.find("\\BADN").unwrap();
+    assert_eq!(data(&ns, "\\BADN"), Data::Uninitialized);
+    let ssdt = cat(&[&name_obj("NEW0", &[0x01]), &name_obj("NEW1", &[0x01])]);
+    assert_eq!(ns.load_table(&table(&ssdt)).unwrap().faults, 0);
+    assert_eq!(ns.follow(ns.find("\\BADA").unwrap()), Some(badn));
+    assert_eq!(data(&ns, "\\BADN"), Data::Uninitialized);
+}
+
+#[test]
+fn a_definition_takes_the_placeholder_of_its_own_name()
+{
+    // BankField (REG0, BNK0, FOOM (ABCD), 0x5F) { AccessAs (0, 0), FLD0, 8 }
+    // before Method (FOOM, 1). The first walk reads FOOM as a name, so it
+    // takes `A` as the flags and declares `BCD_` and FLD0; the second reads
+    // the call and defines FLD0 alone, in FLD0's own node.
+    let field_list = cat(&[&[0x5F, 0x01, 0x00, 0x00], b"FLD0", &[0x08]]);
+    let aml = cat(&[
+        &cat(&[&[0x5B, 0x80], &name("REG0"), &[0x01, 0x00], &byte(0x10)]),
+        &pkg_obj(
+            &[0x5B, 0x81],
+            &cat(&[&name("REG0"), &[0x01], b"BNK0", &[0x08]]),
+        ),
+        &pkg_obj(
+            &[0x5B, 0x87],
+            &cat(&[
+                &name("REG0"),
+                &name("BNK0"),
+                &name("FOOM"),
+                &name("ABCD"),
+                &field_list,
+            ]),
+        ),
+        &method("FOOM", 1, &ret(&[ARG0])),
+    ]);
+    let ns = load(&aml);
+    let fld0 = unit(&ns, "\\FLD0");
+    assert!(matches!(fld0.kind, FieldKind::Bank { .. }), "{fld0:?}");
+    assert_eq!(data(&ns, "\\BCD_"), Data::Uninitialized);
 }
 
 #[test]

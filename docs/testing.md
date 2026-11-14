@@ -588,7 +588,8 @@ memory size, or device set, and owes no local host run, whatever file it is in:
 
 **Identical images.** A PR whose own diff (When the runs are owed below) leaves every file
 `cargo xtask build` installs identical, in every part a loader reads, on both architectures and in
-both profiles, changes nothing a boot runs: every line of its own diff outside `xtask/` is inert.
+both profiles, changes nothing a boot runs: every line of its own diff outside the host side named
+below is inert.
 The evidence is `cargo xtask compare-images`
 ([xtask/README.md](../xtask/README.md#cargo-xtask-compare-images)), never a comparison made by
 hand. It builds the PR's merge base and its head in one scratch worktree and compares each
@@ -597,10 +598,12 @@ bytes of its `PT_LOAD` segments, and its allocated sections and note sections (t
 `.note.seraph.*` section by name); a PE image by its headers and sections, its link time stamps and
 its debug directory aside; the bootloader bundle by its entries; and any other file by its bytes.
 Its verdict line names both commits and the four cells (x86_64 and riscv64, each debug and
-release), and only `IDENTICAL` over all four makes the lines inert. A line under `xtask/` is judged
-as the rest of this section judges it, verdict or not: the launchers, the disk tooling, and the
-host-driven tests run on the host, outside every image, and the device surfaces below list items of
-them, so identical images are no evidence about them. The verdict does not cover:
+release), and only `IDENTICAL` over all four makes the lines inert. The host side is judged as the
+rest of this section judges it, verdict or not: every line under `xtask/`, and every line of a crate
+xtask's build compiles in (each in-tree crate of the `[dependencies]` of `xtask/Cargo.toml`, and
+each in-tree crate those depend on, such as `shared/gdb-rsp/`). The launchers, the disk tooling, and
+the host-driven tests run on the host, outside every image, and the device surfaces below list items
+of them, so identical images are no evidence about them. The verdict does not cover:
 
 - a build that is not reproducible: two builds of one commit that differ make the command report a
   difference, so a PR loses the class but never claims it wrongly;

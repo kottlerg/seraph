@@ -201,8 +201,10 @@ claims.
    debug and release); when its base is not the merge base of its head with
    `origin/master`; or when its head does not cover the PR head, that is,
    when the PR's own diff at the two heads differs in a change that
-   section's list does not make inert. The class leaves every line under
-   `xtask/` to the screens above. A run's surface is the one that owes it,
+   section's list does not make inert. The class leaves the host side to the
+   screens above: every line under `xtask/`, and every line of an in-tree
+   crate xtask's build compiles in (`shared/gdb-rsp/` among them), as that
+   paragraph names them. A run's surface is the one that owes it,
    as When the runs are owed defines it; for the runs a concurrency-fix
    purpose owes, it is every non-inert line of the PR's own diff. The body's
    `## Validation` MUST report each owed run with its `--runs` count, its

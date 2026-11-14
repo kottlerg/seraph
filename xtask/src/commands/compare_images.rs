@@ -7,14 +7,22 @@
 //! every part a loader reads (`docs/testing.md` § Coverage tiers, Inert
 //! changes).
 //!
-//! Both commits are built in one scratch worktree,
-//! `target/xtask/compare-images/tree`, by that commit's own `cargo xtask clean`
-//! and `cargo xtask build`, once per architecture and profile, and each built
-//! sysroot is moved aside. One path serves both sides because a build embeds
-//! absolute source paths (the panic locations of the `-Z build-std` crates
-//! under `target/seraph-toolchain/`), so two checkouts at different paths
-//! never build equal images. The scratch worktree's `target/` is a cache that
-//! later builds reuse.
+//! Both commits are built in one scratch worktree, by that commit's own
+//! `cargo xtask clean` and `cargo xtask build`, once per architecture and
+//! profile, and each built sysroot is moved to
+//! `target/xtask/compare-images/`. One path serves both sides because a build
+//! embeds absolute source paths (the panic locations of the `-Z build-std`
+//! crates under `target/seraph-toolchain/`), so two checkouts at different
+//! paths never build equal images. The scratch worktree's `target/` is a cache
+//! that later builds reuse.
+//!
+//! Each build is the commit's own: the scratch worktree lies in the user's
+//! cache directory (`tree_path`), outside the checkout, whose
+//! `.cargo/config.toml` Cargo would otherwise merge into both builds, and each
+//! nested `cargo xtask` runs without the variables the outer `cargo run` set
+//! (`removed_variables`), among them `RUSTUP_TOOLCHAIN`, which would pin both
+//! to the outer checkout's toolchain, and the `[env]` table's
+//! `RUST_TARGET_PATH`, which would pin both to its target specifications.
 //!
 //! Every file the build installs is compared by the parts of it a loader
 //! reads (`image_parts`): an ELF image by its loader-relevant header fields,
@@ -528,27 +536,216 @@ fn git(dir: &Path, args: &[&str]) -> Result<String>
     Ok(out.trim().to_owned())
 }
 
-/// Run `cargo xtask <args>` in the scratch worktree, passing the host wait on.
-fn xtask(tree: &Path, args: &[&str], wait_host: Option<u64>) -> Result<()>
+/// How each nested `cargo xtask` runs: the host wait it passes on, and the
+/// variables it removes from the environment it inherits.
+struct Nested
+{
+    wait_host: Option<u64>,
+    removed: Vec<String>,
+}
+
+/// Run `cargo xtask <args>` in the scratch worktree, as a shell in it would:
+/// with none of the variables the outer `cargo run` set, so that the
+/// commit's own toolchain, target specifications, and Cargo configuration
+/// build it.
+fn xtask(tree: &Path, args: &[&str], nested: &Nested) -> Result<()>
 {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(tree).arg("xtask").args(args);
-    if let Some(secs) = wait_host
+    if let Some(secs) = nested.wait_host
     {
         cmd.arg("--wait-host").arg(secs.to_string());
     }
-    // The scratch worktree builds into its own `target/`.
-    cmd.env_remove("CARGO_TARGET_DIR");
+    for name in &nested.removed
+    {
+        cmd.env_remove(name);
+    }
     run_cmd(&mut cmd)
 }
 
-/// Create the scratch worktree at `tree`, or reuse the one there.
+/// Whether the variable `name` of `cargo xtask`'s environment is one that
+/// `cargo run` or the rustup proxy sets for the program it runs, rather than
+/// one of the user's: `CARGO` and every `CARGO_*` but `CARGO_HOME` (the
+/// target directory among them), `RUSTUP_TOOLCHAIN`, which outranks a
+/// commit's own `rust-toolchain.toml`, and the proxy's `RUST_RECURSION_COUNT`.
+fn set_by_cargo_run(name: &str) -> bool
+{
+    name == "CARGO"
+        || (name.starts_with("CARGO_") && name != "CARGO_HOME")
+        || name == "RUSTUP_TOOLCHAIN"
+        || name == "RUST_RECURSION_COUNT"
+}
+
+/// The variables the `[env]` table of a Cargo configuration file sets, as
+/// `NAME = ...` keys of `[env]` or as `[env.NAME]` tables. Cargo sets them
+/// for the program `cargo run` runs, and a nested Cargo does not replace a
+/// variable already set, so each would override the commit's own value.
+fn config_env_keys(text: &str) -> Vec<String>
+{
+    let unquote = |name: &str| name.trim().trim_matches('"').to_owned();
+    let mut keys = Vec::new();
+    let mut in_env = false;
+    for line in text.lines().map(str::trim)
+    {
+        if line.starts_with('#')
+        {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[')
+        {
+            let header = header
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or("");
+            let header = header.trim();
+            in_env = header == "env";
+            if let Some(name) = header.strip_prefix("env.")
+            {
+                keys.push(unquote(name));
+            }
+            continue;
+        }
+        if in_env && let Some((key, _)) = line.split_once('=')
+        {
+            let name = key.split('.').next().unwrap_or(key);
+            if !name.trim().is_empty()
+            {
+                keys.push(unquote(name));
+            }
+        }
+    }
+    keys
+}
+
+/// The Cargo configuration files in the `.cargo` directory `dot_cargo`.
+fn configs_in(dot_cargo: &Path) -> Vec<PathBuf>
+{
+    ["config.toml", "config"]
+        .into_iter()
+        .map(|name| dot_cargo.join(name))
+        .filter(|path| path.is_file())
+        .collect()
+}
+
+/// Cargo's home directory: `CARGO_HOME`, or `.cargo` in the user's home.
+fn cargo_home() -> Option<PathBuf>
+{
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cargo")))
+}
+
+/// The variables to remove from each nested build's environment: those
+/// `set_by_cargo_run` names, and those the `[env]` tables of the Cargo
+/// configuration files the outer `cargo xtask` read set (`root`'s and its
+/// ancestors', and Cargo's home's).
+fn removed_variables(root: &Path) -> Vec<String>
+{
+    let mut configs: Vec<PathBuf> = root
+        .ancestors()
+        .flat_map(|dir| configs_in(&dir.join(".cargo")))
+        .collect();
+    configs.extend(cargo_home().into_iter().flat_map(|home| configs_in(&home)));
+    let mut names: BTreeSet<String> = configs
+        .iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .flat_map(|text| config_env_keys(&text))
+        .collect();
+    names.extend(
+        std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| set_by_cargo_run(name)),
+    );
+    names.into_iter().collect()
+}
+
+/// The scratch worktree of the checkout at `root`, in the user's cache
+/// directory `cache`: named for the checkout's path, so that each checkout
+/// has its own and keeps it, and outside the checkout, whose Cargo
+/// configuration a build in a directory below it would merge with the
+/// commit's own.
+fn tree_path(cache: &Path, root: &Path) -> PathBuf
+{
+    let name: String = root
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._".contains(c)
+            {
+                c
+            }
+            else
+            {
+                '-'
+            }
+        })
+        .collect();
+    cache.join("seraph-compare-images").join(name)
+}
+
+/// The user's cache directory: `XDG_CACHE_HOME`, `.cache` in the home
+/// directory, or `LOCALAPPDATA` on Windows.
+fn cache_dir() -> Result<PathBuf>
+{
+    let absolute = |name: &str| {
+        std::env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    absolute("XDG_CACHE_HOME")
+        .or_else(|| std::env::home_dir().map(|home| home.join(".cache")))
+        .or_else(|| absolute("LOCALAPPDATA"))
+        .context("no cache directory: set XDG_CACHE_HOME")
+}
+
+/// The Cargo configuration files of the directories above `tree`, which a
+/// build in it would merge with the commit's own, but for Cargo's home
+/// `home`, which every build reads alike.
+fn foreign_configs(tree: &Path, home: Option<&Path>) -> Vec<PathBuf>
+{
+    let same = |a: &Path, b: &Path| match (fs::canonicalize(a), fs::canonicalize(b))
+    {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    tree.ancestors()
+        .skip(1)
+        .map(|dir| dir.join(".cargo"))
+        .filter(|dot_cargo| home.is_none_or(|home| !same(dot_cargo, home)))
+        .flat_map(|dot_cargo| configs_in(&dot_cargo))
+        .collect()
+}
+
+/// Create the scratch worktree at `tree`, or reuse the one there when it is
+/// a worktree of `root`'s repository.
 fn prepare_tree(root: &Path, tree: &Path) -> Result<()>
 {
+    let foreign = foreign_configs(tree, cargo_home().as_deref());
+    if let Some(config) = foreign.first()
+    {
+        bail!(
+            "{} would be merged into both builds in {}; set XDG_CACHE_HOME to a directory \
+             with no Cargo configuration above it",
+            config.display(),
+            tree.display()
+        );
+    }
     git(root, &["worktree", "prune"])?;
     if tree.join(".git").exists()
     {
-        return Ok(());
+        let common = |dir: &Path| {
+            git(
+                dir,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+        };
+        if common(tree).ok() == Some(common(root)?)
+        {
+            return Ok(());
+        }
+        fs::remove_dir_all(tree).with_context(|| format!("removing {}", tree.display()))?;
+        git(root, &["worktree", "prune"])?;
     }
     if let Some(parent) = tree.parent()
     {
@@ -568,7 +765,7 @@ fn build_side(
     scratch: &Path,
     (side, commit): (Side, &str),
     cells: &[Cell],
-    wait_host: Option<u64>,
+    nested: &Nested,
 ) -> Result<()>
 {
     step(&format!(
@@ -579,14 +776,14 @@ fn build_side(
     git(tree, &["clean", "-ffdx", "-e", "/target"])?;
     for cell in cells
     {
-        xtask(tree, &["clean"], wait_host)?;
+        xtask(tree, &["clean"], nested)?;
         let arch = cell.arch.to_string();
         let mut args = vec!["build", "--skip-lints", "--arch", arch.as_str()];
         if cell.profile == Profile::Release
         {
             args.push("--release");
         }
-        xtask(tree, &args, wait_host)?;
+        xtask(tree, &args, nested)?;
         let dst = scratch.join(side.dir_name()).join(cell.label());
         if dst.exists()
         {
@@ -709,11 +906,14 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
     };
     let cells = cells(args);
     let scratch = ctx.target_dir.join("xtask").join("compare-images");
-    let tree = scratch.join("tree");
+    let tree = tree_path(&cache_dir()?, root);
     prepare_tree(root, &tree)?;
-    let wait_host = args.host.wait_host;
-    build_side(&tree, &scratch, (Side::Base, &base), &cells, wait_host)?;
-    build_side(&tree, &scratch, (Side::Head, &head), &cells, wait_host)?;
+    let nested = Nested {
+        wait_host: args.host.wait_host,
+        removed: removed_variables(root),
+    };
+    build_side(&tree, &scratch, (Side::Base, &base), &cells, &nested)?;
+    build_side(&tree, &scratch, (Side::Head, &head), &cells, &nested)?;
     let mut reports = Vec::new();
     for &cell in &cells
     {
@@ -1131,5 +1331,89 @@ mod tests
         assert!(report.ends_with(
             "compare-images: DIFFERENT (1) base b1 head h1 cells x86_64-debug,riscv64-release\n"
         ));
+    }
+
+    #[test]
+    fn the_variables_cargo_run_and_rustup_set_are_removed_and_the_users_kept()
+    {
+        for name in [
+            "CARGO",
+            "CARGO_MANIFEST_DIR",
+            "CARGO_TARGET_DIR",
+            "RUSTUP_TOOLCHAIN",
+            "RUST_RECURSION_COUNT",
+        ]
+        {
+            assert!(set_by_cargo_run(name), "{name}");
+        }
+        for name in ["CARGO_HOME", "RUSTUP_HOME", "PATH", "HOME", "CARGOX"]
+        {
+            assert!(!set_by_cargo_run(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_config_env_table_names_its_variables()
+    {
+        let text = "\
+[alias]
+xtask = \"run --package xtask --\"
+
+[env]
+# COMMENTED = \"no\"
+RUST_TARGET_PATH = { value = \"xtask/targets\", relative = true }
+\"QUOTED\" = \"1\"
+DOTTED.value = \"2\"
+
+[env.TABLED]
+value = \"3\"
+
+[build]
+rustflags = [\"-Zunstable-options\"]
+";
+        assert_eq!(
+            config_env_keys(text),
+            ["RUST_TARGET_PATH", "QUOTED", "DOTTED", "TABLED"]
+        );
+        assert_eq!(config_env_keys("[build]\njobs = 4\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn each_checkout_has_its_own_scratch_tree_in_the_cache()
+    {
+        let cache = Path::new("/cache");
+        assert_eq!(
+            tree_path(cache, Path::new("/home/u/seraph")),
+            Path::new("/cache/seraph-compare-images/-home-u-seraph")
+        );
+        assert_ne!(
+            tree_path(cache, Path::new("/home/u/seraph")),
+            tree_path(cache, Path::new("/home/u/seraph/.claude/worktrees/w1"))
+        );
+    }
+
+    #[test]
+    fn a_cargo_config_above_the_tree_is_foreign_unless_it_is_cargo_home()
+    {
+        let root =
+            std::env::temp_dir().join(format!("xtask-compare-images-{}", std::process::id()));
+        let tree = root.join("checkout").join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        assert_eq!(foreign_configs(&tree, None), Vec::<PathBuf>::new());
+        let dot_cargo = root.join("checkout").join(".cargo");
+        fs::create_dir_all(&dot_cargo).unwrap();
+        fs::write(dot_cargo.join("config.toml"), "[env]\n").unwrap();
+        // The tree's own configuration is the commit's, not a foreign one.
+        fs::create_dir_all(tree.join(".cargo")).unwrap();
+        fs::write(tree.join(".cargo").join("config.toml"), "[env]\n").unwrap();
+        assert_eq!(
+            foreign_configs(&tree, None),
+            [dot_cargo.join("config.toml")]
+        );
+        assert_eq!(
+            foreign_configs(&tree, Some(&dot_cargo)),
+            Vec::<PathBuf>::new()
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 }

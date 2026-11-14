@@ -415,15 +415,28 @@ cargo xtask compare-images [--base REV] [--head REV] [--arch x86_64|riscv64]... 
 | `--arch` | both | The architectures to build; repeatable, or comma-separated |
 | `--profile` | both | The profiles to build; repeatable, or comma-separated |
 
-Both commits are built in one scratch worktree, `target/xtask/compare-images/tree`, which the
-command adds with `git worktree add --detach` and reuses: it checks each commit out there, removes
-every untracked file but `target/`, and runs that commit's own `cargo xtask clean` and
+Both commits are built in one scratch worktree, which the command adds with
+`git worktree add --detach` and reuses: it checks each commit out there, removes every untracked
+file but `target/`, and runs that commit's own `cargo xtask clean` and
 `cargo xtask build --skip-lints --arch <a> [--release]` once per cell, moving each built sysroot to
 `target/xtask/compare-images/<base|head>/<arch>-<profile>/`. One path serves both commits because a
 build embeds absolute source paths (the panic locations of the `-Z build-std` crates under
 `target/seraph-toolchain/`), so builds in two checkouts never compare equal. The scratch
 worktree's `target/` is kept as a cache, so a later comparison rebuilds only what changed; the
 first one builds every cell from scratch.
+
+Each build is the commit's own. The scratch worktree is
+`<cache>/seraph-compare-images/<checkout path, each other character as ->`, `<cache>` being
+`XDG_CACHE_HOME`, else `~/.cache`: outside the checkout, whose `.cargo/config.toml` Cargo would
+merge into every build below it. The command refuses to run when a directory above the scratch
+worktree holds a Cargo configuration other than Cargo's home's. Each nested `cargo xtask` runs
+without the variables the outer `cargo run` and the rustup proxy set: `CARGO` and each `CARGO_*`
+but `CARGO_HOME`, `RUSTUP_TOOLCHAIN` (which outranks the commit's `rust-toolchain.toml`),
+`RUST_RECURSION_COUNT`, and each variable set by the `[env]` table of a Cargo configuration the
+outer build read (the checkout's and those above it, and Cargo's home's), such as
+`RUST_TARGET_PATH`, which names the commit's target specifications.
+`cargo xtask clean --all` leaves the scratch worktree; `git worktree remove --force <path>`
+removes it.
 
 Each file of a cell's two sysroots is compared by its format:
 
@@ -437,7 +450,8 @@ Each file of a cell's two sysroots is compared by its format:
 A file in one sysroot only is reported as `added` or `removed`. The symbol tables, the debug
 information, `.comment`, and a file's size are not compared. The disk image is not compared
 either: `xtask/src/disk.rs` packs it from the compared files, and a change to that code is under
-`xtask/`, which the class leaves to the coverage screens.
+`xtask/`, whose lines, and those of the crates xtask's build compiles in, the class leaves to the
+coverage screens.
 
 The command prints, for each cell, its file count and each difference as `<path>: <part>`, then
 the verdict line, and writes the same text to

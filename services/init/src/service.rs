@@ -294,7 +294,8 @@ fn collect_hw_caps(info: &InitInfo) -> HwCaps
             | CapType::Mmio
             | CapType::IoPort
             | CapType::SchedControl
-            | CapType::SbiControl =>
+            | CapType::SbiControl
+            | CapType::EntropyControl =>
             {}
         }
     }

@@ -9,7 +9,10 @@
 //! The lint pass runs Clippy over the test configuration of the selected
 //! packages once for each architecture's Linux target, so test code gated on
 //! either architecture is linted on any host; it only checks, building `std`
-//! from source for each target, and links nothing. The tests then compile and
+//! from source for each target, and links nothing. The crates that use the
+//! toolchain sysroot's own crates ([`PREBUILT_STD_ONLY`]) cannot build against
+//! a `std` built from source, so the pass lints them for the host alone,
+//! against the prebuilt `std`. The tests then compile and
 //! run for the host. The workspace Cargo.toml sets panic=abort for dev/release
 //! profiles; host test builds override this implicitly via the test harness.
 //!
@@ -63,6 +66,14 @@ const EMULATED_START_FILE: &str = "crt1.o";
 /// emulated test run.
 const HOST_ONLY: [&str; 2] = ["xtask", "seraph-wrapper-shim"];
 
+/// The workspace crates that reach crates of the toolchain sysroot under
+/// `rustc_private` (xtask's `object`, `addr2line` and `rustc_demangle`). Those
+/// crates link the prebuilt `core`, so a build with `-Zbuild-std` meets two
+/// `core`s (`E0152`): the lint pass checks these crates for the host target
+/// against the prebuilt `std` instead of for [`LINT_TARGETS`]. They are
+/// host-only ([`HOST_ONLY`]), so no other target runs them.
+const PREBUILT_STD_ONLY: [&str; 1] = ["xtask"];
+
 /// The lints the test lint pass allows, and the one place the relaxation of
 /// lints for test code is stated (`docs/coding-standards.md` § Clippy). In a
 /// test, an unwrapped error, an explicit panic, a panic in a function that
@@ -89,6 +100,11 @@ pub fn run(ctx: &BuildContext, args: &TestArgs) -> Result<()>
     {
         step(&format!("Linting test code for {target}"));
         run_cmd(cargo(ctx).arg("clippy").args(lint_args(packages, target)))?;
+    }
+    if let Some(args) = host_lint_args(packages)
+    {
+        step("Linting test code for the host, against the prebuilt std");
+        run_cmd(cargo(ctx).arg("clippy").args(args))?;
     }
 
     step("Testing (host)");
@@ -197,16 +213,51 @@ fn emulated_env() -> [(&'static str, &'static str); 3]
 /// The `cargo clippy` arguments of the test lint pass over `packages` for
 /// `target`: every target `cargo test` compiles, in its test configuration,
 /// with all warnings treated as errors and [`TEST_RELAXED_LINTS`] allowed.
+/// [`PREBUILT_STD_ONLY`] is left out; [`host_lint_args`] lints it.
 fn lint_args<'a>(packages: &[&'a str], target: &'a str) -> Vec<&'a str>
 {
     let mut args = packages.to_vec();
+    if packages.contains(&"--workspace")
+    {
+        for krate in PREBUILT_STD_ONLY
+        {
+            args.extend(["--exclude", krate]);
+        }
+    }
     args.extend(["--tests", "--target", target, LINT_BUILD_STD]);
+    push_driver_args(&mut args);
+    args
+}
+
+/// The `cargo clippy` arguments that lint [`PREBUILT_STD_ONLY`]'s test
+/// configuration for the host against the prebuilt `std`, with the driver
+/// arguments of [`lint_args`]; `None` when `packages` selects none of those
+/// crates.
+fn host_lint_args(packages: &[&str]) -> Option<Vec<&'static str>>
+{
+    if !packages.contains(&"--workspace")
+    {
+        return None;
+    }
+    let mut args = Vec::new();
+    for krate in PREBUILT_STD_ONLY
+    {
+        args.extend(["-p", krate]);
+    }
+    args.push("--tests");
+    push_driver_args(&mut args);
+    Some(args)
+}
+
+/// Append the clippy-driver arguments of the lint pass: all warnings
+/// treated as errors, [`TEST_RELAXED_LINTS`] allowed.
+fn push_driver_args(args: &mut Vec<&str>)
+{
     args.extend(["--", "-D", "warnings"]);
     for lint in TEST_RELAXED_LINTS
     {
         args.extend(["-A", lint]);
     }
-    args
 }
 
 fn cargo(ctx: &BuildContext) -> Command
@@ -232,16 +283,47 @@ mod tests
     #[test]
     fn lint_pass_denies_warnings_and_allows_each_relaxed_lint_in_the_driver()
     {
-        let args = lint_args(packages(TestComponent::All), LINT_TARGETS[0]);
-        let driver = driver_args(&args);
-        assert_eq!(&driver[..2], ["-D", "warnings"]);
-        for lint in TEST_RELAXED_LINTS
+        let all = packages(TestComponent::All);
+        for args in [
+            lint_args(all, LINT_TARGETS[0]),
+            host_lint_args(all).unwrap(),
+        ]
         {
-            assert!(
-                driver.windows(2).any(|w| w == ["-A", lint]),
-                "{lint} is not allowed in {driver:?}"
-            );
+            let driver = driver_args(&args);
+            assert_eq!(&driver[..2], ["-D", "warnings"]);
+            for lint in TEST_RELAXED_LINTS
+            {
+                assert!(
+                    driver.windows(2).any(|w| w == ["-A", lint]),
+                    "{lint} is not allowed in {driver:?}"
+                );
+            }
         }
+    }
+
+    // Defect guarded: a crate that reaches the sysroot's crates linted with
+    // `-Zbuild-std`, which fails on two `core`s, or left out of the lint
+    // pass altogether.
+    #[test]
+    fn crates_on_the_sysroot_crates_are_linted_for_the_host_on_the_prebuilt_std_only()
+    {
+        let all = packages(TestComponent::All);
+        for target in LINT_TARGETS
+        {
+            let args = lint_args(all, target);
+            for krate in PREBUILT_STD_ONLY
+            {
+                assert!(
+                    args.windows(2).any(|w| w == ["--exclude", krate]),
+                    "{krate} is not excluded from {args:?}"
+                );
+            }
+        }
+        let host = host_lint_args(all).unwrap();
+        let split = host.iter().position(|a| *a == "--").unwrap();
+        assert_eq!(&host[..split], ["-p", "xtask", "--tests"]);
+        assert!(!host.contains(&LINT_BUILD_STD), "{host:?}");
+        assert_eq!(host_lint_args(packages(TestComponent::Kernel)), None);
     }
 
     #[test]

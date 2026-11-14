@@ -262,6 +262,14 @@ mod tests
         assert_eq!(function_path("a::hxyz"), "a::hxyz");
     }
 
+    #[test]
+    fn a_mangled_symbol_is_matched_by_its_path()
+    {
+        let name =
+            crate::symbolize::demangle("_ZN6kernel4arch6x86_643cpu9halt_loop17h0123456789abcdefE");
+        assert!(function_path(&name).ends_with("::cpu::halt_loop"), "{name}");
+    }
+
     // The defect caught: a stop reply whose thread is misread, so the test
     // reads another CPU's registers.
     #[test]

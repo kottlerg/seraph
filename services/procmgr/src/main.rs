@@ -1878,18 +1878,23 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         let _ = syscall::cap_delete(creator_ep);
     }
 
-    if let Ok(result) = result
+    match result
     {
-        log_spawn_sched(sched);
-        arm_and_reply_create(label, &result, ipc_buf, ctx);
-    }
-    else
-    {
-        // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
-        // request's own checks, whatever the cause `create_process` reports.
-        // `finalize_creation` consumes the relay only on success.
-        release_caps(&[caps.relay]);
-        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        Ok(result) =>
+        {
+            log_spawn_sched(sched);
+            arm_and_reply_create(label, &result, ipc_buf, ctx);
+        }
+        Err(cause) =>
+        {
+            // § Label 1 names `OUT_OF_MEMORY` for every creation failure past
+            // the request's own checks, whatever the cause `create_process`
+            // reports, so the cause is logged here, where it is still known.
+            // `finalize_creation` consumes the relay only on success.
+            std::os::seraph::log!(warn: "create from a module failed (procmgr_errors {cause})");
+            release_caps(&[caps.relay]);
+            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        }
     }
 }
 

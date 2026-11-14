@@ -11,7 +11,6 @@
 //! function, its address (eight bytes, little-endian) and its frame size in
 //! bytes (ULEB128). The linker keeps an entry only for a function it keeps.
 
-use std::borrow::Cow;
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
@@ -137,10 +136,7 @@ fn function_name(file: &object::File<'_>, address: u64) -> String
         .filter(|sym| sym.kind() == SymbolKind::Text && sym.is_definition())
         .find(|sym| sym.address() == address)
         .and_then(|sym| sym.name().ok())
-        .map_or_else(
-            || format!("{address:#x}"),
-            |name| addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned(),
-        )
+        .map_or_else(|| format!("{address:#x}"), crate::symbolize::demangle)
 }
 
 /// Fail when a function of the riscv64 kernel image at `image` has a frame

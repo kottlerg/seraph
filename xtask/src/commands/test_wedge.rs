@@ -444,7 +444,7 @@ fn image_spans(data: &[u8]) -> Result<Image>
         {
             continue;
         };
-        let name = addr2line::demangle_auto(std::borrow::Cow::Borrowed(raw), None);
+        let name = crate::symbolize::demangle(raw);
         let span = Span {
             start: sym.address(),
             end: sym.address().saturating_add(sym.size()),

@@ -536,7 +536,7 @@ fn dispatch_span(data: &[u8]) -> Result<Span>
         {
             continue;
         };
-        let name = addr2line::demangle_auto(std::borrow::Cow::Borrowed(raw), None);
+        let name = crate::symbolize::demangle(raw);
         if function_path(&name) == "kernel::syscall::dispatch"
         {
             let span = Span {

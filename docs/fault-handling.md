@@ -908,6 +908,12 @@ not yet backed takes the same path through the restartable syscalls: the pager b
 the syscall re-executes ([Kernel Copies](#kernel-copies)), so a caller need not touch its buffer
 first.
 
+A pager MUST evict only pages it mapped itself. memmgr's eviction is design intent; not yet
+implemented: under memory pressure memmgr is to evict cold pages it backed into a compressed store
+in RAM and restore them on the next fault, never evicting a page of a process whose budget node is
+a reserve node, nor a region registered no-evict
+([memmgr Memory Pool § Eviction](../services/memmgr/docs/memory-pool.md#eviction)).
+
 ### Default System Pager
 
 The broadly useful memory policies — lazy and guard-page stack growth, zero-fill-on-demand
@@ -915,7 +921,9 @@ anonymous memory, copy-on-write sharing, swap and overcommit, working-set tracki
 snapshotting — exist only if a manager sits on the fault path of most processes. Binding a
 default pager to all ordinary processes is a userspace policy decision (a creator default
 plus the runtime's copy of the spawning thread's bindings onto each thread it spawns), not a
-kernel one.
+kernel one. Of swap, memmgr is to implement compressed eviction in RAM (design intent; not yet
+implemented, [Demand Paging](#demand-paging-and-the-default-system-pager) above), and a separate
+swap service its disk tier ([#43](https://github.com/kottlerg/seraph/issues/43)).
 
 Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
 fault handler on every process it creates and advertises it in

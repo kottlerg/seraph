@@ -115,11 +115,17 @@ impl Drop for ScratchMapping
     }
 }
 
-/// Map a module memory cap read-only, probing for the exact mappable page count.
+/// Map a module memory cap read-only, whole, and return the mapping with its
+/// page count.
 ///
-/// Starts from 128 pages and decrements until the mapping succeeds. The
-/// returned [`ScratchMapping`] owns the reservation; dropping it unmaps
-/// and releases the VA.
+/// The mapping spans every page of the cap, its `CAP_INFO_MEMORY_SIZE` in whole
+/// pages, so the loader reads every byte of the image the cap holds, however
+/// large. A boot module's cap covers the module's pages, the last one's tail
+/// past the image included (`mint_module_memory_caps` in
+/// `core/kernel/src/cap/mod.rs`), and the ELF parsers bound every read by the
+/// image's own headers, so those tail bytes are never read as the image. The
+/// returned [`ScratchMapping`] owns the reservation; dropping it unmaps and
+/// releases the VA.
 ///
 /// `module_memory_cap` is a borrowed derivation of the caller's full-rights
 /// module-source memory cap. We derive a read-only child cap for the load-time
@@ -128,31 +134,36 @@ impl Drop for ScratchMapping
 /// the returned [`ScratchMapping`] and dropped alongside the unmap.
 ///
 /// # Errors
-/// `procmgr_errors::INSUFFICIENT_RIGHTS` when the read-only derivation
-/// fails, and the last probe's [`ScratchMapping::map`] code when no page
-/// count from 128 down to one maps.
+/// `procmgr_errors::INSUFFICIENT_RIGHTS` when the read-only derivation fails;
+/// `procmgr_errors::MAP_FAILED` when the cap is not a Memory cap or holds no
+/// whole page; and [`ScratchMapping::map`]'s code when the reservation or the
+/// map of the whole cap fails.
 pub fn map_module(module_memory_cap: u64, self_aspace: u64) -> Result<(ScratchMapping, u64), u64>
 {
     let module_ro = syscall::cap_derive(module_memory_cap, syscall::RIGHTS_MEM_MAP)
         .map_err(|_| procmgr_errors::INSUFFICIENT_RIGHTS)?;
-    let mut pages: u64 = 128;
-    let mut last = procmgr_errors::MAP_FAILED;
-    while pages > 0
+    // A Memory cap's size is a whole number of pages; the division drops
+    // nothing a map could reach.
+    let pages = syscall::cap_info(module_ro, syscall::CAP_INFO_MEMORY_SIZE)
+        .map_or(0, |size| size / PAGE_SIZE);
+    if pages == 0
     {
-        match ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_FROM_CAP)
-        {
-            Ok(mut scratch) =>
-            {
-                scratch.set_owns_cap(module_ro);
-                return Ok((scratch, pages));
-            }
-            Err(code) => last = code,
-        }
-        // The loop condition keeps `pages` above zero.
-        pages = pages.saturating_sub(1);
+        let _ = syscall::cap_delete(module_ro);
+        return Err(procmgr_errors::MAP_FAILED);
     }
-    let _ = syscall::cap_delete(module_ro);
-    Err(last)
+    match ScratchMapping::map(self_aspace, module_ro, pages, syscall::MAP_FROM_CAP)
+    {
+        Ok(mut scratch) =>
+        {
+            scratch.set_owns_cap(module_ro);
+            Ok((scratch, pages))
+        }
+        Err(code) =>
+        {
+            let _ = syscall::cap_delete(module_ro);
+            Err(code)
+        }
+    }
 }
 
 /// Derive a memory cap with the given protection rights for mapping.

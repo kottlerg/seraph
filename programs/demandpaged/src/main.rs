@@ -8,7 +8,7 @@
 //! Demand paging is the system-wide default, so when spawned normally procmgr
 //! binds this process's fault handler to memmgr (the pager). The pager phase
 //! also spawns it `pinned(true)` to prove the opt-out leaves it with no pager.
-//! Four modes, selected by argv:
+//! Five modes, selected by argv:
 //!
 //!   * default — reserve an unbacked region, register it as demand-paged, and
 //!     write a per-page pattern across it. Each first touch faults to memmgr,
@@ -34,15 +34,20 @@
 //!     memmgr accepts only if the teardown removed the first registration.
 //!     The second region is filled, read back and torn down the same way.
 //!     Exits `SUCCESS` when both rounds pass.
+//!   * `bench [CHUNKS]` — time, in cycles, the first touch of each chunk of a
+//!     demand region and a grant-and-map of the same size, and log the min,
+//!     mean and max of each (programs/demandpaged/README.md § Bench mode). It
+//!     reports and asserts no bound; exits `SUCCESS` when every touch, grant
+//!     and map succeeded.
 //!
-//! Driven by `services/svctest`'s pager phase.
+//! Driven by `services/svctest`'s pager phases.
 
 use std::os::seraph::{
     register_demand_paged, reserve_pages, startup_info, unregister_demand_paged,
 };
 use std::process::ExitCode;
 
-use syscall_abi::{CAP_INFO_ASPACE_PT_BUDGET, MAP_READ, PAGE_SIZE, SyscallError};
+use syscall_abi::{CAP_INFO_ASPACE_PT_BUDGET, MAP_READ, MAP_WRITABLE, PAGE_SIZE, SyscallError};
 
 const PAGES: usize = 4;
 const PAGE: usize = 4096;
@@ -71,6 +76,10 @@ fn main() -> ExitCode
     else if std::env::args().any(|a| a == "teardown")
     {
         teardown()
+    }
+    else if std::env::args().any(|a| a == "bench")
+    {
+        bench()
     }
     else
     {
@@ -315,4 +324,233 @@ fn page_table_drain() -> ExitCode
         }
     }
     ExitCode::SUCCESS
+}
+
+/// Pages memmgr backs on a demand fault when a free run covers them: one
+/// chunk (`DEMAND_CHUNK_PAGES`, services/memmgr/docs/memory-pool.md § Demand
+/// faults).
+const CHUNK_PAGES: u64 = 16;
+
+/// Chunks the `bench` mode times on each path when no count is given.
+const BENCH_CHUNKS: u64 = 64;
+
+/// Chunks the `bench` mode touches, or grants and maps, untimed before it
+/// times a path.
+const BENCH_WARMUP: u64 = 4;
+
+#[cfg(target_arch = "x86_64")]
+const ARCH_TAG: &str = "x86_64";
+#[cfg(target_arch = "riscv64")]
+const ARCH_TAG: &str = "riscv64";
+
+/// The hardware cycle counter. Units differ by architecture; only deltas on
+/// one architecture compare.
+fn cycles_now() -> u64
+{
+    #[cfg(target_arch = "x86_64")]
+    {
+        let lo: u32;
+        let hi: u32;
+        // SAFETY: `rdtsc` is unprivileged on x86_64 (the kernel leaves
+        // CR4.TSD clear) and writes only edx:eax.
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nostack, nomem, preserves_flags),
+            );
+        }
+        (u64::from(hi) << 32) | u64::from(lo)
+    }
+    #[cfg(target_arch = "riscv64")]
+    {
+        let c: u64;
+        // SAFETY: `csrr cycle` is unprivileged once the kernel sets
+        // `scounteren.CY`, which it does on every hart
+        // (core/kernel/src/arch/riscv64/interrupts.rs).
+        unsafe {
+            core::arch::asm!("csrr {}, cycle", out(reg) c, options(nostack, nomem));
+        }
+        c
+    }
+}
+
+/// Running min, sum and max of one path's timed samples.
+struct Samples
+{
+    min: u64,
+    sum: u64,
+    max: u64,
+    count: u64,
+}
+
+impl Samples
+{
+    const fn new() -> Self
+    {
+        Self {
+            min: u64::MAX,
+            sum: 0,
+            max: 0,
+            count: 0,
+        }
+    }
+
+    fn add(&mut self, cycles: u64)
+    {
+        self.min = self.min.min(cycles);
+        self.max = self.max.max(cycles);
+        self.sum = self.sum.saturating_add(cycles);
+        self.count = self.count.saturating_add(1);
+    }
+
+    fn log(&self, path: &str)
+    {
+        let mean = self.sum.checked_div(self.count).unwrap_or(0);
+        std::os::seraph::log!(
+            "arch={ARCH_TAG} path={path} chunk_pages={CHUNK_PAGES} chunks={} cycles_min={} \
+             cycles_mean={mean} cycles_max={}",
+            self.count,
+            self.min,
+            self.max
+        );
+    }
+}
+
+/// The `bench` mode: the cycles of a demand chunk's first touch against those
+/// of a grant-and-map of the same size. Exit codes: `0` when both paths ran;
+/// `2` if the registration or the reservation fails, a region too large for
+/// the address space included; `4` if a grant or its map fails; `6` if the
+/// chunk count is not a positive integer that fits in 64 bits; `7` if the
+/// thread cannot be pinned to one CPU. A fault memmgr declines kills the
+/// process.
+///
+/// The thread is pinned to CPU 0 before it times anything: each sample spans
+/// a block on memmgr, and a thread woken on another CPU would subtract one
+/// CPU's cycle counter from another's, which riscv64 does not keep in step.
+/// The untimed warm-up chunks of each path block on memmgr, so the thread
+/// runs on CPU 0 by the first timed sample.
+fn bench() -> ExitCode
+{
+    std::os::seraph::log::register_name(b"demandpaged");
+    let chunks = match std::env::args()
+        .skip_while(|a| a != "bench")
+        .nth(1)
+        .map(|a| a.parse::<u64>())
+    {
+        None => BENCH_CHUNKS,
+        Some(Ok(n)) if n > 0 => n,
+        Some(_) => return ExitCode::from(6),
+    };
+    let chunk_bytes = CHUNK_PAGES.saturating_mul(PAGE_SIZE);
+    let Some(total) = chunks.checked_add(BENCH_WARMUP)
+    else
+    {
+        return ExitCode::from(2);
+    };
+    // The region's byte size must fit too, so no chunk address below
+    // overflows.
+    let Some(pages) = total
+        .checked_mul(CHUNK_PAGES)
+        .filter(|_| total.checked_mul(chunk_bytes).is_some())
+    else
+    {
+        return ExitCode::from(2);
+    };
+    if syscall::thread_set_affinity(startup_info().self_thread, 0).is_err()
+    {
+        return ExitCode::from(7);
+    }
+
+    // Fault path: the first store into each chunk of a demand region is one
+    // fault, which memmgr backs with the whole chunk when a free run covers
+    // it. The registration funds the region's page tables, so a sample is
+    // the kernel's delivery of the fault, memmgr's work on it and the resume.
+    let Ok(region) = register_demand_paged(pages)
+    else
+    {
+        return ExitCode::from(2);
+    };
+    let mut fault = Samples::new();
+    for chunk in 0..total
+    {
+        let va = region
+            .va_start()
+            .saturating_add(chunk.saturating_mul(chunk_bytes));
+        let start = cycles_now();
+        // SAFETY: `va` starts a chunk of a read-write demand region this
+        // process registered, which holds no Rust object; the store's fault
+        // is backed by the pager.
+        unsafe { core::ptr::write_volatile(va as *mut u64, 1) };
+        let cycles = cycles_now().wrapping_sub(start);
+        if chunk >= BENCH_WARMUP
+        {
+            fault.add(cycles);
+        }
+    }
+
+    // Grant path: a contiguous grant of one chunk's pages, its map into a
+    // reservation (funding page tables when the map is refused for want of
+    // them), and the first store, which then faults on nothing.
+    let Ok(reservation) = reserve_pages(pages)
+    else
+    {
+        return ExitCode::from(2);
+    };
+    let info = startup_info();
+    let mut grant = Samples::new();
+    for chunk in 0..total
+    {
+        let va = reservation
+            .va_start()
+            .saturating_add(chunk.saturating_mul(chunk_bytes));
+        let start = cycles_now();
+        let Some(cap) = request_contiguous(info.memmgr_endpoint, CHUNK_PAGES)
+        else
+        {
+            return ExitCode::from(4);
+        };
+        // SAFETY: the chunk lies in this process's own reservation, which
+        // nothing else maps and where no Rust object or IPC page lies.
+        let mapped = unsafe {
+            std::os::seraph::mem_map_funded(cap, info.self_aspace, va, 0, CHUNK_PAGES, MAP_WRITABLE)
+        };
+        if mapped.is_err()
+        {
+            return ExitCode::from(4);
+        }
+        // SAFETY: the page was just mapped read-write in this process's own
+        // reservation and holds no Rust object.
+        unsafe { core::ptr::write_volatile(va as *mut u64, 1) };
+        let cycles = cycles_now().wrapping_sub(start);
+        if chunk >= BENCH_WARMUP
+        {
+            grant.add(cycles);
+        }
+    }
+
+    fault.log("fault");
+    grant.log("grant");
+    ExitCode::SUCCESS
+}
+
+/// One Memory cap of `pages` contiguous pages from memmgr
+/// (`REQUEST_MEMORY_CAPS` with `REQUIRE_CONTIGUOUS`). `None` when the request
+/// fails or the reply is not one cap of `pages` pages.
+fn request_contiguous(memmgr_ep: u64, pages: u64) -> Option<u64>
+{
+    let flags = u64::from(ipc::memmgr_labels::REQUIRE_CONTIGUOUS) << 32;
+    let msg = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+        .word(0, pages | flags)
+        .build();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is this thread's kernel-registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) }.ok()?;
+    let (counts, _) = ipc::memmgr_grant_layout(&reply)?;
+    if counts != [pages]
+    {
+        return None;
+    }
+    reply.caps().first().copied()
 }

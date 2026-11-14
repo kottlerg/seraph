@@ -2745,8 +2745,8 @@ fn relro_page_range(va: u64, size: u64, bias: u64) -> Option<(u64, u64)>
 #[expect(
     clippy::too_many_arguments,
     reason = "each argument is a distinct input the caller holds separately: the image, procmgr's \
-              own caps and tables, the child's universals, argv and env, death set and scheduling, \
-              and the IPC buffer"
+              own caps and tables, the child's universals, argv and env, death set, parent relay \
+              and scheduling, and the IPC buffer"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -2762,6 +2762,7 @@ fn create_process_from_bytes(
     universals: &UniversalCaps,
     argv_env: ChildArgvEnv,
     deaths: &Mutex<DeathSet>,
+    parent_relay_cap: u64,
     sched: ChildSched,
     ipc_buf: *mut u64,
 ) -> Result<CreateResult, u64>
@@ -3042,9 +3043,7 @@ fn create_process_from_bytes(
         process_badge,
         universals.paging,
         universals.self_memmgr_ep,
-        // Boot-module spawns (CREATE_PROCESS) have no parent death queue to
-        // relay terminal faults to; only CREATE_FROM_FILE carries a relay.
-        0,
+        parent_relay_cap,
         sched.band_max,
         image,
         ipc_buf,
@@ -3060,6 +3059,8 @@ fn create_process_from_bytes(
 /// Create a process from an ELF module memory cap (suspended).
 ///
 /// Maps the memory cap, delegates to `create_process_from_bytes`, then unmaps.
+/// `parent_relay_cap` is consumed only on `Ok`, so on `Err` the caller
+/// releases it.
 ///
 /// # Errors
 /// A `procmgr_errors` code naming the cause: [`loader::map_module`]'s
@@ -3083,6 +3084,7 @@ pub fn create_process(
     universals: &UniversalCaps,
     argv_env: ChildArgvEnv,
     deaths: &Mutex<DeathSet>,
+    parent_relay_cap: u64,
     sched: ChildSched,
 ) -> Result<CreateResult, u64>
 {
@@ -3106,6 +3108,7 @@ pub fn create_process(
         universals,
         argv_env,
         deaths,
+        parent_relay_cap,
         sched,
         ipc_buf,
     );

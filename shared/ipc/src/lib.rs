@@ -88,7 +88,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 13;
+pub const PROCMGR_LABELS_VERSION: u32 = 14;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -99,9 +99,10 @@ pub mod procmgr_labels
     use core::prelude::rust_2024::*;
 
     /// Create a new process from a boot module Memory cap. Caps: `[module,
-    /// creator_endpoint?, argv_env?]`, the last present iff
+    /// creator_endpoint?, argv_env?, death_relay?]`, `argv_env` present iff
     /// [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data words
-    /// `0..4`. Label layout as for [`CREATE_FROM_FILE`] (bit 17 is ignored).
+    /// `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as for
+    /// [`CREATE_FROM_FILE`]. Label layout as for [`CREATE_FROM_FILE`].
     /// Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
     /// the returned badged `process_handle` — procmgr's CREATE path
@@ -164,12 +165,12 @@ pub mod procmgr_labels
     /// and never routed through this binding path, so they are pinned by
     /// construction regardless.
     pub const CREATE_PINNED: u64 = 1 << 16;
-    /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
-    /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
-    /// message, which then carries at least two caps). Once the child is
-    /// recorded, procmgr binds it as an `AddressSpace` death observer
-    /// (correlator 0) on the child so that a terminal fault in any
-    /// of the child's threads posts the fault class straight to the
+    /// Label flag (bit 17) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// the message carries a trailing death-relay POST-only `EventQueue` cap
+    /// (the LAST cap in the message, which then carries at least two caps).
+    /// Once the child is recorded, procmgr binds it as an `AddressSpace`
+    /// death observer (correlator 0) on the child so that a terminal fault
+    /// in any of the child's threads posts the fault class straight to the
     /// spawner's own death queue, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
     /// `EventQueue` state at bind time). Occupies bit 17 of the

@@ -71,13 +71,17 @@ keep the answer in the record:
 
 Three standing rules need no question. Outside the milestone moves of docs/conventions.md
 § Release Production (those of step 1, as the maintainer decides them, and those of step 8),
-move an Issue to a later milestone only on a hard dependency on another Issue. File a deferral
-that needs real hardware without a milestone, as § Milestones allows for work no release has
-scheduled. No PR closes a rolling `<scope>: defects found by review` Issue (docs/conventions.md
-§ Follow-up Issues): it stays open as the scope's recording sink of its milestone, even with
-every item ticked, until that step 8 closes it, and PRs reference it with `Refs` only. The
-rolling Issue of a scope is the open one of the current milestone; earlier milestones' carry the
-same title.
+move an Issue to a later milestone only on a hard dependency on an Issue of that milestone.
+File an Issue without a milestone only when it cannot be worked on now: it needs hardware the
+project does not have, it is not possible yet, or whether it belongs in the project is itself
+undecided (`cargo xtask issue-file --unscheduled --reason`, its body stating which, as
+§ Milestones requires). File every other Issue under the current milestone, or a later one when
+it depends on an Issue of that milestone; the size of a milestone and the date of a release are
+not reasons for a later milestone or for none. No PR closes a rolling
+`<scope>: defects found by review` Issue (docs/conventions.md § Follow-up Issues): it stays open
+as the scope's recording sink of its milestone, even with every item ticked, until that step 8
+closes it, and PRs reference it with `Refs` only. The rolling Issue of a scope is the open one of
+the current milestone; earlier milestones' carry the same title.
 
 ## Ownership
 

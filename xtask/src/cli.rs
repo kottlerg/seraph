@@ -1330,9 +1330,28 @@ pub struct IssueFileArgs
     #[arg(long)]
     pub milestone: Option<String>,
 
-    /// File without a milestone: future-state work no release has scheduled.
+    /// File without a milestone: work that cannot be done now. Needs
+    /// `--reason`.
     #[arg(long)]
     pub unscheduled: bool,
+
+    /// Why an `--unscheduled` Issue cannot be done now; its body states the
+    /// same reason in a `No milestone: <reason>` line.
+    #[arg(long, value_enum)]
+    pub reason: Option<UnscheduledReason>,
+}
+
+/// Why an Issue may stay without a milestone (docs/conventions.md
+/// § Milestones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum UnscheduledReason
+{
+    /// It needs hardware the project does not have.
+    Hardware,
+    /// It is not possible yet.
+    NotPossible,
+    /// Whether it belongs in the project is itself undecided.
+    Undecided,
 }
 
 // ── Orch ──────────────────────────────────────────────────────────────────────

@@ -38,7 +38,11 @@ only if that does not cure it.
 3. **Replace the orchestrator at about 250,000 tokens.** Its notifications carry its token
    count. At that size, or when it asks, send `park`; when it answers `parked` and hands back,
    spawn a new one with "resume from the record" and give it its id. Stop the old one only if it
-   does not hand back.
+   does not hand back. When it asks because a merge changed its own file, the request names the
+   changed files: the new one's line is "resume from the record; read from disk first: <the
+   files>", since the definition this session loaded is the old one. When the orchestrator
+   names this file after a merge, read it again yourself. A merge that changes `.claude/` needs
+   no new session (`.claude/agents/orchestrator.md` § Plan); this session continues.
 4. **Forward what orphans send you.** A worker spawned by an earlier orchestrator stays alive,
    but its hand-back and task notifications arrive here. Forward a hand-back to the current
    orchestrator verbatim: it is the worker's only copy of its report (a gate report, a question

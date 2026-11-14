@@ -18,7 +18,15 @@ still owes it (a sync when `master` moves, and the composition check after its m
 ## Authorities
 
 Read `.claude/CLAUDE.md` from your own worktree first: the copy loaded for you can be the
-parent session's, which may predate your worktree. Then read each Issue
+parent session's, which may predate your worktree. Next read each file your prompt names to
+read from disk: an instruction file changed since the session started, this file among them when
+it changed, of which the copy loaded for you is the old one. Read it as `master` holds it
+(`git fetch origin`, then `git show origin/master:<path>`), since your branch may predate the
+merge that changed it; where it differs from the copy loaded for you, it governs. The same holds
+when the orchestrator tells you later that a file changed: read it again that way before your
+next step. Tell every agent you spawn (a `pr-reviewer`, a `pr-auditor`, an `Explore`, a
+`scribe`) whose own agent file is among those files to read it the same way first. Then read
+each Issue
 (`gh issue view <N> --comments`) and what the change needs:
 
 - Every change: docs/conventions.md § Commit Messages and § Branch and PR Workflow, and the

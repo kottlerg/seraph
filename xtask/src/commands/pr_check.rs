@@ -55,6 +55,7 @@ pub struct Patterns
     issue_ref: Regex,
     closing_ref: Regex,
     refs_ref: Regex,
+    refs_number: Regex,
     attribution: Regex,
     planning_label: Regex,
     subject_form: Regex,
@@ -86,8 +87,14 @@ impl Patterns
             ))?,
             // `Refs` takes the `#N` form only: the Issues it names are looked
             // up in this repository, and a reference into another repository
-            // names an Issue these checks cannot read.
-            refs_ref: Regex::new(r"(?i)\brefs\s*:?\s*#(\d+)")?,
+            // names an Issue these checks cannot read. One keyword may name a
+            // list (`Refs #12, #34`, `Refs #12 and #34`): every `#N` joined to
+            // the one before it on the same line by a comma, `and`, or spaces.
+            // Anything else ends the list.
+            refs_ref: Regex::new(
+                r"(?i)\brefs\s*:?\s*#\d+(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+(?:and[ \t]+)?)#\d+)*",
+            )?,
+            refs_number: Regex::new(r"#(\d+)")?,
             attribution: Regex::new(
                 r"(?i)claude\.ai/|claude-session|co-authored-by:\s*claude|generated with \[?claude",
             )?,
@@ -175,19 +182,23 @@ fn refs_in(pattern: &Regex, text: &str, forms: &[(Option<usize>, usize)]) -> Vec
         {
             continue;
         };
-        let line = text
-            .get(..whole.start())
-            .unwrap_or("")
-            .matches('\n')
-            .count()
-            .saturating_add(1);
         out.push(IssueRef {
             repo,
             issue: number,
-            line,
+            line: line_at(text, whole.start()),
         });
     }
     out
+}
+
+/// The 1-based line of `text` that byte offset `at` stands on.
+fn line_at(text: &str, at: usize) -> usize
+{
+    text.get(..at)
+        .unwrap_or("")
+        .matches('\n')
+        .count()
+        .saturating_add(1)
 }
 
 /// Every closing reference in `text`: the Issues GitHub closes when the text
@@ -197,10 +208,31 @@ pub fn closing_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
     refs_in(&pat.closing_ref, text, &[(Some(2), 3), (Some(4), 5)])
 }
 
-/// Every `Refs #N` in `text`.
+/// Every Issue a `Refs` keyword names in `text`: `Refs #N`, and each `#N` of
+/// a list after one keyword (`Refs #N, #M`), each with the line it is on.
 pub fn refs_refs(pat: &Patterns, text: &str) -> Vec<IssueRef>
 {
-    refs_in(&pat.refs_ref, text, &[(None, 1)])
+    let mut out = Vec::new();
+    for list in pat.refs_ref.find_iter(text)
+    {
+        for found in pat.refs_number.captures_iter(list.as_str())
+        {
+            let (Some(whole), Some(issue)) = (
+                found.get(0),
+                found.get(1).and_then(|n| n.as_str().parse::<u64>().ok()),
+            )
+            else
+            {
+                continue;
+            };
+            out.push(IssueRef {
+                repo: None,
+                issue,
+                line: line_at(text, list.start().saturating_add(whole.start())),
+            });
+        }
+    }
+    out
 }
 
 /// `line` without what may open it before its text: quote markers (`>`),
@@ -518,6 +550,7 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
         ));
     }
     out.extend(check_body_closing(pat, body));
+    out.extend(check_refs_unread(pat, body));
     if section(body, "## Validation").is_none()
     {
         out.push(Diag::error(
@@ -533,6 +566,52 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
             "body",
             "the `## Validation` section names no validated head",
         ));
+    }
+    out
+}
+
+/// The `Refs` lines of a PR body that hold an Issue number `refs_refs` does
+/// not read, so that a list is never read in part without a message.
+fn check_refs_unread(pat: &Patterns, body: &str) -> Vec<Diag>
+{
+    let read = refs_refs(pat, body);
+    let mut out = Vec::new();
+    for (index, line) in body.lines().enumerate()
+    {
+        let number = index.saturating_add(1);
+        // Only a line that holds a `Refs` list: the word alone (a rule name
+        // such as `pr-refs-rolling`, a `refs/heads/` path, `Refs` in prose)
+        // starts none, and its numbers are prose.
+        let Some(list) = pat.refs_ref.find(line)
+        else
+        {
+            continue;
+        };
+        // A `#N` of this repository after the list's start that the list did
+        // not take: the list ended before it, at text between the numbers. A
+        // number before the list is prose, which no list could hold.
+        let unread: Vec<String> = pat
+            .issue_ref
+            .captures_iter(line)
+            .filter(|found| found.get(0).is_some_and(|all| all.start() >= list.start()))
+            .filter(|found| found.get(1).is_none() && found.get(3).is_none())
+            .filter_map(|found| found.get(2)?.as_str().parse::<u64>().ok())
+            .filter(|issue| !read.iter().any(|r| r.line == number && r.issue == *issue))
+            .map(|issue| format!("#{issue}"))
+            .collect();
+        if !unread.is_empty()
+        {
+            out.push(Diag::warning(
+                "pr-refs-unread",
+                format!("body:{number}"),
+                format!(
+                    "{} on this `Refs` line is not read as a referenced Issue: a `Refs` list \
+                     ends at anything but a comma, `and`, or spaces; give it its own `Refs`, \
+                     or reword the line",
+                    unread.join(", ")
+                ),
+            ));
+        }
     }
     out
 }
@@ -1258,6 +1337,15 @@ pub struct Issue
     pub title: String,
     pub body: String,
     pub milestone: Option<String>,
+    /// GitHub reports the Issue closed.
+    pub closed: bool,
+}
+
+/// Whether `title` is a rolling follow-up Issue's (docs/conventions.md
+/// § Follow-up Issues).
+pub fn is_rolling(title: &str) -> bool
+{
+    title.trim_end().ends_with(ROLLING_TITLE_SUFFIX)
 }
 
 fn version_of(title: &str) -> Option<(u64, u64, u64)>
@@ -1285,7 +1373,7 @@ pub fn check_closed_issue(issue: &Issue, current: Option<&str>) -> Vec<Diag>
 {
     let at = format!("#{}", issue.number);
     let mut out = Vec::new();
-    if issue.title.trim_end().ends_with(ROLLING_TITLE_SUFFIX)
+    if is_rolling(&issue.title)
     {
         out.push(Diag::error(
             "pr-closes-rolling",
@@ -1319,6 +1407,48 @@ pub fn check_closed_issue(issue: &Issue, current: Option<&str>) -> Vec<Diag>
             format!(
                 "the PR closes it under milestone {}; the current milestone is {want}",
                 issue.milestone.as_deref().unwrap_or("none")
+            ),
+        ));
+    }
+    out
+}
+
+/// Check a rolling follow-up Issue the PR references with `Refs`: it is the
+/// rolling Issue of its scope in the current milestone, open and carrying
+/// that milestone. A rolling Issue belongs to one milestone and closes with
+/// its release (docs/conventions.md § Follow-up Issues), so one of an
+/// earlier milestone, which carries the same title, is not the one to name.
+/// Empty for any other Issue, and for the milestone part when no versioned
+/// milestone is open.
+pub fn check_rolling_issue(issue: &Issue, current: Option<&str>) -> Vec<Diag>
+{
+    if !is_rolling(&issue.title)
+    {
+        return Vec::new();
+    }
+    let at = format!("#{}", issue.number);
+    let held = issue.milestone.as_deref().unwrap_or("none");
+    let mut out = Vec::new();
+    if issue.closed
+    {
+        out.push(Diag::error(
+            "pr-refs-rolling",
+            &at,
+            format!(
+                "the rolling follow-up Issue is closed (milestone {held}); name the open rolling \
+                 Issue of its scope in the current milestone, which holds its carried items"
+            ),
+        ));
+    }
+    else if let Some(want) = current
+        && issue.milestone.as_deref() != Some(want)
+    {
+        out.push(Diag::error(
+            "pr-refs-rolling",
+            &at,
+            format!(
+                "the rolling follow-up Issue carries milestone {held}; the rolling Issue of a \
+                 scope is the one of the current milestone, {want}"
             ),
         ));
     }
@@ -1366,6 +1496,7 @@ fn issue_from(value: &Value) -> Issue
             .and_then(|m| m.get("title"))
             .and_then(Value::as_str)
             .map(str::to_owned),
+        closed: value.get("state").and_then(Value::as_str) == Some("CLOSED"),
     }
 }
 
@@ -1456,8 +1587,21 @@ fn check_issues(
         );
     }
 
-    let mut out = Vec::new();
-    let current = if closed.is_empty()
+    let closed_issues = closed
+        .iter()
+        .map(|number| Ok(issue_from(&gh::issue(root, *number)?)))
+        .collect::<Result<Vec<Issue>>>()?;
+    let referenced_issues = referenced
+        .iter()
+        .filter(|n| !closed.contains(n))
+        .map(|number| Ok(issue_from(&gh::issue(root, *number)?)))
+        .collect::<Result<Vec<Issue>>>()?;
+    // The milestones are read only when an Issue needs the current one: one
+    // the PR closes, or a rolling Issue it references.
+    let current = if closed_issues.is_empty()
+        && !referenced_issues
+            .iter()
+            .any(|issue| is_rolling(&issue.title))
     {
         None
     }
@@ -1465,16 +1609,16 @@ fn check_issues(
     {
         current_milestone(&gh::open_milestones(root)?)
     };
-    for number in &closed
+    let mut out = Vec::new();
+    for issue in &closed_issues
     {
-        let issue = issue_from(&gh::issue(root, *number)?);
-        out.extend(check_closed_issue(&issue, current.as_deref()));
-        out.extend(check_referenced_issue(&issue, pr));
+        out.extend(check_closed_issue(issue, current.as_deref()));
+        out.extend(check_referenced_issue(issue, pr));
     }
-    for number in referenced.iter().filter(|n| !closed.contains(n))
+    for issue in &referenced_issues
     {
-        let issue = issue_from(&gh::issue(root, *number)?);
-        out.extend(check_referenced_issue(&issue, pr));
+        out.extend(check_rolling_issue(issue, current.as_deref()));
+        out.extend(check_referenced_issue(issue, pr));
     }
     Ok(out)
 }
@@ -1815,6 +1959,62 @@ mod tests
         // cannot read, and `prefs` only ends in the word.
         assert_eq!(found("Refs owner/repo#8"), [] as [u64; 0]);
         assert_eq!(found("prefs #9"), [] as [u64; 0]);
+    }
+
+    #[test]
+    fn a_refs_list_after_one_keyword_names_every_issue()
+    {
+        let p = pat();
+        let found =
+            |text: &str| -> Vec<u64> { refs_refs(&p, text).iter().map(|r| r.issue).collect() };
+        assert_eq!(found("Refs #12, #34"), [12, 34]);
+        assert_eq!(found("Refs: #1,#2, and #3"), [1, 2, 3]);
+        assert_eq!(found("refs #4 and #5 #6"), [4, 5, 6]);
+        // The list ends at anything else: another repository's reference,
+        // a word, or the end of the line.
+        assert_eq!(found("Refs #7, owner/repo#8, #9"), [7]);
+        assert_eq!(found("Refs #7 and then #9"), [7]);
+        assert_eq!(found("Refs #7,\n#9 is another"), [7]);
+        // Each number keeps its own line.
+        let refs = refs_refs(&p, "Summary\n\nRefs #12, #34\n");
+        assert_eq!(
+            refs.iter().map(|r| (r.issue, r.line)).collect::<Vec<_>>(),
+            [(12, 3), (34, 3)]
+        );
+        // The callers read the whole list: closing the second Issue of a
+        // `Refs` list is the same contradiction as closing a lone one.
+        let body = BODY.replace("Refs #11", "Refs #11, #10");
+        assert_eq!(rules(&check_body(&p, &body)), ["pr-closes-and-refs"]);
+    }
+
+    #[test]
+    fn a_refs_line_read_in_part_is_reported()
+    {
+        let p = pat();
+        // Text between two numbers ends the list: the second is named.
+        for line in ["Refs #11 (items 2 and 3), #12", "Refs #11; #12"]
+        {
+            let body = BODY.replace("Refs #11", line);
+            let diags = check_body(&p, &body);
+            assert_eq!(rules(&diags), ["pr-refs-unread"], "{line}");
+            assert_eq!(diags[0].at, "body:5");
+            assert!(diags[0].message.contains("#12"), "{}", diags[0].message);
+        }
+        // A list read in full, another repository's reference, which `Refs`
+        // never reads, and a number in prose before the keyword pass.
+        for line in [
+            "Refs #11, #12 and #13",
+            "Refs #11, owner/repo#12",
+            "Refs #11\n\n**#12, `Refs` lists.** Prose.",
+            // The word with no list after it: a rule name, a path, prose.
+            "Refs #11\n\n- [x] `pr-refs-rolling` reports a rolling Issue (#12)",
+            "Refs #11\n\npushed to refs/heads/master (#12)",
+            "Refs #11\n\n`Refs` lists are read in full (#12)",
+        ]
+        {
+            let body = BODY.replace("Refs #11", line);
+            assert_eq!(check_body(&p, &body), [] as [Diag; 0], "{line}");
+        }
     }
 
     #[test]
@@ -2665,6 +2865,7 @@ mod tests
             title: title.into(),
             body: body.into(),
             milestone: milestone.map(str::to_owned),
+            closed: false,
         }
     }
 
@@ -2722,6 +2923,33 @@ mod tests
             rules(&check_closed_issue(&rolling, Some("v0.1.3"))),
             ["pr-closes-rolling"]
         );
+    }
+
+    #[test]
+    fn a_referenced_rolling_issue_is_the_open_one_of_the_current_milestone()
+    {
+        let title = "xtask: defects found by review";
+        let current = Some("v0.1.5");
+        // The open rolling Issue of the current milestone passes.
+        assert_eq!(
+            check_rolling_issue(&issue(title, "", current), current),
+            [] as [Diag; 0]
+        );
+        // The closed one of the release before, which carries the same
+        // title, is not the scope's rolling Issue any more.
+        let mut earlier = issue(title, "", Some("v0.1.4"));
+        earlier.closed = true;
+        let found = check_rolling_issue(&earlier, current);
+        assert_eq!(rules(&found), ["pr-refs-rolling"]);
+        assert!(found[0].message.contains("closed"), "{}", found[0].message);
+        // An open one of another milestone is refused as well.
+        let found = check_rolling_issue(&issue(title, "", Some("v0.1.4")), current);
+        assert_eq!(rules(&found), ["pr-refs-rolling"]);
+        assert!(found[0].message.contains("v0.1.5"), "{}", found[0].message);
+        // Any other Issue is not compared, whatever its state or milestone.
+        let mut other = issue("xtask: a", "", Some("v0.1.4"));
+        other.closed = true;
+        assert_eq!(check_rolling_issue(&other, current), [] as [Diag; 0]);
     }
 
     #[test]

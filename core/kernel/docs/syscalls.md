@@ -1618,10 +1618,11 @@ bound, and otherwise takes the unhandled outcome; on `FAULT_REPLY_REDIRECT` it d
 the endpoint the reply named, or takes the unhandled outcome when the reply named none (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). A target blocked in an upcall delivery (`FAULT_KIND_UPCALL`) is killed in
-neither case: a stop that cancels the delivery drops the upcall, any reply that claimed it first
-settles it (a redirect that named an endpoint by delivering the upcall there when the thread is
-next started), and the thread resumes at its registers when next started (for a delivery at the
-syscall point, its syscall returns its own result;
+neither case: a stop that cancels the delivery drops the upcall, and any other reply that claimed
+it first settles it, so the thread resumes at its registers when next started; after a
+`FAULT_REPLY_REDIRECT` that named an endpoint, the start delivers the upcall there instead, and the
+thread stays fault-blocked until that endpoint's reply disposes of it, then resumes at its
+registers (for a delivery at the syscall point, its syscall returns its own result;
 [docs/fault-handling.md](../../../docs/fault-handling.md#asynchronous-upcalls) § Asynchronous
 Upcalls). If the thread is blocked (on IPC or in `SYS_THREAD_SLEEP`), the block is
 cancelled (the blocked syscall on the target thread returns `Interrupted`, unless a genuine waker

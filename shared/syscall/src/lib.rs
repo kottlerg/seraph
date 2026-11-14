@@ -2401,9 +2401,12 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// outcome; on `FAULT_REPLY_REDIRECT` it delivers the fault to the endpoint
 /// the reply named, or takes the kill outcome when it named none, as
 /// [`thread_start`] says (docs/fault-handling.md § Delivery, Resume, and
-/// Kill). A thread blocked in an upcall delivery is never killed: whatever
-/// the outcome, the upcall is settled or dropped and the start resumes the
-/// thread at its registers (docs/fault-handling.md § Asynchronous Upcalls).
+/// Kill). A thread blocked in an upcall delivery is never killed: the upcall
+/// is settled or dropped and the start resumes the thread at its registers,
+/// except after a `FAULT_REPLY_REDIRECT` that named an endpoint, when the
+/// start delivers the upcall there and the thread stays fault-blocked until
+/// that endpoint's reply disposes of it (docs/fault-handling.md
+/// § Asynchronous Upcalls).
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object

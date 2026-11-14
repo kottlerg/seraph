@@ -5,7 +5,7 @@
 
 //! memmgr's whole bookkeeping state: the arena, the free pool over it, the
 //! deferred list beside it, and the process index, with the per-process frame
-//! and region list operations.
+//! and region list operations and the chunk tables of the regions.
 //!
 //! A [`Ledger`] owns no global state and is mutated only through `&mut`, so
 //! the service holds one instance today and a sharded pager can hold one per
@@ -21,12 +21,16 @@
 //! (`services/memmgr/docs/memory-pool.md` § Reclamation).
 
 use crate::arena::{
-    Arena, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord, Slot, SlotStore,
+    Arena, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord, RegionNode, Slot,
+    SlotStore,
 };
+use crate::chunk::{self, ChunkEntry, ChunkError};
 use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
-use crate::{DemandRegion, FreeRun, region_contains, regions_overlap};
+use crate::{
+    DemandRegion, FreeRun, chunk_count, chunk_for, chunk_index, region_contains, regions_overlap,
+};
 
 use syscall_abi::PAGE_SIZE;
 
@@ -40,6 +44,22 @@ pub enum RegionError
     NoSlot,
     /// The record slot named holds no process record.
     NoRecord,
+}
+
+/// Why [`Ledger::back_chunk`] recorded no run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackError
+{
+    /// The slot named holds no region.
+    NoRegion,
+    /// The run is not page-aligned or does not lie inside the region.
+    Outside,
+    /// The arena has fewer free slots outside its reserve than the run's
+    /// descriptor and the chunk's path in the table need
+    /// ([`Ledger::back_slots`]).
+    NoSlot,
+    /// The chunk's entry refused the run ([`ChunkEntry::back`]).
+    Chunk(ChunkError),
 }
 
 /// How many matching frames [`Ledger::return_frames_where`] moves.
@@ -89,7 +109,27 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         match self.arena.get(rec).node
         {
             Node::Process(r) => Some(r),
-            Node::Free | Node::Run(_) | Node::Region(_) | Node::Frame(_) => None,
+            Node::Free
+            | Node::Run(_)
+            | Node::Region(_)
+            | Node::Frame(_)
+            | Node::ChunkDir(_)
+            | Node::Chunk(_) => None,
+        }
+    }
+
+    /// The region node in slot `reg`.
+    fn region_node(&self, reg: NodeIdx) -> Option<RegionNode>
+    {
+        match self.arena.get(reg).node
+        {
+            Node::Region(r) => Some(r),
+            Node::Free
+            | Node::Run(_)
+            | Node::Frame(_)
+            | Node::Process(_)
+            | Node::ChunkDir(_)
+            | Node::Chunk(_) => None,
         }
     }
 
@@ -215,7 +255,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Some(f)
     }
 
-    /// Register a demand-paged region on `rec`, rejecting overlap.
+    /// Register a demand-paged region on `rec`, rejecting overlap. Its chunk
+    /// table starts empty.
     ///
     /// # Errors
     /// [`RegionError::Overlap`], [`RegionError::NoSlot`], or
@@ -228,99 +269,179 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(RegionError::NoRecord);
         };
         let mut cur = r.region_head;
-        while let Node::Region(have) = self.arena.get(cur).node
+        while let Some(have) = self.region_node(cur)
         {
-            if regions_overlap(region.va_base, region.len, have.va_base, have.len)
+            if regions_overlap(
+                region.va_base,
+                region.len,
+                have.region.va_base,
+                have.region.len,
+            )
             {
                 return Err(RegionError::Overlap);
             }
             cur = self.arena.get(cur).next;
         }
+        let node = RegionNode {
+            region,
+            table: NODE_NULL,
+        };
         let idx = self
             .arena
-            .alloc(Node::Region(region), r.region_head)
+            .alloc(Node::Region(node), r.region_head)
             .ok_or(RegionError::NoSlot)?;
         r.region_head = idx;
         self.set_record(rec, r);
         Ok(())
     }
 
-    /// The region of `rec` containing `va`.
+    /// The region of `rec` containing `va`, with its slot, which names it to
+    /// the chunk-table operations.
     #[must_use]
-    pub fn region_for(&self, rec: NodeIdx, va: u64) -> Option<DemandRegion>
+    pub fn region_for(&self, rec: NodeIdx, va: u64) -> Option<(NodeIdx, DemandRegion)>
     {
         let mut cur = self.record(rec)?.region_head;
-        while let Node::Region(have) = self.arena.get(cur).node
+        while let Some(have) = self.region_node(cur)
         {
-            if region_contains(have.va_base, have.len, va)
+            if region_contains(have.region.va_base, have.region.len, va)
             {
-                return Some(have);
+                return Some((cur, have.region));
             }
             cur = self.arena.get(cur).next;
         }
         None
     }
 
-    /// The unbacked span of `[lo, hi)` around `page_base` on `rec`: `None`
-    /// when a frame memmgr mapped (`va != unmapped`) already covers
-    /// `page_base`, else `[start, end)`, the largest span within `[lo, hi)`
-    /// that holds `page_base` and no page of a mapped frame. `page_base` lies
-    /// in `[lo, hi)`. A demand fault backs a window of this span, so a chunk a
-    /// fragmented pool backed in parts is completed without mapping over a
-    /// part already backed.
+    /// The slot of the region of `rec` exactly matching `[va_base, va_base +
+    /// len)`.
     #[must_use]
-    pub fn unbacked_span(
-        &self,
-        rec: NodeIdx,
-        page_base: u64,
-        lo: u64,
-        hi: u64,
-        unmapped: u64,
-    ) -> Option<(u64, u64)>
+    pub fn region_exact(&self, rec: NodeIdx, va_base: u64, len: u64) -> Option<NodeIdx>
     {
-        let (mut start, mut end) = (lo, hi);
-        let Some(r) = self.record(rec)
-        else
+        let mut cur = self.record(rec)?.region_head;
+        while let Some(have) = self.region_node(cur)
         {
-            return Some((start, end));
-        };
-        let mut cur = r.frame_head;
-        while let Node::Frame(f) = self.arena.get(cur).node
-        {
+            if have.region.va_base == va_base && have.region.len == len
+            {
+                return Some(cur);
+            }
             cur = self.arena.get(cur).next;
-            if f.va == unmapped
-            {
-                continue;
-            }
-            let f_end =
-                f.va.saturating_add(u64::from(f.page_count).saturating_mul(PAGE_SIZE));
-            if f_end <= page_base
-            {
-                start = start.max(f_end);
-            }
-            else if f.va > page_base
-            {
-                end = end.min(f.va);
-            }
-            else
-            {
-                return None;
-            }
         }
-        Some((start, end))
+        None
     }
 
-    /// Remove the region of `rec` exactly matching `[va_base, va_base +
-    /// len)`, freeing its slot.
-    pub fn remove_region(&mut self, rec: NodeIdx, va_base: u64, len: u64) -> Option<DemandRegion>
+    /// The entry of the chunk of region `reg` holding `page_base`, which lies
+    /// in the region: [`ChunkEntry::UNBACKED`] when the chunk has no entry, or
+    /// when `reg` holds no region. Reads the region's slot and the chunk's
+    /// path in its table, never a run.
+    #[must_use]
+    pub fn chunk_at(&self, reg: NodeIdx, page_base: u64) -> ChunkEntry
+    {
+        self.region_node(reg).map_or(ChunkEntry::UNBACKED, |node| {
+            chunk::entry(
+                &self.arena,
+                node.table,
+                chunk::table_height(chunk_count(&node.region)),
+                chunk_index(&node.region, page_base),
+            )
+        })
+    }
+
+    /// Free slots outside the arena's reserve that [`Ledger::back_chunk`]
+    /// needs for a run of the chunk of region `reg` holding `page_base`: one
+    /// for the run's descriptor, and one for each node of the chunk's path in
+    /// the table that does not exist yet.
+    #[must_use]
+    pub fn back_slots(&self, reg: NodeIdx, page_base: u64) -> u64
+    {
+        let path = self.region_node(reg).map_or(0, |node| {
+            chunk::missing_slots(
+                &self.arena,
+                node.table,
+                chunk::table_height(chunk_count(&node.region)),
+                chunk_index(&node.region, page_base),
+            )
+        });
+        path.saturating_add(1)
+    }
+
+    /// Record `frame`, a run memmgr mapped at `frame.va` in region `reg`, on
+    /// the run list of the chunk holding it, and mark its pages backed in the
+    /// chunk's entry ([`ChunkEntry::back`]). Either all of it is recorded or
+    /// nothing changes.
+    ///
+    /// # Errors
+    /// [`BackError::NoRegion`] when `reg` holds no region,
+    /// [`BackError::Outside`] when the run is unaligned or leaves the region,
+    /// [`BackError::Chunk`] when the chunk's entry refuses the run (it leaves
+    /// the chunk, covers a backed page, or the chunk is evicting or swapped),
+    /// and [`BackError::NoSlot`] when the arena has fewer free slots than
+    /// [`Ledger::back_slots`].
+    pub fn back_chunk(&mut self, reg: NodeIdx, frame: FrameDesc) -> Result<(), BackError>
+    {
+        let mut node = self.region_node(reg).ok_or(BackError::NoRegion)?;
+        let region = node.region;
+        let end = u64::from(frame.page_count)
+            .checked_mul(PAGE_SIZE)
+            .and_then(|bytes| frame.va.checked_add(bytes))
+            .ok_or(BackError::Outside)?;
+        if !frame.va.is_multiple_of(PAGE_SIZE)
+            || frame.va < region.va_base
+            || end > region.va_base.saturating_add(region.len)
+        {
+            return Err(BackError::Outside);
+        }
+        let (chunk_base, _) = chunk_for(&region, frame.va);
+        // The run starts in its chunk, so its page offset is below the chunk's
+        // `DEMAND_CHUNK_PAGES` pages.
+        let first = u32::try_from(frame.va.saturating_sub(chunk_base) / PAGE_SIZE)
+            .map_err(|_| BackError::Outside)?;
+        let height = chunk::table_height(chunk_count(&region));
+        let index = chunk_index(&region, frame.va);
+        let entry = chunk::entry(&self.arena, node.table, height, index);
+        // Refuse the run before taking any slot, so a refusal changes nothing.
+        entry
+            .back(first, frame.page_count, NODE_NULL)
+            .map_err(BackError::Chunk)?;
+        let path = chunk::missing_slots(&self.arena, node.table, height, index);
+        if self.arena.available() < path.saturating_add(1)
+        {
+            return Err(BackError::NoSlot);
+        }
+        let run = self
+            .arena
+            .alloc(Node::Frame(frame), entry.runs())
+            .ok_or(BackError::NoSlot)?;
+        let backed = entry
+            .back(first, frame.page_count, run)
+            .map_err(BackError::Chunk)?;
+        if !chunk::set_entry(&mut self.arena, &mut node.table, height, index, backed)
+        {
+            self.arena.free(run);
+            return Err(BackError::NoSlot);
+        }
+        self.arena.set_node(reg, Node::Region(node));
+        Ok(())
+    }
+
+    /// Unlink the region in slot `reg` from `rec`'s region list and free its
+    /// slot and its chunk table, taking each run of the table back, pooled or
+    /// deferred as `quiescent` decides. memmgr unmaps the region first, so the
+    /// region's own mappings do not keep a run deferred. Returns the region,
+    /// or `None`, changing nothing, when `reg` is not one of `rec`'s regions.
+    pub fn remove_region(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Option<DemandRegion>
     {
         let mut r = self.record(rec)?;
         let mut prev = NODE_NULL;
         let mut cur = r.region_head;
-        while let Node::Region(have) = self.arena.get(cur).node
+        while let Some(have) = self.region_node(cur)
         {
             let next = self.arena.get(cur).next;
-            if have.va_base == va_base && have.len == len
+            if cur == reg
             {
                 if prev == NODE_NULL
                 {
@@ -331,8 +452,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 {
                     self.arena.set_next(prev, next);
                 }
+                self.release_table(have.table, quiescent);
                 self.arena.free(cur);
-                return Some(have);
+                return Some(have.region);
             }
             prev = cur;
             cur = next;
@@ -340,11 +462,24 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         None
     }
 
-    /// Take every frame of `rec` that `pick` selects off the record,
-    /// rewriting each frame slot into a run slot in place, so the move needs
-    /// no fresh slot and cannot fail: into the free pool when `quiescent`
-    /// accepts the run, else onto the deferred list. Returns how many frames
-    /// moved.
+    /// Free every node of the chunk table at `root`, taking each run back,
+    /// pooled or deferred as `quiescent` decides ([`retire`]).
+    fn release_table(&mut self, root: NodeIdx, mut quiescent: impl FnMut(&FreeRun) -> bool)
+    {
+        let Self {
+            arena,
+            pool,
+            deferred,
+            ..
+        } = self;
+        chunk::release(arena, root, |arena, idx, frame| {
+            retire(arena, pool, deferred, idx, &frame, &mut quiescent);
+        });
+    }
+
+    /// Take every frame of `rec`'s frame list that `pick` selects off the
+    /// list, pooled or deferred as `quiescent` decides ([`retire`]). Returns
+    /// how many frames moved.
     fn return_frames_where(
         &mut self,
         rec: NodeIdx,
@@ -378,26 +513,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             {
                 self.arena.set_next(prev, next);
             }
-            let run = FreeRun {
-                cap_slot: f.cap_slot,
-                page_count: u64::from(f.page_count),
-                phys_base: f.phys_base,
-            };
-            self.arena.set(
+            retire(
+                &mut self.arena,
+                &mut self.pool,
+                &mut self.deferred,
                 cur,
-                Slot {
-                    node: Node::Run(run),
-                    next: NODE_NULL,
-                },
+                &f,
+                &mut quiescent,
             );
-            if quiescent(&run)
-            {
-                self.pool.push_node(&mut self.arena, cur);
-            }
-            else
-            {
-                self.deferred.park(&mut self.arena, cur);
-            }
             // Each pass moves one frame descriptor, so `moved` is below the slot count.
             moved = moved.saturating_add(1);
             if take == Take::First
@@ -425,39 +548,22 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 == 1
     }
 
-    /// Take back every frame of `rec` memmgr mapped at a page base in `[base,
-    /// end)`, pooled or deferred as `quiescent` decides.
-    pub fn return_frames_in(
-        &mut self,
-        rec: NodeIdx,
-        base: u64,
-        end: u64,
-        unmapped: u64,
-        quiescent: impl FnMut(&FreeRun) -> bool,
-    )
+    /// Take back every frame of `rec`, on its frame list and in its regions'
+    /// chunk tables, pooled or deferred as `quiescent` decides, and free every
+    /// region slot and table node, leaving both lists empty.
+    pub fn reclaim_all(&mut self, rec: NodeIdx, mut quiescent: impl FnMut(&FreeRun) -> bool)
     {
-        self.return_frames_where(
-            rec,
-            |f| f.va != unmapped && f.va >= base && f.va < end,
-            Take::Every,
-            quiescent,
-        );
-    }
-
-    /// Take back every frame of `rec`, pooled or deferred as `quiescent`
-    /// decides, and free every region slot, leaving both lists empty.
-    pub fn reclaim_all(&mut self, rec: NodeIdx, quiescent: impl FnMut(&FreeRun) -> bool)
-    {
-        self.return_frames_where(rec, |_| true, Take::Every, quiescent);
+        self.return_frames_where(rec, |_| true, Take::Every, &mut quiescent);
         let Some(mut r) = self.record(rec)
         else
         {
             return;
         };
         let mut cur = r.region_head;
-        while let Node::Region(_) = self.arena.get(cur).node
+        while let Some(have) = self.region_node(cur)
         {
             let next = self.arena.get(cur).next;
+            self.release_table(have.table, &mut quiescent);
             self.arena.free(cur);
             cur = next;
         }
@@ -480,11 +586,46 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 }
 
+/// Rewrite the frame slot `idx`, holding `frame`, into a run slot in place and
+/// move it into `pool` when `quiescent` accepts the run, else onto `deferred`.
+/// The move needs no fresh slot, so it cannot fail.
+fn retire<S: SlotStore>(
+    arena: &mut Arena<S>,
+    pool: &mut FreePool,
+    deferred: &mut DeferredList,
+    idx: NodeIdx,
+    frame: &FrameDesc,
+    quiescent: &mut impl FnMut(&FreeRun) -> bool,
+)
+{
+    let run = FreeRun {
+        cap_slot: frame.cap_slot,
+        page_count: u64::from(frame.page_count),
+        phys_base: frame.phys_base,
+    };
+    arena.set(
+        idx,
+        Slot {
+            node: Node::Run(run),
+            next: NODE_NULL,
+        },
+    );
+    if quiescent(&run)
+    {
+        pool.push_node(arena, idx);
+    }
+    else
+    {
+        deferred.park(arena, idx);
+    }
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
     use crate::arena::test_store::VecStore;
+    use crate::chunk::ChunkState;
 
     const UNMAPPED: u64 = u64::MAX;
 
@@ -682,29 +823,7 @@ mod tests
     }
 
     #[test]
-    fn return_frames_in_reclaims_only_mapped_frames_inside_the_span()
-    {
-        let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
-        assert!(l.push_frame(rec, frame(1, 16, 0x10000, 0x40_0000)));
-        assert!(l.push_frame(rec, frame(2, 16, 0x20000, 0x41_0000)));
-        assert!(l.push_frame(rec, frame(3, 16, 0x30000, 0x80_0000)));
-        assert!(l.push_frame(rec, frame(4, 1, 0x40000, UNMAPPED)));
-        l.return_frames_in(rec, 0x40_0000, 0x42_0000, UNMAPPED, pool_all);
-        assert_eq!(l.pool.free_pages(), 32);
-        // The frame outside the span stays backed; the span's pages are not.
-        assert_eq!(
-            l.unbacked_span(rec, 0x80_0000, 0x80_0000, 0x81_0000, UNMAPPED),
-            None
-        );
-        assert_eq!(
-            l.unbacked_span(rec, 0x40_0000, 0x40_0000, 0x41_0000, UNMAPPED),
-            Some((0x40_0000, 0x41_0000))
-        );
-    }
-
-    #[test]
-    fn add_region_rejects_overlap_and_remove_region_needs_an_exact_match()
+    fn add_region_rejects_overlap_and_region_exact_needs_an_exact_match()
     {
         let mut l = ledger();
         let rec = l.insert_process(1).unwrap();
@@ -714,44 +833,225 @@ mod tests
             Err(RegionError::Overlap)
         );
         l.add_region(rec, region(0x3000, 0x1000)).unwrap();
-        assert_eq!(l.region_for(rec, 0x3800).map(|r| r.va_base), Some(0x3000));
-        assert!(l.remove_region(rec, 0x1000, 0x1000).is_none());
-        assert!(l.remove_region(rec, 0x3000, 0x1000).is_some());
+        let (reg, found) = l.region_for(rec, 0x3800).unwrap();
+        assert_eq!(found.va_base, 0x3000);
+        assert_eq!(l.region_exact(rec, 0x3000, 0x1000), Some(reg));
+        assert!(l.region_exact(rec, 0x1000, 0x1000).is_none());
+        assert!(l.remove_region(rec, reg, pool_all).is_some());
+        assert!(l.remove_region(rec, reg, pool_all).is_none());
         assert!(l.region_for(rec, 0x3800).is_none());
         assert!(l.region_for(rec, 0x1000).is_some());
     }
 
-    #[test]
-    fn unbacked_span_ignores_caller_owned_grants()
+    /// The base of the region [`backed_ledger`] registers.
+    const BASE: u64 = 0x100_0000;
+    const CHUNK: u64 = crate::CHUNK_BYTES;
+
+    /// A ledger, the free slot count before its record was added, its record
+    /// holding a grant and a region of 64 chunks at `BASE` (a table of three
+    /// directory levels), and the region's slot. Chunk 0 is backed by two
+    /// runs and chunk 63 in part by one.
+    fn backed_ledger() -> (Ledger<VecStore, VecWords>, u64, NodeIdx, NodeIdx)
     {
         let mut l = ledger();
+        // SAFETY: VecStore grows on write.
+        unsafe { l.arena.add_page() };
+        let free = l.arena.free_count();
         let rec = l.insert_process(1).unwrap();
-        assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
-        assert_eq!(
-            l.unbacked_span(rec, 0x1000, 0x1000, 0x5000, UNMAPPED),
-            Some((0x1000, 0x5000))
-        );
+        l.push_grant(rec, 9, 2, 0x9_0000, UNMAPPED).unwrap();
+        l.add_region(rec, region(BASE, 64 * CHUNK)).unwrap();
+        let reg = l.region_exact(rec, BASE, 64 * CHUNK).unwrap();
+        l.back_chunk(reg, frame(1, 4, 0x1_0000, BASE)).unwrap();
+        l.back_chunk(reg, frame(2, 12, 0x2_0000, BASE + 4 * PAGE_SIZE))
+            .unwrap();
+        l.back_chunk(reg, frame(3, 3, 0x3_0000, BASE + 63 * CHUNK + PAGE_SIZE))
+            .unwrap();
+        (l, free, rec, reg)
     }
 
     #[test]
-    fn unbacked_span_is_none_on_a_backed_page_and_bounded_by_backed_frames()
+    fn back_chunk_marks_each_run_in_its_chunk_entry_only()
     {
-        // Chunk [0x10000, 0x20000): pages 0x12000..0x14000 and 0x18000..0x19000
-        // backed, plus a frame outside the chunk that must not narrow it.
-        let mut l = ledger();
+        let (l, _, _, reg) = backed_ledger();
+        let first = l.chunk_at(reg, BASE + 5 * PAGE_SIZE);
+        assert_eq!(first.state(), ChunkState::Resident);
+        assert_eq!(first.backed(), 0xFFFF);
+        let last = l.chunk_at(reg, BASE + 63 * CHUNK);
+        assert_eq!(last.backed(), 0b1110);
+        // The span a fault on the last chunk backs stops at the run.
+        assert_eq!(last.unbacked_span(0, 16), Some((0, 1)));
+        assert_eq!(last.unbacked_span(9, 16), Some((4, 16)));
+        assert_eq!(l.chunk_at(reg, BASE + 7 * CHUNK), ChunkEntry::UNBACKED);
+        assert_eq!(l.chunk_at(NODE_NULL, BASE), ChunkEntry::UNBACKED);
+        // The two runs of chunk 0 are on its run list, newest first.
+        let head = l.arena.get(first.runs());
+        assert!(matches!(head.node, Node::Frame(f) if f.cap_slot == 2));
+        assert!(matches!(l.arena.get(head.next).node, Node::Frame(f) if f.cap_slot == 1));
+        assert_eq!(l.arena.get(head.next).next, NODE_NULL);
+    }
+
+    #[test]
+    fn back_chunk_refuses_an_overlap_a_run_outside_and_a_full_arena_unchanged()
+    {
+        let (mut l, _, rec, reg) = backed_ledger();
+        let free = l.arena.free_count();
+        let before = l.chunk_at(reg, BASE + 63 * CHUNK);
+        let at = |va| frame(4, 1, 0x4_0000, va);
+        assert_eq!(
+            l.back_chunk(reg, at(BASE + 63 * CHUNK + 2 * PAGE_SIZE)),
+            Err(BackError::Chunk(ChunkError::Window))
+        );
+        // A run crossing into the next chunk leaves its own.
+        assert_eq!(
+            l.back_chunk(reg, frame(4, 2, 0x4_0000, BASE + 63 * CHUNK - PAGE_SIZE)),
+            Err(BackError::Chunk(ChunkError::Window))
+        );
+        assert_eq!(
+            l.back_chunk(reg, at(BASE + 64 * CHUNK)),
+            Err(BackError::Outside)
+        );
+        assert_eq!(
+            l.back_chunk(reg, at(BASE - PAGE_SIZE)),
+            Err(BackError::Outside)
+        );
+        assert_eq!(l.back_chunk(reg, at(BASE + 0x800)), Err(BackError::Outside));
+        assert_eq!(l.back_chunk(rec, at(BASE)), Err(BackError::NoRegion));
+        assert_eq!(l.arena.free_count(), free);
+        // Chunk 40 lies under another child of the root: it needs two
+        // directory nodes, its leaf, and the run's slot. Chunk 63 has its
+        // path and needs only the run's.
+        let far = BASE + 40 * CHUNK;
+        assert_eq!(l.back_slots(reg, far), 4);
+        assert_eq!(l.back_slots(reg, BASE + 63 * CHUNK), 1);
+        let taken = fill_arena_but(&mut l, 3);
+        assert_eq!(l.back_chunk(reg, at(far)), Err(BackError::NoSlot));
+        assert_eq!(l.arena.free_count(), 3);
+        assert_eq!(l.chunk_at(reg, far), ChunkEntry::UNBACKED);
+        assert_eq!(l.chunk_at(reg, BASE + 63 * CHUNK), before);
+        // One more free slot is enough.
+        l.arena.free(taken[0]);
+        l.back_chunk(reg, at(far)).unwrap();
+        assert_eq!(l.arena.free_count(), 0);
+        assert_eq!(l.chunk_at(reg, far).backed(), 1);
+    }
+
+    #[test]
+    fn remove_region_returns_every_run_of_its_table_and_frees_every_slot()
+    {
+        let (mut l, _, rec, reg) = backed_ledger();
+        let free = l.arena.free_count();
+        // A run the check refuses waits on the deferred list.
+        let gone = l.remove_region(rec, reg, |r| r.cap_slot != 3).unwrap();
+        assert_eq!(gone.va_base, BASE);
+        assert_eq!((l.pool.free_pages(), l.pool.run_count()), (16, 2));
+        assert_eq!((l.deferred.pages(), l.deferred.run_count()), (3, 1));
+        // The three run slots became run nodes. The table's seven nodes (its
+        // root, and three below it on each chunk's path) and the region's
+        // slot are free.
+        assert_eq!(l.arena.free_count(), free + 7 + 1);
+        assert!(l.region_for(rec, BASE).is_none());
+        // The grant stays on the record.
+        assert!(l.release_frame_by_region(rec, 1, pool_all));
+    }
+
+    #[test]
+    fn remove_process_returns_the_runs_of_every_region_table()
+    {
+        let (mut l, free, _, _) = backed_ledger();
+        l.remove_process(1, pool_all).unwrap();
+        // The grant's two pages, chunk 0's sixteen, and chunk 63's three.
+        assert_eq!((l.pool.free_pages(), l.pool.run_count()), (21, 4));
+        // Only the four run slots stay taken.
+        assert_eq!(l.arena.free_count(), free - 4);
+    }
+
+    /// A slot store that counts its reads.
+    #[derive(Default)]
+    struct CountingStore
+    {
+        slots: VecStore,
+        reads: core::cell::Cell<u64>,
+    }
+
+    impl SlotStore for CountingStore
+    {
+        unsafe fn read(&self, idx: NodeIdx) -> Slot
+        {
+            self.reads.set(self.reads.get() + 1);
+            // SAFETY: the caller's contract, passed on.
+            unsafe { self.slots.read(idx) }
+        }
+
+        unsafe fn write(&mut self, idx: NodeIdx, slot: Slot)
+        {
+            // SAFETY: the caller's contract, passed on.
+            unsafe { self.slots.write(idx, slot) };
+        }
+    }
+
+    #[test]
+    fn a_chunk_lookup_reads_its_path_whatever_runs_the_process_holds()
+    {
+        let mut l = Ledger::new(CountingStore::default(), VecWords::default());
+        for _ in 0..128
+        {
+            // SAFETY: the counting store's vector grows on write.
+            unsafe { l.arena.add_page() };
+        }
+        // SAFETY: the test word store grows on write.
+        unsafe { l.index.add_page(&mut l.arena) };
         let rec = l.insert_process(1).unwrap();
-        assert!(l.push_frame(rec, frame(1, 2, 0xA_0000, 0x12000)));
-        assert!(l.push_frame(rec, frame(2, 1, 0xB_0000, 0x18000)));
-        assert!(l.push_frame(rec, frame(3, 4, 0xC_0000, 0x40000)));
-        let span = |page| l.unbacked_span(rec, page, 0x10000, 0x20000, UNMAPPED);
-        assert_eq!(span(0x12000), None);
-        assert_eq!(span(0x13000), None);
-        assert_eq!(span(0x18000), None);
-        assert_eq!(span(0x10000), Some((0x10000, 0x12000)));
-        assert_eq!(span(0x11000), Some((0x10000, 0x12000)));
-        assert_eq!(span(0x14000), Some((0x14000, 0x18000)));
-        assert_eq!(span(0x17000), Some((0x14000, 0x18000)));
-        assert_eq!(span(0x1F000), Some((0x19000, 0x20000)));
+        for i in 0..200
+        {
+            l.push_grant(rec, i, 1, i * PAGE_SIZE, UNMAPPED).unwrap();
+        }
+        // A region of 2^14 chunks: a table of seven directory levels.
+        let chunks: u64 = 1 << 14;
+        l.add_region(rec, region(BASE, chunks * CHUNK)).unwrap();
+        let reg = l.region_exact(rec, BASE, chunks * CHUNK).unwrap();
+        let height = chunk::table_height(chunks);
+        assert_eq!(height, 7);
+        // Back 1000 chunks spread over the region with one run each, and
+        // chunk 0 with sixteen.
+        for c in 0..1000
+        {
+            let va = BASE + (c * 16 + 1) * CHUNK;
+            l.back_chunk(reg, frame(c, 16, c * CHUNK, va)).unwrap();
+        }
+        for p in 0..16
+        {
+            l.back_chunk(reg, frame(p, 1, p * PAGE_SIZE, BASE + p * PAGE_SIZE))
+                .unwrap();
+        }
+        let lookup = |va: u64| {
+            let reads = l.arena.store().reads.get();
+            let entry = l.chunk_at(reg, va);
+            (entry, l.arena.store().reads.get() - reads)
+        };
+        // The region's slot, then the chunk's path from the root to its leaf.
+        let path = 1 + u64::from(height) + 1;
+        let (entry, reads) = lookup(BASE + 3 * PAGE_SIZE);
+        assert_eq!((entry.backed(), reads), (0xFFFF, path));
+        let (entry, reads) = lookup(BASE + (999 * 16 + 1) * CHUNK);
+        assert_eq!((entry.backed(), reads), (0xFFFF, path));
+        let (entry, reads) = lookup(BASE + (chunks - 1) * CHUNK);
+        assert_eq!(entry, ChunkEntry::UNBACKED);
+        assert!(reads <= path);
+    }
+
+    /// Take every free slot but `keep`, returning the slots taken.
+    fn fill_arena_but(l: &mut Ledger<VecStore, VecWords>, keep: usize) -> Vec<NodeIdx>
+    {
+        let mut taken = Vec::new();
+        while let Some(idx) = l.arena.alloc(Node::Free, NODE_NULL)
+        {
+            taken.push(idx);
+        }
+        for idx in taken.split_off(taken.len() - keep)
+        {
+            l.arena.free(idx);
+        }
+        taken
     }
 
     /// Take every free slot, leaving the arena full.

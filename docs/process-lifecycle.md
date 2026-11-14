@@ -530,9 +530,10 @@ The death-notification flow:
    § DMA-Safe Teardown and
    [`procmgr/docs/ipc-interface.md`](../services/procmgr/docs/ipc-interface.md#label-3-release_hold)
    § Label 3).
-3. **Memmgr reclaims.** Memmgr walks the per-process frame list and inserts
-   each Memory cap back into its free pool, except a frame another process
-   can still reach (a capability to it, a kernel object retyped from it that
+3. **Memmgr reclaims.** Memmgr walks the per-process frame list and every
+   demand-paged region's chunk table and inserts each Memory cap back into
+   its free pool, except a frame another process can still reach (a
+   capability to it, a kernel object retyped from it that
    another process still references, or another address space's mapping of
    it), which waits on memmgr's deferred list until a later recheck finds it
    unreachable (see

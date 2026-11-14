@@ -291,6 +291,7 @@ Every entry in this section is correct as is.
 | `AP_IST_PAIR_SIZE` | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 32 KiB, `2 * IST_STACK_SIZE` | encoding artefact (two IST stacks) | `cpu_count` x 32 KiB | correct as is | None |
 | Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; root table (PML4 or PML5) below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
 | `wait_icr_idle` (`ICR_IDLE_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based) | none | correct as is | None |
+| `dump_remote_frame` (`REMOTE_FRAME_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based; bounds only the wait for a CPU no NMI reaches) | none | correct as is | None |
 | `wait_for_ack` ladder | `core/kernel/src/arch/*/interrupts.rs` | 250 / 750 / 5000 ms, on the spin-count estimate before the timer is calibrated | tuning (time-based) | none | correct as is | None |
 | `MAX_SPINS_PER_UNIT` | `core/kernel/src/bounded_wait.rs` | 10 000 spins per us | provable unreachability (a 10 GHz clock), so the fallback never times out early | none | correct as is | None |
 | `start_ap` delays | `core/kernel/src/arch/x86_64/interrupts.rs` | 10 ms, 200 us | hardware spec (Intel SDM INIT-SIPI-SIPI) | none | correct as is | None |
@@ -525,6 +526,8 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `Elf64Ehdr.e_phnum`, `e_shnum` | `shared/elf/src/lib.rs` | `u16` | hardware spec (ELF64 header) | none | correct as is | None |
 | ed25519 `MSG_SCRATCH` | `shared/crypto/src/ed25519.rs` | 1024 | provably unreachable (largest RFC 8032 vector 1023 B) | 2 KiB stack | correct as is | None |
 | `Sha512.total_len` | `shared/crypto/src/sha512.rs` | `u128` | hardware spec (FIPS 180-4 length field) | 16 B | correct as is | None |
+| `chacha20poly1305::MAX_LEN` | `shared/crypto/src/chacha20poly1305.rs` | `(2^32 - 1) * 64` B = 274 877 906 880 B per sealed buffer | format spec (RFC 8439 § 2.8: the 32-bit block counter, block 0 taken by the Poly1305 key) | none | correct as is | None |
+| chacha20-poly1305 `KAT_SCRATCH` | `shared/crypto/src/chacha20poly1305.rs` | 384 B | provably unreachable (largest RFC 8439 vector 375 B) | 768 B stack | correct as is | None |
 | `FONT_9X20` | `shared/font/src/lib.rs` | 256 glyphs | hardware spec (CP437) | 10 KiB rodata | correct as is | None |
 | `FONT_9X20_EXT_COUNT` | `shared/font/src/lib.rs` | 20 | encoding artefact (code points the tree renders) | 800 B rodata | correct as is | Pin the map against the count |
 | `Utf8Decoder.buf` | `shared/text/src/utf8.rs` | 4 B | hardware spec (UTF-8 sequence length) | 5 B | correct as is | None |
@@ -539,25 +542,27 @@ Every entry here is `correct as is`; none is tracked.
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | process table (`ProcessIndex`, `Node::Process`) | `services/memmgr/free-pool/src/index.rs` | arena-backed records, linear-hash badge index | provably unreachable (no constant: records are arena nodes, grown from the pool) | none | correct as is | None |
+| budget nodes (`BudgetNode`, `Node::Budget`) | `services/memmgr/free-pool/src/budget.rs` | arena-backed, one per process record, kept past its process while a deferred run is charged to it; `u64` page counts, max and reference count | provably unreachable (no constant: nodes are arena nodes, grown from the pool; no count passes the pages or slots that exist) | one arena slot per node | correct as is | None |
 | `PROCESS_INDEX_VA`, `PROCESS_INDEX_END` | `services/memmgr/src/main.rs` | 1 GiB bucket window (2^27 buckets) | tuning (past it buckets stop splitting and chains lengthen; bounds no capacity) | none | correct as is | None |
 | `MAX_LOAD` | `services/memmgr/free-pool/src/index.rs` | 2 | tuning (mean chain length before a split) | none | correct as is | None |
 | Arena node index (`NodeIdx`, `NODE_NULL`) | `services/memmgr/free-pool/src/arena.rs` | `u64`, sentinel `u64::MAX` | provably unreachable (2^64 slots exceed any address space) | 8 B per link | correct as is | None |
 | `META_ARENA_LOW_END`, `META_ARENA_HIGH_BASE`, `META_ARENA_HIGH_END` | `services/memmgr/src/main.rs` | low zone to `MAIN_TLS_WINDOW.base` (about 115 GiB of VA), high zone from 2^38 to the boot's user-half top | hardware spec (the paging mode's user half) | none | correct as is | None |
 | `META_ARENA_SLOTS_LOG2`, `PHYS_TABLE_TEMP_SLOTS_LOG2` | `services/memmgr/src/main.rs` | 21 | encoding artefact (ASLR window, asserted) | none | correct as is | None |
 | zone-map assert | `services/memmgr/src/main.rs` | compile time | encoding artefact | none | correct as is | None |
-| `SLOTS_PER_PAGE`, `SLOT_SIZE` | `services/memmgr/free-pool/src/arena.rs` | `PAGE_SIZE / size_of::<Slot>()`: 56 B slots, 73 per arena page (the largest payloads, `FrameDesc`, `ProcessRecord` and the chunk-directory node `[NodeIdx; DIR_FANOUT]`, are 40 B each) | encoding artefact (no slot straddles a page) | none | correct as is | None |
+| `SLOTS_PER_PAGE`, `SLOT_SIZE` | `services/memmgr/free-pool/src/arena.rs` | `PAGE_SIZE / size_of::<Slot>()`: 64 B slots, 64 per arena page (the largest payloads, `ProcessRecord` and the chunk-directory node `[NodeIdx; DIR_FANOUT]`, are 48 B each; host-tested) | encoding artefact (no slot straddles a page) | none | correct as is | None |
 | free pool (`FreePool`, `Node::Run`) | `services/memmgr/free-pool/src/pool.rs` | arena-backed runs sorted by physical base | provably unreachable (no constant: runs are arena nodes, grown from the pool) | none | correct as is | None |
-| `DIR_FANOUT` | `services/memmgr/free-pool/src/chunk.rs` | 5: children per chunk-table directory node, the slot indices that fit the largest other payload (`FrameDesc`), so a directory node does not enlarge the arena slot (asserted at compile time); a region's table height is the fewest levels of 5 that cover its chunk count, so a fault reads the region node plus height + 1 slots | encoding artefact | none | correct as is | None |
+| `DIR_FANOUT` | `services/memmgr/free-pool/src/chunk.rs` | 6: children per chunk-table directory node, the slot indices that fit the largest other payload (`ProcessRecord`), so a directory node does not enlarge the arena slot (asserted at compile time); a region's table height is the fewest levels of 6 that cover its chunk count, so a fault reads the region node plus height + 1 slots | encoding artefact | none | correct as is | None |
 | `DEMAND_CHUNK_PAGES` | `services/memmgr/free-pool/src/lib.rs` | 16 | tuning (fault-around window; on a fragmented pool a fault backs as many pages as the largest free run holds) | none | correct as is | Adaptive window is #236 |
 | `SCRUB_VA`, `SCRUB_WINDOW_PAGES` | `services/memmgr/src/main.rs` | 512 pages (2 MiB) at 4 GiB in memmgr's address space | tuning (pages one pass maps to zero a run before hand-out; a larger run takes more passes; bounds no capacity) | one leaf page table, funded at the first scrub and kept | correct as is | None |
 | `FreeRun.page_count` | `services/memmgr/free-pool/src/lib.rs` | `u64` pages | provably unreachable (2^64 pages exceed any physical address space) | embedded | correct as is | None |
-| Region id (`FrameDesc.region_id`, `ProcessRecord.next_region_id`) | `services/memmgr/free-pool/src/arena.rs` | `u64` per-process sequence from 1; a spent sequence fails the grant `QUOTA` | provably unreachable (2^64 − 1 grants to one process) | 8 B on every arena slot (the slot grew from 48 to 56 B, 85 to 73 per page) | correct as is | None |
+| Region id (`FrameDesc.region_id`, `ProcessRecord.next_region_id`) | `services/memmgr/free-pool/src/arena.rs` | `u64` per-process sequence from 1; a spent sequence fails the grant `QUOTA` | provably unreachable (2^64 − 1 grants to one process) | 8 B on every arena slot (`ProcessRecord`, the largest payload, carries `next_region_id`) | correct as is | None |
 | `FrameDesc.page_count`, REQUEST_MEMORY_CAPS `want_pages` | `services/memmgr/free-pool/src/arena.rs`, `services/memmgr/src/main.rs` | `u32` pages per grant | encoding artefact (wire packs a request's pages in 32 bits) | none | correct as is | Callers loop |
 | `MAX_GRANT_RUNS` (`Grant`) | `services/memmgr/free-pool/src/pool.rs` | `MSG_CAP_SLOTS_MAX` | ABI width | 96 B stack | correct as is | None: a grant over more runs is partial and the caller loops |
 | `MEMMGR_FORWARD_HEADROOM` | `services/init/src/bootstrap.rs` | 512 slots in memmgr's `CSpace` | tuning (caps past it reach memmgr at init's reap) | none | correct as is | None |
 | `DEFERRED_RECHECK_BATCH` | `services/memmgr/src/main.rs` | 64 runs | tuning (deferred runs one recheck checks, at most one recheck per turn of the receive loop; a run not pooled goes to the back, so successive rechecks visit every run) | none | correct as is | None |
 | `DEFERRED_RECHECK_WINDOWS` | `services/memmgr/src/main.rs` | 256 mapping-count windows of up to 512 pages | tuning (with the batch, bounds a turn's deferred kernel queries to three per run checked plus 256, plus the windows of the largest deferred run, which is read whole when it crosses the budget) | none | correct as is | None |
 | `ARENA_RETURN_RESERVE` | `services/memmgr/src/main.rs` | 1 slot | tuning (held back from every other allocation, so the arena grows first; spent only when growth is ruled out; a further last-resort return then leaves one run out of circulation) | one arena slot | correct as is | None |
+| `SYSTEM_RESERVE_DIVISOR` | `services/memmgr/free-pool/src/budget.rs` | 64: the system reserve is `pool_total / 64` free pages, which only a charge to a reserve budget node may take (services/memmgr/docs/memory-pool.md § Distribution policy) | tuning (a floor for the core's allocations under pressure, proportional to RAM, so it stops no larger machine first; it limits no process) | `pool_total / 64` pages a process outside the reserve cannot take | correct as is | None |
 | `InitBootstrap.in_use` | `services/memmgr/src/main.rs` | `MAX_IN_USE` = 4 | provably unreachable (three tier-1 producers) | 128 B stack | correct as is | None |
 | process badges | `services/memmgr/src/main.rs` | 63 random bits, bit 63 the phys-class flag (`memmgr_labels::PHYS_CLASS_BADGE_BIT`) | ABI width (the kernel's 64-bit badge word; 2^63 badges per class) | none | correct as is | None |
 | `POOL_TOTAL_PAGES` | `services/memmgr/src/main.rs` | `u64`, saturating | ABI width | 8 B | correct as is | None |
@@ -617,7 +622,7 @@ Every entry here is `correct as is`; none is tracked.
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
 | svc-defs argv and env limit (`check_startup_blobs`) | `services/svcmgr/svc-defs/src/parse.rs` | argv and env together at most `ARGV_ENV_MAX_BYTES` | the process ABI's argv/env region | none | correct as is | None |
 | reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | table index, `u64` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its live thread state) | none | correct as is | None |
-| endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 6 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
+| endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 7 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
 | bootstrap badge | `services/svcmgr/src/restart.rs` | random `u64` | ABI width | none | correct as is | None |
 
 ### vfsd and namespace
@@ -626,8 +631,10 @@ Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `VfsdRootBackend.nodes` | `services/vfsd/root-backend/src/lib.rs` | heap `Vec`, one node per installed path component, never freed (no unmount) | per-instance (grows with the mount tree; an allocation failure refuses the install) | none | correct as is | None |
+| `VfsdRootBackend.nodes` | `services/vfsd/root-backend/src/lib.rs` | heap `Vec`, one node per installed path component, never freed (a removed mount leaves its node vacant for a later install to reuse) | per-instance (grows with the mount tree; an allocation failure refuses the install) | none | correct as is | None |
 | tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (`install` refuses a pool of `u32::MAX` nodes, each a heap allocation) | 4 B per link | correct as is | None |
+| `TreeNode.live` | `services/vfsd/root-backend/src/lib.rs` | `u32`, the mounted mounts in a node's subtree | provably unreachable (each mount holds a node of its own, and the pool stays below `u32::MAX` nodes) | 4 B per node | correct as is | None |
+| `DEATH_QUEUE_CAPACITY`, `DEATH_QUEUE_OBSERVERS` | `services/vfsd/src/driver.rs` | 2 entries and 2 death-observer nodes per fatfs driver's death queue | provably unreachable (one node per binding, of which a driver has two; one entry reports the death, and a post past the capacity is dropped with the death already queued) | `event_queue_retype_bytes(2, 2)` per mount | correct as is | None |
 | tree component limit (`validate_name`) | `services/vfsd/root-backend/src/lib.rs` | `MAX_NAME_LEN` (255) | ABI width (the namespace protocol's name rule) | none (names are heap-allocated to their length) | correct as is | None |
 | `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
 | `discover_disks` disk list | `services/vfsd/src/partition.rs` | heap `Vec`, one `Disk` per block driver devmgr serves, found once at startup | per-instance (devmgr's block-driver count, one per virtio-blk device; an allocation failure stops discovery with a log, keeping the disks found before it) | none | correct as is | None |
@@ -636,7 +643,7 @@ Every entry here is `correct as is`; none is tracked.
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
 | `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
-| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another) | 4 thread stacks | correct as is | None (#254) |
+| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another's IPC, and `GET_SWAP_PARTITION` only on the swap lock across one block-driver call) | 4 thread stacks | correct as is | None (#254) |
 
 ### init and logd
 

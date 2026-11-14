@@ -71,12 +71,18 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
         → vfsd queries devmgr's registry → each disk's blk_labels::MOUNT_AUTHORITY-badged SEND_GRANT
           → vfsd issues REGISTER_PARTITION (whole-disk endpoint of the partition's disk only)
             → virtio-blk mints a partition-badged SEND_GRANT and returns it in the reply
-              → vfsd spawns fs driver; injects partition-scoped block cap
+              → vfsd keeps it; spawns fs driver; injects a derivation of it
                 → vfsd sends FS_MOUNT; fs driver reads BPB, replies OK
                   → vfsd captures fs driver's root namespace cap
                     → init pulls system root via GET_SYSTEM_ROOT_CAP
                       → init distributes copies via CONFIGURE_NAMESPACE
 ```
+
+The swap partition takes a shorter branch from the `REGISTER_PARTITION` step: vfsd keeps the
+partition cap virtio-blk returns, runs no fs driver on it, and hands a derivation of it to the
+holder of the `vfsd.swap` SEND on `GET_SWAP_PARTITION`, revoking the derivation it handed out
+before ([`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md)
+§ Label 14).
 
 The kernel half (BootInfo → Mmio mint → devmgr → driver binding)
 is owned by [`device-management.md`](device-management.md). The
@@ -111,6 +117,7 @@ or on-disk UUID. The model is:
   [`SERAPH_ROOT_X86_64`](../abi/boot-protocol/src/role_guids.rs),
   [`SERAPH_ROOT_RISCV64`](../abi/boot-protocol/src/role_guids.rs),
   and the arch-neutral [`SERAPH_DATA`](../abi/boot-protocol/src/role_guids.rs)
+  and [`SERAPH_SWAP`](../abi/boot-protocol/src/role_guids.rs)
   in [`abi/boot-protocol/src/role_guids.rs`](../abi/boot-protocol/src/role_guids.rs).
 - **The EFI System Partition is auto-mounted at `/esp`** immediately
   after the root self-mount, using the standard ESP type GUID
@@ -129,14 +136,21 @@ or on-disk UUID. The model is:
   therefore a disk-authoring choice, not a vfsd concern; the in-tree
   image (see [build-system.md](build-system.md)) carries the tree on the
   partition only.
+- **The swap partition is never mounted.** It carries no filesystem: vfsd
+  looks it up by the arch-neutral `SERAPH_SWAP` type GUID on the first
+  `GET_SWAP_PARTITION` request, not at startup, and hands the swap
+  service a raw partition cap on it. A disk with no swap partition boots
+  as one with: the request then replies `NO_MOUNT`. The in-tree image
+  carries one, the last partition of `disk.img`.
 - **Every disk is searched.** At startup vfsd sends `QUERY_DEVICE` on the block class SEND
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
   serves, and parses each disk's GPT. A role lookup, at the root
-  self-mount, the auto-mounts, and a runtime `MOUNT`, considers the
-  partitions of every held disk; a disk whose GPT cannot be read or
-  validated contributes none. The partition's `REGISTER_PARTITION` goes
+  self-mount, the auto-mounts, a runtime `MOUNT`, and the first
+  `GET_SWAP_PARTITION`, considers the partitions of every held disk; a
+  disk whose GPT cannot be read or validated contributes none. The
+  partition's `REGISTER_PARTITION` goes
   to the block driver of the disk that holds it.
 - **DPS-style priority tie-break.** Where multiple partitions match
   a role GUID, on one disk or across disks, GPT attribute bits 48–63 are
@@ -147,7 +161,8 @@ or on-disk UUID. The model is:
   ([device-management.md](device-management.md#relationship-to-other-services)),
   so disk order never breaks a tie. For the root role an ambiguity is a
   fatal boot error that must be repaired; the `/esp` and `/data`
-  auto-mounts skip the mount.
+  auto-mounts skip the mount, and `GET_SWAP_PARTITION` replies
+  `NO_MOUNT`.
 - **Nothing else binds.** There is no `mounts.conf`, no `/etc/fstab`,
   no kernel command line carrying mount config, no on-disk
   filesystem label or UUID consulted by vfsd. The GUID is the
@@ -240,7 +255,7 @@ Authoritative wire shapes for `REGISTER_PARTITION`,
 `BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, and `BLK_GET_GEOMETRY`
 live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
-The fs-driver side — `FS_MOUNT`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
+The fs-driver side — `FS_MOUNT`, `FS_UNMOUNT`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
 `FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,
 `FS_TRUNCATE`, `FS_CLOSE`, and the directory-mutation labels — is owned by
 [`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).
@@ -259,6 +274,17 @@ The supported failure-handling primitives are:
   death and does not respawn a driver; the mount stays installed
   against the dead endpoint. Other mounts and the block driver are
   unaffected.
+- **Block device revocation.** An fs driver learns that its block
+  device capability was revoked at its first block request afterwards:
+  it answers that request as for any failed block access (`IO_ERROR`,
+  or what the label's section names) and exits. Until a request
+  reaches the device, an idle driver, or one serving requests from its
+  page cache, serves on. A failed block call through a capability
+  still live, or an error reply, fails only its request
+  ([`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md)
+  § Loss of the block device). The driver's exit is then an fs-driver
+  crash, as above, unless the request was an `FS_UNMOUNT`, which
+  replies success and ends as an unmount (§ Driver exit there).
 - **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
   namespace endpoint cascades through the kernel derivation graph
   and invalidates every cap ever derived from it: vfsd's retained

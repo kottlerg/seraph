@@ -9,11 +9,12 @@
 //!
 //! * **Bootstrap worker** (always one): owns the bootstrap endpoint, sits in
 //!   `ipc_recv`, and matches inbound child REQUESTs against pending
-//!   [`BootstrapOrder`]s registered via [`WorkerPool::submit`].
+//!   [`BootstrapOrder`]s registered via [`WorkerPool::submit_bootstrap`].
 //! * **Active workers** (a small pool): pull [`CreateFromFileOrder`]s
 //!   off a queue and issue the outbound IPC sequence (procmgr
 //!   `CREATE_FROM_FILE` + `START_PROCESS` + waiting on the bootstrap
-//!   worker's per-request channel).
+//!   worker's per-request channel), submitted via
+//!   [`WorkerPool::submit_create_from_file`].
 //!
 //! Active workers exist because the kernel's single-slot reply target
 //! prohibits nested server IPC: vfsd's main thread holds `reply_tcb = caller`
@@ -30,19 +31,9 @@ use crate::worker;
 /// capacity: a queued job waits for the next free worker.
 pub const ACTIVE_WORKER_COUNT: usize = 2;
 
-/// A unit of work submitted to the pool.
-pub enum WorkOrder
-{
-    /// Deliver caps to a fatfs child via `bootstrap::reply_round` when its
-    /// REQUEST arrives on the worker-owned bootstrap endpoint.
-    Bootstrap(BootstrapOrder),
-    /// Issue `procmgr_labels::CREATE_FROM_FILE` and `START_PROCESS` from a
-    /// worker thread so vfsd's main thread can keep servicing OPEN while
-    /// procmgr re-enters the VFS to load the binary.
-    CreateFromFile(CreateFromFileOrder),
-}
-
-/// Caps to deliver to one fatfs child during its bootstrap round.
+/// Caps to deliver to one fatfs child during its bootstrap round, via
+/// `bootstrap::reply_round` when its REQUEST arrives on the worker-owned
+/// bootstrap endpoint.
 ///
 /// Handing an order to the pool hands over its two caps: from then on the
 /// pool either delivers them to the child (the bootstrap round moves them
@@ -59,10 +50,12 @@ pub struct BootstrapOrder
     pub service: u64,
 }
 
-/// Spawn a process from a caller-resolved file cap via procmgr. The active
-/// worker submits the contained [`BootstrapOrder`] internally before
-/// driving the procmgr call sequence, so the bootstrap worker is ready
-/// when the child REQUESTs.
+/// Spawn a process from a caller-resolved file cap via procmgr, issuing
+/// `procmgr_labels::CREATE_FROM_FILE` and `START_PROCESS` from a worker
+/// thread so vfsd's main thread can keep servicing OPEN while procmgr
+/// re-enters the VFS to load the binary. The active worker submits the
+/// contained [`BootstrapOrder`] internally before driving the procmgr call
+/// sequence, so the bootstrap worker is ready when the child REQUESTs.
 pub struct CreateFromFileOrder
 {
     pub procmgr_ep: u64,
@@ -78,30 +71,45 @@ pub struct CreateFromFileOrder
     /// moved to the worker. Forwarded to procmgr as the child's
     /// `creator_endpoint`.
     pub badged_creator: u64,
+    /// The child's death queue (`crate::driver::FatfsDriver::death_queue`).
+    /// Stays the caller's: the worker derives the relay it sends under
+    /// `CREATE_DEATH_RELAY` from it and binds the child's main thread to it.
+    pub death_queue: u64,
     /// The bootstrap caps to deliver once the child REQUESTs.
     pub bootstrap: BootstrapOrder,
 }
 
 /// Per-request completion channel: `None` until the worker writes a result.
-pub type Channel = Arc<(Mutex<Option<bool>>, Condvar)>;
+pub type Channel<T> = Arc<(Mutex<Option<T>>, Condvar)>;
 
-fn new_channel() -> Channel
+fn new_channel<T>() -> Channel<T>
 {
     Arc::new((Mutex::new(None), Condvar::new()))
 }
 
-/// Returned by `submit`; the caller blocks on `wait` for the worker's outcome.
-#[must_use = "WorkHandle::wait must be called or the result is discarded"]
-pub struct WorkHandle
+/// Write `result` to `channel` and wake its waiter.
+pub fn complete<T>(channel: &Channel<T>, result: T)
 {
-    channel: Channel,
+    let (lock, cvar) = &**channel;
+    *lock.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+    cvar.notify_one();
 }
 
-impl WorkHandle
+/// Returned by a submit; the caller blocks on `wait` for the worker's
+/// outcome: `bool` for a bootstrap delivery, the child's process handle
+/// for a `CREATE_FROM_FILE` job.
+#[must_use = "WorkHandle::wait must be called or the result is discarded"]
+pub struct WorkHandle<T>
 {
-    /// Block until the worker reports completion. `true` on success,
-    /// `false` on any failure path the worker recognised.
-    pub fn wait(self) -> bool
+    channel: Channel<T>,
+}
+
+impl<T: Default> WorkHandle<T>
+{
+    /// Block until the worker reports completion and return its result:
+    /// `true` or `Some` on success, `false` or `None` on any failure path
+    /// the worker recognised.
+    pub fn wait(self) -> T
     {
         let mut st = self
             .channel
@@ -116,7 +124,7 @@ impl WorkHandle
                 .wait(st)
                 .unwrap_or_else(PoisonError::into_inner);
         }
-        st.take().unwrap_or(false)
+        st.take().unwrap_or_default()
     }
 }
 
@@ -126,7 +134,7 @@ pub struct PendingBootstrap
     pub badge: u64,
     pub blk: u64,
     pub service: u64,
-    pub channel: Channel,
+    pub channel: Channel<bool>,
 }
 
 /// Shared state between the main thread (publisher) and the bootstrap worker
@@ -152,7 +160,7 @@ impl BootstrapState
 pub struct ActiveJob
 {
     pub order: CreateFromFileOrder,
-    pub completion: Channel,
+    pub completion: Channel<Option<u64>>,
 }
 
 /// Shared queue between the main thread (submitter) and active worker threads.
@@ -228,51 +236,55 @@ impl WorkerPool
         self.bootstrap_ep
     }
 
-    /// Submit a work order. Returns `None` if the relevant queue cannot grow
-    /// to hold it (no memory), after deleting every cap the order carries,
-    /// so a refused order leaves nothing of it in vfsd's `CSpace`.
-    pub fn submit(&self, order: WorkOrder) -> Option<WorkHandle>
+    /// Register a bootstrap order for the bootstrap worker; see
+    /// [`submit_bootstrap`].
+    pub fn submit_bootstrap(&self, order: BootstrapOrder) -> Option<WorkHandle<bool>>
     {
-        match order
-        {
-            WorkOrder::Bootstrap(b) => submit_bootstrap(&self.bootstrap_state, b),
-            WorkOrder::CreateFromFile(c) =>
-            {
-                let channel = new_channel();
-                let mut q = self
-                    .active_state
-                    .queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if q.try_reserve(1).is_err()
-                {
-                    drop(q);
-                    let _ = syscall::cap_delete(c.file_cap);
-                    let _ = syscall::cap_delete(c.badged_creator);
-                    delete_bootstrap_caps(c.bootstrap.blk, c.bootstrap.service);
-                    return None;
-                }
-                q.push_back(ActiveJob {
-                    order: c,
-                    completion: channel.clone(),
-                });
-                drop(q);
-                self.active_state.condvar.notify_one();
-                Some(WorkHandle { channel })
-            }
-        }
+        submit_bootstrap(&self.bootstrap_state, order)
     }
 
-    /// Withdraw a bootstrap order registered by [`Self::submit`]; see
-    /// [`abandon_bootstrap`].
-    pub fn abandon_bootstrap(&self, badge: u64, handle: WorkHandle)
+    /// Queue a `CREATE_FROM_FILE` job for an active worker. Returns `None`
+    /// if the queue cannot grow to hold it (no memory), after deleting
+    /// every cap the order carries, so a refused order leaves nothing of it
+    /// in vfsd's `CSpace`.
+    pub fn submit_create_from_file(
+        &self,
+        order: CreateFromFileOrder,
+    ) -> Option<WorkHandle<Option<u64>>>
+    {
+        let channel = new_channel();
+        let mut q = self
+            .active_state
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if q.try_reserve(1).is_err()
+        {
+            drop(q);
+            let _ = syscall::cap_delete(order.file_cap);
+            let _ = syscall::cap_delete(order.badged_creator);
+            delete_bootstrap_caps(order.bootstrap.blk, order.bootstrap.service);
+            return None;
+        }
+        q.push_back(ActiveJob {
+            order,
+            completion: channel.clone(),
+        });
+        drop(q);
+        self.active_state.condvar.notify_one();
+        Some(WorkHandle { channel })
+    }
+
+    /// Withdraw a bootstrap order registered by [`Self::submit_bootstrap`];
+    /// see [`abandon_bootstrap`].
+    pub fn abandon_bootstrap(&self, badge: u64, handle: WorkHandle<bool>)
     {
         abandon_bootstrap(&self.bootstrap_state, badge, handle);
     }
 }
 
 /// Insert a bootstrap order into the shared state and return a `WorkHandle`
-/// to its completion channel. Used by `WorkerPool::submit` and directly by
+/// to its completion channel. Used by `WorkerPool::submit_bootstrap` and directly by
 /// active workers preparing a bootstrap delivery before driving procmgr.
 ///
 /// Returns `None` when the pending list cannot grow to hold the order (no
@@ -284,7 +296,7 @@ pub fn submit_bootstrap(
         blk,
         service,
     }: BootstrapOrder,
-) -> Option<WorkHandle>
+) -> Option<WorkHandle<bool>>
 {
     let channel = new_channel();
     let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -312,7 +324,7 @@ pub fn submit_bootstrap(
 /// child's REQUEST, and this waits on `handle` until that round ends (the
 /// caps then reached the child, or the worker deleted them). Either way no
 /// cap of the order remains in vfsd's `CSpace` once this returns.
-pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: WorkHandle)
+pub fn abandon_bootstrap(state: &Mutex<BootstrapState>, badge: u64, handle: WorkHandle<bool>)
 {
     if let Some(pending) = take_pending_by_badge(state, badge)
     {

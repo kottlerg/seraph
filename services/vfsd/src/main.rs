@@ -16,7 +16,8 @@
 //! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
 //! `/esp` and the data partition at `/data`) during startup, before
 //! serving any request; the runtime `MOUNT` IPC remains for
-//! explicit/foreign-GUID mounts.
+//! explicit/foreign-GUID mounts. The swap partition is never mounted:
+//! `GET_SWAP_PARTITION` hands its holder a raw partition cap.
 //!
 //! See `services/vfsd/README.md` for the design and
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
@@ -32,17 +33,20 @@ use std::sync::{Mutex, PoisonError};
 
 use ipc::{IpcMessage, blk_labels, ns_labels};
 use namespace_protocol::{GateError, compose_forward_lookup_rights, gate};
-use root_backend::VfsdRootBackend;
+use root_backend::{Mount, VfsdRootBackend};
 use worker_pool::WorkerPool;
 
 /// Number of threads that recv on the service endpoint. A concurrency
 /// knob that bounds no capacity: a request that finds every handler busy
 /// waits in the endpoint's queue for the next free thread. No
-/// service-endpoint request waits on another one, so the count cannot
+/// service-endpoint request waits on another one's IPC, so the count cannot
 /// deadlock: what a `MOUNT` handler blocks on (the worker pool, procmgr's
 /// `CREATE_FROM_FILE`, whose binary reads go to the fs driver that minted
 /// the file cap, the `NS_LOOKUP` walk the namespace thread serves, and the
-/// driver's `FS_MOUNT` probe) never calls the service endpoint.
+/// driver's `FS_MOUNT` probe) never calls the service endpoint. A
+/// `GET_SWAP_PARTITION` handler waits only for the swap lock, which the
+/// holder keeps across one `REGISTER_PARTITION` call to the block driver,
+/// and the block driver never calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Longest mount path a `MOUNT` request can name: the bytes the request's
@@ -190,8 +194,9 @@ fn main() -> !
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
-    // synthetic root. The service endpoint carries only `MOUNT` and
-    // `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
+    // synthetic root. The service endpoint carries only `MOUNT`,
+    // `GET_SYSTEM_ROOT_CAP` and `GET_SWAP_PARTITION`; the namespace
+    // endpoint is separated so
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
     let Some(namespace_ep) =
@@ -229,6 +234,7 @@ fn main() -> !
         namespace_ep,
         system_root_cap,
         root_backend: Mutex::new(VfsdRootBackend::new()),
+        swap: Mutex::new(swap::SwapPartition::new()),
     }));
 
     // Spawn the namespace dispatcher first: the `/esp` self-mount below
@@ -300,6 +306,11 @@ pub struct VfsdRuntime
     /// on each successful MOUNT; the namespace dispatcher reads on each
     /// `NS_*` request.
     pub root_backend: Mutex<VfsdRootBackend>,
+    /// The swap partition cap vfsd keeps, registered by the first
+    /// `GET_SWAP_PARTITION` that finds the partition. The lock is held
+    /// across a whole hand-out, so the first request's registration and a
+    /// later request's revoke never interleave.
+    pub swap: Mutex<swap::SwapPartition>,
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -342,6 +353,8 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   check before either installs, `install`) reject.
 ///
 /// No `do_mount`-touched state is shared without one of these locks.
+/// `GET_SWAP_PARTITION` touches only `rt.swap`, under its own mutex, and
+/// takes no other lock while it holds it.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -415,6 +428,37 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
                 else
                 {
                     handle_get_system_root_cap(ipc_buf, rt);
+                }
+            }
+            ipc::vfsd_labels::GET_SWAP_PARTITION =>
+            {
+                // Verb-bit gate: the hand-out revokes the previous holder's
+                // cap, so only the swap service's SWAP_AUTHORITY badge
+                // reaches it.
+                if badge & ipc::vfsd_labels::SWAP_AUTHORITY == 0
+                {
+                    std::os::seraph::log!(
+                        warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
+                    );
+                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+                {
+                    std::os::seraph::log!(
+                        warn: "GET_SWAP_PARTITION rejected: caller VFSD_LABELS_VERSION={} \
+                         expected {}",
+                        recv.word(0),
+                        ipc::VFSD_LABELS_VERSION
+                    );
+                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else
+                {
+                    handle_get_swap_partition(ipc_buf, rt);
                 }
             }
             _ =>
@@ -804,6 +848,102 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+// ── Swap-partition hand-out ─────────────────────────────────────────────────
+
+/// The operations of a swap-partition hand-out, carried out with the held
+/// disks' GPTs, the block drivers, and capability syscalls on this thread's
+/// IPC buffer.
+struct SwapIo<'a>
+{
+    rt: &'a VfsdRuntime,
+    ipc_buf: *mut u64,
+}
+
+impl swap::SwapOps for SwapIo<'_>
+{
+    fn lookup(&mut self) -> Result<gpt::PartitionLocation, gpt::GptLookupError>
+    {
+        // The role resolves across every held disk, as a mount role does
+        // (docs/storage.md § GPT Role-GUID Discovery).
+        let disk_parts = self.rt.disks.iter().map(|d| d.partitions.as_slice());
+        gpt::lookup_partition_by_type_guid(&role_guids::SERAPH_SWAP, disk_parts)
+    }
+
+    fn register(&mut self, location: &gpt::PartitionLocation) -> Option<u64>
+    {
+        // The lookup ran over `rt.disks`, so its index is in range.
+        let disk = self.rt.disks.get(location.disk)?;
+        derive_and_register_partition(
+            disk.blk_ep,
+            location.first_lba,
+            location.length_lba,
+            self.ipc_buf,
+        )
+    }
+
+    fn revoke_descendants(&mut self, cap: u64) -> bool
+    {
+        match syscall::cap_revoke_all(cap)
+        {
+            Ok(()) => true,
+            Err(code) =>
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SWAP_PARTITION: cap_revoke_all failed: code={code}"
+                );
+                false
+            }
+        }
+    }
+
+    fn derive(&mut self, cap: u64) -> Option<u64>
+    {
+        syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND_GRANT).ok()
+    }
+}
+
+/// Handle [`vfsd_labels::GET_SWAP_PARTITION`]: hand the caller a
+/// `SEND_GRANT` on the swap partition, revoking the cap an earlier
+/// hand-out returned ([`swap::SwapPartition::hand_out`]).
+///
+/// The dispatcher admits only a `SWAP_AUTHORITY` badge. The partition is
+/// looked up and registered on the first request, never at startup, so a
+/// disk with no swap partition changes nothing until a request, which then
+/// replies [`vfsd_errors::NO_MOUNT`]; so does a tie between swap partitions.
+/// A failed registration, revoke or derivation replies
+/// [`vfsd_errors::IO_ERROR`].
+fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime)
+{
+    let handed = rt
+        .swap
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hand_out(&mut SwapIo { rt, ipc_buf });
+    let reply = match handed
+    {
+        Ok(cap) => IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
+            .cap(cap)
+            .build(),
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "GET_SWAP_PARTITION failed: {e:?}");
+            let label = match e
+            {
+                swap::HandOutError::NoPartition | swap::HandOutError::Ambiguous =>
+                {
+                    ipc::vfsd_errors::NO_MOUNT
+                }
+                swap::HandOutError::Register
+                | swap::HandOutError::Revoke
+                | swap::HandOutError::Derive => ipc::vfsd_errors::IO_ERROR,
+            };
+            IpcMessage::new(label)
+        }
+    };
+    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 // ── MOUNT handler ──────────────────────────────────────────────────────────
 
 /// Mount role decoded from the MOUNT IPC wire byte. The producer
@@ -1033,10 +1173,11 @@ fn mount_path_is_root(path: &[u8]) -> bool
 ///
 /// Looks the role's type GUID up across every held disk's GPT, registers
 /// the partition bound with the block driver of the disk that holds it,
-/// spawns a fatfs driver, registers a mount entry, and captures the
-/// driver's namespace endpoint (terminal mounts) or a badged SEND on the
-/// root fs (the root mount) into [`VfsdRootBackend`] so the system-root
-/// cap can resolve through the new mount.
+/// spawns a fatfs driver, and stores the mount's record in
+/// [`VfsdRootBackend`]: the driver's namespace endpoint (terminal mounts)
+/// or a badged SEND on the root fs (the root mount), through which the
+/// system-root cap resolves into the new mount, with the driver's caps and
+/// the partition cap (`docs/namespace-composition.md` § Mount record).
 ///
 /// On success returns a fresh badged SEND for the caller (zero if
 /// minting failed; the mount itself still landed). On failure
@@ -1059,10 +1200,10 @@ pub(crate) fn do_mount(
     clippy::too_many_lines,
     reason = "the mount-and-publish transaction runs inline. The install pre-check, partition \
               registration with virtio-blk, fatfs spawn, synthetic-root install, and \
-              namespace-root cap minting share the `partition_ep` / `fatfs` / `driver_ep` locals, \
-              and every failure arm after the spawn tears the driver down through \
-              `fatfs.endpoint`; folding a subset into helpers would thread those locals through \
-              and hide which arm releases what"
+              namespace-root cap minting share the `partition` / `fatfs` / `driver_ep` locals, \
+              and every failure arm after the spawn releases the mount through \
+              `release_failed_mount`; folding a subset into helpers would thread those locals \
+              through and hide which arm releases what"
 )]
 fn do_mount_internal(
     rt: &VfsdRuntime,
@@ -1125,11 +1266,22 @@ fn do_mount_internal(
         return Err(ipc::vfsd_errors::TABLE_FULL);
     }
 
-    let Some(partition_ep) =
+    // vfsd keeps the registered partition cap in the mount record and hands
+    // the driver a derivation of it, so revoking the kept cap cuts the
+    // driver off the partition (`docs/namespace-composition.md` § Mount
+    // record).
+    let Some(partition) =
         derive_and_register_partition(disk.blk_ep, partition_lba, partition_len, ipc_buf)
     else
     {
         std::os::seraph::log!(warn: "MOUNT: partition cap registration failed");
+        return Err(ipc::vfsd_errors::SPAWN_FAILED);
+    };
+    let Ok(partition_ep) = syscall::cap_derive(partition, syscall::RIGHTS_EP_SEND_GRANT)
+    else
+    {
+        std::os::seraph::log!(warn: "MOUNT: partition cap derive failed");
+        revoke_partition(partition);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
 
@@ -1162,6 +1314,7 @@ fn do_mount_internal(
     {
         std::os::seraph::log!(warn: "MOUNT: failed to spawn fatfs");
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
+        revoke_partition(partition);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
     let driver_ep = fatfs.send;
@@ -1209,7 +1362,7 @@ fn do_mount_internal(
             std::os::seraph::log!(warn: "MOUNT: root fall-through cap derive failed");
             // Revoking the endpoint also invalidates `caller_root_cap` and
             // stops the driver, which nothing would reach otherwise.
-            driver::teardown_driver(fatfs.endpoint);
+            release_failed_mount(&fatfs, partition);
             return Err(ipc::vfsd_errors::IO_ERROR);
         };
         c
@@ -1219,8 +1372,8 @@ fn do_mount_internal(
         driver_ep
     };
 
-    // Install the mount; capture any synthetic intermediates created
-    // along the path so we can populate their fall-through caps after
+    // Install the mount; capture the synthetic intermediates the install
+    // made visible so we can populate their fall-through caps after
     // releasing the lock (the walk needs IPC and we must not block
     // other namespace traffic on it).
     let install_result = {
@@ -1228,7 +1381,17 @@ fn do_mount_internal(
             .root_backend
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        backend.install(path, install_cap)
+        backend.install(
+            path,
+            Mount {
+                cap: install_cap,
+                endpoint: fatfs.endpoint,
+                process: fatfs.process,
+                death_queue: fatfs.death_queue,
+                partition,
+                disk: location.disk,
+            },
+        )
     };
     let Some(install_result) = install_result
     else
@@ -1240,7 +1403,7 @@ fn do_mount_internal(
         std::os::seraph::log!(
             warn: "MOUNT: synthetic-root install failed (no memory or mount point taken)"
         );
-        driver::teardown_driver(fatfs.endpoint);
+        release_failed_mount(&fatfs, partition);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
 
@@ -1250,9 +1413,8 @@ fn do_mount_internal(
         // so the unbadged SEND_GRANT has no further use.
         log_cap_delete("root mount driver_ep", driver_ep);
     }
-    // `fatfs.endpoint` stays in vfsd's CSpace for the life of the mount
-    // (every mount is permanent): it is the one handle that can revoke
-    // the driver, per `driver::FatfsDriver`.
+    // The mount record now holds `fatfs.endpoint`, the process handle, the
+    // death queue and the partition cap for the life of the mount.
 
     populate_fallthrough_caps(rt, ipc_buf, install_result.as_slice());
 
@@ -1260,14 +1422,41 @@ fn do_mount_internal(
     Ok(caller_root_cap.unwrap_or(0))
 }
 
-/// For each newly-created synthetic intermediate, walk the root mount
-/// to the corresponding directory and record the resulting cap as
-/// that intermediate's `fallthrough_cap`.
+/// Release what a mount transaction holds once it fails after its driver
+/// started: the partition cap is revoked, cutting the driver off its
+/// partition; the driver's service endpoint is revoked
+/// ([`driver::teardown_driver`]), invalidating every cap minted from it
+/// and stopping the driver; and the process handle and death queue are
+/// deleted.
+fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64)
+{
+    revoke_partition(partition);
+    driver::teardown_driver(fatfs.endpoint);
+    log_cap_delete("driver process handle", fatfs.process);
+    log_cap_delete("driver death queue", fatfs.death_queue);
+}
+
+/// Revoke and delete a partition cap vfsd registered: the driver's
+/// derivation of it stops reaching the block driver.
+fn revoke_partition(partition: u64)
+{
+    if let Err(code) = syscall::cap_revoke_all(partition)
+    {
+        std::os::seraph::log!(warn: "partition revoke: cap_revoke_all failed: code={code}");
+    }
+    log_cap_delete("partition cap", partition);
+}
+
+/// For each synthetic intermediate the install made visible, walk the
+/// root mount to the corresponding directory and record the resulting
+/// cap as that intermediate's `fallthrough_cap`.
 ///
 /// A walk that fails (root mount not yet installed, or the path does
 /// not exist in the root filesystem) leaves `fallthrough_cap = 0`;
 /// subsequent unmatched lookups against that intermediate then reply
-/// `NotFound` instead of forwarding. Every skip is logged.
+/// `NotFound` instead of forwarding. A walked cap the tree refuses,
+/// because the node no longer needs one by the time the walk ends, is
+/// deleted. Every skip is logged.
 fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates: &[u32])
 {
     for &node_idx in intermediates
@@ -1296,11 +1485,19 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
         }
         if let Some(cap) = walk_root_mount_path(root_mount_cap, &path, ipc_buf)
         {
-            let mut backend = rt
+            let stored = rt
                 .root_backend
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            backend.set_fallthrough_cap(node_idx, cap);
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_fallthrough_cap(node_idx, cap);
+            if !stored
+            {
+                std::os::seraph::log!(
+                    warn: "MOUNT: fallthrough skip node_idx={node_idx}: the node no longer \
+                     needs one",
+                );
+                log_cap_delete("unneeded fallthrough cap", cap);
+            }
         }
         else
         {

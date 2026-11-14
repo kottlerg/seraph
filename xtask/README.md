@@ -27,7 +27,7 @@ xtask/
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
-│   ├── guest.rs                # A QEMU process a QMP-driven harness drives, and its serial reader
+│   ├── guest.rs                # A QEMU process a host-driven harness drives, and its serial reader
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
@@ -43,8 +43,8 @@ xtask/
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, compare_images, test_crash_report, test_debug_port,
 │   │                           #   test_gdb, test_kaslr, test_log_level, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, lint_docs, pr_check, review,
-│   │                           #   release_scope, issue, orch, hook, host)
+│   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
+│   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -239,12 +239,13 @@ fails if the bundle is missing. The bundle is composed by
 harness). `mkdisk` always removes the `\EFI\seraph\mapredo` test knob, which
 only [`test-map-redo`](#cargo-xtask-test-map-redo) stages, for its own boot.
 
-`disk.img` carries three GPT partitions: the EFI System Partition
+`disk.img` carries four GPT partitions: the EFI System Partition
 (from `sysroot/esp/`), the arch-specific Seraph root (from `sysroot/`,
-excluding `esp/` and `data/`), and an arch-neutral `SERAPH_DATA`
-partition (from `sysroot/data/`). The data partition is authored
-unconditionally; `mkdisk --split-data` authors it alone on a second image,
-`disk-data.img` beside `disk.img`, which then carries the other two, for a
+excluding `esp/` and `data/`), an arch-neutral `SERAPH_DATA`
+partition (from `sysroot/data/`), and a 64 MiB raw swap partition of the arch-neutral
+`SERAPH_SWAP` type GUID (no filesystem, left zero), always the last partition of `disk.img`. The
+data partition is authored unconditionally; `mkdisk --split-data` authors it alone on a second
+image, `disk-data.img` beside `disk.img`, which then carries the ESP, root and swap, for a
 boot that attaches the pair (`run --second-disk disk-data.img`), and every
 other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
 the data partition at `/data`, on whichever disk holds it; the data tree
@@ -274,7 +275,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
 | `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
-| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP and root on `disk.img`, both at `--block-size`; omit to author all three on `disk.img` and remove a stale `disk-data.img` |
+| `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
 
 Example — stage `svctest` and run it (`--repack-only` keeps the hand-added
 recipe; a plain repack would prune it):
@@ -788,6 +789,40 @@ cargo xtask test-terminal [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 ```
 
 See [docs/testing.md](../docs/testing.md) for the harness model.
+
+---
+
+### `cargo xtask test-wedge`
+
+Check the softlockup watchdog's report of a CPU wedged in the kernel with interrupts off, on either
+arch ([docs/testing.md](../docs/testing.md#interrupts-off-wedge-test-wedge) § Interrupts-off wedge).
+Boots the current sysroot's default boot headless twice, with QEMU's gdbstub on a unix socket under
+`target/xtask/`, and waits for the terminal's `terminal: READY for injection` line, reading the
+KASLR slide and each CPU's hardware id from the kernel's boot lines. It then stops the VM over the
+GDB remote serial protocol, moves the chosen CPU's program counter from the idle loop's halt to the
+kernel's `halt_loop`, which masks interrupts and halts for good, resumes the VM, and checks the
+watchdog's report. The first boot wedges the highest-numbered AP, the second the BSP. On x86_64
+the report must also hold the wedged CPU's NMI frame with its `rip` inside `halt_loop`.
+
+A pure runner with the same boot requirements as `test-terminal`; it reads the kernel's symbols
+from the sysroot's kernel image:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask mkdisk [--arch x86_64|riscv64]
+cargo xtask test-wedge [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--cpus` | `4` | vCPUs of the guest; at least 2 |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the READY line is bounded by five minutes, each gdbstub reply by twenty seconds, the
+search for the CPU halted in the idle loop by 100 stops 100 ms apart, and the report by two
+minutes. The command fails, killing QEMU, on any of those bounds, on a gdbstub it cannot reach, and
+on a report line that is missing or wrong.
 
 ---
 
@@ -1470,8 +1505,8 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
 `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-log-level`,
-`test-debug-port`, `test-gdb` and `capture-acpi` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-kaslr`, `test-map-redo`,
+`test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

@@ -405,13 +405,13 @@ which returns its pool, comes after their teardowns and every cascade they start
 Arena](#body-arena)). Every release a teardown makes pushes the object it orphans: an ancestor
 Memory object's retype lease, a donation's lease, the references a dying `CSpace`'s slots hold (a
 nested `CSpace` among them), a caller-sized wait set's member references, a thread's fault-handler
-binding, and the queue references of an owner's chain of death-observer nodes. The call pops and
-tears down the most recent object until the stack is empty, and no teardown calls `dealloc_object`
-itself, so a chain of `CSpace`s each holding the last reference to the next, or a `CSpace` releasing
-thousands of objects, is torn down iteratively with constant stack use, and no arm runs inside
-another's lock scope (a nested `CSpace`'s derivation drain takes the derivation lock after the outer
-arm has released it; a wait set's sources are torn down after `wait_set_drop` has released every
-source lock).
+binding and fault redirect, and the queue references of an owner's chain of death-observer nodes.
+The call pops and tears down the most recent object until the stack is empty, and no teardown calls
+`dealloc_object` itself, so a chain of `CSpace`s each holding the last reference to the next, or a
+`CSpace` releasing thousands of objects, is torn down iteratively with constant stack use, and no
+arm runs inside another's lock scope (a nested `CSpace`'s derivation drain takes the derivation
+lock after the outer arm has released it; a wait set's sources are torn down after
+`wait_set_drop` has released every source lock).
 
 The walk holds no lock across groups (each group's return takes only its Memory object's locks,
 its read lock and its retype-allocator lock), and takes the interrupts pending on its CPU after
@@ -421,8 +421,12 @@ most `RECORDS_PER_PAGE` records of one Memory object, whose return costs one wal
 page free list (at most one node per page of the object, [docs/limits.md](../../../docs/limits.md)),
 an insertion per run, and the sort of the group and of its records' kept arena pages. The kept
 pages are a dimension of their own, bounded by the bodies that outlive the `CSpace`, one page per
-body at most. Neither the donation count nor any `init_pages` lengthens the window; the walk's
-total length still grows with the donation count. It runs to completion in whichever context drops
+body at most. Before taking the locks, the return zeroes the group's runs
+([memory-internals.md](memory-internals.md) § Kernel Object Memory), taking the pending interrupts
+after every 16 pages it zeroes, so the zeroing adds at most one 16-page batch of stores to a window.
+Neither the donation count nor any `init_pages` lengthens the window; the walk's
+total length still grows with the donation count and, through the zeroing, with the pages donated,
+the create-time slab's `init_pages` included. It runs to completion in whichever context drops
 the last reference: the deleting syscall, with interrupts masked on that CPU except in the windows;
 or, when the owner is handed to the per-CPU deferred-reclaim stack (a thread deleting an object it
 is itself bound to, a syscall pin or a batched capability move dropping the last reference, or an
@@ -430,9 +434,10 @@ Mmio object's mapping record releasing the address space at that object's teardo
 list is [thread-lifecycle-and-sleep.md](thread-lifecycle-and-sleep.md) § Self-teardown) — the next
 syscall epilogue on that CPU, with interrupts masked except in the windows, or the idle thread's
 drain, with interrupts enabled ([scheduling-internals.md](scheduling-internals.md) § Lock
-Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how finely it donated, and
-can land on an unrelated thread's syscall, which is not preempted during it: the same memory
-donated as single pages costs one record per page. The standard runtime's map retry donates one
+Hierarchy, "Bare spin locks"). So an owner's teardown time scales with how much it donated, which
+the zeroing visits once per page, and with how finely, and can land on an unrelated thread's
+syscall, which is not preempted during it: the same memory donated as single pages costs one record
+per page. The standard runtime's map retry donates one
 page per page-table shortfall (its budget top-up donates the shortfall in one call), so a
 process's count is of the order of its page-table page count, one per 2 MiB of mapped span.
 
@@ -511,9 +516,10 @@ alive.
 The cut sorts each donation's kept pages once and walks its span with them in order, so a teardown
 with `r` donation records and `h` kept pages costs `O(r + h log h)`, allocating nothing and on a
 fixed stack (the sort is a bottom-up merge through 64 sorted runs), plus one walk of each record's
-Memory object's page free list, as the return of a donation without kept pages costs ([§
-Teardown](#teardown)). `h` counts only pages holding a body that outlives the `CSpace`: at most one
-per such body, and at most the `CSpace`'s arena pages, one per 31 bodies it funded. Each of those
+Memory object's page free list and the zeroing of every page it returns, `O(p)` for `p` donated
+pages, as the return of a donation without kept pages costs ([§ Teardown](#teardown)). `h` counts
+only pages holding a body that outlives the `CSpace`: at most one per such body, and at most the
+`CSpace`'s arena pages, one per 31 bodies it funded. Each of those
 pages returns later, in the call that frees its last chunk, as a one-page `retype_free`.
 
 ---
@@ -730,8 +736,9 @@ costs a 72-byte slot, a retype child of at least 128 bytes, or a 24-byte observe
 them hold at least 48 GiB against one object, and reaching it refuses instead of corrupting. Every
 other reference is taken unchecked, in the 2^31 of headroom between the limit and `u32::MAX`,
 because each kind is bounded by an object count rather than by a request. Per thread: its syscall
-pins (a few), its fault-handler binding (one), the lease of a retype it has in flight that passed
-`retype_allocate`'s check just before the count reached the limit (one), and the destinations of an
+pins (a few), its fault-handler binding (one), its fault redirect (one), the lease of a retype it
+has in flight that passed `retype_allocate`'s check just before the count reached the limit (one),
+and the destinations of an
 IPC transfer it has in flight that passed the message check (at most `MSG_CAP_SLOTS_MAX`, four);
 fewer than 16 in all. Per other object: wait-set membership (one per source), Mmio mapping records
 (each 16 bytes of a caller-funded body or spill chunk, so 2^31 of them hold 32 GiB), SEED leases
@@ -777,6 +784,10 @@ The principal kernel-internal owners:
   delivery and before its park (the pin-before-park rule), so a concurrent rebind or unbind
   cannot free the endpoint mid-delivery; a release that drops the last reference runs the
   endpoint's teardown, whose send-queue drain kills the faulter if it is still queued there.
+- **Fault redirect.** A `FAULT_REPLY_REDIRECT` reply takes a reference on the Endpoint it names
+  into the faulting thread's `fault_redirect` field (one per thread), held until the thread's next
+  delivery takes it (as a fault delivery does a binding's) or the thread's destruction releases
+  it ([fault-handling.md § Reply](../../../docs/fault-handling.md#reply)).
 - **Death-observer bindings.** `SYS_THREAD_BIND_NOTIFICATION` and
   `SYS_ASPACE_BIND_NOTIFICATION` take a reference on the bound EventQueue, under the owner's
   lock (the thread's `sched_lock`, the address space's `death_lock`), held for the binding's

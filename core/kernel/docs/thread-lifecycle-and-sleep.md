@@ -407,8 +407,12 @@ stated explicitly.
     enabled, until tcb.wake_in_flight == 0 — a waker that claimed tcb (under a
     source lock, or the timer at its pop) set it before its enqueue_and_wake,
     which, on the Exited tcb, clears it after releasing tcb's sched_lock, as
-    its last touch of the TCB. Then sleep_wakeups_quiesce(): a timer batch that popped
-    tcb keeps its pointer until the batch ends (Sleep List Invariant 9).
+    its last touch of the TCB. Then swap tcb.fault_redirect to null and release
+    the endpoint it held, if any, as step 13 releases a binding's: a
+    FAULT_REPLY_REDIRECT reply stores it before the wake that clears
+    wake_in_flight, so only after the gate is it final. Then
+    sleep_wakeups_quiesce(): a timer batch that popped tcb keeps its pointer
+    until the batch ends (Sleep List Invariant 9).
 15. (x86_64 only) Release IOPB if bound.
 16. Unregister tcb from the live-thread registry.
 17. Poison: tcb.magic = 0; tcb.priority = 0xFF.

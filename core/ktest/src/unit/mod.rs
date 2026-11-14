@@ -835,4 +835,8 @@ pub fn run_all(ctx: &TestContext)
     // ── Shared crypto primitives ──────────────────────────────────────────────
     run_test!("crypto::sha512_kats", crypto::sha512_kats(ctx));
     run_test!("crypto::ed25519_kats", crypto::ed25519_kats(ctx));
+    run_test!(
+        "crypto::chacha20_poly1305_kats",
+        crypto::chacha20_poly1305_kats(ctx)
+    );
 }

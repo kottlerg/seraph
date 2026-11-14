@@ -113,7 +113,16 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   request beyond the free block at the heap's top, and an allocation
   grows again while each grow maps pages, so a single allocation is
   bounded only by the heap zone ([Growth Zones](#growth-zones)) and the
-  pool.
+  pool. Design intent; not yet implemented
+  ([#230](https://github.com/kottlerg/seraph/issues/230)): in a
+  demand-paged process the grow path extends a committed demand region
+  above the heap floor instead, which memmgr charges in full, budget and
+  RAM, when it accepts the extension, and backs chunk by chunk on first
+  touch, so a grow is refused as an allocation error, never as a fault,
+  and the heap holds no Memory caps
+  ([memmgr Memory Pool § Eviction](../services/memmgr/docs/memory-pool.md#eviction)).
+  A process with no pager keeps requesting Memory caps with
+  `REQUEST_MEMORY_CAPS` and mapping them.
 - **Bootstrap.** Before `fn main()` runs, `std::os::seraph::_start`
   installs the heap floor at the process's heap base, drawn per process
   from the heap zone's window via one raw non-allocating `SYS_GETRANDOM`
@@ -270,8 +279,10 @@ quality caveat.
   `DEFAULT_PROCESS_STACK_PAGES`. Loaders refuse a binary whose note
   declares zero pages or more than `MAX_PROCESS_STACK_PAGES`; the pool's
   available RAM is the remaining gate on the resulting
-  `REQUEST_MEMORY_CAPS` calls (memmgr tracks per-process frames in a
-  RAM-bound arena, not a fixed quota). For an `ET_DYN` image the
+  `REQUEST_MEMORY_CAPS` calls, with the memory max of the process's
+  budget node where its creator set one; no default per-process ceiling
+  exists ([memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy). For an `ET_DYN` image the
   creator leaves the `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages below
   `stack_top_vaddr` to the stack: it maps no other surface there, the
   layout's draw windows keep every other bootstrap surface out of them
@@ -401,6 +412,20 @@ memmgr serves frame requests over IPC. The contract:
   pool's free pages cover it, the reply is a **partial grant**: success with
   fewer pages than asked. When the free pages do not cover `want_pages`, the
   request fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
+- **Reserve refusal.** A caller whose budget node is outside the system
+  reserve may not take its pages: either shape fails with its out-of-memory
+  code, before any run is taken, when `want_pages` would leave fewer free
+  pages than the reserve, however many pages are free. `QUERY_POOL_STATUS`
+  reports the reserve beside the free pages
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy;
+  [ipc-interface.md](../services/memmgr/docs/ipc-interface.md) § Label 6).
+- **Budget refusal.** Either shape fails with `memmgr_errors::LIMIT`, before
+  any run is taken, when `want_pages` would take the subtree of the caller's
+  budget node, or of an ancestor, over its max
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy). The RAM may exist; the caller's budget refuses it,
+  and only a release or a raised max lets a repeat succeed.
 - **Caller loops.** A best-effort caller MUST compare the granted page total
   with `want_pages` and request the remainder again (or release what it
   cannot use); a single reply is not guaranteed to cover the request.

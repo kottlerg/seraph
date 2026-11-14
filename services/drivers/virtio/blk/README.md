@@ -56,10 +56,11 @@ caller badge; unbadged callers are rejected:
    `QUERY_DEVICE` on the `block` class and held by vfsd. Reads and writes are bounded only
    by device capacity. Permitted to issue `REGISTER_PARTITION`.
 2. **Per-partition (partition badge, `MOUNT_AUTHORITY` clear)** — minted by
-   the driver and returned in the `REGISTER_PARTITION` reply; vfsd hands them
-   to filesystem drivers. The kernel rejects re-badging a badged source, so
-   the caller cannot derive partition caps itself. Reads and writes are
-   bounded by the partition LBA range registered for the badge.
+   the driver and returned in the `REGISTER_PARTITION` reply; vfsd keeps each
+   and hands a derivation of it to the filesystem driver. The kernel rejects
+   re-badging a badged source, so the caller cannot derive partition caps
+   itself. Reads and writes are bounded by the partition LBA range registered
+   for the badge.
 
 ---
 

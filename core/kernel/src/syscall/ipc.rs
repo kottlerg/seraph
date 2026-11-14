@@ -1157,7 +1157,10 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// move, or IPC capability transfer) wakes the caller with the synthetic
 /// `IPC_REPLY_TRANSFER_FAILED` label and returns the error to the server. No
 /// GRANT right check: the server is trusted by virtue of holding RECEIVE on the
-/// endpoint.
+/// endpoint. A reply to a fault-blocked caller moves no capability: its label
+/// is the disposition, and a [`syscall::FAULT_REPLY_REDIRECT`] reply's one
+/// capability names, in the server's `CSpace`, the endpoint the fault goes to
+/// next ([`stage_redirect`]).
 ///
 /// The reply binding is claimed before anything reads the caller: the won
 /// claim is what keeps the caller's TCB live (its `wake_in_flight` pin waits
@@ -1166,11 +1169,6 @@ unsafe fn deposit_transfer_failed_reply(caller: *mut crate::sched::thread::Threa
 /// failure sentinel. With no caller bound, the payload and capability checks
 /// still run, so their errors keep precedence over `InvalidCapability`
 /// (core/kernel/docs/syscalls.md § `SYS_IPC_REPLY`).
-#[expect(
-    clippy::too_many_lines,
-    reason = "a single logical operation (claim + payload + cap pre-alloc + reply dispatch, with a \
-              fault-reply fast path); splitting would obscure the all-or-nothing reply atomicity"
-)]
 #[cfg(not(test))]
 pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
 {
@@ -1212,72 +1210,13 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidCapability);
     };
 
-    // Fault reply: the caller is a thread the kernel parked BlockedOnFault by
-    // fault redirection, not a SYS_IPC_CALL caller. The reply label alone
-    // carries the disposition (RESUME default, KILL declines, FORWARD
-    // declines a VM-class delivery to the exception class and is a KILL on any
-    // other); its caps are neither validated nor moved, and the faulter's
-    // CSpace is not grown. A KILL or FORWARD reply's data word 0, when sent,
-    // is the handler's decline reason: it is deposited in the faulter's
-    // ipc_msg, which this won claim owns, for the kill diagnostic or the
-    // forwarded message (docs/fault-handling.md § Reply); an unreadable word
-    // deposits no reason rather than failing the reply. Record the
-    // outcome for the fault helper and wake the faulter, which resumes by
-    // re-executing its faulting instruction (or continuing from a
-    // handler-modified PC) rather than returning a syscall value. We won the
-    // reply_tcb CAS, so no canceller will also wake this faulter — recording
-    // the outcome here is race-free.
     // SAFETY: caller is pinned by the won claim (see above); its ipc_state is
     // stable until enqueue_and_wake clears it.
     if unsafe { (*caller).ipc_state } == crate::sched::thread::IpcThreadState::BlockedOnFault
     {
-        let outcome = if label == syscall::FAULT_REPLY_KILL || label == syscall::FAULT_REPLY_FORWARD
-        {
-            let mut reply = Message::new(label);
-            // SAFETY: tcb is the calling thread's valid TCB; ipc_buffer is
-            // written only by its own SYS_IPC_BUFFER_SET.
-            let buf = unsafe { (*tcb).ipc_buffer };
-            // SAFETY: buf is a user IPC buffer VA or 0, read through
-            // copy_from_user (read_ipc_buf's contract).
-            if data_count > 0 && unsafe { read_ipc_buf(buf, 1, &mut reply.data) }.is_ok()
-            {
-                reply.data_count = 1;
-            }
-            // SAFETY: caller pinned by the won claim, which owns its ipc_msg
-            // until the wake below.
-            unsafe { (*caller).ipc_msg = reply };
-            // SAFETY: caller pinned by the won claim; fault_delivery_class
-            // was written under its sched_lock when its delivery opened,
-            // before the message this reply answers was sent.
-            let class = usize::from(unsafe { (*caller).fault_delivery_class });
-            if label == syscall::FAULT_REPLY_FORWARD && class == crate::ipc::fault::CLASS_VM
-            {
-                crate::ipc::fault::FAULT_OUTCOME_FORWARDED
-            }
-            else
-            {
-                crate::ipc::fault::FAULT_OUTCOME_DECLINED
-            }
-        }
-        else
-        {
-            crate::ipc::fault::FAULT_OUTCOME_RESUME
-        };
-        // SAFETY: caller pinned by the claim.
-        unsafe { &(*caller).fault_outcome }.store(outcome, core::sync::atomic::Ordering::Release);
-        // SAFETY: caller pinned by the claim; the episode's exclusive claim is
-        // the reply_tcb CAS won inside endpoint_reply.
-        unsafe { crate::sched::thread::stamp_deposit_episode(caller) };
-        // SAFETY: caller pinned by the claim.
-        debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
-        // SAFETY: caller pinned by the claim.
-        let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
-        debug_assert!(target_cpu < crate::sched::MAX_CPUS);
-        // SAFETY: caller pinned by the claim; target_cpu came from
-        // select_target_cpu; it transitions to Ready under sched.lock in
-        // enqueue_and_wake.
-        unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
-        return Ok(0);
+        // SAFETY: tcb is the calling thread's valid TCB; caller is the
+        // fault-blocked thread whose reply claim it won; no lock is held.
+        return unsafe { reply_to_fault(tcb, caller, label, data_count, cap_count) };
     }
 
     // A SYS_IPC_CALL caller: read the data words and pre-validate the reply
@@ -1396,6 +1335,129 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
     Ok(0)
 }
 
+/// The fault-reply path of [`sys_ipc_reply`]: `caller` is a thread the
+/// kernel parked `BlockedOnFault` by fault redirection, not a `SYS_IPC_CALL`
+/// caller, and `server` won its reply claim.
+///
+/// The reply label alone carries the disposition (RESUME default, KILL
+/// declines, FORWARD declines a VM-class delivery to the exception class and
+/// is a KILL on any other, REDIRECT names the endpoint the fault goes to
+/// next); no cap is moved, and the faulter's `CSpace` is not grown. A KILL or
+/// FORWARD reply's data word 0, when sent, is the handler's decline reason: it
+/// is deposited in the faulter's `ipc_msg`, which the won claim owns, for the
+/// kill diagnostic or the forwarded message (docs/fault-handling.md § Reply);
+/// an unreadable word deposits no reason rather than failing the reply. A
+/// REDIRECT reply's one cap is resolved in `server`'s `CSpace`
+/// ([`stage_redirect`]); a refusal takes the unhandled outcome and returns its
+/// error. The outcome is recorded for the fault helper and the faulter woken;
+/// it resumes in `fault_dispatch`, not with a syscall value. The won
+/// `reply_tcb` CAS means no canceller also wakes the faulter, so recording the
+/// outcome here is race-free.
+///
+/// # Errors
+/// [`stage_redirect`]'s, for a refused REDIRECT reply; the faulter is woken
+/// with the unhandled outcome first.
+///
+/// # Safety
+/// `server` must be the calling thread's valid TCB, in syscall context with
+/// no lock held; `caller` is the fault-blocked thread whose reply claim
+/// `server` won inside `endpoint_reply`, pinned by that claim.
+#[cfg(not(test))]
+unsafe fn reply_to_fault(
+    server: *mut crate::sched::thread::ThreadControlBlock,
+    caller: *mut crate::sched::thread::ThreadControlBlock,
+    label: u64,
+    data_count: usize,
+    cap_count: usize,
+) -> Result<u64, SyscallError>
+{
+    let mut result = Ok(0);
+    let outcome = if label == syscall::FAULT_REPLY_REDIRECT
+    {
+        // SAFETY: the contract above, which is stage_redirect's.
+        match unsafe { stage_redirect(server, caller, data_count, cap_count) }
+        {
+            Ok(()) => crate::ipc::fault::FAULT_OUTCOME_REDIRECTED,
+            Err(e) =>
+            {
+                result = Err(e);
+                crate::ipc::fault::FAULT_OUTCOME_REDIRECT_REFUSED
+            }
+        }
+    }
+    else if label == syscall::FAULT_REPLY_KILL || label == syscall::FAULT_REPLY_FORWARD
+    {
+        // SAFETY: the contract above.
+        unsafe { deposit_reply_word(server, caller, label, 0, data_count) };
+        // SAFETY: caller pinned by the won claim; fault_delivery_class was
+        // written under its sched_lock when its delivery opened, before the
+        // message this reply answers was sent.
+        let class = usize::from(unsafe { (*caller).fault_delivery_class });
+        if label == syscall::FAULT_REPLY_FORWARD && class == crate::ipc::fault::CLASS_VM
+        {
+            crate::ipc::fault::FAULT_OUTCOME_FORWARDED
+        }
+        else
+        {
+            crate::ipc::fault::FAULT_OUTCOME_DECLINED
+        }
+    }
+    else
+    {
+        crate::ipc::fault::FAULT_OUTCOME_RESUME
+    };
+    // SAFETY: caller pinned by the claim.
+    unsafe { &(*caller).fault_outcome }.store(outcome, core::sync::atomic::Ordering::Release);
+    // SAFETY: caller pinned by the claim; the episode's exclusive claim is the
+    // reply_tcb CAS won inside endpoint_reply.
+    unsafe { crate::sched::thread::stamp_deposit_episode(caller) };
+    // SAFETY: caller pinned by the claim.
+    debug_assert_eq!(unsafe { (*caller).magic }, crate::sched::thread::TCB_MAGIC);
+    // SAFETY: caller pinned by the claim.
+    let target_cpu = unsafe { crate::sched::select_target_cpu(caller) };
+    debug_assert!(target_cpu < crate::sched::MAX_CPUS);
+    // SAFETY: caller pinned by the claim; target_cpu came from
+    // select_target_cpu; it transitions to Ready under sched.lock in
+    // enqueue_and_wake.
+    unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
+    result
+}
+
+/// Deposit a fault reply's `label` and its data word 0, when sent and
+/// readable from `server`'s IPC buffer, in `caller`'s `ipc_msg`, with `badge`:
+/// the decline reason of a KILL or FORWARD reply, the word of a REDIRECT.
+/// Written in place, so no staged `Message` adds to the reply path's frame.
+///
+/// # Safety
+/// `server` must be the calling thread's valid TCB; `caller` is pinned by
+/// `server`'s won reply claim, which owns its `ipc_msg` until the wake.
+#[cfg(not(test))]
+unsafe fn deposit_reply_word(
+    server: *mut crate::sched::thread::ThreadControlBlock,
+    caller: *mut crate::sched::thread::ThreadControlBlock,
+    label: u64,
+    badge: u64,
+    data_count: usize,
+)
+{
+    // SAFETY: server is the running thread; ipc_buffer is written only by its
+    // own SYS_IPC_BUFFER_SET.
+    let buf = unsafe { (*server).ipc_buffer };
+    // SAFETY: caller pinned by the won claim, which owns its ipc_msg until the
+    // wake (contract).
+    let deposit = unsafe { &mut (*caller).ipc_msg };
+    deposit.label = label;
+    deposit.badge = badge;
+    deposit.cap_count = 0;
+    deposit.data_count = 0;
+    // SAFETY: buf is a user IPC buffer VA or 0, read through copy_from_user
+    // (read_ipc_buf's contract).
+    if data_count > 0 && unsafe { read_ipc_buf(buf, 1, &mut deposit.data) }.is_ok()
+    {
+        deposit.data_count = 1;
+    }
+}
+
 /// Read a reply's data words and its `cap_count` capability handles from the
 /// server's IPC buffer into `msg`, and pre-validate the capability slots in
 /// the server's own `CSpace`.
@@ -1438,6 +1500,83 @@ unsafe fn stage_reply_payload(
         msg.cap_slots = handles;
         msg.cap_count = cap_count;
     }
+    Ok(())
+}
+
+/// Stage a [`syscall::FAULT_REPLY_REDIRECT`] reply of `server` for the
+/// fault-blocked `caller` whose reply claim it won: resolve the reply's one
+/// capability handle to an Endpoint cap of `server`'s, of any rights, take a
+/// reference on its endpoint into `caller`'s `fault_redirect`, and deposit
+/// the cap's badge and the reply's data word 0 (when sent and readable) in
+/// `caller`'s `ipc_msg`, for the faulter's next delivery pass
+/// (docs/fault-handling.md § Reply). The cap stays in `server`'s `CSpace`.
+///
+/// # Errors
+/// - `cap_count` other than one → [`SyscallError::InvalidArgument`].
+/// - `read_cap_handles`' errors for the handle: `InvalidArgument` with no IPC
+///   buffer registered, `InvalidAddress` when it is unmapped.
+/// - A stale handle or a cap other than an Endpoint →
+///   [`SyscallError::InvalidCapability`].
+///
+/// Nothing is deposited on an error.
+///
+/// # Safety
+/// `server` must be the calling thread's valid TCB, in syscall context with
+/// no lock held; `caller` is pinned by `server`'s won reply claim, which owns
+/// its `ipc_msg` and `fault_redirect` until the wake.
+#[cfg(not(test))]
+unsafe fn stage_redirect(
+    server: *mut crate::sched::thread::ThreadControlBlock,
+    caller: *mut crate::sched::thread::ThreadControlBlock,
+    data_count: usize,
+    cap_count: usize,
+) -> Result<(), SyscallError>
+{
+    if cap_count != 1
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // SAFETY: server is the running thread; ipc_buffer is written only by its
+    // own SYS_IPC_BUFFER_SET.
+    let buf = unsafe { (*server).ipc_buffer };
+    // SAFETY: buf validated by read_cap_handles.
+    let [handle, ..] = unsafe { read_cap_handles(buf, 1) }?;
+    // SAFETY: server is the running thread's valid TCB (contract).
+    let cspace = unsafe { (*server).cspace };
+    // SAFETY: cspace is the running thread's bound CSpace, which outlives the
+    // syscall; syscall context with no lock held (contract).
+    let cap = unsafe { lookup_cap(cspace, handle, EpRights::NONE) }?;
+    let ep = cap
+        .object
+        .ok_or(SyscallError::InvalidCapability)?
+        .cast::<crate::cap::object::EndpointObject>();
+    // The field's own reference, taken while the lookup's pin holds the
+    // endpoint; one per thread, so bounded (KernelObjectHeader::inc_ref).
+    // SAFETY: ep is the Endpoint object the lookup pinned, live while `cap`
+    // lives; the header is at offset 0.
+    unsafe { ep.as_ref() }.header.inc_ref();
+
+    // SAFETY: server and caller as this fn's contract states.
+    unsafe {
+        deposit_reply_word(
+            server,
+            caller,
+            syscall::FAULT_REPLY_REDIRECT,
+            cap.badge,
+            data_count,
+        );
+    }
+    // SAFETY: caller pinned by the won claim, which owns its fault_redirect
+    // until the wake (contract); the field is atomic.
+    let prior = unsafe { &(*caller).fault_redirect }
+        .swap(ep.as_ptr(), core::sync::atomic::Ordering::Release);
+    debug_assert!(
+        prior.is_null(),
+        "sys_ipc_reply: fault_redirect set while a delivery was in flight"
+    );
+    // The lookup's pin is released here, with no lock held; the field's
+    // reference keeps the endpoint.
+    drop(cap);
     Ok(())
 }
 

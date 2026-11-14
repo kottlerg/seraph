@@ -54,6 +54,8 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   Handshake-checked at first contact (`data[0]` unless noted):
 //     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
 //     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
+//                             and vfsd_labels::GET_SWAP_PARTITION
+//                             (swap service ↔ vfsd)
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
 //                             and blk_labels::BLK_GET_GEOMETRY
 //                             (vfsd, fatfs ↔ virtio-blk)
@@ -88,7 +90,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 13;
+pub const PROCMGR_LABELS_VERSION: u32 = 15;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -99,9 +101,12 @@ pub mod procmgr_labels
     use core::prelude::rust_2024::*;
 
     /// Create a new process from a boot module Memory cap. Caps: `[module,
-    /// creator_endpoint?, argv_env?]`, the last present iff
+    /// creator_endpoint?, argv_env?, death_relay?]`, `argv_env` present iff
     /// [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data words
-    /// `0..4`. Label layout as for [`CREATE_FROM_FILE`] (bit 17 is ignored).
+    /// `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as for
+    /// [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
+    /// the next data word (word 0, or word 4 after the header). Label layout
+    /// and reply as for [`CREATE_FROM_FILE`].
     /// Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
     /// the returned badged `process_handle` — procmgr's CREATE path
@@ -126,11 +131,18 @@ pub mod procmgr_labels
     /// * bit `28` — [`CREATE_DMA_HOLD`]
     /// * bit `29` — [`CREATE_ARGV_ENV`]
     /// * bit `30` — [`CREATE_PHYS_ACCESS`]
-    /// * bits `[31..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `31` — [`CREATE_MEMORY_MAX`]
+    /// * bit `32` — [`CREATE_RESERVE`]
+    /// * bits `[33..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
     /// * `words 1..5` — the [`ArgvEnvHeader`] (only when [`CREATE_ARGV_ENV`] is set)
+    /// * the next word — the child's memory max in pages (only when
+    ///   [`CREATE_MEMORY_MAX`] is set): word 1, or word 5 after the header
+    ///
+    /// Reply: `data[0]` is the max the child's memmgr budget node took after
+    /// memmgr's clamp, `u64::MAX` for none.
     ///
     /// Caps: `[file_cap, creator_endpoint?, argv_env?, death_relay?]`. The
     /// `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`] is set, and
@@ -164,12 +176,12 @@ pub mod procmgr_labels
     /// and never routed through this binding path, so they are pinned by
     /// construction regardless.
     pub const CREATE_PINNED: u64 = 1 << 16;
-    /// Label flag (bit 17) for [`CREATE_FROM_FILE`]: the message carries a
-    /// trailing death-relay POST-only `EventQueue` cap (the LAST cap in the
-    /// message, which then carries at least two caps). Once the child is
-    /// recorded, procmgr binds it as an `AddressSpace` death observer
-    /// (correlator 0) on the child so that a terminal fault in any
-    /// of the child's threads posts the fault class straight to the
+    /// Label flag (bit 17) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// the message carries a trailing death-relay POST-only `EventQueue` cap
+    /// (the LAST cap in the message, which then carries at least two caps).
+    /// Once the child is recorded, procmgr binds it as an `AddressSpace`
+    /// death observer (correlator 0) on the child so that a terminal fault
+    /// in any of the child's threads posts the fault class straight to the
     /// spawner's own death queue, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
     /// `EventQueue` state at bind time). Occupies bit 17 of the
@@ -240,11 +252,32 @@ pub mod procmgr_labels
     /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
     /// (**physical-address flag**).
     pub const CREATE_PHYS_ACCESS: u64 = 1 << 30;
-    /// Still-reserved bits `[31..64]` of a create label. Procmgr rejects
+    /// Label flag (bit 31) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
+    /// request carries a memory max for the child, in pages, in one data word
+    /// after the others: after the [`ArgvEnvHeader`] when [`CREATE_ARGV_ENV`]
+    /// is set, so at word 0 or 4 of `CREATE_PROCESS` and at word 1 or 5 of
+    /// `CREATE_FROM_FILE`. procmgr registers the child's memmgr budget node
+    /// with that max (`memmgr_labels::REGISTER_MAX`), which memmgr clamps to
+    /// what the creator's node and every ancestor have left; the create reply
+    /// carries the max the node took in `data[0]`. A request that sets the
+    /// flag without delivering the word is refused (`INVALID_ARGUMENT`).
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
+    /// `CREATE_PROCESS` (**Memory max and reserve**).
+    pub const CREATE_MEMORY_MAX: u64 = 1 << 31;
+    /// Label flag (bit 32) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// make the child's memmgr budget node a system-reserve node
+    /// (`memmgr_labels::REGISTER_RESERVE`). Honoured only from a creator
+    /// whose own node is a reserve node; procmgr refuses it from any other
+    /// creator (`INVALID_ARGUMENT`). A child of an un-badged creator (init)
+    /// is a reserve node with or without it. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
+    /// (**Memory max and reserve**).
+    pub const CREATE_RESERVE: u64 = 1 << 32;
+    /// Still-reserved bits `[33..64]` of a create label. Procmgr rejects
     /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
     /// addition is provably additive: existing senders are known to send
     /// zeros.
-    pub const CREATE_RESERVED_MASK: u64 = !((1 << 31) - 1);
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 33) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 
@@ -838,7 +871,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 9;
+pub const MEMMGR_LABELS_VERSION: u32 = 10;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -866,7 +899,12 @@ pub mod memmgr_labels
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process and receive the badged SEND cap
     /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
-    /// `data[1]` carries the flags ([`REGISTER_PHYS_CLASS`]). Specified in
+    /// `data[1]` carries the flags ([`REGISTER_PHYS_CLASS`],
+    /// [`REGISTER_RESERVE`], [`REGISTER_MAX`]), `data[2]` the memmgr badge of
+    /// the process whose budget node is the new node's parent (0 for a
+    /// top-level node), and `data[3]` the max in pages with [`REGISTER_MAX`].
+    /// The reply carries the badge in `data[0]` and the max the node took, after
+    /// memmgr's clamp, in `data[1]`. Specified in
     /// `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
@@ -876,6 +914,14 @@ pub mod memmgr_labels
     /// [`CREATE_PHYS_ACCESS`](super::procmgr_labels::CREATE_PHYS_ACCESS)
     /// (devmgr and the IOMMU drivers).
     pub const REGISTER_PHYS_CLASS: u64 = 1 << 0;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 1): the new budget node is in
+    /// the system reserve. memmgr refuses it under a parent outside the
+    /// reserve.
+    pub const REGISTER_RESERVE: u64 = 1 << 1;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 2): `data[3]` carries the new
+    /// budget node's max in pages, which memmgr clamps to what the parent and
+    /// every ancestor have left. Without it the node has no max.
+    pub const REGISTER_MAX: u64 = 1 << 2;
     /// The bit of a memmgr process badge that marks a phys-class process
     /// ([`REGISTER_PHYS_CLASS`]); memmgr draws the other 63 bits at random.
     /// init clears it in the badge it mints for procmgr on memmgr's endpoint,
@@ -915,11 +961,14 @@ pub mod memmgr_labels
     ///   `free_bytes` once a later reclamation's recheck finds it
     ///   unreachable. A caller polls `free_bytes` and `deferred_bytes`
     ///   together to confirm a dead process's pages were reclaimed.
+    /// * `data[5]` — `largest_free_bytes`: the largest single free run.
+    /// * `data[6]` — `reserve_bytes`: the system reserve, the free pages a
+    ///   charge to a budget node outside the reserve may not take.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory. `data[3]` and `data[4]` are appended fields — readers
+    /// "dark" memory. `data[3]` to `data[6]` are appended fields — readers
     /// needing only the identity may ignore them.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.
@@ -986,6 +1035,16 @@ pub mod memmgr_labels
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (unknown badge or no
     /// region matches `[va_base, len)` exactly).
     pub const UNREGISTER_REGION: u64 = 9;
+
+    /// Read the caller's own budget usage, in pages. Universal label,
+    /// attributed by `recv.badge`; read-only.
+    ///
+    /// Reply (`SUCCESS`): `data[0]` the pages charged to the caller's budget
+    /// node, `data[1]` its max (`u64::MAX` for none), and `data[2]` the pages
+    /// charged to it and every node below it. `INVALID_ARGUMENT` for an
+    /// unknown badge. Specified in `services/memmgr/docs/ipc-interface.md`
+    /// § Label 10: `QUERY_MEMORY_USAGE`.
+    pub const QUERY_MEMORY_USAGE: u64 = 10;
 
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with
@@ -1054,6 +1113,10 @@ pub mod memmgr_errors
     /// caller's version as `data[0]`; mismatch here means the caller was
     /// built against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
+    /// The request would take the subtree of the caller's budget node, or of
+    /// an ancestor, over its max. Distinct from the out-of-memory codes: the
+    /// RAM may exist, and the caller's budget refuses it.
+    pub const LIMIT: u64 = 8;
 }
 
 /// Init → memmgr bootstrap payload layout.
@@ -1151,7 +1214,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 10;
+pub const SVCMGR_LABELS_VERSION: u32 = 11;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -1222,8 +1285,8 @@ pub mod svcmgr_labels
     // endowment, not a dedicated label (svcmgr launches logd itself, from
     // its recipe). The `CAPS` rounds carry svcmgr's own endpoints plus the source
     // caps it needs for its publish role (`rootfs.root` SEND,
-    // devmgr-registry `SEND|GRANT` source, `vfsd.mount` and `vfsd.deny`
-    // SENDs) and `SVCMGR_LABELS_VERSION` in
+    // devmgr-registry `SEND|GRANT` source, `vfsd.mount`, `vfsd.deny`, and
+    // `vfsd.swap` SENDs) and `SVCMGR_LABELS_VERSION` in
     // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
     // pair svcmgr parks in its pending-registration table; a final
     // `LOGD_SOURCES` round carries the master-log and procmgr death-auth
@@ -1358,7 +1421,7 @@ pub mod svcmgr_labels
 ///
 /// A name whose cap carries authority is seed-only: `rootfs.root`, the
 /// four `devmgr.*` names, [`published_names::VFSD_MOUNT`],
-/// [`published_names::LOGD_QUERY`], and each provider
+/// [`published_names::VFSD_SWAP`], [`published_names::LOGD_QUERY`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
 /// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
@@ -1371,9 +1434,9 @@ pub mod svcmgr_labels
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
 {
-    /// Badged SEND on the root filesystem's namespace endpoint at
-    /// its root directory. The driver behind it (fatfs today, any
-    /// FS driver tomorrow) is opaque to consumers.
+    /// Badged SEND on vfsd's namespace endpoint at its synthetic root:
+    /// the namespace root, which crosses mounts. The fs drivers behind
+    /// it are opaque to consumers.
     pub const ROOTFS_ROOT: &[u8] = b"rootfs.root";
 
     /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's
@@ -1437,6 +1500,13 @@ pub mod published_names
     /// which carries no verb bit: the negative-test twin of [`VFSD_MOUNT`].
     /// Seed-only and seeded only by svctest.
     pub const VFSD_DENY: &[u8] = b"vfsd.deny";
+
+    /// SEND on vfsd's service endpoint badged
+    /// `vfsd_labels::SWAP_AUTHORITY` alone: the `GET_SWAP_PARTITION`
+    /// surface. Seed-only; the swap service's recipe is to seed it, and
+    /// svctest's recipe seeds it while no swap service exists, to drive the
+    /// hand-out.
+    pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
 
     /// SEND on the master log endpoint badged
     /// `log_labels::LOG_QUERY_AUTHORITY`: logd's `QUERY_SLOTS` and
@@ -1634,7 +1704,7 @@ pub mod pwrmgr_errors
 
 /// Wire-protocol version of [`vfsd_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const VFSD_LABELS_VERSION: u32 = 2;
+pub const VFSD_LABELS_VERSION: u32 = 3;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
@@ -1660,6 +1730,20 @@ pub mod vfsd_labels
     /// from which all later namespace-cap distribution flows.
     pub const GET_SYSTEM_ROOT_CAP: u64 = 13;
 
+    /// Hand the caller a cap on the swap partition: a `SEND_GRANT` on the
+    /// block driver of the disk that holds the partition of
+    /// `boot_protocol::role_guids::SERAPH_SWAP` type, badged with that
+    /// partition's range. At most one cap vfsd handed out reaches the
+    /// partition: each hand-out revokes the one before it.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::VFSD_LABELS_VERSION`].
+    /// Reply: `SUCCESS` with `caps[0]` = the partition cap; `UNAUTHORIZED`
+    /// when the caller's badge lacks [`SWAP_AUTHORITY`];
+    /// `LABEL_VERSION_MISMATCH` when `data[0]` differs; `NO_MOUNT` when no
+    /// held disk carries a swap partition or two tie at the highest priority;
+    /// `IO_ERROR` when the registration, the revoke, or the derivation fails.
+    pub const GET_SWAP_PARTITION: u64 = 14;
+
     /// Authority bit in the vfsd-service-endpoint badge. Set on caps
     /// minted for consumers permitted to call
     /// [`GET_SYSTEM_ROOT_CAP`]. Without it the handler replies
@@ -1676,6 +1760,15 @@ pub mod vfsd_labels
     /// The cap is badged, so its holder cannot add [`SEED_AUTHORITY`].
     /// Disjoint position from [`SEED_AUTHORITY`].
     pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Authority bit in the vfsd-service-endpoint badge gating
+    /// [`GET_SWAP_PARTITION`]. init mints it, alone, onto a SEND it endows
+    /// svcmgr with; svcmgr publishes that SEND seed-only as
+    /// [`crate::published_names::VFSD_SWAP`], which only the swap service's
+    /// recipe is to seed (svctest's recipe seeds it while no swap service
+    /// exists). The cap is badged, so its holder cannot add another bit.
+    /// Disjoint position from [`MOUNT_AUTHORITY`] and [`SEED_AUTHORITY`].
+    pub const SWAP_AUTHORITY: u64 = 1u64 << 61;
 
     /// The badge init stamps on the no-authority SEND on vfsd's service
     /// endpoint that svcmgr publishes seed-only as
@@ -1741,7 +1834,7 @@ pub mod ns_labels
 
 /// Wire-protocol version of [`fs_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const FS_LABELS_VERSION: u32 = 5;
+pub const FS_LABELS_VERSION: u32 = 6;
 /// IPC labels for filesystem drivers (FAT, ext4, etc.).
 pub mod fs_labels
 {
@@ -1925,6 +2018,28 @@ pub mod fs_labels
     /// cap). Every refusal deletes the carried SEND. Specified in
     /// `services/fs/docs/fs-driver-protocol.md` § Label 18: `FS_OPEN`.
     pub const FS_OPEN: u64 = 18;
+    /// Unmount: the driver ends its service and exits.
+    ///
+    /// Request: un-badged, on the driver's service endpoint, as [`FS_MOUNT`];
+    /// `data[0]` = caller's compiled [`super::FS_LABELS_VERSION`]; the
+    /// [`UNMOUNT_FORCE`] flag in the label's flag bits. The driver releases
+    /// every open whose client is gone; when live opens remain and the
+    /// request is not forced, it replies `fs_errors::BUSY` with `data[0]` =
+    /// the live opens and keeps serving. Otherwise it releases every open,
+    /// as [`FS_CLOSE`] would, replies `fs_errors::SUCCESS`, and exits with
+    /// [`EXIT_UNMOUNTED`]. Specified in
+    /// `services/fs/docs/fs-driver-protocol.md` § Label 19: `FS_UNMOUNT`.
+    pub const FS_UNMOUNT: u64 = 19;
+    /// [`FS_UNMOUNT`] flag: unmount with live opens, releasing them.
+    pub const UNMOUNT_FORCE: u64 = 1 << 16;
+    /// Exit code of a driver that replied to [`FS_UNMOUNT`] and exited: the
+    /// exit reason its death observers receive is
+    /// `syscall_abi::encode_exit_code` of it. Specified, with
+    /// [`EXIT_DEVICE_GONE`], in `services/fs/docs/fs-driver-protocol.md`
+    /// § Driver exit.
+    pub const EXIT_UNMOUNTED: u32 = 0;
+    /// Exit code of a driver that found its block device capability revoked.
+    pub const EXIT_DEVICE_GONE: u32 = 1;
 }
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
@@ -3550,6 +3665,7 @@ const _: () = core::assert!(
         && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
+        && vfsd_labels::SWAP_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
         && log_labels::LOG_QUERY_AUTHORITY & VERB_BIT_MASK != 0
         && log_badges::LOG_BADGE_INIT & VERB_BIT_MASK == 0
@@ -3858,6 +3974,9 @@ pub mod fs_errors
     /// `FS_WRITE` on a directory cap) or because the operation is
     /// permitted only on files.
     pub const IS_A_DIRECTORY: u64 = 12;
+    /// `FS_UNMOUNT` without `UNMOUNT_FORCE` refused: live opens remain;
+    /// `data[0]` carries their count.
+    pub const BUSY: u64 = 13;
     /// Unknown opcode on fs-driver endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

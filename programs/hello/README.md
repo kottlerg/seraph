@@ -69,6 +69,10 @@ spawn target:
   destroys one child before its start and starts another to its exit, and checks that procmgr
   holds the started child's pages until `RELEASE_HOLD` on the child's release token, which its
   process handle cannot send.
+- `memory_max_phase` (`services/svctest/src/phases/budget.rs`) passes it as the file cap of
+  refused raw `CREATE_FROM_FILE` requests (one with a one-page memory max, which procmgr cannot
+  load it under), and its `budget-child` creates it with a memory max above the child's own and
+  destroys it unstarted, to check the max memmgr clamps it to.
 - `pipes_phase` (`services/svctest/src/phases/pipes.rs`) captures its stdout through a pipe
   and through `Command::output()`, and expects bytes and a clean exit.
 

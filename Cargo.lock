@@ -1627,6 +1627,7 @@ dependencies = [
  "syscall-abi",
  "vfsd-gpt",
  "vfsd-root-backend",
+ "vfsd-swap",
 ]
 
 [[package]]
@@ -1638,6 +1639,13 @@ name = "vfsd-root-backend"
 version = "0.1.4"
 dependencies = [
  "namespace-protocol",
+]
+
+[[package]]
+name = "vfsd-swap"
+version = "0.1.4"
+dependencies = [
+ "vfsd-gpt",
 ]
 
 [[package]]

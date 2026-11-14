@@ -2982,6 +2982,11 @@ pub fn sys_cap_create_wait_set(tf: UserFrame) -> Result<u64, SyscallError>
     }
 }
 
+/// One past the highest `syscall::CAP_INFO_*` selector `sys_cap_info`
+/// answers; raise it when a new selector is at or above it. A selector at or
+/// past it is refused before the dispatch.
+const CAP_INFO_FIELD_BOUND: u64 = syscall::CAP_INFO_IRQ_REMAP_HANDLES + 1;
+
 /// `SYS_CAP_INFO` (36): read-only inspection of a capability slot's runtime state.
 ///
 /// arg0 = capability handle in the caller's `CSpace` (generation-checked).
@@ -3064,6 +3069,16 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     // mispredicted tag test reaches casts null, never an object of another
     // type. Architecturally the arm's tag check has passed, so `object_of`
     // returns the pinned object, which the arms' SAFETY comments rely on.
+
+    // A selector at or past the bound is refused here, after the handle (so a
+    // bad handle still reports `InvalidCapability`), and the dispatch reads
+    // the selector clamped as data: a mispredicted refusal selects arm 0,
+    // never a jump-table entry past the table.
+    if field >= CAP_INFO_FIELD_BOUND
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    let field = crate::arch::nospec::mask_index_u64(field, CAP_INFO_FIELD_BOUND);
 
     match field
     {
@@ -3156,6 +3171,13 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
             // the queried cap carries it, or the caller names in `arg2` a
             // Memory cap of its own that does (core/kernel/docs/syscalls.md
             // § `SYS_CAP_INFO`). The credential is pinned only for the check.
+            // Whichever holds it is folded into the object read below as data:
+            // the queried cap's `PHYS` through the rights hidden at resolution,
+            // the credential's through the object its lookup folds `PHYS`
+            // into. A path past a mispredicted refusal reads a null object
+            // (core/kernel/docs/capability-internals.md § Speculative-Execution
+            // Hardening).
+            let mut phys_held = slot.rights_mask(MemRights::PHYS.erase());
             if !rights.contains(MemRights::PHYS.erase())
             {
                 let credential = tf.arg(2);
@@ -3165,10 +3187,23 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
                 }
                 // SAFETY: caller_cspace is the running thread's bound CSpace;
                 // no lock held.
-                drop(unsafe { super::lookup_cap(caller_cspace, credential, MemRights::PHYS) }?);
+                let held =
+                    unsafe { super::lookup_cap(caller_cspace, credential, MemRights::PHYS) }?;
+                // The mask reads the folded object's address itself, not a
+                // test of it, so no branch the lookup took on the object lets
+                // the compiler fold it: all-ones when the address is non-null.
+                let credential_object = held.object.map_or(0, |object| object.as_ptr().addr());
+                phys_held |= crate::arch::nospec::index_mask(0, credential_object);
+                drop(held);
             }
-            // SAFETY: tag confirmed Memory.
-            let memory = unsafe { &*(slot.object_of(CapTag::Memory).cast::<MemoryObject>()) };
+            let memory = crate::arch::nospec::select_ptr(
+                phys_held,
+                slot.object_of(CapTag::Memory),
+                core::ptr::null_mut(),
+            );
+            // SAFETY: tag confirmed Memory, and the caller holds `PHYS` (checked
+            // above), so `memory` is the MemoryObject `slot` pins.
+            let memory = unsafe { &*memory.cast::<MemoryObject>() };
             Ok(memory.base)
         }
         CAP_INFO_MEMORY_MAPPINGS =>
@@ -3508,6 +3543,11 @@ fn wait_set_capacity(raw: u64) -> Option<u16>
 /// `first_page .. first_page + pages` of a region of `region_bytes`, or `None`
 /// when `pages` is 0 or above `max_pages`, or the window runs past the region.
 /// Every product and sum is checked, so no register value wraps into range.
+/// The window returned is clamped to the region as data
+/// (`nospec::mask_span_u64`), so the frame-map walk of a path past a
+/// mispredicted check reads no count outside the region
+/// (core/kernel/docs/capability-internals.md § Speculative-Execution
+/// Hardening).
 fn mappings_window(
     first_page: u64,
     pages: u64,
@@ -3526,7 +3566,11 @@ fn mappings_window(
     {
         return None;
     }
-    Some((offset, len))
+    Some(crate::arch::nospec::mask_span_u64(
+        offset,
+        len,
+        region_bytes,
+    ))
 }
 
 /// The `SYS_CAP_CREATE_EVENT_QUEUE` observer-node count argument as a `u32`, or
@@ -3557,7 +3601,44 @@ fn event_queue_capacity(raw: u64) -> Option<u32>
 #[cfg(test)]
 mod tests
 {
-    use super::{event_queue_capacity, event_queue_observers, mappings_window, wait_set_capacity};
+    use super::{
+        CAP_INFO_FIELD_BOUND, event_queue_capacity, event_queue_observers, mappings_window,
+        wait_set_capacity,
+    };
+
+    // Defect guarded: a selector added at or past the dispatch bound without
+    // raising it would be refused, and a bound left above the selectors would
+    // let a mispredicted refusal index past the dispatch's jump table.
+    #[test]
+    fn cap_info_field_bound_is_one_past_the_highest_selector()
+    {
+        let selectors = [
+            syscall::CAP_INFO_TAG_RIGHTS,
+            syscall::CAP_INFO_MEMORY_SIZE,
+            syscall::CAP_INFO_MEMORY_AVAILABLE,
+            syscall::CAP_INFO_MEMORY_HAS_RETYPE,
+            syscall::CAP_INFO_ASPACE_PT_BUDGET,
+            syscall::CAP_INFO_CSPACE_CAPACITY,
+            syscall::CAP_INFO_CSPACE_USED,
+            syscall::CAP_INFO_CSPACE_BUDGET,
+            syscall::CAP_INFO_MEMORY_PHYS_BASE,
+            syscall::CAP_INFO_THREAD_STATE,
+            syscall::CAP_INFO_TLB_ELIDED,
+            syscall::CAP_INFO_TLB_PERFORMED,
+            syscall::CAP_INFO_MEMORY_MAPPINGS,
+            syscall::CAP_INFO_SOLE_REFERENCE,
+            syscall::CAP_INFO_ASPACE_TERMINAL_FAULT,
+            syscall::CAP_INFO_IRQ_MSG_ADDRESS,
+            syscall::CAP_INFO_IRQ_MSG_DATA,
+            syscall::CAP_INFO_IRQ_REMAP_ENTRY,
+            syscall::CAP_INFO_IRQ_REMAP_HANDLES,
+        ];
+        assert!(selectors.iter().all(|&s| s < CAP_INFO_FIELD_BOUND));
+        assert_eq!(
+            selectors.iter().max().map(|m| m + 1),
+            Some(CAP_INFO_FIELD_BOUND)
+        );
+    }
 
     // Defect guarded: a capacity narrowed before its range check, or a zero
     // capacity accepted, would size a set the walk and ring cannot index.

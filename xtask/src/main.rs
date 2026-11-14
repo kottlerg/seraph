@@ -102,6 +102,7 @@ fn main()
         CliCommand::TestKaslr(args) => commands::test_kaslr::run(&ctx, args),
         CliCommand::TestCrashReport(args) => commands::test_crash_report::run(args),
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
+        CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),

@@ -133,14 +133,16 @@ a sender that sets no level logs at info.
   environment entry (`error`, `warn`, `info`, `debug`, or `trace`; absent
   or any other value: info). A line above that level is neither formatted
   nor sent, so it costs no IPC; a record is filtered as a line is. A
-  service sets the entry with the `.svc`
+  service svcmgr launches sets the entry with the `.svc`
   `env` key ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
-  § `argv` / `env`), a spawner with `Command::env`. The processes init
-  spawns (procmgr, devmgr, vfsd, and svcmgr) and those devmgr and vfsd
-  spawn (the drivers and fatfs) receive no environment, so they log at
-  info and their debug lines show only with a code change; svcmgr only
-  binds the services init spawns, so an `env` key in their `.svc` recipes
-  reaches nothing. Neither receiver
+  § `argv` / `env`), a spawner with `Command::env`. The services init
+  spawns (procmgr, devmgr, vfsd, and svcmgr) take their level from the
+  boot bundle's log-level configuration, `services/init/log-levels.conf`,
+  which init reads at boot and passes to each as its `SERAPH_LOG` entry
+  ([init bootstrap](../../init/docs/bootstrap.md) § Log levels); svcmgr
+  only binds the services init spawns, so an `env` key in their `.svc`
+  recipes reaches nothing. A driver devmgr spawns and a fatfs instance vfsd
+  spawns inherit their spawner's level. Neither receiver
   filters: each renders every line it receives. An error line is sent at
   every level.
 - **Line level.** The stream carries bytes, not lines, so a receiver gives a

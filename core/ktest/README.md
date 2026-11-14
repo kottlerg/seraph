@@ -106,7 +106,7 @@ subsystem, mirroring the kernel's own source layout.
 | `cap_info.rs` | `SYS_CAP_INFO` (tag, rights, sole reference, type-specific fields); the `InitInfo` RAM Memory descriptors against their caps; the `Phys` gate on the physical base and on an address space's `Read` right |
 | `retype.rs` | Retype primitive: augmentation and donation spill, `CSpace` growth into the indirect and double-indirect directory regions by explicit placement, PT walk budget, kernel PT pool, and the page-pool latency cases: a TLB shootdown of a CPU deleting a pool of ten thousand donations, or seeding one large donation, is acknowledged within a bound while the call runs; and the machine-code stubs the address-space stop cases run, each written through a data mapping and then mapped executable, with `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rising across that map (the instruction-fetch synchronisation of [docs/memory-model.md § Instruction-Fetch Coherence](../../docs/memory-model.md#instruction-fetch-coherence), which QEMU does not need to pass) |
 | `mm.rs` | `SYS_MEM_MAP/UNMAP/PROTECT`, `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_ASPACE_QUERY` |
-| `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument` |
+| `entropy.rs` | `SYS_GETRANDOM`, including an unmapped or read-only buffer refused with `InvalidAddress` and an over-maximum length refused with `InvalidArgument`; `SYS_ENTROPY_CONTRIBUTE` (`entropy_contribute_then_draw`, `entropy_contribute_cap_refusals`, `entropy_contribute_arg_refusals`) |
 | `notification.rs` | `SYS_NOTIFICATION_SEND`, `SYS_NOTIFICATION_WAIT` (blocking and `notification_wait_timeout`) |
 | `event.rs` | `SYS_EVENT_POST`, `SYS_EVENT_RECV` (blocking, `try_recv`, timeout) |
 | `wait_set.rs` | `SYS_WAIT_SET_ADD/REMOVE/WAIT`, including two threads waiting on one set at once, each arrival on a member waking one of them, a member that takes several arrivals holding one ready-ring entry so another member's still reaches a waiter, a member's backlog served in turn while another member keeps taking arrivals, work a woken waiter leaves returned by a later wait, and a ready-ring entry skipped once its endpoint's only sender is stopped, as [docs/ipc-design.md § Waiting on Multiple Sources](../../docs/ipc-design.md#waiting-on-multiple-sources) defines |
@@ -426,8 +426,8 @@ Defined in `src/main.rs` (the `spawn::` items in `src/spawn.rs`, the `tally::` i
   `thread_cap` (ktest's own Thread cap, through which a test pins or
   reprioritises the harness thread), the IPC buffer pointer `ipc_buf`,
   `memory_base` (first RAM Memory cap), `sbi_control_cap` (zero on
-  x86-64), `sched_control_cap` (the root `SchedControl`), and
-  `init_info_va` (the `InitInfo` page's VA). Passed by reference to
+  x86-64), `sched_control_cap` (the root `SchedControl`), `entropy_control_cap` (the
+  root `EntropyControl`), and `init_info_va` (the `InitInfo` page's VA). Passed by reference to
   every test function. `cspace_cap` is queried via
   `cap_info(_, CAP_INFO_CSPACE_CAPACITY)` by hardware tests whose
   scans must cover slots populated after `aspace_cap` (e.g. narrow

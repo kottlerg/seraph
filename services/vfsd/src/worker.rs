@@ -163,10 +163,22 @@ fn handle_create_from_file(
         return false;
     };
 
+    let argv_env = crate::driver::inherited_level_env();
+    let argv_env_flag = if argv_env.is_some()
+    {
+        procmgr_labels::CREATE_ARGV_ENV
+    }
+    else
+    {
+        0
+    };
     // An fs driver is the blocking dependency of every vfsd read, so it
     // runs at vfsd's own level; band ceiling equals the level.
-    let create_msg = IpcMessage::builder(
+    // Caps: [file_cap, creator, argv_env?]; the argv/env header rides in data
+    // words 1..5, after `file_size`.
+    let mut builder = IpcMessage::builder(
         procmgr_labels::CREATE_FROM_FILE
+            | argv_env_flag
             | procmgr_labels::create_sched_bits(
                 ipc::sched_policy::FS_DRIVER_PRIORITY,
                 ipc::sched_policy::FS_DRIVER_PRIORITY,
@@ -174,12 +186,22 @@ fn handle_create_from_file(
     )
     .word(0, file_size)
     .cap(file_cap)
-    .cap(badged_creator)
-    .build();
+    .cap(badged_creator);
+    if let Some(env) = &argv_env
+    {
+        builder = builder.words(1, &env.header_words()).cap(env.cap());
+    }
+    let create_msg = builder.build();
 
     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
     // file_cap and badged_creator ownership transfer via the IPC.
-    let Ok(create_reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
+    let create_reply = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
+    // procmgr has copied the env by now, or refused the request.
+    if let Some(env) = argv_env
+    {
+        env.settle(create_reply.as_ref().map_or(0, |r| r.label));
+    }
+    let Ok(create_reply) = create_reply
     else
     {
         // A call refused before delivery transfers no cap, so both are still

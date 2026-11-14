@@ -397,8 +397,8 @@ it is not delivered, so a declined upcall is dropped and the thread continues
 A syscall that copies to or from a caller-supplied user buffer can fault on that buffer inside the
 kernel: the buffer lies on a page the pager has not backed (a demand region no access has reached,
 or a page the pager has since reclaimed), or on a page whose mapping forbids the access. The
-restartable syscalls, `SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`,
-`SYS_THREAD_READ_MEM`, and `SYS_THREAD_WRITE_MEM`
+restartable syscalls, `SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`,
+`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, and `SYS_THREAD_WRITE_MEM`
 ([syscalls.md § Restartable Syscalls](../core/kernel/docs/syscalls.md#restartable-syscalls)), take
 the fault path for such a fault:
 

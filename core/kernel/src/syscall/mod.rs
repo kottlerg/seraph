@@ -44,14 +44,14 @@ use syscall::{
     SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
     SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
     SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
-    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
-    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC,
-    SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
-    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
-    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
-    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL,
-    SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP,
+    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
+    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
     SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
     SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
     SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
@@ -510,6 +510,7 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
         SYS_IRQ_MSG_ALLOC => hw::sys_irq_msg_alloc(tf),
         SYS_IRQ_ROUTE => hw::sys_irq_route(tf),
         SYS_IRQ_REMAP => hw::sys_irq_remap(tf),
+        SYS_ENTROPY_CONTRIBUTE => return entropy::sys_entropy_contribute(tf),
         _ => Err(SyscallError::UnknownSyscall),
     };
     ret.map_err(RestartableError::Failed)
@@ -1088,6 +1089,10 @@ pub(crate) struct PinnedCap
     /// of every handler branch on `tag`: the value [`Self::tag_mask`] compares,
     /// which no such branch lets the compiler fold.
     hidden_tag: usize,
+    /// `rights` as a `usize`, passed through `nospec::hide` at resolution,
+    /// ahead of every handler branch on `rights`: the value
+    /// [`Self::rights_mask`] compares.
+    hidden_rights: usize,
 }
 
 #[cfg(not(test))]
@@ -1129,6 +1134,31 @@ impl PinnedCap
     {
         self.hidden_tag
     }
+
+    /// All-ones when the slot held every right in `rights` at resolution,
+    /// else zero, computed from the rights hidden at resolution.
+    ///
+    /// For a right a handler tests after resolution, beyond those its lookup
+    /// required: the handler folds this mask into the pointer its accesses
+    /// past the refusal go through (`nospec::select_ptr`), so a path a
+    /// mispredicted refusal reaches dereferences null. The comparison stays
+    /// data wherever the call sits, a branch on [`Self::rights`] dominating it
+    /// included (core/kernel/docs/capability-internals.md
+    /// § Speculative-Execution Hardening).
+    #[must_use]
+    pub fn rights_mask(&self, rights: crate::cap::slot::Rights) -> usize
+    {
+        held_rights_mask(self.hidden_rights, rights)
+    }
+}
+
+/// All-ones when `held`, a rights word passed through `nospec::hide`, holds
+/// every right in `rights`, else zero (`nospec::mask_if`): the comparison of
+/// [`PinnedCap::rights_mask`].
+fn held_rights_mask(held: usize, rights: crate::cap::slot::Rights) -> usize
+{
+    let wanted = usize::from(rights.0);
+    crate::arch::nospec::mask_if(held & wanted == wanted)
 }
 
 #[cfg(not(test))]
@@ -1275,6 +1305,7 @@ unsafe fn pin_checked(
         let held = slot.rights.contains(required);
         let usable = nospec::mask_if(live & typed & held);
         let hidden_tag = nospec::hide(slot.tag as usize);
+        let hidden_rights = nospec::hide(usize::from(slot.rights.0));
         let raw = slot
             .object
             .map_or(core::ptr::null_mut(), core::ptr::NonNull::as_ptr);
@@ -1288,7 +1319,7 @@ unsafe fn pin_checked(
             slot.rights,
             slot.badge,
             object,
-            hidden_tag,
+            (hidden_tag, hidden_rights),
         )
     });
     if let Some((true, true, true, _, _, _, Some(obj), _)) = snapshot
@@ -1303,7 +1334,7 @@ unsafe fn pin_checked(
     let lock = unsafe { &(*cspace).lock };
     // SAFETY: paired with the lock_raw above.
     unsafe { lock.unlock_raw(saved) };
-    let (live, typed, held, tag, rights, badge, object, hidden_tag) =
+    let (live, typed, held, tag, rights, badge, object, (hidden_tag, hidden_rights)) =
         snapshot.ok_or(SyscallError::InvalidCapability)?;
     if !live || !typed
     {
@@ -1319,6 +1350,7 @@ unsafe fn pin_checked(
         badge,
         object,
         hidden_tag,
+        hidden_rights,
     })
 }
 
@@ -1387,5 +1419,25 @@ mod exit_code_tests
         assert_eq!(encode_exit_code(u32::MAX), EXIT_FAULT_BASE - 1);
         assert_ne!(encode_exit_code(u32::MAX), EXIT_VOLUNTARY);
         assert!(encode_exit_code(u32::MAX) < EXIT_FAULT_BASE);
+    }
+}
+
+#[cfg(test)]
+mod rights_mask_tests
+{
+    use super::held_rights_mask;
+    use crate::cap::slot::Rights;
+
+    #[test]
+    fn rights_mask_is_all_ones_only_when_every_wanted_right_is_held()
+    {
+        // WRITE | EXECUTE held: either alone, both, and none pass.
+        let held = 0b0110;
+        assert_eq!(held_rights_mask(held, Rights(0b0010)), usize::MAX);
+        assert_eq!(held_rights_mask(held, Rights(0b0110)), usize::MAX);
+        assert_eq!(held_rights_mask(held, Rights::NONE), usize::MAX);
+        // One wanted right missing fails the whole request, not just that bit.
+        assert_eq!(held_rights_mask(held, Rights(0b1010)), 0);
+        assert_eq!(held_rights_mask(0, Rights(0b0001)), 0);
     }
 }

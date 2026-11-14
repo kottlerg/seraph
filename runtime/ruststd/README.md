@@ -445,7 +445,9 @@ passes it to the thread syscalls that inspect and modify the child
 `CREATE_FROM_FILE` transfers with `CREATE_ARGV_ENV`
 ([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#label-1-create_process)
 § Label 1, **argv and env**). `std::os::seraph::process::ArgvEnvCap` builds that cap and its
-header for any sender of a raw create request (svcmgr's launch and restart, svctest). After the
+header for any sender of a raw create request (svcmgr's launch and restart, svctest, and devmgr's
+and vfsd's driver spawns, which pass the child the spawner's own level as its one env entry,
+`std::os::seraph::log::inherited_level_entry`, `None` at info). After the
 call the sender passes the reply label to `ArgvEnvCap::settle`, which withholds the run (it stays
 charged to the sender) on `ARGV_ENV_STILL_MAPPED`, when procmgr may still map its pages, and
 otherwise returns it to memmgr. `spawn` refuses with `ArgumentListTooLong` only when argv

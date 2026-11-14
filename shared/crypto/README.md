@@ -60,11 +60,11 @@ intent; not yet implemented.
   x86-64, Intel lists `MUL` among its data-operand-independent-timing (DOIT)
   instructions, but on its parts that enumerate the DOITM control (Ice Lake and
   later, inside the platform floor) it guarantees that timing only while DOITM
-  is set, and Seraph does not set it. Two values pass through
-  `core::hint::black_box`, so the optimiser cannot rewrite them into a branch:
-  the mask that picks the fully reduced Poly1305 result, and the 128-bit
-  difference of the two tags, which `open` tests once, after both tags are
-  whole. Both functions are kept out of line. No secret is wiped after use:
+  is set, and Seraph does not set it; #1085 decides that posture. Two values
+  pass through `core::hint::black_box`, so the optimiser cannot rewrite them
+  into a branch: the mask that picks the fully reduced Poly1305 result, and the
+  128-bit difference of the two tags, which `open` tests once, after both tags
+  are whole. Both functions are kept out of line. No secret is wiped after use:
   copies stay in the caller's address space, which holds the key anyway.
 - **Independent of the kernel entropy subsystem.** The kernel's
   `entropy/{keccak,sponge}` Keccak/SHAKE256 sponge is kernel-internal and

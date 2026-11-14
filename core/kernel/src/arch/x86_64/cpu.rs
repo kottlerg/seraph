@@ -14,8 +14,8 @@
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
 //! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
 //! host stubs). `cpuid`, `current_cpu` (which returns 0 under test),
-//! `halt_until_interrupt`, `disable_interrupts`, and `halt_loop` are also built for
-//! host tests.
+//! `halt_until_interrupt`, `disable_interrupts`, `halt_loop`, and the no-op
+//! `disable_unswitched_user_state` are also built for host tests.
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
 
@@ -526,6 +526,15 @@ pub unsafe fn verify_baseline() {}
 /// only a serializing event on the CPU that runs it, which every return to
 /// user mode through `iretq` and every context switch supplies.
 pub fn sync_instruction_fetch() {}
+
+/// Disable, for ring 3, every state the kernel does not switch. A no-op on
+/// x86-64, which has no state-enable registers: the extended state ring 3 can
+/// reach is the set of XCR0 components `fpu` enables (x87, SSE, AVX), and the
+/// XSAVE switch saves and restores exactly that set.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the riscv64 item.
+pub unsafe fn disable_unswitched_user_state() {}
 
 // ── Misc ──────────────────────────────────────────────────────────────────────
 

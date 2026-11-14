@@ -23,6 +23,7 @@ use init_protocol::{CapDescriptor, CapType, INIT_INFO_MAX_PAGES, INIT_PROTOCOL_V
 
 mod arch;
 mod bootstrap;
+mod log_levels;
 pub(crate) mod logging;
 mod mount;
 mod service;
@@ -661,6 +662,13 @@ fn run(info_ptr: u64) -> !
         syscall::thread_exit();
     };
 
+    // The levels the `log-levels` boot module sets for the services init
+    // spawns (`log_levels`), read before the bootstrap loads reuse the
+    // scratch span.
+    // SAFETY: nothing has mapped TEMP_MAP_BASE yet, and no Rust object of
+    // init lies there.
+    let levels = unsafe { log_levels::read(info) };
+
     // ── Bootstrap memmgr (raw ELF load; first half of remaining memory caps) ──────
 
     if find_module_by_name(info, b"memmgr").is_none()
@@ -697,12 +705,17 @@ fn run(info_ptr: u64) -> !
         svcmgr_service_ep,
         mm.procmgr_send_cap,
         baseline_sched,
+        levels.get(init_log_levels::Service::Procmgr),
     )
     else
     {
         logging::log("FATAL: failed to bootstrap procmgr");
         syscall::thread_exit();
     };
+
+    // The page that carries devmgr's, vfsd's and svcmgr's levels into their
+    // create requests, allocated while init's pool is still init's.
+    let spawn_env = log_levels::SpawnEnv::new(levels, &mut alloc);
 
     // Now every alloc-from-init's-pool consumer has run. Reserve one
     // page for the memmgr phys-table (written below; sent in caps[1] of
@@ -893,6 +906,7 @@ fn run(info_ptr: u64) -> !
             init_bootstrap_ep,
             devmgr_registry_ep,
             svcmgr_service_ep,
+            &spawn_env,
             ipc_buf,
         )
         .unwrap_or(0);
@@ -913,6 +927,7 @@ fn run(info_ptr: u64) -> !
                 registry_ep: devmgr_registry_ep,
                 vfsd_service_ep,
             },
+            &spawn_env,
             ipc_buf,
         )
         .unwrap_or(0);
@@ -973,6 +988,7 @@ fn run(info_ptr: u64) -> !
         init_logd_thread_cap,
         mem_reap_floor,
         alloc.orphan_memory_caps(),
+        &spawn_env,
     );
 }
 

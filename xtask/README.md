@@ -40,9 +40,9 @@ xtask/
 │   ├── commands/               # Subcommand modules (build, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, compare_images, test_crash_report, test_debug_port,
-│   │                           #   test_gdb, test_kaslr, test_map_redo, test_terminal,
-│   │                           #   test_vmgenid, lint_docs, pr_check, review, release_scope,
-│   │                           #   issue, orch, hook, host)
+│   │                           #   test_gdb, test_kaslr, test_log_level, test_map_redo,
+│   │                           #   test_terminal, test_vmgenid, lint_docs, pr_check, review,
+│   │                           #   release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -255,11 +255,11 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
-`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, and `test-map-redo`
-repack the images in the layout they find: `disk.img`'s block size, and the data partition on
-`disk-data.img` when that image is there. The four test commands boot that layout, attaching
-`disk-data.img` as the second disk when it holds the data partition; `run` and `run-parallel`
-attach a second disk only as `--second-disk` names it.
+`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, `test-map-redo`, and
+`test-log-level` repack the images in the layout they find: `disk.img`'s block size, and the data
+partition on `disk-data.img` when that image is there. The five test commands boot that layout,
+attaching `disk-data.img` as the second disk when it holds the data partition; `run` and
+`run-parallel` attach a second disk only as `--second-disk` names it.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
@@ -316,12 +316,16 @@ cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
 | `--harness` | `init` | Which binary becomes the bundle's `init` entry: `init` for the regular userspace init, `ktest` for the kernel-test harness |
 
-`--harness init` produces a 10-entry bundle on x86-64 and an 11-entry bundle on
+`--harness init` produces an 11-entry bundle on x86-64 and a 12-entry bundle on
 riscv64 (`init` + the 8 boot modules listed in `xtask/src/bundle.rs::MODULES`, the IOMMU
 driver of the architecture's family from `ARCH_MODULES`, `iommu-vtd` on
-x86-64 and `iommu-riscv` on riscv64, and, on riscv64, the platform description table
-`platform-qemu-virt` from `ARCH_TABLES`; the bootloader and init address entries
-by name, so order is not significant). `--harness ktest`
+x86-64 and `iommu-riscv` on riscv64, on riscv64 the platform description table
+`platform-qemu-virt` from `ARCH_TABLES`, and the log-level configuration `log-levels`,
+packed from the repository's `services/init/log-levels.conf`; the bootloader and init address
+entries by name, so order is not significant). The configuration names the log level of each
+service init spawns ([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md)
+§ Log levels); an edit to it takes effect at the next `compose-bundle` or `build`, with no
+rebuild of a component. `--harness ktest`
 produces a single-entry bundle (`ktest` as the `init` entry, zero
 modules); ktest is monolithic and does not spawn userspace.
 
@@ -895,6 +899,39 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ---
 
+### `cargo xtask test-log-level`
+
+Check that the boot bundle's log-level configuration reaches the service it names and the
+processes that service spawns, and no other, on either arch
+([services/init/docs/bootstrap.md](../services/init/docs/bootstrap.md) § Log levels). Saves the
+staged bundle, composes the default-init bundle with a configuration of its own,
+`vfsd = debug`, written to `target/xtask/test-log-level/log-levels.conf`, repacks the disk images
+in the layout they have, boots the current sysroot once, and always puts the saved bundle back
+and repacks again in that layout afterwards. It passes when the boot reaches its pass marker and
+its log holds a `[vfsd] DEBUG ` line and a `[fatfs] DEBUG ` line, fatfs logging at the level of
+vfsd, which spawns it, and no `[devmgr] DEBUG ` or `[procmgr] DEBUG ` line.
+
+A pure runner; requires a populated sysroot with the default-init bundle's binaries and a harness
+staged (CI runs it in the usertest cell, on that cell's usertest staging), and `--test-devices`
+when that harness is svctest, whose devmgr phases drive the test devices (as for `run`):
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cp sysroot/config/svcmgr/tests/usertest.svc sysroot/config/svcmgr/services/
+cargo xtask mkdisk --repack-only [--arch x86_64|riscv64]
+cargo xtask test-log-level [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
+    [--test-devices]
+```
+
+The boot runs through `run-parallel` (`--parallel 1 --runs 1`, its default pass and fail markers,
+`--timeout` defaulting to 900 s) with `--save-logs` into `target/xtask/test-log-level/`, and the
+check reads the log saved there (a log an earlier boot left there is removed first). A boot that
+ends `FAIL`, `HANG`, `OK` or `ERR` fails the command before the check, as it fails `run-parallel`;
+a `QEMU-CRASH` boot, a host-emulator crash that `run-parallel` does not count as a failure, is
+reported skipped, which passes the command.
+
+---
+
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
@@ -1252,18 +1289,24 @@ File a GitHub Issue with the labels and milestone
 
 ```
 cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
-    (--milestone <title> | --unscheduled)
+    (--milestone <title> | --unscheduled --reason <hardware|not-possible|undecided>)
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision (`--unscheduled` is for future-state work no release has scheduled). It
-refuses a rolling follow-up Issue (a title ending `: defects found by review`) under anything
-but the current milestone, the lowest-versioned open one, which it reads from GitHub, and one
-whose title an open Issue of the current milestone already carries: the scope has its rolling
-Issue there (§ Follow-up Issues). A rolling Issue of an earlier milestone carries the same title
-and does not count. After
-filing it reads the Issue back and fails when a label or the milestone was not applied, naming
-what is missing.
+milestone decision. `--unscheduled` files an Issue without a milestone, which
+[docs/conventions.md](../docs/conventions.md) § Milestones allows only for an Issue that cannot
+be worked on now, and needs `--reason`: `hardware` (it needs hardware the project does not
+have), `not-possible` (it is not possible yet) or `undecided` (whether it belongs in the project
+is itself undecided). The body states the same reason in a line that begins
+`No milestone: <reason>`, the reason as `--reason` names it and the rest of the line saying why;
+the command refuses an `--unscheduled` filing whose body has no such line or one naming another
+reason, and a filing under a milestone whose body has one. It refuses a rolling follow-up Issue
+(a title ending `: defects found by review`) under anything but the current milestone, the
+lowest-versioned open one, which it reads from GitHub, and one whose title an open Issue of the
+current milestone already carries: the scope has its rolling Issue there (§ Follow-up Issues).
+A rolling Issue of an earlier milestone carries the same title and does not count. After filing
+it reads the Issue back and fails when a label or the milestone was not applied, naming what is
+missing.
 
 ### `cargo xtask orch`
 
@@ -1379,8 +1422,8 @@ has no `hook` command exits with that code, so `.claude/settings.json` writes ea
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
 `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
-and `test-gdb` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-log-level`,
+`test-debug-port` and `test-gdb` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

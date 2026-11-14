@@ -236,6 +236,137 @@ pub unsafe fn probe_asid_bits() -> u32
     implemented.count_ones()
 }
 
+// ── U-mode state enables (Ssstateen) ──────────────────────────────────────────
+
+// `__sstateen0_write` writes `sstateen0` (CSR 0x10C, written by number) from
+// `a0` and reads it back into `a0`; `a1` returns 0. Apart from those two
+// registers it touches no register, memory or stack. If either access raises
+// an illegal-instruction trap (the hart has no Ssstateen, or M-mode firmware
+// left `mstateen0.SE0` clear), execution resumes at `__sstateen0_fault_fixup`,
+// which returns `a0` = 0 and `a1` = 1. See [`sstateen0_fault_fixup`] for the
+// hook.
+#[cfg(not(test))]
+core::arch::global_asm!(
+    ".section .text.sstateen0_write, \"ax\"",
+    ".global __sstateen0_write",
+    ".global __sstateen0_fault_start",
+    ".global __sstateen0_fault_end",
+    ".global __sstateen0_fault_fixup",
+    // fn __sstateen0_write(value: a0) -> (a0: the read back, a1: 1 if trapped)
+    "__sstateen0_write:",
+    "    li    a1, 0",
+    "__sstateen0_fault_start:",
+    "    csrw  0x10C, a0",
+    "    csrr  a0, 0x10C",
+    "__sstateen0_fault_end:",
+    "    ret",
+    "__sstateen0_fault_fixup:",
+    "    li    a0, 0",
+    "    li    a1, 1",
+    "    ret",
+);
+
+/// What `__sstateen0_write` returns in `a0` and `a1`: the RISC-V calling
+/// convention returns a two-word aggregate in those registers.
+#[cfg(not(test))]
+#[repr(C)]
+struct SstateenAccess
+{
+    /// `sstateen0` read back after the write; 0 when an access trapped.
+    read_back: u64,
+    /// 1 when an access trapped, else 0.
+    trapped: u64,
+}
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// Write `value` to `sstateen0` and read the CSR back.
+    fn __sstateen0_write(value: u64) -> SstateenAccess;
+    /// The `sstateen0` write, the first faultable instruction of
+    /// `__sstateen0_write`.
+    static __sstateen0_fault_start: u8;
+    /// First byte past the `sstateen0` read back.
+    static __sstateen0_fault_end: u8;
+    /// Recovery landing pad: reports the trap.
+    static __sstateen0_fault_fixup: u8;
+}
+
+/// If `pc` is one of the `sstateen0` accesses, return the address of their
+/// recovery fixup; otherwise `None`. Consulted by `interrupts::kernel_exception`
+/// on an S-mode illegal-instruction trap, which redirects `sepc` to the fixup so
+/// [`disable_unswitched_user_state`] halts the boot by name instead of through
+/// the unhandled-exception report.
+#[cfg(not(test))]
+pub(super) fn sstateen0_fault_fixup(pc: u64) -> Option<u64>
+{
+    let lo = core::ptr::addr_of!(__sstateen0_fault_start) as u64;
+    let hi = core::ptr::addr_of!(__sstateen0_fault_end) as u64;
+    if pc >= lo && pc < hi
+    {
+        Some(core::ptr::addr_of!(__sstateen0_fault_fixup) as u64)
+    }
+    else
+    {
+        None
+    }
+}
+
+/// Disable, for U-mode, every state the kernel does not switch: write
+/// `sstateen0` with no state enabled ([`super::encoding::SSTATEEN0_USER_ENABLES`])
+/// and halt the boot unless it reads back so.
+///
+/// Ssstateen is required (docs/platform-requirements.md § riscv64
+/// Classification). A hart without it, or whose firmware keeps `sstateen0` from
+/// S-mode (`mstateen0.SE0` clear), traps at the access, and the fixup turns the
+/// trap into a halt that names the extension. The CSR is per hart: the BSP calls
+/// this in Phase 5 and each AP in `kernel_entry_ap`. `sstateen1` to
+/// `sstateen3` are not written: no ratified extension defines state in them.
+///
+/// # Safety
+/// Must execute in S-mode on the hart being initialised, after its `stvec` is
+/// installed, `sscratch` is cleared and its per-CPU pointer is installed: a
+/// trapped access is recovered through `kernel_exception`, which reads
+/// `current_cpu()`.
+#[cfg(not(test))]
+pub unsafe fn disable_unswitched_user_state()
+{
+    use super::encoding::{SSTATEEN0_USER_ENABLES, SstateenError, check_sstateen0};
+
+    // SAFETY: `__sstateen0_write` is the routine above, a C-ABI leaf that
+    // writes `a0` and `a1` alone and touches no memory. Its two instructions
+    // that can trap are the `sstateen0` accesses, whose illegal-instruction
+    // trap `kernel_exception` resumes at the fixup through
+    // `sstateen0_fault_fixup`; the caller's contract installs the trap path
+    // that recovery runs on.
+    let access = unsafe { __sstateen0_write(SSTATEEN0_USER_ENABLES) };
+    let read_back = (access.trapped == 0).then_some(access.read_back);
+    match check_sstateen0(read_back)
+    {
+        Ok(()) =>
+        {}
+        Err(SstateenError::Inaccessible) => crate::fatal(
+            "Ssstateen: sstateen0 not accessible from S-mode (no Ssstateen, or the firmware \
+             left mstateen0.SE0 clear) — required (RVA23)",
+        ),
+        Err(SstateenError::Kept(value)) =>
+        {
+            crate::kprintln!(
+                "sstateen0 read back {:#x}, not the {:#x} written",
+                value,
+                SSTATEEN0_USER_ENABLES
+            );
+            crate::fatal("Ssstateen: sstateen0 kept a U-mode state enable set");
+        }
+    }
+}
+
+/// Test-build stub: the `sstateen0` write is a privileged CSR access.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
+#[cfg(test)]
+pub unsafe fn disable_unswitched_user_state() {}
+
 // ── Per-CPU tp register ───────────────────────────────────────────────────────
 
 /// Install `addr` as the per-CPU data pointer for the current hart.

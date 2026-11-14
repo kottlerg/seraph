@@ -116,6 +116,13 @@ pub enum CliCommand
     /// pass marker, and remove the knob again (see xtask/README.md).
     TestMapRedo(TestMapRedoArgs),
 
+    /// Check that the log-level configuration reaches the services init
+    /// spawns: compose the bundle with vfsd set to debug, boot the current
+    /// sysroot once through `run-parallel`, assert that vfsd's and fatfs's
+    /// debug lines appear and devmgr's and procmgr's do not, and compose the
+    /// bundle back (see xtask/README.md).
+    TestLogLevel(TestLogLevelArgs),
+
     /// Check the debug port's transport: stage the `debug-echo` fixture,
     /// boot the current sysroot once with `--debug-port`, exchange GDB remote
     /// serial protocol packets with the fixture over the port's TCP end, and
@@ -227,6 +234,7 @@ impl CliCommand
             | Self::TestKaslr(_)
             | Self::TestCrashReport(_)
             | Self::TestMapRedo(_)
+            | Self::TestLogLevel(_)
             | Self::TestDebugPort(_)
             | Self::TestGdb(_)
             | Self::LintDocs(_)
@@ -692,6 +700,38 @@ pub struct TestMapRedoArgs
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64).
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Attach the test devices, as `run --test-devices` does: a staged
+    /// svctest needs them to reach its pass marker.
+    #[arg(long)]
+    pub test_devices: bool,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
+}
+
+// ── TestLogLevel ──────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestLogLevelArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Boot timeout, in seconds, for HANG classification.
+    #[arg(long, default_value = "900")]
+    pub timeout: u64,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 
     /// Attach the test devices, as `run --test-devices` does: a staged
     /// svctest needs them to reach its pass marker.
@@ -1278,9 +1318,28 @@ pub struct IssueFileArgs
     #[arg(long)]
     pub milestone: Option<String>,
 
-    /// File without a milestone: future-state work no release has scheduled.
+    /// File without a milestone: work that cannot be done now. Needs
+    /// `--reason`.
     #[arg(long)]
     pub unscheduled: bool,
+
+    /// Why an `--unscheduled` Issue cannot be done now; its body states the
+    /// same reason in a `No milestone: <reason>` line.
+    #[arg(long, value_enum)]
+    pub reason: Option<UnscheduledReason>,
+}
+
+/// Why an Issue may stay without a milestone (docs/conventions.md
+/// § Milestones).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum UnscheduledReason
+{
+    /// It needs hardware the project does not have.
+    Hardware,
+    /// It is not possible yet.
+    NotPossible,
+    /// Whether it belongs in the project is itself undecided.
+    Undecided,
 }
 
 // ── Orch ──────────────────────────────────────────────────────────────────────

@@ -84,6 +84,10 @@ vfsd/
   elsewhere. vfsd supplies each driver with a partition-scoped block
   device endpoint and the receive side of its own service endpoint (see
   [`services/fs/docs/fs-driver-protocol.md`](../fs/docs/fs-driver-protocol.md#bootstrap-caps)).
+  On both paths a vfsd logging at any level but info creates the
+  driver with its own level as the driver's `SERAPH_LOG` env entry, so
+  a driver logs at vfsd's level
+  ([init bootstrap](../init/docs/bootstrap.md) § Log levels).
   See [`docs/namespace-composition.md`](docs/namespace-composition.md)
   and [`docs/storage.md`](../../docs/storage.md).
 - **GPT enumeration + mount discovery** — at startup, queries devmgr

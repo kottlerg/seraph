@@ -12,7 +12,8 @@
 //! edit, restoring the backup when what GitHub holds is not what was sent.
 //! `issue-file` creates an Issue with the labels and milestone
 //! `docs/conventions.md` § Labels and § Milestones require, and reads it back
-//! to confirm that both were applied; a rolling follow-up Issue it files only
+//! to confirm that both were applied; an Issue without a milestone it files
+//! only with a reason its body states, and a rolling follow-up Issue only
 //! under the current milestone, and only when no open Issue of that milestone
 //! carries its title (§ Follow-up Issues).
 
@@ -23,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
-use crate::cli::{IssueEditArgs, IssueFileArgs};
+use crate::cli::{IssueEditArgs, IssueFileArgs, UnscheduledReason};
 use crate::commands::pr_check::{current_milestone, is_rolling};
 use crate::context::Context as BuildContext;
 use crate::gh;
@@ -74,12 +75,47 @@ pub enum MilestoneChoice
 {
     /// File under the milestone with this title.
     Milestone(String),
-    /// Future-state work no release has scheduled: no milestone.
-    Unscheduled,
+    /// No milestone: the Issue cannot be worked on now, for this reason.
+    Unscheduled(UnscheduledReason),
     /// No decision was given.
     Missing,
-    /// Both a milestone and "unscheduled" were given.
+    /// `--unscheduled` was given without a reason.
+    NoReason,
+    /// `--reason` was given without `--unscheduled`.
+    StrayReason,
+    /// Both a milestone and `--unscheduled` were given.
     Conflicting,
+}
+
+impl UnscheduledReason
+{
+    /// The reason as `--reason` and the body's `No milestone:` line name it.
+    fn token(self) -> &'static str
+    {
+        match self
+        {
+            UnscheduledReason::Hardware => "hardware",
+            UnscheduledReason::NotPossible => "not-possible",
+            UnscheduledReason::Undecided => "undecided",
+        }
+    }
+}
+
+/// The line that states, in an Issue's body, why it has no milestone.
+const NO_MILESTONE: &str = "No milestone:";
+
+/// The reasons the body's `No milestone:` lines state, each as the first
+/// word after the marker.
+fn stated_reasons(body: &str) -> Vec<&str>
+{
+    body.lines()
+        .filter_map(|l| l.trim().strip_prefix(NO_MILESTONE))
+        .map(|rest| {
+            rest.split(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '('))
+                .find(|w| !w.is_empty())
+                .unwrap_or("")
+        })
+        .collect()
 }
 
 impl MilestoneChoice
@@ -87,16 +123,22 @@ impl MilestoneChoice
     #[expect(
         clippy::fn_params_excessive_bools,
         reason = "`unscheduled` is the value of `--unscheduled`, which the constructor encodes \
-                  with `--milestone` into the choice"
+                  with `--milestone` and `--reason` into the choice"
     )]
-    fn from_args(milestone: Option<&str>, unscheduled: bool) -> Self
+    fn from_args(
+        milestone: Option<&str>,
+        unscheduled: bool,
+        reason: Option<UnscheduledReason>,
+    ) -> Self
     {
-        match (milestone, unscheduled)
+        match (milestone, unscheduled, reason)
         {
-            (Some(_), true) => MilestoneChoice::Conflicting,
-            (Some(title), false) => MilestoneChoice::Milestone(title.to_owned()),
-            (None, true) => MilestoneChoice::Unscheduled,
-            (None, false) => MilestoneChoice::Missing,
+            (Some(_), true, _) => MilestoneChoice::Conflicting,
+            (_, false, Some(_)) => MilestoneChoice::StrayReason,
+            (Some(title), false, None) => MilestoneChoice::Milestone(title.to_owned()),
+            (None, true, Some(reason)) => MilestoneChoice::Unscheduled(reason),
+            (None, true, None) => MilestoneChoice::NoReason,
+            (None, false, None) => MilestoneChoice::Missing,
         }
     }
 
@@ -105,8 +147,10 @@ impl MilestoneChoice
         match self
         {
             MilestoneChoice::Milestone(title) => Some(title),
-            MilestoneChoice::Unscheduled
+            MilestoneChoice::Unscheduled(_)
             | MilestoneChoice::Missing
+            | MilestoneChoice::NoReason
+            | MilestoneChoice::StrayReason
             | MilestoneChoice::Conflicting => None,
         }
     }
@@ -305,19 +349,50 @@ pub fn check_filing(
     {
         out.push("no subsystem label".to_owned());
     }
+    let stated = stated_reasons(body);
     match milestone
     {
         MilestoneChoice::Missing => out.push(
-            "no milestone; give --milestone, or --unscheduled for future-state work no release \
-             has scheduled"
+            "no milestone; give --milestone, or --unscheduled --reason <reason> for an Issue \
+             that cannot be worked on now"
                 .to_owned(),
         ),
+        MilestoneChoice::NoReason => out
+            .push("--unscheduled needs --reason: hardware, not-possible, or undecided".to_owned()),
+        MilestoneChoice::StrayReason =>
+        {
+            out.push("--reason applies only with --unscheduled".to_owned());
+        }
         MilestoneChoice::Conflicting =>
         {
             out.push("--milestone and --unscheduled exclude each other".to_owned());
         }
-        MilestoneChoice::Milestone(_) | MilestoneChoice::Unscheduled =>
-        {}
+        MilestoneChoice::Unscheduled(reason) =>
+        {
+            let token = reason.token();
+            if !stated.contains(&token)
+            {
+                out.push(format!(
+                    "the body states no reason for having no milestone; add a line \
+                     `{NO_MILESTONE} {token}` that says why"
+                ));
+            }
+            if stated.iter().any(|s| *s != token)
+            {
+                out.push(format!(
+                    "the body's `{NO_MILESTONE}` lines state a reason other than `{token}`"
+                ));
+            }
+        }
+        MilestoneChoice::Milestone(_) =>
+        {
+            if !stated.is_empty()
+            {
+                out.push(format!(
+                    "the body has a `{NO_MILESTONE}` line but is filed under a milestone"
+                ));
+            }
+        }
     }
     out
 }
@@ -447,7 +522,8 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
     step(&format!("Filing an Issue: {}", args.title));
     let body = fs::read_to_string(&args.body_file)
         .with_context(|| format!("cannot read {}", args.body_file.display()))?;
-    let choice = MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled);
+    let choice =
+        MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled, args.reason);
     let mut problems = check_filing(&args.title, &body, &args.label, &choice);
     if is_rolling(&args.title)
     {
@@ -590,22 +666,82 @@ mod tests
         );
     }
 
+    const HARDWARE_BODY: &str = "## Goal\n\nNo milestone: hardware. A board with a TPM.\n";
+
     #[test]
     fn a_filing_needs_one_milestone_decision()
     {
         let ok = labels(&["xtask", "infra"]);
         let choice = MilestoneChoice::from_args;
+        let hardware = Some(UnscheduledReason::Hardware);
         assert_eq!(
-            check_filing("t", "b", &ok, &choice(Some("v0.1.4"), false)),
+            check_filing("t", "b", &ok, &choice(Some("v0.1.4"), false, None)),
             [] as [String; 0]
         );
         assert_eq!(
-            check_filing("t", "b", &ok, &choice(None, true)),
+            check_filing("t", HARDWARE_BODY, &ok, &choice(None, true, hardware)),
             [] as [String; 0]
         );
-        assert_eq!(check_filing("t", "b", &ok, &choice(None, false)).len(), 1);
+        for wrong in [
+            choice(None, false, None),
+            choice(None, true, None),
+            choice(None, false, hardware),
+            choice(Some("v0.1.4"), false, hardware),
+            choice(Some("v0.1.4"), true, None),
+            choice(Some("v0.1.4"), true, hardware),
+        ]
+        {
+            let problems = check_filing("t", HARDWARE_BODY, &ok, &wrong);
+            assert!(
+                problems.iter().any(|p| p.contains("--")),
+                "{wrong:?}: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unscheduled_filing_states_its_reason_in_the_body()
+    {
+        let ok = labels(&["xtask", "infra"]);
+        let unscheduled = MilestoneChoice::Unscheduled;
+        for (reason, line) in [
+            (
+                UnscheduledReason::Hardware,
+                "No milestone: hardware (a RISC-V board)",
+            ),
+            (
+                UnscheduledReason::NotPossible,
+                "  No milestone: not-possible; QEMU lacks it",
+            ),
+            (UnscheduledReason::Undecided, "No milestone: undecided."),
+        ]
+        {
+            let body = format!("## Goal\n\n{line}\n");
+            assert_eq!(
+                check_filing("t", &body, &ok, &unscheduled(reason)),
+                [] as [String; 0],
+                "{line}"
+            );
+        }
+        // A body that states no reason, or another one, is refused.
+        let none = check_filing("t", "b", &ok, &unscheduled(UnscheduledReason::Hardware));
+        assert!(none[0].contains("`No milestone: hardware`"), "{none:?}");
+        let other = check_filing(
+            "t",
+            HARDWARE_BODY,
+            &ok,
+            &unscheduled(UnscheduledReason::Undecided),
+        );
+        assert_eq!(other.len(), 2, "{other:?}");
+        // The reason is the first word after the marker, not a word anywhere.
+        let buried = "No milestone: the hardware question is undecided\n";
         assert_eq!(
-            check_filing("t", "b", &ok, &choice(Some("v0.1.4"), true)).len(),
+            check_filing("t", buried, &ok, &unscheduled(UnscheduledReason::Hardware)).len(),
+            2
+        );
+        // A body that says it has no milestone is not filed under one.
+        assert_eq!(
+            check_filing("t", HARDWARE_BODY, &ok, &milestone("v0.1.4")).len(),
             1
         );
     }
@@ -619,7 +755,10 @@ mod tests
             rolling_milestone_problem(rolling, &milestone("v0.1.4"), current),
             None
         );
-        for wrong in [milestone("v0.1.5"), MilestoneChoice::Unscheduled]
+        for wrong in [
+            milestone("v0.1.5"),
+            MilestoneChoice::Unscheduled(UnscheduledReason::Undecided),
+        ]
         {
             let problem = rolling_milestone_problem(rolling, &wrong, current).expect("a refusal");
             assert!(problem.contains("`v0.1.4`"), "{problem}");
@@ -664,7 +803,11 @@ mod tests
             None
         );
         assert_eq!(
-            rolling_milestone_problem(title, &MilestoneChoice::Unscheduled, Some("v0.1.4")),
+            rolling_milestone_problem(
+                title,
+                &MilestoneChoice::Unscheduled(UnscheduledReason::NotPossible),
+                Some("v0.1.4")
+            ),
             None
         );
     }
@@ -673,10 +816,7 @@ mod tests
     fn a_filing_with_an_empty_title_or_body_is_refused()
     {
         let ok = labels(&["xtask", "infra"]);
-        assert_eq!(
-            check_filing(" ", "", &ok, &MilestoneChoice::Unscheduled).len(),
-            2
-        );
+        assert_eq!(check_filing(" ", "", &ok, &milestone("v0.1.4")).len(), 2);
     }
 
     #[test]

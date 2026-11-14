@@ -11,6 +11,8 @@
 //! driver included. log + procmgr caps arrive via `ProcessInfo` and are not
 //! part of this protocol.
 
+use std::os::seraph::process::ArgvEnvCap;
+
 use driver_binding::resources::{
     END_SLOTS, Endpoints, IommuUnit, MAX_IOMMU_UNITS, Resource, Round,
 };
@@ -244,6 +246,24 @@ fn mint_bootstrap_badge() -> Option<u64>
     }
 }
 
+/// The env a driver is created with: devmgr's own level, which every driver
+/// inherits (`std::os::seraph::log::inherited_level_entry`), as its one
+/// entry. `None` while devmgr logs at info, and, after a warning, when the
+/// cap cannot be built; the driver then logs at info.
+fn inherited_level_env() -> Option<ArgvEnvCap>
+{
+    let entry = std::os::seraph::log::inherited_level_entry()?;
+    match ArgvEnvCap::new(&[], 0, &entry, 1)
+    {
+        Ok(env) => env,
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "driver spawn: level env not built ({e}); driver logs at info");
+            None
+        }
+    }
+}
+
 /// The priority level a driver granted `tier` is created at
 /// ([`BoundSpawnConfig::priority`]).
 pub fn tier_priority(tier: driver_binding::decl::Tier) -> u8
@@ -430,7 +450,8 @@ fn serve_list_round(
 #[expect(
     clippy::large_stack_frames,
     reason = "the `derived` cap array (75 `u64`s, 600 B), the `create_msg`, `reply` and \
-              `start_msg` `IpcMessage`s (568 B each), and the resource-list rounds (`Round`, 568 B \
+              `start_msg` `IpcMessage`s (568 B each) and the create builder's copy, and the \
+              resource-list rounds (`Round`, 568 B \
               each, each built just before it is served) and their messages (568 B each); on the \
               32 KiB main-thread stack of devmgr"
 )]
@@ -492,26 +513,46 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         flags |= procmgr_labels::CREATE_PHYS_ACCESS;
     }
     let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
-    let create_msg = match config.source
+    let argv_env = inherited_level_env();
+    if argv_env.is_some()
     {
-        CreateSource::Module(module_cap) =>
-        {
+        flags |= procmgr_labels::CREATE_ARGV_ENV;
+    }
+    // Caps: [source, creator, argv_env?]; the argv/env header rides in data
+    // words 0..4 of `CREATE_PROCESS` and 1..5 of `CREATE_FROM_FILE`, after the
+    // file size.
+    let (builder, header_word) = match config.source
+    {
+        CreateSource::Module(module_cap) => (
             IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | sched_bits)
                 .cap(module_cap)
-                .cap(badged_creator)
-                .build()
-        }
-        CreateSource::File { file_cap, size } =>
-        {
+                .cap(badged_creator),
+            0,
+        ),
+        CreateSource::File { file_cap, size } => (
             IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | flags | sched_bits)
                 .word(0, size)
                 .cap(file_cap)
-                .cap(badged_creator)
-                .build()
-        }
+                .cap(badged_creator),
+            1,
+        ),
+    };
+    let create_msg = match &argv_env
+    {
+        Some(env) => builder
+            .words(header_word, &env.header_words())
+            .cap(env.cap())
+            .build(),
+        None => builder.build(),
     };
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) })
+    let reply = unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) };
+    // procmgr has copied the env by now, or refused the request.
+    if let Some(env) = argv_env
+    {
+        env.settle(reply.as_ref().map_or(0, |r| r.label));
+    }
+    let Ok(reply) = reply
     else
     {
         std::os::seraph::log!(warn: "driver create ipc_call failed");

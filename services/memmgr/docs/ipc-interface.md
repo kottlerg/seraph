@@ -356,9 +356,10 @@ client holds derive from memmgr's own grants, so a client's donation would
 alias frames memmgr has already lent out back into the free pool and count
 them in `pool_total` twice. Used by procmgr's init reap to hand over
 init's reclaimed memory: the usable-RAM caps init did not forward in memmgr's
-bootstrap round, the free remainders `MemoryAlloc` abandoned, ELF segments,
-`InitInfo`, stack, the bootloader/bundle reclaim ranges, the AP-trampoline
-frame, and boot-module ELF sources. See
+bootstrap round, the free remainders `MemoryAlloc` abandoned, the page that
+carried the spawned services' `SERAPH_LOG` entries when init allocated one, ELF
+segments, `InitInfo`, stack, the bootloader/bundle reclaim ranges, the
+AP-trampoline frame, and boot-module ELF sources. See
 [docs/process-lifecycle.md](../../../docs/process-lifecycle.md#init-reap) §"Init reap".
 
 **Request:**

@@ -15,9 +15,13 @@ init/
 ├── Cargo.toml                  # Workspace member; no_std binary
 ├── clippy.toml                 # Clippy settings; frame threshold of init's 16 KiB stack
 ├── README.md
+├── log-levels.conf             # Log level of each service init spawns; packed into the
+│                               # boot bundle as `log-levels` (docs/bootstrap.md § Log levels)
 ├── docs/
 │   └── bootstrap.md            # Authoritative stage enumeration;
 │                               # init's side of the capability flow
+├── log-levels/                 # `init-log-levels` crate: the log-level configuration's
+│                               # parser (host-tested)
 ├── sender-table/               # `init-sender-table` crate: init-logd's per-sender
 │                               # slot table (host-tested)
 └── src/
@@ -25,6 +29,8 @@ init/
     ├── bootstrap.rs            # Raw memmgr / procmgr ELF-load + kernel-object setup
     ├── service.rs              # IPC-driven spawns (devmgr, vfsd, svcmgr)
     │                           # and phase3_svcmgr_handover
+    ├── log_levels.rs           # Log-level configuration read and the spawned
+    │                           # services' `SERAPH_LOG` env
     ├── mount.rs                # GET_SYSTEM_ROOT_CAP pull (vfsd self-mounts root)
     ├── logging.rs              # init-logd thread
     │                           # (serves the log endpoint until real-logd takes over)
@@ -51,8 +57,10 @@ decodes it with (see the
 Init runs three stages between `_start` and `sys_thread_exit`:
 
 1. **Raw bootstrap** — version-check `InitInfo`, set up the IPC buffer, mint
-   endpoints, spawn init-logd, bring up memmgr and procmgr via raw syscalls,
-   then drive procmgr IPC to create devmgr and vfsd.
+   endpoints, spawn init-logd, read the log-level configuration, bring up
+   memmgr and procmgr via raw syscalls, then drive procmgr IPC to create
+   devmgr and vfsd, each spawned service with its configured log level (see
+   [docs/bootstrap.md § Log levels](docs/bootstrap.md#log-levels)).
 2. **Root acquisition** — vfsd self-mounts the Seraph root partition at `/`
    on its own startup; init issues no `MOUNT` (see
    [vfsd service interface](../vfsd/docs/vfs-ipc-interface.md)). Pull the seed

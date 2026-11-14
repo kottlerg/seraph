@@ -36,11 +36,11 @@
 //!
 //! A boot whose kernel faults with `CR4.CET` set, `SH_STK_EN` clear and a
 //! zero interrupt SSP table address in its exception report, a state the
-//! kernel never leaves, ran on a host that lost the guest's CET state. The
-//! maintainer decided that on a host that is itself a guest (the CPUID
-//! hypervisor bit), where a nested hypervisor has been seen to lose it, such
-//! a run is inconclusive: the boot runs again, up to [`CET_ATTEMPTS`] times,
-//! and passes only on a run without it. On any other host it fails
+//! kernel never leaves, ran on a host that lost the guest's CET state. On a
+//! host that is itself a guest of another hypervisor (the CPUID hypervisor
+//! bit), where that state can be lost at run time, such a run is
+//! inconclusive: the boot runs again, up to [`CET_ATTEMPTS`] times, and
+//! passes only on a run without it. On any other host it fails
 //! (core/kernel/docs/return-address-integrity.md § Verification Record).
 
 use std::path::{Path, PathBuf};
@@ -153,9 +153,8 @@ enum Attempt
 
 /// Run `boot` until it passes, up to [`CET_ATTEMPTS`] times while each run
 /// ends in [`Attempt::HostLostCetState`] on a host that is itself a guest
-/// (`host_is_guest`), where a nested hypervisor has been seen to lose a
-/// guest's CET registers (core/kernel/docs/return-address-integrity.md
-/// § Verification Record). It passes only on a run with no such end. On a
+/// (`host_is_guest`), where a guest's CET state can be lost at run time
+/// (core/kernel/docs/return-address-integrity.md § Verification Record). It passes only on a run with no such end. On a
 /// host that is not a guest the same end is a failure.
 fn retry(host_is_guest: bool, mut boot: impl FnMut() -> Result<Attempt>) -> Result<()>
 {

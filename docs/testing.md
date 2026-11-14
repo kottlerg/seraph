@@ -517,11 +517,12 @@ not a CI boot. See [xtask/README.md § test-cet](../xtask/README.md#cargo-xtask-
 command.
 
 A boot whose kernel exception report shows `CR4.CET` set, `SH_STK_EN` clear and a zero interrupt
-SSP table address, a state the kernel never leaves, ran on a host that lost the guest's CET state
+SSP table address ran on a host that lost the guest's CET state: the kernel writes those registers
+once per CPU and never with 0
 ([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md) § x86-64
-Mechanism). A nested hypervisor has been seen to lose it (§ Verification Record there). The
-maintainer decided that on a host that is itself a guest, by the CPUID hypervisor bit, such a run
-is inconclusive: the command boots again, up to four runs of each boot, and the boot passes only on
+Mechanism). On a host that is itself a guest of another hypervisor that state can be lost at run
+time (§ Verification Record there). On such a host, by the CPUID hypervisor bit, the run is
+inconclusive: the command boots again, up to four runs of each boot, and the boot passes only on
 a run without it; four such runs fail the command as inconclusive. On a host that is not a guest
 the same report fails the command, as does every other fault.
 

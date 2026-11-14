@@ -233,7 +233,9 @@ See [`docs/syscalls.md`](docs/syscalls.md). The audit classifying
 every cross-boundary output (syscall, IPC, fault, exit) for kernel-virtual-address
 disclosure is in [`docs/cross-boundary-disclosure.md`](docs/cross-boundary-disclosure.md);
 it records the accepted residual of the x86-64 descriptor-table registers on a CPU without
-UMIP.
+UMIP, and the open residual of a dead kernel object's bytes, which the holder of the Memory
+capability it was retyped from can map
+([#1110](https://github.com/kottlerg/seraph/issues/1110)).
 
 ---
 

@@ -1555,7 +1555,9 @@ fn spawn_and_settle(
         serves: Serves::Iommu,
         badge: device_badge,
         driver: ServedDriver {
-            ep: client.ep,
+            // The endpoint stays the client's: no withdrawal of the driver
+            // deletes it.
+            ep: 0,
             dev_caps: None,
             platform_caps: None,
             process_handle,

@@ -95,10 +95,15 @@
 //! A held round that delivers on CPU 1 runs its delivery on the deleter as
 //! the raise returns, before the change, so it comes late; the held rounds
 //! that deliver on any other CPU, CPU 0 included, can arm: three in four of
-//! them at 4 CPUs, one in two at 2. A rebound round
-//! arms only when the rebind's store lands between a delivery's load of the
-//! notification and its signal, the last steps of a delivery that masks the
-//! line first, and on x86-64, where the mask is the long step, it seldom does.
+//! them at 4 CPUs, one in two at 2. The fixed direct and rebound rounds
+//! alternate, so at an even CPU count each kind's fixed rounds deliver on
+//! half the CPUs, which half depending on where the kernel's turn over the
+//! CPUs (`irq::next_target_cpu`) stood when the cell began; at 2 CPUs the fixed direct rounds may all
+//! deliver on CPU 1 and arm none. The extra rounds ([`extend`]) are of one
+//! kind and take every CPU in turn. A rebound round arms only when the
+//! rebind's store lands between a delivery's load of the notification and its
+//! signal, the last steps of a delivery that masks the line first, and on
+//! x86-64, where the mask is the long step, it seldom does.
 //!
 //! ## What the host must give
 //!

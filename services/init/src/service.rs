@@ -1822,7 +1822,7 @@ fn finish_init_reap_handoff(
 )
 {
     // Donate every `owns_memory` Memory cap init solely holds, streamed in
-    // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
+    // MSG_CAP_SLOTS_MAX-sized rounds. Four disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
     //    segments, user stack, and the InitInfo region. (init's IPC buffer is
     //    not here: it lives in init's bootstrap arena, forwarded to memmgr at
@@ -1832,6 +1832,8 @@ fn finish_init_reap_handoff(
     //    cap — which carry no named InitInfo slot.
     //  - MemoryAlloc's orphans: free remainders abandoned while carving the
     //    bootstrap arenas, below the floor with no descriptor.
+    //  - the log-level env page (`log_levels::SpawnEnv`), when init allocated
+    //    one: consumed from `MemoryAlloc` but never forwarded.
     // The walk skips caps init does not solely own or that are not RAM: the
     // consumed/forwarded usable-RAM prefix (below `mem_reap_floor` —
     // `MemoryAlloc` arenas and the memory caps `finalize_memmgr` already forwarded;

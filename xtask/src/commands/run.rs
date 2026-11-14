@@ -136,6 +136,7 @@ fn launch(
         vmgenid_guid: Some("auto"),
         incoming: None,
         riscv_mmu: args.riscv_mmu,
+        riscv_zkr: args.riscv_zkr,
         x86_paging: args.x86_paging,
         iommu: args.iommu,
         debug_port: args.debug_port,

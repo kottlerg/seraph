@@ -297,6 +297,7 @@ Every entry in this section is correct as is.
 | `PIT_CALIBRATION_MS` | `core/kernel/src/arch/x86_64/timer.rs` | 10 ms | hardware spec (PIT) | none | correct as is | None |
 | `PIT_POLL_BUDGET_TSC_TICKS` | `core/kernel/src/arch/x86_64/timer.rs` | 2^32 TSC ticks (0.43 s at 10 GHz), then fatal | tuning (bounds no capacity) | none | correct as is | None |
 | `rdseed_u64`, `rdrand_u64` retry | `core/kernel/src/arch/x86_64/entropy.rs` | 32 | tolerance (above the Intel DRNG RDRAND guidance of 10; RDSEED has no fixed count) | none | correct as is | None |
+| riscv64 `SEED_WORD_BUDGET_US` | `core/kernel/src/arch/riscv64/entropy.rs` | 10 ms per 64-bit `seed` word, then the draw gives up | tuning (time-based; the source's sample rate is the platform's) | none | correct as is | None |
 | `enable_tagged_tlb` | `core/kernel/src/arch/x86_64/paging.rs` | 4096 | hardware spec (12-bit PCID) | none | correct as is | None |
 | `TrapFrame::arg` | `core/kernel/src/arch/*/trap_frame.rs` | 6 arguments | ABI width (syscall register convention) | none | correct as is | None |
 | riscv64 `MAX_IRQ_ID`, `APLIC_MAX_SOURCES` | `core/kernel/src/arch/riscv64/mod.rs`, `aia_encoding.rs` | 1023 | hardware spec (AIA: APLIC sources) | none | correct as is | None |
@@ -323,7 +324,7 @@ Every entry here is `correct as is`; none is tracked.
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | Boot hardware-RNG draw cap | `core/kernel/src/entropy/mod.rs` | 512 words | provably unreachable (start-up needs 128) | none | correct as is | None |
-| `boot_jitter_scrape` | `core/kernel/src/entropy/mod.rs` | 64 samples | tuning (supplementary source) | none | correct as is | None (#393) |
+| `boot_jitter_scrape` | `core/kernel/src/entropy/mod.rs` | 64 samples | tuning (supplementary source) | none | correct as is | None |
 | Health-test constants (`RCT_CUTOFF`, `APT_WINDOW`, `APT_CUTOFF`, `STARTUP_BYTES`) | `core/kernel/src/entropy/health.rs` | 31 / 512 / 384 / 1024 | hardware spec (NIST SP 800-90B), with `APT_CUTOFF` a stricter tuning than the standard's table | none | correct as is | None |
 | Keccak tables, `LANES`, `RATE` | `core/kernel/src/entropy/keccak.rs`, `sponge.rs` | 24, 25, 136 | hardware spec (Keccak-f[1600], SHAKE256) | rodata | correct as is | None |
 | `RESEED_DRAW_INTERVAL`, `RESEED_TIME_BUDGET_US`, `RESEED_OVERDUE_FACTOR` | `core/kernel/src/entropy/reseed_policy.rs` | 256 / 1 s / 2 | tuning | none | correct as is | None |

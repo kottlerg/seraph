@@ -219,6 +219,10 @@ Each feature is classified per architecture as one of:
   default boot uses, exposed through the firmware's `VirtioRngDxe` binding `virtio-rng`;
   firmware that delivers a DTB may supply `/chosen/rng-seed` instead, and with neither the pool
   seeds from jitter (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+- **Zkr seed CSR** — the kernel's hardware RNG, a raw entropy source the pool mixes beside the
+  boot seed; used where the hart implements `Zkr` and the M-mode firmware grants S-mode the CSR
+  (`mseccfg.SSEED`, which OpenSBI sets on such a hart), which the kernel learns by probing the
+  CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **GOP framebuffer, PCIe ECAM** — as on x86-64.
 
 ### Unsupported
@@ -233,9 +237,6 @@ Each feature is classified per architecture as one of:
   cache-coherent DMA. (Distinct from Svpbmt: the PBMT memory type governs how a hart's own
   accesses to a mapping behave, not DMA cache coherence.)
 - **Secure Boot, TPM, RTC** — not boot dependencies.
-- **Zkr seed CSR** — not used: M-mode-owned under default firmware, so it is not an S-mode
-  entropy source; the kernel reports no riscv64 hardware RNG (see
-  [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **Sdtrig debug triggers (SBI Debug Triggers, DBTR)** — not used: the kernel programs no trigger.
   The reference platform (QEMU `-cpu max` under OpenSBI) offers two triggers through DBTR, of the
   address-match types, and no instruction-count (`icount`) trigger, which a single-step would

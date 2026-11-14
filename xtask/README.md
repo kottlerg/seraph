@@ -978,12 +978,16 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states that the incoming diff touches none of the PR's files, or that it is comment-only (§ Syncing with `master`); a reader decides the overlap and the incoming diff's kind, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
 | `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
+| `pr-refs-rolling` | error | Every rolling follow-up Issue the body references with `Refs` is open and carries the current milestone: it is the rolling Issue of its scope in that milestone, not a rolling Issue of an earlier milestone with the same title, which step 8 of § Release Production closed after moving its open items on. |
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
-so that a keyword in prose that closes an Issue by accident is seen. A closing reference into
+so that a keyword in prose that closes an Issue by accident is seen. A `Refs` keyword references
+every `#N` of the list that follows it on its line (`Refs #N, #M`, `Refs #N and #M`), as
+§ Commit and PR cross-references allows; the list ends at anything else, such as a reference
+into another repository. A closing reference into
 another repository (`<owner>/<repo>#N`, or that Issue's URL, naming a repository other than this
 one) is printed apart and not checked, since the Issue rules read this repository's Issues.
 
@@ -1170,7 +1174,10 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 The command refuses a filing without a class label, without a subsystem label, or without a
 milestone decision (`--unscheduled` is for future-state work no release has scheduled). It
 refuses a rolling follow-up Issue (a title ending `: defects found by review`) under anything
-but the current milestone, the lowest-versioned open one, which it reads from GitHub. After
+but the current milestone, the lowest-versioned open one, which it reads from GitHub, and one
+whose title an open Issue of the current milestone already carries: the scope has its rolling
+Issue there (§ Follow-up Issues). A rolling Issue of an earlier milestone carries the same title
+and does not count. After
 filing it reads the Issue back and fails when a label or the milestone was not applied, naming
 what is missing.
 

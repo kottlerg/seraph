@@ -69,7 +69,8 @@
 // The agent types below resolve from the definitions the session loaded at its
 // start, so the session that runs this workflow must have started after
 // `.claude/agents/release-verifier.md` and `release-auditor.md` were on the
-// checked-out branch.
+// checked-out branch. A change to this script alone needs no new session: the
+// call names it by `scriptPath`.
 //
 // Every stage takes the diff from the local tree (`git diff`), never from
 // `gh pr diff` or the `files` field of `gh pr view`, which GitHub caps.

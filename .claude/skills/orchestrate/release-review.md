@@ -5,9 +5,13 @@ Supporting file of `.claude/agents/orchestrator.md` § Release review.
 When the current milestone is ready to close, run the release review of docs/conventions.md
 § Release Production. Only the top session has the Workflow tool, so the supervisor makes each
 workflow call for you: send it the exact call and the paths to save to, and it answers with the
-two verdict lines and the paths. The workflow's agents resolve from the definitions the top
-session loaded at its start, so the release review needs a session started after those files
-are on the checked-out branch; say so to the maintainer if the session is older.
+two verdict lines and the paths. This is the one place where an instruction-file merge needs a
+new session (`.claude/agents/orchestrator.md` § Plan). The workflow's agents resolve from the
+definitions the top session loaded at its start, and the script's prompts do not tell them to
+read their file from disk, so a changed `release-auditor` or `release-verifier` definition needs a
+session started after the change is on the checked-out branch; say so to the maintainer when
+the session is older. A changed `.claude/workflows/release-review.js` needs no new session: the
+call passes `scriptPath`, below.
 
 - `git fetch origin` and check out `origin/master`, clean. The first call is
   `Workflow({name: "release-review", args: {mode: "scope", from: "<previous tag>", version:

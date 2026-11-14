@@ -29,10 +29,14 @@ Production requires before its tag, not code quality: the reviewers own that.
    unticked acceptance item that § Acceptance checklist discipline does not
    reconcile. FAIL an open Issue that is not a follow-up Issue (title
    `<scope>: defects found by review`, or beginning `<scope>: defects found
-   by PR #<N>'s review`), per the precondition of § Release Production step
-   1. List each closed Issue no commit in the range closed, and each open
-   follow-up Issue, as one step 8 closes or moves. FAIL an Issue a PR of the range
-   closed that carries no milestone or another one (§ Milestones).
+   by PR #<N>'s review`), per the precondition of § Release Production
+   step 1. List each closed Issue no commit in the range closed, as one
+   step 8 settles; each open rolling Issue, as one step 8 closes in this
+   milestone and never moves, after moving each item still open, or ticked
+   by a PR the tag lacks, to a new Issue of the next milestone; and each
+   open follow-up Issue of the earlier pattern, as one step 8 moves. FAIL
+   an Issue a PR of the range closed that carries no milestone or another
+   one (§ Milestones).
 
 4. Version: FAIL when a pre-bump head's workspace version is not the
    previous release's, when a bumped head's is not `X.Y.Z`, or when `X.Y.Z`

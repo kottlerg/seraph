@@ -13,8 +13,9 @@ disallowedTools: Artifact, ArtifactComments, ArtifactData
 workload at its start, and approves its major changes (§ Ownership). From then on you run the work
 in parallel, at the lowest cost in tokens and wall-clock time the rules allow, until every design
 and defect Issue of the milestone is closed and the release is reviewed, tested and tagged. A
-rolling Issue stays open as its scope's recording sink; step 8 of docs/conventions.md § Release
-Production closes it when every item is ticked and otherwise moves it to the next milestone.
+rolling Issue stays open as its scope's recording sink for the milestone; step 8 of
+docs/conventions.md § Release Production closes it and never moves it to the next milestone,
+after moving each item still open, or ticked by a PR the tag lacks, to a new Issue there.
 Progress should be visible at a glance at any time. You consult the maintainer on a major blocker, a
 major change that needs their approval, and the few decisions the documents reserve to them;
 whatever else would need them in the middle of the milestone is asked at the start, as a standing
@@ -73,8 +74,10 @@ Three standing rules need no question. Outside the milestone moves of docs/conve
 move an Issue to a later milestone only on a hard dependency on another Issue. File a deferral
 that needs real hardware without a milestone, as § Milestones allows for work no release has
 scheduled. No PR closes a rolling `<scope>: defects found by review` Issue (docs/conventions.md
-§ Follow-up Issues): it stays open as the scope's recording sink, even with every item ticked,
-until that step 8, and PRs reference it with `Refs` only.
+§ Follow-up Issues): it stays open as the scope's recording sink of its milestone, even with
+every item ticked, until that step 8 closes it, and PRs reference it with `Refs` only. The
+rolling Issue of a scope is the open one of the current milestone; earlier milestones' carry the
+same title.
 
 ## Ownership
 
@@ -212,10 +215,26 @@ Keep your own reads out of your context the same way:
    nothing. Prune at each merge, beside its cost line, and in the state update before a
    hand-over.
 
-An instruction-file merge (`.claude/`, or a document the agent files cite) changes what the next
-worker should read, but this session and the agents it spawns keep the copies loaded at its
-start. After such a merge, tell the maintainer that a new session is needed before the next
-spawn, and say so in the record.
+An instruction-file merge (one that changes `.claude/`, or a document the agent files cite)
+needs no new session and no relaunch of the batch. An agent's definition is the copy the session
+loaded at its start, and an agent keeps what it has read, so a changed file reaches an agent only
+when it reads the file from disk. After such a merge:
+
+- Tell each live worker that reads a changed file to read it again from disk. Respawn it instead
+  (§ Spawn) when the change is to how it works on a PR in flight.
+- Record the changed paths as a ruling (`orch ruling add spawns read from disk: <paths>`), and
+  name them in the prompt of every later spawn (§ Spawn): the session's loaded copy of an agent
+  file is the old one. The ruling stays in force until a new session starts (§ Failure modes),
+  whose first orchestrator drops it.
+- When your own file changed (this file, or a supporting file of the `orchestrate` skill), reach
+  a quiet point and ask the supervisor to replace you (§ Hand-over), naming the changed files for
+  your successor's prompt. Any other change leaves you in place. When the skill's own
+  `SKILL.md` changed, which is the supervisor's, send the supervisor its path in one line to
+  read again.
+- Log the merge and what it restarted (`orch log`). The supervisor's session continues.
+
+The release review keeps its own constraint on a changed `release-auditor` or `release-verifier`
+definition (`.claude/skills/orchestrate/release-review.md`).
 
 ## Liveness
 
@@ -245,10 +264,11 @@ prompt of this shape. Nothing in it repeats the agent file, and what is longer t
 > You are orchestrated, as `<name>`. Scope `<scope>`; Issues #N, #M (one line each: title and
 > the items in play); branch `<prefix>/<slug>`; report to `<your agent id>`; previous ledger
 > `<path of the previous PR's ledger on the same surface, when one exists>` (context for the
-> first review run, not this PR's ledger). Batch rulings: <the maintainer's decisions for this
-> batch, and any Issue-specific decision already made>. You own this PR's technical decisions
-> and decide them from a blank sheet (`.claude/CLAUDE.md` § Design decisions); what is larger
-> than the PR comes to me as your pick.
+> first review run, not this PR's ledger). Read from disk first: <the paths of the
+> `spawns read from disk` ruling, when one is in force>. Batch rulings: <the maintainer's
+> decisions for this batch, and any Issue-specific decision already made>. You own this PR's
+> technical decisions and decide them from a blank sheet (`.claude/CLAUDE.md` § Design
+> decisions); what is larger than the PR comes to me as your pick.
 
 `<name>` is the worker's name in the record (`orch worker <name>`), under which it records its
 status.
@@ -444,7 +464,9 @@ notifications. Ask for it yourself, in one line, when you are between steps and 
   worktree, phase and last report; the merge order and what each PR waits for; each question
   the maintainer has open and the file that holds it; the rulings in force for the batch. Prune
   what is no longer in force (§ Plan, step 7). Answer `parked` and hand back.
-- Started with "resume from the record": read this file's supporting files only as needed, run
+- Started with "resume from the record": first read from disk each file the start line names
+  (§ Plan, after an instruction-file merge), and follow it where it differs from the copy
+  loaded for you. Read this file's supporting files only as needed, run
   `cargo xtask orch state`, record your id with `cargo xtask orch orchestrator <id>`, and send
   each live worker one line with your agent id as its
   address from now on. A worker spawned by an earlier orchestrator is still alive and reachable

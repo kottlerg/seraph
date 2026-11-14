@@ -96,13 +96,15 @@ a GitHub milestone. The current milestone is the lowest-versioned open one. An I
 will absorb (a defect, a cleanup, scheduled work of any class) MUST carry a milestone from
 creation: the current milestone, or the later release it is planned for. A follow-up Issue the
 pre-merge review files (§ Follow-up Issues) MUST carry the current milestone: it records
-findings on work the current release contains, and step 8 of § Release Production closes it or
-moves it on when the release closes. Only future-state work no release has scheduled (a design
+findings on work the current release contains, and step 8 of § Release Production settles it
+when the release closes. A rolling Issue belongs to that one milestone: step 8 closes it, and it
+is never moved to a later milestone. Only future-state work no release has scheduled (a design
 umbrella, an unscheduled feature) MAY stay unassigned; it is assigned when it is scheduled. The
 rule applies to open Issues filed before it: the maintainer assigns each a milestone or confirms
 it as unscheduled work. An Issue that closes without a milestone, or under one other than the
-current milestone, MUST be assigned the current milestone when it closes; step 8 of § Release
-Production decides the release a closed Issue settles on. A pull request MUST NOT carry a
+current milestone, MUST be assigned the current milestone when it closes, apart from a rolling
+Issue, which step 8 of § Release Production closes in its own milestone; step 8 decides the
+release a closed Issue settles on. A pull request MUST NOT carry a
 milestone; milestones are assigned to Issues only.
 
 ### Commit and PR cross-references
@@ -110,6 +112,8 @@ milestone; milestones are assigned to Issues only.
 - Commit messages MAY reference Issues by `#N` where useful.
 - A commit or PR description that changes an Issue without closing it (ticking items on a
   follow-up Issue it drains in part) MUST reference it via `Refs #N`, which auto-closes nothing.
+  One `Refs` MAY name several Issues as a list on its line (`Refs #N, #M`, or `Refs #N and #M`),
+  and every `#N` of the list is a referenced Issue.
 - A PR that closes an Issue MUST reference it via `Fixes #N` / `Closes #N` in its description, so
   the merge auto-closes the Issue. Manual `gh issue close` after the fact is a procedural miss,
   not a substitute.
@@ -395,14 +399,15 @@ the merge resolved.
 
 ### Follow-up Issues
 
-The follow-up Issue of a scope is the one open Issue whose title is
-`<scope>: defects found by review`, where `<scope>` is a commit-title scope (§ Commit Messages),
-the narrowest that covers the file. It holds defects only (§ Findings), each found off the
-surface of the PR whose review found it, and every PR's such defects in that scope append to it,
-so it is also called the rolling Issue. It is filed only when the scope has none open, with the
-current milestone (§ Milestones) and the labels § Labels requires. Filing it needs no approval
-of its own: the maintainer's standing approval covers the rolling Issue of a scope that has
-none.
+The follow-up Issue of a scope is the one open Issue of the current milestone (§ Milestones)
+whose title is `<scope>: defects found by review`, where `<scope>` is a commit-title scope
+(§ Commit Messages), the narrowest that covers the file. It holds defects only (§ Findings),
+each found off the surface of the PR whose review found it, and every PR's such defects in that
+scope append to it, so it is also called the rolling Issue. A scope has at most one in each
+milestone, and the rolling Issues of earlier milestones carry the same title. It is filed only
+when the scope has none open in the current milestone, with that milestone and the labels
+§ Labels requires. Filing it needs no approval of its own: the maintainer's standing approval
+covers the rolling Issue of a scope that has none.
 
 An open Issue whose title begins `<scope>: defects found by PR #N's review`, filed before the
 rolling Issues, is a follow-up Issue under every rule of this section; a finding recorded in its
@@ -419,9 +424,11 @@ items:
   no item is left open once the findings of its last run are recorded, and then carries
   `Fixes #N` beside the `Refs #N`;
 - MUST NOT close a rolling Issue. The rolling Issue is the one recording sink of its scope for
-  the milestone, so that a scope has one such Issue per milestone and not one per PR. It is
-  closed at step 8 of § Release Production when every item is ticked, and otherwise moves to
-  the next milestone with its open items.
+  its milestone, so that a scope has one such Issue per milestone and not one per PR. It
+  belongs to that milestone alone: step 8 of § Release Production closes it, and it is never
+  moved to a later milestone. An item still open then, or ticked by a PR the tag does not
+  contain, is first moved to a new Issue of the next milestone: a standalone Issue, or, when
+  the items are minor, the new rolling Issue of the scope in that milestone.
 
 A drain PR MUST NOT file a successor: a defect its run leaves in the same scope is appended to
 the Issue it drains, which stays open.
@@ -610,15 +617,18 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    has completed successfully and the maintainer approves the publishing. No
    workflow publishes it.
 8. On the maintainer's approval of this step's milestone work: `v<X>.<Y>.<Z+1>` is created
-   when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>` is open. A rolling follow-up Issue of
-   § Branch and PR Workflow whose items were all ticked by PRs the tag contains is closed and
-   stays in `v<X>.<Y>.<Z>`; one with an item open, or ticked by a PR merged after the tag, moves
-   to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`, so that a fix the tag lacks is
-   recorded against the release that ships it. Every other Issue in `v<X>.<Y>.<Z>` or a lower
-   open milestone moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside the tag closed
-   it, and otherwise to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`.
-   `v<X>.<Y>.<Z>` and every lower open milestone are then closed; the lowest-versioned open
-   milestone is current (§ Milestones).
+   when no `v<X>.<Y>.*` milestone above `v<X>.<Y>.<Z>` is open. Every Issue in `v<X>.<Y>.<Z>`
+   or a lower open milestone other than a rolling follow-up Issue of § Branch and PR Workflow
+   moves to `v<X>.<Y>.<Z>` when it is closed and no commit outside the tag closed it, and
+   otherwise to the lowest-versioned open milestone above `v<X>.<Y>.<Z>`. `v<X>.<Y>.<Z>` and
+   every lower open milestone are then closed; the lowest-versioned open milestone is current
+   (§ Milestones). Last, each rolling Issue of the closed milestones is closed where it stands
+   and never moved to a later milestone. Each of its items still open, or ticked by a PR merged
+   after the tag, is first moved to a new Issue of the current milestone: a standalone Issue,
+   or, when the items are minor, the scope's new rolling Issue (§ Follow-up Issues). A moved
+   item leaves the closed Issue's body (`cargo xtask issue-edit` with `--allow-removal`), whose
+   closing comment names the Issue that now holds it, so that a fix the tag lacks is recorded
+   against the release that ships it.
 
 ---
 

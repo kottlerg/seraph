@@ -33,7 +33,8 @@ xtask/
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
-│   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
+│   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
+│   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
 │   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
@@ -383,8 +384,13 @@ The lint pass runs `cargo clippy --tests` over the selected packages, once for
 `x86_64-unknown-linux-gnu` and once for `riscv64gc-unknown-linux-gnu`, with all warnings treated as
 errors, so test code gated on either architecture is linted on any host. Each pass only checks: it
 builds `std` from source for its target (`-Zbuild-std=std,panic_unwind,test`), needs no rustup
-target, and links nothing. It allows the lints `TEST_RELAXED_LINTS` in `src/commands/test.rs`
-names, as [docs/coding-standards.md](../docs/coding-standards.md) § Clippy states.
+target, and links nothing. `xtask` reaches the `object`, `addr2line` and `rustc_demangle` crates of
+the toolchain sysroot under `rustc_private`, which link the prebuilt `core` and so cannot build
+beside a `std` built from source; those two passes leave it out (`PREBUILT_STD_ONLY`), and a third
+lints its test configuration for the host target alone, against the prebuilt `std`. It is
+host-only, so no riscv64 Linux build of it runs. Every pass allows the lints `TEST_RELAXED_LINTS`
+in `src/commands/test.rs` names, as [docs/coding-standards.md](../docs/coding-standards.md)
+§ Clippy states.
 
 Tests compile for the host — no `--arch` flag needed. The workspace-level
 `panic=abort` profile does not affect the test harness.

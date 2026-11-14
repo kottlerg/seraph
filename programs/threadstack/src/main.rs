@@ -598,8 +598,9 @@ fn span_overflow() -> u8
     // SAFETY: both stores are to the stack below the stack pointer, which holds
     // no live value: the first to the usable stack, which the dry run wrote,
     // and the second to the guard, whose fault ends the process, or, past a
-    // guard too small for it, to the parked worker's stack, which this test
-    // reports. Neither changes a register but the scratch one declared.
+    // guard too small for it, to a mapped page of the parked worker (its IPC
+    // buffer, or its stack below), which this test reports. Neither changes a
+    // register but the scratch one declared.
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!(

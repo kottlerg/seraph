@@ -16,7 +16,8 @@
 //! vfsd self-mounts the Seraph root partition at `/` (and the ESP at
 //! `/esp` and the data partition at `/data`) during startup, before
 //! serving any request; the runtime `MOUNT` IPC remains for
-//! explicit/foreign-GUID mounts.
+//! explicit/foreign-GUID mounts. The swap partition is never mounted:
+//! `GET_SWAP_PARTITION` hands its holder a raw partition cap.
 //!
 //! See `services/vfsd/README.md` for the design and
 //! `services/fs/docs/fs-driver-protocol.md` for the driver-side protocol.
@@ -38,11 +39,14 @@ use worker_pool::WorkerPool;
 /// Number of threads that recv on the service endpoint. A concurrency
 /// knob that bounds no capacity: a request that finds every handler busy
 /// waits in the endpoint's queue for the next free thread. No
-/// service-endpoint request waits on another one, so the count cannot
+/// service-endpoint request waits on another one's IPC, so the count cannot
 /// deadlock: what a `MOUNT` handler blocks on (the worker pool, procmgr's
 /// `CREATE_FROM_FILE`, whose binary reads go to the fs driver that minted
 /// the file cap, the `NS_LOOKUP` walk the namespace thread serves, and the
-/// driver's `FS_MOUNT` probe) never calls the service endpoint.
+/// driver's `FS_MOUNT` probe) never calls the service endpoint. A
+/// `GET_SWAP_PARTITION` handler waits only for the swap lock, which the
+/// holder keeps across one `REGISTER_PARTITION` call to the block driver,
+/// and the block driver never calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
 /// Longest mount path a `MOUNT` request can name: the bytes the request's
@@ -190,8 +194,9 @@ fn main() -> !
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
-    // synthetic root. The service endpoint carries only `MOUNT` and
-    // `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
+    // synthetic root. The service endpoint carries only `MOUNT`,
+    // `GET_SYSTEM_ROOT_CAP` and `GET_SWAP_PARTITION`; the namespace
+    // endpoint is separated so
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
     let Some(namespace_ep) =
@@ -229,6 +234,7 @@ fn main() -> !
         namespace_ep,
         system_root_cap,
         root_backend: Mutex::new(VfsdRootBackend::new()),
+        swap: Mutex::new(swap::SwapPartition::new()),
     }));
 
     // Spawn the namespace dispatcher first: the `/esp` self-mount below
@@ -300,6 +306,11 @@ pub struct VfsdRuntime
     /// on each successful MOUNT; the namespace dispatcher reads on each
     /// `NS_*` request.
     pub root_backend: Mutex<VfsdRootBackend>,
+    /// The swap partition cap vfsd keeps, registered by the first
+    /// `GET_SWAP_PARTITION` that finds the partition. The lock is held
+    /// across a whole hand-out, so the first request's registration and a
+    /// later request's revoke never interleave.
+    pub swap: Mutex<swap::SwapPartition>,
 }
 
 // ── Service loop ───────────────────────────────────────────────────────────
@@ -342,6 +353,8 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   check before either installs, `install`) reject.
 ///
 /// No `do_mount`-touched state is shared without one of these locks.
+/// `GET_SWAP_PARTITION` touches only `rt.swap`, under its own mutex, and
+/// takes no other lock while it holds it.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -415,6 +428,37 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
                 else
                 {
                     handle_get_system_root_cap(ipc_buf, rt);
+                }
+            }
+            ipc::vfsd_labels::GET_SWAP_PARTITION =>
+            {
+                // Verb-bit gate: the hand-out revokes the previous holder's
+                // cap, so only the swap service's SWAP_AUTHORITY badge
+                // reaches it.
+                if badge & ipc::vfsd_labels::SWAP_AUTHORITY == 0
+                {
+                    std::os::seraph::log!(
+                        warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
+                    );
+                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+                {
+                    std::os::seraph::log!(
+                        warn: "GET_SWAP_PARTITION rejected: caller VFSD_LABELS_VERSION={} \
+                         expected {}",
+                        recv.word(0),
+                        ipc::VFSD_LABELS_VERSION
+                    );
+                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
+                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+                }
+                else
+                {
+                    handle_get_swap_partition(ipc_buf, rt);
                 }
             }
             _ =>
@@ -799,6 +843,102 @@ fn handle_get_system_root_cap(ipc_buf: *mut u64, rt: &VfsdRuntime)
     {
         std::os::seraph::log!(warn: "GET_SYSTEM_ROOT_CAP derive failed");
         IpcMessage::new(ipc::vfsd_errors::IO_ERROR)
+    };
+    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+// ── Swap-partition hand-out ─────────────────────────────────────────────────
+
+/// The operations of a swap-partition hand-out, carried out with the held
+/// disks' GPTs, the block drivers, and capability syscalls on this thread's
+/// IPC buffer.
+struct SwapIo<'a>
+{
+    rt: &'a VfsdRuntime,
+    ipc_buf: *mut u64,
+}
+
+impl swap::SwapOps for SwapIo<'_>
+{
+    fn lookup(&mut self) -> Result<gpt::PartitionLocation, gpt::GptLookupError>
+    {
+        // The role resolves across every held disk, as a mount role does
+        // (docs/storage.md § GPT Role-GUID Discovery).
+        let disk_parts = self.rt.disks.iter().map(|d| d.partitions.as_slice());
+        gpt::lookup_partition_by_type_guid(&role_guids::SERAPH_SWAP, disk_parts)
+    }
+
+    fn register(&mut self, location: &gpt::PartitionLocation) -> Option<u64>
+    {
+        // The lookup ran over `rt.disks`, so its index is in range.
+        let disk = self.rt.disks.get(location.disk)?;
+        derive_and_register_partition(
+            disk.blk_ep,
+            location.first_lba,
+            location.length_lba,
+            self.ipc_buf,
+        )
+    }
+
+    fn revoke_descendants(&mut self, cap: u64) -> bool
+    {
+        match syscall::cap_revoke_all(cap)
+        {
+            Ok(()) => true,
+            Err(code) =>
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SWAP_PARTITION: cap_revoke_all failed: code={code}"
+                );
+                false
+            }
+        }
+    }
+
+    fn derive(&mut self, cap: u64) -> Option<u64>
+    {
+        syscall::cap_derive(cap, syscall::RIGHTS_EP_SEND_GRANT).ok()
+    }
+}
+
+/// Handle [`vfsd_labels::GET_SWAP_PARTITION`]: hand the caller a
+/// `SEND_GRANT` on the swap partition, revoking the cap an earlier
+/// hand-out returned ([`swap::SwapPartition::hand_out`]).
+///
+/// The dispatcher admits only a `SWAP_AUTHORITY` badge. The partition is
+/// looked up and registered on the first request, never at startup, so a
+/// disk with no swap partition changes nothing until a request, which then
+/// replies [`vfsd_errors::NO_MOUNT`]; so does a tie between swap partitions.
+/// A failed registration, revoke or derivation replies
+/// [`vfsd_errors::IO_ERROR`].
+fn handle_get_swap_partition(ipc_buf: *mut u64, rt: &VfsdRuntime)
+{
+    let handed = rt
+        .swap
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hand_out(&mut SwapIo { rt, ipc_buf });
+    let reply = match handed
+    {
+        Ok(cap) => IpcMessage::builder(ipc::vfsd_errors::SUCCESS)
+            .cap(cap)
+            .build(),
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "GET_SWAP_PARTITION failed: {e:?}");
+            let label = match e
+            {
+                swap::HandOutError::NoPartition | swap::HandOutError::Ambiguous =>
+                {
+                    ipc::vfsd_errors::NO_MOUNT
+                }
+                swap::HandOutError::Register
+                | swap::HandOutError::Revoke
+                | swap::HandOutError::Derive => ipc::vfsd_errors::IO_ERROR,
+            };
+            IpcMessage::new(label)
+        }
     };
     // SAFETY: ipc_buf is the thread-registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

@@ -679,6 +679,11 @@ pub unsafe fn disable_interrupts()
 /// With SIE cleared the hart cannot actually handle the interrupt, so it
 /// re-executes `wfi` immediately — achieving an effective halt without a
 /// busy spin.
+///
+/// Never inlined, so the kernel image has a `halt_loop` symbol:
+/// `cargo xtask test-wedge` moves an idle hart's program counter to it to
+/// wedge that hart with interrupts off.
+#[inline(never)]
 pub fn halt_loop() -> !
 {
     // SAFETY: disabling interrupts before wfi is required for a safe permanent halt.

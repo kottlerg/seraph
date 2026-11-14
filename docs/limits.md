@@ -291,6 +291,7 @@ Every entry in this section is correct as is.
 | `AP_IST_PAIR_SIZE` | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | 32 KiB, `2 * IST_STACK_SIZE` | encoding artefact (two IST stacks) | `cpu_count` x 32 KiB | correct as is | None |
 | Trampoline template and SIPI widths | `core/kernel/src/arch/x86_64/ap_trampoline.rs` | page-sized; root table (PML4 or PML5) below 4 GiB | hardware spec (real-mode SIPI, 32-bit CR3 load) | one page | correct as is | None |
 | `wait_icr_idle` (`ICR_IDLE_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based) | none | correct as is | None |
+| `dump_remote_frame` (`REMOTE_FRAME_BUDGET_US`) | `core/kernel/src/arch/x86_64/interrupts.rs` | 1 s | tuning (time-based; bounds only the wait for a CPU no NMI reaches) | none | correct as is | None |
 | `wait_for_ack` ladder | `core/kernel/src/arch/*/interrupts.rs` | 250 / 750 / 5000 ms, on the spin-count estimate before the timer is calibrated | tuning (time-based) | none | correct as is | None |
 | `MAX_SPINS_PER_UNIT` | `core/kernel/src/bounded_wait.rs` | 10 000 spins per us | provable unreachability (a 10 GHz clock), so the fallback never times out early | none | correct as is | None |
 | `start_ap` delays | `core/kernel/src/arch/x86_64/interrupts.rs` | 10 ms, 200 us | hardware spec (Intel SDM INIT-SIPI-SIPI) | none | correct as is | None |
@@ -621,7 +622,7 @@ Every entry here is `correct as is`; none is tracked.
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
 | svc-defs argv and env limit (`check_startup_blobs`) | `services/svcmgr/svc-defs/src/parse.rs` | argv and env together at most `ARGV_ENV_MAX_BYTES` | the process ABI's argv/env region | none | correct as is | None |
 | reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | table index, `u64` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its live thread state) | none | correct as is | None |
-| endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 6 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
+| endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 7 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
 | bootstrap badge | `services/svcmgr/src/restart.rs` | random `u64` | ABI width | none | correct as is | None |
 
 ### vfsd and namespace
@@ -642,7 +643,7 @@ Every entry here is `correct as is`; none is tracked.
 | `GptHeader.num_parts`, `entry_size` | `services/vfsd/gpt/src/lib.rs` | `u32` | hardware spec (UEFI GPT) | none | correct as is | None |
 | `BootstrapState.pending`, `ActiveState.queue` | `services/vfsd/src/worker_pool.rs` | heap `Vec` and `VecDeque`, one entry per in-flight fatfs spawn | per-instance (an allocation failure refuses the order and releases its caps) | none | correct as is | None |
 | `ACTIVE_WORKER_COUNT` | `services/vfsd/src/worker_pool.rs` | 2 | tuning (concurrency knob) | 2 thread stacks | correct as is | None (#254) |
-| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another) | 4 thread stacks | correct as is | None (#254) |
+| `SERVICE_THREAD_COUNT` | `services/vfsd/src/main.rs` | 4 | tuning (concurrency knob; no service-endpoint request waits on another's IPC, and `GET_SWAP_PARTITION` only on the swap lock across one block-driver call) | 4 thread stacks | correct as is | None (#254) |
 
 ### init and logd
 

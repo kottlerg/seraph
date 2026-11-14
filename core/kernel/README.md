@@ -143,6 +143,7 @@ core/kernel/
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
     ├── transient-execution.md  # x86-64 transient-execution table: classes, sources, rules
+    ├── return-address-integrity.md # Kernel shadow stacks: threat model, options, direction
     ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of outputs
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
@@ -166,6 +167,9 @@ in [`docs/arch-interface.md`](docs/arch-interface.md). No code outside `arch/` c
 and re-exported from `arch/mod.rs` as a unified interface. On x86-64,
 `arch/x86_64/vulnerability.rs` derives at boot the CPU's exposure to each transient-execution
 class and logs it; see [`docs/transient-execution.md`](docs/transient-execution.md).
+Hardware shadow stacks for the kernel's return addresses (Zicfiss on riscv64, CET SHSTK on
+x86-64, each used where the hardware has it) are design intent, not yet implemented; see
+[`docs/return-address-integrity.md`](docs/return-address-integrity.md).
 
 ### `mm/`
 

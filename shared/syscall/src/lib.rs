@@ -1274,11 +1274,13 @@ pub unsafe fn thread_configure_with_tls(
 /// claimed it, or whose handler's claiming reply was `FAULT_REPLY_KILL` (or a
 /// `FAULT_REPLY_FORWARD` of a delivery other than a virtual-memory one, of one
 /// with no exception handler bound, or of the fault of a restartable syscall's
-/// user copy), is not resumed: starting it kills it
-/// as an unhandled fault, which posts its death and address-space observers,
-/// or, for the fault of a restartable syscall's user copy, fails that syscall
-/// with `InvalidAddress` (docs/fault-handling.md § Delivery, Resume, and
-/// Kill). An upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or
+/// user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), is not
+/// resumed: starting it kills it as an unhandled fault, which posts its death
+/// and address-space observers, or, for the fault of a restartable syscall's
+/// user copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
+/// § Delivery, Resume, and Kill). Starting one whose claiming reply was a
+/// `FAULT_REPLY_REDIRECT` that named an endpoint delivers the fault there. An
+/// upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or
 /// that the claiming reply declined (`FAULT_REPLY_KILL`, or
 /// `FAULT_REPLY_FORWARD`, a decline for an upcall), drops the upcall instead,
 /// and the start resumes the thread at its registers (docs/fault-handling.md
@@ -2397,10 +2399,15 @@ pub fn ioport_bind(thread_cap: u64, ioport_cap: u64) -> Result<(), i64>
 /// the fault through the thread's exception-class handler when the reply
 /// answered the virtual-memory class's delivery of a fault other than a kernel
 /// copy's and an exception handler is bound, and otherwise takes the kill
-/// outcome, as [`thread_start`] says
-/// (docs/fault-handling.md § Delivery, Resume, and Kill). A thread blocked in an upcall delivery is never killed: whatever
-/// the outcome, the upcall is settled or dropped and the start resumes the
-/// thread at its registers (docs/fault-handling.md § Asynchronous Upcalls).
+/// outcome; on `FAULT_REPLY_REDIRECT` it delivers the fault to the endpoint
+/// the reply named, or takes the kill outcome when it named none, as
+/// [`thread_start`] says (docs/fault-handling.md § Delivery, Resume, and
+/// Kill). A thread blocked in an upcall delivery is never killed: the upcall
+/// is settled or dropped and the start resumes the thread at its registers,
+/// except after a `FAULT_REPLY_REDIRECT` that named an endpoint, when the
+/// start delivers the upcall there and the thread stays fault-blocked until
+/// that endpoint's reply disposes of it (docs/fault-handling.md
+/// § Asynchronous Upcalls).
 ///
 /// If the thread is running on another CPU, the call returns once that CPU
 /// has descheduled it and published its register save, or once an object

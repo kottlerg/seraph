@@ -178,8 +178,8 @@ pub struct SvcmgrCaps
     /// svcmgr's own bootstrap endpoint (receives bootstrap requests from
     /// restarted children).
     pub bootstrap_ep: u64,
-    /// SEND on the root filesystem's namespace endpoint, published as
-    /// `rootfs.root`. Zero if init could not derive it.
+    /// SEND on vfsd's synthetic root, derived by init from its system-root
+    /// cap, published as `rootfs.root`. Zero if init could not derive it.
     pub rootfs_root: u64,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
     /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and
@@ -193,6 +193,9 @@ pub struct SvcmgrCaps
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, published
     /// seed-only as `vfsd.deny`. Zero if absent.
     pub vfsd_deny: u64,
+    /// `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, published
+    /// seed-only as `vfsd.swap`. Zero if absent.
+    pub vfsd_swap: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
@@ -251,6 +254,7 @@ pub fn bootstrap_caps(
                             devmgr_registry: c.devmgr_registry,
                             vfsd_mount: c.vfsd_mount,
                             vfsd_deny: c.vfsd_deny,
+                            vfsd_swap: c.vfsd_swap,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,
                         });

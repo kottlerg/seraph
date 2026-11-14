@@ -1247,13 +1247,15 @@ pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u64,
     pub svcmgr_bootstrap_ep: u64,
-    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). svcmgr
-    /// derives the published `rootfs.root` SEND from it.
+    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). init derives
+    /// the endowed `rootfs.root` SEND from it in `endow_svcmgr`, and
+    /// svcmgr publishes that SEND as received.
     pub rootfs_root_cap: u64,
     pub devmgr_registry_ep: u64,
     /// vfsd's un-badged service endpoint. init mints the endowed
-    /// `MOUNT_AUTHORITY` SEND (published as `vfsd.mount`) and the
-    /// `DENY_BADGE` SEND (published as `vfsd.deny`) from it.
+    /// `MOUNT_AUTHORITY` SEND (published as `vfsd.mount`), the
+    /// `DENY_BADGE` SEND (published as `vfsd.deny`), and the
+    /// `SWAP_AUTHORITY` SEND (published as `vfsd.swap`) from it.
     pub vfsd_service_ep: u64,
     /// Reserved master-log endpoint source (`cap_derive(log_ep, RIGHTS_ALL)`).
     /// svcmgr mints real-logd's master-log RECV from it on every (re)launch,
@@ -1272,16 +1274,18 @@ pub struct SvcmgrEndowment
 /// Start svcmgr, then serve the handover endowment over the bootstrap
 /// protocol.
 ///
-/// The `CAPS` rounds (two rounds for the six slots) deliver
+/// The `CAPS` rounds (two rounds for the seven slots) deliver
 /// svcmgr's service + bootstrap endpoints (full
-/// rights) and the publish-role source caps: a `SEND` on the root
-/// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
-/// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
-/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.bind` publish caps, the
+/// rights) and the publish-role source caps: a `SEND` on vfsd's synthetic
+/// root derived from the system-root cap (svcmgr publishes it as
+/// `rootfs.root`) and a badge-0 `SEND|GRANT` source on devmgr's registry
+/// endpoint (svcmgr mints the `devmgr.registry` / `devmgr.shutdown` /
+/// `devmgr.bind` publish caps, the
 /// `devmgr.class.*` class SENDs, and the `DRIVERS_DIR_AUTHORITY`
-/// `SET_DRIVERS_DIR` cap from it), plus two SENDs on
+/// `SET_DRIVERS_DIR` cap from it), plus three SENDs on
 /// vfsd's service endpoint svcmgr publishes seed-only: `MOUNT_AUTHORITY`-badged
-/// (`vfsd.mount`) and `DENY_BADGE`-badged (`vfsd.deny`). An absent source
+/// (`vfsd.mount`), `DENY_BADGE`-badged (`vfsd.deny`), and
+/// `SWAP_AUTHORITY`-badged (`vfsd.swap`). An absent source
 /// cap is left off its round and its presence bit clear (the
 /// `svcmgr_endowment` encoding), since the kernel refuses a null cap slot.
 ///
@@ -1343,7 +1347,8 @@ fn endow_svcmgr(
         destroy_partial_child(process_handle, ipc_buf);
         return false;
     }
-    // rootfs.root SEND — badge inherited from the root fs namespace cap.
+    // rootfs.root SEND — badge inherited from the system-root cap (vfsd's
+    // synthetic root at full namespace rights).
     let rootfs_send = if endow.rootfs_root_cap != 0
     {
         syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0)
@@ -1366,8 +1371,9 @@ fn endow_svcmgr(
 
     // vfsd service-endpoint SENDs: one badged MOUNT_AUTHORITY alone (no
     // SEED_AUTHORITY, which would hand over the system root), one badged
-    // DENY_BADGE (no verb bit). Both are badged, so svcmgr and the recipes
-    // seeding them cannot re-badge them into either authority.
+    // DENY_BADGE (no verb bit), and one badged SWAP_AUTHORITY alone. Each is
+    // badged, so svcmgr and the recipes seeding them cannot re-badge one
+    // into another authority.
     let vfsd_send = |badge: u64| {
         if endow.vfsd_service_ep == 0
         {
@@ -1378,12 +1384,13 @@ fn endow_svcmgr(
     };
     let vfsd_mount = vfsd_send(ipc::vfsd_labels::MOUNT_AUTHORITY);
     let vfsd_deny = vfsd_send(ipc::vfsd_labels::DENY_BADGE);
+    let vfsd_swap = vfsd_send(ipc::vfsd_labels::SWAP_AUTHORITY);
 
     // The CAPS rounds: the positional slot list [service, bootstrap, rootfs,
-    // devmgr_reg, vfsd_mount, vfsd_deny], split over as many rounds as it needs, each carrying the
-    // present caps of its window, named by its presence word, and the count
-    // of CAPS rounds after it. The LOGD_SOURCES round is always terminal, so
-    // no earlier round is.
+    // devmgr_reg, vfsd_mount, vfsd_deny, vfsd_swap], split over as many
+    // rounds as it needs, each carrying the present caps of its window, named
+    // by its presence word, and the count of CAPS rounds after it. The
+    // LOGD_SOURCES round is always terminal, so no earlier round is.
     let caps_rounds = svcmgr_endowment::encode_caps(&svcmgr_endowment::CapsRound {
         service_ep: service_copy,
         bootstrap_ep: boot_copy,
@@ -1391,6 +1398,7 @@ fn endow_svcmgr(
         devmgr_registry: devmgr_registry_src,
         vfsd_mount,
         vfsd_deny,
+        vfsd_swap,
     });
     for caps_round in &caps_rounds
     {
@@ -1585,7 +1593,7 @@ pub fn phase3_svcmgr_handover(
 
     // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
     // endpoints plus the publish-role source caps (rootfs root, devmgr
-    // registry, the two vfsd SENDs), then one round per init-bootstrapped
+    // registry, the three vfsd SENDs), then one round per init-bootstrapped
     // substrate service carries that service's (name, thread_cap) for
     // death-supervision binding, and the terminal round carries the reserved
     // log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes

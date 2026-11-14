@@ -64,7 +64,7 @@
 //! demand region: memmgr must back each fault from a smaller run.
 //!
 //! A tenth phase, **sparse region**, registers a region of 2^14 chunks, whose
-//! chunk table in memmgr has seven directory levels, and touches a spread of
+//! chunk table in memmgr has six directory levels, and touches a spread of
 //! its chunks and its last one: each fault must find its chunk's entry, back
 //! it, and leave every other chunk's data in place.
 
@@ -127,7 +127,7 @@ pub fn phases() -> &'static [Phase]
 /// code a `FAULT_REPLY_FORWARD` carries in the low half of data word 0 (zero
 /// on a resume): services/memmgr/docs/ipc-interface.md § Kernel-origin fault
 /// message tables the codes.
-fn forged_vm_fault(va: u64, access: u64) -> (u64, u64)
+pub(crate) fn forged_vm_fault(va: u64, access: u64) -> (u64, u64)
 {
     let info = startup_info();
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -475,8 +475,8 @@ fn demand_fault_cost_phase(_: &Caps)
 }
 
 /// Chunks of the region [`demand_paging_sparse_region_phase`] registers: 2^14
-/// (1 GiB of VA), so memmgr's chunk table for it has seven directory levels of
-/// five children each (services/memmgr/docs/memory-pool.md § Chunk table).
+/// (1 GiB of VA), so memmgr's chunk table for it has six directory levels of
+/// six children each (services/memmgr/docs/memory-pool.md § Chunk table).
 const SPARSE_CHUNKS: u64 = 1 << 14;
 
 /// Chunks [`demand_paging_sparse_region_phase`] touches before its last one,

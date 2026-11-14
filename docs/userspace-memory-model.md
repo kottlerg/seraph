@@ -273,8 +273,7 @@ quality caveat.
   `REQUEST_MEMORY_CAPS` calls, with the memory max of the process's
   budget node where its creator set one; no default per-process ceiling
   exists ([memory-pool.md](../services/memmgr/docs/memory-pool.md)
-  § Distribution policy; a creator cannot set the max yet, since procmgr
-  passes none, [#260](https://github.com/kottlerg/seraph/issues/260)). For an `ET_DYN` image the
+  § Distribution policy). For an `ET_DYN` image the
   creator leaves the `STACK_GUARD_PAGES + MAX_PROCESS_STACK_PAGES` pages below
   `stack_top_vaddr` to the stack: it maps no other surface there, the
   layout's draw windows keep every other bootstrap surface out of them

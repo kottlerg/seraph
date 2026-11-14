@@ -67,7 +67,10 @@ procmgr/
   devmgr) for inclusion in the child's CSpace; mint and pass per-process
   initial caps to newly created processes via `ProcessInfo`.
 - **memmgr coordination** — call `memmgr.REGISTER_PROCESS` before
-  spawning a child to obtain the child's `memmgr_endpoint_cap`; call
+  spawning a child to obtain the child's `memmgr_endpoint_cap`, registering
+  its budget node under its creator's with the max and reserve membership the
+  create asks for (see [docs/ipc-interface.md](docs/ipc-interface.md)
+  § Label 1, **Memory max and reserve**); call
   `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim, or, for a
   started child created with `CREATE_DMA_HOLD`, only once its creator sends
   `RELEASE_HOLD` on the child's release token (see

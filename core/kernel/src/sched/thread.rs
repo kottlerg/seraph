@@ -876,14 +876,28 @@ pub struct ThreadControlBlock
     /// [`crate::ipc::fault::FAULT_OUTCOME_KILL`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_REDELIVER`] /
     /// [`crate::ipc::fault::FAULT_OUTCOME_DECLINED`] /
-    /// [`crate::ipc::fault::FAULT_OUTCOME_FORWARDED`]. Set to `PENDING` with
-    /// the binding read that opens a delivery (under `sched_lock`), and by the
-    /// single wake-claim winner: `RESUME`, `DECLINED`, or `FORWARDED` by a
-    /// genuine reply,
+    /// [`crate::ipc::fault::FAULT_OUTCOME_FORWARDED`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_REDIRECTED`] /
+    /// [`crate::ipc::fault::FAULT_OUTCOME_REDIRECT_REFUSED`]. Set to `PENDING`
+    /// with the binding read that opens a delivery (under `sched_lock`), and by
+    /// the single wake-claim winner: `RESUME`, `DECLINED`, `FORWARDED`,
+    /// `REDIRECTED`, or `REDIRECT_REFUSED` by a genuine reply,
     /// `KILL` by handler-thread destruction or cancellation, `REDELIVER` by a
     /// binding change, so
     /// resume-vs-cancellation is unambiguous. See `docs/fault-handling.md`.
     pub fault_outcome: core::sync::atomic::AtomicU8,
+
+    /// The endpoint a [`syscall::FAULT_REPLY_REDIRECT`] reply named, with a
+    /// reference this field owns, from that reply to the faulting thread's
+    /// next delivery pass; null otherwise. Stored by the reply that won the
+    /// delivery's reply claim (`sys_ipc_reply`), before its wake, beside
+    /// [`fault_outcome`](Self::fault_outcome) `REDIRECTED`; taken (swapped to
+    /// null) by the thread's own `fault_dispatch` once that wake resumes it,
+    /// which hands the reference to the redirected delivery; and released by
+    /// `dealloc_object(Thread)`, after its wake-in-flight gate, for a thread
+    /// destroyed before it ran again. A delivery is in flight only after its
+    /// pass took the field, so a reply claiming one finds it null.
+    pub fault_redirect: core::sync::atomic::AtomicPtr<crate::cap::object::EndpointObject>,
 
     /// True while this thread is delivering / blocked on a fault. Written only
     /// by this thread, outside any park and under its `sched_lock`:

@@ -11,7 +11,7 @@
 //! default adapter); the bootloader captured its base via UEFI GOP before
 //! `ExitBootServices`.
 
-use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
+use std::os::seraph::{mmio_map_funded, reserve_pages};
 
 /// Reserve `total_pages` VA pages and map the framebuffer `Mmio`
 /// cap into them as writable MMIO. Returns the mapped base pointer on
@@ -26,13 +26,10 @@ pub unsafe fn fb_mmio_init(self_aspace: u64, mmio_cap: u64, total_pages: u64) ->
 {
     let range = reserve_pages(total_pages).ok()?;
     let base_va = range.va_start();
-    if !fund_aspace_pt_budget(self_aspace, total_pages)
-    {
-        return None;
-    }
-    // `flags` is reserved and the kernel ignores it, so this passes 0: the
-    // mapping is writable because the `Mmio` cap carries the Write right,
-    // and the kernel applies uncacheable attributes to every page of it.
+    // The mapping is writable because the `Mmio` cap carries the Write right,
+    // and the kernel applies uncacheable attributes to every page of it. A
+    // failed map leaves the range reserved for the process's lifetime, so no
+    // later reservation lands on a page it mapped.
     // SAFETY: `range` is a fresh reservation of `total_pages` pages from the
     // per-process arena, owned for the process's lifetime, and the caller's
     // contract bounds the region to it: VA no Rust object or IPC page
@@ -40,6 +37,6 @@ pub unsafe fn fb_mmio_init(self_aspace: u64, mmio_cap: u64, total_pages: u64) ->
     // The renderer (`render.rs`) reaches the mapping only through raw
     // `write_volatile` and `ptr::copy` accesses, never a reference, and the
     // reservation stays held for the process's lifetime (`mmio_map` § Safety).
-    unsafe { syscall::mmio_map(self_aspace, mmio_cap, base_va, 0) }.ok()?;
+    unsafe { mmio_map_funded(self_aspace, mmio_cap, base_va, total_pages) }.ok()?;
     Some(base_va as *mut u8)
 }

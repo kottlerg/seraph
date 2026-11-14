@@ -25,7 +25,7 @@ use driver_binding::decl::DriverDecl;
 use firmware::platform::PlatformTable;
 use ipc::IpcMessage;
 use process_abi::{NT_SERAPH_DRIVER, SERAPH_NOTE_OWNER};
-use std::os::seraph::{reserve_pages, unreserve_pages};
+use std::os::seraph::reserve_pages;
 use syscall_abi::PAGE_SIZE;
 
 use crate::{arch, caps, spawn};
@@ -285,16 +285,10 @@ fn with_module<R>(
         return None;
     };
     let va = range.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, pages)
-    {
-        std::os::seraph::log!(warn: "boot module: page-table budget not funded; not read");
-        unreserve_pages(range);
-        return None;
-    }
     // SAFETY: `range` is a fresh reservation of `pages` pages from the
     // per-process arena, owned here: VA no Rust object or IPC page occupies.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             module_cap,
             caps.self_aspace,
             va,
@@ -306,7 +300,9 @@ fn with_module<R>(
     if mapped.is_err()
     {
         std::os::seraph::log!(warn: "boot module: not mapped; not read");
-        unreserve_pages(range);
+        // SAFETY: the span is this call's own reservation, which no
+        // reference reaches.
+        unsafe { crate::unmap_window(caps.self_aspace, range) };
         return None;
     }
     // SAFETY: `span` bytes, at most `pages` pages, are mapped read-only from
@@ -317,8 +313,7 @@ fn with_module<R>(
     // SAFETY: the span is this call's own reservation, and `bytes`, the only
     // reference into it, is not used past `read`, whose result borrows none
     // of it.
-    let _ = unsafe { syscall::mem_unmap(caps.self_aspace, va, pages) };
-    unreserve_pages(range);
+    unsafe { crate::unmap_window(caps.self_aspace, range) };
     Some(out)
 }
 

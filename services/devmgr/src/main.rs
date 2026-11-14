@@ -1125,7 +1125,7 @@ fn handle_query_shutdown_device(
 
 /// Carve, map, and scan one ECAM window, appending its functions to
 /// `devices`. Returns `false`, logging why, when no aperture covers the
-/// window, the VA reservation, page-table funding, or mapping fails, or the
+/// window, the VA reservation or the funded mapping fails, or the
 /// scan stops for lack of memory before recording any function; a scan that
 /// stops after recording some keeps them and counts as scanned.
 fn enumerate_ecam(
@@ -1194,8 +1194,8 @@ fn enumerate_ecam(
 /// Map the `Mmio` cap `cap`, `pages` pages, into devmgr's own address space
 /// `aspace` at fresh VA, run `access` on the mapping's base address, then
 /// unmap it and return what `access` returned. Returns `None`, logged under
-/// `what`, when the VA reservation, the page-table funding, or the mapping
-/// fails; `access` then does not run.
+/// `what`, when the VA reservation or the mapping, page-table funding
+/// included (`mmio_map_funded`), fails; `access` then does not run.
 ///
 /// The VA is a fresh reservation from the per-process arena that no Rust
 /// object or IPC page occupies, mapped for exactly the call to `access`:
@@ -1216,29 +1216,42 @@ fn with_mmio_mapped<R>(
         return None;
     };
     let va = range.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(aspace, pages)
-    {
-        std::os::seraph::log!(warn: "{}: page-table budget not funded", what);
-        unreserve_pages(range);
-        return None;
-    }
     // SAFETY: `va` starts `range`, a fresh reservation of `pages` pages from
     // the per-process arena, owned here: VA no Rust object or IPC page
     // occupies. `access` reaches the mapping only through raw volatile
     // accesses, never a reference, and `range` is unreserved only after the
     // unmap below (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(aspace, cap, va, 0) }.is_err()
+    let mapped = unsafe { std::os::seraph::mmio_map_funded(aspace, cap, va, pages) };
+    if mapped.is_err()
     {
         std::os::seraph::log!(warn: "{}: mapping failed", what);
-        unreserve_pages(range);
+        // SAFETY: the span is `range`, owned here, which no reference reaches.
+        unsafe { unmap_window(aspace, range) };
         return None;
     }
     let result = access(va);
     // SAFETY: `access` has returned, and was the mapping's only use; the span
     // is `range`, owned here.
-    let _ = unsafe { syscall::mem_unmap(aspace, va, pages) };
-    unreserve_pages(range);
+    unsafe { unmap_window(aspace, range) };
     Some(result)
+}
+
+/// Unmap the whole span of `range`, a reservation in devmgr's own address
+/// space `aspace` that a map may have left pages in, and return it to the
+/// arena. A map can fail with the pages before the failing one mapped, and
+/// unmapping a page that is not mapped is harmless. When the unmap fails the
+/// range stays reserved for devmgr's lifetime, so no later reservation lands
+/// on a page still mapped there.
+///
+/// # Safety
+/// No live Rust reference or object lies in the span (`mem_unmap` § Safety).
+pub(crate) unsafe fn unmap_window(aspace: u64, range: std::os::seraph::ReservedRange)
+{
+    // SAFETY: the caller's contract.
+    if unsafe { syscall::mem_unmap(aspace, range.va_start(), range.page_count()) }.is_ok()
+    {
+        unreserve_pages(range);
+    }
 }
 
 /// Keep a scanned ECAM window's cap and location in `caps.config_space` and

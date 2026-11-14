@@ -77,16 +77,12 @@ fn map_registers(aspace: u64, registers: Registers) -> Option<u64>
         return None;
     };
     let va = range.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(aspace, registers.pages)
-    {
-        std::os::seraph::log!(error: "register window: page-table funding failed");
-        return None;
-    }
     // SAFETY: `range` is a fresh reservation of the cap's pages from the
     // per-process arena, never returned, so the VA stays the registers' for
     // the driver's life; the backend reaches them only through raw volatile
     // accesses (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(aspace, registers.cap, va, 0) }.is_err()
+    if unsafe { std::os::seraph::mmio_map_funded(aspace, registers.cap, va, registers.pages) }
+        .is_err()
     {
         std::os::seraph::log!(error: "register window: mmio_map failed");
         return None;

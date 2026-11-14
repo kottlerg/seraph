@@ -178,10 +178,6 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         fail("BAR reserve_pages failed");
     };
     let window_va = window.va_start();
-    if !std::os::seraph::fund_aspace_pt_budget(caps.self_aspace, window_pages)
-    {
-        fail("BAR PT-budget funding failed");
-    }
     for (range, &offset) in ranges.iter().zip(&placed)
     {
         let Some(range_va) = window_va.checked_add(offset)
@@ -189,6 +185,7 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         {
             fail("BAR range past the address space");
         };
+        let range_pages = range.bytes.div_ceil(PAGE_SIZE);
         // SAFETY: `window` is a fresh reservation of `window_pages` pages
         // from the per-process arena, and `place` put this range's pages at
         // `offset` inside its BAR's share of it, overlapping no other
@@ -197,7 +194,10 @@ fn map_register_window(caps: &DriverCaps, layout: &RegisterLayout) -> u64
         // volatile accessors, never a reference, and the reservation is
         // never returned, so the VA stays reserved for the driver's lifetime
         // (`mmio_map` § Safety).
-        if unsafe { syscall::mmio_map(caps.self_aspace, range.cap, range_va, 0) }.is_err()
+        let mapped = unsafe {
+            std::os::seraph::mmio_map_funded(caps.self_aspace, range.cap, range_va, range_pages)
+        };
+        if mapped.is_err()
         {
             fail("BAR mmio_map failed");
         }
@@ -290,7 +290,7 @@ fn dma_pages(caps: &DriverCaps, pages: u64, what: &str, ipc_buf: *mut u64) -> Dm
     // owned here for the mapping's life: VA no Rust object or IPC page
     // occupies.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             memory,
             caps.self_aspace,
             va,

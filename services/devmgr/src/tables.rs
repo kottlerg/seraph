@@ -16,13 +16,14 @@
 use crate::arch;
 use crate::caps::{AcpiRegion, Firmware};
 use firmware::EcamLocation;
-use std::os::seraph::{reserve_pages, unreserve_pages};
+use std::os::seraph::reserve_pages;
 use syscall_abi::PAGE_SIZE;
 
 /// Map `page_count` pages of the read-only Memory cap `cap`, from its page
 /// `first_page`, run `read` on the mapped bytes, and unmap them. Returns
-/// `None`, logging why, when the VA reservation or the mapping fails, and
-/// otherwise what `read` returns.
+/// `None`, logging why, when the VA reservation or the mapping, page-table
+/// funding included (`mem_map_funded`), fails, and otherwise what `read`
+/// returns.
 fn with_mapped<R>(
     firmware: &Firmware,
     cap: u64,
@@ -42,7 +43,7 @@ fn with_mapped<R>(
     // SAFETY: `range` is a fresh reservation of `page_count` pages from the
     // per-process arena, owned here: VA no Rust object or IPC page occupies.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             cap,
             firmware.self_aspace,
             va,
@@ -58,7 +59,9 @@ fn with_mapped<R>(
             page_count,
             first_page
         );
-        unreserve_pages(range);
+        // SAFETY: the span is this call's own reservation, which no
+        // reference reaches.
+        unsafe { crate::unmap_window(firmware.self_aspace, range) };
         return None;
     }
     // SAFETY: `span` bytes are mapped read-only from `va` above.
@@ -66,8 +69,7 @@ fn with_mapped<R>(
     let out = read(bytes);
     // SAFETY: the span is this call's own reservation, and `bytes`, the only
     // reference into it, is not used past the line above.
-    let _ = unsafe { syscall::mem_unmap(firmware.self_aspace, va, page_count) };
-    unreserve_pages(range);
+    unsafe { crate::unmap_window(firmware.self_aspace, range) };
     out
 }
 

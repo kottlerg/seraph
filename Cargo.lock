@@ -1190,10 +1190,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruststd-pt-funding"
+name = "ruststd-pool-funding"
 version = "0.1.4"
 dependencies = [
  "rustc-std-workspace-core",
+ "syscall-abi",
 ]
 
 [[package]]

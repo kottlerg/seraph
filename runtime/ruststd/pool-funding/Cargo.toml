@@ -2,19 +2,19 @@
 # Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
 [package]
-name = "ruststd-pt-funding"
+name = "ruststd-pool-funding"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
 # Dual-mode: a host-tested workspace member AND a `rustc-dep-of-std`
-# dependency of the seraph std overlay. Holds the pure page-table funding
+# dependency of the seraph std overlay. Holds the pure growth-pool funding
 # policy of the overlay (`runtime/ruststd/src/sys/alloc/seraph.rs`): how a
-# top-up of an address space's page-table pool decides its donations and its
-# outcome, and how a map into the process's own address space retries after an
-# exhausted pool. The budget read, the donation and the map syscalls stay with
-# the caller, so the only dep is the build-std core facade, activated under the
-# `rustc-dep-of-std` feature.
+# top-up of an address space's page-table pool or a `CSpace`'s slot-page pool
+# decides its donations and its outcome, and how a map into the process's own
+# address space retries after an exhausted pool. The pool reads, the donations
+# and the map syscalls stay with the caller, so the only dep is the build-std
+# core facade, activated under the `rustc-dep-of-std` feature.
 [lib]
 test = true
 doctest = false
@@ -24,6 +24,11 @@ doctest = false
 # `rustc-dep-of-std`, so `use core::…` resolves against the build-std
 # core facade. Same pattern as runtime/ruststd/argv-env.
 rustc-std-workspace-core = { version = "1.0.1", optional = true }
+
+# The host tests model a `CSpace` top-up with the shortfall
+# `fund_cspace_slot_budget` reads (`syscall_abi::cspace_topup_pages`).
+[dev-dependencies]
+syscall-abi = { path = "../../../abi/syscall" }
 
 [features]
 rustc-dep-of-std = ["rustc-std-workspace-core"]

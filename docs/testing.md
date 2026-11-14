@@ -485,17 +485,18 @@ the framebuffer boot, `--display framebuffer`, and the debug-port boots, `test-d
 `test-gdb`, are device cells, see Device surfaces, Framebuffer cell, Debug-port cell, and Release
 host runs below), filesystem (FAT), riscv64
 paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
-are manual, same posture as CPU-count variations), x86_64 paging depth (4-level —
-5-level runs via `cargo xtask run --x86-paging 5`, under TCG (`SERAPH_ACCEL=tcg`) on a
-host whose CPU lacks LA57, are manual, same posture), disk logical block size (512 bytes —
-the 4Kn boot, a 4096-byte-block image on a 4096-byte-block device, is a storage cell, see
-Device surfaces and Disk variations below), and disk count (one — the second-disk boots are
-storage cells too). The `virtio-rng` device is
+are manual, same posture as CPU-count variations), riscv64 Zkr entropy source (on —
+runs without it via `cargo xtask run --riscv-zkr off` are manual, same posture), x86_64
+paging depth (4-level — 5-level runs via `cargo xtask run --x86-paging 5`, under TCG
+(`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are manual, same posture), disk
+logical block size (512 bytes — the 4Kn boot, a 4096-byte-block image on a 4096-byte-block
+device, is a storage cell, see Device surfaces and Disk variations below), and disk count (one
+— the second-disk boots are storage cells too). The `virtio-rng` device is
 a boot-entropy source for the pool seed and KASLR: the firmware's RNG driver
 binds it and exposes `EFI_RNG_PROTOCOL`, which the bootloader draws from (OVMF
 also backs the protocol with RDRAND on x86_64; on riscv64 the device is the
 only firmware source under the EDK2 firmware CI boots, and the pool mixes
-jitter besides; see
+the Zkr `seed` CSR and jitter besides; see
 [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 A driver or filesystem joins the default boot set, and with it the canonical cells, only by
 replacing the main device of its type (Driver coverage below); any other driver adds cells to

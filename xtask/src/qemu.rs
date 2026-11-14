@@ -75,6 +75,34 @@ impl RiscvMmu
     }
 }
 
+/// Whether the guest RISC-V CPU implements the `Zkr` entropy source.
+///
+/// With it, the firmware grants S-mode the `seed` CSR and the kernel's
+/// hardware RNG draws from it; without it, the kernel's probe of the CSR traps
+/// and the source is absent (core/kernel/docs/entropy.md § Sources and
+/// graceful degradation). Explicit both ways, against QEMU default drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum RiscvZkr
+{
+    /// Implement `Zkr` (`zkr=on`) — the default.
+    On,
+    /// Leave `Zkr` out (`zkr=off`).
+    Off,
+}
+
+impl RiscvZkr
+{
+    /// `-cpu` property suffix that pins the guest's `Zkr`.
+    fn cpu_zkr_prop(self) -> &'static str
+    {
+        match self
+        {
+            Self::On => ",zkr=on",
+            Self::Off => ",zkr=off",
+        }
+    }
+}
+
 /// Guest x86-64 paging depth for a QEMU launch.
 ///
 /// Pins the guest CPU's `la57` property on every accelerator, so the CPUID
@@ -316,6 +344,9 @@ pub struct QemuLaunchSpec<'a>
     pub incoming: Option<&'a str>,
     /// Guest paging-mode ceiling; riscv64 only, ignored on `x86_64`.
     pub riscv_mmu: RiscvMmu,
+    /// Whether the guest CPU implements `Zkr`; riscv64 only, ignored on
+    /// `x86_64`.
+    pub riscv_zkr: RiscvZkr,
     /// Guest paging depth; `x86_64` only, ignored on riscv64.
     pub x86_paging: X86Paging,
     /// Whether the machine's IOMMU is attached; every launch site attaches it
@@ -741,13 +772,19 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // and why the named `-cpu rva23s64` model is not used, are specified in
     // docs/build-system.md § QEMU and Firmware.
     //
+    // The `zkr` property (`RiscvZkr::cpu_zkr_prop`, on by default) gives the
+    // hart the Zkr entropy source, whose `seed` CSR the firmware (OpenSBI)
+    // grants S-mode when the hart has it, so the kernel's hardware RNG draws
+    // from it; the source is optional, and `--riscv-zkr off` boots without it.
+    //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.
     args.extend([
         "-cpu".into(),
         format!(
             "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
-             ssaia=on,smaia=on{}",
+             ssaia=on,smaia=on{}{}",
+            spec.riscv_zkr.cpu_zkr_prop(),
             spec.riscv_mmu.cpu_satp_props()
         ),
     ]);
@@ -1019,6 +1056,7 @@ mod tests
             vmgenid_guid: None,
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
+            riscv_zkr: RiscvZkr::On,
             x86_paging: X86Paging::Four,
             iommu: Iommu::Attached,
             debug_port: None,
@@ -1046,6 +1084,20 @@ mod tests
         spec.riscv_mmu = RiscvMmu::Sv57;
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(cpu_arg(&argv).ends_with(",sv57=on"));
+    }
+
+    #[test]
+    fn argv_reflects_riscv_zkr()
+    {
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).contains(",zkr=on"));
+
+        let mut spec = riscv_spec(1, 512);
+        spec.riscv_zkr = RiscvZkr::Off;
+        let argv = build_qemu_argv(&spec).unwrap();
+        let cpu = cpu_arg(&argv);
+        assert!(cpu.contains(",zkr=off"));
+        assert!(!cpu.contains(",zkr=on"));
     }
 
     #[test]
@@ -1122,6 +1174,7 @@ mod tests
             vmgenid_guid: Some("auto"),
             incoming: Some("exec:cat state.bin"),
             riscv_mmu: RiscvMmu::Sv48,
+            riscv_zkr: RiscvZkr::On,
             x86_paging: X86Paging::Four,
             iommu: Iommu::Attached,
             debug_port: None,
@@ -1150,6 +1203,7 @@ mod tests
             vmgenid_guid: None,
             incoming: None,
             riscv_mmu: RiscvMmu::Sv48,
+            riscv_zkr: RiscvZkr::On,
             x86_paging,
             iommu: Iommu::Attached,
             debug_port: None,

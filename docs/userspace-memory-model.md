@@ -234,8 +234,8 @@ fail loudly by design. The default boot on both architectures is
 firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
 firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
 without that device, under the EDK2 firmware the default boot uses, seeds
-from jitter alone
-([#393](https://github.com/kottlerg/seraph/issues/393)); see
+from the Zkr `seed` CSR where the hart implements it and the firmware grants
+it, and otherwise from jitter alone; see
 [`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
 quality caveat.
 

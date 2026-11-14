@@ -69,9 +69,18 @@ Three source classes are mixed into the pool:
   entropy](arch-interface.md#entropy--archcurrententropy)). On x86-64 this is
   RDSEED (a conditioned, seed-grade source, preferred) with an RDRAND fallback,
   CPUID-gated, each with bounded retry on the transient not-ready condition the
-  ISA permits. Hardware output is health-gated (below) before it is trusted.
-  riscv64 has no S-mode hardware RNG — the `Zkr` `seed` CSR is M-mode-owned
-  (`mseccfg.SSEED`) — so `hw_rng_available` is false there.
+  ISA permits. On riscv64 it is the `Zkr` entropy source, read through its
+  `seed` CSR, which S-mode may read only where M-mode firmware grants it
+  (`mseccfg.SSEED`; OpenSBI sets it on a hart that implements `Zkr`). S-mode
+  cannot read `mseccfg`, and an ISA string naming `zkr` does not say whether
+  the grant was made, so `hw_rng_available` probes by one read of the CSR:
+  without `Zkr` or the grant the read raises an illegal-instruction exception,
+  which the trap handler recovers through the access's fixup, and the source
+  is absent; a `DEAD` status is absent too. A word is four 16-bit `ES16`
+  samples, the source's not-ready states (`BIST`, `WAIT`) retried within a time
+  budget per word, and a `DEAD` read during a draw latches the source absent.
+  The samples are raw, unconditioned entropy. Hardware output is health-gated
+  (below) before it is trusted.
 - **Timing jitter** — cycle-counter samples (`read_cycle_counter`: TSC on
   x86-64; the `time` CSR on riscv64) taken at distinct interrupt event classes.
   This is the always-available source.
@@ -228,10 +237,16 @@ through it. The default QEMU boot set therefore includes `virtio-rng-pci` on bot
 arches (added for KASLR, [#252](https://github.com/kottlerg/seraph/issues/252))
 ([xtask/README.md § Attached devices](../../../xtask/README.md#attached-devices)),
 which closes the riscv64 boot-entropy hole: the boot log shows
-`entropy: seeded from boot seed (N bytes)` on riscv64. Where no such
-device is present, riscv64 falls back to jitter only — narrowed continuously at
-runtime by the timer-tick jitter hook, which feeds a fresh sample into each CPU's
-accumulator on every tick (and per device IRQ). The bootloader also keeps a DTB
+`entropy: seeded from boot seed (N bytes)` on riscv64. The default riscv64 CPU
+also implements `Zkr` (`--riscv-zkr`,
+[xtask/README.md § run](../../../xtask/README.md#cargo-xtask-run)), so the
+`seed` CSR adds a raw hardware source beside the firmware seed and the log also
+shows `entropy: seeded from hardware RNG (N words)`. Where no such device is
+present, riscv64 seeds from the `seed` CSR where the hart implements `Zkr` and
+the firmware grants it, and otherwise falls back to jitter only — narrowed
+continuously at runtime by the timer-tick jitter hook, which feeds a fresh
+sample into each CPU's accumulator on every tick (and per device IRQ). The
+bootloader also keeps a DTB
 `/chosen/rng-seed` reader as a secondary fallback for firmware that delivers a
 DTB, scrubbed from the userspace-visible blob and split between the KASLR word
 and the pool seed as [boot-flow.md](../../boot/docs/boot-flow.md) step 5c
@@ -246,9 +261,9 @@ splits its single seed non-overlapping for the same reason); see
 The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
 self-test capture is each generator's first draw and necessarily seeds from
 the boot-time pool (scrape-dominated on a jitter-only boot, such as riscv64
-without `virtio-rng`), so the capture is followed by marking the generator
-stale (`CpuRng::mark_stale`). On the BSP the first real consumer draw is
-Phase 8 idle-thread creation (`sched::alloc_thread_id` via `next_u32`),
+with neither `virtio-rng` nor a readable `seed` CSR), so the capture is
+followed by marking the generator stale (`CpuRng::mark_stale`). On the BSP the
+first real consumer draw is Phase 8 idle-thread creation (`sched::alloc_thread_id` via `next_u32`),
 milliseconds after Phase 5. Its mandatory reseed folds an accumulator that
 holds no tick samples yet (`timer_tick` returns before sampling while the BSP
 boot transient is active, from Phase 4 until `sched::enter`), so it adds only
@@ -311,9 +326,9 @@ Phase 5 seeding and never in interrupt context. Userspace ASLR (the
 per-process bootstrap-layout, image-bias, heap-base, and reservation-arena
 draws in procmgr/init/`std::sys::seraph`) consumes the same generators through
 `SYS_GETRANDOM` (see [docs/userspace-memory-model.md](../../../docs/userspace-memory-model.md)).
-Without a firmware boot seed (a riscv64 boot without
-`virtio-rng`, #393) the pool seeds from timing jitter alone and those draws
-carry the boot-entropy-hole caveat above. The power-on self-test (§ Testing)
+Without a firmware boot seed or a hardware RNG (a riscv64 boot with neither
+`virtio-rng` nor a readable `seed` CSR) the pool seeds from timing jitter alone
+and those draws carry the boot-entropy-hole caveat above. The power-on self-test (§ Testing)
 validates the API once per boot.
 
 ## Boot wiring and lifecycle
@@ -356,8 +371,8 @@ validates the API once per boot.
   turning a QEMU run red on either architecture. Validated on
   x86_64 (firmware-seeded — `entropy: seeded from boot seed` — since OVMF
   implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through
-  `VirtioRngDxe` with the default boot set's `virtio-rng`; jitter-only without
-  it).
+  `VirtioRngDxe` with the default boot set's `virtio-rng`, and from the `seed`
+  CSR beside it; with neither, jitter-only).
 - **Guest reseed coverage**: ktest's
   `entropy::getrandom_reseed_interval_stream` streams 300 draws across the
   256-draw interval on both architectures; svctest's `random-contention`

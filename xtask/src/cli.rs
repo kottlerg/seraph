@@ -16,7 +16,7 @@ use crate::arch::Arch;
 use crate::bundle::Harness;
 use crate::context::Profile;
 use crate::disk::BlockSize;
-use crate::qemu::{DiskLine, Iommu, RiscvMmu, X86Paging};
+use crate::qemu::{DiskLine, Iommu, RiscvMmu, RiscvZkr, X86Paging};
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -440,6 +440,13 @@ pub struct RunArgs
     /// selects the mode a run exercises.
     #[arg(long, default_value = "sv48")]
     pub riscv_mmu: RiscvMmu,
+
+    /// Whether the guest RISC-V CPU implements the Zkr entropy source
+    /// (riscv64 only; ignored on `x86_64`). `off` boots the kernel's
+    /// hardware-RNG path without a source: its probe of the `seed` CSR traps
+    /// and the pool seeds from the firmware boot seed and jitter.
+    #[arg(long, default_value = "on")]
+    pub riscv_zkr: RiscvZkr,
 
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
     /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging
@@ -869,6 +876,14 @@ pub struct RunParallelArgs
     /// selects the mode every run in the batch exercises.
     #[arg(long, default_value = "sv48")]
     pub riscv_mmu: RiscvMmu,
+
+    /// Whether the guest RISC-V CPU implements the Zkr entropy source
+    /// (riscv64 only; ignored on `x86_64`), for every run in the batch. `off`
+    /// boots the kernel's hardware-RNG path without a source: its probe of the
+    /// `seed` CSR traps and the pool seeds from the firmware boot seed and
+    /// jitter.
+    #[arg(long, default_value = "on")]
+    pub riscv_zkr: RiscvZkr,
 
     /// Guest x86-64 paging depth (`x86_64` only; ignored on riscv64). Pins
     /// the QEMU CPU's `la57` property; the bootloader enables 5-level paging

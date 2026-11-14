@@ -242,6 +242,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let cpus = args.cpus;
             let mem_mib = args.mem;
             let riscv_mmu = args.riscv_mmu;
+            let riscv_zkr = args.riscv_zkr;
             let x86_paging = args.x86_paging;
             let iommu = args.iommu;
             let debug_port = args.debug_port;
@@ -330,6 +331,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     vmgenid_guid: Some("auto"),
                     incoming: None,
                     riscv_mmu,
+                    riscv_zkr,
                     x86_paging,
                     iommu,
                     debug_port,

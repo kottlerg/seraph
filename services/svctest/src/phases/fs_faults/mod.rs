@@ -11,8 +11,11 @@
 //! where it left the entry's 8.3 slot: live when the failure came before
 //! that slot's write, and as the device holds the slot when that write
 //! failed (services/fs/docs/fs-driver-protocol.md § Label 14: `FS_REMOVE`
-//! and § Label 16: `FS_RENAME`). Each case lives in its own directory, whose
-//! single sector the faults are armed on.
+//! and § Label 16: `FS_RENAME`), and a directory grows only into a cluster
+//! already zeroed (services/fs/fat/docs/crash-safety.md § Write ordering).
+//! Each case lives in its own directory, and its faults are armed on that
+//! directory's single sector, on its file's data sector, or on the cluster
+//! the directory grows into.
 
 mod ramdisk;
 
@@ -47,6 +50,8 @@ const CONTENT: &[u8] = b"fs_block_faults content";
 const SLOTS_PER_SECTOR: usize = 16;
 /// Characters one LFN slot holds.
 const LFN_CHARS: usize = 13;
+/// The FAT16 end-of-chain value fatfs writes.
+const FAT16_EOC: u16 = 0xFFFF;
 
 /// Every case of the module docs, against one svctest-owned fatfs.
 pub fn fs_block_faults_phase(_: &Caps)
@@ -64,6 +69,7 @@ pub fn fs_block_faults_phase(_: &Caps)
     remove_unsettled_when_device_unreadable(&fs, &disk);
     remove_kept_unread_when_lfn_write_dropped(&fs, &disk);
     write_dropped_leaves_cache_unchanged(&fs, &disk);
+    dir_growth_links_only_zeroed_cluster(&fs, &disk);
 
     fs.stop();
     std::os::seraph::log!("fs_block_faults phase passed");
@@ -405,6 +411,87 @@ fn write_dropped_leaves_cache_unchanged(fs: &OwnFatfs, disk: &SharedDisk)
     let _ = syscall::cap_delete(dir);
 }
 
+/// A full directory grows into a freed cluster that still holds two 8.3
+/// entries, and the write zeroing it is dropped: the insert fails with the
+/// directory's chain unchanged and the cluster still free, so neither stale
+/// entry surfaces. A second insert grows the directory into the same
+/// cluster, zeroed, and the stale entries stay gone.
+fn dir_growth_links_only_zeroed_cluster(fs: &OwnFatfs, disk: &SharedDisk)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let (dir, lba) = fs.case_dir(disk, b"G1");
+    let dir_cluster = slot_cluster(disk, lba, 0);
+    // "." and "..", then one entry taking every other slot: no slot is
+    // free and no end-of-directory marker is left.
+    fill_rest_of_sector(dir, 2);
+
+    // A removed file's cluster, holding what reads as two directory
+    // entries, is the next one the allocator takes.
+    let mut stale = [0u8; 64];
+    stale[..11].copy_from_slice(b"GHOST   TXT");
+    stale[11] = 0x20;
+    stale[32..43].copy_from_slice(b"GHOST2  TXT");
+    stale[43] = 0x20;
+    let (holder, _) =
+        fs_create(fs.root, b"G1STALE.BIN", ipc_buf).expect("G1: stale holder FS_CREATE");
+    fs_write_inline(holder, 0, &stale, ipc_buf).expect("G1: stale holder FS_WRITE");
+    let (root_lba, root_off) = lock(disk)
+        .find_root_sfn(b"G1STALE BIN")
+        .expect("G1: stale holder entry not on disk");
+    let stale_cluster = slot_cluster(disk, root_lba, root_off / 32);
+    fs_remove(fs.root, b"G1STALE.BIN", ipc_buf).expect("G1: stale holder FS_REMOVE");
+    let _ = syscall::cap_delete(holder);
+    let stale_lba = RamDisk::cluster_lba(stale_cluster);
+    assert_eq!(
+        lock(disk).sector(stale_lba).get(..64),
+        Some(&stale[..]),
+        "G1: the freed cluster holds the stale entries"
+    );
+
+    lock(disk).arm(stale_lba, 0, Fault::DropWrite);
+    let got = fs_create(dir, b"G1NEW.TXT", ipc_buf).map(|(cap, _)| {
+        let _ = syscall::cap_delete(cap);
+    });
+    assert_fired(disk, "G1");
+    assert_eq!(
+        got,
+        Err(fs_errors::IO_ERROR),
+        "G1: an insert whose growth zeroing was dropped"
+    );
+    assert_eq!(
+        lock(disk).fat_entry(dir_cluster),
+        FAT16_EOC,
+        "G1: the failed growth linked a cluster to the directory"
+    );
+    assert_eq!(
+        lock(disk).fat_entry(stale_cluster),
+        0,
+        "G1: the failed growth left the unzeroed cluster allocated"
+    );
+    expect_missing(dir, b"GHOST.TXT", "G1: stale entry after the failed growth");
+
+    let (new, _) = fs_create(dir, b"G1NEW.TXT", ipc_buf).expect("G1: FS_CREATE after the fault");
+    let _ = syscall::cap_delete(new);
+    assert_eq!(
+        lock(disk).fat_entry(dir_cluster),
+        stale_cluster,
+        "G1: the directory grew into another cluster"
+    );
+    assert_eq!(
+        lock(disk).fat_entry(stale_cluster),
+        FAT16_EOC,
+        "G1: the directory's new cluster ends its chain"
+    );
+    expect_present(dir, b"G1NEW.TXT", "G1: entry in the grown cluster");
+    expect_missing(dir, b"GHOST.TXT", "G1: first stale entry after the growth");
+    expect_missing(
+        dir,
+        b"GHOST2.TXT",
+        "G1: second stale entry after the growth",
+    );
+    let _ = syscall::cap_delete(dir);
+}
+
 // ── Case helpers ───────────────────────────────────────────────────────────
 
 /// LFN slots fatfs writes for `name`, which is not a strict 8.3 name.
@@ -446,13 +533,20 @@ fn fill_rest_of_sector(dir: u64, used: usize)
 /// directory sector `lba`.
 fn first_entry_cluster(disk: &SharedDisk, lba: usize) -> u16
 {
-    let slot: [u8; 32] = *lock(disk)
+    slot_cluster(disk, lba, 2)
+}
+
+/// First cluster of the 8.3 entry in slot `slot` of the directory sector
+/// `lba`.
+fn slot_cluster(disk: &SharedDisk, lba: usize, slot: usize) -> u16
+{
+    let raw: [u8; 32] = *lock(disk)
         .sector(lba)
         .as_chunks::<32>()
         .0
-        .get(2)
-        .expect("fs_block_faults: directory sector has no slot 2");
-    u16::from_le_bytes([slot[26], slot[27]])
+        .get(slot)
+        .expect("fs_block_faults: directory sector has no such slot");
+    u16::from_le_bytes([raw[26], raw[27]])
 }
 
 /// Every fault the case armed fired: the operation reached the write it

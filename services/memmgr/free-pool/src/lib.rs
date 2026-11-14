@@ -4,8 +4,9 @@
 // services/memmgr/free-pool/src/lib.rs
 
 //! Pure bookkeeping logic for memmgr: the metadata arena, the free pool, the
-//! deferred list of reclaimed frames not yet pooled, the process index, and
-//! the demand-region interval arithmetic and protection check.
+//! deferred list of reclaimed frames not yet pooled, the process index, the
+//! chunk table of each demand region, and the demand-region interval
+//! arithmetic and protection check.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
@@ -20,6 +21,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod arena;
+pub mod chunk;
 pub mod deferred;
 pub mod index;
 pub mod ledger;
@@ -27,11 +29,12 @@ pub mod pool;
 
 pub use arena::{
     Arena, ArenaLayout, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord,
-    SLOTS_PER_PAGE, SlotStore,
+    RegionNode, SLOTS_PER_PAGE, SlotStore,
 };
+pub use chunk::{ChunkEntry, ChunkError, ChunkState};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
-pub use ledger::{Ledger, RegionError};
+pub use ledger::{BackError, Ledger, RegionError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 
 use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRITABLE, PAGE_SIZE};
@@ -41,6 +44,9 @@ use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRI
 /// A fault-around tuning value that bounds no capacity: a page outside the
 /// chunk faults again and is backed by the next chunk.
 pub const DEMAND_CHUNK_PAGES: u32 = 16;
+
+/// Bytes of one demand chunk.
+const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
 
 /// One free run: a Memory cap memmgr owns, covering `page_count` pages
 /// starting at physical address `phys_base`. The page count is `u64`, so a
@@ -96,6 +102,25 @@ pub fn regions_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool
     a_base < b_base.saturating_add(b_len) && b_base < a_base.saturating_add(a_len)
 }
 
+/// Chunks of `region`: its length in [`DEMAND_CHUNK_PAGES`] chunks, the last
+/// one counted when the region ends inside it.
+#[must_use]
+pub const fn chunk_count(region: &DemandRegion) -> u64
+{
+    region.len.div_ceil(CHUNK_BYTES)
+}
+
+/// The index in `region` of the chunk holding `page_base`, which lies in the
+/// region: `(page_base - va_base) / chunk bytes`, the index of the chunk's
+/// entry in the region's chunk table.
+#[must_use]
+pub const fn chunk_index(region: &DemandRegion, page_base: u64) -> u64
+{
+    // page_base >= region.va_base: the caller found the page in the region,
+    // and va_base is page-aligned, so the page cannot precede it.
+    page_base.saturating_sub(region.va_base) / CHUNK_BYTES
+}
+
 /// The contiguous chunk of `region` that backs a fault at `page_base`: the
 /// `DEMAND_CHUNK_PAGES`-aligned window within the region containing the page,
 /// clamped to the region end (the last chunk may be shorter). Chunks are
@@ -109,10 +134,7 @@ pub fn regions_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) -> bool
 #[must_use]
 pub fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
 {
-    const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
-    // page_base >= region.va_base: region_for matched `va`, and va_base is
-    // page-aligned, so the page containing `va` cannot precede it.
-    let chunk_idx = page_base.saturating_sub(region.va_base) / CHUNK_BYTES;
+    let chunk_idx = chunk_index(region, page_base);
     // The region lies within the address space, so its end and the chunk sums stay below
     // `u64::MAX`.
     let chunk_base = region
@@ -247,6 +269,20 @@ mod tests
                 assert!(base <= page && page < w_end, "{pages} pages at {page:#x}");
             }
         }
+    }
+
+    #[test]
+    fn chunk_count_counts_a_last_chunk_the_region_ends_inside()
+    {
+        let region = |pages| DemandRegion {
+            va_base: 0x10000,
+            len: pages * PAGE_SIZE,
+            prot: 0,
+        };
+        assert_eq!(chunk_count(&region(0)), 0);
+        assert_eq!(chunk_count(&region(1)), 1);
+        assert_eq!(chunk_count(&region(16)), 1);
+        assert_eq!(chunk_count(&region(17)), 2);
     }
 
     #[test]

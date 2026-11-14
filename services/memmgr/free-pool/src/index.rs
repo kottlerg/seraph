@@ -185,7 +185,12 @@ impl<W: WordStore> ProcessIndex<W>
             {
                 Node::Process(rec) if rec.badge == badge => return Some(cur),
                 Node::Process(_) => cur = slot.next,
-                Node::Free | Node::Run(_) | Node::Region(_) | Node::Frame(_) => return None,
+                Node::Free
+                | Node::Run(_)
+                | Node::Region(_)
+                | Node::Frame(_)
+                | Node::ChunkDir(_)
+                | Node::Chunk(_) => return None,
             }
         }
         None

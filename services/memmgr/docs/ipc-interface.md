@@ -524,8 +524,8 @@ tables to that address space's PT growth budget (observable via
 [docs/capability-model.md](../../../docs/capability-model.md)
 §"Address-space and CSpace growth budgets") under a single coarse TLB shootdown (plus one span
 invalidation each time the cleared frames overflow the kernel's frame-map release batch).
-memmgr then returns each backing frame to the free pool and frees the region (see
-[`memory-pool.md`](memory-pool.md) §"Reclamation"). The region
+memmgr then removes the region and frees its chunk table, returning each run on it to the free
+pool (see [`memory-pool.md`](memory-pool.md) §"Reclamation"). The region
 occupies its own VA surface, so the span unmap touches only frames memmgr
 backed on fault; frames the caller mapped itself (e.g. `REQUEST_MEMORY_CAPS`
 grants) live on a disjoint surface and are untouched. The frames return to the
@@ -588,16 +588,17 @@ forwards to.
 | 3 | `faulting_va` lies in no registered region |
 | 4 | The region's protection refuses the access |
 | 5 | No delegated address space |
-| 6 | The metadata arena cannot grow for the run's frame descriptor |
+| 6 | The metadata arena cannot grow for the slots recording the run takes: its descriptor, and the chunk's path in the region's chunk table |
 | 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, or the split of a run larger than the span to back failed |
-| 8 | The run's frame descriptor cannot be recorded |
+| 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
 
-Demand chunks are tracked exactly like `REQUEST_MEMORY_CAPS` allocations, so
-`PROCESS_DIED` / `UNREGISTER_REGION` reclaim them and the all-RAM-accounted
-identity is unaffected (the pages move from a free run to the process record;
+Each demand run is recorded on its chunk in the region's chunk table, so
+`PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted
+identity is unaffected (the pages move from a free run to the chunk table;
 they were already owned). The runs memmgr donates to the process's page-table
-pool are tracked the same way and reclaimed by `PROCESS_DIED` only.
+pool are recorded on the process record, like a grant, and reclaimed by
+`PROCESS_DIED` only.
 
 ---
 

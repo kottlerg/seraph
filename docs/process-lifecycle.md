@@ -81,10 +81,10 @@ of init's roots moved over IPC, revocable only through the root; the per-service
 init-reap handoff init moves only its kernel-object caps and the reclaimable
 Memory caps it solely owns to procmgr (see "Init reap" below). The remaining
 root caps stay in init's CSpace: the firmware caps;
-the `Interrupt`, `IoPort`, `SbiControl`, and `Mmio` roots; and both halves of the split
-`SchedControl` root (the baseline band init delegated and the elevated remainder it keeps). The
-kernel keeps no reference on that CSpace once init runs: it is an ordinary CSpace held by its
-capabilities (see
+the `Interrupt`, `IoPort`, `SbiControl`, `EntropyControl`, and `Mmio` roots; and both halves of
+the split `SchedControl` root (the baseline band init delegated and the elevated remainder it
+keeps). The kernel keeps no reference on that CSpace once init runs: it is an ordinary CSpace held
+by its capabilities (see
 [capability-internals.md § Initial CSpace Population](../core/kernel/docs/capability-internals.md#initial-cspace-population)),
 so procmgr's deletion of the last one at the reap frees it and releases those caps (see
 [Init reap](#init-reap)).

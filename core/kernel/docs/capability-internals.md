@@ -599,6 +599,7 @@ pub enum CapTag
     IoPort        = 11,  // x86-64 only; Phase 7 mints one root cap over the full 64K port space
     SchedControl  = 12,  // priority-band authority; carries [min, max], no rights bit
     SbiControl    = 13,  // SBI forwarding authority (RISC-V only)
+    EntropyControl = 14, // authority to contribute bytes to the entropy pool
 }
 ```
 
@@ -634,6 +635,7 @@ WaitSet       MODIFY=0 WAIT=1
 IoPort        USE=0
 SchedControl  (no rights bits: presence + [min, max] band is the authority)
 SbiControl    RESET=0 SUSPEND=1 CPPC=2 BASE=3 DBCN=4 PMU=5
+EntropyControl CONTRIBUTE=0
 ```
 
 Rights are checked at every syscall that uses a capability. The check is a single
@@ -1353,15 +1355,16 @@ specific slot numbers.
 | 4 | 7 | One root Interrupt range capability (every valid IRQ id on the architecture; Notify and Mint rights) |
 | 5 | 7 | Map-only Memory capabilities (one per `AcpiReclaimable` memory-map region, as many as the map reports, then the page holding `BootInfo.acpi_rsdp`, then the `BootInfo.device_tree` blob) |
 | 6 | 7 | One root IoPort capability over the full 64K I/O port space (x86-64 only), or one SbiControl capability carrying every sanctioned SBI right (RISC-V only) |
-| 7 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
-| 8 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
-| 9 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
-| 10 | 9 | Init's own address space capability |
-| 11 | 9 | Reclaimable Memory capabilities for init's ELF segments |
-| 12 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
-| 13 | 9 | Reclaimable Memory capabilities for init's stack pages |
-| 14 | 9 | Init's own thread capability |
-| 15 | 9 | Init's own CSpace capability |
+| 7 | 7 | One EntropyControl capability carrying Contribute |
+| 8 | 7 | Memory capabilities for boot module images (raw ELF for procmgr, devmgr, etc.) |
+| 9 | 7 | Reclaimable Memory capabilities for bootloader scratch pages (`BootInfo`, descriptor arrays, MMIO aperture array, reclaim-array page, CPU-id pages, transient page-table frames) and the bundle's non-module pages (header + entry table + pad, init ELF source body, inter-module and trailing slack — module bodies are excluded, covered by the boot-module Memory caps above) — one cap per `BootInfo.reclaim_ranges` entry not flagged `RECLAIM_FLAG_LATE` |
+| 10 | 8 | Late-reclaim Memory capabilities (one per `BootInfo.reclaim_ranges` entry flagged `RECLAIM_FLAG_LATE`: the AP trampoline page) |
+| 11 | 9 | Init's own address space capability |
+| 12 | 9 | Reclaimable Memory capabilities for init's ELF segments |
+| 13 | 9 | Reclaimable Memory capabilities for the `InitInfo` pages |
+| 14 | 9 | Reclaimable Memory capabilities for init's stack pages |
+| 15 | 9 | Init's own thread capability |
+| 16 | 9 | Init's own CSpace capability |
 
 The kernel passes the slot numbers to init in the `InitInfo` block it maps into
 init's address space (its VA is init's first argument; see
@@ -1370,7 +1373,7 @@ lists each Phase 7 and Phase 8 slot with its type; header fields name the single
 caps and the base and count of several groups, including every Phase 9 group.
 
 The root CSpace is created with one reference, the kernel's hold on it while Phases 7 to 9
-populate it. Init's own CSpace capability (order 15) takes over that reference rather than
+populate it. Init's own CSpace capability (order 16) takes over that reference rather than
 adding one, and init's thread, like every thread, holds none on the CSpace it is bound to,
 so from Phase 9 on the root CSpace is an ordinary CSpace whose count is its capabilities and
 syscall pins: the deletion of its last capability, procmgr's at init's reap, frees it

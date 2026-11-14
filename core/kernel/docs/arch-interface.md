@@ -853,7 +853,7 @@ The bound primitives the speculation-safe paths are built on (the rule is
 [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces; its use is
 [capability-internals.md](capability-internals.md) § Speculative-Execution Hardening).
 Architecture-neutral code calls them through `arch::nospec`, which adds `mask_index`,
-`mask_index_u64`, `mask_if`, and `select_ptr` over them.
+`mask_index_u64`, `mask_span_u64`, `mask_if`, and `select_ptr` over them.
 
 ```rust
 /// All-ones when `index < bound`, zero otherwise, computed without a branch, so

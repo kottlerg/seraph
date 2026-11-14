@@ -7,12 +7,17 @@
 //!
 //! # Adding new `SystemInfoType` variants
 //! 1. Add the variant to `SystemInfoType` in `abi/syscall/src/lib.rs`.
-//! 2. Add a match arm in `sys_system_info` below.
+//! 2. Add a match arm in `sys_system_info` below, and raise
+//!    `SYSTEM_INFO_BOUND` when the new discriminant is at or above it.
 //! 3. Add a userspace wrapper in `shared/syscall/src/lib.rs` if needed.
 
 #[cfg(not(test))]
 use super::UserFrame;
 use syscall::SyscallError;
+
+/// One past the highest `SystemInfoType` discriminant `sys_system_info`
+/// answers. A discriminant at or past it is refused before the match.
+const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::InstructionCacheSyncs as u64 + 1;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
@@ -24,12 +29,23 @@ use syscall::SyscallError;
 /// Returns `InvalidArgument` for an unknown discriminant or an unknown
 /// `StackHighWater` class, and `NotSupported` for the handoff class when the
 /// kernel could not locate the handoff stack.
+///
+/// A discriminant at or past [`SYSTEM_INFO_BOUND`] is refused before the
+/// match, and the match reads it clamped as data (`nospec::mask_index_u64`),
+/// so a mispredicted refusal selects arm 0, never a jump-table entry past the
+/// table (core/kernel/docs/capability-internals.md § Speculative-Execution
+/// Hardening).
 #[cfg(not(test))]
 pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
 {
+    let kind = tf.arg(0);
+    if kind >= SYSTEM_INFO_BOUND
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
     // Match on the raw discriminant rather than converting to the enum —
     // keeps the handler independent of any TryFrom impl.
-    match tf.arg(0)
+    match crate::arch::nospec::mask_index_u64(kind, SYSTEM_INFO_BOUND)
     {
         0 =>
         // KernelVersion — packed (major << 32) | (minor << 16) | patch
@@ -129,11 +145,16 @@ pub fn sys_aspace_query(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidAddress);
     }
 
-    // Virtual address must be in the user half.
-    if virt >= crate::mm::user_va_top()
+    // Virtual address must be in the user half. The walk below reads `virt`
+    // clamped as data, so a path past a mispredicted refusal walks VA 0, never
+    // the kernel half of the root (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening).
+    let user_va_top = crate::mm::user_va_top();
+    if virt >= user_va_top
     {
         return Err(SyscallError::InvalidAddress);
     }
+    let virt = crate::arch::nospec::mask_index_u64(virt, user_va_top);
 
     // Resolve AddressSpace cap. READ right is required to inspect mappings.
     // SAFETY: current_tcb() returns current thread; syscall context ensures it is set.
@@ -164,5 +185,37 @@ pub fn sys_aspace_query(tf: UserFrame) -> Result<u64, SyscallError>
     {
         Some((phys, _raw_pte)) => Ok(phys),
         None => Err(SyscallError::InvalidAddress),
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::SYSTEM_INFO_BOUND;
+    use syscall::SystemInfoType;
+
+    // Defect guarded: a discriminant added at or past the dispatch bound
+    // without raising it would be refused, and a bound left above the
+    // discriminants would let a mispredicted refusal index past the match's
+    // jump table.
+    #[test]
+    fn system_info_bound_is_one_past_the_highest_discriminant()
+    {
+        let kinds = [
+            SystemInfoType::KernelVersion,
+            SystemInfoType::CpuCount,
+            SystemInfoType::PageSize,
+            SystemInfoType::BootProtocolVersion,
+            SystemInfoType::ElapsedUs,
+            SystemInfoType::CurrentCpu,
+            SystemInfoType::UserVaTop,
+            SystemInfoType::StackHighWater,
+            SystemInfoType::ThreadRetypeBytes,
+            SystemInfoType::LiveCSpaceCount,
+            SystemInfoType::InstructionCacheSyncs,
+        ];
+        let max = kinds.iter().map(|&k| k as u64).max();
+        assert!(kinds.iter().all(|&k| (k as u64) < SYSTEM_INFO_BOUND));
+        assert_eq!(max.map(|m| m + 1), Some(SYSTEM_INFO_BOUND));
     }
 }

@@ -1896,9 +1896,10 @@ pub fn sys_wait_set_add(tf: UserFrame) -> Result<u64, SyscallError>
     let src = unsafe { super::pin_slot(cspace_ptr, src_handle) }?;
     // SAFETY: src pins the object it names.
     let (source_ptr, source_tag, source_header, member_right) = unsafe { wait_set_source(&src) }?;
-    // The member right is folded into the source pointers as data before it
-    // is tested, so a path past a mispredicted refusal reaches null.
-    let held = nospec::mask_if(src.rights.contains(member_right));
+    // The member right is folded into the source pointers as data, from the
+    // rights hidden at resolution, so a path past a mispredicted refusal
+    // reaches null.
+    let held = src.rights_mask(member_right);
     let source_ptr = nospec::select_ptr(held, source_ptr, core::ptr::null_mut());
     let source_header = nospec::select_ptr(held, source_header, core::ptr::null_mut());
     if !src.rights.contains(member_right)

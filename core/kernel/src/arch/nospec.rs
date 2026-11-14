@@ -54,6 +54,28 @@ pub fn mask_index_u64(index: u64, bound: u64) -> u64
     mask_index(index as usize, bound as usize) as u64
 }
 
+/// `(offset, len)` when the byte span `[offset, offset + len)` lies inside an
+/// object of `size` bytes, else `(0, 0)`, computed without a branch. A span
+/// whose end overflows lies outside.
+///
+/// For a span a caller checks against an object and then walks frame by
+/// frame: the walk of a mispredicted check covers nothing, never a frame past
+/// the object.
+#[inline]
+#[must_use]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "`usize` is 64 bits wide on every kernel target (asserted above), so `u64 as usize` \
+              and back are exact"
+)]
+pub fn mask_span_u64(offset: u64, len: u64, size: u64) -> (u64, u64)
+{
+    let end = offset.saturating_add(len);
+    // All-ones when `size < end`, the span the caller refuses.
+    let outside = speculation::index_mask(size as usize, end as usize) as u64;
+    (offset & !outside, len & !outside)
+}
+
 /// All-ones when `cond` holds, zero otherwise, as an opaque value the compiler
 /// cannot turn back into a branch.
 ///
@@ -132,6 +154,19 @@ mod tests
         assert_eq!(mask_index_u64(55, 56), 55);
         assert_eq!(mask_index_u64(56, 56), 0);
         assert_eq!(mask_index_u64(u64::MAX, 56), 0);
+    }
+
+    #[test]
+    fn mask_span_keeps_a_span_inside_the_object_and_empties_one_past_it()
+    {
+        // Inside, up to the object's last byte.
+        assert_eq!(mask_span_u64(0x1000, 0x2000, 0x4000), (0x1000, 0x2000));
+        assert_eq!(mask_span_u64(0x1000, 0x3000, 0x4000), (0x1000, 0x3000));
+        // An end one page past the object, an offset past it, and an end that
+        // overflows all give the empty span at the object's base.
+        assert_eq!(mask_span_u64(0x1000, 0x4000, 0x4000), (0, 0));
+        assert_eq!(mask_span_u64(0x8000, 0x1000, 0x4000), (0, 0));
+        assert_eq!(mask_span_u64(u64::MAX - 0xFFF, 0x2000, 0x4000), (0, 0));
     }
 
     #[test]

@@ -192,10 +192,25 @@ impl<W: WordStore> ProcessIndex<W>
                 | Node::Region(_)
                 | Node::Frame(_)
                 | Node::ChunkDir(_)
-                | Node::Chunk(_) => return None,
+                | Node::Chunk(_)
+                | Node::Caps(_) => return None,
             }
         }
         None
+    }
+
+    /// Call `f` with the slot of every indexed record, bucket by bucket.
+    pub fn for_each<S: SlotStore>(&self, arena: &Arena<S>, mut f: impl FnMut(NodeIdx))
+    {
+        for bucket in 0..self.buckets().min(self.capacity)
+        {
+            let mut cur = self.head(bucket);
+            while cur != NODE_NULL
+            {
+                f(cur);
+                cur = arena.get(cur).next;
+            }
+        }
     }
 
     /// Index the record slot `idx` (which holds a [`Node::Process`] whose
@@ -346,7 +361,7 @@ mod tests
             badge,
             frame_head: NODE_NULL,
             region_head: NODE_NULL,
-            aspace_cap: 0,
+            caps: NODE_NULL,
             next_region_id: 1,
             budget: NODE_NULL,
         })
@@ -421,6 +436,22 @@ mod tests
             assert_eq!(ix.find(&a, badges[i]), Some(slots[i]));
         }
         assert_eq!(ix.len(), 3);
+    }
+
+    #[test]
+    fn for_each_visits_every_record_once_across_bucket_splits()
+    {
+        let (mut a, mut ix) = setup();
+        let n = BUCKETS_PER_PAGE * MAX_LOAD * 3;
+        let mut slots: Vec<NodeIdx> = (1..=n).map(|b| insert(&mut a, &mut ix, b)).collect();
+        assert!(ix.buckets() > BUCKETS_PER_PAGE);
+        let gone = ix.remove(&mut a, 5).unwrap();
+        slots.retain(|&s| s != gone);
+        let mut seen = Vec::new();
+        ix.for_each(&a, |idx| seen.push(idx));
+        seen.sort_unstable();
+        slots.sort_unstable();
+        assert_eq!(seen, slots);
     }
 
     #[test]

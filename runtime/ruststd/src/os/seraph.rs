@@ -614,6 +614,10 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
             ) };
             syscall::process_exit(STARTUP_FAIL_HEAP);
         }
+        // Register for memmgr's memory-pressure signal, so every std process
+        // can wait on it with no call of its own. A failure leaves the
+        // process unregistered; nothing else depends on it.
+        pal_alloc::register_pressure();
     }
 
     // In a demand-paged process, let the main-thread stack grow on demand below
@@ -979,6 +983,101 @@ pub fn object_slab_release(grant: ObjectGrant) {
 #[stable(feature = "seraph_ext", since = "1.0.0")]
 pub fn memmgr_pool_free_bytes() -> Option<u64> {
     pal_alloc::memmgr_query_free_bytes()
+}
+
+/// memmgr's memory-pressure level: how close its free pool is to the system
+/// reserve (`services/memmgr/docs/memory-pool.md` § Memory pressure). The
+/// level is advisory: a process that holds memory it can give back, such as
+/// a cache, releases some on `Low` and more on `Critical`.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum MemoryPressure {
+    /// The free pool is at or above the low threshold.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    Normal,
+    /// The free pool is below the low threshold.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    Low,
+    /// The free pool is at or below the system reserve: memmgr refuses a
+    /// grant to a process outside the reserve.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    Critical,
+}
+
+/// memmgr's current memory-pressure level, or `None` if memmgr is
+/// unreachable.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn memory_pressure() -> Option<MemoryPressure> {
+    match pal_alloc::memmgr_query_pressure()? {
+        ipc::memmgr_labels::PRESSURE_NORMAL => Some(MemoryPressure::Normal),
+        ipc::memmgr_labels::PRESSURE_LOW => Some(MemoryPressure::Low),
+        ipc::memmgr_labels::PRESSURE_CRITICAL => Some(MemoryPressure::Critical),
+        _ => None,
+    }
+}
+
+/// The bit memmgr sends on [`memory_pressure_notification`] when the
+/// memory-pressure level changes.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub const MEMORY_PRESSURE_BIT: u64 = pal_alloc::PRESSURE_BIT;
+
+/// The Notification memmgr sends [`MEMORY_PRESSURE_BIT`] on when the
+/// memory-pressure level changes, with every right, so a server can add it
+/// to its wait set; `None` when the process is not registered (a process
+/// with no memmgr endpoint, or one whose registration at start failed).
+///
+/// `_start` registers it, so the process makes no call of its own. A send
+/// coalesces with one not yet taken, so a wake says the level changed at
+/// least once since the last; [`memory_pressure`] then reads the level.
+/// A process that registers another Notification with memmgr itself
+/// (`memmgr_labels::REGISTER_PRESSURE`) replaces this one, which is then
+/// signalled no more.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn memory_pressure_notification() -> Option<u64> {
+    pal_alloc::pressure_notification()
+}
+
+/// Block until the memory-pressure level changes, or `timeout` passes, and
+/// return the level then. `None` waits without bound; `Some(Duration::ZERO)`
+/// takes a change already signalled without blocking.
+///
+/// Each change wakes one waiter of the process: a thread that waits here
+/// takes the bit from every other.
+///
+/// # Errors
+/// `Unsupported` when the process is not registered
+/// ([`memory_pressure_notification`]), `TimedOut` when no change came in
+/// `timeout`, and another error when the wait or the read of the level fails.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub fn wait_memory_pressure(
+    timeout: Option<crate::time::Duration>,
+) -> crate::io::Result<MemoryPressure> {
+    let sig = memory_pressure_notification().ok_or_else(|| {
+        crate::io::Error::new(
+            crate::io::ErrorKind::Unsupported,
+            "seraph: no memory-pressure registration",
+        )
+    })?;
+    let timeout_ms = match timeout {
+        None => 0,
+        Some(d) if d.is_zero() => syscall::WAIT_TRY_ONCE,
+        // A wait shorter than a millisecond rounds up, since 0 means no bound.
+        Some(d) => u64::try_from(d.as_millis()).unwrap_or(u64::MAX - 1).max(1),
+    };
+    let bits = match syscall::notification_wait_timeout(sig, timeout_ms) {
+        Ok(bits) => bits,
+        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => 0,
+        Err(_) => return Err(crate::io::Error::other("seraph: memory-pressure wait failed")),
+    };
+    if bits == 0 {
+        return Err(crate::io::Error::new(
+            crate::io::ErrorKind::TimedOut,
+            "seraph: no memory-pressure change",
+        ));
+    }
+    memory_pressure()
+        .ok_or_else(|| crate::io::Error::other("seraph: memory-pressure level unreadable"))
 }
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a

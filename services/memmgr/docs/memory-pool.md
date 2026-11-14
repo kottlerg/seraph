@@ -204,7 +204,11 @@ and never reclaims them. Each entry records:
 - The head of an intrusive list of the demand-paged regions the process has
   registered (`REGISTER_REGION`), each with its chunk table, which holds the
   runs that back the region ([Chunk table](#chunk-table)).
-- The delegated child `AddressSpace` cap, when demand-paged.
+- The index of its caps node, an arena node made and freed with the record,
+  so the record stays within the arena's slot size: it holds the delegated
+  child `AddressSpace` cap, when demand-paged, and the Notification cap
+  `REGISTER_PRESSURE` gave, with the bits it is signalled with
+  ([Memory pressure](#memory-pressure)).
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
@@ -230,8 +234,8 @@ two, so the array only ever appends and lookup stays constant-time on average;
 when the window is spent, buckets stop splitting and chains lengthen, which
 costs lookup time and bounds no capacity. The window's base is fixed, not
 drawn per boot like the arena's: the array holds only arena indices. `REGISTER_PROCESS` returns
-`TOO_MANY_PROCESSES` only when the record's node or its budget node cannot be allocated: system
-RAM is exhausted.
+`TOO_MANY_PROCESSES` only when the record's node, its caps node or its budget node cannot be
+allocated: system RAM is exhausted.
 
 ---
 
@@ -717,6 +721,40 @@ Live control of a running process's max is [#1097](https://github.com/kottlerg/s
 
 ---
 
+## Memory pressure
+
+memmgr tells processes how close the free pool is to the system reserve, so a process holding
+memory it can give back (a cache) gives it back before a grant is refused. It acts on the level in
+no other way: it only signals, and kills nothing.
+
+**Levels.** The level is computed from the free pool's pages, deferred pages excluded, against
+`pool_total`. It is `CRITICAL` at or below the system reserve (§ Distribution policy), where a grant
+to a process outside the reserve is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages;
+and `NORMAL` otherwise. A worse level applies at once. A better one applies only once the free pool
+clears that level's threshold by a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages,
+and at least one, so a pool that hovers at a threshold does not flip the level on every turn: the
+level becomes the one the free pool less the band gives, and no worse than before. The constants
+are tuning values proportional to RAM ([docs/limits.md](../../../docs/limits.md) § memmgr); the
+computation is the host-tested `free-pool` module `pressure`.
+
+**Signal.** A process registers a Notification cap and the bits to send on it with
+`REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11); the std runtime registers
+every process at start. The cap sits in the record's caps node ([Per-Process
+Tracking](#per-process-tracking)), so a process holds one slot of memmgr's `CSpace`: a second
+registration replaces the first and memmgr deletes the cap the first carried. `PROCESS_DIED`
+deletes the cap before it takes the process's frames back, since the cap keeps the Notification,
+and the frame it was retyped from, alive ([Reclamation](#reclamation)).
+
+At the top of each turn of its receive loop, after the `CSpace` top-up, memmgr recomputes the
+level, and on a change it sends each registrant its bits once. The send ORs the bits into the
+Notification and never blocks, so no client can hold memmgr, and bits not yet taken coalesce: a
+registrant that wakes knows the level changed at least once, and reads the level, which
+`QUERY_POOL_STATUS` returns in `data[7]`. A send that fails, to a cap the client revoked, is
+dropped. The broadcast walks every record through the index, a cost paid only on a change of
+level.
+
+---
+
 ## Failure Modes
 
 | Failure | Cause | Caller observation |
@@ -725,7 +763,7 @@ Live control of a running process's max is [#1097](https://github.com/kottlerg/s
 | `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant would take the system reserve from a caller outside it | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `TOO_MANY_PROCESSES` | A process record or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
+| `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built

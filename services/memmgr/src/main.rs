@@ -20,9 +20,9 @@
 
 use free_pool::{
     ArenaLayout, ChargeError, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
-    NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError, NodeIdx, NodeSpec, RecheckBudget,
-    RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk_for,
-    fault_window, region_grants, reserve_pages,
+    NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError, NodeIdx, NodeSpec, PressureLevel,
+    RecheckBudget, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
+    chunk_for, fault_window, pressure_level, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -1413,11 +1413,11 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         return;
     };
 
-    // The record and its budget node are arena nodes and the index grows with
-    // them, so the table refuses for want of room only when the arena cannot
-    // grow: system RAM is exhausted.
+    // The record, its caps and its budget node are arena nodes and the index
+    // grows with them, so the table refuses for want of room only when the
+    // arena cannot grow: system RAM is exhausted.
     ensure_index(l);
-    if !ensure_slots(l, 2)
+    if !ensure_slots(l, 3)
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
@@ -1499,7 +1499,22 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // slot. The record's `aspace_cap` is by then a stale slot index that
     // memmgr's allocator may have reused for an unrelated cap (e.g. a pool-run
     // tail); deleting it would free that cap and corrupt the free pool.
+    //
+    // The pressure Notification cap, by contrast, is memmgr's own derivation
+    // that no teardown revokes, and it keeps the Notification alive: it is
+    // deleted before the reclaim, so the frame the Notification was retyped
+    // from passes the quiescence check instead of waiting on the deferred
+    // list. Its handle carries the slot's generation, so a cap the client
+    // revoked meanwhile is refused rather than freeing a reused slot.
     let l = ledger_mut();
+    if let Some(rec) = l.find(dead_badge)
+    {
+        let pressure = l.take_pressure(rec);
+        if pressure != 0
+        {
+            let _ = syscall::cap_delete(pressure);
+        }
+    }
     let rechecked = recheck_deferred(l);
     if l.remove_process(dead_badge, quiescent).is_some() || rechecked != 0
     {
@@ -1625,6 +1640,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .word(4, deferred_bytes)
         .word(5, largest_bytes)
         .word(6, reserve_bytes)
+        .word(7, pressure_wire(current_pressure()))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1731,7 +1747,7 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
+    let aspace_cap = l.aspace_cap(rec);
     // Tear down the whole region span in the child AS in one call: clear every
     // leaf PTE and reclaim the now-empty intermediate page tables to the child's
     // PT growth pool (one coarse shootdown, plus the span invalidations of the
@@ -1778,7 +1794,7 @@ fn handle_delegate_aspace(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, pro
         return;
     };
     // Replace any prior delegation, dropping the stale cap.
-    let prior = l.record(rec).map_or(0, |r| r.aspace_cap);
+    let prior = l.aspace_cap(rec);
     if prior != 0
     {
         let _ = syscall::cap_delete(prior);
@@ -1961,7 +1977,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::AccessRefused, 0);
         return;
     }
-    let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
+    let aspace_cap = l.aspace_cap(rec);
     if aspace_cap == 0
     {
         decline_fault(ipc_buf, FaultDecline::NoAspace, 0);
@@ -2359,6 +2375,90 @@ fn pool_total_add(pages: u64)
     }
 }
 
+// ── Memory pressure ──────────────────────────────────────────────────────────
+
+/// The pressure level memmgr last signalled. Single-threaded memmgr — plain
+/// static suffices.
+static mut PRESSURE: PressureLevel = PressureLevel::Normal;
+
+/// The pressure level as it stands: the free pool, deferred pages excluded,
+/// against `pool_total` ([`pressure_level`]).
+fn current_pressure() -> PressureLevel
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    unsafe { PRESSURE }
+}
+
+/// The wire value of `level` (`QUERY_POOL_STATUS` `data[7]`).
+const fn pressure_wire(level: PressureLevel) -> u64
+{
+    match level
+    {
+        PressureLevel::Normal => memmgr_labels::PRESSURE_NORMAL,
+        PressureLevel::Low => memmgr_labels::PRESSURE_LOW,
+        PressureLevel::Critical => memmgr_labels::PRESSURE_CRITICAL,
+    }
+}
+
+/// Recompute the pressure level after a turn of the receive loop and, when it
+/// changed, send every registrant its bits
+/// (services/memmgr/docs/memory-pool.md § Memory pressure). A Notification
+/// send never blocks, so no client can hold memmgr here; a send that fails (a
+/// cap the client revoked) is dropped. The walk visits every record, which
+/// costs a turn only on a change of level.
+fn signal_pressure()
+{
+    let l = ledger_mut();
+    let prev = current_pressure();
+    let level = pressure_level(prev, l.pool.free_pages(), pool_total_pages());
+    if level == prev
+    {
+        return;
+    }
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    unsafe { PRESSURE = level };
+    l.for_each_pressure(|cap, bits| {
+        let _ = syscall::notification_send(cap, bits);
+    });
+}
+
+/// Register the caller's pressure Notification: `data[0]` the nonzero bits
+/// to send, `caps[0]` a Notification cap with Notify, which [`dispatch`]
+/// passes as `caps` (services/memmgr/docs/ipc-interface.md § Label 11). A
+/// registration replaces the caller's earlier one, whose cap is deleted, so
+/// a client holds one slot of memmgr's `CSpace` however often it registers.
+/// A refused cap is deleted.
+fn handle_register_pressure(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
+{
+    let Some(&cap) = caps.first()
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let bits = req.word(0);
+    let l = ledger_mut();
+    let rec = l.find(req.badge);
+    let notify = syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok_and(|packed| {
+        packed >> 32 == u64::from(syscall::CAP_TAG_NOTIFICATION)
+            && packed & syscall::RIGHTS_NTF_NOTIFY != 0
+    });
+    let Some(prior) = rec
+        .filter(|_| notify && bits != 0)
+        .and_then(|rec| l.set_pressure(rec, cap, bits))
+    else
+    {
+        let _ = syscall::cap_delete(cap);
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if prior != 0
+    {
+        let _ = syscall::cap_delete(prior);
+    }
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
 // ── Reply helpers ────────────────────────────────────────────────────────────
 
 fn reply_label(ipc_buf: *mut u64, label: u64)
@@ -2528,7 +2628,7 @@ fn insert_boot_records(procmgr_badge: u64) -> bool
         .into_iter()
         .all(|badge| {
             ensure_index(l);
-            ensure_slots(l, 2) && l.insert_process(badge, NodeSpec::TOP_RESERVE).is_ok()
+            ensure_slots(l, 3) && l.insert_process(badge, NodeSpec::TOP_RESERVE).is_ok()
         })
 }
 
@@ -2544,13 +2644,14 @@ fn delete_caps(caps: &[u64])
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
 /// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first for
-/// `DELEGATE_ASPACE`, none for any other label. [`dispatch`] deletes the rest.
+/// `DELEGATE_ASPACE` and `REGISTER_PRESSURE`, none for any other label.
+/// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
     {
         memmgr_labels::DONATE_MEMORY_CAPS => attached,
-        memmgr_labels::DELEGATE_ASPACE => attached.min(1),
+        memmgr_labels::DELEGATE_ASPACE | memmgr_labels::REGISTER_PRESSURE => attached.min(1),
         _ => 0,
     }
 }
@@ -2620,6 +2721,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         {
             handle_query_memory_usage(req, ipc_buf);
         }
+        memmgr_labels::REGISTER_PRESSURE =>
+        {
+            handle_register_pressure(req, kept, ipc_buf);
+        }
         _ =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -2675,6 +2780,9 @@ fn main(startup: &StartupInfo) -> !
     loop
     {
         hold_cspace_headroom(startup.self_cspace);
+        // After the top-up, which draws on the free pool too, so the level a
+        // registrant reads is the one the next receive starts from.
+        signal_pressure();
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let req = match unsafe { ipc::ipc_recv(boot.service_ep, ipc_buf) }
         {

@@ -50,12 +50,14 @@
 //! victim's Interrupt cap against the deliveries the same way, so a delivery
 //! walks the binding in the object being freed. After each delete the
 //! keeper's binding must still be served: once it acknowledges, a raise
-//! signals it.
+//! signals it. That raise must not signal the victim: the victim's binding,
+//! bound last, is linked ahead of the keeper's, so a delivery that walked the
+//! line after the delete and still found it would signal the victim first.
 //!
 //! ## Two schedules
 //!
 //! Every kind of round (direct, rebound, binding) runs in two schedules,
-//! about half its fixed rounds in each ([`held`]), because where an
+//! about half its rounds in each ([`held`]), because where an
 //! acknowledgement contends with a delivery differs by interrupt controller:
 //!
 //! - **Streamed:** the controller acknowledges and raises over and over, so
@@ -81,7 +83,7 @@
 //!   sleeping controller leaves CPU 0 free to deliver.
 //!
 //! In three of four held notification rounds, and in every held binding
-//! round, the round is observed ([`Plan::fixed`]): the deleter keeps the
+//! round, the round is observed ([`Plan::of`]): the deleter keeps the
 //! watched notification (the round's, or the victim) alive through the
 //! change and takes its bits just before the change and again just after it.
 //! No delivery reaches that notification through the binding once the change
@@ -95,40 +97,41 @@
 //! A held round that delivers on CPU 1 runs its delivery on the deleter as
 //! the raise returns, before the change, so it comes late; the held rounds
 //! that deliver on any other CPU, CPU 0 included, can arm: three in four of
-//! them at 4 CPUs, one in two at 2. The fixed direct and rebound rounds
-//! alternate, so at an even CPU count each kind's fixed rounds deliver on
-//! half the CPUs, which half depending on where the kernel's turn over the
-//! CPUs (`irq::next_target_cpu`) stood when the cell began; at 2 CPUs the fixed direct rounds may all
-//! deliver on CPU 1 and arm none. The extra rounds ([`extend`]) are of one
-//! kind and take every CPU in turn. A rebound round arms only when the
-//! rebind's store lands between a delivery's load of the notification and its
-//! signal, the last steps of a delivery that masks the line first, and on
-//! x86-64, where the mask is the long step, it seldom does.
+//! them at 4 CPUs, one in two at 2. The direct and rebound rounds alternate,
+//! so at an even CPU count each kind's rounds deliver on half the CPUs, which
+//! half depending on where the kernel's turn over the CPUs
+//! (`irq::next_target_cpu`) stood when the cell began; at 2 CPUs the direct
+//! rounds may all deliver on CPU 1 and arm none. A rebound round arms
+//! only when the rebind's store lands between a delivery's load of the
+//! notification and its signal, the last steps of a delivery that masks the
+//! line first, and on x86-64, where the mask is the long step, it seldom
+//! does.
 //!
 //! ## What the host must give
 //!
-//! A held round arms only when CPU 1 and the CPU that delivers run at once,
-//! within microseconds of each other. A host that runs fewer of the guest's
-//! CPUs at a time than the guest has (a burn-in runner booting two 4-CPU
-//! guests on four cores, or a boundary run past the host's core count) does
-//! so in fewer rounds, and in some stretches in none. The check therefore
-//! counts armed rounds rather than a share of them: after a phase's fixed
-//! rounds, while fewer than [`MIN_ARMED`] observed held rounds of its kind
-//! have armed the race, the phase runs held, observed rounds of that kind,
-//! up to [`MAX_EXTRA_ROUNDS`] of them ([`extend`]). A slower host only takes
-//! more of these extra rounds; the host must run CPU 1 and a delivering CPU
-//! at once in [`MIN_ARMED`] of the rounds, not throughout.
+//! Nothing. A held round arms only when CPU 1 and the CPU that delivers run
+//! at once, within microseconds of each other, and a host that runs fewer of
+//! the guest's CPUs at a time than the guest has (a burn-in runner booting
+//! two 4-CPU guests on four cores, or a guest pinned to fewer cores than its
+//! CPUs) arms few rounds or none. No guest action holds a delivery in
+//! flight, since a delivery runs with interrupts disabled and waits for
+//! nothing a thread holds, so the case cannot bring the race about on such a
+//! host, and requires no count of armed rounds. It logs them, one line per
+//! kind in a fixed form ([`report`]), so a run on a host that runs the CPUs
+//! at once shows that the case still races.
 //!
-//! Required: the kernel survives every round, every rebind succeeds, every
-//! keeper is served after its round's delete, and the observed held direct
-//! and binding rounds that arm the race each number at least [`MIN_ARMED`]
-//! once the extra rounds have run ([`armed_needed`]); the armed rebound
-//! rounds are logged and not required. A change that no longer meets a
-//! delivery in flight arms
-//! none, and fails the check after every extra round. The log line of each
-//! kind also counts the observed rounds that came late and early, and the
-//! extra rounds run. The UART interrupt is disabled again when the cell
-//! ends.
+//! The check that a change waits out a delivery in flight does not rest on
+//! the host: the kernel's host tests (core/kernel/src/irq.rs, the tests of
+//! changes against a running delivery) hold a delivery, through the kernel's
+//! own delivery steps, in flight on one thread, run the kernel's own change
+//! step on another, and fail when the change returns before the delivery
+//! exits: a line's unbind with a walk standing on the removed binding (the
+//! binding rounds, and the direct rounds' delete), the release of the line
+//! (the direct rounds), and a rebind (the rebound rounds).
+//!
+//! Required: the kernel survives every round, every rebind succeeds, and
+//! after each binding round's delete a raise signals the keeper and not the
+//! victim. The UART interrupt is disabled again when the cell ends.
 //!
 //! Needs **≥ 2 CPUs**.
 
@@ -159,13 +162,6 @@ const DELETER_CPU: u32 = 1;
 const MAX_RAISES: u32 = 20_000;
 /// Raises after the delete, so deliveries also meet a removed binding.
 const TRAILING_RAISES: u32 = 16;
-/// Observed held rounds of each required kind (direct, binding) that must arm
-/// the race ([`armed_needed`]).
-const MIN_ARMED: u32 = 4;
-/// Held, observed rounds of a required kind that run at most after its fixed
-/// rounds, while fewer than [`MIN_ARMED`] of its rounds have armed the race
-/// ([`extend`]).
-const MAX_EXTRA_ROUNDS: u32 = 2000;
 /// Wait for the delivery probe's signal, in ms, through [`crate::scaled_bound`].
 const PROBE_TIMEOUT_MS: u64 = 1000;
 /// Polls (1 ms each) for the deleter's exit, through [`crate::scaled_polls`].
@@ -275,26 +271,15 @@ struct Plan
 
 impl Plan
 {
-    /// The plan of fixed round `round` of kind `kind`: held by [`held`], and,
+    /// The plan of round `round` of kind `kind`: held by [`held`], and,
     /// when held, observed in every binding round and in the notification
     /// rounds [`observed`] picks.
-    fn fixed(round: u32, kind: Kind) -> Self
+    fn of(round: u32, kind: Kind) -> Self
     {
         Self {
             kind,
             held: held(round),
             observed: kind == Kind::Binding || observed(round),
-        }
-    }
-
-    /// The plan of an extra round of kind `kind` ([`extend`]): held and
-    /// observed, since only such a round can arm the race.
-    fn extra(kind: Kind) -> Self
-    {
-        Self {
-            kind,
-            held: true,
-            observed: true,
         }
     }
 }
@@ -315,8 +300,8 @@ enum Ran
 
 /// Per kind of round (direct, rebound, binding): of the held rounds observed,
 /// how many met their delivery (armed the race), came late or came early
-/// ([`Outcome`]); how many streamed rounds overlapped the race; and how many
-/// extra rounds ran ([`extend`]).
+/// ([`Outcome`]); and how many streamed rounds overlapped the race. The counts
+/// are logged, not required (module doc § What the host must give).
 #[derive(Default)]
 struct Tally
 {
@@ -325,7 +310,6 @@ struct Tally
     late: [u32; 3],
     early: [u32; 3],
     overlapped: [u32; 3],
-    extra: [u32; 3],
 }
 
 impl Tally
@@ -428,9 +412,8 @@ fn carve_line(ctx: &TestContext) -> Result<u64, &'static str>
 }
 
 /// Prove the stand-in delivers, then run [`CYCLES`] notification rounds and
-/// [`BINDING_CYCLES`] binding rounds, each phase with the extra rounds its
-/// required kind takes ([`extend`]), and require [`MIN_ARMED`] armed held
-/// rounds of each required kind, on a system of `cpus` CPUs.
+/// [`BINDING_CYCLES`] binding rounds on a system of `cpus` CPUs, and log how
+/// their changes fell against the deliveries ([`report`]).
 fn race(ctx: &TestContext, line: u64, cpus: u64) -> TestResult
 {
     probe_delivery(ctx, line)?;
@@ -493,102 +476,46 @@ fn race_with(ctx: &TestContext, line: u64, cpus: u64, done: u64) -> TestResult
         return Err("stress::irq_route_delete_race: a rebind to the spare notification failed");
     }
     exited?;
-    report(&tally)
-}
-
-/// Log each kind's counts, and require each kind's observed held rounds that
-/// armed the race to number what it needs ([`armed_needed`]).
-fn report(tally: &Tally) -> TestResult
-{
-    let mut short = false;
-    for kind in Kind::ALL
-    {
-        let armed = Tally::of(&tally.armed, kind);
-        let needed = armed_needed(kind);
-        crate::log_args(format_args!(
-            "stress::irq_route_delete_race: armed_{name}={armed} of {held} observed (needed \
-             {needed}; late {late}, early {early}; {extra} extra rounds), \
-             overlapped_{name}={overlapped}",
-            name = kind.name(),
-            held = Tally::of(&tally.held, kind),
-            late = Tally::of(&tally.late, kind),
-            early = Tally::of(&tally.early, kind),
-            extra = Tally::of(&tally.extra, kind),
-            overlapped = Tally::of(&tally.overlapped, kind),
-        ));
-        short |= armed < needed;
-    }
-    if short
-    {
-        return Err(
-            "stress::irq_route_delete_race: fewer held rounds of some kind armed the race than it needs",
-        );
-    }
+    report(&tally);
     Ok(())
 }
 
-/// The observed held rounds of `kind` that must arm the race: [`MIN_ARMED`],
-/// or none for a rebound round, which arms only when the rebind's store lands
-/// between a delivery's load of the notification and its signal, the last
-/// steps of a delivery that masks the line first: too narrow a window to
-/// require (module doc § Two schedules).
-fn armed_needed(kind: Kind) -> u32
+/// Log each kind's counts, one line per kind in a fixed form
+/// (`stress::irq_route_delete_race: armed_<kind>=<n> of <m> observed (late
+/// <l>, early <e>), overlapped_<kind>=<o>`): how its observed held rounds fell
+/// against their deliveries, and how many of its streamed rounds overlapped
+/// the race. They show how often the host ran CPU 1 and a delivering CPU at
+/// once, and are not required (module doc § What the host must give).
+fn report(tally: &Tally)
 {
-    if kind == Kind::Rebound { 0 } else { MIN_ARMED }
+    for kind in Kind::ALL
+    {
+        crate::log_args(format_args!(
+            "stress::irq_route_delete_race: armed_{name}={armed} of {held} observed (late \
+             {late}, early {early}), overlapped_{name}={overlapped}",
+            name = kind.name(),
+            armed = Tally::of(&tally.armed, kind),
+            held = Tally::of(&tally.held, kind),
+            late = Tally::of(&tally.late, kind),
+            early = Tally::of(&tally.early, kind),
+            overlapped = Tally::of(&tally.overlapped, kind),
+        ));
+    }
 }
 
-/// The notification rounds, then the binding rounds, each phase followed by
-/// the extra rounds its required kind takes ([`extend`]). The spare is
-/// deleted whatever the outcome.
+/// The notification rounds, then the binding rounds. The spare is deleted
+/// whatever the outcome.
 fn phases(ctx: &TestContext, line: u64, spare: u64) -> Result<Tally, &'static str>
 {
     let mut tally = Tally::default();
     // Every round routes the line once, so the rounds' numbers stay in step
     // with the routes' turn over the CPUs ([`cpu_slot`]).
     let mut round = 0;
-    let notified = rounds(ctx, line, &mut round, &mut tally).and_then(|()| {
-        extend(Kind::Direct, &mut round, &mut tally, |round, plan| {
-            notification_round(ctx, line, round, plan)
-        })
-    });
+    let notified = rounds(ctx, line, &mut round, &mut tally);
     cap_delete(spare).ok();
     notified?;
     binding_rounds(ctx, line, &mut round, &mut tally)?;
     Ok(tally)
-}
-
-/// After a phase's fixed rounds, run held, observed rounds of `kind` through
-/// `run`, numbered on from `round`, until the kind's armed rounds number what
-/// it needs ([`armed_needed`]) or [`MAX_EXTRA_ROUNDS`] have run, and count
-/// them into `tally`.
-///
-/// How often a held round arms depends on the host as much as on the kernel:
-/// it needs the CPU that delivers and CPU 1 to run at once, which a host that
-/// runs fewer of the guest's CPUs at a time than it has does in fewer rounds
-/// (module doc § What the host must give). A change that no longer meets a
-/// delivery in flight arms none, and fails the check after every extra round;
-/// a slower host only takes more of them.
-fn extend(
-    kind: Kind,
-    round: &mut u32,
-    tally: &mut Tally,
-    mut run: impl FnMut(u32, Plan) -> Result<Ran, &'static str>,
-) -> TestResult
-{
-    let plan = Plan::extra(kind);
-    let mut extra = 0;
-    while Tally::of(&tally.armed, kind) < armed_needed(kind) && extra < MAX_EXTRA_ROUNDS
-    {
-        *round = round.saturating_add(1);
-        extra = extra.saturating_add(1);
-        let ran = run(*round, plan)?;
-        tally.count(plan, ran);
-    }
-    if let Some(slot) = tally.extra.get_mut(kind.index())
-    {
-        *slot = extra;
-    }
-    Ok(())
 }
 
 /// Route the line through a copy, bind the copy to a fresh notification and
@@ -622,7 +549,7 @@ fn probe_delivery(ctx: &TestContext, line: u64) -> TestResult
 }
 
 /// Whether `round` runs held rather than streamed (module doc § Two
-/// schedules): about half the fixed rounds of each kind, chosen by a bit of a
+/// schedules): about half the rounds of each kind, chosen by a bit of a
 /// multiplicative hash of the round. A choice by the round number's low bits
 /// would fall in step with the routes' turn over the CPUs, and hold a kind's
 /// rounds on the same CPUs every time.
@@ -635,14 +562,14 @@ fn held(round: u32) -> bool
 /// watched notification's capability through the change and takes its bits
 /// after it (module doc § Two schedules). Three in four, by two more bits of
 /// the hash, so the rest still have the change free the notification. Every
-/// binding round is observed ([`Plan::fixed`]), since the victim outlives its
+/// binding round is observed ([`Plan::of`]), since the victim outlives its
 /// rounds.
 fn observed(round: u32) -> bool
 {
     round.wrapping_mul(2_654_435_761) & (3 << 13) != 0
 }
 
-/// The [`CYCLES`] fixed notification rounds, direct and rebound in turn,
+/// The [`CYCLES`] notification rounds, direct and rebound in turn,
 /// numbered on from `round` and counted into `tally`.
 fn rounds(ctx: &TestContext, line: u64, round: &mut u32, tally: &mut Tally) -> TestResult
 {
@@ -657,7 +584,7 @@ fn rounds(ctx: &TestContext, line: u64, round: &mut u32, tally: &mut Tally) -> T
         {
             Kind::Direct
         };
-        let plan = Plan::fixed(*round, kind);
+        let plan = Plan::of(*round, kind);
         let ran = notification_round(ctx, line, *round, plan)?;
         tally.count(plan, ran);
     }
@@ -745,6 +672,14 @@ fn race_delete(
         await_delete(round)?;
         Ran::Streamed { overlapped }
     };
+    // The change is done. A binding round's victim outlives the round: take
+    // what the deliveries before and during the change left, so a bit from
+    // here on comes from a delivery that began after the change
+    // ([`race_binding_delete`]).
+    if plan.kind == Kind::Binding
+    {
+        notification_try_wait(watched).ok();
+    }
     for _ in 0..TRAILING_RAISES
     {
         for &cap in acks
@@ -800,9 +735,8 @@ fn await_held(round: u32) -> TestResult
     Ok(())
 }
 
-/// The [`BINDING_CYCLES`] fixed binding rounds, then the extra ones the
-/// binding rounds take ([`extend`]), numbered on from `round` and counted into
-/// `tally`.
+/// The [`BINDING_CYCLES`] binding rounds, numbered on from `round` and counted
+/// into `tally`.
 fn binding_rounds(ctx: &TestContext, line: u64, round: &mut u32, tally: &mut Tally) -> TestResult
 {
     let keeper = cap_create_notification(ctx.memory_base)
@@ -814,13 +748,10 @@ fn binding_rounds(ctx: &TestContext, line: u64, round: &mut u32, tally: &mut Tal
             let ntfs = [keeper, victim];
             (0..BINDING_CYCLES).try_for_each(|_| {
                 *round = round.saturating_add(1);
-                let plan = Plan::fixed(*round, Kind::Binding);
+                let plan = Plan::of(*round, Kind::Binding);
                 let ran = binding_round(line, *round, plan, ntfs)?;
                 tally.count(plan, ran);
                 Ok(())
-            })?;
-            extend(Kind::Binding, round, tally, |round, plan| {
-                binding_round(line, round, plan, ntfs)
             })
         });
     if let Ok(victim) = victim
@@ -852,7 +783,8 @@ fn binding_round(line: u64, round: u32, plan: Plan, ntfs: [u64; 2]) -> Result<Ra
 
 /// Route the line through `caps[0]` (kept), bind it and `caps[1]` (doomed),
 /// race the deleter's delete of the doomed copy ([`race_delete`]), and require
-/// the kept copy's notification to be signalled after.
+/// a raise after it to signal the kept copy's notification and not the
+/// victim's.
 fn race_binding_delete(
     round: u32,
     plan: Plan,
@@ -885,10 +817,24 @@ fn race_binding_delete(
     raise_tx_interrupt();
     let bits = notification_wait_timeout(ntfs[0], crate::scaled_bound(PROBE_TIMEOUT_MS));
     quiet_tx_interrupt();
-    match bits
+    if !matches!(bits, Ok(bits) if bits & 1 != 0)
     {
-        Ok(bits) if bits & 1 != 0 => Ok(ran),
-        _ => Err("stress::irq_route_delete_race: the kept binding was not served after the delete"),
+        return Err(
+            "stress::irq_route_delete_race: the kept binding was not served after the delete",
+        );
+    }
+    // That delivery walked the line after the change, and the doomed binding,
+    // bound last, was linked ahead of the kept one: had the change left it
+    // linked, the walk would have signalled the victim before the keeper.
+    // [`race_delete`] took the victim's bits once the change was done, so any
+    // bit now came from a delivery that began after the change and still
+    // reached the binding it removed.
+    match notification_try_wait(ntfs[1])
+    {
+        Ok(bits) if bits != 0 => Err(
+            "stress::irq_route_delete_race: a delivery after the delete reached the removed binding",
+        ),
+        _ => Ok(ran),
     }
 }
 

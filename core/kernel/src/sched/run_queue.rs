@@ -660,7 +660,7 @@ impl PerCpuScheduler
 
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
-        let queues = unsafe { &mut *self.queues.get() };
+        let queues = unsafe { self.queues.as_mut_unchecked() };
         // A priority at or above `NUM_PRIORITY_LEVELS` names no queue. Every
         // caller reads `false` as the lossless skip of a TCB that stays linked,
         // so a link that cannot be made halts instead.
@@ -735,7 +735,7 @@ impl PerCpuScheduler
         let q = ne.ilog2() as usize;
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
-        let queues = unsafe { &mut *self.queues.get() };
+        let queues = unsafe { self.queues.as_mut_unchecked() };
         let Some((queue, tcb)) = queues
             .get_mut(q)
             .and_then(|queue| queue.dequeue().map(|tcb| (queue, tcb)))
@@ -953,7 +953,7 @@ impl PerCpuScheduler
         let q = queue_index(priority);
         // SAFETY: the caller holds `self.lock` (contract), so no other
         // reference to the queues is live.
-        let queues = unsafe { &mut *self.queues.get() };
+        let queues = unsafe { self.queues.as_mut_unchecked() };
         let Some(queue) = queues.get_mut(q)
         else
         {
@@ -990,7 +990,7 @@ impl PerCpuScheduler
     {
         // SAFETY: the caller holds `self.lock` (contract), so no `&mut` to the
         // queues is live.
-        let queues = unsafe { &*self.queues.get() };
+        let queues = unsafe { self.queues.as_ref_unchecked() };
         let mut ne = self.non_empty.load(Ordering::Relaxed);
         while ne != 0
         {

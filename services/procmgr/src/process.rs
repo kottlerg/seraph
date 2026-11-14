@@ -14,6 +14,7 @@ use death_set::DeathSet;
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
 use process_abi::{PROCESS_ABI_VERSION, PROCESS_MAIN_TLS_MAX_PAGES, resolve_stack_pages};
 use process_layout::{ProcessLayout, choose_process_layout};
+use std::mem::DropGuard;
 use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use syscall_abi::{
@@ -3269,50 +3270,13 @@ fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
 // ── Per-creation resource guards ────────────────────────────────────────────
 //
 // `create_process_from_file` accumulates resources whose ownership transfers
-// step by step: the caller-transferred file cap, a child-billed memmgr send
+// step by step: the caller-transferred file open, a child-billed memmgr send
 // cap, the three child kernel-object caps, and the per-child PI/TLS memory caps.
-// Each guard's `Drop` releases the resource if it has not been transferred to
-// the success path via `disarm()`. Constructed at the point of acquisition;
-// disarmed only after the caps have been moved into the final destination.
-
-/// Holds procmgr's open of the caller-transferred file until the success
-/// path consumes it.
-struct FileCapGuard
-{
-    file: OpenedFile,
-    ipc_buf: *mut u64,
-}
-
-impl FileCapGuard
-{
-    fn new(file: OpenedFile, ipc_buf: *mut u64) -> Self
-    {
-        Self { file, ipc_buf }
-    }
-
-    fn cap(&self) -> u64
-    {
-        self.file.cap
-    }
-
-    fn disarm(mut self) -> OpenedFile
-    {
-        let f = self.file;
-        self.file.cap = 0;
-        f
-    }
-}
-
-impl Drop for FileCapGuard
-{
-    fn drop(&mut self)
-    {
-        if self.file.cap != 0
-        {
-            vfs_close(self.file, self.ipc_buf);
-        }
-    }
-}
+// The file open is held in a `DropGuard` whose action is `vfs_close`, so every
+// exit closes it. Each guard type below releases its resource in `Drop` if it
+// has not been transferred to the success path via `disarm()`. Constructed at
+// the point of acquisition; disarmed only after the caps have been moved into
+// the final destination.
 
 /// Holds a child-billed memmgr SEND cap and its memmgr-side badge from
 /// `REGISTER_PROCESS` until the child's table entry owns them.
@@ -3770,11 +3734,11 @@ pub fn create_process_from_file(
 
     // Caller-transferred file node cap: opened at once, and the open
     // wrapped, so every early return between here and the success-path
-    // disarm closes the open (FS_CLOSE on the fs driver) and frees
-    // procmgr's CSpace slot.
-    let file_cap = FileCapGuard::new(
+    // drop closes the open (FS_CLOSE on the fs driver) and frees
+    // procmgr's CSpace slots.
+    let file_cap = DropGuard::new(
         vfs_open(file_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?,
-        ipc_buf,
+        move |file| vfs_close(file, ipc_buf),
     );
 
     if file_size == 0
@@ -3834,7 +3798,7 @@ pub fn create_process_from_file(
     // driver over-reporting `bytes_read` cannot make procmgr write past the
     // header page.
     let header_len =
-        vfs_read_exact(file_cap.cap(), ipc_buf, 0, hdr_page).ok_or(procmgr_errors::IO_ERROR)?;
+        vfs_read_exact(file_cap.cap, ipc_buf, 0, hdr_page).ok_or(procmgr_errors::IO_ERROR)?;
     // Every later read goes through `reads`, which makes none once one has
     // failed, so an unanswering server costs the create one bounded wait.
     // The parsers it feeds report a failed read as a malformed image or as
@@ -3877,7 +3841,7 @@ pub fn create_process_from_file(
     let rela = if kind == elf::ElfKind::Dyn
     {
         elf::rela_table_metadata(ehdr, header_data, file_size, |off, dst| {
-            reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
+            reads.read(|| vfs_read_exact(file_cap.cap, ipc_buf, off, dst))
         })
         .map_err(|_| reads.code(procmgr_errors::INVALID_ELF))?
     }
@@ -3893,7 +3857,7 @@ pub fn create_process_from_file(
             let count = walk_relocs_streaming(
                 t,
                 machine,
-                |off, dst| reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
+                |off, dst| reads.read(|| vfs_read_exact(file_cap.cap, ipc_buf, off, dst)),
                 |r| in_span &= elf::reloc_target_in_span(r, span_min, span_end),
             )
             .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
@@ -3923,7 +3887,7 @@ pub fn create_process_from_file(
     let stack_pages = resolve_stack_pages(elf::parse_stack_note_streaming(
         ehdr,
         file_size,
-        |off, dst| reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst)),
+        |off, dst| reads.read(|| vfs_read_exact(file_cap.cap, ipc_buf, off, dst)),
     ))
     .ok_or_else(|| reads.code(procmgr_errors::INVALID_ELF))?;
     if reads.failed()
@@ -3974,7 +3938,7 @@ pub fn create_process_from_file(
         // `first_page` is `seg_vaddr` rounded down, so the difference is below a page.
         let dest_offset = seg_vaddr.saturating_sub(first_page) as usize;
         let load_ctx = ElfLoadCtx {
-            file_cap: file_cap.cap(),
+            file_cap: file_cap.cap,
             ipc_buf,
             self_aspace,
         };
@@ -4080,7 +4044,7 @@ pub fn create_process_from_file(
                 child_objs.aspace(),
                 &tls_template,
                 seg.offset,
-                file_cap.cap(),
+                file_cap.cap,
                 mms.cap(),
                 ipc_buf,
                 &layout,
@@ -4094,7 +4058,7 @@ pub fn create_process_from_file(
                             t,
                             machine,
                             |off, dst| {
-                                reads.read(|| vfs_read_exact(file_cap.cap(), ipc_buf, off, dst))
+                                reads.read(|| vfs_read_exact(file_cap.cap, ipc_buf, off, dst))
                             },
                             |r| {
                                 let _ = elf::apply_reloc_in_span(r, bias, seg.vaddr, template);
@@ -4130,11 +4094,10 @@ pub fn create_process_from_file(
         return Err(procmgr_errors::IO_ERROR);
     }
 
-    // Disarm and consume the file cap: success-path `vfs_close` issues
-    // FS_CLOSE and deletes the slots. From here on `file_cap` is no longer
-    // available; any subsequent failure must not depend on it.
-    let raw_file = file_cap.disarm();
-    vfs_close(raw_file, ipc_buf);
+    // Close the file now: dropping the guard runs its `vfs_close`, which
+    // issues FS_CLOSE and deletes the slots. From here on `file_cap` is no
+    // longer available; any subsequent failure must not depend on it.
+    drop(file_cap);
 
     let universals = UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,

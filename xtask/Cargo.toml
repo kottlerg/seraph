@@ -39,8 +39,9 @@ libc = "0.2"
 which = "8"
 # `symbolize`: ELF parsing (sections, symbol table) and DWARF address-to-line
 # resolution, in Rust, so symbolizing needs no host tool the pinned toolchain
-# does not ship (its llvm-tools carries no symbolizer).
-object = { version = "0.40", default-features = false, features = ["read_core", "elf", "std"] }
+# does not ship (its llvm-tools carries no symbolizer). `compare-images`: the
+# headers and sections of the ELF and PE images it compares.
+object = { version = "0.40", default-features = false, features = ["read_core", "elf", "pe", "std"] }
 addr2line = { version = "0.27", default-features = false, features = ["std", "rustc-demangle"] }
 # `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
 # GitHub CLI answers in JSON, and the review's run records are JSON files.

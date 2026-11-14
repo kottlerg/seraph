@@ -231,7 +231,8 @@ follow a separate flow through devmgr; see
 ### Address Space
 
 A capability to a process's virtual address space. Rights:
-- **Map** — may install and remove mappings in this address space
+- **Map** — may install and remove mappings in this address space, and read
+  and clear its pages' accessed bits (`SYS_ASPACE_HARVEST`)
 - **Read** — may inspect current mappings (`SYS_ASPACE_QUERY`, which returns
   their physical addresses); minted on init's kernel-created address space and,
   for an address space retyped later, only when its Memory cap carries `Phys`

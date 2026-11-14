@@ -1695,7 +1695,7 @@ fn reply_create_result(
 /// Label layout:
 ///   bits [0..16]  = opcode (`CREATE_PROCESS`)
 ///   bit  16       = `CREATE_PINNED` (opt out of the default system pager)
-///   bit  17       = `CREATE_DEATH_RELAY` (on `CREATE_FROM_FILE` only)
+///   bit  17       = `CREATE_DEATH_RELAY` (a death-relay cap is the last cap)
 ///   bits [18..23] = `CREATE_PRIORITY` (0 = default; see `resolve_create_sched`)
 ///   bits [23..28] = `CREATE_BAND_MAX` (0 = copy of the creator's band)
 ///   bit  28       = `CREATE_DMA_HOLD` (hold the reclaim for `RELEASE_HOLD`)
@@ -1706,9 +1706,11 @@ fn reply_create_result(
 /// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
 /// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`.
 ///
-/// Expects `caps = [module_memory, creator_endpoint?, argv_env?]`, the last
-/// only with `CREATE_ARGV_ENV`; caps between the creator endpoint and it are
-/// deleted. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
+/// Expects `caps = [module_memory, creator_endpoint?, argv_env?, relay?]`,
+/// `argv_env` only with `CREATE_ARGV_ENV` and `relay` only with
+/// `CREATE_DEATH_RELAY`; caps between the creator endpoint and them are
+/// deleted. The relay is consumed by `finalize_creation` on success and
+/// deleted here on every other outcome. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
 /// IPCs (one per piped direction) on the returned badged `process_handle`
 /// between create and `START_PROCESS`; the create path itself stays
 /// stdio-agnostic.
@@ -1723,10 +1725,11 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         return;
     }
 
-    // `CREATE_PROCESS` ignores `CREATE_DEATH_RELAY`, so only the argv/env
-    // cap is peeled off the tail.
+    // The tail caps peel off as on `CREATE_FROM_FILE`; a request that flags
+    // a tail cap its caps cannot supply apart from the module cap is
+    // malformed.
     let Some(caps) =
-        process::split_create_caps(all_caps, process::CreateTailCaps::of_create_process(label))
+        process::split_create_caps(all_caps, process::CreateTailCaps::of_create(label))
     else
     {
         release_caps(all_caps);
@@ -1744,7 +1747,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     let Some((sched, argv_env)) = checked
     else
     {
-        release_caps(&[module_cap, creator_ep, caps.argv_env]);
+        release_caps(&[module_cap, creator_ep, caps.argv_env, caps.relay]);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
@@ -1781,7 +1784,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         Err(e) =>
         {
             process::settle_failed_argv_env(mms, e);
-            release_caps(&[module_cap, creator_ep]);
+            release_caps(&[module_cap, creator_ep, caps.relay]);
             reply_empty(ipc_buf, e.code());
             return;
         }
@@ -1809,6 +1812,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         &universals,
         argv_env,
         &ctx.deaths,
+        caps.relay,
         sched,
     );
 
@@ -1843,19 +1847,18 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         let _ = syscall::cap_delete(creator_ep);
     }
 
-    match result
+    if let Ok(result) = result
     {
-        Ok(result) =>
-        {
-            log_spawn_sched(sched);
-            arm_and_reply_create(label, &result, ipc_buf, ctx);
-        }
+        log_spawn_sched(sched);
+        arm_and_reply_create(label, &result, ipc_buf, ctx);
+    }
+    else
+    {
         // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
         // request's own checks, whatever the cause `create_process` reports.
-        Err(_) =>
-        {
-            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        }
+        // `finalize_creation` consumes the relay only on success.
+        release_caps(&[caps.relay]);
+        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
     }
 }
 
@@ -1947,10 +1950,8 @@ fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx
     // positionally fixed at caps[1]. A request that flags a tail cap its caps
     // cannot supply apart from the file cap is malformed: taking that cap as
     // a tail cap too would release one slot twice.
-    let Some(caps) = process::split_create_caps(
-        all_caps,
-        process::CreateTailCaps::of_create_from_file(label),
-    )
+    let Some(caps) =
+        process::split_create_caps(all_caps, process::CreateTailCaps::of_create(label))
     else
     {
         release_caps(all_caps);

@@ -922,8 +922,16 @@ IOMMU in front of every device included. Each surface is
 the files and directories its row lists, as a whole, and, in any other file, a changed line that
 names one of its listed items as a whole identifier or lies within one's definition; a protocol
 module of `shared/ipc`, and an item the row lists by its definition alone, is on a surface only by
-a changed line within that definition. A PR owes the cells of every surface a non-inert line of its
-own diff is on.
+a changed line within that definition. In a file outside a surface's files and directories, a
+changed line that names a listed type only in an import or re-export, or in a signature or type
+annotation, is not on that surface by that name; it stays on one when it names another listed item
+or lies within a listed item's definition. A line that reads or writes one of the type's fields,
+calls one of its methods, or constructs or matches its value names it in another use and stays on
+the surface. The exemption reaches no listed function, constant, or protocol module: each stays on
+a surface as the sentences above define. The listed types are `InterruptObject`,
+`Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`, `InitFramebufferInfo`,
+`QemuDisplay`, `BatchDisplay`, and `BootEntropy`. A PR owes the cells of every surface a non-inert
+line of its own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
@@ -951,7 +959,9 @@ lint-docs` checks this list as it checks the two above, its directories (written
 one does: the first command lists the changed files on a surface as a whole, and the other two print
 every candidate, which the PR owes the surface's cells for when a non-inert changed line names the
 item or lies within its definition (within it alone for a protocol module and for an item listed by
-definition alone), read in that file's hunk.
+definition alone), read in that file's hunk, unless the line names a listed type only in an import,
+a re-export, a signature, or a type annotation, as the first paragraph of Device surfaces defines
+it.
 
 ```sh
 git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \

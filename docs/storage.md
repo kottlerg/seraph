@@ -71,7 +71,7 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
         → vfsd queries devmgr's registry → each disk's blk_labels::MOUNT_AUTHORITY-badged SEND_GRANT
           → vfsd issues REGISTER_PARTITION (whole-disk endpoint of the partition's disk only)
             → virtio-blk mints a partition-badged SEND_GRANT and returns it in the reply
-              → vfsd spawns fs driver; injects partition-scoped block cap
+              → vfsd keeps it; spawns fs driver; injects a derivation of it
                 → vfsd sends FS_MOUNT; fs driver reads BPB, replies OK
                   → vfsd captures fs driver's root namespace cap
                     → init pulls system root via GET_SYSTEM_ROOT_CAP

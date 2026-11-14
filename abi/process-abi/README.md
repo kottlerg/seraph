@@ -261,9 +261,11 @@ Targets), and a smaller guard could lie wholly between them. Every stack of the 
 binaries keeps the same guard: init's main stack, which the kernel places, init's log-thread
 stack, and ktest's child stacks ([docs/build-system.md](../../docs/build-system.md) § Custom
 Targets). The pool's
-available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS` calls; memmgr enforces
-no per-process quota (see
-[services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Non-Goals).
+available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS` calls, with the memory
+max of the process's budget node where its creator set one; no default per-process ceiling exists
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Distribution
+policy; the max is design intent, not yet implemented,
+[#260](https://github.com/kottlerg/seraph/issues/260)).
 `PROCESS_MAIN_TLS_MAX_PAGES` (2^18 pages) bounds the main-thread TLS block the same way: loaders
 map the pages the binary's `PT_TLS` memsz needs (`tls_block_layout`) and refuse a larger block.
 

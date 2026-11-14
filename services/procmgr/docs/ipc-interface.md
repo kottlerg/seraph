@@ -62,19 +62,21 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 1 |
-| label bits `[16..31]` | Create flags and scheduling fields (see **Pinned flag**, **Scheduling fields**, **argv and env**, and **Physical-address flag** below) |
+| label bits `[16..31]` | Create flags and scheduling fields (see **Pinned flag**, **Death relay**, **Scheduling fields**, **argv and env**, and **Physical-address flag** below) |
 | label bits `[31..64]` | Reserved, zero |
 | data[0..4] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, `args_bytes`, `args_count`, `env_bytes`, `env_count`, one `u64` each |
 | cap[0] | Memory capability for the ELF module image |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
-| last cap | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs |
+| next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs |
+| last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap (**Death relay** below) |
 
 procmgr maps the module, parses the ELF, creates the child's address space,
 CSpace, and thread, maps LOAD segments, and populates the `ProcessInfo`
 handover page, with the child's argv and env in the pages after it (see
 **argv and env** below). procmgr deletes its copies of cap[0], cap[1], and
-the argv/env cap whether creation succeeds or fails, and deletes any further
-cap. A
+the argv/env cap whether creation succeeds or fails, and deletes any cap the
+layout does not name; the death-relay cap it binds or deletes as **Death
+relay** below says. A
 failed creation releases everything procmgr acquired for the child, including
 the child's memmgr record: procmgr sends memmgr `PROCESS_DIED` for it, so the
 pages already allocated to the child return to memmgr's pool.
@@ -112,7 +114,7 @@ holds a handle to it.
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
 | 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation, or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
-| 7 | `INVALID_ARGUMENT` | Reserved label bits `[31..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, or `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below) |
+| 7 | `INVALID_ARGUMENT` | `CREATE_DEATH_RELAY` set without a cap of its own (**Death relay** below), reserved label bits `[31..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, or `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below) |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 
 **argv and env.** The label's bit 29 (`CREATE_ARGV_ENV`, in the window shared with
@@ -120,9 +122,9 @@ holds a handle to it.
 sizes and funds: one run holding the argv blob at byte 0 and the env blob directly after it, each a
 concatenation of NUL-terminated UTF-8 strings (env entries `KEY=VALUE`), with the
 `ipc::procmgr_labels::ArgvEnvHeader` of the two blobs' byte lengths and string counts in four data
-words. The cap is the last one before the death relay (`CREATE_FROM_FILE`), or the last cap without
-one, so the creator endpoint stays at cap[1]. Without the flag the child gets no argv and no env,
-and the request carries neither the header nor the cap. procmgr refuses the request with
+words. The cap is the last one before the death relay (**Death relay** below), or the last cap
+without one, so the creator endpoint stays at cap[1]. Without the flag the child gets no argv and no
+env, and the request carries neither the header nor the cap. procmgr refuses the request with
 `INVALID_ARGUMENT`, before it acquires anything for the child, when the flag is set without a cap of
 its own, a header word was not delivered, the cap is not a Memory cap, or the blobs reach past the
 cap or together exceed `process_abi::ARGV_ENV_MAX_BYTES`. Otherwise, once it has registered the
@@ -168,6 +170,16 @@ creation. procmgr writes `pager_endpoint_cap` and `pager_badge` only after the
 delegation and the main thread's binding have both taken effect, so the page never
 names a pager the child does not have; a child whose binding failed, or whose page
 procmgr could not map to advertise it, reads zero and keeps its memory eager.
+
+**Death relay.** The label's bit 17 (`CREATE_DEATH_RELAY`, in the window shared with
+`CREATE_FROM_FILE`) marks a request whose last cap is a POST-only `EventQueue` cap, the relay. It
+is the last cap, so the creator-endpoint slot stays at cap[1], and a cap of its own, as the
+argv/env cap is: a request needs one cap past cap[0] for each of `CREATE_DEATH_RELAY` and
+`CREATE_ARGV_ENV` it sets, and one that sets more than its caps can supply is refused with
+`INVALID_ARGUMENT`. Once the child is recorded, procmgr binds the relay as an `AddressSpace` death
+observer (correlator 0) on the child, using one of the relay queue's observer nodes, so a terminal
+fault in any of the child's threads posts the fault class to the spawner's own death queue, then
+deletes its copy; a failed creation deletes it unbound.
 
 **DMA hold flag.** The label's bit 28 (`CREATE_DMA_HOLD`, in the window shared
 with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child
@@ -413,33 +425,28 @@ Create a suspended process from an ELF binary the caller has already resolved:
 the caller walks its own namespace cap to the binary node and transfers the
 resulting file cap. procmgr opens it (`FS_OPEN`), streams the ELF with `FS_READ` /
 `FS_READ_MEMORY` against its own open, and never holds a namespace cap of its own. Loading, the
-**Pinned flag**, the **Scheduling fields**, and **argv and env** are as for `CREATE_PROCESS`.
+**Pinned flag**, the **Death relay**, the **Scheduling fields**, and **argv and env** are as for
+`CREATE_PROCESS`.
 
 **Request:**
 
 | Field | Value |
 |---|---|
 | label bits `[0..16]` | 13 |
-| label bits `[16..31]` | As for `CREATE_PROCESS`; bit 17 (`CREATE_DEATH_RELAY`) marks a trailing death-relay cap |
+| label bits `[16..31]` | As for `CREATE_PROCESS` |
 | label bits `[31..64]` | Reserved, zero |
 | data[0] | `file_size` in bytes, from the caller's `NS_LOOKUP` size hint |
 | data[1..5] | When `CREATE_ARGV_ENV` is set: the `ArgvEnvHeader`, as for `CREATE_PROCESS` |
 | cap[0] | File cap for the binary |
 | cap[1] | Optional creator endpoint, copied into the child's `ProcessInfo.creator_endpoint_cap` |
 | next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: the argv/env Memory cap, as for `CREATE_PROCESS` |
-| last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap |
+| last cap | When `CREATE_DEATH_RELAY` is set: the death-relay cap, as for `CREATE_PROCESS` |
 
 procmgr deletes the file cap once it has opened it, `FS_CLOSE`s and deletes its open after the load,
 whether it succeeds or fails, and deletes its copies of the creator endpoint and the argv/env cap
 and any cap the layout does not name; a request refused before the open deletes the file cap
-unopened. When present, the death-relay cap is the last cap in the message, so the creator-endpoint
-slot stays at cap[1]; it is a cap of its own, as the argv/env cap is, so a request needs one cap
-past the file cap for each of `CREATE_DEATH_RELAY` and `CREATE_ARGV_ENV` it sets, and one that sets
-more than its caps can supply is refused with `INVALID_ARGUMENT`. Once the child is recorded,
-procmgr binds the relay as an `AddressSpace` death observer (correlator 0) on the child, using one
-of the relay queue's observer nodes, so a terminal fault in any of the child's threads posts the
-fault class to the spawner's own death queue, then deletes its copy; a failed creation deletes it
-unbound. `CREATE_PROCESS` ignores bit 17.
+unopened. The death-relay cap is bound or deleted as for `CREATE_PROCESS` (§ Label 1, **Death
+relay**), the file cap standing in for cap[0].
 
 The file cap's server is the caller's to choose, so procmgr bounds each call it makes on the file
 cap and on its open (`FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, `FS_CLOSE`) at
@@ -1080,4 +1087,5 @@ classes it rebound, and the same restore once an attach's watch thread exits.
 [memmgr IPC Interface](../../memmgr/docs/ipc-interface.md),
 [services/procmgr/README.md](../README.md),
 [Restart Protocol](../../svcmgr/docs/restart-protocol.md),
-[`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md)
+[`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md),
+[Synthetic Root and Namespace Composition](../../vfsd/docs/namespace-composition.md)

@@ -4,10 +4,7 @@ Enumerates every value the kernel emits across the user/kernel boundary and
 classifies it toward the goal that no kernel virtual address or kernel pointer
 escapes to userspace — a prerequisite for kernel address-space layout
 randomization (KASLR). Accepted residual: the x86-64
-descriptor-table registers on a CPU without UMIP (§ Surface inventory). Open residual,
-tracked by [#1110](https://github.com/kottlerg/seraph/issues/1110): a dead kernel object's
-bytes, which the holder of the Memory capability it was retyped from can map (§ Kernel state
-in donated memory).
+descriptor-table registers on a CPU without UMIP (§ Surface inventory).
 
 ---
 
@@ -32,8 +29,7 @@ Each surface is classified as one of:
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
   derived from one. A leak. **None found** among emitted values; the one hardware surface
   of this class, the descriptor-table registers on an x86-64 CPU without UMIP, is listed
-  below, and kernel state kept in donated memory is a separate surface, below, with one open
-  residual.
+  below, and kernel state kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable
@@ -279,8 +275,8 @@ the TCB, and the extended-state save area), and the sub-page bodies of
 endpoints, notifications, wait sets, and event queues (which hold TCB and
 source-object pointers) — plus the retype allocator's free-list links (offsets
 into the region, not addresses). The donating capability cannot map what it
-has retyped away while the object lives (after its death, see the open residual at the end of
-this section): `SYS_MEM_MAP` refuses a range below its retype bump cursor
+has retyped away while the object lives (after its death, see the clear at the end of this
+section): `SYS_MEM_MAP` refuses a range below its retype bump cursor
 ([docs/capability-model.md § Typed Memory](../../../docs/capability-model.md#typed-memory)).
 Nor can a retype carve a page any address space maps: the kernel counts the
 user mappings of every frame of RAM and refuses a retype over a mapped page
@@ -330,19 +326,21 @@ stack pages at Phase 9. The drain hands its extents out with their headers in pl
 zeroes all of them, the seed reserve included, before minting any, as above, so
 the Memory caps userspace retypes and maps start from zeroed RAM.
 
-After boot the kernel does not clear the bytes a dead kernel object returns to the Memory object it
-was retyped from (`cap::retype::retype_free`). That leaves one open residual, tracked by
-[#1110](https://github.com/kottlerg/seraph/issues/1110). When the freed bytes sit at the top
-of the retyped span, the retype bump cursor rolls back below them, and when the last retyped
-byte returns, the region resets to virgin; either way the bytes lie at or above the cursor, so
-`SYS_MEM_MAP` lets the holder of the Memory capability map them, and it reads the dead object's
-state as the object left it: a thread slab's kernel stack, with its saved kernel pointers and
-return addresses, or the pointers of another object this section lists. Across processes,
-a frame reclaimed from a process can hold the same state as well as what the process wrote, and
-memmgr zeroes every run before it hands the run to another process, as a grant or as a demand
-fault's backing
+A dead kernel object's bytes go back to the Memory object it was retyped from, and the cursor can
+then move below them: when the freed bytes sit at the top of the retyped span, the retype bump
+cursor rolls back over them, and when the last retyped byte returns, the region resets to virgin.
+Either way the bytes lie at or above the cursor, where `SYS_MEM_MAP` lets the holder of the Memory
+capability map them. The kernel therefore zeroes every byte a free returns before it rejoins the
+retype allocator (`cap::retype::retype_free` and `retype_free_runs`;
+[memory-internals.md](memory-internals.md) § Kernel Object Memory), so no dead object's state
+reaches the holder: not a thread slab's kernel
+stack, with its saved kernel pointers and return addresses, nor the pointers of another object this
+section lists. The only kernel-written bytes left in free space are the retype allocator's free-list
+links above, offsets and page counts within the region. Across processes, a frame reclaimed from a
+process can hold what the process wrote, and memmgr zeroes every run before it hands the run to
+another process, as a grant or as a demand fault's backing
 ([services/memmgr/docs/memory-pool.md](../../../services/memmgr/docs/memory-pool.md) § Frame
-contents), so neither reaches the next owner.
+contents), so it does not reach the next owner.
 
 ## Kernel console diagnostics
 

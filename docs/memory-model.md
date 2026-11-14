@@ -369,8 +369,16 @@ the sentinel unambiguous regardless of how firmware classifies `[0, PAGE_SIZE)`.
 ### Frame Allocation is Fallible
 
 Frame allocation can fail. Every call site must handle `None` or an error result
-explicitly. There is no OOM killer; a failed allocation propagates as an error to
-the caller. This applies inside the kernel as well as in userspace allocation paths.
+explicitly. Neither the kernel nor memmgr kills a process when memory runs out: a failed
+allocation is an error to the caller, in the kernel and in userspace alike. A demand fault
+of a user-mode access that the pager cannot back has no caller; it goes to the faulting
+thread's exception handler, which may hold it for a bounded time. The same fault in a
+restartable syscall's copy of a user buffer has the syscall as its caller: no exception
+handler sees it, and the syscall fails with `InvalidAddress`
+([fault-handling.md § Kernel Copies](fault-handling.md#kernel-copies)). Policy beyond that
+is a userspace service holding only the capabilities its supervisor endows it. The hold and
+the policy service are design intent; not yet implemented
+([fault-handling.md § Crash Reports](fault-handling.md#crash-reports)).
 
 ---
 

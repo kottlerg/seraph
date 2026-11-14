@@ -118,8 +118,8 @@ The full memmgr IPC specification is in
 - `PROCESS_DIED(badge)` (procmgr-only)
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
-- `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms and the free and deferred
-  totals
+- `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms, the free and deferred
+  totals, and the largest free run
 - `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)

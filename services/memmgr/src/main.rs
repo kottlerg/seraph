@@ -1364,26 +1364,29 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 }
 
 /// Reply with the all-RAM-accounted identity terms plus the current free and
-/// deferred totals (all in bytes): `system_ram`, `kernel_reserved`,
-/// `pool_total`, `free`, `deferred`. Read-only; the caller asserts
-/// `system_ram == kernel_reserved + pool_total`. `pool_total` is the monotonic
-/// owned-RAM counter scaled to bytes; `free` is the subset currently in free
-/// runs (lent to no process), which falls on allocation and rises on
-/// reclamation; `deferred` is the subset reclaimed but held on the deferred
-/// list while another process can still reach it. The identity facts arrive
-/// verbatim from the kernel.
+/// deferred totals and the largest free run (all in bytes): `system_ram`,
+/// `kernel_reserved`, `pool_total`, `free`, `deferred`, `largest_free`.
+/// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
+/// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
+/// the subset currently in free runs (lent to no process), which falls on
+/// allocation and rises on reclamation; `deferred` is the subset reclaimed but
+/// held on the deferred list while another process can still reach it;
+/// `largest_free` is the largest single free run, the most one contiguous
+/// grant can take. The identity facts arrive verbatim from the kernel.
 fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
 {
     let pool_total_bytes = pool_total_pages().saturating_mul(PAGE_SIZE);
     let l = ledger_mut();
     let free_bytes = l.pool.free_pages().saturating_mul(PAGE_SIZE);
     let deferred_bytes = l.deferred.pages().saturating_mul(PAGE_SIZE);
+    let largest_bytes = l.pool.largest_pages(&l.arena).saturating_mul(PAGE_SIZE);
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, boot.system_ram_bytes)
         .word(1, boot.kernel_reserved_bytes)
         .word(2, pool_total_bytes)
         .word(3, free_bytes)
         .word(4, deferred_bytes)
+        .word(5, largest_bytes)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };

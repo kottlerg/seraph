@@ -402,9 +402,9 @@ Structure").
 
 ### Label 6: `QUERY_POOL_STATUS`
 
-Read-only query of the all-RAM-accounted identity plus the current free
-total. Privilege: universal — returns aggregate counts only, no caps and no
-state change.
+Read-only query of the all-RAM-accounted identity plus the current free,
+deferred and largest-run totals. Privilege: universal — returns aggregate
+counts only, no caps and no state change.
 
 **Request:** label 6, no words, no caps.
 
@@ -418,6 +418,7 @@ state change.
 | data[2] | `pool_total_bytes` — every page memmgr owns (free runs, in-use arenas, reap donations); monotonic |
 | data[3] | `free_bytes` — subset of `pool_total_bytes` in free runs, lent to no process |
 | data[4] | `deferred_bytes` — subset of `pool_total_bytes` reclaimed but held out of the free runs while another process can still reach it |
+| data[5] | `largest_free_bytes` — the largest single free run, the most one `REQUIRE_CONTIGUOUS` grant can take; 0 when the pool is empty |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -430,9 +431,12 @@ hold on the deferred list, because another process can still reach the
 frames (see [`memory-pool.md`](memory-pool.md) §"Reclamation"); it falls as
 a later recheck moves them to the free runs. A caller asserting that a dead
 process's pages were reclaimed polls `data[3]` back to its pre-spawn
-baseline, and `data[4]` shows what is held instead. `data[3]` and `data[4]`
-are appended after the identity terms; readers needing only the identity may
-ignore them.
+baseline, and `data[4]` shows what is held instead. `largest_free_bytes`
+(`data[5]`) shows how fragmented the free runs are: below
+`DEMAND_CHUNK_PAGES` pages while `data[3]` is not zero, a demand fault is
+backed from a smaller run (§ Kernel-origin fault message). `data[3]` to
+`data[5]` are appended after the identity terms; readers needing only the
+identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
 

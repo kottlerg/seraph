@@ -69,6 +69,9 @@ spawn target:
   destroys one child before its start and starts another to its exit, and checks that procmgr
   holds the started child's pages until `RELEASE_HOLD` on the child's release token, which its
   process handle cannot send.
+- `create_process_large_module_phase` reads it, lays it out in a memory grant with its program
+  headers' file data moved past the grant's first 128 pages, creates it from that grant through
+  raw `CREATE_PROCESS`, and expects a clean exit.
 - `memory_max_phase` (`services/svctest/src/phases/budget.rs`) passes it as the file cap of
   refused raw `CREATE_FROM_FILE` requests (one with a one-page memory max, which procmgr cannot
   load it under), and its `budget-child` creates it with a memory max above the child's own and

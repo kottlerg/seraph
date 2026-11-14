@@ -6,8 +6,9 @@
 //! Per-process address-space bounds: the heap and reservation arena placed in
 //! the zones sized to the user half, one allocation far past the free heap
 //! tail, freed reservation VA reused past any fixed run-table size, a
-//! main-thread TLS block wider than a page, and the loader's refusal of a
-//! stack note above `MAX_PROCESS_STACK_PAGES`.
+//! main-thread TLS block wider than a page, spawned threads' IPC buffers in the
+//! arena, and the loader's refusal of a stack note above
+//! `MAX_PROCESS_STACK_PAGES`.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -46,6 +47,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "wide_main_tls",
             run: wide_main_tls_phase,
+        },
+        Phase {
+            name: "spawned_ipc_buffer_in_arena",
+            run: spawned_ipc_buffer_in_arena_phase,
         },
     ]
 }
@@ -104,6 +109,46 @@ pub fn growth_zones_phase(_: &Caps)
         );
     }
     std::os::seraph::log!("growth zones: top={top:#x} heap={heap_va:#x} arena={arena_va:#x}");
+}
+
+/// A spawned thread's IPC buffer is a page of its own in the reservation
+/// arena, outside the byte heap, whose demand floor the pager backs: the
+/// kernel's IPC-buffer copies are not restartable, so the page is one the
+/// runtime mapped from a grant of its own (docs/userspace-memory-model.md
+/// § Page Reservations). A thread spawned by that thread gets its own page
+/// too, its grant requested over the first thread's buffer, and the two
+/// threads, both live, hold different pages.
+pub fn spawned_ipc_buffer_in_arena_phase(_: &Caps)
+{
+    let zones = process_layout::growth_zones(std::os::seraph::user_va_top());
+    let own_buffer = || std::os::seraph::current_ipc_buf().addr() as u64;
+    let (outer, inner) = std::thread::spawn(move || {
+        let inner = std::thread::spawn(own_buffer)
+            .join()
+            .expect("nested IPC-buffer thread panicked");
+        (own_buffer(), inner)
+    })
+    .join()
+    .expect("IPC-buffer thread panicked");
+
+    for (who, va) in [("spawned", outer), ("nested", inner)]
+    {
+        assert_ne!(va, 0, "{who} thread registered no IPC buffer");
+        assert!(
+            va.is_multiple_of(syscall_abi::PAGE_SIZE),
+            "{who} thread's IPC buffer {va:#x} is not page-aligned"
+        );
+        assert!(
+            va >= zones.arena.window.base && va < zones.arena.end_bound(),
+            "{who} thread's IPC buffer {va:#x} outside the arena zone {:?}",
+            zones.arena
+        );
+    }
+    assert_ne!(
+        outer, inner,
+        "two live threads share the IPC buffer {outer:#x}"
+    );
+    std::os::seraph::log!("spawned IPC buffers in the arena: {outer:#x} {inner:#x}");
 }
 
 /// One allocation far larger than the free heap tail plus any single grow

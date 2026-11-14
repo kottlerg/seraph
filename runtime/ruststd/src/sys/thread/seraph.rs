@@ -7,9 +7,12 @@
 //! Every spawned thread's stack has `GUARD_PAGES` unmapped pages below it (see
 //! `alloc_stack`): a demand-paged process gives each thread a guarded
 //! demand-paged stack of at least `os::seraph::DEFAULT_DEMAND_STACK_PAGES`, and
-//! a process with no pager a guarded stack mapped at spawn (`EagerStack`). A
-//! stack that cannot be had fails the spawn. Per-thread IPC
-//! buffers are page-aligned heap allocations. Join synchronises on a
+//! a process with no pager a guarded stack mapped at spawn (`MappedGrant`). A
+//! stack that cannot be had fails the spawn. Each spawned thread's IPC buffer
+//! is a page of its own, mapped at spawn from a dedicated memmgr grant in the
+//! reservation arena (`MappedGrant`), never a heap page or a pager page: the
+//! kernel's IPC-buffer copies are not restartable, so the page stays mapped
+//! while the thread lives. Join synchronises on a
 //! Notification cap; the child thread signals just before calling
 //! SYS_THREAD_EXIT, and join then reclaims the child's kernel object, caps, and
 //! heap/VA resources. A detached handle (dropped without join), or a join whose
@@ -71,8 +74,8 @@ const GUARD_PAGES: u64 = process_abi::STACK_GUARD_PAGES as u64;
 /// page's slots (`CSPACE_SLOTS_PER_PAGE`, which
 /// `syscall_abi::cspace_topup_pages` holds for the body arena), or its growth
 /// budget below a page. One spawn takes a few slots for good (the Thread cap,
-/// its done notification, and, in a process with no pager, its stack's
-/// grant) and a few more while it runs (the Thread slab,
+/// its done notification, its IPC buffer's grant, and, in a process with no
+/// pager, its stack's grant) and a few more while it runs (the Thread slab,
 /// a pool-page refill, a further death queue and its grant, a heap grow's at
 /// most `MSG_CAP_SLOTS_MAX` caps), about ten in all, so the mark leaves room
 /// for a whole spawn with margin.
@@ -116,8 +119,8 @@ struct SpawnArgs {
 /// The reclaimable resources a spawned thread owns. Moved as a unit between the
 /// `Thread` handle (joinable), the reaper registry (detached), and the reclaim
 /// path. Has no `Drop` glue — every field is a cap slot, a raw heap pointer, a
-/// `Copy` `Layout`, a `StackAlloc` (whose variants own no `Drop` glue: a
-/// reservation, cap slots, and plain integers), or
+/// `Copy` `Layout`, a `StackAlloc` or a `MappedGrant` (which own no `Drop`
+/// glue: a reservation, cap slots, and plain integers), or
 /// a plain `u64` — so it is freed only via the explicit
 /// [`ThreadResources::reclaim`].
 struct ThreadResources {
@@ -129,24 +132,24 @@ struct ThreadResources {
     slab_region_id: u64,
     done_notification: u64,
     stack: StackAlloc,
-    ipc_buf_base: *mut u8,
-    ipc_buf_layout: Layout,
+    /// The thread's IPC buffer: one page, no guard.
+    ipc_buf: MappedGrant,
     tls_block: *mut u8,
     tls_layout: Option<Layout>,
 }
 
-// SAFETY: the raw pointers are owned pointers to distinct heap allocations
-// (the IPC buffer, the TLS block) that no other `ThreadResources` names; the
-// value is moved whole between the handle, the reaper registry, and the
-// reclaim path, so whichever thread holds it is the only one that frees them.
+// SAFETY: the raw pointer is an owned pointer to the TLS block, a heap
+// allocation no other `ThreadResources` names; the value is moved whole
+// between the handle, the reaper registry, and the reclaim path, so whichever
+// thread holds it is the only one that frees it.
 unsafe impl Send for ThreadResources {}
 
 impl ThreadResources {
     /// Reclaim every owned resource: delete the Thread cap (drives
     /// `dealloc_object(Thread)` — drain + `retype_free` + ancestor `dec_ref`),
-    /// delete the done-notification cap, free the TLS block and IPC buffer, and
-    /// release the stack. A `done_notification` of 0 (the permanently null
-    /// slot, set by a join whose wait failed) deletes nothing.
+    /// delete the done-notification cap, free the TLS block, and release the
+    /// IPC buffer and the stack. A `done_notification` of 0 (the permanently
+    /// null slot, set by a join whose wait failed) deletes nothing.
     ///
     /// # Safety
     /// The owning thread MUST have left user-mode (joined, or its kernel death
@@ -166,14 +169,14 @@ impl ThreadResources {
         // thread-churn loop, rather than leaking a run per spawn until process
         // death (#274). Must follow the Thread cap delete above.
         crate::sys::alloc::seraph::slab_release_fresh(self.slab_region_id);
-        // SAFETY: the thread has left user-mode; these allocations are no longer
-        // read or written from user space.
-        unsafe {
-            if let Some(l) = self.tls_layout {
-                dealloc(self.tls_block, l);
-            }
-            dealloc(self.ipc_buf_base, self.ipc_buf_layout);
+        if let Some(l) = self.tls_layout {
+            // SAFETY: the thread has left user-mode, so nothing reads or
+            // writes its TLS block, which `alloc_thread_tls` allocated with `l`.
+            unsafe { dealloc(self.tls_block, l) };
         }
+        // The thread has left user-mode and makes no further IPC, so its IPC
+        // buffer page is no thread's live registered buffer.
+        self.ipc_buf.release();
         free_stack(self.stack);
     }
 }
@@ -188,8 +191,8 @@ pub struct Thread {
 }
 
 // SAFETY: every resource is a plain cap slot, an owned pointer to a distinct
-// heap allocation, or an owned stack allocation — none shared with any other
-// thread; `reaper` is a plain index pair.
+// heap allocation, or an owned stack or IPC-buffer mapping — none shared with
+// any other thread; `reaper` is a plain index pair.
 unsafe impl Send for Thread {}
 // SAFETY: &Thread exposes no interior mutability; `join` consumes by value.
 unsafe impl Sync for Thread {}
@@ -201,8 +204,9 @@ enum StackAlloc {
     /// A demand-paged process's stack: a reserved VA window whose usable pages
     /// the pager backs on first touch, above guard pages it declines.
     Demand(crate::os::seraph::GuardedStack),
-    /// The stack of a process with no pager, mapped at spawn ([`EagerStack`]).
-    Eager(EagerStack),
+    /// The stack of a process with no pager, mapped at spawn: a
+    /// [`MappedGrant`] above `GUARD_PAGES` guard pages.
+    Eager(MappedGrant),
 }
 
 impl StackAlloc {
@@ -211,103 +215,106 @@ impl StackAlloc {
     fn sp(&self) -> u64 {
         match self {
             StackAlloc::Demand(g) => g.usable_top() & !15,
-            StackAlloc::Eager(e) => e.usable_top() & !15,
+            StackAlloc::Eager(e) => e.top() & !15,
         }
     }
 }
 
-/// A guarded stack mapped in full at spawn, for a process with no pager: one
-/// page reservation of `GUARD_PAGES` guard pages below `usable_pages` usable
-/// ones, the usable pages mapped read-write from one contiguous memmgr grant and
-/// the guard left unmapped. A process with no pager has no virtual-memory
-/// handler, so a fault on the guard takes the outcome of a fault with none
-/// bound and kills the thread, and with it the process
-/// (docs/fault-handling.md § Reply, § Crash Reports), as the pager's refusal
-/// of a demand stack's guard does.
-struct EagerStack {
+/// Pages mapped read-write at spawn from one contiguous memmgr grant, in a page
+/// reservation of their own above `guard_pages` pages left unmapped: the stack
+/// of a process with no pager (`GUARD_PAGES` guard pages), and every spawned
+/// thread's IPC buffer (one page, no guard). The pages are the process's own
+/// grant, not a pager page, so they stay mapped until [`Self::release`]
+/// unmaps them.
+///
+/// A process with no pager has no virtual-memory handler, so a fault on an
+/// eager stack's guard takes the outcome of a fault with none bound and kills
+/// the thread, and with it the process (docs/fault-handling.md § Reply,
+/// § Crash Reports), as the pager's refusal of a demand stack's guard does.
+struct MappedGrant {
     /// The whole reservation, guard pages lowest.
     range: crate::sys::reserve::ReservedRange,
-    /// The grant mapped over the usable pages, held until they are unmapped.
+    /// The grant mapped over the pages above the guard, held until they are
+    /// unmapped.
     cap: u64,
     /// memmgr's id of the grant, which returns its run to the pool.
     region_id: u64,
-    usable_pages: u64,
-    /// The process's own address space, which maps the usable pages.
+    guard_pages: u64,
+    pages: u64,
+    /// The process's own address space, which maps the pages.
     aspace: u64,
 }
 
-impl EagerStack {
-    /// Reserve and map an eager stack of `usable_pages` above `GUARD_PAGES`
-    /// guard pages in the calling process, through memmgr (`memmgr_ep`).
+impl MappedGrant {
+    /// Reserve `guard_pages` plus `pages` pages in the calling process and map
+    /// the top `pages` from one contiguous memmgr grant (`memmgr_ep`). `what`
+    /// names the use in the error.
     ///
     /// # Errors
-    /// Returns an error when the reservation or the grant fails, or the map
-    /// fails ([`mem_map_funded`], which tops the page-table pool up and maps
-    /// again while it finds the pool exhausted); everything the call took is
-    /// released first.
+    /// Returns an error when there is no memmgr, when the reservation or the
+    /// grant fails, or when the map fails ([`mem_map_funded`], which tops the
+    /// page-table pool up and maps again while it finds the pool exhausted);
+    /// everything the call took is released first.
     ///
     /// [`mem_map_funded`]: crate::sys::alloc::seraph::mem_map_funded
-    fn map(memmgr_ep: u64, aspace: u64, usable_pages: u64) -> io::Result<EagerStack> {
+    fn map(
+        memmgr_ep: u64,
+        aspace: u64,
+        guard_pages: u64,
+        pages: u64,
+        what: &str,
+    ) -> io::Result<MappedGrant> {
         use crate::sys::alloc::seraph::{mem_map_funded, slab_request_pages};
         use crate::sys::reserve::{reserve_pages, unreserve_pages};
 
+        let fail = |step: &str| io::Error::other(format!("seraph: {what}: {step}"));
         if memmgr_ep == 0 {
-            return Err(io::Error::other("seraph: no memmgr to back a thread stack"));
+            return Err(fail("no memmgr to grant its pages"));
         }
-        let total = GUARD_PAGES
-            .checked_add(usable_pages)
-            .ok_or_else(|| io::Error::other("seraph: invalid stack geometry"))?;
-        let range = reserve_pages(total)
-            .map_err(|_| io::Error::other("seraph: stack VA reservation failed"))?;
-        let Some((cap, _, region_id)) = slab_request_pages(memmgr_ep, usable_pages) else {
+        let total = guard_pages.checked_add(pages).ok_or_else(|| fail("invalid geometry"))?;
+        let range = reserve_pages(total).map_err(|_| fail("VA reservation failed"))?;
+        let Some((cap, _, region_id)) = slab_request_pages(memmgr_ep, pages) else {
             unreserve_pages(range);
-            return Err(io::Error::other("seraph: stack frame grant failed"));
+            return Err(fail("frame grant failed"));
         };
-        let stack = EagerStack { range, cap, region_id, usable_pages, aspace };
-        // SAFETY: the usable pages lie in `range`, a fresh reservation this
-        // call owns, so no Rust object or IPC buffer page lies in them;
-        // `aspace` is this process's own.
+        let grant = MappedGrant { range, cap, region_id, guard_pages, pages, aspace };
+        // SAFETY: the pages lie in `range`, a fresh reservation this call
+        // owns, so no Rust object or IPC buffer page lies in them; `aspace` is
+        // this process's own.
         let mapped = unsafe {
-            mem_map_funded(
-                cap,
-                aspace,
-                stack.usable_base(),
-                0,
-                usable_pages,
-                syscall_abi::MAP_WRITABLE,
-            )
+            mem_map_funded(cap, aspace, grant.base(), 0, pages, syscall_abi::MAP_WRITABLE)
         };
         if mapped.is_err() {
             // A map refused part-way leaves the pages before the failing one
             // mapped, so the release unmaps the span before it frees anything.
-            stack.release();
-            return Err(io::Error::other("seraph: thread stack mem_map failed"));
+            grant.release();
+            return Err(fail("mem_map failed"));
         }
-        Ok(stack)
+        Ok(grant)
     }
 
-    /// Lowest usable byte: the first page above the guard.
-    fn usable_base(&self) -> u64 {
-        self.range.va_start() + GUARD_PAGES * PAGE_SIZE
+    /// Lowest mapped byte: the first page above the guard.
+    fn base(&self) -> u64 {
+        self.range.va_start() + self.guard_pages * PAGE_SIZE
     }
 
-    /// Top of the usable region, the top of the reservation.
-    fn usable_top(&self) -> u64 {
-        self.usable_base() + self.usable_pages * PAGE_SIZE
+    /// Top of the mapped pages, the top of the reservation.
+    fn top(&self) -> u64 {
+        self.base() + self.pages * PAGE_SIZE
     }
 
-    /// Unmap the usable pages, then release the reservation, delete the grant's
-    /// cap, and return its run to memmgr. When the unmap fails, some pages may
+    /// Unmap the pages, then release the reservation, delete the grant's cap,
+    /// and return its run to memmgr. When the unmap fails, some pages may
     /// still be mapped, so the reservation, the cap and the run stay the
     /// process's for its lifetime rather than pass to a later reservation or
-    /// back to memmgr's pool while mapped here. Call only once no thread runs
-    /// on the stack.
+    /// back to memmgr's pool while mapped here. Call only once no thread uses
+    /// the pages: none runs on them as its stack, and none that has them as
+    /// its IPC buffer makes another IPC.
     fn release(self) {
-        // SAFETY: the span is this stack's usable pages, which no thread runs
-        // on (the caller's contract), so no live Rust object or IPC buffer
-        // page lies in them.
-        let unmapped =
-            unsafe { syscall::mem_unmap(self.aspace, self.usable_base(), self.usable_pages) };
+        // SAFETY: the span is these pages, which no thread uses any more (the
+        // caller's contract), so no live Rust object or IPC buffer page in use
+        // lies in them.
+        let unmapped = unsafe { syscall::mem_unmap(self.aspace, self.base(), self.pages) };
         if unmapped.is_err() {
             return;
         }
@@ -320,8 +327,9 @@ impl EagerStack {
 /// Allocate a spawned thread's stack, guarded either way. A demand-paged
 /// process gets a guarded demand stack of the requested size (at least
 /// `DEFAULT_MIN_STACK_SIZE`, in whole pages) or `DEFAULT_DEMAND_STACK_PAGES`,
-/// whichever is larger; a process with no pager gets an [`EagerStack`] of the
-/// requested size alone, since each of its pages costs a frame at spawn.
+/// whichever is larger; a process with no pager gets an eager stack, a
+/// [`MappedGrant`] of the requested size alone above `GUARD_PAGES` guard pages,
+/// since each of its pages costs a frame at spawn.
 ///
 /// # Errors
 /// Returns the reservation's error: a demand-paged process whose demand stack
@@ -338,15 +346,21 @@ fn alloc_stack(
             crate::cmp::max(requested_pages, crate::os::seraph::DEFAULT_DEMAND_STACK_PAGES);
         crate::os::seraph::reserve_guarded_stack(usable_pages, GUARD_PAGES).map(StackAlloc::Demand)
     } else {
-        EagerStack::map(info.memmgr_endpoint, info.self_aspace, requested_pages)
-            .map(StackAlloc::Eager)
+        MappedGrant::map(
+            info.memmgr_endpoint,
+            info.self_aspace,
+            GUARD_PAGES,
+            requested_pages,
+            "thread stack",
+        )
+        .map(StackAlloc::Eager)
     }
 }
 
 /// Release a stack: a demand stack is unregistered (memmgr unmaps and reclaims
 /// its backing frames) and its VA released once memmgr has answered
 /// (`unregister_guarded_stack`); an eager stack is unmapped and its VA and
-/// grant released ([`EagerStack::release`]). Call only when the thread no
+/// grant released ([`MappedGrant::release`]). Call only when the thread no
 /// longer uses the stack — on the error unwind in [`Thread::new`] (before
 /// start) or in [`Thread::join`] (after the thread has left user-mode).
 fn free_stack(stack: StackAlloc) {
@@ -358,18 +372,18 @@ fn free_stack(stack: StackAlloc) {
 
 /// Unwind a spawn that failed after its `SpawnArgs` was built and before any
 /// thread started with it: delete the done notification, drop the boxed
-/// init, free the TLS block and IPC buffer, and release the stack.
+/// init, free the TLS block, and release the IPC buffer and the stack.
 ///
 /// # Safety
 /// `args` MUST come from `Box::into_raw` in [`Thread::new`], with no thread
-/// started on it; `tls_block`/`tls_layout` and `ipc_buf_base`/`ipc_buf_layout`
-/// MUST be that spawn's own allocations, which nothing else references.
+/// started on it; `tls_block`/`tls_layout` MUST be that spawn's own
+/// allocation, which nothing else references, and `ipc_buf` and `stack` that
+/// spawn's own.
 unsafe fn unwind_unstarted_spawn(
     args: *mut SpawnArgs,
     tls_block: *mut u8,
     tls_layout: Option<Layout>,
-    ipc_buf_base: *mut u8,
-    ipc_buf_layout: Layout,
+    ipc_buf: MappedGrant,
     stack: StackAlloc,
 ) {
     // SAFETY: the caller's contract makes `args` an unshared `Box::into_raw`.
@@ -378,13 +392,13 @@ unsafe fn unwind_unstarted_spawn(
     // started thread took it over.
     drop(unsafe { Box::from_raw(args.init) });
     let _ = syscall::cap_delete(args.done_notification);
-    // SAFETY: the caller's contract makes these this spawn's own allocations.
-    unsafe {
-        if let Some(l) = tls_layout {
-            dealloc(tls_block, l);
-        }
-        dealloc(ipc_buf_base, ipc_buf_layout);
+    if let Some(l) = tls_layout {
+        // SAFETY: the caller's contract makes the block this spawn's own
+        // allocation of `l`.
+        unsafe { dealloc(tls_block, l) };
     }
+    // No thread started, so none registered the page as its IPC buffer.
+    ipc_buf.release();
     free_stack(stack);
 }
 
@@ -404,26 +418,19 @@ impl Thread {
 
         let stack = alloc_stack(info, stack_bytes)?;
 
-        let ipc_buf_layout = match Layout::from_size_align(PAGE_SIZE_USIZE, PAGE_SIZE_USIZE) {
-            Ok(l) => l,
-            Err(_) => {
-                free_stack(stack);
-                return Err(io::Error::other("seraph: ipc buffer layout invalid"));
-            }
-        };
-        // SAFETY: `ipc_buf_layout` has a non-zero size and power-of-two alignment.
-        let ipc_buf_base = unsafe { alloc(ipc_buf_layout) };
-        if ipc_buf_base.is_null() {
-            free_stack(stack);
-            return Err(io::Error::other("seraph: ipc buffer allocation failed"));
-        }
-        // The kernel's IPC-buffer copies fail on an unbacked page instead of
-        // faulting to the pager, and in a demand-paged process this heap page
-        // may not be backed yet: touch it so the pager backs it now
-        // (core/kernel/docs/syscalls.md § `SYS_IPC_BUFFER_SET`).
-        // SAFETY: `ipc_buf_base` is a fresh, page-aligned, page-sized
-        // allocation this function owns; nothing else references it.
-        unsafe { core::ptr::write_volatile(ipc_buf_base, 0) };
+        // The IPC buffer is a page of the process's own grant, mapped now and
+        // until the thread is reclaimed, never a heap page the pager backs:
+        // the kernel's IPC-buffer copies are not restartable, so a fault on
+        // the page fails the IPC instead of reaching the pager
+        // (docs/fault-handling.md § Kernel Copies).
+        let ipc_buf =
+            match MappedGrant::map(info.memmgr_endpoint, info.self_aspace, 0, 1, "IPC buffer") {
+                Ok(buf) => buf,
+                Err(e) => {
+                    free_stack(stack);
+                    return Err(e);
+                }
+            };
 
         // Allocate + populate the TLS block. Processes without a PT_TLS
         // segment have `tls_template_memsz == 0` and skip allocation —
@@ -431,8 +438,7 @@ impl Thread {
         let (tls_block, tls_layout, tls_base) = match alloc_thread_tls(info) {
             Ok(triple) => triple,
             Err(e) => {
-                // SAFETY: ipc_buf_base came from `alloc(ipc_buf_layout)` above.
-                unsafe { dealloc(ipc_buf_base, ipc_buf_layout) };
+                ipc_buf.release();
                 free_stack(stack);
                 return Err(e);
             }
@@ -444,20 +450,19 @@ impl Thread {
         }) {
             Some(cap) => cap,
             None => {
-                // SAFETY: heap allocations owned by this function.
-                unsafe {
-                    if let Some(l) = tls_layout {
-                        dealloc(tls_block, l);
-                    }
-                    dealloc(ipc_buf_base, ipc_buf_layout);
+                if let Some(l) = tls_layout {
+                    // SAFETY: `alloc_thread_tls` allocated the block with `l`
+                    // above, for this spawn alone.
+                    unsafe { dealloc(tls_block, l) };
                 }
+                ipc_buf.release();
                 free_stack(stack);
                 return Err(io::Error::other("seraph: notification cap alloc failed"));
             }
         };
 
         let args = Box::into_raw(Box::new(SpawnArgs {
-            ipc_buffer_vaddr: ipc_buf_base as u64,
+            ipc_buffer_vaddr: ipc_buf.base(),
             self_thread_cap: 0,
             init: Box::into_raw(init),
             done_notification,
@@ -472,9 +477,7 @@ impl Thread {
                 None => {
                     // SAFETY: `args` came from `Box::into_raw` above and no thread started
                     // with it; the TLS block, IPC buffer, and stack are this spawn's own.
-                    unsafe {
-                        unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
-                    };
+                    unsafe { unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf, stack) };
                     return Err(io::Error::other("seraph: thread retype slab alloc failed"));
                 }
             };
@@ -506,9 +509,7 @@ impl Thread {
                     crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
                     // SAFETY: `args` came from `Box::into_raw` above and no thread started
                     // with it; the TLS block, IPC buffer, and stack are this spawn's own.
-                    unsafe {
-                        unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
-                    };
+                    unsafe { unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf, stack) };
                     return Err(io::Error::other("seraph: thread cap alloc failed"));
                 }
             };
@@ -542,9 +543,7 @@ impl Thread {
             crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
             // SAFETY: `args` came from `Box::into_raw` above and no thread started
             // with it; the TLS block, IPC buffer, and stack are this spawn's own.
-            unsafe {
-                unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
-            };
+            unsafe { unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf, stack) };
             return Err(io::Error::other("seraph: thread_configure failed"));
         }
 
@@ -570,9 +569,7 @@ impl Thread {
             crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
             // SAFETY: `args` came from `Box::into_raw` above and no thread started
             // with it; the TLS block, IPC buffer, and stack are this spawn's own.
-            unsafe {
-                unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
-            };
+            unsafe { unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf, stack) };
             return Err(io::Error::other(format!(
                 "seraph: thread_inherit_fault_handler failed (error {e})"
             )));
@@ -606,9 +603,7 @@ impl Thread {
             crate::sys::alloc::seraph::slab_release_fresh(thread_slab_region_id);
             // SAFETY: `args` came from `Box::into_raw` above and no thread started
             // with it; the TLS block, IPC buffer, and stack are this spawn's own.
-            unsafe {
-                unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf_base, ipc_buf_layout, stack)
-            };
+            unsafe { unwind_unstarted_spawn(args, tls_block, tls_layout, ipc_buf, stack) };
             return Err(io::Error::other("seraph: thread_start failed"));
         }
 
@@ -618,8 +613,7 @@ impl Thread {
                 slab_region_id: thread_slab_region_id,
                 done_notification,
                 stack,
-                ipc_buf_base,
-                ipc_buf_layout,
+                ipc_buf,
                 tls_block,
                 tls_layout,
             },
@@ -696,9 +690,10 @@ impl Drop for Thread {
         // Dropping a `Thread` without `join()` is a detach: the child runs on
         // independently and the caller has no synchronisation point to know
         // when it leaves user-mode. Freeing the stack, IPC buffer, or TLS block
-        // here would be a use-after-free — the memory would re-enter the heap's
-        // free list and the `FreeNode` metadata would clobber the child's live
-        // TLS/stack data.
+        // here would be a use-after-free — the TLS block would re-enter the
+        // heap's free list, where the `FreeNode` metadata would clobber the
+        // child's live TLS data, and the stack and IPC buffer would be unmapped,
+        // or their VA and frames handed on, under the running child.
         //
         // Instead, hand ownership to the reaper registry: a kernel death
         // observer (bound in `new`) posts to one of the process's death
@@ -1048,8 +1043,8 @@ extern "C" fn thread_entry(arg: u64) -> ! {
     // in Thread::new; this is the sole consumer.
     let args = unsafe { Box::from_raw(arg as *mut SpawnArgs) };
     crate::os::seraph::set_current_thread_cap(args.self_thread_cap);
-    // SAFETY: `ipc_buffer_vaddr` is the page-aligned page Thread::new heap-
-    // allocated for this thread alone; no Rust object lives in it, and std
+    // SAFETY: `ipc_buffer_vaddr` is the page Thread::new mapped from a grant
+    // for this thread alone; no Rust object lives in it, and std
     // reaches it only through the raw `current_ipc_buf` pointer, holding no
     // reference across an IPC syscall.
     if unsafe { syscall::ipc_buffer_set(args.ipc_buffer_vaddr) }.is_ok() {

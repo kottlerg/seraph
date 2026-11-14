@@ -32,25 +32,27 @@
 //!     rather than the run hanging.
 //!   * `bigframe` — spawn a worker that runs and then parks, then a second
 //!     worker, whose stack the reservation arena places directly above the
-//!     first's, that calls a function whose single frame is larger than its
-//!     whole usable stack and writes only the frame's lowest byte. That byte
-//!     lies past the guard, near the top of the first worker's registered
-//!     stack, so only the target's stack probes, touching each page of the
-//!     frame in turn, fault on the guard. Same verdict as `guard`: the
-//!     process must be killed.
+//!     first worker's one-page IPC buffer, itself directly above the first
+//!     worker's stack, that calls a function whose single frame is larger
+//!     than its whole usable stack and writes only the frame's lowest byte.
+//!     That byte lies past the guard and that IPC buffer, near the top of the
+//!     first worker's registered stack, so only the target's stack probes,
+//!     touching each page of the frame in turn, fault on the guard. Same
+//!     verdict as `guard`: the process must be killed.
 //!   * `splitframe` — the same two workers; the second descends its stack,
 //!     writing every page, to within a page of its usable base, and there
 //!     calls `split_frame`, a frame of 6128 bytes with a return-address save,
 //!     which calls `page_leaf`, a leaf of 4080 bytes of locals that writes
 //!     only its lowest byte. On riscv64 the split prologue and the leaf leave
 //!     about 10 KiB between the save and that byte unwritten, so a guard of
-//!     two pages or fewer lets the byte land in the first worker's stack.
+//!     two pages or fewer lets the byte land on a mapped page of the first
+//!     worker: its IPC buffer, or its stack below.
 //!     Same verdict as `guard`.
 //!   * `span` — the same descent, then two stores 14312 bytes apart, the
 //!     largest distance between two consecutive stack stores of the std
 //!     target (`process_abi::STACK_GUARD_PAGES`), so a guard of three pages
-//!     or fewer lets the second land in the first worker's stack. Same
-//!     verdict as `guard`.
+//!     or fewer lets the second land on a mapped page of the first worker:
+//!     its IPC buffer, or its stack below. Same verdict as `guard`.
 //!   * `main-grow` — the main thread itself recurses as deep as `grow`'s
 //!     worker, far past the pages the loader mapped for it, and prints `PASS`.
 //!     Exits `SUCCESS`.
@@ -91,8 +93,9 @@ const USABLE_STACK_PAGES: usize = 512;
 const GUARD_PAGES: usize = 4;
 
 /// `bigframe` frame size: the usable demand stack, its guard, and 3 pages,
-/// so the frame's lowest byte lies 3 pages below the guard, near the top of
-/// the stack reserved just below.
+/// so the frame's lowest byte lies 3 pages below the guard, past the
+/// one-page IPC buffer reserved just below it and near the top of the stack
+/// below that.
 const BIG_FRAME_BYTES: usize = (USABLE_STACK_PAGES + GUARD_PAGES + 3) * 4096;
 
 /// Stack size every `guard`, `bigframe`, `eager-grow`, and `eager-bigframe` worker
@@ -109,8 +112,9 @@ const EAGER_STACK_BYTES: usize = EAGER_STACK_PAGES * 4096;
 const EAGER_GROW_DEPTH: u64 = 10;
 
 /// `eager-bigframe` frame size: the eager stack, its guard, and 3 pages, so
-/// the frame's lowest byte lies 3 pages below the guard, near the top of the
-/// eager stack reserved just below.
+/// the frame's lowest byte lies 3 pages below the guard, past the one-page
+/// IPC buffer reserved just below it and near the top of the eager stack
+/// below that.
 const EAGER_BIG_FRAME_BYTES: usize = (EAGER_STACK_PAGES + GUARD_PAGES + 3) * 4096;
 
 /// Locals of `split_frame`: with its return-address save, a frame of 6128
@@ -401,20 +405,21 @@ fn eager_big_frame() -> u8
 
 /// Run `frame`, a frame larger than its worker's stack and guard that writes
 /// only its lowest byte, on a worker whose stack the reservation arena places
-/// directly above a parked worker's: `bigframe` with [`big_frame`],
-/// `eager-bigframe` with [`eager_big_frame`].
+/// directly above a parked worker's IPC buffer and stack: `bigframe` with
+/// [`big_frame`], `eager-bigframe` with [`eager_big_frame`].
 fn bigframe(frame: fn() -> u8) -> ExitCode
 {
     println!("about to overflow");
     let _ = std::io::stdout().flush();
 
-    // The parked worker's stack is reserved first, so the arena places the
-    // big-frame worker's stack (guard lowest) directly above it. Waiting
-    // until the parked worker runs maps the top of its stack, and the page
-    // table covering it, so the big frame's write lands on a page memmgr backs
-    // without a fault rather than on a page table this address space has not
-    // funded. An eager stack is mapped whole at spawn, so for it the wait
-    // changes nothing.
+    // The parked worker's stack and then its one-page IPC buffer are reserved
+    // first, so the arena places the big-frame worker's stack (guard lowest)
+    // directly above that buffer, which lies directly above the parked
+    // worker's stack. Waiting until the parked worker runs maps the top of its
+    // stack, and the page table covering it, so the big frame's write lands on
+    // a page memmgr backs without a fault rather than on a page table this
+    // address space has not funded. An eager stack is mapped whole at spawn,
+    // so for it the wait changes nothing.
     let (ready_tx, ready) = std::sync::mpsc::channel::<()>();
     let (release, parked) = std::sync::mpsc::channel::<()>();
     let below = spawn_worker(move || {
@@ -434,11 +439,11 @@ fn bigframe(frame: fn() -> u8) -> ExitCode
 }
 
 /// Run `overflow` on a worker whose stack the reservation arena places
-/// directly above a parked worker's, as `bigframe` does, from a stack pointer
-/// within a page of the worker's usable base. A dry run first descends to the
-/// same depth and writes just below it, then returns: it shows the overflow
-/// starts inside the usable stack, so only the overflow's deeper store can
-/// reach the guard.
+/// directly above a parked worker's IPC buffer and stack, as `bigframe` does,
+/// from a stack pointer within a page of the worker's usable base. A dry run
+/// first descends to the same depth and writes just below it, then returns:
+/// it shows the overflow starts inside the usable stack, so only the
+/// overflow's deeper store can reach the guard.
 fn over_the_guard(overflow: fn() -> u8) -> ExitCode
 {
     // As in `bigframe`: the parked worker runs first, so the top of its stack
@@ -593,8 +598,9 @@ fn span_overflow() -> u8
     // SAFETY: both stores are to the stack below the stack pointer, which holds
     // no live value: the first to the usable stack, which the dry run wrote,
     // and the second to the guard, whose fault ends the process, or, past a
-    // guard too small for it, to the parked worker's stack, which this test
-    // reports. Neither changes a register but the scratch one declared.
+    // guard too small for it, to a mapped page of the parked worker (its IPC
+    // buffer, or its stack below), which this test reports. Neither changes a
+    // register but the scratch one declared.
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!(

@@ -13,9 +13,12 @@
 //! `FS_REMOVE`, `FS_MKDIR`, `FS_RENAME`); per-open caps carry the open's
 //! `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`, and the stateless
 //! file labels.
-//! `FS_MOUNT` is the one unbadged service-level request, used by vfsd
-//! as a BPB-validation probe at mount time. All disk I/O is performed via
-//! the block device IPC endpoint received at creation time.
+//! The unbadged service-level requests are vfsd's: `FS_MOUNT`, a
+//! BPB-validation probe at mount time, and `FS_UNMOUNT`, after which the
+//! driver exits. All disk I/O is performed via the block device IPC endpoint
+//! received at creation time; a block call that finds that capability
+//! revoked ends the driver once the request in flight is answered
+//! ([`cache::block_call`]).
 //!
 //! Per-node badges are minted by `NS_LOOKUP` (badge = `(NodeId,
 //! NamespaceRights)`); per-node ops look the node up in `NodeTable`. Per-open
@@ -212,7 +215,7 @@ fn query_block_size(block_dev: u64, ipc_buf: *mut u64) -> Option<u32>
         .word(0, u64::from(ipc::BLK_LABELS_VERSION))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(block_dev, &msg, ipc_buf) }.ok()?;
+    let reply = unsafe { cache::block_call(block_dev, &msg, ipc_buf) }?;
     drop_caps(reply.caps());
     if reply.label != ipc::blk_errors::SUCCESS
     {
@@ -249,8 +252,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 
 /// Main FAT service loop.
 ///
-/// Three request shapes share one endpoint:
-/// - `FS_MOUNT` — unbadged (badge == 0); vfsd's BPB-validation probe.
+/// Four request shapes share one endpoint:
+/// - `FS_MOUNT` and `FS_UNMOUNT` — unbadged (badge == 0); vfsd's
+///   BPB-validation probe and its unmount ([`handle_unmount`]).
 /// - `NS_LOOKUP` / `NS_STAT` / `NS_READDIR` — namespace dispatch via
 ///   the protocol crate.
 /// - Per-node `FS_*` requests — badge packs `(NodeId, NamespaceRights)`
@@ -287,6 +291,13 @@ fn service_loop(
     let mut sweeps = SweepSchedule::new();
     loop
     {
+        // The last request found the block device capability revoked and
+        // has been answered: the device is gone for good, so the driver
+        // ends (fs-driver-protocol.md § Loss of the block device).
+        if cache::device_gone()
+        {
+            std::process::exit(fs_labels::EXIT_DEVICE_GONE.cast_signed());
+        }
         // The last request may have met a full cache on a path that does
         // not hold the open table's lock (relieve_pressure).
         if cache.take_pressure()
@@ -311,8 +322,22 @@ fn service_loop(
 
         let opcode = msg.label & 0xFFFF;
 
-        // Unbadged service-level requests: FS_MOUNT only. FS_MOUNT carries
-        // no caps, so none a request carried is kept.
+        // Unbadged service-level requests: FS_MOUNT and FS_UNMOUNT. Neither
+        // carries caps, so none a request carried is kept.
+        if msg.badge == 0 && opcode == fs_labels::FS_UNMOUNT
+        {
+            drop_caps(msg.caps());
+            handle_unmount(
+                &msg,
+                state,
+                files,
+                &mut sweeps,
+                cache,
+                caps.block_dev,
+                ipc_buf,
+            );
+            continue;
+        }
         if msg.badge == 0
         {
             let code = if opcode == fs_labels::FS_MOUNT
@@ -1113,6 +1138,54 @@ fn sweep_dead_opens(files: &mut OpenTable, sweeps: &mut SweepSchedule, cache: &P
 {
     files.remove_where(OpenFile::client_gone, |f| release_open_file(&f, cache));
     sweeps.swept(files.len());
+}
+
+/// `FS_UNMOUNT` (services/fs/docs/fs-driver-protocol.md § Label 19): sweep
+/// the opens whose client is gone, then refuse with `BUSY` and the count of
+/// live opens, unless none is left or the request carries `UNMOUNT_FORCE`.
+/// Otherwise release every open as `FS_CLOSE` would, which revokes the
+/// client's liveness and page caps, write the `FSInfo` hints of a mounted
+/// volume, reply, and exit the process. The single dispatch thread runs this
+/// between requests, so no request of this driver is in flight; the eviction
+/// worker finds the opens gone when it next takes the table's lock.
+fn handle_unmount(
+    msg: &IpcMessage,
+    state: &mut FatState,
+    files: &Mutex<OpenTable>,
+    sweeps: &mut SweepSchedule,
+    cache: &PageCache,
+    block_dev: u64,
+    ipc_buf: *mut u64,
+)
+{
+    if msg.word(0) != u64::from(ipc::FS_LABELS_VERSION)
+    {
+        reply_err(ipc::fs_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+        return;
+    }
+    let mut files_g = files.lock().unwrap_or_else(PoisonError::into_inner);
+    sweep_dead_opens(&mut files_g, sweeps, cache);
+    let live = files_g.len();
+    if live != 0 && msg.label & fs_labels::UNMOUNT_FORCE == 0
+    {
+        drop(files_g);
+        let reply = IpcMessage::builder(ipc::fs_errors::BUSY)
+            .word(0, live as u64)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        return;
+    }
+    files_g.remove_where(|_| true, |f| release_open_file(&f, cache));
+    drop(files_g);
+    if state.fat_size != 0
+    {
+        alloc::flush_fsinfo(state, cache, block_dev, ipc_buf);
+    }
+    std::os::seraph::log!("unmounted ({live} opens released); exiting");
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(ipc::fs_errors::SUCCESS), ipc_buf) };
+    std::process::exit(fs_labels::EXIT_UNMOUNTED.cast_signed());
 }
 
 /// `FS_READ_MEMORY` against an open cap: the page is tracked on that open

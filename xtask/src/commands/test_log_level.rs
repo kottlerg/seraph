@@ -41,7 +41,8 @@ use crate::util::step;
 
 /// The configuration the test boots: vfsd at debug, every other service at
 /// info.
-const LEVELS: &str = "# test-log-level: vfsd at debug, every other service at info.\nvfsd = debug\n";
+const LEVELS: &str =
+    "# test-log-level: vfsd at debug, every other service at info.\nvfsd = debug\n";
 
 /// Log-line markers of a debug line of each process the check reads: the
 /// `[name] DEBUG ` prefix logd writes (`services/logd/docs/ipc-interface.md`
@@ -88,7 +89,9 @@ fn check_log(log: &str) -> Result<Verdict>
     {
         if holds(marker)
         {
-            bail!("a {marker:?} line: {service}, which the configuration leaves at info, logged at debug");
+            bail!(
+                "a {marker:?} line: {service}, which the configuration leaves at info, logged at debug"
+            );
         }
     }
     Ok(Verdict::Pass)
@@ -114,8 +117,8 @@ pub fn run(ctx: &Context, args: &TestLogLevelArgs) -> Result<()>
     // The staged bundle and the layout are read before anything changes, so
     // a failed compose or repack cannot change what the restore writes.
     let bundle = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
-    let staged =
-        std::fs::read(&bundle).with_context(|| format!("reading the staged {}", bundle.display()))?;
+    let staged = std::fs::read(&bundle)
+        .with_context(|| format!("reading the staged {}", bundle.display()))?;
     let layout = crate::disk::current_layout(ctx)?;
     let booted = compose_with_levels(ctx, args.arch, Harness::Init, &levels)
         .context("composing the bundle with vfsd at debug")
@@ -282,8 +285,7 @@ mod tests
         });
         for service in Service::ALL
         {
-            let expected =
-                (service == Service::Vfsd).then(|| log::parse_level(b"debug").unwrap());
+            let expected = (service == Service::Vfsd).then(|| log::parse_level(b"debug").unwrap());
             assert_eq!(levels.get(service), expected);
         }
     }

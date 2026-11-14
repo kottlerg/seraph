@@ -132,7 +132,11 @@ pub fn parse(text: &[u8], mut on_error: impl FnMut(&[u8], LineError)) -> Levels
     let mut levels = Levels::default();
     for raw in text.split(|&b| b == b'\n')
     {
-        let line = raw.split(|&b| b == b'#').next().unwrap_or_default().trim_ascii();
+        let line = raw
+            .split(|&b| b == b'#')
+            .next()
+            .unwrap_or_default()
+            .trim_ascii();
         if line.is_empty()
         {
             continue;
@@ -183,7 +187,10 @@ mod tests
     fn parse_ok(text: &str) -> Levels
     {
         parse(text.as_bytes(), |line, e| {
-            panic!("unexpected error {e:?} on {:?}", String::from_utf8_lossy(line))
+            panic!(
+                "unexpected error {e:?} on {:?}",
+                String::from_utf8_lossy(line)
+            )
         })
     }
 

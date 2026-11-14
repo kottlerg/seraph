@@ -656,7 +656,13 @@ mod tests
     #[test]
     fn a_level_entry_parses_back_to_its_level()
     {
-        for level in [LEVEL_ERROR, LEVEL_WARN, LEVEL_INFO, LEVEL_DEBUG, LEVEL_TRACE]
+        for level in [
+            LEVEL_ERROR,
+            LEVEL_WARN,
+            LEVEL_INFO,
+            LEVEL_DEBUG,
+            LEVEL_TRACE,
+        ]
         {
             let mut out = [0xAAu8; LEVEL_ENTRY_MAX + 4];
             let n = level_entry(level, &mut out).expect("a level's entry");
@@ -691,7 +697,10 @@ mod tests
         assert_eq!(level_entry(6, &mut out), None);
         // A shorter name fits a buffer the longest does not.
         let mut warn = [0u8; LEVEL_ENTRY_MAX - 1];
-        assert_eq!(level_entry(LEVEL_WARN, &mut warn), Some(LEVEL_ENTRY_MAX - 1));
+        assert_eq!(
+            level_entry(LEVEL_WARN, &mut warn),
+            Some(LEVEL_ENTRY_MAX - 1)
+        );
     }
 
     /// The one test that sets the process-global level, so no other test

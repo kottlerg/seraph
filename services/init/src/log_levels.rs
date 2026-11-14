@@ -178,8 +178,17 @@ impl SpawnEnv
             return None;
         }
         // SAFETY: the caller's contract covers TEMP_MAP_BASE in `aspace`.
-        if unsafe { syscall::mem_map(self.page, aspace, TEMP_MAP_BASE, 0, 1, syscall::MAP_WRITABLE) }
-            .is_err()
+        if unsafe {
+            syscall::mem_map(
+                self.page,
+                aspace,
+                TEMP_MAP_BASE,
+                0,
+                1,
+                syscall::MAP_WRITABLE,
+            )
+        }
+        .is_err()
         {
             log("init: log-levels: env page map failed; service spawned without env");
             return None;

@@ -1153,6 +1153,79 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// A `CSpace` teardown keeps the children of a dying slot inside the revoke
+/// reach of the slot's ancestors, as a delete does
+/// (core/kernel/docs/capability-internals.md § Revocation Algorithm).
+///
+/// A, in ktest's `CSpace`, derives B; B derives C, kept here, and C3, moved
+/// into a third `CSpace`. B is then moved into a second `CSpace`, a move that
+/// keeps its derivation position (parent A, children C and C3), so the
+/// shape is that of three processes: A's holder delegated B, and B's holder
+/// derived C and C3 for two others. Deleting the second `CSpace`'s only
+/// capability tears B down. C must stay usable until A's holder revokes; the
+/// revoke of A must then free both: a send on C fails with
+/// `InvalidCapability`, and the third `CSpace`'s `USED` count drops by one.
+pub fn cspace_teardown_keeps_children_revocable(ctx: &TestContext) -> TestResult
+{
+    let a = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "teardown_revocable: create_notification failed")?;
+    let cs2 = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "teardown_revocable: create_cspace (second) failed")?;
+    let cs3 = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "teardown_revocable: create_cspace (third) failed")?;
+
+    let mut c = None;
+    let mut body = || -> TestResult {
+        let b = cap_derive(a, RIGHTS_NOTIFY).map_err(|_| "teardown_revocable: derive B failed")?;
+        let c_here =
+            cap_derive(b, RIGHTS_NOTIFY).map_err(|_| "teardown_revocable: derive C failed")?;
+        c = Some(c_here);
+        let c3 =
+            cap_derive(b, RIGHTS_NOTIFY).map_err(|_| "teardown_revocable: derive C3 failed")?;
+        cap_move(c3, cs3, 0).map_err(|_| "teardown_revocable: cap_move(C3) failed")?;
+        cap_move(b, cs2, 0).map_err(|_| "teardown_revocable: cap_move(B) failed")?;
+        let used3 = cap_info(cs3, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "teardown_revocable: cap_info(third USED) failed")?;
+
+        // The second CSpace's last capability: its teardown drains B.
+        cap_delete(cs2).map_err(|_| "teardown_revocable: cap_delete(second CSpace) failed")?;
+        notification_send(c_here, 0x1)
+            .map_err(|_| "teardown_revocable: C unusable after its parent's CSpace teardown")?;
+
+        cap_revoke(a).map_err(|_| "teardown_revocable: cap_revoke(A) failed")?;
+        match notification_send(c_here, 0x1)
+        {
+            Ok(()) => return Err("teardown_revocable: C survived A's revoke after B's teardown"),
+            Err(e) if e == SyscallError::InvalidCapability as i64 =>
+            {}
+            Err(_) => return Err("teardown_revocable: send on revoked C failed, not stale"),
+        }
+        let used3_after = cap_info(cs3, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "teardown_revocable: cap_info(third USED after) failed")?;
+        if used3_after.checked_add(1) != Some(used3)
+        {
+            return Err("teardown_revocable: C3 survived A's revoke after B's teardown");
+        }
+        Ok(())
+    };
+    let result = body();
+    if result.is_err()
+    {
+        // A failed run can leave C a live root outside A's subtree; the
+        // handle's generation keeps a delete of a freed C from touching a
+        // recycled slot.
+        if let Some(c) = c
+        {
+            cap_delete(c).ok();
+        }
+        cap_revoke(a).ok();
+        cap_delete(cs2).ok();
+    }
+    cap_delete(cs3).map_err(|_| "teardown_revocable: cap_delete(third CSpace) failed")?;
+    cap_delete(a).map_err(|_| "teardown_revocable: cap_delete(A) failed")?;
+    result
+}
+
 /// Correlators for the death observers in `cspace_delete_stops_bound_thread`.
 const STOP_CORR_EARLY: u64 = 0x5701;
 const STOP_CORR_LATE: u64 = 0x5702;

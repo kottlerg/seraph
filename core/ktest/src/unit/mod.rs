@@ -40,7 +40,7 @@ use crate::run_test;
 )]
 #[expect(
     clippy::large_stack_frames,
-    reason = "no large local: the estimate sums the temporaries of its 234 `run_test!` expansions \
+    reason = "no large local: the estimate sums the temporaries of its 241 `run_test!` expansions \
               (the logged names, the closure passed to `run_isolated` and its `TestResult`, about \
               220 B each), and the compiled frame is under 1 KiB; on init's 16 KiB stack"
 )]
@@ -124,6 +124,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "cap::cspace_teardown_multibatch",
         cap::cspace_teardown_multibatch(ctx)
+    );
+    run_test!(
+        "cap::cspace_teardown_keeps_children_revocable",
+        cap::cspace_teardown_keeps_children_revocable(ctx)
     );
     run_test!(
         "cap::cspace_delete_stops_bound_thread",

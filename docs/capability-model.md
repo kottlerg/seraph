@@ -83,7 +83,9 @@ scaling, and DRAM rows. The system draws the line as follows.
   whose bit the firmware set (`TM`, for the `time` counter, for example). On x86-64 it never
   sets `CR4.TSD` or `CR4.PCE`: each AP starts with both clear, and the boot CPU keeps the
   firmware's values, so ring 3 reads the timestamp counter unless the firmware set `CR4.TSD`, and
-  reads the performance counters only where the firmware set `CR4.PCE`. Capability-mediated
+  reads the performance counters only where the firmware set `CR4.PCE`. Setting these controls
+  on every CPU from the kernel alone, whatever the firmware left, is design intent, not yet
+  implemented ([#1118](https://github.com/kottlerg/seraph/issues/1118)). Capability-mediated
   performance-counter access is design intent, not yet implemented
   ([#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the gating of the
   counters, need security domains

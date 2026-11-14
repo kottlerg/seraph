@@ -580,6 +580,10 @@ fn return_taken(l: &mut MemLedger, cap_slot: u64, pages: u32, phys_base: u64)
 /// bookkeeping, so a top-up is never a single page.
 const ASPACE_TOPUP_PAGES: u32 = 4;
 
+/// The smallest donation [`fund_client_page_tables`] makes to a client's
+/// page-table pool, when [`ASPACE_TOPUP_PAGES`] is not free or not admitted.
+const CLIENT_TOPUP_MIN_PAGES: u32 = 2;
+
 /// Page-table top-ups one map attempts before giving up: a self-map
 /// ([`map_self`]) or a demand chunk's map into a client
 /// ([`map_client_chunk`]).
@@ -1823,9 +1827,9 @@ enum FaultDecline
     /// when the failure was an exhausted pool; the high 32 bits of the reason
     /// word carry the magnitude of its `SyscallError`.
     MapFailed = 9,
-    /// Backing the faulting page, or funding the page tables the map of the
-    /// run backing it needs beside that run, would take the subtree of the
-    /// process's budget node, or of an ancestor, over its max
+    /// Backing the faulting page, or the faulting page and the least
+    /// page-table funding its map needs ([`back_span`]), would take the
+    /// subtree of the process's budget node, or of an ancestor, over its max
     /// (services/memmgr/docs/memory-pool.md § Distribution policy).
     BudgetLimit = 10,
 }
@@ -1855,6 +1859,32 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
     let reply = IpcMessage::builder(label).word(0, word).build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Admit as much of a demand fault's span of `span_pages` as the budget node
+/// of `rec` takes ([`admissible`]): the span, clamped to the headroom under the
+/// max of the node and its ancestors and, for a node outside the reserve, to
+/// the free pages above the system reserve. Then select the run that backs
+/// those pages: one covering them, else the largest free run. The span is a
+/// fault-around preference, so the fault is declined only when not even the
+/// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
+/// [`FaultDecline::NoFreePage`] at the reserve or when the selection fails.
+fn select_fault_run(l: &mut MemLedger, rec: NodeIdx, span_pages: u32)
+-> Result<Grant, FaultDecline>
+{
+    match admissible(l, rec, u64::from(span_pages))
+    {
+        Ok(pages) =>
+        {
+            // At most `span_pages`, so it fits a `u32`.
+            let pages = u32::try_from(pages).unwrap_or(span_pages);
+            select(l, pages, Fit::Contiguous)
+                .or_else(|_| select(l, pages, Fit::UpTo))
+                .map_err(|_| FaultDecline::NoFreePage)
+        }
+        Err(ChargeError::Limit) => Err(FaultDecline::BudgetLimit),
+        Err(ChargeError::Reserve) => Err(FaultDecline::NoFreePage),
+    }
 }
 
 /// Service a kernel-synthesized page fault for a demand-paged process.
@@ -1899,32 +1929,6 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// holds (services/memmgr/docs/memory-pool.md § Chunk table). A declined
 /// fault's run is unmapped before it returns to the pool
 /// ([`release_unmapped_chunk`]).
-/// Admit as much of a demand fault's span of `span_pages` as the budget node
-/// of `rec` takes ([`admissible`]): the span, clamped to the headroom under the
-/// max of the node and its ancestors and, for a node outside the reserve, to
-/// the free pages above the system reserve. Then select the run that backs
-/// those pages: one covering them, else the largest free run. The span is a
-/// fault-around preference, so the fault is declined only when not even the
-/// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
-/// [`FaultDecline::NoFreePage`] at the reserve or when the selection fails.
-fn select_fault_run(l: &mut MemLedger, rec: NodeIdx, span_pages: u32)
--> Result<Grant, FaultDecline>
-{
-    match admissible(l, rec, u64::from(span_pages))
-    {
-        Ok(pages) =>
-        {
-            // At most `span_pages`, so it fits a `u32`.
-            let pages = u32::try_from(pages).unwrap_or(span_pages);
-            select(l, pages, Fit::Contiguous)
-                .or_else(|_| select(l, pages, Fit::UpTo))
-                .map_err(|_| FaultDecline::NoFreePage)
-        }
-        Err(ChargeError::Limit) => Err(FaultDecline::BudgetLimit),
-        Err(ChargeError::Reserve) => Err(FaultDecline::NoFreePage),
-    }
-}
-
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
@@ -1997,55 +2001,23 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
     }
-    let grant = match select_fault_run(l, rec, span_pages)
+    let target = FaultTarget {
+        rec,
+        aspace_cap,
+        prot: region.prot,
+        span: (span_start, span_end),
+        page_base,
+        held: need,
+    };
+    let frame = match back_span(l, &target, span_pages)
     {
-        Ok(grant) => grant,
-        Err(reason) =>
+        Ok(frame) => frame,
+        Err((reason, detail)) =>
         {
-            decline_fault(ipc_buf, reason, 0);
+            decline_fault(ipc_buf, reason, detail);
             return;
         }
     };
-    let (outer, pages, phys) = grant.entries[0];
-    // The run's mapped VA, which places it in its chunk.
-    let frame = FrameDesc {
-        cap_slot: outer,
-        page_count: pages,
-        phys_base: phys,
-        va: fault_window(span_start, span_end, page_base, pages),
-        region_id: NO_REGION_ID,
-    };
-
-    // Zero the run before the process can read it (services/memmgr/docs/
-    // memory-pool.md § Frame contents). It is mapped nowhere yet, so a
-    // failure returns it to the pool as it is.
-    if let Err(e) = scrub_run(l, outer, u64::from(pages))
-    {
-        insert_run(
-            l,
-            FreeRun {
-                cap_slot: outer,
-                page_count: u64::from(pages),
-                phys_base: phys,
-            },
-        );
-        decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs());
-        return;
-    }
-
-    // Map first, then record the run in its chunk: a failed map leaves the
-    // chunk's entry as it was. A page-table top-up during the map holds the
-    // slots recording the run needs.
-    if let Err(refusal) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot, need)
-    {
-        release_unmapped_chunk(l, rec, aspace_cap, frame);
-        match refusal
-        {
-            MapRefusal::Map(e) => decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs()),
-            MapRefusal::Limit => decline_fault(ipc_buf, FaultDecline::BudgetLimit, 0),
-        }
-        return;
-    }
     // Record the run on its chunk, so it is reclaimed on death or unregister.
     if !ensure_slots(l, need) || l.back_chunk(rec, reg, frame).is_err()
     {
@@ -2056,6 +2028,101 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
 }
 
+/// The demand fault [`back_span`] backs.
+struct FaultTarget
+{
+    /// The faulting process's record.
+    rec: NodeIdx,
+    /// Its delegated address space.
+    aspace_cap: u64,
+    /// The region's protection.
+    prot: u64,
+    /// The part of the chunk no earlier run backs, `[start, end)`.
+    span: (u64, u64),
+    /// The faulting page.
+    page_base: u64,
+    /// The arena slots recording the run takes, held through a page-table
+    /// top-up.
+    held: u64,
+}
+
+/// Back the span of `target` with one run of at most `span_pages` pages
+/// around the faulting page, zeroed and mapped into the process. The run is
+/// as much of the span as the budget admits ([`select_fault_run`]). When the
+/// map needs page-table funding the budget or the reserve refuses beside a run
+/// of more than one page, the run goes back to the pool and a run smaller by
+/// the least donation backs the fault instead, so the fault is declined only
+/// when not even the faulting page and the least donation fit.
+///
+/// # Errors
+/// The [`FaultDecline`] and its detail word ([`decline_fault`]).
+fn back_span(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    span_pages: u32,
+) -> Result<FrameDesc, (FaultDecline, u64)>
+{
+    let mut cap = span_pages;
+    loop
+    {
+        let grant = select_fault_run(l, target.rec, cap).map_err(|reason| (reason, 0))?;
+        let (outer, pages, phys) = grant.entries[0];
+        // The run's mapped VA, which places it in its chunk.
+        let frame = FrameDesc {
+            cap_slot: outer,
+            page_count: pages,
+            phys_base: phys,
+            va: fault_window(target.span.0, target.span.1, target.page_base, pages),
+            region_id: NO_REGION_ID,
+        };
+
+        // Zero the run before the process can read it (services/memmgr/docs/
+        // memory-pool.md § Frame contents). It is mapped nowhere yet, so a
+        // failure returns it to the pool as it is.
+        if let Err(e) = scrub_run(l, outer, u64::from(pages))
+        {
+            insert_run(
+                l,
+                FreeRun {
+                    cap_slot: outer,
+                    page_count: u64::from(pages),
+                    phys_base: phys,
+                },
+            );
+            return Err((FaultDecline::MapFailed, e.unsigned_abs()));
+        }
+
+        // Map first; the caller records the run in its chunk after, so a
+        // failed map leaves the chunk's entry as it was. A page-table top-up
+        // during the map holds the slots recording the run needs.
+        let Err(refusal) = map_client_chunk(
+            l,
+            target.rec,
+            target.aspace_cap,
+            &frame,
+            target.prot,
+            target.held,
+        )
+        else
+        {
+            return Ok(frame);
+        };
+        release_unmapped_chunk(l, target.rec, target.aspace_cap, frame);
+        match refusal
+        {
+            MapRefusal::Limit | MapRefusal::Reserve(_) if pages > 1 =>
+            {
+                cap = pages.saturating_sub(CLIENT_TOPUP_MIN_PAGES).max(1);
+            }
+            MapRefusal::Limit => return Err((FaultDecline::BudgetLimit, 0)),
+            MapRefusal::Map(e) | MapRefusal::Reserve(e) =>
+            {
+                return Err((FaultDecline::MapFailed, e.unsigned_abs()));
+            }
+        }
+    }
+}
+
 /// Why [`map_client_chunk`] did not map a demand chunk.
 enum MapRefusal
 {
@@ -2064,6 +2131,9 @@ enum MapRefusal
     /// Funding the page tables the map needs would take the subtree of the
     /// process's budget node, or of an ancestor, over its max.
     Limit,
+    /// Funding the page tables the map needs would take the system reserve
+    /// from a budget node outside it; the last map failed with this error.
+    Reserve(i64),
 }
 
 /// Why [`fund_client_page_tables`] funded nothing.
@@ -2071,6 +2141,9 @@ enum FundRefusal
 {
     /// The process's budget admits not even the smallest donation.
     Limit,
+    /// Not even the smallest donation fits above the system reserve, and the
+    /// process's budget node is outside it.
+    Reserve,
     /// Any other failure, which leaves the map's own error standing.
     Failed,
 }
@@ -2080,8 +2153,9 @@ enum FundRefusal
 /// client's page-table pool exhausted, memmgr funds the pool from its own
 /// ([`fund_client_page_tables`]), holding the `held` arena slots that
 /// recording the chunk takes, and maps again, at most [`PT_FUND_ROUNDS`]
-/// times. Returns the last map error otherwise, or [`MapRefusal::Limit`]
-/// when the process's budget refused the funding.
+/// times. Returns the last map error otherwise, [`MapRefusal::Limit`] when
+/// the process's budget refused the funding, or [`MapRefusal::Reserve`] when
+/// the system reserve did.
 ///
 /// Pool outers are full-rights, so `mem_map` gates the mapping to `prot`
 /// directly (the kernel grants read at every map, and W^X is enforced); no
@@ -2128,6 +2202,7 @@ fn map_client_chunk(
             Ok(()) =>
             {}
             Err(FundRefusal::Limit) => return Err(MapRefusal::Limit),
+            Err(FundRefusal::Reserve) => return Err(MapRefusal::Reserve(e)),
             Err(FundRefusal::Failed) => return Err(MapRefusal::Map(e)),
         }
         rounds = rounds.saturating_add(1);
@@ -2136,9 +2211,9 @@ fn map_client_chunk(
 
 /// Fund the client address space `aspace_cap`'s page-table growth pool from
 /// memmgr's free pool: donate a contiguous run of [`ASPACE_TOPUP_PAGES`] (or
-/// two pages when no such run is free, or the process's budget admits only
-/// two) with augment-mode `cap_create_aspace`, and account the run to the
-/// client's record `rec` like a grant memmgr did not map
+/// [`CLIENT_TOPUP_MIN_PAGES`] when no such run is free, or the process's
+/// budget admits only that) with augment-mode `cap_create_aspace`, and account
+/// the run to the client's record `rec` like a grant memmgr did not map
 /// ([`FRAME_VA_UNMAPPED`], no region id). The donation is admitted beside the
 /// `pending` pages of the demand run whose map needs it, which are charged
 /// only once the run is recorded, and is charged to the budget node, so only
@@ -2149,9 +2224,10 @@ fn map_client_chunk(
 /// beside the run's descriptor, for the caller's demand chunk.
 ///
 /// # Errors
-/// [`FundRefusal::Limit`] when the budget admits not even two pages;
-/// [`FundRefusal::Failed`] for every other failure: the charge would take the
-/// reserve, or the arena, the pool or the donation fails.
+/// [`FundRefusal::Limit`] when the budget admits not even
+/// [`CLIENT_TOPUP_MIN_PAGES`]; [`FundRefusal::Reserve`] when they would take
+/// the reserve; [`FundRefusal::Failed`] for every other failure: the arena,
+/// the pool or the donation fails.
 fn fund_client_page_tables(
     l: &mut MemLedger,
     rec: NodeIdx,
@@ -2171,19 +2247,19 @@ fn fund_client_page_tables(
     }
     else
     {
-        match admit(l, rec, 2, pending)
+        match admit(l, rec, u64::from(CLIENT_TOPUP_MIN_PAGES), pending)
         {
-            Ok(()) => 2,
+            Ok(()) => CLIENT_TOPUP_MIN_PAGES,
             Err(ChargeError::Limit) => return Err(FundRefusal::Limit),
-            Err(ChargeError::Reserve) => return Err(FundRefusal::Failed),
+            Err(ChargeError::Reserve) => return Err(FundRefusal::Reserve),
         }
     };
     let Ok(grant) = select(l, first, Fit::Contiguous).or_else(|e| {
-        if first == 2
+        if first == CLIENT_TOPUP_MIN_PAGES
         {
             return Err(e);
         }
-        select(l, 2, Fit::Contiguous)
+        select(l, CLIENT_TOPUP_MIN_PAGES, Fit::Contiguous)
     })
     else
     {

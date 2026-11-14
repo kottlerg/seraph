@@ -647,7 +647,7 @@ forwards to.
 | 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page is in the system reserve and the process's budget node is outside it, or the split of a run larger than the pages to back failed |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
-| 10 | The faulting page, or the page-table funding the map of its run needs beside that run, would take the subtree of the process's budget node, or of an ancestor, over its max ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
+| 10 | The faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted

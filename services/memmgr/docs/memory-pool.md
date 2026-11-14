@@ -245,7 +245,9 @@ The span is a fault-around preference, and the process's budget node bounds it. 
 admits as much of the span as the node takes ([Distribution policy](#distribution-policy)): the
 span, clamped to what the max of the node and of every ancestor leaves, and, for a node outside the
 system reserve, to the free pages above the reserve. A fault is declined with code 10 only when the
-max admits not even the faulting page, and with code 7 when the reserve does not. It then selects
+max admits not even the faulting page, and with code 7 when the reserve does not; a run whose map
+needs page-table funding the budget refuses is shortened first ([Client page-table
+funding](#client-page-table-funding)). It then selects
 a run covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the deferred
 recheck before it fails (see [Reclamation](#reclamation)). When no free run covers them, it takes
 the largest free run whole, which needs no split, and maps it over the part of the span around the
@@ -340,13 +342,18 @@ run is quiescent by then, or waits on the deferred list until it is (see
 [Reclamation](#reclamation)). The pages move from a free run to the process's entry, so
 `pool_total` is unchanged.
 
-A fault whose funding the budget refuses, because not even two pages fit under the max of the
-process's node or of an ancestor beside the run being mapped, is declined with code 10. A fault
-whose map still fails, because the free pool cannot fund the pool or the map fails for another
-reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault
-message). A failed map can leave the first pages of the run mapped. memmgr unmaps the run's span
-before it returns the run to the free pool, so no page of a pooled run stays mapped in the process.
-When that unmap fails, the run stays recorded on the process's entry until `PROCESS_DIED`.
+When the budget refuses the funding, because not even two pages fit under the max of the
+process's node or of an ancestor beside the run being mapped, or the reserve refuses it, and the
+run is longer than one page, memmgr returns the run to the free pool and backs the fault again with
+a run at least two pages shorter, down to one page, around the faulting page as before. So the
+funding a fault needs never spends the room its faulting page would fit in. A one-page run whose
+funding the budget refuses is declined with code 10, and one whose funding the reserve refuses with
+code 9. A fault whose map still fails, because the free pool cannot fund the pool or the map fails
+for another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md)
+§ Kernel-origin fault message). A failed map can leave the first pages of the run mapped. memmgr
+unmaps the run's span before it returns the run to the free pool, so no page of a pooled run stays
+mapped in the process. When that unmap fails, the run stays recorded on the process's entry until
+`PROCESS_DIED`.
 
 ---
 

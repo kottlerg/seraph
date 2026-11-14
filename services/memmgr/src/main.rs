@@ -1388,7 +1388,7 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
     let rec = match l.insert_process(new_badge, spec)
     {
         Ok(rec) => rec,
-        Err(NodeError::Parent | NodeError::Refs) =>
+        Err(NodeError::Parent) =>
         {
             reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
             return;

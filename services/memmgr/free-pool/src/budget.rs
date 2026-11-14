@@ -45,11 +45,10 @@ pub struct BudgetNode
     pub own: u64,
     /// Pages charged to this node and to every node below it.
     pub subtree: u64,
-    /// Process records and child nodes that point at this node. A record or
-    /// child more than `u32::MAX` would need is refused at creation
-    /// ([`NodeError::Refs`]); each holds an arena slot, so the count is RAM
-    /// bound well below that.
-    pub refs: u32,
+    /// Process records and child nodes that point at this node. Each holds an
+    /// arena slot, and a [`NodeIdx`] is a `u64`, so the count cannot pass
+    /// `u64::MAX`.
+    pub refs: u64,
     /// [`FLAG_RESERVE`].
     pub flags: u32,
 }
@@ -101,8 +100,6 @@ pub enum NodeError
     /// The parent is not a budget node, or a reserve node was asked for under
     /// a parent outside the reserve.
     Parent,
-    /// The parent's reference count is spent.
-    Refs,
     /// The arena has no free slot outside its reserve.
     NoSlot,
 }
@@ -171,8 +168,7 @@ pub fn headroom<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> u64
 ///
 /// # Errors
 /// [`NodeError::Parent`] for a parent that is not a node, or a reserve node
-/// under a parent outside the reserve; [`NodeError::Refs`] for a parent whose
-/// count is spent; [`NodeError::NoSlot`] for a full arena. Nothing changes
+/// under a parent outside the reserve; [`NodeError::NoSlot`] for a full arena. Nothing changes
 /// then.
 pub fn create<S: SlotStore>(arena: &mut Arena<S>, spec: NodeSpec) -> Result<NodeIdx, NodeError>
 {
@@ -193,7 +189,7 @@ pub fn create<S: SlotStore>(arena: &mut Arena<S>, spec: NodeSpec) -> Result<Node
             max = max.min(headroom(arena, spec.parent));
         }
         Some(BudgetNode {
-            refs: p.refs.checked_add(1).ok_or(NodeError::Refs)?,
+            refs: p.refs.saturating_add(1),
             ..p
         })
     };
@@ -494,16 +490,11 @@ mod tests
     }
 
     #[test]
-    fn create_without_a_slot_or_with_a_spent_parent_count_changes_nothing()
+    fn create_without_a_slot_changes_nothing()
     {
         let mut a = arena();
         let top = create(&mut a, NodeSpec::TOP).unwrap();
-        let mut b = node(&a, top).unwrap();
-        b.refs = u32::MAX;
-        a.set_node(top, Node::Budget(b));
-        assert_eq!(create(&mut a, under(top, NO_MAX)), Err(NodeError::Refs));
-        b.refs = 1;
-        a.set_node(top, Node::Budget(b));
+        let b = node(&a, top).unwrap();
         while a.alloc(Node::Free, NODE_NULL).is_some()
         {}
         assert_eq!(create(&mut a, under(top, NO_MAX)), Err(NodeError::NoSlot));

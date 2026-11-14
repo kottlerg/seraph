@@ -141,6 +141,13 @@ There is no fixed ceiling on `returned_cap_count` other than the IPC
 reply-side cap-slot limit (see [`docs/ipc-design.md`](../../../docs/ipc-design.md)).
 Best-effort replies may use the full reply-side capacity.
 
+memmgr admits the whole of `want_pages` against the caller's budget node
+before it selects a run, and charges the node each page it grants
+([`memory-pool.md`](memory-pool.md) § Distribution policy). A request over
+the max of the node or of an ancestor fails `LIMIT`, whatever part of it
+the pool could serve; one that would leave fewer free pages than the system
+reserve, from a caller outside it, fails as exhaustion, with code 1 or 2.
+
 **Reply (error):**
 
 | Field | Value |
@@ -152,10 +159,11 @@ Best-effort replies may use the full reply-side capacity.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies |
-| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, or deriving the caller's copy failed |
+| 1 | `OUT_OF_MEMORY_CONTIGUOUS` | `REQUIRE_CONTIGUOUS` set; no run satisfies, or the grant would take the system reserve from a caller outside it |
+| 2 | `OUT_OF_MEMORY_BEST_EFFORT` | Best-effort: the pool's free pages do not cover `want_pages`, no run could be taken, the grant would take the system reserve from a caller outside it, or deriving the caller's copy failed |
 | 3 | `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted), memmgr could not map a selected run to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or the caller's region-id sequence is spent (unreachable: 2^64 − 1 grants) |
 | 4 | `INVALID_ARGUMENT` | `want_pages == 0`, `flags` reserved bits set, or badge unknown |
+| 8 | `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max |
 
 ### Label 2: `RELEASE_MEMORY_CAPS`
 
@@ -220,8 +228,8 @@ rechecks. See [`memory-pool.md`](memory-pool.md) §"Reclamation".
 ### Label 3: `REGISTER_PROCESS`
 
 Procmgr informs memmgr of a new process. Memmgr allocates a per-process
-tracking entry and returns a badged SEND cap on memmgr's endpoint
-that procmgr will install in the new process's
+tracking entry and the process's budget node, and returns a badged SEND cap
+on memmgr's endpoint that procmgr will install in the new process's
 `ProcessInfo.memmgr_endpoint_cap`. Privilege: procmgr-only.
 
 **Request:**
@@ -230,7 +238,18 @@ that procmgr will install in the new process's
 |---|---|
 | label | 3 |
 | data[0] | Caller's `MEMMGR_LABELS_VERSION` |
-| data[1] | Flags: bit 0 `REGISTER_PHYS_CLASS` registers the process phys-class; other bits reserved, zero |
+| data[1] | Flags: bit 0 `REGISTER_PHYS_CLASS` registers the process phys-class; bit 1 `REGISTER_RESERVE` makes its budget node a reserve node; bit 2 `REGISTER_MAX` gives the node the max in `data[3]`; other bits reserved, zero |
+| data[2] | Memmgr-side badge of the process whose budget node is the new node's parent, or 0 for a top-level node |
+| data[3] | With `REGISTER_MAX`: the node's max in pages; ignored otherwise |
+
+The budget node ([`memory-pool.md`](memory-pool.md) § Distribution policy)
+is created under the node of the process `data[2]` names. memmgr clamps a
+max to what the parent and every ancestor have left, so a node never asks
+for more than its chain can grant, and replies with the max the node took.
+Without `REGISTER_MAX` the node has no max, and only its ancestors and the
+system reserve limit it. memmgr refuses a reserve node under a parent outside
+the reserve; whether a creator may ask for a reserve child, and what max it
+asks, is procmgr's to check before it registers.
 
 The badge of the requesting endpoint identifies procmgr; memmgr verifies
 this and rejects the call otherwise. memmgr mints a fresh badge for the
@@ -253,6 +272,7 @@ own grants lack the right.
 |---|---|
 | label | 0 (success) |
 | data[0] | Memmgr-side process badge (procmgr forwards this in `PROCESS_DIED`) |
+| data[1] | The max the budget node took, in pages, after the clamp; `u64::MAX` for none |
 | cap[0] | Badged SEND cap on memmgr's endpoint, identifying the new process |
 
 The badge is also encoded in the returned cap, but userspace currently
@@ -270,9 +290,9 @@ the eventual `PROCESS_DIED`.
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_ARGUMENT` | Reserved `data[1]` flag bits set |
+| 4 | `INVALID_ARGUMENT` | Reserved `data[1]` flag bits set; `data[2]` names no process, or memmgr's or init's own boot record; or `REGISTER_RESERVE` under a parent outside the reserve |
 | 5 | `UNAUTHORIZED` | Caller is not procmgr |
-| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry (its record node could not be allocated: system RAM exhausted), the badge draw failed, or the reply cap could not be derived |
+| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry (its record node or its budget node could not be allocated: system RAM exhausted), the badge draw failed, or the reply cap could not be derived |
 | 7 | `LABEL_VERSION_MISMATCH` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
 
 ### Label 4: `PROCESS_DIED`
@@ -540,6 +560,36 @@ pool as on `PROCESS_DIED`, so the all-RAM-accounted identity is unaffected.
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | Unknown badge, or no region matches `[va_base, len)` exactly |
 
+### Label 10: `QUERY_MEMORY_USAGE`
+
+Read-only query of the caller's own budget node
+([`memory-pool.md`](memory-pool.md) § Distribution policy). Privilege:
+universal — attributed to the caller by `recv.badge`; it reads no other
+process's node, carries no caps and changes no state.
+
+**Request:** label 10, no words, no caps.
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | `own_pages` — pages charged to the caller's node |
+| data[1] | `max_pages` — the node's max, `u64::MAX` for none |
+| data[2] | `subtree_pages` — pages charged to the node and to every node below it |
+
+The charge counts each grant, demand chunk and page-table donation memmgr
+accounts to the caller, and each such run held on the deferred list after the
+caller released it, until the run rejoins the free pool. A max below
+`subtree_pages` is not an error: a lowered max refuses new charges until the
+usage falls below it.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | Unknown badge |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page
@@ -571,7 +621,8 @@ to the process, and maps the chunk again, at most four times
 fault in a region does not depend on the process having funded the pool beforehand. A non-VM
 fault replies `FAULT_REPLY_KILL`, and every other case — unknown process, address outside every
 region, a write to a region without `MAP_WRITABLE` or an instruction fetch from one
-without `MAP_EXECUTABLE` (which no backing satisfies), no delegated AS, or any allocation/map
+without `MAP_EXECUTABLE` (which no backing satisfies), no delegated AS, a charge over the max of
+the process's budget node or an ancestor, or any allocation/map
 failure — replies `FAULT_REPLY_FORWARD`; each carries data word 0 the decline reason: the code below
 in its low 32 bits, and in its high 32 the magnitude of the failed syscall's error for code 9, else
 zero. The kernel hands the fault to the thread's exception handler, the crash endpoint procmgr
@@ -590,16 +641,19 @@ forwards to.
 | 4 | The region's protection refuses the access |
 | 5 | No delegated address space |
 | 6 | The metadata arena cannot grow for the slots recording the run takes: its descriptor, and the chunk's path in the region's chunk table |
-| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, or the split of a run larger than the span to back failed |
+| 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page is in the system reserve and the process's budget node is outside it, or the split of a run larger than the span to back failed |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
+| 10 | The span to back, or the page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted
 identity is unaffected (the pages move from a free run to the chunk table;
 they were already owned). The runs memmgr donates to the process's page-table
 pool are recorded on the process record, like a grant, and reclaimed by
-`PROCESS_DIED` only.
+`PROCESS_DIED` only. Both are charged to the process's budget node: memmgr
+admits the whole span before it selects the run, and each donation before it
+makes it.
 
 ---
 

@@ -401,6 +401,12 @@ memmgr serves frame requests over IPC. The contract:
   pool's free pages cover it, the reply is a **partial grant**: success with
   fewer pages than asked. When the free pages do not cover `want_pages`, the
   request fails with `memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT`.
+- **Budget refusal.** Either shape fails with `memmgr_errors::LIMIT`, before
+  any run is taken, when `want_pages` would take the subtree of the caller's
+  budget node, or of an ancestor, over its max
+  ([services/memmgr/docs/memory-pool.md](../services/memmgr/docs/memory-pool.md)
+  § Distribution policy). The RAM may exist; the caller's budget refuses it,
+  and only a release or a raised max lets a repeat succeed.
 - **Caller loops.** A best-effort caller MUST compare the granted page total
   with `want_pages` and request the remainder again (or release what it
   cannot use); a single reply is not guaranteed to cover the request.

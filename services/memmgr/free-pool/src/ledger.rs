@@ -154,8 +154,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// node made for `spec` ([`budget::create`]).
     ///
     /// # Errors
-    /// [`NodeError::Parent`] or [`NodeError::Refs`] for a parent the node
-    /// cannot take; [`NodeError::NoSlot`] when the arena has fewer than the
+    /// [`NodeError::Parent`] for a parent the node cannot take; [`NodeError::NoSlot`] when the arena has fewer than the
     /// two free slots outside its reserve the record and its node take, or the
     /// index has no bucket storage. Nothing is left allocated then.
     pub fn insert_process(&mut self, badge: u64, spec: NodeSpec) -> Result<NodeIdx, NodeError>

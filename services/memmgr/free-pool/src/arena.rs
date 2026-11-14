@@ -433,6 +433,19 @@ mod tests
     use super::test_store::VecStore;
     use super::*;
 
+    /// The slot geometry docs/limits.md § memmgr states: the process record
+    /// is the largest payload, and the slot is 64 bytes, 64 to a page.
+    #[test]
+    fn a_slot_is_64_bytes_and_the_process_record_its_largest_payload()
+    {
+        assert_eq!(size_of::<ProcessRecord>(), 48);
+        assert!(size_of::<BudgetNode>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<DeferredRun>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<FrameDesc>() <= size_of::<ProcessRecord>());
+        assert_eq!(SLOT_SIZE, 64);
+        assert_eq!(SLOTS_PER_PAGE, 64);
+    }
+
     #[test]
     fn alloc_fails_until_a_page_is_carved_then_reuses_freed_slots()
     {

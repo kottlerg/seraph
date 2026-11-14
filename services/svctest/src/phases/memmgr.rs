@@ -37,6 +37,10 @@ pub fn phases() -> &'static [Phase]
             run: stray_cap_flood_phase,
         },
         Phase {
+            name: "memmgr_memory_usage",
+            run: memory_usage_phase,
+        },
+        Phase {
             name: "grant_retyped_unmappable",
             run: grant_retyped_unmappable_phase,
         },
@@ -304,6 +308,54 @@ pub(crate) fn pool_free_and_largest() -> (u64, u64)
     (reply.word(3), reply.word(5))
 }
 
+/// svctest's own budget usage from memmgr's `QUERY_MEMORY_USAGE`, in pages:
+/// `(own, max, subtree)`.
+fn memory_usage() -> (u64, u64, u64)
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_MEMORY_USAGE).build();
+    let reply = memmgr_call(&req, "QUERY_MEMORY_USAGE");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_MEMORY_USAGE status"
+    );
+    (reply.word(0), reply.word(1), reply.word(2))
+}
+
+/// Pages of the grant [`memory_usage_phase`] takes and releases.
+const USAGE_GRANT_PAGES: u32 = 3;
+
+/// memmgr charges a grant to svctest's budget node and uncharges its release:
+/// a contiguous grant of [`USAGE_GRANT_PAGES`] raises the pages
+/// `QUERY_MEMORY_USAGE` reports by that count, and its release lowers them
+/// back. svctest's node has no max (procmgr asks none), and its subtree holds
+/// at least its own pages. Nothing between the queries allocates or touches
+/// new stack, so no demand fault charges a page meanwhile; svctest deletes the
+/// grant cap before the release, so memmgr pools the run at once rather than
+/// deferring it charged.
+pub fn memory_usage_phase(_: &Caps)
+{
+    let (own, max, subtree) = memory_usage();
+    assert_eq!(max, u64::MAX, "svctest's budget node has a max");
+    assert!(
+        subtree >= own,
+        "subtree usage {subtree} below own usage {own}"
+    );
+    let (grant, region_id) = try_request_contiguous(USAGE_GRANT_PAGES)
+        .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
+    let (granted, _, _) = memory_usage();
+    release_grant(grant, region_id);
+    let (released, _, _) = memory_usage();
+    assert_eq!(
+        granted,
+        own.checked_add(u64::from(USAGE_GRANT_PAGES))
+            .expect("usage overflowed"),
+        "usage after a {USAGE_GRANT_PAGES}-page grant (before {own})"
+    );
+    assert_eq!(released, own, "usage after the grant's release");
+    std::os::seraph::log!("memory usage {own} -> {granted} -> {released} pages, no max");
+}
+
 /// A `DONATE_MEMORY_CAPS` from a client other than procmgr is refused with
 /// `UNAUTHORIZED`. The donated cap is a derivation of a one-page grant svctest
 /// still holds, the aliasing donation the gate exists to stop: memmgr would
@@ -472,7 +524,7 @@ struct StrayCapCase
 /// from a caller that is not procmgr, a forged `FAULT_LABEL`, and an unknown
 /// label. Each request is refused or has no lasting effect, so the flood
 /// changes no memmgr state but its `CSpace`.
-const STRAY_CAP_CASES: [StrayCapCase; 11] = [
+const STRAY_CAP_CASES: [StrayCapCase; 12] = [
     // want_pages == 0.
     StrayCapCase {
         label: ipc::memmgr_labels::REQUEST_MEMORY_CAPS,
@@ -508,6 +560,12 @@ const STRAY_CAP_CASES: [StrayCapCase; 11] = [
     },
     StrayCapCase {
         label: ipc::memmgr_labels::QUERY_POOL_STATUS,
+        words: [0, 0, 0],
+        kept: 0,
+        expected: ipc::memmgr_errors::SUCCESS,
+    },
+    StrayCapCase {
+        label: ipc::memmgr_labels::QUERY_MEMORY_USAGE,
         words: [0, 0, 0],
         kept: 0,
         expected: ipc::memmgr_errors::SUCCESS,

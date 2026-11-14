@@ -142,6 +142,13 @@ pub enum CliCommand
     /// with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md).
     TestWedge(TestWedgeArgs),
 
+    /// Check the x86-64 kernel's CET supervisor shadow stacks on a host
+    /// whose CPU has them, under KVM, failing on any other: boot the current
+    /// sysroot's ktest bundle on shadow stacks to its pass marker, then boot
+    /// it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return
+    /// address, and check the `#CP` it raises (see xtask/README.md).
+    TestCet(TestCetArgs),
+
     /// Capture the ACPI tables of one QEMU configuration into the `shared/aml`
     /// fixtures: boot the firmware alone on a blank disk, save the guest's
     /// memory over QMP once the firmware has installed its tables, find the
@@ -252,6 +259,7 @@ impl CliCommand
             | Self::TestDebugPort(_)
             | Self::TestGdb(_)
             | Self::TestWedge(_)
+            | Self::TestCet(_)
             | Self::CaptureAcpi(_)
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
@@ -770,6 +778,25 @@ pub struct TestWedgeArgs
     pub arch: Arch,
 
     /// Number of vCPUs to expose to the guest (QEMU -smp); at least 2.
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
+}
+
+// ── TestCet ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestCetArgs
+{
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
     #[arg(long, default_value = "4")]
     pub cpus: u32,
 

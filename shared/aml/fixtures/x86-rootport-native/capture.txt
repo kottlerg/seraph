@@ -1,0 +1,11 @@
+ACPI tables of a QEMU guest, written by `cargo xtask capture-acpi --config x86-rootport-native`.
+Regenerate them with that command; do not edit them.
+
+QEMU: QEMU emulator version 11.1.3
+Firmware: OVMF_CODE.4m.fd
+QEMU arguments: -m 512M -smp 4 -drive if=none,id=hd0,format=raw,file=<disk> -device virtio-blk-pci,drive=hd0,disable-legacy=on,iommu_platform=on,logical_block_size=512,physical_block_size=512 -device virtio-keyboard-pci,disable-legacy=on,id=kbd0,iommu_platform=on -device virtio-rng-pci -serial stdio -no-reboot -qmp unix:<qmp-socket>,server,nowait -machine q35,kernel-irqchip=split -device intel-iommu,intremap=on,eim=on -device edu,dma_mask=0xffffffff -device pci-testdev,addr=0x15 -device pci-testdev,addr=0x16 -device pci-testdev,addr=0x17,membar=4K -device pci-testdev,addr=0x18,membar=8K -device vmgenid,guid=auto -enable-kvm -cpu host,la57=off -drive if=pflash,format=raw,readonly=on,file=<firmware-code> -display none -vga none -device pcie-root-port,id=rp0,chassis=1,addr=0x1c -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off
+
+Root table entries: FACP APIC SSDT HPET MCFG DMAR WAET
+Files:
+  DSDT.aml (8369 bytes)
+  SSDT1.aml (202 bytes)

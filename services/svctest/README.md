@@ -40,7 +40,8 @@ services/svctest/
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
-        │                      # death queues; logd death forward; init reap
+        │                      # large-module create; death queues; logd death
+        │                      # forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
         ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`

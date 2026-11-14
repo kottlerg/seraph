@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// xtask/src/symbolize.rs
+// xtask/src/symbolize/mod.rs
 
 //! ELF address symbolization: an address in a loaded image, less the image's
 //! load bias, resolved to function, file, and line from the image's DWARF, or
@@ -9,11 +9,12 @@
 //! the address.
 //!
 //! The DWARF reader is the `addr2line` crate over sections the `object` crate
-//! parses, so no host tool is involved. A compressed debug section is refused,
-//! since the reader is built without decompression; rustc writes its DWARF
-//! uncompressed unless asked otherwise.
-
-use std::borrow::Cow;
+//! parses: the copies the pinned toolchain's sysroot ships for std's
+//! backtraces, reached under `rustc_private` (`main.rs`), so no host tool and
+//! no registry crate is involved. std builds them without demangling or
+//! decompression: Rust names are demangled here with the sysroot's
+//! `rustc_demangle`, and a compressed debug section is refused; rustc writes
+//! its DWARF uncompressed unless asked otherwise.
 
 use addr2line::gimli::{self, EndianSlice, RunTimeEndian};
 use anyhow::{Context as _, Result, bail};
@@ -187,12 +188,22 @@ fn function_symbols(file: &object::File<'_>) -> Vec<FunctionSymbol>
             Some(FunctionSymbol {
                 address: sym.address(),
                 size: sym.size(),
-                name: addr2line::demangle_auto(Cow::Borrowed(name), None).into_owned(),
+                name: demangle(name),
             })
         })
         .collect();
     symbols.sort_by_key(|sym| sym.address);
     symbols
+}
+
+/// `name` demangled when it is a Rust symbol name, else as it is.
+pub fn demangle(name: &str) -> String
+{
+    match rustc_demangle::try_demangle(name)
+    {
+        Ok(demangled) => format!("{demangled:#}"),
+        Err(_) => name.to_owned(),
+    }
 }
 
 /// The DWARF frames covering `vaddr`, innermost first; empty when no unit
@@ -205,7 +216,7 @@ fn dwarf_frames(dwarf: &DwarfContext<'_>, vaddr: u64) -> Result<Vec<Frame>>
     {
         let function = match &frame.function
         {
-            Some(name) => Some(name.demangle()?.into_owned()),
+            Some(name) => Some(demangle(&name.raw_name()?)),
             None => None,
         };
         let (file, line, column) = match &frame.location
@@ -265,7 +276,7 @@ fn is_executable_elf(flags: SegmentFlags) -> bool
 {
     match flags
     {
-        SegmentFlags::Elf { p_flags, .. } => p_flags.contains(object::elf::PF_X),
+        SegmentFlags::Elf { p_flags } => p_flags & object::elf::PF_X != 0,
         _ => false,
     }
 }
@@ -381,279 +392,8 @@ pub fn parse_hex(text: &str) -> Result<u64>
     u64::from_str_radix(digits, 16).with_context(|| format!("not a hex address: {text:?}"))
 }
 
-/// ELF fixtures with a known symbol table and DWARF, written in-test, for
-/// this module's tests and the crash-log tests.
 #[cfg(test)]
-pub(crate) mod fixture
-{
-    use ::gimli::write::{
-        Address, AttributeValue, DwarfUnit, EndianVec, FileId, LineProgram, LineString, Sections,
-        Unit, UnitEntryId,
-    };
-    use ::gimli::{Encoding, Format, LineEncoding, LittleEndian, constants};
-    pub(crate) use object::Architecture;
-    use object::write::{Object, StandardSection, Symbol, SymbolSection};
-    use object::{BinaryFormat, Endianness, SectionFlags, SectionKind, SymbolFlags, SymbolScope};
-
-    use super::SymbolKind;
-
-    /// Link address of the fixture's functions' base for a user PIE.
-    pub(crate) const USER_BASE: u64 = 0;
-    /// Link address of the fixture's functions' base for a kernel image.
-    pub(crate) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
-
-    // The fixture's layout, as offsets from its base: `outer` at 0x100..0x140,
-    // with `inner` inlined into it at 0x110..0x120 from a call on line 11;
-    // `anon` at 0x180..0x1c0, an unnamed DWARF function with no line rows;
-    // `leaf` at 0x200..0x220 and `tail` at 0x280 with no size, in the symbol
-    // table only. The compile unit spans 0x100..0x1c0.
-    pub(crate) const OUTER: u64 = 0x100;
-    pub(crate) const INNER: u64 = 0x110;
-    pub(super) const ANON: u64 = 0x180;
-    pub(crate) const LEAF: u64 = 0x200;
-    pub(super) const TAIL: u64 = 0x280;
-    pub(super) const OUTER_MANGLED: &str = "_ZN7fixture5outer17h0123456789abcdefE";
-    pub(super) const SYMBOLS: [(&str, u64, u64); 4] = [
-        (OUTER_MANGLED, OUTER, 0x40),
-        ("_ZN7fixture4anon17h0123456789abcdefE", ANON, 0x40),
-        ("_ZN7fixture4leaf17h0123456789abcdefE", LEAF, 0x20),
-        ("_ZN7fixture4tail17h0123456789abcdefE", TAIL, 0),
-    ];
-
-    /// Which sections the fixture image carries.
-    #[derive(Clone, Copy, PartialEq)]
-    pub(crate) enum Debug
-    {
-        Dwarf,
-        SymbolsOnly,
-    }
-
-    /// The fixture's line program: one sequence over `outer`.
-    pub(super) fn fixture_line_program(encoding: Encoding, base: u64) -> (LineProgram, FileId)
-    {
-        let mut program = LineProgram::new(
-            encoding,
-            LineEncoding::default(),
-            LineString::String(b"/src".to_vec()),
-            None,
-            LineString::String(b"fixture.rs".to_vec()),
-            None,
-        );
-        let dir = program.default_directory();
-        let file = program.add_file(LineString::String(b"fixture.rs".to_vec()), dir, None);
-        program.begin_sequence(Some(Address::Constant(base + OUTER)));
-        for (offset, line) in [(0, 10), (INNER - OUTER, 20), (0x20, 12)]
-        {
-            let row = program.row();
-            row.address_offset = offset;
-            row.file = file;
-            row.line = line;
-            program.generate_row();
-        }
-        program.end_sequence(0x40);
-        (program, file)
-    }
-
-    /// Add a DIE of `tag` under `parent` covering `base + start` for `len`
-    /// bytes, with the further attributes `attrs`.
-    pub(super) fn add_ranged_die(
-        unit: &mut Unit,
-        parent: UnitEntryId,
-        tag: constants::DwTag,
-        (start, len): (u64, u64),
-        attrs: Vec<(constants::DwAt, AttributeValue)>,
-    ) -> UnitEntryId
-    {
-        let id = unit.add(parent, tag);
-        let die = unit.get_mut(id);
-        die.set(
-            constants::DW_AT_low_pc,
-            AttributeValue::Address(Address::Constant(start)),
-        );
-        die.set(constants::DW_AT_high_pc, AttributeValue::Udata(len));
-        for (name, value) in attrs
-        {
-            die.set(name, value);
-        }
-        id
-    }
-
-    /// The fixture's DIEs: the unit, `inner`'s abstract instance, `outer`
-    /// with `inner` inlined into it, and the unnamed `anon`.
-    pub(super) fn fixture_dies(unit: &mut Unit, base: u64, file: FileId)
-    {
-        let root = unit.root();
-        let cu = unit.get_mut(root);
-        cu.set(
-            constants::DW_AT_name,
-            AttributeValue::String(b"fixture.rs".to_vec()),
-        );
-        cu.set(
-            constants::DW_AT_comp_dir,
-            AttributeValue::String(b"/src".to_vec()),
-        );
-        cu.set(
-            constants::DW_AT_low_pc,
-            AttributeValue::Address(Address::Constant(base + OUTER)),
-        );
-        cu.set(
-            constants::DW_AT_high_pc,
-            AttributeValue::Udata(ANON + 0x40 - OUTER),
-        );
-
-        let inner = unit.add(root, constants::DW_TAG_subprogram);
-        let die = unit.get_mut(inner);
-        die.set(
-            constants::DW_AT_name,
-            AttributeValue::String(b"inner".to_vec()),
-        );
-        die.set(
-            constants::DW_AT_inline,
-            AttributeValue::Inline(constants::DW_INL_inlined),
-        );
-
-        let outer = add_ranged_die(
-            unit,
-            root,
-            constants::DW_TAG_subprogram,
-            (base + OUTER, 0x40),
-            vec![
-                (
-                    constants::DW_AT_name,
-                    AttributeValue::String(b"outer".to_vec()),
-                ),
-                (
-                    constants::DW_AT_linkage_name,
-                    AttributeValue::String(OUTER_MANGLED.as_bytes().to_vec()),
-                ),
-            ],
-        );
-        add_ranged_die(
-            unit,
-            outer,
-            constants::DW_TAG_inlined_subroutine,
-            (base + INNER, 0x10),
-            vec![
-                (
-                    constants::DW_AT_abstract_origin,
-                    AttributeValue::UnitRef(inner),
-                ),
-                (
-                    constants::DW_AT_call_file,
-                    AttributeValue::FileIndex(Some(file)),
-                ),
-                (constants::DW_AT_call_line, AttributeValue::Udata(11)),
-            ],
-        );
-        add_ranged_die(
-            unit,
-            root,
-            constants::DW_TAG_subprogram,
-            (base + ANON, 0x40),
-            vec![],
-        );
-    }
-
-    /// The fixture's DWARF sections, by name.
-    pub(super) fn fixture_dwarf(base: u64) -> Vec<(&'static str, Vec<u8>)>
-    {
-        let encoding = Encoding {
-            format: Format::Dwarf32,
-            version: 4,
-            address_size: 8,
-        };
-        let mut dwarf = DwarfUnit::new(encoding);
-        let (program, file) = fixture_line_program(encoding, base);
-        dwarf.unit.line_program = program;
-        fixture_dies(&mut dwarf.unit, base, file);
-
-        let mut sections = Sections::new(EndianVec::new(LittleEndian));
-        dwarf.write(&mut sections).expect("write DWARF");
-        let mut out = Vec::new();
-        sections
-            .for_each(|id, data| -> Result<(), ()> {
-                if !data.slice().is_empty()
-                {
-                    out.push((id.name(), data.slice().to_vec()));
-                }
-                Ok(())
-            })
-            .expect("collect DWARF sections");
-        out
-    }
-
-    /// An ELF image of `arch` whose functions sit at link addresses from
-    /// `base`, with [`SYMBOLS`] in its symbol table and `debug` as its debug
-    /// sections: name, contents, and ELF section flags.
-    pub(crate) fn elf(arch: Architecture, base: u64, debug: Vec<(&str, Vec<u8>, u64)>) -> Vec<u8>
-    {
-        let mut obj = Object::new(BinaryFormat::Elf, arch, Endianness::Little);
-        let text = obj.section_id(StandardSection::Text);
-        obj.append_section_data(text, &[0; 0x300], 16);
-        for (name, offset, size) in SYMBOLS
-        {
-            obj.add_symbol(Symbol {
-                name: name.as_bytes().to_vec(),
-                value: base + offset,
-                size,
-                kind: SymbolKind::Text,
-                scope: SymbolScope::Linkage,
-                weak: false,
-                section: SymbolSection::Section(text),
-                flags: SymbolFlags::None,
-            });
-        }
-        for (name, data, sh_flags) in debug
-        {
-            let id = obj.add_section(Vec::new(), name.as_bytes().to_vec(), SectionKind::Debug);
-            obj.append_section_data(id, &data, 1);
-            obj.section_mut(id).flags = SectionFlags::Elf {
-                sh_type: object::elf::SHT_PROGBITS,
-                sh_flags: object::elf::SectionFlags(sh_flags),
-            };
-        }
-        obj.write().expect("write ELF")
-    }
-
-    /// The fixture image: [`elf`] with the DWARF of [`fixture_dwarf`] for
-    /// `Debug::Dwarf`, with no debug sections for `Debug::SymbolsOnly`.
-    pub(crate) fn fixture(arch: Architecture, base: u64, debug: Debug) -> Vec<u8>
-    {
-        let sections = match debug
-        {
-            Debug::Dwarf => fixture_dwarf(base)
-                .into_iter()
-                .map(|(name, data)| (name, data, 0))
-                .collect(),
-            Debug::SymbolsOnly => Vec::new(),
-        };
-        elf(arch, base, sections)
-    }
-
-    /// The fixture's DWARF with section `name`'s contents passed through
-    /// `edit` and its flags set to `sh_flags`.
-    pub(crate) fn fixture_with_section(
-        name: &str,
-        sh_flags: u64,
-        edit: impl Fn(Vec<u8>) -> Vec<u8>,
-    ) -> Vec<u8>
-    {
-        let sections = fixture_dwarf(USER_BASE)
-            .into_iter()
-            .map(|(id, data)| {
-                if id == name
-                {
-                    (id, edit(data), sh_flags)
-                }
-                else
-                {
-                    (id, data, 0)
-                }
-            })
-            .collect();
-        elf(Architecture::X86_64, USER_BASE, sections)
-    }
-}
+pub(crate) mod fixture;
 
 #[cfg(test)]
 mod tests
@@ -768,15 +508,19 @@ mod tests
     {
         // An ELF compression header (`Elf64_Chdr`: ch_type ELFCOMPRESS_ZLIB,
         // reserved, ch_size, ch_addralign) ahead of the section's bytes.
-        let image = fixture_with_section(".debug_info", object::elf::SHF_COMPRESSED.0, |data| {
-            let mut out = Vec::new();
-            out.extend_from_slice(&object::elf::ELFCOMPRESS_ZLIB.0.to_le_bytes());
-            out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&(data.len() as u64).to_le_bytes());
-            out.extend_from_slice(&1u64.to_le_bytes());
-            out.extend_from_slice(&data);
-            out
-        });
+        let image = fixture_with_section(
+            ".debug_info",
+            u64::from(object::elf::SHF_COMPRESSED),
+            |data| {
+                let mut out = Vec::new();
+                out.extend_from_slice(&object::elf::ELFCOMPRESS_ZLIB.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+                out.extend_from_slice(&1u64.to_le_bytes());
+                out.extend_from_slice(&data);
+                out
+            },
+        );
         let err = Symbolizer::new(&image)
             .err()
             .expect("compressed section accepted");

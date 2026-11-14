@@ -481,7 +481,7 @@ fn image_spans(data: &[u8]) -> Result<Image>
         {
             continue;
         };
-        let name = addr2line::demangle_auto(std::borrow::Cow::Borrowed(raw), None);
+        let name = crate::symbolize::demangle(raw);
         let span = Span {
             start: sym.address(),
             end: sym.address().saturating_add(sym.size()),
@@ -718,6 +718,14 @@ terminal: READY for injection";
             "kernel::sched::helper"
         );
         assert_eq!(function_path("a::hxyz"), "a::hxyz");
+    }
+
+    #[test]
+    fn a_mangled_symbol_is_matched_by_its_path()
+    {
+        let name =
+            crate::symbolize::demangle("_ZN6kernel4arch6x86_643cpu9halt_loop17h0123456789abcdefE");
+        assert!(function_path(&name).ends_with("::cpu::halt_loop"), "{name}");
     }
 
     fn image() -> Image

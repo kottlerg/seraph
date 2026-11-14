@@ -3,7 +3,8 @@
 
 // core/kernel/src/arch/x86_64/speculation.rs
 
-//! x86-64 speculation-safe bound primitives.
+//! x86-64 speculation-safe bound primitives, and the boot-time enumeration of
+//! the CPU's transient-execution vulnerabilities.
 //!
 //! [`hide`] gives a copy of a value the compiler cannot relate to the
 //! original. [`index_mask`] turns a bounds comparison into data, so a load that a
@@ -12,6 +13,23 @@
 //! on the two are in `crate::arch::nospec`; the rule they serve is
 //! docs/capability-model.md § Capability Spaces, and the mechanism is
 //! core/kernel/docs/capability-internals.md § Speculative-Execution Hardening.
+//! [`enumerate_vulnerabilities`] derives and logs the vulnerability table of
+//! core/kernel/docs/transient-execution.md, through `super::vulnerability`.
+
+/// Read the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`, derive its
+/// vulnerability table, and log the inputs and the table on the serial
+/// console. Called once on the BSP in Phase 1, after `cpu::verify_baseline`.
+#[cfg(not(test))]
+pub fn enumerate_vulnerabilities()
+{
+    let cpu = super::vulnerability::enumerate();
+    let table = super::vulnerability::derive(&cpu);
+    super::vulnerability::report(&cpu, &table);
+}
+
+/// No-op test stub.
+#[cfg(test)]
+pub fn enumerate_vulnerabilities() {}
 
 /// All-ones when `index < bound`, zero otherwise, computed without a branch.
 ///

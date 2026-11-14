@@ -31,6 +31,7 @@ xtask/
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
+│   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
@@ -41,7 +42,7 @@ xtask/
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, compare_images, test_crash_report, test_debug_port,
-│   │                           #   test_gdb, test_kaslr, test_log_level, test_map_redo,
+│   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
 │   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -819,6 +820,39 @@ on a report line that is missing or wrong.
 
 ---
 
+### `cargo xtask test-cet`
+
+Check the kernel's CET supervisor shadow stacks, x86_64 only
+([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks). Boots the
+current sysroot headless twice under KVM with `-cpu host,cet-ss=on,enforce`: the first runs ktest
+to its pass marker and requires the kernel's `shadow stacks: on` line before it; the second, with
+QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoint at
+`syscall::dispatch` once ktest has started, overwrites the return address at the stopped CPU's
+stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an
+address inside `dispatch`, trying up to five calls.
+
+A pure runner; the sysroot must hold the composed ktest bundle, and it reads the kernel's symbols
+from the sysroot's kernel image:
+
+```sh
+cargo xtask build --arch x86_64
+cargo xtask compose-bundle --harness ktest
+cargo xtask test-cet [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+Each boot is bounded by five minutes and each gdbstub reply by 30 s. The command fails, killing
+QEMU, on any of those bounds, on a gdbstub it cannot reach, and on a missing or wrong line. It
+fails before the boots without KVM, and QEMU refuses to start, which fails it naming the refused
+feature, when the host's CPU or KVM cannot give the guest CET shadow stacks: it never passes
+without running them.
+
+---
+
 ### `cargo xtask test-vmgenid`
 
 Boot the VMGENID snapshot-resume test (#395), x86_64 only — QEMU's riscv64
@@ -1498,8 +1532,8 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
 `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-kaslr`, `test-map-redo`,
-`test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`, `test-kaslr`,
+`test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

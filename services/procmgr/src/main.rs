@@ -253,9 +253,9 @@ const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
 /// retype slab: `SystemInfoType::ThreadRetypeBytes` in pages (guard page,
-/// kernel stack, wrapper/TCB, extended-state save area, which the boot CPU sizes), all
-/// consumed by the kernel. Queried once and cached; `None` if the query
-/// fails, which fails the spawn.
+/// kernel stack, wrapper/TCB, extended-state save area, which the boot CPU sizes, and
+/// with shadow stacks on a shadow-stack page), all consumed by the kernel. Queried once
+/// and cached; `None` if the query fails, which fails the spawn.
 pub(crate) fn thread_retype_pages() -> Option<u64>
 {
     use std::sync::atomic::{AtomicU64, Ordering};

@@ -1575,7 +1575,8 @@ pub enum SystemInfoType
     StackHighWater = 9,
     /// Raw retype debit of one `Thread`, in bytes: one guard page, the kernel
     /// stack, one page holding the object wrapper and the thread control
-    /// block, and the extended-state (FPU, SIMD, vector) save area, all
+    /// block, the extended-state (FPU, SIMD, vector) save area, and, when the
+    /// kernel runs on shadow stacks, the thread's shadow-stack page, all
     /// page-granular. The guard page is the caller's memory and unusable
     /// while the thread exists: the kernel unmaps it below the stack so an
     /// overflow faults. The save area's size is the boot CPU's (on x86-64 the

@@ -159,12 +159,14 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
 `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny phases, which require an
-`UNAUTHORIZED` reply to `QUERY_DEVICE` and `MINT_CLASS_SEND` (on `caps[2]` and `caps[3]`, neither of
+`UNAUTHORIZED` reply to `QUERY_DEVICE`, `WATCH_CLASS`, and `MINT_CLASS_SEND` (on `caps[2]` and
+`caps[3]`, neither of
 whose badges carries a class slot), `QUERY_SHUTDOWN_DEVICE`, and `BIND_DRIVERS`. `caps[3]` carries
 `REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY` as a `SEND|GRANT`, since `BIND_DRIVERS` moves a cap to
 devmgr; it is the one seed that arrives with GRANT, and the on-demand-bind phase sends
 `BIND_DRIVERS` on it. `caps[7]` and `caps[8]` are the `serial` and `input` class SENDs. The
-input-ordinal phase requires a cap from `QUERY_DEVICE`
+input-ordinal phase waits on a `WATCH_CLASS` watch (bounded by `DEVICE_WAIT_MS`) until devmgr
+serves an input driver, then requires a cap from `QUERY_DEVICE`
 on `caps[8]` at instance ordinal 0 (sent and absent) and `NO_DEVICE` past the one keyboard of every
 boot's device set. The drivers stray-cap phase takes granted SENDs on the serial and input drivers'
 endpoints through `caps[7]` and `caps[8]` (`QUERY_DEVICE`) and floods each driver with calls
@@ -256,7 +258,8 @@ attached and watched, unbinds svctest's bindings and leaves no watch to bind it 
 unbind a debugger's binding from a thread of its own whose registration it refuses, svctest having
 declared itself undebuggable; then gives the endpoint back and sees a second child declined by
 procmgr). The
-devmgr on-demand-bind phase sends `BIND_DRIVERS` on `caps[3]` over `/tests/drivers/`, which no
+devmgr on-demand-bind phase registers a `WATCH_CLASS` watch on `caps[10]`, then sends
+`BIND_DRIVERS` on `caps[3]` over `/tests/drivers/`, which no
 drivers-directory pass at boot reads, so devmgr binds the
 [`test-fault`](../drivers/test-fault/README.md) driver to the QEMU `pci-testdev` functions that
 `--test-devices` attaches, one instance each. The
@@ -264,8 +267,12 @@ phase asks `caps[10]` for the fixtures: the two serving instances hold instance 
 and ordinal 2 answers `NO_DEVICE`; `FAULT_EXIT` on ordinal 0 makes the next query on it answer
 `WITHDRAWN`; the free pool then returns to its size before the bind, so the instance that never
 reports ready and the instance that fails its bootstrap's terminal round were destroyed; and a
-second `BIND_DRIVERS` over the directory binds nothing. The DMA confinement phase polls
-`QUERY_DEVICE` on `caps[9]` (10 ms apart, `INPUT_ATTEMPTS` times) until devmgr serves the
+second `BIND_DRIVERS` over the directory binds nothing. The watch, registered at ordinal count 0, is
+signalled when the bind serves the fixtures and again when `FAULT_EXIT` withdraws ordinal 0. With
+that watch held, the phase fills the class to `MAX_CLASS_WATCHERS` (8): the next registration is
+refused `WATCHERS_FULL`, and once it deletes one watch a new registration is admitted. The DMA
+confinement phase waits on a `WATCH_CLASS` watch on `caps[9]` (bounded by `DEVICE_WAIT_MS`) until
+devmgr serves the
 [`test-dma`](../drivers/test-dma/README.md) fixture, which devmgr binds to QEMU's `edu` device
 (attached by `--test-devices` on both architectures) by its declaration at `SET_DRIVERS_DIR`,
 and asserts it is served; it then asks the driver to probe: a copy through a mapped

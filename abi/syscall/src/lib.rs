@@ -593,11 +593,15 @@ pub const SYS_IRQ_ROUTE: u64 = 63;
 /// [`RIGHTS_IRQ_MINT`], while no interrupt source exists. See
 /// `core/kernel/docs/syscalls.md` § `SYS_IRQ_REMAP` (64).
 pub const SYS_IRQ_REMAP: u64 = 64;
+/// Entropy: mix a caller-supplied buffer into the kernel entropy pool, through
+/// an `EntropyControl` capability carrying [`RIGHTS_ENTROPY_CONTRIBUTE`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ENTROPY_CONTRIBUTE` (65).
+pub const SYS_ENTROPY_CONTRIBUTE: u64 = 65;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_IRQ_REMAP + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_ENTROPY_CONTRIBUTE + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -618,6 +622,13 @@ pub const IRQ_REMAP_ON_EXTENDED: u64 = 2;
 /// draws under disabled interrupts); userspace loops for larger buffers. The
 /// value mirrors the BSD `getentropy(2)` cap.
 pub const MAX_GETRANDOM_LEN: usize = 256;
+
+/// Maximum bytes a single `SYS_ENTROPY_CONTRIBUTE` call may mix into the pool.
+///
+/// Bounds the kernel stack copy and the time the call holds the pool lock,
+/// which is taken with interrupts disabled; a contributor loops for larger
+/// buffers.
+pub const MAX_ENTROPY_CONTRIBUTE_LEN: usize = 256;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -1138,6 +1149,12 @@ pub const RIGHTS_SBI_DBCN: u64 = 1 << 4;
 /// `SbiControl`: may forward the SBI Performance Monitoring Unit (PMU) extension
 /// (RISC-V only).
 pub const RIGHTS_SBI_PMU: u64 = 1 << 5;
+
+// EntropyControl ──
+
+/// `EntropyControl`: may mix bytes into the kernel entropy pool with
+/// [`SYS_ENTROPY_CONTRIBUTE`].
+pub const RIGHTS_ENTROPY_CONTRIBUTE: u64 = 1 << 0;
 
 // ABI promise: the MAP_WRITABLE / MAP_EXECUTABLE rustdoc above states that
 // prot bits coincide with the Memory rights bit positions. Nothing decodes
@@ -1774,6 +1791,8 @@ mod tests
                 RIGHTS_SBI_DBCN,
                 RIGHTS_SBI_PMU,
             ],
+            // EntropyControl
+            &[RIGHTS_ENTROPY_CONTRIBUTE],
         ];
 
         for bits in spaces

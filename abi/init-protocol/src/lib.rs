@@ -104,7 +104,12 @@
 ///     init that does not fund fails its later splits with `OutOfMemory`.
 ///     Field layout unchanged; semantic change to what the root `CSpace`
 ///     carries.
-pub const INIT_PROTOCOL_VERSION: u32 = 17;
+/// v18: Added [`CapType::EntropyControl`]: the root `CSpace` carries one
+///     `EntropyControl` capability, on both architectures, named by its
+///     [`CapDescriptor`] alone (no [`InitInfo`] field). Field layout
+///     unchanged; an init built against v17 would read the new descriptor's
+///     type byte as no [`CapType`] at all.
+pub const INIT_PROTOCOL_VERSION: u32 = 18;
 
 /// Length of [`InitModuleName::name`], matching
 /// `boot_protocol::BOOT_MODULE_NAME_LEN` so the kernel copies the bundle
@@ -479,6 +484,9 @@ pub enum CapType
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only). Matches `CapTag::SbiControl = 13`.
     SbiControl = 13,
+    /// Authority to mix bytes into the kernel entropy pool. Matches
+    /// `CapTag::EntropyControl = 14`. `aux0 = aux1 = 0`.
+    EntropyControl = 14,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────

@@ -14,8 +14,9 @@ and `random_u64` draws through `getrandom` and returns `InvalidState` on a short
 untyped entries, `raw_syscall3` and `raw_syscall4`, pass three or four argument registers as
 given, for harness tests of the kernel's argument validation that need register values the
 typed wrappers cannot express;
-`getrandom_raw`, `thread_read_regs_raw`, `thread_write_regs_raw`, `thread_read_mem_raw`, and
-`thread_write_mem_raw` likewise take a raw buffer pointer for the kernel's buffer-validation tests.
+`getrandom_raw`, `entropy_contribute_raw`, `thread_read_regs_raw`, `thread_write_regs_raw`,
+`thread_read_mem_raw`, and `thread_write_mem_raw` likewise take a raw buffer pointer for the
+kernel's buffer-validation tests.
 
 A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object
 occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`,

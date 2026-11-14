@@ -403,6 +403,7 @@ The kernel populates init's CSpace before transferring control (see
 | SBI (RISC-V) | `SbiControl` cap |
 | Firmware tables | Read-only `Memory` caps covering the ACPI RSDP page, each `AcpiReclaimable` region, and the DTB blob |
 | Scheduler | `SchedControl` cap |
+| Entropy | `EntropyControl` cap (`Contribute`) |
 | Boot modules | `Memory` caps for each boot-module image inside `bootstrap.bundle` (procmgr, memmgr, devmgr, vfsd, …) — resolved by name via the `init_protocol` module-name table |
 
 The roots of the hardware and control authority init delegates stay in

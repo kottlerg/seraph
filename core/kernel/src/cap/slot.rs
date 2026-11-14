@@ -155,6 +155,8 @@ pub enum CapTag
     SchedControl = 12,
     /// SBI forwarding authority (RISC-V only).
     SbiControl = 13,
+    /// Authority to mix bytes into the kernel entropy pool.
+    EntropyControl = 14,
 }
 
 // ── Rights ────────────────────────────────────────────────────────────────────
@@ -556,6 +558,19 @@ define_typed_rights! {
     }
 }
 
+define_typed_rights! {
+    /// Rights-space marker for `EntropyControl` capabilities.
+    ///
+    /// One right: `sys_entropy_contribute` requires `CONTRIBUTE` to mix a
+    /// caller's bytes into the entropy pool (docs/capability-model.md
+    /// § `EntropyControl`).
+    EntropyControlCap, EntropyRights, EntropyControl
+    {
+        /// May mix bytes into the kernel entropy pool.
+        CONTRIBUTE = syscall::RIGHTS_ENTROPY_CONTRIBUTE;
+    }
+}
+
 // ── CapabilitySlot ────────────────────────────────────────────────────────────
 
 /// A single capability slot in a `CSpace` page.
@@ -895,6 +910,7 @@ mod tests
         assert_eq!(CapTag::IoPort as u8, CapType::IoPort as u8);
         assert_eq!(CapTag::SchedControl as u8, CapType::SchedControl as u8);
         assert_eq!(CapTag::SbiControl as u8, CapType::SbiControl as u8);
+        assert_eq!(CapTag::EntropyControl as u8, CapType::EntropyControl as u8);
     }
 
     #[test]

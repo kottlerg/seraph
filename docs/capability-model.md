@@ -446,6 +446,27 @@ per-service level assignments live in `shared/ipc`'s `sched_policy` module
 and the svcmgr `.svc` recipes. For priority levels, ranges, and constants, see
 [core/kernel/docs/scheduler.md § Priority Levels](../core/kernel/docs/scheduler.md#priority-levels).
 
+### EntropyControl
+
+A capability authorising the holder to mix bytes into the kernel entropy pool with
+`SYS_ENTROPY_CONTRIBUTE`, on both architectures. Rights:
+- **Contribute** — may mix up to `MAX_ENTROPY_CONTRIBUTE_LEN` (256) bytes per call into the pool
+
+A contribution changes a kernel-managed resource, the pool, so it is authority-bearing and needs
+this capability, where the draw, `SYS_GETRANDOM`, names no object and is ambient. The kernel
+gives contributed bytes no entropy credit and refuses a contribution before the pool is seeded,
+so a holder can only add to the pool, never stand in for the kernel's own sources (see
+[core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Sources and graceful
+degradation).
+
+`EntropyControlObject` carries no fields, and its init descriptor has `aux0 = aux1 = 0`; there is
+no split or merge. The kernel mints the one root cap at boot into init's CSpace, carrying
+**Contribute**, and init finds it by its descriptor's type. `EntropyControl` capabilities are not
+creatable at runtime. Which process holds it after init is userspace policy, set by ordinary
+minimum-privilege distribution; a cap init has not passed on by its reap is released when the
+reap frees init's CSpace, and no process can contribute until the next boot (see
+[process-lifecycle.md § Init reap](process-lifecycle.md#init-reap)).
+
 ---
 
 ## Rights and Attenuation
@@ -880,6 +901,7 @@ The kernel mints these during Phases 7–9 of
 - One root IoPort capability covering the full 64K I/O port space (x86-64 only)
 - One SbiControl capability (RISC-V only) carrying every sanctioned SBI right
 - One SchedControl capability spanning the full userspace priority range `[1, PRIORITY_MAX]`
+- One EntropyControl capability carrying Contribute
 - Thread, AddressSpace, and CSpace capabilities for init itself
 - Memory capabilities for each boot module image (raw ELF images for early services)
 - Reclaimable Memory capabilities, one per `BootInfo.reclaim_ranges` entry (bootloader

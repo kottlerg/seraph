@@ -29,8 +29,7 @@ Each surface is classified as one of:
 - **(a) kernel VA / pointer** — a kernel virtual address, kernel pointer, or value
   derived from one. A leak. **None found** among emitted values; the one hardware surface
   of this class, the descriptor-table registers on an x86-64 CPU without UMIP, is listed
-  below, and kernel state kept in donated memory is a separate surface, below, with one open
-  residual.
+  below, and kernel state kept in donated memory is a separate surface, below.
 - **(b) userspace VA** — an address in the caller's own (or a delegate's) address
   space. The caller already owns it; not a disclosure.
 - **(c) opaque / randomized** — a kernel-minted identifier that is unguessable

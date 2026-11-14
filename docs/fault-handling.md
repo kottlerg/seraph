@@ -898,6 +898,7 @@ svcmgr service definitions carry no paging key; see
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
+[Memory Model](memory-model.md),
 [Platform Requirements](platform-requirements.md), [Process Lifecycle](process-lifecycle.md),
 [Supervision](supervision.md),
 [Testing](testing.md), [Userspace Memory Model](userspace-memory-model.md),

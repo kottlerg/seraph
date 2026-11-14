@@ -254,7 +254,7 @@ returns `GateError::UnknownLabel` for an opcode the table does not list,
 `GateError::WrongKind` for an open-instance badge, or `GateError::PermissionDenied` when the
 badge lacks the requirement. `gate_open(label, badge)` applies the same table to an
 open-instance badge and returns its open id and rights, with `GateError::WrongKind` for a node
-badge. Unbadged service-level labels (`FS_MOUNT`) are dispatched outside both.
+badge. Unbadged service-level labels (`FS_MOUNT`, `FS_UNMOUNT`) are dispatched outside both.
 
 ---
 

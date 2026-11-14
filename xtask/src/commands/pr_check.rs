@@ -56,6 +56,7 @@ pub struct Patterns
     closing_ref: Regex,
     refs_ref: Regex,
     refs_number: Regex,
+    refs_keyword: Regex,
     attribution: Regex,
     planning_label: Regex,
     subject_form: Regex,
@@ -95,6 +96,7 @@ impl Patterns
                 r"(?i)\brefs\s*:?\s*#\d+(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+(?:and[ \t]+)?)#\d+)*",
             )?,
             refs_number: Regex::new(r"#(\d+)")?,
+            refs_keyword: Regex::new(r"(?i)\brefs\b")?,
             attribution: Regex::new(
                 r"(?i)claude\.ai/|claude-session|co-authored-by:\s*claude|generated with \[?claude",
             )?,
@@ -550,6 +552,7 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
         ));
     }
     out.extend(check_body_closing(pat, body));
+    out.extend(check_refs_unread(pat, body));
     if section(body, "## Validation").is_none()
     {
         out.push(Diag::error(
@@ -565,6 +568,46 @@ pub fn check_body(pat: &Patterns, body: &str) -> Vec<Diag>
             "body",
             "the `## Validation` section names no validated head",
         ));
+    }
+    out
+}
+
+/// The `Refs` lines of a PR body that hold an Issue number `refs_refs` does
+/// not read, so that a list is never read in part without a message.
+fn check_refs_unread(pat: &Patterns, body: &str) -> Vec<Diag>
+{
+    let read = refs_refs(pat, body);
+    let mut out = Vec::new();
+    for (index, line) in body.lines().enumerate()
+    {
+        let number = index.saturating_add(1);
+        if !pat.refs_keyword.is_match(line)
+        {
+            continue;
+        }
+        // A `#N` of this repository on a `Refs` line that no list took: the
+        // list ended before it, at text between the numbers.
+        let unread: Vec<String> = pat
+            .issue_ref
+            .captures_iter(line)
+            .filter(|found| found.get(1).is_none() && found.get(3).is_none())
+            .filter_map(|found| found.get(2)?.as_str().parse::<u64>().ok())
+            .filter(|issue| !read.iter().any(|r| r.line == number && r.issue == *issue))
+            .map(|issue| format!("#{issue}"))
+            .collect();
+        if !unread.is_empty()
+        {
+            out.push(Diag::warning(
+                "pr-refs-unread",
+                format!("body:{number}"),
+                format!(
+                    "{} on this `Refs` line is not read as a referenced Issue: a `Refs` list \
+                     ends at anything but a comma, `and`, or spaces; give it its own `Refs`, \
+                     or reword the line",
+                    unread.join(", ")
+                ),
+            ));
+        }
     }
     out
 }
@@ -1938,6 +1981,28 @@ mod tests
         // `Refs` list is the same contradiction as closing a lone one.
         let body = BODY.replace("Refs #11", "Refs #11, #10");
         assert_eq!(rules(&check_body(&p, &body)), ["pr-closes-and-refs"]);
+    }
+
+    #[test]
+    fn a_refs_line_read_in_part_is_reported()
+    {
+        let p = pat();
+        // Text between two numbers ends the list: the second is named.
+        for line in ["Refs #11 (items 2 and 3), #12", "Refs #11; #12"]
+        {
+            let body = BODY.replace("Refs #11", line);
+            let diags = check_body(&p, &body);
+            assert_eq!(rules(&diags), ["pr-refs-unread"], "{line}");
+            assert_eq!(diags[0].at, "body:5");
+            assert!(diags[0].message.contains("#12"), "{}", diags[0].message);
+        }
+        // A list read in full, and another repository's reference, which
+        // `Refs` never reads, pass.
+        for line in ["Refs #11, #12 and #13", "Refs #11, owner/repo#12"]
+        {
+            let body = BODY.replace("Refs #11", line);
+            assert_eq!(check_body(&p, &body), [] as [Diag; 0], "{line}");
+        }
     }
 
     #[test]

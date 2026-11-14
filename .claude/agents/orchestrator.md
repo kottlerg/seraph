@@ -218,9 +218,11 @@ Keep your own reads out of your context the same way:
 An instruction-file merge (one that changes `.claude/`, or a document the agent files cite)
 needs no new session and no relaunch of the batch. An agent's definition is the copy the session
 loaded at its start, and an agent keeps what it has read, so a changed file reaches an agent only
-when it reads the file from disk. After such a merge:
+when it reads the file from disk, as `master` holds it: a worker's worktree sits on a branch that
+may predate the merge, so it reads the file with `git show origin/master:<path>` after
+`git fetch origin`. After such a merge:
 
-- Tell each live worker that reads a changed file to read it again from disk. Respawn it instead
+- Tell each live worker that reads a changed file to read it again that way. Respawn it instead
   (§ Spawn) when the change is to how it works on a PR in flight.
 - Record the changed paths as a ruling (`orch ruling add spawns read from disk: <paths>`), and
   name them in the prompt of every later spawn (§ Spawn): the session's loaded copy of an agent
@@ -233,8 +235,8 @@ when it reads the file from disk. After such a merge:
   read again.
 - Log the merge and what it restarted (`orch log`). The supervisor's session continues.
 
-The release review keeps its own constraint on a changed `release-auditor` or `release-verifier`
-definition (`.claude/skills/orchestrate/release-review.md`).
+The release review keeps its own constraint on a changed `pr-reviewer`, `release-auditor` or
+`release-verifier` definition (`.claude/skills/orchestrate/release-review.md`).
 
 ## Liveness
 
@@ -465,8 +467,11 @@ notifications. Ask for it yourself, in one line, when you are between steps and 
   the maintainer has open and the file that holds it; the rulings in force for the batch. Prune
   what is no longer in force (§ Plan, step 7). Answer `parked` and hand back.
 - Started with "resume from the record": first read from disk each file the start line names
-  (§ Plan, after an instruction-file merge), and follow it where it differs from the copy
-  loaded for you. Read this file's supporting files only as needed, run
+  (§ Plan, after an instruction-file merge), and, once `cargo xtask orch state` has printed the
+  rulings, each path of a `spawns read from disk` ruling that is this file or a supporting file
+  of the `orchestrate` skill, since every later replacement is spawned from the same old copy.
+  Follow each where it differs from the copy loaded for you. Read this file's supporting files
+  only as needed, run
   `cargo xtask orch state`, record your id with `cargo xtask orch orchestrator <id>`, and send
   each live worker one line with your agent id as its
   address from now on. A worker spawned by an earlier orchestrator is still alive and reachable

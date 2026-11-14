@@ -113,7 +113,9 @@ milestone; milestones are assigned to Issues only.
 - A commit or PR description that changes an Issue without closing it (ticking items on a
   follow-up Issue it drains in part) MUST reference it via `Refs #N`, which auto-closes nothing.
   One `Refs` MAY name several Issues as a list on its line (`Refs #N, #M`, or `Refs #N and #M`),
-  and every `#N` of the list is a referenced Issue.
+  and every `#N` of the list is a referenced Issue. The list's numbers are joined by commas,
+  `and`, or spaces alone; anything else between them (a remark, a semicolon, a line break)
+  ends the list, and a number after it needs its own `Refs`.
 - A PR that closes an Issue MUST reference it via `Fixes #N` / `Closes #N` in its description, so
   the merge auto-closes the Issue. Manual `gh issue close` after the fact is a procedural miss,
   not a substitute.

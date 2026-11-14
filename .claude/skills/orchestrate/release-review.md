@@ -8,8 +8,9 @@ workflow call for you: send it the exact call and the paths to save to, and it a
 two verdict lines and the paths. This is the one place where an instruction-file merge needs a
 new session (`.claude/agents/orchestrator.md` § Plan). The workflow's agents resolve from the
 definitions the top session loaded at its start, and the script's prompts do not tell them to
-read their file from disk, so a changed `release-auditor` or `release-verifier` definition needs a
-session started after the change is on the checked-out branch; say so to the maintainer when
+read their file from disk, so a changed `pr-reviewer`, `release-auditor` or `release-verifier`
+definition (the reviewer runs every shard and lens) needs a session started after the change is
+on the checked-out branch; say so to the maintainer when
 the session is older. A changed `.claude/workflows/release-review.js` needs no new session: the
 call passes `scriptPath`, below.
 

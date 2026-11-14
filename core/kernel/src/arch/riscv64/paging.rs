@@ -152,7 +152,7 @@ const EXECUTE: u64 = super::encoding::PTE_EXECUTE;
 /// bit in hardware (Svadu, with `menvcfg.ADUE` set) or raises a page fault
 /// when an access observes A=0 (Svade, the baseline the kernel requires).
 /// Pre-setting it spares a new leaf that fault; a user leaf loses it only to
-/// `SYS_ASPACE_HARVEST` ([`harvest_user_accessed`]), and the fault path sets it
+/// `SYS_ASPACE_HARVEST` ([`clear_user_accessed`]), and the fault path sets it
 /// again ([`user_fault_is_spurious`]).
 const ACCESSED: u64 = 1 << 6;
 /// Dirty — pre-set in writable leaf PTEs (as ACCESSED; the fault path sets it
@@ -1378,24 +1378,17 @@ fn leaf_word(slot: &mut PageTableEntry) -> &AtomicU64
     unsafe { AtomicU64::from_ptr(core::ptr::from_mut(slot).cast::<u64>()) }
 }
 
-/// Clear the accessed bit (A) of every present 4 KiB leaf of
-/// `[virt_base, virt_base + page_count * 4 KiB)` in the page table rooted at
-/// `root_virt`, and pass the VA of each leaf whose A was set to
-/// `on_accessed`, in VA order.
-///
-/// A NAPOT member is demoted first (demote-before-divergence,
-/// [memory-internals.md](../../../docs/memory-internals.md) § NAPOT Contiguity
-/// (RISC-V)), so each page's A is its own. Flushes no TLB: a hart that still
-/// caches the leaf with A set completes accesses without setting it again, so
-/// the next harvest under-reports that page
-/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
+/// Pass the VA of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)`, in the page table rooted at
+/// `root_virt`, whose accessed bit (A) is set to `on_accessed`, in VA order.
+/// Changes no leaf.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
 /// caller must hold the address space's `pt_lock`, and the span must lie in
 /// the user half.
 #[cfg(not(test))]
-pub unsafe fn harvest_user_accessed(
+pub unsafe fn read_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
@@ -1406,7 +1399,44 @@ pub unsafe fn harvest_user_accessed(
     // held (caller's contract).
     unsafe {
         for_each_leaf_slot(root_virt, virt_base, page_count, &mut |l0, va| {
-            if !is_present_at(l0, va)
+            if let Some(slot) = entry_mut(l0, 0, va)
+                && slot.is_present()
+                && leaf_word(slot).load(Ordering::Relaxed) & ACCESSED != 0
+            {
+                on_accessed(va);
+            }
+        });
+    }
+}
+
+/// Clear the accessed bit (A) of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `reported` names
+/// (the pages a [`read_user_accessed`] found accessed). A page unmapped since
+/// is skipped.
+///
+/// A NAPOT member is demoted first (demote-before-divergence,
+/// [memory-internals.md](../../../docs/memory-internals.md) § NAPOT Contiguity
+/// (RISC-V)), so each page's A is its own; a live group therefore never lacks
+/// A, since a group is promoted only from 16 identical leaves including a newly
+/// installed one, which carries A. Flushes no TLB: a hart that still caches the
+/// leaf with A set completes accesses without setting it again, so the next
+/// harvest under-reports that page
+/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
+///
+/// # Safety
+/// As [`read_user_accessed`].
+#[cfg(not(test))]
+pub unsafe fn clear_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    reported: &dyn Fn(u64) -> bool,
+)
+{
+    // SAFETY: as for read_user_accessed (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |l0, va| {
+            if !is_present_at(l0, va) || !reported(va)
             {
                 return;
             }
@@ -1415,40 +1445,8 @@ pub unsafe fn harvest_user_accessed(
                 demote_napot_64k(l0, va);
             }
             if let Some(slot) = entry_mut(l0, 0, va)
-                && leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed) & ACCESSED != 0
             {
-                on_accessed(va);
-            }
-        });
-    }
-}
-
-/// Set the accessed bit (A) of every present 4 KiB leaf of
-/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `accessed` names:
-/// the undo of a [`harvest_user_accessed`] whose bitmap could not be
-/// delivered. A page unmapped since is skipped. A NAPOT group is never
-/// touched: a group is promoted only from 16 identical leaves including a
-/// newly installed one, which carries A, so every member of a live group
-/// already has A set and the update changes nothing.
-///
-/// # Safety
-/// As [`harvest_user_accessed`].
-#[cfg(not(test))]
-pub unsafe fn mark_user_accessed(
-    root_virt: u64,
-    virt_base: u64,
-    page_count: usize,
-    accessed: &dyn Fn(u64) -> bool,
-)
-{
-    // SAFETY: as for harvest_user_accessed (caller's contract).
-    unsafe {
-        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |l0, va| {
-            if is_present_at(l0, va)
-                && accessed(va)
-                && let Some(slot) = entry_mut(l0, 0, va)
-            {
-                leaf_word(slot).fetch_or(ACCESSED, Ordering::Relaxed);
+                leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed);
             }
         });
     }
@@ -1465,7 +1463,7 @@ fn is_present_at(l0: &[PageTableEntry; 512], va: u64) -> bool
 /// present leaf table covers, with that table, to `on_slot`, in VA order.
 ///
 /// # Safety
-/// As [`harvest_user_accessed`].
+/// As [`read_user_accessed`].
 #[cfg(not(test))]
 unsafe fn for_each_leaf_slot(
     root_virt: u64,
@@ -2005,7 +2003,7 @@ fn svade_update(pte: u64, access: UserAccess) -> Option<u64>
 /// acknowledgement of its shootdown before the frame can be reused; a freed
 /// frame holds no valid leaf, so a swap on one fails. A NAPOT member that lacks
 /// A is reported genuine instead: setting one member's bit would diverge the
-/// group, and no live group lacks A ([`mark_user_accessed`]).
+/// group, and no live group lacks A ([`clear_user_accessed`]).
 ///
 /// # Safety
 /// Must run in S-mode in the faulting thread's context, i.e. before `satp` has

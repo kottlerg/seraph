@@ -344,8 +344,8 @@ pub fn run_all(ctx: &TestContext)
         mm::aspace_harvest_refusals(ctx)
     );
     run_test!(
-        "mm::aspace_harvest_bitmap_fault_restores",
-        mm::aspace_harvest_bitmap_fault_restores(ctx)
+        "mm::aspace_harvest_bitmap_fault_clears_nothing",
+        mm::aspace_harvest_bitmap_fault_clears_nothing(ctx)
     );
     run_test!(
         "mm::aspace_harvest_kernel_copy_sets_accessed",

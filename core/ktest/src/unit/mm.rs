@@ -1023,12 +1023,15 @@ pub fn aspace_harvest_refusals(ctx: &TestContext) -> TestResult
 }
 
 /// A harvest whose bitmap copy-out faults, with no fault handler to resolve
-/// it, fails with `InvalidAddress` and leaves every accessed bit as it was: the
+/// it, fails with `InvalidAddress` before it clears any accessed bit: the
 /// next harvest reports the pages the failed one read.
-pub fn aspace_harvest_bitmap_fault_restores(ctx: &TestContext) -> TestResult
+pub fn aspace_harvest_bitmap_fault_clears_nothing(ctx: &TestContext) -> TestResult
 {
-    let _pages = HarvestPages::map(ctx, "aspace_harvest_bitmap_fault_restores: map failed")?;
-    harvest(ctx).map_err(|_| "aspace_harvest_bitmap_fault_restores: first harvest failed")?;
+    let _pages = HarvestPages::map(
+        ctx,
+        "aspace_harvest_bitmap_fault_clears_nothing: map failed",
+    )?;
+    harvest(ctx).map_err(|_| "aspace_harvest_bitmap_fault_clears_nothing: first harvest failed")?;
 
     store(&[2, 3]);
     // The page after the mapped ones is never mapped.

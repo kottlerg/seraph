@@ -431,7 +431,7 @@ A syscall that copies to or from a caller-supplied user buffer can fault on that
 kernel: the buffer lies on a page the pager has not backed (a demand region no access has reached,
 or a page the pager has since reclaimed), or on a page whose mapping forbids the access. The
 restartable syscalls, `SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`,
-`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, and `SYS_THREAD_WRITE_MEM`
+`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, and `SYS_ASPACE_HARVEST`
 ([syscalls.md § Restartable Syscalls](../core/kernel/docs/syscalls.md#restartable-syscalls)), take
 the fault path for such a fault:
 
@@ -458,7 +458,8 @@ the fault path for such a fault:
   `InvalidAddress`; the thread continues past the syscall instruction, or from an instruction
   pointer the handler wrote. With no handler bound the syscall fails with `InvalidAddress` at once.
 - **Stale entries.** A copy fault the live page tables already satisfy (a stale TLB entry, which a
-  mapping the handler just installed can leave on another CPU) is retried in the kernel, as a
+  mapping the handler just installed can leave on another CPU, or on riscv64 a leaf that lacks
+  the A or D bit the access needs, which the kernel sets) is retried in the kernel, as a
   user-mode fault is, and reaches neither the handler nor the caller.
 
 The kernel cannot tell an address the pager registered from one it did not; the handler's reply

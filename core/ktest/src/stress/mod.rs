@@ -11,6 +11,7 @@
 //! for logging and PASS/FAIL counting.
 
 mod affinity_swap_handoff;
+mod aspace_harvest_race;
 mod cap_delete_reply_wake;
 mod cap_delete_running;
 mod cap_revoke_under_use;
@@ -197,6 +198,7 @@ pub fn run_all(ctx: &TestContext)
         "stress::concurrent_map_unmap",
         concurrent_map_unmap::run(ctx)
     );
+    run_integration_test!("stress::aspace_harvest_race", aspace_harvest_race::run(ctx));
     run_integration_test!("stress::retype_concurrent", retype_concurrent::run(ctx));
     run_integration_test!("stress::split_delete_race", split_delete_race::run(ctx));
     run_integration_test!("stress::fpu_migration_churn", fpu_migration_churn::run(ctx));

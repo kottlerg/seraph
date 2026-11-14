@@ -1527,25 +1527,21 @@ impl AddressSpace
         Ok(())
     }
 
-    /// Read and clear the accessed bit of every mapped page of
-    /// `[virt_base, virt_base + page_count * PAGE_SIZE)`, under `pt_lock`, and
-    /// set bit `i % 8` of `bitmap[i / 8]` for each page `i` of the range whose
-    /// bit was set; an unmapped page's bit is left as it is. Returns the number
-    /// of pages reported. Flushes no TLB
+    /// Set bit `i % 8` of `bitmap[i / 8]` for each mapped page `i` of
+    /// `[virt_base, virt_base + page_count * PAGE_SIZE)` whose accessed bit is
+    /// set, under `pt_lock`, changing no leaf; an unmapped page's bit is left
+    /// as it is. Returns the number of pages reported. The first half of a
+    /// harvest; [`clear_accessed`](Self::clear_accessed) is the second
     /// ([memory-internals.md](../../docs/memory-internals.md) § Accessed Bits).
     ///
     /// # Safety
     /// The range must lie in the user half, and `bitmap` must hold at least
     /// `page_count.div_ceil(8)` bytes.
     #[cfg(not(test))]
-    pub unsafe fn harvest_accessed(
-        &self,
-        virt_base: u64,
-        page_count: usize,
-        bitmap: &mut [u8],
-    ) -> u64
+    pub unsafe fn read_accessed(&self, virt_base: u64, page_count: usize, bitmap: &mut [u8])
+    -> u64
     {
-        use crate::arch::current::paging::harvest_user_accessed;
+        use crate::arch::current::paging::read_user_accessed;
 
         let mut accessed = 0u64;
         crate::percpu::preempt_disable();
@@ -1553,7 +1549,7 @@ impl AddressSpace
         // SAFETY: root_virt is valid, pt_lock is held, and the range is in the
         // user half (caller's contract).
         unsafe {
-            harvest_user_accessed(self.root_virt, virt_base, page_count, &mut |va| {
+            read_user_accessed(self.root_virt, virt_base, page_count, &mut |va| {
                 if let Some((index, bit)) = harvest_bit(virt_base, va)
                     && let Some(byte) = bitmap.get_mut(index)
                 {
@@ -1568,24 +1564,24 @@ impl AddressSpace
         accessed
     }
 
-    /// Set the accessed bit again on every page of
+    /// Clear the accessed bit of each page of
     /// `[virt_base, virt_base + page_count * PAGE_SIZE)` that `bitmap` reports
-    /// (as [`harvest_accessed`](Self::harvest_accessed) wrote it) and that is
-    /// still mapped: the undo of a harvest whose bitmap the caller could not
-    /// take, so the call changes nothing visible.
+    /// (as [`read_accessed`](Self::read_accessed) wrote it) and that is still
+    /// mapped, under `pt_lock`. A page that gained the bit after the read is
+    /// not reported, so it keeps the bit for the next harvest. Flushes no TLB.
     ///
     /// # Safety
-    /// As [`harvest_accessed`](Self::harvest_accessed).
+    /// As [`read_accessed`](Self::read_accessed).
     #[cfg(not(test))]
-    pub unsafe fn restore_accessed(&self, virt_base: u64, page_count: usize, bitmap: &[u8])
+    pub unsafe fn clear_accessed(&self, virt_base: u64, page_count: usize, bitmap: &[u8])
     {
-        use crate::arch::current::paging::mark_user_accessed;
+        use crate::arch::current::paging::clear_user_accessed;
 
         crate::percpu::preempt_disable();
         self.pt_lock();
-        // SAFETY: as for harvest_accessed (caller's contract).
+        // SAFETY: as for read_accessed (caller's contract).
         unsafe {
-            mark_user_accessed(self.root_virt, virt_base, page_count, &|va| {
+            clear_user_accessed(self.root_virt, virt_base, page_count, &|va| {
                 harvest_bit(virt_base, va)
                     .and_then(|(index, bit)| Some(bitmap.get(index)? & bit != 0))
                     .unwrap_or(false)

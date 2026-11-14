@@ -59,7 +59,7 @@ const PCD: u64 = 1 << 4;
 /// Accessed (A) — the processor sets it on the first access through a leaf;
 /// the kernel pre-sets it in every leaf it builds, as on RISC-V, so a leaf the
 /// kernel installs or rewrites reads accessed until `SYS_ASPACE_HARVEST`
-/// clears it ([`harvest_user_accessed`]).
+/// clears it ([`clear_user_accessed`]).
 const ACCESSED: u64 = 1 << 5;
 /// Page Size (PS) — set in a PDE/PDPTE to make it a large-page leaf.
 const LARGE_PAGE: u64 = 1 << 7;
@@ -1294,21 +1294,17 @@ fn leaf_word(slot: &mut PageTableEntry) -> &AtomicU64
     unsafe { AtomicU64::from_ptr(core::ptr::from_mut(slot).cast::<u64>()) }
 }
 
-/// Clear the accessed bit (A) of every present 4 KiB leaf of
-/// `[virt_base, virt_base + page_count * 4 KiB)` in the page table rooted at
-/// `root_virt`, and pass the VA of each leaf whose A was set to
-/// `on_accessed`, in VA order.
-///
-/// Flushes no TLB: a CPU that still caches the leaf completes accesses without
-/// setting A again, so the next harvest under-reports that page
-/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
+/// Pass the VA of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)`, in the page table rooted at
+/// `root_virt`, whose accessed bit (A) is set to `on_accessed`, in VA order.
+/// Changes no leaf.
 ///
 /// # Safety
 /// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
 /// caller must hold the address space's `pt_lock`, and the span must lie in
 /// the user half.
 #[cfg(not(test))]
-pub unsafe fn harvest_user_accessed(
+pub unsafe fn read_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
@@ -1319,8 +1315,7 @@ pub unsafe fn harvest_user_accessed(
     // held (caller's contract).
     unsafe {
         for_each_leaf_slot(root_virt, virt_base, page_count, &mut |slot, va| {
-            if slot.is_present()
-                && leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed) & ACCESSED != 0
+            if slot.is_present() && leaf_word(slot).load(Ordering::Relaxed) & ACCESSED != 0
             {
                 on_accessed(va);
             }
@@ -1328,27 +1323,31 @@ pub unsafe fn harvest_user_accessed(
     }
 }
 
-/// Set the accessed bit (A) of every present 4 KiB leaf of
-/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `accessed` names:
-/// the undo of a [`harvest_user_accessed`] whose bitmap could not be
-/// delivered. A page unmapped since is skipped.
+/// Clear the accessed bit (A) of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `reported` names
+/// (the pages a [`read_user_accessed`] found accessed). A page unmapped since
+/// is skipped.
+///
+/// Flushes no TLB: a CPU that still caches the leaf completes accesses without
+/// setting A again, so the next harvest under-reports that page
+/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
 ///
 /// # Safety
-/// As [`harvest_user_accessed`].
+/// As [`read_user_accessed`].
 #[cfg(not(test))]
-pub unsafe fn mark_user_accessed(
+pub unsafe fn clear_user_accessed(
     root_virt: u64,
     virt_base: u64,
     page_count: usize,
-    accessed: &dyn Fn(u64) -> bool,
+    reported: &dyn Fn(u64) -> bool,
 )
 {
-    // SAFETY: as for harvest_user_accessed (caller's contract).
+    // SAFETY: as for read_user_accessed (caller's contract).
     unsafe {
         for_each_leaf_slot(root_virt, virt_base, page_count, &mut |slot, va| {
-            if slot.is_present() && accessed(va)
+            if slot.is_present() && reported(va)
             {
-                leaf_word(slot).fetch_or(ACCESSED, Ordering::Relaxed);
+                leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed);
             }
         });
     }
@@ -1359,7 +1358,7 @@ pub unsafe fn mark_user_accessed(
 /// covers, with the VA, to `on_slot`, in VA order.
 ///
 /// # Safety
-/// As [`harvest_user_accessed`].
+/// As [`read_user_accessed`].
 #[cfg(not(test))]
 unsafe fn for_each_leaf_slot(
     root_virt: u64,

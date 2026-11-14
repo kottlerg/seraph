@@ -582,10 +582,10 @@ pub fn sys_mem_protect(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 /// § `SYS_ASPACE_HARVEST` (66); the accessed-bit model:
 /// `core/kernel/docs/memory-internals.md` § Accessed Bits.
 ///
-/// Restartable (core/kernel/docs/syscalls.md § Restartable Syscalls): when the
-/// bitmap copy faults, the harvested pages get their accessed bit back before
-/// the fault reaches the dispatcher, so the call has changed nothing visible
-/// and re-executes on resume.
+/// Restartable (core/kernel/docs/syscalls.md § Restartable Syscalls): the call
+/// reads the bits, copies the bitmap out, and clears only the reported bits
+/// once the copy has succeeded, so a fault on the copy finds nothing changed
+/// and the call re-executes on resume.
 #[cfg(not(test))]
 pub fn sys_aspace_harvest(tf: UserFrame) -> Result<u64, crate::uaccess::RestartableError>
 {
@@ -659,23 +659,19 @@ pub fn sys_aspace_harvest(tf: UserFrame) -> Result<u64, crate::uaccess::Restarta
     // `aspace_slot` pins for the call.
     let aspace = unsafe { &*as_ptr };
 
-    // ── Harvest, then copy out ────────────────────────────────────────────────
+    // ── Read, copy out, then clear ────────────────────────────────────────────
 
     // SAFETY: the range is in the user half (validated above) and `bitmap`
     // holds `page_count.div_ceil(8)` bytes.
-    let accessed = unsafe { aspace.harvest_accessed(virt_base, page_count, bitmap) };
-    // The span was range-validated above; a fault on it reaches the dispatcher
-    // as a restartable fault.
+    let accessed = unsafe { aspace.read_accessed(virt_base, page_count, bitmap) };
+    // Nothing has changed yet, so a fault on the copy restarts the call
+    // cleanly (core/kernel/docs/syscalls.md § Restartable Syscalls). The span
+    // was range-validated above; a fault on it reaches the dispatcher as a
+    // restartable fault.
     // SAFETY: bitmap is valid for its length; bitmap_ptr is the validated span.
-    let copied = unsafe {
-        crate::uaccess::copy_to_user_restartable(bitmap_ptr, bitmap.as_ptr(), bitmap.len())
-    };
-    if let Err(fault) = copied
-    {
-        // SAFETY: as for harvest_accessed; `bitmap` is what it wrote.
-        unsafe { aspace.restore_accessed(virt_base, page_count, bitmap) };
-        return Err(fault);
-    }
+    unsafe { crate::uaccess::copy_to_user_restartable(bitmap_ptr, bitmap.as_ptr(), bitmap.len()) }?;
+    // SAFETY: as for read_accessed; `bitmap` is what it wrote.
+    unsafe { aspace.clear_accessed(virt_base, page_count, bitmap) };
     Ok(accessed)
 }
 

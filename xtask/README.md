@@ -27,7 +27,7 @@ xtask/
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
-│   ├── guest.rs                # A QEMU process a QMP-driven harness drives, and its serial reader
+│   ├── guest.rs                # A QEMU process a host-driven harness drives, and its serial reader
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
@@ -42,8 +42,8 @@ xtask/
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, compare_images, test_crash_report, test_debug_port,
 │   │                           #   test_gdb, test_kaslr, test_log_level, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, lint_docs, pr_check, review,
-│   │                           #   release_scope, issue, orch, hook, host)
+│   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
+│   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
 └── wrapper-shim/               # rustc / clippy-driver dispatch shim (see Sub-crates)
@@ -785,6 +785,40 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 
 ---
 
+### `cargo xtask test-wedge`
+
+Check the softlockup watchdog's report of a CPU wedged in the kernel with interrupts off, on either
+arch ([docs/testing.md](../docs/testing.md#interrupts-off-wedge-test-wedge) § Interrupts-off wedge).
+Boots the current sysroot's default boot headless twice, with QEMU's gdbstub on a unix socket under
+`target/xtask/`, and waits for the terminal's `terminal: READY for injection` line, reading the
+KASLR slide and each CPU's hardware id from the kernel's boot lines. It then stops the VM over the
+GDB remote serial protocol, moves the chosen CPU's program counter from the idle loop's halt to the
+kernel's `halt_loop` (on x86_64 also clearing the interrupt flag), resumes the VM, and checks the
+watchdog's report. The first boot wedges the highest-numbered AP, the second the BSP. On x86_64
+the report must also hold the wedged CPU's NMI frame with its `rip` inside `halt_loop`.
+
+A pure runner with the same boot requirements as `test-terminal`; it reads the kernel's symbols
+from the sysroot's kernel image:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask mkdisk [--arch x86_64|riscv64]
+cargo xtask test-wedge [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--cpus` | `4` | vCPUs of the guest; at least 2 |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the READY line is bounded by five minutes, each gdbstub reply by twenty seconds, the
+search for the CPU halted in the idle loop by 100 stops 100 ms apart, and the report by two
+minutes. The command fails, killing QEMU, on any of those bounds, on a gdbstub it cannot reach, and
+on a report line that is missing or wrong.
+
+---
+
 ### `cargo xtask test-vmgenid`
 
 Boot the VMGENID snapshot-resume test (#395), x86_64 only — QEMU's riscv64
@@ -1464,8 +1498,8 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
 `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-log-level`,
-`test-debug-port`, `test-gdb` and `capture-acpi` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-kaslr`, `test-map-redo`,
+`test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

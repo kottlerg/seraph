@@ -793,7 +793,7 @@ Boots the current sysroot's default boot headless twice, with QEMU's gdbstub on 
 `target/xtask/`, and waits for the terminal's `terminal: READY for injection` line, reading the
 KASLR slide and each CPU's hardware id from the kernel's boot lines. It then stops the VM over the
 GDB remote serial protocol, moves the chosen CPU's program counter from the idle loop's halt to the
-kernel's `halt_loop` (on x86_64 also clearing the interrupt flag), resumes the VM, and checks the
+kernel's `halt_loop`, which masks interrupts and halts for good, resumes the VM, and checks the
 watchdog's report. The first boot wedges the highest-numbered AP, the second the BSP. On x86_64
 the report must also hold the wedged CPU's NMI frame with its `rip` inside `halt_loop`.
 

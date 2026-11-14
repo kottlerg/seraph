@@ -218,7 +218,8 @@ Each feature is classified per architecture as one of:
 - **EFI_RNG_PROTOCOL** — the boot seed's only firmware source under the EDK2 firmware the
   default boot uses, exposed through the firmware's `VirtioRngDxe` binding `virtio-rng`;
   firmware that delivers a DTB may supply `/chosen/rng-seed` instead, and with neither the pool
-  seeds from jitter (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
+  seeds from the Zkr `seed` CSR where the hart has it and the firmware grants it, and otherwise
+  from jitter (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **Zkr seed CSR** — the kernel's hardware RNG, a raw entropy source the pool mixes beside the
   boot seed; used where the hart implements `Zkr` and the M-mode firmware grants S-mode the CSR
   (`mseccfg.SSEED`, which OpenSBI sets on such a hart), which the kernel learns by probing the

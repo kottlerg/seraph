@@ -261,9 +261,9 @@ splits its single seed non-overlapping for the same reason); see
 The first *consumer* draw is decoupled from the boot scrape: the Phase 5/8
 self-test capture is each generator's first draw and necessarily seeds from
 the boot-time pool (scrape-dominated on a jitter-only boot, such as riscv64
-without `virtio-rng`), so the capture is followed by marking the generator
-stale (`CpuRng::mark_stale`). On the BSP the first real consumer draw is
-Phase 8 idle-thread creation (`sched::alloc_thread_id` via `next_u32`),
+with neither `virtio-rng` nor a readable `seed` CSR), so the capture is
+followed by marking the generator stale (`CpuRng::mark_stale`). On the BSP the
+first real consumer draw is Phase 8 idle-thread creation (`sched::alloc_thread_id` via `next_u32`),
 milliseconds after Phase 5. Its mandatory reseed folds an accumulator that
 holds no tick samples yet (`timer_tick` returns before sampling while the BSP
 boot transient is active, from Phase 4 until `sched::enter`), so it adds only
@@ -371,8 +371,8 @@ validates the API once per boot.
   turning a QEMU run red on either architecture. Validated on
   x86_64 (firmware-seeded — `entropy: seeded from boot seed` — since OVMF
   implements `EFI_RNG_PROTOCOL`) and riscv64 (firmware-seeded through
-  `VirtioRngDxe` with the default boot set's `virtio-rng`; jitter-only without
-  it).
+  `VirtioRngDxe` with the default boot set's `virtio-rng`, and from the `seed`
+  CSR beside it; with neither, jitter-only).
 - **Guest reseed coverage**: ktest's
   `entropy::getrandom_reseed_interval_stream` streams 300 draws across the
   256-draw interval on both architectures; svctest's `random-contention`

@@ -5,19 +5,27 @@
 
 //! Loading a DSDT or SSDT into the namespace.
 //!
-//! The loader walks the table's term list in order. It enters the bodies of
-//! `Scope`, `Device`, `Processor`, `PowerResource` and `ThermalZone` itself;
-//! it records a `Method` with its body's span, which [`Namespace::method_code`]
-//! parses on first use; it parses every other term, creates the objects that
-//! `Name` (its data folded to a constant), `Alias`, `External`, `Mutex`,
+//! The loader walks the table's term list in order, twice. It enters the
+//! bodies of `Scope`, `Device`, `Processor`, `PowerResource` and
+//! `ThermalZone` itself, and records a `Method` with its body's span, which
+//! [`Namespace::method_code`] parses on first use.
+//!
+//! The first walk declares: it creates the `Device`, `Processor`,
+//! `PowerResource` and `ThermalZone` objects, the methods and the
+//! `External`s, and parses every other term only to find where it ends. The
+//! second walk defines: it parses every other term again, now that every
+//! method of the table has its argument count in the namespace, creates the
+//! objects that `Name` (its data folded to a constant), `Alias`, `Mutex`,
 //! `Event`, `OperationRegion`, `DataRegion` and the field definitions
 //! declare, and keeps any other term as module-level code
-//! ([`Namespace::module_terms`]) for an evaluator to run.
+//! ([`Namespace::module_terms`]) for an evaluator to run. So a call to a
+//! method defined later in the same table parses as a call wherever it is.
 //!
 //! A fault ends only the term list it is found in: a term whose end its
 //! `PkgLength` gives is skipped and the list continues after it, and any
-//! other ends the list, whose enclosing list continues. The load counts the
-//! faults and keeps the first.
+//! other ends the list, whose enclosing list continues. The second walk
+//! counts the faults of both and keeps the first; the first walk records
+//! none, since the second meets each of its faults again.
 
 use alloc::vec::Vec;
 
@@ -44,7 +52,8 @@ pub struct LoadReport
 {
     /// The table's id.
     pub table: TableId,
-    /// The nodes the load created or defined over an `External`.
+    /// The nodes the load created, and the `External`s it defined. An
+    /// `External` of a name that already exists creates nothing.
     pub objects: usize,
     /// The module-level terms it kept.
     pub module_terms: usize,
@@ -94,6 +103,8 @@ impl Namespace
             ns: self,
             bytes: &bytes,
             mask: if int64 { u64::MAX } else { 0xFFFF_FFFF },
+            declaring: true,
+            declared: Vec::new(),
             report: LoadReport {
                 table: id,
                 objects: 0,
@@ -102,6 +113,8 @@ impl Namespace
                 first_fault: None,
             },
         };
+        loader.list(SDT_HEADER_LEN, len, NodeId::ROOT, 0);
+        loader.declaring = false;
         loader.list(SDT_HEADER_LEN, len, NodeId::ROOT, 0);
         let report = loader.report;
         if let Some(t) = self.tables.last_mut()
@@ -154,6 +167,11 @@ struct Loader<'a, 'b>
     /// The table's integer width as a mask: 64 bits from revision 2, else
     /// 32.
     mask: u64,
+    /// Whether this is the first walk, which declares.
+    declaring: bool,
+    /// The table offset of each object body and method the first walk
+    /// created, with its node, in offset order.
+    declared: Vec<(usize, NodeId)>,
     report: LoadReport,
 }
 
@@ -168,10 +186,51 @@ impl Loader<'_, '_>
         Owner::Table(self.report.table)
     }
 
+    /// Count `fault`, in the second walk.
     fn record(&mut self, fault: Fault)
     {
+        if self.declaring
+        {
+            return;
+        }
         self.report.faults = self.report.faults.saturating_add(1);
         self.report.first_fault.get_or_insert(fault);
+    }
+
+    /// The node the first walk created for the object body or method at
+    /// `pos`, in the second walk.
+    fn declared_at(&self, pos: usize) -> Option<NodeId>
+    {
+        if self.declaring
+        {
+            return None;
+        }
+        let i = self.declared.binary_search_by_key(&pos, |d| d.0).ok()?;
+        self.declared.get(i).map(|d| d.1)
+    }
+
+    /// Create the object body or method `name` at `pos` in `scope`, or, in
+    /// the second walk, take the node the first created for it.
+    fn declare(
+        &mut self,
+        scope: NodeId,
+        name: &Name,
+        object: Object,
+        pos: usize,
+    ) -> Result<NodeId, Fault>
+    {
+        if let Some(node) = self.declared_at(pos)
+        {
+            return Ok(node);
+        }
+        let node = self.create(scope, name, object, pos)?;
+        if self.declaring
+        {
+            // A position the list cannot keep is created again in the second
+            // walk, which then counts the `Exists` fault.
+            let _ = push(&mut self.declared, (pos, node));
+        }
+        Ok(node)
     }
 
     /// Load the term list `start..end` in `scope`, at nesting `depth`.
@@ -287,7 +346,7 @@ impl Loader<'_, '_>
             },
             code: None,
         };
-        self.create(scope, &name, Object::Method(method), pos)
+        self.declare(scope, &name, Object::Method(method), pos)
             .map_err(|f| (f, Some(pkg_end)))?;
         Ok(pkg_end)
     }
@@ -328,7 +387,7 @@ impl Loader<'_, '_>
             Some(_) | None => Object::Device,
         };
         let node = self
-            .create(scope, &name, object, pos)
+            .declare(scope, &name, object, pos)
             .map_err(|f| (f, Some(pkg_end)))?;
         self.list(at, pkg_end, node, depth.saturating_add(1));
         Ok(pkg_end)
@@ -353,7 +412,8 @@ impl Loader<'_, '_>
     }
 
     /// Any other term: parse it, then define the object it declares or keep
-    /// it as module-level code.
+    /// it as module-level code. The first walk declares an `External` and
+    /// defines nothing else.
     fn statement(&mut self, pos: usize, end: usize, scope: NodeId) -> Result<usize, Stop>
     {
         let mut parser = Parser::new(self.ns, self.bytes, pos, end, scope);
@@ -365,6 +425,10 @@ impl Loader<'_, '_>
             Some(Err(f)) => return Err((f, self.package_end(pos, end))),
             None => return Ok(end),
         };
+        if self.declaring && term.op != Op::External
+        {
+            return Ok(next);
+        }
         self.define(term, scope, pos).map_err(|f| (f, Some(next)))?;
         Ok(next)
     }
@@ -459,7 +523,8 @@ impl Loader<'_, '_>
     }
 
     /// `External`. An External is a declaration: one whose parent is not
-    /// defined yet declares nothing, and is no fault.
+    /// defined yet, or whose name already exists, declares nothing, and is
+    /// no fault.
     fn external(
         &mut self,
         scope: NodeId,
@@ -474,7 +539,7 @@ impl Loader<'_, '_>
         match self.create(scope, name, Object::External { kind, args }, pos)
         {
             Ok(_) => Ok(()),
-            Err(f) if f.kind == FaultKind::NotFound => Ok(()),
+            Err(f) if matches!(f.kind, FaultKind::NotFound | FaultKind::Exists) => Ok(()),
             Err(f) => Err(f),
         }
     }

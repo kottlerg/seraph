@@ -198,8 +198,14 @@ pub enum Op
     CreateField,
 
     // ── Statements ────────────────────────────────────────────────────
-    /// kids: predicate, body list, and the `Else` that follows it, if any.
+    /// kids: predicate, body list, an [`Op::ElseIf`] for each `Else` of the
+    /// chain that follows it whose body is one `If`, and the [`Op::Else`]
+    /// that ends the chain, if any.
     If,
+    /// An `Else` whose body is one `If`, folded into the `If` it follows so
+    /// that a chain of them (a compiled `Switch`) does not nest; kids:
+    /// predicate, body list. Its offset is the inner `If`'s.
+    ElseIf,
     /// kids: body list.
     Else,
     /// kids: predicate, body list.

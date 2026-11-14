@@ -43,6 +43,13 @@ pub use namespace::Namespace;
 /// operand, a term list inside an `If`, a package inside a package. The
 /// table loader's nesting of `Scope`, `Device` and the other object bodies
 /// counts against it too.
+///
+/// Unreachable on real tables: term nesting is the nesting of the ASL
+/// source's expressions and blocks, which no machine's size deepens. The one
+/// construct whose depth grows with a count, an `Else` whose body is one
+/// `If` (a compiled `Switch` makes one per `Case`), is parsed at the depth
+/// of the `If` it follows ([`term::Op::ElseIf`]). Object bodies nest as the
+/// device hierarchy does, a level or two per bridge.
 pub const MAX_PARSE_DEPTH: usize = 64;
 
 /// The stack a thread that loads and parses AML needs: enough for a table
@@ -52,13 +59,17 @@ pub const MAX_PARSE_DEPTH: usize = 64;
 /// riscv64, so this is a little over twice the measured peak.
 pub const PARSE_STACK_BYTES: usize = 256 * 1024;
 
-/// The most live nodes a namespace holds, the predefined ones included.
-pub const MAX_NODES: usize = 65_536;
-
 /// The largest `BufferSize` of a buffer a `Name` in a table declares.
+///
+/// It bounds the size of one data object, which the firmware's source fixes
+/// and the machine's size does not enlarge, so that a few bytes of a
+/// malformed table cannot make the loader allocate gigabytes.
 pub const MAX_BUFFER_BYTES: usize = 65_536;
 
 /// The largest element count of a package a `Name` in a table declares.
+///
+/// A `Package`'s count is one byte by the encoding; a `VarPackage`'s is a
+/// term, which this bounds as [`MAX_BUFFER_BYTES`] bounds a buffer.
 pub const MAX_PACKAGE_ELEMENTS: usize = 4096;
 
 /// The value of `Revision` (`RevisionOp`): this interpreter's revision.
@@ -82,8 +93,8 @@ pub enum FaultKind
     Depth,
     /// An allocation failed.
     NoMemory,
-    /// A bound of this crate was reached: [`MAX_NODES`],
-    /// [`MAX_BUFFER_BYTES`] or [`MAX_PACKAGE_ELEMENTS`].
+    /// A bound of this crate was reached: [`MAX_BUFFER_BYTES`],
+    /// [`MAX_PACKAGE_ELEMENTS`], or the width of an id or a table offset.
     Bound,
     /// A `Name` in a table whose data is not constant.
     NotConstant,

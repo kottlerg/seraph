@@ -705,14 +705,67 @@ fn else_attaches_to_its_if_and_a_stray_else_faults()
     let c = code(&mut ns, "\\MTH0");
     assert_eq!(c.len(), 2);
     assert_eq!(c[0].kids.len(), 3);
-    assert_eq!(c[0].kids[2].op, Op::Else);
-    assert_eq!(c[0].kids[2].kids[0].op, Op::List);
+    // The Else's body is one If: it is an ElseIf of the first.
+    assert_eq!(c[0].kids[2].op, Op::ElseIf);
+    assert_eq!(c[0].kids[2].kids[1].op, Op::List);
     assert_eq!(c[1].op, Op::Noop);
+
+    // An Else whose body is more than one If stays an Else.
+    let aml = method(
+        "MTH0",
+        1,
+        &cat(&[
+            &if_(&[ARG0], &ret(&[0x01])),
+            &else_(&cat(&[&if_(&[ARG0], &ret(&[0x00])), &[0xA3]])),
+        ]),
+    );
+    let mut ns = load(&aml);
+    let c = code(&mut ns, "\\MTH0");
+    assert_eq!(c.len(), 1);
+    assert_eq!(c[0].kids[2].op, Op::Else);
+    assert_eq!(c[0].kids[2].kids[0].kids.len(), 2);
 
     let stray = method("MTH0", 0, &cat(&[&[0xA3], &else_(&[0xA3])]));
     let mut ns = load(&stray);
     let id = ns.find("\\MTH0").unwrap();
     assert_eq!(ns.method_code(id).unwrap_err().kind, FaultKind::StrayElse);
+}
+
+#[test]
+fn an_else_if_chain_of_any_length_nests_no_deeper()
+{
+    // A compiled Switch of CASES cases: If (LEqual (Arg0, k)) { Return (k) }
+    // Else { If ... Else { Return (0xFF) } }, far past the depth bound.
+    const CASES: u8 = 200;
+    let case = |k: u8| if_(&cat(&[&[0x93, ARG0], &byte(k)]), &ret(&byte(k)));
+    let mut chain = cat(&[&case(CASES - 1), &else_(&ret(&byte(0xFF)))]);
+    for k in (0..CASES - 1).rev()
+    {
+        chain = cat(&[&case(k), &else_(&chain)]);
+    }
+    let mut ns = load(&method("SWCH", 1, &chain));
+    let c = code(&mut ns, "\\SWCH");
+    assert_eq!(c.len(), 1);
+    let kids = &c[0].kids;
+    assert_eq!(c[0].op, Op::If);
+    assert_eq!(kids.len(), 2 + usize::from(CASES - 1) + 1);
+    for (k, t) in kids[2..kids.len() - 1].iter().enumerate()
+    {
+        assert_eq!(t.op, Op::ElseIf);
+        assert_eq!(t.kids[0].kids[1].int(), Some(u64::try_from(k + 1).unwrap()));
+    }
+    assert_eq!(kids.last().unwrap().op, Op::Else);
+
+    // A chain that ends in an If ends in an ElseIf.
+    let aml = method(
+        "MTH0",
+        1,
+        &cat(&[&case(0), &else_(&cat(&[&case(1), &else_(&case(2))]))]),
+    );
+    let mut ns = load(&aml);
+    let c = code(&mut ns, "\\MTH0");
+    let ops: Vec<Op> = c[0].kids.iter().map(|t| t.op).collect();
+    assert_eq!(ops, [Op::LEqual, Op::List, Op::ElseIf, Op::ElseIf]);
 }
 
 #[test]
@@ -1110,6 +1163,59 @@ fn module_level_code_is_kept_in_order()
     assert_eq!(m[1].term.op, Op::CreateDWordField);
     // The If's Name is the evaluator's to create.
     assert!(ns.find("\\COND").is_none());
+}
+
+#[test]
+fn a_call_to_a_method_defined_later_in_the_table_parses_at_load()
+{
+    // If (One) { MTHA (1) } and OperationRegion (REG0, SystemMemory,
+    // MTHB (1), 0x10), both before the methods they call.
+    let aml = cat(&[
+        &if_(&[0x01], &cat(&[&name("MTHA"), &byte(1)])),
+        &cat(&[
+            &[0x5B, 0x80],
+            &name("REG0"),
+            &[0x00],
+            &name("MTHB"),
+            &byte(1),
+            &byte(0x10),
+        ]),
+        &device("DEV0", &method("MTHA", 1, &ret(&[ARG0]))),
+        &method("MTHB", 1, &ret(&[ARG0])),
+        &scope("\\", &method("MTHA", 1, &ret(&[ARG0]))),
+    ]);
+    let ns = load(&aml);
+    let m = ns.module_terms();
+    assert_eq!(m.len(), 1, "{m:?}");
+    let call = &m[0].term.kids[1].kids[0];
+    assert_eq!((call.op, call.kids.len()), (Op::Call, 1));
+    let Some(Object::Region(r)) = ns.object(ns.find("\\REG0").unwrap())
+    else
+    {
+        panic!("REG0 is not a region");
+    };
+    let offset = ns.expr(r.offset).unwrap();
+    assert_eq!((offset.op, offset.kids.len()), (Op::Call, 1));
+    assert_eq!(ns.expr(r.length).unwrap().int(), Some(0x10));
+}
+
+#[test]
+fn a_load_counts_each_object_once()
+{
+    // Two walks, one count: the device, its method, the External and the
+    // method defined over it.
+    let aml = cat(&[
+        &cat(&[&[0x15], &name("\\MTHX"), &[8, 1]]),
+        &device("DEV0", &method("MTH0", 0, &[0xA3])),
+        &method("MTHX", 1, &[0xA3]),
+    ]);
+    let mut ns = Namespace::new().unwrap();
+    let r = ns.load_table(&table(&aml)).unwrap();
+    assert_eq!((r.objects, r.faults), (4, 0), "{r:?}");
+    // An External of a defined name creates nothing.
+    let ssdt = cat(&[&[0x15], &name("\\DEV0"), &[6, 0]]);
+    let r = ns.load_table(&table(&ssdt)).unwrap();
+    assert_eq!((r.objects, r.faults), (0, 0), "{r:?}");
 }
 
 #[test]

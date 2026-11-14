@@ -29,7 +29,7 @@
 use alloc::vec::Vec;
 
 use crate::encoding::{
-    self, NameStr, OP_BUFFER, OP_BYTE, OP_DWORD, OP_ELSE, OP_EXT_PREFIX, OP_ONE, OP_ONES,
+    self, NameStr, OP_BUFFER, OP_BYTE, OP_DWORD, OP_ELSE, OP_EXT_PREFIX, OP_IF, OP_ONE, OP_ONES,
     OP_PACKAGE, OP_QWORD, OP_STRING, OP_VAR_PACKAGE, OP_WORD, OP_ZERO,
 };
 use crate::namespace::{Namespace, NodeId};
@@ -235,6 +235,7 @@ const fn statement_only(op: Op) -> bool
             | Op::Fatal
             | Op::Unload
             | Op::If
+            | Op::ElseIf
             | Op::Else
             | Op::While
             | Op::Alias
@@ -534,10 +535,62 @@ impl<'a> Parser<'a>
         let mut t = self.term(Want::Statement)?;
         if t.op == Op::If && self.peek_at(0) == Some(OP_ELSE)
         {
-            let e = self.nested(Self::else_term)?;
-            self.push_kid(&mut t, e)?;
+            let saved = self.end;
+            let chain = self.else_chain(&mut t);
+            self.end = saved;
+            chain?;
         }
         Ok(t)
+    }
+
+    /// The `Else` at the current position, which follows the `If` `t`, added
+    /// to `t`. While an `Else`'s body is one `If`, that `If` is added as an
+    /// [`Op::ElseIf`] parsed at the depth of `t`, and the `Else` that follows
+    /// it continues the chain, so a chain of any length nests no deeper.
+    fn else_chain(&mut self, t: &mut Term) -> Result<(), Fault>
+    {
+        loop
+        {
+            let Some(end) = self.else_if_end()
+            else
+            {
+                let e = self.nested(Self::else_term)?;
+                return self.push_kid(t, e);
+            };
+            self.end = end;
+            self.advance(1)?;
+            self.package()?;
+            let mut e = self.term(Want::Statement)?;
+            e.op = Op::ElseIf;
+            self.push_kid(t, e)?;
+            if self.pos >= end
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    /// When the `Else` at the current position has a body that is one `If`,
+    /// alone or with the `Else` that follows it, the end of that body.
+    fn else_if_end(&self) -> Option<usize>
+    {
+        let view = self.view();
+        let (body, end) = encoding::package(view, self.pos.checked_add(1)?)?;
+        if view.get(body) != Some(&OP_IF)
+        {
+            return None;
+        }
+        let (_, if_end) = encoding::package(view, body.checked_add(1)?)?;
+        if if_end == end
+        {
+            return Some(end);
+        }
+        if if_end > end || view.get(if_end) != Some(&OP_ELSE)
+        {
+            return None;
+        }
+        let (_, else_end) = encoding::package(view, if_end.checked_add(1)?)?;
+        (else_end == end).then_some(end)
     }
 
     /// The `Else` at the current position.

@@ -6,7 +6,9 @@
 //! The ACPI namespace: a tree of named objects rooted at `\`.
 //!
 //! Nodes live in an arena and link to their parent, first child and next
-//! sibling; [`NodeId`] indexes it. Every node has an [`Owner`]: the
+//! sibling; [`NodeId`] indexes it. The arena grows as nodes are created, so
+//! a table's load adds nodes in proportion to its bytes: every object a
+//! table declares takes at least its four-byte name segment. Every node has an [`Owner`]: the
 //! predefined objects, the table whose load created it, or an evaluator's
 //! method frame, whose objects [`Namespace::remove_owned`] deletes when the
 //! method returns. A removed node's slot, and its id, are reused.
@@ -27,7 +29,7 @@ use alloc::vec::Vec;
 use crate::encoding::{NameStr, Seg};
 use crate::parse::Parser;
 use crate::term::{Name, Term};
-use crate::{Fault, FaultKind, MAX_NODES, push};
+use crate::{Fault, FaultKind, push};
 
 /// A node of the namespace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -494,9 +496,11 @@ impl Namespace
     ///
     /// # Errors
     ///
-    /// [`FaultKind::Bound`] at [`MAX_NODES`], [`FaultKind::NoMemory`] when
-    /// an allocation fails, [`FaultKind::NotFound`] when `parent` is not live,
-    /// and [`FaultKind::Exists`] when `parent` has a child of that name.
+    /// [`FaultKind::NoMemory`] when an allocation fails,
+    /// [`FaultKind::Bound`] when the arena holds as many nodes as a
+    /// [`NodeId`] can name, [`FaultKind::NotFound`] when `parent` is not
+    /// live, and [`FaultKind::Exists`] when `parent` has a child of that
+    /// name.
     pub fn add_child(
         &mut self,
         parent: NodeId,
@@ -512,10 +516,6 @@ impl Namespace
         if self.child(parent, name).is_some()
         {
             return Err(FaultKind::Exists);
-        }
-        if self.live >= MAX_NODES
-        {
-            return Err(FaultKind::Bound);
         }
         let sibling = self.node(parent).and_then(|n| n.child);
         let node = Node {
@@ -782,16 +782,17 @@ impl Namespace
         None
     }
 
-    /// Create the node `name` declares from `scope`, holding `object`. Every segment but the last must resolve; the last is
-    /// created under it. A definition replaces an `External` of the same
-    /// name; an `External` of a defined name changes nothing.
+    /// Create the node `name` declares from `scope`, holding `object`. Every
+    /// segment but the last must resolve; the last is created under it. A
+    /// definition replaces an `External` of the same name.
     ///
     /// # Errors
     ///
     /// [`FaultKind::BadName`] for a name of no segment,
     /// [`FaultKind::NotFound`] when the parent does not resolve,
-    /// [`FaultKind::Exists`] for a name already defined, and the faults of
-    /// [`Namespace::add_child`].
+    /// [`FaultKind::Exists`] for a name already defined, or for an
+    /// `External` of a name that already exists, which changes nothing, and
+    /// the faults of [`Namespace::add_child`].
     pub fn create(
         &mut self,
         scope: NodeId,
@@ -821,11 +822,7 @@ impl Namespace
         if let Some(existing) = self.child(parent, last)
         {
             let placeholder = matches!(self.object(existing), Some(Object::External { .. }));
-            if matches!(object, Object::External { .. })
-            {
-                return Ok(existing);
-            }
-            if !placeholder
+            if !placeholder || matches!(object, Object::External { .. })
             {
                 return Err(FaultKind::Exists);
             }
@@ -908,7 +905,8 @@ impl Namespace
     /// # Errors
     ///
     /// The parse's [`Fault`], or one of [`FaultKind::NotFound`] when `id`
-    /// is not an AML method.
+    /// is not an AML method. A fault anywhere in the body is the method's,
+    /// and the method keeps no code: no part of a faulting body is kept.
     pub fn method_code(&mut self, id: NodeId) -> Result<CodeId, Fault>
     {
         let not_found = Fault::at(FaultKind::NotFound, 0);

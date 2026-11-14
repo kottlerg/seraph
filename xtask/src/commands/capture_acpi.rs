@@ -136,7 +136,12 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
     fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let disk = work.join("blank.img");
     // Beside `work`, not in it: a UNIX socket's path is under 108 bytes.
-    let sock = ctx.target_dir.join("xtask").join("acpi-qmp.sock");
+    // One per configuration, as `work` is, so captures of two
+    // configurations run side by side never reach each other's QEMU.
+    let sock = ctx
+        .target_dir
+        .join("xtask")
+        .join(format!("acpi-{name}.sock"));
     let dump = work.join("memory.bin");
     for p in [&sock, &dump]
     {

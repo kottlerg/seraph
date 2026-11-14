@@ -54,6 +54,10 @@ parses; an alias is followed, and an `External` of a method gives its count. Eac
 position takes the operand kind its opcode's grammar names (`TermArg`, `SuperName`, `Target`, a
 name that is never invoked, or `SimpleName`).
 
+An `Else` whose body is one `If` (alone or with its own `Else`) is an `ElseIf` of the `If` it
+follows, parsed at that `If`'s depth, so a chain of them, as a compiled `Switch` makes one per
+`Case`, nests no deeper however long it is.
+
 Every read is bounded by the end of the package being parsed, nesting is bounded by
 `MAX_PARSE_DEPTH`, every term consumes at least one byte, and every allocation is fallible, so
 any byte string parses to terms or a `Fault`, never a panic.
@@ -75,25 +79,33 @@ Names resolve as ACPI 6.5 § 5.3 says: a name with a root or parent prefix, or o
 segment, is a path from the scope it starts at; a relative name of one segment is looked up in
 that scope and then in each enclosing scope up to the root.
 
-`load_table` walks a DSDT or SSDT's term list in order. It enters the bodies of `Scope`,
-`Device`, `Processor`, `PowerResource` and `ThermalZone`; it records a `Method` with the span of
-its body, which `method_code` parses on first use; it creates the objects that `Name` (its data
-folded to a constant), `Alias`, `External`, `Mutex`, `Event`, `OperationRegion`, `DataRegion`
-and the field definitions declare; and it keeps every other term as module-level code, in
-order, for an evaluator to run. The namespace keeps a copy of each table.
+`load_table` walks a DSDT or SSDT's term list in order, twice. Both walks enter the bodies of
+`Scope`, `Device`, `Processor`, `PowerResource` and `ThermalZone`. The first declares: it creates
+the `Device`, `Processor`, `PowerResource` and `ThermalZone` objects, each `Method` with the span
+of its body, which `method_code` parses on first use, and each `External`, and parses every
+other term only to find its end. The second defines: it parses every other term again, now that
+the table's methods have their argument counts in the namespace, so a call to a method defined
+later in the same table parses as a call; it creates the objects that `Name` (its data folded to
+a constant), `Alias`, `Mutex`, `Event`, `OperationRegion`, `DataRegion` and the field
+definitions declare; and it keeps every other term as module-level code, in order, for an
+evaluator to run. The namespace keeps a copy of each table.
 
 A fault ends only the term list it is found in: a term whose end its `PkgLength` gives is
 skipped and the list continues after it, and any other fault ends the list, whose enclosing
 list continues. The `LoadReport` counts the objects created, the module-level terms kept and the
-faults met, and keeps the first fault.
+faults the second walk met, and keeps the first fault. `method_code` parses a method's whole
+body or none of it: a fault anywhere in the body is the method's fault, and the method has no
+code. `parse_methods` parses every method and counts the methods that fault.
 
 ---
 
 ## Bounds
 
 The bounds are constants of `src/lib.rs`, stated in [docs/limits.md](../../docs/limits.md)
-§ devmgr: the nesting depth (`MAX_PARSE_DEPTH`), the live nodes (`MAX_NODES`), and the size of a
-buffer and of a package a table's `Name` declares (`MAX_BUFFER_BYTES`, `MAX_PACKAGE_ELEMENTS`).
+§ devmgr: the nesting depth (`MAX_PARSE_DEPTH`), and the size of a buffer and of a package a
+table's `Name` declares (`MAX_BUFFER_BYTES`, `MAX_PACKAGE_ELEMENTS`). The namespace has no node
+bound: its arena grows with the nodes created, and a table's load creates at most one node for
+each four bytes of its AML, since every object a table declares takes at least its name segment.
 A thread that loads or parses AML MUST have `PARSE_STACK_BYTES` of stack, which a host test
 checks by a load and a parse nested to the depth bound on a thread of that size.
 

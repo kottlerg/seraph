@@ -57,9 +57,9 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 // (`reserve/seraph.rs`).
 
 /// Heap floor installed at `_start`, in 4 KiB pages (2 MiB). Sized to cover
-/// stdio's lazy line buffer, two worker-thread stacks plus their per-thread
-/// IPC buffer pages, typical collection workloads, and the peak of a piped
-/// `Command::spawn` without needing `grow`. In a demand-paged process the
+/// stdio's lazy line buffer, typical collection workloads, and the peak of a
+/// piped `Command::spawn` without needing `grow`; a spawned thread's stack and
+/// IPC buffer lie in page reservations, not here. In a demand-paged process the
 /// floor is a registered demand region (`REGISTER_REGION`), so it costs VA
 /// and only the frames of the pages first touched; a process with no pager
 /// (pinned, or whose registration failed) maps it eagerly instead.

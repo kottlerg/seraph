@@ -559,6 +559,11 @@ pub fn heap_bootstrap(memmgr_ep: u64, self_aspace: u64) -> bool {
 /// unbootstrapped state, so it serves no allocation; pages the failed attempt
 /// mapped stay mapped and accounted until the process exits.
 fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
+    // Both floors fund page tables before the heap exists (a demand floor's
+    // top-up, an eager floor's funded map), retyping from the object slab,
+    // whose refill path must be wired first. `_start` has already wired it;
+    // a second store of the same endpoint is harmless.
+    object_slab_init(memmgr_ep);
     // The base draw happens before the allocator exists: the raw getrandom
     // wrapper is a registers-only syscall and must stay non-allocating, like
     // the IPC wrappers `grow_exact` uses. A failed draw degrades to the
@@ -611,9 +616,6 @@ fn register_demand_floor(memmgr_ep: u64, self_aspace: u64, heap_base: u64) -> bo
     if !has_pager || ipc_buf.is_null() {
         return false;
     }
-    // The page-table funding retypes from the object slab, whose refill path
-    // `_start` otherwise wires after the heap.
-    object_slab_init(memmgr_ep);
     // Best effort, as for every demand region (`register_demand_paged`): the
     // pager funds the pool itself when a fault finds it exhausted, so the
     // top-up only keeps the floor's first faults off that path.
@@ -720,9 +722,10 @@ static SLAB_BIN_512: ObjectSlab = empty_slab();
 /// memmgr endpoint shared by every slab path. Set once at process start.
 static SLAB_MEMMGR_EP: crate::sync::atomic::AtomicU64 = crate::sync::atomic::AtomicU64::new(0);
 
-/// Set the memmgr endpoint backing the object-slab refill path. The heap
-/// bootstrap sets it before funding a demand floor's page tables, and `_start`
-/// sets it again (to the same endpoint) after `heap_bootstrap`.
+/// Set the memmgr endpoint backing the object-slab refill path. `_start` sets
+/// it before stdio attaches its pipes, since a funded map tops the page-table
+/// pool up through the slab, and the heap bootstrap sets it again (to the same
+/// endpoint) before installing the floor.
 pub fn object_slab_init(memmgr_ep: u64) {
     SLAB_MEMMGR_EP.store(memmgr_ep, Ordering::Release);
 }

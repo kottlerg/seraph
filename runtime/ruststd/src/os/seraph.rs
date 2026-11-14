@@ -528,6 +528,17 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
     unsafe { (*STARTUP.0.get()).write(startup) };
     STARTUP_READY.store(true, Ordering::Release);
 
+    // Wire the object-slab refill path against memmgr before anything maps:
+    // a funded map (`mem_map_funded`: a child's stdio ring pages below, the
+    // heap floor) tops the page-table pool up from memory the slab requests,
+    // and allocates nothing, so it can run before the heap exists. Cap-create
+    // syscalls retype out of a slab Memory cap acquired lazily on first use.
+    // Zero `memmgr_endpoint_cap` (memmgr itself, init, or something earlier in
+    // the chain) leaves the path unwired.
+    if info.memmgr_endpoint_cap != 0 {
+        pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
+    }
+
     // Wire the three stdio pipes before the heap bootstrap. Each
     // direction takes (memory_cap, data_notification_cap, space_notification_cap);
     // zero memory caps are tolerated (writes silently drop / reads
@@ -603,10 +614,6 @@ pub extern "C" fn _start(info_ptr: u64) -> ! {
             ) };
             syscall::process_exit(STARTUP_FAIL_HEAP);
         }
-        // Wire the object-slab refill path against the same memmgr endpoint.
-        // Cap-create syscalls retype memory out of a slab Memory cap acquired
-        // lazily on first use.
-        pal_alloc::object_slab_init(info.memmgr_endpoint_cap);
     }
 
     // In a demand-paged process, let the main-thread stack grow on demand below

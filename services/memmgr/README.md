@@ -24,8 +24,8 @@ memmgr/
 ├── README.md
 ├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
 │                               # arena, free pool, deferred list, process
-│                               # index, region logic, per-region chunk
-│                               # tables
+│                               # index, budget nodes, region logic,
+│                               # per-region chunk tables
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
@@ -78,6 +78,11 @@ Allocation Contract").
   toward exhaustion even though its RAM stays flat. Selection and reclamation
   rules live in [`docs/memory-pool.md`](docs/memory-pool.md) §"Allocation" and
   §"Reclamation".
+- **Budget accounting** — charge every page lent to a process to its budget
+  node, refuse a charge over the max of the node or an ancestor with `LIMIT`
+  (a demand fault with decline code 10), and keep the system reserve for the
+  core (see [`docs/memory-pool.md`](docs/memory-pool.md) § Distribution
+  policy).
 - **Coalescing** — fold adjacent free pages back into larger contiguous
   Memory caps via reverse-`memory_split`, sustaining the success rate of
   `REQUIRE_CONTIGUOUS` requests as the pool fragments. Runs after every
@@ -115,13 +120,15 @@ The full memmgr IPC specification is in
   address; `RIGHTS_MEM_PHYS` only for a phys-class caller)
 - `RELEASE_MEMORY_CAPS(region_id[..])` — return granted regions mid-life, named by the
   opaque region ids the grant returned
-- `REGISTER_PROCESS(...) → badged_endpoint_cap` (procmgr-only)
+- `REGISTER_PROCESS(flags, parent_badge, max) → badge, max, badged_endpoint_cap`
+  (procmgr-only); creates the process's budget node
 - `PROCESS_DIED(badge)` (procmgr-only)
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
 - `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms, the free and deferred
   totals, and the largest free run
 - `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region
+- `QUERY_MEMORY_USAGE` — read the caller's own budget usage, its max, and its subtree's usage
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
 
@@ -130,9 +137,9 @@ The full memmgr IPC specification is in
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records, per-process region and frame descriptors, and the regions'
-chunk-table nodes are nodes in a self-hosted metadata arena carved from
-memmgr's own pool, indexed by `u64` (see
+process records and their budget nodes, per-process region and frame
+descriptors, and the regions' chunk-table nodes are nodes in a self-hosted
+metadata arena carved from memmgr's own pool, indexed by `u64` (see
 [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are
 found through a linear-hash index that grows with them. The arena grows until
 RAM is exhausted or its address-space zones are spent; the high zone,
@@ -157,6 +164,7 @@ The remaining constants are tuning values that bound no capacity:
 | `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck checks; a run not pooled goes to the back |
 | `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count windows one recheck spends; the run that crosses the budget is still read whole |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
+| `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)
 §"memmgr".

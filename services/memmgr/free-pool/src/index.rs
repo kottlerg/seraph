@@ -187,6 +187,8 @@ impl<W: WordStore> ProcessIndex<W>
                 Node::Process(_) => cur = slot.next,
                 Node::Free
                 | Node::Run(_)
+                | Node::Deferred(_)
+                | Node::Budget(_)
                 | Node::Region(_)
                 | Node::Frame(_)
                 | Node::ChunkDir(_)
@@ -346,6 +348,7 @@ mod tests
             region_head: NODE_NULL,
             aspace_cap: 0,
             next_region_id: 1,
+            budget: NODE_NULL,
         })
     }
 

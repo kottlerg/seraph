@@ -910,7 +910,8 @@ child bounded creates it with a memory max, which bounds the memory the
 child can fund growth with — not a kernel knob. The max is memmgr's
 distribution policy
 ([memory-pool.md](../services/memmgr/docs/memory-pool.md) § Distribution
-policy), design intent; not yet implemented
+policy). memmgr enforces it; procmgr's creation path that passes it is
+design intent; not yet implemented
 ([#260](https://github.com/kottlerg/seraph/issues/260)).
 
 Seeding policy: a CSpace creation site seeds the pool for the process's

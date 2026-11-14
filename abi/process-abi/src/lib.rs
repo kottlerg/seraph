@@ -134,8 +134,7 @@ pub const STACK_GUARD_PAGES: u32 = 4;
 /// available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS`
 /// calls, with the memory max of the process's budget node where its creator
 /// set one; no default per-process ceiling exists (see
-/// `services/memmgr/docs/memory-pool.md` § Distribution policy; a creator
-/// cannot set the max yet, since procmgr passes none, #260). The value is the
+/// `services/memmgr/docs/memory-pool.md` § Distribution policy). The value is the
 /// largest stack whose reservation (this and the [`STACK_GUARD_PAGES`] guard
 /// below it) fills the region tail `process-layout` leaves after each draw
 /// window (`MAX_WINDOW_REGION_PAGES`, 1 GiB), which it pins with a const

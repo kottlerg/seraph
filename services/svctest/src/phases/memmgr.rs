@@ -802,7 +802,7 @@ fn deferred_bytes() -> u64
 
 /// Make memmgr recheck its deferred list: a `RELEASE_MEMORY_CAPS` naming no
 /// grant releases nothing and only rechecks.
-fn recheck_deferred()
+pub(crate) fn recheck_deferred()
 {
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
         .word(0, 0)
@@ -823,7 +823,7 @@ fn recheck_deferred()
 /// the total counts as settled only after [`SETTLE_QUIET`] rechecks in a row
 /// leave it unlowered: enough to cycle a list of `SETTLE_QUIET` batches of
 /// runs, far past what a svctest boot defers.
-fn settled_deferred_bytes() -> u64
+pub(crate) fn settled_deferred_bytes() -> u64
 {
     // A test wait bound: it limits only how many rechecks the settle takes.
     const MAX_SETTLE: u32 = 256;

@@ -2513,7 +2513,10 @@ mod tests
             CREATE_ARGV_ENV, CREATE_FROM_FILE, CREATE_MEMORY_MAX, CREATE_PROCESS,
         };
         // No flag: no max, whatever the words.
-        let plain = IpcMessage::builder(CREATE_FROM_FILE).word(0, 4096).word(1, 7).build();
+        let plain = IpcMessage::builder(CREATE_FROM_FILE)
+            .word(0, 4096)
+            .word(1, 7)
+            .build();
         assert_eq!(decode_memory_max(&plain, 1), Ok(None));
         // CREATE_PROCESS: word 0, or word 4 after the header.
         let module = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX)

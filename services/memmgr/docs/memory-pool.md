@@ -690,8 +690,9 @@ process: memmgr's self-funding, which is charged to no node, and the reserve nod
 Reserve membership is an attribute each node takes when it is created, not one its children
 inherit. The nodes of memmgr's boot records
 (procmgr's, and memmgr's and init's own) and of init's children (devmgr, vfsd and svcmgr) are
-reserve nodes, and so is the node of a process created with procmgr's reserve creation flag, which
-procmgr honours only from a reserve creator, as it does `CREATE_PHYS_ACCESS`. A process a reserve
+reserve nodes, and so is the node of a process created with procmgr's reserve creation flag
+(`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it does
+`CREATE_PHYS_ACCESS`. A process a reserve
 creator creates without the flag is outside the reserve, so svcmgr's services, crashd among them,
 are outside it until svcmgr passes the flag for them; a recipe key that asks for it is
 [#1098](https://github.com/kottlerg/seraph/issues/1098). The reserve is `pool_total / 64`
@@ -699,9 +700,12 @@ are outside it until svcmgr passes the flag for them; a recipe key that asks for
 
 **Create-time ceiling.** procmgr registers each process with its creator's node as the parent (a
 child of init is a top-level node: init's own record holds only init's bootstrap arenas and parents
-no process) and, when the creator asks for one, a max in pages. memmgr clamps the max to what the
-parent and every ancestor have left, and refuses a reserve node under a parent outside the reserve.
-A process reads its node's usage, its max and its subtree's usage with `QUERY_MEMORY_USAGE`.
+no process) and, when the creator asks for one with `CREATE_MEMORY_MAX`, a max in pages. memmgr
+clamps the max to what the parent and every ancestor have left, and refuses a reserve node under a
+parent outside the reserve; procmgr relays the max the node took to the creator in the create reply
+([services/procmgr/docs/ipc-interface.md](../../procmgr/docs/ipc-interface.md)
+§ Label 1, **Memory max and reserve**). A process reads its node's usage, its max and its subtree's
+usage with `QUERY_MEMORY_USAGE`.
 
 **Server-side charges.** Memory a server spends on a client's behalf (procmgr's process-table
 entry, vfsd's and fatfs's per-client state) is charged to the server's node, not to the client's.
@@ -709,14 +713,7 @@ A client can therefore make a server spend memory beyond the client's own max, b
 server's node and the reserve. This is a known gap; charging that state to the client is
 [#1100](https://github.com/kottlerg/seraph/issues/1100).
 
-memmgr's half of this policy is implemented: the budget nodes, the charge, the reserve, `LIMIT`,
-decline code 10 and `QUERY_MEMORY_USAGE`, and a parent, a max and reserve membership taken at
-`REGISTER_PROCESS` ([`ipc-interface.md`](ipc-interface.md) § Label 3). procmgr's half, which
-passes them, and its reserve creation flag are design intent; not yet implemented
-([#260](https://github.com/kottlerg/seraph/issues/260)). Until it lands, procmgr registers every
-process as a top-level node with no max and outside the reserve, so the boot records' nodes are the
-only reserve nodes, and no process has a max. Live control of a running process's max is
-[#1097](https://github.com/kottlerg/seraph/issues/1097).
+Live control of a running process's max is [#1097](https://github.com/kottlerg/seraph/issues/1097).
 
 ---
 

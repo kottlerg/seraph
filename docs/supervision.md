@@ -42,8 +42,8 @@ pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
 
 | Supervisor | Supervises | Observes death through | On death |
 |---|---|---|---|
-| svcmgr | memmgr, procmgr, devmgr, vfsd (endowed by init) | a death observer bound on the thread cap each endowment round delivers | the service's recipe decides; every one of these is `restart = never`, `critical = yes`, so its death powers the system off |
-| svcmgr | each service it launches with a `restart` other than `never` | a death observer bound on the thread cap procmgr's create reply returns | the recipe's `restart` policy and budget, then `critical` ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)) |
+| svcmgr | memmgr, procmgr, devmgr, vfsd (endowed by init) | a death observer bound on the main thread, through the thread cap each endowment round delivers | the service's recipe decides; every one of these is `restart = never`, `critical = yes`, so its death powers the system off |
+| svcmgr | each service it launches with a `restart` other than `never` | a death observer bound on the main thread, through the thread cap procmgr's create reply returns | the recipe's `restart` policy and budget, then `critical` ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)) |
 | devmgr | drivers it spawns | a death observer bound on each driver's thread | the driver is withdrawn and its DMA hold released once its device is quiesced; no restart (design intent; not yet implemented, #1077; the IOMMU driver, #1079) ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#relationship-to-drivers)) |
 | vfsd | fs drivers it spawns | nothing | the mount stays installed against the dead endpoint; no restart (design intent; not yet implemented, #1078) ([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants)) |
 | pwrmgr | svcmgr | an event queue svcmgr binds to its own death (§ Observing svcmgr) | power-off (design intent; not yet implemented, #262) |
@@ -52,6 +52,14 @@ A `restart = never` service that svcmgr launches, rather than binds, is launched
 binds no death observer for it and keeps no record of it, so that service has no supervisor
 ([Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy).
+
+svcmgr's observer is on a service's main thread only, so the policy above applies to the main
+thread's death. A terminal fault in another thread of a service procmgr created (devmgr, vfsd, and
+every service svcmgr launches; crashd, logd, devmgr and vfsd run worker threads) drives procmgr's
+teardown of the whole process. That teardown revokes svcmgr's thread cap, and its stop of the main
+thread posts no death ([Process Lifecycle § Exit reason](process-lifecycle.md#exit-reason)). So
+such a death reaches neither the recipe's `restart` nor its `critical`: the service stays down, and
+the system runs on without it. Routing that death to svcmgr is not yet implemented (#1094).
 
 ---
 
@@ -91,12 +99,17 @@ death to its graceful shutdown through the shutdown actuator, pwrmgr
 ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)).
 svcmgr cannot observe its own death. pwrmgr observing it and powering the system off is design
 intent; not yet implemented (#262) (§ Observing svcmgr): today svcmgr's death is observed only by
-procmgr, which reaps it, and the system runs on unsupervised.
+procmgr, which reaps it, and the system runs on unsupervised. What svcmgr observes of memmgr and
+procmgr is their main threads' deaths (§ Supervision Hierarchy). init creates both by raw syscalls,
+so no observer is bound on either address space. A terminal fault in another of their threads (such
+as procmgr's reaper or request workers) ends that thread alone, nothing observes it, and the system
+runs on. Observing such a fault as the service's death is not yet implemented (#1094).
 
 devmgr and vfsd are `restart = never`, `critical = yes`, and are not in the core set: their restart
 is future work that no principle excludes, and no restart of either is designed yet. The death of
-either is system death through the same graceful shutdown, by its recipe, not by membership of the
-core set.
+either's main thread is system death through the same graceful shutdown, by its recipe, not by
+membership of the core set; a terminal fault in one of their worker threads is not, today
+(§ Supervision Hierarchy).
 
 The path from a core or critical death to power-off MUST NOT depend on the service that died. svcmgr
 and pwrmgr are demand-paged on memmgr (memmgr and procmgr are pinned by construction, per
@@ -210,6 +223,9 @@ Each item below is specified above or in the document it names, and is not yet i
 - devmgr restarts drivers: #1077. The IOMMU driver survives and restarts: #1079.
 - vfsd restarts fs drivers by revoke and re-resolve: #1078.
 - procmgr tears down the processes a dead pager other than memmgr served: #226.
+- The terminal fault of any thread of a supervised service reaches svcmgr as that service's death,
+  for the services procmgr creates and for memmgr and procmgr (§ Supervision Hierarchy, § Core Set
+  and System Death): #1094.
 
 ---
 

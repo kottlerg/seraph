@@ -804,9 +804,11 @@ name = "init"
 version = "0.1.4"
 dependencies = [
  "elf",
+ "init-log-levels",
  "init-protocol",
  "init-sender-table",
  "ipc",
+ "log 0.1.4",
  "logd-codec",
  "namespace-protocol",
  "ns-client",
@@ -815,6 +817,13 @@ dependencies = [
  "svcmgr-endowment",
  "syscall",
  "syscall-abi",
+]
+
+[[package]]
+name = "init-log-levels"
+version = "0.1.4"
+dependencies = [
+ "log 0.1.4",
 ]
 
 [[package]]

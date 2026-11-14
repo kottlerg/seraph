@@ -43,7 +43,7 @@ const MODULE_SCRATCH_MAX_PAGES: u64 = (ELF_PAGE_TEMP_VA - TEMP_MAP_BASE) / PAGE_
 /// Pages a boot module of `module_size` bytes spans at `TEMP_MAP_BASE`, or
 /// `None` when it would reach the ELF scratch span
 /// ([`MODULE_SCRATCH_MAX_PAGES`]).
-fn module_scratch_pages(module_size: u64) -> Option<u64>
+pub(crate) fn module_scratch_pages(module_size: u64) -> Option<u64>
 {
     let pages = module_size.div_ceil(PAGE_SIZE);
     (pages <= MODULE_SCRATCH_MAX_PAGES).then_some(pages)
@@ -163,14 +163,15 @@ fn retype_reserve_pages() -> u64
 }
 
 /// Bodies init's own `CSpace` arena backs after [`fund_own_cspace`] besides
-/// one per MMIO aperture: the split tails of the three `MemoryAlloc` carves
-/// that follow init's own arena's (memmgr's and procmgr's arenas and the
-/// phys-table page), the two children of the `SchedControl` split, and the
-/// derivations of the root `Interrupt` cap and, on x86-64, of the root
-/// `IoPort` cap that init serves devmgr. Fixed by init's own code; the
+/// one per MMIO aperture: the split tails of the four `MemoryAlloc` carves
+/// that follow init's own arena's (memmgr's and procmgr's arenas, the
+/// spawned services' env page when the log-level configuration needs it,
+/// and the phys-table page), the two children of the `SchedControl` split,
+/// and the derivations of the root `Interrupt` cap and, on x86-64, of the
+/// root `IoPort` cap that init serves devmgr. Fixed by init's own code; the
 /// aperture derivations scale with the hardware and are counted from
 /// `InitInfo` ([`init_cspace_fund_pages`]).
-const INIT_FIXED_BODIES: u64 = 3 + 2 + 2;
+const INIT_FIXED_BODIES: u64 = 4 + 2 + 2;
 
 /// Pool pages init donates to its own `CSpace` before it makes any body or
 /// binds any port (core/kernel/docs/capability-internals.md § Body Arena):
@@ -905,7 +906,7 @@ unsafe fn populate_memmgr_info(
 }
 
 /// Locate a `CapDescriptor` by slot index.
-fn descriptor_for(info: &InitInfo, slot: u64) -> Option<&CapDescriptor>
+pub(crate) fn descriptor_for(info: &InitInfo, slot: u64) -> Option<&CapDescriptor>
 {
     crate::descriptors(info).iter().find(|d| d.slot == slot)
 }
@@ -1531,6 +1532,7 @@ unsafe fn populate_procmgr_info(
     caps: &ProcmgrCaps,
     stack_pages: u32,
     layout: &ProcessLayout,
+    env_bytes: u64,
 ) -> Option<()>
 {
     let pm_thread_in_pm =
@@ -1601,6 +1603,14 @@ unsafe fn populate_procmgr_info(
         // faults); leave the pager unbound.
         pi.pager_endpoint_cap = 0;
         pi.pager_badge = 0;
+        // No argv. The env, when present, is the one `SERAPH_LOG` entry
+        // `place_procmgr_env` writes at the start of the argv/env region.
+        if env_bytes != 0
+        {
+            pi.env_offset = process_abi::ARGV_ENV_REGION_OFFSET;
+            pi.env_bytes = env_bytes;
+            pi.env_count = 1;
+        }
     };
     // SAFETY: the caller's contract: `target_aspace` is a child's address space,
     // never init's own.
@@ -1614,6 +1624,40 @@ unsafe fn populate_procmgr_info(
     }?;
 
     Some(())
+}
+
+/// Place procmgr's env, the one entry `entry`, in the first page of its
+/// argv/env region (`ARGV_ENV_REGION_OFFSET` past its `ProcessInfo` page),
+/// mapped read-only into `target_aspace`. Consumes one backing page; places
+/// nothing for an empty `entry`.
+///
+/// # Safety
+/// `target_aspace` must name a child's address space, never init's own: the
+/// function places a page into it at a VA the child's layout chooses, without
+/// checking what init holds there.
+unsafe fn place_procmgr_env(
+    arena: &mut BootArena,
+    target_aspace: u64,
+    layout: &ProcessLayout,
+    entry: &[u8],
+) -> Option<()>
+{
+    if entry.is_empty()
+    {
+        return Some(());
+    }
+    let va = layout
+        .process_info_va
+        .checked_add(process_abi::ARGV_ENV_REGION_OFFSET)?;
+    let populate = |scratch_va: u64| {
+        // SAFETY: scratch_va is mapped writable and zeroed, one page, and an
+        // entry is at most `log::LEVEL_ENTRY_MAX` bytes.
+        let page = unsafe { core::slice::from_raw_parts_mut(scratch_va as *mut u8, entry.len()) };
+        page.copy_from_slice(entry);
+    };
+    // SAFETY: the caller's contract: `target_aspace` is a child's address space,
+    // never init's own.
+    unsafe { arena.place_page(target_aspace, va, syscall::MAP_READ, populate) }
 }
 
 /// Place the stack and IPC buffer pages in `arena`, zeroed and mapped
@@ -1745,9 +1789,19 @@ pub fn bootstrap_procmgr(
     svcmgr_service_ep: u64,
     memmgr_send_cap: u64,
     baseline_sched: u64,
+    log_level: Option<u64>,
 ) -> Option<ProcmgrBootstrap>
 {
     let init_aspace = info.aspace_cap;
+
+    // procmgr's env: the `SERAPH_LOG` entry of the level the log-level
+    // configuration sets for it (`crate::log_levels`), else none.
+    let mut env_entry = [0u8; log::LEVEL_ENTRY_MAX];
+    let env_len = log_level
+        .and_then(|level| log::level_entry(level, &mut env_entry))
+        .unwrap_or(0);
+    // `env_len` is at most the entry buffer's length.
+    let env_entry = env_entry.get(..env_len).unwrap_or_default();
 
     let module_memory_cap = crate::find_module_by_name(info, b"procmgr")?;
     let module_size = crate::descriptors(info)
@@ -1825,10 +1879,12 @@ pub fn bootstrap_procmgr(
     let layout = choose_child_layout();
 
     // procmgr is std-using: its arena reserves ELF segments + the main TLS
-    // block + `ProcessInfo` + stack + IPC buffer.
+    // block + `ProcessInfo` + its env page when it has an env + stack + IPC
+    // buffer.
     let backing_pages = elf_backing_pages(ehdr, module_bytes)?
         .checked_add(tls_backing_pages(ehdr, module_bytes))?
         .checked_add(1)?
+        .checked_add(u64::from(!env_entry.is_empty()))?
         .checked_add(u64::from(stack_pages))?
         .checked_add(1)?;
     let mut arena = BootArena::carve(alloc, init_aspace, backing_pages)?;
@@ -1976,7 +2032,19 @@ pub fn bootstrap_procmgr(
     };
     // SAFETY: the target is the child address space `cap_create_aspace` retyped
     // above for this service, never init's own.
-    unsafe { populate_procmgr_info(&mut arena, pm_aspace, &pm_caps, stack_pages, &layout) }?;
+    unsafe {
+        populate_procmgr_info(
+            &mut arena,
+            pm_aspace,
+            &pm_caps,
+            stack_pages,
+            &layout,
+            env_entry.len() as u64,
+        )
+    }?;
+    // SAFETY: the target is the child address space `cap_create_aspace` retyped
+    // above for this service, never init's own.
+    unsafe { place_procmgr_env(&mut arena, pm_aspace, &layout, env_entry) }?;
 
     // SAFETY: the target is the child address space `cap_create_aspace` retyped
     // above for this service, never init's own.

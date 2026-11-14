@@ -1496,6 +1496,22 @@ pub mod log {
         ::log::ensure_badged_cap(current_ipc_buf())
     }
 
+    /// The env entry that gives a child this process's level: `SERAPH_LOG=<name>`
+    /// and its terminating NUL, one entry of an env blob, for a spawner whose
+    /// children inherit its level (`services/logd/docs/ipc-interface.md`
+    /// § Levels). `None` while the process logs at info, the level a child
+    /// without the entry takes.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn inherited_level_entry() -> Option<crate::vec::Vec<u8>> {
+        let level = ::log::max_level();
+        if level == ::ipc::stream_labels::LEVEL_INFO {
+            return None;
+        }
+        let mut entry = [0u8; ::log::LEVEL_ENTRY_MAX];
+        let len = ::log::level_entry(level, &mut entry)?;
+        Some(entry.get(..len)?.to_vec())
+    }
+
     /// Register a display name for this process's log stream.
     /// Idempotent — re-registration with the same name is a silent
     /// no-op at the receiver. Names longer than the receiver's

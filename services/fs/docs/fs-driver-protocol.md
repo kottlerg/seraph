@@ -8,6 +8,7 @@ codes) is specified in
 this document covers the labels that remain fs-driver-specific:
 
 - `FS_MOUNT` — vfsd-to-driver BPB-validation probe at mount time.
+- `FS_UNMOUNT` — vfsd-to-driver unmount, after which the driver exits.
 - `FS_OPEN` — mint a per-open cap and its liveness cap on a file node cap.
 - `FS_READ` — inline read on a file node cap or open cap.
 - `FS_READ_MEMORY` / `FS_RELEASE_MEMORY` / `FS_RELEASE_ACK` — memory-cap
@@ -26,8 +27,8 @@ this document covers the labels that remain fs-driver-specific:
 A driver runs as a separate process. After `FS_MOUNT` succeeds, the
 driver dispatches incoming requests by their badge shape:
 
-- `badge == 0` — service-level request from vfsd (only `FS_MOUNT`
-  today).
+- `badge == 0` — service-level request from vfsd (`FS_MOUNT` and
+  `FS_UNMOUNT`).
 - `badge != 0` carrying namespace rights in bits 40..64, with the
   `OPEN_INSTANCE` bit (48) clear — node-cap request (badge layout per
   [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
@@ -97,6 +98,55 @@ does not read).
 
 The block device endpoint arrives in the driver's bootstrap round;
 see [Bootstrap caps](#bootstrap-caps).
+
+---
+
+## Label 19: `FS_UNMOUNT`
+
+Unmount. Sent by vfsd on the un-badged service endpoint, as `FS_MOUNT` is.
+After a success reply the driver exits and serves no further request.
+
+**Request**
+
+| Field | Value |
+|---|---|
+| `label` | `19`, with the flag bits below |
+| `data[0]` | Caller's `ipc::FS_LABELS_VERSION` |
+
+| Label bit | Flag |
+|---|---|
+| 16 | `fs_labels::UNMOUNT_FORCE`: unmount although opens are live, releasing them |
+
+The request carries no caps; the driver deletes any it carries. The label
+on a node cap or an open cap is answered `UNKNOWN_OPCODE`.
+
+The driver first releases every open whose client is gone, as the sweep of
+[§ Label 18](#label-18-fs_open) does; every open left is live. Without
+`UNMOUNT_FORCE`, a live open makes the driver reply `BUSY`, with the number
+of live opens in `data[0]`, and serve on. Otherwise it releases every open
+as [`FS_CLOSE`](#label-3-fs_close) does: it revokes the open's outstanding
+pages and the copies of its liveness cap, and deletes its release SEND. It
+then writes the volume's `FSInfo` hints (FAT32), replies success, and exits
+with `fs_labels::EXIT_UNMOUNTED` ([§ Driver exit](#driver-exit)).
+
+Only opens make the driver busy. A node cap, such as a client's working
+directory, is not counted, since the driver cannot count the holders of a
+capability. A page a client mapped stays mapped after the release, since a
+revoke removes no mapping
+([Capability Model § Revocation](../../../docs/capability-model.md#revocation)).
+
+The driver serves one request at a time, so an unmount runs after the
+request in flight and before any later one. After the reply the driver
+receives nothing: a client that calls through a node cap or an open cap
+afterwards finds no receiver until the holder of the service endpoint
+tears the endpoint down.
+
+**Reply (success)**: `label = 0`, empty body; the driver then exits.
+
+**Reply (error)**: `label = ipc::fs_errors::*`: `LABEL_VERSION_MISMATCH`
+when `data[0]` differs from the driver's `FS_LABELS_VERSION` (checked
+before anything else), or `BUSY` (live opens remain and `UNMOUNT_FORCE` is
+clear; `data[0]` is their number). The driver serves on after either.
 
 ---
 
@@ -810,6 +860,46 @@ partition cap vfsd keeps for the mount, so vfsd can revoke it. See
 [`services/vfsd/docs/vfs-ipc-interface.md`](../../vfsd/docs/vfs-ipc-interface.md)
 § Label 10: `MOUNT` for the registration step and
 [`services/drivers/virtio/blk/README.md`](../../drivers/virtio/blk/README.md).
+Revoking it takes the device from the driver for good, as
+[Loss of the block device](#loss-of-the-block-device) describes.
+
+---
+
+## Loss of the block device
+
+The driver loses its block device for good when the capability's holder
+revokes it. It tells that loss from a failure that passes by asking the
+kernel about the block device capability whenever a block request's
+`SYS_IPC_CALL` fails (`SYS_CAP_INFO`,
+[core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md#sys_cap_info-36)
+§ `SYS_CAP_INFO`): a capability that names nothing any more
+(`InvalidCapability`) was revoked. The driver then logs the loss, answers
+the request in flight as for any failed block access (`IO_ERROR`, or what
+the label's section names), issues no further block request, and exits with
+`fs_labels::EXIT_DEVICE_GONE` ([§ Driver exit](#driver-exit)) before it
+receives another request. A failed call through a capability that still
+names its endpoint, and an error reply from the block driver, are
+transient: the request fails as its label's section states, and the driver
+serves on.
+
+---
+
+## Driver exit
+
+A driver exits on its own in two cases, each with its own exit code, a
+`fs_labels` constant. Its death observers receive the exit reason
+`syscall_abi::encode_exit_code(code)`
+([abi/syscall/src/lib.rs](../../../abi/syscall/src/lib.rs) § Exit reason
+constants).
+
+| Code | Constant | Cause |
+|---|---|---|
+| `0` | `EXIT_UNMOUNTED` | The driver replied success to [`FS_UNMOUNT`](#label-19-fs_unmount) |
+| `1` | `EXIT_DEVICE_GONE` | The driver found its block device capability revoked ([§ Loss of the block device](#loss-of-the-block-device)) |
+
+The reason `0` also ends a driver whose bootstrap round or page-cache
+setup failed, before any `FS_MOUNT`; any other end of a driver is a fault
+or a kill.
 
 ---
 

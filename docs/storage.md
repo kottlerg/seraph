@@ -240,7 +240,7 @@ Authoritative wire shapes for `REGISTER_PARTITION`,
 `BLK_READ_INTO_MEMORY`, `BLK_WRITE_FROM_MEMORY`, and `BLK_GET_GEOMETRY`
 live in
 [`services/drivers/virtio/blk/README.md`](../services/drivers/virtio/blk/README.md).
-The fs-driver side — `FS_MOUNT`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
+The fs-driver side — `FS_MOUNT`, `FS_UNMOUNT`, `FS_OPEN`, `FS_READ`, `FS_READ_MEMORY`,
 `FS_RELEASE_MEMORY`, `FS_RELEASE_ACK`, `FS_WRITE`, `FS_WRITE_MEMORY`,
 `FS_TRUNCATE`, `FS_CLOSE`, and the directory-mutation labels — is owned by
 [`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md).
@@ -259,6 +259,13 @@ The supported failure-handling primitives are:
   death and does not respawn a driver; the mount stays installed
   against the dead endpoint. Other mounts and the block driver are
   unaffected.
+- **Block device revocation.** An fs driver whose block device
+  capability is revoked answers the request in flight `IO_ERROR` and
+  exits; a failed block call through a capability still live, or an
+  error reply, fails only its request
+  ([`services/fs/docs/fs-driver-protocol.md`](../services/fs/docs/fs-driver-protocol.md)
+  § Loss of the block device). The driver's exit is then an fs-driver
+  crash, as above.
 - **Mount-tree-wide revocation.** `cap_revoke` on an fs driver's
   namespace endpoint cascades through the kernel derivation graph
   and invalidates every cap ever derived from it: vfsd's retained

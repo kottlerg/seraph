@@ -420,8 +420,17 @@ impl Samples
 
 /// The `bench` mode: the cycles of a demand chunk's first touch against those
 /// of a grant-and-map of the same size. Exit codes: `0` when both paths ran;
-/// `2` if the registration or the reservation fails; `4` if a grant or its
-/// map fails; `6` if the chunk count is not a positive integer.
+/// `2` if the registration or the reservation fails, a region too large for
+/// the address space included; `4` if a grant or its map fails; `6` if the
+/// chunk count is not a positive integer that fits in 64 bits; `7` if the
+/// thread cannot be pinned to one CPU. A fault memmgr declines kills the
+/// process.
+///
+/// The thread is pinned to CPU 0 before it times anything: each sample spans
+/// a block on memmgr, and a thread woken on another CPU would subtract one
+/// CPU's cycle counter from another's, which riscv64 does not keep in step.
+/// The untimed warm-up chunks of each path block on memmgr, so the thread
+/// runs on CPU 0 by the first timed sample.
 fn bench() -> ExitCode
 {
     let chunks = match std::env::args()
@@ -437,7 +446,7 @@ fn bench() -> ExitCode
     let Some(total) = chunks.checked_add(BENCH_WARMUP)
     else
     {
-        return ExitCode::from(6);
+        return ExitCode::from(2);
     };
     // The region's byte size must fit too, so no chunk address below
     // overflows.
@@ -446,8 +455,12 @@ fn bench() -> ExitCode
         .filter(|_| total.checked_mul(chunk_bytes).is_some())
     else
     {
-        return ExitCode::from(6);
+        return ExitCode::from(2);
     };
+    if syscall::thread_set_affinity(startup_info().self_thread, 0).is_err()
+    {
+        return ExitCode::from(7);
+    }
 
     // Fault path: the first store into each chunk of a demand region is one
     // fault, which memmgr backs with the whole chunk when a free run covers

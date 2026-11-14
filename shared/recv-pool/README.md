@@ -8,9 +8,11 @@ Worker-pool receive helper for multi-threaded std services.
 
 A service that serves one endpoint from several threads builds a `RecvPool` from the endpoint's
 RECV capability, a `RecvGuard` diagnostic hook, and a handler. `spawn` starts named worker threads
-behind a start gate and returns once each has started running its code, `open` lets them receive,
-and `serve_on_current` opens the gate and makes the calling thread one more worker. A worker whose
-thread has no IPC buffer page tells the hook (`NO_IPC_BUFFER`) and exits its thread. Each worker
+behind a start gate and returns once each worker it started has started running its code, whatever
+another thread's `spawn` on the same pool does; `open` lets them receive, and `serve_on_current`
+opens the gate and makes the calling thread one more worker. A worker whose thread has no IPC
+buffer page logs it and exits its thread, the process and the other workers going on, so the
+hook, whose `Fatal` stage means the process exits, is not told. Each worker
 receives on its own IPC buffer page, under a `RecvGuard`
 ([IPC Design](../../docs/ipc-design.md) § Receive-Failure Policy), and calls the handler with the
 received message and its `IpcBuf`.
@@ -28,7 +30,7 @@ opens the gate when it takes the endpoint over, as logd does
 
 The crate spawns `std` threads and reads each thread's page through `std::os::seraph`, so its
 contents compile only for seraph and no host test reaches them; svctest's `recv_pool` phase
-exercises it. It depends on `shared/ipc`, `shared/syscall` and `abi/syscall`.
+exercises it. It depends on `shared/ipc` and `shared/syscall`.
 
 ---
 

@@ -1525,11 +1525,13 @@ pub unsafe fn ack(irq: u32, binding: &IrqBinding)
 /// Remove `binding` from source `irq` (called when its Interrupt object is
 /// freed); a binding that is not bound is left untouched.
 ///
-/// A delivery that read the binding is waited out before this returns. A line
-/// is then released at its controller when no binding remains, and unmasked
-/// when the remaining bindings owe nothing, so a receiver that goes cannot
-/// hold a shared line masked ([`unbind_line`]). A message target keeps its
-/// slot, unbound ([`free_message`] releases it).
+/// A delivery that read the binding is waited out before this returns. When no
+/// binding remains, the line stays routed and masked while a route holder
+/// remains, and is released at its controller only when no holder remains
+/// either ([`drop_route_holder`] releases it when the last holder goes); when
+/// bindings remain, it is unmasked once they owe nothing, so a receiver that
+/// goes cannot hold a shared line masked ([`unbind_line`]). A message target
+/// keeps its slot, unbound ([`free_message`] releases it).
 ///
 /// Returns the object of the notification the binding named, whose reference
 /// the binding gave up, for the caller to release once the routing lock is

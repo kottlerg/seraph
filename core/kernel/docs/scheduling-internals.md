@@ -1250,9 +1250,12 @@ mode returns at once because the ICR MSR has no such bit) is **not** a `wait_for
 spins on a hardware register that clears within microseconds on a healthy LAPIC. The spin is
 bounded in wall-clock time, 1 s by `timer::elapsed_us` (`ICR_IDLE_BUDGET_US`, through
 `bounded_wait::spin_until`), far beyond any architectural timing; exhaustion indicates a
-hardware-level fault (stuck APIC, emulator bug) and calls `crate::fatal` immediately. The five
-callers (`send_init_ipi`, `send_sipi`, `send_tlb_shootdown_ipi`, `send_wakeup_ipi`,
-`send_nmi_to`) call it for its side effect only; the return type is `()`.
+hardware-level fault (stuck APIC, emulator bug) and calls `crate::fatal` immediately. Its callers
+call it for its side effect only; the return type is `()`. `apic_send_icr` calls it before every
+xAPIC send, inside the window in which it disables interrupts and writes `ICR_HIGH` then `ICR_LOW`:
+`ICR_LOW` sends to whatever `ICR_HIGH` holds, so an interrupt handler that sent its own IPI inside
+that window would redirect the interrupted send. `send_init_ipi` and `send_sipi` also call it after
+their sends, so each step of the INIT-SIPI sequence is accepted before the next.
 
 ### `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`
 

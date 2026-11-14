@@ -945,9 +945,10 @@ fn flush_partial(slot: &mut Slot, seq: &mut u64, out: &mut LineBuf)
     slot.push_history(SlotTable::next_seq(seq), us, level, &line);
 }
 
-/// Record / update the display name for `badge`. Lines emitted with
-/// the old name remain attributed to the old name in history (those
-/// are immutable); subsequent emissions render under the new name.
+/// Record / update the display name for `badge`. History entries carry
+/// no name, only the badge (`QUERY_HISTORY`), so a rename changes the
+/// slot's one current name (`QUERY_SLOTS`), which every line of the
+/// sender then renders under, earlier ones included.
 /// Long names truncated. No collision-suffix policy (procmgr's
 /// process badge is unique, so name collisions only happen if two
 /// processes intentionally pick the same display name).

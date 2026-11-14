@@ -729,6 +729,10 @@ impl<B: Backend, C: CapOps> Service<B, C>
 
     /// Set up interrupt remapping with a table of `entries` entries, or turn
     /// it off for 0 (`REMAP_SETUP`); whether its destinations are 32-bit.
+    /// Refused while the units translate more than one PCI segment: the one
+    /// table they share names an entry's requester by a source ID with no
+    /// segment, so a function on one segment would pass the entries written
+    /// for the same-numbered function on another.
     fn remap_setup(&mut self, entries: u64, extended: u64) -> Result<bool, u64>
     {
         let invalid = iommu_errors::INVALID_REQUEST;
@@ -743,9 +747,15 @@ impl<B: Backend, C: CapOps> Service<B, C>
             return Ok(false);
         }
         let entries = u32::try_from(entries).map_err(|_| invalid)?;
+        let segments_differ = self
+            .units
+            .0
+            .first()
+            .is_some_and(|first| self.units.0.iter().any(|u| u.segment != first.segment));
         if self.remap.is_some()
             || !entries.is_power_of_two()
             || !(2..=MAX_REMAP_ENTRIES).contains(&entries)
+            || segments_differ
         {
             return Err(invalid);
         }
@@ -1741,6 +1751,31 @@ mod tests
         assert_eq!(s.backend.remapping, None);
         let r = remap_setup(&mut s, iommu_labels::MAX_REMAP_ENTRIES, 0);
         assert_eq!(r.label, iommu_errors::SUCCESS);
+    }
+
+    /// Defect caught: one shared table, whose entries name a requester with
+    /// no segment, was set up for units on two segments.
+    #[test]
+    fn units_on_two_segments_refuse_the_setup()
+    {
+        let units = Units(vec![
+            UnitScope {
+                segment: 0,
+                include_pci_all: true,
+                scopes: vec![],
+            },
+            UnitScope {
+                segment: 1,
+                include_pci_all: true,
+                scopes: vec![],
+            },
+        ]);
+        let mut s = Service::new(Fake::default(), FakeCaps::default(), units).unwrap();
+        assert_eq!(
+            remap_setup(&mut s, 1024, 0).label,
+            iommu_errors::INVALID_REQUEST
+        );
+        assert_eq!(s.backend.remapping, None);
     }
 
     #[test]

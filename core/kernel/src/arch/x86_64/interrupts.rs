@@ -429,10 +429,14 @@ const ICR_NMI: u32 = 0x0000_4400;
 
 /// Issue one ICR command targeting hardware APIC ID `dest`.
 ///
-/// xAPIC mode writes `ICR_HIGH` (destination) then `ICR_LOW` (command); x2APIC
-/// mode writes the single 64-bit `IA32_X2APIC_ICR` MSR with the full 32-bit
-/// destination in the high dword. Callers serialise with [`wait_icr_idle`]
-/// (a no-op in x2APIC, which has no delivery-status bit).
+/// xAPIC mode waits for the ICR to be idle ([`wait_icr_idle`]), then writes
+/// `ICR_HIGH` (destination) and `ICR_LOW` (command), all with interrupts
+/// disabled: writing `ICR_LOW` sends to whatever `ICR_HIGH` holds, so an
+/// interrupt handler that sent its own IPI between the two writes would
+/// redirect this command to its destination, and one that sent between the
+/// wait and the writes would leave a send pending under them. x2APIC mode
+/// writes the single 64-bit `IA32_X2APIC_ICR` MSR with the full 32-bit
+/// destination in the high dword, one write that no interrupt can split.
 ///
 /// The caller's earlier stores (a shootdown request, the NMI-backtrace count)
 /// are visible to the target before the IPI arrives: the x2APIC MSR write is not
@@ -459,15 +463,22 @@ unsafe fn apic_send_icr(dest: u32, cmd: u32)
     {
         crate::fatal("apic_send_icr: APIC ID > 255 requires x2APIC");
     }
+    // SAFETY: ring 0 (this function's contract); restored below.
+    let saved = unsafe { cpu::save_and_disable_interrupts() };
+    // SAFETY: xAPIC mode (checked above); polls ICR_LOW only.
+    unsafe { wait_icr_idle() };
     // SAFETY: APIC MMIO is valid; ICR_HIGH takes the destination in bits [31:24].
     unsafe {
         apic_write(APIC_ICR_HIGH, dest << 24);
     }
     // SAFETY: APIC MMIO is valid; cmd is a valid ICR command word (caller's
-    // contract), and writing ICR_LOW sends it to the destination set above.
+    // contract), and writing ICR_LOW sends it to the destination set above,
+    // which no interrupt could overwrite with interrupts disabled.
     unsafe {
         apic_write(APIC_ICR_LOW, cmd);
     }
+    // SAFETY: saved came from save_and_disable_interrupts on this CPU.
+    unsafe { cpu::restore_interrupts(saved) };
 }
 
 /// Wall-clock budget for the ICR delivery-status bit to clear, in microseconds. A healthy
@@ -542,10 +553,6 @@ unsafe fn send_sipi(target_apic_id: u32, vector: u8)
 #[cfg(not(test))]
 pub unsafe fn send_tlb_shootdown_ipi(target_apic_id: u32)
 {
-    // Wait for previous IPI to complete before sending a new one.
-    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
-    unsafe { wait_icr_idle() };
-
     // SAFETY: fixed delivery mode (0), vector 250, level=0, trigger=edge.
     unsafe {
         apic_send_icr(target_apic_id, u32::from(IPI_VECTOR_TLB_SHOOTDOWN));
@@ -562,10 +569,6 @@ pub unsafe fn send_tlb_shootdown_ipi(target_apic_id: u32)
 #[cfg(not(test))]
 pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
 {
-    // Wait for previous IPI to complete before sending a new one.
-    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
-    unsafe { wait_icr_idle() };
-
     // SAFETY: fixed delivery mode (0), vector 251, level=0, trigger=edge.
     unsafe {
         apic_send_icr(target_apic_id, u32::from(IPI_VECTOR_WAKEUP));
@@ -581,8 +584,6 @@ pub unsafe fn send_wakeup_ipi(target_apic_id: u32)
 #[cfg(not(test))]
 pub unsafe fn send_nmi_to(target_apic_id: u32)
 {
-    // SAFETY: wait_icr_idle polls ICR_LOW until delivery status clears.
-    unsafe { wait_icr_idle() };
     // SAFETY: ICR_NMI encodes delivery_mode=NMI (4), level=assert, trigger=edge.
     unsafe {
         apic_send_icr(target_apic_id, ICR_NMI);

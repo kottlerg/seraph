@@ -570,7 +570,8 @@ unsafe fn place_main_tls(
         None => None,
     };
     let populate = |span: &mut [u8]| {
-        // `filesz <= memsz <= block_size <= span.len()`: the template fits.
+        // `filesz <= memsz` (`elf::tls_segment` refuses a template past its
+        // `p_memsz`) `<= block_size <= span.len()`: the template fits.
         let Some(template) = span.get_mut(..seg.filesz as usize)
         else
         {

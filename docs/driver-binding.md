@@ -203,7 +203,9 @@ never claims more than its device and the system's policy give it:
   treat a driver's data as untrusted.
 - **DMA width.** The width limits the device's IOVA space and never widens it past what its
   remapping unit translates; devmgr knows no device's DMA width, so a driver declares its own.
-  A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole.
+  A width without DMA, outside 12 to 64 bits, or repeated rejects the declaration whole. A
+  confined device's IOVA space starts at 1 MiB, so devmgr refuses to confine, and so to bind,
+  a device whose width leaves it no IOVA there (20 bits or fewer).
 - **Form.** Every field has a fixed bound (the match entries, the name's length, the vector
   count). A declaration that exceeds one, carries an unknown field kind, or fails to decode is
   rejected whole and logged. devmgr's reads of a candidate binary are bounded too: the ELF
@@ -230,8 +232,9 @@ neither.
 A driver's instance limit counts its devices in record order (PCI segment, bus, device,
 function; then the firmware's table order). A device no declaration matches stays recorded
 and unbound, and a later declaration (a driver installed afterwards, through `BIND_DRIVERS`, or
-a hotplug pass) can still match it. A limited driver's bound devices are counted over the boot
-by driver name, so a later pass binds it only to the devices its limit leaves.
+a hotplug pass) can still match it. A limited driver's bound devices are counted by driver
+name, within a pass and over the boot, so two declarations of one name share one count and a
+later pass binds the driver only to the devices its limit leaves.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process

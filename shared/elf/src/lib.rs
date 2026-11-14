@@ -149,7 +149,9 @@ pub enum ElfError
     NoSegments,
     /// Program header table extends beyond the file data.
     PhdrTableOverflow,
-    /// A `PT_LOAD` segment references data beyond the file.
+    /// A `PT_LOAD` or `PT_TLS` segment references data beyond the file, or
+    /// a `PT_TLS` template's initialized part is larger than the template
+    /// (`p_filesz` past `p_memsz`).
     SegmentOverflow,
     /// The `PT_DYNAMIC` segment or the relocation table it describes is
     /// malformed: bad bounds or entry size, size cap exceeded, table not
@@ -186,8 +188,9 @@ pub struct Elf64Ehdr
     pub e_entry: u64,
     /// File offset of the program header table.
     pub e_phoff: u64,
-    /// File offset of the section header table (read only by the stack-note
-    /// parsers).
+    /// File offset of the section header table (read only by the note
+    /// locators, [`find_note`] and [`find_note_streaming`], for the stack
+    /// note and a driver's declaration note).
     pub e_shoff: u64,
     /// Processor-specific flags.
     pub e_flags: u32,
@@ -197,13 +200,13 @@ pub struct Elf64Ehdr
     pub e_phentsize: u16,
     /// Number of program header entries.
     pub e_phnum: u16,
-    /// Size of one section header entry in bytes (read only by the stack-note
-    /// parsers).
+    /// Size of one section header entry in bytes (read only by the note
+    /// locators).
     pub e_shentsize: u16,
-    /// Number of section header entries (read only by the stack-note parsers).
+    /// Number of section header entries (read only by the note locators).
     pub e_shnum: u16,
-    /// Index of the section name string table entry (read only by the
-    /// stack-note parsers).
+    /// Index of the section name string table entry (read only by the note
+    /// locators).
     pub e_shstrndx: u16,
 }
 
@@ -644,7 +647,8 @@ pub fn load_segments_metadata<'a>(
 /// # Errors
 ///
 /// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond the ELF image, or [`ElfError::PhdrTableOverflow`] if a
+/// extends beyond the ELF image or past its `p_memsz`, so the template would
+/// not fit the block sized to it, or [`ElfError::PhdrTableOverflow`] if a
 /// program header lies outside `data`.
 pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, ElfError>
 {
@@ -663,7 +667,7 @@ pub fn tls_segment(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<TlsSegment>, 
         let seg_end = (phdr.p_offset as usize).checked_add(phdr.p_filesz as usize);
         match seg_end
         {
-            Some(end) if end <= data.len() =>
+            Some(end) if end <= data.len() && phdr.p_filesz <= phdr.p_memsz =>
             {}
             _ => return Err(ElfError::SegmentOverflow),
         }
@@ -1088,8 +1092,9 @@ fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
 /// # Errors
 ///
 /// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond `file_size`, or [`ElfError::PhdrTableOverflow`] if a
-/// program header lies outside `header_data`.
+/// extends beyond `file_size` or past its `p_memsz`, or
+/// [`ElfError::PhdrTableOverflow`] if a program header lies outside
+/// `header_data`.
 pub fn tls_segment_metadata(
     ehdr: &Elf64Ehdr,
     header_data: &[u8],
@@ -1111,7 +1116,7 @@ pub fn tls_segment_metadata(
         let seg_end = phdr.p_offset.checked_add(phdr.p_filesz);
         match seg_end
         {
-            Some(end) if end <= file_size =>
+            Some(end) if end <= file_size && phdr.p_filesz <= phdr.p_memsz =>
             {}
             _ => return Err(ElfError::SegmentOverflow),
         }
@@ -2314,6 +2319,57 @@ mod tests
                 executable: true,
                 ..
             })]
+        ));
+    }
+
+    /// Defect caught: a `PT_TLS` template larger than its `p_memsz` was
+    /// accepted, and init, sizing the block to `p_memsz`, skipped copying it
+    /// and still started procmgr.
+    #[test]
+    fn a_tls_template_past_its_memory_size_is_refused()
+    {
+        let mut img = vec![0u8; 0x400];
+        put(&mut img, 0, &ehdr_bytes(ET_EXEC, 2));
+        put(
+            &mut img,
+            64,
+            &phdr_bytes(PT_LOAD, PF_R | PF_X, 0, 0, 0x400, 0x400),
+        );
+        put(
+            &mut img,
+            64 + 56,
+            &phdr_bytes(PT_TLS, PF_R, 0x200, 0x200, 0x20, 0x10),
+        );
+        let (ehdr, _) = valid_executable(&img);
+        assert!(matches!(
+            tls_segment(&ehdr, &img),
+            Err(ElfError::SegmentOverflow)
+        ));
+        assert!(matches!(
+            tls_segment_metadata(&ehdr, &img, 0x400),
+            Err(ElfError::SegmentOverflow)
+        ));
+        // A template that fills its block exactly is taken.
+        put(
+            &mut img,
+            64 + 56,
+            &phdr_bytes(PT_TLS, PF_R, 0x200, 0x200, 0x20, 0x20),
+        );
+        assert!(matches!(
+            tls_segment(&ehdr, &img),
+            Ok(Some(TlsSegment {
+                filesz: 0x20,
+                memsz: 0x20,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            tls_segment_metadata(&ehdr, &img, 0x400),
+            Ok(Some(TlsSegment {
+                filesz: 0x20,
+                memsz: 0x20,
+                ..
+            }))
         ));
     }
 

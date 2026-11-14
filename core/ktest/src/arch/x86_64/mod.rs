@@ -94,7 +94,9 @@ pub const ROUTABLE_HIGH_IRQ_IDS: &[u32] = &[23];
 /// `SYS_CAP_INFO` to give a message-signaled Interrupt cap: a
 /// compatibility-format address in the local APIC's message window
 /// (`0xFEEx_x000`, physical destination, no redirection hint), and a device
-/// vector (33-249) with fixed delivery and edge trigger.
+/// vector (33-249) with fixed delivery and edge trigger. These are the formats
+/// with interrupt remapping off, which ktest never turns on
+/// (`unit::hw::irq_remap_refusals`).
 pub fn msi_message_plausible(address: u64, data: u64) -> bool
 {
     address & !0x000F_F000 == 0xFEE0_0000 && (33..=249).contains(&data)

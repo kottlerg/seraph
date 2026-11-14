@@ -914,6 +914,12 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
             step(&format!("Ended the batch; its state is {}", kept.display()));
         }
         OrchCommand::Orchestrator { id: None } => println!("{}", orchestrator_id(&load(&dir)?)?),
+        OrchCommand::Grant {
+            command: OrchGrantCommand::Clear,
+        } => println!(
+            "{}",
+            grant_clear_everywhere(&dir, &host_lock::lock_dir(ctx), secs)?
+        ),
         command @ (OrchCommand::Orchestrator { id: Some(_) }
         | OrchCommand::Worker(_)
         | OrchCommand::Grant { .. }
@@ -930,9 +936,33 @@ pub fn run(ctx: &BuildContext, args: &OrchArgs) -> Result<()>
     Ok(())
 }
 
+/// End the exclusive grant (`grant clear`): remove it from the host lock in
+/// `lock_dir` first, whatever the batch state in `dir` records, then from the
+/// state. A grant the state no longer records (a state lost while the host
+/// lock in the git common directory kept its grant, or a clear that failed
+/// after the state's was saved) is so still removed, and only the state's
+/// refusal is reported.
+fn grant_clear_everywhere(dir: &Path, lock_dir: &Path, secs: u64) -> Result<String>
+{
+    let host_holder = host_lock::read_grant(lock_dir).ok().flatten();
+    host_lock::clear_grant(lock_dir)?;
+    match change(dir, &Change::GrantClear, secs)
+    {
+        Ok(line) => Ok(line),
+        Err(refused) => match host_holder
+        {
+            Some(holder) => Ok(format!(
+                "host grant of {holder} ended; the batch state recorded none ({refused:#})"
+            )),
+            None => Err(refused),
+        },
+    }
+}
+
 /// Carry a change of the exclusive grant to the host lock, whose boots it
 /// admits (`crate::host_lock`): `grant set` records the holder there, and
-/// `grant clear` removes it.
+/// `grant clear` removes it ([`grant_clear_everywhere`], which `run` calls
+/// first).
 fn apply_to_host(ctx: &BuildContext, change: &Change) -> Result<()>
 {
     match change
@@ -1336,6 +1366,30 @@ mod tests
         assert!(log(&dir, "an event", SECS).is_err());
         end(&dir, SECS).unwrap_err();
         assert!(!dir.exists());
+    }
+
+    /// Defect caught: with a host grant the batch state did not record, `grant
+    /// clear` refused before the host lock was touched, so no orch command
+    /// could remove the grant and every boot not passed it was refused.
+    #[test]
+    fn grant_clear_removes_a_host_grant_the_state_does_not_record()
+    {
+        let dir = scratch("host-grant");
+        let lock_dir = scratch("host-grant-lock");
+        crate::host_lock::write_grant(&lock_dir, "W1", "run-parallel --smp 8").unwrap();
+        // No batch state at all.
+        let line = grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap();
+        assert!(line.contains("host grant of W1 ended"));
+        assert_eq!(crate::host_lock::read_grant(&lock_dir).unwrap(), None);
+        // A batch whose state records no grant.
+        start(&dir, "close out the milestone", SECS).unwrap();
+        crate::host_lock::write_grant(&lock_dir, "W2", "run-parallel --smp 8").unwrap();
+        grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap();
+        assert_eq!(crate::host_lock::read_grant(&lock_dir).unwrap(), None);
+        // With no grant anywhere the state's refusal stands.
+        grant_clear_everywhere(&dir, &lock_dir, SECS).unwrap_err();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&lock_dir);
     }
 
     #[test]

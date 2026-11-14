@@ -4,13 +4,14 @@ x86-64 CMOS / MC146818-compatible RTC driver. Serves
 [`rtc_labels::RTC_GET_EPOCH_TIME`](../../../shared/ipc/src/lib.rs).
 
 Installed to `/services/drivers/cmos-rtc` on the rootfs. Bound by
-devmgr on x86-64 platforms to the platform device record the ACPI namespace gives `PNP0B00`
+devmgr on x86-64 platforms to the platform device record the ACPI namespace gives `PNP0B00`,
+`PNP0B01` or `PNP0B02` as its `_HID` or a `_CID`
 ([Device Management](../../../docs/device-management.md#driver-binary-sources)),
 `procmgr_labels::CREATE_FROM_FILE` against a vfsd file SEND devmgr
 walks to from the `LOOKUP | READ | READDIR` `/services/drivers/` subtree cap svcmgr
 delivers post-handover via `devmgr_labels::SET_DRIVERS_DIR`. The driver carries a declaration in
-the ELF note section `.note.seraph.driver` (ACPI `PNP0B00`), which the drivers-directory pass
-matches against that record.
+the ELF note section `.note.seraph.driver` (each of those IDs as `_HID` and as `_CID`), which the
+drivers-directory pass matches against that record.
 [devmgr](../../devmgr/docs/responsibilities.md#responsibilities) owns
 the driver's service endpoint and mints client SEND caps on
 `devmgr_labels::QUERY_DEVICE` on the `rtc` class SEND, each badged with

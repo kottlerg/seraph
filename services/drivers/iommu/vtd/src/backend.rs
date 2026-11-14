@@ -395,9 +395,25 @@ impl Vtd
         u.wait(|u| u.read32(regs::GSTS) & regs::G_SIRTP != 0)?;
         self.submit(unit, &[queue::iec_global()])?;
         let u = self.unit(unit)?;
-        let gsts = u.read32(regs::GSTS);
-        u.write32(regs::GCMD, regs::gcmd_remap_on(gsts));
-        u.wait(|u| u.read32(regs::GSTS) & (regs::G_IRE | regs::G_CFI) == regs::G_IRE)
+        let fields = regs::G_IRE | regs::G_CFI;
+        for _ in 0..regs::REMAP_ON_STEPS
+        {
+            let Some(command) = regs::remap_on_step(u.read32(regs::GSTS))
+            else
+            {
+                return Ok(());
+            };
+            u.write32(regs::GCMD, command);
+            u.wait(|u| u.read32(regs::GSTS) & fields == command & fields)?;
+        }
+        if regs::remap_on_step(u.read32(regs::GSTS)).is_none()
+        {
+            Ok(())
+        }
+        else
+        {
+            Err(BackendError::Timeout)
+        }
     }
 
     /// Write a two-word entry of the table page `table` at word `index`, the

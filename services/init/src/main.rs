@@ -216,8 +216,8 @@ pub(crate) fn find_cap_by_type(info: &InitInfo, wanted: CapType) -> Option<u64>
 /// `advance_cap` records at most one orphan per cap it moves to, and every
 /// usable-RAM cap has a descriptor, so the orphans never outnumber
 /// `InitInfo.memory_count` and the table holds them on any firmware map the
-/// kernel can describe. The table lives in init's BSS (about 43 KiB, sized
-/// before init can allocate), whose pages memmgr's pool takes at init's reap.
+/// kernel can describe. The table lives in init's BSS (64 KiB, sized before
+/// init can allocate), whose pages memmgr's pool takes at init's reap.
 const MAX_ORPHAN_MEMORY_CAPS: usize =
     INIT_INFO_MAX_PAGES * PAGE_SIZE as usize / core::mem::size_of::<CapDescriptor>();
 

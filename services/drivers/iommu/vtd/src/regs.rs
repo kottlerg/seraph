@@ -99,13 +99,31 @@ pub const fn gcmd_clear(gsts: u32, bit: u32) -> u32
     gsts & !G_ONE_SHOT & !bit
 }
 
-/// The value written to `GCMD` to turn interrupt remapping on with
-/// compatibility-format interrupts blocked, keeping every other persistent
-/// state `gsts` reports.
+/// Writes [`remap_on_step`] makes at most: interrupt remapping on, then
+/// compatibility-format interrupts blocked.
+pub const REMAP_ON_STEPS: usize = 2;
+
+/// The next value written to `GCMD` to turn interrupt remapping on with
+/// compatibility-format interrupts blocked, from the `GSTS` the unit reports
+/// now; `None` once both hold. Each write changes one control field, as the
+/// Global Command Register's definition requires of software (VT-d
+/// specification section 11.4.4): `IRE` set first, then `CFI` cleared when
+/// the firmware left compatibility format passing through.
 #[must_use]
-pub const fn gcmd_remap_on(gsts: u32) -> u32
+pub const fn remap_on_step(gsts: u32) -> Option<u32>
 {
-    (gsts & !G_ONE_SHOT & !G_CFI) | G_IRE
+    if gsts & G_IRE == 0
+    {
+        Some(gcmd_set(gsts, G_IRE))
+    }
+    else if gsts & G_CFI != 0
+    {
+        Some(gcmd_clear(gsts, G_CFI))
+    }
+    else
+    {
+        None
+    }
 }
 
 /// The fields of `CAP` the driver uses.
@@ -296,13 +314,23 @@ mod tests
         assert_eq!(gcmd_clear(G_TE | G_QIE | G_SRTP, G_QIE), G_TE);
     }
 
+    /// Defect caught: `IRE` set and `CFI` cleared in one `GCMD` write, two
+    /// control fields changed at once.
     #[test]
-    fn remapping_turns_on_with_compatibility_format_interrupts_blocked()
+    fn remapping_turns_on_then_blocks_compatibility_format_one_write_each()
     {
         // Firmware left compatibility format passing through and a one-shot
-        // pointer set reported; neither is carried into the command.
+        // pointer set reported; the pointer is never carried into a command.
         let gsts = G_TE | G_QIE | G_CFI | G_SIRTP;
-        assert_eq!(gcmd_remap_on(gsts), G_TE | G_QIE | G_IRE);
+        let first = remap_on_step(gsts).unwrap();
+        assert_eq!(first, G_TE | G_QIE | G_CFI | G_IRE);
+        let second = remap_on_step(first).unwrap();
+        assert_eq!(second, G_TE | G_QIE | G_IRE);
+        assert_eq!(remap_on_step(second), None);
+        // With compatibility format already blocked, one write does it.
+        let first = remap_on_step(G_TE | G_QIE).unwrap();
+        assert_eq!(first, G_TE | G_QIE | G_IRE);
+        assert_eq!(remap_on_step(first), None);
     }
 
     #[test]

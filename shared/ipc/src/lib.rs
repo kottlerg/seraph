@@ -1404,7 +1404,7 @@ pub mod published_names
     pub const DEVMGR_REGISTRY: &[u8] = b"devmgr.registry";
 
     /// Prefix of the names svcmgr publishes devmgr's class SENDs under:
-    /// `devmgr.class.<class>`, one for each class file of
+    /// `devmgr.class.<stem>`, one for each class file of
     /// `/config/devmgr/classes/`, each the SEND
     /// `devmgr_labels::MINT_CLASS_SEND` returns for the class with the verb
     /// mask its file sets. Seed-only: a service reaches a class's drivers
@@ -1462,22 +1462,22 @@ pub const RTC_LABELS_VERSION: u32 = 1;
 /// [`timed_labels::GET_WALL_TIME`] thereafter without further driver IPC.
 ///
 /// **Acquisition path**: the RTC driver binary lives on the rootfs disk
-/// at `/services/drivers/<chip>` and is loaded by devmgr from there.
-/// svcmgr walks its system root to `/services/drivers/` and hands devmgr a
+/// under `/services/drivers/` and is loaded by devmgr from there. svcmgr
+/// walks its system root to `/services/drivers/` and hands devmgr a
 /// `LOOKUP | READ | READDIR`-attenuated subtree cap via
-/// [`devmgr_labels::SET_DRIVERS_DIR`]. Devmgr replies SUCCESS to that
-/// handshake *before* doing any spawn work (so svcmgr never blocks on
-/// driver bring-up); it then walks the per-arch driver name
-/// (`cmos-rtc` on x86-64, `goldfish-rtc` on RISC-V) from the subtree
-/// cap, calls [`procmgr_labels::CREATE_FROM_FILE`], and delivers the
-/// per-arch hardware authority cap (ISA `IoPort` for CMOS; MMIO
-/// aperture for goldfish-rtc) through the bootstrap protocol — all
-/// between the `SET_DRIVERS_DIR` handler's `ipc_reply` and the next
-/// `ipc_recv`. See [`devmgr_labels::SET_DRIVERS_DIR`] for the nested-IPC
-/// constraint that forces this ordering. Spawn is at-most-once per
-/// boot; failure is sticky and clients see
-/// [`devmgr_errors::NO_DEVICE`] permanently. RTC drivers are
-/// **not** carried in the boot bundle.
+/// [`devmgr_labels::SET_DRIVERS_DIR`]; devmgr replies before any spawn
+/// work. No step names an RTC driver: in the drivers-directory pass, on
+/// devmgr's control thread while its registry workers go on serving,
+/// devmgr binds the driver whose declaration (`rtc` class) matches the
+/// RTC's platform device record (`PNP0B00`, `PNP0B01` or `PNP0B02` on
+/// x86-64, the `google,goldfish-rtc` key on RISC-V), spawns it through
+/// [`procmgr_labels::CREATE_FROM_FILE`], and delivers the record's
+/// hardware authority cap (ISA `IoPort` for CMOS; MMIO aperture for
+/// goldfish-rtc) through the bootstrap protocol. An `rtc`
+/// [`devmgr_labels::QUERY_DEVICE`] that would find no driver waits until
+/// the pass and its settle are done. Spawn is at-most-once per boot;
+/// failure is sticky and clients see [`devmgr_errors::NO_DEVICE`]
+/// permanently. RTC drivers are **not** carried in the boot bundle.
 ///
 /// Adding a new RTC chip is a matter of writing a driver crate that
 /// answers this single label and binding it through devmgr's per-board
@@ -1980,15 +1980,16 @@ pub mod devmgr_labels
     ///
     /// The caller's badge identifies the device by indexing devmgr's
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
-    /// entry, or an entry that carries no startup info (the serial and RTC
-    /// drivers', and that of a PCI function presenting no `VirtIO` register
-    /// layout), gets
-    /// `INVALID_REQUEST`. The catalog only grows (the entry of a driver that
-    /// failed to spawn or was withdrawn stays),
-    /// so a badge is never recycled and its `u64` width bounds no catalog
-    /// size. No authority bit is checked. Devmgr stores the payload bytes
-    /// opaquely; the per-class shape lives in the driver crate. Reply schema
-    /// (generic for every kind):
+    /// entry, or an entry that carries no startup info (the serial driver's,
+    /// the goldfish RTC driver's, a CMOS RTC driver's when the FADT names no
+    /// century register, and that of a PCI function presenting no `VirtIO`
+    /// register layout), gets `INVALID_REQUEST`. A CMOS RTC driver's entry
+    /// otherwise carries [`super::device_info_kind::RTC_CENTURY`]. The
+    /// catalog only grows (the entry of a driver that failed to spawn or was
+    /// withdrawn stays), so a badge is never recycled and its `u64` width
+    /// bounds no catalog size. No authority bit is checked. Devmgr stores the
+    /// payload bytes opaquely; the per-class shape lives in the driver crate.
+    /// Reply schema (generic for every kind):
     /// - `word[0]` = `kind` discriminant ([`super::device_info_kind`])
     /// - `word[1]` = `version` (per-kind payload schema version)
     /// - `word[2]` = `byte_len` (valid bytes in the payload)
@@ -2017,10 +2018,11 @@ pub mod devmgr_labels
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
-    /// work, so svcmgr never blocks on driver bring-up. The spawn of the
-    /// per-arch RTC driver, the drivers-directory pass (the listing, the
-    /// read of each entry's driver declaration, and the bind of every PCI
-    /// device still unbound that a declaration matches), the
+    /// work, so svcmgr never blocks on driver bring-up. The
+    /// drivers-directory pass (the listing, the read of each entry's driver
+    /// declaration, and the bind of every PCI device and platform device
+    /// record still unbound that a declaration matches, the RTC's among
+    /// them), the
     /// [`super::procmgr_labels::CREATE_FROM_FILE`] calls and bootstrap
     /// rounds they make, and the settle that waits for each driver to
     /// report ready ([`DRIVER_READY`]), run on devmgr's control thread
@@ -2646,7 +2648,8 @@ pub mod devmgr_dma_labels
     /// driver that confines the device did not remove the mapping, which
     /// stays standing), or `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
     pub const DMA_UNMAP: u64 = 2;
-    /// Report the IOMMU faults devmgr has taken for the caller's device.
+    /// Report the DMA translation faults devmgr has taken for the caller's
+    /// device; an interrupt-remapping fault is logged only.
     ///
     /// devmgr first takes the faults the IOMMU driver has recorded
     /// (`iommu_labels::TAKE_FAULTS`) and logs each, as it does periodically.
@@ -2952,7 +2955,9 @@ pub mod iommu_labels
     /// `SUCCESS` with `data[0]` = 1 when the destinations are 32-bit, 0
     /// when they are 8-bit; or an error code, with remapping off:
     /// `INVALID_REQUEST` for a size outside the bound, a table already set
-    /// up, or an IOMMU family or unit that does not remap interrupts.
+    /// up, units that translate more than one PCI segment (an entry names
+    /// its requester by a source ID with no segment), or an IOMMU family or
+    /// unit that does not remap interrupts.
     pub const REMAP_SETUP: u64 = 9;
     /// Make one entry of the remapping table deliver to a CPU's vector for
     /// one requester, replacing what it held; the reply follows the

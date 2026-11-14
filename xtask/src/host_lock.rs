@@ -58,6 +58,10 @@ pub const SMALL_BOOTS_MAX: u32 = 3;
 /// How often a command started with `--wait-host` asks again.
 const WAIT_POLL: Duration = Duration::from_secs(10);
 
+/// How often a host-lock wait reads whether Ctrl+C ended it: short enough
+/// that the wait ends at once to the user.
+const INTERRUPT_SLICE: Duration = Duration::from_millis(100);
+
 /// The lock directory's name under the git common directory.
 const LOCK_DIR_NAME: &str = "seraph-host";
 const ADMISSION_LOCK: &str = "admission.lock";
@@ -739,7 +743,9 @@ pub fn try_admit(
 
 /// Admit `request` in `dir`, asking again every `poll` until admitted or
 /// until `wait` has passed (no wait refuses at once). A refusal at the bound
-/// is the command's error, naming the last reason.
+/// is the command's error, naming the last reason; so is a wait that
+/// `interrupted` reports ended (Ctrl+C, `crate::term::signal::interrupted`),
+/// which is read every [`INTERRUPT_SLICE`] of it.
 pub fn admit(
     dir: &Path,
     request: &Request,
@@ -747,6 +753,7 @@ pub fn admit(
     wait: Option<Duration>,
     poll: Duration,
     probe: &dyn Fn() -> Probe,
+    interrupted: &dyn Fn() -> bool,
 ) -> Result<Admission>
 {
     let started = Instant::now();
@@ -770,9 +777,23 @@ pub fn admit(
                         "waiting for the host (up to {}s): {refusal}",
                         bound.as_secs()
                     ));
-                    last_printed = Some(refusal);
+                    last_printed = Some(refusal.clone());
                 }
-                std::thread::sleep(poll.min(bound.saturating_sub(waited)));
+                let pause = poll.min(bound.saturating_sub(waited));
+                let paused = Instant::now();
+                loop
+                {
+                    if interrupted()
+                    {
+                        bail!("interrupted while waiting for the host: {refusal}");
+                    }
+                    let left = pause.saturating_sub(paused.elapsed());
+                    if left.is_zero()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(left.min(INTERRUPT_SLICE));
+                }
             }
             Some(bound) => bail!(
                 "the host did not admit this command within --wait-host {}: {refusal}",
@@ -827,6 +848,7 @@ fn admit_command(ctx: &Context, host: &HostArgs, request: &Request) -> Result<Ad
         wait,
         WAIT_POLL,
         &probe_host,
+        &crate::term::signal::interrupted,
     )
 }
 
@@ -961,6 +983,7 @@ mod tests
             Some(Duration::from_secs(5)),
             Duration::from_millis(20),
             &|| quiet(),
+            &|| false,
         )
     }
 
@@ -1260,6 +1283,7 @@ mod tests
             Some(Duration::from_millis(300)),
             Duration::from_millis(50),
             &|| quiet(),
+            &|| false,
         )
         .unwrap_err();
         assert!(started.elapsed() >= Duration::from_millis(300));
@@ -1267,7 +1291,15 @@ mod tests
         assert!(text.contains("did not admit"), "{text}");
         assert!(text.contains("runs alone"), "{text}");
 
-        let unwaited = admit(&dir, &large, &claim(), None, Duration::ZERO, &|| quiet());
+        let unwaited = admit(
+            &dir,
+            &large,
+            &claim(),
+            None,
+            Duration::ZERO,
+            &|| quiet(),
+            &|| false,
+        );
         unwaited.unwrap_err();
 
         // Released mid-wait, the waiting command gets in.
@@ -1282,10 +1314,40 @@ mod tests
             Some(Duration::from_secs(10)),
             Duration::from_millis(50),
             &|| quiet(),
+            &|| false,
         );
         releaser.join().unwrap();
         assert!(admitted.is_ok());
         drop(admitted);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Defect caught: Ctrl+C during a `--wait-host` wait did nothing, the
+    /// handler being a no-op and the wait a sleep in xtask itself, so the
+    /// command polled on until admitted or out of time.
+    #[test]
+    fn an_interrupt_ends_the_wait_at_once()
+    {
+        let dir = scratch("interrupt");
+        let large = boot(8, 1, BootMode::Shared);
+        let held = try_admit(&dir, &large, &claim(), &|| quiet()).unwrap();
+        let started = Instant::now();
+        let asked = std::sync::atomic::AtomicU32::new(0);
+        let err = admit(
+            &dir,
+            &large,
+            &claim(),
+            Some(Duration::from_secs(60)),
+            Duration::from_secs(10),
+            &|| quiet(),
+            // Interrupted on the second look, inside the first poll's sleep.
+            &|| asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1,
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let text = format!("{err:#}");
+        assert!(text.contains("interrupted"), "{text}");
+        drop(held);
         fs::remove_dir_all(&dir).unwrap();
     }
 

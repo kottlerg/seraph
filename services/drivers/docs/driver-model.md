@@ -26,8 +26,10 @@ when it exits on its own.
    of its own; [docs/driver-binding.md](../../../docs/driver-binding.md) is the
    design.
 4. A driver serves client requests on the service endpoint devmgr creates and delivers in its
-   bootstrap; devmgr keeps the endpoint and mints client SEND caps from its device
-   registry (`QUERY_*_DEVICE`). A driver MUST report `DRIVER_READY` on its devmgr query cap once
+   bootstrap; devmgr keeps the endpoint and mints client SEND caps to it through the
+   class-keyed `QUERY_DEVICE`, sent on a class SEND that svcmgr publishes as
+   `devmgr.class.<stem>` ([docs/driver-binding.md](../../../docs/driver-binding.md) § Device
+   Classes). A driver MUST report `DRIVER_READY` on its devmgr query cap once
    its device is set up, immediately before its service loop (`ipc::report_driver_ready`), and
    exit when devmgr refuses the report: devmgr serves its endpoint only after that report, and
    destroys and withdraws a driver that has not reported within its settle bound; see

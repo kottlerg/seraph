@@ -305,8 +305,8 @@ unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u64]) -> Result<()
     r
 }
 
-/// Move the caps named by `src_handles[..cap_count]` from `src_tcb`'s
-/// `CSpace` to `dst_tcb`'s.
+/// Move the caps named by `src_handles[..cap_count]` from the `CSpace` that
+/// `src` names to the one `dst` names.
 ///
 /// All-or-nothing at the start: if either `CSpace` is gone, any slot is
 /// null/invalid, repeated within the same message, pinned by an in-flight
@@ -316,29 +316,31 @@ unsafe fn prevalidate_sender_caps(cs: *mut CSpace, handles: &[u64]) -> Result<()
 /// caps are transferred.
 /// Validation, destination pre-allocation, and the first batch of every
 /// move run under one `DERIVATION_LOCK` hold with both `CSpace`s resolved
-/// through the registry from each TCB's `cspace_id`/`cspace_epoch`; moves
-/// that need further batches are driven by `move_cap_drive` after the
-/// locks drop. Registry resolution, batching, and the handle each
-/// degraded move delivers follow core/kernel/docs/capability-internals.md
-/// § Capability Transfer in IPC and § Move.
+/// through the registry from the identities the caller copied out of each
+/// thread while it was live; moves that need further batches are driven by
+/// `move_cap_drive` after the locks drop. Registry resolution, batching, and
+/// the handle each degraded move delivers follow
+/// core/kernel/docs/capability-internals.md § Capability Transfer in IPC and
+/// § Move.
+///
+/// No thread is read here: a sender a receive bound can be woken by a
+/// canceller and freed once the receive drops `ep.lock`, so its identity is
+/// taken under that lock (`BoundSender`).
 ///
 /// On success, writes the destination cap handles to `dst_handles_out` and
 /// returns the number of caps transferred. The caller is responsible for
 /// writing the results to the appropriate IPC buffer.
 ///
 /// # Safety
-/// `src_tcb` and `dst_tcb` must be valid TCBs for the duration of the call:
-/// the running thread, a sender parked `BlockedOnReply`, or a receiver
-/// pinned by `wake_in_flight`. Neither thread's `CSpace` needs to be held.
 /// Syscall context with interrupts disabled and no lock held: the locks are
 /// taken here, and a completed move's freed source reference is dropped
 /// through `release_moved_object`, whose contract excludes every lock it
 /// names.
 #[cfg(not(test))]
 unsafe fn transfer_caps(
-    src_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    src: crate::cap::CSpaceIdentity,
     src_handles: &[u64],
-    dst_tcb: *mut crate::sched::thread::ThreadControlBlock,
+    dst: crate::cap::CSpaceIdentity,
     dst_handles_out: &mut [u64; MSG_CAP_SLOTS_MAX],
 ) -> Result<usize, SyscallError>
 {
@@ -355,21 +357,7 @@ unsafe fn transfer_caps(
 
     crate::cap::DERIVATION_LOCK.write_lock();
 
-    // SAFETY: src_tcb is valid per the caller contract; cspace_id is
-    // read-only after creation.
-    let src_id = unsafe { (*src_tcb).cspace_id };
-    // SAFETY: src_tcb is valid per the caller contract; cspace_epoch is
-    // read-only after creation.
-    let src_epoch = unsafe { (*src_tcb).cspace_epoch };
-    let src_resolved = crate::cap::lookup_cspace(src_id, src_epoch);
-    // SAFETY: dst_tcb is valid per the caller contract; cspace_id is
-    // read-only after creation.
-    let dst_id = unsafe { (*dst_tcb).cspace_id };
-    // SAFETY: dst_tcb is valid per the caller contract; cspace_epoch is
-    // read-only after creation.
-    let dst_epoch = unsafe { (*dst_tcb).cspace_epoch };
-    let resolved = (src_resolved, crate::cap::lookup_cspace(dst_id, dst_epoch));
-    let (Some(src_cspace), Some(dst_cspace)) = resolved
+    let (Some(src_cspace), Some(dst_cspace)) = (src.lookup(), dst.lookup())
     else
     {
         crate::cap::DERIVATION_LOCK.write_unlock();
@@ -489,6 +477,32 @@ unsafe fn transfer_caps(
 
 // ── IPC syscall handlers ──────────────────────────────────────────────────────
 
+/// [`transfer_caps`] between two threads both live for the whole call, whose
+/// `CSpace` identities are copied here: the path for a sender and a receiver
+/// neither of which a canceller can free meanwhile. A sender a receive bound
+/// is not one of them; `sys_ipc_recv` passes the identity `BoundSender`
+/// copied under `ep.lock` to [`transfer_caps`] instead.
+///
+/// # Safety
+/// `src_tcb` and `dst_tcb` must be valid TCBs for the duration of the call:
+/// the running thread, a thread a won reply claim pins, or one a
+/// `wake_in_flight` pin keeps. [`transfer_caps`]'s contract holds.
+#[cfg(not(test))]
+unsafe fn transfer_caps_between_threads(
+    src_tcb: *const crate::sched::thread::ThreadControlBlock,
+    src_handles: &[u64],
+    dst_tcb: *const crate::sched::thread::ThreadControlBlock,
+    dst_handles_out: &mut [u64; MSG_CAP_SLOTS_MAX],
+) -> Result<usize, SyscallError>
+{
+    // SAFETY: src_tcb is valid for the call (contract).
+    let src = unsafe { crate::cap::CSpaceIdentity::of_thread(src_tcb) };
+    // SAFETY: dst_tcb is valid for the call (contract).
+    let dst = unsafe { crate::cap::CSpaceIdentity::of_thread(dst_tcb) };
+    // SAFETY: transfer_caps's contract holds (contract).
+    unsafe { transfer_caps(src, src_handles, dst, dst_handles_out) }
+}
+
 /// Move the caps carried by a `SYS_IPC_CALL` message from the running caller's
 /// `CSpace` into a server that was already blocked in recv, stashing the
 /// destination handles in the server's `ipc_msg` so it publishes them when
@@ -526,7 +540,7 @@ unsafe fn deliver_call_caps(
     // SAFETY: caller_tcb is the running caller; server_tcb a valid TCB
     // pinned by wake_in_flight; this function's caller holds no lock.
     let transferred = unsafe {
-        transfer_caps(
+        transfer_caps_between_threads(
             caller_tcb,
             leading(&msg.cap_slots, msg.cap_count),
             server_tcb,
@@ -976,9 +990,14 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         unsafe { crate::ipc::endpoint::endpoint_recv(ep_state, tcb, deadline) }.ok()
     };
 
-    if let Some((caller, msg)) = result
+    if let Some(bound) = result
     {
-        // A caller was waiting; deliver message immediately.
+        // A caller was waiting; deliver message immediately. The caller's TCB
+        // is not read from here on: once the endpoint lock dropped, a
+        // canceller (a stop, a timed call's expiry, a teardown) may have
+        // claimed the binding and woken it, and it may have exited and been
+        // freed. Its message and CSpace identity were copied under the lock.
+        let msg = &bound.msg;
         // SAFETY: tcb validated above.
         let server_buf = unsafe { (*tcb).ipc_buffer };
 
@@ -996,14 +1015,14 @@ pub fn sys_ipc_recv(tf: UserFrame) -> Result<u64, SyscallError>
         let mut dst_handles = [0u64; MSG_CAP_SLOTS_MAX];
         if msg.cap_count > 0
         {
-            // SAFETY: caller returned by endpoint_recv is a valid TCB parked
-            // BlockedOnReply; tcb is the running receiver; endpoint_recv
-            // released ep.lock, so no lock is held.
+            // SAFETY: tcb is the running receiver.
+            let dst = unsafe { crate::cap::CSpaceIdentity::of_thread(tcb) };
+            // SAFETY: the receive released ep.lock, so no lock is held.
             transferred = unsafe {
                 transfer_caps(
-                    caller,
+                    bound.cspace,
                     leading(&msg.cap_slots, msg.cap_count),
-                    tcb,
+                    dst,
                     &mut dst_handles,
                 )
             }
@@ -1281,13 +1300,9 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
             // CSpace is resolved through the registry
             // (core/kernel/docs/capability-internals.md § Move).
             crate::cap::DERIVATION_LOCK.write_lock();
-            // SAFETY: caller is pinned by the won claim, so its TCB is live;
-            // cspace_id is read-only after creation.
-            let cspace_id = unsafe { (*caller).cspace_id };
-            // SAFETY: caller is pinned by the won claim, so its TCB is live;
-            // cspace_epoch is read-only after creation.
-            let cspace_epoch = unsafe { (*caller).cspace_epoch };
-            let r = match crate::cap::lookup_cspace(cspace_id, cspace_epoch)
+            // SAFETY: caller is pinned by the won claim, so its TCB is live.
+            let caller_cspace = unsafe { crate::cap::CSpaceIdentity::of_thread(caller) };
+            let r = match caller_cspace.lookup()
             {
                 Some(cs) =>
                 {
@@ -1328,7 +1343,7 @@ pub fn sys_ipc_reply(tf: UserFrame) -> Result<u64, SyscallError>
         // SAFETY: tcb is the running server; caller is pinned by the claim
         // and parked BlockedOnReply; no lock is held.
         let transfer = unsafe {
-            transfer_caps(
+            transfer_caps_between_threads(
                 tcb,
                 leading(&msg.cap_slots, cap_count),
                 caller,

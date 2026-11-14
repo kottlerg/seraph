@@ -820,17 +820,17 @@ impl ProcessTable
         self.entries.get(start..).unwrap_or_default().iter()
     }
 
-    /// Lightweight status lookup for `QUERY_PROCESS`. Returns
-    /// `(started, thread_cap)` when an entry is present; `None` if the
-    /// badge is unknown (already reaped or never existed).
-    ///
-    /// `thread_cap` is procmgr's `CSpace` slot for the child's main thread,
-    /// suitable for `cap_info`'s `CAP_INFO_THREAD_STATE` selector to
-    /// fetch the kernel-authoritative lifecycle snapshot.
+    /// Lightweight status lookup for `QUERY_PROCESS`: the entry's
+    /// [`QueryEntry`] when one is present; `None` if the badge is unknown
+    /// (already reaped or never existed).
     #[must_use]
-    pub fn query_by_badge(&self, badge: u64) -> Option<(bool, u64)>
+    pub fn query_by_badge(&self, badge: u64) -> Option<QueryEntry>
     {
-        self.find_by_badge(badge).map(|e| (e.started, e.thread_cap))
+        self.find_by_badge(badge).map(|e| QueryEntry {
+            started: e.started,
+            thread_cap: e.thread_cap,
+            aspace_cap: e.aspace_cap,
+        })
     }
 
     /// memmgr badge of the live entry whose badge matches, for the
@@ -1105,6 +1105,65 @@ pub fn resolve_spawn_sched(
         return None;
     }
     Some((priority, band_max))
+}
+
+// ── Process query ───────────────────────────────────────────────────────────
+
+/// What `QUERY_PROCESS` reads of a live entry ([`ProcessTable::query_by_badge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QueryEntry
+{
+    /// Whether the process was started.
+    pub started: bool,
+    /// procmgr's slot for the child's main thread, for the kernel's
+    /// `CAP_INFO_THREAD_STATE`.
+    pub thread_cap: u64,
+    /// procmgr's slot for the child's address space, for the kernel's
+    /// `CAP_INFO_ASPACE_TERMINAL_FAULT`.
+    pub aspace_cap: u64,
+}
+
+/// A live entry's state as `QUERY_PROCESS` answers it ([`QueryEntry::state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueryState
+{
+    /// Dead before procmgr reaped it, with this exit reason.
+    Exited(u64),
+    /// Started and not dead.
+    Alive,
+    /// Not yet started.
+    Created,
+}
+
+impl QueryEntry
+{
+    /// The entry's state from the kernel's records, read as
+    /// [`resync_exit_reason`] reads them (`main_thread`, `exited`,
+    /// `terminal_fault`): a process whose main thread exited, or one of
+    /// whose threads took a terminal fault, is exited though procmgr has not
+    /// reaped it yet, so a caller whose wait returned on its death never sees
+    /// it alive.
+    #[must_use]
+    pub fn state(
+        &self,
+        main_thread: Option<u64>,
+        exited: u32,
+        terminal_fault: Option<u64>,
+    ) -> QueryState
+    {
+        if let Some(reason) = resync_exit_reason(main_thread, exited, terminal_fault)
+        {
+            QueryState::Exited(reason)
+        }
+        else if self.started
+        {
+            QueryState::Alive
+        }
+        else
+        {
+            QueryState::Created
+        }
+    }
 }
 
 // ── Death resync ────────────────────────────────────────────────────────────
@@ -2084,11 +2143,55 @@ mod tests
         let mut table = ProcessTable::new();
         let mut entry = entry_with_badge(16);
         entry.thread_cap = 7;
+        entry.aspace_cap = 8;
         assert_eq!(table.insert(entry), Ok(()));
-        assert_eq!(table.query_by_badge(16), Some((false, 7)));
+        let created = QueryEntry {
+            started: false,
+            thread_cap: 7,
+            aspace_cap: 8,
+        };
+        assert_eq!(table.query_by_badge(16), Some(created));
         table.find_mut_by_badge(16).expect("entry present").started = true;
-        assert_eq!(table.query_by_badge(16), Some((true, 7)));
+        assert_eq!(
+            table.query_by_badge(16),
+            Some(QueryEntry {
+                started: true,
+                ..created
+            })
+        );
         assert_eq!(table.query_by_badge(99), None);
+    }
+
+    /// Defect caught: a process whose worker thread took a terminal fault
+    /// answered ALIVE between its death post and procmgr's reap, because only
+    /// the main thread's state was read.
+    #[test]
+    fn a_query_answers_exited_for_a_main_thread_exit_or_any_terminal_fault()
+    {
+        const EXITED: u32 = 3;
+        let running = 1u64 << 32;
+        let started = QueryEntry {
+            started: true,
+            thread_cap: 7,
+            aspace_cap: 8,
+        };
+        assert_eq!(
+            started.state(Some(running), EXITED, Some(0)),
+            QueryState::Alive
+        );
+        assert_eq!(
+            started.state(Some(running), EXITED, Some(0x0E)),
+            QueryState::Exited(0x0E)
+        );
+        assert_eq!(
+            started.state(Some((u64::from(EXITED) << 32) | 5), EXITED, Some(0)),
+            QueryState::Exited(5)
+        );
+        let created = QueryEntry {
+            started: false,
+            ..started
+        };
+        assert_eq!(created.state(None, EXITED, None), QueryState::Created);
     }
 
     #[test]

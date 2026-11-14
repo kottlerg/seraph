@@ -257,12 +257,12 @@ pub fn bootstrap_caps(
                     }
                     Err(DecodeError::VersionMismatch) =>
                     {
-                        std::os::seraph::log!(warn: "bootstrap: endowment version mismatch");
+                        std::os::seraph::log!(error: "bootstrap: endowment version mismatch");
                         return None;
                     }
                     Err(DecodeError::Malformed) =>
                     {
-                        std::os::seraph::log!(warn: "bootstrap: malformed endowment CAPS round");
+                        std::os::seraph::log!(error: "bootstrap: malformed endowment CAPS round");
                         return None;
                     }
                 }

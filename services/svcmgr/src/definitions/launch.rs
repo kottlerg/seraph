@@ -129,6 +129,11 @@ pub(crate) enum LaunchKind
 ///   * `[4]` the `framebuffer` class SEND (`devmgr.class.framebuffer`), the
 ///     same for the framebuffer driver.
 ///
+/// A publication is named by its class file's stem, not by the class the
+/// file configures; these two carry the `serial` and `framebuffer` classes
+/// because the shipped `serial.class` and `framebuffer.class` set no `class`
+/// key naming another.
+///
 /// logd's recipe declares `log_sink`, which excludes `seed`, so svcmgr
 /// resolves these two publications for it here.
 /// A source absent from the endowment, an unpublished class, or a derive

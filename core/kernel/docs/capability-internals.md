@@ -1392,10 +1392,14 @@ place of the server's (see [docs/ipc-design.md](../../../docs/ipc-design.md) § 
 capability is relocated by the batched move described under [Move](#move):
 
 ```
-transfer_caps(sender_tcb, handles, receiver_tcb):
+transfer_caps(sender_cspace, handles, receiver_cspace):
+    // Each identity (cspace_id, cspace_epoch) is copied out of its thread
+    // while the thread is known to be live: the running thread, a sender
+    // under the endpoint lock before its reply binding is published, or a
+    // thread a won reply claim or a wake_in_flight pin keeps.
     one hold (derivation lock, then both CSpace locks in pointer order):
-        resolve both CSpaces through the registry from the identity each
-            TCB carries (cspace_id, cspace_epoch); either gone → refuse
+        resolve both CSpaces through the registry from the two identities;
+            either gone → refuse
         validate every handle: distinct, occupied, generation current,
             not pinned
         refuse (QuotaExceeded) if any handle's object is at REF_COUNT_LIMIT

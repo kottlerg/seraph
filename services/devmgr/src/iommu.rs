@@ -61,7 +61,9 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use driver_binding::decl::{DriverDecl, Tier};
 use firmware::binding::{Choice, MatchTable, RecordKeys, Source};
-use firmware::dma::{Confinement, ReservedError, ReservedRange, iova_limit, reserved_ranges};
+use firmware::dma::{
+    Confinement, ReservedError, ReservedRange, has_iova_space, iova_limit, reserved_ranges,
+};
 use firmware::dmar::{self, Bdf, Resolved};
 use firmware::rimt;
 use iommu_core::Scope;
@@ -102,6 +104,19 @@ impl Family
         {
             Self::Vtd => "VT-d units",
             Self::Riscv => "RISC-V IOMMUs",
+        }
+    }
+
+    /// What the address word `address` of a fault of reason `reason` the
+    /// family's driver recorded names: a VT-d interrupt-remapping fault names
+    /// a remapping table handle (`dmar::fault_site`), every other fault an
+    /// IOVA.
+    fn fault_site(self, reason: u16, address: u64) -> dmar::FaultSite
+    {
+        match self
+        {
+            Self::Vtd => dmar::fault_site(reason, address),
+            Self::Riscv => dmar::FaultSite::Iova(address),
         }
     }
 
@@ -462,7 +477,9 @@ fn drain(ep: u64)
     }
 }
 
-/// The faults devmgr has taken for each device, by requester ID.
+/// The DMA translation faults devmgr has taken for each device, by requester
+/// ID: the count and the latest's IOVA. An interrupt-remapping fault is
+/// logged only ([`take_and_log`]).
 #[derive(Default)]
 struct FaultCounts(Vec<(u64, u64, u64)>);
 
@@ -696,9 +713,10 @@ impl Iommu
     /// and those ranges, unconfined with none when no unit translates it.
     /// Logged `Err` when it is refused: the RIMT renames its device ID, its
     /// unit is not programmed, the driver has failed, its reserved regions
-    /// overlap pooled memory, pass the unit's width, or are too many, or the
-    /// `ATTACH` or a reserved mapping fails; a device attached by then is
-    /// blocked again.
+    /// overlap pooled memory, pass the unit's width, or are too many, its IOVA
+    /// limit leaves no IOVA above `IOVA_BASE` (a declared DMA width of 20 bits
+    /// or less, `firmware::dma::has_iova_space`), or the `ATTACH` or a
+    /// reserved mapping fails; a device attached by then is blocked again.
     pub fn confine(
         &self,
         name: &str,
@@ -711,6 +729,16 @@ impl Iommu
         {
             return Ok((Confinement::Unconfined, Vec::new()));
         };
+        let limit = iova_limit(self.client.width(unit), dma_width);
+        if !has_iova_space(limit)
+        {
+            std::os::seraph::log!(
+                warn: "{}: DMA address width leaves no IOVA above {:#x}; refused",
+                name,
+                firmware::dma::IOVA_BASE
+            );
+            return Err(Refused);
+        }
         let reserved = self.reserved_ranges(name, pci_dev, unit)?;
         let rid =
             iommu_labels::requester_id(pci_dev.segment, pci_dev.bus, pci_dev.dev, pci_dev.func);
@@ -748,7 +776,6 @@ impl Iommu
                 r.base.saturating_add(r.len)
             );
         }
-        let limit = iova_limit(self.client.width(unit), dma_width);
         let interrupt_range = matches!(self.topology, Topology::Dmar { .. });
         Ok((
             Confinement::Domain {
@@ -826,6 +853,22 @@ impl Iommu
         })
     }
 
+    /// What keeps interrupt remapping off on this platform
+    /// (`dmar::remap_obstacle`): a VT-d unit not handed to the driver, or
+    /// units on more than one PCI segment. `None` for an IOMMU family other
+    /// than VT-d, which [`Self::io_apic_sources`] turns away first.
+    pub fn remap_obstacle(&self) -> Option<dmar::RemapObstacle>
+    {
+        let Topology::Dmar {
+            dmar, unit_index, ..
+        } = &self.topology
+        else
+        {
+            return None;
+        };
+        dmar::remap_obstacle(dmar, unit_index.iter().map(Option::is_some))
+    }
+
     /// The DMAR's flags and the source ID of each I/O APIC its units name,
     /// by I/O APIC ID (`crate::intremap::enable`); `None` for an IOMMU
     /// family other than VT-d. An I/O APIC whose path does not resolve is
@@ -866,7 +909,9 @@ impl Iommu
     }
 }
 
-/// Take `client`'s recorded faults and log each, recording it in `counts`.
+/// Take `client`'s recorded faults and log each, recording a DMA translation
+/// fault in `counts`; a VT-d interrupt-remapping fault names a remapping
+/// table handle, not an IOVA ([`Family::fault_site`]), and is logged only.
 ///
 /// `counts` stays locked from before the take until every fault taken is
 /// recorded, so a caller that reads `counts` after its own take sees every
@@ -888,18 +933,32 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
             taken.push((rid, reason, iova));
         }
     });
-    for (rid, reason, iova) in taken
+    let family = arch::current::IOMMU_FAMILY;
+    for &(rid, reason, address) in &taken
     {
+        if let dmar::FaultSite::Iova(iova) = family.fault_site(reason, address)
+        {
+            counts.record(rid, iova);
+        }
+    }
+    drop(counts);
+    for (rid, reason, address) in taken
+    {
+        let (what, value) = match family.fault_site(reason, address)
+        {
+            dmar::FaultSite::Iova(iova) => ("IOVA", iova),
+            dmar::FaultSite::InterruptHandle(handle) => ("interrupt remapping handle", handle),
+        };
         std::os::seraph::log!(
-            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} IOVA {:#x}",
+            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} {} {:#x}",
             rid >> 16,
             (rid >> 8) & 0xff,
             (rid >> 3) & 0x1f,
             rid & 7,
             reason,
-            iova
+            what,
+            value
         );
-        counts.record(rid, iova);
     }
 }
 

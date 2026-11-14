@@ -56,12 +56,14 @@
 //!
 //! # Locking
 //! Every APLIC access is a single register write, with no read-modify-write, so
-//! none takes a lock. The per-source routes ([`SOURCE_ROUTES`]) and the EID rows
-//! are written only by [`route`], [`unroute`], [`alloc_message`] and
-//! [`free_message`], which `irq` serialises under its routing lock; [`unmask`]
-//! runs under it too, and a delivery reads the entry [`claim`] returns from its
-//! own hart's row lock-free, inside that hart's delivery gate
-//! (`irq::DeliveryGate`).
+//! none takes a lock. The per-source routes ([`SOURCE_ROUTES`]) are written only
+//! by [`route`] and [`unroute`]; an EID-row entry is taken and freed only by
+//! [`route`], [`unroute`], [`alloc_message`] and [`free_message`], and between
+//! the two `irq` binds and unbinds the entry it reaches through [`slot_entry`]
+//! (`irq::SlotEntry`), every store a `SeqCst` store. `irq` serialises all of
+//! these under its routing lock; [`unmask`] runs under it too, and a delivery
+//! reads the entry [`claim`] returns from its own hart's row lock-free, inside
+//! that hart's delivery gate (`irq::DeliveryGate`).
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 

@@ -871,33 +871,111 @@ pub fn irq_msg_exhaustion_and_reuse(ctx: &TestContext) -> TestResult
     result
 }
 
-/// Words of [`MSG_SEEN`]: one bit per message key ([`msg_key`]), 256 pages of
-/// [`MSG_SLOTS_PER_CPU_MAX`] slots.
-const MSG_SEEN_WORDS: usize = 8192;
-const _: () = assert!(MSG_SEEN_WORDS as u64 * 64 == 256 * MSG_SLOTS_PER_CPU_MAX);
+/// Target pages [`mint_every_slot`] tells apart: one per CPU (a local APIC on
+/// x86-64, an IMSIC interrupt file on riscv64), so at most `MAX_CPUS`.
+const MSG_PAGES_MAX: usize = boot_protocol::MAX_CPUS;
 
-/// The messages [`mint_every_slot`] has seen live, one bit per [`msg_key`]. A
-/// static, since ktest has no heap; only that function, which ktest's
-/// sequential unit tier runs on one thread, touches it.
-static MSG_SEEN: [core::sync::atomic::AtomicU64; MSG_SEEN_WORDS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MSG_SEEN_WORDS];
+/// Slots of [`MSG_PAGE_TABLE`], twice the pages it holds, so a probe for a page
+/// never meets a full table.
+const MSG_PAGE_SLOTS: usize = 2 * MSG_PAGES_MAX;
 
-/// The bit of message (`address`, `data`) in [`MSG_SEEN`]: the low 8 bits of
-/// the address's page (the local APIC id on x86-64, the IMSIC file's page on
-/// riscv64) above the data's 11 bits. Equal messages always share a key, so a
-/// repeat is always found; two messages whose pages differ only above those 8
-/// bits would also share one and fail the test, never pass it. `None` for data
-/// past 11 bits.
-fn msg_key(address: u64, data: u64) -> Option<usize>
+/// Data values one page's row of [`MSG_SEEN`] tells apart:
+/// [`MSG_SLOTS_PER_CPU_MAX`], as an index.
+const MSG_DATA_VALUES: usize = 2048;
+const _: () = assert!(MSG_DATA_VALUES as u64 == MSG_SLOTS_PER_CPU_MAX);
+
+/// Words of one page's row of [`MSG_SEEN`]: one bit per data value below
+/// [`MSG_DATA_VALUES`].
+const MSG_ROW_WORDS: usize = MSG_DATA_VALUES / 64;
+
+/// The target pages [`mint_every_slot`] has seen, an open-addressed table of
+/// page numbers plus one (0 marks a free slot), probed linearly from the
+/// page number modulo its length.
+static MSG_PAGE_TABLE: [core::sync::atomic::AtomicU64; MSG_PAGE_SLOTS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MSG_PAGE_SLOTS];
+
+/// The row of [`MSG_SEEN`] each page of [`MSG_PAGE_TABLE`] took, at the same
+/// index: rows are taken in the order the pages are first seen.
+static MSG_PAGE_ROW: [core::sync::atomic::AtomicU32; MSG_PAGE_SLOTS] =
+    [const { core::sync::atomic::AtomicU32::new(0) }; MSG_PAGE_SLOTS];
+
+/// The messages [`mint_every_slot`] has seen live, one bit per [`msg_key`]: a
+/// row of [`MSG_ROW_WORDS`] words per target page. Statics, since ktest has no
+/// heap; only that function, which ktest's sequential unit tier runs on one
+/// thread, touches them.
+static MSG_SEEN: [core::sync::atomic::AtomicU64; MSG_PAGES_MAX * MSG_ROW_WORDS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MSG_PAGES_MAX * MSG_ROW_WORDS];
+
+/// Forget every message and page [`mint_every_slot`] has seen.
+fn msg_seen_reset()
+{
+    for word in MSG_PAGE_TABLE.iter().chain(&MSG_SEEN)
+    {
+        word.store(0, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The row of [`MSG_SEEN`] for target page `page`, taking the next free row
+/// (`rows` counts the rows taken) the first time the page is seen. Fails when
+/// more pages are seen than there are CPUs to own them.
+fn msg_page_row(page: u64, rows: &mut usize) -> Result<usize, &'static str>
+{
+    const MANY: &str = "hw::irq_msg_every_slot_one_notification: more target pages than CPUs";
+    let tag = page.checked_add(1).ok_or(MANY)?;
+    // The remainder is below MSG_PAGE_SLOTS, which fits a usize.
+    let slot = page.checked_rem(MSG_PAGE_SLOTS as u64).ok_or(MANY)?;
+    let mut index = usize::try_from(slot).map_err(|_| MANY)?;
+    for _ in 0..MSG_PAGE_SLOTS
+    {
+        let (Some(slot), Some(row)) = (MSG_PAGE_TABLE.get(index), MSG_PAGE_ROW.get(index))
+        else
+        {
+            return Err(MANY);
+        };
+        match slot.load(core::sync::atomic::Ordering::Relaxed)
+        {
+            0 =>
+            {
+                if *rows >= MSG_PAGES_MAX
+                {
+                    return Err(MANY);
+                }
+                let taken = *rows;
+                slot.store(tag, core::sync::atomic::Ordering::Relaxed);
+                row.store(
+                    u32::try_from(taken).map_err(|_| MANY)?,
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                *rows = taken.saturating_add(1);
+                return Ok(taken);
+            }
+            seen if seen == tag =>
+            {
+                return usize::try_from(row.load(core::sync::atomic::Ordering::Relaxed))
+                    .map_err(|_| MANY);
+            }
+            _ => index = index.saturating_add(1) % MSG_PAGE_SLOTS,
+        }
+    }
+    Err(MANY)
+}
+
+/// The bit of message (`address`, `data`) in [`MSG_SEEN`]: the data's bit in
+/// the row of the address's whole page (the local APIC on x86-64, the IMSIC
+/// file on riscv64). Two messages share a key exactly when both their pages
+/// and their data are equal, at any CPU count. Fails for data past 11 bits.
+fn msg_key(address: u64, data: u64, rows: &mut usize) -> Result<usize, &'static str>
 {
     if data >= MSG_SLOTS_PER_CPU_MAX
     {
-        return None;
+        return Err("hw::irq_msg_every_slot_one_notification: data past 11 bits");
     }
-    let page = (address >> 12) & 0xFF;
-    page.checked_mul(MSG_SLOTS_PER_CPU_MAX)
+    let row = msg_page_row(address >> 12, rows)?;
+    let data = usize::try_from(data)
+        .map_err(|_| "hw::irq_msg_every_slot_one_notification: data past 11 bits")?;
+    row.checked_mul(MSG_DATA_VALUES)
         .and_then(|base| base.checked_add(data))
-        .and_then(|key| usize::try_from(key).ok())
+        .ok_or("hw::irq_msg_every_slot_one_notification: message key out of range")
 }
 
 /// Mint through `authority` until the targets run out (`QuotaExceeded`),
@@ -910,10 +988,8 @@ fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
 -> Result<u64, &'static str>
 {
     let (mint_limit, donation_limit) = msg_exhaustion_bounds()?;
-    for word in &MSG_SEEN
-    {
-        word.store(0, core::sync::atomic::Ordering::Relaxed);
-    }
+    msg_seen_reset();
+    let mut rows = 0;
     let mut minted = 0;
     let mut donated = 0;
     let mut refills = 0u64;
@@ -936,8 +1012,7 @@ fn mint_every_slot(ctx: &TestContext, authority: u64, sig: Option<u64>)
                 {
                     return Err("hw::irq_msg_every_slot_one_notification: message out of range");
                 }
-                let key = msg_key(address, data)
-                    .ok_or("hw::irq_msg_every_slot_one_notification: data past 11 bits")?;
+                let key = msg_key(address, data, &mut rows)?;
                 let bit = 1u64 << (key % 64);
                 let word = MSG_SEEN
                     .get(key / 64)

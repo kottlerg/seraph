@@ -295,7 +295,7 @@ fn forward_death_to_logd(badge: u64, exit_reason: u64)
 // uses, and its `process::split_create_caps` call sites in the create
 // handlers, resolve through this module.
 pub use process_table::{
-    ArgvEnvRefusal, CreateTailCaps, ImageSpan, ProcessEntry, ProcessTable, RecentExits,
+    ArgvEnvRefusal, CreateTailCaps, ImageSpan, ProcessEntry, ProcessTable, QueryState, RecentExits,
     ReleaseRefusal, badge_is_acceptable, release_token_badge, resolve_spawn_sched,
     resync_exit_reason, split_create_caps,
 };
@@ -4237,7 +4237,9 @@ pub fn create_process_from_file(
 /// Returns the exit reason the process is torn down with, for the caller to
 /// record in the recent-exits ring so `QUERY_PROCESS` answers `EXITED` for
 /// it: the reason the kernel retained when the main thread had already
-/// exited (a death procmgr's drain had not reaped yet), else `EXIT_KILLED`,
+/// exited, or else the first terminal fault any of its threads took (a death
+/// procmgr's drain had not reaped yet, [`resync_exit_reason`]), else
+/// `EXIT_KILLED`,
 /// the reason the kernel records for a thread its teardown stops. The death
 /// forwarded to logd carries the same reason.
 ///
@@ -4257,15 +4259,19 @@ pub fn destroy_process(
     let (tail, exit_reason) = {
         let mut state = tables.lock();
         let entry = state.table.take_by_badge(badge)?;
-        let exit_reason =
-            match syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
-            {
-                Ok(packed) if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED =>
-                {
-                    packed & 0xFFFF_FFFF
-                }
-                _ => EXIT_KILLED,
-            };
+        let main_thread =
+            syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE).ok();
+        let terminal_fault = syscall::cap_info(
+            entry.aspace_cap,
+            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+        )
+        .ok();
+        let exit_reason = resync_exit_reason(
+            main_thread,
+            syscall_abi::THREAD_STATE_EXITED,
+            terminal_fault,
+        )
+        .unwrap_or(EXIT_KILLED);
         match record
         {
             ExitRecord::Record => state.recent.record(badge, exit_reason, crate::now_ns()),

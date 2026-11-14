@@ -563,14 +563,27 @@ unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
     unsafe { crate::sched::enqueue_and_wake(caller, target_cpu) };
 }
 
+/// What a receive keeps of a sender it bound for its reply
+/// (`bind_next_sender`): `msg`, its message, and `cspace`, its `CSpace`
+/// identity, both copied under `ep.lock`. It carries no pointer to the
+/// sender: once the receive drops the lock, a canceller can claim the reply
+/// binding and wake the sender, which can exit and be freed. The capability
+/// transfer resolves the source `CSpace` from `cspace`.
+#[cfg(not(test))]
+pub struct BoundSender
+{
+    pub msg: Message,
+    pub cspace: crate::cap::CSpaceIdentity,
+}
+
 /// Dequeue the first live sender on `ep` and bind it to `server` for the
 /// reply, under `ep.lock`, which the caller holds.
 ///
-/// Returns `Some((caller, msg, displaced))` when a sender was bound:
-/// `displaced` is the binding the rebind's swap displaced (null when the slot
-/// was empty), which the caller MUST release with [`release_displaced_caller`]
-/// once it has dropped `ep.lock`. Returns `None` when the send queue holds no
-/// live sender, and `server`'s binding is then unchanged.
+/// Returns `Some((bound, displaced))` when a sender was bound: `displaced` is
+/// the binding the rebind's swap displaced (null when the slot was empty),
+/// which the caller MUST release with [`release_displaced_caller`] once it has
+/// dropped `ep.lock`. Returns `None` when the send queue holds no live sender,
+/// and `server`'s binding is then unchanged.
 ///
 /// # Safety
 /// `server` must be the running thread's valid TCB, and `ep.lock` held.
@@ -578,7 +591,7 @@ unsafe fn release_displaced_caller(caller: *mut ThreadControlBlock)
 unsafe fn bind_next_sender(
     ep: &mut EndpointState,
     server: *mut ThreadControlBlock,
-) -> Option<(*mut ThreadControlBlock, Message, *mut ThreadControlBlock)>
+) -> Option<(BoundSender, *mut ThreadControlBlock)>
 {
     // Dequeue successive senders, skipping any that died / were stopped
     // mid-rebind. The BlockedOnSend → BlockedOnReply transition publishes the
@@ -607,6 +620,15 @@ unsafe fn bind_next_sender(
         }
         // SAFETY: caller dequeued from send_head.
         let msg = unsafe { (*caller).ipc_msg };
+        // The sender's CSpace identity is copied now, before the commit
+        // publishes the binding: from that publication a canceller (a stop,
+        // a timed call's expiry, a teardown) can claim the binding and wake
+        // the caller, which can then exit and be freed while the receive's
+        // capability transfer is still to run.
+        // SAFETY: caller dequeued from send_head under ep.lock, which a stop
+        // or dealloc of a BlockedOnSend thread takes to unlink it, so it is
+        // live.
+        let cspace = unsafe { crate::cap::CSpaceIdentity::of_thread(caller) };
         // A fault sender (kernel-synthesized delivery) parks as BlockedOnFault
         // so its reply and its cancellation take the fault outcomes
         // (docs/fault-handling.md § Delivery, Resume, and Kill, § Kernel
@@ -643,7 +665,7 @@ unsafe fn bind_next_sender(
             unsafe { crate::sched::commit_reply_rebind_under_local_lock(caller, parked, server) };
         if let Some(displaced) = committed
         {
-            return Some((caller, msg, displaced));
+            return Some((BoundSender { msg, cspace }, displaced));
         }
         // Refused: the caller is dying or stopped, and nothing was published.
         // The send-queue dequeue above is the episode claim (and why a
@@ -673,8 +695,9 @@ unsafe fn bind_next_sender(
 /// Attempt to receive on `ep` as `server`.
 ///
 /// First releases a caller still bound from an earlier unreplied receive
-/// (`release_unreplied_caller`). Returns `Ok(caller, msg)` if a sender was
-/// waiting (server continues running; sender remains blocked on reply).
+/// (`release_unreplied_caller`). Returns `Ok(bound)` if a sender was waiting
+/// (server continues running; sender remains blocked on reply, and
+/// [`BoundSender`] holds what the receive keeps of it).
 /// Returns `Err(())` if no sender was available (the server is committed
 /// `BlockedOnRecv` on the recv queue, unless the park is refused, in which case
 /// it is unlinked and, on a stop-won or upcall refusal, its park is stamped
@@ -691,7 +714,7 @@ pub unsafe fn endpoint_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,
     deadline: u64,
-) -> Result<(*mut ThreadControlBlock, Message), ()>
+) -> Result<BoundSender, ()>
 {
     // SAFETY: server is the running thread; no lock held (contract).
     unsafe { release_unreplied_caller(server) };
@@ -704,7 +727,7 @@ pub unsafe fn endpoint_recv(
     let saved = unsafe { ep.lock.lock_raw() };
 
     // SAFETY: server is the running thread; ep.lock held.
-    if let Some((caller, msg, displaced)) = unsafe { bind_next_sender(ep, server) }
+    if let Some((bound, displaced)) = unsafe { bind_next_sender(ep, server) }
     {
         // Entry released any earlier binding, and only this thread binds.
         debug_assert!(
@@ -713,7 +736,7 @@ pub unsafe fn endpoint_recv(
         );
         // SAFETY: paired with lock_raw above.
         unsafe { ep.lock.unlock_raw(saved) };
-        return Ok((caller, msg));
+        return Ok(bound);
     }
 
     // No sender — block server on recv queue.
@@ -781,7 +804,7 @@ pub unsafe fn endpoint_recv(
 
 /// Receive on `ep` as `server` without parking (`SYS_IPC_RECV` try-once).
 ///
-/// Returns `Some((caller, msg))` when a sender was waiting, bound as
+/// Returns `Some(bound)` when a sender was waiting, bound as
 /// [`endpoint_recv`] binds it; the caller this binding displaced (one still
 /// bound from an earlier unreplied receive) is released only then, after
 /// `ep.lock` drops. Returns `None` when no sender was waiting, and leaves
@@ -801,7 +824,7 @@ pub unsafe fn endpoint_recv(
 pub unsafe fn endpoint_try_recv(
     ep: *mut EndpointState,
     server: *mut ThreadControlBlock,
-) -> Option<(*mut ThreadControlBlock, Message)>
+) -> Option<BoundSender>
 {
     // SAFETY: ep validated by caller.
     let ep = unsafe { &mut *ep };
@@ -811,10 +834,10 @@ pub unsafe fn endpoint_try_recv(
     let bound = unsafe { bind_next_sender(ep, server) };
     // SAFETY: paired with lock_raw above.
     unsafe { ep.lock.unlock_raw(saved) };
-    let (caller, msg, displaced) = bound?;
+    let (bound, displaced) = bound?;
     // SAFETY: the rebind's swap claimed `displaced`; no lock held.
     unsafe { release_displaced_caller(displaced) };
-    Some((caller, msg))
+    Some(bound)
 }
 
 /// Claim the caller bound in `server.reply_tcb` for a reply.

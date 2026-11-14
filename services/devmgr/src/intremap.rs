@@ -21,9 +21,11 @@
 //! entry before it frees the target ([`InterruptRemap::clear`]). The kernel
 //! reports each source's entry (`CAP_INFO_IRQ_REMAP_ENTRY`).
 //!
-//! When the DMAR offers no interrupt remapping, an I/O APIC the MADT lists
-//! has no source ID in the DMAR, the table cannot be set up, or the kernel
-//! refuses the switch, remapping stays off, logged once, and a device's
+//! When the DMAR offers no interrupt remapping, a VT-d unit was not handed to
+//! the driver, the units translate more than one PCI segment (the shared
+//! table's entries name a requester with no segment), an I/O APIC the MADT
+//! lists has no source ID in the DMAR, the table cannot be set up, or the
+//! kernel refuses the switch, remapping stays off, logged once, and a device's
 //! messages reach the local APICs unchecked, as without an IOMMU. The RISC-V
 //! IOMMU confines messages by translation instead (`crate::dma`), so riscv64
 //! never turns this on. See `docs/device-management.md` § Interrupt Delivery.
@@ -114,8 +116,9 @@ impl InterruptRemap
     {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "the source ID is the requester ID's low 16 bits; the segment selects the \
-                      unit, and the table is every unit's"
+            reason = "the source ID is the requester ID's low 16 bits; remapping is on only when \
+                      every unit translates one segment (`firmware::dmar::remap_obstacle`), so \
+                      the segment dropped names no other requester"
         )]
         let source = rid as u16;
         self.write(cap, false, source)
@@ -158,6 +161,11 @@ pub fn enable(
     if !flags.interrupt_remapping
     {
         off("the DMAR offers none");
+        return None;
+    }
+    if let Some(obstacle) = iommu.remap_obstacle()
+    {
+        off(obstacle.why());
         return None;
     }
     let io_apics = locate_table_by_sig(firmware, *b"APIC").and_then(|madt| {

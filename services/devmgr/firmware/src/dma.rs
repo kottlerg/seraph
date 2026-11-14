@@ -89,6 +89,17 @@ pub fn iova_limit(unit_bits: u8, device_bits: Option<u8>) -> u64
     device_bits.map_or(unit, |bits| unit.min(end(bits)))
 }
 
+/// Whether a confined device whose IOVA space ends at `limit` ([`iova_limit`])
+/// has room for a mapping: its space starts at [`IOVA_BASE`], so a limit at
+/// or below it (a declared DMA address width of 20 bits or less) leaves none,
+/// and devmgr refuses to confine such a device rather than bind a driver
+/// whose every `DMA_MAP` would fail.
+#[must_use]
+pub fn has_iova_space(limit: u64) -> bool
+{
+    limit > IOVA_BASE
+}
+
 /// How a registered device reaches its frames.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Confinement
@@ -1297,5 +1308,17 @@ mod tests
         assert_eq!(iova_limit(48, Some(64)), 1 << 48);
         assert_eq!(iova_limit(64, None), u64::MAX);
         assert_eq!(iova_limit(64, Some(64)), u64::MAX);
+    }
+
+    /// Defect caught: a device whose declared DMA width ends its IOVA space
+    /// at or below `IOVA_BASE` confined and bound, with every `DMA_MAP` then
+    /// failing for want of an IOVA.
+    #[test]
+    fn a_dma_width_of_20_bits_or_less_leaves_no_iova_space()
+    {
+        assert!(!has_iova_space(iova_limit(48, Some(12))));
+        assert!(!has_iova_space(iova_limit(48, Some(20))));
+        assert!(has_iova_space(iova_limit(48, Some(21))));
+        assert!(has_iova_space(iova_limit(48, None)));
     }
 }

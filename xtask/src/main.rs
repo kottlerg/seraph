@@ -69,9 +69,10 @@ fn main()
         }
     };
 
-    // Install a no-op Ctrl+C handler so SIGINT terminates the inner
-    // subprocess (cargo, QEMU) without killing xtask itself. Allows
-    // TerminalGuard::drop and error propagation to run on Ctrl+C.
+    // Install a Ctrl+C handler that only records the signal, so SIGINT
+    // terminates the inner subprocess (cargo, QEMU) without killing xtask
+    // itself, and ends a host-lock wait. Allows TerminalGuard::drop and
+    // error propagation to run on Ctrl+C.
     if let Err(err) = term::signal::install()
     {
         eprintln!("error: {err:#}");

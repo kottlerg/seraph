@@ -315,6 +315,43 @@ pub fn lookup_cspace(id: CSpaceId, expected_epoch: u32) -> Option<*mut CSpace>
     CSPACE_REGISTRY.lookup(id, expected_epoch)
 }
 
+/// The registry identity of a thread's `CSpace` (its `cspace_id` and
+/// `cspace_epoch`), copied out of the TCB while the thread is known to be
+/// live, so a later path resolves the `CSpace` through the registry
+/// ([`lookup_cspace`]) without reading the TCB again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CSpaceIdentity
+{
+    pub id: CSpaceId,
+    pub epoch: u32,
+}
+
+impl CSpaceIdentity
+{
+    /// Copy `tcb`'s `CSpace` identity.
+    ///
+    /// # Safety
+    /// `tcb` must be a valid TCB for the duration of the call: the running
+    /// thread, or one the caller pins (a held queue lock, a won reply claim,
+    /// or a `wake_in_flight` pin). Both fields are read-only after creation.
+    #[cfg(not(test))]
+    pub unsafe fn of_thread(tcb: *const crate::sched::thread::ThreadControlBlock) -> Self
+    {
+        // SAFETY: tcb is valid (caller contract); cspace_id is read-only
+        // after creation.
+        let id = unsafe { (*tcb).cspace_id };
+        // SAFETY: as above; cspace_epoch is read-only after creation.
+        let epoch = unsafe { (*tcb).cspace_epoch };
+        Self { id, epoch }
+    }
+
+    /// Resolve this identity through the registry ([`lookup_cspace`]).
+    pub fn lookup(self) -> Option<*mut CSpace>
+    {
+        lookup_cspace(self.id, self.epoch)
+    }
+}
+
 /// Sum [`MemoryObject::available_bytes`] across every [`CapTag::Memory`] cap
 /// in `cspace`. Used by Phase 9 to print the boot-handover ledger so that
 /// "RAM granted to userspace as retypable bytes" can be reconciled against
@@ -1536,11 +1573,32 @@ static DESCRIPTOR_ARRAY: core::sync::atomic::AtomicPtr<CapDescriptor> =
 static INIT_INFO_HEADER: core::sync::atomic::AtomicPtr<init_protocol::InitInfo> =
     core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
-/// Host-test stand-in for the `InitInfo` header, zeroed as Phase 7 zeroes the
-/// reserved block.
 #[cfg(test)]
-static mut TEST_INIT_INFO_HEADER: core::mem::MaybeUninit<init_protocol::InitInfo> =
-    core::mem::MaybeUninit::zeroed();
+std::thread_local! {
+    /// Host-test stand-in for the `InitInfo` header, zeroed as Phase 7 zeroes
+    /// the reserved block. One per test thread: host tests run in parallel,
+    /// and each test that builds a root `CSpace` writes the header as the
+    /// single boot thread does, so a shared one would be a data race.
+    static TEST_INIT_INFO_HEADER: core::cell::UnsafeCell<
+        core::mem::MaybeUninit<init_protocol::InitInfo>,
+    > = const { core::cell::UnsafeCell::new(core::mem::MaybeUninit::zeroed()) };
+
+    /// Host-test stand-in for the `InitInfo` descriptor array, one per test
+    /// thread for the reason [`TEST_INIT_INFO_HEADER`] gives.
+    static TEST_DESCRIPTOR_ARRAY: core::cell::UnsafeCell<
+        [CapDescriptor; TEST_DESCRIPTOR_CAPACITY],
+    > = const {
+        core::cell::UnsafeCell::new(
+            [CapDescriptor {
+                slot: 0,
+                cap_type: init_protocol::CapType::Memory,
+                pad: [0; 7],
+                aux0: 0,
+                aux1: 0,
+            }; TEST_DESCRIPTOR_CAPACITY],
+        )
+    };
+}
 
 /// The `InitInfo` header of the reserved block. Every field of
 /// [`init_protocol::InitInfo`] is an integer, an array of integers or the
@@ -1562,20 +1620,10 @@ fn init_info_header() -> *mut init_protocol::InitInfo
     }
     #[cfg(test)]
     {
-        core::ptr::addr_of_mut!(TEST_INIT_INFO_HEADER).cast::<init_protocol::InitInfo>()
+        // The thread's own header, live for the rest of the test thread.
+        TEST_INIT_INFO_HEADER.with(|h| h.get().cast::<init_protocol::InitInfo>())
     }
 }
-
-/// Host-test stand-in for the `InitInfo` descriptor array.
-#[cfg(test)]
-static mut TEST_DESCRIPTOR_ARRAY: [CapDescriptor; TEST_DESCRIPTOR_CAPACITY] = [CapDescriptor {
-    slot: 0,
-    cap_type: init_protocol::CapType::Memory,
-    pad: [0; 7],
-    aux0: 0,
-    aux1: 0,
-};
-    TEST_DESCRIPTOR_CAPACITY];
 
 /// The descriptor array's first slot.
 fn descriptor_array() -> *mut CapDescriptor
@@ -1594,7 +1642,8 @@ fn descriptor_array() -> *mut CapDescriptor
     }
     #[cfg(test)]
     {
-        core::ptr::addr_of_mut!(TEST_DESCRIPTOR_ARRAY).cast::<CapDescriptor>()
+        // The thread's own array, live for the rest of the test thread.
+        TEST_DESCRIPTOR_ARRAY.with(|a| a.get().cast::<CapDescriptor>())
     }
 }
 

@@ -54,7 +54,8 @@ devmgr's responsibilities are:
   [docs/pci-enumeration.md](pci-enumeration.md) step 4), then the service
   endpoint and the driver's devmgr query cap (below). The serial driver
   matches an SPCR interface type 0x00 or 0x12 or `_HID` `PNP0501`, the
-  framebuffer driver the `boot-framebuffer` key, `cmos-rtc` `_HID` `PNP0B00`,
+  framebuffer driver the `boot-framebuffer` key, `cmos-rtc` `_HID` or `_CID`
+  `PNP0B00`, `PNP0B01` or `PNP0B02`,
   and `goldfish-rtc` the platform key `google,goldfish-rtc`. devmgr attaches
   the FADT's `CENTURY` index to the record carrying `PNP0B00`, `PNP0B01`, or
   `PNP0B02` as device info (`ipc::device_info_kind::RTC_CENTURY`, a one-byte
@@ -115,7 +116,8 @@ devmgr's responsibilities are:
   segment, bus, device, function order, and binds each to its most specific
   match: an exact vendor and device key outranks a class key, two equally
   specific matches are a conflict that devmgr logs and binds neither of, and a
-  declaration's instance limit counts the devices bound to it in that order.
+  declaration's instance limit counts the devices bound to a driver of its
+  name in that order.
   A device is bound at most once a boot, so a drivers-directory declaration
   never takes a device a boot module's driver holds. The bind
   (`services/devmgr/src/bind.rs`) gives the driver its own service endpoint
@@ -322,11 +324,18 @@ devmgr's responsibilities are:
   bootstrap fails, so the Bus Master Enable and Interrupt Disable writes, the
   endpoint revocation, and the BAR and configuration-page releases run; the
   fixture declares no reset and no DMA, so neither a reset nor a DMA release
-  runs there. No boot withdraws a DMA-capable PCI-bound driver. A boot serves
-  every such driver that reports ready, and devmgr withdraws one only on its
-  death or a failed settle, which a test boot cannot cause: only devmgr holds
-  a PCI-bound driver's process handle, and the only virtio-blk driver of a
-  test boot serves its root filesystem. Nor could a boot place a late device
+  runs there. Every `--test-devices` boot runs it on one DMA-capable
+  PCI-bound driver: svctest's `devmgr_msi_release` phase has the `test-dma`
+  fixture, bound to QEMU's `edu` device and declaring no reset, exit
+  (`ipc::test_dma_labels::FIXTURE_EXIT`), and devmgr withdraws it on its
+  death, so step 0 and the hold of step 5 run: behind an IOMMU the block lets
+  `RELEASE_HOLD` return the fixture's memory, and without one its reset is
+  never confirmed, so the memory stays quarantined. No boot withdraws any
+  other DMA-capable driver. A boot serves every such driver that reports
+  ready, and devmgr withdraws one only on its death or a failed settle, which
+  a test boot causes for no other: only devmgr holds a PCI-bound driver's
+  process handle, and the only virtio-blk driver of a test boot serves its
+  root filesystem. Nor could a boot place a late device
   write after a free, since the emulated devices complete a request on their
   own event loop, with nothing a guest can hold in flight. What every boot does
   run is the carve of each bound function's configuration page, the bind's
@@ -386,9 +395,11 @@ devmgr's responsibilities are:
   DMA capability. The DMA endpoint's `devmgr_dma_labels::DMA_FAULTS` answers a
   device's own caller: devmgr takes and logs the IOMMU driver's recorded faults
   (`iommu_labels::TAKE_FAULTS`), and replies `data[0]` = `DMA_CONFINED` (1)
-  when an IOMMU confines the device, else 0, `data[1]` = faults taken for the
-  device over the boot, `data[2]` = the latest IOVA, page aligned, 0 with
-  none; `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
+  when an IOMMU confines the device, else 0, `data[1]` = DMA translation
+  faults taken for the device over the boot, `data[2]` = the latest's IOVA,
+  page aligned, 0 with none (a VT-d interrupt-remapping fault, whose
+  recorded address is a remapping table handle, is logged only);
+  `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
 
   The [`test-fault`](../../drivers/test-fault/README.md) fixture lives in
   `/tests/drivers/`, which no boot-time pass reads: it binds the QEMU

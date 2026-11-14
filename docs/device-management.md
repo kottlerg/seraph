@@ -566,8 +566,10 @@ On x86-64 with VT-d interrupt remapping on (§ IOMMU Discovery and Programming),
 write is delivered only through a remapping entry devmgr had the IOMMU driver write for the
 device's own requester ID: a remappable message naming an entry written for another requester, or
 an entry not present, is blocked, and so is every compatibility-format message. With remapping off
-(the DMAR offers none, an I/O APIC has no source ID in the DMAR, or the driver or the kernel refused
-the setup, each logged by devmgr), a device whose DMA engine writes to the interrupt range can raise
+(the DMAR offers none, a VT-d unit was not handed to the driver, the units translate more than one
+PCI segment, whose functions the one shared table, naming a requester with no segment, would not
+tell apart, an I/O APIC has no source ID in the DMAR, or the driver or the kernel refused the
+setup, each logged by devmgr), a device whose DMA engine writes to the interrupt range can raise
 any vector on any CPU whose APIC id is below `0xFF`, the exception vectors 16 to 31 included, behind
 an IOMMU or not; its driver cannot do so through the MSI-X table, which only devmgr writes. On
 riscv64 behind the RISC-V IOMMU a device's writes reach only the interrupt files its domain maps.
@@ -603,9 +605,9 @@ label, `devmgr_labels::QUERY_DEVICE`, sent on a class SEND: a SEND on devmgr's r
 whose badge names a class and the verb bits the reply carries. The class and the verbs come from
 the badge, never the message, and a registry SEND without a class slot gets `UNAUTHORIZED`.
 svcmgr mints each class SEND (`devmgr_labels::MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`) from
-a class file and publishes it seed-only as `devmgr.class.<class>`
-([driver-binding.md](driver-binding.md) § Device Classes). The dependency ordering is fixed by
-init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
+a class file and publishes it seed-only as `devmgr.class.<stem>` (the class file's name without
+`.class`) ([driver-binding.md](driver-binding.md) § Device Classes). The dependency ordering is
+fixed by init's bootstrap sequence (devmgr before vfsd) and by svcmgr launching those consumers only
 after handover; devmgr and vfsd are `restart = never`, so no restart ordering exists.
 
 devmgr binds each PCI device the most specific driver declaration matches

@@ -6,7 +6,7 @@
 //! Parser for the device class files of `/config/devmgr/classes/`: a
 //! class's access policy, which svcmgr turns into one class SEND
 //! (`ipc::devmgr_labels::MINT_CLASS_SEND`) and publishes seed-only as
-//! `devmgr.class.<class>` (`services/svcmgr/docs/service-definitions.md`
+//! `devmgr.class.<stem>` (`services/svcmgr/docs/service-definitions.md`
 //! § Device class files).
 //!
 //! The grammar is a `.svc` file's: line-oriented `key = value`, `#` starts a
@@ -40,18 +40,19 @@ pub const CLASSES_DIR: &str = "/config/devmgr/classes";
 /// Suffix of a class file's name.
 pub const CLASS_FILE_SUFFIX: &str = ".class";
 
-/// The discovery-registry name svcmgr publishes class `class`'s SEND
-/// under: `ipc::published_names::DEVMGR_CLASS_PREFIX` then the class name.
-/// `None` when the heap cannot hold it.
+/// The discovery-registry name svcmgr publishes a class file's SEND
+/// under: `ipc::published_names::DEVMGR_CLASS_PREFIX` then the file's stem
+/// (`ClassDefinition::stem`), which names the class only when the file has
+/// no `class` key naming another one. `None` when the heap cannot hold it.
 #[must_use]
-pub fn class_publication(class: &[u8]) -> Option<Vec<u8>>
+pub fn class_publication(stem: &[u8]) -> Option<Vec<u8>>
 {
     let prefix = ipc::published_names::DEVMGR_CLASS_PREFIX;
     let mut name = Vec::new();
-    name.try_reserve_exact(prefix.len().saturating_add(class.len()))
+    name.try_reserve_exact(prefix.len().saturating_add(stem.len()))
         .ok()?;
     name.extend_from_slice(prefix);
-    name.extend_from_slice(class);
+    name.extend_from_slice(stem);
     Some(name)
 }
 

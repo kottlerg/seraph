@@ -25,6 +25,16 @@
               from third-party host deps (clap, gpt, fatfs, libc, which); not resolvable without \
               upstream releases"
 )]
+// `symbolize`, the riscv64 kernel frame check and `compare-images` read ELF,
+// PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
+// pinned toolchain's sysroot ships for std's backtraces, so they have no Cargo
+// entry (docs/coding-standards.md § Dependencies). Only a build against the
+// prebuilt std reaches them; `cargo xtask test` lints xtask that way.
+#![feature(rustc_private)]
+
+extern crate addr2line;
+extern crate object;
+extern crate rustc_demangle;
 
 use clap::Parser;
 

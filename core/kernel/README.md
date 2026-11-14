@@ -95,6 +95,7 @@ core/kernel/
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── drain.rs            # CSpace teardown drain: re-links derivations out of dying slots
 │   │   ├── ioport_bindings.rs  # Per-thread I/O-port binding table and its withdrawal
 │   │   ├── object.rs           # Kernel object headers and wrappers, page pools, teardown
 │   │   ├── registry.rs         # RAM-sized CSpaceId registry arena (id → CSpace, epoch, free list)
@@ -185,6 +186,8 @@ instruction fetch on every CPU before it can run. See
 The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
+`drain.rs` is the teardown drain that takes a dying `CSpace`'s slots out of the derivation tree
+(see [`docs/capability-internals.md`](docs/capability-internals.md) § Teardown Drain).
 `object.rs` defines the kernel object headers and wrappers, the page pools that back
 address-space page tables and CSpace slot pages, the CSpace body arena that funds the objects a
 split or a range-capability copy creates (its pure logic in `arena.rs`), and their allocation and

@@ -496,18 +496,18 @@ another in three ways:
   next.
 - **Another process holds a Memory capability to it.** A capability the grantee moved to another
   process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
-  out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
-  map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
+  out stays under that intermediary when the grantee's `CSpace` is torn down; either way its holder
+  can map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
   device still writing it.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
 Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
 
 1. The intermediary is the only reference to that Memory object (`CAP_INFO_SOLE_REFERENCE`): no
-   other capability to it in any `CSpace`, moved, derived, or orphaned into a derivation root, and
-   no kernel-internal reference such as a retype lease or a page-pool donation. memmgr reads this
-   first: once it holds it keeps holding, since no other process has a capability through which to
-   add a reference or a mapping, so the reads after it cannot be raced.
+   other capability to it in any `CSpace`, moved or derived, and no kernel-internal reference such
+   as a retype lease or a page-pool donation. memmgr reads this first: once it holds it keeps
+   holding, since no other process has a capability through which to add a reference or a mapping,
+   so the reads after it cannot be raced.
 2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. The
    kernel refuses a grantee's split or merge of its grant, since memmgr's intermediary names the
    same object ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md)

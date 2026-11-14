@@ -1149,30 +1149,21 @@ through the reference it pins on the handler endpoint, and the death post throug
 binding's reference on its `EventQueue` (§ Kernel Object Reference Counting).
 
 Every derivation link reachable from a live slot resolves: before a `CSpace`
-unregisters, its teardown drain (`drain_dying_cspace_batch`) unlinks every
-dying slot from the forest — foreign children are orphaned into derivation
-roots, and each slot is spliced out of its parent/sibling links with the
-neighbours re-linked directly. Each unlink leaves the forest fully consistent,
-so the drain runs in step-bounded batches (every slot visited and every link
-edit is one step) that release the derivation write lock between holds
-(mirroring revocation's batching); a foreign traversal in a window between
-batches sees ordinary consistent nodes. The one remaining source of a dead
-link is a foreign sender whose capability transfer into the dying CSpace had
-already committed to a receiver there before that receiver was stopped, wiring
-a link into a slot the drain cursor has passed. A link that fails to resolve —
-that race, or genuine corruption — is contained wherever a walk meets it,
+unregisters, its teardown drain takes every one of its slots out of the forest,
+and from the drain's first hold no IPC capability transfer or in-flight move
+wires a link into it ([Teardown Drain](#teardown-drain)). A link that fails to
+resolve is therefore genuine corruption, contained wherever a walk meets it,
 always by truncation: the revoke walk cuts the chain hanging from the dead
 link, logs it, and the syscall returns `InvalidState` instead of reporting a
 clean revoke; the reparent walk that deletion and the range splits run on the
-consumed slot's children cuts and logs the same way and completes (the
-abandoned children were already orphaned from a vanished CSpace); the teardown
-drain, which has no caller to report to, detects the same condition as a head
-pop that makes no progress, logs it, cuts the dying slot's child list, and
-continues with the next slot. A drain truncation abandons the foreign children
-chained behind the dead link without clearing their parent pointers: they keep
-naming the dying CSpace, and only the registry epoch check keeps such a
-pointer fail-closed (it resolves to nothing — the child behaves as a
-derivation root) rather than aliasing onto a recycled CSpace id.
+consumed slot's children cuts and logs the same way and completes; the teardown
+drain, which has no caller to report to, cuts and logs the same way and
+continues, as it does for an unlink that makes no progress (a node whose own
+links do not lead back to the list it heads). A truncation abandons the live
+nodes chained behind the dead link without clearing their parent pointers:
+they keep naming the vanished `CSpace`, and only the registry epoch check keeps
+such a pointer fail-closed (it resolves to nothing — the node behaves as a
+derivation root) rather than aliasing onto a recycled `CSpace` id.
 
 **Performance characteristics:** Revocation is O(N) in the number of descendants.
 For well-behaved systems, derivation trees are shallow (a server derives a
@@ -1197,6 +1188,73 @@ no IPC object lock while it holds the derivation tree write lock. Each batch col
 objects of the slots it freed and releases the write lock. It then `dec_ref`s each object and
 deallocates any that reach zero (`dealloc_revoked`); `dealloc_object` takes whatever IPC object
 locks that object's teardown needs.
+
+### Teardown Drain
+
+A `CSpace` reaching refcount zero takes every one of its slots out of the derivation forest before
+it unregisters (`drain_dying_cspace_batch`, `core/kernel/src/cap/drain.rs`). The teardown keeps the
+lineage as a delete does: a capability derived through a dying slot is re-linked under the nearest
+ancestor outside the dying `CSpace`, so it stays inside every revoke above it, and becomes a
+derivation root only when no such ancestor exists. A capability derived through a process that has
+exited therefore stays revocable by whoever delegated to that process, and an intermediate holder
+cannot take a lineage out of its ancestors' reach by exiting.
+
+The dying slots of a derivation tree form *regions*, maximal connected groups of dying slots. A
+region's *top* is the dying slot whose parent `P` is outside the dying `CSpace` or absent, and `P`
+is where everything hanging under the region goes. The drain scans the slot indices, ascends from
+each slot still in the forest to its region's top, and flattens the region from there with the
+revoke walk's stackless hoist, one constant-time edit per step on the top's head `H`:
+
+```
+drain(dying CSpace):
+    first hold: mark the CSpace draining
+    for each slot index, in order:
+        while the slot is in the forest (it has a parent, a child, or a sibling):
+            x = the slot; while x's parent is a dying slot: x = that parent   (ascend)
+            P = x's parent, re-read at every step
+            no H              → unlink x                                     (drained)
+            H outside         → unlink H; link it under P (a root if no P)
+            H dying, child G  → unlink G; link it under x if dying, else under P
+            H dying, no child → unlink H                                     (drained)
+    final hold: unregister the CSpace
+```
+
+Each dying slot is examined at most twice by the scan, ascended over once, hoisted at most once and
+unlinked once, and each capability outside the `CSpace` that hangs under a region is re-linked once,
+directly under `P`. The drain's total work is therefore linear in the slots the `CSpace` spans and
+the capabilities hanging under them, whatever the shape of its trees or the order of its indices.
+Re-linking each dying slot's children under its own parent instead would move a child again for
+every dying ancestor the scan reaches after it: quadratic for a chain of dying slots whose parents
+sit at higher indices than their children, a shape any process can lay out with explicit-index
+inserts or moves. Each slot scanned, ascent, and link edit is one step, at most `MAX_DRAIN_EDITS`
+per derivation-lock hold, so a hold is bounded by a constant whatever the population; the drain's
+position across holds is the scan's cursor and the slot it works from.
+
+Every edit leaves the forest consistent, so the drain releases the derivation lock between holds,
+as revocation does, and a foreign traversal in a window between holds sees ordinary nodes. A revoke
+above a region hoists or frees dying slots like any others, and whatever the drain re-links goes
+under `P`, inside that revoke's subtree; a dying slot a revoke freed is skipped as empty. The scan
+passes a slot only once it is out of the forest, so a dying slot that foreign activity moves out of
+its region between holds is examined again rather than left behind, and `P` is re-read at every
+step, since a foreign delete can re-link a top. Work can still arrive between holds — a foreign
+delete of a slot whose parent is dying re-links its children there, and the drain then re-links
+them in turn — so the loop is bounded by contention rather than by a constant, and carries no batch
+backstop: a teardown cannot fail, and a holder of capabilities derived from the dying `CSpace`
+prolongs it only while it keeps deleting, which stalls the deleting thread, not the system.
+
+The first hold marks the `CSpace` *draining*, a flag written and read under the derivation lock.
+From then on IPC capability transfer resolves the `CSpace` as gone
+([Capability Transfer in IPC](#capability-transfer-in-ipc)), and so does an in-flight move's
+revalidation of either slot ([Move](#move)): no capability enters the `CSpace` behind the scan, and
+none leaves a slot the drain has already taken out of the forest, where the destination would take
+an empty position and become a root. The drain itself, delete, revoke, and the splits resolve a
+draining `CSpace` as before, since they edit its slots.
+
+At the end no live slot names the dying `CSpace`, the invariant `free_cspace_id` relies on to
+recycle the id. A link that fails to resolve is contained by truncation (see
+[Revocation Algorithm](#revocation-algorithm)). More ascents than the `CSpace` has slots can only be
+a cycle of parent links, since no edit puts a slot under one of its own descendants; the drain
+unlinks the slot it stands on from its parent, which breaks the cycle, and logs it.
 
 ### Move
 
@@ -1223,8 +1281,9 @@ move(src, dst):
         all moved → finish; else link dst as src's first child
     every later hold (derivation lock; a finish also takes the source CSpace lock to free src):
         revalidate src and dst: occupied, same generation, same object
+        (a slot whose CSpace is draining counts as gone)
         both live     → unlink dst, migrate another batch, finish or re-link
-        src gone, dst live → unpin dst; done (whoever freed src dropped its reference)
+        src gone, dst live → unpin dst; done (whoever took src releases its reference)
         dst gone      → unpin src; InvalidState (src keeps the cap and its remaining children)
         both gone     → InvalidCapability
     finish: dst takes src's links and every neighbour that points at src;
@@ -1261,16 +1320,21 @@ holds no reference on its `CSpace`, so a raw pointer read from its TCB could
 name storage a teardown has unregistered and freed, whereas a `CSpace` that
 resolves stays allocated for the hold — unregistration happens under the
 same lock and the storage is released only after it. The later batches
-resolve both slots the same way, so a `CSpace` torn down meanwhile is
-observed as gone rather than dereferenced, and a source slot that no longer
-resolves is left to that teardown's cascade, which releases the reference
-it holds. The drain of a dying `CSpace` treats its in-flight slots like any
-other: the children hanging under a dying slot become derivation roots (the
-standard teardown semantic above) — the destination, carrying its migrated
-children, when the source's `CSpace` dies (the move then completes on the
-next batch, the destination now a root), the migrated children when the
-destination's `CSpace` dies (the move reports `InvalidState`, the source
-keeping the capability and its remaining children). When the freed source
+resolve both slots the same way, and treat a slot whose `CSpace` is draining as
+gone ([Teardown Drain](#teardown-drain)), so a `CSpace` torn down meanwhile is
+observed as gone rather than dereferenced, no batch migrates into or out of a
+`CSpace` whose drain has begun, and a source slot left in a dying `CSpace` is
+left to that teardown's cascade, which releases the reference it holds. The
+drain treats the in-flight slots like any other, re-linking what hangs under a
+dying slot under the nearest ancestor outside its `CSpace`. When the source's
+`CSpace` dies, the move completes where it stands: the drain re-links the
+destination, carrying its migrated children, and the source's unmigrated
+children under the source's parent, so all of them stay inside every revoke
+above the source (the unmigrated children as the destination's siblings, not
+its children). When the destination's `CSpace` dies, the move reports
+`InvalidState` and the source keeps the capability: the drain re-links the
+migrated children under the source, its parent, so the source keeps every
+child. When the freed source
 slot's reference was the last one to a `Thread`, `CSpace`, or
 `AddressSpace`, the object goes to the CPU's deferred reclaim rather than
 being torn down in place — a teardown stops bound threads and waits on
@@ -1432,7 +1496,7 @@ transfer_caps(sender_cspace, handles, receiver_cspace):
     // thread a won reply claim or a wake_in_flight pin keeps.
     one hold (derivation lock, then both CSpace locks in pointer order):
         resolve both CSpaces through the registry from the two identities;
-            either gone → refuse
+            either gone or draining → refuse
         validate every handle: distinct, occupied, generation current,
             not pinned
         refuse (QuotaExceeded) if any handle's object is at REF_COUNT_LIMIT
@@ -1460,6 +1524,14 @@ per-slot generation handles make the receiver's handle fail closed if such a rev
 frees the receiver's slot (#349). A move that finishes in the first hold is atomic
 against revocation; one that needs further batches is protected by the in-flight
 pins and stays revocation-complete between holds (see [Move](#move)).
+
+A `CSpace` whose teardown drain has begun resolves as gone (`CSpaceIdentity::lookup`; see
+[Teardown Drain](#teardown-drain)): a transfer into or out of it is refused as one whose `CSpace`
+has unregistered is, no capability moving and the sender keeping its own (the refusals above: a
+message delivered with zero capabilities, or a reply that wakes the caller with
+`IPC_REPLY_TRANSFER_FAILED`). No capability enters a dying `CSpace` behind the drain's scan, and
+none leaves a slot the drain has already taken out of the forest. The reply path's destination
+pre-allocation resolves the caller's `CSpace` the same way.
 
 Reply capabilities are not part of the derivation tree — they are single-use, cannot be derived, and
 are not tracked for revocation (see [docs/ipc-design.md](../../../docs/ipc-design.md) § The

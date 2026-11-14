@@ -15,6 +15,8 @@ this boundary.
 core/kernel/
 ├── Cargo.toml                  # Workspace member; no_std crate
 ├── build.rs                    # Linker script selection per target
+├── vendor/
+│   └── intel-affected-processor-list/ # Intel's affected-processor list, vendored verbatim
 ├── linker/
 │   ├── x86_64.ld               # Linker script for x86-64
 │   └── riscv64.ld              # Linker script for RISC-V
@@ -51,7 +53,8 @@ core/kernel/
 │   │   │   ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │   │   ├── console.rs      # Early serial (COM1 16550, I/O-port) output
 │   │   │   ├── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
-│   │   │   └── speculation.rs  # Branchless bound mask (cmp/sbb) and opaque identity
+│   │   │   ├── speculation.rs  # Bound mask (cmp/sbb), opaque identity, enumeration
+│   │   │   └── vulnerability.rs # Transient-execution table (CPUID, ARCH_CAPABILITIES); host-tested
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
 │   │       ├── aia.rs          # APLIC (MSI delivery mode) and IMSIC interrupt files
@@ -72,7 +75,7 @@ core/kernel/
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │       ├── console.rs      # Early serial (ns16550 MMIO UART) output
 │   │       ├── entropy.rs      # Zkr seed CSR hardware RNG; cycle counter for jitter
-│   │       └── speculation.rs  # Branchless bound mask (sltu/neg) and opaque identity
+│   │       └── speculation.rs  # Bound mask (sltu/neg), opaque identity, no-op enumeration
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
 │   │   ├── buddy.rs            # Physical frame allocator (buddy algorithm)
@@ -139,6 +142,7 @@ core/kernel/
     ├── arch-interface.md       # Architecture abstraction layer and dispatch surface
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
+    ├── transient-execution.md  # x86-64 transient-execution table: classes, sources, rules
     ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of outputs
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
@@ -159,7 +163,9 @@ core/kernel/
 All architecture-specific code. Each subdirectory implements the dispatch surface defined
 in [`docs/arch-interface.md`](docs/arch-interface.md). No code outside `arch/` contains
 `#[cfg(target_arch)]` guards. The active architecture module is selected at build time
-and re-exported from `arch/mod.rs` as a unified interface.
+and re-exported from `arch/mod.rs` as a unified interface. On x86-64,
+`arch/x86_64/vulnerability.rs` derives at boot the CPU's exposure to each transient-execution
+class and logs it; see [`docs/transient-execution.md`](docs/transient-execution.md).
 
 ### `mm/`
 

@@ -70,10 +70,12 @@ scaling, and DRAM rows. The system draws the line as follows.
   - on riscv64, the data bounds alone: the RVA23 floor defines no speculation barrier and no
     speculation control for the kernel to enumerate or drive.
 
-  On x86-64, enumerating the running CPU's vulnerabilities (`IA32_ARCH_CAPABILITIES` and CPUID)
-  and applying the entry and exit mitigations a vulnerable CPU needs (buffer clearing,
-  branch-predictor and return-prediction controls), for the classes the floor silicon does not
-  mitigate in silicon, is design intent, not yet implemented
+  On x86-64 the kernel enumerates the boot CPU's exposure to each transient-execution class at
+  the user-to-kernel boundary (`IA32_ARCH_CAPABILITIES`, CPUID, and the vendors' published
+  guidance) and logs it
+  ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)).
+  Applying the entry and exit mitigations that enumeration selects (buffer clearing,
+  branch-predictor and return-prediction controls) is design intent, not yet implemented
   ([#1085](https://github.com/kottlerg/seraph/issues/1085)). Until then the x86-64 boundary
   rests on the defences above.
 - **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a

@@ -155,7 +155,7 @@ pub fn entropy_contribute_then_draw(ctx: &TestContext) -> TestResult
     let cap = entropy_cap(ctx)?;
     let info = syscall::cap_info(cap, syscall_abi::CAP_INFO_TAG_RIGHTS)
         .map_err(|_| "entropy_contribute: cap_info on the EntropyControl cap failed")?;
-    if (info >> 32) as u8 != init_protocol::CapType::EntropyControl as u8
+    if info >> 32 != u64::from(init_protocol::CapType::EntropyControl as u8)
     {
         return Err("entropy_contribute: the descriptor's slot is not an EntropyControl cap");
     }
@@ -208,7 +208,11 @@ pub fn entropy_contribute_cap_refusals(ctx: &TestContext) -> TestResult
     // SAFETY: the kernel refuses the call for its handle before it reads the
     // buffer, so nothing past `buf`'s 16 bytes is read.
     let r = unsafe {
-        syscall::entropy_contribute_raw(0, buf.as_ptr(), syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN + 1)
+        syscall::entropy_contribute_raw(
+            0,
+            buf.as_ptr(),
+            syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN + 1,
+        )
     };
     if r != invalid_cap
     {
@@ -241,7 +245,11 @@ pub fn entropy_contribute_arg_refusals(ctx: &TestContext) -> TestResult
     // SAFETY: a length above MAX_ENTROPY_CONTRIBUTE_LEN is refused before the
     // kernel reads the buffer, so nothing past `buf`'s 16 bytes is read.
     let r = unsafe {
-        syscall::entropy_contribute_raw(cap, buf.as_ptr(), syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN + 1)
+        syscall::entropy_contribute_raw(
+            cap,
+            buf.as_ptr(),
+            syscall_abi::MAX_ENTROPY_CONTRIBUTE_LEN + 1,
+        )
     };
     if r != Err(SyscallError::InvalidArgument as i64)
     {
@@ -251,9 +259,18 @@ pub fn entropy_contribute_arg_refusals(ctx: &TestContext) -> TestResult
     }
 
     for (va, failure) in [
-        (0, "entropy_contribute: a null buffer must return InvalidAddress"),
-        (KERNEL_HALF_VA, "entropy_contribute: a kernel-half buffer must return InvalidAddress"),
-        (UNMAPPED_USER_VA, "entropy_contribute: an unmapped buffer must return InvalidAddress"),
+        (
+            0,
+            "entropy_contribute: a null buffer must return InvalidAddress",
+        ),
+        (
+            KERNEL_HALF_VA,
+            "entropy_contribute: a kernel-half buffer must return InvalidAddress",
+        ),
+        (
+            UNMAPPED_USER_VA,
+            "entropy_contribute: an unmapped buffer must return InvalidAddress",
+        ),
     ]
     {
         // SAFETY: the kernel refuses each span: the null and kernel-half ones

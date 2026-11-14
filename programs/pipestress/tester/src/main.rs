@@ -20,9 +20,6 @@
 //! count stays flat across the run; a pool that instead refills leaks one
 //! pool-cap slot (and strands one memmgr grant) per ~63 chunks, which the
 //! slot bound below trips.
-//!
-//! Output goes to stdout only: the usertest orchestrator drains stdout to
-//! EOF before stderr, so unbounded stderr would deadlock against it.
 
 #![expect(
     clippy::expect_used,

@@ -164,6 +164,7 @@ pub(super) use live::IA32_PL0_SSP;
 #[cfg(not(test))]
 pub use live::{
     decide, enable, init_cpu_pages, init_stack, load_thread_token, prepare_ap, prepare_boot_cpu,
+    report_registers,
 };
 
 #[cfg(not(test))]
@@ -295,6 +296,41 @@ mod live
         unsafe { cpu::write_msr(IA32_INTERRUPT_SSP_TABLE_ADDR, cpu_layout(cpu_pages).table) };
         // SAFETY: as above.
         unsafe { cpu::write_cr4(cpu::read_cr4() | CR4_CET) };
+    }
+
+    /// Print this CPU's CET registers for the kernel exception report, to the
+    /// serial console only (the table address and `IA32_PL0_SSP` are kernel
+    /// VAs): `IA32_S_CET`, `IA32_INTERRUPT_SSP_TABLE_ADDR`, and
+    /// `IA32_PL0_SSP`. Prints nothing while `CR4.CET` is clear, as it is on a
+    /// CPU without `CET_SS`, where the MSRs need not exist.
+    ///
+    /// [`arm`] writes a non-zero table address before it sets `CR4.CET`, and
+    /// [`enable`], the only writer of `IA32_S_CET`, sets `SH_STK_EN`. A report
+    /// with `CR4.CET` set, `SH_STK_EN` clear, and a zero table address is
+    /// therefore of CET state lost outside the kernel, which `cargo xtask
+    /// test-cet` tells apart from a kernel fault
+    /// (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism).
+    pub fn report_registers()
+    {
+        if cpu::read_cr4() & CR4_CET == 0
+        {
+            return;
+        }
+        // SAFETY: ring 0; `CR4.CET` is set only by `arm`, on a CPU with
+        // `CET_SS`, so all three MSRs exist.
+        let (s_cet, table, pl0_ssp) = unsafe {
+            (
+                cpu::read_msr(IA32_S_CET),
+                cpu::read_msr(IA32_INTERRUPT_SSP_TABLE_ADDR),
+                cpu::read_msr(IA32_PL0_SSP),
+            )
+        };
+        crate::kprintln_serial!(
+            "  cet: s_cet={:#x}  int_ssp_table={:#018x}  pl0_ssp={:#018x}",
+            s_cet,
+            table,
+            pl0_ssp
+        );
     }
 
     /// Prepare the BSP for [`enable`]: give the handoff stack a shadow stack

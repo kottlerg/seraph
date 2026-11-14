@@ -543,6 +543,7 @@ pub(super) unsafe extern "C" fn common_exception_handler(
     crate::kprintln_serial!("  rip={:#018x}  cr2={:#018x}", f.rip, cr2);
     crate::kprintln!("  cs={:#x}  rflags={:#018x}", f.cs, f.rflags,);
     dump_x86_regs(f);
+    super::shadow_stack::report_registers();
     fatal(
         if (f.cs & 3) != 0
         {

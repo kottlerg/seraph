@@ -21,16 +21,16 @@
 //! `services/memmgr/docs/memory-pool.md` § Chunk table.
 
 use crate::DEMAND_CHUNK_PAGES;
-use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, SlotStore};
+use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, SlotStore};
 
 /// Children of a directory node: as many slot indices as fill the largest
-/// other payload, a [`FrameDesc`], so a directory node does not grow the
+/// other payload, a [`ProcessRecord`], so a directory node does not grow the
 /// arena slot.
-pub const DIR_FANOUT: usize = 5;
+pub const DIR_FANOUT: usize = 6;
 
 // Hard size budget: a directory node shares the arena slot with every other
 // payload, and `SLOTS_PER_PAGE` is sized for the largest of them.
-const _: () = assert!(size_of::<[NodeIdx; DIR_FANOUT]>() <= size_of::<FrameDesc>());
+const _: () = assert!(size_of::<[NodeIdx; DIR_FANOUT]>() <= size_of::<ProcessRecord>());
 
 // Hard size budget: the backed mask holds one bit per page of a chunk.
 const _: () = assert!(DEMAND_CHUNK_PAGES <= u16::BITS);
@@ -416,6 +416,8 @@ fn child<S: SlotStore>(arena: &Arena<S>, dir: NodeIdx, pos: usize) -> NodeIdx
         Node::ChunkDir(children) => children.get(pos).copied().unwrap_or(NODE_NULL),
         Node::Free
         | Node::Run(_)
+        | Node::Deferred(_)
+        | Node::Budget(_)
         | Node::Region(_)
         | Node::Frame(_)
         | Node::Process(_)
@@ -464,6 +466,8 @@ pub fn entry<S: SlotStore>(arena: &Arena<S>, root: NodeIdx, height: u32, index: 
         Some(
             Node::Free
             | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
             | Node::Region(_)
             | Node::Frame(_)
             | Node::Process(_)
@@ -600,7 +604,13 @@ pub fn release<S: SlotStore>(
                 }
             }
             // Not a table node: no table links to one, so leave it alone.
-            Node::Free | Node::Run(_) | Node::Region(_) | Node::Frame(_) | Node::Process(_) =>
+            Node::Free
+            | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
+            | Node::Region(_)
+            | Node::Frame(_)
+            | Node::Process(_) =>
             {
                 continue;
             }
@@ -776,11 +786,11 @@ mod tests
             (0, 0),
             (1, 0),
             (2, 1),
-            (5, 1),
-            (6, 2),
-            (25, 2),
-            (26, 3),
-            (u64::MAX, 28),
+            (6, 1),
+            (7, 2),
+            (36, 2),
+            (37, 3),
+            (u64::MAX, 25),
         ]
         {
             assert_eq!(table_height(chunks), height, "{chunks} chunks");
@@ -852,7 +862,7 @@ mod tests
         assert_eq!((a.free_count(), root), (free, before));
         assert_eq!(entry(&a, root, height, far), ChunkEntry::UNBACKED);
         // A chunk past the table is refused whatever the arena holds.
-        assert!(!set_entry(&mut a, &mut root, height, 3125, resident(0, 1)));
+        assert!(!set_entry(&mut a, &mut root, height, 1296, resident(0, 1)));
     }
 
     #[test]
@@ -863,7 +873,7 @@ mod tests
         let height = table_height(200);
         let mut root = NODE_NULL;
         let mut runs = 0;
-        for i in [0, 1, 57, 124, 125, 199]
+        for i in [0, 1, 35, 36, 57, 199]
         {
             // Two runs on each chunk, the first linked below the second.
             let frame = |va| {

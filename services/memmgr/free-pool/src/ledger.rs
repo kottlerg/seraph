@@ -19,11 +19,17 @@
 //! accepts joins the free pool, and one it refuses is parked on the
 //! [`DeferredList`] until a later [`Ledger::recheck_deferred`] accepts it
 //! (`services/memmgr/docs/memory-pool.md` § Reclamation).
+//!
+//! Every frame accounted to a record is charged to the record's budget node
+//! where it is accounted, and the charge is released where the frame joins the
+//! free pool, so a node's own count is the pages of the frames, demand runs
+//! and deferred runs charged to it ([`crate::budget`]).
 
 use crate::arena::{
-    Arena, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord, RegionNode, Slot,
-    SlotStore,
+    Arena, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord,
+    RegionNode, Slot, SlotStore,
 };
+use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError};
 use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
@@ -52,6 +58,8 @@ pub enum BackError
 {
     /// The slot named holds no region.
     NoRegion,
+    /// The record slot named holds no process record.
+    NoRecord,
     /// The run is not page-aligned or does not lie inside the region.
     Outside,
     /// The arena has fewer free slots outside its reserve than the run's
@@ -111,6 +119,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Process(r) => Some(r),
             Node::Free
             | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
             | Node::Region(_)
             | Node::Frame(_)
             | Node::ChunkDir(_)
@@ -126,6 +136,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             Node::Region(r) => Some(r),
             Node::Free
             | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
             | Node::Frame(_)
             | Node::Process(_)
             | Node::ChunkDir(_)
@@ -138,27 +150,70 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.arena.set_node(rec, Node::Process(r));
     }
 
-    /// Add a record for `badge` with empty lists. `None` when the arena has
-    /// no free slot outside its reserve or the index has no bucket storage;
-    /// nothing is left allocated then.
-    pub fn insert_process(&mut self, badge: u64) -> Option<NodeIdx>
+    /// Add a record for `badge` with empty lists, charged to a new budget
+    /// node made for `spec` ([`budget::create`]).
+    ///
+    /// # Errors
+    /// [`NodeError::Parent`] or [`NodeError::Refs`] for a parent the node
+    /// cannot take; [`NodeError::NoSlot`] when the arena has fewer than the
+    /// two free slots outside its reserve the record and its node take, or the
+    /// index has no bucket storage. Nothing is left allocated then.
+    pub fn insert_process(&mut self, badge: u64, spec: NodeSpec) -> Result<NodeIdx, NodeError>
     {
-        let rec = self.arena.alloc(
-            Node::Process(ProcessRecord {
-                badge,
-                frame_head: NODE_NULL,
-                region_head: NODE_NULL,
-                aspace_cap: 0,
-                next_region_id: 1,
-            }),
-            NODE_NULL,
-        )?;
+        if self.arena.available() < 2
+        {
+            return Err(NodeError::NoSlot);
+        }
+        let node = budget::create(&mut self.arena, spec)?;
+        let record = Node::Process(ProcessRecord {
+            badge,
+            frame_head: NODE_NULL,
+            region_head: NODE_NULL,
+            aspace_cap: 0,
+            next_region_id: 1,
+            budget: node,
+        });
+        let Some(rec) = self.arena.alloc(record, NODE_NULL)
+        else
+        {
+            budget::unref(&mut self.arena, node);
+            return Err(NodeError::NoSlot);
+        };
         if !self.index.insert(&mut self.arena, rec)
         {
             self.arena.free(rec);
-            return None;
+            budget::unref(&mut self.arena, node);
+            return Err(NodeError::NoSlot);
         }
-        Some(rec)
+        Ok(rec)
+    }
+
+    /// The budget node of the record `rec`.
+    #[must_use]
+    pub fn budget(&self, rec: NodeIdx) -> Option<BudgetNode>
+    {
+        budget::node(&self.arena, self.record(rec)?.budget)
+    }
+
+    /// Whether `pages` more may be charged to the budget node of `rec`, with
+    /// `reserve` of the pool's free pages in the system reserve
+    /// ([`budget::admit`]). A record that does not exist admits nothing.
+    ///
+    /// # Errors
+    /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
+    pub fn admit(&self, rec: NodeIdx, pages: u64, reserve: u64) -> Result<(), ChargeError>
+    {
+        let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
+        budget::admit(&self.arena, node, pages, self.pool.free_pages(), reserve)
+    }
+
+    /// Set the max of the budget node of `rec` ([`budget::set_max`]).
+    pub fn set_max(&mut self, rec: NodeIdx, max: u64)
+    {
+        if let Some(r) = self.record(rec)
+        {
+            budget::set_max(&mut self.arena, r.budget, max);
+        }
     }
 
     /// Unindex and free the record keyed by `badge` after taking back every
@@ -174,6 +229,10 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.reclaim_all(rec, quiescent);
         let r = self.record(rec);
         self.arena.free(rec);
+        if let Some(r) = r
+        {
+            budget::unref(&mut self.arena, r.budget);
+        }
         r
     }
 
@@ -187,8 +246,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
-    /// Account `frame` to `rec`. Returns `false` when the arena has no free
-    /// slot outside its reserve.
+    /// Account `frame` to `rec`, charged to its budget node. Returns `false`
+    /// when the arena has no free slot outside its reserve.
     pub fn push_frame(&mut self, rec: NodeIdx, frame: FrameDesc) -> bool
     {
         let Some(mut r) = self.record(rec)
@@ -203,11 +262,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         };
         r.frame_head = idx;
         self.set_record(rec, r);
+        budget::charge(&mut self.arena, r.budget, u64::from(frame.page_count));
         true
     }
 
     /// Account a caller-owned grant of `page_count` pages at `phys_base`,
-    /// held by memmgr's `cap_slot`, to `rec`, marked with `va` (the service's
+    /// held by memmgr's `cap_slot`, to `rec` and its budget node, marked with
+    /// `va` (the service's
     /// caller-owned-mapping marker) and the record's next region id, which
     /// it returns for the grant reply. `None` when the arena has no free slot
     /// outside its reserve or the record's id sequence is spent; the record
@@ -235,11 +296,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         r.frame_head = idx;
         r.next_region_id = next_region_id;
         self.set_record(rec, r);
+        budget::charge(&mut self.arena, r.budget, u64::from(page_count));
         Some(region_id)
     }
 
-    /// Undo the most recent [`Ledger::push_frame`] on `rec`, returning the
-    /// descriptor. The frame's cap is the caller's to return to the pool.
+    /// Undo the most recent [`Ledger::push_frame`] on `rec`, releasing its
+    /// charge, and return the descriptor. The frame's cap is the caller's to
+    /// return to the pool.
     pub fn pop_frame(&mut self, rec: NodeIdx) -> Option<FrameDesc>
     {
         let mut r = self.record(rec)?;
@@ -252,6 +315,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.arena.free(r.frame_head);
         r.frame_head = slot.next;
         self.set_record(rec, r);
+        budget::uncharge(&mut self.arena, r.budget, u64::from(f.page_count));
         Some(f)
     }
 
@@ -364,20 +428,27 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         path.saturating_add(1)
     }
 
-    /// Record `frame`, a run memmgr mapped at `frame.va` in region `reg`, on
-    /// the run list of the chunk holding it, and mark its pages backed in the
-    /// chunk's entry ([`ChunkEntry::back`]). Either all of it is recorded or
-    /// nothing changes.
+    /// Record `frame`, a run memmgr mapped at `frame.va` in region `reg` of
+    /// `rec`, on the run list of the chunk holding it, mark its pages backed in
+    /// the chunk's entry ([`ChunkEntry::back`]), and charge it to the budget
+    /// node of `rec`. Either all of it is recorded or nothing changes.
     ///
     /// # Errors
+    /// [`BackError::NoRecord`] when `rec` holds no record,
     /// [`BackError::NoRegion`] when `reg` holds no region,
     /// [`BackError::Outside`] when the run is unaligned or leaves the region,
     /// [`BackError::Chunk`] when the chunk's entry refuses the run (it leaves
     /// the chunk, covers a backed page, or the chunk is evicting or swapped),
     /// and [`BackError::NoSlot`] when the arena has fewer free slots than
     /// [`Ledger::back_slots`].
-    pub fn back_chunk(&mut self, reg: NodeIdx, frame: FrameDesc) -> Result<(), BackError>
+    pub fn back_chunk(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        frame: FrameDesc,
+    ) -> Result<(), BackError>
     {
+        let charged = self.record(rec).ok_or(BackError::NoRecord)?.budget;
         let mut node = self.region_node(reg).ok_or(BackError::NoRegion)?;
         let region = node.region;
         let end = u64::from(frame.page_count)
@@ -420,6 +491,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(BackError::NoSlot);
         }
         self.arena.set_node(reg, Node::Region(node));
+        budget::charge(&mut self.arena, charged, u64::from(frame.page_count));
         Ok(())
     }
 
@@ -452,7 +524,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 {
                     self.arena.set_next(prev, next);
                 }
-                self.release_table(have.table, quiescent);
+                self.release_table(have.table, r.budget, quiescent);
                 self.arena.free(cur);
                 return Some(have.region);
             }
@@ -463,8 +535,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 
     /// Free every node of the chunk table at `root`, taking each run back,
-    /// pooled or deferred as `quiescent` decides ([`retire`]).
-    fn release_table(&mut self, root: NodeIdx, mut quiescent: impl FnMut(&FreeRun) -> bool)
+    /// pooled or deferred as `quiescent` decides, its charge on the budget node
+    /// `charged` ([`retire`]).
+    fn release_table(
+        &mut self,
+        root: NodeIdx,
+        charged: NodeIdx,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    )
     {
         let Self {
             arena,
@@ -473,7 +551,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             ..
         } = self;
         chunk::release(arena, root, |arena, idx, frame| {
-            retire(arena, pool, deferred, idx, &frame, &mut quiescent);
+            retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
         });
     }
 
@@ -519,6 +597,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 &mut self.deferred,
                 cur,
                 &f,
+                r.budget,
                 &mut quiescent,
             );
             // Each pass moves one frame descriptor, so `moved` is below the slot count.
@@ -563,7 +642,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         while let Some(have) = self.region_node(cur)
         {
             let next = self.arena.get(cur).next;
-            self.release_table(have.table, &mut quiescent);
+            self.release_table(have.table, r.budget, &mut quiescent);
             self.arena.free(cur);
             cur = next;
         }
@@ -586,15 +665,18 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     }
 }
 
-/// Rewrite the frame slot `idx`, holding `frame`, into a run slot in place and
-/// move it into `pool` when `quiescent` accepts the run, else onto `deferred`.
-/// The move needs no fresh slot, so it cannot fail.
+/// Rewrite the frame slot `idx`, holding `frame` charged to the budget node
+/// `charged`, in place: into a run slot moved into `pool`, its charge
+/// released, when `quiescent` accepts the run, else into a deferred run slot
+/// parked on `deferred`, still charged. The move needs no fresh slot, so it
+/// cannot fail.
 fn retire<S: SlotStore>(
     arena: &mut Arena<S>,
     pool: &mut FreePool,
     deferred: &mut DeferredList,
     idx: NodeIdx,
     frame: &FrameDesc,
+    charged: NodeIdx,
     quiescent: &mut impl FnMut(&FreeRun) -> bool,
 )
 {
@@ -603,19 +685,30 @@ fn retire<S: SlotStore>(
         page_count: u64::from(frame.page_count),
         phys_base: frame.phys_base,
     };
-    arena.set(
-        idx,
-        Slot {
-            node: Node::Run(run),
-            next: NODE_NULL,
-        },
-    );
     if quiescent(&run)
     {
+        budget::uncharge(arena, charged, run.page_count);
+        arena.set(
+            idx,
+            Slot {
+                node: Node::Run(run),
+                next: NODE_NULL,
+            },
+        );
         pool.push_node(arena, idx);
     }
     else
     {
+        arena.set(
+            idx,
+            Slot {
+                node: Node::Deferred(DeferredRun {
+                    run,
+                    budget: charged,
+                }),
+                next: NODE_NULL,
+            },
+        );
         deferred.park(arena, idx);
     }
 }
@@ -626,6 +719,7 @@ mod tests
     use super::*;
     use crate::arena::test_store::VecStore;
     use crate::chunk::ChunkState;
+    use crate::budget::{NO_MAX, reserve_pages};
 
     const UNMAPPED: u64 = u64::MAX;
 
@@ -692,12 +786,12 @@ mod tests
     fn insert_process_fails_cleanly_without_a_slot()
     {
         let mut l = Ledger::new(VecStore::default(), VecWords::default());
-        assert!(l.insert_process(1).is_none());
+        assert_eq!(l.insert_process(1, NodeSpec::TOP), Err(NodeError::NoSlot));
         // SAFETY: VecStore grows on write.
         unsafe { l.arena.add_page() };
         let free = l.arena.free_count();
         // Still no bucket storage: the record slot is given back.
-        assert!(l.insert_process(1).is_none());
+        assert_eq!(l.insert_process(1, NodeSpec::TOP), Err(NodeError::NoSlot));
         assert_eq!(l.arena.free_count(), free);
     }
 
@@ -706,7 +800,7 @@ mod tests
     {
         let mut l = ledger();
         let free = l.arena.free_count();
-        let rec = l.insert_process(42).unwrap();
+        let rec = l.insert_process(42, NodeSpec::TOP).unwrap();
         assert!(l.push_frame(rec, frame(1, 2, 0x1000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 16, 0x10000, 0x40_0000)));
         l.add_region(rec, region(0x40_0000, 0x10_0000)).unwrap();
@@ -725,7 +819,7 @@ mod tests
     {
         let mut l = ledger();
         let free = l.arena.free_count();
-        let rec = l.insert_process(7).unwrap();
+        let rec = l.insert_process(7, NodeSpec::TOP).unwrap();
         assert!(l.push_frame(rec, frame(1, 2, 0x1000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 3, 0x8000, UNMAPPED)));
         let id = l.push_grant(rec, 3, 4, 0x20000, UNMAPPED).unwrap();
@@ -737,13 +831,16 @@ mod tests
         l.remove_process(7, |r| r.cap_slot != 2).unwrap();
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (2, 1));
         assert_eq!((l.deferred.pages(), l.deferred.run_count()), (7, 2));
-        // Every frame slot became a run slot, pooled or parked; only the
-        // record's slot was freed.
-        assert_eq!(l.arena.free_count(), free - 3);
+        // Every frame slot became a run slot, pooled or parked; the record's
+        // slot was freed, and its budget node outlives it while the parked
+        // runs stay charged to it.
+        assert_eq!(l.arena.free_count(), free - 4);
         assert_eq!(
             l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all),
             7
         );
+        // The recheck uncharged the last runs, and the node went with them.
+        assert_eq!(l.arena.free_count(), free - 3);
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (9, 3));
         assert_eq!(l.deferred.run_count(), 0);
     }
@@ -760,7 +857,7 @@ mod tests
     fn pop_frame_undoes_the_latest_push()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let first = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
         assert!(l.push_grant(rec, 2, 1, 0x2000, UNMAPPED).is_some());
         assert_eq!(l.pop_frame(rec).map(|f| f.cap_slot), Some(2));
@@ -772,8 +869,8 @@ mod tests
     fn release_frame_by_region_takes_only_the_named_grant_of_the_caller()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
-        let other = l.insert_process(2).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let other = l.insert_process(2, NodeSpec::TOP).unwrap();
         let id = l.push_grant(rec, 1, 4, 0x8000, UNMAPPED).unwrap();
         // Records number their grants independently: the same id names
         // another process's grant there.
@@ -793,7 +890,7 @@ mod tests
     fn a_record_never_reissues_a_region_id()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let first = l.push_grant(rec, 1, 1, 0x1000, UNMAPPED).unwrap();
         assert!(l.release_frame_by_region(rec, first, pool_all));
         // The same run granted again is a new grant with a new id, so a stale
@@ -808,7 +905,7 @@ mod tests
     fn push_grant_refuses_a_spent_id_sequence_and_a_full_arena_unchanged()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let mut r = l.record(rec).unwrap();
         r.next_region_id = u64::MAX;
         l.set_record(rec, r);
@@ -826,7 +923,7 @@ mod tests
     fn add_region_rejects_overlap_and_region_exact_needs_an_exact_match()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         l.add_region(rec, region(0x1000, 0x2000)).unwrap();
         assert_eq!(
             l.add_region(rec, region(0x2000, 0x1000)),
@@ -857,14 +954,14 @@ mod tests
         // SAFETY: VecStore grows on write.
         unsafe { l.arena.add_page() };
         let free = l.arena.free_count();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         l.push_grant(rec, 9, 2, 0x9_0000, UNMAPPED).unwrap();
         l.add_region(rec, region(BASE, 64 * CHUNK)).unwrap();
         let reg = l.region_exact(rec, BASE, 64 * CHUNK).unwrap();
-        l.back_chunk(reg, frame(1, 4, 0x1_0000, BASE)).unwrap();
-        l.back_chunk(reg, frame(2, 12, 0x2_0000, BASE + 4 * PAGE_SIZE))
+        l.back_chunk(rec, reg, frame(1, 4, 0x1_0000, BASE)).unwrap();
+        l.back_chunk(rec, reg, frame(2, 12, 0x2_0000, BASE + 4 * PAGE_SIZE))
             .unwrap();
-        l.back_chunk(reg, frame(3, 3, 0x3_0000, BASE + 63 * CHUNK + PAGE_SIZE))
+        l.back_chunk(rec, reg, frame(3, 3, 0x3_0000, BASE + 63 * CHUNK + PAGE_SIZE))
             .unwrap();
         (l, free, rec, reg)
     }
@@ -898,39 +995,39 @@ mod tests
         let before = l.chunk_at(reg, BASE + 63 * CHUNK);
         let at = |va| frame(4, 1, 0x4_0000, va);
         assert_eq!(
-            l.back_chunk(reg, at(BASE + 63 * CHUNK + 2 * PAGE_SIZE)),
+            l.back_chunk(rec, reg, at(BASE + 63 * CHUNK + 2 * PAGE_SIZE)),
             Err(BackError::Chunk(ChunkError::Window))
         );
         // A run crossing into the next chunk leaves its own.
         assert_eq!(
-            l.back_chunk(reg, frame(4, 2, 0x4_0000, BASE + 63 * CHUNK - PAGE_SIZE)),
+            l.back_chunk(rec, reg, frame(4, 2, 0x4_0000, BASE + 63 * CHUNK - PAGE_SIZE)),
             Err(BackError::Chunk(ChunkError::Window))
         );
         assert_eq!(
-            l.back_chunk(reg, at(BASE + 64 * CHUNK)),
+            l.back_chunk(rec, reg, at(BASE + 64 * CHUNK)),
             Err(BackError::Outside)
         );
         assert_eq!(
-            l.back_chunk(reg, at(BASE - PAGE_SIZE)),
+            l.back_chunk(rec, reg, at(BASE - PAGE_SIZE)),
             Err(BackError::Outside)
         );
-        assert_eq!(l.back_chunk(reg, at(BASE + 0x800)), Err(BackError::Outside));
-        assert_eq!(l.back_chunk(rec, at(BASE)), Err(BackError::NoRegion));
+        assert_eq!(l.back_chunk(rec, reg, at(BASE + 0x800)), Err(BackError::Outside));
+        assert_eq!(l.back_chunk(rec, rec, at(BASE)), Err(BackError::NoRegion));
         assert_eq!(l.arena.free_count(), free);
-        // Chunk 40 lies under another child of the root: it needs two
-        // directory nodes, its leaf, and the run's slot. Chunk 63 has its
-        // path and needs only the run's.
+        // Chunk 40 lies under the root's child that holds chunk 63, but under
+        // another child of that: it needs one directory node, its leaf, and
+        // the run's slot. Chunk 63 has its path and needs only the run's.
         let far = BASE + 40 * CHUNK;
-        assert_eq!(l.back_slots(reg, far), 4);
+        assert_eq!(l.back_slots(reg, far), 3);
         assert_eq!(l.back_slots(reg, BASE + 63 * CHUNK), 1);
-        let taken = fill_arena_but(&mut l, 3);
-        assert_eq!(l.back_chunk(reg, at(far)), Err(BackError::NoSlot));
-        assert_eq!(l.arena.free_count(), 3);
+        let taken = fill_arena_but(&mut l, 2);
+        assert_eq!(l.back_chunk(rec, reg, at(far)), Err(BackError::NoSlot));
+        assert_eq!(l.arena.free_count(), 2);
         assert_eq!(l.chunk_at(reg, far), ChunkEntry::UNBACKED);
         assert_eq!(l.chunk_at(reg, BASE + 63 * CHUNK), before);
         // One more free slot is enough.
         l.arena.free(taken[0]);
-        l.back_chunk(reg, at(far)).unwrap();
+        l.back_chunk(rec, reg, at(far)).unwrap();
         assert_eq!(l.arena.free_count(), 0);
         assert_eq!(l.chunk_at(reg, far).backed(), 1);
     }
@@ -1000,27 +1097,27 @@ mod tests
         }
         // SAFETY: the test word store grows on write.
         unsafe { l.index.add_page(&mut l.arena) };
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         for i in 0..200
         {
             l.push_grant(rec, i, 1, i * PAGE_SIZE, UNMAPPED).unwrap();
         }
-        // A region of 2^14 chunks: a table of seven directory levels.
+        // A region of 2^14 chunks: a table of six directory levels.
         let chunks: u64 = 1 << 14;
         l.add_region(rec, region(BASE, chunks * CHUNK)).unwrap();
         let reg = l.region_exact(rec, BASE, chunks * CHUNK).unwrap();
         let height = chunk::table_height(chunks);
-        assert_eq!(height, 7);
+        assert_eq!(height, 6);
         // Back 1000 chunks spread over the region with one run each, and
         // chunk 0 with sixteen.
         for c in 0..1000
         {
             let va = BASE + (c * 16 + 1) * CHUNK;
-            l.back_chunk(reg, frame(c, 16, c * CHUNK, va)).unwrap();
+            l.back_chunk(rec, reg, frame(c, 16, c * CHUNK, va)).unwrap();
         }
         for p in 0..16
         {
-            l.back_chunk(reg, frame(p, 1, p * PAGE_SIZE, BASE + p * PAGE_SIZE))
+            l.back_chunk(rec, reg, frame(p, 1, p * PAGE_SIZE, BASE + p * PAGE_SIZE))
                 .unwrap();
         }
         let lookup = |va: u64| {
@@ -1065,7 +1162,7 @@ mod tests
     fn push_frame_refuses_on_a_full_arena_leaving_the_record_unchanged()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
         let before = l.record(rec);
         fill_arena(&mut l);
@@ -1078,7 +1175,7 @@ mod tests
     fn add_region_reports_a_full_arena_and_a_missing_record()
     {
         let mut l = ledger();
-        let rec = l.insert_process(1).unwrap();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         let before = l.record(rec);
         fill_arena(&mut l);
         assert_eq!(
@@ -1091,5 +1188,235 @@ mod tests
             l.add_region(NODE_NULL, region(0x1000, 0x1000)),
             Err(RegionError::NoRecord)
         );
+    }
+
+    /// The pages of every frame, demand run and deferred run charged to the
+    /// budget node `node`, walked from the records, the chunk tables and the
+    /// deferred list: what the node's own count must equal.
+    fn held_by(l: &Ledger<VecStore, VecWords>, node: NodeIdx) -> u64
+    {
+        let mut pages = 0;
+        for idx in 0..l.arena.pages() * crate::SLOTS_PER_PAGE
+        {
+            let Node::Process(r) = l.arena.get(idx).node
+            else
+            {
+                if let Node::Deferred(d) = l.arena.get(idx).node
+                    && d.budget == node
+                {
+                    pages += d.run.page_count;
+                }
+                continue;
+            };
+            if r.budget != node
+            {
+                continue;
+            }
+            let mut cur = r.frame_head;
+            while let Node::Frame(f) = l.arena.get(cur).node
+            {
+                pages += u64::from(f.page_count);
+                cur = l.arena.get(cur).next;
+            }
+            let mut reg = r.region_head;
+            while let Some(have) = l.region_node(reg)
+            {
+                let height = chunk::table_height(chunk_count(&have.region));
+                for c in 0..chunk_count(&have.region)
+                {
+                    let mut run = chunk::entry(&l.arena, have.table, height, c).runs();
+                    while let Node::Frame(f) = l.arena.get(run).node
+                    {
+                        pages += u64::from(f.page_count);
+                        run = l.arena.get(run).next;
+                    }
+                }
+                reg = l.arena.get(reg).next;
+            }
+        }
+        pages
+    }
+
+    /// The record's node's own and subtree counts, checked against what it
+    /// holds.
+    fn usage(l: &Ledger<VecStore, VecWords>, rec: NodeIdx) -> (u64, u64)
+    {
+        let b = l.budget(rec).unwrap();
+        assert_eq!(b.own, held_by(l, l.record(rec).unwrap().budget));
+        (b.own, b.subtree)
+    }
+
+    #[test]
+    fn the_charge_rises_on_each_charge_and_falls_on_release_unregister_and_reclaim()
+    {
+        let (mut l, _, rec, reg) = backed_ledger();
+        // The grant of 2 and the demand runs of 4, 12 and 3.
+        assert_eq!(usage(&l, rec), (21, 21));
+        // A page-table donation is a frame on the record.
+        assert!(l.push_frame(rec, frame(5, 4, 0x5_0000, UNMAPPED)));
+        assert_eq!(usage(&l, rec), (25, 25));
+        let id = l.push_grant(rec, 6, 8, 0x6_0000, UNMAPPED).unwrap();
+        assert_eq!(usage(&l, rec), (33, 33));
+        // Release of a grant, then unregister of the region.
+        assert!(l.release_frame_by_region(rec, id, pool_all));
+        assert_eq!(usage(&l, rec), (25, 25));
+        l.remove_region(rec, reg, pool_all).unwrap();
+        assert_eq!(usage(&l, rec), (6, 6));
+        // A run the check refuses stays charged until a recheck pools it.
+        let id = l.push_grant(rec, 7, 5, 0x7_0000, UNMAPPED).unwrap();
+        assert!(l.release_frame_by_region(rec, id, |_| false));
+        assert_eq!(usage(&l, rec), (11, 11));
+        l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
+        assert_eq!(usage(&l, rec), (6, 6));
+        // pop_frame undoes the latest charge.
+        assert!(l.pop_frame(rec).is_some());
+        assert_eq!(usage(&l, rec), (2, 2));
+        // Reclaim at death takes the rest; the node goes with the record.
+        let node = l.record(rec).unwrap().budget;
+        l.remove_process(1, pool_all).unwrap();
+        assert!(budget::node(&l.arena, node).is_none());
+    }
+
+    /// A ledger with `pages` free pages in its pool, in one run.
+    fn ledger_with_pool(pages: u64) -> Ledger<VecStore, VecWords>
+    {
+        let mut l = ledger();
+        l.pool
+            .push(
+                &mut l.arena,
+                FreeRun {
+                    cap_slot: 900,
+                    page_count: pages,
+                    phys_base: 0x1000_0000,
+                },
+            )
+            .unwrap();
+        l
+    }
+
+    #[test]
+    fn a_node_outlives_its_process_while_a_child_lives_or_a_run_is_deferred()
+    {
+        let mut l = ledger();
+        let parent = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let parent_node = l.record(parent).unwrap().budget;
+        let child = l
+            .insert_process(
+                2,
+                NodeSpec {
+                    parent: parent_node,
+                    max: NO_MAX,
+                    reserve: false,
+                },
+            )
+            .unwrap();
+        let child_node = l.record(child).unwrap().budget;
+        assert!(l.push_frame(child, frame(1, 3, 0x1000, UNMAPPED)));
+        assert!(l.push_frame(child, frame(2, 5, 0x9000, UNMAPPED)));
+        assert_eq!(usage(&l, parent), (0, 8));
+        // The parent dies first: its live child keeps its node, which still
+        // counts the child's charge.
+        l.remove_process(1, pool_all).unwrap();
+        let p = budget::node(&l.arena, parent_node).unwrap();
+        assert_eq!((p.refs, p.own, p.subtree), (1, 0, 8));
+        // The child dies with one frame still reachable: its node stays,
+        // charged with the deferred run, and so does its parent's.
+        l.remove_process(2, |r| r.cap_slot != 2).unwrap();
+        let c = budget::node(&l.arena, child_node).unwrap();
+        assert_eq!((c.refs, c.own), (0, 5));
+        assert_eq!(c.own, held_by(&l, child_node));
+        assert_eq!(budget::node(&l.arena, parent_node).map(|p| p.subtree), Some(5));
+        // The deferred run rejoins the pool: both nodes are freed.
+        l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
+        assert!(budget::node(&l.arena, child_node).is_none());
+        assert!(budget::node(&l.arena, parent_node).is_none());
+    }
+
+    #[test]
+    fn a_charge_over_a_max_is_a_limit_and_lowering_it_reclaims_nothing()
+    {
+        let mut l = ledger_with_pool(1000);
+        let parent = l
+            .insert_process(
+                1,
+                NodeSpec {
+                    parent: NODE_NULL,
+                    max: 10,
+                    reserve: false,
+                },
+            )
+            .unwrap();
+        let child = l
+            .insert_process(
+                2,
+                NodeSpec {
+                    parent: l.record(parent).unwrap().budget,
+                    max: NO_MAX,
+                    reserve: false,
+                },
+            )
+            .unwrap();
+        assert!(l.push_grant(child, 1, 6, 0x1000, UNMAPPED).is_some());
+        // The ancestor's max limits the child, which has none of its own.
+        assert_eq!(l.admit(child, 4, 0), Ok(()));
+        assert_eq!(l.admit(child, 5, 0), Err(ChargeError::Limit));
+        assert_eq!(l.admit(parent, 5, 0), Err(ChargeError::Limit));
+        // Lowering the child's max below its usage keeps the usage and
+        // refuses every new charge.
+        l.set_max(child, 2);
+        assert_eq!(usage(&l, child), (6, 6));
+        assert_eq!(l.admit(child, 1, 0), Err(ChargeError::Limit));
+        assert_eq!(l.budget(child).map(|b| b.max), Some(2));
+    }
+
+    #[test]
+    fn a_reserve_node_is_served_after_an_ordinary_client_drains_the_pool()
+    {
+        let mut l = ledger_with_pool(640);
+        let reserve = reserve_pages(640);
+        let core = l.insert_process(1, NodeSpec::TOP_RESERVE).unwrap();
+        let client = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let take = |l: &mut Ledger<VecStore, VecWords>, rec, pages: u32| {
+            l.admit(rec, u64::from(pages), reserve)?;
+            let grant = l
+                .pool
+                .select(&mut l.arena, pages, crate::Fit::Contiguous, |cap, _| {
+                    Some(cap + 1)
+                })
+                .unwrap();
+            let (cap, pages, phys) = grant.entries[0];
+            l.push_grant(rec, cap, pages, phys, UNMAPPED).unwrap();
+            Ok(())
+        };
+        assert_eq!(reserve, 10);
+        // The client drains every page outside the reserve, and no more.
+        assert_eq!(take(&mut l, client, 631), Err(ChargeError::Reserve));
+        assert_eq!(take(&mut l, client, 630), Ok(()));
+        assert_eq!(l.pool.free_pages(), reserve);
+        assert_eq!(take(&mut l, client, 1), Err(ChargeError::Reserve));
+        // The core's charge is served from the reserve.
+        assert_eq!(take(&mut l, core, 10), Ok(()));
+        assert_eq!(l.pool.free_pages(), 0);
+        assert_eq!(usage(&l, core), (reserve, reserve));
+    }
+
+    #[test]
+    fn insert_process_refuses_a_reserve_child_of_a_client_unchanged()
+    {
+        let mut l = ledger();
+        let client = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let free = l.arena.free_count();
+        let spec = NodeSpec {
+            parent: l.record(client).unwrap().budget,
+            max: NO_MAX,
+            reserve: true,
+        };
+        assert_eq!(l.insert_process(2, spec), Err(NodeError::Parent));
+        assert_eq!(l.arena.free_count(), free);
+        assert!(l.find(2).is_none());
+        // One slot short of the record and its node: refused whole.
+        fill_arena_but(&mut l, 1);
+        assert_eq!(l.insert_process(3, NodeSpec::TOP), Err(NodeError::NoSlot));
+        assert_eq!(l.arena.available(), 1);
     }
 }

@@ -19,9 +19,10 @@
 )]
 
 use free_pool::{
-    ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
-    NO_REGION_ID, NODE_NULL, Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore,
-    WordStore, arena::Slot, chunk::ChunkState, chunk_for, fault_window, region_grants,
+    ArenaLayout, ChargeError, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger,
+    MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError, NodeIdx, NodeSpec,
+    RecheckBudget, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
+    chunk_for, fault_window, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -388,6 +389,28 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
             SelectError::Contiguous => memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
             SelectError::BestEffort => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
         })
+}
+
+/// Admit a charge of `pages` to the budget node of `rec` against the max of
+/// the node and its ancestors and, for a node outside the reserve, against
+/// the system reserve (`free_pool::budget::admit`;
+/// services/memmgr/docs/memory-pool.md § Distribution policy). A refusal
+/// first rechecks the deferred runs, unless this turn of the receive loop
+/// already has, and, when one moved to the pool, which releases its charge and
+/// adds free pages, admits once more. Every charge to a process is admitted
+/// here before its run leaves the pool: a grant, a demand fault's run, and a
+/// page-table donation to its address space.
+fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64) -> Result<(), ChargeError>
+{
+    let reserve = reserve_pages(pool_total_pages());
+    l.admit(rec, pages, reserve).or_else(|e| {
+        if recheck_deferred(l) == 0
+        {
+            return Err(e);
+        }
+        coalesce(l);
+        l.admit(rec, pages, reserve)
+    })
 }
 
 // ── Deferred reclamation ─────────────────────────────────────────────────────
@@ -1122,7 +1145,25 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     {
         Fit::Contiguous
     };
-    let grant = match select(l, want_pages, fit)
+    // The whole request is admitted before any run leaves the pool: a charge
+    // over a max fails `LIMIT`, whatever part of it would fit; one that would
+    // take the reserve fails as exhaustion, with the out-of-memory code of
+    // the request's fit.
+    let selected = match admit(l, rec, u64::from(want_pages))
+    {
+        Ok(()) => select(l, want_pages, fit),
+        Err(ChargeError::Limit) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::LIMIT);
+            return;
+        }
+        Err(ChargeError::Reserve) => Err(match fit
+        {
+            Fit::Contiguous => memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            Fit::BestEffort | Fit::UpTo => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
+        }),
+    };
+    let grant = match selected
     {
         Ok(g) => g,
         Err(code) =>
@@ -1254,6 +1295,24 @@ fn handle_release_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
+/// The budget node a `REGISTER_PROCESS` names as the new node's parent by
+/// the memmgr badge of its process: [`NODE_NULL`] for 0, a top-level node.
+/// `None` for a badge no record carries, or a reserved boot record's
+/// (`MEMMGR_SELF_BADGE`, `INIT_SELF_BADGE`), which no process is created
+/// under.
+fn budget_parent(l: &MemLedger, badge: u64) -> Option<NodeIdx>
+{
+    if badge == 0
+    {
+        return Some(NODE_NULL);
+    }
+    if badge == MEMMGR_SELF_BADGE || badge == INIT_SELF_BADGE
+    {
+        return None;
+    }
+    l.find(badge).and_then(|rec| l.record(rec)).map(|r| r.budget)
+}
+
 fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64, procmgr_badge: u64)
 {
     if req.badge != procmgr_badge
@@ -1268,13 +1327,38 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         return;
     }
     let flags = req.word(1);
-    if flags & !memmgr_labels::REGISTER_PHYS_CLASS != 0
+    let known = memmgr_labels::REGISTER_PHYS_CLASS
+        | memmgr_labels::REGISTER_RESERVE
+        | memmgr_labels::REGISTER_MAX;
+    if flags & !known != 0
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
 
     let l = ledger_mut();
+    // The new process's budget node: under the node of the process whose
+    // memmgr badge `data[2]` names, or top-level for 0, with the max in
+    // `data[3]` when `REGISTER_MAX` is set (services/memmgr/docs/
+    // ipc-interface.md § Label 3). The reserved boot records are no parent.
+    let Some(parent) = budget_parent(l, req.word(2))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let spec = NodeSpec {
+        parent,
+        max: if flags & memmgr_labels::REGISTER_MAX == 0
+        {
+            NO_MAX
+        }
+        else
+        {
+            req.word(3)
+        },
+        reserve: flags & memmgr_labels::REGISTER_RESERVE != 0,
+    };
     let class_bit = if flags & memmgr_labels::REGISTER_PHYS_CLASS == 0
     {
         0
@@ -1292,14 +1376,31 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         return;
     };
 
-    // The record is an arena node and the index grows with it, so the table
-    // refuses only when the arena cannot grow: system RAM is exhausted.
+    // The record and its budget node are arena nodes and the index grows with
+    // them, so the table refuses for want of room only when the arena cannot
+    // grow: system RAM is exhausted.
     ensure_index(l);
-    if !ensure_slots(l, 1) || l.insert_process(new_badge).is_none()
+    if !ensure_slots(l, 2)
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     }
+    let rec = match l.insert_process(new_badge, spec)
+    {
+        Ok(rec) => rec,
+        Err(NodeError::Parent | NodeError::Refs) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+        Err(NodeError::NoSlot) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
+            return;
+        }
+    };
+    // The max the node took, after the clamp to its parent chain's headroom.
+    let max = l.budget(rec).map_or(NO_MAX, |b| b.max);
 
     let Ok(send_cap) =
         syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
@@ -1312,6 +1413,7 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
 
     let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, new_badge)
+        .word(1, max)
         .cap(send_cap)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -1489,6 +1591,29 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
 }
 
+/// Reply with the caller's own budget usage, in pages: `data[0]` the pages
+/// charged to its node, `data[1]` the node's max (`u64::MAX` for none), and
+/// `data[2]` the pages charged to the node and every node below it
+/// (services/memmgr/docs/ipc-interface.md § Label 10). Attributed by
+/// `req.badge`; an unknown badge is `INVALID_ARGUMENT`. Read-only.
+fn handle_query_memory_usage(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let l = ledger_mut();
+    let Some(node) = l.find(req.badge).and_then(|rec| l.budget(rec))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, node.own)
+        .word(1, node.max)
+        .word(2, node.subtree)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
 /// Register a demand-paged anonymous region for the calling process.
 ///
 /// Attributed by `req.badge` (the caller's per-process badge). The region is
@@ -1650,8 +1775,9 @@ enum FaultDecline
     /// table.
     NoArenaSlot = 6,
     /// The free pool holds no page to back the faulting page: it is empty,
-    /// even after the deferred runs were rechecked, or the split of a run
-    /// larger than the span to back failed.
+    /// even after the deferred runs were rechecked, every free page it holds
+    /// is in the system reserve and the process's budget node is outside it,
+    /// or the split of a run larger than the span to back failed.
     NoFreePage = 7,
     /// The run could not be recorded on its chunk in the region's chunk
     /// table.
@@ -1662,6 +1788,10 @@ enum FaultDecline
     /// when the failure was an exhausted pool; the high 32 bits of the reason
     /// word carry the magnitude of its `SyscallError`.
     MapFailed = 9,
+    /// Backing the span, or funding the page tables its map needs, would take
+    /// the subtree of the process's budget node, or of an ancestor, over its
+    /// max (services/memmgr/docs/memory-pool.md § Distribution policy).
+    BudgetLimit = 10,
 }
 
 /// Decline the fault, with data word 0 the reason word: `reason` in its low
@@ -1803,6 +1933,23 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
     }
+    // The whole span is admitted against the process's budget before a run
+    // leaves the pool, though a fragmented pool may back less of it.
+    match admit(l, rec, u64::from(span_pages))
+    {
+        Ok(()) =>
+        {}
+        Err(ChargeError::Limit) =>
+        {
+            decline_fault(ipc_buf, FaultDecline::BudgetLimit, 0);
+            return;
+        }
+        Err(ChargeError::Reserve) =>
+        {
+            decline_fault(ipc_buf, FaultDecline::NoFreePage, 0);
+            return;
+        }
+    }
     let Ok(grant) =
         select(l, span_pages, Fit::Contiguous).or_else(|_| select(l, span_pages, Fit::UpTo))
     else
@@ -1840,14 +1987,18 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // Map first, then record the run in its chunk: a failed map leaves the
     // chunk's entry as it was. A page-table top-up during the map holds the
     // slots recording the run needs.
-    if let Err(e) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot, need)
+    if let Err(refusal) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot, need)
     {
         release_unmapped_chunk(l, rec, aspace_cap, frame);
-        decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs());
+        match refusal
+        {
+            MapRefusal::Map(e) => decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs()),
+            MapRefusal::Limit => decline_fault(ipc_buf, FaultDecline::BudgetLimit, 0),
+        }
         return;
     }
     // Record the run on its chunk, so it is reclaimed on death or unregister.
-    if !ensure_slots(l, need) || l.back_chunk(reg, frame).is_err()
+    if !ensure_slots(l, need) || l.back_chunk(rec, reg, frame).is_err()
     {
         release_unmapped_chunk(l, rec, aspace_cap, frame);
         decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
@@ -1856,12 +2007,32 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
 }
 
+/// Why [`map_client_chunk`] did not map a demand chunk.
+enum MapRefusal
+{
+    /// The last map failed with this error.
+    Map(i64),
+    /// Funding the page tables the map needs would take the subtree of the
+    /// process's budget node, or of an ancestor, over its max.
+    Limit,
+}
+
+/// Why [`fund_client_page_tables`] funded nothing.
+enum FundRefusal
+{
+    /// The process's budget admits not even the smallest donation.
+    Limit,
+    /// Any other failure, which leaves the map's own error standing.
+    Failed,
+}
+
 /// Map the demand chunk `frame` describes into the client address space
 /// `aspace_cap` at `frame.va` with `prot`. When the kernel reports the
 /// client's page-table pool exhausted, memmgr funds the pool from its own
 /// ([`fund_client_page_tables`]), holding the `held` arena slots that
 /// recording the chunk takes, and maps again, at most [`PT_FUND_ROUNDS`]
-/// times. Returns the last map error otherwise.
+/// times. Returns the last map error otherwise, or [`MapRefusal::Limit`]
+/// when the process's budget refused the funding.
 ///
 /// Pool outers are full-rights, so `mem_map` gates the mapping to `prot`
 /// directly (the kernel grants read at every map, and W^X is enforced); no
@@ -1876,7 +2047,7 @@ fn map_client_chunk(
     frame: &FrameDesc,
     prot: u64,
     held: u64,
-) -> Result<(), i64>
+) -> Result<(), MapRefusal>
 {
     let mut rounds: u32 = 0;
     loop
@@ -1899,11 +2070,16 @@ fn map_client_chunk(
         {
             return Ok(());
         };
-        if e != SyscallError::OutOfMemory as i64
-            || rounds == PT_FUND_ROUNDS
-            || !fund_client_page_tables(l, rec, aspace_cap, held)
+        if e != SyscallError::OutOfMemory as i64 || rounds == PT_FUND_ROUNDS
         {
-            return Err(e);
+            return Err(MapRefusal::Map(e));
+        }
+        match fund_client_page_tables(l, rec, aspace_cap, held)
+        {
+            Ok(()) =>
+            {}
+            Err(FundRefusal::Limit) => return Err(MapRefusal::Limit),
+            Err(FundRefusal::Failed) => return Err(MapRefusal::Map(e)),
         }
         rounds = rounds.saturating_add(1);
     }
@@ -1911,26 +2087,55 @@ fn map_client_chunk(
 
 /// Fund the client address space `aspace_cap`'s page-table growth pool from
 /// memmgr's free pool: donate a contiguous run of [`ASPACE_TOPUP_PAGES`] (or
-/// two pages when no such run is free) with augment-mode `cap_create_aspace`,
-/// and account the run to the client's record `rec` like a grant memmgr did
-/// not map ([`FRAME_VA_UNMAPPED`], no region id), so only `PROCESS_DIED`
-/// reclaims it, once the address space's teardown has released the donation
-/// (services/memmgr/docs/memory-pool.md § Client page-table funding). memmgr
-/// keeps the run's cap as the reclaim anchor. A refused donation returns the
-/// run to the pool. The arena keeps `held` free slots beside the run's
-/// descriptor, for the caller's demand chunk.
-fn fund_client_page_tables(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, held: u64) -> bool
+/// two pages when no such run is free, or the process's budget admits only
+/// two) with augment-mode `cap_create_aspace`, and account the run to the
+/// client's record `rec` like a grant memmgr did not map
+/// ([`FRAME_VA_UNMAPPED`], no region id), charged to its budget node, so only
+/// `PROCESS_DIED` reclaims it, once the address space's teardown has released
+/// the donation (services/memmgr/docs/memory-pool.md § Client page-table
+/// funding). memmgr keeps the run's cap as the reclaim anchor. A refused
+/// donation returns the run to the pool. The arena keeps `held` free slots
+/// beside the run's descriptor, for the caller's demand chunk.
+///
+/// # Errors
+/// [`FundRefusal::Limit`] when the budget admits not even two pages;
+/// [`FundRefusal::Failed`] for every other failure: the charge would take the
+/// reserve, or the arena, the pool or the donation fails.
+fn fund_client_page_tables(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    aspace_cap: u64,
+    held: u64,
+) -> Result<(), FundRefusal>
 {
     // One slot for this run's descriptor, and those held for the chunk.
     if !ensure_slots(l, held.saturating_add(1))
     {
-        return false;
+        return Err(FundRefusal::Failed);
     }
-    let Ok(grant) =
-        select(l, ASPACE_TOPUP_PAGES, Fit::Contiguous).or_else(|_| select(l, 2, Fit::Contiguous))
+    let first = if admit(l, rec, u64::from(ASPACE_TOPUP_PAGES)).is_ok()
+    {
+        ASPACE_TOPUP_PAGES
+    }
     else
     {
-        return false;
+        match admit(l, rec, 2)
+        {
+            Ok(()) => 2,
+            Err(ChargeError::Limit) => return Err(FundRefusal::Limit),
+            Err(ChargeError::Reserve) => return Err(FundRefusal::Failed),
+        }
+    };
+    let Ok(grant) = select(l, first, Fit::Contiguous).or_else(|e| {
+        if first == 2
+        {
+            return Err(e);
+        }
+        select(l, 2, Fit::Contiguous)
+    })
+    else
+    {
+        return Err(FundRefusal::Failed);
     };
     let (outer, pages, phys) = grant.entries[0];
     let run = FreeRun {
@@ -1948,15 +2153,15 @@ fn fund_client_page_tables(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, hel
     if !l.push_frame(rec, frame)
     {
         insert_run(l, run);
-        return false;
+        return Err(FundRefusal::Failed);
     }
     if syscall::cap_create_aspace(outer, aspace_cap, u64::from(pages)).is_ok()
     {
-        return true;
+        return Ok(());
     }
     let _ = l.pop_frame(rec);
     insert_run(l, run);
-    false
+    Err(FundRefusal::Failed)
 }
 
 /// Give back a demand chunk whose fault memmgr is declining: unmap whatever
@@ -2183,6 +2388,9 @@ fn ingest_in_use(boot: &InitBootstrap)
 /// first IPC memmgr serves), and the memmgr-self and init-self records that
 /// hold the bootstrap arenas. procmgr and memmgr never die; init exits at reap
 /// but its arena stays parked, so none of these records is ever reclaimed.
+/// Each takes a top-level reserve budget node with no max: they are the core
+/// the system reserve is kept for (services/memmgr/docs/memory-pool.md
+/// § Distribution policy).
 fn insert_boot_records(procmgr_badge: u64) -> bool
 {
     let l = ledger_mut();
@@ -2190,7 +2398,7 @@ fn insert_boot_records(procmgr_badge: u64) -> bool
         .into_iter()
         .all(|badge| {
             ensure_index(l);
-            ensure_slots(l, 1) && l.insert_process(badge).is_some()
+            ensure_slots(l, 2) && l.insert_process(badge, NodeSpec::TOP_RESERVE).is_ok()
         })
 }
 
@@ -2277,6 +2485,10 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::DELEGATE_ASPACE =>
         {
             handle_delegate_aspace(req, kept, ipc_buf, boot.procmgr_badge);
+        }
+        memmgr_labels::QUERY_MEMORY_USAGE =>
+        {
+            handle_query_memory_usage(req, ipc_buf);
         }
         _ =>
         {

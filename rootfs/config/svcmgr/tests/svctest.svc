@@ -10,7 +10,7 @@
 # on-demand bind phase sends BIND_DRIVERS on, with a cap on /tests/drivers;
 # vfsd.mount is the MOUNT_AUTHORITY SEND on vfsd's service endpoint the
 # vfsd phases drive MOUNT's rejection paths with, and vfsd.deny its
-# no-authority twin. The vfsd seeds ride in a second bootstrap round, so
+# no-authority twin. Those two vfsd seeds ride in a second bootstrap round, so
 # every svctest boot exercises a seed list longer than one round; the
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
 # logd.query is the LOG_QUERY_AUTHORITY SEND on the master log endpoint the
@@ -24,6 +24,10 @@
 # /config/devmgr/tests/, which svcmgr does not scan, and are copied into
 # /config/devmgr/classes/ with this recipe; the fixtures' devices are
 # attached by `cargo xtask run --test-devices`.
+# vfsd.swap is the SWAP_AUTHORITY SEND on vfsd's service endpoint the
+# vfsd_swap_partition phase takes the swap partition through. svctest
+# holds it only while no swap service exists: the swap service's recipe
+# is to seed it, and two holders would revoke each other's partition cap.
 # svctest resolves the public pwrmgr.deny no-auth twin itself via
 # QUERY_ENDPOINT. debug_authority = yes delivers procmgr's
 # DEBUG_AUTHORITY SEND|GRANT in the slot after the seeds, and svctest,
@@ -51,5 +55,5 @@ restart   = never
 critical  = no
 namespace = universal
 cwd       = /data
-seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny
+seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount vfsd.deny logd.query devmgr.class.serial devmgr.class.input devmgr.class.test-dma devmgr.class.test-fault devmgr.class.serial-deny devmgr.class.input-deny devmgr.class.framebuffer-deny vfsd.swap
 debug_authority = yes

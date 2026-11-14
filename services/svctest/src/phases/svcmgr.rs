@@ -186,7 +186,7 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
-/// cap. svctest's own non-zero seeds show fourteen of the refused names are
+/// cap. svctest's own non-zero seeds show fifteen of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
 /// the same loop as `devmgr.registry` and `devmgr.bind`, and the other
 /// `devmgr.class.*` names by the same class loop as `devmgr.class.serial` and
@@ -211,6 +211,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         (caps.serial_deny_class, "devmgr.class.serial-deny"),
         (caps.input_deny_class, "devmgr.class.input-deny"),
         (caps.framebuffer_deny_class, "devmgr.class.framebuffer-deny"),
+        (caps.vfsd_swap, "vfsd.swap"),
     ]
     {
         assert_ne!(cap, 0, "svcmgr_seed_only_names_refused: no {shown} seed");
@@ -231,6 +232,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         ipc::published_names::DEVMGR_BIND,
         ipc::published_names::VFSD_MOUNT,
         ipc::published_names::VFSD_DENY,
+        ipc::published_names::VFSD_SWAP,
         ipc::published_names::LOGD_QUERY,
         b"devmgr.class.block",
         b"devmgr.class.serial",

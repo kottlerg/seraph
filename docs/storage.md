@@ -78,6 +78,12 @@ kernel (phase 7) mints Mmio caps from BootInfo.mmio_apertures and the root IRQ r
                       → init distributes copies via CONFIGURE_NAMESPACE
 ```
 
+The swap partition takes a shorter branch from the `REGISTER_PARTITION` step: vfsd keeps the
+partition cap virtio-blk returns, runs no fs driver on it, and hands a derivation of it to the
+holder of the `vfsd.swap` SEND on `GET_SWAP_PARTITION`, revoking the derivation it handed out
+before ([`services/vfsd/docs/vfs-ipc-interface.md`](../services/vfsd/docs/vfs-ipc-interface.md)
+§ Label 14).
+
 The kernel half (BootInfo → Mmio mint → devmgr → driver binding)
 is owned by [`device-management.md`](device-management.md). The
 phase-7 mint of the root IRQ range cap is owned by
@@ -111,6 +117,7 @@ or on-disk UUID. The model is:
   [`SERAPH_ROOT_X86_64`](../abi/boot-protocol/src/role_guids.rs),
   [`SERAPH_ROOT_RISCV64`](../abi/boot-protocol/src/role_guids.rs),
   and the arch-neutral [`SERAPH_DATA`](../abi/boot-protocol/src/role_guids.rs)
+  and [`SERAPH_SWAP`](../abi/boot-protocol/src/role_guids.rs)
   in [`abi/boot-protocol/src/role_guids.rs`](../abi/boot-protocol/src/role_guids.rs).
 - **The EFI System Partition is auto-mounted at `/esp`** immediately
   after the root self-mount, using the standard ESP type GUID
@@ -129,14 +136,21 @@ or on-disk UUID. The model is:
   therefore a disk-authoring choice, not a vfsd concern; the in-tree
   image (see [build-system.md](build-system.md)) carries the tree on the
   partition only.
+- **The swap partition is never mounted.** It carries no filesystem: vfsd
+  looks it up by the arch-neutral `SERAPH_SWAP` type GUID on the first
+  `GET_SWAP_PARTITION` request, not at startup, and hands the swap
+  service a raw partition cap on it. A disk with no swap partition boots
+  as one with: the request then replies `NO_MOUNT`. The in-tree image
+  carries one, the last partition of `disk.img`.
 - **Every disk is searched.** At startup vfsd sends `QUERY_DEVICE` on the block class SEND
   at instance ordinals 0, 1, …, passing a `WITHDRAWN` one (a disk whose
   driver devmgr withdrew when it died), until another reply is not
   `SUCCESS`, holds the whole-disk cap of every block driver devmgr
   serves, and parses each disk's GPT. A role lookup, at the root
-  self-mount, the auto-mounts, and a runtime `MOUNT`, considers the
-  partitions of every held disk; a disk whose GPT cannot be read or
-  validated contributes none. The partition's `REGISTER_PARTITION` goes
+  self-mount, the auto-mounts, a runtime `MOUNT`, and the first
+  `GET_SWAP_PARTITION`, considers the partitions of every held disk; a
+  disk whose GPT cannot be read or validated contributes none. The
+  partition's `REGISTER_PARTITION` goes
   to the block driver of the disk that holds it.
 - **DPS-style priority tie-break.** Where multiple partitions match
   a role GUID, on one disk or across disks, GPT attribute bits 48–63 are
@@ -147,7 +161,8 @@ or on-disk UUID. The model is:
   ([device-management.md](device-management.md#relationship-to-other-services)),
   so disk order never breaks a tie. For the root role an ambiguity is a
   fatal boot error that must be repaired; the `/esp` and `/data`
-  auto-mounts skip the mount.
+  auto-mounts skip the mount, and `GET_SWAP_PARTITION` replies
+  `NO_MOUNT`.
 - **Nothing else binds.** There is no `mounts.conf`, no `/etc/fstab`,
   no kernel command line carrying mount config, no on-disk
   filesystem label or UUID consulted by vfsd. The GUID is the

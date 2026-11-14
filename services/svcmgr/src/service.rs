@@ -193,6 +193,9 @@ pub struct SvcmgrCaps
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, published
     /// seed-only as `vfsd.deny`. Zero if absent.
     pub vfsd_deny: u64,
+    /// `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, published
+    /// seed-only as `vfsd.swap`. Zero if absent.
+    pub vfsd_swap: u64,
     /// Reserved master-log endpoint source (`RIGHTS_ALL`). svcmgr mints
     /// real-logd's master-log RECV from it on every (re)launch, and the
     /// one-shot `HANDOVER_PULL` SEND on the first launch, and publishes the
@@ -251,6 +254,7 @@ pub fn bootstrap_caps(
                             devmgr_registry: c.devmgr_registry,
                             vfsd_mount: c.vfsd_mount,
                             vfsd_deny: c.vfsd_deny,
+                            vfsd_swap: c.vfsd_swap,
                             master_log_source: 0,
                             procmgr_death_auth_source: 0,
                         });

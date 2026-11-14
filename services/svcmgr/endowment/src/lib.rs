@@ -57,11 +57,14 @@ pub mod caps_slot
     /// The `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint
     /// (`vfsd.deny`).
     pub const VFSD_DENY: usize = 5;
+    /// The `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service
+    /// endpoint (`vfsd.swap`).
+    pub const VFSD_SWAP: usize = 6;
 }
 
 /// Number of slots in the `CAPS` slot list: one per role in [`caps_slot`],
 /// whose roles are fixed, so the list cannot overflow.
-pub const CAPS_SLOTS: usize = 6;
+pub const CAPS_SLOTS: usize = 7;
 
 /// Number of `CAPS` rounds the slot list takes.
 pub const CAPS_ROUNDS: usize = slot_round_count(CAPS_SLOTS);
@@ -97,6 +100,8 @@ pub struct CapsRound
     pub vfsd_mount: u64,
     /// `DENY_BADGE`-badged SEND on vfsd's service endpoint, or `0`.
     pub vfsd_deny: u64,
+    /// `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, or `0`.
+    pub vfsd_swap: u64,
 }
 
 impl CapsRound
@@ -111,6 +116,7 @@ impl CapsRound
         slots[caps_slot::DEVMGR_REGISTRY] = self.devmgr_registry;
         slots[caps_slot::VFSD_MOUNT] = self.vfsd_mount;
         slots[caps_slot::VFSD_DENY] = self.vfsd_deny;
+        slots[caps_slot::VFSD_SWAP] = self.vfsd_swap;
         slots
     }
 
@@ -123,6 +129,7 @@ impl CapsRound
             devmgr_registry: slots[caps_slot::DEVMGR_REGISTRY],
             vfsd_mount: slots[caps_slot::VFSD_MOUNT],
             vfsd_deny: slots[caps_slot::VFSD_DENY],
+            vfsd_swap: slots[caps_slot::VFSD_SWAP],
         }
     }
 }
@@ -439,6 +446,7 @@ mod tests
             devmgr_registry,
             vfsd_mount: 0,
             vfsd_deny: 0,
+            vfsd_swap: 0,
         }
     }
 
@@ -458,17 +466,18 @@ mod tests
         last
     }
 
-    // The six slots take two rounds; each optional source, in either
+    // The seven slots take two rounds; each optional source, in either
     // window, round-trips present or absent.
     #[test]
     fn caps_round_trips_with_every_source_present_or_absent()
     {
-        for mask in 0u32..16
+        for mask in 0u32..32
         {
             let pick = |bit: u32, cap: u64| if mask & bit != 0 { cap } else { 0 };
             let sent = CapsRound {
                 vfsd_mount: pick(4, 0x23),
                 vfsd_deny: pick(8, 0x24),
+                vfsd_swap: pick(16, 0x25),
                 ..caps_round(pick(1, 0x21), pick(2, 0x22))
             };
             assert_eq!(decode_all(&encode_caps(&sent)), Ok(Some(sent)));

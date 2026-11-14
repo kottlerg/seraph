@@ -543,6 +543,12 @@ carry the `WRITE` namespace right.
 count; the FAT driver always reports the whole payload and replies an error (`NO_SPACE`)
 instead of a short count.
 
+A write whose offset lies past the file's end extends the file, and the bytes between the old
+end and the offset read as zeros, through [`FS_READ`](#label-2-fs_read) and
+[`FS_READ_MEMORY`](#label-7-fs_read_memory) alike. A driver MUST NOT return a byte the file
+never held, whatever its on-disk format leaves in the storage the write takes: a freed file's
+data, or a block past the old end.
+
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE` (no free cluster, or the write would end
 past `u32::MAX` bytes, the largest FAT file size; the driver refuses
@@ -576,6 +582,9 @@ every outcome (mirror of the read-memory ownership discipline). The
 driver MUST NOT keep a mapping of the source page, or any capability to
 it, past its reply: once the reply arrives the caller may return the
 page to memmgr's pool, which another process can then be granted.
+
+A write whose offset lies past the file's end leaves the gap reading as zeros, as for
+[`FS_WRITE`](#label-4-fs_write).
 
 **Errors**: `INVALID_BADGE`, `IS_A_DIRECTORY`, `IO_ERROR`,
 `PERMISSION_DENIED`, `NO_SPACE` (as for [`FS_WRITE`](#label-4-fs_write)),

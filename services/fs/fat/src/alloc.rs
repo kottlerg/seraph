@@ -213,8 +213,9 @@ pub fn allocate_cluster(
 
 /// The free cluster the next allocation takes, found without writing
 /// anything: its FAT entry stays free until [`claim_cluster`] marks it.
-/// A caller may write the cluster's sectors in between (a directory
-/// zeroes its new cluster before linking it), since fatfs's single
+/// A caller may write the cluster's sectors in between (a growing
+/// directory zeroes its new cluster before linking it, and `FS_MKDIR`
+/// writes a new directory's cluster before claiming it), since fatfs's single
 /// service thread holds `state` throughout, so no other allocation can
 /// take the cluster first.
 ///

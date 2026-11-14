@@ -1656,7 +1656,8 @@ unsafe extern "custom" fn ipi_nmi_backtrace_stub()
 /// and returns (the stub's iretq resumes the interrupted code). With no request
 /// pending (a real hardware NMI) it tail-calls
 /// `common_exception_handler` which never returns — the iretq tail of
-/// the stub is dead code in that case.
+/// the stub is dead code in that case. After a watchdog frame's last line it
+/// counts the backtrace in `interrupts::NMI_BACKTRACES_PRINTED`.
 ///
 /// NMI is not APIC-EOI'd, so no `acknowledge()` call.
 #[cfg(not(test))]
@@ -1722,6 +1723,9 @@ extern "C" fn ipi_nmi_backtrace_handler(tf: *const TrapFrame, vector: u64, error
         f.r14,
         f.r15
     );
+    // The frame is printed: release a watchdog waiting on it
+    // (`interrupts::dump_remote_frame`).
+    super::interrupts::NMI_BACKTRACES_PRINTED.fetch_add(1, core::sync::atomic::Ordering::Release);
 }
 
 /// Wakeup IPI handler stub (vector 251).

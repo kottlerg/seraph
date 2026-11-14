@@ -2081,10 +2081,11 @@ pub fn bind_notification_fires_on_exit(ctx: &TestContext) -> TestResult
 
 /// Death-observer bindings are funded by the observing queue's node pool:
 /// one thread takes more bindings than the former fixed per-thread ceiling of
-/// four, every one fires, a bind beyond a queue's nodes returns
+/// four, every one fires exactly once, a bind beyond a queue's nodes returns
 /// `OutOfMemory`, and destroying the bound thread returns its nodes for a new
-/// binding. Fails if the kernel still caps observers per thread, drops a post
-/// from a chained node, over-commits a pool, or leaks a node at teardown.
+/// binding. Fails if the kernel still caps observers per thread, drops or
+/// repeats a post from a chained node, over-commits a pool, or leaks a node at
+/// teardown.
 pub fn bind_notification_nodes_come_from_the_queue(ctx: &TestContext) -> TestResult
 {
     const NODES: u32 = 6;
@@ -2114,18 +2115,23 @@ fn bind_nodes_on(ctx: &TestContext, eq: u64, nodes: u32) -> TestResult
     // SAFETY: `BIND_NOTIF_STACK` is a static stack, reached only through `addr_of!`.
     let stack_top = unsafe { crate::ChildStack::top(core::ptr::addr_of!(BIND_NOTIF_STACK)) };
     // SAFETY: the stack is `BIND_NOTIF_STACK`, which this test and
-    // `bind_notification_fires_on_exit` use one at a time, each waiting for
-    // its child to exit before returning; no other live thread runs on it.
+    // `bind_notification_fires_on_exit` use one at a time, each receiving its
+    // child's death entry before returning; the kernel posts it after the
+    // child's `Exited` commit, past which the child never runs on the stack
+    // again, so no other live thread runs on it.
     unsafe { crate::spawn::configure_and_start(&child, bind_notif_exit_entry, stack_top, 0) }
         .map_err(|_| "thread::bind_nodes: configure_and_start failed")?;
-    crate::spawn::wait_until_exited(child.th, crate::scaled_polls(2000))?;
 
-    // Every chained node posted once, its own correlator, a clean exit.
+    // Every chained node posted once, its own correlator, a clean exit. The
+    // exit path walks the observer chain after it commits `Exited`, so each
+    // entry is awaited, bounded, rather than read once the thread is `Exited`.
+    let bound_ms = crate::scaled_bound(2000);
     let mut seen = 0u64;
     for _ in 0..nodes
     {
-        let death = syscall::event_try_recv_death(eq)
+        let entry = syscall::event_recv_entry(eq, bound_ms)
             .map_err(|_| "thread::bind_nodes: a chained observer posted nothing")?;
+        let death = syscall::DeathEvent::from_entry(entry);
         let i = death.correlator ^ 0x0B5E_0000_0000_0000;
         if i >= u64::from(nodes) || death.exit_reason != 0 || seen & (1 << i) != 0
         {
@@ -2135,8 +2141,14 @@ fn bind_nodes_on(ctx: &TestContext, eq: u64, nodes: u32) -> TestResult
     }
 
     // Destroying the thread returns its nodes: a fresh thread binds again.
-    child.delete_thread().ok();
+    // The teardown waits until the thread runs on no CPU, so its walk has
+    // ended: an entry still queued is a post beyond one per node.
+    let deleted = child.delete_thread();
     child.delete_cspace().ok();
+    if deleted.is_ok() && syscall::event_try_recv(eq) != Err(SyscallError::WouldBlock as i64)
+    {
+        return Err("thread::bind_nodes: a chained observer posted more than once");
+    }
     let mut next = crate::spawn::new_child(ctx)
         .map_err(|_| "thread::bind_nodes: spawn::new_child (second) failed")?;
     let rebound = thread_bind_notification(next.th, eq, 1);

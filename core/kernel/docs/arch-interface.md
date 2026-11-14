@@ -599,6 +599,12 @@ pub unsafe fn send_wakeup_ipi(target_hw_id: u32);
 /// a logged warning on RISC-V → `crate::fatal`) per
 /// the timing ladder described by `ctx`. Used by the shootdown initiator's wait.
 pub unsafe fn wait_for_ack(cond: impl FnMut() -> bool, ctx: &IpiWaitCtx<'_>);
+
+/// Have logical CPU `cpu`, which the softlockup watchdog's heartbeat checks found silent,
+/// print its own interrupted frame, and wait a bounded time for it; returns whether a frame
+/// was printed. x86-64 sends it an NMI backtrace request; RISC-V returns false (no S-mode
+/// NMI).
+pub fn dump_remote_frame(cpu: usize) -> bool;
 ```
 
 The `wait_for_ack` phases and their windows are specified in
@@ -853,7 +859,9 @@ The bound primitives the speculation-safe paths are built on (the rule is
 [docs/capability-model.md](../../../docs/capability-model.md) § Capability Spaces; its use is
 [capability-internals.md](capability-internals.md) § Speculative-Execution Hardening).
 Architecture-neutral code calls them through `arch::nospec`, which adds `mask_index`,
-`mask_index_u64`, `mask_span_u64`, `mask_if`, and `select_ptr` over them.
+`mask_index_u64`, `mask_span_u64`, `mask_if`, and `select_ptr` over them. The module also holds
+the boot-time enumeration of the CPU's transient-execution vulnerabilities
+([transient-execution.md](transient-execution.md)).
 
 ```rust
 /// All-ones when `index < bound`, zero otherwise, computed without a branch, so
@@ -868,6 +876,12 @@ pub fn index_mask(index: usize, bound: usize) -> usize;
 /// cannot relate to `value`, taken where it is written, so a later branch on
 /// `value` does not let it fold a comparison of the copy.
 pub fn hide(value: usize) -> usize;
+
+/// Derive the boot CPU's transient-execution vulnerability table and log it.
+/// Called once on the BSP in Phase 1, after the baseline check. x86-64 reads
+/// CPUID and `IA32_ARCH_CAPABILITIES` (transient-execution.md); RISC-V does
+/// nothing, since the RVA23 floor defines no such enumeration.
+pub fn enumerate_vulnerabilities();
 ```
 
 ---

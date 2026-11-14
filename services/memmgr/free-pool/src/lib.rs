@@ -5,8 +5,8 @@
 
 //! Pure bookkeeping logic for memmgr: the metadata arena, the free pool, the
 //! deferred list of reclaimed frames not yet pooled, the process index, the
-//! chunk table of each demand region, and the demand-region interval
-//! arithmetic and protection check.
+//! budget nodes processes are charged to, the chunk table of each demand
+//! region, and the demand-region interval arithmetic and protection check.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
@@ -21,6 +21,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod arena;
+pub mod budget;
 pub mod chunk;
 pub mod deferred;
 pub mod index;
@@ -28,8 +29,11 @@ pub mod ledger;
 pub mod pool;
 
 pub use arena::{
-    Arena, ArenaLayout, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord,
-    RegionNode, SLOTS_PER_PAGE, SlotStore,
+    Arena, ArenaLayout, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx,
+    ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
+};
+pub use budget::{
+    BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
 };
 pub use chunk::{ChunkEntry, ChunkError, ChunkState};
 pub use deferred::{DeferredList, RecheckBudget};

@@ -176,8 +176,8 @@ const fn nz(bit: u32) -> NonZeroU32
 }
 
 /// Per-badged-label rights requirements. Unbadged service-level
-/// labels (e.g. `FS_MOUNT`) are dispatched separately and do not
-/// appear here.
+/// labels (`FS_MOUNT`, `FS_UNMOUNT`) are dispatched separately and do
+/// not appear here.
 const RIGHTS_TABLE: &[(u64, RightsRequirement)] = &[
     (
         ipc::ns_labels::NS_LOOKUP,

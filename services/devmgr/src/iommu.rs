@@ -1320,9 +1320,6 @@ pub fn bring_up(
         registry,
         ipc_buf,
     );
-    // A started driver holds copies of the register caps derived from
-    // devmgr's; devmgr keeps none.
-    handed.release();
     match settled
     {
         Settled::Ready =>
@@ -1553,10 +1550,12 @@ enum Settled
 /// the guard `module.1` holds, with `grants`, delivering it the `handed`
 /// units with the client's endpoint as its service endpoint, in a settle
 /// batch of its own, its death watched on `death_eq` as well as devmgr's
-/// death queue, and settle it. The driver is created held, since its units
-/// walk its table pages by DMA; devmgr, holding no register cap, cannot stop
-/// them, so it deletes the release token at the spawn and procmgr keeps the
-/// driver's pages held for the rest of the boot once it dies.
+/// death queue, and settle it. devmgr deletes the `handed` register caps
+/// once the spawn returns, whatever its outcome. The driver is created held,
+/// since its units walk its table pages by DMA; devmgr, holding no register
+/// cap, cannot stop them, so it deletes the release token at the spawn and
+/// procmgr keeps the driver's pages held for the rest of the boot once it
+/// dies.
 #[expect(
     clippy::too_many_arguments,
     reason = "the spawn and its settle consume the declaration, the client, the death watch, the \
@@ -1583,6 +1582,7 @@ fn spawn_and_settle(
     else
     {
         std::os::seraph::log!(warn: "IOMMU driver: no settle batch or badge; not spawned");
+        handed.release();
         return Settled::NotStarted;
     };
     // `spawn_bound_driver` owns the module cap's lifecycle from here
@@ -1608,7 +1608,11 @@ fn spawn_and_settle(
         // declaration of the boot tier is given it.
         priority: spawn::tier_priority(grants.tier),
     };
-    let process_handle = match spawn::spawn_bound_driver(&config, ipc_buf)
+    let spawn = spawn::spawn_bound_driver(&config, ipc_buf);
+    // A started driver holds copies derived from devmgr's register caps;
+    // devmgr keeps none, whatever the spawn's outcome.
+    handed.release();
+    let process_handle = match spawn
     {
         spawn::DriverSpawn::Bootstrapped(child) =>
         {

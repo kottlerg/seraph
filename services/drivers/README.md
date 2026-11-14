@@ -36,7 +36,7 @@ services/drivers/
 │   │   ├── README.md
 │   │   └── src/
 │   │       ├── lib.rs              # The Backend trait each family implements
-│   │       ├── bootstrap.rs        # Unit rounds and scopes (host-tested)
+│   │       ├── delivery.rs         # What the driver takes from its resource list (host-tested)
 │   │       ├── faults.rs           # Polled fault queue (host-tested)
 │   │       ├── service.rs          # iommu_labels service, domain records (host-tested)
 │   │       └── table.rs            # The TableStore the family tables are built in

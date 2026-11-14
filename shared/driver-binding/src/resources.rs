@@ -788,8 +788,9 @@ impl PlatformDelivery
 }
 
 /// Request rounds from `creator` until the end round, decoding each into a
-/// [`ResourceList`]. The rounds are bounded: each one either adds a resource
-/// or ends the list, and the list holds at most [`MAX_RESOURCES`].
+/// [`ResourceList`]. The rounds are bounded: each one adds a resource, adds
+/// an IOMMU unit, or ends the list, and the list holds at most
+/// [`MAX_RESOURCES`] resources and [`MAX_IOMMU_UNITS`] units.
 ///
 /// # Safety
 /// `ipc_buf` must point to the caller thread's registered IPC buffer page.

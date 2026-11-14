@@ -2,10 +2,10 @@
 
 The RISC-V IOMMU driver (`iommu-riscv`): the separate driver process that programs RISC-V IOMMUs
 (RISC-V IOMMU Architecture Specification v1.0) for devmgr. devmgr discovers each IOMMU that is a PCI
-function through the ACPI RIMT, turns on the function's memory decode and bus mastering, moves the
-first page of its BAR 0, which holds every register, to this driver, and drives it over
-`ipc::iommu_labels` from behind its DMA endpoint, so device drivers keep the `devmgr_dma_labels`
-contract whichever IOMMU sits behind it
+function through the ACPI RIMT, turns on the function's memory decode and bus mastering, delivers
+the first page of its BAR 0, which holds every register, to this driver in its resource list,
+keeping no copy, and drives it over `ipc::iommu_labels` from behind its DMA endpoint, so device
+drivers keep the `devmgr_dma_labels` contract whichever IOMMU sits behind it
 ([docs/device-management.md](../../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming). It is riscv64 only, and ships as a boot module, since it must
 confine the root disk before the disk's driver maps a ring; it carries a declaration in the ELF note

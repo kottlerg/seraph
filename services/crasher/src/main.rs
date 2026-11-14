@@ -147,12 +147,8 @@ fn bootstrap_caps(creator_ep: u64, ipc_buffer: *mut u8) -> (u64, u64, usize)
 /// Liveness probe: call `QUERY_ENDPOINT` on the svcmgr cap for a name that
 /// does not exist. A successful round-trip (any reply, including
 /// `UNKNOWN_NAME`) proves the cap is live. A dead or stale seed makes
-/// `ipc_call` return `Err`, which is logged without the `FATAL:` prefix, so
-/// the default `--fail` regex of `cargo xtask run-parallel`
-/// (xtask/README.md § `cargo xtask run-parallel`) does not catch a seed that
-/// was not re-injected live after restart. TODO(#438): log the failed
-/// round-trip as `FATAL:`; deferred by maintainer decision to the work #438
-/// tracks.
+/// `ipc_call` return `Err`, which is a surface that failed to round-trip and
+/// is logged with `FATAL:` (services/crasher/README.md).
 fn probe_svcmgr(svcmgr_cap: u64, ipc_buffer: *mut u8)
 {
     #[expect(
@@ -169,6 +165,6 @@ fn probe_svcmgr(svcmgr_cap: u64, ipc_buffer: *mut u8)
     match unsafe { ipc::ipc_call(svcmgr_cap, &msg, ipc_buf) }
     {
         Ok(reply) => std::os::seraph::log!("svcmgr probe reply={}", reply.label),
-        Err(_) => std::os::seraph::log!("svcmgr probe ipc_call failed"),
+        Err(_) => std::os::seraph::log!("FATAL: svcmgr probe ipc_call failed"),
     }
 }

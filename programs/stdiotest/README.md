@@ -50,8 +50,12 @@ PASS
 
 ## Tester
 
-`stdiotest-tester` spawns `/programs/stdiotest` with piped stdin and stdout, writes the probe
-line `hello-stdio`, closes stdin, and reads stdout to EOF. Its verdict follows the
+`stdiotest-tester` first writes four 1024-byte lines (4096 bytes, twice the 2048-byte pipe ring)
+to its own stderr while its stdout is open, which checks that `usertest` drains a tester's two
+streams at once: an orchestrator that read stdout to EOF first would leave the tester blocked on
+the full stderr ring, and the run would hang. It then spawns `/programs/stdiotest` with piped
+stdin and stdout, writes the probe line `hello-stdio`, closes stdin, and reads stdout to EOF. Its
+verdict follows the
 [tester contract](../../docs/testing.md#contract):
 
 | Condition | Stdout | Exit code |

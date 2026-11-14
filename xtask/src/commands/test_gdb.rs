@@ -35,9 +35,10 @@ use crate::arch::Arch;
 use crate::cli::TestGdbArgs;
 use crate::context::Context;
 use crate::debug_stub;
+use crate::disk::DiskLayout;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, X86Paging, build_qemu_argv,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, SecondDisk, X86Paging, build_qemu_argv,
     prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
@@ -111,7 +112,10 @@ pub fn run(ctx: &Context, args: &TestGdbArgs) -> Result<()>
     std::fs::copy(&target_source, &target_staged)
         .with_context(|| format!("staging {}", target_source.display()))?;
     let staged = debug_stub::stage(ctx, args.arch, TARGET_NAME);
-    let booted = staged.as_ref().ok().map(|_| boot(ctx, args, &gdb));
+    let booted = staged
+        .as_ref()
+        .ok()
+        .map(|&layout| boot(ctx, args, &gdb, layout));
     // Restore first, every step of it whatever another's outcome, and
     // surface its first failure ahead of the staging's and the boot's.
     let removed = std::fs::remove_file(&target_staged)
@@ -147,9 +151,9 @@ enum Serial
     Detached(String),
 }
 
-/// Boot with the debug port, wait for the stub, run GDB, wait for the stub's
-/// detach line, kill QEMU.
-fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<Session>
+/// Boot the images of `layout` with the debug port, wait for the stub, run
+/// GDB, wait for the stub's detach line, kill QEMU.
+fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Result<Session>
 {
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.
@@ -164,11 +168,15 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path) -> Result<Session>
         }
     };
     let disk_path = ctx.disk_image();
+    let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
         arch: args.arch,
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-        second_disk: None,
+        second_disk: data_image
+            .as_deref()
+            .map(SecondDisk::of_image)
+            .transpose()?,
         firmware_code_path: &firmware_code,
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,

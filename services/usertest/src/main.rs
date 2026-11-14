@@ -98,8 +98,9 @@ fn discover_testers() -> Vec<PathBuf>
     out
 }
 
-/// Spawn one tester, forward its stdout/stderr to the boot log under a
-/// per-tester prefix, and turn the exit status into a pass/fail.
+/// Spawn one tester, forward its stdout and stderr to the boot log under a
+/// per-tester prefix, both at once, and turn the exit status into a
+/// pass/fail.
 fn run_one(path: &Path) -> Result<(), String>
 {
     let path_str = path.to_str().ok_or_else(|| "non-utf8 path".to_string())?;
@@ -115,19 +116,34 @@ fn run_one(path: &Path) -> Result<(), String>
         .spawn()
         .map_err(|e| format!("spawn: {e}"))?;
 
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    if let Some(s) = stdout
+    // The two streams are drained at once, stderr on its own thread: a
+    // tester blocked on a full pipe ring of one stream would otherwise never
+    // close the other, and the run would hang.
+    let err_reader = child.stderr.take().map(|s| {
+        let tester = name.clone();
+        std::thread::Builder::new()
+            .name(format!("{name}-stderr"))
+            .spawn(move || forward_lines(&tester, "err", s))
+    });
+    if let Some(s) = child.stdout.take()
     {
         forward_lines(&name, "out", s);
     }
-    if let Some(s) = stderr
+    // Joined before the wait, and a reader failure reported only after it, so
+    // no tester is left unreaped. A reader that failed to spawn dropped the
+    // stream's read end, so the tester's stderr writes fail instead of
+    // blocking.
+    let reader = match err_reader
     {
-        forward_lines(&name, "err", s);
-    }
+        Some(Ok(handle)) => handle
+            .join()
+            .map_err(|_| "stderr reader panicked".to_string()),
+        Some(Err(e)) => Err(format!("stderr reader spawn: {e}")),
+        None => Ok(()),
+    };
 
     let status = child.wait().map_err(|e| format!("wait: {e}"))?;
+    reader?;
     if status.success()
     {
         Ok(())

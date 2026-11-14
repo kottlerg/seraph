@@ -33,7 +33,7 @@ services/svctest/
         ├── startup.rs         # argv, env, stack envelope, TLS at entry; unset cwd path
         ├── memmgr.rs          # Heap; donation; stray caps; retyped grant; CSpace funding;
         │                      # object-slab release; deferred reclaim; identity;
-        │                      # physical base withheld
+        │                      # physical base withheld; frames zeroed at hand-out
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS, stack note
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
@@ -53,7 +53,8 @@ services/svctest/
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
-        │                      #   refused access; page-table drain; teardown
+        │                      #   refused access; page-table drain; teardown; fault cost;
+        │                      #   faults on a fragmented pool
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -224,6 +225,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `open-undeliverable-child`  | `fs_opens`     | `fs_reclaims_dead_opens` (failed reply)     |
 | `reclaim-child`             | `memmgr`       | `frame_reclaim_live_object` (held endpoint) |
+| `scrub-child`               | `memmgr`       | `memmgr_frame_scrub` (frames of a death)    |
 | `exit-code-zero`            | `exit_code`    | `exit_code`                                 |
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |

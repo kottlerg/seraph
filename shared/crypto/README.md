@@ -9,8 +9,8 @@ services. Does no I/O and holds no keys. Today its only dependent is ktest, whic
 runs the known-answer tests on target.
 
 The per-binary signing chain of trust (#124), which will own key management, the
-`.seraph.sig` ELF section, and xtask signing, and will consume `ed25519_verify`, is
-design intent; not yet implemented.
+signature trailer, and xtask signing, and will consume `ed25519_verify`, is design
+intent; not yet implemented.
 
 ---
 
@@ -52,6 +52,26 @@ vectors, plus tamper negatives (flipped signature/message, wrong key,
 non-canonical S, invalid public key, and the two non-canonical public-key
 encodings).
 
+The host tests also run, under `cargo xtask test` on the host and under riscv64
+emulation, the infrastructure of [`testkit/`](testkit/README.md), the crate's
+only dev-dependency:
+
+- **Wycheproof.** Every case of the vendored `ed25519_test.json`: valid cases
+  verify, invalid ones are refused (a signature of another length than 64 bytes
+  is refused by the API's `&[u8; 64]`), and an acceptable one (a small- or
+  mixed-order public key) verifies exactly when the cofactorless equation holds,
+  which the reference judges.
+- **Differential.** `ed25519_verify` against the `ed25519-dalek` reference, on
+  generated signatures with one-bit corruptions and on an edge-case corpus
+  (malleability, the S range check, degenerate and non-canonical public keys,
+  small-order and non-canonical R), comparing which check fails, not only
+  acceptance; `sha512` and `Sha512` against `RustCrypto` `sha2` over every
+  length to 300 bytes and longer messages, fed whole and in pieces.
+
+Any disagreement fails the test. The loader, the harness and the references are
+reusable by any crate that tests a primitive: it takes `crypto-testkit` as a
+dev-dependency (see its README for adding a Wycheproof file or schema).
+
 ---
 
 ## Source Layout
@@ -60,6 +80,8 @@ encodings).
 shared/crypto/
 ├── Cargo.toml                  # Workspace member; no_std library; no dependencies
 ├── README.md
+├── testkit/                    # Test-only: Wycheproof loader, differential
+│                               # harness, references (crypto-testkit)
 └── src/
     ├── lib.rs                  # Crate doc, public re-exports
     ├── sha512.rs               # SHA-512 (one-shot + incremental) + KATs
@@ -76,6 +98,7 @@ shared/crypto/
 | Document | Content |
 |---|---|
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [testkit/README.md](testkit/README.md) | The test infrastructure the host tests run |
 
 ---
 

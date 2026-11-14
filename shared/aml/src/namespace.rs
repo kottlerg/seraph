@@ -580,7 +580,7 @@ impl Namespace
     }
 
     /// Unlink `id` from its parent and free it and its subtree.
-    fn remove(&mut self, id: NodeId) -> Result<(), FaultKind>
+    pub(crate) fn remove(&mut self, id: NodeId) -> Result<(), FaultKind>
     {
         if id == NodeId::ROOT
         {
@@ -801,6 +801,47 @@ impl Namespace
         owner: Owner,
     ) -> Result<NodeId, FaultKind>
     {
+        let (parent, last) = self.parent_of(scope, name)?;
+        if let Some(existing) = self.child(parent, last)
+        {
+            let placeholder = matches!(self.object(existing), Some(Object::External { .. }));
+            if !placeholder || matches!(object, Object::External { .. })
+            {
+                return Err(FaultKind::Exists);
+            }
+            if let Some(n) = self.node_mut(existing)
+            {
+                n.object = object;
+                n.owner = owner;
+            }
+            return Ok(existing);
+        }
+        self.add_child(parent, last, object, owner)
+    }
+
+    /// Create the node `name` declares from `scope` as a placeholder that
+    /// holds [`Data::Uninitialized`], for a table load to define later;
+    /// [`FaultKind::Exists`] when the name exists in any form, and the
+    /// other faults of [`Namespace::create`].
+    pub(crate) fn declare(
+        &mut self,
+        scope: NodeId,
+        name: &Name,
+        owner: Owner,
+    ) -> Result<NodeId, FaultKind>
+    {
+        let (parent, last) = self.parent_of(scope, name)?;
+        if self.child(parent, last).is_some()
+        {
+            return Err(FaultKind::Exists);
+        }
+        self.add_child(parent, last, Object::Data(Data::Uninitialized), owner)
+    }
+
+    /// The node under which `name`, declared from `scope`, is placed, and
+    /// its last segment. Every segment but the last must resolve.
+    fn parent_of(&self, scope: NodeId, name: &Name) -> Result<(NodeId, Seg), FaultKind>
+    {
         let last = *name.segs.last().ok_or(FaultKind::BadName)?;
         let start = if name.root
         {
@@ -819,21 +860,7 @@ impl Namespace
             .take(parents)
             .try_fold(start, |node, seg| self.child(node, seg))
             .ok_or(FaultKind::NotFound)?;
-        if let Some(existing) = self.child(parent, last)
-        {
-            let placeholder = matches!(self.object(existing), Some(Object::External { .. }));
-            if !placeholder || matches!(object, Object::External { .. })
-            {
-                return Err(FaultKind::Exists);
-            }
-            if let Some(n) = self.node_mut(existing)
-            {
-                n.object = object;
-                n.owner = owner;
-            }
-            return Ok(existing);
-        }
-        self.add_child(parent, last, object, owner)
+        Ok((parent, last))
     }
 
     // ── Code ──────────────────────────────────────────────────────────

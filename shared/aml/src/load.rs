@@ -10,16 +10,19 @@
 //! `ThermalZone` itself, and records a `Method` with its body's span, which
 //! [`Namespace::method_code`] parses on first use.
 //!
-//! The first walk declares: it creates the `Device`, `Processor`,
-//! `PowerResource` and `ThermalZone` objects, the methods and the
-//! `External`s, and parses every other term only to find where it ends. The
-//! second walk defines: it parses every other term again, now that every
-//! method of the table has its argument count in the namespace, creates the
-//! objects that `Name` (its data folded to a constant), `Alias`, `Mutex`,
-//! `Event`, `OperationRegion`, `DataRegion` and the field definitions
-//! declare, and keeps any other term as module-level code
-//! ([`Namespace::module_terms`]) for an evaluator to run. So a call to a
-//! method defined later in the same table parses as a call wherever it is.
+//! The first walk declares every name the table defines at load: it creates
+//! the `Device`, `Processor`, `PowerResource` and `ThermalZone` objects, the
+//! methods and the `External`s, and a placeholder node for each name that
+//! `Name`, `Alias`, `Mutex`, `Event`, `OperationRegion`, `DataRegion` and the
+//! field definitions declare. The second walk defines: it parses every other
+//! term again, now that every name of the table is in the namespace and
+//! every method has its argument count, gives each placeholder its object
+//! (a `Name`'s data folded to a constant), and keeps any other term as
+//! module-level code ([`Namespace::module_terms`]) for an evaluator to run.
+//! So a reference to a name defined later in the same table resolves as the
+//! table defines it: a call to a method parses as a call, and a data object
+//! of the scope hides a method of an enclosing scope. A placeholder the
+//! second walk does not define is removed.
 //!
 //! A fault ends only the term list it is found in: a term whose end its
 //! `PkgLength` gives is skipped and the list continues after it, and any
@@ -31,7 +34,7 @@ use alloc::vec::Vec;
 
 use crate::encoding::{
     self, EXT_BANK_FIELD, EXT_DEVICE, EXT_FIELD, EXT_INDEX_FIELD, EXT_POWER_RES, EXT_PROCESSOR,
-    EXT_THERMAL_ZONE, OP_ELSE, OP_EXT_PREFIX, OP_IF, OP_METHOD, OP_SCOPE, OP_WHILE,
+    EXT_THERMAL_ZONE, OP_ELSE, OP_EXT_PREFIX, OP_IF, OP_METHOD, OP_SCOPE, OP_WHILE, Seg,
 };
 use crate::namespace::{
     AccessAs, Body, Data, FieldKind, FieldUnit, Method, Namespace, NodeId, Object, Owner, Region,
@@ -116,6 +119,7 @@ impl Namespace
         loader.list(SDT_HEADER_LEN, len, NodeId::ROOT, 0);
         loader.declaring = false;
         loader.list(SDT_HEADER_LEN, len, NodeId::ROOT, 0);
+        loader.sweep();
         let report = loader.report;
         if let Some(t) = self.tables.last_mut()
         {
@@ -169,9 +173,10 @@ struct Loader<'a, 'b>
     mask: u64,
     /// Whether this is the first walk, which declares.
     declaring: bool,
-    /// The table offset of each object body and method the first walk
-    /// created, with its node, in offset order.
-    declared: Vec<(usize, NodeId)>,
+    /// Each node the first walk created: the table offset of the term that
+    /// declares it, the index of the name among the term's names, and the
+    /// node, in that order.
+    declared: Vec<(usize, usize, NodeId)>,
     report: LoadReport,
 }
 
@@ -197,16 +202,102 @@ impl Loader<'_, '_>
         self.report.first_fault.get_or_insert(fault);
     }
 
-    /// The node the first walk created for the object body or method at
+    /// The node the first walk created for the name `idx` of the term at
     /// `pos`, in the second walk.
-    fn declared_at(&self, pos: usize) -> Option<NodeId>
+    fn declared_at(&self, pos: usize, idx: usize) -> Option<NodeId>
     {
         if self.declaring
         {
             return None;
         }
-        let i = self.declared.binary_search_by_key(&pos, |d| d.0).ok()?;
-        self.declared.get(i).map(|d| d.1)
+        let i = self
+            .declared
+            .binary_search_by_key(&(pos, idx), |d| (d.0, d.1))
+            .ok()?;
+        self.declared.get(i).map(|d| d.2)
+    }
+
+    /// Keep `node` as the first walk's node for the name `idx` of the term
+    /// at `pos`. A node the list cannot keep is removed: the second walk
+    /// then defines it as a name the first walk did not declare.
+    fn keep_declared(&mut self, pos: usize, idx: usize, node: NodeId)
+    {
+        if push(&mut self.declared, (pos, idx, node)).is_err()
+        {
+            self.remove(node);
+        }
+    }
+
+    /// Remove `node` and its subtree, uncounting them.
+    fn remove(&mut self, node: NodeId)
+    {
+        let before = self.ns.len();
+        // A failed removal leaves nodes the load created; they stay counted.
+        let _ = self.ns.remove(node);
+        let gone = before.saturating_sub(self.ns.len());
+        self.report.objects = self.report.objects.saturating_sub(gone);
+    }
+
+    /// Remove every placeholder the second walk did not define: a term the
+    /// first walk read as a definition and the second faulted on or never
+    /// reached.
+    fn sweep(&mut self)
+    {
+        let mut i = 0;
+        while let Some(&(_, _, node)) = self.declared.get(i)
+        {
+            if self.ns.object(node) == Some(&Object::Data(Data::Uninitialized))
+            {
+                self.remove(node);
+            }
+            i = i.saturating_add(1);
+        }
+    }
+
+    /// In the first walk, a placeholder for the name `idx` of the term at
+    /// `pos`. A name that exists already, or whose parent does not, gets
+    /// none.
+    fn placeholder(&mut self, scope: NodeId, name: &Name, pos: usize, idx: usize)
+    {
+        let owner = self.owner();
+        if let Ok(node) = self.ns.declare(scope, name, owner)
+        {
+            self.report.objects = self.report.objects.saturating_add(1);
+            self.keep_declared(pos, idx, node);
+        }
+    }
+
+    /// In the first walk, a placeholder for each name the definition `term`
+    /// at `pos` declares.
+    fn declare_names(&mut self, term: &Term, scope: NodeId, pos: usize)
+    {
+        match (term.op, &term.imm)
+        {
+            (
+                Op::Name | Op::Alias | Op::Mutex | Op::Event | Op::OpRegion | Op::DataRegion,
+                Imm::Name(name),
+            ) => self.placeholder(scope, name, pos, 0),
+            (Op::Field | Op::IndexField | Op::BankField, Imm::Fields(list)) =>
+            {
+                let names = list.elems.iter().filter_map(|e| match e
+                {
+                    FieldElem::Named { name, .. } => Some(*name),
+                    FieldElem::Reserved { .. }
+                    | FieldElem::Access { .. }
+                    | FieldElem::ExtendedAccess { .. }
+                    | FieldElem::Connect(_) => None,
+                });
+                for (idx, seg) in names.enumerate()
+                {
+                    if let Ok(name) = seg_name(seg)
+                    {
+                        self.placeholder(scope, &name, pos, idx);
+                    }
+                }
+            }
+            _ =>
+            {}
+        }
     }
 
     /// Create the object body or method `name` at `pos` in `scope`, or, in
@@ -219,16 +310,14 @@ impl Loader<'_, '_>
         pos: usize,
     ) -> Result<NodeId, Fault>
     {
-        if let Some(node) = self.declared_at(pos)
+        if let Some(node) = self.declared_at(pos, 0)
         {
             return Ok(node);
         }
         let node = self.create(scope, name, object, pos)?;
         if self.declaring
         {
-            // A position the list cannot keep is created again in the second
-            // walk, which then counts the `Exists` fault.
-            let _ = push(&mut self.declared, (pos, node));
+            self.keep_declared(pos, 0, node);
         }
         Ok(node)
     }
@@ -412,8 +501,8 @@ impl Loader<'_, '_>
     }
 
     /// Any other term: parse it, then define the object it declares or keep
-    /// it as module-level code. The first walk declares an `External` and
-    /// defines nothing else.
+    /// it as module-level code. The first walk declares an `External`, and
+    /// a placeholder for each name any other definition declares.
     fn statement(&mut self, pos: usize, end: usize, scope: NodeId) -> Result<usize, Stop>
     {
         let mut parser = Parser::new(self.ns, self.bytes, pos, end, scope);
@@ -427,6 +516,7 @@ impl Loader<'_, '_>
         };
         if self.declaring && term.op != Op::External
         {
+            self.declare_names(&term, scope, pos);
             return Ok(next);
         }
         self.define(term, scope, pos).map_err(|f| (f, Some(next)))?;
@@ -491,8 +581,29 @@ impl Loader<'_, '_>
                 return self.keep(term, scope).map_err(fault);
             }
         };
-        let object = object.map_err(fault)?;
-        self.create(scope, &name, object, pos).map(drop)
+        self.place(scope, &name, object.map_err(fault)?, pos, 0)
+    }
+
+    /// Give the first walk's placeholder for the name `idx` of the term at
+    /// `pos` its `object`, or create `name` in `scope` when the first walk
+    /// declared none.
+    fn place(
+        &mut self,
+        scope: NodeId,
+        name: &Name,
+        object: Object,
+        pos: usize,
+        idx: usize,
+    ) -> Result<(), Fault>
+    {
+        if let Some(slot) = self
+            .declared_at(pos, idx)
+            .and_then(|node| self.ns.object_mut(node))
+        {
+            *slot = object;
+            return Ok(());
+        }
+        self.create(scope, name, object, pos).map(drop)
     }
 
     /// Keep `term` as module-level code run in `scope`.
@@ -616,6 +727,7 @@ impl Loader<'_, '_>
         let mut bit = 0u32;
         let mut access_as = None;
         let mut connection = None;
+        let mut idx = 0usize;
         for elem in list.elems
         {
             match elem
@@ -630,14 +742,9 @@ impl Loader<'_, '_>
                         bit_len: bits,
                         connection,
                     };
-                    let mut segs = Vec::new();
-                    push(&mut segs, name).map_err(fault)?;
-                    let name = Name {
-                        root: false,
-                        up: 0,
-                        segs,
-                    };
-                    self.create(scope, &name, Object::Field(unit), pos)?;
+                    let name = seg_name(name).map_err(fault)?;
+                    self.place(scope, &name, Object::Field(unit), pos, idx)?;
+                    idx = idx.saturating_add(1);
                     bit = bit.checked_add(bits).ok_or(fault(FaultKind::Bound))?;
                 }
                 FieldElem::Reserved { bits } =>
@@ -668,6 +775,18 @@ impl Loader<'_, '_>
 
 /// The operand terms of a parsed declaration, in order.
 type Kids = alloc::vec::IntoIter<Term>;
+
+/// The relative name of one segment `seg`, as a field element declares it.
+fn seg_name(seg: Seg) -> Result<Name, FaultKind>
+{
+    let mut segs = Vec::new();
+    push(&mut segs, seg)?;
+    Ok(Name {
+        root: false,
+        up: 0,
+        segs,
+    })
+}
 
 /// The next operand term.
 fn next(kids: &mut Kids) -> Result<Term, FaultKind>

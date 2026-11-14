@@ -1200,6 +1200,46 @@ fn a_call_to_a_method_defined_later_in_the_table_parses_at_load()
 }
 
 #[test]
+fn a_data_object_defined_later_in_its_scope_hides_an_outer_method()
+{
+    // Device (DEV0) { OperationRegion (REG0, SystemMemory, BASE, 0x10)
+    // Name (BASE, 0x1000) }, then Method (\BASE, 1): the region's offset is
+    // DEV0.BASE, not a call of \BASE.
+    let aml = cat(&[
+        &device(
+            "DEV0",
+            &cat(&[
+                &[0x5B, 0x80],
+                &name("REG0"),
+                &[0x00],
+                &name("BASE"),
+                &byte(0x10),
+                &name_obj("BASE", &dword(0x1000)),
+            ]),
+        ),
+        &method("BASE", 1, &ret(&[ARG0])),
+        // A buffer sized by Local0 parses but is not constant: the first
+        // walk's placeholder for it is removed.
+        &name_obj("BADN", &buffer(&[LOCAL0], &[])),
+    ]);
+    let mut ns = Namespace::new().unwrap();
+    let r = ns.load_table(&table(&aml)).unwrap();
+    assert_eq!(r.faults, 1, "{r:?}");
+    assert_eq!(r.first_fault.unwrap().kind, FaultKind::NotConstant);
+    let Some(Object::Region(reg)) = ns.object(ns.find("\\DEV0.REG0").unwrap())
+    else
+    {
+        panic!("REG0 is not a region");
+    };
+    assert_eq!(ns.expr(reg.offset).unwrap().op, Op::NameRef);
+    assert_eq!(ns.expr(reg.length).unwrap().int(), Some(0x10));
+    assert_eq!(data(&ns, "\\DEV0.BASE"), Data::Integer(0x1000));
+    assert!(ns.find("\\BADN").is_none());
+    // DEV0, REG0, DEV0.BASE and \BASE.
+    assert_eq!(r.objects, 4, "{r:?}");
+}
+
+#[test]
 fn a_load_counts_each_object_once()
 {
     // Two walks, one count: the device, its method, the External and the

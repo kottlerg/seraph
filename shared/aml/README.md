@@ -80,15 +80,18 @@ segment, is a path from the scope it starts at; a relative name of one segment i
 that scope and then in each enclosing scope up to the root.
 
 `load_table` walks a DSDT or SSDT's term list in order, twice. Both walks enter the bodies of
-`Scope`, `Device`, `Processor`, `PowerResource` and `ThermalZone`. The first declares: it creates
-the `Device`, `Processor`, `PowerResource` and `ThermalZone` objects, each `Method` with the span
-of its body, which `method_code` parses on first use, and each `External`, and parses every
-other term only to find its end. The second defines: it parses every other term again, now that
-the table's methods have their argument counts in the namespace, so a call to a method defined
-later in the same table parses as a call; it creates the objects that `Name` (its data folded to
-a constant), `Alias`, `Mutex`, `Event`, `OperationRegion`, `DataRegion` and the field
-definitions declare; and it keeps every other term as module-level code, in order, for an
-evaluator to run. The namespace keeps a copy of each table.
+`Scope`, `Device`, `Processor`, `PowerResource` and `ThermalZone`. The first declares every name
+the table defines at load: it creates the `Device`, `Processor`, `PowerResource` and
+`ThermalZone` objects, each `Method` with the span of its body, which `method_code` parses on
+first use, each `External`, and a placeholder for each name that `Name`, `Alias`, `Mutex`,
+`Event`, `OperationRegion`, `DataRegion` and the field definitions declare. The second defines:
+it parses every term but those bodies again, now that the table's names are all in the
+namespace, so a reference to a name defined later in the same table resolves as the table
+defines it (a call to a method parses as a call, and a data object of the scope hides a method
+of an enclosing scope); it gives each placeholder its object (a `Name`'s data folded to a
+constant); and it keeps every other term as module-level code, in order, for an evaluator to
+run. A placeholder the second walk does not define is removed. The namespace keeps a copy of
+each table.
 
 A fault ends only the term list it is found in: a term whose end its `PkgLength` gives is
 skipped and the list continues after it, and any other fault ends the list, whose enclosing

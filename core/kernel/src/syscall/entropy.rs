@@ -151,18 +151,6 @@ pub fn contribute_span(
     Ok(len)
 }
 
-/// Overwrite `bytes` with zeros through volatile stores, which the compiler
-/// may not remove as dead, then fence the compiler.
-pub fn wipe(bytes: &mut [u8])
-{
-    for b in bytes.iter_mut()
-    {
-        // SAFETY: `b` is a valid, aligned, exclusively borrowed `u8`.
-        unsafe { core::ptr::write_volatile(b, 0) };
-    }
-    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-}
-
 /// The kernel stack copy of a contribution, wiped when it goes out of scope:
 /// after the absorb, and after a faulted copy, which may have filled a prefix.
 #[cfg(not(test))]
@@ -173,7 +161,7 @@ impl Drop for ContributeStage
 {
     fn drop(&mut self)
     {
-        wipe(&mut self.0);
+        crate::entropy::wipe(&mut self.0);
     }
 }
 
@@ -319,15 +307,5 @@ mod tests
             contribute_span(0, 32, TOP, false),
             Err(SyscallError::InvalidAddress)
         );
-    }
-
-    // Defect guarded: a wipe that misses a byte, leaving contributed bytes on
-    // the kernel stack.
-    #[test]
-    fn wipe_zeroes_every_byte()
-    {
-        let mut bytes = [0xA5u8; MAX_ENTROPY_CONTRIBUTE_LEN];
-        wipe(&mut bytes);
-        assert!(bytes.iter().all(|&b| b == 0));
     }
 }

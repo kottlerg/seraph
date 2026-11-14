@@ -186,7 +186,8 @@ The reseed policy is a pure, host-tested decision function
   (`jitter::collect` — the staging words, the sample count, and the
   instantaneous cycle counter, so every contribution carries fresh timing),
   draws `RESEED_BYTES` (32 — a 256-bit reseed) of fresh seed material, and
-  absorbs it; the seed buffer is then zeroed. Whenever VMGENID detection is
+  absorbs it; the seed buffer on the kernel stack is then cleared with volatile
+  stores the compiler cannot drop (`entropy::wipe`). Whenever VMGENID detection is
   armed, every mandatory reseed additionally absorbs the live GUID into the pool
   after the jitter fold and before the seed draw.
 - The draw interval bounds how much output depends on any single seed without

@@ -38,6 +38,7 @@ pub mod fault_pager_roundtrip;
 pub mod fault_resume_modifies_pc;
 pub mod fault_syscall_buffer;
 pub mod fpu_survives_ipc_call;
+pub mod freed_object_bytes_zeroed;
 pub mod idle_past_watchdog_threshold;
 pub mod idle_pull_starved_ready;
 pub mod ipc_call_interrupted_stop_start;
@@ -79,7 +80,7 @@ use crate::run_integration_test;
 )]
 #[expect(
     clippy::large_stack_frames,
-    reason = "no large local: the estimate sums the temporaries of its 53 `run_integration_test!` \
+    reason = "no large local: the estimate sums the temporaries of its 55 `run_integration_test!` \
               expansions (the logged names, the closure passed to `run_isolated` and its \
               `TestResult`, about 220 B each), and the compiled frame is under 1 KiB; on init's 16 \
               KiB stack"
@@ -152,6 +153,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::mem_map_retyped_refused",
         mem_map_retyped_refused::run(ctx)
+    );
+    run_integration_test!(
+        "integration::freed_object_bytes_zeroed",
+        freed_object_bytes_zeroed::run(ctx)
     );
     run_integration_test!(
         "integration::retype_over_mapped_refused",

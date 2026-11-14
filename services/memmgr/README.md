@@ -5,9 +5,9 @@ allocates Memory capabilities to all std-built services on demand, tracks
 per-process memory-cap ownership, and reclaims memory caps when a process dies.
 
 memmgr is a `no_std` binary: it cannot bootstrap a general heap against
-itself, so it has none. Its free pool, process table, and per-process frame
-and region descriptors all live in a self-hosted metadata arena carved from
-its own pool (see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata
+itself, so it has none. Its free pool, process table, per-process frame and
+region descriptors, and the regions' chunk tables all live in a self-hosted
+metadata arena carved from its own pool (see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata
 Arena"). After memmgr is in place, the only `no_std` userspace services in the
 system are `init` and `memmgr` (see
 [`docs/process-lifecycle.md`](../../docs/process-lifecycle.md) §"Userspace
@@ -24,7 +24,8 @@ memmgr/
 ├── README.md
 ├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
 │                               # arena, free pool, deferred list, process
-│                               # index, region logic
+│                               # index, region logic, per-region chunk
+│                               # tables
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
@@ -129,11 +130,12 @@ The full memmgr IPC specification is in
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records, and per-process region and frame descriptors are nodes in a
-self-hosted metadata arena carved from memmgr's own pool, indexed by `u64`
-(see [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records
-are found through a linear-hash index that grows with them. The arena grows
-until RAM is exhausted or its address-space zones are spent; the high zone,
+process records, per-process region and frame descriptors, and the regions'
+chunk-table nodes are nodes in a self-hosted metadata arena carved from
+memmgr's own pool, indexed by `u64` (see
+[`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are
+found through a linear-hash index that grows with them. The arena grows until
+RAM is exhausted or its address-space zones are spent; the high zone,
 above the shared 2^38 layout ceiling, exists on paging modes whose user half
 is wider. memmgr funds its own `CSpace` and page-table growth from its pool,
 so neither init-seeded budget bounds it. A failed growth surfaces as `QUOTA`

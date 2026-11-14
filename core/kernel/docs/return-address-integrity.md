@@ -374,8 +374,10 @@ throwaway and are not in the tree.
    KVM (the Linux 7.3 source, read) writes the guest's `S_CET` and interrupt SSP table fields
    only on a write from userspace or from the guest, which the kernel never makes with 0, and on
    a vCPU reset, which clears `CR4.CET` too. The registers are therefore lost in the outer
-   hypervisor's emulation of nested VMX, whose version was not read. No host without nesting
-   was available, so the kernel has not run on shadow stacks outside one.
+   hypervisor's emulation of nested VMX, whose version was not read
+   ([#1161](https://github.com/kottlerg/seraph/issues/1161)). No host without nesting was
+   available, so the kernel has not run on shadow stacks outside one
+   ([#1160](https://github.com/kottlerg/seraph/issues/1160)).
 
 Sources read: the CFI chapters of the RISC-V ISA manual (`src/unpriv/cfi.adoc` and
 `src/priv/cfi.adoc` of `riscv/riscv-isa-manual`), the Firmware Features extension of the SBI

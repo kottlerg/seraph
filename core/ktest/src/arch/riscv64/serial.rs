@@ -19,7 +19,8 @@ pub const UART_PHYS: u64 = 0x1000_0000;
 pub(crate) const SERIAL_VA: u64 = 0x3000_0000;
 
 /// Current UART virtual base (set after `mmio_map`).
-// ktest is single-threaded on the serial path.
+// Written once, by `init`, before ktest starts any other thread; only read
+// after, by whichever thread uses the UART.
 static mut UART_VA: u64 = 0;
 
 /// UART register offsets.
@@ -130,6 +131,14 @@ pub fn raise_tx_interrupt()
         core::ptr::write_volatile(base.add(IER), 0x00);
         core::ptr::write_volatile(base.add(IER), IER_THRI);
     }
+}
+
+/// Let the thread `thread_cap` names call [`raise_tx_interrupt`]: nothing to
+/// grant, since the UART page is mapped in ktest's address space, which every
+/// ktest thread shares. Returns `true`.
+pub fn grant_tx_interrupt(_thread_cap: u64) -> bool
+{
+    true
 }
 
 /// Disable every UART interrupt source (IER = 0), the state [`init`] leaves.

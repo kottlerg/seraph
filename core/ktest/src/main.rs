@@ -584,11 +584,14 @@ fn spare_ram_slots(info: &init_protocol::InitInfo) -> core::ops::Range<u64>
 /// `CSpace` only with the slots init uses and the one arena page init spends
 /// before it funds itself (`ROOT_CSPACE_BODY_PAGES`, core/kernel/src/cap/mod.rs).
 /// ktest's bodies are `frame_pool`'s 64 permanent splits, the I/O-port
-/// subdivider's splits and the serial port's binding table on x86-64
-/// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES`), and each case's own splits
-/// and copies, which it deletes again. 16 pages hold the binding table and 13
-/// arena pages, 403 bodies (`syscall_abi::CSPACE_BODIES_PER_PAGE` a page), far
-/// above that peak. Bodies and binding tables draw on the same pool pages as
+/// subdivider's splits, the binding tables on x86-64
+/// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES` each: the main thread's, for
+/// the serial port, and, while `stress::irq_route_delete_race` runs, its
+/// deleter's, for the same ports, `crate::arch::serial::grant_tx_interrupt`),
+/// and each case's own splits and copies, which it deletes again. At that
+/// peak 16 pages hold the two binding tables and 10 arena pages, 310 bodies
+/// (`syscall_abi::CSPACE_BODIES_PER_PAGE` a page), far above the bodies it
+/// needs. Bodies and binding tables draw on the same pool pages as
 /// slots, so a shortfall is first absorbed by the slot pages the kernel seeds
 /// for init (`ROOT_CSPACE_INIT_HEADROOM_SLOTS`), and then fails the case that
 /// exhausts the pool with `OutOfMemory`.
@@ -1037,9 +1040,10 @@ pub fn halt() -> !
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> !
 {
-    // On x86-64 only the main thread holds the COM1 I/O-port binding, so a
-    // child that called log would fault on outb. The handler cannot tell the
-    // main thread from a child, so it exits the thread without logging on
-    // every architecture.
+    // On x86-64 only the main thread, and a thread
+    // `crate::arch::serial::grant_tx_interrupt` has bound, hold the COM1
+    // I/O-port binding, so any other child that called log would fault on
+    // outb. The handler cannot tell the main thread from a child, so it exits
+    // the thread without logging on every architecture.
     syscall::thread_exit()
 }

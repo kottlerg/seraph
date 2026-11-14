@@ -27,9 +27,10 @@ xtask/
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
+│   ├── guest.rs                # A QEMU process a QMP-driven harness drives, and its serial reader
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
-│   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests
+│   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize.rs            # ELF address resolution: DWARF, symbol-table fallback
@@ -37,7 +38,7 @@ xtask/
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
-│   ├── commands/               # Subcommand modules (build, run, run_parallel,
+│   ├── commands/               # Subcommand modules (build, capture_acpi, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
 │   │                           #   test, compare_images, test_crash_report, test_debug_port,
 │   │                           #   test_gdb, test_kaslr, test_map_redo, test_terminal,
@@ -1369,6 +1370,47 @@ on stderr. The harness reads a hook's exit code 2 as a refusal, and a checkout w
 has no `hook` command exits with that code, so `.claude/settings.json` writes each command as
 `cargo xtask hook <event> || true`.
 
+### `cargo xtask capture-acpi`
+
+Capture the ACPI tables of one QEMU configuration into the `shared/aml` fixtures
+([shared/aml/README.md](../shared/aml/README.md) § Fixtures). Boots the firmware alone, headless,
+on a blank 1 MiB disk, in the tree's launch of the configuration's architecture with the test
+devices attached, 4 vCPUs and 512 MiB, plus the devices the configuration adds. Once the
+firmware prints its first boot-option line (`BdsDxe: ` from OVMF, `[Bds]Booting ` from the
+riscv64 firmware), by which point it has installed the tables QEMU generated, the command stops
+the guest and saves its RAM over QMP (`stop`, then `pmemsave`), and QEMU quits.
+
+It then finds every RSDP in the RAM image (the signature on a 16-byte boundary, the checksum
+valid, and from revision 2 the extended checksum too), walks its XSDT, or its RSDT when it has
+no XSDT, checking every table's checksum, and takes the DSDT from the FADT's `X_DSDT`, or its
+32-bit `DSDT` when the FADT is too short for `X_DSDT` or it is zero. Every RSDP whose walk
+succeeds must give the same tables. It replaces the `.aml` files of the output directory with
+`DSDT.aml` and the SSDTs in XSDT order (`SSDT1.aml`, `SSDT2.aml`, ...), and writes
+`capture.txt`: the command, the QEMU version, the firmware image's file name, the QEMU
+arguments with host paths replaced by placeholders, and the signatures of the root table's
+entries.
+
+```sh
+cargo xtask capture-acpi --config <configuration> [--out DIR] [--timeout SECS]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--config` | (required) | The configuration (below) |
+| `--out` | `shared/aml/fixtures/<config>` | The directory the tables are written to |
+| `--timeout` | `600` | Seconds to wait for the firmware's boot-option line |
+
+| Configuration | Added to the launch |
+|---|---|
+| `x86-default` | Nothing |
+| `x86-rootport` | `-device pcie-root-port,id=rp0,chassis=1,addr=0x1c` |
+| `x86-rootport-native` | The `x86-rootport` root port and `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off` |
+| `riscv64-rootport` | `-device pcie-root-port,id=rp0,chassis=1` |
+
+Needs no sysroot. The boot is a small one of the host launch rules (below). The command fails
+when no RSDP's walk succeeds, when two give different tables, and on a QMP error or a timeout:
+the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
+
 ---
 
 ## Host launch rules
@@ -1376,8 +1418,8 @@ has no `hook` command exits with that code, so `.claude/settings.json` writes ea
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
 `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`
-and `test-gdb` as boots.
+`run-parallel`, `test-terminal`, `test-vmgenid`, `test-kaslr`, `test-map-redo`, `test-debug-port`,
+`test-gdb` and `capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
@@ -1473,4 +1515,5 @@ printed line: each CI job is its own host.
 [Memory Model](../docs/memory-model.md), [Testing](../docs/testing.md),
 [programs/terminal/README.md](../programs/terminal/README.md),
 [rootfs/README.md](../rootfs/README.md),
-[services/gdbstub/README.md](../services/gdbstub/README.md)
+[services/gdbstub/README.md](../services/gdbstub/README.md),
+[shared/aml/README.md](../shared/aml/README.md)

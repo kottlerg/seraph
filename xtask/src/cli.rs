@@ -128,6 +128,13 @@ pub enum CliCommand
     /// again (see xtask/README.md).
     TestGdb(TestGdbArgs),
 
+    /// Capture the ACPI tables of one QEMU configuration into the `shared/aml`
+    /// fixtures: boot the firmware alone on a blank disk, save the guest's
+    /// memory over QMP once the firmware has installed its tables, find the
+    /// RSDP, walk the XSDT, and write the DSDT and every SSDT with a note of
+    /// the capture (see xtask/README.md).
+    CaptureAcpi(CaptureAcpiArgs),
+
     /// Check the mechanical documentation and source-header rules: Markdown
     /// column limit, file-header layout, `## Summarized By` shape, forward
     /// links, order, and labels, and document reachability from the root
@@ -229,6 +236,7 @@ impl CliCommand
             | Self::TestMapRedo(_)
             | Self::TestDebugPort(_)
             | Self::TestGdb(_)
+            | Self::CaptureAcpi(_)
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
             | Self::PrCheck(_)
@@ -750,6 +758,50 @@ pub struct TestGdbArgs
     /// Guest memory size in MiB (QEMU -m).
     #[arg(long, default_value = "512")]
     pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
+}
+
+// ── CaptureAcpi ──────────────────────────────────────────────────────────────
+
+/// A QEMU configuration whose ACPI tables `capture-acpi` captures; each is
+/// the tree's launch (`crate::qemu::build_qemu_argv`) of one architecture
+/// with the test devices attached, plus the devices it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AcpiConfig
+{
+    /// q35 as the tree boots it.
+    X86Default,
+    /// q35 with an empty PCI Express root port
+    /// (`pcie-root-port,id=rp0,chassis=1,addr=0x1c`).
+    X86Rootport,
+    /// `x86-rootport` with ACPI PCI hotplug off
+    /// (`-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`), so the
+    /// firmware grants native hotplug.
+    X86RootportNative,
+    /// riscv64 `virt` with an empty PCI Express root port
+    /// (`pcie-root-port,id=rp0,chassis=1`).
+    Riscv64Rootport,
+}
+
+#[derive(Parser)]
+pub struct CaptureAcpiArgs
+{
+    /// The configuration to capture.
+    #[arg(long)]
+    pub config: AcpiConfig,
+
+    /// The directory the tables are written to (default:
+    /// `shared/aml/fixtures/<config>`). Its `.aml` files are replaced.
+    #[arg(long, value_name = "DIR")]
+    pub out: Option<PathBuf>,
+
+    /// Seconds to wait for the firmware to reach its boot options.
+    #[arg(long, default_value = "600")]
+    pub timeout: u64,
 
     /// The shared host's launch rules (see xtask/README.md "Host launch
     /// rules").

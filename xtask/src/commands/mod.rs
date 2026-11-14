@@ -6,6 +6,7 @@
 //! Re-exports all subcommand modules.
 
 pub mod build;
+pub mod capture_acpi;
 pub mod clean;
 pub mod compare_images;
 pub mod compose_bundle;

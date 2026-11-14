@@ -22,6 +22,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aml"
+version = "0.1.4"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -476,6 +480,7 @@ dependencies = [
 name = "devmgr-firmware"
 version = "0.1.4"
 dependencies = [
+ "aml",
  "driver-binding",
  "ipc",
  "svc-grammar",

@@ -14,9 +14,9 @@ path.
 ## Authority
 
 This document is authoritative for vfsd's namespace-server behavior:
-the shape of the synthetic root, the mount-tree representation, the
-mount-crossing mint that attenuates rights across a terminal mount, and
-fall-through delegation to the root mount.
+the shape of the synthetic root, the mount-tree representation and the
+record each mount keeps, the mount-crossing mint that attenuates rights
+across a terminal mount, and fall-through delegation to the root mount.
 
 The wire protocol is defined by
 [`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md).
@@ -34,14 +34,18 @@ vfsd's heap. Each node carries:
 |---|---|
 | `name` / `name_len` | Path component captured at install time |
 | `parent` / `first_child` / `next_sibling` | Tree links |
-| `terminal_endpoint` | *Unbadged* SEND on the underlying driver's namespace endpoint, set on a node that is itself a mount point; zero on a synthetic intermediate. Each crossing `NS_LOOKUP` mints a fresh attenuated badged SEND from it |
+| `slot` | The node's mount, with its state (§ Mount record): none, mounted, or being removed |
+| `live` | Count of mounted mounts in the node's subtree, the node's own included; a node other than the root is *visible* exactly when it is non-zero |
 | `fallthrough_cap` | Badged SEND on the root mount's namespace endpoint addressing the directory at this node's path in the root filesystem; zero if no such fall-through is available |
 
 The synthetic root is `NodeId::ROOT` (pool index 0) and always
 exists; its `fallthrough_cap` carries the root mount cap captured
 when `MOUNT path="/"` succeeds. An install adds one node per path
-component not yet in the tree, and nodes are never freed (there is no
-unmount), so a node's pool index is its `NodeId` for the life of vfsd.
+component not yet in the tree, and nodes are never freed: a removed
+mount leaves its node vacant and a later install reuses it, so a node's
+pool index is its `NodeId` for the life of vfsd. A node is a *terminal*
+when it holds a mounted mount, a *synthetic intermediate* when it holds
+none but is visible, and *vacant* otherwise.
 No fixed count bounds the tree; an install that cannot allocate its
 nodes is refused and leaves the tree unchanged. A component follows the
 namespace protocol's name rule (`namespace_protocol::validate_name`, at
@@ -52,13 +56,65 @@ is the `vfsd-root-backend` crate
 ([`services/vfsd/root-backend/src/lib.rs`](../root-backend/src/lib.rs)).
 
 Multi-component mount paths install through the tree by walking
-components, creating synthetic intermediates on demand, and setting
-`terminal_endpoint` on the final node. After install the caller
+components, creating synthetic intermediates on demand, and storing the
+mount record on the final node. After install the caller
 (`do_mount`) walks the root mount component-by-component via
-`NS_LOOKUP` to populate each new intermediate's `fallthrough_cap`.
+`NS_LOOKUP` to populate the `fallthrough_cap` of each intermediate the
+install made visible (a node it created, or a vacant node it reused) that
+has none. Only one install makes a node visible, so concurrent `MOUNT`s
+never walk for the same node, and the tree refuses a walked cap for a node
+that has one by then, which vfsd deletes.
 The in-tree mount set is the root mount (`/`) plus the single-component
 `/esp` and `/data` auto-mounts; the multi-component install path
 remains supported but is currently unexercised in production.
+
+### Mount record
+
+Every mount, the root mount included, keeps one record on the node it
+is mounted on (`root_backend::Mount`), holding what vfsd needs to reach
+the mount's driver and to tear it down:
+
+| Field | Holds |
+|---|---|
+| `cap` | The cap the tree resolves the mount through: below `/`, the *unbadged* SEND on the driver's namespace endpoint (§ Mount-crossing mint); for `/`, the badged SEND on the root fs, also the synthetic root's `fallthrough_cap` |
+| `endpoint` | The driver's service endpoint as vfsd created it, from which every cap on it derives (§ Revocation) |
+| `process` | procmgr's process handle for the driver, from the create reply |
+| `death_queue` | `RECV` on the driver's death queue (below) |
+| `partition` | The partition cap virtio-blk returned on `REGISTER_PARTITION`; the driver holds a `cap_derive` (`SEND_GRANT`) of it, so `cap_revoke_all` on this cap cuts the driver off the partition |
+| `disk` | The index, in vfsd's disk list, of the disk that holds the partition |
+
+The death queue is an event queue of capacity 2 with 2 death-observer
+nodes, one per binding. vfsd binds the driver's main thread to it with
+the create reply's `Thread` cap before `START_PROCESS`, so the main
+thread's exit or terminal fault posts to it, and then deletes the
+`Thread` cap. The create request carries a `POST`-only derivation of the
+queue under `CREATE_DEATH_RELAY`, which procmgr binds to the driver's
+address space, so a terminal fault in any of the driver's threads posts
+to it as well
+([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
+§ Label 1, **Death relay**). Both spawn paths, `CREATE_PROCESS` from the
+boot module and `CREATE_FROM_FILE`, set up both bindings. No vfsd thread
+reads the queue yet (design intent; not yet implemented: vfsd reacting
+to a driver's death).
+
+A record is in one of two states. While *mounted*, lookups cross it.
+Removing a mount below `/` takes two steps:
+`VfsdRootBackend::begin_unmount` moves the record to *being removed*,
+after which no lookup crosses it and no install may take the node, and
+`VfsdRootBackend::remove_mount` clears the record once the caller has
+torn the driver down, leaving the node vacant unless a mount below it
+keeps it visible as an intermediate. The root mount is never removed.
+`NS_LOOKUP`, `NS_READDIR`, the shadowing of fall-through entries, and a
+node's child count skip a node that is not visible, so the name of a
+vacant node, or of a node whose own mount is being removed with no
+mount below it, falls through to the root filesystem as an absent name
+does. vfsd does not yet remove a mount: no request or event reaches
+`begin_unmount` (design intent; not yet implemented).
+
+A `MOUNT` that fails after its driver started releases what its record
+would have held: it revokes and deletes the partition cap, revokes the
+driver's service endpoint (which stops the driver), and deletes the
+process handle and the death queue.
 
 ---
 
@@ -68,7 +124,7 @@ remains supported but is currently unexercised in production.
 endpoint dispatches in two stages, from `vfsd::namespace_loop`:
 
 1. **Local-child match.** `VfsdRootBackend::lookup` walks the
-   parent node's child list. A match on a *terminal* child returns
+   parent node's visible children (§ Mount record). A match on a *terminal* child returns
    an `EntryTarget::External` view carrying the driver's unbadged
    endpoint and the peer root node; the namespace-protocol crate
    ([`shared/namespace-protocol/README.md`](../../../shared/namespace-protocol/README.md)
@@ -133,7 +189,7 @@ namespace endpoint at full rights — `caller_root_cap`, returned to the
 `MOUNT` caller (or dropped on the internal `auto_mount_role` path that
 handles the `/esp` and `/data` mounts without a synchronous caller). The
 backend then retains the driver's **unbadged** namespace endpoint
-(`driver_ep`) as the terminal node's `terminal_endpoint`.
+(`driver_ep`) as the `cap` of the terminal node's mount record.
 
 Every `NS_LOOKUP` that crosses the mount mints a *fresh* badged SEND on
 that endpoint carrying the composed
@@ -160,15 +216,17 @@ each forwarded request rather than minting a reply cap.
 The supported revocation primitive for a mount is **destroy the fs
 driver**: `cap_revoke` on the driver's namespace endpoint cascades
 through the kernel derivation graph and invalidates every cap ever
-derived from it — the `terminal_endpoint`, every per-lookup reply cap,
+derived from it — the mount record's `cap`, every per-lookup reply cap,
 and the `MOUNT` caller's copy. This is the `kill the server` shape
 documented in
 [`docs/namespace-model.md`](../../../docs/namespace-model.md#revocation).
 That authority is the driver's original endpoint (a driver's service and
-namespace endpoint are one), which vfsd keeps per mount
-(`FatfsDriver::endpoint` in `src/driver.rs`): the backend's retained
-`terminal_endpoint`, the root mount's badged fall-through cap, and the
-driver's own receive copy all derive from it.
+namespace endpoint are one), which vfsd keeps in the mount record
+(`endpoint`, § Mount record): the record's `cap`, the root mount's
+badged fall-through cap, and the driver's own receive copy all derive
+from it. The driver's block-device authority is revoked the same way,
+through the record's `partition`, from which the driver's partition cap
+derives.
 Revoking a cap the backend retains reaches only that cap's descendants,
 not the driver's receive copy, so it does not stop the server.
 Per-cap revocation — invalidating one issued node cap without affecting
@@ -223,15 +281,14 @@ Wire-label numbers for both surfaces live in `ipc::vfsd_labels` and
 
 ## Lifetime
 
-A successful `install` retains the `terminal_endpoint` (terminal
-nodes) and any walked `fallthrough_cap`s (synthetic intermediates, plus
-the root mount's badged fall-through cap) for the lifetime of the vfsd
-process. vfsd also keeps each mounted driver's original service endpoint,
-from which every cap above derives, as the handle that revokes the driver;
-a mount that fails after its driver started is torn down through it. Unmount is not implemented;
-the mount-tree is permanent until vfsd exits. Deferred follow-ups:
-per-process `system_root_cap` distribution (different processes
-seeing different roots) and `cap_revoke`-driven unmount.
+A successful `install` stores the mount's record (§ Mount record) and
+any walked `fallthrough_cap`s (synthetic intermediates, plus the root
+mount's badged fall-through cap); the tree keeps them until the mount is
+removed, and the record's caps are vfsd's to release. vfsd removes no
+mount yet, so every mount and its record last until vfsd exits (design
+intent; not yet implemented: unmount, and the handling of a mounted
+device's loss). Per-process `system_root_cap` distribution (different
+processes seeing different roots) is not implemented.
 
 ---
 

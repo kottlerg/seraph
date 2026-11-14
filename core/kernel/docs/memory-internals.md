@@ -156,6 +156,23 @@ sub-page capacity. A carve happens only once the bump cursor cannot serve the cl
 frontier is by then spent and the class's free list empty: without the carve, the sub-page request
 fails instead.
 
+A free zeroes every byte it returns before the bytes rejoin the allocator (`retype_free`, and
+`retype_free_runs` for the runs of a dead pool's donations). The bump cursor moves back below freed
+bytes when a free sits at the frontier and when the last retyped byte returns (the drain reset), and
+`SYS_MEM_MAP` maps any range at or above the cursor, so without the clear the holder of the Memory
+capability would read the dead object's state
+([cross-boundary-disclosure.md](cross-boundary-disclosure.md) § Kernel state in donated memory).
+The clear runs before the free takes the object's locks, in batches of 16 pages with the interrupts
+pending on the CPU taken between batches, so the clear masks interrupts for one batch at a time
+whatever the free's size. The only kernel-written bytes left in free space are the allocator's own
+free-list words, written after the clear: a free sub-page slot's first 8 bytes (the next slot's
+offset) and the 16-byte header (page count and next run's offset) at the start of every free block
+on the page list, each list ending at an all-ones sentinel. A freed block that joins the free run
+below it gets no header of its own; when it joins the free run above it, that run's header stays
+inside the merged run until its pages are retyped again.
+They are region offsets and counts, which carry no address, and the drain reset leaves them in
+place.
+
 Retype and pool allocation are fallible and MUST be handled as fallible at every
 call site; there is no allocation that cannot fail
 ([docs/memory-model.md](../../../docs/memory-model.md) § Kernel Allocation is Fallible).

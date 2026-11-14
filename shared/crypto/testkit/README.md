@@ -22,7 +22,7 @@ case (one the standard lets an implementation take either way) is judged by a po
 states, never skipped.
 
 The module is the only one that parses JSON. A file for another algorithm is one more `Source`
-constant, and a new schema one more group type beside `eddsa`.
+constant, and a new schema one more group type beside `eddsa` and `aead`.
 
 ## Differential harness
 
@@ -48,6 +48,7 @@ so every run is deterministic
 | File | Upstream | SHA-256 |
 |---|---|---|
 | `ed25519_test.json` | `C2SP/wycheproof`, `testvectors_v1/ed25519_test.json` at commit `65ca494727a52944c204441c860b039e6786b99b` | `ea80ffebac085e21cb9d3e903e7fa2b448d96702da5b31f061d0b83b430b74b3` |
+| `chacha20_poly1305_test.json` | `C2SP/wycheproof`, `testvectors_v1/chacha20_poly1305_test.json` at commit `65ca494727a52944c204441c860b039e6786b99b` | `fe61d25f90e1bde4461d00eafe61049e5f29bd999f36b766df9cda90906ad53d` |
 
 A file is updated by replacing it whole from an upstream commit and recording the commit and
 checksum here.
@@ -62,7 +63,7 @@ shared/crypto/testkit/
 ├── README.md
 ├── src/
 │   ├── lib.rs                  # Crate root
-│   ├── wycheproof.rs           # Wycheproof loader and runner; EddsaVerify schema
+│   ├── wycheproof.rs           # Wycheproof loader and runner; EddsaVerify, AeadTest schemas
 │   ├── differential.rs         # Differential driver and report
 │   ├── ed25519.rs              # Ed25519 reference verdict, generated and edge-case inputs
 │   ├── sha512.rs               # SHA-512 reference digest and generated inputs
@@ -71,6 +72,7 @@ shared/crypto/testkit/
 └── vectors/
     └── wycheproof/
         ├── LICENSE             # Upstream's Apache-2.0 license
+        ├── chacha20_poly1305_test.json  # ChaCha20-Poly1305 AEAD cases
         └── ed25519_test.json   # Ed25519 verification cases
 ```
 

@@ -82,8 +82,13 @@ vfsd/
   structural — `/services/fs/fatfs` is unreachable until root mounts,
   so spawning the fatfs that brings the root online cannot be moved
   elsewhere. vfsd supplies each driver with a partition-scoped block
-  device endpoint and the receive side of its own service endpoint (see
+  device endpoint, derived from the partition cap vfsd keeps, and the
+  receive side of its own service endpoint (see
   [`services/fs/docs/fs-driver-protocol.md`](../fs/docs/fs-driver-protocol.md#bootstrap-caps)).
+  Each mount keeps a record of its driver: the service endpoint, the
+  process handle, a death queue the driver's exit or fault posts to,
+  and the partition cap (see
+  [`docs/namespace-composition.md`](docs/namespace-composition.md#mount-record)).
   On both paths a vfsd logging at any level but info creates the
   driver with its own level as the driver's `SERAPH_LOG` env entry, so
   a driver logs at vfsd's level

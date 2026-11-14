@@ -741,7 +741,9 @@ not by grants, so the heap holds no Memory caps. memmgr charges a committed exte
 it accepts it: its pages to the budget node, and to `promised`, the count of committed pages that
 hold no frame, with a bound on the page tables and chunk metadata they can need. Every admission
 (a grant, an extension, an uncommitted demand run, a page-table donation) requires
-`free - promised - reserve + A >= want`, where A is the overcommit allowance. A fault on a
+`free - promised - R + A >= want`, where A is the overcommit allowance and R is the system
+reserve for a charge to a node outside it and 0 for a charge to a reserve node ([Distribution
+policy](#distribution-policy)). A fault on a
 committed page draws from `promised`, so with A = 0 it is never declined for budget or RAM, and a
 refused extension fails the allocation, never a fault. With A = 0 memmgr evicts only uncommitted
 pages (thread stacks, heap floors, `register_demand_paged` regions): evicting an uncommitted chunk
@@ -750,20 +752,22 @@ adds store pages against `promised`. A ships at 0. Above 0, heap pages are evict
 committed fault that finds no frame compresses a victim within its turn or is declined as a commit
 overrun.
 
-**Selection.** While the pool's pressure level reads `LOW`
+**Selection.** While the pool's pressure level reads `LOW` or `CRITICAL`
 ([#261](https://github.com/kottlerg/seraph/issues/261)), memmgr reclaims until it reads `NORMAL`,
 and stops there. Each reclaiming turn reads and clears the accessed bits of a bounded slice of the
 eligible regions through the kernel's harvest syscall and ages each chunk with its two-bit age
 ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is a victim. The granule
-is the chunk: one capability, one unmap and one restore fault per chunk.
+is the chunk: one unmap and one restore fault per chunk, over every run on its run list.
 
 **States.** memmgr unmaps a victim chunk with `SYS_MEM_UNMAP`, leaving its page tables, and the
 chunk is evicting while the compression worker stores its pages; a fault on an evicting chunk
 remaps the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to
 the free pool and its entry's link holds the store handle. An all-zero page takes no store space.
 A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
-bounded by one chunk's decompression: memmgr takes a run, maps it in a scratch window of its own,
-decompresses into it, maps it into the process, frees the store slot, and resumes the thread.
+bounded by one chunk's decompression: memmgr takes runs covering the chunk's backed pages, as a
+demand fault selects them ([Demand faults](#demand-faults)), maps them in a scratch window of its
+own, decompresses into them, maps them into the process, frees the store slot, and resumes the
+thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,

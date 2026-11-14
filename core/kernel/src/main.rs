@@ -252,6 +252,9 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::cpu::verify_baseline();
     }
     kprintln!("baseline ok");
+    // Log the CPU's transient-execution vulnerability table
+    // (core/kernel/docs/transient-execution.md).
+    arch::current::speculation::enumerate_vulnerabilities();
 
     // ── Phase 2: physical memory ────────────────────────────────────────────
     // Parse the memory map and subtract reserved regions, keeping the free

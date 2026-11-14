@@ -523,7 +523,11 @@ gives the PR-level linear view.
   none is owed and why (that the PR's changes outside Markdown are all inert,
   or that its non-inert lines change none of the CPU-count, memory, and device
   surfaces that section names and it states no concurrency-fix purpose as that
-  section defines it).
+  section defines it). A PR whose lines are inert because its images are
+  identical (that section's Identical images) quotes the verdict line of
+  `cargo xtask compare-images` and gives the head it ran at and the path of
+  the report the command wrote; the pre-merge audit reads that report and
+  checks its base, its head, its four cells, and its verdict.
 
 ## CI Gating
 

@@ -586,6 +586,33 @@ memory size, or device set, and owes no local host run, whatever file it is in:
   any other changed line in a file that remains, the declaration that named the module included,
   is judged on its own.
 
+**Identical images.** A PR whose own diff (When the runs are owed below) leaves every file
+`cargo xtask build` installs identical, in every part a loader reads, on both architectures and in
+both profiles, changes nothing a boot runs: every line of its own diff outside the host side named
+below is inert.
+The evidence is `cargo xtask compare-images`
+([xtask/README.md](../xtask/README.md#cargo-xtask-compare-images)), never a comparison made by
+hand. It builds the PR's merge base and its head in one scratch worktree and compares each
+installed file: an ELF image by its loader-relevant header fields, its program headers and the
+bytes of its `PT_LOAD` segments, and its allocated sections and note sections (the loaders read a
+`.note.seraph.*` section by name); a PE image by its headers and sections, its link time stamps and
+its debug directory aside; the bootloader bundle by its entries; and any other file by its bytes.
+Its verdict line names both commits and the four cells (x86_64 and riscv64, each debug and
+release), and only `IDENTICAL` over all four makes the lines inert. The host side is judged as the
+rest of this section judges it, verdict or not: every line under `xtask/`, and every line of a crate
+xtask's build compiles in (each in-tree crate of the `[dependencies]` of `xtask/Cargo.toml`, and
+each in-tree crate those depend on, such as `shared/gdb-rsp/`). The launchers, the disk tooling, and
+the host-driven tests run on the host, outside every image, and the device surfaces below list items
+of them, so identical images are no evidence about them. The verdict does not cover:
+
+- a build that is not reproducible: two builds of one commit that differ make the command report a
+  difference, so a PR loses the class but never claims it wrongly;
+- a later head whose changes alter an image: a verdict at head H covers a later head M only when
+  the PR's own diff makes the same changes at H and at M apart from changes the list above makes
+  inert, and otherwise the command is run again at M, or the PR owes what its non-inert lines owe;
+- what no loader reads: the symbol tables, the debug information, and the size of a file, which
+  can move where the bootloader and procmgr place later data but no byte a loaded image holds.
+
 A PR whose changes outside Markdown are all inert owes no local host run, whatever purpose it
 states. The surfaces below, and Repeat count, are judged on the non-inert lines only.
 
@@ -965,7 +992,8 @@ coverage of the runs that surface owes, and those runs MUST be run again at a he
 body MUST report each run it owes with its `--runs` count, its outcome, and the head it ran at, or
 state that none is owed and why: that its changes outside Markdown are all inert, or that its
 non-inert lines change none of the CPU-count, memory, and device surfaces and it states no
-concurrency-fix purpose as Repeat count defines it.
+concurrency-fix purpose as Repeat count defines it. A PR whose lines are inert by Identical images
+above quotes the command's verdict line and gives the head it ran at.
 
 **Hangs at oversubscription.** A boundary run the PR does not owe, that is, one whose surface the
 PR's own diff does not change, that HANGs (outlives its `--timeout` budget) or fails with a defect

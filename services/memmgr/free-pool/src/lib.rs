@@ -124,6 +124,21 @@ pub fn chunk_for(region: &DemandRegion, page_base: u64) -> (u64, u32)
     (chunk_base, chunk_pages)
 }
 
+/// The base of the window of `pages` pages a demand fault at `page_base`
+/// backs within the unbacked span `[span_start, span_end)`: the span's start
+/// when `pages` covers the whole span, else the faulting page, moved down only
+/// as far as needed to keep the window inside the span. The window always
+/// holds the faulting page. `page_base` lies in the span, and `pages` is at
+/// least 1 and at most the span's page count.
+#[must_use]
+pub fn fault_window(span_start: u64, span_end: u64, page_base: u64, pages: u32) -> u64
+{
+    let window = u64::from(pages).saturating_mul(PAGE_SIZE);
+    page_base
+        .min(span_end.saturating_sub(window))
+        .max(span_start)
+}
+
 #[cfg(test)]
 mod tests
 {
@@ -194,6 +209,44 @@ mod tests
         // a window misaligned by dividing by PAGE_SIZE instead of chunk_bytes.
         let (base, _) = chunk_for(&region, 0x10000 + chunk_bytes + PAGE_SIZE);
         assert_eq!(base, 0x10000 + chunk_bytes);
+    }
+
+    #[test]
+    fn fault_window_backs_the_whole_span_when_the_run_covers_it()
+    {
+        // A 16-page span backed by 16 pages starts at the span, wherever the
+        // fault fell in it.
+        for page in [0x10000, 0x15000, 0x1F000]
+        {
+            assert_eq!(fault_window(0x10000, 0x20000, page, 16), 0x10000);
+        }
+    }
+
+    #[test]
+    fn fault_window_holds_the_faulting_page_inside_the_span()
+    {
+        let (start, end) = (0x10000, 0x20000);
+        // Room above the page: the window starts at it.
+        assert_eq!(fault_window(start, end, 0x12000, 4), 0x12000);
+        // Near the span's end: the window moves down to end at the span end.
+        assert_eq!(fault_window(start, end, 0x1E000, 4), 0x1C000);
+        // One page: exactly the faulting page.
+        for page in [0x10000, 0x17000, 0x1F000]
+        {
+            assert_eq!(fault_window(start, end, page, 1), page);
+        }
+        // Every window holds the page and stays in the span.
+        for pages in 1..=16u32
+        {
+            for i in 0..16u64
+            {
+                let page = start + i * PAGE_SIZE;
+                let base = fault_window(start, end, page, pages);
+                let w_end = base + u64::from(pages) * PAGE_SIZE;
+                assert!(base >= start && w_end <= end, "{pages} pages at {page:#x}");
+                assert!(base <= page && page < w_end, "{pages} pages at {page:#x}");
+            }
+        }
     }
 
     #[test]

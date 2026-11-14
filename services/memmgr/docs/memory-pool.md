@@ -663,8 +663,8 @@ userspace RAM, is the distributor. The kernel accounts; memmgr decides which cha
 **Budget nodes.** memmgr charges every page it lends to a process to a budget node, a memmgr object
 separate from the process record. A node has a parent link, an optional max in pages, and a charge
 counter for its subtree: the pages charged to the node and to every node below it. A process record
-points at a node; nothing assumes one node per process. The charge covers each grant, demand chunk
-and page-table donation memmgr accounts to the process ([Per-Process
+points at a node; nothing assumes one node per process. The charge covers each grant, demand-fault
+run and page-table donation memmgr accounts to the process ([Per-Process
 Tracking](#per-process-tracking)), and each such run on the deferred list until it rejoins the free
 pool ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
 index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
@@ -674,17 +674,21 @@ process, die, and free its subtree's budget while the frames stay held.
 
 **Charging.** A charge is checked against the max of the node and of every ancestor. A request
 that would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
-system exhaustion, and a demand fault that would is declined with code 10, distinct from code 7, so
-a crash report tells a budget kill from an exhaustion kill. Lowering a max reclaims nothing and
-kills no process: it refuses new charges until the subtree's usage falls below it. A node without
-a max is limited only by its ancestors and the system reserve. No recipe, and nothing else in the
-default image, sets a max, so no default per-process ceiling exists.
+system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
+with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
+least page-table donation its map needs), so a crash report tells a budget kill from an exhaustion
+kill ([Demand faults](#demand-faults)). Lowering a max reclaims nothing and kills no process: it
+refuses new charges until the subtree's usage falls below it. A node without a max is limited only
+by its ancestors and the system reserve. No recipe, and nothing else in the default image, sets a
+max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
-reserve. It is a floor for the core and a limit on no process: memmgr's self-funding, which is
-charged to no node, and the reserve nodes draw on it. Reserve membership is an attribute each node
-takes when it is created, not one its children inherit. The nodes of memmgr's boot records
+reserve, and a demand fault of such a node backs only the free pages above the reserve, declined
+with code 7 when they hold not even the faulting page. It is a floor for the core and a limit on no
+process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
+Reserve membership is an attribute each node takes when it is created, not one its children
+inherit. The nodes of memmgr's boot records
 (procmgr's, and memmgr's and init's own) and of init's children (devmgr, vfsd and svcmgr) are
 reserve nodes, and so is the node of a process created with procmgr's reserve creation flag, which
 procmgr honours only from a reserve creator, as it does `CREATE_PHYS_ACCESS`. A process a reserve

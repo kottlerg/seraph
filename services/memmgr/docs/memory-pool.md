@@ -781,9 +781,11 @@ swapped pages' size, and `QUERY_MEMORY_USAGE` a process's resident and swapped p
 the pager
 ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md#sys_thread_read_mem-60)
 § `SYS_THREAD_READ_MEM`). A debugger or crash service that gets that failure on a page of an
-evicted chunk asks procmgr's debug authority to make the range resident; procmgr has memmgr restore
-each evicted chunk of the range, which counts as an access in the chunk's age, and the reader
-retries. A page no fault has backed stays not present.
+evicted chunk asks procmgr, through the debug authority, to make the range resident; only a holder
+of the debug authority may ask, and memmgr takes the request from procmgr alone. procmgr has
+memmgr restore each evicted chunk of the range, which counts as an access in the chunk's age, and
+the reader retries. The request restores and backs nothing else: a page no fault has backed stays
+not present.
 
 ---
 

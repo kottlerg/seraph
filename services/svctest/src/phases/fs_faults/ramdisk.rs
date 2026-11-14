@@ -7,7 +7,13 @@
 //! just past FAT12's cluster count, formatted at run time and held sparsely,
 //! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
 //! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
-//! sector and attempt.
+//! sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
+//!
+//! The device can also go away: a request carrying [`GONE_BADGE`] revokes
+//! every capability derived from the block endpoint, fatfs's among them, and
+//! stops the server, as a device whose partition capabilities its owner
+//! revoked (services/fs/docs/fs-driver-protocol.md § Loss of the block
+//! device).
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -39,6 +45,8 @@ const MAX_SECTORS_PER_REQUEST: usize = 8;
 
 /// Badge of the phase's stop SEND on the block endpoint.
 pub const STOP_BADGE: u64 = 0x5_70B;
+/// Badge of the phase's SEND that takes the device away.
+pub const GONE_BADGE: u64 = 0x60E;
 
 /// A fault the device applies to one request.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -92,6 +100,9 @@ pub struct RamDisk
 {
     sectors: BTreeMap<usize, Box<[u8; SECTOR]>>,
     rules: Vec<Rule>,
+    /// Every read and write is answered `DEVICE_STATUS_IOERR` and moves no
+    /// sector.
+    failing: bool,
 }
 
 /// The disk the phase and the block server thread share.
@@ -136,6 +147,7 @@ impl RamDisk
         Arc::new(Mutex::new(Self {
             sectors: BTreeMap::from([(0, Box::new(boot)), (FAT_LBA, Box::new(fat))]),
             rules: Vec::new(),
+            failing: false,
         }))
     }
 
@@ -205,6 +217,18 @@ impl RamDisk
         self.rules.clear();
     }
 
+    /// Fail every read and write until [`RamDisk::serve_all`].
+    pub fn fail_all(&mut self)
+    {
+        self.failing = true;
+    }
+
+    /// Serve reads and writes again after [`RamDisk::fail_all`].
+    pub fn serve_all(&mut self)
+    {
+        self.failing = false;
+    }
+
     /// The fault that fires on a request starting at `lba`, counting the
     /// request against every armed rule of its direction there.
     fn take_fault(&mut self, lba: usize, direction: Direction) -> Option<Fault>
@@ -228,8 +252,9 @@ impl RamDisk
 }
 
 /// Serve the block requests fatfs sends on `ep` until a message carrying
-/// [`STOP_BADGE`]. Each request's Memory cap is mapped at a scratch page for
-/// the copy, unmapped, and moved back in the reply.
+/// [`STOP_BADGE`] or [`GONE_BADGE`]; the latter first revokes every
+/// capability derived from `ep`. Each request's Memory cap is mapped at a
+/// scratch page for the copy, unmapped, and moved back in the reply.
 pub fn serve(ep: u64, disk: &SharedDisk)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -242,8 +267,14 @@ pub fn serve(ep: u64, disk: &SharedDisk)
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
         let msg =
             unsafe { ipc::ipc_recv(ep, ipc_buf) }.expect("fs_faults block server: ipc_recv failed");
-        if msg.badge == STOP_BADGE
+        if msg.badge == STOP_BADGE || msg.badge == GONE_BADGE
         {
+            // The revoke precedes the reply, so the device is gone once the
+            // sender's call returns.
+            if msg.badge == GONE_BADGE
+            {
+                syscall::cap_revoke_all(ep).expect("fs_faults block server: revoke of the device");
+            }
             // SAFETY: as above.
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
             return;
@@ -351,6 +382,10 @@ fn transfer(
         return blk_errors::OUT_OF_BOUNDS;
     }
     let mut disk = lock(disk);
+    if disk.failing
+    {
+        return blk_errors::DEVICE_STATUS_IOERR;
+    }
     let fault = disk.take_fault(lba, direction);
     if matches!(fault, Some(Fault::DropWrite | Fault::FailRead))
     {

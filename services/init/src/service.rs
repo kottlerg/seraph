@@ -1247,8 +1247,9 @@ pub struct SvcmgrEndowment
 {
     pub svcmgr_service_ep: u64,
     pub svcmgr_bootstrap_ep: u64,
-    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). svcmgr
-    /// derives the published `rootfs.root` SEND from it.
+    /// Seed system-root cap (`GET_SYSTEM_ROOT_CAP` from vfsd). init derives
+    /// the endowed `rootfs.root` SEND from it in `endow_svcmgr`, and
+    /// svcmgr publishes that SEND as received.
     pub rootfs_root_cap: u64,
     pub devmgr_registry_ep: u64,
     /// vfsd's un-badged service endpoint. init mints the endowed
@@ -1275,10 +1276,11 @@ pub struct SvcmgrEndowment
 ///
 /// The `CAPS` rounds (two rounds for the seven slots) deliver
 /// svcmgr's service + bootstrap endpoints (full
-/// rights) and the publish-role source caps: a `SEND` on the root
-/// filesystem namespace endpoint (svcmgr publishes it as `rootfs.root`) and
-/// a badge-0 `SEND|GRANT` source on devmgr's registry endpoint (svcmgr mints
-/// the `devmgr.registry` / `devmgr.shutdown` / `devmgr.bind` publish caps, the
+/// rights) and the publish-role source caps: a `SEND` on vfsd's synthetic
+/// root derived from the system-root cap (svcmgr publishes it as
+/// `rootfs.root`) and a badge-0 `SEND|GRANT` source on devmgr's registry
+/// endpoint (svcmgr mints the `devmgr.registry` / `devmgr.shutdown` /
+/// `devmgr.bind` publish caps, the
 /// `devmgr.class.*` class SENDs, and the `DRIVERS_DIR_AUTHORITY`
 /// `SET_DRIVERS_DIR` cap from it), plus three SENDs on
 /// vfsd's service endpoint svcmgr publishes seed-only: `MOUNT_AUTHORITY`-badged
@@ -1345,7 +1347,8 @@ fn endow_svcmgr(
         destroy_partial_child(process_handle, ipc_buf);
         return false;
     }
-    // rootfs.root SEND — badge inherited from the root fs namespace cap.
+    // rootfs.root SEND — badge inherited from the system-root cap (vfsd's
+    // synthetic root at full namespace rights).
     let rootfs_send = if endow.rootfs_root_cap != 0
     {
         syscall::cap_derive(endow.rootfs_root_cap, syscall::RIGHTS_EP_SEND).unwrap_or(0)

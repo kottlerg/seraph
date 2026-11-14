@@ -202,9 +202,10 @@ impl KernelObjectHeader
 
     /// Increment the reference count for an owner whose number is bounded
     /// below the headroom above [`REF_COUNT_LIMIT`]: a syscall pin, a binding,
-    /// a mapping record, a boot mint's SEED lease, a chunk's reference on its
-    /// [`ArenaPage`] (at most 31 per page), a kept arena page's lease on its
-    /// donation's Memory object (one per page of that donation), or the lease of a retype that
+    /// a thread's fault redirect (one per thread), a mapping record, a boot
+    /// mint's SEED lease, a chunk's reference on its [`ArenaPage`] (at most 31
+    /// per page), a kept arena page's lease on its donation's Memory object
+    /// (one per page of that donation), or the lease of a retype that
     /// [`crate::cap::retype::retype_allocate`] admitted (see
     /// core/kernel/docs/capability-internals.md § Kernel Object Reference
     /// Counting), or an IPC transfer's move destination, whose message
@@ -5402,6 +5403,26 @@ unsafe fn dealloc_thread(
         // SAFETY: wake_saved_int from save_and_disable_interrupts above.
         unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
         crate::percpu::preempt_enable();
+
+        // Release the endpoint a redirecting fault reply left for a pass
+        // this thread never ran (ThreadControlBlock::fault_redirect). After
+        // the gate above, because such a reply stores it before the wake
+        // that clears wake_in_flight; an orphaned endpoint goes on the
+        // cascade stack, as a binding's does.
+        // SAFETY: tcb valid (not yet freed); the field is atomic.
+        let redirect = unsafe { &(*tcb).fault_redirect }
+            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+        // SAFETY: redirect is non-null in the second operand, and the field's
+        // reference on the endpoint, still held, keeps it live.
+        if !redirect.is_null() && unsafe { (*redirect).header.dec_ref() } == 0
+        {
+            // SAFETY: redirect is non-null.
+            let ep_header =
+                unsafe { core::ptr::NonNull::new_unchecked(redirect.cast::<KernelObjectHeader>()) };
+            // SAFETY: no lock is held here; the field's reference was the
+            // endpoint's last, leaving it unreferenced for the push.
+            unsafe { stack.push(ep_header) };
+        }
 
         // A timer batch that popped this thread keeps its pointer, with no
         // reference, until it finishes: wait it out before the free (its

@@ -178,8 +178,8 @@ pub struct SvcmgrCaps
     /// svcmgr's own bootstrap endpoint (receives bootstrap requests from
     /// restarted children).
     pub bootstrap_ep: u64,
-    /// SEND on the root filesystem's namespace endpoint, published as
-    /// `rootfs.root`. Zero if init could not derive it.
+    /// SEND on vfsd's synthetic root, derived by init from its system-root
+    /// cap, published as `rootfs.root`. Zero if init could not derive it.
     pub rootfs_root: u64,
     /// `SEND|GRANT`, badge-0 source on devmgr's registry endpoint. svcmgr
     /// mints the seed-only `devmgr.registry`, `devmgr.shutdown`, and

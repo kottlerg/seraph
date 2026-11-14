@@ -131,6 +131,34 @@ pub fn log(s: &str)
     }
 }
 
+/// [`log`] of one line made of `parts`, which need not be UTF-8 (a line of a
+/// boot module's text among them) and hold no newline.
+pub fn log_parts(parts: &[&[u8]])
+{
+    // SAFETY: as in `log`.
+    let cap = unsafe { INIT_LOG_SEND };
+    // SAFETY: as in `log`.
+    let ipc_buf = unsafe { MAIN_IPC_BUF };
+
+    if cap != 0 && !ipc_buf.is_null()
+    {
+        for part in parts
+        {
+            ipc_log(cap, ipc_buf, part);
+        }
+        ipc_log(cap, ipc_buf, b"\n");
+    }
+    else
+    {
+        for &b in parts.iter().copied().flatten()
+        {
+            arch::current::serial_write_byte(b);
+        }
+        arch::current::serial_write_byte(b'\r');
+        arch::current::serial_write_byte(b'\n');
+    }
+}
+
 /// Switch the main thread from direct serial to IPC-based logging.
 ///
 /// Must be called exactly once after the log thread has started. `cap` must

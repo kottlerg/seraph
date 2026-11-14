@@ -12,8 +12,10 @@
 //! capability set.
 
 use crate::idle_loop;
+use crate::log_levels::{ArgvEnv, SpawnEnv};
 use crate::logging::log;
 use crate::walk;
+use init_log_levels::Service;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
 
@@ -37,6 +39,31 @@ pub struct ServiceThreadCaps
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// The `CREATE_PROCESS` request for `module` with creator endpoint
+/// `creator`, its label carrying `flags`, and `argv_env` when present
+/// (`CREATE_ARGV_ENV`: the header in data words `0..4`, the cap last).
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the builder and the built `IpcMessage` (568 B each); on init's 16 KiB stack"
+)]
+fn create_process_msg(
+    flags: u64,
+    module: u64,
+    creator: u64,
+    argv_env: Option<&ArgvEnv>,
+) -> IpcMessage
+{
+    let argv_env_flag = argv_env.map_or(0, |_| procmgr_labels::CREATE_ARGV_ENV);
+    let mut builder = IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | argv_env_flag)
+        .cap(module)
+        .cap(creator);
+    if let Some(env) = argv_env
+    {
+        builder = builder.words(0, &env.header).cap(env.cap);
+    }
+    builder.build()
+}
 
 fn derive_badged_creator(bootstrap_ep: u64) -> Option<(u64, u64)>
 {
@@ -401,11 +428,18 @@ fn serve_extent_rounds(
     true
 }
 
-/// The boot modules init starts itself or hands to the service it starts
-/// them through, never forwarded to devmgr: the bootstrap services and the
-/// root filesystem driver.
-const BOOTSTRAP_MODULES: [&[u8]; 6] =
-    [b"init", b"procmgr", b"memmgr", b"devmgr", b"vfsd", b"fatfs"];
+/// The boot modules init uses itself or hands to the service it starts them
+/// through, never forwarded to devmgr: the bootstrap services, the root
+/// filesystem driver, and init's log-level configuration.
+const BOOTSTRAP_MODULES: [&[u8]; 7] = [
+    b"init",
+    b"procmgr",
+    b"memmgr",
+    b"devmgr",
+    b"vfsd",
+    b"fatfs",
+    crate::log_levels::MODULE_NAME,
+];
 
 /// Module caps one `kind::MODULE` round carries (`MSG_CAP_SLOTS_MAX`).
 const MODULES_PER_ROUND: usize = 4;
@@ -623,6 +657,7 @@ pub fn create_devmgr_with_caps(
     bootstrap_ep: u64,
     registry_ep: u64,
     svcmgr_service_ep: u64,
+    spawn_env: &SpawnEnv,
     ipc_buf: *mut u64,
 ) -> Option<u64>
 {
@@ -630,27 +665,34 @@ pub fn create_devmgr_with_caps(
     let devmgr_module_copy = module_spawn_copy(devmgr_memory_cap)?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
+    // SAFETY: `info.aspace_cap` is init's own address space, whose scratch
+    // span at TEMP_MAP_BASE is unmapped once the memmgr bootstrap is done.
+    let argv_env = unsafe { spawn_env.argv_env(Service::Devmgr, info.aspace_cap) };
 
-    // caps: [module, creator]. No stdio pipes — devmgr reaches the
+    // caps: [module, creator, argv_env?]. No stdio pipes — devmgr reaches the
     // system log via the discovery cap procmgr installs in ProcessInfo.
     // Band ceiling deliberately above devmgr's own level so it can place
     // the drivers it spawns at the boot/aux driver levels. Phys-class
     // (`CREATE_PHYS_ACCESS`): devmgr reads the physical bases of the frames
     // it maps for unconfined devices, and spawns the IOMMU driver phys-class
     // (docs/device-management.md § DMA Authorisation).
-    let create_msg = IpcMessage::builder(
-        procmgr_labels::CREATE_PROCESS
-            | procmgr_labels::CREATE_PHYS_ACCESS
+    let create_msg = create_process_msg(
+        procmgr_labels::CREATE_PHYS_ACCESS
             | procmgr_labels::create_sched_bits(
                 ipc::sched_policy::DEVMGR_PRIORITY,
                 ipc::sched_policy::DEVMGR_BAND_MAX,
             ),
-    )
-    .cap(devmgr_module_copy)
-    .cap(badged_creator)
-    .build();
+        devmgr_module_copy,
+        badged_creator,
+        argv_env.as_ref(),
+    );
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
+    let call = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
+    if let Some(env) = argv_env
+    {
+        env.release();
+    }
+    let Ok(reply) = call
     else
     {
         log("devmgr: CREATE_PROCESS ipc_call failed");
@@ -977,16 +1019,12 @@ fn request_block_class(registry_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 }
 
 /// Create vfsd via procmgr and serve its bootstrap.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each), the builder's copy and the \
-              temporaries of the bootstrap rounds' messages (568 B each); on init's 16 KiB stack"
-)]
 pub fn create_vfsd_with_caps(
     info: &InitInfo,
     procmgr_ep: u64,
     bootstrap_ep: u64,
     spawn: &VfsdSpawnCaps,
+    spawn_env: &SpawnEnv,
     ipc_buf: *mut u64,
 ) -> Option<u64>
 {
@@ -994,19 +1032,26 @@ pub fn create_vfsd_with_caps(
     let vfsd_module_copy = module_spawn_copy(vfsd_memory_cap)?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
+    // SAFETY: `info.aspace_cap` is init's own address space, whose scratch
+    // span at TEMP_MAP_BASE is unmapped once the memmgr bootstrap is done.
+    let argv_env = unsafe { spawn_env.argv_env(Service::Vfsd, info.aspace_cap) };
 
-    let create_msg = IpcMessage::builder(
-        procmgr_labels::CREATE_PROCESS
-            | procmgr_labels::create_sched_bits(
-                ipc::sched_policy::VFSD_PRIORITY,
-                ipc::sched_policy::VFSD_PRIORITY,
-            ),
-    )
-    .cap(vfsd_module_copy)
-    .cap(badged_creator)
-    .build();
+    let create_msg = create_process_msg(
+        procmgr_labels::create_sched_bits(
+            ipc::sched_policy::VFSD_PRIORITY,
+            ipc::sched_policy::VFSD_PRIORITY,
+        ),
+        vfsd_module_copy,
+        badged_creator,
+        argv_env.as_ref(),
+    );
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) })
+    let call = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
+    if let Some(env) = argv_env
+    {
+        env.release();
+    }
+    let Ok(reply) = call
     else
     {
         log("vfsd: CREATE_PROCESS ipc_call failed");
@@ -1101,10 +1146,11 @@ pub fn create_vfsd_with_caps(
               16 KiB stack"
 )]
 pub fn create_svcmgr_from_file(
+    info: &InitInfo,
     procmgr_ep: u64,
     bootstrap_ep: u64,
     system_root_cap: u64,
-    init_self_cspace: u64,
+    spawn_env: &SpawnEnv,
     ipc_buf: *mut u64,
 ) -> Option<(u64, u64)>
 {
@@ -1114,21 +1160,38 @@ pub fn create_svcmgr_from_file(
         unsafe { walk::walk_to_file(system_root_cap, b"/services/svcmgr", 0xFFFF, ipc_buf) }?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
+    // SAFETY: `info.aspace_cap` is init's own address space, whose scratch
+    // span at TEMP_MAP_BASE is unmapped once the memmgr bootstrap is done.
+    let argv_env = unsafe { spawn_env.argv_env(Service::Svcmgr, info.aspace_cap) };
 
-    let msg = IpcMessage::builder(
+    // Caps: [file, creator, argv_env?]; the argv/env header rides in data
+    // words 1..5, after the file size.
+    let mut builder = IpcMessage::builder(
         procmgr_labels::CREATE_FROM_FILE
             | procmgr_labels::create_sched_bits(
                 ipc::sched_policy::SVCMGR_PRIORITY,
                 ipc::sched_policy::SVCMGR_PRIORITY,
-            ),
+            )
+            | argv_env
+                .as_ref()
+                .map_or(0, |_| procmgr_labels::CREATE_ARGV_ENV),
     )
     .word(0, walked.size)
     .cap(walked.file_cap)
-    .cap(badged_creator)
-    .build();
+    .cap(badged_creator);
+    if let Some(env) = &argv_env
+    {
+        builder = builder.words(1, &env.header).cap(env.cap);
+    }
+    let msg = builder.build();
 
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let Ok(reply) = (unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) })
+    let call = unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) };
+    if let Some(env) = argv_env
+    {
+        env.release();
+    }
+    let Ok(reply) = call
     else
     {
         log("phase 3: svcmgr CREATE_FROM_FILE ipc_call failed");
@@ -1165,7 +1228,7 @@ pub fn create_svcmgr_from_file(
     if !configure_child_namespace(
         process_handle,
         system_root_cap,
-        init_self_cspace,
+        info.cspace_cap,
         None,
         ipc_buf,
     )
@@ -1490,10 +1553,9 @@ pub fn phase3_svcmgr_handover(
     init_logd_thread_cap: u64,
     mem_reap_floor: u64,
     orphan_memory_caps: &[u64],
+    spawn_env: &SpawnEnv,
 ) -> !
 {
-    let init_self_cspace = info.cspace_cap;
-
     // svcmgr's service endpoint is created in early init
     // (before bootstrap_procmgr) so procmgr can receive an un-badged
     // SEND on it in its bootstrap round and distribute query caps via
@@ -1508,10 +1570,11 @@ pub fn phase3_svcmgr_handover(
 
     log("phase 3: loading svcmgr from /services/svcmgr");
     let Some((svcmgr_handle, svcmgr_badge)) = create_svcmgr_from_file(
+        info,
         procmgr_ep,
         bootstrap_ep,
         system_root_cap,
-        init_self_cspace,
+        spawn_env,
         ipc_buf,
     )
     else
@@ -1597,6 +1660,7 @@ pub fn phase3_svcmgr_handover(
             ipc_buf,
             mem_reap_floor,
             orphan_memory_caps,
+            spawn_env.page(),
         );
     }
 
@@ -1755,10 +1819,11 @@ fn finish_init_reap_handoff(
     ipc_buf: *mut u64,
     mem_reap_floor: u64,
     orphan_memory_caps: &[u64],
+    env_page: Option<u64>,
 )
 {
     // Donate every `owns_memory` Memory cap init solely holds, streamed in
-    // MSG_CAP_SLOTS_MAX-sized rounds. Three disjoint sources:
+    // MSG_CAP_SLOTS_MAX-sized rounds. Four disjoint sources:
     //  - explicit InitInfo ranges (not in the descriptor array): init's ELF
     //    segments, user stack, and the InitInfo region. (init's IPC buffer is
     //    not here: it lives in init's bootstrap arena, forwarded to memmgr at
@@ -1768,6 +1833,8 @@ fn finish_init_reap_handoff(
     //    cap — which carry no named InitInfo slot.
     //  - MemoryAlloc's orphans: free remainders abandoned while carving the
     //    bootstrap arenas, below the floor with no descriptor.
+    //  - the log-level env page (`log_levels::SpawnEnv`), when init allocated
+    //    one: consumed from `MemoryAlloc` but never forwarded.
     // The walk skips caps init does not solely own or that are not RAM: the
     // consumed/forwarded usable-RAM prefix (below `mem_reap_floor` —
     // `MemoryAlloc` arenas and the memory caps `finalize_memmgr` already forwarded;
@@ -1849,6 +1916,20 @@ fn finish_init_reap_handoff(
         for &slot in orphan_memory_caps
         {
             push(slot);
+        }
+        // The page that carried the spawned services' `SERAPH_LOG` entries
+        // (`log_levels::SpawnEnv`): a `MemoryAlloc` page below the floor,
+        // or a split product with no descriptor, so the walk above skips it.
+        // Every create that lent it has returned, and procmgr deleted its
+        // copy before replying. A create refused with `ARGV_ENV_STILL_MAPPED`
+        // may have left it mapped read-only in procmgr's copy window, which
+        // procmgr never reads again. init withholds the page for its own
+        // lifetime, as that reply asks, and it returns to memmgr's pool at
+        // init's end, as a std sender's withheld run does at its death; held
+        // back past the reap it would free into the sealed buddy.
+        if let Some(page) = env_page
+        {
+            push(page);
         }
     }
     if cn > 0

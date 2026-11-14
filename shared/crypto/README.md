@@ -53,12 +53,14 @@ intent; not yet implemented.
   no memory index depends on the key, the keystream, the plaintext, the
   Poly1305 accumulator, or a tag; branches and indices depend on the buffer
   and AAD lengths only. ChaCha20 is additions, exclusive ors and rotations by
-  constants; Poly1305 adds the 64-bit multiply, whose latency is independent
-  of its operands on both targets: the riscv64 platform floor of
+  constants; Poly1305 adds the 64-bit multiply. On riscv64 its latency is
+  architecturally independent of its operands: the platform floor of
   [docs/platform-requirements.md](../../docs/platform-requirements.md) is RVA23
-  silicon, whose mandatory set includes Zkt, which covers `mul` and `mulhu`; on
-  x86-64, Intel lists `MUL` among its data-operand-independent-timing
-  instructions. Two values pass through
+  silicon, whose mandatory set includes Zkt, which covers `mul` and `mulhu`. On
+  x86-64, Intel lists `MUL` among its data-operand-independent-timing (DOIT)
+  instructions, but on its parts that enumerate the DOITM control (Ice Lake and
+  later, inside the platform floor) it guarantees that timing only while DOITM
+  is set, and Seraph does not set it. Two values pass through
   `core::hint::black_box`, so the optimiser cannot rewrite them into a branch:
   the mask that picks the fully reduced Poly1305 result, and the 128-bit
   difference of the two tags, which `open` tests once, after both tags are

@@ -113,8 +113,9 @@ is never removed.
 node's child count skip a node that is not visible, so the name of a
 vacant node, or of a node whose own mount is being removed with no
 mount below it, falls through to the root filesystem as an absent name
-does. Only those two requests fall through: any other request on a
-synthetic node is answered `NotSupported`, so nothing is created on the
+does. Only those two requests fall through: `NS_STAT` on a synthetic
+node is answered locally (§ NS_LOOKUP composition), and any other
+request on one is answered `NotSupported`, so nothing is created on the
 root filesystem through one. The `UNMOUNT` request is the one caller of
 `begin_unmount` (§ Unmount).
 

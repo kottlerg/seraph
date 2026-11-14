@@ -193,8 +193,8 @@ fn main() -> !
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
-    // synthetic root. The service endpoint carries only `MOUNT` and
-    // `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
+    // synthetic root. The service endpoint carries only `MOUNT`, `UNMOUNT`
+    // and `GET_SYSTEM_ROOT_CAP`; the namespace endpoint is separated so
     // a single dispatcher thread can serve every walk without
     // contending with mount-table mutations.
     let Some(namespace_ep) =

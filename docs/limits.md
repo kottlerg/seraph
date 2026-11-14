@@ -624,8 +624,10 @@ Every entry here is `correct as is`; none is tracked.
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
-| `VfsdRootBackend.nodes` | `services/vfsd/root-backend/src/lib.rs` | heap `Vec`, one node per installed path component, never freed (no unmount) | per-instance (grows with the mount tree; an allocation failure refuses the install) | none | correct as is | None |
+| `VfsdRootBackend.nodes` | `services/vfsd/root-backend/src/lib.rs` | heap `Vec`, one node per installed path component, never freed (a removed mount leaves its node vacant for a later install to reuse) | per-instance (grows with the mount tree; an allocation failure refuses the install) | none | correct as is | None |
 | tree node index (`NONE`) | `services/vfsd/root-backend/src/lib.rs` | `u32` | provably unreachable (`install` refuses a pool of `u32::MAX` nodes, each a heap allocation) | 4 B per link | correct as is | None |
+| `TreeNode.live` | `services/vfsd/root-backend/src/lib.rs` | `u32`, the mounted mounts in a node's subtree | provably unreachable (each mount holds a node of its own, and the pool stays below `u32::MAX` nodes) | 4 B per node | correct as is | None |
+| `DEATH_QUEUE_CAPACITY`, `DEATH_QUEUE_OBSERVERS` | `services/vfsd/src/driver.rs` | 2 entries and 2 death-observer nodes per fatfs driver's death queue | provably unreachable (one node per binding, of which a driver has two; one entry reports the death, and a post past the capacity is dropped with the death already queued) | `event_queue_retype_bytes(2, 2)` per mount | correct as is | None |
 | tree component limit (`validate_name`) | `services/vfsd/root-backend/src/lib.rs` | `MAX_NAME_LEN` (255) | ABI width (the namespace protocol's name rule) | none (names are heap-allocated to their length) | correct as is | None |
 | `MAX_MOUNT_PATH_LEN` | `services/vfsd/src/main.rs` | `(MSG_DATA_WORDS_MAX - 2) * 8` = 496 | ABI width (the path bytes one MOUNT message carries) | none | correct as is | None |
 | `discover_disks` disk list | `services/vfsd/src/partition.rs` | heap `Vec`, one `Disk` per block driver devmgr serves, found once at startup | per-instance (devmgr's block-driver count, one per virtio-blk device; an allocation failure stops discovery with a log, keeping the disks found before it) | none | correct as is | None |

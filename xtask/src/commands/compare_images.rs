@@ -182,7 +182,7 @@ fn elf_parts(data: &[u8]) -> Option<Vec<Part>>
     {
         let flags = section.sh_flags(endian);
         let kind = section.sh_type(endian);
-        if !flags.contains(SHF_ALLOC) && kind != SHT_NOTE
+        if flags & u64::from(SHF_ALLOC) == 0 && kind != SHT_NOTE
         {
             continue;
         }

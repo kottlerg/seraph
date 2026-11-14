@@ -53,9 +53,10 @@ no change to the encoding.
 | slot 3 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
 | slot 4 | `vfsd_labels::MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.mount`; absent if its derive fails) |
 | slot 5 | `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.deny`; absent if its derive fails) |
+| slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `10`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `11`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -112,9 +113,10 @@ definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
 endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
-`vfsd.mount`, `vfsd.deny`, `logd.query`) into its own registry, configures devmgr's device
-classes and publishes each as `devmgr.class.<stem>` (the class file's name without `.class`), and
-installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering the event loop.
+`vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`) into its own registry, configures devmgr's
+device classes and publishes each as `devmgr.class.<stem>` (the class file's name without
+`.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering
+the event loop.
 
 ---
 
@@ -205,8 +207,8 @@ freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint. `QUERY_ENDPOINT`
 
 Only public names resolve. A name whose cap carries authority is published
 seed-only and answers `UNKNOWN_NAME`, as an unknown name does: `rootfs.root`,
-the four `devmgr.*` names (`devmgr.bind` included), `vfsd.mount`, `logd.query`, and each
-provider name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today
+the four `devmgr.*` names (`devmgr.bind` included), `vfsd.mount`, `vfsd.swap`, `logd.query`, and
+each provider name whose badge carries a verb bit (`ipc::VERB_BIT_MASK`; the `:auth` entries, today
 `pwrmgr.shutdown`). `vfsd.deny` carries no authority but is seed-only too: it
 is svctest's test twin, reached only through svctest's recipe. A
 seed-only name reaches a process only through a recipe's `seed = ...` line,

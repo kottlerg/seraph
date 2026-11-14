@@ -60,8 +60,11 @@ pub struct Caps
     pub serial_deny_class: u64,
     pub input_deny_class: u64,
     pub framebuffer_deny_class: u64,
+    /// `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint
+    /// (`vfsd.swap`), in slot 14.
+    pub vfsd_swap: u64,
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
-    /// `debug_authority = yes` delivers in slot 14, after the seeds.
+    /// `debug_authority = yes` delivers in slot 15, after the seeds.
     pub debug_authority: u64,
 }
 
@@ -90,7 +93,7 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Fourteen seeds and the debug-authority slot take four rounds; an absent slot decodes as
+    // Fifteen seeds and the debug-authority slot take four rounds; an absent slot decodes as
     // `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
@@ -108,9 +111,10 @@ fn request_round() -> Caps
             serial_deny_class,
             input_deny_class,
             framebuffer_deny_class,
+            vfsd_swap,
             debug_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<15>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<16>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -129,6 +133,7 @@ fn request_round() -> Caps
     caps.serial_deny_class = serial_deny_class;
     caps.input_deny_class = input_deny_class;
     caps.framebuffer_deny_class = framebuffer_deny_class;
+    caps.vfsd_swap = vfsd_swap;
     caps.debug_authority = debug_authority;
 
     caps

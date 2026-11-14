@@ -54,6 +54,8 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //   Handshake-checked at first contact (`data[0]` unless noted):
 //     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
 //     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
+//                             and vfsd_labels::GET_SWAP_PARTITION
+//                             (swap service ↔ vfsd)
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
 //                             and blk_labels::BLK_GET_GEOMETRY
 //                             (vfsd, fatfs ↔ virtio-blk)
@@ -1152,7 +1154,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 10;
+pub const SVCMGR_LABELS_VERSION: u32 = 11;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -1223,8 +1225,8 @@ pub mod svcmgr_labels
     // endowment, not a dedicated label (svcmgr launches logd itself, from
     // its recipe). The `CAPS` rounds carry svcmgr's own endpoints plus the source
     // caps it needs for its publish role (`rootfs.root` SEND,
-    // devmgr-registry `SEND|GRANT` source, `vfsd.mount` and `vfsd.deny`
-    // SENDs) and `SVCMGR_LABELS_VERSION` in
+    // devmgr-registry `SEND|GRANT` source, `vfsd.mount`, `vfsd.deny`, and
+    // `vfsd.swap` SENDs) and `SVCMGR_LABELS_VERSION` in
     // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
     // pair svcmgr parks in its pending-registration table; a final
     // `LOGD_SOURCES` round carries the master-log and procmgr death-auth
@@ -1439,6 +1441,13 @@ pub mod published_names
     /// Seed-only and seeded only by svctest.
     pub const VFSD_DENY: &[u8] = b"vfsd.deny";
 
+    /// SEND on vfsd's service endpoint badged
+    /// `vfsd_labels::SWAP_AUTHORITY` alone: the `GET_SWAP_PARTITION`
+    /// surface. Seed-only; the swap service's recipe is to seed it, and
+    /// svctest's recipe seeds it while no swap service exists, to drive the
+    /// hand-out.
+    pub const VFSD_SWAP: &[u8] = b"vfsd.swap";
+
     /// SEND on the master log endpoint badged
     /// `log_labels::LOG_QUERY_AUTHORITY`: logd's `QUERY_SLOTS` and
     /// `QUERY_HISTORY` surface. svcmgr mints it from its master-log source.
@@ -1635,7 +1644,7 @@ pub mod pwrmgr_errors
 
 /// Wire-protocol version of [`vfsd_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const VFSD_LABELS_VERSION: u32 = 2;
+pub const VFSD_LABELS_VERSION: u32 = 3;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
@@ -1661,6 +1670,20 @@ pub mod vfsd_labels
     /// from which all later namespace-cap distribution flows.
     pub const GET_SYSTEM_ROOT_CAP: u64 = 13;
 
+    /// Hand the caller a cap on the swap partition: a `SEND_GRANT` on the
+    /// block driver of the disk that holds the partition of
+    /// `boot_protocol::role_guids::SERAPH_SWAP` type, badged with that
+    /// partition's range. At most one cap vfsd handed out reaches the
+    /// partition: each hand-out revokes the one before it.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::VFSD_LABELS_VERSION`].
+    /// Reply: `SUCCESS` with `caps[0]` = the partition cap; `UNAUTHORIZED`
+    /// when the caller's badge lacks [`SWAP_AUTHORITY`];
+    /// `LABEL_VERSION_MISMATCH` when `data[0]` differs; `NO_MOUNT` when no
+    /// held disk carries a swap partition or two tie at the highest priority;
+    /// `IO_ERROR` when the registration, the revoke, or the derivation fails.
+    pub const GET_SWAP_PARTITION: u64 = 14;
+
     /// Authority bit in the vfsd-service-endpoint badge. Set on caps
     /// minted for consumers permitted to call
     /// [`GET_SYSTEM_ROOT_CAP`]. Without it the handler replies
@@ -1677,6 +1700,15 @@ pub mod vfsd_labels
     /// The cap is badged, so its holder cannot add [`SEED_AUTHORITY`].
     /// Disjoint position from [`SEED_AUTHORITY`].
     pub const MOUNT_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Authority bit in the vfsd-service-endpoint badge gating
+    /// [`GET_SWAP_PARTITION`]. init mints it, alone, onto a SEND it endows
+    /// svcmgr with; svcmgr publishes that SEND seed-only as
+    /// [`crate::published_names::VFSD_SWAP`], which only the swap service's
+    /// recipe is to seed (svctest's recipe seeds it while no swap service
+    /// exists). The cap is badged, so its holder cannot add another bit.
+    /// Disjoint position from [`MOUNT_AUTHORITY`] and [`SEED_AUTHORITY`].
+    pub const SWAP_AUTHORITY: u64 = 1u64 << 61;
 
     /// The badge init stamps on the no-authority SEND on vfsd's service
     /// endpoint that svcmgr publishes seed-only as
@@ -3551,6 +3583,7 @@ const _: () = core::assert!(
         && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
+        && vfsd_labels::SWAP_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::DENY_BADGE & VERB_BIT_MASK == 0
         && log_labels::LOG_QUERY_AUTHORITY & VERB_BIT_MASK != 0
         && log_badges::LOG_BADGE_INIT & VERB_BIT_MASK == 0

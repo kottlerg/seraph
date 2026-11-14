@@ -571,9 +571,9 @@ pub struct MkdiskArgs
     pub block_size: BlockSize,
 
     /// Author the data partition alone on a second image, `disk-data.img`,
-    /// and only the ESP and root partitions on `disk.img`; boot the pair with
-    /// `--second-disk disk-data.img`. Without it `disk.img` carries all three
-    /// and a `disk-data.img` an earlier authoring left is removed.
+    /// and only the ESP, root and swap partitions on `disk.img`; boot the pair
+    /// with `--second-disk disk-data.img`. Without it `disk.img` carries all
+    /// four and a `disk-data.img` an earlier authoring left is removed.
     #[arg(long)]
     pub split_data: bool,
 }

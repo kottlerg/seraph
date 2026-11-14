@@ -203,8 +203,8 @@ pub struct InstallResult
 
 impl InstallResult
 {
-    /// Pool indices of the intermediates on the path that need a
-    /// fall-through cap, root first.
+    /// Pool indices of the intermediates this install made visible that
+    /// need a fall-through cap, root first.
     #[must_use]
     pub fn as_slice(&self) -> &[u32]
     {

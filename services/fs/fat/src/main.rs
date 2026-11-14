@@ -1339,11 +1339,13 @@ fn resolve_dir_cluster(node_id: NodeId, state: &FatState, nodes: &NodeTable) -> 
 }
 
 /// Common cluster-walk-and-write engine used by `FS_WRITE` and
-/// `FS_WRITE_MEMORY`. Walks the file's cluster chain from `offset`,
-/// allocating new clusters as needed, and writes `data` sector-by-
-/// sector through [`PageCache::write_sector`] (read-modify-write
-/// applies for partial-sector writes). Returns the file's
-/// (possibly-updated) first cluster and its new size.
+/// `FS_WRITE_MEMORY`. Walks the file's cluster chain from `offset`, or
+/// from the file's old size when that is lower, allocating new clusters as
+/// needed, and writes zeros up to `offset`, then `data`, sector by sector
+/// through [`PageCache::write_sector`] (read-modify-write for a sector
+/// holding old bytes of the file the write leaves,
+/// [`fat_parse::sector_write`]). Returns the file's (possibly-updated)
+/// first cluster and its new size.
 ///
 /// The chain is extended only at its end-of-chain marker: a failed FAT
 /// read or a corrupt link is an error, never a place to link a new
@@ -1398,11 +1400,16 @@ fn write_file_bytes(
         return Err(FatError::Corrupt);
     }
 
+    // A write past the file's end writes the gap between the old end and
+    // `offset` as zeros, in the same pass as the payload: the clusters and
+    // sectors it covers may hold an earlier owner's bytes, and every byte
+    // below the new size must read as written or as zero
+    // (services/fs/docs/fs-driver-protocol.md § Label 4: `FS_WRITE`).
+    let start = offset.min(u64::from(file_size));
     let mut cluster = chain_head;
-    let first = state.file_position(offset).ok_or(FatError::Corrupt)?;
+    let first = state.file_position(start).ok_or(FatError::Corrupt)?;
 
-    // Walk to the cluster containing the target offset, allocating
-    // along the way for sparse writes. When we hit EOC, the current
+    // Walk to the cluster holding `start`. When we hit EOC, the current
     // `cluster` is the terminal one — `allocate_cluster(Some(cluster))`
     // links the new cluster after it. (A previous version threaded a
     // separate `prev` that was updated after `cluster`, so on
@@ -1421,8 +1428,8 @@ fn write_file_bytes(
 
     let mut cluster_index = first.cluster_index;
     let mut rest = data;
-    let mut cur_offset = offset;
-    while !rest.is_empty()
+    let mut cur_offset = start;
+    while cur_offset < u64::from(end)
     {
         let pos = state.file_position(cur_offset).ok_or(FatError::Corrupt)?;
         // The previous sector ended its cluster: move on to the next one.
@@ -1438,29 +1445,35 @@ fn write_file_bytes(
         let sector_lba = state
             .cluster_to_sector(cluster)
             .saturating_add(pos.sector_in_cluster);
-        let (chunk, tail) = rest
-            .split_at_checked(pos.left_in_sector)
-            .unwrap_or((rest, &[]));
+        let share = fat_parse::sector_write(
+            &pos,
+            cur_offset,
+            offset,
+            u64::from(end),
+            u64::from(file_size),
+        )
+        .ok_or(FatError::Corrupt)?;
+        let (chunk, tail) = rest.split_at_checked(share.data).unwrap_or((rest, &[]));
 
-        // Read-modify-write the sector unless we are writing the full
-        // sector from offset 0. Heap-allocated to keep the
-        // write-path frame within the default 32 KiB stack envelope
-        // when release LTO inlines the nested helpers
+        // Read-modify-write the sector only when it holds old bytes of the
+        // file the share leaves; any other sector is written from zeros.
+        // Heap-allocated to keep the write-path frame within the default
+        // 32 KiB stack envelope when release LTO inlines the nested helpers
         // (`insert_entry → write_dir_slot → ...`).
         let mut sector_buf = sector_buffer()?;
-        let full_sector_overwrite =
-            pos.offset_in_sector == 0 && chunk.len() == state.sector_bytes();
-        if !full_sector_overwrite
+        if share.read_first
             && !cache.read_sector(u64::from(sector_lba), block_dev, &mut *sector_buf, ipc_buf)
         {
             return Err(FatError::Io);
         }
-        // The chunk ends at or before the sector's end.
-        let dst = state
+        // The share ends at or before the sector's end.
+        let (gap, payload) = state
             .sector_mut(&mut sector_buf)
             .get_mut(pos.offset_in_sector..)
-            .unwrap_or_default();
-        for (d, &b) in dst.iter_mut().zip(chunk)
+            .and_then(|dst| dst.split_at_mut_checked(share.zeros))
+            .ok_or(FatError::Corrupt)?;
+        gap.fill(0);
+        for (d, &b) in payload.iter_mut().zip(chunk)
         {
             *d = b;
         }
@@ -1470,8 +1483,10 @@ fn write_file_bytes(
         }
 
         rest = tail;
-        // Bounded by `end`, a `u32`, so this never saturates.
-        cur_offset = cur_offset.saturating_add(chunk.len() as u64);
+        // Bounded by `end`, a `u32`, so neither step saturates.
+        cur_offset = cur_offset
+            .saturating_add(share.zeros as u64)
+            .saturating_add(chunk.len() as u64);
     }
 
     debug_assert_eq!(cur_offset, u64::from(end));
@@ -1675,7 +1690,7 @@ fn handle_write_memory(
     // per-process arena for this handler alone, which runs only on the
     // dispatch thread; nothing else maps it and no Rust object lies in it.
     let mapped = unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             restricted_cap,
             self_aspace,
             va,
@@ -1931,28 +1946,34 @@ fn create_entry_common(
         NewEntryKind::File => (0u32, NodeKind::File),
         NewEntryKind::Dir =>
         {
-            let new_cluster = match allocate_cluster(state, None, cache, caps.block_dev, ipc_buf)
+            // The cluster is written while the FAT still holds it free and
+            // only then claimed, as a growing directory's is: a failed write
+            // changes no FAT entry, so nothing is left to free, and no
+            // claimed cluster ever holds an earlier owner's bytes
+            // (services/fs/fat/docs/crash-safety.md § Write ordering).
+            let made = alloc::find_free_cluster(state, cache, caps.block_dev, ipc_buf).and_then(
+                |new_cluster| {
+                    write_dot_entries(
+                        state,
+                        new_cluster,
+                        parent_cluster,
+                        cache,
+                        caps.block_dev,
+                        ipc_buf,
+                    )?;
+                    alloc::claim_cluster(state, new_cluster, None, cache, caps.block_dev, ipc_buf)?;
+                    Ok(new_cluster)
+                },
+            );
+            match made
             {
-                Ok(c) => c,
+                Ok(new_cluster) => (new_cluster, NodeKind::Dir),
                 Err(e) =>
                 {
                     reply_err(fat_error_to_wire(e), ipc_buf);
                     return;
                 }
-            };
-            if let Err(e) = write_dot_entries(
-                state,
-                new_cluster,
-                parent_cluster,
-                cache,
-                caps.block_dev,
-                ipc_buf,
-            )
-            {
-                reply_err(fat_error_to_wire(e), ipc_buf);
-                return;
             }
-            (new_cluster, NodeKind::Dir)
         }
     };
 

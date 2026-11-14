@@ -383,7 +383,8 @@ pub fn grant_retyped_unmappable_phase(_: &Caps)
     {
         // SAFETY: `range` is a fresh page reservation from the per-process
         // arena, owned here: VA no Rust object or IPC page occupies.
-        let mapped = unsafe { syscall::mem_map(grant, info.self_aspace, va, 0, 1, prot) };
+        let mapped =
+            unsafe { std::os::seraph::mem_map_funded(grant, info.self_aspace, va, 0, 1, prot) };
         if mapped.is_ok()
         {
             // SAFETY: as for the map above.
@@ -986,8 +987,10 @@ pub fn frame_reclaim_mapped_release_phase(_: &Caps)
     let va = range.va_start();
     // SAFETY: `range` is a fresh page reservation from the per-process arena,
     // owned here: VA no Rust object or IPC page occupies.
-    unsafe { syscall::mem_map(grant, info.self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE) }
-        .expect("frame_reclaim_mapped_release: mem_map of the grant failed");
+    unsafe {
+        std::os::seraph::mem_map_funded(grant, info.self_aspace, va, 0, 1, MAP_READ | MAP_WRITABLE)
+    }
+    .expect("frame_reclaim_mapped_release: mem_map of the grant failed");
 
     let baseline = settled_deferred_bytes();
     let release = ipc::IpcMessage::builder(ipc::memmgr_labels::RELEASE_MEMORY_CAPS)
@@ -1104,8 +1107,10 @@ fn assert_draws_avoid(held: u64, draws: &[(u64, u64)], what: &str)
     {
         // SAFETY: `range` is a fresh page reservation from the per-process
         // arena, owned here: VA no Rust object or IPC page occupies.
-        unsafe { syscall::mem_map(cap, info.self_aspace, va, 0, 1, syscall::MAP_READ) }
-            .expect("assert_draws_avoid: mem_map of a draw failed");
+        unsafe {
+            std::os::seraph::mem_map_funded(cap, info.self_aspace, va, 0, 1, syscall::MAP_READ)
+        }
+        .expect("assert_draws_avoid: mem_map of a draw failed");
         let during = syscall::cap_info_memory_mappings(held, 0, 1)
             .expect("assert_draws_avoid: held mappings");
         // SAFETY: `va` is the page mapped just above, in this process's own
@@ -1155,7 +1160,7 @@ pub fn phys_base_withheld_phase(_: &Caps)
     // SAFETY: `range` is a fresh page reservation from the per-process arena,
     // owned here: VA no Rust object or IPC page occupies.
     unsafe {
-        syscall::mem_map(
+        std::os::seraph::mem_map_funded(
             grant,
             info.self_aspace,
             va,

@@ -155,8 +155,13 @@ the process via the page-reservation allocator inside `std::sys::seraph`.
   `std::os::seraph::reserve_pages(n) → Result<ReservedRange, ReserveError>`
   returns a contiguous unmapped VA range of `n` pages.
   `unreserve_pages(range)` releases it. The caller maps owned Memory
-  caps into the reservation with `mem_map`. The caller is responsible
-  for `mem_unmap` before `unreserve_pages`.
+  caps into the reservation with `std::os::seraph::mem_map_funded`, and
+  an `Mmio` cap with `std::os::seraph::mmio_map_funded`, which top up the
+  page-table pool and map again while the map fails with `OutOfMemory`
+  ([runtime/ruststd/README.md](../runtime/ruststd/README.md) § Page
+  reservations). The caller is responsible for `mem_unmap` before
+  `unreserve_pages`, after a failed map too, since a map refused part-way
+  can leave the pages before the failing one mapped.
 - **Arena.** Each process carves its arena out of its own address space
   on first use, in the arena zone sized to its user half
   ([Growth Zones](#growth-zones)). The arena base is drawn per process

@@ -64,7 +64,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
-use std::os::seraph::reserve_pages;
+use std::os::seraph::{mem_map_funded, reserve_pages};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
@@ -205,7 +205,7 @@ pub enum InitError
     Reserve,
     /// The fs process's `CSpace` could not be funded for the cache's caps.
     CSpace,
-    /// `mem_map` failed for one of the slot memory caps.
+    /// The scratch page could not be mapped.
     Map,
     /// The heap could not hold the slot table.
     Heap,
@@ -298,7 +298,7 @@ impl PageCache
         let scratch_cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
         // SAFETY: scratch_va is a fresh page reservation from the per-process
         // arena, owned by the cache: VA no Rust object or IPC page occupies.
-        unsafe { syscall::mem_map(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE) }
+        unsafe { mem_map_funded(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE) }
             .map_err(|_| InitError::Map)?;
         SCRATCH_MEMORY
             .set(ScratchMemory {
@@ -419,7 +419,7 @@ impl PageCache
         // SAFETY: slot.va is a page of the slot-ceiling-page window reserved
         // at init from the per-process arena and owned by the cache, and no
         // page is mapped there yet: VA no Rust object or IPC page occupies.
-        if unsafe { syscall::mem_map(cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_err()
+        if unsafe { mem_map_funded(cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_err()
         {
             let _ = syscall::cap_delete(cap);
             return None;
@@ -843,13 +843,13 @@ impl PageCache
             return Swap::Restored;
         }
         // SAFETY: as above; the VA was just unmapped.
-        if unsafe { syscall::mem_map(fresh, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
+        if unsafe { mem_map_funded(fresh, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
         {
             slot.memory_cap.store(fresh, Ordering::Release);
             return Swap::Done;
         }
         // SAFETY: as above; restores the page the slot had.
-        if unsafe { syscall::mem_map(old, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
+        if unsafe { mem_map_funded(old, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
         {
             return Swap::Restored;
         }

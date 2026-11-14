@@ -27,10 +27,10 @@ devmgr's responsibilities are:
   derives per-device interrupt lines from PCI configuration space; resolving
   interrupt routing and power domains from firmware tables is design intent;
   not yet implemented.
-- **Enumerate PCI devices** — for each ECAM window, reserve VA, fund the AS's
-  page-table growth budget via `fund_aspace_pt_budget`, then map the window
-  via `mmio_map`, read configuration space, discover every function and its
-  BARs, resolve interrupt assignments. See
+- **Enumerate PCI devices** — for each ECAM window, reserve VA, map the
+  window via `std::os::seraph::mmio_map_funded`, which funds the AS's
+  page-table growth budget the map needs, read configuration space, discover
+  every function and its BARs, resolve interrupt assignments. See
   [`docs/pci-enumeration.md`](pci-enumeration.md).
 - **Bind drivers** — match discovered devices to driver binaries in
   [`drivers/`](../../drivers/README.md) by the declaration each binary

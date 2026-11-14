@@ -706,9 +706,9 @@ const STD_WORKSPACE_DEPS: [(&str, &str, Option<&str>); 14] = [
         Some("ruststd-heap-fit"),
     ),
     (
-        "pt-funding",
-        "runtime/ruststd/pt-funding",
-        Some("ruststd-pt-funding"),
+        "pool-funding",
+        "runtime/ruststd/pool-funding",
+        Some("ruststd-pool-funding"),
     ),
     (
         "spin-wait",

@@ -15,7 +15,7 @@
 //! `IER = 0`), so RX raises the APLIC source the driver routes to its client.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use std::os::seraph::{fund_aspace_pt_budget, reserve_pages};
+use std::os::seraph::{mmio_map_funded, reserve_pages};
 
 use driver_binding::resources::Resource;
 use syscall_abi::PAGE_SIZE;
@@ -70,18 +70,15 @@ pub unsafe fn serial_init(_self_thread: u64, self_aspace: u64, registers: &Resou
         return false;
     };
     let base_va = range.va_start();
-    if !fund_aspace_pt_budget(self_aspace, 1)
-    {
-        return false;
-    }
     // SAFETY: `range` is a fresh one-page reservation from the per-process
     // arena, owned for the process's lifetime, and the caller's contract
     // bounds the region to one page, so the whole-region mapping stays
     // inside it: VA no Rust object or IPC page occupies.
     // This module's UART accessors reach the mapping only through raw
     // volatile loads and stores, never a reference, and the reservation
-    // stays held for the process's lifetime (`mmio_map` § Safety).
-    if unsafe { syscall::mmio_map(self_aspace, mmio_cap, base_va, 0) }.is_err()
+    // stays held for the process's lifetime (`mmio_map` § Safety), mapped
+    // or not.
+    if unsafe { mmio_map_funded(self_aspace, mmio_cap, base_va, 1) }.is_err()
     {
         return false;
     }

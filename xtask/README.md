@@ -252,11 +252,12 @@ uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID D
 The images' logical block size, the unit of their GPT LBAs and the sector
 size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
-author the partitions above; `build`, `compose-bundle`, `test-kaslr`, and
-`test-map-redo` author them at 512 bytes on a single image, so a 4Kn or split boot runs
-`mkdisk` after them. `run --debug-target`, `run-parallel --debug-target`, and `test-gdb` repack
-the images in the layout they find: `disk.img`'s block size, and the data partition on
-`disk-data.img` when that image is there.
+author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
+image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
+`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, and `test-map-redo`
+repack the images in the layout they find: `disk.img`'s block size, and the data partition on
+`disk-data.img` when that image is there. Their boots attach `disk.img` alone unless the command
+takes `--second-disk`.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
@@ -732,9 +733,10 @@ Verify KASLR (#252) on either arch. Boots the ktest bundle headless twice with
 KASLR enabled, scrapes the kernel's serial-only
 `kaslr: slide=… image_base=… dm_base=…` line, and asserts the joint
 `(slide, dm_base)` differs between boots (joint compare + one retry bounds a
-false failure at ~1e-8). Then stages the `nokaslr` knob, repacks `disk.img`,
-boots once, and asserts the deterministic layout (slide 0, image at link base,
-direct map at the mode floor) — always restoring the KASLR-enabled image.
+false failure at ~1e-8). Then stages the `nokaslr` knob, repacks the disk
+images in the layout they have, boots once, and asserts the deterministic layout
+(slide 0, image at link base, direct map at the mode floor) — always restoring
+the KASLR-enabled images in that layout.
 
 A pure runner; requires the ktest bundle composed:
 
@@ -786,11 +788,11 @@ passes the command. The model is in
 
 Check that a boot whose bootloader redoes its steps 6 and 7 completes, on either arch. Stages the
 `\EFI\seraph\mapredo` test knob, which makes the first attempt of the bootloader's steps 6 and 7
-redo whatever its memory map's size
-([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array),
-repacks `disk.img`, boots the current sysroot once, and always removes the knob and repacks again
-afterwards. It passes when the boot reaches its pass marker and its log holds the bootloader's
-line `boot: memory map: mapredo knob present; redoing steps 6 and 7` exactly once.
+redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md)
+§ Sizing the Entry Array), repacks the disk images in the layout they have, boots the current
+sysroot once, and always removes the knob and repacks again in that layout afterwards. It passes
+when the boot reaches its pass marker and its log holds the bootloader's line `boot: memory map:
+mapredo knob present; redoing steps 6 and 7` exactly once.
 
 A pure runner; requires a harness staged (CI runs it on the ktest bundle), and `--test-devices`
 when that harness is svctest, whose devmgr phases drive the test devices (as for `run`):
@@ -816,15 +818,15 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
-([services/debug-echo/README.md](../services/debug-echo/README.md)) from
-`config/svcmgr/tests/` into `config/svcmgr/services/`, repacks `disk.img`, boots the current
+([services/debug-echo/README.md](../services/debug-echo/README.md)) from `config/svcmgr/tests/` into
+`config/svcmgr/services/`, repacks the disk images in the layout they have, boots the current
 sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
 the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
 port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
 `shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)). It then kills QEMU,
-removes the recipe, and repacks `disk.img` again, whatever the outcome. It passes when every
-answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug port
-(`test-debug-port`) lists the exchange.
+removes the recipe, and repacks the images in that layout again, whatever the outcome. It passes
+when every answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug
+port (`test-debug-port`) lists the exchange.
 
 A pure runner; requires a populated sysroot:
 

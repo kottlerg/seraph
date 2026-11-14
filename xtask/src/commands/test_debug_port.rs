@@ -6,13 +6,13 @@
 //! Debug-port transport test: GDB remote serial protocol packets reach a
 //! guest service over the debug port and its answers come back.
 //!
-//! Stages the `debug-echo` fixture's recipe into the boot set, repacks
-//! `disk.img`, and boots the current sysroot once with the debug port
+//! Stages the `debug-echo` fixture's recipe into the boot set, repacks the
+//! disk images in the layout they have, and boots the current sysroot once with the debug port
 //! attached (a `virtio-console` device whose host end QEMU serves on a TCP
 //! port). Once the fixture logs [`READY_MARKER`] on the serial stream, the
 //! host connects and drives one exchange ([`exchange`]), framing and checking
 //! every packet with the same `gdb-rsp` crate the fixture links. The fixture's
-//! recipe is always removed and `disk.img` repacked afterwards. The verdict
+//! recipe is always removed and the images repacked in that layout afterwards. The verdict
 //! is computed here and the host kills QEMU, as `test-terminal` does.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build`.
@@ -69,24 +69,22 @@ pub fn run(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
         .join("svcmgr")
         .join("tests")
         .join(RECIPE);
+    // Read before staging, so a failed staging repack cannot change the
+    // layout the restore writes.
+    let layout = crate::disk::current_layout(ctx)?;
     std::fs::copy(&source, &staged)
         .with_context(|| format!("staging {} as {}", source.display(), staged.display()))?;
-    let booted = repack(ctx, args.arch).and_then(|()| boot(ctx, args));
+    let booted =
+        crate::disk::create_disk_image(ctx, args.arch, layout).and_then(|()| boot(ctx, args));
     // Restore first, and surface its failure ahead of the boot's: a recipe
     // left staged would start the fixture on every later boot.
     std::fs::remove_file(&staged)
         .with_context(|| format!("removing {}", staged.display()))
-        .and_then(|()| repack(ctx, args.arch))
-        .context("restoring disk.img without the fixture")?;
+        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
+        .context("restoring the disk images without the fixture")?;
     booted?;
     step("debug port test: PASS (packets reached the fixture and its answers came back)");
     Ok(())
-}
-
-/// Repack `disk.img` from the sysroot as it stands (`mkdisk --repack-only`).
-fn repack(ctx: &Context, arch: Arch) -> Result<()>
-{
-    crate::disk::create_disk_image(ctx, arch, crate::disk::DiskLayout::default())
 }
 
 /// Boot with the debug port, wait for the fixture, drive the exchange, and

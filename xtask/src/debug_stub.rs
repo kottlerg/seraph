@@ -20,7 +20,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::context::Context;
-use crate::disk::{BlockSize, DataPlacement, DiskLayout};
+use crate::disk::DiskLayout;
 
 /// The stub's recipe file name, in the template directory and once staged.
 const RECIPE: &str = "gdbstub.svc";
@@ -74,40 +74,12 @@ fn recipe_for(template: &str, target: &str) -> Result<String>
     Ok(lines.join("\n") + "\n")
 }
 
-/// The layout the disk images have now: `disk.img`'s block size, and the
-/// data partition on `disk-data.img` when that image is there.
-fn current_layout(ctx: &Context) -> Result<DiskLayout>
-{
-    let block_size = layout_block_size(crate::disk::logical_block_size(&ctx.disk_image())?)?;
-    let data = if ctx.data_disk_image().is_file()
-    {
-        DataPlacement::SecondImage
-    }
-    else
-    {
-        DataPlacement::MainImage
-    };
-    Ok(DiskLayout { block_size, data })
-}
-
-/// The [`BlockSize`] of an image whose GPT is laid out in `bytes`-byte
-/// blocks.
-fn layout_block_size(bytes: u32) -> Result<BlockSize>
-{
-    match bytes
-    {
-        512 => Ok(BlockSize::B512),
-        4096 => Ok(BlockSize::B4096),
-        other => bail!("disk.img has {other}-byte blocks, which mkdisk does not author"),
-    }
-}
-
 /// Stage the stub for `target` and repack the disk images in the layout
 /// they have; returns that layout, for [`unstage`]. A failed repack removes
 /// the staged recipe again and leaves the images to a rebuild.
 pub fn stage(ctx: &Context, arch: Arch, target: &str) -> Result<DiskLayout>
 {
-    let layout = current_layout(ctx)?;
+    let layout = crate::disk::current_layout(ctx)?;
     let template_path = template(ctx);
     let text = std::fs::read_to_string(&template_path)
         .with_context(|| format!("reading {}", template_path.display()))?;
@@ -220,15 +192,6 @@ mod tests
         // A name procmgr would truncate can never match.
         recipe_for(template, &"n".repeat(NAME_MAX)).unwrap();
         recipe_for(template, &"n".repeat(NAME_MAX + 1)).unwrap_err();
-    }
-
-    // Defect caught: staging repacked a 4Kn image at 512-byte blocks.
-    #[test]
-    fn the_staged_layout_keeps_the_image_s_block_size()
-    {
-        assert_eq!(layout_block_size(512).unwrap(), BlockSize::B512);
-        assert_eq!(layout_block_size(4096).unwrap(), BlockSize::B4096);
-        layout_block_size(8192).unwrap_err();
     }
 
     #[test]

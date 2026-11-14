@@ -12,8 +12,9 @@
 //! (`core/boot/docs/memory-map.md` § Sizing the Entry Array), which QEMU's
 //! firmware never makes it do. The `\EFI\seraph\mapredo` test knob makes the
 //! first attempt redo whatever its map's size. This command stages the knob,
-//! repacks `disk.img`, boots the current sysroot once through `run-parallel`,
-//! and always removes the knob and repacks again afterwards. It passes when
+//! repacks the disk images in the layout they have, boots the current sysroot
+//! once through `run-parallel`, and always removes the knob and repacks again
+//! in that layout afterwards. It passes when
 //! the boot reaches its harness's pass marker and its log holds the
 //! bootloader's knob line [`KNOB_LINE`] exactly once. A boot whose
 //! `run-parallel` outcome is a `QEMU-CRASH` is skipped, not failed, as
@@ -89,17 +90,18 @@ pub fn run(ctx: &Context, args: &TestMapRedoArgs) -> Result<()>
         {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", log.display())),
     }
+    // The layout is read before staging, so a failed staging repack cannot
+    // change the one the restore writes.
+    let layout = crate::disk::current_layout(ctx)?;
     stage_knob(ctx, Knob::MapRedo).context("staging the mapredo knob")?;
-    let booted = crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
-        .context("repacking disk.img with the mapredo knob")
+    let booted = crate::disk::create_disk_image(ctx, args.arch, layout)
+        .context("repacking the disk images with the mapredo knob")
         .and_then(|()| boot(ctx, args, &dir));
     // Restore first, and surface its failure ahead of the boot's: a knob left
     // staged would redo steps 6 and 7 on every later boot of this sysroot.
     remove_knob(ctx, Knob::MapRedo)
-        .and_then(|()| {
-            crate::disk::create_disk_image(ctx, args.arch, crate::disk::DiskLayout::default())
-        })
-        .context("removing the mapredo knob and repacking disk.img")?;
+        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
+        .context("removing the mapredo knob and repacking the disk images")?;
     booted?;
     step(&format!("map redo test: reading {}", log.display()));
     let bytes = std::fs::read(&log).with_context(|| format!("reading {}", log.display()))?;

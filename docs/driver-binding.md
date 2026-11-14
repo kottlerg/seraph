@@ -16,14 +16,10 @@ every boot module outside its bootstrap set to devmgr untagged; devmgr reads the
 the boot modules and of the drivers-directory entries, within § Declaration Bounds; it
 enumerates every kind of device record of § Device Records (PCI, the ACPI namespace, the SPCR,
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
-against the records (§ Matching), binds each matched PCI and platform record through one path
-that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. The rest is design intent; not yet implemented:
-
-- the IOMMU driver's delivery: devmgr binds it by its family record but gives it its own
-  bootstrap rounds rather than the resource list
-  ([#938](https://github.com/kottlerg/seraph/issues/938));
-- the hotplug event path (§ Hotplug, [#939](https://github.com/kottlerg/seraph/issues/939)).
+against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
+path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
+§ Binding gives. The hotplug event path is design intent, not yet implemented (§ Hotplug,
+[#939](https://github.com/kottlerg/seraph/issues/939)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -238,14 +234,16 @@ later pass binds the driver only to the devices its limit leaves.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
-serves every unit of its family. It is spawned with its own IOMMU bootstrap rounds
-(`iommu_core::bootstrap`), not the resource list. Its binding keeps what
+serves every unit of its family. Its resource list is one group per unit (§ Binding): the
+unit's round, carrying its PCI segment and its scope, then the unit's register `Mmio` range,
+and its fault interrupt when devmgr gives it one. Its binding keeps what
 [device-management.md](device-management.md#iommu-discovery-and-programming) § IOMMU Discovery
 and Programming specifies:
 
 - it is bound in a pass and settle batch of its own, before the boot pass over every other
   boot-module driver;
-- every unit's register `Mmio` capability moves to it, and devmgr keeps no copy;
+- every unit's register `Mmio` capability is delivered to it, and devmgr deletes its own once
+  the spawn returns, keeping no copy;
 - it is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and `CREATE_PHYS_ACCESS` at the boot tier,
   from its declaration's DMA and physical-access fields;
 - it is given no DMA capability;
@@ -278,8 +276,10 @@ at `BIND_DRIVERS`, and for a hot-added device:
    within § Declaration Bounds, from its boot module or its file.
 5. Deliver the capabilities over the bootstrap protocol as a self-describing resource list:
    each capability with its resource kind and its fields, then the service endpoint, the
-   devmgr query capability, and the DMA capability. One delivery shape serves every driver
-   that binds to a PCI or platform record; the IOMMU driver takes its own bootstrap rounds.
+   devmgr query capability, and the DMA capability. One delivery shape serves every driver.
+   The IOMMU record's list also carries one unit round before each unit's resources, naming
+   the unit's segment and scope; a driver bound to any other record refuses a list that
+   carries one (`driver_binding::resources`).
 6. Record the driver in the pass's settle batch; the settle, the serving of ready drivers, and
    the withdrawal of the rest are unchanged
    ([responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)

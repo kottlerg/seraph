@@ -629,10 +629,11 @@ RISC-V IOMMU driver (see
 
 ## Relationship to drivers
 
-devmgr is the sole authority for spawning device drivers; supervising (restarting) them
-is design intent; not yet implemented (#17, #262). After discovering a device, devmgr
-requests procmgr to create the driver process and then delegates the per-device
-capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
+devmgr is the sole authority for spawning device drivers. It observes every driver's death and
+withdraws the driver; restarting one is design intent; not yet implemented (#1077; the
+supervision hierarchy is in [docs/supervision.md](../../../docs/supervision.md)). After
+discovering a device, devmgr requests procmgr to create the driver process and then delegates
+the per-device capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [`drivers/README.md`](../../drivers/README.md) for the driver model.
 
 ---
@@ -641,7 +642,8 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 
 [Device Tree Parsing](../../../core/boot/docs/dtb.md),
 [Capability Model](../../../docs/capability-model.md),
-[Device Management](../../../docs/device-management.md), [services/devmgr/README.md](../README.md),
+[Device Management](../../../docs/device-management.md),
+[Supervision](../../../docs/supervision.md), [services/devmgr/README.md](../README.md),
 [services/drivers/README.md](../../drivers/README.md),
 [services/drivers/cmos/README.md](../../drivers/cmos/README.md),
 [Driver Model](../../drivers/docs/driver-model.md),
@@ -656,5 +658,4 @@ capability set via IPC. Drivers MUST NOT be started independently of devmgr. See
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
-[services/pwrmgr/README.md](../../pwrmgr/README.md),
-[Restart Protocol](../../svcmgr/docs/restart-protocol.md)
+[services/pwrmgr/README.md](../../pwrmgr/README.md)

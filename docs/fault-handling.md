@@ -895,6 +895,7 @@ svcmgr service definitions carry no paging key; see
 [core/ktest/README.md](../core/ktest/README.md),
 [Capability Model](capability-model.md), [IPC Design](ipc-design.md),
 [Platform Requirements](platform-requirements.md), [Process Lifecycle](process-lifecycle.md),
+[Supervision](supervision.md),
 [Testing](testing.md), [Userspace Memory Model](userspace-memory-model.md),
 [programs/deadline/README.md](../programs/deadline/README.md),
 [programs/debugger/README.md](../programs/debugger/README.md),

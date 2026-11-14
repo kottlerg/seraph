@@ -3,8 +3,8 @@
 # Autostarts on a normal boot. Relays the virtio-input keyboard to a child's
 # stdin and the child's stdout to the framebuffer + serial TX, with a minimal
 # line discipline (local echo, single-line backspace, CR->LF). Persistent and
-# non-bootstrap: critical = no, restart = never (svcmgr supervises it but does
-# not auto-restart it; a post-login session model owns terminal lifecycle in a
+# non-bootstrap: critical = no, restart = never (svcmgr launches it one-shot and
+# does not supervise it; a post-login session model owns terminal lifecycle in a
 # later release). It is never in the ESP bundle and init never loads it.
 #
 # argv[1] is the child binary the terminal spawns: /programs/shell (#112).

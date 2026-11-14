@@ -236,15 +236,11 @@ history-pull SEND aside.
 
 ## Supervision hierarchy
 
-svcmgr only supervises top-level services. devmgr spawns drivers (serial /
-framebuffer / virtio-blk / virtio-input / cmos / goldfish-rtc / future net; per
-[devmgr responsibilities](../../devmgr/docs/responsibilities.md#relationship-to-drivers)),
-and vfsd spawns filesystem drivers (fatfs / future ext / btrfs); neither observes
-a child's death or restarts it (per
-[storage.md](../../../docs/storage.md#failure-and-revocation-invariants)).
-Supervision of those children by devmgr and vfsd is design intent; not yet
-implemented (#17, #262). None of those flow through the handover
-endowment.
+The supervision hierarchy, the core set, and the restart shapes are specified in
+[Supervision](../../../docs/supervision.md); this section states svcmgr's part of them. svcmgr
+supervises top-level services only. The drivers devmgr spawns and the filesystem drivers vfsd
+spawns are not in its table, and none of them flows through the handover endowment
+([Supervision § Supervision Hierarchy](../../../docs/supervision.md#supervision-hierarchy)).
 
 The table below lists the services svcmgr currently binds or launches
 (per the shipped and staged `.svc` files). A `restart = never` service
@@ -256,7 +252,9 @@ svcmgr binds no death notification for it and records no `ServiceEntry`
 live in `/config/svcmgr/tests/` (svcmgr does not scan it) and are staged
 into `/config/svcmgr/services/` only for test boots — `crasher` is
 co-staged with `svctest` (per [testing.md](../../../docs/testing.md#gating)).
-The rest ship in `/config/svcmgr/services/` and load on every boot, except
+Every other recipe in `/config/svcmgr/tests/` is `restart = never`,
+`critical = no`, staged only by the test command that uses it. The rest
+ship in `/config/svcmgr/services/` and load on every boot, except
 that the functional harness boots drop `terminal` (per
 [testing.md](../../../docs/testing.md#one-shutdown-invoking-harness-per-boot)
 § One shutdown-invoking harness per boot, Test isolation).
@@ -273,19 +271,17 @@ that the functional harness boots drop `terminal` (per
 | `logd` | svcmgr-launched (log sink) | `on_failure` | `yes` |
 | `timed` | svcmgr-launched (provider) | `on_failure` | `no` |
 | `pwrmgr` | svcmgr-launched (provider) | `on_failure` | `no` |
+| `crashd` | svcmgr-launched | `on_failure` | `no` |
 | `terminal` | svcmgr-launched | `never` | `no` |
 
-Restart paths for the init-endowed (bind-only) substrate set are
-aspirational today: each was spawned with arch-/firmware-authority caps
-that init holds and svcmgr cannot re-mint (memmgr/procmgr via raw
-`cap_create_*` syscalls; devmgr/vfsd with one-shot authority handover;
-per [init bootstrap](../../init/docs/bootstrap.md)). When their `.svc`
-`restart` value moves off `never` in the future, the spawn path needs to
-gain access to those caps — either via a new init→svcmgr handover round,
-or by relocating the spawn entirely into svcmgr.
+memmgr and procmgr are in the core set and never restart; devmgr and vfsd
+are not, but no restart of either is designed. svcmgr holds none of the
+authority init created them with, so it could not respawn any of the four
+([Supervision § Restart Authority](../../../docs/supervision.md#restart-authority)).
 
-`timed`, `pwrmgr`, and `logd` are *not* in that set: they are
-svcmgr-launched. `timed` and `pwrmgr` are genuinely restartable: they hold no
+`timed`, `pwrmgr`, and `logd` restart on a persistent endpoint
+([Supervision § Restart Shapes](../../../docs/supervision.md#restart-shapes)).
+`timed` and `pwrmgr` hold no
 unique source cap — each re-acquires its authority on (re)start by
 querying devmgr (`QUERY_DEVICE` on the rtc class SEND for timed, per
 [timed/README.md](../../timed/README.md); `QUERY_ACPI_TABLE` +
@@ -305,16 +301,9 @@ expires (the first after `LOG_CALL_TIMEOUT_MS`, the rest after
 `LOG_CALL_UNANSWERED_TIMEOUT_MS`, per [shared/log](../../../shared/log/README.md)),
 so the respawn is delayed, not prevented.
 
----
-
-## procmgr Fallback
-
-If procmgr itself crashes, svcmgr cannot use procmgr IPC to restart it.
-A raw-syscall fallback that recreates procmgr is design intent; not yet
-implemented (#26); svcmgr holds no process-creation capabilities today.
-procmgr is `critical = yes`, so its death falls into the graceful-shutdown
-path (per
-[process-lifecycle.md](../../../docs/process-lifecycle.md#procmgr-restart-fallback)).
+svcmgr's own death is not routed here: svcmgr is in the core set, and
+pwrmgr observing it is design intent; not yet implemented (#262)
+([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)).
 
 ---
 
@@ -322,10 +311,10 @@ path (per
 
 [Console Model](../../../docs/console-model.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Supervision](../../../docs/supervision.md),
 [services/crasher/README.md](../../crasher/README.md),
 [services/logd/README.md](../../logd/README.md),
 [logd handover protocol](../../logd/docs/handover-protocol.md),
 [logd IPC interface](../../logd/docs/ipc-interface.md),
-[services/procmgr/README.md](../../procmgr/README.md),
 [services/pwrmgr/README.md](../../pwrmgr/README.md), [services/svcmgr/README.md](../README.md),
 [svcmgr IPC Interface](ipc-interface.md), [`.svc` Service Definitions](service-definitions.md)

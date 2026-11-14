@@ -22,10 +22,12 @@ is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` ne
 `GRANT`; a seed is `SEND` except `devmgr.bind`, which is `SEND|GRANT`. The
 endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
 
-A raw-syscall fallback that lets svcmgr recreate procmgr if procmgr
-itself crashes is design intent; not yet implemented (#26); svcmgr holds no
-process-creation capabilities today
-([docs/restart-protocol.md](docs/restart-protocol.md) § procmgr Fallback).
+svcmgr supervises the top-level services and is itself in the core set with
+memmgr and procmgr: none of the three restarts, and the death of memmgr or
+procmgr powers the system off. Powering off on svcmgr's own death, observed by
+pwrmgr, is design intent; not yet implemented (#262). svcmgr holds no
+process-creation capabilities; every launch and restart goes through procmgr
+([docs/supervision.md](../../docs/supervision.md)).
 
 ---
 
@@ -263,6 +265,7 @@ See [docs/restart-protocol.md](docs/restart-protocol.md).
 | [docs/architecture.md](../../docs/architecture.md) | System design, init/procmgr/svcmgr roles |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, verb-bit authority, revocation |
 | [docs/process-lifecycle.md](../../docs/process-lifecycle.md) | Userspace boot order, init's Handover stage, process-death flow |
+| [docs/supervision.md](../../docs/supervision.md) | Supervision hierarchy, core set, restart shapes, late-launch rule |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |
 | [services/svcmgr/endowment/README.md](endowment/README.md) | `svcmgr-endowment`: the handover-endowment wire codec svcmgr decodes with |

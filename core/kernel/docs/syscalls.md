@@ -3342,6 +3342,7 @@ source of truth.
 [Capability Model](../../../docs/capability-model.md),
 [Device Management](../../../docs/device-management.md), [IPC Design](../../../docs/ipc-design.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Supervision](../../../docs/supervision.md),
 [Testing](../../../docs/testing.md),
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [services/drivers/serial/README.md](../../../services/drivers/serial/README.md),

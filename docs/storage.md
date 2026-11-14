@@ -305,12 +305,12 @@ To prevent inference of behavior that does not exist:
 
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
 [Build System](build-system.md),
+[Supervision](supervision.md),
 [rootfs/README.md](../rootfs/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/drivers/virtio/blk/README.md](../services/drivers/virtio/blk/README.md),
 [services/fs/README.md](../services/fs/README.md),
 [init Bootstrap Stages](../services/init/docs/bootstrap.md),
-[Restart Protocol](../services/svcmgr/docs/restart-protocol.md),
 [services/vfsd/README.md](../services/vfsd/README.md),
 [vfsd Service Interface](../services/vfsd/docs/vfs-ipc-interface.md),
 [xtask/README.md](../xtask/README.md)

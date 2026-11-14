@@ -1,10 +1,11 @@
 # memmgr — RAM frame allocator + per-process page-pool ledger.
 #
 # Bootstrapped by init via raw `cap_create_*` syscalls (no
-# CREATE_FROM_FILE; binary cannot be respawned by svcmgr today).
-# `restart = never` + `critical = yes`: on unrecoverable death
-# svcmgr issues `pwrmgr_labels::SHUTDOWN` via `pwrmgr.shutdown` and
-# the system powers off.
+# CREATE_FROM_FILE), and in the core set (docs/supervision.md): it
+# never restarts, and its death is system death. `restart = never` +
+# `critical = yes`: on its death svcmgr issues
+# `pwrmgr_labels::SHUTDOWN` via `pwrmgr.shutdown` and the system
+# powers off.
 #
 # The `binary` line is required by the parser and points at the
 # canonical sysroot install location (the live process was loaded

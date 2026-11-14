@@ -2,8 +2,9 @@
 #
 # One-shot: exits cleanly on completion; svcmgr never restarts it.
 # Seeds resolve through svcmgr's discovery registry, each seed-only (no
-# QUERY_ENDPOINT reaches them): rootfs.root is the FS-driver-agnostic
-# root-mount cap; pwrmgr.shutdown is the SHUTDOWN_AUTHORITY-tokened SEND;
+# QUERY_ENDPOINT reaches them): rootfs.root is the SEND on vfsd's
+# synthetic root, which crosses mounts; pwrmgr.shutdown is the
+# SHUTDOWN_AUTHORITY-tokened SEND;
 # devmgr.registry is the REGISTRY_QUERY_AUTHORITY SEND the devmgr deny
 # phases send the gated labels on; devmgr.bind is the
 # REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY SEND|GRANT the devmgr

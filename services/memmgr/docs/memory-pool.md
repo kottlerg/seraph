@@ -705,9 +705,14 @@ A client can therefore make a server spend memory beyond the client's own max, b
 server's node and the reserve. This is a known gap; charging that state to the client is
 [#1100](https://github.com/kottlerg/seraph/issues/1100).
 
-The budget nodes, the reserve, `LIMIT`, decline code 10 and `QUERY_MEMORY_USAGE` are design intent;
-not yet implemented ([#260](https://github.com/kottlerg/seraph/issues/260)). Live control of a
-running process's max is [#1097](https://github.com/kottlerg/seraph/issues/1097).
+memmgr's half of this policy is implemented: the budget nodes, the charge, the reserve, `LIMIT`,
+decline code 10 and `QUERY_MEMORY_USAGE`, and a parent, a max and reserve membership taken at
+`REGISTER_PROCESS` ([`ipc-interface.md`](ipc-interface.md) § Label 3). procmgr's half, which
+passes them, and its reserve creation flag are design intent; not yet implemented
+([#260](https://github.com/kottlerg/seraph/issues/260)). Until it lands, procmgr registers every
+process as a top-level node with no max and outside the reserve, so the boot records' nodes are the
+only reserve nodes, and no process has a max. Live control of a running process's max is
+[#1097](https://github.com/kottlerg/seraph/issues/1097).
 
 ---
 

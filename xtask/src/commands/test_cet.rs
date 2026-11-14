@@ -131,10 +131,10 @@ pub fn run(ctx: &Context, args: &TestCetArgs) -> Result<()>
     // Held until the command returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
 
-    let host_is_guest = host_is_a_guest();
-    retry(host_is_guest, || ktest_boot(ctx, args)).context("boot 1, ktest on shadow stacks")?;
+    let host = this_host();
+    retry(host, || ktest_boot(ctx, args)).context("boot 1, ktest on shadow stacks")?;
     step("CET boot 1: ktest passed with shadow stacks on");
-    retry(host_is_guest, || corrupt_boot(ctx, args, dispatch))
+    retry(host, || corrupt_boot(ctx, args, dispatch))
         .context("boot 2, a corrupted return address")?;
     step("CET shadow-stack test: PASS (ktest on shadow stacks; #CP on a corrupted return)");
     Ok(())
@@ -151,19 +151,31 @@ enum Attempt
     HostLostCetState,
 }
 
+/// Whether the machine this command runs on is itself a guest of another
+/// hypervisor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Host
+{
+    /// The CPUID hypervisor bit is set.
+    Guest,
+    /// It is clear.
+    NotGuest,
+}
+
 /// Run `boot` until it passes, up to [`CET_ATTEMPTS`] times while each run
-/// ends in [`Attempt::HostLostCetState`] on a host that is itself a guest
-/// (`host_is_guest`), where a guest's CET state can be lost at run time
-/// (core/kernel/docs/return-address-integrity.md § Verification Record). It passes only on a run with no such end. On a
-/// host that is not a guest the same end is a failure.
-fn retry(host_is_guest: bool, mut boot: impl FnMut() -> Result<Attempt>) -> Result<()>
+/// ends in [`Attempt::HostLostCetState`] on a [`Host::Guest`], where a
+/// guest's CET state can be lost at run time
+/// (core/kernel/docs/return-address-integrity.md § Verification Record). It
+/// passes only on a run with no such end. On a [`Host::NotGuest`] the same
+/// end is a failure.
+fn retry(host: Host, mut boot: impl FnMut() -> Result<Attempt>) -> Result<()>
 {
     for attempt in 1..=CET_ATTEMPTS
     {
         match boot()?
         {
             Attempt::Passed => return Ok(()),
-            Attempt::HostLostCetState if !host_is_guest => bail!(
+            Attempt::HostLostCetState if host == Host::NotGuest => bail!(
                 "the kernel faulted with CR4.CET set and IA32_S_CET and the interrupt SSP table \
                  address 0, which the kernel never leaves, on a host that is not itself a guest \
                  (no CPUID hypervisor bit)"
@@ -209,20 +221,27 @@ fn lost_cet_state(lines: &[String]) -> bool
     seen
 }
 
-/// Whether the machine this command runs on is itself a guest: the CPUID
-/// hypervisor bit (`CPUID.1:ECX[31]`).
+/// The machine this command runs on, by the CPUID hypervisor bit
+/// (`CPUID.1:ECX[31]`).
 #[cfg(target_arch = "x86_64")]
-fn host_is_a_guest() -> bool
+fn this_host() -> Host
 {
-    std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+    if std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+    {
+        Host::Guest
+    }
+    else
+    {
+        Host::NotGuest
+    }
 }
 
 /// A host that is not `x86_64` runs no KVM `x86_64` guest, so `run` stops
 /// before this matters.
 #[cfg(not(target_arch = "x86_64"))]
-fn host_is_a_guest() -> bool
+fn this_host() -> Host
 {
-    false
+    Host::NotGuest
 }
 
 /// `lines`, which end in a kernel exception report's first line, with the
@@ -688,10 +707,10 @@ mod tests
 
     /// Run `retry` over `ends`, returning its verdict and how many boots it
     /// made.
-    fn retried(host_is_guest: bool, ends: &[Result<Attempt, &str>]) -> (Result<()>, usize)
+    fn retried(host: Host, ends: &[Result<Attempt, &str>]) -> (Result<()>, usize)
     {
         let mut boots = 0;
-        let verdict = retry(host_is_guest, || {
+        let verdict = retry(host, || {
             let end = ends[boots];
             boots += 1;
             end.map_err(|e| anyhow::anyhow!("{e}"))
@@ -707,15 +726,15 @@ mod tests
     {
         use Attempt::{HostLostCetState as Lost, Passed};
 
-        let (verdict, boots) = retried(true, &[Ok(Lost), Ok(Lost), Ok(Passed)]);
+        let (verdict, boots) = retried(Host::Guest, &[Ok(Lost), Ok(Lost), Ok(Passed)]);
         verdict.unwrap();
         assert_eq!(boots, 3);
 
-        let (verdict, boots) = retried(true, &[Ok(Lost); CET_ATTEMPTS as usize]);
+        let (verdict, boots) = retried(Host::Guest, &[Ok(Lost); CET_ATTEMPTS as usize]);
         assert!(verdict.unwrap_err().to_string().contains("inconclusive"));
         assert_eq!(boots, CET_ATTEMPTS as usize);
 
-        let (verdict, boots) = retried(false, &[Ok(Lost), Ok(Passed)]);
+        let (verdict, boots) = retried(Host::NotGuest, &[Ok(Lost), Ok(Passed)]);
         assert!(
             verdict
                 .unwrap_err()
@@ -724,7 +743,7 @@ mod tests
         );
         assert_eq!(boots, 1);
 
-        let (verdict, boots) = retried(true, &[Ok(Lost), Err("ktest failed"), Ok(Passed)]);
+        let (verdict, boots) = retried(Host::Guest, &[Ok(Lost), Err("ktest failed"), Ok(Passed)]);
         assert_eq!(verdict.unwrap_err().to_string(), "ktest failed");
         assert_eq!(boots, 2);
     }

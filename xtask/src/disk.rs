@@ -127,6 +127,18 @@ pub struct DiskLayout
     pub data: DataPlacement,
 }
 
+impl DiskLayout
+{
+    /// The image a boot of this layout attaches as its second disk:
+    /// `disk-data.img` when the layout puts the data partition there, so the
+    /// boot has its `/data`.
+    #[must_use]
+    pub fn second_image(self, ctx: &BuildContext) -> Option<PathBuf>
+    {
+        (self.data == DataPlacement::SecondImage).then(|| ctx.data_disk_image())
+    }
+}
+
 /// One FAT partition of an image: its GPT name, type and unique GUIDs, size,
 /// and the host directory it is populated from (skipped when absent).
 struct Volume
@@ -411,6 +423,45 @@ pub fn logical_block_size(path: &Path) -> Result<u32>
             path.display()
         )
     })
+}
+
+/// The layout the sysroot's disk images have now: `disk.img`'s block size,
+/// and the data partition on `disk-data.img` when that image is there. A
+/// command that stages a file for one boot and restores it afterwards repacks
+/// in this layout both times, so a 4Kn or split image stays one.
+///
+/// # Errors
+/// Fails as [`image_layout`] does.
+pub fn current_layout(ctx: &BuildContext) -> Result<DiskLayout>
+{
+    image_layout(&ctx.disk_image(), &ctx.data_disk_image())
+}
+
+/// The layout of the images at `main_image` and `data_image`, as
+/// [`current_layout`] reads it.
+///
+/// # Errors
+/// Fails when `main_image` carries no GPT header at either block size.
+fn image_layout(main_image: &Path, data_image: &Path) -> Result<DiskLayout>
+{
+    let block_size = match logical_block_size(main_image)?
+    {
+        512 => BlockSize::B512,
+        4096 => BlockSize::B4096,
+        other => anyhow::bail!(
+            "{} has {other}-byte blocks, which mkdisk does not author",
+            main_image.display()
+        ),
+    };
+    let data = if data_image.is_file()
+    {
+        DataPlacement::SecondImage
+    }
+    else
+    {
+        DataPlacement::MainImage
+    };
+    Ok(DiskLayout { block_size, data })
 }
 
 /// The block size a second disk's device presents: `override_size` when the
@@ -864,6 +915,66 @@ mod tests
         )
         .unwrap();
         assert!(!data_image.exists());
+    }
+
+    // Defect caught: test-debug-port restored a 4Kn or split image as a
+    // 512-byte single image, deleting disk-data.img.
+    #[test]
+    fn the_layout_read_back_is_the_one_authored_and_survives_a_repack()
+    {
+        for block_size in [BlockSize::B512, BlockSize::B4096]
+        {
+            for data in [DataPlacement::MainImage, DataPlacement::SecondImage]
+            {
+                let layout = DiskLayout { block_size, data };
+                let scratch = Scratch::new(&format!("layout-{}-{data:?}", block_size.bytes()));
+                let main = scratch.0.join("disk.img");
+                let data_image = scratch.0.join("disk-data.img");
+                let sources = scratch.sources();
+                author_images(&main, &data_image, Arch::X86_64, layout, &sources).unwrap();
+                assert_eq!(image_layout(&main, &data_image).unwrap(), layout);
+
+                // A repack in the layout read back keeps it.
+                let read = image_layout(&main, &data_image).unwrap();
+                author_images(&main, &data_image, Arch::X86_64, read, &sources).unwrap();
+                assert_eq!(image_layout(&main, &data_image).unwrap(), layout);
+                assert_eq!(data_image.is_file(), data == DataPlacement::SecondImage);
+            }
+        }
+    }
+
+    // Defect caught: a split layout booted without its data disk, so the
+    // boot had no /data.
+    #[test]
+    fn only_a_split_layout_boots_a_second_image()
+    {
+        let ctx = BuildContext {
+            root: PathBuf::from("/w"),
+            sysroot: PathBuf::from("/w/sysroot"),
+            target_dir: PathBuf::from("/w/target"),
+        };
+        for block_size in [BlockSize::B512, BlockSize::B4096]
+        {
+            let split = DiskLayout {
+                block_size,
+                data: DataPlacement::SecondImage,
+            };
+            assert_eq!(split.second_image(&ctx), Some(ctx.data_disk_image()));
+            let single = DiskLayout {
+                block_size,
+                data: DataPlacement::MainImage,
+            };
+            assert_eq!(single.second_image(&ctx), None);
+        }
+    }
+
+    #[test]
+    fn a_file_with_no_gpt_has_no_layout()
+    {
+        let scratch = Scratch::new("no-layout");
+        let main = scratch.0.join("disk.img");
+        fs::write(&main, [0u8; 8192]).unwrap();
+        image_layout(&main, &scratch.0.join("disk-data.img")).unwrap_err();
     }
 
     #[test]

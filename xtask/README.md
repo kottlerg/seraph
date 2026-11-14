@@ -252,11 +252,13 @@ uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID D
 The images' logical block size, the unit of their GPT LBAs and the sector
 size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
-author the partitions above; `build`, `compose-bundle`, `test-kaslr`, and
-`test-map-redo` author them at 512 bytes on a single image, so a 4Kn or split boot runs
-`mkdisk` after them. `run --debug-target`, `run-parallel --debug-target`, and `test-gdb` repack
-the images in the layout they find: `disk.img`'s block size, and the data partition on
-`disk-data.img` when that image is there.
+author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
+image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
+`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, and `test-map-redo`
+repack the images in the layout they find: `disk.img`'s block size, and the data partition on
+`disk-data.img` when that image is there. The four test commands boot that layout, attaching
+`disk-data.img` as the second disk when it holds the data partition; `run` and `run-parallel`
+attach a second disk only as `--second-disk` names it.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
@@ -732,9 +734,10 @@ Verify KASLR (#252) on either arch. Boots the ktest bundle headless twice with
 KASLR enabled, scrapes the kernel's serial-only
 `kaslr: slide=… image_base=… dm_base=…` line, and asserts the joint
 `(slide, dm_base)` differs between boots (joint compare + one retry bounds a
-false failure at ~1e-8). Then stages the `nokaslr` knob, repacks `disk.img`,
-boots once, and asserts the deterministic layout (slide 0, image at link base,
-direct map at the mode floor) — always restoring the KASLR-enabled image.
+false failure at ~1e-8). Then stages the `nokaslr` knob, repacks the disk
+images in the layout they have, boots once, and asserts the deterministic layout
+(slide 0, image at link base, direct map at the mode floor) — always restoring
+the KASLR-enabled images in that layout.
 
 A pure runner; requires the ktest bundle composed:
 
@@ -786,11 +789,11 @@ passes the command. The model is in
 
 Check that a boot whose bootloader redoes its steps 6 and 7 completes, on either arch. Stages the
 `\EFI\seraph\mapredo` test knob, which makes the first attempt of the bootloader's steps 6 and 7
-redo whatever its memory map's size
-([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md) § Sizing the Entry Array),
-repacks `disk.img`, boots the current sysroot once, and always removes the knob and repacks again
-afterwards. It passes when the boot reaches its pass marker and its log holds the bootloader's
-line `boot: memory map: mapredo knob present; redoing steps 6 and 7` exactly once.
+redo whatever its memory map's size ([core/boot/docs/memory-map.md](../core/boot/docs/memory-map.md)
+§ Sizing the Entry Array), repacks the disk images in the layout they have, boots the current
+sysroot once, and always removes the knob and repacks again in that layout afterwards. It passes
+when the boot reaches its pass marker and its log holds the bootloader's line `boot: memory map:
+mapredo knob present; redoing steps 6 and 7` exactly once.
 
 A pure runner; requires a harness staged (CI runs it on the ktest bundle), and `--test-devices`
 when that harness is svctest, whose devmgr phases drive the test devices (as for `run`):
@@ -816,15 +819,15 @@ See [docs/testing.md](../docs/testing.md) for the harness model.
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
-([services/debug-echo/README.md](../services/debug-echo/README.md)) from
-`config/svcmgr/tests/` into `config/svcmgr/services/`, repacks `disk.img`, boots the current
+([services/debug-echo/README.md](../services/debug-echo/README.md)) from `config/svcmgr/tests/` into
+`config/svcmgr/services/`, repacks the disk images in the layout they have, boots the current
 sysroot once with the debug port attached (as `run --debug-port` attaches it, headless), waits for
 the fixture's `[debug-echo] READY on the debug port` line on the serial stream, connects to the
 port, and drives one GDB remote serial protocol exchange with the fixture, framed at both ends by
 `shared/gdb-rsp` ([shared/gdb-rsp/README.md](../shared/gdb-rsp/README.md)). It then kills QEMU,
-removes the recipe, and repacks `disk.img` again, whatever the outcome. It passes when every
-answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug port
-(`test-debug-port`) lists the exchange.
+removes the recipe, and repacks the images in that layout again, whatever the outcome. It passes
+when every answer of the exchange arrives as expected; [docs/testing.md](../docs/testing.md) § Debug
+port (`test-debug-port`) lists the exchange.
 
 A pure runner; requires a populated sysroot:
 
@@ -972,18 +975,24 @@ It runs every `commit-check` rule on the PR's commits (`origin/<base>..<head>`),
 | `pr-unticked-box` | error | The body has no unticked task-list item (§ PR-body checklist discipline): `[ ]` after a `-`, `*`, `+`, or numbered list marker, the forms GitHub renders as a checkbox. |
 | `pr-attribution` | error | The body carries no tool attribution line and no session link. |
 | `pr-closes-and-refs` | warning | The body does not both close an Issue and reference it with `Refs #N`; a closing reference that names a repository (`<owner>/<repo>#N`, or the Issue's URL) is not compared. A drain PR that closes a follow-up Issue of the earlier pattern carries both (§ Follow-up Issues); in any other body the pair usually means a sentence closes an Issue the PR only references. |
+| `pr-refs-unread` | warning | Every `#N` after the start of a `Refs` list on its body line is read as a referenced Issue (a line with the word but no list, such as a rule name or prose, is not checked): one the `Refs` list does not reach, because other text stands between it and the number before it, is named with its line, since its ticks and state go unchecked. A reference into another repository is not counted. |
 | `pr-closing-in-prose` | warning | No closing reference stands inside a sentence: a closing keyword before an Issue reference closes that Issue when the PR merges, whatever the sentence says and even inside backticks. A line of closing references alone (`Fixes #N`), with or without a list or quote marker before it, is the intended form. |
 | `pr-validation` | error | The body has a `## Validation` section that names a validated head: the first word of that section that is a commit hash in the clone. |
 | `pr-validated-head` | error | The validated head is the PR head; or it is a commit of the branch (one the head holds and the base branch does not), the section says the delta since it is documentation or comments only (a phrase that pairs `only` with comments, Markdown, or documentation, such as `comment-only`, `Markdown only`, or `only in comments`, not after a `not` within three words and outside a template placeholder `<…>`; whether the phrase is about the delta stays with the auditor), and `git diff <validated> <head>` alters, Markdown (`*.md` in any letter case) aside, only comment lines and no file a build embeds ([docs/testing.md](../docs/testing.md) § Coverage tiers). A binary change, a mode change, and any non-blank line of a file type whose comment syntax the command does not know (it knows Rust, TOML, YAML, and shell) count as changes. When a merge of the base branch lies between the two heads, the command compares the PR's own change at each, `git diff <merge base> <validated>` and `git diff <merge base> <head>`, as multisets of changed lines per file, whitespace included, instead of the delta: they must differ only in comment or Markdown lines and in no file a build embeds, two binary changes agree only when their `index` lines match (the same blobs before and after, and the same mode), a change to a final newline alone is a change, as is a different mode for a file the PR adds or deletes at both heads (an added or deleted file is otherwise judged by its lines, so a file of comments alone stays comment-only), each difference is reported with the head it stands at; a line the PR reordered or moved within its own files since the validated head, which the multisets cannot see, is read from `git diff <validated> <head>` over those files less the sync's incoming diff, and a code line of it in a file whose own change compares equal is reported as moved or reordered; and the section must say the delta is documentation or comments only when the two differ at all. |
 | `pr-validated-sync` | warning | No merge of the base branch lies between a validated head that passes `pr-validated-head` and the PR head. After one the body states that the incoming diff touches none of the PR's files, or that it is comment-only (§ Syncing with `master`); a reader decides the overlap and the incoming diff's kind, the command cannot. |
 | `pr-milestone` | error | The pull request carries no milestone (§ Milestones). |
 | `pr-closes-rolling` | error | The PR closes no rolling follow-up Issue (§ Follow-up Issues). |
+| `pr-refs-rolling` | error | Every rolling follow-up Issue the body references with `Refs` is open and carries the current milestone: it is the rolling Issue of its scope in that milestone, not a rolling Issue of an earlier milestone with the same title, which step 8 of § Release Production closed after moving its open items on. |
 | `issue-acceptance` | error | Every Issue the PR closes has no unticked box under its `## Acceptance` (§ Acceptance checklist discipline). |
 | `issue-milestone` | error | Every Issue the PR closes carries the current milestone, the lowest-versioned open one. |
 | `issue-marker-unticked` | error | On every Issue the PR closes or references with `Refs #N`, each item carrying `(fixed by PR #<N>)` is ticked. |
 
 The command prints the Issues the body and the commits close and the ones the body references,
-so that a keyword in prose that closes an Issue by accident is seen. A closing reference into
+so that a keyword in prose that closes an Issue by accident is seen. A `Refs` keyword references
+every `#N` of the list that follows it on its line (`Refs #N, #M`, `Refs #N and #M`), as
+§ Commit and PR cross-references allows; the list ends at anything else, such as a remark or a
+reference into another repository, and `pr-refs-unread` names a number of this repository that
+it leaves after the list's start on the line. A closing reference into
 another repository (`<owner>/<repo>#N`, or that Issue's URL, naming a repository other than this
 one) is printed apart and not checked, since the Issue rules read this repository's Issues.
 
@@ -1170,7 +1179,10 @@ cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
 The command refuses a filing without a class label, without a subsystem label, or without a
 milestone decision (`--unscheduled` is for future-state work no release has scheduled). It
 refuses a rolling follow-up Issue (a title ending `: defects found by review`) under anything
-but the current milestone, the lowest-versioned open one, which it reads from GitHub. After
+but the current milestone, the lowest-versioned open one, which it reads from GitHub, and one
+whose title an open Issue of the current milestone already carries: the scope has its rolling
+Issue there (§ Follow-up Issues). A rolling Issue of an earlier milestone carries the same title
+and does not count. After
 filing it reads the Issue back and fails when a label or the milestone was not applied, naming
 what is missing.
 

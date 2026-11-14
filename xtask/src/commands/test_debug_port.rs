@@ -6,13 +6,13 @@
 //! Debug-port transport test: GDB remote serial protocol packets reach a
 //! guest service over the debug port and its answers come back.
 //!
-//! Stages the `debug-echo` fixture's recipe into the boot set, repacks
-//! `disk.img`, and boots the current sysroot once with the debug port
+//! Stages the `debug-echo` fixture's recipe into the boot set, repacks the
+//! disk images in the layout they have, and boots the current sysroot once with the debug port
 //! attached (a `virtio-console` device whose host end QEMU serves on a TCP
 //! port). Once the fixture logs [`READY_MARKER`] on the serial stream, the
 //! host connects and drives one exchange ([`exchange`]), framing and checking
 //! every packet with the same `gdb-rsp` crate the fixture links. The fixture's
-//! recipe is always removed and `disk.img` repacked afterwards. The verdict
+//! recipe is always removed and the images repacked in that layout afterwards. The verdict
 //! is computed here and the host kills QEMU, as `test-terminal` does.
 //!
 //! A pure runner: requires a populated sysroot from `cargo xtask build`.
@@ -31,9 +31,10 @@ use gdb_rsp::frame::{Event, PacketReader, PacketWriter, unescape};
 use crate::arch::Arch;
 use crate::cli::TestDebugPortArgs;
 use crate::context::Context;
+use crate::disk::DiskLayout;
 use crate::firmware::find_ovmf_code;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, X86Paging, build_qemu_argv,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, SecondDisk, X86Paging, build_qemu_argv,
     prepare_riscv_firmware, validate_sysroot_for_launch,
 };
 use crate::util::{require_tool, step};
@@ -69,29 +70,27 @@ pub fn run(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
         .join("svcmgr")
         .join("tests")
         .join(RECIPE);
+    // Read before staging, so a failed staging repack cannot change the
+    // layout the restore writes.
+    let layout = crate::disk::current_layout(ctx)?;
     std::fs::copy(&source, &staged)
         .with_context(|| format!("staging {} as {}", source.display(), staged.display()))?;
-    let booted = repack(ctx, args.arch).and_then(|()| boot(ctx, args));
+    let booted = crate::disk::create_disk_image(ctx, args.arch, layout)
+        .and_then(|()| boot(ctx, args, layout));
     // Restore first, and surface its failure ahead of the boot's: a recipe
     // left staged would start the fixture on every later boot.
     std::fs::remove_file(&staged)
         .with_context(|| format!("removing {}", staged.display()))
-        .and_then(|()| repack(ctx, args.arch))
-        .context("restoring disk.img without the fixture")?;
+        .and_then(|()| crate::disk::create_disk_image(ctx, args.arch, layout))
+        .context("restoring the disk images without the fixture")?;
     booted?;
     step("debug port test: PASS (packets reached the fixture and its answers came back)");
     Ok(())
 }
 
-/// Repack `disk.img` from the sysroot as it stands (`mkdisk --repack-only`).
-fn repack(ctx: &Context, arch: Arch) -> Result<()>
-{
-    crate::disk::create_disk_image(ctx, arch, crate::disk::DiskLayout::default())
-}
-
-/// Boot with the debug port, wait for the fixture, drive the exchange, and
-/// kill QEMU.
-fn boot(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
+/// Boot the images of `layout` with the debug port, wait for the fixture,
+/// drive the exchange, and kill QEMU.
+fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<()>
 {
     // Picked here, right before QEMU binds it, to keep the window in which
     // another process could take it short.
@@ -106,11 +105,15 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs) -> Result<()>
         }
     };
     let disk_path = ctx.disk_image();
+    let data_image = layout.second_image(ctx);
     let spec = QemuLaunchSpec {
         arch: args.arch,
         disk_path: &disk_path,
         disk_block_size: crate::disk::logical_block_size(&disk_path)?,
-        second_disk: None,
+        second_disk: data_image
+            .as_deref()
+            .map(SecondDisk::of_image)
+            .transpose()?,
         firmware_code_path: &firmware_code,
         firmware_vars_path: firmware_vars.as_deref(),
         cpus: args.cpus,

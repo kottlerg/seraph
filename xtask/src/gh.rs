@@ -44,7 +44,7 @@ pub fn json(root: &Path, args: &[&str]) -> Result<Value>
     serde_json::from_str(&out).with_context(|| format!("gh {} returned no JSON", args.join(" ")))
 }
 
-/// An Issue's number, title, body, milestone, and labels.
+/// An Issue's number, title, body, milestone, labels, and state.
 pub fn issue(root: &Path, number: u64) -> Result<Value>
 {
     json(
@@ -54,9 +54,53 @@ pub fn issue(root: &Path, number: u64) -> Result<Value>
             "view",
             &number.to_string(),
             "--json",
-            "number,title,body,milestone,labels",
+            "number,title,body,milestone,labels,state",
         ],
     )
+}
+
+/// The largest list `open_issues_in` reads; `gh` may truncate a longer one.
+const ISSUE_LIST_LIMIT: usize = 1000;
+
+/// The number and title of every open Issue that carries `milestone`. Refuses
+/// a list of `ISSUE_LIST_LIMIT` entries, which `gh` may have truncated.
+pub fn open_issues_in(root: &Path, milestone: &str) -> Result<Vec<(u64, String)>>
+{
+    let limit = ISSUE_LIST_LIMIT.to_string();
+    let list = json(
+        root,
+        &[
+            "issue",
+            "list",
+            "--state",
+            "open",
+            "--milestone",
+            milestone,
+            "--limit",
+            &limit,
+            "--json",
+            "number,title",
+        ],
+    )?;
+    let issues: Vec<(u64, String)> = list
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .filter_map(|i| {
+            Some((
+                i.get("number")?.as_u64()?,
+                i.get("title")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect();
+    if issues.len() >= ISSUE_LIST_LIMIT
+    {
+        bail!(
+            "milestone {milestone} lists {ISSUE_LIST_LIMIT} open Issues or more; gh may have \
+             truncated the list"
+        );
+    }
+    Ok(issues)
 }
 
 /// The titles of the repository's open milestones.

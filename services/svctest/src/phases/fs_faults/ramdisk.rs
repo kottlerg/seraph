@@ -306,6 +306,24 @@ pub fn serve(ep: u64, disk: &SharedDisk)
     }
 }
 
+/// The reply label for a request whose Memory cap the block server's map
+/// refused with `error`. A map that still finds the page-table pool exhausted
+/// after the funded map's top-ups is the server's own failure, not the
+/// caller's, and is answered `DEVICE_FAULT`, the code a block driver gives a
+/// request whose cap could not be mapped for the device; any other refusal is
+/// the cap's, answered `INVALID_MEMORY_CAP`.
+fn map_refusal_label(error: i64) -> u64
+{
+    if error == syscall_abi::SyscallError::OutOfMemory as i64
+    {
+        blk_errors::DEVICE_FAULT
+    }
+    else
+    {
+        blk_errors::INVALID_MEMORY_CAP
+    }
+}
+
 /// Copy `count` sectors at `lba` between the disk and the page `cap` names,
 /// in `direction`, unless an armed fault says otherwise. Returns the reply
 /// label.
@@ -346,9 +364,9 @@ fn transfer(
     // SAFETY: `va` is the block server's own page reservation from the
     // per-process arena, used only by this thread for one copy at a time: VA
     // no Rust object or IPC page occupies.
-    if unsafe { syscall::mem_map(cap, aspace, va, 0, 1, prot) }.is_err()
+    if let Err(e) = unsafe { std::os::seraph::mem_map_funded(cap, aspace, va, 0, 1, prot) }
     {
-        return blk_errors::INVALID_MEMORY_CAP;
+        return map_refusal_label(e);
     }
     for i in 0..count
     {

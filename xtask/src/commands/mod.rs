@@ -7,6 +7,7 @@
 
 pub mod build;
 pub mod clean;
+pub mod compare_images;
 pub mod compose_bundle;
 pub mod hook;
 pub mod host;

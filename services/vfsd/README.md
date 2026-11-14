@@ -19,16 +19,18 @@ vfsd/
 ├── README.md
 ├── gpt/                     # `vfsd-gpt` crate: pure host-tested GPT-format parser
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
+├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/
-│   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT handler
+│   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT and
+│   │                        # GET_SWAP_PARTITION handlers
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── partition.rs         # Disk and partition discovery: block I/O over the gpt crate
-│   ├── role_guids.rs        # Compile-time arch-conditional root + ESP GUIDs
+│   ├── role_guids.rs        # Compile-time arch-conditional root, ESP, data and swap GUIDs
 │   ├── worker.rs            # Worker thread implementation
 │   └── worker_pool.rs       # Bootstrap-endpoint pool for spawned drivers
 └── docs/
     ├── namespace-composition.md   # Synthetic root, root-mount delegation
-    └── vfs-ipc-interface.md       # MOUNT wire shape
+    └── vfs-ipc-interface.md       # Service-endpoint labels and their wire shapes
 ```
 
 ---
@@ -52,16 +54,27 @@ vfsd/
   point falls through to the root partition. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md#two-endpoints-one-process)
   and [`docs/storage.md`](../../docs/storage.md).
-- **Service endpoint** — handles `MOUNT` and `GET_SYSTEM_ROOT_CAP` on
-  its un-badged service endpoint, with multi-threaded recv so
-  independent requests proceed while one waits on a driver spawn; no
-  service-endpoint request waits on another, so the thread count is a
-  concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
+- **Service endpoint** — handles `MOUNT`, `GET_SYSTEM_ROOT_CAP` and
+  `GET_SWAP_PARTITION` on its un-badged service endpoint, with
+  multi-threaded recv so independent requests proceed while one waits on
+  a driver spawn; no service-endpoint request waits on another's IPC (a
+  `GET_SWAP_PARTITION` waits at most for the swap lock, held across one
+  call to the block driver, which never calls vfsd), so the thread count
+  is a concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts), gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
   self-mounted, and svctest is its only in-tree caller. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
   [`docs/namespace-composition.md`](docs/namespace-composition.md).
+- **Swap-partition hand-out** — `GET_SWAP_PARTITION`, gated on the
+  `SWAP_AUTHORITY` badge bit, hands the swap service a raw partition cap
+  on the `SERAPH_SWAP` partition, which vfsd never mounts. The first
+  request looks the partition up and registers it, so vfsd's startup does
+  not depend on one; each later request revokes the cap handed out before,
+  so one holder at a time reaches the partition. The hand-out's decisions
+  are the host-tested `vfsd-swap` crate. See
+  [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
+  [`docs/storage.md`](../../docs/storage.md).
 - **System-root cap delivery** — vfsd does not push a system-root
   cap anywhere at boot. Init pulls one via
   `vfsd_labels::GET_SYSTEM_ROOT_CAP`; service threads start only after
@@ -142,7 +155,8 @@ devmgr discovers storage hardware, spawns block device drivers, and
 publishes their endpoints in the device registry. vfsd queries the
 registry at startup, once per instance ordinal, to obtain the
 `MOUNT_AUTHORITY`-badged whole-disk cap on every virtio-blk instance.
-For each mount vfsd sends `REGISTER_PARTITION` on the cap of the disk
+For each mount, and for the swap partition on the first
+`GET_SWAP_PARTITION`, vfsd sends `REGISTER_PARTITION` on the cap of the disk
 that holds the partition, and that virtio-blk instance mints and returns
 a partition-badged cap. See
 [`docs/device-management.md`](../../docs/device-management.md) and

@@ -670,8 +670,10 @@ pub fn fs_write_memory_phase(_: &Caps)
     let va = range.va_start();
     // SAFETY: `range` is a fresh page reservation from the per-process arena,
     // owned here: VA no Rust object or IPC page occupies.
-    unsafe { syscall::mem_map(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE) }
-        .expect("mem_map memory cap failed");
+    unsafe {
+        std::os::seraph::mem_map_funded(memory_cap, info.self_aspace, va, 0, 1, MAP_WRITABLE)
+    }
+    .expect("mem_map memory cap failed");
 
     // SAFETY: va just mapped MAP_WRITABLE for one page; WRITE_LEN ≤ PAGE_SIZE.
     unsafe {
@@ -1319,7 +1321,7 @@ impl HeldPage
         // SAFETY: `range` is a fresh page reservation from the per-process
         // arena, owned here: VA no Rust object or IPC page occupies.
         unsafe {
-            syscall::mem_map(
+            std::os::seraph::mem_map_funded(
                 cap,
                 startup_info().self_aspace,
                 range.va_start(),

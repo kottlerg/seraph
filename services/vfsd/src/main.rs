@@ -32,7 +32,7 @@ use std::sync::{Mutex, PoisonError};
 
 use ipc::{IpcMessage, blk_labels, ns_labels};
 use namespace_protocol::{GateError, compose_forward_lookup_rights, gate};
-use root_backend::VfsdRootBackend;
+use root_backend::{Mount, VfsdRootBackend};
 use worker_pool::WorkerPool;
 
 /// Number of threads that recv on the service endpoint. A concurrency
@@ -1033,10 +1033,11 @@ fn mount_path_is_root(path: &[u8]) -> bool
 ///
 /// Looks the role's type GUID up across every held disk's GPT, registers
 /// the partition bound with the block driver of the disk that holds it,
-/// spawns a fatfs driver, registers a mount entry, and captures the
-/// driver's namespace endpoint (terminal mounts) or a badged SEND on the
-/// root fs (the root mount) into [`VfsdRootBackend`] so the system-root
-/// cap can resolve through the new mount.
+/// spawns a fatfs driver, and stores the mount's record in
+/// [`VfsdRootBackend`]: the driver's namespace endpoint (terminal mounts)
+/// or a badged SEND on the root fs (the root mount), through which the
+/// system-root cap resolves into the new mount, with the driver's caps and
+/// the partition cap (`docs/namespace-composition.md` § Mount record).
 ///
 /// On success returns a fresh badged SEND for the caller (zero if
 /// minting failed; the mount itself still landed). On failure
@@ -1059,10 +1060,10 @@ pub(crate) fn do_mount(
     clippy::too_many_lines,
     reason = "the mount-and-publish transaction runs inline. The install pre-check, partition \
               registration with virtio-blk, fatfs spawn, synthetic-root install, and \
-              namespace-root cap minting share the `partition_ep` / `fatfs` / `driver_ep` locals, \
-              and every failure arm after the spawn tears the driver down through \
-              `fatfs.endpoint`; folding a subset into helpers would thread those locals through \
-              and hide which arm releases what"
+              namespace-root cap minting share the `partition` / `fatfs` / `driver_ep` locals, \
+              and every failure arm after the spawn releases the mount through \
+              `release_failed_mount`; folding a subset into helpers would thread those locals \
+              through and hide which arm releases what"
 )]
 fn do_mount_internal(
     rt: &VfsdRuntime,
@@ -1125,11 +1126,22 @@ fn do_mount_internal(
         return Err(ipc::vfsd_errors::TABLE_FULL);
     }
 
-    let Some(partition_ep) =
+    // vfsd keeps the registered partition cap in the mount record and hands
+    // the driver a derivation of it, so revoking the kept cap cuts the
+    // driver off the partition (`docs/namespace-composition.md` § Mount
+    // record).
+    let Some(partition) =
         derive_and_register_partition(disk.blk_ep, partition_lba, partition_len, ipc_buf)
     else
     {
         std::os::seraph::log!(warn: "MOUNT: partition cap registration failed");
+        return Err(ipc::vfsd_errors::SPAWN_FAILED);
+    };
+    let Ok(partition_ep) = syscall::cap_derive(partition, syscall::RIGHTS_EP_SEND_GRANT)
+    else
+    {
+        std::os::seraph::log!(warn: "MOUNT: partition cap derive failed");
+        revoke_partition(partition);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
 
@@ -1162,6 +1174,7 @@ fn do_mount_internal(
     {
         std::os::seraph::log!(warn: "MOUNT: failed to spawn fatfs");
         log_cap_delete("module_cap (spawn-fail)", module_cap_for_spawn);
+        revoke_partition(partition);
         return Err(ipc::vfsd_errors::SPAWN_FAILED);
     };
     let driver_ep = fatfs.send;
@@ -1209,7 +1222,7 @@ fn do_mount_internal(
             std::os::seraph::log!(warn: "MOUNT: root fall-through cap derive failed");
             // Revoking the endpoint also invalidates `caller_root_cap` and
             // stops the driver, which nothing would reach otherwise.
-            driver::teardown_driver(fatfs.endpoint);
+            release_failed_mount(&fatfs, partition);
             return Err(ipc::vfsd_errors::IO_ERROR);
         };
         c
@@ -1219,8 +1232,8 @@ fn do_mount_internal(
         driver_ep
     };
 
-    // Install the mount; capture any synthetic intermediates created
-    // along the path so we can populate their fall-through caps after
+    // Install the mount; capture the synthetic intermediates the install
+    // made visible so we can populate their fall-through caps after
     // releasing the lock (the walk needs IPC and we must not block
     // other namespace traffic on it).
     let install_result = {
@@ -1228,7 +1241,17 @@ fn do_mount_internal(
             .root_backend
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        backend.install(path, install_cap)
+        backend.install(
+            path,
+            Mount {
+                cap: install_cap,
+                endpoint: fatfs.endpoint,
+                process: fatfs.process,
+                death_queue: fatfs.death_queue,
+                partition,
+                disk: location.disk,
+            },
+        )
     };
     let Some(install_result) = install_result
     else
@@ -1240,7 +1263,7 @@ fn do_mount_internal(
         std::os::seraph::log!(
             warn: "MOUNT: synthetic-root install failed (no memory or mount point taken)"
         );
-        driver::teardown_driver(fatfs.endpoint);
+        release_failed_mount(&fatfs, partition);
         return Err(ipc::vfsd_errors::TABLE_FULL);
     };
 
@@ -1250,9 +1273,8 @@ fn do_mount_internal(
         // so the unbadged SEND_GRANT has no further use.
         log_cap_delete("root mount driver_ep", driver_ep);
     }
-    // `fatfs.endpoint` stays in vfsd's CSpace for the life of the mount
-    // (every mount is permanent): it is the one handle that can revoke
-    // the driver, per `driver::FatfsDriver`.
+    // The mount record now holds `fatfs.endpoint`, the process handle, the
+    // death queue and the partition cap for the life of the mount.
 
     populate_fallthrough_caps(rt, ipc_buf, install_result.as_slice());
 
@@ -1260,14 +1282,41 @@ fn do_mount_internal(
     Ok(caller_root_cap.unwrap_or(0))
 }
 
-/// For each newly-created synthetic intermediate, walk the root mount
-/// to the corresponding directory and record the resulting cap as
-/// that intermediate's `fallthrough_cap`.
+/// Release what a mount transaction holds once it fails after its driver
+/// started: the partition cap is revoked, cutting the driver off its
+/// partition; the driver's service endpoint is revoked
+/// ([`driver::teardown_driver`]), invalidating every cap minted from it
+/// and stopping the driver; and the process handle and death queue are
+/// deleted.
+fn release_failed_mount(fatfs: &driver::FatfsDriver, partition: u64)
+{
+    revoke_partition(partition);
+    driver::teardown_driver(fatfs.endpoint);
+    log_cap_delete("driver process handle", fatfs.process);
+    log_cap_delete("driver death queue", fatfs.death_queue);
+}
+
+/// Revoke and delete a partition cap vfsd registered: the driver's
+/// derivation of it stops reaching the block driver.
+fn revoke_partition(partition: u64)
+{
+    if let Err(code) = syscall::cap_revoke_all(partition)
+    {
+        std::os::seraph::log!(warn: "partition revoke: cap_revoke_all failed: code={code}");
+    }
+    log_cap_delete("partition cap", partition);
+}
+
+/// For each synthetic intermediate the install made visible, walk the
+/// root mount to the corresponding directory and record the resulting
+/// cap as that intermediate's `fallthrough_cap`.
 ///
 /// A walk that fails (root mount not yet installed, or the path does
 /// not exist in the root filesystem) leaves `fallthrough_cap = 0`;
 /// subsequent unmatched lookups against that intermediate then reply
-/// `NotFound` instead of forwarding. Every skip is logged.
+/// `NotFound` instead of forwarding. A walked cap the tree refuses,
+/// because the node no longer needs one by the time the walk ends, is
+/// deleted. Every skip is logged.
 fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates: &[u32])
 {
     for &node_idx in intermediates
@@ -1296,11 +1345,19 @@ fn populate_fallthrough_caps(rt: &VfsdRuntime, ipc_buf: *mut u64, intermediates:
         }
         if let Some(cap) = walk_root_mount_path(root_mount_cap, &path, ipc_buf)
         {
-            let mut backend = rt
+            let stored = rt
                 .root_backend
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            backend.set_fallthrough_cap(node_idx, cap);
+                .unwrap_or_else(PoisonError::into_inner)
+                .set_fallthrough_cap(node_idx, cap);
+            if !stored
+            {
+                std::os::seraph::log!(
+                    warn: "MOUNT: fallthrough skip node_idx={node_idx}: the node no longer \
+                     needs one",
+                );
+                log_cap_delete("unneeded fallthrough cap", cap);
+            }
         }
         else
         {

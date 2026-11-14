@@ -805,7 +805,8 @@ through `std::os::seraph::startup_info()`), per
 The block device endpoint is partition-scoped: vfsd registers the
 partition bound with virtio-blk before delivering this cap, so the
 driver reads by partition-relative LBA and virtio-blk enforces the
-bound on every `BLK_READ_INTO_MEMORY`. See
+bound on every `BLK_READ_INTO_MEMORY`. The cap is a derivation of the
+partition cap vfsd keeps for the mount, so vfsd can revoke it. See
 [`services/vfsd/docs/vfs-ipc-interface.md`](../../vfsd/docs/vfs-ipc-interface.md)
 § Label 10: `MOUNT` for the registration step and
 [`services/drivers/virtio/blk/README.md`](../../drivers/virtio/blk/README.md).

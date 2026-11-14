@@ -40,26 +40,16 @@ pub struct CreateTailCaps
 {
     /// The label sets `CREATE_ARGV_ENV`.
     pub argv_env: bool,
-    /// The label sets `CREATE_DEATH_RELAY` and the opcode honours it.
+    /// The label sets `CREATE_DEATH_RELAY`.
     pub death_relay: bool,
 }
 
 impl CreateTailCaps
 {
-    /// The tail caps of a `CREATE_PROCESS` label, which ignores
-    /// `CREATE_DEATH_RELAY`.
+    /// The tail caps of a `CREATE_PROCESS` or `CREATE_FROM_FILE` label: both
+    /// opcodes read the two flags alike.
     #[must_use]
-    pub const fn of_create_process(label: u64) -> Self
-    {
-        Self {
-            argv_env: label & procmgr_labels::CREATE_ARGV_ENV != 0,
-            death_relay: false,
-        }
-    }
-
-    /// The tail caps of a `CREATE_FROM_FILE` label.
-    #[must_use]
-    pub const fn of_create_from_file(label: u64) -> Self
+    pub const fn of_create(label: u64) -> Self
     {
         Self {
             argv_env: label & procmgr_labels::CREATE_ARGV_ENV != 0,
@@ -142,19 +132,42 @@ mod tests
     };
 
     // Defect guarded: a label decode that reads a tail flag from the wrong
-    // bit, or honours the relay on `CREATE_PROCESS`, which ignores it.
+    // bit, or ignores the relay on one of the two create opcodes.
     #[test]
     fn tail_caps_follow_the_label_flags()
     {
-        use ipc::procmgr_labels::{CREATE_ARGV_ENV, CREATE_DEATH_RELAY};
-        let label = CREATE_ARGV_ENV | CREATE_DEATH_RELAY;
-        assert_eq!(CreateTailCaps::of_create_from_file(label), BOTH);
-        assert_eq!(CreateTailCaps::of_create_process(label), ARGV);
+        use ipc::procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_DEATH_RELAY, CREATE_FROM_FILE, CREATE_PROCESS,
+        };
+        for opcode in [CREATE_PROCESS, CREATE_FROM_FILE]
+        {
+            let label = opcode | CREATE_ARGV_ENV | CREATE_DEATH_RELAY;
+            assert_eq!(CreateTailCaps::of_create(label), BOTH);
+            assert_eq!(
+                CreateTailCaps::of_create(opcode | CREATE_DEATH_RELAY),
+                RELAY
+            );
+            assert_eq!(CreateTailCaps::of_create(opcode | CREATE_ARGV_ENV), ARGV);
+            assert_eq!(CreateTailCaps::of_create(opcode), NONE);
+        }
+    }
+
+    // Defect guarded: a `CREATE_PROCESS` that flags the relay without a cap
+    // of its own taken as well-formed, so the module or creator cap is bound
+    // as the relay and released twice; the handler answers `None` with
+    // `INVALID_ARGUMENT` (`services/procmgr/docs/ipc-interface.md` § Label 1).
+    #[test]
+    fn create_process_relay_without_its_cap_is_rejected()
+    {
+        use ipc::procmgr_labels::{CREATE_ARGV_ENV, CREATE_DEATH_RELAY, CREATE_PROCESS};
+        let relay = CreateTailCaps::of_create(CREATE_PROCESS | CREATE_DEATH_RELAY);
+        assert_eq!(split_create_caps(&[5], relay), None);
+        let both = CreateTailCaps::of_create(CREATE_PROCESS | CREATE_DEATH_RELAY | CREATE_ARGV_ENV);
+        assert_eq!(split_create_caps(&[5, 8], both), None);
         assert_eq!(
-            CreateTailCaps::of_create_from_file(CREATE_DEATH_RELAY),
-            RELAY
+            split_create_caps(&[5, 6, 9], relay),
+            Some(caps(5, 6, 0, 9, &[]))
         );
-        assert_eq!(CreateTailCaps::of_create_process(0), NONE);
     }
 
     fn caps(source: u64, creator: u64, argv_env: u64, relay: u64, extra: &[u64]) -> CreateCaps<'_>

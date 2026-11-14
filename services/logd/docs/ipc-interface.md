@@ -41,9 +41,10 @@ logd restart is design intent; not yet implemented (#262), per svcmgr's
 § Supervision hierarchy.
 
 logd keeps `cap[0]`, the procmgr `cap[2]` (retained after `REGISTER_DEATH_EQ`), and the class SENDs
-`cap[3]` and `cap[4]` for its lifetime, using `cap[3]` to resolve and cache the serial driver's
-write endpoint and, when a framebuffer driver is present, `cap[4]` the framebuffer driver's;
-`cap[1]` is deleted after the handover release.
+`cap[3]` and `cap[4]` for its lifetime, using `cap[3]` to register a `WATCH_CLASS` watch and resolve
+the serial driver's write endpoint and, when a framebuffer driver is present, `cap[4]` the
+framebuffer driver's, on its main thread, which resolves a driver again only when devmgr signals
+that class's watch; `cap[1]` is deleted after the handover release.
 
 ## Endpoint
 

@@ -36,8 +36,11 @@ targets; only the one-time init-logd history pull
 
 * **Driver-mediated serial writer.** logd emits received log lines
   and its own diagnostics through the userspace serial driver
-  (`services/drivers/serial/`), resolved once via devmgr's
-  `QUERY_DEVICE` on the `serial` class SEND and written with `SERIAL_WRITE_BYTES`. logd
+  (`services/drivers/serial/`), resolved via devmgr's
+  `QUERY_DEVICE` on the `serial` class SEND and written with `SERIAL_WRITE_BYTES`. logd registers a
+  `WATCH_CLASS` watch on the class at start and resolves the driver then, on its main thread; it
+  resolves again, from that thread's wait-set loop, only when devmgr signals the watch (a
+  withdrawn driver's revoked SEND is replaced, a held SEND that still works is kept). logd
   holds no UART hardware authority. It cannot route its own
   diagnostics through `seraph::log!` because it IS the log receiver;
   the macro would self-IPC into the endpoint logd serves and
@@ -45,8 +48,8 @@ targets; only the one-time init-logd history pull
   output routes to the serial driver through a
   `std::os::seraph::set_panic_sink` sink rather than the log endpoint,
   and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
-  startup so no path can self-IPC. Until the driver is resolvable,
-  serial output is dropped while history still accrues; early-boot
+  startup so no path can self-IPC. The emit path never calls devmgr: while no driver is
+  resolved, serial output is dropped while history still accrues; early-boot
   output is covered by init-logd's direct-UART fallback. logd holds its
   own diagnostics until init-logd, which writes the UART directly, has
   acknowledged the handover release, so the two never write a line at
@@ -55,13 +58,13 @@ targets; only the one-time init-logd history pull
   [docs/console-model.md](../../docs/console-model.md).
 
 * **Driver-mediated framebuffer mirror.** logd also mirrors each line
-  it writes to serial onto the framebuffer, resolved at most once via
-  devmgr's `QUERY_DEVICE` on the `framebuffer` class SEND and written with `FB_WRITE_BYTES`,
+  it writes to serial onto the framebuffer, resolved via
+  devmgr's `QUERY_DEVICE` on the `framebuffer` class SEND, under a `WATCH_CLASS` watch handled as
+  the serial driver's, and written with `FB_WRITE_BYTES`,
   so the steady-state userspace log stream reaches the screen as well as
   the UART (matching the early-kernel console). The mirror soft-degrades
   to a no-op when no framebuffer driver is present (headless boot),
-  leaving serial the authoritative channel; the resolution is attempted
-  exactly once so a headless boot does not re-query devmgr per line.
+  leaving serial the authoritative channel; the emit path never queries devmgr.
   See [docs/console-model.md](../../docs/console-model.md).
 
 * **Log records.** Beside the text stream, a sender can send a log record,

@@ -16,7 +16,7 @@ use std::time::Duration;
 use gdb_rsp::command::Command;
 use gdb_rsp::frame::{AckMode, Event, PacketReader, PacketWriter, unescape};
 use gdb_rsp::{Error, PACKET_SIZE};
-use ipc::{ClassCallError, IpcMessage, devmgr_errors, serial_errors, serial_labels};
+use ipc::{IpcMessage, serial_errors, serial_labels};
 
 /// Logged once the fixture holds the debug port and waits for packets: the
 /// host test connects on seeing it. Kept in sync with
@@ -26,12 +26,6 @@ const READY_MARKER: &str = "READY on the debug port";
 /// The vendor query the fixture echoes: `qSeraph.Echo:<data>` is answered
 /// with `<data>`, unescaped and escaped again.
 const ECHO_QUERY: &[u8] = b"qSeraph.Echo:";
-
-/// How often, and how long apart, the fixture asks devmgr for the debug port
-/// while devmgr has not yet received the drivers directory its driver loads
-/// from.
-const QUERY_ATTEMPTS: u32 = 200;
-const QUERY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The bounded wait between reads, in milliseconds: the driver signals the
 /// RX notification on each interrupt, and the timeout recovers a lost one.
@@ -88,30 +82,17 @@ fn bootstrap_seed(creator_ep: u64, ipc_buf: *mut u64) -> Option<u64>
 }
 
 /// Ask devmgr for the debug port through `debug_port_class`, the
-/// `debug-port` class SEND (`QUERY_DEVICE` at ordinal 0), waiting out its
-/// driver's on-disk spawn: devmgr replies `NO_DEVICE` until
-/// `SET_DRIVERS_DIR` arrives, and a query received after that waits in
-/// devmgr until the on-disk batch has settled.
+/// `debug-port` class SEND: the class's first live driver, waited for on a
+/// `WATCH_CLASS` watch while devmgr serves none (`ipc::await_device`).
 fn query_debug_port(debug_port_class: u64, ipc_buf: *mut u64) -> Option<u64>
 {
-    for _ in 0..QUERY_ATTEMPTS
-    {
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        match unsafe { ipc::query_device(debug_port_class, 0, ipc_buf) }
-        {
-            Ok(cap) => return Some(cap),
-            Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) =>
-            {
-                std::thread::sleep(QUERY_INTERVAL);
-            }
-            Err(e) =>
-            {
-                std::os::seraph::log!("QUERY_DEVICE on the debug-port class refused ({e:?})");
-                return None;
-            }
-        }
-    }
-    None
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let found = unsafe { ipc::await_device(debug_port_class, 0, ipc_buf, || {}) };
+    found
+        .inspect_err(|e| {
+            std::os::seraph::log!("QUERY_DEVICE on the debug-port class refused ({e:?})");
+        })
+        .ok()
 }
 
 /// Register a notification the port's driver signals on receive; `0` when

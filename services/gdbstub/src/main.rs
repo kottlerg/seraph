@@ -41,8 +41,7 @@ use gdbstub::control::{self, Plan};
 use gdbstub::session::{self, Kernel, Page, Resumed, Session, Stop};
 use gdbstub::{regs, signal, stop_signal};
 use ipc::{
-    ClassCallError, IpcMessage, devmgr_errors, procmgr_errors, procmgr_labels, serial_errors,
-    serial_labels, svcmgr_labels,
+    IpcMessage, procmgr_errors, procmgr_labels, serial_errors, serial_labels, svcmgr_labels,
 };
 
 /// Logged once the stub is attached and serves the debug port; the batch
@@ -50,9 +49,8 @@ use ipc::{
 /// `xtask/src/commands/test_gdb.rs`.
 const READY_MARKER: &str = "attached; serving the debug port";
 
-/// How long, and how often, the stub looks for the debug port, and for its
-/// target in procmgr's process list at startup before it serves the port
-/// detached.
+/// How long, and how often, the stub looks for its target in procmgr's
+/// process list at startup before it serves the port detached.
 const FIND_ATTEMPTS: u32 = 600;
 const FIND_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -185,32 +183,13 @@ struct Port
 impl Port
 {
     /// Take the port from devmgr through `debug_port_class`, the
-    /// `debug-port` class SEND (`QUERY_DEVICE` at ordinal 0), waiting out
-    /// its driver's on-disk spawn, and register an RX notification on it.
+    /// `debug-port` class SEND: the class's first live driver, waited for on
+    /// a `WATCH_CLASS` watch while devmgr serves none
+    /// (`ipc::await_device`). Then register an RX notification on it.
     fn open(debug_port_class: u64, ipc_buf: *mut u64) -> Option<Self>
     {
-        let mut cap = 0;
-        for _ in 0..FIND_ATTEMPTS
-        {
-            // SAFETY: ipc_buf is the registered IPC buffer.
-            match unsafe { ipc::query_device(debug_port_class, 0, ipc_buf) }
-            {
-                Ok(c) =>
-                {
-                    cap = c;
-                    break;
-                }
-                Err(ClassCallError::Refused(devmgr_errors::NO_DEVICE)) =>
-                {
-                    std::thread::sleep(FIND_INTERVAL);
-                }
-                Err(_) => return None,
-            }
-        }
-        if cap == 0
-        {
-            return None;
-        }
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let cap = unsafe { ipc::await_device(debug_port_class, 0, ipc_buf, || {}) }.ok()?;
         let rx = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,
             |slab| syscall::cap_create_notification(slab).ok(),

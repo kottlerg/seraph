@@ -29,7 +29,7 @@ mod handover;
 mod slot;
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use ipc::log_labels::{LOG_QUERY_AUTHORITY, QUERY_HISTORY, QUERY_SLOTS};
@@ -54,6 +54,9 @@ const WS_BADGE_DEATH: u64 = 1;
 /// `WaitSet` badge for logd's resync notification ([`RESYNC_WALK_DONE`],
 /// [`RESYNC_REQUESTED`]).
 const WS_BADGE_RESYNC: u64 = 2;
+/// `WaitSet` badges for the serial and framebuffer class watches
+/// ([`OutputDriver`]), in [`resolve_output_drivers`]'s order.
+const WS_BADGE_WATCHES: [u64; 2] = [3, 4];
 
 /// Resync-notification bit the resync helper thread signals when its walk of
 /// procmgr's live badges ends.
@@ -151,13 +154,6 @@ fn main() -> !
         syscall::thread_exit();
     };
 
-    // Record the class SENDs for the emit path. The serial driver is
-    // resolved via `QUERY_DEVICE` on the `serial` class SEND before the
-    // handover pull (`resolve_output_drivers`), and again on a later emit
-    // while it is not resolvable; until then serial output is dropped
-    // (init-logd covered the pre-driver window) while history still accrues.
-    serial_init(caps.serial_class, caps.fb_class);
-
     // logd serves the log endpoint, so it must never emit through it. Route
     // panic / alloc-error / precondition output to the serial driver (the
     // path `self_log` already uses) via the std panic sink, and drop the
@@ -185,19 +181,22 @@ fn main() -> !
         syscall::thread_exit();
     };
     register_with_procmgr(caps.procmgr_death_auth_send, death_eq, ipc_buf);
-    // Resolve the serial and framebuffer drivers through devmgr now, while
-    // init-logd still drains the log endpoint: the first write that would
-    // resolve them is held until after the release, when the endpoint has no
-    // reader until the receive pool's gate opens, and devmgr may then be logging
+    // Register the serial and framebuffer class watches and resolve both
+    // drivers through devmgr now, while init-logd still drains the log
+    // endpoint: after the release the endpoint has no reader until the
+    // receive pool's gate opens, and devmgr may then be logging
     // (`services/devmgr/docs/responsibilities.md`, the on-disk settle).
-    resolve_output_drivers(ipc_buf);
+    // Until a driver is resolved its output is dropped (init-logd covered
+    // the pre-driver window) while history still accrues; the main thread
+    // resolves it again when devmgr signals its class's watch.
+    let watches = resolve_output_drivers(caps.serial_class, caps.fb_class, ipc_buf);
     let Some(resync_note) = create_resync_note()
     else
     {
         fatal("FATAL: resync notification create failed; halting");
         syscall::thread_exit();
     };
-    let Some(ws_cap) = create_wait_set(death_eq, resync_note)
+    let Some(ws_cap) = create_wait_set(death_eq, resync_note, watches)
     else
     {
         fatal("FATAL: wait_set create failed; halting");
@@ -280,7 +279,7 @@ fn main() -> !
     logd.lock().table = table;
     pool.open();
     let mut resync = Resync::new(caps.procmgr_death_auth_send, resync_note);
-    control_loop(ws_cap, logd, &mut resync);
+    control_loop(ws_cap, logd, &mut resync, watches, ipc_buf);
 }
 
 /// The state logd's receive workers and its main thread share.
@@ -345,13 +344,14 @@ fn create_resync_note() -> Option<u64>
     })
 }
 
-/// Build the main thread's 2-member wait set: the death event queue
-/// (`WS_BADGE_DEATH`) and the resync notification (`WS_BADGE_RESYNC`). The
+/// Build the main thread's wait set: the death event queue
+/// (`WS_BADGE_DEATH`), the resync notification (`WS_BADGE_RESYNC`), and each
+/// class watch registered (`WS_BADGE_WATCHES`; 0 for one that is not). The
 /// log endpoint is the receive workers', outside the set.
-fn create_wait_set(death_eq: u64, resync_note: u64) -> Option<u64>
+fn create_wait_set(death_eq: u64, resync_note: u64, watches: [u64; 2]) -> Option<u64>
 {
-    // The set's member capacity: the two members above.
-    const WS_MEMBERS: u32 = 2;
+    // The set's member capacity: the members above.
+    const WS_MEMBERS: u32 = 4;
     let Some(ws) = std::os::seraph::object_slab_retype(
         std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
         |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
@@ -376,6 +376,18 @@ fn create_wait_set(death_eq: u64, resync_note: u64) -> Option<u64>
         let _ = write!(buf, "wait_set_add(resync) err={e}");
         self_log(buf.as_str());
         return None;
+    }
+    for (&watch, &badge) in watches.iter().zip(&WS_BADGE_WATCHES)
+    {
+        // A watch the set cannot hold is never waited on: its driver stays
+        // as resolved at start.
+        if watch != 0
+            && let Err(e) = syscall::wait_set_add(ws, watch, badge)
+        {
+            let mut buf = SerialFmt::new();
+            let _ = write!(buf, "wait_set_add(watch {badge}) err={e}");
+            self_log(buf.as_str());
+        }
     }
     Some(ws)
 }
@@ -426,9 +438,18 @@ fn register_with_procmgr(procmgr_send: u64, death_eq: u64, ipc_buf: *mut u64)
 }
 
 /// The main thread's loop: drain deaths when the death queue is ready, so a
-/// queue no request wakes a worker for still empties, and run the
-/// [`Resync`] on its notification's bits.
-fn control_loop(ws_cap: u64, logd: &Logd, resync: &mut Resync) -> !
+/// queue no request wakes a worker for still empties, run the [`Resync`] on
+/// its notification's bits, and resolve an output driver again when devmgr
+/// signals its class watch ([`OutputDriver::refresh`]; `watches` in
+/// [`resolve_output_drivers`]'s order), on `ipc_buf`, the main thread's IPC
+/// buffer page.
+fn control_loop(
+    ws_cap: u64,
+    logd: &Logd,
+    resync: &mut Resync,
+    watches: [u64; 2],
+    ipc_buf: *mut u64,
+) -> !
 {
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
@@ -461,7 +482,22 @@ fn control_loop(ws_cap: u64, logd: &Logd, resync: &mut Resync) -> !
                     resync.start(logd);
                 }
             }
-            _ => (),
+            badge =>
+            {
+                for ((output, &watch), &watch_badge) in [&SERIAL, &FB]
+                    .into_iter()
+                    .zip(&watches)
+                    .zip(&WS_BADGE_WATCHES)
+                {
+                    if badge == watch_badge
+                    {
+                        // Take and clear the bits, as for the resync
+                        // notification above.
+                        let _ = syscall::notification_wait_timeout(watch, 1);
+                        output.refresh(ipc_buf);
+                    }
+                }
+            }
         }
     }
 }
@@ -975,27 +1011,95 @@ fn register_name(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize)
 
 // ── Serial output (driver-mediated) ────────────────────────────────────────
 
-/// The `serial` class SEND on devmgr's registry endpoint.
-static SERIAL_CLASS: AtomicU64 = AtomicU64::new(0);
-/// The `framebuffer` class SEND on devmgr's registry endpoint.
-static FB_CLASS: AtomicU64 = AtomicU64::new(0);
-/// Resolved SEND cap on the serial driver's service endpoint, cached after
-/// the first successful `QUERY_DEVICE` on [`SERIAL_CLASS`]. Zero =
-/// unresolved.
-static SERIAL_CAP: AtomicU64 = AtomicU64::new(0);
-/// Resolved SEND cap on the framebuffer driver's service endpoint. `0` =
-/// not yet attempted; [`FB_UNAVAILABLE`] = attempted and no driver present
-/// (headless boot); any other value = the resolved cap. Once devmgr has
-/// answered, the outcome is cached either way, so framebuffer mirroring
-/// stays a no-op on a headless boot without re-querying devmgr.
-static FB_CAP: AtomicU64 = AtomicU64::new(0);
-/// Set while one thread queries devmgr for the serial driver. Another
-/// thread that finds it set does not query (its bytes are dropped, as while
-/// the driver is not resolvable), so threads never query devmgr at once and
-/// no second cap is resolved.
-static SERIAL_RESOLVING: AtomicBool = AtomicBool::new(false);
-/// [`SERIAL_RESOLVING`] for the framebuffer driver.
-static FB_RESOLVING: AtomicBool = AtomicBool::new(false);
+/// An output driver logd writes through, resolved through devmgr: its class
+/// SEND and the driver's SEND. Only the main thread resolves
+/// ([`Self::start`] before the handover pull, then [`Self::refresh`] from
+/// [`control_loop`] when devmgr signals the class's `WATCH_CLASS` watch);
+/// the emit path only reads [`Self::cap`], so no receive worker waits on
+/// devmgr. A worker blocked on devmgr's reply while devmgr's control thread
+/// waits on a log call that worker would serve could deadlock the two: a
+/// query devmgr receives during a bind pass, whose answer would name no
+/// driver, waits for the pass's settle.
+struct OutputDriver
+{
+    /// The class SEND on devmgr's registry endpoint; 0 when the bootstrap
+    /// carried none.
+    class: AtomicU64,
+    /// The SEND on the driver's service endpoint; 0 while none is resolved,
+    /// and the emit path then drops the bytes.
+    cap: AtomicU64,
+}
+
+impl OutputDriver
+{
+    const fn new() -> Self
+    {
+        Self {
+            class: AtomicU64::new(0),
+            cap: AtomicU64::new(0),
+        }
+    }
+
+    /// The driver's SEND, or 0 while none is resolved.
+    fn cap(&self) -> u64
+    {
+        self.cap.load(Ordering::Acquire)
+    }
+
+    /// Record `class`, register the class watch, then resolve the driver,
+    /// so a change after the resolution signals the watch. Returns the
+    /// watch's Notification for the main thread's wait set; 0 when none is
+    /// registered (devmgr refused it, logged).
+    fn start(&self, class: u64, what: &str, ipc_buf: *mut u64) -> u64
+    {
+        self.class.store(class, Ordering::Release);
+        if class == 0
+        {
+            return 0;
+        }
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        let watch = match unsafe { ipc::watch_class(class, ipc_buf) }
+        {
+            Ok(watch) => watch.note,
+            Err(e) =>
+            {
+                let mut buf = SerialFmt::new();
+                let _ = write!(buf, "{what} class watch refused ({e:?}); resolved once");
+                self_log(buf.as_str());
+                0
+            }
+        };
+        self.resolve(ipc_buf);
+        watch
+    }
+
+    /// The class watch signalled: resolve the driver again, unless the SEND
+    /// held still names a served driver (a withdrawal revokes it).
+    fn refresh(&self, ipc_buf: *mut u64)
+    {
+        let held = self.cap();
+        if held != 0 && syscall::cap_info(held, syscall::CAP_INFO_TAG_RIGHTS).is_ok()
+        {
+            return;
+        }
+        self.resolve(ipc_buf);
+    }
+
+    /// Resolve the class's first live driver (`ipc::first_device`), or none.
+    fn resolve(&self, ipc_buf: *mut u64)
+    {
+        let class = self.class.load(Ordering::Acquire);
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        let cap = unsafe { ipc::first_device(class, ipc_buf) }.unwrap_or(0);
+        self.cap.store(cap, Ordering::Release);
+    }
+}
+
+/// The serial driver logd writes every line to.
+static SERIAL: OutputDriver = OutputDriver::new();
+/// The framebuffer driver logd mirrors every line to; none on a headless
+/// boot, and the mirror is then a no-op.
+static FB: OutputDriver = OutputDriver::new();
 /// Held across the `SERIAL_WRITE_BYTES` calls of one line, so a line longer
 /// than one call (a record renders to up to `RENDERED_MAX_BYTES`) is not
 /// split by another thread's. A lock held across an IPC call departs from
@@ -1010,23 +1114,9 @@ static SERIAL_EMIT: Mutex<()> = Mutex::new(());
 /// (`services/drivers/framebuffer/src/main.rs`).
 static FB_EMIT: Mutex<()> = Mutex::new(());
 
-/// Sentinel stored in [`FB_CAP`] once a resolution attempt finds no
-/// framebuffer driver. Repeating the `QUERY_DEVICE` per log line
-/// would open a deadlock window against devmgr's own logging — devmgr →
-/// `log_ep` → logd, while a logd thread blocks here on devmgr's reply — so
-/// the no-driver answer is cached. `u64::MAX` names no cap: no handle sets
-/// bit 63.
-const FB_UNAVAILABLE: u64 = u64::MAX;
 /// Maximum payload bytes per `SERIAL_WRITE_BYTES` or `FB_WRITE_BYTES` (one
 /// full IPC data area).
 const SERIAL_CHUNK: usize = syscall_abi::MSG_DATA_WORDS_MAX * 8;
-
-/// Record the class SENDs for the emit path.
-fn serial_init(serial_class: u64, fb_class: u64)
-{
-    SERIAL_CLASS.store(serial_class, Ordering::Release);
-    FB_CLASS.store(fb_class, Ordering::Release);
-}
 
 /// The calling thread's registered IPC buffer, for the emit path's
 /// `ipc_call`s: the main thread, each receive worker, and the resync helper
@@ -1038,48 +1128,15 @@ fn emit_ipc_buf() -> *mut u64
     std::os::seraph::current_ipc_buf()
 }
 
-/// Resolve (and cache) the serial driver's SEND cap via `QUERY_DEVICE` at
-/// ordinal 0 on the `serial` class. Returns 0 while the driver is not yet
-/// resolvable (devmgr not reachable, or driver not spawned) or while another
-/// thread resolves it ([`SERIAL_RESOLVING`]); the caller then drops the
-/// bytes.
-fn resolve_serial_cap(ipc_buf: *mut u64) -> u64
+/// Register the serial and framebuffer class watches and resolve both
+/// drivers ([`OutputDriver::start`]) on the main thread. Returns the watches'
+/// Notifications, 0 for one not registered.
+fn resolve_output_drivers(serial_class: u64, fb_class: u64, ipc_buf: *mut u64) -> [u64; 2]
 {
-    let cached = SERIAL_CAP.load(Ordering::Acquire);
-    if cached != 0
-    {
-        return cached;
-    }
-    let class = SERIAL_CLASS.load(Ordering::Acquire);
-    if class == 0
-        || SERIAL_RESOLVING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return 0;
-    }
-    // A thread that resolved it may have finished since the load above.
-    let mut cap = SERIAL_CAP.load(Ordering::Acquire);
-    if cap == 0
-    {
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        if let Ok(resolved) = unsafe { ipc::query_device(class, 0, ipc_buf) }
-        {
-            SERIAL_CAP.store(resolved, Ordering::Release);
-            cap = resolved;
-        }
-    }
-    SERIAL_RESOLVING.store(false, Ordering::Release);
-    cap
-}
-
-/// Resolve, and cache, the serial driver's and the framebuffer driver's SEND
-/// caps without writing anything: [`resolve_serial_cap`] and
-/// [`resolve_fb_cap`] on the calling thread's IPC buffer.
-fn resolve_output_drivers(ipc_buf: *mut u64)
-{
-    let _ = resolve_serial_cap(ipc_buf);
-    let _ = resolve_fb_cap(ipc_buf);
+    [
+        SERIAL.start(serial_class, "serial", ipc_buf),
+        FB.start(fb_class, "framebuffer", ipc_buf),
+    ]
 }
 
 /// Write `bytes` to the driver behind `cap` with one `op` call per
@@ -1100,8 +1157,7 @@ fn write_chunks(cap: u64, op: u64, bytes: &[u8], ipc_buf: *mut u64)
 }
 
 /// Write one fully-formatted line to the serial driver under
-/// [`SERIAL_EMIT`]. Silently drops the bytes if the driver is
-/// not yet resolvable.
+/// [`SERIAL_EMIT`]. Silently drops the bytes while no driver is resolved.
 fn serial_write(bytes: &[u8])
 {
     let ipc_buf = emit_ipc_buf();
@@ -1109,7 +1165,7 @@ fn serial_write(bytes: &[u8])
     {
         return;
     }
-    let cap = resolve_serial_cap(ipc_buf);
+    let cap = SERIAL.cap();
     if cap == 0
     {
         return;
@@ -1118,90 +1174,9 @@ fn serial_write(bytes: &[u8])
     write_chunks(cap, ipc::serial_labels::SERIAL_WRITE_BYTES, bytes, ipc_buf);
 }
 
-/// Resolve (and cache) the framebuffer driver's SEND cap via `QUERY_DEVICE`
-/// at ordinal 0 on the `framebuffer` class. Returns 0 while the driver is
-/// not yet resolvable (devmgr unreachable, headless boot, or driver not
-/// spawned) or while another thread resolves it ([`FB_RESOLVING`]); the
-/// caller then skips the framebuffer mirror. Uses the same IPC buffer the
-/// serial path resolved through.
-fn resolve_fb_cap(ipc_buf: *mut u64) -> u64
-{
-    let cached = FB_CAP.load(Ordering::Acquire);
-    if cached == FB_UNAVAILABLE
-    {
-        return 0;
-    }
-    if cached != 0
-    {
-        return cached;
-    }
-    let class = FB_CLASS.load(Ordering::Acquire);
-    // No class SEND recorded (serial_init sets it before any output, and
-    // a boot without the framebuffer class has none): no IPC, so nothing to
-    // latch.
-    if class == 0
-        || FB_RESOLVING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        return 0;
-    }
-    // A thread that resolved it may have finished since the load above.
-    let latched = FB_CAP.load(Ordering::Acquire);
-    let cap = if latched != 0
-    {
-        if latched == FB_UNAVAILABLE
-        {
-            0
-        }
-        else
-        {
-            latched
-        }
-    }
-    else
-    {
-        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        match unsafe { ipc::query_device(class, 0, ipc_buf) }
-        {
-            // devmgr answered. Latch the outcome so the threads issue no
-            // more QUERY_DEVICE: the resolved cap, or FB_UNAVAILABLE when
-            // devmgr reports no framebuffer driver (headless boot). The
-            // driver, when present, is spawned before svcmgr launches logd,
-            // so this resolves it. Latching the no-driver answer is what
-            // prevents a per-line re-query, which would open a deadlock
-            // window against devmgr's own logging (devmgr → log_ep → logd,
-            // while a logd thread blocks here on devmgr's reply).
-            Ok(cap) =>
-            {
-                FB_CAP.store(
-                    if cap == 0 { FB_UNAVAILABLE } else { cap },
-                    Ordering::Release,
-                );
-                cap
-            }
-            // Could not complete the query (transient — the call returned
-            // rather than blocking, so this is not the logd↔devmgr deadlock
-            // path). Leave the cache unset and retry on the next line,
-            // matching resolve_serial_cap; the serial class resolves on the
-            // same devmgr endpoint, so a hard failure here does not recur in
-            // practice.
-            Err(ipc::ClassCallError::Call(_)) => 0,
-            // devmgr answered with no driver.
-            Err(_) =>
-            {
-                FB_CAP.store(FB_UNAVAILABLE, Ordering::Release);
-                0
-            }
-        }
-    };
-    FB_RESOLVING.store(false, Ordering::Release);
-    cap
-}
-
 /// Mirror a fully-formatted line to the framebuffer driver under [`FB_EMIT`].
-/// Silently skips the mirror if the driver is not resolvable, so serial
-/// remains the always-present, authoritative channel (CI scrapes serial; the
+/// Silently skips the mirror while no driver is resolved, so serial remains
+/// the always-present, authoritative channel (CI scrapes serial; the
 /// framebuffer is an on-screen convenience).
 fn fb_write(bytes: &[u8])
 {
@@ -1210,7 +1185,7 @@ fn fb_write(bytes: &[u8])
     {
         return;
     }
-    let cap = resolve_fb_cap(ipc_buf);
+    let cap = FB.cap();
     if cap == 0
     {
         return;
@@ -1401,8 +1376,8 @@ impl LineBuf
 /// Panic-output sink registered with std via `set_panic_sink`. Routes
 /// logd's own panic / alloc-error / precondition output to the serial
 /// driver — never through the log endpoint logd serves. Forwards raw bytes
-/// (std frames the panic message), and drops them until the driver is
-/// resolvable. Must stay non-allocating and panic-free: it runs
+/// (std frames the panic message), and drops them while no driver is
+/// resolved. Must stay non-allocating and panic-free: it runs
 /// from the panic path, and takes no lock, so a panic on a thread that holds
 /// [`SERIAL_EMIT`] or the state lock still reaches the driver. Its calls use
 /// the calling thread's own IPC buffer ([`emit_ipc_buf`]), so a panic or
@@ -1414,7 +1389,7 @@ fn panic_to_serial(bytes: &[u8])
     {
         return;
     }
-    let cap = resolve_serial_cap(ipc_buf);
+    let cap = SERIAL.cap();
     if cap != 0
     {
         write_chunks(cap, ipc::serial_labels::SERIAL_WRITE_BYTES, bytes, ipc_buf);

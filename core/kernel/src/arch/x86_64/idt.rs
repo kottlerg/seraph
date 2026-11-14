@@ -719,7 +719,7 @@ macro_rules! isr_stub {
     ($name:ident, $vector:expr, has_error_code = false) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
-        unsafe extern "C" fn $name()
+        unsafe extern "custom" fn $name()
         {
             core::arch::naked_asm!(
                 "push 0",                     // dummy error code
@@ -732,7 +732,7 @@ macro_rules! isr_stub {
     ($name:ident, $vector:expr, has_error_code = true) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
-        unsafe extern "C" fn $name()
+        unsafe extern "custom" fn $name()
         {
             core::arch::naked_asm!(
                 concat!("push ", $vector), // vector number (error code already on stack)
@@ -757,7 +757,7 @@ macro_rules! isr_stub {
 /// the hardware iret frame at the top of stack for `iretq`.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn common_exception_trampoline()
+unsafe extern "custom" fn common_exception_trampoline()
 {
     core::arch::naked_asm!(
         concat!(
@@ -784,7 +784,7 @@ unsafe extern "C" fn common_exception_trampoline()
 /// kernel-half address (see [`paranoid_entry_asm`]).
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn paranoid_exception_trampoline()
+unsafe extern "custom" fn paranoid_exception_trampoline()
 {
     core::arch::naked_asm!(
         concat!(
@@ -803,14 +803,14 @@ unsafe extern "C" fn paranoid_exception_trampoline()
 /// Generate a naked ISR stub that enters through
 /// [`paranoid_exception_trampoline`]; otherwise as [`isr_stub`].
 ///
-/// The generated `unsafe extern "C" fn` is an IDT gate target only: it is never
-/// called, and its contract is the hardware interrupt frame it is entered with
+/// The generated `unsafe extern "custom" fn` is an IDT gate target only: it is
+/// never called, and its contract is the hardware interrupt frame it is entered with
 /// (`# Safety` of [`paranoid_exception_trampoline`]).
 macro_rules! paranoid_isr_stub {
     ($name:ident, $vector:expr, has_error_code = false) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
-        unsafe extern "C" fn $name()
+        unsafe extern "custom" fn $name()
         {
             core::arch::naked_asm!(
                 "push 0",                     // dummy error code
@@ -823,7 +823,7 @@ macro_rules! paranoid_isr_stub {
     ($name:ident, $vector:expr, has_error_code = true) => {
         #[cfg(not(test))]
         #[unsafe(naked)]
-        unsafe extern "C" fn $name()
+        unsafe extern "custom" fn $name()
         {
             core::arch::naked_asm!(
                 concat!("push ", $vector), // vector number (error code already on stack)
@@ -984,7 +984,7 @@ extern "C" fn irq_dispatch(vector: u64, user_frame: *mut TrapFrame)
 /// the `call` 16-byte aligned (identical parity to the exception stubs).
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn common_irq_trampoline()
+unsafe extern "custom" fn common_irq_trampoline()
 {
     core::arch::naked_asm!(
         concat!(
@@ -1052,7 +1052,7 @@ const DEVICE_STUB_STRIDE: usize = 16;
 /// stubs' addresses as gates.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn device_irq_stubs()
+unsafe extern "custom" fn device_irq_stubs()
 {
     // The `.set` counter gives each repetition its vector; `offset` makes the
     // assembler symbol's value an immediate, where a bare symbol in Intel
@@ -1095,7 +1095,7 @@ const _: () = assert!(DEVICE_STUB_STRIDE == 1 << 4);
 /// may preempt.
 #[cfg(not(test))]
 #[unsafe(naked)]
-pub unsafe extern "C" fn isr_timer()
+pub unsafe extern "custom" fn isr_timer()
 {
     core::arch::naked_asm!(
         "push 0",  // placeholder
@@ -1110,7 +1110,7 @@ pub unsafe extern "C" fn isr_timer()
 /// Spurious interrupts are not acknowledged via EOI — see Intel SDM §10.9.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn isr_spurious()
+unsafe extern "custom" fn isr_spurious()
 {
     core::arch::naked_asm!("iretq");
 }
@@ -1123,7 +1123,7 @@ unsafe extern "C" fn isr_spurious()
 /// and then `iretq`s, so hardware re-executes the trapping instruction.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn isr_nm()
+unsafe extern "custom" fn isr_nm()
 {
     core::arch::naked_asm!(
         // Hardware frame: [rsp] = rip, [rsp + 8] = cs.
@@ -1268,7 +1268,7 @@ extern "C" fn nm_handler()
 /// tail is dead.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn isr_page_fault()
+unsafe extern "custom" fn isr_page_fault()
 {
     core::arch::naked_asm!(
         concat!(
@@ -1604,7 +1604,7 @@ unsafe fn redirect_user_fault(
 /// clears its acknowledgement bit, and EOIs.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn ipi_tlb_shootdown_stub()
+unsafe extern "custom" fn ipi_tlb_shootdown_stub()
 {
     core::arch::naked_asm!(
         "push 0",   // placeholder
@@ -1631,7 +1631,7 @@ unsafe extern "C" fn ipi_tlb_shootdown_stub()
 /// `placeholder + vector` prologue matches the exception stubs' alignment parity.
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn ipi_nmi_backtrace_stub()
+unsafe extern "custom" fn ipi_nmi_backtrace_stub()
 {
     core::arch::naked_asm!(
         concat!(
@@ -1732,7 +1732,7 @@ extern "C" fn ipi_nmi_backtrace_handler(tf: *const TrapFrame, vector: u64, error
 /// (the interrupt itself wakes the CPU).
 #[cfg(not(test))]
 #[unsafe(naked)]
-unsafe extern "C" fn ipi_wakeup_stub()
+unsafe extern "custom" fn ipi_wakeup_stub()
 {
     core::arch::naked_asm!(
         "push 0",   // placeholder
@@ -1791,10 +1791,11 @@ pub unsafe fn init()
     // SAFETY: single-threaded boot.
     let idt = unsafe { &mut *core::ptr::addr_of_mut!(IDT) };
 
-    // Helper: set gate for `vec` pointing to `handler` (unsafe extern "C" fn)
-    // with IST index `ist`. Casts through `*const ()` to avoid lint.
+    // Helper: set gate for `vec` pointing to `handler` (a naked entry stub,
+    // taken as an `unsafe extern "custom" fn` pointer) with IST index `ist`.
+    // Casts through `*const ()` to avoid lint.
     // Every vector below is below 256, the table's length.
-    let mut set = |vec: usize, handler: unsafe extern "C" fn(), ist: u8| {
+    let mut set = |vec: usize, handler: unsafe extern "custom" fn(), ist: u8| {
         if let Some(entry) = idt.get_mut(vec)
         {
             *entry = IdtEntry::new(handler as *const () as u64, ist, 0);

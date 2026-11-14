@@ -266,7 +266,9 @@ span. A later fault on a page of the span the run did not cover is backed the sa
 fills in parts, each part one run and one frame record. A fault is therefore declined for want of
 RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the
 free pool holds no page, when every free page is in the system reserve and the process's node is
-outside it, or when the split of a run larger than the pages to back fails.
+outside it, or when the split of a run larger than the pages to back fails. A restore of a
+swapped chunk (design intent; not yet implemented) has its own admission
+([Eviction](#eviction)).
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
@@ -685,10 +687,10 @@ that would take a subtree over its max fails with `LIMIT`, distinct from the out
 system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
 with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
 least page-table donation its map needs), so a crash report tells a budget kill from an exhaustion
-kill ([Demand faults](#demand-faults)). Lowering a max reclaims nothing and kills no process: it
-refuses new charges until the subtree's usage falls below it. A node without a max is limited only
-by its ancestors and the system reserve. No recipe, and nothing else in the default image, sets a
-max, so no default per-process ceiling exists.
+kill ([Demand faults](#demand-faults)). Lowering a max reclaims
+nothing and kills no process: it refuses new charges until the subtree's usage falls below it. A
+node without a max is limited only by its ancestors and the system reserve. No recipe, and nothing
+else in the default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
@@ -804,10 +806,19 @@ chunk is evicting while the compression worker stores its pages; a fault on an e
 remaps the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to
 the free pool and its entry's link holds the store handle. An all-zero page takes no store space.
 A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
-bounded by one chunk's decompression: memmgr takes runs covering the chunk's backed pages, as a
-demand fault selects them ([Demand faults](#demand-faults)), maps them in a scratch window of its
-own, decompresses into them, maps them into the process, frees the store slot, and resumes the
-thread.
+bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
+any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
+10. A restore of a committed chunk is a committed fault: it draws from `promised` as any committed
+fault does ([Commit](#eviction)), and with A above 0 a restore that finds no frame compresses a
+victim within its turn or is declined as a commit overrun. A restore of an uncommitted chunk passes
+the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, with want the chunk's
+backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
+deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is otherwise
+declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the granule,
+so a restore is never clamped to part of a chunk. memmgr takes runs covering the chunk's backed
+pages, selected as a demand fault selects ([Demand faults](#demand-faults), run selection only),
+maps them in a scratch window of its own, decompresses into them, maps them into the process,
+frees the store slot, and resumes the thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,

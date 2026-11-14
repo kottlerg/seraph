@@ -138,7 +138,7 @@ pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
 pub(super) enum SeedPoll
 {
     /// `ES16` (`0b10`): bits \[15:0\] hold 16 bits of entropy.
-    Sample(u16),
+    Es16(u16),
     /// `BIST` (`0b00`, a self-test is running) or `WAIT` (`0b01`, no entropy
     /// is ready yet): a later read may return a sample.
     NotReady,
@@ -153,7 +153,7 @@ pub(super) fn decode_seed(value: u64) -> SeedPoll
 {
     match (value >> 30) & 0b11
     {
-        0b10 => SeedPoll::Sample((value & 0xFFFF) as u16),
+        0b10 => SeedPoll::Es16((value & 0xFFFF) as u16),
         0b11 => SeedPoll::Dead,
         _ => SeedPoll::NotReady,
     }
@@ -192,7 +192,7 @@ pub(super) fn seed_word(
         {
             match decode_seed(read())
             {
-                SeedPoll::Sample(sample) => break sample,
+                SeedPoll::Es16(sample) => break sample,
                 SeedPoll::NotReady =>
                 {
                     if expired()
@@ -623,11 +623,11 @@ mod tests
     #[test]
     fn seed_status_decodes_by_opst_alone()
     {
-        assert_eq!(decode_seed(seed(0b10, 0xABCD)), SeedPoll::Sample(0xABCD));
+        assert_eq!(decode_seed(seed(0b10, 0xABCD)), SeedPoll::Es16(0xABCD));
         // Custom bits [23:16] beside a sample are not entropy.
         assert_eq!(
             decode_seed(seed(0b10, 0xABCD) | (0x5A << 16)),
-            SeedPoll::Sample(0xABCD)
+            SeedPoll::Es16(0xABCD)
         );
         assert_eq!(decode_seed(seed(0b00, 0)), SeedPoll::NotReady);
         assert_eq!(decode_seed(seed(0b01, 0)), SeedPoll::NotReady);

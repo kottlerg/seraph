@@ -195,6 +195,19 @@ Each feature is classified per architecture as one of:
   NAPOT page encodings; asserted by `paging::verify_paging_extensions`, before the first
   userspace mapping, from the bootloader-confirmed hart capabilities. Svade is the baseline A/D-bit
   model.
+- **Ssstateen — `sstateen0`, granted to S-mode** — the state-enable CSR through which the kernel
+  keeps U-mode from every state it does not save and restore on a context switch: state a process
+  could reach and the kernel does not switch would persist into the next process on the hart, a
+  leak or a covert channel below the capability boundary. Every hart writes `sstateen0` with no
+  state enabled (the custom state of `C`, the Zfinx `fcsr` of `FCSR`, which is read-only zero on a
+  hart with F, the Zcmt `jvt` of `JVT`, and every bit a later extension defines) and halts the
+  boot when the write does not read back
+  (`core/kernel/src/arch/riscv64/cpu.rs`, `disable_unswitched_user_state`). `sstateen1` to
+  `sstateen3` are not written: no ratified extension defines state in them. The M-mode firmware
+  must grant S-mode the CSR (`mstateen0.SE0`); OpenSBI does so on a hart with Smstateen, the
+  M-mode part of the extension, which the firmware alone uses. The RVA23 floor mandates
+  Ssstateen, so requiring it excludes no in-floor hardware. Under emulation the CPU model must
+  enable Smstateen (`smstateen=on`, [build-system.md](build-system.md) § QEMU and Firmware).
 - **`time` CSR (Zicntr)** — the timestamp source.
 - **Address translation**: one of Sv39/Sv48/Sv57, negotiated at boot (DTB
   `mmu-type` claim, confirmed by a `satp` write-probe that falls back to the next-narrower mode;
@@ -230,8 +243,6 @@ Each feature is classified per architecture as one of:
 
 - **PLIC** — not driven: the kernel has no PLIC path, and a platform that presents only a PLIC
   does not boot.
-- **Ssstateen / Smstateen** — not used, although the RVA23 floor mandates Ssstateen: the kernel
-  does not program the state-enable CSRs.
 - **Legacy / embedded RISC-V profiles** — outside the RVA23 floor.
 - **Port-mapped I/O** — RISC-V has no port I/O; all device access is MMIO.
 - **Cache-block-management instructions (Zicbom/Zicboz/Zicbop)** — not used; the kernel assumes
@@ -280,12 +291,15 @@ feature it halts with a message naming the specific feature, rather than failing
   boot hart's, and every hart without ASIDs; emulated RISC-V provides ASID, so unlike x86-64 PCID
   this is gated). A hart without V, the boot hart or a secondary one, is stopped by the kernel's
   fatal illegal-instruction trap at its `vlenb` read rather than by a message naming V; the boot
-  hart's named message covers a malformed `vlenb`. Extension requirements introduced by a subsystem
-  (the timer, the paging extensions, AIA) are asserted by that subsystem during boot — the timer,
-  for example, refuses to boot unless the bootloader confirmed Sstc (and a timebase frequency) for
-  every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus` nodes), and the interrupt
-  initialisation unless it confirmed Ssaia for every hart and reported a supervisor-level APLIC
-  domain and IMSIC layout.
+  hart's named message covers a malformed `vlenb`. Ssstateen is asserted by access on every hart,
+  the boot hart in Phase 5 and each secondary hart at its bring-up: a hart without it, or whose
+  firmware keeps `sstateen0` from S-mode, traps at the write, and the trap's fixup halts the boot
+  with a message naming Ssstateen, as does a write that does not read back. Extension requirements
+  introduced by a subsystem (the timer, the paging extensions, AIA) are asserted by that subsystem
+  during boot — the timer, for example, refuses to boot unless the bootloader confirmed Sstc (and a
+  timebase frequency) for every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus`
+  nodes), and the interrupt initialisation unless it confirmed Ssaia for every hart and reported a
+  supervisor-level APLIC domain and IMSIC layout.
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or

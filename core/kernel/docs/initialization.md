@@ -393,6 +393,14 @@ the fatal trap a hart without V takes at the read finds its per-CPU pointer inst
 `vlenb` of 0, above 8192, or not a power of two halts the boot by name; each AP checks its own
 `vlenb` against the boot hart's at bring-up (Phase 8) and halts the boot on a mismatch.
 
+Next the BSP disables, for user mode, the state the kernel does not switch
+(`cpu::disable_unswitched_user_state`), after its per-CPU install for the same reason. RISC-V
+writes `sstateen0` with no state enabled and halts the boot by name when the write traps (no
+Ssstateen, or firmware that left `mstateen0.SE0` clear) or does not read back; each AP does the
+same at bring-up (Phase 8). x86-64 has no state-enable register: the XCR0 set of step 2 is the
+extended state ring 3 reaches, and the XSAVE switch saves all of it
+([platform-requirements.md](../../../docs/platform-requirements.md) § riscv64 Classification).
+
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
 extensions, then enables hardware address-space tags (x86-64 PCID with INVPCID where present,
@@ -418,9 +426,10 @@ range). See [entropy.md](entropy.md).
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
 gates only the SBI HSM and RFENCE extensions; the boot hart's Vector extension, the ASID-tagged
 TLB, Sstc and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here,
-at their initialization sites (each secondary hart's Vector extension, `vlenb` and ASID-tagged
-TLB in Phase 8). A boot hart without V halts through the fatal illegal-instruction trap at its
-`vlenb` read; the named message covers a `vlenb` of 0, above 8192, or not a power of two
+at their initialization sites, and Ssstateen where the BSP writes `sstateen0` (each secondary
+hart's Vector extension, `vlenb`, Ssstateen and ASID-tagged TLB in Phase 8). A boot hart
+without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
+message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
 
 **Completion criterion:** Interrupts are enabled, the preemption timer is running,
@@ -679,8 +688,11 @@ firmware hart id past the target's hart index, or outside the reported IMSIC lay
 itself the same way at its IMSIC file's initialisation, before announcing itself, as does an
 AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot
 hart's"), one without the Vector extension, which takes a fatal illegal-instruction trap at its
-`vlenb` read, or one without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported",
-from `paging::enable_tagged_tlb` in `kernel_entry_ap`).
+`vlenb` read, one whose `sstateen0` the kernel cannot write or that does not read back
+("Ssstateen: sstateen0 not accessible from S-mode …" or "Ssstateen: sstateen0 kept a U-mode
+state enable set", from `cpu::disable_unswitched_user_state` in `kernel_entry_ap`), or one
+without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported", from
+`paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
 marker is matched by the `run-parallel` fail regex, which turns a QEMU run red
 (see [entropy.md](entropy.md) § Testing).
@@ -883,7 +895,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, no writable `sstateen0`, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

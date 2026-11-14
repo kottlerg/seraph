@@ -260,7 +260,9 @@ span. A later fault on a page of the span the run did not cover is backed the sa
 fills in parts, each part one run and one frame record. A fault is therefore declined for want of
 RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the
 free pool holds no page, when every free page is in the system reserve and the process's node is
-outside it, or when the split of a run larger than the pages to back fails.
+outside it, when the free pages above the reserve hold fewer than a swapped chunk's backed pages
+for a restore ([Eviction](#eviction)), or when the split of a run larger than the pages to back
+fails.
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
@@ -679,15 +681,17 @@ that would take a subtree over its max fails with `LIMIT`, distinct from the out
 system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
 with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
 least page-table donation its map needs), so a crash report tells a budget kill from an exhaustion
-kill ([Demand faults](#demand-faults)). Lowering a max reclaims nothing and kills no process: it
-refuses new charges until the subtree's usage falls below it. A node without a max is limited only
-by its ancestors and the system reserve. No recipe, and nothing else in the default image, sets a
-max, so no default per-process ceiling exists.
+kill ([Demand faults](#demand-faults)). A restore of a swapped chunk is never declined with code
+10, since it is not admitted against the max ([Eviction](#eviction)). Lowering a max reclaims
+nothing and kills no process: it refuses new charges until the subtree's usage falls below it. A
+node without a max is limited only by its ancestors and the system reserve. No recipe, and nothing
+else in the default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
 reserve, and a demand fault of such a node backs only the free pages above the reserve, declined
-with code 7 when they hold not even the faulting page. It is a floor for the core and a limit on no
+with code 7 when they hold not even the faulting page, and so is a restore of a swapped chunk
+when they hold fewer than the chunk's backed pages. It is a floor for the core and a limit on no
 process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
 Reserve membership is an attribute each node takes when it is created, not one its children
 inherit. The nodes of memmgr's boot records
@@ -764,10 +768,15 @@ chunk is evicting while the compression worker stores its pages; a fault on an e
 remaps the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to
 the free pool and its entry's link holds the store handle. An all-zero page takes no store space.
 A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
-bounded by one chunk's decompression: memmgr takes runs covering the chunk's backed pages, as a
-demand fault selects them ([Demand faults](#demand-faults)), maps them in a scratch window of its
-own, decompresses into them, maps them into the process, frees the store slot, and resumes the
-thread.
+bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
+any ancestor, since the node stays charged for its evicted pages. The system reserve applies to it
+as to any demand fault ([Distribution policy](#distribution-policy), System reserve): for a node
+outside the reserve it takes only free pages above the reserve, after the deferred recheck, and is
+declined with code 7 otherwise, the chunk staying swapped and its store slot kept; the chunk is the
+granule, so a restore is never clamped to part of a chunk. A reserve node's restore draws on the
+reserve. memmgr takes runs covering the chunk's backed pages, selected as a demand fault selects
+([Demand faults](#demand-faults), run selection only), maps them in a scratch window of its own,
+decompresses into them, maps them into the process, frees the store slot, and resumes the thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,

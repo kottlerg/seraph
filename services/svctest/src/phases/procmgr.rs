@@ -387,8 +387,8 @@ pub fn init_cspace_released_phase(_: &Caps)
 
 /// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, `procmgr_concurrent_spawn`,
 /// `crash_endpoint`,
-/// `procmgr_dma_hold`, and `death_queue_growth` run after the namespace cluster has established
-/// attenuation invariants.
+/// `procmgr_dma_hold`, `create_process_large_module`, and `death_queue_growth` run after the
+/// namespace cluster has established attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
 {
     &[
@@ -435,6 +435,10 @@ pub fn command_phases() -> &'static [Phase]
         Phase {
             name: "procmgr_dma_hold",
             run: procmgr_dma_hold_phase,
+        },
+        Phase {
+            name: "create_process_large_module",
+            run: create_process_large_module_phase,
         },
         Phase {
             name: "death_queue_growth",
@@ -1968,6 +1972,178 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
          {DMA_HOLD_WINDOWS} windows"
     );
     std::os::seraph::log!("procmgr_dma_hold phase passed");
+}
+
+/// Pages ahead of the program-header data in the module
+/// [`create_process_large_module_phase`] builds: 512 KiB, so every segment,
+/// the relocation table and the TLS template lie past the module's first 128
+/// pages.
+const LARGE_MODULE_SHIFT_PAGES: u64 = 128;
+
+/// `QUERY_PROCESS` polls for the large-module child's exit. A test wait bound.
+const LARGE_MODULE_EXIT_POLLS: u32 = 100_000;
+
+/// `image`, an ELF64 little-endian image, laid out as a module whose file data
+/// lies past its first [`LARGE_MODULE_SHIFT_PAGES`] pages: the image whole at
+/// byte 0, where the loader reads its ELF header, program headers and section
+/// headers, and a second copy at the shift, to which every program header's
+/// `p_offset` is moved. Panics when `image` is too short for the headers it
+/// names.
+fn shifted_module(image: &[u8]) -> Vec<u8>
+{
+    let shift = LARGE_MODULE_SHIFT_PAGES
+        .checked_mul(syscall_abi::PAGE_SIZE)
+        .expect("the shift fits a u64");
+    let shift_bytes = usize::try_from(shift).expect("the shift fits a usize");
+    let len = shift_bytes
+        .checked_add(image.len())
+        .expect("the module length fits a usize");
+    let mut module = vec![0u8; len];
+    module
+        .get_mut(..image.len())
+        .expect("the module holds the image at byte 0")
+        .copy_from_slice(image);
+    module
+        .get_mut(shift_bytes..)
+        .expect("the module holds the image at the shift")
+        .copy_from_slice(image);
+
+    // The little-endian field of `width` bytes at `at` (at most 8).
+    let field = |at: usize, width: usize| -> u64 {
+        let mut word = [0u8; 8];
+        let end = at
+            .checked_add(width)
+            .expect("a header field's end fits a usize");
+        word.get_mut(..width)
+            .expect("a header field is at most 8 bytes")
+            .copy_from_slice(
+                image
+                    .get(at..end)
+                    .expect("hello's headers lie inside the image"),
+            );
+        u64::from_le_bytes(word)
+    };
+    let index = |n: u64| usize::try_from(n).expect("an ELF header field fits a usize");
+    // ELF64: `e_phoff` at 0x20, `e_phentsize` at 0x36, `e_phnum` at 0x38;
+    // `p_offset` at 8 within a program header.
+    let phoff = index(field(0x20, 8));
+    let phentsize = index(field(0x36, 2));
+    for i in 0..index(field(0x38, 2))
+    {
+        let at = i
+            .checked_mul(phentsize)
+            .and_then(|o| o.checked_add(phoff))
+            .and_then(|o| o.checked_add(8))
+            .expect("a program header's offset fits a usize");
+        let moved = field(at, 8)
+            .checked_add(shift)
+            .expect("a moved p_offset fits a u64");
+        let end = at.checked_add(8).expect("a p_offset's end fits a usize");
+        module
+            .get_mut(at..end)
+            .expect("hello's program headers lie inside the image")
+            .copy_from_slice(&moved.to_le_bytes());
+    }
+    module
+}
+
+/// procmgr loads a module whose file data lies past its first 128 pages:
+/// `CREATE_PROCESS` maps the module's whole Memory cap
+/// (`services/procmgr/docs/ipc-interface.md` § Label 1). svctest holds no boot
+/// module, so it builds one from `/programs/hello` ([`shifted_module`]) in a
+/// contiguous memmgr grant, creates the child from a map-only derivation of
+/// the grant, starts it, and checks that it exits cleanly.
+pub fn create_process_large_module_phase(_: &Caps)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels, procmgr_process_state};
+
+    let image = std::fs::read("/programs/hello").expect("reading /programs/hello failed");
+    let module = shifted_module(&image);
+    let pages = (module.len() as u64).div_ceil(syscall_abi::PAGE_SIZE);
+    assert!(
+        pages > LARGE_MODULE_SHIFT_PAGES,
+        "the module spans {pages} pages, not past {LARGE_MODULE_SHIFT_PAGES}"
+    );
+    let (grant, region_id) =
+        super::memmgr::try_request_contiguous(u32::try_from(pages).expect("page count fits u32"))
+            .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
+
+    let aspace = startup_info().self_aspace;
+    let range = std::os::seraph::reserve_pages(pages).expect("reserve_pages for the module");
+    let va = range.va_start();
+    // SAFETY: `range` is a fresh reservation of `pages` pages from the
+    // per-process arena, owned here: VA no Rust object or IPC page occupies.
+    unsafe { std::os::seraph::mem_map_funded(grant, aspace, va, 0, pages, syscall::MAP_WRITABLE) }
+        .expect("mapping the module grant writable failed");
+    {
+        // SAFETY: the `pages` pages at `va` were just mapped writable, and the
+        // module is at most that long; the slice ends before the unmap below.
+        let dst = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, module.len()) };
+        dst.copy_from_slice(&module);
+    }
+    // SAFETY: the span is `range`, mapped above; the slice over it is dead.
+    unsafe { syscall::mem_unmap(aspace, va, pages) }.expect("unmapping the module grant failed");
+    std::os::seraph::unreserve_pages(range);
+
+    let transfer = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP)
+        .expect("deriving the module's transfer cap failed");
+    let create = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
+        .cap(transfer)
+        .build();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe {
+        ipc::ipc_call(
+            startup_info().procmgr_endpoint,
+            &create,
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .expect("CREATE_PROCESS from the large module: ipc_call failed");
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "CREATE_PROCESS from a {pages}-page module whose file data lies past page \
+         {LARGE_MODULE_SHIFT_PAGES} replied {}",
+        reply.label
+    );
+    let &[handle, thread] = reply.caps()
+    else
+    {
+        panic!("CREATE_PROCESS replied {} caps", reply.caps().len());
+    };
+
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::START_PROCESS),
+        procmgr_errors::SUCCESS,
+        "START_PROCESS of the large-module child",
+    );
+    let exit = (0..LARGE_MODULE_EXIT_POLLS).find_map(|_| {
+        let (state, reason) = process_state_and_reason(handle);
+        if state == procmgr_process_state::EXITED
+        {
+            return Some(reason);
+        }
+        std::thread::yield_now();
+        None
+    });
+    let reason = exit.expect("the large-module child did not exit");
+    assert_eq!(
+        reason, 0,
+        "the large-module child exited with reason {reason:#x}"
+    );
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+        procmgr_errors::SUCCESS,
+        "DESTROY_PROCESS of the exited large-module child",
+    );
+    for cap in [thread, handle]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    super::memmgr::release_grant(grant, region_id);
+    std::os::seraph::log!("create_process_large_module phase passed ({pages} pages)");
 }
 
 /// `CONFIGURE_PIPE` cells on a child created (and never started) through raw

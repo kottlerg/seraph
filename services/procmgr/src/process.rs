@@ -3133,7 +3133,8 @@ pub fn create_process(
 ) -> Result<CreateResult, u64>
 {
     let (module_scratch, module_pages) = loader::map_module(module_memory_cap, self_aspace)?;
-    // `map_module` returns at most 128 pages, so the product is small.
+    // `map_module`'s page count is the module cap's size in whole pages, so
+    // the product is at most that size and does not saturate.
     let module_size = module_pages.saturating_mul(PAGE_SIZE);
     let module_va = module_scratch.va();
 

@@ -807,7 +807,7 @@ impl<T> Locked<T>
         // SAFETY: paired with unlock_raw below on the only path out.
         let saved = unsafe { self.lock.lock_raw() };
         // SAFETY: the lock is held, so this is the only reference to the value.
-        let result = f(unsafe { &mut *self.value.get() });
+        let result = f(unsafe { self.value.as_mut_unchecked() });
         // SAFETY: paired with lock_raw above.
         unsafe { self.lock.unlock_raw(saved) };
         result

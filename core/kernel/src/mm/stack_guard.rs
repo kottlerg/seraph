@@ -103,7 +103,7 @@ mod live
             // retain the list past its call.
             let saved = unsafe { self.lock.lock_raw() };
             // SAFETY: the lock is held, so this is the head's only reference.
-            let head = unsafe { &mut *self.head.get() };
+            let head = unsafe { self.head.as_mut_unchecked() };
             let mut list = FreeList { head };
             let r = f(&mut list);
             // SAFETY: paired with the acquisition above.

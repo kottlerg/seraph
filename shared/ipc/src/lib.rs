@@ -1404,9 +1404,9 @@ pub mod svcmgr_labels
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
 {
-    /// Badged SEND on the root filesystem's namespace endpoint at
-    /// its root directory. The driver behind it (fatfs today, any
-    /// FS driver tomorrow) is opaque to consumers.
+    /// Badged SEND on vfsd's namespace endpoint at its synthetic root:
+    /// the namespace root, which crosses mounts. The fs drivers behind
+    /// it are opaque to consumers.
     pub const ROOTFS_ROOT: &[u8] = b"rootfs.root";
 
     /// `pwrmgr_labels::SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's

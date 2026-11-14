@@ -152,9 +152,9 @@ fn main() -> !
 /// separately on the launch path ([`definitions::launch`]).
 fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrCaps)
 {
-    // rootfs.root — SEND on the root filesystem's namespace endpoint,
-    // endowed pre-derived by init. Seed-only: the whole-filesystem namespace
-    // reaches only the recipes that seed it.
+    // rootfs.root — SEND on vfsd's synthetic root, endowed pre-derived by
+    // init from its system-root cap. Seed-only: the whole namespace, across
+    // every mount, reaches only the recipes that seed it.
     publish_endowed_send(
         registry,
         caps.rootfs_root,

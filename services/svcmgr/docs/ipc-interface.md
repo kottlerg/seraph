@@ -49,7 +49,7 @@ no change to the encoding.
 |---|---|
 | slot 0 | svcmgr's service endpoint (RECV; required) |
 | slot 1 | svcmgr's own bootstrap endpoint (RECV — serves launched/restarted children; required) |
-| slot 2 | SEND on the root filesystem's namespace endpoint (published as `rootfs.root`; absent if init could not derive it) |
+| slot 2 | SEND on vfsd's synthetic root (the namespace root, which crosses mounts; [namespace-composition.md](../../vfsd/docs/namespace-composition.md)), derived from init's system-root cap (published as `rootfs.root`; absent if init could not derive it) |
 | slot 3 | `SEND\|GRANT`, badge-0 source on devmgr's registry endpoint (absent if init holds none or its derive fails) |
 | slot 4 | `vfsd_labels::MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.mount`; absent if its derive fails) |
 | slot 5 | `vfsd_labels::DENY_BADGE`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.deny`; absent if its derive fails) |

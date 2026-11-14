@@ -85,7 +85,9 @@ disjoint surfaces:
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo` page and `InitInfo` region, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
-overlap within a single address space.
+overlap within a single address space. None reaches below
+`USER_VA_FLOOR` (64 KiB, `abi/syscall`), under which the kernel maps no
+page ([Memory Model](memory-model.md) § Userspace Layout).
 
 `std::sys::seraph` is the single chooser of byte-heap and
 page-reservation VAs within the running process. The creator picks
@@ -429,8 +431,11 @@ owns them.
 - **Heap** — the kernel only sees mappings of Memory caps at user-
   supplied VAs.
 - **VA allocation policy** — the kernel enforces page alignment and
-  the user-half bound; it does not track VAs, and allocates none except
-  init's bootstrap layout and image bias, drawn once per boot.
+  the user range `[USER_VA_FLOOR, user_va_top())`: no page below the
+  64 KiB floor is ever mapped, and every mapping syscall refuses a range
+  that starts below it ([Memory Model](memory-model.md) § Userspace
+  Layout). It does not track VAs, and allocates none except init's
+  bootstrap layout and image bias, drawn once per boot.
 - **Memory ownership beyond the derivation tree** — the kernel does
   not know which process "owns" a Memory.
 - **Process death implications for memory** — when a process's

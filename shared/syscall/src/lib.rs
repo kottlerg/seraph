@@ -755,9 +755,9 @@ pub fn cap_create_thread(
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
-/// non-canonical, or the range leaves the user half), `InvalidArgument`
-/// (zero page count, overflow, the range runs past the memory region, or
-/// `offset_pages` lies below the retype cursor),
+/// non-canonical, below `USER_VA_FLOOR`, or the range leaves the user half),
+/// `InvalidArgument` (zero page count, overflow, the range runs past the
+/// memory region, or `offset_pages` lies below the retype cursor),
 /// `InvalidCapability` (also when `memory_cap` is revoked or deleted while
 /// the call runs), `InsufficientRights` (requested permissions exceed the
 /// cap's rights), `WxViolation`, or `OutOfMemory` (page-table
@@ -811,8 +811,9 @@ pub unsafe fn mem_map(
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
-/// or the range leaves the user half), `InvalidArgument` (zero page count or
-/// overflow), `InvalidCapability`, or `InsufficientRights` (cap lacks Map).
+/// below `USER_VA_FLOOR`, or the range leaves the user half),
+/// `InvalidArgument` (zero page count or overflow), `InvalidCapability`, or
+/// `InsufficientRights` (cap lacks Map).
 #[inline]
 pub unsafe fn mem_unmap(aspace_cap: u64, virt: u64, page_count: u64) -> Result<(), i64>
 {
@@ -879,7 +880,8 @@ pub unsafe fn mem_unmap_reclaim(aspace_cap: u64, virt: u64, page_count: u64) -> 
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
-/// the range leaves the user half, or a page in it is not mapped),
+/// below `USER_VA_FLOOR`, the range leaves the user half, or a page in it is
+/// not mapped),
 /// `InvalidArgument` (zero page count, overflow, or no free frame during the
 /// page-table walk), `WxViolation`, `InvalidCapability`, or
 /// `InsufficientRights` (requested permissions exceed the cap's rights or
@@ -2331,8 +2333,9 @@ pub fn irq_remap(authority: u64, setting: u64) -> Result<(), i64>
 /// [`mmio_split`] stay safe functions.
 ///
 /// # Errors
-/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned or
-/// non-canonical, or the range leaves the user half), `InvalidCapability`,
+/// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,
+/// non-canonical or below `USER_VA_FLOOR`, or the range leaves the user
+/// half), `InvalidCapability`,
 /// `InsufficientRights` (a cap lacks Map), `InvalidArgument` (MMIO region
 /// size zero, unaligned, or overflowing), or `OutOfMemory` (page-table growth
 /// pool exhausted; refill with [`cap_create_aspace`] in augment mode; or, for a

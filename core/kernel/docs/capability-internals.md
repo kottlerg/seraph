@@ -194,11 +194,13 @@ Every resolution of a handle passes through `slot` or `slot_mut`: `pin_slot`, `l
 capability-tree handlers, the IPC transfer pre-validation, and explicit placement.
 
 A misspeculated use of the null object that `pin_checked` folds a failed lookup into dereferences
-null at a small offset. Userspace can map virtual page 0 (#741), and the documents do not state
-whether SMAP or a clear `SUM` stop that transient load. A rights bit a handler tests after
-resolution, beyond those its lookup requires, is a branch only, `sys_wait_set_add`'s member right
-aside (folded, above); those sites, and the user-supplied indexes that select a kernel array entry
-outside the capability path, are recorded on #270.
+null at a small offset. No address space maps a page below `USER_VA_FLOOR` (64 KiB), which every
+capability object and the TCB fit under (`cap::object` asserts it at compile time), so that load
+never reads memory a process chose, whether or not SMAP or a clear `SUM` stop it (see
+[docs/memory-model.md § Userspace Layout](../../../docs/memory-model.md#userspace-layout)). A
+rights bit a handler tests after resolution, beyond those its lookup requires, is a branch only,
+`sys_wait_set_add`'s member right aside (folded, above); those sites, and the user-supplied
+indexes that select a kernel array entry outside the capability path, are recorded on #270.
 
 ### Free Slot Tracking
 

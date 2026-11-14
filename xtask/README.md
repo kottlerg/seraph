@@ -1289,18 +1289,24 @@ File a GitHub Issue with the labels and milestone
 
 ```
 cargo xtask issue-file --title <title> --body-file <path> --label <label>... \
-    (--milestone <title> | --unscheduled)
+    (--milestone <title> | --unscheduled --reason <hardware|not-possible|undecided>)
 ```
 
 The command refuses a filing without a class label, without a subsystem label, or without a
-milestone decision (`--unscheduled` is for future-state work no release has scheduled). It
-refuses a rolling follow-up Issue (a title ending `: defects found by review`) under anything
-but the current milestone, the lowest-versioned open one, which it reads from GitHub, and one
-whose title an open Issue of the current milestone already carries: the scope has its rolling
-Issue there (§ Follow-up Issues). A rolling Issue of an earlier milestone carries the same title
-and does not count. After
-filing it reads the Issue back and fails when a label or the milestone was not applied, naming
-what is missing.
+milestone decision. `--unscheduled` files an Issue without a milestone, which
+[docs/conventions.md](../docs/conventions.md) § Milestones allows only for an Issue that cannot
+be worked on now, and needs `--reason`: `hardware` (it needs hardware the project does not
+have), `not-possible` (it is not possible yet) or `undecided` (whether it belongs in the project
+is itself undecided). The body states the same reason in a line that begins
+`No milestone: <reason>`, the reason as `--reason` names it and the rest of the line saying why;
+the command refuses an `--unscheduled` filing whose body has no such line or one naming another
+reason, and a filing under a milestone whose body has one. It refuses a rolling follow-up Issue
+(a title ending `: defects found by review`) under anything but the current milestone, the
+lowest-versioned open one, which it reads from GitHub, and one whose title an open Issue of the
+current milestone already carries: the scope has its rolling Issue there (§ Follow-up Issues).
+A rolling Issue of an earlier milestone carries the same title and does not count. After filing
+it reads the Issue back and fails when a label or the milestone was not applied, naming what is
+missing.
 
 ### `cargo xtask orch`
 

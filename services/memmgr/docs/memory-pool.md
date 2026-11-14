@@ -79,7 +79,8 @@ Selection walks the list:
   `REQUIRE_CONTIGUOUS` request and the single-run case of best-effort
   allocation.
 - **Largest run.** Best-effort allocation falls back to repeatedly taking the
-  largest run when no single run is large enough.
+  largest run when no single run is large enough, and a demand fault to
+  taking it once, whole (see [Demand faults](#demand-faults)).
 
 Taking a whole run frees its node; splitting one keeps the node for the
 remainder, whose sorted position does not change. Returning a run inserts it
@@ -146,6 +147,34 @@ takes back (see [Per-Process Tracking](#per-process-tracking)).
 
 ---
 
+## Frame contents
+
+Every page memmgr hands out reads zero: each run of a `REQUEST_MEMORY_CAPS` grant, and each run a
+demand fault maps (see [Demand faults](#demand-faults)). A pooled run can hold what its last owner
+wrote, and what the kernel left in it: a reclaimed frame keeps the bytes of the objects that were
+retyped from it, since the kernel credits a dead object's bytes back to its Memory object without
+clearing them. memmgr does not rely on any path that returns a run to the pool to clear it, so it
+clears each run once, at hand-out, after selection and before the run is accounted, derived, or
+mapped into the process.
+
+memmgr maps the run read-write into its own address space through a scrub window of 512 pages
+(2 MiB, the span of one leaf page table, at a base aligned to it), zeroes it, and unmaps it again,
+one window at a time for a larger run. A plain unmap keeps the window's page table, so only the
+first scrub funds page tables, from the free pool as every map into memmgr's own address space
+does ([Metadata Arena](#metadata-arena)). The window holds a run only while memmgr clears it, and
+no other process can read memmgr's address space.
+
+When a run cannot be mapped into the window, memmgr unmaps whatever part the failed map left
+mapped and keeps the run: a grant goes back to the pool whole and the request fails with `QUOTA`,
+and a demand fault's run goes back to the pool and the fault is declined with code 9
+([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message).
+
+The clearing costs one map, one pass of stores over the run, and one unmap per hand-out. svctest's
+`demand_fault_cost` phase reports the mean cost of a 16-page demand fault, the measure of a change
+to that work.
+
+---
+
 ## Per-Process Tracking
 
 memmgr maintains a per-process table keyed on the per-process badge memmgr
@@ -163,7 +192,7 @@ and never reclaims them. Each entry records:
 - The delegated child `AddressSpace` cap, when demand-paged.
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
-  reuses; bootstrap arenas and demand-paged chunks carry none.
+  reuses; bootstrap arenas and demand-fault runs carry none.
 
 The frame and region list nodes live in a self-hosted metadata arena (below),
 not in the record, so per-process frame and region counts are bounded by RAM —
@@ -187,16 +216,42 @@ RAM is exhausted.
 
 ---
 
+## Demand faults
+
+A demand-paged region is backed in chunks of `DEMAND_CHUNK_PAGES` (16) pages, aligned to the
+region's base and clamped to its end. On a fault in a region, memmgr backs the part of the
+faulting page's chunk that no earlier run backs: the largest span of the chunk that holds the
+faulting page and no page of a run memmgr mapped before. On a pool with a free run that covers the
+span, that is the whole chunk on its first fault, backed by one run.
+
+memmgr first selects a run covering the span, as a `REQUIRE_CONTIGUOUS` request would, with the
+deferred recheck before it fails (see [Reclamation](#reclamation)). When no free run covers the
+span, it takes the largest free run whole, which needs no split, and maps it over the part of the
+span around the faulting page: from the faulting page up, moved down only as far as needed to stay
+inside the span. A later fault on a page of the span the run did not cover is backed the same way,
+so the chunk fills in parts, each part one run and one frame record. A fault is therefore declined
+for want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message)
+only when the free pool holds no page, or when the split of a run larger than the span fails.
+
+Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the
+region's protection, and recorded on the process's entry with its mapped VA and no region id, so
+`UNREGISTER_REGION` unmaps and reclaims it and `PROCESS_DIED` reclaims it (see
+[Reclamation](#reclamation)). The pages move from a free run to the process's entry, so
+`pool_total` is unchanged.
+
+---
+
 ## Client page-table funding
 
-memmgr maps a demand chunk into the faulting process's address space, and the kernel takes the
-page tables that map needs from that address space's own page-table growth pool
+memmgr maps a demand-fault run ([Demand faults](#demand-faults)) into the faulting process's
+address space, and the kernel takes the page tables that map needs from that address space's own
+page-table growth pool
 ([docs/capability-model.md](../../../docs/capability-model.md) § Address-space and CSpace growth
 budgets). The pool is shared by every mapping in the address space, the process's own and the
 pager's. A process that funds the pool before it registers a region (ruststd's
 `fund_aspace_pt_budget`) cannot reserve that funding for the region: any later mapping may draw it
-first. So memmgr does not depend on it. When the map of a chunk fails with `OutOfMemory`, memmgr
-funds the pool itself and maps the chunk again, at most four times:
+first. So memmgr does not depend on it. When the map of a run fails with `OutOfMemory`, memmgr
+funds the pool itself and maps the run again, at most four times:
 
 1. It selects a contiguous run of four pages from the free pool, or of two when no four-page run
    is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
@@ -215,9 +270,9 @@ run is quiescent by then, or waits on the deferred list until it is (see
 
 A fault whose map still fails, because the free pool cannot fund the pool or the map fails for
 another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin
-fault message). A failed map can leave the first pages of the chunk mapped. memmgr unmaps the
-chunk's span before it returns the chunk to the free pool, so no page of a pooled run stays
-mapped in the process. When that unmap fails, the chunk stays recorded on the process's entry
+fault message). A failed map can leave the first pages of the run mapped. memmgr unmaps the
+run's span before it returns the run to the free pool, so no page of a pooled run stays
+mapped in the process. When that unmap fails, the run stays recorded on the process's entry
 until `PROCESS_DIED`.
 
 ---
@@ -381,7 +436,7 @@ A query that fails answers no. A quiescent frame joins the free pool. Any other 
 is, so reclamation still never allocates and cannot fail. A deferred run is owned by memmgr and
 counted in `pool_total`, lent to no process, and never granted. Before every `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool fails (a
-`REQUEST_MEMORY_CAPS` grant, a demand fault's chunk, or memmgr's own arena, index, page-table, or
+`REQUEST_MEMORY_CAPS` grant, a demand fault's run, or memmgr's own arena, index, page-table, or
 `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run that has become
 quiescent joins the free pool (and the failed selection runs once more), and each that has not goes
 to the back of the list, so successive rechecks visit every run. Only the first of these in a turn
@@ -436,7 +491,7 @@ caller-owned grant. The caller usually cannot transfer the cap back — having
 retyped the region (e.g. into a Thread) and dropped its inner copy, it no
 longer holds one — so it names each region by the region id memmgr reported
 at grant. memmgr matches that id against the entry's frame list (grants only;
-demand-mapped chunks, which carry no id, are reclaimed by
+demand-fault runs, which carry no id, are reclaimed by
 `UNREGISTER_REGION`), takes the frame off the record, returns it to the pool
 when it is quiescent and to the deferred list otherwise (the node becomes
 the run's node in either case), and coalesces the freed runs with their
@@ -510,7 +565,7 @@ preconditions above. A declined pair stays as two discrete runs.
 |---|---|---|
 | `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS` | Reply with error label; caller may retry without the flag, or fail |
 | `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages` | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `QUOTA` | Tracking-metadata arena could not grow (system RAM exhausted) | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy

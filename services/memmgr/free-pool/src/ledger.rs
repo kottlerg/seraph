@@ -261,30 +261,53 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         None
     }
 
-    /// Whether a frame memmgr mapped (`va != unmapped`) already covers
-    /// `page_base` on `rec`.
+    /// The unbacked span of `[lo, hi)` around `page_base` on `rec`: `None`
+    /// when a frame memmgr mapped (`va != unmapped`) already covers
+    /// `page_base`, else `[start, end)`, the largest span within `[lo, hi)`
+    /// that holds `page_base` and no page of a mapped frame. `page_base` lies
+    /// in `[lo, hi)`. A demand fault backs a window of this span, so a chunk a
+    /// fragmented pool backed in parts is completed without mapping over a
+    /// part already backed.
     #[must_use]
-    pub fn frame_covering(&self, rec: NodeIdx, page_base: u64, unmapped: u64) -> bool
+    pub fn unbacked_span(
+        &self,
+        rec: NodeIdx,
+        page_base: u64,
+        lo: u64,
+        hi: u64,
+        unmapped: u64,
+    ) -> Option<(u64, u64)>
     {
+        let (mut start, mut end) = (lo, hi);
         let Some(r) = self.record(rec)
         else
         {
-            return false;
+            return Some((start, end));
         };
         let mut cur = r.frame_head;
         while let Node::Frame(f) = self.arena.get(cur).node
         {
-            if f.va != unmapped
-                && page_base >= f.va
-                && page_base
-                    < f.va
-                        .saturating_add(u64::from(f.page_count).saturating_mul(PAGE_SIZE))
-            {
-                return true;
-            }
             cur = self.arena.get(cur).next;
+            if f.va == unmapped
+            {
+                continue;
+            }
+            let f_end =
+                f.va.saturating_add(u64::from(f.page_count).saturating_mul(PAGE_SIZE));
+            if f_end <= page_base
+            {
+                start = start.max(f_end);
+            }
+            else if f.va > page_base
+            {
+                end = end.min(f.va);
+            }
+            else
+            {
+                return None;
+            }
         }
-        false
+        Some((start, end))
     }
 
     /// Remove the region of `rec` exactly matching `[va_base, va_base +
@@ -669,8 +692,15 @@ mod tests
         assert!(l.push_frame(rec, frame(4, 1, 0x40000, UNMAPPED)));
         l.return_frames_in(rec, 0x40_0000, 0x42_0000, UNMAPPED, pool_all);
         assert_eq!(l.pool.free_pages(), 32);
-        assert!(l.frame_covering(rec, 0x80_0000, UNMAPPED));
-        assert!(!l.frame_covering(rec, 0x40_0000, UNMAPPED));
+        // The frame outside the span stays backed; the span's pages are not.
+        assert_eq!(
+            l.unbacked_span(rec, 0x80_0000, 0x80_0000, 0x81_0000, UNMAPPED),
+            None
+        );
+        assert_eq!(
+            l.unbacked_span(rec, 0x40_0000, 0x40_0000, 0x41_0000, UNMAPPED),
+            Some((0x40_0000, 0x41_0000))
+        );
     }
 
     #[test]
@@ -692,12 +722,36 @@ mod tests
     }
 
     #[test]
-    fn frame_covering_ignores_caller_owned_grants()
+    fn unbacked_span_ignores_caller_owned_grants()
     {
         let mut l = ledger();
         let rec = l.insert_process(1).unwrap();
         assert!(l.push_frame(rec, frame(1, 1, 0x1000, UNMAPPED)));
-        assert!(!l.frame_covering(rec, 0x1000, UNMAPPED));
+        assert_eq!(
+            l.unbacked_span(rec, 0x1000, 0x1000, 0x5000, UNMAPPED),
+            Some((0x1000, 0x5000))
+        );
+    }
+
+    #[test]
+    fn unbacked_span_is_none_on_a_backed_page_and_bounded_by_backed_frames()
+    {
+        // Chunk [0x10000, 0x20000): pages 0x12000..0x14000 and 0x18000..0x19000
+        // backed, plus a frame outside the chunk that must not narrow it.
+        let mut l = ledger();
+        let rec = l.insert_process(1).unwrap();
+        assert!(l.push_frame(rec, frame(1, 2, 0xA_0000, 0x12000)));
+        assert!(l.push_frame(rec, frame(2, 1, 0xB_0000, 0x18000)));
+        assert!(l.push_frame(rec, frame(3, 4, 0xC_0000, 0x40000)));
+        let span = |page| l.unbacked_span(rec, page, 0x10000, 0x20000, UNMAPPED);
+        assert_eq!(span(0x12000), None);
+        assert_eq!(span(0x13000), None);
+        assert_eq!(span(0x18000), None);
+        assert_eq!(span(0x10000), Some((0x10000, 0x12000)));
+        assert_eq!(span(0x11000), Some((0x10000, 0x12000)));
+        assert_eq!(span(0x14000), Some((0x14000, 0x18000)));
+        assert_eq!(span(0x17000), Some((0x14000, 0x18000)));
+        assert_eq!(span(0x1F000), Some((0x19000, 0x20000)));
     }
 
     /// Take every free slot, leaving the arena full.

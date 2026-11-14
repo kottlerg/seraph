@@ -53,6 +53,10 @@ pub enum Fit
     /// Any runs, up to [`MAX_GRANT_RUNS`], possibly covering less than the
     /// request (a partial grant).
     BestEffort,
+    /// One run: the whole request when a run covers it, else the largest run
+    /// whole, which then covers less than the request (a demand fault's
+    /// fallback on a fragmented pool).
+    UpTo,
 }
 
 /// Why a selection found nothing to grant.
@@ -60,7 +64,8 @@ pub enum Fit
 pub enum SelectError
 {
     /// No single run covers a `REQUIRE_CONTIGUOUS` request, or its split
-    /// failed.
+    /// failed; for [`Fit::UpTo`], the pool is empty or the covering run's
+    /// split failed.
     Contiguous,
     /// The pool's free pages do not cover a best-effort request, or no run
     /// could be taken.
@@ -375,6 +380,10 @@ impl FreePool
     ///   partial grant the caller requests again for the rest). When the free
     ///   pages do not cover `want`, or no run could be taken,
     ///   [`SelectError::BestEffort`].
+    /// - [`Fit::UpTo`]: the smallest covering run, split to size, as one
+    ///   entry; when no run covers `want`, the largest run whole as one entry
+    ///   of fewer pages, which needs no split. [`SelectError::Contiguous`]
+    ///   when the pool is empty or the covering run's split fails.
     ///
     /// On error the pool is unchanged. `split` is the kernel's
     /// `memory_split`.
@@ -393,16 +402,20 @@ impl FreePool
             entries: [(0, 0, 0); MAX_GRANT_RUNS],
             count: 0,
         };
-        if let Some(c) = self.smallest_fit(arena, u64::from(want))
+        let covering = self.smallest_fit(arena, u64::from(want));
+        if let Some(c) = covering
             && let Some((cap, phys)) = self.take_exactly(arena, c, want, &mut split)
         {
             grant.entries[0] = (cap, want, phys);
             grant.count = 1;
             return Ok(grant);
         }
-        if fit == Fit::Contiguous
+        match fit
         {
-            return Err(SelectError::Contiguous);
+            Fit::Contiguous => return Err(SelectError::Contiguous),
+            Fit::UpTo => return self.take_largest_whole(arena, covering, grant),
+            Fit::BestEffort =>
+            {}
         }
         if self.free_pages < u64::from(want)
         {
@@ -439,6 +452,35 @@ impl FreePool
         {
             return Err(SelectError::BestEffort);
         }
+        Ok(grant)
+    }
+
+    /// The [`Fit::UpTo`] fallback once no run could be split to the request:
+    /// the largest run whole, as `grant`'s one entry. `covering` is the run
+    /// that covers the request, if any; when there is one, its split failed,
+    /// and the selection fails rather than take more pages than asked.
+    fn take_largest_whole<S: SlotStore>(
+        &mut self,
+        arena: &mut Arena<S>,
+        covering: Option<Cursor>,
+        mut grant: Grant,
+    ) -> Result<Grant, SelectError>
+    {
+        if covering.is_some()
+        {
+            return Err(SelectError::Contiguous);
+        }
+        let c = self.largest(arena).ok_or(SelectError::Contiguous)?;
+        // No run covers the request, so the largest is below it, a `u32`.
+        let pages = run_of(arena, c.cur)
+            .and_then(|r| u32::try_from(r.page_count).ok())
+            .ok_or(SelectError::Contiguous)?;
+        // An exact take unlinks the run whole and never splits.
+        let (cap, phys) = self
+            .take_exactly(arena, c, pages, |_, _| None)
+            .ok_or(SelectError::Contiguous)?;
+        grant.entries[0] = (cap, pages, phys);
+        grant.count = 1;
         Ok(grant)
     }
 
@@ -800,6 +842,80 @@ mod tests
             SelectError::BestEffort
         );
         assert_eq!((pool.free_pages(), pool.run_count()), (4, 1));
+    }
+
+    #[test]
+    fn select_up_to_takes_the_covering_run_split_to_the_request()
+    {
+        let mut a = arena();
+        let mut pool = FreePool::new();
+        pool.push(&mut a, run(1, 3, 0x1000)).unwrap();
+        pool.push(&mut a, run(2, 20, 0x10000)).unwrap();
+        pool.push(&mut a, run(3, 40, 0x100_000)).unwrap();
+        // 16 pages: the smallest covering run (20) is split, as Contiguous does.
+        let g = pool.select(&mut a, 16, Fit::UpTo, |_, _| Some(9)).unwrap();
+        assert_eq!(g.entries(), [(2, 16, 0x10000)]);
+        assert_eq!((pool.free_pages(), pool.run_count()), (47, 3));
+    }
+
+    #[test]
+    fn select_up_to_takes_the_largest_run_whole_on_a_fragmented_pool()
+    {
+        // No run covers 16 pages: the largest (7) leaves whole, unsplit, and
+        // the free pages and run count fall by exactly that run.
+        let mut a = arena();
+        let mut pool = FreePool::new();
+        pool.push(&mut a, run(1, 3, 0x1000)).unwrap();
+        pool.push(&mut a, run(2, 7, 0x10000)).unwrap();
+        pool.push(&mut a, run(3, 5, 0x100_000)).unwrap();
+        let g = pool.select(&mut a, 16, Fit::UpTo, no_split).unwrap();
+        assert_eq!(g.entries(), [(2, 7, 0x10000)]);
+        assert_eq!((pool.free_pages(), pool.run_count()), (8, 2));
+        assert_eq!(runs(&pool, &a), [run(1, 3, 0x1000), run(3, 5, 0x100_000)]);
+        // Contiguous on the same pool still refuses.
+        assert_eq!(
+            pool.select(&mut a, 16, Fit::Contiguous, no_split)
+                .unwrap_err(),
+            SelectError::Contiguous
+        );
+    }
+
+    #[test]
+    fn select_up_to_falls_to_one_page_and_fails_only_on_an_empty_pool()
+    {
+        let mut a = arena();
+        let mut pool = FreePool::new();
+        for i in 0..3u64
+        {
+            pool.push(&mut a, run(i, 1, i * 0x10000)).unwrap();
+        }
+        for _ in 0..3
+        {
+            let g = pool.select(&mut a, 16, Fit::UpTo, no_split).unwrap();
+            assert_eq!(g.count, 1);
+            assert_eq!(g.entries()[0].1, 1);
+        }
+        assert_eq!((pool.free_pages(), pool.run_count()), (0, 0));
+        assert_eq!(
+            pool.select(&mut a, 16, Fit::UpTo, no_split).unwrap_err(),
+            SelectError::Contiguous
+        );
+    }
+
+    #[test]
+    fn select_up_to_fails_unchanged_when_the_covering_split_is_refused()
+    {
+        // A run covers the request but cannot be split: the selection does not
+        // fall back to taking it whole, which would exceed the request.
+        let mut a = arena();
+        let mut pool = FreePool::new();
+        pool.push(&mut a, run(1, 3, 0x1000)).unwrap();
+        pool.push(&mut a, run(2, 20, 0x10000)).unwrap();
+        assert_eq!(
+            pool.select(&mut a, 16, Fit::UpTo, |_, _| None).unwrap_err(),
+            SelectError::Contiguous
+        );
+        assert_eq!((pool.free_pages(), pool.run_count()), (23, 2));
     }
 
     #[test]

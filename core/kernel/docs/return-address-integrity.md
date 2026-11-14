@@ -21,8 +21,9 @@ Out of scope:
 - The feature classification itself, which
   [docs/platform-requirements.md](../../../docs/platform-requirements.md) owns.
 
-Implementation status: no mechanism of this document is implemented. Every statement of kernel
-behaviour in § Direction, § riscv64 Mechanism, and § x86-64 Mechanism is design intent.
+Implementation status: the x86-64 mechanism is implemented as § x86-64 Mechanism describes. The
+riscv64 mechanism is not: every statement of riscv64 kernel behaviour in § Direction and § riscv64
+Mechanism is design intent.
 
 ---
 
@@ -185,12 +186,105 @@ extension, as § Verification Record cites them.
 
 ## x86-64 Mechanism
 
-Design intent; not yet implemented. The implementation
-([#1083](https://github.com/kottlerg/seraph/issues/1083)) specifies it here: `CR4.CET`,
-`IA32_S_CET.SH_STK_EN`, the supervisor shadow-stack pointer, the interrupt shadow-stack table for
-the vectors that switch stacks, shadow-stack leaves in the direct map, and the shadow-stack token
-switch on context switch. Its protection does not depend on compiler instrumentation, since
-`CALL` and `RET` maintain the shadow stack (§ Options).
+Implemented in `arch/x86_64/shadow_stack.rs`, with the context switch, the syscall path, and the
+direct-map edits it relies on. The architectural facts are from the Intel SDM's CET chapter
+(Volume 1, chapter 17) and its instruction pages for `RSTORSSP`, `SAVEPREVSSP`, `SETSSBSY`,
+`CLRSSBSY`, `CALL`, `RET`, and `IRET`. The protection needs no compiler instrumentation, since
+`CALL` and `RET` maintain the shadow stack (§ Options); the kernel image is the same with
+shadow stacks on or off.
+
+- **Decision.** In Phase 4 the boot CPU decides, once, that shadow stacks are on when it reports
+  `CET_SS` (`CPUID.(EAX=7,ECX=0):ECX[7]`) (`shadow_stack::decide`), before any shadow-stack page
+  is laid out. They are on for every CPU or for none, since a thread migrates between CPUs with a
+  live call chain: an AP that lacks `CET_SS` when the boot CPU has it halts the boot
+  (`shadow_stack::prepare_ap`), and
+  [docs/platform-requirements.md](../../../docs/platform-requirements.md) § x86-64
+  Classification states the condition. The kernel does not read `CET_SSS`
+  (`CPUID.(EAX=7,ECX=1):EDX[18]`), which says that the processor never marks a supervisor
+  token busy before an event delivery completes. KVM does not report it to a guest, and the
+  kernel enables shadow stacks without it, so under a hypervisor whose event delivery is
+  interrupted midway a token can be left busy and the next delivery through it faults.
+- **Shadow-stack memory.** Every shadow stack is one 4 KiB page, which holds 512 return
+  addresses, and an event taken in ring 0 takes three words of it (below). A deeper chain runs
+  into the page below, which faults for a Thread's and the idle thread's (an ordinary page there,
+  to which no shadow-stack access is allowed).
+  - Each Thread's is the last page of its retype slot (`sched/thread_slot.rs`), above its
+    extended-state area, and the slot grows by one page while shadow stacks are on: the slot size
+    a Thread retype debits, and `SystemInfoType::ThreadRetypeBytes`, include it.
+  - Each CPU keeps three pages from the top of its idle-stack block's spare, directly below the
+    guard page: the idle thread's shadow stack, lowest; the IST1 shadow stack (`#DF`, `#MC`),
+    with the interrupt SSP table in the first eight words of its page; and the IST2 shadow
+    stack (NMI). A shadow stack that outgrows its page runs on into the page below, where no
+    fault stops it when that page is a shadow stack too; the idle thread's, which nests every
+    interrupt taken while the CPU idles, is the lowest, so the page below it is never one of
+    the three, and an IST stack holds one event.
+  - The handoff stack's is one page the boot CPU takes from the buddy in Phase 5 and keeps.
+
+  Each page's direct-map leaf has the shadow-stack encoding: present, not writable, dirty,
+  supervisor, never executable (`PageTableEntry::new_shadow_stack_page`). Ordinary stores to it
+  fault, and shadow-stack accesses succeed, since every table entry above the leaf is
+  writable. The 2 MiB direct-map leaf is split first, from the guard-page reserve of
+  `mm/stack_guard.rs` ([memory-internals.md](memory-internals.md) § Kernel Stack Guards). A
+  Thread's page gets the encoding in `stack_guard::hole`, under the same hold as its guard,
+  and every online CPU drops its translation of the page before thread creation continues (a
+  kernel-page shootdown), so no CPU keeps a writable alias of a live shadow stack. Thread
+  destruction (`stack_guard::close`) maps the page read-write again and flushes only its own
+  CPU: a CPU that kept the read-only translation and writes the page faults, and the page-fault
+  handler's spurious-write retry (a supervisor write to a kernel-half page whose live leaf is
+  present and writable) flushes the entry and re-executes the store. The per-CPU and handoff
+  pages get the encoding while only the boot CPU runs, and keep it.
+- **Tokens and the switch.** A fresh shadow stack whose top is `T` holds three words
+  (`shadow_stack::fresh_words`): the supervisor token at `T - 8` (its own address, busy bit
+  clear), the address the thread first runs at at `T - 16`, and a restore token at `T - 24`
+  holding `(T - 16) | 1`. The thread's `SavedState` gains `ssp` (the address of the restore token
+  its next switch-in restores from, `T - 24` for a fresh stack) and `ssp_token` (its supervisor
+  token, `T - 8`). `context::switch` reads the outgoing shadow-stack pointer (`rdsspq`), stores
+  the word below it in `current.ssp`, moves to the incoming stack through the restore token at
+  `next.ssp` (`rstorssp`), leaves a restore token on the outgoing stack at that word
+  (`saveprevssp`), and loads `IA32_PL0_SSP` with `next.ssp_token`, all before the outgoing
+  thread's `context_saved = 1` publication, so a CPU that resumes it finds its restore token. It
+  resumes the incoming thread with `ret`, so the shadow stack checks the resume address, where
+  without shadow stacks it jumps. A switch whose outgoing and incoming states are the same thread
+  (the scheduler's idle-to-idle fallback) leaves the shadow stack as it is: no restore token lies
+  below the running SSP, so `rstorssp` would fault.
+- **Enable.** `shadow_stack::enable` sets `IA32_S_CET.SH_STK_EN` and runs `setssbsy`, which
+  takes the supervisor token `IA32_PL0_SSP` names, marks it busy, and starts an empty shadow
+  stack below it; it returns by a jump, since that stack holds no copy of its return address.
+  No frame that began before the enable may return after it, so it is called only from functions
+  that never return:
+  - The boot CPU enables in Phase 5, in `kernel_entry_post_rebase` after the tagged-TLB setup and
+    before the SYSCALL MSRs and the timer, on the handoff shadow stack
+    (`shadow_stack::prepare_boot_cpu` lays out its token, points `IA32_PL0_SSP` at it and
+    `IA32_INTERRUPT_SSP_TABLE_ADDR` at the boot CPU's table, and sets `CR4.CET`). The GDT reload's
+    far return precedes it. The kernel logs `shadow stacks: on`.
+  - An AP enables in `kernel_entry_ap` before its SYSCALL MSRs, on its idle shadow stack, whose
+    supervisor token `shadow_stack::prepare_ap` loads.
+  - `sched::enter` loads `IA32_PL0_SSP` with init's token before init's first run, which is not
+    a switch-in.
+- **Kernel entry and exit.** An interrupt or exception from ring 3 loads the shadow-stack
+  pointer from `IA32_PL0_SSP`, the running thread's supervisor token, and marks it busy, and the
+  `IRET` back to ring 3 clears the busy bit. `SYSCALL` does neither: `syscall_entry` runs
+  `setssbsy` once it is on the kernel stack, and the exit runs `clrssbsy` on the token at the
+  shadow-stack pointer before `SYSRETQ`, with interrupts disabled from before the restores. An
+  event taken in ring 0 pushes its `CS`, return address, and shadow-stack pointer to the shadow
+  stack, and `IRET` checks them, so no handler may resume a ring-0 frame at a different address:
+  a fault inside `copy_user` ends the copy in place (`rcx` 0, `rax` the bytes left) instead of
+  moving `rip` to a fixup. `#DF`, `#MC` (IST1), and NMI (IST2) switch to the per-CPU IST shadow
+  stack the interrupt SSP table names. User mode runs without shadow stacks: `IA32_U_CET` stays
+  0.
+- **Faults.** A mismatch raises the control-protection fault (`#CP`, vector 21): error code 1
+  for `RET`, 2 for `IRET`, 4 for `RSTORSSP`, 5 for `SETSSBSY`. It is a kernel fault and halts
+  with the kernel exception report.
+- **Without CET.** `CR4.CET` stays clear and every shadow-stack instruction of the switch and
+  the syscall path is skipped by a branch on `shadow_stack::ENABLED`. No page is kept or
+  converted, and the Thread slot keeps its size.
+- **Test.** `cargo xtask test-cet` ([docs/testing.md](../../../docs/testing.md) § CET shadow
+  stacks) boots the kernel under KVM with `-cpu host,cet-ss=on,enforce`. ktest must pass with
+  `shadow stacks: on`, and a return address of `syscall::dispatch` that the host overwrites
+  through QEMU's gdbstub must raise `#CP` with error code 1. The kernel carries no test code for
+  it. QEMU refuses to start where KVM cannot give the guest `CET_SS`, and the command then fails,
+  naming the feature. The host tests of `shadow_stack.rs` model `RSTORSSP`, `SAVEPREVSSP`,
+  `CALL`, and `RET` over the token layout.
 
 ---
 

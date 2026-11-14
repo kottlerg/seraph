@@ -418,14 +418,17 @@ live threads and bound threads × CPUs (rule 3); no page-table walks, buddy allo
 syscalls, or other long-latency operations under any spinlock.
 
 **Kernel-stack guard lock.** `mm::stack_guard`'s lock, a `crate::sync::Spinlock`, serialises
-the direct-map holes under the kernel stacks and their leaf-table reserve
-([memory-internals.md](memory-internals.md) § Kernel Stack Guards). It is a leaf taken alone:
-thread creation, the Thread slab's reclaim, and the boot take it with no other lock held and
-acquire nothing under it. Its hold is one direct-map walk of the paging depth's levels plus, at
-a chunk's first hole, the 512 entries of the leaf table that splits it, a bounded walk the
-no-page-table-walk rule above excepts for this lock alone. Neither a hole nor a fill sends a TLB
-shootdown; a fill's local flush where `CACHES_NOT_PRESENT_ENTRIES` holds (riscv64) runs after its
-release ([memory-internals.md](memory-internals.md) § Kernel Stack Guards).
+the direct-map holes under the kernel stacks, the shadow-stack pages' leaves, and their
+leaf-table reserve ([memory-internals.md](memory-internals.md) § Kernel Stack Guards,
+§ Shadow-Stack Pages). It is a leaf taken alone: thread creation, the Thread slab's reclaim, and
+the boot take it with no other lock held and acquire nothing under it. Its hold is at most three
+direct-map walks of the paging depth's levels (a guard, with shadow stacks on the thread's
+shadow-stack page, and the guard's undo when that second edit fails) plus, at a chunk's first
+edit, the 512 entries of the leaf table that splits it, a bounded walk the no-page-table-walk
+rule above excepts for this lock alone. Neither a hole nor a fill sends a TLB shootdown; a fill's
+local flushes run after its release. The only shootdown is a Thread shadow-stack page's, which
+thread creation sends after the release ([memory-internals.md](memory-internals.md) § Kernel
+Stack Guards, § Shadow-Stack Pages).
 
 **Bare spin locks (MUST).** The derivation tree lock
 (`cap::derivation::DERIVATION_LOCK`), the per-`MemoryObject` reader-writer
@@ -942,6 +945,18 @@ taken while sp and floor still name the outgoing stack, and the store, to the pe
 is never a guard, cannot fault. A floor written earlier, in Rust before the call, would leave a
 window where a fault taken on the outgoing stack is compared against the incoming stack's floor
 and reported as an overflow instead of as itself. x86-64 checks no floor.
+
+**x86-64 shadow stack at the switch.** With shadow stacks on
+([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism), `switch()`
+records the outgoing thread's restore-token address in `current.saved_state.ssp`, moves the
+shadow-stack pointer to next's shadow stack (`rstorssp` on `next.saved_state.ssp`), leaves the
+outgoing stack's restore token (`saveprevssp`) and loads `IA32_PL0_SSP` with next's
+supervisor token, all before the rsp swap and so before the `context_saved = 1`
+publication: a peer CPU that resumes the outgoing thread after the publication finds its
+restore token in place. `switch()` then resumes next by `ret` instead of `jmp`, so the shadow
+stack checks the resume address. A switch from a thread to itself (the idle-to-idle
+fallback of step 3.5) leaves the shadow stack as it is, since no restore token lies below its
+shadow-stack pointer.
 
 Per-arch step ordering: both arches follow the textbook sequence above literally —
 `sched.lock.release_lock_only()` (step 3) runs in Rust before the lockless `next.context_saved`

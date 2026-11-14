@@ -13,6 +13,13 @@
 //! idle stack's guard in Phase 4 ([`hole_on_boot_cpu`]) and each Thread slot's
 //! guard page while the thread exists ([`hole`], [`close`]).
 //!
+//! With shadow stacks on, the module also gives shadow-stack pages their
+//! encoding in the direct map, under the same lock and from the same reserve
+//! (`core/kernel/docs/memory-internals.md` § Shadow-Stack Pages): each CPU's
+//! and the handoff stack's in Phase 4 and 5 ([`shadow_on_boot_cpu`]), and each
+//! Thread slot's with its guard ([`hole`], which shoots the page down on every
+//! CPU, and [`close`]).
+//!
 //! Neither a Thread guard's hole nor its fill sends a shootdown. [`hole`]
 //! advances the guard epoch and returns it for the new thread's TCB; every
 //! switch-in compares the incoming thread's stamp with the epoch the CPU last
@@ -294,13 +301,14 @@ mod live
     /// direct map, give the page at `shadow`, the thread's shadow stack when
     /// shadow stacks are on, the shadow-stack encoding, and return the guard
     /// epoch to stamp in the thread's TCB. On an error neither page changed.
-    /// No CPU's TLB is flushed here, this one's included: nothing reaches the
-    /// guard page, nor runs on the shadow stack, before the new thread first
-    /// runs, and every CPU's record, this one's too, predates the stamp, so
-    /// each flushes before it runs the thread ([`flush_before_run`], at a
-    /// switch-in or in `sched::enter`). Until a CPU flushes, a stale writable
-    /// translation of the shadow page lets an ordinary store from that CPU
-    /// through, as a stale translation of the guard lets an overflow through.
+    /// No CPU's TLB is flushed for the guard, this one's included: nothing
+    /// reaches the guard page before the new thread first runs, and every
+    /// CPU's record, this one's too, predates the stamp, so each flushes
+    /// before it runs the thread ([`flush_before_run`], at a switch-in or in
+    /// `sched::enter`). The shadow page is flushed on every online CPU before
+    /// this returns (a kernel-page shootdown): a stale writable translation
+    /// of it on any CPU, not only on the one that runs the thread, would let
+    /// an ordinary store reach the thread's shadow stack.
     ///
     /// # Errors
     /// As [`hole_on_boot_cpu`].
@@ -317,10 +325,46 @@ mod live
         // SAFETY: caller contract.
         unsafe { hole_locked(guard, shadow) }?;
         debug_assert!(!is_mapped(guard), "stack_guard: a holed guard is mapped");
+        if let Some(shadow) = shadow
+        {
+            // SAFETY: after SMP bringup with no lock held (caller contract).
+            unsafe { flush_everywhere(phys_to_virt(shadow)) };
+        }
         // After the edit, which the reserve lock's release published: a CPU
         // that reads this epoch or a later one sees the hole.
         // The epoch wraps, as `fetch_add` does.
         Ok(GUARD_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1))
+    }
+
+    /// Drop every CPU's cached translation of the direct-map page at `virt`:
+    /// this CPU's by a local flush, every other online CPU's by a kernel-page
+    /// shootdown (`mm::tlb_shootdown::shootdown` on the kernel root, tag 0).
+    ///
+    /// # Safety
+    /// After SMP bringup, with no lock held: the shootdown waits for the other
+    /// CPUs with interrupts enabled.
+    unsafe fn flush_everywhere(virt: u64)
+    {
+        // SAFETY: ring 0 / S-mode; dropping this CPU's cached entry for a
+        // kernel address is always safe.
+        unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
+        let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+        let remote = crate::cpu_mask::MaskSource::Below(cpu_count);
+        crate::percpu::preempt_disable();
+        // SAFETY: the kernel root is the active root's kernel half on every
+        // CPU; `remote` names only online CPUs (the shootdown leaves this one
+        // out); preemption is disabled around the call and no lock is held
+        // (caller contract). A one-page request on the kernel root with tag 0
+        // drops the kernel mapping in every address space.
+        unsafe {
+            crate::mm::tlb_shootdown::shootdown(
+                crate::mm::paging::kernel_root_table_pa(),
+                &remote,
+                virt,
+                0,
+            );
+        }
+        crate::percpu::preempt_enable();
     }
 
     /// Flush this CPU's whole TLB, in every address space, when `stamp`, the

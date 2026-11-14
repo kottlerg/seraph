@@ -25,9 +25,11 @@ Every function in the dispatch surface MUST be defined on every supported archit
 checks completeness for every surface item that architecture-neutral code calls: if one is
 missing on the target being compiled, its `arch::current::…` call fails to resolve and the
 build breaks. Items with no neutral caller are not checked this way: `interrupts::disable`,
-`timer::delay_us`, `cpu::user_copy_fixup`, `paging::user_fault_is_spurious`, and
-`TrapFrame::set_ipc_return_with_badge`. Of these, `timer::delay_us`, `cpu::user_copy_fixup`, and
-`paging::user_fault_is_spurious` are called only by arch-internal code; the rest have no caller.
+`timer::delay_us`, `paging::user_fault_is_spurious`, and `TrapFrame::set_ipc_return_with_badge`.
+Of these, `timer::delay_us` and `paging::user_fault_is_spurious` are called only by
+arch-internal code; the rest have no caller. The recovery of a fault inside `cpu::copy_user` is
+arch-internal and not on the surface: x86-64 ends the copy in place (`cpu::in_user_copy`), and
+riscv64 resumes at a fixup (`cpu::user_copy_fixup`).
 
 ---
 
@@ -43,7 +45,8 @@ core/kernel/src/arch/
 │   ├── paging.rs   ├── context.rs  ├── interrupts.rs ├── timer.rs
 │   ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
 │   ├── gdt.rs      ├── idt.rs      ├── ioapic.rs     ├── fpu.rs
-│   ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs └── speculation.rs
+│   ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
+│   └── shadow_stack.rs
 └── riscv64/
     ├── mod.rs      ├── aia.rs      # APLIC (MSI mode) and IMSIC
     ├── aia_encoding.rs # AIA register-map arithmetic; no arch-module deps
@@ -51,6 +54,7 @@ core/kernel/src/arch/
     ├── syscall.rs  ├── cpu.rs      ├── console.rs    ├── trap_frame.rs
     ├── gdt.rs      ├── idt.rs      ├── sbi.rs        ├── fpu.rs
     ├── platform.rs ├── ap_trampoline.rs ├── entropy.rs ├── speculation.rs
+    ├── shadow_stack.rs
     └── encoding.rs # SBI mask, F/D/V, page/tick math, PTE permissions; no arch-module deps
 ```
 
@@ -346,11 +350,27 @@ pub unsafe fn hole_direct_map_page(
     take_table: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(), PagingError>;
 
-/// Map the direct-map page at `virt` to `phys` again, closing a hole. When
-/// `CACHES_NOT_PRESENT_ENTRIES` holds, the caller flushes this CPU; another
-/// CPU that kept the not-present entry flushes before it runs a thread whose
-/// stack the page becomes, or takes the riscv64 S-mode spurious-fault retry
-/// on any other use (memory-internals.md § Kernel Stack Guards).
+/// Give the direct-map page at `virt`, the RAM page `phys`, the supervisor
+/// shadow-stack encoding (x86-64: present, R/W clear, Dirty set), splitting a
+/// 2 MiB leaf as `hole_direct_map_page` does; from then on only shadow-stack
+/// accesses write it. The caller flushes every CPU that may hold a writable
+/// translation of the page before a CPU runs on it as a shadow stack
+/// (memory-internals.md § Kernel Stack Guards). RISC-V refuses with
+/// `NotMapped`; the kernel runs on no shadow stack there and never asks
+/// (return-address-integrity.md).
+pub unsafe fn shadow_direct_map_page(
+    virt: u64,
+    phys: u64,
+    take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>;
+
+/// Map the direct-map page at `virt` to `phys` read-write again, closing a
+/// hole or ending a shadow stack. When `CACHES_NOT_PRESENT_ENTRIES` holds, the
+/// caller flushes this CPU; another CPU that kept the not-present entry
+/// flushes before it runs a thread whose stack the page becomes, or takes the
+/// riscv64 S-mode spurious-fault retry on any other use. An x86-64 CPU that
+/// kept a shadow stack's read-only translation takes the kernel spurious-write
+/// retry on its first store (memory-internals.md § Kernel Stack Guards).
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64);
 
 /// Whether a CPU may cache a not-present entry, so that a page made present
@@ -447,6 +467,18 @@ pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64);
 /// on x86-64, where a guard-page fault escalates to a double fault on IST1.
 pub fn set_stack_floor(saved: &mut SavedState, floor: u64);
 
+/// Record a new thread's fresh shadow stack (`shadow_stack::init_stack`, or
+/// `shadow_stack::idle_stack` for an idle thread) in a `SavedState` before
+/// first run, when shadow stacks are on: x86-64 keeps the restore-token
+/// address `switch` restores from (`ssp`) and the supervisor token it loads
+/// into `IA32_PL0_SSP` (`ssp_token`); a no-op on RISC-V.
+pub fn set_shadow_stack(saved: &mut SavedState, stack: shadow_stack::ShadowStack);
+
+/// The thread's supervisor shadow-stack token, for a first run that is not a
+/// switch-in (`sched::enter`, through `shadow_stack::load_thread_token`); 0
+/// with shadow stacks off and on RISC-V.
+pub fn shadow_stack_token(saved: &SavedState) -> u64;
+
 /// Round a user-supplied stack pointer to the entry point's `extern "C"` ABI
 /// alignment (x86-64 SysV `rsp ≡ 8 (mod 16)`: `(sp & !0xF) - 8`, wrapping for
 /// `sp` below 16; RISC-V LP64D `sp ≡ 0 (mod 16)`: `sp & !0xF`).
@@ -457,7 +489,11 @@ pub fn align_initial_stack(sp: u64) -> u64;
 /// state is fully saved, so another CPU may observe the thread as switched-out.
 /// On RISC-V the stack-pointer swap is followed at once by the store of
 /// `next`'s stack floor to `PerCpuData::kernel_stack_floor` (one load and one
-/// store), so no trap sees one stack with another's floor.
+/// store), so no trap sees one stack with another's floor. On x86-64 with
+/// shadow stacks on, it also moves the shadow-stack pointer to `next`'s shadow
+/// stack and resumes `next` by `ret`, so the shadow stack checks the resume
+/// address; a switch from a thread to itself leaves the shadow stack as it is
+/// (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism).
 ///
 /// # Safety
 /// `current` and `next` must point to valid `SavedState` for the duration of the
@@ -773,19 +809,19 @@ pub fn halt_loop() -> !;
 
 /// Copy `len` bytes between kernel and user memory across the SMAP/SUM access
 /// window with in-kernel fault recovery: a fault on an unmapped or read-only
-/// user span returns the count of bytes not copied (at least 1; recovered by
-/// the page-fault handler's user-copy fixup) instead of panicking, and 0 means
-/// the copy completed. The sole sanctioned path for kernel access to user
-/// pointers; the typed `crate::uaccess::copy_to_user` / `copy_from_user`
-/// wrappers turn a fault into `SyscallError::InvalidAddress`, and the
-/// restartable ones into the faulting address (`len - returned` bytes in).
+/// user span returns the count of bytes not copied (at least 1) instead of
+/// panicking, and 0 means the copy completed. The page-fault handler, after it
+/// retries a fault the live tables already satisfy
+/// (`paging::user_fault_is_spurious`), recovers the fault the arch's own way:
+/// x86-64 ends the copy in place, setting `rax` to the bytes left and `rcx` to 0
+/// and resuming the faulting `rep movsb`, so the return address is unchanged, as
+/// a shadow stack requires (`cpu::in_user_copy` names the instruction); riscv64
+/// resumes at a fixup (`cpu::user_copy_fixup`). The sole sanctioned path for
+/// kernel access to user pointers; the typed `crate::uaccess::copy_to_user` /
+/// `copy_from_user` wrappers turn a fault into `SyscallError::InvalidAddress`,
+/// and the restartable ones into the faulting address (`len - returned` bytes
+/// in).
 pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize;
-
-/// Map a faulting PC to the `copy_user` recovery fixup, or `None`. Consulted by
-/// the page-fault handler on a kernel-mode fault to redirect into the fixup,
-/// after it retries a fault the live tables already satisfy
-/// (`paging::user_fault_is_spurious`).
-pub fn user_copy_fixup(pc: u64) -> Option<u64>;
 
 /// Debug-build check that the user-controlled privileged state a kernel entry
 /// must clear is clear; a no-op in release builds. x86-64 asserts RFLAGS AC,
@@ -882,6 +918,60 @@ pub fn hide(value: usize) -> usize;
 /// CPUID and `IA32_ARCH_CAPABILITIES` (transient-execution.md); RISC-V does
 /// nothing, since the RVA23 floor defines no such enumeration.
 pub fn enumerate_vulnerabilities();
+```
+
+---
+
+## `shadow_stack` — `arch::current::shadow_stack`
+
+Supervisor shadow stacks, the hardware return-address integrity of
+[return-address-integrity.md](return-address-integrity.md). x86-64 runs the kernel on CET
+supervisor shadow stacks when the CPU reports them; RISC-V runs on none, and every function
+below is a stub there (`enabled` is `false`, `CPU_PAGES` is 0).
+
+```rust
+/// Pages of shadow-stack memory each CPU's idle block holds: the idle thread's
+/// shadow stack and the two IST stacks' (with the interrupt SSP table) on
+/// x86-64; 0 on RISC-V.
+pub const CPU_PAGES: usize;
+
+/// A fresh shadow stack, as `context::set_shadow_stack` records it.
+pub struct ShadowStack;
+
+/// Whether the kernel runs on shadow stacks. Fixed by `decide` before any
+/// shadow-stack page is laid out.
+pub fn enabled() -> bool;
+
+/// Decide, on the BSP in Phase 4, whether the kernel runs on shadow stacks:
+/// when the BSP reports CET shadow stacks (CPUID.(EAX=7,ECX=0):ECX[7]).
+pub unsafe fn decide();
+
+/// Write a CPU's `CPU_PAGES` pages at direct-map `base` while they are still
+/// ordinary memory: the idle thread's fresh shadow stack (first run at
+/// `idle_entry`), the interrupt SSP table and the IST stacks' tokens.
+pub unsafe fn init_cpu_pages(base: u64, idle_entry: u64);
+
+/// The idle thread's shadow stack in the CPU pages at `base`.
+pub const fn idle_stack(base: u64) -> ShadowStack;
+
+/// Lay out a thread's fresh shadow stack in the page at direct-map `page`
+/// while it is still ordinary memory, for a first run at `entry`.
+pub unsafe fn init_stack(page: u64, entry: u64) -> ShadowStack;
+
+/// Point the CPU's ring-0 shadow-stack pointer register at a thread's
+/// supervisor token (`context::shadow_stack_token`), for a first run that is
+/// not a switch-in; `context::switch` sets it on a switch.
+pub unsafe fn load_thread_token(token: u64);
+
+/// Give the BSP's handoff stack a shadow stack of its own and arm the BSP's
+/// registers (Phase 5); `prepare_ap` arms an AP on its idle shadow stack,
+/// halting when the AP lacks the feature the BSP enabled.
+pub unsafe fn prepare_boot_cpu(allocator: &mut BuddyAllocator, cpu_pages: u64);
+pub unsafe fn prepare_ap(cpu_pages: u64);
+
+/// Turn shadow stacks on for this CPU. Called from a function that never
+/// returns, since no frame live before the call has a shadow copy.
+pub unsafe extern "C" fn enable();
 ```
 
 ---

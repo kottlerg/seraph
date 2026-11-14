@@ -1463,7 +1463,7 @@ unsafe fn kernel_entry_post_rebase(
         // SEED_MEMORY for init's Thread, in the layout `sys_cap_create_thread`
         // establishes: the guard page, the kernel stack, then the
         // `ThreadObject` followed by the TCB, then the per-thread FPU/SIMD/V
-        // save area.
+        // save area, then with shadow stacks on the shadow-stack page.
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
             use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 

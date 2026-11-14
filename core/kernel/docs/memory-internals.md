@@ -651,13 +651,15 @@ page (§ Kernel Stack Guards). Two sources exist:
 - The idle threads' stacks come from the buddy allocator in Phase 4, one order-3 block
   per CPU, while the buddy still holds large contiguous blocks (before the Phase 7
   drain): the stack is the block's top `KERNEL_STACK_PAGES` pages, the guard the page
-  below it, and the pages below the guard go back to the buddy. They live for the
-  kernel's lifetime ([initialization.md](initialization.md) § Phase 4: Typed-Memory Cap
-  Surface).
+  below it, and the pages below the guard go back to the buddy, apart from the CPU's
+  shadow-stack pages when the kernel runs on shadow stacks (§ Shadow-Stack Pages). They
+  live for the kernel's lifetime ([initialization.md](initialization.md) § Phase 4:
+  Typed-Memory Cap Surface).
 - Every other thread's stack is the `KERNEL_STACK_PAGES` pages above the guard page that
   starts its Thread slab — guard, stack, then the page holding the `ThreadObject` and
   TCB, then the per-thread FPU/SIMD save area, whose pages the boot CPU sizes
-  (`sched::thread_slot`, `SystemInfoType::ThreadRetypeBytes`) — which
+  (`sched::thread_slot`, `SystemInfoType::ThreadRetypeBytes`), then, with shadow stacks
+  on, the thread's shadow-stack page — which
   `SYS_CAP_CREATE_THREAD` carves from the caller's Memory capability, and boot code
   carves from the SEED reserve for init's own thread; the slab returns to its source when
   the thread's reference count reaches zero (see
@@ -756,6 +758,37 @@ every overflow on the guard by its own means:
 
 Phase 8 halts unless the handoff stack's guard (when Phase 3 found one) and every idle
 stack's guard are unmapped.
+
+### Shadow-Stack Pages
+
+When the kernel runs on x86-64 CET supervisor shadow stacks
+([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism), every
+shadow stack is one 4 KiB page whose direct-map leaf has the shadow-stack encoding
+(present, R/W clear, Dirty set; `paging::shadow_direct_map_page`), so no ordinary store
+reaches it. `mm/stack_guard.rs` makes and ends these leaves under the same leaf lock and
+guard-table reserve as the holes:
+
+- Each CPU keeps `shadow_stack::CPU_PAGES` pages (its idle thread's shadow stack and the
+  two IST stacks') from the top of its idle block's spare, directly below the idle
+  stack's guard; Phase 4 writes them and gives them the encoding while only the boot CPU
+  runs (`stack_guard::shadow_on_boot_cpu`), and the rest of the spare goes back to the
+  buddy. The handoff stack's shadow stack is one buddy page converted the same way in
+  Phase 5. All of these are permanent.
+- A Thread slab's last page is its shadow stack. Thread creation writes the page's first
+  words, then converts it together with the guard hole (`stack_guard::hole`). Before
+  creation returns, the page is flushed on every online CPU by a kernel-page shootdown,
+  since a stale writable translation on any CPU, not only the one that runs the thread,
+  would let an ordinary store reach the shadow stack. Freeing the slab maps the page
+  read-write again with the guard (`stack_guard::close`) and flushes this CPU's entry.
+  Another CPU that kept the read-only entry faults on its first ordinary store to the
+  page. The x86-64 ring-0 page-fault path finds the live 4 KiB leaf writable, flushes the
+  entry and retries the store (`paging::kernel_write_fault_is_spurious`). A CPU that runs
+  the page as a new kernel stack flushes first by the guard epoch, as above.
+
+A shadow stack that outgrows its page runs onto the page below it. Below a Thread's
+shadow stack lies its save area's last page, and below the idle shadow stack lies a buddy
+page, both ordinary memory, so the shadow-stack push faults there. The IST shadow stacks
+lie above the idle one and hold one event each.
 
 ### Kernel Stack Depth
 

@@ -413,13 +413,15 @@ stated explicitly.
 16. Unregister tcb from the live-thread registry.
 17. Poison: tcb.magic = 0; tcb.priority = 0xFF.
 18. drop_in_place(tcb).
-19. Close the slot's guard page (`mm::stack_guard::close`): map it back into
-    the direct map before the slot returns to its Memory capability. On
-    riscv64, whose harts may cache the not-present entry, the close flushes
-    this hart's translation alone (`flush_kernel_page`), with no shootdown
-    and nothing to wait for; another hart that kept the entry is covered as
+19. Close the slot's guard page and, when present, its shadow-stack page
+    (`mm::stack_guard::close`): map them back into the direct map read-write
+    before the slot returns to its Memory capability. On riscv64, whose harts
+    may cache the not-present entry, the close flushes this hart's
+    translation alone (`flush_kernel_page`), with no shootdown and nothing to
+    wait for; another hart that kept the entry is covered as
     memory-internals.md § Kernel Stack Guards states. x86-64 caches no
-    not-present entry and flushes nothing.
+    not-present entry and flushes only the shadow-stack page's read-only
+    entry, on this CPU alone (memory-internals.md § Shadow-Stack Pages).
 20. retype_free + ancestor dec_ref + cascade (the dealloc cascade stack,
     `CascadeStack`, that dealloc_object drains; step 13's orphaned endpoint
     and event queues, if any, are torn down from it after this arm returns).

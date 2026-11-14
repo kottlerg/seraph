@@ -47,9 +47,9 @@ SEND badged with its device badge on the private endpoint of its devmgr spawn ba
 also names the RTC's line (APLIC source 11), but the declaration asks for no interrupt,
 so devmgr delivers none.
 
-The driver reserves one page of VA via `reserve_pages`, funds the AS's
-page-table growth budget for that page via `fund_aspace_pt_budget`, and maps
-the `Mmio` cap into it via `syscall::mmio_map`. It then reports
+The driver reserves one page of VA via `reserve_pages` and maps the `Mmio`
+cap into it via `std::os::seraph::mmio_map_funded`, which funds the AS's
+page-table growth budget the map needs. It then reports
 `devmgr_labels::DRIVER_READY` on the query cap, immediately before its
 service loop, and exits when devmgr refuses it: devmgr serves the driver's
 endpoint only after the report, and withdraws it when the driver dies.

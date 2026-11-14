@@ -36,10 +36,10 @@ ruststd/
 ├── heap-fit/                   # `ruststd-heap-fit` crate: pure, host-tested placement rule
 │   └── src/lib.rs              #   of the byte heap (where a request lands in a free block,
 │                               #   what stays free); a rustc-dep-of-std dep of overlaid std
-├── pt-funding/                 # `ruststd-pt-funding` crate: pure, host-tested page-table
-│   └── src/lib.rs              #   funding policy (a top-up's donations and outcome, the
-│                               #   map retry after an exhausted pool); a rustc-dep-of-std
-│                               #   dep of overlaid std
+├── pool-funding/               # `ruststd-pool-funding` crate: pure, host-tested funding
+│   └── src/lib.rs              #   policy of the page-table and `CSpace` growth pools (a
+│                               #   top-up's donations and outcome, the map retry after an
+│                               #   exhausted pool); a rustc-dep-of-std dep of overlaid std
 ├── spin-wait/                  # `ruststd-spin-wait` crate: pure, host-tested contended-wait
 │   └── src/lib.rs              #   policy of the overlay's spin mutex and of a parking wait
 │                               #   with no Notification (spin, then sleep); a
@@ -150,9 +150,10 @@ procmgr), `std::sys::seraph` exposes a page-granular reservation allocator:
 
 ```rust
 let range = std::os::seraph::reserve_pages(n)?;     // unmapped VA range
-std::os::seraph::fund_aspace_pt_budget(self_aspace, n); // fund PT growth
 // SAFETY: `range` is an owned reservation; no Rust object or IPC page lies in it.
-unsafe { syscall::mem_map(memory_cap, self_aspace, range.va, 0, n, prot)? };
+unsafe {
+    std::os::seraph::mem_map_funded(memory_cap, self_aspace, range.va, 0, n, prot)?
+};
 // ... use the mapping ...
 // SAFETY: no Rust reference into the range is live any more.
 unsafe { syscall::mem_unmap(self_aspace, range.va, n)? };
@@ -165,29 +166,34 @@ page lies in it, and, for `mmio_map`, that only raw pointers reach the mapping (
 sections the [`shared/syscall` README](../../shared/syscall/README.md) summarizes). A fresh
 reservation discharges the first by construction.
 
-Mapping a foreign Memory cap into a retype-backed `AddressSpace` first funds
-that AS's page-table growth budget: `fund_aspace_pt_budget(self_aspace, n)`
-acquires a memmgr-backed RETYPE Memory cap and augments the AS's PT pool via
+A map into a retype-backed `AddressSpace` draws its intermediate page tables
+from that AS's page-table growth pool, and fails with `OutOfMemory` when the
+pool is exhausted. `fund_aspace_pt_budget(self_aspace, n)` tops the pool up: it
+acquires a memmgr-backed RETYPE Memory cap and augments the pool via
 `cap_create_aspace`, donating only the pool's shortfall against the worst case
-for `n` pages. It MUST be called after reserving VA and before
-`mem_map`/`mmio_map`, or the map fails with `OutOfMemory`. It returns `false`
-only when a top-up could not be had (memmgr unreachable or refusing the grant,
-or the kernel refusing the donation).
+for `n` pages. It returns `false` only when a donation was refused (memmgr
+unreachable or refusing the grant, or the kernel refusing the donation).
 
 The pool is shared by every mapping of the process, the pager's included, so a
 top-up cannot be reserved for the span it was made for: another thread's mapping
 can draw it before that span's map runs, and the map then fails with
 `OutOfMemory`. The map, not a read of the pool, decides whether the span is
-covered. Every map std makes into its own address space (the heap's grow, an
-eager thread stack, a pipe's ring page, the `File` read and write frames, the
-spawner's argv/env window) therefore goes through one helper, `mem_map_funded`
-in `sys/alloc`: it maps first, and while the map fails with `OutOfMemory` tops
-the pool up and maps again, up to `MAP_TOP_UPS` (4) top-ups, the bound memmgr
-sets on the same loop for a demand chunk
+covered. A map into the process's own address space therefore goes through a
+funded map, `std::os::seraph::mem_map_funded` for a Memory cap and
+`std::os::seraph::mmio_map_funded` for an Mmio cap: it maps first, and while the
+map fails with `OutOfMemory` tops the pool up for the span and maps again, up to
+`MAP_TOP_UPS` (4) top-ups, the bound memmgr sets on the same loop for a demand
+chunk
 ([Client page-table funding](../../services/memmgr/docs/memory-pool.md#client-page-table-funding)).
-A map that fails part-way leaves the pages before the failing one mapped, and
-the next map maps them again. The policy is the host-tested `ruststd-pt-funding`
-crate; the syscalls stay in the overlay. A demand-region registration
+Every other error is returned at once. Every map std makes into its own address
+space (the heap's grow, an eager thread stack, a pipe's ring page, the `File`
+read and write frames, the spawner's argv/env window) goes through the same
+helper, and a service or driver maps into its own address space through these
+two functions. A map that fails part-way
+leaves the pages before the failing one mapped, and the next map maps them
+again; a caller that gives up on the span unmaps it before releasing its
+reservation. The policy is the host-tested `ruststd-pool-funding` crate; the
+syscalls stay in the overlay. A demand-region registration
 (`register_demand_paged`, the main thread's stack growth, the heap's demand
 floor, a spawned thread's demand stack) maps nothing itself, so it tops the pool
 up as best effort and does not fail on the outcome: memmgr funds the pool itself
@@ -290,8 +296,12 @@ std::os::seraph::fund_cspace_slot_budget(self_cspace, n);       // ensure >= n o
   when the headroom falls short of `n` plus a page's slots, or the growth budget
   (`CAP_INFO_CSPACE_BUDGET`) below a page, and donates it with augment-mode `cap_create_cspace`,
   sized by `syscall_abi::cspace_topup_pages`. The page beyond `n` is for the `CSpace`'s body
-  arena, which a split or a range-capability copy draws on. It returns `false` if either still
-  falls short after the funding rounds.
+  arena, which a split or a range-capability copy draws on. It donates the shortfall it reads,
+  in at most `FUND_ROUNDS` (2) donations (the `ruststd-pool-funding` crate), and returns `false`
+  only when a donation was refused. The headroom is shared by every capability allocation of
+  the process, so another thread's allocations can take the donated slots first; a headroom that
+  reads short after donations that were made is no failure, and the caller's own allocation
+  decides, failing with the refillable `OutOfMemory`.
 
 A process calls it before a known burst of capability acquisitions; fatfs funds its page cache
 this way. A long-lived service calls it when the headroom drops below a low-water mark, as

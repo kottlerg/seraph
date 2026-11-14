@@ -230,8 +230,9 @@ impl Store
         // SAFETY: `range` is a fresh reservation of `pages` pages from the
         // per-process arena, kept for the driver's life once mapped: VA no
         // Rust object or IPC page occupies.
-        let mapped =
-            unsafe { syscall::mem_map(cap, self.aspace, va, 0, pages, syscall::MAP_WRITABLE) };
+        let mapped = unsafe {
+            std::os::seraph::mem_map_funded(cap, self.aspace, va, 0, pages, syscall::MAP_WRITABLE)
+        };
         if mapped.is_err()
         {
             std::os::seraph::log!(warn: "table pages: mapping failed");

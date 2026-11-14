@@ -51,7 +51,9 @@ impl ScratchMapping
         // per-process arena, owned by this mapping: VA no Rust object or IPC
         // page occupies. A cap shorter than `pages` is refused, so the map
         // never reaches past the reservation.
-        if unsafe { syscall::mem_map(memory_cap, self_aspace, va, 0, pages, prot) }.is_err()
+        let mapped =
+            unsafe { std::os::seraph::mem_map_funded(memory_cap, self_aspace, va, 0, pages, prot) };
+        if mapped.is_err()
         {
             // The kernel maps page by page and stops at the first failure, so
             // pages before it may be mapped: unmap the whole span (unmapping a
@@ -311,7 +313,7 @@ pub(crate) unsafe fn load_elf_segment_into_child(
         // SAFETY: page `i` of the `num_pages`-page reservation taken above,
         // owned by `scratch`: VA no Rust object or IPC page occupies.
         let mapped = unsafe {
-            syscall::mem_map(
+            std::os::seraph::mem_map_funded(
                 memory_cap,
                 self_aspace,
                 scratch_base.saturating_add(i.saturating_mul(PAGE_SIZE)),

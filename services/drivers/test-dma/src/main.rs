@@ -243,8 +243,12 @@ impl Driver
         let range = reserve_pages(1).ok()?;
         let va = range.va_start();
         // SAFETY: `range` is a fresh one-page reservation, kept for the
-        // driver's life: VA no Rust object or IPC page occupies.
-        unsafe { syscall::mem_map(cap, self.aspace, va, 0, 1, syscall::MAP_WRITABLE) }.ok()?;
+        // driver's life, mapped or not: VA no Rust object or IPC page
+        // occupies.
+        unsafe {
+            std::os::seraph::mem_map_funded(cap, self.aspace, va, 0, 1, syscall::MAP_WRITABLE)
+        }
+        .ok()?;
         Some((cap, va))
     }
 
@@ -659,12 +663,13 @@ fn main() -> !
         syscall::thread_exit();
     };
     let regs = range.va_start();
-    let funded = std::os::seraph::fund_aspace_pt_budget(info.self_aspace, bar_pages);
     // SAFETY: `range` is a fresh reservation of `bar_pages` pages, kept for
     // the driver's life, and the BAR cap spans at most `bar_pages` pages, so
     // the whole-cap mapping stays inside it; the registers are reached only
     // through raw volatile accesses (`mmio_map` § Safety).
-    if !funded || unsafe { syscall::mmio_map(info.self_aspace, bar_cap, regs, 0) }.is_err()
+    let mapped =
+        unsafe { std::os::seraph::mmio_map_funded(info.self_aspace, bar_cap, regs, bar_pages) };
+    if mapped.is_err()
     {
         std::os::seraph::log!("test-dma: BAR 0 not mapped");
         syscall::thread_exit();

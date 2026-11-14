@@ -181,8 +181,10 @@ and a demand fault's run goes back to the pool and the fault is declined with co
 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message).
 
 The clearing costs one map, one pass of stores over the run, and one unmap per hand-out. svctest's
-`demand_fault_cost` phase reports the mean cost of a 16-page demand fault, the measure of a change
-to that work.
+`demand_fault_cost` phase reports the cycles of a 16-page demand fault and of a grant-and-map of
+the same size, the measure of a change to that work
+([programs/demandpaged/README.md](../../../programs/demandpaged/README.md#bench-mode) § Bench
+mode).
 
 ---
 

@@ -12,7 +12,9 @@
 //! edit, restoring the backup when what GitHub holds is not what was sent.
 //! `issue-file` creates an Issue with the labels and milestone
 //! `docs/conventions.md` § Labels and § Milestones require, and reads it back
-//! to confirm that both were applied.
+//! to confirm that both were applied; a rolling follow-up Issue it files only
+//! under the current milestone, and only when no open Issue of that milestone
+//! carries its title (§ Follow-up Issues).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,7 +24,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 
 use crate::cli::{IssueEditArgs, IssueFileArgs};
-use crate::commands::pr_check::{ROLLING_TITLE_SUFFIX, current_milestone};
+use crate::commands::pr_check::{current_milestone, is_rolling};
 use crate::context::Context as BuildContext;
 use crate::gh;
 use crate::tasklist::{TaskItem, task_item, task_item_text};
@@ -330,7 +332,7 @@ pub fn rolling_milestone_problem(
     current: Option<&str>,
 ) -> Option<String>
 {
-    if !title.trim_end().ends_with(ROLLING_TITLE_SUFFIX)
+    if !is_rolling(title)
     {
         return None;
     }
@@ -349,6 +351,28 @@ pub fn rolling_milestone_problem(
     }
     Some(format!(
         "a rolling follow-up Issue takes the current milestone, `{current}`"
+    ))
+}
+
+/// Why a rolling follow-up Issue titled `title` may not be filed when `open`
+/// lists the open Issues of the current milestone by number and title: the
+/// scope already has its rolling Issue there (docs/conventions.md § Follow-up
+/// Issues). A rolling Issue of an earlier milestone, open or closed, carries
+/// the same title and is not in `open`, so it does not count. `None` when the
+/// title is not a rolling Issue's or no open Issue carries it.
+pub fn rolling_duplicate_problem(title: &str, open: &[(u64, String)]) -> Option<String>
+{
+    if !is_rolling(title)
+    {
+        return None;
+    }
+    let held = open
+        .iter()
+        .find(|(_, other)| other.trim() == title.trim())?;
+    Some(format!(
+        "the scope's rolling follow-up Issue of the current milestone is #{}; record the \
+         findings there",
+        held.0
     ))
 }
 
@@ -425,7 +449,7 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
         .with_context(|| format!("cannot read {}", args.body_file.display()))?;
     let choice = MilestoneChoice::from_args(args.milestone.as_deref(), args.unscheduled);
     let mut problems = check_filing(&args.title, &body, &args.label, &choice);
-    if args.title.trim_end().ends_with(ROLLING_TITLE_SUFFIX)
+    if is_rolling(&args.title)
     {
         let current = current_milestone(&gh::open_milestones(&ctx.root)?);
         problems.extend(rolling_milestone_problem(
@@ -433,6 +457,13 @@ pub fn run_file(ctx: &BuildContext, args: &IssueFileArgs) -> Result<()>
             &choice,
             current.as_deref(),
         ));
+        if let Some(current) = current.as_deref()
+        {
+            problems.extend(rolling_duplicate_problem(
+                &args.title,
+                &gh::open_issues_in(&ctx.root, current)?,
+            ));
+        }
     }
     if !problems.is_empty()
     {
@@ -594,6 +625,34 @@ mod tests
             assert!(problem.contains("`v0.1.4`"), "{problem}");
         }
         assert!(rolling_milestone_problem(rolling, &milestone("v0.1.4"), None).is_some());
+    }
+
+    #[test]
+    fn a_rolling_issue_is_filed_once_per_milestone()
+    {
+        let rolling = "xtask: defects found by review";
+        // The open Issues of the current milestone. The rolling Issue of the
+        // release before, closed at that release or still open in its own
+        // milestone, carries the same title but is not among them.
+        let current = [
+            (1050, "claude: a rule".to_owned()),
+            (1061, "docs: defects found by review".to_owned()),
+        ];
+        assert_eq!(rolling_duplicate_problem(rolling, &current), None);
+        // A second one of the same scope in the same milestone is refused,
+        // naming the one that holds the scope's findings.
+        let held = [
+            (1062, rolling.to_owned()),
+            (1050, "claude: a rule".to_owned()),
+        ];
+        let problem = rolling_duplicate_problem(rolling, &held).expect("a refusal");
+        assert!(problem.contains("#1062"), "{problem}");
+        // An Issue that is not a rolling one is never compared.
+        let title = "xtask: a later feature";
+        assert_eq!(
+            rolling_duplicate_problem(title, &[(7, title.to_owned())]),
+            None
+        );
     }
 
     #[test]

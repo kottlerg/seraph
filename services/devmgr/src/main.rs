@@ -592,17 +592,6 @@ impl Registry
         for (state, spawned) in roster.into_outcomes()
         {
             let name = spawned.name;
-            if spawned.serves == Serves::Iommu && state != DriverState::Ready
-            {
-                // Destroyed but not released: its service endpoint is the
-                // IOMMU client's, which is never deleted.
-                std::os::seraph::log!(
-                    warn: "{}: driver not ready when its batch settled; destroyed",
-                    name.as_str()
-                );
-                spawn::destroy_child(spawned.driver.process_handle, ipc_buf);
-                continue;
-            }
             let (driver, why) = match state
             {
                 DriverState::Ready =>
@@ -637,7 +626,7 @@ impl Registry
         let taken = self.lock().served.take_dead(post.badge);
         match taken
         {
-            // The IOMMU driver's record is dropped, not released.
+            // The IOMMU driver's record holds nothing to release.
             Some((None, _record)) =>
             {
                 std::os::seraph::log!(
@@ -1674,6 +1663,10 @@ enum Serves
 /// and the driver's process handle while devmgr keeps it.
 struct ServedDriver
 {
+    /// The driver's service endpoint, which [`Self::release`] revokes and
+    /// deletes; 0 for the IOMMU driver, whose endpoint is the IOMMU client's
+    /// (`iommu::IommuClient`) and never deleted, so no withdrawal of the
+    /// driver frees a slot the client's death watch would drain.
     ep: u64,
     dev_caps: Option<bind::PciDeviceCaps>,
     /// For a driver bound to a platform record, the caps devmgr carved for
@@ -1721,14 +1714,17 @@ impl ServedDriver
     }
 
     /// Release what the registry holds for the driver: revoke its service
-    /// endpoint (every copy derived from it: the driver's receive copy and
-    /// every client SEND) and delete it, so callers queued on it return, and
-    /// release the device's caps. The device's catalog entry stays, so its
-    /// badge is never recycled.
+    /// endpoint, when it holds one (every copy derived from it: the driver's
+    /// receive copy and every client SEND), and delete it, so callers queued
+    /// on it return, and release the device's caps. The device's catalog
+    /// entry stays, so its badge is never recycled.
     fn release(&self)
     {
-        let _ = syscall::cap_revoke(self.ep);
-        let _ = syscall::cap_delete(self.ep);
+        if self.ep != 0
+        {
+            let _ = syscall::cap_revoke(self.ep);
+            let _ = syscall::cap_delete(self.ep);
+        }
         if let Some(dev_caps) = &self.dev_caps
         {
             dev_caps.release();
@@ -1776,9 +1772,9 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
 struct ServedDrivers
 {
     classes: Classes<ServedDriver>,
-    /// The IOMMU driver once its batch settles, at ordinal 0. Its service
-    /// endpoint is the one the IOMMU client calls, so its record is never
-    /// released: a death fails the client closed instead
+    /// The IOMMU driver once its batch settles, at ordinal 0. Its record
+    /// holds no service endpoint (the client's is never deleted) and, once
+    /// served, no process handle: a death fails the client closed
     /// ([`Registry::withdraw_dead`]).
     iommu: Served<ServedDriver>,
     /// The client the IOMMU driver is called through, once it is ready.
@@ -1858,9 +1854,9 @@ impl ServedDrivers
 
     /// Take out the served driver whose device badge is `badge`, leaving a
     /// tombstone at its ordinal, with its class: `None` for the IOMMU driver,
-    /// whose record the caller drops, not releases, since its endpoint stays
-    /// the client's and no thread calls a reused slot; a class's driver the
-    /// caller withdraws. `None` when no driver is served under `badge`.
+    /// whose record holds nothing to release and whose death the caller
+    /// fails the client on; a class's driver the caller withdraws. `None`
+    /// when no driver is served under `badge`.
     fn take_dead(&mut self, badge: u64) -> Option<(Option<ClassName>, ServedDriver)>
     {
         if let Some(record) = self.iommu.withdraw(badge)

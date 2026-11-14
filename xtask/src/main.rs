@@ -106,6 +106,7 @@ fn main()
         CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
+        CliCommand::TestWedge(args) => commands::test_wedge::run(&ctx, args),
         CliCommand::CaptureAcpi(args) => commands::capture_acpi::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),

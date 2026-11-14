@@ -1170,8 +1170,9 @@ The window during which the BSP is live but SMP state is not yet steady. Begins 
 ## IPI Taxonomy
 
 The kernel sends two IPI kinds on both arches, TLB shootdown and wakeup; x86-64 additionally sends
-INIT/SIPI to start APs and a vector-2 NMI from the IPI watchdog (§ IPI Watchdog Ladder). Each has a
-defined purpose and correctness role.
+INIT/SIPI to start APs and a vector-2 NMI backtrace request from the IPI watchdog (§ IPI Watchdog
+Ladder) and from the softlockup watchdog's heartbeat cross-checks (§ Softlockup Watchdog). Each has
+a defined purpose and correctness role.
 
 ### x86_64
 
@@ -1226,7 +1227,7 @@ phases keyed off the elapsed-microseconds delta from the start of the wait:
 |---|---|---|
 | A | 0 – 250 ms | Spin with `core::hint::spin_loop()` while `cond()` reports unacked. |
 | B | 250 – 750 ms | Call `ctx.resend()` once at the boundary, then continue spinning. Recovers from a dropped IPI under emulators with non-deterministic LAPIC delivery. |
-| C | 750 ms – 5 s | x86-64: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU; the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
+| C | 750 ms – 5 s | x86-64: request a backtrace from that CPU (`request_nmi_backtrace(target_cpu)`: increment the per-CPU request count returned by `nmi_backtrace_request(target_cpu)` and send a vector-2 NMI to that CPU); the target's dedicated NMI handler dumps its `TrapFrame` to serial so the eventual Phase-D panic is diagnosable. RISC-V: emit a single logged warning (no S-mode NMI surface; Phase C degrades to a warn). |
 | D | > 5 s | Print `target_cpu`, `op_name`, `elapsed_ms` to serial, then `crate::fatal`. |
 
 Before the timer is calibrated `elapsed_us` gives no reading, and the ladder runs on an elapsed
@@ -1263,11 +1264,13 @@ The x86-64 IDT registers a dedicated stub at vector 2 (IST=2 per the NMI ABI) th
 canonical `TrapFrame`, switches to the kernel GS base when the user base is active (decided from the
 sign bit of `IA32_GS_BASE`, not the saved CS, since an NMI can arrive between a ring-3 entry and its
 `swapgs`), and calls a returning handler; on return it disables interrupts, swaps back if it
-swapped, then writes back and `iretq`s. Each Phase-C sender increments the per-CPU request count
-returned by `nmi_backtrace_request(cpu)` before it sends, and the handler takes one request per NMI
-(a decrement that refuses at 0):
-- **A request taken** (watchdog-requested): dump the saved frame to serial and return; the stub's
-  `iretq` resumes the interrupted code.
+swapped, then writes back and `iretq`s. Every sender requests through `request_nmi_backtrace(cpu)`
+(the IPI ladder's Phase C, and the softlockup watchdog's `dump_remote_frame`), which increments the
+per-CPU request count returned by `nmi_backtrace_request(cpu)` before it sends, and the handler
+takes one request per NMI (a decrement that refuses at 0):
+- **A request taken** (watchdog-requested): dump the saved frame to serial, add one to the global
+  count of printed backtraces (`NMI_BACKTRACES_PRINTED`), and return; the stub's `iretq` resumes
+  the interrupted code.
 - **None pending** (real hardware NMI): tail-call `common_exception_handler` which never returns —
   the stub's `iretq` tail is dead code in that case.
 
@@ -1282,6 +1285,14 @@ is dropped meanwhile, in which case the latched ping takes the remaining request
 NMI is dumped and resumed; a ping NMI the CPU drops (one NMI is latched while the handler runs;
 further ones are lost, Intel SDM Vol. 3A § 6.7.1) leaves a request that the next NMI, of either
 kind, takes.
+
+The frame lines go out through `kprintln_nmi!`, which takes the console lock by swap rather than
+waiting for it, so they can interleave with another CPU's output. `dump_remote_frame` keeps the
+softlockup watchdog's report apart from them: it reads `NMI_BACKTRACES_PRINTED`, requests the
+backtrace, and spins until the count moves or 1 s passes (`REMOTE_FRAME_BUDGET_US`, through
+`bounded_wait::spin_until`), before its caller prints anything. Another sender's backtrace finishing
+in that window also ends the wait; each frame's first line names its CPU. The IPI ladder's Phase C
+does not wait: its ack wait goes on spinning, and its report is the Phase-D panic.
 
 NMI is not APIC-EOI'd; the handler does not call `acknowledge()`.
 
@@ -1555,6 +1566,18 @@ silence — so the AP-side check is the only detector that can name that state (
 the BSP scans AP stamps (`ap_silence_check`) and fires on an AP silent past the grace window. Both
 defer to an in-flight TLB shootdown, as below.
 
+The observer's report would show only its own state, so before it prints, once it holds the latch,
+it has the silent CPU print its own frame (`arch::current::interrupts::dump_remote_frame`). On
+x86-64 that is an NMI backtrace request (§ `ipi_nmi_backtrace_stub` / `ipi_nmi_backtrace_handler`),
+which a CPU wedged with interrupts masked still takes: its `rip` names where it is wedged. The
+observer waits up to 1 s for the frame, so the frame's lines come before its own, which end with
+`own_frame=true` when the frame was printed in time and `own_frame=false` otherwise. On RISC-V
+there is no S-mode NMI, and a hart wedged with `sstatus.SIE` clear takes no supervisor interrupt,
+so the report is the observer's alone and its line ends with `own_frame=false`.
+`cargo xtask test-wedge` wedges an idle AP, then the BSP, with interrupts masked on both
+architectures and checks this report (see
+[testing.md § Interrupts-off wedge](../../../docs/testing.md#interrupts-off-wedge-test-wedge)).
+
 The heartbeat checks measure staleness in wall time, so their grace scales
 with CPU count (`heartbeat_stall_ticks`, stepping at multiples of 128 CPUs:
 <256 CPUs → 8 s, 256–383 → 16 s, 384–511 → 24 s, 512–639 → 32 s, and so on:
@@ -1654,8 +1677,9 @@ cross-checks).
 
 **Does NOT catch:** every CPU wedged interrupts-off simultaneously (no
 heartbeat check runs anywhere — the all-idle detector is also dead because
-its counter stops). Only an NMI / always-on S-mode timer hardlockup
-detector closes that; tracked as issue #33. A `Blocked` thread whose waker
+its counter stops). Only a per-CPU detector that fires with no observer
+left closes that (an x86-64 performance-counter overflow NMI, or riscv64 SBI
+Supervisor Software Events); tracked as issue #1088. A `Blocked` thread whose waker
 genuinely never claimed it (no deadline, no `wake_in_flight`, no
 `wake_pending`) is indistinguishable from a legitimate indefinite wait by
 TCB scalars alone and is also not flagged; when every thread is so blocked, the

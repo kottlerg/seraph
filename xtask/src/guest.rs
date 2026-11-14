@@ -3,8 +3,9 @@
 
 // xtask/src/guest.rs
 
-//! A QEMU process a host harness drives over QMP, and the thread reading its
-//! serial output: the VMGENID snapshot-resume test and the ACPI table capture.
+//! A QEMU process a host harness drives, and the thread reading its serial
+//! output: over QMP, the VMGENID snapshot-resume test and the ACPI table
+//! capture; over the gdbstub, the interrupts-off wedge test.
 
 use std::io::BufReader;
 use std::process::Child;
@@ -126,6 +127,24 @@ impl Guest
             if markers.iter().any(|m| line.contains(m))
             {
                 return Ok(());
+            }
+        }
+    }
+
+    /// Echo serial lines until one holds `marker` or `timeout` passes, and
+    /// return every line read, the marker's last.
+    pub fn collect_until(&mut self, marker: &str, timeout: Duration) -> Result<Vec<String>>
+    {
+        let start = Instant::now();
+        let mut lines = Vec::new();
+        loop
+        {
+            let line = self.next_line(timeout.saturating_sub(start.elapsed()), &[marker])?;
+            let done = line.contains(marker);
+            lines.push(line);
+            if done
+            {
+                return Ok(lines);
             }
         }
     }
@@ -268,6 +287,23 @@ mod tests
         guest
             .wait_for_any(&["BdsDxe: ", "[Bds]Booting "], Duration::from_secs(10))
             .unwrap();
+    }
+
+    #[test]
+    fn collect_until_returns_the_lines_through_the_marker()
+    {
+        let mut guest = echoing("a\nb marker\nc\n");
+        let lines = guest
+            .collect_until("marker", Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(lines, ["a", "b marker"]);
+        // The line after the marker is left for the next read, and a marker
+        // that never comes times out.
+        let rest = guest.collect_until("c", Duration::from_secs(10)).unwrap();
+        assert_eq!(rest, ["c"]);
+        guest
+            .collect_until("d", Duration::from_millis(200))
+            .unwrap_err();
     }
 
     #[test]

@@ -32,7 +32,7 @@ const PFLASH_SIZE: u64 = 32 * 1024 * 1024;
 
 /// GDB stub exposure for a QEMU launch.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum GdbMode
+pub enum GdbMode<'a>
 {
     /// No gdbstub.
     Off,
@@ -41,6 +41,10 @@ pub enum GdbMode
     Listen,
     /// Expose the gdbstub and freeze at the first instruction (`-s -S`).
     Freeze,
+    /// Expose the gdbstub on a unix socket at this path, without pausing the
+    /// guest (`-gdb unix:<path>,server=on,wait=off`): a host harness drives
+    /// it, and a per-run path keeps concurrent boots off the shared TCP port.
+    Unix(&'a Path),
 }
 
 /// Guest RISC-V paging mode ceiling for a QEMU launch.
@@ -328,7 +332,7 @@ pub struct QemuLaunchSpec<'a>
     /// Guest memory size in MiB.
     pub mem_mib: u32,
     pub display: QemuDisplay,
-    pub gdb: GdbMode,
+    pub gdb: GdbMode<'a>,
     /// When set, expose a QMP control socket at this path
     /// (`-qmp unix:<path>,server,nowait`) so a host harness can drive the
     /// guest — the interactive-input test injects keys this way.
@@ -490,6 +494,10 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         {}
         GdbMode::Listen => args.push("-s".into()),
         GdbMode::Freeze => args.extend(["-s".into(), "-S".into()]),
+        GdbMode::Unix(path) => args.extend([
+            "-gdb".into(),
+            format!("unix:{},server=on,wait=off", path.display()),
+        ]),
     }
 
     let accel = accel::detect_for_arch(spec.arch);
@@ -1087,6 +1095,17 @@ mod tests
         spec.riscv_mmu = RiscvMmu::Sv57;
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(cpu_arg(&argv).ends_with(",sv57=on"));
+    }
+
+    #[test]
+    fn argv_exposes_the_gdbstub_on_a_unix_socket()
+    {
+        let mut spec = riscv_spec(1, 512);
+        spec.gdb = GdbMode::Unix(Path::new("/tmp/wedge.gdb"));
+        let argv = build_qemu_argv(&spec).unwrap();
+        let gdb = argv.iter().position(|a| a == "-gdb").unwrap();
+        assert_eq!(argv[gdb + 1], "unix:/tmp/wedge.gdb,server=on,wait=off");
+        assert!(!argv.iter().any(|a| a == "-s" || a == "-S"));
     }
 
     #[test]

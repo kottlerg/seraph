@@ -193,18 +193,43 @@ pub fn update_fat_entry(
 }
 
 /// Allocate one free cluster, mark it end-of-chain, and optionally
-/// link it as the successor of `prev`.
+/// link it as the successor of `prev`: [`find_free_cluster`], then
+/// [`claim_cluster`].
+///
+/// # Errors
+/// As [`find_free_cluster`] and [`claim_cluster`].
+pub fn allocate_cluster(
+    state: &mut FatState,
+    prev: Option<u32>,
+    cache: &PageCache,
+    block_dev: u64,
+    ipc_buf: *mut u64,
+) -> Result<u32, FatError>
+{
+    let found = find_free_cluster(state, cache, block_dev, ipc_buf)?;
+    claim_cluster(state, found, prev, cache, block_dev, ipc_buf)?;
+    Ok(found)
+}
+
+/// The free cluster the next allocation takes, found without writing
+/// anything: its FAT entry stays free until [`claim_cluster`] marks it.
+/// A caller may write the cluster's sectors in between (a directory
+/// zeroes its new cluster before linking it), since fatfs's single
+/// service thread holds `state` throughout, so no other allocation can
+/// take the cluster first.
 ///
 /// Scan strategy: start at `next_free_hint` (or cluster 2 on FAT16 /
 /// hint miss), walk forward, wrap to cluster 2 once, terminate on
 /// finding a free entry or completing the wrap. Bad clusters are
-/// skipped. On success, the returned cluster's FAT entry is written
-/// `eoc_value(fat_type)` and `next_free_hint` is bumped to the slot
-/// after the allocation. The single wrap visits each of the volume's
+/// skipped. The single wrap visits each of the volume's
 /// `total_clusters` at most once, so the volume, not a constant, bounds it.
-pub fn allocate_cluster(
+///
+/// # Errors
+/// [`FatError::NoSpace`] when no cluster is free; [`FatError::Corrupt`]
+/// when the volume has no data cluster or the cluster found reads as the
+/// bad-cluster marker; [`FatError::Io`] when a FAT sector cannot be read.
+pub fn find_free_cluster(
     state: &mut FatState,
-    prev: Option<u32>,
     cache: &PageCache,
     block_dev: u64,
     ipc_buf: *mut u64,
@@ -214,12 +239,7 @@ pub fn allocate_cluster(
     {
         return Err(FatError::Corrupt);
     }
-    // The last data cluster: mount bounds `total_clusters` below the FAT32
-    // bad-cluster marker, so this never fails on a mounted volume.
-    let max_cluster = state
-        .total_clusters
-        .checked_add(1)
-        .ok_or(FatError::Corrupt)?;
+    let max_cluster = last_data_cluster(state)?;
     let start = if state.is_data_cluster(state.next_free_hint)
     {
         state.next_free_hint
@@ -249,25 +269,57 @@ pub fn allocate_cluster(
     {
         return Err(FatError::Corrupt);
     }
+    Ok(found)
+}
+
+/// The last data cluster. Mount bounds `total_clusters` below the FAT32
+/// bad-cluster marker, so this never fails on a mounted volume.
+fn last_data_cluster(state: &FatState) -> Result<u32, FatError>
+{
+    state.total_clusters.checked_add(1).ok_or(FatError::Corrupt)
+}
+
+/// Claim `cluster`, which [`find_free_cluster`] returned: mark it
+/// end-of-chain, then link it as the successor of `prev` if given. The
+/// mark comes first, so a link never names a cluster the FAT holds free.
+/// On success `next_free_hint` is bumped to the cluster after it and the
+/// free count lowered.
+///
+/// # Errors
+/// [`FatError::Io`] when a FAT sector cannot be read or written;
+/// [`FatError::Corrupt`] when `cluster` or `prev` lies outside the data
+/// region. A failure after the mark leaves `cluster` end-of-chain: an
+/// orphan (services/fs/fat/docs/crash-safety.md), or the chain's last
+/// cluster when the failed link reached the device or a FAT copy anyway.
+pub fn claim_cluster(
+    state: &mut FatState,
+    cluster: u32,
+    prev: Option<u32>,
+    cache: &PageCache,
+    block_dev: u64,
+    ipc_buf: *mut u64,
+) -> Result<(), FatError>
+{
+    let max_cluster = last_data_cluster(state)?;
 
     // Mark the new cluster end-of-chain.
     update_fat_entry(
         state,
-        found,
+        cluster,
         eoc_value(state.fat_type),
         cache,
         block_dev,
         ipc_buf,
     )?;
 
-    // Link prev → found if requested.
+    // Link prev → cluster if requested.
     if let Some(p) = prev
     {
-        update_fat_entry(state, p, found, cache, block_dev, ipc_buf)?;
+        update_fat_entry(state, p, cluster, cache, block_dev, ipc_buf)?;
     }
 
     // Bump the advisory hint past the allocation (wrap to 2 at end).
-    state.next_free_hint = found
+    state.next_free_hint = cluster
         .checked_add(1)
         .filter(|&next| next <= max_cluster)
         .unwrap_or(2);
@@ -282,11 +334,11 @@ pub fn allocate_cluster(
     // the FAT32 image has no FSInfo sector.
     flush_fsinfo(state, cache, block_dev, ipc_buf);
 
-    Ok(found)
+    Ok(())
 }
 
 /// Defensive double-check that `cluster` is not the bad-cluster
-/// sentinel. Used by `allocate_cluster` after the scan; the scan loop
+/// sentinel. Used by `find_free_cluster` after the scan; the scan loop
 /// itself never breaks on a non-free entry so this should always be
 /// false but guards against a corrupt FAT.
 fn found_is_bad(

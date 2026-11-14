@@ -100,12 +100,20 @@ Allocation Contract").
 - **Serve MMIO or IOMMU memory caps.** memmgr's pool is RAM only. MMIO Memory
   caps come from devmgr (see [device-management.md](../../docs/device-management.md));
   memmgr never sees them.
-- **Implement swap or a backing store.** Memory caps are allocated out of
-  physical RAM, and as the default pager memmgr fills a demand-paged fault
-  from that RAM too (see [docs/fault-handling.md](../../docs/fault-handling.md)
-  § Demand Paging and the Default System Pager); nothing is paged out. A failed
-  allocation returns an out-of-memory error to the caller (see
-  [`docs/memory-pool.md`](docs/memory-pool.md) §"Failure Modes").
+- **Perform device I/O.** memmgr serves the page faults and heap growth of
+  every service on the storage path, so it never waits on one of them and reads
+  or writes no device itself. Memory caps are allocated out of physical RAM,
+  and as the default pager memmgr fills a demand-paged fault from that RAM too
+  (see [docs/fault-handling.md](../../docs/fault-handling.md) § Demand Paging
+  and the Default System Pager); a failed allocation returns an out-of-memory
+  error to the caller (see [`docs/memory-pool.md`](docs/memory-pool.md)
+  §"Failure Modes"). Under memory pressure memmgr is to evict cold pages it
+  mapped as pager into a compressed store it keeps in RAM, and restore them on
+  the next fault (design intent; not yet implemented: see
+  [`docs/memory-pool.md`](docs/memory-pool.md#eviction) § Eviction). Swap to
+  disk is that store's second tier: a separate swap service writes store pages
+  out and reads them back
+  ([#43](https://github.com/kottlerg/seraph/issues/43)).
 - **Operate a page cache.** Caching of file pages (when fs drivers
   implement it) lives in the fs driver, not in memmgr.
 

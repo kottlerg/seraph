@@ -71,7 +71,8 @@ handle (`CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`).
 | next-to-last cap, or last without a relay | When `CREATE_ARGV_ENV` is set: Memory cap holding the argv and env blobs |
 | last cap | When `CREATE_DEATH_RELAY` is set: POST-only `EventQueue` cap (**Death relay** below) |
 
-procmgr maps the module, parses the ELF, creates the child's address space,
+procmgr maps the module's whole Memory cap read-only (every page of its size), parses the
+ELF, creates the child's address space,
 CSpace, and thread, maps LOAD segments, and populates the `ProcessInfo`
 handover page, with the child's argv and env in the pages after it (see
 **argv and env** below). procmgr deletes its copies of cap[0], cap[1], and
@@ -115,7 +116,7 @@ holds a handle to it.
 | Code | Name | Meaning |
 |---|---|---|
 | 1 | `INVALID_ELF` | No module capability was transferred |
-| 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation (a max too small for the child among its causes), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned) |
+| 2 | `OUT_OF_MEMORY` | Creation failed: module mapping, ELF validation or loading, kernel-object or memory-cap allocation (a max too small for the child among its causes), or, with `CREATE_DMA_HOLD`, the room for the child's held reclaim or the derivation of its release token (the child, never started, is destroyed and its pages returned). For a failure of the creation itself, from the module mapping to the table entry, procmgr logs a warning naming the cause's `procmgr_errors` code, which the reply does not carry |
 | 7 | `INVALID_ARGUMENT` | `CREATE_DEATH_RELAY` set without a cap of its own (**Death relay** below), reserved label bits `[33..64]` set, the scheduling fields violate the resolution rules below (band above the creator's ceiling, or priority above the resolved band), the argv and env violate the rules of **argv and env** below, `CREATE_PHYS_ACCESS` comes from a creator that is not phys-class (**Physical-address flag** below), or the request's badge names no live process, `CREATE_MEMORY_MAX` comes without its data word, or `CREATE_RESERVE` comes from a creator outside the system reserve (**Memory max and reserve** below) |
 | 14 | `ARGV_ENV_STILL_MAPPED` | A copy window of the argv and env would not unmap; the caller withholds its argv/env run (**argv and env** below) |
 

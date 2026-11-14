@@ -409,8 +409,11 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 [Page Tables](../core/boot/docs/page-tables.md),
 [core/kernel/README.md](../core/kernel/README.md),
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
+[Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Memory Subsystem Internals](../core/kernel/docs/memory-internals.md),
-[Architecture Overview](architecture.md), [Platform Requirements](platform-requirements.md),
-[xtask/README.md](../xtask/README.md)
+[Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[Architecture Overview](architecture.md), [Limits](limits.md),
+[Platform Requirements](platform-requirements.md),
+[Userspace Memory Model](userspace-memory-model.md), [xtask/README.md](../xtask/README.md)

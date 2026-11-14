@@ -23,6 +23,15 @@ components must be installed:
 
 Run `rustup show` in the repository root to confirm the toolchain is active.
 
+xtask reads ELF, PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
+toolchain's sysroot ships for std's backtraces
+([coding-standards.md](coding-standards.md#dependencies) § Dependencies). The std of every host
+carries them, with `object`'s ELF and PE readers (on macOS too), except two: a
+`*-pc-windows-msvc` host's, which symbolizes its backtraces through the platform's debug-help
+library instead, and an AIX host's, whose `object` reads XCOFF only. On Windows xtask therefore
+needs the GNU host toolchain (`rustup set default-host x86_64-pc-windows-gnu` before the pinned
+toolchain is installed); on a `*-windows-msvc` host it fails to compile, naming that toolchain.
+
 `cargo xtask test` runs the host tests a second time built for `riscv64gc-unknown-linux-gnu`,
 under QEMU's user-mode emulator, so it needs a Linux host with three more packages: the emulator
 (`qemu-riscv64`), the riscv64 Linux cross compiler that links the test binaries
@@ -31,8 +40,9 @@ they are `qemu-user`, `gcc-riscv64-linux-gnu` and `libc6-dev-riscv64-cross`; on 
 `qemu-user`, `riscv64-linux-gnu-gcc` and `riscv64-linux-gnu-glibc`. The command fails, naming
 them, when one is missing.
 
-`cargo xtask symbolize` reads DWARF and symbol tables in Rust (the `addr2line` and `object` crates
-of xtask's dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
+`cargo xtask symbolize` reads DWARF and symbol tables in Rust, with the `addr2line` and `object`
+crates the toolchain's sysroot ships ([coding-standards.md](coding-standards.md#dependencies)
+§ Dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
 through QEMU's gdbstub ([testing.md § Troubleshooting](testing.md#troubleshooting)) needs a host
 GDB that supports the guest's architecture: a riscv64 guest needs a GDB built for RISC-V as well
 as the host, such as one configured with `--enable-targets=all` or a distribution's multi-target
@@ -449,8 +459,9 @@ cargo xtask test --component kernel     # single crate
 ```
 
 Before it runs the tests, `cargo xtask test` lints the test code: Clippy over the test
-configuration of the selected crates for the Linux target of each architecture, with all warnings
-treated as errors ([coding-standards.md](coding-standards.md#clippy) § Clippy;
+configuration of the selected crates for the Linux target of each architecture (`xtask`, which
+builds only against the prebuilt `std`, for the host target alone), with all warnings treated as
+errors ([coding-standards.md](coding-standards.md#clippy) § Clippy;
 [xtask/README.md](../xtask/README.md) § `cargo xtask test`). After the host run, it builds the
 tests of the selected crates, `xtask` and its wrapper shim left out, for
 `riscv64gc-unknown-linux-gnu` and runs them under `qemu-riscv64`, so a test gated on riscv64 runs

@@ -55,9 +55,10 @@
 //! allocator places on the same VA. memmgr accepts that registration only if
 //! the teardown removed the first one.
 //!
-//! An eighth phase, **fault cost**, times the faults of a demand region one
-//! chunk at a time and logs the mean, the figure the cost of memmgr's work on
-//! a fault is measured by.
+//! An eighth phase, **fault cost**, runs the child's bench mode, which times
+//! the first touch of each chunk of a demand region and a grant-and-map of the
+//! same size and logs the min, mean and max cycles of each, the figures the
+//! cost of memmgr's work on a fault is measured by.
 //!
 //! A ninth phase, **fragmented**, leaves the pool free pages in runs of one
 //! page fewer than a demand chunk and no run of a chunk's size, and touches a
@@ -426,52 +427,29 @@ fn assert_ram_identity()
 /// (`DEMAND_CHUNK_PAGES`, services/memmgr/free-pool/src/lib.rs).
 const DEMAND_CHUNK_PAGES: u64 = 16;
 
-/// Chunk faults [`demand_fault_cost_phase`] times in each round.
-const COST_CHUNKS: u64 = 64;
-
-/// Rounds [`demand_fault_cost_phase`] times, each on a fresh region.
-const COST_ROUNDS: usize = 4;
-
-/// Time the faults of a demand region one chunk at a time: each round
-/// registers a region of [`COST_CHUNKS`] chunks, writes one word in each
-/// chunk's first page, so each write is one fault that memmgr backs with a
-/// whole chunk, and logs the mean time per fault. The region's page tables
-/// are funded at registration, so the time is memmgr's work on the fault and
-/// the kernel's delivery of it. No bound is asserted: the figure is the
-/// measure of a change to that work (services/memmgr/docs/memory-pool.md
-/// § Frame contents).
+/// Spawn `/programs/demandpaged bench`, which times the first touch of each
+/// chunk of a demand region and a grant-and-map of the same size and logs
+/// the min, mean and max cycles of each (programs/demandpaged/README.md
+/// § Bench mode). No bound is asserted: the figures are the measure of a
+/// change to memmgr's work on a fault (services/memmgr/docs/memory-pool.md
+/// § Frame contents). The phase passes when the child exits cleanly and the
+/// RAM identity holds after memmgr reclaims what it was lent.
 fn demand_fault_cost_phase(_: &Caps)
 {
-    let pages = COST_CHUNKS.saturating_mul(DEMAND_CHUNK_PAGES);
-    let chunk_bytes = DEMAND_CHUNK_PAGES.saturating_mul(syscall_abi::PAGE_SIZE);
-    let mut means_ns = [0u128; COST_ROUNDS];
-    for mean in &mut means_ns
-    {
-        let region = std::os::seraph::register_demand_paged(pages)
-            .expect("demand_fault_cost: registering the region failed");
-        let base = region.va_start();
-        let start = std::time::Instant::now();
-        for chunk in 0..COST_CHUNKS
-        {
-            let va = base.saturating_add(chunk.saturating_mul(chunk_bytes));
-            // SAFETY: `va` is the first page of a chunk of a read-write demand
-            // region of this process, whose first write backs it; no Rust
-            // reference points into the region.
-            unsafe { core::ptr::write_volatile(va as *mut u64, 1) };
-        }
-        *mean = start
-            .elapsed()
-            .as_nanos()
-            .checked_div(u128::from(COST_CHUNKS))
-            .unwrap_or_default();
-        // SAFETY: no Rust reference and no IPC buffer lies in the region.
-        unsafe { std::os::seraph::unregister_demand_paged(region) }
-            .expect("demand_fault_cost: unregistering the region failed");
-    }
-    std::os::seraph::log!(
-        "demand_fault_cost: mean ns per {DEMAND_CHUNK_PAGES}-page chunk fault over \
-         {COST_CHUNKS} faults, per round: {means_ns:?}"
+    use std::process::Command;
+
+    let mut child = Command::new("/programs/demandpaged")
+        .arg("bench")
+        .spawn()
+        .expect("spawn /programs/demandpaged bench failed");
+    let status = child.wait().expect("demandpaged bench wait failed");
+    std::os::seraph::log!("demandpaged bench exited: {status}");
+    assert!(
+        status.success(),
+        "the fault-cost bench must run both paths to the end: {status}"
     );
+    assert_ram_identity();
+    std::os::seraph::log!("demand_fault_cost phase passed");
 }
 
 /// Chunks of the region [`demand_paging_sparse_region_phase`] registers: 2^14

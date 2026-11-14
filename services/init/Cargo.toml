@@ -13,6 +13,10 @@ test = false
 init-protocol = { path = "../../abi/init-protocol" }
 # init-logd's per-sender slot table, kept host-testable outside this no_std bin.
 init-sender-table = { path = "sender-table" }
+# The `log-levels` boot module's parser, kept host-testable outside this no_std bin.
+init-log-levels = { path = "log-levels" }
+# `level_entry`: the `SERAPH_LOG` env entry init hands the services it spawns.
+log = { path = "../../shared/log" }
 process-abi = { path = "../../abi/process-abi" }
 process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }

@@ -205,10 +205,15 @@ bootloader/bundle reclaim ranges, the AP-trampoline frame, and the
 boot-module ELF sources) in further `REGISTER_INIT_TEARDOWN` rounds, sends
 `INIT_TEARDOWN_DONE`, then
 `sys_thread_exit`s. The usable-RAM prefix init consumed or forwarded at
-`finalize_memmgr` (already memmgr's) and the firmware read-only caps
-(RSDP/ACPI/DTB) are excluded; the usable-RAM tail init did not forward in
-memmgr's bootstrap round and the free remainders `MemoryAlloc` abandoned while
-carving bootstrap arenas are donated with the set above. init's own
+`finalize_memmgr` (already memmgr's), apart from the one page named below, and
+the firmware read-only caps (RSDP/ACPI/DTB) are excluded; the usable-RAM tail
+init did not forward in memmgr's bootstrap round, the free remainders
+`MemoryAlloc` abandoned while carving bootstrap arenas, and the page
+`MemoryAlloc` gave before `finalize_memmgr` for the spawned services'
+`SERAPH_LOG` entries, when the log-level configuration set a level
+([init bootstrap](../services/init/docs/bootstrap.md#log-levels) § Log levels),
+are donated with the set above. That page is consumed but not memmgr's: init
+does not forward it, so the reap is its only route to memmgr's pool. init's own
 bootstrap backing — its own `CSpace`'s fund, its endpoint and log-thread
 retype slabs, and the offset-mapped IPC buffer and log-thread stack/IPC — is
 not in this set:

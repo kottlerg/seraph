@@ -589,8 +589,8 @@ for a device
 § IOMMU Discovery and Programming); `MODULE` rounds of up to four Memory caps (round data
 `[MODULE, n, size_0, ..., size_n-1]`, each module's size in bytes, since a module's cap covers
 whole pages and devmgr reads no byte past the module's end) carry every boot module outside
-init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs), untagged: the driver images
-and any platform description table; a cap-less
+init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels), untagged: the
+driver images and any platform description table; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and
 the terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch shutdown-authority
 cap (a full-rights derivation of init's root `IoPort` on x86-64, a Reset + Suspend `SbiControl`

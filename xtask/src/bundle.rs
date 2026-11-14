@@ -15,7 +15,9 @@
 //!   into the bundle, and the IOMMU driver of the architecture's IOMMU
 //!   family: `iommu-vtd` on x86-64, `iommu-riscv` on riscv64; and the
 //!   platform description tables of the architecture's machines
-//!   (`platform-qemu-virt` on riscv64), from `services/devmgr/platform/`.
+//!   (`platform-qemu-virt` on riscv64), from `services/devmgr/platform/`;
+//!   and the log-level configuration init reads at boot (`log-levels`), from
+//!   `services/init/log-levels.conf`.
 //!   `init` is named `"init"`; modules carry their service name. Sources span
 //!   `sysroot/services/`, `sysroot/services/drivers/`, and
 //!   `sysroot/services/fs/` per each component's install destination.
@@ -119,18 +121,73 @@ const ARCH_TABLES: &[(Arch, &str, &str)] = &[(
     "services/devmgr/platform/qemu-virt.platform",
 )];
 
+/// Bundle entry name of the log-level configuration init reads at boot
+/// (`services/init/docs/bootstrap.md` § Log levels).
+pub const LOG_LEVELS_ENTRY: &str = "log-levels";
+
+/// Repository-relative path of the committed log-level configuration that
+/// [`compose`] packs as the [`LOG_LEVELS_ENTRY`] entry of a default-init
+/// bundle. It is read from the repository, not the sysroot, so an edit takes
+/// effect at the next `cargo xtask compose-bundle`, with no rebuild.
+pub const LOG_LEVELS_SOURCE: &str = "services/init/log-levels.conf";
+
 /// Compose a bundle for the chosen harness and write it to
 /// `sysroot/esp/EFI/seraph/bootstrap.bundle`, overwriting any existing
 /// file. Source binaries are read from per-component sysroot paths
 /// driven by each component's [`crate::commands::build::InstallDest`].
 ///
-/// `Harness::Init` bundles `init` plus every entry in [`MODULES`] and every
-/// entry of [`ARCH_MODULES`] and [`ARCH_TABLES`] for `arch`. `Harness::Ktest` bundles only
-/// `ktest` as the `init` entry.
+/// `Harness::Init` bundles `init` plus every entry in [`MODULES`], every
+/// entry of [`ARCH_MODULES`] and [`ARCH_TABLES`] for `arch`, and the
+/// committed log-level configuration [`LOG_LEVELS_SOURCE`].
+/// `Harness::Ktest` bundles only `ktest` as the `init` entry.
 pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
 {
-    let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
+    compose_with_levels(ctx, arch, harness, &ctx.root.join(LOG_LEVELS_SOURCE))
+}
 
+/// [`compose`], with the [`LOG_LEVELS_ENTRY`] entry of a `Harness::Init`
+/// bundle read from `levels` in place of [`LOG_LEVELS_SOURCE`]: the
+/// `test-log-level` harness boots a configuration of its own this way.
+pub fn compose_with_levels(
+    ctx: &BuildContext,
+    arch: Arch,
+    harness: Harness,
+    levels: &Path,
+) -> Result<()>
+{
+    let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
+    let entries = entries(ctx, arch, harness, levels)?;
+
+    let parent = out_path
+        .parent()
+        .context("compose-bundle: bundle path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("compose-bundle: create {}", parent.display()))?;
+
+    let entry_count =
+        u32::try_from(entries.len()).context("compose-bundle: too many entries for u32")?;
+    write_bundle(&out_path, entry_count, &entries)?;
+
+    step(&format!(
+        "Bundle: {} ({} entries, harness={:?})",
+        out_path.display(),
+        entries.len(),
+        harness
+    ));
+    Ok(())
+}
+
+/// The `(bundle_entry_name, source_path)` entries of `harness`'s bundle for
+/// `arch`, in bundle order, with `levels` as the source of the
+/// [`LOG_LEVELS_ENTRY`] entry of a `Harness::Init` bundle. Fails naming the
+/// first source that does not exist.
+fn entries(
+    ctx: &BuildContext,
+    arch: Arch,
+    harness: Harness,
+    levels: &Path,
+) -> Result<Vec<(String, PathBuf)>>
+{
     let init_src = ctx.sysroot.join(harness.init_source());
     if !init_src.exists()
     {
@@ -170,25 +227,16 @@ pub fn compose(ctx: &BuildContext, arch: Arch, harness: Harness) -> Result<()>
             }
             entries.push(((*name).to_owned(), p));
         }
+        if !levels.exists()
+        {
+            anyhow::bail!(
+                "compose-bundle: log-level configuration missing at {}",
+                levels.display()
+            );
+        }
+        entries.push((LOG_LEVELS_ENTRY.to_owned(), levels.to_path_buf()));
     }
-
-    let parent = out_path
-        .parent()
-        .context("compose-bundle: bundle path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("compose-bundle: create {}", parent.display()))?;
-
-    let entry_count =
-        u32::try_from(entries.len()).context("compose-bundle: too many entries for u32")?;
-    write_bundle(&out_path, entry_count, &entries)?;
-
-    step(&format!(
-        "Bundle: {} ({} entries, harness={:?})",
-        out_path.display(),
-        entries.len(),
-        harness
-    ));
-    Ok(())
+    Ok(entries)
 }
 
 /// Write the bundle file: header, per-entry headers, then bodies aligned
@@ -302,6 +350,78 @@ mod tests
         assert_eq!(align_up(1, 4096), Some(4096));
         assert_eq!(align_up(4096, 4096), Some(4096));
         assert_eq!(align_up(u64::MAX, 4096), None);
+    }
+
+    /// A scratch directory unique to this test process and call.
+    fn scratch(tag: &str) -> PathBuf
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "seraph-bundle-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Defect caught: a default-init bundle without the log-level
+    // configuration, or with the committed file where a harness asked for its
+    // own, so init boots every service at info whatever was configured.
+    #[test]
+    fn an_init_bundle_carries_the_log_level_configuration_it_is_given()
+    {
+        let root = scratch("levels");
+        let ctx = BuildContext {
+            root: root.clone(),
+            sysroot: root.join("sysroot"),
+            target_dir: root.join("target"),
+        };
+        let arch = Arch::Riscv64;
+        let sources = std::iter::once("services/init")
+            .chain(MODULES.iter().map(|(_, s)| *s))
+            .chain(
+                ARCH_MODULES
+                    .iter()
+                    .filter(|(a, _, _)| *a == arch)
+                    .map(|(_, _, s)| *s),
+            );
+        for source in sources
+        {
+            let p = ctx.sysroot.join(source);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"elf").unwrap();
+        }
+        for (_, _, source) in ARCH_TABLES.iter().filter(|(a, _, _)| *a == arch)
+        {
+            let p = root.join(source);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, b"table").unwrap();
+        }
+        let levels = root.join("levels.conf");
+        fs::write(&levels, b"vfsd = debug\n").unwrap();
+
+        let init = entries(&ctx, arch, Harness::Init, &levels).expect("init entries");
+        let found: Vec<&PathBuf> = init
+            .iter()
+            .filter(|(name, _)| name == LOG_LEVELS_ENTRY)
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(found, [&levels]);
+
+        // The ktest bundle is the harness alone.
+        let ktest_src = ctx.sysroot.join("tests/ktest");
+        fs::create_dir_all(ktest_src.parent().unwrap()).unwrap();
+        fs::write(&ktest_src, b"elf").unwrap();
+        let ktest = entries(&ctx, arch, Harness::Ktest, &levels).expect("ktest entries");
+        assert_eq!(ktest, [("init".to_owned(), ktest_src)]);
+
+        // A missing configuration is an error, as a missing module is.
+        entries(&ctx, arch, Harness::Init, &root.join("absent.conf")).unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Two-file round trip: write a bundle from two tiny "binary" files,

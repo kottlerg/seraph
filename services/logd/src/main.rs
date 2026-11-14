@@ -1028,6 +1028,9 @@ struct OutputDriver
     /// The SEND on the driver's service endpoint; 0 while none is resolved,
     /// and the emit path then drops the bytes.
     cap: AtomicU64,
+    /// The driver's instance ordinal in its class, while `cap` is nonzero.
+    /// Only the main thread reads it.
+    ordinal: AtomicU64,
 }
 
 impl OutputDriver
@@ -1037,6 +1040,7 @@ impl OutputDriver
         Self {
             class: AtomicU64::new(0),
             cap: AtomicU64::new(0),
+            ordinal: AtomicU64::new(0),
         }
     }
 
@@ -1069,29 +1073,59 @@ impl OutputDriver
                 0
             }
         };
-        self.resolve(ipc_buf);
+        self.resolve(0, ipc_buf);
         watch
     }
 
-    /// The class watch signalled: resolve the driver again, unless the SEND
-    /// held still names a served driver (a withdrawal revokes it).
+    /// The class watch signalled: ask devmgr whether the held driver's
+    /// ordinal is still served, and resolve again from the next ordinal when
+    /// devmgr answers `WITHDRAWN`, or from ordinal 0 when none is held.
+    /// devmgr's answer decides, not the held SEND: devmgr signals a
+    /// withdrawal in the hold that leaves the tombstone, before it revokes
+    /// the driver's endpoint, so the SEND can still be valid here.
     fn refresh(&self, ipc_buf: *mut u64)
     {
-        let held = self.cap();
-        if held != 0 && syscall::cap_info(held, syscall::CAP_INFO_TAG_RIGHTS).is_ok()
+        let class = self.class.load(Ordering::Acquire);
+        if self.cap() == 0
         {
+            self.resolve(0, ipc_buf);
             return;
         }
-        self.resolve(ipc_buf);
+        let ordinal = self.ordinal.load(Ordering::Relaxed);
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
+        match unsafe { ipc::query_device(class, ordinal, ipc_buf) }
+        {
+            Ok(copy) =>
+            {
+                // Still served: keep the held SEND.
+                let _ = syscall::cap_delete(copy);
+            }
+            Err(ipc::ClassCallError::Refused(ipc::devmgr_errors::WITHDRAWN)) =>
+            {
+                self.resolve(ordinal.saturating_add(1), ipc_buf);
+            }
+            // devmgr refused or did not answer: keep what is held until the
+            // next signal.
+            Err(_) =>
+            {}
+        }
     }
 
-    /// Resolve the class's first live driver (`ipc::first_device`), or none.
-    fn resolve(&self, ipc_buf: *mut u64)
+    /// Resolve the class's first live driver from ordinal `start`
+    /// (`ipc::first_device_from`), or none, and delete the SEND it replaces.
+    /// A replaced SEND that devmgr has revoked is already gone; one an emit
+    /// thread still holds fails that thread's call on the slot's generation.
+    fn resolve(&self, start: u64, ipc_buf: *mut u64)
     {
         let class = self.class.load(Ordering::Acquire);
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let cap = unsafe { ipc::first_device(class, ipc_buf) }.unwrap_or(0);
-        self.cap.store(cap, Ordering::Release);
+        let (ordinal, cap) = unsafe { ipc::first_device_from(class, start, ipc_buf) }.unwrap_or((0, 0));
+        self.ordinal.store(ordinal, Ordering::Relaxed);
+        let old = self.cap.swap(cap, Ordering::AcqRel);
+        if old != 0
+        {
+            let _ = syscall::cap_delete(old);
+        }
     }
 }
 

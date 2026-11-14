@@ -2706,30 +2706,55 @@ pub unsafe fn watch_class(class_send: u64, ipc_buf: *mut u64)
 }
 
 /// The driver at the lowest ordinal of the class whose class SEND is
-/// `class_send` that is not withdrawn: [`query_device`] at ordinals 0, 1,
-/// ..., passing each [`devmgr_errors::WITHDRAWN`] reply. Logs nothing.
+/// `class_send` that is not withdrawn: [`first_device_from`] ordinal 0.
+/// Logs nothing.
+///
+/// # Safety
+/// `ipc_buf` must point to the calling thread's registered IPC buffer page.
+///
+/// # Errors
+/// As [`first_device_from`]: [`devmgr_errors::NO_DEVICE`] when the class
+/// serves no live driver.
+pub unsafe fn first_device(class_send: u64, ipc_buf: *mut u64) -> Result<u64, ClassCallError>
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { first_device_from(class_send, 0, ipc_buf) }.map(|(_, cap)| cap)
+}
+
+/// The driver at the lowest ordinal from `start` of the class whose class
+/// SEND is `class_send` that is not withdrawn, with that ordinal:
+/// [`query_device`] at ordinals `start`, `start + 1`, ..., passing each
+/// [`devmgr_errors::WITHDRAWN`] reply. A withdrawn ordinal stays withdrawn
+/// for the boot, so a client that held the driver at an ordinal and finds
+/// it withdrawn goes on from the next one. Logs nothing.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
 ///
 /// # Errors
 /// The first [`query_device`] error that is not `WITHDRAWN`:
-/// [`devmgr_errors::NO_DEVICE`] when the class serves no live driver.
-pub unsafe fn first_device(class_send: u64, ipc_buf: *mut u64) -> Result<u64, ClassCallError>
+/// [`devmgr_errors::NO_DEVICE`] when the class serves no live driver from
+/// `start`.
+pub unsafe fn first_device_from(
+    class_send: u64,
+    start: u64,
+    ipc_buf: *mut u64,
+) -> Result<(u64, u64), ClassCallError>
 {
-    let mut ordinal = 0u64;
+    let mut ordinal = start;
     loop
     {
         // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
         match unsafe { query_device(class_send, ordinal, ipc_buf) }
         {
+            Ok(cap) => return Ok((ordinal, cap)),
             Err(ClassCallError::Refused(devmgr_errors::WITHDRAWN)) =>
             {
                 ordinal = ordinal
                     .checked_add(1)
                     .ok_or(ClassCallError::Refused(devmgr_errors::NO_DEVICE))?;
             }
-            other => return other,
+            Err(e) => return Err(e),
         }
     }
 }

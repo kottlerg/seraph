@@ -39,8 +39,9 @@ targets; only the one-time init-logd history pull
   (`services/drivers/serial/`), resolved via devmgr's
   `QUERY_DEVICE` on the `serial` class SEND and written with `SERIAL_WRITE_BYTES`. logd registers a
   `WATCH_CLASS` watch on the class at start and resolves the driver then, on its main thread; it
-  resolves again, from that thread's wait-set loop, only when devmgr signals the watch (a
-  withdrawn driver's revoked SEND is replaced, a held SEND that still works is kept). logd
+  resolves again, from that thread's wait-set loop, only when devmgr signals the watch: when
+  devmgr answers that the held driver's ordinal is withdrawn, logd resolves from the next ordinal
+  and deletes the replaced SEND, and it keeps a driver devmgr still serves. logd
   holds no UART hardware authority. It cannot route its own
   diagnostics through `seraph::log!` because it IS the log receiver;
   the macro would self-IPC into the endpoint logd serves and

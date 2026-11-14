@@ -1875,6 +1875,32 @@ const _: () = assert!(
     "CSpaceKernelObject + CSpace exceed the wrapper page"
 );
 
+// A failed capability lookup folds the object pointer to null
+// (`syscall::pin_checked`), so a misspeculated use of the object loads from
+// null plus a field's offset, and a misspeculated use of an empty thread
+// queue or reply link loads from null plus a TCB field's offset. No user page
+// lies below `USER_VA_FLOOR` (`mm::in_user_range`), so such a load reads no
+// memory a process chose while every such object fits under the floor
+// (core/kernel/docs/capability-internals.md § Speculative-Execution Hardening).
+const _: () = {
+    use core::mem::size_of;
+    let floor = syscall::USER_VA_FLOOR;
+    assert!(size_of::<MemoryObject>() as u64 <= floor);
+    assert!(size_of::<MmioObject>() as u64 <= floor);
+    assert!(size_of::<InterruptObject>() as u64 <= floor);
+    assert!(size_of::<IoPortObject>() as u64 <= floor);
+    assert!(size_of::<SchedControlObject>() as u64 <= floor);
+    assert!(size_of::<SbiControlObject>() as u64 <= floor);
+    assert!(size_of::<ThreadObject>() as u64 <= floor);
+    assert!(size_of::<AddressSpaceObject>() as u64 <= floor);
+    assert!(size_of::<CSpaceKernelObject>() as u64 <= floor);
+    assert!(size_of::<EndpointObject>() as u64 <= floor);
+    assert!(size_of::<NotificationObject>() as u64 <= floor);
+    assert!(size_of::<EventQueueObject>() as u64 <= floor);
+    assert!(size_of::<WaitSetObject>() as u64 <= floor);
+    assert!(size_of::<crate::sched::thread::ThreadControlBlock>() as u64 <= floor);
+};
+
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.
 unsafe impl Send for CSpaceKernelObject {}
 // SAFETY: CSpaceKernelObject is accessed only with proper locks.

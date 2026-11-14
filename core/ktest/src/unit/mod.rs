@@ -301,6 +301,10 @@ pub fn run_all(ctx: &TestContext)
         mm::mem_map_kernel_half_err(ctx)
     );
     run_test!(
+        "mm::mem_map_below_floor_err",
+        mm::mem_map_below_floor_err(ctx)
+    );
+    run_test!(
         "mm::memory_split_at_zero_err",
         mm::memory_split_at_zero_err(ctx)
     );
@@ -699,6 +703,10 @@ pub fn run_all(ctx: &TestContext)
 
     // ── Hardware access syscalls ──────────────────────────────────────────────
     run_test!("hw::mmio_map", hw::mmio_map(ctx));
+    run_test!(
+        "hw::mmio_map_below_floor_err",
+        hw::mmio_map_below_floor_err(ctx)
+    );
     run_test!("hw::mmio_split_carves", hw::mmio_split_carves(ctx));
     run_test!(
         "hw::mmio_split_wrong_tag_err",

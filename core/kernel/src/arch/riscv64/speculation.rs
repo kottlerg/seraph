@@ -16,6 +16,14 @@
 //! `crate::arch::nospec`; the rule they serve is docs/capability-model.md
 //! § Capability Spaces, and the mechanism is
 //! core/kernel/docs/capability-internals.md § Speculative-Execution Hardening.
+//! [`enumerate_vulnerabilities`] does nothing: the RVA23 floor defines no
+//! enumeration of transient-execution vulnerabilities
+//! (core/kernel/docs/transient-execution.md).
+
+/// Enumerate the boot hart's transient-execution vulnerabilities. RISC-V
+/// defines no architectural enumeration of them under the RVA23 floor, so there
+/// is nothing to read and nothing is logged.
+pub fn enumerate_vulnerabilities() {}
 
 /// All-ones when `index < bound`, zero otherwise, computed without a branch.
 ///

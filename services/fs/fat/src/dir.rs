@@ -1468,9 +1468,14 @@ fn scan_sector_for_remove(
     Ok(None)
 }
 
-/// Free a file's data clusters and update the directory entry to
-/// reflect the removed allocation. Wrapper that callers can use after
-/// [`remove_entry`] returns a [`RemovedEntry`] with `start_cluster != 0`.
+/// Free the cluster chain of an entry [`remove_entry`] removed; an entry
+/// with `start_cluster == 0` has none, and nothing is freed. Only the FAT
+/// is written: the caller detaches the chain from its directory entry
+/// first ([`remove_entry`] marks the entry deleted), so a failure partway
+/// leaves an orphan chain, never an entry on freed clusters.
+///
+/// # Errors
+/// As [`free_cluster_chain`].
 pub fn free_entry_data(
     state: &mut FatState,
     entry: &RemovedEntry,

@@ -525,6 +525,8 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `Elf64Ehdr.e_phnum`, `e_shnum` | `shared/elf/src/lib.rs` | `u16` | hardware spec (ELF64 header) | none | correct as is | None |
 | ed25519 `MSG_SCRATCH` | `shared/crypto/src/ed25519.rs` | 1024 | provably unreachable (largest RFC 8032 vector 1023 B) | 2 KiB stack | correct as is | None |
 | `Sha512.total_len` | `shared/crypto/src/sha512.rs` | `u128` | hardware spec (FIPS 180-4 length field) | 16 B | correct as is | None |
+| `chacha20poly1305::MAX_LEN` | `shared/crypto/src/chacha20poly1305.rs` | `(2^32 - 1) * 64` B = 274 877 906 880 B per sealed buffer | format spec (RFC 8439 § 2.8: the 32-bit block counter, block 0 taken by the Poly1305 key) | none | correct as is | None |
+| chacha20-poly1305 `KAT_SCRATCH` | `shared/crypto/src/chacha20poly1305.rs` | 384 B | provably unreachable (largest RFC 8439 vector 375 B) | 768 B stack | correct as is | None |
 | `FONT_9X20` | `shared/font/src/lib.rs` | 256 glyphs | hardware spec (CP437) | 10 KiB rodata | correct as is | None |
 | `FONT_9X20_EXT_COUNT` | `shared/font/src/lib.rs` | 20 | encoding artefact (code points the tree renders) | 800 B rodata | correct as is | Pin the map against the count |
 | `Utf8Decoder.buf` | `shared/text/src/utf8.rs` | 4 B | hardware spec (UTF-8 sequence length) | 5 B | correct as is | None |
@@ -558,6 +560,7 @@ Every entry here is `correct as is`; none is tracked.
 | `DEFERRED_RECHECK_BATCH` | `services/memmgr/src/main.rs` | 64 runs | tuning (deferred runs one recheck checks, at most one recheck per turn of the receive loop; a run not pooled goes to the back, so successive rechecks visit every run) | none | correct as is | None |
 | `DEFERRED_RECHECK_WINDOWS` | `services/memmgr/src/main.rs` | 256 mapping-count windows of up to 512 pages | tuning (with the batch, bounds a turn's deferred kernel queries to three per run checked plus 256, plus the windows of the largest deferred run, which is read whole when it crosses the budget) | none | correct as is | None |
 | `ARENA_RETURN_RESERVE` | `services/memmgr/src/main.rs` | 1 slot | tuning (held back from every other allocation, so the arena grows first; spent only when growth is ruled out; a further last-resort return then leaves one run out of circulation) | one arena slot | correct as is | None |
+| `SYSTEM_RESERVE_DIVISOR` | `services/memmgr/free-pool/src/budget.rs` | 64: the system reserve is `pool_total / 64` free pages, which only a charge to a reserve budget node may take (services/memmgr/docs/memory-pool.md § Distribution policy) | tuning (a floor for the core's allocations under pressure, proportional to RAM, so it stops no larger machine first; it limits no process) | `pool_total / 64` pages a process outside the reserve cannot take | correct as is | Design intent; not yet implemented (#260) |
 | `InitBootstrap.in_use` | `services/memmgr/src/main.rs` | `MAX_IN_USE` = 4 | provably unreachable (three tier-1 producers) | 128 B stack | correct as is | None |
 | process badges | `services/memmgr/src/main.rs` | 63 random bits, bit 63 the phys-class flag (`memmgr_labels::PHYS_CLASS_BADGE_BIT`) | ABI width (the kernel's 64-bit badge word; 2^63 badges per class) | none | correct as is | None |
 | `POOL_TOTAL_PAGES` | `services/memmgr/src/main.rs` | `u64`, saturating | ABI width | 8 B | correct as is | None |

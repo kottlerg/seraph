@@ -904,8 +904,12 @@ a spent reserve fails before blocking (see
 There is no per-CSpace slot quota: capacity below the structural
 ceiling is exactly what the paid pool backs. Containing a child's cap
 footprint is a memory-distribution decision — a supervisor that wants a
-child bounded gives it less memory to fund growth with — not a kernel
-knob.
+child bounded creates it with a memory max, which bounds the memory the
+child can fund growth with — not a kernel knob. The max is memmgr's
+distribution policy
+([memory-pool.md](../services/memmgr/docs/memory-pool.md) § Distribution
+policy), design intent; not yet implemented
+([#260](https://github.com/kottlerg/seraph/issues/260)).
 
 Seeding policy: a CSpace creation site seeds the pool for the process's
 expected startup population; a process that outgrows its seed self-funds

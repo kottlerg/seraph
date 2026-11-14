@@ -3,10 +3,10 @@
 
 // shared/crypto/src/lib.rs
 
-//! In-OS cryptographic primitives: SHA-512 hashing and Ed25519 signature
-//! verification.
+//! In-OS cryptographic primitives: SHA-512 hashing, Ed25519 signature
+//! verification, and ChaCha20-Poly1305 authenticated encryption.
 //!
-//! `no_std`, no allocation, no external dependencies. Two primitives:
+//! `no_std`, no allocation, no external dependencies. Three primitives:
 //!
 //! - [`sha512`] / [`Sha512`] — FIPS 180-4 SHA-512, one-shot and incremental.
 //!   The incremental form hashes large inputs (e.g. boot-module bodies)
@@ -16,6 +16,10 @@
 //!   data (public key, signature, message), so the field arithmetic is
 //!   variable-time by design and carries no side-channel obligation. Failure
 //!   is terminal: a single `Err` exit, no fallback, no warn-and-continue.
+//! - [`chacha20poly1305`] — the RFC 8439 AEAD, sealing and opening a buffer
+//!   in place with a detached tag. It handles secret data, so no branch and
+//!   no memory index depends on the key, the plaintext or a tag, and a tag is
+//!   compared in a time that does not depend on where it differs.
 //!
 //! SHA-512 is the only hash provided because Ed25519 mandates it internally
 //! (RFC 8032 §5.1); one core serves both the public hash and the signature's
@@ -28,12 +32,16 @@
 
 #![no_std]
 
+pub mod chacha20poly1305;
 pub mod sha512;
 
+mod chacha20;
 mod ed25519;
 mod edwards;
 mod field;
+mod poly1305;
 mod scalar;
 
+pub use chacha20poly1305::run_chacha20_poly1305_kats;
 pub use ed25519::{VerifyError, ed25519_verify, run_ed25519_kats};
 pub use sha512::{Sha512, run_sha512_kats, sha512};

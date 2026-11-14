@@ -686,20 +686,44 @@ fn scratch_path(cache: &Path, common: &Path) -> PathBuf
     cache.join("seraph-compare-images").join(name)
 }
 
+/// How often a run waiting for the scratch lock tries it again and reads the
+/// interrupt flag.
+const LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Hold the scratch directory `scratch` for this run: one run at a time uses
-/// a repository's scratch worktree, and a second waits for the first.
-fn lock_scratch(scratch: &Path) -> Result<fs::File>
+/// a repository's scratch worktree, and a second waits for the first, trying
+/// the lock every [`LOCK_POLL`] and ending the wait once `interrupted`
+/// reports Ctrl+C (`crate::term::signal::interrupted`), which a blocking
+/// lock would not see.
+fn lock_scratch(scratch: &Path, interrupted: &dyn Fn() -> bool) -> Result<fs::File>
 {
     fs::create_dir_all(scratch).with_context(|| format!("creating {}", scratch.display()))?;
     let path = scratch.join("lock");
     let file = fs::File::create(&path).with_context(|| format!("opening {}", path.display()))?;
-    if let Err(fs::TryLockError::WouldBlock) = file.try_lock()
+    let mut announced = false;
+    loop
     {
-        step("compare-images: waiting for another run to release the scratch worktree");
+        match file.try_lock()
+        {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) =>
+            {}
+            Err(fs::TryLockError::Error(error)) =>
+            {
+                return Err(error).with_context(|| format!("locking {}", path.display()));
+            }
+        }
+        if interrupted()
+        {
+            bail!("interrupted while waiting for another run to release the scratch worktree");
+        }
+        if !announced
+        {
+            step("compare-images: waiting for another run to release the scratch worktree");
+            announced = true;
+        }
+        std::thread::sleep(LOCK_POLL);
     }
-    file.lock()
-        .with_context(|| format!("locking {}", path.display()))?;
-    Ok(file)
 }
 
 /// The user's cache directory: `XDG_CACHE_HOME`, `.cache` in the home
@@ -928,7 +952,7 @@ pub fn run(ctx: &BuildContext, args: &CompareImagesArgs) -> Result<()>
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )?;
     let scratch = scratch_path(&cache_dir()?, Path::new(&common));
-    let _held = lock_scratch(&scratch)?;
+    let _held = lock_scratch(&scratch, &crate::term::signal::interrupted)?;
     let tree = scratch.join("tree");
     prepare_tree(root, &tree)?;
     let nested = Nested {
@@ -1425,14 +1449,20 @@ rustflags = [\"-Zunstable-options\"]
     {
         let scratch =
             std::env::temp_dir().join(format!("xtask-compare-lock-{}", std::process::id()));
-        let held = lock_scratch(&scratch).unwrap();
+        let held = lock_scratch(&scratch, &|| false).unwrap();
         let other = fs::File::open(scratch.join("lock")).unwrap();
         assert!(matches!(
             other.try_lock(),
             Err(fs::TryLockError::WouldBlock)
         ));
+        // A waiting run ends its wait on Ctrl+C rather than blocking on.
+        let error = lock_scratch(&scratch, &|| true).unwrap_err();
+        assert!(error.to_string().contains("interrupted"), "{error}");
         drop(held);
         other.try_lock().unwrap();
+        drop(other);
+        // A free lock is taken before the interrupt flag is read.
+        drop(lock_scratch(&scratch, &|| true).unwrap());
         fs::remove_dir_all(&scratch).unwrap();
     }
 

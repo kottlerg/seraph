@@ -419,10 +419,11 @@ A repository has one scratch directory, `<cache>/seraph-compare-images/<name>/`,
 `XDG_CACHE_HOME`, else `~/.cache`, and `<name>` the path of the repository's git common directory
 with each byte but an ASCII letter, digit, `.` or `_` written as `-` and two hex digits. Every
 checkout of the repository shares it, and one run at a time holds it, by a lock on its `lock` file;
-a second run waits. Both commits are built in its scratch worktree, `tree/`, which the command adds
-with `git worktree add --detach` and reuses: it checks each commit out there, removes every
-untracked file but `target/`, and runs that commit's own `cargo xtask clean` and
-`cargo xtask build --skip-lints --arch <a> [--release]` once per cell, moving each built sysroot to
+a second run waits, and Ctrl+C ends its wait. Both commits are built in its scratch worktree,
+`tree/`, which the command adds with `git worktree add --detach` and reuses: it checks each commit
+out there, removes every untracked file but `target/`, and runs that commit's own
+`cargo xtask clean` and `cargo xtask build --skip-lints --arch <a> [--release]` once per cell,
+moving each built sysroot to
 `<base|head>/<arch>-<profile>/` beside it. One path serves both commits because a build embeds
 absolute source paths (the panic locations of the `-Z build-std` crates under
 `target/seraph-toolchain/`), so builds in two checkouts never compare equal. The scratch

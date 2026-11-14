@@ -581,15 +581,18 @@ fn check_refs_unread(pat: &Patterns, body: &str) -> Vec<Diag>
     for (index, line) in body.lines().enumerate()
     {
         let number = index.saturating_add(1);
-        if !pat.refs_keyword.is_match(line)
+        let Some(keyword) = pat.refs_keyword.find(line)
+        else
         {
             continue;
-        }
-        // A `#N` of this repository on a `Refs` line that no list took: the
-        // list ended before it, at text between the numbers.
+        };
+        // A `#N` of this repository after the `Refs` keyword that no list
+        // took: the list ended before it, at text between the numbers. A
+        // number before the keyword is prose, which no list could hold.
         let unread: Vec<String> = pat
             .issue_ref
             .captures_iter(line)
+            .filter(|found| found.get(0).is_some_and(|all| all.start() >= keyword.end()))
             .filter(|found| found.get(1).is_none() && found.get(3).is_none())
             .filter_map(|found| found.get(2)?.as_str().parse::<u64>().ok())
             .filter(|issue| !read.iter().any(|r| r.line == number && r.issue == *issue))
@@ -1996,9 +1999,13 @@ mod tests
             assert_eq!(diags[0].at, "body:5");
             assert!(diags[0].message.contains("#12"), "{}", diags[0].message);
         }
-        // A list read in full, and another repository's reference, which
-        // `Refs` never reads, pass.
-        for line in ["Refs #11, #12 and #13", "Refs #11, owner/repo#12"]
+        // A list read in full, another repository's reference, which `Refs`
+        // never reads, and a number in prose before the keyword pass.
+        for line in [
+            "Refs #11, #12 and #13",
+            "Refs #11, owner/repo#12",
+            "Refs #11\n\n**#12, `Refs` lists.** Prose.",
+        ]
         {
             let body = BODY.replace("Refs #11", line);
             assert_eq!(check_body(&p, &body), [] as [Diag; 0], "{line}");

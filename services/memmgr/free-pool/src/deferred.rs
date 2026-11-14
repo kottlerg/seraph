@@ -8,14 +8,33 @@
 //!
 //! A frame memmgr takes back from a process (death, release, region teardown)
 //! joins the free pool only when memmgr's quiescence check passes; a frame
-//! that fails it is parked here as a [`Node::Run`] in the slot its frame
-//! descriptor occupied, and a later recheck moves it to the pool once the
-//! check passes. The check itself is a kernel query, injected as a closure.
-//! See `services/memmgr/docs/memory-pool.md` § Reclamation.
+//! that fails it is parked here as a [`Node::Deferred`] in the slot its frame
+//! descriptor occupied, still charged to its budget node, and a later recheck
+//! releases the charge and moves it to the pool once the check passes. The
+//! check itself is a kernel query, injected as a closure. See
+//! `services/memmgr/docs/memory-pool.md` § Reclamation.
 
 use crate::FreeRun;
-use crate::arena::{Arena, NODE_NULL, NodeIdx, SlotStore};
-use crate::pool::{FreePool, run_of};
+use crate::arena::{Arena, DeferredRun, NODE_NULL, Node, NodeIdx, Slot, SlotStore};
+use crate::budget;
+use crate::pool::FreePool;
+
+/// The deferred run slot `idx` holds.
+fn deferred_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<DeferredRun>
+{
+    match arena.get(idx).node
+    {
+        Node::Deferred(d) => Some(d),
+        Node::Free
+        | Node::Run(_)
+        | Node::Budget(_)
+        | Node::Region(_)
+        | Node::Frame(_)
+        | Node::Process(_)
+        | Node::ChunkDir(_)
+        | Node::Chunk(_) => None,
+    }
+}
 
 /// Parked runs, oldest first, chained through each slot's `next` link, with
 /// running totals of their runs and pages.
@@ -64,14 +83,14 @@ impl DeferredList
         self.pages
     }
 
-    /// Append the run slot `idx` already holds. Every caller rewrites the slot
-    /// into a run first; a slot that does not hold one is a caller defect,
-    /// caught in debug builds and ignored otherwise.
+    /// Append the deferred run slot `idx` already holds. Every caller rewrites
+    /// the slot into a deferred run first; a slot that does not hold one is a
+    /// caller defect, caught in debug builds and ignored otherwise.
     pub fn park<S: SlotStore>(&mut self, arena: &mut Arena<S>, idx: NodeIdx)
     {
-        let parked = run_of(arena, idx);
-        debug_assert!(parked.is_some(), "park: slot {idx} holds no run");
-        let Some(run) = parked
+        let parked = deferred_of(arena, idx);
+        debug_assert!(parked.is_some(), "park: slot {idx} holds no deferred run");
+        let Some(DeferredRun { run, .. }) = parked
         else
         {
             return;
@@ -92,10 +111,11 @@ impl DeferredList
     }
 
     /// Detach the oldest run, returning its slot (still holding the run).
-    fn pop<S: SlotStore>(&mut self, arena: &mut Arena<S>) -> Option<(NodeIdx, FreeRun)>
+    fn pop<S: SlotStore>(&mut self, arena: &mut Arena<S>) -> Option<(NodeIdx, DeferredRun)>
     {
         let idx = self.head;
-        let run = run_of(arena, idx)?;
+        let parked = deferred_of(arena, idx)?;
+        let run = parked.run;
         self.head = arena.get(idx).next;
         if self.head == NODE_NULL
         {
@@ -104,7 +124,7 @@ impl DeferredList
         // `run_of` found a run, so the list is non-empty and `runs` is above zero.
         self.runs = self.runs.saturating_sub(1);
         self.pages = self.pages.saturating_sub(run.page_count);
-        Some((idx, run))
+        Some((idx, parked))
     }
 
     /// Check at most `budget.runs` parked runs, oldest first, while
@@ -112,9 +132,10 @@ impl DeferredList
     /// is checked whenever any of the cost budget remains, so the run that
     /// crosses it is still checked whole; once it is spent the recheck stops,
     /// leaving the unchecked runs at the head for the next one. Each run
-    /// `quiescent` accepts moves to `pool`, and each it refuses goes back to
-    /// the end of the list, so successive rechecks visit every run in turn.
-    /// Returns the pages moved to the pool.
+    /// `quiescent` accepts has its charge released from its budget node
+    /// ([`budget::uncharge`]) and moves to `pool`, and each it refuses goes
+    /// back to the end of the list, so successive rechecks visit every run in
+    /// turn. Returns the pages moved to the pool.
     pub fn recheck<S: SlotStore>(
         &mut self,
         arena: &mut Arena<S>,
@@ -132,7 +153,7 @@ impl DeferredList
             {
                 break;
             }
-            let Some((idx, run)) = self.pop(arena)
+            let Some((idx, DeferredRun { run, budget: node })) = self.pop(arena)
             else
             {
                 break;
@@ -140,6 +161,14 @@ impl DeferredList
             left = left.saturating_sub(cost(&run));
             if quiescent(&run)
             {
+                budget::uncharge(arena, node, run.page_count);
+                arena.set(
+                    idx,
+                    Slot {
+                        node: Node::Run(run),
+                        next: NODE_NULL,
+                    },
+                );
                 pool.push_node(arena, idx);
                 moved = moved.saturating_add(run.page_count);
             }
@@ -176,7 +205,6 @@ impl RecheckBudget
 mod tests
 {
     use super::*;
-    use crate::arena::Node;
     use crate::arena::test_store::VecStore;
 
     fn arena() -> Arena<VecStore>
@@ -206,10 +234,13 @@ mod tests
     {
         let idx = a
             .alloc(
-                Node::Run(FreeRun {
-                    cap_slot,
-                    page_count: pages,
-                    phys_base: cap_slot * 0x10_0000,
+                Node::Deferred(DeferredRun {
+                    run: FreeRun {
+                        cap_slot,
+                        page_count: pages,
+                        phys_base: cap_slot * 0x10_0000,
+                    },
+                    budget: NODE_NULL,
                 }),
                 NODE_NULL,
             )

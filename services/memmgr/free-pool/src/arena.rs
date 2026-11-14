@@ -5,8 +5,9 @@
 
 //! Self-hosted metadata arena: fixed-size slots threaded on a free list.
 //!
-//! Every piece of memmgr's bookkeeping (free runs, process records, region and
-//! frame descriptors, and the nodes of each region's chunk table) is a [`Node`]
+//! Every piece of memmgr's bookkeeping (free and deferred runs, process
+//! records, budget nodes, region and frame descriptors, and the nodes of each
+//! region's chunk table) is a [`Node`]
 //! in one [`Slot`] of this arena. The arena
 //! only hands out indices it has carved; the storage behind them is a
 //! [`SlotStore`] the caller supplies (pool-backed mapped pages in memmgr, a
@@ -16,6 +17,7 @@
 
 use syscall_abi::PAGE_SIZE;
 
+use crate::budget::BudgetNode;
 use crate::chunk::{ChunkEntry, DIR_FANOUT};
 use crate::{DemandRegion, FreeRun};
 
@@ -49,12 +51,12 @@ pub struct FrameDesc
 /// a record's ids start at 1.
 pub const NO_REGION_ID: u64 = 0;
 
-/// One tracked process: its badge and the heads of its frame and region
-/// lists. The frame list holds every frame memmgr accounts to the process
-/// outside its demand regions (grants, page-table donations, a bootstrap
-/// arena); a run backing a demand region lives in that region's chunk table.
-/// The record's own slot `next` link chains it in its
-/// [`crate::ProcessIndex`] bucket.
+/// One tracked process: its badge, the heads of its frame and region lists,
+/// and the budget node its frames are charged to. The frame list holds every
+/// frame memmgr accounts to the process outside its demand regions (grants,
+/// page-table donations, a bootstrap arena); a run backing a demand region
+/// lives in that region's chunk table. The record's own slot `next` link
+/// chains it in its [`crate::ProcessIndex`] bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessRecord
 {
@@ -67,6 +69,19 @@ pub struct ProcessRecord
     /// from 1, so an id names one grant of this process for the record's
     /// life and reveals nothing the process does not already know.
     pub next_region_id: u64,
+    /// The [`BudgetNode`] every frame of the process is charged to, which
+    /// counts the record as one of its references.
+    pub budget: NodeIdx,
+}
+
+/// A run taken back from a process and parked on the
+/// [`crate::DeferredList`] until no other process can reach it, still
+/// charged to the budget node it was charged to while the process held it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeferredRun
+{
+    pub run: FreeRun,
+    pub budget: NodeIdx,
 }
 
 /// One registered demand region on its process's region list: the region and
@@ -85,6 +100,8 @@ pub enum Node
 {
     Free,
     Run(FreeRun),
+    Deferred(DeferredRun),
+    Budget(BudgetNode),
     Region(RegionNode),
     Frame(FrameDesc),
     Process(ProcessRecord),
@@ -415,6 +432,19 @@ mod tests
 {
     use super::test_store::VecStore;
     use super::*;
+
+    /// The slot geometry docs/limits.md § memmgr states: the process record
+    /// is the largest payload, and the slot is 64 bytes, 64 to a page.
+    #[test]
+    fn a_slot_is_64_bytes_and_the_process_record_its_largest_payload()
+    {
+        assert_eq!(size_of::<ProcessRecord>(), 48);
+        assert!(size_of::<BudgetNode>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<DeferredRun>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<FrameDesc>() <= size_of::<ProcessRecord>());
+        assert_eq!(SLOT_SIZE, 64);
+        assert_eq!(SLOTS_PER_PAGE, 64);
+    }
 
     #[test]
     fn alloc_fails_until_a_page_is_carved_then_reuses_freed_slots()

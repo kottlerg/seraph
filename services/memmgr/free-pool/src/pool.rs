@@ -104,6 +104,8 @@ pub(crate) fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<Fre
     {
         Node::Run(run) => Some(run),
         Node::Free
+        | Node::Deferred(_)
+        | Node::Budget(_)
         | Node::Region(_)
         | Node::Frame(_)
         | Node::Process(_)

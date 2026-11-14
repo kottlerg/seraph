@@ -839,7 +839,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 9;
+pub const MEMMGR_LABELS_VERSION: u32 = 10;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -867,7 +867,12 @@ pub mod memmgr_labels
     pub const RELEASE_MEMORY_CAPS: u64 = 2;
     /// Procmgr-only: register a new process and receive the badged SEND cap
     /// procmgr installs in the new process's `ProcessInfo.memmgr_endpoint_cap`.
-    /// `data[1]` carries the flags ([`REGISTER_PHYS_CLASS`]). Specified in
+    /// `data[1]` carries the flags ([`REGISTER_PHYS_CLASS`],
+    /// [`REGISTER_RESERVE`], [`REGISTER_MAX`]), `data[2]` the memmgr badge of
+    /// the process whose budget node is the new node's parent (0 for a
+    /// top-level node), and `data[3]` the max in pages with [`REGISTER_MAX`].
+    /// The reply carries the badge in `data[0]` and the max the node took, after
+    /// memmgr's clamp, in `data[1]`. Specified in
     /// `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
@@ -877,6 +882,14 @@ pub mod memmgr_labels
     /// [`CREATE_PHYS_ACCESS`](super::procmgr_labels::CREATE_PHYS_ACCESS)
     /// (devmgr and the IOMMU drivers).
     pub const REGISTER_PHYS_CLASS: u64 = 1 << 0;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 1): the new budget node is in
+    /// the system reserve. memmgr refuses it under a parent outside the
+    /// reserve.
+    pub const REGISTER_RESERVE: u64 = 1 << 1;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 2): `data[3]` carries the new
+    /// budget node's max in pages, which memmgr clamps to what the parent and
+    /// every ancestor have left. Without it the node has no max.
+    pub const REGISTER_MAX: u64 = 1 << 2;
     /// The bit of a memmgr process badge that marks a phys-class process
     /// ([`REGISTER_PHYS_CLASS`]); memmgr draws the other 63 bits at random.
     /// init clears it in the badge it mints for procmgr on memmgr's endpoint,
@@ -916,11 +929,14 @@ pub mod memmgr_labels
     ///   `free_bytes` once a later reclamation's recheck finds it
     ///   unreachable. A caller polls `free_bytes` and `deferred_bytes`
     ///   together to confirm a dead process's pages were reclaimed.
+    /// * `data[5]` — `largest_free_bytes`: the largest single free run.
+    /// * `data[6]` — `reserve_bytes`: the system reserve, the free pages a
+    ///   charge to a budget node outside the reserve may not take.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory. `data[3]` and `data[4]` are appended fields — readers
+    /// "dark" memory. `data[3]` to `data[6]` are appended fields — readers
     /// needing only the identity may ignore them.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.
@@ -987,6 +1003,16 @@ pub mod memmgr_labels
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (unknown badge or no
     /// region matches `[va_base, len)` exactly).
     pub const UNREGISTER_REGION: u64 = 9;
+
+    /// Read the caller's own budget usage, in pages. Universal label,
+    /// attributed by `recv.badge`; read-only.
+    ///
+    /// Reply (`SUCCESS`): `data[0]` the pages charged to the caller's budget
+    /// node, `data[1]` its max (`u64::MAX` for none), and `data[2]` the pages
+    /// charged to it and every node below it. `INVALID_ARGUMENT` for an
+    /// unknown badge. Specified in `services/memmgr/docs/ipc-interface.md`
+    /// § Label 10: `QUERY_MEMORY_USAGE`.
+    pub const QUERY_MEMORY_USAGE: u64 = 10;
 
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with
@@ -1055,6 +1081,10 @@ pub mod memmgr_errors
     /// caller's version as `data[0]`; mismatch here means the caller was
     /// built against a different revision of `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
+    /// The request would take the subtree of the caller's budget node, or of
+    /// an ancestor, over its max. Distinct from the out-of-memory codes: the
+    /// RAM may exist, and the caller's budget refuses it.
+    pub const LIMIT: u64 = 8;
 }
 
 /// Init → memmgr bootstrap payload layout.

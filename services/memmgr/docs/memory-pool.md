@@ -103,7 +103,11 @@ unable to grow.
 
 ## Allocation
 
-`REQUEST_MEMORY_CAPS(want_pages, flags)`:
+`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the caller's budget
+node (§ Distribution policy): a request over the max of the node or of an ancestor fails `LIMIT`,
+and one that would leave fewer free pages than the system reserve, from a caller outside it, fails
+with the out-of-memory code of its flags, before any run leaves the pool. An admitted request
+then selects:
 
 1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
    `want_pages`. On hit: detach the run, split off exactly `want_pages` via
@@ -131,7 +135,9 @@ unable to grow.
 
 A selection that fails, contiguous or best-effort, first rechecks the deferred
 list (see [Reclamation](#reclamation)) and, when a run moved to the pool,
-selects once more before memmgr returns the out-of-memory code.
+selects once more before memmgr returns the out-of-memory code. A refused
+admission does the same before it fails: a pooled run releases its charge and
+adds free pages.
 
 Each Memory cap returned to the caller is a derive-twice copy: memmgr
 retains an intermediary in its own CSpace and hands the second derivation
@@ -143,7 +149,9 @@ a caller whose badge marks it phys-class (devmgr and the IOMMU drivers; see
 no other caller can read where its frames lie. Each grant run is recorded on
 the caller's entry under the next id of the entry's region-id sequence, which
 the reply returns in place of a physical address and `RELEASE_MEMORY_CAPS`
-takes back (see [Per-Process Tracking](#per-process-tracking)).
+takes back (see [Per-Process Tracking](#per-process-tracking)), and charged to
+the entry's budget node. A best-effort grant charges the pages it carries, which
+can be fewer than the admitted `want_pages`.
 
 ---
 
@@ -199,6 +207,10 @@ and never reclaims them. Each entry records:
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
+- The index of its budget node (§ Distribution policy), to which every run on
+  the record and on its regions' chunk tables is charged. The three boot
+  records have top-level reserve nodes with no max, so their bootstrap arenas
+  are charged too.
 
 The frame, region, and chunk-table nodes live in a self-hosted metadata arena (below),
 not in the record, so per-process frame and region counts are bounded by RAM —
@@ -217,7 +229,7 @@ two, so the array only ever appends and lookup stays constant-time on average;
 when the window is spent, buckets stop splitting and chains lengthen, which
 costs lookup time and bounds no capacity. The window's base is fixed, not
 drawn per boot like the arena's: the array holds only arena indices. `REGISTER_PROCESS` returns
-`TOO_MANY_PROCESSES` only when the record's node cannot be allocated: system
+`TOO_MANY_PROCESSES` only when the record's node or its budget node cannot be allocated: system
 RAM is exhausted.
 
 ---
@@ -231,20 +243,29 @@ faulting page and no page of a run memmgr mapped before, which it reads from the
 the region's chunk table ([Chunk table](#chunk-table)). On a pool with a free run that covers the
 span, that is the whole chunk on its first fault, backed by one run.
 
-memmgr first selects a run covering the span, as a `REQUIRE_CONTIGUOUS` request would, with the
-deferred recheck before it fails (see [Reclamation](#reclamation)). When no free run covers the
-span, it takes the largest free run whole, which needs no split, and maps it over the part of the
-span around the faulting page: from the faulting page up, moved down only as far as needed to stay
-inside the span. A later fault on a page of the span the run did not cover is backed the same way,
-so the chunk fills in parts, each part one run and one frame record. A fault is therefore declined
-for want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message)
-only when the free pool holds no page, or when the split of a run larger than the span fails.
+The span is a fault-around preference, and the process's budget node bounds it. memmgr first admits
+as much of the span as the node takes ([Distribution policy](#distribution-policy)): the span,
+clamped to what the max of the node and of every ancestor leaves, and, for a node outside the system
+reserve, to the free pages above the reserve. A fault is declined with code 7 when the reserve
+admits not even the faulting page. It is declined with code 10 only when the max admits not even the
+faulting page, or, when the map needs page-table funding, not the faulting page and the least
+donation beside it, and with code 9 when the reserve refuses that donation. A longer run whose
+funding is refused is shortened first ([Client page-table funding](#client-page-table-funding)). It
+then selects a run covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the
+deferred recheck before it fails (see [Reclamation](#reclamation)). When no free run covers them, it
+takes the largest free run whole, which needs no split, and maps it over the part of the span around
+the faulting page: from the faulting page up, moved down only as far as needed to stay inside the
+span. A later fault on a page of the span the run did not cover is backed the same way, so the chunk
+fills in parts, each part one run and one frame record. A fault is therefore declined for want of
+RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the
+free pool holds no page, when every free page is in the system reserve and the process's node is
+outside it, or when the split of a run larger than the pages to back fails.
 
-Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the
-region's protection, and recorded on its chunk's entry with its mapped VA and no region id, so
-`UNREGISTER_REGION` unmaps and reclaims it and `PROCESS_DIED` reclaims it (see
-[Reclamation](#reclamation)). The pages move from a free run to the process, so `pool_total` is
-unchanged.
+Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
+protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
+the process's budget node, so `UNREGISTER_REGION` unmaps and reclaims it and `PROCESS_DIED` reclaims
+it (see [Reclamation](#reclamation)). The pages move from a free run to the process, so `pool_total`
+is unchanged.
 
 ---
 
@@ -266,12 +287,12 @@ is design intent; not yet implemented ([#230](https://github.com/kottlerg/seraph
 Today nothing evicts a chunk, so a fault finds its chunk unbacked or resident.
 
 The table is a radix tree of [Metadata Arena](#metadata-arena) slots rooted in the region's node.
-A directory node holds `DIR_FANOUT` (5) children: the slot indices that fit in the slot's largest
+A directory node holds `DIR_FANOUT` (6) children: the slot indices that fit in the slot's largest
 payload, so a directory node does not enlarge the slot. A leaf holds one chunk's entry. The tree is
 indexed by the chunk's index in the region, its offset from the region's base in chunks, one
-base-5 digit per level. Its height is fixed by the region's chunk count, as the fewest directory
-levels that give every chunk a leaf: none for a region of one chunk, seven for a region of 2^14
-chunks (1 GiB), eighteen for one that fills a 57-bit address space's user half. A node exists only
+base-6 digit per level. Its height is fixed by the region's chunk count, as the fewest directory
+levels that give every chunk a leaf: none for a region of one chunk, six for a region of 2^14
+chunks (1 GiB), sixteen for one that fills a 57-bit address space's user half. A node exists only
 on the path to a chunk that has an entry. The table therefore costs slots in proportion to the
 chunks the process touched, at most one more than the height per chunk, not in proportion to the
 VA it registered.
@@ -304,11 +325,16 @@ pager's. A process that funds the pool before it registers a region (ruststd's
 first. So memmgr does not depend on it. When the map of a run fails with `OutOfMemory`, memmgr
 funds the pool itself and maps the run again, at most four times:
 
-1. It selects a contiguous run of four pages from the free pool, or of two when no four-page run
-   is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
+1. It admits four pages against the process's budget node, or two when four would take the
+   subtree of the node or of an ancestor over its max, or would take the system reserve. The demand
+   run whose map needs the funding is charged only once it is recorded, so the donation is
+   admitted against the max beside that run's pages. It then
+   selects a contiguous run of the admitted size from the free pool, or of two when no four-page
+   run is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
    donates a single page.
 2. It records the run on the process's entry like a grant it did not map: no mapped VA and no
-   region id. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take it back.
+   region id, charged to the budget node. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take
+   it back.
 3. It donates the run to the pool with augment-mode `cap_create_aspace` on the delegated
    `AddressSpace` cap, and keeps its own cap to the run as the reclaim anchor. When the kernel
    refuses the donation, memmgr takes the record back and returns the run to the free pool.
@@ -319,26 +345,34 @@ run is quiescent by then, or waits on the deferred list until it is (see
 [Reclamation](#reclamation)). The pages move from a free run to the process's entry, so
 `pool_total` is unchanged.
 
-A fault whose map still fails, because the free pool cannot fund the pool or the map fails for
-another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md) § Kernel-origin
-fault message). A failed map can leave the first pages of the run mapped. memmgr unmaps the
-run's span before it returns the run to the free pool, so no page of a pooled run stays
-mapped in the process. When that unmap fails, the run stays recorded on the process's entry
-until `PROCESS_DIED`.
+When the budget refuses the funding, because not even two pages fit under the max of the
+process's node or of an ancestor beside the run being mapped, or the reserve refuses it, and the
+run is longer than one page, memmgr returns the run to the free pool and backs the fault again with
+a run at least two pages shorter, down to one page, around the faulting page as before. So the
+funding a fault needs never spends the room its faulting page would fit in. A one-page run whose
+funding the budget refuses is declined with code 10, and one whose funding the reserve refuses with
+code 9. A fault whose map still fails, because the free pool cannot fund the pool or the map fails
+for another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md)
+§ Kernel-origin fault message). A failed map can leave the first pages of the run mapped. memmgr
+unmaps the run's span before it returns the run to the free pool, so no page of a pooled run stays
+mapped in the process. When that unmap fails, the run stays recorded on the process's entry until
+`PROCESS_DIED`.
 
 ---
 
 ## Metadata Arena
 
-All of memmgr's bookkeeping — free runs, deferred runs, process records,
-per-process frame and region descriptors, and the regions' chunk tables — is
+All of memmgr's bookkeeping — free runs, deferred runs, process records and
+their budget nodes, per-process frame and region descriptors, and the regions'
+chunk tables — is
 nodes drawn from a self-hosted arena rather than fixed `.bss` arrays. memmgr
 is `no_std` and cannot bootstrap
 a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
-- Nodes are fixed-size `Slot`s (a tagged run, process, region, frame,
-  chunk-directory, chunk, or free payload plus a `next` index) reached by a
+- Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, process,
+  region, frame, chunk-directory, chunk, or free payload plus a `next` index)
+  reached by a
   `u64` index, so the index never bounds the
   arena before the address space does.
 - A free list threads the unused slots. Allocation pops the head; free pushes
@@ -484,10 +518,12 @@ Memory object of every derivation it granted. The frame is **quiescent** when al
    at the same point).
 4. No address space maps any page of it (`CAP_INFO_MEMORY_MAPPINGS`, read window by window).
 
-A query that fails answers no. A quiescent frame joins the free pool. Any other frame joins the
-**deferred list**: its descriptor node is rewritten into a run node in place, as a pooled frame's
-is, so reclamation still never allocates and cannot fail. A deferred run is owned by memmgr and
-counted in `pool_total`, lent to no process, and never granted. Before every `PROCESS_DIED`,
+A query that fails answers no. A quiescent frame joins the free pool, and its pages are uncharged
+from the budget node they were charged to. Any other frame joins the **deferred list**: its
+descriptor node is rewritten into a run node in place, as a pooled frame's is, so reclamation
+still never allocates and cannot fail. A deferred run is owned by memmgr and counted in
+`pool_total`, lent to no process, and never granted; it keeps its budget node and stays charged
+to it until a recheck pools it (§ Distribution policy). Before every `PROCESS_DIED`,
 `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION`, and before any selection from the free pool fails (a
 `REQUEST_MEMORY_CAPS` grant, a demand fault's run, or memmgr's own arena, index, page-table, or
 `CSpace` growth), memmgr rechecks the deferred list, oldest run first: each run that has become
@@ -526,7 +562,8 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
    the frame is quiescent, else onto the deferred list (no fresh node, so
    the step cannot fail).
 4. Return every chunk-table node, every region node, and the record's own
-   node to the arena free list.
+   node to the arena free list, and drop the record's reference to its budget
+   node, which is freed with it unless a deferred run is still charged to it.
 5. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
@@ -618,10 +655,11 @@ preconditions above. A declined pair stays as two discrete runs.
 
 | Failure | Cause | Caller observation |
 |---|---|---|
-| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS` | Reply with error label; caller may retry without the flag, or fail |
-| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages` | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take the system reserve from a caller outside it | Reply with error label; caller may retry without the flag, or fail |
+| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant would take the system reserve from a caller outside it | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `TOO_MANY_PROCESSES` | A process record could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
+| `TOO_MANY_PROCESSES` | A process record or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built

@@ -835,6 +835,13 @@ QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoin
 stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an
 address inside `dispatch`, trying up to five calls.
 
+A boot whose kernel faults with the exception report's `cet:` line showing `s_cet` without
+`SH_STK_EN` and `int_ssp_table=0` ran on a host that lost the guest's CET state. On a host with the
+CPUID hypervisor bit the command reports the run as inconclusive and boots again, up to four runs
+of each boot, passing only on a run without it and failing as inconclusive after four; on any other
+host that report fails the command
+([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks).
+
 A pure runner; the sysroot must hold the composed ktest bundle, and it reads the kernel's symbols
 from the sysroot's kernel image:
 

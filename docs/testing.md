@@ -516,6 +516,15 @@ without running the shadow stacks. The host computes the verdict and kills QEMU,
 not a CI boot. See [xtask/README.md § test-cet](../xtask/README.md#cargo-xtask-test-cet) for the
 command.
 
+A boot whose kernel exception report shows `CR4.CET` set, `SH_STK_EN` clear and a zero interrupt
+SSP table address, a state the kernel never leaves, ran on a host that lost the guest's CET state
+([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md) § x86-64
+Mechanism). A nested hypervisor has been seen to lose it (§ Verification Record there). The
+maintainer decided that on a host that is itself a guest, by the CPUID hypervisor bit, such a run
+is inconclusive: the command boots again, up to four runs of each boot, and the boot passes only on
+a run without it; four such runs fail the command as inconclusive. On a host that is not a guest
+the same report fails the command, as does every other fault.
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -1212,9 +1221,11 @@ above), whose first boot runs ktest with the kernel on CET shadow stacks and who
 that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
 bundle, a debug-profile build, at 4 vCPUs. It runs only under KVM on a host whose CPU reports CET
 shadow stacks: on any other host the command fails, naming what is missing, and never passes, so a
-PR that owes the cell runs it on such a host. Each boot is bounded by five minutes and each gdbstub
-answer by 30 s; it has no `run-parallel` budget. The pair is the cet device cell (Device surfaces
-above).
+PR that owes the cell runs it on such a host. On a host that is itself a guest, a run that ends
+in the host's loss of the guest's CET state is inconclusive and run again, up to four runs of each
+boot, and the cell passes only on runs without it (CET shadow stacks (`test-cet`) above). Each boot
+is bounded by five minutes and each gdbstub answer by 30 s; it has no `run-parallel` budget. The
+pair is the cet device cell (Device surfaces above).
 
 ```sh
 # CET cell, x86_64 only:

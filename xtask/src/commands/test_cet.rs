@@ -33,6 +33,15 @@
 //!
 //! The kernel carries no test code for either boot: the fault is made at the
 //! hardware boundary, as `test-wedge` makes its wedge.
+//!
+//! A boot whose kernel faults with `CR4.CET` set, `SH_STK_EN` clear and a
+//! zero interrupt SSP table address in its exception report, a state the
+//! kernel never leaves, ran on a host that lost the guest's CET state. The
+//! maintainer decided that on a host that is itself a guest (the CPUID
+//! hypervisor bit), where a nested hypervisor has been seen to lose it, such
+//! a run is inconclusive: the boot runs again, up to [`CET_ATTEMPTS`] times,
+//! and passes only on a run without it. On any other host it fails
+//! (core/kernel/docs/return-address-integrity.md § Verification Record).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -71,6 +80,22 @@ const FAIL_MARKERS: [&str; 4] = ["SOME TESTS FAILED", "KERNEL EXCEPTION", "FATAL
 const EXCEPTION_MARKER: &str = "KERNEL EXCEPTION";
 const CP_NEAR_RET: &str = "(vec=21 err=0x1)";
 
+/// The line that ends the kernel's exception report (`crate::fatal`).
+const FATAL_MARKER: &str = "FATAL:";
+
+/// The exception report's CET line, which the kernel prints while `CR4.CET`
+/// is set (`shadow_stack::report_registers`), and its two fields read here.
+const CET_LINE: &str = "cet: s_cet=";
+const S_CET_FIELD: &str = "s_cet=";
+const SSP_TABLE_FIELD: &str = "int_ssp_table=";
+
+/// `IA32_S_CET.SH_STK_EN` (bit 0): supervisor shadow stacks on.
+const S_CET_SH_STK_EN: u64 = 1;
+
+/// How many times each boot runs while every run ends with the host having
+/// lost the guest's CET state ([`Attempt::HostLostCetState`]).
+const CET_ATTEMPTS: u32 = 4;
+
 /// Budget for boot 1's ktest run, and for boot 2 to reach ktest.
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
 
@@ -106,11 +131,115 @@ pub fn run(ctx: &Context, args: &TestCetArgs) -> Result<()>
     // Held until the command returns, after its last QEMU has exited.
     let _host = crate::host_lock::admit_boot(ctx, &args.host, args.cpus, 1)?;
 
-    ktest_boot(ctx, args).context("boot 1, ktest on shadow stacks")?;
+    let host_is_guest = host_is_a_guest();
+    retry(host_is_guest, || ktest_boot(ctx, args)).context("boot 1, ktest on shadow stacks")?;
     step("CET boot 1: ktest passed with shadow stacks on");
-    corrupt_boot(ctx, args, dispatch).context("boot 2, a corrupted return address")?;
+    retry(host_is_guest, || corrupt_boot(ctx, args, dispatch))
+        .context("boot 2, a corrupted return address")?;
     step("CET shadow-stack test: PASS (ktest on shadow stacks; #CP on a corrupted return)");
     Ok(())
+}
+
+/// How a boot that did not fail ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attempt
+{
+    /// Every check of the boot passed.
+    Passed,
+    /// The kernel faulted after the host lost the guest's CET state
+    /// ([`lost_cet_state`]): the run says nothing about the kernel.
+    HostLostCetState,
+}
+
+/// Run `boot` until it passes, up to [`CET_ATTEMPTS`] times while each run
+/// ends in [`Attempt::HostLostCetState`] on a host that is itself a guest
+/// (`host_is_guest`), where a nested hypervisor has been seen to lose a
+/// guest's CET registers (core/kernel/docs/return-address-integrity.md
+/// § Verification Record). It passes only on a run with no such end. On a
+/// host that is not a guest the same end is a failure.
+fn retry(host_is_guest: bool, mut boot: impl FnMut() -> Result<Attempt>) -> Result<()>
+{
+    for attempt in 1..=CET_ATTEMPTS
+    {
+        match boot()?
+        {
+            Attempt::Passed => return Ok(()),
+            Attempt::HostLostCetState if !host_is_guest => bail!(
+                "the kernel faulted with CR4.CET set and IA32_S_CET and the interrupt SSP table \
+                 address 0, which the kernel never leaves, on a host that is not itself a guest \
+                 (no CPUID hypervisor bit)"
+            ),
+            Attempt::HostLostCetState => step(&format!(
+                "Inconclusive run {attempt} of {CET_ATTEMPTS}: this nested host lost the guest's \
+                 CET state (IA32_S_CET and the interrupt SSP table address 0); booting again"
+            )),
+        }
+    }
+    bail!(
+        "inconclusive: this nested host lost the guest's CET state in all {CET_ATTEMPTS} runs, \
+         and the test passes only on a run in which it does not"
+    )
+}
+
+/// Whether the kernel exception reports in `lines` show CET state lost
+/// outside the kernel: at least one CET line, and every CET line with
+/// `SH_STK_EN` clear and a zero interrupt SSP table address. The kernel
+/// writes a non-zero table address before it sets `CR4.CET` and writes
+/// `IA32_S_CET` only with `SH_STK_EN` set, so it never leaves that state
+/// itself (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism);
+/// a report with any other CET state is the kernel's fault.
+fn lost_cet_state(lines: &[String]) -> bool
+{
+    let mut seen = false;
+    for line in lines.iter().filter(|l| l.contains(CET_LINE))
+    {
+        let (Some(s_cet), Some(table)) = (
+            field_hex(line, S_CET_FIELD),
+            field_hex(line, SSP_TABLE_FIELD),
+        )
+        else
+        {
+            return false;
+        };
+        if s_cet & S_CET_SH_STK_EN != 0 || table != 0
+        {
+            return false;
+        }
+        seen = true;
+    }
+    seen
+}
+
+/// Whether the machine this command runs on is itself a guest: the CPUID
+/// hypervisor bit (`CPUID.1:ECX[31]`).
+#[cfg(target_arch = "x86_64")]
+fn host_is_a_guest() -> bool
+{
+    std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0
+}
+
+/// A host that is not `x86_64` runs no KVM `x86_64` guest, so `run` stops
+/// before this matters.
+#[cfg(not(target_arch = "x86_64"))]
+fn host_is_a_guest() -> bool
+{
+    false
+}
+
+/// `lines`, which end in a kernel exception report's first line, with the
+/// rest of that report: the lines up to its `FATAL:` line, or none when it
+/// does not come within [`FAULT_TIMEOUT`].
+fn with_report(guest: &mut Guest, mut lines: Vec<String>) -> Vec<String>
+{
+    if lines.last().is_some_and(|l| l.contains(EXCEPTION_MARKER))
+    {
+        lines.extend(
+            guest
+                .collect_until(FATAL_MARKER, FAULT_TIMEOUT)
+                .unwrap_or_default(),
+        );
+    }
+    lines
 }
 
 /// A QEMU on the current sysroot with shadow stacks on, its stderr kept in a
@@ -200,17 +329,28 @@ fn cet_spec<'a>(
 }
 
 /// Boot 1: ktest to its pass marker, on shadow stacks.
-fn ktest_boot(ctx: &Context, args: &TestCetArgs) -> Result<()>
+fn ktest_boot(ctx: &Context, args: &TestCetArgs) -> Result<Attempt>
 {
     step("Launching QEMU for the CET ktest boot");
     let mut run = launch(ctx, args, GdbMode::Off, "ktest")?;
     let mut ends = vec![PASS_MARKER];
     ends.extend(FAIL_MARKERS);
-    let result = run
-        .guest
-        .collect_until_any(&ends, BOOT_TIMEOUT)
-        .map_err(|e| run.explain(e))
-        .and_then(|lines| check_ktest(&lines));
+    let result = match run.guest.collect_until_any(&ends, BOOT_TIMEOUT)
+    {
+        Err(e) => Err(run.explain(e)),
+        Ok(lines) =>
+        {
+            let lines = with_report(&mut run.guest, lines);
+            if lost_cet_state(&lines)
+            {
+                Ok(Attempt::HostLostCetState)
+            }
+            else
+            {
+                check_ktest(&lines).map(|()| Attempt::Passed)
+            }
+        }
+    };
     let stderr = run.stderr.clone();
     run.guest.shutdown();
     let _ = std::fs::remove_file(stderr);
@@ -218,7 +358,7 @@ fn ktest_boot(ctx: &Context, args: &TestCetArgs) -> Result<()>
 }
 
 /// Boot 2: corrupt a `dispatch` return address and expect the `#CP`.
-fn corrupt_boot(ctx: &Context, args: &TestCetArgs, dispatch: Span) -> Result<()>
+fn corrupt_boot(ctx: &Context, args: &TestCetArgs, dispatch: Span) -> Result<Attempt>
 {
     let sock = ctx
         .target_dir
@@ -235,6 +375,11 @@ fn corrupt_boot(ctx: &Context, args: &TestCetArgs, dispatch: Span) -> Result<()>
             .guest
             .collect_until_any(&[KTEST_STARTED, EXCEPTION_MARKER], BOOT_TIMEOUT)
             .map_err(|e| run.explain(e))?;
+        let lines = with_report(&mut run.guest, lines);
+        if lost_cet_state(&lines)
+        {
+            return Ok(Attempt::HostLostCetState);
+        }
         let slide = check_started(&lines)?;
         let span = dispatch.slid(slide);
         for attempt in 1..=CORRUPT_ATTEMPTS
@@ -251,8 +396,14 @@ fn corrupt_boot(ctx: &Context, args: &TestCetArgs, dispatch: Span) -> Result<()>
             {
                 continue;
             };
-            let rip = run.guest.collect_until("rip=", FAULT_TIMEOUT)?;
-            return check_fault(report.last().map(String::as_str), rip.last(), span);
+            let rest = run.guest.collect_until(FATAL_MARKER, FAULT_TIMEOUT)?;
+            if lost_cet_state(&rest)
+            {
+                return Ok(Attempt::HostLostCetState);
+            }
+            let rip = rest.iter().find(|l| l.contains("rip="));
+            return check_fault(report.last().map(String::as_str), rip, span)
+                .map(|()| Attempt::Passed);
         }
         bail!("no #CP in {CORRUPT_ATTEMPTS} corrupted returns of syscall::dispatch")
     })();
@@ -500,6 +651,83 @@ mod tests
             "kernel: kaslr: slide=0x0 i\nkernel: shadow stacks: on\nkernel: KERNEL EXCEPTION: x",
         );
         check_started(&faulted).unwrap_err();
+    }
+
+    const LOST: &str = "kernel:   cet: s_cet=0x0  int_ssp_table=0x0000000000000000  \
+                        pl0_ssp=0x0000000000000000";
+    const HEALTHY: &str = "kernel:   cet: s_cet=0x1  int_ssp_table=0xffffffffc7a41000  \
+                           pl0_ssp=0x0000000000000000";
+    const KERNEL_LEFT_OFF: &str = "kernel:   cet: s_cet=0x0  int_ssp_table=0xffffffffc7a41000  \
+                                   pl0_ssp=0x0000000000000000";
+    const UD: &str = "kernel: KERNEL EXCEPTION: cpu=3 cause=#UD invalid opcode (vec=6 err=0x0)";
+
+    // The defect caught: a kernel fault taken for the host's loss of the
+    // guest's CET state, so a kernel bug counts as inconclusive. Only the
+    // state the kernel never leaves (SH_STK_EN clear and a zero table
+    // address, in every report) is the host's.
+    #[test]
+    fn only_cleared_s_cet_and_table_is_the_hosts_loss()
+    {
+        let report = |cet: &str| lines(&format!("{UD}\nkernel:   rip=0x1  cr2=0x0\n{cet}"));
+        assert!(lost_cet_state(&report(LOST)));
+        assert!(!lost_cet_state(&report(HEALTHY)));
+        assert!(!lost_cet_state(&report(KERNEL_LEFT_OFF)));
+        let table_only = "kernel:   cet: s_cet=0x1  int_ssp_table=0x0000000000000000  pl0_ssp=0x0";
+        assert!(!lost_cet_state(&report(table_only)));
+        // No CET line: CR4.CET was clear, or the report did not arrive.
+        assert!(!lost_cet_state(&lines(UD)));
+        // Two CPUs' reports, one of them a kernel fault.
+        assert!(!lost_cet_state(&lines(&format!(
+            "{UD}\n{LOST}\n{UD}\n{HEALTHY}"
+        ))));
+        assert!(lost_cet_state(&lines(&format!(
+            "{UD}\n{LOST}\n{UD}\n{LOST}"
+        ))));
+        let unreadable = "kernel:   cet: s_cet=zz  int_ssp_table=0x0  pl0_ssp=0x0";
+        assert!(!lost_cet_state(&report(unreadable)));
+    }
+
+    /// Run `retry` over `ends`, returning its verdict and how many boots it
+    /// made.
+    fn retried(host_is_guest: bool, ends: &[Result<Attempt, &str>]) -> (Result<()>, usize)
+    {
+        let mut boots = 0;
+        let verdict = retry(host_is_guest, || {
+            let end = ends[boots];
+            boots += 1;
+            end.map_err(|e| anyhow::anyhow!("{e}"))
+        });
+        (verdict, boots)
+    }
+
+    // The defect caught: an inconclusive run counted as a pass, retries
+    // without bound, the host's loss forgiven on a host that is not a guest,
+    // or a real failure retried away.
+    #[test]
+    fn a_lost_state_run_is_retried_only_on_a_guest_host_and_never_passes()
+    {
+        use Attempt::{HostLostCetState as Lost, Passed};
+
+        let (verdict, boots) = retried(true, &[Ok(Lost), Ok(Lost), Ok(Passed)]);
+        verdict.unwrap();
+        assert_eq!(boots, 3);
+
+        let (verdict, boots) = retried(true, &[Ok(Lost); CET_ATTEMPTS as usize]);
+        assert!(verdict.unwrap_err().to_string().contains("inconclusive"));
+        assert_eq!(boots, CET_ATTEMPTS as usize);
+
+        let (verdict, boots) = retried(false, &[Ok(Lost), Ok(Passed)]);
+        assert!(
+            verdict
+                .unwrap_err()
+                .to_string()
+                .contains("not itself a guest")
+        );
+        assert_eq!(boots, 1);
+
+        let (verdict, boots) = retried(true, &[Ok(Lost), Err("ktest failed"), Ok(Passed)]);
+        assert_eq!(verdict.unwrap_err().to_string(), "ktest failed");
+        assert_eq!(boots, 2);
     }
 
     #[test]

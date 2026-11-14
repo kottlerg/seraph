@@ -291,7 +291,10 @@ shadow stacks on or off.
   `shadow stacks: on`, and a return address of `syscall::dispatch` that the host overwrites
   through QEMU's gdbstub must raise `#CP` with error code 1. The kernel carries no test code for
   it. QEMU refuses to start where KVM cannot give the guest `CET_SS`, and the command then fails,
-  naming the feature. The host tests of `shadow_stack.rs` model `RSTORSSP`, `SAVEPREVSSP`,
+  naming the feature. A boot whose exception report shows the CET state lost outside the kernel,
+  as the Faults item above describes, is inconclusive on a host that is itself a guest, by the
+  CPUID hypervisor bit, and is run again, up to four runs, passing only on a run without it; on
+  any other host it fails. The host tests of `shadow_stack.rs` model `RSTORSSP`, `SAVEPREVSSP`,
   `CALL`, and `RET` over the token layout.
 
 ---

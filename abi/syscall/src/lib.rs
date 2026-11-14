@@ -1241,14 +1241,16 @@ pub const fn encode_exit_code(code: u32) -> u64
 // delivered to a thread's bound fault-handler endpoint (see
 // `SYS_THREAD_SET_FAULT_HANDLER` and `docs/fault-handling.md`). The message the
 // kernel synthesizes on the faulting thread's behalf carries `FAULT_LABEL`, the
-// badge of the bound endpoint cap, and four data words: `[kind, d1, d2, ip]`.
+// badge of the bound endpoint cap (of the named one for a redirect), and four
+// data words: `[kind, d1, d2, ip]`, with a fifth for a forward or a redirect.
 
 /// Reserved IPC label marking a kernel-originated fault message. Distinct so a
 /// handler can recognise a fault message. The label proves kernel origin only
 /// on an endpoint whose handler hands out no SEND. The badge of a fault message
 /// is the derivation badge of the Endpoint cap bound by
-/// `SYS_THREAD_SET_FAULT_HANDLER`, so it is as derivation-locked as the badge
-/// of an ordinary send through that cap; a binder cannot choose it (see
+/// `SYS_THREAD_SET_FAULT_HANDLER`, or of the cap a [`FAULT_REPLY_REDIRECT`]
+/// reply names, so it is as derivation-locked as the badge of an ordinary send
+/// through that cap; neither a binder nor a redirector can choose it (see
 /// `docs/fault-handling.md` § Security). Reserved by the kernel; servers must
 /// not produce this label themselves. Chosen adjacent to [`IPC_REPLY_TRANSFER_FAILED`] (`u64::MAX`)
 /// in the reserved high range.
@@ -1362,8 +1364,9 @@ pub const FAULT_EXC_FP: u64 = 10;
 
 /// Fault reply label: resume the faulting thread (re-execute the faulting
 /// instruction, or the syscall whose user copy faulted, or continue from a
-/// handler-modified instruction pointer). The default disposition; the kernel
-/// ignores its data words and caps.
+/// handler-modified instruction pointer). The default disposition, which every
+/// label other than [`FAULT_REPLY_KILL`], [`FAULT_REPLY_FORWARD`] and
+/// [`FAULT_REPLY_REDIRECT`] takes; the kernel ignores its data words and caps.
 pub const FAULT_REPLY_RESUME: u64 = 0;
 
 /// Fault reply label: the handler declines, and the fault takes the outcome it
@@ -1392,6 +1395,27 @@ pub const FAULT_REPLY_FORWARD: u64 = 2;
 /// carries the forwarder's data word 0; a delivery that no handler forwarded
 /// carries four data words, and a forwarded one five.
 pub const FAULT_FORWARD_REASON_WORD: usize = 4;
+
+/// Fault reply label: the handler hands the fault to another endpoint. The
+/// reply carries exactly one capability handle in its cap block, an Endpoint
+/// cap of the handler's with any rights, which the kernel resolves in the
+/// handler's `CSpace` and does not move. The kernel delivers the same fault
+/// message to that endpoint, with that cap's derivation badge, data words 0–3
+/// unchanged and data word [`FAULT_REDIRECT_WORD`] the redirector's data word 0
+/// (`0` when the reply carries none); the thread stays fault-blocked, and the
+/// reply to that delivery then decides, as for any delivery. Valid for a
+/// delivery of any class and for the fault of a restartable syscall's user
+/// copy, which a resume there restarts. A reply that names no such cap (a cap
+/// count other than one, an unreadable cap block, a stale handle, or a cap of
+/// another type) fails with that error, and the fault takes the outcome it has
+/// with no handler bound (docs/fault-handling.md § Reply).
+pub const FAULT_REPLY_REDIRECT: u64 = 3;
+
+/// Data word of a redirected fault message ([`FAULT_REPLY_REDIRECT`]) that
+/// carries the redirector's data word 0: the word a forwarded message carries
+/// its reason in, so a redirected delivery, like a forwarded one, carries five
+/// data words.
+pub const FAULT_REDIRECT_WORD: usize = 4;
 
 /// Fault class bit: virtual-memory faults ([`FAULT_KIND_VM`]), the faults of a
 /// restartable syscall's user copy among them. A `fault_class_mask` selects

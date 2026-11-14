@@ -93,9 +93,12 @@ enclosing scope; it gives each of the table's placeholders that a definition nam
 order, for an evaluator to run. The namespace keeps a copy of each table.
 
 The first walk reads in table order too, so a reference it meets before the definition of the
-data object it names still resolves without it: to a method of that name in an enclosing scope,
-which the reference then calls in both walks. Where the two walks read a term differently, the
-first may declare a name the second never defines. A load never removes a node: a placeholder
+data object it names resolves, in that walk, to a method of that name in an enclosing scope
+defined earlier, and reads as a call of it. When that reading ends the term list with a fault
+whose end is not known, the data object is not declared, and the second walk reads the same
+call. Otherwise the first walk goes on to declare the data object, and the second reads the name
+as a reference to it. Where the two walks read a term differently, the first may declare a name
+the second never defines. A load never removes a node: a placeholder
 the second walk does not define, by a fault or by such a reading, stays an uninitialized data
 object, so every reference resolved to it stays valid.
 

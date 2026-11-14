@@ -92,10 +92,13 @@ These are not in the table, for the reason given:
   INTEL-SA-01247) is mitigated by microcode alone. Zero-at-ret (CVE-2026-20917, INTEL-SA-01423)
   needs a privileged adversary in ring 0 and is mitigated by firmware alone.
 - **Linux report entries that are not classes.** `old_microcode`, `ghostwrite` (a RISC-V
-  implementation defect), and `ibpb_no_ret`, which describes an IBPB behaviour.
+  implementation defect), and `ibpb_no_ret`, an IBPB property that the table records as the
+  `ibpb_leaves_rsb` behaviour (§ Predictor behaviours).
 - **Classes subsumed by a reported one, or mitigated by microcode.** Spectre v3a (rogue system
-  register read) is mitigated by microcode alone. Intra-mode branch target injection is part of `bhi`. Restricted RSB alternate behaviour
-  (RRSBA) is part of `retbleed` on the parts that have it.
+  register read) is mitigated by microcode alone. Intra-mode branch target injection is part of
+  `bhi`. Restricted RSB alternate behaviour (RRSBA) keeps alternate return predictions within
+  the current predictor mode while enhanced IBRS is on (Intel's RSBU guidance), and the table
+  records it as the `rsb_alternate` behaviour (§ Predictor behaviours).
 
 ---
 
@@ -113,10 +116,10 @@ maximum, since such a leaf returns another leaf's data. It reads `IA32_ARCH_CAPA
 | `CPUID.(EAX=07H,ECX=0):EBX` | HLE (bit 4) and RTM (bit 11): TSX is present |
 | `CPUID.(EAX=07H,ECX=0):EDX` | Hybrid (bit 15); `IA32_ARCH_CAPABILITIES` implemented (bit 29) |
 | `CPUID.(EAX=07H,ECX=2):EDX` | `BHI_CTRL` (bit 4) |
-| `CPUID Fn8000_0008 EBX` | AMD: `SsbdNotRequired` (bit 26), `BTC_NO` (bit 29) |
+| `CPUID Fn8000_0008 EBX` | AMD: `SsbdNotRequired` (bit 26), `BTC_NO` (bit 29), `IBPB_RET` (bit 30) |
 | `CPUID Fn8000_0021 EAX` | AMD: `SRSO_NO` (bit 29), `SRSO_USER_KERNEL_NO` (bit 30) |
 | `CPUID Fn8000_0021 ECX` | AMD: `TSA_SQ_NO` (bit 1), `TSA_L1_NO` (bit 2), `TSA_FILL_NO` (bit 7) |
-| `IA32_ARCH_CAPABILITIES` | The `*_NO` bits, `RSBA`, `TSX_CTRL` and `RFDS_CLEAR` (§ Enumerated bits) |
+| `IA32_ARCH_CAPABILITIES` | The `*_NO` bits, `RSBA`, `TSX_CTRL` and `RFDS_CLEAR` (§ Enumerated bits); `RRSBA` (§ Predictor behaviours) |
 
 The inputs are read on the boot CPU only. Intel states that the RFDS bits enumerate identically
 on every logical processor of a hybrid part. No vendor document found states the same for every
@@ -126,8 +129,9 @@ bit the table reads.
 
 ## Derivation
 
-`derive` applies four steps in order: the vendor's per-model table, the
-`IA32_ARCH_CAPABILITIES` bits, AMD's CPUID bits (AMD parts only), then the boundary rules.
+`derive` applies five steps in order: the vendor's per-model table, the
+`IA32_ARCH_CAPABILITIES` bits, AMD's CPUID bits (AMD parts only), the boundary rules, then the
+predictor behaviours.
 
 ### Intel
 
@@ -240,22 +244,44 @@ The last step lowers each class to the boundary its vendor confines it to:
   untrusted software, as for MDS. Any other part clears them only before a VM entry, for an
   attacker with MMIO access, which only a VMM gives.
 
-<!-- Predictor behaviours section: pending -->
+### Predictor behaviours
+
+Beside the classes, the table records two return-prediction behaviours. Each is a property of
+the predictors, not a class of its own. They select where the kernel fills the return stack
+buffer (RSB), which [#1085](https://github.com/kottlerg/seraph/issues/1085) part (b) applies. A
+CPU of another vendor has both.
+
+| Behaviour | Log name | Meaning | Intel | AMD |
+|---|---|---|---|---|
+| `IbpbLeavesRsb` | `ibpb_leaves_rsb` | An IBPB does not keep a `RET` after it from being predicted by an RSB entry created before it | `eibrs_pbrsb` is not `NotAffected`: Intel defines post-barrier RSB predictions across an IBPB as well as a VM exit | No `IBPB_RET` (`CPUID Fn8000_0008 EBX[30]`): AMD-SB-1040 states that an IBPB may not prevent return predictions from pre-IBPB targets on Zen to Zen 3 |
+| `RsbAlternate` | `rsb_alternate` | A `RET` that finds the RSB empty may be predicted by an alternate predictor, such as the branch target buffer | `retbleed` is not `NotAffected` (the list's RSBA column, or `RSBA`), or `IA32_ARCH_CAPABILITIES.RRSBA` (bit 19) | No part: AMD states that its processors do not put `RET`-based predictions in BTB-type structures (STMS, mitigation V2-1) |
+
+The behaviours select a fill after an IBPB the kernel issues and on a context switch in the
+retpoline build. Neither selects a fill on entry from user mode. Intel states that an RSB
+overwrite after a transition from user mode to supervisor mode is not necessary when SMEP is
+enabled, which the kernel does, and that on parts with enhanced IBRS, SMEP prevents user-mode RSB
+entries from being used in supervisor mode (Intel's mitigation overview). AMD names an RSB
+stuffing sequence (STMS, mitigation V2-3) and SMEP as alternative ways to protect the return
+address predictor (BTC-TG).
 
 ---
 
 ## Report
 
-`report` writes six lines to the serial log after `baseline ok`. The first two give the CPU and
-the inputs. Each of the other four gives one exposure's classes in table order, or `none`:
+`report` writes seven lines to the serial log after `baseline ok`. The first two give the CPU
+and the inputs. Each of the next four gives one exposure's classes in table order, or `none`.
+The last gives the behaviours the CPU has, or `none`. The second line is one line in the log;
+it is broken here for width, and each `<v>` is a hexadecimal value:
 
 ```text
 x86 cpu: GenuineIntel family 0x6 model 0x97 stepping 0x2 hybrid 0
-x86 cpu: arch_capabilities 0x... cpuid 7.0 ebx 0x... edx 0x... 7.2 edx 0x... 8000_0008 ebx 0x... 8000_0021 eax 0x... ecx 0x...
+x86 cpu: arch_capabilities <v> cpuid 7.0 ebx <v> edx <v> 7.2 edx <v> 8000_0008 ebx <v> \
+         8000_0021 eax <v> ecx <v>
 x86 vulnerabilities, affected, kernel action: <classes>
 x86 vulnerabilities, affected, mitigated by firmware: <classes>
 x86 vulnerabilities, affected, not at user-to-kernel: <classes>
 x86 vulnerabilities, not affected: <classes>
+x86 predictor behaviours: <behaviours>
 ```
 
 ---
@@ -280,8 +306,9 @@ status § Intel maps, and every Intel class has a column.
 
 On the development host (Alder Lake S, KVM, `-cpu host`), the classes the ktest boot logs as
 affected (every exposure but `NotAffected`) are the classes the host's Linux kernel reports as
-affected in its `bugs` line, less the entries § Excluded classes names. Validation on other
-hardware is [#1123](https://github.com/kottlerg/seraph/issues/1123).
+affected in its `bugs` line, less the entries § Excluded classes names. The boot logs the
+`ibpb_leaves_rsb` behaviour, which the host's `bugs` line reports as `ibpb_no_ret`.
+Validation on other hardware is [#1123](https://github.com/kottlerg/seraph/issues/1123).
 
 ---
 

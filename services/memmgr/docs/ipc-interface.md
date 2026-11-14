@@ -240,7 +240,7 @@ on memmgr's endpoint that procmgr will install in the new process's
 | data[0] | Caller's `MEMMGR_LABELS_VERSION` |
 | data[1] | Flags: bit 0 `REGISTER_PHYS_CLASS` registers the process phys-class; bit 1 `REGISTER_RESERVE` makes its budget node a reserve node; bit 2 `REGISTER_MAX` gives the node the max in `data[3]`; other bits reserved, zero |
 | data[2] | Memmgr-side badge of the process whose budget node is the new node's parent, or 0 for a top-level node |
-| data[3] | With `REGISTER_MAX`: the node's max in pages; ignored otherwise |
+| data[3] | With `REGISTER_MAX`: the node's max in pages, `u64::MAX` for none; ignored otherwise |
 
 The budget node ([`memory-pool.md`](memory-pool.md) § Distribution policy)
 is created under the node of the process `data[2]` names. memmgr clamps a
@@ -612,8 +612,13 @@ the page that no earlier run backs — one zeroed Memory cap mapped across up to
 already backed (another thread's fault on the same chunk, delivered before the
 mapping) is resumed without backing. When no free run covers that part, the
 largest free run backs the pages around the faulting one, so the fault is
-declined for want of RAM only when no page is free
-([`memory-pool.md`](memory-pool.md#demand-faults) § Demand faults). Backing a
+declined for want of RAM only when no page it may take is free
+([`memory-pool.md`](memory-pool.md#demand-faults) § Demand faults). For a
+process whose budget node is outside the system reserve, the reserve's pages
+are not among them: the fault is declined with code 7 when no free page lies
+above the reserve, and with code 9 when the reserve refuses the page-table
+funding its map needs
+([`memory-pool.md`](memory-pool.md#distribution-policy) § Distribution policy). Backing a
 chunk rather than a single page keeps cap-slot consumption to one cap per chunk
 on an unfragmented pool, so a deep demand stack cannot exhaust memmgr's CSpace;
 stacks grow contiguously, so a chunk's pages are consumed as the stack

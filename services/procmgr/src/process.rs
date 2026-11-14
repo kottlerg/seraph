@@ -556,11 +556,14 @@ pub struct CreateResult
     /// The child's process badge (its table key), so a create whose reply
     /// cannot be delivered can destroy the child.
     pub badge: u64,
+    /// The max in pages the child's memmgr budget node took after memmgr's
+    /// clamp, `u64::MAX` for none: the create reply's `data[0]`.
+    pub memory_max: u64,
 }
 
-/// Resolved scheduling placement for a child, produced by
-/// `crate::resolve_create_sched` from the create-label fields and the
-/// creator's ceiling. Invariant: `1 <= priority <= band_max <=`
+/// Resolved placement for a child, produced by `crate::resolve_create_sched`
+/// from the create-label fields and the creator: its scheduling and its
+/// memmgr registration. Invariant: `1 <= priority <= band_max <=`
 /// [`ipc::sched_policy::BASELINE_PRIORITY_MAX`].
 #[derive(Clone, Copy)]
 pub struct ChildSched
@@ -570,9 +573,37 @@ pub struct ChildSched
     /// Upper bound of the baseline `SchedControl` band minted into the
     /// child (`[1, band_max]`).
     pub band_max: u8,
-    /// The `memmgr_labels::REGISTER_PROCESS` flags the child registers with
-    /// (`process_table::child_memmgr_flags`): its physical-address class.
-    pub memmgr_flags: u64,
+    /// How the child registers with memmgr (`process_table::child_budget`):
+    /// its physical-address class, its budget node's parent, reserve
+    /// membership, and max.
+    pub budget: process_table::ChildBudget,
+}
+
+/// What memmgr's `REGISTER_PROCESS` reply gave procmgr for a child
+/// (`crate::register_with_memmgr`): the child-billed SEND cap, the child's
+/// memmgr badge, and the max its budget node took. A failed registration is
+/// [`MemmgrRegistration::NONE`].
+#[derive(Clone, Copy)]
+pub struct MemmgrRegistration
+{
+    /// Slot in procmgr's `CSpace` of the badged SEND memmgr minted for the
+    /// child; `0` when the registration failed.
+    pub cap: u64,
+    /// The child's memmgr badge, sent back in `PROCESS_DIED`.
+    pub badge: u64,
+    /// The max in pages the child's node took after memmgr's clamp
+    /// (`data[1]` of the reply), `u64::MAX` for none.
+    pub max: u64,
+}
+
+impl MemmgrRegistration
+{
+    /// No registration: memmgr is unwired, or refused or failed the call.
+    pub const NONE: Self = Self {
+        cap: 0,
+        badge: 0,
+        max: u64::MAX,
+    };
 }
 
 // ── Child setup helpers ─────────────────────────────────────────────────────
@@ -618,6 +649,10 @@ pub struct UniversalCaps
     /// `memmgr_labels::PROCESS_DIED` at child teardown so memmgr can
     /// reclaim the right ledger entry. Zero when memmgr is not wired.
     pub memmgr_badge: u64,
+    /// The max in pages the child's memmgr budget node took
+    /// (`MemmgrRegistration::max`), `u64::MAX` for none; relayed in the
+    /// create reply.
+    pub memmgr_max: u64,
     /// Un-badged SEND cap on svcmgr's service endpoint, sourced from
     /// the slot procmgr received during init bootstrap. Used as the
     /// `cap_derive_badge` source for minting a per-child badged SEND
@@ -2109,13 +2144,12 @@ fn finalize_creation(
     tables: &Tables,
     self_endpoint: u64,
     deaths: &Mutex<DeathSet>,
-    memmgr_send_cap: u64,
-    memmgr_badge: u64,
+    memmgr: MemmgrRegistration,
     process_badge: u64,
     paging: Paging,
     self_memmgr_ep: u64,
     parent_relay_cap: u64,
-    band_max: u8,
+    sched: ChildSched,
     image: ImageSpan,
     ipc_buf: *mut u64,
     layout: &ProcessLayout,
@@ -2124,6 +2158,11 @@ fn finalize_creation(
 {
     let badge = process_badge;
     let pi_memory_cap = info_caps.pi_memory.cap();
+    let MemmgrRegistration {
+        cap: memmgr_send_cap,
+        badge: memmgr_badge,
+        max: memory_max,
+    } = memmgr;
 
     // Bind a death observer from procmgr's death queues on the child's main
     // thread. Correlator = the table badge; on death, dispatch_death recovers
@@ -2207,7 +2246,8 @@ fn finalize_creation(
         memmgr_badge,
         namespace_override: 0,
         cwd_override: 0,
-        band_max,
+        band_max: sched.band_max,
+        reserve: sched.budget.reserve,
         entry_point,
         tls_base_va: main_tls.base_va,
         stack_top_vaddr: layout.stack_top,
@@ -2256,6 +2296,7 @@ fn finalize_creation(
         process_handle,
         thread_for_caller,
         badge,
+        memory_max,
     })
 }
 
@@ -3038,13 +3079,16 @@ fn create_process_from_bytes(
         tables,
         self_endpoint,
         deaths,
-        child_memmgr_send,
-        universals.memmgr_badge,
+        MemmgrRegistration {
+            cap: child_memmgr_send,
+            badge: universals.memmgr_badge,
+            max: universals.memmgr_max,
+        },
         process_badge,
         universals.paging,
         universals.self_memmgr_ep,
         parent_relay_cap,
-        sched.band_max,
+        sched,
         image,
         ipc_buf,
         &layout,
@@ -3295,20 +3339,22 @@ pub(crate) struct MemmgrSendGuard
 {
     cap: u64,
     badge: u64,
+    max: u64,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
 }
 
 impl MemmgrSendGuard
 {
-    /// Guard the `(cap, badge)` pair `register_with_memmgr` returned;
-    /// `memmgr_ep` is procmgr's own memmgr endpoint, the one `PROCESS_DIED`
-    /// is accepted on.
-    pub(crate) fn new(cap: u64, badge: u64, memmgr_ep: u64, ipc_buf: *mut u64) -> Self
+    /// Guard the registration `register_with_memmgr` returned; `memmgr_ep`
+    /// is procmgr's own memmgr endpoint, the one `PROCESS_DIED` is accepted
+    /// on.
+    pub(crate) fn new(registration: MemmgrRegistration, memmgr_ep: u64, ipc_buf: *mut u64) -> Self
     {
         Self {
-            cap,
-            badge,
+            cap: registration.cap,
+            badge: registration.badge,
+            max: registration.max,
             memmgr_ep,
             ipc_buf,
         }
@@ -3322,6 +3368,22 @@ impl MemmgrSendGuard
     pub(crate) fn badge(&self) -> u64
     {
         self.badge
+    }
+
+    /// The max the child's budget node took, `u64::MAX` for none.
+    pub(crate) fn max(&self) -> u64
+    {
+        self.max
+    }
+
+    /// The guarded registration, still owned by the guard.
+    pub(crate) fn registration(&self) -> MemmgrRegistration
+    {
+        MemmgrRegistration {
+            cap: self.cap,
+            badge: self.badge,
+            max: self.max,
+        }
     }
 
     pub(crate) fn disarm(mut self) -> (u64, u64)
@@ -3753,9 +3815,8 @@ pub fn create_process_from_file(
     // front; the header scratch memory cap, the per-segment memory caps, and all
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
-    let (mms_cap, mms_badge) =
-        crate::register_with_memmgr(ctx.memmgr_ep, sched.memmgr_flags, ipc_buf);
-    let mms = MemmgrSendGuard::new(mms_cap, mms_badge, ctx.memmgr_ep, ipc_buf);
+    let registration = crate::register_with_memmgr(ctx.memmgr_ep, &sched.budget, ipc_buf);
+    let mms = MemmgrSendGuard::new(registration, ctx.memmgr_ep, ipc_buf);
     if mms.cap() == 0
     {
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -4107,6 +4168,7 @@ pub fn create_process_from_file(
         log_send_source: ctx.log_ep,
         memmgr_endpoint: mms.cap(),
         memmgr_badge: mms.badge(),
+        memmgr_max: mms.max(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
         paging,
@@ -4170,13 +4232,12 @@ pub fn create_process_from_file(
         tables,
         self_endpoint,
         deaths,
-        mms.cap(),
-        mms.badge(),
+        mms.registration(),
         process_badge,
         universals.paging,
         universals.self_memmgr_ep,
         parent_relay_cap,
-        sched.band_max,
+        sched,
         image,
         ipc_buf,
         &layout,

@@ -1904,8 +1904,10 @@ fn select_fault_run(l: &mut MemLedger, rec: NodeIdx, span_pages: u32)
 /// fault on a page an earlier run backed is resumed without backing. When no
 /// free run covers that part, the largest free run backs the pages around the
 /// faulting one ([`fault_window`]), and the process's budget node bounds the
-/// span backed ([`select_fault_run`]), so a fault fails only when no page the
-/// process may take is free
+/// span backed ([`select_fault_run`], [`back_span`]), so a fault fails for
+/// want of memory only when the process may take not even the faulting page,
+/// or, when the map needs page-table funding, not the faulting page and the
+/// least donation beside it
 /// (services/memmgr/docs/memory-pool.md § Demand faults). Backing a chunk
 /// rather than a single page bounds cap-slot consumption (one cap per chunk on
 /// an unfragmented pool). The page tables the map needs come from the client

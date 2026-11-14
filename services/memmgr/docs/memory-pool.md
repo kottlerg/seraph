@@ -241,22 +241,23 @@ faulting page and no page of a run memmgr mapped before, which it reads from the
 the region's chunk table ([Chunk table](#chunk-table)). On a pool with a free run that covers the
 span, that is the whole chunk on its first fault, backed by one run.
 
-The span is a fault-around preference, and the process's budget node bounds it. memmgr first
-admits as much of the span as the node takes ([Distribution policy](#distribution-policy)): the
-span, clamped to what the max of the node and of every ancestor leaves, and, for a node outside the
-system reserve, to the free pages above the reserve. A fault is declined with code 10 only when the
-max admits not even the faulting page, and with code 7 when the reserve does not; a run whose map
-needs page-table funding the budget refuses is shortened first ([Client page-table
-funding](#client-page-table-funding)). It then selects
-a run covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the deferred
-recheck before it fails (see [Reclamation](#reclamation)). When no free run covers them, it takes
-the largest free run whole, which needs no split, and maps it over the part of the span around the
-faulting page: from the faulting page up, moved down only as far as needed to stay inside the
-span. A later fault on a page of the span the run did not cover is backed the same way, so the
-chunk fills in parts, each part one run and one frame record. A fault is therefore declined for
-want of RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only
-when the free pool holds no page, when every free page is in the system reserve and the process's
-node is outside it, or when the split of a run larger than the pages to back fails.
+The span is a fault-around preference, and the process's budget node bounds it. memmgr first admits
+as much of the span as the node takes ([Distribution policy](#distribution-policy)): the span,
+clamped to what the max of the node and of every ancestor leaves, and, for a node outside the system
+reserve, to the free pages above the reserve. A fault is declined with code 7 when the reserve
+admits not even the faulting page. It is declined with code 10 only when the max admits not even the
+faulting page, or, when the map needs page-table funding, not the faulting page and the least
+donation beside it, and with code 9 when the reserve refuses that donation. A longer run whose
+funding is refused is shortened first ([Client page-table funding](#client-page-table-funding)). It
+then selects a run covering the admitted pages, as a `REQUIRE_CONTIGUOUS` request would, with the
+deferred recheck before it fails (see [Reclamation](#reclamation)). When no free run covers them, it
+takes the largest free run whole, which needs no split, and maps it over the part of the span around
+the faulting page: from the faulting page up, moved down only as far as needed to stay inside the
+span. A later fault on a page of the span the run did not cover is backed the same way, so the chunk
+fills in parts, each part one run and one frame record. A fault is therefore declined for want of
+RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the
+free pool holds no page, when every free page is in the system reserve and the process's node is
+outside it, or when the split of a run larger than the pages to back fails.
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to

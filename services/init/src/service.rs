@@ -1919,8 +1919,10 @@ fn finish_init_reap_handoff(
         // Every create that lent it has returned, and procmgr deleted its
         // copy before replying. A create refused with `ARGV_ENV_STILL_MAPPED`
         // may have left it mapped read-only in procmgr's copy window, which
-        // procmgr never reads again; the page is donated all the same, since
-        // held back it would free into the sealed buddy at the reap.
+        // procmgr never reads again. init withholds the page for its own
+        // lifetime, as that reply asks, and it returns to memmgr's pool at
+        // init's end, as a std sender's withheld run does at its death; held
+        // back past the reap it would free into the sealed buddy.
         if let Some(page) = env_page
         {
             push(page);

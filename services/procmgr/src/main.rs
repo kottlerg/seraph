@@ -298,9 +298,13 @@ pub(crate) const ASPACE_RETYPE_PAGES: u64 = 48;
 /// 0 is the wrapper, the 6 slot pages give 6 × 56 − 1 = 335 usable slots.
 pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 
-/// Register a new child with memmgr. On success returns
-/// `(memmgr_send_cap_slot, memmgr_badge)`. On any failure (memmgr
-/// unwired, IPC error, OOM) returns `(0, 0)`.
+/// Register a new child with memmgr as `budget` says
+/// (`memmgr_labels::REGISTER_PROCESS`: its class and reserve membership in
+/// the flags, its budget node's parent in `data[2]`, and its max in
+/// `data[3]` with `REGISTER_MAX`). On success returns the registration: the
+/// SEND cap slot, the child's memmgr badge, and the max the node took after
+/// memmgr's clamp. On any failure (memmgr unwired, IPC error, a refused
+/// parent, OOM) returns [`process::MemmgrRegistration::NONE`].
 ///
 /// The cap slot lands in procmgr's `CSpace`; procmgr both:
 ///  * uses it for every per-child memory-cap allocation (so memmgr accounts
@@ -308,39 +312,47 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 ///  * copies it into the child's `ProcessInfo.memmgr_endpoint_cap` so the
 ///    child's std heap-bootstrap can call `REQUEST_MEMORY_CAPS` on it.
 ///
-/// `flags` are the `REGISTER_PROCESS` flags (`ChildSched::memmgr_flags`).
 /// The badge is opaque to procmgr, apart from the phys-class bit
-/// `process_table::child_memmgr_flags` reads, and is sent back in the
+/// `process_table::Creator::phys_class` reads. It is sent back in the
 /// `PROCESS_DIED` payload at child teardown so memmgr can reclaim the
-/// right record.
+/// right record, and as the parent of the child's own children's nodes.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "procmgr is a binary, not a library, and every caller passes its thread's registered \
               IPC buffer page as `ipc_buf`"
 )]
-pub fn register_with_memmgr(memmgr_ep: u64, flags: u64, ipc_buf: *mut u64) -> (u64, u64)
+pub fn register_with_memmgr(
+    memmgr_ep: u64,
+    budget: &process_table::ChildBudget,
+    ipc_buf: *mut u64,
+) -> process::MemmgrRegistration
 {
     if memmgr_ep == 0
     {
-        return (0, 0);
+        return process::MemmgrRegistration::NONE;
     }
     let msg = IpcMessage::builder(memmgr_labels::REGISTER_PROCESS)
         .word(0, u64::from(ipc::MEMMGR_LABELS_VERSION))
-        .word(1, flags)
+        .word(1, budget.register_flags())
+        .word(2, budget.parent)
+        .word(3, budget.max.unwrap_or(0))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
     else
     {
-        return (0, 0);
+        return process::MemmgrRegistration::NONE;
     };
     if reply.label != memmgr_errors::SUCCESS
     {
-        return (0, 0);
+        std::os::seraph::log!(warn: "memmgr refused the child's registration ({})", reply.label);
+        return process::MemmgrRegistration::NONE;
     }
-    let cap = reply.caps().first().copied().unwrap_or(0);
-    let badge = reply.word(0);
-    (cap, badge)
+    process::MemmgrRegistration {
+        cap: reply.caps().first().copied().unwrap_or(0),
+        badge: reply.word(0),
+        max: reply.word(1),
+    }
 }
 
 /// Allocate exactly one page from memmgr. Returns the cap slot of the
@@ -1456,7 +1468,8 @@ fn handle_configure_namespace(
 }
 
 /// The checks a create request passes before procmgr acquires anything for
-/// the child: its scheduling fields ([`resolve_create_sched`]) and, when the
+/// the child: its creator, scheduling fields, memory max and class
+/// ([`resolve_create_sched`]) and, when the
 /// label sets `CREATE_ARGV_ENV`, the header of its argv and env, which starts
 /// at data word `first_word`, against the `argv_env_cap` that holds them
 /// (`process::check_argv_env`). Returns the resolved placement and the
@@ -1469,7 +1482,7 @@ fn check_create_request(
     table: &process::ProcessTable,
 ) -> Option<(process::ChildSched, Option<process::ArgvEnvRequest>)>
 {
-    let sched = resolve_create_sched(req.label, req.badge, table)?;
+    let sched = resolve_create_sched(req, first_word, table)?;
     if req.label & procmgr_labels::CREATE_ARGV_ENV == 0
     {
         return Some((sched, None));
@@ -1485,54 +1498,67 @@ fn check_create_request(
     }
 }
 
-/// Resolve the scheduling fields and the physical-address class of a create
-/// label against the caller's spawn ceiling and class. `None` means the
-/// request must be rejected with `INVALID_ARGUMENT`: still-reserved label bits
-/// are set, the requested band exceeds the creator's, the requested priority
-/// falls outside the resolved band, or `CREATE_PHYS_ACCESS` comes from a
-/// creator that is not phys-class (`process_table::child_memmgr_flags`).
+/// Resolve a create request against its creator: the scheduling fields
+/// against the creator's spawn ceiling, and the child's memmgr registration
+/// (its budget node's parent, its max, reserve membership and class) against
+/// the creator's node and class. The request's data words after the fixed
+/// ones start at `first_word`. `None` means the request must be rejected with
+/// `INVALID_ARGUMENT`: still-reserved label bits are set, the badge names no
+/// creator (`process_table::ProcessTable::creator_of`), the requested band
+/// exceeds the creator's, the requested priority falls outside the resolved
+/// band, `CREATE_MEMORY_MAX` comes without its word, or `CREATE_PHYS_ACCESS`
+/// or `CREATE_RESERVE` comes from a creator that may not ask for it
+/// (`process_table::child_budget`).
 ///
-/// Creator ceiling: badge `0` is init (the unbadged service-endpoint
-/// holder) with the full baseline ceiling. A nonzero badge is a
-/// procmgr-spawned process whose ceiling is its own minted band; a badge
-/// procmgr never minted (e.g. the `DEATH_EQ_AUTHORITY` verb badge) falls
-/// back to a conservative default ceiling.
+/// Creator: badge `0` is init (the unbadged service-endpoint holder), or
+/// svcmgr's un-badged mint source, with the full baseline ceiling, and its
+/// children are top-level reserve nodes. A nonzero badge is a live
+/// procmgr-spawned process, whose ceiling is its own minted band and under
+/// whose node the child's sits. Any other badge (a reaped process's own cap or
+/// handle, a verb-badged cap, a release token) is refused: its child would
+/// escape every memory max.
 fn resolve_create_sched(
-    label: u64,
-    badge: u64,
+    req: &IpcMessage,
+    first_word: usize,
     table: &process::ProcessTable,
 ) -> Option<process::ChildSched>
 {
+    let label = req.label;
     if label & procmgr_labels::CREATE_RESERVED_MASK != 0
     {
         return None;
     }
+    let Some(creator) = table.creator_of(req.badge)
+    else
+    {
+        std::os::seraph::log!(warn: "create from a badge that names no live process refused");
+        return None;
+    };
     let requested_priority = ((label >> procmgr_labels::CREATE_PRIORITY_SHIFT)
         & procmgr_labels::CREATE_SCHED_FIELD_MASK) as u8;
     let requested_band = ((label >> procmgr_labels::CREATE_BAND_MAX_SHIFT)
         & procmgr_labels::CREATE_SCHED_FIELD_MASK) as u8;
-    let creator_band_max = if badge == 0
-    {
-        ipc::sched_policy::BASELINE_PRIORITY_MAX
-    }
-    else
-    {
-        table
-            .band_max_by_badge(badge)
-            .unwrap_or(ipc::sched_policy::DEFAULT_SPAWN_PRIORITY)
-    };
     let (priority, band_max) = process::resolve_spawn_sched(
         requested_priority,
         requested_band,
-        creator_band_max,
+        creator.band_max,
         ipc::sched_policy::DEFAULT_SPAWN_PRIORITY,
     )?;
-    let memmgr_flags =
-        process_table::child_memmgr_flags(label, badge, table.memmgr_badge_by_badge(badge))?;
+    let budget = process_table::decode_memory_max(req, first_word)
+        .and_then(|max| process_table::child_budget(label, max, &creator));
+    let budget = match budget
+    {
+        Ok(budget) => budget,
+        Err(refusal) =>
+        {
+            std::os::seraph::log!(warn: "create budget refused: {refusal:?}");
+            return None;
+        }
+    };
     Some(process::ChildSched {
         priority,
         band_max,
-        memmgr_flags,
+        budget,
     })
 }
 
@@ -1647,7 +1673,8 @@ fn arm_and_reply_create(
 /// when the reply cannot deliver it.
 ///
 /// Reply caps: `[process_handle, thread, release_token?]`, the token only for a
-/// `CREATE_DMA_HOLD` child. The reply's cap transfer is all-or-nothing: when
+/// `CREATE_DMA_HOLD` child; `data[0]` is the max the child's memmgr budget
+/// node took, `u64::MAX` for none. The reply's cap transfer is all-or-nothing: when
 /// the caller's `CSpace` cannot take every cap (or the caller is gone), the
 /// caller resumes with `IPC_REPLY_TRANSFER_FAILED` and no caps, and every cap
 /// stays in procmgr's `CSpace`. No one then holds the handle that could start
@@ -1662,6 +1689,7 @@ fn reply_create_result(
 )
 {
     let mut msg = IpcMessage::builder(procmgr_errors::SUCCESS)
+        .word(0, result.memory_max)
         .cap(result.process_handle)
         .cap(result.thread_for_caller);
     if let Some(token) = release_token
@@ -1701,10 +1729,13 @@ fn reply_create_result(
 ///   bit  28       = `CREATE_DMA_HOLD` (hold the reclaim for `RELEASE_HOLD`)
 ///   bit  29       = `CREATE_ARGV_ENV` (argv and env in a Memory cap)
 ///   bit  30       = `CREATE_PHYS_ACCESS` (a phys-class child)
-///   bits [31..64] = reserved (must be zero)
+///   bit  31       = `CREATE_MEMORY_MAX` (a memory max follows in a data word)
+///   bit  32       = `CREATE_RESERVE` (a system-reserve child)
+///   bits [33..64] = reserved (must be zero)
 ///
 /// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
-/// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`.
+/// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`;
+/// then the memory max in pages, only with `CREATE_MEMORY_MAX`.
 ///
 /// Expects `caps = [module_memory, creator_endpoint?, argv_env?, relay?]`,
 /// `argv_env` only with `CREATE_ARGV_ENV` and `relay` only with
@@ -1765,9 +1796,8 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     // returns every page already billed to the child) and drops the slot,
     // except after an argv/env copy window that would not unmap, whose
     // record `settle_failed_argv_env` withholds.
-    let (memmgr_send, memmgr_badge) =
-        register_with_memmgr(ctx.memmgr_ep, sched.memmgr_flags, ipc_buf);
-    let mms = process::MemmgrSendGuard::new(memmgr_send, memmgr_badge, ctx.memmgr_ep, ipc_buf);
+    let registration = register_with_memmgr(ctx.memmgr_ep, &sched.budget, ipc_buf);
+    let mms = process::MemmgrSendGuard::new(registration, ctx.memmgr_ep, ipc_buf);
 
     // The child's checked copy of the argv and env, on its account. The
     // caller's cap is no longer needed once it is taken (or refused), so it
@@ -1795,6 +1825,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         log_send_source: ctx.log_ep,
         memmgr_endpoint: mms.cap(),
         memmgr_badge: mms.badge(),
+        memmgr_max: mms.max(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
         paging: process::Paging::of_label(label),
@@ -1847,18 +1878,23 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         let _ = syscall::cap_delete(creator_ep);
     }
 
-    if let Ok(result) = result
+    match result
     {
-        log_spawn_sched(sched);
-        arm_and_reply_create(label, &result, ipc_buf, ctx);
-    }
-    else
-    {
-        // § Label 1 names `OUT_OF_MEMORY` for every creation failure past the
-        // request's own checks, whatever the cause `create_process` reports.
-        // `finalize_creation` consumes the relay only on success.
-        release_caps(&[caps.relay]);
-        reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        Ok(result) =>
+        {
+            log_spawn_sched(sched);
+            arm_and_reply_create(label, &result, ipc_buf, ctx);
+        }
+        Err(cause) =>
+        {
+            // § Label 1 names `OUT_OF_MEMORY` for every creation failure past
+            // the request's own checks, whatever the cause `create_process`
+            // reports, so the cause is logged here, where it is still known.
+            // `finalize_creation` consumes the relay only on success.
+            std::os::seraph::log!(warn: "create from a module failed (procmgr_errors {cause})");
+            release_caps(&[caps.relay]);
+            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
+        }
     }
 }
 

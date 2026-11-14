@@ -214,6 +214,7 @@ mod tests
             namespace_override: 0,
             cwd_override: 0,
             band_max: 0,
+            reserve: false,
             entry_point: 0,
             tls_base_va: 0,
             stack_top_vaddr: 0,

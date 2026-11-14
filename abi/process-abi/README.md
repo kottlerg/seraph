@@ -264,8 +264,7 @@ Targets). The pool's
 available RAM is the remaining gate on the resulting `REQUEST_MEMORY_CAPS` calls, with the memory
 max of the process's budget node where its creator set one; no default per-process ceiling exists
 ([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Distribution
-policy; a creator cannot set the max yet, since procmgr passes none,
-[#260](https://github.com/kottlerg/seraph/issues/260)).
+policy).
 `PROCESS_MAIN_TLS_MAX_PAGES` (2^18 pages) bounds the main-thread TLS block the same way: loaders
 map the pages the binary's `PT_TLS` memsz needs (`tls_block_layout`) and refuse a larger block.
 

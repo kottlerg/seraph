@@ -296,3 +296,36 @@ mod imp
 
 #[cfg(not(test))]
 pub use imp::{fill_bytes, init, init_ap, init_storage, is_seeded, next_u32};
+
+/// Overwrite `bytes` with zeros through volatile stores, which the compiler
+/// may not remove as dead, then fence the compiler. Clears secret material
+/// from the kernel stack after its last use: a reseed's seed (`cpurng`) and
+/// the stack copy of an `SYS_ENTROPY_CONTRIBUTE` contribution
+/// (`syscall::entropy`), where a plain store before the buffer goes out of
+/// scope is a dead store the optimiser may drop.
+pub fn wipe(bytes: &mut [u8])
+{
+    for b in bytes.iter_mut()
+    {
+        // SAFETY: `b` is a valid, aligned, exclusively borrowed `u8`.
+        unsafe { core::ptr::write_volatile(b, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::wipe;
+
+    // Defect guarded: a wipe that misses a byte, leaving secret bytes on the
+    // kernel stack. Whether the optimiser keeps the stores is a property of
+    // the emitted code, which no host test observes.
+    #[test]
+    fn wipe_zeroes_every_byte()
+    {
+        let mut bytes = [0xA5u8; 256];
+        wipe(&mut bytes);
+        assert!(bytes.iter().all(|&b| b == 0));
+    }
+}

@@ -77,7 +77,7 @@ impl CpuRng
         let mut seed = [0u8; RESEED_BYTES];
         pool::draw_seed(&mut seed);
         self.prng.absorb(&seed);
-        seed.fill(0);
+        super::wipe(&mut seed);
         self.finish_reseed(guid, now_us);
     }
 
@@ -96,7 +96,7 @@ impl CpuRng
             return false;
         }
         self.prng.absorb(&seed);
-        seed.fill(0);
+        super::wipe(&mut seed);
         self.finish_reseed(guid, now_us);
         true
     }

@@ -125,11 +125,11 @@ heap's high-water mark with a single multi-page `mem_map` per returned cap;
 a grow covers the whole request, and an allocation grows again while each
 grow maps pages. The heap floor is installed by `std::os::seraph::_start`
 before `fn main()` runs: a demand region registered with memmgr in a
-demand-paged process, whose pages the pager backs on their first touch
-(`Thread::new` touches a spawned thread's IPC buffer, a heap page, before the
-thread registers it, since the kernel's IPC-buffer copies need it backed), and
-an eager mapping otherwise. On OOM, the platform `alloc` returns null and the `alloc` crate
-aborts through `handle_alloc_error`; nothing unwinds. See
+demand-paged process, whose pages the pager backs on their first touch, and
+an eager mapping otherwise. A spawned thread's IPC buffer is not a heap page
+([§ Spawned-thread IPC buffers](#spawned-thread-ipc-buffers)). On OOM, the
+platform `alloc` returns null and the `alloc` crate aborts through
+`handle_alloc_error`; nothing unwinds. See
 [§ Byte Heap](../../docs/userspace-memory-model.md#byte-heap).
 
 One spin mutex (`SpinMutex`, `src/sys/alloc/seraph.rs`) guards the byte heap.
@@ -186,10 +186,10 @@ map fails with `OutOfMemory` tops the pool up for the span and maps again, up to
 chunk
 ([Client page-table funding](../../services/memmgr/docs/memory-pool.md#client-page-table-funding)).
 Every other error is returned at once. Every map std makes into its own address
-space (the heap's grow, an eager thread stack, a pipe's ring page, the `File`
-read and write frames, the spawner's argv/env window) goes through the same
-helper, and a service or driver maps into its own address space through these
-two functions. A map that fails part-way
+space (the heap's grow, an eager thread stack, a spawned thread's IPC buffer, a
+pipe's ring page, the `File` read and write frames, the spawner's argv/env
+window) goes through the same helper, and a service or driver maps into its own
+address space through these two functions. A map that fails part-way
 leaves the pages before the failing one mapped, and the next map maps them
 again; a caller that gives up on the span unmaps it before releasing its
 reservation. The policy is the host-tested `ruststd-pool-funding` crate; the
@@ -275,6 +275,21 @@ one's observer nodes (the `ruststd-death-queues` crate), and each queue with one
 nodes. Every queue is drained before each bind, in the same lock hold, so a queue's pending posts
 never exceed its nodes plus the one thread bound in that same hold, which is its entries, and no
 death post is dropped.
+
+#### Spawned-thread IPC buffers
+
+Each spawned thread's IPC buffer is a page of its own that `sys/thread` maps at spawn, in any
+process: a one-page page reservation with no guard, mapped read-write through `mem_map_funded`
+(§ Page reservations) from a one-page contiguous memmgr grant, the same mapping an eager stack
+makes. It is never a heap page and never a pager page: the kernel's IPC-buffer copies are not
+restartable, so a fault on the page fails the IPC instead of reaching the pager
+([docs/fault-handling.md § Kernel Copies](../../docs/fault-handling.md#kernel-copies)), and a
+page the process maps from its own grant stays mapped until the process unmaps it. The thread
+registers the page with `SYS_IPC_BUFFER_SET` on entry. If the reservation, the grant, or the map
+fails, the spawn releases what it took and fails with the error. The thread's reclaim, at join or
+by the reaper as for its stack, unmaps the page, releases its reservation, deletes the grant's
+cap, and returns the grant's run to memmgr's pool, keeping all of them for the process's lifetime
+when the unmap fails. The grant's cap occupies one `CSpace` slot while the thread lives.
 
 ### CSpace slot headroom
 

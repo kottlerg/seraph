@@ -3,13 +3,15 @@
 
 // core/ktest/src/unit/crypto.rs
 
-//! Tier 1 tests for the shared `crypto` crate (SHA-512, Ed25519 verify).
+//! Tier 1 tests for the shared `crypto` crate (SHA-512, Ed25519 verify,
+//! ChaCha20-Poly1305).
 //!
 //! These run the crate's own known-answer vectors on the live target so the
 //! primitives are validated under QEMU on both `x86_64` and `riscv64`, not only
 //! by the host-side `cargo xtask test` run. The vector tables and assertions
-//! live in `shared/crypto` (`run_sha512_kats` / `run_ed25519_kats`); this
-//! module is a thin on-target entry point so host and on-target runs exercise identical logic.
+//! live in `shared/crypto` (`run_sha512_kats`, `run_ed25519_kats`,
+//! `run_chacha20_poly1305_kats`); this module is a thin on-target entry point
+//! so host and on-target runs exercise identical logic.
 
 use crate::{TestContext, TestResult};
 
@@ -26,4 +28,13 @@ pub fn sha512_kats(_ctx: &TestContext) -> TestResult
 pub fn ed25519_kats(_ctx: &TestContext) -> TestResult
 {
     crypto::run_ed25519_kats()
+}
+
+/// ChaCha20-Poly1305 known-answer tests: every RFC 8439 vector of the block
+/// function, the cipher, Poly1305, the Poly1305 key derivation and the AEAD,
+/// plus tamper negatives (a flipped bit of the tag, ciphertext, nonce or AAD,
+/// and another key, each refused with the buffer unchanged).
+pub fn chacha20_poly1305_kats(_ctx: &TestContext) -> TestResult
+{
+    crypto::run_chacha20_poly1305_kats()
 }

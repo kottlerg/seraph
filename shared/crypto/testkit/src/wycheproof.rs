@@ -49,6 +49,14 @@ pub const ED25519: Source = Source {
     json: include_str!("../vectors/wycheproof/ed25519_test.json"),
 };
 
+/// `chacha20_poly1305_test.json`: ChaCha20-Poly1305 authenticated encryption
+/// (`AeadTest`).
+pub const CHACHA20_POLY1305: Source = Source {
+    file: "chacha20_poly1305_test.json",
+    schema: "aead_test_schema_v1.json",
+    json: include_str!("../vectors/wycheproof/chacha20_poly1305_test.json"),
+};
+
 /// A case's expected result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -356,6 +364,100 @@ pub mod eddsa
         pub fn has_flag(&self, flag: &str) -> bool
         {
             self.flags().iter().any(|f| f == flag)
+        }
+    }
+}
+
+/// The `AeadTest` schema (`aead_test_schema_v1.json`): the key, nonce (`iv`),
+/// AAD, plaintext (`msg`), ciphertext and tag per case. A `valid` case is a
+/// correct encryption; an `invalid` one carries a modified tag or a nonce of
+/// another size than the algorithm's.
+pub mod aead
+{
+    use super::{Deserialize, Expected, hex_field};
+
+    /// An `AeadTest` group.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Group
+    {
+        #[serde(rename = "type")]
+        kind: String,
+        /// The key size of every case, in bits.
+        pub key_size: usize,
+        /// The nonce size of every case, in bits.
+        pub iv_size: usize,
+        /// The tag size of every case, in bits.
+        pub tag_size: usize,
+        /// The group's cases.
+        pub tests: Vec<Case>,
+    }
+
+    /// An `AeadTest` case.
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct Case
+    {
+        tc_id: u64,
+        comment: String,
+        flags: Vec<String>,
+        /// The key.
+        #[serde(deserialize_with = "hex_field")]
+        pub key: Vec<u8>,
+        /// The nonce, of any length: a case may carry one of another size.
+        #[serde(deserialize_with = "hex_field")]
+        pub iv: Vec<u8>,
+        /// The associated data.
+        #[serde(deserialize_with = "hex_field")]
+        pub aad: Vec<u8>,
+        /// The plaintext.
+        #[serde(deserialize_with = "hex_field")]
+        pub msg: Vec<u8>,
+        /// The ciphertext, as long as the plaintext.
+        #[serde(deserialize_with = "hex_field")]
+        pub ct: Vec<u8>,
+        /// The tag.
+        #[serde(deserialize_with = "hex_field")]
+        pub tag: Vec<u8>,
+        result: Expected,
+    }
+
+    impl super::Case for Case
+    {
+        fn id(&self) -> u64
+        {
+            self.tc_id
+        }
+
+        fn expected(&self) -> Expected
+        {
+            self.result
+        }
+
+        fn comment(&self) -> &str
+        {
+            &self.comment
+        }
+
+        fn flags(&self) -> &[String]
+        {
+            &self.flags
+        }
+    }
+
+    impl super::Group for Group
+    {
+        const TYPE: &'static str = "AeadTest";
+        type Case = Case;
+
+        fn group_type(&self) -> &str
+        {
+            &self.kind
+        }
+
+        fn cases(&self) -> &[Case]
+        {
+            &self.tests
         }
     }
 }

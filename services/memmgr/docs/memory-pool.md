@@ -152,9 +152,11 @@ takes back (see [Per-Process Tracking](#per-process-tracking)).
 
 Every page memmgr hands out reads zero: each run of a `REQUEST_MEMORY_CAPS` grant, and each run a
 demand fault maps (see [Demand faults](#demand-faults)). A pooled run can hold what its last owner
-wrote, and what the kernel left in it: a reclaimed frame keeps the bytes of the objects that were
-retyped from it, since the kernel credits a dead object's bytes back to its Memory object without
-clearing them. memmgr does not rely on any path that returns a run to the pool to clear it, so it
+wrote, and what the kernel left in it: the kernel zeroes a dead object's bytes when it frees them,
+but a frame objects were retyped from keeps the retype allocator's free-list links, region offsets
+and page counts
+([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md) § Kernel
+Object Memory). memmgr does not rely on any path that returns a run to the pool to clear it, so it
 clears each run once, at hand-out, after selection and before the run is accounted, derived, or
 mapped into the process.
 

@@ -76,16 +76,19 @@ with `NO_MOUNT` (fatal only for the root self-mount); see
 registers the partition bound with the virtio-blk instance of the disk
 that holds it, spawns a fatfs driver, sends `FS_MOUNT` (see
 [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md))
-to validate the BPB, captures the driver's
-root cap into `VfsdRootBackend`, and replies with a badged SEND on
+to validate the BPB, stores the mount's record (the driver's caps and
+the partition cap; see
+[`namespace-composition.md`](namespace-composition.md#mount-record)
+§ Mount record) in `VfsdRootBackend`, and replies with a badged SEND on
 the new filesystem's namespace endpoint addressing its root. A mount
 on `/` once root is already mounted, on a path that is already a mount
 point, or on a path with a component the namespace protocol cannot name, is
 rejected (`TABLE_FULL`) before any partition is registered or driver
 spawned. A mount that fails after the spawn (the `FS_MOUNT` probe, an
 install a concurrent `MOUNT` beat, or an install that cannot allocate its
-tree nodes) revokes the new driver's service
-endpoint, which stops the driver; the partition bound virtio-blk
+tree nodes) revokes the partition cap vfsd registered and the new
+driver's service endpoint, which stops the driver, and deletes the
+driver's process handle and death queue; the partition bound virtio-blk
 registered for it stays in virtio-blk's table, which has no unregister
 request.
 

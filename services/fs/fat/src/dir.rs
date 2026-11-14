@@ -18,7 +18,7 @@
 //! that have no LFN entry still surface lower-case rather than as
 //! `BOOT    CON`.
 
-use crate::alloc::{FatError, allocate_cluster, free_cluster_chain};
+use crate::alloc::{FatError, claim_cluster, find_free_cluster, free_cluster_chain};
 use crate::bpb::{FatState, FatType, MAX_SECTOR_SIZE, sector_buffer};
 use crate::cache::PageCache;
 use crate::fat::chain_next;
@@ -883,8 +883,9 @@ pub fn directory_is_empty(
 }
 
 /// Populate a freshly-allocated directory cluster with the `.` and
-/// `..` entries. Called by `FS_MKDIR` after [`allocate_cluster`] gives
-/// us a zero-able cluster.
+/// `..` entries, and zero the rest of it. Called by `FS_MKDIR` after
+/// [`crate::alloc::allocate_cluster`] gives it the cluster, which still
+/// holds an earlier owner's bytes.
 pub fn write_dot_entries(
     state: &mut FatState,
     new_dir_cluster: u32,
@@ -898,9 +899,7 @@ pub fn write_dot_entries(
     let mut buf = sector_buffer()?;
     // First sector: "." and ".." entries packed at offsets 0 and 32;
     // remaining slots zeroed (== "end of directory" sentinel for every
-    // following slot). Subsequent sectors of the cluster stay zero;
-    // we rely on allocate_cluster having left them zero, and zero the
-    // first sector here explicitly.
+    // following slot). The cluster's other sectors are zeroed below.
     let dot = pack_83_entry(b".          ", ATTR_DIRECTORY, new_dir_cluster, 0);
     let dotdot_cluster = if parent_cluster == state.root_cluster
     {
@@ -941,17 +940,23 @@ pub fn write_dot_entries(
 /// through the rest of the directory before the directory grows. The
 /// driver zeroes every directory cluster it allocates, as format tools do,
 /// so the slot after a run that crossed the marker still reads as end of
-/// directory. A FAT32 directory whose chain ends with the run still short
-/// is extended by a zeroed cluster linked after its last one, and the run
-/// continues into it; the FAT16 fixed root cannot grow.
+/// directory. A clustered directory (any but the FAT16 fixed root, which
+/// cannot grow) whose chain ends with the run still short is extended by
+/// a free cluster, zeroed while the FAT still holds it free and only then
+/// marked end-of-chain and linked after the last one, so the chain never
+/// reaches a cluster holding an earlier owner's bytes; the run continues
+/// into it. A failed zeroing changes no FAT entry; a failure after it
+/// leaves a zeroed cluster, orphaned or linked
+/// (services/fs/fat/docs/crash-safety.md § Write ordering).
 ///
 /// # Errors
-/// [`FatError::Io`] when a directory or FAT sector cannot be read or a
-/// new cluster cannot be zeroed; [`FatError::NoSpace`] when the FAT16 root
-/// area holds no such run or no free cluster remains to extend a FAT32
-/// directory; [`FatError::Corrupt`] when the directory's first cluster or
-/// a link lies outside the data region, a link is a bad-cluster marker,
-/// or the chain has a cycle; any other error of [`allocate_cluster`].
+/// [`FatError::Io`] when a directory or FAT sector cannot be read, or a
+/// new cluster cannot be zeroed or claimed; [`FatError::NoSpace`] when the
+/// FAT16 root area holds no such run or no free cluster remains to extend
+/// a clustered directory; [`FatError::Corrupt`] when the directory's first
+/// cluster or a link lies outside the data region, a link is a bad-cluster
+/// marker, or the chain has a cycle; any other error of
+/// [`find_free_cluster`] or [`claim_cluster`].
 fn find_free_slot_run(
     state: &mut FatState,
     parent_dir_cluster: u32,
@@ -984,7 +989,7 @@ fn find_free_slot_run(
         return Err(FatError::NoSpace);
     }
 
-    // FAT32 clustered directory walk.
+    // Clustered directory walk.
     let mut cluster = dir_start_cluster(state, parent_dir_cluster)?;
     let mut steps = 0;
     loop
@@ -1012,8 +1017,9 @@ fn find_free_slot_run(
         }
         else
         {
-            let new_cluster = allocate_cluster(state, Some(cluster), cache, block_dev, ipc_buf)?;
+            let new_cluster = find_free_cluster(state, cache, block_dev, ipc_buf)?;
             zero_cluster(state, new_cluster, cache, block_dev, ipc_buf)?;
+            claim_cluster(state, new_cluster, Some(cluster), cache, block_dev, ipc_buf)?;
             new_cluster
         };
     }

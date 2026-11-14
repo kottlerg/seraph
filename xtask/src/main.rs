@@ -29,8 +29,16 @@
 // PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
 // pinned toolchain's sysroot ships for std's backtraces, so they have no Cargo
 // entry (docs/coding-standards.md § Dependencies). Only a build against the
-// prebuilt std reaches them; `cargo xtask test` lints xtask that way.
+// prebuilt std reaches them; `cargo xtask test` lints xtask that way. The std
+// of a `*-windows-msvc` host carries no `object` or `addr2line`, so xtask
+// builds on Windows with the GNU host toolchain (docs/build-system.md
+// § Toolchain).
 #![feature(rustc_private)]
+#[cfg(all(windows, target_env = "msvc"))]
+compile_error!(
+    "xtask needs the toolchain sysroot's `object` and `addr2line`, which a *-windows-msvc host's \
+     std does not carry: build it with the GNU host toolchain (docs/build-system.md § Toolchain)"
+);
 
 extern crate addr2line;
 extern crate object;

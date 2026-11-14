@@ -149,7 +149,8 @@ one as a dependency of any kind. Code the pinned toolchain ships (std and the cr
 and `rust-src` carry) is inside the trust boundary, as it already is for the OS, whose std embeds
 vendored `libc`, `hashbrown` and `rustc_demangle`. A host crate reaches a crate of the sysroot by
 `extern crate` under `#![feature(rustc_private)]`, with no Cargo entry; such a crate builds only
-against the prebuilt `std`, never beside a `std` built from source (`-Zbuild-std`).
+against the prebuilt `std`, never beside a `std` built from source (`-Zbuild-std`), and only on a
+host whose `std` carries that crate ([build-system.md](build-system.md#toolchain) § Toolchain).
 
 ---
 

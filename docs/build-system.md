@@ -23,6 +23,14 @@ components must be installed:
 
 Run `rustup show` in the repository root to confirm the toolchain is active.
 
+xtask reads ELF, PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
+toolchain's sysroot ships for std's backtraces
+([coding-standards.md](coding-standards.md#dependencies) § Dependencies). The std of every host
+carries them except a `*-pc-windows-msvc` host's, which symbolizes its backtraces through the
+platform's debug-help library instead. On Windows xtask therefore needs the GNU host toolchain
+(`rustup set default-host x86_64-pc-windows-gnu` before the pinned toolchain is installed); on a
+`*-windows-msvc` host it fails to compile, naming that toolchain.
+
 `cargo xtask test` runs the host tests a second time built for `riscv64gc-unknown-linux-gnu`,
 under QEMU's user-mode emulator, so it needs a Linux host with three more packages: the emulator
 (`qemu-riscv64`), the riscv64 Linux cross compiler that links the test binaries

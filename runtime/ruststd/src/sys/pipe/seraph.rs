@@ -40,7 +40,7 @@ use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::sys::reserve::{ReservedRange, reserve_pages, unreserve_pages};
-use shmem::{SharedBuffer, SharedRegion, SpscHeader, SpscReader, SpscWriter};
+use shmem::{SpscHeader, SpscReader, SpscWriter};
 use syscall_abi::SyscallError;
 
 /// Ring data byte capacity. One 4 KiB page = 16-byte header + 4080 bytes
@@ -446,17 +446,33 @@ impl Pipe {
         reserved: ReservedRange,
     ) -> io::Result<Pipe> {
         let child_va = reserved.va_start();
-        let regions = [SharedRegion { cap: memory_cap, pages: 1 }];
-        // SAFETY: child_va is the caller's reservation from the per-process
-        // arena (`sys::reserve`): VA no Rust object or IPC page occupies, owned
-        // exclusively by this pipe until its Drop unmaps it and returns it.
-        match unsafe { SharedBuffer::attach(&regions, aspace, child_va) } {
-            // Same forget-the-SharedBuffer trick: Pipe's Drop unmaps.
-            Ok(sb) => core::mem::forget(sb),
-            Err(_) => {
-                unreserve_pages(reserved);
-                return Err(io::Error::other("seraph pipe: SharedBuffer::attach failed"));
-            }
+        // Map the page read-write through a derived mapping cap, funded as
+        // the parent's end maps it; Pipe's Drop unmaps it. A refused map of
+        // one page leaves nothing mapped, so the reservation goes straight
+        // back to the arena.
+        let map_result = syscall::cap_derive(memory_cap, syscall::RIGHTS_MEM_MAP_RW)
+            .and_then(|rw| {
+                // SAFETY: child_va is the caller's reservation from the
+                // per-process arena (`sys::reserve`): VA no Rust object or
+                // IPC page occupies, owned exclusively by this pipe until its
+                // Drop unmaps it and returns it. `aspace` is this process's
+                // own.
+                let r = unsafe {
+                    crate::sys::alloc::seraph::mem_map_funded(
+                        rw,
+                        aspace,
+                        child_va,
+                        0,
+                        1,
+                        syscall::MAP_WRITABLE,
+                    )
+                };
+                let _ = syscall::cap_delete(rw);
+                r
+            });
+        if map_result.is_err() {
+            unreserve_pages(reserved);
+            return Err(io::Error::other("seraph pipe: ring page map failed"));
         }
         Ok(Pipe {
             memory_cap,

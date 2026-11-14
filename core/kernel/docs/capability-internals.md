@@ -151,7 +151,11 @@ loads behind the branch execute with the out-of-bound value, so every bound betw
 user-supplied handle and the object it names is also enforced as data. The syscall handlers hold
 the same line past resolution: a right a handler tests beyond those its lookup requires, and a
 user-supplied value that selects a kernel array entry, a span of frames, a page-table walk, or a
-dispatch table entry, are enforced as data as well (the table below).
+dispatch table entry, are enforced as data as well (the table below). These bounds are the
+kernel's defence of the user-to-kernel boundary against bounds-check bypass on both
+architectures; the posture on the other transient-execution classes and on isolation between
+processes is [docs/capability-model.md](../../../docs/capability-model.md)
+§ Microarchitectural Isolation.
 
 The primitives are `arch::current::speculation::index_mask` and
 `arch::current::speculation::hide`. `index_mask(index, bound)` is all-ones when `index < bound`,

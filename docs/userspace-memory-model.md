@@ -85,7 +85,9 @@ disjoint surfaces:
 | Bootstrap cross-boundary VAs | 4 KiB pages | Process creator (kernel for init, init for memmgr/procmgr, procmgr for everyone else) | `ProcessInfo` page and `InitInfo` region, main-thread stack (with the demand-growth range `std::os::seraph::_start` registers inside its reservation), main-thread IPC buffer, main-thread TLS block |
 
 Each surface is independent of the others; their VA ranges do not
-overlap within a single address space.
+overlap within a single address space. None reaches below
+`USER_VA_FLOOR` (64 KiB, `abi/syscall`), under which the kernel maps no
+page ([Memory Model](memory-model.md) § Userspace Layout).
 
 `std::sys::seraph` is the single chooser of byte-heap and
 page-reservation VAs within the running process. The creator picks
@@ -232,8 +234,8 @@ fail loudly by design. The default boot on both architectures is
 firmware-seeded through `EFI_RNG_PROTOCOL` (OVMF natively on x86_64; the
 firmware's `VirtioRngDxe` with `virtio-rng` on riscv64); a riscv64 boot
 without that device, under the EDK2 firmware the default boot uses, seeds
-from jitter alone
-([#393](https://github.com/kottlerg/seraph/issues/393)); see
+from the Zkr `seed` CSR where the hart implements it and the firmware grants
+it, and otherwise from jitter alone; see
 [`core/kernel/docs/entropy.md`](../core/kernel/docs/entropy.md) for the
 quality caveat.
 
@@ -429,8 +431,11 @@ owns them.
 - **Heap** — the kernel only sees mappings of Memory caps at user-
   supplied VAs.
 - **VA allocation policy** — the kernel enforces page alignment and
-  the user-half bound; it does not track VAs, and allocates none except
-  init's bootstrap layout and image bias, drawn once per boot.
+  the user range `[USER_VA_FLOOR, user_va_top())`: no page below the
+  64 KiB floor is ever mapped, and every mapping syscall refuses a range
+  that starts below it ([Memory Model](memory-model.md) § Userspace
+  Layout). It does not track VAs, and allocates none except init's
+  bootstrap layout and image bias, drawn once per boot.
 - **Memory ownership beyond the derivation tree** — the kernel does
   not know which process "owns" a Memory.
 - **Process death implications for memory** — when a process's

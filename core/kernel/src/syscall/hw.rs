@@ -608,17 +608,16 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::mm::paging::{LeafGrant, PageFlags};
     use crate::syscall::current_tcb;
 
-    // Virtual address must be page-aligned and in user half.
-    let user_va_top = crate::mm::user_va_top();
+    const PAGE_BYTES: u64 = PAGE_SIZE as u64;
+
     let aspace_idx = tf.arg(0);
     let mmio_idx = tf.arg(1);
 
     let virt_base = tf.arg(2);
     let flags = tf.arg(3);
-    if virt_base & 0xFFF != 0 || virt_base >= user_va_top
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
+    // The base is page-aligned and in the user range, above `USER_VA_FLOOR`;
+    // the whole range is checked once the region's size is known.
+    crate::mm::check_user_base(virt_base)?;
 
     // SAFETY: syscall (kernel) context after sched::init; current_tcb() returns this
     // CPU's current thread.
@@ -650,14 +649,10 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
         return Err(SyscallError::InvalidArgument);
     }
 
-    // Guard against virtual range overflow.
-    let virt_end = virt_base
-        .checked_add(mmio_size)
-        .ok_or(SyscallError::InvalidArgument)?;
-    if virt_end > user_va_top
-    {
-        return Err(SyscallError::InvalidAddress);
-    }
+    // The range lies wholly in the user range, checked before the mapping is
+    // recorded, so a refusal changes nothing.
+    let page_count = (mmio_size / PAGE_BYTES) as usize;
+    let virt_end = crate::mm::user_range_end(virt_base, page_count)?;
     // The region's physical end. A device region the kernel provisioned
     // cannot pass the end of the address space; the check refuses one that
     // would rather than wrap it.

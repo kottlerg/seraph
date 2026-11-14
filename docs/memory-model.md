@@ -140,8 +140,24 @@ the binary format. The general convention is:
                         │    IPC buffer, main-thread TLS
                         │  Page-reservation arena   ┐ Sv39, or size unknown
                         │  Byte heap (grows upward) ┘
-  (low VA)              ┘
+  USER_VA_FLOOR         ┤
+                        │  Never mapped (64 KiB)
+  0                     ┘
 ```
+
+No page below `USER_VA_FLOOR` (64 KiB, `abi/syscall`) is mapped in any address space, on either
+architecture and in every paging mode, so the user range a mapping may cover is
+`[USER_VA_FLOOR, user_va_top())`. `SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`, and
+`SYS_MMIO_MAP` refuse a range that starts below the floor with `InvalidAddress`
+([syscalls.md](../core/kernel/docs/syscalls.md)), and the kernel installs no user page below it,
+init's included. A kernel load through a null pointer at an offset below the floor therefore
+never reads memory a process chose: a misspeculated use of the null object a failed capability
+lookup folds to ([capability-internals.md](../core/kernel/docs/capability-internals.md)
+§ Speculative-Execution Hardening), or of an empty kernel link. SMAP and a clear `sstatus.SUM`
+stop the architectural access (§ Kernel Isolation — SMEP and SMAP); the floor does not depend on
+their stopping a transient one. It is larger than every capability object and the TCB, which the
+kernel asserts at compile time, with room for a larger kernel structure or an index added to the
+offset.
 
 The diagram shows the ordering convention only: each region's base is randomised per
 process within a fixed window (ASLR, [#39](https://github.com/kottlerg/seraph/issues/39)).
@@ -393,8 +409,11 @@ Retype and pool allocation MUST be handled as fallible at every call site.
 [Page Tables](../core/boot/docs/page-tables.md),
 [core/kernel/README.md](../core/kernel/README.md),
 [Architecture Abstraction Layer](../core/kernel/docs/arch-interface.md),
+[Capability Subsystem Internals](../core/kernel/docs/capability-internals.md),
 [Kernel Cross-Boundary Disclosure Inventory](../core/kernel/docs/cross-boundary-disclosure.md),
 [Kernel Initialization Sequence](../core/kernel/docs/initialization.md),
 [Memory Subsystem Internals](../core/kernel/docs/memory-internals.md),
-[Architecture Overview](architecture.md), [Platform Requirements](platform-requirements.md),
-[xtask/README.md](../xtask/README.md)
+[Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[Architecture Overview](architecture.md), [Limits](limits.md),
+[Platform Requirements](platform-requirements.md),
+[Userspace Memory Model](userspace-memory-model.md), [xtask/README.md](../xtask/README.md)

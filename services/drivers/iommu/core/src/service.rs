@@ -42,7 +42,7 @@ use ipc::recv_guard::{RecvFailureStage, RecvGuard};
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::{PAGE_SIZE, RIGHTS_MEM_MAP, RIGHTS_MEM_WRITE};
 
-use crate::bootstrap::Units;
+use crate::delivery::Units;
 use crate::faults::{Fault, FaultQueue};
 use crate::{Access, Backend, BackendError, RemapEntry};
 
@@ -926,8 +926,8 @@ mod tests
 {
     use super::*;
     use crate::UnitInfo;
-    use crate::bootstrap::{Scope, UnitScope};
     use core::cell::RefCell;
+    use driver_binding::resources::{IommuUnit, Scope};
     use ipc::devmgr_dma_labels::ACCESS_DEVICE_READ;
 
     const RW: u64 = ACCESS_DEVICE_READ | ACCESS_DEVICE_WRITE;
@@ -1133,12 +1133,12 @@ mod tests
     fn service() -> Service<Fake, FakeCaps>
     {
         let units = Units(vec![
-            UnitScope {
+            IommuUnit {
                 segment: 0,
                 include_pci_all: true,
                 scopes: vec![],
             },
-            UnitScope {
+            IommuUnit {
                 segment: 0,
                 include_pci_all: false,
                 scopes: vec![Scope::Function(0x0020)],
@@ -1794,12 +1794,12 @@ mod tests
     fn units_on_two_segments_refuse_the_setup()
     {
         let units = Units(vec![
-            UnitScope {
+            IommuUnit {
                 segment: 0,
                 include_pci_all: true,
                 scopes: vec![],
             },
-            UnitScope {
+            IommuUnit {
                 segment: 1,
                 include_pci_all: true,
                 scopes: vec![],

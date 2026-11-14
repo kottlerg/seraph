@@ -96,8 +96,8 @@ or stamped for a different architecture.
 
 ```
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
-    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--x86-paging 4|5] \
-    [--iommu attached|absent] \
+    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--riscv-zkr on|off] \
+    [--x86-paging 4|5] [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
     [--debug-port PORT [--debug-target NAME]] [--test-devices]
 ```
@@ -111,6 +111,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=8192`, `boot_protocol::MAX_CPUS`, the boot protocol's CPU ceiling) |
 | `--mem` | Guest memory size in MiB (default: `512`) |
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
+| `--riscv-zkr` | Whether the guest RISC-V CPU implements the Zkr entropy source (default: `on`; riscv64 only, ignored on x86_64). Appends `zkr=on` or `zkr=off` to the QEMU `-cpu` model. With it, OpenSBI grants S-mode the `seed` CSR and the kernel's pool seeds from it beside the firmware boot seed (`entropy: seeded from hardware RNG`); `off` boots the path without the source, where the kernel's probe of the CSR traps and the pool seeds from the boot seed and jitter ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Sources and graceful degradation). Runs with `off` are manual ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
 | `--x86-paging` | Guest x86-64 paging depth (default: `4`; x86_64 only, ignored on riscv64). Appends `la57=off` (`4`) or `la57=on` (`5`) to the QEMU `-cpu` model on every accelerator, which sets the CPUID LA57 bit the bootloader negotiates the depth from ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57`, per [docs/memory-model.md](../docs/memory-model.md) § x86-64. The default pins `4` because TCG's `-cpu max` otherwise advertises LA57. `5` on a native accelerator (KVM, HVF, WHPX, NVMM) whose host CPU lacks LA57 fails before launch, naming the TCG route (`SERAPH_ACCEL=tcg`), since QEMU would drop the property with a warning and boot 4-level |
 | `--iommu` | Whether the machine's IOMMU is attached (default: `attached`): `intel-iommu` with interrupt remapping and 32-bit destinations offered (`intremap=on,eim=on`, under KVM on a `kernel-irqchip=split` machine) on x86-64, `riscv-iommu-pci` in Bare mode (`off=off`) at 00:01.0 on riscv64, with the `virtio-pci` devices a driver of the system binds behind it (`iommu_platform=on`). `absent` boots the no-IOMMU variant, the no-iommu device cell of the local and release host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), which keeps devmgr's unconfined path covered while the attached IOMMU confines every device a driver binds, on both architectures ([docs/device-management.md](../docs/device-management.md#dma-safety-model) § DMA Safety Model) |
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
@@ -491,6 +492,7 @@ cargo xtask run-parallel \
     [--cpus N] \
     [--mem MIB] \
     [--riscv-mmu sv39|sv48|sv57] \
+    [--riscv-zkr on|off] \
     [--x86-paging 4|5] \
     [--iommu attached|absent] \
     [--display headless|framebuffer] \
@@ -515,6 +517,7 @@ cargo xtask run-parallel \
 | `--cpus` | `4` | vCPUs per guest (bounded by `1..=8192`, `boot_protocol::MAX_CPUS`) |
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
+| `--riscv-zkr` | `on` | Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-zkr` |
 | `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
 | `--iommu` | `attached` | Whether the machine's IOMMU is attached; same semantics as `cargo xtask run --iommu` |
 | `--display` | `headless` | What each guest presents for display, never a window. `headless` drops the display adapter, as `cargo xtask run --headless` does, so devmgr spawns no framebuffer driver. `framebuffer` keeps QEMU std VGA (see Attached devices) with no display window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |

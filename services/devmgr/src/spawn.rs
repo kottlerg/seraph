@@ -6,12 +6,14 @@
 //! Driver process spawning with per-device capability delivery via bootstrap.
 //!
 //! Creates driver processes via procmgr, then serves the driver's bootstrap
-//! over IPC to deliver its per-device capability set: for a driver bound to
-//! a device, the device's resource list ([`driver_binding::resources`]); for
-//! the IOMMU driver, its own rounds. log + procmgr caps arrive via
-//! `ProcessInfo` and are not part of this protocol.
+//! over IPC to deliver its per-device capability set: the bound record's
+//! resource list ([`driver_binding::resources`]), for every driver the IOMMU
+//! driver included. log + procmgr caps arrive via `ProcessInfo` and are not
+//! part of this protocol.
 
-use driver_binding::resources::{END_SLOTS, Endpoints, Resource, Round};
+use driver_binding::resources::{
+    END_SLOTS, Endpoints, IommuUnit, MAX_IOMMU_UNITS, Resource, Round,
+};
 use ipc::{IpcMessage, procmgr_labels};
 
 /// Source the child's ELF binary is loaded from: a boot module devmgr holds
@@ -87,8 +89,8 @@ impl Drop for ModuleCapGuard
 /// RAII guard for a child created via `CREATE_PROCESS` whose bootstrap has not
 /// yet reached its final `done` round. `Drop` releases the caller-side
 /// `thread_cap` slot delivered in the `CREATE_PROCESS` reply, the
-/// `process_handle` slot unless [`keep_handle`](Self::keep_handle) or
-/// [`keep_held`](Self::keep_held) took it, and the `release_token` slot (a
+/// `process_handle` slot unless [`keep_held`](Self::keep_held) took it, and
+/// the `release_token` slot (a
 /// `CREATE_DMA_HOLD` child's) unless [`keep_held`](Self::keep_held) took it.
 /// While still armed, `Drop` additionally sends `DESTROY_PROCESS` over the
 /// badged `process_handle` first ([`destroy_child`]), so procmgr reaps the
@@ -118,21 +120,13 @@ impl ChildGuard
         }
     }
 
-    /// The child was started: keep it alive and hand its process handle to
-    /// the caller, which keeps it at least until the driver's settle batch
-    /// settles (to destroy a driver that never reports ready) or withdraws
-    /// the started driver at once when its bootstrap failed. `Drop` still
-    /// frees the thread cap, and the release token, so a `CREATE_DMA_HOLD`
-    /// child kept this way has its hold never released.
-    fn keep_handle(mut self) -> u64
-    {
-        self.destroy = false;
-        core::mem::take(&mut self.process_handle)
-    }
-
-    /// As [`Self::keep_handle`], for a `CREATE_DMA_HOLD` child whose hold the
-    /// caller releases once its device is confirmed stopped: hand it the
-    /// release token too.
+    /// The child was started: keep it alive and hand its process handle and
+    /// its release token (0 for a child without a hold) to the caller, which
+    /// keeps the handle at least until the driver's settle batch settles (to
+    /// destroy a driver that never reports ready) or withdraws the started
+    /// driver at once when its bootstrap failed, and releases the hold once
+    /// the device is confirmed stopped, or deletes the token to keep the
+    /// hold for the boot. `Drop` still frees the thread cap.
     fn keep_held(mut self) -> HeldChild
     {
         self.destroy = false;
@@ -250,6 +244,17 @@ fn mint_bootstrap_badge() -> Option<u64>
     }
 }
 
+/// The priority level a driver granted `tier` is created at
+/// ([`BoundSpawnConfig::priority`]).
+pub fn tier_priority(tier: driver_binding::decl::Tier) -> u8
+{
+    match tier
+    {
+        driver_binding::decl::Tier::Boot => ipc::sched_policy::BOOT_DRIVER_PRIORITY,
+        driver_binding::decl::Tier::Auxiliary => ipc::sched_policy::AUX_DRIVER_PRIORITY,
+    }
+}
+
 /// The most resources one bound driver is delivered: every range of a PCI
 /// function's BARs (`driver_binding::resources::MAX_PCI_RANGES`) and either
 /// its wired line or the most message-signaled vectors a declaration
@@ -270,11 +275,24 @@ pub struct BoundSpawnConfig<'a>
     /// The device's resources, each with the cap devmgr keeps for it, from
     /// which the driver's copy is derived; at most [`MAX_BOUND_RESOURCES`].
     pub resources: &'a [Resource],
+    /// The remapping units of an IOMMU record, each with the index in
+    /// `resources` of the first resource of its group: its unit round is
+    /// served before that resource's round, or before the end round for an
+    /// index of `resources.len()`. At most `MAX_IOMMU_UNITS`, the indices in
+    /// order; empty for every record but the IOMMU record.
+    pub units: &'a [(usize, IommuUnit)],
     /// devmgr's copy of the device's DMA capability
-    /// ([`crate::dma::DmaGrant::cap`]) for a DMA declaration; the driver is
-    /// then created `CREATE_PINNED` and `CREATE_DMA_HOLD`. `None` for a
-    /// driver of a device that performs no DMA.
+    /// ([`crate::dma::DmaGrant::cap`]) for a DMA declaration; `None` for a
+    /// driver given no DMA capability.
     pub dma_cap: Option<u64>,
+    /// Whether the driver is created `CREATE_PINNED` and `CREATE_DMA_HOLD`:
+    /// its device performs DMA into its memory (a DMA declaration given a
+    /// DMA capability, or the IOMMU driver, whose units walk its table
+    /// pages).
+    pub held: bool,
+    /// Whether the driver is created `CREATE_PHYS_ACCESS`
+    /// (`firmware::binding::Grants::phys_access`).
+    pub phys_access: bool,
     pub service_ep: u64,
     /// Endpoint the driver's devmgr query cap is a `device_badge`-badged
     /// SEND on: the private driver endpoint of the driver's settle batch
@@ -284,6 +302,11 @@ pub struct BoundSpawnConfig<'a>
     /// as the correlator: devmgr's driver death queue
     /// ([`crate::settle::DriverWatch::death_eq`]).
     pub death_eq: u64,
+    /// A second event queue the driver's death observer posts to, with the
+    /// same correlator, for a driver whose death a devmgr thread other than
+    /// the control thread must see at once: the IOMMU death watch's
+    /// (`crate::iommu`). `None` for every other driver.
+    pub watch_eq: Option<u64>,
     pub device_badge: u64,
     /// Priority level the driver is created at; its band ceiling equals
     /// its level (a driver never spawns further processes). Rides the
@@ -293,18 +316,16 @@ pub struct BoundSpawnConfig<'a>
     pub priority: u8,
 }
 
-/// How a driver spawn ended. `H` is what the caller keeps of the started
-/// driver: its badged process handle ([`spawn_iommu_driver`]), or that and
-/// its release token ([`spawn_bound_driver`], [`HeldChild`]).
-pub enum DriverSpawn<H = u64>
+/// How a driver spawn ended ([`spawn_bound_driver`]).
+pub enum DriverSpawn
 {
     /// The driver completed its bootstrap: what the caller keeps of it.
-    Bootstrapped(H),
+    Bootstrapped(HeldChild),
     /// The driver was started but its bootstrap failed after it, so it may
     /// hold the device's caps: what the caller keeps of it, through which it
     /// withdraws the driver from the device and destroys it as a live
     /// driver.
-    Unbootstrapped(H),
+    Unbootstrapped(HeldChild),
     /// The spawn failed before the driver started; the child, if created,
     /// is torn down and its pages returned.
     Failed,
@@ -339,24 +360,59 @@ fn resource_round(resource: &Resource, copy: u64) -> Option<Round>
     }
 }
 
-/// Start a driver devmgr has bound to a device and deliver it the device's
-/// resource list ([`driver_binding::resources`]): one non-terminal round per
-/// resource, in `config.resources`' order, each carrying a copy of its cap,
-/// then the terminal round carrying the service endpoint, the devmgr query
-/// cap (a SEND on `query_ep` badged `device_badge`, through which the driver
-/// fetches its device info and reports ready), and, for a DMA declaration,
-/// the DMA capability. Once the end round is served it binds a death
-/// observer on the driver's thread to `death_eq`, correlator
-/// `device_badge`, so devmgr sees the driver's death, before it reports
-/// ready or after it is served.
+/// Serve `round` of a resource list on `bootstrap_ep` to the child whose
+/// bootstrap badge is `child_badge`; false, logged, when it could not be
+/// encoded (`None`) or served.
+fn serve_list_round(
+    bootstrap_ep: u64,
+    child_badge: u64,
+    ipc_buf: *mut u64,
+    round: Option<Round>,
+) -> bool
+{
+    let Some(round) = round
+    else
+    {
+        std::os::seraph::log!(warn: "driver resource round not encodable");
+        return false;
+    };
+    // SAFETY: every caller passes devmgr's registered IPC buffer.
+    let served = unsafe {
+        ipc::bootstrap::serve_round(
+            bootstrap_ep,
+            child_badge,
+            ipc_buf,
+            round.done(),
+            round.caps(),
+            round.data(),
+        )
+    };
+    if served.is_err()
+    {
+        std::os::seraph::log!(warn: "driver bootstrap round failed");
+    }
+    served.is_ok()
+}
+
+/// Start a driver devmgr has bound to a device record and deliver it the
+/// record's resource list ([`driver_binding::resources`]): one non-terminal
+/// round per resource, in `config.resources`' order, each carrying a copy of
+/// its cap, with each IOMMU unit's round before the first resource of its
+/// group, then the terminal round carrying the service endpoint, the devmgr
+/// query cap (a SEND on `query_ep` badged `device_badge`, through which the
+/// driver fetches its device info and reports ready), and, for a DMA
+/// declaration, the DMA capability. Once the end round is served it binds a
+/// death observer on the driver's thread to `death_eq`, and to `watch_eq`
+/// when given, correlator `device_badge`, so devmgr sees the driver's death,
+/// before it reports ready or after it is served.
 ///
-/// A driver of a DMA device is created `CREATE_PINNED`, since its device may
-/// write its memory before a demand fault could back it, and
-/// `CREATE_DMA_HOLD`, since it may write it after the driver dies until
-/// devmgr has stopped its DMA; procmgr then holds its pages after it is torn
-/// down until devmgr releases them on its release token
-/// ([`destroy_and_release`]). Any other driver is created demand-paged, with
-/// no hold and no release token.
+/// A `held` driver is created `CREATE_PINNED`, since its device may write
+/// its memory before a demand fault could back it, and `CREATE_DMA_HOLD`,
+/// since it may write it after the driver dies until devmgr has stopped its
+/// DMA; procmgr then holds its pages after it is torn down until devmgr
+/// releases them on its release token ([`destroy_and_release`]). Any other
+/// driver is created demand-paged, with no hold and no release token. A
+/// `phys_access` driver is created `CREATE_PHYS_ACCESS`.
 ///
 /// Returns [`DriverSpawn::Bootstrapped`] with the child's badged process
 /// handle and release token (0 without a hold) ([`HeldChild`]), which the
@@ -374,10 +430,11 @@ fn resource_round(resource: &Resource, copy: u64) -> Option<Round>
 #[expect(
     clippy::large_stack_frames,
     reason = "the `derived` cap array (75 `u64`s, 600 B), the `create_msg`, `reply` and \
-              `start_msg` `IpcMessage`s (568 B each) and the bootstrap rounds' messages (568 B \
-              each); on the 32 KiB main-thread stack of devmgr"
+              `start_msg` `IpcMessage`s (568 B each), and the resource-list rounds (`Round`, 568 B \
+              each, each built just before it is served) and their messages (568 B each); on the \
+              32 KiB main-thread stack of devmgr"
 )]
-pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn<HeldChild>
+pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
 {
     // Release the source ELF cap on every exit before the create call
     // consumes it. Disarmed once the ipc_call returns, which transfers the
@@ -394,6 +451,22 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         std::os::seraph::log!(warn: "driver spawn: more than {} resources", MAX_BOUND_RESOURCES);
         return DriverSpawn::Failed;
     }
+    // Each unit's round goes before the first resource of its group, so the
+    // driver numbers the units in this order only when their groups are.
+    let units_ordered = config
+        .units
+        .windows(2)
+        .all(|pair| matches!(pair, [(a, _), (b, _)] if a <= b));
+    if config.units.len() > MAX_IOMMU_UNITS
+        || !units_ordered
+        || config
+            .units
+            .last()
+            .is_some_and(|(at, _)| *at > config.resources.len())
+    {
+        std::os::seraph::log!(warn: "driver spawn: IOMMU units out of order or past their bound");
+        return DriverSpawn::Failed;
+    }
     let Some(child_badge) = mint_bootstrap_badge()
     else
     {
@@ -408,15 +481,16 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         return DriverSpawn::Failed;
     };
 
-    let held = config.dma_cap.is_some();
-    let flags = if held
+    let held = config.held;
+    let mut flags = 0;
+    if held
     {
-        procmgr_labels::CREATE_PINNED | procmgr_labels::CREATE_DMA_HOLD
+        flags |= procmgr_labels::CREATE_PINNED | procmgr_labels::CREATE_DMA_HOLD;
     }
-    else
+    if config.phys_access
     {
-        0
-    };
+        flags |= procmgr_labels::CREATE_PHYS_ACCESS;
+    }
     let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
     let create_msg = match config.source
     {
@@ -554,246 +628,49 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         return DriverSpawn::Failed;
     }
 
-    // The resource rounds, then the end round.
-    let end = Round::end(&Endpoints {
-        service: service_copy,
-        devmgr_query: query_copy,
-        dma: dma_copy,
-    });
-    let rounds = config
-        .resources
-        .iter()
-        .zip(derived)
-        .map(|(resource, copy)| resource_round(resource, copy))
-        .chain(core::iter::once(Some(end)));
-    for round in rounds
-    {
-        let Some(round) = round
-        else
+    // The resource rounds, each unit's round before the first resource of
+    // its group, then the end round, each built just before it is served.
+    let serve = |round| serve_list_round(config.bootstrap_ep, child_badge, ipc_buf, round);
+    let served = 'rounds: {
+        for at in 0..=count
         {
-            std::os::seraph::log!(warn: "driver resource round not encodable");
-            delete_all(&derived);
-            return DriverSpawn::Unbootstrapped(child_guard.keep_held());
-        };
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let served = unsafe {
-            ipc::bootstrap::serve_round(
-                config.bootstrap_ep,
-                child_badge,
-                ipc_buf,
-                round.done(),
-                round.caps(),
-                round.data(),
-            )
-        };
-        if served.is_err()
-        {
-            std::os::seraph::log!(warn: "driver bootstrap round failed");
-            delete_all(&derived);
-            return DriverSpawn::Unbootstrapped(child_guard.keep_held());
+            for (_, unit) in config.units.iter().filter(|(first, _)| *first == at)
+            {
+                if !serve(Round::iommu_unit(unit))
+                {
+                    break 'rounds false;
+                }
+            }
+            if let Some((resource, &copy)) = config.resources.get(at).zip(derived.get(at))
+                && !serve(resource_round(resource, copy))
+            {
+                break 'rounds false;
+            }
         }
+        serve(Some(Round::end(&Endpoints {
+            service: service_copy,
+            devmgr_query: query_copy,
+            dma: dma_copy,
+        })))
+    };
+    if !served
+    {
+        delete_all(&derived);
+        return DriverSpawn::Unbootstrapped(child_guard.keep_held());
     }
 
     // Observe the driver's death from here on. Bound only once every round
     // has succeeded, so the death queue takes posts only from the drivers a
     // roster records; a child that already died posts at once.
-    if syscall::thread_bind_notification(thread_cap, config.death_eq, config.device_badge).is_err()
+    let bound = [Some(config.death_eq), config.watch_eq]
+        .into_iter()
+        .flatten()
+        .all(|eq| syscall::thread_bind_notification(thread_cap, eq, config.device_badge).is_ok());
+    if !bound
     {
         std::os::seraph::log!(warn: "driver death observer bind failed");
         return DriverSpawn::Unbootstrapped(child_guard.keep_held());
     }
     std::os::seraph::log!("driver started");
     DriverSpawn::Bootstrapped(child_guard.keep_held())
-}
-
-/// One remapping unit handed to the IOMMU driver: its register `Mmio` cap,
-/// which the spawn moves to the driver (devmgr keeps no copy), and its
-/// bootstrap round's data words (`iommu_core::bootstrap`).
-pub struct UnitRound
-{
-    pub cap: u64,
-    pub words: Vec<u64>,
-}
-
-/// Capabilities and identifiers for the IOMMU driver's spawn
-/// ([`spawn_iommu_driver`]).
-pub struct IommuSpawnConfig<'a>
-{
-    pub procmgr_ep: u64,
-    pub bootstrap_ep: u64,
-    /// The driver's boot-module Memory cap, consumed by `CREATE_PROCESS` or
-    /// deleted on a failure before it.
-    pub module_cap: u64,
-    /// The units, in unit-index order; every cap is moved to the driver or
-    /// deleted.
-    pub units: &'a [UnitRound],
-    /// devmgr-owned service endpoint; the driver receives on a copy.
-    pub service_ep: u64,
-    /// The private endpoint of the driver's settle batch.
-    pub query_ep: u64,
-    /// devmgr's driver death queue.
-    pub death_eq: u64,
-    /// The IOMMU death watch's queue, a second observer of the driver's
-    /// death that no call of devmgr's control thread can delay
-    /// (`crate::iommu`).
-    pub watch_eq: u64,
-    pub device_badge: u64,
-    pub priority: u8,
-}
-
-/// Spawn the IOMMU driver and serve its bootstrap
-/// (`iommu_core::bootstrap`): one round per unit with its register cap, then
-/// the terminal round with a copy of `service_ep` and a SEND badged
-/// `device_badge` on `query_ep`; once that is served, two death observers,
-/// on `death_eq` and `watch_eq`. Created `CREATE_PINNED`, since the units
-/// walk its table pages and they must never fault, `CREATE_DMA_HOLD`,
-/// since the units can walk those pages after it dies: devmgr never releases
-/// the hold, so it deletes the release token and the pages stay quarantined
-/// for the boot, and `CREATE_PHYS_ACCESS`, since the units are programmed
-/// with physical addresses, of its table pages and of every frame `MAP`
-/// installs. Both observers carry the correlator `device_badge`. Returns as
-/// [`spawn_bound_driver`] does, with the process handle alone.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one spawn transaction, as `spawn_bound_driver`: every derived cap owns a slot \
-              released on a later failure, and the rounds follow the bootstrap protocol one to one"
-)]
-pub fn spawn_iommu_driver(config: &IommuSpawnConfig, ipc_buf: *mut u64) -> DriverSpawn
-{
-    let mut module_guard = ModuleCapGuard::new(config.module_cap);
-    let release_units = |from: usize| {
-        for u in config.units.get(from..).unwrap_or(&[])
-        {
-            let _ = syscall::cap_delete(u.cap);
-        }
-    };
-    let Some(child_badge) = mint_bootstrap_badge()
-    else
-    {
-        std::os::seraph::log!(warn: "IOMMU driver spawn: entropy draw failed");
-        release_units(0);
-        return DriverSpawn::Failed;
-    };
-    let Ok(badged_creator) =
-        syscall::cap_derive_badge(config.bootstrap_ep, syscall::RIGHTS_EP_SEND, child_badge)
-    else
-    {
-        std::os::seraph::log!(warn: "IOMMU driver spawn: badged creator derivation failed");
-        release_units(0);
-        return DriverSpawn::Failed;
-    };
-    let flags = procmgr_labels::CREATE_PINNED
-        | procmgr_labels::CREATE_DMA_HOLD
-        | procmgr_labels::CREATE_PHYS_ACCESS;
-    let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
-    let create_msg = IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | sched_bits)
-        .cap(config.module_cap)
-        .cap(badged_creator)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) };
-    let Ok(reply) = reply
-    else
-    {
-        std::os::seraph::log!(warn: "IOMMU driver create ipc_call failed");
-        release_units(0);
-        return DriverSpawn::Failed;
-    };
-    // The call transferred the module cap to procmgr whatever its reply.
-    module_guard.disarm();
-    // `CREATE_DMA_HOLD`: [process handle, thread, release token].
-    let reply_caps = reply.caps();
-    let (0, &[process_handle, thread_cap, release_token]) = (reply.label, reply_caps)
-    else
-    {
-        std::os::seraph::log!(warn: "IOMMU driver create failed");
-        for &c in reply_caps
-        {
-            let _ = syscall::cap_delete(c);
-        }
-        release_units(0);
-        return DriverSpawn::Failed;
-    };
-    let child_guard = ChildGuard::new(process_handle, thread_cap, release_token, ipc_buf);
-    let Ok(service_copy) = syscall::cap_derive(config.service_ep, syscall::RIGHTS_ALL)
-    else
-    {
-        std::os::seraph::log!(warn: "IOMMU driver service endpoint derivation failed");
-        release_units(0);
-        return DriverSpawn::Failed;
-    };
-    let Ok(query_copy) = syscall::cap_derive_badge(
-        config.query_ep,
-        syscall::RIGHTS_EP_SEND,
-        config.device_badge,
-    )
-    else
-    {
-        std::os::seraph::log!(warn: "IOMMU driver query cap derivation failed");
-        release_units(0);
-        let _ = syscall::cap_delete(service_copy);
-        return DriverSpawn::Failed;
-    };
-    // Deleting a slot a round already moved is a no-op.
-    let release_endpoints = || {
-        let _ = syscall::cap_delete(service_copy);
-        let _ = syscall::cap_delete(query_copy);
-    };
-    let start_msg = IpcMessage::new(procmgr_labels::START_PROCESS);
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let started = unsafe { ipc::ipc_call(process_handle, &start_msg, ipc_buf) };
-    if !matches!(started, Ok(r) if r.label == 0)
-    {
-        std::os::seraph::log!(warn: "IOMMU driver START_PROCESS failed");
-        release_units(0);
-        release_endpoints();
-        return DriverSpawn::Failed;
-    }
-    for (i, unit) in config.units.iter().enumerate()
-    {
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let served = unsafe {
-            ipc::bootstrap::serve_round(
-                config.bootstrap_ep,
-                child_badge,
-                ipc_buf,
-                false,
-                &[unit.cap],
-                &unit.words,
-            )
-        };
-        if served.is_err()
-        {
-            std::os::seraph::log!(warn: "IOMMU driver bootstrap unit round failed");
-            release_units(i);
-            release_endpoints();
-            return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
-        }
-    }
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let served = unsafe {
-        ipc::bootstrap::serve_round(
-            config.bootstrap_ep,
-            child_badge,
-            ipc_buf,
-            true,
-            &[service_copy, query_copy],
-            &[iommu_core::bootstrap::ROUND_ENDPOINTS],
-        )
-    };
-    if served.is_err()
-    {
-        std::os::seraph::log!(warn: "IOMMU driver bootstrap endpoint round failed");
-        release_endpoints();
-        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
-    }
-    if syscall::thread_bind_notification(thread_cap, config.death_eq, config.device_badge).is_err()
-        || syscall::thread_bind_notification(thread_cap, config.watch_eq, config.device_badge)
-            .is_err()
-    {
-        std::os::seraph::log!(warn: "IOMMU driver death observer bind failed");
-        return DriverSpawn::Unbootstrapped(child_guard.keep_handle());
-    }
-    std::os::seraph::log!("IOMMU driver started");
-    DriverSpawn::Bootstrapped(child_guard.keep_handle())
 }

@@ -5,9 +5,10 @@
 
 //! RISC-V register-map and instruction-encoding arithmetic: the SBI hart-mask
 //! window, page rounding, the timer's tick and microsecond conversions, the
-//! F/D/V opcode decode the lazy extended-state trap uses, the PTE permission
-//! bits and their test in the kernel's spurious-fault retry, and the user
-//! leaf's grant bits and the permission change they bound.
+//! F/D/V opcode decode the lazy extended-state trap uses, the Zkr `seed` CSR's
+//! status decode and the word the hardware RNG builds from its samples, the
+//! PTE permission bits and their test in the kernel's spurious-fault retry,
+//! and the user leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module.
@@ -127,6 +128,85 @@ pub(super) fn is_fp_or_v_opcode(insn: u64) -> bool
     // (`c.fldsp`/`c.fsdsp`) both use funct3 (bits[15:13]) ∈ {0b001, 0b101},
     // which are FP-only in those quadrants on RV64.
     matches!(insn & 0x3, 0b00 | 0b10) && matches!((insn >> 13) & 0x7, 0b001 | 0b101)
+}
+
+// ── The Zkr `seed` CSR ────────────────────────────────────────────────────────
+
+/// What one read of the Zkr `seed` CSR reports, by its `OPST` field (bits
+/// \[31:30\]; the RISC-V scalar cryptography specification, § Entropy Source).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SeedPoll
+{
+    /// `ES16` (`0b10`): bits \[15:0\] hold 16 bits of entropy.
+    Es16(u16),
+    /// `BIST` (`0b00`, a self-test is running) or `WAIT` (`0b01`, no entropy
+    /// is ready yet): a later read may return a sample.
+    NotReady,
+    /// `DEAD` (`0b11`): an unrecoverable self-test failure. A read that
+    /// trapped decodes here too: its fixup returns `u64::MAX`, whose `OPST`
+    /// is `DEAD` (`entropy::seed_fault_fixup`).
+    Dead,
+}
+
+/// Decode the value a read of the `seed` CSR returned.
+pub(super) fn decode_seed(value: u64) -> SeedPoll
+{
+    match (value >> 30) & 0b11
+    {
+        0b10 => SeedPoll::Es16((value & 0xFFFF) as u16),
+        0b11 => SeedPoll::Dead,
+        _ => SeedPoll::NotReady,
+    }
+}
+
+/// Why [`seed_word`] built no word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SeedError
+{
+    /// A read reported `DEAD`, or trapped: the source is unusable.
+    Dead,
+    /// The source stayed in `BIST` or `WAIT` until the word's wait budget was
+    /// spent.
+    TimedOut,
+}
+
+/// Build a 64-bit word from four `ES16` samples of the `seed` CSR, the first
+/// sample in the low 16 bits.
+///
+/// `read` reads the CSR once. Each read that finds the source not ready calls
+/// `expired`, which says whether the word's wait budget is spent; until it is,
+/// the read is repeated.
+///
+/// # Errors
+/// [`SeedError::Dead`] at the first `DEAD` read (or trapped one);
+/// [`SeedError::TimedOut`] when `expired` reports the budget spent.
+pub(super) fn seed_word(
+    mut read: impl FnMut() -> u64,
+    mut expired: impl FnMut() -> bool,
+) -> Result<u64, SeedError>
+{
+    let mut word = 0u64;
+    for shift in [0u32, 16, 32, 48]
+    {
+        let sample = loop
+        {
+            match decode_seed(read())
+            {
+                SeedPoll::Es16(sample) => break sample,
+                SeedPoll::NotReady =>
+                {
+                    if expired()
+                    {
+                        return Err(SeedError::TimedOut);
+                    }
+                    core::hint::spin_loop();
+                }
+                SeedPoll::Dead => return Err(SeedError::Dead),
+            }
+        };
+        word |= u64::from(sample) << shift;
+    }
+    Ok(word)
 }
 
 // ── PTE permission bits and the kernel spurious-fault test ───────────────────
@@ -530,5 +610,90 @@ mod tests
             both & (0xFF | (0xFFF_FFFF_FFFF << 10) | PTE_PBMT_MASK | (1 << 63)),
             0
         );
+    }
+
+    // ── The Zkr `seed` CSR ──
+
+    /// A `seed` value with status `opst` and entropy `bits`.
+    fn seed(opst: u64, bits: u64) -> u64
+    {
+        (opst << 30) | bits
+    }
+
+    #[test]
+    fn seed_status_decodes_by_opst_alone()
+    {
+        assert_eq!(decode_seed(seed(0b10, 0xABCD)), SeedPoll::Es16(0xABCD));
+        // Custom bits [23:16] beside a sample are not entropy.
+        assert_eq!(
+            decode_seed(seed(0b10, 0xABCD) | (0x5A << 16)),
+            SeedPoll::Es16(0xABCD)
+        );
+        assert_eq!(decode_seed(seed(0b00, 0)), SeedPoll::NotReady);
+        assert_eq!(decode_seed(seed(0b01, 0)), SeedPoll::NotReady);
+        assert_eq!(decode_seed(seed(0b11, 0)), SeedPoll::Dead);
+    }
+
+    #[test]
+    fn the_fixup_value_of_a_trapped_seed_read_decodes_as_dead()
+    {
+        // The probe reports the source absent on this value; decoding it as
+        // anything else would draw from a hart that has no source.
+        assert_eq!(decode_seed(u64::MAX), SeedPoll::Dead);
+    }
+
+    #[test]
+    fn a_seed_word_takes_four_samples_low_first_across_not_ready_reads()
+    {
+        let mut reads = [
+            seed(0b01, 0),
+            seed(0b10, 0x1111),
+            seed(0b00, 0),
+            seed(0b10, 0x2222),
+            seed(0b10, 0x3333),
+            seed(0b01, 0),
+            seed(0b10, 0x4444),
+        ]
+        .into_iter();
+        let mut waits = 0;
+        let word = seed_word(
+            || reads.next().unwrap(),
+            || {
+                waits += 1;
+                false
+            },
+        );
+        assert_eq!(word, Ok(0x4444_3333_2222_1111));
+        assert_eq!(waits, 3);
+        assert_eq!(reads.next(), None);
+    }
+
+    #[test]
+    fn a_dead_seed_read_ends_the_word()
+    {
+        let mut reads = [seed(0b10, 0x1111), seed(0b11, 0)].into_iter();
+        assert_eq!(
+            seed_word(|| reads.next().unwrap(), || false),
+            Err(SeedError::Dead)
+        );
+    }
+
+    #[test]
+    fn a_seed_source_not_ready_past_the_budget_times_out()
+    {
+        let mut reads = 0;
+        let mut waits = 0;
+        let word = seed_word(
+            || {
+                reads += 1;
+                seed(0b01, 0)
+            },
+            || {
+                waits += 1;
+                waits == 3
+            },
+        );
+        assert_eq!(word, Err(SeedError::TimedOut));
+        assert_eq!(reads, 3);
     }
 }

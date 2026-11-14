@@ -627,11 +627,11 @@ counter for its subtree: the pages charged to the node and to every node below i
 points at a node; nothing assumes one node per process. The charge covers each grant, demand chunk
 and page-table donation memmgr accounts to the process ([Per-Process
 Tracking](#per-process-tracking)), and each such run on the deferred list until it rejoins the free
-pool ([Reclamation](#reclamation)). memmgr's own metadata (its arena, index, page tables and
-`CSpace` growth) is charged to no node. A node outlives its process while a node below it is alive
-or a run charged to it is on the deferred list, and its charge stays in its parent's subtree
-meanwhile, so a process cannot hand its frames to another process, die, and free its subtree's
-budget while the frames stay held.
+pool ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
+index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
+process while a node below it is alive or a run charged to it is on the deferred list, and its
+charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
+process, die, and free its subtree's budget while the frames stay held.
 
 **Charging.** A charge is checked against the max of the node and of every ancestor. A request
 that would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
@@ -643,17 +643,22 @@ default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
-reserve. It is a floor for the core (memmgr's self-funding, which is charged to no node, procmgr,
-svcmgr, the critical services and crashd) and a limit on no process. Reserve membership is an
-attribute of a node, inherited down the tree: the children of init are reserve nodes, and so is a
-process created with procmgr's reserve creation flag, which procmgr honours only from a reserve
-creator, as it does `CREATE_PHYS_ACCESS`. The reserve is `pool_total / 64`
+reserve. It is a floor for the core and a limit on no process: memmgr's self-funding, which is
+charged to no node, and the reserve nodes draw on it. Reserve membership is an attribute each node
+takes when it is created, not one its children inherit. The nodes of memmgr's boot records
+(procmgr's, and memmgr's and init's own) and of init's children (devmgr, vfsd and svcmgr) are
+reserve nodes, and so is the node of a process created with procmgr's reserve creation flag, which
+procmgr honours only from a reserve creator, as it does `CREATE_PHYS_ACCESS`. A process a reserve
+creator creates without the flag is outside the reserve, so svcmgr's services, crashd among them,
+are outside it until svcmgr passes the flag for them; a recipe key that asks for it is
+[#1098](https://github.com/kottlerg/seraph/issues/1098). The reserve is `pool_total / 64`
 ([docs/limits.md](../../../docs/limits.md) § memmgr).
 
-**Create-time ceiling.** procmgr registers each process with its creator's node as the parent and,
-when the creator asks for one, a max in pages. memmgr clamps the max to what the parent and every
-ancestor have left, and refuses a reserve node under a parent outside the reserve. A process reads
-its node's usage, its max and its subtree's usage with `QUERY_MEMORY_USAGE`.
+**Create-time ceiling.** procmgr registers each process with its creator's node as the parent (a
+child of init is a top-level node: init's own record holds only init's bootstrap arenas and parents
+no process) and, when the creator asks for one, a max in pages. memmgr clamps the max to what the
+parent and every ancestor have left, and refuses a reserve node under a parent outside the reserve.
+A process reads its node's usage, its max and its subtree's usage with `QUERY_MEMORY_USAGE`.
 
 **Server-side charges.** Memory a server spends on a client's behalf (procmgr's process-table
 entry, vfsd's and fatfs's per-client state) is charged to the server's node, not to the client's.

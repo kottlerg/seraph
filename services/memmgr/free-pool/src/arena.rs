@@ -6,7 +6,8 @@
 //! Self-hosted metadata arena: fixed-size slots threaded on a free list.
 //!
 //! Every piece of memmgr's bookkeeping (free runs, process records, region and
-//! frame descriptors) is a [`Node`] in one [`Slot`] of this arena. The arena
+//! frame descriptors, and the nodes of each region's chunk table) is a [`Node`]
+//! in one [`Slot`] of this arena. The arena
 //! only hands out indices it has carved; the storage behind them is a
 //! [`SlotStore`] the caller supplies (pool-backed mapped pages in memmgr, a
 //! vector in host tests), made available one page of slots at a time by
@@ -15,6 +16,7 @@
 
 use syscall_abi::PAGE_SIZE;
 
+use crate::chunk::{ChunkEntry, DIR_FANOUT};
 use crate::{DemandRegion, FreeRun};
 
 /// Arena slot index. `u64` so the index never bounds the arena before the
@@ -26,8 +28,9 @@ pub const NODE_NULL: NodeIdx = u64::MAX;
 
 /// One backing frame accounted to a process: a Memory cap memmgr holds,
 /// covering `page_count` pages at `phys_base`. `va` is the page base memmgr
-/// mapped it at (a demand chunk), or the caller-owned-mapping marker the
-/// service chooses.
+/// mapped it at (a run backing part of a demand chunk, kept on that chunk's
+/// run list in the region's chunk table), or the caller-owned-mapping marker
+/// the service chooses (a frame on the record's frame list).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameDesc
 {
@@ -47,7 +50,10 @@ pub struct FrameDesc
 pub const NO_REGION_ID: u64 = 0;
 
 /// One tracked process: its badge and the heads of its frame and region
-/// lists. The record's own slot `next` link chains it in its
+/// lists. The frame list holds every frame memmgr accounts to the process
+/// outside its demand regions (grants, page-table donations, a bootstrap
+/// arena); a run backing a demand region lives in that region's chunk table.
+/// The record's own slot `next` link chains it in its
 /// [`crate::ProcessIndex`] bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessRecord
@@ -63,15 +69,30 @@ pub struct ProcessRecord
     pub next_region_id: u64,
 }
 
+/// One registered demand region on its process's region list: the region and
+/// the root of its chunk table ([`crate::chunk`]), [`NODE_NULL`] while no
+/// chunk of it has an entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionNode
+{
+    pub region: DemandRegion,
+    pub table: NodeIdx,
+}
+
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Node
 {
     Free,
     Run(FreeRun),
-    Region(DemandRegion),
+    Region(RegionNode),
     Frame(FrameDesc),
     Process(ProcessRecord),
+    /// A directory node of a chunk table: its children, [`NODE_NULL`] where
+    /// no chunk below the child has an entry.
+    ChunkDir([NodeIdx; DIR_FANOUT]),
+    /// A leaf of a chunk table: one chunk's entry.
+    Chunk(ChunkEntry),
 }
 
 /// An arena slot: a payload plus the index of the next slot on whichever

@@ -21,7 +21,7 @@
 use free_pool::{
     ArenaLayout, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
     NO_REGION_ID, NODE_NULL, Node, NodeIdx, RecheckBudget, RegionError, SelectError, SlotStore,
-    WordStore, arena::Slot, chunk_for, fault_window, region_grants,
+    WordStore, arena::Slot, chunk::ChunkState, chunk_for, fault_window, region_grants,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -115,9 +115,10 @@ const POOL_FRAME_RIGHTS: u64 = syscall::RIGHTS_MEM_WRITE
     | syscall::RIGHTS_MEM_PHYS;
 
 /// `va` stamped on a frame descriptor memmgr did **not** map itself
-/// (`REQUEST_MEMORY_CAPS` grants and bootstrap arenas): the caller owns the
-/// mapping, so `UNREGISTER_REGION` must never unmap it. Demand-fault frames
-/// carry their mapped page base instead.
+/// (`REQUEST_MEMORY_CAPS` grants, client page-table donations and bootstrap
+/// arenas), which sits on the process record's frame list. A demand-fault run
+/// carries its mapped page base instead, which places it in its chunk of the
+/// region's chunk table ([`free_pool::Ledger::back_chunk`]).
 const FRAME_VA_UNMAPPED: u64 = u64::MAX;
 
 // ── Private VA zones ─────────────────────────────────────────────────────────
@@ -1542,9 +1543,10 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
 ///
 /// Attributed by `req.badge`; words are `[va_base, len_bytes]`. The range must
 /// match a previously [`handle_register_region`]'d region exactly. memmgr
-/// unmaps the region span from the child `AddressSpace`, returns each backing
-/// frame to the pool (or to the deferred list when it is not quiescent), and
-/// frees the region. The reverse of registration plus
+/// unmaps the region span from the child `AddressSpace`, returns each run on
+/// the region's chunk table to the pool (or to the deferred list when it is
+/// not quiescent), and frees the table and the region. The reverse of
+/// registration plus
 /// the frames [`handle_fault`] mapped. Reply: [`memmgr_errors::SUCCESS`], or
 /// `INVALID_ARGUMENT` (unknown badge or no exact-match region).
 fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
@@ -1559,13 +1561,12 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let Some(region) = l.remove_region(rec, va_base, len)
+    let Some(reg) = l.region_exact(rec, va_base, len)
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    let end = region.va_base.saturating_add(region.len);
     let aspace_cap = l.record(rec).map_or(0, |r| r.aspace_cap);
     // Tear down the whole region span in the child AS in one call: clear every
     // leaf PTE and reclaim the now-empty intermediate page tables to the child's
@@ -1575,10 +1576,10 @@ fn handle_unregister_region(req: &IpcMessage, ipc_buf: *mut u64)
     // SAFETY: `aspace_cap` is a client address space procmgr delegated
     // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
     // memmgr runs on.
-    let _ =
-        unsafe { syscall::mem_unmap_reclaim(aspace_cap, region.va_base, region.len / PAGE_SIZE) };
+    let _ = unsafe { syscall::mem_unmap_reclaim(aspace_cap, va_base, len / PAGE_SIZE) };
     recheck_deferred(l);
-    l.return_frames_in(rec, region.va_base, end, FRAME_VA_UNMAPPED, quiescent);
+    // Free the region and its chunk table, taking back each run on it.
+    let _ = l.remove_region(rec, reg, quiescent);
     // Restore contiguity across the reclaimed runs, so a register/unregister
     // churn does not drift the run (and tracking-anchor) count up.
     coalesce(l);
@@ -1644,13 +1645,16 @@ enum FaultDecline
     AccessRefused = 4,
     /// procmgr has delegated no address space for the process.
     NoAspace = 5,
-    /// The metadata arena could not grow for the chunk's frame descriptor.
+    /// The metadata arena could not grow for the slots recording the run
+    /// takes: its descriptor, and the chunk's path in the region's chunk
+    /// table.
     NoArenaSlot = 6,
     /// The free pool holds no page to back the faulting page: it is empty,
     /// even after the deferred runs were rechecked, or the split of a run
     /// larger than the span to back failed.
     NoFreePage = 7,
-    /// The run's frame descriptor could not be recorded.
+    /// The run could not be recorded on its chunk in the region's chunk
+    /// table.
     FrameRecord = 8,
     /// A map of the run failed: into memmgr's scrub window to zero it
     /// ([`scrub_run`]), or into the process, after memmgr funded the
@@ -1718,12 +1722,15 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// [`syscall_abi::FAULT_REPLY_KILL`]; each with the [`FaultDecline`] that
 /// refused it in data word 0 ([`decline_fault`]).
 ///
-/// The run is accounted to the process record (reclaimed on `PROCESS_DIED` /
-/// `UNREGISTER_REGION` like any issued cap), and so is each page-table run
-/// memmgr donates for it (reclaimed on `PROCESS_DIED`); `pool_total` is
-/// unchanged because the pages were already owned — they move from a free run
-/// to the record. A declined fault's run is unmapped before it returns to
-/// the pool ([`release_unmapped_chunk`]).
+/// The run is recorded on its chunk's entry in the region's chunk table
+/// ([`free_pool::Ledger::back_chunk`]; reclaimed on `PROCESS_DIED` /
+/// `UNREGISTER_REGION`), and each page-table run memmgr donates for it on the
+/// process record (reclaimed on `PROCESS_DIED`); `pool_total` is unchanged
+/// because the pages were already owned — they move from a free run to the
+/// process. The fault reads the chunk's entry, never the runs the process
+/// holds (services/memmgr/docs/memory-pool.md § Chunk table). A declined
+/// fault's run is unmapped before it returns to the pool
+/// ([`release_unmapped_chunk`]).
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
@@ -1741,7 +1748,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::UnknownProcess, 0);
         return;
     };
-    let Some(region) = l.region_for(rec, va)
+    let Some((reg, region)) = l.region_for(rec, va)
     else
     {
         decline_fault(ipc_buf, FaultDecline::NoRegion, 0);
@@ -1760,27 +1767,38 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::NoAspace, 0);
         return;
     }
-    // The part of the faulting page's chunk no earlier run backs. None: the
-    // page itself is backed, because another thread's fault on it was served
-    // first, and that mapping satisfies this granted access. Resume.
+    // The part of the faulting page's chunk no earlier run backs, read from
+    // the chunk's entry in the region's chunk table. None: the page itself is
+    // backed, because another thread's fault on it was served first, and that
+    // mapping satisfies this granted access. Resume.
     let (chunk_base, chunk_pages) = chunk_for(&region, page_base);
-    let chunk_end = chunk_base.saturating_add(u64::from(chunk_pages).saturating_mul(PAGE_SIZE));
-    let Some((span_start, span_end)) =
-        l.unbacked_span(rec, page_base, chunk_base, chunk_end, FRAME_VA_UNMAPPED)
+    let entry = l.chunk_at(reg, page_base);
+    // Nothing evicts a chunk yet, so a fault finds it unbacked or resident.
+    debug_assert!(matches!(
+        entry.state(),
+        ChunkState::Unbacked | ChunkState::Resident
+    ));
+    // The page lies in its chunk, below `DEMAND_CHUNK_PAGES`.
+    let page = u32::try_from(page_base.saturating_sub(chunk_base) / PAGE_SIZE).unwrap_or(0);
+    let Some((first, end)) = entry.unbacked_span(page, chunk_pages)
     else
     {
         reply_label(ipc_buf, syscall_abi::FAULT_REPLY_RESUME);
         return;
     };
+    let span_start = chunk_base.saturating_add(u64::from(first).saturating_mul(PAGE_SIZE));
+    let span_end = chunk_base.saturating_add(u64::from(end).saturating_mul(PAGE_SIZE));
     // The span lies in the chunk, so its page count is at most
     // `DEMAND_CHUNK_PAGES`, and at least 1, the faulting page.
-    let span_pages = u32::try_from(span_end.saturating_sub(span_start) / PAGE_SIZE).unwrap_or(1);
+    let span_pages = end.saturating_sub(first);
 
-    // Back the span with one Memory cap, after securing the slot its
-    // descriptor takes: one run covering the span, else, on a fragmented pool,
-    // the largest free run, mapped over the part of the span around the
-    // faulting page (services/memmgr/docs/memory-pool.md § Demand faults).
-    if !ensure_slots(l, 1)
+    // Back the span with one Memory cap, after securing the slots recording
+    // it takes (its descriptor, and the chunk's path in the table): one run
+    // covering the span, else, on a fragmented pool, the largest free run,
+    // mapped over the part of the span around the faulting page
+    // (services/memmgr/docs/memory-pool.md § Demand faults).
+    let need = l.back_slots(reg, page_base);
+    if !ensure_slots(l, need)
     {
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
@@ -1793,7 +1811,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     };
     let (outer, pages, phys) = grant.entries[0];
-    // The run's mapped VA, so UNREGISTER_REGION can find and unmap it.
+    // The run's mapped VA, which places it in its chunk.
     let frame = FrameDesc {
         cap_slot: outer,
         page_count: pages,
@@ -1819,17 +1837,17 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    // Map first, then account the run to the record: a page-table top-up
-    // during the map records its own frame on the record, which must not land
-    // above an already-pushed chunk that a failure would then pop.
-    if let Err(e) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot)
+    // Map first, then record the run in its chunk: a failed map leaves the
+    // chunk's entry as it was. A page-table top-up during the map holds the
+    // slots recording the run needs.
+    if let Err(e) = map_client_chunk(l, rec, aspace_cap, &frame, region.prot, need)
     {
         release_unmapped_chunk(l, rec, aspace_cap, frame);
         decline_fault(ipc_buf, FaultDecline::MapFailed, e.unsigned_abs());
         return;
     }
-    // Account the chunk so it is reclaimed on death or unregister.
-    if !ensure_slots(l, 1) || !l.push_frame(rec, frame)
+    // Record the run on its chunk, so it is reclaimed on death or unregister.
+    if !ensure_slots(l, need) || l.back_chunk(reg, frame).is_err()
     {
         release_unmapped_chunk(l, rec, aspace_cap, frame);
         decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
@@ -1841,7 +1859,8 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 /// Map the demand chunk `frame` describes into the client address space
 /// `aspace_cap` at `frame.va` with `prot`. When the kernel reports the
 /// client's page-table pool exhausted, memmgr funds the pool from its own
-/// ([`fund_client_page_tables`]) and maps again, at most [`PT_FUND_ROUNDS`]
+/// ([`fund_client_page_tables`]), holding the `held` arena slots that
+/// recording the chunk takes, and maps again, at most [`PT_FUND_ROUNDS`]
 /// times. Returns the last map error otherwise.
 ///
 /// Pool outers are full-rights, so `mem_map` gates the mapping to `prot`
@@ -1856,6 +1875,7 @@ fn map_client_chunk(
     aspace_cap: u64,
     frame: &FrameDesc,
     prot: u64,
+    held: u64,
 ) -> Result<(), i64>
 {
     let mut rounds: u32 = 0;
@@ -1881,7 +1901,7 @@ fn map_client_chunk(
         };
         if e != SyscallError::OutOfMemory as i64
             || rounds == PT_FUND_ROUNDS
-            || !fund_client_page_tables(l, rec, aspace_cap)
+            || !fund_client_page_tables(l, rec, aspace_cap, held)
         {
             return Err(e);
         }
@@ -1897,11 +1917,12 @@ fn map_client_chunk(
 /// reclaims it, once the address space's teardown has released the donation
 /// (services/memmgr/docs/memory-pool.md § Client page-table funding). memmgr
 /// keeps the run's cap as the reclaim anchor. A refused donation returns the
-/// run to the pool.
-fn fund_client_page_tables(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64) -> bool
+/// run to the pool. The arena keeps `held` free slots beside the run's
+/// descriptor, for the caller's demand chunk.
+fn fund_client_page_tables(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, held: u64) -> bool
 {
-    // One slot for this run's descriptor, and one held for the chunk's.
-    if !ensure_slots(l, 2)
+    // One slot for this run's descriptor, and those held for the chunk.
+    if !ensure_slots(l, held.saturating_add(1))
     {
         return false;
     }
@@ -2122,8 +2143,8 @@ fn ingest_pool(boot: &InitBootstrap)
 /// The arenas are retype-pinned and offset-mapped for the immortal service's
 /// life — memmgr never allocates from or frees them; this is pure accounting.
 /// The owner records (procmgr, memmgr-self, init-self) must already exist.
-/// Frames carry [`FRAME_VA_UNMAPPED`]: memmgr did not map them, so no
-/// `UNREGISTER_REGION` path ever unmaps them.
+/// Frames carry [`FRAME_VA_UNMAPPED`]: memmgr did not map them, and they sit
+/// on the record's frame list, which no `UNREGISTER_REGION` touches.
 fn ingest_in_use(boot: &InitBootstrap)
 {
     let l = ledger_mut();

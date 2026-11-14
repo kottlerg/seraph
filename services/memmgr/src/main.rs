@@ -2381,8 +2381,8 @@ fn pool_total_add(pages: u64)
 /// static suffices.
 static mut PRESSURE: PressureLevel = PressureLevel::Normal;
 
-/// The pressure level as it stands: the free pool, deferred pages excluded,
-/// against `pool_total` ([`pressure_level`]).
+/// The pressure level [`signal_pressure`] last computed, at the top of this
+/// turn of the receive loop.
 fn current_pressure() -> PressureLevel
 {
     // SAFETY: memmgr is single-threaded; no concurrent access.

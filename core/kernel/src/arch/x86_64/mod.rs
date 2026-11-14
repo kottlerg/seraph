@@ -24,6 +24,7 @@ pub mod speculation;
 pub mod syscall;
 pub mod timer;
 pub mod trap_frame;
+pub mod vulnerability;
 
 /// Architecture name string for use in diagnostic output.
 pub const ARCH_NAME: &str = "x86_64";

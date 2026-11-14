@@ -13,7 +13,7 @@
 //! `copy_user`, `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
 //! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
-//! host stubs). `cpuid`, `current_cpu` (which returns 0 under test),
+//! host stubs). `cpuid`, `cpuid_subleaf`, `current_cpu` (which returns 0 under test),
 //! `halt_until_interrupt`, `disable_interrupts`, `halt_loop`, and the no-op
 //! `disable_unswitched_user_state` are also built for host tests.
 
@@ -28,7 +28,14 @@
 /// case the `pop` clobbers the result.
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32)
 {
-    let r = core::arch::x86_64::__cpuid_count(leaf, 0);
+    cpuid_subleaf(leaf, 0)
+}
+
+/// Execute CPUID with leaf `leaf` and sub-leaf `subleaf`. Returns
+/// `(eax, ebx, ecx, edx)`, through the same intrinsic as [`cpuid`].
+pub fn cpuid_subleaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32)
+{
+    let r = core::arch::x86_64::__cpuid_count(leaf, subleaf);
     (r.eax, r.ebx, r.ecx, r.edx)
 }
 

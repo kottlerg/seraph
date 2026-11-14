@@ -337,6 +337,7 @@ policy + budget):
 [Capability Model](../../../docs/capability-model.md),
 [Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Supervision](../../../docs/supervision.md),
 [services/init/README.md](../../init/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),

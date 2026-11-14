@@ -16,10 +16,11 @@ This document is authoritative for:
   parent-chosen runtime values and which are ABI constants.
 - The steady-state process-creation flow under procmgr.
 - The process-death notification flow that drives memmgr reclamation.
-- The procmgr-restart fallback when procmgr itself dies.
 
 Component-internal details (memmgr's pool structure, procmgr's ELF
-loader, init's per-stage code) live in those components' own docs.
+loader, init's per-stage code) live in those components' own docs. Who
+supervises which service, and what the death of memmgr or procmgr does to
+the system, is specified in [Supervision](supervision.md).
 
 ---
 
@@ -555,25 +556,12 @@ reclamation step inserts back into the free pool.
 
 ---
 
-## Procmgr Restart Fallback
+## Death of memmgr or procmgr
 
-If procmgr itself dies, no other process can spawn replacements via the
-normal path. procmgr's recipe is `restart = never`, `critical = yes`:
-svcmgr does not recreate procmgr and initiates a graceful shutdown (see
-[Restart Protocol](../services/svcmgr/docs/restart-protocol.md#procmgr-fallback)
-§ procmgr Fallback and
-[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md#critical)
-§ `critical`). A raw-syscall
-fallback that recreates procmgr and re-establishes its memmgr cap is not
-implemented.
-
-memmgr's state is independent of procmgr's, and memmgr's `REGISTER_PROCESS`
-authority is held by whichever process holds the procmgr-side badged
-cap at the time.
-
-If memmgr dies, the system cannot recover. Memmgr is on the trusted
-path of every std-built service; its death implies an unrecoverable
-fault. svcmgr does not restart memmgr.
+memmgr and procmgr are in the core set: neither is restarted, and the
+death of either is system death, which svcmgr turns into a graceful
+shutdown (see [Supervision § Core Set and System
+Death](supervision.md#core-set-and-system-death)).
 
 ---
 
@@ -610,7 +598,8 @@ Handling](fault-handling.md#delivery-resume-and-kill)).
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
 [Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
-[Capability Model](capability-model.md), [Fault Handling](fault-handling.md), [Testing](testing.md),
+[Capability Model](capability-model.md), [Fault Handling](fault-handling.md),
+[Supervision](supervision.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
 [programs/pipefault/README.md](../programs/pipefault/README.md),
 [programs/relrofault/README.md](../programs/relrofault/README.md),

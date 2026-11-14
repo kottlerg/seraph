@@ -95,8 +95,11 @@ and teardown go through procmgr. See
 
 **svcmgr**
 Service supervisor and discovery registry. Detects crashes and restarts
-services via procmgr; a procmgr death triggers graceful shutdown (the
-raw-syscall procmgr-restart fallback is not implemented). See
+services via procmgr. memmgr, procmgr, and svcmgr form the core set, which
+never restarts: the death of memmgr or procmgr powers the system off, and
+so would svcmgr's (design intent; not yet implemented (#262)). The
+supervision hierarchy and the restart model are specified in
+[`supervision.md`](supervision.md). See
 [`services/svcmgr/README.md`](../services/svcmgr/README.md).
 
 **devmgr**
@@ -323,6 +326,7 @@ either aim.
 
 [README.md](../README.md), [core/kernel/README.md](../core/kernel/README.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
+[Supervision](supervision.md),
 [runtime/libc/README.md](../runtime/libc/README.md),
 [services/drivers/README.md](../services/drivers/README.md),
 [services/netd/README.md](../services/netd/README.md),

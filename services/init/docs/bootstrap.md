@@ -390,11 +390,11 @@ enumerates init's side of it.
 [System Bootstrap](../../../docs/bootstrap.md),
 [Device Management](../../../docs/device-management.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Supervision](../../../docs/supervision.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
 [services/init/README.md](../README.md), [logd IPC interface](../../logd/docs/ipc-interface.md),
 [memmgr Memory Pool](../../memmgr/docs/memory-pool.md),
 [services/procmgr/README.md](../../procmgr/README.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md),
 [svcmgr IPC Interface](../../svcmgr/docs/ipc-interface.md),
-[Restart Protocol](../../svcmgr/docs/restart-protocol.md),
 [vfsd Service Interface](../../vfsd/docs/vfs-ipc-interface.md)

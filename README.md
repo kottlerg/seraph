@@ -86,6 +86,8 @@ Overall project design documents live in [`docs/`](docs/):
   memmgr authority, page-reservation contract
 - [Process Lifecycle](docs/process-lifecycle.md) — userspace boot order,
   ProcessInfo/InitInfo handover, process-death flow
+- [Supervision](docs/supervision.md) — supervision hierarchy, core set and system death,
+  restart shapes, late-launch rule
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
 - [Fault Handling](docs/fault-handling.md) — userspace fault-handler protocol (pager):

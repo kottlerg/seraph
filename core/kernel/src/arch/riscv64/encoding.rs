@@ -7,7 +7,7 @@
 //! window, page rounding, the timer's tick and microsecond conversions, the
 //! F/D/V opcode decode the lazy extended-state trap uses, the Zkr `seed` CSR's
 //! status decode and the word the hardware RNG builds from its samples, the
-//! PTE permission bits and their test in the kernel's spurious-fault retry,
+//! `sstateen0` value and the check of its read back, the PTE permission bits and their test in the kernel's spurious-fault retry,
 //! and the user leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
@@ -207,6 +207,49 @@ pub(super) fn seed_word(
         word |= u64::from(sample) << shift;
     }
     Ok(word)
+}
+
+// ── The Ssstateen `sstateen0` CSR ─────────────────────────────────────────────
+
+/// The value every hart writes to `sstateen0`: no state enabled for U-mode.
+///
+/// The CSR's bits that reach U-mode gate state the kernel does not save and
+/// restore on a context switch, so each is clear: bit 0 (`C`) the
+/// implementation's custom state, bit 1 (`FCSR`) the `fcsr` of a hart whose
+/// floating point runs on the integer registers (Zfinx; read-only zero on a
+/// hart with F, which the floor requires), and bit 2 (`JVT`) the Zcmt jump
+/// table register `jvt`. A bit a later extension defines is clear too, so U-mode
+/// reaches its state only once the kernel switches that state and sets the bit
+/// here. See docs/platform-requirements.md § riscv64 Classification.
+pub(super) const SSTATEEN0_USER_ENABLES: u64 = 0;
+
+/// Why the write of [`SSTATEEN0_USER_ENABLES`] to `sstateen0` did not take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SstateenError
+{
+    /// The write or the read back trapped: the hart has no Ssstateen, or its
+    /// M-mode firmware left `mstateen0.SE0` clear, which keeps `sstateen0`
+    /// from S-mode.
+    Inaccessible,
+    /// The CSR read back this value, not the one written.
+    Kept(u64),
+}
+
+/// Judge the write of [`SSTATEEN0_USER_ENABLES`] to `sstateen0` by its read
+/// back: `None` when an access trapped, else the value the CSR held after the
+/// write.
+///
+/// # Errors
+/// [`SstateenError::Inaccessible`] when an access trapped;
+/// [`SstateenError::Kept`] when the CSR holds another value.
+pub(super) fn check_sstateen0(read_back: Option<u64>) -> Result<(), SstateenError>
+{
+    match read_back
+    {
+        None => Err(SstateenError::Inaccessible),
+        Some(value) if value == SSTATEEN0_USER_ENABLES => Ok(()),
+        Some(value) => Err(SstateenError::Kept(value)),
+    }
 }
 
 // ── PTE permission bits and the kernel spurious-fault test ───────────────────
@@ -695,5 +738,32 @@ mod tests
         );
         assert_eq!(word, Err(SeedError::TimedOut));
         assert_eq!(reads, 3);
+    }
+
+    // ── The Ssstateen `sstateen0` CSR ──
+
+    #[test]
+    fn an_sstateen0_that_reads_back_the_value_written_is_accepted()
+    {
+        assert_eq!(check_sstateen0(Some(SSTATEEN0_USER_ENABLES)), Ok(()));
+    }
+
+    #[test]
+    fn a_trapped_sstateen0_access_is_inaccessible()
+    {
+        // The probe's fixup reports a trap as `None`; accepting it would let
+        // U-mode keep whatever state enables the firmware left.
+        assert_eq!(check_sstateen0(None), Err(SstateenError::Inaccessible));
+    }
+
+    #[test]
+    fn an_sstateen0_enable_left_set_is_reported_with_the_value_read()
+    {
+        // The `JVT` bit kept set: U-mode would reach `jvt`, which no switch saves.
+        let jvt_kept = SSTATEEN0_USER_ENABLES | (1 << 2);
+        assert_eq!(
+            check_sstateen0(Some(jvt_kept)),
+            Err(SstateenError::Kept(jvt_kept))
+        );
     }
 }

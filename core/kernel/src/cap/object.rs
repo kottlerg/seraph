@@ -68,6 +68,7 @@ pub enum ObjectType
     /// The header of a `CSpace` body-arena page ([`ArenaPage`]); never in a
     /// capability slot.
     ArenaPage = 13,
+    EntropyControl = 14,
 }
 
 // ── KernelObjectHeader ────────────────────────────────────────────────────────
@@ -717,6 +718,7 @@ unsafe fn lineage_of<'a>(hdr: NonNull<KernelObjectHeader>) -> &'a RangeLineage
         | ObjectType::EventQueue
         | ObjectType::WaitSet
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage => crate::fatal("lineage_of: not a range-capability object"),
     }
 }
@@ -1146,6 +1148,18 @@ pub struct SchedControlObject
 /// M-mode firmware.
 #[repr(C)]
 pub struct SbiControlObject
+{
+    pub header: KernelObjectHeader,
+}
+
+/// Kernel object for entropy-contribution authority (`EntropyControl`
+/// capability).
+///
+/// There is exactly one `EntropyControl` object, created at boot. Grants the
+/// holder authority to mix bytes into the kernel entropy pool with
+/// `SYS_ENTROPY_CONTRIBUTE`; it carries no fields.
+#[repr(C)]
+pub struct EntropyControlObject
 {
     pub header: KernelObjectHeader,
 }
@@ -1891,6 +1905,7 @@ const _: () = {
     assert!(size_of::<IoPortObject>() as u64 <= floor);
     assert!(size_of::<SchedControlObject>() as u64 <= floor);
     assert!(size_of::<SbiControlObject>() as u64 <= floor);
+    assert!(size_of::<EntropyControlObject>() as u64 <= floor);
     assert!(size_of::<ThreadObject>() as u64 <= floor);
     assert!(size_of::<AddressSpaceObject>() as u64 <= floor);
     assert!(size_of::<CSpaceKernelObject>() as u64 <= floor);
@@ -2749,6 +2764,7 @@ unsafe fn deferred_link(ptr: NonNull<KernelObjectHeader>) -> *mut *mut KernelObj
         | ObjectType::EventQueue
         | ObjectType::WaitSet
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage => crate::fatal("deferred reclaim: object type carries no link"),
     }
 }
@@ -2832,6 +2848,7 @@ pub unsafe fn release_ref(obj: NonNull<KernelObjectHeader>)
         | ObjectType::EventQueue
         | ObjectType::WaitSet
         | ObjectType::SbiControl
+        | ObjectType::EntropyControl
         | ObjectType::ArenaPage =>
         {
             // SAFETY: refcount 0; no other references exist; no lock held
@@ -3541,7 +3558,8 @@ pub unsafe fn object_for_new_slot(
         | CapTag::CSpace
         | CapTag::WaitSet
         | CapTag::SchedControl
-        | CapTag::SbiControl =>
+        | CapTag::SbiControl
+        | CapTag::EntropyControl =>
         {
             // A new slot is the reference userspace can multiply, so it is
             // refused at the ceiling (`REF_COUNT_LIMIT`).
@@ -3905,6 +3923,12 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
             // SAFETY: refcount 0, exclusively owned SbiControlObject (dealloc_object's
             // contract); no lock is held.
             unsafe { free_body::<SbiControlObject>(ptr, stack) };
+        }
+        ObjectType::EntropyControl =>
+        {
+            // SAFETY: refcount 0, exclusively owned EntropyControlObject
+            // (dealloc_object's contract); no lock is held.
+            unsafe { free_body::<EntropyControlObject>(ptr, stack) };
         }
 
         // ── Arena page kept past its CSpace ───────────────────────────────

@@ -543,12 +543,15 @@ Phase 7.
       I/O; or one SbiControl capability (RISC-V only) carrying every
       sanctioned SBI right, for init to forward sanctioned SBI extensions and
       attenuate per-consumer copies.
-   g. Memory capabilities for the boot module images, via
+   g. One EntropyControl capability carrying Contribute, authorising the holder to
+      contribute bytes to the entropy pool through SYS_ENTROPY_CONTRIBUTE; init finds it by
+      its `CapDescriptor` (`CapType::EntropyControl`, `aux0 = aux1 = 0`)
+   h. Memory capabilities for the boot module images, via
       `cap::mint_module_memory_caps` (one per `BootInfo.modules` entry), which
       also writes each module's name entry, and the entry count, into the
       `InitInfo` header's module-name table in place in the region step 1
       reserved
-   h. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
+   i. (Init's AddressSpace, Thread, and CSpace capabilities and the Memory capabilities
       for its segments, InitInfo pages, and stack pages are added in Phase 9)
 
    Because step 1 reserves Phase 9's backing before the drain takes the

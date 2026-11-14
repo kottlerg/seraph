@@ -128,7 +128,7 @@ core/kernel/
 │   └── syscall/                # Syscall dispatch
 │       ├── mod.rs              # Dispatch; yield/exit/sleep, IPC-buffer and notification binding
 │       ├── cap.rs              # Capability syscall implementations
-│       ├── entropy.rs          # SYS_GETRANDOM
+│       ├── entropy.rs          # SYS_GETRANDOM, SYS_ENTROPY_CONTRIBUTE
 │       ├── hw.rs               # MMIO, IRQ, and I/O-port syscalls and their splits
 │       ├── ipc.rs              # IPC syscall implementations
 │       ├── mem.rs              # Memory syscall implementations
@@ -198,7 +198,8 @@ The kernel entropy subsystem: a multi-source pool feeding per-CPU forward-secure
 CSPRNGs, with hardware-source health gating, an interrupt-time jitter source, a
 kernel-internal draw API, and a boot-time power-on self-test. Kernel consumers
 call `fill_bytes`; userspace draws from the same generators through
-`SYS_GETRANDOM`. See [`docs/entropy.md`](docs/entropy.md).
+`SYS_GETRANDOM`, and a holder of an `EntropyControl` capability contributes bytes through
+`SYS_ENTROPY_CONTRIBUTE`. See [`docs/entropy.md`](docs/entropy.md).
 
 ### `ipc/`
 

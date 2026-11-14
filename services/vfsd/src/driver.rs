@@ -24,6 +24,8 @@
 //! fatfs is never handed the whole-disk cap and cannot escape the partition
 //! regardless of what sector number it computes.
 
+use std::os::seraph::process::ArgvEnvCap;
+
 use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 
 use crate::VfsdCaps;
@@ -285,20 +287,42 @@ fn spawn_via_module(
         return false;
     };
 
+    let argv_env = inherited_level_env();
+    let argv_env_flag = if argv_env.is_some()
+    {
+        procmgr_labels::CREATE_ARGV_ENV
+    }
+    else
+    {
+        0
+    };
     // Same placement as the on-disk fs-driver spawn path (worker.rs): an
     // fs driver runs at vfsd's own level with a matching band ceiling.
-    let create_msg = IpcMessage::builder(
+    // Caps: [module, creator, argv_env?]; the argv/env header rides in data
+    // words 0..4.
+    let mut builder = IpcMessage::builder(
         procmgr_labels::CREATE_PROCESS
+            | argv_env_flag
             | procmgr_labels::create_sched_bits(
                 ipc::sched_policy::FS_DRIVER_PRIORITY,
                 ipc::sched_policy::FS_DRIVER_PRIORITY,
             ),
     )
     .cap(module_copy)
-    .cap(badged_creator)
-    .build();
+    .cap(badged_creator);
+    if let Some(env) = &argv_env
+    {
+        builder = builder.words(0, &env.header_words()).cap(env.cap());
+    }
+    let create_msg = builder.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(create_reply) = (unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) })
+    let create_reply = unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) };
+    // procmgr has copied the env by now, or refused the request.
+    if let Some(env) = argv_env
+    {
+        env.settle(create_reply.as_ref().map_or(0, |r| r.label));
+    }
+    let Ok(create_reply) = create_reply
     else
     {
         // A call refused before delivery transfers no cap, so both are still
@@ -338,6 +362,24 @@ fn spawn_via_module(
     }
 
     true
+}
+
+/// The env an fs driver is created with: vfsd's own level, which every fs
+/// driver inherits (`std::os::seraph::log::inherited_level_entry`), as its
+/// one entry. `None` while vfsd logs at info, and, after a warning, when the
+/// cap cannot be built; the driver then logs at info. Both spawn paths use it.
+pub fn inherited_level_env() -> Option<ArgvEnvCap>
+{
+    let entry = std::os::seraph::log::inherited_level_entry()?;
+    match ArgvEnvCap::new(&[], 0, &entry, 1)
+    {
+        Ok(env) => env,
+        Err(e) =>
+        {
+            std::os::seraph::log!(warn: "fatfs spawn: level env not built ({e}); driver logs at info");
+            None
+        }
+    }
 }
 
 /// Post-boot spawn path: resolve `/services/fs/fatfs` via vfsd's held namespace

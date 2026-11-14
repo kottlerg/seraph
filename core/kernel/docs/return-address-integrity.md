@@ -103,7 +103,8 @@ no compiler instrumentation.
 
 Downsides of the direction:
 
-- A riscv64 hart without Zicfiss gets no protection, and Zicfiss is optional in RVA23 (check 4).
+- A riscv64 machine on which any hart lacks Zicfiss gets no protection on any hart, and Zicfiss
+  is optional in RVA23 (check 4).
 - x86-64 hardware without CET gets no protection.
 - The x86-64 enabled path lies outside the CI gate.
 - The riscv64 path depends on an unstable rustc flag and on target features LLVM still names
@@ -132,20 +133,25 @@ extension, as § Verification Record cites them.
   between them, made with interrupts disabled, after the hart's first shadow stack has its SS
   leaf (below):
   - The boot hart enables after Phase 3 and the boot-stack rebase, inline in
-    `kernel_entry_post_rebase`, not in a function it calls. Before Phase 3 no direct map, and so
-    no SS leaf, exists. A function entered before the enable would check its return against a
-    shadow stack it never pushed to; `kernel_entry_post_rebase` never returns, so no frame that
-    began before the enable runs its `sspopchk`.
+    `kernel_entry_post_rebase` once Phase 4 has captured `KernelMmio`, not in a function it
+    calls. Before Phase 3 no direct map, and so no SS leaf, exists. A function entered before the
+    enable would check its return against a shadow stack it never pushed to;
+    `kernel_entry_post_rebase` never returns, so no frame that began before the enable runs its
+    `sspopchk`.
   - A secondary hart enables in its startup assembly, before its first call, on the shadow
     stack the boot hart prepared for its idle stack.
   - Shadow stacks are on for every hart or for none, since a thread migrates between harts with
-    a live call chain. The boot hart's reply decides: after an error reply
-    (`SBI_ERR_NOT_SUPPORTED` from a firmware whose hart lacks Zicfiss, or the reply of a
-    firmware without FWFT) no hart asks, and the kernel runs with the instructions as no-ops. A
-    secondary hart whose `SET` fails after the boot hart's succeeded halts the boot, as a
-    secondary hart with a different vector length does
+    a live call chain, so the kernel decides before any hart enables. The bootloader gains a
+    `HART_CAP_ZICFISS` bit in `KernelMmio::hart_caps`, which it sets only when every enabled
+    hart's DTB node or ACPI RHCT ISA string advertises Zicfiss, as for the other `HART_CAP_*`
+    bits. Without that bit no hart asks, and the kernel runs with the instructions as no-ops: a
+    machine on which only some harts have Zicfiss boots unprotected. With it, the boot hart's
+    reply decides: after an error reply (`SBI_ERR_NOT_SUPPORTED`, or the reply of a firmware
+    without FWFT) no hart asks either. A secondary hart whose `SET` fails after the boot hart's
+    succeeded contradicts its own hardware description, and halts the boot, as a secondary hart
+    with a different vector length does
     ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § riscv64
-    Classification).
+    Classification states both conditions).
 
   The kernel keeps `senvcfg.SSE` clear, so U-mode cannot access `ssp` and runs Zicfiss
   instructions as no-ops. `SYS_SBI_CALL` keeps refusing the FWFT extension (`syscall/sbi.rs`),

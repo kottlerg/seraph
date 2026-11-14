@@ -248,7 +248,10 @@ Each feature is classified per architecture as one of:
   CSR (see [core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md)).
 - **GOP framebuffer, PCIe ECAM** — as on x86-64.
 - **Zicfiss** — supervisor shadow stacks, return-address integrity for the kernel, enabled
-  through the SBI Firmware Features extension; an RVA23 option, not mandatory (design intent;
+  through the SBI Firmware Features extension; an RVA23 option, not mandatory. Used only when
+  the firmware tables advertise it for every hart, so a machine on which only some harts have it
+  runs unprotected; a secondary hart whose firmware then refuses the enable, after the boot
+  hart's succeeded, halts the boot, since its description is wrong (design intent;
   not yet enabled, and not buildable until the toolchain emits the shadow-stack instructions;
   [core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 

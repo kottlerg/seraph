@@ -84,11 +84,11 @@ scaling, and DRAM rows. The system draws the line as follows.
   no `scounteren` bit beyond `CY` (performance-counter access is design intent, not yet
   implemented, [#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the
   gating of that counter, need security domains
-  ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only policy treats every address space as its own domain, which in a
-  microkernel puts a predictor barrier on most IPC switches, and one control applied alone (SMT
-  sibling parking, for example) gives no guarantee that can be stated. Cross-domain isolation
-  is design intent, not yet implemented
-  ([#1086](https://github.com/kottlerg/seraph/issues/1086)).
+  ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only
+  policy treats every address space as its own domain, which in a microkernel puts a predictor
+  barrier on most IPC switches, and one control applied alone (SMT sibling parking, for
+  example) gives no guarantee that can be stated. Cross-domain isolation is design intent, not
+  yet implemented ([#1086](https://github.com/kottlerg/seraph/issues/1086)).
 - **SMT** — stays on. The kernel brings up and schedules every logical CPU, SMT siblings
   included, as an independent CPU. Siblings are not an isolation boundary: threads of different
   processes run on the siblings of one core at once, and contention for the resources the

@@ -84,6 +84,9 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     // before this call. A refusal is reported where the checks stood, after
     // the range checks below.
     let permissions = map_permissions(prot_bits, memory_slot.rights);
+    // The rights `prot_bits` asks for, folded into the address space the
+    // mapping loop walks once the refusal has passed (below).
+    let permitted = memory_slot.rights_mask(requested_rights(prot_bits));
     if matches!(permissions, Ok((_, true)))
     {
         crate::mm::icache::sync_user_code();
@@ -111,12 +114,17 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
     }
     // The physical span of the mapped pages. It lies inside the Memory
     // object's range, which cannot pass the end of the address space; the
-    // checks refuse a span that would rather than wrap it.
+    // checks refuse a span that would rather than wrap it. The span is the
+    // offset and the length clamped as data (`nospec::mask_span_u64`), so the
+    // frame pins and the mapping loop of a path past a mispredicted bound
+    // cover no frame outside the object.
+    let (span_offset, span_len) =
+        crate::arch::nospec::mask_span_u64(byte_offset, mapping_size, memory_size);
     let phys_base = memory_phys
-        .checked_add(byte_offset)
+        .checked_add(span_offset)
         .ok_or(SyscallError::InvalidArgument)?;
     let phys_end = phys_base
-        .checked_add(mapping_size)
+        .checked_add(span_len)
         .ok_or(SyscallError::InvalidArgument)?;
 
     // Retype/map boundary (docs/capability-model.md § Typed Memory). Pin the
@@ -165,13 +173,19 @@ pub fn sys_mem_map(tf: UserFrame) -> Result<u64, SyscallError>
         executable: memory_slot.rights.contains(MemRights::EXECUTE.erase()),
     };
 
-    // Resolve AddressSpace cap.
+    // Resolve AddressSpace cap. The address space is selected through the
+    // requested rights' mask, so a path past a mispredicted rights refusal
+    // walks a null address space (core/kernel/docs/capability-internals.md
+    // § Speculative-Execution Hardening); architecturally the refusal has
+    // passed, and the select returns the pinned object.
     // SAFETY: caller_cspace validated; lookup_cap checks tag and rights.
     let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let (as_ptr, aso_raw) = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        let aso = obj.as_ptr().cast::<AddressSpaceObject>();
-        // SAFETY: aso is a valid pointer to an AddressSpaceObject.
+        let aso = crate::arch::nospec::select_ptr(permitted, obj.as_ptr(), core::ptr::null_mut())
+            .cast::<AddressSpaceObject>();
+        // SAFETY: tag confirmed AddressSpace, and the rights refusal above
+        // has passed, so aso is the AddressSpaceObject `aspace_slot` pins.
         let as_inner = unsafe { (*aso).address_space };
         (as_inner, aso)
     };
@@ -249,6 +263,18 @@ fn map_permissions(
         return Err(SyscallError::WxViolation);
     }
     Ok((writable, executable))
+}
+
+/// The Memory rights a `SYS_MEM_MAP` or `SYS_MEM_PROTECT` `prot_bits` asks
+/// for: its `MAP_WRITABLE` and `MAP_EXECUTABLE` bits, which are the Memory
+/// rights' `WRITE` and `EXECUTE` bits (`abi/syscall` asserts it). The mask
+/// [`super::PinnedCap::rights_mask`] gives for them is the handlers' rights
+/// fold.
+fn requested_rights(prot_bits: u64) -> crate::cap::slot::Rights
+{
+    crate::cap::slot::Rights::from_mask(
+        prot_bits & (syscall::MAP_WRITABLE | syscall::MAP_EXECUTABLE),
+    )
 }
 
 /// Frame-map pins over a span of frames, held by `sys_mem_map` from before its
@@ -460,6 +486,12 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
     let memory_rights = memory_slot.rights;
 
     // Requested permissions must be a subset of what the Memory cap allows.
+    // The requested rights' mask selects the address space the protect loop
+    // walks, so a path past a mispredicted refusal walks a null address space
+    // (core/kernel/docs/capability-internals.md § Speculative-Execution
+    // Hardening); architecturally the refusal has passed, and the select
+    // returns the pinned object.
+    let permitted = memory_slot.rights_mask(requested_rights(prot_bits));
     if writable && !memory_rights.contains(MemRights::WRITE.erase())
     {
         return Err(SyscallError::InsufficientRights);
@@ -480,8 +512,11 @@ pub fn sys_mem_protect(tf: UserFrame) -> Result<u64, SyscallError>
     let aspace_slot = unsafe { super::lookup_cap(caller_cspace, aspace_idx, AsRights::MAP) }?;
     let as_ptr = {
         let obj = aspace_slot.object.ok_or(SyscallError::InvalidCapability)?;
-        // SAFETY: tag confirmed AddressSpace.
-        let as_obj = unsafe { &*(obj.as_ptr().cast::<AddressSpaceObject>()) };
+        let aso = crate::arch::nospec::select_ptr(permitted, obj.as_ptr(), core::ptr::null_mut())
+            .cast::<AddressSpaceObject>();
+        // SAFETY: tag confirmed AddressSpace, and the rights refusal above
+        // has passed, so aso is the AddressSpaceObject `aspace_slot` pins.
+        let as_obj = unsafe { &*aso };
         as_obj.address_space
     };
 
@@ -1062,4 +1097,26 @@ pub fn sys_memory_merge(tf: UserFrame) -> Result<u64, SyscallError>
 pub fn sys_memory_merge(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::requested_rights;
+    use crate::cap::slot::{MemRights, Rights};
+
+    #[test]
+    fn requested_rights_are_the_write_and_execute_of_prot_bits_alone()
+    {
+        let write = MemRights::WRITE.erase();
+        let execute = MemRights::EXECUTE.erase();
+        assert_eq!(requested_rights(0), Rights::NONE);
+        assert_eq!(requested_rights(syscall::MAP_WRITABLE), write);
+        assert_eq!(
+            requested_rights(syscall::MAP_WRITABLE | syscall::MAP_EXECUTABLE),
+            write | execute
+        );
+        // Bits outside the two name no right a map or protect checks.
+        assert_eq!(requested_rights(!syscall::MAP_WRITABLE), execute);
+    }
 }

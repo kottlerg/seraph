@@ -717,8 +717,8 @@ mod tests
 {
     use super::*;
     use crate::arena::test_store::VecStore;
-    use crate::chunk::ChunkState;
     use crate::budget::{NO_MAX, reserve_pages};
+    use crate::chunk::ChunkState;
 
     const UNMAPPED: u64 = u64::MAX;
 
@@ -960,8 +960,12 @@ mod tests
         l.back_chunk(rec, reg, frame(1, 4, 0x1_0000, BASE)).unwrap();
         l.back_chunk(rec, reg, frame(2, 12, 0x2_0000, BASE + 4 * PAGE_SIZE))
             .unwrap();
-        l.back_chunk(rec, reg, frame(3, 3, 0x3_0000, BASE + 63 * CHUNK + PAGE_SIZE))
-            .unwrap();
+        l.back_chunk(
+            rec,
+            reg,
+            frame(3, 3, 0x3_0000, BASE + 63 * CHUNK + PAGE_SIZE),
+        )
+        .unwrap();
         (l, free, rec, reg)
     }
 
@@ -999,7 +1003,11 @@ mod tests
         );
         // A run crossing into the next chunk leaves its own.
         assert_eq!(
-            l.back_chunk(rec, reg, frame(4, 2, 0x4_0000, BASE + 63 * CHUNK - PAGE_SIZE)),
+            l.back_chunk(
+                rec,
+                reg,
+                frame(4, 2, 0x4_0000, BASE + 63 * CHUNK - PAGE_SIZE)
+            ),
             Err(BackError::Chunk(ChunkError::Window))
         );
         assert_eq!(
@@ -1010,7 +1018,10 @@ mod tests
             l.back_chunk(rec, reg, at(BASE - PAGE_SIZE)),
             Err(BackError::Outside)
         );
-        assert_eq!(l.back_chunk(rec, reg, at(BASE + 0x800)), Err(BackError::Outside));
+        assert_eq!(
+            l.back_chunk(rec, reg, at(BASE + 0x800)),
+            Err(BackError::Outside)
+        );
         assert_eq!(l.back_chunk(rec, rec, at(BASE)), Err(BackError::NoRegion));
         assert_eq!(l.arena.free_count(), free);
         // Chunk 40 lies under the root's child that holds chunk 63, but under
@@ -1324,7 +1335,10 @@ mod tests
         let c = budget::node(&l.arena, child_node).unwrap();
         assert_eq!((c.refs, c.own), (0, 5));
         assert_eq!(c.own, held_by(&l, child_node));
-        assert_eq!(budget::node(&l.arena, parent_node).map(|p| p.subtree), Some(5));
+        assert_eq!(
+            budget::node(&l.arena, parent_node).map(|p| p.subtree),
+            Some(5)
+        );
         // The deferred run rejoins the pool: both nodes are freed.
         l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
         assert!(budget::node(&l.arena, child_node).is_none());

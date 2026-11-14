@@ -19,10 +19,10 @@
 )]
 
 use free_pool::{
-    ArenaLayout, ChargeError, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger,
-    MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError, NodeIdx, NodeSpec,
-    RecheckBudget, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
-    chunk_for, fault_window, region_grants, reserve_pages,
+    ArenaLayout, ChargeError, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
+    NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError, NodeIdx, NodeSpec, RecheckBudget,
+    RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk_for,
+    fault_window, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -1107,6 +1107,39 @@ fn pop_frames(l: &mut MemLedger, rec: NodeIdx, n: usize)
     }
 }
 
+/// Admit a grant of `want_pages` to the budget node of `rec` ([`admit`]), then
+/// select its runs, as one run when `flags` carries `REQUIRE_CONTIGUOUS`, else
+/// best-effort. The whole request is admitted before any run leaves the pool:
+/// a charge over a max fails `LIMIT`, whatever part of it the pool could serve;
+/// one that would take the reserve fails as exhaustion, with the out-of-memory
+/// code of the fit, as a failed selection does.
+fn select_admitted(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    want_pages: u32,
+    flags: u32,
+) -> Result<Grant, u64>
+{
+    let fit = if flags & memmgr_labels::REQUIRE_CONTIGUOUS == 0
+    {
+        Fit::BestEffort
+    }
+    else
+    {
+        Fit::Contiguous
+    };
+    match admit(l, rec, u64::from(want_pages))
+    {
+        Ok(()) => select(l, want_pages, fit),
+        Err(ChargeError::Limit) => Err(memmgr_errors::LIMIT),
+        Err(ChargeError::Reserve) => Err(match fit
+        {
+            Fit::Contiguous => memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
+            Fit::BestEffort | Fit::UpTo => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
+        }),
+    }
+}
+
 fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let arg = req.word(0);
@@ -1137,35 +1170,14 @@ fn handle_request_memory_caps(req: &IpcMessage, ipc_buf: *mut u64)
         return;
     }
 
-    let fit = if flags & memmgr_labels::REQUIRE_CONTIGUOUS == 0
+    let grant = match select_admitted(l, rec, want_pages, flags)
     {
-        Fit::BestEffort
-    }
-    else
-    {
-        Fit::Contiguous
-    };
-    // The whole request is admitted before any run leaves the pool: a charge
-    // over a max fails `LIMIT`, whatever part of it would fit; one that would
-    // take the reserve fails as exhaustion, with the out-of-memory code of
-    // the request's fit.
-    let selected = match admit(l, rec, u64::from(want_pages))
-    {
-        Ok(()) => select(l, want_pages, fit),
-        Err(ChargeError::Limit) =>
+        Ok(g) => g,
+        Err(memmgr_errors::LIMIT) =>
         {
             reply_label(ipc_buf, memmgr_errors::LIMIT);
             return;
         }
-        Err(ChargeError::Reserve) => Err(match fit
-        {
-            Fit::Contiguous => memmgr_errors::OUT_OF_MEMORY_CONTIGUOUS,
-            Fit::BestEffort | Fit::UpTo => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
-        }),
-    };
-    let grant = match selected
-    {
-        Ok(g) => g,
         Err(code) =>
         {
             let reply = IpcMessage::builder(code)
@@ -1310,7 +1322,9 @@ fn budget_parent(l: &MemLedger, badge: u64) -> Option<NodeIdx>
     {
         return None;
     }
-    l.find(badge).and_then(|rec| l.record(rec)).map(|r| r.budget)
+    l.find(badge)
+        .and_then(|rec| l.record(rec))
+        .map(|r| r.budget)
 }
 
 fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64, procmgr_badge: u64)
@@ -1861,6 +1875,25 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 /// holds (services/memmgr/docs/memory-pool.md § Chunk table). A declined
 /// fault's run is unmapped before it returns to the pool
 /// ([`release_unmapped_chunk`]).
+/// Admit a demand fault's span of `span_pages` to the budget node of `rec`
+/// ([`admit`]), then select the run that backs it: one covering the span, else
+/// the largest free run. The whole span is admitted before a run leaves the
+/// pool, though a fragmented pool may back less of it. A charge over a max is
+/// [`FaultDecline::BudgetLimit`]; one that would take the reserve, or a failed
+/// selection, is [`FaultDecline::NoFreePage`].
+fn select_fault_run(l: &mut MemLedger, rec: NodeIdx, span_pages: u32)
+-> Result<Grant, FaultDecline>
+{
+    match admit(l, rec, u64::from(span_pages))
+    {
+        Ok(()) => select(l, span_pages, Fit::Contiguous)
+            .or_else(|_| select(l, span_pages, Fit::UpTo))
+            .map_err(|_| FaultDecline::NoFreePage),
+        Err(ChargeError::Limit) => Err(FaultDecline::BudgetLimit),
+        Err(ChargeError::Reserve) => Err(FaultDecline::NoFreePage),
+    }
+}
+
 fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
 {
     if req.word(0) != syscall_abi::FAULT_KIND_VM
@@ -1933,29 +1966,14 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
     }
-    // The whole span is admitted against the process's budget before a run
-    // leaves the pool, though a fragmented pool may back less of it.
-    match admit(l, rec, u64::from(span_pages))
+    let grant = match select_fault_run(l, rec, span_pages)
     {
-        Ok(()) =>
-        {}
-        Err(ChargeError::Limit) =>
+        Ok(grant) => grant,
+        Err(reason) =>
         {
-            decline_fault(ipc_buf, FaultDecline::BudgetLimit, 0);
+            decline_fault(ipc_buf, reason, 0);
             return;
         }
-        Err(ChargeError::Reserve) =>
-        {
-            decline_fault(ipc_buf, FaultDecline::NoFreePage, 0);
-            return;
-        }
-    }
-    let Ok(grant) =
-        select(l, span_pages, Fit::Contiguous).or_else(|_| select(l, span_pages, Fit::UpTo))
-    else
-    {
-        decline_fault(ipc_buf, FaultDecline::NoFreePage, 0);
-        return;
     };
     let (outer, pages, phys) = grant.entries[0];
     // The run's mapped VA, which places it in its chunk.

@@ -262,7 +262,10 @@ pub fn uncharge<S: SlotStore>(arena: &mut Arena<S>, idx: NodeIdx, pages: u64)
     walk(arena, idx, |b, first| {
         if first
         {
-            debug_assert!(b.own >= pages, "uncharge: {pages} pages over the node's own");
+            debug_assert!(
+                b.own >= pages,
+                "uncharge: {pages} pages over the node's own"
+            );
             b.own = b.own.saturating_sub(pages);
         }
         b.subtree = b.subtree.saturating_sub(pages);

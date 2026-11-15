@@ -788,13 +788,17 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // grants S-mode when the hart has it, so the kernel's hardware RNG draws
     // from it; the source is optional, and `--riscv-zkr off` boots without it.
     //
+    // `svadu=off,svade=on` pins the Svade A/D scheme the kernel requires: the
+    // rv64 model enables Svadu, under which the hart sets A and D itself and
+    // the kernel's software A/D update (`user_fault_is_spurious`) never runs.
+    //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.
     args.extend([
         "-cpu".into(),
         format!(
             "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
-             ssaia=on,smaia=on,smstateen=on{}{}",
+             ssaia=on,smaia=on,smstateen=on,svadu=off,svade=on{}{}",
             spec.riscv_zkr.cpu_zkr_prop(),
             spec.riscv_mmu.cpu_satp_props()
         ),
@@ -1155,6 +1159,15 @@ mod tests
         // the hart has no Ssstateen; QEMU's rv64 model leaves Smstateen off.
         let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
         assert!(cpu_arg(&argv).contains(",smstateen=on"));
+    }
+
+    #[test]
+    fn riscv_cpu_pins_svade()
+    {
+        // The rv64 model enables Svadu, so without the pin the hart sets A
+        // and D itself and the kernel's Svade A/D update is never exercised.
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).contains(",svadu=off,svade=on"));
     }
 
     #[test]

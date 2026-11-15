@@ -357,6 +357,7 @@ and the generation) was decided on [#637](https://github.com/kottlerg/seraph/iss
 | `MAX_ENTROPY_CONTRIBUTE_LEN` | `abi/syscall/src/lib.rs` | 256 B | per-call bound (callers loop; it bounds the kernel's stack copy and the interrupts-off hold of the pool lock) | 256 B stack | correct as is | None |
 | `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` | `abi/syscall/src/lib.rs` | 512 pages per window | batch size (a larger region is read window by window) | none | correct as is | None |
 | `MAX_THREAD_MEM_COPY` | `abi/syscall/src/lib.rs` | 4096 B per call | per-call bound (the kernel stages the bytes in the per-CPU syscall scratch buffer, `core/kernel/src/syscall/scratch.rs`; a debugger loops over a larger range) | 4 KiB per CPU, the scratch buffer, which `SYS_CAP_REVOKE`'s 2 KiB batch snapshot (`MAX_REVOKE_EDITS`) shares | correct as is | None |
+| `MAX_HARVEST_PAGES` | `abi/syscall/src/lib.rs` | 4096 pages per call | per-call bound (it bounds `SYS_ASPACE_HARVEST`'s bitmap on the kernel stack and its hold of the page-table lock; a pager loops over a larger range) | 512 B stack | correct as is | None |
 | `encode_exit_code` range | `abi/syscall/src/lib.rs` | 12-bit code below `EXIT_FAULT_BASE` | encoding artefact (flat exit-reason space) | none | correct as is | Saturates; never aliases success |
 | `KERNEL_VERSION` packing | `abi/syscall/src/lib.rs` | 32 / 16 / 16 bits | encoding artefact | none | correct as is | None |
 

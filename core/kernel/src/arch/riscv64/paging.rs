@@ -146,14 +146,17 @@ const READ: u64 = super::encoding::PTE_READ;
 const WRITE: u64 = super::encoding::PTE_WRITE;
 /// Execute permission.
 const EXECUTE: u64 = super::encoding::PTE_EXECUTE;
-/// Accessed — must be pre-set in leaf PTEs.
+/// Accessed — pre-set in every leaf PTE the kernel builds.
 ///
-/// Per RISC-V Privileged Spec §5.4.1, an implementation may either update
-/// the A bit in hardware or raise a page fault when a load/store/fetch
-/// observes A=0. Hardware update is opt-in via the Svadu extension; absent
-/// Svadu, software must pre-set A=1.
+/// Per RISC-V Privileged Spec §5.4.1, an implementation either updates the A
+/// bit in hardware (Svadu, with `menvcfg.ADUE` set) or raises a page fault
+/// when an access observes A=0 (Svade, the baseline the kernel requires).
+/// Pre-setting it spares a new leaf that fault; a user leaf loses it only to
+/// `SYS_ASPACE_HARVEST` ([`clear_user_accessed`]), and the fault path sets it
+/// again ([`user_fault_is_spurious`]).
 const ACCESSED: u64 = 1 << 6;
-/// Dirty — must be pre-set in writable leaf PTEs (same rationale as ACCESSED).
+/// Dirty — pre-set in writable leaf PTEs (as ACCESSED; the fault path sets it
+/// on a store to a writable leaf that lacks it).
 const DIRTY: u64 = 1 << 7;
 /// PPN field mask: bits \[53:10\], representing `(phys >> 12) << 10`.
 const PPN_MASK: u64 = 0x003F_FFFF_FFFF_FC00;
@@ -214,8 +217,8 @@ impl PageTableEntry
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
-        // Pre-set A (and D for writable leaves) — see `ACCESSED` const for
-        // the Priv-Spec §5.4.1 / Svadu rationale.
+        // Pre-set A (and D for writable leaves): see `ACCESSED` for the
+        // Priv-Spec §5.4.1 Svade / Svadu rationale.
         let mut bits = VALID | ACCESSED | ((phys >> 2) & PPN_MASK);
         if flags.readable
         {
@@ -1359,6 +1362,173 @@ unsafe fn walk_leaves(
     }
 }
 
+// ── Accessed-bit harvest ──────────────────────────────────────────────────────
+
+/// The leaf `slot` as an atomic word. The A and D bits of a user leaf change
+/// under three writers that do not share a lock: the hart itself (under
+/// Svadu), the lock-free fault path ([`user_fault_is_spurious`]), and a
+/// harvest under `pt_lock`, so each of them updates the word atomically and
+/// none loses another's bit.
+#[cfg(not(test))]
+fn leaf_word(slot: &mut PageTableEntry) -> &AtomicU64
+{
+    // SAFETY: `PageTableEntry` is `repr(transparent)` over `u64`, so `slot` is
+    // a valid, 8-byte-aligned `u64` for the borrow's lifetime, and every
+    // concurrent access to a leaf's A and D bits is atomic (see above).
+    unsafe { AtomicU64::from_ptr(core::ptr::from_mut(slot).cast::<u64>()) }
+}
+
+/// Pass the VA of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)`, in the page table rooted at
+/// `root_virt`, whose accessed bit (A) is set to `on_accessed`, in VA order.
+/// Changes no leaf.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
+/// caller must hold the address space's `pt_lock`, and the span must lie in
+/// the user half.
+#[cfg(not(test))]
+pub unsafe fn read_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_accessed: &mut dyn FnMut(u64),
+)
+{
+    // SAFETY: root_virt is the direct-map VA of a valid root, and pt_lock is
+    // held (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |l0, va| {
+            if let Some(slot) = entry_mut(l0, 0, va)
+                && slot.is_present()
+                && leaf_word(slot).load(Ordering::Relaxed) & ACCESSED != 0
+            {
+                on_accessed(va);
+            }
+        });
+    }
+}
+
+/// Clear the accessed bit (A) of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `reported` names
+/// (the pages a [`read_user_accessed`] found accessed). A page unmapped since
+/// is skipped.
+///
+/// A NAPOT member is demoted first (demote-before-divergence,
+/// [memory-internals.md](../../../docs/memory-internals.md) § NAPOT Contiguity
+/// (RISC-V)), so each page's A is its own; a live group therefore never lacks
+/// A, since a group is promoted only from 16 identical leaves including a newly
+/// installed one, which carries A. Flushes no TLB: a hart that still caches the
+/// leaf with A set completes accesses without setting it again, so the next
+/// harvest under-reports that page
+/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
+///
+/// # Safety
+/// As [`read_user_accessed`].
+#[cfg(not(test))]
+pub unsafe fn clear_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    reported: &dyn Fn(u64) -> bool,
+)
+{
+    // SAFETY: as for read_user_accessed (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |l0, va| {
+            if !is_present_at(l0, va) || !reported(va)
+            {
+                return;
+            }
+            if is_napot(l0, va)
+            {
+                demote_napot_64k(l0, va);
+            }
+            if let Some(slot) = entry_mut(l0, 0, va)
+            {
+                leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed);
+            }
+        });
+    }
+}
+
+/// Whether `va`'s slot in the leaf table `l0` holds a present leaf.
+#[cfg(not(test))]
+fn is_present_at(l0: &[PageTableEntry; 512], va: u64) -> bool
+{
+    entry(l0, 0, va).is_some_and(PageTableEntry::is_present)
+}
+
+/// Pass each page VA of `[virt_base, virt_base + page_count * 4 KiB)` that a
+/// present leaf table covers, with that table, to `on_slot`, in VA order.
+///
+/// # Safety
+/// As [`read_user_accessed`].
+#[cfg(not(test))]
+unsafe fn for_each_leaf_slot(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_slot: &mut dyn FnMut(&mut [PageTableEntry; 512], u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+
+    // The caller's span lies in the user half, so neither operation saturates.
+    let virt_end = virt_base.saturating_add((page_count as u64).saturating_mul(PAGE_SIZE as u64));
+    // SAFETY: root_virt is the direct-map VA of a valid root (caller's contract).
+    let root = unsafe { table_at(root_virt) };
+    // SAFETY: root is a live table at the root level; pt_lock is held.
+    unsafe { walk_leaf_tables(root, root_level(), virt_base, virt_end, on_slot) };
+}
+
+/// Pass each page VA of `[lo, hi)` under `table` (a table at `level`) that a
+/// present leaf table covers, with that table, to `on_slot`. Leaf entries at a
+/// non-leaf level are skipped, as in [`unmap_user_region_pooled`]. Bounded
+/// recursion: `level <= 4`.
+///
+/// # Safety
+/// `table` must be a live table at `level` whose reachable child frames are
+/// live; the caller must hold the address space's `pt_lock`.
+#[cfg(not(test))]
+unsafe fn walk_leaf_tables(
+    table: &mut [PageTableEntry; 512],
+    level: usize,
+    lo: u64,
+    hi: u64,
+    on_slot: &mut dyn FnMut(&mut [PageTableEntry; 512], u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    let Some(child_level) = level.checked_sub(1)
+    else
+    {
+        for va in (lo..hi).step_by(PAGE_SIZE)
+        {
+            on_slot(table, va);
+        }
+        return;
+    };
+
+    let mut va = lo;
+    while va < hi
+    {
+        let entry_end = hi.min(next_level_boundary(level, va));
+        if let Some(e) = entry(table, level, va)
+            && e.is_present()
+            && e.0 & LEAF_BITS == 0
+        {
+            // SAFETY: a present non-leaf entry points at a live child table.
+            let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+            // SAFETY: child is a live table at child_level (this call's contract).
+            unsafe { walk_leaf_tables(child, child_level, va, entry_end, on_slot) };
+        }
+        va = entry_end;
+    }
+}
+
 /// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
 ///
 /// Walks the kernel root from `phys_to_virt(kernel_root_table_pa())` down to the
@@ -1798,33 +1968,81 @@ pub fn user_leaf_grant(pte: u64) -> LeafGrant
     super::encoding::user_leaf_grant(pte)
 }
 
-/// Classify a userspace page fault at `va` as a spurious stale-TLB fault.
+/// The A and D bits a user `access` that the leaf `pte` permits needs set
+/// before a Svade hart completes it: A, and D too for a store. Returns the leaf
+/// with them set, or `None` when the leaf already carries them.
+fn svade_update(pte: u64, access: UserAccess) -> Option<u64>
+{
+    let needed = match access
+    {
+        UserAccess::Store => ACCESSED | DIRTY,
+        UserAccess::Load | UserAccess::Fetch => ACCESSED,
+    };
+    (pte & needed != needed).then_some(pte | needed)
+}
+
+/// Classify a userspace page fault at `va` as one the hart resolves on retry,
+/// setting the A (and D) bit the access needs where the leaf lacks it.
 ///
-/// Walks the *current* (`satp`) page tables for `va` and returns `true` iff
-/// `va` is mapped, user-accessible, and the live leaf PTE permits `access`,
-/// the faulting access — meaning the fault must be a stale TLB entry the hart
-/// resolves on retry after a local `sfence.vma`. Returns `false` for any
-/// genuine fault (unmapped, or the live mapping still forbids the access); the
-/// caller then delivers it as a genuine fault per
-/// [fault-handling.md](../../../../../docs/fault-handling.md). A `true` result
-/// requires the live PTE to grant the access, and [`PageTableEntry::new_page`]
-/// pre-sets A (and D for writable leaves), so the retried instruction cannot
-/// re-fault on an A/D update even without Svadu — no retry counter is needed.
+/// Walks the *current* (`satp`) page tables for `va` and returns `false` for
+/// any genuine fault (unmapped, or the live mapping still forbids the
+/// access); the caller then delivers it as a genuine fault per
+/// [fault-handling.md](../../../../../docs/fault-handling.md). When the live
+/// leaf is user-accessible and permits `access`, the fault is either a stale
+/// TLB entry or, under Svade, a leaf whose A bit `SYS_ASPACE_HARVEST` cleared
+/// (or a writable leaf without D, on a store): the walk sets the missing bits
+/// with one compare-and-swap ([`svade_update`]) and returns `true`, and the
+/// caller flushes the local entry and retries the access. A failed swap also
+/// returns `true`: the leaf changed under it, and the retried access faults
+/// again into this check if it still needs to. Each `true` either finds the
+/// bits set or sets them, so the retry completes unless the leaf changes
+/// again, and no retry counter is needed.
+///
+/// The swap runs without `pt_lock`. SIE is clear and the space is active on
+/// this hart, so a teardown that frees the leaf's table waits for this hart's
+/// acknowledgement of its shootdown before the frame can be reused; a freed
+/// frame holds no valid leaf, so a swap on one fails. A NAPOT member that lacks
+/// A is reported genuine instead: setting one member's bit would diverge the
+/// group, and no live group lacks A ([`clear_user_accessed`]).
 ///
 /// # Safety
 /// Must run in S-mode in the faulting thread's context, i.e. before `satp` has
-/// been changed by a context switch.
+/// been changed by a context switch, with SIE clear.
 #[cfg(not(test))]
 pub unsafe fn user_fault_is_spurious(va: u64, access: UserAccess) -> bool
 {
+    use crate::mm::paging::phys_to_virt;
+
     // SAFETY: S-mode; reads satp to recover the active page-table root.
-    let root_phys = unsafe { read_root_phys() };
-    let root_virt = crate::mm::paging::phys_to_virt(root_phys);
-    // SAFETY: root_virt is the direct-map VA of the active root.
-    match unsafe { translate_user_page(root_virt, va) }
+    let root_virt = phys_to_virt(unsafe { read_root_phys() });
+    // SAFETY: root_virt is the direct-map VA of the active root; its tables
+    // stay allocated while this hart, with SIE clear, runs the space (above).
+    let Some(l0) = (unsafe { descend_existing(root_virt, va, root_level(), 0, phys_to_virt) })
+    else
     {
-        Some((_pa, pte)) => pte_permits_user_access(pte, access),
-        None => false,
+        return false;
+    };
+    let Some(slot) = entry_mut(l0, 0, va)
+    else
+    {
+        return false;
+    };
+    let word = leaf_word(slot);
+    let pte = word.load(Ordering::Relaxed);
+    if !pte_permits_user_access(pte, access)
+    {
+        return false;
+    }
+    match svade_update(pte, access)
+    {
+        None => true,
+        Some(_) if pte & NAPOT != 0 => false,
+        Some(updated) =>
+        {
+            // A failure means the leaf changed; the retry re-evaluates it.
+            let _ = word.compare_exchange(pte, updated, Ordering::Relaxed, Ordering::Relaxed);
+            true
+        }
     }
 }
 
@@ -2165,6 +2383,36 @@ mod tests
         // Invalid: genuine fault regardless of other bits.
         let invalid = USER | READ | WRITE | EXECUTE;
         assert!(!pte_permits_user_access(invalid, UserAccess::Load));
+    }
+
+    #[test]
+    fn svade_update_sets_accessed_for_a_load_or_fetch()
+    {
+        let harvested = VALID | USER | READ | EXECUTE | DIRTY;
+        assert_eq!(
+            svade_update(harvested, UserAccess::Load),
+            Some(harvested | ACCESSED)
+        );
+        assert_eq!(
+            svade_update(harvested, UserAccess::Fetch),
+            Some(harvested | ACCESSED)
+        );
+        assert_eq!(svade_update(harvested | ACCESSED, UserAccess::Load), None);
+    }
+
+    #[test]
+    fn svade_update_sets_accessed_and_dirty_for_a_store()
+    {
+        let rw = VALID | USER | READ | WRITE;
+        assert_eq!(
+            svade_update(rw, UserAccess::Store),
+            Some(rw | ACCESSED | DIRTY)
+        );
+        assert_eq!(
+            svade_update(rw | ACCESSED, UserAccess::Store),
+            Some(rw | ACCESSED | DIRTY)
+        );
+        assert_eq!(svade_update(rw | ACCESSED | DIRTY, UserAccess::Store), None);
     }
 
     // ── Shootdown-elision classification ───────────────────────────────────────

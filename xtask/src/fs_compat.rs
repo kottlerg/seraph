@@ -29,7 +29,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use crate::error::{Context, Result};
 
 /// Materialise `dst` to reference the same content as `src`. Tries
 /// symlink, then hard link (for files), then physical copy.

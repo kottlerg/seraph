@@ -44,7 +44,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::Result;
+use crate::error::Result;
 
 /// Set by the handler once SIGINT has arrived; never cleared.
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -73,7 +73,7 @@ mod imp
     use std::ffi::c_int;
     use std::sync::atomic::Ordering;
 
-    use anyhow::{Context as _, Result};
+    use crate::error::{Context as _, Result};
 
     use super::INTERRUPTED;
     use crate::sys::unix::{SIG_ERR, SIGINT, signal};
@@ -111,7 +111,7 @@ mod imp
 {
     use std::sync::atomic::Ordering;
 
-    use anyhow::{Context as _, Result};
+    use crate::error::{Context as _, Result};
 
     use super::INTERRUPTED;
     use crate::sys::windows::{
@@ -151,7 +151,7 @@ mod imp
 #[cfg(not(any(unix, windows)))]
 mod imp
 {
-    use anyhow::Result;
+    use crate::error::Result;
 
     /// A host with neither interface installs nothing.
     #[expect(

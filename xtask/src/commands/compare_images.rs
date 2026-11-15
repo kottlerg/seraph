@@ -39,7 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use boot_protocol::bundle as bundle_fmt;
 use object::Endianness;
 use object::elf::{FileHeader64, PT_LOAD, SHF_ALLOC, SHT_NOTE};

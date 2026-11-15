@@ -28,7 +28,7 @@ use std::ffi::OsStr;
 use std::fmt::Write;
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow};
+use crate::error::{Result, err};
 
 // ── Default search tables ────────────────────────────────────────────────────
 
@@ -182,7 +182,7 @@ fn find_riscv_firmware_impl(
             }
             Ok((code, vars))
         }
-        (Some(_), None) | (None, Some(_)) => Err(anyhow!(
+        (Some(_), None) | (None, Some(_)) => Err(err!(
             "${ENV_RISCV_CODE} and ${ENV_RISCV_VARS} must be set \
                  together (or both left unset). Pairing a custom code \
                  image with a system vars template (or vice versa) \
@@ -265,7 +265,7 @@ fn find_riscv_firmware_dir() -> Result<PathBuf>
 
 /// Build the standard "not found" error: label, env-var instruction,
 /// tried-paths list, per-platform install hints.
-fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> anyhow::Error
+fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> crate::error::Error
 {
     let mut msg = format!("{label} not found");
     msg.push_str("\n\nTried (none existed):\n");
@@ -287,20 +287,20 @@ fn not_found_error(label: &str, env_var: &str, tried: &[&str], hints: &str) -> a
         "\nSet ${env_var} to a direct path, or install the firmware:\n"
     );
     msg.push_str(hints);
-    anyhow!(msg)
+    err!(msg)
 }
 
 /// Build the "discovered file missing" error.
-fn missing_file_error(label: &str, path: &std::path::Path) -> anyhow::Error
+fn missing_file_error(label: &str, path: &std::path::Path) -> crate::error::Error
 {
-    anyhow!("{label} not found at resolved path: {}", path.display())
+    err!("{label} not found at resolved path: {}", path.display())
 }
 
 /// Build the "env var set to a path that doesn't exist" error.
 /// Names the env var so the user can fix or unset it.
-fn missing_env_path_error(env_var: &str, path: &std::path::Path) -> anyhow::Error
+fn missing_env_path_error(env_var: &str, path: &std::path::Path) -> crate::error::Error
 {
-    anyhow!(
+    err!(
         "${env_var}={} does not exist; unset {env_var} to fall back to default search",
         path.display(),
     )

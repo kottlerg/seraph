@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::TestKaslrArgs;

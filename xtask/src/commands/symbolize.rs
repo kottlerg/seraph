@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result};
 
 use crate::cli::SymbolizeArgs;
 use crate::context::Context;

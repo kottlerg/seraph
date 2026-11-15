@@ -31,7 +31,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::TestTerminalArgs;
@@ -193,7 +193,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
     let mut kbd_pass = false;
     let mut transcript = String::new();
     let mut verdict: Option<bool> = None;
-    let mut inject_err: Option<anyhow::Error> = None;
+    let mut inject_err: Option<crate::error::Error> = None;
 
     loop
     {
@@ -246,7 +246,7 @@ pub fn run(ctx: &Context, args: &TestTerminalArgs) -> Result<()>
             .write_all(SERIAL_INPUT)
             .and_then(|()| qemu_stdin.flush())
         {
-            inject_err = Some(anyhow::Error::new(e).context("serial RX injection failed"));
+            inject_err = Some(crate::error::Error::from(e).context("serial RX injection failed"));
             break;
         }
     }

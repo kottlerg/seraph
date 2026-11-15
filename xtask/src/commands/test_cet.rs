@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use object::{Object as _, ObjectSymbol as _, SymbolKind};
 
 use crate::accel::{self, Accel};
@@ -272,12 +272,12 @@ impl Launch
 {
     /// The failure for `err`: QEMU's refusal of the feature when it printed
     /// one, otherwise `err` with the stderr QEMU wrote.
-    fn explain(&self, err: anyhow::Error) -> anyhow::Error
+    fn explain(&self, err: crate::error::Error) -> crate::error::Error
     {
         let qemu = std::fs::read_to_string(&self.stderr).unwrap_or_default();
         match refusal(&qemu)
         {
-            Some(line) => anyhow::anyhow!(
+            Some(line) => crate::error::err!(
                 "the host cannot give the guest CET shadow stacks (QEMU: {line}); test-cet needs \
                  a CPU with CET_SS and a KVM that passes it through"
             ),
@@ -713,7 +713,7 @@ mod tests
         let verdict = retry(host, || {
             let end = ends[boots];
             boots += 1;
-            end.map_err(|e| anyhow::anyhow!("{e}"))
+            end.map_err(|e| crate::error::err!("{e}"))
         });
         (verdict, boots)
     }

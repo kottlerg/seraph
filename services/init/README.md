@@ -75,8 +75,9 @@ Init runs three stages between `_start` and `sys_thread_exit`:
    source caps (`rootfs.root` SEND, devmgr-registry `SEND|GRANT` source,
    and the `MOUNT_AUTHORITY`-, `DENY_BADGE`- and `SWAP_AUTHORITY`-badged SENDs on vfsd's
    service endpoint),
-   one `(name, thread_cap)` round per init-bootstrapped substrate
-   service, and a terminal round carrying the reserved log-sink sources
+   one `(name, thread_cap, observer)` round per init-bootstrapped substrate
+   service (the observer is an address-space cap or a process handle), and a terminal round
+   carrying the reserved log-sink sources
    (master-log endpoint + procmgr `SEND|GRANT`) svcmgr keeps to launch and
    supervise real-logd. Move init's own kernel objects to procmgr in the
    first `REGISTER_INIT_TEARDOWN` round, which binds

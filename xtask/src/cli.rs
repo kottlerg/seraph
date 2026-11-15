@@ -80,6 +80,12 @@ pub enum CliCommand
     /// Requires an arch-tagged sysroot from a prior `cargo xtask build`.
     Mkdisk(MkdiskArgs),
 
+    /// Check every FAT volume of `disk.img`, and of `disk-data.img` when it
+    /// is there, with `fsck.fat -n` (dosfstools), an independent reader of
+    /// the volumes mkdisk writes. Runs in CI's validate job; see
+    /// xtask/README.md.
+    CheckDisk(CheckDiskArgs),
+
     /// Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from
     /// `sysroot/services/` and repack `disk.img`. Use `--harness ktest`
     /// to run the kernel test harness; the default is `--harness init`.
@@ -254,6 +260,7 @@ impl CliCommand
             | Self::KtestTiming(_)
             | Self::Symbolize(_)
             | Self::Mkdisk(_)
+            | Self::CheckDisk(_)
             | Self::ComposeBundle(_)
             | Self::TestTerminal(_)
             | Self::TestVmgenid(_)
@@ -1306,6 +1313,11 @@ fn parse_hex_arg(text: &str) -> Result<u64, String>
 {
     crate::symbolize::parse_hex(text).map_err(|err| format!("{err:#}"))
 }
+
+// ── CheckDisk ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct CheckDiskArgs;
 
 // ── LintDocs ──────────────────────────────────────────────────────────────────
 

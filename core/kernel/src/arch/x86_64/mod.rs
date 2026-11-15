@@ -16,6 +16,7 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod ioapic;
+pub mod mitigation;
 pub mod msi;
 pub mod paging;
 pub mod platform;

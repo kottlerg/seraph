@@ -16,14 +16,34 @@
 //! `crate::arch::nospec`; the rule they serve is docs/capability-model.md
 //! § Capability Spaces, and the mechanism is
 //! core/kernel/docs/capability-internals.md § Speculative-Execution Hardening.
-//! [`enumerate_vulnerabilities`] does nothing: the RVA23 floor defines no
-//! enumeration of transient-execution vulnerabilities
+//! [`select_mitigations`] and [`apply_mitigations_this_cpu`] do nothing and
+//! [`mitigation_info`] answers nothing: the RVA23 floor defines no enumeration
+//! of transient-execution vulnerabilities and no control for them
 //! (core/kernel/docs/transient-execution.md).
 
-/// Enumerate the boot hart's transient-execution vulnerabilities. RISC-V
-/// defines no architectural enumeration of them under the RVA23 floor, so there
-/// is nothing to read and nothing is logged.
-pub fn enumerate_vulnerabilities() {}
+/// Enumerate the boot hart's transient-execution vulnerabilities and select
+/// their controls. RISC-V defines no architectural enumeration of them and no
+/// control under the RVA23 floor, so there is nothing to read, select or log.
+pub fn select_mitigations() {}
+
+/// Set the calling hart's controls of the selection: there are none.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the x86-64 item.
+pub unsafe fn apply_mitigations_this_cpu() {}
+
+/// The mitigation state for `SYS_SYSTEM_INFO`
+/// (`SystemInfoType::SpeculationControls`): `NotSupported` for every view
+/// (`syscall::SPECULATION_VIEW_*`), since riscv64 has no such state, and
+/// `InvalidArgument` for an unknown view.
+pub fn mitigation_info(view: u64) -> Result<u64, ::syscall::SyscallError>
+{
+    if view > ::syscall::SPECULATION_VIEW_IN_EFFECT
+    {
+        return Err(::syscall::SyscallError::InvalidArgument);
+    }
+    Err(::syscall::SyscallError::NotSupported)
+}
 
 /// All-ones when `index < bound`, zero otherwise, computed without a branch.
 ///

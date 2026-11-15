@@ -71,14 +71,17 @@ again.
    (arch::current::cpu::verify_baseline): refuse hardware missing a required
    baseline feature with a diagnostic, before any subsystem that assumes the
    baseline runs
-4. Enumerate the CPU's transient-execution vulnerabilities
-   (arch::current::speculation::enumerate_vulnerabilities) and log the table
-   (x86-64; nothing on RISC-V)
+4. Enumerate the CPU's transient-execution vulnerabilities, log the table, select and
+   publish the user-to-kernel controls it calls for and log them
+   (arch::current::speculation::select_mitigations), then set the boot CPU's per-CPU
+   controls (arch::current::speculation::apply_mitigations_this_cpu) (x86-64; nothing on
+   RISC-V)
 ```
 
 The step-3 gate and the baseline it enforces are defined in
 [platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate. The
-step-4 table is defined in [transient-execution.md](transient-execution.md).
+step-4 table and controls are defined in [transient-execution.md](transient-execution.md); each AP
+sets its own per-CPU controls in `kernel_entry_ap`, before it enters user mode.
 
 The early console is allocation-free and output-only.
 

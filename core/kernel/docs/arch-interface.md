@@ -938,11 +938,26 @@ pub fn index_mask(index: usize, bound: usize) -> usize;
 /// `value` does not let it fold a comparison of the copy.
 pub fn hide(value: usize) -> usize;
 
-/// Derive the boot CPU's transient-execution vulnerability table and log it.
-/// Called once on the BSP in Phase 1, after the baseline check. x86-64 reads
-/// CPUID and `IA32_ARCH_CAPABILITIES` (transient-execution.md); RISC-V does
-/// nothing, since the RVA23 floor defines no such enumeration.
-pub fn enumerate_vulnerabilities();
+/// Derive the boot CPU's transient-execution vulnerability table, select the
+/// user-to-kernel controls it calls for, publish the selection, and log the
+/// table and the controls. Called once on the BSP in Phase 1, after the
+/// baseline check, before any AP starts. x86-64 reads CPUID and
+/// `IA32_ARCH_CAPABILITIES` (transient-execution.md § Controls); RISC-V does
+/// nothing, since the RVA23 floor defines no such enumeration or control.
+pub fn select_mitigations();
+
+/// Set the calling CPU's per-CPU controls of the selection (x86-64:
+/// `IA32_SPEC_CTRL`, `EFER`, `IA32_UARCH_MISC_CTL`; RISC-V: none). Called on
+/// the BSP in Phase 1 and on each AP in `kernel_entry_ap`.
+///
+/// # Safety
+/// Ring 0 / S-mode on the CPU being brought up, after `select_mitigations`.
+pub unsafe fn apply_mitigations_this_cpu();
+
+/// One word of the mitigation state for `SYS_SYSTEM_INFO(SpeculationControls)`:
+/// the view `view` names (`SPECULATION_VIEW_*`), `InvalidArgument` for an
+/// unknown view, and `NotSupported` for every view on RISC-V.
+pub fn mitigation_info(view: u64) -> Result<u64, SyscallError>;
 ```
 
 ---

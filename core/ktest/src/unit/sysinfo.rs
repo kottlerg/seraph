@@ -6,16 +6,19 @@
 //! Tier 1 tests for system info syscalls.
 //!
 //! Covers: `SYS_SYSTEM_INFO` (every `SystemInfoType` variant, and an unknown
-//! discriminant). `InstructionCacheSyncs` is read here for the boot's sync of
+//! discriminant). `SpeculationControls` is read here for its views and their
+//! refusals; x86-64's `integration::speculation_controls` checks the words
+//! against each other on every CPU. `InstructionCacheSyncs` is read here for the boot's sync of
 //! ktest's own image; its rise across each runtime call site is checked by
 //! `integration::thread_memory` and `unit::retype`'s code stub.
 
 use syscall::{
     MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap,
-    memory_merge, memory_split, system_info,
+    memory_merge, memory_split, speculation_controls, system_info,
 };
 use syscall_abi::{
-    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE, SyscallError,
+    CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE,
+    SPECULATION_VIEW_IN_EFFECT, SPECULATION_VIEW_INPUTS, SPECULATION_VIEW_SELECTED, SyscallError,
     SystemInfoType,
 };
 
@@ -354,6 +357,56 @@ fn split_top(ctx: &TestContext, pages: u64) -> Result<u64, &'static str>
         .ok_or("sysinfo::thread_retype_bytes: memory_base too small")?;
     memory_split(ctx.memory_base, at)
         .map_err(|_| "sysinfo::thread_retype_bytes: memory_split(memory_base) failed")
+}
+
+/// `system_info(SpeculationControls)` answers each view where the kernel
+/// reports mitigation state (x86-64) and returns `NotSupported` for each where
+/// it does not (riscv64); a view past the last returns `InvalidArgument` on
+/// both. Where it answers, a selected control is a known
+/// `SPECULATION_CONTROL_*` bit and the inputs a known `SPECULATION_INPUT_*`
+/// bit.
+pub fn speculation_controls_views(_ctx: &TestContext) -> TestResult
+{
+    let views = [
+        SPECULATION_VIEW_INPUTS,
+        SPECULATION_VIEW_SELECTED,
+        SPECULATION_VIEW_IN_EFFECT,
+    ];
+    if crate::arch::HAS_SPECULATION_CONTROLS
+    {
+        let inputs = speculation_controls(SPECULATION_VIEW_INPUTS)
+            .map_err(|_| "system_info(SpeculationControls) inputs view failed")?;
+        let selected = speculation_controls(SPECULATION_VIEW_SELECTED)
+            .map_err(|_| "system_info(SpeculationControls) selected view failed")?;
+        speculation_controls(SPECULATION_VIEW_IN_EFFECT)
+            .map_err(|_| "system_info(SpeculationControls) in-effect view failed")?;
+        if inputs & !syscall_abi::SPECULATION_INPUT_ALL != 0
+        {
+            return Err("system_info(SpeculationControls) inputs carry an undefined bit");
+        }
+        if selected & !syscall_abi::SPECULATION_CONTROL_ALL != 0
+        {
+            return Err("system_info(SpeculationControls) selection carries an undefined bit");
+        }
+    }
+    else
+    {
+        for view in views
+        {
+            if speculation_controls(view) != Err(SyscallError::NotSupported as i64)
+            {
+                return Err("system_info(SpeculationControls) did not return NotSupported");
+            }
+        }
+    }
+    if speculation_controls(SPECULATION_VIEW_IN_EFFECT + 1)
+        != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err(
+            "system_info(SpeculationControls, unknown view) did not return InvalidArgument",
+        );
+    }
+    Ok(())
 }
 
 /// The kernel synchronised instruction fetch for ktest's own image before

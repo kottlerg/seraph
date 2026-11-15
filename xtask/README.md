@@ -83,7 +83,10 @@ build of a commit orders its binaries' statics as CI's does (see
 CI's ([docs/testing.md](../docs/testing.md#troubleshooting) § Troubleshooting).
 
 A riscv64 kernel build runs with `RUSTFLAGS="-Zunstable-options -Zemit-stack-sizes"`, which
-reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. After the link,
+reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. An x86-64
+kernel build and its Clippy pass run with
+`RUSTFLAGS="-Zunstable-options -Zretpoline-external-thunk"`, which sends every indirect branch of
+the kernel and its `-Z build-std` crates through the kernel's retpoline thunk. After the link,
 and before the image is installed, the build reads the image's `.stack_sizes` section and fails,
 naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MAX` (2032 bytes,
 `src/stack_sizes.rs`), the kernel frame bound of

@@ -60,7 +60,9 @@ intent; not yet implemented.
   x86-64, Intel lists `MUL` among its data-operand-independent-timing (DOIT)
   instructions, but on its parts that enumerate the DOITM control (Ice Lake and
   later, inside the platform floor) it guarantees that timing only while DOITM
-  is set, and Seraph does not set it; #1085 decides that posture. Two values
+  is set, and the kernel sets DOITM on every CPU that enumerates it
+  ([core/kernel/docs/transient-execution.md](../../core/kernel/docs/transient-execution.md)
+  § Data-operand-independent timing). Two values
   pass through `core::hint::black_box`, so the optimiser cannot rewrite them
   into a branch: the mask that picks the fully reduced Poly1305 result, and the
   128-bit difference of the two tags, which `open` tests once, after both tags

@@ -1709,6 +1709,34 @@ pub fn stack_high_water(class: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// One word of the x86-64 transient-execution mitigation state
+/// (`SystemInfoType::SpeculationControls`): the view `view` names
+/// (`syscall_abi::SPECULATION_VIEW_*`), a `SPECULATION_INPUT_*` or
+/// `SPECULATION_CONTROL_*` set.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` for an unknown view,
+/// and `NotSupported` on riscv64, which has no such state.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "a non-negative return is the queried value"
+)]
+#[inline]
+pub fn speculation_controls(view: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the
+    // SpeculationControls discriminant and arg1 the view, which the kernel
+    // validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::SpeculationControls as u64,
+            view,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
 /// Exclusive top of the user half of the caller's address space
 /// (`SystemInfoType::UserVaTop`): the first virtual address a mapping syscall
 /// refuses, fixed per architecture and boot paging mode.

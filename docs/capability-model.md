@@ -66,18 +66,24 @@ scaling, and DRAM rows. The system draws the line as follows.
     ([core/kernel/docs/capability-internals.md](../core/kernel/docs/capability-internals.md)
     § Speculative-Execution Hardening);
   - on x86-64, an `lfence` after every entry-side `swapgs` decision (`entry_swapgs_asm`,
-    `paranoid_entry_asm`), and the mitigations the floor silicon applies in silicon;
+    `paranoid_entry_asm`), the mitigations the floor silicon applies in silicon, and the
+    entry and exit controls the kernel selects by enumerating the boot CPU: enhanced or
+    automatic IBRS or the retpoline build against branch target injection, the `BHI_DIS_S`
+    control or a branch-history clear on entry, a `VERW` buffer clear on return to user, the
+    return-stack fill the selection calls for, and `DOITM` where the CPU enumerates it
+    ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
+    § Controls);
   - on riscv64, the data bounds alone: the RVA23 floor defines no speculation barrier and no
     speculation control for the kernel to enumerate or drive.
 
   On x86-64 the kernel enumerates the boot CPU's exposure to each transient-execution class at
   the user-to-kernel boundary (`IA32_ARCH_CAPABILITIES`, CPUID, and the vendors' published
-  guidance) and logs it
+  guidance), logs it, and selects the controls above from it
   ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)).
-  Applying the entry and exit mitigations that enumeration selects (buffer clearing,
-  branch-predictor and return-prediction controls) is design intent, not yet implemented
-  ([#1085](https://github.com/kottlerg/seraph/issues/1085)). Until then the x86-64 boundary
-  rests on the defences above.
+  The return mitigations for `retbleed` and `spec_rstack_overflow` (a return thunk or an
+  IBPB on entry) are design intent, not yet implemented
+  ([#1085](https://github.com/kottlerg/seraph/issues/1085)); until then a CPU the table gives
+  kernel action for either class is not defended against it.
 - **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a
   context switch, does not schedule SMT siblings by trust, partitions no cache, and gates no
   counter by process. On riscv64 it sets `scounteren.CY`, so U-mode reads the cycle counter, and

@@ -119,7 +119,11 @@ Each feature is classified per architecture as one of:
   is vendor-specific (Intel enumerates via `IA32_ARCH_CAPABILITIES`; AMD differs), so it is not part
   of the cross-vendor boot-gate. What the kernel defends beyond them, and what it leaves
   unmitigated, is the posture of [capability-model.md](capability-model.md)
-  § Microarchitectural Isolation.
+  § Microarchitectural Isolation; the controls it selects by enumeration (enhanced or automatic
+  IBRS, `BHI_DIS_S`, `VERW`) are opportunistic in the same sense as the entries below, each
+  with a software fallback or a stated gap
+  ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
+  § Controls).
 - **2 MiB large pages** — used for the kernel direct map.
 - **UEFI firmware and ACPI 2.0+ (XSDT, MADT)** — the boot and hardware-discovery path. There is no
   BIOS or RSDT fallback.
@@ -144,6 +148,15 @@ Each feature is classified per architecture as one of:
   the direct-map base (an AP's GDT lies in the direct map); see
   [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)
   § Surface inventory.
+- **DOITM** (`IA32_UARCH_MISC_CTL` bit 0, enumerated by `IA32_ARCH_CAPABILITIES` bit 12) — set
+  on every CPU that enumerates it, from boot, for every thread, so the instructions Intel lists
+  as data-operand-independent (`MUL` among them) keep operand-independent timing, the guarantee
+  the riscv64 floor gives through Zkt and the constant-time claims of
+  [shared/crypto](../shared/crypto/README.md) rest on. Intel parts before Ice Lake do not
+  enumerate it and time those instructions as if it were set; AMD defines no counterpart. The
+  decision, its reason and its cost against Intel's advice are in
+  [core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
+  § Data-operand-independent timing.
 - **EFI_RNG_PROTOCOL** — an additional boot entropy seed.
 - **GOP framebuffer** — graphical console; a headless serial-only boot is valid.
 - **PCIe ECAM (MCFG)** — discovered when firmware publishes it; not required by the kernel.

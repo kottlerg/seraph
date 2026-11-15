@@ -31,8 +31,12 @@
 //! arrive between a ring-3 entry and its `swapgs`, so they decide the swap from
 //! `IA32_GS_BASE` instead (`paranoid_entry_asm` / `paranoid_exit_asm`). Every
 //! entry-side swap decision is followed by `lfence`. The spurious-interrupt stub
-//! (vector 255) runs only `iretq`: it executes no kernel code and touches no GS
-//! state.
+//! (vector 255) runs only `iretq`: it executes no kernel code, touches no GS
+//! state, and loads nothing but the frame the CPU pushed, so it needs no
+//! transient-execution control. Every other stub, from ring 3, clears the
+//! branch history before its handler and runs `VERW` before its `iretq` where
+//! the selection asks for them (`tf_build_asm`, `exit_swapgs_asm`,
+//! `paranoid_exit_asm`; core/kernel/docs/transient-execution.md § Controls).
 //!
 //! # Exception vector groups
 //! Vectors with a hardware-pushed error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
@@ -186,6 +190,13 @@ struct Idtr
 /// `rax` is saved first, then reused as the copy scratch. After the fragment
 /// rsp = `S-168` = `TrapFrame` base; the stub frame sits at `[rsp+168 ..=
 /// rsp+216]`.
+///
+/// Last, from ring 3 (the saved CS has a non-zero RPL), it calls
+/// `mitigation::seraph_clear_branch_history`, which clears the branch history
+/// where the transient-execution selection asks for it, before the trampoline
+/// reaches any indirect branch (core/kernel/docs/transient-execution.md
+/// § Controls). The call clobbers `rax`, `rcx` and the flags, all saved or
+/// dead by then.
 #[cfg(not(test))]
 macro_rules! tf_build_asm {
     () => {
@@ -216,7 +227,11 @@ macro_rules! tf_build_asm {
             "mov [rsp + 144], rax\n",
             "mov rax, [rsp + 216]\n", // stub ss
             "mov [rsp + 152], rax\n",
-            "mov qword ptr [rsp + 160], 0\n", // fs_base
+            "mov qword ptr [rsp + 160], 0\n",   // fs_base
+            "test byte ptr [rsp + 144], 0x3\n", // saved CS RPL; 0 => ring 0
+            "jz 85f\n",
+            "call seraph_clear_branch_history\n",
+            "85:\n",
         )
     };
 }
@@ -317,6 +332,10 @@ macro_rules! entry_swapgs_asm {
 /// instruction ends at the canonical boundary, and `syscall_entry` diverts a
 /// non-canonical return RIP to a user `#GP` instead of `sysretq`. So no stub can
 /// enter with a ring-0 frame on the user GS base.
+///
+/// On the ring-3 path the swap is followed by `mitigation::verw_asm`, the
+/// `VERW` of the transient-execution selection, the last memory access before
+/// the `iretq`; it clobbers only the flags, which the `iretq` reloads.
 #[cfg(not(test))]
 macro_rules! exit_swapgs_asm {
     ($cs:literal) => {
@@ -327,6 +346,7 @@ macro_rules! exit_swapgs_asm {
             "], 0x3\n",
             "jz 82f\n",
             "swapgs\n",
+            super::mitigation::verw_asm!(),
             "82:\n",
         )
     };
@@ -360,7 +380,13 @@ macro_rules! paranoid_entry_asm {
 }
 
 /// Naked-asm fragment: undo [`paranoid_entry_asm`]'s swap (if it swapped), then
-/// restore the frame and `iretq`.
+/// restore the frame, run `mitigation::verw_asm`, and `iretq`.
+///
+/// The `VERW` runs on a return to ring 0 as well: a paranoid stub can
+/// interrupt a return to user mode after its own `VERW` (an NMI or `#MC`
+/// between that `VERW` and the `sysretq` or `iretq`), and the handler's
+/// loads would otherwise reach user mode uncleared. The stubs are rare, so the
+/// unconditional clear costs little.
 #[cfg(not(test))]
 macro_rules! paranoid_exit_asm {
     () => {
@@ -371,6 +397,7 @@ macro_rules! paranoid_exit_asm {
             "swapgs\n",
             "84:\n",
             tf_restore_asm!(),
+            super::mitigation::verw_asm!(),
             "iretq\n",
         )
     };
@@ -1138,6 +1165,12 @@ unsafe extern "custom" fn isr_nm()
         "push r9",
         "push r10",
         "push r11",
+        // From ring 3, clear the branch history where the selection asks for
+        // it, before the handler (see `tf_build_asm`); CS is at [rsp + 80].
+        "test byte ptr [rsp + 80], 0x3",
+        "jz 87f",
+        "call seraph_clear_branch_history",
+        "87:",
         "call {handler}",
         "pop r11",
         "pop r10",

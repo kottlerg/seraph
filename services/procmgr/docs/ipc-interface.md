@@ -542,7 +542,8 @@ pool until the child's address space is torn down (none when the bind follows th
 terminal fault posts: an exit (`sys_thread_exit`, `sys_process_exit`) posts only to the exiting
 thread's observers, and a teardown (`DESTROY_PROCESS`, or procmgr's reap) posts to neither
 ([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) § Exit reason). A fault
-of the main thread posts both to this observer and to the main thread's observers.
+of the main thread that is its address space's first terminal fault posts both to this observer
+and to the main thread's observers; a later one posts only to the main thread's observers.
 
 **Reply:** label 0 (success), or an error code.
 

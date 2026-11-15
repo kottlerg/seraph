@@ -656,8 +656,9 @@ one procmgr binds on the driver's address space at devmgr's request ([procmgr IP
 Interface](../../procmgr/docs/ipc-interface.md) § Label 25: `BIND_DEATH_OBSERVER`), which the first
 terminal fault of any of the driver's threads posts, once. A fault of a worker thread drives
 procmgr's teardown of the driver, whose stop of the main thread posts nothing, so only the
-address-space observer reports that death. A fault of the main thread posts to both observers;
-devmgr takes the first post and drops the second, which names a driver already dead or withdrawn. An
+address-space observer reports that death. A fault of the main thread that is the driver's first
+terminal fault posts to both observers; devmgr takes the first post and drops the second, which
+names a driver already dead or withdrawn. An
 exit of the main thread posts only the thread observer, since the kernel fires an address space's
 observers on a terminal fault alone, so neither observer covers the other. Restarting a driver is
 design intent; not yet

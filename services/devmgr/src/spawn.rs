@@ -460,7 +460,8 @@ fn serve_list_round(
 /// first terminal fault of any of its threads posts. procmgr's teardown of the
 /// driver after a fault of another thread stops the main thread with no post,
 /// so the address-space observer is the only one that sees that death; a
-/// fault of the main thread posts to both.
+/// fault of the main thread that is the driver's first terminal fault posts
+/// to both.
 ///
 /// A `held` driver is created `CREATE_PINNED`, since its device may write
 /// its memory before a demand fault could back it, and `CREATE_DMA_HOLD`,

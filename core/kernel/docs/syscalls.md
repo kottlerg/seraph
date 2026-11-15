@@ -3236,15 +3236,15 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | `class` | `StackHighWater` only: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2); ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
+| 1 | `class` or `view` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
 **Capability requirement:** None.
 
-**Errors:** `InvalidArgument` (unknown `info_type`, or unknown `class` for `StackHighWater`);
-`NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
-stack).
+**Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`, or
+unknown `view` for `SpeculationControls`); `NotSupported` (`StackHighWater` handoff class, when
+the kernel could not locate the handoff stack; `SpeculationControls` on riscv64).
 
 ### `SystemInfoType`
 
@@ -3339,6 +3339,17 @@ pub enum SystemInfoType
     /// diagnostic count, read by ktest to check that each such path
     /// synchronises, since emulation does not fail when one does not.
     InstructionCacheSyncs = 12,
+
+    /// One word of the x86-64 transient-execution mitigation state, the view in
+    /// arg1: the inputs the kernel selected the user-to-kernel controls from
+    /// (`SPECULATION_INPUT_*`: the classes the boot CPU's vulnerability table
+    /// gives kernel action, its predictor behaviours and the control bits it
+    /// enumerates), the controls it selected at boot (`SPECULATION_CONTROL_*`),
+    /// or the controls in effect on the calling CPU (`SPECULATION_CONTROL_*`),
+    /// read from its MSRs and from the flags the entry and exit code test
+    /// ([transient-execution.md](transient-execution.md) § Controls).
+    /// `NotSupported` on riscv64, which defines no enumeration of the classes.
+    SpeculationControls = 13,
 }
 ```
 

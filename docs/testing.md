@@ -490,8 +490,10 @@ after `test-terminal`, on the default boot `test-terminal` restored.
 
 ### CET shadow stacks (`test-cet`)
 
-On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them, so a
-corrupted return address faults instead of being followed
+On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them and its
+transient-execution selection rewrites no return (it does on a CPU without enhanced or Automatic
+IBRS, which takes the retpoline sequence), so a corrupted return address faults instead of being
+followed
 ([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)). Neither the CI
 runners nor TCG offer the feature, so CI boots only the kernel without them. Every launcher pins the
 guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), and a QEMU
@@ -1224,12 +1226,12 @@ cargo xtask test-gdb --arch <arch>
 above), whose first boot runs ktest with the kernel on CET shadow stacks and whose second checks
 that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
 bundle, a debug-profile build, at 4 vCPUs. It runs only under KVM on a host whose CPU reports CET
-shadow stacks: on any other host the command fails, naming what is missing, and never passes, so a
-PR that owes the cell runs it on such a host. On a host that is itself a guest, a run that ends
-in the host's loss of the guest's CET state is inconclusive and run again, up to four runs of each
-boot, and the cell passes only on runs without it (CET shadow stacks (`test-cet`) above). Each boot
-is bounded by five minutes and each gdbstub answer by 30 s; it has no `run-parallel` budget. The
-pair is the cet device cell (Device surfaces above).
+shadow stacks and enhanced or Automatic IBRS: on any other host the command fails, naming what is
+missing, and never passes, so a PR that owes the cell runs it on such a host. On a host that is
+itself a guest, a run that ends in the host's loss of the guest's CET state is inconclusive and run
+again, up to four runs of each boot, and the cell passes only on runs without it (CET shadow stacks
+(`test-cet`) above). Each boot is bounded by five minutes and each gdbstub answer by 30 s; it has no
+`run-parallel` budget. The pair is the cet device cell (Device surfaces above).
 
 ```sh
 # CET cell, x86_64 only:

@@ -37,7 +37,8 @@ pub struct OpenSsl
 
 impl OpenSsl
 {
-    /// The command, writing its files under `dir`, which exists.
+    /// The command, writing its files under `dir`, a directory the generator
+    /// created for the run alone.
     pub const fn new(dir: PathBuf) -> Self
     {
         Self { dir }

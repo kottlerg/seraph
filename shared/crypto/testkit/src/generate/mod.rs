@@ -27,6 +27,8 @@ mod openssl;
 
 use std::fmt;
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use json::{Value, json};
 
@@ -69,8 +71,8 @@ pub struct Files
 }
 
 /// Generate both vector files with OpenSSL, the command's files kept in a
-/// working directory under the system's temporary directory and removed
-/// after.
+/// private working directory under the system's temporary directory (see
+/// [`private_dir`]) and removed after.
 ///
 /// # Errors
 ///
@@ -78,8 +80,13 @@ pub struct Files
 /// cannot be written, or a check of the module description fails.
 pub fn generate() -> Result<Files, Error>
 {
-    let dir = std::env::temp_dir().join(format!("crypto-reference-vectors-{}", std::process::id()));
-    fs::create_dir_all(&dir).map_err(|e| Error(format!("creating {}: {e}", dir.display())))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let dir = private_dir(
+        &std::env::temp_dir(),
+        &format!("crypto-reference-vectors-{}-{nonce}", std::process::id()),
+    )?;
     let ed25519 = Ed25519 {
         openssl: OpenSsl::new(dir.clone()),
     };
@@ -91,6 +98,26 @@ pub fn generate() -> Result<Files, Error>
     Ok(Files {
         files: vec![(ed25519::FILE, ed), (sha512::FILE, sha)],
     })
+}
+
+/// Create the directory `name` under `base` for this run alone: it must not
+/// exist yet, so a directory another user prepared (holding a symlink a file
+/// write would follow) fails the run instead of receiving its files, and on
+/// Unix only the owner can enter it.
+///
+/// # Errors
+///
+/// An [`Error`] when the directory exists or cannot be created.
+fn private_dir(base: &Path, name: &str) -> Result<PathBuf, Error>
+{
+    let dir = base.join(name);
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
+        .map_err(|e| Error(format!("creating {}: {e}", dir.display())))?;
+    Ok(dir)
 }
 
 /// The version line of the `openssl` command, the reference.
@@ -705,6 +732,31 @@ mod tests
         assert_eq!(value["cases"][1]["a"], 2u64);
         assert_eq!(value["none"].as_array().map(Vec::len), Some(0));
         assert_eq!(text.lines().filter(|l| l.contains("\"a\"")).count(), 2);
+    }
+
+    #[test]
+    fn the_working_directory_is_new_and_private()
+    {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let base = private_dir(
+            &std::env::temp_dir(),
+            &format!("crypto-testkit-test-{}-{nanos}", std::process::id()),
+        )
+        .unwrap();
+        let dir = private_dir(&base, "work").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
+        assert!(
+            private_dir(&base, "work").is_err(),
+            "an existing directory is refused"
+        );
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

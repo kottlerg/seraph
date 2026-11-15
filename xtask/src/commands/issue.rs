@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use json::Value;
 
 use crate::cli::{IssueEditArgs, IssueFileArgs, UnscheduledReason};
 use crate::commands::pr_check::{current_milestone, is_rolling};
@@ -473,7 +473,7 @@ pub fn missing_metadata(
 }
 
 /// The names of the labels an Issue carries, as `gh issue view` returns it.
-fn label_names(issue: &serde_json::Value) -> Vec<String>
+fn label_names(issue: &json::Value) -> Vec<String>
 {
     issue["labels"].as_array().map_or_default(|labels| {
         labels

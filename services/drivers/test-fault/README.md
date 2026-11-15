@@ -9,9 +9,11 @@ cap, so a boot without svctest never starts it. Each instance takes the resource
 [`driver_binding::resources`](../../../shared/driver-binding/README.md) and its role from its
 device's BAR 2 (`ipc::test_fault_labels`):
 
-- No BAR 2: it reports `DRIVER_READY` and serves `FAULT_PING` (reply `SUCCESS`) and
+- No BAR 2: it reports `DRIVER_READY` and serves `FAULT_PING` (reply `SUCCESS`),
   `FAULT_EXIT` (reply `SUCCESS`, then exit after `FAULT_EXIT_DELAY_MS` without receiving
-  again, so a call queued after the reply reaches a dead driver until devmgr withdraws it).
+  again, so a call queued after the reply reaches a dead driver until devmgr withdraws it), and
+  `FAULT_WORKER` (reply `SUCCESS`, then receive nothing more while a thread it starts faults
+  after `FAULT_EXIT_DELAY_MS`, so procmgr tears the driver down with its main thread alive).
 - A BAR 2 of `HANG_BAR_BYTES` (4 KiB): it takes the whole list, then holds `HOLD_BYTES`
   (4 MiB) of touched memory and neither reports ready nor exits, so the bind's settle ends at
   its bound and devmgr destroys it, returning the memory, which svctest observes.

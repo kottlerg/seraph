@@ -712,9 +712,12 @@ every child's parent link, in batches with the derivation lock released between
 them when the list is large. While a move is in flight both slots are pinned —
 the same refusal an in-flight revocation imposes on its root — so no other
 operation can tear the migration, and every descendant stays within its
-ancestors' revocation reach throughout, with one exception the kernel shares
-with every other slot: a CSpace torn down while the move is in flight releases
-the children hanging under its dying slots as derivation roots. See
+ancestors' revocation reach throughout. A CSpace torn down while the move is in
+flight takes no further part in it: when the destination's CSpace dies, the move
+fails and the source keeps the capability and every child; when the source's
+CSpace dies, the move ends where it stands, the teardown re-linking the
+destination and the children not yet moved under the source's parent (see
+[Revocation](#revocation)). See
 [capability-internals.md](../core/kernel/docs/capability-internals.md) § Move.
 
 ---
@@ -746,6 +749,16 @@ until the syscall stops using it, so the revoke frees the object only after that
 with it (see
 [capability-internals.md](../core/kernel/docs/capability-internals.md#storage-hybrid-radix-directory)
 § Storage: Hybrid Radix Directory).
+
+The reach survives the exit of an intermediate holder. Deleting a capability re-links its
+children under its own parent, and tearing down a CSpace re-links the capabilities derived
+through its slots under their nearest ancestor outside that CSpace, so a capability derived
+through a process that has exited stays revocable by whoever delegated to that process; it
+becomes a derivation root only when the lineage has no ancestor outside the dead CSpace. An
+intermediate holder therefore cannot take a lineage out of its ancestors' reach, by deleting or
+by exiting. While a CSpace is being torn down, no IPC transfer moves a capability into or out of
+it (see [capability-internals.md](../core/kernel/docs/capability-internals.md#teardown-drain)
+§ Teardown Drain).
 
 ---
 

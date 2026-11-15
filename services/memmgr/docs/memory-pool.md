@@ -506,18 +506,18 @@ another in three ways:
   next.
 - **Another process holds a Memory capability to it.** A capability the grantee moved to another
   process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
-  out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
-  map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
+  out stays under that intermediary when the grantee's `CSpace` is torn down; either way its holder
+  can map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
   device still writing it.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
 Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
 
 1. The intermediary is the only reference to that Memory object (`CAP_INFO_SOLE_REFERENCE`): no
-   other capability to it in any `CSpace`, moved, derived, or orphaned into a derivation root, and
-   no kernel-internal reference such as a retype lease or a page-pool donation. memmgr reads this
-   first: once it holds it keeps holding, since no other process has a capability through which to
-   add a reference or a mapping, so the reads after it cannot be raced.
+   other capability to it in any `CSpace`, moved or derived, and no kernel-internal reference such
+   as a retype lease or a page-pool donation. memmgr reads this first: once it holds it keeps
+   holding, since no other process has a capability through which to add a reference or a mapping,
+   so the reads after it cannot be raced.
 2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. The
    kernel refuses a grantee's split or merge of its grant, since memmgr's intermediary names the
    same object ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md)
@@ -554,10 +554,11 @@ whose reaching capability, object, or mapping never goes, held by a process that
 stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
-memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches neither a
-derivation the grantee made and handed out, which its `CSpace`'s teardown leaves a derivation
-root, nor any mapping already made, and it would drop the reference a driver holds on a frame its
-device may still write. The frame waits instead, until its holder drops the capability.
+memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches no mapping
+already made, and it would cut off every holder below the intermediary, a holder of a derivation
+the grantee made and handed out included, since the grantee's `CSpace` teardown leaves that
+derivation under the intermediary, and among them a driver whose device may still write the frame.
+The frame waits instead, until its holder drops the capability.
 
 On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
 `CREATE_DMA_HOLD` process until its creator releases it, the frames staying on

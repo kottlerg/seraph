@@ -69,11 +69,13 @@ pub enum MoveStep
     /// Children remain. Release `DERIVATION_LOCK` and continue with
     /// [`move_cap_drive`].
     Pending(CapMove),
-    /// The move cannot complete. `InvalidCapability`: an ancestor's revoke
-    /// freed both slots. `InvalidState`: the destination was freed (an
-    /// ancestor's revoke reached it after hoisting it, or its `CSpace` was
-    /// torn down) while the source is still live — the source keeps the
-    /// capability and whatever children remained under it.
+    /// The move cannot complete. `InvalidCapability`: both slots are gone (an
+    /// ancestor's revoke freed them, or their `CSpace`s are being torn down).
+    /// `InvalidState`: the destination is gone (an ancestor's revoke reached
+    /// it after hoisting it, or its `CSpace` is being torn down) while the
+    /// source is still live — the source keeps the capability, the children
+    /// that remained under it, and, once the destination's drain re-links
+    /// them, the children already migrated.
     Lost(SyscallError),
     /// The liveness backstop tripped (`MAX_REPARENT_BATCHES`): the source's
     /// child list kept growing (deriving from the pinned source is refused, but
@@ -392,10 +394,11 @@ unsafe fn drive_batch(mv: &CapMove, batches: &mut u32, backstop: u32) -> MoveSte
         (false, false) => MoveStep::Lost(SyscallError::InvalidCapability),
         (false, true) =>
         {
-            // Whoever freed the source — an ancestor's revoke (after hoisting the
-            // destination out from under it) or the teardown of the source's
-            // `CSpace` (which left the destination a root) — dropped the reference
-            // it held; the destination is the capability now.
+            // Whoever took the source — an ancestor's revoke (after hoisting the
+            // destination out from under it), or the teardown of the source's
+            // `CSpace` (whose drain re-links the destination and the source's
+            // remaining children under the source's parent) — releases the
+            // reference it holds; the destination is the capability now.
             // SAFETY: caller contract; dst resolved live.
             unsafe { unpin(mv.dst) };
             MoveStep::Done {
@@ -603,13 +606,24 @@ unsafe fn free_source(mv: &CapMove, src_lock: SourceLock) -> bool
 }
 
 /// Whether `id` still holds the capability the move is relocating: occupied,
-/// same generation, same object.
+/// same generation, same object, and its `CSpace` not draining. A slot of a
+/// `CSpace` whose teardown drain has begun counts as gone, so the move takes
+/// no capability into or out of it (core/kernel/docs/capability-internals.md
+/// § Move).
 ///
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK`.
 unsafe fn live(id: SlotId, generation: u32, object: NonNull<KernelObjectHeader>) -> bool
 {
+    // SAFETY: a registry-resolved `CSpace` stays allocated while
+    // DERIVATION_LOCK is held (caller contract); the flag is atomic.
+    let draining = super::lookup_cspace(id.cspace_id, id.epoch)
+        .is_none_or(|cs| unsafe { (*cs).is_draining() });
+    if draining
+    {
+        return false;
+    }
     // SAFETY: caller contract.
     unsafe { resolve_slot_mut(id) }.is_some_and(|s| {
         s.tag != CapTag::Null && s.generation() == generation && s.object == Some(object)
@@ -1085,11 +1099,11 @@ mod tests
             panic!("expected a pending move");
         };
         let dst = dst_of(ID_B, mv.handle());
-        // The destination's CSpace is torn down: its drain orphans dst's
-        // children into roots and unlinks dst.
+        // An ancestor's revoke takes the destination: it hoists dst's
+        // children under its root and frees dst.
         DERIVATION_LOCK.write_lock();
         // SAFETY: DERIVATION_LOCK held; dst live.
-        assert!(unsafe { reparent_children(dst, None, usize::MAX) });
+        assert!(unsafe { reparent_children(dst, Some(root), usize::MAX) });
         // SAFETY: DERIVATION_LOCK held; dst live.
         unsafe { unlink_node(dst) };
         // SAFETY: single-threaded test ownership of the leaked CSpace; dst live.
@@ -1111,6 +1125,139 @@ mod tests
             "the unmigrated child stays under src"
         );
         assert_eq!(refcount(obj), 1);
+        crate::cap::unregister_cspace(ID_A);
+        crate::cap::unregister_cspace(ID_B);
+    }
+
+    /// Drain `id`'s `CSpace` to completion as its teardown does, leaving it
+    /// registered so its slots can be read.
+    fn drain(cs: *mut CSpace, id: CSpaceId)
+    {
+        use crate::cap::drain::{DrainState, drain_dying_cspace_batch};
+        let epoch = crate::cap::registry_epoch(id);
+        let mut st = DrainState::new();
+        let mut done = false;
+        let mut calls = 0;
+        while !done && calls < 10_000
+        {
+            DERIVATION_LOCK.write_lock();
+            // SAFETY: DERIVATION_LOCK held; the test CSpace is registered and
+            // unshared.
+            done = unsafe { drain_dying_cspace_batch(cs, id, epoch, &mut st) };
+            DERIVATION_LOCK.write_unlock();
+            calls += 1;
+        }
+        assert!(done, "the drain must finish");
+    }
+
+    // Defect guarded: a move that keeps migrating out of a source whose
+    // CSpace is being torn down, or a teardown that leaves the destination
+    // and the source's remaining children outside the source's ancestors.
+    #[test]
+    fn a_draining_source_completes_the_move_and_its_ancestors_keep_every_child()
+    {
+        const ID_R: CSpaceId = 3225;
+        const ID_A: CSpaceId = 3226;
+        const ID_B: CSpaceId = 3227;
+        let r = mk_registered_cspace(ID_R);
+        let a = mk_registered_cspace(ID_A);
+        let b = mk_registered_cspace(ID_B);
+        let obj = mk_object();
+        let root = occupy(r, ID_R);
+        let src = occupy(a, ID_A);
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        unsafe { (*a).slot_mut(src.index.get()).expect("src slot").object = Some(obj) };
+        // SAFETY: single-threaded test ownership of the leaked CSpace.
+        let handle = unsafe { (*a).cap_handle(src.index) };
+        let kids = occupy_many(r, ID_R, MAX_REPARENT_EDITS + 9);
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: DERIVATION_LOCK held; both slots live.
+        let mut linked = unsafe { link_child(root, src) };
+        for k in &kids
+        {
+            // SAFETY: DERIVATION_LOCK held; both slots live.
+            linked &= unsafe { link_child(src, *k) };
+        }
+        DERIVATION_LOCK.write_unlock();
+        assert!(linked, "setup links must land");
+        let MoveStep::Pending(mv) = begin(a, handle, b, Placement::IpcTransfer).expect("begin")
+        else
+        {
+            panic!("expected a pending move");
+        };
+        let dst = dst_of(ID_B, mv.handle());
+
+        // The source's CSpace starts draining before the next batch.
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: single-threaded test ownership; DERIVATION_LOCK held.
+        unsafe { (*a).set_draining() };
+        DERIVATION_LOCK.write_unlock();
+        let step = move_cap_drive(mv);
+        assert!(
+            matches!(step, MoveStep::Done { release: None, .. }),
+            "the destination is the capability now: {step:?}"
+        );
+        assert_eq!(parents_under(&kids, src), 9, "no batch ran after the flag");
+        assert_eq!(refcount(obj), 2, "the source slot keeps its reference");
+        drain(a, ID_A);
+
+        let d = snap(dst).expect("destination live");
+        assert!(!d.pinned);
+        assert_eq!(d.parent, Some(root), "the destination under src's parent");
+        assert_eq!(parents_under(&kids, dst), MAX_REPARENT_EDITS);
+        assert_eq!(
+            parents_under(&kids, root),
+            9,
+            "the unmigrated children under src's parent"
+        );
+        crate::cap::unregister_cspace(ID_A);
+        crate::cap::unregister_cspace(ID_B);
+        crate::cap::unregister_cspace(ID_R);
+    }
+
+    // Defect guarded: a move that migrates into a destination whose CSpace
+    // is being torn down, or a teardown that leaves the migrated children
+    // outside the source.
+    #[test]
+    fn a_draining_destination_fails_the_move_and_the_source_keeps_every_child()
+    {
+        const ID_A: CSpaceId = 3228;
+        const ID_B: CSpaceId = 3229;
+        let a = mk_registered_cspace(ID_A);
+        let b = mk_registered_cspace(ID_B);
+        let obj = mk_object();
+        let (root, src, sib, kids, handle) = mk_tree(a, ID_A, MAX_REPARENT_EDITS + 9, obj);
+        let MoveStep::Pending(mv) = begin(a, handle, b, Placement::IpcTransfer).expect("begin")
+        else
+        {
+            panic!("expected a pending move");
+        };
+        let dst = dst_of(ID_B, mv.handle());
+
+        DERIVATION_LOCK.write_lock();
+        // SAFETY: single-threaded test ownership; DERIVATION_LOCK held.
+        unsafe { (*b).set_draining() };
+        DERIVATION_LOCK.write_unlock();
+        assert!(matches!(
+            move_cap_drive(mv),
+            MoveStep::Lost(SyscallError::InvalidState)
+        ));
+        drain(b, ID_B);
+
+        let s = snap(src).expect("source keeps the capability");
+        assert!(!s.pinned);
+        assert_eq!(s.parent, Some(root));
+        assert_eq!(s.next, Some(sib), "source keeps its position");
+        assert_eq!(
+            parents_under(&kids, src),
+            kids.len(),
+            "every child back under src"
+        );
+        assert_eq!(
+            snap(dst).map(|d| d.parent),
+            Some(None),
+            "dst out of the forest"
+        );
         crate::cap::unregister_cspace(ID_A);
         crate::cap::unregister_cspace(ID_B);
     }

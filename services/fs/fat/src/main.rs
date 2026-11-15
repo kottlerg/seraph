@@ -209,10 +209,12 @@ fn spawn_pressure_thread(service: u64)
 }
 
 /// Wait for memmgr's level to change; at `Low` or `Critical` mark a
-/// release pending and wake the dispatch loop with a call on `wake`. Ends
-/// when the wait fails, or when the call does, which it does once vfsd has
-/// revoked the service endpoint: the dispatch loop's receive then fails too
-/// and ends the driver.
+/// release pending and wake the dispatch loop with a call on `wake`. A call
+/// that a stop or an upcall interrupts is made again, since a second wake
+/// costs the loop one more refused request. Ends when the wait fails, or
+/// when the call fails otherwise, as it does once vfsd has revoked the
+/// service endpoint: the dispatch loop's receive then fails too and ends the
+/// driver.
 fn pressure_thread(wake: u64)
 {
     loop
@@ -231,8 +233,17 @@ fn pressure_thread(wake: u64)
         RELEASE_PENDING.store(true, Ordering::Release);
         let msg = IpcMessage::builder(PRESSURE_WAKE).build();
         let ipc_buf = std::os::seraph::current_ipc_buf();
-        // SAFETY: ipc_buf is this thread's registered IPC buffer.
-        if unsafe { ipc::ipc_call(wake, &msg, ipc_buf) }.is_err()
+        let woken = loop
+        {
+            // SAFETY: ipc_buf is this thread's registered IPC buffer.
+            match unsafe { ipc::ipc_call(wake, &msg, ipc_buf) }
+            {
+                Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 =>
+                {}
+                result => break result.is_ok(),
+            }
+        };
+        if !woken
         {
             break;
         }

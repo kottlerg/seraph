@@ -75,10 +75,14 @@ const LIMITED_KEEP_CORRUPT: i32 = 4;
 /// allocate while it runs; its commitment ends when it has at most this many
 /// left to commit.
 const HOG_MARGIN_PAGES: u64 = 1024;
-/// Reservations the hog may attempt before it gives up: each failure halves
-/// the next attempt, and each success commits at least half of what is left
-/// above the margin.
+/// Reservations the hog may attempt before it gives up, over all its
+/// commitments down to the margin: each failure halves the next attempt, and
+/// each success commits at least half of what is left above the margin.
 const HOG_MAX_ROUNDS: usize = 256;
+/// Grants past what is left the hog may ask before it gives up: each one
+/// memmgr admits means another process freed pages after the hog read what
+/// was left.
+const HOG_REFUSAL_ATTEMPTS: usize = 8;
 /// Bytes of the hog's ballast: the size of the heap's floor, so the ballast
 /// holds at least what the floor has free.
 const HOG_BALLAST_BYTES: usize = 2 << 20;
@@ -87,7 +91,8 @@ const HOG_STATUS_FAILED: i32 = 2;
 /// Exit code: the hog did not commit down to [`HOG_MARGIN_PAGES`] in
 /// [`HOG_MAX_ROUNDS`] attempts.
 const HOG_NOT_COMMITTED: i32 = 3;
-/// Exit code: a grant of one page past what is left was not refused with
+/// Exit code: a grant of one page past what is left was admitted in each of
+/// [`HOG_REFUSAL_ATTEMPTS`] attempts, or refused other than with
 /// `OUT_OF_MEMORY_BEST_EFFORT`.
 const HOG_GRANT_NOT_REFUSED: i32 = 4;
 /// Exit code: the refusal reported no free pages past the grant asked, so it
@@ -424,7 +429,7 @@ fn run_hog()
         status.success(),
         "the heap-commit hog exited {status:?}: {HOG_STATUS_FAILED}=QUERY_POOL_STATUS failed, \
          {HOG_NOT_COMMITTED}=it did not commit down to its margin, {HOG_GRANT_NOT_REFUSED}=a grant \
-         past what is left was not refused, {HOG_NO_FREE_PAGES}=the refusal showed no free \
+         past what is left was admitted in every attempt, {HOG_NO_FREE_PAGES}=the refusal showed no free \
          pages, {HOG_BALLAST_FAILED}=its ballast's allocation failed, a fault=a fault on a committed page was declined"
     );
 }
@@ -482,6 +487,13 @@ fn uncommitted_available() -> u64
 /// hog then writes every page it committed, and exits 0; a fault memmgr
 /// declined would kill it instead.
 ///
+/// Other processes free pages while the hog runs (a file system gives back
+/// its cache when the hog's commitment raises memmgr's pressure level), so
+/// what is left can grow between the hog's read of it and its grant. memmgr
+/// then admits the grant; the hog keeps it, which its exit returns, commits
+/// down to its margin again and asks again, up to
+/// [`HOG_REFUSAL_ATTEMPTS`] times.
+///
 /// The heap's floor is an uncommitted demand region below the committed one
 /// (docs/userspace-memory-model.md § Byte Heap), whose untouched pages memmgr
 /// backs only while it has pages to spare. So the hog first fills what its
@@ -496,16 +508,34 @@ fn hog_main() -> !
         exit(HOG_BALLAST_FAILED);
     }
     ballast.resize(HOG_BALLAST_BYTES, 1);
+    let mut rounds = HOG_MAX_ROUNDS;
+    for _ in 0..HOG_REFUSAL_ATTEMPTS
+    {
+        let left = commit_to_margin(&mut held, &mut rounds);
+        if past_grant_refused(left)
+        {
+            touch_committed(&mut held);
+            exit(0);
+        }
+    }
+    exit(HOG_GRANT_NOT_REFUSED);
+}
+
+/// Commit blocks into `held` until what memmgr can still promise is at most
+/// [`HOG_MARGIN_PAGES`], spending reservation attempts from `rounds`, and
+/// return what is then left; exit with [`HOG_NOT_COMMITTED`] when `rounds`
+/// runs out first.
+fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
+{
     let mut ask = u64::MAX;
-    let mut left = None;
-    for _ in 0..HOG_MAX_ROUNDS
+    while *rounds > 0
     {
         let available = uncommitted_available();
         if available <= HOG_MARGIN_PAGES
         {
-            left = Some(available);
-            break;
+            return available;
         }
+        *rounds = rounds.saturating_sub(1);
         ask = ask.min(available.saturating_sub(HOG_MARGIN_PAGES / 2));
         let mut block: Vec<u8> = Vec::new();
         if block.try_reserve_exact(page_bytes(ask)).is_ok()
@@ -517,11 +547,17 @@ fn hog_main() -> !
             ask /= 2;
         }
     }
-    let Some(left) = left
-    else
-    {
-        exit(HOG_NOT_COMMITTED)
-    };
+    exit(HOG_NOT_COMMITTED)
+}
+
+/// Ask memmgr for a best-effort grant of one page more than `left`. Returns
+/// `true` when memmgr refuses it with `OUT_OF_MEMORY_BEST_EFFORT` and counts
+/// more free pages than the grant asked, and `false` when it grants it (the
+/// hog keeps the grant). Exits with [`HOG_NO_FREE_PAGES`] on a refusal that
+/// counts no more free pages than asked, and with [`HOG_GRANT_NOT_REFUSED`] on
+/// any other reply.
+fn past_grant_refused(left: u64) -> bool
+{
     let past = left.saturating_add(1);
     let grant = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
         .word(0, past)
@@ -542,11 +578,19 @@ fn hog_main() -> !
             {
                 exit(HOG_NO_FREE_PAGES);
             }
+            true
         }
+        Ok(r) if r.label == memmgr_errors::SUCCESS => false,
         _ => exit(HOG_GRANT_NOT_REFUSED),
     }
+}
+
+/// Write one byte of every page of the blocks in `held`, each a committed
+/// reservation the hog has not touched.
+fn touch_committed(held: &mut [Vec<u8>])
+{
     let page = page_bytes(1);
-    for block in &mut held
+    for block in held
     {
         for byte in block.spare_capacity_mut().iter_mut().step_by(page)
         {
@@ -556,5 +600,4 @@ fn hog_main() -> !
             unsafe { std::ptr::write_volatile(byte.as_mut_ptr(), 1) };
         }
     }
-    exit(0);
 }

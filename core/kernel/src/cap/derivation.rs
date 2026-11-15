@@ -522,12 +522,10 @@ pub enum BatchStatus
     /// releasing the lock, deallocating the collected objects, and
     /// revalidating the root.
     MoreWork,
-    /// A derivation link failed to resolve — genuine corruption, or a foreign
-    /// sender's capability transfer that committed into a dying `CSpace`
-    /// before its receiver was stopped (core/kernel/docs/capability-internals.md
-    /// § Revocation Algorithm). The dangling chain was truncated for
-    /// containment; the caller must surface an error rather than report a
-    /// clean revoke.
+    /// A derivation link failed to resolve, which only corruption produces
+    /// (core/kernel/docs/capability-internals.md § Revocation Algorithm). The
+    /// dangling chain was truncated for containment; the caller must surface
+    /// an error rather than report a clean revoke.
     DeadLink,
 }
 
@@ -549,10 +547,10 @@ pub enum BatchStatus
 /// # Safety
 ///
 /// Caller must hold `DERIVATION_LOCK` write lock. Derivation links
-/// reachable from a live slot resolve, save for the dead-link sources
-/// core/kernel/docs/capability-internals.md § Revocation Algorithm names; a
-/// link that fails to resolve is contained: the walk truncates the chain
-/// hanging from it, logs it, and reports [`BatchStatus::DeadLink`].
+/// reachable from a live slot resolve, save for corruption
+/// (core/kernel/docs/capability-internals.md § Revocation Algorithm); a link
+/// that fails to resolve is contained: the walk truncates the chain hanging
+/// from it, logs it, and reports [`BatchStatus::DeadLink`].
 pub unsafe fn revoke_subtree_batch(
     root: SlotId,
 ) -> (&'static [Option<NonNull<KernelObjectHeader>>], BatchStatus)
@@ -652,9 +650,9 @@ fn collected(
 /// nodes chained behind the dead link are abandoned. How each walk
 /// reports and recovers from this — the revoke walk's `DeadLink` error, the
 /// reparent walk (delete, the range splits, and move) completing before its
-/// caller frees `owner`, and the teardown drain cutting through its own
-/// head pop — is defined in core/kernel/docs/capability-internals.md
-/// § Revocation Algorithm.
+/// caller frees `owner`, and the teardown drain continuing past it — is
+/// defined in core/kernel/docs/capability-internals.md § Revocation
+/// Algorithm.
 ///
 /// An abandoned node keeps its `deriv_parent` (naming `owner`) and sibling
 /// links, so it is outside every ancestor's revoke reach from here on, and

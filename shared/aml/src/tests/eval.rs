@@ -738,6 +738,68 @@ fn objects_a_method_creates_are_removed_when_it_returns()
 }
 
 #[test]
+fn a_method_defining_an_external_name_gives_the_table_node_back()
+{
+    // A table declares \_SB.XDEV External and loads TBL0 under it; MAKE
+    // defines the device, with an object of its own, and reads TBL0.
+    let defs = cat(&[
+        &[0x15],
+        &n("\\_SB.XDEV"),
+        &[6, 0],
+        &scope("\\_SB.XDEV", &name_obj("TBL0", &i(5))),
+        &method(
+            "MAKE",
+            0,
+            &cat(&[
+                &device("\\_SB.XDEV", &name_obj("LOC0", &i(1))),
+                &ret(&n("\\_SB.XDEV.TBL0")),
+            ]),
+        ),
+    ]);
+    // TEST calls MAKE more times than an evaluation may create objects.
+    const { assert!(MAX_EVAL_OBJECTS < 5000) };
+    let body = cat(&[
+        &store(&i(0), &l(0)),
+        &while_(
+            &op(&[0x95], &[&l(0), &i(5000)]),
+            &cat(&[&op(&n("MAKE"), &[]), &op(&[0x75], &[&l(0)])]),
+        ),
+        &ret(&l(0)),
+    ]);
+    let mut ns = table_of(2, &defs, 0, &body);
+    let before = ns.len();
+    let xdev = ns.find("\\_SB.XDEV").unwrap();
+    let generation = ns.generation(xdev).unwrap();
+    let mut sim = Sim::new();
+    for _ in 0..2
+    {
+        assert_eq!(
+            run_on(&mut ns, &mut sim, "\\MAKE", vec![]),
+            Ok(Data::Integer(5))
+        );
+        assert_eq!(ns.len(), before);
+        assert_eq!(ns.find("\\_SB.XDEV"), Some(xdev));
+        assert!(matches!(
+            ns.object(xdev),
+            Some(Object::External { kind: 6, .. })
+        ));
+        assert!(matches!(ns.owner(xdev), Some(Owner::Table(_))));
+        assert_eq!(data(&ns, "\\_SB.XDEV.TBL0"), Data::Integer(5));
+        assert!(ns.find("\\_SB.XDEV.LOC0").is_none());
+    }
+    // Each return gave the External back with a new generation, so a
+    // reference to the method's device fails.
+    assert_ne!(ns.generation(xdev), Some(generation));
+    // Each return also gave back the object count the definition took.
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(5000))
+    );
+    assert_eq!(ns.len(), before);
+    assert_eq!(data(&ns, "\\_SB.XDEV.TBL0"), Data::Integer(5));
+}
+
+#[test]
 fn module_level_code_runs_once_and_keeps_its_objects()
 {
     let aml = cat(&[

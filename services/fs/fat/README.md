@@ -17,7 +17,7 @@ fat/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction
 └── src/
-    ├── main.rs                 # Dispatch loop and pressure wait, FS_* handlers, write engine
+    ├── main.rs                 # Dispatch loop, pressure thread, FS_* handlers, write engine
     ├── bpb.rs                  # BPB parser, FatState fields
     ├── alloc.rs                # Cluster allocator, FAT-mirror writes, FSInfo flush
     ├── dir.rs                  # Directory walks and mutation (insert/remove/rename)

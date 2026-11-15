@@ -34,15 +34,15 @@ in [crash-safety.md](crash-safety.md).
   `PAGE_SIZE` over it. A slot takes its page from memmgr when a miss finds no slot that holds a page
   and no sector run, and the cache evicts only once every slot holds a page or memmgr refuses one,
   so an idle mount pays only for the pages it fills. When memmgr's memory-pressure level turns `Low`
-  or `Critical`, the dispatch loop, which waits on a wait set holding the service endpoint and the
-  runtime's pressure Notification, gives memmgr back every page no reference holds and no client
-  maps, after the mapping check below for a page that went to a client, but the `RELEASE_KEEP` (4)
-  most recently used, which a miss evicts when memmgr refuses a page, as at `Critical`; it gives
-  back every spare page of the quarantine and every page a failed fill left without a cap, too, and
-  the slots take pages again on demand. An open holds at most the slot ceiling of outstanding
-  `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with general headroom
-  for every slot page, the quarantine's replacements, a per-read ancestor cap for every slot (each
-  outstanding page holds one), the scratch page, and 64 more
+  or `Critical`, a pressure thread, which waits on the runtime's pressure Notification, wakes the
+  dispatch loop with an unbadged call on the service endpoint, and the loop gives memmgr back every
+  page no reference holds and no client maps, after the mapping check below for a page that went to
+  a client, but the `RELEASE_KEEP` (4) most recently used, which a miss evicts when memmgr refuses a
+  page, as at `Critical`; it gives back every spare page of the quarantine and every page a failed
+  fill left without a cap, too, and the slots take pages again on demand. An open holds at most the
+  slot ceiling of outstanding `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with
+  general headroom for every slot page, the quarantine's replacements, a per-read ancestor cap for
+  every slot (each outstanding page holds one), the scratch page, and 64 more
   (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache, or holding every slot
   outstanding, never meets an exhausted `CSpace`; a failed funding fails cache init. Before it
   records an open's release SEND and liveness cap, each `FS_OPEN` tops the `CSpace` up so the same

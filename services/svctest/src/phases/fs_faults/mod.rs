@@ -25,7 +25,10 @@
 //! (services/fs/docs/fs-driver-protocol.md § Loss of the block device).
 //! `FS_UNMOUNT` is refused `BUSY` while an open is live, and with
 //! `UNMOUNT_FORCE` releases the opens and ends the driver (§ Label 19:
-//! `FS_UNMOUNT`). Every case that ends a driver ends its own.
+//! `FS_UNMOUNT`). A driver whose service endpoint is revoked and deleted, as
+//! vfsd ends one it cannot use, exits at its next receive
+//! (`ipc::recv_guard::EXIT_RECV_WEDGE`). Every case that ends a driver ends
+//! its own.
 
 mod pressure;
 mod ramdisk;
@@ -100,6 +103,7 @@ pub fn fs_block_faults_phase(_: &Caps)
 
     unmount_busy_while_open_live();
     unmount_forced_releases_opens();
+    revoked_service_ends_driver();
     std::os::seraph::log!("fs_block_faults phase passed");
 }
 
@@ -152,6 +156,25 @@ fn revoked_block_cap_ends_driver(fs: &mut OwnFatfs, disk: &SharedDisk)
     );
     let _ = syscall::cap_delete(file);
     let _ = syscall::cap_delete(dir);
+}
+
+/// The service endpoint goes away, as vfsd tears down a driver it cannot
+/// use (services/vfsd/src/driver.rs, `teardown_driver`): every capability
+/// derived from it, the driver's among them, is revoked, and the endpoint's
+/// last capability is deleted. The driver's dispatch loop, parked in its
+/// receive, finds its endpoint gone, and the driver exits with
+/// `ipc::recv_guard::EXIT_RECV_WEDGE` with no request to answer.
+fn revoked_service_ends_driver()
+{
+    let disk = RamDisk::formatted();
+    let fs = OwnFatfs::start(&disk);
+    fs.expect_serving("R1: before the revocation");
+    fs.revoke_service();
+    fs.expect_exit(
+        ipc::recv_guard::EXIT_RECV_WEDGE,
+        "R1: the driver after its service endpoint was revoked",
+    );
+    fs.stop();
 }
 
 /// `FS_UNMOUNT` without `UNMOUNT_FORCE` while one open is live is refused
@@ -1019,6 +1042,17 @@ impl OwnFatfs
             .expect("fs_block_faults: the block device was already stopped")
             .join()
             .expect("fs_block_faults: block server thread panicked");
+    }
+
+    /// Take the service endpoint away: revoke every capability derived from
+    /// it, the driver's and the root cap among them, and delete the last.
+    /// [`Self::stop`]'s deletes of the two handles are then refused as stale.
+    fn revoke_service(&self)
+    {
+        syscall::cap_revoke_all(self.service)
+            .expect("fs_block_faults: revoking the service endpoint failed");
+        syscall::cap_delete(self.service)
+            .expect("fs_block_faults: deleting the service endpoint failed");
     }
 
     /// The driver's main thread has not exited.

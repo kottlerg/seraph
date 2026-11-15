@@ -30,13 +30,16 @@
 //! swept out of the table (`sweep_dead_opens`). Write-side metadata patching
 //! uses the node's cached `DirEntryLocation`.
 //!
-//! Memory pressure: the dispatch loop waits on a wait set holding the service
-//! endpoint and the runtime's memory-pressure Notification
-//! (`std::os::seraph::memory_pressure_notification`). When memmgr's level
-//! changes to `Low` or `Critical`, the loop gives memmgr back the pages the
-//! cache holds idle but the few most recently used, which a miss evicts when
-//! memmgr refuses a page ([`cache::PageCache::release_idle_pages`]), and goes
-//! on serving; the cache grows again on demand, within what memmgr grants.
+//! Memory pressure: a pressure thread waits on the runtime's memory-pressure
+//! Notification (`std::os::seraph::wait_memory_pressure`). When memmgr's
+//! level changes to `Low` or `Critical`, it marks a release pending and wakes
+//! the dispatch loop with an unbadged call on the service endpoint. The loop,
+//! at the top of its next turn, gives memmgr back the pages the cache holds
+//! idle but the few most recently used, which a miss evicts when memmgr
+//! refuses a page ([`cache::PageCache::release_idle_pages`]), and goes on
+//! serving; the cache grows again on demand, within what memmgr grants. The
+//! loop itself receives on the service endpoint alone, so a revocation of
+//! the endpoint ends the driver at its next receive.
 //!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding
@@ -56,6 +59,7 @@ mod fat;
 mod file;
 
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use alloc::{FatError, allocate_cluster};
@@ -90,9 +94,6 @@ struct FatCaps
 {
     block_dev: u64,
     service: u64,
-    /// The dispatch loop's wait set over `service` and the memory-pressure
-    /// Notification, made after the bootstrap round; `None` without one.
-    pressure: Option<PressureWait>,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -110,12 +111,11 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(mut caps) = bootstrap_caps(info, ipc_buf)
+    let Some(caps) = bootstrap_caps(info, ipc_buf)
     else
     {
         syscall::thread_exit();
     };
-    caps.pressure = PressureWait::new(caps.service);
 
     let cache = match PageCache::init(
         info.memmgr_endpoint,
@@ -160,76 +160,100 @@ fn main() -> !
         }
     }
 
+    spawn_pressure_thread(caps.service);
+
     service_loop(
         &caps, &mut state, &mut nodes, &files, cache, ipc_buf, &eviction,
     );
 }
 
-/// Wait-set badge of the service endpoint.
-const WS_BADGE_SERVICE: u64 = 0;
-/// Wait-set badge of the memory-pressure Notification.
-const WS_BADGE_PRESSURE: u64 = 1;
-/// Members of the dispatch loop's wait set: the service endpoint and the
-/// memory-pressure Notification.
-const WS_MEMBERS: u32 = 2;
+// ── Memory pressure ────────────────────────────────────────────────────────
 
-/// The dispatch loop's wait set and the memory-pressure Notification it
-/// holds (module docs, Memory pressure).
-struct PressureWait
+/// Set by the pressure thread when memmgr's level turns `Low` or
+/// `Critical`; the dispatch loop takes it at the top of a turn
+/// ([`release_under_pressure`]).
+static RELEASE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Label of the pressure thread's wake call, sent unbadged on the service
+/// endpoint. No service-level request uses it, so the dispatch loop refuses
+/// it with `UNKNOWN_OPCODE`; the turn the call costs the loop is the wake.
+const PRESSURE_WAKE: u64 = 0;
+const _: () =
+    assert!(PRESSURE_WAKE != fs_labels::FS_MOUNT && PRESSURE_WAKE != fs_labels::FS_UNMOUNT);
+
+/// Start the pressure thread (module docs, Memory pressure) on an unbadged
+/// SEND derived from `service`. Logged and skipped when the process is not
+/// registered for pressure or the cap or the thread cannot be had: the cache
+/// is then kept whatever the level, since the level is advisory.
+fn spawn_pressure_thread(service: u64)
 {
-    ws: u64,
-    sig: u64,
+    if std::os::seraph::memory_pressure_notification().is_none()
+    {
+        std::os::seraph::log!(warn: "not registered for memory pressure; cache kept under pressure");
+        return;
+    }
+    let Ok(wake) = syscall::cap_derive(service, syscall::RIGHTS_EP_SEND)
+    else
+    {
+        std::os::seraph::log!(warn: "no wake cap; cache kept under memory pressure");
+        return;
+    };
+    if std::thread::Builder::new()
+        .name("fatfs-pressure".into())
+        .spawn(move || pressure_thread(wake))
+        .is_err()
+    {
+        std::os::seraph::log!(warn: "pressure thread spawn failed; cache kept under memory pressure");
+        let _ = syscall::cap_delete(wake);
+    }
 }
 
-impl PressureWait
+/// Wait for memmgr's level to change; at `Low` or `Critical` mark a
+/// release pending and wake the dispatch loop with a call on `wake`. Ends
+/// when the wait fails, or when the call does, which it does once vfsd has
+/// revoked the service endpoint: the dispatch loop's receive then fails too
+/// and ends the driver.
+fn pressure_thread(wake: u64)
 {
-    /// The wait set over `service` and the runtime's pressure Notification.
-    /// `None`, logged, when the process is not registered for pressure or
-    /// the set cannot be made: the loop then receives on `service` alone and
-    /// keeps its cache whatever the level, since the level is advisory.
-    fn new(service: u64) -> Option<Self>
+    loop
     {
-        let Some(sig) = std::os::seraph::memory_pressure_notification()
-        else
+        match std::os::seraph::wait_memory_pressure(None)
         {
-            std::os::seraph::log!(warn: "not registered for memory pressure; cache kept under pressure");
-            return None;
-        };
-        let Some(ws) = std::os::seraph::object_slab_retype(
-            std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
-            |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
-        )
-        else
-        {
-            std::os::seraph::log!(warn: "wait set not created; cache kept under memory pressure");
-            return None;
-        };
-        if syscall::wait_set_add(ws, service, WS_BADGE_SERVICE).is_err()
-            || syscall::wait_set_add(ws, sig, WS_BADGE_PRESSURE).is_err()
-        {
-            std::os::seraph::log!(warn: "wait set not filled; cache kept under memory pressure");
-            let _ = syscall::cap_delete(ws);
-            return None;
+            Ok(MemoryPressure::Low | MemoryPressure::Critical) =>
+            {}
+            Ok(_) => continue,
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "memory-pressure wait failed ({e}); cache kept under pressure");
+                break;
+            }
         }
-        Some(Self { ws, sig })
-    }
-
-    /// Take the pressure bits, then read memmgr's level; at `Low` or
-    /// `Critical` give memmgr back the cache's idle pages. Run by the
-    /// dispatch thread between requests ([`PageCache::release_idle_pages`]).
-    fn on_signal(&self, cache: &PageCache, ipc_buf: *mut u64)
-    {
-        // The wait set is level-triggered: taking the bits ends the wake.
-        let _ = syscall::notification_try_wait(self.sig);
-        let Some(level @ (MemoryPressure::Low | MemoryPressure::Critical)) =
-            std::os::seraph::memory_pressure()
-        else
+        RELEASE_PENDING.store(true, Ordering::Release);
+        let msg = IpcMessage::builder(PRESSURE_WAKE).build();
+        let ipc_buf = std::os::seraph::current_ipc_buf();
+        // SAFETY: ipc_buf is this thread's registered IPC buffer.
+        if unsafe { ipc::ipc_call(wake, &msg, ipc_buf) }.is_err()
         {
-            return;
-        };
-        let released = cache.release_idle_pages(ipc_buf);
-        std::os::seraph::log!("memory pressure {level:?}: {released} cache pages given back");
+            break;
+        }
     }
+    let _ = syscall::cap_delete(wake);
+}
+
+/// Read memmgr's level again, since it can have recovered since the
+/// pressure thread's wake, and at `Low` or `Critical` give memmgr back the
+/// cache's idle pages. Run by the dispatch thread between requests
+/// ([`PageCache::release_idle_pages`]).
+fn release_under_pressure(cache: &PageCache, ipc_buf: *mut u64)
+{
+    let Some(level @ (MemoryPressure::Low | MemoryPressure::Critical)) =
+        std::os::seraph::memory_pressure()
+    else
+    {
+        return;
+    };
+    let released = cache.release_idle_pages(ipc_buf);
+    std::os::seraph::log!("memory pressure {level:?}: {released} cache pages given back");
 }
 
 /// Issue a single bootstrap round against the creator endpoint and assemble
@@ -249,7 +273,6 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
     Some(FatCaps {
         block_dev: round.caps[0],
         service: round.caps[1],
-        pressure: None,
     })
 }
 
@@ -347,9 +370,9 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   `OpenTable`: the open's own `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and
 ///   `FS_CLOSE`, and the stateless file ops on the open's node.
 ///
-/// The loop waits on the [`PressureWait`] set when there is one, and
-/// receives on the endpoint when it reports the endpoint ready; a pressure
-/// signal is handled between requests ([`PressureWait::on_signal`]).
+/// A release under memory pressure runs at the top of a turn, once the
+/// pressure thread has marked one pending and woken the loop
+/// ([`release_under_pressure`]).
 ///
 /// The open table is shared with the eviction worker via a `Mutex`. Main
 /// takes the lock to resolve an open cap, `FS_OPEN` takes it only around a
@@ -392,26 +415,11 @@ fn service_loop(
                 eviction.enqueue(req);
             }
         }
-        // One guard covers a failing wait and a failing recv: a
-        // level-triggered set keeps reporting the endpoint ready while the
-        // recv fails, and only a successful recv counts as progress.
-        if let Some(pressure) = &caps.pressure
+        // The pressure thread marked a release and woke the loop with a
+        // call (module docs, Memory pressure).
+        if RELEASE_PENDING.swap(false, Ordering::AcqRel)
         {
-            match syscall::wait_set_wait(pressure.ws)
-            {
-                Ok(WS_BADGE_PRESSURE) =>
-                {
-                    pressure.on_signal(cache, ipc_buf);
-                    continue;
-                }
-                Ok(_) =>
-                {}
-                Err(e) =>
-                {
-                    guard.on_failure(e);
-                    continue;
-                }
-            }
+            release_under_pressure(cache, ipc_buf);
         }
         // SAFETY: ipc_buf is the registered IPC buffer page.
         let msg = match unsafe { ipc::ipc_recv(caps.service, ipc_buf) }

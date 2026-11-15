@@ -235,6 +235,10 @@ impl Compiler<'_>
         prefer: Prefer,
     ) -> Result<(), Error>
     {
+        if max.is_none() && can_be_empty(node)
+        {
+            return self.at_least_of_nullable(node, min, prefer);
+        }
         for _ in 0..min
         {
             self.node(node)?;
@@ -242,10 +246,6 @@ impl Compiler<'_>
         let Some(max) = max
         else
         {
-            if can_be_empty(node)
-            {
-                return self.optional_plus(node, prefer);
-            }
             let split = self.emit(Inst::Split(0, 0))?;
             self.node(node)?;
             self.emit(Inst::Jump(split))?;
@@ -268,20 +268,36 @@ impl Compiler<'_>
         Ok(())
     }
 
-    /// `(?:node+)?`, the unbounded tail of a repetition whose node can match empty. In the
-    /// plain loop, a path through `node` that consumes nothing returns to the loop's split,
+    /// `node{min,}` for a node that can match empty: `(?:node+)?` when `min` is 0, and otherwise
+    /// `min - 1` copies and then `node+`, whose split after the last copy loops back to it. In
+    /// the plain loop, a path through `node` that consumes nothing returns to the loop's split,
     /// which the position has already visited, so it dies, and the exit is reached only after
     /// the node's consuming paths: a repetition that prefers more would then outrank the empty
-    /// iteration a backtracking engine takes first. Here that path reaches a second split, whose
-    /// exit it takes at its own priority.
-    fn optional_plus(&mut self, node: &Node, prefer: Prefer) -> Result<(), Error>
+    /// iteration a backtracking engine takes first. Here that path reaches the split after the
+    /// copy and takes its exit at its own priority. The `regex` crate compiles the same form,
+    /// so the groups inside `node` hold the text they hold there.
+    fn at_least_of_nullable(&mut self, node: &Node, min: u32, prefer: Prefer) -> Result<(), Error>
     {
-        let entry = self.emit(Inst::Split(0, 0))?;
+        let entry = match min.checked_sub(1)
+        {
+            None => Some(self.emit(Inst::Split(0, 0))?),
+            Some(copies) =>
+            {
+                for _ in 0..copies
+                {
+                    self.node(node)?;
+                }
+                None
+            }
+        };
         let body = self.insts.len();
         self.node(node)?;
         let again = self.emit(Inst::Split(0, 0))?;
         let end = self.insts.len();
-        self.set(entry, Inst::split(prefer, body, end));
+        if let Some(entry) = entry
+        {
+            self.set(entry, Inst::split(prefer, body, end));
+        }
         self.set(again, Inst::split(prefer, body, end));
         Ok(())
     }

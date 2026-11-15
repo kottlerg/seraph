@@ -415,6 +415,19 @@ mod tests
     }
 
     #[test]
+    fn a_group_in_a_repetition_of_a_node_that_can_match_empty_holds_its_last_consuming_iteration()
+    {
+        let group = |pattern: &str, text: &str| {
+            let caps = Regex::new(pattern).unwrap().captures(text).unwrap();
+            caps.get(1).map(|m| (m.start(), m.end()))
+        };
+        assert_eq!(group("(a*)+", "aa"), Some((0, 2)));
+        assert_eq!(group("(a|)+b", "ab"), Some((0, 1)));
+        assert_eq!(group("(a*){2,}", "aa"), Some((2, 2)));
+        assert_eq!(group("(a*)*", "aa"), Some((0, 2)));
+    }
+
+    #[test]
     fn captures_iter_numbers_each_matchs_groups()
     {
         let re = Regex::new(r"(\w)=(\d)").unwrap();

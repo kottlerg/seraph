@@ -21,9 +21,8 @@
 
 #![expect(
     clippy::multiple_crate_versions,
-    reason = "duplicate transitive versions (bitflags, hashbrown, windows-sys, wit-bindgen) come \
-              from third-party host deps (clap, gpt, fatfs, libc, which); not resolvable without \
-              upstream releases"
+    reason = "windows-sys resolves at two versions: 0.59, which xtask's own Windows console \
+              bindings declare, and 0.61, which clap's terminal styling (anstream) pulls in"
 )]
 // `symbolize`, the riscv64 kernel frame check and `compare-images` read ELF,
 // PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
@@ -59,6 +58,7 @@ mod disk;
 mod firmware;
 mod fs_compat;
 mod gh;
+mod gpt;
 mod guest;
 mod host_lock;
 mod qemu;

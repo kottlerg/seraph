@@ -70,7 +70,7 @@ Setting `default-members = ["xtask"]` in the workspace root `Cargo.toml` means
 bare `cargo build` and `cargo run` operate only on the host-target xtask
 binary. Components targeting the kernel, bootloader, or std-userspace triples
 must be built via `cargo xtask build` so the correct custom target JSON and
-`-Zbuild-std` flags are passed and, for the bootloader and the riscv64 kernel,
+`-Zbuild-std` flags are passed and, for the bootloader and each kernel,
 `RUSTFLAGS` is set (§ Custom Targets).
 
 [`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot
@@ -190,11 +190,20 @@ the same from any checkout.
 The riscv64 kernel build, and its Clippy pass, also run with `RUSTFLAGS` set,
 to `-Zunstable-options -Zemit-stack-sizes` (`RISCV64_KERNEL_RUSTFLAGS` in
 `xtask/src/commands/build.rs`), so that `-Z emit-stack-sizes` reaches the
-`-Z build-std` crates as well. `RUSTFLAGS` replaces the `[build] rustflags`
-of `.cargo/config.toml` there too: a flag added to that array reaches the
-riscv64 kernel only when it is added to `RISCV64_KERNEL_RUSTFLAGS` as well,
-and a `RUSTFLAGS` set in the calling environment does not reach the
-bootloader or the riscv64 kernel.
+`-Z build-std` crates as well. The x86-64 kernel build and its Clippy pass run
+with `RUSTFLAGS` set to `-Zunstable-options -Zretpoline-external-thunk`
+(`X86_64_KERNEL_RUSTFLAGS`), so that every indirect call and jump of the kernel
+and of its `-Z build-std` crates goes through the kernel's retpoline thunk
+([transient-execution.md](../core/kernel/docs/transient-execution.md)
+§ Controls). `RUSTFLAGS` replaces the `[build] rustflags` of
+`.cargo/config.toml` there too: a flag added to that array reaches a kernel
+only when it is added to `RISCV64_KERNEL_RUSTFLAGS` and
+`X86_64_KERNEL_RUSTFLAGS` as well, and a `RUSTFLAGS` set in the calling
+environment does not reach the bootloader or either kernel. A
+`SERAPH_FORCE_RETURN_MITIGATION` set there does reach the x86-64 kernel's
+compile, which reads it to force the inputs of its return mitigations
+([transient-execution.md](../core/kernel/docs/transient-execution.md)
+§ Forced return mitigations); the riscv64 kernel does not read it.
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace
@@ -500,7 +509,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs and `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal` and `test-wedge`, plus `test-vmgenid` on x86_64. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, checks the staged images' FAT volumes with `check-disk` (`fsck.fat -n`), and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs and `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal` and `test-wedge`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
@@ -509,7 +518,8 @@ The jobs that boot under QEMU (`validate` in `build-test.yml` and `burnin`
 in `burnin.yml`) install it and run on the pinned `ubuntu-26.04` runner
 image, whose archive ships `qemu-system-riscv64` in the `qemu-system-riscv`
 package (QEMU 10.2). The composite action
-`.github/actions/qemu-packages/action.yml` holds the install list and the
+`.github/actions/qemu-packages/action.yml` holds the install list (QEMU,
+its firmware, and dosfstools, whose `fsck.fat` `check-disk` runs) and the
 apt flags (no recommends) once; its `mode` input selects the cache key, the
 download, or the install, and the download and install calls pass the
 package directory as its `dir` input. Every booting cell `needs:` its

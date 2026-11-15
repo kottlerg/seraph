@@ -17,18 +17,20 @@ use syscall::SyscallError;
 
 /// One past the highest `SystemInfoType` discriminant `sys_system_info`
 /// answers. A discriminant at or past it is refused before the match.
-const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::InstructionCacheSyncs as u64 + 1;
+const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::SpeculationControls as u64 + 1;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
 /// arg0 = `SystemInfoType` discriminant (u64).
-/// arg1 = the stack class for `StackHighWater` (`syscall::STACK_CLASS_*`);
+/// arg1 = the stack class for `StackHighWater` (`syscall::STACK_CLASS_*`), or
+/// the view for `SpeculationControls` (`syscall::SPECULATION_VIEW_*`);
 /// ignored by every other discriminant.
 ///
 /// Returns the queried value as a scalar `u64`. No buffer is required.
-/// Returns `InvalidArgument` for an unknown discriminant or an unknown
-/// `StackHighWater` class, and `NotSupported` for the handoff class when the
-/// kernel could not locate the handoff stack.
+/// Returns `InvalidArgument` for an unknown discriminant, an unknown
+/// `StackHighWater` class or an unknown `SpeculationControls` view, and
+/// `NotSupported` for the handoff class when the kernel could not locate the
+/// handoff stack and for `SpeculationControls` on riscv64.
 ///
 /// A discriminant at or past [`SYSTEM_INFO_BOUND`] is refused before the
 /// match, and the match reads it clamped as data (`nospec::mask_index_u64`),
@@ -117,6 +119,14 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         // (`SystemInfoType::InstructionCacheSyncs`).
         {
             Ok(crate::mm::icache::sync_count())
+        }
+        13 =>
+        // SpeculationControls — the view in arg1 of the transient-execution
+        // selection: its inputs and controls, facts of the CPU model and its
+        // microcode, the same for every caller and carrying no kernel secret
+        // (docs/cross-boundary-disclosure.md).
+        {
+            crate::arch::current::speculation::mitigation_info(tf.arg(1))
         }
         _ => Err(SyscallError::InvalidArgument),
     }
@@ -213,6 +223,7 @@ mod tests
             SystemInfoType::ThreadRetypeBytes,
             SystemInfoType::LiveCSpaceCount,
             SystemInfoType::InstructionCacheSyncs,
+            SystemInfoType::SpeculationControls,
         ];
         let max = kinds.iter().map(|&k| k as u64).max();
         assert!(kinds.iter().all(|&k| (k as u64) < SYSTEM_INFO_BOUND));

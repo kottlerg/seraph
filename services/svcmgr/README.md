@@ -40,7 +40,10 @@ svcmgr/
 ├── src/
 │   ├── main.rs                    # main() (std runtime), IPC dispatch,
 │   │                              # dispatch_deaths, initiate_graceful_shutdown
+│   ├── classes.rs                 # Device class files configured with devmgr
 │   ├── death_queues.rs            # Death-queue ring capacity and first pool
+│   ├── endowed_servers.rs         # Liveness of vfsd and devmgr before
+│   │                              # reconciliation records them
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
@@ -59,7 +62,9 @@ svcmgr/
 │                                  # wire-blob encoder (`build_blob`), the
 │                                  # `cwd_rights` / `handover_permitted`
 │                                  # decisions, the windowed
-│                                  # `RestartBudget`
+│                                  # `RestartBudget`, the device class file
+│                                  # parser, and the death correlator and
+│                                  # cap decoding (`death_tag`, `death_caps`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see
@@ -81,8 +86,9 @@ svcmgr/
   [`service::bootstrap_caps`](src/service.rs): svcmgr's own endpoints,
   the publish-role source caps (`rootfs.root` SEND, devmgr-registry
   `SEND|GRANT` source, the `vfsd.mount`, `vfsd.deny` and `vfsd.swap` SENDs on vfsd's
-  service endpoint), one `(name, thread_cap)` round per substrate
-  service init bootstrapped before svcmgr existed, and a terminal
+  service endpoint), one `(name, thread_cap, observer)` round per substrate
+  service init bootstrapped before svcmgr existed (the observer is a Control-only
+  address-space cap or a process handle), and a terminal
   `LOGD_SOURCES` round carrying the two log-sink source caps svcmgr holds
   for the system's lifetime (the master-log source and a badge-0
   `SEND|GRANT` death-auth source on procmgr's service endpoint). Recipes
@@ -93,13 +99,17 @@ svcmgr/
   [docs/ipc-interface.md](docs/ipc-interface.md#handover-endowment-bootstrap-rounds).
 - **Reconciliation** — at `HANDOVER_COMPLETE` scan
   `/config/svcmgr/services/`, parse each `<name>.svc`, and pair it
-  with the pending-registration table (substrate pairs parked from the
+  with the pending-registration table (substrate triples parked from the
   endowment). Three outcomes: `bind only` (parked AND defined),
   `launching` (defined only), `registered without definition`
   (parked AND no recipe → hard error). With no memory for the parsed
   list, or for a bind-only entry's record, an endowed service runs on
   unsupervised (logged, not reported as a configuration error); a recipe
-  dropped for memory is reported like a malformed one. See
+  dropped for memory is reported like a malformed one. A vfsd found dead
+  before or during the scan, which reads through it, ends reconciliation
+  with every endowed service unsupervised, and its death is routed as
+  system death ([docs/restart-protocol.md](docs/restart-protocol.md)
+  § Death detection). See
   [docs/service-definitions.md](docs/service-definitions.md) § Reconciliation.
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)
@@ -107,15 +117,16 @@ svcmgr/
   `start_process`) and serve the seed bootstrap rounds; only restart
   resolves the namespace through `apply_namespace_policy`
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Shared spawn primitives).
-- **Health monitoring** — bind every supervised service's main
-  thread to svcmgr's death queues with `correlator = service_index`,
-  adding a queue when every pool is out of nodes. Detect crashes via
-  async notifications, resyncing from
-  the kernel's thread states after a drain that may have followed a full
-  queue ([docs/restart-protocol.md](docs/restart-protocol.md) § Death
-  detection). The service table, its restart recipes, the pending
-  registrations, and the discovery registry all grow on the heap, with no
-  fixed count.
+- **Health monitoring** — bind two death observers per supervised
+  service to svcmgr's death queues, one on the main thread and one on the
+  address space (posted by the first terminal fault of any thread), both
+  with the `DeathTag` correlator `(instance << 32) | slot`, adding a queue
+  when every pool is out of nodes. Detect crashes via async
+  notifications, resyncing from the kernel's thread and address-space
+  states after a drain that may have followed a full queue
+  ([docs/restart-protocol.md](docs/restart-protocol.md) § Death detection). The service table, its
+  restart recipes, the pending registrations, and the discovery registry all grow on the heap, with
+  no fixed count.
 - **Restart management** — on detected crash, route through
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
   re-spawn the service from the recorded recipe. The `.svc` file is the

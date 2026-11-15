@@ -1,0 +1,20 @@
+# /tests/crasher worker-fault — svcmgr's worker-thread-fault restart fixture.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest (services-surface harness) in CI and stageable
+# by hand: copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+#
+# Exercises svcmgr's death routing for a fault of a thread other than the
+# main thread: crasher's worker-fault role serves `ipc::restart_probe_labels`
+# on the endpoint of the name it provides. svctest reads the instance's
+# nonce, has a worker thread fault, and reads the nonce again: a new nonce
+# shows that svcmgr routed the death and restarted the service
+# (`restart = on_failure`). `critical = no`: the system continues if the
+# restart budget is spent.
+binary    = /tests/crasher
+argv      = crasher worker-fault
+restart   = on_failure
+critical  = no
+namespace = none
+provides  = crasher.worker

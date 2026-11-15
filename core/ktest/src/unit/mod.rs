@@ -811,6 +811,10 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::live_cspace_count",
         sysinfo::live_cspace_count(ctx)
     );
+    run_test!(
+        "sysinfo::speculation_controls_views",
+        sysinfo::speculation_controls_views(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

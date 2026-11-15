@@ -10,17 +10,18 @@
 //! same procmgr surface (`CREATE_FROM_FILE` → `CONFIGURE_NAMESPACE`
 //! → `START_PROCESS` → bootstrap rounds) that restart uses. Returns
 //! the [`Launched`] handles; for a supervised launch [`launch`] binds
-//! death-notification itself, before `START_PROCESS`.
+//! the service's death observers itself, before `START_PROCESS`.
 
 use ipc::procmgr_labels;
 use registry::{Resolver, Visibility};
+use svcmgr_defs::DeathTag;
 use svcmgr_defs::class::class_publication;
 
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
-    CreatedProcess, RestartCtx, StartupBlobs, destroy_partial_child, mint_debug_authority,
-    start_process, walk_and_create_from_file,
+    CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, destroy_partial_child,
+    mint_debug_authority, start_process, walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -328,19 +329,18 @@ fn assemble_provided_boot_caps(
 /// for an optional seed; consumers that don't tolerate a missing cap fail on
 /// first use, which is the right surface for a real misconfiguration.
 ///
-/// `bind_target` carries the death correlator for supervised launches,
-/// bound on `ctx.deaths`: when present, death-notification is bound BEFORE
-/// `START_PROCESS` so the observer is in place the instant the thread
-/// runs. (A death before the bind is delivered regardless — the kernel
-/// retains the exit reason and replays it to a later bind — but binding
-/// up front keeps the common path a single in-place post.) For one-shot
-/// launches (`restart = never`, e.g. `svctest`) the caller passes
-/// `None` and forgoes supervision binding.
+/// `bind_target` carries the death tag of a supervised launch: when present,
+/// both death observers are bound on `ctx.deaths` under it before
+/// `START_PROCESS` ([`bind_instance_observers`]), one on the main thread and
+/// one on the address space, so a death of any thread of the service, from
+/// the instant it runs, reaches svcmgr. For one-shot launches
+/// (`restart = never`, e.g. `svctest`) the caller passes `None` and forgoes
+/// supervision binding.
 pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-    bind_target: Option<u64>,
+    bind_target: Option<DeathTag>,
 ) -> Option<Launched>
 {
     let (argv_blob, argv_count) = build_blob(&def.argv);
@@ -367,16 +367,18 @@ pub fn launch(
         return None;
     }
 
-    // Bind death-notification BEFORE start_process so any immediate
+    // Bind the death observers BEFORE start_process so any immediate
     // post-start death is captured. Thread is suspended at this
     // point — no userspace code has run yet.
-    if let Some(correlator) = bind_target
-        && ctx
-            .deaths
-            .bind_thread(created.thread_cap, correlator)
-            .is_err()
+    if let Some(tag) = bind_target
+        && !bind_instance_observers(
+            ctx,
+            created.thread_cap,
+            created.process_handle,
+            tag.correlator(),
+        )
     {
-        std::os::seraph::log!(warn: "launch {}: thread_bind_notification failed", def.name);
+        std::os::seraph::log!(warn: "launch {}: death observer bind failed", def.name);
         destroy_partial_child(created.process_handle, created.thread_cap, ctx.ipc_buf);
         return None;
     }

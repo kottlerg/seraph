@@ -5,17 +5,32 @@
 
 //! Deliberate-crash fixture validating svcmgr's restart path.
 //!
-//! Gating, the surface checks, the fail rules, and the capability slots are
-//! defined in `services/crasher/README.md`.
+//! Two roles, chosen by `argv[1]`: `selftest` checks its restart surfaces and
+//! faults its main thread; `worker-fault` serves `ipc::restart_probe_labels`
+//! and, on request, faults a worker thread. Gating, the surface checks, the
+//! fail rules, and the capability slots are defined in
+//! `services/crasher/README.md`.
 
 use std::os::seraph::startup_info;
 use std::thread;
 use std::time::Duration;
 
+use ipc::{IpcMessage, restart_probe_labels};
+
 fn main()
 {
     std::os::seraph::log::register_name(b"crasher");
     let info = startup_info();
+
+    if std::env::args().nth(1).as_deref() == Some("worker-fault")
+    {
+        #[expect(
+            clippy::cast_ptr_alignment,
+            reason = "the IPC buffer is page-aligned (4 KiB), satisfying u64 alignment"
+        )]
+        let ipc_buf = info.ipc_buffer.cast::<u64>();
+        worker_fault_role(info.creator_endpoint, ipc_buf);
+    }
 
     // Assert the recipe surfaces are present on THIS spawn — first launch
     // and every restart. Each logs `<surface> ok` or a `FATAL:` mismatch.
@@ -166,5 +181,96 @@ fn probe_svcmgr(svcmgr_cap: u64, ipc_buffer: *mut u8)
     {
         Ok(reply) => std::os::seraph::log!("svcmgr probe reply={}", reply.label),
         Err(_) => std::os::seraph::log!("FATAL: svcmgr probe ipc_call failed"),
+    }
+}
+
+/// The `worker-fault` role: take the provided name's service endpoint from
+/// bootstrap slot 0, draw this instance's nonce, and serve
+/// `restart_probe_labels` until a `PROBE_FAULT_WORKER` request, after which a
+/// worker thread faults while the main thread parks.
+fn worker_fault_role(creator_ep: u64, ipc_buf: *mut u64) -> !
+{
+    let service_ep = if creator_ep == 0
+    {
+        0
+    }
+    else
+    {
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        unsafe { ipc::bootstrap::request_slots::<1>(creator_ep, ipc_buf) }.map_or(0, |[cap]| cap)
+    };
+    let nonce = syscall::random_u64().unwrap_or(0);
+    if service_ep == 0 || nonce == 0
+    {
+        std::os::seraph::log!("FATAL: worker-fault: no service endpoint or nonce");
+        syscall::thread_exit();
+    }
+    std::os::seraph::log!("worker-fault: serving");
+    let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
+    loop
+    {
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let msg = match unsafe { ipc::ipc_recv(service_ep, ipc_buf) }
+        {
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
+        };
+        guard.on_success();
+        for &c in msg.caps()
+        {
+            let _ = syscall::cap_delete(c);
+        }
+        let reply = match msg.label
+        {
+            restart_probe_labels::PROBE_INSTANCE =>
+            {
+                IpcMessage::builder(restart_probe_labels::SUCCESS)
+                    .word(0, nonce)
+                    .build()
+            }
+            restart_probe_labels::PROBE_FAULT_WORKER =>
+            {
+                IpcMessage::new(restart_probe_labels::SUCCESS)
+            }
+            _ => IpcMessage::new(restart_probe_labels::UNKNOWN_OPCODE),
+        };
+        // SAFETY: ipc_buf is the registered IPC buffer page.
+        let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        if msg.label == restart_probe_labels::PROBE_FAULT_WORKER
+        {
+            fault_worker();
+        }
+    }
+}
+
+/// Start a thread that takes a terminal fault after
+/// [`restart_probe_labels::FAULT_DELAY_MS`], and park the main thread
+/// without receiving again: only the worker's fault ends the process, through
+/// procmgr's teardown, which posts no death for the main thread.
+fn fault_worker() -> !
+{
+    let spawned = thread::Builder::new()
+        .name("fault-worker".into())
+        .spawn(|| {
+            let _ = syscall::thread_sleep(restart_probe_labels::FAULT_DELAY_MS);
+            std::os::seraph::log!("worker-fault: worker thread faulting");
+            // SAFETY: deliberately invalid: the null write faults, and no
+            // handler maps the null page, so the fault is terminal.
+            unsafe {
+                core::ptr::write_volatile(core::ptr::null_mut::<u8>(), 0x42);
+            }
+        });
+    if spawned.is_err()
+    {
+        std::os::seraph::log!("FATAL: worker-fault: worker thread not started");
+        syscall::thread_exit();
+    }
+    loop
+    {
+        let _ = syscall::thread_sleep(u64::from(u32::MAX));
     }
 }

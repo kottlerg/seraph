@@ -77,6 +77,12 @@ pub fn fresh_range_root(ctx: &TestContext) -> Option<u64>
 /// arch-neutral cells that exercise a port binding skip it.
 pub const HAS_IO_PORTS: bool = false;
 
+/// Whether the kernel reports transient-execution mitigation state
+/// (`SystemInfoType::SpeculationControls`): not on RISC-V, whose RVA23 floor
+/// defines no enumeration of the vulnerabilities, so `unit::sysinfo` expects
+/// `NotSupported` for every view.
+pub const HAS_SPECULATION_CONTROLS: bool = false;
+
 /// Whether a user-mode CPU write raises a message-signaled target, as
 /// `stress::msg_inject_delete_race` needs: true, since a message is a write of
 /// the target's identity to its hart's IMSIC file, which ktest can map through

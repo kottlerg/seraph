@@ -18,7 +18,9 @@ boot-protocol = { path = "../abi/boot-protocol" }
 # `test-debug-port`: the GDB remote serial protocol's framing, shared with the
 # guest fixture it drives.
 gdb-rsp = { path = "../shared/gdb-rsp" }
-fatfs = "0.3"
+# The FAT encodings mkdisk's volume writer shares with the fatfs service: FAT
+# entries, long-name slots and their checksum, and short names' numeric tails.
+fat_parse = { path = "../services/fs/fat/fat-parse", package = "fatfs-parse" }
 # Regex matching for run-parallel pass/fail classification.
 regex = "1"
 # `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
@@ -33,6 +35,9 @@ logd-codec = { path = "../services/logd/codec" }
 # procmgr's thread crash badge (`threads::is_crash_badge`): `symbolize --log`
 # tells a block that carries one, which names no process, from a process's.
 procmgr-process-table = { path = "../services/procmgr/process-table" }
+# vfsd's GPT parser: `check-disk` finds each image's partitions through it, and
+# the disk tooling's tests read the tables mkdisk writes back through it.
+vfsd-gpt = { path = "../services/vfsd/gpt" }
 
 [dev-dependencies]
 # The normalized exception codes test-crash-report's tests build reports with.
@@ -44,9 +49,6 @@ ipc = { path = "../shared/ipc" }
 # through, and the level codes it returns.
 init-log-levels = { path = "../services/init/log-levels" }
 log = { path = "../shared/log" }
-# vfsd's GPT parser, which the disk tooling's tests read the tables mkdisk
-# writes back through.
-vfsd-gpt = { path = "../services/vfsd/gpt" }
 
 [lints]
 workspace = true

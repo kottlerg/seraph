@@ -36,7 +36,116 @@ pub fn phases() -> &'static [Phase]
             name: "svcmgr_second_seed_round",
             run: svcmgr_second_seed_round_phase,
         },
+        Phase {
+            name: "svcmgr_worker_fault_restart",
+            run: svcmgr_worker_fault_restart_phase,
+        },
     ]
+}
+
+/// How long [`svcmgr_worker_fault_restart_phase`] waits for the fixture's
+/// name to be published, in milliseconds: svcmgr may launch the fixture after
+/// svctest.
+const WORKER_FAULT_PUBLISH_WAIT_MS: u64 = 10_000;
+
+/// The recipe that starts the fixture [`svcmgr_worker_fault_restart_phase`]
+/// drives, when it is staged for this boot.
+const WORKER_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-worker.svc";
+
+/// End to end: a terminal fault of a thread other than the main thread of a
+/// supervised service reaches svcmgr, which restarts the service under its
+/// `restart = on-failure` policy. The `crasher` fixture's `worker-fault`
+/// role (`rootfs/config/svcmgr/tests/crasher-worker.svc`) serves
+/// `ipc::restart_probe_labels` on the name it provides: the phase reads the
+/// instance's nonce, has a worker thread fault, and reads the nonce again
+/// through the same SEND. procmgr's teardown stops the old instance's main
+/// thread with no death post, so only svcmgr's address-space observer sees the
+/// death; the second read is queued on the provided endpoint until the
+/// restarted instance answers it with a new nonce. Were the death not routed,
+/// no instance would receive again and the call would block until the run's
+/// timeout.
+///
+/// The phase runs when the fixture's recipe is staged in
+/// `/config/svcmgr/services/` and is skipped otherwise; once staged, the name
+/// must be published within [`WORKER_FAULT_PUBLISH_WAIT_MS`].
+fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
+{
+    use ipc::restart_probe_labels as probe;
+
+    match std::fs::metadata(WORKER_FAULT_RECIPE)
+    {
+        Ok(_) =>
+        {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            std::os::seraph::log!(
+                "svcmgr_worker_fault_restart phase skipped: crasher-worker.svc not staged"
+            );
+            return;
+        }
+        Err(e) => panic!("svcmgr_worker_fault_restart: stat {WORKER_FAULT_RECIPE}: {e:?}"),
+    }
+
+    let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_worker_fault_restart");
+    let name = probe::NAME;
+    let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
+    let mut waited_ms = 0;
+    let fixture = loop
+    {
+        let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
+            .expect("svcmgr QUERY_ENDPOINT ipc_call must return a reply");
+        if reply.label == ipc::svcmgr_errors::SUCCESS
+        {
+            break reply.caps().first().copied().unwrap_or(0);
+        }
+        assert!(
+            waited_ms < WORKER_FAULT_PUBLISH_WAIT_MS,
+            "svcmgr_worker_fault_restart: {} not published within {WORKER_FAULT_PUBLISH_WAIT_MS} ms, last reply {:#x}",
+            String::from_utf8_lossy(name),
+            reply.label
+        );
+        let _ = syscall::thread_sleep(50);
+        waited_ms = waited_ms.saturating_add(50);
+    };
+    assert_ne!(
+        fixture, 0,
+        "svcmgr_worker_fault_restart: QUERY_ENDPOINT returned no cap"
+    );
+
+    let nonce = |what: &str| -> u64 {
+        let msg = ipc::IpcMessage::new(probe::PROBE_INSTANCE);
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
+            .unwrap_or_else(|e| panic!("svcmgr_worker_fault_restart: {what} call failed: {e:?}"));
+        assert_eq!(
+            reply.label,
+            probe::SUCCESS,
+            "svcmgr_worker_fault_restart: {what} reply {:#x}",
+            reply.label
+        );
+        reply.word(0)
+    };
+
+    let before = nonce("first PROBE_INSTANCE");
+    let msg = ipc::IpcMessage::new(probe::PROBE_FAULT_WORKER);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
+        .expect("svcmgr_worker_fault_restart: PROBE_FAULT_WORKER call must return a reply");
+    assert_eq!(
+        reply.label,
+        probe::SUCCESS,
+        "svcmgr_worker_fault_restart: PROBE_FAULT_WORKER reply {:#x}",
+        reply.label
+    );
+    let after = nonce("PROBE_INSTANCE after the worker fault");
+    assert_ne!(
+        before, after,
+        "svcmgr_worker_fault_restart: the same instance answered after its worker faulted"
+    );
+    let _ = syscall::cap_delete(fixture);
+    std::os::seraph::log!("svcmgr worker-fault-restart phase passed (restarted instance answered)");
 }
 
 /// The recipe's fifth and sixth seeds (`vfsd.mount`, `vfsd.deny`) fill

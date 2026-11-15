@@ -169,6 +169,7 @@ rootfs/config/svcmgr/
 │   ├── svctest.svc
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
+│   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
@@ -490,8 +491,10 @@ after `test-terminal`, on the default boot `test-terminal` restored.
 
 ### CET shadow stacks (`test-cet`)
 
-On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them, so a
-corrupted return address faults instead of being followed
+On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them and its
+transient-execution selection rewrites no return (it does on a CPU that takes the retpoline
+sequence, one without enhanced IBRS, Automatic IBRS or IBRS on entry), so a corrupted return
+address faults instead of being followed
 ([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)). Neither the CI
 runners nor TCG offer the feature, so CI boots only the kernel without them. Every launcher pins the
 guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), and a QEMU
@@ -535,8 +538,11 @@ Per boot, at most one *shutdown-invoking* harness recipe MUST be staged in
 `/config/svcmgr/services/`.
 
 Non-shutdown fixtures may co-stage alongside one harness. `crasher`
-(`restart = always`, never shuts down) is co-staged with `svctest` in
-the services-surface CI cell so its restart loop is exercised there; its
+(`restart = always`, never shuts down) and its worker-fault role
+(`crasher-worker.svc`, `restart = on_failure`) are co-staged with `svctest` in
+the services-surface CI cell so their restart paths are exercised there (svctest's
+`svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
+skipped otherwise); its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it.
 
@@ -641,9 +647,9 @@ surface.
     message writes the riscv-iommu translates, its MSI delivery and MSI forge phases;
   - clock: the machine's RTC (the CMOS RTC on `q35`, the Goldfish RTC on `virt`), through the
     cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
-  - filesystem: FAT, through the fatfs driver, on the partitions `mkdisk` formats (the ESP, root
-    and data partitions; the swap partition is raw and no fatfs serves it): svctest's filesystem
-    phases;
+  - filesystem: FAT16, through the fatfs driver, on the partitions `mkdisk` formats (the ESP, root
+    and data partitions, each FAT16 at its size; the swap partition is raw and no fatfs serves
+    it): svctest's filesystem phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
     confinement and MSI delivery, forge, churn, and release phases, four `pci-testdev` functions,
@@ -1021,7 +1027,7 @@ line of its own diff is on.
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
 | Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
-| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
+| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
@@ -1030,7 +1036,7 @@ line of its own diff is on.
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
-| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
+| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); the code that runs on the supervisor shadow stack at every entry from user mode, or decides whether shadow stacks are on (`seraph_enter_from_user`, `__x86_indirect_thunk_r11`, `rewrites_returns`, and `RETURN_REWRITING`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies what
@@ -1057,7 +1063,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs \
     core/kernel/src/arch/riscv64/aia.rs core/kernel/src/arch/riscv64/aia_encoding.rs \
     core/kernel/src/arch/x86_64/msi.rs core/kernel/src/arch/x86_64/remap.rs services/vfsd/ \
-    xtask/src/disk.rs xtask/src/gpt.rs xtask/src/commands/mkdisk.rs \
+    xtask/src/disk.rs xtask/src/gpt.rs xtask/src/fat.rs xtask/src/commands/mkdisk.rs \
     services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
@@ -1083,6 +1089,7 @@ D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
 D="$D|shadow_stack|shadow_page|shadow_offset|set_shadow_stack_pages|shadow_on_boot_cpu"
 D="$D|make_cpu_shadow_pages|(idle|cpu)_shadow_pages|idle_saved_state|shadow_direct_map_page"
 D="$D|new_shadow_stack_page|kernel_write_fault_is_spurious"
+D="$D|seraph_enter_from_user|__x86_indirect_thunk_r11|rewrites_returns|RETURN_REWRITING"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($D)\b"
 git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
@@ -1158,7 +1165,7 @@ owes some of the cells runs those boots, and the release host runs run all four.
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
@@ -1193,7 +1200,7 @@ is the framebuffer device cell (Device surfaces above).
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only
@@ -1224,12 +1231,12 @@ cargo xtask test-gdb --arch <arch>
 above), whose first boot runs ktest with the kernel on CET shadow stacks and whose second checks
 that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
 bundle, a debug-profile build, at 4 vCPUs. It runs only under KVM on a host whose CPU reports CET
-shadow stacks: on any other host the command fails, naming what is missing, and never passes, so a
-PR that owes the cell runs it on such a host. On a host that is itself a guest, a run that ends
-in the host's loss of the guest's CET state is inconclusive and run again, up to four runs of each
-boot, and the cell passes only on runs without it (CET shadow stacks (`test-cet`) above). Each boot
-is bounded by five minutes and each gdbstub answer by 30 s; it has no `run-parallel` budget. The
-pair is the cet device cell (Device surfaces above).
+shadow stacks and enhanced or Automatic IBRS: on any other host the command fails, naming what is
+missing, and never passes, so a PR that owes the cell runs it on such a host. On a host that is
+itself a guest, a run that ends in the host's loss of the guest's CET state is inconclusive and run
+again, up to four runs of each boot, and the cell passes only on runs without it (CET shadow stacks
+(`test-cet`) above). Each boot is bounded by five minutes and each gdbstub answer by 30 s; it has no
+`run-parallel` budget. The pair is the cet device cell (Device surfaces above).
 
 ```sh
 # CET cell, x86_64 only:

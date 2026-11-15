@@ -71,14 +71,17 @@ again.
    (arch::current::cpu::verify_baseline): refuse hardware missing a required
    baseline feature with a diagnostic, before any subsystem that assumes the
    baseline runs
-4. Enumerate the CPU's transient-execution vulnerabilities
-   (arch::current::speculation::enumerate_vulnerabilities) and log the table
-   (x86-64; nothing on RISC-V)
+4. Enumerate the CPU's transient-execution vulnerabilities, log the table, select and
+   publish the user-to-kernel controls it calls for and log them
+   (arch::current::speculation::select_mitigations), then set the boot CPU's per-CPU
+   controls (arch::current::speculation::apply_mitigations_this_cpu) (x86-64; nothing on
+   RISC-V)
 ```
 
 The step-3 gate and the baseline it enforces are defined in
 [platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate. The
-step-4 table is defined in [transient-execution.md](transient-execution.md).
+step-4 table and controls are defined in [transient-execution.md](transient-execution.md); each AP
+sets its own per-CPU controls in `kernel_entry_ap`, before it enters user mode.
 
 The early console is allocation-free and output-only.
 
@@ -273,7 +276,8 @@ address, the reason, and the span's end.
    per 2 MiB chunk of RAM, from which the kernel-stack guard pages split the direct map
    (`mm::stack_guard::seed`; [memory-internals.md](memory-internals.md) § Kernel Stack
    Guards). Decide whether the kernel runs on shadow stacks: on x86-64 when the BSP
-   reports CET shadow stacks, never on riscv64 (`shadow_stack::decide`;
+   reports CET shadow stacks and the step-4 selection of Phase 1 rewrites no return, never
+   on riscv64 (`shadow_stack::decide`;
    [return-address-integrity.md](return-address-integrity.md)); with them on, every
    Thread slot ends in a shadow-stack page (`thread_slot::set_shadow_stack_pages`)
 4. Fix every CPU set's width at the boot's CPU count (`cpu_mask::set_boot_cpu_count`,
@@ -704,7 +708,11 @@ hardware TLB tags than the BSP configured halts itself with
 the BSP's wait then expires the same way. An x86-64 AP that lacks the CET shadow stacks the
 BSP turned on halts itself the same way ("AP lacks the CET shadow stacks the BSP enabled",
 from `shadow_stack::prepare_ap` in `kernel_entry_ap`, which otherwise turns them on before
-the AP's timer). On riscv64 an AP that cannot be an APLIC MSI target (a
+the AP's timer). An x86-64 AP that does not enumerate a transient-execution MSR control
+the BSP selected halts itself the same way, before it touches the MSR ("CPU lacks the
+<control> the boot CPU selected", from `speculation::apply_mitigations_this_cpu` in
+`kernel_entry_ap`; [transient-execution.md](transient-execution.md) § Controls). On riscv64
+an AP that cannot be an APLIC MSI target (a
 firmware hart id past the target's hart index, or outside the reported IMSIC layout) halts
 itself the same way at its IMSIC file's initialisation, before announcing itself, as does an
 AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot

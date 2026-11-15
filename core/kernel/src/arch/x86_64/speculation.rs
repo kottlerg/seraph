@@ -13,23 +13,70 @@
 //! on the two are in `crate::arch::nospec`; the rule they serve is
 //! docs/capability-model.md § Capability Spaces, and the mechanism is
 //! core/kernel/docs/capability-internals.md § Speculative-Execution Hardening.
-//! [`enumerate_vulnerabilities`] derives and logs the vulnerability table of
-//! core/kernel/docs/transient-execution.md, through `super::vulnerability`.
+//! [`select_mitigations`] derives and logs the vulnerability table of
+//! core/kernel/docs/transient-execution.md, through `super::vulnerability`,
+//! and selects and installs the user-to-kernel controls it calls for, through
+//! `super::mitigation`; [`apply_mitigations_this_cpu`] sets the per-CPU ones.
 
 /// Read the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`, derive its
-/// vulnerability table, and log the inputs and the table on the serial
-/// console. Called once on the BSP in Phase 1, after `cpu::verify_baseline`.
+/// vulnerability table, select the user-to-kernel controls the table calls
+/// for (from the inputs a `SERAPH_FORCE_RETURN_MITIGATION` build forces, where
+/// one does), publish the selection, and log the inputs, the table and the controls
+/// on the serial console. Called once on the BSP in Phase 1, after
+/// `cpu::verify_baseline`, before any AP starts or any thread enters user
+/// mode.
 #[cfg(not(test))]
-pub fn enumerate_vulnerabilities()
+pub fn select_mitigations()
 {
+    use super::mitigation::{FORCED_RETURN, Inputs, install, report, select};
+
     let cpu = super::vulnerability::enumerate();
     let table = super::vulnerability::derive(&cpu);
     super::vulnerability::report(&cpu, &table);
+    let inputs = Inputs::of(&cpu, &table).forced(FORCED_RETURN);
+    let controls = select(inputs);
+    install(inputs, controls);
+    report(&cpu, inputs, controls);
 }
 
 /// No-op test stub.
 #[cfg(test)]
-pub fn enumerate_vulnerabilities() {}
+pub fn select_mitigations() {}
+
+/// Set the calling CPU's per-CPU controls of the selection (enhanced IBRS, or
+/// the kernel's `IA32_SPEC_CTRL` value of IBRS on entry, `BHI_DIS_S`,
+/// Automatic IBRS, `DOITM`), through
+/// `super::mitigation::apply_this_cpu`.
+///
+/// # Panics
+/// Halts, naming the control, when this CPU does not enumerate an MSR control
+/// the boot CPU selected (`super::mitigation::missing_msr_control`).
+///
+/// # Safety
+/// Ring 0, after [`select_mitigations`], on the CPU being brought up: the BSP
+/// in Phase 1, each AP in `kernel_entry_ap`.
+#[cfg(not(test))]
+pub unsafe fn apply_mitigations_this_cpu()
+{
+    // SAFETY: the caller's contract is `apply_this_cpu`'s.
+    unsafe { super::mitigation::apply_this_cpu() };
+}
+
+/// No-op test stub.
+///
+/// # Safety
+/// No preconditions.
+#[cfg(test)]
+pub unsafe fn apply_mitigations_this_cpu() {}
+
+/// One word of the mitigation state for `SYS_SYSTEM_INFO`
+/// (`SystemInfoType::SpeculationControls`): the view `view` names
+/// (`syscall::SPECULATION_VIEW_*`), or `InvalidArgument` for an unknown view.
+#[cfg(not(test))]
+pub fn mitigation_info(view: u64) -> Result<u64, ::syscall::SyscallError>
+{
+    super::mitigation::info(view).ok_or(::syscall::SyscallError::InvalidArgument)
+}
 
 /// All-ones when `index < bound`, zero otherwise, computed without a branch.
 ///

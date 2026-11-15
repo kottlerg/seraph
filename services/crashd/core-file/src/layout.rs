@@ -36,8 +36,9 @@ const PF_W: u32 = 2;
 const PF_R: u32 = 4;
 
 /// Most `PT_LOAD` headers a core carries: `e_phnum` is 16 bits, and the
-/// `PN_XNUM` extension is not written. Runs past it are not recorded.
-pub const MAX_LOADS: usize = 0xfffe;
+/// `PN_XNUM` extension is not written, so with the `PT_NOTE` they number at
+/// most `0xfffe`, one below `PN_XNUM`. Runs past it are not recorded.
+pub const MAX_LOADS: usize = 0xfffd;
 
 /// One run of mapped pages with one protection, as `SYS_THREAD_LIST_PAGES`
 /// reports it.
@@ -393,6 +394,6 @@ mod tests
             .collect();
         let core = plan(Machine::X86_64, &[], &runs, &[], u64::MAX).unwrap();
         assert_eq!(core.loads.len(), MAX_LOADS);
-        assert_eq!(u16_at(&core.head, 56), 0xffff);
+        assert_eq!(u16_at(&core.head, 56), 0xfffe);
     }
 }

@@ -53,7 +53,7 @@ The file is laid out as:
 
 The runs are the mapped user pages of the process's address space as `SYS_THREAD_LIST_PAGES`
 reports them ([core/kernel/docs/syscalls.md](../../../core/kernel/docs/syscalls.md)), adjacent
-pages of one protection joined into one run, in address order, at most 65 534 (`e_phnum` is 16
+pages of one protection joined into one run, in address order, at most 65 533 (`e_phnum` is 16
 bits and the `PN_XNUM` extension is not written). Each `PT_LOAD` carries:
 
 | Field | Value |

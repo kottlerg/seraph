@@ -18,7 +18,8 @@
 //! recycling identifiers ([`node_slab::NodeSlab`]) and the open-instance
 //! table's ([`open_slab::OpenSlab`]), with the schedule of its sweeps for
 //! opens whose client is gone ([`open_slab::SweepSchedule`]), and picks the
-//! page cache's eviction victim ([`lru_victim`]). This crate
+//! page cache's eviction victim ([`lru_victim`]) and the idle pages it keeps
+//! when it gives the others back ([`keep_most_recent`]). This crate
 //! performs no
 //! I/O and holds no filesystem state: the `fatfs` service reads sectors over
 //! a block-device IPC, hands the bytes here, and keeps the
@@ -91,7 +92,8 @@ pub struct VictimView
     /// gave its page back to memmgr, a page swap lost it, or a failed fill
     /// lost its cap.
     pub has_cap: bool,
-    /// The pick in progress has passed over the slot already.
+    /// The caller excludes the slot: the pick in progress has passed over it
+    /// already, or a client may still map its page.
     pub skipped: bool,
     /// The slot's last-use sequence number; lower is older.
     pub lru_seq: u64,
@@ -117,6 +119,53 @@ pub fn lru_victim(slots: impl IntoIterator<Item = VictimView>) -> Option<usize>
         }
     }
     best.map(|(i, _)| i)
+}
+
+/// Idle pages a `fatfs` cache keeps when it gives its idle pages back under
+/// memory pressure: the most recently used ones ([`keep_most_recent`]). A
+/// request holds one slot reference at a time, so one kept page lets a miss
+/// evict when memmgr refuses the cache a page at `Critical`; four keep the
+/// FAT, directory and data pages one request walks. Shared with svctest as
+/// [`slot_ceiling`] is.
+pub const RELEASE_KEEP: usize = 4;
+
+/// Mark in `kept` the `keep` most recently used slots (the highest
+/// `lru_seq`, the first of a tie) that no reference holds, that hold a page
+/// cap, and that the caller does not skip, or every such slot when there are
+/// fewer: the idle pages a `fatfs` cache keeps when it gives the others back.
+/// `kept` holds a mark per slot and is cleared first; a slot past its length
+/// is never marked.
+pub fn keep_most_recent(
+    slots: &(impl IntoIterator<Item = VictimView> + Clone),
+    keep: usize,
+    kept: &mut [bool],
+)
+{
+    kept.fill(false);
+    for _ in 0..keep
+    {
+        let mut best: Option<(usize, u64)> = None;
+        for (i, slot) in slots.clone().into_iter().enumerate()
+        {
+            let eligible = !slot.referenced
+                && slot.has_cap
+                && !slot.skipped
+                && kept.get(i).is_some_and(|&mark| !mark);
+            if eligible && best.is_none_or(|(_, seq)| slot.lru_seq > seq)
+            {
+                best = Some((i, slot.lru_seq));
+            }
+        }
+        let Some((i, _)) = best
+        else
+        {
+            return;
+        };
+        if let Some(mark) = kept.get_mut(i)
+        {
+            *mark = true;
+        }
+    }
 }
 
 /// FAT variant detected from cluster count.
@@ -1618,6 +1667,37 @@ mod tests
         assert_eq!(lru_victim(slots), Some(3));
         assert_eq!(lru_victim([]), None);
         assert_eq!(lru_victim([referenced(0), skipped(0)]), None);
+    }
+
+    // The defect caught: a release under memory pressure that gives back
+    // every idle page leaves a cache that memmgr refuses pages at `Critical`
+    // nothing to evict, so every miss fails until the level clears.
+    #[test]
+    fn keep_most_recent_keeps_the_newest_idle_slots_first_of_a_tie()
+    {
+        let slots = [idle(3), idle(9), idle(1), idle(7), idle(9), idle(5)];
+        let mut kept = [true; 6];
+        keep_most_recent(&slots, 3, &mut kept);
+        assert_eq!(kept, [false, true, false, true, true, false]);
+        keep_most_recent(&slots, 0, &mut kept);
+        assert_eq!(kept, [false; 6]);
+    }
+
+    #[test]
+    fn keep_most_recent_keeps_only_idle_slots_with_a_cap_the_caller_does_not_skip()
+    {
+        let slots = [referenced(9), capless(8), skipped(7), idle(2), idle(1)];
+        let mut kept = [false; 5];
+        keep_most_recent(&slots, 4, &mut kept);
+        assert_eq!(kept, [false, false, false, true, true]);
+    }
+
+    #[test]
+    fn keep_most_recent_never_marks_a_slot_past_its_mark_buffer()
+    {
+        let mut kept = [false; 2];
+        keep_most_recent(&[idle(1), idle(2), idle(3)], 2, &mut kept);
+        assert_eq!(kept, [true, true]);
     }
 
     #[test]

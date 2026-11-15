@@ -33,9 +33,10 @@
 //! Memory pressure: the dispatch loop waits on a wait set holding the service
 //! endpoint and the runtime's memory-pressure Notification
 //! (`std::os::seraph::memory_pressure_notification`). When memmgr's level
-//! changes to `Low` or `Critical`, the loop gives memmgr back every page the
-//! cache holds idle ([`cache::PageCache::release_idle_pages`]) and goes on
-//! serving; the cache grows again on demand, within what memmgr grants.
+//! changes to `Low` or `Critical`, the loop gives memmgr back the pages the
+//! cache holds idle but the few most recently used, which a miss evicts when
+//! memmgr refuses a page ([`cache::PageCache::release_idle_pages`]), and goes
+//! on serving; the cache grows again on demand, within what memmgr grants.
 //!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding

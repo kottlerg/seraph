@@ -43,20 +43,26 @@
 //! When memmgr's memory-pressure level reads `Low` or `Critical`
 //! (`services/memmgr/docs/memory-pool.md` § Memory pressure), the dispatch
 //! loop calls [`PageCache::release_idle_pages`], which gives memmgr back
-//! every page the cache holds idle: the page of each slot no reference holds,
-//! and every spare page of the quarantine. The cache is write-through, so such
-//! a page holds nothing the device lacks and goes back without a write. A slot
-//! whose page went to a client passes the check of § Reuse of a page a client
-//! mapped first: its page goes back only once every derivation of its cap is
-//! revoked and the cache's own mapping is the only one left. A page a client
-//! still maps stays in its slot, since a replacement would take a page from
-//! memmgr, and a quarantined page stays held. A page goes back unmapped and
-//! with its cap deleted, so memmgr returns it to the free pool and uncharges
-//! the fs. The slot keeps its VA and holds no page until a miss provisions
-//! it again; a slot below the provisioned mark with no page is provisioned
-//! before the mark moves. Each change of level to `Low` or `Critical`
-//! releases again, and growth after a release stays demand-driven: at
-//! `Critical` memmgr refuses the fs a page and a miss evicts instead.
+//! the pages the cache holds idle, the slot pages no reference holds and
+//! every spare page of the quarantine, all but the `RELEASE_KEEP` (4) most
+//! recently used slot pages (`fat_parse::keep_most_recent`). The kept pages
+//! are what a miss evicts when memmgr refuses the fs a page, as it does at
+//! `Critical` to a process outside the system reserve, so the fs keeps
+//! serving: a request holds one slot reference at a time. The cache is
+//! write-through, so an idle page holds nothing the device lacks and goes back
+//! without a write. A slot whose page went to a client passes the check of
+//! § Reuse of a page a client mapped first: its page is kept or goes back only
+//! once every derivation of its cap is revoked and the cache's own mapping is
+//! the only one left. A page a client still maps stays in its slot, since a
+//! replacement would take a page from memmgr, and a quarantined page stays
+//! held. A slot whose cap a failed fill lost, which no miss reuses, gives its
+//! page back too. A page goes back unmapped and with its cap deleted, so
+//! memmgr returns it to the free pool and uncharges the fs once no other
+//! holder maps it or holds a cap to it. The slot keeps its VA and holds no
+//! page until a miss provisions it again; a slot below the provisioned mark
+//! with no page is provisioned before the mark moves. Each change of level to
+//! `Low` or `Critical` releases again, and growth after a release stays
+//! demand-driven.
 //!
 //! ## Reuse of a page a client mapped
 //!
@@ -90,8 +96,8 @@ use std::os::seraph::{mem_map_funded, reserve_pages};
 use std::sync::{Mutex, OnceLock, PoisonError};
 use syscall_abi::{MAP_WRITABLE, MSG_DATA_WORDS_MAX, PAGE_SIZE, SyscallError};
 
-use fat_parse::VictimView;
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
+use fat_parse::{RELEASE_KEEP, VictimView};
 
 /// Process-static scratch memory cap used for single-sector writeback in
 /// [`PageCache::write_sector`] and single-sector device reads in
@@ -170,7 +176,8 @@ struct CacheSlot
     /// memmgr's region id of the slot's page, the name `RELEASE_MEMORY_CAPS`
     /// takes to give it back; 0 when the slot has no page (memmgr's ids start
     /// at 1). A slot whose cap a failed fill lost keeps its id: its VA still
-    /// maps the page, so it is never provisioned again.
+    /// maps the page, so no miss provisions it until a release under memory
+    /// pressure unmaps the page and gives it back.
     region_id: AtomicU64,
     va: u64,
     refcount: AtomicU32,
@@ -504,23 +511,56 @@ impl PageCache
         Some(idx)
     }
 
-    /// Give memmgr back every page the cache holds idle (module docs § Release
+    /// Give memmgr back the pages the cache holds idle (module docs § Release
     /// under memory pressure): the page of each slot that no reference holds
-    /// and no client maps, and every spare page of the quarantine. Returns
-    /// how many pages memmgr took back. Called only by the dispatch thread,
+    /// and no client maps, but the `RELEASE_KEEP` most recently used, the page
+    /// of each slot whose cap a failed fill lost, and every spare page of the
+    /// quarantine. Returns how many pages memmgr took back. Called only by the dispatch thread,
     /// the only one that takes a slot reference or gives a slot a page; the
     /// eviction worker only drops references, so a slot found unreferenced
     /// stays so for the call.
     pub fn release_idle_pages(&self, ipc_buf: *mut u64) -> usize
     {
-        let mut batch = ReleaseBatch::new(self.memmgr_ep);
+        // An idle page that went to a client is a candidate only once the
+        // client's mapping is gone, as for a pick.
         for slot in self.live_slots()
         {
+            let cap = slot.memory_cap.load(Ordering::Acquire);
+            if cap != 0
+                && slot.exposed.load(Ordering::Acquire)
+                && slot.refcount.load(Ordering::Acquire) == 0
+                && exposure(cap) == Exposure::CacheAlone
+            {
+                slot.exposed.store(false, Ordering::Release);
+            }
+        }
+        let mut kept = self
+            .victim_skips
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        fat_parse::keep_most_recent(
+            &self.live_slots().iter().map(|slot| VictimView {
+                referenced: slot.refcount.load(Ordering::Acquire) != 0,
+                has_cap: slot.memory_cap.load(Ordering::Acquire) != 0,
+                skipped: slot.exposed.load(Ordering::Acquire),
+                lru_seq: slot.lru_seq.load(Ordering::Acquire),
+            }),
+            RELEASE_KEEP,
+            &mut kept,
+        );
+        let mut batch = ReleaseBatch::new(self.memmgr_ep);
+        for (i, slot) in self.live_slots().iter().enumerate()
+        {
+            if kept.get(i).copied().unwrap_or(true)
+            {
+                continue;
+            }
             if let Some(region_id) = self.take_idle_page(slot)
             {
                 batch.push(region_id, ipc_buf);
             }
         }
+        drop(kept);
         let mut quarantine = self
             .quarantine
             .lock()
@@ -536,27 +576,22 @@ impl PageCache
     }
 
     /// Take `slot`'s page out of the cache to give it back, returning its
-    /// region id: unmap it from the slot's VA and delete its cap. `None`, the
-    /// slot unchanged, when the slot has no page or no cap, a reference holds
-    /// it, or it was exposed and a client may still map its page
-    /// ([`exposure`]). A failed unmap leaves the slot its page with no
-    /// sector run, which the next miss fills.
+    /// region id: unmap it from the slot's VA and delete its cap, when it has
+    /// one. `None`, the slot unchanged, when the slot has no page, a reference
+    /// holds it, or it is still marked exposed: [`Self::release_idle_pages`]
+    /// cleared the mark of every idle page the cache alone maps. A slot whose
+    /// cap a failed fill lost gives its page back too: its VA still maps the
+    /// page, which no pick or miss reuses. A failed unmap leaves the slot its
+    /// page with no sector run, which the next miss fills.
     fn take_idle_page(&self, slot: &CacheSlot) -> Option<u64>
     {
         let cap = slot.memory_cap.load(Ordering::Acquire);
         let region_id = slot.region_id.load(Ordering::Acquire);
-        if cap == 0 || region_id == 0 || slot.refcount.load(Ordering::Acquire) != 0
+        if region_id == 0
+            || slot.refcount.load(Ordering::Acquire) != 0
+            || slot.exposed.load(Ordering::Acquire)
         {
             return None;
-        }
-        if slot.exposed.load(Ordering::Acquire)
-        {
-            if exposure(cap) != Exposure::CacheAlone
-            {
-                return None;
-            }
-            // Only the cache maps the page, as after a pick's check.
-            slot.exposed.store(false, Ordering::Release);
         }
         // No lookup hits the page from here.
         slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
@@ -567,8 +602,11 @@ impl PageCache
         {
             return None;
         }
-        let _ = syscall::cap_delete(cap);
-        slot.memory_cap.store(0, Ordering::Release);
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+            slot.memory_cap.store(0, Ordering::Release);
+        }
         slot.region_id.store(0, Ordering::Release);
         Some(region_id)
     }

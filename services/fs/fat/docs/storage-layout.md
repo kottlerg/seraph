@@ -36,9 +36,11 @@ in [crash-safety.md](crash-safety.md).
   so an idle mount pays only for the pages it fills. When memmgr's memory-pressure level turns `Low`
   or `Critical`, the dispatch loop, which waits on a wait set holding the service endpoint and the
   runtime's pressure Notification, gives memmgr back every page no reference holds and no client
-  maps, after the mapping check below for a page that went to a client, and every spare page of the
-  quarantine; the slots take pages again on demand. An open holds at most the slot ceiling of
-  outstanding `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with general headroom
+  maps, after the mapping check below for a page that went to a client, but the `RELEASE_KEEP` (4)
+  most recently used, which a miss evicts when memmgr refuses a page, as at `Critical`; it gives
+  back every spare page of the quarantine and every page a failed fill left without a cap, too, and
+  the slots take pages again on demand. An open holds at most the slot ceiling of outstanding
+  `FS_READ_MEMORY` pages. Cache init funds the fs's own `CSpace` with general headroom
   for every slot page, the quarantine's replacements, a per-read ancestor cap for every slot (each
   outstanding page holds one), the scratch page, and 64 more
   (`std::os::seraph::fund_cspace_slot_budget`), so growing the cache, or holding every slot

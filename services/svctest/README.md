@@ -314,10 +314,11 @@ delivers it a block endpoint a thread of its own serves from a RAM FAT16 volume,
 with `DESTROY_PROCESS`. Its last cases end their driver themselves, each observed through an event
 queue bound to the driver's main thread: the block server revokes every capability derived from
 its endpoint, and two more drivers, each on a volume of its own, take `FS_UNMOUNT`. The
-`fs_pressure_release` phase before it starts a fatfs the same way, drives memmgr's level to `Low`
-and back as `memmgr_pressure` does, and checks from the block server's log of reads that the
-driver gave back every idle cache page but the one svctest still maps, with its children's charge
-falling to match and memmgr's pool total unchanged. The FS,
+`fs_pressure_release` phase before it starts a fatfs the same way, loses one cache page's cap in a
+read the block server fails, drives memmgr's level to `Low` and back as `memmgr_pressure` does, and
+checks from the block server's log of reads that the driver gave back every idle cache page but the
+one svctest still maps and the few it keeps, the lost cap's page among them, with its children's
+charge falling to match and memmgr's pool total unchanged. The FS,
 namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the build-synthesised
 `/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; `fsbench`, spawned
 by the `fs_crossover_bench` phase, reads the build-synthesised `/data/svctest/bench.bin`, which the

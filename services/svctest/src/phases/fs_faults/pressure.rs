@@ -4,26 +4,29 @@
 // services/svctest/src/phases/fs_faults/pressure.rs
 
 //! fatfs under memory pressure: a fatfs svctest spawns itself gives memmgr
-//! back its idle cache pages when the level turns `Low`, keeps the page a
-//! client still maps, and goes on serving
+//! back its idle cache pages when the level turns `Low`, the page whose cap a
+//! failed fill lost among them, keeps the page a client still maps and its
+//! most recently used idle pages, and goes on serving
 //! (services/fs/fat/docs/storage-layout.md, Page cache).
 
 use std::collections::BTreeSet;
 
 use ipc::fs_errors;
 
-use super::ramdisk::{self, RamDisk, lock};
+use super::ramdisk::{self, Fault, RamDisk, lock};
 use super::{CHUNK, OwnFatfs, slot_cluster};
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{
     fs_close, fs_create, fs_open_live, fs_read_bytes, fs_release_memory, fs_write_inline,
 };
+use crate::ipc_util::ns::ns_lookup;
 use crate::phases::memmgr::{memory_usage, pool_pressure_status, release_grant, take_pages};
 
 /// The file's name, and its 8.3 entry as the root directory holds it.
 const NAME: &[u8] = b"PRESSURE.BIN";
 const SFN: &[u8; 11] = b"PRESSUREBIN";
-/// Bytes of the file: eight pages, each cluster one sector.
+/// Bytes of the file: eight pages, each cluster one sector, so the cache
+/// fills more pages than fatfs keeps idle under pressure.
 const FILE_BYTES: usize = 8 * PAGE;
 /// Bytes of one page, as fatfs caches it.
 const PAGE: usize = 4096;
@@ -33,6 +36,9 @@ const SECTORS_PER_PAGE: usize = PAGE / ramdisk::SECTOR;
 /// releases and unmaps (B) before the level turns.
 const MAPPED_AT: usize = 3 * PAGE;
 const UNMAPPED_AT: usize = 5 * PAGE;
+/// File offset of the page whose first fill the block server fails and
+/// whose cap it keeps (C).
+const LOST_AT: usize = PAGE;
 /// Release cookies of the two `FS_READ_MEMORY` pages.
 const MAPPED_COOKIE: u64 = 0xA;
 const UNMAPPED_COOKIE: u64 = 0xB;
@@ -51,15 +57,20 @@ fn content_byte(at: usize) -> u8
 /// fatfs gives memmgr back its idle cache pages under memory pressure
 /// (services/fs/fat/src/cache.rs, Release under memory pressure):
 ///
-/// 1. svctest starts a fatfs of its own and writes a file; two reads of it
-///    leave the second served from the cache, with no device read.
+/// 1. svctest writes a file through a fatfs of its own, then starts another
+///    on the volume, whose cache is empty. The block server fails the first
+///    fill of page C of the file and keeps its cap, so the read fails and the
+///    slot keeps a page it cannot refill. Two reads of the file follow.
 /// 2. svctest takes page A of the file through `FS_READ_MEMORY` and maps it,
 ///    and page B, which it does not map; it releases both.
 /// 3. svctest drives memmgr's level to `Low`, as `memmgr_pressure` does. The
 ///    pages charged to svctest's children, fatfs's among them, fall by at
-///    least the cache pages fatfs filled less A, which a client still maps.
-/// 4. A read of the file reads every page of it but A from the device again,
-///    and returns the file; A's mapping still reads the file.
+///    least the pages fatfs's cache holds (each page it filled, and C's lost
+///    one) less A, which a client still maps, and less the
+///    `fat_parse::RELEASE_KEEP` idle pages fatfs keeps.
+/// 4. A read of the file reads every page of it from the device again but A
+///    and at most `RELEASE_KEEP` kept ones, and returns the file; A's mapping
+///    still reads the file.
 /// 5. svctest releases its grants: the level returns to `Normal`, and memmgr's
 ///    pool total is unchanged and accounts for all of RAM
 ///    (`system_ram == kernel_reserved + pool_total`).
@@ -68,11 +79,31 @@ pub fn fs_pressure_release_phase(_: &Caps)
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let (_, _, pool_total) = pool_identity();
     let disk = RamDisk::formatted();
-    let fs = OwnFatfs::start(&disk);
 
-    // 1. The file, read twice.
+    // 1. The file, with page C's cap lost, then read twice.
     let want: Vec<u8> = (0..FILE_BYTES).map(content_byte).collect();
-    let (file, sectors) = write_file(&fs, &disk, &want);
+    let sectors = {
+        let writer = OwnFatfs::start(&disk);
+        let (file, sectors) = write_file(&writer, &disk, &want);
+        let _ = syscall::cap_delete(file);
+        writer.stop();
+        sectors
+    };
+    let _ = lock(&disk).take_reads();
+    let fs = OwnFatfs::start(&disk);
+    let (file, _, _) = ns_lookup(fs.root, NAME, 0xFFFF, ipc_buf)
+        .unwrap_or_else(|e| panic!("fs_pressure: lookup of the file: {e}"));
+    let page_c = page_base(sector_at(&sectors, LOST_AT));
+    lock(&disk).arm(page_c, 0, Fault::LoseCap);
+    assert_eq!(
+        fs_read_bytes(file, LOST_AT as u64, CHUNK as u64, ipc_buf),
+        Err(fs_errors::IO_ERROR),
+        "fs_pressure: the read whose fill lost page C's cap"
+    );
+    assert!(
+        lock(&disk).unfired().is_empty(),
+        "fs_pressure: the read of page C never filled it"
+    );
     assert_eq!(read_file(file), want, "fs_pressure: the file's first read");
     assert_eq!(read_file(file), want, "fs_pressure: the file's second read");
 
@@ -81,24 +112,27 @@ pub fn fs_pressure_release_phase(_: &Caps)
     let mapped = expose_pages(open);
     let page_a = page_base(sector_at(&sectors, MAPPED_AT));
     let page_b = page_base(sector_at(&sectors, UNMAPPED_AT));
-    assert_ne!(
-        page_a, page_b,
-        "fs_pressure: pages A and B share a cache page"
+    assert!(
+        page_a != page_b && page_c != page_a && page_c != page_b,
+        "fs_pressure: pages A, B and C share a cache page"
     );
     let filled = cache_fills(&lock(&disk).take_reads());
     assert!(
-        filled.contains(&page_a) && filled.contains(&page_b),
-        "fs_pressure: pages A and B are not among the cache's fills"
+        filled.contains(&page_a) && filled.contains(&page_b) && filled.contains(&page_c),
+        "fs_pressure: pages A, B and C are not among the cache's fills"
     );
 
     // 3. The level to Low; fatfs gives its idle pages back.
     let (own_before, _, subtree_before) = memory_usage();
     let children_before = subtree_before.saturating_sub(own_before);
     let held = drive_low();
-    let floor = u64::try_from(filled.len().saturating_sub(1)).expect("page count fits u64");
+    // The pages held: each filled one, and C's lost one. A stays, and so do
+    // the kept ones.
+    let floor = u64::try_from(filled.len().saturating_sub(fat_parse::RELEASE_KEEP))
+        .expect("page count fits u64");
     let released = await_children_drop(children_before, floor);
 
-    // 4. Every page but A comes from the device again.
+    // 4. Every page but A and the kept ones comes from the device again.
     expect_reread(file, &disk, &want, &sectors, page_a);
     mapped.expect_content(&want, "fs_pressure: page A's mapping after the release");
     fs.expect_serving("fs_pressure: after the release");
@@ -124,8 +158,9 @@ pub fn fs_pressure_release_phase(_: &Caps)
     fs.stop();
     std::os::seraph::log!(
         "fs_pressure_release passed: {released} pages given back at Low of {} the cache \
-         filled, the mapped page kept",
-        filled.len()
+         held, the mapped page and {} idle ones kept",
+        filled.len().saturating_add(1),
+        fat_parse::RELEASE_KEEP
     );
 }
 
@@ -172,7 +207,8 @@ fn expose_pages(open: u64) -> MappedPage
 }
 
 /// A read of the file after the release returns `want` and reads every
-/// cache page of it but `page_a` from the device again.
+/// cache page of it from the device again but `page_a` and at most
+/// `fat_parse::RELEASE_KEEP` pages fatfs kept.
 fn expect_reread(
     file: u64,
     disk: &ramdisk::SharedDisk,
@@ -194,10 +230,11 @@ fn expect_reread(
         .into_iter()
         .filter(|&page| page != page_a && !reread.contains(&page))
         .collect();
-    assert_eq!(
-        missing,
-        Vec::<usize>::new(),
-        "fs_pressure: file pages the read after the release found still cached"
+    assert!(
+        missing.len() <= fat_parse::RELEASE_KEEP,
+        "fs_pressure: file pages {missing:?} the read after the release found still cached, \
+         more than the {} fatfs keeps",
+        fat_parse::RELEASE_KEEP
     );
     assert!(
         !reread.contains(&page_a),

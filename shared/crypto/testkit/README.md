@@ -48,7 +48,9 @@ on every input with the file's.
 | `ed25519.json` | `generated`: 128 rounds from seed `0x5e4a_ed25`, each a valid signature over a random message under a random key, with one-bit flips of the signature, message and key, a random key and a random signature. `edgeCases`: S + kL and the S range boundary, non-canonical and small-order R, every non-canonical public-key encoding, the torsion points as keys, and mixed-order keys with signatures crafted to satisfy or fail the cofactorless equation. `wycheproofAcceptable`: every case the vendored Wycheproof file marks acceptable | The first RFC 8032 check that fails, in order: S below L, then the public key the canonical encoding of a point (OpenSSL decodes such keys leniently, so the generator checks the encoding itself), then OpenSSL's cofactorless verification |
 | `sha512.json` | Every length from 0 to 300 bytes and 64 longer messages, from seed `0x5e4a_9512`, each with the split points of an incremental hash | OpenSSL's digest |
 
-The `generate` module writes both files, and the `crypto-reference-vectors` binary runs it. It
+The `generate` module writes both files, and the `crypto-reference-vectors` binary runs it:
+`cargo xtask crypto-vectors` regenerates them, and with `--check` fails unless they regenerate
+byte-identically ([xtask/README.md](../../../xtask/README.md) § `cargo xtask crypto-vectors`). It
 builds the inputs (the generated ones from `rng::Rng`, the edge cases with the edwards25519
 arithmetic of `generate::edwards` and `generate::nat`, which are independent of
 `shared/crypto`) and gives each to the `openssl` command, which signs, verifies and hashes. The

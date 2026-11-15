@@ -365,6 +365,8 @@ impl Parser<'_>
             'n' => ClassItem::Char('\n'),
             'r' => ClassItem::Char('\r'),
             't' => ClassItem::Char('\t'),
+            // The `regex` crate reads `\<` and `\>` as word-start and word-end assertions.
+            '<' | '>' => return Err(self.error(at, "a word-start or word-end assertion")),
             c if c.is_ascii_punctuation() => ClassItem::Char(c),
             _ => return Err(self.error(at, "an unsupported escape")),
         })
@@ -388,7 +390,9 @@ impl Parser<'_>
                 {
                     return Err(self.error(item_at, "a nested class, which is unsupported"));
                 }
-                Some('&') if self.peek() == Some('&') =>
+                // `&&`, `--` and `~~` are the `regex` crate's intersection, difference and
+                // symmetric difference wherever an item starts.
+                Some(c @ ('&' | '-' | '~')) if self.peek() == Some(c) =>
                 {
                     return Err(self.error(item_at, "a class set operation, which is unsupported"));
                 }
@@ -430,11 +434,11 @@ impl Parser<'_>
         ))
     }
 
-    /// The end of a class range, when a `-` that is not the class's last member follows its
-    /// start; `at` is the class's `[`.
+    /// The end of a class range, when a `-` follows its start that is neither the class's last
+    /// member nor the first of a `--`; `at` is the class's `[`.
     fn range_end(&mut self, at: usize) -> Result<Option<char>, Error>
     {
-        if self.peek() != Some('-') || matches!(self.peek_second(), Some(']') | None)
+        if self.peek() != Some('-') || matches!(self.peek_second(), Some(']' | '-') | None)
         {
             return Ok(None);
         }
@@ -744,6 +748,11 @@ mod tests
             (r"[a-\d]", "ends in a set"),
             ("[[:alpha:]]", "a nested class"),
             ("[a&&b]", "set operation"),
+            ("[0-9--4]", "set operation"),
+            ("[a--x]", "set operation"),
+            ("[a~~b]", "set operation"),
+            (r"\<PANIC\>", "a word-start or word-end assertion"),
+            (r"[\<]", "a word-start or word-end assertion"),
             (r"\1", "an unsupported escape"),
             (r"\p{L}", "an unsupported escape"),
             ("a\\", "a trailing backslash"),

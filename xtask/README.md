@@ -1685,7 +1685,7 @@ compiles to at most 10000 instructions (`MAX_INSTS`).
 | Construct | Matches |
 |---|---|
 | `x` | The character, for any character but `\ . + * ? ( ) \| [ { ^ $` |
-| `\x` | `x`, for any ASCII punctuation character `x` |
+| `\x` | `x`, for any ASCII punctuation character `x` but `<` and `>` |
 | `\n`, `\r`, `\t` | Newline, carriage return, tab |
 | `.` | Any character but newline |
 | `[...]`, `[^...]` | One character of the set, or one outside it with `^`: characters, ranges (`a-z`), escapes, and the classes below; `]` first and `-` first or last are members |
@@ -1703,7 +1703,8 @@ compiles to at most 10000 instructions (`MAX_INSTS`).
 | `*?`, `+?`, `??`, `{n,}?`, `{n,m}?` | The same, as few as lead to a match |
 
 Anything else is refused with its reason and its byte offset in the pattern: a back-reference, a
-look-around, a named group, a Unicode class (`\p{..}`), a nested class or a class set operation, a
+look-around, a named group, a Unicode class (`\p{..}`), the word-start and word-end assertions
+(`\<`, `\>`), a nested class, a class set operation (a doubled `&`, `-` or `~` in a class), a
 flag other than `i`, a repetition of a repetition (`a**`), and groups nested more than 64 deep.
 Where the syntax overlaps that of the Rust `regex` crate it means the same, except that `\d`,
 `\w` and `\b` are ASCII only and `(?i)` folds ASCII letters only.

@@ -400,6 +400,21 @@ mod tests
     }
 
     #[test]
+    fn a_repetition_of_a_node_that_can_match_empty_takes_the_empty_iteration_first()
+    {
+        // A backtracking engine, and the `regex` crate, take the empty alternative first and
+        // stop there.
+        assert_eq!(spans("(?:|a)*", "aa"), vec![(0, 0), (1, 1), (2, 2)]);
+        assert_eq!(spans("(?:x?|y)*", "y"), vec![(0, 0), (1, 1)]);
+        assert_eq!(spans("(?:|a)+", "aa"), vec![(0, 0), (1, 1), (2, 2)]);
+        assert_eq!(spans("(?:|a){2,}", "a"), vec![(0, 0), (1, 1)]);
+        // Preferring fewer, or a node that cannot match empty, is unchanged.
+        assert_eq!(spans("(?:a|)*", "aa"), vec![(0, 2)]);
+        assert_eq!(spans("(?:|a)*?", "a"), vec![(0, 0), (1, 1)]);
+        assert_eq!(spans("(?:ab)*", "abab"), vec![(0, 4)]);
+    }
+
+    #[test]
     fn captures_iter_numbers_each_matchs_groups()
     {
         let re = Regex::new(r"(\w)=(\d)").unwrap();

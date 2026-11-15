@@ -242,6 +242,10 @@ impl Compiler<'_>
         let Some(max) = max
         else
         {
+            if can_be_empty(node)
+            {
+                return self.optional_plus(node, prefer);
+            }
             let split = self.emit(Inst::Split(0, 0))?;
             self.node(node)?;
             self.emit(Inst::Jump(split))?;
@@ -264,6 +268,24 @@ impl Compiler<'_>
         Ok(())
     }
 
+    /// `(?:node+)?`, the unbounded tail of a repetition whose node can match empty. In the
+    /// plain loop, a path through `node` that consumes nothing returns to the loop's split,
+    /// which the position has already visited, so it dies, and the exit is reached only after
+    /// the node's consuming paths: a repetition that prefers more would then outrank the empty
+    /// iteration a backtracking engine takes first. Here that path reaches a second split, whose
+    /// exit it takes at its own priority.
+    fn optional_plus(&mut self, node: &Node, prefer: Prefer) -> Result<(), Error>
+    {
+        let entry = self.emit(Inst::Split(0, 0))?;
+        let body = self.insts.len();
+        self.node(node)?;
+        let again = self.emit(Inst::Split(0, 0))?;
+        let end = self.insts.len();
+        self.set(entry, Inst::split(prefer, body, end));
+        self.set(again, Inst::split(prefer, body, end));
+        Ok(())
+    }
+
     /// Replace the instruction at `at`, emitted earlier as a placeholder.
     fn set(&mut self, at: usize, inst: Inst)
     {
@@ -271,6 +293,20 @@ impl Compiler<'_>
         {
             *slot = inst;
         }
+    }
+}
+
+/// Whether `node` matches some text in a way that consumes none of it.
+fn can_be_empty(node: &Node) -> bool
+{
+    match node
+    {
+        Node::Empty | Node::Look(_) => true,
+        Node::Literal(_) | Node::Class(_) => false,
+        Node::Group(_, inner) => can_be_empty(inner),
+        Node::Concat(items) => items.iter().all(can_be_empty),
+        Node::Alternate(alternatives) => alternatives.iter().any(can_be_empty),
+        Node::Repeat { node, min, .. } => *min == 0 || can_be_empty(node),
     }
 }
 

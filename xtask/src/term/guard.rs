@@ -288,7 +288,8 @@ mod tests
         let mut termios = Termios::zeroed();
         // SAFETY: the descriptor is open, held by `tty`; termios is storage
         // `tcgetattr` may fill.
-        assert_eq!(unsafe { tcgetattr(tty.as_raw_fd(), &raw mut termios) }, 0);
+        let r = unsafe { tcgetattr(tty.as_raw_fd(), &raw mut termios) };
+        assert_eq!(r, 0);
         termios
     }
 
@@ -305,10 +306,8 @@ mod tests
         let mut winsize = Winsize::default();
         // SAFETY: the descriptor is open, held by `tty`; TIOCGWINSZ writes one
         // `Winsize` to the pointer passed.
-        assert_eq!(
-            unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &raw mut winsize) },
-            0
-        );
+        let r = unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &raw mut winsize) };
+        assert_eq!(r, 0);
         winsize
     }
 

@@ -30,6 +30,13 @@
 //! swept out of the table (`sweep_dead_opens`). Write-side metadata patching
 //! uses the node's cached `DirEntryLocation`.
 //!
+//! Memory pressure: the dispatch loop waits on a wait set holding the service
+//! endpoint and the runtime's memory-pressure Notification
+//! (`std::os::seraph::memory_pressure_notification`). When memmgr's level
+//! changes to `Low` or `Critical`, the loop gives memmgr back every page the
+//! cache holds idle ([`cache::PageCache::release_idle_pages`]) and goes on
+//! serving; the cache grows again on demand, within what memmgr grants.
+//!
 //! Cache coherence: writes go through write-through
 //! ([`cache::PageCache::write_sector`]) so any outstanding
 //! `FS_READ_MEMORY` cap aliasing the same page observes new bytes
@@ -47,7 +54,7 @@ mod eviction;
 mod fat;
 mod file;
 
-use std::os::seraph::{StartupInfo, startup_info};
+use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use alloc::{FatError, allocate_cluster};
@@ -82,6 +89,9 @@ struct FatCaps
 {
     block_dev: u64,
     service: u64,
+    /// The dispatch loop's wait set over `service` and the memory-pressure
+    /// Notification, made after the bootstrap round; `None` without one.
+    pressure: Option<PressureWait>,
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────
@@ -99,11 +109,12 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(caps) = bootstrap_caps(info, ipc_buf)
+    let Some(mut caps) = bootstrap_caps(info, ipc_buf)
     else
     {
         syscall::thread_exit();
     };
+    caps.pressure = PressureWait::new(caps.service);
 
     let cache = match PageCache::init(
         info.memmgr_endpoint,
@@ -153,6 +164,73 @@ fn main() -> !
     );
 }
 
+/// Wait-set badge of the service endpoint.
+const WS_BADGE_SERVICE: u64 = 0;
+/// Wait-set badge of the memory-pressure Notification.
+const WS_BADGE_PRESSURE: u64 = 1;
+/// Members of the dispatch loop's wait set: the service endpoint and the
+/// memory-pressure Notification.
+const WS_MEMBERS: u32 = 2;
+
+/// The dispatch loop's wait set and the memory-pressure Notification it
+/// holds (module docs, Memory pressure).
+struct PressureWait
+{
+    ws: u64,
+    sig: u64,
+}
+
+impl PressureWait
+{
+    /// The wait set over `service` and the runtime's pressure Notification.
+    /// `None`, logged, when the process is not registered for pressure or
+    /// the set cannot be made: the loop then receives on `service` alone and
+    /// keeps its cache whatever the level, since the level is advisory.
+    fn new(service: u64) -> Option<Self>
+    {
+        let Some(sig) = std::os::seraph::memory_pressure_notification()
+        else
+        {
+            std::os::seraph::log!(warn: "not registered for memory pressure; cache kept under pressure");
+            return None;
+        };
+        let Some(ws) = std::os::seraph::object_slab_retype(
+            std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
+            |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
+        )
+        else
+        {
+            std::os::seraph::log!(warn: "wait set not created; cache kept under memory pressure");
+            return None;
+        };
+        if syscall::wait_set_add(ws, service, WS_BADGE_SERVICE).is_err()
+            || syscall::wait_set_add(ws, sig, WS_BADGE_PRESSURE).is_err()
+        {
+            std::os::seraph::log!(warn: "wait set not filled; cache kept under memory pressure");
+            let _ = syscall::cap_delete(ws);
+            return None;
+        }
+        Some(Self { ws, sig })
+    }
+
+    /// Take the pressure bits, then read memmgr's level; at `Low` or
+    /// `Critical` give memmgr back the cache's idle pages. Run by the
+    /// dispatch thread between requests ([`PageCache::release_idle_pages`]).
+    fn on_signal(&self, cache: &PageCache, ipc_buf: *mut u64)
+    {
+        // The wait set is level-triggered: taking the bits ends the wake.
+        let _ = syscall::notification_try_wait(self.sig);
+        let Some(level @ (MemoryPressure::Low | MemoryPressure::Critical)) =
+            std::os::seraph::memory_pressure()
+        else
+        {
+            return;
+        };
+        let released = cache.release_idle_pages(ipc_buf);
+        std::os::seraph::log!("memory pressure {level:?}: {released} cache pages given back");
+    }
+}
+
 /// Issue a single bootstrap round against the creator endpoint and assemble
 /// [`FatCaps`].
 fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
@@ -170,6 +248,7 @@ fn bootstrap_caps(info: &StartupInfo, ipc_buf: *mut u64) -> Option<FatCaps>
     Some(FatCaps {
         block_dev: round.caps[0],
         service: round.caps[1],
+        pressure: None,
     })
 }
 
@@ -267,6 +346,10 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   `OpenTable`: the open's own `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and
 ///   `FS_CLOSE`, and the stateless file ops on the open's node.
 ///
+/// The loop waits on the [`PressureWait`] set when there is one, and
+/// receives on the endpoint when it reports the endpoint ready; a pressure
+/// signal is handled between requests ([`PressureWait::on_signal`]).
+///
 /// The open table is shared with the eviction worker via a `Mutex`. Main
 /// takes the lock to resolve an open cap, `FS_OPEN` takes it only around a
 /// sweep and its table update, and `FS_READ_MEMORY`, `FS_RELEASE_MEMORY`, and `FS_CLOSE`
@@ -306,6 +389,27 @@ fn service_loop(
             if let Some(req) = pick_eviction_candidate(&mut files_g)
             {
                 eviction.enqueue(req);
+            }
+        }
+        // One guard covers a failing wait and a failing recv: a
+        // level-triggered set keeps reporting the endpoint ready while the
+        // recv fails, and only a successful recv counts as progress.
+        if let Some(pressure) = &caps.pressure
+        {
+            match syscall::wait_set_wait(pressure.ws)
+            {
+                Ok(WS_BADGE_PRESSURE) =>
+                {
+                    pressure.on_signal(cache, ipc_buf);
+                    continue;
+                }
+                Ok(_) =>
+                {}
+                Err(e) =>
+                {
+                    guard.on_failure(e);
+                    continue;
+                }
             }
         }
         // SAFETY: ipc_buf is the registered IPC buffer page.

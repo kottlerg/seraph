@@ -328,7 +328,7 @@ pub(crate) fn pool_reserve() -> u64
 
 /// svctest's own budget usage from memmgr's `QUERY_MEMORY_USAGE`, in pages:
 /// `(own, max, subtree)`.
-fn memory_usage() -> (u64, u64, u64)
+pub(crate) fn memory_usage() -> (u64, u64, u64)
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_MEMORY_USAGE).build();
     let reply = memmgr_call(&req, "QUERY_MEMORY_USAGE");
@@ -1602,7 +1602,7 @@ const PRESSURE_WAITER_STOP_GAP: std::time::Duration = std::time::Duration::from_
 
 /// memmgr's `QUERY_POOL_STATUS` pool total, free total and pressure level
 /// (`data[2]`, `data[3]` and `data[7]`), the totals in pages.
-fn pool_pressure_status() -> (u64, u64, u64)
+pub(crate) fn pool_pressure_status() -> (u64, u64, u64)
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
     let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
@@ -1646,7 +1646,7 @@ fn take_bits(sig: u64) -> u64
 
 /// Draw grants from memmgr, contiguous or not, until `pages` pages are held,
 /// returning each grant's cap and region id.
-fn take_pages(pages: u64) -> Vec<(u64, u64)>
+pub(crate) fn take_pages(pages: u64) -> Vec<(u64, u64)>
 {
     let mut held = Vec::new();
     let mut taken = 0u64;

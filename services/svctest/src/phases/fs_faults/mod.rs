@@ -27,6 +27,7 @@
 //! `UNMOUNT_FORCE` releases the opens and ends the driver (§ Label 19:
 //! `FS_UNMOUNT`). Every case that ends a driver ends its own.
 
+mod pressure;
 mod ramdisk;
 
 use std::sync::Arc;
@@ -45,10 +46,16 @@ use ramdisk::{Fault, RamDisk, SharedDisk, lock};
 
 pub fn phases() -> &'static [Phase]
 {
-    &[Phase {
-        name: "fs_block_faults",
-        run: fs_block_faults_phase,
-    }]
+    &[
+        Phase {
+            name: "fs_pressure_release",
+            run: pressure::fs_pressure_release_phase,
+        },
+        Phase {
+            name: "fs_block_faults",
+            run: fs_block_faults_phase,
+        },
+    ]
 }
 
 /// Badge of fatfs's SEND on the block endpoint.

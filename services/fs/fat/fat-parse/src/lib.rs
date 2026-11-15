@@ -17,7 +17,8 @@
 //! short-name numeric tails ([`TailSet`]), and keeps the node table's
 //! recycling identifiers ([`node_slab::NodeSlab`]) and the open-instance
 //! table's ([`open_slab::OpenSlab`]), with the schedule of its sweeps for
-//! opens whose client is gone ([`open_slab::SweepSchedule`]). This crate
+//! opens whose client is gone ([`open_slab::SweepSchedule`]), and picks the
+//! page cache's eviction victim ([`lru_victim`]). This crate
 //! performs no
 //! I/O and holds no filesystem state: the `fatfs` service reads sectors over
 //! a block-device IPC, hands the bytes here, and keeps the
@@ -52,8 +53,9 @@ pub const MIN_SECTOR_SIZE: usize = 512;
 /// Fewest cache slots a `fatfs` page cache may grow to, each one page: its
 /// ceiling on a machine of up to [`SLOT_RAM_DIVISOR`] × 256 pages (512 MiB) of
 /// RAM. Above that the ceiling grows with RAM ([`slot_ceiling`]). The cache
-/// takes a slot's page from memmgr on the slot's first use, so a mount pays
-/// only for the slots it fills. Defined here, in the host-tested library, so
+/// takes a slot's page from memmgr when a miss needs the slot, and gives idle
+/// pages back under memory pressure, so a mount pays only for the slots it
+/// fills. Defined here, in the host-tested library, so
 /// the svctest harness that checks the cache's bounds reads the same values
 /// the driver uses.
 pub const SLOT_COUNT: usize = 256;
@@ -78,6 +80,44 @@ pub fn slot_ceiling(system_ram_pages: u64) -> usize
 /// mapped by a client) and clean spares number fewer than this. Shared with
 /// svctest as [`slot_ceiling`] is.
 pub const QUARANTINE_MAX: usize = 32;
+
+/// One `fatfs` cache slot as [`lru_victim`] sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct VictimView
+{
+    /// A reference holds the slot: a read or write is inside its page.
+    pub referenced: bool,
+    /// The slot holds a page cap to refill. One without holds no page: it
+    /// gave its page back to memmgr, a page swap lost it, or a failed fill
+    /// lost its cap.
+    pub has_cap: bool,
+    /// The pick in progress has passed over the slot already.
+    pub skipped: bool,
+    /// The slot's last-use sequence number; lower is older.
+    pub lru_seq: u64,
+}
+
+/// The index of the slot a `fatfs` cache refills on a miss it cannot meet
+/// by growing: the least recently used one (the lowest `lru_seq`, the first
+/// of a tie) that no reference holds, that holds a page cap, and that the
+/// pick has not skipped. `None` when no slot qualifies.
+#[must_use]
+pub fn lru_victim(slots: impl IntoIterator<Item = VictimView>) -> Option<usize>
+{
+    let mut best: Option<(usize, u64)> = None;
+    for (i, slot) in slots.into_iter().enumerate()
+    {
+        if slot.referenced || !slot.has_cap || slot.skipped
+        {
+            continue;
+        }
+        if best.is_none_or(|(_, seq)| slot.lru_seq < seq)
+        {
+            best = Some((i, slot.lru_seq));
+        }
+    }
+    best.map(|(i, _)| i)
+}
 
 /// FAT variant detected from cluster count.
 #[derive(Clone, Copy)]
@@ -1523,6 +1563,61 @@ mod tests
             slot_ceiling(u64::MAX),
             (u64::MAX / SLOT_RAM_DIVISOR) as usize
         );
+    }
+
+    /// An unreferenced, unskipped slot with a page cap, last used at `lru_seq`.
+    fn idle(lru_seq: u64) -> VictimView
+    {
+        VictimView {
+            referenced: false,
+            has_cap: true,
+            skipped: false,
+            lru_seq,
+        }
+    }
+
+    fn capless(lru_seq: u64) -> VictimView
+    {
+        VictimView {
+            has_cap: false,
+            ..idle(lru_seq)
+        }
+    }
+
+    fn referenced(lru_seq: u64) -> VictimView
+    {
+        VictimView {
+            referenced: true,
+            ..idle(lru_seq)
+        }
+    }
+
+    fn skipped(lru_seq: u64) -> VictimView
+    {
+        VictimView {
+            skipped: true,
+            ..idle(lru_seq)
+        }
+    }
+
+    // The defect caught: a slot with no page cap (given back under memory
+    // pressure, lost by a swap or a failed fill) chosen as the victim. Its
+    // last-use number never moves, so once the cache is full it would be
+    // every miss's pick, and every refill of it fails.
+    #[test]
+    fn lru_victim_passes_over_a_slot_with_no_page_cap()
+    {
+        assert_eq!(lru_victim([capless(1), idle(7), idle(5)]), Some(2));
+        assert_eq!(lru_victim([capless(0)]), None);
+    }
+
+    #[test]
+    fn lru_victim_takes_the_oldest_unreferenced_unskipped_slot_first_of_a_tie()
+    {
+        let slots = [referenced(1), skipped(2), idle(4), idle(3), idle(3)];
+        assert_eq!(lru_victim(slots), Some(3));
+        assert_eq!(lru_victim([]), None);
+        assert_eq!(lru_victim([referenced(0), skipped(0)]), None);
     }
 
     #[test]

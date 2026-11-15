@@ -28,13 +28,35 @@
 //! continues to point at the same physical pages.
 //!
 //! The cache grows on demand: a slot takes its page from memmgr
-//! `REQUEST_MEMORY_CAPS` (`REQUIRE_CONTIGUOUS`, one IPC per slot) the first
-//! time a miss finds every provisioned slot in use or none provisioned, up to
-//! the slot ceiling, so an idle mount pays for no page it never fills. A
-//! miss evicts the least recently used unreferenced slot only once every slot
-//! is provisioned or memmgr refuses a page. The VA window for
-//! every slot is reserved at init and held for the fs process's lifetime; the
-//! reservation is intentionally leaked (`ReservedRange` has no `Drop`).
+//! `REQUEST_MEMORY_CAPS` (`REQUIRE_CONTIGUOUS`, one IPC per slot) when a
+//! miss finds no slot that holds a page and no sector run, up to the slot
+//! ceiling, so an idle mount pays for no page it never fills. A miss evicts
+//! the least recently used unreferenced slot only once every slot holds a
+//! page or memmgr refuses one. The cache keeps each page's region id, the
+//! name `RELEASE_MEMORY_CAPS` takes, so it can give the page back. The VA
+//! window for every slot is reserved at init and held for the fs process's
+//! lifetime; the reservation is intentionally leaked (`ReservedRange` has no
+//! `Drop`).
+//!
+//! ## Release under memory pressure
+//!
+//! When memmgr's memory-pressure level reads `Low` or `Critical`
+//! (`services/memmgr/docs/memory-pool.md` § Memory pressure), the dispatch
+//! loop calls [`PageCache::release_idle_pages`], which gives memmgr back
+//! every page the cache holds idle: the page of each slot no reference holds,
+//! and every spare page of the quarantine. The cache is write-through, so such
+//! a page holds nothing the device lacks and goes back without a write. A slot
+//! whose page went to a client passes the check of § Reuse of a page a client
+//! mapped first: its page goes back only once every derivation of its cap is
+//! revoked and the cache's own mapping is the only one left. A page a client
+//! still maps stays in its slot, since a replacement would take a page from
+//! memmgr, and a quarantined page stays held. A page goes back unmapped and
+//! with its cap deleted, so memmgr returns it to the free pool and uncharges
+//! the fs. The slot keeps its VA and holds no page until a miss provisions
+//! it again; a slot below the provisioned mark with no page is provisioned
+//! before the mark moves. Each change of level to `Low` or `Critical`
+//! releases again, and growth after a release stays demand-driven: at
+//! `Critical` memmgr refuses the fs a page and a miss evicts instead.
 //!
 //! ## Reuse of a page a client mapped
 //!
@@ -47,7 +69,7 @@
 //! count is read: 1, the cache's own mapping, makes the slot reusable. A
 //! higher count means a client still maps the page. The slot then takes a
 //! replacement page (a clean spare, else a fresh page from memmgr), and the
-//! still-mapped page is quarantined: kept, never returned to memmgr, and
+//! still-mapped page is quarantined: kept, not returned to memmgr while a client maps it, and
 //! re-checked on every later pick. A quarantined page whose count falls to
 //! 0, after a revoke that completed, becomes a spare. A revoke that does not
 //! complete (a holder deriving faster than revocation reaches) skips the slot
@@ -66,8 +88,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 use ipc::{IpcMessage, blk_errors, blk_labels, memmgr_errors, memmgr_labels};
 use std::os::seraph::{mem_map_funded, reserve_pages};
 use std::sync::{Mutex, OnceLock, PoisonError};
-use syscall_abi::{MAP_WRITABLE, PAGE_SIZE, SyscallError};
+use syscall_abi::{MAP_WRITABLE, MSG_DATA_WORDS_MAX, PAGE_SIZE, SyscallError};
 
+use fat_parse::VictimView;
 pub use fat_parse::{QUARANTINE_MAX, SLOT_COUNT, slot_ceiling};
 
 /// Process-static scratch memory cap used for single-sector writeback in
@@ -135,7 +158,8 @@ struct CacheSlot
     /// Page-aligned starting LBA (a multiple of the sectors per page) of the
     /// sector run cached here. `PAGE_BASE_EMPTY` if unfilled.
     page_lba_base: AtomicU64,
-    /// `CSpace` slot index of the Memory cap backing this cache page.
+    /// `CSpace` slot index of the Memory cap backing this cache page; 0 when
+    /// the slot has no page, or a failed fill lost its cap.
     ///
     /// Atomic because each `BLK_READ_INTO_MEMORY` round trip moves the cap
     /// out and back; the kernel may install the returned cap at a
@@ -143,6 +167,11 @@ struct CacheSlot
     /// Synchronisation is via the slot `refcount` `AcqRel` pair — readers
     /// load `memory_cap` only after a successful refcount bump.
     memory_cap: AtomicU64,
+    /// memmgr's region id of the slot's page, the name `RELEASE_MEMORY_CAPS`
+    /// takes to give it back; 0 when the slot has no page (memmgr's ids start
+    /// at 1). A slot whose cap a failed fill lost keeps its id: its VA still
+    /// maps the page, so it is never provisioned again.
+    region_id: AtomicU64,
     va: u64,
     refcount: AtomicU32,
     lru_seq: AtomicU64,
@@ -152,25 +181,35 @@ struct CacheSlot
     exposed: AtomicBool,
 }
 
+/// One page the cache took from memmgr: its Memory cap and its region id.
+#[derive(Clone, Copy)]
+struct Page
+{
+    cap: u64,
+    region_id: u64,
+}
+
 /// Pages the cache holds beyond its slots (module docs § Reuse of a page a
 /// client mapped). Only the dispatch thread, which picks victims, touches it.
 struct Quarantine
 {
-    /// Caps of pages taken out of a slot while a client still mapped them.
-    held: Vec<u64>,
-    /// Caps of pages no address space maps, ready to replace a slot's page.
-    spare: Vec<u64>,
+    /// Pages taken out of a slot while a client still mapped them.
+    held: Vec<Page>,
+    /// Pages no address space maps, ready to replace a slot's page.
+    spare: Vec<Page>,
 }
 
 /// Process-wide page cache.
 pub struct PageCache
 {
     /// Every slot the cache may hold, as many as its slot ceiling. Only
-    /// `slots[..provisioned]` has a page; the rest are VA windows waiting for
-    /// one.
+    /// `slots[..provisioned]` can hold a page; the rest are VA windows waiting
+    /// for one. A slot below the mark whose `region_id` is 0 holds none: it
+    /// gave its page back ([`Self::release_idle_pages`]) or a swap lost it.
     slots: Box<[CacheSlot]>,
-    /// Slots that have taken their page, in index order. Written only by the
-    /// dispatch thread, the one that fills slots.
+    /// The provisioned mark: slots below it have taken a page at least once,
+    /// in index order. Written only by the dispatch thread, the one that fills
+    /// slots.
     provisioned: AtomicUsize,
     /// Bytes per sector: the device's logical block size, set at mount.
     sector_size: AtomicU32,
@@ -217,7 +256,8 @@ impl PageCache
     /// reports, [`SLOT_COUNT`] if it reports none), fund the fs process's own
     /// `cspace` for the cache's caps, reserve a contiguous VA window for the
     /// slots, allocate and map the scratch page, and return the
-    /// process-static cache. Slot pages come later, one per slot on first use.
+    /// process-static cache. Slot pages come later, one per slot when a miss
+    /// needs it.
     pub fn init(
         memmgr_ep: u64,
         self_aspace: u64,
@@ -260,6 +300,7 @@ impl PageCache
             slots.push(CacheSlot {
                 page_lba_base: AtomicU64::new(PAGE_BASE_EMPTY),
                 memory_cap: AtomicU64::new(0),
+                region_id: AtomicU64::new(0),
                 va,
                 refcount: AtomicU32::new(0),
                 lru_seq: AtomicU64::new(0),
@@ -295,7 +336,9 @@ impl PageCache
         // once at startup keeps both synchronous and free of init-time
         // error paths.
         let scratch_va = reserve_pages(1).map_err(|_| InitError::Reserve)?.va_start();
-        let scratch_cap = request_one_page(memmgr_ep, ipc_buf).ok_or(InitError::Memmgr)?;
+        let scratch_cap = request_one_page(memmgr_ep, ipc_buf)
+            .ok_or(InitError::Memmgr)?
+            .cap;
         // SAFETY: scratch_va is a fresh page reservation from the per-process
         // arena, owned by the cache: VA no Rust object or IPC page occupies.
         unsafe { mem_map_funded(scratch_cap, self_aspace, scratch_va, 0, 1, MAP_WRITABLE) }
@@ -376,8 +419,8 @@ impl PageCache
     }
 
     /// Top the fs process's `CSpace` (`cspace`) up so every general slot the
-    /// cache can still take stays free: a page cap for each slot not yet
-    /// provisioned, a per-read ancestor for every slot, the quarantine's
+    /// cache can still take stays free: a page cap for each slot without a
+    /// page, a per-read ancestor for every slot, the quarantine's
     /// replacements, and [`RUN_TIME_CSPACE_HEADROOM`] (the init funding,
     /// less the slot pages and the scratch page already held). Called before
     /// `FS_OPEN` records a release SEND and a liveness cap, which hold slots
@@ -388,17 +431,17 @@ impl PageCache
     pub fn fund_run_time_headroom(&self, cspace: u64) -> bool
     {
         let ceiling = self.slot_ceiling();
-        // At most the ceiling is provisioned. The sum is a count of capability
+        // At most the ceiling holds a page. The sum is a count of capability
         // slots, which past `usize` no CSpace holds: the saturated request
         // fails to fund as such.
-        let unprovisioned = ceiling.saturating_sub(self.provisioned.load(Ordering::Acquire));
-        let slots = unprovisioned
+        let without_page = ceiling.saturating_sub(self.pages_held());
+        let slots = without_page
             .saturating_add(ceiling)
             .saturating_add(QUARANTINE_MAX + RUN_TIME_CSPACE_HEADROOM);
         std::os::seraph::fund_cspace_slot_budget(cspace, u64::try_from(slots).unwrap_or(u64::MAX))
     }
 
-    /// The slots that hold a page: the provisioned prefix of `slots`.
+    /// The slots that can hold a page: the provisioned prefix of `slots`.
     fn live_slots(&self) -> &[CacheSlot]
     {
         // `provisioned` never passes the slot count.
@@ -407,28 +450,127 @@ impl PageCache
             .unwrap_or_default()
     }
 
-    /// Give the next unprovisioned slot its page, returning its index, or
-    /// `None` when every slot has one or memmgr refuses a page. Called only
-    /// by the dispatch thread on a miss, so slots are provisioned in index
-    /// order with no race on `provisioned`.
-    fn provision_next(&self, ipc_buf: *mut u64) -> Option<usize>
+    /// Slots that hold a page, counting one whose cap a failed fill lost,
+    /// whose VA still maps its page.
+    fn pages_held(&self) -> usize
     {
-        let idx = self.provisioned.load(Ordering::Acquire);
+        self.live_slots()
+            .iter()
+            .filter(|s| s.region_id.load(Ordering::Acquire) != 0)
+            .count()
+    }
+
+    /// Give a slot with no page its page, returning its index, or `None`
+    /// when every slot has one or memmgr refuses a page. A slot below the
+    /// provisioned mark that holds no page is taken first, so the mark moves
+    /// only when none is left. Called only by the dispatch thread on a miss,
+    /// and only that thread gives a slot a page or takes it away, so there
+    /// is no race on `provisioned` or on the slot.
+    fn provision(&self, ipc_buf: *mut u64) -> Option<usize>
+    {
+        let mark = self.provisioned.load(Ordering::Acquire);
+        let idx = self
+            .live_slots()
+            .iter()
+            .position(|s| s.region_id.load(Ordering::Acquire) == 0)
+            .unwrap_or(mark);
         let slot = self.slots.get(idx)?;
-        let cap = request_one_page(self.memmgr_ep, ipc_buf)?;
+        let page = request_one_page(self.memmgr_ep, ipc_buf)?;
         // SAFETY: slot.va is a page of the slot-ceiling-page window reserved
         // at init from the per-process arena and owned by the cache, and no
-        // page is mapped there yet: VA no Rust object or IPC page occupies.
-        if unsafe { mem_map_funded(cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_err()
+        // page is mapped there: the slot never held one, or its page was
+        // unmapped when it went back to memmgr or a swap lost it. It is VA no
+        // Rust object or IPC page occupies.
+        if unsafe { mem_map_funded(page.cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }
+            .is_err()
         {
-            let _ = syscall::cap_delete(cap);
+            let _ = syscall::cap_delete(page.cap);
+            if !release_regions(self.memmgr_ep, &[page.region_id], ipc_buf)
+            {
+                std::os::seraph::log!(warn: "cache: an unmappable page was not given back");
+            }
             return None;
         }
-        slot.memory_cap.store(cap, Ordering::Release);
-        // `idx` indexes `slots`, so this never saturates.
-        self.provisioned
-            .store(idx.saturating_add(1), Ordering::Release);
+        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        slot.exposed.store(false, Ordering::Release);
+        slot.memory_cap.store(page.cap, Ordering::Release);
+        slot.region_id.store(page.region_id, Ordering::Release);
+        if idx == mark
+        {
+            // `idx` indexes `slots`, so this never saturates.
+            self.provisioned
+                .store(idx.saturating_add(1), Ordering::Release);
+        }
         Some(idx)
+    }
+
+    /// Give memmgr back every page the cache holds idle (module docs § Release
+    /// under memory pressure): the page of each slot that no reference holds
+    /// and no client maps, and every spare page of the quarantine. Returns
+    /// how many pages memmgr took back. Called only by the dispatch thread,
+    /// the only one that takes a slot reference or gives a slot a page; the
+    /// eviction worker only drops references, so a slot found unreferenced
+    /// stays so for the call.
+    pub fn release_idle_pages(&self, ipc_buf: *mut u64) -> usize
+    {
+        let mut batch = ReleaseBatch::new(self.memmgr_ep);
+        for slot in self.live_slots()
+        {
+            if let Some(region_id) = self.take_idle_page(slot)
+            {
+                batch.push(region_id, ipc_buf);
+            }
+        }
+        let mut quarantine = self
+            .quarantine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        quarantine.recheck();
+        for page in quarantine.spare.drain(..)
+        {
+            let _ = syscall::cap_delete(page.cap);
+            batch.push(page.region_id, ipc_buf);
+        }
+        drop(quarantine);
+        batch.finish(ipc_buf)
+    }
+
+    /// Take `slot`'s page out of the cache to give it back, returning its
+    /// region id: unmap it from the slot's VA and delete its cap. `None`, the
+    /// slot unchanged, when the slot has no page or no cap, a reference holds
+    /// it, or it was exposed and a client may still map its page
+    /// ([`exposure`]). A failed unmap leaves the slot its page with no
+    /// sector run, which the next miss fills.
+    fn take_idle_page(&self, slot: &CacheSlot) -> Option<u64>
+    {
+        let cap = slot.memory_cap.load(Ordering::Acquire);
+        let region_id = slot.region_id.load(Ordering::Acquire);
+        if cap == 0 || region_id == 0 || slot.refcount.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        if slot.exposed.load(Ordering::Acquire)
+        {
+            if exposure(cap) != Exposure::CacheAlone
+            {
+                return None;
+            }
+            // Only the cache maps the page, as after a pick's check.
+            slot.exposed.store(false, Ordering::Release);
+        }
+        // No lookup hits the page from here.
+        slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
+        // SAFETY: slot.va is this slot's page of the cache's reserved window,
+        // which only the cache maps; the slot is unreferenced, so no read or
+        // write of the page is in progress and no Rust reference into it lives.
+        if unsafe { syscall::mem_unmap(self.self_aspace, slot.va, 1) }.is_err()
+        {
+            return None;
+        }
+        let _ = syscall::cap_delete(cap);
+        slot.memory_cap.store(0, Ordering::Release);
+        slot.region_id.store(0, Ordering::Release);
+        Some(region_id)
     }
 
     /// Write one sector, the first sector-size bytes of `data`, through the
@@ -587,9 +729,10 @@ impl PageCache
             self.release(idx);
             return false;
         };
-        // SAFETY: refcount > 0 for the duration of this borrow; slot.va
-        // was mapped writable for one page when the slot was provisioned
-        // and is owned by this process. The page holds the sectors per page
+        // SAFETY: refcount > 0 for the duration of this borrow, so the slot
+        // keeps the page it was filled into (a release takes only an
+        // unreferenced slot's page); slot.va maps that page writable and is
+        // owned by this process. The page holds the sectors per page
         // contiguously, `len` bytes each, so the sector lies inside it, and
         // `buf` holds at least `len` bytes.
         unsafe {
@@ -685,10 +828,10 @@ impl PageCache
         Some(victim)
     }
 
-    /// A provisioned slot that has never held a page and is unreferenced,
-    /// else a newly provisioned one ([`Self::provision_next`]): the cache
-    /// grows before it evicts. `None` when every slot is provisioned and
-    /// filled, or memmgr refuses a page.
+    /// A slot with a page that holds no sector run and is unreferenced, else
+    /// one newly given a page ([`Self::provision`]): the cache grows before
+    /// it evicts. `None` when every slot holds a page and a sector run, or
+    /// memmgr refuses a page.
     fn free_or_new_slot(&self, ipc_buf: *mut u64) -> Option<usize>
     {
         self.live_slots()
@@ -699,7 +842,7 @@ impl PageCache
                     && s.memory_cap.load(Ordering::Acquire) != 0
                     && !s.exposed.load(Ordering::Acquire)
             })
-            .or_else(|| self.provision_next(ipc_buf))
+            .or_else(|| self.provision(ipc_buf))
     }
 
     /// The slot holding the page at `page_lba_base`, with a reference taken
@@ -767,21 +910,22 @@ impl PageCache
             return false;
         };
         let cap = slot.memory_cap.load(Ordering::Acquire);
+        let region_id = slot.region_id.load(Ordering::Acquire);
         if cap == 0
         {
             return false;
         }
-        // A revoke that does not complete can leave a client a derivation that
-        // maps the page later; skip the slot for this pick instead.
-        if syscall::cap_revoke_all(cap).is_err()
+        match exposure(cap)
         {
-            return false;
-        }
-        // An unreadable count is treated as still mapped.
-        if syscall::cap_info_memory_mappings(cap, 0, 1) == Ok(1)
-        {
-            slot.exposed.store(false, Ordering::Release);
-            return true;
+            Exposure::CacheAlone =>
+            {
+                slot.exposed.store(false, Ordering::Release);
+                return true;
+            }
+            // Skip the slot for this pick.
+            Exposure::Unrevoked => return false,
+            Exposure::ClientMapped =>
+            {}
         }
         let mut quarantine = self
             .quarantine
@@ -805,11 +949,12 @@ impl PageCache
         {
             return false;
         };
-        match self.swap_page(slot, cap, fresh)
+        let old = Page { cap, region_id };
+        match self.swap_page(slot, old, fresh)
         {
             Swap::Done =>
             {
-                quarantine.held.push(cap);
+                quarantine.held.push(old);
                 slot.exposed.store(false, Ordering::Release);
                 true
             }
@@ -820,9 +965,10 @@ impl PageCache
             }
             Swap::Lost =>
             {
-                // The slot keeps no page: `exposed` stays set and its cap is
-                // 0, so no pick reuses it and no lookup hits it.
-                quarantine.held.push(cap);
+                // The slot keeps no page: its cap and region id are 0, so no
+                // pick reuses it and no lookup hits it until a miss gives it
+                // a page again (`Self::provision`).
+                quarantine.held.push(old);
                 quarantine.spare.push(fresh);
                 false
             }
@@ -833,7 +979,7 @@ impl PageCache
     /// failure `old` is mapped back; when that fails too, the slot is left
     /// with no page ([`Swap::Lost`]). The slot is unreferenced, so no reader is
     /// inside its page.
-    fn swap_page(&self, slot: &CacheSlot, old: u64, fresh: u64) -> Swap
+    fn swap_page(&self, slot: &CacheSlot, old: Page, fresh: Page) -> Swap
     {
         // SAFETY: slot.va is this slot's page of the cache's reserved window,
         // which only the cache maps; the slot is unreferenced, so no read or
@@ -843,42 +989,41 @@ impl PageCache
             return Swap::Restored;
         }
         // SAFETY: as above; the VA was just unmapped.
-        if unsafe { mem_map_funded(fresh, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
+        if unsafe { mem_map_funded(fresh.cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }
+            .is_ok()
         {
-            slot.memory_cap.store(fresh, Ordering::Release);
+            slot.memory_cap.store(fresh.cap, Ordering::Release);
+            slot.region_id.store(fresh.region_id, Ordering::Release);
             return Swap::Done;
         }
         // SAFETY: as above; restores the page the slot had.
-        if unsafe { mem_map_funded(old, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
+        if unsafe { mem_map_funded(old.cap, self.self_aspace, slot.va, 0, 1, MAP_WRITABLE) }.is_ok()
         {
             return Swap::Restored;
         }
         slot.page_lba_base.store(PAGE_BASE_EMPTY, Ordering::Release);
         slot.memory_cap.store(0, Ordering::Release);
+        slot.region_id.store(0, Ordering::Release);
+        slot.exposed.store(false, Ordering::Release);
         Swap::Lost
     }
 
-    /// The least recently used slot with no reference that `skipped` does not
-    /// exclude. `skipped` holds a mark per slot; a slot past it is excluded.
+    /// The least recently used slot with no reference and a page cap that
+    /// `skipped` does not exclude ([`fat_parse::lru_victim`]). `skipped`
+    /// holds a mark per slot; a slot past it is excluded.
     fn lru_unreferenced(&self, skipped: &[bool]) -> Option<usize>
     {
-        let mut best: Option<(usize, u64)> = None;
-        for (i, slot) in self.live_slots().iter().enumerate()
-        {
-            if skipped.get(i).copied().unwrap_or(true) || slot.refcount.load(Ordering::Acquire) != 0
-            {
-                continue;
-            }
-            let seq = slot.lru_seq.load(Ordering::Acquire);
-            match best
-            {
-                None => best = Some((i, seq)),
-                Some((_, b)) if seq < b => best = Some((i, seq)),
-                _ =>
-                {}
-            }
-        }
-        best.map(|(i, _)| i)
+        fat_parse::lru_victim(
+            self.live_slots()
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| VictimView {
+                    referenced: slot.refcount.load(Ordering::Acquire) != 0,
+                    has_cap: slot.memory_cap.load(Ordering::Acquire) != 0,
+                    skipped: skipped.get(i).copied().unwrap_or(true),
+                    lru_seq: slot.lru_seq.load(Ordering::Acquire),
+                }),
+        )
     }
 
     fn bump_seq(&self) -> u64
@@ -911,8 +1056,44 @@ enum Swap
     Done,
     /// The slot still maps its old page; the fresh page is unused.
     Restored,
-    /// The slot's VA maps neither page; the slot is out of service.
+    /// The slot's VA maps neither page; the slot holds no page until a miss
+    /// gives it one.
     Lost,
+}
+
+/// Who may map an exposed slot's page, read by [`exposure`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exposure
+{
+    /// Every derivation of the cap is revoked and only the cache maps the
+    /// page.
+    CacheAlone,
+    /// Every derivation is revoked, but another address space still maps
+    /// the page, or its count is unreadable and taken as mapped.
+    ClientMapped,
+    /// The revoke did not complete: a client may hold a derivation that maps
+    /// the page later.
+    Unrevoked,
+}
+
+/// Revoke every derivation of slot page cap `cap`, so no holder can map the
+/// page again, then read who maps it (module docs § Reuse of a page a client
+/// mapped).
+fn exposure(cap: u64) -> Exposure
+{
+    if syscall::cap_revoke_all(cap).is_err()
+    {
+        return Exposure::Unrevoked;
+    }
+    // An unreadable count is treated as still mapped.
+    if syscall::cap_info_memory_mappings(cap, 0, 1) == Ok(1)
+    {
+        Exposure::CacheAlone
+    }
+    else
+    {
+        Exposure::ClientMapped
+    }
 }
 
 impl Quarantine
@@ -922,12 +1103,12 @@ impl Quarantine
     fn recheck(&mut self)
     {
         let spare = &mut self.spare;
-        self.held.retain(|&cap| {
-            let unmapped = syscall::cap_revoke_all(cap).is_ok()
-                && syscall::cap_info_memory_mappings(cap, 0, 1) == Ok(0);
+        self.held.retain(|&page| {
+            let unmapped = syscall::cap_revoke_all(page.cap).is_ok()
+                && syscall::cap_info_memory_mappings(page.cap, 0, 1) == Ok(0);
             if unmapped
             {
-                spare.push(cap);
+                spare.push(page);
             }
             !unmapped
         });
@@ -1109,8 +1290,9 @@ fn query_system_ram_pages(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
     (reply.label == memmgr_errors::SUCCESS).then(|| reply.word(0) / PAGE_SIZE)
 }
 
-/// Acquire one single-page Memory cap from memmgr.
-fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
+/// Acquire one single-page Memory cap from memmgr, with the region id that
+/// gives it back.
+fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<Page>
 {
     let arg = 1u64 | (u64::from(memmgr_labels::REQUIRE_CONTIGUOUS) << 32);
     let req = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
@@ -1118,13 +1300,109 @@ fn request_one_page(memmgr_ep: u64, ipc_buf: *mut u64) -> Option<u64>
         .build();
     // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }.ok()?;
-    if reply.label != memmgr_errors::SUCCESS
+    let cap = reply.caps().first().copied();
+    let region_id = match ipc::memmgr_grant_layout(&reply)
     {
-        return None;
-    }
-    if reply.word(0) != 1
+        Some((&[1], &[id])) if id != 0 => id,
+        _ => 0,
+    };
+    match (cap, region_id)
     {
-        return None;
+        (Some(cap), 1..) => Some(Page { cap, region_id }),
+        (Some(cap), 0) =>
+        {
+            // A grant that is not one page with an id cannot be given back
+            // by name; drop the cap and treat the request as refused.
+            let _ = syscall::cap_delete(cap);
+            None
+        }
+        (None, _) => None,
     }
-    reply.caps().first().copied()
+}
+
+/// Region ids [`release_regions`] sends per `RELEASE_MEMORY_CAPS`: a count
+/// word and as many ids as the message's other data words hold.
+const RELEASE_BATCH: usize = MSG_DATA_WORDS_MAX - 1;
+
+/// Region ids queued for [`release_regions`], sent a full batch at a time
+/// from a stack array, so a release under memory pressure allocates nothing.
+struct ReleaseBatch
+{
+    memmgr_ep: u64,
+    ids: [u64; RELEASE_BATCH],
+    len: usize,
+    /// Pages memmgr took back.
+    released: usize,
+}
+
+impl ReleaseBatch
+{
+    fn new(memmgr_ep: u64) -> Self
+    {
+        Self {
+            memmgr_ep,
+            ids: [0; RELEASE_BATCH],
+            len: 0,
+            released: 0,
+        }
+    }
+
+    fn push(&mut self, region_id: u64, ipc_buf: *mut u64)
+    {
+        if let Some(entry) = self.ids.get_mut(self.len)
+        {
+            *entry = region_id;
+            self.len = self.len.saturating_add(1);
+        }
+        if self.len == RELEASE_BATCH
+        {
+            self.flush(ipc_buf);
+        }
+    }
+
+    fn flush(&mut self, ipc_buf: *mut u64)
+    {
+        let ids = self.ids.get(..self.len).unwrap_or_default();
+        if !ids.is_empty() && release_regions(self.memmgr_ep, ids, ipc_buf)
+        {
+            self.released = self.released.saturating_add(ids.len());
+        }
+        self.len = 0;
+    }
+
+    /// Send what is queued; returns how many pages memmgr took back.
+    fn finish(mut self, ipc_buf: *mut u64) -> usize
+    {
+        self.flush(ipc_buf);
+        self.released
+    }
+}
+
+/// Give memmgr back the pages of `ids`, at most [`RELEASE_BATCH`] region
+/// ids, whose caps the cache has already unmapped and deleted. Returns
+/// whether memmgr took them. A refused or failed release is logged: the
+/// pages stay charged to the fs, unreachable from it, until it exits.
+fn release_regions(memmgr_ep: u64, ids: &[u64], ipc_buf: *mut u64) -> bool
+{
+    let mut req = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS).word(0, ids.len() as u64);
+    for (i, &id) in ids.iter().enumerate()
+    {
+        req = req.word(i.saturating_add(1), id);
+    }
+    let req = req.build();
+    loop
+    {
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+        match unsafe { ipc::ipc_call(memmgr_ep, &req, ipc_buf) }
+        {
+            Ok(reply) if reply.label == memmgr_errors::SUCCESS => return true,
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            Ok(_) | Err(_) =>
+            {
+                std::os::seraph::log!(warn: "cache: memmgr refused {} released pages", ids.len());
+                return false;
+            }
+        }
+    }
 }

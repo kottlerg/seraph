@@ -8,6 +8,7 @@
 //! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
 //! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
 //! sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
+//! The device keeps a log of the reads it served ([`RamDisk::take_reads`]).
 //!
 //! The device can also go away: a request carrying [`GONE_BADGE`] revokes
 //! every capability derived from the block endpoint, fatfs's among them, and
@@ -103,6 +104,9 @@ pub struct RamDisk
     /// Every read and write is answered `DEVICE_STATUS_IOERR` and moves no
     /// sector.
     failing: bool,
+    /// `(first sector, sectors)` of every read served since the last
+    /// [`RamDisk::take_reads`].
+    reads: Vec<(usize, usize)>,
 }
 
 /// The disk the phase and the block server thread share.
@@ -148,6 +152,7 @@ impl RamDisk
             sectors: BTreeMap::from([(0, Box::new(boot)), (FAT_LBA, Box::new(fat))]),
             rules: Vec::new(),
             failing: false,
+            reads: Vec::new(),
         }))
     }
 
@@ -227,6 +232,13 @@ impl RamDisk
     pub fn serve_all(&mut self)
     {
         self.failing = false;
+    }
+
+    /// `(first sector, sectors)` of every read the device served since the
+    /// last call, in order, emptying the log.
+    pub fn take_reads(&mut self) -> Vec<(usize, usize)>
+    {
+        core::mem::take(&mut self.reads)
     }
 
     /// The fault that fires on a request starting at `lba`, counting the
@@ -402,6 +414,10 @@ fn transfer(
     if let Err(e) = unsafe { std::os::seraph::mem_map_funded(cap, aspace, va, 0, 1, prot) }
     {
         return map_refusal_label(e);
+    }
+    if direction == Direction::Read
+    {
+        disk.reads.push((lba, count));
     }
     for i in 0..count
     {

@@ -23,25 +23,22 @@ Label numbers, error codes, and query states are defined in
 [`shared/ipc/src/lib.rs`](../../../shared/ipc/src/lib.rs) (`procmgr_labels`,
 `procmgr_errors`, `procmgr_process_state`).
 
-`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, and
-`CONFIGURE_NAMESPACE` are sent on a **process handle** (the badged endpoint a
-create call returns), and `RELEASE_HOLD` on a **release token** (the third cap
-a `CREATE_DMA_HOLD` create returns); procmgr identifies the target process by
-the badge `ipc_recv` delivers. A process handle is badged with the child's
-process badge and `procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of
-`ipc::VERB_BIT_MASK`, which no process badge carries), which tells it from the
-child's own procmgr cap (`ProcessInfo.procmgr_endpoint_cap`), badged with the
-process badge alone. procmgr clears the tag before it serves a request, so a
-handle names its child to every label, and refuses `DECLARE_NO_DEBUG` and
-`REGISTER_THREAD`, which name their sender, on a badge carrying it with
-`INVALID_BADGE`, deleting the caps the request carried: only the child itself
-sends them (§ Label 21, § Label 22). Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
-§ `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
-§ `QUERY_LIVE_PROCESSES` below, and labels 19–24 in § Crash Endpoint and Debug Authority.
-Labels 4–7 and 10
-are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
-other unknown opcode, and deletes the caps such a request carried (see
-§ Capability Transfer).
+`START_PROCESS`, `DESTROY_PROCESS`, `QUERY_PROCESS`, `CONFIGURE_PIPE`, `CONFIGURE_NAMESPACE`, and
+`BIND_DEATH_OBSERVER` are sent on a **process handle** (the badged endpoint a create call returns),
+and `RELEASE_HOLD` on a **release token** (the third cap a `CREATE_DMA_HOLD` create returns);
+procmgr identifies the target process by the badge `ipc_recv` delivers. A process handle is badged
+with the child's process badge and `procmgr_labels::PROCESS_HANDLE_TAG` (bit 59, a bit of
+`ipc::VERB_BIT_MASK`, which no process badge carries), which tells it from the child's own procmgr
+cap (`ProcessInfo.procmgr_endpoint_cap`), badged with the process badge alone. procmgr clears the
+tag before it serves a request, so a handle names its child to every label, and refuses
+`DECLARE_NO_DEBUG` and `REGISTER_THREAD`, which name their sender, on a badge carrying it with
+`INVALID_BADGE`, deleting the caps the request carried: only the child itself sends them
+(§ Label 21, § Label 22). `BIND_DEATH_OBSERVER` is served on a process handle only (§ Label 25).
+Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`,
+§ `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24
+in § Crash Endpoint and Debug Authority, and label 25 in § Label 25: `BIND_DEATH_OBSERVER`.
+Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
+other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
 
 Memory-cap allocation is owned by memmgr, not procmgr, per
 [docs/process-lifecycle.md](../../../docs/process-lifecycle.md)
@@ -517,6 +514,48 @@ included, as for `CREATE_PROCESS`.
 | 12 | `INSUFFICIENT_RIGHTS` | Rights derivation failed during segment load |
 | 14 | `ARGV_ENV_STILL_MAPPED` | As for `CREATE_PROCESS` (§ Label 1, **argv and env**) |
 
+### Label 25: `BIND_DEATH_OBSERVER`
+
+Bind the caller's event queue as a terminal-fault death observer on the address space of the child a
+process handle names, so the creator sees the first terminal fault in any of the child's threads,
+not only in the main thread its `Thread` cap observes. procmgr keeps the address space's `Control`
+right, which binding such an observer needs
+([docs/capability-model.md](../../../docs/capability-model.md#address-space) § Address Space), and
+makes the bind on the creator's behalf. A creator may send it any number of times while the child
+lives, before or after `START_PROCESS`, each with its own queue and correlator.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| sent on | the child's process handle |
+| data[0] | correlator: the word every post of this observer carries beside the exit reason |
+| cap[0] | a cap on the observing `EventQueue` carrying `POST` |
+
+procmgr binds the queue with `aspace_bind_notification` and deletes its copy of the cap on every
+outcome, as it deletes any further cap. Once bound, the first terminal fault of any thread of the
+child posts the death entry `(fault class, correlator)` to the queue, once: a later fault posts
+nothing ([syscalls.md](../../../core/kernel/docs/syscalls.md) § `SYS_ASPACE_BIND_NOTIFICATION`
+(53)). A child that has already taken a terminal fault posts its retained fault class at once, so a
+bind that follows the fault loses nothing. The binding takes one death-observer node of the queue's
+pool until the child's address space is torn down (none when the bind follows the fault). Only a
+terminal fault posts: an exit (`sys_thread_exit`, `sys_process_exit`) posts only to the exiting
+thread's observers, and a teardown (`DESTROY_PROCESS`, or procmgr's reap) posts to neither
+([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) § Exit reason). A fault
+of the main thread that is its address space's first terminal fault posts both to this observer
+and to the main thread's observers; a later one posts only to the main thread's observers.
+
+**Reply:** label 0 (success), or an error code.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 2 | `OUT_OF_MEMORY` | The queue has no free death-observer node |
+| 4 | `INVALID_BADGE` | The handle names no live process: it was torn down, or never created |
+| 7 | `INVALID_ARGUMENT` | No cap, or a cap that is not an `EventQueue` cap carrying `POST` |
+| 13 | `UNAUTHORIZED` | Not sent on a process handle: the child's own procmgr cap, or any other badge |
+
 ---
 
 ## Capability Transfer
@@ -546,7 +585,9 @@ On a create reply, procmgr transfers a badged process handle endpoint (for
 subsequent per-process operations), a derived copy of the child's `Thread`
 capability (Control, Observe, and Upcall rights, `RIGHTS_THREAD`), and, for a
 `CREATE_DMA_HOLD` child, its release token to the caller. procmgr retains the
-original caps for process lifecycle management.
+original caps for process lifecycle management, and hands out no cap on the
+child's address space: a creator observes its terminal faults through
+`BIND_DEATH_OBSERVER` (§ Label 25).
 
 ---
 

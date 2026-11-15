@@ -1475,21 +1475,23 @@ fn query_widths(client: &IommuClient, units: usize) -> Vec<u8>
 }
 
 /// Create the IOMMU driver's service endpoint and the client devmgr calls it
-/// through, and start the thread that watches for the driver's death: it
-/// waits on an event queue of its own, to which the driver's spawn binds a
-/// second death observer, and fails the client at once on a death post, so
-/// the failure never waits on devmgr's control thread, which may itself be
-/// blocked in a call to the dead driver (directly, or through a read whose
+/// through, and start the thread that watches for the driver's death: it waits on
+/// an event queue of its own, to which the driver's spawn binds its second pair
+/// of death observers (`settle::OBSERVERS_PER_DRIVER`; the queue holds their two
+/// posts and the ending post), and fails the client at once on the first death
+/// post, so the failure never waits on devmgr's control thread, which may itself
+/// be blocked in a call to the dead driver (directly, or through a read whose
 /// buffer the DMA thread is mapping). A post with tag 0, which no death post
 /// carries (the correlator is a nonzero device badge), only ends the thread.
-/// `None`, logged, when the endpoint, the queue, or the thread cannot be
-/// created.
+/// `None`, logged, when the endpoint, the queue, or the thread cannot be created.
 fn start_death_watch() -> Option<(Arc<IommuClient>, u64)>
 {
+    // Two death posts and the ending post; one node per observer.
+    const OBSERVERS: u32 = crate::settle::OBSERVERS_PER_DRIVER;
     let ep = crate::create_service_endpoint()?;
     let eq = std::os::seraph::object_slab_retype(
-        std::os::seraph::event_queue_retype_bytes(2, 1),
-        |slab| syscall::event_queue_create_observed(slab, 2, 1).ok(),
+        std::os::seraph::event_queue_retype_bytes(u64::from(OBSERVERS + 1), u64::from(OBSERVERS)),
+        |slab| syscall::event_queue_create_observed(slab, OBSERVERS + 1, OBSERVERS).ok(),
     );
     let Some(eq) = eq
     else

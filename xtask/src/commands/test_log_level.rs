@@ -181,6 +181,7 @@ fn run_args(args: &TestLogLevelArgs, dir: &Path, data_image: Option<PathBuf>) ->
         riscv_mmu: crate::qemu::RiscvMmu::Sv48,
         riscv_zkr: crate::qemu::RiscvZkr::On,
         x86_paging: crate::qemu::X86Paging::Four,
+        x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
         iommu: crate::qemu::Iommu::Attached,
         debug_port: None,
         debug_target: None,

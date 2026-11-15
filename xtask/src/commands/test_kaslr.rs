@@ -109,6 +109,7 @@ impl Guest
             riscv_mmu: args.riscv_mmu,
             riscv_zkr: crate::qemu::RiscvZkr::On,
             x86_paging: args.x86_paging,
+            x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,

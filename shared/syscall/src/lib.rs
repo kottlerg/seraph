@@ -674,8 +674,9 @@ pub fn raw_cap_create_cspace(
 ///
 /// `memory_cap` must carry `MemRights::RETYPE` and have at least
 /// `SystemInfoType::ThreadRetypeBytes` of `available_bytes` (1 guard page, 4
-/// kstack pages, 1 page for the wrapper and TCB, and the FPU/SIMD/V save-area pages the
-/// boot CPU sizes; see `cap::retype::dispatch_for(Thread)`).
+/// kstack pages, 1 page for the wrapper and TCB, the FPU/SIMD/V save-area pages the
+/// boot CPU sizes, and one shadow-stack page when the kernel runs on shadow stacks; see
+/// `cap::retype::dispatch_for(Thread)`).
 ///
 /// Creation priority: with `sched_cap == 0`, `priority` must also be 0 and
 /// the thread is created at `PRIORITY_MIN` (floor-only creation needs no

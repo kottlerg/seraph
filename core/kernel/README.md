@@ -54,6 +54,7 @@ core/kernel/
 │   │   │   ├── console.rs      # Early serial (COM1 16550, I/O-port) output
 │   │   │   ├── entropy.rs      # Hardware RNG (RDSEED/RDRAND) + cycle counter
 │   │   │   ├── speculation.rs  # Bound mask (cmp/sbb), opaque identity, enumeration
+│   │   │   ├── shadow_stack.rs # CET supervisor shadow stacks: decision, tokens, pages, enable
 │   │   │   └── vulnerability.rs # Transient-execution table (CPUID, ARCH_CAPABILITIES); host-tested
 │   │   └── riscv64/            # RISC-V implementation
 │   │       ├── mod.rs
@@ -75,6 +76,7 @@ core/kernel/
 │   │       ├── platform.rs     # Bootloader-discovered hardware accessors
 │   │       ├── console.rs      # Early serial (ns16550 MMIO UART) output
 │   │       ├── entropy.rs      # Zkr seed CSR hardware RNG; cycle counter for jitter
+│   │       ├── shadow_stack.rs # Kernel shadow stacks: off (Zicfiss not yet built)
 │   │       └── speculation.rs  # Bound mask (sltu/neg), opaque identity, no-op enumeration
 │   ├── mm/                     # Memory management subsystem
 │   │   ├── mod.rs
@@ -168,8 +170,9 @@ in [`docs/arch-interface.md`](docs/arch-interface.md). No code outside `arch/` c
 and re-exported from `arch/mod.rs` as a unified interface. On x86-64,
 `arch/x86_64/vulnerability.rs` derives at boot the CPU's exposure to each transient-execution
 class and logs it; see [`docs/transient-execution.md`](docs/transient-execution.md).
-Hardware shadow stacks for the kernel's return addresses (Zicfiss on riscv64, CET SHSTK on
-x86-64, each used where the hardware has it) are design intent, not yet implemented; see
+Hardware shadow stacks protect the kernel's return addresses where the hardware has them:
+CET SHSTK on x86-64 (`arch/x86_64/shadow_stack.rs`), implemented; Zicfiss on riscv64, design
+intent, not yet implemented; see
 [`docs/return-address-integrity.md`](docs/return-address-integrity.md).
 
 ### `mm/`

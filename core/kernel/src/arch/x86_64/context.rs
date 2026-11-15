@@ -9,7 +9,8 @@
 //! `new_state` constructs the initial state for a new thread.
 //!
 //! `switch` saves the current thread's callee-saved registers to `*current`
-//! and restores them from `*next`, then jumps to `next.rip`.
+//! and restores them from `*next`, then jumps to `next.rip`; with shadow
+//! stacks on it switches the shadow stack too and returns to `next.rip`.
 //!
 //! `return_to_user` builds an `iretq` frame from a [`TrapFrame`] on the
 //! current kernel stack and transitions to ring-3 user mode.
@@ -26,18 +27,22 @@ use crate::arch::ThreadKind;
 ///
 /// ## Field offsets (used by assembly in `switch`)
 ///
-/// | Offset | Field   |
-/// |--------|---------|
-/// |  0     | rip     |
-/// |  8     | rsp     |
-/// | 16     | rbx     |
-/// | 24     | rbp     |
-/// | 32     | r12     |
-/// | 40     | r13     |
-/// | 48     | r14     |
-/// | 56     | r15     |
-/// | 64     | fs_base |
-/// | 72     | rflags  |
+/// | Offset | Field       |
+/// |--------|-------------|
+/// |  0     | `rip`       |
+/// |  8     | `rsp`       |
+/// | 16     | `rbx`       |
+/// | 24     | `rbp`       |
+/// | 32     | `r12`       |
+/// | 40     | `r13`       |
+/// | 48     | `r14`       |
+/// | 56     | `r15`       |
+/// | 64     | `fs_base`   |
+/// | 72     | `rflags`    |
+/// | 80     | `ssp`       |
+/// | 88     | `ssp_token` |
+///
+/// The offsets are checked at compile time below the struct.
 #[derive(Debug, Default, Clone, Copy)]
 #[repr(C)]
 pub struct SavedState
@@ -57,7 +62,32 @@ pub struct SavedState
     pub fs_base: u64,
     /// RFLAGS at the moment of the switch.
     pub rflags: u64,
+    /// With shadow stacks on (`shadow_stack::enabled`), the address of the
+    /// restore token `switch` restores the thread's shadow stack from: one
+    /// word below the shadow-stack pointer of its last switch-out, or the
+    /// token of its fresh stack (`shadow_stack::fresh_words`). 0 otherwise.
+    pub ssp: u64,
+    /// With shadow stacks on, the address of the thread's supervisor token,
+    /// which `switch` loads into `IA32_PL0_SSP`. 0 otherwise.
+    pub ssp_token: u64,
 }
+
+// The offsets `switch` addresses the fields at.
+const _: () = {
+    use core::mem::offset_of;
+    assert!(offset_of!(SavedState, rip) == 0);
+    assert!(offset_of!(SavedState, rsp) == 8);
+    assert!(offset_of!(SavedState, rbx) == 16);
+    assert!(offset_of!(SavedState, rbp) == 24);
+    assert!(offset_of!(SavedState, r12) == 32);
+    assert!(offset_of!(SavedState, r13) == 40);
+    assert!(offset_of!(SavedState, r14) == 48);
+    assert!(offset_of!(SavedState, r15) == 56);
+    assert!(offset_of!(SavedState, fs_base) == 64);
+    assert!(offset_of!(SavedState, rflags) == 72);
+    assert!(offset_of!(SavedState, ssp) == 80);
+    assert!(offset_of!(SavedState, ssp_token) == 88);
+};
 
 impl SavedState
 {
@@ -99,6 +129,24 @@ pub fn seed_tls_base(saved: &mut SavedState, tls_base: u64)
 /// floor its trap entry checks).
 #[inline]
 pub fn set_stack_floor(_saved: &mut SavedState, _floor: u64) {}
+
+/// Record a new thread's fresh shadow stack (`shadow_stack::init_stack`),
+/// which `switch` enters on the thread's first switch-in.
+#[inline]
+pub fn set_shadow_stack(saved: &mut SavedState, stack: super::shadow_stack::ShadowStack)
+{
+    saved.ssp = stack.ssp;
+    saved.ssp_token = stack.token;
+}
+
+/// The thread's supervisor shadow-stack token, for a first run that is not a
+/// switch-in (`sched::enter`, `shadow_stack::load_thread_token`); 0 with
+/// shadow stacks off.
+#[inline]
+pub fn shadow_stack_token(saved: &SavedState) -> u64
+{
+    saved.ssp_token
+}
 
 /// Round a user-supplied stack pointer to the ABI alignment expected at an
 /// `extern "C"` entry point. On x86-64 `SysV`, `rsp` ≡ 8 (mod 16) at function
@@ -149,6 +197,14 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> Save
 ///
 /// For a thread's first run, `next.rip` is its entry function; for a resumed
 /// thread, `next.rip` is the return address of the previous `switch` call.
+///
+/// With shadow stacks on (`shadow_stack::enabled`), `switch` also moves the
+/// shadow-stack pointer to next's shadow stack through the restore token
+/// `next.ssp` names, leaves a restore token on the outgoing one and records
+/// it in `current.ssp`, loads `IA32_PL0_SSP` with `next.ssp_token`, and
+/// resumes by `ret`, so the shadow stack checks `next.rip`
+/// (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism). When
+/// `current` and `next` are the same thread, the shadow stack stays as it is.
 ///
 /// # Safety
 /// Both pointers must be valid, aligned `SavedState` values. The caller
@@ -201,6 +257,34 @@ pub unsafe extern "C" fn switch(
         "shl rdx, 32",
         "or  rax, rdx",
         "mov [rdi + 64], rax", // saved_state.fs_base
+        // ── Shadow stack (only while shadow stacks are on) ────────────────
+        // SSP names the shadow copy of the return address popped above. Save
+        // the word below it, where `saveprevssp` leaves the outgoing stack's
+        // restore token; move SSP to next's stack through the restore token
+        // its `ssp` names (`rstorssp` faults when there is none); and point
+        // IA32_PL0_SSP at next's supervisor token. Both tokens are written
+        // before the `context_saved` publication below, so a CPU that resumes
+        // the outgoing thread finds its restore token. A switch to the running
+        // thread itself (`schedule` falls back from idle to idle) keeps the
+        // shadow stack as it is: no restore token lies below its SSP yet, so
+        // `rstorssp` would fault, and the `ret` below checks the shadow copy
+        // its own call of `switch` pushed.
+        "cmp byte ptr [rip + {shadow}], 0",
+        "je 2f",
+        "cmp rdi, rsi",
+        "je 2f",
+        "rdsspq rax",
+        "sub rax, 8",
+        "mov [rdi + 80], rax", // saved_state.ssp
+        "mov rax, [rsi + 80]",
+        "rstorssp [rax]",
+        "saveprevssp",
+        "mov rax, [rsi + 88]", // next.ssp_token
+        "mov rdx, rax",
+        "shr rdx, 32",
+        "mov ecx, {pl0_ssp}",
+        "wrmsr",
+        "2:",
         // ── Restore next thread ───────────────────────────────────────────
         // #117 ordering invariant: the `context_saved = 1` publication and `popfq` MUST
         // both stay below the rsp swap (`mov rsp, [rsi + 8]`); see
@@ -227,13 +311,24 @@ pub unsafe extern "C" fn switch(
         "mov dword ptr [r11], 1", // *save_flag = 1
         "1:",
         // Restore rflags (may re-enable IF). Doing this AFTER the rsp
-        // swap means an interrupt taken between popfq and `jmp rax`
-        // pushes its iretq frame to next's kstack, not the outgoing one.
+        // swap means an interrupt taken between popfq and the jump pushes
+        // its iretq frame to next's kstack, not the outgoing one.
         "mov rax, [rsi + 72]",
         "push rax",
+        "mov rax, [rsi + 0]", // rip (resume address)
+        "cmp byte ptr [rip + {shadow}], 0",
+        "je 3f",
+        // With shadow stacks on, resume by `ret`: the top of next's shadow
+        // stack holds the same address (its last call of `switch`, or the
+        // entry a fresh stack holds), and a mismatch raises #CP.
         "popfq",
-        "mov rax, [rsi + 0]", // rip (jump target)
-        "jmp rax",            // jump to next thread's rip
+        "push rax",
+        "ret",
+        "3:",
+        "popfq",
+        "jmp rax", // jump to next thread's rip
+        shadow = sym super::shadow_stack::ENABLED,
+        pl0_ssp = const super::shadow_stack::IA32_PL0_SSP,
     );
 }
 

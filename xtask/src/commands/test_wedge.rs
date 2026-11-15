@@ -29,17 +29,12 @@
 //! the default boot set (`terminal.svc` autostarted), idle once the terminal
 //! prints its READY marker. A gdbstub that cannot be reached fails the test.
 
-use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use gdb_rsp::PACKET_SIZE;
-use gdb_rsp::frame::{Event, PacketReader, PacketWriter};
 use object::{Object as _, ObjectSymbol as _, SymbolKind};
 
 use crate::arch::Arch;
@@ -48,9 +43,10 @@ use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, build_qemu_argv,
-    prepare_riscv_firmware, validate_sysroot_for_launch,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    build_qemu_argv, prepare_riscv_firmware, validate_sysroot_for_launch,
 };
+use crate::qemu_gdb::{Span, Stub, field_hex, function_path, le_hex};
 use crate::util::{require_tool, step};
 
 /// Marker the guest `terminal` prints once the default boot is up. Kept in
@@ -100,30 +96,6 @@ enum Victim
     Ap,
     /// The BSP, reported by an AP.
     Bsp,
-}
-
-/// A half-open address range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Span
-{
-    start: u64,
-    end: u64,
-}
-
-impl Span
-{
-    fn contains(self, addr: u64) -> bool
-    {
-        (self.start..self.end).contains(&addr)
-    }
-
-    fn slid(self, slide: u64) -> Self
-    {
-        Self {
-            start: self.start.wrapping_add(slide),
-            end: self.end.wrapping_add(slide),
-        }
-    }
 }
 
 /// The kernel functions the test needs, at their link addresses.
@@ -205,6 +177,7 @@ fn boot_once(ctx: &Context, args: &TestWedgeArgs, image: &Image, victim: Victim)
         riscv_mmu: RiscvMmu::Sv48,
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
+        x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: false,
@@ -279,7 +252,7 @@ fn wedge(sock: &Path, arch: Arch, hw_id: u32, image: &Image, slide: u64) -> Resu
     for _ in 0..MOVE_ATTEMPTS
     {
         // Connecting stops the VM; detaching resumes it.
-        let mut stub = Stub::connect(sock)?;
+        let mut stub = Stub::connect(sock, ANSWER_TIMEOUT)?;
         stub.request(b"?")?;
         stub.expect_ok(format!("Hg{thread_id:x}").as_bytes())?;
         // Reading the whole register block has QEMU fetch the CPU's state from
@@ -454,16 +427,6 @@ fn parse_boot(lines: &[String]) -> Result<Boot>
     Ok(Boot { slide, cpus })
 }
 
-/// The hexadecimal number after `key` in `line` (`0x` prefix optional), up
-/// to whitespace or a closing parenthesis.
-fn field_hex(line: &str, key: &str) -> Option<u64>
-{
-    let (_, rest) = line.split_once(key)?;
-    let digits = rest.split(|c: char| c.is_whitespace() || c == ')').next()?;
-    let digits = digits.strip_prefix("0x").unwrap_or(digits);
-    u64::from_str_radix(digits, 16).ok()
-}
-
 /// Find `halt_loop` and the idle loop in the kernel's symbol table.
 fn image_spans(data: &[u8]) -> Result<Image>
 {
@@ -512,152 +475,6 @@ fn image_spans(data: &[u8]) -> Result<Image>
     Ok(Image { halt_loop, idle })
 }
 
-/// A demangled symbol name without the legacy mangling's `::h<16 hex>` hash.
-fn function_path(name: &str) -> &str
-{
-    match name.rsplit_once("::h")
-    {
-        Some((path, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
-        {
-            path
-        }
-        _ => name,
-    }
-}
-
-/// `value` as GDB register bytes: little-endian, two hex digits a byte.
-fn le_hex(value: u64) -> String
-{
-    let mut hex = String::with_capacity(16);
-    for b in value.to_le_bytes()
-    {
-        // Writing to a String cannot fail.
-        let _ = write!(hex, "{b:02x}");
-    }
-    hex
-}
-
-/// Bytes from GDB hex digits.
-fn from_hex(hex: &[u8]) -> Result<Vec<u8>>
-{
-    if hex.len() % 2 != 0
-    {
-        bail!("odd hex length {}", hex.len());
-    }
-    hex.chunks(2)
-        .map(|pair| {
-            let digits = std::str::from_utf8(pair).context("non-ASCII hex")?;
-            u8::from_str_radix(digits, 16).with_context(|| format!("bad hex `{digits}`"))
-        })
-        .collect()
-}
-
-/// A little-endian 64-bit value from a register reply.
-fn le_u64(hex: &[u8]) -> Result<u64>
-{
-    let bytes = from_hex(hex)?;
-    let array: [u8; 8] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("a {}-byte register, not 8", bytes.len()))?;
-    Ok(u64::from_le_bytes(array))
-}
-
-/// QEMU's gdbstub over its unix socket, in the protocol's acknowledged mode.
-struct Stub
-{
-    stream: UnixStream,
-    reader: PacketReader<PACKET_SIZE>,
-}
-
-impl Stub
-{
-    fn connect(path: &Path) -> Result<Self>
-    {
-        let stream = UnixStream::connect(path)
-            .with_context(|| format!("connecting to the gdbstub at {}", path.display()))?;
-        stream.set_read_timeout(Some(ANSWER_TIMEOUT))?;
-        Ok(Self {
-            stream,
-            reader: PacketReader::new(),
-        })
-    }
-
-    /// Send `body` and return the reply's body, acknowledging it.
-    fn request(&mut self, body: &[u8]) -> Result<Vec<u8>>
-    {
-        let mut buf = vec![0u8; 2 * PACKET_SIZE];
-        let mut w = PacketWriter::new(&mut buf);
-        w.bytes(body);
-        let len = w
-            .finish()
-            .map_err(|e| anyhow::anyhow!("packet past the buffer: {e:?}"))?;
-        let packet = buf.get(..len).context("packet length past the buffer")?;
-        let what = String::from_utf8_lossy(body).into_owned();
-        self.stream
-            .write_all(packet)
-            .with_context(|| format!("sending `{what}`"))?;
-        let mut byte = [0u8; 1];
-        loop
-        {
-            let n = self
-                .stream
-                .read(&mut byte)
-                .with_context(|| format!("reading the reply to `{what}`"))?;
-            if n == 0
-            {
-                bail!("the gdbstub closed the connection before replying to `{what}`");
-            }
-            match self.reader.push(byte[0])
-            {
-                None | Some(Event::Ack) =>
-                {}
-                Some(Event::Nack) => self.stream.write_all(packet)?,
-                Some(Event::Packet(reply)) =>
-                {
-                    let reply = reply.to_vec();
-                    self.stream.write_all(b"+")?;
-                    if reply.first() == Some(&b'E') && reply.len() == 3
-                    {
-                        bail!(
-                            "the gdbstub refused `{what}`: {}",
-                            String::from_utf8_lossy(&reply)
-                        );
-                    }
-                    return Ok(reply);
-                }
-                Some(other) => bail!("unexpected {other:?} replying to `{what}`"),
-            }
-        }
-    }
-
-    fn expect_ok(&mut self, body: &[u8]) -> Result<()>
-    {
-        let reply = self.request(body)?;
-        if reply != b"OK"
-        {
-            bail!(
-                "`{}` answered {:?}, not OK",
-                String::from_utf8_lossy(body),
-                String::from_utf8_lossy(&reply)
-            );
-        }
-        Ok(())
-    }
-
-    fn read_register(&mut self, regnum: usize) -> Result<u64>
-    {
-        let reply = self.request(format!("p{regnum:x}").as_bytes())?;
-        le_u64(&reply).with_context(|| format!("register {regnum}"))
-    }
-
-    fn read_memory(&mut self, addr: u64, len: usize) -> Result<Vec<u8>>
-    {
-        let reply = self.request(format!("m{addr:x},{len:x}").as_bytes())?;
-        from_hex(&reply).with_context(|| format!("memory at {addr:#x}"))
-    }
-}
-
 #[cfg(test)]
 mod tests
 {
@@ -692,40 +509,6 @@ terminal: READY for injection";
         ))
         .unwrap_err();
         parse_boot(&lines("kaslr: slide=0x0 image_base=0x0")).unwrap_err();
-    }
-
-    #[test]
-    fn register_values_round_trip_little_endian()
-    {
-        let v = 0xffff_ffff_8012_3456;
-        assert_eq!(le_hex(v), "56341280ffffffff");
-        assert_eq!(le_u64(le_hex(v).as_bytes()).unwrap(), v);
-        le_u64(b"5634").unwrap_err();
-        le_u64(b"zz34128000000000").unwrap_err();
-        assert_eq!(from_hex(b"f4").unwrap(), [0xF4]);
-        from_hex(b"f").unwrap_err();
-    }
-
-    #[test]
-    fn the_legacy_hash_is_stripped_from_a_symbol()
-    {
-        assert_eq!(
-            function_path("kernel::arch::x86_64::cpu::halt_loop::h0123456789abcdef"),
-            "kernel::arch::x86_64::cpu::halt_loop"
-        );
-        assert_eq!(
-            function_path("kernel::sched::helper"),
-            "kernel::sched::helper"
-        );
-        assert_eq!(function_path("a::hxyz"), "a::hxyz");
-    }
-
-    #[test]
-    fn a_mangled_symbol_is_matched_by_its_path()
-    {
-        let name =
-            crate::symbolize::demangle("_ZN6kernel4arch6x86_643cpu9halt_loop17h0123456789abcdefE");
-        assert!(function_path(&name).ends_with("::cpu::halt_loop"), "{name}");
     }
 
     fn image() -> Image

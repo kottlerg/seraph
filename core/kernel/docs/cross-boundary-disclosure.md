@@ -65,7 +65,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `CAP_INFO_IRQ_REMAP_HANDLES` → the count of remapping handles the boot's CPUs use (`min(cpu_count, 302) * 217`); x86-64 only | `cap::sys_cap_info`, `arch::x86_64::interrupts::remap_handles` | d |
 | `SYS_SYSTEM_INFO` (kernel and boot-protocol versions, cpu count, page size, elapsed µs, current cpu, user-half top) | `sysinfo::sys_system_info` | c/d |
 | `SYS_SYSTEM_INFO(StackHighWater)` → the deepest use, in bytes, of the idle, thread, or handoff kernel stacks; readable by any process with no capability, and the thread class is a system-wide maximum over every freed thread, other processes' included | `sysinfo::sys_system_info`, `stack_depth::high_water` | d |
-| `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, and the extended-state save area, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
+| `SYS_SYSTEM_INFO(ThreadRetypeBytes)` → the bytes one Thread retype debits: the guard page, the kernel stack, the TCB page, the extended-state save area, and with shadow stacks on a shadow-stack page, whose page count the boot CPU's XSAVE size (CPUID leaf 0xD) or `vlenb` sets; a page-granular count that names no kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `sched::thread_slot::thread_slot_bytes` | d |
 | `SYS_SYSTEM_INFO(LiveCSpaceCount)` → the number of `CSpace` registry ids in use system-wide, every process's `CSpace`s included; a count that names no id, epoch, or kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `cap::live_cspace_count` | d |
 | `SYS_SYSTEM_INFO(InstructionCacheSyncs)` → the number of instruction-fetch synchronisations since boot, counted per call, every process's executable maps, protects to executable, and thread-memory writes included; a count that names no address, readable by any process with no capability | `sysinfo::sys_system_info`, `mm::icache::sync_count` | d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page, to a holder of `AsRights::READ`, which init's kernel-created address space and an address space retyped from a `PHYS` source alone carry | `sysinfo::sys_aspace_query`, `AddressSpace::query_page`, `cap::sys_cap_create_aspace` | **e** |
@@ -273,8 +273,8 @@ them (each a page of leaf or directory-page pointers), page tables, page-pool re
 record holds a raw `KernelObjectHeader` pointer to its donation's ancestor;
 see [capability-internals.md](capability-internals.md) § Page Pools), thread
 slabs (the kernel stack with its saved kernel pointers and return addresses,
-the TCB, and the extended-state save area), and the sub-page bodies of
-endpoints, notifications, wait sets, and event queues (which hold TCB and
+the TCB, the extended-state save area, and with shadow stacks on a shadow-stack page), and the
+sub-page bodies of endpoints, notifications, wait sets, and event queues (which hold TCB and
 source-object pointers) — plus the retype allocator's free-list links (offsets
 into the region, not addresses). The donating capability cannot map what it
 has retyped away while the object lives (after its death, see the clear at the end of this
@@ -390,13 +390,13 @@ objects by kind, printing no pointer; the bootloader's console (which also mirro
 framebuffer) prints only the opaque `kaslr_flags`. Paths that end in `fatal`, which halts only the
 faulting CPU (so on SMP the rest of the system, userspace included, keeps running), print an
 address-free header via `kprintln!` and every value that can be a kernel VA via `kprintln_serial!`:
-the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, and the register file serial-only; the vector,
-error code, `cs`, and `rflags` on the console), the riscv64 `KERNEL STACK OVERFLOW` dump
-(`sepc`, `stval`, `sp`, and `floor` serial-only; the CPU on the console), the riscv64
-`KERNEL EXCEPTION` dump (`sepc`, `stval`, `satp`, and the register file serial-only; `scause`
-and `sstatus` on the console), the
-riscv64 unknown-interrupt path (`sepc` serial-only), and the riscv64 `BUG: ecall return sepc` path
-(`sepc`, `ra`, `sp`, and `a7` serial-only).
+the x86-64 `KERNEL EXCEPTION` dump (`rip`, `cr2`, the register file, and, with `CR4.CET` set,
+the CET registers serial-only; the vector, error code, `cs`, and `rflags` on the console), the
+riscv64 `KERNEL STACK OVERFLOW` dump (`sepc`, `stval`, `sp`, and `floor` serial-only; the CPU on
+the console), the riscv64 `KERNEL EXCEPTION` dump (`sepc`, `stval`, `satp`, and the register file
+serial-only; `scause` and `sstatus` on the console), the riscv64 unknown-interrupt path (`sepc`
+serial-only), and the riscv64 `BUG: ecall return sepc` path (`sepc`, `ra`, `sp`, and `a7`
+serial-only).
 
 ## Maintaining this inventory
 

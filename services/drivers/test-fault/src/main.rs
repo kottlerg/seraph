@@ -17,7 +17,8 @@
 //! - a function with no BAR 2 reports `DRIVER_READY` and serves `FAULT_PING`
 //!   and `FAULT_EXIT`; `FAULT_EXIT` replies and then exits without receiving
 //!   again, so a call queued after it reaches a dead driver, which devmgr
-//!   withdraws;
+//!   withdraws; `FAULT_WORKER` replies, then receives nothing more and starts
+//!   a thread that faults, the death of a driver by a worker thread's fault;
 //! - a function whose BAR 2 is `HANG_BAR_BYTES` long takes the whole list,
 //!   then holds `HOLD_BYTES` of touched memory and neither reports ready nor
 //!   exits, so devmgr's settle ends at its bound and destroys it;
@@ -205,10 +206,9 @@ fn serve(service_ep: u64, ipc_buf: *mut u64) -> !
         }
         let reply = match msg.label
         {
-            test_fault_labels::FAULT_PING | test_fault_labels::FAULT_EXIT =>
-            {
-                IpcMessage::new(ipc::devmgr_errors::SUCCESS)
-            }
+            test_fault_labels::FAULT_PING
+            | test_fault_labels::FAULT_EXIT
+            | test_fault_labels::FAULT_WORKER => IpcMessage::new(ipc::devmgr_errors::SUCCESS),
             _ => IpcMessage::new(ipc::devmgr_errors::UNKNOWN_OPCODE),
         };
         // SAFETY: ipc_buf is the registered IPC buffer page.
@@ -219,5 +219,37 @@ fn serve(service_ep: u64, ipc_buf: *mut u64) -> !
             std::os::seraph::log!("test-fault: exiting on FAULT_EXIT");
             syscall::thread_exit();
         }
+        if msg.label == test_fault_labels::FAULT_WORKER
+        {
+            fault_worker();
+        }
+    }
+}
+
+/// Start a thread that takes a terminal fault after
+/// [`test_fault_labels::FAULT_EXIT_DELAY_MS`], and park the main thread
+/// without receiving again: only the worker's fault ends the process, through
+/// procmgr's teardown, which posts no death for the main thread.
+fn fault_worker() -> !
+{
+    let spawned = std::thread::Builder::new()
+        .name("test-fault-worker".into())
+        .spawn(|| {
+            let _ = syscall::thread_sleep(test_fault_labels::FAULT_EXIT_DELAY_MS);
+            std::os::seraph::log!("test-fault: worker thread faulting on FAULT_WORKER");
+            // SAFETY: deliberately invalid: the null write faults, and no
+            // handler maps the null page, so the fault is terminal.
+            unsafe {
+                core::ptr::write_volatile(core::ptr::null_mut::<u8>(), 0x42);
+            }
+        });
+    if spawned.is_err()
+    {
+        std::os::seraph::log!("test-fault: FAULT_WORKER thread not started; exiting");
+        syscall::thread_exit();
+    }
+    loop
+    {
+        let _ = syscall::thread_sleep(u64::from(u32::MAX));
     }
 }

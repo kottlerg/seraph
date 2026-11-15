@@ -40,7 +40,7 @@ use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::QemuDisplay;
 use crate::qemu::{
-    GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, build_qemu_argv,
+    GdbMode, Iommu, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack, build_qemu_argv,
     validate_sysroot_for_launch,
 };
 use crate::qmp;
@@ -111,6 +111,7 @@ fn launch(
         riscv_mmu: RiscvMmu::Sv48,
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
+        x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: false,

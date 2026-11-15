@@ -1494,7 +1494,8 @@ pub fn dispatch_for(object_type: ObjectType, size_arg: u64) -> Option<DispatchEn
         // the direct map while the thread exists; pages 1..=N are kstack
         // (kstack_top = base + (N+1)*PAGE_SIZE); page N+1 holds wrapper +
         // TCB; pages N+2.. are the save area (XSAVE on x86-64; F/D and V on
-        // RISC-V). `sys_cap_create_thread` and the reclaim arm in
+        // RISC-V), then one shadow-stack page when the kernel runs on shadow
+        // stacks. `sys_cap_create_thread` and the reclaim arm in
         // `dealloc_object_one` read the same size.
         ObjectType::Thread => Some(DispatchEntry {
             raw_bytes: crate::sched::thread_slot::thread_slot_bytes(),

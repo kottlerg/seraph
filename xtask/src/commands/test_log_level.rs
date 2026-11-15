@@ -28,7 +28,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Context as _, Result, bail};
-use regex::Regex;
 
 use crate::bundle::{Harness, compose_with_levels};
 use crate::cli::{
@@ -37,6 +36,7 @@ use crate::cli::{
 };
 use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
+use crate::regex::Regex;
 use crate::util::step;
 
 /// The configuration the test boots: vfsd at debug, every other service at

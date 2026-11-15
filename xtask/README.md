@@ -35,6 +35,7 @@ xtask/
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
+│   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
@@ -550,7 +551,8 @@ each build and clean it runs, which are admitted on their own.
 ### `cargo xtask run-parallel`
 
 Launch N QEMU instances in parallel against an already-built sysroot,
-classifying each run's outcome via user-supplied pass/fail regexes.
+classifying each run's outcome via user-supplied pass/fail patterns, in the syntax of
+§ Pattern syntax.
 Intended for shaking out timing-dependent bugs (races, lost wakeups,
 scheduling order) that single-shot `cargo xtask run` cannot reliably
 expose. Requires a populated sysroot — run `cargo xtask build` first.
@@ -1666,6 +1668,45 @@ The options:
 The load is the host's `getloadavg` (`/proc/loadavg` on Linux); a host that reports none is not
 refused on it. On a GitHub Actions runner (`GITHUB_ACTIONS=true`) the checks are skipped with one
 printed line: each CI job is its own host.
+
+---
+
+## Pattern syntax
+
+Every regular expression xtask matches, those `run-parallel` takes (`--pass`, `--fail`,
+`--fail-also`) and those its checks compile (`commit-check`, `pr-check`, `lint-docs`,
+`ktest-timing`, `test-log-level`, `test-map-redo`), runs on xtask's own engine in `src/regex/`: a
+Pike VM over the syntax below. The match reported is the leftmost-first one: the earliest start,
+and at that start the alternative and the repetition count a backtracking engine would try
+first. A search does at most a constant amount of work per instruction of the compiled pattern
+per character of the text, whatever the two hold, so no text makes a match run long; a pattern
+compiles to at most 10000 instructions (`MAX_INSTS`).
+
+| Construct | Matches |
+|---|---|
+| `x` | The character, for any character but `\ . + * ? ( ) \| [ { ^ $` |
+| `\x` | `x`, for any ASCII punctuation character `x` |
+| `\n`, `\r`, `\t` | Newline, carriage return, tab |
+| `.` | Any character but newline |
+| `[...]`, `[^...]` | One character of the set, or one outside it with `^`: characters, ranges (`a-z`), escapes, and the classes below; `]` first and `-` first or last are members |
+| `\d`, `\w`, `\s` | An ASCII digit; an ASCII letter, digit or `_`; a Unicode `White_Space` character |
+| `\D`, `\W`, `\S` | Any character the lower-case class does not match |
+| `^`, `$` | The start, the end of the text (not of a line) |
+| `\b`, `\B` | A position with a `\w` character on exactly one side; any other position |
+| `a\|b` | `a`, or else `b` |
+| `(...)` | A capture group, numbered from 1 by its `(` |
+| `(?:...)` | A group that captures nothing |
+| `(?i)`, `(?-i)` | From here to the end of the enclosing group, ASCII letters match either case, or only their own |
+| `(?i:...)`, `(?-i:...)` | The same, within the group |
+| `*`, `+`, `?` | 0 or more, 1 or more, 0 or 1 of the preceding item, as many as lead to a match |
+| `{n}`, `{n,}`, `{n,m}` | n, at least n, n to m of the preceding item (n and m at most 1000), as many as lead to a match |
+| `*?`, `+?`, `??`, `{n,}?`, `{n,m}?` | The same, as few as lead to a match |
+
+Anything else is refused with its reason and its byte offset in the pattern: a back-reference, a
+look-around, a named group, a Unicode class (`\p{..}`), a nested class or a class set operation, a
+flag other than `i`, a repetition of a repetition (`a**`), and groups nested more than 64 deep.
+Where the syntax overlaps that of the Rust `regex` crate it means the same, except that `\d`,
+`\w` and `\b` are ASCII only and `(?i)` folds ASCII letters only.
 
 ---
 

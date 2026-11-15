@@ -327,6 +327,8 @@ sysroot/
                           # (from rootfs/), plus deterministic svctest
                           # fixtures synthesised under data/svctest/,
                           # which svctest also uses as scratch space.
+  crash/                  # Created empty: the directory crashd writes
+                          # cores to (services/crashd/docs/core-format.md).
 ```
 
 The UEFI firmware discovers the bootloader at `EFI/BOOT/BOOT<arch>.EFI`
@@ -340,7 +342,7 @@ fixtures, but test-only artifacts also install under `services/drivers/`,
 [testing.md § Sysroot layout](testing.md#sysroot-layout) lists them.
 
 Non-ESP, non-`data` directories (`services/`, `programs/`, `tests/`,
-`config/`) populate the GPT image's root partition, which userspace
+`config/`, `crash/`) populate the GPT image's root partition, which userspace
 services mount via vfsd / fatfs after boot. `data/` populates a
 dedicated `SERAPH_DATA` partition instead of the root partition; vfsd
 auto-mounts it at `/data`. (vfsd would also serve `/data` from a root-fs

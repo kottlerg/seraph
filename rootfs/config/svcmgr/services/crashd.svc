@@ -12,9 +12,17 @@
 # `restart = on_failure`: procmgr declines the faults that arrive while crashd
 # is down, and hands the endpoint to the respawned crashd when it registers.
 # `critical = no`: without crashd the system runs, unreported.
+#
+# `CORE_DUMP` names the processes whose faults leave an ELF core in /crash:
+# `no` (the default) writes none, a comma-separated list of process names
+# writes one for each process named (services/crashd/docs/operation.md
+# § Core Dump). The namespace grants /crash alone, with the rights the core
+# store uses (create, write, list, size, delete, rename) and not READ: a
+# core holds the process's memory, so reading one needs a cap to /crash.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
-namespace       = none
+env             = CORE_DUMP=no
+namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes

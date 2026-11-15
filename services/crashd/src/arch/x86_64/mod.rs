@@ -8,6 +8,9 @@
 /// The report's architecture.
 pub const ARCH: crash_report::Arch = crash_report::Arch::X86_64;
 
+/// The core's machine.
+pub const MACHINE: core_file::Machine = core_file::Machine::X86_64;
+
 /// Bytes of the register file.
 pub const REGS_SIZE: usize = syscall_abi::REGS_X86_64_SIZE;
 

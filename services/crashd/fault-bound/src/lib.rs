@@ -6,19 +6,20 @@
 //! The state that bounds crashd's handling of one fault, shared by its
 //! receiving thread and its watchdog thread.
 //!
-//! The receiver arms a generation for each fault ([`FaultBound::arm`]). The
-//! watchdog finds a generation past its bound ([`FaultBound::due`]) and
-//! commits to cancel it ([`FaultBound::commit`]) only while that generation
-//! is still armed, so a generation that ended meanwhile is never cancelled,
-//! and then posts the receiver the upcall that cancels its blocking request.
-//! The receiver checks [`FaultBound::fired`] before each blocking request, so
-//! none is sent once the bound has passed. A generation that ends cancelled
-//! ([`FaultBound::end`]) is settled by the watchdog once its upcall is served
-//! or its post refused ([`FaultBound::settle`]), and the receiver waits for
-//! that before it arms the next, so no upcall of one generation lands in the
-//! next one's handling (`services/crashd/docs/operation.md` § Bounds). The
-//! state is atomics alone and takes the time as an argument, so it is
-//! host-tested.
+//! The receiver arms a generation for each bounded step of a fault's handling
+//! ([`FaultBound::arm`]), with the step's own bound: the report's, then the
+//! core dump's. The watchdog finds a generation past its deadline
+//! ([`FaultBound::due`]) and commits to cancel it ([`FaultBound::commit`])
+//! only while that generation is still armed, so a generation that ended
+//! meanwhile is never cancelled, and then posts the receiver the upcall that
+//! cancels its blocking request. The receiver checks [`FaultBound::fired`]
+//! before each blocking request, so none is sent once the bound has passed. A
+//! generation that ends cancelled ([`FaultBound::end`]) is settled by the
+//! watchdog once its upcall is served or its post refused
+//! ([`FaultBound::settle`]), and the receiver waits for that before it arms
+//! the next, so no upcall of one generation lands in the next one's handling
+//! (`services/crashd/docs/operation.md` § Bounds). The state is atomics alone
+//! and takes the time as an argument, so it is host-tested.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -36,8 +37,9 @@ pub struct FaultBound
     /// The generation being handled, `0` while none is, with [`FIRED`] set
     /// once the watchdog committed to cancel it.
     armed: AtomicU64,
-    /// When the armed generation began, in the caller's milliseconds.
-    armed_at_ms: AtomicU64,
+    /// When the armed generation's bound passes, in the caller's
+    /// milliseconds.
+    deadline_ms: AtomicU64,
     /// The last generation armed; the receiver alone writes it.
     generation: AtomicU64,
     /// The last generation whose cancellation the watchdog has finished.
@@ -52,23 +54,25 @@ impl FaultBound
     {
         Self {
             armed: AtomicU64::new(0),
-            armed_at_ms: AtomicU64::new(0),
+            deadline_ms: AtomicU64::new(0),
             generation: AtomicU64::new(0),
             settled: AtomicU64::new(0),
         }
     }
 
-    /// Receiver: begin a fault's handling at `now_ms` and return its
-    /// generation. The previous generation has ended ([`Self::end`]), and
-    /// been settled when it ended cancelled ([`Self::settled`]).
-    pub fn arm(&self, now_ms: u64) -> u64
+    /// Receiver: begin a bounded step at `now_ms`, due once `bound_ms` have
+    /// passed, and return its generation. The previous generation has ended
+    /// ([`Self::end`]), and been settled when it ended cancelled
+    /// ([`Self::settled`]).
+    pub fn arm(&self, now_ms: u64, bound_ms: u64) -> u64
     {
         let generation = self
             .generation
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        self.armed_at_ms.store(now_ms, Ordering::Relaxed);
-        // Release: a watchdog that reads this generation reads its start.
+        self.deadline_ms
+            .store(now_ms.saturating_add(bound_ms), Ordering::Relaxed);
+        // Release: a watchdog that reads this generation reads its deadline.
         self.armed.store(generation, Ordering::Release);
         generation
     }
@@ -98,18 +102,18 @@ impl FaultBound
         self.settled.load(Ordering::Acquire) >= generation
     }
 
-    /// Watchdog: the generation armed at `now_ms` for `bound_ms` or more and
-    /// not yet fired; `None` when there is none.
+    /// Watchdog: the armed generation whose deadline has passed at `now_ms`
+    /// and that is not yet fired; `None` when there is none.
     #[must_use]
-    pub fn due(&self, now_ms: u64, bound_ms: u64) -> Option<u64>
+    pub fn due(&self, now_ms: u64) -> Option<u64>
     {
         let armed = self.armed.load(Ordering::Acquire);
         if armed == 0 || armed & FIRED != 0
         {
             return None;
         }
-        let at = self.armed_at_ms.load(Ordering::Relaxed);
-        (now_ms.saturating_sub(at) >= bound_ms).then_some(armed)
+        let deadline = self.deadline_ms.load(Ordering::Relaxed);
+        (now_ms >= deadline).then_some(armed)
     }
 
     /// Watchdog: commit to cancel `generation`, which [`Self::due`] returned.
@@ -147,25 +151,41 @@ mod tests
     fn a_generation_is_not_due_before_its_bound_passes()
     {
         let bound = FaultBound::new();
-        assert_eq!(bound.due(5000, BOUND), None);
-        let g = bound.arm(1000);
-        assert_eq!(bound.due(1000 + BOUND - 1, BOUND), None);
+        assert_eq!(bound.due(5000), None);
+        let g = bound.arm(1000, BOUND);
+        assert_eq!(bound.due(1000 + BOUND - 1), None);
         assert!(!bound.fired(g));
         assert!(!bound.end(g));
         // An ended generation is never due.
-        assert_eq!(bound.due(1000 + BOUND, BOUND), None);
+        assert_eq!(bound.due(1000 + BOUND), None);
+    }
+
+    #[test]
+    fn each_generation_is_due_at_its_own_bound()
+    {
+        // The report's step, then the dump's, with a longer bound.
+        let bound = FaultBound::new();
+        let report = bound.arm(0, BOUND);
+        assert!(!bound.end(report));
+        let dump = bound.arm(BOUND - 1, 10 * BOUND);
+        assert_eq!(bound.due(2 * BOUND), None);
+        assert_eq!(bound.due(11 * BOUND - 1), Some(dump));
+        // A bound past the clock's end is never due.
+        assert!(!bound.end(dump));
+        let _ = bound.arm(1, u64::MAX);
+        assert_eq!(bound.due(u64::MAX - 1), None);
     }
 
     #[test]
     fn a_committed_generation_is_fired_once_and_settled_by_the_watchdog()
     {
         let bound = FaultBound::new();
-        let g = bound.arm(0);
-        assert_eq!(bound.due(BOUND, BOUND), Some(g));
+        let g = bound.arm(0, BOUND);
+        assert_eq!(bound.due(BOUND), Some(g));
         assert!(bound.commit(g));
         assert!(bound.fired(g));
         // One cancellation per generation.
-        assert_eq!(bound.due(2 * BOUND, BOUND), None);
+        assert_eq!(bound.due(2 * BOUND), None);
         assert!(!bound.commit(g));
         assert!(bound.end(g));
         assert!(!bound.settled(g));
@@ -179,10 +199,10 @@ mod tests
         // The watchdog finds generation g past its bound, then the receiver
         // ends g and arms the next before the watchdog commits.
         let bound = FaultBound::new();
-        let g = bound.arm(0);
-        assert_eq!(bound.due(BOUND, BOUND), Some(g));
+        let g = bound.arm(0, BOUND);
+        assert_eq!(bound.due(BOUND), Some(g));
         assert!(!bound.end(g));
-        let next = bound.arm(BOUND);
+        let next = bound.arm(BOUND, BOUND);
         assert_ne!(next, g);
         assert!(!bound.commit(g));
         assert!(!bound.fired(next));

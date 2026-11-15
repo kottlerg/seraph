@@ -35,6 +35,11 @@ rootfs/
 xtask synthesises additional data fixtures at build time directly into
 the sysroot at `sysroot/data/svctest/{large.bin, bench.bin}`; they are
 not stored under `rootfs/` since they are deterministic build artifacts.
+It also creates `sysroot/crash/` empty, which git cannot carry here: the
+directory crashd writes cores to
+([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md)).
+The build never prunes it, so cores written to a disk image survive until
+the image is rebuilt.
 
 The bootloader's `bootstrap.bundle` (init plus every boot module) is
 composed by `cargo xtask build` and written to

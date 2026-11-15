@@ -1,7 +1,7 @@
 # crashd Operation
 
-How crashd registers as the crash service, handles each fault, bounds that handling, and what it
-cannot report.
+How crashd registers as the crash service, handles each fault, writes a core of a process its
+policy names, bounds that handling, and what it cannot report.
 
 ---
 
@@ -12,10 +12,12 @@ cannot report.
 2. Its bootstrap round delivers one cap, a `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which
    its recipe's `debug_authority = yes` has svcmgr mint
    ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `debug_authority`).
-3. It starts its watchdog thread, then binds its main thread's upcall class to an endpoint the
+3. It reads its core-dump policy from the `CORE_DUMP` entry of its environment and logs it
+   ([Core Dump](#core-dump)).
+4. It starts its watchdog thread, then binds its main thread's upcall class to an endpoint the
    watchdog receives on, so the watchdog does not copy that binding onto itself
    ([Bounds](#bounds)).
-4. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
+5. It sends `REGISTER_CRASH_SERVICE` with a Thread cap of its main thread, and receives a `RECV` cap
    on procmgr's crash endpoint, which every process procmgr creates has its exception class bound
    to ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
    Authority).
@@ -48,15 +50,66 @@ Authority). crashd:
    message's;
 3. reads the bytes at the instruction pointer through the same cap, since every thread of the
    process shares its address space;
-4. logs the block ([block-format.md](block-format.md)), then declines the fault with the block's id
-   as the decline reason, which the kernel prints on its `fault unhandled` line.
+4. logs the block ([block-format.md](block-format.md));
+5. writes a core of the process when its policy names it ([Core Dump](#core-dump)), and logs the
+   dump's line;
+6. declines the fault with the block's id as the decline reason, which the kernel prints on its
+   `fault unhandled` line.
 
-The block is logged before the decline, so the kernel's diagnostic of the kill does not land among
-its lines on the serial console.
+The block and the dump's line are logged before the decline, so the kernel's diagnostic of the
+kill does not land among them on the serial console.
 
 A fault of a restartable syscall's user copy never reaches crashd: its pager's forward is a decline
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), so the syscall fails and the
 process, which lives on, leaves no report.
+
+---
+
+## Core Dump
+
+`CORE_DUMP` in crashd's environment, which its recipe's `env` key sets, names the processes
+crashd writes a core of. `no`, the recipe's value, or no entry, writes none. Otherwise the value is
+a comma-separated list of names, each matched against a process's name, the first string of its
+argv, or that name's last path component, so `crashme` names a process started as
+`/programs/crashme`. A process with an empty name is never named. crashd logs the setting at
+startup, `core dumps off` or `core dumps for <list>`; a list holding an empty name is logged as a
+warning and writes no core. The usertest boot stages a recipe that names `crashme`
+([docs/testing.md](../../../docs/testing.md) § Crash reports).
+
+A dump follows the block when the report attached and read the process within its bound, its
+`status` `complete`, and the policy is not off. Its steps, in order, each under the dump's bound
+([Bounds](#bounds)):
+
+1. It reads the process's name from `LIST_PROCESSES`, and ends, with no line, when the policy
+   does not name it.
+2. It writes no core of a process that declared itself on the core path (`DECLARE_NO_CORE`, which
+   the attach reply's flags word reports): vfsd, the FAT driver and the block driver, through
+   which the core would be written, so the dump never waits on the process that died
+   ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 26: `DECLARE_NO_CORE`).
+3. It attaches the process again, page by page, and stops each listed thread but the faulting one
+   (`SYS_THREAD_STOP`): the fault holds that one already, and a stop would cancel its fault. It
+   reads the registers and extended state of each, the faulting thread first, at most 256 threads
+   (`CORE_THREADS_MAX`); a thread past them is stopped and not recorded. When the faulting thread
+   is not listed (one that never registered), it writes no core.
+4. It lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at
+   the load bias for the core's `NT_AUXV`, and lays the core out within the per-core budget.
+5. It deletes the `.part` files earlier dumps left, and the oldest cores until the new one fits
+   the directory budget.
+6. It writes the core under its `.part` name, reading the pages through the faulting thread's
+   cap, and renames it.
+
+The threads it stopped stay stopped: the decline that follows ends the process, whose teardown ends
+every thread. The core's names, budgets and contents are in [core-format.md](core-format.md).
+
+After the block, before the decline, crashd logs one line of the dump's outcome, carrying the
+block's `id`:
+
+```
+core id=<id> written /crash/<name> bytes=<size>
+core id=<id> not written: <reason>
+```
+
+A process the policy does not name gets no line.
 
 ---
 
@@ -79,8 +132,17 @@ served the upcall, and logs the rest of the block after the decline, when nothin
 faulting thread any more. So no cancellation of one fault reaches the next fault's handling,
 unless the watchdog has not served it within another 2 s; crashd then logs that and goes on, and
 the late upcall can cut one request of the next fault's handling short. The stack scan reads at
-most
-8 KiB (`STACK_SCAN_BYTES`).
+most 8 KiB (`STACK_SCAN_BYTES`).
+
+A dump runs under a bound of its own, 60 s (`DUMP_BOUND`), after the report's and outside it, as
+a new generation of the same watchdog. A request it waits in, an attach or a file-system call, is
+cancelled as the report's is, and the runtime's file calls return an error for it; crashd then
+sends no further request, writes no core, logs `not written: the dump passed its bound`, and
+declines. The faulting thread is held while the dump runs, so the bound is the most a dump delays
+the process's teardown and crashd's next fault. It covers a core of the per-core budget, 2 MiB
+(`CORE_BYTES_MAX`), at half the slowest rate measured writing through the FAT driver, about
+75 KB/s on a riscv64 debug build under QEMU, where each 4 KiB write allocates a cluster: the 0.9 MiB
+core of crashme's `worker` mode took 8 s to 12 s on debug builds of both architectures.
 
 ---
 
@@ -109,9 +171,15 @@ most
   exceptions are reported.
 - **Debugged threads.** A debugger that binds a thread's exception class takes its faults; crashd
   sees none of them.
+- **Cores.** A process whose faulting thread never registered gets no core, and a core records at
+  most 256 threads ([Core Dump](#core-dump)). A file write the dump's bound cancels leaves its page
+  frame mapped in crashd until crashd exits, since the FAT driver may still be copying from it
+  (`write_memory_chunks` in
+  [`runtime/ruststd/src/sys/fs/seraph.rs`](../../../runtime/ruststd/src/sys/fs/seraph.rs)); each
+  cancelled dump costs one page so.
 
-Persistence of the reports through logd's disk and network sinks, core dumps after the log report,
-and holding a crashed process stopped for a debugger are design intent; not yet implemented
+Persistence of the reports through logd's disk and network sinks, and holding a crashed process
+stopped for a debugger, are design intent; not yet implemented
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Crash Reports).
 
 ---

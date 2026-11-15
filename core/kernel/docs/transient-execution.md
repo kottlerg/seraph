@@ -291,8 +291,9 @@ the MSR, since the access would fault. The code is `arch/x86_64/mitigation.rs`.
 
 The inputs are the classes the table gives `Kernel` exposure, the two predictor behaviours, and
 five enumerated bits: `IBRS_ALL` (`IA32_ARCH_CAPABILITIES` bit 1), IBRS
-(`CPUID.(EAX=07H,ECX=0):EDX[26]`, Intel, or `CPUID Fn8000_0008 EBX[14]`, AMD), Automatic IBRS
-(`CPUID Fn8000_0021 EAX[8]`, AMD), `BHI_CTRL`, and `DOITM` (`IA32_ARCH_CAPABILITIES` bit 12). A
+(`CPUID.(EAX=07H,ECX=0):EDX[26]`, read on an Intel part only: another vendor's `retbleed` may be
+branch type confusion, which IBRS does not answer), Automatic IBRS (`CPUID Fn8000_0021 EAX[8]`,
+AMD), `BHI_CTRL`, and `DOITM` (`IA32_ARCH_CAPABILITIES` bit 12). A
 kernel built to force the return mitigations replaces some of them (§ Forced return mitigations).
 
 | Control | Log name | Selected when | Where it acts |
@@ -331,10 +332,13 @@ a jump table. The kernel's thunk tests a flag that `install` sets. With retpolin
 runs the sequence: a `call` whose return the RSB predicts into a `pause; lfence` loop, and a
 `ret` to the target. Otherwise it runs `lfence; jmp r11`, where the `lfence` keeps a
 mispredicted test of the flag from reaching the plain jump on a part that needs the sequence. The
-assembly stubs have two indirect branches of their own. `switch`'s resume without shadow stacks
-goes through the thunk. `shadow_stack::enable` ends in a plain `jmp r11` to its caller, outside
-the thunk: it runs only where shadow stacks turn on, which `shadow_stack::decide` allows only
-when retpoline is not selected (below), so the jump never needs the sequence.
+assembly stubs have three indirect branches of their own. `switch`'s resume without shadow
+stacks goes through the thunk. `shadow_stack::enable` ends in a plain `jmp r11` to its caller,
+outside the thunk: it runs only where shadow stacks turn on, which `shadow_stack::decide` allows
+only when retpoline is not selected (below), so the jump never needs the sequence. The AP
+trampoline's long-mode relay (`ap_trampoline.rs`) ends in a plain `jmp rax` to the AP's entry
+function, outside the thunk: it runs once per AP, in Phase 8, before any thread has entered user
+mode on any CPU, so no prediction user mode trained can steer it.
 
 The cost of the thunk where retpoline is not selected (a call, a compare and an `lfence` per
 indirect branch) is not measured.
@@ -386,8 +390,10 @@ return, so shadow stacks stay on
 
 AMD parts have no `rsb_alternate` (§ Predictor behaviours), so the rule does not select IBRS on
 entry for their `retbleed` (branch type confusion), and no control answers it or
-`spec_rstack_overflow`; `mitigation::report` logs each such class (§ Report). A part without
-IBRS, which the rule leaves on the retpoline sequence, is logged the same way.
+`spec_rstack_overflow`; `mitigation::report` logs each such class (§ Report). An Intel part
+without IBRS, and a part of another vendor, whose `retbleed` may be either form and whose IBRS
+is not read, stay on the retpoline sequence and are logged the same way. Enhanced IBRS and IBRS on
+entry count as answering `retbleed` only where the CPU has `rsb_alternate`.
 
 No part that the project boots has `retbleed`; a kernel built to force the return mitigations
 runs IBRS on entry on the development host (§ Forced return mitigations).

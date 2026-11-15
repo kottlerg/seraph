@@ -1790,8 +1790,8 @@ pub const SPECULATION_INPUT_DOITM: u64 = 1 << 12;
 pub const SPECULATION_INPUT_RETBLEED: u64 = 1 << 13;
 /// Input: the table gives speculative return stack overflow kernel action.
 pub const SPECULATION_INPUT_SRSO: u64 = 1 << 14;
-/// Input: the CPU implements `IA32_SPEC_CTRL.IBRS` (`CPUID.(EAX=07H,ECX=0):EDX[26]`
-/// or `CPUID Fn8000_0008 EBX[14]`).
+/// Input: the CPU is an Intel part that implements `IA32_SPEC_CTRL.IBRS`
+/// (`CPUID.(EAX=07H,ECX=0):EDX[26]`).
 pub const SPECULATION_INPUT_IBRS: u64 = 1 << 15;
 
 /// Control: enhanced IBRS, `IA32_SPEC_CTRL.IBRS` set on every CPU.

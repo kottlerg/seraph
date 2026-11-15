@@ -506,7 +506,7 @@ The death-notification flow:
 
 1. **Procmgr observes.** Procmgr's existing supervision path detects
    the death (a death notification on the child's main thread, an
-   address-space death notification for a terminal fault in any thread,
+   address-space death notification for the first terminal fault in any thread,
    or an explicit `DESTROY_PROCESS` teardown). When one of its death
    queues was full and a post was dropped, procmgr recovers the
    main-thread deaths from the kernel's thread states, and the

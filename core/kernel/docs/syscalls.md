@@ -1540,9 +1540,9 @@ Starting a thread whose fault episode a stop cancelled (before any reply claimed
 handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a delivery other
 than a virtual-memory one, of one with no exception handler bound, or of the fault of a
 restartable syscall's user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), kills it as
-an unhandled
-fault, which posts its death and address-space observers, or, for the fault of a restartable
-syscall's user copy, fails that syscall with `InvalidAddress` (see
+an unhandled fault, which posts its death observers and, when the fault is its address space's
+first terminal fault, the space's observers, or, for the fault of a restartable syscall's user
+copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). Starting one whose claiming reply was a `FAULT_REPLY_REDIRECT` that named an
 endpoint delivers the fault to that endpoint. An upcall delivery (`FAULT_KIND_UPCALL`) is no fault:
@@ -2992,10 +2992,13 @@ right, so only a process that may read physical addresses translates its pages.
 
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
-Bind a terminal-fault death observer to an address space. When any thread in the space faults
-terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
-for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the bound
-event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. Voluntary
+Bind a terminal-fault death observer to an address space. On the first terminal fault of any
+thread in the space (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
+pattern for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the
+bound event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. The address space dies
+once: a later terminal fault of another of its threads, on any CPU, exits that thread and posts
+nothing, so a binding receives one entry in its life, carrying the retained reason that
+`CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (§ `SYS_CAP_INFO`). Voluntary
 `SYS_THREAD_EXIT` does not fire these observers (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 

@@ -317,14 +317,12 @@ mod live
             return;
         }
         // SAFETY: ring 0; `CR4.CET` is set only by `arm`, on a CPU with
-        // `CET_SS`, so all three MSRs exist.
-        let (s_cet, table, pl0_ssp) = unsafe {
-            (
-                cpu::read_msr(IA32_S_CET),
-                cpu::read_msr(IA32_INTERRUPT_SSP_TABLE_ADDR),
-                cpu::read_msr(IA32_PL0_SSP),
-            )
-        };
+        // `CET_SS`, so the MSR exists.
+        let s_cet = unsafe { cpu::read_msr(IA32_S_CET) };
+        // SAFETY: as above.
+        let table = unsafe { cpu::read_msr(IA32_INTERRUPT_SSP_TABLE_ADDR) };
+        // SAFETY: as above.
+        let pl0_ssp = unsafe { cpu::read_msr(IA32_PL0_SSP) };
         crate::kprintln_serial!(
             "  cet: s_cet={:#x}  int_ssp_table={:#018x}  pl0_ssp={:#018x}",
             s_cet,

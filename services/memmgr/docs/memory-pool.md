@@ -779,13 +779,13 @@ the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, wi
 backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
 deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is otherwise
 declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the granule,
-so a restore is never clamped to part of a chunk. memmgr takes runs covering the chunk's backed
-pages, selected as a demand fault selects ([Demand faults](#demand-faults), run selection only),
-maps them in a scratch window of its own, and writes every byte of every backed page there before
-it maps the run into the process: it decompresses each stored page and zero-fills each all-zero
-page, which takes no store space. That full write replaces the hand-out clear of
-[Frame contents](#frame-contents), so no byte of a run's earlier owner reaches the process. It then
-frees the store slot and resumes the thread.
+so a restore is never clamped to part of a chunk. memmgr takes runs covering exactly the chunk's
+backed pages (no run spans an unbacked page of a chunk backed in parts), selected as a demand fault
+selects ([Demand faults](#demand-faults), run selection only), maps them in a scratch window of its
+own, and writes every byte of every page of each run there before it maps the run into the process:
+it decompresses each stored page and zero-fills each all-zero page, which takes no store space. That
+full write replaces the hand-out clear of [Frame contents](#frame-contents), so no byte of a run's
+earlier owner reaches the process. It then frees the store slot and resumes the thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,

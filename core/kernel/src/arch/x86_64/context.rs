@@ -404,6 +404,12 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
         // because the TrapFrame occupies [tf_ptr, tf_ptr+167].
         // tf_ptr is on the dispatched thread's kernel stack (direct map).
         "lea rsp, [rdi]",
+        // Interrupts off until the iretq restores the user's IF (see
+        // `syscall.rs` § Entry contract), then the user-mode IA32_SPEC_CTRL
+        // value where the selection asks for it, before the registers it
+        // clobbers (eax, ecx, edx) are restored.
+        "cli",
+        super::mitigation::ibrs_exit_asm!(),
         // Build the iretq frame on the current kernel stack.
         // iretq pops (low → high address): RIP, CS, RFLAGS, RSP, SS.
         // We push in reverse order: SS first, RIP last.
@@ -433,10 +439,8 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
         "mov r14, [rdi + 104]",
         "mov r15, [rdi + 112]",
         "mov rdi, [rdi + 40]", // restore rdi last (was TrapFrame pointer)
-        // User GS base back in place for ring 3, with interrupts off until the
-        // iretq restores the user's IF (see `syscall.rs` § Entry contract),
-        // then the selection's VERW, which clobbers only the flags.
-        "cli",
+        // User GS base back in place for ring 3, then the selection's VERW,
+        // which clobbers only the flags.
         "swapgs",
         super::mitigation::verw_asm!(),
         "iretq",
@@ -547,6 +551,12 @@ pub unsafe extern "C" fn switch_and_enter_user(
         // 2. Switch page tables. RSP now points to the direct-mapped init
         //    kernel stack, which is covered by the copied kernel-upper entries.
         "mov cr3, rdi",
+        // Interrupts off until the iretq restores the user's IF (see
+        // `syscall.rs` § Entry contract), then the user-mode IA32_SPEC_CTRL
+        // value where the selection asks for it, before the registers it
+        // clobbers (eax, ecx, edx) are restored.
+        "cli",
+        super::mitigation::ibrs_exit_asm!(),
         // 3. Build iretq frame below TrapFrame (RSP = tf_ptr = rsi).
         //    iretq pops (low → high address): RIP, CS, RFLAGS, RSP, SS.
         "mov rax, [rsi + 152]",
@@ -575,10 +585,8 @@ pub unsafe extern "C" fn switch_and_enter_user(
         "mov r15, [rsi + 112]",
         "mov rdi, [rsi + 40]", // restore rdi before rsi
         "mov rsi, [rsi + 32]", // restore rsi last (was TrapFrame pointer)
-        // User GS base back in place for ring 3, with interrupts off until the
-        // iretq restores the user's IF (see `syscall.rs` § Entry contract),
-        // then the selection's VERW, which clobbers only the flags.
-        "cli",
+        // User GS base back in place for ring 3, then the selection's VERW,
+        // which clobbers only the flags.
         "swapgs",
         super::mitigation::verw_asm!(),
         "iretq",

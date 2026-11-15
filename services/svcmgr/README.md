@@ -40,7 +40,10 @@ svcmgr/
 ├── src/
 │   ├── main.rs                    # main() (std runtime), IPC dispatch,
 │   │                              # dispatch_deaths, initiate_graceful_shutdown
+│   ├── classes.rs                 # Device class files configured with devmgr
 │   ├── death_queues.rs            # Death-queue ring capacity and first pool
+│   ├── endowed_servers.rs         # Liveness of vfsd and devmgr before
+│   │                              # reconciliation records them
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
@@ -59,7 +62,9 @@ svcmgr/
 │                                  # wire-blob encoder (`build_blob`), the
 │                                  # `cwd_rights` / `handover_permitted`
 │                                  # decisions, the windowed
-│                                  # `RestartBudget`
+│                                  # `RestartBudget`, the device class file
+│                                  # parser, and the death correlator and
+│                                  # cap decoding (`death_tag`, `death_caps`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see
@@ -100,7 +105,11 @@ svcmgr/
   (parked AND no recipe → hard error). With no memory for the parsed
   list, or for a bind-only entry's record, an endowed service runs on
   unsupervised (logged, not reported as a configuration error); a recipe
-  dropped for memory is reported like a malformed one. See
+  dropped for memory is reported like a malformed one. A vfsd found dead
+  before or during the scan, which reads through it, ends reconciliation
+  with every endowed service unsupervised, and its death is routed as
+  system death ([docs/restart-protocol.md](docs/restart-protocol.md)
+  § Death detection). See
   [docs/service-definitions.md](docs/service-definitions.md) § Reconciliation.
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)

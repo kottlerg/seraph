@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: GPL-2.0-only
 // Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
-// shared/aml/src/tests.rs
+// shared/aml/src/tests/mod.rs
 
-//! Tests of the parser and the loader: the checked-in QEMU tables, the
-//! no-panic properties over prefixes and arbitrary bytes, and one
-//! hand-assembled case per grammar piece.
+//! Tests of the parser, the loader and the evaluator: the checked-in QEMU
+//! tables, the no-panic properties over prefixes and arbitrary bytes, and
+//! one hand-assembled case per grammar piece. The evaluator's own tests are
+//! in [`eval`], those that run the QEMU tables' methods on the simulated
+//! machine of [`sim`] in [`qemu`].
 
 use std::path::{Path, PathBuf};
 use std::{fs, thread};
 
 use crate::encoding::Seg;
 use crate::namespace::{
-    AccessAs, Body, Data, FieldKind, FieldUnit, Namespace, NodeId, Object, Owner,
+    AccessAs, Body, Data, ExprId, FieldKind, FieldUnit, Namespace, NodeId, Object, Operand, Owner,
 };
 use crate::parse::Parser;
 use crate::resource::{self, Resource};
 use crate::term::{FieldElem, Imm, Name, Op, Term};
 use crate::{FaultKind, LoadReport, MAX_PARSE_DEPTH};
+
+mod eval;
+mod qemu;
+mod sim;
 
 // ── Builders ──────────────────────────────────────────────────────────
 
@@ -912,7 +918,7 @@ fn name_data_folds_to_constants()
     };
     assert_eq!(p.len(), 4);
     assert_eq!(p[0], Data::Integer(1));
-    assert!(matches!(&p[1], Data::Reference(n) if n.root && n.segs == vec![seg("INT0")]));
+    assert!(matches!(&p[1], Data::Name(n) if n.root && n.segs == vec![seg("INT0")]));
     assert_eq!(p[2], Data::Package(vec![Data::String(b"x".to_vec())]));
     assert_eq!(p[3], Data::Uninitialized);
     assert_eq!(
@@ -928,12 +934,44 @@ fn name_data_folds_to_constants()
         .unwrap();
     assert_eq!(data(&ns, "\\ONES"), Data::Integer(0xFFFF_FFFF));
 
+    // A string is at most MAX_BUFFER_BYTES long, in a Name and in a
+    // method's code alike.
+    let long = |len: usize| string(&"a".repeat(len));
+    let ns = load(&name_obj("STR1", &long(crate::MAX_BUFFER_BYTES)));
+    assert!(matches!(data(&ns, "\\STR1"), Data::String(s) if s.len() == crate::MAX_BUFFER_BYTES));
+    let mut ns = Namespace::new().unwrap();
+    let r = ns
+        .load_table(&table(&cat(&[
+            &method("MTH1", 0, &ret(&long(crate::MAX_BUFFER_BYTES + 1))),
+            // A fault in a Name ends its list, so each is in a Scope of its own.
+            &scope("\\", &name_obj("STR2", &long(crate::MAX_BUFFER_BYTES + 1))),
+            &scope(
+                "\\",
+                &name_obj("PKG1", &package(1, &[long(crate::MAX_BUFFER_BYTES + 1)])),
+            ),
+        ])))
+        .unwrap();
+    assert_eq!(r.faults, 2, "{r:?}");
+    assert_eq!(r.first_fault.unwrap().kind, FaultKind::Bound);
+    let mth = ns.find("\\MTH1").unwrap();
+    assert_eq!(ns.method_code(mth).unwrap_err().kind, FaultKind::Bound);
+
     // A buffer whose size is not constant is a fault.
     let mut ns = Namespace::new().unwrap();
     let r = ns
         .load_table(&table(&name_obj("BUF2", &buffer(&[LOCAL0], &[]))))
         .unwrap();
     assert_eq!(r.first_fault.unwrap().kind, FaultKind::NotConstant);
+}
+
+/// The expression id of an operand a table load kept.
+fn kept(op: Operand) -> ExprId
+{
+    match op
+    {
+        Operand::Expr(id) => id,
+        Operand::Value(v) => panic!("operand {v:#x} is not a kept expression"),
+    }
 }
 
 /// A namespace with a `Field`, an `IndexField` and a `BankField` over two
@@ -1055,14 +1093,14 @@ fn index_and_bank_fields_name_their_registers()
         panic!();
     };
     assert_eq!((region, bank), (reg, ns.find("\\AAAA").unwrap()));
-    assert_eq!(ns.expr(value).unwrap().int(), Some(3));
+    assert_eq!(ns.expr(kept(value)).unwrap().int(), Some(3));
     let Some(Object::Region(r)) = ns.object(reg)
     else
     {
         panic!();
     };
     assert_eq!(r.space, 1);
-    assert_eq!(ns.expr(r.offset).unwrap().int(), Some(0xAE00));
+    assert_eq!(ns.expr(kept(r.offset)).unwrap().int(), Some(0xAE00));
 }
 
 #[test]
@@ -1125,7 +1163,7 @@ fn object_kinds()
     let ns = load(&aml);
     let obj = |p: &str| ns.object(ns.find(p).unwrap()).unwrap().clone();
     assert_eq!(obj("\\MTX0"), Object::Mutex { sync: 3 });
-    assert_eq!(obj("\\EVT0"), Object::Event);
+    assert_eq!(obj("\\EVT0"), Object::Event { pending: 0 });
     assert_eq!(
         obj("\\CPU0"),
         Object::Processor {
@@ -1194,9 +1232,9 @@ fn a_call_to_a_method_defined_later_in_the_table_parses_at_load()
     {
         panic!("REG0 is not a region");
     };
-    let offset = ns.expr(r.offset).unwrap();
+    let offset = ns.expr(kept(r.offset)).unwrap();
     assert_eq!((offset.op, offset.kids.len()), (Op::Call, 1));
-    assert_eq!(ns.expr(r.length).unwrap().int(), Some(0x10));
+    assert_eq!(ns.expr(kept(r.length)).unwrap().int(), Some(0x10));
 }
 
 #[test]
@@ -1233,8 +1271,8 @@ fn a_data_object_defined_later_in_its_scope_hides_an_outer_method()
     {
         panic!("REG0 is not a region");
     };
-    assert_eq!(ns.expr(reg.offset).unwrap().op, Op::NameRef);
-    assert_eq!(ns.expr(reg.length).unwrap().int(), Some(0x10));
+    assert_eq!(ns.expr(kept(reg.offset)).unwrap().op, Op::NameRef);
+    assert_eq!(ns.expr(kept(reg.length)).unwrap().int(), Some(0x10));
     assert_eq!(data(&ns, "\\DEV0.BASE"), Data::Integer(0x1000));
     // DEV0, REG0, DEV0.BASE, \BASE, BADN and BADA.
     assert_eq!(r.objects, 6, "{r:?}");
@@ -1466,10 +1504,15 @@ fn frame_objects_are_removed_with_their_frame()
             Owner::Frame(7),
         )
         .unwrap();
-    ns.create(a, &n("SUB0"), Object::Event, Owner::Frame(7))
+    ns.create(a, &n("SUB0"), Object::Event { pending: 0 }, Owner::Frame(7))
         .unwrap();
-    ns.create(mth, &n("LOC1"), Object::Event, Owner::Frame(8))
-        .unwrap();
+    ns.create(
+        mth,
+        &n("LOC1"),
+        Object::Event { pending: 0 },
+        Owner::Frame(8),
+    )
+    .unwrap();
     assert_eq!(ns.len(), before + 3);
     ns.remove_owned(Owner::Frame(7)).unwrap();
     assert_eq!(ns.len(), before + 1);
@@ -1477,12 +1520,22 @@ fn frame_objects_are_removed_with_their_frame()
     assert!(ns.find("\\MTH0.LOC1").is_some());
     // The freed slots are reused.
     let c = ns
-        .create(mth, &n("LOC2"), Object::Event, Owner::Frame(9))
+        .create(
+            mth,
+            &n("LOC2"),
+            Object::Event { pending: 0 },
+            Owner::Frame(9),
+        )
         .unwrap();
     assert!(c == a || ns.len() == before + 2);
     assert_eq!(ns.path(c).unwrap(), vec![seg("MTH0"), seg("LOC2")]);
     assert_eq!(
-        ns.create(mth, &n("LOC1"), Object::Event, Owner::Frame(9)),
+        ns.create(
+            mth,
+            &n("LOC1"),
+            Object::Event { pending: 0 },
+            Owner::Frame(9)
+        ),
         Err(FaultKind::Exists)
     );
 }

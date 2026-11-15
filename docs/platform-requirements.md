@@ -120,8 +120,8 @@ Each feature is classified per architecture as one of:
   of the cross-vendor boot-gate. What the kernel defends beyond them, and what it leaves
   unmitigated, is the posture of [capability-model.md](capability-model.md)
   § Microarchitectural Isolation; the controls it selects by enumeration (enhanced or automatic
-  IBRS, `BHI_DIS_S`, `VERW`) are opportunistic in the same sense as the entries below, each
-  with a software fallback or a stated gap
+  IBRS, IBRS on entry, `BHI_DIS_S`, `VERW`) are opportunistic in the same sense as the entries
+  below, each with a software fallback or a stated gap
   ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
   § Controls).
 - **2 MiB large pages** — used for the kernel direct map.
@@ -137,7 +137,8 @@ Each feature is classified per architecture as one of:
 - **CET shadow stack (SHSTK)** — supervisor shadow stacks, return-address integrity for the
   kernel, enabled when the boot CPU reports `CET_SS` and the kernel's transient-execution
   selection uses no control that rewrites a return (the retpoline sequence, which a CPU without
-  enhanced or Automatic IBRS takes, AMD Zen 3 among them): the mitigation takes precedence.
+  enhanced IBRS, Automatic IBRS or IBRS on entry takes, AMD Zen 3 among them; IBRS on entry
+  rewrites none): the mitigation takes precedence.
   Once enabled, every other CPU must report `CET_SS` too, or the boot halts. Without it the
   kernel runs unprotected and otherwise unchanged
   ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)

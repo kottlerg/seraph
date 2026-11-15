@@ -58,8 +58,8 @@ use crate::encoding::{
     EXT_THERMAL_ZONE, OP_ELSE, OP_EXT_PREFIX, OP_IF, OP_METHOD, OP_SCOPE, OP_WHILE, Seg,
 };
 use crate::namespace::{
-    AccessAs, Body, Data, FieldKind, FieldUnit, Method, Namespace, NodeId, Object, Owner, Region,
-    Table, TableId,
+    AccessAs, Body, Data, ExprId, FieldKind, FieldUnit, Method, Namespace, NodeId, Object, Operand,
+    Owner, Region, Table, TableId,
 };
 use crate::parse::{Parser, to_name};
 use crate::term::{FieldElem, FieldList, Imm, Name, Op, Term};
@@ -524,7 +524,7 @@ impl Loader<'_, '_>
             (Op::Alias, Imm::Name(name)) => (name, self.alias(scope, &mut kids)),
             (Op::External, Imm::Name(name)) => return self.external(scope, &name, &mut kids, pos),
             (Op::Mutex, Imm::Name(name)) => (name, mutex(&mut kids)),
-            (Op::Event, Imm::Name(name)) => (name, Ok(Object::Event)),
+            (Op::Event, Imm::Name(name)) => (name, Ok(Object::Event { pending: 0 })),
             (Op::OpRegion, Imm::Name(name)) => (name, self.region(&mut kids)),
             (Op::DataRegion, Imm::Name(name)) => (name, self.data_region(&mut kids)),
             (Op::Field, Imm::Fields(list)) =>
@@ -627,12 +627,13 @@ impl Loader<'_, '_>
     fn region(&mut self, kids: &mut Kids) -> Result<Object, FaultKind>
     {
         let space = small(&next(kids)?);
-        let offset = self.ns.add_expr(next(kids)?)?;
-        let length = self.ns.add_expr(next(kids)?)?;
+        let offset = Operand::Expr(self.ns.add_expr(next(kids)?)?);
+        let length = Operand::Expr(self.ns.add_expr(next(kids)?)?);
         Ok(Object::Region(Region {
             space,
             offset,
             length,
+            pci: None,
         }))
     }
 
@@ -666,7 +667,7 @@ impl Loader<'_, '_>
     {
         let region = self.resolve(scope, next(kids)?)?;
         let bank = self.resolve(scope, next(kids)?)?;
-        let value = self.ns.add_expr(next(kids)?)?;
+        let value = Operand::Expr(self.ns.add_expr(next(kids)?)?);
         Ok(FieldKind::Bank {
             region,
             bank,
@@ -691,50 +692,92 @@ impl Loader<'_, '_>
     ) -> Result<(), Fault>
     {
         let fault = |k: FaultKind| Fault::at(k, pos);
-        let mut bit = 0u32;
-        let mut access_as = None;
-        let mut connection = None;
+        let mut walk = FieldWalk::new(kind, list.flags);
         for elem in list.elems
         {
-            match elem
+            if let FieldElem::Connect(t) = elem
             {
-                FieldElem::Named { name, bits } =>
-                {
-                    let unit = FieldUnit {
-                        kind,
-                        flags: list.flags,
-                        access_as,
-                        bit_offset: bit,
-                        bit_len: bits,
-                        connection,
-                    };
-                    let name = seg_name(name).map_err(fault)?;
-                    self.place(scope, &name, Object::Field(unit), pos)?;
-                    bit = bit.checked_add(bits).ok_or(fault(FaultKind::Bound))?;
-                }
-                FieldElem::Reserved { bits } =>
-                {
-                    bit = bit.checked_add(bits).ok_or(fault(FaultKind::Bound))?;
-                }
-                FieldElem::Access { kind, attrib } =>
-                {
-                    access_as = Some(AccessAs {
-                        kind,
-                        attrib,
-                        len: 0,
-                    });
-                }
-                FieldElem::ExtendedAccess { kind, attrib, len } =>
-                {
-                    access_as = Some(AccessAs { kind, attrib, len });
-                }
-                FieldElem::Connect(t) =>
-                {
-                    connection = Some(self.ns.add_expr(t).map_err(fault)?);
-                }
+                walk.connection = Some(self.ns.add_expr(t).map_err(fault)?);
+                continue;
+            }
+            if let Some((seg, unit)) = walk.step(&elem).map_err(fault)?
+            {
+                let name = seg_name(seg).map_err(fault)?;
+                self.place(scope, &name, Object::Field(unit), pos)?;
             }
         }
         Ok(())
+    }
+}
+
+/// A walk of a field list: the bit offset, the `AccessAs` and the
+/// `Connection` each element leaves for the units after it.
+#[derive(Debug)]
+pub(crate) struct FieldWalk
+{
+    kind: FieldKind,
+    flags: u8,
+    bit: u32,
+    access_as: Option<AccessAs>,
+    /// The `Connection` of the units after it, which the caller sets.
+    pub(crate) connection: Option<ExprId>,
+}
+
+impl FieldWalk
+{
+    /// A walk of a field list of `kind` with `FieldFlags` `flags`.
+    pub(crate) const fn new(kind: FieldKind, flags: u8) -> Self
+    {
+        Self {
+            kind,
+            flags,
+            bit: 0,
+            access_as: None,
+            connection: None,
+        }
+    }
+
+    /// Take the element `elem`: the field unit it declares, with its name,
+    /// or `None` for an element that declares none. A `Connection` is the
+    /// caller's to set.
+    pub(crate) fn step(&mut self, elem: &FieldElem) -> Result<Option<(Seg, FieldUnit)>, FaultKind>
+    {
+        match *elem
+        {
+            FieldElem::Named { name, bits } =>
+            {
+                let unit = FieldUnit {
+                    kind: self.kind,
+                    flags: self.flags,
+                    access_as: self.access_as,
+                    bit_offset: self.bit,
+                    bit_len: bits,
+                    connection: self.connection,
+                };
+                self.bit = self.bit.checked_add(bits).ok_or(FaultKind::Bound)?;
+                Ok(Some((name, unit)))
+            }
+            FieldElem::Reserved { bits } =>
+            {
+                self.bit = self.bit.checked_add(bits).ok_or(FaultKind::Bound)?;
+                Ok(None)
+            }
+            FieldElem::Access { kind, attrib } =>
+            {
+                self.access_as = Some(AccessAs {
+                    kind,
+                    attrib,
+                    len: 0,
+                });
+                Ok(None)
+            }
+            FieldElem::ExtendedAccess { kind, attrib, len } =>
+            {
+                self.access_as = Some(AccessAs { kind, attrib, len });
+                Ok(None)
+            }
+            FieldElem::Connect(_) => Ok(None),
+        }
     }
 }
 
@@ -808,7 +851,7 @@ fn fold(t: Term, mask: u64) -> Result<Data, FaultKind>
         (Op::Integer, Imm::Int(v)) => Ok(Data::Integer(v & mask)),
         (Op::Revision, _) => Ok(Data::Integer(REVISION)),
         (Op::String, Imm::Bytes(b)) => Ok(Data::String(b)),
-        (Op::NameRef, Imm::Name(n)) => Ok(Data::Reference(n)),
+        (Op::NameRef, Imm::Name(n)) => Ok(Data::Name(n)),
         (Op::Buffer, Imm::Bytes(mut bytes)) =>
         {
             let size = kids

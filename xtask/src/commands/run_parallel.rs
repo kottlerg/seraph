@@ -23,7 +23,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::error::{Context as _, Result, bail};
-use regex::Regex;
 
 use crate::accel::detect_for_arch;
 use crate::arch::Arch;
@@ -37,6 +36,7 @@ use crate::qemu::{
     GdbMode, QemuLaunchSpec, SecondDisk, build_qemu_argv, prepare_riscv_firmware,
     validate_sysroot_for_launch,
 };
+use crate::regex::Regex;
 use crate::term::filter::FilterWriter;
 use crate::util::{require_tool, step};
 

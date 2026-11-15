@@ -10,8 +10,8 @@
 //! service is permanently down (continue, or graceful shutdown). On restart
 //! svcmgr re-creates the process via procmgr, replays the recipe's
 //! argv/env/cwd/seed surfaces, its scheduling fields (`priority`,
-//! `sched_max`), and its log-sink flag, serves its bootstrap, and rebinds
-//! death notification.
+//! `sched_max`), and its log-sink flag, binds the new instance's death
+//! observers before it starts, and serves its bootstrap.
 //!
 //! Bootstrap delivery re-resolves the recipe's `seed` caps (the log-sink
 //! service instead gets a round minted from the reserved log-sink sources).
@@ -24,8 +24,10 @@ use crate::definitions::launch::{
 };
 use crate::definitions::{build_blob, cwd_rights};
 use crate::service::{POLICY_ALWAYS, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry};
-use ipc::{IpcMessage, procmgr_labels};
+use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 use std::os::seraph::process::ArgvEnvCap;
+use svcmgr_defs::DeathTag;
+use syscall_abi::SyscallError;
 
 /// Outcome of [`handle_death`], routed by the caller (`dispatch_deaths`
 /// in `main.rs`) to either continue, log degradation, or initiate a
@@ -283,10 +285,10 @@ pub struct RestartCtx
     pub procmgr_ep: u64,
     pub bootstrap_ep: u64,
     pub ipc_buf: *mut u64,
-    /// The death-notification queues. Restarted services are rebound
-    /// here with the same correlator they used pre-crash, so the routing
-    /// in `dispatch_deaths` continues to land on the correct
-    /// `ServiceEntry`.
+    /// The death-notification queues. A restarted service's observers are
+    /// bound here under its slot and its new instance, so the routing in
+    /// `dispatch_deaths` lands on the same `ServiceEntry` and drops a late
+    /// post of the dead instance.
     pub deaths: death_set::DeathSet,
     /// Reserved master-log endpoint source. svcmgr mints real-logd's RECV (and
     /// the first-launch `HANDOVER_PULL` SEND) from it on every (re)launch.
@@ -303,10 +305,10 @@ pub struct RestartCtx
 /// budget + restart source). When the service ends up permanently down
 /// — restart not attempted or failed — `system_critical` alone decides
 /// whether the system can continue without it. Marks the service
-/// inactive if not restarted. `correlator` is the death-payload tag
-/// used to route this entry — the restarted thread is rebound under
-/// the same value so subsequent crashes route back to the same
-/// `ServiceEntry`.
+/// inactive if not restarted. `tag` is the death tag the routed post
+/// carried: the restarted instance's observers are bound under the same slot
+/// and the next instance, so its death routes back to the same
+/// `ServiceEntry` and a late post of this instance is dropped.
 ///
 /// Returns a [`DeathOutcome`] the caller routes:
 ///
@@ -320,7 +322,7 @@ pub fn handle_death(
     svc: &mut ServiceEntry,
     exit_reason: u64,
     ctx: &RestartCtx,
-    correlator: u64,
+    tag: DeathTag,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
 ) -> DeathOutcome
@@ -339,7 +341,7 @@ pub fn handle_death(
         u64::from(svc.restart_count.saturating_add(1))
     );
 
-    if !restart_process(svc, ctx, correlator, recipe, registry)
+    if !restart_process(svc, ctx, tag.slot, recipe, registry)
     {
         svc.active = false;
         return permanent_death_outcome(svc);
@@ -407,14 +409,17 @@ fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
     true
 }
 
-/// Release the dead instance, create a new process via procmgr, start it,
-/// serve its bootstrap rounds, and rebind death notification. Returns `true`
-/// on success; on a failure after the create the new child is destroyed and
-/// `svc.process_handle` is zeroed.
+/// Release the dead instance, create a new process via procmgr, bind its
+/// death observers (its main thread's, and its address space's through
+/// procmgr) under the slot's next instance, start it, and serve its bootstrap
+/// rounds. The observers are bound before `START_PROCESS`, so no death of the
+/// new instance precedes them. Returns `true` on success; on a failure after
+/// the create the new child is destroyed and the entry holds no instance
+/// (`process_handle` and `thread_cap` zero).
 fn restart_process(
     svc: &mut ServiceEntry,
     ctx: &RestartCtx,
-    correlator: u64,
+    slot: u32,
     recipe: Option<&RestartRecipe>,
     registry: &mut registry::Registry,
 ) -> bool
@@ -423,11 +428,11 @@ fn restart_process(
     // ProcessInfo memory cap) before spawning a fresh one. CSpace teardown
     // cascades: memory caps handed to the dead process via `REQUEST_MEMORY_CAPS`
     // (which procmgr no longer holds caps on) get dec-ref'd and reclaimed
-    // into memmgr's pool. An init-endowed (bind-only) service's initial
-    // instance was created by init, not svcmgr, so svcmgr has no handle for
-    // it — `process_handle == 0` on its first death, and we skip; subsequent
-    // deaths reclaim. A svcmgr-launched service holds the handle
-    // reconciliation recorded at launch, so its first death reclaims too.
+    // into memmgr's pool. A service init created by raw syscalls (memmgr,
+    // procmgr) has no process handle, and is never restarted: its recipe is
+    // `restart = never`. Every other service holds the handle its launch, its
+    // last restart, or init's endowment (devmgr, vfsd) recorded. A teardown
+    // procmgr already ran makes the call a no-op reply.
     if svc.process_handle != 0
     {
         let destroy_msg = IpcMessage::new(procmgr_labels::DESTROY_PROCESS);
@@ -436,12 +441,15 @@ fn restart_process(
         let _ = syscall::cap_delete(svc.process_handle);
         svc.process_handle = 0;
     }
-    // Release svcmgr's reference to the dead instance's exited thread; for
-    // an init-spawned first instance it is svcmgr's only handle on it.
-    if svc.thread_cap != 0
+    // Release svcmgr's references to the dead instance: its exited thread and,
+    // for an instance init created by raw syscalls, its address space.
+    for cap in [&mut svc.thread_cap, &mut svc.aspace_cap]
     {
-        let _ = syscall::cap_delete(svc.thread_cap);
-        svc.thread_cap = 0;
+        if *cap != 0
+        {
+            let _ = syscall::cap_delete(*cap);
+            *cap = 0;
+        }
     }
 
     let Some((process_handle, new_thread_cap, child_badge)) = create_process(svc, recipe, ctx)
@@ -449,21 +457,36 @@ fn restart_process(
     {
         return false;
     };
+
+    let instance = svc.instance.wrapping_add(1);
+    let tag = DeathTag { slot, instance };
+    if !bind_instance_observers(ctx, new_thread_cap, process_handle, tag.correlator())
+    {
+        std::os::seraph::log!(warn: "failed to bind the new instance's death observers");
+        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        return false;
+    }
     svc.process_handle = process_handle;
+    svc.thread_cap = new_thread_cap;
+    svc.instance = instance;
+    // The entry names the new instance from here; a failure below destroys it
+    // and leaves the entry holding none.
+    let fail = |svc: &mut ServiceEntry| {
+        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        svc.process_handle = 0;
+        svc.thread_cap = 0;
+        false
+    };
 
     if !start_process(process_handle, ctx.ipc_buf)
     {
-        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
-        svc.process_handle = 0;
-        return false;
+        return fail(svc);
     }
 
     let Some(boot_caps) = restart_boot_caps(svc, ctx, recipe, registry)
     else
     {
-        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
-        svc.process_handle = 0;
-        return false;
+        return fail(svc);
     };
 
     if serve_boot_slots(ctx, child_badge, &boot_caps).is_err()
@@ -472,22 +495,12 @@ fn restart_process(
         // serve_round MOVES caps on success; on failure they may or
         // may not have been consumed. Best-effort delete is safe
         // (delete of an already-transferred slot is a no-op). The
-        // started child is blocked in its bootstrap request, so it is
-        // destroyed rather than left waiting.
+        // started child is blocked in its bootstrap request; destroy it.
         delete_caps(&boot_caps);
-        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
-        svc.process_handle = 0;
-        return false;
+        return fail(svc);
     }
 
     svc.bootstrap_badge = child_badge;
-
-    if !rebind_death_notification(svc, &ctx.deaths, new_thread_cap, correlator)
-    {
-        destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
-        svc.process_handle = 0;
-        return false;
-    }
     true
 }
 
@@ -793,23 +806,63 @@ pub(crate) fn destroy_partial_child(process_handle: u64, thread_cap: u64, ipc_bu
     let _ = syscall::cap_delete(thread_cap);
 }
 
-/// Rebind death notification onto the death queues using the same
-/// correlator the dead instance used. Every supervised service routes
-/// through `ctx.deaths`, and the payload tag is what links a death back to
-/// its `ServiceEntry`.
-fn rebind_death_notification(
-    svc: &mut ServiceEntry,
-    deaths: &death_set::DeathSet,
-    new_thread_cap: u64,
+/// Bind both death observers of a new instance under `correlator`: one on its
+/// main thread (`thread_cap`), and one on its address space, which procmgr
+/// binds on svcmgr's behalf through `process_handle` ([`bind_fault_observer`]),
+/// so the first terminal fault of any of its threads reaches svcmgr. True when
+/// both are bound. Shared by the launch and restart paths, which call it
+/// before `START_PROCESS`.
+pub(crate) fn bind_instance_observers(
+    ctx: &RestartCtx,
+    thread_cap: u64,
+    process_handle: u64,
     correlator: u64,
 ) -> bool
 {
-    if deaths.bind_thread(new_thread_cap, correlator).is_err()
-    {
-        std::os::seraph::log!(warn: "failed to rebind death notification");
-        return false;
-    }
+    ctx.deaths.bind_thread(thread_cap, correlator).is_ok()
+        && bind_fault_observer(&ctx.deaths, process_handle, correlator, ctx.ipc_buf)
+}
 
-    svc.thread_cap = new_thread_cap;
-    true
+/// Have procmgr bind one of svcmgr's death queues as a terminal-fault death
+/// observer, posting `correlator`, on the address space of the child
+/// `process_handle` names (`procmgr_labels::BIND_DEATH_OBSERVER`), through a
+/// `POST` copy of the queue the call transfers. The death set picks the queue
+/// as for a thread bind: procmgr's `OUT_OF_MEMORY` reply (the queue has no free
+/// observer node) moves the bind to another queue, or grows the set. True
+/// when procmgr bound it; false, any copy released, when the copy cannot be
+/// derived or the call fails or is refused (a child procmgr already tore down
+/// among the causes).
+pub(crate) fn bind_fault_observer(
+    deaths: &death_set::DeathSet,
+    process_handle: u64,
+    correlator: u64,
+    ipc_buf: *mut u64,
+) -> bool
+{
+    deaths
+        .bind_with(|queue| {
+            let post = syscall::cap_derive(queue, syscall::RIGHTS_EQ_POST)?;
+            let msg = IpcMessage::builder(procmgr_labels::BIND_DEATH_OBSERVER)
+                .word(0, correlator)
+                .cap(post)
+                .build();
+            // SAFETY: `ipc_buf` is svcmgr's registered IPC buffer.
+            match unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
+            {
+                // procmgr deletes its copy on every reply.
+                Ok(reply) if reply.label == procmgr_errors::SUCCESS => Ok(()),
+                Ok(reply) if reply.label == procmgr_errors::OUT_OF_MEMORY =>
+                {
+                    Err(SyscallError::OutOfMemory as i64)
+                }
+                Ok(_) => Err(SyscallError::InvalidArgument as i64),
+                Err(e) =>
+                {
+                    // The call did not transfer the copy.
+                    let _ = syscall::cap_delete(post);
+                    Err(e)
+                }
+            }
+        })
+        .is_ok()
 }

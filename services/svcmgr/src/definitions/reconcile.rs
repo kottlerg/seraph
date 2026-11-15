@@ -10,7 +10,8 @@
 //! Three outcomes per `.svc` file:
 //!
 //! 1. **Defined AND registered** — bind death-notification on the
-//!    registered thread cap, record the recipe's fixed fields on the
+//!    registered thread cap and on the service's address space, through the
+//!    cap init endowed with it, record the recipe's fixed fields on the
 //!    matching `ServiceEntry` and its argv/env/cwd/seed, log-sink flag,
 //!    and scheduling fields in the parallel `RestartRecipe` table.
 //! 2. **Defined only** — call [`super::launch::launch`] to spawn the
@@ -29,7 +30,10 @@ use std::os::seraph::log;
 
 use super::parse::parse;
 use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch, shutdown_actuator};
-use crate::restart::RestartCtx;
+use svcmgr_defs::DeathTag;
+use svcmgr_endowment::SubstrateObserver;
+
+use crate::restart::{RestartCtx, bind_fault_observer};
 use crate::service::{
     POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
 };
@@ -37,13 +41,18 @@ use crate::service::{
 /// Entry in svcmgr's pending-registration table populated from init's
 /// handover endowment (one substrate `SUBSTRATE` round each). Each entry
 /// pairs a service name with the thread cap svcmgr will bind
-/// death-notification on once the matching `.svc` definition is found.
+/// death-notification on once the matching `.svc` definition is found, and
+/// the cap it binds the observer of the service's address space through.
 pub struct PendingRegistration
 {
     /// The service name the substrate round carried, at most
     /// `ipc::svcmgr_labels::NAME_MAX` bytes.
     pub name: String,
     pub thread_cap: u64,
+    /// The cap svcmgr binds the death observer of the service's address
+    /// space through: a `Control`-only address-space cap (memmgr, procmgr) or
+    /// the procmgr process handle (devmgr, vfsd).
+    pub observer: SubstrateObserver,
     /// Set to `true` once a `.svc` definition has consumed this entry, or
     /// when the scan has no memory for the parsed recipes and releases it
     /// unsupervised (`release_unsupervised`). Entries still `false` after
@@ -83,8 +92,8 @@ pub struct ShutdownActuator
 /// The service table and its index-aligned restart recipes, grown together,
 /// and the shutdown actuator among them.
 ///
-/// A slot is never reused, so its index is a stable death correlator for
-/// every instance the slot supervises; a launch that fails leaves its
+/// A slot is never reused, so its index names one service in every death
+/// post for svcmgr's lifetime ([`DeathTag`]); a launch that fails leaves its
 /// reserved slot inactive. Both vectors grow on the heap with no fixed count.
 pub struct ServiceTable
 {
@@ -108,17 +117,17 @@ impl ServiceTable
     }
 
     /// Reserve the next slot, inactive, and return its index and the death
-    /// correlator that names it. `None`, changing nothing, when the heap
-    /// cannot grow either vector.
-    fn reserve(&mut self) -> Option<(usize, u64)>
+    /// tag of its first instance. `None`, changing nothing, when the heap
+    /// cannot grow either vector or the index does not fit a tag's slot.
+    fn reserve(&mut self) -> Option<(usize, DeathTag)>
     {
         let idx = self.services.len();
-        let correlator = u64::try_from(idx).ok()?;
+        let tag = DeathTag::new(idx, 0)?;
         self.services.try_reserve(1).ok()?;
         self.recipes.try_reserve(1).ok()?;
         self.services.push(ServiceEntry::empty());
         self.recipes.push(None);
-        Some((idx, correlator))
+        Some((idx, tag))
     }
 
     /// Store `entry` and `recipe` in the slot `idx` that [`Self::reserve`]
@@ -336,12 +345,11 @@ fn handle_definition(
     {
         slot.consumed = true;
         log!("svcmgr: bind only: {}", def.name);
-        // init-created service: svcmgr has no process_handle (init
-        // didn't share it). First death cannot DESTROY_PROCESS — see
-        // `restart::restart_process`. Bind happens after the fact (the
-        // thread has been running since its bootstrap spawn); `bind_only`
-        // states why a death in that window is still delivered.
-        return bind_only(def, slot.thread_cap, table, &ctx.deaths);
+        // init-created service: init endowed its thread cap and the cap
+        // its address space is observed through. Bind happens after the fact
+        // (the thread has been running since its bootstrap spawn);
+        // `bind_only` states why a death in that window is still delivered.
+        return bind_only(def, slot, table, ctx);
     }
 
     // Not registered by init → svcmgr launches it.
@@ -377,13 +385,13 @@ fn handle_definition(
     // never reused, so a burned slot costs one heap entry; healthy boots
     // never burn.
     //
-    // The correlator is deliberately the service-table index, not a
-    // randomized value (#249): it is opaque to the kernel, delivered only to
-    // svcmgr's own private death queues (never in an IPC body, cap, or logged
-    // value), and consumed directly as `services[idx]` on death dispatch.
-    // With no untrusted observer there is nothing to enumerate, and a
-    // (random-epoch, index) split would buy nothing.
-    let Some((idx, correlator)) = table.reserve()
+    // The correlator is deliberately the service-table index and the
+    // instance (`DeathTag`), not a randomized value (#249): it is opaque to
+    // the kernel, delivered only to svcmgr's own private death queues (never
+    // in an IPC body, cap, or logged value), and consumed directly as
+    // `services[idx]` on death dispatch. With no untrusted observer there is
+    // nothing to enumerate, and a random epoch would buy nothing.
+    let Some((idx, tag)) = table.reserve()
     else
     {
         log!(
@@ -403,7 +411,7 @@ fn handle_definition(
         return None;
     };
 
-    let Some(launched) = launch::launch(def, ctx, registry, Some(correlator))
+    let Some(launched) = launch::launch(def, ctx, registry, Some(tag))
     else
     {
         log!(warn: "svcmgr: launch failed: {}", def.name);
@@ -418,32 +426,42 @@ fn handle_definition(
 }
 
 /// Bind-only path: bind death-notification on a thread init already
-/// started in Phase 1/2/3, record the `ServiceEntry`. `process_handle`
-/// is `0` for these services (init never shared its handle); first
-/// death cannot `DESTROY_PROCESS` — see `restart::restart_process`.
+/// started in Phase 1/2/3, and the observer of its address space through the
+/// cap init endowed with it, and record the `ServiceEntry`. For memmgr and
+/// procmgr, which init created by raw syscalls, that cap is a `Control`-only
+/// address-space cap, bound directly and kept for the resync; for devmgr and
+/// vfsd, which init created through procmgr, it is the process handle,
+/// through which procmgr binds the observer
+/// (`procmgr_labels::BIND_DEATH_OBSERVER`) and which the entry keeps.
 ///
 /// Race-free despite binding after the thread was started: the kernel
 /// retains a thread's `exit_reason` past death and `thread_bind_notification`
-/// serialises on the thread's `sched_lock`. A death in the window between
-/// init's spawn and this bind is therefore delivered to the death queues when the
-/// bind lands on the already-exited thread, not dropped (#106 Window 2).
+/// serialises on the thread's `sched_lock`, and it retains the address
+/// space's first terminal fault and replays it to a later address-space bind.
+/// A death in the window between init's spawn and this bind is therefore
+/// delivered to the death queues when the bind lands, not dropped (#106
+/// Window 2). A failed address-space bind is logged and leaves the main
+/// thread's observer standing: init cannot be asked again, and the service is
+/// still supervised for its main thread's death.
 ///
-/// Returns the slot of the recorded entry, or `None` when none is recorded.
+/// Returns the slot of the recorded entry, or `None` when none is recorded;
+/// the registration's caps are then released.
 fn bind_only(
     def: &Definition,
-    thread_cap: u64,
+    pending: &PendingRegistration,
     table: &mut ServiceTable,
-    deaths: &death_set::DeathSet,
+    ctx: &RestartCtx,
 ) -> Option<usize>
 {
-    let Some((idx, correlator)) = table.reserve()
+    let release = || release_registration(pending);
+    let Some((idx, tag)) = table.reserve()
     else
     {
         log!(
             warn: "svcmgr: no memory for a service-table slot; dropping {}",
             def.name
         );
-        let _ = syscall::cap_delete(thread_cap);
+        release();
         return None;
     };
     let (Some(mut entry), Some(recipe)) = (build_entry(def), recipe_from(def))
@@ -453,20 +471,59 @@ fn bind_only(
             warn: "svcmgr: no memory for {}'s entry; running unsupervised",
             def.name
         );
-        let _ = syscall::cap_delete(thread_cap);
+        release();
         return None;
     };
-    if deaths.bind_thread(thread_cap, correlator).is_err()
+    if ctx
+        .deaths
+        .bind_thread(pending.thread_cap, tag.correlator())
+        .is_err()
     {
         log!(warn: "svcmgr: bind death-notification failed for {}", def.name);
-        let _ = syscall::cap_delete(thread_cap);
+        release();
         return None;
     }
-    // `process_handle` stays 0: init created this instance and kept its
-    // handle (see `restart::restart_process`).
-    entry.thread_cap = thread_cap;
+    entry.thread_cap = pending.thread_cap;
+    let bound = match pending.observer
+    {
+        SubstrateObserver::AddressSpace(aspace) =>
+        {
+            entry.aspace_cap = aspace;
+            ctx.deaths.bind_aspace(aspace, tag.correlator()).is_ok()
+        }
+        SubstrateObserver::ProcessHandle(handle) =>
+        {
+            entry.process_handle = handle;
+            bind_fault_observer(&ctx.deaths, handle, tag.correlator(), ctx.ipc_buf)
+        }
+        SubstrateObserver::None => false,
+    };
+    if !bound
+    {
+        log!(
+            warn: "svcmgr: no address-space observer for {}; only its main thread's death is seen",
+            def.name
+        );
+    }
     table.install(idx, entry, recipe)?;
     Some(idx)
+}
+
+/// Release every cap of a pending registration svcmgr does not supervise.
+fn release_registration(pending: &PendingRegistration)
+{
+    let observer = match pending.observer
+    {
+        SubstrateObserver::AddressSpace(cap) | SubstrateObserver::ProcessHandle(cap) => cap,
+        SubstrateObserver::None => 0,
+    };
+    for cap in [pending.thread_cap, observer]
+    {
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
 }
 
 /// Clone the launch surfaces the restart path replays from a parsed
@@ -565,7 +622,7 @@ fn build_entry(def: &Definition) -> Option<ServiceEntry>
     Some(entry)
 }
 
-/// Release the thread cap of every pending registration when the scan has
+/// Release the caps of every pending registration when the scan has
 /// no memory to parse the recipes: the init-spawned services run on,
 /// unsupervised, and none is reported as a configuration error.
 fn release_unsupervised(pending: &mut [PendingRegistration])
@@ -576,19 +633,16 @@ fn release_unsupervised(pending: &mut [PendingRegistration])
             warn: "svcmgr: no memory for the recipes; {} runs unsupervised",
             slot.name_str()
         );
-        if slot.thread_cap != 0
-        {
-            let _ = syscall::cap_delete(slot.thread_cap);
-        }
+        release_registration(slot);
         slot.consumed = true;
     }
 }
 
 /// Log every entry in `pending` that was never matched by a `.svc`
-/// definition and release its thread cap. Per the reconciliation
+/// definition and release its caps. Per the reconciliation
 /// contract these are hard errors but non-fatal — svcmgr keeps
 /// running for the services that did resolve cleanly. Releasing the
-/// thread cap here avoids leaking a slot per orphaned registration
+/// caps here avoids leaking a slot per orphaned registration
 /// over svcmgr's lifetime.
 fn report_orphans(pending: &[PendingRegistration])
 {
@@ -600,10 +654,7 @@ fn report_orphans(pending: &[PendingRegistration])
                 warn: "svcmgr: registered without definition: {} (refusing to bind)",
                 slot.name_str()
             );
-            if slot.thread_cap != 0
-            {
-                let _ = syscall::cap_delete(slot.thread_cap);
-            }
+            release_registration(slot);
         }
     }
 }

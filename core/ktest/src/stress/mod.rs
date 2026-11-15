@@ -106,9 +106,10 @@ fn rotation_slot(cycle: u32, cycles: u32, span: u32) -> u32
 /// Run all stress tests.
 #[expect(
     clippy::large_stack_frames,
-    reason = "no large local: the estimate sums the temporaries of its 44 `run_test!` expansions \
-              (the logged names, the closure passed to `run_isolated` and its `TestResult`, about \
-              220 B each), and the compiled frame is under 1 KiB; on init's 16 KiB stack"
+    reason = "no large local: the estimate sums the temporaries of its `run_integration_test!` \
+              expansions (the logged names, the closure passed to `run_isolated` and its \
+              `TestResult`, about 220 B each), and the compiled frame is under 1 KiB; on init's 16 \
+              KiB stack"
 )]
 pub fn run_all(ctx: &TestContext)
 {

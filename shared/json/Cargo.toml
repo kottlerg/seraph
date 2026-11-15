@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "json"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# `no_std` with `alloc`, no dependency: a strict JSON value, its parser and
+# its printers, for host code that reads untrusted JSON.
+[lib]
+doctest = false
+
+[lints]
+workspace = true

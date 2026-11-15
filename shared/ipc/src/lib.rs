@@ -91,7 +91,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 15;
+pub const PROCMGR_LABELS_VERSION: u32 = 16;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -387,6 +387,21 @@ pub mod procmgr_labels
     /// tools and `std::process::Child::try_wait`-style probes that want to
     /// peek without blocking on a death event.
     pub const QUERY_PROCESS: u64 = 9;
+    /// Bind the caller's event queue as a terminal-fault death observer on
+    /// a child's address space, sent on the child's badged
+    /// `process_handle` only: `caps[0]` a `POST` cap on the queue,
+    /// `data[0]` the correlator the post carries. The first terminal fault
+    /// in any of the child's threads then posts `(fault class, correlator)`
+    /// to the queue, once; a child that has already faulted posts its retained fault
+    /// class at once. procmgr keeps the address space's `Control` right
+    /// and deletes its copy of the cap whatever the outcome. Replies
+    /// `SUCCESS`; `UNAUTHORIZED` on a cap other than a process handle;
+    /// `INVALID_BADGE` when the handle names no live process;
+    /// `INVALID_ARGUMENT` without a queue cap or on one that lacks `POST`;
+    /// `OUT_OF_MEMORY` when the queue has no free observer node. Specified
+    /// in `services/procmgr/docs/ipc-interface.md` § Label 25:
+    /// `BIND_DEATH_OBSERVER`.
+    pub const BIND_DEATH_OBSERVER: u64 = 25;
     /// Install one direction's shmem-backed stdio pipe on a child
     /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] but not yet
     /// started.
@@ -2483,17 +2498,18 @@ pub mod devmgr_labels
 /// The `test-fault` fixture driver's service labels and roles
 /// (services/drivers/test-fault/README.md).
 ///
-/// devmgr binds the fixture to QEMU's `pci-testdev` functions (PCI
-/// `1b36:0005`) only through [`devmgr_labels::BIND_DRIVERS`], since it is
-/// installed outside `/services/drivers/`. Each instance takes its role from
-/// the resource list devmgr delivers it: a function with no BAR 2 serves; one
-/// whose BAR 2 is [`HANG_BAR_BYTES`] long holds [`HOLD_BYTES`] and never
-/// reports ready; one whose BAR 2 is [`ORPHAN_BAR_BYTES`] long holds
-/// [`HOLD_BYTES`] and fails its bootstrap's terminal round, so devmgr destroys
-/// it mid-bootstrap. A serving instance answers [`FAULT_PING`] with
-/// `SUCCESS`, and [`FAULT_EXIT`] with `SUCCESS` before it receives nothing
-/// more and exits once [`FAULT_EXIT_DELAY_MS`] has passed, so a call sent on
-/// the endpoint after the reply stays queued until devmgr withdraws the dead
+/// devmgr binds the fixture to QEMU's `pci-testdev` functions (PCI `1b36:0005`)
+/// only through [`devmgr_labels::BIND_DRIVERS`], since it is installed outside
+/// `/services/drivers/`. Each instance takes its role from the resource list
+/// devmgr delivers it: a function with no BAR 2 serves; one whose BAR 2 is
+/// [`HANG_BAR_BYTES`] long holds [`HOLD_BYTES`] and never reports ready; one
+/// whose BAR 2 is [`ORPHAN_BAR_BYTES`] long holds [`HOLD_BYTES`] and fails its
+/// bootstrap's terminal round, so devmgr destroys it mid-bootstrap. A serving
+/// instance answers [`FAULT_PING`] with `SUCCESS`, [`FAULT_EXIT`] with `SUCCESS`
+/// before it receives nothing more and exits once [`FAULT_EXIT_DELAY_MS`] has
+/// passed, and [`FAULT_WORKER`] with `SUCCESS` before it receives nothing more
+/// and a thread of its own faults once that delay has passed, so a call sent on
+/// the endpoint after either reply stays queued until devmgr withdraws the dead
 /// fixture. Every request carries no data; no badge bit is checked.
 pub mod test_fault_labels
 {
@@ -2512,6 +2528,10 @@ pub mod test_fault_labels
     /// Reply `SUCCESS`, then exit after [`FAULT_EXIT_DELAY_MS`] without
     /// receiving again.
     pub const FAULT_EXIT: u64 = 2;
+    /// Reply `SUCCESS`, then receive nothing more and start a thread that
+    /// takes a terminal fault after [`FAULT_EXIT_DELAY_MS`], while the main
+    /// thread lives on: the death of a driver whose worker thread faults.
+    pub const FAULT_WORKER: u64 = 3;
     /// How long the fixture waits between its `FAULT_EXIT` reply and its
     /// exit, so the caller's next call is queued before the fixture dies.
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;

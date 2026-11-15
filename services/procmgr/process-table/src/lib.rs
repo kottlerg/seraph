@@ -1080,6 +1080,40 @@ pub fn served_on_handle(opcode: u64) -> bool
     )
 }
 
+/// Whether procmgr serves `opcode` on a process handle alone:
+/// `BIND_DEATH_OBSERVER`, through which only the child's creator chooses who
+/// observes the child's address space.
+#[must_use]
+pub fn served_on_handle_only(opcode: u64) -> bool
+{
+    opcode == ipc::procmgr_labels::BIND_DEATH_OBSERVER
+}
+
+/// The error procmgr refuses `opcode` with for the kind of cap it came on,
+/// read from the request's `badge` as received ([`request_badge`]: a
+/// process handle's carries `PROCESS_HANDLE_TAG`), before it serves it:
+/// `INVALID_BADGE` for a label not served on a handle
+/// ([`served_on_handle`]), and `UNAUTHORIZED` for a label served on a
+/// handle alone ([`served_on_handle_only`]) sent on any other cap; `None`
+/// when it serves it.
+#[must_use]
+pub fn sender_refusal(opcode: u64, badge: u64) -> Option<u64>
+{
+    let (_, on_handle) = request_badge(badge);
+    if on_handle && !served_on_handle(opcode)
+    {
+        Some(ipc::procmgr_errors::INVALID_BADGE)
+    }
+    else if !on_handle && served_on_handle_only(opcode)
+    {
+        Some(ipc::procmgr_errors::UNAUTHORIZED)
+    }
+    else
+    {
+        None
+    }
+}
+
 /// Whether a request on procmgr's endpoint badged `caller_badge` carries
 /// `procmgr_labels::DEBUG_AUTHORITY`.
 #[must_use]
@@ -1804,6 +1838,29 @@ mod tests
         {
             assert!(served_on_handle(opcode));
         }
+    }
+
+    #[test]
+    fn sender_refusal_matches_each_label_to_its_cap()
+    {
+        use ipc::procmgr_errors::{INVALID_BADGE, UNAUTHORIZED};
+        use ipc::procmgr_labels::{
+            BIND_DEATH_OBSERVER, DECLARE_NO_DEBUG, PROCESS_HANDLE_TAG, QUERY_PROCESS,
+            REGISTER_THREAD,
+        };
+        let (own, handle) = (0x50, 0x50 | PROCESS_HANDLE_TAG);
+        // Labels naming their sender are refused on a handle.
+        for opcode in [DECLARE_NO_DEBUG, REGISTER_THREAD]
+        {
+            assert_eq!(sender_refusal(opcode, handle), Some(INVALID_BADGE));
+            assert_eq!(sender_refusal(opcode, own), None);
+        }
+        // The observer bind is the creator's: refused on any other cap.
+        assert_eq!(sender_refusal(BIND_DEATH_OBSERVER, handle), None);
+        assert_eq!(sender_refusal(BIND_DEATH_OBSERVER, own), Some(UNAUTHORIZED));
+        // Every other label is served on both.
+        assert_eq!(sender_refusal(QUERY_PROCESS, handle), None);
+        assert_eq!(sender_refusal(QUERY_PROCESS, own), None);
     }
 
     /// A table holding the sender `0x40` and another process `0x50`, each

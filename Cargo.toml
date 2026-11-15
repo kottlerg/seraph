@@ -67,6 +67,7 @@ members = [
     "shared/recv-pool",
     "shared/syscall",
     "shared/ipc",
+    "shared/json",
     "shared/log",
     "shared/ns-client",
     "shared/registry",

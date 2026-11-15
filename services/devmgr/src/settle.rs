@@ -9,10 +9,11 @@
 //! for the rest of the boot.
 //!
 //! devmgr keeps one [`DriverWatch`] for the boot: a death event queue every
-//! driver's death observer posts to, with its device badge as the
-//! correlator, a job notification the registry's workers signal when a
-//! request leaves work for the control thread (`crate::Registry`), and a
-//! wait set over both that devmgr's control thread waits on. devmgr spawns
+//! driver's death observers post to, one on its main thread and one on its
+//! address space, with its device badge as the correlator, a job
+//! notification the registry's workers signal when a request leaves work for
+//! the control thread (`crate::Registry`), and a wait set over both that
+//! devmgr's control thread waits on. devmgr spawns
 //! its drivers in batches after the IOMMU batch (at boot, the drivers bound
 //! by the boot modules' declarations; after `SET_DRIVERS_DIR`, the drivers
 //! bound by the drivers directory's declarations; after each
@@ -62,6 +63,12 @@ pub const SETTLE_TIMEOUT: Duration =
     Duration::from_secs(2 * virtio_core::pci::RESET_TIMEOUT.as_secs());
 const _: () = assert!(SETTLE_TIMEOUT.as_millis() == ipc::devmgr_labels::SETTLE_TIMEOUT_MS as u128);
 
+/// Death observers devmgr binds on each driver to its death queue
+/// (`crate::spawn::spawn_bound_driver`): one on the driver's main thread and
+/// one on its address space. A fault of the main thread that is the driver's
+/// first terminal fault posts to both.
+pub const OBSERVERS_PER_DRIVER: u32 = 2;
+
 /// Wait-set badge of the job notification.
 const WS_BADGE_JOB: u64 = 1;
 /// Wait-set badge of a settling batch's private driver endpoint.
@@ -101,23 +108,27 @@ pub struct DriverWatch
 impl DriverWatch
 {
     /// Create the watch for a boot that spawns at most `drivers` drivers:
-    /// the death queue holds one post and one death-observer node per
-    /// driver, since devmgr spawns each at most once and binds one observer
-    /// on each, so no death is dropped and every bind is funded. The queue
-    /// holds at most the kernel's `EVENT_QUEUE_MAX_CAPACITY`; past it, the
-    /// bind of a driver beyond the queue's nodes fails and that driver is not
-    /// spawned, logged. The job notification is a member of the wait set
-    /// from the start. Returns `None`, logging why and releasing what it
-    /// created, when an object cannot be created.
+    /// the death queue holds [`OBSERVERS_PER_DRIVER`] posts and
+    /// death-observer nodes per driver, since devmgr spawns each at most once
+    /// and binds that many observers on each, whose posts the kernel bounds
+    /// (core/kernel/docs/syscalls.md § `SYS_THREAD_BIND_NOTIFICATION` (47)
+    /// and § `SYS_ASPACE_BIND_NOTIFICATION` (53)), so no death is dropped
+    /// and every bind is funded. The queue holds at most the kernel's
+    /// `EVENT_QUEUE_MAX_CAPACITY`; past it, the bind of a driver beyond the
+    /// queue's nodes fails and that driver is withdrawn, logged. The job
+    /// notification is a member of the wait set from the start. Returns
+    /// `None`, logging why and releasing what it created, when an object
+    /// cannot be created.
     pub fn new(drivers: usize) -> Option<Self>
     {
-        let capacity = u32::try_from(drivers)
+        let wanted = drivers.saturating_mul(OBSERVERS_PER_DRIVER as usize);
+        let capacity = u32::try_from(wanted)
             .unwrap_or(u32::MAX)
             .clamp(1, syscall_abi::EVENT_QUEUE_MAX_CAPACITY);
-        if usize::try_from(capacity).is_ok_and(|c| c < drivers)
+        if usize::try_from(capacity).is_ok_and(|c| c < wanted)
         {
             std::os::seraph::log!(
-                warn: "watch: {} drivers past the death queue's capacity {}",
+                warn: "watch: the death observers of {} drivers past the death queue's capacity {}",
                 drivers as u64,
                 capacity
             );

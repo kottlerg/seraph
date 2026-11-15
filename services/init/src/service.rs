@@ -18,24 +18,52 @@ use crate::walk;
 use init_log_levels::Service;
 use init_protocol::{CapType, InitInfo};
 use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
+use svcmgr_endowment::{SubstrateObserver, encode_substrate};
 
-/// Thread caps init collects across Phases 1-3 to hand svcmgr in the
-/// handover endowment (one `SUBSTRATE` round each). Zero in a slot means
-/// init could not capture (or chose not to capture) that service's thread
-/// cap; the corresponding endowment round is then skipped.
+/// The cap through which svcmgr observes a substrate service's address space,
+/// as init holds it.
+#[derive(Default, Clone, Copy)]
+pub enum Observer
+{
+    /// None: svcmgr observes the main thread only.
+    #[default]
+    None,
+    /// init's cap on the address space of a service it created by raw
+    /// syscalls (memmgr, procmgr); svcmgr is endowed a `Control`-only
+    /// derivation of it.
+    AddressSpace(u64),
+    /// The procmgr process handle of a service init had procmgr create
+    /// (devmgr, vfsd), moved to svcmgr, which binds its observer through
+    /// procmgr (`procmgr_labels::BIND_DEATH_OBSERVER`).
+    ProcessHandle(u64),
+}
+
+/// The caps init hands svcmgr for one substrate service in its `SUBSTRATE`
+/// round: its main thread cap and its address-space [`Observer`].
+#[derive(Default, Clone, Copy)]
+pub struct SubstrateCaps
+{
+    /// The service's main thread cap; zero when init could not capture it,
+    /// and the service's round is then skipped.
+    pub thread: u64,
+    pub observer: Observer,
+}
+
+/// The substrate caps init collects across Phases 1-3 to hand svcmgr in the
+/// handover endowment (one `SUBSTRATE` round each).
 ///
 /// Field order matches reconciliation order in the boot log, not
 /// spawn order. memmgr / procmgr come from
-/// [`crate::bootstrap::MemmgrBootstrap::mm_thread`] /
-/// [`crate::bootstrap::ProcmgrBootstrap::pm_thread`]; the rest come
+/// [`crate::bootstrap::MemmgrBootstrap`] /
+/// [`crate::bootstrap::ProcmgrBootstrap`]; the rest come
 /// from the matching spawn-helper return values.
 #[derive(Default, Clone, Copy)]
 pub struct ServiceThreadCaps
 {
-    pub memmgr: u64,
-    pub procmgr: u64,
-    pub devmgr: u64,
-    pub vfsd: u64,
+    pub memmgr: SubstrateCaps,
+    pub procmgr: SubstrateCaps,
+    pub devmgr: SubstrateCaps,
+    pub vfsd: SubstrateCaps,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -659,7 +687,7 @@ pub fn create_devmgr_with_caps(
     svcmgr_service_ep: u64,
     spawn_env: &SpawnEnv,
     ipc_buf: *mut u64,
-) -> Option<u64>
+) -> Option<SubstrateCaps>
 {
     let devmgr_memory_cap = crate::find_module_by_name(info, b"devmgr")?;
     let devmgr_module_copy = module_spawn_copy(devmgr_memory_cap)?;
@@ -974,7 +1002,10 @@ pub fn create_devmgr_with_caps(
         &[kind::SVCMGR_BUNDLE, bundle_cap_count as u64],
         "devmgr: bootstrap SVCMGR_BUNDLE round failed",
     );
-    Some(thread_cap)
+    Some(SubstrateCaps {
+        thread: thread_cap,
+        observer: Observer::ProcessHandle(process_handle),
+    })
 }
 
 // ── vfsd creation ────────────────────────────────────────────────────────────
@@ -1026,7 +1057,7 @@ pub fn create_vfsd_with_caps(
     spawn: &VfsdSpawnCaps,
     spawn_env: &SpawnEnv,
     ipc_buf: *mut u64,
-) -> Option<u64>
+) -> Option<SubstrateCaps>
 {
     let vfsd_memory_cap = crate::find_module_by_name(info, b"vfsd")?;
     let vfsd_module_copy = module_spawn_copy(vfsd_memory_cap)?;
@@ -1131,7 +1162,10 @@ pub fn create_vfsd_with_caps(
         "vfsd: bootstrap round 2 failed",
     );
 
-    Some(thread_cap)
+    Some(SubstrateCaps {
+        thread: thread_cap,
+        observer: Observer::ProcessHandle(process_handle),
+    })
 }
 
 // ── svcmgr / procmgr coordination ───────────────────────────────────────────
@@ -1453,7 +1487,12 @@ fn endow_svcmgr(
 
 /// Serve svcmgr one `SUBSTRATE` round per init-bootstrapped service whose
 /// thread cap init captured, stopping at the first failure with its
-/// `serve_round` error code.
+/// `serve_round` error code. Each round carries the service's thread cap and
+/// its address-space observer cap ([`Observer`]): for memmgr and procmgr a
+/// `Control`-only derivation of the address space, for devmgr and vfsd the
+/// process handle. An address-space cap that cannot be derived leaves the
+/// round without an observer, logged; svcmgr then observes that service's main
+/// thread only.
 ///
 /// init skips a service whose thread cap it could not capture, so a missing
 /// recipe match is bind-only-absent rather than a `registered without
@@ -1466,42 +1505,52 @@ fn serve_substrate_rounds(
     ipc_buf: *mut u64,
 ) -> Result<(), u64>
 {
-    let registrations: &[(&[u8], u64)] = &[
+    let registrations: &[(&[u8], SubstrateCaps)] = &[
         (b"memmgr", thread_caps.memmgr),
         (b"procmgr", thread_caps.procmgr),
         (b"devmgr", thread_caps.devmgr),
         (b"vfsd", thread_caps.vfsd),
     ];
-    for &(name, thread_cap) in registrations
+    for &(name, caps) in registrations
     {
-        if thread_cap == 0
+        if caps.thread == 0
         {
             continue;
         }
-        let mut name_words = [0u64; ipc::svcmgr_labels::NAME_WORDS];
-        let Some(nw) = ipc::svcmgr_labels::pack_name(name, &mut name_words)
+        let observer = match caps.observer
+        {
+            Observer::None => SubstrateObserver::None,
+            Observer::AddressSpace(aspace) =>
+            {
+                if let Ok(control) = syscall::cap_derive(aspace, syscall::RIGHTS_AS_CONTROL)
+                {
+                    SubstrateObserver::AddressSpace(control)
+                }
+                else
+                {
+                    log("phase 3: substrate address-space observer cap not derived");
+                    SubstrateObserver::None
+                }
+            }
+            Observer::ProcessHandle(handle) => SubstrateObserver::ProcessHandle(handle),
+        };
+        let Some(round) = encode_substrate(name, caps.thread, observer)
         else
         {
             log("phase 3: substrate name exceeds svcmgr's NAME_MAX; not endowed");
+            if let SubstrateObserver::AddressSpace(control) = observer
+            {
+                let _ = syscall::cap_delete(control);
+            }
             continue;
         };
-        let mut data = [0u64; 2 + ipc::svcmgr_labels::NAME_WORDS];
-        let [kind_word, len_word, words @ ..] = &mut data;
-        *kind_word = svcmgr_endowment::kind::SUBSTRATE;
-        *len_word = name.len() as u64;
-        // `pack_name` returns the count of words it wrote into `name_words`, which is
-        // at most `NAME_WORDS`, the length of both `words` and `name_words`.
-        if let (Some(dst), Some(src)) = (words.get_mut(..nw), name_words.get(..nw))
-        {
-            dst.copy_from_slice(src);
-        }
         serve_checked(
             bootstrap_ep,
             child_badge,
             ipc_buf,
             false,
-            &[thread_cap],
-            data.get(..nw.saturating_add(2)).unwrap_or_default(),
+            round.caps(),
+            round.data(),
             "phase 3: svcmgr endowment SUBSTRATE round failed",
         )?;
     }
@@ -1532,8 +1581,8 @@ fn end_endowment(bootstrap_ep: u64, child_badge: u64, ipc_buf: *mut u64)
 // ── Phase 3 orchestration ───────────────────────────────────────────────────
 
 /// Phase 3: load svcmgr, serve it the handover endowment (its own
-/// endpoints + publish-role source caps + one `(name, thread_cap)` round
-/// per init-bootstrapped substrate service + the reserved log-sink
+/// endpoints + publish-role source caps + one `(name, thread_cap, observer)`
+/// round per init-bootstrapped substrate service + the reserved log-sink
 /// sources), then notification `HANDOVER_COMPLETE` so svcmgr scans
 /// `/config/svcmgr/services/`. svcmgr owns all post-handover work from the
 /// endowment: it publishes the well-known names, installs devmgr's drivers
@@ -1594,8 +1643,8 @@ pub fn phase3_svcmgr_handover(
     // Serve svcmgr its handover endowment: the CAPS rounds carry svcmgr's own
     // endpoints plus the publish-role source caps (rootfs root, devmgr
     // registry, the three vfsd SENDs), then one round per init-bootstrapped
-    // substrate service carries that service's (name, thread_cap) for
-    // death-supervision binding, and the terminal round carries the reserved
+    // substrate service carries that service's (name, thread_cap, observer)
+    // for death-supervision binding, and the terminal round carries the reserved
     // log-sink sources. svcmgr drains it all in `bootstrap_caps`, publishes
     // the well-known names it owns (`rootfs.root` / `svcmgr` / the `devmgr.*`
     // and `vfsd.*` names), installs devmgr's drivers dir, and reconciles

@@ -56,7 +56,7 @@ no change to the encoding.
 | slot 6 | `vfsd_labels::SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (published seed-only as `vfsd.swap`; absent if its derive fails) |
 | caps[..] | the present slots of the round's window, in slot order |
 | data[0] | `1` (`CAPS`) |
-| data[1] | `SVCMGR_LABELS_VERSION` (currently `11`) handshake, in every `CAPS` round |
+| data[1] | `SVCMGR_LABELS_VERSION` (currently `12`) handshake, in every `CAPS` round |
 | data[2] | presence word, relative to the round's window: bit `i` is set when window slot `i` is present |
 | data[3] | rounds left: the number of `CAPS` rounds after this one (`0` on the last) |
 
@@ -81,9 +81,11 @@ vfsd) whose thread cap init captured; logd is not a substrate. See init's
 | Field | Value |
 |---|---|
 | caps[0] | the service's main thread cap (Control right) for death-notification binding |
+| caps[1] | the observer cap, present exactly when `data[2]` is non-zero |
 | data[0] | `2` (`SUBSTRATE`) |
 | data[1] | `name_len` (byte length of the service name) |
-| data[2..] | service name bytes packed LE into `u64` words (`svcmgr_labels::pack_name`; at most `svcmgr_labels::NAME_MAX` = 64 bytes) |
+| data[2] | `observer_kind`: `0` none; `1` address space (caps[1] is a Control-only `AddressSpace` cap); `2` process handle (caps[1] is the service's procmgr process handle) |
+| data[3..] | service name bytes packed LE into `u64` words (`svcmgr_labels::pack_name`; at most `svcmgr_labels::NAME_MAX` = 64 bytes) |
 
 **Final round — `LOGD_SOURCES` (`data[0] = 3`, terminal):**
 
@@ -107,7 +109,10 @@ absent, which the round's presence word records (see
 [`seed`](service-definitions.md#seed)); logd runs without that slot's cap, or,
 for the master-log source, exits at startup.
 
-svcmgr parks each substrate pair in its pending-registration table. It does **not**
+svcmgr parks each substrate `(name, thread, observer)` triple in its pending-registration
+table. memmgr and procmgr carry an address-space cap, devmgr and vfsd a process handle; svcmgr
+keeps the cap as the entry's `aspace_cap` or `process_handle` and binds the second death observer
+through it ([restart-protocol.md](restart-protocol.md#death-detection)). It does **not**
 bind death-notification at endowment time — the matching `.svc`
 definition is paired at reconciliation, on
 [`HANDOVER_COMPLETE`](#label-2-handover_complete). After draining the
@@ -116,7 +121,8 @@ endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`) into its own registry, configures devmgr's
 device classes and publishes each as `devmgr.class.<stem>` (the class file's name without
 `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering
-the event loop.
+the event loop. Both read through vfsd and call devmgr, and are skipped when either is dead
+([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 ---
 
@@ -145,7 +151,7 @@ to teardown), then runs
 
 1. Scan `/config/svcmgr/services/`, parse each `.svc` into a
    [`Definition`](../src/definitions/mod.rs).
-2. Reconcile against the pending-registration table (the substrate pairs
+2. Reconcile against the pending-registration table (the substrate triples
    parked from the endowment):
    * **parked AND defined** — bind death-notification, record the
      recipe's fixed fields on the `ServiceEntry` and its argv/env/cwd/seed,
@@ -265,15 +271,16 @@ See [`docs/capability-model.md`](../../../docs/capability-model.md)
 
 svcmgr maintains a growable set of death EventQueues. At
 reconciliation time, every supervised service has its main thread
-bound to one of them with `correlator = service_table_index`. The
+bound to one of them, and its address space bound to one, each with the
+`DeathTag` correlator `(instance << 32) | slot`. The
 WaitSet holds the service endpoint (badge 0) and every death queue
 (badge 1).
 
-When a thread exits (clean or fault), the kernel posts the death entry
-`(exit_reason, correlator)` to the queue its observer was bound on (see
-[restart-protocol.md](restart-protocol.md#death-detection)). svcmgr drains
-every queue and routes each payload to its `ServiceEntry` via the
-correlator, then dispatches through
+When the main thread exits (clean or fault), or any thread takes the address space's first
+terminal fault, the kernel posts the death entry `(exit_reason, correlator)` to the queue its
+observer was bound on (see [restart-protocol.md](restart-protocol.md#death-detection)). svcmgr
+drains every queue and routes each payload whose tag names the slot's active, current instance
+to its `ServiceEntry`, then dispatches through
 [`restart::handle_death`](../src/restart.rs).
 
 Exit reason encoding:

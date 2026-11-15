@@ -227,6 +227,13 @@ public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `serv
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
 reply to `SHUTDOWN`.
 
+The `svcmgr_worker_fault_restart` phase runs when the `crasher-worker.svc` recipe is staged
+beside `svctest.svc` and is skipped otherwise; staged, it fails if `crasher.worker` is not
+published within 10 s. It reads the instance's
+nonce with `PROBE_INSTANCE`, sends `PROBE_FAULT_WORKER` so a worker thread of the fixture faults,
+and requires a different nonce from the instance svcmgr restarts
+([crasher](../crasher/README.md)).
+
 ---
 
 ## Child Modes

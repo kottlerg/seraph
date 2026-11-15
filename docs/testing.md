@@ -169,6 +169,7 @@ rootfs/config/svcmgr/
 │   ├── svctest.svc
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
+│   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
@@ -491,9 +492,9 @@ after `test-terminal`, on the default boot `test-terminal` restored.
 ### CET shadow stacks (`test-cet`)
 
 On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them and its
-transient-execution selection rewrites no return (it does on a CPU without enhanced or Automatic
-IBRS, which takes the retpoline sequence), so a corrupted return address faults instead of being
-followed
+transient-execution selection rewrites no return (it does on a CPU that takes the retpoline
+sequence, one without enhanced IBRS, Automatic IBRS or IBRS on entry), so a corrupted return
+address faults instead of being followed
 ([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)). Neither the CI
 runners nor TCG offer the feature, so CI boots only the kernel without them. Every launcher pins the
 guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), and a QEMU
@@ -537,8 +538,11 @@ Per boot, at most one *shutdown-invoking* harness recipe MUST be staged in
 `/config/svcmgr/services/`.
 
 Non-shutdown fixtures may co-stage alongside one harness. `crasher`
-(`restart = always`, never shuts down) is co-staged with `svctest` in
-the services-surface CI cell so its restart loop is exercised there; its
+(`restart = always`, never shuts down) and its worker-fault role
+(`crasher-worker.svc`, `restart = on_failure`) are co-staged with `svctest` in
+the services-surface CI cell so their restart paths are exercised there (svctest's
+`svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
+skipped otherwise); its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it.
 
@@ -1032,7 +1036,7 @@ line of its own diff is on.
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
-| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
+| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); the code that runs on the supervisor shadow stack at every entry from user mode, or decides whether shadow stacks are on (`seraph_enter_from_user`, `__x86_indirect_thunk_r11`, `rewrites_returns`, and `RETURN_REWRITING`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies what
@@ -1085,6 +1089,7 @@ D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
 D="$D|shadow_stack|shadow_page|shadow_offset|set_shadow_stack_pages|shadow_on_boot_cpu"
 D="$D|make_cpu_shadow_pages|(idle|cpu)_shadow_pages|idle_saved_state|shadow_direct_map_page"
 D="$D|new_shadow_stack_page|kernel_write_fault_is_spurious"
+D="$D|seraph_enter_from_user|__x86_indirect_thunk_r11|rewrites_returns|RETURN_REWRITING"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($D)\b"
 git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
@@ -1160,7 +1165,7 @@ owes some of the cells runs those boots, and the release host runs run all four.
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
@@ -1195,7 +1200,7 @@ is the framebuffer device cell (Device surfaces above).
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only

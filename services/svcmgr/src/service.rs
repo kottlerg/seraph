@@ -34,8 +34,20 @@ pub struct ServiceEntry
     /// Service name: its `.svc` file's stem, at most
     /// `ipc::svcmgr_labels::NAME_MAX` bytes.
     pub name: String,
-    /// Capability slot for the service's thread.
+    /// Capability slot for the service's main thread.
     pub thread_cap: u64,
+    /// The instance of the service [`Self::thread_cap`] belongs to: `0` for
+    /// the first, one more for each restart (wrapping). Both death observers
+    /// of an instance carry it in their [`svcmgr_defs::DeathTag`], so a post
+    /// is routed only for the instance that runs now.
+    pub instance: u32,
+    /// A `Control`-only cap on the address space of a service init created by
+    /// raw syscalls (memmgr, procmgr), from its endowment round: svcmgr bound
+    /// the death observer of the service's other threads with it, and reads
+    /// the space's retained terminal fault back through it in a resync. Zero
+    /// for every other service, whose address space procmgr observes for
+    /// svcmgr through [`Self::process_handle`].
+    pub aspace_cap: u64,
     /// Persistent service endpoint svcmgr created for a `provides = ...`
     /// service: the source half (the child holds a RECV derivation,
     /// consumers a published SEND). Zero for pure-consumer services. The
@@ -73,9 +85,13 @@ pub struct ServiceEntry
     /// after each successful `CREATE_FROM_FILE` reply on restart; used to
     /// call `DESTROY_PROCESS` before spawning the next restart so procmgr
     /// can reclaim kernel objects and return its memory caps to memmgr's
-    /// pool. Zero only for init-endowed services (which svcmgr never
-    /// created — init did), so their first death cannot destroy; the
-    /// restart then populates it and subsequent deaths can.
+    /// pool; svcmgr also binds the death observer of the service's address
+    /// space through it (`procmgr_labels::BIND_DEATH_OBSERVER`) and asks
+    /// procmgr for the instance's state through it in a resync
+    /// (`procmgr_labels::QUERY_PROCESS`). For a
+    /// substrate service init created through procmgr (devmgr, vfsd) it is
+    /// the handle init endowed; zero for memmgr and procmgr, which procmgr
+    /// did not create.
     pub process_handle: u64,
     /// Namespace-policy kind reconciliation recorded from the `.svc`
     /// `namespace = ...` line; one of `ipc::svcmgr_labels::NS_POLICY_*`.
@@ -100,6 +116,8 @@ impl ServiceEntry
         Self {
             name: String::new(),
             thread_cap: 0,
+            instance: 0,
+            aspace_cap: 0,
             provided_endpoint: 0,
             vfs_path: String::new(),
             restart_policy: 0,
@@ -165,7 +183,8 @@ pub struct RestartRecipe
 // (only present caps ride, a presence bitmap names the slot each fills) are
 // the `svcmgr_endowment` crate, which init encodes with; the wire layout is
 // specified in services/svcmgr/docs/ipc-interface.md § Handover endowment.
-// Each `SUBSTRATE` round parks one `(name, thread_cap)` pair in `pending`;
+// Each `SUBSTRATE` round parks one service's name, main thread cap and
+// address-space observer cap in `pending`;
 // `HANDOVER_COMPLETE` later reconciles them against
 // `/config/svcmgr/services/`. log and procmgr endpoints arrive via
 // `ProcessInfo` / `StartupInfo`, not these rounds.
@@ -211,8 +230,9 @@ pub struct SvcmgrCaps
 }
 
 /// Acquire svcmgr's initial cap set and substrate registrations from its
-/// creator (init) by draining the handover endowment rounds. Substrate
-/// `(name, thread_cap)` pairs are parked in `pending`; the returned
+/// creator (init) by draining the handover endowment rounds. Each substrate
+/// service's registration (name, main thread cap, address-space observer
+/// cap) is parked in `pending`; the returned
 /// `SvcmgrCaps` carries the endpoint + publish-source caps. Returns `None`
 /// on a missing creator endpoint, a failed round, a version mismatch, or a
 /// malformed CAPS round.
@@ -333,56 +353,45 @@ pub fn try_string(s: &str) -> Option<String>
     Some(out)
 }
 
-/// Park one substrate `(name, thread_cap)` round in `pending`. Releases the
-/// delivered thread cap on any reject (invalid name, heap exhausted) so a
-/// malformed round cannot leak a cap.
+/// Park one decoded `SUBSTRATE` round (the service's name, its main thread
+/// cap, and the cap svcmgr observes its address space through) in
+/// `pending`. Releases every delivered cap on any reject (a round that does
+/// not decode, a name that is not UTF-8, heap exhausted), so a malformed round
+/// cannot leak a cap.
 fn ingest_substrate(round: &ipc::bootstrap::BootstrapRound, pending: &mut Vec<PendingRegistration>)
 {
-    if round.cap_count < 1
-    {
-        return;
-    }
-    let thread_cap = round.caps[0];
-    if thread_cap == 0
-    {
-        return;
-    }
-    let reject = |cap: u64| {
-        let _ = syscall::cap_delete(cap);
+    let caps = round.caps.get(..round.cap_count).unwrap_or_default();
+    let words = round.data.get(..round.data_words).unwrap_or_default();
+    let reject = |why: &str| {
+        std::os::seraph::log!(warn: "bootstrap: substrate round dropped: {why}");
+        for &cap in caps
+        {
+            let _ = syscall::cap_delete(cap);
+        }
     };
-    let name_len = round.data[1] as usize;
-    let Some(bytes) = round
-        .data
-        .get(2..round.data_words)
-        .and_then(|words| ipc::svcmgr_labels::unpack_name(words, name_len))
+    let Ok(substrate) = svcmgr_endowment::decode_substrate(caps, words)
     else
     {
-        std::os::seraph::log!(warn: "bootstrap: substrate name invalid");
-        reject(thread_cap);
+        reject("malformed");
         return;
     };
-    let Some(name) = bytes
-        .get(..name_len)
-        .and_then(|name| core::str::from_utf8(name).ok())
+    let Some(name) = core::str::from_utf8(substrate.name()).ok()
     else
     {
-        std::os::seraph::log!(warn: "bootstrap: substrate name invalid");
-        reject(thread_cap);
+        reject("name invalid");
         return;
     };
     let Some(name) = try_string(name).filter(|_| pending.try_reserve(1).is_ok())
     else
     {
-        std::os::seraph::log!(
-            warn: "bootstrap: no memory for a pending registration; dropping substrate"
-        );
-        reject(thread_cap);
+        reject("no memory for a pending registration");
         return;
     };
     std::os::seraph::log!("endowed: {name}");
     pending.push(PendingRegistration {
         name,
-        thread_cap,
+        thread_cap: substrate.thread,
+        observer: substrate.observer,
         consumed: false,
     });
 }

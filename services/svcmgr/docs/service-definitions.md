@@ -415,7 +415,9 @@ it sends `SET_DRIVERS_DIR`. For each file it sends devmgr `devmgr_labels::MINT_C
 the class SEND devmgr replies with seed-only as `devmgr.class.<stem>`, `<stem>` being the file
 name without `.class` (`ipc::published_names::DEVMGR_CLASS_PREFIX`). A service reaches a class
 only when its `seed` line names that publication. A file that cannot be read or parsed, or whose
-class devmgr refuses, is logged and skipped.
+class devmgr refuses, is logged and skipped. The files are read through vfsd and the classes
+minted by devmgr, and either found dead ends the pass
+([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 The grammar is the `.svc` grammar: line-oriented `key = value`, `#` comments, an unknown or
 repeated key an error. The class name is the `class` key, or the file stem (the file name without
@@ -447,12 +449,12 @@ init requests the `block` class SEND itself, for vfsd's root mount.
 
 At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 `<name>.svc`, and reconciles against the pending-registration table
-(substrate pairs parked from the handover endowment):
+(substrate triples parked from the handover endowment):
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind death-notification on the endowed thread cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind death-notification (when `restart != never`, so the observer is in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
 
 Out of memory changes two outcomes. When the scan has no room for the list of parsed recipes, it
@@ -461,6 +463,11 @@ on unsupervised, and none is reported as a configuration error. When a **bind on
 `ServiceEntry` or restart recipe cannot be built, svcmgr logs `no memory for <name>'s entry;
 running unsupervised` and releases that thread cap; a **launching** entry in the same state is
 not launched. A recipe the heap cannot copy at parse time is dropped like a malformed one.
+
+A vfsd found dead before or during the scan, which reads through vfsd, ends reconciliation as a
+scan with no room for the parsed list does: nothing is recorded or launched, every pending
+registration is released, and svcmgr routes vfsd's death as system death
+([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 ## Relevant Design Documents
 

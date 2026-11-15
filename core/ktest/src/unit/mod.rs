@@ -774,6 +774,10 @@ pub fn run_all(ctx: &TestContext)
         "hw::irq_split_wrong_tag_err",
         hw::irq_split_wrong_tag_err(ctx)
     );
+    run_test!(
+        "hw::irq_split_wide_arg_err",
+        hw::irq_split_wide_arg_err(ctx)
+    );
 
     // ── Architecture-specific tests (`crate::arch::run_unit`) ────────────────────
     crate::arch::run_unit(ctx);

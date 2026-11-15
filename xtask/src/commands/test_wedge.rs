@@ -34,7 +34,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use object::{Object as _, ObjectSymbol as _, SymbolKind};
 
 use crate::arch::Arch;

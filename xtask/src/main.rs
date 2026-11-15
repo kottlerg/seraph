@@ -50,6 +50,7 @@ mod crash_log;
 mod debug_stub;
 mod diag;
 mod disk;
+mod error;
 mod firmware;
 mod fs_compat;
 mod gh;
@@ -145,7 +146,7 @@ fn main()
 
     if let Err(err) = result
     {
-        // Print the full error chain (anyhow includes context from .context() calls).
+        // `{:#}` prints the whole chain: each `context` above its cause.
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }

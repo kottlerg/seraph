@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 
 // ── Step printing ─────────────────────────────────────────────────────────────
 
@@ -86,7 +86,7 @@ pub fn require_tool(name: &str) -> Result<PathBuf>
         std::env::consts::EXE_EXTENSION,
     )
     .ok_or_else(|| {
-        anyhow::anyhow!(
+        crate::error::err!(
             "{name} not found on PATH\n{hint}",
             hint = install_hint_for(name),
         )

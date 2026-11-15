@@ -9,7 +9,7 @@
 //! being which file in the ESP staging area they author. This command
 //! authors `bootstrap.bundle`; `mkdisk` never does.
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::bundle;
 use crate::cli::ComposeBundleArgs;

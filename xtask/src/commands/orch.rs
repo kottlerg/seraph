@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use crate::error::{Context, Result, bail, err};
 use json::{Map, Value, json};
 
 use crate::cli::{
@@ -183,7 +183,7 @@ fn object_mut<'a>(state: &'a mut Value, key: &str) -> Result<&'a mut Map>
     state
         .get_mut(key)
         .and_then(Value::as_object_mut)
-        .ok_or_else(|| anyhow!("the state has no `{key}` object"))
+        .ok_or_else(|| err!("the state has no `{key}` object"))
 }
 
 /// Set the field `key` of the state to `value`.
@@ -191,7 +191,7 @@ fn set(state: &mut Value, key: &str, value: Value) -> Result<()>
 {
     state
         .as_object_mut()
-        .ok_or_else(|| anyhow!("the state is not an object"))?
+        .ok_or_else(|| err!("the state is not an object"))?
         .insert(key.to_owned(), value);
     Ok(())
 }
@@ -201,7 +201,7 @@ fn list_mut<'a>(state: &'a mut Value, key: &str) -> Result<&'a mut Vec<Value>>
     state
         .get_mut(key)
         .and_then(Value::as_array_mut)
-        .ok_or_else(|| anyhow!("the state has no `{key}` list"))
+        .ok_or_else(|| err!("the state has no `{key}` list"))
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> &'a str
@@ -273,7 +273,7 @@ fn grant_clear(state: &mut Value) -> Result<String>
         .get("grant")
         .filter(|grant| !grant.is_null())
         .map(|grant| text(grant, "holder").to_owned())
-        .ok_or_else(|| anyhow!("no exclusive grant is outstanding"))?;
+        .ok_or_else(|| err!("no exclusive grant is outstanding"))?;
     set(state, "grant", Value::Null)?;
     Ok(format!("grant of {holder} ended"))
 }
@@ -406,7 +406,7 @@ fn apply_worker(
         .entry(name.clone())
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or_else(|| anyhow!("the state's entry for {name} is not an object"))?;
+        .ok_or_else(|| err!("the state's entry for {name} is not an object"))?;
     for (field, value) in &set
     {
         worker.insert((*field).to_owned(), json!(value));
@@ -772,7 +772,7 @@ fn end(dir: &Path, secs: u64) -> Result<PathBuf>
             _ => dir.join(format!("{stem}-{number}.state.json")),
         })
         .find(|path| !path.exists())
-        .ok_or_else(|| anyhow!("no free name for the ended batch's state"))?;
+        .ok_or_else(|| err!("no free name for the ended batch's state"))?;
     fs::rename(dir.join(STATE_FILE), &kept)
         .with_context(|| format!("moving the state to {}", kept.display()))?;
     Ok(kept)
@@ -864,7 +864,7 @@ fn orchestrator_id(state: &Value) -> Result<String>
         .get("orchestrator")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| anyhow!("the state names no orchestrator"))
+        .ok_or_else(|| err!("the state names no orchestrator"))
 }
 
 /// Print the state in `dir` as the JSON it is stored as.

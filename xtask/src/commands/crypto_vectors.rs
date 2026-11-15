@@ -12,7 +12,7 @@
 
 use std::process::Command;
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::cli::CryptoVectorsArgs;
 use crate::context::Context as BuildContext;

@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use gdb_rsp::PACKET_SIZE;
 use gdb_rsp::frame::{Event, PacketReader, PacketWriter, unescape};
 
@@ -171,7 +171,7 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
     let result = rx
         .recv_timeout(BOOT_TIMEOUT)
         .map_err(|_| {
-            anyhow::anyhow!(
+            crate::error::err!(
                 "the fixture's {READY_MARKER:?} line did not appear within {}s",
                 BOOT_TIMEOUT.as_secs()
             )
@@ -231,7 +231,7 @@ impl Link
         body(&mut w);
         let len = w
             .finish()
-            .map_err(|e| anyhow::anyhow!("packet past the buffer: {e:?}"))?;
+            .map_err(|e| crate::error::err!("packet past the buffer: {e:?}"))?;
         self.send(buf.get(..len).context("packet length past the buffer")?)
     }
 
@@ -316,7 +316,7 @@ fn exchange(link: &mut Link) -> Result<()>
     })?;
     let echoed = link.expect(&Expect::Packet, "the echo")?;
     let mut out = vec![0u8; echoed.len()];
-    let n = unescape(&echoed, &mut out).map_err(|e| anyhow::anyhow!("echo: {e:?}"))?;
+    let n = unescape(&echoed, &mut out).map_err(|e| crate::error::err!("echo: {e:?}"))?;
     if out.get(..n) != Some(data.as_slice())
     {
         bail!("the echo differs from the {} bytes sent", data.len());

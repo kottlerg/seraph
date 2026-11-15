@@ -385,110 +385,115 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
             }
         };
         guard.on_success();
+        dispatch_service_request(&recv, ipc_buf, rt);
+    }
+}
 
-        let label = recv.label;
-        let opcode = label & 0xFFFF;
-        let badge = recv.badge;
+/// Serves one request received on the service endpoint: gates it on its
+/// badge's verb bit, then hands it to its label's handler, which replies.
+fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
+{
+    let opcode = recv.label & 0xFFFF;
+    let badge = recv.badge;
 
-        match opcode
+    match opcode
+    {
+        ipc::vfsd_labels::MOUNT =>
         {
-            ipc::vfsd_labels::MOUNT =>
+            // Verb-bit gate (docs/capability-model.md): MOUNT spawns a
+            // driver and installs a mount, so only a MOUNT_AUTHORITY
+            // badge reaches the handler.
+            if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
             {
-                // Verb-bit gate (docs/capability-model.md): MOUNT spawns a
-                // driver and installs a mount, so only a MOUNT_AUTHORITY
-                // badge reaches the handler.
-                if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(warn: "MOUNT rejected: badge lacks MOUNT_AUTHORITY");
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_mount_request(&recv, ipc_buf, rt);
-                }
-            }
-            ipc::vfsd_labels::UNMOUNT =>
-            {
-                // Who may mount may unmount: the same verb bit gates it.
-                if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(warn: "UNMOUNT rejected: badge lacks MOUNT_AUTHORITY");
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_unmount_request(&recv, ipc_buf, rt);
-                }
-            }
-            ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
-            {
-                if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} \
-                         expected {}",
-                        recv.word(0),
-                        ipc::VFSD_LABELS_VERSION
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_get_system_root_cap(ipc_buf, rt);
-                }
-            }
-            ipc::vfsd_labels::GET_SWAP_PARTITION =>
-            {
-                // Verb-bit gate: the hand-out revokes the previous holder's
-                // cap, so only the swap service's SWAP_AUTHORITY badge
-                // reaches it.
-                if badge & ipc::vfsd_labels::SWAP_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SWAP_PARTITION rejected: caller VFSD_LABELS_VERSION={} \
-                         expected {}",
-                        recv.word(0),
-                        ipc::VFSD_LABELS_VERSION
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_get_swap_partition(ipc_buf, rt);
-                }
-            }
-            _ =>
-            {
-                let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
+                std::os::seraph::log!(warn: "MOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
                 // SAFETY: ipc_buf is the thread-registered IPC buffer page.
                 let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
             }
+            else
+            {
+                handle_mount_request(recv, ipc_buf, rt);
+            }
+        }
+        ipc::vfsd_labels::UNMOUNT =>
+        {
+            // Who may mount may unmount: the same verb bit gates it.
+            if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
+            {
+                std::os::seraph::log!(warn: "UNMOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else
+            {
+                handle_unmount_request(recv, ipc_buf, rt);
+            }
+        }
+        ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
+        {
+            if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} \
+                     expected {}",
+                    recv.word(0),
+                    ipc::VFSD_LABELS_VERSION
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else
+            {
+                handle_get_system_root_cap(ipc_buf, rt);
+            }
+        }
+        ipc::vfsd_labels::GET_SWAP_PARTITION =>
+        {
+            // Verb-bit gate: the hand-out revokes the previous holder's
+            // cap, so only the swap service's SWAP_AUTHORITY badge
+            // reaches it.
+            if badge & ipc::vfsd_labels::SWAP_AUTHORITY == 0
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SWAP_PARTITION rejected: caller VFSD_LABELS_VERSION={} \
+                     expected {}",
+                    recv.word(0),
+                    ipc::VFSD_LABELS_VERSION
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else
+            {
+                handle_get_swap_partition(ipc_buf, rt);
+            }
+        }
+        _ =>
+        {
+            let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         }
     }
 }

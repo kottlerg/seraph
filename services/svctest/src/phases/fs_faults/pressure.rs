@@ -417,9 +417,10 @@ impl Drop for MappedPage
     }
 }
 
-/// Take grants until memmgr's free pool sits at 6/128 of the pool, below
-/// the low threshold (1/16) and above the reserve (2/128), then wait for
-/// the level to read `Low`; returns the grants.
+/// Take grants until memmgr's free pages outside `promised`, which its level
+/// reads, sit at 6/128 of the pool, below the low threshold (1/16) and above
+/// the reserve (2/128), then wait for the level to read `Low`; returns the
+/// grants.
 fn drive_low() -> Vec<(u64, u64)>
 {
     let (total, free, level) = pool_pressure_status();

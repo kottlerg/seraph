@@ -25,7 +25,8 @@ memmgr/
 ├── free-pool/                  # `memmgr-free-pool` crate: pure host-tested
 │                               # arena, free pool, deferred list, process
 │                               # index, budget nodes, region logic,
-│                               # per-region chunk tables
+│                               # per-region chunk tables, commitment
+│                               # bounds (`commit.rs`)
 ├── src/
 │   └── main.rs                 # _start() entry point, IPC dispatch loop
 └── docs/
@@ -134,8 +135,12 @@ The full memmgr IPC specification is in
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
 - `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms, the free and deferred
-  totals, the largest free run, the system reserve, and the memory-pressure level
-- `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region
+  totals, the largest free run, the system reserve, the memory-pressure level, and the pages
+  promised to committed regions
+- `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region;
+  `REGION_COMMIT` makes it a committed region
+- `EXTEND_REGION` / `SHRINK_REGION` — grow a committed region in place, or lower its top to a
+  64 KiB chunk multiple
 - `QUERY_MEMORY_USAGE` — read the caller's own budget usage, its max, and its subtree's usage
 - `REGISTER_PRESSURE(bits, notification_cap)` — register the Notification memmgr signals on a
   change of the memory-pressure level; a second replaces the first, and the std runtime
@@ -176,7 +181,7 @@ The remaining constants are tuning values that bound no capacity:
 | `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count windows one recheck spends; the run that crosses the budget is still read whole |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 | `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take; the pressure level is `CRITICAL` at or below it |
-| `PRESSURE_LOW_DIVISOR` | 16 | The pressure level is `LOW` below `pool_total / 16` free pages ([`docs/memory-pool.md`](docs/memory-pool.md) § Memory pressure) |
+| `PRESSURE_LOW_DIVISOR` | 16 | The pressure level is `LOW` below `pool_total / 16` free pages outside `promised` ([`docs/memory-pool.md`](docs/memory-pool.md) § Memory pressure) |
 | `PRESSURE_BAND_DIVISOR` | 128 | Hysteresis band of `pool_total / 128` pages, at least one, that the free pool clears before the level improves |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)

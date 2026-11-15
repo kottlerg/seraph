@@ -59,6 +59,9 @@ services/svctest/
         │                      #   faults on a fragmented pool; a sparse large region
         ├── budget.rs          # Create-time memory max: clamp, grants to it, LIMIT, decline 10,
         │                      #   pages back after the destroy; reserve and max refusals
+        ├── heap_commit.rs     # Committed heap growth: max refusal as an allocation error, a grant
+        │                      #   past the promised bound, no fault declined, committed region
+        │                      #   register, extend, shrink; all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -252,6 +255,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |
 | `aslr-layout-diverge-child` | `random`       | `aslr-layout` (per-process layout tuple)    |
 | `stale-map-child`           | `unmount`      | `vfsd_unmount_stale_mapping` (mapped page)  |
+| `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
+| `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 
 ---
 

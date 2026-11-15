@@ -413,8 +413,16 @@ rebuilds the kernel when the variable changes.
 
 On the development host the forced build selects IBRS on entry in place of enhanced IBRS, beside
 `BHI_DIS_S`, `VERW` on exit and the fill after an IBPB, so the ktest boot runs the entry and exit
-writes on every CPU. Its cost there, measured with the ktest bench against the build without the
-override, is not yet recorded.
+writes on every CPU. Its cost there was measured with the ktest bench: release builds with and
+without the override, three boots of each, at 4 vCPUs in a KVM guest on the Alder Lake host, with
+no other guest running. Each syscall round trip costs about 575 cycles more (minimum of 1000
+iterations, the same in every boot): `null_syscall_roundtrip` 184 to 186 cycles without the
+override and 757 to 759 with it, and `cap_info_lookup` 265 to 269 and 842 to 844.
+`mem_map_unmap`, two calls, costs about 1150 more (1935 to 2148, and 3212 to 3252). The IPC and
+notification round trips, which wait on another thread, vary more between boots than the
+difference. The comparison is with enhanced IBRS, which writes nothing on entry or exit, and on
+a part that is not one IBRS on entry is selected for; its cost on such a part is not measured
+([#1123](https://github.com/kottlerg/seraph/issues/1123)).
 
 ### Branch history injection
 

@@ -1474,7 +1474,8 @@ fn hello_file() -> (u64, u64)
 /// svctest, which is not phys-class, `ATTACH_PROCESS` and
 /// `REGISTER_CRASH_SERVICE` from a sender without the `DEBUG_AUTHORITY` badge,
 /// and a `CONFIGURE_PIPE` with an unknown
-/// direction or for a direction already configured. Each refused request
+/// direction or for a direction already configured, and the refusals of
+/// `BIND_DEATH_OBSERVER` ([`bind_death_observer_cells`]). Each refused request
 /// carries caps. procmgr's slot count is not observable from a client, so
 /// each cell asserts the refusal reply, and a
 /// spawn afterwards shows procmgr still serves. The phase then checks that
@@ -1561,6 +1562,7 @@ pub fn procmgr_refusals_phase(_: &Caps)
     }
 
     configure_pipe_refusals();
+    bind_death_observer_cells();
     argv_env_refusals();
 
     let status = std::process::Command::new("/programs/hello")
@@ -2214,6 +2216,111 @@ fn configure_pipe_refusals()
     );
     let _ = syscall::cap_delete(thread);
     let _ = syscall::cap_delete(handle);
+}
+
+/// procmgr serves `BIND_DEATH_OBSERVER` as
+/// `services/procmgr/docs/ipc-interface.md` § Label 25 specifies: refused
+/// `UNAUTHORIZED` on svctest's own procmgr cap, which is no process handle;
+/// `INVALID_ARGUMENT` on a handle without a queue cap, or with one that lacks
+/// `POST`; bound on a handle with a `POST` cap, which takes the queue's one
+/// observer node, so a second bind is refused `OUT_OF_MEMORY`; and
+/// `INVALID_BADGE` once the child is destroyed. Each refused request carries
+/// a cap, which procmgr deletes. A fault's post through such a binding is
+/// checked end to end by the devmgr on-demand bind phase.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the 8 request `IpcMessage`s of its calls (568 B each) and their replies; on the \
+              32 KiB main-thread stack of svctest"
+)]
+fn bind_death_observer_cells()
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let queue =
+        std::os::seraph::object_slab_retype(syscall_abi::event_queue_retype_bytes(1, 1), |slab| {
+            syscall::event_queue_create_observed(slab, 1, 1).ok()
+        })
+        .expect("BIND_DEATH_OBSERVER: event queue creation failed");
+    let post = || {
+        syscall::cap_derive(queue, syscall::RIGHTS_EQ_POST)
+            .expect("deriving a POST cap on the queue failed")
+    };
+    let bind = |cap: Option<u64>| {
+        let builder = IpcMessage::builder(procmgr_labels::BIND_DEATH_OBSERVER).word(0, 0x5EED);
+        match cap
+        {
+            Some(cap) => builder.cap(cap).build(),
+            None => builder.build(),
+        }
+    };
+    let procmgr = startup_info().procmgr_endpoint;
+    expect_reply(
+        procmgr,
+        &bind(Some(post())),
+        procmgr_errors::UNAUTHORIZED,
+        "BIND_DEATH_OBSERVER on svctest's own procmgr cap",
+    );
+
+    let (file, size) = hello_file();
+    let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
+        .word(0, size)
+        .cap(file)
+        .build();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    let reply = unsafe { ipc::ipc_call(procmgr, &create, std::os::seraph::current_ipc_buf()) }
+        .expect("raw CREATE_FROM_FILE call failed");
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "raw CREATE_FROM_FILE refused"
+    );
+    let (handle, thread) = match reply.caps()
+    {
+        &[handle, thread] => (handle, thread),
+        other => panic!("CREATE_FROM_FILE replied {} caps", other.len()),
+    };
+    expect_reply(
+        handle,
+        &bind(None),
+        procmgr_errors::INVALID_ARGUMENT,
+        "BIND_DEATH_OBSERVER without a queue cap",
+    );
+    let recv_only = syscall::cap_derive(queue, syscall::RIGHTS_EQ_RECV)
+        .expect("deriving a RECV-only cap on the queue failed");
+    expect_reply(
+        handle,
+        &bind(Some(recv_only)),
+        procmgr_errors::INVALID_ARGUMENT,
+        "BIND_DEATH_OBSERVER with a queue cap lacking POST",
+    );
+    expect_reply(
+        handle,
+        &bind(Some(post())),
+        procmgr_errors::SUCCESS,
+        "BIND_DEATH_OBSERVER on a process handle",
+    );
+    expect_reply(
+        handle,
+        &bind(Some(post())),
+        procmgr_errors::OUT_OF_MEMORY,
+        "BIND_DEATH_OBSERVER past the queue's observer nodes",
+    );
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+        procmgr_errors::SUCCESS,
+        "DESTROY_PROCESS of the observed child",
+    );
+    expect_reply(
+        handle,
+        &bind(Some(post())),
+        procmgr_errors::INVALID_BADGE,
+        "BIND_DEATH_OBSERVER on the handle of a destroyed child",
+    );
+    for cap in [thread, handle, queue]
+    {
+        let _ = syscall::cap_delete(cap);
+    }
 }
 
 /// argv[1] of the child that checks procmgr destroys a child whose create

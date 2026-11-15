@@ -69,7 +69,7 @@ fn main() -> !
         std::os::seraph::log!(error: "terminal: a devmgr.class seed is missing; exiting");
         syscall::thread_exit();
     };
-    let Some(input_cap) = query_device(input_class, ipc_buf)
+    let Some(input_cap) = await_device(input_class, "input", ipc_buf)
     else
     {
         std::os::seraph::log!(error: "terminal: no input device; exiting");
@@ -85,7 +85,7 @@ fn main() -> !
     {
         std::os::seraph::log!(warn: "terminal: framebuffer unavailable; serial-only output");
     }
-    let Some(serial_cap) = query_device(serial_class, ipc_buf)
+    let Some(serial_cap) = await_device(serial_class, "serial", ipc_buf)
     else
     {
         std::os::seraph::log!(error: "terminal: no serial device; exiting");
@@ -270,20 +270,29 @@ fn bootstrap_class_sends(creator_ep: u64, ipc_buf: *mut u64) -> Option<[u64; 3]>
     caps.iter().all(|&cap| cap != 0).then_some(caps)
 }
 
-/// The first driver of the class whose class SEND is `class_send`
-/// (`QUERY_DEVICE` at ordinal 0), retrying a bounded number of times while
-/// the driver's on-disk spawn completes: for a class the terminal cannot run
-/// without, which `devmgr_errors::NO_DEVICE` lets a client retry.
-fn query_device(class_send: u64, ipc_buf: *mut u64) -> Option<u64>
+/// The first live driver of the class whose class SEND is `class_send`, a
+/// class the terminal cannot run without: while the class serves none, wait
+/// on a `WATCH_CLASS` watch until devmgr serves one (`ipc::await_device`),
+/// logging the wait once. `None` when devmgr refuses the query or the watch,
+/// logged.
+fn await_device(class_send: u64, what: &str, ipc_buf: *mut u64) -> Option<u64>
 {
-    for _ in 0..100
-    {
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        if let Ok(cap) = unsafe { ipc::query_device(class_send, 0, ipc_buf) }
-        {
-            return Some(cap);
-        }
-        let _ = syscall::thread_yield();
-    }
-    None
+    let mut logged = false;
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let found = unsafe {
+        ipc::await_device(class_send, 0, ipc_buf, || {
+            if !logged
+            {
+                logged = true;
+                std::os::seraph::log!(
+                    "terminal: no {what} device yet; waiting for devmgr to serve one"
+                );
+            }
+        })
+    };
+    found
+        .inspect_err(|e| {
+            std::os::seraph::log!(error: "terminal: {what} device query failed ({e:?})");
+        })
+        .ok()
 }

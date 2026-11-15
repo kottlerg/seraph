@@ -234,9 +234,17 @@ name = "crashd"
 version = "0.1.4"
 dependencies = [
  "crash-report",
+ "crashd-core-file",
  "crashd-fault-bound",
  "ipc",
  "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "crashd-core-file"
+version = "0.1.4"
+dependencies = [
  "syscall-abi",
 ]
 

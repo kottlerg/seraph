@@ -181,12 +181,13 @@ impl Evaluator<'_>
         value::integer(&v, self.width()).map_err(by(t))
     }
 
-    /// `v`, or, when it is a reference `Index` made, the value it refers to.
+    /// `v`, or, when it is a reference `Index` made, the value it refers to,
+    /// counted against [`crate::MAX_EVAL_ALLOC`] as the copy the read makes.
     pub(super) fn computational(&mut self, v: Data) -> Result<Data, Fault>
     {
         match v
         {
-            Data::Ref(r) if !r.path.is_empty() => self.read_ref(&r),
+            Data::Ref(r) if !r.path.is_empty() => self.counted_read(&r),
             Data::Uninitialized
             | Data::Integer(_)
             | Data::String(_)
@@ -633,6 +634,7 @@ impl Evaluator<'_>
         let target = kid(t, 0)?;
         let place = self.place(target)?;
         let v = self.read_place(&place).map_err(placed(target))?;
+        self.charge(&v).map_err(by(target))?;
         let v = self.computational(v)?;
         let width = self.width();
         let old = value::integer(&v, width).map_err(by(t))?;
@@ -811,7 +813,16 @@ impl Evaluator<'_>
             self.check_ref(r).map_err(super::bare)?;
             return Ok(self.node_type(node));
         }
-        Ok(self.read_ref(r)?.type_number())
+        Ok(self.counted_read(r)?.type_number())
+    }
+
+    /// The object `r` refers to, counted against [`crate::MAX_EVAL_ALLOC`]
+    /// as the copy the read makes.
+    fn counted_read(&mut self, r: &Ref) -> Result<Data, Fault>
+    {
+        let v = self.read_ref(r)?;
+        self.charge(&v).map_err(super::bare)?;
+        Ok(v)
     }
 
     /// `Match`: the index of the first package element from the start index

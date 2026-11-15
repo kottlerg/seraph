@@ -1275,14 +1275,19 @@ fn every_loop_ends_at_the_step_bound()
 fn the_values_an_evaluation_makes_are_bounded()
 {
     // Each value counted once, as it is made: a 4 KiB buffer made, read
-    // from a name, returned by a method, held in a package, or converted.
+    // from a name, returned by a method, held in a package, converted, or
+    // copied from one package element to another through two references.
     let slot = size_of::<Data>();
     let buf = 0x1000 + slot;
     let defs = cat(&[
         &name_obj("BUF0", &buffer(&i(0x1000), &[])),
         &method("MKBF", 0, &ret(&buffer(&i(0x1000), &[]))),
+        &name_obj("SRC_", &package(1, &[buffer(&i(0x1000), &[])])),
+        &name_obj("DST_", &package(1, &[i(0)])),
     ]);
-    let cases: [(Vec<u8>, usize); 5] = [
+    // A reference to an element: its own slot and one index.
+    let element_ref = slot + 4;
+    let cases: [(Vec<u8>, usize); 6] = [
         (store(&buffer(&i(0x1000), &[]), &l(0)), buf),
         (store(&n("BUF0"), &l(0)), buf),
         (store(&n("MKBF"), &l(0)), buf),
@@ -1291,6 +1296,10 @@ fn the_values_an_evaluation_makes_are_bounded()
             buf + slot,
         ),
         (op(&[0x96], &[&n("BUF0"), &l(0)]), 2 * buf),
+        (
+            store(&index(&n("SRC_"), &i(0)), &index(&n("DST_"), &i(0))),
+            buf + 2 * element_ref,
+        ),
     ];
     for (pass, each) in cases
     {

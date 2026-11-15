@@ -393,7 +393,8 @@ entry for their `retbleed` (branch type confusion), and no control answers it or
 `spec_rstack_overflow`; `mitigation::report` logs each such class (§ Report). An Intel part
 without IBRS, and a part of another vendor, whose `retbleed` may be either form and whose IBRS
 is not read, stay on the retpoline sequence and are logged the same way. Enhanced IBRS and IBRS on
-entry count as answering `retbleed` only where the CPU has `rsb_alternate`.
+entry count as answering `retbleed` only on an Intel part with `rsb_alternate` and the IBRS
+input.
 
 No part that the project boots has `retbleed`; a kernel built to force the return mitigations
 runs IBRS on entry on the development host (§ Forced return mitigations).

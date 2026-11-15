@@ -330,16 +330,18 @@ const CONTROL_NAMES: [(u64, &str); 11] = [
 ];
 
 /// The classes the table gives kernel action that no selected control
-/// answers, by their log names: `retbleed` unless its returns fall back to
-/// the branch target buffer (`rsb_alternate`) and enhanced IBRS or IBRS on
-/// entry is selected (an AMD part's branch type confusion, which IBRS does
-/// not answer, and a part left on the retpoline sequence), and
+/// answers, by their log names: `retbleed` unless it is the form IBRS
+/// answers, returns that fall back to the branch target buffer on an Intel
+/// part (`rsb_alternate` with the IBRS input, which is read on Intel parts
+/// only), and enhanced IBRS or IBRS on entry is selected; so an AMD part's
+/// branch type confusion, a part of another vendor's `retbleed` of either
+/// form, and a part left on the retpoline sequence are named; and
 /// `spec_rstack_overflow`, which no control answers.
 fn unanswered(inputs: Inputs, controls: Controls) -> [Option<&'static str>; 2]
 {
     let ibrs = controls.bits() & (SPECULATION_CONTROL_EIBRS | SPECULATION_CONTROL_IBRS_ENTRY) != 0;
-    let retbleed = inputs.any(SPECULATION_INPUT_RETBLEED)
-        && !(ibrs && inputs.any(SPECULATION_INPUT_RSB_ALTERNATE));
+    let intel_form = inputs.has(SPECULATION_INPUT_RSB_ALTERNATE | SPECULATION_INPUT_IBRS);
+    let retbleed = inputs.any(SPECULATION_INPUT_RETBLEED) && !(ibrs && intel_form);
     [
         retbleed.then_some("retbleed"),
         inputs
@@ -1154,6 +1156,14 @@ mod tests
             unanswered(inputs, select(inputs)),
             [Some("retbleed"), Some("spec_rstack_overflow")]
         );
+        other.leaf7_edx |= 1 << 29;
+        other.arch_capabilities = 1 << 1;
+        let inputs = Inputs::of(&other, &derive(&other));
+        assert!(select(inputs).bits() & SPECULATION_CONTROL_EIBRS != 0);
+        assert_eq!(
+            unanswered(inputs, select(inputs)),
+            [Some("retbleed"), Some("spec_rstack_overflow")]
+        );
     }
 
     // Defect caught: a part whose table gives every class kernel action and both
@@ -1293,8 +1303,8 @@ mod tests
     // answers left out of the log, or a warning for one a control answers.
     // Zen 2 leaves `retbleed` and `spec_rstack_overflow` open; enhanced IBRS
     // and IBRS on entry each answer `retbleed` whose returns fall back to the
-    // branch target buffer, and neither answers it otherwise (branch type
-    // confusion).
+    // branch target buffer on an Intel part, and neither answers it otherwise
+    // (branch type confusion, or another vendor's `retbleed` of either form).
     #[test]
     fn unanswered_names_each_open_class()
     {
@@ -1304,15 +1314,18 @@ mod tests
             unanswered(inputs, select(inputs)),
             [Some("retbleed"), Some("spec_rstack_overflow")]
         );
-        let retbleed = Inputs(SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_RSB_ALTERNATE);
+        let retbleed = Inputs(
+            SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_RSB_ALTERNATE | SPECULATION_INPUT_IBRS,
+        );
         let confusion = Inputs(SPECULATION_INPUT_RETBLEED);
+        let other_vendor = Inputs(SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_RSB_ALTERNATE);
         for answer in [SPECULATION_CONTROL_EIBRS, SPECULATION_CONTROL_IBRS_ENTRY]
         {
             assert_eq!(unanswered(retbleed, Controls(answer)), [None, None]);
-            assert_eq!(
-                unanswered(confusion, Controls(answer)),
-                [Some("retbleed"), None]
-            );
+            for open in [confusion, other_vendor]
+            {
+                assert_eq!(unanswered(open, Controls(answer)), [Some("retbleed"), None]);
+            }
         }
         assert_eq!(
             unanswered(retbleed, Controls(SPECULATION_CONTROL_RETPOLINE)),

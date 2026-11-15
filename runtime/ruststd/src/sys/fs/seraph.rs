@@ -590,7 +590,7 @@ fn walk_components(
             {
                 let dup = syscall::cap_derive(root_cap, syscall_abi::RIGHTS_EP_SEND)
                     .map_err(|_| {
-                        io::Error::other("seraph fs: cap_derive of anchor dir failed")
+                        call_failed(root_cap, "seraph fs: cap_derive of anchor dir failed")
                     })?;
                 Ok(WalkedNode {
                     cap: dup,
@@ -642,11 +642,12 @@ fn walk_components(
             Ok(r) => r,
             Err(_) =>
             {
+                let err = call_failed(current_cap, "seraph fs: NS_LOOKUP ipc_call failed");
                 if current_owns
                 {
                     let _ = syscall::cap_delete(current_cap);
                 }
-                return Err(io::Error::other("seraph fs: NS_LOOKUP ipc_call failed"));
+                return Err(err);
             }
         };
         if reply.label != 0
@@ -883,7 +884,7 @@ fn write_inline(
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: FS_WRITE ipc_call failed"))?;
+        .map_err(|_| call_failed(file_cap, "seraph fs: FS_WRITE ipc_call failed"))?;
     if reply.label != fs_errors::SUCCESS
     {
         return Err(map_fs_error(reply.label));
@@ -1136,7 +1137,7 @@ fn write_frame_chunk(
     // driver received the message; every other one is a refusal before the
     // call blocked (`ipc::ipc_call` # Errors).
     let reply = reply.map_err(|e| {
-        let err = io::Error::other("seraph fs: FS_WRITE_MEMORY ipc_call failed");
+        let err = call_failed(file_cap, "seraph fs: FS_WRITE_MEMORY ipc_call failed");
         if e == syscall_abi::SyscallError::Interrupted as i64
         {
             ChunkError::Call(err)
@@ -1201,7 +1202,7 @@ fn file_open(node_cap: u64, release_send: u64, ipc_buf: *mut u64) -> io::Result<
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(node_cap, &msg, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: FS_OPEN ipc_call failed"))?;
+        .map_err(|_| call_failed(node_cap, "seraph fs: FS_OPEN ipc_call failed"))?;
     let (opened, surplus) = match *reply.caps()
     {
         [open, liveness, ref rest @ ..] if reply.label == fs_errors::SUCCESS =>
@@ -1231,7 +1232,7 @@ fn file_truncate_zero(file_cap: u64, ipc_buf: *mut u64) -> io::Result<()>
     let msg = IpcMessage::builder(fs_labels::FS_TRUNCATE).word(0, 0).build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(file_cap, &msg, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: FS_TRUNCATE ipc_call failed"))?;
+        .map_err(|_| call_failed(file_cap, "seraph fs: FS_TRUNCATE ipc_call failed"))?;
     if reply.label != fs_errors::SUCCESS
     {
         return Err(map_fs_error(reply.label));
@@ -1263,8 +1264,9 @@ fn create_file_at(
         Ok(r) => r,
         Err(_) =>
         {
+            let err = call_failed(split.parent_cap, "seraph fs: FS_CREATE ipc_call failed");
             release_split_parent(&split);
-            return Err(io::Error::other("seraph fs: FS_CREATE ipc_call failed"));
+            return Err(err);
         }
     };
 
@@ -1609,7 +1611,7 @@ impl File
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
         let reply = unsafe { ipc::ipc_call(self.file_cap, &msg, ipc_buf) }
-            .map_err(|_| io::Error::other("seraph fs: FS_READ ipc_call failed"))?;
+            .map_err(|_| call_failed(self.file_cap, "seraph fs: FS_READ ipc_call failed"))?;
         if reply.label != fs_errors::SUCCESS
         {
             return Err(map_fs_error(reply.label));
@@ -1643,7 +1645,9 @@ impl File
             .build();
         // SAFETY: ipc_buf is the registered IPC buffer.
         let reply = unsafe { ipc::ipc_call(self.file_cap, &msg, ipc_buf) }
-            .map_err(|_| io::Error::other("seraph fs: FS_READ_MEMORY ipc_call failed"))?;
+            .map_err(|_| {
+                call_failed(self.file_cap, "seraph fs: FS_READ_MEMORY ipc_call failed")
+            })?;
         if reply.label != fs_errors::SUCCESS
         {
             return Err(map_fs_error(reply.label));
@@ -2042,6 +2046,31 @@ fn ns_error_to_io(label: u64) -> io::Error
     }
 }
 
+/// The error for a failed `ipc_call` on `cap`, `what` naming the call.
+///
+/// A cap whose server is gone is dead: an unmount revokes the driver's
+/// endpoint, and the revoke frees every cap derived from it, in every
+/// `CSpace` (docs/capability-model.md § Revocation), so the slot no longer
+/// holds a cap and `cap_info` on it answers `InvalidCapability`. Such a
+/// failure is `StaleNetworkFileHandle`: the node is gone, and the caller
+/// resolves its path again. A call that fails while its cap is still live
+/// (interrupted, or refused for one of the message's own caps) is `Other`.
+///
+/// Call it before the caller deletes `cap`, since a deleted slot reads as
+/// dead too.
+fn call_failed(cap: u64, what: &'static str) -> io::Error
+{
+    if syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS)
+        == Err(syscall_abi::SyscallError::InvalidCapability as i64)
+    {
+        io::Error::new(io::ErrorKind::StaleNetworkFileHandle, what)
+    }
+    else
+    {
+        io::Error::other(what)
+    }
+}
+
 fn map_fs_error(label: u64) -> io::Error
 {
     match label
@@ -2181,9 +2210,10 @@ fn remove_leaf(path: &Path, expected: NodeKind) -> io::Result<()>
     let label = fs_labels::FS_REMOVE | ((split.leaf.len() as u64) << 16);
     let msg = IpcMessage::builder(label).bytes(0, &split.leaf).build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(split.parent_cap, &msg, ipc_buf) };
+    let reply = unsafe { ipc::ipc_call(split.parent_cap, &msg, ipc_buf) }
+        .map_err(|_| call_failed(split.parent_cap, "seraph fs: FS_REMOVE ipc_call failed"));
     release_split_parent(&split);
-    let reply = reply.map_err(|_| io::Error::other("seraph fs: FS_REMOVE ipc_call failed"))?;
+    let reply = reply?;
     if reply.label != fs_errors::SUCCESS
     {
         return Err(map_fs_error(reply.label));
@@ -2204,9 +2234,10 @@ pub fn mkdir(path: &Path) -> io::Result<()>
     let label = fs_labels::FS_MKDIR | ((split.leaf.len() as u64) << 16);
     let msg = IpcMessage::builder(label).bytes(0, &split.leaf).build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(split.parent_cap, &msg, ipc_buf) };
+    let reply = unsafe { ipc::ipc_call(split.parent_cap, &msg, ipc_buf) }
+        .map_err(|_| call_failed(split.parent_cap, "seraph fs: FS_MKDIR ipc_call failed"));
     release_split_parent(&split);
-    let reply = reply.map_err(|_| io::Error::other("seraph fs: FS_MKDIR ipc_call failed"))?;
+    let reply = reply?;
     if reply.label != fs_errors::SUCCESS
     {
         return Err(map_fs_error(reply.label));
@@ -2288,10 +2319,11 @@ pub fn rename(from: &Path, to: &Path) -> io::Result<()>
         .bytes(2, &combined)
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(src.parent_cap, &msg, ipc_buf) };
+    let reply = unsafe { ipc::ipc_call(src.parent_cap, &msg, ipc_buf) }
+        .map_err(|_| call_failed(src.parent_cap, "seraph fs: FS_RENAME ipc_call failed"));
     release_split_parent(&src);
     release_split_parent(&dst);
-    let reply = reply.map_err(|_| io::Error::other("seraph fs: FS_RENAME ipc_call failed"))?;
+    let reply = reply?;
     if reply.label != fs_errors::SUCCESS
     {
         return Err(map_fs_error(reply.label));
@@ -2370,9 +2402,10 @@ pub fn remove_dir_all(path: &Path) -> io::Result<()>
     let label = fs_labels::FS_REMOVE | ((split.leaf.len() as u64) << 16);
     let msg = IpcMessage::builder(label).bytes(0, &split.leaf).build();
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(split.parent_cap, &msg, ipc_buf) };
+    let reply = unsafe { ipc::ipc_call(split.parent_cap, &msg, ipc_buf) }
+        .map_err(|_| call_failed(split.parent_cap, "seraph fs: FS_REMOVE ipc_call failed"));
     release_split_parent(&split);
-    let reply = reply.map_err(|_| io::Error::other("seraph fs: FS_REMOVE ipc_call failed"))?;
+    let reply = reply?;
     if reply.label != fs_errors::SUCCESS
     {
         return Err(map_fs_error(reply.label));
@@ -2432,7 +2465,7 @@ fn drain_dir_recursive(dir_cap: u64, ipc_buf: *mut u64) -> io::Result<()>
         let msg = IpcMessage::builder(label).bytes(0, &entry.name).build();
         // SAFETY: ipc_buf is the registered IPC buffer.
         let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }
-            .map_err(|_| io::Error::other("seraph fs: FS_REMOVE ipc_call failed"))?;
+            .map_err(|_| call_failed(dir_cap, "seraph fs: FS_REMOVE ipc_call failed"))?;
         if reply.label != fs_errors::SUCCESS
         {
             return Err(map_fs_error(reply.label));
@@ -2460,7 +2493,7 @@ fn ns_readdir_one(
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(dir_cap, &msg, ipc_buf) }
-        .map_err(|_| io::Error::other("seraph fs: NS_READDIR ipc_call failed"))?;
+        .map_err(|_| call_failed(dir_cap, "seraph fs: NS_READDIR ipc_call failed"))?;
     if reply.label == fs_labels::END_OF_DIR
     {
         return Ok(None);
@@ -2559,9 +2592,10 @@ pub fn stat(path: &Path) -> io::Result<FileAttr>
     // NS_STAT against the walked node cap.
     let msg = IpcMessage::new(ns_labels::NS_STAT);
     // SAFETY: ipc_buf is the registered IPC buffer.
-    let reply = unsafe { ipc::ipc_call(walked.cap, &msg, ipc_buf) };
+    let reply = unsafe { ipc::ipc_call(walked.cap, &msg, ipc_buf) }
+        .map_err(|_| call_failed(walked.cap, "seraph fs: NS_STAT ipc_call failed"));
     let _ = syscall::cap_delete(walked.cap);
-    let reply = reply.map_err(|_| io::Error::other("seraph fs: NS_STAT ipc_call failed"))?;
+    let reply = reply?;
     if reply.label != 0
     {
         return Err(ns_error_to_io(reply.label));

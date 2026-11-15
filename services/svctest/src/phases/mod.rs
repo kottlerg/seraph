@@ -33,6 +33,9 @@
 //! 7. [`procmgr::logd_forward`] just after [`procmgr::spawn_only`]: it
 //!    reads its child's retired slot from logd before many other children
 //!    die and retire theirs, and polls until logd has drained the death.
+//! 8. [`unmount`] after every phase that uses `/data` or the cwd: it
+//!    unmounts the data partition, killing every cap on it, before it
+//!    mounts it again and sets the cwd to it again.
 
 use crate::runner::Phase;
 
@@ -62,6 +65,7 @@ pub mod startup;
 pub mod svcmgr;
 pub mod threading;
 pub mod timed;
+pub mod unmount;
 pub mod vfsd;
 
 /// Ordered phase list. Order encodes cross-module dependencies (see
@@ -104,6 +108,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(vfsd::phases());
+    out.extend_from_slice(unmount::phases());
     out.extend_from_slice(procmgr::init_reap());
     out.extend_from_slice(memmgr::identity());
     out

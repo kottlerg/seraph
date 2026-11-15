@@ -417,6 +417,21 @@ fn entry(table: &[PageTableEntry; 512], level: usize, va: u64) -> Option<PageTab
     table.get(vpn_index(level, va)).copied()
 }
 
+/// Read entry `index` of the 512-entry table at `table_va` without forming a
+/// reference to the table.
+///
+/// # Safety
+/// `table_va` must address a readable, 8-byte-aligned 512-entry table and
+/// `index` must be below 512.
+unsafe fn read_entry(table_va: u64, index: usize) -> PageTableEntry
+{
+    debug_assert!(index < 512);
+    // SAFETY: index is below 512, so the entry lies inside the table (caller contract).
+    let entry = unsafe { (table_va as *const PageTableEntry).add(index) };
+    // SAFETY: per the caller contract the table is readable and aligned.
+    unsafe { entry.read() }
+}
+
 // ── Level descent ─────────────────────────────────────────────────────────────
 
 /// Level of the root table under the active mode: 4 (Sv57), 3 (Sv48) or 2 (Sv39).
@@ -1529,6 +1544,105 @@ unsafe fn walk_leaf_tables(
     }
 }
 
+// ── Page enumeration ──────────────────────────────────────────────────────────
+
+/// Pass each present 4 KiB user leaf of `[start, hi)`, in the page table
+/// rooted at `root_virt`, to `on_leaf` in VA order, as its VA, its frame and
+/// its raw bits, examining at most `budget` table entries at any level.
+/// `on_leaf` returns whether it took the leaf, and the scan stops at the first
+/// it does not take. Leaf entries at a non-leaf level are skipped, as in
+/// [`unmap_user_region_pooled`]: the user mapping path never installs one. A
+/// NAPOT member reports its own page's frame ([`leaf_phys`]).
+///
+/// Returns the first VA the scan did not finish: the VA of the leaf `on_leaf`
+/// did not take, the start of the span of the entry the budget stopped
+/// before, or `hi` once the whole span is scanned.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
+/// caller must hold the address space's `pt_lock`, `start` must be
+/// page-aligned, and `[start, hi)` must lie in the user half.
+#[cfg(not(test))]
+pub unsafe fn scan_user_leaves(
+    root_virt: u64,
+    start: u64,
+    hi: u64,
+    budget: usize,
+    on_leaf: &mut dyn FnMut(u64, u64, u64) -> bool,
+) -> u64
+{
+    let mut scan = LeafScan {
+        budget,
+        to_virt: crate::mm::paging::phys_to_virt,
+        on_leaf,
+    };
+    // SAFETY: root_virt is the direct-map VA of a valid root at the root
+    // level, whose tables pt_lock keeps unchanged and every one of which the
+    // direct map reaches at phys_to_virt of its frame (caller's contract).
+    unsafe { scan.table(root_virt, root_level(), start, hi) }.unwrap_or(hi)
+}
+
+/// The state of one [`scan_user_leaves`]: the entries it may still examine,
+/// the translation that reaches a table from its frame, and the leaf sink.
+struct LeafScan<'a>
+{
+    budget: usize,
+    to_virt: fn(u64) -> u64,
+    on_leaf: &'a mut dyn FnMut(u64, u64, u64) -> bool,
+}
+
+impl LeafScan<'_>
+{
+    /// Scan `[lo, hi)` under the table at `table_va`, a table at `level`;
+    /// `Some` of the VA the scan stopped at, or `None` once the span is
+    /// scanned. Bounded recursion: `level <= 4`.
+    ///
+    /// # Safety
+    /// `table_va` must address a readable 512-entry table at `level`, and
+    /// `to_virt` must map the frame of every table a present non-leaf entry
+    /// under it names to a readable address of that table, none of which
+    /// changes during the scan.
+    unsafe fn table(&mut self, table_va: u64, level: usize, lo: u64, hi: u64) -> Option<u64>
+    {
+        let mut va = lo;
+        while va < hi
+        {
+            let Some(left) = self.budget.checked_sub(1)
+            else
+            {
+                return Some(va);
+            };
+            self.budget = left;
+            // The span's last entry at the top level ends at 2^64, which the
+            // boundary wraps to 0; the user half never reaches it.
+            let boundary = next_level_boundary(level, va);
+            let end = if boundary == 0 { hi } else { hi.min(boundary) };
+            // SAFETY: table_va is a readable table (this call's contract); the
+            // index is below 512.
+            let e = unsafe { read_entry(table_va, vpn_index(level, va)) };
+            if let Some(child_level) = level.checked_sub(1)
+            {
+                if e.is_present() && e.0 & LEAF_BITS == 0
+                {
+                    let child = (self.to_virt)(e.phys_addr());
+                    // SAFETY: a present non-leaf entry names a table at
+                    // child_level, readable at `child` (this call's contract).
+                    if let Some(stop) = unsafe { self.table(child, child_level, va, end) }
+                    {
+                        return Some(stop);
+                    }
+                }
+            }
+            else if e.is_present() && !(self.on_leaf)(va, leaf_phys(e, va), e.0)
+            {
+                return Some(va);
+            }
+            va = end;
+        }
+        None
+    }
+}
+
 /// RISC-V counterpart to [`crate::mm::paging::unmap_identity_page`].
 ///
 /// Walks the kernel root from `phys_to_virt(kernel_root_table_pa())` down to the
@@ -2518,5 +2632,189 @@ mod tests
         let prior = leaf(FRAME_A, Rights::Writable);
         let new = leaf(FRAME_B, Rights::Writable);
         assert_eq!(classify_user_map(prior, new), MapOutcome::Replace);
+    }
+
+    // ── Leaf scan ─────────────────────────────────────────────────────────────
+
+    /// A page-table frame on the host heap; its host address stands for its
+    /// physical address (host addresses lie below bit 56, so `PPN_MASK` keeps
+    /// them), and the scan reaches it through an identity translation.
+    #[repr(C, align(4096))]
+    struct Table([PageTableEntry; 512]);
+
+    /// A user space under a mode, built on host frames: the path from the root
+    /// to one level-1 table over the 1 GiB-aligned `base`, whose entry 0 and
+    /// entry 2 name leaf tables and whose entry 1 is a megapage leaf over the
+    /// bait, every entry of which is a valid user "leaf", so a scan that read a
+    /// megapage's frame as a table would report them. Entry 2's table holds a
+    /// NAPOT group in slots 16..32. `leaves` lists each leaf in VA order.
+    struct Space
+    {
+        _boxes: Vec<Box<Table>>,
+        root: u64,
+        top: usize,
+        base: u64,
+        leaves: Vec<(u64, u64, u64)>,
+    }
+
+    impl Space
+    {
+        /// The end of the level-1 table's span: every leaf lies below it.
+        fn hi(&self) -> u64
+        {
+            self.base + (1 << 30)
+        }
+
+        /// Scan `[start, hi)` with `budget`, taking every leaf until
+        /// `refuse` names one; the leaves taken and where the scan stopped.
+        fn scan(
+            &self,
+            start: u64,
+            budget: usize,
+            refuse: Option<u64>,
+        ) -> (Vec<(u64, u64, u64)>, u64)
+        {
+            let mut got = Vec::new();
+            let mut on_leaf = |va, pa, bits| {
+                if refuse == Some(va)
+                {
+                    return false;
+                }
+                got.push((va, pa, bits));
+                true
+            };
+            let mut scan = LeafScan {
+                budget,
+                to_virt: |pa| pa,
+                on_leaf: &mut on_leaf,
+            };
+            // SAFETY: every table of the space is a live host frame reached
+            // through its address (identity translation); the boxes are not
+            // touched while the scan reads.
+            let stop = unsafe { scan.table(self.root, self.top, start, self.hi()) };
+            (got, stop.unwrap_or(self.hi()))
+        }
+    }
+
+    fn base_for(mode: PagingMode) -> u64
+    {
+        match mode
+        {
+            PagingMode::Sv39 => 0x20_4000_0000,
+            PagingMode::Sv48 => 0x7F_4000_0000,
+            PagingMode::Sv57 => 0x00F0_7F40_4000_0000,
+        }
+    }
+
+    fn space(mode: PagingMode) -> Space
+    {
+        let base = base_for(mode);
+        let top = mode.levels() - 1;
+        // The path's tables (root to level 1), two leaf tables, the bait.
+        let mut boxes: Vec<Box<Table>> = (0..top + 3)
+            .map(|_| Box::new(Table([PageTableEntry(0); 512])))
+            .collect();
+        let addr = |t: &Table| core::ptr::from_ref(t) as u64;
+        let addrs: Vec<u64> = boxes.iter().map(|t| addr(t)).collect();
+        let (l1, pt_a, pt_b, bait) = (top - 1, top, top + 1, top + 2);
+        for (i, level) in (2..=top).rev().enumerate()
+        {
+            boxes[i].0[vpn_index(level, base)] = PageTableEntry::new_table(addrs[i + 1]);
+        }
+        let ppn = |pa: u64| (pa >> 2) & PPN_MASK;
+        boxes[bait].0 = [PageTableEntry(VALID | READ | USER | ppn(addrs[bait])); 512];
+        boxes[l1].0[0] = PageTableEntry::new_table(addrs[pt_a]);
+        boxes[l1].0[1] = PageTableEntry(VALID | READ | USER | ppn(addrs[bait]));
+        boxes[l1].0[2] = PageTableEntry::new_table(addrs[pt_b]);
+        let mut leaves = Vec::new();
+        for (pt, l1_index, slot, write) in [
+            (pt_a, 0u64, 0usize, WRITE),
+            (pt_a, 0, 1, WRITE),
+            (pt_a, 0, 2, EXECUTE),
+            (pt_a, 0, 511, 0),
+            (pt_b, 2, 0, WRITE),
+        ]
+        {
+            let va = base + (l1_index << 21) + ((slot as u64) << 12);
+            let frame = 0x8000_0000 + ((slot as u64) << 12) + (l1_index << 24);
+            let bits = VALID | READ | USER | write | ppn(frame);
+            boxes[pt].0[slot] = PageTableEntry(bits);
+            leaves.push((va, frame, bits));
+        }
+        // A 64 KiB NAPOT group over a 64 KiB-aligned base: each member carries
+        // the base's PPN with the size encoding in ppn[3:0].
+        let napot_base = 0x9000_0000u64;
+        let member = VALID | READ | USER | PBMT_IO | NAPOT | ppn(napot_base) | NAPOT_64K_PPN;
+        for (slot, entry) in boxes[pt_b].0.iter_mut().enumerate().skip(16).take(16)
+        {
+            *entry = PageTableEntry(member);
+            let va = base + (2 << 21) + ((slot as u64) << 12);
+            leaves.push((va, napot_base + ((slot as u64 - 16) << 12), member));
+        }
+        Space {
+            _boxes: boxes,
+            root: addrs[0],
+            top,
+            base,
+            leaves,
+        }
+    }
+
+    // The defects caught: a scan that misses a leaf, reports one out of VA
+    // order or with another frame or bits, reports a NAPOT member's group
+    // base instead of its own frame, or reads a megapage's frame as a table.
+    #[test]
+    fn a_leaf_scan_reports_every_valid_leaf_in_va_order()
+    {
+        for mode in ALL_MODES
+        {
+            let s = space(mode);
+            let (got, stop) = s.scan(s.base, usize::MAX, None);
+            assert_eq!(got, s.leaves, "{mode:?}");
+            assert_eq!(stop, s.hi(), "{mode:?}");
+            let (got, _) = s.scan(s.leaves[2].0, usize::MAX, None);
+            assert_eq!(got, s.leaves[2..], "{mode:?}: a scan from a leaf's VA");
+        }
+    }
+
+    // The defects caught: a budget that is not honoured, a resume VA that
+    // skips a leaf or repeats one, or a resumed scan that makes no progress.
+    #[test]
+    fn a_budgeted_leaf_scan_resumes_where_it_stopped()
+    {
+        for mode in ALL_MODES
+        {
+            let s = space(mode);
+            for budget in [s.top + 1, s.top + 2, s.top + 5, 64, 600]
+            {
+                let mut all = Vec::new();
+                let mut start = s.base;
+                while start < s.hi()
+                {
+                    let (got, stop) = s.scan(start, budget, None);
+                    assert!(
+                        stop > start,
+                        "{mode:?} budget {budget}: no progress at {start:#x}"
+                    );
+                    all.extend(got);
+                    start = stop;
+                }
+                assert_eq!(all, s.leaves, "{mode:?} budget {budget}");
+            }
+        }
+    }
+
+    // The defect caught: a refused leaf that is skipped instead of reported as
+    // the place to resume.
+    #[test]
+    fn a_refused_leaf_stops_the_scan_at_its_va()
+    {
+        for mode in ALL_MODES
+        {
+            let s = space(mode);
+            let (got, stop) = s.scan(s.base, usize::MAX, Some(s.leaves[4].0));
+            assert_eq!(got, s.leaves[..4], "{mode:?}");
+            assert_eq!(stop, s.leaves[4].0, "{mode:?}");
+        }
     }
 }

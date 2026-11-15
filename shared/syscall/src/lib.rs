@@ -55,12 +55,12 @@ use syscall_abi::{
     SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
     SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
     SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL,
-    SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
-    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
-    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
-    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
-    SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
+    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
+    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
+    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
+    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
+    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -81,6 +81,12 @@ pub use syscall_abi::{
     RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET,
     RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE,
     RIGHTS_THREAD_UPCALL, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
+};
+pub use syscall_abi::{
+    EXT_REGS_RISCV64_F0_OFFSET, EXT_REGS_RISCV64_FCSR_OFFSET, EXT_REGS_RISCV64_V0_OFFSET,
+    EXT_REGS_RISCV64_VCSR_OFFSET, EXT_REGS_RISCV64_VL_OFFSET, EXT_REGS_RISCV64_VSTART_OFFSET,
+    EXT_REGS_RISCV64_VTYPE_OFFSET, EXT_REGS_X86_64_XCR0, MAX_PAGE_RUNS, PAGE_RUN_EXECUTE,
+    PAGE_RUN_NO_COPY, PAGE_RUN_READ, PAGE_RUN_WRITE, PageRun,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -2907,6 +2913,90 @@ pub unsafe fn thread_read_mem_raw(
     // page, or thread entry state.
     let ret = unsafe { syscall4(SYS_THREAD_READ_MEM, thread_cap, va, buf as u64, len as u64) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// List the mapped user pages of the address space `thread_cap`'s thread
+/// executes in, from the page-aligned `start`, into `runs` as runs of pages
+/// of one protection (`SYS_THREAD_LIST_PAGES`). `runs.len()` must be in
+/// `1..=MAX_PAGE_RUNS`. The thread need not be stopped, but a core writer
+/// stops the space's threads for a coherent view (`docs/fault-handling.md`
+/// § Debugging). Returns the runs written and the first VA not listed, from
+/// which the next call continues: the top of the user half once the listing
+/// is complete. A call that writes no run below the top has only spent its
+/// kernel bound on unmapped space; the caller continues from the VA returned.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
+/// is invalid), `InsufficientRights` (it lacks Control), `InvalidState` (the
+/// thread has exited, has no address space, or its address space's teardown
+/// has begun), `InvalidArgument` (no runs, or more than `MAX_PAGE_RUNS`), or
+/// `InvalidAddress` (`start` is unaligned or above the top of the user half,
+/// `runs` is not wholly in the user half, or a fault on it is unhandled: the
+/// call is restartable, as [`thread_read_regs`] states).
+#[inline]
+pub fn thread_list_pages(
+    thread_cap: u64,
+    start: u64,
+    runs: &mut [PageRun],
+) -> Result<(usize, u64), i64>
+{
+    // SAFETY: syscall5_ret2 issues the raw syscall; `runs` is a live,
+    // exclusively borrowed slice, so the kernel's writes of at most
+    // `runs.len()` runs land in memory no other Rust reference names, and
+    // any bit pattern is a valid `PageRun`. The call changes no mapping, IPC
+    // page, or thread entry state.
+    let (ret, resume) = unsafe {
+        syscall5_ret2(
+            SYS_THREAD_LIST_PAGES,
+            thread_cap,
+            start,
+            runs.as_mut_ptr() as u64,
+            runs.len() as u64,
+            0,
+        )
+    };
+    // A non-negative count converts; a negative one is the error code.
+    usize::try_from(ret).map_or(Err(ret), |count| Ok((count, resume)))
+}
+
+/// Copy the extended register state (floating point, SIMD, vector) of
+/// `thread_cap`'s thread from byte `offset` of its image into `buf`
+/// (`SYS_THREAD_READ_EXT_REGS`). `buf.len()` must be in
+/// `1..=MAX_THREAD_MEM_COPY`. The thread must be held still as for
+/// [`thread_read_regs`]. The image is the x86-64 XSAVE area for
+/// `EXT_REGS_X86_64_XCR0`, or the riscv64 layout the `EXT_REGS_RISCV64_*`
+/// offsets state. Returns the bytes copied, 0 for an offset at or past the
+/// image's end, and the image's size.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` (the thread cap
+/// is invalid), `InsufficientRights` (it lacks Observe), `InvalidState` (the
+/// thread is neither fault-blocked nor `Stopped` and descheduled),
+/// `InvalidArgument` (a length of 0 or above `MAX_THREAD_MEM_COPY`, or the
+/// thread has no extended-state area), or `InvalidAddress` (`buf` is not
+/// wholly in the user half, or a fault on it is unhandled: the call is
+/// restartable, as [`thread_read_regs`] states).
+#[inline]
+pub fn thread_read_ext_regs(thread_cap: u64, offset: u64, buf: &mut [u8])
+-> Result<(u64, u64), i64>
+{
+    // SAFETY: syscall5_ret2 issues the raw syscall; `buf` is a live,
+    // exclusively borrowed slice, so the kernel's writes of at most
+    // `buf.len()` bytes land in memory no other Rust reference names, and any
+    // byte value is a valid `u8`. The call changes no mapping, IPC page, or
+    // thread entry state.
+    let (ret, size) = unsafe {
+        syscall5_ret2(
+            SYS_THREAD_READ_EXT_REGS,
+            thread_cap,
+            offset,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            0,
+        )
+    };
+    // A non-negative count converts; a negative one is the error code.
+    u64::try_from(ret).map_or(Err(ret), |copied| Ok((copied, size)))
 }
 
 /// Copy `buf` to `va` in the address space `thread_cap`'s thread executes in

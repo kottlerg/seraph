@@ -360,10 +360,12 @@ wrappers stay safe functions ([shared/syscall/README.md](../shared/syscall/READM
 ### Thread
 
 A capability to a thread. Rights:
-- **Control** — may start, stop, and configure the thread, write its registers, and read and
-  write the memory of the address space it executes in (`SYS_THREAD_READ_MEM`,
-  `SYS_THREAD_WRITE_MEM`; [Fault Handling § Debugging](fault-handling.md#debugging))
-- **Observe** — may read the thread's register state (for debugging)
+- **Control** — may start, stop, and configure the thread, write its registers, read and
+  write the memory of the address space it executes in, and list that space's mapped pages
+  (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, `SYS_THREAD_LIST_PAGES`;
+  [Fault Handling § Debugging](fault-handling.md#debugging))
+- **Observe** — may read the thread's register state, its extended (floating-point, SIMD and
+  vector) state included (`SYS_THREAD_READ_REGS`, `SYS_THREAD_READ_EXT_REGS`; for debugging)
 - **Upcall** — may post an asynchronous upcall to the thread
   ([Fault Handling § Asynchronous Upcalls](fault-handling.md#asynchronous-upcalls)); a post that
   may be delivered at any instruction also needs Control

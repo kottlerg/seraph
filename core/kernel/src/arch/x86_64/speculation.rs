@@ -24,8 +24,9 @@
 /// for (from the inputs a `SERAPH_FORCE_RETURN_MITIGATION` build forces, where
 /// one does), publish the selection, and log the inputs, the table and the controls
 /// on the serial console. Called once on the BSP in Phase 1, after
-/// `cpu::verify_baseline`, before any AP starts or any thread enters user
-/// mode.
+/// `cpu::verify_baseline` and `gdt::load_boot_segments` (the `SBPB` probe
+/// takes its `#GP` through the kernel's code segment), before any AP starts or
+/// any thread enters user mode.
 #[cfg(not(test))]
 pub fn select_mitigations()
 {
@@ -54,9 +55,9 @@ pub fn select_mitigations() {}
 /// the boot CPU selected (`super::mitigation::missing_msr_control`).
 ///
 /// # Safety
-/// Ring 0, after [`select_mitigations`], on the CPU being brought up, with
-/// interrupts off and before its shadow stack is enabled: the BSP in Phase 1,
-/// each AP in `kernel_entry_ap`.
+/// Ring 0, after [`select_mitigations`], on the CPU being brought up and on
+/// the kernel's GDT, with interrupts off and before its shadow stack is
+/// enabled: the BSP in Phase 1, each AP in `kernel_entry_ap`.
 #[cfg(not(test))]
 pub unsafe fn apply_mitigations_this_cpu()
 {

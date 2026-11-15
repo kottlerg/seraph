@@ -252,12 +252,23 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::cpu::verify_baseline();
     }
     kprintln!("baseline ok");
+    // Run the boot CPU on the kernel's own segment descriptors (x86-64: the
+    // BSP's GDT without its TSS, which Phase 5 adds; riscv64: no-op), so the
+    // `#GP` a fault-tolerant MSR access of the step below recovers from is
+    // delivered through a code-segment descriptor the kernel maps: the
+    // firmware's GDT lies in memory the kernel's page tables do not map.
+    // SAFETY: ring 0 / S-mode on the boot CPU, once, from the single boot
+    // thread, before Phase 5's `interrupts::init` loads the full GDT.
+    unsafe {
+        arch::current::gdt::load_boot_segments();
+    }
     // Log the CPU's transient-execution vulnerability table, select and
     // publish the controls it calls for, and set the boot CPU's per-CPU ones
     // (core/kernel/docs/transient-execution.md).
     arch::current::speculation::select_mitigations();
-    // SAFETY: ring 0 / S-mode on the boot CPU, after `select_mitigations`,
-    // with interrupts disabled and shadow stacks not yet enabled (Phase 5).
+    // SAFETY: ring 0 / S-mode on the boot CPU, on the kernel's segment
+    // descriptors (above), after `select_mitigations`, with interrupts disabled
+    // and shadow stacks not yet enabled (Phase 5).
     unsafe {
         arch::current::speculation::apply_mitigations_this_cpu();
     }

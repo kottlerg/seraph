@@ -138,10 +138,13 @@ raises `#GP` where it does not, as a write of a reserved bit does. The write rec
 fault (`idt::msr_recovering`). For the one instruction, the CPU runs on a probe table built on the
 stack, whose `#GP` gate resumes at a label after the `wrmsr` and whose other gates are the kernel's
 where the kernel's table is the one loaded; the table loaded before is loaded again after. The
-probe runs with interrupts off and before shadow stacks are on, since the gate resumes at an
-address other than the one the CPU saved, which a shadow stack would refuse. A completed write runs
-a branch predictor barrier, which changes no architectural state. The result is the
-`sbpb_accepted` field of the first report line (§ Report).
+gate's delivery reads the kernel's code-segment descriptor, so the boot CPU loads the kernel's
+segment descriptors first, in Phase 1 ([initialization.md](initialization.md) § Phase 1): the
+firmware's GDT lies in memory the kernel's page tables do not map. The probe runs with interrupts
+off and before shadow stacks are on, since the gate resumes at an address other than the one the
+CPU saved, which a shadow stack would refuse. A completed write runs a branch predictor barrier,
+which changes no architectural state. The result is the `sbpb_accepted` field of the first report
+line (§ Report).
 
 The table and the selection are made from the boot CPU's inputs. Intel states that the RFDS bits
 enumerate identically on every logical processor of a hybrid part. No vendor document found

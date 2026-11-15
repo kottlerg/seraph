@@ -833,8 +833,9 @@ fn de_cfg_outcome(read: Option<u64>, wrote: Option<bool>, read_back: Option<u64>
 /// it back.
 ///
 /// # Safety
-/// As [`super::idt::msr_recovering`]: ring 0, interrupts off, no shadow
-/// stack. The write sets one bit the vendor defines and keeps the others.
+/// As [`super::idt::msr_recovering`]: ring 0 on the kernel's GDT, interrupts
+/// off, no shadow stack. The write sets one bit the vendor defines and keeps
+/// the others.
 #[cfg(not(test))]
 unsafe fn set_de_cfg() -> DeCfg
 {
@@ -888,8 +889,10 @@ static DE_CFG_LOGGED: AtomicBool = AtomicBool::new(false);
 /// before any access to its MSR.
 ///
 /// # Safety
-/// Ring 0, on the CPU being brought up, after [`install`], with interrupts
-/// off and before `shadow_stack::enable` on it.
+/// Ring 0, on the CPU being brought up and on the kernel's GDT
+/// (`gdt::load_boot_segments` on the boot CPU, `gdt::init_ap` on an AP),
+/// after [`install`], with interrupts off and before `shadow_stack::enable`
+/// on it.
 #[cfg(not(test))]
 pub unsafe fn apply_this_cpu()
 {

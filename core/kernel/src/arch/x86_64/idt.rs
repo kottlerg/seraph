@@ -66,7 +66,7 @@
     expect(
         clippy::cast_possible_truncation,
         reason = "every narrowing cast here is bounded — the IDTR limit (256 * 16 - 1 fits u16), \
-                  the masked/shifted handler-offset splits in `IdtEntry::on_selector`, the \
+                  the masked/shifted handler-offset splits in `IdtEntry::new`, the \
                   probe table's limit and the masked/shifted MSR value halves in \
                   `msr_recovering`, and the \
                   device-range vector-to-u8 cast in `irq_dispatch`; the code it covers is compiled \
@@ -116,16 +116,9 @@ impl IdtEntry
     /// - Type = 0xE (64-bit interrupt gate, clears IF on entry).
     pub fn new(handler: u64, ist: u8, dpl: u8) -> Self
     {
-        Self::on_selector(handler, KERNEL_CS, ist, dpl)
-    }
-
-    /// As [`IdtEntry::new`], on the code segment `selector`: the probe table
-    /// of [`msr_recovering`] runs before the kernel's GDT may be loaded.
-    pub fn on_selector(handler: u64, selector: u16, ist: u8, dpl: u8) -> Self
-    {
         Self {
             offset_low: (handler & 0xFFFF) as u16,
-            selector,
+            selector: KERNEL_CS,
             ist: ist & 0x7,
             // P=1, DPL, 0, type=0xE (64-bit interrupt gate)
             type_attr: 0x80 | ((dpl & 3) << 5) | 0x0E,
@@ -2083,14 +2076,16 @@ unsafe extern "C" {
 ///
 /// For the one instruction, the CPU runs on a probe table built on the stack:
 /// its `#GP` gate resumes at the probe's recovery label (`seraph_msr_probe_gp`),
-/// on the code segment the CPU runs on, and its other gates are copied from
+/// on [`KERNEL_CS`], and its other gates are copied from
 /// [`IDT`] where that is the table loaded, and absent otherwise. The table
 /// loaded before is loaded again after. In Phase 1 on the boot CPU, before
 /// [`init`], no kernel handler exists to copy, so an NMI or `#MC` during the
 /// probe ends the boot as it would anywhere else in that phase.
 ///
 /// # Safety
-/// Ring 0, interrupts off, and no supervisor shadow stack on this CPU: the
+/// Ring 0, on the kernel's GDT (`gdt::load_boot_segments` on the boot CPU,
+/// `gdt::init_ap` on an AP), whose code-segment descriptor the gate's delivery
+/// reads; interrupts off; and no supervisor shadow stack on this CPU: the
 /// handler's `iretq` returns to an address other than the one the CPU saved,
 /// which a shadow stack would refuse with `#CP`. Callers run in Phase 1 and in
 /// an AP's bring-up, before `shadow_stack::enable`. A write that completes has
@@ -2124,12 +2119,16 @@ pub unsafe fn msr_recovering(msr: u32, value: Option<u64>) -> Option<u64>
     {
         gates.copy_from_slice(&kernel[..PROBE_GATES]);
     }
-    let cs: u16;
-    // SAFETY: reads the CS selector into a register.
-    unsafe {
-        core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+    #[cfg(debug_assertions)]
+    {
+        let cs: u16;
+        // SAFETY: reads the CS selector into a register.
+        unsafe {
+            core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+        }
+        debug_assert_eq!(cs, KERNEL_CS, "MSR probe off the kernel's GDT");
     }
-    gates[GP_VECTOR] = IdtEntry::on_selector(seraph_msr_probe_gp as *const () as u64, cs, 0, 0);
+    gates[GP_VECTOR] = IdtEntry::new(seraph_msr_probe_gp as *const () as u64, 0, 0);
     let probe = Idtr {
         // 19 gates of 16 bytes: the limit fits u16 and does not saturate.
         limit: core::mem::size_of_val(&gates).saturating_sub(1) as u16,
@@ -2223,32 +2222,6 @@ mod tests
         )]
         let reserved = e._reserved;
         assert_eq!(reserved, 0);
-    }
-
-    /// A gate on another selector differs from [`IdtEntry::new`]'s in the
-    /// selector alone.
-    #[test]
-    fn idt_entry_on_selector_takes_the_selector()
-    {
-        let e = IdtEntry::on_selector(0xDEAD_BEEF_1234_5678, 0x38, 0, 0);
-        let n = IdtEntry::new(0xDEAD_BEEF_1234_5678, 0, 0);
-        assert_eq!(e.selector, 0x38);
-        assert_eq!(
-            (
-                e.offset_low,
-                e.offset_mid,
-                e.offset_high,
-                e.ist,
-                e.type_attr
-            ),
-            (
-                n.offset_low,
-                n.offset_mid,
-                n.offset_high,
-                n.ist,
-                n.type_attr
-            )
-        );
     }
 
     #[test]

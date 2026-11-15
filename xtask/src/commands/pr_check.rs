@@ -26,8 +26,8 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use json::Value;
 use regex::Regex;
-use serde_json::Value;
 
 use crate::cli::{CommitCheckArgs, PrCheckArgs};
 use crate::commands::review;
@@ -2965,7 +2965,7 @@ mod tests
     #[test]
     fn the_gate_needs_a_clean_merge_state_and_every_check_green()
     {
-        let green: Value = serde_json::from_str(
+        let green: Value = json::parse(
             r#"{"mergeStateStatus":"CLEAN","statusCheckRollup":[
                 {"name":"host-tests","status":"COMPLETED","conclusion":"SUCCESS"},
                 {"name":"optional","status":"COMPLETED","conclusion":"SKIPPED"},
@@ -2974,7 +2974,7 @@ mod tests
         .unwrap();
         assert_eq!(check_merge_state(&green), [] as [Diag; 0]);
 
-        let red: Value = serde_json::from_str(
+        let red: Value = json::parse(
             r#"{"mergeStateStatus":"BEHIND","statusCheckRollup":[
                 {"name":"host-tests","status":"IN_PROGRESS","conclusion":""},
                 {"name":"validate","status":"COMPLETED","conclusion":"FAILURE"}]}"#,
@@ -2985,7 +2985,7 @@ mod tests
             ["gate-merge-state", "gate-checks", "gate-checks"]
         );
 
-        let none: Value = serde_json::from_str(r#"{"mergeStateStatus":"CLEAN"}"#).unwrap();
+        let none: Value = json::parse(r#"{"mergeStateStatus":"CLEAN"}"#).unwrap();
         assert_eq!(rules(&check_merge_state(&none)), ["gate-checks"]);
     }
 }

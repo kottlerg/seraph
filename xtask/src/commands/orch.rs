@@ -29,7 +29,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde_json::{Map, Value, json};
+use json::{Map, Value, json};
 
 use crate::cli::{
     OrchArgs, OrchCommand, OrchGrantCommand, OrchQuestionCommand, OrchRulingCommand, OrchWorkerArgs,
@@ -178,12 +178,22 @@ fn new_state(goal: &str, log: &str) -> Result<Value>
     }))
 }
 
-fn object_mut<'a>(state: &'a mut Value, key: &str) -> Result<&'a mut Map<String, Value>>
+fn object_mut<'a>(state: &'a mut Value, key: &str) -> Result<&'a mut Map>
 {
     state
         .get_mut(key)
         .and_then(Value::as_object_mut)
         .ok_or_else(|| anyhow!("the state has no `{key}` object"))
+}
+
+/// Set the field `key` of the state to `value`.
+fn set(state: &mut Value, key: &str, value: Value) -> Result<()>
+{
+    state
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("the state is not an object"))?
+        .insert(key.to_owned(), value);
+    Ok(())
 }
 
 fn list_mut<'a>(state: &'a mut Value, key: &str) -> Result<&'a mut Vec<Value>>
@@ -208,7 +218,7 @@ fn apply(state: &mut Value, change: &Change, now: &str) -> Result<String>
         Change::Orchestrator(id) =>
         {
             let id = one_line("the orchestrator's id", id)?;
-            state["orchestrator"] = json!(id);
+            set(state, "orchestrator", json!(id))?;
             Ok(format!("orchestrator is {id}"))
         }
         Change::Worker { name, fields } => apply_worker(state, name, fields, now),
@@ -264,7 +274,7 @@ fn grant_clear(state: &mut Value) -> Result<String>
         .filter(|grant| !grant.is_null())
         .map(|grant| text(grant, "holder").to_owned())
         .ok_or_else(|| anyhow!("no exclusive grant is outstanding"))?;
-    state["grant"] = Value::Null;
+    set(state, "grant", Value::Null)?;
     Ok(format!("grant of {holder} ended"))
 }
 
@@ -286,7 +296,7 @@ fn order_set(state: &mut Value, items: &[String]) -> Result<String>
         .map(|item| one_line("a merge-order entry", item))
         .collect::<Result<Vec<_>>>()?;
     let line = format!("merge order: {}", join_or_none(&items));
-    state["order"] = json!(items);
+    set(state, "order", json!(items))?;
     Ok(line)
 }
 
@@ -327,7 +337,11 @@ fn grant_set(state: &mut Value, holder: &str, commands: &str, now: &str) -> Resu
         );
     }
     list_mut(state, "queue")?.retain(|entry| text(entry, "holder") != holder);
-    state["grant"] = json!({ "holder": holder, "commands": commands, "since": now });
+    set(
+        state,
+        "grant",
+        json!({ "holder": holder, "commands": commands, "since": now }),
+    )?;
     Ok(format!("grant to {holder}: {commands}"))
 }
 
@@ -649,7 +663,7 @@ fn load(dir: &Path) -> Result<Value>
             path.display()
         )
     })?;
-    serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))
+    json::parse(&raw).with_context(|| format!("parsing {}", path.display()))
 }
 
 /// Write the state through a temporary file, so a reader never sees half of
@@ -658,7 +672,7 @@ fn save(dir: &Path, state: &Value) -> Result<()>
 {
     let path = dir.join(STATE_FILE);
     let temporary = dir.join(format!("{STATE_FILE}.tmp"));
-    let mut raw = serde_json::to_string_pretty(state).context("encoding the state")?;
+    let mut raw = state.to_string_pretty();
     raw.push('\n');
     fs::write(&temporary, raw).with_context(|| format!("writing {}", temporary.display()))?;
     fs::rename(&temporary, &path).with_context(|| format!("replacing {}", path.display()))
@@ -857,10 +871,7 @@ fn orchestrator_id(state: &Value) -> Result<String>
 fn print_state_json(dir: &Path) -> Result<()>
 {
     let state = load(dir)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&state).context("encoding the state")?
-    );
+    println!("{}", state.to_string_pretty());
     Ok(())
 }
 
@@ -1160,7 +1171,7 @@ mod tests
         apply(&mut state, &grant("W2"), NOW).unwrap();
         assert_eq!(
             state["queue"].as_array().unwrap().as_slice(),
-            [] as [serde_json::Value; 0]
+            [] as [json::Value; 0]
         );
         apply(&mut state, &Change::Unqueue("W2".to_owned()), NOW).unwrap_err();
     }
@@ -1180,7 +1191,7 @@ mod tests
         apply(&mut state, &Change::QuestionClose("Q1".to_owned()), NOW).unwrap();
         assert_eq!(
             state["questions"].as_array().unwrap().as_slice(),
-            [] as [serde_json::Value; 0]
+            [] as [json::Value; 0]
         );
     }
 

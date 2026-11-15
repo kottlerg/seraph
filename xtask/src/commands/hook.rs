@@ -32,7 +32,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context as _, Result, bail};
-use serde_json::{Value, json};
+use json::{Value, json};
 
 use crate::cli::{HookArgs, HookEvent};
 use crate::commands::pr_check::RELEASE_APPROVAL_RULE;
@@ -928,7 +928,7 @@ fn note(text: &str)
 /// note on stderr when it is not JSON.
 fn parse_event(raw: &str) -> Option<Value>
 {
-    match serde_json::from_str(raw)
+    match json::parse(raw)
     {
         Ok(event) => Some(event),
         Err(err) =>
@@ -950,7 +950,7 @@ fn answer_event(raw: &str, gate: &dyn Fn(u64) -> Gate) -> Answer
     };
     let command = event
         .pointer("/tool_input/command")
-        .and_then(serde_json::Value::as_str)
+        .and_then(json::Value::as_str)
         .unwrap_or("");
     answer_bash(command, Caller::of(&event), gate)
 }

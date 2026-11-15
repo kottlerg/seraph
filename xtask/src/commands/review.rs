@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Map, Value, json};
+use json::{Map, Value, json};
 
 use crate::cli::{ReviewCheckArgs, ReviewLedgerArgs};
 use crate::context::Context as BuildContext;
@@ -196,7 +196,7 @@ pub fn read_records(dir: &Path) -> Result<Vec<Record>>
         }
         let text = fs::read_to_string(entry.path())
             .with_context(|| format!("cannot read {}", entry.path().display()))?;
-        out.push((name, serde_json::from_str(&text).unwrap_or(Value::Null)));
+        out.push((name, json::parse(&text).unwrap_or(Value::Null)));
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
@@ -742,7 +742,7 @@ fn ledger_of(records: &[Record], settled: impl Fn(&Value) -> bool) -> Vec<Value>
             entry.insert("run".to_owned(), json!(run));
             for field in EARLIER_FIELDS
             {
-                if let Some(value) = finding.get(*field)
+                if let Some(value) = finding.get(field)
                 {
                     entry.insert((*field).to_owned(), value.clone());
                 }
@@ -914,11 +914,8 @@ fn write_pr_ledger(ctx: &BuildContext, pr: u64) -> Result<()>
     let records = read_records(&dir)?;
     let ledger = ledger(&records);
     let path = dir.join("ledger.json");
-    fs::write(
-        &path,
-        format!("{}\n", serde_json::to_string_pretty(&ledger)?),
-    )
-    .with_context(|| format!("cannot write {}", path.display()))?;
+    fs::write(&path, format!("{}\n", ledger.to_string_pretty()))
+        .with_context(|| format!("cannot write {}", path.display()))?;
     println!(
         "    ledger entries: {}, from {} record(s): {}",
         ledger.as_array().map_or(0, Vec::len),
@@ -978,7 +975,7 @@ fn print_release_ledger(
         entries.len(),
         prs.len()
     );
-    println!("{}", serde_json::to_string_pretty(&Value::Array(entries))?);
+    println!("{}", Value::Array(entries).to_string_pretty());
     Ok(())
 }
 
@@ -1089,7 +1086,7 @@ mod tests
             "not an object",
         ]);
         r["recorded"] = json!([finding("b", "open")]);
-        r["recorded"][0]["must_violation"] = json!("no");
+        r["recorded"].as_array_mut().unwrap()[0]["must_violation"] = json!("no");
         let found = check_record(NAME, &r);
         // The six fields the first entry lacks, one finding each.
         let missing = found
@@ -1688,7 +1685,7 @@ mod tests
         let blank = defect_record("BLOCKING ISSUES", vec![split.clone()]);
         assert_eq!(
             release_ledger(&[("full-0a82b0aa.json".to_owned(), blank)]),
-            [] as [serde_json::Value; 0]
+            [] as [json::Value; 0]
         );
         // The workflow lists a split finding under `undecided`.
         let mut ruled_undecided = split.clone();

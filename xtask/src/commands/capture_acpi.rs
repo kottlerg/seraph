@@ -31,8 +31,8 @@ use crate::context::Context;
 use crate::firmware::find_ovmf_code;
 use crate::guest::Guest;
 use crate::qemu::{
-    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, build_qemu_argv,
-    prepare_riscv_firmware,
+    GdbMode, Iommu, QemuDisplay, QemuLaunchSpec, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack,
+    build_qemu_argv, prepare_riscv_firmware,
 };
 use crate::qmp;
 use crate::util::{require_tool, step};
@@ -173,6 +173,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         riscv_mmu: RiscvMmu::Sv48,
         riscv_zkr: RiscvZkr::On,
         x86_paging: X86Paging::Four,
+        x86_shadow_stack: X86ShadowStack::Off,
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: true,

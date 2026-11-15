@@ -87,7 +87,10 @@ On `SYSCALL`:
    active and the user GS base moves to `IA32_KERNEL_GS_BASE`
 4. The stub saves the user `rsp` to `PerCpuData::user_rsp` and loads `rsp` from the
    per-CPU kernel stack pointer (`PerCpuData::kernel_rsp`, read through GS); `SYSCALL`
-   itself does not change `rsp`, and TSS `RSP0` serves only interrupt and exception entry
+   itself does not change `rsp`, and TSS `RSP0` serves only interrupt and exception entry.
+   With shadow stacks on (`SYSCALL` leaves the shadow-stack pointer 0), the stub then runs
+   `setssbsy`, which takes the thread's supervisor token from `IA32_PL0_SSP` and marks it
+   busy ([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism)
 5. Kernel saves the user register file (including `rcx` and `r11`) onto the kernel stack
 6. Kernel calls `syscall::dispatch(tf)` with a pointer to the saved `TrapFrame`;
    `dispatch` reads the number from `rax` and arguments 0–5 from `rdi`, `rsi`, `rdx`,
@@ -95,9 +98,11 @@ On `SYSCALL`:
 7. Kernel writes return values into the saved register frame, except for a
    restarted syscall (§ Restartable Syscalls), whose frame `rip` it rewinds to the
    `SYSCALL` instruction
-8. Kernel restores the user register file and switches to the user `rsp`
-9. `cli; swapgs`: the user GS base is back in place, with interrupts off until `SYSRET`
-   restores the user's `IF`
+8. `cli`: interrupts stay off until `SYSRET` restores the user's `IF`. With shadow stacks
+   on, `clrssbsy` releases the thread's supervisor token, which the shadow-stack pointer
+   names again once every call has returned, and the pointer becomes 0
+9. Kernel restores the user register file, switches to the user `rsp`, and runs `swapgs`:
+   the user GS base is back in place
 10. `SYSRET` restores `rip` from `rcx`, `rflags` from `r11`, transitions to CPL 3
 
 No non-canonical return `rip` (at or above the boot paging depth's lower-half limit,
@@ -756,7 +761,7 @@ CSpace.
 
 | # | Name | Description |
 |---|---|---|
-| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, its guard page, TCB, and FPU save area: `SystemInfoType::ThreadRetypeBytes` bytes |
+| 0 | `memory_cap` | Memory capability (Retype rights); supplies the thread's kernel stack, its guard page, TCB, FPU save area, and with shadow stacks on its shadow-stack page: `SystemInfoType::ThreadRetypeBytes` bytes |
 | 1 | `aspace_cap` | Address space capability (Map rights) the thread executes in |
 | 2 | `cspace_cap` | CSpace capability (Insert rights) the thread is bound to |
 | 3 | `sched_cap` | `SchedControl` capability governing the creation priority, or 0 |
@@ -3198,8 +3203,9 @@ pub enum SystemInfoType
     /// Raw retype debit of one `Thread`, in bytes, and so the size of the
     /// Memory capability `SYS_CAP_CREATE_THREAD` needs: one guard page, the
     /// kernel stack, one page holding the object wrapper and the TCB, and the
-    /// extended-state (FPU, SIMD, vector) save area, all whole pages. The guard
-    /// page is the caller's memory, debited with the rest, and unusable while
+    /// extended-state (FPU, SIMD, vector) save area, and, when the kernel runs
+    /// on shadow stacks, the thread's shadow-stack page, all whole pages. The
+    /// guard page is the caller's memory, debited with the rest, and unusable while
     /// the thread exists: the kernel unmaps it below the stack so an overflow
     /// faults. The save area is the boot CPU's, sized once at Phase 5: on
     /// x86-64 the XSAVE size of the components XCR0 enables (CPUID leaf 0xD),

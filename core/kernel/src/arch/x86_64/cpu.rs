@@ -10,7 +10,7 @@
 //! kernel-entry RFLAGS check.
 //!
 //! `current_stack_pointer`, `load_word_racy`, the CR4/MSR accessors, `x2apic_wrmsr_fence`,
-//! `copy_user`, `user_copy_fixup`, the enable routines, `verify_baseline`, `install_percpu`, the
+//! `copy_user`, `in_user_copy`, the enable routines, `verify_baseline`, `install_percpu`, the
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
 //! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
 //! host stubs). `cpuid`, `cpuid_subleaf`, `current_cpu` (which returns 0 under test),
@@ -178,33 +178,31 @@ pub unsafe fn write_msr(msr: u32, val: u64)
 
 // `copy_user` is the sole sanctioned path for kernel access to user memory. It
 // owns the SMAP access window (`stac`/`clac`) and is covered by the page-fault
-// handler's user-copy fixup: a fault on an unmapped or read-only user span
-// inside the copy redirects to `__copy_user_fixup` (which executes `clac` and
-// returns the count of bytes not copied, `rep movsb`'s `rcx` at the fault)
-// instead of panicking. See `crate::uaccess` for
-// the typed `copy_to_user`/`copy_from_user` wrappers and `idt::page_fault_handler`
-// for the fixup hook. Every kernel entry clears DF (SFMASK on SYSCALL, `cld`
-// in the IDT stubs), so `rep movsb` copies forward.
+// handler's user-copy recovery: a fault on an unmapped or read-only user span
+// inside the copy ends the copy where it stands instead of panicking. The
+// handler moves `rep movsb`'s count at the fault (the bytes not copied) into
+// `rax` and zeroes `rcx`, and returns to the same instruction, which then
+// copies nothing, so the routine closes the window and returns that count.
+// The return address is left as it was: with shadow
+// stacks on, a return to another address raises #CP. See `crate::uaccess` for
+// the typed `copy_to_user`/`copy_from_user` wrappers and
+// `idt::page_fault_handler` for the hook. Every kernel entry clears DF (SFMASK
+// on SYSCALL, `cld` in the IDT stubs), so `rep movsb` copies forward.
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".section .text.copy_user, \"ax\"",
     ".global __copy_user",
     ".global __copy_user_fault_start",
     ".global __copy_user_fault_end",
-    ".global __copy_user_fixup",
     // fn __copy_user(dst: rdi, src: rsi, len: rdx) -> rax (bytes not copied)
     "__copy_user:",
     "    stac",
     "    mov rcx, rdx",
+    "    xor eax, eax", // a copy that does not fault leaves no byte behind
     "__copy_user_fault_start:",
     "    rep movsb",
     "__copy_user_fault_end:",
     "    clac",
-    "    xor eax, eax",
-    "    ret",
-    "__copy_user_fixup:",
-    "    clac",
-    "    mov rax, rcx", // the faulting iteration's count: at least 1
     "    ret",
 );
 
@@ -217,8 +215,6 @@ unsafe extern "C" {
     static __copy_user_fault_start: u8;
     /// First byte past the faultable copy instruction.
     static __copy_user_fault_end: u8;
-    /// Recovery landing pad: closes the SMAP window, returns the bytes left.
-    static __copy_user_fixup: u8;
 }
 
 /// Copy `len` bytes from `src` to `dst` across the SMAP window with fault
@@ -235,7 +231,7 @@ unsafe extern "C" {
 pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
 {
     // SAFETY: forwarded to the asm routine; a fault on the user span is recovered
-    // by the page-fault handler via __copy_user_fixup.
+    // by the page-fault handler, which ends the copy in place.
     unsafe { __copy_user(dst, src, len) }
 }
 
@@ -251,23 +247,15 @@ pub unsafe fn copy_user(dst: *mut u8, src: *const u8, len: usize) -> usize
     0
 }
 
-/// If `pc` lies within `copy_user`'s faultable region, return the address of the
-/// recovery fixup; otherwise `None`. Consulted by the page-fault handler on a
-/// kernel-mode fault to convert an unmapped/read-only user access into an error
-/// return instead of a panic.
+/// Whether `pc` lies within `copy_user`'s faultable region. Consulted by the
+/// page-fault handler on a kernel-mode fault to convert an unmapped or
+/// read-only user access into an error return instead of a panic.
 #[cfg(not(test))]
-pub fn user_copy_fixup(pc: u64) -> Option<u64>
+pub fn in_user_copy(pc: u64) -> bool
 {
     let lo = core::ptr::addr_of!(__copy_user_fault_start) as u64;
     let hi = core::ptr::addr_of!(__copy_user_fault_end) as u64;
-    if pc >= lo && pc < hi
-    {
-        Some(core::ptr::addr_of!(__copy_user_fixup) as u64)
-    }
-    else
-    {
-        None
-    }
+    pc >= lo && pc < hi
 }
 
 // ── SMEP / SMAP ───────────────────────────────────────────────────────────────

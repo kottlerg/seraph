@@ -9,7 +9,10 @@
 //! A Thread slot is one guard page ([`GUARD_PAGES`]), the kernel stack
 //! ([`KERNEL_STACK_PAGES`]), one page holding the `ThreadObject` wrapper and
 //! the TCB, then the per-thread extended-state (FPU, SIMD, vector) save area,
-//! rounded up to whole pages. The guard page is the caller's memory, debited
+//! rounded up to whole pages, then, with shadow stacks on, the thread's
+//! shadow-stack page ([`shadow_page`]), which thread creation gives the
+//! shadow-stack encoding in the direct map (`mm::stack_guard::hole`) until
+//! the slot is freed. The guard page is the caller's memory, debited
 //! like the rest of the slot, and unusable while the thread exists: thread
 //! creation removes it from the direct map (`mm::stack_guard`), so an
 //! overflow of the stack faults instead of writing below the slot.
@@ -53,20 +56,53 @@ pub const fn extended_pages(extended_bytes: u64) -> u64
     if pages == 0 { 1 } else { pages }
 }
 
-/// Bytes of a Thread slot whose save area is `extended_bytes`: the guard,
-/// the kernel stack, the wrapper and TCB page, and the save area's pages.
-/// Saturates at `u64::MAX`, a size no Memory cap can supply, so a save area
-/// too large to address fails the retype.
-pub const fn slot_bytes(extended_bytes: u64) -> u64
+/// Offset of the shadow-stack page in a Thread slot whose save area is
+/// `extended_bytes`: the page after the save area's. Saturates as
+/// [`slot_bytes`] does.
+pub const fn shadow_offset(extended_bytes: u64) -> u64
 {
     extended_pages(extended_bytes)
         .saturating_mul(PAGE_SIZE as u64)
         .saturating_add(EXTENDED_OFFSET)
 }
 
+/// Bytes of a Thread slot whose save area is `extended_bytes` and which ends
+/// in `shadow_pages` shadow-stack pages (1 with shadow stacks on, else 0):
+/// the guard, the kernel stack, the wrapper and TCB page, the save area's
+/// pages, and the shadow stack. Saturates at `u64::MAX`, a size no Memory
+/// cap can supply, so a save area too large to address fails the retype.
+pub const fn slot_bytes(extended_bytes: u64, shadow_pages: u64) -> u64
+{
+    shadow_offset(extended_bytes).saturating_add(shadow_pages.saturating_mul(PAGE_SIZE as u64))
+}
+
 /// The save-area size the boot CPU reported, in bytes; zero before the
 /// report.
 static EXTENDED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Shadow-stack pages a Thread slot ends in: 1 once the boot decided shadow
+/// stacks are on (`arch::current::shadow_stack::decide`, Phase 4), else 0.
+static SHADOW_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// Record the shadow-stack pages a Thread slot ends in: 1 with shadow stacks
+/// on, else 0. Called once on the boot CPU in Phase 4, after the shadow-stack
+/// decision and before any Thread is retyped or the seed reserve is sized.
+pub fn set_shadow_stack_pages(pages: u64)
+{
+    SHADOW_PAGES.store(pages, Ordering::Relaxed);
+}
+
+/// The physical address of the shadow-stack page of the Thread slot at
+/// `block_phys`, or `None` when slots carry none.
+pub fn shadow_page(block_phys: u64) -> Option<u64>
+{
+    if SHADOW_PAGES.load(Ordering::Relaxed) == 0
+    {
+        return None;
+    }
+    // Inside the slot, which lies inside its Memory cap's range.
+    Some(block_phys.wrapping_add(shadow_offset(EXTENDED_BYTES.load(Ordering::Relaxed))))
+}
 
 /// Record the boot CPU's extended-state area size. Called once on the boot
 /// CPU during architecture init (Phase 5), before any Thread is retyped.
@@ -85,7 +121,10 @@ pub fn extended_area_bytes() -> u64
 /// Bytes every Thread retype debits from its source Memory cap.
 pub fn thread_slot_bytes() -> u64
 {
-    slot_bytes(EXTENDED_BYTES.load(Ordering::Relaxed))
+    slot_bytes(
+        EXTENDED_BYTES.load(Ordering::Relaxed),
+        SHADOW_PAGES.load(Ordering::Relaxed),
+    )
 }
 
 #[cfg(test)]
@@ -99,7 +138,18 @@ mod tests
     #[test]
     fn an_unreported_area_takes_one_page()
     {
-        assert_eq!(slot_bytes(0), (BASE + 1) * PAGE);
+        assert_eq!(slot_bytes(0, 0), (BASE + 1) * PAGE);
+    }
+
+    // The defect caught: a shadow-stack page that overlaps the save area's
+    // last page, or a slot that does not grow by it, so the retype debits
+    // too little and the shadow stack lands past the slot.
+    #[test]
+    fn the_shadow_stack_page_ends_the_slot_after_the_save_area()
+    {
+        assert_eq!(shadow_offset(PAGE + 1), (BASE + 2) * PAGE);
+        assert_eq!(slot_bytes(PAGE + 1, 1), shadow_offset(PAGE + 1) + PAGE);
+        assert_eq!(slot_bytes(PAGE + 1, 0), shadow_offset(PAGE + 1));
     }
 
     // The defect caught: a save area that spills past its last page by a
@@ -116,7 +166,7 @@ mod tests
     #[test]
     fn the_largest_riscv_area_composes_into_whole_pages()
     {
-        assert_eq!(slot_bytes(262_448), (BASE + 65) * PAGE);
+        assert_eq!(slot_bytes(262_448, 0), (BASE + 65) * PAGE);
     }
 
     // The defect caught: a save area whose page-rounded size passes `u64`
@@ -124,7 +174,7 @@ mod tests
     #[test]
     fn an_area_too_large_to_address_saturates_the_slot()
     {
-        assert_eq!(slot_bytes(u64::MAX), u64::MAX);
-        assert_eq!(slot_bytes(u64::MAX - EXTENDED_OFFSET), u64::MAX);
+        assert_eq!(slot_bytes(u64::MAX, 0), u64::MAX);
+        assert_eq!(slot_bytes(u64::MAX - EXTENDED_OFFSET, 1), u64::MAX);
     }
 }

@@ -22,6 +22,7 @@ pub mod interrupts;
 pub mod paging;
 pub mod platform;
 pub mod sbi;
+pub mod shadow_stack;
 pub mod speculation;
 pub mod syscall;
 pub mod timer;

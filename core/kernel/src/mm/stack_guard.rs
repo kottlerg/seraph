@@ -13,6 +13,13 @@
 //! idle stack's guard in Phase 4 ([`hole_on_boot_cpu`]) and each Thread slot's
 //! guard page while the thread exists ([`hole`], [`close`]).
 //!
+//! With shadow stacks on, the module also gives shadow-stack pages their
+//! encoding in the direct map, under the same lock and from the same reserve
+//! (`core/kernel/docs/memory-internals.md` § Shadow-Stack Pages): each CPU's
+//! and the handoff stack's in Phase 4 and 5 ([`shadow_on_boot_cpu`]), and each
+//! Thread slot's with its guard ([`hole`], which shoots the page down on every
+//! CPU, and [`close`]).
+//!
 //! Neither a Thread guard's hole nor its fill sends a shootdown. [`hole`]
 //! advances the guard epoch and returns it for the new thread's TCB; every
 //! switch-in compares the incoming thread's stamp with the epoch the CPU last
@@ -206,21 +213,66 @@ mod live
         REMAINING.load(Ordering::Relaxed)
     }
 
-    /// Unmap the page at `phys` from the direct map under the reserve's lock.
+    /// Unmap the page at `guard` from the direct map, and give the page at
+    /// `shadow`, if any, the shadow-stack encoding, under one hold of the
+    /// reserve's lock.
     ///
     /// # Safety
     /// As [`hole`].
-    unsafe fn hole_locked(phys: u64) -> Result<(), PagingError>
+    unsafe fn hole_locked(guard: u64, shadow: Option<u64>) -> Result<(), PagingError>
     {
+        use crate::arch::current::paging::{
+            fill_direct_map_page, hole_direct_map_page, shadow_direct_map_page,
+        };
+
         RESERVE.with(|list| {
-            // SAFETY: the lock serialises the edit and the reserve; the
-            // caller owns the page and keeps everything off it.
-            unsafe {
-                crate::arch::current::paging::hole_direct_map_page(phys_to_virt(phys), &mut || {
-                    list.pop()
-                })
+            // SAFETY: the lock serialises the edits and the reserve; the
+            // caller owns the pages and keeps everything off the guard, and
+            // every store but the shadow stack's off the shadow page.
+            unsafe { hole_direct_map_page(phys_to_virt(guard), &mut || list.pop()) }?;
+            let Some(shadow) = shadow
+            else
+            {
+                return Ok(());
+            };
+            // SAFETY: as above.
+            let made =
+                unsafe { shadow_direct_map_page(phys_to_virt(shadow), shadow, &mut || list.pop()) };
+            if made.is_err()
+            {
+                // The caller sees the error with neither page changed.
+                // SAFETY: the hole above left a leaf table; the lock is held.
+                unsafe { fill_direct_map_page(phys_to_virt(guard), guard) };
             }
+            made
         })
+    }
+
+    /// Give the RAM page at `phys` the shadow-stack encoding in the direct map
+    /// while only the boot CPU runs, flushing this CPU's TLB. A per-CPU or the
+    /// handoff shadow stack, kept for good.
+    ///
+    /// # Errors
+    /// As [`hole_on_boot_cpu`].
+    ///
+    /// # Safety
+    /// Before any other CPU starts (Phase 4 or 5). `phys` is a page-aligned
+    /// RAM page the caller owns, which nothing but its shadow stack writes from
+    /// here on.
+    pub unsafe fn shadow_on_boot_cpu(phys: u64) -> Result<(), PagingError>
+    {
+        let virt = phys_to_virt(phys);
+        RESERVE.with(|list| {
+            // SAFETY: the lock serialises the edit and the reserve; caller
+            // contract for the page.
+            unsafe {
+                crate::arch::current::paging::shadow_direct_map_page(virt, phys, &mut || list.pop())
+            }
+        })?;
+        // SAFETY: ring 0 / S-mode; no other CPU has run, so none caches the
+        // translation.
+        unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
+        Ok(())
     }
 
     /// Unmap the RAM page at `phys` from the direct map while only the boot
@@ -238,38 +290,81 @@ mod live
     pub unsafe fn hole_on_boot_cpu(phys: u64) -> Result<(), PagingError>
     {
         // SAFETY: caller contract.
-        unsafe { hole_locked(phys) }?;
+        unsafe { hole_locked(phys, None) }?;
         // SAFETY: ring 0 / S-mode; no other CPU has run, so none caches the
         // translation.
         unsafe { crate::arch::current::paging::flush_kernel_page(phys_to_virt(phys)) };
         Ok(())
     }
 
-    /// Unmap the RAM page at `phys`, a new thread's guard page, from the
-    /// direct map, and return the guard epoch to stamp in the thread's TCB.
-    /// No CPU's TLB is flushed here, this one's included: nothing reaches the
-    /// guard page before the new thread first runs, and every CPU's record,
-    /// this one's too, predates the stamp, so each flushes before it runs the
-    /// thread ([`flush_before_run`], at a switch-in or in `sched::enter`).
+    /// Unmap the RAM page at `guard`, a new thread's guard page, from the
+    /// direct map, give the page at `shadow`, the thread's shadow stack when
+    /// shadow stacks are on, the shadow-stack encoding, and return the guard
+    /// epoch to stamp in the thread's TCB. On an error neither page changed.
+    /// No CPU's TLB is flushed for the guard, this one's included: nothing
+    /// reaches the guard page before the new thread first runs, and every
+    /// CPU's record, this one's too, predates the stamp, so each flushes
+    /// before it runs the thread ([`flush_before_run`], at a switch-in or in
+    /// `sched::enter`). The shadow page is flushed on every online CPU before
+    /// this returns (a kernel-page shootdown): a stale writable translation
+    /// of it on any CPU, not only on the one that runs the thread, would let
+    /// an ordinary store reach the thread's shadow stack.
     ///
     /// # Errors
     /// As [`hole_on_boot_cpu`].
     ///
     /// # Safety
-    /// After SMP bringup (Phase 8 on), with no lock held. `phys` is a
-    /// page-aligned RAM page the caller owns, which nothing reaches through
-    /// the direct map until [`close`]; the returned epoch is stamped in the
-    /// TCB of the thread whose stack lies above it before the thread first
-    /// runs.
-    pub unsafe fn hole(phys: u64) -> Result<u64, PagingError>
+    /// After SMP bringup (Phase 8 on), with no lock held. `guard` and `shadow`
+    /// are distinct page-aligned RAM pages the caller owns: nothing reaches
+    /// `guard` through the direct map, and nothing but the thread's shadow
+    /// stack writes `shadow`, until [`close`]. The returned epoch is stamped
+    /// in the TCB of the thread whose stack lies above `guard` before the
+    /// thread first runs.
+    pub unsafe fn hole(guard: u64, shadow: Option<u64>) -> Result<u64, PagingError>
     {
         // SAFETY: caller contract.
-        unsafe { hole_locked(phys) }?;
-        debug_assert!(!is_mapped(phys), "stack_guard: a holed guard is mapped");
+        unsafe { hole_locked(guard, shadow) }?;
+        debug_assert!(!is_mapped(guard), "stack_guard: a holed guard is mapped");
+        if let Some(shadow) = shadow
+        {
+            // SAFETY: after SMP bringup with no lock held (caller contract).
+            unsafe { flush_everywhere(phys_to_virt(shadow)) };
+        }
         // After the edit, which the reserve lock's release published: a CPU
         // that reads this epoch or a later one sees the hole.
         // The epoch wraps, as `fetch_add` does.
         Ok(GUARD_EPOCH.fetch_add(1, Ordering::AcqRel).wrapping_add(1))
+    }
+
+    /// Drop every CPU's cached translation of the direct-map page at `virt`:
+    /// this CPU's by a local flush, every other online CPU's by a kernel-page
+    /// shootdown (`mm::tlb_shootdown::shootdown` on the kernel root, tag 0).
+    ///
+    /// # Safety
+    /// After SMP bringup, with no lock held: the shootdown waits for the other
+    /// CPUs with interrupts enabled.
+    unsafe fn flush_everywhere(virt: u64)
+    {
+        // SAFETY: ring 0 / S-mode; dropping this CPU's cached entry for a
+        // kernel address is always safe.
+        unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
+        let cpu_count = crate::sched::CPU_COUNT.load(Ordering::Relaxed) as usize;
+        let remote = crate::cpu_mask::MaskSource::Below(cpu_count);
+        crate::percpu::preempt_disable();
+        // SAFETY: the kernel root is the active root's kernel half on every
+        // CPU; `remote` names only online CPUs (the shootdown leaves this one
+        // out); preemption is disabled around the call and no lock is held
+        // (caller contract). A one-page request on the kernel root with tag 0
+        // drops the kernel mapping in every address space.
+        unsafe {
+            crate::mm::tlb_shootdown::shootdown(
+                crate::mm::paging::kernel_root_table_pa(),
+                &remote,
+                virt,
+                0,
+            );
+        }
+        crate::percpu::preempt_enable();
     }
 
     /// Flush this CPU's whole TLB, in every address space, when `stamp`, the
@@ -313,35 +408,51 @@ mod live
         unsafe { crate::percpu::set_guard_epoch_flushed(epoch) };
     }
 
-    /// Map the page at `phys`, holed by [`hole`], into the direct map again,
-    /// so the page can hold anything once more, and drop this CPU's cached
-    /// not-present entry for it where the architecture caches one
-    /// (`CACHES_NOT_PRESENT_ENTRIES`: riscv64; x86-64 caches none). No other
-    /// CPU is flushed: one that kept the invalid entry flushes before it runs
-    /// a thread whose kernel stack the page becomes (that thread's creation
-    /// advances the guard epoch after this fill; [`flush_before_run`]), and
-    /// any other use of the page faults on a different stack, where the
-    /// kernel's spurious-fault retry flushes the entry and re-executes
-    /// (`core/kernel/docs/memory-internals.md` § Kernel Stack Guards).
+    /// Map the page at `guard`, holed by [`hole`], and the shadow stack at
+    /// `shadow` it made, read-write into the direct map again, so the pages
+    /// can hold anything once more, and drop this CPU's cached entries for
+    /// them: a guard's not-present entry where the architecture caches one
+    /// (`CACHES_NOT_PRESENT_ENTRIES`: riscv64; x86-64 caches none), and a
+    /// shadow stack's read-only entry. No other CPU is flushed: one that kept
+    /// either entry flushes before it runs a thread whose kernel stack the
+    /// page becomes (that thread's creation advances the guard epoch after
+    /// this fill; [`flush_before_run`]), and any other use of the page faults
+    /// on a different stack, where the kernel's spurious-fault retry flushes
+    /// the entry and re-executes (`core/kernel/docs/memory-internals.md`
+    /// § Kernel Stack Guards).
     ///
     /// # Safety
-    /// With no lock held. `phys` was holed by [`hole`] and is not holed again
-    /// until this returns.
-    pub unsafe fn close(phys: u64)
+    /// With no lock held. `guard` and `shadow` were holed and made a shadow
+    /// stack by one [`hole`], whose thread no longer runs, and are not passed
+    /// to it again until this returns.
+    pub unsafe fn close(guard: u64, shadow: Option<u64>)
     {
-        let virt = phys_to_virt(phys);
+        use crate::arch::current::paging::{
+            CACHES_NOT_PRESENT_ENTRIES, fill_direct_map_page, flush_kernel_page,
+        };
+
         RESERVE.with(|_| {
             // SAFETY: the reserve's lock serialises the edit; the hole left a
             // leaf table.
-            unsafe { crate::arch::current::paging::fill_direct_map_page(virt, phys) };
+            unsafe { fill_direct_map_page(phys_to_virt(guard), guard) };
+            if let Some(shadow) = shadow
+            {
+                // SAFETY: as above; the shadow stack left a leaf table.
+                unsafe { fill_direct_map_page(phys_to_virt(shadow), shadow) };
+            }
         });
-        if crate::arch::current::paging::CACHES_NOT_PRESENT_ENTRIES
+        // A migration between the fill and these flushes is harmless: the
+        // CPU left behind is covered as every other one is (above).
+        if CACHES_NOT_PRESENT_ENTRIES
         {
-            // A migration between the fill and this flush is harmless: the
-            // CPU left behind is covered as every other one is (above).
-            // SAFETY: ring 0 / S-mode; dropping this CPU's cached entry for
-            // `virt` is always safe.
-            unsafe { crate::arch::current::paging::flush_kernel_page(virt) };
+            // SAFETY: ring 0 / S-mode; dropping this CPU's cached entry for a
+            // kernel address is always safe.
+            unsafe { flush_kernel_page(phys_to_virt(guard)) };
+        }
+        if let Some(shadow) = shadow
+        {
+            // SAFETY: as above.
+            unsafe { flush_kernel_page(phys_to_virt(shadow)) };
         }
     }
 
@@ -359,7 +470,7 @@ mod live
 #[cfg(not(test))]
 pub use live::{
     close, flush_before_run, hole, hole_on_boot_cpu, is_mapped, remaining_frames, seed,
-    seeded_frames,
+    seeded_frames, shadow_on_boot_cpu,
 };
 
 #[cfg(test)]

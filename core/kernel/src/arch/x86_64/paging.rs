@@ -143,14 +143,15 @@ impl PageTableEntry
 
     /// Construct a 4 KiB supervisor shadow-stack leaf for `phys`: present,
     /// R/W clear and Dirty set (the shadow-stack encoding while `CR4.CET` is
-    /// set), supervisor-only, never executable, write-back. Ordinary stores
-    /// fault on it; `CALL`, the shadow-stack instructions and event delivery
-    /// write it. Every table entry above it on the walk keeps R/W set
-    /// ([`Self::new_table`]), which the encoding requires.
+    /// set), accessed as every leaf the kernel builds, supervisor-only, never
+    /// executable, write-back. Ordinary stores fault on it; `CALL`, the
+    /// shadow-stack instructions and event delivery write it. Every table
+    /// entry above it on the walk keeps R/W set ([`Self::new_table`]), which
+    /// the encoding requires.
     pub fn new_shadow_stack_page(phys: u64) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
-        Self(PRESENT | DIRTY | NO_EXECUTE | (phys & PHYS_MASK))
+        Self(PRESENT | ACCESSED | DIRTY | NO_EXECUTE | (phys & PHYS_MASK))
     }
 
     /// Construct a 2 MiB large-page entry (PS bit set in a PDE) with `flags`.
@@ -2256,6 +2257,7 @@ mod tests
         };
         assert!(PageTableEntry::new_page(0x3000, flags).0 & ACCESSED != 0);
         assert!(PageTableEntry::new_large_page(0x20_0000, flags).0 & ACCESSED != 0);
+        assert!(PageTableEntry::new_shadow_stack_page(0x3000).0 & ACCESSED != 0);
     }
 
     #[test]

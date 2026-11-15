@@ -376,9 +376,10 @@ copies them, so the grant survives both.
 ## Accessed Bits
 
 Every leaf the kernel builds carries the accessed bit (A): `PageTableEntry::new_page` and
-`new_large_page` set it on both architectures, and on RISC-V `new_page` sets the dirty bit (D) too
-on a writable leaf. A leaf the kernel installs or rewrites therefore reads accessed until
-`SYS_ASPACE_HARVEST` clears A, the only path that clears it on a user leaf.
+`new_large_page` set it on both architectures, as does the x86-64 shadow-stack leaf
+(`new_shadow_stack_page`), and on RISC-V `new_page` sets the dirty bit (D) too on a writable leaf.
+A leaf the kernel installs or rewrites therefore reads accessed until `SYS_ASPACE_HARVEST` clears
+A, the only path that clears it on a user leaf.
 
 **Harvest.** `sys_aspace_harvest` runs in three steps:
 

@@ -859,10 +859,10 @@ the mapped pages, and writes an ELF core that host `gdb` reads to `/crash` on th
 filesystem, under a bound of its own and within a per-core and a directory byte budget, the oldest
 core deleted first ([crashd Operation § Core Dump](../services/crashd/docs/operation.md#core-dump),
 [Core Format](../services/crashd/docs/core-format.md)). A process on the path a core is written
-through, vfsd, the FAT driver and the block driver, declares itself so to procmgr at startup
-(`DECLARE_NO_CORE`), and the crash service writes no core of it, so a dump never waits on the
-process that died. A policy that holds a crashed process stopped for a debugger to rebind is
-design intent; not yet implemented.
+through, vfsd, the FAT driver, the block driver, devmgr and the IOMMU driver, declares itself so to
+procmgr at startup (`DECLARE_NO_CORE`), and the crash service writes no core of it, so a dump
+never waits on the process that died. A policy that holds a crashed process stopped for a
+debugger to rebind is design intent; not yet implemented.
 
 ---
 

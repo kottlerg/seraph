@@ -58,12 +58,13 @@ when it exits on its own.
    suppression), since devmgr alone writes the MSI-X table and its masks
    ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts)
    § Message-Signaled Interrupts).
-6. A block driver MUST declare itself on the core path at startup, before it serves a request
-   (`procmgr_labels::DECLARE_NO_CORE`, sent on its own procmgr cap): the crash service writes a
-   core to the root filesystem through the block driver beneath it, so a core of that driver
-   would wait on the driver it describes, and the declaration tells the crash service to write
-   none ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 26:
-   `DECLARE_NO_CORE`). vfsd and each filesystem driver declare themselves the same way.
+6. A block driver and an IOMMU driver MUST declare themselves on the core path at startup, before
+   they serve a request (`procmgr_labels::DECLARE_NO_CORE`, sent on their own procmgr cap): the
+   crash service writes a core to the root filesystem through the block driver beneath it, whose
+   every transfer devmgr maps through the IOMMU driver, so a core of either would wait on the
+   driver it describes, and the declaration tells the crash service to write none
+   ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 26: `DECLARE_NO_CORE`).
+   vfsd, each filesystem driver and devmgr declare themselves the same way.
 7. A driver SHOULD use shared library crates (e.g. `services/drivers/virtio/core/`) where
    applicable rather than duplicating transport logic.
 

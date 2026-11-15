@@ -1149,24 +1149,26 @@ classes it rebound, and the same restore once an attach's watch thread exits.
 
 The sender declares itself on the **core path**, the processes a core dump's write waits on: the
 crash service writes a core to `/crash` through vfsd, the filesystem driver of the root partition,
-and the block driver beneath it ([crashd Operation](../../crashd/docs/operation.md) § Core Dump), so
-a core of one of them, written while its faulting thread is held, would wait on the process it
-describes. procmgr marks the sender, and every `ATTACH_PROCESS` reply for it from then on carries
-`ATTACH_FLAG_NO_CORE` in `data[7]` (Label 20); the crash service writes no core of a process whose
-reply carries it, and still reports the fault in the log. The mark changes nothing else: the
-process stays attachable and bound to the crash endpoint. It is one-way for the process's life. A
-repeat is answered as the first. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no live
-process or the request came on a process handle.
+the block driver beneath it, devmgr, which maps each transfer's buffer on its DMA endpoint, and the
+IOMMU driver devmgr installs those mappings through
+([crashd Operation](../../crashd/docs/operation.md) § Core Dump), so a core of one of them, written
+while its faulting thread is held, would wait on the process it describes. procmgr marks the
+sender, and every `ATTACH_PROCESS` reply for it from then on carries `ATTACH_FLAG_NO_CORE` in
+`data[7]` (Label 20); the crash service writes no core of a process whose reply carries it, and
+still reports the fault in the log. The mark changes nothing else: the process stays attachable
+and bound to the crash endpoint. It is one-way for the process's life. A repeat is answered as the
+first. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no live process or the request
+came on a process handle.
 
-The duty falls on every process a write to `/crash` can wait on: vfsd, each filesystem driver, and
-each block driver, which each send the declaration at startup, before they serve a request. A new
-storage driver sends it too, as the driver-authoring rules require
-([Driver Model](../../drivers/docs/driver-model.md) § Adding a Driver). A process
-that faults before its declaration reaches procmgr is dumped like any other, and its dump's wait
-on it ends at the crash service's dump bound ([crashd Operation](../../crashd/docs/operation.md)
-§ Bounds), as does the wait of a dump that blocks on a process that never declared. A process can
-declare itself only, so the declaration removes no core of another process. Its mark leaves out a
-core of the declarer alone, which holds nothing of another process.
+The duty falls on every process a write to `/crash` can wait on: vfsd, each filesystem driver, each
+block driver, devmgr, and each IOMMU driver, which each send the declaration at startup, before they
+serve a request. A new storage or IOMMU driver sends it too, as the driver-authoring rules require
+([Driver Model](../../drivers/docs/driver-model.md) § Adding a Driver). A process that faults before
+its declaration reaches procmgr is dumped like any other, and its dump's wait on it ends at the
+crash service's dump bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds), as does
+the wait of a dump that blocks on a process that never declared. A process can declare itself only,
+so the declaration removes no core of another process. Its mark leaves out a core of the declarer
+alone, which holds nothing of another process.
 
 ---
 

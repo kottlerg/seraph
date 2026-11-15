@@ -83,8 +83,9 @@ A dump follows the block when the report attached and read the process within it
 1. It reads the process's name from `LIST_PROCESSES`, and ends, with no line, when the policy
    does not name it.
 2. It writes no core of a process that declared itself on the core path (`DECLARE_NO_CORE`, which
-   the attach reply's flags word reports): vfsd, the FAT driver and the block driver, through
-   which the core would be written, so the dump never waits on the process that died
+   the attach reply's flags word reports): vfsd, the FAT driver, the block driver, devmgr and the
+   IOMMU driver, through which the core would be written, so the dump never waits on the process
+   that died
    ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 26: `DECLARE_NO_CORE`).
 3. It attaches the process again, page by page, and stops each listed thread but the faulting one
    (`SYS_THREAD_STOP`): the fault holds that one already, and a stop would cancel its fault. It

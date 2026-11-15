@@ -857,9 +857,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             },
         );
         budget::uncharge(&mut self.arena, charged, unbacked);
-        self.promised = self
-            .promised
-            .saturating_sub(unbacked.saturating_add(meta));
+        self.promised = self.promised.saturating_sub(unbacked.saturating_add(meta));
         Ok(())
     }
 
@@ -2008,9 +2006,8 @@ mod tests
             if let Node::Region(have) = l.arena.get(idx).node
                 && let Some(c) = l.commit_at(have.commit)
             {
-                pages += have.region.len / PAGE_SIZE - run_pages(l, &have)
-                    + c.pt_left
-                    + c.meta_left;
+                pages +=
+                    have.region.len / PAGE_SIZE - run_pages(l, &have) + c.pt_left + c.meta_left;
             }
         }
         pages
@@ -2647,7 +2644,10 @@ mod tests
             l.add_region(rec, region(BASE, CHUNK), Commit::Committed),
             Err(RegionError::NoSlot)
         );
-        assert_eq!((l.arena.available(), promised(&l), usage(&l, rec).0), (1, 0, 0));
+        assert_eq!(
+            (l.arena.available(), promised(&l), usage(&l, rec).0),
+            (1, 0, 0)
+        );
         let plain = l
             .add_region(rec, region(BASE, CHUNK), Commit::Uncommitted)
             .unwrap();

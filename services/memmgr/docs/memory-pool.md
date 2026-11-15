@@ -221,7 +221,7 @@ and never reclaims them. Each entry records:
   records have top-level reserve nodes with no max, so their bootstrap arenas
   are charged too.
 
-The frame, region, and chunk-table nodes live in a self-hosted metadata arena (below),
+The frame, region, commitment, and chunk-table nodes live in a self-hosted metadata arena (below),
 not in the record, so per-process frame and region counts are bounded by RAM —
 not by a fixed constant. The arena is what makes the demand-paged thread-stack
 consumer (one region plus many lazily-grown frames per thread) viable: a fixed
@@ -588,8 +588,9 @@ the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process
    Memory cap and insert it into the free pool at its sorted position when
    the frame is quiescent, else onto the deferred list (no fresh node, so
    the step cannot fail).
-5. Return every chunk-table node, every region node, the record's own node,
-   and its caps node to the arena free list, and drop the record's reference
+5. Return every chunk-table node, every region node, the commitment node of
+   each committed region, the record's own node, and its caps node to the
+   arena free list, and drop the record's reference
    to its budget node, which is freed with it unless a deferred run is still
    charged to it.
 6. Run coalescing across the newly-freed runs and their adjacent
@@ -629,7 +630,8 @@ whole region span from the delegated child `AddressSpace` in one
 `mem_unmap_reclaim` call, which also returns the emptied page tables to that
 address space's page-table budget (the process is still alive, so the mappings
 must be removed before the frames return to the pool). It then removes the
-region node and frees its chunk table ([Chunk table](#chunk-table)), returning
+region node, with its commitment node when it is committed ([Commit](#commit)),
+and frees its chunk table ([Chunk table](#chunk-table)), returning
 each backing run's cap to the pool, or to the deferred list when the run is not
 quiescent (each descriptor node becoming its run's node), and coalesces the
 freed runs with their physical neighbours. The entry's frame list, which holds

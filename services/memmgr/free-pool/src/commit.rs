@@ -11,9 +11,11 @@
 //! A committed region of `pages` pages promises its data pages that hold no
 //! frame yet, a page-table reservation its faults' page-table donations draw
 //! from ([`pt_reserve`]), and a bound on the metadata-arena pages its chunk
-//! table and run descriptors can take ([`meta_bound`]). The data pages and the
-//! reservation are charged to the region's budget node when it is committed;
-//! the metadata bound is charged to no node, as memmgr's metadata never is.
+//! table and run descriptors can take ([`meta_bound`]), which the arena's
+//! growth for its faults draws from as their donations draw from the
+//! reservation. The data pages and the reservation are charged to the region's
+//! budget node when it is committed; the metadata bound is charged to no node,
+//! as memmgr's metadata never is.
 //! Each is computed from the region's whole length, so a region grown in many
 //! small extensions promises what one registration of its length would. The
 //! reservation is that of the largest length the region has had, since a cut

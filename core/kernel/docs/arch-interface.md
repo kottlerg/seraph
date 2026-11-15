@@ -960,8 +960,10 @@ pub fn hide(value: usize) -> usize;
 /// user-to-kernel controls it calls for, publish the selection, and log the
 /// table and the controls. Called once on the BSP in Phase 1, after the
 /// baseline check, before any AP starts. x86-64 reads CPUID and
-/// `IA32_ARCH_CAPABILITIES` (transient-execution.md § Controls); RISC-V does
-/// nothing, since the RVA23 floor defines no such enumeration or control.
+/// `IA32_ARCH_CAPABILITIES`, and selects from the inputs a
+/// `SERAPH_FORCE_RETURN_MITIGATION` build forces where one does
+/// (transient-execution.md § Controls); RISC-V does nothing, since the RVA23
+/// floor defines no such enumeration or control.
 pub fn select_mitigations();
 
 /// Set the calling CPU's per-CPU controls of the selection (x86-64:

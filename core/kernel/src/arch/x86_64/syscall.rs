@@ -120,14 +120,15 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 3. Switches to `gs:[8]` (`PerCpuData::kernel_rsp`), and with shadow stacks
 ///    on (`shadow_stack::enabled`) to the thread's shadow stack (`setssbsy`).
 /// 4. Allocates a 168-byte [`TrapFrame`] on the kernel stack.
-/// 5. Saves all GPRs and CPU-state fields into the frame, then clears the
-///    branch history where the transient-execution selection asks for it
-///    (`mitigation::seraph_clear_branch_history`).
+/// 5. Saves all GPRs and CPU-state fields into the frame, then sets `IBRS`
+///    and clears the branch history where the transient-execution selection
+///    asks for them (`mitigation::seraph_enter_from_user`).
 /// 6. Calls `crate::syscall::dispatch`.
 /// 7. Disables interrupts, releases the shadow stack's token (`clrssbsy`)
-///    with shadow stacks on, restores registers, swaps back to the user GS
-///    base, runs the selection's `VERW` (`mitigation::verw_asm`), and
-///    executes `sysretq`.
+///    with shadow stacks on, writes the user-mode `IA32_SPEC_CTRL` value
+///    where the selection asks for it (`mitigation::ibrs_exit_asm`), restores
+///    registers, swaps back to the user GS base, runs the selection's `VERW`
+///    (`mitigation::verw_asm`), and executes `sysretq`.
 ///
 /// `IA32_KERNEL_GS_BASE` must hold this CPU's `PerCpuData` pointer while user
 /// code runs: installed in `IA32_GS_BASE` by `percpu::init_bsp` in Phase 5
@@ -187,10 +188,10 @@ unsafe extern "custom" fn syscall_entry()
         "mov qword ptr [rsp + 144], 0x23", // cs = USER_CS
         "mov qword ptr [rsp + 152], 0x1b", // ss = USER_DS
         "mov qword ptr [rsp + 160], 0",    // fs_base: unused (TLS base is SavedState.fs_base)
-        // Clear the branch history before any indirect branch, where the
-        // selection asks for it (core/kernel/docs/transient-execution.md
-        // § Controls). Clobbers eax, ecx and the flags, all saved above.
-        "call seraph_clear_branch_history",
+        // Set IBRS and clear the branch history before any indirect branch,
+        // where the selection asks for them (core/kernel/docs/transient-execution.md
+        // § Controls). Clobbers eax, ecx, edx and the flags, all saved above.
+        "call seraph_enter_from_user",
 
         // ── Phase 3: dispatch ─────────────────────────────────────────────
         "mov rdi, rsp",             // arg0 = *mut TrapFrame
@@ -217,6 +218,10 @@ unsafe extern "custom" fn syscall_entry()
         "rdsspq rax",
         "clrssbsy [rax]",
         "4:",
+        // The user-mode IA32_SPEC_CTRL value, where the selection asks for
+        // it, after the last kernel call and before the registers it clobbers
+        // (eax, ecx, edx) are restored.
+        super::mitigation::ibrs_exit_asm!(),
         // sysretq: RIP←RCX, RFLAGS←R11, RSP stays as set.
         "mov rax, [rsp +   0]",     // return value (dispatch set tf.rax)
         "mov rbx, [rsp +   8]",

@@ -70,7 +70,7 @@ Setting `default-members = ["xtask"]` in the workspace root `Cargo.toml` means
 bare `cargo build` and `cargo run` operate only on the host-target xtask
 binary. Components targeting the kernel, bootloader, or std-userspace triples
 must be built via `cargo xtask build` so the correct custom target JSON and
-`-Zbuild-std` flags are passed and, for the bootloader and the riscv64 kernel,
+`-Zbuild-std` flags are passed and, for the bootloader and each kernel,
 `RUSTFLAGS` is set (§ Custom Targets).
 
 [`abi/boot-protocol`](../abi/boot-protocol/README.md) is the source of truth for the boot
@@ -199,7 +199,11 @@ and of its `-Z build-std` crates goes through the kernel's retpoline thunk
 `.cargo/config.toml` there too: a flag added to that array reaches a kernel
 only when it is added to `RISCV64_KERNEL_RUSTFLAGS` and
 `X86_64_KERNEL_RUSTFLAGS` as well, and a `RUSTFLAGS` set in the calling
-environment does not reach the bootloader or either kernel.
+environment does not reach the bootloader or either kernel. A
+`SERAPH_FORCE_RETURN_MITIGATION` set there does reach the x86-64 kernel's
+compile, which reads it to force the inputs of its return mitigations
+([transient-execution.md](../core/kernel/docs/transient-execution.md)
+§ Forced return mitigations); the riscv64 kernel does not read it.
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace

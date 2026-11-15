@@ -20,30 +20,32 @@
 
 /// Read the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`, derive its
 /// vulnerability table, select the user-to-kernel controls the table calls
-/// for, publish the selection, and log the inputs, the table and the controls
+/// for (from the inputs a `SERAPH_FORCE_RETURN_MITIGATION` build forces, where
+/// one does), publish the selection, and log the inputs, the table and the controls
 /// on the serial console. Called once on the BSP in Phase 1, after
 /// `cpu::verify_baseline`, before any AP starts or any thread enters user
 /// mode.
 #[cfg(not(test))]
 pub fn select_mitigations()
 {
-    use super::mitigation::{Inputs, install, report, select};
+    use super::mitigation::{FORCED_RETURN, Inputs, install, report, select};
 
     let cpu = super::vulnerability::enumerate();
     let table = super::vulnerability::derive(&cpu);
     super::vulnerability::report(&cpu, &table);
-    let inputs = Inputs::of(&cpu, &table);
+    let inputs = Inputs::of(&cpu, &table).forced(FORCED_RETURN);
     let controls = select(inputs);
     install(inputs, controls);
-    report(&cpu, controls);
+    report(&cpu, inputs, controls);
 }
 
 /// No-op test stub.
 #[cfg(test)]
 pub fn select_mitigations() {}
 
-/// Set the calling CPU's per-CPU controls of the selection (enhanced IBRS,
-/// `BHI_DIS_S`, Automatic IBRS, `DOITM`), through
+/// Set the calling CPU's per-CPU controls of the selection (enhanced IBRS, or
+/// the kernel's `IA32_SPEC_CTRL` value of IBRS on entry, `BHI_DIS_S`,
+/// Automatic IBRS, `DOITM`), through
 /// `super::mitigation::apply_this_cpu`.
 ///
 /// # Panics

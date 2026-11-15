@@ -33,10 +33,12 @@
 //! entry-side swap decision is followed by `lfence`. The spurious-interrupt stub
 //! (vector 255) runs only `iretq`: it executes no kernel code, touches no GS
 //! state, and loads nothing but the frame the CPU pushed, so it needs no
-//! transient-execution control. Every other stub, from ring 3, clears the
-//! branch history before its handler and runs `VERW` before its `iretq` where
-//! the selection asks for them (`tf_build_asm`, `exit_swapgs_asm`,
-//! `paranoid_exit_asm`; core/kernel/docs/transient-execution.md § Controls).
+//! transient-execution control. Every other stub, from ring 3, runs the entry
+//! routine (`IBRS` and the branch history clearing) before its handler, and
+//! the `IA32_SPEC_CTRL` write and `VERW` before its `iretq`, where the
+//! selection asks for them (`tf_build_asm`, `tf_resume_asm`, `exit_swapgs_asm`,
+//! `paranoid_entry_asm`, `paranoid_exit_asm`;
+//! core/kernel/docs/transient-execution.md § Controls).
 //!
 //! # Exception vector groups
 //! Vectors with a hardware-pushed error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
@@ -192,11 +194,11 @@ struct Idtr
 /// rsp+216]`.
 ///
 /// Last, from ring 3 (the saved CS has a non-zero RPL), it calls
-/// `mitigation::seraph_clear_branch_history`, which clears the branch history
-/// where the transient-execution selection asks for it, before the trampoline
-/// reaches any indirect branch (core/kernel/docs/transient-execution.md
-/// § Controls). The call clobbers `rax`, `rcx` and the flags, all saved or
-/// dead by then.
+/// `mitigation::seraph_enter_from_user`, which sets `IBRS` and clears the
+/// branch history where the transient-execution selection asks for them,
+/// before the trampoline reaches any indirect branch
+/// (core/kernel/docs/transient-execution.md § Controls). The call clobbers
+/// `rax`, `rcx`, `rdx` and the flags, all saved or dead by then.
 #[cfg(not(test))]
 macro_rules! tf_build_asm {
     () => {
@@ -230,7 +232,7 @@ macro_rules! tf_build_asm {
             "mov qword ptr [rsp + 160], 0\n",   // fs_base
             "test byte ptr [rsp + 144], 0x3\n", // saved CS RPL; 0 => ring 0
             "jz 85f\n",
-            "call seraph_clear_branch_history\n",
+            "call seraph_enter_from_user\n",
             "85:\n",
         )
     };
@@ -275,14 +277,26 @@ macro_rules! tf_restore_asm {
     };
 }
 
-/// Naked-asm fragment: [`tf_restore_asm`], then the ring-3 GS exit
-/// ([`exit_swapgs_asm`], keyed on the iret frame's CS at `[rsp + 8]`), then
-/// `iretq`. The return tail of every trampoline that entered through
-/// [`entry_swapgs_asm`].
+/// Naked-asm fragment: disable interrupts and, on a return to ring 3 (the
+/// frame's CS at `[rsp + 144]` has a non-zero RPL), write the user-mode
+/// `IA32_SPEC_CTRL` value where the selection asks for it
+/// (`mitigation::ibrs_exit_asm`, which clobbers registers the frame restores);
+/// then [`tf_restore_asm`], the ring-3 GS exit ([`exit_swapgs_asm`], keyed on
+/// the iret frame's CS at `[rsp + 8]`), and `iretq`. The return tail of every
+/// trampoline that entered through [`entry_swapgs_asm`].
 #[cfg(not(test))]
 macro_rules! tf_resume_asm {
     () => {
-        concat!(tf_restore_asm!(), exit_swapgs_asm!("8"), "iretq\n")
+        concat!(
+            "cli\n",
+            "test byte ptr [rsp + 144], 0x3\n",
+            "jz 86f\n",
+            super::mitigation::ibrs_exit_asm!(),
+            "86:\n",
+            tf_restore_asm!(),
+            exit_swapgs_asm!("8"),
+            "iretq\n",
+        )
     };
 }
 
@@ -359,7 +373,11 @@ macro_rules! exit_swapgs_asm {
 /// and is never a kernel-half address (`cpu::enable_smep_smap` keeps
 /// `CR4.FSGSBASE` clear on every CPU, so ring 3 has no `wrgsbase`), so a clear
 /// sign bit in `IA32_GS_BASE` means the user base is active. Swaps if so and records it in `r12`
-/// (callee-saved across the handler call) for [`paranoid_exit_asm`].
+/// (callee-saved across the handler call) for [`paranoid_exit_asm`]. Then,
+/// where the selection asks for IBRS on entry, it saves the interrupted
+/// `IA32_SPEC_CTRL` in `r13` and writes the kernel's value
+/// (`mitigation::ibrs_paranoid_entry_asm`): the stub may have interrupted a
+/// return after its user-mode write, or an entry before its kernel one.
 #[cfg(not(test))]
 macro_rules! paranoid_entry_asm {
     () => {
@@ -375,12 +393,15 @@ macro_rules! paranoid_entry_asm {
             "mov r12d, 1\n",
             "83:\n",
             "lfence\n", // see `entry_swapgs_asm`
+            super::mitigation::ibrs_paranoid_entry_asm!(),
         )
     };
 }
 
-/// Naked-asm fragment: undo [`paranoid_entry_asm`]'s swap (if it swapped), then
-/// restore the frame, run `mitigation::verw_asm`, and `iretq`.
+/// Naked-asm fragment: undo [`paranoid_entry_asm`]'s `IA32_SPEC_CTRL` write
+/// (`mitigation::ibrs_paranoid_exit_asm`: the user-mode value on a return to
+/// ring 3, the saved one otherwise) and its swap (if it swapped), then restore
+/// the frame, run `mitigation::verw_asm`, and `iretq`.
 ///
 /// The `VERW` runs on a return to ring 0 as well: a paranoid stub can
 /// interrupt a return to user mode after its own `VERW` (an NMI or `#MC`
@@ -392,6 +413,7 @@ macro_rules! paranoid_exit_asm {
     () => {
         concat!(
             "cli\n",
+            super::mitigation::ibrs_paranoid_exit_asm!("144"),
             "test r12, r12\n",
             "jz 84f\n",
             "swapgs\n",
@@ -1165,13 +1187,22 @@ unsafe extern "custom" fn isr_nm()
         "push r9",
         "push r10",
         "push r11",
-        // From ring 3, clear the branch history where the selection asks for
-        // it, before the handler (see `tf_build_asm`); CS is at [rsp + 80].
+        // From ring 3, set IBRS and clear the branch history where the
+        // selection asks for them, before the handler (see `tf_build_asm`);
+        // CS is at [rsp + 80].
         "test byte ptr [rsp + 80], 0x3",
         "jz 87f",
-        "call seraph_clear_branch_history",
+        "call seraph_enter_from_user",
         "87:",
         "call {handler}",
+        // To ring 3, the user-mode IA32_SPEC_CTRL value where the selection
+        // asks for it, with interrupts off and before the registers it
+        // clobbers are restored (see `tf_resume_asm`).
+        "cli",
+        "test byte ptr [rsp + 80], 0x3",
+        "jz 88f",
+        super::mitigation::ibrs_exit_asm!(),
+        "88:",
         "pop r11",
         "pop r10",
         "pop r9",

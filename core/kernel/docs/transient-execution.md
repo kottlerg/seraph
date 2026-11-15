@@ -18,9 +18,11 @@ after the baseline check (`speculation::select_mitigations`), and written to the
 
 The table states what each class asks of the kernel at the user-to-kernel boundary, and the
 kernel applies the controls it selects there: buffer clearing on return to user mode, the
-branch-predictor controls, and the return stack buffer fills (§ Controls). The return mitigations
-for `retbleed` and `spec_rstack_overflow` (a return thunk, or an IBPB on entry) are design
-intent, not yet implemented ([#1085](https://github.com/kottlerg/seraph/issues/1085)).
+branch-predictor controls, IBRS on entry for `retbleed` on an Intel part without enhanced IBRS,
+and the return stack buffer fills (§ Controls). No control answers `retbleed` on an AMD part
+(branch type confusion) or `spec_rstack_overflow`; their mechanism is not yet decided
+([#1085](https://github.com/kottlerg/seraph/issues/1085)), and the serial log names each such class
+(§ Report).
 
 RISC-V has no counterpart. The RVA23 floor defines no enumeration of transient-execution
 vulnerabilities and no speculation control, so `speculation::select_mitigations` does nothing
@@ -281,21 +283,24 @@ selection is `mitigation::select`, a pure function of the inputs below; `mitigat
 publishes it, and every CPU sets the per-CPU controls of it in its bring-up
 (`speculation::apply_mitigations_this_cpu`: the boot CPU in Phase 1, each AP in
 `kernel_entry_ap`). A CPU that does not enumerate an MSR control the selection holds
-(`IBRS_ALL`, Automatic IBRS, `BHI_CTRL` or `DOITM`) halts with "CPU lacks the <control> the
-boot CPU selected" (`mitigation::missing_msr_control`) before it touches the MSR, since the
-access would fault. The code is `arch/x86_64/mitigation.rs`.
+(`IBRS_ALL`, IBRS for IBRS on entry, Automatic IBRS, `BHI_CTRL` or `DOITM`) halts with "CPU
+lacks the <control> the boot CPU selected" (`mitigation::missing_msr_control`) before it touches
+the MSR, since the access would fault. The code is `arch/x86_64/mitigation.rs`.
 
 ### Selection
 
 The inputs are the classes the table gives `Kernel` exposure, the two predictor behaviours, and
-four enumerated bits: `IBRS_ALL` (`IA32_ARCH_CAPABILITIES` bit 1), Automatic IBRS
-(`CPUID Fn8000_0021 EAX[8]`, AMD), `BHI_CTRL`, and `DOITM` (`IA32_ARCH_CAPABILITIES` bit 12).
+five enumerated bits: `IBRS_ALL` (`IA32_ARCH_CAPABILITIES` bit 1), IBRS
+(`CPUID.(EAX=07H,ECX=0):EDX[26]`, Intel, or `CPUID Fn8000_0008 EBX[14]`, AMD), Automatic IBRS
+(`CPUID Fn8000_0021 EAX[8]`, AMD), `BHI_CTRL`, and `DOITM` (`IA32_ARCH_CAPABILITIES` bit 12). A
+kernel built to force the return mitigations replaces some of them (§ Forced return mitigations).
 
 | Control | Log name | Selected when | Where it acts |
 |---|---|---|---|
-| Enhanced IBRS | `eibrs` | `spectre_v2` is `Kernel` and the CPU enumerates `IBRS_ALL` | `IA32_SPEC_CTRL.IBRS` set once on every CPU |
-| Automatic IBRS | `auto_ibrs` | `spectre_v2` is `Kernel`, no `IBRS_ALL`, and the CPU enumerates Automatic IBRS | `EFER.AIBRSE` (bit 21) set on every CPU |
-| Retpoline | `retpoline` | `spectre_v2` is `Kernel`, with neither | Every indirect call and jump of the kernel |
+| Enhanced IBRS | `eibrs` | `spectre_v2` is `Kernel`, or `retbleed` is `Kernel` and the CPU has `rsb_alternate`; and the CPU enumerates `IBRS_ALL` | `IA32_SPEC_CTRL.IBRS` set once on every CPU |
+| IBRS on entry | `ibrs_entry` | `retbleed` is `Kernel`, the CPU has `rsb_alternate`, no `IBRS_ALL`, and the CPU enumerates IBRS | `IA32_SPEC_CTRL.IBRS` set on every entry from user mode and cleared on every return to it |
+| Automatic IBRS | `auto_ibrs` | `spectre_v2` is `Kernel`, neither of the two above, and the CPU enumerates Automatic IBRS | `EFER.AIBRSE` (bit 21) set on every CPU |
+| Retpoline | `retpoline` | `spectre_v2` is `Kernel`, with none of the three | Every indirect call and jump of the kernel |
 | `BHI_DIS_S` | `bhi_dis_s` | `bhi` is `Kernel` and the CPU enumerates `BHI_CTRL` | `IA32_SPEC_CTRL.BHI_DIS_S` (bit 10) set on every CPU |
 | Branch history clearing | `bhb_clear` | `bhi` is `Kernel`, without `BHI_CTRL` | Every entry from user mode |
 | `VERW` on exit | `verw_exit` | `mds`, `tsx_async_abort`, `mmio_stale_data`, `reg_file_data_sampling` or `tsa` is `Kernel` | Every return to user mode |
@@ -326,8 +331,10 @@ a jump table. The kernel's thunk tests a flag that `install` sets. With retpolin
 runs the sequence: a `call` whose return the RSB predicts into a `pause; lfence` loop, and a
 `ret` to the target. Otherwise it runs `lfence; jmp r11`, where the `lfence` keeps a
 mispredicted test of the flag from reaching the plain jump on a part that needs the sequence. The
-assembly stubs have one indirect branch of their own outside the thunk, `switch`'s resume
-without shadow stacks, which goes through the thunk too.
+assembly stubs have two indirect branches of their own. `switch`'s resume without shadow stacks
+goes through the thunk. `shadow_stack::enable` ends in a plain `jmp r11` to its caller, outside
+the thunk: it runs only where shadow stacks turn on, which `shadow_stack::decide` allows only
+when retpoline is not selected (below), so the jump never needs the sequence.
 
 The cost of the thunk where retpoline is not selected (a call, a compare and an `lfence` per
 indirect branch) is not measured.
@@ -345,16 +352,71 @@ control rewrites a return
 is in the project's reach to boot ([#1123](https://github.com/kottlerg/seraph/issues/1123)); the
 host tests of `mitigation.rs` cover the rule over the Zen 3, Zen 4 and development-host vectors.
 
+### Return predictions
+
+On an Intel part with `rsb_alternate` (Skylake-generation parts, the list's RSBA column), a `ret`
+that finds the RSB empty may be predicted from the branch target buffer, which user mode can
+train. Intel states that IBRS mitigates this behaviour and the retpoline sequence does not, and
+that the operating system should set IBRS after the transition from a less privileged mode
+(Intel's RSBU guidance). Where such a part has no enhanced IBRS but implements IBRS, the kernel
+selects IBRS on entry. Enhanced IBRS covers the case where the part has it.
+
+The entry routine, `seraph_enter_from_user`, runs on every entry from user mode before any
+indirect branch and any `ret` its own `call` does not pair: in `syscall_entry` after the frame
+is saved, in every exception and interrupt trampoline that builds a `TrapFrame` (`tf_build_asm`,
+keyed on the saved CS), and in the `#NM` stub. With IBRS on entry selected it first writes
+`IA32_SPEC_CTRL` with the kernel's value, `IBRS` set. It ends in `lfence`, so no later
+instruction runs before the write completes. Every return to user mode writes the user-mode
+value, the same without `IBRS` (`mitigation::ibrs_exit_asm`), with interrupts off and after the
+last kernel `call`, `ret` and indirect branch: in `syscall_entry` before `sysretq`, in
+`tf_resume_asm` and the `#NM` stub when the frame's CS is ring 3, and in `return_to_user` and
+`switch_and_enter_user`. The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) can arrive between a
+return's write and its `sysretq` or `iretq`, or before an entry's write, so they save the
+interrupted value and write the kernel's on entry, and on exit write the user-mode value when
+they return to ring 3 and the saved one otherwise. Under this control the kernel owns the whole
+MSR: both values are the selection's `IA32_SPEC_CTRL` bits (`BHI_DIS_S` where selected, and
+`IBRS` in the kernel's), and every CPU writes the kernel's value whole in its bring-up, so a bit
+the firmware set is cleared.
+
+IBRS set in the kernel also keeps predictions made in user mode from steering the kernel's
+indirect branches, so it answers branch target injection as well, and the selection takes neither
+the retpoline sequence nor the switch fill beside it (§ Return stack buffer). It rewrites no
+return, so shadow stacks stay on
+([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism).
+
+AMD parts have no `rsb_alternate` (§ Predictor behaviours), so the rule does not select IBRS on
+entry for their `retbleed` (branch type confusion), and no control answers it or
+`spec_rstack_overflow`; `mitigation::report` logs each such class (§ Report). A part without
+IBRS, which the rule leaves on the retpoline sequence, is logged the same way.
+
+No part that the project boots has `retbleed`; a kernel built to force the return mitigations
+runs IBRS on entry on the development host (§ Forced return mitigations).
+
+### Forced return mitigations
+
+A kernel built with `SERAPH_FORCE_RETURN_MITIGATION=intel` in the environment of
+`cargo xtask build` selects from forced inputs (`mitigation::FORCED_RETURN`, read at compile time):
+the CPU's inputs with `retbleed` and `rsb_alternate` added and `IBRS_ALL` removed, the inputs of
+an Intel part that needs IBRS on entry. It adds no enumerated bit, so a CPU without IBRS still
+selects no control it cannot run. The inputs view of `SYS_SYSTEM_INFO(SpeculationControls)`
+reports the forced inputs, and the boot logs a line naming the override before the controls
+(§ Report). Unset or empty, the variable forces nothing; any other value fails the build. Cargo
+rebuilds the kernel when the variable changes.
+
+On the development host the forced build selects IBRS on entry in place of enhanced IBRS, beside
+`BHI_DIS_S`, `VERW` on exit and the fill after an IBPB, so the ktest boot runs the entry and exit
+writes on every CPU. Its cost there, measured with the ktest bench against the build without the
+override, is not yet recorded.
+
 ### Branch history injection
 
 `BHI_DIS_S` keeps branch history from user mode from selecting the predicted targets of the
 kernel's indirect branches (Intel's BHI guidance). A CPU without `BHI_CTRL` runs Intel's clearing
-sequence, `seraph_clear_branch_history`, on every entry from user mode before any indirect
-branch: in `syscall_entry` after the frame is saved, in every exception and interrupt trampoline
-that builds a `TrapFrame` (`tf_build_asm`, keyed on the saved CS), and in the `#NM` stub. It is
-the long sequence (12 outer and 7 inner iterations), which Intel states is effective on every
-part that does not enumerate `BHI_NO`. Its calls and returns pair up, so it runs on a supervisor
-shadow stack. With the clearing not selected, the routine runs `lfence` and returns.
+sequence in the entry routine, `seraph_enter_from_user` (§ Return predictions), after the
+`IA32_SPEC_CTRL` write. It is the long sequence (12 outer and 7 inner iterations), which Intel
+states is effective on every part that does not enumerate `BHI_NO`. Its calls and returns pair
+up, so it runs on a supervisor shadow stack. With neither IBRS on entry nor the clearing
+selected, the routine runs `lfence` and returns.
 
 ### Buffer clearing
 
@@ -384,6 +446,10 @@ such a part, `switch` fills the RSB with 32 entries that trap speculation (`int3
 the next thread's stack, then runs `lfence` (Intel's retpoline white paper). Retpoline keeps
 shadow stacks off (§ Branch target injection), so the fill runs only without them, and its return
 addresses are dropped from the stack alone.
+
+IBRS on entry, which replaces retpoline on a part with `retbleed`, keeps such a `ret` from
+taking a prediction user mode trained (§ Return predictions), so the switch fill is not selected
+beside it.
 
 Where an IBPB does not clear the RSB (`ibpb_leaves_rsb`), the fill after an IBPB is selected.
 The kernel issues no IBPB, so the control is in effect wherever it is selected and no boot
@@ -425,8 +491,10 @@ algorithms and names no instruction-timing mode or guarantee (AMD-TPSC).
 `report` writes seven lines to the serial log after `baseline ok`. The first two give the CPU
 and the inputs. Each of the next four gives one exposure's classes in table order, or `none`.
 The last gives the behaviours the CPU has, or `none`. `mitigation::report` then writes the
-selected controls by their log names (§ Selection), or `none`, and the warning of § Buffer
-clearing where it applies. The second line is one line in the log;
+override line of a forced build (§ Forced return mitigations), the selected controls by their log
+names (§ Selection), or `none`, the warning of § Buffer clearing where it applies, and one line for
+each of `retbleed` and `spec_rstack_overflow` that is `Kernel` with no selected control
+answering it (§ Return predictions). The second line is one line in the log;
 it is broken here for width, and each `<v>` is a hexadecimal value:
 
 ```text
@@ -439,6 +507,7 @@ x86 vulnerabilities, affected, not at user-to-kernel: <classes>
 x86 vulnerabilities, not affected: <classes>
 x86 predictor behaviours: <behaviours>
 x86 mitigations: <controls>
+x86 mitigations: <class> has kernel action, but no control answers it
 ```
 
 ---
@@ -468,17 +537,20 @@ affected in its `bugs` line, less the entries § Excluded classes names. The boo
 
 The host tests in `mitigation.rs` cover each rule of § Selection, and the controls selected for
 the development host's part, the CPU QEMU's TCG presents, AMD Zen 2, Zen 3 and Zen 4, Ice Lake
-and Comet Lake with and without `IBRS_ALL`, the parts that report every `*_NO` bit, an Intel
-model the list does not name, and a CPU of another vendor. They also cover the MSR bits each
-control sets and the flags `install` leaves.
+and Comet Lake with and without `IBRS_ALL`, Skylake S and Coffee Lake H with IBRS (IBRS on
+entry), the parts that report every `*_NO` bit, an Intel model the list does not name, and a CPU
+of another vendor. They also cover the MSR bits each control sets, the two `IA32_SPEC_CTRL`
+values of IBRS on entry, the flags `install` leaves, the forced inputs and the refusal of an
+unknown override, and the classes the log names as unanswered.
 
 The ktest case `integration::speculation_controls` restates § Selection over the inputs the
 kernel reports and requires the selection to match it, then requires the controls in effect on
 every CPU to equal the selection, read through `SYS_SYSTEM_INFO(SpeculationControls)` with the
 case pinned to each CPU in turn. On the development host the boot selects enhanced IBRS,
 `BHI_DIS_S`, `VERW` on exit and the fill after an IBPB; under QEMU's TCG it selects retpoline
-and the fill after an IBPB. No boot the project runs selects the branch history clearing, the
-fill on switch, `VERW` before idle, Automatic IBRS or `DOITM`; the host tests alone cover their
+and the fill after an IBPB, and in the forced build (§ Forced return mitigations) IBRS on entry in
+place of enhanced IBRS. No boot the project runs selects the branch history clearing, the fill on
+switch, `VERW` before idle, Automatic IBRS or `DOITM`; the host tests alone cover their
 selection.
 
 Validation on other hardware is [#1123](https://github.com/kottlerg/seraph/issues/1123).

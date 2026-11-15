@@ -61,6 +61,7 @@ mod host_lock;
 mod qemu;
 mod qemu_gdb;
 mod qmp;
+mod regex;
 mod rust_src;
 mod stack_sizes;
 mod symbolize;

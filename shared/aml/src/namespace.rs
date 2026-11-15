@@ -11,7 +11,12 @@
 //! table declares takes at least its four-byte name segment. Every node has an [`Owner`]: the
 //! predefined objects, the table whose load created it, or an evaluator's
 //! method frame, whose objects [`Namespace::remove_owned`] deletes when the
-//! method returns. A removed node's slot, and its id, are reused.
+//! method returns. A removed node's slot, and its id, are reused. A node a
+//! table created is never removed: a method frame that defines a name a table
+//! declared `External` holds that node only until it returns, when the
+//! `External` and its owner are given back, and a frame's nodes hold only
+//! nodes of that frame or of frames it called, since no table loads while a
+//! method runs.
 //!
 //! Names resolve as ACPI 6.5 § 5.3 says: a name with a root or parent prefix,
 //! or of more than one segment, is a path from the scope it starts at; a
@@ -21,14 +26,23 @@
 //! A method's code is kept apart from the nodes, in a store indexed by
 //! [`CodeId`], and the expressions an object definition keeps (a region's
 //! offset and length, a bank value, a connection) in one indexed by
-//! [`ExprId`], so an evaluator can borrow the code it runs and change the
-//! nodes it acts on at the same time.
+//! [`ExprId`]. An evaluator takes the code it runs out of its store and
+//! puts it back when it is done, so it can change the nodes while it runs
+//! the code; a method called again while its code is out is parsed anew.
+//!
+//! Each node slot counts its reuses ([`Namespace::generation`]), so a
+//! reference that names a node with the generation it saw fails once the
+//! node is removed, even when the slot holds another node, or once a frame's
+//! object over an `External` has ended.
 
 use alloc::vec::Vec;
 
 use crate::encoding::{NameStr, Seg};
+use crate::host::PciAddress;
 use crate::parse::Parser;
-use crate::term::{Name, Term};
+use crate::term::{Name, Op, Term};
+pub use crate::value::Data;
+use crate::value::Ref;
 use crate::{Fault, FaultKind, push};
 
 /// A node of the namespace.
@@ -66,27 +80,9 @@ pub enum Owner
     Predefined,
     /// A table's load.
     Table(TableId),
-    /// An evaluator's method frame, by the evaluator's own numbering.
+    /// An evaluator's method frame, by its call depth: the frame's objects
+    /// are removed when it returns, before a frame of the same depth runs.
     Frame(u32),
-}
-
-/// The data of a `Name` a table declares, its value folded at load.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Data
-{
-    /// An integer, already truncated to 32 bits in a table of revision 1.
-    Integer(u64),
-    /// A string's characters.
-    String(Vec<u8>),
-    /// A buffer.
-    Buffer(Vec<u8>),
-    /// A package.
-    Package(Vec<Data>),
-    /// A name in a package, unresolved: it is resolved from the scope of the
-    /// `Name` that holds the package.
-    Reference(Name),
-    /// A package element the package's count declares but its list omits.
-    Uninitialized,
 }
 
 /// A method the interpreter itself implements.
@@ -130,16 +126,30 @@ pub struct Method
     pub code: Option<CodeId>,
 }
 
+/// An operand of an object definition: an expression a table load keeps,
+/// which an evaluator evaluates on first use, or its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Operand
+{
+    /// The expression, not yet evaluated.
+    Expr(ExprId),
+    /// The value.
+    Value(u64),
+}
+
 /// An operation region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Region
 {
     /// `RegionSpace`.
     pub space: u8,
-    /// The offset expression.
-    pub offset: ExprId,
-    /// The length expression.
-    pub length: ExprId,
+    /// The offset.
+    pub offset: Operand,
+    /// The length.
+    pub length: Operand,
+    /// The PCI function of a `PCI_Config` region, once an evaluator has
+    /// found it.
+    pub pci: Option<PciAddress>,
 }
 
 /// What a field unit is a part of.
@@ -163,8 +173,8 @@ pub enum FieldKind
         region: NodeId,
         /// The bank selection field unit.
         bank: NodeId,
-        /// The bank value expression.
-        value: ExprId,
+        /// The bank value.
+        value: Operand,
     },
 }
 
@@ -199,6 +209,18 @@ pub struct FieldUnit
     pub bit_len: u32,
     /// The last `Connection` before it.
     pub connection: Option<ExprId>,
+}
+
+/// A buffer field: bits of a buffer that `CreateField` and its kin name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferField
+{
+    /// The buffer.
+    pub source: Ref,
+    /// The first bit.
+    pub bit_offset: u64,
+    /// The width in bits.
+    pub bit_len: u64,
 }
 
 /// The object a node holds.
@@ -241,11 +263,17 @@ pub enum Object
         sync: u8,
     },
     /// An event.
-    Event,
+    Event
+    {
+        /// The signals not yet waited for.
+        pending: u32,
+    },
     /// An operation region.
     Region(Region),
     /// A field unit.
     Field(FieldUnit),
+    /// A buffer field.
+    BufferField(BufferField),
     /// A data table region: signature, OEM ID, OEM table ID.
     DataRegion([ExprId; 3]),
     /// An alias of another node.
@@ -258,6 +286,18 @@ pub enum Object
         /// The argument count, for a method.
         args: u8,
     },
+}
+
+/// A node whose `External` a method frame's definition replaced, and the
+/// `External` to give back when the frame ends.
+#[derive(Clone, Copy, Debug)]
+struct Lent
+{
+    node: NodeId,
+    frame: Owner,
+    owner: Owner,
+    kind: u8,
+    args: u8,
 }
 
 /// The `ObjectType` of a method, as `External` gives it.
@@ -276,6 +316,9 @@ struct Node
     owner: Owner,
     object: Object,
     live: bool,
+    /// The number of times the slot has been freed or has had a frame's
+    /// object over an `External` end.
+    generation: u32,
 }
 
 /// A table's bytes and its integer width.
@@ -308,7 +351,10 @@ pub struct Namespace
     free: Vec<u32>,
     live: usize,
     pub(crate) tables: Vec<Table>,
-    codes: Vec<Vec<Term>>,
+    /// The nodes method frames hold over an `External`.
+    lent: Vec<Lent>,
+    /// Each method's code; `None` while an evaluator runs it.
+    codes: Vec<Option<Vec<Term>>>,
     exprs: Vec<Term>,
     pub(crate) module: Vec<ModuleTerm>,
 }
@@ -330,6 +376,7 @@ impl Namespace
             free: Vec::new(),
             live: 0,
             tables: Vec::new(),
+            lent: Vec::new(),
             codes: Vec::new(),
             exprs: Vec::new(),
             module: Vec::new(),
@@ -344,35 +391,41 @@ impl Namespace
                 owner: Owner::Predefined,
                 object: Object::Scope,
                 live: true,
+                generation: 0,
             },
         )?;
         ns.live = 1;
         let mut os = Vec::new();
         os.try_reserve(20).map_err(|_| FaultKind::NoMemory)?;
         os.extend_from_slice(b"Microsoft Windows NT");
-        let predefined = [
-            (*b"_GPE", Object::Scope),
-            (*b"_PR_", Object::Scope),
-            (*b"_SB_", Object::Device),
-            (*b"_SI_", Object::Scope),
-            (*b"_TZ_", Object::Scope),
-            (*b"_GL_", Object::Mutex { sync: 0 }),
-            (
-                *b"_OSI",
-                Object::Method(Method {
-                    args: 1,
-                    flags: 1,
-                    body: Body::Native(Native::Osi),
-                    code: None,
-                }),
-            ),
-            (*b"_OS_", Object::Data(Data::String(os))),
-            (*b"_REV", Object::Data(Data::Integer(2))),
-        ];
-        for (name, object) in predefined
+        // One call each: an array of the objects would hold them all on the
+        // stack at once.
+        for name in [*b"_GPE", *b"_PR_"]
         {
-            ns.add_child(NodeId::ROOT, name, object, Owner::Predefined)?;
+            ns.add_child(NodeId::ROOT, name, Object::Scope, Owner::Predefined)?;
         }
+        ns.add_child(NodeId::ROOT, *b"_SB_", Object::Device, Owner::Predefined)?;
+        for name in [*b"_SI_", *b"_TZ_"]
+        {
+            ns.add_child(NodeId::ROOT, name, Object::Scope, Owner::Predefined)?;
+        }
+        ns.add_child(
+            NodeId::ROOT,
+            *b"_GL_",
+            Object::Mutex { sync: 0 },
+            Owner::Predefined,
+        )?;
+        let osi = Object::Method(Method {
+            args: 1,
+            flags: 1,
+            body: Body::Native(Native::Osi),
+            code: None,
+        });
+        ns.add_child(NodeId::ROOT, *b"_OSI", osi, Owner::Predefined)?;
+        let os = Object::Data(Data::String(os));
+        ns.add_child(NodeId::ROOT, *b"_OS_", os, Owner::Predefined)?;
+        let rev = Object::Data(Data::Integer(2));
+        ns.add_child(NodeId::ROOT, *b"_REV", rev, Owner::Predefined)?;
         Ok(ns)
     }
 
@@ -414,6 +467,15 @@ impl Namespace
     pub fn object_mut(&mut self, id: NodeId) -> Option<&mut Object>
     {
         self.node_mut(id).map(|n| &mut n.object)
+    }
+
+    /// The generation of the live node `id`: the number of times its slot
+    /// has been freed before, or has had a frame's object over an
+    /// `External` end.
+    #[must_use]
+    pub fn generation(&self, id: NodeId) -> Option<u32>
+    {
+        self.node(id).map(|n| n.generation)
     }
 
     /// The name segment of `id`.
@@ -518,7 +580,7 @@ impl Namespace
             return Err(FaultKind::Exists);
         }
         let sibling = self.node(parent).and_then(|n| n.child);
-        let node = Node {
+        let mut node = Node {
             name,
             parent,
             child: None,
@@ -526,6 +588,7 @@ impl Namespace
             owner,
             object,
             live: true,
+            generation: 0,
         };
         let id = if let Some(slot) = self.free.pop()
         {
@@ -535,6 +598,7 @@ impl Namespace
             {
                 return Err(FaultKind::NotFound);
             };
+            node.generation = n.generation;
             *n = node;
             id
         }
@@ -552,18 +616,27 @@ impl Namespace
         Ok(id)
     }
 
-    /// Remove every node `owner` created, with its subtree.
+    /// Remove every node `owner` created, with its subtree, and give back
+    /// the `External` of each node `owner` holds over one; the number of
+    /// nodes removed or given back.
+    ///
+    /// The nodes a frame holds over an `External` are given back first, so
+    /// the nodes removed are those the frame created, whose subtrees hold
+    /// only nodes of that frame or of frames it called, which have returned:
+    /// no table's node is removed.
     ///
     /// # Errors
     ///
     /// [`FaultKind::NoMemory`] when the free list cannot grow; the nodes
     /// removed before the failure stay removed.
-    pub fn remove_owned(&mut self, owner: Owner) -> Result<(), FaultKind>
+    pub fn remove_owned(&mut self, owner: Owner) -> Result<usize, FaultKind>
     {
         if owner == Owner::Predefined
         {
-            return Ok(());
+            return Ok(0);
         }
+        let given = self.give_back(owner);
+        let before = self.live.saturating_add(given);
         let mut i = 0;
         while i < self.nodes.len()
         {
@@ -576,7 +649,36 @@ impl Namespace
             }
             i = i.saturating_add(1);
         }
-        Ok(())
+        Ok(before.saturating_sub(self.live))
+    }
+
+    /// Give back the `External` of each node `frame` holds over one, with
+    /// its owner and a new generation, so that a reference to the frame's
+    /// object fails; the number given back.
+    fn give_back(&mut self, frame: Owner) -> usize
+    {
+        let mut given = 0usize;
+        let mut i = 0;
+        while let Some(l) = self.lent.get(i).copied()
+        {
+            if l.frame != frame
+            {
+                i = i.saturating_add(1);
+                continue;
+            }
+            self.lent.swap_remove(i);
+            if let Some(n) = self.node_mut(l.node)
+            {
+                n.object = Object::External {
+                    kind: l.kind,
+                    args: l.args,
+                };
+                n.owner = l.owner;
+                n.generation = n.generation.wrapping_add(1);
+                given = given.saturating_add(1);
+            }
+        }
+        given
     }
 
     /// Unlink `id` from its parent and free it and its subtree.
@@ -627,6 +729,7 @@ impl Namespace
                 n.live = false;
                 n.child = None;
                 n.object = Object::Scope;
+                n.generation = n.generation.wrapping_add(1);
             }
             push(&mut self.free, cur.0)?;
             self.live = self.live.saturating_sub(1);
@@ -784,7 +887,9 @@ impl Namespace
 
     /// Create the node `name` declares from `scope`, holding `object`. Every
     /// segment but the last must resolve; the last is created under it. A
-    /// definition replaces an `External` of the same name.
+    /// definition replaces an `External` of the same name: a table's takes
+    /// the node, and a method frame's holds it until
+    /// [`Namespace::remove_owned`] gives the `External` back to its owner.
     ///
     /// # Errors
     ///
@@ -804,10 +909,28 @@ impl Namespace
         let (parent, last) = self.parent_of(scope, name)?;
         if let Some(existing) = self.child(parent, last)
         {
-            let placeholder = matches!(self.object(existing), Some(Object::External { .. }));
-            if !placeholder || matches!(object, Object::External { .. })
+            let Some(&Object::External { kind, args }) = self.object(existing)
+            else
             {
                 return Err(FaultKind::Exists);
+            };
+            if matches!(object, Object::External { .. })
+            {
+                return Err(FaultKind::Exists);
+            }
+            if let Owner::Frame(_) = owner
+            {
+                let held = self.owner(existing).ok_or(FaultKind::NotFound)?;
+                push(
+                    &mut self.lent,
+                    Lent {
+                        node: existing,
+                        frame: owner,
+                        owner: held,
+                        kind,
+                        args,
+                    },
+                )?;
             }
             if let Some(n) = self.node_mut(existing)
             {
@@ -925,13 +1048,54 @@ impl Namespace
         self.exprs.get(usize::try_from(id.0).ok()?)
     }
 
-    /// The parsed code `id`.
+    /// Take the expression `id` out of its store, leaving a `Noop` until
+    /// [`Namespace::put_expr`] returns it.
+    pub(crate) fn take_expr(&mut self, id: ExprId) -> Option<Term>
+    {
+        let slot = self.exprs.get_mut(usize::try_from(id.0).ok()?)?;
+        let noop = Term {
+            op: Op::Noop,
+            imm: crate::term::Imm::None,
+            kids: Vec::new(),
+            offset: slot.offset,
+        };
+        Some(core::mem::replace(slot, noop))
+    }
+
+    /// Return the expression [`Namespace::take_expr`] took.
+    pub(crate) fn put_expr(&mut self, id: ExprId, term: Term)
+    {
+        if let Some(slot) = usize::try_from(id.0)
+            .ok()
+            .and_then(|i| self.exprs.get_mut(i))
+        {
+            *slot = term;
+        }
+    }
+
+    /// The parsed code `id`; `None` while an evaluator runs it.
     #[must_use]
     pub fn code(&self, id: CodeId) -> Option<&[Term]>
     {
-        self.codes
-            .get(usize::try_from(id.0).ok()?)
-            .map(Vec::as_slice)
+        self.codes.get(usize::try_from(id.0).ok()?)?.as_deref()
+    }
+
+    /// Take the parsed code `id` out of its store, until
+    /// [`Namespace::put_code`] returns it; `None` while it is out.
+    pub(crate) fn take_code(&mut self, id: CodeId) -> Option<Vec<Term>>
+    {
+        self.codes.get_mut(usize::try_from(id.0).ok()?)?.take()
+    }
+
+    /// Return the code [`Namespace::take_code`] took.
+    pub(crate) fn put_code(&mut self, id: CodeId, code: Vec<Term>)
+    {
+        if let Some(slot) = usize::try_from(id.0)
+            .ok()
+            .and_then(|i| self.codes.get_mut(i))
+        {
+            *slot = Some(code);
+        }
     }
 
     /// The code of the method `id`, parsed on the first call and kept.
@@ -969,7 +1133,7 @@ impl Namespace
         let code = CodeId(
             u32::try_from(self.codes.len()).map_err(|_| Fault::at(FaultKind::Bound, start))?,
         );
-        push(&mut self.codes, terms).map_err(|k| Fault::at(k, start))?;
+        push(&mut self.codes, Some(terms)).map_err(|k| Fault::at(k, start))?;
         if let Some(Object::Method(m)) = self.object_mut(id)
         {
             m.code = Some(code);

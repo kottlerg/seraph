@@ -28,7 +28,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Context as _, Result, bail};
-use regex::Regex;
 
 use crate::cli::{
     DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
@@ -37,6 +36,7 @@ use crate::cli::{
 use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
+use crate::regex::Regex;
 use crate::util::step;
 
 /// The bootloader's line for an attempt the knob redoes

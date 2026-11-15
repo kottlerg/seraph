@@ -134,18 +134,6 @@ pub struct Ledger<S, W>
     promised: u64,
 }
 
-/// How a committed fault's page-table donation is funded
-/// ([`Ledger::committed_donation`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CommittedDonation
-{
-    /// Drawn from the region's page-table reservation, which carries its
-    /// charge ([`Ledger::draw_pt_reserve`]).
-    Reserved,
-    /// Past the reservation: charged as the donation, without admission.
-    Overrun,
-}
-
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
 {
     pub const fn new(slots: S, words: W) -> Self
@@ -877,28 +865,6 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         budget::uncharge(&mut self.arena, r.budget, pages);
         self.promised = self.promised.saturating_sub(pages);
         true
-    }
-
-    /// How a page-table donation of `pages` for a fault in the committed
-    /// region `reg` is funded: [`CommittedDonation::Reserved`] while the
-    /// region's page-table reservation holds `pages`
-    /// ([`Ledger::draw_pt_reserve`]); past it, [`CommittedDonation::Overrun`]
-    /// while the free pages outside `promised` hold `pages`, charged without
-    /// the max test or the system reserve's, so a committed fault is never
-    /// declined for budget (`services/memmgr/docs/memory-pool.md` § Commit).
-    /// `None` when neither holds `pages`, or `reg` is not a committed region.
-    #[must_use]
-    pub fn committed_donation(&self, reg: NodeIdx, pages: u64) -> Option<CommittedDonation>
-    {
-        let left = self.region_node(reg)?.commit.get()?.pt_left;
-        if left >= pages
-        {
-            Some(CommittedDonation::Reserved)
-        }
-        else
-        {
-            (self.uncommitted_free() >= pages).then_some(CommittedDonation::Overrun)
-        }
     }
 
     /// The region of `rec` containing `va`, with its slot, which names it to
@@ -2177,64 +2143,6 @@ mod tests
         assert_eq!(usage(&l, rec), (4, 4));
         assert_eq!(promised(&l), 0);
         assert_eq!(l.uncommitted_free(), 10_000);
-    }
-
-    #[test]
-    fn a_committed_donation_past_the_reservation_is_charged_without_the_max()
-    {
-        let len = 64 * CHUNK;
-        let need = commit::grow_need(0, len);
-        let mut l = roomy_ledger(need.promised() + 40);
-        let rec = l
-            .insert_process(
-                1,
-                NodeSpec {
-                    parent: NODE_NULL,
-                    max: need.charged(),
-                    reserve: false,
-                },
-            )
-            .unwrap();
-        let reg = l
-            .add_region(rec, region(BASE, len), Commit::Committed)
-            .unwrap();
-        // The commitment fills the max: no other charge is admitted.
-        assert_eq!(l.admit(rec, 2, 0, 0), Err(ChargeError::Limit));
-        // Every donation the reservation holds is drawn from it and charged
-        // once.
-        let mut cap = 100;
-        while l.committed_donation(reg, 2) == Some(CommittedDonation::Reserved)
-        {
-            assert!(l.push_frame(rec, frame(cap, 2, cap * 0x1000, UNMAPPED)));
-            assert!(l.draw_pt_reserve(rec, reg, 2));
-            cap += 1;
-        }
-        assert_eq!(l.pt_reserve(reg), 0);
-        assert_eq!(usage(&l, rec).0, need.charged());
-        // Past it, a donation is funded although the max refuses any charge,
-        // and is charged over the max; `promised` does not move.
-        let before = promised(&l);
-        assert_eq!(
-            l.committed_donation(reg, 2),
-            Some(CommittedDonation::Overrun)
-        );
-        assert!(l.push_frame(rec, frame(cap, 2, cap * 0x1000, UNMAPPED)));
-        assert_eq!(usage(&l, rec).0, need.charged() + 2);
-        assert_eq!(promised(&l), before);
-        // It takes no page another commitment is promised.
-        let spare = l.uncommitted_free();
-        take(
-            &mut l,
-            u32::try_from(spare - 1).unwrap(),
-            crate::Fit::Contiguous,
-        );
-        assert_eq!(l.uncommitted_free(), 1);
-        assert_eq!(l.committed_donation(reg, 2), None);
-        // Nor is an uncommitted region funded this way.
-        let plain = l
-            .add_region(rec, region(BASE + len, CHUNK), Commit::Uncommitted)
-            .unwrap();
-        assert_eq!(l.committed_donation(plain, 2), None);
     }
 
     #[test]

@@ -344,10 +344,9 @@ funds the pool itself and maps the run again, at most four times:
    admitted against the max beside that run's pages. It then
    selects a contiguous run of the admitted size from the free pool, or of two when no four-page
    run is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
-   donates a single page. A fault in a committed region instead makes a two-page donation and
-   admits nothing: it draws the donation from the region's page-table reservation, which carries
-   its charge, or, past the reservation, charges it without the max and reserve tests
-   ([Commit](#commit)).
+   donates a single page. A fault in a committed region instead draws a two-page donation from the
+   region's page-table reservation, which carries its charge, and admits nothing; once the
+   reservation no longer holds one, its donation is admitted as above ([Commit](#commit)).
 2. It records the run on the process's entry like a grant it did not map: no mapped VA and no
    region id, charged to the budget node. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take
    it back.
@@ -698,8 +697,7 @@ process while a node below it is alive or a run charged to it is on the deferred
 charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
 process, die, and free its subtree's budget while the frames stay held.
 
-**Charging.** A charge is checked against the max of the node and of every ancestor, except a
-committed fault's page-table donation past its region's reservation ([Commit](#commit)). A request
+**Charging.** A charge is checked against the max of the node and of every ancestor. A request
 that would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
 system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
 with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
@@ -748,14 +746,16 @@ Live control of a running process's max is [#1097](https://github.com/kottlerg/s
 
 ## Commit
 
-A region registered with `REGION_COMMIT` is committed ([ipc-interface.md](ipc-interface.md)
-§ Label 7). memmgr admits and charges its whole length when it registers it, and each growth by
-`EXTEND_REGION` (§ Label 12) when it accepts that growth, so a fault in a committed region is
-never declined for budget or RAM: a refusal reaches the process as the error reply of the call that
-asked, where it can fail an allocation, never as a fault. std's heap grows this way. It keeps its
-uncommitted floor and registers one committed growth region directly above it on its first grow,
-which each later grow extends, so a heap is two regions however large it grows and holds no Memory
-caps ([Userspace Memory Model § Byte Heap](../../../docs/userspace-memory-model.md#byte-heap)).
+A region registered with `REGION_COMMIT` is committed ([ipc-interface.md](ipc-interface.md) § Label
+7). memmgr admits and charges its whole length when it registers it, and each growth by
+`EXTEND_REGION` (§ Label 12) when it accepts that growth, so a fault in a committed region is not
+declined for budget or RAM while the region's page-table reservation lasts, which only the process's
+own mappings can spend early (Faults below): a refusal reaches the process as the error reply of the
+call that asked, where it can fail an allocation, not as a fault. std's heap grows this way. It
+keeps its uncommitted floor and registers one committed growth region directly above it on its first
+grow, which each later grow extends, so a heap is two regions however large it grows and holds no
+Memory caps ([Userspace Memory Model § Byte
+Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 
 **Promised.** memmgr counts in `promised` what the committed regions can still take from the free
 pool: for each, its pages that hold no frame yet, what is left of its page-table reservation, and
@@ -784,27 +784,27 @@ release below). The computation is the host-tested `free-pool` module `commit`.
 uncommitted one, and its run is selected as any demand run's ([Demand faults](#demand-faults)). The
 run's pages were charged with the commitment, so recording the run charges nothing more and lowers
 `promised` by its pages. A page-table donation its map needs ([Client page-table
-funding](#client-page-table-funding)) is two pages, and is never admitted. It is drawn from the
-region's reservation: the donation's pages leave the reservation and `promised`, and are charged
-once, as the donation. The address space's page-table pool is shared, so any other mapping of the
-process can take the pages a donation leaves in it. Between two maps the reservation covers the
-region's donations whatever those mappings take. The kernel keeps at most one page of a donation for
-its bookkeeping, so each two-page donation adds at least one page, and a map that still runs out
-after a donation needs more pages than the pool held: the donations of one map take at most two
-pages for each page table it creates. The tables a committed region's maps create lie in its span
-and stay until it is unregistered (a cut, and the unmap of a run whose fault is declined, keep
-them), so they number at most `pool_funding::pt_pages_for` of its largest length, which the `commit`
-module's host tests check against a pool that every other mapping empties between two maps. Two
-cases draw past the reservation: a thread of the process that maps between two rounds of one map can
-take the donated pages first, and a table in the region's span that a reclaiming unmap removed once
-it was empty (the process's own unmap of the region's pages, or an unmap of another range after a
-cut emptied the table) is built again. A donation past the reservation is charged to the budget node
-as the donation, without the max test and the system reserve's, and takes only free pages outside
-`promised`, so a node's charge can pass its max by those donations, and no other committed region's
-promise is taken. A committed fault is still declined, with code 9, when its map fails as any map
-can: fewer than two free pages lie outside `promised`, or no two contiguous pages are free, for a
-donation, or a thread of the process maps between the rounds of one map and takes the donated pages
-faster than four rounds fund them.
+funding](#client-page-table-funding)) is two pages, drawn from the region's reservation without
+admission: the donation's pages leave the reservation and `promised`, and are charged once, as the
+donation. The address space's page-table pool is shared, so any other mapping of the process can
+take the pages a donation leaves in it. Between two maps the reservation covers the region's
+donations whatever those mappings take. The kernel keeps at most one page of a donation for its
+bookkeeping, so each two-page donation adds at least one page, and a map that still runs out after a
+donation needs more pages than the pool held: the donations of one map take at most two pages for
+each page table it creates. The tables a committed region's maps create lie in its span and stay
+until it is unregistered (a cut, and the unmap of a run whose fault is declined, keep them), so they
+number at most `pool_funding::pt_pages_for` of its largest length, which the `commit` module's host
+tests check against a pool that every other mapping empties between two maps. Two cases, both of the
+process's own doing, spend the reservation faster: a thread of the process that maps between two
+rounds of one map can take the donated pages first, which costs that map a round and the reservation
+a donation, and a table in the region's span that a reclaiming unmap the process made or asked for
+removed (its own unmap of the region's pages, or the unregistering of a region it placed in a span a
+cut freed) is built again. A donation the reservation no longer holds is admitted as any other, so
+the process's budget and the system reserve bound what it takes, and the fault is declined with code
+10 when the max refuses even that donation, or with code 9 when the reserve does. A committed fault
+is also declined, with code 9, when its map fails as any map can: no two contiguous pages are free
+for a donation, or a thread of the process maps between the rounds of one map and takes the donated
+pages faster than four rounds fund them.
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
@@ -876,9 +876,9 @@ Reservations](../../../docs/userspace-memory-model.md#page-reservations)), and i
 procmgr have no pager, so eviction never reaches a page the kernel's non-restartable IPC-buffer
 copies use.
 
-**Overcommit allowance.** Every admission's test ([Commit](#commit)) gains an overcommit
-allowance A: `free - promised - R + A >= want`. With A = 0, a fault on a committed page draws from
-`promised` as today, so it is never declined for budget or RAM. With A = 0 memmgr evicts only
+**Overcommit allowance.** Every admission's test ([Commit](#commit)) gains an overcommit allowance
+A: `free - promised - R + A >= want`. With A = 0, a fault on a committed page draws from `promised`
+as today, so it is not declined for budget or RAM ([Commit](#commit)). With A = 0 memmgr evicts only
 uncommitted pages (thread stacks, heap floors, `register_demand_paged` regions): evicting an
 uncommitted chunk frees its frames less the store pages its contents take, while evicting a
 committed chunk only adds store pages against `promised`. A ships at 0. Above 0, heap pages are

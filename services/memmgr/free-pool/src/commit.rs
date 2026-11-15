@@ -39,13 +39,13 @@ use syscall_abi::PAGE_SIZE;
 /// at most twice that many pages. The tables committed maps create lie in the
 /// region's span and stay until it is unregistered (a cut and a failed map
 /// keep them), so they number at most `pool_funding::pt_pages_for` of its
-/// largest length, and the donations at most [`pt_reserve`] of it. Two cases
-/// draw past it: a thread of the process that maps between two rounds of one
-/// map can take the donated pages first, and a table in the region's span that
-/// a reclaiming unmap removed once it was empty (the process's own, or one of
-/// another range after a cut emptied the table) is built again. A donation past the reservation is charged without admission, so it
-/// is never refused for budget (`Ledger::committed_donation`;
-/// `services/memmgr/docs/memory-pool.md` § Commit).
+/// largest length, and the donations at most [`pt_reserve`] of it. Two cases,
+/// both of the process's own doing, spend it faster: a thread of the process
+/// that maps between two rounds of one map can take the donated pages first,
+/// and a table in the region's span that a reclaiming unmap the process made or
+/// asked for removed is built again. A donation past the reservation is admitted as any
+/// other, so the process's budget and the system reserve bound what it takes
+/// (`services/memmgr/docs/memory-pool.md` § Commit).
 pub const PT_DONATION_PAGES: u64 = 2;
 
 /// Arena slots one chunk of a committed region can take at most: a run

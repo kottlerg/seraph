@@ -502,14 +502,17 @@ lazily on fault, and only once procmgr has delegated this process's
 region's whole length before it registers it: its pages and a page-table
 reservation to the caller's budget node, and those and a metadata bound to
 `promised` (`QUERY_POOL_STATUS` `data[8]`). A fault in a committed region is
-then never declined for budget or RAM (codes 7 and 10 below; its page-table
-donations draw on the region's reservation, and past it are charged without the
-max test), and only a
-committed region grows by `EXTEND_REGION` (§ Label 12) or shrinks by
-`SHRINK_REGION` (§ Label 13). A refused commitment registers nothing. A reply
-that does not reach the caller unregisters the region again, as a grant whose
-reply fails is rolled back, so a caller whose call was interrupted makes it
-again ([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers its
+then not declined for budget or RAM (codes 7 and 10 below) while the region's
+page-table reservation, which its page-table donations draw on, lasts: a thread
+of the process that maps while a committed fault's map is funded, or a
+reclaiming unmap of page tables in the region's span the process made or asked
+for, can spend it, and a donation past it is admitted as any other, so the
+fault can then be declined with code 10 or 9. Only a committed region grows by
+`EXTEND_REGION` (§ Label 12) or shrinks by `SHRINK_REGION` (§ Label 13). A
+refused commitment registers nothing. A reply that does not reach the caller
+unregisters the region again, as a grant whose reply fails is rolled back, so a
+caller whose call was interrupted makes it again
+([`memory-pool.md`](memory-pool.md) § Commit). The std heap registers its
 growth region this way.
 
 **Error codes:**
@@ -780,7 +783,7 @@ no handler it forwards to.
 | 7 | No free page can back the faulting page: the free pool is empty after the deferred runs are rechecked, every free page outside `promised` is in the system reserve and the process's budget node is outside it, or none is outside `promised` (a fault in an uncommitted region), or the split of a run larger than the pages to back failed |
 | 8 | The run cannot be recorded on its chunk in the region's chunk table |
 | 9 | A map of the run failed: into memmgr, to zero it ([`memory-pool.md`](memory-pool.md#frame-contents) § Frame contents), or into the process, after the page-table funding above when the pool was exhausted; memmgr unmaps whatever part of the run the failed map left mapped |
-| 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
+| 10 | In an uncommitted region, the faulting page, or the faulting page and the least page-table funding its map needs, would take the subtree of the process's budget node, or of an ancestor, over its max; in a committed region, the least page-table funding would, once the region's page-table reservation no longer holds it (§ Label 7); a longer run is shortened before the fault is declined ([`memory-pool.md`](memory-pool.md) § Client page-table funding) |
 
 Each demand run is recorded on its chunk in the region's chunk table, so
 `PROCESS_DIED` / `UNREGISTER_REGION` reclaim it and the all-RAM-accounted

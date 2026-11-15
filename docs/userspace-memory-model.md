@@ -119,8 +119,9 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   and every later grow extends it (`EXTEND_REGION`), in 16-page (64 KiB)
   multiples. memmgr charges each in full, budget and RAM, when it accepts
   it and backs chunks on first touch, so a grow is refused as an
-  allocation error (null from `alloc`, `Err` from `try_reserve`), never
-  as a fault, and the heap holds no Memory caps
+  allocation error (null from `alloc`, `Err` from `try_reserve`), not
+  as a fault (unless the process's other mappings spend the region's
+  page-table reservation early), and the heap holds no Memory caps
   ([memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit)).
   A process with no pager keeps requesting Memory caps with
   `REQUEST_MEMORY_CAPS` and mapping them.

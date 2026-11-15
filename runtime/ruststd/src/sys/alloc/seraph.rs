@@ -417,7 +417,10 @@ impl Heap {
     /// with `REGION_COMMIT`, every later one extends it (`EXTEND_REGION`).
     /// memmgr admits and charges the whole growth before it answers, so the
     /// pages are backed on first touch and no fault in them is declined for
-    /// budget or RAM; a refusal (`LIMIT` at this process's max,
+    /// budget or RAM while the region's page-table reservation lasts, which
+    /// only this process's other mappings can spend early, by taking the
+    /// page-table pages memmgr donates for a fault in the middle of its map;
+    /// a refusal (`LIMIT` at this process's max,
     /// `OUT_OF_MEMORY_BEST_EFFORT` when the RAM outside memmgr's promises is
     /// short) returns `false`, so an allocation fails where it is made, and
     /// `try_reserve` returns `Err`, rather than a later touch faulting with

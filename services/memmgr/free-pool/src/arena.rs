@@ -52,19 +52,20 @@ pub struct FrameDesc
 pub const NO_REGION_ID: u64 = 0;
 
 /// One tracked process: its badge, the heads of its frame and region lists,
-/// and the budget node its frames are charged to. The frame list holds every
-/// frame memmgr accounts to the process outside its demand regions (grants,
-/// page-table donations, a bootstrap arena); a run backing a demand region
-/// lives in that region's chunk table. The record's own slot `next` link
-/// chains it in its [`crate::ProcessIndex`] bucket.
+/// the slot of the caps memmgr holds for it, and the budget node its frames
+/// are charged to. The frame list holds every frame memmgr accounts to the
+/// process outside its demand regions (grants, page-table donations, a
+/// bootstrap arena); a run backing a demand region lives in that region's
+/// chunk table. The record's own slot `next` link chains it in its
+/// [`crate::ProcessIndex`] bucket.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessRecord
 {
     pub badge: u64,
     pub frame_head: NodeIdx,
     pub region_head: NodeIdx,
-    /// Delegated child `AddressSpace` cap, or `0` when not demand-paged.
-    pub aspace_cap: u64,
+    /// The [`Node::Caps`] slot made with the record and freed with it.
+    pub caps: NodeIdx,
     /// The region id the record's next grant takes: a per-process sequence
     /// from 1, so an id names one grant of this process for the record's
     /// life and reveals nothing the process does not already know.
@@ -72,6 +73,20 @@ pub struct ProcessRecord
     /// The [`BudgetNode`] every frame of the process is charged to, which
     /// counts the record as one of its references.
     pub budget: NodeIdx,
+}
+
+/// The caps memmgr holds for one process, in a slot of their own beside its
+/// [`ProcessRecord`], so the record stays within the slot size. A handle of
+/// `0` is no cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessCaps
+{
+    /// Delegated child `AddressSpace` cap, or `0` when not demand-paged.
+    pub aspace: u64,
+    /// The Notification cap `REGISTER_PRESSURE` gave, or `0` for none.
+    pub pressure: u64,
+    /// The bits a change of pressure level sends on [`ProcessCaps::pressure`].
+    pub pressure_bits: u64,
 }
 
 /// A run taken back from a process and parked on the
@@ -105,6 +120,8 @@ pub enum Node
     Region(RegionNode),
     Frame(FrameDesc),
     Process(ProcessRecord),
+    /// The caps of the process whose record names this slot.
+    Caps(ProcessCaps),
     /// A directory node of a chunk table: its children, [`NODE_NULL`] where
     /// no chunk below the child has an entry.
     ChunkDir([NodeIdx; DIR_FANOUT]),
@@ -442,6 +459,7 @@ mod tests
         assert!(size_of::<BudgetNode>() <= size_of::<ProcessRecord>());
         assert!(size_of::<DeferredRun>() <= size_of::<ProcessRecord>());
         assert!(size_of::<FrameDesc>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
         assert_eq!(SLOT_SIZE, 64);
         assert_eq!(SLOTS_PER_PAGE, 64);
     }

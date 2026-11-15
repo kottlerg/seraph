@@ -78,7 +78,8 @@ from the page, wires stdio, the log and service-registry caps, and the namespace
 level `seraph::log!` filters at from the env blob's `SERAPH_LOG` entry
 ([logd IPC interface](../../services/logd/docs/ipc-interface.md) § Levels), and, when the
 page carries a memmgr endpoint, bootstraps the heap against memmgr (exiting with `STARTUP_FAIL_HEAP`
-if that fails), and, when the page carries a pager and the image is `ET_DYN`, registers the
+if that fails) and registers the process for memmgr's memory-pressure signal, and, when the page
+carries a pager and the image is `ET_DYN`, registers the
 main-thread stack's demand-growth range
 ([§ Bootstrap-cross-boundary VAs](#bootstrap-cross-boundary-vas)). Last it runs the
 rustc-synthesised `main`, which drives `std::rt::lang_start` and the binary's idiomatic
@@ -595,6 +596,32 @@ under contention. The backends are under `src/sys/sync/`.
   and returns. The sleep lets a thread that would `unpark` it, a lock holder among them, run on
   the parked thread's CPU when it runs below a strict-priority parked thread there
   ([core/kernel/docs/scheduler.md](../../core/kernel/docs/scheduler.md) § Scheduling Classes).
+
+---
+
+## Memory pressure
+
+`_start` registers each process that has a memmgr endpoint for memmgr's memory-pressure signal
+(`src/sys/alloc/seraph.rs`, `register_pressure`): it retypes a Notification, and hands memmgr a
+Notify-only derivation of it with `REGISTER_PRESSURE`
+([services/memmgr/docs/ipc-interface.md](../../services/memmgr/docs/ipc-interface.md) § Label 11).
+A call cancelled with `Interrupted` is made again with a fresh derivation, which replaces any that
+reached memmgr. A failure leaves the process unregistered, and nothing else depends on it.
+
+`std::os::seraph` exposes the level and the signal
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Memory
+pressure):
+
+- `memory_pressure()` reads the level (`MemoryPressure::Normal`, `Low` or `Critical`) from
+  `QUERY_POOL_STATUS`.
+- `memory_pressure_notification()` is the registered Notification, with every right, which memmgr
+  sends `MEMORY_PRESSURE_BIT` on at each change of level; a server adds it to its wait set.
+- `wait_memory_pressure(timeout)` waits for the bit and returns the level then. Each change wakes
+  one waiter of the process. A wait cancelled with `Interrupted` (a stop of the thread, or an
+  upcall to it) waits again for what is left of `timeout`.
+
+A process that registers another Notification itself replaces the runtime's, which memmgr then
+signals no more.
 
 ---
 

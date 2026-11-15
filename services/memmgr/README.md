@@ -134,9 +134,12 @@ The full memmgr IPC specification is in
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
 - `QUERY_POOL_STATUS` — read the all-RAM-accounted identity terms, the free and deferred
-  totals, and the largest free run
+  totals, the largest free run, the system reserve, and the memory-pressure level
 - `REGISTER_REGION` / `UNREGISTER_REGION` — register and tear down a demand-paged region
 - `QUERY_MEMORY_USAGE` — read the caller's own budget usage, its max, and its subtree's usage
+- `REGISTER_PRESSURE(bits, notification_cap)` — register the Notification memmgr signals on a
+  change of the memory-pressure level; a second replaces the first, and the std runtime
+  registers every process at start
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
 
@@ -172,7 +175,9 @@ The remaining constants are tuning values that bound no capacity:
 | `DEFERRED_RECHECK_BATCH` | 64 runs | Deferred runs one recheck checks; a run not pooled goes to the back |
 | `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count windows one recheck spends; the run that crosses the budget is still read whole |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
-| `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take |
+| `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take; the pressure level is `CRITICAL` at or below it |
+| `PRESSURE_LOW_DIVISOR` | 16 | The pressure level is `LOW` below `pool_total / 16` free pages ([`docs/memory-pool.md`](docs/memory-pool.md) § Memory pressure) |
+| `PRESSURE_BAND_DIVISOR` | 128 | Hysteresis band of `pool_total / 128` pages, at least one, that the free pool clears before the level improves |
 
 The catalogue entry for each bound is in [`docs/limits.md`](../../docs/limits.md)
 §"memmgr".

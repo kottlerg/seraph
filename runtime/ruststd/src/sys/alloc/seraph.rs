@@ -45,9 +45,11 @@ use crate::marker::PhantomData;
 use crate::mem::{align_of, size_of};
 use crate::os::seraph::{current_ipc_buf, ipc_call_until_answered};
 use crate::ptr::{NonNull, null_mut};
-use crate::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use ipc::memmgr_labels::{QUERY_POOL_STATUS, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS};
+use ipc::memmgr_labels::{
+    QUERY_POOL_STATUS, REGISTER_PRESSURE, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS,
+};
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
 // The heap zone (base window and span) comes from
@@ -1158,6 +1160,83 @@ pub fn memmgr_query_free_bytes() -> Option<u64> {
         return None;
     }
     Some(reply.word(3))
+}
+
+/// memmgr's memory-pressure level (`QUERY_POOL_STATUS`, reply `data[7]`, one
+/// of `memmgr_labels::PRESSURE_*`). `None` if memmgr is unreachable. Made
+/// again for as long as the call is interrupted, as a read-only query may be.
+pub fn memmgr_query_pressure() -> Option<u64> {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    let ipc_buf = current_ipc_buf();
+    if ep == 0 || ipc_buf.is_null() {
+        return None;
+    }
+    let msg = ipc::IpcMessage::builder(QUERY_POOL_STATUS).build();
+    // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+    let reply = unsafe { ipc_call_until_answered(ep, &msg, ipc_buf) }.ok()?;
+    (reply.label == 0).then(|| reply.word(7))
+}
+
+/// The bit memmgr sends on [`pressure_notification`] when the pressure level
+/// changes.
+pub const PRESSURE_BIT: u64 = 1;
+
+/// The Notification [`register_pressure`] registered with memmgr, with every
+/// right, or `0` when the process holds no registration.
+static PRESSURE_SIG: AtomicU64 = AtomicU64::new(0);
+
+/// The Notification memmgr signals with [`PRESSURE_BIT`] on a change of the
+/// pressure level, or `None` when `_start` could not register one.
+pub fn pressure_notification() -> Option<u64> {
+    Some(PRESSURE_SIG.load(Ordering::Acquire)).filter(|&sig| sig != 0)
+}
+
+/// Register this process for memmgr's memory-pressure signal
+/// (`REGISTER_PRESSURE`): retype a Notification, and hand memmgr a Notify-only
+/// derivation of it with [`PRESSURE_BIT`]. `_start` calls it once, after the
+/// heap bootstrap, so every std process is registered with no call of its own.
+/// A failure leaves the process unregistered and [`pressure_notification`]
+/// `None`; nothing else depends on it.
+///
+/// A call cancelled with `Interrupted` may still have reached memmgr, which
+/// then holds the derivation it carried; the call is made again with a fresh
+/// derivation, which replaces the first, so memmgr ends with one
+/// registration whichever calls reached it.
+pub fn register_pressure() {
+    let ep = SLAB_MEMMGR_EP.load(Ordering::Acquire);
+    let ipc_buf = current_ipc_buf();
+    if ep == 0 || ipc_buf.is_null() {
+        return;
+    }
+    let Some(sig) = object_slab_retype(syscall_abi::NOTIFICATION_RETYPE_BYTES, |slab| {
+        syscall::cap_create_notification(slab).ok()
+    }) else {
+        return;
+    };
+    let registered = loop {
+        let Ok(notify) = syscall::cap_derive(sig, syscall::RIGHTS_NTF_NOTIFY) else {
+            break false;
+        };
+        let msg = ipc::IpcMessage::builder(REGISTER_PRESSURE)
+            .word(0, PRESSURE_BIT)
+            .cap(notify)
+            .build();
+        // SAFETY: ipc_buf is the calling thread's registered IPC buffer.
+        let result = unsafe { ipc::ipc_call(ep, &msg, ipc_buf) };
+        // A cap the call moved to memmgr has left this slot, and its handle's
+        // generation keeps the delete from reaching a later occupant.
+        let _ = syscall::cap_delete(notify);
+        match result {
+            Err(e) if e == syscall_abi::SyscallError::Interrupted as i64 => {}
+            Ok(reply) => break reply.label == ipc::memmgr_errors::SUCCESS,
+            Err(_) => break false,
+        }
+    };
+    if registered {
+        PRESSURE_SIG.store(sig, Ordering::Release);
+    } else {
+        let _ = syscall::cap_delete(sig);
+    }
 }
 
 /// Fund `self_aspace`'s page-table growth budget to cover mapping a

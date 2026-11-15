@@ -133,5 +133,6 @@ writes the file.
 
 ## Summarized By
 
-[Fault Handling](../../../docs/fault-handling.md), [services/crashd/README.md](../README.md),
-[crashd Operation](operation.md), [programs/crashme/README.md](../../../programs/crashme/README.md)
+[Fault Handling](../../../docs/fault-handling.md),
+[programs/crashme/README.md](../../../programs/crashme/README.md),
+[services/crashd/README.md](../README.md), [crashd Operation](operation.md)

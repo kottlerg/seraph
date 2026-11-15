@@ -391,10 +391,11 @@ return, so shadow stacks stay on
 AMD parts have no `rsb_alternate` (§ Predictor behaviours), so the rule does not select IBRS on
 entry for their `retbleed` (branch type confusion), and no control answers it or
 `spec_rstack_overflow`; `mitigation::report` logs each such class (§ Report). An Intel part
-without IBRS, and a part of another vendor, whose `retbleed` may be either form and whose IBRS
-is not read, stay on the retpoline sequence and are logged the same way. Enhanced IBRS and IBRS on
-entry count as answering `retbleed` only on an Intel part with `rsb_alternate` and the IBRS
-input.
+without enhanced IBRS or IBRS stays on the retpoline sequence. A part of another vendor, whose
+`retbleed` may be either form and whose IBRS is not read, takes enhanced IBRS where it enumerates
+`IBRS_ALL` and the retpoline sequence otherwise. Each is logged the same way: enhanced IBRS and
+IBRS on entry count as answering `retbleed` only on an Intel part with `rsb_alternate` and the
+IBRS input.
 
 No part that the project boots has `retbleed`; a kernel built to force the return mitigations
 runs IBRS on entry on the development host (§ Forced return mitigations).

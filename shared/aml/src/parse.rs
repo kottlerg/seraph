@@ -34,7 +34,7 @@ use crate::encoding::{
 };
 use crate::namespace::{Namespace, NodeId};
 use crate::term::{FieldElem, FieldList, Imm, Name, Op, Term};
-use crate::{Fault, FaultKind, MAX_PARSE_DEPTH, push};
+use crate::{Fault, FaultKind, MAX_BUFFER_BYTES, MAX_PARSE_DEPTH, push};
 
 /// `Local0`.
 const LOCAL0: u8 = 0x60;
@@ -812,12 +812,16 @@ impl<'a> Parser<'a>
         Ok(leaf(Op::Integer, Imm::Int(v), offset))
     }
 
-    /// A string.
+    /// A string, at most [`MAX_BUFFER_BYTES`] long.
     fn string(&mut self) -> Result<Term, Fault>
     {
         let offset = self.offset();
         let (bytes, size) = encoding::string(self.view(), self.pos)
             .ok_or_else(|| self.fault(FaultKind::Truncated))?;
+        if bytes.len() > MAX_BUFFER_BYTES
+        {
+            return Err(self.fault(FaultKind::Bound));
+        }
         let owned = copy(bytes).map_err(|k| self.fault(k))?;
         self.advance(size)?;
         Ok(leaf(Op::String, Imm::Bytes(owned), offset))

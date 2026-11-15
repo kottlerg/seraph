@@ -71,7 +71,8 @@ pub const MAX_PARSE_DEPTH: usize = 64;
 pub const PARSE_STACK_BYTES: usize = 256 * 1024;
 
 /// The largest buffer or string: the `BufferSize` of a buffer a `Name` in a
-/// table declares, and the length of a buffer or string an evaluation makes.
+/// table declares, the length of a string in a table's AML, and the length
+/// of a buffer or string an evaluation makes.
 ///
 /// It bounds the size of one data object, which the firmware's source fixes
 /// and the machine's size does not enlarge, so that a few bytes of a

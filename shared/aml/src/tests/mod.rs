@@ -934,6 +934,28 @@ fn name_data_folds_to_constants()
         .unwrap();
     assert_eq!(data(&ns, "\\ONES"), Data::Integer(0xFFFF_FFFF));
 
+    // A string is at most MAX_BUFFER_BYTES long, in a Name and in a
+    // method's code alike.
+    let long = |len: usize| string(&"a".repeat(len));
+    let ns = load(&name_obj("STR1", &long(crate::MAX_BUFFER_BYTES)));
+    assert!(matches!(data(&ns, "\\STR1"), Data::String(s) if s.len() == crate::MAX_BUFFER_BYTES));
+    let mut ns = Namespace::new().unwrap();
+    let r = ns
+        .load_table(&table(&cat(&[
+            &method("MTH1", 0, &ret(&long(crate::MAX_BUFFER_BYTES + 1))),
+            // A fault in a Name ends its list, so each is in a Scope of its own.
+            &scope("\\", &name_obj("STR2", &long(crate::MAX_BUFFER_BYTES + 1))),
+            &scope(
+                "\\",
+                &name_obj("PKG1", &package(1, &[long(crate::MAX_BUFFER_BYTES + 1)])),
+            ),
+        ])))
+        .unwrap();
+    assert_eq!(r.faults, 2, "{r:?}");
+    assert_eq!(r.first_fault.unwrap().kind, FaultKind::Bound);
+    let mth = ns.find("\\MTH1").unwrap();
+    assert_eq!(ns.method_code(mth).unwrap_err().kind, FaultKind::Bound);
+
     // A buffer whose size is not constant is a fault.
     let mut ns = Namespace::new().unwrap();
     let r = ns

@@ -75,6 +75,18 @@ revokes it), or whose endowed address space has a retained terminal fault
 (`CAP_INFO_ASPACE_TERMINAL_FAULT`). A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.
 
+A worker-thread fault of a service procmgr created shows in svcmgr's caps only once procmgr's
+teardown revokes the thread cap, which can follow the resync. So the resync then binds the
+address-space observer of each such service the kernel shows alive again, through its process
+handle (`procmgr_labels::BIND_DEATH_OBSERVER`): the kernel retains the space's first terminal
+fault and posts it to a later bind, so a dropped fault post reaches the emptied queue. The re-arm
+runs only while memmgr and procmgr are alive and supervised, since it calls procmgr, and each
+re-arm holds one observer node of svcmgr's death set until that process dies.
+
+Reconciliation records a devmgr or vfsd that died before its bind with the thread cap init
+endowed, and a resync right after reconciliation routes its death (`EXIT_KILLED` for a revoked
+cap).
+
 Exit reason encoding (owned by
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)), and
 how the `on_failure` policy classes each range:

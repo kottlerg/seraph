@@ -22,7 +22,8 @@ endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
 `PROBE_FAULT_WORKER` replies, then receives nothing more while a worker thread takes a terminal
 fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. procmgr
 tears the process down, and svcmgr restarts it through its address-space observer; svctest's
-`svcmgr_worker_fault_restart` phase reads a new nonce from the restarted instance. A role that
+`svcmgr_worker_fault_restart` phase, which runs when this recipe is staged, reads a new nonce from
+the restarted instance. A role that
 lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
 
 ---

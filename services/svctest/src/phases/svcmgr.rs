@@ -48,10 +48,14 @@ pub fn phases() -> &'static [Phase]
 /// svctest.
 const WORKER_FAULT_PUBLISH_WAIT_MS: u64 = 10_000;
 
+/// The recipe that starts the fixture [`svcmgr_worker_fault_restart_phase`]
+/// drives, when it is staged for this boot.
+const WORKER_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-worker.svc";
+
 /// End to end: a terminal fault of a thread other than the main thread of a
 /// supervised service reaches svcmgr, which restarts the service under its
 /// `restart = on-failure` policy. The `crasher` fixture's `worker-fault`
-/// role (`rootfs/config/svcmgr/tests/crasher-worker.svc`, co-staged) serves
+/// role (`rootfs/config/svcmgr/tests/crasher-worker.svc`) serves
 /// `ipc::restart_probe_labels` on the name it provides: the phase reads the
 /// instance's nonce, has a worker thread fault, and reads the nonce again
 /// through the same SEND. procmgr's teardown stops the old instance's main
@@ -60,9 +64,27 @@ const WORKER_FAULT_PUBLISH_WAIT_MS: u64 = 10_000;
 /// restarted instance answers it with a new nonce. Were the death not routed,
 /// no instance would receive again and the call would block until the run's
 /// timeout.
+///
+/// The phase runs when the fixture's recipe is staged in
+/// `/config/svcmgr/services/` and is skipped otherwise; once staged, the name
+/// must be published within [`WORKER_FAULT_PUBLISH_WAIT_MS`].
 fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 {
     use ipc::restart_probe_labels as probe;
+
+    match std::fs::metadata(WORKER_FAULT_RECIPE)
+    {
+        Ok(_) =>
+        {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            std::os::seraph::log!(
+                "svcmgr_worker_fault_restart phase skipped: crasher-worker.svc not staged"
+            );
+            return;
+        }
+        Err(e) => panic!("svcmgr_worker_fault_restart: stat {WORKER_FAULT_RECIPE}: {e:?}"),
+    }
 
     let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_worker_fault_restart");
     let name = probe::NAME;
@@ -80,7 +102,7 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
         }
         assert!(
             waited_ms < WORKER_FAULT_PUBLISH_WAIT_MS,
-            "svcmgr_worker_fault_restart: {} not published within {WORKER_FAULT_PUBLISH_WAIT_MS}              ms (is crasher-worker.svc staged?), last reply {:#x}",
+            "svcmgr_worker_fault_restart: {} not published within {WORKER_FAULT_PUBLISH_WAIT_MS} ms, last reply {:#x}",
             String::from_utf8_lossy(name),
             reply.label
         );

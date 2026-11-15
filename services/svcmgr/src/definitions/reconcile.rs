@@ -434,15 +434,21 @@ fn handle_definition(
 /// through which procmgr binds the observer
 /// (`procmgr_labels::BIND_DEATH_OBSERVER`) and which the entry keeps.
 ///
-/// Race-free despite binding after the thread was started: the kernel
-/// retains a thread's `exit_reason` past death and `thread_bind_notification`
+/// Binding after the thread was started loses no death: the kernel retains a
+/// thread's `exit_reason` past death and `thread_bind_notification`
 /// serialises on the thread's `sched_lock`, and it retains the address
-/// space's first terminal fault and replays it to a later address-space bind.
-/// A death in the window between init's spawn and this bind is therefore
-/// delivered to the death queues when the bind lands, not dropped (#106
-/// Window 2). A failed address-space bind is logged and leaves the main
-/// thread's observer standing: init cannot be asked again, and the service is
-/// still supervised for its main thread's death.
+/// space's first terminal fault and replays it to a later address-space bind,
+/// so a death in the window between init's spawn and this bind is delivered
+/// to the death queues when the bind lands (#106 Window 2). A devmgr or vfsd
+/// that died in that window and that procmgr has already torn down has had
+/// its thread cap revoked, so both binds fail; the entry is recorded with
+/// that cap all the same, and the resync that follows reconciliation reads
+/// the revoked cap as `EXIT_KILLED` and routes the death. A thread bind that
+/// fails on a live service (the death set out of memory) leaves the main
+/// thread's exit to a later resync. A failed address-space bind on a live
+/// service is logged and leaves the main thread's observer standing: init
+/// cannot be asked again, and the service is still supervised for its main
+/// thread's death.
 ///
 /// Returns the slot of the recorded entry, or `None` when none is recorded;
 /// the registration's caps are then released.
@@ -479,9 +485,9 @@ fn bind_only(
         .bind_thread(pending.thread_cap, tag.correlator())
         .is_err()
     {
+        // Recorded all the same: a revoked thread cap is a death the resync
+        // after reconciliation routes.
         log!(warn: "svcmgr: bind death-notification failed for {}", def.name);
-        release();
-        return None;
     }
     entry.thread_cap = pending.thread_cap;
     let bound = match pending.observer

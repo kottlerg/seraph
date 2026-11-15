@@ -539,7 +539,8 @@ Non-shutdown fixtures may co-stage alongside one harness. `crasher`
 (`restart = always`, never shuts down) and its worker-fault role
 (`crasher-worker.svc`, `restart = on_failure`) are co-staged with `svctest` in
 the services-surface CI cell so their restart paths are exercised there (svctest's
-`svcmgr_worker_fault_restart` phase fails if `crasher.worker` is not published); its
+`svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
+skipped otherwise); its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it.
 

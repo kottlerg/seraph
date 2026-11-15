@@ -502,7 +502,10 @@ impl Evaluator<'_>
             None => bit_buffer(bit_len).map_err(bare)?,
             Some(_) => Vec::new(),
         };
-        let first = (bit_offset / 8) / wb * wb;
+        let first = (bit_offset / 8)
+            .checked_div(wb)
+            .unwrap_or(0)
+            .saturating_mul(wb);
         let start = bit_offset.saturating_sub(first.saturating_mul(8));
         let total = start.saturating_add(bit_len);
         let datums = total.div_ceil(wbits);

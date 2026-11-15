@@ -109,14 +109,24 @@ fn region(name_: &str, space: u8, offset: &[u8], len: &[u8]) -> Vec<u8>
 /// the empty name).
 fn unit(name_: &str, bits: u32) -> Vec<u8>
 {
-    let mut out = if name_.is_empty() { vec![0] } else { seg(name_).to_vec() };
+    let mut out = if name_.is_empty()
+    {
+        vec![0]
+    }
+    else
+    {
+        seg(name_).to_vec()
+    };
     if bits < 0x40
     {
         out.push(u8::try_from(bits).unwrap());
     }
     else
     {
-        out.extend([0x40 | u8::try_from(bits & 0xF).unwrap(), u8::try_from(bits >> 4).unwrap()]);
+        out.extend([
+            0x40 | u8::try_from(bits & 0xF).unwrap(),
+            u8::try_from(bits >> 4).unwrap(),
+        ]);
     }
     out
 }
@@ -210,7 +220,10 @@ fn integer_arithmetic()
     let divide = op(&[0x78], &[&i(17), &i(5), &l(1), &l(2)]);
     let both = ret(&bin(0x72, &bin(0x77, &l(2), &i(100)), &l(1)));
     assert_eq!(int_of(&cat(&[&divide, &both])), 302);
-    assert_eq!(fault(&[], &ret(&bin(0x85, &i(1), &i(0)))), FaultKind::DivideByZero);
+    assert_eq!(
+        fault(&[], &ret(&bin(0x85, &i(1), &i(0)))),
+        FaultKind::DivideByZero
+    );
     assert_eq!(
         fault(&[], &op(&[0x78], &[&i(1), &i(0), &[0], &[0]])),
         FaultKind::DivideByZero
@@ -243,7 +256,10 @@ fn integer_arithmetic()
 fn integers_are_32_bits_in_a_revision_1_table()
 {
     let mut ns = table_of(1, &[], 0, &ret(&bin(0x72, &i(0xFFFF_FFFF), &i(1))));
-    assert_eq!(run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]), Ok(Data::Integer(0)));
+    assert_eq!(
+        run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]),
+        Ok(Data::Integer(0))
+    );
     let mut ns = table_of(1, &[], 0, &ret(&[0xFF]));
     assert_eq!(
         run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]),
@@ -264,9 +280,18 @@ fn logical_operators_compare_each_type()
     assert_eq!(int_of(&ret(&op(&[0x91], &[&i(0), &i(2)]))), ONES);
     assert_eq!(int_of(&ret(&op(&[0x92], &[&i(0)]))), ONES);
     assert_eq!(int_of(&ret(&op(&[0x93], &[&i(3), &i(3)]))), ONES);
-    assert_eq!(int_of(&ret(&op(&[0x95], &[&string("abc"), &string("abd")]))), ONES);
-    assert_eq!(int_of(&ret(&op(&[0x94], &[&string("abc"), &string("ab")]))), ONES);
-    assert_eq!(int_of(&ret(&op(&[0x93], &[&b(&[1, 2]), &b(&[1, 2])]))), ONES);
+    assert_eq!(
+        int_of(&ret(&op(&[0x95], &[&string("abc"), &string("abd")]))),
+        ONES
+    );
+    assert_eq!(
+        int_of(&ret(&op(&[0x94], &[&string("abc"), &string("ab")]))),
+        ONES
+    );
+    assert_eq!(
+        int_of(&ret(&op(&[0x93], &[&b(&[1, 2]), &b(&[1, 2])]))),
+        ONES
+    );
     // The second operand converted to the first's type.
     assert_eq!(int_of(&ret(&op(&[0x93], &[&i(0x1F), &string("1F")]))), ONES);
     assert_eq!(int_of(&ret(&op(&[0x93], &[&string("1F"), &i(0x1F)]))), 0);
@@ -281,7 +306,10 @@ fn explicit_conversions()
     assert_eq!(conv(0x99, &string("0x1F")), Data::Integer(0x1F));
     assert_eq!(conv(0x99, &string("31")), Data::Integer(31));
     assert_eq!(conv(0x99, &b(&[1, 2])), Data::Integer(0x0201));
-    assert_eq!(conv(0x96, &i(0x0102)), Data::Buffer(vec![2, 1, 0, 0, 0, 0, 0, 0]));
+    assert_eq!(
+        conv(0x96, &i(0x0102)),
+        Data::Buffer(vec![2, 1, 0, 0, 0, 0, 0, 0])
+    );
     assert_eq!(conv(0x96, &string("ab")), Data::Buffer(b"ab\0".to_vec()));
     assert_eq!(conv(0x98, &i(0xAB)), s_("0xAB"));
     assert_eq!(conv(0x98, &b(&[1, 0xAB])), s_("0x01,0xAB"));
@@ -290,11 +318,18 @@ fn explicit_conversions()
     let to_string = |x: &[u8], len: &[u8]| ok(&[], &ret(&op(&[0x9C], &[x, len, &[0]])));
     assert_eq!(to_string(&b(b"ab\0c"), &[0xFF]), s_("ab"));
     assert_eq!(to_string(&b(b"abcd"), &i(3)), s_("abc"));
-    let mid = |x: &[u8], at: u64, len: u64| ok(&[], &ret(&op(&[0x9E], &[x, &i(at), &i(len), &[0]])));
+    let mid =
+        |x: &[u8], at: u64, len: u64| ok(&[], &ret(&op(&[0x9E], &[x, &i(at), &i(len), &[0]])));
     assert_eq!(mid(&string("abcdef"), 2, 3), s_("cde"));
     assert_eq!(mid(&string("abcdef"), 4, 9), s_("ef"));
     assert_eq!(mid(&b(&[1, 2, 3]), 9, 1), Data::Buffer(vec![]));
-    assert_eq!(fault(&[], &ret(&op(&[0x99], &[&string("99999999999999999999"), &[0]]))), FaultKind::Range);
+    assert_eq!(
+        fault(
+            &[],
+            &ret(&op(&[0x99], &[&string("99999999999999999999"), &[0]]))
+        ),
+        FaultKind::Range
+    );
 }
 
 #[test]
@@ -303,7 +338,10 @@ fn concatenation_converts_the_second_operand_to_the_first_type()
     let concat = |x: &[u8], y: &[u8]| ok(&[], &ret(&bin(0x73, x, y)));
     assert_eq!(concat(&string("ab"), &i(0x10)), s_("ab0000000000000010"));
     assert_eq!(concat(&string("ab"), &string("cd")), s_("abcd"));
-    assert_eq!(concat(&b(&[1]), &i(2)), Data::Buffer(vec![1, 2, 0, 0, 0, 0, 0, 0, 0]));
+    assert_eq!(
+        concat(&b(&[1]), &i(2)),
+        Data::Buffer(vec![1, 2, 0, 0, 0, 0, 0, 0, 0])
+    );
     assert_eq!(
         concat(&i(1), &i(2)),
         Data::Buffer([1u64.to_le_bytes(), 2u64.to_le_bytes()].concat())
@@ -317,7 +355,10 @@ fn concatenation_converts_the_second_operand_to_the_first_type()
         ok(&[], &ret(&bin(0x84, &x, &y))),
         Data::Buffer(cat(&[&irq, &io, &[0x79, 0]]))
     );
-    assert_eq!(fault(&[], &ret(&bin(0x84, &b(&[1, 2]), &y))), FaultKind::Type);
+    assert_eq!(
+        fault(&[], &ret(&bin(0x84, &b(&[1, 2]), &y))),
+        FaultKind::Type
+    );
 }
 
 #[test]
@@ -341,7 +382,12 @@ fn size_and_type_of_each_object()
     assert_eq!(size("STR0"), Data::Integer(3));
     assert_eq!(size("BUF0"), Data::Integer(4));
     assert_eq!(size("PKG0"), Data::Integer(2));
-    assert_eq!(test(&defs, &ret(&op(&[0x87], &[&n("INT0")]))).unwrap_err().kind, FaultKind::Type);
+    assert_eq!(
+        test(&defs, &ret(&op(&[0x87], &[&n("INT0")])))
+            .unwrap_err()
+            .kind,
+        FaultKind::Type
+    );
     let kind = |obj: &str| ok(&defs, &ret(&op(&[0x8E], &[&n(obj)])));
     for (obj, t) in [
         ("INT0", 1),
@@ -366,7 +412,10 @@ fn size_and_type_of_each_object()
         &ret(&op(&[0x8E], &[&n("QW00")])),
     ]);
     assert_eq!(ok(&defs, &body), Data::Integer(14));
-    assert_eq!(ok(&defs, &ret(&op(&[0x8E], &[&ext(0x31)]))), Data::Integer(16));
+    assert_eq!(
+        ok(&defs, &ret(&op(&[0x8E], &[&ext(0x31)]))),
+        Data::Integer(16)
+    );
     assert_eq!(ok(&defs, &ret(&op(&[0x8E], &[&l(0)]))), Data::Integer(0));
 }
 
@@ -375,7 +424,10 @@ fn constants_timer_revision_and_osi()
 {
     assert_eq!(int_of(&ret(&ext(0x30))), crate::REVISION);
     assert_ne!(int_of(&ret(&ext(0x33))), 0);
-    assert_eq!(int_of(&ret(&op(&n("\\_OSI"), &[&string("Windows 2015")]))), ONES);
+    assert_eq!(
+        int_of(&ret(&op(&n("\\_OSI"), &[&string("Windows 2015")]))),
+        ONES
+    );
     assert_eq!(int_of(&ret(&op(&n("\\_OSI"), &[&string("Linux")]))), 0);
     assert_eq!(ok(&[], &ret(&n("\\_REV"))), Data::Integer(2));
 }
@@ -392,41 +444,65 @@ fn references_read_and_write_in_place()
         &name_obj("PKG0", &package(3, &[i(1), i(2), package(1, &[i(3)])])),
         &method("SET_", 1, &store(&i(7), &a(0))),
     ]);
-    let mut ns = table_of(2, &defs, 0, &cat(&[
-        // RefOf and DerefOf.
-        &store(&op(&[0x71], &[&n("INT0")]), &l(0)),
-        &store(&deref(&l(0)), &l(1)),
-        // A store through an index of a package, a buffer and a string.
-        &store(&i(9), &index(&n("PKG0"), &i(1))),
-        &store(&i(0x41), &index(&n("BUF0"), &i(0))),
-        &store(&i(0x5A), &index(&n("STR0"), &i(2))),
-        // A nested element.
-        &store(&i(8), &index(&deref(&index(&n("PKG0"), &i(2))), &i(0))),
-        // A method storing to an argument that holds a reference.
-        &op(&n("SET_"), &[&op(&[0x71], &[&n("INT0")])]),
-        &ret(&l(1)),
-    ]));
+    let mut ns = table_of(
+        2,
+        &defs,
+        0,
+        &cat(&[
+            // RefOf and DerefOf.
+            &store(&op(&[0x71], &[&n("INT0")]), &l(0)),
+            &store(&deref(&l(0)), &l(1)),
+            // A store through an index of a package, a buffer and a string.
+            &store(&i(9), &index(&n("PKG0"), &i(1))),
+            &store(&i(0x41), &index(&n("BUF0"), &i(0))),
+            &store(&i(0x5A), &index(&n("STR0"), &i(2))),
+            // A nested element.
+            &store(&i(8), &index(&deref(&index(&n("PKG0"), &i(2))), &i(0))),
+            // A method storing to an argument that holds a reference.
+            &op(&n("SET_"), &[&op(&[0x71], &[&n("INT0")])]),
+            &ret(&l(1)),
+        ]),
+    );
     let mut sim = Sim::new();
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(5)));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(5))
+    );
     assert_eq!(data(&ns, "\\INT0"), Data::Integer(7));
     assert_eq!(data(&ns, "\\BUF0"), Data::Buffer(vec![0x41, 2, 3, 4]));
     assert_eq!(data(&ns, "\\STR0"), s_("abZ"));
     assert_eq!(
         data(&ns, "\\PKG0"),
-        Data::Package(vec![Data::Integer(1), Data::Integer(9), Data::Package(vec![Data::Integer(8)])])
+        Data::Package(vec![
+            Data::Integer(1),
+            Data::Integer(9),
+            Data::Package(vec![Data::Integer(8)])
+        ])
     );
     // An index past the end.
-    assert_eq!(fault(&defs, &ret(&deref(&index(&n("PKG0"), &i(3))))), FaultKind::Range);
-    assert_eq!(fault(&defs, &store(&i(1), &index(&n("BUF0"), &i(4)))), FaultKind::Range);
+    assert_eq!(
+        fault(&defs, &ret(&deref(&index(&n("PKG0"), &i(3))))),
+        FaultKind::Range
+    );
+    assert_eq!(
+        fault(&defs, &store(&i(1), &index(&n("BUF0"), &i(4)))),
+        FaultKind::Range
+    );
     // An element read through the index, without DerefOf, as an operand.
-    assert_eq!(ok(&defs, &ret(&bin(0x72, &index(&n("BUF0"), &i(1)), &i(0)))), Data::Integer(2));
+    assert_eq!(
+        ok(&defs, &ret(&bin(0x72, &index(&n("BUF0"), &i(1)), &i(0)))),
+        Data::Integer(2)
+    );
     // CondRefOf: whether the name resolves, storing its reference.
     let cond = |obj: &str| ok(&defs, &ret(&op(&ext(0x12), &[&n(obj), &l(0)])));
     assert_eq!(cond("INT0"), Data::Integer(ONES));
     assert_eq!(cond("NONE"), Data::Integer(0));
     // A reference returned to the caller of a local's reference is the
     // value it referred to.
-    let r = ok(&[], &cat(&[&store(&i(4), &l(0)), &ret(&op(&[0x71], &[&l(0)]))]));
+    let r = ok(
+        &[],
+        &cat(&[&store(&i(4), &l(0)), &ret(&op(&[0x71], &[&l(0)]))]),
+    );
     assert_eq!(r, Data::Integer(4));
 }
 
@@ -439,12 +515,17 @@ fn store_converts_to_a_named_objects_type_and_copy_object_replaces()
         &name_obj("STR0", &string("x")),
         &name_obj("PKG0", &package(1, &[i(1)])),
     ]);
-    let mut ns = table_of(2, &defs, 0, &cat(&[
-        &store(&string("1F"), &n("INT0")),
-        &store(&i(0x01_0203_0405), &n("BUF0")),
-        &store(&i(0x1F), &n("STR0")),
-        &store(&i(3), &n("PKG0")),
-    ]));
+    let mut ns = table_of(
+        2,
+        &defs,
+        0,
+        &cat(&[
+            &store(&string("1F"), &n("INT0")),
+            &store(&i(0x01_0203_0405), &n("BUF0")),
+            &store(&i(0x1F), &n("STR0")),
+            &store(&i(3), &n("PKG0")),
+        ]),
+    );
     run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]).unwrap();
     assert_eq!(data(&ns, "\\INT0"), Data::Integer(0x1F));
     // A buffer keeps its length.
@@ -456,9 +537,15 @@ fn store_converts_to_a_named_objects_type_and_copy_object_replaces()
     run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]).unwrap();
     assert_eq!(data(&ns, "\\INT0"), Data::Buffer(vec![9]));
     // A local takes any value as it is.
-    assert_eq!(ok(&[], &cat(&[&store(&string("q"), &l(0)), &ret(&l(0))])), s_("q"));
+    assert_eq!(
+        ok(&[], &cat(&[&store(&string("q"), &l(0)), &ret(&l(0))])),
+        s_("q")
+    );
     // An uninitialized local read is a fault.
-    assert_eq!(fault(&[], &ret(&bin(0x72, &l(3), &i(1)))), FaultKind::Uninitialized);
+    assert_eq!(
+        fault(&[], &ret(&bin(0x72, &l(3), &i(1)))),
+        FaultKind::Uninitialized
+    );
 }
 
 #[test]
@@ -467,7 +554,13 @@ fn match_finds_the_first_element_meeting_both_conditions()
     let defs = name_obj("PKG0", &package(4, &[i(1), i(5), i(9), string("x")]));
     // MEQ 5, MTR.
     let m = |op1: u8, x: u64, op2: u8, y: u64, start: u64| {
-        ok(&defs, &ret(&op(&[0x89], &[&n("PKG0"), &[op1], &i(x), &[op2], &i(y), &i(start)])))
+        ok(
+            &defs,
+            &ret(&op(
+                &[0x89],
+                &[&n("PKG0"), &[op1], &i(x), &[op2], &i(y), &i(start)],
+            )),
+        )
     };
     assert_eq!(m(1, 5, 0, 0, 0), Data::Integer(1));
     // MGT 4 and MLT 9.
@@ -485,35 +578,59 @@ fn loops_branches_and_calls()
     let body = cat(&[
         &store(&i(0), &l(0)),
         &store(&i(0), &l(1)),
-        &while_(&[0x01], &cat(&[
-            &[0x75],
-            &l(0),
-            &if_(&op(&[0x92, 0x95], &[&l(0), &i(10)]), &[0xA5]),
-            &if_(&op(&[0x93], &[&bin(0x7B, &l(0), &i(1)), &i(0)]), &[0x9F]),
-            &op(&[0x72], &[&l(1), &l(0), &l(1)]),
-        ])),
+        &while_(
+            &[0x01],
+            &cat(&[
+                &[0x75],
+                &l(0),
+                &if_(&op(&[0x92, 0x95], &[&l(0), &i(10)]), &[0xA5]),
+                &if_(&op(&[0x93], &[&bin(0x7B, &l(0), &i(1)), &i(0)]), &[0x9F]),
+                &op(&[0x72], &[&l(1), &l(0), &l(1)]),
+            ]),
+        ),
         &ret(&l(1)),
     ]);
     assert_eq!(int_of(&body), 1 + 3 + 5 + 7 + 9);
     // If, Else.
-    let pick = |x: u64| int_of(&cat(&[&if_(&op(&[0x93], &[&i(x), &i(1)]), &ret(&i(10))), &else_(&ret(&i(20)))]));
+    let pick = |x: u64| {
+        int_of(&cat(&[
+            &if_(&op(&[0x93], &[&i(x), &i(1)]), &ret(&i(10))),
+            &else_(&ret(&i(20))),
+        ]))
+    };
     assert_eq!((pick(1), pick(2)), (10, 20));
     // A recursive call with an argument: 5!.
-    let fact = method("FACT", 1, &cat(&[
-        &if_(&op(&[0x95], &[&a(0), &i(2)]), &ret(&i(1))),
-        &ret(&bin(0x77, &a(0), &op(&n("FACT"), &[&bin(0x74, &a(0), &i(1))]))),
-    ]));
-    assert_eq!(ok(&fact, &ret(&op(&n("FACT"), &[&i(5)]))), Data::Integer(120));
+    let fact = method(
+        "FACT",
+        1,
+        &cat(&[
+            &if_(&op(&[0x95], &[&a(0), &i(2)]), &ret(&i(1))),
+            &ret(&bin(
+                0x77,
+                &a(0),
+                &op(&n("FACT"), &[&bin(0x74, &a(0), &i(1))]),
+            )),
+        ]),
+    );
+    assert_eq!(
+        ok(&fact, &ret(&op(&n("FACT"), &[&i(5)]))),
+        Data::Integer(120)
+    );
     // A method with no Return returns no value.
     assert_eq!(ok(&[], &[0xA3]), Data::Uninitialized);
     // Arguments and locals are each frame's own.
     let set = method("SETL", 0, &store(&i(1), &l(0)));
-    assert_eq!(ok(&set, &cat(&[&store(&i(7), &l(0)), &n("SETL"), &ret(&l(0))])), Data::Integer(7));
+    assert_eq!(
+        ok(&set, &cat(&[&store(&i(7), &l(0)), &n("SETL"), &ret(&l(0))])),
+        Data::Integer(7)
+    );
     // Too many arguments.
     let mut ns = table_of(2, &[], 1, &ret(&a(0)));
     let args = vec![Data::Integer(1); 8];
     assert_eq!(
-        run_on(&mut ns, &mut Sim::new(), "\\TEST", args).unwrap_err().kind,
+        run_on(&mut ns, &mut Sim::new(), "\\TEST", args)
+            .unwrap_err()
+            .kind,
         FaultKind::Args
     );
 }
@@ -521,23 +638,44 @@ fn loops_branches_and_calls()
 #[test]
 fn objects_a_method_creates_are_removed_when_it_returns()
 {
-    let mut ns = table_of(2, &[], 0, &cat(&[
-        &name_obj("LOC0", &i(3)),
-        &device("DEV0", &name_obj("_ADR", &i(0))),
-        &method("INNR", 0, &ret(&i(4))),
-        &ret(&bin(0x72, &n("LOC0"), &n("INNR"))),
-    ]));
+    let mut ns = table_of(
+        2,
+        &[],
+        0,
+        &cat(&[
+            &name_obj("LOC0", &i(3)),
+            &device("DEV0", &name_obj("_ADR", &i(0))),
+            &method("INNR", 0, &ret(&i(4))),
+            &ret(&bin(0x72, &n("LOC0"), &n("INNR"))),
+        ]),
+    );
     let before = ns.len();
     let mut sim = Sim::new();
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(7)));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(7))
+    );
     assert_eq!(ns.len(), before);
     assert!(ns.find("\\TEST.LOC0").is_none());
     // And again: the names are free to create.
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(7)));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(7))
+    );
     // A fault removes them too.
-    let mut ns = table_of(2, &[], 0, &cat(&[&name_obj("LOC0", &i(3)), &ext(0x32), &[1], &[0; 4], &i(0)]));
+    let mut ns = table_of(
+        2,
+        &[],
+        0,
+        &cat(&[&name_obj("LOC0", &i(3)), &ext(0x32), &[1], &[0; 4], &i(0)]),
+    );
     let before = ns.len();
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap_err().kind, FaultKind::Fatal);
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![])
+            .unwrap_err()
+            .kind,
+        FaultKind::Fatal
+    );
     assert_eq!(ns.len(), before);
 }
 
@@ -546,7 +684,10 @@ fn module_level_code_runs_once_and_keeps_its_objects()
 {
     let aml = cat(&[
         &name_obj("FLAG", &i(0)),
-        &if_(&[0x01], &cat(&[&store(&i(1), &n("FLAG")), &name_obj("MADE", &i(2))])),
+        &if_(
+            &[0x01],
+            &cat(&[&store(&i(1), &n("FLAG")), &name_obj("MADE", &i(2))]),
+        ),
         &store(&i(1), &n("NONE")),
     ]);
     let mut ns = Namespace::new().unwrap();
@@ -564,23 +705,53 @@ fn module_level_code_runs_once_and_keeps_its_objects()
 fn unsupported_operators_fail_closed()
 {
     let load = op(&ext(0x20), &[&n("BUF0"), &l(0)]);
-    assert_eq!(fault(&name_obj("BUF0", &b(&[0])), &load), FaultKind::Unsupported);
+    assert_eq!(
+        fault(&name_obj("BUF0", &b(&[0])), &load),
+        FaultKind::Unsupported
+    );
     let region_ = region("REG0", 0x0A, &i(0), &i(4));
-    let body = cat(&[&region_, &field("REG0", 1, &[unit("FLD0", 8)]), &ret(&n("FLD0"))]);
+    let body = cat(&[
+        &region_,
+        &field("REG0", 1, &[unit("FLD0", 8)]),
+        &ret(&n("FLD0")),
+    ]);
     assert_eq!(fault(&[], &body), FaultKind::Unsupported);
     // A Connection in a field list a method defines.
     let region_ = region("REG0", 1, &i(0x100), &i(4));
     let connect = cat(&[&[0x02], &n("REG0")]);
-    let body = cat(&[&region_, &field("REG0", 1, &[connect, unit("FLD0", 8)]), &ret(&n("FLD0"))]);
+    let body = cat(&[
+        &region_,
+        &field("REG0", 1, &[connect, unit("FLD0", 8)]),
+        &ret(&n("FLD0")),
+    ]);
     assert_eq!(fault(&[], &body), FaultKind::Unsupported);
-    assert_eq!(fault(&[], &cat(&[&ext(0x32), &[1], &[0; 4], &i(0)])), FaultKind::Fatal);
+    assert_eq!(
+        fault(&[], &cat(&[&ext(0x32), &[1], &[0; 4], &i(0)])),
+        FaultKind::Fatal
+    );
     // LoadTable, Unload and DataTableRegion: no table is loaded or mapped
     // after the namespace's load.
     let strings: Vec<Vec<u8>> = (0..5).map(|_| string("")).collect();
-    let load_table = op(&ext(0x1F), &[&strings[0], &strings[1], &strings[2], &strings[3], &strings[4], &i(0)]);
+    let load_table = op(
+        &ext(0x1F),
+        &[
+            &strings[0],
+            &strings[1],
+            &strings[2],
+            &strings[3],
+            &strings[4],
+            &i(0),
+        ],
+    );
     assert_eq!(fault(&[], &load_table), FaultKind::Unsupported);
-    assert_eq!(fault(&[], &op(&ext(0x2A), &[&l(0)])), FaultKind::Unsupported);
-    let data_region = op(&ext(0x88), &[&n("DRG0"), &string("DSDT"), &string(""), &string("")]);
+    assert_eq!(
+        fault(&[], &op(&ext(0x2A), &[&l(0)])),
+        FaultKind::Unsupported
+    );
+    let data_region = op(
+        &ext(0x88),
+        &[&n("DRG0"), &string("DSDT"), &string(""), &string("")],
+    );
     assert_eq!(fault(&[], &data_region), FaultKind::Unsupported);
 }
 
@@ -590,7 +761,10 @@ fn unsupported_operators_fail_closed()
 /// `units`, and a method `TEST` of `body`.
 fn io_field(flags: u8, units: &[Vec<u8>], body: &[u8]) -> (Namespace, Sim)
 {
-    let defs = cat(&[&region("REG0", 1, &i(0x100), &i(8)), &field("REG0", flags, units)]);
+    let defs = cat(&[
+        &region("REG0", 1, &i(0x100), &i(8)),
+        &field("REG0", flags, units),
+    ]);
     (table_of(2, &defs, 0, body), Sim::new())
 }
 
@@ -602,7 +776,17 @@ fn field_units_read_and_write_their_bits_under_each_update_rule()
     let (mut ns, mut sim) = io_field(0x01, &units, &store(&i(0xAB), &n("FLD0")));
     for (port, v) in [(0x100, 0x5Au8), (0x101, 0xC3)]
     {
-        Host::io_write(&mut sim, crate::host::Span { base: 0x100, len: 8 }, port, Width::Byte, u64::from(v)).unwrap();
+        Host::io_write(
+            &mut sim,
+            crate::host::Span {
+                base: 0x100,
+                len: 8,
+            },
+            port,
+            Width::Byte,
+            u64::from(v),
+        )
+        .unwrap();
     }
     sim.log.clear();
     run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap();
@@ -610,7 +794,10 @@ fn field_units_read_and_write_their_bits_under_each_update_rule()
     assert_eq!(sim.io_writes(), vec![(0x100, 0xBA), (0x101, 0xCA)]);
     // Reading it back.
     let (mut ns, _) = io_field(0x01, &units, &ret(&n("FLD0")));
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(0xAB)));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(0xAB))
+    );
     // WriteAsOnes and WriteAsZeros: no read, the other bits set or clear.
     let (mut ns, mut ones) = io_field(0x21, &units, &store(&i(0), &n("FLD1")));
     run_on(&mut ns, &mut ones, "\\TEST", vec![]).unwrap();
@@ -632,13 +819,31 @@ fn a_field_wider_than_an_integer_reads_as_a_buffer()
 {
     let defs = cat(&[
         &region("REG0", 0, &i(0x1000), &i(16)),
-        &pkg_obj(&ext(0x81), &cat(&[&n("REG0"), &[0x03], &unit("WIDE", 0x48)])),
+        &pkg_obj(
+            &ext(0x81),
+            &cat(&[&n("REG0"), &[0x03], &unit("WIDE", 0x48)]),
+        ),
     ]);
-    let mut ns = table_of(2, &defs, 0, &cat(&[&store(&b(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), &n("WIDE")), &ret(&n("WIDE"))]));
+    let mut ns = table_of(
+        2,
+        &defs,
+        0,
+        &cat(&[
+            &store(&b(&[1, 2, 3, 4, 5, 6, 7, 8, 9]), &n("WIDE")),
+            &ret(&n("WIDE")),
+        ]),
+    );
     let mut sim = Sim::new();
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Buffer(vec![1, 2, 3, 4, 5, 6, 7, 8, 9])));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Buffer(vec![1, 2, 3, 4, 5, 6, 7, 8, 9]))
+    );
     assert_eq!(sim.mem_byte(0x1008), 9);
-    assert!(sim.log.iter().all(|a| a.space == Space::Mem && a.width == Width::DWord));
+    assert!(
+        sim.log
+            .iter()
+            .all(|a| a.space == Space::Mem && a.width == Width::DWord)
+    );
 }
 
 #[test]
@@ -646,16 +851,47 @@ fn index_and_bank_fields_select_their_register_first()
 {
     let defs = cat(&[
         &region("REG0", 1, &i(0x100), &i(4)),
-        &field("REG0", 0x01, &[unit("IDX0", 8), unit("DAT0", 8), unit("BNK0", 8)]),
-        &pkg_obj(&ext(0x86), &cat(&[&n("IDX0"), &n("DAT0"), &[0x01], &unit("", 16), &unit("IFL0", 8)])),
-        &pkg_obj(&ext(0x87), &cat(&[&n("REG0"), &n("BNK0"), &i(3), &[0x01], &unit("", 24), &unit("BFL0", 8)])),
+        &field(
+            "REG0",
+            0x01,
+            &[unit("IDX0", 8), unit("DAT0", 8), unit("BNK0", 8)],
+        ),
+        &pkg_obj(
+            &ext(0x86),
+            &cat(&[
+                &n("IDX0"),
+                &n("DAT0"),
+                &[0x01],
+                &unit("", 16),
+                &unit("IFL0", 8),
+            ]),
+        ),
+        &pkg_obj(
+            &ext(0x87),
+            &cat(&[
+                &n("REG0"),
+                &n("BNK0"),
+                &i(3),
+                &[0x01],
+                &unit("", 24),
+                &unit("BFL0", 8),
+            ]),
+        ),
     ]);
-    let mut ns = table_of(2, &defs, 0, &cat(&[&store(&i(0x77), &n("IFL0")), &store(&i(0x66), &n("BFL0"))]));
+    let mut ns = table_of(
+        2,
+        &defs,
+        0,
+        &cat(&[&store(&i(0x77), &n("IFL0")), &store(&i(0x66), &n("BFL0"))]),
+    );
     let mut sim = Sim::new();
     run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap();
     // The index field's unit at byte 2: index 2, then the data; the bank
     // field's: bank 3, then the register.
-    assert_eq!(sim.io_writes(), vec![(0x100, 2), (0x101, 0x77), (0x102, 3), (0x103, 0x66)]);
+    assert_eq!(
+        sim.io_writes(),
+        vec![(0x100, 2), (0x101, 0x77), (0x102, 3), (0x103, 0x66)]
+    );
 }
 
 #[test]
@@ -673,7 +909,9 @@ fn a_region_offset_from_an_expression_is_evaluated_at_first_access()
     // An access the host refuses ends the evaluation.
     sim.refuse = Some(1);
     assert_eq!(
-        run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap_err().kind,
+        run_on(&mut ns, &mut sim, "\\TEST", vec![])
+            .unwrap_err()
+            .kind,
         FaultKind::Host(HostError::Refused)
     );
 }
@@ -689,29 +927,50 @@ fn buffer_fields_read_and_write_their_bits()
         &ret(&n("BUF0")),
     ]);
     assert_eq!(ok(&defs, &body), Data::Buffer(vec![8, 7, 6, 5, 4, 3, 2, 1]));
-    let mut ns = table_of(2, &defs, 0, &cat(&[
-        &op(&[0x8A], &[&n("BUF0"), &i(0), &n("DW00")]),
-        &op(&[0x8D], &[&n("BUF0"), &i(32), &n("BIT0")]),
-        &op(&ext(0x13), &[&n("BUF0"), &i(36), &i(12), &n("FL12")]),
-        &store(&i(0x1234_5678), &n("DW00")),
-        &store(&i(1), &n("BIT0")),
-        &store(&i(0xABC), &n("FL12")),
-        &ret(&bin(0x72, &n("DW00"), &n("FL12"))),
-    ]));
+    let mut ns = table_of(
+        2,
+        &defs,
+        0,
+        &cat(&[
+            &op(&[0x8A], &[&n("BUF0"), &i(0), &n("DW00")]),
+            &op(&[0x8D], &[&n("BUF0"), &i(32), &n("BIT0")]),
+            &op(&ext(0x13), &[&n("BUF0"), &i(36), &i(12), &n("FL12")]),
+            &store(&i(0x1234_5678), &n("DW00")),
+            &store(&i(1), &n("BIT0")),
+            &store(&i(0xABC), &n("FL12")),
+            &ret(&bin(0x72, &n("DW00"), &n("FL12"))),
+        ]),
+    );
     let mut sim = Sim::new();
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(0x1234_5678 + 0xABC)));
-    assert_eq!(data(&ns, "\\BUF0"), Data::Buffer(vec![0x78, 0x56, 0x34, 0x12, 0xC1, 0xAB, 0, 0]));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(0x1234_5678 + 0xABC))
+    );
+    assert_eq!(
+        data(&ns, "\\BUF0"),
+        Data::Buffer(vec![0x78, 0x56, 0x34, 0x12, 0xC1, 0xAB, 0, 0])
+    );
     // A field past the end of its buffer.
-    assert_eq!(fault(&defs, &op(&[0x8A], &[&n("BUF0"), &i(5), &n("DW00")])), FaultKind::Range);
+    assert_eq!(
+        fault(&defs, &op(&[0x8A], &[&n("BUF0"), &i(5), &n("DW00")])),
+        FaultKind::Range
+    );
     // A field over an argument writes the caller's buffer (as _OSC does).
-    let body = cat(&[&op(&[0x8B], &[&a(0), &i(1), &n("WD00")]), &store(&i(0xBEEF), &n("WD00")), &ret(&a(0))]);
+    let body = cat(&[
+        &op(&[0x8B], &[&a(0), &i(1), &n("WD00")]),
+        &store(&i(0xBEEF), &n("WD00")),
+        &ret(&a(0)),
+    ]);
     let mut ns = table_of(2, &[], 1, &body);
     assert_eq!(
         run_on(&mut ns, &mut sim, "\\TEST", vec![Data::Buffer(vec![0; 4])]),
         Ok(Data::Buffer(vec![0, 0xEF, 0xBE, 0]))
     );
     // A field over a temporary.
-    let body = cat(&[&op(&[0x8C], &[&b(&[1, 2]), &i(1), &n("BY00")]), &ret(&n("BY00"))]);
+    let body = cat(&[
+        &op(&[0x8C], &[&b(&[1, 2]), &i(1), &n("BY00")]),
+        &ret(&n("BY00")),
+    ]);
     assert_eq!(ok(&[], &body), Data::Integer(2));
 }
 
@@ -733,9 +992,19 @@ fn mutexes_follow_the_ordering_rule()
     ]);
     assert_eq!(ok(&defs, &good), Data::Integer(0));
     // Descending.
-    assert_eq!(fault(&defs, &cat(&[&acquire("MTX2", 0xFFFF), &acquire("MTX1", 0xFFFF)])), FaultKind::MutexOrder);
+    assert_eq!(
+        fault(
+            &defs,
+            &cat(&[&acquire("MTX2", 0xFFFF), &acquire("MTX1", 0xFFFF)])
+        ),
+        FaultKind::MutexOrder
+    );
     // A release below the current level.
-    let wrong = cat(&[&acquire("MTX1", 0xFFFF), &acquire("MTX2", 0xFFFF), &release("MTX1")]);
+    let wrong = cat(&[
+        &acquire("MTX1", 0xFFFF),
+        &acquire("MTX2", 0xFFFF),
+        &release("MTX1"),
+    ]);
     assert_eq!(fault(&defs, &wrong), FaultKind::MutexOrder);
     // A release of a mutex not held.
     assert_eq!(fault(&defs, &release("MTX1")), FaultKind::MutexOrder);
@@ -746,17 +1015,35 @@ fn mutexes_follow_the_ordering_rule()
     run_on(&mut ns, &mut sim, "\\HOLD", vec![]).unwrap();
     run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap();
     // A serialized method of sync level 3 holds level 3 while it runs.
-    let serialized = pkg_obj(&[0x14], &cat(&[&n("SER3"), &[0x38], &acquire("MTX1", 0xFFFF)]));
+    let serialized = pkg_obj(
+        &[0x14],
+        &cat(&[&n("SER3"), &[0x38], &acquire("MTX1", 0xFFFF)]),
+    );
     let defs3 = cat(&[&defs, &serialized]);
     assert_eq!(fault(&defs3, &n("SER3")), FaultKind::MutexOrder);
     // The global lock mutex takes the firmware lock.
-    let mut ns = table_of(2, &[], 0, &cat(&[&acquire("\\_GL_", 0xFFFF), &acquire("\\_GL_", 0xFFFF), &release("\\_GL_")]));
+    let mut ns = table_of(
+        2,
+        &[],
+        0,
+        &cat(&[
+            &acquire("\\_GL_", 0xFFFF),
+            &acquire("\\_GL_", 0xFFFF),
+            &release("\\_GL_"),
+        ]),
+    );
     let mut sim = Sim::new();
     run_on(&mut ns, &mut sim, "\\TEST", vec![]).unwrap();
-    assert_eq!((sim.gl_acquires, sim.gl_releases, sim.gl_held), (1, 1, false));
+    assert_eq!(
+        (sim.gl_acquires, sim.gl_releases, sim.gl_held),
+        (1, 1, false)
+    );
     sim.gl_refuse = true;
     let mut ns = table_of(2, &[], 0, &ret(&acquire("\\_GL_", 5)));
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(ONES)));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(ONES))
+    );
 }
 
 #[test]
@@ -775,11 +1062,18 @@ fn events_count_their_signals()
         &signal,
         &reset,
         &store(&wait(0), &l(3)),
-        &ret(&bin(0x72, &bin(0x72, &l(0), &l(1)), &bin(0x7B, &l(2), &l(3)))),
+        &ret(&bin(
+            0x72,
+            &bin(0x72, &l(0), &l(1)),
+            &bin(0x7B, &l(2), &l(3)),
+        )),
     ]);
     let mut ns = table_of(2, &defs, 0, &body);
     let mut sim = Sim::new();
-    assert_eq!(run_on(&mut ns, &mut sim, "\\TEST", vec![]), Ok(Data::Integer(ONES)));
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(ONES))
+    );
     assert_eq!(sim.slept_ms, 5);
     // No timeout, nothing to signal: a deadlock.
     assert_eq!(fault(&defs, &wait(0xFFFF)), FaultKind::Deadlock);
@@ -808,11 +1102,18 @@ fn delays_and_notifications_reach_the_host()
     assert_eq!((sim.slept_ms, sim.stalled_us), (100, 255));
     assert_eq!(
         sim.notes,
-        vec![("\\DEV0".to_string(), 0x80), ("\\CPU0".to_string(), 0x81), ("\\TZ00".to_string(), 0x82)]
+        vec![
+            ("\\DEV0".to_string(), 0x80),
+            ("\\CPU0".to_string(), 0x81),
+            ("\\TZ00".to_string(), 0x82)
+        ]
     );
     assert_eq!(fault(&[], &op(&ext(0x21), &[&i(256)])), FaultKind::Range);
     let defs = name_obj("INT0", &i(0));
-    assert_eq!(fault(&defs, &op(&[0x86], &[&n("INT0"), &i(1)])), FaultKind::Type);
+    assert_eq!(
+        fault(&defs, &op(&[0x86], &[&n("INT0"), &i(1)])),
+        FaultKind::Type
+    );
 }
 
 // ── Bounds ────────────────────────────────────────────────────────────
@@ -824,7 +1125,9 @@ fn count_passes(pass: &[u8]) -> (FaultKind, u64)
     let defs = name_obj("CNT_", &i(0));
     let body = while_(&[0x01], &cat(&[&[0x75], &n("CNT_"), pass]));
     let mut ns = table_of(2, &defs, 0, &body);
-    let kind = run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]).unwrap_err().kind;
+    let kind = run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![])
+        .unwrap_err()
+        .kind;
     let Data::Integer(passes) = data(&ns, "\\CNT_")
     else
     {
@@ -839,7 +1142,10 @@ fn every_loop_ends_at_the_step_bound()
     let (kind, passes) = count_passes(&[0xA3]);
     assert_eq!(kind, FaultKind::Bound);
     // Each pass: the predicate, the Increment and its operand, the Noop.
-    assert!(passes > (MAX_EVAL_STEPS / 8) as u64 && passes < MAX_EVAL_STEPS as u64, "{passes}");
+    assert!(
+        passes > (MAX_EVAL_STEPS / 8) as u64 && passes < MAX_EVAL_STEPS as u64,
+        "{passes}"
+    );
 }
 
 #[test]
@@ -851,12 +1157,21 @@ fn the_values_an_evaluation_makes_are_bounded()
     let most = (MAX_EVAL_ALLOC / 0x1000) as u64;
     assert!(passes > most / 2 && passes <= most + 1, "{passes}");
     // One buffer or package past its own bound.
-    assert_eq!(fault(&[], &store(&buffer(&i(0x1_0001), &[]), &l(0))), FaultKind::Bound);
-    assert_eq!(fault(&[], &store(&pkg_obj(&[0x13], &i(5000)), &l(0))), FaultKind::Bound);
+    assert_eq!(
+        fault(&[], &store(&buffer(&i(0x1_0001), &[]), &l(0))),
+        FaultKind::Bound
+    );
+    assert_eq!(
+        fault(&[], &store(&pkg_obj(&[0x13], &i(5000)), &l(0))),
+        FaultKind::Bound
+    );
     // A string grown past MAX_BUFFER_BYTES.
     let grow = cat(&[
         &store(&string(""), &l(0)),
-        &while_(&[0x01], &op(&[0x73], &[&l(0), &string("0123456789abcdef"), &l(0)])),
+        &while_(
+            &[0x01],
+            &op(&[0x73], &[&l(0), &string("0123456789abcdef"), &l(0)]),
+        ),
     ]);
     assert_eq!(fault(&[], &grow), FaultKind::Bound);
 }
@@ -871,21 +1186,36 @@ fn package_nesting_is_bounded()
         &store(&l(1), &l(0)),
     ]);
     let defs = name_obj("CNT_", &i(0));
-    let body = cat(&[&store(&i(0), &l(0)), &while_(&[0x01], &cat(&[&[0x75], &n("CNT_"), &nest]))]);
+    let body = cat(&[
+        &store(&i(0), &l(0)),
+        &while_(&[0x01], &cat(&[&[0x75], &n("CNT_"), &nest])),
+    ]);
     let mut ns = table_of(2, &defs, 0, &body);
-    assert_eq!(run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]).unwrap_err().kind, FaultKind::Bound);
+    assert_eq!(
+        run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![])
+            .unwrap_err()
+            .kind,
+        FaultKind::Bound
+    );
     let Data::Integer(passes) = data(&ns, "\\CNT_")
     else
     {
         panic!();
     };
-    assert!((MAX_VALUE_DEPTH as u64..=MAX_VALUE_DEPTH as u64 + 1).contains(&passes), "{passes}");
+    assert!(
+        (MAX_VALUE_DEPTH as u64..=MAX_VALUE_DEPTH as u64 + 1).contains(&passes),
+        "{passes}"
+    );
 }
 
 #[test]
 fn call_depth_is_bounded()
 {
-    let defs = method("RECR", 1, &ret(&op(&n("RECR"), &[&bin(0x72, &a(0), &i(1))])));
+    let defs = method(
+        "RECR",
+        1,
+        &ret(&op(&n("RECR"), &[&bin(0x72, &a(0), &i(1))])),
+    );
     let mut ns = table_of(2, &defs, 0, &ret(&op(&n("RECR"), &[&i(0)])));
     let f = run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![]).unwrap_err();
     assert_eq!(f.kind, FaultKind::Depth);
@@ -896,7 +1226,12 @@ fn call_depth_is_bounded()
             &if_(&op(&[0x93], &[&a(0), &i(last)]), &ret(&a(0))),
             &ret(&op(&n("RECR"), &[&bin(0x72, &a(0), &i(1))])),
         ]);
-        let mut ns = table_of(2, &method("RECR", 1, &body), 0, &ret(&op(&n("RECR"), &[&i(0)])));
+        let mut ns = table_of(
+            2,
+            &method("RECR", 1, &body),
+            0,
+            &ret(&op(&n("RECR"), &[&i(0)])),
+        );
         run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![])
     };
     let last = MAX_CALL_DEPTH as u64 - 2;
@@ -910,11 +1245,20 @@ fn the_objects_an_evaluation_creates_are_bounded()
     // A chain of methods M0 to M<last>, each creating 600 objects in its
     // own scope and calling the next: six make 3600 objects, seven 4200.
     const { assert!(600 * 6 < MAX_EVAL_OBJECTS && 600 * 7 > MAX_EVAL_OBJECTS) };
-    let names: Vec<u8> = (0..600).flat_map(|k| name_obj(&format!("N{k:03}"), &i(0))).collect();
+    let names: Vec<u8> = (0..600)
+        .flat_map(|k| name_obj(&format!("N{k:03}"), &i(0)))
+        .collect();
     let chain = |last: usize| {
         let defs: Vec<u8> = (0..=last)
             .flat_map(|k| {
-                let next = if k < last { op(&n(&format!("M{}", k + 1)), &[]) } else { vec![] };
+                let next = if k < last
+                {
+                    op(&n(&format!("M{}", k + 1)), &[])
+                }
+                else
+                {
+                    vec![]
+                };
                 method(&format!("M{k}"), 0, &cat(&[&names, &next]))
             })
             .collect();
@@ -928,7 +1272,10 @@ fn the_objects_an_evaluation_creates_are_bounded()
     assert_eq!(chain(5), Ok(Data::Uninitialized));
     assert_eq!(chain(6).unwrap_err().kind, FaultKind::Bound);
     // A method that recurses creates its objects again in the same scope.
-    let body = cat(&[&name_obj("N000", &i(0)), &if_(&a(0), &op(&n("RECR"), &[&i(0)]))]);
+    let body = cat(&[
+        &name_obj("N000", &i(0)),
+        &if_(&a(0), &op(&n("RECR"), &[&i(0)])),
+    ]);
     let defs = method("RECR", 1, &body);
     assert_eq!(fault(&defs, &op(&n("RECR"), &[&i(1)])), FaultKind::Exists);
 }
@@ -951,29 +1298,62 @@ struct Probe(Sim);
 
 impl Host for Probe
 {
-    fn io_read(&mut self, region: crate::host::Span, port: u64, width: Width) -> Result<u64, HostError>
+    fn io_read(
+        &mut self,
+        region: crate::host::Span,
+        port: u64,
+        width: Width,
+    ) -> Result<u64, HostError>
     {
         let mark = 0u8;
         LOWEST.with(|l| l.set(l.get().min(std::ptr::addr_of!(mark) as usize)));
         self.0.io_read(region, port, width)
     }
-    fn io_write(&mut self, region: crate::host::Span, port: u64, width: Width, value: u64) -> Result<(), HostError>
+    fn io_write(
+        &mut self,
+        region: crate::host::Span,
+        port: u64,
+        width: Width,
+        value: u64,
+    ) -> Result<(), HostError>
     {
         self.0.io_write(region, port, width, value)
     }
-    fn mem_read(&mut self, region: crate::host::Span, addr: u64, width: Width) -> Result<u64, HostError>
+    fn mem_read(
+        &mut self,
+        region: crate::host::Span,
+        addr: u64,
+        width: Width,
+    ) -> Result<u64, HostError>
     {
         self.0.mem_read(region, addr, width)
     }
-    fn mem_write(&mut self, region: crate::host::Span, addr: u64, width: Width, value: u64) -> Result<(), HostError>
+    fn mem_write(
+        &mut self,
+        region: crate::host::Span,
+        addr: u64,
+        width: Width,
+        value: u64,
+    ) -> Result<(), HostError>
     {
         self.0.mem_write(region, addr, width, value)
     }
-    fn pci_read(&mut self, function: crate::host::PciAddress, offset: u64, width: Width) -> Result<u64, HostError>
+    fn pci_read(
+        &mut self,
+        function: crate::host::PciAddress,
+        offset: u64,
+        width: Width,
+    ) -> Result<u64, HostError>
     {
         self.0.pci_read(function, offset, width)
     }
-    fn pci_write(&mut self, function: crate::host::PciAddress, offset: u64, width: Width, value: u64) -> Result<(), HostError>
+    fn pci_write(
+        &mut self,
+        function: crate::host::PciAddress,
+        offset: u64,
+        width: Width,
+        value: u64,
+    ) -> Result<(), HostError>
     {
         self.0.pci_write(function, offset, width, value)
     }
@@ -1027,7 +1407,10 @@ fn an_evaluation_fits_the_stack_budget_at_the_depth_bound()
                 {
                     call = op(&[0x80], &[&call, &[0]]);
                 }
-                let body = cat(&[&if_(&op(&[0x93], &[&a(0), &i(0)]), &ret(&n("FLD0"))), &ret(&call)]);
+                let body = cat(&[
+                    &if_(&op(&[0x93], &[&a(0), &i(0)]), &ret(&n("FLD0"))),
+                    &ret(&call),
+                ]);
                 let defs = cat(&[
                     &region("REG0", 1, &i(0x100), &i(1)),
                     &field("REG0", 1, &[unit("FLD0", 8)]),
@@ -1052,7 +1435,10 @@ fn an_evaluation_fits_the_stack_budget_at_the_depth_bound()
             assert!(reached + 64 > MAX_EVAL_DEPTH, "{reached}");
             // A parse nested to its bound may run at that depth, on the
             // same stack.
-            assert!(2 * deepest + PARSE_STACK_BYTES < EVAL_STACK_BYTES, "{deepest}");
+            assert!(
+                2 * deepest + PARSE_STACK_BYTES < EVAL_STACK_BYTES,
+                "{deepest}"
+            );
             eprintln!("evaluation stack at the depth bound: {deepest} bytes");
         })
         .unwrap()
@@ -1090,7 +1476,16 @@ fn arbitrary_method_bodies_evaluate_to_a_result_or_a_fault()
         0x70, 0x72, 0x73, 0x74, 0x75, 0x77, 0x78, 0x79, 0x7B, 0x83, 0x86, 0x87, 0x88, 0x8A, 0x8E,
         0x93, 0x96, 0x98, 0x9D, 0xA0, 0xA2, 0xA4, 0x60, 0x61, 0x68, 0x0A, 0x0D, 0x11, 0x12, 0x5B,
     ];
-    let tails = [b"INT0".as_slice(), b"BUF0", b"PKG0", b"FLD0", b"MTX0", b"EVT0", b"DEV0", b"MTH0"];
+    let tails = [
+        b"INT0".as_slice(),
+        b"BUF0",
+        b"PKG0",
+        b"FLD0",
+        b"MTX0",
+        b"EVT0",
+        b"DEV0",
+        b"MTH0",
+    ];
     let mut faults = 0;
     for _ in 0..3000
     {
@@ -1101,7 +1496,9 @@ fn arbitrary_method_bodies_evaluate_to_a_result_or_a_fault()
             match rand() % 4
             {
                 0 => body.push(lead[usize::try_from(rand() % lead.len() as u64).unwrap()]),
-                1 => body.extend_from_slice(tails[usize::try_from(rand() % tails.len() as u64).unwrap()]),
+                1 => body.extend_from_slice(
+                    tails[usize::try_from(rand() % tails.len() as u64).unwrap()],
+                ),
                 _ => body.push(u8::try_from(rand() & 0xFF).unwrap()),
             }
         }
@@ -1112,11 +1509,11 @@ fn arbitrary_method_bodies_evaluate_to_a_result_or_a_fault()
         let failed = {
             let mut ev = Evaluator::new(&mut ns, &mut sim);
             let _ = ev.run_module_code();
-            ev.evaluate_path("\\TEST", vec![Data::Integer(1), Data::Buffer(vec![0; 4])]).is_err()
+            ev.evaluate_path("\\TEST", vec![Data::Integer(1), Data::Buffer(vec![0; 4])])
+                .is_err()
         };
         faults += usize::from(failed);
         assert!(!sim.gl_held);
     }
     assert!(faults > 0);
 }
-

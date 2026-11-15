@@ -23,7 +23,7 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 
 /// A handshaken QMP connection.
 struct Client

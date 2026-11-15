@@ -31,7 +31,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result};
 
 use crate::arch::Arch;
 use crate::cli::TestVmgenidArgs;

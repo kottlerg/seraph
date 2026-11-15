@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use json::{Value, json};
 
 use crate::cli::{BootHostArgs, HostArgs};
@@ -652,12 +652,12 @@ impl Admission
 pub enum Attempt
 {
     Refused(String),
-    Failed(anyhow::Error),
+    Failed(crate::error::Error),
 }
 
-impl From<anyhow::Error> for Attempt
+impl From<crate::error::Error> for Attempt
 {
-    fn from(err: anyhow::Error) -> Self
+    fn from(err: crate::error::Error) -> Self
     {
         Attempt::Failed(err)
     }

@@ -15,7 +15,7 @@ use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use crate::error::{Context, Result};
 use boot_protocol::role_guids;
 use clap::ValueEnum;
 
@@ -293,7 +293,7 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> 
     let bundle_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
     if !bundle_path.exists()
     {
-        anyhow::bail!(
+        crate::error::bail!(
             "mkdisk: {} missing — run `cargo xtask build` (default-init bundle) or \
              `cargo xtask compose-bundle --harness {{init,ktest}}` first",
             bundle_path.display()
@@ -490,7 +490,7 @@ fn image_layout(main_image: &Path, data_image: &Path) -> Result<DiskLayout>
     {
         512 => BlockSize::B512,
         4096 => BlockSize::B4096,
-        other => anyhow::bail!(
+        other => crate::error::bail!(
             "{} has {other}-byte blocks, which mkdisk does not author",
             main_image.display()
         ),

@@ -12,7 +12,7 @@
 //! caller gives, so two authorings of one table are byte-identical. In-tree code replaces a
 //! registry crate here (`docs/coding-standards.md` § Dependencies).
 
-use anyhow::{Context, Result, bail, ensure};
+use crate::error::{Context, Result, bail, ensure};
 
 /// A GUID in its on-disk byte order: the first three fields little-endian, the last eight
 /// bytes as written (the `EFI_GUID` layout). The Seraph role GUIDs of

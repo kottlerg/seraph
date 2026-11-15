@@ -13,7 +13,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use object::{Object as _, ObjectSection as _, ObjectSymbol as _, SymbolKind};
 
 /// The largest fixed frame, in bytes, of a function in the riscv64 kernel

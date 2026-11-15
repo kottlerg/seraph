@@ -31,7 +31,7 @@ use std::io::Read as _;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use json::{Value, json};
 
 use crate::cli::{HookArgs, HookEvent};

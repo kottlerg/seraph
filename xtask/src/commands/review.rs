@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use json::{Map, Value, json};
 
 use crate::cli::{ReviewCheckArgs, ReviewLedgerArgs};

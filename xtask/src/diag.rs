@@ -11,7 +11,7 @@
 
 use std::fmt;
 
-use anyhow::{Result, bail};
+use crate::error::{Result, bail};
 
 /// Rule severity. A warning is printed and counted; it fails the command only
 /// under `Strictness::Strict`.

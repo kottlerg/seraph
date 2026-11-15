@@ -16,8 +16,8 @@
 //! `rustc_demangle`, and a compressed debug section is refused; rustc writes
 //! its DWARF uncompressed unless asked otherwise.
 
+use crate::error::{Context as _, Result, bail};
 use addr2line::gimli::{self, EndianSlice, RunTimeEndian};
-use anyhow::{Context as _, Result, bail};
 use object::{
     CompressionFormat, Object as _, ObjectSection as _, ObjectSegment as _, ObjectSymbol as _,
     SegmentFlags, SymbolKind,

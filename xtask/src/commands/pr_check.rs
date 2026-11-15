@@ -25,7 +25,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use json::Value;
 use regex::Regex;
 

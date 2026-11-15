@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;

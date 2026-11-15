@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result};
 
 /// A Cargo build profile: the debug build or the `--release` build.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

@@ -344,7 +344,9 @@ funds the pool itself and maps the run again, at most four times:
    admitted against the max beside that run's pages. It then
    selects a contiguous run of the admitted size from the free pool, or of two when no four-page
    run is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
-   donates a single page.
+   donates a single page. A fault in a committed region instead draws a two-page donation from the
+   region's page-table reservation, which carries its charge, and admits nothing
+   ([Commit](#commit)).
 2. It records the run on the process's entry like a grant it did not map: no mapped VA and no
    region id, charged to the budget node. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take
    it back.
@@ -685,9 +687,11 @@ userspace RAM, is the distributor. The kernel accounts; memmgr decides which cha
 separate from the process record. A node has a parent link, an optional max in pages, and a charge
 counter for its subtree: the pages charged to the node and to every node below it. A process record
 points at a node; nothing assumes one node per process. The charge covers each grant, demand-fault
-run and page-table donation memmgr accounts to the process ([Per-Process
-Tracking](#per-process-tracking)), and each such run on the deferred list until it rejoins the free
-pool ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
+run of an uncommitted region and page-table donation memmgr accounts to the process ([Per-Process
+Tracking](#per-process-tracking)), each committed region's pages and what is left of its page-table
+reservation, charged whole when the region is committed whether or not its pages hold frames
+([Commit](#commit)), and each such run on the deferred list until it rejoins the free pool
+([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
 index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
 process while a node below it is alive or a run charged to it is on the deferred list, and its
 charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
@@ -762,33 +766,48 @@ policy](#distribution-policy)). So no charge takes a free page a committed regio
 free pages outside it ([Memory pressure](#memory-pressure)).
 
 **What a commitment holds.** A committed region of `pages` pages charges its budget node its
-pages and a page-table reservation: the intermediate page tables a map of the whole region can need
-under any paging depth (`pool_funding::pt_pages_for`), and `PT_RESERVE_SLACK` pages for the
-rounding of the last donation and the page the kernel keeps of a donation
-([docs/limits.md](../../../docs/limits.md) § memmgr). It adds those to `promised` with a metadata
+pages and a page-table reservation: two pages (`PT_DONATION_PAGES`, the size of its page-table
+donations; see Faults below) for each intermediate page table a map of the whole region can need
+under any paging depth (`pool_funding::pt_pages_for`). It adds those to `promised` with a metadata
 bound: for each chunk, a run descriptor for each of its pages, its leaf and its share of the
 directory nodes, and one directory node for each level of the table, in arena pages
 ([Chunk table](#chunk-table), [Metadata Arena](#metadata-arena)). The max of the node and its
 ancestors bounds the pages and the reservation; the metadata bound is charged to no node, as
 memmgr's metadata never is. Each part is computed from the region's whole length, so a region grown
-in many small steps is charged and promised what one registration of its final length would be.
-The computation is the host-tested `free-pool` module `commit`.
+in many small steps is charged and promised what one registration of its final length would be;
+the reservation is that of the largest length the region has had, since a cut keeps it (Shrink and
+release below). The computation is the host-tested `free-pool` module `commit`.
 
 **Faults.** A fault in a committed region is admitted without the budget and RAM tests of an
 uncommitted one, and its run is selected as any demand run's ([Demand faults](#demand-faults)).
 The run's pages were charged with the commitment, so recording the run charges nothing more and
 lowers `promised` by its pages. A page-table donation its map needs ([Client page-table
-funding](#client-page-table-funding)) is drawn from the region's reservation while enough of it is
-left: the donation's pages leave the reservation and `promised`, and are charged once, as the
-donation. A donation the reservation cannot cover is admitted as any other.
+funding](#client-page-table-funding)) is drawn from the region's reservation, two pages at a time,
+without admission: the donation's pages leave the reservation and `promised`, and are charged
+once, as the donation. The address space's page-table pool is shared, so any other mapping of the
+process can take the pages a donation leaves in it, and the reservation covers the region's
+donations whatever those mappings take. The kernel keeps at most one page of a donation for its
+bookkeeping, so each two-page donation adds at least one page, and a map that still runs out after
+a donation needs more pages than the pool held: the donations of one map take at most two pages for
+each page table it creates. The tables a committed region's maps create lie in its span and stay
+until it is unregistered, so they number at most `pool_funding::pt_pages_for` of its largest
+length, which the `commit` module's host tests check against a pool that every other mapping
+empties between two maps. A committed fault is still declined, with code 9, when its map fails as
+any map can: the free pool holds no two contiguous pages for a donation, a thread of the process
+maps between the rounds of one map and takes the donated pages faster than four rounds fund them,
+or the process unmapped pages of the region itself and reclaimed their page tables, after which a
+donation the reservation no longer covers is admitted as any other.
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
 the directory levels the shorter region does not need, and takes back each run on them, pooled or
 deferred ([Reclamation](#reclamation)). It releases the commitment of the pages cut: the charge of
-those that held no run and of the page-table reservation the shorter region does not need, at most
-what is left of it, and their part of `promised`. `UNREGISTER_REGION` and `PROCESS_DIED` release a
-committed region's whole commitment the same way.
+those that held no run, and their part of `promised`. It unmaps them without reclaiming page
+tables, so the tables of the pages cut stay in the address space until the region is unregistered,
+and the region keeps its page-table reservation: a regrowth up to the largest length the region has
+had adds none. `UNREGISTER_REGION` and `PROCESS_DIED` release a committed region's whole
+commitment: the charge of its pages that hold no run and of what is left of its reservation, and
+its part of `promised`.
 
 **Retries.** A committed registration or growth whose reply does not reach the caller is undone,
 as a grant whose reply fails is rolled back, so a caller whose call was interrupted makes it again

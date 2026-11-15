@@ -32,14 +32,14 @@ pub mod pool;
 pub mod pressure;
 
 pub use arena::{
-    Arena, ArenaLayout, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx,
+    Arena, ArenaLayout, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx,
     ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
 };
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
 };
 pub use chunk::{ChunkEntry, ChunkError, ChunkState};
-pub use commit::{CommitNeed, PT_RESERVE_SLACK};
+pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
 pub use ledger::{BackError, Commit, Ledger, RegionError, ResizeError};

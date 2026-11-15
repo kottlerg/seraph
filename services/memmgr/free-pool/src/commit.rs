@@ -15,7 +15,9 @@
 //! reservation are charged to the region's budget node when it is committed;
 //! the metadata bound is charged to no node, as memmgr's metadata never is.
 //! Each is computed from the region's whole length, so a region grown in many
-//! small extensions promises what one registration of its length would.
+//! small extensions promises what one registration of its length would. The
+//! reservation is that of the largest length the region has had, since a cut
+//! keeps the page tables of the pages it cuts ([`regrow_need`]).
 
 use crate::arena::SLOTS_PER_PAGE;
 use crate::chunk::table_height;
@@ -23,32 +25,40 @@ use crate::{CHUNK_BYTES, DEMAND_CHUNK_PAGES};
 
 use syscall_abi::PAGE_SIZE;
 
-/// Pages a committed region's page-table reservation holds beyond
-/// `pool_funding::pt_pages_for` of its length: two of memmgr's page-table
-/// donations, one for the rounding of the last donation up to the donation
-/// size, and one for the page the kernel keeps of a donation as its own
-/// bookkeeping (`SYS_CAP_CREATE_ASPACE`). A tuning value that bounds no
-/// capacity: a donation the reservation cannot cover is admitted as any other
+/// Pages of each page-table donation a committed region's fault draws from
+/// the region's reservation, and the pages the reservation holds for each
+/// intermediate page table a map of the region can need.
+///
+/// The address space's page-table pool is shared: any mapping of the process
+/// can take the pages a committed fault's donation left in it. The bound holds
+/// whatever they take. The kernel keeps at most one page of a donation for its
+/// own bookkeeping (`SYS_CAP_CREATE_ASPACE`), so each two-page donation gives
+/// the pool at least one page, and a map that still runs out after a donation
+/// needs more pages than the pool held: the donations one map makes number at
+/// most the page tables it creates, and take at most twice that many pages. The
+/// tables committed maps create lie in the region's span and stay until it is
+/// unregistered (a cut keeps them), so they number at most
+/// `pool_funding::pt_pages_for` of its largest length, and the donations at
+/// most [`pt_reserve`] of it. A map creates at most one table per level below
+/// the root, four, which the map's four funding rounds cover; a thread of the
+/// process that maps between two rounds of one map can take a donated page
+/// first, which costs that map a round
 /// (`services/memmgr/docs/memory-pool.md` § Commit).
-pub const PT_RESERVE_SLACK: u64 = 8;
+pub const PT_DONATION_PAGES: u64 = 2;
 
 /// Arena slots one chunk of a committed region can take at most: a run
 /// descriptor for each of its pages, its leaf, and its share of the
 /// directory nodes above it, which number fewer than its table's chunks.
 const META_SLOTS_PER_CHUNK: u64 = DEMAND_CHUNK_PAGES as u64 + 2;
 
-/// The page-table reservation of a committed region of `pages` pages: the
-/// intermediate page tables a map of the whole region can need under any
-/// paging depth (`pool_funding::pt_pages_for`), and [`PT_RESERVE_SLACK`].
+/// The page-table reservation of a committed region of `pages` pages:
+/// [`PT_DONATION_PAGES`] for each intermediate page table a map of the whole
+/// region can need under any paging depth (`pool_funding::pt_pages_for`).
 /// Zero for no pages.
 #[must_use]
 pub const fn pt_reserve(pages: u64) -> u64
 {
-    if pages == 0
-    {
-        return 0;
-    }
-    pool_funding::pt_pages_for(pages).saturating_add(PT_RESERVE_SLACK)
+    pool_funding::pt_pages_for(pages).saturating_mul(PT_DONATION_PAGES)
 }
 
 /// The metadata-arena pages a committed region of `len` bytes can take at
@@ -96,16 +106,38 @@ impl CommitNeed
 }
 
 /// What a committed region's growth from `old_len` to `new_len` bytes adds
-/// (a registration grows it from 0). Each part is its value at `new_len` less
-/// its value at `old_len`, so nothing is added for a `new_len` at or below
-/// `old_len`.
+/// when it has never been longer than `old_len` (a registration grows it from
+/// 0): [`regrow_need`] with `old_len` as the largest length.
 #[must_use]
 pub const fn grow_need(old_len: u64, new_len: u64) -> CommitNeed
 {
+    regrow_need(old_len, old_len, new_len)
+}
+
+/// What a committed region's growth from `old_len` to `new_len` bytes adds
+/// when the largest length it has had is `high_len`, at least `old_len`. The
+/// data pages and the metadata bound are each their value at `new_len` less
+/// their value at `old_len`. The page-table reservation is its value at the
+/// larger of `new_len` and `high_len` less its value at `high_len`: a cut
+/// keeps the page tables and the reservation of the pages it cut, so a regrowth
+/// up to `high_len` adds none. Nothing is added for a `new_len` at or below
+/// `old_len`.
+#[must_use]
+pub const fn regrow_need(old_len: u64, high_len: u64, new_len: u64) -> CommitNeed
+{
     let (old_pages, new_pages) = (old_len / PAGE_SIZE, new_len / PAGE_SIZE);
+    let high_pages = high_len / PAGE_SIZE;
+    let top_pages = if new_pages > high_pages
+    {
+        new_pages
+    }
+    else
+    {
+        high_pages
+    };
     CommitNeed {
         pages: new_pages.saturating_sub(old_pages),
-        pt: pt_reserve(new_pages).saturating_sub(pt_reserve(old_pages)),
+        pt: pt_reserve(top_pages).saturating_sub(pt_reserve(high_pages)),
         meta: meta_bound(new_len).saturating_sub(meta_bound(old_len)),
     }
 }
@@ -145,10 +177,77 @@ mod tests
     {
         assert_eq!(pt_reserve(0), 0);
         // One page touches one table at each of four levels below the root.
-        assert_eq!(pt_reserve(1), 4 + PT_RESERVE_SLACK);
+        assert_eq!(pt_reserve(1), 4 * PT_DONATION_PAGES);
         // 513 pages can straddle two tables at each level.
-        assert_eq!(pt_reserve(513), 2 * 4 + PT_RESERVE_SLACK);
+        assert_eq!(pt_reserve(513), 2 * 4 * PT_DONATION_PAGES);
         assert_eq!(grow_need(PAGE_SIZE, PAGE_SIZE), grow_need(0, 0));
+    }
+
+    #[test]
+    fn a_regrowth_below_the_largest_length_adds_no_reservation()
+    {
+        let (chunk, high) = (CHUNK_BYTES, 40 * CHUNK_BYTES);
+        let back = regrow_need(5 * chunk, high, 30 * chunk);
+        assert_eq!(back.pt, 0);
+        assert_eq!(back.pages, grow_need(5 * chunk, 30 * chunk).pages);
+        assert_eq!(back.meta, grow_need(5 * chunk, 30 * chunk).meta);
+        let past = regrow_need(5 * chunk, high, 600 * chunk);
+        assert_eq!(past.pt, grow_need(high, 600 * chunk).pt);
+        assert_eq!(regrow_need(5 * chunk, high, 5 * chunk), grow_need(0, 0));
+    }
+
+    /// Page-table donations of a committed region's maps, against a model of
+    /// the address space's shared page-table pool in which every other mapping
+    /// takes whatever the pool holds between two of memmgr's maps, and the
+    /// kernel keeps a page of every donation, or of every other one, for its
+    /// bookkeeping: the pages drawn stay within the reservation, and no map
+    /// needs more donations than its funding rounds allow.
+    #[test]
+    fn committed_donations_stay_within_the_reservation_however_the_pool_is_shared()
+    {
+        const LEVELS: u32 = 4;
+        const ROUNDS: u64 = 4;
+        let chunk_pages = u64::from(DEMAND_CHUNK_PAGES);
+        // A region that starts one chunk short of a 2 MiB table's end, so it
+        // straddles tables at every level.
+        let base_page = (1 << 27) - chunk_pages;
+        for (chunks, keep_every) in [(1, 1), (40, 1), (40, 2), (2_000, 1), (2_000, 2)]
+        {
+            let pages = chunks * chunk_pages;
+            let mut tables = std::collections::BTreeSet::new();
+            let (mut pool, mut drawn, mut donations) = (0u64, 0u64, 0u64);
+            // Touch the chunks in a scattered order.
+            for i in 0..chunks
+            {
+                let c = (i * 7919) % chunks;
+                let page = base_page + c * chunk_pages;
+                let need = (1..=LEVELS)
+                    .filter(|&level| tables.insert((level, page >> (9 * level))))
+                    .count();
+                let need = u64::try_from(need).unwrap();
+                let mut rounds = 0;
+                while pool < need
+                {
+                    assert!(
+                        rounds < ROUNDS,
+                        "{chunks} chunks: chunk {c} ran out of rounds"
+                    );
+                    donations += 1;
+                    drawn += PT_DONATION_PAGES;
+                    let kept = u64::from(donations % keep_every == 0);
+                    pool += PT_DONATION_PAGES - kept;
+                    rounds += 1;
+                }
+                // The map takes `need` pages, and every other mapping takes the
+                // rest of what the pool holds.
+                pool = 0;
+            }
+            assert!(
+                drawn <= pt_reserve(pages),
+                "{chunks} chunks: drew {drawn} of {}",
+                pt_reserve(pages)
+            );
+        }
     }
 
     #[test]

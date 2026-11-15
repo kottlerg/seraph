@@ -34,7 +34,7 @@
 //! § Commit).
 
 use crate::arena::{
-    Arena, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessCaps,
+    Arena, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessCaps,
     ProcessRecord, RegionNode, Slot, SlotStore,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
@@ -569,7 +569,17 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         let node = RegionNode {
             region,
             table: NODE_NULL,
-            commit: committed.then_some(need.pt),
+            commit: if committed
+            {
+                Commitment {
+                    pt_left: need.pt,
+                    high_len: region.len,
+                }
+            }
+            else
+            {
+                Commitment::NONE
+            },
         };
         let idx = self
             .arena
@@ -609,7 +619,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             if cur == reg
             {
-                return have.commit.map(|_| have).ok_or(ResizeError::NotCommitted);
+                return have
+                    .commit
+                    .get()
+                    .map(|_| have)
+                    .ok_or(ResizeError::NotCommitted);
             }
             cur = self.arena.get(cur).next;
         }
@@ -619,8 +633,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Grow the committed region `reg` of `rec` to `new_len` bytes in place,
     /// raising its chunk table to the new length's height
     /// ([`chunk::raise`]), and charge and promise the growth as
-    /// [`Ledger::add_region`] does ([`commit::grow_need`]); admitting it is the
-    /// caller's. A `new_len` equal to the length changes nothing.
+    /// [`Ledger::add_region`] does, against the largest length the region has
+    /// had ([`commit::regrow_need`]); admitting it is the caller's. A `new_len`
+    /// equal to the length changes nothing.
     ///
     /// # Errors
     /// [`ResizeError::NoRegion`], [`ResizeError::NotCommitted`],
@@ -675,9 +690,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return Err(ResizeError::NoSlot);
         }
-        let need = commit::grow_need(old_len, new_len);
+        let high_len = node.commit.high_len;
+        let need = commit::regrow_need(old_len, high_len, new_len);
         node.region = new_region;
-        node.commit = node.commit.map(|pt| pt.saturating_add(need.pt));
+        node.commit = Commitment {
+            pt_left: node.commit.pt_left.saturating_add(need.pt),
+            high_len: high_len.max(new_len),
+        };
         self.arena.set_node(reg, Node::Region(node));
         budget::charge(&mut self.arena, r.budget, need.charged());
         self.promised = self.promised.saturating_add(need.promised());
@@ -689,10 +708,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// ([`chunk::truncate`]), taking each run of the chunks cut back, pooled or
     /// deferred as `quiescent` decides, and release the commitment of the
     /// pages cut: their charge, less the runs' (which retire as any run does),
-    /// the page-table reservation the shorter region no longer needs, at most
-    /// what is left of it, and their part of `promised`. memmgr unmaps the
-    /// pages cut first, so their mappings keep no run deferred. A `new_len`
-    /// equal to the length changes nothing.
+    /// and their part of `promised`. The page-table reservation stays whole:
+    /// memmgr unmaps the pages cut first without reclaiming page tables, so the
+    /// tables of the pages cut stay in the address space until the region is
+    /// unregistered, and a regrowth up to the largest length the region has had
+    /// adds no reservation ([`commit::regrow_need`]). Their mappings gone, the
+    /// pages cut keep no run deferred. A `new_len` equal to the length changes
+    /// nothing.
     ///
     /// # Errors
     /// [`ResizeError::NoRegion`], [`ResizeError::NotCommitted`], or
@@ -754,17 +776,49 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             });
         }
         let cut = commit::grow_need(new_len, old_len);
-        let left = node.commit.unwrap_or(0);
-        let pt = cut.pt.min(left);
         // The runs cut lay in the pages cut, so their pages are at most those.
         let unbacked = cut.pages.saturating_sub(run_pages);
         node.region = new_region;
-        node.commit = Some(left.saturating_sub(pt));
         self.arena.set_node(reg, Node::Region(node));
-        budget::uncharge(&mut self.arena, charged, unbacked.saturating_add(pt));
+        budget::uncharge(&mut self.arena, charged, unbacked);
         self.promised = self
             .promised
-            .saturating_sub(unbacked.saturating_add(pt).saturating_add(cut.meta));
+            .saturating_sub(unbacked.saturating_add(cut.meta));
+        Ok(())
+    }
+
+    /// Undo [`Ledger::extend_region`] of the committed region `reg` of `rec`
+    /// from `old_len` bytes, when the largest length it had before was
+    /// `old_high`: cut it back ([`Ledger::shrink_region`]) and release the
+    /// page-table reservation the growth added, so a caller that repeats the
+    /// growth is charged once. No fault was served since the growth, so no run
+    /// lies past `old_len`.
+    ///
+    /// # Errors
+    /// As [`Ledger::shrink_region`]; the reservation then stays.
+    pub fn undo_extend(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        old_len: u64,
+        old_high: u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Result<(), ResizeError>
+    {
+        self.shrink_region(rec, reg, old_len, quiescent)?;
+        let mut node = self.committed_region(rec, reg)?;
+        let charged = self.record(rec).ok_or(ResizeError::NoRegion)?.budget;
+        let high_len = old_high.min(node.commit.high_len);
+        let added = commit::pt_reserve(node.commit.high_len / PAGE_SIZE)
+            .saturating_sub(commit::pt_reserve(high_len / PAGE_SIZE))
+            .min(node.commit.pt_left);
+        node.commit = Commitment {
+            pt_left: node.commit.pt_left.saturating_sub(added),
+            high_len,
+        };
+        self.arena.set_node(reg, Node::Region(node));
+        budget::uncharge(&mut self.arena, charged, added);
+        self.promised = self.promised.saturating_sub(added);
         Ok(())
     }
 
@@ -772,7 +826,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     #[must_use]
     pub fn is_committed(&self, reg: NodeIdx) -> bool
     {
-        self.region_node(reg).is_some_and(|n| n.commit.is_some())
+        self.region_node(reg)
+            .is_some_and(|n| n.commit.get().is_some())
     }
 
     /// The pages left of the page-table reservation of region `reg`: 0 for an
@@ -780,7 +835,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     #[must_use]
     pub fn pt_reserve(&self, reg: NodeIdx) -> u64
     {
-        self.region_node(reg).and_then(|n| n.commit).unwrap_or(0)
+        self.region_node(reg)
+            .and_then(|n| n.commit.get())
+            .map_or(0, |c| c.pt_left)
     }
 
     /// Draw `pages` from the page-table reservation of the committed region
@@ -798,12 +855,12 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         {
             return false;
         };
-        let Some(left) = node.commit.and_then(|pt| pt.checked_sub(pages))
+        let Some(left) = node.commit.get().and_then(|c| c.pt_left.checked_sub(pages))
         else
         {
             return false;
         };
-        node.commit = Some(left);
+        node.commit.pt_left = left;
         self.arena.set_node(reg, Node::Region(node));
         budget::uncharge(&mut self.arena, r.budget, pages);
         self.promised = self.promised.saturating_sub(pages);
@@ -944,7 +1001,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(BackError::NoSlot);
         }
         self.arena.set_node(reg, Node::Region(node));
-        if node.commit.is_some()
+        if node.commit.get().is_some()
         {
             self.promised = self.promised.saturating_sub(u64::from(frame.page_count));
         }
@@ -1020,11 +1077,11 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
             });
         }
-        if let Some(pt) = node.commit
+        if let Some(c) = node.commit.get()
         {
             // The runs lay in the region, so their pages are at most its own.
             let unbacked = (node.region.len / PAGE_SIZE).saturating_sub(run_pages);
-            let held = unbacked.saturating_add(pt);
+            let held = unbacked.saturating_add(c.pt_left);
             budget::uncharge(&mut self.arena, charged, held);
             self.promised = self
                 .promised
@@ -1777,9 +1834,9 @@ mod tests
             {
                 // A committed region is charged its length and reservation,
                 // its runs within them.
-                pages += match have.commit
+                pages += match have.commit.get()
                 {
-                    Some(pt) => have.region.len / PAGE_SIZE + pt,
+                    Some(c) => have.region.len / PAGE_SIZE + c.pt_left,
                     None => run_pages(l, &have),
                 };
                 reg = l.arena.get(reg).next;
@@ -1813,10 +1870,10 @@ mod tests
         for idx in 0..l.arena.pages() * crate::SLOTS_PER_PAGE
         {
             if let Node::Region(have) = l.arena.get(idx).node
-                && let Some(pt) = have.commit
+                && let Some(c) = have.commit.get()
             {
                 pages += have.region.len / PAGE_SIZE - run_pages(l, &have)
-                    + pt
+                    + c.pt_left
                     + commit::meta_bound(have.region.len);
             }
         }
@@ -2266,14 +2323,26 @@ mod tests
         assert_eq!((usage(&l, rec), promised(&l)), before);
         // Cut to 5 chunks: the runs of chunks 5 and 39 go back, and the region
         // holds what one of 5 chunks with chunk 0 backed holds.
+        // The page-table reservation stays that of 40 chunks.
         let free = l.pool.free_pages();
         l.shrink_region(rec, reg, 5 * CHUNK, pool_all).unwrap();
         assert_eq!(l.pool.free_pages(), free + 32);
         let five = commit::grow_need(0, 5 * CHUNK);
-        assert_eq!(usage(&l, rec).0, five.charged());
-        assert_eq!(promised(&l), five.promised() - 16);
+        let forty = commit::grow_need(0, 40 * CHUNK);
+        assert_eq!(usage(&l, rec).0, five.pages + forty.pt);
+        assert_eq!(promised(&l), five.pages - 16 + forty.pt + five.meta);
+        assert_eq!(l.pt_reserve(reg), forty.pt);
         assert_eq!(l.chunk_at(reg, BASE).backed(), 0xFFFF);
         assert!(l.region_for(rec, BASE + 5 * CHUNK).is_none());
+        // Grown back to 40 chunks, it adds no reservation; undone, the growth
+        // releases what it added, which here is none.
+        l.extend_region(rec, reg, 40 * CHUNK).unwrap();
+        assert_eq!(usage(&l, rec).0, forty.charged());
+        assert_eq!(promised(&l), forty.promised() - 16);
+        l.undo_extend(rec, reg, 5 * CHUNK, 40 * CHUNK, pool_all)
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, five.pages + forty.pt);
+        assert_eq!(l.pt_reserve(reg), forty.pt);
         // A top inside a chunk that holds nothing past it is accepted.
         l.shrink_region(rec, reg, 4 * CHUNK + PAGE_SIZE, pool_all)
             .unwrap();
@@ -2297,10 +2366,36 @@ mod tests
         back_whole(&mut l, rec, reg, 3);
         l.shrink_region(rec, reg, 2 * CHUNK, |_| false).unwrap();
         assert_eq!(l.deferred.pages(), 16);
-        let two = commit::grow_need(0, 2 * CHUNK);
-        assert_eq!(usage(&l, rec).0, two.charged() + 16);
-        assert_eq!(promised(&l), two.promised());
+        let (two, four) = (
+            commit::grow_need(0, 2 * CHUNK),
+            commit::grow_need(0, 4 * CHUNK),
+        );
+        assert_eq!(usage(&l, rec).0, two.pages + four.pt + 16);
+        assert_eq!(promised(&l), two.pages + four.pt + two.meta);
         l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
-        assert_eq!(usage(&l, rec).0, two.charged());
+        assert_eq!(usage(&l, rec).0, two.pages + four.pt);
+    }
+
+    #[test]
+    fn an_undone_extension_releases_the_reservation_it_added()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Committed)
+            .unwrap();
+        back_whole(&mut l, rec, reg, 1);
+        let before = (usage(&l, rec), promised(&l), l.pt_reserve(reg));
+        l.extend_region(rec, reg, 600 * CHUNK).unwrap();
+        assert_eq!(l.pt_reserve(reg), commit::grow_need(0, 600 * CHUNK).pt);
+        l.undo_extend(rec, reg, 4 * CHUNK, 4 * CHUNK, pool_all)
+            .unwrap();
+        assert_eq!((usage(&l, rec), promised(&l), l.pt_reserve(reg)), before);
+        // Repeated, the growth is charged once.
+        l.extend_region(rec, reg, 600 * CHUNK).unwrap();
+        assert_eq!(
+            usage(&l, rec).0,
+            commit::grow_need(0, 600 * CHUNK).charged()
+        );
     }
 }

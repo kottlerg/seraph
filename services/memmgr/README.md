@@ -181,7 +181,6 @@ The remaining constants are tuning values that bound no capacity:
 | `DEFERRED_RECHECK_WINDOWS` | 256 windows | Mapping-count windows one recheck spends; the run that crosses the budget is still read whole |
 | `PROCESS_INDEX_VA`..`PROCESS_INDEX_END` | 1 GiB | Bucket-array window; past it chains lengthen |
 | `SYSTEM_RESERVE_DIVISOR` | 64 | The system reserve is `pool_total / 64` free pages, which only a reserve budget node's charge may take; the pressure level is `CRITICAL` at or below it |
-| `PT_RESERVE_SLACK` | 8 pages | Pages a committed region's page-table reservation holds beyond `pool_funding::pt_pages_for` of its length |
 | `PRESSURE_LOW_DIVISOR` | 16 | The pressure level is `LOW` below `pool_total / 16` free pages outside `promised` ([`docs/memory-pool.md`](docs/memory-pool.md) § Memory pressure) |
 | `PRESSURE_BAND_DIVISOR` | 128 | Hysteresis band of `pool_total / 128` pages, at least one, that the free pool clears before the level improves |
 

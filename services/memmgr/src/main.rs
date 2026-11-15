@@ -21,9 +21,10 @@
 use free_pool::{
     ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Fit, FrameDesc,
     FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
-    NodeIdx, NodeSpec, PressureLevel, RecheckBudget, RegionError, ResizeError, SelectError,
-    SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk::table_height, chunk_count,
-    chunk_for, commit::grow_need, fault_window, pressure_level, region_grants, reserve_pages,
+    NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError, ResizeError,
+    SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk::table_height,
+    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pressure_level,
+    region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -604,8 +605,11 @@ fn return_taken(l: &mut MemLedger, cap_slot: u64, pages: u32, phys_base: u64)
 const ASPACE_TOPUP_PAGES: u32 = 4;
 
 /// The smallest donation [`fund_client_page_tables`] makes to a client's
-/// page-table pool, when [`ASPACE_TOPUP_PAGES`] is not free or not admitted.
+/// page-table pool, when [`ASPACE_TOPUP_PAGES`] is not free or not admitted,
+/// and the donation a committed region's fault draws from its reservation
+/// (`free_pool::PT_DONATION_PAGES`).
 const CLIENT_TOPUP_MIN_PAGES: u32 = 2;
+const _: () = assert!(CLIENT_TOPUP_MIN_PAGES as u64 == PT_DONATION_PAGES);
 
 /// Page-table top-ups one map attempts before giving up: a self-map
 /// ([`map_self`]) or a demand chunk's map into a client
@@ -1793,28 +1797,31 @@ const fn commit_refusal(e: ChargeError) -> u64
     }
 }
 
-/// The committed region of the record `rec` based at `va_base`, its slot and
-/// its length.
-fn committed_region(l: &MemLedger, rec: NodeIdx, va_base: u64) -> Option<(NodeIdx, u64)>
+/// The committed region of the record `rec` based at `va_base`: its slot, its
+/// length and the largest length it has had.
+fn committed_region(l: &MemLedger, rec: NodeIdx, va_base: u64) -> Option<(NodeIdx, u64, u64)>
 {
-    l.region_based(rec, va_base)
-        .filter(|(_, node)| node.commit.is_some())
-        .map(|(reg, node)| (reg, node.region.len))
+    l.region_based(rec, va_base).and_then(|(reg, node)| {
+        node.commit
+            .get()
+            .map(|c| (reg, node.region.len, c.high_len))
+    })
 }
 
 /// Grow a committed region of the calling process in place:
 /// `[va_base, new_len)` from `data[0]` and `data[1]`
 /// (services/memmgr/docs/ipc-interface.md § Label 12). The growth is admitted
-/// and charged as a committed registration of it ([`admit_commit`]), and
-/// the region's chunk table gains the levels the new length needs. A reply
-/// that does not reach the caller shrinks the region back, so a caller whose
-/// call was interrupted repeats it.
+/// and charged as a committed registration of it ([`admit_commit`]), its
+/// page-table reservation against the largest length the region has had
+/// ([`regrow_need`]), and the region's chunk table gains the levels the new
+/// length needs. A reply that does not reach the caller undoes the growth, so a
+/// caller whose call was interrupted repeats it.
 fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let va_base = req.word(0);
     let new_len = req.word(1);
     let l = ledger_mut();
-    let Some((rec, (reg, len))) = l
+    let Some((rec, (reg, len, high))) = l
         .find(req.badge)
         .and_then(|rec| committed_region(l, rec, va_base).map(|r| (rec, r)))
     else
@@ -1832,7 +1839,7 @@ fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    if let Err(e) = admit_commit(l, rec, grow_need(len, new_len))
+    if let Err(e) = admit_commit(l, rec, regrow_need(len, high, new_len))
     {
         reply_label(ipc_buf, commit_refusal(e));
         return;
@@ -1868,7 +1875,7 @@ fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
     {
         // As in [`handle_register_region`]: undo the growth the caller did
         // not learn of. No fault was served since, so no run lies past `len`.
-        let _ = l.shrink_region(rec, reg, len, quiescent);
+        let _ = l.undo_extend(rec, reg, len, high, quiescent);
     }
 }
 
@@ -1877,15 +1884,16 @@ fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
 /// (services/memmgr/docs/ipc-interface.md § Label 13): unmap the pages past
 /// it from the client address space, then cut the chunks past it from the
 /// region's chunk table, taking each run back, pooled or deferred, and
-/// releasing the commitment of the pages cut
-/// (`free_pool::Ledger::shrink_region`). A repeat finds the region at the new
+/// releasing the commitment of the pages cut; their page tables and the
+/// region's page-table reservation stay (`free_pool::Ledger::shrink_region`).
+/// A repeat finds the region at the new
 /// length and succeeds, so an interrupted call is safe to repeat.
 fn handle_shrink_region(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let va_base = req.word(0);
     let new_len = req.word(1);
     let l = ledger_mut();
-    let Some((rec, (reg, len))) = l
+    let Some((rec, (reg, len, _))) = l
         .find(req.badge)
         .and_then(|rec| committed_region(l, rec, va_base).map(|r| (rec, r)))
     else
@@ -1902,12 +1910,14 @@ fn handle_shrink_region(req: &IpcMessage, ipc_buf: *mut u64)
     {
         let aspace_cap = l.aspace_cap(rec);
         // Clear the cut pages' PTEs before their runs can reach another
-        // owner, as [`handle_unregister_region`] does for a whole region.
+        // owner, as [`handle_unregister_region`] does for a whole region, but
+        // keep the page tables: the region's page-table reservation covers
+        // each table its maps create once (`free_pool::PT_DONATION_PAGES`).
         // SAFETY: `aspace_cap` is a client address space procmgr delegated
         // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
         // memmgr runs on.
         let _ = unsafe {
-            syscall::mem_unmap_reclaim(
+            syscall::mem_unmap(
                 aspace_cap,
                 va_base.saturating_add(new_len),
                 len.saturating_sub(new_len) / PAGE_SIZE,
@@ -2459,9 +2469,11 @@ fn map_client_chunk(
 /// only once the run is recorded, and is charged to the budget node, so only
 /// `PROCESS_DIED` reclaims it, once the address space's teardown has released
 /// the donation (services/memmgr/docs/memory-pool.md § Client page-table
-/// funding). For a fault in a committed region, a donation the region's
-/// page-table reservation covers is drawn from it instead of admitted
-/// (`free_pool::Ledger::draw_pt_reserve`; § Commit), so it is charged once.
+/// funding). For a fault in a committed region, the donation is drawn from the
+/// region's page-table reservation instead of admitted, two pages at a time
+/// (`free_pool::PT_DONATION_PAGES`, which the reservation is sized for;
+/// `free_pool::Ledger::draw_pt_reserve`; § Commit), so it is charged once and
+/// never refused for budget or RAM.
 /// memmgr keeps the run's cap as the reclaim anchor. A refused donation
 /// returns the run to the pool. The arena keeps `target.held` free slots
 /// beside the run's descriptor, for the caller's demand chunk.
@@ -2483,15 +2495,20 @@ fn fund_client_page_tables(
     {
         return Err(FundRefusal::Failed);
     }
-    let reserved = target.committed.map_or(0, |reg| l.pt_reserve(reg));
-    let first = if reserved >= u64::from(ASPACE_TOPUP_PAGES)
-        || admit(l, rec, u64::from(ASPACE_TOPUP_PAGES), pending).is_ok()
-    {
-        ASPACE_TOPUP_PAGES
-    }
-    else if reserved >= u64::from(CLIENT_TOPUP_MIN_PAGES)
+    // A committed fault's donation is drawn from its region's reservation, in
+    // donations of the size the reservation is computed for. One it does not
+    // cover, which only a process that unmapped its own committed pages can
+    // meet, is admitted as any other.
+    let drawn = target
+        .committed
+        .is_some_and(|reg| l.pt_reserve(reg) >= PT_DONATION_PAGES);
+    let first = if drawn
     {
         CLIENT_TOPUP_MIN_PAGES
+    }
+    else if admit(l, rec, u64::from(ASPACE_TOPUP_PAGES), pending).is_ok()
+    {
+        ASPACE_TOPUP_PAGES
     }
     else
     {
@@ -2533,10 +2550,10 @@ fn fund_client_page_tables(
     }
     if syscall::cap_create_aspace(outer, aspace_cap, u64::from(pages)).is_ok()
     {
-        // A donation the reservation covers was not admitted: draw it, so the
-        // charge `push_frame` made is the reservation's, not a second one.
+        // A drawn donation was not admitted: draw it from the reservation, so
+        // the charge `push_frame` made is the reservation's, not a second one.
         if let Some(reg) = target.committed
-            && reserved >= u64::from(pages)
+            && drawn
         {
             l.draw_pt_reserve(rec, reg, u64::from(pages));
         }

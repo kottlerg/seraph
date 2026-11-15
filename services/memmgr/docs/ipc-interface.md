@@ -502,7 +502,8 @@ lazily on fault, and only once procmgr has delegated this process's
 region's whole length before it registers it: its pages and a page-table
 reservation to the caller's budget node, and those and a metadata bound to
 `promised` (`QUERY_POOL_STATUS` `data[8]`). A fault in a committed region is
-then never declined for budget or RAM (codes 7 and 10 below), and only a
+then never declined for budget or RAM (codes 7 and 10 below; its page-table
+donations draw on the region's reservation), and only a
 committed region grows by `EXTEND_REGION` (§ Label 12) or shrinks by
 `SHRINK_REGION` (§ Label 13). A refused commitment registers nothing. A reply
 that does not reach the caller unregisters the region again, as a grant whose
@@ -607,9 +608,12 @@ process's node, carries no caps and changes no state.
 | data[1] | `max_pages` — the node's max, `u64::MAX` for none |
 | data[2] | `subtree_pages` — pages charged to the node and to every node below it |
 
-The charge counts each grant, demand chunk and page-table donation memmgr
-accounts to the caller, and each such run held on the deferred list after the
-caller released it, until the run rejoins the free pool. A max below
+The charge counts each grant, demand chunk of an uncommitted region and
+page-table donation memmgr accounts to the caller, each committed region's
+pages and what is left of its page-table reservation, charged whole when the
+region is committed whether or not its pages hold frames (§ Label 7), and each
+such run held on the deferred list after the caller released it, until the run
+rejoins the free pool. A max below
 `subtree_pages` is not an error: a lowered max refuses new charges until the
 usage falls below it.
 
@@ -668,11 +672,13 @@ its base kept. Privilege: universal — attributed to the caller by
 
 memmgr admits and charges the growth as a committed registration of it:
 each part of the commitment is computed from the whole length, so a region
-grown in steps is charged what one registration of its final length would be
+grown in steps is charged what one registration of its final length would be,
+and the page-table reservation from the largest length the region has had, so
+a regrowth after a cut (§ Label 13) adds none up to it
 ([`memory-pool.md`](memory-pool.md) § Commit). The region's chunk table gains
 the directory levels the new length needs. A reply that does not reach the
-caller lowers the region to its old length again, so a caller whose call was
-interrupted makes it again without being charged twice.
+caller undoes the growth, its page-table reservation included, so a caller
+whose call was interrupted makes it again without being charged twice.
 
 **Reply (success):** `label` 0, also for a `new_len_bytes` equal to the
 length.
@@ -704,8 +710,9 @@ memmgr unmaps the pages past the new top from the caller's delegated
 `AddressSpace`, then cuts the chunks past it from the region's chunk table,
 returning each run on them to the free pool or the deferred list as
 `UNREGISTER_REGION` does (§ Label 9), and releases the commitment of the pages
-cut: their charge and their part of `promised`
-([`memory-pool.md`](memory-pool.md) § Commit). A repeat of a cut finds the
+cut: their charge and their part of `promised`. It keeps the page tables of
+the pages cut, and with them the region's page-table reservation, until the
+region is unregistered ([`memory-pool.md`](memory-pool.md) § Commit). A repeat of a cut finds the
 region at its new length and succeeds, so an interrupted call is safe to
 repeat.
 

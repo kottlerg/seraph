@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::error::{Context as _, Result, bail};
-use regex::Regex;
+use crate::regex::Regex;
 
 /// Version of the baseline file format `write_baseline` emits and
 /// `parse_baseline` accepts.
@@ -296,24 +296,29 @@ impl Scan
             self.ktest_start = Some(at);
             self.timing.boot_secs = Some(at);
         }
-        else if let Some(c) = p.tier.captures(msg)
+        else if let Some(tier) = p.tier.captures(msg).and_then(|c| c.get(1))
         {
             self.lose_open_cells(at);
             self.close_tier(at);
-            self.tier = Some((c[1].to_string(), at));
+            self.tier = Some((tier.as_str().to_string(), at));
         }
         else if msg.starts_with("passed=")
         {
             self.lose_open_cells(at);
             self.close_tier(at);
         }
-        else if let Some(c) = p.run.captures(msg).or_else(|| p.started.captures(msg))
+        else if let Some(name) = p
+            .run
+            .captures(msg)
+            .or_else(|| p.started.captures(msg))
+            .and_then(|c| c.get(1))
         {
-            self.open_cell(&c[1], at);
+            self.open_cell(name.as_str(), at);
         }
         else if let Some(c) = p.end.captures(msg)
+            && let (Some(verdict), Some(name)) = (c.get(1), c.get(2))
         {
-            let outcome = if &c[1] == "PASS"
+            let outcome = if verdict.as_str() == "PASS"
             {
                 CellOutcome::Pass
             }
@@ -321,7 +326,7 @@ impl Scan
             {
                 CellOutcome::Fail
             };
-            self.close_cell(&c[2], outcome, at);
+            self.close_cell(name.as_str(), outcome, at);
         }
     }
 
@@ -338,14 +343,14 @@ impl Scan
             return true;
         }
         if self.timing.cpus.is_none()
-            && let Some(c) = p.width.captures(line)
+            && let Some(cpus) = p.width.captures(line).and_then(|c| c.get(1))
         {
-            self.timing.cpus = c[1].parse().ok();
+            self.timing.cpus = cpus.as_str().parse().ok();
         }
         if self.timing.arch.is_none()
-            && let Some(c) = p.banner.captures(line)
+            && let Some(arch) = p.banner.captures(line).and_then(|c| c.get(1))
         {
-            self.timing.arch = Some(c[1].to_string());
+            self.timing.arch = Some(arch.as_str().to_string());
         }
         false
     }
@@ -418,7 +423,7 @@ fn stamps_of(p: &Patterns, line: &str) -> Vec<Stamp>
             Some(Stamp {
                 start: m.start(),
                 end: m.end(),
-                at: c[1].parse().ok()?,
+                at: c.get(1)?.as_str().parse().ok()?,
             })
         })
         .collect()

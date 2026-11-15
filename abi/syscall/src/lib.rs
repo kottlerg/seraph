@@ -1738,7 +1738,8 @@ pub enum SystemInfoType
     /// effect on the calling CPU (`SPECULATION_CONTROL_*`), read from its
     /// MSRs and from the flags the kernel's entry and exit code test. Each word
     /// is derived from the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`,
-    /// which name the CPU's vulnerabilities, not a kernel secret. ktest reads
+    /// which name the CPU's vulnerabilities, not a kernel secret, and from the
+    /// inputs a kernel built to force its return mitigations forces. ktest reads
     /// it to check that every CPU runs the controls the boot CPU's table
     /// selects (core/kernel/docs/transient-execution.md § Controls).
     /// `NotSupported` on riscv64, which defines no enumeration of the
@@ -1784,6 +1785,14 @@ pub const SPECULATION_INPUT_BHI_CTRL: u64 = 1 << 11;
 /// Input: the CPU implements the data-operand-independent timing mode control
 /// (`IA32_ARCH_CAPABILITIES.DOITM`).
 pub const SPECULATION_INPUT_DOITM: u64 = 1 << 12;
+/// Input: the table gives Retbleed (returns predicted by an alternate predictor,
+/// or of the wrong branch type) kernel action.
+pub const SPECULATION_INPUT_RETBLEED: u64 = 1 << 13;
+/// Input: the table gives speculative return stack overflow kernel action.
+pub const SPECULATION_INPUT_SRSO: u64 = 1 << 14;
+/// Input: the CPU is an Intel part that implements `IA32_SPEC_CTRL.IBRS`
+/// (`CPUID.(EAX=07H,ECX=0):EDX[26]`).
+pub const SPECULATION_INPUT_IBRS: u64 = 1 << 15;
 
 /// Control: enhanced IBRS, `IA32_SPEC_CTRL.IBRS` set on every CPU.
 pub const SPECULATION_CONTROL_EIBRS: u64 = 1 << 0;
@@ -1806,11 +1815,14 @@ pub const SPECULATION_CONTROL_RSB_FILL_SWITCH: u64 = 1 << 7;
 pub const SPECULATION_CONTROL_RSB_FILL_IBPB: u64 = 1 << 8;
 /// Control: `IA32_UARCH_MISC_CTL.DOITM` set on every CPU.
 pub const SPECULATION_CONTROL_DOITM: u64 = 1 << 9;
+/// Control: `IA32_SPEC_CTRL.IBRS` set on every entry from user mode and cleared
+/// on every return to it.
+pub const SPECULATION_CONTROL_IBRS_ENTRY: u64 = 1 << 10;
 
 /// Every `SPECULATION_INPUT_*` bit; no inputs word carries another.
-pub const SPECULATION_INPUT_ALL: u64 = (SPECULATION_INPUT_DOITM << 1) - 1;
+pub const SPECULATION_INPUT_ALL: u64 = (SPECULATION_INPUT_IBRS << 1) - 1;
 /// Every `SPECULATION_CONTROL_*` bit; no controls word carries another.
-pub const SPECULATION_CONTROL_ALL: u64 = (SPECULATION_CONTROL_DOITM << 1) - 1;
+pub const SPECULATION_CONTROL_ALL: u64 = (SPECULATION_CONTROL_IBRS_ENTRY << 1) - 1;
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.
 pub const STACK_CLASS_IDLE: u64 = 0;

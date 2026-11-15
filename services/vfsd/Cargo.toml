@@ -14,8 +14,8 @@ test = false
 # vfsd compares GPT entries against these to identify the rootfs.
 boot-protocol = { path = "../../abi/boot-protocol" }
 # Pure GPT-format parser; vfsd wraps it with block-device I/O in partition.rs.
-# Package is `vfsd-gpt` (the bare `gpt` name is the crates.io crate xtask uses);
-# the `gpt` dependency key keeps the in-crate path short.
+# Package is `vfsd-gpt`, which names whose parser it is; the `gpt` dependency
+# key keeps the in-crate path short.
 gpt = { path = "gpt", package = "vfsd-gpt" }
 ipc = { path = "../../shared/ipc" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }

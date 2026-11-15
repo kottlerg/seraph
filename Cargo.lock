@@ -747,6 +747,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "json"
+version = "0.1.4"
+
+[[package]]
 name = "kernel"
 version = "0.1.4"
 dependencies = [

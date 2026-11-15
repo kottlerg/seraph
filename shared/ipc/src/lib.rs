@@ -390,9 +390,9 @@ pub mod procmgr_labels
     /// Bind the caller's event queue as a terminal-fault death observer on
     /// a child's address space, sent on the child's badged
     /// `process_handle` only: `caps[0]` a `POST` cap on the queue,
-    /// `data[0]` the correlator the post carries. A terminal fault in any
-    /// of the child's threads then posts `(fault class, correlator)` to the
-    /// queue; a child that has already faulted posts its retained fault
+    /// `data[0]` the correlator the post carries. The first terminal fault
+    /// in any of the child's threads then posts `(fault class, correlator)`
+    /// to the queue, once; a child that has already faulted posts its retained fault
     /// class at once. procmgr keeps the address space's `Control` right
     /// and deletes its copy of the cap whatever the outcome. Replies
     /// `SUCCESS`; `UNAUTHORIZED` on a cap other than a process handle;

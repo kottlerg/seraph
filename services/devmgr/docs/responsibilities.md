@@ -652,15 +652,15 @@ the RISC-V IOMMU driver, keeping no copy of either (see
 devmgr is the sole authority for spawning device drivers. It observes each driver's death and
 withdraws the driver. It binds two death observers on each driver, with the driver's device badge as
 the correlator: one on the driver's main thread, which an exit or a fault of that thread posts, and
-one procmgr binds on the driver's address space at devmgr's request
-([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 25: `BIND_DEATH_OBSERVER`),
-which a terminal fault of any of the driver's threads posts. A fault of a worker thread drives
+one procmgr binds on the driver's address space at devmgr's request ([procmgr IPC
+Interface](../../procmgr/docs/ipc-interface.md) § Label 25: `BIND_DEATH_OBSERVER`), which the first
+terminal fault of any of the driver's threads posts, once. A fault of a worker thread drives
 procmgr's teardown of the driver, whose stop of the main thread posts nothing, so only the
 address-space observer reports that death. A fault of the main thread posts to both observers;
-devmgr takes the first post and drops the second, which names a driver already dead or withdrawn.
-An exit of the main thread posts only the thread observer, since the kernel fires an address
-space's observers on a terminal fault alone, so neither observer covers the other. Restarting a
-driver is design intent; not yet
+devmgr takes the first post and drops the second, which names a driver already dead or withdrawn. An
+exit of the main thread posts only the thread observer, since the kernel fires an address space's
+observers on a terminal fault alone, so neither observer covers the other. Restarting a driver is
+design intent; not yet
 implemented (#1077; the supervision hierarchy is in
 [docs/supervision.md](../../../docs/supervision.md)). After
 discovering a device, devmgr requests procmgr to create the driver process and then delegates

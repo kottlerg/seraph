@@ -456,8 +456,8 @@ fn serve_list_round(
 /// with correlator `device_badge`, so devmgr sees the driver's death, before
 /// it reports ready or after it is served: one on the driver's main thread,
 /// which an exit or a fault of that thread posts, and one on its address
-/// space, bound by procmgr (`procmgr_labels::BIND_DEATH_OBSERVER`), which a
-/// terminal fault of any of its threads posts. procmgr's teardown of the
+/// space, bound by procmgr (`procmgr_labels::BIND_DEATH_OBSERVER`), which the
+/// first terminal fault of any of its threads posts. procmgr's teardown of the
 /// driver after a fault of another thread stops the main thread with no post,
 /// so the address-space observer is the only one that sees that death; a
 /// fault of the main thread posts to both.

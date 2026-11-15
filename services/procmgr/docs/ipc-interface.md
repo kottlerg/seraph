@@ -517,9 +517,9 @@ included, as for `CREATE_PROCESS`.
 ### Label 25: `BIND_DEATH_OBSERVER`
 
 Bind the caller's event queue as a terminal-fault death observer on the address space of the child a
-process handle names, so the creator sees a terminal fault in any of the child's threads, not only
-in the main thread its `Thread` cap observes. procmgr keeps the address space's `Control` right,
-which binding such an observer needs
+process handle names, so the creator sees the first terminal fault in any of the child's threads,
+not only in the main thread its `Thread` cap observes. procmgr keeps the address space's `Control`
+right, which binding such an observer needs
 ([docs/capability-model.md](../../../docs/capability-model.md#address-space) § Address Space), and
 makes the bind on the creator's behalf. A creator may send it any number of times while the child
 lives, before or after `START_PROCESS`, each with its own queue and correlator.
@@ -533,15 +533,16 @@ lives, before or after `START_PROCESS`, each with its own queue and correlator.
 | cap[0] | a cap on the observing `EventQueue` carrying `POST` |
 
 procmgr binds the queue with `aspace_bind_notification` and deletes its copy of the cap on every
-outcome, as it deletes any further cap. Once bound, a terminal fault of any thread of the child
-posts the death entry `(fault class, correlator)` to the queue. A child that has already taken a
-terminal fault posts its retained fault class at once, so a bind that follows the fault loses
-nothing. The binding takes one death-observer node of the queue's pool until the child's address
-space is torn down (none when the bind follows the fault). Only a terminal fault posts: an exit
-(`sys_thread_exit`, `sys_process_exit`) posts only to the exiting thread's observers, and a
-teardown (`DESTROY_PROCESS`, or procmgr's reap) posts to neither
-([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) § Exit reason). A
-fault of the main thread posts both to this observer and to the main thread's observers.
+outcome, as it deletes any further cap. Once bound, the first terminal fault of any thread of the
+child posts the death entry `(fault class, correlator)` to the queue, once: a later fault posts
+nothing ([syscalls.md](../../../core/kernel/docs/syscalls.md) § `SYS_ASPACE_BIND_NOTIFICATION`
+(53)). A child that has already taken a terminal fault posts its retained fault class at once, so a
+bind that follows the fault loses nothing. The binding takes one death-observer node of the queue's
+pool until the child's address space is torn down (none when the bind follows the fault). Only a
+terminal fault posts: an exit (`sys_thread_exit`, `sys_process_exit`) posts only to the exiting
+thread's observers, and a teardown (`DESTROY_PROCESS`, or procmgr's reap) posts to neither
+([docs/process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason) § Exit reason). A fault
+of the main thread posts both to this observer and to the main thread's observers.
 
 **Reply:** label 0 (success), or an error code.
 

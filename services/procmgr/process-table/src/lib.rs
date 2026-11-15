@@ -85,9 +85,9 @@ pub const RECENT_EXIT_RETENTION_NS: u64 = 30_000_000_000;
 /// each one step no other thread interleaves.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "`reserve`, `started`, `dma_hold` and `no_debug` are independent facts set at \
-              different points of the child's life (creation, start, create flag, declaration), \
-              not states of one machine"
+    reason = "`reserve`, `started`, `dma_hold`, `no_debug` and `no_core` are independent facts \
+              set at different points of the child's life (creation, start, create flag, \
+              declarations), not states of one machine"
 )]
 pub struct ProcessEntry
 {
@@ -173,6 +173,10 @@ pub struct ProcessEntry
     /// procmgr unbound its crash handler and refuses `ATTACH_PROCESS` on it
     /// ([`attach_target`]).
     pub no_debug: bool,
+    /// Set by the child's `DECLARE_NO_CORE` ([`ProcessTable::declare_no_core`]):
+    /// the child is on the path a core is written through, which
+    /// `ATTACH_PROCESS` reports ([`ProcessEntry::attach_flags`]).
+    pub no_core: bool,
     /// Where the loader placed the child's image, which `ATTACH_PROCESS`
     /// reports.
     pub image: ImageSpan,
@@ -232,6 +236,21 @@ impl ProcessEntry
     pub fn badge(&self) -> u64
     {
         self.badge
+    }
+
+    /// The child's declarations, as the `ATTACH_PROCESS` reply's
+    /// `procmgr_labels::ATTACH_WORD_FLAGS` carries them.
+    #[must_use]
+    pub fn attach_flags(&self) -> u64
+    {
+        if self.no_core
+        {
+            ipc::procmgr_labels::ATTACH_FLAG_NO_CORE
+        }
+        else
+        {
+            0
+        }
     }
 
     /// Whether a thread of this child bound under `badge` is bound to the
@@ -767,6 +786,17 @@ impl ProcessTable
         })
     }
 
+    /// Mark the live entry whose badge matches as on the path a core is
+    /// written through (`DECLARE_NO_CORE`, sent on the child's own procmgr
+    /// cap). Returns `false` when the badge names no live entry.
+    #[must_use]
+    pub fn declare_no_core(&mut self, badge: u64) -> bool
+    {
+        self.find_mut_by_badge(badge)
+            .map(|entry| entry.no_core = true)
+            .is_some()
+    }
+
     /// The live entry whose badge matches.
     #[must_use]
     pub fn find_by_badge(&self, badge: u64) -> Option<&ProcessEntry>
@@ -1068,15 +1098,17 @@ pub fn request_badge(badge: u64) -> (u64, bool)
 }
 
 /// Whether procmgr serves `opcode` (a label's low 16 bits) on a process
-/// handle: every label but `DECLARE_NO_DEBUG` and `REGISTER_THREAD`, which
-/// name their sender itself and are served on the child's own procmgr cap
-/// alone.
+/// handle: every label but `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE` and
+/// `REGISTER_THREAD`, which name their sender itself and are served on the
+/// child's own procmgr cap alone.
 #[must_use]
 pub fn served_on_handle(opcode: u64) -> bool
 {
     !matches!(
         opcode,
-        ipc::procmgr_labels::DECLARE_NO_DEBUG | ipc::procmgr_labels::REGISTER_THREAD
+        ipc::procmgr_labels::DECLARE_NO_DEBUG
+            | ipc::procmgr_labels::DECLARE_NO_CORE
+            | ipc::procmgr_labels::REGISTER_THREAD
     )
 }
 
@@ -1480,6 +1512,7 @@ mod tests
             started: false,
             dma_hold: false,
             no_debug: false,
+            no_core: false,
             image: ImageSpan::default(),
             threads: ThreadRegistry::new(),
             name: ProcessName::EMPTY,
@@ -1611,6 +1644,23 @@ mod tests
             attached(&mut table, ipc::procmgr_labels::DEBUG_AUTHORITY, 0x78),
             Ok((0x78, 0))
         );
+    }
+
+    #[test]
+    fn a_no_core_declaration_marks_its_sender_alone_and_leaves_it_attachable()
+    {
+        use ipc::procmgr_labels::{ATTACH_FLAG_NO_CORE, DEBUG_AUTHORITY};
+        let mut table = ProcessTable::new();
+        table.insert(entry_with_badge(0x77)).unwrap();
+        table.insert(entry_with_badge(0x78)).unwrap();
+        assert!(!table.declare_no_core(0x79));
+        assert!(table.declare_no_core(0x77));
+        // A repeat is answered as the first.
+        assert!(table.declare_no_core(0x77));
+        let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x77).unwrap();
+        assert_eq!(entry.attach_flags(), ATTACH_FLAG_NO_CORE);
+        let (entry, _) = attach_target(&mut table, DEBUG_AUTHORITY, 0x78).unwrap();
+        assert_eq!(entry.attach_flags(), 0);
     }
 
     #[test]
@@ -1816,8 +1866,8 @@ mod tests
     fn a_process_handle_names_its_child_and_sends_neither_declaration_nor_registration()
     {
         use ipc::procmgr_labels::{
-            DECLARE_NO_DEBUG, DESTROY_PROCESS, PROCESS_HANDLE_TAG, QUERY_PROCESS, REGISTER_THREAD,
-            START_PROCESS,
+            DECLARE_NO_CORE, DECLARE_NO_DEBUG, DESTROY_PROCESS, PROCESS_HANDLE_TAG, QUERY_PROCESS,
+            REGISTER_THREAD, START_PROCESS,
         };
         // A child's own procmgr cap carries its process badge alone; its
         // process handle carries the tag too, which procmgr clears.
@@ -1830,7 +1880,7 @@ mod tests
             ipc::procmgr_labels::INIT_REAP_CORRELATOR,
             ipc::VERB_BIT_MASK
         ));
-        for opcode in [DECLARE_NO_DEBUG, REGISTER_THREAD]
+        for opcode in [DECLARE_NO_DEBUG, DECLARE_NO_CORE, REGISTER_THREAD]
         {
             assert!(!served_on_handle(opcode));
         }
@@ -1845,12 +1895,12 @@ mod tests
     {
         use ipc::procmgr_errors::{INVALID_BADGE, UNAUTHORIZED};
         use ipc::procmgr_labels::{
-            BIND_DEATH_OBSERVER, DECLARE_NO_DEBUG, PROCESS_HANDLE_TAG, QUERY_PROCESS,
-            REGISTER_THREAD,
+            BIND_DEATH_OBSERVER, DECLARE_NO_CORE, DECLARE_NO_DEBUG, PROCESS_HANDLE_TAG,
+            QUERY_PROCESS, REGISTER_THREAD,
         };
         let (own, handle) = (0x50, 0x50 | PROCESS_HANDLE_TAG);
         // Labels naming their sender are refused on a handle.
-        for opcode in [DECLARE_NO_DEBUG, REGISTER_THREAD]
+        for opcode in [DECLARE_NO_DEBUG, DECLARE_NO_CORE, REGISTER_THREAD]
         {
             assert_eq!(sender_refusal(opcode, handle), Some(INVALID_BADGE));
             assert_eq!(sender_refusal(opcode, own), None);

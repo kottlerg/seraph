@@ -528,10 +528,11 @@ cost on such a part is not measured ([#1123](https://github.com/kottlerg/seraph/
 `BHI_DIS_S` keeps branch history from user mode from selecting the predicted targets of the
 kernel's indirect branches (Intel's BHI guidance). A CPU without `BHI_CTRL` runs Intel's clearing
 sequence in the entry routine, `seraph_enter_from_user` (§ Return predictions), after the
-`IA32_SPEC_CTRL` write. It is the long sequence (12 outer and 7 inner iterations), which Intel
-states is effective on every part that does not enumerate `BHI_NO`. Its calls and returns pair
-up, so it runs on a supervisor shadow stack. With neither IBRS on entry nor the clearing
-selected, the routine runs `lfence` and returns.
+`IA32_SPEC_CTRL` write and the IBPB on entry (§ IBPB on entry). It is the long sequence (12 outer
+and 7 inner iterations), which Intel states is effective on every part that does not enumerate
+`BHI_NO`. Its calls and returns pair up, so it runs on a supervisor shadow stack. With none of
+IBRS on entry, the IBPB on entry and the clearing selected, the routine runs `lfence` and
+returns.
 
 ### Buffer clearing
 

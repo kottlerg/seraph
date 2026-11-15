@@ -231,30 +231,42 @@ fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
 /// Have procmgr bind `eq` as a terminal-fault death observer on the address
 /// space of the child `process_handle` names, with `correlator`
 /// (`procmgr_labels::BIND_DEATH_OBSERVER`), through a `POST` copy of `eq`
-/// that the call transfers. True when procmgr bound it; false, the copy
-/// released, when the copy cannot be derived or the call fails or is refused
-/// (the child torn down already among the causes).
-fn bind_fault_observer(process_handle: u64, eq: u64, correlator: u64, ipc_buf: *mut u64) -> bool
+/// that the call transfers.
+///
+/// # Errors
+/// `OutOfMemory` when procmgr refused the bind for want of a free node in
+/// `eq`'s pool (`procmgr_errors::OUT_OF_MEMORY`), which a death set takes
+/// as a reason to try another queue; the `SYS_CAP_DERIVE` error when the
+/// copy cannot be derived; `InvalidState` when the call fails, the copy
+/// released, or procmgr refuses the bind otherwise (the child torn down
+/// already among the causes).
+fn bind_fault_observer(
+    process_handle: u64,
+    eq: u64,
+    correlator: u64,
+    ipc_buf: *mut u64,
+) -> Result<(), i64>
 {
-    let Ok(post) = syscall::cap_derive(eq, syscall::RIGHTS_EQ_POST)
-    else
-    {
-        return false;
-    };
+    let post = syscall::cap_derive(eq, syscall::RIGHTS_EQ_POST)?;
     let msg = IpcMessage::builder(procmgr_labels::BIND_DEATH_OBSERVER)
         .word(0, correlator)
         .cap(post)
         .build();
     // SAFETY: every caller passes devmgr's registered IPC buffer.
-    if let Ok(reply) = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
+    match unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
     {
-        reply.label == 0
-    }
-    else
-    {
-        // The call did not transfer the copy.
-        let _ = syscall::cap_delete(post);
-        false
+        Ok(reply) if reply.label == 0 => Ok(()),
+        Ok(reply) if reply.label == ipc::procmgr_errors::OUT_OF_MEMORY =>
+        {
+            Err(syscall_abi::SyscallError::OutOfMemory as i64)
+        }
+        Ok(_) => Err(syscall_abi::SyscallError::InvalidState as i64),
+        Err(_) =>
+        {
+            // The call did not transfer the copy.
+            let _ = syscall::cap_delete(post);
+            Err(syscall_abi::SyscallError::InvalidState as i64)
+        }
     }
 }
 
@@ -348,10 +360,10 @@ pub struct BoundSpawnConfig<'a>
     /// SEND on: the private driver endpoint of the driver's settle batch
     /// ([`crate::settle::SettleBatch::driver_ep`]).
     pub query_ep: u64,
-    /// Event queue the driver's death observers post to, with `device_badge`
-    /// as the correlator: devmgr's driver death queue
-    /// ([`crate::settle::DriverWatch::death_eq`]).
-    pub death_eq: u64,
+    /// The watch the driver's death observers are bound on, with
+    /// `device_badge` as the correlator: devmgr's driver death queues
+    /// ([`crate::settle::DriverWatch`]).
+    pub watch: &'a crate::settle::DriverWatch,
     /// A second event queue the driver's death observers post to, with the
     /// same correlator, for a driver whose death a devmgr thread other than
     /// the control thread must see at once: the IOMMU death watch's
@@ -452,7 +464,7 @@ fn serve_list_round(
 /// query cap (a SEND on `query_ep` badged `device_badge`, through which the
 /// driver fetches its device info and reports ready), and, for a DMA
 /// declaration, the DMA capability. Once the end round is served it binds
-/// two death observers to `death_eq`, and two to `watch_eq` when given, each
+/// two death observers on `watch`, and two to `watch_eq` when given, each
 /// with correlator `device_badge`, so devmgr sees the driver's death, before
 /// it reports ready or after it is served: one on the driver's main thread,
 /// which an exit or a fault of that thread posts, and one on its address
@@ -738,14 +750,17 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     }
 
     // Observe the driver's death from here on. Bound only once every round
-    // has succeeded, so the death queue takes posts only from the drivers a
+    // has succeeded, so the death queues take posts only from the drivers a
     // roster records; a child that already died or faulted posts at once.
-    let bound = [Some(config.death_eq), config.watch_eq]
-        .into_iter()
-        .flatten()
-        .all(|eq| {
-            syscall::thread_bind_notification(thread_cap, eq, config.device_badge).is_ok()
-                && bind_fault_observer(process_handle, eq, config.device_badge, ipc_buf)
+    let badge = config.device_badge;
+    let bound = config.watch.bind_thread(thread_cap, badge).is_ok()
+        && config
+            .watch
+            .bind_with(|eq| bind_fault_observer(process_handle, eq, badge, ipc_buf))
+            .is_ok()
+        && config.watch_eq.is_none_or(|eq| {
+            syscall::thread_bind_notification(thread_cap, eq, badge).is_ok()
+                && bind_fault_observer(process_handle, eq, badge, ipc_buf).is_ok()
         });
     if !bound
     {

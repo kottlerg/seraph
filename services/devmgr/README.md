@@ -23,7 +23,8 @@ devmgr/
 │                                   #   bounds), the served-class table, bounded image reads,
 │                                   #   the AML `Device` walker (on `shared/aml`'s encodings
 │                                   #   and resource-template decoder), platform device
-│                                   #   records, the platform description table parser
+│                                   #   records, the platform description table parser,
+│                                   #   PCI device records (states, appends, INTx routes)
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,

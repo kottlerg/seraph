@@ -94,6 +94,12 @@ pub struct PciDevice
     /// The secondary and subordinate bus of a PCI-to-PCI bridge (a type-1
     /// header): the buses behind it. `None` for every other function.
     pub bridge_buses: Option<(u8, u8)>,
+    /// The `INTx` pin and device number the function's interrupt pin reaches
+    /// its root bus with, through the swizzle of every bridge between
+    /// (`crate::pci_records::host_intx`); `None` for a function with no pin,
+    /// and for every function until its record is made
+    /// (`crate::pci_records::PciRecords`).
+    pub host_intx: Option<(u8, u8)>,
     /// The MSI capability of a type-0 header; `None` for a function without
     /// one and every other header layout.
     pub msi: Option<Msi>,
@@ -199,6 +205,7 @@ fn read_function(
         irq_pin: cfg.read8(bus, dev, func, 0x3D),
         virtio_info: VirtioPciStartupInfo::default(),
         bridge_buses: None,
+        host_intx: None,
         msi: None,
         msix: None,
     };

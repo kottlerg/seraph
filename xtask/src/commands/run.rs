@@ -189,10 +189,11 @@ fn launch_qemu(binary: &str, args: &[String], desc: &str, output: QemuOutput) ->
     // is not part of the firmware-spam problem; passing it through
     // unfiltered preserves any meaningful QEMU diagnostics.
     //
-    // SIGINT handling: the global no-op handler installed in main()
-    // (term::signal::install) means Ctrl+C terminates QEMU directly
-    // via the tty without killing xtask. The TerminalGuard captured
-    // in run() runs its drop on the way out, restoring termios.
+    // SIGINT handling: the global handler installed in main(), which
+    // only records the signal (term::signal::install), means Ctrl+C
+    // terminates QEMU directly via the tty without killing xtask. The
+    // TerminalGuard captured in run() runs its drop on the way out,
+    // restoring termios.
     let resolved = require_tool(binary)?;
     let mut child = Command::new(&resolved)
         .args(args)

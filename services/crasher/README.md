@@ -13,6 +13,18 @@ round-trip, such as one dropped on restart, is logged with a `FATAL:` prefix, wh
 `run-parallel` fail regex catches to fail the run. The deliberate `USERSPACE FAULT` does not
 count as a failure.
 
+A second role, selected by argv `crasher worker-fault`, checks that svcmgr routes the fault of a
+thread other than the main thread. Its recipe, `rootfs/config/svcmgr/tests/crasher-worker.svc`
+(`restart = on_failure`, `critical = no`, `namespace = none`, `provides = crasher.worker`), is
+co-staged with `svctest` wherever `crasher.svc` is. The role takes the provided name's service
+endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
+`ipc::restart_probe_labels`: `PROBE_INSTANCE` replies a per-instance random nonce in word 0, and
+`PROBE_FAULT_WORKER` replies, then receives nothing more while a worker thread takes a terminal
+fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. procmgr
+tears the process down, and svcmgr restarts it through its address-space observer; svctest's
+`svcmgr_worker_fault_restart` phase reads a new nonce from the restarted instance. A role that
+lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
+
 ---
 
 ## Source Layout
@@ -22,14 +34,15 @@ crasher/
 ├── Cargo.toml
 ├── README.md
 └── src/
-    └── main.rs            # Surface checks, then the deliberate fault
+    └── main.rs            # Surface checks, then the deliberate fault; the worker-fault role
 ```
 
 ---
 
 ## Capabilities
 
-The bootstrap round delivers the recipe's two seeds again on every spawn and respawn:
+The bootstrap round delivers the recipe's two seeds again on every spawn and respawn (the
+`worker-fault` role instead receives its provided service endpoint in `caps[0]`):
 
 | Slot      | Cap                       |
 |-----------|---------------------------|

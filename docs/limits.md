@@ -87,19 +87,18 @@ An entry an existing open Issue already names cites it in the recommendation.
   RAM-bound, and the kernel's `CSpace` registry is sized from RAM and does not bind first. The
   death queues' observer pools grow too: procmgr and svcmgr each add a queue, funded from their
   own memory, when every pool is out of nodes, and logd's queue needs none, since procmgr posts
-  each death to it. The death correlators are the full `u64` badge or table index. A further
-  queue is one contiguous memmgr grant, retried at half the pool down to the first pool's
-  size, and the wait set that holds the queues doubles up to 1024 members. Each wait set
-  is one contiguous grant too, so RAM that refuses every request above three pages stops the
-  set at 256 members, where the queues still hold about 16 K live processes: the death-queue
-  set's floor, not a cap a system meets, since such RAM refuses each spawn's own contiguous
-  grants (a 48-page `AddressSpace`, a `Thread` slot of seven pages or more) first. The
-  first bound past RAM is the death-queue set's ceiling: at most 1023 queues of
-  `EVENT_QUEUE_MAX_CAPACITY` (2^20) nodes, at two nodes a live process about 0.5 G processes.
-  Past it, the cap handle's 32-bit index field, which the `CSpace` directory reaches
-  (`MAX_SLOTS_STRUCTURAL`), holds procmgr's `CSpace` near 1 G children. Neither binds before
-  RAM: at the 16 TiB at which the `u32` `CSpaceId` stops the registry, RAM backs fewer than
-  0.1 G processes.
+  each death to it. The death correlators are the full `u64` badge or svcmgr's `(instance << 32) |
+  slot` tag. A further queue is one contiguous memmgr grant, retried at half the pool down to the
+  first pool's size, and the wait set that holds the queues doubles up to 1024 members. Each wait
+  set is one contiguous grant too, so RAM that refuses every request above three pages stops the set
+  at 256 members, where the queues still hold about 16 K live processes: the death-queue set's
+  floor, not a cap a system meets, since such RAM refuses each spawn's own contiguous grants (a
+  48-page `AddressSpace`, a `Thread` slot of seven pages or more) first. The first bound past RAM is
+  the death-queue set's ceiling: at most 1023 queues of `EVENT_QUEUE_MAX_CAPACITY` (2^20) nodes, at
+  two nodes a live process about 0.5 G processes. Past it, the cap handle's 32-bit index field,
+  which the `CSpace` directory reaches (`MAX_SLOTS_STRUCTURAL`), holds procmgr's `CSpace` near 1 G
+  children. Neither binds before RAM: at the 16 TiB at which the `u32` `CSpaceId` stops the
+  registry, RAM backs fewer than 0.1 G processes.
 - **Per-process address space.** The surfaces a creator places stay in one static map below
   Sv39's 2^38 on every architecture; the heap and reservation arena a process places itself are
   sized to its user half (tens of GiB under Sv39, 32 TiB each under 2^47), and the main stack and
@@ -260,7 +259,7 @@ Tracked by [#638](https://github.com/kottlerg/seraph/issues/638).
 | `PerCpuScheduler.load`, `non_empty` | `core/kernel/src/sched/run_queue.rs` | `AtomicU32` | provably unreachable (load at most threads, mask 32 bits for 13 queues) | per CPU | correct as is | None |
 | `ThreadControlBlock.death_observers` | `core/kernel/src/sched/thread.rs` | unbounded chain of queue-funded nodes | none (each node is funded by the observing queue) | 8 B per TCB | correct as is | None |
 | `EventQueueState.observer_count` | `core/kernel/src/ipc/event_queue.rs` | caller-chosen, at most `EVENT_QUEUE_MAX_CAPACITY` | caller-funded per queue (24 B per node) | none up front | correct as is | Bindings past the pool return `OutOfMemory` until a bound owner is destroyed |
-| `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u64` correlator, full `u64` reason (one two-word EQ entry) | ABI width | embedded | correct as is | None: procmgr, svcmgr and devmgr pass the full badge or table index |
+| `DeathObserver.correlator`, posted exit reason | `core/kernel/src/sched/thread.rs` | `u64` correlator, full `u64` reason (one two-word EQ entry) | ABI width | embedded | correct as is | None: procmgr, svcmgr and devmgr pass the full badge or tag |
 | `ThreadControlBlock.thread_id` | `core/kernel/src/sched/thread.rs` | random `u32` | provably unreachable as an identity (diagnostic only; no lookup, not exposed) | 4 B per TCB | correct as is | Widen if ever exposed |
 | `park_seq`, `start_seq`, `park_episode`, `deposit_episode` | `core/kernel/src/sched/thread.rs` | `u32` | provably unreachable (freshness inside one short window) | embedded | correct as is | None |
 | `ThreadControlBlock.cspace_epoch` | `core/kernel/src/sched/thread.rs` | `u32` | encoding artefact (mirrors the registry epoch) | 4 B per TCB | correct as is | None |
@@ -625,7 +624,7 @@ Every entry here is `correct as is`; none is tracked.
 | `ServiceEntry.vfs_path`, `ns_subtree_path` | `services/svcmgr/src/service.rs` | heap strings, at most `MAX_PATH_LEN` (4096) | the shared recipe path limit | their length | correct as is | None |
 | `ServiceEntry.name`, `PendingRegistration.name` | `services/svcmgr/src/service.rs` | heap strings, at most `svcmgr_labels::NAME_MAX` (64) | the shared svcmgr name limit | their length | correct as is | None |
 | svc-defs argv and env limit (`check_startup_blobs`) | `services/svcmgr/svc-defs/src/parse.rs` | argv and env together at most `ARGV_ENV_MAX_BYTES` | the process ABI's argv/env region | none | correct as is | None |
-| reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | table index, `u64` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its live thread state) | none | correct as is | None |
+| reconcile correlator (`ServiceTable::reserve`) | `services/svcmgr/src/definitions/reconcile.rs` | `DeathTag`, `(instance << 32) \| slot` | encoding artefact (slots are never reused; a stale post for a restarted instance is dropped on its instance) | none | correct as is | None |
 | endowment `CAPS_SLOTS`, `ROUND_DATA_WORDS`, `CAPS_ROUNDS` | `services/svcmgr/endowment/src/lib.rs` | 7 / 4 / derived | provably unreachable (enumerated roles) | none | correct as is | None |
 | bootstrap badge | `services/svcmgr/src/restart.rs` | random `u64` | ABI width | none | correct as is | None |
 

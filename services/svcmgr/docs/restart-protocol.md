@@ -7,12 +7,31 @@ shared spawn primitives, and criticality handling.
 
 ## Death detection
 
-svcmgr binds every supervised service's main thread to one of its death
-EventQueues via `SYS_THREAD_BIND_NOTIFICATION`, using the service's table
-index, widened to the full `u64`, as the correlator. When a thread exits —
-either cleanly via `SYS_THREAD_EXIT` or due to an unhandled fault — the
-kernel posts the death entry `(exit_reason, correlator)` to that queue (per
-[syscalls.md](../../../core/kernel/docs/syscalls.md)).
+svcmgr binds two death observers for every supervised service instance, both
+on its death EventQueues and both with the instance's `DeathTag` as the
+correlator, `(instance << 32) | slot` ([`svc-defs`](../svc-defs/src/death_tag.rs)):
+the slot is the service's table index, and the instance is `0` for the first
+and one more for each restart. One observer is on the main thread
+(`SYS_THREAD_BIND_NOTIFICATION`): when that thread exits, cleanly via
+`SYS_THREAD_EXIT` or on an unhandled fault, the kernel posts the death entry
+`(exit_reason, correlator)` to its queue (per
+[syscalls.md](../../../core/kernel/docs/syscalls.md)). The other is on the
+address space, and the first terminal fault of any of its threads posts it.
+procmgr's teardown of the process stops the main thread without a post and
+revokes svcmgr's thread cap, so the address-space observer is the one that
+reports a fault of another thread. svcmgr binds the address-space observer
+as follows:
+
+- For a service svcmgr launches or restarts, procmgr binds it:
+  `BIND_DEATH_OBSERVER` (procmgr label 25) on the process handle, with a `POST`
+  copy of a svcmgr death queue. Both binds happen before `START_PROCESS`.
+- For memmgr and procmgr, which init creates by raw syscalls, svcmgr binds it
+  itself with `SYS_ASPACE_BIND_NOTIFICATION` (`DeathSet::bind_aspace`), through a
+  Control-only address-space cap the handover endowment delivers, which the
+  entry keeps (`ServiceEntry.aspace_cap`).
+- For devmgr and vfsd, which init creates through procmgr, svcmgr sends
+  `BIND_DEATH_OBSERVER` on the process handle the handover endowment delivers,
+  which the entry keeps (`ServiceEntry.process_handle`).
 
 A bind takes one death-observer node from its queue's pool, fixed when the
 queue is created, so svcmgr keeps a growable set of queues: a bind tries the
@@ -40,17 +59,20 @@ more) dedicated grant returns to memmgr through
 than svcmgr's `CSpace` has slots. On wakeup svcmgr drains every queue and
 routes each payload to its `ServiceEntry` via the correlator, then
 dispatches through [`restart::handle_death`](../src/restart.rs). The service
-table grows on the heap and never reuses a slot, so an index names one
-service for svcmgr's lifetime; a post whose service's current thread the
-kernel reports live (`CAP_INFO_THREAD_STATE`) is a dead instance's that a
-resync already handled, and is dropped.
+table grows on the heap and never reuses a slot, so a slot names one
+service for svcmgr's lifetime. `route_death` routes a post only when the
+slot is active and the tag's instance is the slot's current one, and the exit
+reason is the post's. Any other post is dropped: a late post of an instance
+already routed, and the second of the two posts a main-thread fault makes when
+it is the address space's first terminal fault.
 
 Each death queue has a fixed tuning capacity (`DEATHS_EQ_CAPACITY`, 64),
 not one sized from the service count. The kernel drops a post to a full
 queue, so a drain that takes a full queue's worth of events or more from one
-queue resyncs: it
-routes a death for every active service whose thread the kernel reports
-exited. A dropped post leaves a full queue of events behind it for that
+queue resyncs: it routes a death for every active service whose main thread the kernel reports
+exited (the kernel's reason), whose thread cap no longer resolves (`EXIT_KILLED`: procmgr's teardown
+revokes it), or whose endowed address space has a retained terminal fault
+(`CAP_INFO_ASPACE_TERMINAL_FAULT`). A dropped post leaves a full queue of events behind it for that
 drain or the next, so the resync runs after the drop.
 
 Exit reason encoding (owned by
@@ -100,25 +122,26 @@ permanent loss* (per [service-definitions.md](service-definitions.md#critical)).
    * Otherwise (`critical = no`) → log `service down: <name>; system
      continues degraded`, return `Degraded`.
 3. **Restart permitted** → call `restart_process`:
-   * If `process_handle != 0` (svcmgr-launched services), send
-     `procmgr_labels::DESTROY_PROCESS` to reclaim the previous
-     instance's kernel objects. Init-spawned services start with
-     `process_handle == 0`, so the first death cannot destroy;
-     subsequent deaths can.
-   * Delete the dead instance's `thread_cap`, svcmgr's reference to the
-     exited thread.
+   * If `process_handle != 0`, send `procmgr_labels::DESTROY_PROCESS` to
+     reclaim the previous instance's kernel objects. Every service
+     procmgr created has a handle, including devmgr and vfsd, whose handles
+     init endows; memmgr and procmgr, which init creates by raw syscalls,
+     have `process_handle == 0`.
+   * Delete the dead instance's `thread_cap` and `aspace_cap`, svcmgr's
+     references to the exited thread and its address space.
    * Spawn a fresh instance via the shared primitive
      [`walk_and_create_from_file`](#shared-spawn-primitives) (VFS
      path), replaying the recipe's `argv` / `env` from the stored
      [`RestartRecipe`](../src/service.rs).
    * Re-apply the per-service namespace policy **and `cwd`** via
      [`apply_namespace_policy`](#shared-spawn-primitives).
+   * Bind both death observers of the new instance (`bind_instance_observers`)
+     under the same slot and the next instance, so subsequent crashes route
+     back to the same entry and a late post of the dead instance is dropped.
    * Start the child via [`start_process`](#shared-spawn-primitives)
      (`START_PROCESS`).
    * Serve the restart bootstrap rounds, re-resolving the recipe's
      `seed` names from the discovery registry in declaration order.
-   * Rebind death-notification on the new thread cap using the same
-     correlator so subsequent crashes route back to the same entry.
    * On success: increment `restart_count` (a lifetime count for the
      restart log line), return `Restarted`.
    * On failure: any failure after `CREATE_FROM_FILE` destroys the new
@@ -136,7 +159,7 @@ endpoint of the shutdown actuator, the service whose recipe declares
 [`shutdown_actuator`](service-definitions.md#shutdown_actuator), stamped
 with the badge of the `:auth` name it declares, and issues
 `pwrmgr_labels::SHUTDOWN` through it. An actuator whose entry is active but
-whose thread has exited has its own death routed first, so it restarts or
+whose current instance the kernel shows dead has its own death routed first, so it restarts or
 ends down before svcmgr calls it. Edge case: with no actuator recorded, or
 the actuator not running (its entry inactive, its own permanent death
 included), graceful shutdown is impossible; svcmgr logs the degraded state
@@ -206,14 +229,15 @@ string at its own length:
 | `system_critical` | `critical = yes \| no` |
 | `ns_policy_kind` / `ns_subtree_path` / `ns_subtree_rights` | `namespace = ...` |
 | `thread_cap` | endowment thread cap (bind-only) or `Launched.thread_cap` (svcmgr-launched) |
-| `process_handle` | `Launched.process_handle` for svcmgr-launched; `0` for init-spawned (see DESTROY_PROCESS comment above) |
+| `process_handle` | `Launched.process_handle` for svcmgr-launched; the endowed process handle for devmgr and vfsd; `0` for memmgr and procmgr (see DESTROY_PROCESS above) |
+| `aspace_cap` | the endowed Control-only address-space cap for memmgr and procmgr; `0` otherwise |
+| `instance` | the death-tag instance: `0` for the first, one more per restart |
 
 The launch surfaces svcmgr replays beyond that record (the
 argv / env / cwd / seed, plus the log-sink flag and
 scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
-(`ServiceTable.recipes`), index-aligned with `services` via the death
-correlator:
+(`ServiceTable.recipes`), index-aligned with `services` by slot:
 
 | Field | Source |
 |---|---|

@@ -1336,8 +1336,8 @@ pub mod svcmgr_labels
     // caps it needs for its publish role (`rootfs.root` SEND,
     // devmgr-registry `SEND|GRANT` source, `vfsd.mount`, `vfsd.deny`, and
     // `vfsd.swap` SENDs) and `SVCMGR_LABELS_VERSION` in
-    // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
-    // pair svcmgr parks in its pending-registration table; a final
+    // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap, observer)`
+    // triple svcmgr parks in its pending-registration table; a final
     // `LOGD_SOURCES` round carries the master-log and procmgr death-auth
     // sources svcmgr launches logd with. On `HANDOVER_COMPLETE` svcmgr
     // reconciles every parked name against `/config/svcmgr/services/`:

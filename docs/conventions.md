@@ -323,6 +323,12 @@ surface, and `BLOCKING ISSUES` otherwise.
 Any later delta that changes anything but documentation or comments, or that holds a sync
 owing a run with the reviewer, takes a run with the reviewer.
 
+The auditor applies the checks of this run, and those of the audit that completes a run of the
+reviewer alone (§ Pre-merge review), only when its invocation names that run kind in the fixed
+line `.claude/skills/pr-review/SKILL.md` gives; a `since` head or a record path alone never
+selects them. `cargo xtask review-check` rejects the record of a run with the reviewer whose
+audit carries either check.
+
 ### Syncing with `master`
 
 A PR's head MUST contain `master` when it merges (§ Branch protection). A sync is a merge of

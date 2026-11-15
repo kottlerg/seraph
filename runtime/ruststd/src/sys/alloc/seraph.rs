@@ -4,7 +4,8 @@
 // runtime/ruststd/src/sys/alloc/seraph.rs
 
 //! Seraph PAL allocator: a spinlock-guarded first-fit free list whose
-//! backing pages are lazily requested from memmgr. All syscall wrappers
+//! backing pages come from memmgr as the heap grows: a committed demand
+//! region above the heap floor in a demand-paged process, grants otherwise. All syscall wrappers
 //! and protocol labels come from the workspace crates `syscall-abi`,
 //! `syscall`, and `ipc`, pulled into std's dep graph through
 //! `library/std/Cargo.toml` — mirrors the `hermit-abi` /
@@ -48,7 +49,8 @@ use crate::ptr::{NonNull, null_mut};
 use crate::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use ipc::memmgr_labels::{
-    QUERY_POOL_STATUS, REGISTER_PRESSURE, RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS,
+    EXTEND_REGION, QUERY_POOL_STATUS, REGION_COMMIT, REGISTER_PRESSURE, REGISTER_REGION,
+    RELEASE_MEMORY_CAPS, REQUEST_MEMORY_CAPS,
 };
 use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 
@@ -67,9 +69,11 @@ use syscall_abi::{MAP_WRITABLE, PAGE_SIZE};
 /// (pinned, or whose registration failed) maps it eagerly instead.
 const HEAP_INITIAL_PAGES: u64 = 512;
 
-/// Minimum grow increment in pages. Allocation-failure retries extend the
-/// heap by at least this many 4 KiB pages to amortise the memmgr IPC
-/// round-trip over many small follow-up allocations. 16 pages = 64 KiB.
+/// Grow increment in pages. Allocation-failure retries extend the heap by a
+/// multiple of this many 4 KiB pages, at least one, to amortise the memmgr IPC
+/// round-trip over many small follow-up allocations. 16 pages = 64 KiB, one
+/// memmgr demand chunk, so the growth region of a demand-paged heap stays a
+/// whole number of chunks.
 const GROW_MIN_PAGES: u64 = 16;
 
 // ── Spin mutex ──────────────────────────────────────────────────────────────
@@ -207,6 +211,13 @@ struct Heap {
     memmgr_ep: u64,
     /// Cached aspace cap for mapping grow-path pages. Zero before bootstrap.
     self_aspace: u64,
+    /// Base of the committed growth region of a heap whose floor is demand
+    /// paged: the floor's end, where every grow extends the region
+    /// ([`Self::grow_committed`]). Zero for a heap that grows by grants.
+    growth_base: u64,
+    /// The committed growth region's registered length in bytes; zero until
+    /// the first grow registers it.
+    growth_len: u64,
 }
 
 // SAFETY: the free-list pointers address free blocks in the process's own
@@ -222,6 +233,8 @@ impl Heap {
             max: 0,
             memmgr_ep: 0,
             self_aspace: 0,
+            growth_base: 0,
+            growth_len: 0,
         }
     }
 
@@ -345,17 +358,19 @@ impl Heap {
         if l.as_ptr() as usize + size == self.mapped_end { size } else { 0 }
     }
 
-    /// Extend the heap by requesting fresh pages from memmgr, mapping
-    /// them immediately above `mapped_end`, and appending the new region
-    /// to the free list.
+    /// Extend the heap immediately above `mapped_end` and append the new
+    /// bytes to the free list: by a commitment of the committed growth region
+    /// ([`Self::grow_committed`]) when the heap has one, else by fresh pages
+    /// memmgr grants, mapped here ([`Self::grow_exact`]).
     ///
     /// The grow covers `want_bytes` beyond the free block at the heap's top
-    /// ([`Self::tail_free_bytes`]), at least `GROW_MIN_PAGES`, with no other
-    /// bound: a request the rest of the zone cannot hold fails without
-    /// mapping anything. Returns `true` if the grow mapped at least one
-    /// page, `false` on any IPC / map failure before the first page or when
-    /// the zone cannot hold the request. A grow that mapped some pages and
-    /// then failed still adds them to the free list and advances
+    /// ([`Self::tail_free_bytes`]), in a whole number of `GROW_MIN_PAGES`
+    /// increments where the zone holds them, with no other bound: a request
+    /// the rest of the zone cannot hold fails without asking memmgr. Returns
+    /// `true` if the grow added at least one page, `false` on a refused
+    /// commitment, on any IPC / map failure before the first page, or when
+    /// the zone cannot hold the request. A grant grow that mapped some pages
+    /// and then failed still adds them to the free list and advances
     /// `mapped_end` past them (see [`Self::grow_exact`]), so the caller's
     /// retry loop makes progress on every `true`.
     ///
@@ -380,11 +395,14 @@ impl Heap {
         if pages_needed > remaining_pages {
             return false;
         }
-        // The minimum increment is clamped to what fits in the remaining
+        // The increment is clamped to what fits in the remaining
         // [mapped_end, max) window; the request itself fits (checked above).
-        let pages = pages_needed.max(GROW_MIN_PAGES).min(remaining_pages);
+        let pages = pages_needed.max(1).next_multiple_of(GROW_MIN_PAGES).min(remaining_pages);
         if pages == 0 {
             return false;
+        }
+        if self.growth_base != 0 {
+            return self.grow_committed(pages);
         }
 
         // SAFETY: `[start_va, start_va + pages * PAGE_SIZE)` lies in the
@@ -392,6 +410,62 @@ impl Heap {
         // this heap maps and where nothing is mapped yet.
         unsafe { self.grow_exact(pages, start_va) };
         self.mapped_end as u64 > start_va
+    }
+
+    /// Grow the committed growth region by `pages` pages and append them to
+    /// the free list: the first grow registers the region at `growth_base`
+    /// with `REGION_COMMIT`, every later one extends it (`EXTEND_REGION`).
+    /// memmgr admits and charges the whole growth before it answers, so the
+    /// pages are backed on first touch and no fault in them is declined for
+    /// budget or RAM while the region's page-table reservation lasts, which
+    /// only this process's own mappings and unmaps can spend early: another
+    /// thread's map that takes the page-table pages memmgr donates in the
+    /// middle of a fault's map, or an unmap that reclaims page tables in the
+    /// region's span; a refusal (`LIMIT` at this process's max,
+    /// `OUT_OF_MEMORY_BEST_EFFORT` when the RAM outside memmgr's promises is
+    /// short) returns `false`, so an allocation fails where it is made, and
+    /// `try_reserve` returns `Err`, rather than a later touch faulting with
+    /// no frame to back it (docs/userspace-memory-model.md § Byte Heap).
+    ///
+    /// memmgr undoes a commitment whose reply did not reach the caller, so an
+    /// interrupted call is made again ([`ipc_call_until_answered`]) without
+    /// being charged twice. The region's page tables are funded from the
+    /// reservation memmgr holds for it, so no top-up precedes the call.
+    fn grow_committed(&mut self, pages: u64) -> bool {
+        let ipc_buf = current_ipc_buf();
+        if ipc_buf.is_null() {
+            return false;
+        }
+        let bytes = pages * PAGE_SIZE;
+        let new_len = self.growth_len + bytes;
+        let msg = if self.growth_len == 0 {
+            ipc::IpcMessage::builder(REGISTER_REGION)
+                .word(0, self.growth_base)
+                .word(1, new_len)
+                .word(2, MAP_WRITABLE)
+                .word(3, REGION_COMMIT)
+                .build()
+        } else {
+            ipc::IpcMessage::builder(EXTEND_REGION)
+                .word(0, self.growth_base)
+                .word(1, new_len)
+                .build()
+        };
+        // SAFETY: ipc_buf is the current thread's kernel-registered,
+        // page-aligned IPC buffer.
+        match unsafe { ipc_call_until_answered(self.memmgr_ep, &msg, ipc_buf) } {
+            Ok(reply) if reply.label == ipc::memmgr_errors::SUCCESS => {}
+            _ => return false,
+        }
+        self.growth_len = new_len;
+        let base = self.mapped_end;
+        // SAFETY: `[base, base + bytes)` is the committed region's growth,
+        // which lies in this heap's zone above every byte the heap handed out
+        // and is registered writable, so the node write faults its first page
+        // in; size and base are page multiples, so NODE_ALIGN-aligned.
+        unsafe { self.insert(base, bytes as usize) };
+        self.mapped_end = base + bytes as usize;
+        true
     }
 
     /// Request and map exactly `pages` pages starting at `start_va`,
@@ -556,8 +630,9 @@ pub fn heap_bootstrap(memmgr_ep: u64, self_aspace: u64) -> bool {
 /// Draw the heap base in the heap zone sized to this process's address space
 /// ([`crate::os::seraph::growth_zones`]), record the heap's zone and
 /// caps, and install the `HEAP_INITIAL_PAGES` floor: demand-backed
-/// ([`register_demand_floor`]) when the process has a pager, else mapped
-/// through [`Heap::grow_exact`]. On failure the heap is reset to its
+/// ([`register_demand_floor`]) when the process has a pager, with the
+/// committed growth region above it ([`Heap::grow_committed`]), else mapped
+/// through [`Heap::grow_exact`], with grants to grow by. On failure the heap is reset to its
 /// unbootstrapped state, so it serves no allocation; pages the failed attempt
 /// mapped stay mapped and accounted until the process exits.
 fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
@@ -588,6 +663,7 @@ fn heap_install(memmgr_ep: u64, self_aspace: u64) -> bool {
     let floor_end = heap_base + HEAP_INITIAL_PAGES * PAGE_SIZE;
     let ok = if demand_floor {
         heap.mapped_end = floor_end as usize;
+        heap.growth_base = floor_end;
         // SAFETY: `[heap_base, floor_end)` is this heap's registered demand
         // floor, which nothing else uses; the node write below faults its
         // first page in.

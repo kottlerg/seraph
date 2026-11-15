@@ -8,8 +8,9 @@
 //! devmgr serves a driver's service endpoint through the registry only once
 //! the driver has reported its device ready. It spawns a batch of drivers,
 //! then settles the batch: each driver either reports ready (`DRIVER_READY`)
-//! or dies, and devmgr observes the death through a death observer bound on
-//! the driver's thread. [`Roster`] records each driver of the batch under its
+//! or dies, and devmgr observes the death through the death observers bound
+//! on the driver's main thread and on its address space, either of which
+//! may post it first. [`Roster`] records each driver of the batch under its
 //! device badge, takes those two events, says when the batch is settled, and
 //! yields each driver's outcome in spawn order, so the served drivers keep
 //! that order for the registry's instance ordinals. [`settle`] is devmgr's

@@ -91,8 +91,9 @@ fn main() -> !
 
     // Every driver this boot can spawn, each at most once: one per device
     // record (a record is bound at most once, by whichever pass binds it) and
-    // the IOMMU driver. The watch's death queue is sized to them, so every
-    // death observer is funded and no death is dropped.
+    // the IOMMU driver. The watch's death queue is sized to both death
+    // observers of each, each of which posts at most once, so every observer
+    // is funded and no death is dropped.
     let driver_count = records.count().saturating_add(IOMMU_DRIVERS);
     let Some(mut watch) = settle::DriverWatch::new(driver_count)
     else

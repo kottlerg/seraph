@@ -2992,10 +2992,13 @@ right, so only a process that may read physical addresses translates its pages.
 
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
-Bind a terminal-fault death observer to an address space. When any thread in the space faults
-terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
-for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the bound
-event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. Voluntary
+Bind a terminal-fault death observer to an address space. On the first terminal fault of any
+thread in the space (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
+pattern for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the
+bound event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. The address space dies
+once: a later terminal fault of another of its threads, on any CPU, exits that thread and posts
+nothing, so a binding receives one entry in its life, carrying the retained reason that
+`CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (§ `SYS_CAP_INFO`). Voluntary
 `SYS_THREAD_EXIT` does not fire these observers (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 

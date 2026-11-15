@@ -922,8 +922,8 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// arg1 = `EventQueue` cap slot index (`POST` right required).
 /// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
-/// On a terminal fault by any thread in the address space (no handler bound,
-/// the handler replied `KILL`, or the fault episode was cancelled by
+/// On the first terminal fault by any thread in the address space (no handler
+/// bound, the handler replied `KILL`, or the fault episode was cancelled by
 /// destruction of the handler thread, by destruction of the handler endpoint
 /// while the fault is still queued on it, or by a later receive on the
 /// handler thread that passes its capability and headroom checks while the
@@ -932,9 +932,11 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
 /// the kernel posts the entry `(terminal-fault reason, correlator)` to each
-/// bound observer. Only a fault of a thread's own access is terminal: a
-/// restartable syscall's copy fault in any of these cases fails that syscall
-/// with `InvalidAddress` and posts nothing (docs/fault-handling.md § Kernel
+/// bound observer; a later terminal fault of another thread of the space posts
+/// nothing (the space dies once, with the reason retained from its first
+/// fault). Only a fault of a thread's own access is terminal: a restartable
+/// syscall's copy fault in any of these cases fails that syscall with
+/// `InvalidAddress` and posts nothing (docs/fault-handling.md § Kernel
 /// Copies). The kernel only notifies; it never enumerates or terminates
 /// threads, and normal `thread_exit` does NOT fire these observers.
 ///

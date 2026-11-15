@@ -44,6 +44,20 @@ claims.
    PR via `gh pr view --json number,body,title,headRefOid,baseRefName`, or
    local feature branch if no PR exists yet.
 
+2a. Run kind: the parent's prompt carries one line that names the run
+    kind, in one of the three forms the `pr-review` skill § The run gives:
+    `Run kind: with-reviewer` (a run with the reviewer, or a re-audit at
+    its head), `Run kind: completing <record path>` (the audit that
+    completes a run of the reviewer alone at the same head, or a re-audit
+    of it, with that run's record), or `Run kind: auditor-only since <head>,
+    record <record path>` (the auditor-only run, or a re-audit of it, with
+    the head and the record of the last run with the reviewer). Step 11 applies on the
+    `auditor-only` line alone and step 12 on the `completing` line alone. A
+    `since` head, a record path, or a description of the run anywhere else
+    in the prompt never selects either. When the line is absent, or is none
+    of the three forms, apply neither step and report a `Run kind` section
+    as FAIL that says so.
+
 3. Materialize the diff from the local tree: `git diff <base> <head>`, the
    base being `git merge-base <head> origin/<baseRefName>` (or
    `git diff master...HEAD` when no PR exists). Never `gh pr diff` or the
@@ -241,10 +255,10 @@ claims.
     Context the body gives about things outside the diff (motivation,
     history, settings outside the repository) is not checked against it.
 
-11. Auditor-only run: when the parent names this run the auditor-only
-    run `docs/conventions.md` § Branch and PR Workflow allows, it names
-    `since`, the head the last run with the reviewer reviewed, and the path
-    of that run's record. FAIL when the record lists a failed agent
+11. Auditor-only run: on the `auditor-only` run-kind line of step 2a
+    alone. That line names the run `docs/conventions.md` § Auditor-only run
+    allows, with `since`, the head the last run with the reviewer reviewed,
+    and the path of that run's record. FAIL when the record lists a failed agent
     (`stats.failed`), when the PR's own change in `<since>..<head>` alters,
     Markdown aside, anything but comment lines (judged as step 9 judges a
     validation delta, a sync in the range included), or when a commit in
@@ -271,19 +285,23 @@ claims.
     record and the range: `READY TO MERGE` when the range fixes every
     defect of the record's `findings`, `BLOCKING ISSUES` otherwise.
 
-12. Completing audit: when the parent names this audit as the one that
-    completes a run of the reviewer alone at the same head, read that
-    run's record and FAIL each entry of its `recorded` that no open Issue
+12. Completing audit: on the `completing` run-kind line of step 2a alone,
+    which names the record of a run of the reviewer alone at the same head,
+    read that run's record and FAIL each entry of its `recorded` that no open Issue
     records as step 11 says.
 
 ## Output
 
-A per-section verdict, each PASS or FAIL: PR-body checklist; per-issue
-closure with per-criterion lines; silent-deferral scan (FAIL on any
-unreconciled hit); test-plan honesty (FAIL on any bare tick);
-commit-message compliance; validation claim; PR-body claims; in an
-auditor-only run, auditor-only checks; and, in an audit that completes a
-run of the reviewer alone, completing-audit checks.
+The first line states the run kind as step 2a read it: the run-kind line as
+given, or `Run kind: missing`. Then a per-section verdict, each PASS or
+FAIL: PR-body checklist; per-issue closure with per-criterion lines;
+silent-deferral scan (FAIL on any unreconciled hit); test-plan honesty
+(FAIL on any bare tick); commit-message compliance; validation claim;
+PR-body claims; on the `auditor-only` line, auditor-only checks; on the
+`completing` line, completing-audit checks; and, when the line is absent
+or malformed, run kind (FAIL). A run with the reviewer carries neither the
+auditor-only nor the completing-audit section: `cargo xtask review-check`
+rejects a `full` or `delta` record that does.
 
 **The final line MUST be exactly one of:** `AUDIT PASS`, `AUDIT FAIL`.
 Any FAIL section forces `AUDIT FAIL`.

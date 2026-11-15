@@ -1286,6 +1286,13 @@ does not state its record's mode and head, `error record-name`. A record with `a
 record with `NOT RUN` is `error record-audit-shape`; a record without an `audit` key is
 `error record-shape`, since the reviewer-alone form states the `null`.
 
+A `full` or `delta` record whose `audit.sections` holds a section whose name contains
+`auditor-only` or `completing-audit`, in any letter case, is `error record-run-kind`: those are
+the checks of the auditor-only run and of the audit that completes a run of the reviewer alone,
+which only an `audit` record's run kind selects (`.claude/agents/pr-auditor.md` steps 2a, 11
+and 12), so the audit of that run with the reviewer is run again with the run-kind line
+`Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record).
+
 ### `cargo xtask review-ledger`
 
 Build the ledger of a review: the findings a later run must not re-raise

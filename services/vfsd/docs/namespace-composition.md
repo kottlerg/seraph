@@ -90,8 +90,8 @@ the create reply's `Thread` cap before `START_PROCESS`, so the main
 thread's exit or terminal fault posts to it, and then deletes the
 `Thread` cap. The create request carries a `POST`-only derivation of the
 queue under `CREATE_DEATH_RELAY`, which procmgr binds to the driver's
-address space, so a terminal fault in any of the driver's threads posts
-to it as well
+address space, so the first terminal fault in any of the driver's
+threads posts to it as well
 ([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)
 § Label 1, **Death relay**). Both spawn paths, `CREATE_PROCESS` from the
 boot module and `CREATE_FROM_FILE`, set up both bindings. An unmount

@@ -1277,8 +1277,9 @@ pub unsafe fn thread_configure_with_tls(
 /// with no exception handler bound, or of the fault of a restartable syscall's
 /// user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), is not
 /// resumed: starting it kills it as an unhandled fault, which posts its death
-/// and address-space observers, or, for the fault of a restartable syscall's
-/// user copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
+/// observers and, when the fault is its address space's first terminal fault,
+/// the space's observers, or, for the fault of a restartable syscall's user
+/// copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
 /// § Delivery, Resume, and Kill). Starting one whose claiming reply was a
 /// `FAULT_REPLY_REDIRECT` that named an endpoint delivers the fault there. An
 /// upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or
@@ -3241,12 +3242,14 @@ pub fn thread_bind_notification(
 
 /// Register a terminal-fault death-notification observer on an address space.
 ///
-/// When a thread in the target address space takes a *terminal* fault, the
-/// kernel posts the two-word entry `(exit_reason, correlator)` to
-/// `event_queue_cap` (see [`DeathEvent`]), where `exit_reason` is the fault class
-/// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
-/// riscv64). A fault of a thread's own access is terminal on any kill outcome
-/// of the fault protocol:
+/// When a thread in the target address space takes the space's first
+/// *terminal* fault, the kernel posts the two-word entry
+/// `(exit_reason, correlator)` to `event_queue_cap` (see [`DeathEvent`]), where
+/// `exit_reason` is the fault class (`EXIT_FAULT_BASE + vector` on x86-64,
+/// `EXIT_FAULT_BASE + cause` on riscv64). The space dies once: a later
+/// terminal fault of another of its threads posts nothing, so a binding
+/// receives one entry. A fault of a thread's own access is terminal on any kill
+/// outcome of the fault protocol:
 ///
 /// - no fault handler bound;
 /// - a `KILL` reply;

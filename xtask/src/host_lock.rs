@@ -33,7 +33,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
-use serde_json::{Value, json};
+use json::{Value, json};
 
 use crate::cli::{BootHostArgs, HostArgs};
 use crate::context::Context;
@@ -409,8 +409,7 @@ pub fn read_grant(dir: &Path) -> Result<Option<String>>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     };
-    let value: Value =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let value: Value = json::parse(&raw).with_context(|| format!("parsing {}", path.display()))?;
     let holder = value
         .get("holder")
         .and_then(Value::as_str)
@@ -456,7 +455,7 @@ fn unix_secs() -> u64
 /// (a record being written, seen by a reader outside the admission lock).
 fn parse_holder(raw: &str) -> Option<Holder>
 {
-    let value: Value = serde_json::from_str(raw).ok()?;
+    let value: Value = json::parse(raw).ok()?;
     let number = |key: &str| {
         value
             .get(key)

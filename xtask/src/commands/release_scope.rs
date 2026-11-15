@@ -20,7 +20,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use json::{Value, json};
 
 use crate::cli::ReleaseScopeArgs;
 use crate::context::Context as BuildContext;
@@ -805,7 +805,7 @@ pub fn run(ctx: &BuildContext, args: &ReleaseScopeArgs) -> Result<()>
         Some((list, n)) => scope.page(list, n, per_page)?,
         None => scope.summary(per_page),
     };
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    println!("{}", out.to_string_pretty());
     Ok(())
 }
 

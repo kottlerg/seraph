@@ -1744,7 +1744,9 @@ printed them without styling: the same subcommands, arguments, values, defaults,
 requirements; the same help screens, byte for byte; the same error kinds, with the same message
 up to its first blank line; and exit status 0 for help and 2 for an error. An error's `Usage:`
 line is the command's own usage line, without the arguments given or a suggested one, and an
-error prints no `tip:` lines.
+error prints no `tip:` lines. An argument that is not valid UTF-8 is refused with clap's
+`InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
+bytes.
 
 `src/argparse/reference/` holds the evidence: every help screen of the table, and 9193 command
 lines with their outcome (the command and the values parsed, or the error's kind and message),

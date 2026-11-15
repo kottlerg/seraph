@@ -46,11 +46,9 @@ impl Cli
     #[must_use]
     pub fn parse() -> Self
     {
-        let argv: Vec<String> = std::env::args_os()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
         Self::command()
-            .parse_into(&argv)
+            .parse_os_into(&argv)
             .unwrap_or_else(|err| err.exit())
     }
 }
@@ -1879,5 +1877,67 @@ mod tests
         assert!(build_host_of(&["xtask", "run"]).is_none());
         assert!(build_host_of(&["xtask", "lint-docs"]).is_none());
         assert!(build_host_of(&["xtask", "host", "status"]).is_none());
+    }
+
+    /// Parse `words` as the process's argv, the word `BAD` standing for an
+    /// argument that is not valid UTF-8.
+    #[cfg(unix)]
+    fn parse_bytes(words: &[&str]) -> Result<Cli, crate::argparse::Error>
+    {
+        use std::ffi::{OsStr, OsString};
+        use std::os::unix::ffi::OsStrExt as _;
+        let argv: Vec<OsString> = words
+            .iter()
+            .map(|word| match *word
+            {
+                "BAD" => OsStr::from_bytes(b"out\xff.img").to_owned(),
+                _ => OsString::from(word),
+            })
+            .collect();
+        Cli::command().parse_os_into(&argv)
+    }
+
+    // Defect caught: an argument that is not valid UTF-8 converted lossily,
+    // so a path option names another file and a text option takes an
+    // altered value, where clap refused text that is not UTF-8.
+    #[cfg(unix)]
+    #[test]
+    fn an_argument_that_is_not_utf8_is_refused_with_its_command_s_usage()
+    {
+        use crate::argparse::ErrorKind;
+        for (words, usage) in [
+            (
+                &["xtask", "symbolize", "--kernel", "BAD", "0x1"][..],
+                "Usage: xtask symbolize",
+            ),
+            (
+                &["xtask", "build", "--arch", "BAD"][..],
+                "Usage: xtask build",
+            ),
+            (&["xtask", "BAD", "build"][..], "Usage: xtask <COMMAND>"),
+            (&["xtask", "host", "BAD"][..], "Usage: xtask host"),
+            (&["xtask", "help", "BAD"][..], "Usage: xtask <COMMAND>"),
+        ]
+        {
+            let error = parse_bytes(words)
+                .err()
+                .unwrap_or_else(|| panic!("{words:?} parsed"));
+            assert_eq!(error.kind(), ErrorKind::InvalidUtf8, "{words:?}");
+            assert_eq!(error.exit_code(), 2, "{words:?}");
+            let text = error.to_string();
+            assert!(
+                text.starts_with("error: invalid UTF-8 was detected in one or more arguments\n\n"),
+                "{text}"
+            );
+            assert!(text.contains(usage), "{words:?}: {text}");
+        }
+        // An error the parser meets first is the one reported.
+        let first = parse_bytes(&["xtask", "build", "--no-such", "BAD"])
+            .err()
+            .unwrap();
+        assert_eq!(first.kind(), ErrorKind::UnknownArgument);
+        // The program's name may be any bytes.
+        let named = parse_bytes(&["BAD", "build"]).unwrap();
+        assert!(matches!(named.command, CliCommand::Build(_)));
     }
 }

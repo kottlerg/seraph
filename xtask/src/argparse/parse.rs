@@ -15,6 +15,8 @@
 //! comes first, as clap did). After the tokens, the command's conflicts, then
 //! its required arguments, are checked; defaults fill what the line left out.
 
+use std::ffi::OsString;
+
 use super::help;
 use super::{Arg, Command, Error, ErrorKind, Kind, Matches, Source};
 
@@ -272,9 +274,45 @@ fn check(arg: &Arg, value: &str) -> Result<(), Error>
 }
 
 /// Parse `argv` (the program's name first) against the command table `root`.
+#[cfg(test)]
 pub(super) fn parse(root: &Command, argv: &[String]) -> Result<Matches, Error>
 {
-    parse_command(root, argv.get(1..).unwrap_or_default())
+    parse_command(root, argv.get(1..).unwrap_or_default(), None)
+}
+
+/// Parse the process's `argv` (the program's name first) against `root`. The
+/// first argument after the name that is not valid UTF-8 is refused with
+/// [`ErrorKind::InvalidUtf8`] when the parser reaches it, as clap refused
+/// one; the program's name may be any bytes.
+pub(super) fn parse_os(root: &Command, argv: &[OsString]) -> Result<Matches, Error>
+{
+    let mut bad = None;
+    let tokens: Vec<String> = argv
+        .iter()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.to_str().map_or_else(
+                || {
+                    bad = bad.or(Some(index));
+                    String::new()
+                },
+                str::to_owned,
+            )
+        })
+        .collect();
+    parse_command(root, &tokens, bad)
+}
+
+/// The error for an argument that is not valid UTF-8, met while parsing
+/// `cmd`'s arguments.
+fn invalid_utf8(cmd: &Command) -> Error
+{
+    usage_error(
+        cmd,
+        ErrorKind::InvalidUtf8,
+        "invalid UTF-8 was detected in one or more arguments",
+    )
 }
 
 /// The `help` subcommand of `cmd` given `names`: the long help of the
@@ -332,12 +370,13 @@ fn unmatched(cmd: &Command, token: &str) -> Error
     )
 }
 
-/// Parse `tokens`, the command line after `cmd`'s name.
+/// Parse `tokens`, the command line after `cmd`'s name; `bad` is the index
+/// of the first token that was not valid UTF-8, if any.
 #[expect(
     clippy::too_many_lines,
     reason = "one pass over the tokens in clap's order; split, the order of its checks would be harder to follow"
 )]
-fn parse_command(cmd: &Command, tokens: &[String]) -> Result<Matches, Error>
+fn parse_command(cmd: &Command, tokens: &[String], bad: Option<usize>) -> Result<Matches, Error>
 {
     let positionals: Vec<usize> = cmd
         .args
@@ -353,6 +392,10 @@ fn parse_command(cmd: &Command, tokens: &[String]) -> Result<Matches, Error>
     let mut subcommand = None;
     for (index, token) in tokens.iter().enumerate()
     {
+        if bad == Some(index)
+        {
+            return Err(invalid_utf8(cmd));
+        }
         let hyphen_positional = positionals
             .get(next_positional)
             .and_then(|&at| cmd.args.get(at))
@@ -363,6 +406,10 @@ fn parse_command(cmd: &Command, tokens: &[String]) -> Result<Matches, Error>
             {
                 if token == "help"
                 {
+                    if bad.is_some()
+                    {
+                        return Err(invalid_utf8(cmd));
+                    }
                     return Err(help_subcommand(
                         cmd,
                         tokens.get(index.saturating_add(1)..).unwrap_or_default(),
@@ -546,7 +593,11 @@ fn parse_command(cmd: &Command, tokens: &[String]) -> Result<Matches, Error>
             .subcommands
             .get(sub)
             .ok_or_else(|| Error::internal("subcommand index out of range"))?;
-        let sub_matches = parse_command(sub_cmd, tokens.get(from..).unwrap_or_default())?;
+        let sub_matches = parse_command(
+            sub_cmd,
+            tokens.get(from..).unwrap_or_default(),
+            bad.and_then(|index| index.checked_sub(from)),
+        )?;
         matches.subcommand = Some((sub_cmd.name.clone(), Box::new(sub_matches)));
     }
     else if !cmd.subcommands.is_empty()

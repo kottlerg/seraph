@@ -343,9 +343,21 @@ impl Command
     ///
     /// # Errors
     /// The command line's [`Error`]: a usage error, or a help request.
+    #[cfg(test)]
     pub fn parse_into<A: Args>(&self, argv: &[String]) -> Result<A, Error>
     {
         let mut matches = parse::parse(self, argv)?;
+        A::from_matches(&mut matches)
+    }
+
+    /// Parse the process's `argv` (the program's name first) into `A`.
+    ///
+    /// # Errors
+    /// As [`Command::parse_into`], and [`ErrorKind::InvalidUtf8`] for an
+    /// argument that is not valid UTF-8.
+    pub fn parse_os_into<A: Args>(&self, argv: &[std::ffi::OsString]) -> Result<A, Error>
+    {
+        let mut matches = parse::parse_os(self, argv)?;
         A::from_matches(&mut matches)
     }
 }
@@ -434,6 +446,8 @@ pub enum ErrorKind
     MissingSubcommand,
     /// `-h` or `--help`: the help, printed to stdout.
     DisplayHelp,
+    /// An argument that is not valid UTF-8.
+    InvalidUtf8,
     /// Nothing given to a command that needs a subcommand: the help, printed
     /// to stderr.
     DisplayHelpOnMissingArgumentOrSubcommand,

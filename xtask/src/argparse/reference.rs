@@ -259,6 +259,7 @@ fn outcome(
                 | ErrorKind::ArgumentConflict
                 | ErrorKind::MissingRequiredArgument
                 | ErrorKind::MissingSubcommand
+                | ErrorKind::InvalidUtf8
                 | ErrorKind::Internal) =>
                 {
                     let first = text.split("\n\n").next().unwrap_or_default();
@@ -416,6 +417,10 @@ fn every_help_screen_prints_as_recorded()
 #[test]
 fn the_corpus_names_every_command_s_help_screens()
 {
+    if std::env::var_os(BLESS).is_some()
+    {
+        return;
+    }
     let recorded: Vec<String> = screens(HELP).into_iter().map(|(name, _)| name).collect();
     assert_eq!(recorded, screen_names(&Cli::command()));
 }

@@ -150,9 +150,10 @@ unsafe fn save_fp_to(area: *mut u8)
             "fsd f30, 240({a})",
             "fsd f31, 248({a})",
             "csrr {tmp}, fcsr",
-            "sd {tmp}, 256({a})",
+            "sd {tmp}, {fcsr}({a})",
             ".option pop",
             a = in(reg) area,
+            fcsr = const syscall::EXT_REGS_RISCV64_FCSR_OFFSET,
             tmp = out(reg) _,
             options(nostack),
         );
@@ -210,10 +211,11 @@ unsafe fn restore_fp_from(area: *const u8)
             "fld f29, 232({a})",
             "fld f30, 240({a})",
             "fld f31, 248({a})",
-            "ld {tmp}, 256({a})",
+            "ld {tmp}, {fcsr}({a})",
             "csrw fcsr, {tmp}",
             ".option pop",
             a = in(reg) area,
+            fcsr = const syscall::EXT_REGS_RISCV64_FCSR_OFFSET,
             tmp = out(reg) _,
             options(nostack),
         );
@@ -398,11 +400,13 @@ pub fn vlenb() -> u64
 }
 
 /// Offset of `v0` in the save area: the 32 F/D registers and `fcsr` (264
-/// bytes), then `vstart`, `vl`, `vtype` and `vcsr`, padded to 304. The save
-/// and restore asm ([`save_v_to`], [`restore_v_from`]) takes it as a `const`
-/// operand, and the area's size is computed from it ([`cache_vlenb`]), so the
-/// layout is stated once.
-const V_REGS_OFFSET: u64 = 304;
+/// bytes), then `vstart`, `vl`, `vtype` and `vcsr`, padded to 304. The
+/// save area is the image `SYS_THREAD_READ_EXT_REGS` reads, so the ABI states
+/// its layout (`syscall::EXT_REGS_RISCV64_*`). The save and restore asm
+/// ([`save_fp_to`], [`save_v_to`] and their restores) takes those offsets as
+/// `const` operands, and the area's size is computed from this one
+/// ([`cache_vlenb`]), so the layout is stated once.
+const V_REGS_OFFSET: u64 = syscall::EXT_REGS_RISCV64_V0_OFFSET as u64;
 
 /// Largest `vlenb` the V specification allows (VLEN 65536). A hart reporting
 /// more is not conforming; refusing it keeps the save-area arithmetic in range.
@@ -532,7 +536,7 @@ pub unsafe fn check_ap_vlenb() {}
 
 /// Save V state (vstart, vl, vtype, vcsr and v0..v31) to `area`.
 ///
-/// Layout offsets within `area`:
+/// Layout offsets within `area` (`syscall::EXT_REGS_RISCV64_*`):
 /// - 264..272: vstart
 /// - 272..280: vl
 /// - 280..288: vtype
@@ -552,13 +556,13 @@ unsafe fn save_v_to(area: *mut u8)
             ".option push",
             ".option arch, +v",
             "csrr {tmp}, vstart",
-            "sd {tmp}, 264({a})",
+            "sd {tmp}, {vstart}({a})",
             "csrr {tmp}, vl",
-            "sd {tmp}, 272({a})",
+            "sd {tmp}, {vl}({a})",
             "csrr {tmp}, vtype",
-            "sd {tmp}, 280({a})",
+            "sd {tmp}, {vtype}({a})",
             "csrr {tmp}, vcsr",
-            "sd {tmp}, 288({a})",
+            "sd {tmp}, {vcsr}({a})",
             "addi {p}, {a}, {off}",
             "csrr {stride}, vlenb",
             "slli {stride}, {stride}, 3",
@@ -572,6 +576,10 @@ unsafe fn save_v_to(area: *mut u8)
             ".option pop",
             a = in(reg) area,
             off = const V_REGS_OFFSET,
+            vstart = const syscall::EXT_REGS_RISCV64_VSTART_OFFSET,
+            vl = const syscall::EXT_REGS_RISCV64_VL_OFFSET,
+            vtype = const syscall::EXT_REGS_RISCV64_VTYPE_OFFSET,
+            vcsr = const syscall::EXT_REGS_RISCV64_VCSR_OFFSET,
             tmp = out(reg) _,
             p = out(reg) _,
             stride = out(reg) _,
@@ -620,17 +628,21 @@ unsafe fn restore_v_from(area: *const u8)
             "add {p}, {p}, {stride}",
             "vl8re8.v v24, ({p})",
             // Restore vtype + vl exactly (AVL = saved vl).
-            "ld {vl}, 272({a})",
-            "ld {vtype}, 280({a})",
+            "ld {vl}, {vl_at}({a})",
+            "ld {vtype}, {vtype_at}({a})",
             "vsetvl x0, {vl}, {vtype}",
             // vsetvl clears vstart; restore vcsr then vstart from the area.
-            "ld {tmp}, 288({a})",
+            "ld {tmp}, {vcsr_at}({a})",
             "csrw vcsr, {tmp}",
-            "ld {tmp}, 264({a})",
+            "ld {tmp}, {vstart_at}({a})",
             "csrw vstart, {tmp}",
             ".option pop",
             a = in(reg) area,
             off = const V_REGS_OFFSET,
+            vl_at = const syscall::EXT_REGS_RISCV64_VL_OFFSET,
+            vtype_at = const syscall::EXT_REGS_RISCV64_VTYPE_OFFSET,
+            vcsr_at = const syscall::EXT_REGS_RISCV64_VCSR_OFFSET,
+            vstart_at = const syscall::EXT_REGS_RISCV64_VSTART_OFFSET,
             tmp = out(reg) _,
             vl = out(reg) _,
             vtype = out(reg) _,

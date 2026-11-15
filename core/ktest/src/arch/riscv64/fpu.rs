@@ -14,7 +14,9 @@
 //! registers in between. The kernel is soft-float and saves and restores the
 //! live extended state as `core/kernel/docs/scheduler.md` § What Gets Saved and
 //! Restored specifies. Callers: `crate::unit::fpu` and
-//! `crate::integration::fpu_survives_ipc_call`.
+//! `crate::integration::fpu_survives_ipc_call`. [`load_and_spin`] instead
+//! holds the loaded values while the thread spins, for a stop to find them in
+//! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
 
 /// Load `pattern` into f0..f31 and lane 0 of v0..v31, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -482,4 +484,208 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
         }
     }
     mismatches
+}
+
+/// Load `f0`..`f31` and element 0 of `v0`..`v31` with per-register values
+/// (`vl` = 1 at `e64`, `m1`, tail and mask agnostic), then spin for ever,
+/// adding one to `progress` each pass, so a stop finds the values in the
+/// thread's saved extended state. `f{i}` holds `pattern ^ i` and element 0 of
+/// `v{i}` holds `!pattern ^ i`. [`for_each_ext_word`] states where the image
+/// holds them. Caller: `crate::integration::thread_ext_regs`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "32 F loads and 32 V broadcasts, each from its own pattern, dominate the body"
+)]
+pub fn load_and_spin(pattern: u64, progress: &core::sync::atomic::AtomicU32) -> !
+{
+    // SAFETY: the asm writes only the F and V registers and the scratch
+    // registers `t0` and `t1`, which a block that never returns may
+    // overwrite, and increments `progress`, a live atomic, with an AMO. The
+    // scratch registers are named, not allocated, since the compiler may give
+    // two operands of one value one register. The D and V instructions run
+    // with FS and VS enabled on first touch by the kernel's lazy trap, as for
+    // [`preempt_capture`].
+    unsafe {
+        core::arch::asm!(
+            ".option push",
+            ".option arch, +d, +v",
+            "xori t0, {p}, 0",
+            "fmv.d.x f0, t0",
+            "xori t0, {p}, 1",
+            "fmv.d.x f1, t0",
+            "xori t0, {p}, 2",
+            "fmv.d.x f2, t0",
+            "xori t0, {p}, 3",
+            "fmv.d.x f3, t0",
+            "xori t0, {p}, 4",
+            "fmv.d.x f4, t0",
+            "xori t0, {p}, 5",
+            "fmv.d.x f5, t0",
+            "xori t0, {p}, 6",
+            "fmv.d.x f6, t0",
+            "xori t0, {p}, 7",
+            "fmv.d.x f7, t0",
+            "xori t0, {p}, 8",
+            "fmv.d.x f8, t0",
+            "xori t0, {p}, 9",
+            "fmv.d.x f9, t0",
+            "xori t0, {p}, 10",
+            "fmv.d.x f10, t0",
+            "xori t0, {p}, 11",
+            "fmv.d.x f11, t0",
+            "xori t0, {p}, 12",
+            "fmv.d.x f12, t0",
+            "xori t0, {p}, 13",
+            "fmv.d.x f13, t0",
+            "xori t0, {p}, 14",
+            "fmv.d.x f14, t0",
+            "xori t0, {p}, 15",
+            "fmv.d.x f15, t0",
+            "xori t0, {p}, 16",
+            "fmv.d.x f16, t0",
+            "xori t0, {p}, 17",
+            "fmv.d.x f17, t0",
+            "xori t0, {p}, 18",
+            "fmv.d.x f18, t0",
+            "xori t0, {p}, 19",
+            "fmv.d.x f19, t0",
+            "xori t0, {p}, 20",
+            "fmv.d.x f20, t0",
+            "xori t0, {p}, 21",
+            "fmv.d.x f21, t0",
+            "xori t0, {p}, 22",
+            "fmv.d.x f22, t0",
+            "xori t0, {p}, 23",
+            "fmv.d.x f23, t0",
+            "xori t0, {p}, 24",
+            "fmv.d.x f24, t0",
+            "xori t0, {p}, 25",
+            "fmv.d.x f25, t0",
+            "xori t0, {p}, 26",
+            "fmv.d.x f26, t0",
+            "xori t0, {p}, 27",
+            "fmv.d.x f27, t0",
+            "xori t0, {p}, 28",
+            "fmv.d.x f28, t0",
+            "xori t0, {p}, 29",
+            "fmv.d.x f29, t0",
+            "xori t0, {p}, 30",
+            "fmv.d.x f30, t0",
+            "xori t0, {p}, 31",
+            "fmv.d.x f31, t0",
+            "li t0, 1",
+            "vsetvli zero, t0, e64, m1, ta, ma",
+            "not t1, {p}",
+            "xori t0, t1, 0",
+            "vmv.v.x v0, t0",
+            "xori t0, t1, 1",
+            "vmv.v.x v1, t0",
+            "xori t0, t1, 2",
+            "vmv.v.x v2, t0",
+            "xori t0, t1, 3",
+            "vmv.v.x v3, t0",
+            "xori t0, t1, 4",
+            "vmv.v.x v4, t0",
+            "xori t0, t1, 5",
+            "vmv.v.x v5, t0",
+            "xori t0, t1, 6",
+            "vmv.v.x v6, t0",
+            "xori t0, t1, 7",
+            "vmv.v.x v7, t0",
+            "xori t0, t1, 8",
+            "vmv.v.x v8, t0",
+            "xori t0, t1, 9",
+            "vmv.v.x v9, t0",
+            "xori t0, t1, 10",
+            "vmv.v.x v10, t0",
+            "xori t0, t1, 11",
+            "vmv.v.x v11, t0",
+            "xori t0, t1, 12",
+            "vmv.v.x v12, t0",
+            "xori t0, t1, 13",
+            "vmv.v.x v13, t0",
+            "xori t0, t1, 14",
+            "vmv.v.x v14, t0",
+            "xori t0, t1, 15",
+            "vmv.v.x v15, t0",
+            "xori t0, t1, 16",
+            "vmv.v.x v16, t0",
+            "xori t0, t1, 17",
+            "vmv.v.x v17, t0",
+            "xori t0, t1, 18",
+            "vmv.v.x v18, t0",
+            "xori t0, t1, 19",
+            "vmv.v.x v19, t0",
+            "xori t0, t1, 20",
+            "vmv.v.x v20, t0",
+            "xori t0, t1, 21",
+            "vmv.v.x v21, t0",
+            "xori t0, t1, 22",
+            "vmv.v.x v22, t0",
+            "xori t0, t1, 23",
+            "vmv.v.x v23, t0",
+            "xori t0, t1, 24",
+            "vmv.v.x v24, t0",
+            "xori t0, t1, 25",
+            "vmv.v.x v25, t0",
+            "xori t0, t1, 26",
+            "vmv.v.x v26, t0",
+            "xori t0, t1, 27",
+            "vmv.v.x v27, t0",
+            "xori t0, t1, 28",
+            "vmv.v.x v28, t0",
+            "xori t0, t1, 29",
+            "vmv.v.x v29, t0",
+            "xori t0, t1, 30",
+            "vmv.v.x v30, t0",
+            "xori t0, t1, 31",
+            "vmv.v.x v31, t0",
+            "li t0, 1",
+            "2:",
+            "amoadd.w zero, t0, ({c})",
+            "j 2b",
+            ".option pop",
+            p = in(reg) pattern,
+            c = in(reg) progress.as_ptr(),
+            in("t0") 0u64,
+            in("t1") 0u64,
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// Pass each 64-bit word of the extended-state image `SYS_THREAD_READ_EXT_REGS`
+/// returns that [`load_and_spin`] with `pattern` sets, as its byte offset, the
+/// mask of the bits to compare, and their value, to `check`; stops at the
+/// first word `check` refuses and returns whether every word passed. The
+/// image of `image_bytes` bytes holds `f{i}` at
+/// `EXT_REGS_RISCV64_F0_OFFSET + 8i`, `vl` and `vtype` at their offsets, and
+/// `v{i}` at `EXT_REGS_RISCV64_V0_OFFSET + i * vlenb`, `vlenb` being a 32nd of
+/// the bytes past that offset.
+pub fn for_each_ext_word(
+    pattern: u64,
+    image_bytes: u64,
+    check: &mut dyn FnMut(u64, u64, u64) -> bool,
+) -> bool
+{
+    use syscall_abi::{
+        EXT_REGS_RISCV64_F0_OFFSET, EXT_REGS_RISCV64_V0_OFFSET, EXT_REGS_RISCV64_VL_OFFSET,
+        EXT_REGS_RISCV64_VTYPE_OFFSET,
+    };
+    /// `vtype` for `e64`, `m1`, `ta`, `ma`: `vsew` 3 at bits 5:3, `vta` bit 6,
+    /// `vma` bit 7.
+    const VTYPE_E64_M1_TA_MA: u64 = 0xD8;
+    let v0 = EXT_REGS_RISCV64_V0_OFFSET as u64;
+    let vlenb = image_bytes.saturating_sub(v0) / 32;
+    let f = (EXT_REGS_RISCV64_F0_OFFSET as u64..).step_by(8);
+    let v = core::iter::successors(Some(v0), |at| at.checked_add(vlenb));
+    check(EXT_REGS_RISCV64_VL_OFFSET as u64, u64::MAX, 1)
+        && check(
+            EXT_REGS_RISCV64_VTYPE_OFFSET as u64,
+            u64::MAX,
+            VTYPE_E64_M1_TA_MA,
+        )
+        && (0u64..32).zip(f.zip(v)).all(|(i, (f_at, v_at))| {
+            check(f_at, u64::MAX, pattern ^ i) && check(v_at, u64::MAX, !pattern ^ i)
+        })
 }

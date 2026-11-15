@@ -12,9 +12,11 @@
 //! syscall runs to its return without a switch to another thread, so each
 //! syscall's use of the buffer ends before the next one's begins.
 //!
-//! Users: `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM` stage the bytes
-//! they move ([`thread_mem`]), and `SYS_CAP_REVOKE` snapshots each batch's
-//! revoked objects ([`revoke_snapshot`]).
+//! Users: `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` and
+//! `SYS_THREAD_READ_EXT_REGS` stage the bytes they move, and
+//! `SYS_THREAD_LIST_PAGES` the runs it builds ([`thread_mem`]), and
+//! `SYS_CAP_REVOKE` snapshots each batch's revoked objects
+//! ([`revoke_snapshot`]).
 
 use core::ptr::NonNull;
 
@@ -28,7 +30,7 @@ use crate::cap::object::KernelObjectHeader;
 #[repr(C)]
 union SyscallScratch
 {
-    /// The thread-memory syscalls' staged bytes.
+    /// The thread-memory and thread-state syscalls' staged bytes.
     thread_mem: [u8; syscall::MAX_THREAD_MEM_COPY],
     /// `SYS_CAP_REVOKE`'s copy of one batch's revoked objects.
     revoke: [Option<NonNull<KernelObjectHeader>>; MAX_REVOKE_EDITS],

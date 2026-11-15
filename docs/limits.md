@@ -169,6 +169,7 @@ Tracked by [#636](https://github.com/kottlerg/seraph/issues/636).
 | `timer::init(1_000)` tick period | `core/kernel/src/main.rs` | 1000 us | tuning (bounds no capacity) | none | correct as is | None |
 | `FramebufferWriter` geometry fields | `core/kernel/src/framebuffer.rs` | `u32` | ABI width (boot-protocol `FramebufferInfo`) | embedded | correct as is | None |
 | `platform::ValidatedApertures` | `core/kernel/src/platform.rs` | none: a filtered view of `BootInfo`'s aperture list | provable unreachability (nothing is copied) | none | correct as is | None |
+| `PAGE_SCAN_BUDGET` | `core/kernel/src/mm/address_space.rs` | 4096 page-table entries per `SYS_THREAD_LIST_PAGES` call, at any level | per-call bound (it bounds the walk's hold of the page-table lock with preemption off; the caller continues from the resume address) | none | correct as is | None |
 
 ### Kernel: capabilities
 
@@ -358,6 +359,7 @@ and the generation) was decided on [#637](https://github.com/kottlerg/seraph/iss
 | `MAX_ENTROPY_CONTRIBUTE_LEN` | `abi/syscall/src/lib.rs` | 256 B | per-call bound (callers loop; it bounds the kernel's stack copy and the interrupts-off hold of the pool lock) | 256 B stack | correct as is | None |
 | `CAP_INFO_MEMORY_MAPPINGS_MAX_PAGES` | `abi/syscall/src/lib.rs` | 512 pages per window | batch size (a larger region is read window by window) | none | correct as is | None |
 | `MAX_THREAD_MEM_COPY` | `abi/syscall/src/lib.rs` | 4096 B per call | per-call bound (the kernel stages the bytes in the per-CPU syscall scratch buffer, `core/kernel/src/syscall/scratch.rs`; a debugger loops over a larger range) | 4 KiB per CPU, the scratch buffer, which `SYS_CAP_REVOKE`'s 2 KiB batch snapshot (`MAX_REVOKE_EDITS`) shares | correct as is | None |
+| `MAX_PAGE_RUNS` | `abi/syscall/src/lib.rs` | 128 runs per call | per-call bound (the kernel stages the runs, 24 B each, in the per-CPU syscall scratch buffer, within `MAX_THREAD_MEM_COPY`; a caller continues from the resume address) | 3 KiB of the 4 KiB per-CPU scratch buffer | correct as is | None |
 | `MAX_HARVEST_PAGES` | `abi/syscall/src/lib.rs` | 4096 pages per call | per-call bound (it bounds `SYS_ASPACE_HARVEST`'s bitmap on the kernel stack and its hold of the page-table lock; a pager loops over a larger range) | 512 B stack | correct as is | None |
 | `encode_exit_code` range | `abi/syscall/src/lib.rs` | 12-bit code below `EXIT_FAULT_BASE` | encoding artefact (flat exit-reason space) | none | correct as is | Saturates; never aliases success |
 | `KERNEL_VERSION` packing | `abi/syscall/src/lib.rs` | 32 / 16 / 16 bits | encoding artefact | none | correct as is | None |

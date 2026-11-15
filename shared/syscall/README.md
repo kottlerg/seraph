@@ -20,7 +20,7 @@ pointer for the kernel's buffer-validation tests.
 
 A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object
 occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`,
-`thread_read_mem`, `aspace_harvest`). The
+`thread_read_mem`, `aspace_harvest`, `thread_list_pages`, `thread_read_ext_regs`). The
 `cap_create_*` retype wrappers are safe on that rule because the kernel never carves a page some
 address space maps, so a retype cannot overwrite bytes the caller reaches through a mapping; one
 that would fails with `OutOfMemory`, as § Capability Syscalls of

@@ -1119,7 +1119,8 @@ impl OutputDriver
     {
         let class = self.class.load(Ordering::Acquire);
         // SAFETY: ipc_buf is the calling thread's registered IPC buffer page.
-        let (ordinal, cap) = unsafe { ipc::first_device_from(class, start, ipc_buf) }.unwrap_or((0, 0));
+        let (ordinal, cap) =
+            unsafe { ipc::first_device_from(class, start, ipc_buf) }.unwrap_or((0, 0));
         self.ordinal.store(ordinal, Ordering::Relaxed);
         let old = self.cap.swap(cap, Ordering::AcqRel);
         if old != 0

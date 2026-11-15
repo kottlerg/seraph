@@ -1,7 +1,8 @@
 # shared/aml
 
 The ACPI Machine Language (AML) of ACPI 6.5 § 20: its encodings, the resource-template decoder,
-the term parser, and the namespace a DSDT and its SSDTs load into.
+the term parser, the namespace a DSDT and its SSDTs load into, and the evaluator that runs their
+code, reaching hardware through a host trait.
 
 ---
 
@@ -24,7 +25,19 @@ aml/
     ├── parse.rs                # Term parser
     ├── namespace.rs            # Object tree, search rules, predefined objects, code store
     ├── load.rs                 # Table load (Namespace::load_table, LoadReport)
-    └── tests.rs                # Host tests over hand-assembled AML and the fixtures
+    ├── value.rs                # Values (Data), object references, data conversions
+    ├── host.rs                 # The Host trait the evaluator reaches hardware through
+    ├── eval/
+    │   ├── mod.rs              # Evaluator: frames, calls, control flow, module-level code
+    │   ├── expr.rs             # Operand terms and the operators that compute a value
+    │   ├── place.rs            # Targets, references, the store rules
+    │   ├── field.rs            # Operation regions, field units, buffer fields
+    │   └── sync.rs             # Mutexes, events, the global lock, delays, Notify
+    └── tests/
+        ├── mod.rs              # Parser and loader tests over hand-assembled AML and the fixtures
+        ├── eval.rs             # Evaluator tests over hand-assembled AML
+        ├── sim.rs              # The simulated QEMU machine behind the Host trait
+        └── qemu.rs             # The fixtures' methods run on the simulated machine
 ```
 
 `no_std` with `alloc`, no dependency. Host-tested (`cargo xtask test`).
@@ -39,6 +52,9 @@ aml/
 | `resource` | `descriptors`, an iterator over the descriptors of a resource template (§ 6.4), address windows included | No |
 | `term`, `parse` | `Term`, one per opcode, name reference or data object, with its operands in encoding order; the parser that produces it | Yes |
 | `namespace` | `Namespace`: the object tree, name resolution, the objects a load creates, and the code store | Yes |
+| `value` | `Data`, the value of a data object or an expression; `Ref`, an object reference; the conversions of ACPI 6.5 § 19.3.5 | Yes |
+| `host` | `Host`, the trait through which the evaluator reaches operation regions, notifications, delays, the timer, the global lock and `_OSI` | No |
+| `eval` | `Evaluator`: runs control methods and module-level code over a `Namespace` and a `Host` | Yes |
 
 The alloc-free modules serve a caller with no heap: devmgr's static walk of the namespace and its
 `_CRS` adapter (`services/devmgr/firmware/src/aml.rs`) are built on them.
@@ -117,15 +133,79 @@ code. `parse_methods` parses every method and counts the methods that fault.
 
 ---
 
+## Evaluation
+
+`Evaluator::new` borrows a `Namespace` and a `Host`. `evaluate` (or `evaluate_path`, from an
+absolute path) calls a method with its arguments or reads any other object's value, and
+`run_module_code` runs the module-level terms the loads kept, in load order, each as its own
+evaluation, the objects it creates owned by its table. Each evaluation starts with the full
+budget of every bound (§ Bounds) and ends with a value or a `Fault`, never a panic; at its end
+every mutex it left held, the global lock among them, is released.
+
+The evaluator walks the parsed terms of each method's code, which the namespace parses on first
+use. A call pushes a frame holding the method's seven arguments and eight locals; the objects
+the method creates belong to the frame and are removed when it returns, normally or by a fault,
+so a fault leaves the namespace as the code changed it up to the fault, without the frames'
+objects. A table of revision below 2 runs with 32-bit integers.
+
+Values own their data: a package holds its elements and a buffer its bytes. An object reference
+(`RefOf`, `Index`, `CondRefOf`) names where the object lives (a namespace node with its
+generation, a frame's local or argument, or a temporary it owns) and an index path into it, so a
+store through it changes the object in place, and a reference to a removed node or to a returned
+frame's local resolves to nothing. A package element that is an unresolved name is resolved from
+the scope of the package's `Name` when it is read through `Index`.
+
+The store rules are those of ACPI 6.5 § 19.3.5: a store to a named integer, string or buffer
+converts the value to that type, a buffer keeping its length; a store to a named object of any
+other data type, or to a local, replaces it; a store to an argument holding a reference stores
+through it; a store to a field unit or buffer field writes it. `CopyObject` replaces without
+converting.
+
+A field unit is accessed in datums of its access width, each aligned to that width from the
+start of its region, a datum it covers in part written under its update rule (preserve, write as
+ones, write as zeros). A `BankField` unit writes its bank value first; an `IndexField` unit
+writes each datum's byte offset to its index field and moves the datum through its data field.
+A unit whose lock rule says so holds the firmware global lock across the access. A unit wider
+than an integer reads as a buffer. A region is `SystemMemory`, `SystemIO` or `PCI_Config`; its
+offset and length are evaluated when a method defines it, or at its first access when a table
+does, and every access lies inside that span, which each `Host` call carries. A `PCI_Config`
+region's function is found at its first access: the segment and bus are the enclosing host
+bridge's `_SEG` and `_BBN` (0 when absent), replaced at each PCI-to-PCI bridge on the way down
+by the secondary bus number its header holds, and the device and function are the region's
+device's `_ADR`.
+
+The evaluator runs one thread of AML, so no other thread holds a mutex: `Acquire` succeeds unless
+it breaks the ordering rule of ACPI 6.5 § 19.6.2 (the current sync level is the highest among
+the mutexes held, a serialized method's own among them), and `Release` must name a mutex at the
+current level. `\_GL_` also holds the firmware global lock, which the host gives. An event
+counts its signals; `Wait` with none pending times out after its timeout, and fails with no
+timeout, since nothing could signal it. `Notify` passes the object's absolute path and the value
+to the host; `Sleep` and `Stall` go to the host's delays, and `\_OSI` asks the host.
+
+`Load`, `LoadTable`, `Unload`, `DataTableRegion`, a field `Connection`, and the region spaces
+other than the three above fail with `FaultKind::Unsupported`; `Fatal` ends the evaluation with
+`FaultKind::Fatal`.
+
+---
+
 ## Bounds
 
 The bounds are constants of `src/lib.rs`, stated in [docs/limits.md](../../docs/limits.md)
-§ devmgr: the nesting depth (`MAX_PARSE_DEPTH`), and the size of a buffer and of a package a
-table's `Name` declares (`MAX_BUFFER_BYTES`, `MAX_PACKAGE_ELEMENTS`). The namespace has no node
-bound: its arena grows with the nodes created, and a table's load creates at most one node for
-each four bytes of its AML, since every object a table declares takes at least its name segment.
-A thread that loads or parses AML MUST have `PARSE_STACK_BYTES` of stack, which a host test
-checks by a load and a parse nested to the depth bound on a thread of that size.
+§ devmgr: the parser's nesting depth (`MAX_PARSE_DEPTH`), and the size of a buffer, a string and
+a package, whether a table's `Name` declares it or an evaluation makes it (`MAX_BUFFER_BYTES`,
+`MAX_PACKAGE_ELEMENTS`). The namespace has no node bound: its arena grows with the nodes created,
+and a table's load creates at most one node for each four bytes of its AML, since every object a
+table declares takes at least its name segment. A thread that loads or parses AML MUST have
+`PARSE_STACK_BYTES` of stack, which a host test checks by a load and a parse nested to the depth
+bound on a thread of that size.
+
+Each evaluation is bounded in its call depth (`MAX_CALL_DEPTH`), its nesting of terms, calls and
+field accesses on the stack (`MAX_EVAL_DEPTH`), the terms it runs (`MAX_EVAL_STEPS`), which ends
+every loop, the bytes of the values it makes (`MAX_EVAL_ALLOC`), the nesting of packages in a
+value (`MAX_VALUE_DEPTH`), the objects it creates (`MAX_EVAL_OBJECTS`), one `Stall`
+(`MAX_STALL_US`) and its delays in all (`MAX_EVAL_DELAY_MS`). Past a bound it ends with a fault.
+A thread that evaluates MUST have `EVAL_STACK_BYTES` of stack, which a host test checks by an
+evaluation nested to the depth bound on a thread of that size.
 
 ---
 
@@ -147,7 +227,10 @@ Each is the tree's launch of its architecture with the test devices attached, 4 
 512 MiB. `cargo xtask capture-acpi --config <configuration>`
 ([xtask/README.md](../../xtask/README.md) § `cargo xtask capture-acpi`) writes a configuration's
 tables again, for a new QEMU version. The host tests load every table of every configuration and
-parse every method with no fault, and run every prefix of each table through the loader.
+parse every method with no fault, and run every prefix of each table through the loader. They
+also run every method of every configuration on a simulated machine (`src/tests/sim.rs`) that
+models the registers the methods reach as QEMU's devices implement them: ACPI PCI hotplug, CPU
+hotplug, the HPET, the LPC bridge's PIRQ routing and the root port's configuration header.
 
 Firmware tables captured from real hardware are not tracked
 ([docs/testing.md](../../docs/testing.md)).
@@ -167,7 +250,7 @@ Firmware tables captured from real hardware are not tracked
 | Document | Relevance |
 |---|---|
 | [docs/driver-binding.md](../../docs/driver-binding.md) | The ACPI namespace source of devmgr's device records |
-| [docs/limits.md](../../docs/limits.md) | The parser's and the namespace's bounds |
+| [docs/limits.md](../../docs/limits.md) | The parser's, the namespace's and the evaluator's bounds |
 | [docs/testing.md](../../docs/testing.md) | Host tests, and the rule on real-hardware firmware tables |
 
 ---

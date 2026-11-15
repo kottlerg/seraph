@@ -35,7 +35,6 @@
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 pub use boot_protocol::x86_paging::PagingDepth;
-#[cfg(not(test))]
 use boot_protocol::x86_paging::next_level_boundary;
 use boot_protocol::x86_paging::table_index;
 
@@ -1442,6 +1441,104 @@ unsafe fn walk_leaf_slots(
     }
 }
 
+// ── Page enumeration ──────────────────────────────────────────────────────────
+
+/// Pass each present 4 KiB user leaf of `[start, hi)`, in the page table
+/// rooted at `root_virt`, to `on_leaf` in VA order, as its VA, its frame and
+/// its raw bits, examining at most `budget` table entries at any level.
+/// `on_leaf` returns whether it took the leaf, and the scan stops at the first
+/// it does not take. Large-page leaves are skipped, as in [`unmap_user_region_pooled`]:
+/// the user mapping path never installs one.
+///
+/// Returns the first VA the scan did not finish: the VA of the leaf `on_leaf`
+/// did not take, the start of the span of the entry the budget stopped
+/// before, or `hi` once the whole span is scanned.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
+/// caller must hold the address space's `pt_lock`, `start` must be
+/// page-aligned, and `[start, hi)` must lie in the user half.
+#[cfg(not(test))]
+pub unsafe fn scan_user_leaves(
+    root_virt: u64,
+    start: u64,
+    hi: u64,
+    budget: usize,
+    on_leaf: &mut dyn FnMut(u64, u64, u64) -> bool,
+) -> u64
+{
+    let mut scan = LeafScan {
+        budget,
+        to_virt: crate::mm::paging::phys_to_virt,
+        on_leaf,
+    };
+    // SAFETY: root_virt is the direct-map VA of a valid root at the root
+    // level, whose tables pt_lock keeps unchanged and every one of which the
+    // direct map reaches at phys_to_virt of its frame (caller's contract).
+    unsafe { scan.table(root_virt, root_level(), start, hi) }.unwrap_or(hi)
+}
+
+/// The state of one [`scan_user_leaves`]: the entries it may still examine,
+/// the translation that reaches a table from its frame, and the leaf sink.
+struct LeafScan<'a>
+{
+    budget: usize,
+    to_virt: fn(u64) -> u64,
+    on_leaf: &'a mut dyn FnMut(u64, u64, u64) -> bool,
+}
+
+impl LeafScan<'_>
+{
+    /// Scan `[lo, hi)` under the table at `table_va`, a table at `level`;
+    /// `Some` of the VA the scan stopped at, or `None` once the span is
+    /// scanned. Bounded recursion: `level <= 4`.
+    ///
+    /// # Safety
+    /// `table_va` must address a readable 512-entry table at `level`, and
+    /// `to_virt` must map the frame of every table a present non-leaf entry
+    /// under it names to a readable address of that table, none of which
+    /// changes during the scan.
+    unsafe fn table(&mut self, table_va: u64, level: usize, lo: u64, hi: u64) -> Option<u64>
+    {
+        let mut va = lo;
+        while va < hi
+        {
+            let Some(left) = self.budget.checked_sub(1)
+            else
+            {
+                return Some(va);
+            };
+            self.budget = left;
+            // The span's last entry at the top level ends at 2^64, which the
+            // boundary wraps to 0; the user half never reaches it.
+            let boundary = next_level_boundary(level, va);
+            let end = if boundary == 0 { hi } else { hi.min(boundary) };
+            // SAFETY: table_va is a readable table (this call's contract); the
+            // index is below 512.
+            let e = unsafe { read_entry(table_va, table_index(level, va)) };
+            if let Some(child_level) = level.checked_sub(1)
+            {
+                if names_table(e, level)
+                {
+                    let child = (self.to_virt)(e.phys_addr());
+                    // SAFETY: a present non-leaf entry names a table at
+                    // child_level, readable at `child` (this call's contract).
+                    if let Some(stop) = unsafe { self.table(child, child_level, va, end) }
+                    {
+                        return Some(stop);
+                    }
+                }
+            }
+            else if e.is_present() && !(self.on_leaf)(va, e.phys_addr(), e.0)
+            {
+                return Some(va);
+            }
+            va = end;
+        }
+        None
+    }
+}
+
 /// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].
 ///
 /// Walks the kernel root from `phys_to_virt(kernel_root_table_pa())` down to
@@ -2726,6 +2823,171 @@ mod tests
             let large = PageTableEntry(PRESENT | USER | LARGE_PAGE | (p.bait() & PHYS_MASK));
             p.f.set_entry(p.pdpt(), table_index(2, p.va), large);
             assert!(walk(&p).is_none(), "{depth:?}");
+        }
+    }
+
+    // ── Leaf scan ─────────────────────────────────────────────────────────────
+
+    /// A user space at a depth, built on host frames: the path from the root
+    /// to one PD over the 1 GiB-aligned `base`, whose entry 0 and entry 2 name
+    /// PTs and whose entry 1 is a large leaf over the bait, every entry of
+    /// which is a present user "leaf", so a scan that read a large leaf's frame
+    /// as a table would report them. `leaves` lists each leaf in VA order.
+    struct Space
+    {
+        f: Frames,
+        top: usize,
+        base: u64,
+        leaves: Vec<(u64, u64, u64)>,
+    }
+
+    impl Space
+    {
+        /// The end of the PD's span: every leaf lies below it.
+        fn hi(&self) -> u64
+        {
+            self.base + (1 << 30)
+        }
+
+        /// Scan `[start, hi)` with `budget`, taking every leaf until
+        /// `refuse` names one; the leaves taken and where the scan stopped.
+        fn scan(
+            &self,
+            start: u64,
+            budget: usize,
+            refuse: Option<u64>,
+        ) -> (Vec<(u64, u64, u64)>, u64)
+        {
+            let mut got = Vec::new();
+            let mut on_leaf = |va, pa, bits| {
+                if refuse == Some(va)
+                {
+                    return false;
+                }
+                got.push((va, pa, bits));
+                true
+            };
+            let mut scan = LeafScan {
+                budget,
+                to_virt: |pa| pa,
+                on_leaf: &mut on_leaf,
+            };
+            // SAFETY: every table of the space is a live host frame reached
+            // through its `Frames` address (identity translation), and no
+            // reference to any of them is live while the scan reads.
+            let stop = unsafe { scan.table(self.f.addrs[0], self.top, start, self.hi()) };
+            (got, stop.unwrap_or(self.hi()))
+        }
+    }
+
+    fn space(depth: PagingDepth) -> Space
+    {
+        let base = va_for(depth) & !((1 << 30) - 1);
+        let top = depth.levels() - 1;
+        let f = frames(top + 3);
+        let (pd, pt_a, pt_b, bait) = (
+            f.addrs[top - 1],
+            f.addrs[top],
+            f.addrs[top + 1],
+            f.addrs[top + 2],
+        );
+        for (i, level) in (2..=top).rev().enumerate()
+        {
+            let child = PageTableEntry(PageTableEntry::new_table(f.addrs[i + 1]).0 | USER);
+            f.set_entry(f.addrs[i], table_index(level, base), child);
+        }
+        let lure = PageTableEntry(PRESENT | USER | WRITABLE | (bait & PHYS_MASK));
+        for index in 0..512
+        {
+            f.set_entry(bait, index, lure);
+        }
+        let table = |pt| PageTableEntry(PageTableEntry::new_table(pt).0 | USER);
+        f.set_entry(pd, 0, table(pt_a));
+        f.set_entry(
+            pd,
+            1,
+            PageTableEntry(PRESENT | USER | LARGE_PAGE | (bait & PHYS_MASK)),
+        );
+        f.set_entry(pd, 2, table(pt_b));
+        let mut leaves = Vec::new();
+        for (pt, pd_index, slot, writable) in [
+            (pt_a, 0u64, 0usize, true),
+            (pt_a, 0, 1, true),
+            (pt_a, 0, 2, false),
+            (pt_a, 0, 511, false),
+            (pt_b, 2, 0, true),
+            (pt_b, 2, 5, false),
+        ]
+        {
+            let va = base + (pd_index << 21) + ((slot as u64) << 12);
+            let frame = 0x4000_0000 + ((slot as u64) << 12) + (pd_index << 24);
+            let bits = PRESENT | USER | frame | if writable { WRITABLE } else { NO_EXECUTE };
+            f.set_entry(pt, slot, PageTableEntry(bits));
+            leaves.push((va, frame, bits));
+        }
+        Space {
+            f,
+            top,
+            base,
+            leaves,
+        }
+    }
+
+    // The defects caught: a scan that misses a leaf, reports one out of VA
+    // order or with another frame or bits, reads the PML5 index wrongly at
+    // five levels, or reads a large leaf's frame as a table.
+    #[test]
+    fn a_leaf_scan_reports_every_present_leaf_in_va_order()
+    {
+        for depth in DEPTHS
+        {
+            let s = space(depth);
+            let (got, stop) = s.scan(s.base, usize::MAX, None);
+            assert_eq!(got, s.leaves, "{depth:?}");
+            assert_eq!(stop, s.hi(), "{depth:?}");
+            let (got, _) = s.scan(s.leaves[2].0, usize::MAX, None);
+            assert_eq!(got, s.leaves[2..], "{depth:?}: a scan from a leaf's VA");
+        }
+    }
+
+    // The defects caught: a budget that is not honoured, a resume VA that
+    // skips a leaf or repeats one, or a resumed scan that makes no progress.
+    #[test]
+    fn a_budgeted_leaf_scan_resumes_where_it_stopped()
+    {
+        for depth in DEPTHS
+        {
+            let s = space(depth);
+            for budget in [s.top + 1, s.top + 2, s.top + 5, 64, 600]
+            {
+                let mut all = Vec::new();
+                let mut start = s.base;
+                while start < s.hi()
+                {
+                    let (got, stop) = s.scan(start, budget, None);
+                    assert!(
+                        stop > start,
+                        "{depth:?} budget {budget}: no progress at {start:#x}"
+                    );
+                    all.extend(got);
+                    start = stop;
+                }
+                assert_eq!(all, s.leaves, "{depth:?} budget {budget}");
+            }
+        }
+    }
+
+    // The defect caught: a refused leaf that is skipped instead of reported as
+    // the place to resume.
+    #[test]
+    fn a_refused_leaf_stops_the_scan_at_its_va()
+    {
+        for depth in DEPTHS
+        {
+            let s = space(depth);
+            let (got, stop) = s.scan(s.base, usize::MAX, Some(s.leaves[4].0));
+            assert_eq!(got, s.leaves[..4], "{depth:?}");
+            assert_eq!(stop, s.leaves[4].0, "{depth:?}");
         }
     }
 

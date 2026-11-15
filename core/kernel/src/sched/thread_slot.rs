@@ -111,6 +111,25 @@ pub fn set_extended_bytes(bytes: u64)
     EXTENDED_BYTES.store(bytes, Ordering::Relaxed);
 }
 
+/// The save area's size, in bytes, as the boot CPU reported it: the size of
+/// the extended-state image `SYS_THREAD_READ_EXT_REGS` reads.
+pub fn extended_bytes() -> u64
+{
+    EXTENDED_BYTES.load(Ordering::Relaxed)
+}
+
+/// The part of a save area of `size` bytes that a `SYS_THREAD_READ_EXT_REGS`
+/// of `len` bytes from `offset` copies: its start and length. The length is
+/// 0 for an offset at or past the end. The span is clamped to the area as data
+/// (`nospec::mask_span_u64`), so a copy past a mispredicted bound reads
+/// nothing outside it.
+pub fn extended_span(offset: u64, len: usize, size: u64) -> (u64, usize)
+{
+    let n = size.saturating_sub(offset).min(len as u64);
+    let (from, n) = crate::arch::nospec::mask_span_u64(offset, n, size);
+    (from, usize::try_from(n).unwrap_or(0))
+}
+
 /// Bytes of the per-thread save area's pages, which thread creation zeroes.
 /// Saturates as [`slot_bytes`] does; a slot that size is never retyped.
 pub fn extended_area_bytes() -> u64
@@ -167,6 +186,19 @@ mod tests
     fn the_largest_riscv_area_composes_into_whole_pages()
     {
         assert_eq!(slot_bytes(262_448, 0), (BASE + 65) * PAGE);
+    }
+
+    // The defect caught: a read that runs past the area's end, copies a byte
+    // at the end, or wraps for an offset near `u64::MAX`.
+    #[test]
+    fn an_extended_read_copies_only_bytes_inside_the_area()
+    {
+        assert_eq!(extended_span(0, 4096, 832), (0, 832));
+        assert_eq!(extended_span(512, 64, 832), (512, 64));
+        assert_eq!(extended_span(800, 64, 832), (800, 32));
+        assert_eq!(extended_span(832, 64, 832).1, 0);
+        assert_eq!(extended_span(u64::MAX, 4096, 832).1, 0);
+        assert_eq!(extended_span(4096, 4096, 262_448), (4096, 4096));
     }
 
     // The defect caught: a save area whose page-rounded size passes `u64`

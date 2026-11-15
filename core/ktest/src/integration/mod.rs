@@ -62,7 +62,9 @@ pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
 pub mod shared_memory_two_aspaces;
 pub mod stop_read_regs_remote;
+pub mod thread_ext_regs;
 pub mod thread_lifecycle;
+pub mod thread_list_pages;
 pub mod thread_memory;
 pub mod thread_upcall;
 pub mod tlb_coherency;
@@ -264,6 +266,11 @@ pub fn run_all(ctx: &TestContext)
     );
     run_integration_test!("integration::fault_debug", fault_debug::run(ctx));
     run_integration_test!("integration::thread_memory", thread_memory::run(ctx));
+    run_integration_test!(
+        "integration::thread_list_pages",
+        thread_list_pages::run(ctx)
+    );
+    run_integration_test!("integration::thread_ext_regs", thread_ext_regs::run(ctx));
     run_integration_test!(
         "integration::fault_exception_no_handler_kills",
         fault_exception_no_handler_kills::run(ctx)

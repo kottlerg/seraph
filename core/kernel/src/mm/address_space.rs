@@ -452,6 +452,133 @@ pub fn thread_mem_write_check(
     Ok(())
 }
 
+/// Most page-table entries, at any level, one `SYS_THREAD_LIST_PAGES` call
+/// examines: it bounds the time the call holds the address space's
+/// `pt_lock`, as `syscall::MAX_HARVEST_PAGES` does for a harvest.
+pub const PAGE_SCAN_BUDGET: usize = 4096;
+
+/// The `PAGE_RUN_*` protection `SYS_THREAD_LIST_PAGES` reports for a page
+/// whose user leaf grants `leaf` and names the frame at `phys`: the leaf's
+/// read, write and execute rights, and `PAGE_RUN_NO_COPY` when the
+/// thread-memory syscalls refuse the page ([`thread_mem_page_check`] against
+/// `ram_top`).
+pub fn page_run_prot(leaf: crate::mm::paging::PageFlags, phys: u64, ram_top: u64) -> u64
+{
+    let mut prot = 0;
+    if leaf.readable
+    {
+        prot |= syscall::PAGE_RUN_READ;
+    }
+    if leaf.writable
+    {
+        prot |= syscall::PAGE_RUN_WRITE;
+    }
+    if leaf.executable
+    {
+        prot |= syscall::PAGE_RUN_EXECUTE;
+    }
+    if thread_mem_page_check(leaf, phys, ram_top).is_err()
+    {
+        prot |= syscall::PAGE_RUN_NO_COPY;
+    }
+    prot
+}
+
+/// The `syscall::PageRun`s of one `SYS_THREAD_LIST_PAGES` call, built from its
+/// pages in ascending VA order into a byte buffer, one run per
+/// `size_of::<PageRun>()` bytes in the run's native layout. A page that
+/// follows the open run's last page with its protection extends it; any
+/// other page opens a run.
+pub struct PageRuns<'a>
+{
+    /// The runs written, each [`PAGE_RUN_BYTES`] bytes.
+    out: &'a mut [u8],
+    /// Runs the buffer holds.
+    capacity: usize,
+    /// Runs written to `out`.
+    written: usize,
+    /// The run the next page may extend, not yet written.
+    open: Option<syscall::PageRun>,
+}
+
+/// Bytes of one run in a [`PageRuns`] buffer.
+const PAGE_RUN_BYTES: usize = core::mem::size_of::<syscall::PageRun>();
+
+impl<'a> PageRuns<'a>
+{
+    /// An empty set of runs over `out`, which holds `out.len()` divided by
+    /// the run size of them.
+    pub fn new(out: &'a mut [u8]) -> Self
+    {
+        let capacity = out.len().checked_div(PAGE_RUN_BYTES).unwrap_or(0);
+        Self {
+            out,
+            capacity,
+            written: 0,
+            open: None,
+        }
+    }
+
+    /// Add the page at `va`, with protection `prot`. Returns `false`, adding
+    /// nothing, when the page needs a run the buffer has no room for.
+    pub fn push(&mut self, va: u64, prot: u64) -> bool
+    {
+        if let Some(run) = self.open.as_mut()
+        {
+            let next = run
+                .pages
+                .checked_mul(PAGE_SIZE as u64)
+                .and_then(|bytes| run.va.checked_add(bytes));
+            if run.prot == prot && next == Some(va)
+            {
+                // At most one run per page of the user half: no overflow.
+                run.pages = run.pages.saturating_add(1);
+                return true;
+            }
+            // The open run takes one slot and the new run another.
+            if self.written.saturating_add(2) > self.capacity
+            {
+                return false;
+            }
+            let closed = *run;
+            self.write(closed);
+        }
+        else if self.capacity == 0
+        {
+            return false;
+        }
+        self.open = Some(syscall::PageRun { va, pages: 1, prot });
+        true
+    }
+
+    /// Write the open run and return the number of runs, which the first
+    /// that many run sizes of the buffer hold.
+    pub fn finish(mut self) -> usize
+    {
+        if let Some(run) = self.open.take()
+        {
+            self.write(run);
+        }
+        self.written
+    }
+
+    /// Write `run` to the next slot. Every caller has checked that a slot is
+    /// free.
+    fn write(&mut self, run: syscall::PageRun)
+    {
+        let (slots, _) = self.out.as_chunks_mut::<{ PAGE_RUN_BYTES }>();
+        if let Some(slot) = slots.get_mut(self.written)
+        {
+            let (fields, _) = slot.as_chunks_mut::<8>();
+            for (bytes, word) in fields.iter_mut().zip([run.va, run.pages, run.prot])
+            {
+                *bytes = word.to_ne_bytes();
+            }
+            self.written = self.written.saturating_add(1);
+        }
+    }
+}
+
 impl AddressSpace
 {
     /// Acquire the page table modification lock.
@@ -1603,6 +1730,43 @@ impl AddressSpace
         crate::percpu::preempt_enable();
     }
 
+    /// Add the mapped user pages of `[start, hi)` to `runs` in VA order, each
+    /// with its protection ([`page_run_prot`]), under `pt_lock`, examining at
+    /// most [`PAGE_SCAN_BUDGET`] page-table entries. Returns the first VA not
+    /// listed: where the budget ran out or `runs` filled, or `hi` once the
+    /// span is listed. A leaf with no user access is not a user page and is
+    /// passed over.
+    ///
+    /// # Safety
+    /// `start` must be page-aligned and `[start, hi)` must lie in the user
+    /// half. The caller holds no `pt_lock`.
+    #[cfg(not(test))]
+    pub unsafe fn list_pages(&self, start: u64, hi: u64, runs: &mut PageRuns<'_>) -> u64
+    {
+        use crate::arch::current::paging::{scan_user_leaves, user_leaf_flags};
+
+        let ram_top = crate::mm::init::ram_top();
+        crate::percpu::preempt_disable();
+        self.pt_lock();
+        // SAFETY: root_virt is the valid root, pt_lock is held, and the span
+        // is page-aligned in the user half (caller's contract).
+        let resume = unsafe {
+            scan_user_leaves(
+                self.root_virt,
+                start,
+                hi,
+                PAGE_SCAN_BUDGET,
+                &mut |va, phys, pte| {
+                    user_leaf_flags(pte)
+                        .is_none_or(|flags| runs.push(va, page_run_prot(flags, phys, ram_top)))
+                },
+            )
+        };
+        self.pt_unlock();
+        crate::percpu::preempt_enable();
+        resume
+    }
+
     /// Translate a user virtual address to its mapped physical address.
     ///
     /// Performs a read-only page table walk. Returns `Some((phys_addr,
@@ -2164,6 +2328,122 @@ mod thread_mem_tests
         assert_eq!(
             thread_mem_page_check(leaf(false), !(page - 1), top),
             Err(SyscallError::InvalidAddress)
+        );
+    }
+
+    /// The runs a `PageRuns` over room for `capacity` runs holds after
+    /// `pages` (VA, protection) are pushed in order, and whether each push was
+    /// taken.
+    fn runs_of(capacity: usize, pages: &[(u64, u64)]) -> (Vec<syscall::PageRun>, Vec<bool>)
+    {
+        let size = core::mem::size_of::<syscall::PageRun>();
+        // One spare byte: a partial slot holds no run.
+        let mut bytes = vec![0xA5u8; capacity * size + 1];
+        let mut runs = PageRuns::new(&mut bytes);
+        let taken = pages
+            .iter()
+            .map(|&(va, prot)| runs.push(va, prot))
+            .collect();
+        let count = runs.finish();
+        let decoded = bytes[..count * size]
+            .chunks_exact(size)
+            .map(|run| {
+                let word = |i: usize| u64::from_ne_bytes(run[i * 8..i * 8 + 8].try_into().unwrap());
+                syscall::PageRun {
+                    va: word(0),
+                    pages: word(1),
+                    prot: word(2),
+                }
+            })
+            .collect();
+        (decoded, taken)
+    }
+
+    fn run(va: u64, pages: u64, prot: u64) -> syscall::PageRun
+    {
+        syscall::PageRun { va, pages, prot }
+    }
+
+    // The defects caught: a run that swallows a gap or a protection change,
+    // a contiguous page of one protection that opens a second run, or a run
+    // written in another layout than `PageRun`'s.
+    #[test]
+    fn page_runs_join_contiguous_pages_of_one_protection()
+    {
+        const RW: u64 = syscall::PAGE_RUN_READ | syscall::PAGE_RUN_WRITE;
+        const RX: u64 = syscall::PAGE_RUN_READ | syscall::PAGE_RUN_EXECUTE;
+        let p = PAGE_SIZE as u64;
+        let (runs, taken) = runs_of(
+            8,
+            &[
+                (0x10 * p, RX),
+                (0x11 * p, RX),
+                (0x12 * p, RW),
+                (0x14 * p, RW),
+                (0x15 * p, RW),
+            ],
+        );
+        assert!(taken.iter().all(|&t| t));
+        assert_eq!(
+            runs,
+            [
+                run(0x10 * p, 2, RX),
+                run(0x12 * p, 1, RW),
+                run(0x14 * p, 2, RW)
+            ]
+        );
+    }
+
+    // The defects caught: a full buffer that drops a page silently (the
+    // caller resumes past it), or refuses one that extends the last run.
+    #[test]
+    fn a_full_page_run_buffer_refuses_only_a_page_needing_a_new_run()
+    {
+        let p = PAGE_SIZE as u64;
+        let r = syscall::PAGE_RUN_READ;
+        let (runs, taken) = runs_of(2, &[(p, r), (3 * p, r), (4 * p, r), (6 * p, r)]);
+        assert_eq!(taken, [true, true, true, false]);
+        assert_eq!(runs, [run(p, 1, r), run(3 * p, 2, r)]);
+        let (runs, taken) = runs_of(0, &[(p, r)]);
+        assert_eq!((runs.len(), taken), (0, vec![false]));
+    }
+
+    // The defects caught: a protection that misreads a right, or marks a page
+    // the thread-memory syscalls copy as one they refuse, or the reverse.
+    #[test]
+    fn a_page_run_protection_follows_the_leaf_and_the_copy_check()
+    {
+        let page = PAGE_SIZE as u64;
+        let top = 16 * page;
+        let leaf = |writable, executable, uncacheable| crate::mm::paging::PageFlags {
+            readable: true,
+            writable,
+            executable,
+            uncacheable,
+        };
+        assert_eq!(
+            page_run_prot(leaf(true, false, false), page, top),
+            syscall::PAGE_RUN_READ | syscall::PAGE_RUN_WRITE
+        );
+        assert_eq!(
+            page_run_prot(leaf(false, true, false), page, top),
+            syscall::PAGE_RUN_READ | syscall::PAGE_RUN_EXECUTE
+        );
+        assert_eq!(
+            page_run_prot(leaf(true, false, true), page, top),
+            syscall::PAGE_RUN_READ | syscall::PAGE_RUN_WRITE | syscall::PAGE_RUN_NO_COPY
+        );
+        assert_eq!(
+            page_run_prot(leaf(false, false, false), top, top),
+            syscall::PAGE_RUN_READ | syscall::PAGE_RUN_NO_COPY
+        );
+        let execute_only = crate::mm::paging::PageFlags {
+            readable: false,
+            ..leaf(false, true, false)
+        };
+        assert_eq!(
+            page_run_prot(execute_only, page, top),
+            syscall::PAGE_RUN_EXECUTE
         );
     }
 }

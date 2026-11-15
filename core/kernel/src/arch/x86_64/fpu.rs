@@ -141,6 +141,12 @@ const XCR0_X87: u64 = 1 << 0;
 const XCR0_SSE: u64 = 1 << 1;
 const XCR0_AVX: u64 = 1 << 2;
 const XCR0_V3: u64 = XCR0_X87 | XCR0_SSE | XCR0_AVX;
+// The save area is the image `SYS_THREAD_READ_EXT_REGS` reads, whose layout
+// the ABI states by this component set.
+const _: () = assert!(
+    XCR0_V3 == syscall::EXT_REGS_X86_64_XCR0,
+    "the ABI's extended-state image is the XSAVE area of the XCR0 the kernel sets"
+);
 
 /// Write `val` to extended control register `xcr` via XSETBV.
 ///

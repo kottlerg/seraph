@@ -86,8 +86,9 @@ pub struct ServiceEntry
     /// call `DESTROY_PROCESS` before spawning the next restart so procmgr
     /// can reclaim kernel objects and return its memory caps to memmgr's
     /// pool; svcmgr also binds the death observer of the service's address
-    /// space through it (`procmgr_labels::BIND_DEATH_OBSERVER`), at launch
-    /// and again in a resync. For a
+    /// space through it (`procmgr_labels::BIND_DEATH_OBSERVER`) and asks
+    /// procmgr for the instance's state through it in a resync
+    /// (`procmgr_labels::QUERY_PROCESS`). For a
     /// substrate service init created through procmgr (devmgr, vfsd) it is
     /// the handle init endowed; zero for memmgr and procmgr, which procmgr
     /// did not create.

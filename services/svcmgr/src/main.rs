@@ -529,9 +529,9 @@ fn dispatch_ipc(
                 "monitoring {} service(s) after reconciliation",
                 state.table.services.len()
             );
-            // A substrate service that died before its bind is recorded with
-            // the caps init endowed; route its death now.
-            resync_deaths(state, ctx, ResyncCause::Reconciliation);
+            // A devmgr that died before its bind is recorded with the caps
+            // init endowed; route its death now.
+            resync_deaths(state, ctx);
         }
         svcmgr_labels::PUBLISH_ENDPOINT =>
         {
@@ -708,7 +708,7 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
     if full
     {
         std::os::seraph::log!(warn: "a death queue drained full; resyncing services");
-        resync_deaths(state, ctx, ResyncCause::FullDrain);
+        resync_deaths(state, ctx);
     }
 }
 
@@ -792,29 +792,24 @@ fn observed_death(entry: &service::ServiceEntry) -> Option<u64>
     None
 }
 
-/// Route a death for every active service whose current instance the kernel
-/// shows dead ([`observed_death`]): the recovery for death posts a full
-/// queue dropped, and, after reconciliation, for a substrate service whose
-/// observers could not be bound because it had already died. The kernel
-/// records the state before it posts, so a main-thread exit, and a fault of
-/// memmgr or procmgr, whose address spaces svcmgr holds, are found here. A
-/// restart binds the new instance's observers, whose posts go to the queue
-/// this drain has emptied. A post for a service routed here that does arrive
-/// later carries the dead instance, and [`route_death`] drops it.
-///
-/// A worker-thread fault of a service procmgr created shows in svcmgr's caps
-/// only once procmgr's teardown revokes the thread cap, which can follow this
-/// resync. After a full drain ([`ResyncCause::FullDrain`]), each such
-/// service the kernel shows alive has its address-space observer bound again
-/// (`restart::bind_fault_observer`): the kernel retains the space's first terminal fault and posts it to a
-/// later bind, so a fault whose post a full queue dropped is posted again to
-/// the queue this drain has emptied. A re-arm that procmgr refuses means the
-/// process is gone, which the caps then show. The re-arm calls procmgr, so it
-/// runs only while memmgr and procmgr are alive and supervised; each re-arm
-/// holds one observer node of svcmgr's death set until that process dies.
-fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx, cause: ResyncCause)
+/// Route a death for every active service whose current instance is dead:
+/// the recovery for death posts a full queue dropped, and, after
+/// reconciliation, for a devmgr whose observers could not be bound because
+/// it had already died. The kernel records the state before it posts, so a
+/// main-thread exit, a revoked thread cap, and a fault of memmgr or procmgr,
+/// whose address spaces svcmgr holds, are found in svcmgr's own caps
+/// ([`observed_death`]). A worker-thread fault of a service procmgr created
+/// shows there only once procmgr's teardown revokes the thread cap, which can
+/// follow this resync, so each such service the caps show alive is asked of
+/// procmgr (`restart::queried_death`), which reads the space's retained
+/// fault. That call runs only while memmgr and procmgr are active and alive
+/// ([`substrate_alive`]), so procmgr answers it. A restart binds the new
+/// instance's observers, whose posts go to the queue this drain has emptied.
+/// A post for a service routed here that does arrive later carries the dead
+/// instance, and [`route_death`] drops it.
+fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    // Slots the kernel showed alive, which a re-arm may need.
+    // Slots svcmgr's caps showed alive, which procmgr is asked about.
     let mut alive = Vec::new();
     for idx in 0..state.table.services.len()
     {
@@ -830,14 +825,11 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx, cause: Resy
         let Some(exit_reason) = observed_death(svc)
         else
         {
-            if cause == ResyncCause::FullDrain && svc.process_handle != 0
+            // A failed reservation only narrows the query to the slots
+            // recorded before it.
+            if svc.process_handle != 0 && alive.try_reserve(1).is_ok()
             {
-                // A failed reservation only narrows the re-arm to the
-                // slots recorded before it.
-                if alive.try_reserve(1).is_ok()
-                {
-                    alive.push(idx);
-                }
+                alive.push(idx);
             }
             continue;
         };
@@ -861,45 +853,20 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx, cause: Resy
         {
             continue;
         };
+        if !svc.active
+        {
+            continue;
+        }
         let Some(tag) = DeathTag::new(idx, svc.instance)
         else
         {
             continue;
         };
-        if !svc.active
-            || restart::bind_fault_observer(
-                &ctx.deaths,
-                svc.process_handle,
-                tag.correlator(),
-                ctx.ipc_buf,
-            )
-        {
-            continue;
-        }
-        if let Some(exit_reason) = observed_death(svc)
+        if let Some(exit_reason) = restart::queried_death(svc.process_handle, ctx.ipc_buf)
         {
             route_death(tag, exit_reason, state, ctx);
         }
-        else
-        {
-            std::os::seraph::log!(
-                warn: "resync: re-arming {}'s address-space observer failed",
-                svc.name
-            );
-        }
     }
-}
-
-/// Why [`resync_deaths`] runs, which decides whether it re-arms.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ResyncCause
-{
-    /// A drain took a full queue's worth of events from one queue, so a post
-    /// may have been dropped: re-arm.
-    FullDrain,
-    /// Reconciliation recorded the substrate services, whose observers were
-    /// just bound: no re-arm.
-    Reconciliation,
 }
 
 /// Whether every service whose address space svcmgr holds (memmgr and

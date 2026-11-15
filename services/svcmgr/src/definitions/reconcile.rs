@@ -439,11 +439,13 @@ fn handle_definition(
 /// serialises on the thread's `sched_lock`, and it retains the address
 /// space's first terminal fault and replays it to a later address-space bind,
 /// so a death in the window between init's spawn and this bind is delivered
-/// to the death queues when the bind lands (#106 Window 2). A devmgr or vfsd
-/// that died in that window and that procmgr has already torn down has had
-/// its thread cap revoked, so both binds fail; the entry is recorded with
-/// that cap all the same, and the resync that follows reconciliation reads
-/// the revoked cap as `EXIT_KILLED` and routes the death. A thread bind that
+/// to the death queues when the bind lands (#106 Window 2). A devmgr that died
+/// in that window and that procmgr has already torn down has had its thread
+/// cap revoked, so both binds fail; the entry is recorded with that cap all
+/// the same, and the resync that follows reconciliation reads the revoked cap
+/// as `EXIT_KILLED` and routes the death. A vfsd that died before
+/// reconciliation never reaches this path: svcmgr reads the recipe directory
+/// through vfsd. A thread bind that
 /// fails on a live service (the death set out of memory) leaves the main
 /// thread's exit to a later resync. A failed address-space bind on a live
 /// service is logged and leaves the main thread's observer standing: init

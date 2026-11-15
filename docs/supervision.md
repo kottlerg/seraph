@@ -116,7 +116,9 @@ death and powers the system off.
 devmgr and vfsd are `restart = never`, `critical = yes`, and are not in the core set: their restart
 is future work that no principle excludes, and no restart of either is designed yet. The death of
 either, of its main thread or of any worker thread, is system death through the same graceful
-shutdown, by its recipe, not by membership of the core set (§ Supervision Hierarchy).
+shutdown, by its recipe, not by membership of the core set (§ Supervision Hierarchy). A vfsd death
+before svcmgr's reconciliation is the gap (#1094): svcmgr reads its recipes through vfsd, so it
+records no service and launches no shutdown actuator.
 
 The path from a core or critical death to power-off MUST NOT depend on the service that died. svcmgr
 and pwrmgr are demand-paged on memmgr (memmgr and procmgr are pinned by construction, per

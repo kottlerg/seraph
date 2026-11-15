@@ -524,7 +524,7 @@ right, which binding such an observer needs
 makes the bind on the creator's behalf. A creator may send it any number of times while the child
 lives, before or after `START_PROCESS`, each with its own queue and correlator. devmgr uses it for
 each driver it spawns, and svcmgr for each service it launches or restarts and for devmgr and vfsd,
-whose process handles init endows, and again for each of them in a death resync.
+whose process handles init endows.
 
 **Request:**
 

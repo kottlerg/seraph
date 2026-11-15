@@ -823,6 +823,30 @@ pub(crate) fn bind_instance_observers(
         && bind_fault_observer(&ctx.deaths, process_handle, correlator, ctx.ipc_buf)
 }
 
+/// The exit reason of the process `process_handle` names when procmgr reports
+/// it dead (`procmgr_labels::QUERY_PROCESS`), else `None`. procmgr answers
+/// `EXITED` with the main thread's reason or the address space's retained
+/// terminal fault before it reaps the process, and for a while after;
+/// `UNKNOWN` (no entry) reads as `EXIT_KILLED`. A failed or refused call is
+/// `None`. The caller holds procmgr alive, since the call blocks until procmgr
+/// answers.
+pub(crate) fn queried_death(process_handle: u64, ipc_buf: *mut u64) -> Option<u64>
+{
+    let msg = IpcMessage::new(procmgr_labels::QUERY_PROCESS);
+    // SAFETY: `ipc_buf` is svcmgr's registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }.ok()?;
+    if reply.label != procmgr_errors::SUCCESS
+    {
+        return None;
+    }
+    match reply.word(0)
+    {
+        ipc::procmgr_process_state::EXITED => Some(reply.word(1)),
+        ipc::procmgr_process_state::UNKNOWN => Some(syscall_abi::EXIT_KILLED),
+        _ => None,
+    }
+}
+
 /// Have procmgr bind one of svcmgr's death queues as a terminal-fault death
 /// observer, posting `correlator`, on the address space of the child
 /// `process_handle` names (`procmgr_labels::BIND_DEATH_OBSERVER`), through a

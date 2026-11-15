@@ -41,7 +41,9 @@ the last pool (4 nodes first, below a boot's seven supervised and adopted
 services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). A
 further queue is one contiguous grant from memmgr; when memmgr refuses it,
 svcmgr retries at half the pool, down to the first pool's size. A bind that
-still fails fails the launch, restart, or adoption.
+still fails fails the launch or restart. An adoption records the service all
+the same, so a death no observer reports is found by a resync (§ Death
+detection).
 
 The WaitSet holds the service endpoint (badge 0) and every death queue
 (badge 1), and svcmgr's death-queue set (`DeathSet`, the
@@ -76,16 +78,16 @@ revokes it), or whose endowed address space has a retained terminal fault
 drain or the next, so the resync runs after the drop.
 
 A worker-thread fault of a service procmgr created shows in svcmgr's caps only once procmgr's
-teardown revokes the thread cap, which can follow the resync. So the resync then binds the
-address-space observer of each such service the kernel shows alive again, through its process
-handle (`procmgr_labels::BIND_DEATH_OBSERVER`): the kernel retains the space's first terminal
-fault and posts it to a later bind, so a dropped fault post reaches the emptied queue. The re-arm
-runs only while memmgr and procmgr are alive and supervised, since it calls procmgr, and each
-re-arm holds one observer node of svcmgr's death set until that process dies.
+teardown revokes the thread cap, which can follow the resync. So the resync then asks procmgr
+about each such service its caps show alive, through its process handle
+(`procmgr_labels::QUERY_PROCESS`): procmgr reads the space's retained terminal fault and answers
+`EXITED` with it before it reaps the process. The query runs only while memmgr and procmgr are
+active and alive, since it blocks until procmgr answers.
 
-Reconciliation records a devmgr or vfsd that died before its bind with the thread cap init
-endowed, and a resync right after reconciliation routes its death (`EXIT_KILLED` for a revoked
-cap).
+Reconciliation records a devmgr that died before its bind with the thread cap init endowed, and a
+resync right after reconciliation routes its death (`EXIT_KILLED` for a revoked cap). A vfsd that
+died before reconciliation is not routed: svcmgr reads the recipe directory through vfsd, so
+reconciliation records nothing, or blocks, and no shutdown actuator is launched either.
 
 Exit reason encoding (owned by
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)), and

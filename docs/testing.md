@@ -169,6 +169,7 @@ rootfs/config/svcmgr/
 │   ├── svctest.svc
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
+│   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
@@ -537,8 +538,11 @@ Per boot, at most one *shutdown-invoking* harness recipe MUST be staged in
 `/config/svcmgr/services/`.
 
 Non-shutdown fixtures may co-stage alongside one harness. `crasher`
-(`restart = always`, never shuts down) is co-staged with `svctest` in
-the services-surface CI cell so its restart loop is exercised there; its
+(`restart = always`, never shuts down) and its worker-fault role
+(`crasher-worker.svc`, `restart = on_failure`) are co-staged with `svctest` in
+the services-surface CI cell so their restart paths are exercised there (svctest's
+`svcmgr_worker_fault_restart` phase runs when `crasher-worker.svc` is staged and is
+skipped otherwise); its
 bounded faults complete long before `svctest`'s terminal marker, so the
 kernel fault dump never clobbers it.
 
@@ -1160,7 +1164,7 @@ owes some of the cells runs those boots, and the release host runs run all four.
 # Disk variations, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only --block-size 4096
@@ -1195,7 +1199,7 @@ is the framebuffer device cell (Device surfaces above).
 # Framebuffer cell, per architecture (clean between architectures):
 cargo xtask build --arch <arch>
 cp sysroot/config/svcmgr/tests/svctest.svc sysroot/config/svcmgr/tests/crasher.svc \
-    sysroot/config/svcmgr/services/
+    sysroot/config/svcmgr/tests/crasher-worker.svc sysroot/config/svcmgr/services/
 cp sysroot/config/devmgr/tests/*.class sysroot/config/devmgr/classes/
 rm -f sysroot/config/svcmgr/services/terminal.svc sysroot/config/svcmgr/services/crashd.svc
 cargo xtask mkdisk --arch <arch> --repack-only

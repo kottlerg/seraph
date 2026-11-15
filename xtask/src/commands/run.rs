@@ -138,6 +138,7 @@ fn launch(
         riscv_mmu: args.riscv_mmu,
         riscv_zkr: args.riscv_zkr,
         x86_paging: args.x86_paging,
+        x86_shadow_stack: args.x86_shadow_stack,
         iommu: args.iommu,
         debug_port: args.debug_port,
         test_devices: args.test_devices,

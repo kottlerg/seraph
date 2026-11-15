@@ -233,7 +233,8 @@ pick_next(cpu):
 The TCB is the kernel's per-thread state. A thread's TCB lives in its Thread slab, which
 `SYS_CAP_CREATE_THREAD` retypes from the caller's Memory capability (boot code carves init's
 thread from the SEED reserve): a guard page, the kernel stack, then the page holding the
-`ThreadObject` and TCB, then the extended-state area (see
+`ThreadObject` and TCB, then the extended-state area and, when the kernel runs on shadow stacks,
+the shadow-stack page (see
 [memory-internals.md § Kernel Stack Allocation](memory-internals.md#kernel-stack-allocation)).
 Idle threads' TCBs live in a per-CPU array allocated at boot. The excerpt below is abridged to
 the fields this document discusses; `core/kernel/src/sched/thread.rs` holds the full definition.
@@ -353,6 +354,9 @@ set needed for correct execution:
 - `rsp` (stack pointer)
 - The `fs_base` MSR (TLS base pointer)
 - `rflags`
+- With shadow stacks on, `ssp` (the restore-token address the switch restores the thread's
+  shadow stack from) and `ssp_token` (the thread's supervisor shadow-stack token, loaded into
+  `IA32_PL0_SSP`)
 - The kernel stack pointer is stored separately in the TSS `RSP0` field
 
 Caller-saved registers (`rax`, `rcx`, `rdx`, `rsi`, `rdi`, `r8`–`r11`) are not saved

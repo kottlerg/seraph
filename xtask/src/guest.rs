@@ -5,7 +5,8 @@
 
 //! A QEMU process a host harness drives, and the thread reading its serial
 //! output: over QMP, the VMGENID snapshot-resume test and the ACPI table
-//! capture; over the gdbstub, the interrupts-off wedge test.
+//! capture; over the gdbstub, the interrupts-off wedge test and the CET
+//! shadow-stack test.
 
 use std::io::BufReader;
 use std::process::Child;
@@ -135,12 +136,20 @@ impl Guest
     /// return every line read, the marker's last.
     pub fn collect_until(&mut self, marker: &str, timeout: Duration) -> Result<Vec<String>>
     {
+        self.collect_until_any(&[marker], timeout)
+    }
+
+    /// Echo serial lines until one holds any of `markers` or `timeout`
+    /// passes, and return every line read, that line last.
+    pub fn collect_until_any(&mut self, markers: &[&str], timeout: Duration)
+    -> Result<Vec<String>>
+    {
         let start = Instant::now();
         let mut lines = Vec::new();
         loop
         {
-            let line = self.next_line(timeout.saturating_sub(start.elapsed()), &[marker])?;
-            let done = line.contains(marker);
+            let line = self.next_line(timeout.saturating_sub(start.elapsed()), markers)?;
+            let done = markers.iter().any(|m| line.contains(m));
             lines.push(line);
             if done
             {

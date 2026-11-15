@@ -469,7 +469,8 @@ impl Thread {
         }));
 
         // Dedicated slab for the Thread retype slot, sized to the kernel's
-        // debit (guard page, kstack, wrapper and TCB, extended-state save area).
+        // debit (guard page, kstack, wrapper and TCB, extended-state save area, and
+        // with shadow stacks on a shadow-stack page).
         let (thread_slab, thread_slab_region_id) =
             match thread_retype_bytes().and_then(crate::sys::alloc::seraph::object_slab_acquire_fresh)
             {

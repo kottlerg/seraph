@@ -488,6 +488,45 @@ QEMU, as for `test-terminal`. See
 In CI it runs as a further boot pair inside each `usertest` cell (both arches, both profiles),
 after `test-terminal`, on the default boot `test-terminal` restored.
 
+### CET shadow stacks (`test-cet`)
+
+On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them, so a
+corrupted return address faults instead of being followed
+([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)). Neither the CI
+runners nor TCG offer the feature, so CI boots only the kernel without them. Every launcher pins the
+guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), and a QEMU
+without the property, the CI image's among them, cannot offer the feature, so no boot
+runs on shadow stacks because its host offers them, and these boots are where they are tested. No
+harness can corrupt a kernel return address either, and the kernel carries no test hooks.
+`cargo xtask test-cet` (x86_64) runs both checks under KVM with the guest CPU
+`-cpu host,cet-ss=on,enforce`, on a sysroot holding the composed ktest bundle:
+
+1. Boot once and run ktest to its pass marker, with the kernel's `shadow stacks: on` line before
+   it.
+2. Boot again with QEMU's gdbstub on a unix socket. Once ktest has started, set a hardware
+   breakpoint at `syscall::dispatch`, overwrite the return address at the stopped CPU's stack
+   pointer at the first hit, which the shadow stack also holds, and resume. The `ret` of that
+   `dispatch` must raise `#CP` (vector 21) with error code 1 (`NEAR-RET`) at an address inside
+   `dispatch`. A call that does not return leaves no fault, so the host tries again, up to five
+   times.
+
+On a host without KVM, or whose CPU or KVM cannot give the guest CET shadow stacks (QEMU then
+refuses to start under `enforce`), the command fails, naming what is missing: it never passes
+without running the shadow stacks. The host computes the verdict and kills QEMU, as for
+`test-wedge`. It is the cet device cell of the local and release host runs (Coverage tiers below),
+not a CI boot. See [xtask/README.md § test-cet](../xtask/README.md#cargo-xtask-test-cet) for the
+command.
+
+A boot whose kernel exception report shows `CR4.CET` set, `SH_STK_EN` clear and a zero interrupt
+SSP table address ran on a host that lost the guest's CET state: the kernel writes those registers
+once per CPU and never with 0
+([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md) § x86-64
+Mechanism). On a host that is itself a guest of another hypervisor that state can be lost at run
+time (§ Verification Record there). On such a host, by the CPUID hypervisor bit, the run is
+inconclusive: the command boots again, up to four runs of each boot, and the boot passes only on
+a run without it; four such runs fail the command as inconclusive. On a host that is not a guest
+the same report fails the command, as does every other fault.
+
 ### One shutdown-invoking harness per boot
 
 `svctest` and `usertest` invoke `pwrmgr` shutdown on completion. Two such
@@ -544,7 +583,11 @@ paging mode (sv48 — per-mode runs via `cargo xtask run --riscv-mmu sv39|sv57`
 are manual, same posture as CPU-count variations), riscv64 Zkr entropy source (on —
 runs without it via `cargo xtask run --riscv-zkr off` are manual, same posture), x86_64
 paging depth (4-level — 5-level runs via `cargo xtask run --x86-paging 5`, under TCG
-(`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are manual, same posture), disk
+(`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are manual, same posture), x86_64 CET
+shadow stacks (off: the launchers pin `cet-ss=off` on a QEMU that has the property, and neither
+the CI runners nor TCG offer them; the boots on them, `test-cet`, are the cet device cell, see CET
+cell below, and other boots on them, via `cargo xtask run --x86-shadow-stack on` under KVM, are
+manual, same posture), disk
 logical block size (512 bytes — the 4Kn boot, a 4096-byte-block image on a 4096-byte-block
 device, is a storage cell, see Device surfaces and Disk variations below), and disk count (one
 — the second-disk boots are storage cells too). The `virtio-rng` device is
@@ -563,7 +606,7 @@ its own device surface, and variants belong to the tiers below.
 | Canonical | `build-test.yml` | every push / PR | full arch × profile × harness at the fixed defaults |
 | Burn-in | `burnin.yml` | tag push; manual dispatch on any ref | each canonical arch × profile × harness `run-parallel` boot × 20 iterations, 2-way parallel (no `crasher` co-staging, no host-driven `test-*` boots) |
 | Local host runs | developer host, commands below | REQUIRED for a PR whose own diff changes the CPU-count surface, the memory surface, or a device surface, or that states a concurrency-fix purpose as Repeat count defines it and makes a non-inert change (see Boundary surface, Memory surface, Device surfaces, and Repeat count below; a stated concurrency-fix purpose owes the boundary set on its own), once per PR (see When the runs are owed below) | CPU-count and memory variations CI runners cannot reach, and the device cells CI does not boot |
-| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once, whatever the release's PRs touched (see Release host runs below) |
+| Release host runs | local host, commands below | before each tag, on the commit to be tagged or an earlier one with the bump and a documentation- or comment-only change since | every boundary below (riscv64 16 and 128 harts; x86_64 16 and 128 vCPUs) once in the debug profile and once in the release profile, and the memory variation and every device cell (the disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, and the CET cell) once, whatever the release's PRs touched (see Release host runs below) |
 
 **Why local-only.** Hosted CI runners are ~4-vCPU TCG-only machines; a
 16-vCPU guest is a ~4× thread oversubscription and a 128-vCPU guest a
@@ -956,7 +999,7 @@ architecture (4kn, the 4Kn disk; second-disk, the data partition on a second dis
 that disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second
 disk), no-iommu, the no-IOMMU variant of Release host runs below, framebuffer, the boot of
 Framebuffer cell below, and debug-port, the boot of Debug-port cell below, each on each
-architecture. A
+architecture, and cet, the boot pair of CET cell below, on x86_64 alone. A
 driver's device surface is that driver's code, with the harness check that drives that driver
 alone where its row names one; the storage-wide surface is the code every storage cell runs beside
 its drivers; and the shared surface is what every driver shares, the launchers' attachment of the
@@ -987,6 +1030,7 @@ line of its own diff is on.
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
+| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies what
@@ -994,7 +1038,10 @@ fatfs reads. The no-iommu cell boots devmgr, the test-dma driver, and svctest's 
 MSI delivery, forge, churn, and release checks unconfined, and every VirtIO driver without
 `VIRTIO_F_ACCESS_PLATFORM`, which the launchers have a device offer only with the IOMMU attached, so
 the shared surface (the launchers' IOMMU attachment among it), virtio-blk, virtio-input, and
-test-dma owe it. A PR that adds a driver adds its row, with its directory and the cells that
+test-dma owe it. The cet cell runs the kernel on the CPU's CET shadow stacks, which neither the CI
+runners nor TCG offer, so the canonical cells boot every path the CET row lists only with shadow
+stacks off; the shared surface owes it too, since the IRQ entry and exit run on the shadow stack
+when it is on. A PR that adds a driver adds its row, with its directory and the cells that
 exercise its device, and a PR that adds a cell names the surfaces that owe it. `cargo xtask
 lint-docs` checks this list as it checks the two above, its directories (written with a trailing
 `/`) included, and resolves its items in xtask's own sources too. The screen works as the boundary
@@ -1015,7 +1062,8 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
     shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs xtask/src/commands/test_gdb.rs \
-    core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/
+    core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/ \
+    core/kernel/src/arch/x86_64/shadow_stack.rs xtask/src/commands/test_cet.rs xtask/src/qemu_gdb.rs
 D='sys_irq_(register|ack|split|msg_alloc|route|remap)|(un)?route_device_irq|irq_line_count'
 D="$D|dispatch_device_irq|set_remap|remap_entry|remap_handles"
 D="$D|irq_dispatch|common_irq_trampoline|device_irq_stubs|ioapics_into|select_ioapics"
@@ -1032,9 +1080,14 @@ D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
 D="$D|second_disk(_[a-z_]+)?|second_(src|dst|line)|DiskLine"
 D="$D|(FIRST|SECOND|SHARED_LINE_SECOND)_DISK_SLOT"
+D="$D|shadow_stack|shadow_page|shadow_offset|set_shadow_stack_pages|shadow_on_boot_cpu"
+D="$D|make_cpu_shadow_pages|(idle|cpu)_shadow_pages|idle_saved_state|shadow_direct_map_page"
+D="$D|new_shadow_stack_page|kernel_write_fault_is_spurious"
 git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($D)\b"
 git diff -W "$B" <head> -- 'core/kernel/src/arch/*/interrupts.rs' |
     grep -E "^\+\+\+ |\b(acknowledge|mask|unmask)\b"
+git diff -W "$B" <head> -- core/kernel/src/arch/x86_64/ core/kernel/src/mm/stack_guard.rs |
+    grep -E "^\+\+\+ |\b(switch|syscall_entry|page_fault_handler|hole|close)\b"
 ```
 
 **Repeat count.** Every owed run, local or release, runs once (`--runs 1`); nothing raises the
@@ -1167,6 +1220,24 @@ cargo xtask test-debug-port --arch <arch>
 cargo xtask test-gdb --arch <arch>
 ```
 
+**CET cell.** One boot pair on x86_64, `cargo xtask test-cet` (CET shadow stacks (`test-cet`)
+above), whose first boot runs ktest with the kernel on CET shadow stacks and whose second checks
+that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
+bundle, a debug-profile build, at 4 vCPUs. It runs only under KVM on a host whose CPU reports CET
+shadow stacks: on any other host the command fails, naming what is missing, and never passes, so a
+PR that owes the cell runs it on such a host. On a host that is itself a guest, a run that ends
+in the host's loss of the guest's CET state is inconclusive and run again, up to four runs of each
+boot, and the cell passes only on runs without it (CET shadow stacks (`test-cet`) above). Each boot
+is bounded by five minutes and each gdbstub answer by 30 s; it has no `run-parallel` budget. The
+pair is the cet device cell (Device surfaces above).
+
+```sh
+# CET cell, x86_64 only:
+cargo xtask build --arch x86_64
+cargo xtask compose-bundle --harness ktest
+cargo xtask test-cet
+```
+
 **Release host runs.** Before each tag
 ([conventions.md](conventions.md#release-production) § Release Production, step
 4), these MUST be run on the commit to be tagged, or on an earlier commit that contains the
@@ -1176,10 +1247,10 @@ only as this section defines that: the whole boundary set
 in the debug profile and once each in the release profile
 (`cargo xtask build --release`, then the same `run-parallel` command, per
 the boundary commands above), and the memory variation and every device cell (the
-disk variations, the no-IOMMU variant, the framebuffer cell, and the debug-port cell) once each, so
-every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
-CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, and with a debug port,
-and runs the timing report on the boundary
+disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, and the CET
+cell) once each, so every tag boots at each boundary CPU count in both profiles (CI boots release
+builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a
+debug port, and on CET shadow stacks, and runs the timing report on the boundary
 logs, which is reported and blocks nothing. A tag's repeated-run check is the burn-in tier,
 which the tag push starts.
 The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture

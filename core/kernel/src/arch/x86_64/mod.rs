@@ -20,6 +20,7 @@ pub mod msi;
 pub mod paging;
 pub mod platform;
 pub mod remap;
+pub mod shadow_stack;
 pub mod speculation;
 pub mod syscall;
 pub mod timer;

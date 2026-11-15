@@ -101,6 +101,10 @@ A change of the binding of an in-flight fault's class cancels that delivery and 
 fault again under the binding current then ([Rebind](#delivery-resume-and-kill)), on both
 architectures.
 
+A handler's redirect of a fault to an endpoint its reply names (`FAULT_REPLY_REDIRECT`,
+[Reply](#reply)) is implemented on both architectures, for a fault of a user-mode access and for a
+kernel copy's fault, which a resume from the endpoint redirected to restarts.
+
 The asynchronous upcall ([Asynchronous Upcalls](#asynchronous-upcalls)) is implemented on both
 architectures: `SYS_THREAD_POST_UPCALL`, the third class `FAULT_CLASS_UPCALL`, delivery at a
 syscall's return and, for an `UPCALL_ANY_INSTRUCTION` post, at an interrupt's return to user mode,
@@ -165,7 +169,9 @@ handler bound for its class, a fault takes the outcome it has with no handler bo
 fault that crosses classes is a virtual-memory fault its handler forwards
 ([`FAULT_REPLY_FORWARD`](#reply)), delivered again through the exception class; an exception
 handler therefore dispatches on the message's kind, as [Fault Message](#fault-message) gives it, and
-may receive `FAULT_KIND_VM` with a fifth data word.
+may receive `FAULT_KIND_VM` with a fifth data word. A fault its handler redirects
+([`FAULT_REPLY_REDIRECT`](#reply)) leaves the bindings: it is delivered to the endpoint the reply
+names, and stays a delivery of its class, whose binding change still cancels it.
 
 `SYS_THREAD_SET_FAULT_HANDLER(thread_cap, endpoint_cap, reserved, fault_class_mask)`:
 
@@ -246,7 +252,8 @@ thread's behalf. Its format is a stable cross-boundary contract.
 - **Label** — the reserved `FAULT_LABEL`. It proves kernel origin only on an endpoint whose
   handler hands out no `SEND`. A handler that multiplexes client traffic on the same endpoint
   (memmgr) attributes the message by its badge, not by the label; see [Security](#security).
-- **Badge** — the derivation badge of the bound Endpoint cap.
+- **Badge** — the derivation badge of the bound Endpoint cap, or, for a redirected delivery
+  ([`FAULT_REPLY_REDIRECT`](#reply)), of the Endpoint cap the redirecting reply named.
 - **Data word 0** — the fault **kind**:
   - `FAULT_KIND_VM` — a virtual-memory (page) fault.
   - `FAULT_KIND_EXCEPTION` — a CPU exception with no kernel resolution (illegal
@@ -273,7 +280,10 @@ thread's behalf. Its format is a stable cross-boundary contract.
     `UPCALL_POINT_INTERRUPT`); the thread's instruction pointer.
 - **Data word 4** — only on a fault a virtual-memory handler forwarded
   ([`FAULT_REPLY_FORWARD`](#reply)): the forwarder's reason word (`0` when its reply carried
-  none), at `FAULT_FORWARD_REASON_WORD`. A delivery no handler forwarded carries four data words.
+  none), at `FAULT_FORWARD_REASON_WORD`; and on a redirected delivery
+  ([`FAULT_REPLY_REDIRECT`](#reply)): the redirector's data word 0 (`0` when its reply carried
+  none), at `FAULT_REDIRECT_WORD`, the same index. A delivery no handler forwarded or redirected
+  carries four data words.
 
 The faulting thread's full register state is not embedded; a handler that needs it reads
 it with [`SYS_THREAD_READ_REGS`](capability-model.md#thread) on the faulting thread.
@@ -310,7 +320,9 @@ syscall point, past the `ecall` its reported pointer names.
   and a `FAULT_REPLY_FORWARD` reply is acted on as at any forward ([Reply](#reply)): the fault is
   delivered through the exception class when the reply answered the `FAULT_CLASS_VM` delivery of
   a fault other than a kernel copy's and an exception handler is bound, and is otherwise
-  unhandled. Destroying it while stopped ends it as for any stopped thread. A cancelled
+  unhandled. A `FAULT_REPLY_REDIRECT` reply that named an endpoint delivers the fault to that
+  endpoint, and one that named none leaves the fault unhandled. Destroying it while stopped ends
+  it as for any stopped thread, and releases the endpoint a redirect named. A cancelled
   fault-blocked thread is never resumed at its faulting instruction: a thread whose own access
   faulted is killed (a stopped one when next started), and one whose kernel copy faulted has that
   syscall fail.
@@ -331,7 +343,11 @@ syscall point, past the `ecall` its reported pointer names.
   more fault message for the fault; the outcome is unchanged. A stop after the change claimed the
   fault leaves the redelivery: when next started, the thread delivers the fault again. Redelivery
   runs in the kernel, not by resuming the thread at its faulting instruction, so it holds for a
-  trap-type exception whose instruction pointer is already past the trapping instruction.
+  trap-type exception whose instruction pointer is already past the trapping instruction. A
+  redirected delivery ([`FAULT_REPLY_REDIRECT`](#reply)) is in flight under the class of the
+  delivery redirected: a change of that class's binding cancels it as it cancels a delivery
+  through the binding, and the fault is delivered again under that class's binding, not to the
+  endpoint the redirect named.
 
 ### Modifying the faulting thread
 
@@ -362,25 +378,42 @@ The reply **label** conveys disposition:
   syscall's user copy ([Kernel Copies](#kernel-copies)), a forward is a `FAULT_REPLY_KILL` reply.
   The forwarder never waits on the handler it forwards to; memmgr, the pager, forwards every fault
   it cannot back, so a crash service sees them ([Crash Reports](#crash-reports)).
+- `FAULT_REPLY_REDIRECT` — the handler hands the fault to an endpoint it names. The reply carries
+  exactly one capability handle in its cap block: an Endpoint cap of the handler's, with any
+  rights, which the kernel resolves in the handler's CSpace and does not move. The kernel delivers
+  the same fault message to that endpoint, with that cap's derivation badge, data words 0–3
+  unchanged, and the redirector's data word 0 as data word 4 ([Fault Message](#fault-message)),
+  and the reply to that delivery decides, as for any delivery of the fault's class: the thread
+  stays fault-blocked meanwhile, with its registers readable, and that reply may resume, decline,
+  forward (under the forward's rules for the fault's class), or redirect again. A redirect is valid
+  on a delivery of any class and on the fault of a restartable syscall's user copy, which a resume
+  from the endpoint redirected to restarts ([Kernel Copies](#kernel-copies)). The redirector
+  waits on no one: the redirect is its reply. A redirect reply that names no endpoint (a cap count
+  other than one, an unreadable cap block, a stale handle, or a cap of another type) fails with
+  that error ([syscalls.md § `SYS_IPC_REPLY`](../core/kernel/docs/syscalls.md#sys_ipc_reply-1)),
+  and, since the reply has already claimed the fault, the fault is unhandled.
 
-The kernel ignores reply capabilities, and every data word but one: data word 0 of a
-`FAULT_REPLY_KILL` or `FAULT_REPLY_FORWARD` reply, when the reply carries data words, is the
-handler's decline reason. The kernel does not interpret it. When the decline kills a thread whose
-user-mode access faulted, the kernel prints it on its serial console, on a `fault unhandled` line
-ahead of the `USERSPACE FAULT` diagnostic, which names the fault's kind, its address, and the
-instruction pointer, and dumps the registers. The `fault unhandled` line also names the kernel's own
-unhandled causes: the binding of the fault's class found cleared at delivery, the delivery cancelled
-before a reply, and no handler bound for the fault's class at all, so every killed user fault that
-the fault path considered has one. The kills the fault path never considers print none: an x86-64
-user `#PF` with a reserved bit set, which no user action causes, and a syscall return whose
-instruction pointer is not canonical ([Implementation Status](#implementation-status)). A decline
-with no data words prints no reason. memmgr's reasons are tabled in
+Every other label is `FAULT_REPLY_RESUME`. The kernel ignores reply capabilities but a redirect's
+one, and every data word but one: data word 0 of a `FAULT_REPLY_KILL` or `FAULT_REPLY_FORWARD`
+reply, when the reply carries data words, is the handler's decline reason, and of a
+`FAULT_REPLY_REDIRECT` reply the word it passes to the endpoint it names. The kernel interprets
+neither. When a decline kills a thread whose user-mode access faulted, the kernel prints the
+decline reason on its serial console, on a `fault unhandled` line ahead of the `USERSPACE FAULT`
+diagnostic, which names the fault's kind, its address, and the instruction pointer, and dumps the
+registers. The `fault unhandled` line also names the kernel's own unhandled causes: the binding of
+the fault's class found cleared at delivery, the delivery cancelled before a reply, no handler bound
+for the fault's class at all, and a redirect reply that named no endpoint, so every killed user
+fault that the fault path considered has one. The kills the fault path never considers print none:
+an x86-64 user `#PF` with a reserved bit set, which no user action causes, and a syscall return
+whose instruction pointer is not canonical ([Implementation Status](#implementation-status)). A
+decline with no data words prints no reason. memmgr's reasons are tabled in
 [services/memmgr/docs/ipc-interface.md](../services/memmgr/docs/ipc-interface.md#kernel-origin-fault-message-fault_label),
 and the crash service's reason is its report's id
 ([services/crashd/docs/operation.md](../services/crashd/docs/operation.md) § Per Fault).
 
 A declined fault, like every other unhandled one (the binding of its class cleared before delivery,
-or the delivery cancelled; [Delivery, Resume, and Kill](#delivery-resume-and-kill)), takes the
+the delivery cancelled, [Delivery, Resume, and Kill](#delivery-resume-and-kill), or a redirect
+that named no endpoint), takes the
 outcome it has with no handler bound: a fault of a user-mode access kills the thread, and a fault of
 a kernel copy fails its syscall with `InvalidAddress` ([Kernel Copies](#kernel-copies)). The reply
 has this one meaning whatever raised the fault. The message is the same for both, and the handler
@@ -407,10 +440,13 @@ the fault path for such a fault:
   copy to the buffer, read for a copy from it; bit 3 under the rules of
   [Fault Message](#fault-message)), and the syscall instruction as the faulting instruction
   pointer. The thread is fault-blocked with its register frame at that instruction, and the handler
-  reads and edits it as for any fault.
-- **Restart.** On `FAULT_REPLY_RESUME` the thread re-executes the syscall instruction: the syscall
-  runs again from its start, with the frame's argument registers (as the handler left them), or the
-  thread continues from an instruction pointer the handler wrote. A restartable syscall changes
+  reads and edits it as for any fault. A handler that redirects it
+  ([`FAULT_REPLY_REDIRECT`](#reply)) has the same fault delivered to the endpoint it names, whose
+  reply then decides as the handler's would.
+- **Restart.** On `FAULT_REPLY_RESUME`, from the handler or from an endpoint the fault was
+  redirected to, the thread re-executes the syscall instruction: the syscall runs again from its
+  start, with the frame's argument registers (as the handler left them), or the thread continues
+  from an instruction pointer the handler wrote. A restartable syscall changes
   nothing visible outside the call before its copy and writes no register of the caller's frame,
   so its re-execution is a first call; a syscall MUST meet that rule to copy through this path.
 - **No progress.** A handler that resumes without making the access satisfiable takes the same
@@ -418,9 +454,9 @@ the fault path for such a fault:
   the handler, never a kernel retry, and ending the loop is the handler's policy.
 - **Unhandled.** A fault the handler declines or forwards (a forward of a kernel copy's fault is a
   decline, so no exception handler sees a fault the thread survives), or that is otherwise
-  unhandled ([Reply](#reply)), fails the syscall with `InvalidAddress`; the thread continues past
-  the syscall instruction, or from an instruction pointer the handler wrote. With no handler bound
-  the syscall fails with `InvalidAddress` at once.
+  unhandled ([Reply](#reply), a redirect naming no endpoint included), fails the syscall with
+  `InvalidAddress`; the thread continues past the syscall instruction, or from an instruction
+  pointer the handler wrote. With no handler bound the syscall fails with `InvalidAddress` at once.
 - **Stale entries.** A copy fault the live page tables already satisfy (a stale TLB entry, which a
   mapping the handler just installed can leave on another CPU) is retried in the kernel, as a
   user-mode fault is, and reaches neither the handler nor the caller.
@@ -442,7 +478,12 @@ the handler.
    or rebind, or on thread destruction. The binder pins both the thread and the endpoint while it
    writes the binding, and a delivery pins the endpoint it read until it parks (see
    [Fault-Handler Binding](#fault-handler-binding)), so a release that drops the endpoint's last
-   reference while a fault is queued on it destroys the endpoint under rule 3.
+   reference while a fault is queued on it destroys the endpoint under rule 3. The endpoint a
+   [`FAULT_REPLY_REDIRECT`](#reply) reply names is held by a reference of the faulting thread's
+   from that reply until the thread's next delivery takes it, which pins the endpoint until it
+   parks, as a delivery through a binding does; a destruction of the thread before that delivery
+   releases it. Once the fault is queued there, no binding holds that endpoint: its destruction
+   while the fault is queued releases the fault under rule 3, unhandled.
 2. Destruction of the handler thread (deletion of the last capability to its Thread object)
    releases any fault-blocked thread awaiting that handler, leaving its fault unhandled (the
    [Kill](#delivery-resume-and-kill) path: the thread is killed, or its kernel copy's syscall
@@ -466,6 +507,10 @@ go to *its* handler, and a fault of a thread with no handler is unhandled ([Repl
 which terminates the chain. A handler-bearing subsystem (e.g. a pager) MUST be reachable without
 itself depending on the fault path — its own threads have no handler bound, or are eager-mapped —
 so the chain is finite.
+
+A chain of redirects ([`FAULT_REPLY_REDIRECT`](#reply)) is iterative in the same way: each hop is a
+handler's reply and a new delivery made by the faulting thread's own dispatch loop, so it takes no
+kernel stack per hop, and only the handlers' replies extend it.
 
 A thread MUST NOT be bound to a fault-handler endpoint that only it receives on; such a
 thread would block on its own fault endpoint indefinitely.
@@ -528,6 +573,9 @@ Every disposition resumes the thread at its registers:
   - the handler thread receiving again;
   - the handler endpoint's destruction while the message is queued;
   - a binding found cleared at delivery.
+
+A `FAULT_REPLY_REDIRECT` reply ([Reply](#reply)) delivers the upcall, as it delivers a fault, to the
+endpoint it names, whose reply then disposes of it as above; one that names no endpoint drops it.
 
 A change of the upcall class's binding during a delivery delivers the upcall again under the new
 binding, as for a fault. The [Liveness](#liveness) rules hold unchanged.
@@ -824,6 +872,16 @@ address under its own binding, so the copy adds no authority over the faults att
 process. `SYS_THREAD_GET_FAULT_HANDLER` discloses a binding's badge to a holder of `CONTROL`,
 not a capability to its endpoint. Whether a badge value is guessable plays no part.
 
+A redirected delivery ([`FAULT_REPLY_REDIRECT`](#reply)) carries the derivation badge of the
+Endpoint cap the redirecting handler named, a cap that handler holds: the redirector, like a
+binder, chooses which of its caps to name, never the badge value. A redirect needs any Endpoint cap,
+as a binding does, and adds no way of sending `FAULT_LABEL` on an endpoint: the message is the
+kernel's, for a fault the redirector held the reply to, and a holder of any cap to an endpoint can
+already make its own thread's faults reach it by binding. A redirector learns nothing of the
+endpoint it names and grants the target no capability; the target, like any handler, holds the
+reply to the fault and reaches the faulting thread otherwise only through a Thread capability it
+holds.
+
 ---
 
 ## Demand Paging and the Default System Pager
@@ -850,6 +908,12 @@ not yet backed takes the same path through the restartable syscalls: the pager b
 the syscall re-executes ([Kernel Copies](#kernel-copies)), so a caller need not touch its buffer
 first.
 
+A pager MUST evict only pages it mapped itself. memmgr's eviction is design intent; not yet
+implemented: under memory pressure memmgr is to evict cold pages it backed into a compressed store
+in RAM and restore them on the next fault, never evicting a page of a process whose budget node is
+a reserve node, nor a region registered no-evict
+([memmgr Memory Pool § Eviction](../services/memmgr/docs/memory-pool.md#eviction)).
+
 ### Default System Pager
 
 The broadly useful memory policies — lazy and guard-page stack growth, zero-fill-on-demand
@@ -857,7 +921,9 @@ anonymous memory, copy-on-write sharing, swap and overcommit, working-set tracki
 snapshotting — exist only if a manager sits on the fault path of most processes. Binding a
 default pager to all ordinary processes is a userspace policy decision (a creator default
 plus the runtime's copy of the spawning thread's bindings onto each thread it spawns), not a
-kernel one.
+kernel one. Of swap, memmgr is to implement compressed eviction in RAM (design intent; not yet
+implemented, [Demand Paging](#demand-paging-and-the-default-system-pager) above), and a separate
+swap service its disk tier ([#43](https://github.com/kottlerg/seraph/issues/43)).
 
 Demand paging is the **system-wide default**: procmgr binds memmgr (the pager) as the
 fault handler on every process it creates and advertises it in

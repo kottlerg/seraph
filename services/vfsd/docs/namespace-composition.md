@@ -273,19 +273,22 @@ its siblings — is not supported by this scheme.
 
 vfsd holds two un-badged endpoints:
 
-- **Service endpoint** — `MOUNT`, `UNMOUNT` and `GET_SYSTEM_ROOT_CAP`.
-  Multi-threaded recv (`SERVICE_THREAD_COUNT` handlers) so that
-  independent requests proceed while one handler waits on a fatfs
-  spawn. The count is a concurrency knob, not a correctness bound: no
-  service-endpoint request waits on another, since what a `MOUNT`
-  handler blocks on (the worker pool, procmgr's `CREATE_FROM_FILE`,
-  whose `FS_READ`s go to the fs driver that minted the file cap, the
-  `/services/fs/fatfs` walk the namespace dispatcher serves, and the
-  `FS_MOUNT` probe) and what an `UNMOUNT` handler blocks on (the
-  driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
-  `DESTROY_PROCESS`, and the root-mount walk for a fall-through cap)
-  never calls the service endpoint. A request past
-  the last free handler waits in the endpoint queue.
+- **Service endpoint** — `MOUNT`, `UNMOUNT`, `GET_SYSTEM_ROOT_CAP` and
+  `GET_SWAP_PARTITION`. Multi-threaded recv (`SERVICE_THREAD_COUNT`
+  handlers) so that independent requests proceed while one handler
+  waits on a fatfs spawn. The count is a concurrency knob, not a
+  correctness bound: no service-endpoint request waits on another's
+  IPC, since what a `MOUNT` handler blocks on (the worker pool,
+  procmgr's `CREATE_FROM_FILE`, whose `FS_READ`s go to the fs driver
+  that minted the file cap, the `/services/fs/fatfs` walk the namespace
+  dispatcher serves, and the `FS_MOUNT` probe) and what an `UNMOUNT`
+  handler blocks on (the driver's `FS_UNMOUNT` and its death, each
+  within a bound, procmgr's `DESTROY_PROCESS`, and the root-mount walk
+  for a fall-through cap) never calls the service endpoint, and a
+  `GET_SWAP_PARTITION` waits at most for the swap lock, which its
+  holder keeps across one `REGISTER_PARTITION` call to the block
+  driver, which never calls vfsd. A request past the last free handler
+  waits in the endpoint queue.
 - **Namespace endpoint** — `NS_LOOKUP`, `NS_STAT`, `NS_READDIR`.
   Single dispatcher thread; the `NamespaceBackend` methods are
   in-memory walks of one node's children or ancestors, and the only
@@ -339,7 +342,7 @@ roots) is not implemented.
 | [shared/namespace-protocol/README.md](../../../shared/namespace-protocol/README.md) | NS_* wire surface and dispatch crate |
 | [docs/namespace-model.md](../../../docs/namespace-model.md) | Cap-as-namespace principles, sandboxing |
 | [services/fs/docs/fs-driver-protocol.md](../../fs/docs/fs-driver-protocol.md) | Filesystem-driver-specific labels (FS_READ, FS_READ_MEMORY, …) |
-| [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, UNMOUNT, GET_SYSTEM_ROOT_CAP) |
+| [services/vfsd/docs/vfs-ipc-interface.md](vfs-ipc-interface.md) | vfsd service-endpoint surface (MOUNT, UNMOUNT, GET_SYSTEM_ROOT_CAP, GET_SWAP_PARTITION) |
 
 ---
 

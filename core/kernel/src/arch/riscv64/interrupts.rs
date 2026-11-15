@@ -1593,6 +1593,17 @@ pub unsafe fn send_nmi_to(_target_hart_id: u32)
     crate::fatal("send_nmi_to: RISC-V has no S-mode NMI surface");
 }
 
+/// Have a hart the softlockup watchdog found silent print its own frame. RISC-V has no
+/// S-mode NMI surface, and every supervisor interrupt is masked on a hart wedged with
+/// `sstatus.SIE` clear, so no frame is printed and this returns false: the watchdog's report
+/// is the observing hart's dump alone (core/kernel/docs/scheduling-internals.md § Softlockup
+/// Watchdog).
+#[cfg(not(test))]
+pub fn dump_remote_frame(_cpu: usize) -> bool
+{
+    false
+}
+
 /// Context passed to [`wait_for_ack`] by every synchronous IPI sender.
 ///
 /// Identical shape to the x86-64 counterpart so shared call sites (e.g.

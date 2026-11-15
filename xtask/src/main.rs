@@ -25,6 +25,24 @@
               from third-party host deps (clap, gpt, fatfs, libc, which); not resolvable without \
               upstream releases"
 )]
+// `symbolize`, the riscv64 kernel frame check and `compare-images` read ELF,
+// PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
+// pinned toolchain's sysroot ships for std's backtraces, so they have no Cargo
+// entry (docs/coding-standards.md § Dependencies). Only a build against the
+// prebuilt std reaches them; `cargo xtask test` lints xtask that way. The std
+// of a `*-windows-msvc` host carries no `object` or `addr2line`, so xtask
+// builds on Windows with the GNU host toolchain (docs/build-system.md
+// § Toolchain).
+#![feature(rustc_private)]
+#[cfg(all(windows, target_env = "msvc"))]
+compile_error!(
+    "xtask needs the toolchain sysroot's `object` and `addr2line`, which a *-windows-msvc host's \
+     std does not carry: build it with the GNU host toolchain (docs/build-system.md § Toolchain)"
+);
+
+extern crate addr2line;
+extern crate object;
+extern crate rustc_demangle;
 
 use clap::Parser;
 
@@ -106,6 +124,7 @@ fn main()
         CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
+        CliCommand::TestWedge(args) => commands::test_wedge::run(&ctx, args),
         CliCommand::CaptureAcpi(args) => commands::capture_acpi::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),

@@ -23,6 +23,15 @@ components must be installed:
 
 Run `rustup show` in the repository root to confirm the toolchain is active.
 
+xtask reads ELF, PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
+toolchain's sysroot ships for std's backtraces
+([coding-standards.md](coding-standards.md#dependencies) § Dependencies). The std of every host
+carries them, with `object`'s ELF and PE readers (on macOS too), except two: a
+`*-pc-windows-msvc` host's, which symbolizes its backtraces through the platform's debug-help
+library instead, and an AIX host's, whose `object` reads XCOFF only. On Windows xtask therefore
+needs the GNU host toolchain (`rustup set default-host x86_64-pc-windows-gnu` before the pinned
+toolchain is installed); on a `*-windows-msvc` host it fails to compile, naming that toolchain.
+
 `cargo xtask test` runs the host tests a second time built for `riscv64gc-unknown-linux-gnu`,
 under QEMU's user-mode emulator, so it needs a Linux host with three more packages: the emulator
 (`qemu-riscv64`), the riscv64 Linux cross compiler that links the test binaries
@@ -31,8 +40,9 @@ they are `qemu-user`, `gcc-riscv64-linux-gnu` and `libc6-dev-riscv64-cross`; on 
 `qemu-user`, `riscv64-linux-gnu-gcc` and `riscv64-linux-gnu-glibc`. The command fails, naming
 them, when one is missing.
 
-`cargo xtask symbolize` reads DWARF and symbol tables in Rust (the `addr2line` and `object` crates
-of xtask's dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
+`cargo xtask symbolize` reads DWARF and symbol tables in Rust, with the `addr2line` and `object`
+crates the toolchain's sysroot ships ([coding-standards.md](coding-standards.md#dependencies)
+§ Dependencies), so symbolizing needs no host tool beyond the toolchain. Debugging a guest
 through QEMU's gdbstub ([testing.md § Troubleshooting](testing.md#troubleshooting)) needs a host
 GDB that supports the guest's architecture: a riscv64 guest needs a GDB built for RISC-V as well
 as the host, such as one configured with `--enable-targets=all` or a distribution's multi-target
@@ -449,8 +459,9 @@ cargo xtask test --component kernel     # single crate
 ```
 
 Before it runs the tests, `cargo xtask test` lints the test code: Clippy over the test
-configuration of the selected crates for the Linux target of each architecture, with all warnings
-treated as errors ([coding-standards.md](coding-standards.md#clippy) § Clippy;
+configuration of the selected crates for the Linux target of each architecture (`xtask`, which
+builds only against the prebuilt `std`, for the host target alone), with all warnings treated as
+errors ([coding-standards.md](coding-standards.md#clippy) § Clippy;
 [xtask/README.md](../xtask/README.md) § `cargo xtask test`). After the host run, it builds the
 tests of the selected crates, `xtask` and its wrapper shim left out, for
 `riscv64gc-unknown-linux-gnu` and runs them under `qemu-riscv64`, so a test gated on riscv64 runs
@@ -478,7 +489,7 @@ CI workflows live in `.github/workflows/`. Local equivalents are the
 
 | Workflow | Trigger | Purpose |
 |---|---|---|
-| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs and `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal`, plus `test-vmgenid` on x86_64. |
+| `build-test.yml` | push to `master`, PR to `master`, manual dispatch | Light validation: one `host-tests` job runs `cargo xtask lint-docs`, on a pull request `cargo xtask commit-check` over its commits, and then, after installing the riscv64 test emulation packages, `cargo xtask test`, which lints the test code before it runs the tests on the host and under riscv64 emulation; a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the matrix `validate` job builds each `arch × profile` cell, then per-tester either stages a recipe (svctest also co-stages `crasher` and drops `crashd`), drops the autostarted `terminal`, and runs `mkdisk --repack-only` (svctest, usertest), or re-composes the bundle via `compose-bundle --harness ktest`, and runs one `run-parallel --parallel 1 --runs 1` iteration with `--save-logs`, under a per-cell `--timeout`: the rule [testing.md § Coverage tiers](testing.md#coverage-tiers) gives the boundary budgets, applied to the cell's worst CI pass with ktest's 100 s bound at 4 CPUs as the added bound for every cell, and re-derived when that worst changes; the non-passing runs' logs upload as one artifact per cell at the repository's default retention, and every run's saved log, a PASS included, as a second artifact kept 14 days, each with the symbolized crash reports `run-parallel` writes beside its logs; ktest cells then run `test-kaslr` and `test-map-redo`, svctest cells run `test-crash-report --expect none --log` on the log their boot saved, and usertest cells run `test-crash-report --expect reports --log` on theirs and `test-log-level`, then re-mirror the default boot (`mkdisk`) and run `test-terminal` and `test-wedge`, plus `test-vmgenid` on x86_64. |
 | `burnin.yml` | tag push (`v*.*.*`), manual dispatch | Heavy validation: a `qemu-debs` job (`qemu-debs.yml`) provides the QEMU and firmware packages (below); the `arch × profile × tester` matrix builds each cell, stages that one harness (svctest/usertest drop the autostarted `terminal` and `mkdisk --repack-only`; ktest via `compose-bundle --harness ktest`), then burns it in with `run-parallel --parallel 2 --runs 20` under a per-cell `--timeout`, derived from the cell's worst 2-way burn-in pass by the rule the `validate` job's budgets follow, and re-derived when that worst changes. |
 | `qemu-debs.yml` | `workflow_call` from `build-test.yml` and `burnin.yml` | One `qemu-debs` job downloads the QEMU and firmware packages into the cache entry the caller's booting jobs install from (below). |
 | `release.yml` | tag push (`v*.*.*`), manual dispatch against a `v*.*.*` tag ref (jobs refuse branch refs) | A `preflight` job verifies the workspace version matches the tag and `docs/releases/<tag>.md` exists and follows the template (per [docs/releases/README.md](releases/README.md#source-of-truth)); then builds release-profile disk images per architecture, compresses with zstd, generates `SHA256SUMS`, creates a draft GitHub Release whose body is `docs/releases/<tag>.md`. |
@@ -533,7 +544,9 @@ The merge-gating rule (CI must pass green before merge) lives in
 [README.md](../README.md), [core/boot/README.md](../core/boot/README.md),
 [ELF Loading](../core/boot/docs/elf-loading.md),
 [RISC-V UEFI Boot](../core/boot/docs/riscv-uefi-boot.md),
-[core/kernel/README.md](../core/kernel/README.md), [System Bootstrap](bootstrap.md),
+[core/kernel/README.md](../core/kernel/README.md),
+[Return-Address Integrity](../core/kernel/docs/return-address-integrity.md),
+[System Bootstrap](bootstrap.md),
 [Coding Standards](coding-standards.md), [Platform Requirements](platform-requirements.md),
 [docs/releases/README.md](releases/README.md), [Testing](testing.md),
 [rootfs/README.md](../rootfs/README.md),

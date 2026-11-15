@@ -39,6 +39,7 @@
 
 use crate::runner::Phase;
 
+pub mod budget;
 pub mod crash;
 pub mod devmgr;
 pub mod drivers;
@@ -85,6 +86,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(recv_pool::phases());
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
+    out.extend_from_slice(budget::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

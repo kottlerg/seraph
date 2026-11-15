@@ -95,6 +95,7 @@ core/kernel/
 │   │   ├── cspace.rs           # CSpace: slot storage, lookup, growth
 │   │   ├── slot.rs             # Capability slot representation and rights
 │   │   ├── derivation.rs       # Derivation tree, revocation algorithm
+│   │   ├── drain.rs            # CSpace teardown drain: re-links derivations out of dying slots
 │   │   ├── ioport_bindings.rs  # Per-thread I/O-port binding table and its withdrawal
 │   │   ├── object.rs           # Kernel object headers and wrappers, page pools, teardown
 │   │   ├── registry.rs         # RAM-sized CSpaceId registry arena (id → CSpace, epoch, free list)
@@ -143,6 +144,7 @@ core/kernel/
     ├── initialization.md       # Boot-to-init sequence, phase by phase
     ├── syscalls.md             # Syscall ABI and complete syscall table
     ├── transient-execution.md  # x86-64 transient-execution table: classes, sources, rules
+    ├── return-address-integrity.md # Kernel shadow stacks: threat model, options, direction
     ├── cross-boundary-disclosure.md # Kernel-pointer leak audit of outputs
     ├── memory-internals.md     # Memory subsystem implementation details
     ├── capability-internals.md # Capability subsystem implementation details
@@ -166,6 +168,9 @@ in [`docs/arch-interface.md`](docs/arch-interface.md). No code outside `arch/` c
 and re-exported from `arch/mod.rs` as a unified interface. On x86-64,
 `arch/x86_64/vulnerability.rs` derives at boot the CPU's exposure to each transient-execution
 class and logs it; see [`docs/transient-execution.md`](docs/transient-execution.md).
+Hardware shadow stacks for the kernel's return addresses (Zicfiss on riscv64, CET SHSTK on
+x86-64, each used where the hardware has it) are design intent, not yet implemented; see
+[`docs/return-address-integrity.md`](docs/return-address-integrity.md).
 
 ### `mm/`
 
@@ -185,6 +190,8 @@ instruction fetch on every CPU before it can run. See
 The capability subsystem. `cspace.rs` implements per-process capability spaces.
 `slot.rs` defines the in-memory representation of a capability slot and its rights
 bitmask. `derivation.rs` maintains the global derivation tree used for revocation.
+`drain.rs` is the teardown drain that takes a dying `CSpace`'s slots out of the derivation tree
+(see [`docs/capability-internals.md`](docs/capability-internals.md) § Teardown Drain).
 `object.rs` defines the kernel object headers and wrappers, the page pools that back
 address-space page tables and CSpace slot pages, the CSpace body arena that funds the objects a
 split or a range-capability copy creates (its pure logic in `arena.rs`), and their allocation and

@@ -202,9 +202,10 @@ impl KernelObjectHeader
 
     /// Increment the reference count for an owner whose number is bounded
     /// below the headroom above [`REF_COUNT_LIMIT`]: a syscall pin, a binding,
-    /// a mapping record, a boot mint's SEED lease, a chunk's reference on its
-    /// [`ArenaPage`] (at most 31 per page), a kept arena page's lease on its
-    /// donation's Memory object (one per page of that donation), or the lease of a retype that
+    /// a thread's fault redirect (one per thread), a mapping record, a boot
+    /// mint's SEED lease, a chunk's reference on its [`ArenaPage`] (at most 31
+    /// per page), a kept arena page's lease on its donation's Memory object
+    /// (one per page of that donation), or the lease of a retype that
     /// [`crate::cap::retype::retype_allocate`] admitted (see
     /// core/kernel/docs/capability-internals.md § Kernel Object Reference
     /// Counting), or an IPC transfer's move destination, whose message
@@ -4126,12 +4127,14 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
         // donation held, the create-time slab last.
         //
         // Before `unregister_cspace` and the dec_ref cascade run, the
-        // derivation tree's external back-links into this dying `CSpace`
-        // are scrubbed by [`drain_dying_cspace_batch`]. Combined with the
-        // [`SlotId`] epoch check in `lookup_cspace`, this is the
-        // defense-in-depth that lets `free_cspace_id` recycle the id
-        // safely: foreign slots cannot retain a back-link, and any that
-        // somehow slip through fail-fast on epoch mismatch.
+        // derivation drain (`drain::drain_dying_cspace_batch`) takes every
+        // slot of this dying `CSpace` out of the forest, re-linking the
+        // capabilities derived through them under their nearest ancestor
+        // outside it. Combined with the [`SlotId`] epoch check in
+        // `lookup_cspace`, this is the defense-in-depth that lets
+        // `free_cspace_id` recycle the id safely: foreign slots cannot retain
+        // a back-link, and any that somehow slip through fail-fast on epoch
+        // mismatch.
         ObjectType::CSpaceObj =>
         {
             // SAFETY: ptr points at an in-place CSpaceKernelObject; header at offset 0.
@@ -4188,10 +4191,11 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
 
                 // ── Batched pre-unregister derivation drain ──
                 // DERIVATION_LOCK is held per batch (bounded by
-                // MAX_DRAIN_EDITS steps — slots visited plus link edits),
-                // released between batches so
-                // an arbitrarily large donor-funded CSpace never stalls
-                // concurrent derivation traffic behind its teardown.
+                // MAX_DRAIN_EDITS steps), released between batches so an
+                // arbitrarily large donor-funded CSpace never stalls
+                // concurrent derivation traffic behind its teardown. The
+                // first batch marks the CSpace draining, which closes it to
+                // IPC capability transfer and in-flight moves.
                 // `unregister_cspace` runs inside the FINAL batch's
                 // critical section so any concurrent foreign reader sees a
                 // consistent "drained, then absent" transition.
@@ -4200,18 +4204,24 @@ unsafe fn dealloc_object_one(ptr: core::ptr::NonNull<KernelObjectHeader>, stack:
                 // pass below: the objects that pass orphans are torn down
                 // later from the cascade stack, and a `CSpace` among them
                 // takes this same non-recursive lock for its own drain. The
-                // drain already removed every foreign link before this point,
-                // so the dec_ref pass has no derivation-tree work to do —
-                // releasing is safe.
-                let mut drain_cursor: u32 = 0;
+                // drain already took every slot out of the forest before this
+                // point, so the dec_ref pass has no derivation-tree work to
+                // do — releasing is safe.
+                let mut drain = crate::cap::drain::DrainState::new();
                 loop
                 {
                     crate::cap::derivation::DERIVATION_LOCK.write_lock();
                     // SAFETY: DERIVATION_LOCK held; cs_ptr uniquely owned at
-                    // refcount=0; registry entry still live (unregister
-                    // below, in the final batch's hold).
+                    // refcount=0, its bound threads stopped above; registry
+                    // entry still live (unregister below, in the final
+                    // batch's hold).
                     let done = unsafe {
-                        drain_dying_cspace_batch(cs_ptr, id, dying_epoch, &mut drain_cursor)
+                        crate::cap::drain::drain_dying_cspace_batch(
+                            cs_ptr,
+                            id,
+                            dying_epoch,
+                            &mut drain,
+                        )
                     };
                     if done
                     {
@@ -5403,6 +5413,26 @@ unsafe fn dealloc_thread(
         unsafe { crate::arch::current::cpu::restore_interrupts(wake_saved_int) };
         crate::percpu::preempt_enable();
 
+        // Release the endpoint a redirecting fault reply left for a pass
+        // this thread never ran (ThreadControlBlock::fault_redirect). After
+        // the gate above, because such a reply stores it before the wake
+        // that clears wake_in_flight; an orphaned endpoint goes on the
+        // cascade stack, as a binding's does.
+        // SAFETY: tcb valid (not yet freed); the field is atomic.
+        let redirect = unsafe { &(*tcb).fault_redirect }
+            .swap(core::ptr::null_mut(), core::sync::atomic::Ordering::AcqRel);
+        // SAFETY: redirect is non-null in the second operand, and the field's
+        // reference on the endpoint, still held, keeps it live.
+        if !redirect.is_null() && unsafe { (*redirect).header.dec_ref() } == 0
+        {
+            // SAFETY: redirect is non-null.
+            let ep_header =
+                unsafe { core::ptr::NonNull::new_unchecked(redirect.cast::<KernelObjectHeader>()) };
+            // SAFETY: no lock is held here; the field's reference was the
+            // endpoint's last, leaving it unreferenced for the push.
+            unsafe { stack.push(ep_header) };
+        }
+
         // A timer batch that popped this thread keeps its pointer, with no
         // reference, until it finishes: wait it out before the free (its
         // claim finds the waiter by address). See
@@ -5539,191 +5569,6 @@ unsafe fn dealloc_thread(
         // SAFETY: the reference just released was its last.
         unsafe { stack.push(ancestor_nn) };
     }
-}
-
-// ── CSpace teardown helpers ──────────────────────────────────────────────────
-
-/// Maximum drain steps (slots visited plus derivation-link edits) per
-/// `DERIVATION_LOCK` hold while draining
-/// a dying `CSpace` (mirrors `MAX_REVOKE_EDITS`): teardown of an
-/// arbitrarily large donor-funded `CSpace` releases the global lock
-/// between batches, so concurrent derivation traffic never stalls behind
-/// more than a constant amount of drain work.
-#[cfg(not(test))]
-const MAX_DRAIN_EDITS: usize = 256;
-
-/// Drain one batch of a dying `CSpace`'s derivation state.
-///
-/// Processes populated slots from `*cursor` upward. Per slot:
-///
-/// 1. **Unlink every child**, head-first (`unlink_node` on
-///    `deriv_first_child` until the list is empty; one edit each, O(1)
-///    per edit — no list walking). A foreign child becomes a derivation
-///    root of its own subtree; a child in the dying `CSpace` becomes a
-///    parentless dying node, unlinked from *its* children when the cursor
-///    reaches its own index.
-/// 2. **Unlink the slot** from its parent/sibling links (`unlink_node`) —
-///    neighbours, live or dying, are re-linked directly. The head-pops in
-///    step 1 already left `deriv_first_child` at `None`.
-///
-/// Because every unlink re-links the neighbours directly, the forest is
-/// fully consistent after each edit — unlike a splice-then-clear two-pass
-/// drain, no state depends on a later pass. The caller may therefore
-/// release `DERIVATION_LOCK` between batches: a foreign traversal in the
-/// window (a revoke hoist, a transfer repoint) sees ordinary consistent
-/// nodes, and may even revoke a not-yet-drained dying slot — the drain
-/// then skips it as Null and the object refcount is settled once (revoke
-/// dec-refs it; the post-drain `for_each_object` pass skips Null slots).
-///
-/// The batch loop's progress: every edit removes one link, and the
-/// head-pop's no-progress containment truncates any unresolvable or
-/// cyclic chain instead of spinning. Work can still arrive between holds
-/// — the `CSpace` stays registered until the final batch, so a foreign
-/// `SYS_CAP_DELETE` of a slot whose parent is a dying slot reparents that
-/// slot's children into the dying slot, and a capability transfer that
-/// committed to a receiver there before that receiver was stopped can land
-/// caps into it (every bound thread is stopped before the drain, so none
-/// derives out of it).
-/// Each such event adds at most one reparent batch of work while the
-/// drain removes a batch per hold, so the loop is bounded by lock
-/// contention rather than by a constant, and it carries no batch backstop
-/// (a teardown cannot fail): a holder of capabilities derived from the
-/// dying `CSpace` can prolong the teardown for as long as it keeps
-/// deleting, which stalls the deleting thread, not the system. Links
-/// wired behind the cursor dangle once the `CSpace` unregisters and
-/// surface downstream as dead-link truncation, in the drain's own
-/// containment or `revoke_subtree_batch`'s — contained (see
-/// core/kernel/docs/capability-internals.md § Revocation Algorithm).
-/// Apart from those links, the end state is that no slot anywhere
-/// references the dying `CSpace`, which is the invariant `free_cspace_id`
-/// recycling relies on.
-///
-/// Returns `true` once the whole `CSpace` is drained; `false` when the
-/// step budget ran out (call again — the cursor resumes at the same
-/// slot). Every slot visited and every link edit is one step, so a hold
-/// is bounded by `MAX_DRAIN_EDITS` whatever the population.
-///
-/// ## Aliasing avoidance
-///
-/// No borrow into `cs_ptr` is held across foreign-slot accesses: reads of
-/// the dying slot go through brief `(*cs_ptr).slot(..)` scopes, and all
-/// link edits go through `unlink_node`, which resolves every slot it
-/// touches via fresh registry lookups.
-///
-/// # Safety
-///
-/// Caller MUST hold `DERIVATION_LOCK` write lock. `cs_ptr` MUST be a
-/// valid `CSpace` pointer whose refcount has reached zero (exclusive
-/// ownership). The registry entry for `dying_id` MUST still be live —
-/// `unregister_cspace` runs only after the final batch, in the same
-/// critical section, so foreign readers see a consistent
-/// "drained, then absent" transition.
-#[cfg(not(test))]
-unsafe fn drain_dying_cspace_batch(
-    cs_ptr: *mut crate::cap::cspace::CSpace,
-    dying_id: crate::cap::slot::CSpaceId,
-    dying_epoch: u32,
-    cursor: &mut u32,
-) -> bool
-{
-    use crate::cap::cspace::L2_SIZE;
-    use crate::cap::derivation::{truncate_dead_link, unlink_node};
-    use crate::cap::slot::{CapTag, SlotId};
-    use core::num::NonZeroU32;
-
-    // Leaves are contiguous behind the grow cursor; leaf_count bounds the
-    // slot range exactly.
-    // A CSpace's slots are indexed by u32, so the product never saturates.
-    // SAFETY: cs_ptr is uniquely owned (refcount = 0).
-    let slot_count = (unsafe { (*cs_ptr).leaf_count() }.saturating_mul(L2_SIZE)) as u32;
-    // `edits` is below MAX_DRAIN_EDITS before every step (checked) and the
-    // cursor below `slot_count`, so their increments never saturate.
-    let mut edits = 0usize;
-
-    while *cursor < slot_count
-    {
-        let global_idx = *cursor;
-        // Every slot visited counts against the budget like a link edit, so
-        // a hold over a large but sparsely populated `CSpace` stays bounded.
-        if edits >= MAX_DRAIN_EDITS
-        {
-            return false;
-        }
-        let Some(idx_nz) = NonZeroU32::new(global_idx)
-        else
-        {
-            // Slot 0 is permanently null.
-            *cursor = cursor.saturating_add(1);
-            edits = edits.saturating_add(1);
-            continue;
-        };
-        // SAFETY: brief immutable borrow; dropped at the end of the call.
-        let populated =
-            unsafe { (*cs_ptr).slot(global_idx) }.is_some_and(|s| s.tag != CapTag::Null);
-        if !populated
-        {
-            *cursor = cursor.saturating_add(1);
-            edits = edits.saturating_add(1);
-            continue;
-        }
-        let self_id = SlotId::with_epoch(dying_id, dying_epoch, idx_nz);
-
-        // 1. Unlink every child, head-first: each head pop is one O(1)
-        //    edit (the head's unlink rewrites this slot's
-        //    `deriv_first_child` to the next child — no list walking), so
-        //    the edit budget bounds the hold's real work exactly.
-        loop
-        {
-            if edits >= MAX_DRAIN_EDITS
-            {
-                // Budget exhausted mid-slot; the caller re-enters with the
-                // cursor still naming this slot.
-                return false;
-            }
-            // SAFETY: brief immutable borrow of the dying slot.
-            let Some(head) =
-                unsafe { (*cs_ptr).slot(global_idx) }.and_then(|s| s.deriv_first_child)
-            else
-            {
-                break;
-            };
-            // SAFETY: DERIVATION_LOCK held; unlink_node resolves every slot
-            // it touches via fresh registry lookups (occupancy-gated) and
-            // clears the child's parent link.
-            unsafe { unlink_node(head) };
-            edits = edits.saturating_add(1);
-            // No-progress containment: an unresolvable head (dead link, or
-            // a stale/cyclic chain) makes unlink_node a no-op and would
-            // otherwise pin the pop loop forever. Truncate the chain
-            // hanging from it — the same containment revocation applies to
-            // a dead link — and move on.
-            // SAFETY: brief borrows of the dying slot.
-            let still_head =
-                unsafe { (*cs_ptr).slot(global_idx) }.and_then(|s| s.deriv_first_child);
-            if still_head == Some(head)
-            {
-                // SAFETY: DERIVATION_LOCK held; self_id names an occupied
-                // slot of a CSpace that stays registered until the final
-                // batch.
-                unsafe { truncate_dead_link(self_id, head, "teardown drain") };
-                break;
-            }
-        }
-
-        if edits >= MAX_DRAIN_EDITS
-        {
-            return false;
-        }
-
-        // 2. Unlink this slot from its parent/sibling dimension. Step 1
-        //    left its child pointer at None.
-        // SAFETY: DERIVATION_LOCK held (see above).
-        unsafe { unlink_node(self_id) };
-        edits = edits.saturating_add(1);
-
-        *cursor = cursor.saturating_add(1);
-    }
-    true
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

@@ -269,8 +269,14 @@ jobs:
             rm -f sysroot/config/svcmgr/services/usertest.svc
             cargo xtask mkdisk --arch ${{ matrix.arch }}
             cargo xtask test-terminal --arch ${{ matrix.arch }}
+            # Fourth boot pair: the interrupts-off wedge test (#33). Wedges an
+            # idle AP, then the BSP, through QEMU's gdbstub and checks the
+            # softlockup watchdog's report, on x86_64 with the wedged CPU's
+            # own NMI frame; host-side over the gdbstub, so it cannot ride
+            # run-parallel. Reuses the default interactive boot.
+            cargo xtask test-wedge --arch ${{ matrix.arch }}
             if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              # Fourth boot pair: the VMGENID snapshot-resume test (#395).
+              # Fifth boot pair: the VMGENID snapshot-resume test (#395).
               # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
               # host-side QMP migrate/restore, so it cannot ride
               # run-parallel. Reuses the default interactive boot the

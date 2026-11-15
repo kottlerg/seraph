@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "vfsd-swap"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+gpt = { path = "../gpt", package = "vfsd-gpt" }
+
+[lints]
+workspace = true

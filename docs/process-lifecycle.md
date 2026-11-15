@@ -162,11 +162,11 @@ post-handover.
 Init then serves svcmgr the **handover endowment** (see
 [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md)
 § Handover endowment) over the
-bootstrap-round protocol: the `CAPS` rounds (two rounds for its six
+bootstrap-round protocol: the `CAPS` rounds (two rounds for its seven
 slots) carry svcmgr's own endpoints plus the publish-role source caps
-(a `SEND` on the root filesystem namespace
-endpoint, a badge-0 `SEND|GRANT` source on devmgr's registry
-endpoint, and two badged SENDs on vfsd's service endpoint); each
+(a `SEND` on vfsd's synthetic root, derived from init's system-root
+cap, a badge-0 `SEND|GRANT` source on devmgr's registry
+endpoint, and three badged SENDs on vfsd's service endpoint); each
 subsequent `SUBSTRATE` round carries one `(name, thread_cap)`
 pair for a substrate service init bootstrapped (`memmgr`, `procmgr`,
 `devmgr`, `vfsd`), and a terminal `LOGD_SOURCES` round carries the
@@ -178,8 +178,8 @@ yet implemented (#262), per
 well-known names it owns into its own registry
 (`ipc::published_names::ROOTFS_ROOT`, `SVCMGR`, `DEVMGR_REGISTRY`,
 `DEVMGR_SHUTDOWN`, `DEVMGR_BIND` (seed-only, the one name a seed receives as `SEND|GRANT`), the
-`DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `LOGD_QUERY`, minted from the
-endowed sources) and
+`DEVMGR_CLASS_PREFIX` class names, `VFSD_MOUNT`, `VFSD_DENY`, `VFSD_SWAP`, `LOGD_QUERY`, minted
+from the endowed sources) and
 installs devmgr's `/services/drivers/` cap via
 `devmgr_labels::SET_DRIVERS_DIR`.
 The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are

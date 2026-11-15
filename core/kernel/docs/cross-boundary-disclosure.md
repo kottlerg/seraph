@@ -112,7 +112,8 @@ Notes on the non-obvious entries:
   tables (`copy_fault_present`, x86-64 only), and the syscall instruction as `ip`. A
   fault a virtual-memory handler forwarded (`FAULT_REPLY_FORWARD`) carries the same words
   and, as data word 4, the word that handler's reply sent, a user value the kernel copies
-  uninterpreted. No other word carries a kernel VA or a value derived from one. The
+  uninterpreted; a fault redirected (`FAULT_REPLY_REDIRECT`) carries the redirector's word the
+  same way. No other word carries a kernel VA or a value derived from one. The
   forwarded/readable `TrapFrame` holds only user-mode register state (no kernel stack pointer,
   kernel return address, or `CR3`/`satp`); the write path re-validates through
   `sanitize_for_user_resume`. `sys_thread_read_regs` pins the Thread it resolves through

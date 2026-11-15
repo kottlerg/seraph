@@ -765,7 +765,17 @@ unsafe fn kernel_entry_post_rebase(
                 // (core/kernel/docs/initialization.md § Phase 8).
                 fatal("smp: no AP trampoline page; listed CPUs cannot be brought online");
             }
-            kprintln!("smp: starting {} AP(s)", ap_count);
+            // The hardware ids of this and each AP's `online` line map the
+            // logical CPU indices the watchdog names to the platform's CPUs
+            // (`cargo xtask test-wedge` selects a CPU by it).
+            // SAFETY: CPU 0 is below CPU_COUNT, and the APIC id slab was
+            // filled in Phase 4.
+            let bsp_hw_id = unsafe { percpu::apic_id_for(0) };
+            kprintln!(
+                "smp: starting {} AP(s); BSP is CPU 0 (hardware id {:#x})",
+                ap_count,
+                bsp_hw_id
+            );
 
             // Copy/patch the trampoline code into the physical page.
             // SAFETY: direct physical map active (Phase 3); trampoline_pa
@@ -1521,6 +1531,7 @@ unsafe fn kernel_entry_post_rebase(
                         fault_badges: [const { core::sync::atomic::AtomicU64::new(0) };
                             crate::ipc::fault::FAULT_CLASSES],
                         fault_outcome: core::sync::atomic::AtomicU8::new(0),
+                        fault_redirect: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                         in_fault_delivery: false,
                         fault_delivery_class: 0,
                         upcall_pending: core::sync::atomic::AtomicBool::new(false),
@@ -1872,7 +1883,10 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
         fatal("AP provides fewer hardware TLB tags than the BSP configured");
     }
 
-    kprintln!("smp: AP {} online", cpu_id);
+    // SAFETY: cpu_id is this AP's logical index, below CPU_COUNT; the APIC id
+    // slab was filled in Phase 4 and is read-only after it.
+    let hw_id = unsafe { percpu::apic_id_for(cpu_id as usize) };
+    kprintln!("smp: AP {} (hardware id {:#x}) online", cpu_id, hw_id);
 
     // Capture this AP's entropy self-test sample. The AP's generator seeds
     // lazily from the pool (already seeded in Phase 5) on this first draw.

@@ -135,6 +135,13 @@ pub enum CliCommand
     /// again (see xtask/README.md).
     TestGdb(TestGdbArgs),
 
+    /// Check the softlockup watchdog's report of a CPU wedged with interrupts
+    /// off: boot the default boot set twice with QEMU's gdbstub on a unix
+    /// socket, move an idle AP (then the BSP) to the kernel's `halt_loop`
+    /// over the GDB remote serial protocol, and check the watchdog's report,
+    /// with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md).
+    TestWedge(TestWedgeArgs),
+
     /// Capture the ACPI tables of one QEMU configuration into the `shared/aml`
     /// fixtures: boot the firmware alone on a blank disk, save the guest's
     /// memory over QMP once the firmware has installed its tables, find the
@@ -244,6 +251,7 @@ impl CliCommand
             | Self::TestLogLevel(_)
             | Self::TestDebugPort(_)
             | Self::TestGdb(_)
+            | Self::TestWedge(_)
             | Self::CaptureAcpi(_)
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
@@ -571,9 +579,9 @@ pub struct MkdiskArgs
     pub block_size: BlockSize,
 
     /// Author the data partition alone on a second image, `disk-data.img`,
-    /// and only the ESP and root partitions on `disk.img`; boot the pair with
-    /// `--second-disk disk-data.img`. Without it `disk.img` carries all three
-    /// and a `disk-data.img` an earlier authoring left is removed.
+    /// and only the ESP, root and swap partitions on `disk.img`; boot the pair
+    /// with `--second-disk disk-data.img`. Without it `disk.img` carries all
+    /// four and a `disk-data.img` an earlier authoring left is removed.
     #[arg(long)]
     pub split_data: bool,
 }
@@ -745,6 +753,29 @@ pub struct TestLogLevelArgs
     /// svctest needs them to reach its pass marker.
     #[arg(long)]
     pub test_devices: bool,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
+}
+
+// ── TestWedge ─────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestWedgeArgs
+{
+    /// Target architecture.
+    #[arg(long, default_value = "x86_64")]
+    pub arch: Arch,
+
+    /// Number of vCPUs to expose to the guest (QEMU -smp); at least 2.
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
 
     /// The shared host's launch rules (see xtask/README.md "Host launch
     /// rules").

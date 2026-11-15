@@ -4,11 +4,12 @@
 // xtask/src/disk.rs
 
 //! Build GPT disk images from sysroot contents. The images hold three FAT
-//! partitions: an EFI System Partition (from sysroot/esp/), a Seraph root
+//! partitions, an EFI System Partition (from sysroot/esp/), a Seraph root
 //! partition (from sysroot/), and a Seraph data partition (from
-//! sysroot/data/) that vfsd auto-mounts at /data. `disk.img` carries all
-//! three, or the first two with the data partition alone on a second image;
-//! the logical block size, 512 or 4096 bytes, is chosen per authoring.
+//! sysroot/data/) that vfsd auto-mounts at /data, and a raw Seraph swap
+//! partition. `disk.img` carries all four, or all but the data partition,
+//! which then sits alone on a second image; the logical block size, 512 or
+//! 4096 bytes, is chosen per authoring.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -37,6 +38,12 @@ const ROOT_PARTITION_SIZE: u64 = 192 * 1024 * 1024;
 /// fixture plus svctest scratch space); 256 MiB leaves generous headroom
 /// for the test phases' scratch writes.
 const DATA_PARTITION_SIZE: u64 = 256 * 1024 * 1024;
+
+/// Swap partition size. A raw partition, neither formatted nor populated,
+/// which vfsd hands to the swap service; 64 MiB holds the pages a small
+/// `--mem` boot spills under pressure. The image file is sized with
+/// `set_len`, so the partition costs no host disk until it is written.
+const SWAP_PARTITION_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Bytes before the first partition and after the last: the first partition
 /// starts 1 MiB in (standard GPT alignment, past the primary header and
@@ -109,10 +116,10 @@ impl BlockSize
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DataPlacement
 {
-    /// `disk.img` carries all three partitions — the default.
+    /// `disk.img` carries all four partitions — the default.
     #[default]
     MainImage,
-    /// `disk.img` carries the ESP and root; `disk-data.img` carries the data
+    /// `disk.img` carries the ESP, root and swap; `disk-data.img` carries the data
     /// partition alone, for a boot that attaches it as a second disk.
     SecondImage,
 }
@@ -139,15 +146,26 @@ impl DiskLayout
     }
 }
 
-/// One FAT partition of an image: its GPT name, type and unique GUIDs, size,
-/// and the host directory it is populated from (skipped when absent).
+/// One partition of an image: its GPT name, type and unique GUIDs, size, and
+/// what it holds.
 struct Volume
 {
     name: &'static str,
     type_guid: gpt::partition_types::Type,
     unique_uuid: &'static str,
     bytes: u64,
-    source: PathBuf,
+    contents: Contents,
+}
+
+/// What an authored partition holds.
+enum Contents
+{
+    /// A FAT32 volume populated from a host directory (formatted and left
+    /// empty when the directory is absent).
+    Fat(PathBuf),
+    /// No filesystem: the partition's bytes are left as the new image's
+    /// zeros.
+    Raw,
 }
 
 /// The host directories the three partitions are populated from.
@@ -244,24 +262,27 @@ impl Seek for PartitionSlice
 /// layout places the data partition on a second image, `disk-data.img`
 /// beside it.
 ///
-/// The images hold three FAT partitions:
+/// The images hold three FAT partitions and a raw one:
 /// - ESP ([`ESP_PARTITION_SIZE`]): populated from `sysroot/esp/`
 /// - ROOT ([`ROOT_PARTITION_SIZE`]): populated from `sysroot/`
 ///   excluding `esp/` and `data/`
 /// - DATA ([`DATA_PARTITION_SIZE`]): populated from `sysroot/data/`
+/// - SWAP ([`SWAP_PARTITION_SIZE`]): raw, left zero
 ///
-/// `disk.img` carries the ESP and ROOT, and DATA too unless `layout.data` is
-/// [`DataPlacement::SecondImage`], which puts DATA alone on `disk-data.img`.
+/// `disk.img` carries the ESP, ROOT, and SWAP, and DATA too unless
+/// `layout.data` is [`DataPlacement::SecondImage`], which puts DATA alone on
+/// `disk-data.img`. SWAP is the last partition of `disk.img` in both layouts,
+/// so it moves no other partition's LBAs.
 /// Authoring with DATA on `disk.img` removes a `disk-data.img` an earlier
 /// authoring left, so a stale second copy of the data partition cannot be
 /// attached. Every image's GPT LBAs and FAT sectors are `layout.block_size`
 /// bytes.
 ///
-/// ROOT's GPT type-GUID is the arch-specific Seraph root GUID and DATA's is
-/// the arch-neutral Seraph data GUID (see [`boot_protocol::role_guids`]) so
-/// vfsd can identify each by role, on whichever disk holds it, without
-/// consulting a config file. vfsd auto-mounts the data partition at
-/// `/data`. The data tree is placed only on the data partition, not
+/// ROOT's GPT type-GUID is the arch-specific Seraph root GUID, DATA's the
+/// arch-neutral Seraph data GUID, and SWAP's the arch-neutral Seraph swap
+/// GUID (see [`boot_protocol::role_guids`]) so vfsd can identify each by
+/// role, on whichever disk holds it, without consulting a config file. vfsd
+/// auto-mounts the data partition at `/data`. The data tree is placed only on the data partition, not
 /// duplicated onto root; vfsd's fall-through still serves `/data` from
 /// root on images that choose to carry it there instead.
 pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> Result<()>
@@ -318,14 +339,14 @@ fn author_images(
         type_guid: gpt::partition_types::EFI,
         unique_uuid: ESP_UNIQUE_UUID,
         bytes: ESP_PARTITION_SIZE,
-        source: sources.esp.clone(),
+        contents: Contents::Fat(sources.esp.clone()),
     };
     let root = Volume {
         name: "ROOT",
         type_guid: seraph_root_type(arch),
         unique_uuid: ROOT_UNIQUE_UUID,
         bytes: ROOT_PARTITION_SIZE,
-        source: sources.root.clone(),
+        contents: Contents::Fat(sources.root.clone()),
     };
     // The data tree is not also written to the root partition
     // (populate_dir skips top-level data/).
@@ -334,14 +355,21 @@ fn author_images(
         type_guid: seraph_data_type(),
         unique_uuid: DATA_UNIQUE_UUID,
         bytes: DATA_PARTITION_SIZE,
-        source: sources.data.clone(),
+        contents: Contents::Fat(sources.data.clone()),
+    };
+    let swap = Volume {
+        name: "SWAP",
+        type_guid: seraph_swap_type(),
+        unique_uuid: SWAP_UNIQUE_UUID,
+        bytes: SWAP_PARTITION_SIZE,
+        contents: Contents::Raw,
     };
 
     match layout.data
     {
         DataPlacement::MainImage =>
         {
-            write_image(main_image, layout.block_size, &[esp, root, data])?;
+            write_image(main_image, layout.block_size, &[esp, root, data, swap])?;
             if data_image.exists()
             {
                 fs::remove_file(data_image)
@@ -350,7 +378,7 @@ fn author_images(
         }
         DataPlacement::SecondImage =>
         {
-            write_image(main_image, layout.block_size, &[esp, root])?;
+            write_image(main_image, layout.block_size, &[esp, root, swap])?;
             write_image(data_image, layout.block_size, &[data])?;
         }
     }
@@ -377,7 +405,8 @@ fn plan(volumes: &[Volume], block_size: BlockSize) -> Result<(Vec<u64>, u64)>
 }
 
 /// Write a zero-filled image at `path` holding `volumes` as GPT partitions
-/// 1, 2, … in order, each formatted FAT32 and populated from its source.
+/// 1, 2, … in order, each [`Contents::Fat`] one formatted FAT32 and populated
+/// from its source, and each [`Contents::Raw`] one left zero.
 fn write_image(path: &Path, block_size: BlockSize, volumes: &[Volume]) -> Result<()>
 {
     let (starts, image_size) = plan(volumes, block_size)?;
@@ -391,6 +420,11 @@ fn write_image(path: &Path, block_size: BlockSize, volumes: &[Volume]) -> Result
 
     for (volume, start_lba) in volumes.iter().zip(&starts)
     {
+        let Contents::Fat(source) = &volume.contents
+        else
+        {
+            continue;
+        };
         format_and_populate_partition(
             path,
             start_lba
@@ -398,7 +432,7 @@ fn write_image(path: &Path, block_size: BlockSize, volumes: &[Volume]) -> Result
                 .context("partition offset exceeds u64")?,
             volume.bytes,
             block_size,
-            &volume.source,
+            source,
         )?;
     }
     Ok(())
@@ -498,6 +532,7 @@ fn gpt_block_size(head: &[u8]) -> Option<u32>
 pub const ESP_UNIQUE_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef0123456789";
 pub const ROOT_UNIQUE_UUID: &str = "12345678-abcd-ef01-2345-6789abcdef01";
 pub const DATA_UNIQUE_UUID: &str = "c0ffee01-2345-6789-abcd-ef0123456789";
+pub const SWAP_UNIQUE_UUID: &str = "5a9f0e11-2345-6789-abcd-ef0123456789";
 
 /// Return the Seraph root partition type-GUID for `arch`, wrapped as a
 /// `gpt::partition_types::Type` ready for `add_partition_at`.
@@ -521,6 +556,17 @@ fn seraph_data_type() -> gpt::partition_types::Type
 {
     gpt::partition_types::Type {
         guid: uuid::Uuid::from_bytes_le(role_guids::SERAPH_DATA),
+        os: gpt::partition_types::OperatingSystem::None,
+    }
+}
+
+/// Return the Seraph swap partition type-GUID, wrapped as a
+/// `gpt::partition_types::Type` ready for `add_partition_at`. The swap GUID
+/// is arch-neutral, so this takes no `arch`.
+fn seraph_swap_type() -> gpt::partition_types::Type
+{
+    gpt::partition_types::Type {
+        guid: uuid::Uuid::from_bytes_le(role_guids::SERAPH_SWAP),
         os: gpt::partition_types::OperatingSystem::None,
     }
 }
@@ -795,6 +841,48 @@ mod tests
             .collect()
     }
 
+    /// Whether the `len` bytes of `path` at `offset` are all zero.
+    fn block_is_zero(path: &Path, offset: u64, len: u64) -> bool
+    {
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        let mut bytes = vec![0u8; usize::try_from(len).unwrap()];
+        file.read_exact(&mut bytes).unwrap();
+        bytes.iter().all(|&b| b == 0)
+    }
+
+    #[test]
+    fn the_main_image_carries_each_role_in_partition_order()
+    {
+        let scratch = Scratch::new("roles");
+        let main = scratch.0.join("disk.img");
+        author_images(
+            &main,
+            &scratch.0.join("disk-data.img"),
+            Arch::X86_64,
+            DiskLayout::default(),
+            &scratch.sources(),
+        )
+        .unwrap();
+        let types: Vec<uuid::Uuid> = read_partitions(&main, BlockSize::B512)
+            .into_iter()
+            .map(|(_, guid)| guid)
+            .collect();
+        assert_eq!(
+            types,
+            [
+                gpt::partition_types::EFI.guid,
+                seraph_root_type(Arch::X86_64).guid,
+                seraph_data_type().guid,
+                seraph_swap_type().guid
+            ]
+        );
+        assert_eq!(
+            seraph_swap_type().guid.to_string(),
+            "625fc01f-ee56-4912-b67b-fa6bbd3235b0"
+        );
+    }
+
     /// The FAT boot sector's `BPB_BytsPerSec` of the volume at `offset`.
     fn bytes_per_sector(path: &Path, offset: u64) -> u16
     {
@@ -835,15 +923,30 @@ mod tests
                 IMAGE_MARGIN,
                 IMAGE_MARGIN + ESP_PARTITION_SIZE,
                 IMAGE_MARGIN + ESP_PARTITION_SIZE + ROOT_PARTITION_SIZE,
+                IMAGE_MARGIN + ESP_PARTITION_SIZE + ROOT_PARTITION_SIZE + DATA_PARTITION_SIZE,
             ]
             .iter()
             .map(|offset| offset / block)
             .collect();
             assert_eq!(starts, expected, "{block}-byte blocks");
-            for lba in &starts
+            for lba in &starts[..3]
             {
                 assert_eq!(u64::from(bytes_per_sector(&main, lba * block)), block);
             }
+            assert_eq!(
+                fs::metadata(&main).unwrap().len(),
+                IMAGE_MARGIN
+                    + ESP_PARTITION_SIZE
+                    + ROOT_PARTITION_SIZE
+                    + DATA_PARTITION_SIZE
+                    + SWAP_PARTITION_SIZE
+                    + IMAGE_MARGIN
+            );
+            // The swap partition is raw: no FAT volume is written to it.
+            assert!(
+                block_is_zero(&main, starts[3] * block, block),
+                "{block}-byte blocks"
+            );
 
             // The data volume is populated, and reads back, at this size.
             let slice = PartitionSlice::new(
@@ -892,7 +995,8 @@ mod tests
             types(&main),
             [
                 gpt::partition_types::EFI.guid,
-                seraph_root_type(Arch::Riscv64).guid
+                seraph_root_type(Arch::Riscv64).guid,
+                seraph_swap_type().guid
             ]
         );
         assert_eq!(types(&data_image), [seraph_data_type().guid]);

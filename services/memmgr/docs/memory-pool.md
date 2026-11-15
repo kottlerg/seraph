@@ -158,15 +158,17 @@ can be fewer than the admitted `want_pages`.
 
 ## Frame contents
 
-Every page memmgr hands out reads zero: each run of a `REQUEST_MEMORY_CAPS` grant, and each run a
-demand fault maps (see [Demand faults](#demand-faults)). A pooled run can hold what its last owner
+Every page memmgr hands out reads zero, or, for a chunk restored from the compressed store, reads
+the contents it was stored with ([Eviction](#eviction); design intent, not yet implemented): each
+run of a `REQUEST_MEMORY_CAPS` grant, and each run a demand fault maps (see [Demand
+faults](#demand-faults)). A pooled run can hold what its last owner
 wrote, and what the kernel left in it: the kernel zeroes a dead object's bytes when it frees them,
 but a frame objects were retyped from keeps the retype allocator's free-list links, region offsets
 and page counts
 ([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md) § Kernel
 Object Memory). memmgr does not rely on any path that returns a run to the pool to clear it, so it
 clears each run once, at hand-out, after selection and before the run is accounted, derived, or
-mapped into the process.
+mapped into the process. A restore's full write of the run, below, takes the place of that clear.
 
 memmgr maps the run read-write into its own address space through a scrub window of 512 pages
 (2 MiB, the span of one leaf page table, at a base aligned to it), zeroes it, and unmaps it again,
@@ -778,10 +780,13 @@ the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, wi
 backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
 deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is otherwise
 declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the granule,
-so a restore is never clamped to part of a chunk. memmgr takes runs covering the chunk's backed
-pages, selected as a demand fault selects ([Demand faults](#demand-faults), run selection only),
-maps them in a scratch window of its own, decompresses into them, maps them into the process,
-frees the store slot, and resumes the thread.
+so a restore is never clamped to part of a chunk. memmgr takes runs covering exactly the chunk's
+backed pages (no run spans an unbacked page of a chunk backed in parts), selected as a demand fault
+selects ([Demand faults](#demand-faults), run selection only), maps them in a scratch window of its
+own, and writes every byte of every page of each run there before it maps the run into the process:
+it decompresses each stored page and zero-fills each all-zero page, which takes no store space. That
+full write replaces the hand-out clear of [Frame contents](#frame-contents), so no byte of a run's
+earlier owner reaches the process. It then frees the store slot and resumes the thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,

@@ -491,8 +491,10 @@ after `test-terminal`, on the default boot `test-terminal` restored.
 
 ### CET shadow stacks (`test-cet`)
 
-On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them, so a
-corrupted return address faults instead of being followed
+On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports them and its
+transient-execution selection rewrites no return (it does on a CPU without enhanced or Automatic
+IBRS, which takes the retpoline sequence), so a corrupted return address faults instead of being
+followed
 ([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)). Neither the CI
 runners nor TCG offer the feature, so CI boots only the kernel without them. Every launcher pins the
 guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), and a QEMU
@@ -645,9 +647,9 @@ surface.
     message writes the riscv-iommu translates, its MSI delivery and MSI forge phases;
   - clock: the machine's RTC (the CMOS RTC on `q35`, the Goldfish RTC on `virt`), through the
     cmos-rtc and goldfish-rtc drivers: svctest's timed phase;
-  - filesystem: FAT, through the fatfs driver, on the partitions `mkdisk` formats (the ESP, root
-    and data partitions; the swap partition is raw and no fatfs serves it): svctest's filesystem
-    phases;
+  - filesystem: FAT16, through the fatfs driver, on the partitions `mkdisk` formats (the ESP, root
+    and data partitions, each FAT16 at its size; the swap partition is raw and no fatfs serves
+    it): svctest's filesystem phases;
   - and the devices the harnesses drive, which only the svctest launches attach
     (`--test-devices`): QEMU's `edu`, which the test-only test-dma driver drives in svctest's DMA
     confinement and MSI delivery, forge, churn, and release phases, four `pci-testdev` functions,
@@ -1025,7 +1027,7 @@ line of its own diff is on.
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
 | Shared: devmgr, the VirtIO core, the IRQ delivery path, and the devmgr protocol | `services/devmgr/`, `services/drivers/virtio/core/`, `core/kernel/src/irq.rs`, `core/kernel/src/arch/x86_64/ioapic.rs`, `core/kernel/src/arch/riscv64/aia.rs`, `core/kernel/src/arch/riscv64/aia_encoding.rs`, `core/kernel/src/arch/x86_64/msi.rs`, and `core/kernel/src/arch/x86_64/remap.rs`; the IRQ syscalls (`sys_irq_register`, `sys_irq_ack`, `sys_irq_split`, `sys_irq_msg_alloc`, `sys_irq_route`, and `sys_irq_remap`) and the kernel's Interrupt object (`InterruptObject`); the device-interrupt routing and entry (`route_device_irq`, `unroute_device_irq`, `irq_line_count`, `dispatch_device_irq`, the message-signaled targets' slots (`alloc_message_target`, `free_message_target`, and the slot entry a delivery reads, `slot_entry`), and, on x86_64, `irq_dispatch`, `common_irq_trampoline`, `device_irq_stubs`, `ioapics_into`, `select_ioapics`, and the allocation of the per-CPU device-vector rows the routes and targets take (`init_vector_storage`)); the interrupt-remapping switch and the entries it needs (`set_remap`, `remap_entry`, and `remap_handles`); the interrupt controller's acknowledge, mask, and unmask (by definition alone: `acknowledge`, `mask`, and `unmask` in `core/kernel/src/arch/*/interrupts.rs`); the riscv64 external-interrupt dispatch and claim (`dispatch_external`), the allocation of the IMSIC identity rows the routes and targets take (`init_eid_storage`), and the interrupt id range `SYS_IRQ_REGISTER` admits (`MIN_IRQ_ID` and `MAX_IRQ_ID`); and the devmgr protocol modules (`devmgr_labels`, `devmgr_errors`, `devmgr_dma_labels`, `devmgr_dma_errors`, and `device_info_kind`); and the launchers' IOMMU attachment (`Iommu`, `virtio_property`, `RISCV_IOMMU_DEVICE`, `X86_IOMMU_DEVICE`, and `X86_MACHINE_SPLIT_IRQCHIP`) | every device cell |
-| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
+| Storage-wide: vfsd, the storage protocol, and xtask's disk tooling | `services/vfsd/` (its GPT crate, `services/vfsd/gpt/`, included), `xtask/src/disk.rs`, its GPT writer `xtask/src/gpt.rs`, its FAT writer `xtask/src/fat.rs`, and `xtask/src/commands/mkdisk.rs`; the protocol modules between vfsd, the filesystem drivers, and the block drivers (`vfsd_labels`, `vfsd_errors`, `fs_labels`, `fs_errors`, `blk_labels`, and `blk_errors`); and the launchers' disk devices and options (`blk_device`, `check_block_size`, `SecondDisk`, `disk_block_size`, `second_disk` and the `second_disk_*` options, `second_src`, `second_dst`, `second_line`, `DiskLine`, `FIRST_DISK_SLOT`, `SECOND_DISK_SLOT`, `SHARED_LINE_SECOND_DISK_SLOT`, `BlockSize`, and `split_data`) | every storage cell |
 | virtio-blk | `services/drivers/virtio/blk/` | every storage cell, and no-iommu |
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
@@ -1061,7 +1063,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     core/kernel/src/irq.rs core/kernel/src/arch/x86_64/ioapic.rs \
     core/kernel/src/arch/riscv64/aia.rs core/kernel/src/arch/riscv64/aia_encoding.rs \
     core/kernel/src/arch/x86_64/msi.rs core/kernel/src/arch/x86_64/remap.rs services/vfsd/ \
-    xtask/src/disk.rs xtask/src/gpt.rs xtask/src/commands/mkdisk.rs \
+    xtask/src/disk.rs xtask/src/gpt.rs xtask/src/fat.rs xtask/src/commands/mkdisk.rs \
     services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
@@ -1228,12 +1230,12 @@ cargo xtask test-gdb --arch <arch>
 above), whose first boot runs ktest with the kernel on CET shadow stacks and whose second checks
 that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
 bundle, a debug-profile build, at 4 vCPUs. It runs only under KVM on a host whose CPU reports CET
-shadow stacks: on any other host the command fails, naming what is missing, and never passes, so a
-PR that owes the cell runs it on such a host. On a host that is itself a guest, a run that ends
-in the host's loss of the guest's CET state is inconclusive and run again, up to four runs of each
-boot, and the cell passes only on runs without it (CET shadow stacks (`test-cet`) above). Each boot
-is bounded by five minutes and each gdbstub answer by 30 s; it has no `run-parallel` budget. The
-pair is the cet device cell (Device surfaces above).
+shadow stacks and enhanced or Automatic IBRS: on any other host the command fails, naming what is
+missing, and never passes, so a PR that owes the cell runs it on such a host. On a host that is
+itself a guest, a run that ends in the host's loss of the guest's CET state is inconclusive and run
+again, up to four runs of each boot, and the cell passes only on runs without it (CET shadow stacks
+(`test-cet`) above). Each boot is bounded by five minutes and each gdbstub answer by 30 s; it has no
+`run-parallel` budget. The pair is the cet device cell (Device surfaces above).
 
 ```sh
 # CET cell, x86_64 only:

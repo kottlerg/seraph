@@ -51,6 +51,7 @@ mod debug_stub;
 mod diag;
 mod disk;
 mod error;
+mod fat;
 mod firmware;
 mod fs_compat;
 mod gh;
@@ -114,6 +115,7 @@ fn main()
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
         CliCommand::Mkdisk(args) => commands::mkdisk::run(&ctx, args),
+        CliCommand::CheckDisk(args) => commands::check_disk::run(&ctx, args),
         CliCommand::ComposeBundle(args) => commands::compose_bundle::run(&ctx, args),
         CliCommand::TestTerminal(args) => commands::test_terminal::run(&ctx, args),
         CliCommand::TestVmgenid(args) => commands::test_vmgenid::run(&ctx, args),

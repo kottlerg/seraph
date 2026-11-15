@@ -957,17 +957,25 @@ fn build_spec(ctx: &BuildContext, args: &BuildArgs, spec: &Spec) -> Result<()>
 /// image also holds.
 const RISCV64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zemit-stack-sizes";
 
+/// `RUSTFLAGS` for the x86-64 kernel build and its lint pass: the
+/// workspace's `-Zunstable-options`, since `RUSTFLAGS` replaces the config
+/// file's `rustflags`, and `-Zretpoline-external-thunk`, which sends every
+/// indirect call and jump the compiler emits through the kernel's
+/// `__x86_indirect_thunk_r11` and lowers no `match` to a jump table
+/// (core/kernel/docs/transient-execution.md § Controls). Through `RUSTFLAGS`
+/// the flag reaches the `-Z build-std` crates as well, whose functions the
+/// kernel image also holds.
+const X86_64_KERNEL_RUSTFLAGS: &str = "-Zunstable-options -Zretpoline-external-thunk";
+
 /// The environment a build of `profile` for `arch`, and its lint pass, run
 /// with.
 fn profile_env(arch: Arch, profile: BuildProfile) -> &'static [(&'static str, &'static str)]
 {
-    if arch == Arch::Riscv64 && profile == BuildProfile::Kernel
+    match (arch, profile)
     {
-        &[("RUSTFLAGS", RISCV64_KERNEL_RUSTFLAGS)]
-    }
-    else
-    {
-        &[]
+        (Arch::Riscv64, BuildProfile::Kernel) => &[("RUSTFLAGS", RISCV64_KERNEL_RUSTFLAGS)],
+        (Arch::X86_64, BuildProfile::Kernel) => &[("RUSTFLAGS", X86_64_KERNEL_RUSTFLAGS)],
+        _ => &[],
     }
 }
 

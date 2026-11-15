@@ -33,6 +33,9 @@
 //! - `umip.rs` — on a CPU reporting UMIP, ring-3 `SIDT` and `SGDT` raise `#GP`
 //! - `single_step.rs` — a handler single-steps a thread with the trap flag, one
 //!   `FAULT_EXC_DEBUG` per instruction, a `syscall` stepping as one
+//! - `speculation_controls.rs` — the transient-execution controls in effect on
+//!   every CPU are the ones selected, and the selection follows the design
+//!   note's rule over the reported inputs
 
 mod acpi_shutdown;
 pub mod callee_saved;
@@ -46,6 +49,7 @@ mod page_fault_present_bit;
 mod sbi_call;
 pub mod serial;
 mod single_step;
+mod speculation_controls;
 mod syscall_rflags_hardening;
 mod trap_redelivery;
 mod umip;
@@ -59,6 +63,12 @@ use crate::TestContext;
 /// bind to threads (the kernel's `HAS_IO_PORTS`): arch-neutral cells that
 /// exercise a port binding run only where it is true.
 pub const HAS_IO_PORTS: bool = true;
+
+/// Whether the kernel reports transient-execution mitigation state
+/// (`SystemInfoType::SpeculationControls`), which `unit::sysinfo` expects to
+/// answer every view: x86-64 enumerates the vulnerabilities and selects
+/// controls for them.
+pub const HAS_SPECULATION_CONTROLS: bool = true;
 
 /// Whether a user-mode CPU write raises a message-signaled target, as
 /// `stress::msg_inject_delete_race` needs: false, since an MSI is a write to
@@ -319,4 +329,8 @@ pub fn run_integration(ctx: &TestContext)
     crate::run_integration_test!("integration::umip_descriptor_reads_fault", umip::run(ctx));
     crate::run_integration_test!("integration::trap_redelivery", trap_redelivery::run(ctx));
     crate::run_integration_test!("integration::single_step", single_step::run(ctx));
+    crate::run_integration_test!(
+        "integration::speculation_controls",
+        speculation_controls::run(ctx)
+    );
 }

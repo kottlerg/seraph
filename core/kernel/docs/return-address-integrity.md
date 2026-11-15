@@ -79,7 +79,9 @@ only options whose second copy ordinary stores cannot reach.
 The maintainer decided the direction per architecture, both mechanisms opportunistic: used where
 the hardware has the feature, with the kernel running unprotected and otherwise unchanged where
 it does not
-([docs/platform-requirements.md](../../../docs/platform-requirements.md) § Feature Classes):
+([docs/platform-requirements.md](../../../docs/platform-requirements.md) § Feature Classes). On
+x86-64 a selected transient-execution control that rewrites a return takes precedence over the
+feature (§ x86-64 Mechanism, Decision):
 
 - **riscv64: Zicfiss supervisor shadow stacks.** The shadow-stack instructions are Zimop and
   Zcmop encodings, which RVA23 mandates, so one kernel image serves every RVA23 hart: with
@@ -107,6 +109,13 @@ Downsides of the direction:
 - A riscv64 machine on which any hart lacks Zicfiss gets no protection on any hart, and Zicfiss
   is optional in RVA23 (check 4).
 - x86-64 hardware without CET gets no protection.
+- x86-64 hardware with CET whose transient-execution selection rewrites a return gets none
+  either. Among released parts that is AMD Zen 3, which reports `CET_SS` without Automatic IBRS
+  (APM2 § 3.1.7) and so takes the retpoline sequence AMD recommends for it (AMD-SB-1036), and a
+  guest whose hypervisor passes `CET_SS` but hides enhanced IBRS or Automatic IBRS. Intel's
+  parts with `CET_SS` (Tiger Lake and later) enumerate enhanced IBRS, and AMD's from Zen 4
+  Automatic IBRS, so they keep shadow stacks
+  ([transient-execution.md](transient-execution.md) § Branch target injection).
 - The x86-64 enabled path lies outside the CI gate.
 - The riscv64 path depends on an unstable rustc flag and on target features LLVM still names
   experimental (`experimental-zicfiss`).
@@ -194,8 +203,16 @@ direct-map edits it relies on. The architectural facts are from the Intel SDM's 
 shadow stacks on or off.
 
 - **Decision.** In Phase 4 the boot CPU decides, once, that shadow stacks are on when it reports
-  `CET_SS` (`CPUID.(EAX=7,ECX=0):ECX[7]`) (`shadow_stack::decide`), before any shadow-stack page
-  is laid out. They are on for every CPU or for none, since a thread migrates between CPUs with a
+  `CET_SS` (`CPUID.(EAX=7,ECX=0):ECX[7]`) and no transient-execution control the kernel selected
+  in Phase 1 rewrites a return (`shadow_stack::decide`, `mitigation::Controls::rewrites_returns`),
+  before any shadow-stack page is laid out. The maintainer decided that the mitigation of an
+  enumerated vulnerability takes precedence over shadow stacks: a control whose code returns to
+  an address the shadow stack does not hold would raise `#CP`, and the rule names such
+  controls as a class, not one by one. The retpoline sequence is one: its `ret` goes to the
+  branch target
+  ([transient-execution.md](transient-execution.md) § Branch target injection). Where the CPU
+  reports `CET_SS` and the selection keeps shadow stacks off, `decide` logs it. They are on
+  for every CPU or for none, since a thread migrates between CPUs with a
   live call chain: an AP that lacks `CET_SS` when the boot CPU has it halts the boot
   (`shadow_stack::prepare_ap`), and
   [docs/platform-requirements.md](../../../docs/platform-requirements.md) § x86-64

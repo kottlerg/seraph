@@ -205,6 +205,11 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> Save
 /// resumes by `ret`, so the shadow stack checks `next.rip`
 /// (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism). When
 /// `current` and `next` are the same thread, the shadow stack stays as it is.
+/// Without shadow stacks it resumes through the retpoline thunk
+/// (`__x86_indirect_thunk_r11`). On next's stack it fills the return stack
+/// buffer first where the transient-execution selection asks for it
+/// (`mitigation`, `SPECULATION_CONTROL_RSB_FILL_SWITCH`), which it does only
+/// with shadow stacks off.
 ///
 /// # Safety
 /// Both pointers must be valid, aligned `SavedState` values. The caller
@@ -310,6 +315,33 @@ pub unsafe extern "C" fn switch(
         "jz 1f",
         "mov dword ptr [r11], 1", // *save_flag = 1
         "1:",
+        // Fill the return stack buffer with 32 entries that trap speculation
+        // (`int3`), where the transient-execution selection asks for it: on a
+        // part whose returns fall back to the branch target buffer when the
+        // buffer underflows, the retpoline build would otherwise leave next's
+        // returns to a prediction the outgoing thread trained
+        // (core/kernel/docs/transient-execution.md § Controls). Each iteration
+        // makes two calls and drops their return addresses from the stack.
+        // The fill is selected only with the retpoline sequence, which keeps
+        // shadow stacks off (`mitigation::Controls::rewrites_returns`), so no
+        // shadow-stack copy is left to drop. The `lfence` at the join stops a
+        // mispredicted test from running past it. Clobbers rcx and the flags;
+        // r11 is dead after the publication above.
+        "cmp byte ptr [rip + {rsb_fill}], 0",
+        "je 5f",
+        "mov ecx, 16",
+        "6:",
+        "call 7f",
+        "int3",
+        "7:",
+        "call 8f",
+        "int3",
+        "8:",
+        "add rsp, 16",
+        "dec ecx",
+        "jnz 6b",
+        "5:",
+        "lfence",
         // Restore rflags (may re-enable IF). Doing this AFTER the rsp
         // swap means an interrupt taken between popfq and the jump pushes
         // its iretq frame to next's kstack, not the outgoing one.
@@ -326,8 +358,12 @@ pub unsafe extern "C" fn switch(
         "ret",
         "3:",
         "popfq",
-        "jmp rax", // jump to next thread's rip
+        // Jump to next thread's rip through the retpoline thunk, as the
+        // compiler's own indirect branches go (`mitigation`).
+        "mov r11, rax",
+        "jmp __x86_indirect_thunk_r11",
         shadow = sym super::shadow_stack::ENABLED,
+        rsb_fill = sym super::mitigation::RSB_FILL_ON_SWITCH,
         pl0_ssp = const super::shadow_stack::IA32_PL0_SSP,
     );
 }
@@ -398,9 +434,11 @@ pub unsafe extern "C" fn return_to_user(tf: *const super::trap_frame::TrapFrame)
         "mov r15, [rdi + 112]",
         "mov rdi, [rdi + 40]", // restore rdi last (was TrapFrame pointer)
         // User GS base back in place for ring 3, with interrupts off until the
-        // iretq restores the user's IF (see `syscall.rs` § Entry contract).
+        // iretq restores the user's IF (see `syscall.rs` § Entry contract),
+        // then the selection's VERW, which clobbers only the flags.
         "cli",
         "swapgs",
+        super::mitigation::verw_asm!(),
         "iretq",
     );
 }
@@ -538,9 +576,11 @@ pub unsafe extern "C" fn switch_and_enter_user(
         "mov rdi, [rsi + 40]", // restore rdi before rsi
         "mov rsi, [rsi + 32]", // restore rsi last (was TrapFrame pointer)
         // User GS base back in place for ring 3, with interrupts off until the
-        // iretq restores the user's IF (see `syscall.rs` § Entry contract).
+        // iretq restores the user's IF (see `syscall.rs` § Entry contract),
+        // then the selection's VERW, which clobbers only the flags.
         "cli",
         "swapgs",
+        super::mitigation::verw_asm!(),
         "iretq",
     );
 }

@@ -1731,7 +1731,86 @@ pub enum SystemInfoType
     /// check that each such path synchronises (core/kernel/docs/syscalls.md
     /// § `SYS_SYSTEM_INFO`).
     InstructionCacheSyncs = 12,
+    /// One word of the x86-64 transient-execution mitigation state, the view
+    /// named in arg1 (`SPECULATION_VIEW_*`): the inputs the kernel selected
+    /// the user-to-kernel controls from (`SPECULATION_INPUT_*`), the controls
+    /// it selected at boot (`SPECULATION_CONTROL_*`), or the controls in
+    /// effect on the calling CPU (`SPECULATION_CONTROL_*`), read from its
+    /// MSRs and from the flags the kernel's entry and exit code test. Each word
+    /// is derived from the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`,
+    /// which name the CPU's vulnerabilities, not a kernel secret. ktest reads
+    /// it to check that every CPU runs the controls the boot CPU's table
+    /// selects (core/kernel/docs/transient-execution.md § Controls).
+    /// `NotSupported` on riscv64, which defines no enumeration of the
+    /// classes; `InvalidArgument` for an unknown view.
+    SpeculationControls = 13,
 }
+
+/// `SystemInfoType::SpeculationControls` view: the selection's inputs, a
+/// `SPECULATION_INPUT_*` set.
+pub const SPECULATION_VIEW_INPUTS: u64 = 0;
+/// `SystemInfoType::SpeculationControls` view: the controls selected at
+/// boot, a `SPECULATION_CONTROL_*` set.
+pub const SPECULATION_VIEW_SELECTED: u64 = 1;
+/// `SystemInfoType::SpeculationControls` view: the controls in effect on the
+/// calling CPU, a `SPECULATION_CONTROL_*` set.
+pub const SPECULATION_VIEW_IN_EFFECT: u64 = 2;
+
+/// Input: the table gives Spectre v2 (branch target injection) kernel action.
+pub const SPECULATION_INPUT_SPECTRE_V2: u64 = 1 << 0;
+/// Input: the table gives branch history injection kernel action.
+pub const SPECULATION_INPUT_BHI: u64 = 1 << 1;
+/// Input: the table gives microarchitectural data sampling kernel action.
+pub const SPECULATION_INPUT_MDS: u64 = 1 << 2;
+/// Input: the table gives TSX asynchronous abort kernel action.
+pub const SPECULATION_INPUT_TAA: u64 = 1 << 3;
+/// Input: the table gives MMIO stale data kernel action.
+pub const SPECULATION_INPUT_MMIO: u64 = 1 << 4;
+/// Input: the table gives register file data sampling kernel action.
+pub const SPECULATION_INPUT_RFDS: u64 = 1 << 5;
+/// Input: the table gives transient scheduler attacks kernel action.
+pub const SPECULATION_INPUT_TSA: u64 = 1 << 6;
+/// Input: a `RET` that finds the return stack buffer empty may be predicted
+/// by an alternate predictor.
+pub const SPECULATION_INPUT_RSB_ALTERNATE: u64 = 1 << 7;
+/// Input: an IBPB leaves the return stack buffer's entries usable.
+pub const SPECULATION_INPUT_IBPB_LEAVES_RSB: u64 = 1 << 8;
+/// Input: the CPU enumerates enhanced IBRS (`IA32_ARCH_CAPABILITIES.IBRS_ALL`).
+pub const SPECULATION_INPUT_IBRS_ALL: u64 = 1 << 9;
+/// Input: the CPU is an AMD part that enumerates Automatic IBRS.
+pub const SPECULATION_INPUT_AUTO_IBRS: u64 = 1 << 10;
+/// Input: the CPU implements `IA32_SPEC_CTRL.BHI_DIS_S` (`BHI_CTRL`).
+pub const SPECULATION_INPUT_BHI_CTRL: u64 = 1 << 11;
+/// Input: the CPU implements the data-operand-independent timing mode control
+/// (`IA32_ARCH_CAPABILITIES.DOITM`).
+pub const SPECULATION_INPUT_DOITM: u64 = 1 << 12;
+
+/// Control: enhanced IBRS, `IA32_SPEC_CTRL.IBRS` set on every CPU.
+pub const SPECULATION_CONTROL_EIBRS: u64 = 1 << 0;
+/// Control: Automatic IBRS, `EFER.AIBRSE` set on every CPU.
+pub const SPECULATION_CONTROL_AUTO_IBRS: u64 = 1 << 1;
+/// Control: the kernel's indirect branches take the retpoline sequence.
+pub const SPECULATION_CONTROL_RETPOLINE: u64 = 1 << 2;
+/// Control: `IA32_SPEC_CTRL.BHI_DIS_S` set on every CPU.
+pub const SPECULATION_CONTROL_BHI_DIS_S: u64 = 1 << 3;
+/// Control: the branch history clearing sequence on every entry from user mode.
+pub const SPECULATION_CONTROL_BHB_CLEAR: u64 = 1 << 4;
+/// Control: `VERW` before every return to user mode.
+pub const SPECULATION_CONTROL_VERW_EXIT: u64 = 1 << 5;
+/// Control: `VERW` before the idle loop halts.
+pub const SPECULATION_CONTROL_VERW_IDLE: u64 = 1 << 6;
+/// Control: the return stack buffer is filled on every context switch.
+pub const SPECULATION_CONTROL_RSB_FILL_SWITCH: u64 = 1 << 7;
+/// Control: the return stack buffer is filled after every IBPB the kernel
+/// issues.
+pub const SPECULATION_CONTROL_RSB_FILL_IBPB: u64 = 1 << 8;
+/// Control: `IA32_UARCH_MISC_CTL.DOITM` set on every CPU.
+pub const SPECULATION_CONTROL_DOITM: u64 = 1 << 9;
+
+/// Every `SPECULATION_INPUT_*` bit; no inputs word carries another.
+pub const SPECULATION_INPUT_ALL: u64 = (SPECULATION_INPUT_DOITM << 1) - 1;
+/// Every `SPECULATION_CONTROL_*` bit; no controls word carries another.
+pub const SPECULATION_CONTROL_ALL: u64 = (SPECULATION_CONTROL_DOITM << 1) - 1;
 
 /// `SystemInfoType::StackHighWater` class: the per-CPU idle stacks.
 pub const STACK_CLASS_IDLE: u64 = 0;

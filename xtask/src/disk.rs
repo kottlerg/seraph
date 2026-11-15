@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Context, Result};
 use boot_protocol::role_guids;
-use clap::ValueEnum;
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;
@@ -56,19 +55,21 @@ const IMAGE_MARGIN: u64 = 1024 * 1024;
 /// The GPT header signature, at the start of LBA 1.
 const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 
-/// Logical block size of an authored image: the unit of its GPT LBAs and the
-/// sector size of each of its FAT volumes. A launch presents the disk device
-/// at the same size ([`logical_block_size`] reads it back from the image).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
-pub enum BlockSize
-{
-    /// 512-byte blocks — the default.
-    #[default]
-    #[value(name = "512")]
-    B512,
-    /// 4096-byte blocks (4Kn).
-    #[value(name = "4096")]
-    B4096,
+crate::argparse::value_enum! {
+    /// Logical block size of an authored image: the unit of its GPT LBAs and the
+    /// sector size of each of its FAT volumes. A launch presents the disk device
+    /// at the same size ([`logical_block_size`] reads it back from the image).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum BlockSize
+    {
+        /// 512-byte blocks — the default.
+        #[default]
+        #[value(name = "512")]
+        B512,
+        /// 4096-byte blocks (4Kn).
+        #[value(name = "4096")]
+        B4096,
+    }
 }
 
 impl BlockSize

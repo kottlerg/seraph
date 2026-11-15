@@ -912,7 +912,7 @@ enum LedgerTarget
     },
 }
 
-/// The ledger the arguments name. Clap already refuses a number beside
+/// The ledger the arguments name. The parser already refuses a number beside
 /// `--release` and either of `--release` and `--from` without the other;
 /// this refuses what is left: no target at all, and a malformed version.
 fn ledger_target(args: &ReviewLedgerArgs) -> Result<LedgerTarget>

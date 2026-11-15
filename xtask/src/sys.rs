@@ -10,7 +10,7 @@
 //! constant has the value the host's own headers give it, chosen per host by
 //! `cfg`, so no binding crate is needed (`docs/coding-standards.md`
 //! § Dependencies). The Unix bindings name every host they hold values for,
-//! by `target_os`: `linux` (every architecture, glibc and musl), `macos`,
+//! by `target_os`: `linux` (every architecture, glibc, musl and uClibc), `macos`,
 //! `freebsd`, `dragonfly`, `netbsd`, `openbsd`, `illumos` and `solaris`.
 //! xtask fails to compile on any other Unix, naming this file, rather than
 //! call its C library with a value that may be wrong there.
@@ -78,23 +78,49 @@ pub mod unix
         0
     };
 
-    /// The type of `ioctl`'s request argument: `int` under musl and on
-    /// illumos and Solaris, `unsigned long` everywhere else.
+    /// The type of `ioctl`'s request argument: `int` under musl (`target_env`
+    /// `musl` or `ohos`) and on illumos and Solaris, `unsigned long`
+    /// everywhere else.
     #[cfg(any(
         target_os = "illumos",
         target_os = "solaris",
-        all(target_os = "linux", target_env = "musl")
+        all(target_os = "linux", any(target_env = "musl", target_env = "ohos"))
     ))]
     pub type IoctlRequest = c_int;
 
-    /// The type of `ioctl`'s request argument: `int` under musl and on
-    /// illumos and Solaris, `unsigned long` everywhere else.
+    /// The type of `ioctl`'s request argument: `int` under musl (`target_env`
+    /// `musl` or `ohos`) and on illumos and Solaris, `unsigned long`
+    /// everywhere else.
     #[cfg(not(any(
         target_os = "illumos",
         target_os = "solaris",
-        all(target_os = "linux", target_env = "musl")
+        all(target_os = "linux", any(target_env = "musl", target_env = "ohos"))
     )))]
     pub type IoctlRequest = std::ffi::c_ulong;
+
+    /// The request numbered `code` as an `int` request argument, its 32
+    /// bits kept as they are: musl's `ioctl` takes `_IOW` requests, whose
+    /// top bit is set, as negative `int`s.
+    #[cfg(any(
+        target_os = "illumos",
+        target_os = "solaris",
+        all(target_os = "linux", any(target_env = "musl", target_env = "ohos"))
+    ))]
+    const fn request(code: u32) -> IoctlRequest
+    {
+        code.cast_signed()
+    }
+
+    /// The request numbered `code` as an `unsigned long` request argument.
+    #[cfg(not(any(
+        target_os = "illumos",
+        target_os = "solaris",
+        all(target_os = "linux", any(target_env = "musl", target_env = "ohos"))
+    )))]
+    const fn request(code: u32) -> IoctlRequest
+    {
+        code as IoctlRequest
+    }
 
     /// The window-size requests of Linux's generic ioctl numbering, which
     /// every Linux architecture but MIPS, PowerPC and SPARC uses.
@@ -113,10 +139,10 @@ pub mod unix
     ))]
     mod winsize_requests
     {
-        use super::IoctlRequest;
+        use super::{IoctlRequest, request};
 
-        pub const TIOCGWINSZ: IoctlRequest = 0x5413;
-        pub const TIOCSWINSZ: IoctlRequest = 0x5414;
+        pub const TIOCGWINSZ: IoctlRequest = request(0x5413);
+        pub const TIOCSWINSZ: IoctlRequest = request(0x5414);
     }
 
     /// The window-size requests of the BSD ioctl encoding,
@@ -145,10 +171,10 @@ pub mod unix
     ))]
     mod winsize_requests
     {
-        use super::IoctlRequest;
+        use super::{IoctlRequest, request};
 
-        pub const TIOCGWINSZ: IoctlRequest = 0x4008_7468;
-        pub const TIOCSWINSZ: IoctlRequest = 0x8008_7467;
+        pub const TIOCGWINSZ: IoctlRequest = request(0x4008_7468);
+        pub const TIOCSWINSZ: IoctlRequest = request(0x8008_7467);
     }
 
     /// The window-size requests of illumos and Solaris, `('T' << 8) | 104`
@@ -156,10 +182,10 @@ pub mod unix
     #[cfg(any(target_os = "illumos", target_os = "solaris"))]
     mod winsize_requests
     {
-        use super::IoctlRequest;
+        use super::{IoctlRequest, request};
 
-        pub const TIOCGWINSZ: IoctlRequest = 0x5468;
-        pub const TIOCSWINSZ: IoctlRequest = 0x5467;
+        pub const TIOCGWINSZ: IoctlRequest = request(0x5468);
+        pub const TIOCSWINSZ: IoctlRequest = request(0x5467);
     }
 
     /// `TIOCGWINSZ` reads a terminal's window size into a [`Winsize`];

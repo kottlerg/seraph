@@ -3,24 +3,23 @@
 
 // shared/crypto/testkit/src/ed25519.rs
 
-//! The Ed25519 reference verdict and the differential inputs: generated
-//! signatures with their one-bit corruptions, and a corpus of edge cases.
+//! The Ed25519 reference vectors: generated signatures with their one-bit
+//! corruptions, a corpus of edge cases, and the acceptable Wycheproof cases,
+//! each input with the reference's verdict.
 //!
-//! [`reference`] is an RFC 8032 verifier assembled from `ed25519-dalek` and
-//! `curve25519-dalek`, an implementation independent of `shared/crypto`. It
-//! returns which check fails, in RFC order, so a differential run checks the
-//! reason for a rejection as well as the rejection:
+//! The vectors are `vectors/reference/ed25519.json`, which the
+//! [`generate`](crate::generate) module writes with OpenSSL as the
+//! reference. A verdict names which check fails, in RFC 8032 order, so a
+//! differential run checks the reason for a rejection as well as the
+//! rejection:
 //!
 //! 1. S at or above the group order L (§ 5.1.7): [`Verdict::NonCanonicalS`].
 //! 2. A public key that is not the canonical encoding of a point (§ 5.1.3: a
 //!    y at or above p, a y with no x, or x = 0 with the sign bit set):
-//!    [`Verdict::BadPublicKey`]. `ed25519-dalek` decodes such keys leniently
-//!    (it reduces y and ignores the sign bit of x = 0), so the reference
-//!    checks the encoding itself: a key is canonical when it decompresses and
-//!    re-encodes to the same bytes.
+//!    [`Verdict::BadPublicKey`].
 //! 3. The cofactorless equation `[S]B = R + [k]A`, R compared as the
-//!    encoding the signature carries: `ed25519-dalek`'s `verify`, which
-//!    rejects as [`Verdict::Mismatch`].
+//!    encoding the signature carries, as OpenSSL checks it:
+//!    [`Verdict::Mismatch`].
 //!
 //! The cofactorless equation is the one RFC 8032 § 5.1.7 permits beside the
 //! cofactored one; it accepts a subset of what the cofactored equation
@@ -28,14 +27,19 @@
 
 use std::fmt;
 
-use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
-use curve25519_dalek::scalar::Scalar;
-use curve25519_dalek::traits::Identity;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use sha2::{Digest, Sha512};
+use json::Value;
 
 use crate::hex;
-use crate::rng::Rng;
+use crate::vectors::{self, LoadError};
+
+/// The file's name under `vectors/reference/`.
+pub const FILE: &str = "ed25519.json";
+
+/// The schema the file declares, which [`load`] checks.
+pub const SCHEMA: &str = "seraph_ed25519_reference_v1";
+
+/// The file's text.
+const TEXT: &str = include_str!("../vectors/reference/ed25519.json");
 
 /// The outcome of verifying one input: acceptance, or the first check that
 /// failed.
@@ -52,69 +56,36 @@ pub enum Verdict
     Mismatch,
 }
 
-/// The group order L = 2^252 + 27742317777372353535851937790883648493,
-/// little-endian.
-pub const L: [u8; 32] = [
-    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
-];
-
-/// The canonical encoding of a point of order 8; its multiples are the whole
-/// torsion subgroup.
-const ORDER_8: [u8; 32] = [
-    0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0,
-    0xd5, 0xdf, 0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
-];
-
-/// The reference verdict on `signature` over `message` under `public_key`.
-#[must_use]
-pub fn reference(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> Verdict
+impl Verdict
 {
-    let mut s = [0u8; 32];
-    s.copy_from_slice(&signature[32..]);
-    if bool::from(Scalar::from_canonical_bytes(s).is_none())
+    const ALL: [Self; 4] = [
+        Self::Accept,
+        Self::NonCanonicalS,
+        Self::BadPublicKey,
+        Self::Mismatch,
+    ];
+
+    /// The verdict's name in the vector file.
+    #[must_use]
+    pub const fn name(self) -> &'static str
     {
-        return Verdict::NonCanonicalS;
+        match self
+        {
+            Self::Accept => "accept",
+            Self::NonCanonicalS => "nonCanonicalS",
+            Self::BadPublicKey => "badPublicKey",
+            Self::Mismatch => "mismatch",
+        }
     }
-    if !is_canonical_point(public_key)
+
+    /// The verdict a vector file names `name`.
+    fn from_name(name: &str) -> Option<Self>
     {
-        return Verdict::BadPublicKey;
-    }
-    let Ok(key) = VerifyingKey::from_bytes(public_key)
-    else
-    {
-        return Verdict::BadPublicKey;
-    };
-    if key
-        .verify(message, &Signature::from_bytes(signature))
-        .is_ok()
-    {
-        Verdict::Accept
-    }
-    else
-    {
-        Verdict::Mismatch
+        Self::ALL.into_iter().find(|v| v.name() == name)
     }
 }
 
-/// Whether `encoding` is the canonical encoding of a curve point.
-fn is_canonical_point(encoding: &[u8; 32]) -> bool
-{
-    CompressedEdwardsY(*encoding)
-        .decompress()
-        .is_some_and(|point| point.compress().0 == *encoding)
-}
-
-/// The public key of the private key `seed`, and its signature over
-/// `message` (RFC 8032 § 5.1.6).
-#[must_use]
-pub fn sign(seed: &[u8; 32], message: &[u8]) -> ([u8; 32], [u8; 64])
-{
-    let key = SigningKey::from_bytes(seed);
-    (key.verifying_key().to_bytes(), key.sign(message).to_bytes())
-}
-
-/// One verification input.
+/// One verification input, with its reference verdict.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Input
 {
@@ -126,6 +97,8 @@ pub struct Input
     pub message: Vec<u8>,
     /// The 64-byte signature R ‖ S.
     pub signature: [u8; 64],
+    /// The reference's verdict.
+    pub reference: Verdict,
 }
 
 impl fmt::Debug for Input
@@ -145,438 +118,92 @@ impl fmt::Debug for Input
 
 impl Input
 {
-    fn new(
-        label: impl Into<String>,
-        public_key: [u8; 32],
-        message: &[u8],
-        signature: [u8; 64],
-    ) -> Self
+    fn from_json(value: &Value) -> Result<Self, LoadError>
     {
-        Self {
-            label: label.into(),
-            public_key,
-            message: message.to_vec(),
-            signature,
-        }
-    }
-
-    /// This input's reference verdict.
-    #[must_use]
-    pub fn reference(&self) -> Verdict
-    {
-        reference(&self.public_key, &self.message, &self.signature)
-    }
-}
-
-/// `count` generated rounds from `seed`. Each round signs a random message
-/// (empty, short, or up to a few blocks of the hash) under a random key and
-/// yields the valid signature, one-bit flips of the signature, the message
-/// and the key, the signature under a random 32-byte key, and a random
-/// 64-byte signature.
-#[must_use]
-pub fn generated(seed: u64, count: usize) -> Vec<Input>
-{
-    let mut rng = Rng::new(seed);
-    let mut out = Vec::new();
-    for round in 0..count
-    {
-        let secret: [u8; 32] = rng.array();
-        let len = match rng.below(4)
-        {
-            0 => 0,
-            1 => rng.below(4096),
-            _ => rng.below(300),
-        };
-        let message = rng.bytes(len);
-        let (pk, sig) = sign(&secret, &message);
-        out.push(Input::new(
-            format!("round {round} valid"),
-            pk,
-            &message,
-            sig,
-        ));
-
-        let mut flipped = sig;
-        flip_bit(&mut flipped, rng.below(512));
-        out.push(Input::new(
-            format!("round {round} signature bit"),
-            pk,
-            &message,
-            flipped,
-        ));
-
-        if !message.is_empty()
-        {
-            let mut flipped = message.clone();
-            flip_bit(&mut flipped, rng.below(len.wrapping_mul(8)));
-            out.push(Input::new(
-                format!("round {round} message bit"),
-                pk,
-                &flipped,
-                sig,
-            ));
-        }
-
-        let mut flipped = pk;
-        flip_bit(&mut flipped, rng.below(256));
-        out.push(Input::new(
-            format!("round {round} key bit"),
-            flipped,
-            &message,
-            sig,
-        ));
-
-        out.push(Input::new(
-            format!("round {round} random key"),
-            rng.array(),
-            &message,
-            sig,
-        ));
-        out.push(Input::new(
-            format!("round {round} random signature"),
-            pk,
-            &message,
-            rng.array(),
-        ));
-    }
-    out
-}
-
-fn flip_bit(bytes: &mut [u8], bit: usize)
-{
-    if let Some(byte) = bytes.get_mut(bit / 8)
-    {
-        *byte ^= 1 << (bit % 8);
-    }
-}
-
-/// The eight points of the torsion subgroup, the identity first.
-#[must_use]
-pub fn torsion() -> Vec<EdwardsPoint>
-{
-    let Some(generator) = CompressedEdwardsY(ORDER_8).decompress()
-    else
-    {
-        return Vec::new();
-    };
-    let mut points = vec![EdwardsPoint::identity()];
-    let mut next = generator;
-    for _ in 1..8
-    {
-        points.push(next);
-        next += generator;
-    }
-    points
-}
-
-/// Every encoding whose y field (the low 255 bits) is at or above p, with
-/// and without the sign bit: no such encoding is canonical.
-fn y_at_or_above_p() -> Vec<[u8; 32]>
-{
-    let mut out = Vec::new();
-    for low in 0xedu8..=0xff
-    {
-        for top in [0x7fu8, 0xff]
-        {
-            let mut encoding = [0xff; 32];
-            encoding[0] = low;
-            encoding[31] = top;
-            out.push(encoding);
-        }
-    }
-    out
-}
-
-/// The two points with x = 0 (y = 1 and y = -1), encoded with the sign bit
-/// set: neither encoding is canonical.
-fn x_zero_with_sign() -> Vec<[u8; 32]>
-{
-    let mut one = [0u8; 32];
-    one[0] = 1;
-    let mut minus_one = [0xff; 32];
-    minus_one[0] = 0xec;
-    [one, minus_one]
-        .into_iter()
-        .map(|mut encoding| {
-            encoding[31] |= 0x80;
-            encoding
+        let verdict = vectors::string(value, "verdict")?;
+        Ok(Self {
+            label: vectors::string(value, "label")?.to_owned(),
+            public_key: vectors::fixed(value, "publicKey")?,
+            message: vectors::bytes(value, "message")?,
+            signature: vectors::fixed(value, "signature")?,
+            reference: Verdict::from_name(verdict)
+                .ok_or_else(|| LoadError::Parse(format!("unknown verdict {verdict:?}")))?,
         })
-        .collect()
-}
-
-/// `a + b` for 256-bit little-endian integers, or `None` on overflow.
-fn add_256(a: &[u8; 32], b: &[u8; 32]) -> Option<[u8; 32]>
-{
-    let mut out = [0u8; 32];
-    let mut carry = 0u16;
-    for ((o, x), y) in out.iter_mut().zip(a).zip(b)
-    {
-        let sum = u16::from(*x)
-            .wrapping_add(u16::from(*y))
-            .wrapping_add(carry);
-        *o = sum.to_le_bytes()[0];
-        carry = sum >> 8;
-    }
-    (carry == 0).then_some(out)
-}
-
-fn with_s(signature: &[u8; 64], s: &[u8; 32]) -> [u8; 64]
-{
-    let mut out = *signature;
-    out[32..].copy_from_slice(s);
-    out
-}
-
-fn with_r(signature: &[u8; 64], r: &[u8; 32]) -> [u8; 64]
-{
-    let mut out = *signature;
-    out[..32].copy_from_slice(r);
-    out
-}
-
-/// `k = SHA-512(R ‖ A ‖ M) mod L`.
-fn challenge(r: &[u8; 32], a: &[u8; 32], message: &[u8]) -> Scalar
-{
-    let mut hash = Sha512::new();
-    hash.update(r);
-    hash.update(a);
-    hash.update(message);
-    let mut wide = [0u8; 64];
-    wide.copy_from_slice(&hash.finalize());
-    Scalar::from_bytes_mod_order_wide(&wide)
-}
-
-/// Whether a crafted signature satisfies the cofactorless equation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Equation
-{
-    Holds,
-    Fails,
-}
-
-/// The first message `stem ‖ n` (n counting up from 0) whose challenge under
-/// `nonce_point` and `key` makes `[k]torsion` the identity exactly when the
-/// equation is to hold: the term that decides the cofactorless equation for
-/// the crafted signatures below.
-fn message_where(
-    stem: &[u8],
-    nonce_point: &[u8; 32],
-    key: &[u8; 32],
-    torsion: &EdwardsPoint,
-    equation: Equation,
-) -> Vec<u8>
-{
-    let mut n = 0u32;
-    loop
-    {
-        let mut message = stem.to_vec();
-        message.extend_from_slice(&n.to_le_bytes());
-        let k = challenge(nonce_point, key, &message);
-        let killed = k * torsion == EdwardsPoint::identity();
-        if killed == (equation == Equation::Holds)
-        {
-            return message;
-        }
-        n = n.wrapping_add(1);
     }
 }
 
-/// The valid signature the edge cases corrupt.
-struct Base
+/// The reference vectors.
+#[derive(Debug, Clone)]
+pub struct Vectors
 {
-    secret: [u8; 32],
-    message: &'static [u8],
-    public_key: [u8; 32],
-    signature: [u8; 64],
+    /// Generated rounds: each a valid signature over a random message under
+    /// a random key, one-bit flips of the signature, the message and the
+    /// key, the signature under a random 32-byte key, and a random 64-byte
+    /// signature.
+    pub generated: Vec<Input>,
+    /// S + kL and the S range boundary, non-canonical and small-order R,
+    /// every non-canonical public-key encoding, the torsion points as keys,
+    /// and mixed-order keys with signatures crafted to satisfy or fail the
+    /// cofactorless equation.
+    pub edge_cases: Vec<Input>,
+    /// Every case the vendored Wycheproof file marks acceptable (a small- or
+    /// mixed-order key), labelled with its `tcId`.
+    pub wycheproof_acceptable: Vec<Input>,
 }
 
-impl Base
+impl Vectors
 {
-    fn input(&self, label: impl Into<String>, signature: [u8; 64]) -> Input
+    /// The reference verdict of the input `public_key`, `message`,
+    /// `signature`; `None` when the vectors do not hold it.
+    #[must_use]
+    pub fn verdict(
+        &self,
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> Option<Verdict>
     {
-        Input::new(label, self.public_key, self.message, signature)
+        self.generated
+            .iter()
+            .chain(&self.edge_cases)
+            .chain(&self.wycheproof_acceptable)
+            .find(|i| {
+                i.public_key == *public_key && i.message == message && i.signature == *signature
+            })
+            .map(|i| i.reference)
     }
 }
 
-/// `R = O, S = 0`: valid under the identity key for every message.
-fn identity_signature() -> [u8; 64]
+/// Load the reference vectors.
+///
+/// # Errors
+///
+/// A [`LoadError`] when the file does not parse or a case is malformed,
+/// declares another schema, or holds another number of cases than it
+/// declares.
+pub fn load() -> Result<Vectors, LoadError>
 {
-    let mut signature = [0u8; 64];
-    signature[..32].copy_from_slice(&EdwardsPoint::identity().compress().0);
-    signature
+    parse(TEXT)
 }
 
-/// S: malleability (S + kL for every k that keeps it below 2^256), the range
-/// boundary, and canonical but wrong values.
-fn s_cases(base: &Base, out: &mut Vec<Input>)
+fn parse(text: &str) -> Result<Vectors, LoadError>
 {
-    let mut s = [0u8; 32];
-    s.copy_from_slice(&base.signature[32..]);
-    let mut k = 1;
-    let mut shifted = add_256(&s, &L);
-    while let Some(value) = shifted
-    {
-        out.push(base.input(format!("S + {k}L"), with_s(&base.signature, &value)));
-        k += 1;
-        shifted = add_256(&value, &L);
-    }
-    let mut l_minus_one = L;
-    l_minus_one[0] -= 1;
-    let mut l_plus_one = L;
-    l_plus_one[0] += 1;
-    let mut two_252 = [0u8; 32];
-    two_252[31] = 0x10;
-    let mut high_bit = s;
-    high_bit[31] |= 0x80;
-    for (label, value) in [
-        ("S = L", L),
-        ("S = L - 1", l_minus_one),
-        ("S = L + 1", l_plus_one),
-        ("S = 2^252", two_252),
-        ("S = 2^256 - 1", [0xff; 32]),
-        ("S = 0", [0; 32]),
-        ("S with bit 255 set", high_bit),
-    ]
-    {
-        out.push(base.input(label, with_s(&base.signature, &value)));
-    }
-}
-
-/// R: every non-canonical encoding, the torsion points, and R with its sign
-/// bit flipped.
-fn r_cases(base: &Base, out: &mut Vec<Input>)
-{
-    for encoding in y_at_or_above_p().into_iter().chain(x_zero_with_sign())
-    {
-        out.push(base.input("R not canonical", with_r(&base.signature, &encoding)));
-    }
-    for (i, point) in torsion().iter().enumerate()
-    {
-        let encoding = point.compress().0;
-        out.push(base.input(
-            format!("R = torsion {i}"),
-            with_r(&base.signature, &encoding),
-        ));
-    }
-    let mut flipped = base.signature;
-    flipped[31] ^= 0x80;
-    out.push(base.input("R sign bit flipped", flipped));
-}
-
-/// A: every non-canonical encoding and a y with no x, each with the base
-/// signature and with `R = O, S = 0` (which `ed25519-dalek` alone accepts
-/// under a key it decodes to the identity).
-fn non_canonical_key_cases(base: &Base, out: &mut Vec<Input>)
-{
-    let mut no_x = [0u8; 32];
-    no_x[0] = 2;
-    for encoding in y_at_or_above_p()
-        .into_iter()
-        .chain(x_zero_with_sign())
-        .chain([no_x])
-    {
-        out.push(Input::new(
-            "A not canonical",
-            encoding,
-            base.message,
-            base.signature,
-        ));
-        out.push(Input::new(
-            "A not canonical, R = O, S = 0",
-            encoding,
-            base.message,
-            identity_signature(),
-        ));
-    }
-}
-
-/// A in the torsion subgroup: the base signature, and `R = O, S = 0` under a
-/// message whose challenge kills A (the cofactorless equation holds) and one
-/// whose challenge does not.
-fn small_order_key_cases(base: &Base, out: &mut Vec<Input>)
-{
-    let identity = EdwardsPoint::identity().compress().0;
-    for (i, point) in torsion().iter().enumerate()
-    {
-        let key = point.compress().0;
-        out.push(Input::new(
-            format!("A = torsion {i}"),
-            key,
-            base.message,
-            base.signature,
-        ));
-        for equation in [Equation::Holds, Equation::Fails]
-        {
-            if i == 0 && equation == Equation::Fails
-            {
-                // [k]O is the identity for every k.
-                continue;
-            }
-            let crafted = message_where(b"small order A", &identity, &key, point, equation);
-            out.push(Input::new(
-                format!("A = torsion {i}, R = O, S = 0, equation {equation:?}"),
-                key,
-                &crafted,
-                identity_signature(),
-            ));
-        }
-    }
-}
-
-/// A of mixed order (A + T for each torsion point T): signatures made with
-/// A's private scalar, under a message whose challenge kills T (the
-/// cofactorless equation holds) and one whose challenge does not (only the
-/// cofactored equation holds).
-fn mixed_order_key_cases(base: &Base, out: &mut Vec<Input>)
-{
-    let scalar = SigningKey::from_bytes(&base.secret).to_scalar();
-    let point = EdwardsPoint::mul_base(&scalar);
-    let nonce = Scalar::from_bytes_mod_order_wide(&[0x3c; 64]);
-    let nonce_point = EdwardsPoint::mul_base(&nonce).compress().0;
-    for (i, torsion) in torsion().iter().enumerate().skip(1)
-    {
-        let key = (point + torsion).compress().0;
-        for equation in [Equation::Holds, Equation::Fails]
-        {
-            let crafted = message_where(b"mixed order A", &nonce_point, &key, torsion, equation);
-            let s = nonce + challenge(&nonce_point, &key, &crafted) * scalar;
-            let mut signature = [0u8; 64];
-            signature[..32].copy_from_slice(&nonce_point);
-            signature[32..].copy_from_slice(s.as_bytes());
-            out.push(Input::new(
-                format!("A + torsion {i}, equation {equation:?}"),
-                key,
-                &crafted,
-                signature,
-            ));
-        }
-    }
-}
-
-/// The edge-case corpus: signature malleability and the S range check,
-/// non-canonical and small-order R, and degenerate public keys (the torsion
-/// points, every non-canonical encoding, a y with no x, and mixed-order keys
-/// with signatures crafted to satisfy, or fail, the cofactorless equation).
-#[must_use]
-pub fn edge_cases() -> Vec<Input>
-{
-    let secret = [0x5e; 32];
-    let message = b"seraph ed25519 edge case".as_slice();
-    let (public_key, signature) = sign(&secret, message);
-    let base = Base {
-        secret,
-        message,
-        public_key,
-        signature,
+    let document = vectors::document(text)?;
+    let section = |key: &str| -> Result<Vec<Input>, LoadError> {
+        vectors::array(&document, key)?
+            .iter()
+            .map(Input::from_json)
+            .collect()
     };
-    let mut out = vec![base.input("base", base.signature)];
-    s_cases(&base, &mut out);
-    r_cases(&base, &mut out);
-    non_canonical_key_cases(&base, &mut out);
-    small_order_key_cases(&base, &mut out);
-    mixed_order_key_cases(&base, &mut out);
-    out.push(Input::new("all zero", [0; 32], message, [0; 64]));
-    out
+    let loaded = Vectors {
+        generated: section("generated")?,
+        edge_cases: section("edgeCases")?,
+        wycheproof_acceptable: section("wycheproofAcceptable")?,
+    };
+    let found =
+        loaded.generated.len() + loaded.edge_cases.len() + loaded.wycheproof_acceptable.len();
+    vectors::check_header(&document, SCHEMA, found)?;
+    Ok(loaded)
 }
 
 #[cfg(test)]
@@ -584,75 +211,77 @@ mod tests
 {
     use super::*;
 
-    #[test]
-    fn l_is_the_group_order()
+    fn case(verdict: &str, signature: &str) -> String
     {
-        let mut below = L;
-        below[0] -= 1;
-        assert!(bool::from(Scalar::from_canonical_bytes(L).is_none()));
-        assert!(bool::from(Scalar::from_canonical_bytes(below).is_some()));
+        format!(
+            r#"{{"label": "x", "publicKey": "{}", "message": "ab", "signature": "{signature}", "verdict": "{verdict}"}}"#,
+            "11".repeat(32)
+        )
+    }
+
+    fn file(declared: usize, generated: &[String]) -> String
+    {
+        format!(
+            r#"{{"schema": "{SCHEMA}", "numberOfTests": {declared}, "generated": [{}],
+            "edgeCases": [], "wycheproofAcceptable": []}}"#,
+            generated.join(",")
+        )
     }
 
     #[test]
-    fn torsion_is_eight_distinct_small_order_points()
+    fn parse_reads_each_case_and_finds_its_verdict()
     {
-        let points = torsion();
-        let encodings: std::collections::HashSet<[u8; 32]> =
-            points.iter().map(|p| p.compress().0).collect();
-        assert_eq!(encodings.len(), 8);
-        assert!(points.iter().all(EdwardsPoint::is_small_order));
+        let sig = "22".repeat(64);
+        let loaded = parse(&file(
+            2,
+            &[case("accept", &sig), case("badPublicKey", &"33".repeat(64))],
+        ))
+        .unwrap();
+        assert_eq!(loaded.generated[1].reference, Verdict::BadPublicKey);
+        assert_eq!(
+            loaded.verdict(&[0x11; 32], &[0xab], &[0x22; 64]),
+            Some(Verdict::Accept)
+        );
+        assert_eq!(loaded.verdict(&[0x11; 32], &[0xac], &[0x22; 64]), None);
     }
 
     #[test]
-    fn reference_names_the_first_failing_check()
+    fn parse_refuses_a_wrong_count_an_unknown_verdict_or_a_short_signature()
     {
-        let (pk, sig) = sign(&[1; 32], b"m");
-        assert_eq!(reference(&pk, b"m", &sig), Verdict::Accept);
-        assert_eq!(reference(&pk, b"n", &sig), Verdict::Mismatch);
-        // S = L fails the range check before the key is looked at.
-        assert_eq!(
-            reference(&[0xff; 32], b"m", &with_s(&sig, &L)),
-            Verdict::NonCanonicalS
-        );
-        // y = p + 1 encodes the identity non-canonically: ed25519-dalek alone
-        // accepts R = O, S = 0 under it, and the reference refuses the key.
-        let mut identity_plus_p = [0xff; 32];
-        identity_plus_p[0] = 0xee;
-        identity_plus_p[31] = 0x7f;
-        let mut r_identity = [0u8; 64];
-        r_identity[0] = 1;
-        let dalek = VerifyingKey::from_bytes(&identity_plus_p).unwrap();
-        dalek
-            .verify(b"m", &Signature::from_bytes(&r_identity))
-            .unwrap();
-        assert_eq!(
-            reference(&identity_plus_p, b"m", &r_identity),
-            Verdict::BadPublicKey
-        );
+        let sig = "22".repeat(64);
+        assert!(matches!(
+            parse(&file(2, &[case("accept", &sig)])),
+            Err(LoadError::Count {
+                declared: 2,
+                found: 1
+            })
+        ));
+        assert!(matches!(
+            parse(&file(1, &[case("maybe", &sig)])),
+            Err(LoadError::Parse(_))
+        ));
+        assert!(matches!(
+            parse(&file(1, &[case("accept", "22")])),
+            Err(LoadError::Parse(_))
+        ));
     }
 
     #[test]
-    fn the_crafted_edge_cases_reach_the_outcomes_they_are_built_for()
+    fn the_checked_in_vectors_load_and_hold_every_verdict()
     {
-        let cases = edge_cases();
-        let verdict = |label: &str| {
-            cases
-                .iter()
-                .find(|c| c.label == label)
-                .map(Input::reference)
-                .unwrap()
-        };
-        assert_eq!(verdict("base"), Verdict::Accept);
-        assert_eq!(verdict("A + torsion 1, equation Holds"), Verdict::Accept);
-        assert_eq!(verdict("A + torsion 1, equation Fails"), Verdict::Mismatch);
-        assert_eq!(
-            verdict("A = torsion 3, R = O, S = 0, equation Holds"),
-            Verdict::Accept
-        );
-        assert_eq!(
-            verdict("A = torsion 3, R = O, S = 0, equation Fails"),
-            Verdict::Mismatch
-        );
-        assert_eq!(verdict("S + 1L"), Verdict::NonCanonicalS);
+        let loaded = load().unwrap();
+        let all: Vec<&Input> = loaded
+            .generated
+            .iter()
+            .chain(&loaded.edge_cases)
+            .chain(&loaded.wycheproof_acceptable)
+            .collect();
+        for verdict in Verdict::ALL
+        {
+            assert!(
+                all.iter().any(|i| i.reference == verdict),
+                "no {verdict:?} case"
+            );
+        }
     }
 }

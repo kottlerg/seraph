@@ -1678,6 +1678,27 @@ pub unsafe fn hole_direct_map_page(
     Ok(())
 }
 
+/// Give the direct-map page at `virt` the shadow-stack encoding: refused with
+/// [`PagingError::NotMapped`]. The kernel runs on no shadow stack on riscv64
+/// (`shadow_stack::enabled` is false), so `mm::stack_guard` never asks; the
+/// Zicfiss encoding and the fault paths that recognise it come with the
+/// riscv64 shadow-stack support (core/kernel/docs/return-address-integrity.md).
+///
+/// # Errors
+/// Always [`PagingError::NotMapped`].
+///
+/// # Safety
+/// None needed; the signature matches the x86-64 function's.
+#[cfg(not(test))]
+pub unsafe fn shadow_direct_map_page(
+    _virt: u64,
+    _phys: u64,
+    _take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>
+{
+    Err(PagingError::NotMapped)
+}
+
 /// Map the direct-map page at `virt` to `phys` again, closing a hole
 /// [`hole_direct_map_page`] left. A hart may have cached the invalid entry
 /// ([`CACHES_NOT_PRESENT_ENTRIES`]): the caller flushes this hart, and another

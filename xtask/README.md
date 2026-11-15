@@ -32,6 +32,7 @@ xtask/
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
+│   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
@@ -43,8 +44,9 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
-│   │                           #   test, compare_images, test_crash_report, test_debug_port,
-│   │                           #   test_gdb, test_kaslr, test_log_level, test_map_redo,
+│   │                           #   test, crypto_vectors, compare_images, test_crash_report,
+│   │                           #   test_debug_port,
+│   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
 │   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
@@ -100,7 +102,7 @@ or stamped for a different architecture.
 ```
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
     [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--riscv-zkr on|off] \
-    [--x86-paging 4|5] [--iommu attached|absent] \
+    [--x86-paging 4|5] [--x86-shadow-stack off|on] [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
     [--debug-port PORT [--debug-target NAME]] [--test-devices]
 ```
@@ -116,6 +118,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 | `--riscv-zkr` | Whether the guest RISC-V CPU implements the Zkr entropy source (default: `on`; riscv64 only, ignored on x86_64). Appends `zkr=on` or `zkr=off` to the QEMU `-cpu` model. With it, OpenSBI grants S-mode the `seed` CSR and the kernel's pool seeds from it beside the firmware boot seed (`entropy: seeded from hardware RNG`); `off` boots the path without the source, where the kernel's probe of the CSR traps and the pool seeds from the boot seed and jitter ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Sources and graceful degradation). Runs with `off` are manual ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
 | `--x86-paging` | Guest x86-64 paging depth (default: `4`; x86_64 only, ignored on riscv64). Appends `la57=off` (`4`) or `la57=on` (`5`) to the QEMU `-cpu` model on every accelerator, which sets the CPUID LA57 bit the bootloader negotiates the depth from ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § x86-64: Negotiated Paging Depth); the kernel recovers the depth from `CR4.LA57`, per [docs/memory-model.md](../docs/memory-model.md) § x86-64. The default pins `4` because TCG's `-cpu max` otherwise advertises LA57. `5` on a native accelerator (KVM, HVF, WHPX, NVMM) whose host CPU lacks LA57 fails before launch, naming the TCG route (`SERAPH_ACCEL=tcg`), since QEMU would drop the property with a warning and boot 4-level |
+| `--x86-shadow-stack` | Whether the guest x86-64 CPU offers CET supervisor shadow stacks (default: `off`; x86_64 only, ignored on riscv64). Appends `cet-ss=off` (`off`) or `cet-ss=on,enforce` (`on`) to the QEMU `-cpu` model on every accelerator, so whether the kernel runs on shadow stacks ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)) is the run's choice and never the host's: `-cpu host` would otherwise pass `CET_SS` through wherever the host's KVM offers it. `on` refuses to start where the accelerator cannot offer the feature, TCG among them, rather than boot without it. A QEMU whose `-cpu help` lists no `cet-ss` flag (the CI image's 10.2) cannot offer the feature either: `off` appends nothing there, and `on` is refused before launch. The cet cell, `cargo xtask test-cet`, is where shadow stacks are booted ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
 | `--iommu` | Whether the machine's IOMMU is attached (default: `attached`): `intel-iommu` with interrupt remapping and 32-bit destinations offered (`intremap=on,eim=on`, under KVM on a `kernel-irqchip=split` machine) on x86-64, `riscv-iommu-pci` in Bare mode (`off=off`) at 00:01.0 on riscv64, with the `virtio-pci` devices a driver of the system binds behind it (`iommu_platform=on`). `absent` boots the no-IOMMU variant, the no-iommu device cell of the local and release host runs ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers), which keeps devmgr's unconfined path covered while the attached IOMMU confines every device a driver binds, on both architectures ([docs/device-management.md](../docs/device-management.md#dma-safety-model) § DMA Safety Model) |
 | `--second-disk` | Attach `PATH` as a second disk: its own `virtio-blk-pci` device (drive `hd1`) beside `disk.img`, presenting the logical block size of its GPT (see Attached devices). `mkdisk --split-data` authors `disk-data.img` for it; any GPT image at 512- or 4096-byte blocks serves too, and any other image needs `--second-disk-block-size` |
 | `--second-disk-block-size` | Logical and physical block size, in bytes, of the second disk's device, overriding the size read from its image: a power of two of at least 512, up to QEMU's own limit. A size above virtio-blk's `MAX_BLOCK_SIZE` (4096), such as `8192`, stages the refused second disk of the disk variations ([docs/testing.md](../docs/testing.md) § Coverage tiers) |
@@ -414,6 +417,26 @@ their `--wait-host` and `--host-override` options.
 
 ---
 
+### `cargo xtask crypto-vectors`
+
+Regenerate the reference vectors of `shared/crypto/testkit` with OpenSSL, or check that the
+checked-in files regenerate byte-identically.
+
+```
+cargo xtask crypto-vectors [--check]
+```
+
+The command builds and runs the testkit's `crypto-reference-vectors` binary for the host, which
+drives the `openssl` command found on `PATH`
+([shared/crypto/testkit/README.md](../shared/crypto/testkit/README.md)). Without `--check` it
+writes `vectors/reference/ed25519.json` and `sha512.json`; with it, it writes nothing and fails,
+naming each file, unless both regenerate byte-identically. xtask does not depend on the testkit.
+
+The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
+their `--wait-host` and `--host-override` options.
+
+---
+
 ### `cargo xtask compare-images`
 
 Build two commits for each architecture and profile, and compare every file the build installs in
@@ -509,6 +532,7 @@ cargo xtask run-parallel \
     [--riscv-mmu sv39|sv48|sv57] \
     [--riscv-zkr on|off] \
     [--x86-paging 4|5] \
+    [--x86-shadow-stack off|on] \
     [--iommu attached|absent] \
     [--display headless|framebuffer] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
@@ -534,6 +558,7 @@ cargo xtask run-parallel \
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--riscv-zkr` | `on` | Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-zkr` |
 | `--x86-paging` | `4` | Guest x86-64 paging depth (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-paging` |
+| `--x86-shadow-stack` | `off` | Whether the guest x86-64 CPU offers CET supervisor shadow stacks (x86_64 only, ignored on riscv64); same semantics as `cargo xtask run --x86-shadow-stack` |
 | `--iommu` | `attached` | Whether the machine's IOMMU is attached; same semantics as `cargo xtask run --iommu` |
 | `--display` | `headless` | What each guest presents for display, never a window. `headless` drops the display adapter, as `cargo xtask run --headless` does, so devmgr spawns no framebuffer driver. `framebuffer` keeps QEMU std VGA (see Attached devices) with no display window (`-display none`), on a host with or without a graphical backend, so the bootloader hands the kernel a GOP framebuffer and devmgr spawns the framebuffer driver: the framebuffer device cell ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
 | `--second-disk` | (none) | Attach `PATH` as a second disk, as `cargo xtask run --second-disk` does; each slot boots its own copy, as it does of `disk.img` |
@@ -827,6 +852,46 @@ The boot to the READY line is bounded by five minutes, each gdbstub reply by twe
 search for the CPU halted in the idle loop by 100 stops 100 ms apart, and the report by two
 minutes. The command fails, killing QEMU, on any of those bounds, on a gdbstub it cannot reach, and
 on a report line that is missing or wrong.
+
+---
+
+### `cargo xtask test-cet`
+
+Check the kernel's CET supervisor shadow stacks, x86_64 only
+([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks). Boots the
+current sysroot headless twice under KVM with `-cpu host,cet-ss=on,enforce`: the first runs ktest
+to its pass marker and requires the kernel's `shadow stacks: on` line before it; the second, with
+QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoint at
+`syscall::dispatch` once ktest has started, overwrites the return address at the stopped CPU's
+stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an
+address inside `dispatch`, trying up to five calls.
+
+A boot whose kernel faults with the exception report's `cet:` line showing `s_cet` without
+`SH_STK_EN` and `int_ssp_table=0` ran on a host that lost the guest's CET state. On a host with the
+CPUID hypervisor bit the command reports the run as inconclusive and boots again, up to four runs
+of each boot, passing only on a run without it and failing as inconclusive after four; on any other
+host that report fails the command
+([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks).
+
+A pure runner; the sysroot must hold the composed ktest bundle, and it reads the kernel's symbols
+from the sysroot's kernel image:
+
+```sh
+cargo xtask build --arch x86_64
+cargo xtask compose-bundle --harness ktest
+cargo xtask test-cet [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+Each boot is bounded by five minutes and each gdbstub reply by 30 s. The command fails, killing
+QEMU, on any of those bounds, on a gdbstub it cannot reach, and on a missing or wrong line. It
+fails before the boots without KVM, and QEMU refuses to start, which fails it naming the refused
+feature, when the host's CPU or KVM cannot give the guest CET shadow stacks: it never passes
+without running them.
 
 ---
 
@@ -1221,6 +1286,13 @@ does not state its record's mode and head, `error record-name`. A record with `a
 record with `NOT RUN` is `error record-audit-shape`; a record without an `audit` key is
 `error record-shape`, since the reviewer-alone form states the `null`.
 
+A `full` or `delta` record whose `audit.sections` holds a section whose name contains
+`auditor-only` or `completing-audit`, in any letter case, is `error record-run-kind`: those are
+the checks of the auditor-only run and of the audit that completes a run of the reviewer alone,
+which only an `audit` record's run kind selects (`.claude/agents/pr-auditor.md` steps 2a, 11
+and 12), so the audit of that run with the reviewer is run again with the run-kind line
+`Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record).
+
 ### `cargo xtask review-ledger`
 
 Build the ledger of a review: the findings a later run must not re-raise
@@ -1507,10 +1579,11 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 ## Host launch rules
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
-themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
-`compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-kaslr`, `test-map-redo`,
-`test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi` as boots.
+themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
+`crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
+them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`,
+`test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi`
+as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

@@ -379,7 +379,7 @@ impl ChunkEntry
 /// fewest that give it a leaf for every chunk. A region of one chunk has none,
 /// and its root is that chunk's leaf.
 #[must_use]
-pub fn table_height(chunks: u64) -> u32
+pub const fn table_height(chunks: u64) -> u32
 {
     let mut height: u32 = 0;
     let mut capacity: u64 = 1;
@@ -619,6 +619,139 @@ pub fn release<S: SlotStore>(
             }
         }
         arena.free(cur);
+    }
+}
+
+/// The most directory levels a table has: the height of a table with a leaf
+/// for every `u64` chunk index.
+const MAX_HEIGHT: u32 = table_height(u64::MAX);
+
+/// Raise the table at `root` from `height` to `new_height` directory levels,
+/// for a region that grew: each new level is a directory node whose child 0 is
+/// the old root, since every chunk the old table holds has an index below its
+/// capacity, so its digits above the old height are 0. An empty table stays
+/// empty. Returns `false`, changing nothing, when the arena has fewer free
+/// slots outside its reserve than the levels added.
+pub fn raise<S: SlotStore>(
+    arena: &mut Arena<S>,
+    root: &mut NodeIdx,
+    height: u32,
+    new_height: u32,
+) -> bool
+{
+    if *root == NODE_NULL || new_height <= height
+    {
+        return true;
+    }
+    if arena.available() < u64::from(new_height.saturating_sub(height))
+    {
+        return false;
+    }
+    for _ in height..new_height
+    {
+        let mut children = [NODE_NULL; DIR_FANOUT];
+        children[0] = *root;
+        // The check above left a free slot for every level.
+        let Some(idx) = arena.alloc(Node::ChunkDir(children), NODE_NULL)
+        else
+        {
+            return false;
+        };
+        *root = idx;
+    }
+    true
+}
+
+/// Cut the table at `root` of `height` directory levels down to its first
+/// `keep` chunks, for a region that shrank to `keep` chunks: free every node
+/// below which only chunks at or past `keep` lie, handing each run of theirs
+/// to `retire` as [`release`] does, free each directory node left with no
+/// child, then lower the table to [`table_height`] of `keep` by making the
+/// root's child 0 the root. Needs no slot, so it cannot fail.
+pub fn truncate<S: SlotStore>(
+    arena: &mut Arena<S>,
+    root: &mut NodeIdx,
+    height: u32,
+    keep: u64,
+    mut retire: impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+)
+{
+    if keep >= capacity(height)
+    {
+        return;
+    }
+    if keep == 0
+    {
+        release(arena, *root, retire);
+        *root = NODE_NULL;
+        return;
+    }
+    // The directory nodes on the path to the chunk `keep`, the first chunk
+    // dropped, from the root down, with the child each leads through.
+    let mut path = [(NODE_NULL, 0usize); MAX_HEIGHT as usize];
+    let mut depth: usize = 0;
+    let mut cur = *root;
+    let mut level = height;
+    while level > 0 && cur != NODE_NULL
+    {
+        let pos = digit(keep, level);
+        // Every child after `pos` holds only chunks past `keep`; at the
+        // leaves, the child at `pos` is the chunk `keep` itself.
+        let first_dropped = if level == 1
+        {
+            pos
+        }
+        else
+        {
+            pos.saturating_add(1)
+        };
+        for p in first_dropped..DIR_FANOUT
+        {
+            let c = child(arena, cur, p);
+            if c != NODE_NULL
+            {
+                set_child(arena, cur, p, NODE_NULL);
+                release(arena, c, &mut retire);
+            }
+        }
+        if let Some(slot) = path.get_mut(depth)
+        {
+            *slot = (cur, pos);
+            depth = depth.saturating_add(1);
+        }
+        cur = child(arena, cur, pos);
+        level = level.saturating_sub(1);
+    }
+    // Free the directory nodes the cut emptied, from the deepest up: a node
+    // that keeps a child keeps every node above it.
+    while let Some(&(dir, _)) = depth.checked_sub(1).and_then(|d| path.get(d))
+    {
+        let Node::ChunkDir(children) = arena.get(dir).node
+        else
+        {
+            break;
+        };
+        if children.iter().any(|&c| c != NODE_NULL)
+        {
+            break;
+        }
+        arena.free(dir);
+        depth = depth.saturating_sub(1);
+        match depth.checked_sub(1).and_then(|d| path.get(d))
+        {
+            Some(&(parent, pos)) => set_child(arena, parent, pos, NODE_NULL),
+            None => *root = NODE_NULL,
+        }
+    }
+    // Every chunk left has an index below `keep`, so only child 0 of a root
+    // above the new height holds any.
+    let mut level = height;
+    while level > table_height(keep) && *root != NODE_NULL
+    {
+        let below = child(arena, *root, 0);
+        arena.free(*root);
+        *root = below;
+        level = level.saturating_sub(1);
     }
 }
 
@@ -907,5 +1040,114 @@ mod tests
         seen.dedup();
         assert_eq!(seen.len(), runs);
         assert_eq!(a.free_count(), free, "a table node or run was not freed");
+    }
+    /// A table of `chunks` chunks with one run on each chunk of `backed`,
+    /// whose run's `cap_slot` is its chunk index.
+    fn table_with(a: &mut Arena<VecStore>, chunks: u64, backed: &[u64]) -> NodeIdx
+    {
+        let height = table_height(chunks);
+        let mut root = NODE_NULL;
+        for &i in backed
+        {
+            let run = a
+                .alloc(
+                    Node::Frame(FrameDesc {
+                        cap_slot: i,
+                        page_count: 1,
+                        phys_base: 0,
+                        va: 0,
+                        region_id: NO_REGION_ID,
+                    }),
+                    NODE_NULL,
+                )
+                .unwrap();
+            let e = ChunkEntry::UNBACKED.back(0, 1, run).unwrap();
+            assert!(set_entry(a, &mut root, height, i, e));
+        }
+        root
+    }
+
+    /// Slots a table of `chunks` chunks with a run on each chunk of `backed`
+    /// takes, runs included.
+    fn slots_of(chunks: u64, backed: &[u64]) -> u64
+    {
+        let mut a = arena();
+        let free = a.free_count();
+        table_with(&mut a, chunks, backed);
+        free - a.free_count()
+    }
+
+    #[test]
+    fn a_raised_table_keeps_every_entry_and_takes_the_new_chunks()
+    {
+        let mut a = arena();
+        let backed = [0, 3, 5];
+        let mut root = table_with(&mut a, 6, &backed);
+        let free = a.free_count();
+        assert!(raise(&mut a, &mut root, 1, table_height(300)));
+        // One directory node per level added.
+        assert_eq!(free - a.free_count(), u64::from(table_height(300) - 1));
+        let height = table_height(300);
+        for i in 0..6
+        {
+            assert_eq!(
+                entry(&a, root, height, i).backed() != 0,
+                backed.contains(&i),
+                "{i}"
+            );
+        }
+        assert!(set_entry(&mut a, &mut root, height, 299, resident(0, 1)));
+        // An empty table stays empty, and a full arena refuses unchanged.
+        let mut empty = NODE_NULL;
+        assert!(raise(&mut a, &mut empty, 0, 5));
+        assert_eq!(empty, NODE_NULL);
+        while a.available() > 0
+        {
+            a.alloc(Node::Free, NODE_NULL).unwrap();
+        }
+        let before = root;
+        assert!(!raise(&mut a, &mut root, height, height + 1));
+        assert_eq!(root, before);
+    }
+
+    #[test]
+    fn truncate_drops_every_chunk_past_the_cut_and_lowers_the_table()
+    {
+        let backed = [0, 1, 7, 35, 36, 37, 71, 199];
+        for keep in [0, 1, 2, 7, 36, 37, 38, 72, 199, 200, 500]
+        {
+            let mut a = arena();
+            let free = a.free_count();
+            let mut root = table_with(&mut a, 200, &backed);
+            let mut dropped = Vec::new();
+            truncate(&mut a, &mut root, table_height(200), keep, |a, idx, f| {
+                dropped.push(f.cap_slot);
+                a.free(idx);
+            });
+            let kept: Vec<u64> = backed.iter().copied().filter(|&i| i < keep).collect();
+            let gone: Vec<u64> = backed.iter().copied().filter(|&i| i >= keep).collect();
+            dropped.sort_unstable();
+            assert_eq!(dropped, gone, "keep {keep}");
+            // What is left is the table a region of `keep` chunks with the
+            // kept entries has, slot for slot.
+            let height = table_height(keep.min(200));
+            for &i in &kept
+            {
+                assert_ne!(
+                    entry(&a, root, height, i).runs(),
+                    NODE_NULL,
+                    "keep {keep}, {i}"
+                );
+            }
+            assert_eq!(
+                free - a.free_count(),
+                slots_of(keep.min(200), &kept),
+                "keep {keep}"
+            );
+            if kept.is_empty()
+            {
+                assert_eq!(root, NODE_NULL, "keep {keep}");
+            }
+        }
     }
 }

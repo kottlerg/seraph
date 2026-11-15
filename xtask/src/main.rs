@@ -57,6 +57,7 @@ mod gpt;
 mod guest;
 mod host_lock;
 mod qemu;
+mod qemu_gdb;
 mod qmp;
 mod rust_src;
 mod stack_sizes;
@@ -107,6 +108,7 @@ fn main()
         CliCommand::Run(args) => commands::run::run(&ctx, args),
         CliCommand::Clean(args) => commands::clean::run(&ctx, args),
         CliCommand::Test(args) => commands::test::run(&ctx, args),
+        CliCommand::CryptoVectors(args) => commands::crypto_vectors::run(&ctx, args),
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
@@ -121,6 +123,7 @@ fn main()
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::TestWedge(args) => commands::test_wedge::run(&ctx, args),
+        CliCommand::TestCet(args) => commands::test_cet::run(&ctx, args),
         CliCommand::CaptureAcpi(args) => commands::capture_acpi::run(&ctx, args),
         CliCommand::LintDocs(args) => commands::lint_docs::run(&ctx, args),
         CliCommand::CommitCheck(args) => commands::pr_check::run_commit_check(&ctx, args),

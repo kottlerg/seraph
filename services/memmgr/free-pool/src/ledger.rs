@@ -23,14 +23,23 @@
 //! Every frame accounted to a record is charged to the record's budget node
 //! where it is accounted, and the charge is released where the frame joins the
 //! free pool, so a node's own count is the pages of the frames, demand runs
-//! and deferred runs charged to it ([`crate::budget`]).
+//! and deferred runs charged to it ([`crate::budget`]), and the commitment of
+//! each committed region of its records.
+//!
+//! A committed region is charged its whole length and its page-table
+//! reservation when it is committed or extended, and its runs are charged
+//! nothing more when they are backed; the ledger counts in `promised` the pages
+//! committed regions can still take ([`crate::commit`]), and every admission
+//! reads the free pool less `promised` (`services/memmgr/docs/memory-pool.md`
+//! § Commit).
 
 use crate::arena::{
-    Arena, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessCaps,
+    Arena, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessCaps,
     ProcessRecord, RegionNode, Slot, SlotStore,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError};
+use crate::commit::{self, CommitNeed};
 use crate::deferred::{DeferredList, RecheckBudget};
 use crate::index::{ProcessIndex, WordStore};
 use crate::pool::FreePool;
@@ -50,6 +59,36 @@ pub enum RegionError
     NoSlot,
     /// The record slot named holds no process record.
     NoRecord,
+}
+
+/// Whether [`Ledger::add_region`] registers a region committed
+/// ([`crate::commit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Commit
+{
+    /// Charged only for the runs its faults back.
+    Uncommitted,
+    /// Charged and promised its whole length when registered.
+    Committed,
+}
+
+/// Why [`Ledger::extend_region`] or [`Ledger::shrink_region`] changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizeError
+{
+    /// The slot named holds no region of the record.
+    NoRegion,
+    /// The region is not committed.
+    NotCommitted,
+    /// The new length is not page-aligned, or is zero, leaves the address
+    /// space, lies on the wrong side of the current length, or, for a shrink,
+    /// ends inside a chunk that holds a page past it.
+    Length,
+    /// The grown region would overlap another region of the record.
+    Overlap,
+    /// The arena has fewer free slots outside its reserve than the levels a
+    /// grown chunk table adds.
+    NoSlot,
 }
 
 /// Why [`Ledger::back_chunk`] recorded no run.
@@ -89,6 +128,10 @@ pub struct Ledger<S, W>
     /// caller's quiescence check accepts them.
     pub deferred: DeferredList,
     pub index: ProcessIndex<W>,
+    /// Pages the committed regions can still take from the pool: their data
+    /// pages that hold no frame, the page-table reservations their faults have
+    /// not drawn, and their metadata bounds ([`crate::commit`]).
+    promised: u64,
 }
 
 impl<S: SlotStore, W: WordStore> Ledger<S, W>
@@ -100,7 +143,24 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             pool: FreePool::new(),
             deferred: DeferredList::new(),
             index: ProcessIndex::new(words),
+            promised: 0,
         }
+    }
+
+    /// Pages the committed regions can still take from the pool
+    /// ([`crate::commit`]).
+    #[must_use]
+    pub const fn promised(&self) -> u64
+    {
+        self.promised
+    }
+
+    /// Free pages no committed region is promised: the free pool less
+    /// `promised`, which every admission reads.
+    #[must_use]
+    pub fn uncommitted_free(&self) -> u64
+    {
+        self.pool.free_pages().saturating_sub(self.promised)
     }
 
     /// The record slot keyed by `badge`.
@@ -245,8 +305,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
 
     /// Whether `pages` more may be charged to the budget node of `rec`, beside
     /// `pending` pages taken from the pool for it and not yet charged, with
-    /// `reserve` of the pool's free pages in the system reserve
-    /// ([`budget::admit`]). A record that does not exist admits nothing.
+    /// `reserve` of the pool's free pages in the system reserve, against the
+    /// free pages outside `promised` ([`budget::admit`]). A record that does
+    /// not exist admits nothing.
     ///
     /// # Errors
     /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
@@ -264,21 +325,54 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             node,
             pages,
             pending,
-            self.pool.free_pages(),
+            self.uncommitted_free(),
+            reserve,
+        )
+    }
+
+    /// Whether the growth `need` of a committed region of `rec` may be
+    /// committed, with `reserve` of the pool's free pages in the system
+    /// reserve: its data pages and page-table reservation charged to the
+    /// budget node of `rec`, and those and its metadata bound taken from the
+    /// free pages outside `promised` ([`budget::admit`]). A record that does
+    /// not exist admits nothing.
+    ///
+    /// # Errors
+    /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
+    pub fn admit_commit(
+        &self,
+        rec: NodeIdx,
+        need: CommitNeed,
+        reserve: u64,
+    ) -> Result<(), ChargeError>
+    {
+        let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
+        let free = self.uncommitted_free();
+        if free < need.meta
+        {
+            return Err(ChargeError::Reserve);
+        }
+        budget::admit(
+            &self.arena,
+            node,
+            need.charged(),
+            0,
+            free.saturating_sub(need.meta),
             reserve,
         )
     }
 
     /// The most pages, up to `want`, that may be charged to the budget node of
-    /// `rec`, with `reserve` of the pool's free pages in the system reserve
-    /// ([`budget::admissible`]). A record that does not exist admits nothing.
+    /// `rec`, with `reserve` of the pool's free pages in the system reserve,
+    /// against the free pages outside `promised` ([`budget::admissible`]). A
+    /// record that does not exist admits nothing.
     ///
     /// # Errors
     /// [`ChargeError::Limit`] or [`ChargeError::Reserve`].
     pub fn admissible(&self, rec: NodeIdx, want: u64, reserve: u64) -> Result<u64, ChargeError>
     {
         let node = self.record(rec).ok_or(ChargeError::Limit)?.budget;
-        budget::admissible(&self.arena, node, want, self.pool.free_pages(), reserve)
+        budget::admissible(&self.arena, node, want, self.uncommitted_free(), reserve)
     }
 
     /// Set the max of the budget node of `rec` ([`budget::set_max`]).
@@ -435,13 +529,21 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         Some(f)
     }
 
-    /// Register a demand-paged region on `rec`, rejecting overlap. Its chunk
-    /// table starts empty.
+    /// Register a demand-paged region on `rec`, rejecting overlap, and return
+    /// its slot. Its chunk table starts empty. A [`Commit::Committed`] region is charged
+    /// its data pages and page-table reservation, and adds those and its
+    /// metadata bound to `promised` ([`commit::grow_need`]); admitting that
+    /// ([`Ledger::admit_commit`]) is the caller's.
     ///
     /// # Errors
     /// [`RegionError::Overlap`], [`RegionError::NoSlot`], or
     /// [`RegionError::NoRecord`].
-    pub fn add_region(&mut self, rec: NodeIdx, region: DemandRegion) -> Result<(), RegionError>
+    pub fn add_region(
+        &mut self,
+        rec: NodeIdx,
+        region: DemandRegion,
+        commit: Commit,
+    ) -> Result<NodeIdx, RegionError>
     {
         let Some(mut r) = self.record(rec)
         else
@@ -462,9 +564,22 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             }
             cur = self.arena.get(cur).next;
         }
+        let need = commit::grow_need(0, region.len);
+        let committed = commit == Commit::Committed;
         let node = RegionNode {
             region,
             table: NODE_NULL,
+            commit: if committed
+            {
+                Commitment {
+                    pt_left: need.pt,
+                    high_len: region.len,
+                }
+            }
+            else
+            {
+                Commitment::NONE
+            },
         };
         let idx = self
             .arena
@@ -472,7 +587,284 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             .ok_or(RegionError::NoSlot)?;
         r.region_head = idx;
         self.set_record(rec, r);
+        if committed
+        {
+            budget::charge(&mut self.arena, r.budget, need.charged());
+            self.promised = self.promised.saturating_add(need.promised());
+        }
+        Ok(idx)
+    }
+
+    /// The region of `rec` based at `va_base`, with its slot.
+    #[must_use]
+    pub fn region_based(&self, rec: NodeIdx, va_base: u64) -> Option<(NodeIdx, RegionNode)>
+    {
+        let mut cur = self.record(rec)?.region_head;
+        while let Some(have) = self.region_node(cur)
+        {
+            if have.region.va_base == va_base
+            {
+                return Some((cur, have));
+            }
+            cur = self.arena.get(cur).next;
+        }
+        None
+    }
+
+    /// The committed region `reg` of `rec`, or why it is none.
+    fn committed_region(&self, rec: NodeIdx, reg: NodeIdx) -> Result<RegionNode, ResizeError>
+    {
+        let mut cur = self.record(rec).ok_or(ResizeError::NoRegion)?.region_head;
+        while let Some(have) = self.region_node(cur)
+        {
+            if cur == reg
+            {
+                return have
+                    .commit
+                    .get()
+                    .map(|_| have)
+                    .ok_or(ResizeError::NotCommitted);
+            }
+            cur = self.arena.get(cur).next;
+        }
+        Err(ResizeError::NoRegion)
+    }
+
+    /// Grow the committed region `reg` of `rec` to `new_len` bytes in place,
+    /// raising its chunk table to the new length's height
+    /// ([`chunk::raise`]), and charge and promise the growth as
+    /// [`Ledger::add_region`] does, against the largest length the region has
+    /// had ([`commit::regrow_need`]); admitting it is the caller's. A `new_len`
+    /// equal to the length changes nothing.
+    ///
+    /// # Errors
+    /// [`ResizeError::NoRegion`], [`ResizeError::NotCommitted`],
+    /// [`ResizeError::Length`] for a length that is unaligned, smaller, or
+    /// leaves the address space, [`ResizeError::Overlap`] when the growth meets
+    /// another region of `rec`, and [`ResizeError::NoSlot`]. Nothing changes
+    /// then.
+    pub fn extend_region(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        new_len: u64,
+    ) -> Result<(), ResizeError>
+    {
+        let mut node = self.committed_region(rec, reg)?;
+        let old_len = node.region.len;
+        let base = node.region.va_base;
+        if !new_len.is_multiple_of(PAGE_SIZE)
+            || new_len < old_len
+            || base.checked_add(new_len).is_none()
+        {
+            return Err(ResizeError::Length);
+        }
+        if new_len == old_len
+        {
+            return Ok(());
+        }
+        let grown = (
+            base.saturating_add(old_len),
+            new_len.saturating_sub(old_len),
+        );
+        let r = self.record(rec).ok_or(ResizeError::NoRegion)?;
+        let mut cur = r.region_head;
+        while let Some(have) = self.region_node(cur)
+        {
+            if cur != reg && regions_overlap(grown.0, grown.1, have.region.va_base, have.region.len)
+            {
+                return Err(ResizeError::Overlap);
+            }
+            cur = self.arena.get(cur).next;
+        }
+        let new_region = DemandRegion {
+            len: new_len,
+            ..node.region
+        };
+        if !chunk::raise(
+            &mut self.arena,
+            &mut node.table,
+            chunk::table_height(chunk_count(&node.region)),
+            chunk::table_height(chunk_count(&new_region)),
+        )
+        {
+            return Err(ResizeError::NoSlot);
+        }
+        let high_len = node.commit.high_len;
+        let need = commit::regrow_need(old_len, high_len, new_len);
+        node.region = new_region;
+        node.commit = Commitment {
+            pt_left: node.commit.pt_left.saturating_add(need.pt),
+            high_len: high_len.max(new_len),
+        };
+        self.arena.set_node(reg, Node::Region(node));
+        budget::charge(&mut self.arena, r.budget, need.charged());
+        self.promised = self.promised.saturating_add(need.promised());
         Ok(())
+    }
+
+    /// Lower the top of the committed region `reg` of `rec` to `new_len`
+    /// bytes: cut its chunk table to the chunks below the new top
+    /// ([`chunk::truncate`]), taking each run of the chunks cut back, pooled or
+    /// deferred as `quiescent` decides, and release the commitment of the
+    /// pages cut: their charge, less the runs' (which retire as any run does),
+    /// and their part of `promised`. The page-table reservation stays whole:
+    /// memmgr unmaps the pages cut first without reclaiming page tables, so the
+    /// tables of the pages cut stay in the address space until the region is
+    /// unregistered, and a regrowth up to the largest length the region has had
+    /// adds no reservation ([`commit::regrow_need`]). Their mappings gone, the
+    /// pages cut keep no run deferred. A `new_len` equal to the length changes
+    /// nothing.
+    ///
+    /// # Errors
+    /// [`ResizeError::NoRegion`], [`ResizeError::NotCommitted`], or
+    /// [`ResizeError::Length`] for a length that is zero, unaligned, larger, or
+    /// ends inside a chunk that holds a page at or past it. Nothing changes
+    /// then.
+    pub fn shrink_region(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        new_len: u64,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Result<(), ResizeError>
+    {
+        let mut node = self.committed_region(rec, reg)?;
+        let old_len = node.region.len;
+        if new_len == 0 || !new_len.is_multiple_of(PAGE_SIZE) || new_len > old_len
+        {
+            return Err(ResizeError::Length);
+        }
+        if new_len == old_len
+        {
+            return Ok(());
+        }
+        let new_region = DemandRegion {
+            len: new_len,
+            ..node.region
+        };
+        let keep = chunk_count(&new_region);
+        // A chunk the new top cuts stays whole: it may hold no page past it.
+        let in_chunk = new_len % crate::CHUNK_BYTES / PAGE_SIZE;
+        if in_chunk != 0
+        {
+            let base = node.region.va_base.saturating_add(new_len);
+            let past = u32::try_from(in_chunk).map_or(0, |p| {
+                self.chunk_at(reg, base)
+                    .backed()
+                    .checked_shr(p)
+                    .unwrap_or(0)
+            });
+            if past != 0
+            {
+                return Err(ResizeError::Length);
+            }
+        }
+        let charged = self.record(rec).ok_or(ResizeError::NoRegion)?.budget;
+        let height = chunk::table_height(chunk_count(&node.region));
+        let mut run_pages: u64 = 0;
+        {
+            let Self {
+                arena,
+                pool,
+                deferred,
+                ..
+            } = self;
+            chunk::truncate(arena, &mut node.table, height, keep, |arena, idx, frame| {
+                run_pages = run_pages.saturating_add(u64::from(frame.page_count));
+                retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
+            });
+        }
+        let cut = commit::grow_need(new_len, old_len);
+        // The runs cut lay in the pages cut, so their pages are at most those.
+        let unbacked = cut.pages.saturating_sub(run_pages);
+        node.region = new_region;
+        self.arena.set_node(reg, Node::Region(node));
+        budget::uncharge(&mut self.arena, charged, unbacked);
+        self.promised = self
+            .promised
+            .saturating_sub(unbacked.saturating_add(cut.meta));
+        Ok(())
+    }
+
+    /// Undo [`Ledger::extend_region`] of the committed region `reg` of `rec`
+    /// from `old_len` bytes, when the largest length it had before was
+    /// `old_high`: cut it back ([`Ledger::shrink_region`]) and release the
+    /// page-table reservation the growth added, so a caller that repeats the
+    /// growth is charged once. No fault was served since the growth, so no run
+    /// lies past `old_len`.
+    ///
+    /// # Errors
+    /// As [`Ledger::shrink_region`]; the reservation then stays.
+    pub fn undo_extend(
+        &mut self,
+        rec: NodeIdx,
+        reg: NodeIdx,
+        old_len: u64,
+        old_high: u64,
+        quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Result<(), ResizeError>
+    {
+        self.shrink_region(rec, reg, old_len, quiescent)?;
+        let mut node = self.committed_region(rec, reg)?;
+        let charged = self.record(rec).ok_or(ResizeError::NoRegion)?.budget;
+        let high_len = old_high.min(node.commit.high_len);
+        let added = commit::pt_reserve(node.commit.high_len / PAGE_SIZE)
+            .saturating_sub(commit::pt_reserve(high_len / PAGE_SIZE))
+            .min(node.commit.pt_left);
+        node.commit = Commitment {
+            pt_left: node.commit.pt_left.saturating_sub(added),
+            high_len,
+        };
+        self.arena.set_node(reg, Node::Region(node));
+        budget::uncharge(&mut self.arena, charged, added);
+        self.promised = self.promised.saturating_sub(added);
+        Ok(())
+    }
+
+    /// Whether the region in slot `reg` is committed.
+    #[must_use]
+    pub fn is_committed(&self, reg: NodeIdx) -> bool
+    {
+        self.region_node(reg)
+            .is_some_and(|n| n.commit.get().is_some())
+    }
+
+    /// The pages left of the page-table reservation of region `reg`: 0 for an
+    /// uncommitted region, or a slot that holds no region.
+    #[must_use]
+    pub fn pt_reserve(&self, reg: NodeIdx) -> u64
+    {
+        self.region_node(reg)
+            .and_then(|n| n.commit.get())
+            .map_or(0, |c| c.pt_left)
+    }
+
+    /// Draw `pages` from the page-table reservation of the committed region
+    /// `reg` of `rec`, for a page-table donation of that many pages memmgr
+    /// accounted to `rec` ([`Ledger::push_frame`], which charged it): the
+    /// reservation and `promised` fall by `pages`, and so does the charge of
+    /// the budget node of `rec`, which the commitment already carried, so the
+    /// donation is charged once. Returns `false`, changing nothing, when the
+    /// reservation holds fewer than `pages`, the region is not committed, or a
+    /// slot holds no record or region.
+    pub fn draw_pt_reserve(&mut self, rec: NodeIdx, reg: NodeIdx, pages: u64) -> bool
+    {
+        let (Some(r), Some(mut node)) = (self.record(rec), self.region_node(reg))
+        else
+        {
+            return false;
+        };
+        let Some(left) = node.commit.get().and_then(|c| c.pt_left.checked_sub(pages))
+        else
+        {
+            return false;
+        };
+        node.commit.pt_left = left;
+        self.arena.set_node(reg, Node::Region(node));
+        budget::uncharge(&mut self.arena, r.budget, pages);
+        self.promised = self.promised.saturating_sub(pages);
+        true
     }
 
     /// The region of `rec` containing `va`, with its slot, which names it to
@@ -547,7 +939,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
     /// Record `frame`, a run memmgr mapped at `frame.va` in region `reg` of
     /// `rec`, on the run list of the chunk holding it, mark its pages backed in
     /// the chunk's entry ([`ChunkEntry::back`]), and charge it to the budget
-    /// node of `rec`. Either all of it is recorded or nothing changes.
+    /// node of `rec`, or, in a committed region, whose commitment carries its
+    /// charge already, take its pages off `promised`. Either all of it is
+    /// recorded or nothing changes.
     ///
     /// # Errors
     /// [`BackError::NoRecord`] when `rec` holds no record,
@@ -607,7 +1001,14 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             return Err(BackError::NoSlot);
         }
         self.arena.set_node(reg, Node::Region(node));
-        budget::charge(&mut self.arena, charged, u64::from(frame.page_count));
+        if node.commit.get().is_some()
+        {
+            self.promised = self.promised.saturating_sub(u64::from(frame.page_count));
+        }
+        else
+        {
+            budget::charge(&mut self.arena, charged, u64::from(frame.page_count));
+        }
         Ok(())
     }
 
@@ -640,7 +1041,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
                 {
                     self.arena.set_next(prev, next);
                 }
-                self.release_table(have.table, r.budget, quiescent);
+                self.release_region(&have, r.budget, quiescent);
                 self.arena.free(cur);
                 return Some(have.region);
             }
@@ -650,25 +1051,42 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         None
     }
 
-    /// Free every node of the chunk table at `root`, taking each run back,
-    /// pooled or deferred as `quiescent` decides, its charge on the budget node
-    /// `charged` ([`retire`]).
-    fn release_table(
+    /// Free every node of the chunk table of the region `node`, taking each
+    /// run back, pooled or deferred as `quiescent` decides, its charge on the
+    /// budget node `charged` ([`retire`]), and, for a committed region,
+    /// release the rest of its commitment: the charge of its pages that hold no
+    /// run and of what is left of its page-table reservation, and its part of
+    /// `promised`.
+    fn release_region(
         &mut self,
-        root: NodeIdx,
+        node: &RegionNode,
         charged: NodeIdx,
         mut quiescent: impl FnMut(&FreeRun) -> bool,
     )
     {
-        let Self {
-            arena,
-            pool,
-            deferred,
-            ..
-        } = self;
-        chunk::release(arena, root, |arena, idx, frame| {
-            retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
-        });
+        let mut run_pages: u64 = 0;
+        {
+            let Self {
+                arena,
+                pool,
+                deferred,
+                ..
+            } = self;
+            chunk::release(arena, node.table, |arena, idx, frame| {
+                run_pages = run_pages.saturating_add(u64::from(frame.page_count));
+                retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
+            });
+        }
+        if let Some(c) = node.commit.get()
+        {
+            // The runs lay in the region, so their pages are at most its own.
+            let unbacked = (node.region.len / PAGE_SIZE).saturating_sub(run_pages);
+            let held = unbacked.saturating_add(c.pt_left);
+            budget::uncharge(&mut self.arena, charged, held);
+            self.promised = self
+                .promised
+                .saturating_sub(held.saturating_add(commit::meta_bound(node.region.len)));
+        }
     }
 
     /// Take every frame of `rec`'s frame list that `pick` selects off the
@@ -758,7 +1176,7 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         while let Some(have) = self.region_node(cur)
         {
             let next = self.arena.get(cur).next;
-            self.release_table(have.table, r.budget, &mut quiescent);
+            self.release_region(&have, r.budget, &mut quiescent);
             self.arena.free(cur);
             cur = next;
         }
@@ -919,7 +1337,8 @@ mod tests
         let rec = l.insert_process(42, NodeSpec::TOP).unwrap();
         assert!(l.push_frame(rec, frame(1, 2, 0x1000, UNMAPPED)));
         assert!(l.push_frame(rec, frame(2, 16, 0x10000, 0x40_0000)));
-        l.add_region(rec, region(0x40_0000, 0x10_0000)).unwrap();
+        l.add_region(rec, region(0x40_0000, 0x10_0000), Commit::Uncommitted)
+            .unwrap();
         l.set_aspace_cap(rec, 9);
         assert_eq!(l.set_pressure(rec, 11, 1), Some(0));
         let (_, caps) = l.remove_process(42, pool_all).unwrap();
@@ -1101,12 +1520,14 @@ mod tests
     {
         let mut l = ledger();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
-        l.add_region(rec, region(0x1000, 0x2000)).unwrap();
+        l.add_region(rec, region(0x1000, 0x2000), Commit::Uncommitted)
+            .unwrap();
         assert_eq!(
-            l.add_region(rec, region(0x2000, 0x1000)),
+            l.add_region(rec, region(0x2000, 0x1000), Commit::Uncommitted),
             Err(RegionError::Overlap)
         );
-        l.add_region(rec, region(0x3000, 0x1000)).unwrap();
+        l.add_region(rec, region(0x3000, 0x1000), Commit::Uncommitted)
+            .unwrap();
         let (reg, found) = l.region_for(rec, 0x3800).unwrap();
         assert_eq!(found.va_base, 0x3000);
         assert_eq!(l.region_exact(rec, 0x3000, 0x1000), Some(reg));
@@ -1133,7 +1554,8 @@ mod tests
         let free = l.arena.free_count();
         let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
         l.push_grant(rec, 9, 2, 0x9_0000, UNMAPPED).unwrap();
-        l.add_region(rec, region(BASE, 64 * CHUNK)).unwrap();
+        l.add_region(rec, region(BASE, 64 * CHUNK), Commit::Uncommitted)
+            .unwrap();
         let reg = l.region_exact(rec, BASE, 64 * CHUNK).unwrap();
         l.back_chunk(rec, reg, frame(1, 4, 0x1_0000, BASE)).unwrap();
         l.back_chunk(rec, reg, frame(2, 12, 0x2_0000, BASE + 4 * PAGE_SIZE))
@@ -1292,7 +1714,8 @@ mod tests
         }
         // A region of 2^14 chunks: a table of six directory levels.
         let chunks: u64 = 1 << 14;
-        l.add_region(rec, region(BASE, chunks * CHUNK)).unwrap();
+        l.add_region(rec, region(BASE, chunks * CHUNK), Commit::Uncommitted)
+            .unwrap();
         let reg = l.region_exact(rec, BASE, chunks * CHUNK).unwrap();
         let height = chunk::table_height(chunks);
         assert_eq!(height, 6);
@@ -1367,13 +1790,13 @@ mod tests
         let before = l.record(rec);
         fill_arena(&mut l);
         assert_eq!(
-            l.add_region(rec, region(0x1000, 0x1000)),
+            l.add_region(rec, region(0x1000, 0x1000), Commit::Uncommitted),
             Err(RegionError::NoSlot)
         );
         assert_eq!(l.record(rec), before);
         assert!(l.region_for(rec, 0x1000).is_none());
         assert_eq!(
-            l.add_region(NODE_NULL, region(0x1000, 0x1000)),
+            l.add_region(NODE_NULL, region(0x1000, 0x1000), Commit::Uncommitted),
             Err(RegionError::NoRecord)
         );
     }
@@ -1409,20 +1832,59 @@ mod tests
             let mut reg = r.region_head;
             while let Some(have) = l.region_node(reg)
             {
-                let height = chunk::table_height(chunk_count(&have.region));
-                for c in 0..chunk_count(&have.region)
+                // A committed region is charged its length and reservation,
+                // its runs within them.
+                pages += match have.commit.get()
                 {
-                    let mut run = chunk::entry(&l.arena, have.table, height, c).runs();
-                    while let Node::Frame(f) = l.arena.get(run).node
-                    {
-                        pages += u64::from(f.page_count);
-                        run = l.arena.get(run).next;
-                    }
-                }
+                    Some(c) => have.region.len / PAGE_SIZE + c.pt_left,
+                    None => run_pages(l, &have),
+                };
                 reg = l.arena.get(reg).next;
             }
         }
         pages
+    }
+
+    /// The pages of the runs on the chunk table of the region `have`.
+    fn run_pages(l: &Ledger<VecStore, VecWords>, have: &RegionNode) -> u64
+    {
+        let mut pages = 0;
+        let height = chunk::table_height(chunk_count(&have.region));
+        for c in 0..chunk_count(&have.region)
+        {
+            let mut run = chunk::entry(&l.arena, have.table, height, c).runs();
+            while let Node::Frame(f) = l.arena.get(run).node
+            {
+                pages += u64::from(f.page_count);
+                run = l.arena.get(run).next;
+            }
+        }
+        pages
+    }
+
+    /// What `promised` must equal, walked from every committed region: its
+    /// pages that hold no run, its reservation left, and its metadata bound.
+    fn promised_by(l: &Ledger<VecStore, VecWords>) -> u64
+    {
+        let mut pages = 0;
+        for idx in 0..l.arena.pages() * crate::SLOTS_PER_PAGE
+        {
+            if let Node::Region(have) = l.arena.get(idx).node
+                && let Some(c) = have.commit.get()
+            {
+                pages += have.region.len / PAGE_SIZE - run_pages(l, &have)
+                    + c.pt_left
+                    + commit::meta_bound(have.region.len);
+            }
+        }
+        pages
+    }
+
+    /// `promised`, checked against what the committed regions hold.
+    fn promised(l: &Ledger<VecStore, VecWords>) -> u64
+    {
+        assert_eq!(l.promised(), promised_by(l));
+        l.promised()
     }
 
     /// The record's node's own and subtree counts, checked against what it
@@ -1609,5 +2071,331 @@ mod tests
         fill_arena_but(&mut l, 1);
         assert_eq!(l.insert_process(3, NodeSpec::TOP), Err(NodeError::NoSlot));
         assert_eq!(l.arena.available(), 1);
+    }
+    /// Take a run of `pages` pages from the pool as `fit` selects it.
+    fn take(l: &mut Ledger<VecStore, VecWords>, pages: u32, fit: crate::Fit) -> (u64, u32, u64)
+    {
+        let grant = l
+            .pool
+            .select(&mut l.arena, pages, fit, |cap, _| Some(cap + 1))
+            .unwrap();
+        grant.entries[0]
+    }
+
+    /// Back chunk `c` of the region `reg` of `rec` at `BASE` whole, from the pool.
+    fn back_whole(l: &mut Ledger<VecStore, VecWords>, rec: NodeIdx, reg: NodeIdx, c: u64)
+    {
+        let (cap, pages, phys) = take(l, 16, crate::Fit::Contiguous);
+        l.back_chunk(rec, reg, frame(cap, pages, phys, BASE + c * CHUNK))
+            .unwrap();
+    }
+
+    /// [`ledger_with_pool`], with room in the arena for a few hundred slots.
+    fn roomy_ledger(pages: u64) -> Ledger<VecStore, VecWords>
+    {
+        let mut l = ledger_with_pool(pages);
+        for _ in 0..8
+        {
+            // SAFETY: VecStore grows on write.
+            unsafe { l.arena.add_page() };
+        }
+        l
+    }
+
+    #[test]
+    fn a_committed_region_is_charged_and_promised_whole_and_its_runs_charge_nothing_more()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let len = 64 * CHUNK;
+        let need = commit::grow_need(0, len);
+        let reg = l
+            .add_region(rec, region(BASE, len), Commit::Committed)
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, need.charged());
+        assert_eq!(promised(&l), need.promised());
+        assert_eq!(l.pt_reserve(reg), need.pt);
+        // A fault's run takes its pages off `promised`; the charge stands, and
+        // the free pages outside `promised` are as they were.
+        let free = l.uncommitted_free();
+        back_whole(&mut l, rec, reg, 0);
+        assert_eq!(usage(&l, rec).0, need.charged());
+        assert_eq!(promised(&l), need.promised() - 16);
+        assert_eq!(l.uncommitted_free(), free);
+        // A page-table donation drawn from the reservation is charged once.
+        assert!(l.push_frame(rec, frame(50, 4, 0x50_0000, UNMAPPED)));
+        assert!(l.draw_pt_reserve(rec, reg, 4));
+        assert_eq!(usage(&l, rec).0, need.charged());
+        assert_eq!(promised(&l), need.promised() - 20);
+        assert_eq!(l.pt_reserve(reg), need.pt - 4);
+        // No more than the reservation holds is drawn, and only from a
+        // committed region.
+        assert!(!l.draw_pt_reserve(rec, reg, need.pt));
+        assert!(!l.draw_pt_reserve(rec, NODE_NULL, 1));
+        let plain = l
+            .add_region(rec, region(BASE + len, CHUNK), Commit::Uncommitted)
+            .unwrap();
+        assert!(!l.draw_pt_reserve(rec, plain, 1));
+        assert_eq!(l.pt_reserve(plain), 0);
+        // Unregistering pools the run and releases the rest of the commitment;
+        // the donation stays on the record.
+        l.remove_region(rec, reg, pool_all).unwrap();
+        assert_eq!(usage(&l, rec), (4, 4));
+        assert_eq!(promised(&l), 0);
+        assert_eq!(l.uncommitted_free(), 10_000);
+    }
+
+    #[test]
+    fn every_admission_reads_the_free_pages_outside_promised_and_the_reserve()
+    {
+        let mut l = roomy_ledger(1000);
+        let reserve = 10;
+        let core = l.insert_process(1, NodeSpec::TOP_RESERVE).unwrap();
+        let client = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let other = l.insert_process(3, NodeSpec::TOP).unwrap();
+        // The client commits the most it may: free - promised - R >= what
+        // the commitment promises.
+        let need_for = |pages: u64| commit::grow_need(0, pages * PAGE_SIZE);
+        let mut most = 0;
+        while need_for(most + 1).promised() + reserve <= 1000
+        {
+            most += 1;
+        }
+        assert_eq!(
+            l.admit_commit(client, need_for(most + 1), reserve),
+            Err(ChargeError::Reserve)
+        );
+        let need = need_for(most);
+        assert_eq!(l.admit_commit(client, need, reserve), Ok(()));
+        let reg = l
+            .add_region(client, region(BASE, most * PAGE_SIZE), Commit::Committed)
+            .unwrap();
+        // Every page is still free, but a grant to another client is refused
+        // past what lies outside `promised` and the reserve.
+        let left = l.uncommitted_free();
+        assert_eq!((l.pool.free_pages(), left), (1000, 1000 - need.promised()));
+        assert_eq!(
+            l.admit(other, left - reserve + 1, 0, reserve),
+            Err(ChargeError::Reserve)
+        );
+        assert_eq!(l.admit(other, left - reserve, 0, reserve), Ok(()));
+        assert_eq!(
+            l.admissible(other, 16, reserve),
+            if left > reserve
+            {
+                Ok((left - reserve).min(16))
+            }
+            else
+            {
+                Err(ChargeError::Reserve)
+            }
+        );
+        // A reserve node takes the reserve, never a promised page.
+        assert_eq!(l.admit(core, left, 0, reserve), Ok(()));
+        assert_eq!(
+            l.admit(core, left + 1, 0, reserve),
+            Err(ChargeError::Reserve)
+        );
+        assert_eq!(l.admissible(core, left + 5, reserve), Ok(left));
+        // The client's faults are admitted against nothing: they take their
+        // runs from `promised`, so what lies outside it does not move.
+        for c in 0..(most / 16)
+        {
+            back_whole(&mut l, client, reg, c);
+            assert_eq!(l.uncommitted_free(), left);
+        }
+        assert_eq!(promised(&l), need.promised() - most / 16 * 16);
+        l.remove_region(client, reg, pool_all).unwrap();
+        assert_eq!((l.pool.free_pages(), promised(&l)), (1000, 0));
+    }
+
+    #[test]
+    fn a_committed_chunk_backed_in_pieces_on_a_fragmented_pool_keeps_its_promise()
+    {
+        let mut l = ledger();
+        for _ in 0..8
+        {
+            // SAFETY: VecStore grows on write.
+            unsafe { l.arena.add_page() };
+        }
+        // A pool of one-page runs, none adjacent to another.
+        for i in 0..64
+        {
+            l.pool
+                .push(
+                    &mut l.arena,
+                    FreeRun {
+                        cap_slot: 900 + i,
+                        page_count: 1,
+                        phys_base: 0x1000_0000 + i * 2 * PAGE_SIZE,
+                    },
+                )
+                .unwrap();
+        }
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, CHUNK), Commit::Committed)
+            .unwrap();
+        let free = l.uncommitted_free();
+        // No run covers a fault's span, so the largest free run, one page,
+        // backs the faulting page (`Fit::UpTo`, `fault_window`), and each
+        // page of the chunk faults in turn.
+        for p in 0..16
+        {
+            let at = |page: u32| BASE + u64::from(page) * PAGE_SIZE;
+            let (start, end) = l.chunk_at(reg, at(p)).unbacked_span(p, 16).unwrap();
+            assert_eq!((start, end), (p, 16));
+            let (cap, pages, phys) = take(&mut l, end - start, crate::Fit::UpTo);
+            assert_eq!(pages, 1);
+            let va = crate::fault_window(at(start), at(end), at(p), pages);
+            assert_eq!(va, at(p));
+            l.back_chunk(rec, reg, frame(cap, pages, phys, va)).unwrap();
+            assert_eq!(l.uncommitted_free(), free);
+        }
+        assert_eq!(l.chunk_at(reg, BASE).backed(), 0xFFFF);
+        let need = commit::grow_need(0, CHUNK);
+        assert_eq!(promised(&l), need.pt + need.meta);
+        assert_eq!(usage(&l, rec).0, need.charged());
+    }
+
+    #[test]
+    fn extend_and_shrink_move_the_top_and_keep_the_charge_of_what_the_region_holds()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, 6 * CHUNK), Commit::Committed)
+            .unwrap();
+        back_whole(&mut l, rec, reg, 0);
+        back_whole(&mut l, rec, reg, 5);
+        // Grown to 40 chunks, the table gains a level and keeps its entries.
+        l.extend_region(rec, reg, 40 * CHUNK).unwrap();
+        assert_eq!(usage(&l, rec).0, commit::grow_need(0, 40 * CHUNK).charged());
+        assert_eq!(
+            promised(&l),
+            commit::grow_need(0, 40 * CHUNK).promised() - 32
+        );
+        assert_eq!(l.chunk_at(reg, BASE + 5 * CHUNK).backed(), 0xFFFF);
+        back_whole(&mut l, rec, reg, 39);
+        // Refusals change nothing.
+        let other = l
+            .add_region(rec, region(BASE + 50 * CHUNK, CHUNK), Commit::Uncommitted)
+            .unwrap();
+        let before = (usage(&l, rec), promised(&l));
+        assert_eq!(
+            l.extend_region(rec, reg, 51 * CHUNK),
+            Err(ResizeError::Overlap)
+        );
+        assert_eq!(
+            l.extend_region(rec, reg, 20 * CHUNK),
+            Err(ResizeError::Length)
+        );
+        assert_eq!(
+            l.extend_region(rec, reg, 40 * CHUNK + 1),
+            Err(ResizeError::Length)
+        );
+        assert_eq!(
+            l.extend_region(rec, other, 2 * CHUNK),
+            Err(ResizeError::NotCommitted)
+        );
+        assert_eq!(
+            l.extend_region(rec, NODE_NULL, 2 * CHUNK),
+            Err(ResizeError::NoRegion)
+        );
+        assert_eq!(l.extend_region(rec, reg, 40 * CHUNK), Ok(()));
+        // A top inside chunk 5, which holds pages past it, is refused.
+        assert_eq!(
+            l.shrink_region(rec, reg, 5 * CHUNK + PAGE_SIZE, pool_all),
+            Err(ResizeError::Length)
+        );
+        assert_eq!(
+            l.shrink_region(rec, reg, 0, pool_all),
+            Err(ResizeError::Length)
+        );
+        assert_eq!(
+            l.shrink_region(rec, reg, 41 * CHUNK, pool_all),
+            Err(ResizeError::Length)
+        );
+        assert_eq!(
+            l.shrink_region(rec, other, CHUNK, pool_all),
+            Err(ResizeError::NotCommitted)
+        );
+        assert_eq!((usage(&l, rec), promised(&l)), before);
+        // Cut to 5 chunks: the runs of chunks 5 and 39 go back, and the region
+        // holds what one of 5 chunks with chunk 0 backed holds.
+        // The page-table reservation stays that of 40 chunks.
+        let free = l.pool.free_pages();
+        l.shrink_region(rec, reg, 5 * CHUNK, pool_all).unwrap();
+        assert_eq!(l.pool.free_pages(), free + 32);
+        let five = commit::grow_need(0, 5 * CHUNK);
+        let forty = commit::grow_need(0, 40 * CHUNK);
+        assert_eq!(usage(&l, rec).0, five.pages + forty.pt);
+        assert_eq!(promised(&l), five.pages - 16 + forty.pt + five.meta);
+        assert_eq!(l.pt_reserve(reg), forty.pt);
+        assert_eq!(l.chunk_at(reg, BASE).backed(), 0xFFFF);
+        assert!(l.region_for(rec, BASE + 5 * CHUNK).is_none());
+        // Grown back to 40 chunks, it adds no reservation; undone, the growth
+        // releases what it added, which here is none.
+        l.extend_region(rec, reg, 40 * CHUNK).unwrap();
+        assert_eq!(usage(&l, rec).0, forty.charged());
+        assert_eq!(promised(&l), forty.promised() - 16);
+        l.undo_extend(rec, reg, 5 * CHUNK, 40 * CHUNK, pool_all)
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, five.pages + forty.pt);
+        assert_eq!(l.pt_reserve(reg), forty.pt);
+        // A top inside a chunk that holds nothing past it is accepted.
+        l.shrink_region(rec, reg, 4 * CHUNK + PAGE_SIZE, pool_all)
+            .unwrap();
+        usage(&l, rec);
+        promised(&l);
+        // Death releases the rest.
+        let node = l.record(rec).unwrap().budget;
+        l.remove_process(1, pool_all).unwrap();
+        assert_eq!((l.pool.free_pages(), promised(&l)), (10_000, 0));
+        assert!(budget::node(&l.arena, node).is_none());
+    }
+
+    #[test]
+    fn a_run_a_shrink_cannot_pool_stays_charged_until_a_recheck_pools_it()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Committed)
+            .unwrap();
+        back_whole(&mut l, rec, reg, 3);
+        l.shrink_region(rec, reg, 2 * CHUNK, |_| false).unwrap();
+        assert_eq!(l.deferred.pages(), 16);
+        let (two, four) = (
+            commit::grow_need(0, 2 * CHUNK),
+            commit::grow_need(0, 4 * CHUNK),
+        );
+        assert_eq!(usage(&l, rec).0, two.pages + four.pt + 16);
+        assert_eq!(promised(&l), two.pages + four.pt + two.meta);
+        l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
+        assert_eq!(usage(&l, rec).0, two.pages + four.pt);
+    }
+
+    #[test]
+    fn an_undone_extension_releases_the_reservation_it_added()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Committed)
+            .unwrap();
+        back_whole(&mut l, rec, reg, 1);
+        let before = (usage(&l, rec), promised(&l), l.pt_reserve(reg));
+        l.extend_region(rec, reg, 600 * CHUNK).unwrap();
+        assert_eq!(l.pt_reserve(reg), commit::grow_need(0, 600 * CHUNK).pt);
+        l.undo_extend(rec, reg, 4 * CHUNK, 4 * CHUNK, pool_all)
+            .unwrap();
+        assert_eq!((usage(&l, rec), promised(&l), l.pt_reserve(reg)), before);
+        // Repeated, the growth is charged once.
+        l.extend_region(rec, reg, 600 * CHUNK).unwrap();
+        assert_eq!(
+            usage(&l, rec).0,
+            commit::grow_need(0, 600 * CHUNK).charged()
+        );
     }
 }

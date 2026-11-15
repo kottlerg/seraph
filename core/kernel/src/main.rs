@@ -492,6 +492,20 @@ unsafe fn kernel_entry_post_rebase(
         mm::stack_guard::seed(mm::stack_guard::reserve_frames(memory_map), allocator);
     }
 
+    // Decide whether the kernel runs on shadow stacks (x86-64: when the BSP
+    // reports CET shadow stacks; riscv64: never), before the per-CPU storage
+    // below keeps each CPU's shadow-stack pages and before any Thread slot is
+    // sized (core/kernel/docs/return-address-integrity.md).
+    #[cfg(not(test))]
+    {
+        // SAFETY: the single boot thread, once, before any shadow-stack page
+        // is laid out.
+        unsafe { arch::current::shadow_stack::decide() };
+        sched::thread_slot::set_shadow_stack_pages(u64::from(
+            arch::current::shadow_stack::enabled(),
+        ));
+    }
+
     // Allocate the per-CPU storage slabs (`sched::init_storage`: scheduler,
     // idle TCB and idle-stack slabs, idle stacks, watchdog ticks, PerCpuData and
     // APIC IDs, and the x86-64 AP GDT/TSS/IST tables and NMI-backtrace storage)
@@ -643,6 +657,23 @@ unsafe fn kernel_entry_post_rebase(
         unsafe { mm::tag_allocator::enable(hw_tags, boot_cpu_count as usize, allocator) };
     }
     kprintln!("tagged-tlb ok");
+    // Turn shadow stacks on for the BSP, decided in Phase 4, before the timer
+    // enables interrupts: from here every return on this CPU is checked.
+    // `enable` returns without a `ret`, and this function never returns, so
+    // no frame live before it returns after it.
+    #[cfg(not(test))]
+    if arch::current::shadow_stack::enabled()
+    {
+        // SAFETY: CPU 0 is the BSP, below CPU_COUNT; Phase 4 has run.
+        let cpu_pages = unsafe { sched::cpu_shadow_pages(0) };
+        // SAFETY: Phase 5 on the BSP alone, interrupts disabled, shadow
+        // stacks decided on; Phase 4 laid out and converted the BSP's pages.
+        unsafe { arch::current::shadow_stack::prepare_boot_cpu(allocator, cpu_pages) };
+        // SAFETY: after `prepare_boot_cpu`, interrupts disabled, from this
+        // function, which never returns.
+        unsafe { arch::current::shadow_stack::enable() };
+        kprintln!("shadow stacks: on");
+    }
     // SAFETY: IDT installed and interrupts initialized above; syscall entry
     // point registered during arch init; single-threaded boot phase.
     unsafe {
@@ -1432,7 +1463,7 @@ unsafe fn kernel_entry_post_rebase(
         // SEED_MEMORY for init's Thread, in the layout `sys_cap_create_thread`
         // establishes: the guard page, the kernel stack, then the
         // `ThreadObject` followed by the TCB, then the per-thread FPU/SIMD/V
-        // save area.
+        // save area, then with shadow stacks on the shadow-stack page.
         let (init_thread_obj_nn, init_kstack_top, init_tcb) = {
             use cap::object::{KernelObjectHeader, ObjectType, ThreadObject};
 
@@ -1444,13 +1475,30 @@ unsafe fn kernel_entry_post_rebase(
             // nor any offset into it below wraps.
             let block_phys = seed.base.wrapping_add(offset);
             let block_virt = mm::paging::phys_to_virt(block_phys);
-            // Unmap the guard page below init's stack, as thread creation
-            // does (`mm::stack_guard`).
+            // Init's shadow stack, as thread creation lays one out. Its first
+            // run is `sched::enter`'s, not a switch-in, so the entry it holds
+            // is never returned to.
+            let init_shadow_phys = sched::thread_slot::shadow_page(block_phys);
+            let init_shadow_stack = init_shadow_phys.map(|phys| {
+                // SAFETY: the page is the fresh slab's last, owned here and
+                // writable through the direct map until the hole below.
+                unsafe {
+                    arch::current::shadow_stack::init_stack(
+                        mm::paging::phys_to_virt(phys),
+                        init_image.entry_point,
+                    )
+                }
+            });
+            // Unmap the guard page below init's stack, and make the shadow
+            // stack's page one, as thread creation does (`mm::stack_guard`).
             // SAFETY: after SMP bringup (Phase 8), with no lock held; the
             // guard is the fresh slab's first page, which nothing reaches
-            // until the reclaim of init's Thread closes it; the returned
-            // epoch is stamped in init's TCB below, before `sched::enter`.
-            let Ok(init_guard_epoch) = (unsafe { mm::stack_guard::hole(block_phys) })
+            // until the reclaim of init's Thread closes it, and the shadow
+            // page its last, which nothing but init's shadow stack writes
+            // until then; the returned epoch is stamped in init's TCB below,
+            // before `sched::enter`.
+            let Ok(init_guard_epoch) =
+                (unsafe { mm::stack_guard::hole(block_phys, init_shadow_phys) })
             else
             {
                 fatal("Phase 9: cannot unmap init's kernel stack guard page");
@@ -1490,6 +1538,10 @@ unsafe fn kernel_entry_post_rebase(
                 arch::ThreadKind::User,
             );
             arch::current::context::set_stack_floor(&mut init_saved, stack_floor);
+            if let Some(stack) = init_shadow_stack
+            {
+                arch::current::context::set_shadow_stack(&mut init_saved, stack);
+            }
 
             // SAFETY: tcb_ptr lies on page 5 of the freshly-retyped slab,
             // exclusively owned. CSpace is wired below (after take_root_cspace).
@@ -1849,6 +1901,22 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // pointer, above.
     unsafe {
         arch::current::cpu::disable_unswitched_user_state();
+    }
+
+    // Turn shadow stacks on for this AP when the BSP did, on its idle shadow
+    // stack, before the timer enables interrupts. An AP without them halts
+    // here: a thread migrates between CPUs with its shadow stack live.
+    // `enable` returns without a `ret`, and this function never returns.
+    if arch::current::shadow_stack::enabled()
+    {
+        // SAFETY: `cpu_id` is this AP's, below CPU_COUNT; Phase 4 has run.
+        let cpu_pages = unsafe { sched::cpu_shadow_pages(cpu_id as usize) };
+        // SAFETY: on this AP, at ring 0 / S-mode with interrupts disabled, on
+        // its idle stack; the BSP laid out and converted its pages in Phase 4.
+        unsafe { arch::current::shadow_stack::prepare_ap(cpu_pages) };
+        // SAFETY: after `prepare_ap`, interrupts disabled, from this function,
+        // which never returns.
+        unsafe { arch::current::shadow_stack::enable() };
     }
 
     // 5. Configure SYSCALL/SYSRET MSRs (IA32_EFER.SCE, STAR, LSTAR, SFMASK).

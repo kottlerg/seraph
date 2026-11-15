@@ -244,6 +244,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let riscv_mmu = args.riscv_mmu;
             let riscv_zkr = args.riscv_zkr;
             let x86_paging = args.x86_paging;
+            let x86_shadow_stack = args.x86_shadow_stack;
             let iommu = args.iommu;
             let debug_port = args.debug_port;
             let test_devices = args.test_devices;
@@ -333,6 +334,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     riscv_mmu,
                     riscv_zkr,
                     x86_paging,
+                    x86_shadow_stack,
                     iommu,
                     debug_port,
                     test_devices,

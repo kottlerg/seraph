@@ -8,7 +8,8 @@
 //!
 //! Splits a grant off the tail of `memory_base` of one page and one Thread
 //! slot, and retypes a `CSpace` from its first page and a Thread (guard page,
-//! kernel stack, wrapper and TCB page, extended-state area) from the slot
+//! kernel stack, wrapper and TCB page, extended-state area, and with shadow
+//! stacks on a shadow-stack page) from the slot
 //! above it. Each object's death returns its bytes, and the retype cursor
 //! then moves back below them, so `mem_map` lets the grant map them; every
 //! byte must read zero. Without the clear, the Thread's TCB and kernel stack

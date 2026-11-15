@@ -16,7 +16,7 @@ use crate::arch::Arch;
 use crate::bundle::Harness;
 use crate::context::Profile;
 use crate::disk::BlockSize;
-use crate::qemu::{DiskLine, Iommu, RiscvMmu, RiscvZkr, X86Paging};
+use crate::qemu::{DiskLine, Iommu, RiscvMmu, RiscvZkr, X86Paging, X86ShadowStack};
 
 /// Top-level CLI entry point.
 #[derive(Parser)]
@@ -47,6 +47,10 @@ pub enum CliCommand
     /// Lint the test code, then run Seraph unit tests on the host and, built
     /// for riscv64, under QEMU's user-mode emulator (see xtask/README.md).
     Test(TestArgs),
+
+    /// Regenerate the reference vectors of shared/crypto/testkit with
+    /// OpenSSL, or with `--check` fail unless they regenerate identically.
+    CryptoVectors(CryptoVectorsArgs),
 
     /// Launch N QEMU instances in parallel against an already-built image,
     /// classifying each run's outcome via user-supplied pass/fail regexes.
@@ -142,6 +146,13 @@ pub enum CliCommand
     /// with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md).
     TestWedge(TestWedgeArgs),
 
+    /// Check the x86-64 kernel's CET supervisor shadow stacks on a host
+    /// whose CPU has them, under KVM, failing on any other: boot the current
+    /// sysroot's ktest bundle on shadow stacks to its pass marker, then boot
+    /// it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return
+    /// address, and check the `#CP` it raises (see xtask/README.md).
+    TestCet(TestCetArgs),
+
     /// Capture the ACPI tables of one QEMU configuration into the `shared/aml`
     /// fixtures: boot the firmware alone on a blank disk, save the guest's
     /// memory over QMP once the firmware has installed its tables, find the
@@ -236,6 +247,7 @@ impl CliCommand
             Self::Build(args) => Some(&args.host),
             Self::Clean(args) => Some(&args.host),
             Self::Test(args) => Some(&args.host),
+            Self::CryptoVectors(args) => Some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::RunParallel(_)
@@ -252,6 +264,7 @@ impl CliCommand
             | Self::TestDebugPort(_)
             | Self::TestGdb(_)
             | Self::TestWedge(_)
+            | Self::TestCet(_)
             | Self::CaptureAcpi(_)
             | Self::LintDocs(_)
             | Self::CommitCheck(_)
@@ -477,6 +490,16 @@ pub struct RunArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Whether the guest x86-64 CPU offers CET supervisor shadow stacks
+    /// (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss`
+    /// property, so the host's CPU never decides it; a QEMU without the
+    /// property cannot offer them and gets no pin. `on` boots the kernel on
+    /// shadow stacks, or refuses to boot when the accelerator or the QEMU
+    /// cannot offer them; the cet cell (`cargo xtask test-cet`) is where they
+    /// are tested.
+    #[arg(long, default_value = "off")]
+    pub x86_shadow_stack: X86ShadowStack,
 
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
     /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu
@@ -783,6 +806,25 @@ pub struct TestWedgeArgs
     pub host: BootHostArgs,
 }
 
+// ── TestCet ───────────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct TestCetArgs
+{
+    /// Number of vCPUs to expose to the guest (QEMU -smp).
+    #[arg(long, default_value = "4")]
+    pub cpus: u32,
+
+    /// Guest memory size in MiB (QEMU -m).
+    #[arg(long, default_value = "512")]
+    pub mem: u32,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: BootHostArgs,
+}
+
 // ── TestDebugPort ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -916,6 +958,22 @@ pub struct CleanArgs
     pub host: HostArgs,
 }
 
+// ── CryptoVectors ─────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct CryptoVectorsArgs
+{
+    /// Regenerate in memory and fail unless the checked-in files are
+    /// byte-identical, writing nothing.
+    #[arg(long)]
+    pub check: bool,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: HostArgs,
+}
+
 // ── Test ──────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -1013,6 +1071,16 @@ pub struct RunParallelArgs
     /// when CPUID reports LA57, so this selects the depth a run exercises.
     #[arg(long, default_value = "4")]
     pub x86_paging: X86Paging,
+
+    /// Whether the guest x86-64 CPU offers CET supervisor shadow stacks
+    /// (`x86_64` only; ignored on riscv64). Pins the QEMU CPU's `cet-ss`
+    /// property, so the host's CPU never decides it; a QEMU without the
+    /// property cannot offer them and gets no pin. `on` boots the kernel on
+    /// shadow stacks, or refuses to boot when the accelerator or the QEMU
+    /// cannot offer them; the cet cell (`cargo xtask test-cet`) is where they
+    /// are tested.
+    #[arg(long, default_value = "off")]
+    pub x86_shadow_stack: X86ShadowStack,
 
     /// Whether the machine's IOMMU is attached, with the driven `virtio-pci`
     /// devices behind it. `absent` boots the no-IOMMU variant, the no-iommu
@@ -1682,7 +1750,7 @@ mod tests
     #[test]
     fn each_command_that_compiles_is_admitted_as_a_build_with_its_host_options()
     {
-        for command in ["build", "clean", "test", "compare-images"]
+        for command in ["build", "clean", "test", "crypto-vectors", "compare-images"]
         {
             let host = build_host_of(&["xtask", command, "--wait-host", "30"])
                 .unwrap_or_else(|| panic!("`{command}` is not admitted as a build"));

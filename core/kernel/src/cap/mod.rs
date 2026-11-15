@@ -44,6 +44,7 @@ use alloc::boxed::Box;
 pub mod arena;
 pub mod cspace;
 pub mod derivation;
+pub mod drain;
 pub mod ioport_bindings;
 pub mod object;
 pub mod registry;
@@ -347,10 +348,20 @@ impl CSpaceIdentity
         Self { id, epoch }
     }
 
-    /// Resolve this identity through the registry ([`lookup_cspace`]).
+    /// Resolve this identity through the registry ([`lookup_cspace`]) for an
+    /// IPC capability transfer. A `CSpace` whose teardown drain has begun
+    /// resolves to `None`, as one already unregistered does, so no capability
+    /// is transferred into or out of it while the drain runs
+    /// (core/kernel/docs/capability-internals.md § Capability Transfer in
+    /// IPC).
+    ///
+    /// The caller holds `DERIVATION_LOCK`, under which the drain sets the
+    /// flag and the `CSpace` stays registered.
     pub fn lookup(self) -> Option<*mut CSpace>
     {
-        lookup_cspace(self.id, self.epoch)
+        // SAFETY: a registry-resolved `CSpace` stays allocated while the
+        // caller holds DERIVATION_LOCK; the flag is atomic.
+        lookup_cspace(self.id, self.epoch).filter(|&cs| !unsafe { (*cs).is_draining() })
     }
 }
 

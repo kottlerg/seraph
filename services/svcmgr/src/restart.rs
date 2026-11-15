@@ -823,6 +823,20 @@ pub(crate) fn bind_instance_observers(
         && bind_fault_observer(&ctx.deaths, process_handle, correlator, ctx.ipc_buf)
 }
 
+/// The exit reason of a service the kernel shows dead in the caps svcmgr holds
+/// on it, else `None`: its main thread's state through `thread_cap` and, when
+/// `aspace_cap` is non-zero (memmgr and procmgr), its address space's retained
+/// terminal fault (`svcmgr_defs::death_caps::caps_death` decodes both). A zero
+/// `thread_cap` is not read.
+pub(crate) fn caps_death(thread_cap: u64, aspace_cap: u64) -> Option<u64>
+{
+    let thread_state = (thread_cap != 0)
+        .then(|| syscall::cap_info(thread_cap, syscall_abi::CAP_INFO_THREAD_STATE));
+    let aspace_fault = (aspace_cap != 0)
+        .then(|| syscall::cap_info(aspace_cap, syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT));
+    svcmgr_defs::death_caps::caps_death(thread_state, aspace_fault)
+}
+
 /// The exit reason of the process `process_handle` names when procmgr reports
 /// it dead (`procmgr_labels::QUERY_PROCESS`), else `None`. procmgr answers
 /// `EXITED` with the main thread's reason or the address space's retained

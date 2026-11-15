@@ -37,8 +37,9 @@ A bind takes one death-observer node from its queue's pool, fixed when the
 queue is created, so svcmgr keeps a growable set of queues: a bind tries the
 newest queue first, then the older ones, and only when every queue is out of
 nodes creates a further queue, funded from svcmgr's own memory, with twice
-the last pool (4 nodes first, below a boot's seven supervised and adopted
-services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). A
+the last pool (4 nodes first, below the two each of a boot's seven supervised
+and adopted services takes, so every boot grows the set; up to
+`EVENT_QUEUE_MAX_CAPACITY`). A
 further queue is one contiguous grant from memmgr; when memmgr refuses it,
 svcmgr retries at half the pool, down to the first pool's size. A bind that
 still fails fails the launch or restart. An adoption records the service all
@@ -84,10 +85,27 @@ about each such service its caps show alive, through its process handle
 `EXITED` with it before it reaps the process. The query runs only while memmgr and procmgr are
 active and alive, since it blocks until procmgr answers.
 
-Reconciliation records a devmgr that died before its bind with the thread cap init endowed, and a
-resync right after reconciliation routes its death (`EXIT_KILLED` for a revoked cap). A vfsd that
-died before reconciliation is not routed: svcmgr reads the recipe directory through vfsd, so
-reconciliation records nothing, or blocks, and no shutdown actuator is launched either.
+Reconciliation records a devmgr that died before its bind, or a vfsd that died after the recipe
+scan, with the thread cap init endowed, and a resync right after reconciliation routes its death
+(`EXIT_KILLED` for a revoked cap).
+
+svcmgr calls vfsd and devmgr before reconciliation records them. vfsd serves svcmgr's namespace
+root: before the handover svcmgr reads the device class files and walks the drivers directory
+through it, and at the handover it reads the recipe directory. devmgr mints each device class and
+takes `SET_DRIVERS_DIR` before the handover, through the endowed devmgr-registry source. A call to
+a dead server waits for good, since svcmgr's own capability keeps the endpoint alive with none of
+its receivers left. So svcmgr reads a server's liveness from its substrate registration before
+each step that calls it and after every call to it that fails
+([`src/endowed_servers.rs`](../src/endowed_servers.rs)): the state of the endowed thread cap
+(`EXIT_KILLED` for a revoked one), then, while memmgr and procmgr show alive, `QUERY_PROCESS` on
+the endowed process handle, which reports a worker-thread fault procmgr has not yet torn down. A
+dead server ends the step. A dead devmgr is then recorded by reconciliation, and the resync after
+it routes its death, as above. A dead vfsd found at the handover, before or during the recipe
+scan, is system death with no recipe to supervise by: svcmgr records and launches nothing,
+releases every substrate registration (each such service runs on unsupervised, logged), and takes
+the graceful shutdown path, which, with no shutdown actuator recorded, logs the degraded state
+(§ Decision tree). A server that dies after a check, while svcmgr's next call to it waits
+unreceived, still leaves svcmgr blocked (#1185).
 
 Exit reason encoding (owned by
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)), and

@@ -639,10 +639,6 @@ pub fn sys_mmio_map(tf: UserFrame) -> Result<u64, SyscallError>
 
     // The range lies wholly in the user range, checked before the mapping is
     // recorded, so a refusal changes nothing.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "u64 to usize is lossless on the 64-bit targets the kernel builds for"
-    )]
     let page_count = (mmio_size / PAGE_BYTES) as usize;
     // The walk below covers the range clamped as data
     // (`mm::user_page_range`).

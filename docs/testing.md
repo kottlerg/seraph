@@ -169,6 +169,7 @@ rootfs/config/svcmgr/
 │   ├── svctest.svc
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
+│   ├── crashd.svc            # crashd naming crashme for cores; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
@@ -204,6 +205,19 @@ The svctest recipe also stages the test class files of `sysroot/config/devmgr/te
 `sysroot/config/devmgr/classes/`, the directory svcmgr reads class files from, and boots with
 `--test-devices`, which attaches `edu` and four QEMU `pci-testdev` functions that no other launch
 attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
+
+The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
+the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death,
+which the fixture's tester checks ([Crash reports](#crash-reports-test-crash-report)). A usertest
+boot without it fails the crashme tester:
+
+```sh
+cargo xtask build
+cp sysroot/config/svcmgr/tests/usertest.svc sysroot/config/svcmgr/tests/crashd.svc \
+    sysroot/config/svcmgr/services/
+cargo xtask mkdisk --repack-only
+cargo xtask run
+```
 
 `ktest` is gated separately: it lives in the bootloader-loaded bundle,
 not in `svcmgr`'s recipe set. To run `ktest`, swap which binary backs
@@ -364,6 +378,14 @@ must be complete and hold the fields its kind, thread, and status require.
   on riscv64), so the dump names the access that faulted.
 - `--expect none` reads a boot of an image that stages no crashd: the log must hold no block, the
   check that the absent service changes nothing a fault does.
+
+The usertest boot's crashd names `crashme` in its `CORE_DUMP` ([Gating](#gating)), so each of the
+fixture's faulting deaths also leaves an ELF core in `/crash`, which the crashme tester checks in
+the guest: its machine, the faulting thread's signal, instruction pointer and stack pointer
+against the page runs it holds, the illegal instruction's bytes, and the `worker` core's threads
+([programs/crashme/README.md](../programs/crashme/README.md)). A core is checked in the boot, not
+in the log; `gdb` reading one is checked by hand
+([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
 
 In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
 cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go

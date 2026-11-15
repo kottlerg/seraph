@@ -1028,7 +1028,8 @@ when that harness is svctest, whose devmgr phases drive the test devices (as for
 
 ```sh
 cargo xtask build [--arch x86_64|riscv64]
-cp sysroot/config/svcmgr/tests/usertest.svc sysroot/config/svcmgr/services/
+cp sysroot/config/svcmgr/tests/usertest.svc sysroot/config/svcmgr/tests/crashd.svc \
+    sysroot/config/svcmgr/services/
 cargo xtask mkdisk --repack-only [--arch x86_64|riscv64]
 cargo xtask test-log-level [--arch x86_64|riscv64] [--timeout SECS] [--cpus N] [--mem MIB] \
     [--test-devices]

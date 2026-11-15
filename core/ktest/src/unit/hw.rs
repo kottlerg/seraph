@@ -1222,6 +1222,65 @@ pub fn irq_split_carves(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
+/// A raw `SYS_IRQ_SPLIT` whose split-point register has a bit set above bit 31
+/// returns `InvalidArgument` and leaves the cap unsplit, even when its low 32
+/// bits lie inside the range: `0x1_0000_0001` would otherwise split a range
+/// starting at IRQ id 0 at id 1. Run on a derived copy of the first
+/// Interrupt-range cap that the plain split at id 1 then carves, so the refusal
+/// is the register's, not the range's. Skipped if no such cap exists.
+pub fn irq_split_wide_arg_err(ctx: &TestContext) -> TestResult
+{
+    const WIDE_SPLIT_AT: u64 = (1 << 32) | 1;
+    let bound = scan_bound(ctx);
+
+    for slot in 1..=u64::from(bound)
+    {
+        // A slot that cannot be derived is empty; keep scanning.
+        let Ok(copy) = syscall::cap_derive(slot, syscall::RIGHTS_ALL)
+        else
+        {
+            continue;
+        };
+        // SAFETY: raw_syscall3's four conditions hold. SYS_IRQ_SPLIT takes no
+        // pointer and uses no IPC buffer; it changes no mapping and no thread
+        // beyond the registers the call clobbers in this thread; and in
+        // ktest's CSpace it changes only the slot `copy` names and the fresh
+        // slots it fills with the two children.
+        let ret =
+            unsafe { syscall::raw_syscall3(syscall_abi::SYS_IRQ_SPLIT, copy, WIDE_SPLIT_AT, 0) };
+        if ret >= 0
+        {
+            // The split consumed `copy`; its children are in fresh slots this
+            // call cannot name without the secondary return register.
+            return Err("hw::irq_split_wide_arg_err: split accepted a split point above u32::MAX");
+        }
+        if ret != SyscallError::InvalidArgument as i64
+        {
+            // Wrong tag; keep scanning.
+            syscall::cap_delete(copy).ok();
+            continue;
+        }
+        // The refused split left the copy whole: the plain split at id 1
+        // carves it when its range starts at 0 with more than one id.
+        match irq_split(copy, 1)
+        {
+            Ok((below, above)) =>
+            {
+                syscall::cap_delete(below).ok();
+                syscall::cap_delete(above).ok();
+                return Ok(());
+            }
+            Err(_) =>
+            {
+                syscall::cap_delete(copy).ok();
+            }
+        }
+    }
+
+    crate::log("ktest: hw::irq_split_wide_arg_err SKIP (no Interrupt range caps with count>1)");
+    Ok(())
+}
+
 /// `irq_split` on a Memory cap (wrong tag) must return `InvalidCapability`.
 pub fn irq_split_wrong_tag_err(ctx: &TestContext) -> TestResult
 {

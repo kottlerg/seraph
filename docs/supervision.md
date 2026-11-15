@@ -116,13 +116,14 @@ death and powers the system off.
 devmgr and vfsd are `restart = never`, `critical = yes`, and are not in the core set: their restart
 is future work that no principle excludes, and no restart of either is designed yet. The death of
 either, of its main thread or of any worker thread, is system death through the same graceful
-shutdown, by its recipe, not by membership of the core set (§ Supervision Hierarchy). Before its
-reconciliation svcmgr reads its recipes through vfsd, so a vfsd death then leaves it no recipe and
-no shutdown actuator: svcmgr checks vfsd's liveness before each read through vfsd and after each
-that fails, and routes a death it finds as system death, which with no actuator is the logged
-degraded state
+shutdown, by its recipe, not by membership of the core set (§ Supervision Hierarchy). svcmgr calls
+both before its reconciliation records them, and checks the liveness of each before each step
+that calls it and after each call that fails. A devmgr death it finds is recorded at
+reconciliation and routed then. svcmgr reads its recipes through vfsd, so a vfsd death before
+reconciliation leaves it no recipe and no shutdown actuator: it routes the death as system death,
+which with no actuator is the logged degraded state
 ([Restart Protocol § Death detection](../services/svcmgr/docs/restart-protocol.md#death-detection)).
-A vfsd that dies after the check, while svcmgr's next call to it waits unreceived, leaves svcmgr
+A server that dies after the check, while svcmgr's next call to it waits unreceived, leaves svcmgr
 blocked: a call on an endpoint none of whose receivers is left never returns (#1185).
 
 The path from a core or critical death to power-off MUST NOT depend on the service that died. svcmgr

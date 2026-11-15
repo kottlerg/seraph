@@ -30,7 +30,7 @@ mod arch;
 mod classes;
 mod death_queues;
 mod definitions;
-mod namespace_server;
+mod endowed_servers;
 mod restart;
 mod service;
 
@@ -312,9 +312,9 @@ fn publish_minted_send(
 /// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
 /// the endowed devmgr-registry source.
 ///
-/// The walk goes through vfsd, so it is skipped when vfsd is dead
-/// (`namespace_server::death`, read from its registration in `pending`): a
-/// call through a dead vfsd would wait for good.
+/// The walk goes through vfsd and the call goes to devmgr, so both are
+/// skipped when either is dead (`endowed_servers::death`, read from its
+/// registration in `pending`): a call to a dead server would wait for good.
 ///
 /// Best-effort: any failure leaves devmgr without a drivers dir, so timed
 /// sees `NO_DEVICE` on its first `QUERY_DEVICE` through the `rtc` class and
@@ -336,10 +336,13 @@ fn install_drivers_dir(
         std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: no root_dir_cap");
         return;
     }
-    if namespace_server::death(pending, ipc_buf).is_some()
+    for server in [endowed_servers::VFSD, endowed_servers::DEVMGR]
     {
-        std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: vfsd is dead");
-        return;
+        if endowed_servers::death(pending, server, ipc_buf).is_some()
+        {
+            std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: {server} is dead");
+            return;
+        }
     }
 
     // Attenuated rights: only what devmgr needs to list the subtree, walk
@@ -780,7 +783,7 @@ fn route_death(tag: DeathTag, exit_reason: u64, state: &mut SvcmgrState, ctx: &r
 }
 
 /// Route the death of vfsd, the server of svcmgr's namespace root, found
-/// before reconciliation recorded it (`namespace_server::death`): system
+/// before reconciliation recorded it (`endowed_servers::death`): system
 /// death, as for any death of vfsd (docs/supervision.md § Core Set and System
 /// Death). svcmgr cannot read a recipe through a dead vfsd, so it supervises
 /// no service: it releases every substrate registration, whose services run
@@ -797,7 +800,7 @@ fn route_namespace_server_death(
     std::os::seraph::log!(
         error: "{} died before reconciliation (exit reason {exit_reason:#x}); \
          no service recipe can be read",
-        namespace_server::NAME
+        endowed_servers::VFSD
     );
     definitions::reconcile::release_unsupervised(&mut state.pending, "vfsd is dead");
     initiate_graceful_shutdown(state, ctx);

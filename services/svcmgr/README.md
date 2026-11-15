@@ -40,7 +40,10 @@ svcmgr/
 ├── src/
 │   ├── main.rs                    # main() (std runtime), IPC dispatch,
 │   │                              # dispatch_deaths, initiate_graceful_shutdown
+│   ├── classes.rs                 # Device class files configured with devmgr
 │   ├── death_queues.rs            # Death-queue ring capacity and first pool
+│   ├── endowed_servers.rs         # Liveness of vfsd and devmgr before
+│   │                              # reconciliation records them
 │   ├── service.rs                 # ServiceEntry, RestartRecipe, SvcmgrCaps,
 │   │                              # restart-policy constants
 │   ├── restart.rs                 # Shared spawn primitives
@@ -59,7 +62,9 @@ svcmgr/
 │                                  # wire-blob encoder (`build_blob`), the
 │                                  # `cwd_rights` / `handover_permitted`
 │                                  # decisions, the windowed
-│                                  # `RestartBudget`
+│                                  # `RestartBudget`, the device class file
+│                                  # parser, and the death correlator and
+│                                  # cap decoding (`death_tag`, `death_caps`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see

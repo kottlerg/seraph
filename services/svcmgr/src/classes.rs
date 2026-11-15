@@ -20,7 +20,7 @@ use registry::Visibility;
 use svcmgr_defs::class::{CLASS_FILE_SUFFIX, CLASSES_DIR, class_publication, parse_class};
 
 use crate::definitions::reconcile::PendingRegistration;
-use crate::namespace_server;
+use crate::endowed_servers;
 
 /// Configure devmgr's classes from [`CLASSES_DIR`] through `devmgr_registry`,
 /// the endowed badge-0 devmgr-registry source, and publish each class SEND.
@@ -28,10 +28,11 @@ use crate::namespace_server;
 /// mark is in place before the drivers-directory pass. A file that cannot be
 /// read or parsed, or whose class devmgr refuses, is logged and skipped.
 ///
-/// The files are read through vfsd, so vfsd's liveness is read from its
-/// registration in `pending` before the first read and after every read that
-/// fails ([`namespace_server::death`]), and a dead vfsd ends the pass: a later
-/// call through it would wait for good.
+/// The files are read through vfsd and each class is minted by devmgr, so the
+/// liveness of both is read from their registrations in `pending` before the
+/// pass, vfsd's after every read that fails and devmgr's after every mint that
+/// fails ([`endowed_servers::death`]), and a dead server ends the pass: a
+/// later call to it would wait for good.
 pub fn configure(
     registry: &mut registry::Registry,
     devmgr_registry: u64,
@@ -44,7 +45,8 @@ pub fn configure(
         log!(warn: "no devmgr-registry source; no device class configured");
         return;
     }
-    if server_dead(pending, ipc_buf).is_break()
+    if server_dead(pending, endowed_servers::VFSD, ipc_buf).is_break()
+        || server_dead(pending, endowed_servers::DEVMGR, ipc_buf).is_break()
     {
         return;
     }
@@ -72,7 +74,7 @@ pub fn configure(
         let Ok(ent) = ent
         else
         {
-            if server_dead(pending, ipc_buf).is_break()
+            if server_dead(pending, endowed_servers::VFSD, ipc_buf).is_break()
             {
                 break;
             }
@@ -92,13 +94,15 @@ pub fn configure(
     let _ = syscall::cap_delete(minter);
 }
 
-/// `Break` when vfsd is dead ([`namespace_server::death`]), logged: no device
-/// class file can be read.
-fn server_dead(pending: &[PendingRegistration], ipc_buf: *mut u64) -> ControlFlow<()>
+/// `Break` when the server `server` names (vfsd or devmgr) is dead
+/// ([`endowed_servers::death`]), logged: no further class file can be read,
+/// or no further class minted.
+fn server_dead(pending: &[PendingRegistration], server: &str, ipc_buf: *mut u64)
+-> ControlFlow<()>
 {
-    if namespace_server::death(pending, ipc_buf).is_some()
+    if endowed_servers::death(pending, server, ipc_buf).is_some()
     {
-        log!(warn: "vfsd is dead; device classes not configured");
+        log!(warn: "{server} is dead; device classes not configured");
         return ControlFlow::Break(());
     }
     ControlFlow::Continue(())
@@ -108,7 +112,8 @@ fn server_dead(pending: &[PendingRegistration], ipc_buf: *mut u64) -> ControlFlo
 /// publish its SEND as `devmgr.class.<class>`, through `minter`, a
 /// `CLASS_AUTHORITY` SEND on devmgr's registry. `class` is the file's stem,
 /// which names the class configured only when the file sets no `class` key.
-/// `Break` when the file's read failed and vfsd is dead ([`server_dead`]).
+/// `Break` when the file's read failed and vfsd is dead, or devmgr's mint
+/// failed and devmgr is dead ([`server_dead`]).
 fn configure_one(
     registry: &mut registry::Registry,
     minter: u64,
@@ -142,7 +147,7 @@ fn configure_one(
         Err(e) =>
         {
             log!(warn: "cannot read {path}: {e}; class not configured");
-            return server_dead(pending, ipc_buf);
+            return server_dead(pending, endowed_servers::VFSD, ipc_buf);
         }
     };
     let def = match parse_class(class, &contents)
@@ -171,7 +176,7 @@ fn configure_one(
         Err(e) =>
         {
             log!(warn: "class {class}: devmgr refused it ({e:?}); not configured");
-            return ControlFlow::Continue(());
+            return server_dead(pending, endowed_servers::DEVMGR, ipc_buf);
         }
     };
     let Some(name) = class_publication(def.stem.as_bytes())

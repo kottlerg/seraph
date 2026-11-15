@@ -33,7 +33,7 @@ use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch, shu
 use svcmgr_defs::DeathTag;
 use svcmgr_endowment::SubstrateObserver;
 
-use crate::namespace_server;
+use crate::endowed_servers;
 use crate::restart::{RestartCtx, bind_fault_observer};
 use crate::service::{
     POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
@@ -163,7 +163,7 @@ fn is_recipe_name(name: &str) -> bool
 /// released to run unsupervised instead.
 ///
 /// The scan reads through vfsd, so vfsd's liveness is read before it and
-/// after every read that fails ([`namespace_server::death`]): a later call
+/// after every read that fails ([`endowed_servers::death`]): a later call
 /// through a dead vfsd would wait for good. `Err` carries the exit reason of a
 /// vfsd found dead; nothing is then recorded or launched, and `pending` is
 /// left as it was, for the caller to route the death.
@@ -178,7 +178,7 @@ pub fn reconcile_and_launch(
 ) -> Result<(), u64>
 {
     let server_death = |pending: &[PendingRegistration]| -> Result<(), u64> {
-        namespace_server::death(pending, ctx.ipc_buf).map_or(Ok(()), Err)
+        endowed_servers::death(pending, endowed_servers::VFSD, ctx.ipc_buf).map_or(Ok(()), Err)
     };
     server_death(pending)?;
     log!("svcmgr: scanning {SERVICES_DIR}");
@@ -293,7 +293,7 @@ pub fn reconcile_and_launch(
 /// the heap cannot hold, is dropped with a log line. `None` when the heap
 /// cannot hold the list of parsed recipes. The files are read through vfsd,
 /// whose liveness is read from its registration in `pending` after every read
-/// that fails ([`namespace_server::death`]).
+/// that fails ([`endowed_servers::death`]).
 ///
 /// # Errors
 /// vfsd's exit reason when a read failed and vfsd is dead.
@@ -323,7 +323,8 @@ fn parse_recipes(
             Ok(c) => c,
             Err(e) =>
             {
-                if let Some(exit_reason) = namespace_server::death(pending, ipc_buf)
+                if let Some(exit_reason) =
+                    endowed_servers::death(pending, endowed_servers::VFSD, ipc_buf)
                 {
                     return Err(exit_reason);
                 }

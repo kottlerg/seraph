@@ -20,8 +20,9 @@ crashd writes an ELF core of it to `/crash` on the root filesystem, which host `
 a per-core and a directory byte budget; the recipe sets `CORE_DUMP=no`, so no core is written by
 default. The core's directory, names and contents are in
 [docs/core-format.md](docs/core-format.md). crashd writes no core of a process on the path a core
-is written through, vfsd, the FAT driver and the block driver, which declare themselves so to
-procmgr, and its recipe grants it `/crash` alone, without the right to read a core back.
+is written through, vfsd, the FAT driver, the block driver, devmgr and the IOMMU driver, which
+declare themselves so to procmgr, and its recipe grants it `/crash` alone, without the right to
+read a core back.
 
 svcmgr starts crashd from `rootfs/config/svcmgr/services/crashd.svc`, which sets
 `debug_authority = yes` ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)).

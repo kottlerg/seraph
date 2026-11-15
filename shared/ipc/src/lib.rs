@@ -562,8 +562,8 @@ pub mod procmgr_labels
     /// marks it, and every [`ATTACH_PROCESS`] reply for it from then on
     /// carries [`ATTACH_FLAG_NO_CORE`], so the crash service writes no core of
     /// it, a write that would wait on the process it describes. Sent at
-    /// startup by vfsd, each filesystem driver and each block driver. No data,
-    /// no caps. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no
+    /// startup by vfsd, each filesystem driver, each block driver, devmgr and
+    /// each IOMMU driver. No data, no caps. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no
     /// live process or carries [`PROCESS_HANDLE_TAG`]. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_CORE`.
     pub const DECLARE_NO_CORE: u64 = 26;

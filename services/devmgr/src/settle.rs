@@ -8,12 +8,14 @@
 //! the registry serves the batch's drivers, and observe every driver's death
 //! for the rest of the boot.
 //!
-//! devmgr keeps one [`DriverWatch`] for the boot: a death event queue every
-//! driver's death observers post to, one on its main thread and one on its
-//! address space, with its device badge as the correlator, a job
-//! notification the registry's workers signal when a request leaves work for
-//! the control thread (`crate::Registry`), and a wait set over both that
-//! devmgr's control thread waits on. devmgr spawns
+//! devmgr keeps one [`DriverWatch`] for the boot: a counted `DeathSet`
+//! (`shared/death-set`) of death event queues every driver's death observers
+//! post to, one on its main thread and one on its address space, with its
+//! device badge as the correlator, which grows by a further queue when the
+//! queues' binds are spent and never drops a post; a job notification the
+//! registry's workers signal when a request leaves work for the control
+//! thread (`crate::Registry`); and the set's wait set, over the queues and
+//! the job notification, that devmgr's control thread waits on. devmgr spawns
 //! its drivers in batches after the IOMMU batch (at boot, the drivers bound
 //! by the boot modules' declarations; after `SET_DRIVERS_DIR`, the drivers
 //! bound by the drivers directory's declarations; after each
@@ -63,7 +65,7 @@ pub const SETTLE_TIMEOUT: Duration =
     Duration::from_secs(2 * virtio_core::pci::RESET_TIMEOUT.as_secs());
 const _: () = assert!(SETTLE_TIMEOUT.as_millis() == ipc::devmgr_labels::SETTLE_TIMEOUT_MS as u128);
 
-/// Death observers devmgr binds on each driver to its death queue
+/// Death observers devmgr binds on each driver to its death queues
 /// (`crate::spawn::spawn_bound_driver`): one on the driver's main thread and
 /// one on its address space. A fault of the main thread that is the driver's
 /// first terminal fault posts to both.
@@ -73,13 +75,13 @@ pub const OBSERVERS_PER_DRIVER: u32 = 2;
 const WS_BADGE_JOB: u64 = 1;
 /// Wait-set badge of a settling batch's private driver endpoint.
 const WS_BADGE_DRIVER: u64 = 2;
-/// Wait-set badge of the driver death queue.
+/// Wait-set badge of the driver death queues.
 const WS_BADGE_DEATH: u64 = 3;
 /// Wait-set badge of a settling batch's timer notification.
 const WS_BADGE_TIMER: u64 = 4;
-/// Wait-set member capacity: the death queue, and either the job
+/// Members of the wait set other than the death queues: either the job
 /// notification or a settling batch's private endpoint and timer.
-const WS_MEMBERS: u32 = 3;
+const WS_OTHER_MEMBERS: u32 = 2;
 
 /// What woke the control thread's wait.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,19 +89,19 @@ pub enum ControlWake
 {
     /// The job notification was signalled; its bits are taken.
     Job,
-    /// The death queue holds at least one post.
+    /// A death queue holds at least one post.
     Death,
     /// Any other wake; the loop waits again.
     Other,
 }
 
-/// devmgr's death observation for the boot: the death event queue every
-/// driver's death observer posts to, the job notification, and the wait set
-/// the control thread and the settles wait on.
+/// devmgr's death observation for the boot: the death queues every driver's
+/// death observers post to, the job notification, and the wait set over them
+/// the control thread and the settles wait on, which the queues' set owns
+/// and replaces when its queues outgrow it.
 pub struct DriverWatch
 {
-    death_eq: u64,
-    wait_set: u64,
+    deaths: death_set::DeathSet,
     job_note: u64,
     /// Whether `job_note` is a member of `wait_set`.
     jobs_open: bool,
@@ -107,52 +109,25 @@ pub struct DriverWatch
 
 impl DriverWatch
 {
-    /// Create the watch for a boot that spawns at most `drivers` drivers:
-    /// the death queue holds [`OBSERVERS_PER_DRIVER`] posts and
-    /// death-observer nodes per driver, since devmgr spawns each at most once
-    /// and binds that many observers on each, whose posts the kernel bounds
-    /// (core/kernel/docs/syscalls.md § `SYS_THREAD_BIND_NOTIFICATION` (47)
-    /// and § `SYS_ASPACE_BIND_NOTIFICATION` (53)), so no death is dropped
-    /// and every bind is funded. The queue holds at most the kernel's
-    /// `EVENT_QUEUE_MAX_CAPACITY`; past it, the bind of a driver beyond the
-    /// queue's nodes fails and that driver is withdrawn, logged. The job
-    /// notification is a member of the wait set from the start. Returns
-    /// `None`, logging why and releasing what it created, when an object
-    /// cannot be created.
+    /// Create the watch for a boot whose enumeration found `drivers` drivers
+    /// to spawn: the first death queue has [`OBSERVERS_PER_DRIVER`] nodes
+    /// and ring entries per driver, up to the kernel's
+    /// `EVENT_QUEUE_MAX_CAPACITY`, and each later queue twice the last. The
+    /// set counts its binds, so each queue takes no more observers than its
+    /// ring has entries, and every observer posts at most once
+    /// (core/kernel/docs/syscalls.md § `SYS_THREAD_BIND_NOTIFICATION` (47) and
+    /// § `SYS_ASPACE_BIND_NOTIFICATION` (53)): no death is dropped, however
+    /// many drivers devmgr spawns. The job notification is a member of the
+    /// wait set from the start. Returns `None`, logging why, when an object
+    /// cannot be created or the job notification cannot join the wait set;
+    /// the notification is then deleted, and a death set already created is
+    /// not, since `DeathSet` has no teardown and devmgr halts on `None`.
     pub fn new(drivers: usize) -> Option<Self>
     {
         let wanted = drivers.saturating_mul(OBSERVERS_PER_DRIVER as usize);
-        let capacity = u32::try_from(wanted)
+        let first = u32::try_from(wanted)
             .unwrap_or(u32::MAX)
             .clamp(1, syscall_abi::EVENT_QUEUE_MAX_CAPACITY);
-        if usize::try_from(capacity).is_ok_and(|c| c < wanted)
-        {
-            std::os::seraph::log!(
-                warn: "watch: the death observers of {} drivers past the death queue's capacity {}",
-                drivers as u64,
-                capacity
-            );
-        }
-        let eq_bytes =
-            std::os::seraph::event_queue_retype_bytes(u64::from(capacity), u64::from(capacity));
-        let Some(death_eq) = std::os::seraph::object_slab_retype(eq_bytes, |slab| {
-            syscall::event_queue_create_observed(slab, capacity, capacity).ok()
-        })
-        else
-        {
-            std::os::seraph::log!(warn: "watch: death event queue not created");
-            return None;
-        };
-        let Some(wait_set) = std::os::seraph::object_slab_retype(
-            std::os::seraph::wait_set_retype_bytes(u64::from(WS_MEMBERS)),
-            |slab| syscall::wait_set_create(slab, WS_MEMBERS).ok(),
-        )
-        else
-        {
-            std::os::seraph::log!(warn: "watch: wait set not created");
-            let _ = syscall::cap_delete(death_eq);
-            return None;
-        };
         let Some(job_note) = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,
             |slab| syscall::cap_create_notification(slab).ok(),
@@ -160,32 +135,51 @@ impl DriverWatch
         else
         {
             std::os::seraph::log!(warn: "watch: job notification not created");
-            let _ = syscall::cap_delete(wait_set);
-            let _ = syscall::cap_delete(death_eq);
             return None;
         };
-        if syscall::wait_set_add(wait_set, death_eq, WS_BADGE_DEATH).is_err()
-            || syscall::wait_set_add(wait_set, job_note, WS_BADGE_JOB).is_err()
+        let Some(deaths) =
+            death_set::DeathSet::new_counted(WS_OTHER_MEMBERS, WS_BADGE_DEATH, first)
+        else
+        {
+            std::os::seraph::log!(warn: "watch: death queue set not created");
+            let _ = syscall::cap_delete(job_note);
+            return None;
+        };
+        if deaths.add_member(job_note, WS_BADGE_JOB).is_err()
         {
             std::os::seraph::log!(warn: "watch: wait set registration failed");
             let _ = syscall::cap_delete(job_note);
-            let _ = syscall::cap_delete(wait_set);
-            let _ = syscall::cap_delete(death_eq);
             return None;
         }
         Some(Self {
-            death_eq,
-            wait_set,
+            deaths,
             job_note,
             jobs_open: true,
         })
     }
 
-    /// The death event queue a driver's death observer posts to.
-    #[must_use]
-    pub fn death_eq(&self) -> u64
+    /// Bind a death observer on a driver's main thread, `thread_cap`, with
+    /// the driver's device badge as its correlator, on the set's queues.
+    ///
+    /// # Errors
+    /// The `SYS_THREAD_BIND_NOTIFICATION` error, or the set's growth error
+    /// (`death_set::DeathSet::bind_thread`).
+    pub fn bind_thread(&self, thread_cap: u64, device_badge: u64) -> Result<(), i64>
     {
-        self.death_eq
+        self.deaths.bind_thread(thread_cap, device_badge)
+    }
+
+    /// Bind a death observer through `bind`, handed the queue to bind on,
+    /// which returns `OutOfMemory` for a queue with no free node: for the
+    /// observer on a driver's address space, which procmgr binds
+    /// (`crate::spawn`).
+    ///
+    /// # Errors
+    /// The error `bind` returns other than `OutOfMemory`, or the set's
+    /// growth error (`death_set::DeathSet::bind_with`).
+    pub fn bind_with(&self, bind: impl FnMut(u64) -> Result<(), i64>) -> Result<(), i64>
+    {
+        self.deaths.bind_with(bind)
     }
 
     /// The job notification the registry's workers signal when a request
@@ -205,7 +199,7 @@ impl DriverWatch
     {
         if !self.jobs_open
         {
-            syscall::wait_set_add(self.wait_set, self.job_note, WS_BADGE_JOB)?;
+            self.deaths.add_member(self.job_note, WS_BADGE_JOB)?;
             self.jobs_open = true;
         }
         Ok(())
@@ -219,7 +213,7 @@ impl DriverWatch
     /// Returns the wait's failure.
     pub fn wait(&self) -> Result<ControlWake, i64>
     {
-        Ok(match syscall::wait_set_wait(self.wait_set)?
+        Ok(match syscall::wait_set_wait(self.deaths.ws_cap())?
         {
             WS_BADGE_JOB =>
             {
@@ -231,16 +225,14 @@ impl DriverWatch
         })
     }
 
-    /// Take the next death post the queue holds, if any, without blocking.
+    /// Take the next death post the queues hold, if any, without blocking.
     #[must_use]
     pub fn take_death(&self) -> Option<DeathPost>
     {
-        syscall::event_try_recv_death(self.death_eq)
-            .ok()
-            .map(|d| DeathPost {
-                badge: d.correlator,
-                reason: d.exit_reason,
-            })
+        self.deaths.try_recv().map(|d| DeathPost {
+            badge: d.correlator,
+            reason: d.exit_reason,
+        })
     }
 }
 
@@ -302,12 +294,13 @@ impl SettleBatch
         let reopen = watch.jobs_open;
         if reopen
         {
-            let _ = syscall::wait_set_remove(watch.wait_set, watch.job_note);
+            let _ = watch.deaths.remove_member(watch.job_note);
             watch.jobs_open = false;
         }
-        let end = if syscall::wait_set_add(watch.wait_set, self.driver_ep, WS_BADGE_DRIVER).is_ok()
+        let deaths = &watch.deaths;
+        let end = if deaths.add_member(self.driver_ep, WS_BADGE_DRIVER).is_ok()
         {
-            let timer = Timer::arm(watch.wait_set, bound);
+            let timer = Timer::arm(deaths, bound);
             let mut events = BatchEvents {
                 batch: self,
                 watch,
@@ -317,7 +310,7 @@ impl SettleBatch
                 on_other_death,
             };
             let end = roster::settle(&mut events, roster);
-            let _ = syscall::wait_set_remove(watch.wait_set, self.driver_ep);
+            let _ = deaths.remove_member(self.driver_ep);
             drop(timer);
             end.unwrap_or_else(|e| {
                 std::os::seraph::log!(
@@ -351,23 +344,23 @@ impl Drop for SettleBatch
     }
 }
 
-/// A settle's bound: a notification in the wait set that a timer thread
-/// signals once the settle's bound has elapsed. The thread holds its own
-/// copy of the notification and deletes it after signalling, so a signal
+/// A settle's bound: a notification in the watch's wait set that a timer
+/// thread signals once the settle's bound has elapsed. The thread holds its
+/// own copy of the notification and deletes it after signalling, so a signal
 /// after the settle has ended reaches an object no wait set holds, and the
 /// thread never touches a slot devmgr may have reused.
-struct Timer
+struct Timer<'a>
 {
-    wait_set: u64,
+    deaths: &'a death_set::DeathSet,
     sig: u64,
 }
 
-impl Timer
+impl<'a> Timer<'a>
 {
-    /// Create the notification, add it to `wait_set`, and start the timer
-    /// thread. Returns `None`, logged and with what it created released,
-    /// when any step fails; the settle then has no bound.
-    fn arm(wait_set: u64, bound: Duration) -> Option<Self>
+    /// Create the notification, add it to the wait set of `deaths`, and
+    /// start the timer thread. Returns `None`, logged and with what it
+    /// created released, when any step fails; the settle then has no bound.
+    fn arm(deaths: &'a death_set::DeathSet, bound: Duration) -> Option<Self>
     {
         let Some(sig) = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,
@@ -378,7 +371,7 @@ impl Timer
             std::os::seraph::log!(warn: "settle: timer notification not created; settle unbounded");
             return None;
         };
-        if syscall::wait_set_add(wait_set, sig, WS_BADGE_TIMER).is_err()
+        if deaths.add_member(sig, WS_BADGE_TIMER).is_err()
         {
             std::os::seraph::log!(
                 warn: "settle: timer not added to the wait set; settle unbounded"
@@ -386,7 +379,7 @@ impl Timer
             let _ = syscall::cap_delete(sig);
             return None;
         }
-        let timer = Self { wait_set, sig };
+        let timer = Self { deaths, sig };
         let Ok(copy) = syscall::cap_derive(sig, syscall::RIGHTS_ALL)
         else
         {
@@ -408,11 +401,11 @@ impl Timer
     }
 }
 
-impl Drop for Timer
+impl Drop for Timer<'_>
 {
     fn drop(&mut self)
     {
-        let _ = syscall::wait_set_remove(self.wait_set, self.sig);
+        let _ = self.deaths.remove_member(self.sig);
         let _ = syscall::cap_delete(self.sig);
     }
 }
@@ -434,7 +427,7 @@ impl<T> SettleEvents<T> for BatchEvents<'_>
 
     fn wait(&mut self) -> Result<SettleWake, i64>
     {
-        Ok(match syscall::wait_set_wait(self.watch.wait_set)?
+        Ok(match syscall::wait_set_wait(self.watch.deaths.ws_cap())?
         {
             WS_BADGE_DEATH => SettleWake::Death,
             WS_BADGE_DRIVER => SettleWake::Driver,

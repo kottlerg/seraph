@@ -214,7 +214,10 @@ For each matched device, devmgr:
    mapped an interrupt file refuses the device, logged, with its caps
    released and its domain blocked. For the wired line it gives the
    device its own single-line `Interrupt` cap for its GSI (its
-   firmware-programmed IRQ line, else the arch `INTx` fallback). The first
+   firmware-programmed IRQ line, else the arch `INTx` fallback for the pin
+   and device number its interrupt reaches the root bus with, the pin
+   swizzled at each bridge between, PCI-to-PCI Bridge Architecture
+   Specification § 9.1). The first
    time any device asks for a GSI, devmgr splits the line's cap off its
    Interrupt range cap and routes the line through it (`SYS_IRQ_ROUTE`, in
    the line's mode, below); the lines below and above it stay in devmgr's
@@ -272,7 +275,7 @@ For each matched device, devmgr:
    and exits unless every range lies inside its BAR's share, no two
    overlap, and every register region lies inside a range
    (`RegisterLayout::place`).
-8. Binds two death observers to devmgr's driver death queue, with the
+8. Binds two death observers on devmgr's driver death queues, with the
    device badge as the correlator: one on the driver's main thread, and one
    procmgr binds on its address space (`BIND_DEATH_OBSERVER`); keeps the
    driver's process handle for the rest of the boot.

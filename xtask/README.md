@@ -24,6 +24,8 @@ xtask/
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
 │   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
+│   ├── error.rs                # Error type with its context chain; Context, err!, bail!, ensure!
+│   ├── fat.rs                  # FAT16/FAT32 volume writer on fatfs-parse (mkdisk)
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
@@ -43,7 +45,8 @@ xtask/
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run, run_parallel,
-│   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
+│   │                           #   ktest_timing, symbolize, mkdisk, check_disk, compose_bundle,
+│   │                           #   clean,
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
 │   │                           #   test_debug_port,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
@@ -84,7 +87,10 @@ build of a commit orders its binaries' statics as CI's does (see
 CI's ([docs/testing.md](../docs/testing.md#troubleshooting) § Troubleshooting).
 
 A riscv64 kernel build runs with `RUSTFLAGS="-Zunstable-options -Zemit-stack-sizes"`, which
-reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. After the link,
+reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. An x86-64
+kernel build and its Clippy pass run with
+`RUSTFLAGS="-Zunstable-options -Zretpoline-external-thunk"`, which sends every indirect branch of
+the kernel and its `-Z build-std` crates through the kernel's retpoline thunk. After the link,
 and before the image is installed, the build reads the image's `.stack_sizes` section and fails,
 naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MAX` (2032 bytes,
 `src/stack_sizes.rs`), the kernel frame bound of
@@ -255,8 +261,8 @@ boot that attaches the pair (`run --second-disk disk-data.img`), and every
 other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
 the data partition at `/data`, on whichever disk holds it; the data tree
 lives only on this partition, not on root. Every GUID the images carry is fixed (each
-image's disk GUID and each partition's unique GUID), so two authorings of one layout write the
-same partition tables.
+image's disk GUID and each partition's unique GUID), and so is every FAT volume's metadata, so
+two authorings of one layout from one sysroot write identical images.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
 so a dedicated partition is a disk-authoring choice — the in-tree image
 uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID Discovery.)
@@ -270,6 +276,16 @@ image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
 partition on `disk-data.img` when that image is there. The five test commands boot that layout,
 attaching `disk-data.img` as the second disk when it holds the data partition; `run` and
 `run-parallel` attach a second disk only as `--second-disk` names it.
+
+`src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
+the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
+(192 MiB) and data (256 MiB) volumes are FAT16, and a volume too large for FAT16's 65524
+clusters is FAT32. Each volume's data region starts on a cluster boundary, every timestamp is
+1980-01-01, and the volume serial number is the first four bytes of the partition's unique GUID.
+A name that is an upper-case 8.3 name is stored as that alone, and any other with a long name;
+mkdisk refuses a host name FAT cannot store (one not UTF-8, one with a reserved character or a
+trailing space or period, or two names of one directory that differ only in case).
+[`check-disk`](#cargo-xtask-check-disk) checks the volumes with an independent reader.
 
 ```
 cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
@@ -306,6 +322,24 @@ cargo xtask run --arch x86_64 --second-disk disk-data.img
 
 See [docs/testing.md](../docs/testing.md) for the test-harness gating
 contract.
+
+---
+
+### `cargo xtask check-disk`
+
+Check every FAT volume of `disk.img`, and of `disk-data.img` when it is there, with
+`fsck.fat -n` from dosfstools, a reader independent of the writer in `src/fat.rs`. Runs in CI's
+`validate` job after each cell stages its image
+([docs/build-system.md](../docs/build-system.md) § Continuous Integration).
+
+```
+cargo xtask check-disk
+```
+
+The command reads each image's GPT through vfsd's parser (`vfsd-gpt`), copies every partition
+but the raw swap partition to `target/xtask/check-disk/`, and runs `fsck.fat -n`, which
+changes nothing, on the copy. It fails on the first volume `fsck.fat` does not pass, printing
+what `fsck.fat` printed, and when `fsck.fat` is not on `PATH`, naming the package to install.
 
 ---
 
@@ -860,7 +894,10 @@ on a report line that is missing or wrong.
 Check the kernel's CET supervisor shadow stacks, x86_64 only
 ([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks). Boots the
 current sysroot headless twice under KVM with `-cpu host,cet-ss=on,enforce`: the first runs ktest
-to its pass marker and requires the kernel's `shadow stacks: on` line before it; the second, with
+to its pass marker and requires the kernel's `shadow stacks: on` line before it (a kernel that
+logs `shadow stacks: off` instead, which it does on a CPU reporting `CET_SS` without enhanced or
+Automatic IBRS, since it then takes the retpoline sequence, fails the command naming that cause);
+the second, with
 QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoint at
 `syscall::dispatch` once ktest has started, overwrites the return address at the stopped CPU's
 stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an

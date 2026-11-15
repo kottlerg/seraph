@@ -18,7 +18,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use clap::ValueEnum;
 
 use crate::accel::{self, Accel};

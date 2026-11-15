@@ -14,7 +14,7 @@
 use std::io::{Read, Write, copy};
 use std::process::{Command, ExitStatus, Stdio};
 
-use anyhow::{Context as _, Result};
+use crate::error::{Context as _, Result};
 
 use crate::arch::Arch;
 use crate::cli::RunArgs;

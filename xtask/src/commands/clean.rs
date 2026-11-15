@@ -8,7 +8,7 @@
 
 use std::process::Command;
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::cli::CleanArgs;
 use crate::context::Context as BuildContext;
@@ -21,7 +21,7 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
     {
         step(&format!("Removing sysroot: {}", ctx.sysroot.display()));
         std::fs::remove_dir_all(&ctx.sysroot)
-            .map_err(|e| anyhow::anyhow!("failed to remove {}: {}", ctx.sysroot.display(), e))?;
+            .map_err(|e| crate::error::err!("failed to remove {}: {}", ctx.sysroot.display(), e))?;
     }
     else
     {
@@ -33,8 +33,9 @@ pub fn run(ctx: &BuildContext, args: &CleanArgs) -> Result<()>
         if disk_img.exists()
         {
             step(&format!("Removing disk image: {}", disk_img.display()));
-            std::fs::remove_file(&disk_img)
-                .map_err(|e| anyhow::anyhow!("failed to remove {}: {}", disk_img.display(), e))?;
+            std::fs::remove_file(&disk_img).map_err(|e| {
+                crate::error::err!("failed to remove {}: {}", disk_img.display(), e)
+            })?;
         }
     }
 

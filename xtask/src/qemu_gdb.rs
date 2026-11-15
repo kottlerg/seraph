@@ -18,7 +18,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use gdb_rsp::PACKET_SIZE;
 use gdb_rsp::frame::{Event, PacketReader, PacketWriter};
 
@@ -104,7 +104,7 @@ pub fn le_u64(hex: &[u8]) -> Result<u64>
     let array: [u8; 8] = bytes
         .as_slice()
         .try_into()
-        .map_err(|_| anyhow::anyhow!("a {}-byte value, not 8", bytes.len()))?;
+        .map_err(|_| crate::error::err!("a {}-byte value, not 8", bytes.len()))?;
     Ok(u64::from_le_bytes(array))
 }
 
@@ -151,7 +151,7 @@ impl Stub
         w.bytes(body);
         let len = w
             .finish()
-            .map_err(|e| anyhow::anyhow!("packet past the buffer: {e:?}"))?;
+            .map_err(|e| crate::error::err!("packet past the buffer: {e:?}"))?;
         let packet = buf.get(..len).context("packet length past the buffer")?;
         let what = String::from_utf8_lossy(body).into_owned();
         self.stream

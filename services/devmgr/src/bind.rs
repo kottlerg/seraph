@@ -32,6 +32,7 @@ use firmware::binding::{
 use firmware::dma::Confinement;
 use firmware::lines::{HoldError, LineError};
 use firmware::pci::{BarSpan, InterruptPlan, MessagesRefused, Msi, Msix};
+use firmware::pci_records::{PciRecords, RecordState};
 use firmware::records::{PlatformRecord, PlatformRecords};
 use firmware::resource::{CarveError, Span, SplitError};
 use firmware::roster::Roster;
@@ -46,109 +47,78 @@ use crate::{
 
 // ── Records ─────────────────────────────────────────────────────────────────
 
-/// The PCI functions the ECAM walk found, in record order (segment, bus,
-/// device, function), and which of them a driver has been started for.
-pub struct PciRecords
-{
-    devices: Vec<pci::PciDevice>,
-    bound: Vec<bool>,
-}
-
-impl PciRecords
-{
-    /// The records of `devices`, sorted into record order, none bound;
-    /// `None` when the bound flags cannot be allocated.
-    pub fn new(mut devices: Vec<pci::PciDevice>) -> Option<Self>
-    {
-        devices.sort_unstable_by_key(|d| (d.segment, d.bus, d.dev, d.func));
-        let mut bound = Vec::new();
-        bound.try_reserve_exact(devices.len()).ok()?;
-        bound.resize(devices.len(), false);
-        Some(Self { devices, bound })
-    }
-
-    /// Every record, in record order.
-    pub fn devices(&self) -> &[pci::PciDevice]
-    {
-        &self.devices
-    }
-
-    /// Whether `decl`, from `source`, matches a record no driver is bound
-    /// to.
-    fn matches_unbound(&self, decl: &DriverDecl, source: Source) -> bool
-    {
-        self.devices.iter().zip(&self.bound).any(|(d, &bound)| {
-            !bound && firmware::binding::decl_rank(decl, source, &keys(d)).is_some()
-        })
-    }
-}
-
-/// Every device record a bind pass walks, in record order: the PCI records,
-/// then the platform records ([`crate::platform`]), which of them a driver
-/// has been started for, and how many devices each driver with an instance
-/// limit has been started for over the boot.
+/// Every device record a bind pass walks, in record order: the PCI records
+/// ([`PciRecords`]), then the platform records ([`crate::platform`]), each
+/// with its state, and how many devices each driver with an instance limit
+/// has been started for over the boot.
 pub struct Records
 {
     pub pci: PciRecords,
     platform: PlatformRecords,
-    platform_bound: Vec<bool>,
+    /// The state of each platform record, in the same order.
+    platform_states: Vec<RecordState>,
     bound_counts: BoundCounts,
 }
 
 impl Records
 {
-    /// The PCI and platform records, none bound; `None` when the bound flags
-    /// cannot be allocated.
+    /// The PCI and platform records, none bound; `None` when the platform
+    /// records' states cannot be allocated.
     pub fn new(pci: PciRecords, platform: PlatformRecords) -> Option<Self>
     {
-        let mut platform_bound = Vec::new();
-        platform_bound
+        let mut platform_states = Vec::new();
+        platform_states
             .try_reserve_exact(platform.records().len())
             .ok()?;
-        platform_bound.resize(platform.records().len(), false);
+        platform_states.resize(platform.records().len(), RecordState::Unbound);
         Some(Self {
             pci,
             platform,
-            platform_bound,
+            platform_states,
             bound_counts: BoundCounts::new(),
         })
     }
 
-    /// The number of records, PCI and platform: the most drivers the bind
-    /// passes can start, each record being bound at most once.
+    /// The number of records, PCI and platform, removed ones included: the
+    /// most drivers the bind passes can start over them, each record being
+    /// bound at most once.
     pub fn count(&self) -> usize
     {
         self.pci
-            .devices
+            .devices()
             .len()
-            .saturating_add(self.platform_bound.len())
+            .saturating_add(self.platform_states.len())
     }
 
-    /// Whether `decl`, from `source`, matches a record no driver is bound
-    /// to.
+    /// The platform records a pass may bind, with their indices.
+    fn unbound_platform(&self) -> impl Iterator<Item = (usize, &PlatformRecord)>
+    {
+        self.platform
+            .records()
+            .iter()
+            .zip(&self.platform_states)
+            .enumerate()
+            .filter(|(_, (_, state))| **state == RecordState::Unbound)
+            .map(|(index, (record, _))| (index, record))
+    }
+
+    /// Whether `decl`, from `source`, matches a record a pass may bind.
     fn matches_unbound(&self, decl: &DriverDecl, source: Source) -> bool
     {
-        self.pci.matches_unbound(decl, source)
-            || self
-                .platform
-                .records()
-                .iter()
-                .zip(&self.platform_bound)
-                .any(|(r, &bound)| {
-                    !bound
-                        && r.with_keys(|k| firmware::binding::decl_rank(decl, source, k))
-                            .is_some()
-                })
+        self.pci
+            .unbound()
+            .any(|(_, d)| firmware::binding::decl_rank(decl, source, &keys(d)).is_some())
+            || self.unbound_platform().any(|(_, r)| {
+                r.with_keys(|k| firmware::binding::decl_rank(decl, source, k))
+                    .is_some()
+            })
     }
 
-    /// Whether every record has a driver.
-    fn all_bound(&self) -> bool
+    /// Whether no record is left for a pass to bind: each has a driver or is
+    /// removed.
+    fn none_unbound(&self) -> bool
     {
-        self.pci
-            .bound
-            .iter()
-            .chain(&self.platform_bound)
-            .all(|&b| b)
+        self.pci.unbound().next().is_none() && self.unbound_platform().next().is_none()
     }
 }
 
@@ -172,7 +142,8 @@ fn keys(pci_dev: &pci::PciDevice) -> RecordKeys<'static>
 pub struct Pass<'a>
 {
     pub batch: &'a settle::SettleBatch,
-    pub death_eq: u64,
+    /// The watch the pass's drivers' death observers are bound on.
+    pub watch: &'a settle::DriverWatch,
     pub roster: &'a mut Roster<SpawnedDriver>,
 }
 
@@ -230,7 +201,7 @@ pub fn drivers_dir_pass(
     ipc_buf: *mut u64,
 )
 {
-    if records.all_bound()
+    if records.none_unbound()
     {
         return;
     }
@@ -327,16 +298,17 @@ fn bind_records(
         pass,
         ipc_buf,
     );
-    let platform = records.platform.records();
-    for (index, (record, bound)) in platform
-        .iter()
-        .zip(records.platform_bound.iter_mut())
-        .enumerate()
+    for (index, state) in records.platform_states.iter_mut().enumerate()
     {
-        if *bound
+        let Some(record) = records
+            .platform
+            .records()
+            .get(index)
+            .filter(|_| *state == RecordState::Unbound)
+        else
         {
             continue;
-        }
+        };
         match record.with_keys(|k| table.choose(k))
         {
             Choice::Unmatched =>
@@ -363,7 +335,7 @@ fn bind_records(
                 };
                 if bind_platform(index, record, candidate, carve, pass, ipc_buf)
                 {
-                    *bound = true;
+                    *state = RecordState::Bound;
                     table.note_bound(chosen);
                     if let Some(candidate) = table.candidates().get(chosen)
                     {
@@ -385,12 +357,13 @@ fn bind_pci_records(
     ipc_buf: *mut u64,
 )
 {
-    for (pci_dev, bound) in records.devices.iter().zip(records.bound.iter_mut())
+    for at in 0..records.devices().len()
     {
-        if *bound
+        let Some(pci_dev) = records.unbound_at(at)
+        else
         {
             continue;
-        }
+        };
         match table.choose(&keys(pci_dev))
         {
             Choice::Unmatched =>
@@ -420,7 +393,7 @@ fn bind_pci_records(
                 };
                 if bind_pci(pci_dev, candidate, carve, pass, ipc_buf)
                 {
-                    *bound = true;
+                    records.mark_bound(at);
                     table.note_bound(index);
                     if let Some(candidate) = table.candidates().get(index)
                     {
@@ -509,7 +482,7 @@ fn bind_platform(
         phys_access: grants.phys_access,
         service_ep,
         query_ep: pass.batch.driver_ep(),
-        death_eq: pass.death_eq,
+        watch: pass.watch,
         watch_eq: None,
         device_badge: dev_caps.device_badge,
         priority: spawn::tier_priority(grants.tier),
@@ -863,7 +836,7 @@ fn bind_pci(
         phys_access: grants.phys_access,
         service_ep,
         query_ep: pass.batch.driver_ep(),
-        death_eq: pass.death_eq,
+        watch: pass.watch,
         watch_eq: None,
         // Index-derived, not random like the cross-boundary service badges
         // (#249): it names the device's catalog slot, which the driver
@@ -1666,14 +1639,16 @@ fn acquire_single_irq_cap(
 
 /// The GSI of a PCI device: the firmware-programmed config-space IRQ line
 /// when one is set, else the arch `INTx` routing fallback
-/// ([`arch::current::intx_fallback_gsi`]).
+/// ([`arch::current::intx_fallback_gsi`]) of the pin and device number its
+/// interrupt reaches its root bus with (`PciDevice::host_intx`).
 fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
 {
     if pci_dev.irq_line != 0 && pci_dev.irq_line != 0xFF
     {
         return Some(u32::from(pci_dev.irq_line));
     }
-    arch::current::intx_fallback_gsi(pci_dev.irq_pin, pci_dev.dev)
+    let (pin, dev) = pci_dev.host_intx?;
+    arch::current::intx_fallback_gsi(pin, dev)
 }
 
 /// Carve the `Mmio` cap of `pci_dev`'s configuration page out of the kept

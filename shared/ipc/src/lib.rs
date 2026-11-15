@@ -1337,7 +1337,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 11;
+pub const SVCMGR_LABELS_VERSION: u32 = 12;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -1410,8 +1410,8 @@ pub mod svcmgr_labels
     // caps it needs for its publish role (`rootfs.root` SEND,
     // devmgr-registry `SEND|GRANT` source, `vfsd.mount`, `vfsd.deny`, and
     // `vfsd.swap` SENDs) and `SVCMGR_LABELS_VERSION` in
-    // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap)`
-    // pair svcmgr parks in its pending-registration table; a final
+    // `data[1]`; each `SUBSTRATE` round carries one `(name, thread_cap, observer)`
+    // triple svcmgr parks in its pending-registration table; a final
     // `LOGD_SOURCES` round carries the master-log and procmgr death-auth
     // sources svcmgr launches logd with. On `HANDOVER_COMPLETE` svcmgr
     // reconciles every parked name against `/config/svcmgr/services/`:
@@ -1503,9 +1503,9 @@ pub mod svcmgr_labels
     /// [`PUBLISH_ENDPOINT`] by an *external* publisher (no per-publisher
     /// identity in the low bits today — server-side auth is binary: have
     /// the bit, or don't). svcmgr publishes the well-known names it owns
-    /// (`rootfs.root`, `svcmgr`, the four `devmgr.*` names, the two
-    /// `vfsd.*` names, and each provider's `provides` names) directly into
-    /// its own registry, so those
+    /// (those listed in `services/svcmgr/docs/ipc-interface.md` § Handover
+    /// endowment, each device class's `devmgr.class.<stem>` name, and each
+    /// provider's `provides` names) directly into its own registry, so those
     /// need no badge. The gate exists for a future external publisher — devmgr
     /// holds a `PUBLISH_AUTHORITY`-badged SEND from its bootstrap bundle,
     /// reserved for driver registrations.
@@ -2609,6 +2609,34 @@ pub mod test_fault_labels
     /// How long the fixture waits between its `FAULT_EXIT` reply and its
     /// exit, so the caller's next call is queued before the fixture dies.
     pub const FAULT_EXIT_DELAY_MS: u64 = 200;
+}
+
+/// The service labels of the `crasher` fixture's `worker-fault` role
+/// (services/crasher/README.md), through which svctest checks that svcmgr
+/// restarts a supervised service whose worker thread faults.
+///
+/// The fixture serves them on the endpoint of the name its recipe provides,
+/// [`NAME`]. Every request carries no data; no badge bit is checked.
+pub mod restart_probe_labels
+{
+    /// The name the fixture's recipe provides
+    /// (`rootfs/config/svcmgr/tests/crasher-worker.svc`).
+    pub const NAME: &[u8] = b"crasher.worker";
+    /// Reply `SUCCESS` with data word 0 the instance's nonce: a random value
+    /// the process draws once at startup, so a caller tells two instances
+    /// apart.
+    pub const PROBE_INSTANCE: u64 = 1;
+    /// Reply `SUCCESS`, then receive nothing more and start a thread that
+    /// takes a terminal fault after [`FAULT_DELAY_MS`] while the main thread
+    /// lives on.
+    pub const PROBE_FAULT_WORKER: u64 = 2;
+    /// How long the fixture's worker thread waits before it faults, so the
+    /// caller's next call is queued before the fixture dies.
+    pub const FAULT_DELAY_MS: u64 = 200;
+    /// The reply label of a handled request.
+    pub const SUCCESS: u64 = 0;
+    /// The reply label of a request with an unknown label.
+    pub const UNKNOWN_OPCODE: u64 = 1;
 }
 
 /// The `test-dma` fixture driver's service label

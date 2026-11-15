@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use regex::Regex;
 
 /// Version of the baseline file format `write_baseline` emits and

@@ -14,8 +14,14 @@
 //! node, a further queue with twice the last pool. A further queue is one
 //! contiguous grant, so a refused one is retried at half the pool, down to
 //! the first pool's size. A service's queues are members of its main wait
-//! set, beside its service endpoint; when the queues fill it, the set is
-//! replaced by one with twice the members, up to `WAIT_SET_MAX_MEMBERS`. A
+//! set, beside its service endpoint, or beside as many other members as its
+//! user reserves room for ([`DeathQueues::with_members`]); when the queues
+//! fill it, the set is replaced by one with twice the members, up to
+//! `WAIT_SET_MAX_MEMBERS`. A user that may not lose a death post counts its
+//! binds ([`DeathQueues::counting_binds`]): each queue then takes at most as
+//! many binds as its pool holds, and its user sizes the queue's ring to that
+//! pool, so the ring has an entry for every post the queue can receive over
+//! its life, each observer posting at most once. A
 //! user with no wait set (ruststd's thread reaper) creates the set with
 //! `WAIT_SET_MAX_MEMBERS` members and a `grow_ws` that is never reached
 //! below that many queues. The syscalls themselves (the bind, the create
@@ -34,7 +40,9 @@ use alloc::vec::Vec;
 use syscall_abi::{EVENT_QUEUE_MAX_CAPACITY, SyscallError, WAIT_SET_MAX_MEMBERS};
 
 /// Members of a service's first main wait set: its service endpoint and the
-/// first death queue. Each replacement doubles it.
+/// first death queue. Each replacement doubles it. A set that reserves room
+/// for other members (`DeathQueues::with_members`) starts at those and the
+/// first queue instead.
 pub const FIRST_WAIT_SET_MEMBERS: u32 = 2;
 
 /// The error a bind or a create returns when no node or no memory is left.
@@ -46,6 +54,14 @@ pub struct DeathQueues
 {
     /// Queue caps, oldest first.
     queues: Vec<u64>,
+    /// The binds each queue of `queues` can still take, in the same order,
+    /// while binds are counted ([`Self::counting_binds`]); empty otherwise.
+    budgets: Vec<u32>,
+    /// Whether each queue takes at most as many binds as its pool holds.
+    counted: bool,
+    /// Members of the main wait set other than the queues: the service
+    /// endpoint, or what the user reserves room for.
+    reserved: u32,
     /// Observer nodes in the first queue: the smallest pool a refused grant
     /// falls back to.
     first_observers: u32,
@@ -59,16 +75,41 @@ pub struct DeathQueues
 impl DeathQueues
 {
     /// An empty set whose first queue will hold `first_observers` nodes,
-    /// in a wait set with room for `ws_members` members.
+    /// in a wait set with room for `ws_members` members, one of them the
+    /// service endpoint.
     #[must_use]
     pub const fn new(first_observers: u32, ws_members: u32) -> Self
     {
+        Self::with_members(first_observers, ws_members, 1)
+    }
+
+    /// An empty set as [`Self::new`] makes, whose wait set holds
+    /// `reserved` members other than the queues in place of the service
+    /// endpoint.
+    #[must_use]
+    pub const fn with_members(first_observers: u32, ws_members: u32, reserved: u32) -> Self
+    {
         Self {
             queues: Vec::new(),
+            budgets: Vec::new(),
+            counted: false,
+            reserved,
             first_observers,
             next_observers: first_observers,
             ws_members,
         }
+    }
+
+    /// The set with its binds counted: each queue takes at most as many
+    /// binds as the pool it was created with holds, a queue that has taken
+    /// them all being passed over as one out of nodes is. The user creates
+    /// each queue with a ring of as many entries as its pool, so no post to
+    /// it is ever dropped.
+    #[must_use]
+    pub const fn counting_binds(mut self) -> Self
+    {
+        self.counted = true;
+        self
     }
 
     /// The queue caps, oldest first.
@@ -107,10 +148,10 @@ impl DeathQueues
         C: FnMut(u32) -> Result<u64, i64>,
         W: FnOnce(&[u64], u32) -> Result<(), i64>,
     {
-        // The service endpoint holds one member.
+        // The service endpoint, or the reserved members, hold the rest.
         let members_used = u32::try_from(self.queues.len())
             .map_err(|_| OUT_OF_MEMORY)?
-            .saturating_add(1);
+            .saturating_add(self.reserved);
         if members_used >= self.ws_members
         {
             let wider = self.ws_members.saturating_mul(2).min(WAIT_SET_MAX_MEMBERS);
@@ -122,6 +163,10 @@ impl DeathQueues
             self.ws_members = wider;
         }
         self.queues.try_reserve(1).map_err(|_| OUT_OF_MEMORY)?;
+        if self.counted
+        {
+            self.budgets.try_reserve(1).map_err(|_| OUT_OF_MEMORY)?;
+        }
         let mut observers = self.next_observers;
         loop
         {
@@ -130,6 +175,10 @@ impl DeathQueues
                 Ok(queue) =>
                 {
                     self.queues.push(queue);
+                    if self.counted
+                    {
+                        self.budgets.push(observers);
+                    }
                     self.next_observers = observers.saturating_mul(2).min(EVENT_QUEUE_MAX_CAPACITY);
                     return Ok(queue);
                 }
@@ -145,10 +194,12 @@ impl DeathQueues
     /// Bind one observer through `bind`, which is handed a queue cap.
     ///
     /// The queues are tried newest first; a refusal for want of a node
-    /// (`OutOfMemory`) moves to the next older one. When every queue refuses
-    /// so, one further queue is created ([`Self::grow`], through `create`
-    /// and `grow_ws`) and the bind is tried on it once, its result returned
-    /// as it is.
+    /// (`OutOfMemory`) moves to the next older one, and so, while binds are
+    /// counted, does a queue that has taken as many binds as its pool holds,
+    /// without `bind` being called on it. When every queue refuses so, one
+    /// further queue is created ([`Self::grow`], through `create` and
+    /// `grow_ws`) and the bind is tried on it once, its result returned as it
+    /// is. A counted queue's bind that succeeds is counted against it.
     ///
     /// # Errors
     /// The first error `bind` returns other than `OutOfMemory`, at once and
@@ -160,17 +211,43 @@ impl DeathQueues
         C: FnMut(u32) -> Result<u64, i64>,
         W: FnOnce(&[u64], u32) -> Result<(), i64>,
     {
-        for &queue in self.queues.iter().rev()
+        for (index, &queue) in self.queues.iter().enumerate().rev()
         {
+            if self.counted && self.budgets.get(index).is_none_or(|&left| left == 0)
+            {
+                continue;
+            }
             match bind(queue)
             {
                 Err(OUT_OF_MEMORY) =>
                 {}
-                result => return result,
+                result =>
+                {
+                    if result.is_ok()
+                    {
+                        self.count_bind(index);
+                    }
+                    return result;
+                }
             }
         }
         let queue = self.grow(create, grow_ws)?;
-        bind(queue)
+        let result = bind(queue);
+        if result.is_ok()
+        {
+            self.count_bind(self.queues.len().saturating_sub(1));
+        }
+        result
+    }
+
+    /// Count one bind against the queue at `index`, while binds are
+    /// counted.
+    fn count_bind(&mut self, index: usize)
+    {
+        if let Some(left) = self.budgets.get_mut(index)
+        {
+            *left = left.saturating_sub(1);
+        }
     }
 }
 
@@ -440,6 +517,101 @@ mod tests
             set.grow(|_| panic!("no room for another queue"), no_ws),
             Err(OUT_OF_MEMORY)
         );
+    }
+
+    #[test]
+    fn reserved_members_widen_the_wait_set_sooner()
+    {
+        // Room for two reserved members and one queue.
+        let mut set = DeathQueues::with_members(4, 3, 2);
+        assert_eq!(set.grow(|_| Ok(1), no_ws), Ok(1));
+        let mut widened = None;
+        let result = set.grow(
+            |_| Ok(2),
+            |queues, members| {
+                assert_eq!(queues, [1]);
+                widened = Some(members);
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(2));
+        assert_eq!(widened, Some(6));
+        // Two reserved and two queues: room for two more queues.
+        assert_eq!(set.grow(|_| Ok(3), no_ws), Ok(3));
+        assert_eq!(set.grow(|_| Ok(4), no_ws), Ok(4));
+        assert_eq!(set.ws_members(), 6);
+    }
+
+    #[test]
+    fn a_counted_queue_takes_as_many_binds_as_its_pool_and_no_more()
+    {
+        let mut set = DeathQueues::new(2, 64).counting_binds();
+        let mut tried = Vec::new();
+        let mut funded = Vec::new();
+        for _ in 0..5
+        {
+            let result = set.bind(
+                |q| {
+                    tried.push(q);
+                    Ok(())
+                },
+                |observers| {
+                    funded.push(observers);
+                    Ok(u64::from(observers))
+                },
+                no_ws,
+            );
+            assert_eq!(result, Ok(()));
+        }
+        // The first queue (2 nodes) takes two binds, the second (4 nodes) the
+        // next three, and the spent first queue is never offered again, though
+        // its binds never refused for want of a node.
+        assert_eq!(funded, [2, 4]);
+        assert_eq!(tried, [2, 2, 4, 4, 4]);
+        assert_eq!(set.queues(), [2, 4]);
+    }
+
+    #[test]
+    fn a_counted_bind_that_fails_takes_nothing_from_the_queue()
+    {
+        let mut set = DeathQueues::new(1, 64).counting_binds();
+        assert_eq!(set.grow(|_| Ok(10), no_ws), Ok(10));
+        let result = set.bind(
+            |_| Err(INVALID),
+            |_| panic!("a non-OutOfMemory refusal must not grow the set"),
+            no_ws,
+        );
+        assert_eq!(result, Err(INVALID));
+        // The queue's one bind is still there to take.
+        let mut tried = Vec::new();
+        let result = set.bind(
+            |q| {
+                tried.push(q);
+                Ok(())
+            },
+            |_| panic!("the queue had a bind left; nothing to create"),
+            no_ws,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(tried, [10]);
+    }
+
+    #[test]
+    fn a_counted_queue_out_of_nodes_moves_on_as_an_uncounted_one_does()
+    {
+        let mut set = DeathQueues::new(4, 64).counting_binds();
+        assert_eq!(set.grow(|_| Ok(10), no_ws), Ok(10));
+        let mut tried = Vec::new();
+        let result = set.bind(
+            |q| {
+                tried.push(q);
+                if q == 10 { Err(OUT_OF_MEMORY) } else { Ok(()) }
+            },
+            |_| Ok(20),
+            no_ws,
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(tried, [10, 20]);
     }
 
     #[test]

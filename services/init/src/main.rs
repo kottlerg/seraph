@@ -892,8 +892,14 @@ fn run(info_ptr: u64) -> !
     // ── Request procmgr to create early services ──────────────────────────────
 
     let mut thread_caps = service::ServiceThreadCaps {
-        memmgr: mm.mm_thread,
-        procmgr: pm.thread,
+        memmgr: service::SubstrateCaps {
+            thread: mm.mm_thread,
+            observer: service::Observer::AddressSpace(mm.mm_aspace),
+        },
+        procmgr: service::SubstrateCaps {
+            thread: pm.thread,
+            observer: service::Observer::AddressSpace(pm.aspace),
+        },
         ..service::ServiceThreadCaps::default()
     };
 
@@ -909,7 +915,7 @@ fn run(info_ptr: u64) -> !
             &spawn_env,
             ipc_buf,
         )
-        .unwrap_or(0);
+        .unwrap_or_default();
     }
     else
     {
@@ -930,7 +936,7 @@ fn run(info_ptr: u64) -> !
             &spawn_env,
             ipc_buf,
         )
-        .unwrap_or(0);
+        .unwrap_or_default();
     }
     else
     {

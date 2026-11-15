@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 
 // ── Step printing ─────────────────────────────────────────────────────────────
 
@@ -86,7 +86,7 @@ pub fn require_tool(name: &str) -> Result<PathBuf>
         std::env::consts::EXE_EXTENSION,
     )
     .ok_or_else(|| {
-        anyhow::anyhow!(
+        crate::error::err!(
             "{name} not found on PATH\n{hint}",
             hint = install_hint_for(name),
         )
@@ -177,6 +177,14 @@ fn install_hint_for(name: &str) -> String
             compiler against its C library. Install with:\n  \
             Debian / Ubuntu:  apt install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross\n  \
             Arch:             pacman -S qemu-user riscv64-linux-gnu-gcc riscv64-linux-gnu-glibc"
+            .into(),
+        "fsck.fat" => "`cargo xtask check-disk` checks the disk images' FAT volumes with \
+            dosfstools' fsck.fat. Install with:\n  \
+            Fedora:           dnf install dosfstools\n  \
+            Debian / Ubuntu:  apt install dosfstools\n  \
+            Arch:             pacman -S dosfstools\n  \
+            macOS (Homebrew): brew install dosfstools\n  \
+            FreeBSD:          pkg install dosfstools"
             .into(),
         "cargo" | "rustc" => "Install rustup (https://rustup.rs/); xtask requires the toolchain \
              pinned in rust-toolchain.toml. This usually means xtask itself was invoked \

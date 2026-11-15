@@ -106,13 +106,11 @@ fn main() -> !
     // of kind FRAMEBUFFER; every other entry carries no startup info.
     let mut catalog = DeviceCatalog::default();
 
-    // Every driver this boot can spawn, each at most once: one per device
-    // record (a record is bound at most once, by whichever pass binds it) and
-    // the IOMMU driver. The watch's death queue is sized to both death
-    // observers of each, whose posts the kernel bounds
-    // (core/kernel/docs/syscalls.md § SYS_THREAD_BIND_NOTIFICATION (47) and
-    // § SYS_ASPACE_BIND_NOTIFICATION (53)), so every observer is funded and
-    // no death is dropped.
+    // The drivers the boot's records can be given: one per device record (a
+    // record is bound at most once, by whichever pass binds it) and the IOMMU
+    // driver. The watch's first death queue is sized to both death observers
+    // of each; a driver past them, as a record appended later gets, binds on
+    // a further queue (settle::DriverWatch::new).
     let driver_count = records.count().saturating_add(IOMMU_DRIVERS);
     let Some(mut watch) = settle::DriverWatch::new(driver_count)
     else
@@ -255,8 +253,8 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     // order.
     let modules = decls::classify_modules(caps);
     let platform_records = platform::enumerate(caps, &modules.tables);
-    let records =
-        bind::PciRecords::new(devices).and_then(|pci| bind::Records::new(pci, platform_records));
+    let records = firmware::pci_records::PciRecords::new(devices)
+        .and_then(|pci| bind::Records::new(pci, platform_records));
     let Some(records) = records
     else
     {
@@ -2102,7 +2100,6 @@ fn spawn_boot_drivers(
         return;
     };
     let mut roster = Roster::new();
-    let death_eq = watch.death_eq();
     bind::boot_pass(
         records,
         modules,
@@ -2113,7 +2110,7 @@ fn spawn_boot_drivers(
         },
         &mut bind::Pass {
             batch: &batch,
-            death_eq,
+            watch,
             roster: &mut roster,
         },
         ipc_buf,
@@ -2163,7 +2160,6 @@ fn spawn_dir_drivers(
         return;
     };
     let mut roster = Roster::new();
-    let death_eq = watch.death_eq();
     bind::drivers_dir_pass(
         records,
         dir_cap,
@@ -2171,7 +2167,7 @@ fn spawn_dir_drivers(
         carve,
         &mut bind::Pass {
             batch: &batch,
-            death_eq,
+            watch,
             roster: &mut roster,
         },
         ipc_buf,

@@ -13,20 +13,18 @@
 //! `HANDOVER_AUTHORITY`-badged SEND and exits. svcmgr runs for the lifetime
 //! of the system.
 //!
-//! Every supervised service binds death notification onto svcmgr's death
-//! queues with `correlator = service_index`; a further queue joins when
+//! Every supervised service has two death observers on svcmgr's death queues:
+//! one on its main thread and one on its address space, which a terminal
+//! fault of any of its threads posts. Both post the service's `DeathTag`, its
+//! table slot and instance, as the correlator; a further queue joins when
 //! every pool is out of nodes. The main wait set, which `death_set::DeathSet`
 //! owns and widens as the queues fill it, holds the service endpoint (badge
 //! 0) and every death queue (badge 1). On death wakeup svcmgr drains the
-//! queues and routes each payload to its `ServiceEntry` via the correlator.
+//! queues and routes each payload to its `ServiceEntry` via the tag, dropping
+//! a post of an instance already routed.
 //! Multiplexing avoids consuming a wait-set slot per supervised process.
 //!
 //! See `svcmgr/docs/ipc-interface.md` and `svcmgr/docs/restart-protocol.md`.
-
-#![expect(
-    clippy::cast_possible_truncation,
-    reason = "targets 64-bit only; u64/usize conversions lossless"
-)]
 
 mod arch;
 mod classes;
@@ -40,6 +38,7 @@ use ipc::{IpcMessage, svcmgr_labels};
 use registry::{Resolver, Visibility};
 use service::bootstrap_caps;
 use std::os::seraph::{StartupInfo, startup_info};
+use svcmgr_defs::DeathTag;
 
 /// Monotonic time since the first call, in nanoseconds, for the windowed
 /// restart budget. Saturates rather than wraps.
@@ -530,6 +529,9 @@ fn dispatch_ipc(
                 "monitoring {} service(s) after reconciliation",
                 state.table.services.len()
             );
+            // A devmgr that died before its bind is recorded with the caps
+            // init endowed; route its death now.
+            resync_deaths(state, ctx);
         }
         svcmgr_labels::PUBLISH_ENDPOINT =>
         {
@@ -684,9 +686,9 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 }
 
 /// Drain all pending death notifications from every death queue. Each
-/// death event carries the dying service's table index as its correlator
-/// (set at `thread_bind_notification` time) and the exit reason. The wait-set notifies once per
-/// not-empty → empty transition, so a single wakeup may cover several
+/// death event carries the dying service's [`DeathTag`] (its table slot and
+/// instance) as its correlator and the exit reason. The wait-set notifies once
+/// per not-empty → empty transition, so a single wakeup may cover several
 /// deaths; the try-recv loop runs until every queue empties.
 ///
 /// A drain that takes [`death_queues::DEATHS_EQ_CAPACITY`] events or more
@@ -696,7 +698,12 @@ fn handle_query_endpoint(msg: &IpcMessage, registry: &mut registry::Registry, ip
 fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
     let full = ctx.deaths.drain(|death| {
-        route_death(death.correlator, death.exit_reason, state, ctx);
+        route_death(
+            DeathTag::from_correlator(death.correlator),
+            death.exit_reason,
+            state,
+            ctx,
+        );
     });
     if full
     {
@@ -705,39 +712,25 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
     }
 }
 
-/// Route one death to its `ServiceEntry` by correlator (the table index) and
-/// run the restart decision for an active entry.
-fn route_death(
-    correlator: u64,
-    exit_reason: u64,
-    state: &mut SvcmgrState,
-    ctx: &restart::RestartCtx,
-)
+/// Route one death to its `ServiceEntry` by its tag's slot and run the
+/// restart decision, when the entry is active and the tag names its current
+/// instance (`svcmgr_defs::death_tag::routes`). Each instance's observers
+/// post under its own instance, so a post of an instance already routed (the
+/// second of the two posts a main-thread fault that is the address space's
+/// first terminal fault makes, or a post a resync overtook) is dropped.
+fn route_death(tag: DeathTag, exit_reason: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
-    let Some((idx, svc)) = usize::try_from(correlator)
-        .ok()
-        .and_then(|idx| state.table.services.get(idx).map(|svc| (idx, svc)))
+    let idx = tag.index();
+    let Some(svc) = state.table.services.get(idx)
     else
     {
         std::os::seraph::log!(warn: "death notification with unknown correlator");
         return;
     };
-    if !svc.active
+    if !svcmgr_defs::death_tag::routes(tag, svc.active, svc.instance)
     {
         return;
     }
-    // A slot's correlator outlives its instances, so a post can arrive for
-    // an instance [`resync_deaths`] already routed and restarted. The kernel
-    // reports the current instance's thread state: a live thread means the
-    // post is the dead instance's, already handled; an exited one is routed
-    // with the reason the kernel recorded for it, not the post's, which may
-    // be the earlier instance's.
-    let exit_reason = match syscall::cap_info(svc.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
-    {
-        Ok(packed) if (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED => return,
-        Ok(packed) => packed & 0xFFFF_FFFF,
-        Err(_) => exit_reason,
-    };
 
     // Split disjoint field borrows so handle_death gets the entry, its
     // restart recipe, and the registry (for seed re-resolution) at once.
@@ -753,7 +746,7 @@ fn route_death(
         entry,
         exit_reason,
         ctx,
-        correlator,
+        tag,
         table.recipes.get(idx).and_then(Option::as_ref),
         registry,
     );
@@ -763,15 +756,61 @@ fn route_death(
     }
 }
 
-/// Route a death for every active service whose thread the kernel reports
-/// exited (`CAP_INFO_THREAD_STATE`): the recovery for death posts a full
-/// queue dropped. The kernel records the state before it posts, so a service
-/// whose post was lost is found here; a restart rebinds the new instance,
-/// whose own death posts to the queue this drain has emptied. A post for a
-/// service routed here that does arrive later is the dead instance's, and
-/// [`route_death`] drops it because the entry's current thread is live.
+/// The exit reason of `entry`'s current instance when the kernel shows it
+/// dead, else `None`, read from the caps svcmgr holds on it: the reason
+/// recorded for its main thread when that thread has exited; `EXIT_KILLED`
+/// when the thread cap no longer resolves, since procmgr's teardown of the
+/// process revokes it; and, for a service init created by raw syscalls
+/// (memmgr, procmgr), whose address space svcmgr holds, the retained
+/// terminal-fault reason when one of its threads has faulted. A fault of a
+/// worker thread of a procmgr-created service shows here only once procmgr
+/// has torn the service down.
+fn observed_death(entry: &service::ServiceEntry) -> Option<u64>
+{
+    if entry.thread_cap != 0
+    {
+        match syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        {
+            Ok(packed) if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED =>
+            {
+                return Some(packed & 0xFFFF_FFFF);
+            }
+            Ok(_) =>
+            {}
+            Err(_) => return Some(syscall_abi::EXIT_KILLED),
+        }
+    }
+    if entry.aspace_cap != 0
+        && let Ok(reason) = syscall::cap_info(
+            entry.aspace_cap,
+            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
+        )
+        && reason != 0
+    {
+        return Some(reason);
+    }
+    None
+}
+
+/// Route a death for every active service whose current instance is dead:
+/// the recovery for death posts a full queue dropped, and, after
+/// reconciliation, for a devmgr whose observers could not be bound because
+/// it had already died. The kernel records the state before it posts, so a
+/// main-thread exit, a revoked thread cap, and a fault of memmgr or procmgr,
+/// whose address spaces svcmgr holds, are found in svcmgr's own caps
+/// ([`observed_death`]). A worker-thread fault of a service procmgr created
+/// shows there only once procmgr's teardown revokes the thread cap, which can
+/// follow this resync, so each such service the caps show alive is asked of
+/// procmgr (`restart::queried_death`), which reads the space's retained
+/// fault. That call runs only while memmgr and procmgr are active and alive
+/// ([`substrate_alive`]), so procmgr answers it. A restart binds the new
+/// instance's observers, whose posts go to the queue this drain has emptied.
+/// A post for a service routed here that does arrive later carries the dead
+/// instance, and [`route_death`] drops it.
 fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 {
+    // Slots svcmgr's caps showed alive, which procmgr is asked about.
+    let mut alive = Vec::new();
     for idx in 0..state.table.services.len()
     {
         let Some(svc) = state.table.services.get(idx)
@@ -779,28 +818,68 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
         {
             continue;
         };
-        if !svc.active || svc.thread_cap == 0
+        if !svc.active
         {
             continue;
         }
-        let Ok(packed) = syscall::cap_info(svc.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
+        let Some(exit_reason) = observed_death(svc)
+        else
+        {
+            // A failed reservation only narrows the query to the slots
+            // recorded before it.
+            if svc.process_handle != 0 && alive.try_reserve(1).is_ok()
+            {
+                alive.push(idx);
+            }
+            continue;
+        };
+        // `idx` came from the table, whose slots each have a tag
+        // (`ServiceTable::reserve`).
+        let Some(tag) = DeathTag::new(idx, svc.instance)
         else
         {
             continue;
         };
-        if (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
-        {
-            continue;
-        }
-        // `idx` came from the table, whose slots each have a `u64`
-        // correlator (`ServiceTable::reserve`).
-        let Ok(correlator) = u64::try_from(idx)
-        else
-        {
-            continue;
-        };
-        route_death(correlator, packed & 0xFFFF_FFFF, state, ctx);
+        route_death(tag, exit_reason, state, ctx);
     }
+    if alive.is_empty() || !substrate_alive(state)
+    {
+        return;
+    }
+    for idx in alive
+    {
+        let Some(svc) = state.table.services.get(idx)
+        else
+        {
+            continue;
+        };
+        if !svc.active
+        {
+            continue;
+        }
+        let Some(tag) = DeathTag::new(idx, svc.instance)
+        else
+        {
+            continue;
+        };
+        if let Some(exit_reason) = restart::queried_death(svc.process_handle, ctx.ipc_buf)
+        {
+            route_death(tag, exit_reason, state, ctx);
+        }
+    }
+}
+
+/// Whether every service whose address space svcmgr holds (memmgr and
+/// procmgr, which init created by raw syscalls) is active and shown alive by
+/// the kernel, so a call into procmgr is answered.
+fn substrate_alive(state: &SvcmgrState) -> bool
+{
+    state
+        .table
+        .services
+        .iter()
+        .filter(|svc| svc.aspace_cap != 0)
+        .all(|svc| svc.active && observed_death(svc).is_none())
 }
 
 /// Ask the shutdown actuator to power the system off: derive a SEND stamped
@@ -811,8 +890,9 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 /// publisher's. Called from [`route_death`] when a `system_critical` service
 /// dies unrecoverably.
 ///
-/// An actuator whose entry is active but whose thread has exited has a death
-/// not yet routed; that death is routed first, so the actuator restarts under
+/// An actuator whose entry is active but whose current instance the kernel
+/// shows dead ([`observed_death`]) has a death not yet routed; that death is
+/// routed first, so the actuator restarts under
 /// its own policy or ends down. svcmgr then calls only a running actuator
 /// (entry active, thread not exited). With no actuator recorded, or the
 /// actuator down (its own permanent death included), svcmgr logs the
@@ -840,13 +920,10 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
         return;
     };
     if entry.active
-        && entry.thread_cap != 0
-        && !service_running(entry)
-        && let Ok(correlator) = u64::try_from(actuator.slot)
+        && let Some(exit_reason) = observed_death(entry)
+        && let Some(tag) = DeathTag::new(actuator.slot, entry.instance)
     {
-        // `route_death` reads the exit reason the kernel recorded for the
-        // thread; the `0` stands only when that read fails.
-        route_death(correlator, 0, state, ctx);
+        route_death(tag, exit_reason, state, ctx);
     }
     let Some(entry) = state.table.services.get(actuator.slot)
     else
@@ -886,17 +963,10 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
     std::os::seraph::log!(error: "graceful shutdown: SHUTDOWN call returned (failure path)");
 }
 
-/// Whether `entry`'s service is running: the entry is active and the kernel
-/// reports its current thread not exited. A thread whose state cannot be read
-/// counts as not running.
+/// Whether `entry`'s service is running: the entry is active, holds an
+/// instance, and the kernel does not show that instance dead
+/// ([`observed_death`]).
 fn service_running(entry: &service::ServiceEntry) -> bool
 {
-    if !entry.active || entry.thread_cap == 0
-    {
-        return false;
-    }
-    matches!(
-        syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE),
-        Ok(packed) if (packed >> 32) as u32 != syscall_abi::THREAD_STATE_EXITED
-    )
+    entry.active && entry.thread_cap != 0 && observed_death(entry).is_none()
 }

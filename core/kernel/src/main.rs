@@ -252,9 +252,14 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
         arch::current::cpu::verify_baseline();
     }
     kprintln!("baseline ok");
-    // Log the CPU's transient-execution vulnerability table
+    // Log the CPU's transient-execution vulnerability table, select and
+    // publish the controls it calls for, and set the boot CPU's per-CPU ones
     // (core/kernel/docs/transient-execution.md).
-    arch::current::speculation::enumerate_vulnerabilities();
+    arch::current::speculation::select_mitigations();
+    // SAFETY: ring 0 / S-mode on the boot CPU, after `select_mitigations`.
+    unsafe {
+        arch::current::speculation::apply_mitigations_this_cpu();
+    }
 
     // ── Phase 2: physical memory ────────────────────────────────────────────
     // Parse the memory map and subtract reserved regions, keeping the free
@@ -493,7 +498,8 @@ unsafe fn kernel_entry_post_rebase(
     }
 
     // Decide whether the kernel runs on shadow stacks (x86-64: when the BSP
-    // reports CET shadow stacks; riscv64: never), before the per-CPU storage
+    // reports CET shadow stacks and the Phase-1 transient-execution selection
+    // rewrites no return; riscv64: never), before the per-CPU storage
     // below keeps each CPU's shadow-stack pages and before any Thread slot is
     // sized (core/kernel/docs/return-address-integrity.md).
     #[cfg(not(test))]
@@ -1901,6 +1907,15 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // pointer, above.
     unsafe {
         arch::current::cpu::disable_unswitched_user_state();
+    }
+
+    // Set this AP's per-CPU transient-execution controls of the selection the
+    // BSP made in Phase 1 (x86-64: `IA32_SPEC_CTRL`, `EFER`,
+    // `IA32_UARCH_MISC_CTL`; riscv64: no-op), before it enters user mode.
+    // SAFETY: ring 0 / S-mode on this AP, after the BSP's Phase 1
+    // `select_mitigations`.
+    unsafe {
+        arch::current::speculation::apply_mitigations_this_cpu();
     }
 
     // Turn shadow stacks on for this AP when the BSP did, on its idle shadow

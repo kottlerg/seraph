@@ -3,8 +3,10 @@
 Pure, host-tested wire codec for init's handover endowment of svcmgr.
 
 The crate is the single definition of the endowment's round kinds (`CAPS`, `SUBSTRATE`,
-`LOGD_SOURCES`) and of the encoding of the rounds that carry optional source caps. The kernel
-refuses a message carrying a null cap slot, so these rounds list only the caps present and name the
+`LOGD_SOURCES`) and of the encoding of the rounds that carry optional source caps. A `SUBSTRATE`
+round carries the service's thread cap and, when its `observer_kind` word is non-zero, an observer
+cap: `1` a Control-only address-space cap, `2` a process handle. The kernel refuses a message
+carrying a null cap slot, so these rounds list only the caps present and name the
 slot each fills with a presence word. The `CAPS` slot list spans as many `CAPS` rounds as it needs,
 each a window of `shared/ipc`'s slot-round codec with a rounds-left count, as
 [`docs/ipc-interface.md`](../docs/ipc-interface.md#handover-endowment-bootstrap-rounds) specifies.
@@ -26,8 +28,9 @@ services/svcmgr/endowment/
 ├── clippy.toml                 # Clippy settings; frame threshold of init's 16 KiB stack
 ├── README.md
 └── src/
-    └── lib.rs                  # Round kinds, presence bits, encoders and
-                                # decoders of the CAPS and LOGD_SOURCES rounds
+    └── lib.rs                  # Round kinds, presence bits, observer kinds,
+                                # encoders and decoders of the CAPS, SUBSTRATE
+                                # and LOGD_SOURCES rounds
 ```
 
 ---

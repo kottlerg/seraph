@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 
 /// One QEMU instance and the thread reading its serial output.
 ///

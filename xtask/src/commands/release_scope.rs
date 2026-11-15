@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use json::{Value, json};
 
 use crate::cli::ReleaseScopeArgs;

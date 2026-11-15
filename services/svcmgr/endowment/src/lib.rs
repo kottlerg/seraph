@@ -6,8 +6,9 @@
 //! Wire codec for init's handover endowment of svcmgr.
 //!
 //! init serves the endowment over the bootstrap-round protocol and svcmgr
-//! drains it; this crate owns the round kinds and the encoding of the rounds
-//! that carry optional source caps (`CAPS` and `LOGD_SOURCES`). The kernel
+//! drains it; this crate owns the round kinds and the encoding of every round:
+//! `CAPS` and `LOGD_SOURCES`, which carry optional source caps, and
+//! `SUBSTRATE`, which carries one substrate service's registration. The kernel
 //! refuses a message carrying a null cap slot, so an absent source cannot
 //! ride as a zero slot: each of these rounds lists only the caps present,
 //! and a presence bitmap in a data word names which slot each listed cap
@@ -31,7 +32,8 @@ pub mod kind
     /// svcmgr's own endpoints plus the publish-role source caps, over one or
     /// more consecutive rounds.
     pub const CAPS: u64 = 1;
-    /// One substrate `(name, thread_cap)` registration.
+    /// One substrate service's registration: its name, its main thread cap,
+    /// and the cap svcmgr observes the faults of its other threads through.
     pub const SUBSTRATE: u64 = 2;
     /// Terminal round: the reserved log-sink sources svcmgr mints real-logd's
     /// bootstrap caps from on every (re)launch.
@@ -79,9 +81,30 @@ pub mod logd_present
     pub const PROCMGR_DEATH_AUTH: u64 = 1 << 1;
 }
 
-/// Data words an encoded round carries at most (`CAPS`: kind, version,
-/// presence, rounds left).
-const ROUND_DATA_WORDS: usize = 4;
+/// Values of a `SUBSTRATE` round's observer word (`data[2]`): which cap,
+/// if any, follows the thread cap, through which svcmgr binds a death
+/// observer on the service's address space.
+pub mod observer_kind
+{
+    /// No observer cap: the round carries the thread cap alone.
+    pub const NONE: u64 = 0;
+    /// A `Control`-only cap on the service's address space, which svcmgr
+    /// binds with `SYS_ASPACE_BIND_NOTIFICATION` (a service init created by
+    /// raw syscalls: memmgr, procmgr).
+    pub const ADDRESS_SPACE: u64 = 1;
+    /// The service's procmgr process handle, on which svcmgr sends
+    /// `procmgr_labels::BIND_DEATH_OBSERVER` (a service init created through
+    /// procmgr: devmgr, vfsd).
+    pub const PROCESS_HANDLE: u64 = 2;
+}
+
+/// Data words of a `SUBSTRATE` round ahead of the name words: kind, name
+/// length, observer kind.
+const SUBSTRATE_HEADER_WORDS: usize = 3;
+
+/// Data words an encoded round carries at most: a `SUBSTRATE` round's
+/// header and the longest name (`CAPS` rounds carry four).
+const ROUND_DATA_WORDS: usize = SUBSTRATE_HEADER_WORDS + ipc::svcmgr_labels::NAME_WORDS;
 
 /// The caps of the `CAPS` rounds, by role. `0` marks an absent source cap.
 /// The two endpoints are required; in a decoded round set they are never
@@ -218,6 +241,55 @@ impl Round
     }
 }
 
+/// The cap a `SUBSTRATE` round carries after the service's thread cap, by
+/// its [`observer_kind`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubstrateObserver
+{
+    /// No observer cap.
+    None,
+    /// A `Control`-only cap on the service's address space.
+    AddressSpace(u64),
+    /// The service's procmgr process handle.
+    ProcessHandle(u64),
+}
+
+impl SubstrateObserver
+{
+    /// The [`observer_kind`] word and the cap, `None` for no cap.
+    fn kind_and_cap(self) -> (u64, Option<u64>)
+    {
+        match self
+        {
+            SubstrateObserver::None => (observer_kind::NONE, None),
+            SubstrateObserver::AddressSpace(cap) => (observer_kind::ADDRESS_SPACE, Some(cap)),
+            SubstrateObserver::ProcessHandle(cap) => (observer_kind::PROCESS_HANDLE, Some(cap)),
+        }
+    }
+}
+
+/// A decoded `SUBSTRATE` round.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Substrate
+{
+    name: [u8; ipc::svcmgr_labels::NAME_MAX],
+    name_len: usize,
+    /// The service's main thread cap.
+    pub thread: u64,
+    /// The cap svcmgr observes the service's address space through.
+    pub observer: SubstrateObserver,
+}
+
+impl Substrate
+{
+    /// The service's name bytes.
+    #[must_use]
+    pub fn name(&self) -> &[u8]
+    {
+        self.name.get(..self.name_len).unwrap_or_default()
+    }
+}
+
 /// Why a received round does not decode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecodeError
@@ -259,6 +331,97 @@ pub fn encode_caps(caps: &CapsRound) -> [Round; CAPS_ROUNDS]
             ],
             &packed,
         )
+    })
+}
+
+/// Encode the `SUBSTRATE` round of the service `name`, whose main thread cap
+/// is `thread` and whose address space svcmgr observes through `observer`:
+/// `caps = [thread, observer cap?]`, `data = [SUBSTRATE, name_len, observer
+/// kind, name words...]`. `None` when `thread` or the observer cap is `0`
+/// (the kernel refuses a null cap slot), or `name` is empty or longer than
+/// `svcmgr_labels::NAME_MAX`.
+#[must_use]
+pub fn encode_substrate(name: &[u8], thread: u64, observer: SubstrateObserver) -> Option<Round>
+{
+    if thread == 0 || name.is_empty()
+    {
+        return None;
+    }
+    let (observer_word, observer_cap) = observer.kind_and_cap();
+    let mut name_words = [0u64; ipc::svcmgr_labels::NAME_WORDS];
+    let words = ipc::svcmgr_labels::pack_name(name, &mut name_words)?;
+    let mut data = [0u64; ROUND_DATA_WORDS];
+    data[0] = kind::SUBSTRATE;
+    data[1] = name.len() as u64;
+    data[2] = observer_word;
+    for (dst, src) in data
+        .iter_mut()
+        .skip(SUBSTRATE_HEADER_WORDS)
+        .zip(name_words.get(..words)?)
+    {
+        *dst = *src;
+    }
+    // `words` is at most `NAME_WORDS`, so the sum is at most the array length.
+    let mut round = Round::new(data.get(..SUBSTRATE_HEADER_WORDS.saturating_add(words))?);
+    round.caps[0] = thread;
+    round.cap_count = 1;
+    if let Some(cap) = observer_cap
+    {
+        if cap == 0
+        {
+            return None;
+        }
+        round.caps[1] = cap;
+        round.cap_count = 2;
+    }
+    Some(round)
+}
+
+/// Decode a received `SUBSTRATE` round from its delivered `caps` and its
+/// `data` words.
+///
+/// # Errors
+/// [`DecodeError::Malformed`] when the kind is not `SUBSTRATE`, a header
+/// word is missing, the observer word is not an [`observer_kind`], the round
+/// delivered other than the thread cap and the cap its observer word names,
+/// or the name is empty, longer than `svcmgr_labels::NAME_MAX`, or carried in
+/// fewer words than its length needs. On an error the round's caps are still
+/// the caller's to release.
+pub fn decode_substrate(caps: &[u64], data: &[u64]) -> Result<Substrate, DecodeError>
+{
+    let (Some(&kind::SUBSTRATE), Some(&name_len), Some(&observer_word)) =
+        (data.first(), data.get(1), data.get(2))
+    else
+    {
+        return Err(DecodeError::Malformed);
+    };
+    let observer = match (observer_word, caps)
+    {
+        (observer_kind::NONE, &[_]) => SubstrateObserver::None,
+        (observer_kind::ADDRESS_SPACE, &[_, cap]) => SubstrateObserver::AddressSpace(cap),
+        (observer_kind::PROCESS_HANDLE, &[_, cap]) => SubstrateObserver::ProcessHandle(cap),
+        _ => return Err(DecodeError::Malformed),
+    };
+    let thread = caps.first().copied().unwrap_or(0);
+    let name_len = usize::try_from(name_len).map_err(|_| DecodeError::Malformed)?;
+    let name = ipc::svcmgr_labels::unpack_name(
+        data.get(SUBSTRATE_HEADER_WORDS..).unwrap_or_default(),
+        name_len,
+    )
+    .ok_or(DecodeError::Malformed)?;
+    if thread == 0
+        || matches!(
+            observer,
+            SubstrateObserver::AddressSpace(0) | SubstrateObserver::ProcessHandle(0)
+        )
+    {
+        return Err(DecodeError::Malformed);
+    }
+    Ok(Substrate {
+        name,
+        name_len,
+        thread,
+        observer,
     })
 }
 
@@ -563,7 +726,7 @@ mod tests
     fn caps_round_with_a_wrong_or_missing_version_is_refused()
     {
         let rounds = encode_caps(&caps_round(0x21, 0x22));
-        let mut data = [0u64; ROUND_DATA_WORDS];
+        let mut data = [0u64; 4];
         data.copy_from_slice(rounds[0].data());
         data[1] = VERSION + 1;
         assert_eq!(
@@ -662,6 +825,85 @@ mod tests
         let words = [7u64; ROUND_DATA_WORDS + 3];
         let round = Round::new(&words);
         assert_eq!(round.data(), &words[..ROUND_DATA_WORDS]);
+    }
+
+    #[test]
+    fn substrate_round_trips_with_each_observer()
+    {
+        for observer in [
+            SubstrateObserver::None,
+            SubstrateObserver::AddressSpace(0x52),
+            SubstrateObserver::ProcessHandle(0x53),
+        ]
+        {
+            let round = encode_substrate(b"procmgr", 0x51, observer).expect("encodes");
+            let decoded = decode_substrate(round.caps(), round.data()).expect("decodes");
+            assert_eq!(decoded.name(), b"procmgr");
+            assert_eq!(decoded.thread, 0x51);
+            assert_eq!(decoded.observer, observer);
+        }
+        let long = [b'n'; ipc::svcmgr_labels::NAME_MAX];
+        let round = encode_substrate(&long, 0x51, SubstrateObserver::None).expect("encodes");
+        assert_eq!(
+            decode_substrate(round.caps(), round.data()).map(|s| s.name().len()),
+            Ok(long.len())
+        );
+    }
+
+    #[test]
+    fn substrate_with_a_null_cap_or_a_bad_name_does_not_encode()
+    {
+        assert!(encode_substrate(b"vfsd", 0, SubstrateObserver::None).is_none());
+        assert!(encode_substrate(b"vfsd", 1, SubstrateObserver::ProcessHandle(0)).is_none());
+        assert!(encode_substrate(b"", 1, SubstrateObserver::None).is_none());
+        let long = [b'n'; ipc::svcmgr_labels::NAME_MAX + 1];
+        assert!(encode_substrate(&long, 1, SubstrateObserver::None).is_none());
+    }
+
+    // The observer word names how many caps the round carries; a disagreement
+    // would bind an observer through a cap of the wrong kind, or none.
+    #[test]
+    fn substrate_whose_caps_disagree_with_its_observer_word_is_malformed()
+    {
+        let aspace = encode_substrate(b"memmgr", 0x51, SubstrateObserver::AddressSpace(0x52))
+            .expect("encodes");
+        let bare = encode_substrate(b"memmgr", 0x51, SubstrateObserver::None).expect("encodes");
+        assert_eq!(
+            decode_substrate(bare.caps(), aspace.data()),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            decode_substrate(aspace.caps(), bare.data()),
+            Err(DecodeError::Malformed)
+        );
+        let mut data = [0u64; ROUND_DATA_WORDS];
+        data[..aspace.data().len()].copy_from_slice(aspace.data());
+        data[2] = 3;
+        assert_eq!(
+            decode_substrate(aspace.caps(), &data[..aspace.data().len()]),
+            Err(DecodeError::Malformed)
+        );
+    }
+
+    #[test]
+    fn substrate_of_another_kind_or_short_of_words_is_malformed()
+    {
+        let round = encode_substrate(b"devmgr", 0x51, SubstrateObserver::None).expect("encodes");
+        for words in 0..round.data().len()
+        {
+            assert_eq!(
+                decode_substrate(round.caps(), &round.data()[..words]),
+                Err(DecodeError::Malformed)
+            );
+        }
+        let logd = encode_logd_sources(&LogdSources {
+            master_log_source: 0x31,
+            procmgr_death_auth_source: 0,
+        });
+        assert_eq!(
+            decode_substrate(logd.caps(), logd.data()),
+            Err(DecodeError::Malformed)
+        );
     }
 
     #[test]

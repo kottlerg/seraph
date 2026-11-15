@@ -7,6 +7,7 @@
 
 pub mod build;
 pub mod capture_acpi;
+pub mod check_disk;
 pub mod clean;
 pub mod compare_images;
 pub mod compose_bundle;

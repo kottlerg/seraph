@@ -761,6 +761,10 @@ pub struct MemmgrBootstrap
     /// Memmgr's main `Thread` cap (in init's `CSpace`). Init invokes
     /// `thread_configure` + `thread_start` at [`finalize_memmgr`] time.
     pub mm_thread: u64,
+    /// Memmgr's `AddressSpace` cap (in init's `CSpace`). Init endows svcmgr
+    /// a `Control`-only derivation of it, through which svcmgr observes a
+    /// terminal fault of any memmgr thread (`SUBSTRATE` round).
+    pub mm_aspace: u64,
     /// Memmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
     /// as an in-use arena so its pages are accounted in memmgr's pool.
@@ -1116,6 +1120,7 @@ pub fn bootstrap_memmgr(
         procmgr_send_cap,
         mm_cspace,
         mm_thread,
+        mm_aspace,
         arena_cap: arena.cap,
         entry,
         stack_top_vaddr: layout.stack_top,
@@ -1721,6 +1726,10 @@ pub struct ProcmgrBootstrap
     /// Procmgr's main thread cap (in init's `CSpace`). Used by
     /// [`start_procmgr`] to launch procmgr after memmgr is live.
     pub thread: u64,
+    /// Procmgr's `AddressSpace` cap (in init's `CSpace`). Init endows svcmgr
+    /// a `Control`-only derivation of it, through which svcmgr observes a
+    /// terminal fault of any procmgr thread (`SUBSTRATE` round).
+    pub aspace: u64,
     /// Procmgr's contiguous backing arena Memory cap (in init's `CSpace`).
     /// [`finalize_memmgr`] copies it into memmgr's `CSpace` and forwards it
     /// as an in-use arena so its pages are accounted in memmgr's pool.
@@ -2085,6 +2094,7 @@ pub fn bootstrap_procmgr(
         log_endpoint_slot: pm_log_send,
         registry_endpoint_slot: pm_registry_send,
         thread: pm_thread,
+        aspace: pm_aspace,
         arena_cap: arena.cap,
     })
 }

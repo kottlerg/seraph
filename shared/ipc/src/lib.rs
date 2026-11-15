@@ -871,7 +871,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 10;
+pub const MEMMGR_LABELS_VERSION: u32 = 11;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -964,11 +964,14 @@ pub mod memmgr_labels
     /// * `data[5]` — `largest_free_bytes`: the largest single free run.
     /// * `data[6]` — `reserve_bytes`: the system reserve, the free pages a
     ///   charge to a budget node outside the reserve may not take.
+    /// * `data[7]` — the memory-pressure level: [`PRESSURE_NORMAL`],
+    ///   [`PRESSURE_LOW`] or [`PRESSURE_CRITICAL`]. A [`REGISTER_PRESSURE`]
+    ///   bit says it changed; this read is the level.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory. `data[3]` to `data[6]` are appended fields — readers
+    /// "dark" memory. `data[3]` to `data[7]` are appended fields — readers
     /// needing only the identity may ignore them.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.
@@ -1045,6 +1048,36 @@ pub mod memmgr_labels
     /// unknown badge. Specified in `services/memmgr/docs/ipc-interface.md`
     /// § Label 10: `QUERY_MEMORY_USAGE`.
     pub const QUERY_MEMORY_USAGE: u64 = 10;
+
+    /// Register a Notification for the caller's memory-pressure signal.
+    /// Universal label, attributed by `recv.badge`.
+    ///
+    /// Wire format:
+    /// * `data[0]` — the bits to send; nonzero.
+    /// * `caps[0]` — a Notification cap with Notify rights; ownership
+    ///   transfers to memmgr.
+    ///
+    /// On every change of the pressure level memmgr sends the bits on the
+    /// cap, without blocking; the receiver reads the level from
+    /// [`QUERY_POOL_STATUS`] `data[7]`. A process holds one registration: a
+    /// second replaces the first, and `PROCESS_DIED` drops it. The std runtime
+    /// registers every process at start.
+    ///
+    /// Reply: `memmgr_errors::SUCCESS`; or `INVALID_ARGUMENT` (unknown badge,
+    /// zero bits, or `caps[0]` missing or not a Notification with Notify; the
+    /// cap is deleted). Specified in `services/memmgr/docs/ipc-interface.md`
+    /// § Label 11: `REGISTER_PRESSURE`.
+    pub const REGISTER_PRESSURE: u64 = 11;
+
+    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pool is at or above the low
+    /// threshold.
+    pub const PRESSURE_NORMAL: u64 = 0;
+    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pool is below the low
+    /// threshold.
+    pub const PRESSURE_LOW: u64 = 1;
+    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pool is at or below the
+    /// system reserve, so a grant to a process outside it is refused.
+    pub const PRESSURE_CRITICAL: u64 = 2;
 
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap
     /// covering all `want_pages`, or fail with

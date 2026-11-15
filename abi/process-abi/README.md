@@ -177,8 +177,8 @@ data via `std::os::seraph::startup_info()`; init and ktest define neither.
   [`ruststd/`](../../runtime/ruststd/README.md) overlay) takes the `ProcessInfo` page
   address as its argument (entry register), reads `ProcessInfo`, registers the IPC buffer,
   bootstraps the heap against the `memmgr_endpoint` delivered in
-  `ProcessInfo`, then jumps to `lang_start` → user `fn main`. procmgr
-  is itself a std-built service and follows this path.
+  `ProcessInfo`, registers for memmgr's memory-pressure signal, then jumps to `lang_start` →
+  user `fn main`. procmgr is itself a std-built service and follows this path.
 - **[memmgr](../../services/memmgr/README.md)** — bespoke `core`-only `_start` and panic
   handler. memmgr cannot heap-bootstrap against itself (it owns the frame pool) and
   uses no `alloc` collections. It is the only std-less process init spawns via raw

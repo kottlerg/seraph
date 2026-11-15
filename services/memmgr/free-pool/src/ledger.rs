@@ -26,8 +26,8 @@
 //! and deferred runs charged to it ([`crate::budget`]).
 
 use crate::arena::{
-    Arena, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessRecord,
-    RegionNode, Slot, SlotStore,
+    Arena, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessCaps,
+    ProcessRecord, RegionNode, Slot, SlotStore,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError};
@@ -124,7 +124,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Region(_)
             | Node::Frame(_)
             | Node::ChunkDir(_)
-            | Node::Chunk(_) => None,
+            | Node::Chunk(_)
+            | Node::Caps(_) => None,
         }
     }
 
@@ -141,7 +142,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Frame(_)
             | Node::Process(_)
             | Node::ChunkDir(_)
-            | Node::Chunk(_) => None,
+            | Node::Chunk(_)
+            | Node::Caps(_) => None,
         }
     }
 
@@ -150,37 +152,84 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.arena.set_node(rec, Node::Process(r));
     }
 
-    /// Add a record for `badge` with empty lists, charged to a new budget
-    /// node made for `spec` ([`budget::create`]).
+    /// The caps memmgr holds for the record `rec`.
+    #[must_use]
+    pub fn caps(&self, rec: NodeIdx) -> Option<ProcessCaps>
+    {
+        match self.arena.get(self.record(rec)?.caps).node
+        {
+            Node::Caps(c) => Some(c),
+            Node::Free
+            | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
+            | Node::Region(_)
+            | Node::Frame(_)
+            | Node::Process(_)
+            | Node::ChunkDir(_)
+            | Node::Chunk(_) => None,
+        }
+    }
+
+    /// Rewrite the caps of `rec` with `f`. Returns `false`, changing nothing,
+    /// when `rec` holds no record.
+    fn update_caps(&mut self, rec: NodeIdx, f: impl FnOnce(&mut ProcessCaps)) -> bool
+    {
+        let (Some(r), Some(mut c)) = (self.record(rec), self.caps(rec))
+        else
+        {
+            return false;
+        };
+        f(&mut c);
+        self.arena.set_node(r.caps, Node::Caps(c));
+        true
+    }
+
+    /// Add a record for `badge` with empty lists and no caps, charged to a new
+    /// budget node made for `spec` ([`budget::create`]).
     ///
     /// # Errors
-    /// [`NodeError::Parent`] for a parent the node cannot take; [`NodeError::NoSlot`] when the arena has fewer than the
-    /// two free slots outside its reserve the record and its node take, or the
-    /// index has no bucket storage. Nothing is left allocated then.
+    /// [`NodeError::Parent`] for a parent the node cannot take;
+    /// [`NodeError::NoSlot`] when the arena has fewer than the three free
+    /// slots outside its reserve the record, its caps and its node take, or
+    /// the index has no bucket storage. Nothing is left allocated then.
     pub fn insert_process(&mut self, badge: u64, spec: NodeSpec) -> Result<NodeIdx, NodeError>
     {
-        if self.arena.available() < 2
+        if self.arena.available() < 3
         {
             return Err(NodeError::NoSlot);
         }
         let node = budget::create(&mut self.arena, spec)?;
+        let no_caps = Node::Caps(ProcessCaps {
+            aspace: 0,
+            pressure: 0,
+            pressure_bits: 0,
+        });
+        let Some(caps) = self.arena.alloc(no_caps, NODE_NULL)
+        else
+        {
+            budget::unref(&mut self.arena, node);
+            return Err(NodeError::NoSlot);
+        };
         let record = Node::Process(ProcessRecord {
             badge,
             frame_head: NODE_NULL,
             region_head: NODE_NULL,
-            aspace_cap: 0,
+            caps,
             next_region_id: 1,
             budget: node,
         });
         let Some(rec) = self.arena.alloc(record, NODE_NULL)
         else
         {
+            self.arena.free(caps);
             budget::unref(&mut self.arena, node);
             return Err(NodeError::NoSlot);
         };
         if !self.index.insert(&mut self.arena, rec)
         {
             self.arena.free(rec);
+            self.arena.free(caps);
             budget::unref(&mut self.arena, node);
             return Err(NodeError::NoSlot);
         }
@@ -241,34 +290,76 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
-    /// Unindex and free the record keyed by `badge` after taking back every
-    /// frame and freeing every region ([`Ledger::reclaim_all`]). Returns the
-    /// record as it stood, or `None` for an unknown badge.
+    /// Unindex and free the record keyed by `badge`, with its caps slot,
+    /// after taking back every frame and freeing every region
+    /// ([`Ledger::reclaim_all`]). Returns the record and its caps as they
+    /// stood, or `None` for an unknown badge. Deleting the caps is the
+    /// caller's.
     pub fn remove_process(
         &mut self,
         badge: u64,
         quiescent: impl FnMut(&FreeRun) -> bool,
-    ) -> Option<ProcessRecord>
+    ) -> Option<(ProcessRecord, ProcessCaps)>
     {
         let rec = self.index.remove(&mut self.arena, badge)?;
         self.reclaim_all(rec, quiescent);
         let r = self.record(rec);
+        let c = self.caps(rec);
         self.arena.free(rec);
-        if let Some(r) = r
-        {
-            budget::unref(&mut self.arena, r.budget);
-        }
-        r
+        let r = r?;
+        self.arena.free(r.caps);
+        budget::unref(&mut self.arena, r.budget);
+        Some((r, c?))
+    }
+
+    /// The delegated address-space cap of `rec`, or `0` for none.
+    #[must_use]
+    pub fn aspace_cap(&self, rec: NodeIdx) -> u64
+    {
+        self.caps(rec).map_or(0, |c| c.aspace)
     }
 
     /// Set the delegated address-space cap of `rec`.
     pub fn set_aspace_cap(&mut self, rec: NodeIdx, cap: u64)
     {
-        if let Some(mut r) = self.record(rec)
-        {
-            r.aspace_cap = cap;
-            self.set_record(rec, r);
-        }
+        self.update_caps(rec, |c| c.aspace = cap);
+    }
+
+    /// Register `cap` as the pressure Notification of `rec`, signalled with
+    /// `bits`, in place of any earlier one. Returns the cap it replaces, `0`
+    /// for none, for the caller to delete; `None` when `rec` holds no record.
+    pub fn set_pressure(&mut self, rec: NodeIdx, cap: u64, bits: u64) -> Option<u64>
+    {
+        let prior = self.caps(rec)?.pressure;
+        self.update_caps(rec, |c| {
+            c.pressure = cap;
+            c.pressure_bits = bits;
+        });
+        Some(prior)
+    }
+
+    /// Clear the pressure registration of `rec` and return its cap, `0` for
+    /// none, for the caller to delete.
+    pub fn take_pressure(&mut self, rec: NodeIdx) -> u64
+    {
+        let prior = self.caps(rec).map_or(0, |c| c.pressure);
+        self.update_caps(rec, |c| {
+            c.pressure = 0;
+            c.pressure_bits = 0;
+        });
+        prior
+    }
+
+    /// Call `f` with the cap and bits of every pressure registration.
+    pub fn for_each_pressure(&self, mut f: impl FnMut(u64, u64))
+    {
+        self.index.for_each(&self.arena, |rec| {
+            if let Some(c) = self.caps(rec)
+                && c.pressure != 0
+            {
+                f(c.pressure, c.pressure_bits);
+            }
+        });
     }
 
     /// Account `frame` to `rec`, charged to its budget node. Returns `false`
@@ -830,13 +921,74 @@ mod tests
         assert!(l.push_frame(rec, frame(2, 16, 0x10000, 0x40_0000)));
         l.add_region(rec, region(0x40_0000, 0x10_0000)).unwrap();
         l.set_aspace_cap(rec, 9);
-        let gone = l.remove_process(42, pool_all).unwrap();
-        assert_eq!(gone.aspace_cap, 9);
+        assert_eq!(l.set_pressure(rec, 11, 1), Some(0));
+        let (_, caps) = l.remove_process(42, pool_all).unwrap();
+        assert_eq!(
+            caps,
+            ProcessCaps {
+                aspace: 9,
+                pressure: 11,
+                pressure_bits: 1,
+            }
+        );
         assert!(l.find(42).is_none());
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (18, 2));
-        // The two frame slots became the two run slots; the record and the
-        // region slot are free again.
+        // The two frame slots became the two run slots; the record, its caps
+        // and the region slot are free again.
         assert_eq!(l.arena.free_count(), free - 2);
+    }
+
+    #[test]
+    fn insert_process_takes_three_slots_or_none()
+    {
+        let mut l = ledger();
+        let mut filler = NODE_NULL;
+        while l.arena.available() > 2
+        {
+            filler = l.arena.alloc(Node::Free, NODE_NULL).unwrap();
+        }
+        let free = l.arena.free_count();
+        assert_eq!(l.insert_process(1, NodeSpec::TOP), Err(NodeError::NoSlot));
+        assert_eq!(l.arena.free_count(), free);
+        l.arena.free(filler);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        assert_eq!(l.arena.free_count(), free - 2);
+        assert_eq!(l.aspace_cap(rec), 0);
+        assert_eq!(l.caps(rec).map(|c| c.pressure), Some(0));
+    }
+
+    #[test]
+    fn a_second_pressure_registration_replaces_the_first()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        l.set_aspace_cap(rec, 5);
+        assert_eq!(l.set_pressure(rec, 20, 0b10), Some(0));
+        // The first cap comes back for the caller to delete.
+        assert_eq!(l.set_pressure(rec, 21, 0b100), Some(20));
+        let mut seen = Vec::new();
+        l.for_each_pressure(|cap, bits| seen.push((cap, bits)));
+        assert_eq!(seen, [(21, 0b100)]);
+        // The address-space cap beside it is untouched.
+        assert_eq!(l.aspace_cap(rec), 5);
+        // An index that names no record registers nothing.
+        assert_eq!(l.set_pressure(NODE_NULL, 22, 1), None);
+    }
+
+    #[test]
+    fn a_taken_pressure_registration_is_signalled_no_more()
+    {
+        let mut l = ledger();
+        let a = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let b = l.insert_process(2, NodeSpec::TOP).unwrap();
+        l.insert_process(3, NodeSpec::TOP).unwrap();
+        l.set_pressure(a, 30, 1).unwrap();
+        l.set_pressure(b, 31, 1).unwrap();
+        assert_eq!(l.take_pressure(a), 30);
+        assert_eq!(l.take_pressure(a), 0);
+        let mut seen = Vec::new();
+        l.for_each_pressure(|cap, _| seen.push(cap));
+        assert_eq!(seen, [31]);
     }
 
     #[test]

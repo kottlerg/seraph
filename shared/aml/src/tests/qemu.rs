@@ -334,10 +334,12 @@ fn hpet_status_reads_its_registers_under_the_global_lock()
     sim.put_mem(0xFED0_0000, 4, 0xFFFF_FFFF);
     let sta = run(&mut ns, &mut sim, "\\_SB.HPET._STA", vec![]).unwrap();
     assert_eq!(sta, Data::Integer(0));
-    // The lock refused: the access fails rather than run unlocked.
+    // The lock refused for as long as the delay budget lasts: the access
+    // fails rather than run unlocked.
     sim.gl_refuse = true;
     let f = run(&mut ns, &mut sim, "\\_SB.HPET._STA", vec![]).unwrap_err();
-    assert_eq!(f.kind, FaultKind::Host(crate::HostError::Failed));
+    assert_eq!(f.kind, FaultKind::Bound);
+    assert_eq!(sim.gl_waits.last(), Some(&10_000));
 }
 
 #[test]

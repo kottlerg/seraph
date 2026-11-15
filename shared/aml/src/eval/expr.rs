@@ -122,15 +122,48 @@ pub(super) fn name_of_text(text: &[u8]) -> Result<Name, FaultKind>
 
 impl Evaluator<'_>
 {
-    /// The value of the operand `t`.
+    /// The value of the operand `t`, counted against
+    /// [`crate::MAX_EVAL_ALLOC`] unless it was counted where it was made.
     pub(super) fn eval(&mut self, t: &Term) -> Result<Data, Fault>
     {
         self.enter(t)?;
         let r = self.eval_op(t).map_err(placed(t));
         self.leave();
         let v = r?;
-        self.charge(&v).map_err(by(t))?;
+        self.count_made(t, &v)?;
         Ok(v)
+    }
+
+    /// Count the value `v` the term `t` gave against
+    /// [`crate::MAX_EVAL_ALLOC`], unless it was counted where it was made.
+    pub(super) fn count_made(&mut self, t: &Term, v: &Data) -> Result<(), Fault>
+    {
+        if matches!(v, Data::Uninitialized | Data::Integer(_)) || self.counted(t)
+        {
+            return Ok(());
+        }
+        self.charge(v).map_err(by(t))
+    }
+
+    /// Whether the value of `t` was counted as it was made: a package,
+    /// which counts its own slots and whose elements were counted as they
+    /// were evaluated; a method's result, counted as the operand of its
+    /// `Return`; and the result of `Store` and `CopyObject`, their
+    /// operand's value.
+    fn counted(&self, t: &Term) -> bool
+    {
+        if matches!(
+            t.op,
+            Op::Package | Op::VarPackage | Op::Store | Op::CopyObject
+        )
+        {
+            return true;
+        }
+        matches!(t.op, Op::NameRef | Op::Call)
+            && imm_name(t)
+                .ok()
+                .and_then(|name| self.lookup(name))
+                .is_some_and(|node| matches!(self.ns.object(node), Some(Object::Method(_))))
     }
 
     /// The value of the operand `t`, an index reference replaced by the
@@ -398,6 +431,11 @@ impl Evaluator<'_>
         let count = usize::try_from(count).map_err(|_| at(t, FaultKind::Bound))?;
         value::check_count(count).map_err(by(t))?;
         let mut out = value::vec_with(count).map_err(by(t))?;
+        // The bytes this package makes: its own and every slot's, and the
+        // names it holds. An element evaluated that is not an integer was
+        // counted, its slot with it, where it was made.
+        let slot = size_of::<Data>();
+        let mut made = slot.saturating_add(slot.saturating_mul(count));
         for e in elems.iter().take(count)
         {
             let v = if e.op == Op::NameRef
@@ -420,10 +458,20 @@ impl Evaluator<'_>
             }
             else
             {
-                self.eval(e)?
+                let v = self.eval(e)?;
+                if !matches!(v, Data::Uninitialized | Data::Integer(_))
+                {
+                    made = made.saturating_sub(slot);
+                }
+                v
             };
+            if e.op == Op::NameRef
+            {
+                made = made.saturating_add(v.weight().saturating_sub(slot));
+            }
             out.push(v);
         }
+        self.charge_bytes(made).map_err(by(t))?;
         out.resize(count, Data::Uninitialized);
         let v = Data::Package(out);
         if v.depth() > MAX_VALUE_DEPTH
@@ -627,7 +675,6 @@ impl Evaluator<'_>
         {
             self.conversion(t, op, arg)?
         };
-        self.charge(&v).map_err(by(t))?;
         self.result(t, target, v)
     }
 
@@ -704,6 +751,7 @@ impl Evaluator<'_>
         if let Data::Ref(_) = v
         {
             v = self.deref(&v).map_err(placed(t))?;
+            self.charge(&v).map_err(by(t))?;
         }
         let n = match &v
         {

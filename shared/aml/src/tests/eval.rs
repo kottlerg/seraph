@@ -121,11 +121,19 @@ fn unit(name_: &str, bits: u32) -> Vec<u8>
     {
         out.push(u8::try_from(bits).unwrap());
     }
-    else
+    else if bits < 0x1000
     {
         out.extend([
             0x40 | u8::try_from(bits & 0xF).unwrap(),
             u8::try_from(bits >> 4).unwrap(),
+        ]);
+    }
+    else
+    {
+        out.extend([
+            0x80 | u8::try_from(bits & 0xF).unwrap(),
+            u8::try_from((bits >> 4) & 0xFF).unwrap(),
+            u8::try_from(bits >> 12).unwrap(),
         ]);
     }
     out
@@ -507,6 +515,56 @@ fn references_read_and_write_in_place()
 }
 
 #[test]
+fn deref_of_an_element_that_names_an_object_is_that_object()
+{
+    let defs = cat(&[
+        &device("DEV0", &[]),
+        &mutex("MTX1", 1),
+        &name_obj("INT0", &i(5)),
+        &name_obj("PKG1", &package(2, &[i(1), i(2)])),
+        &name_obj(
+            "REFS",
+            &package(4, &[n("DEV0"), n("MTX1"), n("INT0"), n("PKG1")]),
+        ),
+    ]);
+    let el = |k: u64| deref(&index(&n("REFS"), &i(k)));
+    let body = cat(&[
+        &op(&[0x86], &[&el(0), &i(0x80)]),
+        &op(&ext(0x23), &[&el(1), &0xFFFFu16.to_le_bytes()]),
+        &op(&ext(0x27), &[&el(1)]),
+        &store(&i(7), &el(2)),
+        &store(&i(9), &index(&el(3), &i(1))),
+        &ret(&deref(&index(&el(3), &i(0)))),
+    ]);
+    let mut ns = table_of(2, &defs, 0, &body);
+    let mut sim = Sim::new();
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![]),
+        Ok(Data::Integer(1))
+    );
+    assert_eq!(sim.notes, vec![("\\DEV0".to_string(), 0x80)]);
+    assert_eq!(data(&ns, "\\INT0"), Data::Integer(7));
+    assert_eq!(
+        data(&ns, "\\PKG1"),
+        Data::Package(vec![Data::Integer(1), Data::Integer(9)])
+    );
+    // A package a method builds holds references; a local holds it.
+    let body = cat(&[
+        &store(&package(1, &[n("INT0")]), &l(0)),
+        &store(&i(3), &deref(&index(&l(0), &i(0)))),
+        &ret(&n("INT0")),
+    ]);
+    assert_eq!(ok(&defs, &body), Data::Integer(3));
+    // An element that is not a reference is written in place.
+    let body = cat(&[
+        &store(&package(1, &[i(4)]), &l(0)),
+        &store(&i(6), &deref(&index(&l(0), &i(0)))),
+        &ret(&deref(&index(&l(0), &i(0)))),
+    ]);
+    assert_eq!(ok(&defs, &body), Data::Integer(6));
+}
+
+#[test]
 fn store_converts_to_a_named_objects_type_and_copy_object_replaces()
 {
     let defs = cat(&[
@@ -815,6 +873,23 @@ fn field_units_read_and_write_their_bits_under_each_update_rule()
 }
 
 #[test]
+fn a_field_unit_wider_than_a_buffer_is_neither_read_nor_written()
+{
+    let units = [unit("FLDW", 0x1_0000 * 8 + 8)];
+    for body in [store(&i(0), &n("FLDW")), ret(&n("FLDW"))]
+    {
+        let (mut ns, mut sim) = io_field(0x01, &units, &body);
+        assert_eq!(
+            run_on(&mut ns, &mut sim, "\\TEST", vec![])
+                .unwrap_err()
+                .kind,
+            FaultKind::Bound
+        );
+        assert_eq!(sim.log.len(), 0);
+    }
+}
+
+#[test]
 fn a_field_wider_than_an_integer_reads_as_a_buffer()
 {
     let defs = cat(&[
@@ -1044,6 +1119,38 @@ fn mutexes_follow_the_ordering_rule()
         run_on(&mut ns, &mut sim, "\\TEST", vec![]),
         Ok(Data::Integer(ONES))
     );
+    // The wait with no limit asked for the whole delay budget.
+    assert_eq!(sim.gl_waits, vec![10_000, 5]);
+}
+
+#[test]
+fn a_mutex_a_returned_method_left_held_does_not_hold_its_successor()
+{
+    // LEAK defines a mutex of level 3 and acquires it; with Arg0 1 it
+    // releases it, with Arg0 2 it then acquires MTX1, of level 1. Called a
+    // second time, its mutex is a new object whose acquisition sets level
+    // 3: the release is in order, and the acquisition of MTX1 is not.
+    let when = |v: u64, then: &[u8]| pkg_obj(&[0xA0], &cat(&[&op(&[0x93], &[&a(0), &i(v)]), then]));
+    let leak = method(
+        "LEAK",
+        1,
+        &cat(&[
+            &mutex("MTXL", 3),
+            &acquire("MTXL", 0xFFFF),
+            &when(1, &release("MTXL")),
+            &when(2, &acquire("\\MTX1", 0xFFFF)),
+        ]),
+    );
+    let defs = cat(&[&mutex("MTX1", 1), &leak]);
+    let call = |arg: u64| op(&n("LEAK"), &[&i(arg)]);
+    assert_eq!(
+        ok(&defs, &cat(&[&call(0), &call(1), &ret(&i(1))])),
+        Data::Integer(1)
+    );
+    assert_eq!(
+        fault(&defs, &cat(&[&call(0), &call(2)])),
+        FaultKind::MutexOrder
+    );
 }
 
 #[test]
@@ -1122,12 +1229,16 @@ fn delays_and_notifications_reach_the_host()
 /// in each, forever; the fault that ends it and the passes it made.
 fn count_passes(pass: &[u8]) -> (FaultKind, u64)
 {
-    let defs = name_obj("CNT_", &i(0));
+    count_passes_on(&[], pass, &mut Sim::new())
+}
+
+/// As [`count_passes`], after `defs`, on `sim`.
+fn count_passes_on(defs: &[u8], pass: &[u8], sim: &mut Sim) -> (FaultKind, u64)
+{
+    let defs = cat(&[&name_obj("CNT_", &i(0)), defs]);
     let body = while_(&[0x01], &cat(&[&[0x75], &n("CNT_"), pass]));
     let mut ns = table_of(2, &defs, 0, &body);
-    let kind = run_on(&mut ns, &mut Sim::new(), "\\TEST", vec![])
-        .unwrap_err()
-        .kind;
+    let kind = run_on(&mut ns, sim, "\\TEST", vec![]).unwrap_err().kind;
     let Data::Integer(passes) = data(&ns, "\\CNT_")
     else
     {
@@ -1151,11 +1262,31 @@ fn every_loop_ends_at_the_step_bound()
 #[test]
 fn the_values_an_evaluation_makes_are_bounded()
 {
-    // 4 KiB buffers, each dropped at once.
-    let (kind, passes) = count_passes(&store(&buffer(&i(0x1000), &[]), &l(0)));
-    assert_eq!(kind, FaultKind::Bound);
-    let most = (MAX_EVAL_ALLOC / 0x1000) as u64;
-    assert!(passes > most / 2 && passes <= most + 1, "{passes}");
+    // Each value counted once, as it is made: a 4 KiB buffer made, read
+    // from a name, returned by a method, held in a package, or converted.
+    let slot = size_of::<Data>();
+    let buf = 0x1000 + slot;
+    let defs = cat(&[
+        &name_obj("BUF0", &buffer(&i(0x1000), &[])),
+        &method("MKBF", 0, &ret(&buffer(&i(0x1000), &[]))),
+    ]);
+    let cases: [(Vec<u8>, usize); 5] = [
+        (store(&buffer(&i(0x1000), &[]), &l(0)), buf),
+        (store(&n("BUF0"), &l(0)), buf),
+        (store(&n("MKBF"), &l(0)), buf),
+        (
+            store(&package(1, &[buffer(&i(0x1000), &[])]), &l(0)),
+            buf + slot,
+        ),
+        (op(&[0x96], &[&n("BUF0"), &l(0)]), 2 * buf),
+    ];
+    for (pass, each) in cases
+    {
+        let (kind, passes) = count_passes_on(&defs, &pass, &mut Sim::new());
+        assert_eq!(kind, FaultKind::Bound);
+        let most = u64::try_from(MAX_EVAL_ALLOC / each).unwrap();
+        assert!(passes.abs_diff(most) <= 2, "{passes} against {most}");
+    }
     // One buffer or package past its own bound.
     assert_eq!(
         fault(&[], &store(&buffer(&i(0x1_0001), &[]), &l(0))),
@@ -1286,6 +1417,28 @@ fn delays_are_bounded()
     let (kind, passes) = count_passes(&op(&ext(0x22), &[&i(1000)]));
     assert_eq!((kind, passes), (FaultKind::Bound, 11));
     assert_eq!(fault(&[], &op(&ext(0x22), &[&i(10_001)])), FaultKind::Bound);
+    // Waits for the global lock count too: each refused wait in full, and
+    // a wait with no limit asks for what the budget has left.
+    let mut sim = Sim::new();
+    sim.gl_refuse = true;
+    let (kind, passes) = count_passes_on(&[], &acquire("\\_GL_", 1000), &mut sim);
+    assert_eq!((kind, passes), (FaultKind::Bound, 11));
+    assert_eq!(sim.gl_waits.last(), Some(&0));
+    let mut sim = Sim::new();
+    sim.gl_refuse = true;
+    let mut ns = table_of(
+        2,
+        &[],
+        0,
+        &cat(&[&op(&ext(0x22), &[&i(4000)]), &acquire("\\_GL_", 0xFFFF)]),
+    );
+    assert_eq!(
+        run_on(&mut ns, &mut sim, "\\TEST", vec![])
+            .unwrap_err()
+            .kind,
+        FaultKind::Bound
+    );
+    assert_eq!(sim.gl_waits, vec![6000]);
 }
 
 // The lowest stack address the host saw, through its callbacks.

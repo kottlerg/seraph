@@ -163,6 +163,10 @@ impl Evaluator<'_>
         };
         match v
         {
+            Data::Ref(r) if t.op == Op::DerefOf && !r.path.is_empty() =>
+            {
+                self.element_place(r).map_err(|f| at(t, f.kind))
+            }
             Data::Ref(r) => Ok(Place::Ref(r)),
             Data::String(_) if t.op == Op::DerefOf =>
             {
@@ -179,6 +183,44 @@ impl Evaluator<'_>
             | Data::Buffer(_)
             | Data::Package(_)
             | Data::Name(_) => Err(at(t, FaultKind::Type)),
+        }
+    }
+
+    /// The place `DerefOf` of the element reference `r` names: the object
+    /// the element refers to when it is a reference or a name, else the
+    /// element itself, in place.
+    fn element_place(&mut self, r: Ref) -> Result<Place, Fault>
+    {
+        let Some((last, prefix)) = r.path.split_last()
+        else
+        {
+            return Ok(Place::Ref(r));
+        };
+        let i = usize::try_from(*last).unwrap_or(usize::MAX);
+        let names = match navigate(self.root(&r).map_err(bare)?, prefix).map_err(bare)?
+        {
+            Data::Package(p) => matches!(p.get(i), Some(Data::Ref(_) | Data::Name(_))),
+            Data::Uninitialized
+            | Data::Integer(_)
+            | Data::String(_)
+            | Data::Buffer(_)
+            | Data::Name(_)
+            | Data::Ref(_) => false,
+        };
+        if !names
+        {
+            return Ok(Place::Ref(r));
+        }
+        match self.read_ref(&r)?
+        {
+            Data::Ref(inner) => Ok(Place::Ref(inner)),
+            // A name that resolves to nothing.
+            Data::Uninitialized
+            | Data::Integer(_)
+            | Data::String(_)
+            | Data::Buffer(_)
+            | Data::Package(_)
+            | Data::Name(_) => Err(bare(FaultKind::NotFound)),
         }
     }
 

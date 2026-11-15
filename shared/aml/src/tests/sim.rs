@@ -92,6 +92,8 @@ pub(super) struct Sim
     pub gl_releases: u32,
     /// The global lock acquisition fails.
     pub gl_refuse: bool,
+    /// The timeout of each request for the global lock.
+    pub gl_waits: Vec<u16>,
     /// The time slept and stalled.
     pub slept_ms: u64,
     pub stalled_us: u64,
@@ -438,9 +440,10 @@ impl Host for Sim
         self.timer
     }
 
-    fn acquire_global_lock(&mut self, _timeout_ms: u16) -> Result<bool, HostError>
+    fn acquire_global_lock(&mut self, timeout_ms: u16) -> Result<bool, HostError>
     {
         assert!(!self.gl_held, "the global lock acquired twice");
+        self.gl_waits.push(timeout_ms);
         if self.gl_refuse
         {
             return Ok(false);

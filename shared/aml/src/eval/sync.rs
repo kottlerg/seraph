@@ -18,8 +18,8 @@
 //! An event counts its signals. `Wait` on an event with none pending would
 //! block forever with no other thread to signal it: a finite timeout waits
 //! it out and times out, and no timeout (0xFFFF) fails with
-//! [`FaultKind::Deadlock`]. Every wait counts against
-//! [`MAX_EVAL_DELAY_MS`].
+//! [`FaultKind::Deadlock`]. Every wait, for an event or for the global
+//! lock, counts against [`MAX_EVAL_DELAY_MS`].
 
 use super::place::Place;
 use super::{Evaluator, at, by, imm_int, kid};
@@ -75,12 +75,15 @@ impl Evaluator<'_>
             .unwrap_or(0)
     }
 
-    /// The position in [`Evaluator::held`] of the entry of `node`.
+    /// The position in [`Evaluator::held`] of the entry of `node`, made
+    /// for the object the node holds now: an entry left by an object since
+    /// removed is not the entry of one that reuses its node.
     fn held_at(&self, node: NodeId, kind: Kind) -> Option<usize>
     {
+        let generation = self.ns.generation(node);
         self.held
             .iter()
-            .position(|h| h.node == node && h.kind == kind)
+            .position(|h| h.node == node && h.kind == kind && h.generation == generation)
     }
 
     /// Acquire the mutex `node` of sync level `sync`, or nest it again.
@@ -149,17 +152,41 @@ impl Evaluator<'_>
         }
     }
 
-    /// Take the firmware global lock, waiting up to `timeout_ms`, or nest
-    /// it again; whether it is held.
+    /// Take the firmware global lock, waiting up to `timeout_ms` (0xFFFF:
+    /// no limit), or nest it again; whether it is held.
+    ///
+    /// The wait counts against [`MAX_EVAL_DELAY_MS`]: the host is asked to
+    /// wait no longer than the budget has left, and a wait that ends without
+    /// the lock counts in full. One the budget cut short (no limit, or a
+    /// timeout past what is left) fails with [`FaultKind::Bound`].
     pub(super) fn global_acquire(&mut self, timeout_ms: u16) -> Result<bool, FaultKind>
     {
         if self.global == 0
-            && !self
-                .host
-                .acquire_global_lock(timeout_ms)
-                .map_err(FaultKind::Host)?
         {
-            return Ok(false);
+            let left = MAX_EVAL_DELAY_MS.saturating_sub(self.budget.delay_us / 1000);
+            let asked = u64::from(timeout_ms);
+            let cut = asked >= FOREVER || asked > left;
+            // At most 0xFFFE, the longest finite timeout.
+            let wait = if cut { left } else { asked }.min(0xFFFE);
+            let wait_ms = u16::try_from(wait).unwrap_or(0xFFFE);
+            if !self
+                .host
+                .acquire_global_lock(wait_ms)
+                .map_err(FaultKind::Host)?
+            {
+                self.budget.delay_us = self
+                    .budget
+                    .delay_us
+                    .saturating_add(u64::from(wait_ms).saturating_mul(1000));
+                return if cut
+                {
+                    Err(FaultKind::Bound)
+                }
+                else
+                {
+                    Ok(false)
+                };
+            }
         }
         self.global = self.global.checked_add(1).ok_or(FaultKind::Bound)?;
         Ok(true)

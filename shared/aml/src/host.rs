@@ -8,10 +8,15 @@
 //! interfaces `_OSI` reports.
 //!
 //! The evaluator checks every access against its operation region before it
-//! asks: the address and the width lie inside the region's span, which each
-//! call carries so that the host can grant or refuse the region as a whole.
-//! A host that refuses or fails an access returns a [`HostError`], which ends
-//! the evaluation with [`crate::FaultKind::Host`].
+//! asks: the address and the width lie inside the region's span. An I/O or
+//! memory call carries that span, so that the host can grant or refuse the
+//! region as a whole; a PCI configuration call carries the function and the
+//! offset in its configuration space. To find the bus of a `PCI_Config`
+//! region the evaluator also reads, outside any region, the header type
+//! (offset 0x0E) and the secondary bus (0x19) of each PCI-to-PCI bridge
+//! between the host bridge and the region's device. A host that refuses or
+//! fails an access returns a [`HostError`], which ends the evaluation with
+//! [`crate::FaultKind::Host`].
 
 use crate::encoding::Seg;
 
@@ -147,7 +152,8 @@ pub trait Host
     ) -> Result<(), HostError>;
 
     /// Read `width` bytes at offset `offset` of the configuration space of
-    /// `function`.
+    /// `function`: an access of a `PCI_Config` region, or the read of a
+    /// bridge's header type or secondary bus that finds a region's bus.
     ///
     /// # Errors
     ///
@@ -191,7 +197,8 @@ pub trait Host
     fn timer(&mut self) -> u64;
 
     /// Acquire the firmware global lock, waiting up to `timeout_ms`
-    /// milliseconds (0xFFFF: no limit); whether it was acquired.
+    /// milliseconds; whether it was acquired. The evaluator asks for no
+    /// more than its delay budget has left, never 0xFFFF.
     ///
     /// # Errors
     ///

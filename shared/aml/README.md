@@ -165,19 +165,23 @@ A field unit is accessed in datums of its access width, each aligned to that wid
 start of its region, a datum it covers in part written under its update rule (preserve, write as
 ones, write as zeros). A `BankField` unit writes its bank value first; an `IndexField` unit
 writes each datum's byte offset to its index field and moves the datum through its data field.
-A unit whose lock rule says so holds the firmware global lock across the access. A unit wider
-than an integer reads as a buffer. A region is `SystemMemory`, `SystemIO` or `PCI_Config`; its
-offset and length are evaluated when a method defines it, or at its first access when a table
-does, and every access lies inside that span, which each `Host` call carries. A `PCI_Config`
-region's function is found at its first access: the segment and bus are the enclosing host
-bridge's `_SEG` and `_BBN` (0 when absent), replaced at each PCI-to-PCI bridge on the way down
-by the secondary bus number its header holds, and the device and function are the region's
-device's `_ADR`.
+A unit whose lock rule says so holds the firmware global lock across the access, waiting for it
+no longer than the delay budget allows. A unit wider than an integer reads as a buffer; one wider
+than `MAX_BUFFER_BYTES` is neither read nor written and fails with `FaultKind::Bound`. A region
+is `SystemMemory`, `SystemIO` or `PCI_Config`; its offset and length are evaluated when a method
+defines it, or at its first access when a table does, and every access lies inside that span.
+An I/O or memory access carries the span to the host; a `PCI_Config` access carries the
+function and the offset in its configuration space. A `PCI_Config` region's function is found
+at its first access: the segment and bus are the enclosing host bridge's `_SEG` and `_BBN` (0
+when absent), replaced at each PCI-to-PCI bridge on the way down by the secondary bus number its
+header holds, which the evaluator reads from the bridge's configuration space outside any
+region, and the device and function are the region's device's `_ADR`.
 
 The evaluator runs one thread of AML, so no other thread holds a mutex: `Acquire` succeeds unless
 it breaks the ordering rule of ACPI 6.5 § 19.6.2 (the current sync level is the highest among
 the mutexes held, a serialized method's own among them), and `Release` must name a mutex at the
-current level. `\_GL_` also holds the firmware global lock, which the host gives. An event
+current level. `\_GL_` also holds the firmware global lock, which the host gives; a wait for it
+counts against the delay budget, and one with no timeout fails when the budget ends. An event
 counts its signals; `Wait` with none pending times out after its timeout, and fails with no
 timeout, since nothing could signal it. `Notify` passes the object's absolute path and the value
 to the host; `Sleep` and `Stall` go to the host's delays, and `\_OSI` asks the host.
@@ -203,7 +207,8 @@ Each evaluation is bounded in its call depth (`MAX_CALL_DEPTH`), its nesting of 
 field accesses on the stack (`MAX_EVAL_DEPTH`), the terms it runs (`MAX_EVAL_STEPS`), which ends
 every loop, the bytes of the values it makes (`MAX_EVAL_ALLOC`), the nesting of packages in a
 value (`MAX_VALUE_DEPTH`), the objects it creates (`MAX_EVAL_OBJECTS`), one `Stall`
-(`MAX_STALL_US`) and its delays in all (`MAX_EVAL_DELAY_MS`). Past a bound it ends with a fault.
+(`MAX_STALL_US`) and its delays in all, waits for the global lock among them
+(`MAX_EVAL_DELAY_MS`). Past a bound it ends with a fault.
 A thread that evaluates MUST have `EVAL_STACK_BYTES` of stack, which a host test checks by an
 evaluation nested to the depth bound on a thread of that size.
 

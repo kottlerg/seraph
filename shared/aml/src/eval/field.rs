@@ -15,7 +15,8 @@
 //! and a unit of an `IndexField` writes each datum's byte offset to its
 //! index field and moves the datum through its data field. The lock rule
 //! holds the global lock across the whole access. A unit wider than an
-//! integer reads as a buffer, a narrower one as an integer.
+//! integer reads as a buffer, a narrower one as an integer; one wider than
+//! [`MAX_BUFFER_BYTES`] is neither read nor written.
 //!
 //! A region is `SystemMemory`, `SystemIO` or `PCI_Config`; any other space
 //! fails with [`FaultKind::Unsupported`], as a field with a `Connection`
@@ -469,9 +470,10 @@ impl Evaluator<'_>
         {
             return self.field_io(node, unit, src);
         }
+        // No limit: the wait ends with the lock or fails at the delay budget.
         if !self.global_acquire(0xFFFF).map_err(bare)?
         {
-            return Err(bare(FaultKind::Host(HostError::Failed)));
+            return Err(bare(FaultKind::Bound));
         }
         let r = self.field_io(node, unit, src);
         let released = self.global_release().map_err(bare);
@@ -497,6 +499,14 @@ impl Evaluator<'_>
         let wbits = wb.saturating_mul(8);
         let bit_offset = u64::from(unit.bit_offset);
         let bit_len = u64::from(unit.bit_len);
+        // A unit is read into, or written from, at most a buffer's bytes.
+        let most = u64::try_from(MAX_BUFFER_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8);
+        if bit_len > most
+        {
+            return Err(bare(FaultKind::Bound));
+        }
         let mut out = match src
         {
             None => bit_buffer(bit_len).map_err(bare)?,

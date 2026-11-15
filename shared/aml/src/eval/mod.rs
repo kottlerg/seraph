@@ -412,7 +412,13 @@ impl<'a> Evaluator<'a>
         {
             return Ok(());
         }
-        self.budget.alloc = self.budget.alloc.saturating_add(d.weight());
+        self.charge_bytes(d.weight())
+    }
+
+    /// Count `bytes` against [`MAX_EVAL_ALLOC`].
+    fn charge_bytes(&mut self, bytes: usize) -> Result<(), FaultKind>
+    {
+        self.budget.alloc = self.budget.alloc.saturating_add(bytes);
         if self.budget.alloc > MAX_EVAL_ALLOC
         {
             return Err(FaultKind::Bound);
@@ -559,8 +565,16 @@ impl<'a> Evaluator<'a>
             | Op::Wait
             | Op::FromBcd
             | Op::ToBcd
-            | Op::Timer => self.eval_op(t).map(|_| Flow::Next),
+            | Op::Timer => self.exec_expr(t),
         }
+    }
+
+    /// An expression run as a statement, its value discarded once counted.
+    fn exec_expr(&mut self, t: &Term) -> Result<Flow, Fault>
+    {
+        let v = self.eval_op(t)?;
+        self.count_made(t, &v)?;
+        Ok(Flow::Next)
     }
 
     /// `If`, with its `ElseIf`s and `Else`.
@@ -690,7 +704,12 @@ impl<'a> Evaluator<'a>
             Data::Ref(Ref {
                 base: Base::Local { frame, .. } | Base::Arg { frame, .. },
                 ..
-            }) if *frame == serial => self.deref(&v),
+            }) if *frame == serial =>
+            {
+                let d = self.deref(&v)?;
+                self.charge(&d).map_err(bare)?;
+                Ok(d)
+            }
             Data::Uninitialized
             | Data::Integer(_)
             | Data::String(_)
@@ -777,7 +796,6 @@ impl<'a> Evaluator<'a>
             | Object::Region(_)
             | Object::DataRegion(_) => Data::Ref(self.node_ref(node)?),
         };
-        self.charge(&v).map_err(bare)?;
         Ok(v)
     }
 

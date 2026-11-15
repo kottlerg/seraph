@@ -116,9 +116,11 @@ pub const EVAL_STACK_BYTES: usize = 768 * 1024;
 /// table has entries.
 pub const MAX_EVAL_STEPS: usize = 1_000_000;
 
-/// The most bytes of values one evaluation produces, counted as each
-/// string, buffer, package or reference is made, whether or not it is kept.
-/// It bounds the memory a loop that builds values can use.
+/// The most bytes of values one evaluation makes. Each string, buffer,
+/// package or reference an operator, a read or a call gives is counted
+/// once, where it is made, whether or not it is kept; the copy a store
+/// writes to its target is not counted again. It bounds the memory a loop
+/// that builds values can use.
 pub const MAX_EVAL_ALLOC: usize = 16 * 1024 * 1024;
 
 /// The deepest nesting of packages in one value: a package whose element is
@@ -133,9 +135,10 @@ pub const MAX_EVAL_OBJECTS: usize = 4096;
 /// The longest `Stall`, in microseconds, as ACPI 6.5 § 19.6.129 limits it.
 pub const MAX_STALL_US: u64 = 255;
 
-/// The most time one evaluation spends in `Sleep`, `Stall` and the timeouts
-/// of `Wait`, in milliseconds. Firmware sleeps to let hardware settle, for
-/// at most some hundreds of milliseconds per method.
+/// The most time one evaluation spends in `Sleep`, `Stall`, the timeouts
+/// of `Wait` and waits for the global lock, in milliseconds. Firmware
+/// sleeps to let hardware settle, for at most some hundreds of milliseconds
+/// per method.
 pub const MAX_EVAL_DELAY_MS: u64 = 10_000;
 
 /// The value of `Revision` (`RevisionOp`): this interpreter's revision.

@@ -178,6 +178,14 @@ fn install_hint_for(name: &str) -> String
             Debian / Ubuntu:  apt install qemu-user gcc-riscv64-linux-gnu libc6-dev-riscv64-cross\n  \
             Arch:             pacman -S qemu-user riscv64-linux-gnu-gcc riscv64-linux-gnu-glibc"
             .into(),
+        "fsck.fat" => "`cargo xtask check-disk` checks the disk images' FAT volumes with \
+            dosfstools' fsck.fat. Install with:\n  \
+            Fedora:           dnf install dosfstools\n  \
+            Debian / Ubuntu:  apt install dosfstools\n  \
+            Arch:             pacman -S dosfstools\n  \
+            macOS (Homebrew): brew install dosfstools\n  \
+            FreeBSD:          pkg install dosfstools"
+            .into(),
         "cargo" | "rustc" => "Install rustup (https://rustup.rs/); xtask requires the toolchain \
              pinned in rust-toolchain.toml. This usually means xtask itself was invoked \
              outside a rustup-managed environment."

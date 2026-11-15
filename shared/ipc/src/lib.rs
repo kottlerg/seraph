@@ -1774,8 +1774,9 @@ pub mod vfsd_labels
     pub const SEED_AUTHORITY: u64 = 1u64 << 62;
 
     /// Authority bit in the vfsd-service-endpoint badge gating [`MOUNT`]
-    /// and [`UNMOUNT`]: who may mount may unmount. init mints it, alone, onto the SEND it endows svcmgr with; svcmgr
-    /// publishes that SEND seed-only as
+    /// and [`UNMOUNT`]: who may mount may unmount. init mints it, alone,
+    /// onto the SEND it endows svcmgr with; svcmgr publishes that SEND
+    /// seed-only as
     /// [`crate::published_names::VFSD_MOUNT`], which svctest alone seeds.
     /// The cap is badged, so its holder cannot add [`SEED_AUTHORITY`].
     /// Disjoint position from [`SEED_AUTHORITY`].

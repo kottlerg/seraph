@@ -114,7 +114,9 @@ the cancel of a blocking syscall, and `SYS_THREAD_SET_UPCALL_MASK`. Its end-to-e
 
 A debugger's access to the memory of the address space a thread executes in
 (`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, [Debugging](#debugging)) is implemented on both
-architectures, the instruction-fetch synchronisation of a text write included. Its end-to-end
+architectures, the instruction-fetch synchronisation of a text write included, and so are the
+listing of that space's pages (`SYS_THREAD_LIST_PAGES`) and the read of a thread's extended
+register state (`SYS_THREAD_READ_EXT_REGS`), which ktest exercises. Its end-to-end
 consumer is the `debugger` fixture, which debugs a child process
 ([programs/debugger/README.md](../programs/debugger/README.md)). The GDB stub, which debugs a
 process of a running system from a host GDB over the debug port, is implemented on both
@@ -431,7 +433,8 @@ A syscall that copies to or from a caller-supplied user buffer can fault on that
 kernel: the buffer lies on a page the pager has not backed (a demand region no access has reached,
 or a page the pager has since reclaimed), or on a page whose mapping forbids the access. The
 restartable syscalls, `SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`,
-`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, and `SYS_ASPACE_HARVEST`
+`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, `SYS_ASPACE_HARVEST`,
+`SYS_THREAD_LIST_PAGES`, and `SYS_THREAD_READ_EXT_REGS`
 ([syscalls.md § Restartable Syscalls](../core/kernel/docs/syscalls.md#restartable-syscalls)), take
 the fault path for such a fault:
 
@@ -723,7 +726,11 @@ itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
     itself; the decoder refuses both.
 - **Registers.** A handler reads and writes a stopped thread's registers with
   `SYS_THREAD_READ_REGS` and `SYS_THREAD_WRITE_REGS` ([Modifying the faulting
-  thread](#modifying-the-faulting-thread)).
+  thread](#modifying-the-faulting-thread)), and reads its extended (floating-point, SIMD and
+  vector) state with `SYS_THREAD_READ_EXT_REGS`, under `OBSERVE`, in parts of at most
+  `MAX_THREAD_MEM_COPY` bytes: on x86-64 the XSAVE area, on riscv64 the layout the
+  `EXT_REGS_RISCV64_*` offsets of `abi/syscall` give
+  ([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_THREAD_READ_EXT_REGS` (68)).
 - **Memory.** A debugger reads and writes the memory of the address space a thread executes in
   with `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`, at most `MAX_THREAD_MEM_COPY` bytes a
   call, all or nothing, under `CONTROL` on the thread's cap
@@ -733,6 +740,14 @@ itself (§ Label 20: `ATTACH_PROCESS` there). The pieces are:
   the thread stopped, since they act on the space and not the thread, but the space's other
   threads keep running and storing; a debugger stops every thread of the space for a coherent
   view. A debugger thread of the debuggee's own process can also reach the memory directly.
+- **Layout.** A debugger, or a core writer, lists the mapped pages of the address space a thread
+  executes in with `SYS_THREAD_LIST_PAGES`, under `CONTROL` on the thread's cap, as runs of pages
+  of one protection, at most `MAX_PAGE_RUNS` runs a call, each call returning the address the
+  next continues from ([syscalls.md](../core/kernel/docs/syscalls.md)
+  § `SYS_THREAD_LIST_PAGES` (67)). A run marked `PAGE_RUN_NO_COPY` is device memory, or lies past
+  the top of RAM, which `SYS_THREAD_READ_MEM` refuses, so a core writer leaves its bytes out. The
+  listing reads the page tables a call at a time, so the space's threads are stopped first for a
+  layout one instant held.
 - **Text writes.** A software breakpoint is planted by writing `int3` or `ebreak` over an
   instruction, and removed by writing the instruction back. Text is mapped read-only, so the write
   takes `THREAD_MEM_TEXT`: the kernel writes the frame through its own mapping and leaves the

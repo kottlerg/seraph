@@ -1602,7 +1602,7 @@ fn spawn_and_settle(
         phys_access: grants.phys_access,
         service_ep: client.ep,
         query_ep: batch.driver_ep(),
-        death_eq: watch.death_eq(),
+        watch,
         watch_eq: Some(death_eq),
         device_badge,
         // devmgr's DMA thread, at the boot drivers' level, calls the driver

@@ -59,8 +59,8 @@ pub const ELF_MACHINE: u16 = elf::EM_X86_64;
 /// the ACPI DMAR and programmed by `iommu-vtd`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Vtd;
 
-/// GSI for a PCI function whose config-space IRQ line is unset, from its
-/// `INTx` pin and device number.
+/// GSI for a PCI function whose config-space IRQ line is unset, from the
+/// `INTx` pin and device number its interrupt reaches the root bus with.
 ///
 /// Returns `None`: on x86-64 the firmware programs the IRQ line, and
 /// routing an unprogrammed `INTx` pin to a GSI needs the ACPI `_PRT`,

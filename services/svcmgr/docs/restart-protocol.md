@@ -37,8 +37,9 @@ A bind takes one death-observer node from its queue's pool, fixed when the
 queue is created, so svcmgr keeps a growable set of queues: a bind tries the
 newest queue first, then the older ones, and only when every queue is out of
 nodes creates a further queue, funded from svcmgr's own memory, with twice
-the last pool (4 nodes first, below a boot's seven supervised and adopted
-services, so every boot grows the set; up to `EVENT_QUEUE_MAX_CAPACITY`). A
+the last pool (4 nodes first, below the two each of a boot's seven supervised
+and adopted services takes, so every boot grows the set; up to
+`EVENT_QUEUE_MAX_CAPACITY`). A
 further queue is one contiguous grant from memmgr; when memmgr refuses it,
 svcmgr retries at half the pool, down to the first pool's size. A bind that
 still fails fails the launch or restart. An adoption records the service all

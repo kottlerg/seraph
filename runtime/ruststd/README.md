@@ -119,11 +119,16 @@ the full contract.
 
 `std::sys::seraph::alloc` provides the platform allocator functions behind std's `System`
 allocator and its default global allocator, so no `#[global_allocator]` override is needed.
-Every `Box`, `Vec`, `String`, and `alloc`/`std` collection allocates here. The grow path
-requests Memory caps from memmgr via `memmgr_labels::REQUEST_MEMORY_CAPS` on
-`ProcessInfo.memmgr_endpoint_cap`, mapping them at a contiguous VA above the
-heap's high-water mark with a single multi-page `mem_map` per returned cap;
-a grow covers the whole request, and an allocation grows again while each
+Every `Box`, `Vec`, `String`, and `alloc`/`std` collection allocates here. In a demand-paged
+process the grow path registers one committed growth region directly above the heap floor
+(`REGISTER_REGION` with `REGION_COMMIT`) on its first grow and extends it (`EXTEND_REGION`) on
+every later one, in 16-page multiples; memmgr charges each in full when it accepts it, so a
+refused grow is an allocation error, never a fault, and the heap holds no Memory caps
+([services/memmgr/docs/memory-pool.md](../../services/memmgr/docs/memory-pool.md) § Commit). A
+process with no pager requests Memory caps from memmgr via
+`memmgr_labels::REQUEST_MEMORY_CAPS` on `ProcessInfo.memmgr_endpoint_cap`, mapping them at a
+contiguous VA above the heap's high-water mark with a single multi-page `mem_map` per returned
+cap. A grow covers the whole request, and an allocation grows again while each
 grow maps pages. The heap floor is installed by `std::os::seraph::_start`
 before `fn main()` runs: a demand region registered with memmgr in a
 demand-paged process, whose pages the pager backs on their first touch, and

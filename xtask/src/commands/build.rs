@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::{BuildArgs, BuildComponent};

@@ -51,8 +51,21 @@ failed completes the same run: run and save it the same way, with the same revie
 record.
 
 When docs/conventions.md § Auditor-only run allows it, the next run may be `pr-auditor` alone.
-Tell it that it is that run, and give it the PR number, the `since` head, the path of the last
-reviewer run's record, the fixes the round claims, and the open Issue list.
+Give it the PR number, the `since` head, the path of the last reviewer run's record, the fixes
+the round claims, and the open Issue list.
+
+Every `pr-auditor` spawn carries, on a line of its own, exactly one of these run-kind lines, and
+the line alone selects the auditor's run-kind checks (`.claude/agents/pr-auditor.md` step 2a):
+
+- `Run kind: with-reviewer`: the auditor beside the reviewer in a `full` or `delta` run, and a
+  re-audit at the head of such a run after its audit failed;
+- `Run kind: completing <record path>`: the audit that completes a run of the reviewer alone,
+  and a re-audit of it, with the path of that run's record;
+- `Run kind: auditor-only since <head>, record <record path>`: the auditor-only run, and a
+  re-audit of it, with the `since` head and the path of the last reviewer run's record.
+
+A `since` head or a record path given elsewhere in the prompt does not tell the auditor its run
+kind, and an auditor given no run-kind line applies neither run-kind check and fails the audit.
 
 ## The record
 
@@ -82,7 +95,11 @@ defines the record. Six points it leaves to you:
   record there.
 
 Run `cargo xtask review-check <N>` and fix the record until it passes: the ledger and the gate
-read these files. Then give both verdict lines verbatim to the one you report to: a worker
+read these files. Its `error record-run-kind` means the audit of a `full` or `delta` run
+applied the checks of another run kind: run `pr-auditor` again with `Run kind: with-reviewer`,
+put its result in place of that record's `audit` and `audit_verdict`, and append its prose to
+the record's `.md` under a heading that says why. Then give both verdict lines verbatim to the
+one you report to: a worker
 records them in its status line for its orchestrator (`.claude/agents/worker.md` § Reporting),
 and a standalone session gives them to the maintainer.
 

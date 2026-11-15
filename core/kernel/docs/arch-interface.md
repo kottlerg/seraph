@@ -234,6 +234,23 @@ pub unsafe fn clear_user_accessed(
     reported: &dyn Fn(u64) -> bool,
 );
 
+/// Pass each present 4 KiB user leaf of `[start, hi)` (on RISC-V, each Svnapot
+/// group member as its own page) to `on_leaf` in VA order, as its VA, its
+/// frame and its raw bits, examining at most `budget` table entries at any
+/// level, and stop at the first leaf `on_leaf` does not take. Returns the
+/// first VA not finished: that leaf's, the start of the span of the entry the
+/// budget stopped before, or `hi`. Large leaves are passed over, as the
+/// user mapping path never installs one. Drives `SYS_THREAD_LIST_PAGES`
+/// (`AddressSpace::list_pages`). The caller holds the address space's
+/// `pt_lock`.
+pub unsafe fn scan_user_leaves(
+    root_virt: u64,
+    start: u64,
+    hi: u64,
+    budget: usize,
+    on_leaf: &mut dyn FnMut(u64, u64, u64) -> bool,
+) -> u64;
+
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
 /// None if unmapped. Only 4 KiB leaves translate: both architectures return
 /// None at a large leaf above the last level rather than read its frame as a
@@ -410,7 +427,8 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool;
 /// `PageFlags`, or `None` when it is not present or not user-accessible.
 /// `readable` is always set on x86-64; `uncacheable` is set for a non-default
 /// memory type (PCD or PWT on x86-64, a PBMT other than PMA on RISC-V). The
-/// thread-memory copies (`AddressSpace::copy_user_bytes`) gate on it.
+/// thread-memory copies (`AddressSpace::copy_user_bytes`) gate on it, and the
+/// page listing (`AddressSpace::list_pages`) reports it.
 pub fn user_leaf_flags(pte: u64) -> Option<PageFlags>;
 
 /// The grant a user leaf PTE (from `translate_user_page`) records: the Write

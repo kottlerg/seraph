@@ -194,6 +194,8 @@ input is the index or span, whose value the branch does not fix.
 | `sys_mem_map`, `sys_mem_unmap`, `sys_mem_protect`, `sys_mmio_map` | virtual range | the page-table walk of the map, unmap, or protect loop into the kernel half of the root | `mm::user_page_range` returns the checked range clamped to `user_va_top` through `mask_span_u64`, and the loop walks the range it returns; a failed bound gives the empty range at 0 |
 | `sys_aspace_harvest` | virtual range and page count | the page-table walk of the harvest's read and clear into the kernel half of the root, and the bitmap stores past the 512-byte kernel-stack bitmap | `mm::user_page_range` clamps the range as for `sys_mem_map`, and the walk takes its page count from the clamped range, masked below `MAX_HARVEST_PAGES + 1` through `mask_index`; a failed bound walks the empty range |
 | `sys_thread_read_mem`, `sys_thread_write_mem` | target virtual address and length | the software walk of `copy_user_bytes` into the kernel half of the target's root | `thread_mem_args` clamps the span to `user_va_top` through `mask_span_u64`; a failed bound gives the empty span at 0 |
+| `sys_thread_list_pages` | start address and run count | the software walk of `scan_user_leaves` into the kernel half of the target's root, and the run stores past the scratch buffer | the span from the start to `user_va_top` is clamped through `mask_span_u64`, and the run count is masked below `MAX_PAGE_RUNS + 1` through `mask_index_u64` before the runs are staged; a failed bound walks the empty span at 0 |
+| `sys_thread_read_ext_regs` | image offset and length | the save-area loads past the area, and the copy's stores past the scratch buffer | the length is masked below `MAX_THREAD_MEM_COPY + 1` through `mask_index`, and `extended_span` clamps the span to the image through `mask_span_u64`; a failed bound gives the empty copy |
 | `sys_entropy_contribute` | copy length | the copy's stores of caller-chosen bytes past the 256-byte kernel-stack stage | the length is masked below `MAX_ENTROPY_CONTRIBUTE_LEN + 1` through `mask_index` before the copy; a failed bound gives the empty copy |
 | `sys_thread_set_affinity` | CPU index | the per-CPU scheduler entries `migrate_ready_thread` locks and links on | `set_affinity_locked` masks the CPU against `CPU_COUNT` through `mask_index`; a failed bound selects CPU 0 |
 | `sys_thread_set_priority` | priority level | the run queue the relocate links the thread on | the level is masked below `PRIORITY_MAX + 1` through `mask_index`; a failed bound selects level 0 |
@@ -814,14 +816,14 @@ The principal kernel-internal owners:
   [scheduling-internals.md § Lock Hierarchy](scheduling-internals.md#lock-hierarchy)): a
   thread killed while parked never runs the destructor, and the park's binding, not the
   pin, keeps the parked thread reachable from the object's teardown.
-- **Thread address-space pins.** `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM` reach the
-  address space a thread executes in, which no reference of the thread holds: the space's
-  teardown instead marks every bound thread `Exited`, under the thread's `sched_lock`, before it
-  frees anything. `sched::pin_thread_aspace` reads the thread's state and space under that lock
-  and, while the thread is not `Exited`, takes a reference with
+- **Thread address-space pins.** `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` and
+  `SYS_THREAD_LIST_PAGES` reach the address space a thread executes in, which no reference of
+  the thread holds: the space's teardown instead marks every bound thread `Exited`, under the
+  thread's `sched_lock`, before it frees anything. `sched::pin_thread_aspace` reads the thread's
+  state and space under that lock and, while the thread is not `Exited`, takes a reference with
   `KernelObjectHeader::inc_ref_if_live`, which refuses a count of zero rather than revive an
   object whose teardown has begun. The reference is released through `release_ref` when the copy
-  ends, before the syscall returns, as a syscall pin's is.
+  or the listing ends, before the syscall returns, as a syscall pin's is.
 - **Wait-set membership.** `sys_wait_set_add` `inc_ref`s the source's header under the
   source's lock together with the back-pointer publication; `sys_wait_set_remove` and
   `wait_set_drop` perform the matching `dec_ref`. The source's state therefore outlives

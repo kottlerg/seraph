@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use json::{Value, json};
 
 use crate::cli::{BootHostArgs, HostArgs};
@@ -652,12 +652,12 @@ impl Admission
 pub enum Attempt
 {
     Refused(String),
-    Failed(anyhow::Error),
+    Failed(crate::error::Error),
 }
 
-impl From<anyhow::Error> for Attempt
+impl From<crate::error::Error> for Attempt
 {
-    fn from(err: anyhow::Error) -> Self
+    fn from(err: crate::error::Error) -> Self
     {
         Attempt::Failed(err)
     }
@@ -853,9 +853,8 @@ fn admit_command(ctx: &Context, host: &HostArgs, request: &Request) -> Result<Ad
     )
 }
 
-/// Admit a build (a command `CliCommand::build_host` names: `build`, `clean`,
-/// `test`, `compare-images`) on the host's load and its timing holders. Holds
-/// nothing once admitted.
+/// Admit a build (a command `CliCommand::build_host` names) on the host's load
+/// and its timing holders. Holds nothing once admitted.
 pub fn admit_build(ctx: &Context, host: &HostArgs) -> Result<()>
 {
     admit_command(ctx, host, &Request::Build).map(drop)

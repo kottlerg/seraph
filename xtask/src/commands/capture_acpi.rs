@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::{AcpiConfig, CaptureAcpiArgs};

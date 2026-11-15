@@ -24,7 +24,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use anyhow::{Result, bail};
+use crate::error::{Result, bail};
 
 use crate::cli::{TestArgs, TestComponent};
 use crate::context::Context as BuildContext;

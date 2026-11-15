@@ -15,7 +15,9 @@ flags (`THREAD_START_SUSPENDED`), the `SYS_THREAD_POST_UPCALL` flag (`UPCALL_ANY
 (`*_RETYPE_BYTES`, `event_queue_retype_bytes`, `wait_set_retype_bytes`), the `CSpace` funding
 constants (`CSPACE_SLOTS_PER_PAGE`, `CSPACE_BODIES_PER_PAGE`, `IOPORT_BINDING_TABLE_PAGES`), the
 scheduling, message, event-queue, and wait-set limits, the exit-reason and fault-protocol constants,
-the register-file layout, `KERNEL_VERSION`, and `SystemInfoType`, and one helper over them:
+the register-file and extended-state image layouts (`REGS_*`, `EXT_REGS_*`), the
+`SYS_THREAD_LIST_PAGES` run (`PageRun`, `PAGE_RUN_*`, `MAX_PAGE_RUNS`), `KERNEL_VERSION`, and
+`SystemInfoType`, and one helper over them:
 `cspace_topup_pages`, the donation that leaves a `CSpace` a given slot headroom and a page of growth
 budget beyond it for its body arena.
 

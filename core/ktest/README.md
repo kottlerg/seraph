@@ -90,15 +90,16 @@ cycle counter `crate::arch::serial`, `init_io_ports`, `shutdown`, and
 Per-syscall isolation tests. Every kernel syscall except `SYS_ASPACE_BIND_NOTIFICATION`,
 `SYS_PROCESS_EXIT`, the fault-handler binding syscalls (`SYS_THREAD_SET_FAULT_HANDLER`,
 `SYS_THREAD_GET_FAULT_HANDLER`, and `SYS_THREAD_INHERIT_FAULT_HANDLER`), the upcall syscalls
-(`SYS_THREAD_POST_UPCALL` and `SYS_THREAD_SET_UPCALL_MASK`), and the thread-memory syscalls
-(`SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`) has at least one positive-path test and the most
-important negative paths (wrong rights, invalid arguments, wrong object state). Those are exercised
-in Tier 2, by `aspace_fault_notification_late_bind.rs`, by `death_notification_late_bind.rs`, by
-`fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`, `fault_handler_declines_kills.rs`,
-`fault_forward.rs`, `fault_redirect.rs`, `fault_handler_rebind.rs`, `fault_class_bindings.rs`, and
-`fault_exception_redirect.rs`, by
-`thread_upcall.rs`, and by `thread_memory.rs`, respectively. Files are grouped by kernel
-subsystem, mirroring the kernel's own source layout.
+(`SYS_THREAD_POST_UPCALL` and `SYS_THREAD_SET_UPCALL_MASK`), the thread-memory syscalls
+(`SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`), and the core-dump enumeration syscalls
+(`SYS_THREAD_LIST_PAGES` and `SYS_THREAD_READ_EXT_REGS`) has at least one positive-path test and the
+most important negative paths (wrong rights, invalid arguments, wrong object state). Those are
+exercised in Tier 2, by `aspace_fault_notification_late_bind.rs`, by
+`death_notification_late_bind.rs`, by `fault_pager_roundtrip.rs`, `fault_resume_modifies_pc.rs`,
+`fault_handler_declines_kills.rs`, `fault_forward.rs`, `fault_redirect.rs`,
+`fault_handler_rebind.rs`, `fault_class_bindings.rs`, and `fault_exception_redirect.rs`, by
+`thread_upcall.rs`, by `thread_memory.rs`, and by `thread_list_pages.rs` and `thread_ext_regs.rs`,
+respectively. Files are grouped by kernel subsystem, mirroring the kernel's own source layout.
 
 | File | Syscalls / behaviour exercised |
 |---|---|
@@ -194,6 +195,8 @@ concurrent notification and queue events.
 | `fault_syscall_buffer.rs` | A restartable syscall's copy to (`SYS_GETRANDOM`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_READ_MEM`) or from (`SYS_THREAD_WRITE_REGS`, `SYS_THREAD_WRITE_MEM`) an unbacked buffer faults to the caller's handler with the first unmapped byte (a straddling span names its second page), the copy's access, the present bit where the architecture reports it, and the frame's instruction pointer, and the syscall re-executes on resume; a declined fault (unmapped or read-only page) fails the call with `InvalidAddress` and the caller lives; a handler-written instruction pointer stands on a decline and on a resume, as [docs/fault-handling.md § Kernel Copies](../../docs/fault-handling.md#kernel-copies) defines |
 | `fault_exception_redirect.rs` | A non-page-fault CPU exception is redirected to a bound fault handler, which resumes the thread at a new instruction pointer |
 | `thread_memory.rs` | Debugger memory access through a Thread capability, as [docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines: against a never-started thread of a fresh address space, a read straddling two pages returns what ktest stored through its own mapping of them and a `MAX_THREAD_MEM_COPY` write lands there; a write reaching an unmapped page changes nothing (`InvalidAddress`), and an unmapped page, a kernel-half address, a length of 0 or past `MAX_THREAD_MEM_COPY`, an undefined flag, and a cap without `CONTROL` are refused; a text page refuses a write without `THREAD_MEM_TEXT` (`InsufficientRights`), takes one with it, and a text page ktest also maps refuses it (`InvalidState`); a page mapped through a Map-only derived cap refuses a `mem_protect` to writable or executable through the full-rights cap of its frame and a text write (`InsufficientRights`), while the text page, mapped through an RX derived cap, still takes the text write; `SYS_SYSTEM_INFO(InstructionCacheSyncs)` rises across an executable `mem_map`, a `mem_protect` to executable (of a read-only page and of a page executable already), the text write, and a data write; a device page (an `Mmio` page from a copy of one ktest holds) is refused (`InvalidAddress`), and still refused after a `mem_protect` of it, which to writable or executable is itself refused (`InsufficientRights`), skipped when the boot hands ktest no `Mmio`; once the address space is deleted the thread is refused (`InvalidState`); a thread of ktest's own address space reads and writes a ktest static |
+| `thread_list_pages.rs` | Page enumeration through a Thread capability (`SYS_THREAD_LIST_PAGES`, as [core/kernel/docs/syscalls.md](../kernel/docs/syscalls.md) defines): against a never-started thread of a fresh address space mapping two writable pages, a read-only page after them, an executable page and, with an `Mmio`, a device page, the listing continued from each call's resume address holds exactly those runs in address order, the device page marked `PAGE_RUN_NO_COPY`; the same listing made one run a call joins to the same runs; a call at the top of the user half returns no run; a run count of 0 or past `MAX_PAGE_RUNS`, an unaligned or past-the-top start, a null or kernel-half buffer, and a cap without `CONTROL` are refused, and so is the thread once its space is deleted |
+| `thread_ext_regs.rs` | Extended-register reads through a Thread capability (`SYS_THREAD_READ_EXT_REGS`, as [core/kernel/docs/syscalls.md](../kernel/docs/syscalls.md) defines): a child that loaded a distinct value into each FP / SIMD / vector register and spins is refused while running (`InvalidState`); once stopped, each value sits at the offset the abi publishes for it, reads of 1024 and of 100 bytes return the same image, a read at or past the end returns no byte, and a length of 0 or past `MAX_THREAD_MEM_COPY` and a cap without `OBSERVE` are refused |
 | `fault_debug.rs` | A software breakpoint (`int3`, or a 4-byte `ebreak`) under a bound exception handler arrives as `FAULT_EXC_BREAKPOINT` with the architecture's reported instruction pointer (past `int3`, at `ebreak`), and the handler resumes the thread past it, as [docs/fault-handling.md § Debugging](../../docs/fault-handling.md#debugging) defines |
 | `fault_exception_no_handler_kills.rs` | A non-page-fault CPU exception with no handler bound is terminal |
 | `aspace_harvest_no_fault.rs` | A child bound to the harness as its fault handler stores to, loads from, makes a `SYS_GETRANDOM` copy into, and receives IPC data words into pages whose accessed bits `SYS_ASPACE_HARVEST` cleared; no fault reaches the handler (on riscv64 the kernel sets the bit in its fault path), every call succeeds, and the next harvest reports exactly the pages touched, as [core/kernel/docs/memory-internals.md § Accessed Bits](../kernel/docs/memory-internals.md#accessed-bits) defines |

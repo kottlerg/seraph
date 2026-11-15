@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 
 use crate::arch::Arch;
 use crate::cli::TestGdbArgs;
@@ -219,7 +219,7 @@ fn boot(ctx: &Context, args: &TestGdbArgs, gdb: &Path, layout: DiskLayout) -> Re
             {}
             Err(_) =>
             {
-                break Err(anyhow::anyhow!(
+                break Err(crate::error::err!(
                     "the stub's {READY_MARKER:?} line did not appear within {}s",
                     BOOT_TIMEOUT.as_secs()
                 ));
@@ -315,7 +315,7 @@ fn run_gdb(gdb: &Path, arch: Arch, port: u16, binary: &Path) -> Result<String>
     let _ = child.kill();
     let _ = child.wait();
     let output = output
-        .map_err(|_| anyhow::anyhow!("gdb did not finish within {}s", GDB_TIMEOUT.as_secs()))?;
+        .map_err(|_| crate::error::err!("gdb did not finish within {}s", GDB_TIMEOUT.as_secs()))?;
     println!("{output}");
     Ok(output)
 }

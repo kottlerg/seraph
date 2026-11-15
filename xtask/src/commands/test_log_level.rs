@@ -27,7 +27,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use regex::Regex;
 
 use crate::bundle::{Harness, compose_with_levels};

@@ -8,7 +8,7 @@
 //! The rules themselves, and the admission every build and boot passes, are
 //! `crate::host_lock`'s; this command only prints what they read.
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::cli::{HostCommand, HostCommandArgs};
 use crate::context::Context;

@@ -301,9 +301,6 @@ mod tests
         assert_eq!(run_ed25519_kats(), Ok(()));
     }
 
-    /// The seed of the generated inputs; any fixed value serves.
-    const SEED: u64 = 0x5e4a_ed25;
-
     fn verdict(result: Result<(), VerifyError>) -> Verdict
     {
         match result
@@ -336,11 +333,12 @@ mod tests
     /// Every Wycheproof Ed25519 case: valid ones verify, invalid ones are
     /// refused, and an acceptable one (a small- or mixed-order key) verifies
     /// exactly when the cofactorless equation holds, which the reference
-    /// judges.
+    /// vectors judge.
     #[test]
     fn verify_passes_every_wycheproof_case()
     {
         let file = wycheproof::load::<eddsa::Group>(&wycheproof::ED25519).unwrap();
+        let vectors = reference::load().unwrap();
         let report = wycheproof::run(
             &file,
             "wycheproof ed25519",
@@ -349,9 +347,10 @@ mod tests
                     .is_some_and(|(key, sig)| ed25519_verify(&key, &case.msg, &sig).is_ok())
             },
             |group, case| {
-                sized(group, case).is_some_and(|(key, sig)| {
-                    reference::reference(&key, &case.msg, &sig) == Verdict::Accept
-                })
+                let verdict = sized(group, case)
+                    .and_then(|(key, sig)| vectors.verdict(&key, &case.msg, &sig));
+                verdict.expect("the reference vectors hold every acceptable case")
+                    == Verdict::Accept
             },
         );
         assert!(report.agrees(), "{report}");
@@ -362,9 +361,9 @@ mod tests
     {
         let report = differential::compare(
             "ed25519 generated",
-            reference::generated(SEED, 128),
+            reference::load().unwrap().generated,
             ours,
-            Input::reference,
+            |input| input.reference,
         );
         assert!(report.agrees(), "{report}");
     }
@@ -374,9 +373,9 @@ mod tests
     {
         let report = differential::compare(
             "ed25519 edge cases",
-            reference::edge_cases(),
+            reference::load().unwrap().edge_cases,
             ours,
-            Input::reference,
+            |input| input.reference,
         );
         assert!(report.agrees(), "{report}");
     }

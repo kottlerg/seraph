@@ -99,15 +99,55 @@ pub struct DeferredRun
     pub budget: NodeIdx,
 }
 
-/// One registered demand region on its process's region list: the region and
-/// the root of its chunk table ([`crate::chunk`]), [`NODE_NULL`] while no
-/// chunk of it has an entry.
+/// One registered demand region on its process's region list: the region, the
+/// root of its chunk table ([`crate::chunk`]), [`NODE_NULL`] while no chunk of
+/// it has an entry, and, for a committed region, its commitment's page-table
+/// state ([`crate::commit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegionNode
 {
     pub region: DemandRegion,
     pub table: NodeIdx,
+    /// [`Commitment::NONE`] for an uncommitted region.
+    pub commit: Commitment,
 }
+
+/// The page-table state of a committed region's commitment
+/// ([`crate::commit`]). A committed region is never empty, so a zero
+/// `high_len` marks an uncommitted one ([`Commitment::NONE`]), which keeps a
+/// region node within the arena slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Commitment
+{
+    /// The pages of the page-table reservation its faults' donations have not
+    /// drawn.
+    pub pt_left: u64,
+    /// The largest length in bytes the region has had. A cut keeps the page
+    /// tables of the pages it cuts, so the reservation is that of this length
+    /// ([`crate::commit::regrow_need`]).
+    pub high_len: u64,
+}
+
+impl Commitment
+{
+    /// The commitment of an uncommitted region.
+    pub const NONE: Self = Self {
+        pt_left: 0,
+        high_len: 0,
+    };
+
+    /// The commitment, or `None` for an uncommitted region.
+    #[must_use]
+    pub const fn get(self) -> Option<Self>
+    {
+        if self.high_len == 0 { None } else { Some(self) }
+    }
+}
+
+// Hard size budget: a region node shares the arena slot with every other
+// payload, and `SLOTS_PER_PAGE` is sized for the largest of them, a
+// [`ProcessRecord`].
+const _: () = assert!(size_of::<RegionNode>() <= size_of::<ProcessRecord>());
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

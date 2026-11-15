@@ -113,14 +113,16 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   request beyond the free block at the heap's top, and an allocation
   grows again while each grow maps pages, so a single allocation is
   bounded only by the heap zone ([Growth Zones](#growth-zones)) and the
-  pool. Design intent; not yet implemented
-  ([#230](https://github.com/kottlerg/seraph/issues/230)): in a
-  demand-paged process the grow path extends a committed demand region
-  above the heap floor instead, which memmgr charges in full, budget and
-  RAM, when it accepts the extension, and backs chunk by chunk on first
-  touch, so a grow is refused as an allocation error, never as a fault,
-  and the heap holds no Memory caps
-  ([memmgr Memory Pool § Eviction](../services/memmgr/docs/memory-pool.md#eviction)).
+  pool. In a demand-paged process the heap keeps its uncommitted
+  512-page demand floor; its first grow registers one committed growth
+  region (`REGISTER_REGION` with `REGION_COMMIT`) directly above the floor
+  and every later grow extends it (`EXTEND_REGION`), in 16-page (64 KiB)
+  multiples. memmgr charges each in full, budget and RAM, when it accepts
+  it and backs chunks on first touch, so a grow is refused as an
+  allocation error (null from `alloc`, `Err` from `try_reserve`), not
+  as a fault (unless the process's own mappings and unmaps spend the
+  region's page-table reservation early), and the heap holds no Memory caps
+  ([memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit)).
   A process with no pager keeps requesting Memory caps with
   `REQUEST_MEMORY_CAPS` and mapping them.
 - **Bootstrap.** Before `fn main()` runs, `std::os::seraph::_start`

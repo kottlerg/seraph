@@ -605,11 +605,21 @@ pub const SYS_ENTROPY_CONTRIBUTE: u64 = 65;
 /// a caller bitmap. See `core/kernel/docs/syscalls.md` § `SYS_ASPACE_HARVEST`
 /// (66).
 pub const SYS_ASPACE_HARVEST: u64 = 66;
+/// Thread: list the mapped user pages of the thread's address space, as runs
+/// of pages of one protection, through a Thread capability carrying
+/// [`RIGHTS_THREAD_CONTROL`]. See `core/kernel/docs/syscalls.md`
+/// § `SYS_THREAD_LIST_PAGES` (67).
+pub const SYS_THREAD_LIST_PAGES: u64 = 67;
+/// Thread: copy part of a held-still thread's extended register state
+/// (floating point, SIMD, vector) into the caller's buffer, through a Thread
+/// capability carrying [`RIGHTS_THREAD_OBSERVE`]. See
+/// `core/kernel/docs/syscalls.md` § `SYS_THREAD_READ_EXT_REGS` (68).
+pub const SYS_THREAD_READ_EXT_REGS: u64 = 68;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_ASPACE_HARVEST + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_READ_EXT_REGS + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -1504,6 +1514,82 @@ pub const MAX_THREAD_MEM_COPY: usize = 4096;
 /// or without, then makes instruction fetch on every hart see the write
 /// (`docs/fault-handling.md` § Debugging).
 pub const THREAD_MEM_TEXT: u64 = 1 << 0;
+
+// ── Page enumeration (SYS_THREAD_LIST_PAGES) ─────────────────────────────────
+
+/// One run of `SYS_THREAD_LIST_PAGES`: `pages` mapped 4 KiB pages from
+/// `va`, each with the protection `prot` (`PAGE_RUN_*` bits). The kernel
+/// writes runs in ascending `va` order and joins adjacent pages of one
+/// protection into one run; two runs of one call are never adjacent with the
+/// same protection, while the last run of one call and the first of the
+/// next may be.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageRun
+{
+    /// The first page's virtual address, page-aligned.
+    pub va: u64,
+    /// Pages in the run, at least 1.
+    pub pages: u64,
+    /// The protection every page of the run has: `PAGE_RUN_*` bits.
+    pub prot: u64,
+}
+
+/// [`PageRun::prot`] bit: the thread may load from the pages. Every mapped
+/// x86-64 user page is readable. The value is [`MAP_READ`]'s.
+pub const PAGE_RUN_READ: u64 = MAP_READ;
+/// [`PageRun::prot`] bit: the thread may store to the pages. The value is
+/// [`MAP_WRITABLE`]'s.
+pub const PAGE_RUN_WRITE: u64 = MAP_WRITABLE;
+/// [`PageRun::prot`] bit: the thread may execute from the pages. The value
+/// is [`MAP_EXECUTABLE`]'s.
+pub const PAGE_RUN_EXECUTE: u64 = MAP_EXECUTABLE;
+/// [`PageRun::prot`] bit: `SYS_THREAD_READ_MEM` and `SYS_THREAD_WRITE_MEM`
+/// refuse the pages, which are device memory or lie past the top of RAM; a
+/// core dump records the run and skips its bytes.
+pub const PAGE_RUN_NO_COPY: u64 = 1 << 3;
+
+/// Most runs one `SYS_THREAD_LIST_PAGES` call writes. The kernel builds the
+/// runs in its per-CPU syscall scratch buffer, so the bound keeps them within
+/// [`MAX_THREAD_MEM_COPY`] bytes (`docs/limits.md`).
+pub const MAX_PAGE_RUNS: u64 = 128;
+
+const _: () = assert!(
+    core::mem::size_of::<PageRun>() == 24,
+    "PageRun is three u64 words with no padding"
+);
+const _: () = assert!(
+    MAX_PAGE_RUNS * core::mem::size_of::<PageRun>() as u64 <= MAX_THREAD_MEM_COPY as u64,
+    "a full run buffer fits the kernel's staging bytes"
+);
+
+// ── Extended register state (SYS_THREAD_READ_EXT_REGS) ──────────────────────
+
+/// The XCR0 value whose XSAVE area is the x86-64 extended-state image: x87,
+/// SSE and AVX. The image is the standard-format XSAVE area for these
+/// components: the legacy region at 0, the XSAVE header (`XSTATE_BV` first)
+/// at 512, and the upper halves of the YMM registers at 576. A component
+/// whose `XSTATE_BV` bit is clear is in its initial state, whatever its
+/// bytes hold. Bytes 464..512 of the legacy region are not written.
+pub const EXT_REGS_X86_64_XCR0: u64 = 0b111;
+/// Byte offset of `f0` in the riscv64 extended-state image: `fN` sits at
+/// this offset plus `N * 8`, NaN-boxed when it holds a single.
+pub const EXT_REGS_RISCV64_F0_OFFSET: usize = 0;
+/// Byte offset of `fcsr` (8 bytes, the CSR zero-extended) in the riscv64
+/// extended-state image.
+pub const EXT_REGS_RISCV64_FCSR_OFFSET: usize = 256;
+/// Byte offset of `vstart` (8 bytes) in the riscv64 extended-state image.
+pub const EXT_REGS_RISCV64_VSTART_OFFSET: usize = 264;
+/// Byte offset of `vl` (8 bytes) in the riscv64 extended-state image.
+pub const EXT_REGS_RISCV64_VL_OFFSET: usize = 272;
+/// Byte offset of `vtype` (8 bytes) in the riscv64 extended-state image.
+pub const EXT_REGS_RISCV64_VTYPE_OFFSET: usize = 280;
+/// Byte offset of `vcsr` (8 bytes) in the riscv64 extended-state image.
+pub const EXT_REGS_RISCV64_VCSR_OFFSET: usize = 288;
+/// Byte offset of `v0` in the riscv64 extended-state image: `vN` sits at
+/// this offset plus `N * vlenb`, `vlenb` being the image's size less this
+/// offset, divided by 32.
+pub const EXT_REGS_RISCV64_V0_OFFSET: usize = 304;
 
 // ── Accessed-bit harvest (SYS_ASPACE_HARVEST) ────────────────────────────────
 

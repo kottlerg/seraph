@@ -3,31 +3,33 @@
 
 // shared/crypto/testkit/src/sha512.rs
 
-//! The SHA-512 reference digest and the differential inputs: messages of
-//! every length around the padding and block boundaries, and generated
-//! messages with the points at which an incremental hasher is fed.
+//! The SHA-512 reference vectors: messages of every length around the
+//! padding and block boundaries, and longer generated messages, each with
+//! the points at which an incremental hasher is fed and the reference
+//! digest.
 //!
-//! The reference is `RustCrypto`'s `sha2`, an implementation independent of
-//! `shared/crypto`.
+//! The vectors are `vectors/reference/sha512.json`, which the
+//! [`generate`](crate::generate) module writes with OpenSSL as the
+//! reference.
 
 use std::fmt;
 
-use sha2::{Digest, Sha512};
+use json::Value;
 
 use crate::hex;
-use crate::rng::Rng;
+use crate::vectors::{self, LoadError};
 
-/// The reference SHA-512 digest of `data`.
-#[must_use]
-pub fn reference(data: &[u8]) -> [u8; 64]
-{
-    let mut out = [0u8; 64];
-    out.copy_from_slice(&Sha512::digest(data));
-    out
-}
+/// The file's name under `vectors/reference/`.
+pub const FILE: &str = "sha512.json";
 
-/// One message, and the ascending offsets at which an incremental hasher
-/// splits it into `update` calls.
+/// The schema the file declares, which [`load`] checks.
+pub const SCHEMA: &str = "seraph_sha512_reference_v1";
+
+/// The file's text.
+const TEXT: &str = include_str!("../vectors/reference/sha512.json");
+
+/// One message, the ascending offsets at which an incremental hasher splits
+/// it into `update` calls, and its reference digest.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Input
 {
@@ -35,6 +37,8 @@ pub struct Input
     pub data: Vec<u8>,
     /// The split offsets, ascending, each at most `data.len()`.
     pub cuts: Vec<usize>,
+    /// The reference SHA-512 digest of the message.
+    pub digest: [u8; 64],
 }
 
 impl fmt::Debug for Input
@@ -53,6 +57,28 @@ impl fmt::Debug for Input
 
 impl Input
 {
+    fn from_json(value: &Value) -> Result<Self, LoadError>
+    {
+        let data = vectors::bytes(value, "message")?;
+        let cuts = vectors::array(value, "cuts")?
+            .iter()
+            .map(|cut| cut.as_u64().and_then(|c| usize::try_from(c).ok()))
+            .collect::<Option<Vec<usize>>>()
+            .ok_or_else(|| LoadError::Parse("a cut is not a non-negative integer".into()))?;
+        if !cuts.is_sorted() || cuts.last().is_some_and(|&last| last > data.len())
+        {
+            return Err(LoadError::Parse(format!(
+                "cuts {cuts:?} are not ascending offsets within {} bytes",
+                data.len()
+            )));
+        }
+        Ok(Self {
+            data,
+            cuts,
+            digest: vectors::fixed(value, "digest")?,
+        })
+    }
+
     /// The message split at `cuts`: the pieces an incremental hasher is fed,
     /// empty pieces included.
     #[must_use]
@@ -70,31 +96,31 @@ impl Input
     }
 }
 
-/// Every length from 0 to 300 bytes (the 111/112-byte padding boundary and
-/// the 128- and 256-byte block boundaries among them), and longer messages
-/// of several blocks, from `seed`; each split at random offsets, one of them
-/// on a block boundary when the message reaches it.
-#[must_use]
-pub fn generated(seed: u64, long: usize) -> Vec<Input>
+/// Load the reference vectors: every length from 0 to 300 bytes (the
+/// 111/112-byte padding boundary and the 128- and 256-byte block boundaries
+/// among them), then longer messages of several blocks; each split at random
+/// offsets, one of them on the first block boundary when the message reaches
+/// it.
+///
+/// # Errors
+///
+/// A [`LoadError`] when the file does not parse or a case is malformed (cuts
+/// out of order or past the message among them), declares another schema,
+/// or holds another number of cases than it declares.
+pub fn load() -> Result<Vec<Input>, LoadError>
 {
-    let mut rng = Rng::new(seed);
-    let mut lengths: Vec<usize> = (0..=300).collect();
-    lengths.extend((0..long).map(|_| rng.below(8192)));
-    lengths
-        .into_iter()
-        .map(|len| {
-            let data = rng.bytes(len);
-            let mut cuts: Vec<usize> = (0..rng.below(4))
-                .map(|_| rng.below(len.wrapping_add(1)))
-                .collect();
-            if len >= 128
-            {
-                cuts.push(128);
-            }
-            cuts.sort_unstable();
-            Input { data, cuts }
-        })
-        .collect()
+    parse(TEXT)
+}
+
+fn parse(text: &str) -> Result<Vec<Input>, LoadError>
+{
+    let document = vectors::document(text)?;
+    let cases = vectors::array(&document, "generated")?
+        .iter()
+        .map(Input::from_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    vectors::check_header(&document, SCHEMA, cases.len())?;
+    Ok(cases)
 }
 
 #[cfg(test)]
@@ -108,8 +134,35 @@ mod tests
         let input = Input {
             data: b"abcdef".to_vec(),
             cuts: vec![0, 2, 2, 6],
+            digest: [0; 64],
         };
         let pieces: Vec<&[u8]> = input.pieces();
         assert_eq!(pieces, [&b""[..], b"ab", b"", b"cdef", b""]);
+    }
+
+    fn file(cuts: &str) -> String
+    {
+        format!(
+            r#"{{"schema": "{SCHEMA}", "numberOfTests": 1, "generated": [
+            {{"message": "616263", "cuts": {cuts}, "digest": "{}"}}]}}"#,
+            "00".repeat(64)
+        )
+    }
+
+    #[test]
+    fn parse_reads_a_case_and_refuses_cuts_out_of_order_or_past_the_message()
+    {
+        let loaded = parse(&file("[1, 3]")).unwrap();
+        assert_eq!(
+            (loaded[0].data.as_slice(), loaded[0].cuts.as_slice()),
+            (&b"abc"[..], &[1, 3][..])
+        );
+        for bad in ["[2, 1]", "[4]", "[-1]"]
+        {
+            assert!(
+                matches!(parse(&file(bad)), Err(LoadError::Parse(_))),
+                "{bad}"
+            );
+        }
     }
 }

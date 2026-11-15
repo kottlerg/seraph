@@ -48,6 +48,7 @@ pub mod fs_faults;
 pub mod fs_ipc;
 pub mod fs_opens;
 pub mod fs_std;
+pub mod heap_commit;
 pub mod layout;
 pub mod log_client;
 pub mod memmgr;
@@ -87,6 +88,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(budget::phases());
+    out.extend_from_slice(heap_commit::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

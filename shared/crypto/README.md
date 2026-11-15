@@ -94,7 +94,7 @@ only dev-dependency:
   verify, invalid ones are refused (a signature of another length than 64 bytes
   is refused by the API's `&[u8; 64]`), and an acceptable one (a small- or
   mixed-order public key) verifies exactly when the cofactorless equation holds,
-  which the reference judges. Every case of the vendored
+  as OpenSSL's verdict in the reference vectors states. Every case of the vendored
   `chacha20_poly1305_test.json`: `open` turns a valid case's ciphertext into its
   plaintext and refuses an invalid one (a modified tag; a nonce of another size
   than 12 bytes is refused by the API's `&[u8; 12]`), and `seal` turns a valid
@@ -104,11 +104,11 @@ only dev-dependency:
   nonce and AAD, a bit of every ciphertext byte, a truncation and another key
   are refused with the buffer unchanged; the length bound holds at `MAX_LEN`
   and one byte past it.
-- **Differential.** `ed25519_verify` against the `ed25519-dalek` reference, on
-  generated signatures with one-bit corruptions and on an edge-case corpus
-  (malleability, the S range check, degenerate and non-canonical public keys,
-  small-order and non-canonical R), comparing which check fails, not only
-  acceptance; `sha512` and `Sha512` against `RustCrypto` `sha2` over every
+- **Differential.** `ed25519_verify` against reference vectors computed with
+  OpenSSL, on generated signatures with one-bit corruptions and on an edge-case
+  corpus (malleability, the S range check, degenerate and non-canonical public
+  keys, small-order and non-canonical R), comparing which check fails, not only
+  acceptance; `sha512` and `Sha512` against OpenSSL's digests over every
   length to 300 bytes and longer messages, fed whole and in pieces.
 
 Any disagreement fails the test. The loader, the harness and the references are
@@ -124,7 +124,8 @@ shared/crypto/
 ├── Cargo.toml                  # Workspace member; no_std library; no dependencies
 ├── README.md
 ├── testkit/                    # Test-only: Wycheproof loader, differential
-│                               # harness, references (crypto-testkit)
+│                               # harness, OpenSSL reference vectors and their
+│                               # generator (crypto-testkit)
 └── src/
     ├── lib.rs                  # Crate doc, public re-exports
     ├── sha512.rs               # SHA-512 (one-shot + incremental) + KATs

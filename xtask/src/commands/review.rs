@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use json::{Map, Value, json};
 
 use crate::cli::{ReviewCheckArgs, ReviewLedgerArgs};
@@ -53,6 +53,13 @@ const NOT_RUN: &str = "NOT RUN";
 /// The record modes: a first run, a later run with the reviewer, and an
 /// audit alone.
 const MODES: &[&str] = &["full", "delta", "audit"];
+
+/// The audit sections that belong to an `audit` record alone, matched in a
+/// section's name without regard to case: the checks of the auditor-only run
+/// and of the audit that completes a run of the reviewer alone
+/// (.claude/agents/pr-auditor.md steps 11 and 12). A `full` or `delta` record
+/// is a run with the reviewer, whose audit applies neither.
+const AUDIT_ONLY_SECTIONS: &[&str] = &["auditor-only", "completing-audit"];
 
 /// The value of `stats.form` in a record of the defect form.
 const DEFECT_FORM: &str = "defects";
@@ -355,9 +362,39 @@ fn check_verdicts(out: &mut Vec<Diag>, name: &str, record: &Value)
         field(record, "/audit/verdict"),
         AUDIT_VERDICTS,
     );
-    if !field(record, "/audit/sections").is_array()
+    match field(record, "/audit/sections").as_array()
     {
-        out.push(shape(name, "audit.sections", "is not a list"));
+        Some(sections) => check_run_kind(out, name, record, sections),
+        None => out.push(shape(name, "audit.sections", "is not a list")),
+    }
+}
+
+/// That the audit of a run with the reviewer (a `full` or `delta` record)
+/// carries no section of another run kind: one there shows the auditor was
+/// not given its run kind, or misread it, and the audit is re-run with the
+/// run-kind line (.claude/skills/pr-review/SKILL.md § The run).
+fn check_run_kind(out: &mut Vec<Diag>, name: &str, record: &Value, sections: &[Value])
+{
+    let mode = field(record, "/stats/mode");
+    if mode != "full" && mode != "delta"
+    {
+        return;
+    }
+    for (index, section) in sections.iter().enumerate()
+    {
+        let title = section["name"].as_str().unwrap_or("").to_ascii_lowercase();
+        if let Some(kind) = AUDIT_ONLY_SECTIONS.iter().find(|k| title.contains(*k))
+        {
+            out.push(Diag::error(
+                "record-run-kind",
+                format!("{name}: audit.sections[{index}]"),
+                format!(
+                    "a `{mode}` record is a run with the reviewer, and its audit carries a \
+                     `{kind}` section, which only an `audit` record's run kind selects; run the \
+                     audit again with `Run kind: with-reviewer` and put its result in the record"
+                ),
+            ));
+        }
     }
 }
 
@@ -1450,6 +1487,49 @@ mod tests
         ]
         {
             assert_eq!(rules(&check_record(name, &bad)), ["record-audit-shape"]);
+        }
+    }
+
+    fn with_sections(mut r: Value, mode: &str, names: &[&str]) -> Value
+    {
+        r["stats"]["mode"] = json!(mode);
+        r["audit"]["sections"] = Value::Array(
+            names
+                .iter()
+                .map(|n| json!({"name": n, "verdict": "PASS", "items": []}))
+                .collect(),
+        );
+        r
+    }
+
+    #[test]
+    fn a_run_with_the_reviewer_whose_audit_has_an_audit_only_section_is_reported()
+    {
+        for mode in ["full", "delta"]
+        {
+            let name = format!("{mode}-0a82b0aa.json");
+            let auditor_only =
+                with_sections(passing(), mode, &["PR-body claims", "Auditor-only checks"]);
+            let found = check_record(&name, &auditor_only);
+            assert_eq!(rules(&found), ["record-run-kind"]);
+            assert_eq!(found[0].at, format!("{name}: audit.sections[1]"));
+            let completing = with_sections(passing(), mode, &["completing-audit checks"]);
+            assert_eq!(
+                rules(&check_record(&name, &completing)),
+                ["record-run-kind"]
+            );
+        }
+    }
+
+    #[test]
+    fn an_audit_record_may_carry_the_sections_of_its_run_kind()
+    {
+        let ok = with_sections(passing(), "delta", &["PR-body claims", "Validation claim"]);
+        assert_eq!(check_record(NAME, &ok), [] as [Diag; 0]);
+        for section in ["Auditor-only checks", "Completing-audit checks"]
+        {
+            let audit = with_sections(passing(), "audit", &[section]);
+            assert_eq!(check_record("audit-0a82b0aa.json", &audit), [] as [Diag; 0]);
         }
     }
 

@@ -24,6 +24,7 @@ xtask/
 │   ├── accel.rs                # Per-host QEMU acceleration-backend selection
 │   ├── bundle.rs               # Bootloader bundle composition (MODULES table)
 │   ├── disk.rs                 # GPT disk-image construction from the sysroot
+│   ├── error.rs                # Error type with its context chain; Context, err!, bail!, ensure!
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
@@ -44,7 +45,8 @@ xtask/
 │   ├── util.rs                 # Step printing, command execution, tool lookup
 │   ├── commands/               # Subcommand modules (build, capture_acpi, run, run_parallel,
 │   │                           #   ktest_timing, symbolize, mkdisk, compose_bundle, clean,
-│   │                           #   test, compare_images, test_crash_report, test_debug_port,
+│   │                           #   test, crypto_vectors, compare_images, test_crash_report,
+│   │                           #   test_debug_port,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
 │   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
@@ -413,6 +415,26 @@ That build uses an unwinding `dev` profile (`CARGO_PROFILE_DEV_PANIC=unwind`), s
 harness cannot link with a `std` built for `panic=abort`. The command fails, naming the packages
 to install, when the emulator, the cross compiler or its C library is missing
 ([docs/build-system.md](../docs/build-system.md) § Toolchain).
+
+The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
+their `--wait-host` and `--host-override` options.
+
+---
+
+### `cargo xtask crypto-vectors`
+
+Regenerate the reference vectors of `shared/crypto/testkit` with OpenSSL, or check that the
+checked-in files regenerate byte-identically.
+
+```
+cargo xtask crypto-vectors [--check]
+```
+
+The command builds and runs the testkit's `crypto-reference-vectors` binary for the host, which
+drives the `openssl` command found on `PATH`
+([shared/crypto/testkit/README.md](../shared/crypto/testkit/README.md)). Without `--check` it
+writes `vectors/reference/ed25519.json` and `sha512.json`; with it, it writes nothing and fails,
+naming each file, unless both regenerate byte-identically. xtask does not depend on the testkit.
 
 The command is admitted as a build under the [Host launch rules](#host-launch-rules), and takes
 their `--wait-host` and `--host-override` options.
@@ -1271,6 +1293,13 @@ does not state its record's mode and head, `error record-name`. A record with `a
 record with `NOT RUN` is `error record-audit-shape`; a record without an `audit` key is
 `error record-shape`, since the reviewer-alone form states the `null`.
 
+A `full` or `delta` record whose `audit.sections` holds a section whose name contains
+`auditor-only` or `completing-audit`, in any letter case, is `error record-run-kind`: those are
+the checks of the auditor-only run and of the audit that completes a run of the reviewer alone,
+which only an `audit` record's run kind selects (`.claude/agents/pr-auditor.md` steps 2a, 11
+and 12), so the audit of that run with the reviewer is run again with the run-kind line
+`Run kind: with-reviewer` (`.claude/skills/pr-review/SKILL.md` § The record).
+
 ### `cargo xtask review-ledger`
 
 Build the ledger of a review: the findings a later run must not re-raise
@@ -1557,10 +1586,11 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 ## Host launch rules
 
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
-themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test` and
-`compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names them); `run`,
-`run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`, `test-kaslr`,
-`test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi` as boots.
+themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
+`crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
+them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`,
+`test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi`
+as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

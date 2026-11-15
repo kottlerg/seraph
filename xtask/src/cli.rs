@@ -1750,7 +1750,7 @@ mod tests
     #[test]
     fn each_command_that_compiles_is_admitted_as_a_build_with_its_host_options()
     {
-        for command in ["build", "clean", "test", "compare-images"]
+        for command in ["build", "clean", "test", "crypto-vectors", "compare-images"]
         {
             let host = build_host_of(&["xtask", command, "--wait-host", "30"])
                 .unwrap_or_else(|| panic!("`{command}` is not admitted as a build"));

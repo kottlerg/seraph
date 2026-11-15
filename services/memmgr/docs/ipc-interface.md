@@ -40,10 +40,11 @@ Two privilege classes:
   identifies this cap by badge and rejects procmgr-only calls received over
   any other badged cap, replying `UNAUTHORIZED`.
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
-  `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`) are callable
-  over any badged cap, including those memmgr returned from
-  `REGISTER_PROCESS`. `REGISTER_REGION` and `UNREGISTER_REGION` are
-  attributed to the caller by its own badge.
+  `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
+  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`) are callable over any badged
+  cap, including those memmgr returned from `REGISTER_PROCESS`.
+  `REGISTER_REGION`, `UNREGISTER_REGION`, `QUERY_MEMORY_USAGE` and
+  `REGISTER_PRESSURE` are attributed to the caller by its own badge.
 
 The badge on an ordinary IPC message is the badge of the sender's cap,
 and it cannot be forged: badges are minted by `cap_derive_badge` only
@@ -298,12 +299,13 @@ the eventual `PROCESS_DIED`.
 ### Label 4: `PROCESS_DIED`
 
 Procmgr signals process death. memmgr looks up the per-process tracking entry
-by badge, takes back every Memory cap memmgr has issued to that process, and
-runs coalescing (see [`memory-pool.md`](memory-pool.md) §"Reclamation"). A
-frame another process can still reach, through a capability to it, a kernel
-object retyped from it, or a user mapping of it, waits on memmgr's deferred
-list rather than joining the free pool, until a later recheck finds it
-unreachable. Privilege: procmgr-only.
+by badge, deletes the process's `REGISTER_PRESSURE` cap, takes back every
+Memory cap memmgr has issued to that process, and runs coalescing (see
+[`memory-pool.md`](memory-pool.md) §"Reclamation"). A frame another process
+can still reach, through a capability to it, a kernel object retyped from it,
+or a user mapping of it, waits on memmgr's deferred list rather than joining
+the free pool, until a later recheck finds it unreachable. Privilege:
+procmgr-only.
 
 **Request:**
 
@@ -424,8 +426,8 @@ Structure").
 ### Label 6: `QUERY_POOL_STATUS`
 
 Read-only query of the all-RAM-accounted identity plus the current free,
-deferred and largest-run totals. Privilege: universal — returns aggregate
-counts only, no caps and no state change.
+deferred and largest-run totals and the memory-pressure level. Privilege:
+universal — returns aggregate counts only, no caps and no state change.
 
 **Request:** label 6, no words, no caps.
 
@@ -441,6 +443,7 @@ counts only, no caps and no state change.
 | data[4] | `deferred_bytes` — subset of `pool_total_bytes` reclaimed but held out of the free runs while another process can still reach it |
 | data[5] | `largest_free_bytes` — the largest single free run, the most one `REQUIRE_CONTIGUOUS` grant can take; 0 when the pool is empty |
 | data[6] | `reserve_bytes` — the system reserve: the free pages a charge to a budget node outside the reserve may not take ([`memory-pool.md`](memory-pool.md) § Distribution policy) |
+| data[7] | `pressure` — the memory-pressure level: 0 `PRESSURE_NORMAL`, 1 `PRESSURE_LOW`, 2 `PRESSURE_CRITICAL` ([`memory-pool.md`](memory-pool.md) § Memory pressure) |
 
 The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every page
 is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
@@ -459,8 +462,11 @@ baseline, and `data[4]` shows what is held instead. `largest_free_bytes`
 backed from a smaller run (§ Kernel-origin fault message). `reserve_bytes`
 (`data[6]`) is `pool_total / 64` pages: a process outside the reserve has its
 grants refused, and its demand faults declined, once `data[3]` less the
-request would fall below it. `data[3]` to `data[6]` are appended after the
-identity terms; readers needing only the identity may ignore them.
+request would fall below it. `pressure` (`data[7]`) is the level memmgr last
+signalled to the `REGISTER_PRESSURE` registrants, so a registrant woken by its
+bit reads here the level the bit announced, or a later one. `data[3]` to
+`data[7]` are appended after the identity terms; readers needing only the
+identity may ignore them.
 
 ### Label 7: `REGISTER_REGION`
 
@@ -593,6 +599,39 @@ usage falls below it.
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | Unknown badge |
 
+### Label 11: `REGISTER_PRESSURE`
+
+Register the Notification memmgr signals when the memory-pressure level
+changes ([`memory-pool.md`](memory-pool.md) § Memory pressure). Privilege:
+universal — attributed to the caller by `recv.badge`. The std runtime
+registers every process at start (`runtime/ruststd/README.md` § Process
+Entry), so a process waits on the signal with no call of its own.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 11 |
+| data[0] | `bits` — the bits to send on a change of level; nonzero |
+| cap[0] | a Notification cap with Notify rights; ownership transfers to memmgr |
+
+memmgr keeps one registration per process: a second replaces the first, and
+memmgr deletes the cap the first carried, so a client holds one slot of
+memmgr's `CSpace` however often it registers. `PROCESS_DIED` deletes the cap.
+On each change of level memmgr sends `bits` on the cap once, without
+blocking: a send to a Notification ORs the bits in and never waits, and bits
+not yet taken coalesce. The bit says that the level changed; the level is read
+from `QUERY_POOL_STATUS` `data[7]`. A send that fails, for a cap the client
+revoked, is dropped.
+
+**Reply (success):** label 0, no words, no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | Unknown badge, zero `bits`, or `cap[0]` missing or not a Notification with Notify rights; memmgr deletes the cap, and any earlier registration stays |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page
@@ -680,14 +719,15 @@ reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 
-Only two labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
-attached cap) and `DELEGATE_ASPACE` (`cap[0]`). memmgr deletes every other
-cap a message carries before it handles the message, whatever the label,
-the caller, or the reply: the caps attached to any other label (a
-`FAULT_LABEL` message and an unknown label included) and the caps after
-`cap[0]` on `DELEGATE_ASPACE`. It deletes the contract caps as well when the
-caller is not procmgr, and in the error cases the two labels' sections
-state. An attached cap therefore never outlives the call that carried it
+Only three labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
+attached cap), `DELEGATE_ASPACE` (`cap[0]`) and `REGISTER_PRESSURE`
+(`cap[0]`). memmgr deletes every other cap a message carries before it
+handles the message, whatever the label, the caller, or the reply: the caps
+attached to any other label (a `FAULT_LABEL` message and an unknown label
+included) and the caps after `cap[0]` on `DELEGATE_ASPACE` and
+`REGISTER_PRESSURE`. It deletes the contract caps as well when a procmgr-only
+label's caller is not procmgr, and in the error cases the three labels'
+sections state. An attached cap therefore never outlives the call that carried it
 unless memmgr takes ownership of it, so no client can fill memmgr's `CSpace`
 by attaching caps until its receive loop fails and memmgr exits with
 `EXIT_RECV_WEDGE` (see

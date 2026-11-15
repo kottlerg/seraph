@@ -67,51 +67,49 @@ direct console paths remain as fallbacks for the life of the system.
    its history ring). init-logd has no direct-framebuffer path; before the framebuffer driver is
    up, userspace output reaches only the UART.
 
-4. **Serial-driver-mediated path** — devmgr spawns the serial driver
-   (`services/drivers/serial/`); once init-logd has released the master log endpoint to
-   real-logd, every userspace UART writer routes bytes to it via
-   `serial_labels::SERIAL_WRITE_BYTES`. real-logd
-   (`services/logd/src/main.rs`) is the primary client: svcmgr launches and
-   supervises it, it resolves the driver's write endpoint through
-   `devmgr_labels::QUERY_DEVICE` sent on its serial class SEND, and it emits both received log lines
-   and its own diagnostics through it — including its own panic / alloc-error
-   output, routed here via a `std::os::seraph::set_panic_sink` sink rather than
-   the log endpoint logd serves (logd deletes its seeded `log_send_cap` at
-   startup so a fault cannot self-IPC into it). Outside the serial driver,
-   UART hardware authority is held only by init, whose init-logd thread uses it (on riscv64 until
-   init-logd exits after the handover and deletes init's UART Mmio capability), and by devmgr,
-   whose I/O-port and MMIO caps it carves the driver's cap from.
+4. **Serial-driver-mediated path** — devmgr spawns the serial driver (`services/drivers/serial/`);
+   once init-logd has released the master log endpoint to real-logd, every userspace UART writer
+   routes bytes to it via `serial_labels::SERIAL_WRITE_BYTES`. real-logd
+   (`services/logd/src/main.rs`) is the primary client: svcmgr launches and supervises it, it
+   resolves the driver's write endpoint through `devmgr_labels::QUERY_DEVICE` sent on its serial
+   class SEND, registering a `WATCH_CLASS` watch on the class and resolving again only when devmgr
+   signals it, and it emits both received log lines and its own diagnostics through it — including
+   its own panic / alloc-error output, routed here via a `std::os::seraph::set_panic_sink` sink
+   rather than the log endpoint logd serves (logd deletes its seeded `log_send_cap` at startup so a
+   fault cannot self-IPC into it). Outside the serial driver, UART hardware authority is held only
+   by init, whose init-logd thread uses it (on riscv64 until init-logd exits after the handover and
+   deletes init's UART Mmio capability), and by devmgr, whose I/O-port and MMIO caps it carves the
+   driver's cap from.
 
    real-logd is declared restartable (`restart = on_failure`; see
-   [services/logd/README.md](../services/logd/README.md)); a working logd restart is design
-   intent; not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262)). In the
-   intended model, svcmgr holds the master-log endpoint source for the system's life, so a
-   restarted logd re-attaches a fresh RECV to the same endpoint object every sender already
-   targets; the log senders are uninterrupted across the restart and need no re-derivation of
-   their `log_send_cap`. A restarted logd re-resolves the serial driver via `QUERY_DEVICE` on
-   the serial class SEND and resumes serial-mediated output. While logd is down, a sender's
-   `STREAM_BYTES` call waits at the kernel endpoint for at most its bound
-   (`LOG_CALL_TIMEOUT_MS`, then
-   `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
-   [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the
-   kernel panic console remains the guaranteed output path for any fault in that window. Today
-   svcmgr's death handler makes its own `log!` calls to the master-log endpoint before it
-   respawns logd, so the respawn is delayed by those bounds, not prevented, and procmgr rejects
-   a restarted logd's `REGISTER_DEATH_EQ` (first-wins), per
-   [svcmgr restart protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision
-   hierarchy.
+   [services/logd/README.md](../services/logd/README.md)); a working logd restart is design intent;
+   not yet implemented ([#262](https://github.com/kottlerg/seraph/issues/262)). In the intended
+   model, svcmgr holds the master-log endpoint source for the system's life, so a restarted logd
+   re-attaches a fresh RECV to the same endpoint object every sender already targets; the log
+   senders are uninterrupted across the restart and need no re-derivation of their `log_send_cap`. A
+   restarted logd re-resolves the serial driver via `QUERY_DEVICE` on the serial class SEND (under a
+   new `WATCH_CLASS` watch) and resumes serial-mediated output. While logd is down, a sender's
+   `STREAM_BYTES` call waits at the kernel endpoint for at most its bound (`LOG_CALL_TIMEOUT_MS`,
+   then `LOG_CALL_UNANSWERED_TIMEOUT_MS` once one of the process's calls has gone unanswered, per
+   [shared/log](../shared/log/README.md)), and a line no logd takes within it is dropped; the kernel
+   panic console remains the guaranteed output path for any fault in that window. Today svcmgr's
+   death handler makes its own `log!` calls to the master-log endpoint before it respawns logd, so
+   the respawn is delayed by those bounds, not prevented, and procmgr rejects a restarted logd's
+   `REGISTER_DEATH_EQ` (first-wins), per [svcmgr restart
+   protocol](../services/svcmgr/docs/restart-protocol.md) § Supervision hierarchy.
 
 5. **Framebuffer-driver-mediated path** — once devmgr has spawned the
    framebuffer driver (`services/drivers/framebuffer/`), userspace
    framebuffer writers route bytes to it via `fb_labels::FB_WRITE_BYTES`.
    Consumers:
    - **real-logd** (`services/logd/src/main.rs`) resolves the framebuffer
-     write cap via `devmgr_labels::QUERY_DEVICE` sent on its framebuffer class SEND and mirrors
+     write cap via `devmgr_labels::QUERY_DEVICE` sent on its framebuffer class SEND, under a
+     `WATCH_CLASS` watch handled as the serial driver's, and mirrors
      every log line it writes to serial onto the framebuffer too, so the
      steady-state userspace log stream reaches the screen as well as the
      UART. The framebuffer driver, when present, is spawned before svcmgr launches logd;
-     logd resolves the mirror once and, when devmgr reports no framebuffer driver (headless
-     boot), latches it off for its lifetime, so serial stays the authoritative channel.
+     logd's emit path never calls devmgr and, while no framebuffer driver is resolved (headless
+     boot), skips the mirror, so serial stays the authoritative channel.
    - **[`programs/terminal`](../programs/terminal/README.md)** (#111) resolves the
      framebuffer write cap via `QUERY_DEVICE` on its framebuffer class SEND and renders its
      child's stdout — the shell (#112) and anything the shell runs — to the screen, mirrored to

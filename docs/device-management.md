@@ -601,8 +601,9 @@ init
 
 vfsd and the consumers svcmgr launches after handover (logd, pwrmgr, timed, terminal)
 query devmgr's registry for their device endpoints and hardware caps, which devmgr serves
-only after initial enumeration and binding complete. A device endpoint is queried with one
-label, `devmgr_labels::QUERY_DEVICE`, sent on a class SEND: a SEND on devmgr's registry endpoint
+only after initial enumeration and binding complete. A device endpoint is queried with
+`devmgr_labels::QUERY_DEVICE`, and a class's changes are watched with `devmgr_labels::WATCH_CLASS`,
+each sent on a class SEND: a SEND on devmgr's registry endpoint
 whose badge names a class and the verb bits the reply carries. The class and the verbs come from
 the badge, never the message, and a registry SEND without a class slot gets `UNAUTHORIZED`.
 svcmgr mints each class SEND (`devmgr_labels::MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`) from
@@ -651,53 +652,49 @@ replies `NO_DEVICE`. A further console device is left unbound.
 
 devmgr loads driver binaries from one of two places:
 
-- **Boot bundle** — bootstrap-essentials (virtio-blk, serial,
-  framebuffer, and the IOMMU driver of the architecture's family, `iommu-vtd`
-  on x86-64 and `iommu-riscv` on riscv64, which must confine the disk before
-  its driver maps a ring) ship in the bundle and
-  arrive untagged as Memory caps in devmgr's MODULE bootstrap rounds, with any platform
-  description table. devmgr tells a module by its content: it reads the declaration of each ELF
-  image, parses valid UTF-8 text as a platform description table, and logs and releases anything
-  else. It binds the PCI and platform records those declarations match in the boot settle batch
-  (the IOMMU family record in a batch of its own before it), and spawns every driver via
-  `procmgr_labels::CREATE_PROCESS`.
-- **On-disk rootfs** — non-essentials (the per-arch RTC, bound to its platform record, the
-  [virtio-input keyboard driver](../services/drivers/virtio/input/README.md), the debug port's
-  virtio-console
-  driver, and the test-only `test-dma`) live at `/services/drivers/` and are loaded
-  via `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-fault` binary lives in
-  `/tests/drivers/`, which no boot-time pass reads; devmgr binds it only on
-  `devmgr_labels::BIND_DRIVERS` (gated on `BIND_AUTHORITY`, which only svctest's seed-only
-  `devmgr.bind` cap carries), so a boot without svctest binds none. Every binary there carries its
-  declaration in the ELF note section `.note.seraph.driver`; devmgr reads the declaration of each
-  entry once `SET_DRIVERS_DIR` arrives and binds the PCI devices still unbound: virtio-input,
-  virtio-console, and test-dma, none of which is on the read-the-disk critical path, ship only
-  there and are bound there. A device whose declaration takes its interrupt as optional
-  and for which devmgr can give no wired line (for instance, its line lies outside the Interrupt
-  range devmgr holds) is delivered a resource list with no `Interrupt` resource, and its driver
-  polls its queue.
-  Post-handover, svcmgr walks its universal root to `/services/drivers/` and hands devmgr that
-  subtree cap via `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from
-  the devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ | READDIR` rights
-  only — devmgr lists the directory and cannot reach outside the drivers subtree). The handshake
-  is specified in
-  [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
+- **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and the IOMMU driver of
+  the architecture's family, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, which must confine
+  the disk before its driver maps a ring) ship in the bundle and arrive untagged as Memory caps in
+  devmgr's MODULE bootstrap rounds, with any platform description table. devmgr tells a module by
+  its content: it reads the declaration of each ELF image, parses valid UTF-8 text as a platform
+  description table, and logs and releases anything else. It binds the PCI and platform records
+  those declarations match in the boot settle batch (the IOMMU family record in a batch of its own
+  before it), and spawns every driver via `procmgr_labels::CREATE_PROCESS`. - **On-disk rootfs** —
+  non-essentials (the per-arch RTC, bound to its platform record, the [virtio-input keyboard
+  driver](../services/drivers/virtio/input/README.md), the debug port's virtio-console driver, and
+  the test-only `test-dma`) live at `/services/drivers/` and are loaded via
+  `procmgr_labels::CREATE_FROM_FILE`. The test-only `test-fault` binary lives in `/tests/drivers/`,
+  which no boot-time pass reads; devmgr binds it only on `devmgr_labels::BIND_DRIVERS` (gated on
+  `BIND_AUTHORITY`, which only svctest's seed-only `devmgr.bind` cap carries), so a boot without
+  svctest binds none. Every binary there carries its declaration in the ELF note section
+  `.note.seraph.driver`; devmgr reads the declaration of each entry once `SET_DRIVERS_DIR` arrives
+  and binds the PCI devices still unbound: virtio-input, virtio-console, and test-dma, none of which
+  is on the read-the-disk critical path, ship only there and are bound there. A device whose
+  declaration takes its interrupt as optional and for which devmgr can give no wired line (for
+  instance, its line lies outside the Interrupt range devmgr holds) is delivered a resource list
+  with no `Interrupt` resource, and its driver polls its queue. Post-handover, svcmgr walks its
+  universal root to `/services/drivers/` and hands devmgr that subtree cap via
+  `devmgr_labels::SET_DRIVERS_DIR` (gated by `DRIVERS_DIR_AUTHORITY`, minted from the
+  devmgr-registry source init endows svcmgr with; sent at `LOOKUP | READ | READDIR` rights only —
+  devmgr lists the directory and cannot reach outside the drivers subtree). The handshake is
+  specified in [`services/init/docs/bootstrap.md`](../services/init/docs/bootstrap.md) and
   [`services/svcmgr/docs/ipc-interface.md`](../services/svcmgr/docs/ipc-interface.md). Devmgr
   replies SUCCESS before doing any spawn work so svcmgr never blocks on driver bring-up; the actual
   walk + `CREATE_FROM_FILE` + bootstrap rounds, and the settle of those drivers, run on devmgr's
   control thread after `ipc_reply`, while its registry workers go on serving; a query that would
-  find no driver waits until the settle has ended. The spawn is at-most-once per boot;
-  on failure (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did
-  not report ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on
-  subsequent `QUERY_DEVICE` calls on the rtc, input, and debug-port classes and clients
+  find no driver waits until the settle has ended. The spawn is at-most-once per boot; on failure
+  (binary missing, ELF corrupt, hardware-carve failure, OOM, a driver that died or did not report
+  ready within the settle bound, etc.) devmgr replies `devmgr_errors::NO_DEVICE` on subsequent
+  `QUERY_DEVICE` calls on the rtc, input, and debug-port classes and clients
   ([timed](../services/timed/README.md) degrades to its no-RTC path; the terminal, today's only
-  input class consumer, logs and exits). Before `SET_DRIVERS_DIR` arrives the reply is the same
-  `NO_DEVICE`, so a client that cannot proceed without the device MAY retry a bounded number of
-  times (the terminal does), while a client with a no-device path treats the first `NO_DEVICE` as
-  terminal; no client retries without a bound (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the
-  rule). Keeping non-essentials out of the boot bundle keeps the ESP-loaded image to what the system
-  needs before the rootfs is mounted, so on-disk loading is preferred for anything not on the
-  read-the-disk-in-the-first-place critical path.
+  input class consumer, keeps waiting). Before `SET_DRIVERS_DIR` arrives the reply is the same
+  `NO_DEVICE`, so a client that cannot proceed without the device waits on a `WATCH_CLASS` watch
+  ([driver-binding.md](driver-binding.md) § Device Classes; the terminal, the GDB stub and the
+  debug-echo fixture do), while a client with a no-device path treats the first `NO_DEVICE` as
+  terminal (`devmgr_errors::NO_DEVICE` in `shared/ipc` owns the rule). Keeping non-essentials out of
+  the boot bundle keeps the ESP-loaded image to what the system needs before the rootfs is mounted,
+  so on-disk loading is preferred for anything not on the read-the-disk-in-the-first-place critical
+  path.
 
 Storage-side cap delegation downstream of devmgr (whole-disk
 endpoint → vfsd → partition-scoped endpoint → fs driver) is

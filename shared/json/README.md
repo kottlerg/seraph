@@ -67,10 +67,9 @@ reads back as itself.
 | Consumer | Reads |
 |---|---|
 | [`xtask`](../../xtask/README.md) | The GitHub CLI's answers, the review run records and ledgers, the orchestration state, the host lock's records, and the assistant's hook events; it writes the records and the state with the printers |
+| [`shared/crypto/testkit`](../crypto/testkit/README.md) | The vendored Wycheproof files and its reference vectors; its generator writes the vectors with the compact printer |
 
-No component of the OS depends on the crate. `shared/crypto/testkit` reads its Wycheproof vectors
-with the registry crate `serde_json`; its reading them with this crate is design intent, not yet
-implemented.
+No component of the OS depends on the crate.
 
 ---
 

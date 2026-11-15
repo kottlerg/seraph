@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use crash_report::Block;
 
 use crate::cli::{CrashReportExpect, TestCrashReportArgs};
@@ -175,7 +175,7 @@ fn check_log(log: &str, expect: CrashReportExpect) -> Result<Verdict>
     {
         block
             .check()
-            .map_err(|defect| anyhow::anyhow!("block {:016x}: {defect:?}", block.id))?;
+            .map_err(|defect| crate::error::err!("block {:016x}: {defect:?}", block.id))?;
     }
     match expect
     {

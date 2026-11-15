@@ -13,7 +13,9 @@
 //! registers in between. The kernel is soft-float and saves and restores the
 //! live extended state as `core/kernel/docs/scheduler.md` § What Gets Saved and
 //! Restored specifies. Callers: `crate::unit::fpu` and
-//! `crate::integration::fpu_survives_ipc_call`.
+//! `crate::integration::fpu_survives_ipc_call`. [`load_and_spin`] instead
+//! holds the loaded values while the thread spins, for a stop to find them in
+//! the image `SYS_THREAD_READ_EXT_REGS` reads (`crate::integration::thread_ext_regs`).
 
 /// Load `pattern` into xmm0..xmm15, spin `iters` iterations so the timer can
 /// preempt the thread, then capture the registers; returns the mismatched-lane
@@ -273,4 +275,83 @@ pub fn ipc_call_capture(pattern: u64, spin: u64, ep: u64, msg_label: u64) -> u64
         }
     }
     mismatches
+}
+
+/// Load `ymm0`..`ymm15` with per-register values, then spin for ever, adding
+/// one to `progress` each pass, so a stop finds the values in the thread's
+/// saved extended state. Register `i` holds `pattern ^ i` in both 64-bit
+/// words of its low 128 bits (`xmm{i}`) and `!pattern ^ i` in both words of
+/// its upper 128 bits. [`for_each_ext_word`] states where the image holds
+/// them. Caller: `crate::integration::thread_ext_regs`.
+pub fn load_and_spin(pattern: u64, progress: &core::sync::atomic::AtomicU32) -> !
+{
+    let mut table = [[0u64; 4]; 16];
+    for (i, lanes) in (0u64..).zip(table.iter_mut())
+    {
+        let (lo, hi) = (pattern ^ i, !pattern ^ i);
+        *lanes = [lo, lo, hi, hi];
+    }
+    // SAFETY: the asm reads the 512-byte table on this frame, which outlives
+    // it since the block never returns, and increments `progress`, a live
+    // atomic, with a locked add; it touches nothing else.
+    unsafe {
+        core::arch::asm!(
+            "vmovdqu ymm0, [{t} + 0x000]",
+            "vmovdqu ymm1, [{t} + 0x020]",
+            "vmovdqu ymm2, [{t} + 0x040]",
+            "vmovdqu ymm3, [{t} + 0x060]",
+            "vmovdqu ymm4, [{t} + 0x080]",
+            "vmovdqu ymm5, [{t} + 0x0a0]",
+            "vmovdqu ymm6, [{t} + 0x0c0]",
+            "vmovdqu ymm7, [{t} + 0x0e0]",
+            "vmovdqu ymm8, [{t} + 0x100]",
+            "vmovdqu ymm9, [{t} + 0x120]",
+            "vmovdqu ymm10, [{t} + 0x140]",
+            "vmovdqu ymm11, [{t} + 0x160]",
+            "vmovdqu ymm12, [{t} + 0x180]",
+            "vmovdqu ymm13, [{t} + 0x1a0]",
+            "vmovdqu ymm14, [{t} + 0x1c0]",
+            "vmovdqu ymm15, [{t} + 0x1e0]",
+            "2:",
+            "lock inc dword ptr [{c}]",
+            "pause",
+            "jmp 2b",
+            t = in(reg) table.as_ptr(),
+            c = in(reg) progress.as_ptr(),
+            options(noreturn, nostack),
+        );
+    }
+}
+
+/// Pass each 64-bit word of the extended-state image `SYS_THREAD_READ_EXT_REGS`
+/// returns that [`load_and_spin`] with `pattern` sets, as its byte offset, the
+/// mask of the bits to compare, and their value, to `check`; stops at the
+/// first word `check` refuses and returns whether every word passed. The image
+/// is the XSAVE standard format (`syscall_abi::EXT_REGS_X86_64_XCR0`): `xmm{i}`
+/// at 160 + 16i, `XSTATE_BV` at 512, whose SSE and AVX bits the loads set, and
+/// the upper halves at 576 + 16i (Intel SDM Vol. 1 § 13.4 and § 13.5.3).
+pub fn for_each_ext_word(
+    pattern: u64,
+    _image_bytes: u64,
+    check: &mut dyn FnMut(u64, u64, u64) -> bool,
+) -> bool
+{
+    /// `XSTATE_BV` bits of the SSE and AVX components.
+    const SSE_AVX: u64 = 0b110;
+    if !check(512, SSE_AVX, SSE_AVX)
+    {
+        return false;
+    }
+    // Each register's slot is 16-byte aligned, so `| 8` is its second word.
+    let legacy = (160u64..).step_by(16);
+    let upper = (576u64..).step_by(16);
+    (0u64..16)
+        .zip(legacy.zip(upper))
+        .all(|(i, (low_at, high_at))| {
+            let (lo, hi) = (pattern ^ i, !pattern ^ i);
+            check(low_at, u64::MAX, lo)
+                && check(low_at | 8, u64::MAX, lo)
+                && check(high_at, u64::MAX, hi)
+                && check(high_at | 8, u64::MAX, hi)
+        })
 }

@@ -145,7 +145,8 @@ On `ECALL` from U-mode:
 ### Restartable Syscalls
 
 `SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`,
-`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, and `SYS_ASPACE_HARVEST` are restartable: a fault
+`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, `SYS_ASPACE_HARVEST`, `SYS_THREAD_LIST_PAGES`, and
+`SYS_THREAD_READ_EXT_REGS` are restartable: a fault
 of the kernel's copy to or from the caller's buffer is handled as
 [docs/fault-handling.md § Kernel Copies](../../../docs/fault-handling.md#kernel-copies)
 specifies. With a fault handler bound to the caller, the fault is delivered as `FAULT_KIND_VM`
@@ -215,9 +216,11 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  64  SYS_IRQ_REMAP
                                  65  SYS_ENTROPY_CONTRIBUTE
                                  66  SYS_ASPACE_HARVEST
+                                 67  SYS_THREAD_LIST_PAGES
+                                 68  SYS_THREAD_READ_EXT_REGS
 ```
 
-**Implementation status.** Every number 0–66 has a handler; unallocated numbers
+**Implementation status.** Every number 0–68 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -2055,6 +2058,108 @@ its address space's teardown has begun, or a read-only page's frame is mapped mo
 
 ---
 
+### `SYS_THREAD_LIST_PAGES` (67)
+
+List the mapped user pages of the address space a thread executes in, with each page's protection,
+as runs of pages. A core writer calls it to find what a dump holds
+([docs/fault-handling.md § Debugging](../../../docs/fault-handling.md#debugging)).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Control rights) |
+| 1 | `start` | Page-aligned first address to list, at most the top of the user half |
+| 2 | `runs_ptr` | Destination array of `PageRun` in the caller's address space |
+| 3 | `max_runs` | Runs the array holds, `1..=MAX_PAGE_RUNS` (128) |
+
+**Return:** `rax`/`a0`: the number of runs written; `rdx`/`a1`: the resume address, the first
+address the call did not list; `SyscallError` on failure.
+
+A `PageRun` (`abi/syscall`, `#[repr(C)]`) is three `u64`s: `va`, the first page's address;
+`pages`, at least 1; and `prot`, the protection every page of the run has. `prot` carries
+`PAGE_RUN_READ` (bit 0), `PAGE_RUN_WRITE` (bit 1) and `PAGE_RUN_EXECUTE` (bit 2), the bits of
+`MAP_READ`, `MAP_WRITABLE` and `MAP_EXECUTABLE`, as the thread's leaf grants them; and
+`PAGE_RUN_NO_COPY` (bit 3) for a page `SYS_THREAD_READ_MEM` refuses (device memory, or a frame at
+or above the top of RAM), whose bytes a core writer leaves out. No physical address is reported.
+
+The kernel pins the address space as `SYS_THREAD_READ_MEM` does, then, under the space's
+page-table lock, walks the page table from `start` toward the top of the user half in ascending
+address order and builds the runs in the CPU's syscall scratch buffer (`syscall::scratch`): a
+present 4 KiB user leaf (on riscv64, each page of a NAPOT group) that follows the open run's last
+page with its protection extends that run, and any other opens one. The walk examines at most
+`PAGE_SCAN_BUDGET` (4096) page-table entries, at any level, a call
+([docs/limits.md](../../../docs/limits.md)), so the lock is held for a bounded time, and it stops
+early when a page needs a run past `max_runs`. The kernel then copies the runs to `runs_ptr`, and
+only after that copy writes the resume address. The resume address is the page the call stopped
+at, the start of the table span the budget stopped before, or the top of the user half once the
+walk has reached it; a call that returns no run below the top has spent its budget on unmapped
+space. A caller lists a whole space by calling again from each resume address until a call returns
+no run and its own `start`, which only a call at the top does. Runs are written in ascending
+address order and two runs of one call are never adjacent with one protection; the last run of one
+call and the first of the next may be, and a caller joins them.
+
+The thread need not be stopped. The listing is a snapshot of each page-table entry when the walk
+read it, and a space whose threads run, or whose mappings change, between calls can list a layout
+no single instant held; a core writer stops the space's threads first.
+
+**Capability requirement:** `thread_cap` MUST have Control rights, as for `SYS_THREAD_READ_MEM`:
+the layout belongs to the space, not to the thread.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Control), `InvalidState` (as for
+`SYS_THREAD_READ_MEM`), `InvalidArgument` (`max_runs` 0 or above `MAX_PAGE_RUNS`),
+`InvalidAddress` (`start` not page-aligned or above the top of the user half, a null array, the
+array not wholly in the user half, or a fault on it that is unhandled; restartable, § Restartable
+Syscalls).
+
+---
+
+### `SYS_THREAD_READ_EXT_REGS` (68)
+
+Copy part of a stopped thread's extended register state (floating point, SIMD and vector) into a
+caller-supplied buffer.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `thread_cap` | Thread capability (Observe rights) |
+| 1 | `offset` | Byte offset into the state's image |
+| 2 | `buf_ptr` | Destination buffer in the caller's address space |
+| 3 | `len` | Byte count, `1..=MAX_THREAD_MEM_COPY` (4096) |
+
+**Return:** `rax`/`a0`: the bytes copied, `min(len, size - offset)`, or 0 for an `offset` at or past
+the image's end; `rdx`/`a1`: `size`, the image's size in bytes; `SyscallError` on failure.
+
+The image is the thread's extended-state save area, which every switch-out of a thread that used
+the state writes. On x86-64 it is the XSAVE area, in standard format, for the components of
+`EXT_REGS_X86_64_XCR0` (x87, SSE and AVX): `xmm`*i* at byte 160 + 16*i*, `XSTATE_BV` at 512, and
+the upper halves of `ymm`*i* at 576 + 16*i*, 832 bytes in all (Intel SDM Vol. 1 § 13.4); a
+component whose `XSTATE_BV` bit is clear holds its initial value whatever its bytes say. On
+riscv64 it is `f0`..`f31` from `EXT_REGS_RISCV64_F0_OFFSET`, then `fcsr`, `vstart`, `vl`, `vtype`
+and `vcsr` as one `u64` each at their `EXT_REGS_RISCV64_*` offsets, then `v0`..`v31` from
+`EXT_REGS_RISCV64_V0_OFFSET`, `vlenb` bytes each, so `size` is that offset plus 32 `vlenb`, and
+`vlenb` is a 32nd of the bytes past it. Thread creation zeroes the area, so a thread that has not
+used the state reads as zeros, the state its first use starts from (on x86-64, `XSTATE_BV` 0: every
+component initial), and the image holds nothing but the thread's own register state. The image is
+read in parts because riscv64's grows with `VLEN` past what one call copies.
+
+The thread MUST be held still as for `SYS_THREAD_READ_REGS`: `Stopped` and `current` on no CPU
+with its last save published, or fault-blocked; the kernel copies the requested bytes into the
+CPU's syscall scratch buffer under the target's scheduling lock, then copies them to `buf_ptr` and
+writes `size` only after that copy.
+
+**Capability requirement:** `thread_cap` MUST have Observe rights, as for `SYS_THREAD_READ_REGS`:
+the state is register state.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Observe), `InvalidState` (thread
+neither stopped and descheduled nor fault-blocked), `InvalidArgument` (`len` 0 or above
+`MAX_THREAD_MEM_COPY`, or the thread has no save area), `InvalidAddress` (a null buffer, the buffer
+not wholly in the user half, or a fault on it that is unhandled; restartable, § Restartable
+Syscalls).
+
+---
+
 ### `SYS_THREAD_SET_FAULT_HANDLER` (32)
 
 Bind (or clear) the per-thread fault-handler endpoint for the fault classes a mask selects. A
@@ -3430,7 +3535,8 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MIN` | 1 | Lowest priority a userspace thread may be assigned (0 is the idle band) |
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
-| `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` copies |
+| `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM` or `SYS_THREAD_READ_EXT_REGS` copies |
+| `MAX_PAGE_RUNS` | 128 | Most runs one `SYS_THREAD_LIST_PAGES` writes |
 | `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |
 | `BOOT_PROTOCOL_VERSION` | 21 | Expected version in `BootInfo.version` |
 

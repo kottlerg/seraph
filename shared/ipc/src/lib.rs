@@ -887,7 +887,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 11;
+pub const MEMMGR_LABELS_VERSION: u32 = 12;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -983,11 +983,15 @@ pub mod memmgr_labels
     /// * `data[7]` — the memory-pressure level: [`PRESSURE_NORMAL`],
     ///   [`PRESSURE_LOW`] or [`PRESSURE_CRITICAL`]. A [`REGISTER_PRESSURE`]
     ///   bit says it changed; this read is the level.
+    /// * `data[8]` — `promised_bytes`: what the committed regions
+    ///   ([`REGION_COMMIT`]) can still take from the free runs: their pages
+    ///   that hold no frame yet, with bounds on the page tables and metadata
+    ///   they can need. Every admission reads `data[3]` less this.
     ///
     /// The all-RAM-accounted identity is `data[0] == data[1] + data[2]`: every
     /// page of RAM is either fixed kernel reserve or in memmgr's pool, with no
     /// invisible residue. A nonzero `data[0] - data[1] - data[2]` is leaked
-    /// "dark" memory. `data[3]` to `data[7]` are appended fields — readers
+    /// "dark" memory. `data[3]` to `data[8]` are appended fields — readers
     /// needing only the identity may ignore them.
     pub const QUERY_POOL_STATUS: u64 = 6;
     /// Register a demand-paged anonymous region for the calling process.
@@ -1006,15 +1010,28 @@ pub mod memmgr_labels
     /// * `data[0]` — `va_base` (page-aligned virtual address).
     /// * `data[1]` — `len_bytes` (region length; page-multiple, nonzero).
     /// * `data[2]` — `prot` (MAP_* protection bits; W^X enforced).
+    /// * `data[3]` — flags: [`REGION_COMMIT`]; 0 for none.
     ///
     /// Reply: `memmgr_errors::SUCCESS`; `INVALID_ARGUMENT` (bad alignment,
-    /// zero length, W^X violation, unknown prot bit, unknown badge, or
-    /// overlap); or `QUOTA`
-    /// (metadata arena could not grow — system RAM exhausted). No mapping is
-    /// installed here — backing happens lazily on fault, and only once procmgr
-    /// has delegated the process `AddressSpace` cap via [`DELEGATE_ASPACE`].
-    /// Reverse with [`UNREGISTER_REGION`].
+    /// zero length, W^X violation, unknown prot or flag bit, unknown badge, or
+    /// overlap); `QUOTA` (metadata arena could not grow — system RAM
+    /// exhausted); or, for a committed region, `LIMIT` or
+    /// `OUT_OF_MEMORY_BEST_EFFORT` when its commitment is refused. No mapping
+    /// is installed here — backing happens lazily on fault, and only once
+    /// procmgr has delegated the process `AddressSpace` cap via
+    /// [`DELEGATE_ASPACE`]. Reverse with [`UNREGISTER_REGION`]. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 7: `REGISTER_REGION`.
     pub const REGISTER_REGION: u64 = 7;
+    /// [`REGISTER_REGION`] flag (`data[3]` bit 0): commit the region. memmgr
+    /// admits and charges its whole length when it registers it, so a fault
+    /// in it is not declined for budget or RAM while the region's page-table
+    /// reservation lasts, which only the process's own mappings and unmaps
+    /// can spend early (`services/memmgr/docs/ipc-interface.md` § Label 7),
+    /// and only a committed region grows by [`EXTEND_REGION`] or shrinks by
+    /// [`SHRINK_REGION`]. A reply that does not reach the caller undoes the
+    /// registration, so a caller whose call was interrupted makes it again.
+    /// The std heap grows this way.
+    pub const REGION_COMMIT: u64 = 1 << 0;
     /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
     /// memmgr so the pager can map frames into it on fault.
     ///
@@ -1085,14 +1102,52 @@ pub mod memmgr_labels
     /// § Label 11: `REGISTER_PRESSURE`.
     pub const REGISTER_PRESSURE: u64 = 11;
 
-    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pool is at or above the low
-    /// threshold.
+    /// Grow a committed region ([`REGION_COMMIT`]) of the caller in place, its
+    /// base kept. Universal label, attributed by `recv.badge`.
+    ///
+    /// Wire format:
+    /// * `data[0]` — `va_base` (the registered base).
+    /// * `data[1]` — `new_len_bytes` (page-multiple, at least the length).
+    ///
+    /// memmgr admits and charges the growth as a committed registration of
+    /// it. A reply that does not reach the caller undoes the growth, so a
+    /// caller whose call was interrupted makes it again.
+    ///
+    /// Reply: `memmgr_errors::SUCCESS` (also for the current length);
+    /// `INVALID_ARGUMENT` (unknown badge, no committed region at `va_base`, a
+    /// length unaligned, smaller, or past the address space, or growth that
+    /// meets another region); `QUOTA`; `LIMIT`; or
+    /// `OUT_OF_MEMORY_BEST_EFFORT`. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 12: `EXTEND_REGION`.
+    pub const EXTEND_REGION: u64 = 12;
+
+    /// Lower the top of a committed region ([`REGION_COMMIT`]) of the caller,
+    /// its base kept. Universal label, attributed by `recv.badge`.
+    ///
+    /// Wire format:
+    /// * `data[0]` — `va_base` (the registered base).
+    /// * `data[1]` — `new_len_bytes` (a nonzero multiple of the 64 KiB demand
+    ///   chunk, at most the length).
+    ///
+    /// memmgr unmaps the pages past the new top, takes back the frames that
+    /// backed them, and releases their commitment.
+    ///
+    /// Reply: `memmgr_errors::SUCCESS` (also for the current length); or
+    /// `INVALID_ARGUMENT` (unknown badge, no committed region at `va_base`,
+    /// or a length that is zero, not a chunk multiple, or larger). Specified
+    /// in `services/memmgr/docs/ipc-interface.md` § Label 13:
+    /// `SHRINK_REGION`.
+    pub const SHRINK_REGION: u64 = 13;
+
+    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
+    /// promised are at or above the low threshold.
     pub const PRESSURE_NORMAL: u64 = 0;
-    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pool is below the low
-    /// threshold.
+    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
+    /// promised are below the low threshold.
     pub const PRESSURE_LOW: u64 = 1;
-    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pool is at or below the
-    /// system reserve, so a grant to a process outside it is refused.
+    /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
+    /// promised are at or below the system reserve, so a grant to a process
+    /// outside it is refused.
     pub const PRESSURE_CRITICAL: u64 = 2;
 
     /// `REQUEST_MEMORY_CAPS` flag: reply MUST contain exactly one Memory cap

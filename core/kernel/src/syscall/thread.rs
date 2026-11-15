@@ -2909,6 +2909,200 @@ pub fn sys_thread_write_mem(tf: UserFrame) -> Result<u64, RestartableError>
     Ok(0)
 }
 
+/// `SYS_THREAD_LIST_PAGES` (67): list the mapped user pages of a thread's
+/// address space as runs of pages of one protection.
+///
+/// arg0 = Thread cap index (must have CONTROL).
+/// arg1 = Page-aligned VA to list from, at most the top of the user half.
+/// arg2 = Run buffer (caller's user VA), `arg3` `syscall::PageRun`s.
+/// arg3 = Most runs to write, `1..=MAX_PAGE_RUNS`.
+///
+/// The thread need not be stopped. The runs are built in the CPU's syscall
+/// scratch buffer (`syscall::scratch`) under the target space's page-table
+/// lock (`AddressSpace::list_pages`), then copied out. Returns the runs
+/// written, and in the secondary return register the first VA not listed:
+/// the top of the user half once the listing reached it.
+///
+/// # Errors
+/// As in core/kernel/docs/syscalls.md § `SYS_THREAD_LIST_PAGES` (67), and a
+/// [`RestartableError::Faulted`] copy to the buffer, which re-executes the
+/// whole call on the caller's resume.
+#[cfg(not(test))]
+pub fn sys_thread_list_pages(tf: UserFrame) -> Result<u64, RestartableError>
+{
+    use crate::mm::address_space::PageRuns;
+    use syscall::{MAX_PAGE_RUNS, PageRun};
+
+    let start = tf.arg(1);
+    let buf = tf.arg(2);
+    let max = tf.arg(3);
+    if max == 0 || max > MAX_PAGE_RUNS
+    {
+        return Err(SyscallError::InvalidArgument.into());
+    }
+    // The count is clamped as data, so on a path past a mispredicted refusal
+    // the runs are staged within the scratch buffer (core/kernel/docs/
+    // capability-internals.md § Speculative-Execution Hardening).
+    let max = crate::arch::nospec::mask_index_u64(max, MAX_PAGE_RUNS + 1);
+    // MAX_PAGE_RUNS runs fit the staging bytes (an abi assertion).
+    let bytes = usize::try_from(max)
+        .ok()
+        .and_then(|max| max.checked_mul(core::mem::size_of::<PageRun>()))
+        .ok_or(SyscallError::InvalidArgument)?;
+    let top = crate::mm::user_va_top();
+    if !start.is_multiple_of(crate::mm::PAGE_SIZE as u64)
+        || start > top
+        || buf == 0
+        || !user_range(buf, bytes)
+    {
+        return Err(SyscallError::InvalidAddress.into());
+    }
+    // The span is clamped to the user half as data: the walk reads the
+    // target's page tables in software, so on a path past a mispredicted
+    // refusal it walks the empty span at 0, never the kernel half of the root
+    // (core/kernel/docs/capability-internals.md § Speculative-Execution
+    // Hardening). Architecturally the span is [start, top).
+    let (start, span) = crate::arch::nospec::mask_span_u64(start, top.wrapping_sub(start), top);
+    // SAFETY: a syscall handler, which holds `staged` only until it returns
+    // and neither parks nor yields meanwhile (a faulted user copy returns,
+    // and the call is re-executed from its start).
+    let stage = unsafe { super::scratch::thread_mem() };
+    let staged = stage
+        .get_mut(..bytes)
+        .ok_or(SyscallError::InvalidArgument)?;
+    let (count, resume) = {
+        let pin = AspacePin::of_thread(tf.arg(0))?;
+        let mut runs = PageRuns::new(&mut *staged);
+        // SAFETY: start is page-aligned and [start, start + span) lies in the
+        // user half (checked and clamped above); no lock is held.
+        let resume = unsafe {
+            pin.aspace()
+                .list_pages(start, start.wrapping_add(span), &mut runs)
+        };
+        (runs.finish(), resume)
+    };
+    // At most `max` runs, so the bytes fit `staged`.
+    let written = count.saturating_mul(core::mem::size_of::<PageRun>());
+    // Nothing before this copy changed anything visible outside the call,
+    // so a fault re-executes it from the start; the secondary return
+    // register, an argument register, is written only after it.
+    // SAFETY: staged holds `written` initialised bytes; buf is the validated
+    // user destination span, of at least that length.
+    unsafe { crate::uaccess::copy_to_user_restartable(buf, staged.as_ptr(), written)? };
+    tf.set_ipc_return(count as u64, resume);
+    Ok(count as u64)
+}
+
+/// `SYS_THREAD_READ_EXT_REGS` (68): copy part of a stopped or fault-blocked
+/// thread's extended register state (floating point, SIMD, vector).
+///
+/// arg0 = Thread cap index (must have OBSERVE).
+/// arg1 = Byte offset into the state's image.
+/// arg2 = Destination buffer (caller's user VA).
+/// arg3 = Byte count, `1..=MAX_THREAD_MEM_COPY`.
+///
+/// The thread must be fault-blocked, or `Stopped` and descheduled
+/// (`sched::with_held_frame`), as for `SYS_THREAD_READ_REGS`. The image is
+/// the thread's save area, which every switch-out writes, so a thread held
+/// still has its registers there. The bytes are staged in the CPU's syscall
+/// scratch buffer under the thread's `sched_lock`, then copied out. Returns
+/// the bytes copied, 0 for an offset at or past the image's end, and in the
+/// secondary return register the image's size.
+///
+/// # Errors
+/// As in core/kernel/docs/syscalls.md § `SYS_THREAD_READ_EXT_REGS` (68), and
+/// a [`RestartableError::Faulted`] copy to the buffer, which re-executes the
+/// whole call on the caller's resume.
+#[cfg(not(test))]
+pub fn sys_thread_read_ext_regs(tf: UserFrame) -> Result<u64, RestartableError>
+{
+    use crate::cap::object::ThreadObject;
+    use crate::cap::slot::ThreadRights;
+    use crate::sched::thread_slot::{extended_bytes, extended_span};
+
+    let offset = tf.arg(1);
+    let buf = tf.arg(2);
+    let Ok(len) = usize::try_from(tf.arg(3))
+    else
+    {
+        return Err(SyscallError::InvalidArgument.into());
+    };
+    if len == 0 || len > syscall::MAX_THREAD_MEM_COPY
+    {
+        return Err(SyscallError::InvalidArgument.into());
+    }
+    if buf == 0 || !user_range(buf, len)
+    {
+        return Err(SyscallError::InvalidAddress.into());
+    }
+    // The length is clamped as data, so on a path past a mispredicted refusal
+    // the copy stays within the scratch buffer (core/kernel/docs/
+    // capability-internals.md § Speculative-Execution Hardening).
+    let len = crate::arch::nospec::mask_index(len, syscall::MAX_THREAD_MEM_COPY + 1);
+
+    // SAFETY: current_tcb() returns the current thread; syscall context.
+    let caller_tcb = unsafe { super::current_tcb() };
+    if caller_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability.into());
+    }
+    // SAFETY: caller_tcb validated non-null; cspace set at thread creation.
+    let caller_cspace = unsafe { (*caller_tcb).cspace };
+    // SAFETY: caller_cspace is the caller's; lookup_cap checks tag and rights.
+    let thread_slot =
+        unsafe { super::lookup_cap(caller_cspace, tf.arg(0), ThreadRights::OBSERVE) }?;
+    let obj = thread_slot.object.ok_or(SyscallError::InvalidCapability)?;
+    // SAFETY: tag confirmed Thread; thread_slot pins the object.
+    let target_tcb = unsafe { (*obj.as_ptr().cast::<ThreadObject>()).tcb };
+    if target_tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability.into());
+    }
+
+    let size = extended_bytes();
+    let (from, n) = extended_span(offset, len, size);
+    // SAFETY: a syscall handler, which holds `staged` only until it returns
+    // and neither parks nor yields meanwhile (a faulted user copy returns,
+    // and the call is re-executed from its start).
+    let stage = unsafe { super::scratch::thread_mem() };
+    // n <= len <= the buffer's size.
+    let staged = stage.get_mut(..n).ok_or(SyscallError::InvalidArgument)?;
+    let take = |_frame: *mut u8| {
+        // SAFETY: target_tcb is valid while thread_slot pins its object; the
+        // area pointer is set at thread creation and never changes.
+        let area = unsafe { (*target_tcb).extended.area };
+        if area.is_null()
+        {
+            return false;
+        }
+        // from + n <= size, the area's size (extended_span), so the offset
+        // stays in the area.
+        let src = area.wrapping_add(usize::try_from(from).unwrap_or(0));
+        // SAFETY: the thread is held still, so no CPU saves into or restores
+        // from its area meanwhile and its last switch-out save is published;
+        // src is n readable bytes of the area and staged n writable bytes.
+        unsafe { core::ptr::copy_nonoverlapping(src.cast_const(), staged.as_mut_ptr(), n) };
+        true
+    };
+    // SAFETY: target_tcb validated non-null; no lock is held; the closure only
+    // copies kernel memory into the scratch buffer, which cannot fault.
+    match unsafe { crate::sched::with_held_frame(target_tcb, take) }
+    {
+        None => return Err(SyscallError::InvalidState.into()),
+        Some(false) => return Err(SyscallError::InvalidArgument.into()),
+        Some(true) =>
+        {}
+    }
+    // Nothing before this copy changed anything visible outside the call, so
+    // a fault re-executes it from the start; the secondary return register,
+    // an argument register, is written only after it.
+    // SAFETY: staged holds n initialised bytes; buf is the validated user
+    // destination span, of at least n bytes.
+    unsafe { crate::uaccess::copy_to_user_restartable(buf, staged.as_ptr(), n)? };
+    tf.set_ipc_return(n as u64, size);
+    Ok(n as u64)
+}
+
 /// `SYS_THREAD_READ_REGS` (39): read register state of a stopped or fault-blocked
 /// thread.
 ///
@@ -3237,6 +3431,18 @@ pub fn sys_thread_read_mem(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 #[cfg(test)]
 pub fn sys_thread_write_mem(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+#[cfg(test)]
+pub fn sys_thread_list_pages(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
+{
+    Err(SyscallError::NotSupported)
+}
+
+#[cfg(test)]
+pub fn sys_thread_read_ext_regs(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 {
     Err(SyscallError::NotSupported)
 }

@@ -126,7 +126,8 @@ const POOL_WINDOWS: u32 = 8;
 /// Pool queries per window after the child's destroy. A test wait bound.
 const POOL_POLLS: u32 = 256;
 /// How long the phase waits for its child to exit. A test wait bound: the
-/// child's run is a few hundred IPC calls and the zeroing of its grants.
+/// budget child's run is a few hundred IPC calls and the zeroing of its
+/// grants, the heap-commit hog's the zeroing of most of RAM.
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// procmgr's create-time memory max, end to end: the refusals, then a
@@ -276,34 +277,8 @@ fn run_budget_child()
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
-    let (handle, thread) = create_budget_child();
-    let root = syscall::cap_copy(
-        std::os::seraph::root_dir_cap(),
-        startup_info().self_cspace,
-        syscall::RIGHTS_EP_SEND,
-    )
-    .expect("copying the root cap for the budget child failed");
-    expect_reply(
-        handle,
-        &IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
-            .cap(root)
-            .build(),
-        procmgr_errors::SUCCESS,
-        "CONFIGURE_NAMESPACE of the budget child",
-    );
-    expect_reply(
-        handle,
-        &IpcMessage::new(procmgr_labels::START_PROCESS),
-        procmgr_errors::SUCCESS,
-        "START_PROCESS of the budget child",
-    );
-    let reason = await_exit(handle);
-    expect_reply(
-        handle,
-        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
-        procmgr_errors::SUCCESS,
-        "DESTROY_PROCESS of the exited budget child",
-    );
+    let (handle, thread) = create_with_max(BUDGET_CHILD_ROLE, CHILD_MAX_PAGES, "the budget child");
+    let reason = run_to_exit(handle, "the budget child");
     let (file, size) = file_at(b"programs", b"hello");
     expect_reply(
         handle,
@@ -332,17 +307,55 @@ fn run_budget_child()
     );
 }
 
-/// Create `/tests/svctest budget-child` through a raw `CREATE_FROM_FILE` with
-/// `CREATE_MEMORY_MAX` after the argv/env header, assert the reply carries the
-/// max asked (svctest's node has no max, so memmgr's clamp leaves it), and
-/// return `(process handle, thread)`.
-fn create_budget_child() -> (u64, u64)
+/// Configure the namespace of the created child `handle` (`what`, for the
+/// messages) to svctest's root, start it, wait for its exit and destroy it;
+/// its exit reason.
+pub(crate) fn run_to_exit(handle: u64, what: &str) -> u64
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+
+    let root = syscall::cap_copy(
+        std::os::seraph::root_dir_cap(),
+        startup_info().self_cspace,
+        syscall::RIGHTS_EP_SEND,
+    )
+    .unwrap_or_else(|e| panic!("copying the root cap for {what} failed ({e})"));
+    expect_reply(
+        handle,
+        &IpcMessage::builder(procmgr_labels::CONFIGURE_NAMESPACE)
+            .cap(root)
+            .build(),
+        procmgr_errors::SUCCESS,
+        &format!("CONFIGURE_NAMESPACE of {what}"),
+    );
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::START_PROCESS),
+        procmgr_errors::SUCCESS,
+        &format!("START_PROCESS of {what}"),
+    );
+    let reason = await_exit(handle, what);
+    expect_reply(
+        handle,
+        &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
+        procmgr_errors::SUCCESS,
+        &format!("DESTROY_PROCESS of the exited {what}"),
+    );
+    reason
+}
+
+/// Create `/tests/svctest <role>` (`what`, for the messages) through a raw `CREATE_FROM_FILE` with `CREATE_MEMORY_MAX` of
+/// `max` pages after the argv/env header, assert the reply carries the max
+/// asked (svctest's node has no max, so memmgr's clamp leaves it), and return
+/// `(process handle, thread)`.
+pub(crate) fn create_with_max(role: &str, max: u64, what: &str) -> (u64, u64)
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
     use std::os::seraph::process::ArgvEnvCap;
 
-    let argv_env = ArgvEnvCap::new(b"/tests/svctest\0budget-child\0", 2, b"", 0)
-        .expect("building the budget child's argv/env cap failed")
+    let args = format!("/tests/svctest\0{role}\0");
+    let argv_env = ArgvEnvCap::new(args.as_bytes(), 2, b"", 0)
+        .unwrap_or_else(|e| panic!("building the argv/env cap of {what} failed ({e:?})"))
         .expect("a nonempty argv builds a cap");
     let (file, size) = file_at(b"tests", b"svctest");
     let create = IpcMessage::builder(
@@ -352,7 +365,7 @@ fn create_budget_child() -> (u64, u64)
     )
     .word(0, size)
     .words(1, &argv_env.header_words())
-    .word(1 + procmgr_labels::ARGV_ENV_HEADER_WORDS, CHILD_MAX_PAGES)
+    .word(1 + procmgr_labels::ARGV_ENV_HEADER_WORDS, max)
     .cap(file)
     .cap(argv_env.cap())
     .build();
@@ -365,29 +378,23 @@ fn create_budget_child() -> (u64, u64)
         )
     };
     argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
-    let reply = reply.expect("CREATE_FROM_FILE of the budget child failed");
+    let reply = reply.unwrap_or_else(|e| panic!("CREATE_FROM_FILE of {what} failed ({e})"));
     assert_eq!(
         reply.label,
         procmgr_errors::SUCCESS,
-        "CREATE_FROM_FILE of the budget child refused"
+        "CREATE_FROM_FILE of {what} refused"
     );
-    assert_eq!(
-        reply.word(0),
-        CHILD_MAX_PAGES,
-        "the budget child's node took another max"
-    );
+    assert_eq!(reply.word(0), max, "the node of {what} took another max");
     match reply.caps()
     {
         &[handle, thread] => (handle, thread),
-        other => panic!(
-            "CREATE_FROM_FILE of the budget child replied {} caps",
-            other.len()
-        ),
+        other => panic!("CREATE_FROM_FILE of {what} replied {} caps", other.len()),
     }
 }
 
-/// Poll `QUERY_PROCESS` on `handle` until the process exits; its exit reason.
-fn await_exit(handle: u64) -> u64
+/// Poll `QUERY_PROCESS` on `handle` (`what`, for the messages) until the
+/// process exits; its exit reason.
+fn await_exit(handle: u64, what: &str) -> u64
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels, procmgr_process_state};
 
@@ -395,11 +402,11 @@ fn await_exit(handle: u64) -> u64
     let start = Instant::now();
     loop
     {
-        let reply = call(handle, &query, "QUERY_PROCESS of the budget child");
+        let reply = call(handle, &query, "QUERY_PROCESS");
         assert_eq!(
             reply.label,
             procmgr_errors::SUCCESS,
-            "QUERY_PROCESS refused the budget child's handle"
+            "QUERY_PROCESS refused the handle of {what}"
         );
         if reply.word(0) == procmgr_process_state::EXITED
         {
@@ -407,7 +414,7 @@ fn await_exit(handle: u64) -> u64
         }
         assert!(
             start.elapsed() < CHILD_EXIT_TIMEOUT,
-            "the budget child did not exit in {CHILD_EXIT_TIMEOUT:?}"
+            "{what} did not exit in {CHILD_EXIT_TIMEOUT:?}"
         );
         std::thread::yield_now();
     }
@@ -415,7 +422,7 @@ fn await_exit(handle: u64) -> u64
 
 /// memmgr's free pool once its deferred list has settled
 /// ([`crate::phases::memmgr::settled_deferred_bytes`]).
-fn settled_pool_free() -> u64
+pub(crate) fn settled_pool_free() -> u64
 {
     let _ = crate::phases::memmgr::settled_deferred_bytes();
     crate::phases::memmgr::pool_free_and_largest().0
@@ -498,7 +505,7 @@ fn budget_child_main() -> !
 
 /// The child's own usage from memmgr's `QUERY_MEMORY_USAGE`, in pages:
 /// `(own, max, subtree)`; `None` when the call fails or is refused.
-fn memory_usage() -> Option<(u64, u64, u64)>
+pub(crate) fn memory_usage() -> Option<(u64, u64, u64)>
 {
     let req = ipc::IpcMessage::new(ipc::memmgr_labels::QUERY_MEMORY_USAGE);
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.

@@ -328,7 +328,7 @@ pub(crate) fn pool_reserve() -> u64
 
 /// svctest's own budget usage from memmgr's `QUERY_MEMORY_USAGE`, in pages:
 /// `(own, max, subtree)`.
-fn memory_usage() -> (u64, u64, u64)
+pub(crate) fn memory_usage() -> (u64, u64, u64)
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_MEMORY_USAGE).build();
     let reply = memmgr_call(&req, "QUERY_MEMORY_USAGE");
@@ -1600,9 +1600,12 @@ const PRESSURE_OWN_BIT: u64 = 1 << 5;
 const PRESSURE_WAITER_STOPS: u32 = 3;
 const PRESSURE_WAITER_STOP_GAP: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// memmgr's `QUERY_POOL_STATUS` pool total, free total and pressure level
-/// (`data[2]`, `data[3]` and `data[7]`), the totals in pages.
-fn pool_pressure_status() -> (u64, u64, u64)
+/// memmgr's `QUERY_POOL_STATUS` pool total, the free pages outside
+/// `promised`, and the pressure level (`data[2]`, `data[3]` less `data[8]`,
+/// and `data[7]`), the totals in pages. The level is computed from the free
+/// pages outside `promised`, and a grant is admitted only from them, so a
+/// phase that drives the level sizes its grants against them.
+pub(crate) fn pool_pressure_status() -> (u64, u64, u64)
 {
     let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
     let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
@@ -1612,7 +1615,11 @@ fn pool_pressure_status() -> (u64, u64, u64)
         "QUERY_POOL_STATUS status"
     );
     let page = syscall_abi::PAGE_SIZE;
-    (reply.word(2) / page, reply.word(3) / page, reply.word(7))
+    (
+        reply.word(2) / page,
+        reply.word(3).saturating_sub(reply.word(8)) / page,
+        reply.word(7),
+    )
 }
 
 /// memmgr's reply label to a `REGISTER_PRESSURE` of `bits` carrying `cap`, or
@@ -1646,7 +1653,7 @@ fn take_bits(sig: u64) -> u64
 
 /// Draw grants from memmgr, contiguous or not, until `pages` pages are held,
 /// returning each grant's cap and region id.
-fn take_pages(pages: u64) -> Vec<(u64, u64)>
+pub(crate) fn take_pages(pages: u64) -> Vec<(u64, u64)>
 {
     let mut held = Vec::new();
     let mut taken = 0u64;
@@ -1715,8 +1722,8 @@ fn release_under_stopped_waiter(held: Vec<(u64, u64)>) -> std::os::seraph::Memor
 ///    the runtime made ([`std::os::seraph::memory_pressure_notification`]), and
 ///    the level reads `Normal`.
 /// 3. A registration of a second Notification replaces the runtime's. svctest
-///    then takes grants until the free pool sits below the low threshold and
-///    above the reserve: the second Notification receives its bit, the level
+///    then takes grants until the free pages outside `promised` sit below the
+///    low threshold and above the reserve: the second Notification receives its bit, the level
 ///    reads `Low`, and the runtime's Notification receives nothing.
 /// 4. svctest registers the runtime's Notification again, and a helper thread
 ///    waits on it ([`std::os::seraph::wait_memory_pressure`]). svctest stops
@@ -1728,8 +1735,9 @@ fn release_under_stopped_waiter(held: Vec<(u64, u64)>) -> std::os::seraph::Memor
 ///
 /// memmgr's low threshold and band are 1/16 and 1/128 of the pool
 /// (`PRESSURE_LOW_DIVISOR`, `PRESSURE_BAND_DIVISOR`) and its reserve 2/128;
-/// the phase aims the free pool at 6/128, so other processes' allocations
-/// meanwhile move it neither out of `Low` nor into `Critical`.
+/// the phase aims the free pages outside `promised`, which the level reads,
+/// at 6/128, so other processes' allocations meanwhile move it neither out
+/// of `Low` nor into `Critical`.
 pub fn pressure_phase(_: &Caps)
 {
     use std::os::seraph::{MemoryPressure, memory_pressure, memory_pressure_notification};

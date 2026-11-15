@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use json::Value;
 
 use crate::cli::{IssueEditArgs, IssueFileArgs, UnscheduledReason};

@@ -20,7 +20,7 @@ use std::fmt;
 use std::path::{Component, Path};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use crate::error::{Context, Result, bail};
 use regex::Regex;
 
 use crate::cli::LintDocsArgs;

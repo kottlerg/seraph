@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result, bail};
+use crate::error::{Context as _, Result, bail};
 use regex::Regex;
 
 use crate::accel::detect_for_arch;

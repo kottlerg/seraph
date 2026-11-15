@@ -19,7 +19,7 @@
 //! set that diverges from `rootfs/` — e.g. a default recipe removed, or a test
 //! recipe hand-staged — by packing the staged sysroot without that pass.
 
-use anyhow::Result;
+use crate::error::Result;
 
 use crate::cli::MkdiskArgs;
 use crate::context::Context as BuildContext;

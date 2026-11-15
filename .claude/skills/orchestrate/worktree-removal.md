@@ -21,10 +21,19 @@ Before removing one, check both conditions, and skip and report a worktree that 
 - The records are in your checkout: `target/xtask/review/pr<N>/` holds the records of every run
   the worker reported. They exist nowhere else once the worktree is gone.
 - Nothing is unsaved or unpushed: `git -C <path> status --porcelain` prints nothing, and after
-  `git fetch origin`, `git -C <path> rev-list HEAD --not --remotes=origin` prints nothing. A
-  commit it prints that changes no file, which `git -C <path> diff --quiet <commit>^ <commit>`
-  shows by exiting 0, is a park or keep-alive commit and not unsaved work, provided every
-  commit it prints is one.
+  `git fetch origin`, every commit `git -C <path> rev-list HEAD --not --remotes=origin` prints
+  (none, when nothing is unpushed) passes one of two tests, each passed by an exit status of 0:
+  - It changes no file, a park or keep-alive commit:
+    `git -C <path> diff --quiet <commit>^ <commit>`.
+  - Its tree is the tree of a commit reachable from `origin`, the state an approved history
+    rewrite leaves, whose content was pushed under another commit:
+
+    ```
+    tree=$(git -C <path> rev-parse <commit>^{tree})
+    git -C <path> log --remotes=origin --format=%T | grep -qxF "$tree"
+    ```
+
+  A commit that passes neither is unpushed work, and the worktree fails the check.
 
 Remove with `git worktree remove --force --force <path>` (the harness locks agent worktrees, and
 a locked worktree refuses a single `--force`), run `git worktree prune` once after a sweep, and

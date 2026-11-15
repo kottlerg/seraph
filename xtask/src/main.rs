@@ -50,6 +50,7 @@ mod crash_log;
 mod debug_stub;
 mod diag;
 mod disk;
+mod error;
 mod firmware;
 mod fs_compat;
 mod gh;
@@ -108,6 +109,7 @@ fn main()
         CliCommand::Run(args) => commands::run::run(&ctx, args),
         CliCommand::Clean(args) => commands::clean::run(&ctx, args),
         CliCommand::Test(args) => commands::test::run(&ctx, args),
+        CliCommand::CryptoVectors(args) => commands::crypto_vectors::run(&ctx, args),
         CliCommand::RunParallel(args) => commands::run_parallel::run(&ctx, args),
         CliCommand::KtestTiming(args) => commands::ktest_timing::run(&ctx, args),
         CliCommand::Symbolize(args) => commands::symbolize::run(&ctx, args),
@@ -144,7 +146,7 @@ fn main()
 
     if let Err(err) = result
     {
-        // Print the full error chain (anyhow includes context from .context() calls).
+        // `{:#}` prints the whole chain: each `context` above its cause.
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }

@@ -30,7 +30,7 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use crate::error::{Context, Result};
 use boot_protocol::bundle as fmt;
 
 use crate::arch::Arch;
@@ -191,7 +191,7 @@ fn entries(
     let init_src = ctx.sysroot.join(harness.init_source());
     if !init_src.exists()
     {
-        anyhow::bail!(
+        crate::error::bail!(
             "compose-bundle: harness binary missing at {} (run `cargo xtask build` first)",
             init_src.display()
         );
@@ -211,7 +211,7 @@ fn entries(
             let p = ctx.sysroot.join(source);
             if !p.exists()
             {
-                anyhow::bail!(
+                crate::error::bail!(
                     "compose-bundle: module binary missing at {} (run `cargo xtask build` first)",
                     p.display()
                 );
@@ -223,13 +223,13 @@ fn entries(
             let p = ctx.root.join(source);
             if !p.exists()
             {
-                anyhow::bail!("compose-bundle: platform table missing at {}", p.display());
+                crate::error::bail!("compose-bundle: platform table missing at {}", p.display());
             }
             entries.push(((*name).to_owned(), p));
         }
         if !levels.exists()
         {
-            anyhow::bail!(
+            crate::error::bail!(
                 "compose-bundle: log-level configuration missing at {}",
                 levels.display()
             );
@@ -290,7 +290,7 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> 
         let Some(name_dst) = name_buf.get_mut(..nb.len())
         else
         {
-            anyhow::bail!(
+            crate::error::bail!(
                 "compose-bundle: entry name `{name}` exceeds {} bytes",
                 fmt::ENTRY_NAME_LEN
             );

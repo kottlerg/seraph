@@ -48,6 +48,10 @@ pub enum CliCommand
     /// for riscv64, under QEMU's user-mode emulator (see xtask/README.md).
     Test(TestArgs),
 
+    /// Regenerate the reference vectors of shared/crypto/testkit with
+    /// OpenSSL, or with `--check` fail unless they regenerate identically.
+    CryptoVectors(CryptoVectorsArgs),
+
     /// Launch N QEMU instances in parallel against an already-built image,
     /// classifying each run's outcome via user-supplied pass/fail regexes.
     /// Requires a populated sysroot — run `cargo xtask build` first.
@@ -243,6 +247,7 @@ impl CliCommand
             Self::Build(args) => Some(&args.host),
             Self::Clean(args) => Some(&args.host),
             Self::Test(args) => Some(&args.host),
+            Self::CryptoVectors(args) => Some(&args.host),
             Self::CompareImages(args) => Some(&args.host),
             Self::Run(_)
             | Self::RunParallel(_)
@@ -946,6 +951,22 @@ pub struct CleanArgs
     /// Also remove the cargo target/ directory (full clean).
     #[arg(long)]
     pub all: bool,
+
+    /// The shared host's launch rules (see xtask/README.md "Host launch
+    /// rules").
+    #[command(flatten)]
+    pub host: HostArgs,
+}
+
+// ── CryptoVectors ─────────────────────────────────────────────────────────────
+
+#[derive(Parser)]
+pub struct CryptoVectorsArgs
+{
+    /// Regenerate in memory and fail unless the checked-in files are
+    /// byte-identical, writing nothing.
+    #[arg(long)]
+    pub check: bool,
 
     /// The shared host's launch rules (see xtask/README.md "Host launch
     /// rules").
@@ -1729,7 +1750,7 @@ mod tests
     #[test]
     fn each_command_that_compiles_is_admitted_as_a_build_with_its_host_options()
     {
-        for command in ["build", "clean", "test", "compare-images"]
+        for command in ["build", "clean", "test", "crypto-vectors", "compare-images"]
         {
             let host = build_host_of(&["xtask", command, "--wait-host", "30"])
                 .unwrap_or_else(|| panic!("`{command}` is not admitted as a build"));

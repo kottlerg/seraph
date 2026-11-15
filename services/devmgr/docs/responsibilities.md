@@ -209,16 +209,19 @@ devmgr's responsibilities are:
   a platform record's badge names an entry too, the framebuffer's carrying its
   geometry and the CMOS RTC's its century index. Once a driver's bootstrap is
   served,
-  devmgr binds two death observers on the driver to its driver death queue
-  (§ Relationship to drivers): one queue for the boot, sized at enumeration
-  to both observers of every driver the boot can spawn (one per PCI device,
-  one per platform device record, the IOMMU driver), so every bind is funded
-  and no death is dropped. A driver that
+  devmgr binds two death observers on the driver to its driver death queues
+  (§ Relationship to drivers): a counted death set (`shared/death-set`)
+  whose first queue is sized at enumeration to both observers of every
+  driver the boot's records can be given (one per PCI device, one per
+  platform device record, the IOMMU driver), and which adds a further queue
+  of twice the last when the queues' binds are spent. Each queue's ring has
+  an entry per observer it takes and each observer posts at most once, so
+  every bind is funded and no death is dropped. A driver that
   needs startup info (the VirtIO drivers, the framebuffer) calls
   `QUERY_DEVICE_INFO` on its query cap before its device setup, and every
   driver calls `DRIVER_READY` on it after, immediately before its service
   loop. devmgr waits on a wait set over the batch's private endpoint, the
-  death queue, and a timer, serving those two labels on the private endpoint
+  death queues, and a timer, serving those two labels on the private endpoint
   and taking deaths from the queue, until every driver of the batch has
   reported ready or died or the settle bound elapses, and then takes every
   death still queued. It then revokes the private endpoint, serves each driver
@@ -308,7 +311,7 @@ devmgr's responsibilities are:
   at its spawn, or one whose bootstrap failed after its start) is withdrawn
   the same way, its Bus Master Enable cleared before its BAR caps are taken.
   A driver that dies on its own is withdrawn when devmgr takes its death from
-  the death queue; procmgr may reap it first, and holds its memory until
+  the death queues; procmgr may reap it first, and holds its memory until
   devmgr's release. devmgr binds no driver to a PCI device whose
   configuration page it cannot carve or map, since it could not clear that
   function's Bus Master Enable. Then the driver's service endpoint is revoked
@@ -414,7 +417,7 @@ devmgr's responsibilities are:
   and are fixed once its batch settles. devmgr observes the death of every
   driver for the rest of the boot (an exit of its main thread, or a terminal
   fault of any of its threads; § Relationship to drivers): its control thread
-  waits on the death queue and its job notification together, and a settle
+  waits on the death queues and its job notification together, and a settle
   hands the deaths of drivers outside its batch back to it. A served driver
   that dies is withdrawn as above, so callers queued on its endpoint return
   (the endpoint's teardown wakes them), and a tombstone holds its ordinal:

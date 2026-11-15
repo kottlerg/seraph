@@ -3,7 +3,8 @@
 
 // services/memmgr/free-pool/src/pressure.rs
 
-//! Memory-pressure levels: how close the free pool is to the system reserve,
+//! Memory-pressure levels: how close the free pool's pages outside `promised`
+//! (`services/memmgr/docs/memory-pool.md` § Commit) are to the system reserve,
 //! with hysteresis so a pool that hovers at a threshold does not flip the
 //! level on every turn of memmgr's receive loop. memmgr signals every
 //! registered process when the level changes
@@ -53,8 +54,8 @@ fn classify(free: u64, pool_total: u64) -> PressureLevel
     }
 }
 
-/// The level after `prev`, for a free pool of `free` pages (deferred pages
-/// excluded) out of `pool_total`.
+/// The level after `prev`, for `free` pages of the free pool outside
+/// `promised` (deferred pages excluded) out of `pool_total`.
 ///
 /// A worse level applies at once. A better one applies only once the free
 /// pool clears its threshold by the hysteresis band: the result is the level

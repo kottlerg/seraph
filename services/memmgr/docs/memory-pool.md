@@ -104,11 +104,11 @@ unable to grow.
 
 ## Allocation
 
-`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the caller's budget
-node (§ Distribution policy): a request over the max of the node or of an ancestor fails `LIMIT`,
-and one that would leave fewer free pages than the system reserve, from a caller outside it, fails
-with the out-of-memory code of its flags, before any run leaves the pool. An admitted request
-then selects:
+`REQUEST_MEMORY_CAPS(want_pages, flags)` first admits `want_pages` against the caller's budget node
+(§ Distribution policy): a request over the max of the node or of an ancestor fails `LIMIT`, and one
+that would leave fewer free pages outside `promised` ([Commit](#commit)) than the system reserve,
+from a caller outside it, or than none, fails with the out-of-memory code of its flags, before any
+run leaves the pool. An admitted request then selects:
 
 1. **`REQUIRE_CONTIGUOUS` set.** Select the smallest run that covers
    `want_pages`. On hit: detach the run, split off exactly `want_pages` via
@@ -254,8 +254,10 @@ span, that is the whole chunk on its first fault, backed by one run.
 
 The span is a fault-around preference, and the process's budget node bounds it. memmgr first admits
 as much of the span as the node takes ([Distribution policy](#distribution-policy)): the span,
-clamped to what the max of the node and of every ancestor leaves, and, for a node outside the system
-reserve, to the free pages above the reserve. A fault is declined with code 7 when the reserve
+clamped to what the max of the node and of every ancestor leaves, and to the free pages outside
+`promised` ([Commit](#commit)) above, for a node outside the system reserve, the reserve. A fault in
+a committed region skips this admission: its commitment carries the span's charge, and `promised`
+its pages ([Commit](#commit)). A fault is declined with code 7 when the reserve
 admits not even the faulting page. It is declined with code 10 only when the max admits not even the
 faulting page, or, when the map needs page-table funding, not the faulting page and the least
 donation beside it, and with code 9 when the reserve refuses that donation. A longer run whose
@@ -342,7 +344,9 @@ funds the pool itself and maps the run again, at most four times:
    admitted against the max beside that run's pages. It then
    selects a contiguous run of the admitted size from the free pool, or of two when no four-page
    run is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
-   donates a single page.
+   donates a single page. A fault in a committed region instead draws a two-page donation from the
+   region's page-table reservation, which carries its charge, and admits nothing; once the
+   reservation no longer holds one, its donation is admitted as above ([Commit](#commit)).
 2. It records the run on the process's entry like a grant it did not map: no mapped VA and no
    region id, charged to the budget node. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take
    it back.
@@ -365,7 +369,8 @@ funding the budget refuses is declined with code 10, and one whose funding the r
 code 9. A fault whose map still fails, because the free pool cannot fund the pool or the map fails
 for another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md)
 § Kernel-origin fault message). A failed map can leave the first pages of the run mapped. memmgr
-unmaps the run's span before it returns the run to the free pool, so no page of a pooled run stays
+unmaps the run's span, keeping its page tables ([Commit](#commit)), before it returns the run to the
+free pool, so no page of a pooled run stays
 mapped in the process. When that unmap fails, the run stays recorded on the process's entry until
 `PROCESS_DIED`.
 
@@ -683,9 +688,11 @@ userspace RAM, is the distributor. The kernel accounts; memmgr decides which cha
 separate from the process record. A node has a parent link, an optional max in pages, and a charge
 counter for its subtree: the pages charged to the node and to every node below it. A process record
 points at a node; nothing assumes one node per process. The charge covers each grant, demand-fault
-run and page-table donation memmgr accounts to the process ([Per-Process
-Tracking](#per-process-tracking)), and each such run on the deferred list until it rejoins the free
-pool ([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
+run of an uncommitted region and page-table donation memmgr accounts to the process ([Per-Process
+Tracking](#per-process-tracking)), each committed region's pages and what is left of its page-table
+reservation, charged whole when the region is committed whether or not its pages hold frames
+([Commit](#commit)), and each such run on the deferred list until it rejoins the free pool
+([Reclamation](#reclamation)). What memmgr draws from the pool for its own metadata (arena and
 index pages, its page tables and its `CSpace` growth) is charged to no node. A node outlives its
 process while a node below it is alive or a run charged to it is on the deferred list, and its
 charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
@@ -702,9 +709,11 @@ node without a max is limited only by its ancestors and the system reserve. No r
 else in the default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
-take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
-reserve, and a demand fault of such a node backs only the free pages above the reserve, declined
-with code 7 when they hold not even the faulting page. It is a floor for the core and a limit on no
+take: a charge to any other node fails as exhaustion when it would leave fewer free pages outside
+`promised` ([Commit](#commit)) than the reserve, and a demand fault of such a node in an
+uncommitted region backs only the free pages outside `promised` above the reserve, declined with
+code 7 when they hold not even the faulting page. A charge to a reserve node may take the reserve,
+but not a page `promised` holds. It is a floor for the core and a limit on no
 process: memmgr's self-funding, which is charged to no node, and the reserve nodes draw on it.
 Reserve membership is an attribute each node takes when it is created, not one its children
 inherit. The nodes of memmgr's boot records
@@ -736,21 +745,103 @@ Live control of a running process's max is [#1097](https://github.com/kottlerg/s
 
 ---
 
+## Commit
+
+A region registered with `REGION_COMMIT` is committed ([ipc-interface.md](ipc-interface.md) § Label
+7). memmgr admits and charges its whole length when it registers it, and each growth by
+`EXTEND_REGION` (§ Label 12) when it accepts that growth, so a fault in a committed region is not
+declined for budget or RAM while the region's page-table reservation lasts, which only the process's
+own mappings and unmaps can spend early (Faults below): a refusal reaches the process as the error
+reply of the call that asked, where it can fail an allocation, not as a fault. std's heap grows this
+way. It keeps its uncommitted floor and registers one committed growth region directly above it on
+its first grow, which each later grow extends, so a heap is two regions however large it grows and
+holds no Memory caps ([Userspace Memory Model § Byte
+Heap](../../../docs/userspace-memory-model.md#byte-heap)).
+
+**Promised.** memmgr counts in `promised` what the committed regions can still take from the free
+pool: for each, its pages that hold no frame yet, what is left of its page-table reservation, and
+a bound on the metadata its chunk table and run descriptors can take. Every admission reads the
+free pages outside it: a grant, a committed registration or growth, an uncommitted demand run and a
+page-table donation are each admitted only when `free - promised - R >= want`, with R the system
+reserve for a charge to a node outside it and 0 for a charge to a reserve node ([Distribution
+policy](#distribution-policy)). So no charge takes a free page a committed region's fault needs.
+`QUERY_POOL_STATUS` reports `promised` in `data[8]`, and the pressure level is computed from the
+free pages outside it ([Memory pressure](#memory-pressure)).
+
+**What a commitment holds.** A committed region of `pages` pages charges its budget node its
+pages and a page-table reservation: two pages (`PT_DONATION_PAGES`, the size of its page-table
+donations; see Faults below) for each intermediate page table a map of the whole region can need
+under any paging depth (`pool_funding::pt_pages_for`). It adds those to `promised` with a metadata
+bound: for each chunk, a run descriptor for each of its pages, its leaf and its share of the
+directory nodes, and one directory node for each level of the table, in arena pages
+([Chunk table](#chunk-table), [Metadata Arena](#metadata-arena)). The max of the node and its
+ancestors bounds the pages and the reservation; the metadata bound is charged to no node, as
+memmgr's metadata never is. Each part is computed from the region's whole length, so a region grown
+in many small steps is charged and promised what one registration of its final length would be;
+the reservation is that of the largest length the region has had, since a cut keeps it (Shrink and
+release below). The computation is the host-tested `free-pool` module `commit`.
+
+**Faults.** A fault in a committed region is admitted without the budget and RAM tests of an
+uncommitted one, and its run is selected as any demand run's ([Demand faults](#demand-faults)). The
+run's pages were charged with the commitment, so recording the run charges nothing more and lowers
+`promised` by its pages. A page-table donation its map needs ([Client page-table
+funding](#client-page-table-funding)) is two pages, drawn from the region's reservation without
+admission: the donation's pages leave the reservation and `promised`, and are charged once, as the
+donation. The address space's page-table pool is shared, so any other mapping of the process can
+take the pages a donation leaves in it. Between two maps the reservation covers the region's
+donations whatever those mappings take. The kernel keeps at most one page of a donation for its
+bookkeeping, so each two-page donation adds at least one page, and a map that still runs out after a
+donation needs more pages than the pool held: the donations of one map take at most two pages for
+each page table it creates. The tables a committed region's maps create lie in its span and stay
+until it is unregistered: memmgr unmaps a cut's pages, and a run whose fault it declines in any
+region, without reclaiming page tables, since the kernel reclaims a table once it is empty, whatever
+span emptied it, so only the process's own unmaps and its unregistering of a region reclaim them. So
+they number at most `pool_funding::pt_pages_for` of its largest length, which the `commit` module's
+host tests check against a pool that every other mapping empties between two maps. Two cases, both
+of the process's own doing, spend the reservation faster: a thread of the process that maps between
+two rounds of one map can take the donated pages first, which costs that map a round and the
+reservation a donation, and a table in the region's span that a reclaiming unmap the process made or
+asked for removed (its own unmap of pages in a span that shares the table, or its unregistering of a
+region that shares it) is built again. A donation the reservation no longer holds is admitted as any
+other, so the process's budget and the system reserve bound what it takes, and the fault is declined
+with code 10 when the max refuses even that donation, or with code 9 when the reserve does. A
+committed fault is also declined, with code 9, when its map fails as any map can: no two contiguous
+pages are free for a donation, or a thread of the process maps between the rounds of one map and
+takes the donated pages faster than four rounds fund them.
+
+**Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
+multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
+the directory levels the shorter region does not need, and takes back each run on them, pooled or
+deferred ([Reclamation](#reclamation)). It releases the commitment of the pages cut: the charge of
+those that held no run, and their part of `promised`. It unmaps them without reclaiming page
+tables, so the tables of the pages cut stay in the address space until the region is unregistered,
+and the region keeps its page-table reservation: a regrowth up to the largest length the region has
+had adds none. `UNREGISTER_REGION` and `PROCESS_DIED` release a committed region's whole
+commitment: the charge of its pages that hold no run and of what is left of its reservation, and
+its part of `promised`.
+
+**Retries.** A committed registration or growth whose reply does not reach the caller is undone,
+as a grant whose reply fails is rolled back, so a caller whose call was interrupted makes it again
+and is charged once. A cut repeated finds the region at its new length and succeeds.
+
+---
+
 ## Memory pressure
 
 memmgr tells processes how close the free pool is to the system reserve, so a process holding
 memory it can give back (a cache) gives it back before a grant is refused. It acts on the level in
 no other way: it only signals, and kills nothing.
 
-**Levels.** The level is computed from the free pool's pages, deferred pages excluded, against
-`pool_total`. It is `CRITICAL` at or below the system reserve (§ Distribution policy), where a grant
-to a process outside the reserve is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages;
-and `NORMAL` otherwise. A worse level applies at once. A better one applies only once the free pool
-clears that level's threshold by a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages,
-and at least one, so a pool that hovers at a threshold does not flip the level on every turn: the
-level becomes the one the free pool less the band gives, and no worse than before. The constants
-are tuning values proportional to RAM ([docs/limits.md](../../../docs/limits.md) § memmgr); the
-computation is the host-tested `free-pool` module `pressure`.
+**Levels.** The level is computed from the free pool's pages outside `promised`
+([Commit](#commit)), deferred pages excluded, against `pool_total`. It is `CRITICAL` at or below the
+system reserve (§ Distribution policy), where a grant to a process outside the reserve is refused;
+`LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages; and `NORMAL` otherwise. A worse level applies
+at once. A better one applies only once the free pool clears that level's threshold by a hysteresis
+band of `pool_total / PRESSURE_BAND_DIVISOR` pages, and at least one, so a pool that hovers at a
+threshold does not flip the level on every turn: the level becomes the one the free pool less the
+band gives, and no worse than before. The constants are tuning values proportional to RAM
+([docs/limits.md](../../../docs/limits.md) § memmgr); the computation is the host-tested `free-pool`
+module `pressure`.
 
 **Signal.** A process registers a Notification cap and the bits to send on it with
 `REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11); the std runtime registers
@@ -774,8 +865,9 @@ level.
 
 This section is design intent; not yet implemented
 ([#230](https://github.com/kottlerg/seraph/issues/230)). Today memmgr evicts nothing: it fills
-every demand fault from RAM, a heap grows by grants, and exhaustion surfaces as the out-of-memory
-errors and fault declines of [Failure Modes](#failure-modes) and [Demand faults](#demand-faults).
+every demand fault from RAM, and exhaustion surfaces as the out-of-memory errors and fault declines
+of [Failure Modes](#failure-modes) and [Demand faults](#demand-faults), and as refused commitments
+([Commit](#commit)).
 
 **Eligible pages.** memmgr evicts only pages it mapped as pager: the runs it backs on a demand
 fault. It never evicts a granted frame, since a client holding a Memory cap to it may have retyped,
@@ -787,21 +879,14 @@ Reservations](../../../docs/userspace-memory-model.md#page-reservations)), and i
 procmgr have no pager, so eviction never reaches a page the kernel's non-restartable IPC-buffer
 copies use.
 
-**Commit.** A heap grows by extending one committed demand region above its uncommitted floor,
-not by grants, so the heap holds no Memory caps. memmgr charges a committed extension in full when
-it accepts it: its pages to the budget node, and to `promised`, the count of committed pages that
-hold no frame, with a bound on the page tables and chunk metadata they can need. Every admission
-(a grant, an extension, an uncommitted demand run, a page-table donation) requires
-`free - promised - R + A >= want`, where A is the overcommit allowance and R is the system
-reserve for a charge to a node outside it and 0 for a charge to a reserve node ([Distribution
-policy](#distribution-policy)). A fault on a
-committed page draws from `promised`, so with A = 0 it is never declined for budget or RAM, and a
-refused extension fails the allocation, never a fault. With A = 0 memmgr evicts only uncommitted
-pages (thread stacks, heap floors, `register_demand_paged` regions): evicting an uncommitted chunk
-frees its frames less the store pages its contents take, while evicting a committed chunk only
-adds store pages against `promised`. A ships at 0. Above 0, heap pages are evictable too, and a
-committed fault that finds no frame compresses a victim within its turn or is declined as a commit
-overrun.
+**Overcommit allowance.** Every admission's test ([Commit](#commit)) gains an overcommit allowance
+A: `free - promised - R + A >= want`. With A = 0, a fault on a committed page draws from `promised`
+as today, so it is not declined for budget or RAM ([Commit](#commit)). With A = 0 memmgr evicts only
+uncommitted pages (thread stacks, heap floors, `register_demand_paged` regions): evicting an
+uncommitted chunk frees its frames less the store pages its contents take, while evicting a
+committed chunk only adds store pages against `promised`. A ships at 0. Above 0, heap pages are
+evictable too, and a committed fault that finds no frame compresses a victim within its turn or is
+declined as a commit overrun.
 
 **Selection.** While the pool's pressure level reads `LOW` or `CRITICAL`
 ([Memory pressure](#memory-pressure)), memmgr reclaims until it reads `NORMAL`,
@@ -818,7 +903,7 @@ A fault on a swapped chunk is restored in the fault arm within the turn, since t
 bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
 any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
 10. A restore of a committed chunk is a committed fault: it draws from `promised` as any committed
-fault does ([Commit](#eviction)), and with A above 0 a restore that finds no frame compresses a
+fault does ([Commit](#commit)), and with A above 0 a restore that finds no frame compresses a
 victim within its turn or is declined as a commit overrun. A restore of an uncommitted chunk passes
 the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, with want the chunk's
 backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
@@ -860,9 +945,9 @@ not present.
 
 | Failure | Cause | Caller observation |
 |---|---|---|
-| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take the system reserve from a caller outside it | Reply with error label; caller may retry without the flag, or fail |
-| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant would take the system reserve from a caller outside it | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
+| `OUT_OF_MEMORY_CONTIGUOUS` | No free run satisfies `REQUIRE_CONTIGUOUS`, or the grant would take a page `promised` holds, or the system reserve from a caller outside it | Reply with error label; caller may retry without the flag, or fail |
+| `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant, or a committed registration or growth, would take a page `promised` holds, or the system reserve from a caller outside it ([Commit](#commit)) | Reply with error label; caller treats as system-wide RAM exhaustion |
+| `LIMIT` | `want_pages`, or a committed registration's or growth's charge, would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 

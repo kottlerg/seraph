@@ -111,9 +111,10 @@ pub enum ChargeError
     /// The charge would take the subtree of the node or of an ancestor over
     /// its max: `LIMIT`, or a fault declined with code 10.
     Limit,
-    /// The node is outside the reserve and the charge would leave fewer free
-    /// pages than the reserve: system exhaustion, an out-of-memory code or a
-    /// fault declined with code 7.
+    /// The charge would take more free pages than the pool holds outside
+    /// `promised`, or, for a node outside the reserve, leave fewer of them
+    /// than the reserve: system exhaustion, an out-of-memory code or a fault
+    /// declined with code 7.
     Reserve,
 }
 
@@ -215,15 +216,17 @@ pub fn create<S: SlotStore>(arena: &mut Arena<S>, spec: NodeSpec) -> Result<Node
 }
 
 /// Whether `pages` more may be charged to the node `idx`, with `free` pages in
-/// the free pool and `reserve` of them in the system reserve. `pending` pages
-/// already left the pool for the node and are not yet charged to it (a demand
-/// run whose map needs page-table funding first): they count against the max,
-/// and are already out of `free`.
+/// the free pool outside `promised` and `reserve` of them in the system
+/// reserve: `free - R >= pages`, R being `reserve` for a node outside the
+/// reserve and 0 for a reserve node. `pending` pages already left the pool
+/// for the node and are not yet charged to it (a demand run whose map needs
+/// page-table funding first): they count against the max, and are already out
+/// of `free`.
 ///
 /// # Errors
 /// [`ChargeError::Limit`] when `pages` and `pending` together exceed the
-/// [`headroom`] of the node; [`ChargeError::Reserve`] when the node is outside
-/// the reserve and the charge would leave fewer than `reserve` free pages.
+/// [`headroom`] of the node; [`ChargeError::Reserve`] when the charge would
+/// leave fewer than R of the `free` pages.
 pub fn admit<S: SlotStore>(
     arena: &Arena<S>,
     idx: NodeIdx,
@@ -237,8 +240,7 @@ pub fn admit<S: SlotStore>(
     {
         return Err(ChargeError::Limit);
     }
-    let in_reserve = node(arena, idx).is_some_and(|b| b.reserve());
-    if !in_reserve && free.saturating_sub(pages) < reserve
+    if free < pages.saturating_add(floor(arena, idx, reserve))
     {
         return Err(ChargeError::Reserve);
     }
@@ -246,15 +248,15 @@ pub fn admit<S: SlotStore>(
 }
 
 /// The most pages, up to `want`, that may be charged to the node `idx`, with
-/// `free` pages in the free pool and `reserve` of them in the system reserve:
-/// `want`, clamped to the node's [`headroom`] and, for a node outside the
-/// reserve, to the free pages above the reserve. A demand fault backs that
-/// much of its span.
+/// `free` pages in the free pool outside `promised` and `reserve` of them in
+/// the system reserve: `want`, clamped to the node's [`headroom`] and to the
+/// `free` pages above R, which is `reserve` for a node outside the reserve and
+/// 0 for a reserve node. A demand fault backs that much of its span.
 ///
 /// # Errors
 /// [`ChargeError::Limit`] when the headroom admits no page;
-/// [`ChargeError::Reserve`] when the node is outside the reserve and no free
-/// page lies above it. A `want` of 0 admits 0.
+/// [`ChargeError::Reserve`] when no `free` page lies above R. A `want` of 0
+/// admits 0.
 pub fn admissible<S: SlotStore>(
     arena: &Arena<S>,
     idx: NodeIdx,
@@ -272,15 +274,26 @@ pub fn admissible<S: SlotStore>(
     {
         return Err(ChargeError::Limit);
     }
-    if !node(arena, idx).is_some_and(|b| b.reserve())
+    pages = pages.min(free.saturating_sub(floor(arena, idx, reserve)));
+    if pages == 0
     {
-        pages = pages.min(free.saturating_sub(reserve));
-        if pages == 0
-        {
-            return Err(ChargeError::Reserve);
-        }
+        return Err(ChargeError::Reserve);
     }
     Ok(pages)
+}
+
+/// The free pages a charge to the node `idx` must leave, with `reserve` in the
+/// system reserve: `reserve` for a node outside it, 0 for a reserve node.
+fn floor<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx, reserve: u64) -> u64
+{
+    if node(arena, idx).is_some_and(|b| b.reserve())
+    {
+        0
+    }
+    else
+    {
+        reserve
+    }
 }
 
 /// Charge `pages` to the node `idx`: its own count, and the subtree count of
@@ -457,6 +470,11 @@ mod tests
         assert_eq!(admit(&a, client, 16, 0, 20, 4), Ok(()));
         assert_eq!(admit(&a, client, 17, 0, 20, 4), Err(ChargeError::Reserve));
         assert_eq!(admit(&a, core, 20, 0, 20, 4), Ok(()));
+        // A reserve node takes the reserve but no page outside the free ones:
+        // the pages `promised` to committed regions are already out of `free`.
+        assert_eq!(admit(&a, core, 21, 0, 20, 4), Err(ChargeError::Reserve));
+        assert_eq!(admissible(&a, core, 16, 10, 4), Ok(10));
+        assert_eq!(admissible(&a, core, 16, 0, 4), Err(ChargeError::Reserve));
         // A child created as a reserve node under a reserve parent.
         let child = create(
             &mut a,

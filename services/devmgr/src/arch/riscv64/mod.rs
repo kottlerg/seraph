@@ -73,10 +73,12 @@ pub const ELF_MACHINE: u16 = elf::EM_RISCV;
 /// `iommu-riscv`.
 pub const IOMMU_FAMILY: crate::iommu::Family = crate::iommu::Family::Riscv;
 
-/// GSI for a PCI function whose config-space IRQ line is unset, from its
-/// `INTx` pin and device number: the QEMU `virt` PCI host's swizzle onto
-/// APLIC sources 32..=35 (firmware leaves the IRQ line 0 there). Returns
-/// `None` for a pin outside `INTA`..=`INTD` (1..=4).
+/// GSI for a PCI function whose config-space IRQ line is unset, from the
+/// `INTx` pin and device number its interrupt reaches the root bus with
+/// (`PciDevice::host_intx`: its own on the root bus, swizzled at each bridge
+/// behind it): the QEMU `virt` PCI host's swizzle onto APLIC sources
+/// 32..=35 (firmware leaves the IRQ line 0 there). Returns `None` for a pin
+/// outside `INTA`..=`INTD` (1..=4).
 pub fn intx_fallback_gsi(pin: u8, dev: u8) -> Option<u32>
 {
     if (1..=4).contains(&pin)

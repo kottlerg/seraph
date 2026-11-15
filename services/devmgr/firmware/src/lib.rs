@@ -26,8 +26,10 @@
 //! (`dmar`), and walks the RISC-V IO Mapping Table for the RISC-V IOMMUs that
 //! are PCI functions and the functions each translates (`rimt`), walks a DSDT
 //! or SSDT's AML namespace for the devices with a static identity and decodes
-//! their resource templates (`aml`), and parses the SPCR and the platform
-//! description table of devices no firmware table lists (`platform`). The
+//! their resource templates (`aml`), parses the SPCR and the platform
+//! description table of devices no firmware table lists (`platform`), and
+//! keeps the PCI device records, each one's state and the `INTx` pin and
+//! device number its interrupt reaches the root bus with (`pci_records`). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
 //! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable
@@ -48,6 +50,7 @@ pub mod dtb;
 pub mod image;
 pub mod lines;
 pub mod pci;
+pub mod pci_records;
 pub mod platform;
 pub mod records;
 pub mod resource;

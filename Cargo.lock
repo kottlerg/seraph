@@ -265,6 +265,7 @@ name = "devmgr"
 version = "0.1.4"
 dependencies = [
  "boot-protocol",
+ "death-set",
  "devmgr-firmware",
  "driver-binding",
  "elf",

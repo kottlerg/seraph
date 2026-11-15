@@ -1620,11 +1620,11 @@ dependencies = [
  "gdb-rsp",
  "init-log-levels",
  "ipc",
+ "json",
  "log 0.1.4",
  "logd-codec",
  "procmgr-process-table",
  "regex",
- "serde_json",
  "syscall-abi",
  "vfsd-gpt",
 ]

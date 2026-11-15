@@ -734,10 +734,13 @@ fn start_watchdog() -> bool
 /// The watchdog: once a step of a fault's handling has run past its bound
 /// ([`FAULT_BOUND`] for the report, [`dump::DUMP_BOUND`] for a core dump),
 /// commit to cancel its generation, post the receiving thread an upcall, which
-/// cancels the blocking request it waits in (`Interrupted`), serve the
-/// upcall when it is delivered, and settle the generation. The commit holds
-/// only while the generation is still being handled, so one whose handling
-/// ended meanwhile is not cancelled, nor the next one's handling cut short.
+/// cancels the blocking request it waits in (`Interrupted`), and serve the
+/// upcall when it is delivered, once each tick until the receiver ends the
+/// generation, so a request a runtime call sends after the first
+/// cancellation (a file's close as it is dropped) is cancelled too; then
+/// settle the generation. The commit holds only while the generation is
+/// still being handled, so one whose handling ended meanwhile is not
+/// cancelled, nor the next one's handling cut short.
 /// An upcall never cancels a fault of the receiver's own, a page fault on its
 /// pager included, which it waits for.
 fn watchdog(receiver: u64, endpoint: u64) -> !
@@ -755,30 +758,39 @@ fn watchdog(receiver: u64, endpoint: u64) -> !
         {
             continue;
         }
-        // The upcall is delivered at the receiver's next syscall return;
-        // resume it there.
-        if syscall::thread_post_upcall(receiver, generation, 0).is_ok()
+        while cancel_once(receiver, endpoint, generation, ipc_buf) && BOUND.fired(generation)
         {
-            loop
-            {
-                // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-                match unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
-                {
-                    Ok(_) =>
-                    {
-                        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-                        let _ = unsafe {
-                            ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf)
-                        };
-                        break;
-                    }
-                    Err(e) if e == SyscallError::Interrupted as i64 =>
-                    {}
-                    Err(_) => break,
-                }
-            }
+            std::thread::sleep(WATCHDOG_TICK);
         }
         BOUND.settle(generation);
         std::os::seraph::log!(warn: "a step of a fault's handling passed its bound");
+    }
+}
+
+/// Post the receiving thread one upcall for `generation`, which cancels the
+/// blocking request it waits in or is delivered at its next syscall return,
+/// and serve it there; `false` when the post is refused or the upcall cannot
+/// be received.
+fn cancel_once(receiver: u64, endpoint: u64, generation: u64, ipc_buf: *mut u64) -> bool
+{
+    if syscall::thread_post_upcall(receiver, generation, 0).is_err()
+    {
+        return false;
+    }
+    loop
+    {
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        match unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+        {
+            Ok(_) =>
+            {
+                // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
+                return true;
+            }
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            Err(_) => return false,
+        }
     }
 }

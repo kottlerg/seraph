@@ -121,23 +121,26 @@ procmgr can be waiting on the faulting process (an fs driver serving a `CREATE_F
 log write can wait on a driver logd writes through before that driver has declared itself
 undebuggable. When the bound passes, the watchdog posts the receiving thread an upcall
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Asynchronous Upcalls), which cancels
-the blocking request it waits in (`Interrupted`) and is then served by the watchdog. An upcall never
+the blocking request it waits in (`Interrupted`) and is then served by the watchdog. It posts
+another each tick until crashd ends that step, so a request a runtime call sends after the first
+cancellation (the close a file sends as it is dropped) is cancelled in its turn. An upcall never
 cancels a fault of the receiving thread's own, a page fault on its pager included, so the bound
 cannot end crashd. Each fault takes a generation, and the watchdog commits to cancel one only while
 it is still being handled ([`fault-bound/`](../fault-bound/src/lib.rs), host-tested). Once it has,
-crashd sends no further request of that fault's handling, so no later attach waits past the bound,
-wherever the upcall was delivered. On the cancellation crashd declines the fault at once, marking
-the block `status=timeout` when an attach was the request cancelled, waits for the watchdog to have
-served the upcall, and logs the rest of the block after the decline, when nothing waits on the
-faulting thread any more. So no cancellation of one fault reaches the next fault's handling,
-unless the watchdog has not served it within another 2 s; crashd then logs that and goes on, and
-the late upcall can cut one request of the next fault's handling short. The stack scan reads at
-most 8 KiB (`STACK_SCAN_BYTES`).
+crashd starts no further request of that fault's handling, and one a runtime call still sends waits
+at most a tick, wherever the upcall was delivered. On the cancellation crashd declines the fault at
+once, marking the block `status=timeout` when an attach was the request cancelled, waits for the
+watchdog to have served its last upcall, and logs the rest of the block after the decline, when
+nothing waits on the faulting thread any more. So no cancellation of one fault reaches the next
+fault's handling, unless the watchdog has not served it within another 2 s; crashd then logs that
+and goes on, and the late upcall can cut one request of the next fault's handling short. The stack
+scan reads at most 8 KiB (`STACK_SCAN_BYTES`).
 
 A dump runs under a bound of its own, 60 s (`DUMP_BOUND`), after the report's and outside it, as
 a new generation of the same watchdog. A request it waits in, an attach or a file-system call, is
 cancelled as the report's is, and the runtime's file calls return an error for it; crashd then
-sends no further request, writes no core, logs `not written: the dump passed its bound`, and
+starts no further request, the runtime's close of the core file cancelled in its turn, writes no
+core, logs `not written: the dump passed its bound`, and
 declines. The faulting thread is held while the dump runs, so the bound is the most a dump delays
 the process's teardown and crashd's next fault. It covers a core of the per-core budget, 2 MiB
 (`CORE_BYTES_MAX`), at half the slowest rate measured writing through the FAT driver, about

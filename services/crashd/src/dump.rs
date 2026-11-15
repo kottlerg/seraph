@@ -13,10 +13,12 @@
 //! held thread's registers and extended state, lists the space's pages,
 //! lays the core out within its byte budget, makes room in the directory by
 //! deleting the oldest cores, and writes the file under a `.part` name,
-//! renamed once complete. Every blocking request is made only while the
-//! dump's generation has not fired, and the watchdog cancels the one it
-//! waits in once the bound passes, so the dump ends within it whatever the
-//! process or the storage path does.
+//! renamed once complete. Every blocking request is started only while the
+//! dump's generation has not fired, and once the bound passes the watchdog
+//! cancels the one it waits in, and each the runtime still sends until the
+//! dump ends (a file's close as it is dropped), so the dump ends within the
+//! bound and a tick per such request whatever the process or the storage
+//! path does.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -463,8 +465,17 @@ fn make_room(size: u64, generation: u64) -> Result<u64, Outcome>
     };
     let mut entries = Vec::new();
     let mut cores = Vec::new();
-    for item in dir.flatten()
+    for item in dir
     {
+        if fired(generation)
+        {
+            return Err(Outcome::Cancelled);
+        }
+        let Ok(item) = item
+        else
+        {
+            continue;
+        };
         let file = item.file_name();
         let Some(entry) = file.to_str().and_then(store::classify)
         else

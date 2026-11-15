@@ -12,7 +12,7 @@
 //! 4096 bytes, is chosen per authoring.
 
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Context, Result};
@@ -21,6 +21,7 @@ use clap::ValueEnum;
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;
+use crate::fat;
 use crate::gpt::{self, Guid, guid};
 use crate::util::step;
 
@@ -152,8 +153,8 @@ struct Volume
 /// What an authored partition holds.
 enum Contents
 {
-    /// A FAT32 volume populated from a host directory (formatted and left
-    /// empty when the directory is absent).
+    /// A FAT volume ([`crate::fat`]) holding a host directory's tree, or
+    /// nothing when the directory is absent.
     Fat(PathBuf),
     /// No filesystem: the partition's bytes are left as the new image's
     /// zeros.
@@ -166,88 +167,6 @@ struct Sources
     esp: PathBuf,
     root: PathBuf,
     data: PathBuf,
-}
-
-/// A read/write/seek view into a byte range of an underlying file.
-/// Lets the `fatfs` crate operate on a single partition without knowing
-/// about the surrounding GPT layout.
-struct PartitionSlice
-{
-    file: File,
-    /// Absolute file offset of the partition's first byte.
-    offset: u64,
-    /// Absolute file offset one past the partition's last byte.
-    end: u64,
-}
-
-impl PartitionSlice
-{
-    fn new(mut file: File, offset: u64, length: u64) -> io::Result<Self>
-    {
-        let end = offset.checked_add(length).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "partition extends past u64")
-        })?;
-        file.seek(SeekFrom::Start(offset))?;
-        Ok(PartitionSlice { file, offset, end })
-    }
-
-    /// Bytes from the file position to the partition's end: zero at or past
-    /// it, capped at `usize::MAX`.
-    fn remaining(&mut self) -> io::Result<usize>
-    {
-        let pos = self.file.stream_position()?;
-        Ok(usize::try_from(self.end.saturating_sub(pos)).unwrap_or(usize::MAX))
-    }
-}
-
-impl Read for PartitionSlice
-{
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>
-    {
-        let limit = buf.len().min(self.remaining()?);
-        self.file.read(buf.get_mut(..limit).unwrap_or_default())
-    }
-}
-
-impl Write for PartitionSlice
-{
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize>
-    {
-        let limit = buf.len().min(self.remaining()?);
-        self.file.write(buf.get(..limit).unwrap_or_default())
-    }
-
-    fn flush(&mut self) -> io::Result<()>
-    {
-        self.file.flush()
-    }
-}
-
-impl Seek for PartitionSlice
-{
-    /// Seeks within the partition. A target before the partition's first
-    /// byte, or one `u64` cannot hold, is an error that leaves the position
-    /// unchanged.
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64>
-    {
-        let target = match pos
-        {
-            SeekFrom::Start(p) => self.offset.checked_add(p),
-            SeekFrom::End(p) => self.end.checked_add_signed(p),
-            SeekFrom::Current(p) => self.file.stream_position()?.checked_add_signed(p),
-        };
-        let Some((abs, relative)) =
-            target.and_then(|abs| Some((abs, abs.checked_sub(self.offset)?)))
-        else
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek outside the partition",
-            ));
-        };
-        self.file.seek(SeekFrom::Start(abs))?;
-        Ok(relative)
-    }
 }
 
 /// Create the GPT disk image at `<project_root>/disk.img`, and, when the
@@ -407,9 +326,9 @@ fn plan(volumes: &[Volume], block_size: BlockSize) -> Result<(Vec<u64>, u64)>
 }
 
 /// Write a zero-filled image at `path` whose GPT carries `disk_guid` and holds
-/// `volumes` as partitions 1, 2, … in order, each [`Contents::Fat`] one
-/// formatted FAT32 and populated from its source, and each [`Contents::Raw`]
-/// one left zero.
+/// `volumes` as partitions 1, 2, … in order, each [`Contents::Fat`] one a
+/// FAT volume holding its source's tree, and each [`Contents::Raw`] one left
+/// zero.
 fn write_image(
     path: &Path,
     block_size: BlockSize,
@@ -433,13 +352,14 @@ fn write_image(
         {
             continue;
         };
-        format_and_populate_partition(
+        write_fat_partition(
             path,
             start_lba
                 .checked_mul(block_size.bytes())
                 .context("partition offset exceeds u64")?,
             volume.bytes,
             block_size,
+            &volume.unique_guid,
             source,
         )?;
     }
@@ -637,78 +557,82 @@ fn write_gpt(
     Ok(())
 }
 
-/// Format a partition as FAT and populate it from a source directory.
-///
-/// Skips build metadata (`.arch`, `NvVars`) and the top-level `esp` and
-/// `data` subdirectories, each a mount point with its own partition and so
-/// not root content.
-fn format_and_populate_partition(
+/// Write the FAT volume of the `bytes`-byte partition at byte `offset` of the image at
+/// `image_path`, its sectors `block_size` bytes and its serial number the first four bytes of
+/// `unique_guid`, holding the tree under `source_dir` ([`host_tree`]), or nothing when that
+/// directory is absent. The partition's bytes are the new image's zeros, as
+/// [`fat::write_volume`] requires.
+fn write_fat_partition(
     image_path: &Path,
     offset: u64,
-    size: u64,
+    bytes: u64,
     block_size: BlockSize,
+    unique_guid: &Guid,
     source_dir: &Path,
 ) -> Result<()>
 {
-    // Format.
+    let tree = if source_dir.exists()
     {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(image_path)
-            .context("failed to open image for partition format")?;
-        let mut slice = PartitionSlice::new(file, offset, size)?;
-        // 4 KiB clusters align cluster boundaries with the page-granular
-        // sector cache in fs/fat: each cluster is one PAGE_SIZE (8 sectors
-        // of 512 bytes, or one 4Kn sector), so file data within a cluster
-        // is page-contiguous and FS_READ_FRAME can return the cluster's
-        // page directly via cap without per-sector translation. The sector
-        // size is the image's logical block size, which fs/fat requires
-        // the volume's to equal.
-        let opts = fatfs::FormatVolumeOptions::new()
-            .bytes_per_sector(block_size.fat_sector())
-            .bytes_per_cluster(4096)
-            .fat_type(fatfs::FatType::Fat32);
-        fatfs::format_volume(&mut slice, opts).context("failed to format partition as FAT")?;
+        host_tree(source_dir, source_dir)?
     }
-
-    // Populate (if source directory exists).
-    if source_dir.exists()
+    else
     {
-        let file = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(image_path)
-            .context("failed to open image for partition population")?;
-        let slice = PartitionSlice::new(file, offset, size)?;
-        let fat = fatfs::FileSystem::new(slice, fatfs::FsOptions::new())
-            .context("failed to mount partition")?;
-        let root = fat.root_dir();
-        populate_dir(&root, source_dir, source_dir)?;
-    }
-
-    Ok(())
+        Vec::new()
+    };
+    let [a, b, c, d, ..] = *unique_guid;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(image_path)
+        .with_context(|| {
+            format!(
+                "failed to open {} for its FAT volumes",
+                image_path.display()
+            )
+        })?;
+    fat::write_volume(
+        &mut file,
+        offset,
+        bytes,
+        block_size.fat_sector(),
+        u32::from_le_bytes([a, b, c, d]),
+        &tree,
+    )
+    .with_context(|| {
+        format!(
+            "failed to write the FAT volume from {}",
+            source_dir.display()
+        )
+    })?;
+    file.sync_all().context("failed to sync the FAT volume")
 }
 
-/// Recursively copy a host directory tree into a FAT filesystem directory.
-fn populate_dir<T: Read + Write + Seek>(
-    fat_dir: &fatfs::Dir<T>,
-    host_dir: &Path,
-    sysroot_root: &Path,
-) -> Result<()>
+/// The files and directories under `host_dir`, in name order, as a FAT volume holds them.
+///
+/// Skips build metadata (`.arch`, `NvVars`), the `esp` directory, and at the top of
+/// `sysroot_root` the `data` directory: `esp` and `data` are mount points with their own
+/// partitions, and so not root content. Entries other than files and directories are skipped.
+///
+/// # Errors
+/// Fails when a directory cannot be read or a name is not UTF-8.
+fn host_tree(host_dir: &Path, sysroot_root: &Path) -> Result<Vec<fat::Entry>>
 {
     let mut entries: Vec<_> = fs::read_dir(host_dir)
         .with_context(|| format!("failed to read {}", host_dir.display()))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to read {}", host_dir.display()))?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
 
+    let mut tree = Vec::with_capacity(entries.len());
     for entry in entries
     {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| crate::error::err!("{} has a name that is not UTF-8", path.display()))?;
 
         // Skip build metadata and the ESP mount point (populated separately).
-        if name_str == ".arch" || name_str == "NvVars" || name_str == "esp"
+        if name == ".arch" || name == "NvVars" || name == "esp"
         {
             continue;
         }
@@ -717,39 +641,33 @@ fn populate_dir<T: Read + Write + Seek>(
         // is excluded from the root partition (symmetric with `esp`). Skip
         // it only at the sysroot top level — a nested `data/` elsewhere in
         // the tree is still copied.
-        if name_str == "data" && host_dir == sysroot_root
+        if name == "data" && host_dir == sysroot_root
         {
             continue;
         }
 
-        let path = entry.path();
         let ft = entry
             .file_type()
             .with_context(|| format!("failed to get file type: {}", path.display()))?;
-
-        if ft.is_dir()
+        let kind = if ft.is_dir()
         {
-            fat_dir
-                .create_dir(&name_str)
-                .with_context(|| format!("failed to create dir in image: {name_str}"))?;
-            let sub = fat_dir
-                .open_dir(&name_str)
-                .with_context(|| format!("failed to open dir in image: {name_str}"))?;
-            populate_dir(&sub, &path, sysroot_root)?;
+            fat::Kind::Dir(host_tree(&path, sysroot_root)?)
         }
         else if ft.is_file()
         {
-            let mut src =
-                File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
-            let mut dst = fat_dir
-                .create_file(&name_str)
-                .with_context(|| format!("failed to create file in image: {name_str}"))?;
-            io::copy(&mut src, &mut dst)
-                .with_context(|| format!("failed to copy {} into image", path.display()))?;
+            let len = entry
+                .metadata()
+                .with_context(|| format!("failed to read the size of {}", path.display()))?
+                .len();
+            fat::Kind::File { path, len }
         }
+        else
+        {
+            continue;
+        };
+        tree.push(fat::Entry { name, kind });
     }
-
-    Ok(())
+    Ok(tree)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -758,36 +676,6 @@ fn populate_dir<T: Read + Write + Seek>(
 mod tests
 {
     use super::*;
-
-    #[test]
-    fn partition_slice_seeks_stay_inside_the_partition()
-    {
-        let scratch = Scratch::new("slice-seek");
-        let path = scratch.0.join("f.img");
-        fs::write(&path, [0u8; 32]).unwrap();
-        let open = || File::open(&path).unwrap();
-
-        // A partition whose end `u64` cannot hold is refused.
-        assert!(PartitionSlice::new(open(), 8, u64::MAX).is_err());
-
-        // Partition bytes 8..24 of the file.
-        let mut slice = PartitionSlice::new(open(), 8, 16).unwrap();
-        assert_eq!(slice.seek(SeekFrom::Start(4)).unwrap(), 4);
-        assert_eq!(slice.seek(SeekFrom::Current(-4)).unwrap(), 0);
-        assert_eq!(slice.seek(SeekFrom::End(-16)).unwrap(), 0);
-        assert_eq!(slice.seek(SeekFrom::End(0)).unwrap(), 16);
-
-        // Before the partition's first byte, though inside the file.
-        slice.seek(SeekFrom::Start(2)).unwrap();
-        slice.seek(SeekFrom::Current(-3)).unwrap_err();
-        slice.seek(SeekFrom::End(-17)).unwrap_err();
-        // A failed seek leaves the position unchanged.
-        assert_eq!(slice.stream_position().unwrap(), 2);
-
-        // Past what `u64` holds.
-        slice.seek(SeekFrom::Start(u64::MAX)).unwrap_err();
-        assert_eq!(slice.stream_position().unwrap(), 2);
-    }
 
     /// A scratch directory unique to this process and `name`, removed on drop.
     struct Scratch(PathBuf);
@@ -901,10 +789,31 @@ mod tests
         );
     }
 
-    // Defect caught: each authoring drew the GPT's disk GUID at random, so
-    // two builds of one image differed.
+    /// Whether the files at `a` and `b` hold the same bytes.
+    fn same_bytes(first: &Path, second: &Path) -> bool
+    {
+        let mut files = [File::open(first).unwrap(), File::open(second).unwrap()];
+        let mut bufs = [vec![0u8; 1 << 20], vec![0u8; 1 << 20]];
+        loop
+        {
+            let [one, two] = &mut files;
+            let [ours, theirs] = &mut bufs;
+            let len = one.read(ours).unwrap();
+            if len == 0
+            {
+                return two.read(theirs).unwrap() == 0;
+            }
+            if two.read_exact(&mut theirs[..len]).is_err() || ours[..len] != theirs[..len]
+            {
+                return false;
+            }
+        }
+    }
+
+    // Defect caught: each authoring drew the GPT's disk GUID at random, and the FAT writer
+    // stamped each entry with the host's clock, so two builds of one image differed.
     #[test]
-    fn two_authorings_of_a_layout_write_the_same_partition_tables()
+    fn two_authorings_of_a_layout_write_identical_images()
     {
         for data in [DataPlacement::MainImage, DataPlacement::SecondImage]
         {
@@ -912,30 +821,25 @@ mod tests
                 block_size: BlockSize::B512,
                 data,
             };
-            // The first and last IMAGE_MARGIN bytes of each image, which hold
-            // its protective MBR and both GPT headers and entry arrays.
-            let tables = |run: &str| -> Vec<Vec<u8>> {
+            let author = |run: &str| -> Scratch {
                 let scratch = Scratch::new(&format!("again-{run}-{data:?}"));
-                let main = scratch.0.join("disk.img");
-                let data_image = scratch.0.join("disk-data.img");
-                author_images(&main, &data_image, Arch::X86_64, layout, &scratch.sources())
-                    .unwrap();
-                [main, data_image]
-                    .iter()
-                    .filter(|path| path.is_file())
-                    .flat_map(|path| {
-                        let len = fs::metadata(path).unwrap().len();
-                        [
-                            read_range(path, 0, IMAGE_MARGIN),
-                            read_range(path, len - IMAGE_MARGIN, IMAGE_MARGIN),
-                        ]
-                    })
-                    .collect()
+                author_images(
+                    &scratch.0.join("disk.img"),
+                    &scratch.0.join("disk-data.img"),
+                    Arch::X86_64,
+                    layout,
+                    &scratch.sources(),
+                )
+                .unwrap();
+                scratch
             };
-            let first = tables("a");
-            let images = 1 + usize::from(data == DataPlacement::SecondImage);
-            assert_eq!(first.len(), 2 * images);
-            assert_eq!(first, tables("b"), "{data:?}");
+            let (first, second) = (author("a"), author("b"));
+            for image in ["disk.img", "disk-data.img"]
+            {
+                let (a, b) = (first.0.join(image), second.0.join(image));
+                assert_eq!(a.is_file(), b.is_file());
+                assert!(!a.is_file() || same_bytes(&a, &b), "{image}, {data:?}");
+            }
         }
     }
 
@@ -1005,20 +909,19 @@ mod tests
             );
 
             // The data volume is populated, and reads back, at this size.
-            let slice = PartitionSlice::new(
-                File::options().read(true).write(true).open(&main).unwrap(),
+            let mut file = File::open(&main).unwrap();
+            let tree = fat::read::read_volume(
+                &mut file,
                 starts[2] * block,
-                DATA_PARTITION_SIZE,
-            )
-            .unwrap();
-            let fat = fatfs::FileSystem::new(slice, fatfs::FsOptions::new()).unwrap();
-            let mut text = String::new();
-            fat.root_dir()
-                .open_file("test.txt")
-                .unwrap()
-                .read_to_string(&mut text)
-                .unwrap();
-            assert_eq!(text, "seraph");
+                block_size.fat_sector().into(),
+            );
+            assert_eq!(
+                tree.into_iter().collect::<Vec<_>>(),
+                [(
+                    "/test.txt".to_owned(),
+                    fat::read::Node::File(b"seraph".to_vec())
+                )]
+            );
         }
     }
 

@@ -451,15 +451,12 @@ devmgr's responsibilities are:
   synchronous log calls reach a receiver that does not wait on devmgr. During
   the boot settle, before handover, that receiver is init-logd, which never
   calls devmgr; the serial and framebuffer drivers do not log at all. During
-  the on-disk settle it may be logd. logd calls devmgr only to resolve the
-  serial and framebuffer drivers. It resolves both before its
-  `HANDOVER_PULL`, while init-logd still drains the log endpoint, and caches
-  both outcomes. The precondition fails only when the serial driver cannot be
-  resolved: logd then queries the `serial` class (`QUERY_DEVICE`) again on
-  later emits, and that query, which names no driver, waits for the on-disk
-  job, while the control thread's own log lines during that job, and the
-  line it logs when it withdraws a served driver, wait on logd: the same
-  deadlock window.
+  the on-disk settle it may be logd. logd calls devmgr only from its main thread, to
+  register a `WATCH_CLASS` watch on the serial and the framebuffer class and resolve both
+  drivers. It does so before its `HANDOVER_PULL`, while init-logd still drains the log endpoint,
+  and resolves a driver again only when devmgr signals that class's watch; its emit path never
+  calls devmgr, so no receive worker waits on a query that names no driver while the control
+  thread's own log lines during the on-disk job wait on logd.
 
   Driver binaries are sourced from one of two places:
 
@@ -496,7 +493,8 @@ devmgr's responsibilities are:
     its overrun of the settle bound, before it reports ready, is sticky and
     surfaced as `devmgr_errors::NO_DEVICE` on subsequent `QUERY_DEVICE` queries of
     the rtc, input, and debug-port classes, the same reply
-    as before `SET_DRIVERS_DIR` arrives, so a client retries it only a bounded number of times. See
+    as before `SET_DRIVERS_DIR` arrives, so a client that needs the class waits on a `WATCH_CLASS`
+    watch. See
     [docs/device-management.md § Driver binary sources](../../../docs/device-management.md#driver-binary-sources).
 - **Expose device registry** — maintain an IPC service that other services
   query to discover device endpoints after drivers are bound: vfsd resolves
@@ -514,6 +512,25 @@ devmgr's responsibilities are:
   (`devmgr.registry`, `devmgr.bind`) gets `UNAUTHORIZED`. A withdrawn driver's
   ordinal replies `WITHDRAWN` (above) and an ordinal past the last served
   driver of the class `NO_DEVICE`. The query logs nothing.
+
+  A second label on a class SEND, `WATCH_CLASS`, registers a watch on the
+  class ([driver-binding.md § Device
+  Classes](../../../docs/driver-binding.md#device-classes)), refused
+  `UNAUTHORIZED` to a SEND without a class slot. A class SEND carries no grant
+  right, so devmgr creates the watch's Notification from its own object slab,
+  before it takes the registry lock, and replies with a wait-only copy and the
+  class's ordinal count, read in the hold that adds the watch to the class's
+  watcher list (`firmware::watchers`). devmgr signals every watch of a class
+  (`WATCH_CLASS_CHANGED`), without blocking, in the hold that serves a new
+  driver of the class and in each that withdraws one, so the signal and the
+  ordinal it reports are ordered with every query. Before it signals a watch,
+  and when a registration finds the class at `MAX_CLASS_WATCHERS` (8), devmgr
+  asks whether its own copy is the only reference left to the Notification
+  (`CAP_INFO_SOLE_REFERENCE`); a watch whose consumer deleted its copy or
+  exited is deleted and dropped. A registration past the bound with no watch
+  gone is refused `WATCHERS_FULL`. A class therefore holds at most 8
+  Notifications of 64 B each. The handler logs nothing, as the query does
+  not.
 
   devmgr mints class SENDs on `MINT_CLASS_SEND`, gated on `CLASS_AUTHORITY`
   (badge bit 59), which svcmgr and init each derive from their badge-0

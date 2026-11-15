@@ -70,10 +70,11 @@ Framing, command parsing, and the target descriptions are `shared/gdb-rsp`
    `devmgr.class.debug-port` seed, `caps[1]` the `DEBUG_AUTHORITY` SEND on procmgr. A declaration
    procmgr does not accept ends the stub, which logs why: the declaration is what makes procmgr
    refuse an attach to the stub, so no memory write of the stub's lands in its own address space.
-2. It takes the debug port from devmgr (`QUERY_DEVICE`), retrying while devmgr replies
-   `NO_DEVICE`, since the port's driver loads with devmgr's on-disk batch, and registers an RX
-   notification on it. A boot without `--debug-port`, a missing seed or authority, or a missing
-   target name ends the stub, which logs why.
+2. It takes the debug port from devmgr, waiting without a bound on a `WATCH_CLASS` watch until
+   devmgr serves the class's first live driver, since the port's driver loads with devmgr's
+   on-disk batch, and registers an RX notification on it. A missing seed or authority, or a
+   missing target name ends the stub, which logs why; a boot without `--debug-port` leaves it
+   waiting.
 3. It walks procmgr's process list (`LIST_PROCESSES`) for the first process whose name is its
    `argv[1]`, retrying while there is none, since the target can start after the stub. A name is
    the `argv[0]` the target's creator passed; for a service, the first word of its recipe's
@@ -271,7 +272,7 @@ still attached.
 | `MAX_THREADS` | 32 live threads per attach, refreshes included; an exited thread's slot is taken again | listed threads past it are left bound to the crash endpoint and are not shown to GDB; a thread spawned after the attach past it runs under its spawner's binding, and its stops are settled as [Crediting a stop](#stop-model) says |
 | `MAX_RECEIVERS` | 64 receiver threads, twice `MAX_THREADS` | a stop waits on the stub's endpoint until a held one is answered |
 | `STOP_WAIT` | 2 s per all-stop | a thread whose upcall has not arrived runs on |
-| `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the port and for the target at startup | the stub ends (no port) or serves detached (no target) |
+| `FIND_ATTEMPTS` × `FIND_INTERVAL` | 600 × 100 ms, for the target at startup | the stub serves detached (no target) |
 | `REATTACH_ATTEMPTS` × `FIND_INTERVAL` | 50 × 100 ms, for the target at a `qSupported` that finds the stub detached | the stub stays detached; `?` reports the target exited |
 | `REFRESH_TRIES` | 3 pages per refresh | the stop is settled as no new thread's, and the next stop that is not its thread's own refreshes again |
 | `DRAIN_WAIT`, `DRAIN_QUIET` | 500 ms, ended early by 50 ms with no stop, per detach | a stop that reaches the stub's endpoint after procmgr's rebind is a thread's procmgr did not rebind, and the stub declines it |

@@ -494,7 +494,8 @@ On x86_64 the kernel runs on CET supervisor shadow stacks when the CPU reports t
 corrupted return address faults instead of being followed
 ([return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)). Neither the CI
 runners nor TCG offer the feature, so CI boots only the kernel without them. Every launcher pins the
-guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), so no boot
+guest CPU's `cet-ss` property off unless the run asks for it (`--x86-shadow-stack on`), and a QEMU
+without the property, the CI image's among them, cannot offer the feature, so no boot
 runs on shadow stacks because its host offers them, and these boots are where they are tested. No
 harness can corrupt a kernel return address either, and the kernel carries no test hooks.
 `cargo xtask test-cet` (x86_64) runs both checks under KVM with the guest CPU
@@ -583,9 +584,10 @@ are manual, same posture as CPU-count variations), riscv64 Zkr entropy source (o
 runs without it via `cargo xtask run --riscv-zkr off` are manual, same posture), x86_64
 paging depth (4-level — 5-level runs via `cargo xtask run --x86-paging 5`, under TCG
 (`SERAPH_ACCEL=tcg`) on a host whose CPU lacks LA57, are manual, same posture), x86_64 CET
-shadow stacks (off: the launchers pin `cet-ss=off`, and neither the CI runners nor TCG offer them;
-the boots on them, `test-cet`, are the cet device cell, see CET cell below, and other boots on them,
-via `cargo xtask run --x86-shadow-stack on` under KVM, are manual, same posture), disk
+shadow stacks (off: the launchers pin `cet-ss=off` on a QEMU that has the property, and neither
+the CI runners nor TCG offer them; the boots on them, `test-cet`, are the cet device cell, see CET
+cell below, and other boots on them, via `cargo xtask run --x86-shadow-stack on` under KVM, are
+manual, same posture), disk
 logical block size (512 bytes — the 4Kn boot, a 4096-byte-block image on a 4096-byte-block
 device, is a storage cell, see Device surfaces and Disk variations below), and disk count (one
 — the second-disk boots are storage cells too). The `virtio-rng` device is
@@ -1028,7 +1030,7 @@ line of its own diff is on.
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
-| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
+| The CPU's CET shadow stacks, the kernel's x86_64 shadow-stack path | `core/kernel/src/arch/x86_64/shadow_stack.rs`, the host test that drives it and its gdbstub client (`xtask/src/commands/test_cet.rs` and `xtask/src/qemu_gdb.rs`), and the launchers' pin of the guest CPU's `cet-ss` property (`X86ShadowStack` and `qemu_knows_cet_ss`); every use of the module (`shadow_stack`) and of the Thread slot's shadow-stack page (`shadow_page`, `shadow_offset`, and `set_shadow_stack_pages`); the per-CPU and boot shadow-stack pages (`shadow_on_boot_cpu`, `make_cpu_shadow_pages`, `idle_shadow_pages`, `cpu_shadow_pages`, and `idle_saved_state`); the direct-map encoding and its retry (`shadow_direct_map_page`, `new_shadow_stack_page`, and `kernel_write_fault_is_spurious`); and the paths shadow stacks check or switch (by definition alone: the x86_64 `switch`, `syscall_entry`, and `page_fault_handler`, and `mm::stack_guard`'s `hole` and `close`) | cet |
 
 The 4kn cell runs the virtio-blk and fatfs drivers at 4096-byte blocks; the second-disk,
 shared-line, and oversize-block cells vary the disks virtio-blk serves, and none of them varies what

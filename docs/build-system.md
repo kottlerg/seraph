@@ -416,11 +416,15 @@ the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` pas
 followed by `,smstateen=on,svadu=off,svade=on`, the `--riscv-zkr` suffix (default `,zkr=on`)
 and the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
-`,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
-string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
-ships (§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
-required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
-the first userspace mapping, and so are AIA (Ssaia, with the machine's APLIC and IMSIC), without
+`,la57=off`, appended to every x86-64 accelerator's `-cpu` model) and the
+`--x86-shadow-stack` `cet-ss` suffix (default `,cet-ss=off`, appended likewise when the QEMU's
+`-cpu help` lists the `cet-ss` flag; a QEMU without the flag, the 10.2 of the CI image among
+them, cannot offer CET shadow stacks, so the default appends nothing there and `on` is refused
+before launch). The explicit feature string is the source of truth on every supported QEMU,
+including the 10.2 the pinned CI image ships (§ Continuous Integration); the supervisor paging
+extensions (Svpbmt, Svinval, Svnapot) are required by the kernel, whose paging subsystem refuses
+CPUs that lack them during boot, before the first userspace mapping, and so are AIA (Ssaia, with
+the machine's APLIC and IMSIC), without
 which its interrupt initialisation halts the boot, and Ssstateen, whose `sstateen0` the kernel
 writes on every hart and without which it halts the boot (see
 [platform-requirements.md](platform-requirements.md)). QEMU's `rv64` model leaves Smstateen off,

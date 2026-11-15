@@ -13,9 +13,9 @@
 //! guest CPU is `-cpu host,cet-ss=on,enforce`: QEMU refuses to start when KVM
 //! cannot give the guest the feature, and the command then fails, naming
 //! it. It never passes on a host that did not run the shadow stacks. Every
-//! other launch pins the feature off ([`X86ShadowStack`]), so this command
-//! is where shadow stacks are booted: the cet cell (docs/testing.md
-//! "Coverage tiers").
+//! other launch pins the feature off, or runs a QEMU that cannot offer it
+//! ([`X86ShadowStack`]), so this command is where shadow stacks are
+//! booted: the cet cell (docs/testing.md "Coverage tiers").
 //!
 //! Two boots of the current sysroot, which must hold the composed ktest
 //! bundle (`cargo xtask compose-bundle --harness ktest`):

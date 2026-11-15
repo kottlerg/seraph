@@ -231,7 +231,8 @@ follow a separate flow through devmgr; see
 ### Address Space
 
 A capability to a process's virtual address space. Rights:
-- **Map** — may install and remove mappings in this address space
+- **Map** — may install and remove mappings in this address space, and read
+  and clear its pages' accessed bits (`SYS_ASPACE_HARVEST`)
 - **Read** — may inspect current mappings (`SYS_ASPACE_QUERY`, which returns
   their physical addresses); minted on init's kernel-created address space and,
   for an address space retyped later, only when its Memory cap carries `Phys`
@@ -634,7 +635,7 @@ procmgr reaps once both its threads have exited after init's
 procmgr, svcmgr, devmgr, and vfsd, which hold un-badged sources on other servers'
 endpoints for the system's lifetime to mint per-client badges: devmgr on the
 driver service endpoints it creates, from which it mints the verb-bit query caps,
-and vfsd on the fs-driver endpoint it keeps for each terminal mount. Every other
+and vfsd on the fs-driver endpoint it keeps for each terminal mount until its unmount. Every other
 client receives a badged cap whose badge value is chosen by the trusted minter —
 the client cannot subsequently re-badgeize it because of the set-once rule above.
 

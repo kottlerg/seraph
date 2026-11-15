@@ -103,8 +103,11 @@ see [Bootstrap caps](#bootstrap-caps).
 
 ## Label 19: `FS_UNMOUNT`
 
-Unmount. Sent by vfsd on the un-badged service endpoint, as `FS_MOUNT` is.
-After a success reply the driver exits and serves no further request.
+Unmount. Sent by vfsd on the un-badged service endpoint, as `FS_MOUNT` is,
+when it serves an `UNMOUNT`
+([services/vfsd/docs/vfs-ipc-interface.md](../../vfsd/docs/vfs-ipc-interface.md#label-11-unmount)
+§ Label 11). After a success reply the driver exits and serves no further
+request.
 
 **Request**
 
@@ -138,8 +141,13 @@ revoke removes no mapping
 The driver serves one request at a time, so an unmount runs after the
 request in flight and before any later one. After the reply the driver
 receives nothing: a client that calls through a node cap or an open cap
-afterwards finds no receiver until the holder of the service endpoint
-tears the endpoint down.
+afterwards finds no receiver until vfsd tears the endpoint down. vfsd does
+that after any answer but `BUSY` to an unforced request, and after no
+answer in its timeout: it revokes the partition cap and the service
+endpoint, waits a bounded time for the driver's death, and destroys the
+process, so a driver that does not exit is killed
+([services/vfsd/docs/namespace-composition.md](../../vfsd/docs/namespace-composition.md#unmount)
+§ Unmount).
 
 **Reply (success)**: `label = 0`, empty body; the driver then exits.
 
@@ -914,7 +922,9 @@ that are not `fs_labels` constants:
   ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure
   Policy).
 
-Any other end of a driver is a fault or a kill.
+Any other end of a driver is a fault or a kill, such as vfsd's
+destruction of a driver that an unmount found still running
+([§ Label 19](#label-19-fs_unmount)).
 
 ---
 

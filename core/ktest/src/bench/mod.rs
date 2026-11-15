@@ -73,6 +73,7 @@ pub fn run_all(ctx: &crate::TestContext, iters: u32)
     cap::bench_cap_info_lookup(ctx, iters);
     mm::bench_mem_map_unmap(ctx, iters);
     mm::bench_mem_protect(ctx, iters);
+    mm::bench_aspace_harvest(ctx, iters);
     thread::bench_thread_lifecycle(ctx, iters);
     thread::bench_context_switch(ctx, iters);
     event::bench_event_post_recv(ctx, iters);

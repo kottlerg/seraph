@@ -21,8 +21,8 @@ vfsd/
 ├── root-backend/            # `vfsd-root-backend` crate: VfsdRootBackend (NamespaceBackend impl)
 ├── swap/                    # `vfsd-swap` crate: pure host-tested swap-partition hand-out
 ├── src/
-│   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT and
-│   │                        # GET_SWAP_PARTITION handlers
+│   ├── main.rs              # Entry, root self-mount, service + namespace loops, MOUNT,
+│   │                        # UNMOUNT and GET_SWAP_PARTITION handlers
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── partition.rs         # Disk and partition discovery: block I/O over the gpt crate
 │   ├── role_guids.rs        # Compile-time arch-conditional root, ESP, data and swap GUIDs
@@ -54,8 +54,8 @@ vfsd/
   point falls through to the root partition. See
   [`docs/namespace-composition.md`](docs/namespace-composition.md#two-endpoints-one-process)
   and [`docs/storage.md`](../../docs/storage.md).
-- **Service endpoint** — handles `MOUNT`, `GET_SYSTEM_ROOT_CAP` and
-  `GET_SWAP_PARTITION` on its un-badged service endpoint, with
+- **Service endpoint** — handles `MOUNT`, `UNMOUNT`, `GET_SYSTEM_ROOT_CAP`
+  and `GET_SWAP_PARTITION` on its un-badged service endpoint, with
   multi-threaded recv so independent requests proceed while one waits on
   a driver spawn; no service-endpoint request waits on another's IPC (a
   `GET_SWAP_PARTITION` waits at most for the swap lock, held across one
@@ -63,9 +63,13 @@ vfsd/
   is a concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts), gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
-  self-mounted, and svctest is its only in-tree caller. See
+  self-mounted, and svctest is its only in-tree caller. `UNMOUNT`, on
+  the same badge bit, removes a mount below `/`: it asks the driver to
+  unmount (refused `BUSY` while a file is open, unless forced), tears the
+  driver down, and leaves the path falling through to the root
+  filesystem. See
   [`docs/vfs-ipc-interface.md`](docs/vfs-ipc-interface.md) and
-  [`docs/namespace-composition.md`](docs/namespace-composition.md).
+  [`docs/namespace-composition.md`](docs/namespace-composition.md#unmount).
 - **Swap-partition hand-out** — `GET_SWAP_PARTITION`, gated on the
   `SWAP_AUTHORITY` badge bit, hands the swap service a raw partition cap
   on the `SERAPH_SWAP` partition, which vfsd never mounts. The first
@@ -101,7 +105,8 @@ vfsd/
   Each mount keeps a record of its driver: the service endpoint, the
   process handle, a death queue the driver's exit or fault posts to,
   and the partition cap (see
-  [`docs/namespace-composition.md`](docs/namespace-composition.md#mount-record)).
+  [`docs/namespace-composition.md`](docs/namespace-composition.md#mount-record)),
+  from which an unmount tears the driver down.
   On both paths a vfsd logging at any level but info creates the
   driver with its own level as the driver's `SERAPH_LOG` env entry, so
   a driver logs at vfsd's level

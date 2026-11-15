@@ -81,8 +81,8 @@ pub fn check_user_base(virt_base: u64) -> Result<(), syscall::SyscallError>
 
 /// The `(base, end)` of the `page_count` pages from `virt_base` that a memory
 /// syscall (`SYS_MEM_MAP`, `SYS_MEM_UNMAP`, `SYS_MEM_PROTECT`,
-/// `SYS_MMIO_MAP`) names, once the range is checked to lie wholly in the user
-/// range.
+/// `SYS_MMIO_MAP`, `SYS_ASPACE_HARVEST`) names, once the range is checked to
+/// lie wholly in the user range.
 ///
 /// The range returned is the checked one clamped to the user half as data
 /// (`nospec::mask_span_u64` against `user_va_top()`): architecturally it is

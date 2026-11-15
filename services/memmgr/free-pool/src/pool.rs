@@ -111,7 +111,8 @@ pub(crate) fn run_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<Fre
         | Node::Process(_)
         | Node::ChunkDir(_)
         | Node::Chunk(_)
-        | Node::Caps(_) => None,
+        | Node::Caps(_)
+        | Node::Commit(_) => None,
     }
 }
 

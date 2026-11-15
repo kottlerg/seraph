@@ -27,13 +27,13 @@ use std::process::Command;
 
 use crate::error::{Context, Result, bail};
 use json::Value;
-use regex::Regex;
 
 use crate::cli::{CommitCheckArgs, PrCheckArgs};
 use crate::commands::review;
 use crate::context::Context as BuildContext;
 use crate::diag::{Diag, Strictness, report};
 use crate::gh;
+use crate::regex::Regex;
 use crate::tasklist::{TaskItem, task_item};
 use crate::util::{run_cmd_capture, step};
 
@@ -1843,6 +1843,95 @@ mod tests
     fn rules(diags: &[Diag]) -> Vec<&'static str>
     {
         diags.iter().map(|d| d.rule).collect()
+    }
+
+    /// The first match of `re` in `text` and its groups 1 to 5 (`None` for one that took no
+    /// part).
+    fn first(re: &Regex, text: &str) -> Option<(String, Vec<Option<String>>)>
+    {
+        let caps = re.captures(text)?;
+        let whole = caps.get(0)?.as_str().to_owned();
+        let groups = (1..=5)
+            .map(|i| caps.get(i).map(|m| m.as_str().to_owned()))
+            .collect();
+        Some((whole, groups))
+    }
+
+    #[test]
+    fn every_pattern_of_the_checks_matches_what_its_rule_describes()
+    {
+        let p = pat();
+        let whole = |re: &Regex, text: &str| re.find(text).map(|m| m.as_str().to_owned());
+        let some = |s: &str| Some(s.to_owned());
+        // Issue references: each form with its repository and number groups.
+        let (_, groups) = first(&p.issue_ref, "see kottlerg/seraph#12.").unwrap();
+        assert_eq!(groups[..2], [some("kottlerg/seraph"), some("12")]);
+        let (_, groups) = first(&p.issue_ref, "https://github.com/a/b/issues/7").unwrap();
+        assert_eq!(groups[..4], [None, None, some("a/b"), some("7")]);
+        assert_eq!(whole(&p.issue_ref, "# 12 and #x"), None);
+        // A closing keyword directly before a reference, as a word, any case.
+        assert_eq!(whole(&p.closing_ref, "this Fixes: #12"), some("Fixes: #12"));
+        assert_eq!(
+            whole(&p.closing_ref, "RESOLVED a/b#3"),
+            some("RESOLVED a/b#3")
+        );
+        assert_eq!(whole(&p.closing_ref, "prefixes #12"), None);
+        assert_eq!(whole(&p.closing_ref, "fixes the #12"), None);
+        // A `Refs` list ends at the first text between its numbers.
+        assert_eq!(
+            whole(&p.refs_ref, "Refs #12, #34 and #56."),
+            some("Refs #12, #34 and #56")
+        );
+        assert_eq!(whole(&p.refs_ref, "refs: #1 then #2"), some("refs: #1"));
+        assert_eq!(whole(&p.refs_ref, "refs/heads/x #1"), None);
+        let numbers: Vec<&str> = p
+            .refs_number
+            .find_iter("#1, #22")
+            .map(|m| m.as_str())
+            .collect();
+        assert_eq!(numbers, ["#1", "#22"]);
+        // Attribution lines, any case.
+        assert!(p.attribution.is_match("Co-Authored-By:  Claude <x>"));
+        assert!(p.attribution.is_match("see https://claude.ai/code"));
+        assert!(!p.attribution.is_match("Claude Shannon's theorem"));
+        // Planning labels: the word and a number.
+        assert_eq!(
+            whole(&p.planning_label, "xtask: Step 7 of it"),
+            some("Step 7")
+        );
+        assert_eq!(whole(&p.planning_label, "steps 7, phase7"), None);
+        // `<scope>: <summary>`.
+        assert!(p.subject_form.is_match("xtask: drop regex"));
+        assert!(!p.subject_form.is_match(" xtask: x"));
+        assert!(!p.subject_form.is_match("xtask:x"));
+        assert!(!p.subject_form.is_match("xtask drop regex"));
+        // Commit hashes: 7 to 40 lower-case hex digits as a whole word.
+        assert_eq!(whole(&p.hex, "at c8ceb7c52."), some("c8ceb7c52"));
+        assert_eq!(whole(&p.hex, "C8CEB7C abc123 xabc1234"), None);
+        assert_eq!(whole(&p.hex, &"a".repeat(41)), None);
+        // Statements that the delta is documentation or comments only.
+        for statement in [
+            "comment-only",
+            "documentation and comments only",
+            "Markdown only",
+            "only in comments",
+            "only a rustdoc comment",
+        ]
+        {
+            assert!(p.delta_statement.is_match(statement), "{statement}");
+        }
+        assert!(!p.delta_statement.is_match("the comments are inert"));
+        // A `not` among the last three words.
+        assert!(p.negation.is_match("the delta is not "));
+        assert!(p.negation.is_match("it isn't really a "));
+        assert!(!p.negation.is_match("not one two three "));
+        // A placeholder spans lines and holds no angle bracket.
+        assert_eq!(whole(&p.placeholder, "<a\nb>"), some("<a\nb>"));
+        assert_eq!(whole(&p.placeholder, "x <a <b> c>"), some("<b>"));
+        assert!(p.embed.is_match("include_bytes!(\"x\")"));
+        assert!(p.release_notes.is_match("docs/releases/v0.1.5.md"));
+        assert!(!p.release_notes.is_match("docs/releases/v0.1.5.md.bak"));
+        assert!(!p.release_notes.is_match("docs/releases/template.md"));
     }
 
     #[test]

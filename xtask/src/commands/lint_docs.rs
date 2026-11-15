@@ -21,10 +21,10 @@ use std::path::{Component, Path};
 use std::process::Command;
 
 use crate::error::{Context, Result, bail};
-use regex::Regex;
 
 use crate::cli::LintDocsArgs;
 use crate::context::Context as BuildContext;
+use crate::regex::{self, Regex};
 use crate::util::{run_cmd_capture, step};
 
 /// Project column limit for Markdown source (docs/coding-standards.md § Markdown).
@@ -557,7 +557,9 @@ fn link_targets(pat: &Patterns, path: &str, text: &str) -> BTreeSet<String>
     {
         for cap in pat.md_link.captures_iter(&paragraph)
         {
-            if let Some(resolved) = resolve_link(dir, &cap[1])
+            if let Some(resolved) = cap
+                .get(1)
+                .and_then(|target| resolve_link(dir, target.as_str()))
             {
                 out.insert(resolved);
             }
@@ -676,12 +678,13 @@ fn summarized_by(
     pat.md_link
         .captures_iter(body)
         .map(|cap| {
-            resolve_link(dir, &cap[1]).ok_or_else(|| {
+            // Group 1, the target, takes part in every match of `md_link`.
+            let target = cap.get(1).map_or("", |target| target.as_str());
+            resolve_link(dir, target).ok_or_else(|| {
                 (
                     line,
                     format!(
-                        "Summarized By entry `{}` does not resolve to a repository document",
-                        &cap[1]
+                        "Summarized By entry `{target}` does not resolve to a repository document"
                     ),
                 )
             })
@@ -783,7 +786,10 @@ fn check_entry_form(
     let entries: Vec<(String, String)> = pat
         .entry_link
         .captures_iter(&body)
-        .filter_map(|cap| resolve_link(dir, &cap[2]).map(|t| (cap[1].trim().to_owned(), t)))
+        .filter_map(|cap| {
+            let (label, target) = (cap.get(1)?, cap.get(2)?);
+            resolve_link(dir, target.as_str()).map(|t| (label.as_str().trim().to_owned(), t))
+        })
         .collect();
     let mut diags = Vec::new();
     for pair in entries.windows(2)
@@ -1383,7 +1389,7 @@ fn glob_matches(glob: &str, name: &str) -> bool
 /// Whether the symbol pattern `pattern` matches, as a whole word, in `code`.
 fn symbol_resolves(pattern: &str, code: &str) -> std::result::Result<bool, regex::Error>
 {
-    Ok(Regex::new(&format!(r"(?-u:\b)(?:{pattern})(?-u:\b)"))?.is_match(code))
+    Ok(Regex::new(&format!(r"\b(?:{pattern})\b"))?.is_match(code))
 }
 
 /// Why `name` fails to resolve, or `None` when it resolves.
@@ -1418,12 +1424,7 @@ fn unresolved(name: &ListedName, code: &Code, tracked: &[String]) -> Option<Stri
                         .to_owned(),
                 ),
                 Ok(false) => Some("names nothing in the code of a tracked Rust source".to_owned()),
-                // A syntax error renders as the pattern, a caret line, and the
-                // reason; the reason is the last line.
-                Err(err) => Some(format!(
-                    "is not a valid regular expression ({})",
-                    err.to_string().lines().last().unwrap_or_default().trim()
-                )),
+                Err(err) => Some(format!("is not a valid regular expression ({err})")),
             }
         }
     }
@@ -1513,6 +1514,59 @@ mod tests
             path: path.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn every_pattern_of_the_rules_matches_what_its_rule_describes()
+    {
+        let p = pat();
+        let group = |re: &Regex, text: &str, i: usize| {
+            re.captures(text)
+                .and_then(|c| c.get(i))
+                .map(|m| m.as_str().to_owned())
+        };
+        // A line that is one link, image, badge, or URL construct.
+        for line in [
+            "- [text](https://x/y).",
+            "1. [![badge](i.svg)](https://x)",
+            "<https://example.com/a>)",
+            "  ![image](a.png)",
+        ]
+        {
+            assert!(p.link_only.is_match(line), "{line}");
+        }
+        assert!(!p.link_only.is_match("see [a](b) and more"));
+        assert!(p.bare_cite.is_match("as written (see docs/testing.md)."));
+        assert!(!p.bare_cite.is_match("[see](docs/testing.md)"));
+        // A link's target, past a badge's image, and none with a space in it.
+        assert_eq!(
+            group(&p.md_link, "[![b](i.svg)](docs/x.md)", 1).as_deref(),
+            Some("docs/x.md")
+        );
+        assert_eq!(group(&p.md_link, "[a](b c)", 1), None);
+        assert_eq!(
+            group(&p.entry_link, "[Label](../a.md#s)", 1).as_deref(),
+            Some("Label")
+        );
+        assert_eq!(
+            group(&p.entry_link, "[Label](../a.md#s)", 2).as_deref(),
+            Some("../a.md#s")
+        );
+    }
+
+    #[test]
+    fn a_symbol_resolves_as_a_whole_word_and_a_family_by_its_stem()
+    {
+        let resolves =
+            |name: &str, code: &str| symbol_resolves(&prose_symbol_pattern(name), code).unwrap();
+        assert!(resolves("MAX_CPUS", "let n = MAX_CPUS;"));
+        assert!(!resolves("MAX_CPUS", "let n = MAX_CPUS_X + XMAX_CPUS;"));
+        assert!(resolves("mm.map", "x.mm.map(y)"));
+        assert!(!resolves("mm.map", "mmXmap"));
+        assert!(resolves("PAGE_*", "PAGE_SIZE"));
+        assert!(!resolves("PAGE_*", "PAGE_ and XPAGE_SIZE"));
+        let error = symbol_resolves("a(", "a(").unwrap_err();
+        assert!(error.to_string().contains("an unclosed group"), "{error}");
     }
 
     #[test]

@@ -518,6 +518,9 @@ pub const fn remap_entry_unpack(word: u64) -> (u16, u8, u32)
 /// `CapTag::Memory` discriminant.
 pub const CAP_TAG_MEMORY: u8 = 1;
 
+/// `CapTag::Notification` discriminant.
+pub const CAP_TAG_NOTIFICATION: u8 = 4;
+
 // ── Syscall numbers (continued) ──────────────────────────────────────────────
 /// Thread: set scheduling priority.
 pub const SYS_THREAD_SET_PRIORITY: u64 = 37;

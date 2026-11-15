@@ -6,7 +6,8 @@
 //! Pure bookkeeping logic for memmgr: the metadata arena, the free pool, the
 //! deferred list of reclaimed frames not yet pooled, the process index, the
 //! budget nodes processes are charged to, the chunk table of each demand
-//! region, and the demand-region interval arithmetic and protection check.
+//! region, the memory-pressure levels, and the demand-region interval
+//! arithmetic and protection check.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
@@ -27,10 +28,11 @@ pub mod deferred;
 pub mod index;
 pub mod ledger;
 pub mod pool;
+pub mod pressure;
 
 pub use arena::{
     Arena, ArenaLayout, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx,
-    ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
+    ProcessCaps, ProcessRecord, RegionNode, SLOTS_PER_PAGE, SlotStore,
 };
 pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
@@ -40,6 +42,7 @@ pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
 pub use ledger::{BackError, Ledger, RegionError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
+pub use pressure::{PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureLevel, pressure_level};
 
 use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRITABLE, PAGE_SIZE};
 

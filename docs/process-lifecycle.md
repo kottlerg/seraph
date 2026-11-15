@@ -411,7 +411,8 @@ After bootstrap, every process is created by procmgr. The flow:
 9. **Caller sends `START_PROCESS`.** Procmgr runs `thread_configure` +
    `thread_start`; the child's std `_start` registers its IPC buffer,
    bootstraps the heap by calling `REQUEST_MEMORY_CAPS` on its own
-   `memmgr_endpoint_cap`, and enters `main()`.
+   `memmgr_endpoint_cap`, registers for memmgr's memory-pressure signal
+   (`REGISTER_PRESSURE`), and enters `main()`.
 
 A process created via `CREATE_PROCESS` is suspended until
 `START_PROCESS`; the heap-bootstrap step (9) only runs after the caller

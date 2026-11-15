@@ -72,6 +72,10 @@ pub fn phases() -> &'static [Phase]
             name: "memmgr_frame_scrub",
             run: frame_scrub_phase,
         },
+        Phase {
+            name: "memmgr_pressure",
+            run: pressure_phase,
+        },
     ]
 }
 
@@ -1577,5 +1581,258 @@ pub fn frame_scrub_phase(_: &Caps)
         "memmgr_frame_scrub: {} grant pages and {SCRUB_DEMAND_PAGES} demand pages after a death, \
          {SCRUB_PAGE_DRAWS} grant pages after a release, all zero",
         u64::from(SCRUB_PAGES).saturating_mul(SCRUB_DRAWS as u64)
+    );
+}
+
+// ── Memory pressure ─────────────────────────────────────────────────────────
+
+/// How long [`pressure_phase`] waits for a level change, which memmgr signals
+/// at the end of the turn that caused it. A test wait bound.
+const PRESSURE_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The bit [`pressure_phase`]'s own registration asks for, apart from the
+/// runtime's [`std::os::seraph::MEMORY_PRESSURE_BIT`].
+const PRESSURE_OWN_BIT: u64 = 1 << 5;
+
+/// How many times [`pressure_phase`] stops and starts the thread waiting in
+/// [`std::os::seraph::wait_memory_pressure`], and the sleep before each stop,
+/// which lets the thread reach its wait first.
+const PRESSURE_WAITER_STOPS: u32 = 3;
+const PRESSURE_WAITER_STOP_GAP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// memmgr's `QUERY_POOL_STATUS` pool total, free total and pressure level
+/// (`data[2]`, `data[3]` and `data[7]`), the totals in pages.
+fn pool_pressure_status() -> (u64, u64, u64)
+{
+    let req = ipc::IpcMessage::builder(ipc::memmgr_labels::QUERY_POOL_STATUS).build();
+    let reply = memmgr_call(&req, "QUERY_POOL_STATUS");
+    assert_eq!(
+        reply.label,
+        ipc::memmgr_errors::SUCCESS,
+        "QUERY_POOL_STATUS status"
+    );
+    let page = syscall_abi::PAGE_SIZE;
+    (reply.word(2) / page, reply.word(3) / page, reply.word(7))
+}
+
+/// memmgr's reply label to a `REGISTER_PRESSURE` of `bits` carrying `cap`, or
+/// no cap for `0`.
+fn register_pressure(cap: u64, bits: u64) -> u64
+{
+    let mut req = ipc::IpcMessage::builder(ipc::memmgr_labels::REGISTER_PRESSURE).word(0, bits);
+    if cap != 0
+    {
+        req = req.cap(cap);
+    }
+    memmgr_call(&req.build(), "REGISTER_PRESSURE").label
+}
+
+/// A Notify-only derivation of the Notification `sig`.
+fn notify_only(sig: u64) -> u64
+{
+    syscall::cap_derive(sig, syscall::RIGHTS_NTF_NOTIFY).expect("cap_derive of a Notification")
+}
+
+/// The bits pending on the Notification `sig`, taken; `0` for none.
+fn take_bits(sig: u64) -> u64
+{
+    match syscall::notification_try_wait(sig)
+    {
+        Ok(bits) => bits,
+        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 => 0,
+        Err(e) => panic!("notification_try_wait failed ({e})"),
+    }
+}
+
+/// Draw grants from memmgr, contiguous or not, until `pages` pages are held,
+/// returning each grant's cap and region id.
+fn take_pages(pages: u64) -> Vec<(u64, u64)>
+{
+    let mut held = Vec::new();
+    let mut taken = 0u64;
+    while taken < pages
+    {
+        let want = u32::try_from(pages.saturating_sub(taken)).unwrap_or(u32::MAX);
+        let req = ipc::IpcMessage::builder(ipc::memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, u64::from(want))
+            .build();
+        let reply = memmgr_call(&req, "REQUEST_MEMORY_CAPS");
+        let (counts, ids) = ipc::memmgr_grant_layout(&reply).unwrap_or_else(|| {
+            panic!(
+                "REQUEST_MEMORY_CAPS of {want} pages with {taken} of {pages} held: status {:#x}",
+                reply.label
+            )
+        });
+        for ((&cap, &count), &id) in reply.caps().iter().zip(counts).zip(ids)
+        {
+            held.push((cap, id));
+            taken = taken.saturating_add(count);
+        }
+    }
+    held
+}
+
+/// Release the grants `held` while a helper thread waits for the level to
+/// change ([`std::os::seraph::wait_memory_pressure`]), having stopped and
+/// started the helper first while it waits, and return the level its wait
+/// returned.
+fn release_under_stopped_waiter(held: Vec<(u64, u64)>) -> std::os::seraph::MemoryPressure
+{
+    let (cap_tx, cap_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        cap_tx
+            .send(std::os::seraph::thread::current_thread_cap())
+            .expect("publishing the waiter's cap");
+        std::os::seraph::wait_memory_pressure(Some(PRESSURE_WAIT))
+    });
+    let waiter_cap = cap_rx.recv().expect("the waiter's cap");
+    for _ in 0..PRESSURE_WAITER_STOPS
+    {
+        std::thread::sleep(PRESSURE_WAITER_STOP_GAP);
+        if waiter.is_finished()
+        {
+            break;
+        }
+        syscall::thread_stop(waiter_cap).expect("stopping the waiter");
+        syscall::thread_start(waiter_cap).expect("starting the waiter");
+    }
+    for (cap, id) in held
+    {
+        release_grant(cap, id);
+    }
+    waiter
+        .join()
+        .expect("joining the waiter")
+        .expect("wait on the runtime's Notification across stops of its thread")
+}
+
+/// memmgr's memory-pressure level and its signal
+/// (services/memmgr/docs/memory-pool.md § Memory pressure):
+///
+/// 1. `REGISTER_PRESSURE` refuses a missing cap, a Memory cap, a Notification
+///    without Notify, and zero bits, with `INVALID_ARGUMENT`.
+/// 2. svctest, which makes no registration of its own at start, holds the one
+///    the runtime made ([`std::os::seraph::memory_pressure_notification`]), and
+///    the level reads `Normal`.
+/// 3. A registration of a second Notification replaces the runtime's. svctest
+///    then takes grants until the free pool sits below the low threshold and
+///    above the reserve: the second Notification receives its bit, the level
+///    reads `Low`, and the runtime's Notification receives nothing.
+/// 4. svctest registers the runtime's Notification again, and a helper thread
+///    waits on it ([`std::os::seraph::wait_memory_pressure`]). svctest stops
+///    and starts the helper while it waits, which cancels the blocked wait
+///    with `Interrupted` (docs/fault-handling.md § Asynchronous Upcalls), and
+///    then releases the grants: the wait outlasts the stops and returns at
+///    the runtime's bit, the level reads `Normal`, and the second
+///    Notification receives nothing more.
+///
+/// memmgr's low threshold and band are 1/16 and 1/128 of the pool
+/// (`PRESSURE_LOW_DIVISOR`, `PRESSURE_BAND_DIVISOR`) and its reserve 2/128;
+/// the phase aims the free pool at 6/128, so other processes' allocations
+/// meanwhile move it neither out of `Low` nor into `Critical`.
+pub fn pressure_phase(_: &Caps)
+{
+    use std::os::seraph::{MemoryPressure, memory_pressure, memory_pressure_notification};
+
+    let runtime_sig =
+        memory_pressure_notification().expect("the runtime registered no pressure Notification");
+    let own_sig =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        })
+        .expect("Notification retype");
+
+    // 1. Refusals; none replaces the runtime's registration.
+    let invalid = ipc::memmgr_errors::INVALID_ARGUMENT;
+    assert_eq!(
+        register_pressure(0, 1),
+        invalid,
+        "REGISTER_PRESSURE with no cap"
+    );
+    let (grant, region_id) = request_one_page();
+    let alias = syscall::cap_derive(grant, syscall::RIGHTS_ALL).expect("cap_derive of grant");
+    assert_eq!(
+        register_pressure(alias, 1),
+        invalid,
+        "REGISTER_PRESSURE with a Memory cap"
+    );
+    release_grant(grant, region_id);
+    let wait_only = syscall::cap_derive(own_sig, syscall::RIGHTS_NTF_WAIT).expect("cap_derive");
+    assert_eq!(
+        register_pressure(wait_only, 1),
+        invalid,
+        "REGISTER_PRESSURE with a Notification without Notify"
+    );
+    assert_eq!(
+        register_pressure(notify_only(own_sig), 0),
+        invalid,
+        "REGISTER_PRESSURE with zero bits"
+    );
+
+    // 2. The runtime's registration, at Normal.
+    let (total, free, level) = pool_pressure_status();
+    assert_eq!(
+        level,
+        ipc::memmgr_labels::PRESSURE_NORMAL,
+        "level before the drive"
+    );
+    assert_eq!(memory_pressure(), Some(MemoryPressure::Normal));
+    let target = (total / 128).saturating_mul(6);
+    let low_exit = (total / 16).saturating_add(total / 128);
+    assert!(
+        free > low_exit,
+        "free pool {free} of {total} pages too low to drive the level and back"
+    );
+    let _ = take_bits(runtime_sig);
+    let _ = take_bits(own_sig);
+
+    // 3. A second registration replaces the runtime's; drive the level to Low.
+    assert_eq!(
+        register_pressure(notify_only(own_sig), PRESSURE_OWN_BIT),
+        ipc::memmgr_errors::SUCCESS,
+        "REGISTER_PRESSURE replacing the runtime's"
+    );
+    let held = take_pages(free.saturating_sub(target));
+    let wait_ms = u64::try_from(PRESSURE_WAIT.as_millis()).unwrap_or(u64::MAX - 1);
+    let bits = syscall::notification_wait_timeout(own_sig, wait_ms)
+        .expect("wait on the second Notification");
+    assert_eq!(
+        bits, PRESSURE_OWN_BIT,
+        "bits on the second Notification at Low"
+    );
+    let (_, low_free, level) = pool_pressure_status();
+    assert_eq!(
+        level,
+        ipc::memmgr_labels::PRESSURE_LOW,
+        "level with {low_free} of {total} pages free"
+    );
+    assert_eq!(
+        take_bits(runtime_sig),
+        0,
+        "the replaced registration was signalled"
+    );
+
+    // 4. The runtime's registration again; release, back to Normal.
+    assert_eq!(
+        register_pressure(
+            notify_only(runtime_sig),
+            std::os::seraph::MEMORY_PRESSURE_BIT
+        ),
+        ipc::memmgr_errors::SUCCESS,
+        "REGISTER_PRESSURE restoring the runtime's"
+    );
+    let level = release_under_stopped_waiter(held);
+    assert_eq!(level, MemoryPressure::Normal, "level after the release");
+    assert_eq!(
+        take_bits(own_sig),
+        0,
+        "the replaced registration was signalled"
+    );
+    syscall::cap_delete(own_sig).expect("cap_delete of the second Notification");
+
+    std::os::seraph::log!(
+        "memmgr_pressure: Normal -> Low at {low_free} of {total} pages free -> Normal, each \
+         change signalled to the registration in place, the last wait outlasting stops of its \
+         thread"
     );
 }

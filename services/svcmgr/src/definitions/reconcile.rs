@@ -33,6 +33,7 @@ use super::{Definition, NamespaceShape, RestartPolicy, SERVICES_DIR, launch, shu
 use svcmgr_defs::DeathTag;
 use svcmgr_endowment::SubstrateObserver;
 
+use crate::namespace_server;
 use crate::restart::{RestartCtx, bind_fault_observer};
 use crate::service::{
     POLICY_ALWAYS, POLICY_NEVER, POLICY_ON_FAILURE, RestartRecipe, ServiceEntry, try_string,
@@ -160,13 +161,26 @@ fn is_recipe_name(name: &str) -> bool
 /// left unconsumed after the scan are reported as a configuration
 /// error; when the scan has no memory for the parsed recipes they are
 /// released to run unsupervised instead.
+///
+/// The scan reads through vfsd, so vfsd's liveness is read before it and
+/// after every read that fails ([`namespace_server::death`]): a later call
+/// through a dead vfsd would wait for good. `Err` carries the exit reason of a
+/// vfsd found dead; nothing is then recorded or launched, and `pending` is
+/// left as it was, for the caller to route the death.
+///
+/// # Errors
+/// vfsd's exit reason when it is dead before or during the scan.
 pub fn reconcile_and_launch(
     pending: &mut [PendingRegistration],
     table: &mut ServiceTable,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
-)
+) -> Result<(), u64>
 {
+    let server_death = |pending: &[PendingRegistration]| -> Result<(), u64> {
+        namespace_server::death(pending, ctx.ipc_buf).map_or(Ok(()), Err)
+    };
+    server_death(pending)?;
     log!("svcmgr: scanning {SERVICES_DIR}");
 
     let read = match fs::read_dir(SERVICES_DIR)
@@ -174,11 +188,12 @@ pub fn reconcile_and_launch(
         Ok(r) => r,
         Err(e) =>
         {
+            server_death(pending)?;
             log!(warn: "svcmgr: cannot open {SERVICES_DIR}: {e}");
             // Still report pending-without-def errors so a missing
             // /config/svcmgr/services/ does not silently swallow them.
             report_orphans(pending);
-            return;
+            return Ok(());
         }
     };
 
@@ -195,6 +210,7 @@ pub fn reconcile_and_launch(
         let Ok(ent) = ent
         else
         {
+            server_death(pending)?;
             continue;
         };
         let Some(name) = ent.file_name_ref().to_str()
@@ -235,39 +251,13 @@ pub fn reconcile_and_launch(
     // `.svc` suffix stripped from unique file names), so ordering by
     // (consumer, service name) with the allocation-free unstable sort keeps
     // each group in service-name order.
-    let mut defs: Vec<Definition> = Vec::new();
-    if defs.try_reserve_exact(entries.len()).is_err()
+    let Some(mut defs) = parse_recipes(&entries, pending, ctx.ipc_buf)?
+    else
     {
         log!(warn: "svcmgr: no memory to parse {} recipes", entries.len());
-        release_unsupervised(pending);
-        return;
-    }
-    for filename in &entries
-    {
-        let service_name = filename.strip_suffix(".svc").unwrap_or(filename);
-        let Some(path) = recipe_path(filename)
-        else
-        {
-            log!(warn: "svcmgr: no memory for {filename}'s path; dropped");
-            continue;
-        };
-
-        let contents = match fs::read_to_string(&path)
-        {
-            Ok(c) => c,
-            Err(e) =>
-            {
-                log!(warn: "svcmgr: cannot read {path}: {e}");
-                continue;
-            }
-        };
-        match parse(service_name, &contents)
-        {
-            // Within the capacity reserved above, so the push cannot grow.
-            Ok(d) => defs.push(d),
-            Err(e) => log!(warn: "svcmgr: parse {path}: {e}"),
-        }
-    }
+        release_unsupervised(pending, "no memory for the recipes");
+        return Ok(());
+    };
     defs.sort_unstable_by(|a, b| {
         (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
     });
@@ -295,6 +285,60 @@ pub fn reconcile_and_launch(
     }
 
     report_orphans(pending);
+    Ok(())
+}
+
+/// Read and parse the recipe file of each of `entries`, `.svc` file names in
+/// [`SERVICES_DIR`]. A recipe that cannot be read or parsed, or whose path
+/// the heap cannot hold, is dropped with a log line. `None` when the heap
+/// cannot hold the list of parsed recipes. The files are read through vfsd,
+/// whose liveness is read from its registration in `pending` after every read
+/// that fails ([`namespace_server::death`]).
+///
+/// # Errors
+/// vfsd's exit reason when a read failed and vfsd is dead.
+fn parse_recipes(
+    entries: &[String],
+    pending: &[PendingRegistration],
+    ipc_buf: *mut u64,
+) -> Result<Option<Vec<Definition>>, u64>
+{
+    let mut defs: Vec<Definition> = Vec::new();
+    if defs.try_reserve_exact(entries.len()).is_err()
+    {
+        return Ok(None);
+    }
+    for filename in entries
+    {
+        let service_name = filename.strip_suffix(".svc").unwrap_or(filename);
+        let Some(path) = recipe_path(filename)
+        else
+        {
+            log!(warn: "svcmgr: no memory for {filename}'s path; dropped");
+            continue;
+        };
+
+        let contents = match fs::read_to_string(&path)
+        {
+            Ok(c) => c,
+            Err(e) =>
+            {
+                if let Some(exit_reason) = namespace_server::death(pending, ipc_buf)
+                {
+                    return Err(exit_reason);
+                }
+                log!(warn: "svcmgr: cannot read {path}: {e}");
+                continue;
+            }
+        };
+        match parse(service_name, &contents)
+        {
+            // Within the capacity reserved above, so the push cannot grow.
+            Ok(d) => defs.push(d),
+            Err(e) => log!(warn: "svcmgr: parse {path}: {e}"),
+        }
+    }
+    Ok(Some(defs))
 }
 
 /// Record the shutdown actuator `service` at its supervised `slot`, with the
@@ -439,13 +483,13 @@ fn handle_definition(
 /// serialises on the thread's `sched_lock`, and it retains the address
 /// space's first terminal fault and replays it to a later address-space bind,
 /// so a death in the window between init's spawn and this bind is delivered
-/// to the death queues when the bind lands (#106 Window 2). A devmgr that died
-/// in that window and that procmgr has already torn down has had its thread
-/// cap revoked, so both binds fail; the entry is recorded with that cap all
-/// the same, and the resync that follows reconciliation reads the revoked cap
-/// as `EXIT_KILLED` and routes the death. A vfsd that died before
-/// reconciliation never reaches this path: svcmgr reads the recipe directory
-/// through vfsd. A thread bind that
+/// to the death queues when the bind lands (#106 Window 2). A devmgr or vfsd
+/// that died in that window and that procmgr has already torn down has had its
+/// thread cap revoked, so both binds fail; the entry is recorded with that cap
+/// all the same, and the resync that follows reconciliation reads the revoked
+/// cap as `EXIT_KILLED` and routes the death. A vfsd found dead before or
+/// during the recipe scan, which reads through vfsd, never reaches this path:
+/// [`reconcile_and_launch`] ends there and returns its death. A thread bind that
 /// fails on a live service (the death set out of memory) leaves the main
 /// thread's exit to a later resync. A failed address-space bind on a live
 /// service is logged and leaves the main thread's observer standing: init
@@ -630,15 +674,17 @@ fn build_entry(def: &Definition) -> Option<ServiceEntry>
     Some(entry)
 }
 
-/// Release the caps of every pending registration when the scan has
-/// no memory to parse the recipes: the init-spawned services run on,
+/// Release the caps of every pending registration not yet consumed when
+/// svcmgr can supervise none of them, for `reason`, which the log line for
+/// each names: the scan has no memory to parse the recipes, or vfsd, through
+/// which they are read, is dead. The init-spawned services run on,
 /// unsupervised, and none is reported as a configuration error.
-fn release_unsupervised(pending: &mut [PendingRegistration])
+pub fn release_unsupervised(pending: &mut [PendingRegistration], reason: &str)
 {
     for slot in pending.iter_mut().filter(|p| !p.consumed)
     {
         log!(
-            warn: "svcmgr: no memory for the recipes; {} runs unsupervised",
+            warn: "svcmgr: {reason}; {} runs unsupervised",
             slot.name_str()
         );
         release_registration(slot);

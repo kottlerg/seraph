@@ -30,6 +30,7 @@ mod arch;
 mod classes;
 mod death_queues;
 mod definitions;
+mod namespace_server;
 mod restart;
 mod service;
 
@@ -136,8 +137,13 @@ fn main() -> !
     // launched consumer resolves them. The classes go first: a class file's
     // boot-only mark must reach devmgr before its drivers-directory pass.
     publish_well_known(&mut state.registry, &caps);
-    classes::configure(&mut state.registry, caps.devmgr_registry, ipc_buf);
-    install_drivers_dir(&caps, ipc_buf);
+    classes::configure(
+        &mut state.registry,
+        caps.devmgr_registry,
+        &state.pending,
+        ipc_buf,
+    );
+    install_drivers_dir(&caps, &state.pending, ipc_buf);
 
     std::os::seraph::log!("endowed; waiting for handover");
 
@@ -306,10 +312,18 @@ fn publish_minted_send(
 /// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
 /// the endowed devmgr-registry source.
 ///
+/// The walk goes through vfsd, so it is skipped when vfsd is dead
+/// (`namespace_server::death`, read from its registration in `pending`): a
+/// call through a dead vfsd would wait for good.
+///
 /// Best-effort: any failure leaves devmgr without a drivers dir, so timed
 /// sees `NO_DEVICE` on its first `QUERY_DEVICE` through the `rtc` class and
 /// degrades to its no-RTC path; the rest of startup proceeds.
-fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
+fn install_drivers_dir(
+    caps: &service::SvcmgrCaps,
+    pending: &[PendingRegistration],
+    ipc_buf: *mut u64,
+)
 {
     if caps.devmgr_registry == 0
     {
@@ -320,6 +334,11 @@ fn install_drivers_dir(caps: &service::SvcmgrCaps, ipc_buf: *mut u64)
     if root_cap == 0
     {
         std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: no root_dir_cap");
+        return;
+    }
+    if namespace_server::death(pending, ipc_buf).is_some()
+    {
+        std::os::seraph::log!(warn: "SET_DRIVERS_DIR skipped: vfsd is dead");
         return;
     }
 
@@ -519,12 +538,16 @@ fn dispatch_ipc(
             // SAFETY: ipc_buf is the registered IPC buffer.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
             std::os::seraph::log!("handover complete; scanning /config/svcmgr/services/");
-            definitions::reconcile::reconcile_and_launch(
+            if let Err(exit_reason) = definitions::reconcile::reconcile_and_launch(
                 &mut state.pending,
                 &mut state.table,
                 ctx,
                 &mut state.registry,
-            );
+            )
+            {
+                route_namespace_server_death(state, ctx, exit_reason);
+                return;
+            }
             std::os::seraph::log!(
                 "monitoring {} service(s) after reconciliation",
                 state.table.services.len()
@@ -756,6 +779,30 @@ fn route_death(tag: DeathTag, exit_reason: u64, state: &mut SvcmgrState, ctx: &r
     }
 }
 
+/// Route the death of vfsd, the server of svcmgr's namespace root, found
+/// before reconciliation recorded it (`namespace_server::death`): system
+/// death, as for any death of vfsd (docs/supervision.md § Core Set and System
+/// Death). svcmgr cannot read a recipe through a dead vfsd, so it supervises
+/// no service: it releases every substrate registration, whose services run
+/// on unsupervised, and takes the path a `critical` service's unrecoverable
+/// death takes, [`initiate_graceful_shutdown`]. No shutdown actuator can be
+/// recorded, since the actuator's recipe and binary are read through vfsd, so
+/// that path logs the degraded state.
+fn route_namespace_server_death(
+    state: &mut SvcmgrState,
+    ctx: &restart::RestartCtx,
+    exit_reason: u64,
+)
+{
+    std::os::seraph::log!(
+        error: "{} died before reconciliation (exit reason {exit_reason:#x}); \
+         no service recipe can be read",
+        namespace_server::NAME
+    );
+    definitions::reconcile::release_unsupervised(&mut state.pending, "vfsd is dead");
+    initiate_graceful_shutdown(state, ctx);
+}
+
 /// The exit reason of `entry`'s current instance when the kernel shows it
 /// dead, else `None`, read from the caps svcmgr holds on it: the reason
 /// recorded for its main thread when that thread has exited; `EXIT_KILLED`
@@ -767,29 +814,7 @@ fn route_death(tag: DeathTag, exit_reason: u64, state: &mut SvcmgrState, ctx: &r
 /// has torn the service down.
 fn observed_death(entry: &service::ServiceEntry) -> Option<u64>
 {
-    if entry.thread_cap != 0
-    {
-        match syscall::cap_info(entry.thread_cap, syscall_abi::CAP_INFO_THREAD_STATE)
-        {
-            Ok(packed) if (packed >> 32) as u32 == syscall_abi::THREAD_STATE_EXITED =>
-            {
-                return Some(packed & 0xFFFF_FFFF);
-            }
-            Ok(_) =>
-            {}
-            Err(_) => return Some(syscall_abi::EXIT_KILLED),
-        }
-    }
-    if entry.aspace_cap != 0
-        && let Ok(reason) = syscall::cap_info(
-            entry.aspace_cap,
-            syscall_abi::CAP_INFO_ASPACE_TERMINAL_FAULT,
-        )
-        && reason != 0
-    {
-        return Some(reason);
-    }
-    None
+    restart::caps_death(entry.thread_cap, entry.aspace_cap)
 }
 
 /// Route a death for every active service whose current instance is dead:

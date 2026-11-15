@@ -84,10 +84,24 @@ about each such service its caps show alive, through its process handle
 `EXITED` with it before it reaps the process. The query runs only while memmgr and procmgr are
 active and alive, since it blocks until procmgr answers.
 
-Reconciliation records a devmgr that died before its bind with the thread cap init endowed, and a
-resync right after reconciliation routes its death (`EXIT_KILLED` for a revoked cap). A vfsd that
-died before reconciliation is not routed: svcmgr reads the recipe directory through vfsd, so
-reconciliation records nothing, or blocks, and no shutdown actuator is launched either.
+Reconciliation records a devmgr that died before its bind, or a vfsd that died after the recipe
+scan, with the thread cap init endowed, and a resync right after reconciliation routes its death
+(`EXIT_KILLED` for a revoked cap).
+
+vfsd serves svcmgr's namespace root: before the handover svcmgr reads the device class files and
+walks the drivers directory through it, and at the handover it reads the recipe directory. A call
+through a dead vfsd waits for good, since svcmgr's own SEND keeps the endpoint alive with none of
+its receivers left. So svcmgr reads vfsd's liveness from its substrate registration before each of
+those steps and after every vfsd access that fails
+([`src/namespace_server.rs`](../src/namespace_server.rs)): the state of the endowed thread cap
+(`EXIT_KILLED` for a revoked one), then, while memmgr and procmgr show alive, `QUERY_PROCESS` on
+the endowed process handle, which reports a worker-thread fault procmgr has not yet torn down. A
+dead vfsd ends the step. Found at the handover, before or during the recipe scan, its death is
+system death with no recipe to supervise by: svcmgr records and launches nothing, releases every
+substrate registration (each such service runs on unsupervised, logged), and takes the graceful
+shutdown path, which, with no shutdown actuator recorded, logs the degraded state (§ Decision
+tree). A vfsd that dies after a check, while svcmgr's next call to it waits unreceived, still
+leaves svcmgr blocked (#1185).
 
 Exit reason encoding (owned by
 [process-lifecycle.md](../../../docs/process-lifecycle.md#exit-reason)), and

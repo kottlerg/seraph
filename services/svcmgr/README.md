@@ -100,7 +100,11 @@ svcmgr/
   (parked AND no recipe → hard error). With no memory for the parsed
   list, or for a bind-only entry's record, an endowed service runs on
   unsupervised (logged, not reported as a configuration error); a recipe
-  dropped for memory is reported like a malformed one. See
+  dropped for memory is reported like a malformed one. A vfsd found dead
+  before or during the scan, which reads through it, ends reconciliation
+  with every endowed service unsupervised, and its death is routed as
+  system death ([docs/restart-protocol.md](docs/restart-protocol.md)
+  § Death detection). See
   [docs/service-definitions.md](docs/service-definitions.md) § Reconciliation.
 - **Launch** — for `defined only` services, spawn via the shared
   primitives in [`restart.rs`](src/restart.rs)

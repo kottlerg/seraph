@@ -12,22 +12,40 @@
 //! seeds that name.
 
 use std::fs;
+use std::ops::ControlFlow;
 use std::os::seraph::fs::DirEntryExt;
 use std::os::seraph::log;
 
 use registry::Visibility;
 use svcmgr_defs::class::{CLASS_FILE_SUFFIX, CLASSES_DIR, class_publication, parse_class};
 
+use crate::definitions::reconcile::PendingRegistration;
+use crate::namespace_server;
+
 /// Configure devmgr's classes from [`CLASSES_DIR`] through `devmgr_registry`,
 /// the endowed badge-0 devmgr-registry source, and publish each class SEND.
 /// Runs before svcmgr hands devmgr its drivers directory, so a boot-only
 /// mark is in place before the drivers-directory pass. A file that cannot be
 /// read or parsed, or whose class devmgr refuses, is logged and skipped.
-pub fn configure(registry: &mut registry::Registry, devmgr_registry: u64, ipc_buf: *mut u64)
+///
+/// The files are read through vfsd, so vfsd's liveness is read from its
+/// registration in `pending` before the first read and after every read that
+/// fails ([`namespace_server::death`]), and a dead vfsd ends the pass: a later
+/// call through it would wait for good.
+pub fn configure(
+    registry: &mut registry::Registry,
+    devmgr_registry: u64,
+    pending: &[PendingRegistration],
+    ipc_buf: *mut u64,
+)
 {
     if devmgr_registry == 0
     {
         log!(warn: "no devmgr-registry source; no device class configured");
+        return;
+    }
+    if server_dead(pending, ipc_buf).is_break()
+    {
         return;
     }
     let read = match fs::read_dir(CLASSES_DIR)
@@ -49,26 +67,55 @@ pub fn configure(registry: &mut registry::Registry, devmgr_registry: u64, ipc_bu
         log!(warn: "CLASS_AUTHORITY derive failed; no device class configured");
         return;
     };
-    for ent in read.flatten()
+    for ent in read
     {
+        let Ok(ent) = ent
+        else
+        {
+            if server_dead(pending, ipc_buf).is_break()
+            {
+                break;
+            }
+            continue;
+        };
         let Some(filename) = ent.file_name_ref().to_str()
         else
         {
             continue;
         };
         if let Some(class) = filename.strip_suffix(CLASS_FILE_SUFFIX)
+            && configure_one(registry, minter, class, pending, ipc_buf).is_break()
         {
-            configure_one(registry, minter, class, ipc_buf);
+            break;
         }
     }
     let _ = syscall::cap_delete(minter);
+}
+
+/// `Break` when vfsd is dead ([`namespace_server::death`]), logged: no device
+/// class file can be read.
+fn server_dead(pending: &[PendingRegistration], ipc_buf: *mut u64) -> ControlFlow<()>
+{
+    if namespace_server::death(pending, ipc_buf).is_some()
+    {
+        log!(warn: "vfsd is dead; device classes not configured");
+        return ControlFlow::Break(());
+    }
+    ControlFlow::Continue(())
 }
 
 /// Configure the class the file `<CLASSES_DIR>/<class>.class` names and
 /// publish its SEND as `devmgr.class.<class>`, through `minter`, a
 /// `CLASS_AUTHORITY` SEND on devmgr's registry. `class` is the file's stem,
 /// which names the class configured only when the file sets no `class` key.
-fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ipc_buf: *mut u64)
+/// `Break` when the file's read failed and vfsd is dead ([`server_dead`]).
+fn configure_one(
+    registry: &mut registry::Registry,
+    minter: u64,
+    class: &str,
+    pending: &[PendingRegistration],
+    ipc_buf: *mut u64,
+) -> ControlFlow<()>
 {
     // Fallible, as every copy svcmgr makes of configuration text is.
     let mut path = String::new();
@@ -83,7 +130,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         .is_err()
     {
         log!(warn: "class {class}: no memory for its path; not configured");
-        return;
+        return ControlFlow::Continue(());
     }
     path.push_str(CLASSES_DIR);
     path.push('/');
@@ -95,7 +142,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         Err(e) =>
         {
             log!(warn: "cannot read {path}: {e}; class not configured");
-            return;
+            return server_dead(pending, ipc_buf);
         }
     };
     let def = match parse_class(class, &contents)
@@ -104,7 +151,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         Err(e) =>
         {
             log!(warn: "parse {path}: {e}; class not configured");
-            return;
+            return ControlFlow::Continue(());
         }
     };
     let flags = if def.boot_only
@@ -124,7 +171,7 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
         Err(e) =>
         {
             log!(warn: "class {class}: devmgr refused it ({e:?}); not configured");
-            return;
+            return ControlFlow::Continue(());
         }
     };
     let Some(name) = class_publication(def.stem.as_bytes())
@@ -132,11 +179,12 @@ fn configure_one(registry: &mut registry::Registry, minter: u64, class: &str, ip
     {
         log!(warn: "class {class}: no memory for its name; not published");
         let _ = syscall::cap_delete(send);
-        return;
+        return ControlFlow::Continue(());
     };
     if registry.publish(&name, send, Visibility::SeedOnly).is_err()
     {
         log!(warn: "class {class}: publish failed");
         let _ = syscall::cap_delete(send);
     }
+    ControlFlow::Continue(())
 }

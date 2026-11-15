@@ -121,7 +121,8 @@ endowment svcmgr publishes the well-known names it owns (`rootfs.root`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`) into its own registry, configures devmgr's
 device classes and publishes each as `devmgr.class.<stem>` (the class file's name without
 `.class`), and installs devmgr's `/services/drivers/` cap via `SET_DRIVERS_DIR`, before entering
-the event loop.
+the event loop. Both read through vfsd and are skipped when vfsd is dead
+([restart-protocol.md § Death detection](restart-protocol.md#death-detection)).
 
 ---
 

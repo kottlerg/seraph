@@ -40,7 +40,9 @@ use alloc::vec::Vec;
 use syscall_abi::{EVENT_QUEUE_MAX_CAPACITY, SyscallError, WAIT_SET_MAX_MEMBERS};
 
 /// Members of a service's first main wait set: its service endpoint and the
-/// first death queue. Each replacement doubles it.
+/// first death queue. Each replacement doubles it. A set that reserves room
+/// for other members (`DeathQueues::with_members`) starts at those and the
+/// first queue instead.
 pub const FIRST_WAIT_SET_MEMBERS: u32 = 2;
 
 /// The error a bind or a create returns when no node or no memory is left.

@@ -66,11 +66,15 @@ impl PciRecords
         let mut states = Vec::new();
         states.try_reserve_exact(devices.len()).ok()?;
         states.resize(devices.len(), RecordState::Unbound);
-        let routes: Vec<Option<(u8, u8)>> =
-            devices.iter().map(|d| host_intx(&devices, d)).collect();
-        for (device, route) in devices.iter_mut().zip(routes)
+        // In place, with no temporary to allocate: `host_intx` reads no
+        // record's route, only its address, pin and bridge buses.
+        for index in 0..devices.len()
         {
-            device.host_intx = route;
+            let route = devices.get(index).and_then(|d| host_intx(&devices, d));
+            if let Some(device) = devices.get_mut(index)
+            {
+                device.host_intx = route;
+            }
         }
         Some(Self { devices, states })
     }

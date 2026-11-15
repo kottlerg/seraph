@@ -118,21 +118,16 @@ impl DriverWatch
     /// (core/kernel/docs/syscalls.md § `SYS_THREAD_BIND_NOTIFICATION` (47) and
     /// § `SYS_ASPACE_BIND_NOTIFICATION` (53)): no death is dropped, however
     /// many drivers devmgr spawns. The job notification is a member of the
-    /// wait set from the start. Returns `None`, logging why and releasing
-    /// what it created, when an object cannot be created.
+    /// wait set from the start. Returns `None`, logging why, when an object
+    /// cannot be created or the job notification cannot join the wait set;
+    /// the notification is then deleted, and a death set already created is
+    /// not, since `DeathSet` has no teardown and devmgr halts on `None`.
     pub fn new(drivers: usize) -> Option<Self>
     {
         let wanted = drivers.saturating_mul(OBSERVERS_PER_DRIVER as usize);
         let first = u32::try_from(wanted)
             .unwrap_or(u32::MAX)
             .clamp(1, syscall_abi::EVENT_QUEUE_MAX_CAPACITY);
-        let Some(deaths) =
-            death_set::DeathSet::new_counted(WS_OTHER_MEMBERS, WS_BADGE_DEATH, first)
-        else
-        {
-            std::os::seraph::log!(warn: "watch: death queue set not created");
-            return None;
-        };
         let Some(job_note) = std::os::seraph::object_slab_retype(
             std::os::seraph::NOTIFICATION_RETYPE_BYTES,
             |slab| syscall::cap_create_notification(slab).ok(),
@@ -140,6 +135,14 @@ impl DriverWatch
         else
         {
             std::os::seraph::log!(warn: "watch: job notification not created");
+            return None;
+        };
+        let Some(deaths) =
+            death_set::DeathSet::new_counted(WS_OTHER_MEMBERS, WS_BADGE_DEATH, first)
+        else
+        {
+            std::os::seraph::log!(warn: "watch: death queue set not created");
+            let _ = syscall::cap_delete(job_note);
             return None;
         };
         if deaths.add_member(job_note, WS_BADGE_JOB).is_err()

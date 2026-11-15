@@ -34,6 +34,7 @@ use std::cell::{Cell, RefCell};
 use std::os::seraph::ObjectGrant;
 
 use death_queues::DeathQueues;
+use death_queues::queues::FIRST_WAIT_SET_MEMBERS;
 use syscall::DeathEvent;
 use syscall_abi::SyscallError;
 
@@ -99,6 +100,7 @@ impl DeathSet
     {
         Self::create(
             1,
+            FIRST_WAIT_SET_MEMBERS,
             Some((service_ep, service_badge)),
             death_badge,
             Ring::Fixed(entries),
@@ -112,7 +114,14 @@ impl DeathSet
     #[must_use]
     pub fn new_death_only(death_badge: u64, entries: u32, first_observers: u32) -> Option<Self>
     {
-        Self::create(1, None, death_badge, Ring::Fixed(entries), first_observers)
+        Self::create(
+            1,
+            FIRST_WAIT_SET_MEMBERS,
+            None,
+            death_badge,
+            Ring::Fixed(entries),
+            first_observers,
+        )
     }
 
     /// Create a counted set: a main wait set with room for `reserved`
@@ -131,6 +140,7 @@ impl DeathSet
     {
         Self::create(
             reserved,
+            reserved.checked_add(1)?,
             None,
             death_badge,
             Ring::PerBind,
@@ -138,16 +148,19 @@ impl DeathSet
         )
     }
 
+    /// Create the set: a main wait set of `first_members` members, room
+    /// for `reserved` of them other than the queues, `first_member` added
+    /// to it, and the first queue. On any failure every object created is
+    /// deleted.
     fn create(
         reserved: u32,
+        first_members: u32,
         first_member: Option<(u64, u64)>,
         death_badge: u64,
         ring: Ring,
         first_observers: u32,
     ) -> Option<Self>
     {
-        // The members, and the first queue.
-        let first_members = reserved.checked_add(1)?;
         let mut members = Vec::new();
         members
             .try_reserve_exact(usize::try_from(reserved).ok()?)
@@ -176,13 +189,17 @@ impl DeathSet
             ring,
             queues: RefCell::new(policy),
         };
-        set.queues
-            .borrow_mut()
-            .grow(
-                |observers| create_queue(ws_cap, death_badge, ring, observers, 0),
-                |_, _| Err(OUT_OF_MEMORY),
-            )
-            .ok()?;
+        let first = set.queues.borrow_mut().grow(
+            |observers| create_queue(ws_cap, death_badge, ring, observers, 0),
+            |_, _| Err(OUT_OF_MEMORY),
+        );
+        if first.is_err()
+        {
+            // `create_queue` deleted any queue it made; the wait set is
+            // the only object left.
+            delete_object(set.ws_cap.get(), set.ws_grant.take());
+            return None;
+        }
         Some(set)
     }
 

@@ -236,10 +236,11 @@ fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
 /// # Errors
 /// `OutOfMemory` when procmgr refused the bind for want of a free node in
 /// `eq`'s pool (`procmgr_errors::OUT_OF_MEMORY`), which a death set takes
-/// as a reason to try another queue; the `SYS_CAP_DERIVE` error when the
-/// copy cannot be derived; `InvalidState` when the call fails, the copy
-/// released, or procmgr refuses the bind otherwise (the child torn down
-/// already among the causes).
+/// as a reason to try another queue; `InvalidState` when the copy cannot
+/// be derived (a `SYS_CAP_DERIVE` `OutOfMemory` is devmgr's own `CSpace`
+/// running out, not the queue, so it must not move the bind on), when the
+/// call fails, the copy released, or when procmgr refuses the bind
+/// otherwise (the child torn down already among the causes).
 fn bind_fault_observer(
     process_handle: u64,
     eq: u64,
@@ -247,7 +248,8 @@ fn bind_fault_observer(
     ipc_buf: *mut u64,
 ) -> Result<(), i64>
 {
-    let post = syscall::cap_derive(eq, syscall::RIGHTS_EQ_POST)?;
+    let post = syscall::cap_derive(eq, syscall::RIGHTS_EQ_POST)
+        .map_err(|_| syscall_abi::SyscallError::InvalidState as i64)?;
     let msg = IpcMessage::builder(procmgr_labels::BIND_DEATH_OBSERVER)
         .word(0, correlator)
         .cap(post)

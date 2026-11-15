@@ -141,6 +141,19 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    // A core of vfsd would be written through it, so the crash service
+    // must write none: declare it on the core path before it serves
+    // (`procmgr_labels::DECLARE_NO_CORE`). A refusal leaves its core to the
+    // crash service's dump bound.
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            info.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_CORE),
+            ipc_buf,
+        )
+    };
+
     let Some(mut caps) = bootstrap_caps(info, ipc_buf)
     else
     {

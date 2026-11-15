@@ -31,6 +31,9 @@ carries them, with `object`'s ELF and PE readers (on macOS too), except two: a
 library instead, and an AIX host's, whose `object` reads XCOFF only. On Windows xtask therefore
 needs the GNU host toolchain (`rustup set default-host x86_64-pc-windows-gnu` before the pinned
 toolchain is installed); on a `*-windows-msvc` host it fails to compile, naming that toolchain.
+xtask calls the host's C library through bindings declared in `xtask/src/sys.rs`, which hold its
+values for Linux, macOS, FreeBSD, DragonFly BSD, NetBSD, OpenBSD, illumos and Solaris; on any
+other Unix xtask fails to compile, naming that file.
 
 `cargo xtask test` runs the host tests a second time built for `riscv64gc-unknown-linux-gnu`,
 under QEMU's user-mode emulator, so it needs a Linux host with three more packages: the emulator

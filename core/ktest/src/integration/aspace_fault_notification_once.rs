@@ -56,7 +56,7 @@ const CAPACITY: u32 = 4;
 /// through [`crate::scaled_polls`].
 const MAX_POLLS: u32 = 2000;
 
-/// Concurrent rounds made with two or more CPUs, each with a fresh space.
+/// Concurrent rounds made with three or more CPUs, each with a fresh space.
 const CONCURRENT_ROUNDS: u32 = 8;
 
 /// The controller's CPU while the concurrent rounds run.

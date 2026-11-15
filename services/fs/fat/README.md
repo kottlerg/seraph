@@ -12,12 +12,12 @@ fat/
 ├── README.md
 ├── fat-parse/                  # `fatfs-parse`: BPB/dir decoders, slot scans, cluster bounds,
 │                               #   FAT entries, file positions, name encoding, LFN slots
-│                               #   and tails, node slab, cache bounds
+│                               #   and tails, node slab, cache bounds and victim pick
 ├── docs/
 │   ├── crash-safety.md         # Per-op write ordering and post-crash visible states
 │   └── storage-layout.md       # Allocator, directory mutation, page cache, NodeTable, eviction
 └── src/
-    ├── main.rs                 # Dispatch loop, FS_* handlers, write engine
+    ├── main.rs                 # Dispatch loop, pressure thread, FS_* handlers, write engine
     ├── bpb.rs                  # BPB parser, FatState fields
     ├── alloc.rs                # Cluster allocator, FAT-mirror writes, FSInfo flush
     ├── dir.rs                  # Directory walks and mutation (insert/remove/rename)
@@ -80,8 +80,8 @@ carry no rights (a parent with none of the file rights) is refused with
 ## Storage layout
 
 The driver's storage engine is a cluster allocator (`src/alloc.rs`), directory mutation
-(`src/dir.rs`), a write-through page cache of slots taken on first use, up to 256 or 1/512 of RAM,
-whichever is more (`src/cache.rs`), a
+(`src/dir.rs`), a write-through page cache whose slots take pages on demand and give idle ones
+back under memory pressure, up to 256 or 1/512 of RAM, whichever is more (`src/cache.rs`), a
 node table that dedupes by on-disk slot and recycles the nodes of removed or renamed entries
 (`src/backend.rs`), and a cooperative-release eviction worker (`src/eviction.rs`). Sectors are the
 device's logical blocks, 512 to 4096 bytes. Each component's behavior is specified in

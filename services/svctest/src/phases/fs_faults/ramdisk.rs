@@ -8,6 +8,7 @@
 //! served over the `BLK_GET_GEOMETRY`, `BLK_READ_INTO_MEMORY`, and
 //! `BLK_WRITE_FROM_MEMORY` requests fatfs issues, with block faults armed by
 //! sector and attempt, or every request failed at once ([`RamDisk::fail_all`]).
+//! The device keeps a log of the reads it served ([`RamDisk::take_reads`]).
 //!
 //! The device can also go away: a request carrying [`GONE_BADGE`] revokes
 //! every capability derived from the block endpoint, fatfs's among them, and
@@ -58,13 +59,16 @@ pub enum Fault
     FailAfterWrite,
     /// A read is reported failed and fills nothing.
     FailRead,
+    /// A read is reported failed, fills nothing, and keeps the page cap it
+    /// carried: the device deletes it, and the reply carries no cap.
+    LoseCap,
 }
 
 impl Fault
 {
     fn direction(self) -> Direction
     {
-        if self == Fault::FailRead
+        if matches!(self, Fault::FailRead | Fault::LoseCap)
         {
             Direction::Read
         }
@@ -103,6 +107,9 @@ pub struct RamDisk
     /// Every read and write is answered `DEVICE_STATUS_IOERR` and moves no
     /// sector.
     failing: bool,
+    /// `(first sector, sectors)` of every read served since the last
+    /// [`RamDisk::take_reads`].
+    reads: Vec<(usize, usize)>,
 }
 
 /// The disk the phase and the block server thread share.
@@ -148,6 +155,7 @@ impl RamDisk
             sectors: BTreeMap::from([(0, Box::new(boot)), (FAT_LBA, Box::new(fat))]),
             rules: Vec::new(),
             failing: false,
+            reads: Vec::new(),
         }))
     }
 
@@ -229,6 +237,13 @@ impl RamDisk
         self.failing = false;
     }
 
+    /// `(first sector, sectors)` of every read the device served since the
+    /// last call, in order, emptying the log.
+    pub fn take_reads(&mut self) -> Vec<(usize, usize)>
+    {
+        core::mem::take(&mut self.reads)
+    }
+
     /// The fault that fires on a request starting at `lba`, counting the
     /// request against every armed rule of its direction there.
     fn take_fault(&mut self, lba: usize, direction: Direction) -> Option<Fault>
@@ -279,7 +294,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) };
             return;
         }
-        let cap = msg.caps().first().copied().unwrap_or(0);
+        let mut cap = msg.caps().first().copied().unwrap_or(0);
         for &extra in msg.caps().iter().skip(1)
         {
             let _ = syscall::cap_delete(extra);
@@ -311,7 +326,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
                 disk,
                 aspace,
                 va,
-                cap,
+                &mut cap,
                 msg.word(0),
                 msg.word(1),
                 Direction::Read,
@@ -320,7 +335,7 @@ pub fn serve(ep: u64, disk: &SharedDisk)
                 disk,
                 aspace,
                 va,
-                cap,
+                &mut cap,
                 msg.word(0),
                 msg.word(1),
                 Direction::Write,
@@ -355,14 +370,15 @@ fn map_refusal_label(error: i64) -> u64
     }
 }
 
-/// Copy `count` sectors at `lba` between the disk and the page `cap` names,
+/// Copy `count` sectors at `lba` between the disk and the page `*cap` names,
 /// in `direction`, unless an armed fault says otherwise. Returns the reply
-/// label.
+/// label; `*cap` is 0 when the fault deleted the cap, so the reply carries
+/// none.
 fn transfer(
     disk: &SharedDisk,
     aspace: u64,
     va: u64,
-    cap: u64,
+    cap: &mut u64,
     lba: u64,
     count: u64,
     direction: Direction,
@@ -373,7 +389,7 @@ fn transfer(
     {
         return blk_errors::OUT_OF_BOUNDS;
     };
-    if cap == 0 || count == 0 || count > MAX_SECTORS_PER_REQUEST
+    if *cap == 0 || count == 0 || count > MAX_SECTORS_PER_REQUEST
     {
         return blk_errors::INVALID_MEMORY_CAP;
     }
@@ -391,6 +407,12 @@ fn transfer(
     {
         return blk_errors::DEVICE_STATUS_IOERR;
     }
+    if fault == Some(Fault::LoseCap)
+    {
+        let _ = syscall::cap_delete(*cap);
+        *cap = 0;
+        return blk_errors::DEVICE_STATUS_IOERR;
+    }
     let prot = match direction
     {
         Direction::Read => syscall::MAP_WRITABLE,
@@ -399,9 +421,13 @@ fn transfer(
     // SAFETY: `va` is the block server's own page reservation from the
     // per-process arena, used only by this thread for one copy at a time: VA
     // no Rust object or IPC page occupies.
-    if let Err(e) = unsafe { std::os::seraph::mem_map_funded(cap, aspace, va, 0, 1, prot) }
+    if let Err(e) = unsafe { std::os::seraph::mem_map_funded(*cap, aspace, va, 0, 1, prot) }
     {
         return map_refusal_label(e);
+    }
+    if direction == Direction::Read
+    {
+        disk.reads.push((lba, count));
     }
     for i in 0..count
     {

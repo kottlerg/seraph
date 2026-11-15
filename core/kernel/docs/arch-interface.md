@@ -966,7 +966,8 @@ pub fn mitigation_info(view: u64) -> Result<u64, SyscallError>;
 
 Supervisor shadow stacks, the hardware return-address integrity of
 [return-address-integrity.md](return-address-integrity.md). x86-64 runs the kernel on CET
-supervisor shadow stacks when the CPU reports them; RISC-V runs on none, and every function
+supervisor shadow stacks when the CPU reports them and the transient-execution selection uses no
+control that rewrites a return; RISC-V runs on none, and every function
 below is a stub there (`enabled` is `false`, `CPU_PAGES` is 0).
 
 ```rust

@@ -8,7 +8,9 @@
 //! (core/kernel/docs/return-address-integrity.md § x86-64 Mechanism).
 //!
 //! Shadow stacks are on for every CPU or for none, decided once on the BSP in
-//! Phase 4 from `CPUID.(EAX=7,ECX=0):ECX[7]` (`CET_SS`) by [`decide`]. With them
+//! Phase 4 from `CPUID.(EAX=7,ECX=0):ECX[7]` (`CET_SS`) and the Phase-1
+//! transient-execution selection, which keeps them off when a selected control
+//! rewrites a return, by [`decide`]. With them
 //! on, `CALL` pushes each return address to the running shadow stack too and
 //! `RET` compares the two copies, raising a control-protection fault (`#CP`,
 //! vector 21) on a mismatch. Every shadow stack is one 4 KiB page whose

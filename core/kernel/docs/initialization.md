@@ -708,7 +708,11 @@ hardware TLB tags than the BSP configured halts itself with
 the BSP's wait then expires the same way. An x86-64 AP that lacks the CET shadow stacks the
 BSP turned on halts itself the same way ("AP lacks the CET shadow stacks the BSP enabled",
 from `shadow_stack::prepare_ap` in `kernel_entry_ap`, which otherwise turns them on before
-the AP's timer). On riscv64 an AP that cannot be an APLIC MSI target (a
+the AP's timer). An x86-64 AP that does not enumerate a transient-execution MSR control
+the BSP selected halts itself the same way, before it touches the MSR ("CPU lacks the
+<control> the boot CPU selected", from `speculation::apply_mitigations_this_cpu` in
+`kernel_entry_ap`; [transient-execution.md](transient-execution.md) § Controls). On riscv64
+an AP that cannot be an APLIC MSI target (a
 firmware hart id past the target's hart index, or outside the reported IMSIC layout) halts
 itself the same way at its IMSIC file's initialisation, before announcing itself, as does an
 AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot

@@ -46,14 +46,17 @@ pub fn select_mitigations() {}
 /// `BHI_DIS_S`, Automatic IBRS, `DOITM`), through
 /// `super::mitigation::apply_this_cpu`.
 ///
+/// # Panics
+/// Halts, naming the control, when this CPU does not enumerate an MSR control
+/// the boot CPU selected (`super::mitigation::missing_msr_control`).
+///
 /// # Safety
 /// Ring 0, after [`select_mitigations`], on the CPU being brought up: the BSP
 /// in Phase 1, each AP in `kernel_entry_ap`.
 #[cfg(not(test))]
 pub unsafe fn apply_mitigations_this_cpu()
 {
-    // SAFETY: the caller's contract is `apply_this_cpu`'s; every CPU has the
-    // boot CPU's enumeration (core/kernel/docs/transient-execution.md § Inputs).
+    // SAFETY: the caller's contract is `apply_this_cpu`'s.
     unsafe { super::mitigation::apply_this_cpu() };
 }
 

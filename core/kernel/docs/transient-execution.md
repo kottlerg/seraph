@@ -124,9 +124,11 @@ maximum, since such a leaf returns another leaf's data. It reads `IA32_ARCH_CAPA
 | `CPUID Fn8000_0021 ECX` | AMD: `TSA_SQ_NO` (bit 1), `TSA_L1_NO` (bit 2), `TSA_FILL_NO` (bit 7) |
 | `IA32_ARCH_CAPABILITIES` | The `*_NO` bits, `RSBA`, `TSX_CTRL` and `RFDS_CLEAR` (§ Enumerated bits); `RRSBA` (§ Predictor behaviours); `IBRS_ALL` (bit 1) and `DOITM` (bit 12) (§ Controls) |
 
-The inputs are read on the boot CPU only. Intel states that the RFDS bits enumerate identically
-on every logical processor of a hybrid part. No vendor document found states the same for every
-bit the table reads.
+The table and the selection are made from the boot CPU's inputs. Intel states that the RFDS bits
+enumerate identically on every logical processor of a hybrid part. No vendor document found
+states the same for every bit the table reads, so each AP reads its own inputs before it sets
+an MSR control and halts the boot when it does not enumerate one the boot CPU selected
+(§ Controls).
 
 ---
 
@@ -278,7 +280,10 @@ The kernel selects the user-to-kernel controls from the table once, on the boot 
 selection is `mitigation::select`, a pure function of the inputs below; `mitigation::install`
 publishes it, and every CPU sets the per-CPU controls of it in its bring-up
 (`speculation::apply_mitigations_this_cpu`: the boot CPU in Phase 1, each AP in
-`kernel_entry_ap`). The code is `arch/x86_64/mitigation.rs`.
+`kernel_entry_ap`). A CPU that does not enumerate an MSR control the selection holds
+(`IBRS_ALL`, Automatic IBRS, `BHI_CTRL` or `DOITM`) halts with "CPU lacks the <control> the
+boot CPU selected" (`mitigation::missing_msr_control`) before it touches the MSR, since the
+access would fault. The code is `arch/x86_64/mitigation.rs`.
 
 ### Selection
 

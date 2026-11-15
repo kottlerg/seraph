@@ -386,29 +386,76 @@ fn msr_bits(controls: Controls) -> [(u32, u64); 3]
     ]
 }
 
+/// Each control set in an MSR, with the input that enumerates its MSR bit and
+/// the message a CPU that does not enumerate it halts with.
+const MSR_CONTROLS: [(u64, u64, &str); 4] = [
+    (
+        SPECULATION_CONTROL_EIBRS,
+        SPECULATION_INPUT_IBRS_ALL,
+        "CPU lacks the enhanced IBRS the boot CPU selected",
+    ),
+    (
+        SPECULATION_CONTROL_AUTO_IBRS,
+        SPECULATION_INPUT_AUTO_IBRS,
+        "CPU lacks the Automatic IBRS the boot CPU selected",
+    ),
+    (
+        SPECULATION_CONTROL_BHI_DIS_S,
+        SPECULATION_INPUT_BHI_CTRL,
+        "CPU lacks the BHI_DIS_S control the boot CPU selected",
+    ),
+    (
+        SPECULATION_CONTROL_DOITM,
+        SPECULATION_INPUT_DOITM,
+        "CPU lacks the DOITM control the boot CPU selected",
+    ),
+];
+
+/// The halt message for the first MSR control of `controls` that a CPU with
+/// the inputs `inputs` does not enumerate, or `None` when it enumerates every
+/// one. The selection is made from the boot CPU's enumeration, which no vendor
+/// guarantees for every other CPU (core/kernel/docs/transient-execution.md
+/// § Inputs), and an MSR access to a bit the CPU does not implement faults.
+pub fn missing_msr_control(controls: Controls, inputs: Inputs) -> Option<&'static str>
+{
+    MSR_CONTROLS
+        .iter()
+        .find(|&&(control, input, _)| controls.has(control) && !inputs.any(input))
+        .map(|&(_, _, message)| message)
+}
+
 /// Set this CPU's MSR controls of the installed selection: enhanced IBRS and
 /// `BHI_DIS_S` in `IA32_SPEC_CTRL`, Automatic IBRS in `EFER`, and `DOITM` in
 /// `IA32_UARCH_MISC_CTL`, each by a read-modify-write that keeps the MSR's
 /// other bits. Each is per logical processor, so every CPU sets its own.
 ///
+/// # Panics
+/// Halts via `crate::fatal`, naming the control, when this CPU does not
+/// enumerate an MSR control the boot CPU selected ([`missing_msr_control`]),
+/// before any access to its MSR.
+///
 /// # Safety
-/// Ring 0, on the CPU being brought up, after [`install`], with the boot CPU's
-/// enumeration holding for this CPU (core/kernel/docs/transient-execution.md
-/// § Inputs): a control is selected only where the boot CPU implements its
-/// MSR, so neither the read nor the write faults.
+/// Ring 0, on the CPU being brought up, after [`install`].
 #[cfg(not(test))]
 pub unsafe fn apply_this_cpu()
 {
-    let controls = Controls(SELECTED.load(Ordering::Relaxed));
+    let controls = selected();
+    let cpu = super::vulnerability::enumerate();
+    if let Some(message) = missing_msr_control(
+        controls,
+        Inputs::of(&cpu, &super::vulnerability::derive(&cpu)),
+    )
+    {
+        crate::fatal(message);
+    }
     for (msr, bits) in msr_bits(controls)
     {
         if bits == 0
         {
             continue;
         }
-        // SAFETY: ring 0; a selected control implies the boot CPU implements
-        // `msr` (`select`), and this CPU's enumeration is the boot CPU's
-        // (caller's contract).
+        // SAFETY: ring 0; this CPU enumerates every selected control's MSR bit
+        // (checked above), so it implements `msr` and the read cannot fault.
         let value = unsafe { super::cpu::read_msr(msr) };
         // SAFETY: as for the read; the write sets only the control's bits, which
         // the implemented MSR defines, and keeps every other bit.
@@ -417,20 +464,19 @@ pub unsafe fn apply_this_cpu()
 }
 
 /// The controls in effect on the calling CPU, a `SPECULATION_CONTROL_*` set:
-/// the MSR controls as this CPU's MSRs hold them, read where the boot CPU
-/// implements the MSR, and the others as the flags the entry and exit code
-/// test hold them. The fill after an IBPB is reported as selected: the kernel
+/// the MSR controls as this CPU's MSRs hold them, each MSR read where a
+/// selected control lives in it, and the others as the flags the entry and
+/// exit code test hold them. The fill after an IBPB is reported as selected: the kernel
 /// issues no IBPB, so no IBPB is left without it.
 #[cfg(not(test))]
 pub fn in_effect() -> u64
 {
-    let inputs = Inputs(INPUTS.load(Ordering::Relaxed));
-    let selected = Controls(SELECTED.load(Ordering::Relaxed));
+    let selected = selected();
     let mut bits = 0;
     let mut read_bits = |msr: u32, controls: &[(u64, u64)]| {
-        // SAFETY: ring 0; the callers below read only an MSR the boot CPU
-        // implements, which every CPU does (core/kernel/docs/transient-execution.md
-        // § Inputs).
+        // SAFETY: ring 0; the callers below read `EFER`, which every x86-64
+        // CPU implements, or an MSR in which a selected control lives, which
+        // `apply_this_cpu` checked this CPU implements at its bring-up.
         let value = unsafe { super::cpu::read_msr(msr) };
         for &(control, bit) in controls
         {
@@ -440,7 +486,7 @@ pub fn in_effect() -> u64
             }
         }
     };
-    if inputs.any(SPECULATION_INPUT_IBRS_ALL | SPECULATION_INPUT_BHI_CTRL)
+    if selected.bits() & (SPECULATION_CONTROL_EIBRS | SPECULATION_CONTROL_BHI_DIS_S) != 0
     {
         read_bits(
             IA32_SPEC_CTRL,
@@ -451,7 +497,7 @@ pub fn in_effect() -> u64
         );
     }
     read_bits(IA32_EFER, &[(SPECULATION_CONTROL_AUTO_IBRS, EFER_AIBRSE)]);
-    if inputs.any(SPECULATION_INPUT_DOITM)
+    if selected.has(SPECULATION_CONTROL_DOITM)
     {
         read_bits(
             IA32_UARCH_MISC_CTL,
@@ -1011,5 +1057,32 @@ mod tests
                 assert!(controls.rewrites_returns(), "inputs {inputs:#x}");
             }
         }
+    }
+
+    // Defect caught: a CPU that does not enumerate an MSR control the boot CPU
+    // selected brought up anyway, so its MSR access raises #GP, or a CPU
+    // halted for a control that was not selected. Each MSR control is tried
+    // selected and missing, selected and present, and not selected.
+    #[test]
+    fn a_cpu_without_a_selected_msr_control_is_named()
+    {
+        for (control, input, message) in MSR_CONTROLS
+        {
+            assert_eq!(
+                missing_msr_control(Controls(control), Inputs(0)),
+                Some(message)
+            );
+            assert_eq!(missing_msr_control(Controls(control), Inputs(input)), None);
+            assert_eq!(
+                missing_msr_control(Controls(0), Inputs(0)),
+                None,
+                "{message}"
+            );
+        }
+        let all = Controls(::syscall::SPECULATION_CONTROL_ALL);
+        assert_eq!(
+            missing_msr_control(all, Inputs(::syscall::SPECULATION_INPUT_ALL)),
+            None
+        );
     }
 }

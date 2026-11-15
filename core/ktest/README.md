@@ -225,7 +225,8 @@ instruction (the stepped `syscall` stepping as one), as
 selected are the ones
 [core/kernel/docs/transient-execution.md § Controls](../kernel/docs/transient-execution.md#controls)
 states for the inputs it reports, and that on every CPU, the case pinned there in turn, the
-controls in effect equal the selection; it logs the three words. On RISC-V,
+controls in effect equal the selection; it logs the inputs, the selection, and the controls in
+effect on every CPU (or on the first that differs). On RISC-V,
 `src/arch/riscv64/sbi_gating.rs` checks that `SYS_SBI_CALL` refuses kernel-reserved SBI extensions
 and sanctioned ones the cap lacks the right for, and `src/arch/riscv64/single_step.rs` checks that a
 handler steps a thread of a fresh address space through a stub written there, one instruction at a

@@ -842,7 +842,10 @@ on a report line that is missing or wrong.
 Check the kernel's CET supervisor shadow stacks, x86_64 only
 ([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks). Boots the
 current sysroot headless twice under KVM with `-cpu host,cet-ss=on,enforce`: the first runs ktest
-to its pass marker and requires the kernel's `shadow stacks: on` line before it; the second, with
+to its pass marker and requires the kernel's `shadow stacks: on` line before it (a kernel that
+logs `shadow stacks: off` instead, which it does on a CPU reporting `CET_SS` without enhanced or
+Automatic IBRS, since it then takes the retpoline sequence, fails the command naming that cause);
+the second, with
 QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoint at
 `syscall::dispatch` once ktest has started, overwrites the return address at the stopped CPU's
 stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an

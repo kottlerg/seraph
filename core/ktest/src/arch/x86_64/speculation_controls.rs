@@ -18,8 +18,10 @@
 //! the design note fails here as well as in the kernel's host tests. It then
 //! pins this thread to each CPU in turn and requires the in-effect word there
 //! to equal the selected one, so a CPU whose bring-up missed the per-CPU MSR
-//! write (`kernel_entry_ap`) fails the case. It logs the three words, so the
-//! boot log shows which controls engaged on the machine it ran on: under QEMU
+//! write (`kernel_entry_ap`) fails the case. It logs the inputs and the
+//! selection, then the in-effect word: once, after every CPU's equalled the
+//! selection, or the first CPU's that differs. The boot log so shows which
+//! controls engaged on the machine it ran on: under QEMU
 //! TCG the retpoline sequence, and on the development host under KVM
 //! enhanced IBRS, `BHI_DIS_S` and `VERW` on exit.
 
@@ -119,6 +121,12 @@ pub fn run(ctx: &TestContext) -> TestResult
     let cpus = system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "integration::speculation_controls: system_info(CpuCount) failed")?;
     let result = every_cpu(ctx, cpus, selected);
+    if result.is_ok()
+    {
+        crate::log_args(format_args!(
+            "ktest: speculation in_effect={selected:#x} on all {cpus} CPUs"
+        ));
+    }
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "integration::speculation_controls: restore affinity failed");
     result?;

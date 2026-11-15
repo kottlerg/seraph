@@ -172,7 +172,8 @@ and re-exported from `arch/mod.rs` as a unified interface. On x86-64,
 `arch/x86_64/vulnerability.rs` derives at boot the CPU's exposure to each transient-execution
 class and logs it, and `arch/x86_64/mitigation.rs` selects and applies the entry and exit
 controls it calls for; see [`docs/transient-execution.md`](docs/transient-execution.md).
-Hardware shadow stacks protect the kernel's return addresses where the hardware has them:
+Hardware shadow stacks protect the kernel's return addresses where the hardware has them and,
+on x86-64, no selected transient-execution control rewrites a return:
 CET SHSTK on x86-64 (`arch/x86_64/shadow_stack.rs`), implemented; Zicfiss on riscv64, design
 intent, not yet implemented; see
 [`docs/return-address-integrity.md`](docs/return-address-integrity.md).

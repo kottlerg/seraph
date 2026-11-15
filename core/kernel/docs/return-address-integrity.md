@@ -79,7 +79,9 @@ only options whose second copy ordinary stores cannot reach.
 The maintainer decided the direction per architecture, both mechanisms opportunistic: used where
 the hardware has the feature, with the kernel running unprotected and otherwise unchanged where
 it does not
-([docs/platform-requirements.md](../../../docs/platform-requirements.md) § Feature Classes):
+([docs/platform-requirements.md](../../../docs/platform-requirements.md) § Feature Classes). On
+x86-64 a selected transient-execution control that rewrites a return takes precedence over the
+feature (§ x86-64 Mechanism, Decision):
 
 - **riscv64: Zicfiss supervisor shadow stacks.** The shadow-stack instructions are Zimop and
   Zcmop encodings, which RVA23 mandates, so one kernel image serves every RVA23 hart: with

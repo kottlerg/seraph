@@ -230,11 +230,18 @@ pub fn settle<T, E: SettleEvents<T>>(
 }
 
 /// Mark dead every driver whose death the event queue holds, handing each
-/// post for a badge the batch does not hold to the caller.
+/// post for a badge the batch does not hold to the caller. A post for a
+/// driver the batch already holds dead is dropped: a fault of a driver's
+/// main thread posts to both its observers, the main thread's and its
+/// address space's, with the same badge.
 fn drain_deaths<T, E: SettleEvents<T>>(events: &mut E, roster: &mut Roster<T>)
 {
     while let Some(post) = events.try_death()
     {
+        if roster.state(post.badge) == Some(DriverState::Dead)
+        {
+            continue;
+        }
         if roster.mark_dead(post.badge)
         {
             events.on_death(post.badge, post.reason);
@@ -605,6 +612,30 @@ mod tests
         assert_eq!(settle(&mut s, &mut r), Err(()));
         assert_eq!(s.deaths, [(2, 3)]);
         assert_eq!(served(r), [1]);
+    }
+
+    #[test]
+    fn a_second_death_post_of_a_dead_driver_is_dropped()
+    {
+        // Driver 1's main thread faults: its thread observer and its
+        // address-space observer both post its badge. The death is taken
+        // once, and the repeat reaches neither `on_death` nor the caller.
+        let mut r = roster_of(&[1, 2]);
+        let mut s = Script {
+            wakes: vec![
+                (
+                    Ok(SettleWake::Death),
+                    vec![post(1, 0x100e), post(1, 0x100e)],
+                ),
+                (Ok(SettleWake::Driver), vec![post(1, 0x100e)]),
+            ],
+            calls: vec![2],
+            ..Script::default()
+        };
+        assert_eq!(settle(&mut s, &mut r), Ok(SettleEnd::Settled));
+        assert_eq!(s.deaths, [(1, 0x100e)]);
+        assert_eq!(s.other_deaths, [] as [DeathPost; 0]);
+        assert_eq!(served(r), [2]);
     }
 
     #[test]

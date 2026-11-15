@@ -628,8 +628,8 @@ gives the settle, the bound's derivation, and the serving order). `QUERY_DEVICE`
 class's drivers by an optional instance ordinal in `data[1]` (absent means the first): the
 ordinal counts the served drivers of that class in PCI segment, bus, device, function order, is
 not stable across boots, and is fixed once the class settles. devmgr
-observes the death of every driver's main thread for the rest of the boot (a worker thread's
-terminal fault is not observed:
+observes the death of every driver for the rest of the boot (an exit of its main thread, or a
+terminal fault of any of its threads:
 [Supervision § Supervision Hierarchy](supervision.md#supervision-hierarchy)): a served driver
 that dies is withdrawn, its service endpoint revoked so callers queued on it return, and a
 tombstone holds its ordinal, whose query replies `devmgr_errors::WITHDRAWN` while the ordinals

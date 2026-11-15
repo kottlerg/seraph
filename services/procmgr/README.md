@@ -119,6 +119,12 @@ procmgr/
   thread's exception class under a crash badge of its own, so a fault names
   its thread. See [docs/ipc-interface.md](docs/ipc-interface.md) § Label 22:
   `REGISTER_THREAD`.
+- **Death observer binding** — serve `BIND_DEATH_OBSERVER` on a process
+  handle: bind the caller's `EventQueue` on that process's address space,
+  so a terminal fault of any of its threads posts the caller's correlator,
+  while the space's Control right stays with procmgr. See
+  [docs/ipc-interface.md](docs/ipc-interface.md) § Label 25:
+  `BIND_DEATH_OBSERVER`.
 - **Init reap** — accept init's `REGISTER_INIT_TEARDOWN` handoff during
   init's Handover stage
   ([services/init/docs/bootstrap.md](../init/docs/bootstrap.md) § Handover):

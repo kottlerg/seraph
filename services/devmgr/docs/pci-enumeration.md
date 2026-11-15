@@ -272,9 +272,10 @@ For each matched device, devmgr:
    and exits unless every range lies inside its BAR's share, no two
    overlap, and every register region lies inside a range
    (`RegisterLayout::place`).
-8. Binds a death observer on the driver's thread to devmgr's driver death
-   queue, with the device badge as the correlator, and keeps the driver's
-   process handle for the rest of the boot.
+8. Binds two death observers to devmgr's driver death queue, with the
+   device badge as the correlator: one on the driver's main thread, and one
+   procmgr binds on its address space (`BIND_DEATH_OBSERVER`); keeps the
+   driver's process handle for the rest of the boot.
 9. Once every driver of the batch (the boot batch: the boot pass, then the
    serial and framebuffer drivers; the on-disk batch: the RTC driver, then
    the drivers-directory pass) has been spawned, settles the batch: serves

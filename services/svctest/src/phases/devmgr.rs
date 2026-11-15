@@ -32,7 +32,9 @@
 //! bind's settle runs, that the settle ends no earlier than its bound with
 //! the two serving fixtures at ordinals 0 and 1 and no other, that a served
 //! fixture's death withdraws it (a call queued on it returns, its ordinal
-//! replies `WITHDRAWN`) while ordinal 1 keeps its fixture, that memmgr's
+//! replies `WITHDRAWN`) while ordinal 1 keeps its fixture, that a fault of a
+//! thread other than the main thread of the fixture at ordinal 1 withdraws
+//! it the same way, that memmgr's
 //! free pool recovers the memory the never-ready and refusing fixtures held,
 //! which only their destruction returns, and that a second `BIND_DRIVERS`
 //! over the same directory binds nothing and settles at once.
@@ -439,7 +441,8 @@ fn bind_test_drivers(devmgr_bind: u64)
 /// a driver that never reports ready; a driver that fails its bootstrap is
 /// destroyed; a served driver's death withdraws its endpoint (a call queued
 /// on it returns) and leaves a tombstone at its ordinal while the later
-/// ordinal keeps its driver; a second bind over the same directory binds
+/// ordinal keeps its driver; a fault of a served driver's worker thread
+/// withdraws it the same way; a second bind over the same directory binds
 /// nothing. A `WATCH_CLASS` watch on the class is signalled when the bind
 /// serves the fixtures and when the dead one is withdrawn, and the class
 /// holds at most `MAX_CLASS_WATCHERS` watches, a gone one dropped for a new
@@ -549,8 +552,7 @@ fn on_demand_bind_phase(caps: &Caps)
     let ping = call_fixture(again, FAULT_PING).expect("FAULT_PING on ordinal 1 failed");
     assert_eq!(ping.label, SUCCESS, "FAULT_PING reply");
 
-    // Retire the last fixture; its own withdrawal is not observed here.
-    let _ = call_fixture(second, FAULT_EXIT);
+    assert_worker_fault_withdraws(fault, again, watch.note);
     for cap in [first, second, again]
     {
         let _ = syscall::cap_delete(cap);
@@ -564,14 +566,49 @@ fn on_demand_bind_phase(caps: &Caps)
     std::os::seraph::log!(
         "devmgr_on_demand_bind passed: settle ended at its bound after {settle:?}, \
          never-ready and refusing fixtures destroyed, dead driver withdrawn, later ordinal \
-         kept, second bind settled after {rebind:?}, watch signalled on serve and withdrawal"
+         kept, driver whose worker thread faulted withdrawn, second bind settled after \
+         {rebind:?}, watch signalled on serve and withdrawals"
+    );
+}
+
+/// A fault of a thread other than the main thread of the served fixture at
+/// ordinal 1 of the `test-fault` class (`fault`), reached through `fixture`,
+/// withdraws it: the fixture replies to `FAULT_WORKER`, then receives nothing
+/// more, and a thread of its own faults while its main thread lives on.
+/// procmgr tears the fixture down, which posts no death for the main
+/// thread, so only the observer devmgr had procmgr bind on its address space
+/// sees it: the `FAULT_PING` queued meanwhile returns once devmgr withdraws
+/// the fixture, the class watch (`note`) is signalled, and the ordinal then
+/// replies `WITHDRAWN`.
+fn assert_worker_fault_withdraws(fault: u64, fixture: u64, note: u64)
+{
+    use ipc::devmgr_errors::{SUCCESS, WITHDRAWN};
+    use ipc::test_fault_labels::{FAULT_PING, FAULT_WORKER};
+
+    let _ = syscall::notification_try_wait(note);
+    let worker = call_fixture(fixture, FAULT_WORKER).expect("FAULT_WORKER call failed");
+    assert_eq!(worker.label, SUCCESS, "FAULT_WORKER reply");
+    assert!(
+        call_fixture(fixture, FAULT_PING).is_err(),
+        "a call queued on a served driver whose worker thread faulted must return an error"
+    );
+    assert_signalled(
+        note,
+        DEVICE_WAIT_MS,
+        "the fixture whose worker thread faulted was withdrawn",
+    );
+    assert_eq!(
+        query_class(fault, 1, "test-fault"),
+        Err(WITHDRAWN),
+        "the ordinal of the fixture whose worker thread faulted must reply WITHDRAWN"
     );
 }
 
 /// With every fixture gone, memmgr's free pool returns to `free_before`, its
 /// level before the bind, only if devmgr destroyed the never-ready fixture
 /// and the one that refused its bootstrap, each of which holds `HOLD_BYTES`
-/// until it is destroyed; the two serving fixtures exited and are reaped.
+/// until it is destroyed; of the two serving fixtures, one exited and one was
+/// torn down after its worker thread's fault.
 /// Half of one hold absorbs the pool's incidental movement (the fixture
 /// ELF's file-cache warming included), so either fixture left alive fails
 /// it.

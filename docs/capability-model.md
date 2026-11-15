@@ -1034,11 +1034,12 @@ terminal when:
   the fault reply is pending; or
 - the faulting thread is stopped before any reply claims the fault, which cancels the episode.
 
-On a terminal fault by any thread in the address space, the kernel posts the fault class
-(`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer
-and exits the faulting thread. A stopped faulting thread is the exception in timing only: whether
-the stop cancelled the episode or a `KILL` reply had already claimed it, the terminal fault takes
-effect, and is posted, only if the thread is started again (see
+On the first terminal fault by any thread in the address space, the kernel posts the fault class
+(`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on riscv64) to each bound observer.
+The address space dies once: a later terminal fault of another of its threads posts nothing. Every
+terminal fault exits its faulting thread. A stopped faulting thread is the exception in timing
+only: whether the stop cancelled the episode or a `KILL` reply had already claimed it, the
+terminal fault takes effect, and is posted, only if the thread is started again (see
 [Fault Handling](fault-handling.md#delivery-resume-and-kill)). The fault of a restartable syscall's
 copy of a user buffer is never terminal: in each of the cases above it fails that syscall with
 `InvalidAddress`, the thread runs on, and nothing is posted (see

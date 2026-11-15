@@ -55,18 +55,15 @@ pub struct FatfsDriver
     /// `RECV` on the driver's death queue ([`new_death_queue`]): the
     /// driver's main thread is bound to it, and procmgr binds the relay
     /// derived from it to the driver's address space, so its main thread's
-    /// exit and a terminal fault in any of its threads post to it.
+    /// exit and the first terminal fault in any of its threads post to it.
     pub death_queue: u64,
 }
 
 /// Entries a driver's death queue holds. The main-thread binding posts once,
 /// on the main thread's exit or terminal fault, and procmgr's address-space
-/// binding of the relay posts on each terminal fault in any of its threads,
-/// so a driver's death usually posts one or two entries. Any one entry
-/// reports the death: a post past the capacity, from several threads
-/// faulting before procmgr tears the process down, is dropped by the kernel
-/// (`QueueFull`) with the death already queued, so the capacity bounds no
-/// outcome.
+/// binding of the relay posts once, on the first terminal fault in any of its
+/// threads (an address space posts its observers once), so a driver's death
+/// posts one or two entries, and the queue holds every post.
 const DEATH_QUEUE_CAPACITY: u32 = 2;
 
 /// Death-observer nodes of a driver's death queue: the main-thread binding

@@ -13,6 +13,7 @@
 
 pub mod arena_reclaim;
 pub mod aspace_fault_notification_late_bind;
+pub mod aspace_fault_notification_once;
 pub mod aspace_harvest_no_fault;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
@@ -101,6 +102,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::aspace_fault_notification_late_bind",
         aspace_fault_notification_late_bind::run(ctx)
+    );
+    run_integration_test!(
+        "integration::aspace_fault_notification_once",
+        aspace_fault_notification_once::run(ctx)
     );
     run_integration_test!(
         "integration::death_observer_outlives_queue_caps",

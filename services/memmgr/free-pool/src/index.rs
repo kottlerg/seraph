@@ -193,7 +193,8 @@ impl<W: WordStore> ProcessIndex<W>
                 | Node::Frame(_)
                 | Node::ChunkDir(_)
                 | Node::Chunk(_)
-                | Node::Caps(_) => return None,
+                | Node::Caps(_)
+                | Node::Commit(_) => return None,
             }
         }
         None

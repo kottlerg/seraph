@@ -387,7 +387,8 @@ a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, process,
-  region, frame, chunk-directory, chunk, or free payload plus a `next` index)
+  process caps, region, commitment, frame, chunk-directory, chunk, or free
+  payload plus a `next` index)
   reached by a
   `u64` index, so the index never bounds the
   arena before the address space does.
@@ -431,7 +432,9 @@ pages. Refilling the free list can draw a pool frame and map it from inside a
 fault handler; this is bounded (one frame, plus its page-table funding, plus at
 most one deferred recheck per turn of the receive loop when a selection fails;
 see [Reclamation](#reclamation)), with no recursion into per-process
-accounting, and never breaks the identity.
+accounting, and never breaks the identity. For a fault in a committed region,
+the pages a growth takes are drawn from the region's metadata bound
+([Commit](#commit)).
 
 ---
 
@@ -759,8 +762,8 @@ holds no Memory caps ([Userspace Memory Model § Byte
 Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 
 **Promised.** memmgr counts in `promised` what the committed regions can still take from the free
-pool: for each, its pages that hold no frame yet, what is left of its page-table reservation, and
-a bound on the metadata its chunk table and run descriptors can take. Every admission reads the
+pool: for each, its pages that hold no frame yet, and what is left of its page-table reservation and
+of a bound on the metadata its chunk table and run descriptors can take. Every admission reads the
 free pages outside it: a grant, a committed registration or growth, an uncommitted demand run and a
 page-table donation are each admitted only when `free - promised - R >= want`, with R the system
 reserve for a charge to a node outside it and 0 for a charge to a reserve node ([Distribution
@@ -776,10 +779,12 @@ bound: for each chunk, a run descriptor for each of its pages, its leaf and its 
 directory nodes, and one directory node for each level of the table, in arena pages
 ([Chunk table](#chunk-table), [Metadata Arena](#metadata-arena)). The max of the node and its
 ancestors bounds the pages and the reservation; the metadata bound is charged to no node, as
-memmgr's metadata never is. Each part is computed from the region's whole length, so a region grown
-in many small steps is charged and promised what one registration of its final length would be;
-the reservation is that of the largest length the region has had, since a cut keeps it (Shrink and
-release below). The computation is the host-tested `free-pool` module `commit`.
+memmgr's metadata never is. The commitment's state (what is left of the reservation and of the
+metadata bound, and the largest length the region has had) takes an arena slot of its own beside the
+region's. Each part is computed from the region's whole length, so a region grown in many small
+steps is charged and promised what one registration of its final length would be; the reservation is
+that of the largest length the region has had, since a cut keeps it (Shrink and release below). The
+computation is the host-tested `free-pool` module `commit`.
 
 **Faults.** A fault in a committed region is admitted without the budget and RAM tests of an
 uncommitted one, and its run is selected as any demand run's ([Demand faults](#demand-faults)). The
@@ -807,18 +812,24 @@ other, so the process's budget and the system reserve bound what it takes, and t
 with code 10 when the max refuses even that donation, or with code 9 when the reserve does. A
 committed fault is also declined, with code 9, when its map fails as any map can: no two contiguous
 pages are free for a donation, or a thread of the process maps between the rounds of one map and
-takes the donated pages faster than four rounds fund them.
+takes the donated pages faster than four rounds fund them. The arena's growth to record a committed
+fault's run ([Metadata Arena](#metadata-arena)) is drawn from the region's metadata bound as a
+donation is from its reservation, without admission: the pages the growth takes from the pool, the
+arena page and any page tables memmgr's own map of it needs, leave the bound and `promised`, so the
+free pages outside `promised` do not fall for metadata the commitment already counts. Growth past
+what is left of the bound takes free pages outside `promised`, as an uncommitted region's does.
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops
 the directory levels the shorter region does not need, and takes back each run on them, pooled or
 deferred ([Reclamation](#reclamation)). It releases the commitment of the pages cut: the charge of
-those that held no run, and their part of `promised`. It unmaps them without reclaiming page
-tables, so the tables of the pages cut stay in the address space until the region is unregistered,
-and the region keeps its page-table reservation: a regrowth up to the largest length the region has
-had adds none. `UNREGISTER_REGION` and `PROCESS_DIED` release a committed region's whole
-commitment: the charge of its pages that hold no run and of what is left of its reservation, and
-its part of `promised`.
+those that held no run, and their part of `promised`, their metadata bound at most what is left of
+the region's. It unmaps them without reclaiming page tables, so the tables of the pages cut stay in
+the address space until the region is unregistered, and the region keeps its page-table reservation:
+a regrowth up to the largest length the region has had adds none. `UNREGISTER_REGION` and
+`PROCESS_DIED` release a committed region's whole commitment: the charge of its pages that hold no
+run and of what is left of its reservation, and its part of `promised`, what is left of its metadata
+bound with it.
 
 **Retries.** A committed registration or growth whose reply does not reach the caller is undone,
 as a grant whose reply fails is rolled back, so a caller whose call was interrupted makes it again

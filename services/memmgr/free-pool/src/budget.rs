@@ -140,7 +140,8 @@ pub fn node<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<BudgetNode>
         | Node::Process(_)
         | Node::ChunkDir(_)
         | Node::Chunk(_)
-        | Node::Caps(_) => None,
+        | Node::Caps(_)
+        | Node::Commit(_) => None,
     }
 }
 

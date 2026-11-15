@@ -14,14 +14,16 @@
 //!
 //! - **Sequenced** (every CPU count): the second thread starts only once the
 //!   first reads `Exited`, so a kernel that posts per fault posts twice.
-//! - **Concurrent** (two or more CPUs, [`CONCURRENT_ROUNDS`] rounds): the two
-//!   threads are pinned to different CPUs and started back to back, so their
-//!   records contend for the space's `death_lock`.
+//! - **Concurrent** (three or more CPUs, [`CONCURRENT_ROUNDS`] rounds): the
+//!   controller runs on [`CONTROLLER_CPU`] and the two threads are pinned to
+//!   [`FAULT_CPUS`], two other CPUs, and started back to back, so their
+//!   records can contend for the space's `death_lock`.
 //!
 //! After both threads read `Exited`, the round deletes the threads, the
-//! `CSpace` and the address space. The space's teardown stops every bound
-//! thread and waits until it runs on no CPU, so every post either fault would
-//! make has landed before the queue is read. The queue must then hold exactly
+//! `CSpace` and the address space. A thread's deletion waits until it runs on
+//! no CPU, and a faulting thread leaves its CPU only after its fault path has
+//! made its posts, so every post either fault would make has landed before
+//! the queue is read. The queue must then hold exactly
 //! one entry, with the observer's correlator and the reason
 //! `CAP_INFO_ASPACE_TERMINAL_FAULT` read back before the teardown: the first
 //! fault's. Both threads fault with the same class, so the entry's count, not
@@ -57,8 +59,11 @@ const MAX_POLLS: u32 = 2000;
 /// Concurrent rounds made with two or more CPUs, each with a fresh space.
 const CONCURRENT_ROUNDS: u32 = 8;
 
-/// The CPUs a concurrent round pins its two threads to.
-const FAULT_CPUS: [u32; 2] = [0, 1];
+/// The controller's CPU while the concurrent rounds run.
+const CONTROLLER_CPU: u32 = 0;
+/// The CPUs a concurrent round pins its two threads to, apart from the
+/// controller's, so neither waits for the controller to sleep.
+const FAULT_CPUS: [u32; 2] = [1, 2];
 
 /// How a round starts its two faulting threads.
 #[derive(Clone, Copy)]
@@ -75,11 +80,17 @@ pub fn run(ctx: &TestContext) -> TestResult
     round(ctx, Order::Sequenced)?;
     let cpus = system_info(SystemInfoType::CpuCount as u64)
         .map_err(|_| "aspace_fault_notification_once: system_info(CpuCount) failed")?;
-    if cpus < 2
+    if cpus < 3
     {
         return Ok(());
     }
-    (0..CONCURRENT_ROUNDS).try_for_each(|_| round(ctx, Order::Concurrent))
+    thread_set_affinity(ctx.thread_cap, CONTROLLER_CPU)
+        .map_err(|_| "aspace_fault_notification_once: pin controller failed")?;
+    let result = (0..CONCURRENT_ROUNDS).try_for_each(|_| round(ctx, Order::Concurrent));
+    let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
+        .map_err(|_| "aspace_fault_notification_once: restore controller affinity failed");
+    result?;
+    restore
 }
 
 /// The caps one round holds, deleted on drop, the owners before the queue, so
@@ -206,8 +217,9 @@ fn round(ctx: &TestContext, order: Order) -> TestResult
         return Err("aspace_fault_notification_once: the retained reason is not the first fault's");
     }
 
-    // The space's teardown waits until its threads run on no CPU, so every
-    // post either fault makes has landed once it returns.
+    // Each thread's deletion waits until it runs on no CPU, which a faulting
+    // thread leaves only after its posts, so every post has landed once the
+    // deletes return.
     caps.delete_owners()?;
 
     let death = event_try_recv_death(caps.eq)

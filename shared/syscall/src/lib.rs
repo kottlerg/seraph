@@ -1276,8 +1276,9 @@ pub unsafe fn thread_configure_with_tls(
 /// with no exception handler bound, or of the fault of a restartable syscall's
 /// user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), is not
 /// resumed: starting it kills it as an unhandled fault, which posts its death
-/// and address-space observers, or, for the fault of a restartable syscall's
-/// user copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
+/// observers and, when the fault is its address space's first terminal fault,
+/// the space's observers, or, for the fault of a restartable syscall's user
+/// copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
 /// § Delivery, Resume, and Kill). Starting one whose claiming reply was a
 /// `FAULT_REPLY_REDIRECT` that named an endpoint delivers the fault there. An
 /// upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or

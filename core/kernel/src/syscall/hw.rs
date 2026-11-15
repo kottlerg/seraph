@@ -26,18 +26,6 @@
 //! 4. Add a dispatch arm in `core/kernel/src/syscall/mod.rs`.
 //! 5. Add a userspace wrapper in `shared/syscall/src/lib.rs`.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        clippy::cast_possible_truncation,
-        reason = "user-supplied u64 trap-frame args are narrowed to the ABI's u32 IRQ ids, keeping \
-                  the low 32 bits (upper bits are discarded). The remaining narrowings (u64->usize \
-                  on 64-bit targets, the IoPort u32->u16 halves) are lossless or range-checked \
-                  beside the cast; the casts are in the cfg(not(test)) handlers, so the lint fires \
-                  outside the host test build alone"
-    )
-)]
-
 #[cfg(not(test))]
 use super::UserFrame;
 // The host-test stubs keep the arch frame type in their signatures.
@@ -1094,7 +1082,8 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     use crate::syscall::current_tcb;
 
     let irq_handle = tf.arg(0);
-    let split_at = tf.arg(1) as u32;
+    // The whole register: `split_range` refuses a value past the id width.
+    let split_at = tf.arg(1);
     // arg2 reserved.
 
     // ── Capability lookup ─────────────────────────────────────────────────────
@@ -1129,8 +1118,7 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     // ── Validation ────────────────────────────────────────────────────────────
 
     // split_at must lie strictly inside the cap's range.
-    let (lower_count, upper_count) =
-        split_counts(start, count, split_at).ok_or(SyscallError::InvalidArgument)?;
+    let split = split_range(start, count, split_at).ok_or(SyscallError::InvalidArgument)?;
 
     // ── Create two child InterruptObjects ─────────────────────────────────────
 
@@ -1140,9 +1128,9 @@ pub fn sys_irq_split(tf: UserFrame) -> Result<u64, SyscallError>
     // SAFETY: caller_cspace is the running thread's own CSpace, live
     // while the thread runs.
     let funder = unsafe { crate::cap::object::arena_of(caller_cspace) }?;
-    let child1_ptr = funder.alloc_body(InterruptObject::new_root(start, lower_count))?;
+    let child1_ptr = funder.alloc_body(InterruptObject::new_root(start, split.lower))?;
 
-    let child2_ptr = match funder.alloc_body(InterruptObject::new_root(split_at, upper_count))
+    let child2_ptr = match funder.alloc_body(InterruptObject::new_root(split.at, split.upper))
     {
         Ok(p) => p,
         Err(e) =>
@@ -1228,7 +1216,6 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         {
             return Err(SyscallError::InvalidArgument);
         }
-        let split_at = split_at_raw as u32;
 
         // ── Capability lookup ────────────────────────────────────────────────
 
@@ -1273,7 +1260,7 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
             u32::from(size_u16)
         };
         // split_at must lie strictly inside the cap's range.
-        let (lower_count, upper_count) = split_counts(u32::from(base), effective_size, split_at)
+        let split = split_range(u32::from(base), effective_size, split_at_raw)
             .ok_or(SyscallError::InvalidArgument)?;
 
         // ── Create two child IoPortObjects ─────────────────────────────
@@ -1282,9 +1269,13 @@ pub fn sys_ioport_split(tf: UserFrame) -> Result<u64, SyscallError>
         // least one port and the range at most 65536: neither half can be the
         // full 65536, since the split is strict.
 
-        let lower_count: u16 = lower_count as u16;
-        let upper_count: u16 = upper_count as u16;
-        let split_at_u16: u16 = split_at as u16;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the split lies strictly inside a range of at most 65536 ports starting at a \
+                      u16 base, so the split port and both halves fit a u16"
+        )]
+        let (split_at_u16, lower_count, upper_count) =
+            (split.at as u16, split.lower as u16, split.upper as u16);
 
         // The caller's CSpace, which receives both children, funds their
         // bodies from its arena (core/kernel/docs/capability-internals.md
@@ -1338,55 +1329,76 @@ pub fn sys_ioport_split(_tf: &mut TrapFrame) -> Result<u64, SyscallError>
 
 // ── Range splits ─────────────────────────────────────────────────────────────
 
-/// The counts of the two halves of the id range `[start, start + count)` split
-/// at `split_at`, lower half first, or `None` unless `split_at` lies strictly
-/// inside the range, so that each half holds at least one id. Shared by
-/// `SYS_IRQ_SPLIT` and `SYS_IOPORT_SPLIT`.
-const fn split_counts(start: u32, count: u32, split_at: u32) -> Option<(u32, u32)>
+/// A split of the id range `[start, start + count)` at the id `at`: the
+/// lower child covers `lower` ids from `start`, the upper child `upper` ids
+/// from `at`.
+struct RangeSplit
 {
-    let Some(lower) = split_at.checked_sub(start)
-    else
-    {
-        return None;
-    };
-    match count.checked_sub(lower)
-    {
-        Some(upper) if lower > 0 && upper > 0 => Some((lower, upper)),
-        _ => None,
-    }
+    at: u32,
+    lower: u32,
+    upper: u32,
+}
+
+/// The split of the id range `[start, start + count)` at `split_at`, the
+/// caller's whole argument register, or `None` unless `split_at` lies
+/// strictly inside the range, so that each half holds at least one id. A
+/// value with a bit set above the id width lies outside every range, never at
+/// the id its low bits name. Shared by `SYS_IRQ_SPLIT` and `SYS_IOPORT_SPLIT`.
+fn split_range(start: u32, count: u32, split_at: u64) -> Option<RangeSplit>
+{
+    let at = u32::try_from(split_at).ok()?;
+    let lower = at.checked_sub(start)?;
+    let upper = count.checked_sub(lower)?;
+    (lower > 0 && upper > 0).then_some(RangeSplit { at, lower, upper })
 }
 
 #[cfg(test)]
 mod tests
 {
-    use super::split_counts;
+    use super::split_range;
+
+    /// The split as `(at, lower, upper)`, for comparison.
+    fn split(start: u32, count: u32, split_at: u64) -> Option<(u32, u32, u32)>
+    {
+        split_range(start, count, split_at).map(|s| (s.at, s.lower, s.upper))
+    }
 
     // Defect guarded: halves computed from the wrong end, or a full-port-space
     // range whose end passes the u16 ports, would mint children that do not
     // cover the parent exactly.
     #[test]
-    fn split_counts_divides_a_range_at_an_inner_id()
+    fn split_range_divides_a_range_at_an_inner_id()
     {
-        assert_eq!(split_counts(32, 16, 33), Some((1, 15)));
-        assert_eq!(split_counts(32, 16, 47), Some((15, 1)));
+        assert_eq!(split(32, 16, 33), Some((33, 1, 15)));
+        assert_eq!(split(32, 16, 47), Some((47, 15, 1)));
         // The full I/O port space, as `SYS_IOPORT_SPLIT` passes it.
-        assert_eq!(split_counts(0, 65536, 0xFFFF), Some((0xFFFF, 1)));
+        assert_eq!(split(0, 65536, 0xFFFF), Some((0xFFFF, 0xFFFF, 1)));
     }
 
     // Defect guarded: a split point on or outside the range accepted, which
     // would mint an empty child or one whose count wrapped.
     #[test]
-    fn split_counts_refuses_a_split_on_or_outside_the_range()
+    fn split_range_refuses_a_split_on_or_outside_the_range()
     {
         // At the start or the end: one half would be empty.
-        assert_eq!(split_counts(32, 16, 32), None);
-        assert_eq!(split_counts(32, 16, 48), None);
+        assert_eq!(split(32, 16, 32), None);
+        assert_eq!(split(32, 16, 48), None);
         // Below the start, where the lower count would underflow.
-        assert_eq!(split_counts(32, 16, 0), None);
+        assert_eq!(split(32, 16, 0), None);
         // Past the end, where the upper count would underflow.
-        assert_eq!(split_counts(32, 16, u32::MAX), None);
+        assert_eq!(split(32, 16, u64::from(u32::MAX)), None);
         // A single id has no inner split point.
-        assert_eq!(split_counts(7, 1, 7), None);
-        assert_eq!(split_counts(7, 1, 8), None);
+        assert_eq!(split(7, 1, 7), None);
+        assert_eq!(split(7, 1, 8), None);
+    }
+
+    // Defect guarded: a register narrowed to its low 32 bits before the range
+    // check, which would split `[4, 8)` at 5 for `0x1_0000_0005`.
+    #[test]
+    fn split_range_refuses_a_register_past_the_id_width()
+    {
+        assert_eq!(split(4, 4, 5), Some((5, 1, 3)));
+        assert_eq!(split(4, 4, 0x1_0000_0005), None);
+        assert_eq!(split(0, u32::MAX, u64::MAX), None);
     }
 }

@@ -44,22 +44,23 @@ extern crate rustc_std_workspace_core as core;
 use core::prelude::rust_2024::*;
 
 use syscall_abi::{
-    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY,
-    SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT,
-    SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD,
-    SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO,
-    SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV,
-    SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL,
-    SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP,
-    SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE,
-    SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT,
-    SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
-    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
-    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_MEM,
-    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    MEM_UNMAP_RECLAIM_PTS, MSG_DATA_WORDS_MAX, SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_HARVEST,
+    SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
+    SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
+    SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENTROPY_CONTRIBUTE,
+    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
+    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC,
+    SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
+    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
+    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
+    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
+    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_POST_UPCALL,
+    SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
+    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -70,16 +71,16 @@ pub use syscall_abi::{
     CAP_INFO_MEMORY_SIZE, CAP_INFO_SOLE_REFERENCE, CAP_INFO_TAG_RIGHTS, CAP_TAG_MEMORY,
     CAP_TAG_NOTIFICATION, EXIT_FAULT_BASE, EXIT_KILLED, EXIT_VOLUNTARY, IPC_REPLY_TRANSFER_FAILED,
     IRQ_MODE_ACTIVE_LOW, IRQ_MODE_LEVEL, IRQ_MODE_MASK, MAP_EXECUTABLE, MAP_FROM_CAP, MAP_READ,
-    MAP_WRITABLE, MAX_ENTROPY_CONTRIBUTE_LEN, MAX_GETRANDOM_LEN, RIGHTS_ALL, RIGHTS_AS_CONTROL,
-    RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE, RIGHTS_CS_DERIVE,
-    RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_ENTROPY_CONTRIBUTE, RIGHTS_EP_GRANT,
-    RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST, RIGHTS_EQ_RECV,
-    RIGHTS_IOPORT_USE, RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE, RIGHTS_MEM_MAP,
-    RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE, RIGHTS_MEM_WRITE,
-    RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT, RIGHTS_SBI_BASE,
-    RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET, RIGHTS_SBI_SUSPEND,
-    RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE, RIGHTS_THREAD_UPCALL,
-    RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
+    MAP_WRITABLE, MAX_ENTROPY_CONTRIBUTE_LEN, MAX_GETRANDOM_LEN, MAX_HARVEST_PAGES, RIGHTS_ALL,
+    RIGHTS_AS_CONTROL, RIGHTS_AS_MAP, RIGHTS_AS_READ, RIGHTS_CS_ALL, RIGHTS_CS_DELETE,
+    RIGHTS_CS_DERIVE, RIGHTS_CS_INSERT, RIGHTS_CS_REVOKE, RIGHTS_ENTROPY_CONTRIBUTE,
+    RIGHTS_EP_GRANT, RIGHTS_EP_RECEIVE, RIGHTS_EP_SEND, RIGHTS_EP_SEND_GRANT, RIGHTS_EQ_POST,
+    RIGHTS_EQ_RECV, RIGHTS_IOPORT_USE, RIGHTS_IRQ_MINT, RIGHTS_IRQ_NOTIFY, RIGHTS_MEM_EXECUTE,
+    RIGHTS_MEM_MAP, RIGHTS_MEM_MAP_RW, RIGHTS_MEM_MAP_RX, RIGHTS_MEM_PHYS, RIGHTS_MEM_RETYPE,
+    RIGHTS_MEM_WRITE, RIGHTS_MMIO_MAP, RIGHTS_MMIO_WRITE, RIGHTS_NTF_NOTIFY, RIGHTS_NTF_WAIT,
+    RIGHTS_SBI_BASE, RIGHTS_SBI_CPPC, RIGHTS_SBI_DBCN, RIGHTS_SBI_PMU, RIGHTS_SBI_RESET,
+    RIGHTS_SBI_SUSPEND, RIGHTS_THREAD, RIGHTS_THREAD_CONTROL, RIGHTS_THREAD_OBSERVE,
+    RIGHTS_THREAD_UPCALL, RIGHTS_WS_MODIFY, RIGHTS_WS_WAIT, WAIT_TRY_ONCE,
 };
 
 // ── Raw syscall entry ─────────────────────────────────────────────────────────
@@ -673,8 +674,9 @@ pub fn raw_cap_create_cspace(
 ///
 /// `memory_cap` must carry `MemRights::RETYPE` and have at least
 /// `SystemInfoType::ThreadRetypeBytes` of `available_bytes` (1 guard page, 4
-/// kstack pages, 1 page for the wrapper and TCB, and the FPU/SIMD/V save-area pages the
-/// boot CPU sizes; see `cap::retype::dispatch_for(Thread)`).
+/// kstack pages, 1 page for the wrapper and TCB, the FPU/SIMD/V save-area pages the
+/// boot CPU sizes, and one shadow-stack page when the kernel runs on shadow stacks; see
+/// `cap::retype::dispatch_for(Thread)`).
 ///
 /// Creation priority: with `sched_cap == 0`, `priority` must also be 0 and
 /// the thread is created at `PRIORITY_MIN` (floor-only creation needs no
@@ -1275,8 +1277,9 @@ pub unsafe fn thread_configure_with_tls(
 /// with no exception handler bound, or of the fault of a restartable syscall's
 /// user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), is not
 /// resumed: starting it kills it as an unhandled fault, which posts its death
-/// and address-space observers, or, for the fault of a restartable syscall's
-/// user copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
+/// observers and, when the fault is its address space's first terminal fault,
+/// the space's observers, or, for the fault of a restartable syscall's user
+/// copy, fails that syscall with `InvalidAddress` (docs/fault-handling.md
 /// § Delivery, Resume, and Kill). Starting one whose claiming reply was a
 /// `FAULT_REPLY_REDIRECT` that named an endpoint delivers the fault there. An
 /// upcall delivery (`FAULT_KIND_UPCALL`) that a stop cancelled, or
@@ -1855,6 +1858,76 @@ pub fn aspace_query(aspace_cap: u64, virt: u64) -> Result<u64, i64>
     // SAFETY: syscall2 issues raw syscall instruction; aspace_cap is cap index as u64, virt is
     // virtual address; kernel validates cap and mapping, returns physical address.
     let ret = unsafe { syscall2(SYS_ASPACE_QUERY, aspace_cap, virt) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Read and clear the accessed bit of each mapped page of the `pages` pages
+/// from `virt` in an address space, writing one bit per page into `bitmap`:
+/// page `i` is bit `i % 8` of `bitmap[i / 8]`, set when the page was accessed
+/// (or mapped, or its rights changed) since its previous harvest, and clear
+/// when it was not or is unmapped. Bytes past `pages.div_ceil(8)` are left as
+/// they are.
+///
+/// `aspace_cap` — capability handle of the `AddressSpace` (must have MAP).
+/// `pages` — `1..=MAX_HARVEST_PAGES`.
+///
+/// Returns the number of pages reported accessed. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ASPACE_HARVEST` (66).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` (`pages` zero or
+/// above `MAX_HARVEST_PAGES`, or `bitmap` shorter than `pages.div_ceil(8)`
+/// bytes), `InvalidAddress` (`virt` unaligned or the range outside the user
+/// half), `InvalidCapability`, or `InsufficientRights` (cap lacks MAP).
+#[inline]
+pub fn aspace_harvest(aspace_cap: u64, virt: u64, pages: u64, bitmap: &mut [u8])
+-> Result<u64, i64>
+{
+    if (bitmap.len() as u64) < pages.div_ceil(8)
+    {
+        return Err(SyscallError::InvalidArgument as i64);
+    }
+    // SAFETY: `bitmap` is a live, exclusively borrowed slice holding the
+    // `pages.div_ceil(8)` bytes the kernel writes, and any byte is a valid `u8`.
+    unsafe { aspace_harvest_raw(aspace_cap, virt, pages, bitmap.as_mut_ptr()) }
+}
+
+/// Raw `SYS_ASPACE_HARVEST`: the kernel writes `pages.div_ceil(8)` bytes
+/// through `bitmap`.
+///
+/// For harness tests of the kernel's own bitmap validation, which must hand
+/// it a pointer no slice can name (a null, unmapped, or kernel-half address).
+/// Everything else uses [`aspace_harvest`].
+///
+/// # Safety
+/// The span `[bitmap, bitmap + pages.div_ceil(8))` must be valid for writes
+/// and name no memory a live Rust reference covers, or the kernel must refuse
+/// the call (a span not wholly in the user half, or one whose fault no bound
+/// fault handler resolves, is refused with no accessed bit changed). The call
+/// is restartable: with a fault handler bound, a fault on the span is
+/// delivered to it and the call re-executes on resume
+/// (`core/kernel/docs/syscalls.md` § Restartable Syscalls).
+///
+/// # Errors
+/// As [`aspace_harvest`], without its length check; `InvalidAddress` also if
+/// `bitmap` is null, the span is not wholly in the user half, or a fault on
+/// it is unhandled.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ret is proven non-negative in the Ok branch; it is a page count"
+)]
+#[inline]
+pub unsafe fn aspace_harvest_raw(
+    aspace_cap: u64,
+    virt: u64,
+    pages: u64,
+    bitmap: *mut u8,
+) -> Result<u64, i64>
+{
+    // SAFETY: syscall4 issues the raw syscall; the caller's contract makes the
+    // bitmap span valid for the kernel's writes or one the kernel refuses; the
+    // call changes no mapping, IPC page, or thread entry state.
+    let ret = unsafe { syscall4(SYS_ASPACE_HARVEST, aspace_cap, virt, pages, bitmap as u64) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
@@ -3169,12 +3242,14 @@ pub fn thread_bind_notification(
 
 /// Register a terminal-fault death-notification observer on an address space.
 ///
-/// When a thread in the target address space takes a *terminal* fault, the
-/// kernel posts the two-word entry `(exit_reason, correlator)` to
-/// `event_queue_cap` (see [`DeathEvent`]), where `exit_reason` is the fault class
-/// (`EXIT_FAULT_BASE + vector` on x86-64, `EXIT_FAULT_BASE + cause` on
-/// riscv64). A fault of a thread's own access is terminal on any kill outcome
-/// of the fault protocol:
+/// When a thread in the target address space takes the space's first
+/// *terminal* fault, the kernel posts the two-word entry
+/// `(exit_reason, correlator)` to `event_queue_cap` (see [`DeathEvent`]), where
+/// `exit_reason` is the fault class (`EXIT_FAULT_BASE + vector` on x86-64,
+/// `EXIT_FAULT_BASE + cause` on riscv64). The space dies once: a later
+/// terminal fault of another of its threads posts nothing, so a binding
+/// receives one entry. A fault of a thread's own access is terminal on any kill
+/// outcome of the fault protocol:
 ///
 /// - no fault handler bound;
 /// - a `KILL` reply;

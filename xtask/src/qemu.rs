@@ -137,6 +137,99 @@ impl X86Paging
     }
 }
 
+/// Whether an x86-64 guest CPU offers CET supervisor shadow stacks.
+///
+/// Pins the guest CPU's `cet-ss` property on every accelerator, so whether
+/// the kernel runs on shadow stacks is the run's choice and never the host's:
+/// `-cpu host` would otherwise pass `CET_SS` through wherever the host's KVM
+/// offers it. A QEMU without the property (the 10.2 of the CI image among
+/// them) cannot offer the feature at all, so the default gets no pin there
+/// and a request for the feature is refused ([`qemu_knows_cet_ss`]). The
+/// default leaves them off; the cet cell boots them on
+/// (`cargo xtask test-cet`, docs/testing.md "Coverage tiers").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum X86ShadowStack
+{
+    /// No `CET_SS` in the guest's CPUID (`cet-ss=off`) — the default.
+    Off,
+    /// `CET_SS` in the guest's CPUID, or no boot (`cet-ss=on,enforce`):
+    /// QEMU refuses to start when the accelerator cannot provide it, which
+    /// TCG never can, rather than booting without it.
+    On,
+}
+
+impl X86ShadowStack
+{
+    /// `-cpu` property suffix that pins the guest's `CET_SS` bit, given
+    /// whether the QEMU launched knows the `cet-ss` property
+    /// ([`X86Host::qemu_has_cet_ss`]): none for `Off` on a QEMU that does
+    /// not, which cannot offer the feature.
+    ///
+    /// # Errors
+    /// `On` on a QEMU without the property, which would refuse the launch.
+    fn cpu_cet_ss_prop(self, host: X86Host) -> Result<&'static str>
+    {
+        match (self, host.qemu_has_cet_ss)
+        {
+            (Self::Off, true) => Ok(",cet-ss=off"),
+            (Self::Off, false) => Ok(""),
+            (Self::On, true) => Ok(",cet-ss=on,enforce"),
+            (Self::On, false) => bail!(
+                "--x86-shadow-stack on needs a QEMU whose x86-64 CPU has the cet-ss property, \
+                 which {} does not list in `-cpu help`",
+                Arch::X86_64.qemu_binary()
+            ),
+        }
+    }
+}
+
+/// Whether the `x86_64` QEMU knows the `cet-ss` CPU property, read once per
+/// process from `-cpu help`. A QEMU that cannot be run reads as not knowing
+/// it; its launch then fails on its own.
+fn qemu_knows_cet_ss() -> bool
+{
+    static KNOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *KNOWS.get_or_init(|| {
+        Command::new(Arch::X86_64.qemu_binary())
+            .args(["-cpu", "help"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| lists_cpu_flag(&String::from_utf8_lossy(&out.stdout), "cet-ss"))
+    })
+}
+
+/// Whether `flag` is among the CPUID flags of a QEMU's `-cpu help` output,
+/// which lists them after its `Recognized CPUID flags:` heading.
+fn lists_cpu_flag(help: &str, flag: &str) -> bool
+{
+    help.split_once("Recognized CPUID flags:")
+        .is_some_and(|(_, flags)| flags.split_whitespace().any(|f| f == flag))
+}
+
+/// The host facts an `x86_64` launch's CPU model depends on.
+#[derive(Clone, Copy, Debug)]
+struct X86Host
+{
+    /// Whether the host CPU reports LA57 ([`host_cpu_has_la57`]).
+    cpu_has_la57: bool,
+    /// Whether the QEMU launched knows the `cet-ss` CPU property
+    /// ([`qemu_knows_cet_ss`]).
+    qemu_has_cet_ss: bool,
+}
+
+impl X86Host
+{
+    /// The facts of this host and its `x86_64` QEMU.
+    fn probe() -> Self
+    {
+        Self {
+            cpu_has_la57: host_cpu_has_la57(),
+            qemu_has_cet_ss: qemu_knows_cet_ss(),
+        }
+    }
+}
+
 /// The DMA test device a test launch attaches (`--test-devices`): QEMU's
 /// `edu` (PCI `1234:11e8`), its DMA mask widened from the default 28 bits to
 /// 32, so its DMA engine reaches the interrupt addresses svctest's
@@ -353,6 +446,9 @@ pub struct QemuLaunchSpec<'a>
     pub riscv_zkr: RiscvZkr,
     /// Guest paging depth; `x86_64` only, ignored on riscv64.
     pub x86_paging: X86Paging,
+    /// Whether the guest CPU offers CET shadow stacks; `x86_64` only, ignored
+    /// on riscv64.
+    pub x86_shadow_stack: X86ShadowStack,
     /// Whether the machine's IOMMU is attached; every launch site attaches it
     /// unless the run asks for the no-IOMMU variant (`--iommu absent`).
     pub iommu: Iommu,
@@ -503,7 +599,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
     let accel = accel::detect_for_arch(spec.arch);
     match spec.arch
     {
-        Arch::X86_64 => extend_x86(&mut args, spec, accel, host_cpu_has_la57())?,
+        Arch::X86_64 => extend_x86(&mut args, spec, accel, X86Host::probe())?,
         Arch::Riscv64 => extend_riscv(&mut args, spec)?,
     }
 
@@ -644,20 +740,21 @@ fn check_x86_paging(paging: X86Paging, accel: Accel, host_has_la57: bool) -> Res
     Ok(())
 }
 
-#[expect(
-    clippy::fn_params_excessive_bools,
-    reason = "`host_has_la57` is whether the host CPU reports LA57, a host fact the function \
-              passes to `check_x86_paging`"
-)]
 fn extend_x86(
     args: &mut Vec<String>,
     spec: &QemuLaunchSpec,
     accel: Accel,
-    host_has_la57: bool,
+    host: X86Host,
 ) -> Result<()>
 {
-    check_x86_paging(spec.x86_paging, accel, host_has_la57)?;
-    let la57 = spec.x86_paging.cpu_la57_prop();
+    check_x86_paging(spec.x86_paging, accel, host.cpu_has_la57)?;
+    // The `-cpu` properties every accelerator's model takes: the paging
+    // depth and the shadow-stack feature, each pinned to the run's request.
+    let props = format!(
+        "{}{}",
+        spec.x86_paging.cpu_la57_prop(),
+        spec.x86_shadow_stack.cpu_cet_ss_prop(host)?
+    );
     let iommu = spec.iommu == Iommu::Attached;
     // VT-d interrupt remapping needs the I/O APIC emulated outside KVM,
     // which QEMU otherwise refuses.
@@ -698,7 +795,7 @@ fn extend_x86(
             // -cpu host inherits the development host's microarchitecture;
             // the kernel asserts x86-64-v3 in early init, so the host must
             // advertise AVX2/BMI2/FMA (Haswell+ / Excavator+).
-            args.extend(["-enable-kvm".into(), "-cpu".into(), format!("host{la57}")]);
+            args.extend(["-enable-kvm".into(), "-cpu".into(), format!("host{props}")]);
         }
         Accel::Hvf =>
         {
@@ -708,7 +805,7 @@ fn extend_x86(
                 "-accel".into(),
                 "hvf".into(),
                 "-cpu".into(),
-                format!("host{la57}"),
+                format!("host{props}"),
             ]);
         }
         Accel::Whpx =>
@@ -720,7 +817,7 @@ fn extend_x86(
                 "-accel".into(),
                 "whpx".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{la57}"),
+                format!("max,migratable=no{props}"),
             ]);
         }
         Accel::Nvmm =>
@@ -729,7 +826,7 @@ fn extend_x86(
                 "-accel".into(),
                 "nvmm".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{la57}"),
+                format!("max,migratable=no{props}"),
             ]);
         }
         Accel::Tcg =>
@@ -742,7 +839,7 @@ fn extend_x86(
                 "-accel".into(),
                 "tcg,thread=multi".into(),
                 "-cpu".into(),
-                format!("max,migratable=no{la57}"),
+                format!("max,migratable=no{props}"),
             ]);
         }
     }
@@ -788,13 +885,17 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     // grants S-mode when the hart has it, so the kernel's hardware RNG draws
     // from it; the source is optional, and `--riscv-zkr off` boots without it.
     //
+    // `svadu=off,svade=on` pins the Svade A/D scheme the kernel requires: the
+    // rv64 model enables Svadu, under which the hart sets A and D itself and
+    // the kernel's software A/D update (`user_fault_is_spurious`) never runs.
+    //
     // The trailing satp-mode properties (`RiscvMmu::cpu_satp_props`) pin the
     // paging-mode ceiling the guest advertises via DTB `mmu-type`.
     args.extend([
         "-cpu".into(),
         format!(
             "rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,\
-             ssaia=on,smaia=on,smstateen=on{}{}",
+             ssaia=on,smaia=on,smstateen=on,svadu=off,svade=on{}{}",
             spec.riscv_zkr.cpu_zkr_prop(),
             spec.riscv_mmu.cpu_satp_props()
         ),
@@ -1069,6 +1170,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
             x86_paging: X86Paging::Four,
+            x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
@@ -1158,6 +1260,15 @@ mod tests
     }
 
     #[test]
+    fn riscv_cpu_pins_svade()
+    {
+        // The rv64 model enables Svadu, so without the pin the hart sets A
+        // and D itself and the kernel's Svade A/D update is never exercised.
+        let argv = build_qemu_argv(&riscv_spec(1, 512)).unwrap();
+        assert!(cpu_arg(&argv).contains(",svadu=off,svade=on"));
+    }
+
+    #[test]
     fn argv_reflects_cpus_and_mem()
     {
         let argv = build_qemu_argv(&riscv_spec(4, 512)).unwrap();
@@ -1207,6 +1318,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
             x86_paging: X86Paging::Four,
+            x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
@@ -1216,6 +1328,12 @@ mod tests
         let inc = argv.iter().position(|a| a == "-incoming").unwrap();
         assert_eq!(argv[inc + 1], "exec:cat state.bin");
     }
+
+    /// A host with every `x86_64` fact a launch can use.
+    const HOST: X86Host = X86Host {
+        cpu_has_la57: true,
+        qemu_has_cet_ss: true,
+    };
 
     fn x86_spec(x86_paging: X86Paging) -> QemuLaunchSpec<'static>
     {
@@ -1236,6 +1354,7 @@ mod tests
             riscv_mmu: RiscvMmu::Sv48,
             riscv_zkr: RiscvZkr::On,
             x86_paging,
+            x86_shadow_stack: X86ShadowStack::Off,
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
@@ -1284,7 +1403,7 @@ mod tests
                 let mut spec = x86_spec(X86Paging::Four);
                 spec.iommu = iommu;
                 let mut argv = Vec::new();
-                extend_x86(&mut argv, &spec, accel, true).unwrap();
+                extend_x86(&mut argv, &spec, accel, HOST).unwrap();
                 let split = accel == Accel::Kvm && iommu == Iommu::Attached;
                 let expected = if split
                 {
@@ -1316,10 +1435,86 @@ mod tests
             ]
             {
                 let mut argv = Vec::new();
-                extend_x86(&mut argv, &x86_spec(paging), accel, true).unwrap();
-                assert!(cpu_arg(&argv).ends_with(prop), "{accel:?} {paging:?}");
+                extend_x86(&mut argv, &x86_spec(paging), accel, HOST).unwrap();
+                assert!(cpu_arg(&argv).contains(prop), "{accel:?} {paging:?}");
             }
         }
+    }
+
+    // The defect caught: a CPU model that leaves `cet-ss` to the host, so an
+    // ordinary boot on a host whose KVM offers `CET_SS` runs on shadow stacks
+    // and its outcome depends on the host, or a request for them that boots
+    // without them.
+    #[test]
+    fn x86_cpu_pins_cet_ss_to_the_request_on_every_accelerator()
+    {
+        for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
+        {
+            for (shadow_stack, props) in [
+                (X86ShadowStack::Off, ",la57=off,cet-ss=off"),
+                (X86ShadowStack::On, ",la57=off,cet-ss=on,enforce"),
+            ]
+            {
+                let mut spec = x86_spec(X86Paging::Four);
+                spec.x86_shadow_stack = shadow_stack;
+                let mut argv = Vec::new();
+                extend_x86(&mut argv, &spec, accel, HOST).unwrap();
+                assert!(
+                    cpu_arg(&argv).ends_with(props),
+                    "{accel:?} {shadow_stack:?}: {}",
+                    cpu_arg(&argv)
+                );
+            }
+        }
+    }
+
+    // The defect caught: a default launch that names `cet-ss` to a QEMU
+    // without the property, which refuses to start (the CI image's 10.2), or
+    // a request for shadow stacks passed to such a QEMU instead of refused
+    // with the reason.
+    #[test]
+    fn a_qemu_without_cet_ss_gets_no_pin_and_refuses_a_request()
+    {
+        let host = X86Host {
+            qemu_has_cet_ss: false,
+            ..HOST
+        };
+        for accel in [Accel::Kvm, Accel::Hvf, Accel::Whpx, Accel::Nvmm, Accel::Tcg]
+        {
+            let mut argv = Vec::new();
+            extend_x86(&mut argv, &x86_spec(X86Paging::Four), accel, host).unwrap();
+            assert!(
+                cpu_arg(&argv).ends_with(",la57=off"),
+                "{accel:?}: {}",
+                cpu_arg(&argv)
+            );
+            assert!(!cpu_arg(&argv).contains("cet-ss"), "{accel:?}");
+
+            let mut spec = x86_spec(X86Paging::Four);
+            spec.x86_shadow_stack = X86ShadowStack::On;
+            let err = extend_x86(&mut Vec::new(), &spec, accel, host).unwrap_err();
+            assert!(err.to_string().contains("cet-ss"), "{accel:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_cpu_help_flag_list_is_what_names_cet_ss()
+    {
+        // Abridged from QEMU 11.1's output: a model line names the flag
+        // before the list does, so only the list counts.
+        let knows = "Available CPUs:\n  SapphireRapids-v5     Intel Xeon Processor \
+                     (SapphireRapids) [with cet-ss and cet-ibt]\n\nRecognized CPUID flags:\n  \
+                     3dnow abm\n  cet-ss cid cldemote\n";
+        assert!(lists_cpu_flag(knows, "cet-ss"));
+        // QEMU 10.2's list, which has no CET flag.
+        let lacks = "Available CPUs:\n  max\n\nRecognized CPUID flags:\n  3dnow abm\n  \
+                     cid cldemote\n";
+        assert!(!lists_cpu_flag(lacks, "cet-ss"));
+        assert!(!lists_cpu_flag(
+            "  SapphireRapids-v5 [with cet-ss]\n",
+            "cet-ss"
+        ));
+        assert!(!lists_cpu_flag(knows, "cet"));
     }
 
     #[test]

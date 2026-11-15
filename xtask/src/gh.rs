@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use serde_json::Value;
+use json::Value;
 
 use crate::util::require_tool;
 
@@ -41,7 +41,7 @@ pub fn run(root: &Path, args: &[&str]) -> Result<String>
 pub fn json(root: &Path, args: &[&str]) -> Result<Value>
 {
     let out = run(root, args)?;
-    serde_json::from_str(&out).with_context(|| format!("gh {} returned no JSON", args.join(" ")))
+    json::parse(&out).with_context(|| format!("gh {} returned no JSON", args.join(" ")))
 }
 
 /// An Issue's number, title, body, milestone, labels, and state.

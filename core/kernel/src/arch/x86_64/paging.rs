@@ -56,6 +56,14 @@ const PWT: u64 = 1 << 3;
 /// with PWT it selects strong UC (PAT entry 3) under the power-on default PAT,
 /// which the kernel does not reprogram.
 const PCD: u64 = 1 << 4;
+/// Accessed (A) — the processor sets it on the first access through a leaf;
+/// the kernel pre-sets it in every leaf it builds, as on RISC-V, so a leaf the
+/// kernel installs or rewrites reads accessed until `SYS_ASPACE_HARVEST`
+/// clears it ([`clear_user_accessed`]).
+const ACCESSED: u64 = 1 << 5;
+/// Dirty — set by the processor on a write through a leaf; with R/W clear it
+/// marks a shadow-stack page while `CR4.CET` is set.
+const DIRTY: u64 = 1 << 6;
 /// Page Size (PS) — set in a PDE/PDPTE to make it a large-page leaf.
 const LARGE_PAGE: u64 = 1 << 7;
 /// No-Execute — blocks instruction fetch; requires `IA32_EFER.NXE` = 1.
@@ -114,7 +122,7 @@ impl PageTableEntry
     pub fn new_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
-        let mut bits = PRESENT | (phys & PHYS_MASK);
+        let mut bits = PRESENT | ACCESSED | (phys & PHYS_MASK);
         if flags.writable
         {
             bits |= WRITABLE;
@@ -133,13 +141,26 @@ impl PageTableEntry
         Self(bits)
     }
 
+    /// Construct a 4 KiB supervisor shadow-stack leaf for `phys`: present,
+    /// R/W clear and Dirty set (the shadow-stack encoding while `CR4.CET` is
+    /// set), accessed as every leaf the kernel builds, supervisor-only, never
+    /// executable, write-back. Ordinary stores fault on it; `CALL`, the
+    /// shadow-stack instructions and event delivery write it. Every table
+    /// entry above it on the walk keeps R/W set ([`Self::new_table`]), which
+    /// the encoding requires.
+    pub fn new_shadow_stack_page(phys: u64) -> Self
+    {
+        debug_assert!(phys & 0xFFF == 0, "page PA not 4 KiB-aligned");
+        Self(PRESENT | ACCESSED | DIRTY | NO_EXECUTE | (phys & PHYS_MASK))
+    }
+
     /// Construct a 2 MiB large-page entry (PS bit set in a PDE) with `flags`.
     ///
     /// `phys` must be 2 MiB-aligned.
     pub fn new_large_page(phys: u64, flags: PageFlags) -> Self
     {
         debug_assert!(phys & 0x1F_FFFF == 0, "large page PA not 2 MiB-aligned");
-        let mut bits = PRESENT | LARGE_PAGE | (phys & PHYS_MASK);
+        let mut bits = PRESENT | ACCESSED | LARGE_PAGE | (phys & PHYS_MASK);
         if flags.writable
         {
             bits |= WRITABLE;
@@ -1275,6 +1296,152 @@ unsafe fn walk_leaves(
     }
 }
 
+// ── Accessed-bit harvest ──────────────────────────────────────────────────────
+
+/// The leaf `slot` as an atomic word. The processor sets a leaf's A and D bits
+/// with locked updates whatever lock the kernel holds, so a harvest updates the
+/// word atomically and loses none of them.
+#[cfg(not(test))]
+fn leaf_word(slot: &mut PageTableEntry) -> &AtomicU64
+{
+    // SAFETY: `PageTableEntry` is `repr(transparent)` over `u64`, so `slot` is
+    // a valid, 8-byte-aligned `u64` for the borrow's lifetime, and every
+    // concurrent access to a leaf's A and D bits is atomic (see above).
+    unsafe { AtomicU64::from_ptr(core::ptr::from_mut(slot).cast::<u64>()) }
+}
+
+/// Pass the VA of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)`, in the page table rooted at
+/// `root_virt`, whose accessed bit (A) is set to `on_accessed`, in VA order.
+/// Changes no leaf.
+///
+/// # Safety
+/// `root_virt` must be the direct-map VA of a valid 4 KiB user root frame, the
+/// caller must hold the address space's `pt_lock`, and the span must lie in
+/// the user half.
+#[cfg(not(test))]
+pub unsafe fn read_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_accessed: &mut dyn FnMut(u64),
+)
+{
+    // SAFETY: root_virt is the direct-map VA of a valid root, and pt_lock is
+    // held (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |slot, va| {
+            if slot.is_present() && leaf_word(slot).load(Ordering::Relaxed) & ACCESSED != 0
+            {
+                on_accessed(va);
+            }
+        });
+    }
+}
+
+/// Clear the accessed bit (A) of each present 4 KiB leaf of
+/// `[virt_base, virt_base + page_count * 4 KiB)` whose VA `reported` names
+/// (the pages a [`read_user_accessed`] found accessed). A page unmapped since
+/// is skipped.
+///
+/// Flushes no TLB: a CPU that still caches the leaf completes accesses without
+/// setting A again, so the next harvest under-reports that page
+/// ([memory-internals.md](../../../docs/memory-internals.md) § Accessed Bits).
+///
+/// # Safety
+/// As [`read_user_accessed`].
+#[cfg(not(test))]
+pub unsafe fn clear_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    reported: &dyn Fn(u64) -> bool,
+)
+{
+    // SAFETY: as for read_user_accessed (caller's contract).
+    unsafe {
+        for_each_leaf_slot(root_virt, virt_base, page_count, &mut |slot, va| {
+            if slot.is_present() && reported(va)
+            {
+                leaf_word(slot).fetch_and(!ACCESSED, Ordering::Relaxed);
+            }
+        });
+    }
+}
+
+/// Pass the slot of each page VA of
+/// `[virt_base, virt_base + page_count * 4 KiB)` that a present page table
+/// covers, with the VA, to `on_slot`, in VA order.
+///
+/// # Safety
+/// As [`read_user_accessed`].
+#[cfg(not(test))]
+unsafe fn for_each_leaf_slot(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_slot: &mut dyn FnMut(&mut PageTableEntry, u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+
+    // The caller's span lies in the user half, so neither operation saturates.
+    let virt_end = virt_base.saturating_add((page_count as u64).saturating_mul(PAGE_SIZE as u64));
+    // SAFETY: root_virt is the direct-map VA of a valid root (caller's contract).
+    let root = unsafe { table_at(root_virt) };
+    // SAFETY: root is a live table at the root level; pt_lock is held.
+    unsafe { walk_leaf_slots(root, root_level(), virt_base, virt_end, on_slot) };
+}
+
+/// Pass the slot of each page VA of `[lo, hi)` under `table` (a table at
+/// `level`) that a present page table covers, with the VA, to `on_slot`.
+/// Large-page leaves are skipped, as in [`unmap_user_region_pooled`]. Bounded
+/// recursion: `level <= 4`.
+///
+/// # Safety
+/// `table` must be a live table at `level` whose reachable child frames are
+/// live; the caller must hold the address space's `pt_lock`.
+#[cfg(not(test))]
+unsafe fn walk_leaf_slots(
+    table: &mut [PageTableEntry; 512],
+    level: usize,
+    lo: u64,
+    hi: u64,
+    on_slot: &mut dyn FnMut(&mut PageTableEntry, u64),
+)
+{
+    use crate::mm::PAGE_SIZE;
+    use crate::mm::paging::phys_to_virt;
+
+    let Some(child_level) = level.checked_sub(1)
+    else
+    {
+        for va in (lo..hi).step_by(PAGE_SIZE)
+        {
+            if let Some(slot) = entry_mut(table, 0, va)
+            {
+                on_slot(slot, va);
+            }
+        }
+        return;
+    };
+
+    let mut va = lo;
+    while va < hi
+    {
+        let entry_end = hi.min(next_level_boundary(level, va));
+        if let Some(e) = entry(table, level, va)
+            && names_table(e, level)
+        {
+            // SAFETY: a present non-leaf entry points at a live child table.
+            let child = unsafe { table_at(phys_to_virt(e.phys_addr())) };
+            // SAFETY: child is a live table at child_level (this call's contract).
+            unsafe { walk_leaf_slots(child, child_level, va, entry_end, on_slot) };
+        }
+        va = entry_end;
+    }
+}
+
 /// x86-64 implementation of [`crate::mm::paging::unmap_identity_page`].
 ///
 /// Walks the kernel root from `phys_to_virt(kernel_root_table_pa())` down to
@@ -1375,6 +1542,56 @@ pub unsafe fn hole_direct_map_page(
     take_table: &mut dyn FnMut() -> Option<u64>,
 ) -> Result<(), PagingError>
 {
+    // SAFETY: caller contract.
+    unsafe { set_direct_map_leaf(virt, PageTableEntry(0), take_table) }
+}
+
+/// Give the direct-map page at `virt`, the RAM page `phys`, the supervisor
+/// shadow-stack encoding ([`PageTableEntry::new_shadow_stack_page`]), splitting
+/// a 2 MiB leaf as [`hole_direct_map_page`] does. From then on only
+/// shadow-stack accesses write it; ordinary loads still read it.
+///
+/// # Errors
+/// As [`hole_direct_map_page`].
+///
+/// # Safety
+/// As [`hole_direct_map_page`], with "nothing reaches it" read as "nothing
+/// writes it but its shadow stack" until [`fill_direct_map_page`] restores it.
+/// A CPU holding a stale writable translation of the page must flush it
+/// before it runs on the page as a shadow stack: a shadow-stack access through
+/// that translation faults.
+#[cfg(not(test))]
+pub unsafe fn shadow_direct_map_page(
+    virt: u64,
+    phys: u64,
+    take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>
+{
+    // SAFETY: caller contract.
+    unsafe {
+        set_direct_map_leaf(
+            virt,
+            PageTableEntry::new_shadow_stack_page(phys),
+            take_table,
+        )
+    }
+}
+
+/// Write `leaf` as the 4 KiB direct-map entry of `virt`, splitting the 2 MiB
+/// leaf that maps it first.
+///
+/// # Errors
+/// As [`hole_direct_map_page`].
+///
+/// # Safety
+/// As [`hole_direct_map_page`].
+#[cfg(not(test))]
+unsafe fn set_direct_map_leaf(
+    virt: u64,
+    leaf: PageTableEntry,
+    take_table: &mut dyn FnMut() -> Option<u64>,
+) -> Result<(), PagingError>
+{
     use crate::mm::paging::{LARGE_PAGE_SIZE, kernel_root_table_pa, phys_to_virt};
 
     let root_va = phys_to_virt(kernel_root_table_pa());
@@ -1400,19 +1617,25 @@ pub unsafe fn hole_direct_map_page(
         *pde = PageTableEntry::new_table(table_pa);
     }
     // SAFETY: the directory entry names a live leaf table (split above, or
-    // by an earlier hole or the Phase 3 build).
+    // by an earlier edit or the Phase 3 build).
     let pt = unsafe { table_at(phys_to_virt(pde.phys_addr())) };
-    *entry_mut(pt, 0, virt).ok_or(PagingError::NotMapped)? = PageTableEntry(0);
+    *entry_mut(pt, 0, virt).ok_or(PagingError::NotMapped)? = leaf;
     Ok(())
 }
 
-/// Map the direct-map page at `virt` to `phys` again, closing a hole
-/// [`hole_direct_map_page`] left. No flush is needed: x86-64 caches no
-/// not-present entry ([`CACHES_NOT_PRESENT_ENTRIES`]).
+/// Map the direct-map page at `virt` to `phys` read-write again, closing a
+/// hole [`hole_direct_map_page`] left or ending the shadow stack
+/// [`shadow_direct_map_page`] made. A hole needs no flush: x86-64 caches no
+/// not-present entry ([`CACHES_NOT_PRESENT_ENTRIES`]). A CPU that still caches
+/// a shadow stack's read-only translation faults on its first write to the
+/// page and takes the spurious-fault retry ([`kernel_write_fault_is_spurious`]);
+/// one that runs the page as a kernel stack flushes before it does, by the
+/// guard epoch (`mm::stack_guard`).
 ///
 /// # Safety
-/// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`];
-/// the caller serialises every direct-map edit.
+/// `virt` is `direct_map_base() + phys`, holed by [`hole_direct_map_page`] or
+/// made a shadow stack by [`shadow_direct_map_page`]; the caller serialises
+/// every direct-map edit.
 #[cfg(not(test))]
 pub unsafe fn fill_direct_map_page(virt: u64, phys: u64)
 {
@@ -1451,6 +1674,70 @@ pub unsafe fn direct_map_page_present(virt: u64) -> bool
     // SAFETY: a present non-large directory entry names a live leaf table.
     let pt = unsafe { table_at(phys_to_virt(pde.phys_addr())) };
     entry(pt, 0, virt).is_some_and(PageTableEntry::is_present)
+}
+
+/// Whether a ring-0 page fault at the kernel address `va`, its error code
+/// `error_code`, is stale and resolves on retry after a local flush: an
+/// ordinary write ([`write_fault_may_be_stale`]) to a page the kernel's tables
+/// map with a writable 4 KiB leaf. That is a write through the read-only
+/// translation a CPU kept of a shadow stack [`fill_direct_map_page`] has since
+/// made ordinary memory again. A 2 MiB leaf is never stale this way (no shadow
+/// stack is one), so only a leaf table is consulted, and a `true` result needs
+/// the live leaf to permit the write, so the retry makes progress.
+///
+/// # Safety
+/// Must run at ring 0.
+#[cfg(not(test))]
+pub unsafe fn kernel_write_fault_is_spurious(va: u64, error_code: u64) -> bool
+{
+    use crate::mm::paging::{kernel_root_table_pa, phys_to_virt};
+
+    let root_pa = kernel_root_table_pa();
+    if root_pa == 0 || !write_fault_may_be_stale(va, error_code)
+    {
+        return false;
+    }
+    // SAFETY: the kernel root and its tables are live frames reached through
+    // the direct map; a racing edit at worst makes this read report a stale
+    // answer, and a wrong `true` faults again on retry into the same check.
+    let leaf =
+        unsafe { descend_existing(phys_to_virt(root_pa), va, root_level(), 0, phys_to_virt) }
+            .and_then(|pt| entry(pt, 0, va));
+    leaf.is_some_and(|pte| kernel_leaf_permits_write(pte.0))
+}
+
+/// `#PF` error-code bit P: a protection fault, not a missing page.
+const PF_ERR_PRESENT: u64 = 1 << 0;
+/// `#PF` error-code bit W/R: the access was a write.
+const PF_ERR_WRITE: u64 = 1 << 1;
+/// `#PF` error-code bit U/S: the access was made from user mode.
+const PF_ERR_USER: u64 = 1 << 2;
+/// `#PF` error-code bit RSVD: a paging entry has a reserved bit set.
+const PF_ERR_RSVD: u64 = 1 << 3;
+/// `#PF` error-code bit I/D: the access was an instruction fetch.
+const PF_ERR_FETCH: u64 = 1 << 4;
+/// `#PF` error-code bit PK: a protection-key violation.
+const PF_ERR_PK: u64 = 1 << 5;
+/// `#PF` error-code bit SS: the access was a shadow-stack access.
+const PF_ERR_SHADOW_STACK: u64 = 1 << 6;
+
+/// Whether a `#PF` with `error_code` at `va` can be a write through a stale
+/// read-only translation of a kernel page: a protection fault (P set) by an
+/// ordinary (SS clear) supervisor (U/S clear) data (I/D clear) write (W/R set)
+/// to a kernel-half address, with no reserved-bit (RSVD) or protection-key
+/// (PK) violation, which no flush resolves.
+fn write_fault_may_be_stale(va: u64, error_code: u64) -> bool
+{
+    let wanted = PF_ERR_PRESENT | PF_ERR_WRITE;
+    let excluded = PF_ERR_USER | PF_ERR_RSVD | PF_ERR_FETCH | PF_ERR_PK | PF_ERR_SHADOW_STACK;
+    va >> 63 == 1 && error_code & (wanted | excluded) == wanted
+}
+
+/// Whether the kernel 4 KiB leaf `pte` permits an ordinary supervisor write:
+/// present and writable. A shadow-stack leaf is not writable this way.
+fn kernel_leaf_permits_write(pte: u64) -> bool
+{
+    pte & (PRESENT | WRITABLE) == PRESENT | WRITABLE
 }
 
 /// Whether a CPU may cache a not-present entry, so that a page made present
@@ -1960,6 +2247,20 @@ mod tests
     }
 
     #[test]
+    fn new_leaves_read_accessed_until_a_harvest_clears_it()
+    {
+        let flags = PageFlags {
+            readable: true,
+            writable: true,
+            executable: false,
+            uncacheable: false,
+        };
+        assert!(PageTableEntry::new_page(0x3000, flags).0 & ACCESSED != 0);
+        assert!(PageTableEntry::new_large_page(0x20_0000, flags).0 & ACCESSED != 0);
+        assert!(PageTableEntry::new_shadow_stack_page(0x3000).0 & ACCESSED != 0);
+    }
+
+    #[test]
     fn phys_addr_masks_out_flag_bits()
     {
         let pte = PageTableEntry::new_table(0xDEAD_B000);
@@ -1971,6 +2272,61 @@ mod tests
     {
         let pte = PageTableEntry(0);
         assert!(!pte.is_present());
+    }
+
+    // ── Shadow stacks ─────────────────────────────────────────────────────────
+
+    // The defect caught: a shadow-stack leaf that an ordinary store can write
+    // (R/W set), that the processor does not take for a shadow stack (Dirty
+    // clear), that user mode reaches, that executes, or that is not
+    // write-back.
+    #[test]
+    fn a_shadow_stack_leaf_is_present_read_only_dirty_supervisor_nx_write_back()
+    {
+        let pte = PageTableEntry::new_shadow_stack_page(0x0012_3000);
+        assert_eq!(pte.phys_addr(), 0x0012_3000);
+        assert!(pte.is_present());
+        assert_eq!(pte.0 & WRITABLE, 0);
+        assert_ne!(pte.0 & DIRTY, 0);
+        assert_eq!(pte.0 & USER, 0);
+        assert_ne!(pte.0 & NO_EXECUTE, 0);
+        assert_eq!(pte.0 & (PCD | PWT | LARGE_PAGE), 0);
+        assert!(!kernel_leaf_permits_write(pte.0));
+    }
+
+    const KERNEL_VA: u64 = 0xffff_8000_0012_3000;
+
+    // The defect caught: a retry for a fault that is no stale read-only
+    // translation (a missing page, a load, a user access, a reserved-bit or
+    // protection-key violation, a fetch, a shadow-stack access, or a user
+    // address), which would loop on a genuine fault.
+    #[test]
+    fn only_an_ordinary_supervisor_write_to_a_present_kernel_page_may_be_stale()
+    {
+        let write = PF_ERR_PRESENT | PF_ERR_WRITE;
+        assert!(write_fault_may_be_stale(KERNEL_VA, write));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, PF_ERR_WRITE));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, PF_ERR_PRESENT));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_USER));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_RSVD));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_FETCH));
+        assert!(!write_fault_may_be_stale(KERNEL_VA, write | PF_ERR_PK));
+        assert!(!write_fault_may_be_stale(
+            KERNEL_VA,
+            write | PF_ERR_SHADOW_STACK
+        ));
+        assert!(!write_fault_may_be_stale(0x0000_7fff_0000_0000, write));
+    }
+
+    // The defect caught: a retry when the live leaf still forbids the write
+    // (a shadow stack, or a read-only page), which re-faults for ever.
+    #[test]
+    fn a_stale_write_needs_a_live_writable_leaf()
+    {
+        let ram = PageTableEntry::new_page(0x0012_3000, DIRECT_RAM);
+        assert!(kernel_leaf_permits_write(ram.0));
+        assert!(!kernel_leaf_permits_write(ram.0 & !WRITABLE));
+        assert!(!kernel_leaf_permits_write(ram.0 & !PRESENT));
     }
 
     // ── Entry classification ──────────────────────────────────────────────────

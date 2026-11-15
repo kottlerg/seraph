@@ -24,6 +24,7 @@ pub mod run;
 pub mod run_parallel;
 pub mod symbolize;
 pub mod test;
+pub mod test_cet;
 pub mod test_crash_report;
 pub mod test_debug_port;
 pub mod test_gdb;

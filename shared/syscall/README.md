@@ -15,12 +15,12 @@ untyped entries, `raw_syscall3` and `raw_syscall4`, pass three or four argument 
 given, for harness tests of the kernel's argument validation that need register values the
 typed wrappers cannot express;
 `getrandom_raw`, `entropy_contribute_raw`, `thread_read_regs_raw`, `thread_write_regs_raw`,
-`thread_read_mem_raw`, and `thread_write_mem_raw` likewise take a raw buffer pointer for the
-kernel's buffer-validation tests.
+`thread_read_mem_raw`, `thread_write_mem_raw`, and `aspace_harvest_raw` likewise take a raw buffer
+pointer for the kernel's buffer-validation tests.
 
 A wrapper is safe when nothing it can make the kernel do reaches memory a live Rust object
 occupies: buffers the kernel writes or reads are slices (`getrandom`, `thread_read_regs`,
-`thread_read_mem`). The
+`thread_read_mem`, `aspace_harvest`). The
 `cap_create_*` retype wrappers are safe on that rule because the kernel never carves a page some
 address space maps, so a retype cannot overwrite bytes the caller reaches through a mapping; one
 that would fails with `OutOfMemory`, as § Capability Syscalls of

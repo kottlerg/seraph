@@ -272,13 +272,18 @@ address, the reason, and the span's end.
    Phase 5 (`platform::capture_kernel_mmio`), and seed the guard-table reserve, one frame
    per 2 MiB chunk of RAM, from which the kernel-stack guard pages split the direct map
    (`mm::stack_guard::seed`; [memory-internals.md](memory-internals.md) § Kernel Stack
-   Guards)
+   Guards). Decide whether the kernel runs on shadow stacks: on x86-64 when the BSP
+   reports CET shadow stacks, never on riscv64 (`shadow_stack::decide`;
+   [return-address-integrity.md](return-address-integrity.md)); with them on, every
+   Thread slot ends in a shadow-stack page (`thread_slot::set_shadow_stack_pages`)
 4. Fix every CPU set's width at the boot's CPU count (`cpu_mask::set_boot_cpu_count`,
    `cpu_count.div_ceil(64)` words), then allocate per-CPU subsystem storage from the buddy
    allocator while it still holds large contiguous blocks (before the Phase-7 user-cap
    drain): the reschedule-pending CPU set, the scheduler slabs (per-CPU schedulers, idle
    TCBs, idle-stack tops plus one idle kernel stack per CPU, above a guard page the direct
-   map leaves unmapped, watchdog ticks and breadcrumbs), the PerCpuData, APIC-ID,
+   map leaves unmapped and, with shadow stacks on, the CPU's shadow-stack pages, written
+   and given the shadow-stack encoding ([memory-internals.md](memory-internals.md)
+   § Shadow-Stack Pages), watchdog ticks and breadcrumbs), the PerCpuData, APIC-ID,
    TLB-shootdown request and TLB acknowledgement-set slabs, and on x86-64 the per-AP
    GDT/TSS, IST stacks, and NMI-backtrace storage, on riscv64 each CPU's IMSIC identity
    row, sized from the IMSIC's identity count, halting when the bootloader reported no
@@ -301,8 +306,8 @@ Retype-based kernel object memory, which replaces a kernel heap, is specified in
 subsystem's per-CPU state is described in [entropy.md](entropy.md).
 
 **Failure mode:** a failed per-CPU storage, guard-table reserve, frame map table, or `CSpace`
-registry allocation, or an idle stack's guard page the direct map cannot unmap, halts the
-kernel.
+registry allocation, an idle stack's guard page the direct map cannot unmap, or a CPU's
+shadow-stack page it cannot give the shadow-stack encoding, halts the kernel.
 
 **Completion criterion:** the guard-table reserve, per-CPU storage (each idle stack's guard
 page unmapped), the frame map table, and the `CSpace` registry are allocated; there is no
@@ -340,14 +345,20 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
      the GSI is routed (`SYS_IRQ_ROUTE`)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
    with every LVT masked, and mask every I/O APIC entry
-6. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,
+6. When Phase 4 decided the kernel runs on shadow stacks, give the handoff stack a shadow
+   stack (one buddy page with the shadow-stack encoding), point IA32_PL0_SSP at it and
+   IA32_INTERRUPT_SSP_TABLE_ADDR at the BSP's interrupt SSP table, set CR4.CET, then
+   IA32_S_CET.SH_STK_EN, and run `setssbsy` (`shadow_stack::prepare_boot_cpu`,
+   `shadow_stack::enable`; [return-address-integrity.md](return-address-integrity.md)
+   § x86-64 Mechanism). Emit "shadow stacks: on"
+7. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,
    NT and IOPL on entry)
-7. Configure the preemption timer at a fixed 1 ms period (`timer::init(1_000)`):
+8. Configure the preemption timer at a fixed 1 ms period (`timer::init(1_000)`):
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
-8. Enable interrupts (STI)
+9. Enable interrupts (STI)
 ```
 
-The step-7 timer mode selection is specified in [arch-interface.md](arch-interface.md)
+The step-8 timer mode selection is specified in [arch-interface.md](arch-interface.md)
 § `timer`. SMEP and SMAP are required and enabled unconditionally, and SFMASK clears the
 user-controlled RFLAGS bits, AC among them, per
 [memory-model.md](../../../docs/memory-model.md) § Kernel Isolation — SMEP and SMAP. After
@@ -690,7 +701,10 @@ index and hardware id; on x86-64 that wait is the only signal, since SIPI delive
 unacknowledged and `start_ap` cannot report a delivery failure. An AP that provides fewer
 hardware TLB tags than the BSP configured halts itself with
 "AP provides fewer hardware TLB tags than the BSP configured" before announcing itself, so
-the BSP's wait then expires the same way. On riscv64 an AP that cannot be an APLIC MSI target (a
+the BSP's wait then expires the same way. An x86-64 AP that lacks the CET shadow stacks the
+BSP turned on halts itself the same way ("AP lacks the CET shadow stacks the BSP enabled",
+from `shadow_stack::prepare_ap` in `kernel_entry_ap`, which otherwise turns them on before
+the AP's timer). On riscv64 an AP that cannot be an APLIC MSI target (a
 firmware hart id past the target's hart index, or outside the reported IMSIC layout) halts
 itself the same way at its IMSIC file's initialisation, before announcing itself, as does an
 AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot
@@ -780,8 +794,9 @@ calls `sched::enter()`.
    a. Retype init's Thread slot from SEED_MEMORY in the layout SYS_CAP_CREATE_THREAD uses
       (`sched::thread_slot`): a guard page, unmapped from the direct map with no shootdown,
       its guard epoch stamped in init's TCB (`mm::stack_guard::hole`), then init's kernel stack
-      (KERNEL_STACK_PAGES = 4 pages = 16 KiB), the ThreadObject and TCB page, and the
-      save area
+      (KERNEL_STACK_PAGES = 4 pages = 16 KiB), the ThreadObject and TCB page, the
+      save area, and with shadow stacks on init's shadow stack, laid out and given the
+      shadow-stack encoding by the same `hole` call, which flushes the page on every CPU
    b. new_state(entry=init_image.entry_point, stack_top=kstack_top,
       arg=choose_init_layout().init_info_va, kind=ThreadKind::User) stores entry_point in
       saved_state.rip (x86-64) or .ra (RISC-V) and the InitInfo VA as the arg
@@ -805,7 +820,9 @@ calls `sched::enter()`.
 8. Call sched::enter() — does not return:
    a. Dequeue the highest-priority ready thread (init), then, with interrupts disabled,
       flush the BSP's whole TLB when init's guard epoch is newer than its record
-      (`mm::stack_guard::flush_before_run`, as a switch-in would)
+      (`mm::stack_guard::flush_before_run`, as a switch-in would), and with shadow stacks
+      on point IA32_PL0_SSP at init's shadow-stack token (`shadow_stack::load_thread_token`),
+      which a switch-in would also set
    b. Build an initial user-mode TrapFrame on init's kernel stack:
       rip/sepc=entry_point, rsp/sp=chosen init stack top, cs=USER_CS, ss=USER_DS,
       rflags=0x202 (IF=1)
@@ -898,11 +915,11 @@ through its drain until a teardown commits `Exited` over it (see
 | 1 | Early console; platform feature gate | Halt: missing required baseline feature (no console is non-fatal) |
 | 2 | Free physical ranges from memory map | Halt: no usable RAM |
 | 3 | Kernel page tables + direct map; buddy allocator populated | Halt: no free range holds the page-table carve; table frames exhausted; direct map would overlap the kernel image window; BootInfo.device_tree names no valid FDT blob |
-| 4 | Typed-memory cap surface; guard-table reserve; per-CPU storage; frame map table; `CSpace` registry | Halt: guard-table reserve, per-CPU storage, frame map table, or `CSpace` registry allocation failed; an idle stack's guard page not unmapped |
-| 5 | CPU hardware (IDT/GDT/TSS/stvec); seed entropy pool | Halt: hardware initialisation failure |
+| 4 | Typed-memory cap surface; guard-table reserve; per-CPU storage; frame map table; `CSpace` registry | Halt: guard-table reserve, per-CPU storage, frame map table, or `CSpace` registry allocation failed; an idle stack's guard page not unmapped; a CPU's shadow-stack page not converted |
+| 5 | CPU hardware (IDT/GDT/TSS/stvec); x86-64 shadow stacks where present; seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, no writable `sstateen0`, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; an x86-64 AP without the CET shadow stacks the BSP enabled; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, no writable `sstateen0`, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

@@ -31,6 +31,9 @@ carries them, with `object`'s ELF and PE readers (on macOS too), except two: a
 library instead, and an AIX host's, whose `object` reads XCOFF only. On Windows xtask therefore
 needs the GNU host toolchain (`rustup set default-host x86_64-pc-windows-gnu` before the pinned
 toolchain is installed); on a `*-windows-msvc` host it fails to compile, naming that toolchain.
+xtask calls the host's C library through bindings declared in `xtask/src/sys.rs`, which hold its
+values for Linux, macOS, FreeBSD, DragonFly BSD, NetBSD, OpenBSD, illumos and Solaris; on any
+other Unix xtask fails to compile, naming that file.
 
 `cargo xtask test` runs the host tests a second time built for `riscv64gc-unknown-linux-gnu`,
 under QEMU's user-mode emulator, so it needs a Linux host with three more packages: the emulator
@@ -413,19 +416,27 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` passes
 `-machine virt,aia=aplic-imsic` and
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,ssaia=on,smaia=on`
-followed by `,smstateen=on`, the `--riscv-zkr` suffix (default `,zkr=on`) and the
-`--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
+followed by `,smstateen=on,svadu=off,svade=on`, the `--riscv-zkr` suffix (default `,zkr=on`)
+and the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
-`,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
-string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
-ships (§ Continuous Integration); the supervisor paging extensions (Svpbmt, Svinval, Svnapot) are
-required by the kernel, whose paging subsystem refuses CPUs that lack them during boot, before
-the first userspace mapping, and so are AIA (Ssaia, with the machine's APLIC and IMSIC), without
+`,la57=off`, appended to every x86-64 accelerator's `-cpu` model) and the
+`--x86-shadow-stack` `cet-ss` suffix (default `,cet-ss=off`, appended likewise when the QEMU's
+`-cpu help` lists the `cet-ss` flag; a QEMU without the flag, the 10.2 of the CI image among
+them, cannot offer CET shadow stacks, so the default appends nothing there and `on` is refused
+before launch). The explicit feature string is the source of truth on every supported QEMU,
+including the 10.2 the pinned CI image ships (§ Continuous Integration); the supervisor paging
+extensions (Svpbmt, Svinval, Svnapot) are required by the kernel, whose paging subsystem refuses
+CPUs that lack them during boot, before the first userspace mapping, and so are AIA (Ssaia, with
+the machine's APLIC and IMSIC), without
 which its interrupt initialisation halts the boot, and Ssstateen, whose `sstateen0` the kernel
 writes on every hart and without which it halts the boot (see
 [platform-requirements.md](platform-requirements.md)). QEMU's `rv64` model leaves Smstateen off,
 so `smstateen=on` gives the hart the state-enable CSRs, and the bundled OpenSBI grants S-mode
 `sstateen0` (`mstateen0.SE0`) on a hart that has them; the property is present from QEMU 9.0.
+The `rv64` model enables Svadu and leaves Svade off, which with the bundled OpenSBI turns on
+hardware A/D updating (`menvcfg.ADUE`). `svadu=off,svade=on` boots the Svade baseline instead, so
+an access that finds A clear faults and the kernel's fault path sets the bit
+([platform-requirements.md](platform-requirements.md); both properties are present from QEMU 9.0).
 `zkr=on` gives the hart the Zkr entropy source, whose `seed` CSR the bundled OpenSBI grants
 S-mode when the hart implements it, so the kernel's pool seeds from it beside the firmware boot
 seed and the boot log shows

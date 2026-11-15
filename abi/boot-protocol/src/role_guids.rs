@@ -6,11 +6,10 @@
 //! Seraph-minted GPT partition type GUIDs for role-based partition discovery.
 //!
 //! Each constant is a 16-byte array in the on-disk GPT layout (little-endian
-//! for the first three fields, big-endian for the last two — the same byte
-//! ordering `uuid::Uuid::to_bytes_le` produces). Direct byte comparison
-//! against a GPT entry's type-GUID field is therefore correct without
-//! conversion; producers (xtask) reconstruct a `uuid::Uuid` via
-//! `uuid::Uuid::from_bytes_le`.
+//! for the first three fields, big-endian for the last two — the `EFI_GUID`
+//! byte order). Direct byte comparison against a GPT entry's type-GUID field
+//! is therefore correct without conversion, and the producer (xtask's GPT
+//! writer) copies the arrays into the entries as they are.
 //!
 //! Root partitions are arch-distinguished following the Discoverable
 //! Partitions Specification convention: a single disk image may carry both

@@ -228,6 +228,36 @@ fn send_destroy(process_handle: u64, ipc_buf: *mut u64)
     let _ = unsafe { ipc::ipc_call(process_handle, &destroy_msg, ipc_buf) };
 }
 
+/// Have procmgr bind `eq` as a terminal-fault death observer on the address
+/// space of the child `process_handle` names, with `correlator`
+/// (`procmgr_labels::BIND_DEATH_OBSERVER`), through a `POST` copy of `eq`
+/// that the call transfers. True when procmgr bound it; false, the copy
+/// released, when the copy cannot be derived or the call fails or is refused
+/// (the child torn down already among the causes).
+fn bind_fault_observer(process_handle: u64, eq: u64, correlator: u64, ipc_buf: *mut u64) -> bool
+{
+    let Ok(post) = syscall::cap_derive(eq, syscall::RIGHTS_EQ_POST)
+    else
+    {
+        return false;
+    };
+    let msg = IpcMessage::builder(procmgr_labels::BIND_DEATH_OBSERVER)
+        .word(0, correlator)
+        .cap(post)
+        .build();
+    // SAFETY: every caller passes devmgr's registered IPC buffer.
+    if let Ok(reply) = unsafe { ipc::ipc_call(process_handle, &msg, ipc_buf) }
+    {
+        reply.label == 0
+    }
+    else
+    {
+        // The call did not transfer the copy.
+        let _ = syscall::cap_delete(post);
+        false
+    }
+}
+
 /// Draw a fresh non-zero driver-child bootstrap badge: a random `u64` from the
 /// kernel entropy pool, redrawn off the reserved `0` value (an unbadged SEND
 /// carries badge 0). Random rather than monotonic so the driver-spawn count it
@@ -318,11 +348,11 @@ pub struct BoundSpawnConfig<'a>
     /// SEND on: the private driver endpoint of the driver's settle batch
     /// ([`crate::settle::SettleBatch::driver_ep`]).
     pub query_ep: u64,
-    /// Event queue the driver's death observer posts to, with `device_badge`
+    /// Event queue the driver's death observers post to, with `device_badge`
     /// as the correlator: devmgr's driver death queue
     /// ([`crate::settle::DriverWatch::death_eq`]).
     pub death_eq: u64,
-    /// A second event queue the driver's death observer posts to, with the
+    /// A second event queue the driver's death observers post to, with the
     /// same correlator, for a driver whose death a devmgr thread other than
     /// the control thread must see at once: the IOMMU death watch's
     /// (`crate::iommu`). `None` for every other driver.
@@ -421,10 +451,17 @@ fn serve_list_round(
 /// group, then the terminal round carrying the service endpoint, the devmgr
 /// query cap (a SEND on `query_ep` badged `device_badge`, through which the
 /// driver fetches its device info and reports ready), and, for a DMA
-/// declaration, the DMA capability. Once the end round is served it binds a
-/// death observer on the driver's thread to `death_eq`, and to `watch_eq`
-/// when given, correlator `device_badge`, so devmgr sees the driver's death,
-/// before it reports ready or after it is served.
+/// declaration, the DMA capability. Once the end round is served it binds
+/// two death observers to `death_eq`, and two to `watch_eq` when given, each
+/// with correlator `device_badge`, so devmgr sees the driver's death, before
+/// it reports ready or after it is served: one on the driver's main thread,
+/// which an exit or a fault of that thread posts, and one on its address
+/// space, bound by procmgr (`procmgr_labels::BIND_DEATH_OBSERVER`), which the
+/// first terminal fault of any of its threads posts. procmgr's teardown of the
+/// driver after a fault of another thread stops the main thread with no post,
+/// so the address-space observer is the only one that sees that death; a
+/// fault of the main thread that is the driver's first terminal fault posts
+/// to both.
 ///
 /// A `held` driver is created `CREATE_PINNED`, since its device may write
 /// its memory before a demand fault could back it, and `CREATE_DMA_HOLD`,
@@ -702,11 +739,14 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
 
     // Observe the driver's death from here on. Bound only once every round
     // has succeeded, so the death queue takes posts only from the drivers a
-    // roster records; a child that already died posts at once.
+    // roster records; a child that already died or faulted posts at once.
     let bound = [Some(config.death_eq), config.watch_eq]
         .into_iter()
         .flatten()
-        .all(|eq| syscall::thread_bind_notification(thread_cap, eq, config.device_badge).is_ok());
+        .all(|eq| {
+            syscall::thread_bind_notification(thread_cap, eq, config.device_badge).is_ok()
+                && bind_fault_observer(process_handle, eq, config.device_badge, ipc_buf)
+        });
     if !bound
     {
         std::os::seraph::log!(warn: "driver death observer bind failed");

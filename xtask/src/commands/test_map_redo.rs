@@ -149,6 +149,7 @@ fn run_args(args: &TestMapRedoArgs, dir: &Path, data_image: Option<PathBuf>) -> 
         riscv_mmu: args.riscv_mmu,
         riscv_zkr: crate::qemu::RiscvZkr::On,
         x86_paging: args.x86_paging,
+        x86_shadow_stack: crate::qemu::X86ShadowStack::Off,
         iommu: crate::qemu::Iommu::Attached,
         debug_port: None,
         debug_target: None,

@@ -291,8 +291,9 @@ pub struct AddressSpace
 The terminal-fault observer state (the `death_observers` chain of observer nodes,
 `terminal_faulted`, `terminal_fault_reason`) changes and is read only under `death_lock`: the bind
 (`sys_aspace_bind_notification`) pushes a node, drawn from the observing queue's pool, under it, and
-the terminal-fault path records the first fault and reads the chain head under it before the
-faulting thread's `Exited` commit (`record_aspace_terminal_fault`), then walks the chain and posts
+the terminal-fault path records the first fault and, on that fault alone, reads the chain head
+under it before the faulting thread's `Exited` commit (`record_aspace_terminal_fault`; a later
+fault reads none, so the space's observers are posted once), then walks the chain and posts
 outside it after the commit (`post_aspace_death_notification`; a linked node's links never change
 until the teardown takes the chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads
 the retained reason under it (`AddressSpace::retained_terminal_fault`).
@@ -373,6 +374,53 @@ copies them, so the grant survives both.
 
 ---
 
+## Accessed Bits
+
+Every leaf the kernel builds carries the accessed bit (A): `PageTableEntry::new_page` and
+`new_large_page` set it on both architectures, as does the x86-64 shadow-stack leaf
+(`new_shadow_stack_page`), and on RISC-V `new_page` sets the dirty bit (D) too on a writable leaf.
+A leaf the kernel installs or rewrites therefore reads accessed until `SYS_ASPACE_HARVEST` clears
+A, the only path that clears it on a user leaf.
+
+**Harvest.** `sys_aspace_harvest` runs in three steps:
+
+1. `AddressSpace::read_accessed` walks the range's leaf tables under `pt_lock`, with preemption
+   disabled, and records each present leaf whose A is set
+   (`arch::current::paging::read_user_accessed`). It changes no leaf.
+2. The bitmap is copied to the caller. The copy is restartable, and a fault on it finds nothing
+   changed.
+3. `AddressSpace::clear_accessed` walks again under `pt_lock` and clears A on the reported pages
+   that are still mapped (`clear_user_accessed`). It demotes a NAPOT member first (§ NAPOT
+   Contiguity (RISC-V)).
+
+Each update of a leaf's A or D bit is an atomic read-modify-write of the leaf word (`leaf_word`),
+because the other writers of those bits do not take `pt_lock`: the hardware page walker, and on
+RISC-V the fault path below. A range is at most `MAX_HARVEST_PAGES` (4096) pages, which bounds the
+bitmap on the kernel stack (512 bytes) and each hold of the lock.
+
+**No flush.** Clearing A needs no TLB invalidation. A CPU that caches the translation keeps using
+it, and the next harvest reports the page only if a page walk has set A again. A stale entry costs
+the pager accuracy (a hot page can look cold, be evicted, and fault back), never correctness.
+
+**RISC-V without Svadu.** The kernel requires Svade
+([docs/platform-requirements.md](../../../docs/platform-requirements.md)): when an access finds A
+clear, or a store finds D clear, the hart raises a page fault instead of setting the bit. The fault
+reaches `paging::user_fault_is_spurious` from both the U-mode fault path and the kernel-copy fault
+path (`kernel_exception`, for a copy to or from a user page). If the live leaf is user-accessible
+and permits the access, the walk sets the missing bits with one compare-and-swap of the leaf word
+(`svade_update`) and reports the fault spurious. The caller then flushes the local entry and
+retries. No such fault reaches a fault handler or fails a copy.
+
+The swap runs without `pt_lock`. SIE is clear and the space is active on this hart, so a teardown
+cannot reuse the table's frame before this hart acknowledges the teardown's shootdown. A swap that
+loses a race also reports the fault spurious, and the retried access faults again if it still
+needs the bit. A NAPOT member never lacks A: a group is promoted only from leaves that carry it,
+and a harvest demotes before it clears. The walk therefore reports a NAPOT member without A as a
+genuine fault rather than set one member's bit. On a Svadu hart with `menvcfg.ADUE` set, the
+hardware sets the bits and this path never runs. The kernel makes no SBI call to change ADUE.
+
+---
+
 ## TLB Management
 
 Local invalidation primitives live in the per-architecture paging modules:
@@ -421,11 +469,14 @@ Two invariants keep the hint transparent:
   rewriting a live group would leave siblings whose cached 64 KiB entry still translates
   the modified VA. The writer's ordinary per-VA (or span-wide) invalidation then also
   kills any cached group entry, since an `sfence.vma`/`sinval.vma` naming any address
-  inside a NAPOT range must invalidate a covering cached translation.
+  inside a NAPOT range must invalidate a covering cached translation. A harvest also
+  demotes before it clears a member's A bit, and invalidates nothing: a cached group entry
+  then only hides later accesses from the next harvest (§ Accessed Bits).
 
 Readers decode both shapes: `translate_user_page` reconstructs a NAPOT member's PA bits
 \[15:12\] from the VA; the fault classifier and teardown walks are N-agnostic (a NAPOT
-member carries the same V/U/R/W/X bits, and leaf-vs-table discrimination is by R/W/X).
+member carries the same V/U/R/W/X bits, and leaf-vs-table discrimination is by R/W/X), except
+that the classifier sets no A bit on a NAPOT member (§ Accessed Bits).
 
 ### Context Switch TLB Handling
 
@@ -651,13 +702,15 @@ page (§ Kernel Stack Guards). Two sources exist:
 - The idle threads' stacks come from the buddy allocator in Phase 4, one order-3 block
   per CPU, while the buddy still holds large contiguous blocks (before the Phase 7
   drain): the stack is the block's top `KERNEL_STACK_PAGES` pages, the guard the page
-  below it, and the pages below the guard go back to the buddy. They live for the
-  kernel's lifetime ([initialization.md](initialization.md) § Phase 4: Typed-Memory Cap
-  Surface).
+  below it, and the pages below the guard go back to the buddy, apart from the CPU's
+  shadow-stack pages when the kernel runs on shadow stacks (§ Shadow-Stack Pages). They
+  live for the kernel's lifetime ([initialization.md](initialization.md) § Phase 4:
+  Typed-Memory Cap Surface).
 - Every other thread's stack is the `KERNEL_STACK_PAGES` pages above the guard page that
   starts its Thread slab — guard, stack, then the page holding the `ThreadObject` and
   TCB, then the per-thread FPU/SIMD save area, whose pages the boot CPU sizes
-  (`sched::thread_slot`, `SystemInfoType::ThreadRetypeBytes`) — which
+  (`sched::thread_slot`, `SystemInfoType::ThreadRetypeBytes`), then, with shadow stacks
+  on, the thread's shadow-stack page — which
   `SYS_CAP_CREATE_THREAD` carves from the caller's Memory capability, and boot code
   carves from the SEED reserve for init's own thread; the slab returns to its source when
   the thread's reference count reaches zero (see
@@ -756,6 +809,37 @@ every overflow on the guard by its own means:
 
 Phase 8 halts unless the handoff stack's guard (when Phase 3 found one) and every idle
 stack's guard are unmapped.
+
+### Shadow-Stack Pages
+
+When the kernel runs on x86-64 CET supervisor shadow stacks
+([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism), every
+shadow stack is one 4 KiB page whose direct-map leaf has the shadow-stack encoding
+(present, R/W clear, Dirty set; `paging::shadow_direct_map_page`), so no ordinary store
+reaches it. `mm/stack_guard.rs` makes and ends these leaves under the same leaf lock and
+guard-table reserve as the holes:
+
+- Each CPU keeps `shadow_stack::CPU_PAGES` pages (its idle thread's shadow stack and the
+  two IST stacks') from the top of its idle block's spare, directly below the idle
+  stack's guard; Phase 4 writes them and gives them the encoding while only the boot CPU
+  runs (`stack_guard::shadow_on_boot_cpu`), and the rest of the spare goes back to the
+  buddy. The handoff stack's shadow stack is one buddy page converted the same way in
+  Phase 5. All of these are permanent.
+- A Thread slab's last page is its shadow stack. Thread creation writes the page's first
+  words, then converts it together with the guard hole (`stack_guard::hole`). Before
+  creation returns, the page is flushed on every online CPU by a kernel-page shootdown,
+  since a stale writable translation on any CPU, not only the one that runs the thread,
+  would let an ordinary store reach the shadow stack. Freeing the slab maps the page
+  read-write again with the guard (`stack_guard::close`) and flushes this CPU's entry.
+  Another CPU that kept the read-only entry faults on its first ordinary store to the
+  page. The x86-64 ring-0 page-fault path finds the live 4 KiB leaf writable, flushes the
+  entry and retries the store (`paging::kernel_write_fault_is_spurious`). A CPU that runs
+  the page as a new kernel stack flushes first by the guard epoch, as above.
+
+A shadow stack that outgrows its page runs onto the page below it. Below a Thread's
+shadow stack lies its save area's last page, and below the idle shadow stack lies a buddy
+page, both ordinary memory, so the shadow-stack push faults there. The IST shadow stacks
+lie above the idle one and hold one event each.
 
 ### Kernel Stack Depth
 

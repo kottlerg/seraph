@@ -517,7 +517,8 @@ gives the PR-level linear view.
 - Every PR body MUST report, in its `## Validation` section, each local host
   run [testing.md](testing.md#coverage-tiers) § Coverage tiers owes (each
   boundary run, the memory variation, and each device cell: the storage cells,
-  the no-IOMMU variant, the framebuffer cell, and the debug-port cell, per architecture), with its
+  the no-IOMMU variant, the framebuffer cell, and the debug-port cell, per architecture, and the
+  CET cell on x86_64), with its
   `--runs` count, its
   outcome, and the head it ran at (a run the PR does not owe that HANGs or
   fails as that section allows, with the link to its record), or state that
@@ -600,8 +601,9 @@ Producing a release for tag `v<X>.<Y>.<Z>`:
    the memory variation, the disk variations (a 4Kn disk and three
    second-disk boots, on both architectures), the no-IOMMU variant
    (`--iommu absent`, svctest, on both architectures), the framebuffer
-   cell (`--display framebuffer`, svctest, on both architectures), and the
-   debug-port cell (`test-debug-port` and `test-gdb`, on both architectures)
+   cell (`--display framebuffer`, svctest, on both architectures), the
+   debug-port cell (`test-debug-port` and `test-gdb`, on both architectures),
+   and the CET cell (`test-cet`, on x86_64)
    once each. A run at an earlier `master` commit that contains the bump
    stands for the commit to be tagged when the change between the two is
    documentation or comments only, as [testing.md](testing.md#coverage-tiers)

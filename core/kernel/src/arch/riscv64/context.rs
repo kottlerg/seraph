@@ -118,6 +118,18 @@ pub fn set_stack_floor(saved: &mut SavedState, floor: u64)
     saved.stack_floor = floor;
 }
 
+/// Record a new thread's shadow stack: a no-op, as the kernel runs on no
+/// shadow stack on riscv64 (`shadow_stack::enabled`).
+#[inline]
+pub fn set_shadow_stack(_saved: &mut SavedState, _stack: super::shadow_stack::ShadowStack) {}
+
+/// The thread's supervisor shadow-stack token: none on riscv64.
+#[inline]
+pub fn shadow_stack_token(_saved: &SavedState) -> u64
+{
+    0
+}
+
 /// Round a user-supplied stack pointer to the ABI alignment expected at an
 /// `extern "C"` entry point. On RISC-V `LP64D` the return address lives in `ra`,
 /// not on the stack, so function entry expects `sp` ≡ 0 (mod 16).

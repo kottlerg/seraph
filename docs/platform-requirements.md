@@ -131,8 +131,10 @@ Each feature is classified per architecture as one of:
   falls back to xAPIC MMIO.
 - **AES-NI and SHA-NI** — crypto acceleration (design intent; not yet enabled).
 - **CET shadow stack (SHSTK)** — supervisor shadow stacks, return-address integrity for the
-  kernel (design intent; not yet enabled;
-  [core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
+  kernel, enabled when the boot CPU reports `CET_SS`; every other CPU must then report it too,
+  or the boot halts. Without it the kernel runs unprotected and otherwise unchanged
+  ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)
+  § x86-64 Mechanism).
 - **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC
   timer is the fallback.
 - **UMIP** (`CR4.UMIP`) — set on every CPU when present, so ring-3 `SGDT`, `SIDT`, `SLDT`, `SMSW`,
@@ -203,7 +205,12 @@ Each feature is classified per architecture as one of:
 - **Svpbmt, Svinval, Svnapot** — page-based memory types, fine-grained fence invalidation, and
   NAPOT page encodings; asserted by `paging::verify_paging_extensions`, before the first
   userspace mapping, from the bootloader-confirmed hart capabilities. Svade is the baseline A/D-bit
-  model.
+  model. The kernel pre-sets A in every leaf and D in every writable leaf, and clears A only
+  through `SYS_ASPACE_HARVEST`. Absent Svadu, it sets A (and D on a store) in its fault path when
+  an access finds the bit clear
+  ([memory-internals.md](../core/kernel/docs/memory-internals.md#accessed-bits) § Accessed Bits).
+  Under emulation the CPU model enables Svade and disables Svadu (`svade=on,svadu=off`,
+  [build-system.md](build-system.md) § QEMU and Firmware), so CI runs that fault path.
 - **Ssstateen — `sstateen0`, granted to S-mode** — the state-enable CSR through which the kernel
   keeps U-mode from every state it does not save and restore on a context switch: state a process
   could reach and the kernel does not switch would persist into the next process on the hart, a
@@ -232,8 +239,8 @@ Each feature is classified per architecture as one of:
 
 ### Opportunistic
 
-- **Svadu** — hardware A/D-bit updates (design intent; not yet implemented: the kernel pre-sets
-  A in every leaf PTE and D in every writable leaf; Svade is the required baseline).
+- **Svadu** — hardware A/D-bit updates, in effect when the firmware sets `menvcfg.ADUE`. The
+  kernel does not enable them; without them its fault path sets the bits (Svade, above).
 - **Sv57** — a larger-VA expansion above the Sv48 default; used when the
   platform advertises and the probe confirms it.
 - **Zvk vector crypto** — crypto acceleration (design intent; not yet enabled).

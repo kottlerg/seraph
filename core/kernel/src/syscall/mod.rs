@@ -40,8 +40,8 @@ use syscall::SyscallError;
 
 #[cfg(not(test))]
 use syscall::{
-    SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE,
-    SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
+    SYS_ASPACE_BIND_NOTIFICATION, SYS_ASPACE_HARVEST, SYS_ASPACE_QUERY, SYS_CAP_COPY,
+    SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE, SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q,
     SYS_CAP_CREATE_NOTIFICATION, SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE,
     SYS_CAP_DERIVE, SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE,
     SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
@@ -511,6 +511,7 @@ fn dispatch_in_range(nr: u64, tf: UserFrame) -> Result<u64, RestartableError>
         SYS_IRQ_ROUTE => hw::sys_irq_route(tf),
         SYS_IRQ_REMAP => hw::sys_irq_remap(tf),
         SYS_ENTROPY_CONTRIBUTE => return entropy::sys_entropy_contribute(tf),
+        SYS_ASPACE_HARVEST => return mem::sys_aspace_harvest(tf),
         _ => Err(SyscallError::UnknownSyscall),
     };
     ret.map_err(RestartableError::Failed)
@@ -921,8 +922,8 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// arg1 = `EventQueue` cap slot index (`POST` right required).
 /// arg2 = caller-chosen `correlator: u64` (opaque routing tag; every bit kept).
 ///
-/// On a terminal fault by any thread in the address space (no handler bound,
-/// the handler replied `KILL`, or the fault episode was cancelled by
+/// On the first terminal fault by any thread in the address space (no handler
+/// bound, the handler replied `KILL`, or the fault episode was cancelled by
 /// destruction of the handler thread, by destruction of the handler endpoint
 /// while the fault is still queued on it, or by a later receive on the
 /// handler thread that passes its capability and headroom checks while the
@@ -931,9 +932,11 @@ fn sys_thread_bind_notification(tf: UserFrame) -> Result<u64, SyscallError>
 /// claimed `KILL`, and it takes effect, and is posted, only if the thread is
 /// started again; see docs/fault-handling.md § Delivery, Resume, and Kill),
 /// the kernel posts the entry `(terminal-fault reason, correlator)` to each
-/// bound observer. Only a fault of a thread's own access is terminal: a
-/// restartable syscall's copy fault in any of these cases fails that syscall
-/// with `InvalidAddress` and posts nothing (docs/fault-handling.md § Kernel
+/// bound observer; a later terminal fault of another thread of the space posts
+/// nothing (the space dies once, with the reason retained from its first
+/// fault). Only a fault of a thread's own access is terminal: a restartable
+/// syscall's copy fault in any of these cases fails that syscall with
+/// `InvalidAddress` and posts nothing (docs/fault-handling.md § Kernel
 /// Copies). The kernel only notifies; it never enumerates or terminates
 /// threads, and normal `thread_exit` does NOT fire these observers.
 ///

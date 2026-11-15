@@ -253,9 +253,9 @@ const WS_BADGE_DEATH: u64 = 1;
 
 /// Pages requested from memmgr per spawned child for the child's Thread
 /// retype slab: `SystemInfoType::ThreadRetypeBytes` in pages (guard page,
-/// kernel stack, wrapper/TCB, extended-state save area, which the boot CPU sizes), all
-/// consumed by the kernel. Queried once and cached; `None` if the query
-/// fails, which fails the spawn.
+/// kernel stack, wrapper/TCB, extended-state save area, which the boot CPU sizes, and
+/// with shadow stacks on a shadow-stack page), all consumed by the kernel. Queried once
+/// and cached; `None` if the query fails, which fails the spawn.
 pub(crate) fn thread_retype_pages() -> Option<u64>
 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -573,6 +573,11 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 /// worker's IPC buffer `ipc_buf`. Each arm takes the table lock only for its
 /// own reads and writes of the table, and makes its IPC calls with no lock
 /// held (services/procmgr/README.md § Concurrency).
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per procmgr label, each a few lines that hand the request to its \
+              handler; splitting the match would scatter the dispatch table"
+)]
 fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
     hold_cspace_headroom(ctx.self_cspace);
@@ -586,15 +591,17 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     // badge. Every label is served under the child's badge alone, but the
     // two that name their sender, `DECLARE_NO_DEBUG` and `REGISTER_THREAD`,
     // are refused on a handle, so its holder can neither declare the child
-    // nor register a thread into the child's registry.
-    let (badge, on_handle) = process_table::request_badge(req.badge);
-    req.badge = badge;
-    if on_handle && !process_table::served_on_handle(label & 0xFFFF)
+    // nor register a thread into the child's registry, and
+    // `BIND_DEATH_OBSERVER` is refused on any other cap, so only the
+    // creator chooses who observes the child.
+    if let Some(code) = process_table::sender_refusal(label & 0xFFFF, req.badge)
     {
         release_caps(req.caps());
-        reply_empty(ipc_buf, procmgr_errors::INVALID_BADGE);
+        reply_empty(ipc_buf, code);
         return;
     }
+    let (badge, _) = process_table::request_badge(req.badge);
+    req.badge = badge;
 
     // Every cap a request transfers has already moved into procmgr's
     // CSpace. Each arm releases the caps its wire layout does not name, and
@@ -670,6 +677,12 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
                 .build();
             // SAFETY: ipc_buf is the registered IPC buffer page.
             let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+        }
+
+        procmgr_labels::BIND_DEATH_OBSERVER =>
+        {
+            // A bind makes syscalls only, under the table lock.
+            handle_bind_death_observer(&req, ipc_buf, &ctx.tables.lock().table);
         }
 
         procmgr_labels::CREATE_FROM_FILE =>
@@ -1170,6 +1183,50 @@ fn handle_declare_no_debug(badge: u64, ipc_buf: *mut u64, table: &mut process::P
         }
         None => procmgr_errors::INVALID_BADGE,
     };
+    reply_empty(ipc_buf, code);
+}
+
+/// Handle `BIND_DEATH_OBSERVER` — bind the queue of `caps[0]` as a
+/// terminal-fault death observer, correlator `data[0]`, on the address
+/// space of the child the process handle names
+/// (`services/procmgr/docs/ipc-interface.md` § Label 25:
+/// `BIND_DEATH_OBSERVER`). `dispatch_ipc` has refused it on any cap but a
+/// process handle (`process_table::sender_refusal`); procmgr's own copy of
+/// the child's address space keeps its `Control` right. The queue cap is
+/// deleted on every path: the kernel binding holds its own reference to the
+/// queue.
+fn handle_bind_death_observer(req: &IpcMessage, ipc_buf: *mut u64, table: &process::ProcessTable)
+{
+    let caps = req.caps();
+    let queue = caps.first().copied().unwrap_or(0);
+    release_caps(caps.get(1..).unwrap_or(&[]));
+    let code = if queue == 0
+    {
+        procmgr_errors::INVALID_ARGUMENT
+    }
+    else
+    {
+        match table.find_by_badge(req.badge)
+        {
+            None => procmgr_errors::INVALID_BADGE,
+            Some(entry) =>
+            {
+                match syscall::aspace_bind_notification(entry.aspace_cap, queue, req.word(0))
+                {
+                    Ok(()) => procmgr_errors::SUCCESS,
+                    Err(e) if e == syscall_abi::SyscallError::OutOfMemory as i64 =>
+                    {
+                        procmgr_errors::OUT_OF_MEMORY
+                    }
+                    Err(_) => procmgr_errors::INVALID_ARGUMENT,
+                }
+            }
+        }
+    };
+    if queue != 0
+    {
+        let _ = syscall::cap_delete(queue);
+    }
     reply_empty(ipc_buf, code);
 }
 

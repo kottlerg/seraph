@@ -35,7 +35,7 @@ and no shutdown.
 init            launches the bootstrap substrate, endows svcmgr, exits; supervises nothing
 svcmgr          supervises the substrate (memmgr, procmgr, devmgr, vfsd) and every service it
    │            launches from a recipe (logd, timed, pwrmgr, crashd, ...)
-   ├── devmgr   observes each driver's main thread and withdraws a dead driver; restarts none
+   ├── devmgr   observes each driver's death and withdraws a dead driver; restarts none
    └── vfsd     observes no fs driver's death; restarts none
 pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
 ```
@@ -44,7 +44,7 @@ pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
 |---|---|---|---|
 | svcmgr | memmgr, procmgr, devmgr, vfsd (endowed by init) | a death observer bound on the main thread, through the thread cap each endowment round delivers | the service's recipe decides; every one of these is `restart = never`, `critical = yes`, so its death powers the system off |
 | svcmgr | each service it launches with a `restart` other than `never` | a death observer bound on the main thread, through the thread cap procmgr's create reply returns | the recipe's `restart` policy and budget, then `critical` ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)) |
-| devmgr | drivers it spawns | a death observer bound on each driver's main thread | the driver is withdrawn and its DMA hold released once its device is quiesced; no restart (design intent; not yet implemented, #1077; the IOMMU driver, #1079) ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#relationship-to-drivers)) |
+| devmgr | drivers it spawns | a death observer bound on each driver's main thread, and one procmgr binds on its address space (`BIND_DEATH_OBSERVER`), which the first terminal fault of any of its threads posts | the driver is withdrawn and its DMA hold released once its device is quiesced; no restart (design intent; not yet implemented, #1077; the IOMMU driver, #1079) ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#relationship-to-drivers)) |
 | vfsd | fs drivers it spawns | nothing | the mount stays installed against the dead endpoint; no restart (design intent; not yet implemented, #1078) ([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants)) |
 | pwrmgr | svcmgr | an event queue svcmgr binds to its own death (§ Observing svcmgr) | power-off (design intent; not yet implemented, #262) |
 
@@ -61,10 +61,10 @@ thread posts no death ([Process Lifecycle § Exit reason](process-lifecycle.md#e
 such a death reaches neither the recipe's `restart` nor its `critical`: the service stays down, and
 the system runs on without it. Routing that death to svcmgr is not yet implemented (#1094).
 
-devmgr's observer is likewise on a driver's main thread only. A terminal fault in a driver's worker
-thread drives the same teardown, so devmgr never withdraws that driver: the device is not quiesced,
-and the driver's DMA hold is not released. Routing that death to devmgr is not yet implemented
-(#1102).
+devmgr also has procmgr bind an observer on each driver's address space
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Label 25:
+`BIND_DEATH_OBSERVER`), so a terminal fault in a driver's worker thread, which drives the same
+teardown, still reaches devmgr, which withdraws the driver.
 
 ---
 
@@ -194,8 +194,8 @@ Design intent; not yet implemented (#262). The mechanism uses existing kernel su
 
 svcmgr creates one event queue at startup and binds two death observers on it: one on its own main
 thread (`SYS_THREAD_BIND_NOTIFICATION`, through `ProcessInfo.self_thread_cap`), and one on its own
-address space (`SYS_ASPACE_BIND_NOTIFICATION`, through `ProcessInfo.self_aspace_cap`), which a
-terminal fault of any svcmgr thread posts to. svcmgr keeps the queue's original and delivers a
+address space (`SYS_ASPACE_BIND_NOTIFICATION`, through `ProcessInfo.self_aspace_cap`), which the
+first terminal fault of any svcmgr thread posts to. svcmgr keeps the queue's original and delivers a
 derivation carrying only the receive right to the shutdown actuator, pwrmgr, in the bootstrap round
 of each of its launches. pwrmgr waits on that queue beside its service endpoint; an entry on it is
 svcmgr's death, and pwrmgr powers the platform off.
@@ -231,8 +231,6 @@ Each item below is specified above or in the document it names, and is not yet i
 - The terminal fault of any thread of a supervised service reaches svcmgr as that service's death,
   for the services procmgr creates and for memmgr and procmgr (§ Supervision Hierarchy, § Core Set
   and System Death): #1094.
-- The terminal fault of any thread of a driver reaches devmgr as that driver's death
-  (§ Supervision Hierarchy): #1102.
 
 ---
 

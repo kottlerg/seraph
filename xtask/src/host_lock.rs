@@ -33,7 +33,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
-use serde_json::{Value, json};
+use json::{Value, json};
 
 use crate::cli::{BootHostArgs, HostArgs};
 use crate::context::Context;
@@ -350,7 +350,7 @@ fn load_average() -> Option<f64>
     let mut loads = [0.0f64; 3];
     // SAFETY: `getloadavg` writes at most `nelem` (here 1) doubles into the
     // buffer it is given, which holds 3, and keeps no pointer to it.
-    let read = unsafe { libc::getloadavg(loads.as_mut_ptr(), 1) };
+    let read = unsafe { crate::sys::unix::getloadavg(loads.as_mut_ptr(), 1) };
     (read >= 1).then_some(loads[0])
 }
 
@@ -409,8 +409,7 @@ pub fn read_grant(dir: &Path) -> Result<Option<String>>
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     };
-    let value: Value =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    let value: Value = json::parse(&raw).with_context(|| format!("parsing {}", path.display()))?;
     let holder = value
         .get("holder")
         .and_then(Value::as_str)
@@ -456,7 +455,7 @@ fn unix_secs() -> u64
 /// (a record being written, seen by a reader outside the admission lock).
 fn parse_holder(raw: &str) -> Option<Holder>
 {
-    let value: Value = serde_json::from_str(raw).ok()?;
+    let value: Value = json::parse(raw).ok()?;
     let number = |key: &str| {
         value
             .get(key)
@@ -610,6 +609,8 @@ impl Admission
     pub fn share_with_children(&self) -> Result<()>
     {
         use std::os::fd::AsRawFd as _;
+
+        use crate::sys::unix::{F_GETFD, F_SETFD, FD_CLOEXEC, fcntl};
         let Some((path, file)) = &self.record
         else
         {
@@ -619,13 +620,13 @@ impl Admission
         // SAFETY: `fd` is the open descriptor `file` owns for the duration of
         // this call; F_GETFD reads only its descriptor flags, and touches no
         // memory.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        let flags = unsafe { fcntl(fd, F_GETFD) };
         let cleared = flags >= 0
             // SAFETY: `fd` is the open descriptor `file` owns for the duration
             // of this call; F_SETFD writes only its descriptor flags, here the
             // ones F_GETFD returned with close-on-exec cleared, and touches no
             // memory.
-            && unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } >= 0;
+            && unsafe { fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) } >= 0;
         if !cleared
         {
             bail!(

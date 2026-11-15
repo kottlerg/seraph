@@ -37,7 +37,7 @@ xtask/
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
 │   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
-│   ├── sys.rs                  # Hand-declared host OS bindings (signal, console control)
+│   ├── sys.rs                  # Hand-declared host C library and Windows API bindings
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup

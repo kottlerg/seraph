@@ -983,7 +983,9 @@ pub struct ShadowStack;
 pub fn enabled() -> bool;
 
 /// Decide, on the BSP in Phase 4, whether the kernel runs on shadow stacks:
-/// when the BSP reports CET shadow stacks (CPUID.(EAX=7,ECX=0):ECX[7]).
+/// when the BSP reports CET shadow stacks (CPUID.(EAX=7,ECX=0):ECX[7]) and
+/// the Phase-1 transient-execution selection uses no control that rewrites a
+/// return (`select_mitigations`). RISC-V: never.
 pub unsafe fn decide();
 
 /// Write a CPU's `CPU_PAGES` pages at direct-map `base` while they are still

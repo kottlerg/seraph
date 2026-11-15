@@ -276,7 +276,8 @@ address, the reason, and the span's end.
    per 2 MiB chunk of RAM, from which the kernel-stack guard pages split the direct map
    (`mm::stack_guard::seed`; [memory-internals.md](memory-internals.md) § Kernel Stack
    Guards). Decide whether the kernel runs on shadow stacks: on x86-64 when the BSP
-   reports CET shadow stacks, never on riscv64 (`shadow_stack::decide`;
+   reports CET shadow stacks and the step-4 selection of Phase 1 rewrites no return, never
+   on riscv64 (`shadow_stack::decide`;
    [return-address-integrity.md](return-address-integrity.md)); with them on, every
    Thread slot ends in a shadow-stack page (`thread_slot::set_shadow_stack_pages`)
 4. Fix every CPU set's width at the boot's CPU count (`cpu_mask::set_boot_cpu_count`,

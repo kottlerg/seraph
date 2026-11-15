@@ -333,8 +333,12 @@ shadow stacks), and Intel states that retpoline is incompatible with CET shadow 
 BHI guidance). Intel's parts with `CET_SS` (Tiger Lake and later) also enumerate `IBRS_ALL`, and
 AMD's parts from Zen 4 enumerate Automatic IBRS, so among released parts the conflict reaches AMD
 Zen 3, which has `CET_SS` without Automatic IBRS, and a guest whose hypervisor hides `IBRS_ALL`
-or Automatic IBRS but passes `CET_SS`. No such part is in the project's reach to boot
-([#1123](https://github.com/kottlerg/seraph/issues/1123)).
+or Automatic IBRS but passes `CET_SS`. On such a CPU the kernel runs without shadow stacks: the
+mitigation takes precedence, and `shadow_stack::decide` turns them on only when no selected
+control rewrites a return
+([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism). No such part
+is in the project's reach to boot ([#1123](https://github.com/kottlerg/seraph/issues/1123)); the
+host tests of `mitigation.rs` cover the rule over the Zen 3, Zen 4 and development-host vectors.
 
 ### Branch history injection
 
@@ -372,8 +376,9 @@ enumerates none of `MD_CLEAR` (`CPUID.(EAX=07H,ECX=0):EDX[10]`), `RFDS_CLEAR` or
 On a part with `rsb_alternate`, a `ret` that finds the RSB empty may be predicted from the
 branch target buffer, which the retpoline sequence leaves open. Where retpoline is selected on
 such a part, `switch` fills the RSB with 32 entries that trap speculation (`int3`) once it is on
-the next thread's stack, then runs `lfence` (Intel's retpoline white paper). With shadow stacks
-on, it drops the fill's 32 shadow-stack entries as well (`incsspq`).
+the next thread's stack, then runs `lfence` (Intel's retpoline white paper). Retpoline keeps
+shadow stacks off (§ Branch target injection), so the fill runs only without them, and its return
+addresses are dropped from the stack alone.
 
 Where an IBPB does not clear the RSB (`ibpb_leaves_rsb`), the fill after an IBPB is selected.
 The kernel issues no IBPB, so the control is in effect wherever it is selected and no boot

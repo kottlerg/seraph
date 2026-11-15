@@ -498,7 +498,8 @@ unsafe fn kernel_entry_post_rebase(
     }
 
     // Decide whether the kernel runs on shadow stacks (x86-64: when the BSP
-    // reports CET shadow stacks; riscv64: never), before the per-CPU storage
+    // reports CET shadow stacks and the Phase-1 transient-execution selection
+    // rewrites no return; riscv64: never), before the per-CPU storage
     // below keeps each CPU's shadow-stack pages and before any Thread slot is
     // sized (core/kernel/docs/return-address-integrity.md).
     #[cfg(not(test))]

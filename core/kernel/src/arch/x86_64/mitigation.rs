@@ -125,6 +125,16 @@ impl Controls
     {
         self.0 & bits == bits
     }
+
+    /// Whether a selected control rewrites a return, which keeps the kernel
+    /// off shadow stacks (`shadow_stack::decide`;
+    /// core/kernel/docs/return-address-integrity.md § x86-64 Mechanism): the
+    /// mitigation of an enumerated vulnerability takes precedence over
+    /// return-address integrity.
+    pub fn rewrites_returns(self) -> bool
+    {
+        self.0 & RETURN_REWRITING != 0
+    }
 }
 
 /// The controls `inputs` select (core/kernel/docs/transient-execution.md
@@ -202,6 +212,12 @@ pub fn select(inputs: Inputs) -> Controls
     }
     Controls(bits)
 }
+
+/// The controls whose code returns to an address the shadow stack does not
+/// hold: the retpoline sequence's `ret` goes to the branch target, not to the
+/// caller, which raises `#CP` under CET shadow stacks. Every such control
+/// excludes shadow stacks ([`Controls::rewrites_returns`]).
+const RETURN_REWRITING: u64 = SPECULATION_CONTROL_RETPOLINE;
 
 /// Every control, with its name in the serial log, in `SPECULATION_CONTROL_*`
 /// bit order.
@@ -281,6 +297,12 @@ static SERAPH_VERW_ON_EXIT: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 static SERAPH_VERW_SELECTOR: u16 = super::gdt::KERNEL_DS;
+
+/// The controls [`install`] published.
+pub fn selected() -> Controls
+{
+    Controls(SELECTED.load(Ordering::Relaxed))
+}
 
 /// Publish `controls`, selected from `inputs`: the selection word every CPU
 /// applies and the flags the entry and exit code read.
@@ -584,8 +606,8 @@ core::arch::global_asm!(
 #[cfg(test)]
 mod tests
 {
-    use super::*;
     use super::super::vulnerability::{Vendor, derive};
+    use super::*;
 
     /// A CPU of `vendor` with `CPUID.01H:EAX` = `signature` and every other
     /// input zero; the vectors below set the words they need.
@@ -940,5 +962,54 @@ mod tests
         assert!(!VERW_BEFORE_IDLE.load(Ordering::Relaxed));
         assert_eq!(SELECTED.load(Ordering::Relaxed), controls.bits());
         assert_eq!(INPUTS.load(Ordering::Relaxed), SPECULATION_INPUT_SPECTRE_V2);
+    }
+
+    // Defect caught: shadow stacks turned on beside the retpoline sequence,
+    // whose `ret` to the branch target raises #CP, or kept off where no
+    // selected control rewrites a return. The vectors above, each with
+    // `CET_SS` enumerated: the development host (Alder Lake, enhanced IBRS)
+    // and Zen 4 (Automatic IBRS, AMD's APM2 § 3.1.7) keep shadow stacks; Zen 3
+    // (no Automatic IBRS, so the retpoline sequence, AMD-SB-1036) and the CI's
+    // TCG CPU lose them.
+    #[test]
+    fn shadow_stacks_yield_to_a_return_rewriting_control()
+    {
+        let mut host = cpu(Vendor::Intel, 0x0009_0672);
+        host.leaf7_edx = 1 << 29;
+        host.leaf7_2_edx = 0x17;
+        host.arch_capabilities = 0x4000_0000_1400_E06B;
+        let mut zen4 = cpu(Vendor::Amd, 0x00A6_0F12);
+        zen4.ext21_eax = (1 << 8) | (1 << 5);
+        let zen3 = cpu(Vendor::Amd, 0x00A2_0F10);
+        let mut tcg = cpu(Vendor::Amd, 0x0000_0663);
+        tcg.ext8_ebx = 0x204;
+        tcg.ext21_eax = 0x41;
+        for (name, part, keeps_shadow_stacks) in [
+            ("development host", &host, true),
+            ("Zen 4", &zen4, true),
+            ("Zen 3", &zen3, false),
+            ("TCG", &tcg, false),
+        ]
+        {
+            let controls = select(Inputs::of(part, &derive(part)));
+            assert_eq!(!controls.rewrites_returns(), keeps_shadow_stacks, "{name}");
+        }
+    }
+
+    // Defect caught: a selection that fills the return stack buffer on a
+    // switch while shadow stacks stay on: `switch`'s fill drops its return
+    // addresses from the stack alone, which is sound only with shadow stacks
+    // off. Every input set is tried.
+    #[test]
+    fn switch_fill_is_never_selected_with_shadow_stacks()
+    {
+        for inputs in 0..=::syscall::SPECULATION_INPUT_ALL
+        {
+            let controls = select(Inputs(inputs));
+            if controls.has(SPECULATION_CONTROL_RSB_FILL_SWITCH)
+            {
+                assert!(controls.rewrites_returns(), "inputs {inputs:#x}");
+            }
+        }
     }
 }

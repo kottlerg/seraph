@@ -135,8 +135,11 @@ Each feature is classified per architecture as one of:
   falls back to xAPIC MMIO.
 - **AES-NI and SHA-NI** — crypto acceleration (design intent; not yet enabled).
 - **CET shadow stack (SHSTK)** — supervisor shadow stacks, return-address integrity for the
-  kernel, enabled when the boot CPU reports `CET_SS`; every other CPU must then report it too,
-  or the boot halts. Without it the kernel runs unprotected and otherwise unchanged
+  kernel, enabled when the boot CPU reports `CET_SS` and the kernel's transient-execution
+  selection uses no control that rewrites a return (the retpoline sequence, which a CPU without
+  enhanced or Automatic IBRS takes, AMD Zen 3 among them): the mitigation takes precedence.
+  Once enabled, every other CPU must report `CET_SS` too, or the boot halts. Without it the
+  kernel runs unprotected and otherwise unchanged
   ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)
   § x86-64 Mechanism).
 - **TSC-deadline timer mode** — drives the preemption tick when present; the periodic APIC

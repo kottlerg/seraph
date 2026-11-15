@@ -199,14 +199,27 @@ mod live
     }
 
     /// Decide, on the BSP, whether the kernel runs on shadow stacks: when the
-    /// BSP reports `CET_SS`. Every AP must then report it too ([`prepare_ap`]).
+    /// BSP reports `CET_SS` and no transient-execution control the kernel
+    /// selected rewrites a return (`mitigation::Controls::rewrites_returns`).
+    /// Every AP must then report `CET_SS` too ([`prepare_ap`]). Logs the
+    /// reason when the CPU reports `CET_SS` and the selection keeps shadow
+    /// stacks off.
     ///
     /// # Safety
-    /// Phase 4, on the single boot thread, once, before any per-CPU or Thread
-    /// shadow-stack page is laid out.
+    /// Phase 4, on the single boot thread, once, after Phase 1 installed the
+    /// selection and before any per-CPU or Thread shadow-stack page is laid
+    /// out.
     pub unsafe fn decide()
     {
-        ENABLED.store(has_cet_ss(), Ordering::Relaxed);
+        let cet_ss = has_cet_ss();
+        let on = cet_ss && !super::super::mitigation::selected().rewrites_returns();
+        if cet_ss && !on
+        {
+            crate::kprintln!(
+                "shadow stacks: off, CET_SS reported but the retpoline sequence is selected"
+            );
+        }
+        ENABLED.store(on, Ordering::Relaxed);
     }
 
     /// Write the [`super::CPU_PAGES`] pages at the direct-map address `base` while

@@ -208,7 +208,8 @@ pub fn new_state(entry: u64, stack_top: u64, arg: u64, kind: ThreadKind) -> Save
 /// Without shadow stacks it resumes through the retpoline thunk
 /// (`__x86_indirect_thunk_r11`). On next's stack it fills the return stack
 /// buffer first where the transient-execution selection asks for it
-/// (`mitigation`, `SPECULATION_CONTROL_RSB_FILL_SWITCH`).
+/// (`mitigation`, `SPECULATION_CONTROL_RSB_FILL_SWITCH`), which it does only
+/// with shadow stacks off.
 ///
 /// # Safety
 /// Both pointers must be valid, aligned `SavedState` values. The caller
@@ -320,10 +321,12 @@ pub unsafe extern "C" fn switch(
         // buffer underflows, the retpoline build would otherwise leave next's
         // returns to a prediction the outgoing thread trained
         // (core/kernel/docs/transient-execution.md § Controls). Each iteration
-        // makes two calls and drops their return addresses; with shadow stacks
-        // on, the 32 shadow copies are dropped too (`incsspq`). The `lfence`
-        // at the join stops a mispredicted test from running past it. Clobbers
-        // rcx and the flags; r11 is dead after the publication above.
+        // makes two calls and drops their return addresses from the stack.
+        // The fill is selected only with the retpoline sequence, which keeps
+        // shadow stacks off (`mitigation::Controls::rewrites_returns`), so no
+        // shadow-stack copy is left to drop. The `lfence` at the join stops a
+        // mispredicted test from running past it. Clobbers rcx and the flags;
+        // r11 is dead after the publication above.
         "cmp byte ptr [rip + {rsb_fill}], 0",
         "je 5f",
         "mov ecx, 16",
@@ -337,10 +340,6 @@ pub unsafe extern "C" fn switch(
         "add rsp, 16",
         "dec ecx",
         "jnz 6b",
-        "cmp byte ptr [rip + {shadow}], 0",
-        "je 5f",
-        "mov ecx, 32",
-        "incsspq rcx",
         "5:",
         "lfence",
         // Restore rflags (may re-enable IF). Doing this AFTER the rsp

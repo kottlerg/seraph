@@ -20,9 +20,7 @@ boot-protocol = { path = "../abi/boot-protocol" }
 # `test-debug-port`: the GDB remote serial protocol's framing, shared with the
 # guest fixture it drives.
 gdb-rsp = { path = "../shared/gdb-rsp" }
-gpt = "4"
 fatfs = "0.3"
-uuid = "1"
 # Regex matching for run-parallel pass/fail classification.
 regex = "1"
 # Unix termios / ioctl bindings for TerminalGuard. Used unconditionally
@@ -52,6 +50,9 @@ ipc = { path = "../shared/ipc" }
 # through, and the level codes it returns.
 init-log-levels = { path = "../services/init/log-levels" }
 log = { path = "../shared/log" }
+# vfsd's GPT parser, which the disk tooling's tests read the tables mkdisk
+# writes back through.
+vfsd-gpt = { path = "../services/vfsd/gpt" }
 
 # Windows console-mode bindings for TerminalGuard. Only pulled in for
 # Windows builds; Linux/macOS/BSD builds skip this crate entirely.

@@ -1672,6 +1672,40 @@ fn take_pages(pages: u64) -> Vec<(u64, u64)>
     held
 }
 
+/// Release the grants `held` while a helper thread waits for the level to
+/// change ([`std::os::seraph::wait_memory_pressure`]), having stopped and
+/// started the helper first while it waits, and return the level its wait
+/// returned.
+fn release_under_stopped_waiter(held: Vec<(u64, u64)>) -> std::os::seraph::MemoryPressure
+{
+    let (cap_tx, cap_rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        cap_tx
+            .send(std::os::seraph::thread::current_thread_cap())
+            .expect("publishing the waiter's cap");
+        std::os::seraph::wait_memory_pressure(Some(PRESSURE_WAIT))
+    });
+    let waiter_cap = cap_rx.recv().expect("the waiter's cap");
+    for _ in 0..PRESSURE_WAITER_STOPS
+    {
+        std::thread::sleep(PRESSURE_WAITER_STOP_GAP);
+        if waiter.is_finished()
+        {
+            break;
+        }
+        syscall::thread_stop(waiter_cap).expect("stopping the waiter");
+        syscall::thread_start(waiter_cap).expect("starting the waiter");
+    }
+    for (cap, id) in held
+    {
+        release_grant(cap, id);
+    }
+    waiter
+        .join()
+        .expect("joining the waiter")
+        .expect("wait on the runtime's Notification across stops of its thread")
+}
+
 /// memmgr's memory-pressure level and its signal
 /// (services/memmgr/docs/memory-pool.md § Memory pressure):
 ///
@@ -1787,32 +1821,7 @@ pub fn pressure_phase(_: &Caps)
         ipc::memmgr_errors::SUCCESS,
         "REGISTER_PRESSURE restoring the runtime's"
     );
-    let (cap_tx, cap_rx) = std::sync::mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        cap_tx
-            .send(std::os::seraph::thread::current_thread_cap())
-            .expect("publishing the waiter's cap");
-        std::os::seraph::wait_memory_pressure(Some(PRESSURE_WAIT))
-    });
-    let waiter_cap = cap_rx.recv().expect("the waiter's cap");
-    for _ in 0..PRESSURE_WAITER_STOPS
-    {
-        std::thread::sleep(PRESSURE_WAITER_STOP_GAP);
-        if waiter.is_finished()
-        {
-            break;
-        }
-        syscall::thread_stop(waiter_cap).expect("stopping the waiter");
-        syscall::thread_start(waiter_cap).expect("starting the waiter");
-    }
-    for (cap, id) in held
-    {
-        release_grant(cap, id);
-    }
-    let level = waiter
-        .join()
-        .expect("joining the waiter")
-        .expect("wait on the runtime's Notification across stops of its thread");
+    let level = release_under_stopped_waiter(held);
     assert_eq!(level, MemoryPressure::Normal, "level after the release");
     assert_eq!(
         take_bits(own_sig),

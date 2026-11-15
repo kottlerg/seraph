@@ -78,7 +78,7 @@ use std::os::seraph::startup_info;
 use std::time::{Duration, Instant};
 
 use crate::bootstrap::Caps;
-use crate::phases::drivers::INPUT_ATTEMPTS;
+use crate::phases::drivers::DEVICE_WAIT_MS;
 use crate::runner::Phase;
 
 /// What a phase that needs the test-only devices or class files says when
@@ -174,8 +174,8 @@ fn assert_denies(devmgr: u64, label: u64, label_name: &str, bit_name: &str)
     );
 }
 
-/// `QUERY_DEVICE` and `MINT_CLASS_SEND` on `devmgr.registry` and on
-/// `devmgr.bind`, neither of whose badges carries a class slot or
+/// `QUERY_DEVICE`, `WATCH_CLASS`, and `MINT_CLASS_SEND` on `devmgr.registry`
+/// and on `devmgr.bind`, neither of whose badges carries a class slot or
 /// `CLASS_AUTHORITY`, reply `UNAUTHORIZED`.
 fn class_deny_phase(caps: &Caps)
 {
@@ -189,6 +189,12 @@ fn class_deny_phase(caps: &Caps)
             cap,
             ipc::devmgr_labels::QUERY_DEVICE,
             "QUERY_DEVICE",
+            "a class slot",
+        );
+        assert_denies(
+            cap,
+            ipc::devmgr_labels::WATCH_CLASS,
+            "WATCH_CLASS",
             "a class slot",
         );
         assert_denies(
@@ -243,17 +249,14 @@ fn input_instance_ordinal_phase(caps: &Caps)
         "input ordinal: no devmgr.class.input cap seeded"
     );
 
-    let mut first = query_input(devmgr, None);
-    for _ in 1..INPUT_ATTEMPTS
-    {
-        if first.label != ipc::devmgr_errors::NO_DEVICE
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-        first = query_input(devmgr, None);
-    }
-    assert_granted(&first, "input QUERY_DEVICE without an ordinal");
+    // Served once the settle of devmgr's drivers-directory pass ends.
+    let served = await_class(devmgr, "input")
+        .unwrap_or_else(|l| panic!("input ordinal: no input driver served (status {l:#x})"));
+    let _ = syscall::cap_delete(served);
+    assert_granted(
+        &query_input(devmgr, None),
+        "input QUERY_DEVICE without an ordinal",
+    );
     assert_granted(
         &query_input(devmgr, Some(0)),
         "input QUERY_DEVICE ordinal 0",
@@ -314,6 +317,82 @@ fn query_class(class: u64, ordinal: u64, what: &str) -> Result<u64, u64>
     }
 }
 
+/// The first live driver of the class SEND `class`, waited for on a
+/// `WATCH_CLASS` watch for at most [`DEVICE_WAIT_MS`] while devmgr serves
+/// none (`ipc::await_device`): the driver SEND, or devmgr's refusal label.
+fn await_class(class: u64, what: &str) -> Result<u64, u64>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    match unsafe { ipc::await_device(class, DEVICE_WAIT_MS, ipc_buf, || {}) }
+    {
+        Ok(cap) => Ok(cap),
+        Err(ipc::ClassCallError::Refused(label)) => Err(label),
+        Err(e) => panic!("{what} QUERY_DEVICE failed: {e:?}"),
+    }
+}
+
+/// `WATCH_CLASS` on the class SEND `class`: the watch, or devmgr's refusal
+/// label.
+fn watch_class(class: u64) -> Result<ipc::ClassWatch, u64>
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+    match unsafe { ipc::watch_class(class, ipc_buf) }
+    {
+        Ok(watch) => Ok(watch),
+        Err(ipc::ClassCallError::Refused(label)) => Err(label),
+        Err(e) => panic!("devmgr_on_demand_bind: WATCH_CLASS failed: {e:?}"),
+    }
+}
+
+/// Wait at most `ms` milliseconds for devmgr to signal the class watch
+/// `note`; asserts it signals `WATCH_CLASS_CHANGED`, the signal of `what`.
+fn assert_signalled(note: u64, ms: u64, what: &str)
+{
+    let bits = syscall::notification_wait_timeout(note, ms)
+        .unwrap_or_else(|e| panic!("devmgr_on_demand_bind: watch wait failed: {e}"));
+    assert!(
+        bits & ipc::devmgr_labels::WATCH_CLASS_CHANGED != 0,
+        "devmgr_on_demand_bind: no watch signal within {ms} ms when {what}"
+    );
+}
+
+/// A class holds at most `MAX_CLASS_WATCHERS` watches: with `held` live
+/// watches on the class SEND `class`, fill it, find the next registration
+/// refused with `WATCHERS_FULL`, and find one admitted once a watcher has
+/// deleted its copy, which devmgr's sweep finds gone. Deletes every watch it
+/// registered.
+fn assert_watch_bound(class: u64, held: usize)
+{
+    use ipc::devmgr_labels::MAX_CLASS_WATCHERS;
+
+    let mut notes = Vec::new();
+    for _ in held..MAX_CLASS_WATCHERS
+    {
+        let watch = watch_class(class)
+            .unwrap_or_else(|l| panic!("devmgr_on_demand_bind: watch below the bound: {l:#x}"));
+        notes.push(watch.note);
+    }
+    assert_eq!(
+        watch_class(class).map(|w| w.note),
+        Err(ipc::devmgr_errors::WATCHERS_FULL),
+        "devmgr_on_demand_bind: a watch past MAX_CLASS_WATCHERS must be refused"
+    );
+    if let Some(note) = notes.pop()
+    {
+        let _ = syscall::cap_delete(note);
+    }
+    let again = watch_class(class).unwrap_or_else(|l| {
+        panic!("devmgr_on_demand_bind: a gone watch was not dropped for a new one: {l:#x}")
+    });
+    notes.push(again.note);
+    for note in notes
+    {
+        let _ = syscall::cap_delete(note);
+    }
+}
+
 /// Call a fault fixture with `label` and no data.
 fn call_fixture(cap: u64, label: u64) -> Result<ipc::IpcMessage, i64>
 {
@@ -361,7 +440,10 @@ fn bind_test_drivers(devmgr_bind: u64)
 /// destroyed; a served driver's death withdraws its endpoint (a call queued
 /// on it returns) and leaves a tombstone at its ordinal while the later
 /// ordinal keeps its driver; a second bind over the same directory binds
-/// nothing.
+/// nothing. A `WATCH_CLASS` watch on the class is signalled when the bind
+/// serves the fixtures and when the dead one is withdrawn, and the class
+/// holds at most `MAX_CLASS_WATCHERS` watches, a gone one dropped for a new
+/// one.
 fn on_demand_bind_phase(caps: &Caps)
 {
     use ipc::devmgr_errors::{NO_DEVICE, SUCCESS, WITHDRAWN};
@@ -376,6 +458,14 @@ fn on_demand_bind_phase(caps: &Caps)
     assert!(
         fault != 0,
         "devmgr_on_demand_bind: no devmgr.class.test-fault cap seeded: {TEST_DEVICES_HINT}"
+    );
+    // Registered before the free pool is read, so the Notification devmgr
+    // creates for it is not counted against the fixtures' holds.
+    let watch = watch_class(fault)
+        .unwrap_or_else(|l| panic!("devmgr_on_demand_bind: WATCH_CLASS status {l:#x}"));
+    assert_eq!(
+        watch.ordinals, 0,
+        "devmgr_on_demand_bind: the test-fault class served an ordinal before the bind"
     );
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let memmgr = startup_info().memmgr_endpoint;
@@ -401,8 +491,13 @@ fn on_demand_bind_phase(caps: &Caps)
          the bind's settle bound {bound:?}: the registry served nothing while it settled"
     );
 
-    // Served once the bind's settle has ended: a query that finds no driver
-    // waits for it.
+    // The watch is signalled once the bind's settle has ended and devmgr
+    // serves the fixtures; the query then names one.
+    assert_signalled(
+        watch.note,
+        ipc::devmgr_labels::SETTLE_TIMEOUT_MS + DEVICE_WAIT_MS,
+        "the bind served the test-fault fixtures",
+    );
     let first = match query_class(fault, 0, "test-fault")
     {
         Ok(cap) => cap,
@@ -425,6 +520,9 @@ fn on_demand_bind_phase(caps: &Caps)
         Err(NO_DEVICE),
         "devmgr_on_demand_bind: only the two serving fixtures may be served"
     );
+    // Take the bits of the second fixture's serving, which the query above
+    // waited for, so the next wait sees the withdrawal's.
+    let _ = syscall::notification_try_wait(watch.note);
 
     // The fixture at ordinal 0 replies, then dies without receiving again, so
     // the PING sent after the reply is queued on its endpoint until devmgr
@@ -435,6 +533,9 @@ fn on_demand_bind_phase(caps: &Caps)
         call_fixture(first, FAULT_PING).is_err(),
         "a call queued on a dead served driver's endpoint must return an error"
     );
+    // The withdrawal signals the watch in the hold that leaves the
+    // tombstone, before the revocation that returned the queued call.
+    assert_signalled(watch.note, DEVICE_WAIT_MS, "the dead fixture was withdrawn");
     assert_eq!(
         query_class(fault, 0, "test-fault"),
         Err(WITHDRAWN),
@@ -457,11 +558,13 @@ fn on_demand_bind_phase(caps: &Caps)
 
     assert_holds_returned(memmgr, free_before);
     let rebind = assert_rebind_binds_nothing(devmgr, fault, bound);
+    assert_watch_bound(fault, 1);
+    let _ = syscall::cap_delete(watch.note);
 
     std::os::seraph::log!(
         "devmgr_on_demand_bind passed: settle ended at its bound after {settle:?}, \
          never-ready and refusing fixtures destroyed, dead driver withdrawn, later ordinal \
-         kept, second bind settled after {rebind:?}"
+         kept, second bind settled after {rebind:?}, watch signalled on serve and withdrawal"
     );
 }
 
@@ -535,19 +638,9 @@ fn call_test_dma(caps: &Caps, label: u64, phase: &str) -> ipc::IpcMessage
         class != 0,
         "{phase}: no devmgr.class.test-dma cap seeded: {TEST_DEVICES_HINT}"
     );
-    // Served once the settle of devmgr's drivers-directory pass ends, which
-    // can lag svctest's start as the input driver's does.
-    let mut query = query_class(class, 0, "test-dma");
-    for _ in 1..INPUT_ATTEMPTS
-    {
-        if query != Err(ipc::devmgr_errors::NO_DEVICE)
-        {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-        query = query_class(class, 0, "test-dma");
-    }
-    let fixture = match query
+    // Served once the settle of devmgr's drivers-directory pass ends, as the
+    // input driver is.
+    let fixture = match await_class(class, "test-dma")
     {
         Ok(cap) => cap,
         Err(ipc::devmgr_errors::NO_DEVICE) => panic!(

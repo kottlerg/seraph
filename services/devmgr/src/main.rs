@@ -824,6 +824,7 @@ impl Registry
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
             }
             ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf),
+            ipc::devmgr_labels::WATCH_CLASS => self.watch_class(msg, ipc_buf),
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
             _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
@@ -883,6 +884,70 @@ impl Registry
         }
     }
 
+    /// `WATCH_CLASS`: create a Notification, add it to the watchers of the
+    /// class the caller's class badge names, and reply with a wait-only copy
+    /// and the ordinals the class has served, read in the hold that adds
+    /// the watcher, so a change after it signals the watch. The
+    /// Notification is created before the lock is taken, since the slab can
+    /// call memmgr. A reply that fails deletes the copy, so the watch is
+    /// found gone and dropped at the next sweep ([`release_if_gone`]).
+    /// Logs nothing, as `QUERY_DEVICE` does not.
+    fn watch_class(&self, msg: &IpcMessage, ipc_buf: *mut u64)
+    {
+        let class = ipc::devmgr_labels::class_badge::decode(msg.badge)
+            .map(|(slot, _)| slot)
+            .filter(|&slot| self.lock().served.classes.get_slot(slot).is_some());
+        let Some(slot) = class
+        else
+        {
+            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            return;
+        };
+        if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+        {
+            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            return;
+        }
+        let Some(note) = std::os::seraph::object_slab_retype(
+            std::os::seraph::NOTIFICATION_RETYPE_BYTES,
+            |slab| syscall::cap_create_notification(slab).ok(),
+        )
+        else
+        {
+            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            return;
+        };
+        let Ok(copy) = syscall::cap_derive(note, syscall::RIGHTS_NTF_WAIT)
+        else
+        {
+            let _ = syscall::cap_delete(note);
+            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            return;
+        };
+        let watched = self
+            .lock()
+            .served
+            .classes
+            .watch(slot, note, release_if_gone);
+        let Ok(ordinals) = watched
+        else
+        {
+            let _ = syscall::cap_delete(copy);
+            let _ = syscall::cap_delete(note);
+            reply_status(ipc::devmgr_errors::WATCHERS_FULL, ipc_buf);
+            return;
+        };
+        let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
+            .word(0, u64::try_from(ordinals).unwrap_or(u64::MAX))
+            .cap(copy)
+            .build();
+        // SAFETY: ipc_buf is this worker's registered IPC buffer.
+        if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+        {
+            let _ = syscall::cap_delete(copy);
+        }
+    }
+
     /// `BIND_DRIVERS`: keep the directory cap it carries, reply, and post the
     /// on-demand pass over it, which the control thread runs and which
     /// deletes the cap once it ends. Admitted only once `SET_DRIVERS_DIR`
@@ -924,6 +989,35 @@ impl Registry
         reply_status(ipc::devmgr_errors::SUCCESS, ipc_buf);
         self.signal_jobs();
     }
+}
+
+/// Whether the class watch `note` is gone: devmgr's copy of its Notification
+/// is the only reference left (`CAP_INFO_SOLE_REFERENCE`), every copy its
+/// watcher held being deleted. Deletes `note` then. Once it answers so it
+/// keeps answering so, since only devmgr could take a new reference through
+/// its copy. A failed inquiry answers `false`, keeping the watch. Makes no
+/// call that blocks, so it runs under the registry lock.
+fn release_if_gone(note: u64) -> bool
+{
+    let gone = syscall::cap_info(note, syscall::CAP_INFO_SOLE_REFERENCE) == Ok(1);
+    if gone
+    {
+        let _ = syscall::cap_delete(note);
+    }
+    gone
+}
+
+/// Signal the class watch `note` ([`ipc::devmgr_labels::WATCH_CLASS_CHANGED`])
+/// and return `true`, or release it and return `false` when it is gone
+/// ([`release_if_gone`]). Makes no call that blocks.
+fn signal_watcher(note: u64) -> bool
+{
+    if release_if_gone(note)
+    {
+        return false;
+    }
+    let _ = syscall::notification_send(note, ipc::devmgr_labels::WATCH_CLASS_CHANGED);
+    true
 }
 
 /// The IOMMU drivers a boot can spawn: one, of the architecture's family.
@@ -1831,7 +1925,8 @@ impl ServedDrivers
         {
             return Some((spawned.driver, "its device's IOMMU is gone; withdrawn"));
         }
-        let list = match spawned.serves
+        let serves = spawned.serves;
+        let list = match serves
         {
             Serves::Class(class) => self.classes.intern(&class),
             Serves::Iommu => Some(&mut self.iommu),
@@ -1852,6 +1947,10 @@ impl ServedDrivers
         }
         // Room was reserved just above, so the push holds.
         let _ = list.push(spawned.badge, spawned.driver);
+        if let Serves::Class(class) = serves
+        {
+            self.classes.signal(&class, signal_watcher);
+        }
         None
     }
 
@@ -1868,21 +1967,26 @@ impl ServedDrivers
     /// Take out the served driver whose device badge is `badge`, leaving a
     /// tombstone at its ordinal, with its class: `None` for the IOMMU driver,
     /// whose record holds nothing to release and whose death the caller
-    /// fails the client on; a class's driver the caller withdraws. `None`
-    /// when no driver is served under `badge`.
+    /// fails the client on; a class's driver the caller withdraws, its
+    /// class's watchers signalled. `None` when no driver is served under
+    /// `badge`.
     fn take_dead(&mut self, badge: u64) -> Option<(Option<ClassName>, ServedDriver)>
     {
         if let Some(record) = self.iommu.withdraw(badge)
         {
             return Some((None, record));
         }
-        self.classes
+        let (class, driver) = self
+            .classes
             .iter_mut()
-            .find_map(|(class, served)| served.withdraw(badge).map(|d| (Some(*class), d)))
+            .find_map(|(class, served)| served.withdraw(badge).map(|d| (*class, d)))?;
+        self.classes.signal(&class, signal_watcher);
+        Some((Some(class), driver))
     }
 
     /// Take out the first served driver of a device the IOMMU confines,
-    /// leaving its tombstone, for the caller to withdraw.
+    /// leaving its tombstone, for the caller to withdraw, its class's
+    /// watchers signalled.
     fn take_confined(&mut self) -> Option<(ClassName, ServedDriver)>
     {
         let confined = |d: &ServedDriver| {
@@ -1890,23 +1994,25 @@ impl ServedDrivers
                 .as_ref()
                 .is_some_and(bind::PciDeviceCaps::confined)
         };
+        let mut taken = None;
         for (class, served) in self.classes.iter_mut()
         {
             let found = core::cell::Cell::new(false);
-            let mut taken = None;
             served.withdraw_matching(
                 |d| !found.get() && confined(d),
                 |d| {
                     found.set(true);
-                    taken = Some(d);
+                    taken = Some((*class, d));
                 },
             );
-            if let Some(driver) = taken
+            if taken.is_some()
             {
-                return Some((*class, driver));
+                break;
             }
         }
-        None
+        let (class, driver) = taken?;
+        self.classes.signal(&class, signal_watcher);
+        Some((class, driver))
     }
 }
 

@@ -938,9 +938,7 @@ fn name_data_folds_to_constants()
     // method's code alike.
     let long = |len: usize| string(&"a".repeat(len));
     let ns = load(&name_obj("STR1", &long(crate::MAX_BUFFER_BYTES)));
-    assert!(
-        matches!(data(&ns, "\\STR1"), Data::String(s) if s.len() == crate::MAX_BUFFER_BYTES)
-    );
+    assert!(matches!(data(&ns, "\\STR1"), Data::String(s) if s.len() == crate::MAX_BUFFER_BYTES));
     let mut ns = Namespace::new().unwrap();
     let r = ns
         .load_table(&table(&cat(&[

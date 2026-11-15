@@ -7555,7 +7555,8 @@ pub unsafe fn post_death_notification(tcb: *mut thread::ThreadControlBlock, exit
 pub struct AspaceFaultPost
 {
     /// First node of the observer chain read under the space's `death_lock`
-    /// when the fault was recorded; null when the space has no observer or
+    /// when the fault was recorded; null when the space has no observer, the
+    /// space had already faulted (its first fault posts its observers), or
     /// the thread has no address space.
     first: *mut thread::DeathObserver,
     /// The recorded fault's exit reason.
@@ -7567,10 +7568,12 @@ pub struct AspaceFaultPost
 /// observer bound *after* it still learns of the death, and snapshot the
 /// observers to notify.
 ///
-/// Records the reason (first fault wins) and reads the observer chain's head in
-/// one hold of the space's `death_lock`, so every observer is notified exactly
-/// once: one linked before the record is in the snapshot, and a bind after it
-/// receives the retained reason through `AddressSpace::bind_or_retained`.
+/// On the space's first terminal fault, records the reason and reads the
+/// observer chain's head in one hold of the space's `death_lock`; a later
+/// fault records nothing and snapshots no observer. So every observer is
+/// notified exactly once, with the retained reason: one linked before the
+/// first fault is in that fault's snapshot alone, and a bind after it receives
+/// the retained reason through `AddressSpace::bind_or_retained`.
 ///
 /// The terminal-fault path calls this BEFORE it commits the thread's `Exited`
 /// state: the `death_lock` release here precedes the all-locks commit, so a
@@ -7611,10 +7614,10 @@ pub unsafe fn record_aspace_terminal_fault(
 /// node's `EventQueue`. The kernel only notifies here — it does not enumerate
 /// or terminate the address space's threads.
 ///
-/// On a main-thread terminal fault this fires in addition to the per-thread
-/// [`post_death_notification`]; when both target the same consumer queue
-/// (procmgr's death EQ), the consumer reaps the first and the second is harmless
-/// residue — the process is torn down regardless.
+/// When the main thread's terminal fault is its space's first, this fires in
+/// addition to the per-thread [`post_death_notification`]; when both target
+/// the same consumer queue (procmgr's death EQ), the consumer reaps the first
+/// and the second is harmless residue — the process is torn down regardless.
 ///
 /// # Safety
 /// `post` must come from [`record_aspace_terminal_fault`] on this terminal-fault

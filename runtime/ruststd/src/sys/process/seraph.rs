@@ -412,9 +412,9 @@ impl Command {
         // Create the per-child death `EventQueue` BEFORE issuing
         // CREATE_FROM_FILE so a POST-only copy can ride along as the
         // death-relay cap. procmgr binds that copy as an address-space death
-        // observer on the child, so a terminal fault in *any* of the child's
-        // threads (not just the main thread) posts the fault class to this
-        // queue and `wait()` returns. Four covers one post from each source
+        // observer on the child, so the first terminal fault in *any* of the
+        // child's threads (not just the main thread) posts the fault class to
+        // this queue, once, and `wait()` returns. Four covers one post from each source
         // that targets the queue: the main thread's death, the address-space
         // death observer, `kill`'s `EXIT_KILLED`, and the bridge's drop
         // sentinel.

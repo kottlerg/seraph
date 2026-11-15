@@ -53,9 +53,10 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //
 //   Handshake-checked at first contact (`data[0]` unless noted):
 //     FS_LABELS_VERSION     — fs_labels::FS_MOUNT             (vfsd ↔ fatfs)
-//     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd)
-//                             and vfsd_labels::GET_SWAP_PARTITION
-//                             (swap service ↔ vfsd)
+//     VFSD_LABELS_VERSION   — vfsd_labels::GET_SYSTEM_ROOT_CAP (init ↔ vfsd),
+//                             vfsd_labels::GET_SWAP_PARTITION
+//                             (swap service ↔ vfsd), and every
+//                             vfsd_labels::UNMOUNT request
 //     BLK_LABELS_VERSION    — blk_labels::REGISTER_PARTITION   (vfsd ↔ virtio-blk)
 //                             and blk_labels::BLK_GET_GEOMETRY
 //                             (vfsd, fatfs ↔ virtio-blk)
@@ -1752,7 +1753,7 @@ pub mod pwrmgr_errors
 
 /// Wire-protocol version of [`vfsd_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const VFSD_LABELS_VERSION: u32 = 3;
+pub const VFSD_LABELS_VERSION: u32 = 4;
 /// IPC labels for the VFS daemon (`vfsd`).
 pub mod vfsd_labels
 {
@@ -1763,6 +1764,25 @@ pub mod vfsd_labels
     /// [`MOUNT_AUTHORITY`]; vfsd replies `UNAUTHORIZED` otherwise, before it
     /// reads the request.
     pub const MOUNT: u64 = 10;
+    /// Unmount the filesystem mounted at a path, which then falls through
+    /// to the root filesystem's directory of the same name
+    /// (`services/vfsd/docs/vfs-ipc-interface.md` § Label 11).
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::VFSD_LABELS_VERSION`],
+    /// `data[1]` = path length, `data[2..]` = path bytes; [`UNMOUNT_FORCE`]
+    /// in the label. The caller's badge MUST carry [`MOUNT_AUTHORITY`].
+    /// Reply: `SUCCESS` once the driver is gone; `BUSY` with the driver's
+    /// count of live opens in `data[0]`, the mount kept, when the request
+    /// lacks [`UNMOUNT_FORCE`] and a file is open; `UNAUTHORIZED` without
+    /// [`MOUNT_AUTHORITY`] and for `/`, which is never unmounted;
+    /// `LABEL_VERSION_MISMATCH` when `data[0]` differs; `NOT_FOUND` for a
+    /// path length the data words do not carry; `NO_MOUNT` when no mount
+    /// is at the path or its unmount is already under way.
+    pub const UNMOUNT: u64 = 11;
+    /// [`UNMOUNT`] flag (label bit 16): unmount even while files are open.
+    /// The driver releases every open, which revokes each client's
+    /// liveness and cache-page caps.
+    pub const UNMOUNT_FORCE: u64 = 1 << 16;
     // Label 12 is reserved and MUST NOT be reused for an unrelated request
     // (services/vfsd/docs/vfs-ipc-interface.md).
     /// Mint a fresh badged SEND on vfsd's namespace endpoint addressing
@@ -1801,9 +1821,10 @@ pub mod vfsd_labels
     /// design intent; not yet implemented.
     pub const SEED_AUTHORITY: u64 = 1u64 << 62;
 
-    /// Authority bit in the vfsd-service-endpoint badge gating [`MOUNT`].
-    /// init mints it, alone, onto the SEND it endows svcmgr with; svcmgr
-    /// publishes that SEND seed-only as
+    /// Authority bit in the vfsd-service-endpoint badge gating [`MOUNT`]
+    /// and [`UNMOUNT`]: who may mount may unmount. init mints it, alone,
+    /// onto the SEND it endows svcmgr with; svcmgr publishes that SEND
+    /// seed-only as
     /// [`crate::published_names::VFSD_MOUNT`], which svctest alone seeds.
     /// The cap is badged, so its holder cannot add [`SEED_AUTHORITY`].
     /// Disjoint position from [`SEED_AUTHORITY`].
@@ -1820,11 +1841,11 @@ pub mod vfsd_labels
 
     /// The badge init stamps on the no-authority SEND on vfsd's service
     /// endpoint that svcmgr publishes seed-only as
-    /// [`crate::published_names::VFSD_DENY`]: no verb bit, so [`MOUNT`]
-    /// and [`GET_SYSTEM_ROOT_CAP`] refuse it, and non-zero, since a holder
-    /// may badge an un-badged SEND itself
+    /// [`crate::published_names::VFSD_DENY`]: no verb bit, so [`MOUNT`],
+    /// [`UNMOUNT`] and [`GET_SYSTEM_ROOT_CAP`] refuse it, and non-zero,
+    /// since a holder may badge an un-badged SEND itself
     /// (docs/capability-model.md § Verb-bit authority pattern). svctest
-    /// asserts the `MOUNT` refusal through it.
+    /// asserts the `MOUNT` and `UNMOUNT` refusals through it.
     pub const DENY_BADGE: u64 = 1;
 }
 
@@ -4158,10 +4179,15 @@ pub mod vfsd_errors
     /// (e.g. `SEED_AUTHORITY` for `GET_SYSTEM_ROOT_CAP`).
     pub const UNAUTHORIZED: u64 = 9;
     /// Caller's compiled `VFSD_LABELS_VERSION` does not match the receiver's.
-    /// The handshake-checked entry point (`GET_SYSTEM_ROOT_CAP`) carries
-    /// the caller's version as `data[0]`; mismatch here means the caller
-    /// was built against a different revision of `shared/ipc`.
+    /// The handshake-checked entry point (`GET_SYSTEM_ROOT_CAP`) and
+    /// `UNMOUNT` carry the caller's version as `data[0]`; mismatch here
+    /// means the caller was built against a different revision of
+    /// `shared/ipc`.
     pub const LABEL_VERSION_MISMATCH: u64 = 10;
+    /// `UNMOUNT` without `UNMOUNT_FORCE` found files open on the mount,
+    /// which stays mounted; `data[0]` carries the driver's count of live
+    /// opens. Codes 7 and 8 are retired and not reused.
+    pub const BUSY: u64 = 11;
     /// Unknown opcode on vfsd endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

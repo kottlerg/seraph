@@ -123,7 +123,8 @@ enum Slot
     /// A mount that lookups cross.
     Mounted(Mount),
     /// A mount whose removal has begun: no lookup crosses it, and no
-    /// install may take the node until [`VfsdRootBackend::remove_mount`].
+    /// install may take the node until [`VfsdRootBackend::remove_mount`]
+    /// or [`VfsdRootBackend::restore_mount`].
     Unmounting(Mount),
 }
 
@@ -375,7 +376,8 @@ impl VfsdRootBackend
     /// Begin removing the mount on the node at `idx`: from now on no
     /// lookup crosses it, its name falls through to the root filesystem
     /// unless a mount below it keeps the node visible as an intermediate,
-    /// and no install may take the node until [`Self::remove_mount`].
+    /// and no install may take the node until [`Self::remove_mount`]
+    /// finishes the removal or [`Self::restore_mount`] undoes it.
     /// Returns the mount's record.
     ///
     /// # Errors
@@ -417,6 +419,27 @@ impl VfsdRootBackend
         };
         node.slot = Slot::Empty;
         Some(mount)
+    }
+
+    /// Undo [`Self::begin_unmount`] on the node at `idx`: lookups cross the
+    /// mount again and its name is visible again, as before the unmount
+    /// began. Used when the driver refuses the unmount. `false`, changing
+    /// nothing, when no removal has begun on the node.
+    pub fn restore_mount(&mut self, idx: u32) -> bool
+    {
+        let Some(node) = self.node_mut(idx)
+        else
+        {
+            return false;
+        };
+        let Slot::Unmounting(mount) = node.slot
+        else
+        {
+            return false;
+        };
+        node.slot = Slot::Mounted(mount);
+        self.adjust_live(idx, u32::saturating_add);
+        true
     }
 
     /// Apply `step` to the live-mount count of the node at `idx` and of
@@ -898,6 +921,55 @@ mod tests
         let idx = unmounting(&mut b, b"/data", CAP);
         assert!(b.remove_mount(idx).is_some());
         assert_eq!(b.remove_mount(idx), None);
+    }
+
+    #[test]
+    fn a_restored_mount_is_crossed_and_listed_again()
+    {
+        let mut b = VfsdRootBackend::new();
+        let idx = unmounting(&mut b, b"/a/b", CAP);
+        assert_eq!(b.lookup(NodeId::ROOT, b"a").err(), Some(NsError::NotFound));
+        assert!(b.restore_mount(idx));
+        // The intermediate above it is visible again, and the mount point
+        // crosses to its driver.
+        assert_eq!(b.local_child_count(0), 1);
+        let a = b.find(b"/a").expect("installed");
+        let view = b
+            .lookup(NodeId::from_raw_truncated(u64::from(a)), b"b")
+            .expect("crossed again");
+        assert_eq!(
+            view.target,
+            EntryTarget::External {
+                endpoint: CAP,
+                node: NodeId::ROOT,
+            }
+        );
+        // The node is mounted, not mid-removal: a fresh unmount begins and
+        // returns the same record, and the restore counted the mount back
+        // in once, so finishing it leaves the tree empty.
+        assert!(!b.can_install(b"/a/b"));
+        assert_eq!(b.begin_unmount(idx), Ok(mount(CAP)));
+        assert_eq!(b.remove_mount(idx), Some(mount(CAP)));
+        assert_eq!(b.local_child_count(0), 0);
+    }
+
+    #[test]
+    fn restore_mount_undoes_only_a_begun_unmount()
+    {
+        let mut b = VfsdRootBackend::new();
+        assert!(b.install(b"/esp", mount(CAP)).is_some());
+        let idx = b.find(b"/esp").expect("installed");
+        assert!(!b.restore_mount(idx));
+        assert!(!b.restore_mount(0));
+        assert!(!b.restore_mount(UNUSED_IDX));
+        // A refused restore did not count the mount in twice: one unmount
+        // takes the name out of the listing.
+        assert_eq!(b.begin_unmount(idx), Ok(mount(CAP)));
+        assert_eq!(b.local_child_count(0), 0);
+        assert!(b.remove_mount(idx).is_some());
+        // A finished removal cannot be undone.
+        assert!(!b.restore_mount(idx));
+        assert_eq!(b.local_child_count(0), 0);
     }
 
     #[test]

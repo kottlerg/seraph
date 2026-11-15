@@ -567,18 +567,24 @@ On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
 the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process_died)
 § Label 4):
 
-1. Recheck the deferred list.
-2. Remove the per-process record from the index. If absent (untracked
-   badge), skip to step 5 — the death notification is idempotent.
-3. For each frame node in the record's frame list and on the run lists of
+1. When the badge names a record, take the record's pressure registration
+   and delete the cap it carried ([Memory pressure](#memory-pressure)). The
+   cap keeps the process's Notification, and the frame it was retyped from,
+   alive, so it goes before the reclaim: the frame then passes the quiescence
+   check of step 4 instead of waiting on the deferred list.
+2. Recheck the deferred list.
+3. Remove the per-process record from the index. If absent (untracked
+   badge), skip to step 6 — the death notification is idempotent.
+4. For each frame node in the record's frame list and on the run lists of
    its regions' chunk tables, rewrite the node into a run of the retained
    Memory cap and insert it into the free pool at its sorted position when
    the frame is quiescent, else onto the deferred list (no fresh node, so
    the step cannot fail).
-4. Return every chunk-table node, every region node, and the record's own
-   node to the arena free list, and drop the record's reference to its budget
-   node, which is freed with it unless a deferred run is still charged to it.
-5. Run coalescing across the newly-freed runs and their adjacent
+5. Return every chunk-table node, every region node, the record's own node,
+   and its caps node to the arena free list, and drop the record's reference
+   to its budget node, which is freed with it unless a deferred run is still
+   charged to it.
+6. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
 No unmap is performed: the dead process's CSpace is torn down by procmgr

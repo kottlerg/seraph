@@ -30,20 +30,22 @@ use syscall_abi::PAGE_SIZE;
 /// intermediate page table a map of the region can need.
 ///
 /// The address space's page-table pool is shared: any mapping of the process
-/// can take the pages a committed fault's donation left in it. The bound holds
-/// whatever they take. The kernel keeps at most one page of a donation for its
-/// own bookkeeping (`SYS_CAP_CREATE_ASPACE`), so each two-page donation gives
-/// the pool at least one page, and a map that still runs out after a donation
-/// needs more pages than the pool held: the donations one map makes number at
-/// most the page tables it creates, and take at most twice that many pages. The
-/// tables committed maps create lie in the region's span and stay until it is
-/// unregistered (a cut keeps them), so they number at most
-/// `pool_funding::pt_pages_for` of its largest length, and the donations at
-/// most [`pt_reserve`] of it. A map creates at most one table per level below
-/// the root, four, which the map's four funding rounds cover; a thread of the
-/// process that maps between two rounds of one map can take a donated page
-/// first, which costs that map a round
-/// (`services/memmgr/docs/memory-pool.md` § Commit).
+/// can take the pages a committed fault's donation left in it. Between two
+/// maps the bound holds whatever they take. The kernel keeps at most one page
+/// of a donation for its own bookkeeping (`SYS_CAP_CREATE_ASPACE`), so each
+/// two-page donation gives the pool at least one page, and a map that still
+/// runs out after a donation needs more pages than the pool held: the
+/// donations one map makes number at most the page tables it creates, and take
+/// at most twice that many pages. The tables committed maps create lie in the
+/// region's span and stay until it is unregistered (a cut and a failed map
+/// keep them), so they number at most `pool_funding::pt_pages_for` of its
+/// largest length, and the donations at most [`pt_reserve`] of it. Two cases
+/// draw past it: a thread of the process that maps between two rounds of one
+/// map can take the donated pages first, and a table in the region's span that
+/// a reclaiming unmap removed once it was empty (the process's own, or one of
+/// another range after a cut emptied the table) is built again. A donation past the reservation is charged without admission, so it
+/// is never refused for budget (`Ledger::committed_donation`;
+/// `services/memmgr/docs/memory-pool.md` § Commit).
 pub const PT_DONATION_PAGES: u64 = 2;
 
 /// Arena slots one chunk of a committed region can take at most: a run
@@ -203,7 +205,7 @@ mod tests
     /// bookkeeping: the pages drawn stay within the reservation, and no map
     /// needs more donations than its funding rounds allow.
     #[test]
-    fn committed_donations_stay_within_the_reservation_however_the_pool_is_shared()
+    fn committed_donations_stay_within_the_reservation_when_the_pool_is_emptied_between_maps()
     {
         const LEVELS: u32 = 4;
         const ROUNDS: u64 = 4;

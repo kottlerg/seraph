@@ -503,7 +503,8 @@ region's whole length before it registers it: its pages and a page-table
 reservation to the caller's budget node, and those and a metadata bound to
 `promised` (`QUERY_POOL_STATUS` `data[8]`). A fault in a committed region is
 then never declined for budget or RAM (codes 7 and 10 below; its page-table
-donations draw on the region's reservation), and only a
+donations draw on the region's reservation, and past it are charged without the
+max test), and only a
 committed region grows by `EXTEND_REGION` (§ Label 12) or shrinks by
 `SHRINK_REGION` (§ Label 13). A refused commitment registers nothing. A reply
 that does not reach the caller unregisters the region again, as a grant whose

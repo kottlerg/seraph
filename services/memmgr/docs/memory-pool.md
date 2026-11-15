@@ -344,8 +344,9 @@ funds the pool itself and maps the run again, at most four times:
    admitted against the max beside that run's pages. It then
    selects a contiguous run of the admitted size from the free pool, or of two when no four-page
    run is free. A donation can keep one page for the kernel's donation bookkeeping, so it never
-   donates a single page. A fault in a committed region instead draws a two-page donation from the
-   region's page-table reservation, which carries its charge, and admits nothing
+   donates a single page. A fault in a committed region instead makes a two-page donation and
+   admits nothing: it draws the donation from the region's page-table reservation, which carries
+   its charge, or, past the reservation, charges it without the max and reserve tests
    ([Commit](#commit)).
 2. It records the run on the process's entry like a grant it did not map: no mapped VA and no
    region id, charged to the budget node. No `RELEASE_MEMORY_CAPS` or `UNREGISTER_REGION` can take
@@ -697,7 +698,8 @@ process while a node below it is alive or a run charged to it is on the deferred
 charge stays in its parent's subtree meanwhile, so a process cannot hand its frames to another
 process, die, and free its subtree's budget while the frames stay held.
 
-**Charging.** A charge is checked against the max of the node and of every ancestor. A request
+**Charging.** A charge is checked against the max of the node and of every ancestor, except a
+committed fault's page-table donation past its region's reservation ([Commit](#commit)). A request
 that would take a subtree over its max fails with `LIMIT`, distinct from the out-of-memory codes of
 system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
 with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
@@ -779,24 +781,30 @@ the reservation is that of the largest length the region has had, since a cut ke
 release below). The computation is the host-tested `free-pool` module `commit`.
 
 **Faults.** A fault in a committed region is admitted without the budget and RAM tests of an
-uncommitted one, and its run is selected as any demand run's ([Demand faults](#demand-faults)).
-The run's pages were charged with the commitment, so recording the run charges nothing more and
-lowers `promised` by its pages. A page-table donation its map needs ([Client page-table
-funding](#client-page-table-funding)) is drawn from the region's reservation, two pages at a time,
-without admission: the donation's pages leave the reservation and `promised`, and are charged
+uncommitted one, and its run is selected as any demand run's ([Demand faults](#demand-faults)). The
+run's pages were charged with the commitment, so recording the run charges nothing more and lowers
+`promised` by its pages. A page-table donation its map needs ([Client page-table
+funding](#client-page-table-funding)) is two pages, and is never admitted. It is drawn from the
+region's reservation: the donation's pages leave the reservation and `promised`, and are charged
 once, as the donation. The address space's page-table pool is shared, so any other mapping of the
-process can take the pages a donation leaves in it, and the reservation covers the region's
-donations whatever those mappings take. The kernel keeps at most one page of a donation for its
-bookkeeping, so each two-page donation adds at least one page, and a map that still runs out after
-a donation needs more pages than the pool held: the donations of one map take at most two pages for
-each page table it creates. The tables a committed region's maps create lie in its span and stay
-until it is unregistered, so they number at most `pool_funding::pt_pages_for` of its largest
-length, which the `commit` module's host tests check against a pool that every other mapping
-empties between two maps. A committed fault is still declined, with code 9, when its map fails as
-any map can: the free pool holds no two contiguous pages for a donation, a thread of the process
-maps between the rounds of one map and takes the donated pages faster than four rounds fund them,
-or the process unmapped pages of the region itself and reclaimed their page tables, after which a
-donation the reservation no longer covers is admitted as any other.
+process can take the pages a donation leaves in it. Between two maps the reservation covers the
+region's donations whatever those mappings take. The kernel keeps at most one page of a donation for
+its bookkeeping, so each two-page donation adds at least one page, and a map that still runs out
+after a donation needs more pages than the pool held: the donations of one map take at most two
+pages for each page table it creates. The tables a committed region's maps create lie in its span
+and stay until it is unregistered (a cut, and the unmap of a run whose fault is declined, keep
+them), so they number at most `pool_funding::pt_pages_for` of its largest length, which the `commit`
+module's host tests check against a pool that every other mapping empties between two maps. Two
+cases draw past the reservation: a thread of the process that maps between two rounds of one map can
+take the donated pages first, and a table in the region's span that a reclaiming unmap removed once
+it was empty (the process's own unmap of the region's pages, or an unmap of another range after a
+cut emptied the table) is built again. A donation past the reservation is charged to the budget node
+as the donation, without the max test and the system reserve's, and takes only free pages outside
+`promised`, so a node's charge can pass its max by those donations, and no other committed region's
+promise is taken. A committed fault is still declined, with code 9, when its map fails as any map
+can: fewer than two free pages lie outside `promised`, or no two contiguous pages are free, for a
+donation, or a thread of the process maps between the rounds of one map and takes the donated pages
+faster than four rounds fund them.
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops

@@ -19,12 +19,12 @@
 )]
 
 use free_pool::{
-    ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Fit, FrameDesc,
-    FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
-    NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError, ResizeError,
-    SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk::table_height,
-    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pressure_level,
-    region_grants, reserve_pages,
+    ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, CommittedDonation, DemandRegion,
+    Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node,
+    NodeError, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
+    ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
+    chunk::table_height, chunk_count, chunk_for, commit::grow_need, commit::regrow_need,
+    fault_window, pressure_level, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -405,8 +405,10 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 /// [`admit_commit`] before its run leaves the pool: a grant here, a demand
 /// fault's run in an uncommitted region by [`admissible`], a committed region
 /// or its growth by [`admit_commit`], and a page-table donation to its address
-/// space here, beside the demand run whose map needs it, unless a committed
-/// region's reservation already carries it.
+/// space here, beside the demand run whose map needs it, unless it is for a
+/// fault in a committed region: its region's reservation carries it, or past
+/// the reservation it is charged without admission
+/// ([`fund_client_page_tables`]).
 fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<(), ChargeError>
 {
     let reserve = reserve_pages(pool_total_pages());
@@ -2267,7 +2269,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // Record the run on its chunk, so it is reclaimed on death or unregister.
     if !ensure_slots(l, need) || l.back_chunk(rec, reg, frame).is_err()
     {
-        release_unmapped_chunk(l, rec, aspace_cap, frame);
+        release_unmapped_chunk(l, rec, aspace_cap, frame, target.committed);
         decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
         return;
     }
@@ -2350,7 +2352,7 @@ fn back_span(
         {
             return Ok(frame);
         };
-        release_unmapped_chunk(l, target.rec, target.aspace_cap, frame);
+        release_unmapped_chunk(l, target.rec, target.aspace_cap, frame, target.committed);
         match refusal
         {
             MapRefusal::Limit | MapRefusal::Reserve(_) if pages > 1 =>
@@ -2469,11 +2471,13 @@ fn map_client_chunk(
 /// only once the run is recorded, and is charged to the budget node, so only
 /// `PROCESS_DIED` reclaims it, once the address space's teardown has released
 /// the donation (services/memmgr/docs/memory-pool.md § Client page-table
-/// funding). For a fault in a committed region, the donation is drawn from the
-/// region's page-table reservation instead of admitted, two pages at a time
-/// (`free_pool::PT_DONATION_PAGES`, which the reservation is sized for;
-/// `free_pool::Ledger::draw_pt_reserve`; § Commit), so it is charged once and
-/// never refused for budget or RAM.
+/// funding). For a fault in a committed region, the donation is two pages
+/// (`free_pool::PT_DONATION_PAGES`, which the reservation is sized for) and is
+/// not admitted (`free_pool::Ledger::committed_donation`; § Commit): it is
+/// drawn from the region's page-table reservation, so it is charged once, or,
+/// past the reservation, charged as the donation without the max or reserve
+/// tests, taking only free pages outside `promised`. So a committed fault is
+/// never refused for budget.
 /// memmgr keeps the run's cap as the reclaim anchor. A refused donation
 /// returns the run to the pool. The arena keeps `target.held` free slots
 /// beside the run's descriptor, for the caller's demand chunk.
@@ -2496,13 +2500,16 @@ fn fund_client_page_tables(
         return Err(FundRefusal::Failed);
     }
     // A committed fault's donation is drawn from its region's reservation, in
-    // donations of the size the reservation is computed for. One it does not
-    // cover, which only a process that unmapped its own committed pages can
-    // meet, is admitted as any other.
-    let drawn = target
-        .committed
-        .is_some_and(|reg| l.pt_reserve(reg) >= PT_DONATION_PAGES);
-    let first = if drawn
+    // donations of the size the reservation is computed for. Past the
+    // reservation (a map round lost to another thread's mapping, or a table
+    // in the region's span that something reclaimed), it is charged without
+    // admission, from the free pages outside `promised`.
+    let committed = match target.committed
+    {
+        Some(reg) => Some(committed_donation(l, reg).ok_or(FundRefusal::Failed)?),
+        None => None,
+    };
+    let first = if committed.is_some()
     {
         CLIENT_TOPUP_MIN_PAGES
     }
@@ -2553,7 +2560,7 @@ fn fund_client_page_tables(
         // A drawn donation was not admitted: draw it from the reservation, so
         // the charge `push_frame` made is the reservation's, not a second one.
         if let Some(reg) = target.committed
-            && drawn
+            && committed == Some(CommittedDonation::Reserved)
         {
             l.draw_pt_reserve(rec, reg, u64::from(pages));
         }
@@ -2564,19 +2571,52 @@ fn fund_client_page_tables(
     Err(FundRefusal::Failed)
 }
 
+/// How the page-table donation of a fault in the committed region `reg` is
+/// funded (`free_pool::Ledger::committed_donation`). When the free pages
+/// outside `promised` do not hold it, the deferred runs are rechecked first,
+/// unless this turn of the receive loop already has, as [`admit`] does.
+fn committed_donation(l: &mut MemLedger, reg: NodeIdx) -> Option<CommittedDonation>
+{
+    l.committed_donation(reg, PT_DONATION_PAGES).or_else(|| {
+        if recheck_deferred(l) == 0
+        {
+            return None;
+        }
+        coalesce(l);
+        l.committed_donation(reg, PT_DONATION_PAGES)
+    })
+}
+
 /// Give back a demand chunk whose fault memmgr is declining: unmap whatever
 /// part of it a failed map left mapped in the client address space
-/// `aspace_cap`, then return it to the free pool. When the unmap fails, the
-/// chunk may still be mapped, so it is accounted to the record `rec` instead,
+/// `aspace_cap`, then return it to the free pool. In a committed region
+/// (`committed` names it) the unmap keeps the page tables, which its
+/// reservation funded and which stay until the region is unregistered
+/// (services/memmgr/docs/memory-pool.md § Commit); otherwise it reclaims them.
+/// When the unmap fails, the chunk may still be mapped, so it is accounted to the record `rec` instead,
 /// for `PROCESS_DIED` to reclaim; with no slot for that either, it stays owned
 /// and counted in `pool_total` but out of circulation.
-fn release_unmapped_chunk(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, frame: FrameDesc)
+fn release_unmapped_chunk(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    aspace_cap: u64,
+    frame: FrameDesc,
+    committed: Option<NodeIdx>,
+)
 {
-    // SAFETY: `aspace_cap` is a client address space procmgr delegated
-    // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
-    // memmgr runs on.
-    let unmapped =
-        unsafe { syscall::mem_unmap_reclaim(aspace_cap, frame.va, u64::from(frame.page_count)) };
+    let pages = u64::from(frame.page_count);
+    let unmapped = if committed.is_some()
+    {
+        // SAFETY: `aspace_cap` is a client address space procmgr delegated
+        // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes
+        // nothing memmgr runs on.
+        unsafe { syscall::mem_unmap(aspace_cap, frame.va, pages) }
+    }
+    else
+    {
+        // SAFETY: as above: a client address space, never memmgr's own.
+        unsafe { syscall::mem_unmap_reclaim(aspace_cap, frame.va, pages) }
+    };
     if unmapped.is_ok()
     {
         insert_run(

@@ -42,7 +42,7 @@ pub use chunk::{ChunkEntry, ChunkError, ChunkState};
 pub use commit::{CommitNeed, PT_DONATION_PAGES};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
-pub use ledger::{BackError, Commit, Ledger, RegionError, ResizeError};
+pub use ledger::{BackError, Commit, CommittedDonation, Ledger, RegionError, ResizeError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureLevel, pressure_level};
 

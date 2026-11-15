@@ -13,6 +13,7 @@
 
 pub mod arena_reclaim;
 pub mod aspace_fault_notification_late_bind;
+pub mod aspace_harvest_no_fault;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
 pub mod cap_generation_wide;
@@ -81,7 +82,7 @@ use crate::run_integration_test;
 )]
 #[expect(
     clippy::large_stack_frames,
-    reason = "no large local: the estimate sums the temporaries of its 55 `run_integration_test!` \
+    reason = "no large local: the estimate sums the temporaries of its `run_integration_test!` \
               expansions (the logged names, the closure passed to `run_isolated` and its \
               `TestResult`, about 220 B each), and the compiled frame is under 1 KiB; on init's 16 \
               KiB stack"
@@ -246,6 +247,10 @@ pub fn run_all(ctx: &TestContext)
     run_integration_test!(
         "integration::fault_syscall_buffer",
         fault_syscall_buffer::run(ctx)
+    );
+    run_integration_test!(
+        "integration::aspace_harvest_no_fault",
+        aspace_harvest_no_fault::run(ctx)
     );
     run_integration_test!("integration::thread_upcall", thread_upcall::run(ctx));
     run_integration_test!(

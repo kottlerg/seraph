@@ -416,8 +416,8 @@ table lives in [`xtask/README.md`](../xtask/README.md#environment-variables).
 the non-experimental `ssaia` and `smaia` CPU properties. `xtask/src/qemu.rs` passes
 `-machine virt,aia=aplic-imsic` and
 `-cpu rv64,v=true,zba=true,zbb=true,zbs=true,svpbmt=on,svinval=on,svnapot=on,ssaia=on,smaia=on`
-followed by `,smstateen=on`, the `--riscv-zkr` suffix (default `,zkr=on`) and the
-`--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
+followed by `,smstateen=on,svadu=off,svade=on`, the `--riscv-zkr` suffix (default `,zkr=on`)
+and the `--riscv-mmu` satp-mode suffix (default `,sv57=off`) for RISC-V and
 `-cpu max,migratable=no` on x86-64 TCG, plus the `--x86-paging` `la57` suffix (default
 `,la57=off`, appended to every x86-64 accelerator's `-cpu` model). The explicit feature
 string is the source of truth on every supported QEMU, including the 10.2 the pinned CI image
@@ -429,6 +429,10 @@ writes on every hart and without which it halts the boot (see
 [platform-requirements.md](platform-requirements.md)). QEMU's `rv64` model leaves Smstateen off,
 so `smstateen=on` gives the hart the state-enable CSRs, and the bundled OpenSBI grants S-mode
 `sstateen0` (`mstateen0.SE0`) on a hart that has them; the property is present from QEMU 9.0.
+The `rv64` model enables Svadu and leaves Svade off, which with the bundled OpenSBI turns on
+hardware A/D updating (`menvcfg.ADUE`). `svadu=off,svade=on` boots the Svade baseline instead, so
+an access that finds A clear faults and the kernel's fault path sets the bit
+([platform-requirements.md](platform-requirements.md); both properties are present from QEMU 9.0).
 `zkr=on` gives the hart the Zkr entropy source, whose `seed` CSR the bundled OpenSBI grants
 S-mode when the hart implements it, so the kernel's pool seeds from it beside the firmware boot
 seed and the boot log shows

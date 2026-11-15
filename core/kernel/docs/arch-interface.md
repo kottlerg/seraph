@@ -960,18 +960,23 @@ pub fn hide(value: usize) -> usize;
 /// user-to-kernel controls it calls for, publish the selection, and log the
 /// table and the controls. Called once on the BSP in Phase 1, after the
 /// baseline check, before any AP starts. x86-64 reads CPUID and
-/// `IA32_ARCH_CAPABILITIES`, and selects from the inputs a
+/// `IA32_ARCH_CAPABILITIES`, probes `SBPB` on an AMD Family 19h part whose
+/// CPUID does not settle what its IBPB flushes, and selects from the inputs a
 /// `SERAPH_FORCE_RETURN_MITIGATION` build forces where one does
 /// (transient-execution.md § Controls); RISC-V does nothing, since the RVA23
 /// floor defines no such enumeration or control.
 pub fn select_mitigations();
 
 /// Set the calling CPU's per-CPU controls of the selection (x86-64:
-/// `IA32_SPEC_CTRL`, `EFER`, `IA32_UARCH_MISC_CTL`; RISC-V: none). Called on
-/// the BSP in Phase 1 and on each AP in `kernel_entry_ap`.
+/// `IA32_SPEC_CTRL`, `EFER`, `IA32_UARCH_MISC_CTL`, and AMD's `DE_CFG`;
+/// RISC-V: none). Called on the BSP in Phase 1 and on each AP in
+/// `kernel_entry_ap`.
 ///
 /// # Safety
-/// Ring 0 / S-mode on the CPU being brought up, after `select_mitigations`.
+/// Ring 0 / S-mode on the CPU being brought up, after `select_mitigations`,
+/// with interrupts disabled and before its shadow stack is enabled (x86-64:
+/// the `DE_CFG` access recovers from `#GP` through a handler that resumes
+/// at another address than the one the CPU saved).
 pub unsafe fn apply_mitigations_this_cpu();
 
 /// One word of the mitigation state for `SYS_SYSTEM_INFO(SpeculationControls)`:

@@ -256,7 +256,8 @@ pub extern "C" fn kernel_entry(boot_info: *const BootInfo) -> !
     // publish the controls it calls for, and set the boot CPU's per-CPU ones
     // (core/kernel/docs/transient-execution.md).
     arch::current::speculation::select_mitigations();
-    // SAFETY: ring 0 / S-mode on the boot CPU, after `select_mitigations`.
+    // SAFETY: ring 0 / S-mode on the boot CPU, after `select_mitigations`,
+    // with interrupts disabled and shadow stacks not yet enabled (Phase 5).
     unsafe {
         arch::current::speculation::apply_mitigations_this_cpu();
     }
@@ -1911,9 +1912,11 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
 
     // Set this AP's per-CPU transient-execution controls of the selection the
     // BSP made in Phase 1 (x86-64: `IA32_SPEC_CTRL`, `EFER`,
-    // `IA32_UARCH_MISC_CTL`; riscv64: no-op), before it enters user mode.
+    // `IA32_UARCH_MISC_CTL`, and AMD's `DE_CFG`; riscv64: no-op), before it
+    // enters user mode.
     // SAFETY: ring 0 / S-mode on this AP, after the BSP's Phase 1
-    // `select_mitigations`.
+    // `select_mitigations`, with interrupts disabled and before its shadow
+    // stack is enabled below.
     unsafe {
         arch::current::speculation::apply_mitigations_this_cpu();
     }

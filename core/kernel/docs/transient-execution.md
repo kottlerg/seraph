@@ -19,9 +19,10 @@ after the baseline check (`speculation::select_mitigations`), and written to the
 The table states what each class asks of the kernel at the user-to-kernel boundary, and the
 kernel applies the controls it selects there: buffer clearing on return to user mode, the
 branch-predictor controls, IBRS on entry for `retbleed` on an Intel part without enhanced IBRS,
-and the return stack buffer fills (§ Controls). No control answers `retbleed` on an AMD part
-(branch type confusion) or `spec_rstack_overflow`; their mechanism is not yet decided
-([#1085](https://github.com/kottlerg/seraph/issues/1085)), and the serial log names each such class
+an IBPB on entry for `retbleed` on an AMD part (branch type confusion) and for
+`spec_rstack_overflow`, and the return stack buffer fills (§ Controls). A class with kernel
+action that the selection leaves open, for want of a control, of an IBPB, of an IBPB that flushes
+branch types, or of STIBP while SMT is on, is reported as vulnerable on the serial log
 (§ Report).
 
 RISC-V has no counterpart. The RVA23 floor defines no enumeration of transient-execution
@@ -119,12 +120,28 @@ maximum, since such a leaf returns another leaf's data. It reads `IA32_ARCH_CAPA
 | `CPUID.00H` EBX, EDX, ECX | Vendor string: `GenuineIntel`, `AuthenticAMD`, other |
 | `CPUID.01H:EAX` | Family, model and stepping, with the extended fields as Intel SDM Vol. 2A and the AMD PPRs define them |
 | `CPUID.(EAX=07H,ECX=0):EBX` | HLE (bit 4) and RTM (bit 11): TSX is present |
-| `CPUID.(EAX=07H,ECX=0):EDX` | `MD_CLEAR` (bit 10); hybrid (bit 15); `IA32_ARCH_CAPABILITIES` implemented (bit 29) |
+| `CPUID.(EAX=07H,ECX=0):EDX` | `MD_CLEAR` (bit 10); hybrid (bit 15); IBRS and IBPB (bit 26); STIBP (bit 27); `IA32_ARCH_CAPABILITIES` implemented (bit 29) |
+| `CPUID.(EAX=0BH,ECX=0)` | A vendor other than AMD: SMT is on when the level type (`ECX[15:8]`) is SMT and the level counts more than one logical processor (`EBX[15:0]`) |
 | `CPUID.(EAX=07H,ECX=2):EDX` | `BHI_CTRL` (bit 4) |
-| `CPUID Fn8000_0008 EBX` | AMD: `SsbdNotRequired` (bit 26), `BTC_NO` (bit 29), `IBPB_RET` (bit 30) |
-| `CPUID Fn8000_0021 EAX` | AMD: `VERW_CLEAR` (bit 5), Automatic IBRS (bit 8), `SRSO_NO` (bit 29), `SRSO_USER_KERNEL_NO` (bit 30) |
+| `CPUID Fn8000_0001 ECX` | AMD: `TopologyExtensions` (bit 22), which enumerates `Fn8000_001E` |
+| `CPUID Fn8000_0008 EBX` | IBPB (bit 12), STIBP (bit 15); AMD: `SsbdNotRequired` (bit 26), `BTC_NO` (bit 29), `IBPB_RET` (bit 30) |
+| `CPUID Fn8000_001E EBX` | AMD: SMT is on when the threads per core, less one (bits 15:8), are not zero |
+| `CPUID Fn8000_0021 EAX` | AMD: `LfenceAlwaysSerializing` (bit 2), `VERW_CLEAR` (bit 5), Automatic IBRS (bit 8), `SBPB` (bit 27), `IBPB_BRTYPE` (bit 28), `SRSO_NO` (bit 29), `SRSO_USER_KERNEL_NO` (bit 30) |
 | `CPUID Fn8000_0021 ECX` | AMD: `TSA_SQ_NO` (bit 1), `TSA_L1_NO` (bit 2), `TSA_FILL_NO` (bit 7) |
 | `IA32_ARCH_CAPABILITIES` | The `*_NO` bits, `RSBA`, `TSX_CTRL` and `RFDS_CLEAR` (§ Enumerated bits); `RRSBA` (§ Predictor behaviours); `IBRS_ALL` (bit 1) and `DOITM` (bit 12) (§ Controls) |
+
+On an AMD Family 19h part that enumerates IBPB and neither `SBPB` nor `IBPB_BRTYPE`, `read` also
+probes for the microcode of AMD-SB-7005, which makes an IBPB flush every branch type and adds
+`SBPB` (bit 7 of `IA32_PRED_CMD`, MSR 49H) without enumerating either on every part (SRSO-WP). It
+writes `SBPB` to `IA32_PRED_CMD`: the write completes where the microcode implements the bit, and
+raises `#GP` where it does not, as a write of a reserved bit does. The write recovers from the
+fault (`idt::msr_recovering`). For the one instruction, the CPU runs on a probe table built on the
+stack, whose `#GP` gate resumes at a label after the `wrmsr` and whose other gates are the kernel's
+where the kernel's table is the one loaded; the table loaded before is loaded again after. The
+probe runs with interrupts off and before shadow stacks are on, since the gate resumes at an
+address other than the one the CPU saved, which a shadow stack would refuse. A completed write runs
+a branch predictor barrier, which changes no architectural state. The result is the
+`sbpb_accepted` field of the first report line (§ Report).
 
 The table and the selection are made from the boot CPU's inputs. Intel states that the RFDS bits
 enumerate identically on every logical processor of a hybrid part. No vendor document found
@@ -256,14 +273,16 @@ The last step lowers each class to the boundary its vendor confines it to:
 
 ### Predictor behaviours
 
-Beside the classes, the table records two return-prediction behaviours. Each is a property of
-the predictors, not a class of its own. They select where the kernel fills the return stack
-buffer (RSB) (§ Controls). A CPU of another vendor has both.
+Beside the classes, the table records three behaviours of the return predictions and the IBPB.
+Each is a property of the predictors, not a class of its own. The first two select where the
+kernel fills the return stack buffer (RSB), and the third whether an IBPB answers `retbleed` on
+an AMD part and `spec_rstack_overflow` (§ Controls). A CPU of another vendor has all three.
 
 | Behaviour | Log name | Meaning | Intel | AMD |
 |---|---|---|---|---|
 | `IbpbLeavesRsb` | `ibpb_leaves_rsb` | An IBPB does not keep a `RET` after it from being predicted by an RSB entry created before it | `eibrs_pbrsb` is not `NotAffected`: Intel defines post-barrier RSB predictions across an IBPB as well as a VM exit | No `IBPB_RET` (`CPUID Fn8000_0008 EBX[30]`): AMD-SB-1040 states that an IBPB may not prevent return predictions from pre-IBPB targets on Zen to Zen 3 |
 | `RsbAlternate` | `rsb_alternate` | A `RET` that finds the RSB empty may be predicted by an alternate predictor, such as the branch target buffer | `retbleed` is not `NotAffected` (the list's RSBA column, or `RSBA`), the list's RRSBA column gives it (§ Intel), or `IA32_ARCH_CAPABILITIES.RRSBA` (bit 19) | No part: AMD states that its processors do not put `RET`-based predictions in BTB-type structures (STMS, mitigation V2-1) |
+| `IbpbLeavesBranchType` | `ibpb_leaves_brtype` | An IBPB does not flush the branch type predictions that branch type confusion and speculative return stack overflow train | No part: both classes are AMD's | Every part but these: one that enumerates `SRSO_NO` or `IBPB_BRTYPE` (`CPUID Fn8000_0021 EAX[29]`, `EAX[28]`); Family 15h and 17h, whose IBPB flushes every branch type, so that SRSO-WP treats them as `IBPB_BRTYPE`; and Family 19h with the microcode of AMD-SB-7005, which enumerates `SBPB` (`EAX[27]`) or accepts the `SBPB` probe (§ Inputs) |
 
 The behaviours select a fill after an IBPB the kernel issues and on a context switch in the
 retpoline build. Neither selects a fill on entry from user mode. Intel states that an RSB
@@ -283,18 +302,21 @@ selection is `mitigation::select`, a pure function of the inputs below; `mitigat
 publishes it, and every CPU sets the per-CPU controls of it in its bring-up
 (`speculation::apply_mitigations_this_cpu`: the boot CPU in Phase 1, each AP in
 `kernel_entry_ap`). A CPU that does not enumerate an MSR control the selection holds
-(`IBRS_ALL`, IBRS for IBRS on entry, Automatic IBRS, `BHI_CTRL` or `DOITM`) halts with "CPU
-lacks the <control> the boot CPU selected" (`mitigation::missing_msr_control`) before it touches
-the MSR, since the access would fault. The code is `arch/x86_64/mitigation.rs`.
+(`IBRS_ALL`, IBRS for IBRS on entry, Automatic IBRS, `BHI_CTRL`, `DOITM`, IBPB for the IBPB on
+entry, or STIBP) halts with "CPU lacks the <control> the boot CPU selected"
+(`mitigation::missing_msr_control`) before it touches the MSR, since the access would fault.
+The code is `arch/x86_64/mitigation.rs`.
 
 ### Selection
 
-The inputs are the classes the table gives `Kernel` exposure, the two predictor behaviours, and
-five enumerated bits: `IBRS_ALL` (`IA32_ARCH_CAPABILITIES` bit 1), IBRS
-(`CPUID.(EAX=07H,ECX=0):EDX[26]`, read on an Intel part only: another vendor's `retbleed` may be
-branch type confusion, which IBRS does not answer), Automatic IBRS (`CPUID Fn8000_0021 EAX[8]`,
-AMD), `BHI_CTRL`, and `DOITM` (`IA32_ARCH_CAPABILITIES` bit 12). A
-kernel built to force the return mitigations replaces some of them (§ Forced return mitigations).
+The inputs are the classes the table gives `Kernel` exposure, the three predictor behaviours,
+whether SMT is on (§ Inputs), and seven enumerated bits: `IBRS_ALL` (`IA32_ARCH_CAPABILITIES`
+bit 1), IBRS (`CPUID.(EAX=07H,ECX=0):EDX[26]`, read on an Intel part only: another vendor's
+`retbleed` may be branch type confusion, which IBRS does not answer), Automatic IBRS
+(`CPUID Fn8000_0021 EAX[8]`, AMD), `BHI_CTRL`, `DOITM` (`IA32_ARCH_CAPABILITIES` bit 12), IBPB
+(`CPUID Fn8000_0008 EBX[12]` or `CPUID.(EAX=07H,ECX=0):EDX[26]`), and STIBP (`EBX[15]` or
+`EDX[27]` of the same leaves). A kernel built to force the return mitigations replaces some of
+them (§ Forced return mitigations).
 
 | Control | Log name | Selected when | Where it acts |
 |---|---|---|---|
@@ -309,6 +331,8 @@ kernel built to force the return mitigations replaces some of them (§ Forced re
 | RSB fill on switch | `rsb_fill_switch` | Retpoline is selected and the CPU has `rsb_alternate` | Every context switch |
 | RSB fill after IBPB | `rsb_fill_ibpb` | The CPU has `ibpb_leaves_rsb` | After every IBPB the kernel issues |
 | `DOITM` | `doitm` | The CPU enumerates `DOITM` | `IA32_UARCH_MISC_CTL.DOITM` (MSR 1B01H, bit 0) set on every CPU |
+| IBPB on entry | `ibpb_entry` | `retbleed` is `Kernel` without `rsb_alternate` (branch type confusion), or `spec_rstack_overflow` is `Kernel`; and the CPU enumerates IBPB and has no `ibpb_leaves_brtype` | `IA32_PRED_CMD.IBPB` (MSR 49H, bit 0) written on every entry from user mode |
+| STIBP | `stibp` | IBPB on entry is selected and the CPU enumerates STIBP | `IA32_SPEC_CTRL.STIBP` (bit 1) set on every CPU |
 
 The host tests in `mitigation.rs` cover each rule, and the selection for the parts of
 § Validation (§ Validation). `SYS_SYSTEM_INFO(SpeculationControls)` reports the inputs, the
@@ -369,8 +393,9 @@ The entry routine, `seraph_enter_from_user`, runs on every entry from user mode 
 indirect branch and any `ret` its own `call` does not pair: in `syscall_entry` after the frame
 is saved, in every exception and interrupt trampoline that builds a `TrapFrame` (`tf_build_asm`,
 keyed on the saved CS), and in the `#NM` stub. With IBRS on entry selected it first writes
-`IA32_SPEC_CTRL` with the kernel's value, `IBRS` set. It ends in `lfence`, so no later
-instruction runs before the write completes. Every return to user mode writes the user-mode
+`IA32_SPEC_CTRL` with the kernel's value, `IBRS` set; with the IBPB on entry selected it then
+issues the IBPB (§ IBPB on entry). It ends in `lfence`, so no later instruction runs before the
+writes complete. Every return to user mode writes the user-mode
 value, the same without `IBRS` (`mitigation::ibrs_exit_asm`), with interrupts off and after the
 last kernel `call`, `ret` and indirect branch: in `syscall_entry` before `sysretq`, in
 `tf_resume_asm` and the `#NM` stub when the frame's CS is ring 3, and in `return_to_user` and
@@ -389,27 +414,98 @@ return, so shadow stacks stay on
 ([return-address-integrity.md](return-address-integrity.md) § x86-64 Mechanism).
 
 AMD parts have no `rsb_alternate` (§ Predictor behaviours), so the rule does not select IBRS on
-entry for their `retbleed` (branch type confusion), and no control answers it or
-`spec_rstack_overflow`; `mitigation::report` logs each such class (§ Report). An Intel part
-without enhanced IBRS or IBRS stays on the retpoline sequence. A part of another vendor, whose
-`retbleed` may be either form and whose IBRS is not read, takes enhanced IBRS where it enumerates
-`IBRS_ALL` and the retpoline sequence otherwise. Each is logged the same way: enhanced IBRS and
-IBRS on entry count as answering `retbleed` only on an Intel part with `rsb_alternate` and the
-IBRS input.
+entry for their `retbleed` (branch type confusion); the IBPB on entry answers it (§ IBPB on
+entry). An Intel part without enhanced IBRS or IBRS stays on the retpoline sequence. A part of
+another vendor, whose `retbleed` may be either form and whose IBRS is not read, takes enhanced
+IBRS where it enumerates `IBRS_ALL` and the retpoline sequence otherwise. `mitigation::report`
+logs each of these as vulnerable (§ Report): enhanced IBRS and IBRS on entry count as answering
+`retbleed` only on an Intel part with `rsb_alternate` and the IBRS input.
 
 No part that the project boots has `retbleed`; a kernel built to force the return mitigations
-runs IBRS on entry on the development host (§ Forced return mitigations).
+runs IBRS on entry, or the IBPB on entry, on the development host (§ Forced return mitigations).
+
+### IBPB on entry
+
+Branch type confusion (`retbleed` on Families 15h and 17h) lets user mode train the branch
+target buffer so that a kernel instruction is predicted as a `ret` or another branch type to a
+target user mode chose (BTC-TG). Speculative return stack overflow lets it train predictions that
+overflow the return address predictor, so that a kernel `ret` is predicted to such a target
+(SRSO-WP). For both at the user-to-kernel boundary AMD specifies an IBPB on every entry from user
+mode, which flushes the predictions user mode trained before the kernel takes any (BTC-TG;
+SRSO-WP), on a part whose IBPB flushes branch types; and STIBP where SMT is on, since an IBPB does
+not keep a sibling thread running user mode from training the predictions both threads share.
+
+The kernel builds no return thunk, the other mechanism AMD names: IBPB is the one AMD specifies
+for every form of both classes, it rewrites no return and so leaves shadow stacks on
+(§ Branch target injection), and its correctness rests on properties of the entry code that a
+review can check without the hardware:
+
+- **Before the first `ret`.** `seraph_enter_from_user` issues the IBPB (`mitigation::ibpb_asm`,
+  a write of bit 0 to `IA32_PRED_CMD`) before its own `ret`, the first `ret` and indirect branch
+  of every entry from user mode: `syscall_entry` calls it after the frame is saved,
+  `tf_build_asm` as the last step of the frame of every exception and interrupt from ring 3, and
+  the `#NM` stub likewise, none with a `call` or `ret` before it (§ Return predictions).
+- **NMI and machine check.** The paranoid stubs (NMI, `#DB`, `#DF`, `#MC`) build their frame with
+  `tf_build_asm`, so from ring 3 they issue it there. From ring 0 they issue it again after their
+  `IA32_SPEC_CTRL` write (`paranoid_entry_asm`): one can arrive in an entry from user mode before
+  its IBPB, and its handler's returns would otherwise take the predictions user mode trained. The
+  stubs are rare, so the repeated barrier costs little.
+- **The fill.** Where the IBPB leaves the RSB (`ibpb_leaves_rsb`: no `IBPB_RET`, Zen to Zen 3,
+  AMD-SB-1040), the fill after an IBPB follows it: 32 `call`s whose return addresses trap
+  speculation (`int3`) and are dropped from the stack. Where a supervisor shadow stack is on, which
+  `rdsspq` reports by a non-zero shadow stack pointer, `incsspq` drops the 32 entries from it too,
+  so the two stacks match again and no return is rewritten.
+- **Serialization.** The routine ends in `lfence`, so a mispredicted test of a flag runs no later
+  instruction (§ `LFENCE` serialization).
+
+STIBP is selected with the IBPB on entry wherever the CPU enumerates it, and set once in
+`IA32_SPEC_CTRL` on every CPU (in both values the entry and exit code write under IBRS on entry).
+
+The selection leaves a class vulnerable where the CPU has no IBPB; where its IBPB leaves branch
+types (`ibpb_leaves_brtype`: Family 19h without the microcode of AMD-SB-7005, a later family that
+enumerates no `IBPB_BRTYPE`, another vendor), where the IBPB on entry is not selected, since it
+would answer neither class; and where SMT is on and the CPU has no STIBP (Zen and Zen+ without
+it), where the IBPB on entry is selected but leaves the sibling thread open. `mitigation::report`
+logs each such class with its reason (§ Report), and the host tests cover the selection and each
+reason over Zen, Zen 2, Zen 3 with and without that microcode, and Zen 4 (§ Validation). Its cost
+on an AMD part is not measured ([#1123](https://github.com/kottlerg/seraph/issues/1123)).
+
+### `LFENCE` serialization
+
+Every flag test of the entry routine and of the thunk's plain path ends in `lfence`, so that a
+mispredicted test runs no later instruction. On AMD parts that holds where `LFENCE` is
+dispatch-serializing, which `DE_CFG[1]` (MSR C001_1029H) makes it (STMS, mitigation G-2). Every
+CPU sets the bit in its bring-up (`mitigation::apply_this_cpu`): a read, a write with bit 1 added
+where it reads clear, and a read back, each recovering from `#GP` as the `SBPB` probe does
+(§ Inputs). The boot CPU logs the outcome, and an AP only one other than set (§ Report). The kernel
+does not write it:
+
+- **On Intel and other vendors.** Intel defines `LFENCE` as not executing until every prior
+  instruction completes locally (Intel SDM Vol. 2A, LFENCE), and `DE_CFG` is AMD's MSR.
+- **On AMD Families before 10h, and 11h.** `LFENCE` is dispatch-serializing there without the
+  bit (STMS, mitigation G-2).
+- **Where `LfenceAlwaysSerializing` is enumerated** (`CPUID Fn8000_0021 EAX[2]`): `LFENCE` is
+  dispatch-serializing whatever the bit holds (APM CPUID Fn8000_0021).
+- **Where the access faults or the bit does not hold.** A hypervisor may not pass the MSR or may
+  ignore the write. The log names the outcome, and the boot continues.
 
 ### Forced return mitigations
 
-A kernel built with `SERAPH_FORCE_RETURN_MITIGATION=intel` in the environment of
-`cargo xtask build` selects from forced inputs (`mitigation::FORCED_RETURN`, read at compile time):
-the CPU's inputs with `retbleed` and `rsb_alternate` added and `IBRS_ALL` removed, the inputs of
-an Intel part that needs IBRS on entry. It adds no enumerated bit, so a CPU without IBRS still
-selects no control it cannot run. The inputs view of `SYS_SYSTEM_INFO(SpeculationControls)`
-reports the forced inputs, and the boot logs a line naming the override before the controls
-(§ Report). Unset or empty, the variable forces nothing; any other value fails the build. Cargo
-rebuilds the kernel when the variable changes.
+A kernel built with `SERAPH_FORCE_RETURN_MITIGATION` in the environment of `cargo xtask build`
+selects from forced inputs (`mitigation::FORCED_RETURN`, read at compile time):
+
+- `intel`: the CPU's inputs with `retbleed` and `rsb_alternate` added and `IBRS_ALL` removed,
+  the inputs of an Intel part that needs IBRS on entry.
+- `amd`: the CPU's inputs with `retbleed` and `spec_rstack_overflow` added and `rsb_alternate`
+  removed, the inputs of an AMD part that needs the IBPB on entry (§ IBPB on entry). The boot CPU
+  also makes the `SBPB` probe, and every CPU the `DE_CFG[1]` step (§ `LFENCE` serialization),
+  whatever the vendor, so that their recovery from `#GP` runs where the MSR access faults.
+
+Neither adds an enumerated bit, so a CPU without IBRS or IBPB still selects no control it cannot
+run. The inputs view of `SYS_SYSTEM_INFO(SpeculationControls)` reports the forced inputs, and the
+boot logs a line naming the override before the controls (§ Report). Unset or empty, the variable
+forces nothing; any other value fails the build. Cargo rebuilds the kernel when the variable
+changes.
 
 On the development host the forced build selects IBRS on entry in place of enhanced IBRS, beside
 `BHI_DIS_S`, `VERW` on exit and the fill after an IBPB, so the ktest boot runs the entry and exit
@@ -468,8 +564,9 @@ taking a prediction user mode trained (§ Return predictions), so the switch fil
 beside it.
 
 Where an IBPB does not clear the RSB (`ibpb_leaves_rsb`), the fill after an IBPB is selected.
-The kernel issues no IBPB, so the control is in effect wherever it is selected and no boot
-engages it.
+The kernel issues an IBPB only on entry from user mode, where the IBPB on entry is selected, and
+the fill follows it there (§ IBPB on entry); with the IBPB on entry not selected, the control is in
+effect but nothing runs it.
 
 The user-to-kernel boundary needs no other fill, since SMEP is enabled (§ Predictor behaviours).
 SMEP is required: `cpu::verify_baseline` refuses a CPU without it, and `cpu::enable_smep_smap`
@@ -505,16 +602,24 @@ algorithms and names no instruction-timing mode or guarantee (AMD-TPSC).
 ## Report
 
 `report` writes seven lines to the serial log after `baseline ok`. The first two give the CPU
-and the inputs. Each of the next four gives one exposure's classes in table order, or `none`.
-The last gives the behaviours the CPU has, or `none`. `mitigation::report` then writes the
-override line of a forced build (§ Forced return mitigations), the selected controls by their log
-names (§ Selection), or `none`, the warning of § Buffer clearing where it applies, and one line for
-each of `retbleed` and `spec_rstack_overflow` that is `Kernel` with no selected control
-answering it (§ Return predictions). The second line is one line in the log;
-it is broken here for width, and each `<v>` is a hexadecimal value:
+and the inputs: the first ends with whether SMT is on and whether the `SBPB` probe was accepted
+(§ Inputs), each 0 or 1. Each of the next four gives one exposure's classes in table order, or
+`none`. The last gives the behaviours the CPU has, or `none`. `mitigation::report` then writes
+the override line of a forced build (§ Forced return mitigations; the `amd` line ends with the
+`SBPB` probe's outcome, `accepted` or `faulted`), the selected controls by their log names
+(§ Selection), or `none`, one line for each of `retbleed` and `spec_rstack_overflow` that is
+`Kernel` and that the selection leaves vulnerable, and the warning of § Buffer clearing where it
+applies. The reason in a vulnerable line is `no control answers it` (§ Return predictions),
+`no IBPB`, `IBPB does not flush branch types`, or `SMT on without STIBP` (§ IBPB on entry).
+`mitigation::apply_this_cpu` writes the `DE_CFG[1]` line on the boot CPU, and on an AP only for
+an outcome other than `set` (§ `LFENCE` serialization); `<n>` is the CPU's initial APIC ID and
+the outcome is `set`, `not set: the MSR access raised #GP` or `not set: the write did not hold`.
+The first two lines are one line each in the log; they are broken here for width, and each `<v>`
+is a hexadecimal value:
 
 ```text
-x86 cpu: GenuineIntel family 0x6 model 0x97 stepping 0x2 hybrid 0 doitm 0
+x86 cpu: GenuineIntel family 0x6 model 0x97 stepping 0x2 hybrid 0 doitm 0 smt 1 \
+         sbpb_accepted 0
 x86 cpu: arch_capabilities <v> cpuid 7.0 ebx <v> edx <v> 7.2 edx <v> 8000_0008 ebx <v> \
          8000_0021 eax <v> ecx <v>
 x86 vulnerabilities, affected, kernel action: <classes>
@@ -523,7 +628,8 @@ x86 vulnerabilities, affected, not at user-to-kernel: <classes>
 x86 vulnerabilities, not affected: <classes>
 x86 predictor behaviours: <behaviours>
 x86 mitigations: <controls>
-x86 mitigations: <class> has kernel action, but no control answers it
+x86 mitigations: vulnerable: <class> (<reason>)
+x86 mitigations: cpu <n>: DE_CFG[1] (LFENCE dispatch-serializing) <outcome>
 ```
 
 ---
@@ -539,6 +645,7 @@ expectation comes from:
 - Comet Lake (`06_A5H`, `06_A6H`).
 - Jasper Lake and Alder Lake N, the Atom parts affected by RFDS.
 - AMD EPYC 7002 "Rome" (Zen 2).
+- AMD Family 19h (Zen 3) with and without `SBPB`, `IBPB_BRTYPE` or an accepted `SBPB` probe.
 - AMD EPYC 9005 "Turin" (Zen 5), with the bits its PPR reports.
 - An Intel part and an AMD part that report every `*_NO` bit their vendor defines.
 
@@ -555,19 +662,23 @@ The host tests in `mitigation.rs` cover each rule of § Selection, and the contr
 the development host's part, the CPU QEMU's TCG presents, AMD Zen 2, Zen 3 and Zen 4, Ice Lake
 and Comet Lake with and without `IBRS_ALL`, Skylake S and Coffee Lake H with IBRS (IBRS on
 entry), the parts that report every `*_NO` bit, an Intel model the list does not name, and a CPU
-of another vendor. They also cover the MSR bits each control sets, the two `IA32_SPEC_CTRL`
-values of IBRS on entry, the flags `install` leaves, the forced inputs and the refusal of an
-unknown override, and the classes the log names as unanswered.
+of another vendor. For the IBPB on entry they cover Zen with SMT and no STIBP, Zen 2 with IBPB
+and STIBP, Zen 3 without the microcode of AMD-SB-7005 and with it (probe, `SBPB` or
+`IBPB_BRTYPE`), and Zen 4 with `IBPB_BRTYPE`, which keeps shadow stacks. They also cover the MSR
+bits each control sets, the two `IA32_SPEC_CTRL` values of IBRS on entry, the flags `install`
+leaves, both forced inputs and the refusal of an unknown override, each class and reason the log
+names as vulnerable, where `DE_CFG[1]` is written, and the outcome its accesses give.
 
 The ktest case `integration::speculation_controls` restates § Selection over the inputs the
 kernel reports and requires the selection to match it, then requires the controls in effect on
 every CPU to equal the selection, read through `SYS_SYSTEM_INFO(SpeculationControls)` with the
 case pinned to each CPU in turn. On the development host the boot selects enhanced IBRS,
 `BHI_DIS_S`, `VERW` on exit and the fill after an IBPB; under QEMU's TCG it selects retpoline
-and the fill after an IBPB, and in the forced build (§ Forced return mitigations) IBRS on entry in
-place of enhanced IBRS. No boot the project runs selects the branch history clearing, the fill on
-switch, `VERW` before idle, Automatic IBRS or `DOITM`; the host tests alone cover their
-selection.
+and the fill after an IBPB. The `intel` forced build (§ Forced return mitigations) selects IBRS
+on entry in place of enhanced IBRS, and the `amd` one the IBPB on entry with its fill and STIBP
+beside enhanced IBRS, with the `SBPB` probe and the `DE_CFG[1]` step faulting and recovering. No
+boot the project runs selects the branch history clearing, the fill on switch, `VERW` before
+idle, Automatic IBRS or `DOITM`; the host tests alone cover their selection.
 
 Validation on other hardware is [#1123](https://github.com/kottlerg/seraph/issues/1123).
 

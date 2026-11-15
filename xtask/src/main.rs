@@ -19,12 +19,6 @@
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 
-#![expect(
-    clippy::multiple_crate_versions,
-    reason = "duplicate transitive versions (bitflags, hashbrown, windows-sys, wit-bindgen) come \
-              from third-party host deps (clap, gpt, fatfs, libc, which); not resolvable without \
-              upstream releases"
-)]
 // `symbolize`, the riscv64 kernel frame check and `compare-images` read ELF,
 // PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
 // pinned toolchain's sysroot ships for std's backtraces, so they have no Cargo
@@ -59,6 +53,7 @@ mod disk;
 mod firmware;
 mod fs_compat;
 mod gh;
+mod gpt;
 mod guest;
 mod host_lock;
 mod qemu;

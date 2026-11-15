@@ -140,7 +140,7 @@ On `ECALL` from U-mode:
 ### Restartable Syscalls
 
 `SYS_GETRANDOM`, `SYS_ENTROPY_CONTRIBUTE`, `SYS_THREAD_READ_REGS`, `SYS_THREAD_WRITE_REGS`,
-`SYS_THREAD_READ_MEM`, and `SYS_THREAD_WRITE_MEM` are restartable: a fault
+`SYS_THREAD_READ_MEM`, `SYS_THREAD_WRITE_MEM`, and `SYS_ASPACE_HARVEST` are restartable: a fault
 of the kernel's copy to or from the caller's buffer is handled as
 [docs/fault-handling.md § Kernel Copies](../../../docs/fault-handling.md#kernel-copies)
 specifies. With a fault handler bound to the caller, the fault is delivered as `FAULT_KIND_VM`
@@ -152,7 +152,8 @@ instruction (x86-64 rewinds `rip` by the two bytes of `SYSCALL`; RISC-V leaves `
 and writes no register of the caller's frame, so the re-execution sees its argument registers as
 the first call did (on x86-64, the `rcx` and `r11` that `SYSCALL` overwrites carry no argument);
 a syscall made restartable MUST meet the same rule. A copy fault the live tables already satisfy
-(a stale TLB entry) is retried in the kernel and reaches neither the handler nor the caller. The
+(a stale TLB entry, or on riscv64 a leaf that lacks the A or D bit the access needs, which the
+kernel sets) is retried in the kernel and reaches neither the handler nor the caller. The
 IPC buffer copies are not restartable: their faults fail or lose the transfer as
 § `SYS_IPC_BUFFER_SET` states.
 
@@ -208,9 +209,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  63  SYS_IRQ_ROUTE
                                  64  SYS_IRQ_REMAP
                                  65  SYS_ENTROPY_CONTRIBUTE
+                                 66  SYS_ASPACE_HARVEST
 ```
 
-**Implementation status.** Every number 0–65 has a handler; unallocated numbers
+**Implementation status.** Every number 0–66 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -1538,9 +1540,9 @@ Starting a thread whose fault episode a stop cancelled (before any reply claimed
 handler's claiming reply was `FAULT_REPLY_KILL` (or a `FAULT_REPLY_FORWARD` of a delivery other
 than a virtual-memory one, of one with no exception handler bound, or of the fault of a
 restartable syscall's user copy, or a `FAULT_REPLY_REDIRECT` that named no endpoint), kills it as
-an unhandled
-fault, which posts its death and address-space observers, or, for the fault of a restartable
-syscall's user copy, fails that syscall with `InvalidAddress` (see
+an unhandled fault, which posts its death observers and, when the fault is its address space's
+first terminal fault, the space's observers, or, for the fault of a restartable syscall's user
+copy, fails that syscall with `InvalidAddress` (see
 [docs/fault-handling.md](../../../docs/fault-handling.md#delivery-resume-and-kill) § Delivery,
 Resume, and Kill). Starting one whose claiming reply was a `FAULT_REPLY_REDIRECT` that named an
 endpoint delivers the fault to that endpoint. An upcall delivery (`FAULT_KIND_UPCALL`) is no fault:
@@ -2990,10 +2992,13 @@ right, so only a process that may read physical addresses translates its pages.
 
 ### `SYS_ASPACE_BIND_NOTIFICATION` (53)
 
-Bind a terminal-fault death observer to an address space. When any thread in the space faults
-terminally (see [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern
-for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the bound
-event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. Voluntary
+Bind a terminal-fault death observer to an address space. On the first terminal fault of any
+thread in the space (see [capability-model.md](../../../docs/capability-model.md) § "Kill process"
+pattern for the triggers), the kernel posts the two-word entry `(fault reason, correlator)` to the
+bound event queue, as § `SYS_THREAD_BIND_NOTIFICATION` (47) lays it out. The address space dies
+once: a later terminal fault of another of its threads, on any CPU, exits that thread and posts
+nothing, so a binding receives one entry in its life, carrying the retained reason that
+`CAP_INFO_ASPACE_TERMINAL_FAULT` reads back (§ `SYS_CAP_INFO`). Voluntary
 `SYS_THREAD_EXIT` does not fire these observers (see
 [capability-model.md](../../../docs/capability-model.md) § "Kill process" pattern).
 
@@ -3025,6 +3030,48 @@ already-faulted space takes none.
 **Errors:** `InvalidCapability`, `InsufficientRights` (address space lacks Control or
 event queue lacks Post), `OutOfMemory` (the event queue has no free observer node),
 `QuotaExceeded` (the event queue's reference count is at its 2^31 ceiling).
+
+---
+
+### `SYS_ASPACE_HARVEST` (66)
+
+Report which pages of a range have been accessed since their previous harvest, and clear their
+accessed bits. A pager calls it to find cold pages.
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `aspace_cap` | AddressSpace capability (Map rights) |
+| 1 | `va` | Page-aligned first page of the range (user half, at or above `USER_VA_FLOOR`) |
+| 2 | `pages` | Page count, `1..=MAX_HARVEST_PAGES` (4096) |
+| 3 | `bitmap_ptr` | Destination of the `pages.div_ceil(8)`-byte bitmap in the caller's address space |
+
+**Return:** `rax`/`a0`: the number of pages reported accessed; `SyscallError` on failure.
+
+Under the space's page-table lock the kernel reads the accessed (A) bit of each page's user leaf,
+changing none. Page `i` of the range is bit `i % 8` of byte `i / 8`, set when the page's A bit is
+set. A page with no leaf reads clear, and so do the bits of the last byte past `pages`. The kernel
+copies the bitmap to `bitmap_ptr`, then takes the lock again and clears A on each reported page
+that is still mapped. A page that gains A between the read and the clear was not reported and
+keeps the bit for the next harvest; a reported page accessed again in that window loses that
+access. No TLB entry is flushed, so a CPU that still caches a page's translation completes its
+accesses without setting A, and the next harvest can under-report the page. Every leaf the kernel
+installs or rewrites (`SYS_MEM_MAP`, `SYS_MEM_PROTECT`, a NAPOT demotion on riscv64) carries A, so
+a page mapped or reprotected since the previous harvest reads accessed. A set bit therefore means
+the page was accessed or its leaf written; a clear bit is a hint that it was not. On riscv64 the
+kernel sets A in its fault path when the hart does not
+([memory-internals.md § Accessed Bits](memory-internals.md#accessed-bits)).
+
+**Capability requirement:** `aspace_cap` MUST have the Map right. A holder of Map can already
+observe access to a page by unmapping it and waiting for the fault, so the call discloses nothing
+the right does not.
+
+**Errors:** `InvalidCapability`, `InsufficientRights` (cap lacks Map), `InvalidArgument` (`pages`
+0 or above `MAX_HARVEST_PAGES`, or the range's end overflows), `InvalidAddress` (`va` not
+page-aligned, the range not wholly in the user half at or above `USER_VA_FLOOR`, a null bitmap,
+the bitmap not wholly in the user half, or a fault on the bitmap that is unhandled; restartable,
+§ Restartable Syscalls). A failed call clears no accessed bit.
 
 ---
 
@@ -3378,6 +3425,7 @@ intact (see [capability-internals.md](capability-internals.md) § Safe Delegatio
 | `PRIORITY_MAX` | 30 | Maximum priority for userspace threads |
 | `EVENT_QUEUE_MAX_CAPACITY` | 2^20 | Maximum entries, and maximum death-observer nodes, in an event queue |
 | `MAX_THREAD_MEM_COPY` | 4096 | Most bytes one `SYS_THREAD_READ_MEM` or `SYS_THREAD_WRITE_MEM` copies |
+| `MAX_HARVEST_PAGES` | 4096 | Most pages one `SYS_ASPACE_HARVEST` reports |
 | `BOOT_PROTOCOL_VERSION` | 21 | Expected version in `BootInfo.version` |
 
 The values are those of the [`abi/syscall`](../../../abi/syscall/src/lib.rs) and

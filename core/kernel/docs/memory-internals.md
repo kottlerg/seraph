@@ -291,8 +291,9 @@ pub struct AddressSpace
 The terminal-fault observer state (the `death_observers` chain of observer nodes,
 `terminal_faulted`, `terminal_fault_reason`) changes and is read only under `death_lock`: the bind
 (`sys_aspace_bind_notification`) pushes a node, drawn from the observing queue's pool, under it, and
-the terminal-fault path records the first fault and reads the chain head under it before the
-faulting thread's `Exited` commit (`record_aspace_terminal_fault`), then walks the chain and posts
+the terminal-fault path records the first fault and, on that fault alone, reads the chain head
+under it before the faulting thread's `Exited` commit (`record_aspace_terminal_fault`; a later
+fault reads none, so the space's observers are posted once), then walks the chain and posts
 outside it after the commit (`post_aspace_death_notification`; a linked node's links never change
 until the teardown takes the chain), and `SYS_CAP_INFO`'s `CAP_INFO_ASPACE_TERMINAL_FAULT` reads
 the retained reason under it (`AddressSpace::retained_terminal_fault`).
@@ -373,6 +374,52 @@ copies them, so the grant survives both.
 
 ---
 
+## Accessed Bits
+
+Every leaf the kernel builds carries the accessed bit (A): `PageTableEntry::new_page` and
+`new_large_page` set it on both architectures, and on RISC-V `new_page` sets the dirty bit (D) too
+on a writable leaf. A leaf the kernel installs or rewrites therefore reads accessed until
+`SYS_ASPACE_HARVEST` clears A, the only path that clears it on a user leaf.
+
+**Harvest.** `sys_aspace_harvest` runs in three steps:
+
+1. `AddressSpace::read_accessed` walks the range's leaf tables under `pt_lock`, with preemption
+   disabled, and records each present leaf whose A is set
+   (`arch::current::paging::read_user_accessed`). It changes no leaf.
+2. The bitmap is copied to the caller. The copy is restartable, and a fault on it finds nothing
+   changed.
+3. `AddressSpace::clear_accessed` walks again under `pt_lock` and clears A on the reported pages
+   that are still mapped (`clear_user_accessed`). It demotes a NAPOT member first (§ NAPOT
+   Contiguity (RISC-V)).
+
+Each update of a leaf's A or D bit is an atomic read-modify-write of the leaf word (`leaf_word`),
+because the other writers of those bits do not take `pt_lock`: the hardware page walker, and on
+RISC-V the fault path below. A range is at most `MAX_HARVEST_PAGES` (4096) pages, which bounds the
+bitmap on the kernel stack (512 bytes) and each hold of the lock.
+
+**No flush.** Clearing A needs no TLB invalidation. A CPU that caches the translation keeps using
+it, and the next harvest reports the page only if a page walk has set A again. A stale entry costs
+the pager accuracy (a hot page can look cold, be evicted, and fault back), never correctness.
+
+**RISC-V without Svadu.** The kernel requires Svade
+([docs/platform-requirements.md](../../../docs/platform-requirements.md)): when an access finds A
+clear, or a store finds D clear, the hart raises a page fault instead of setting the bit. The fault
+reaches `paging::user_fault_is_spurious` from both the U-mode fault path and the kernel-copy fault
+path (`kernel_exception`, for a copy to or from a user page). If the live leaf is user-accessible
+and permits the access, the walk sets the missing bits with one compare-and-swap of the leaf word
+(`svade_update`) and reports the fault spurious. The caller then flushes the local entry and
+retries. No such fault reaches a fault handler or fails a copy.
+
+The swap runs without `pt_lock`. SIE is clear and the space is active on this hart, so a teardown
+cannot reuse the table's frame before this hart acknowledges the teardown's shootdown. A swap that
+loses a race also reports the fault spurious, and the retried access faults again if it still
+needs the bit. A NAPOT member never lacks A: a group is promoted only from leaves that carry it,
+and a harvest demotes before it clears. The walk therefore reports a NAPOT member without A as a
+genuine fault rather than set one member's bit. On a Svadu hart with `menvcfg.ADUE` set, the
+hardware sets the bits and this path never runs. The kernel makes no SBI call to change ADUE.
+
+---
+
 ## TLB Management
 
 Local invalidation primitives live in the per-architecture paging modules:
@@ -421,11 +468,14 @@ Two invariants keep the hint transparent:
   rewriting a live group would leave siblings whose cached 64 KiB entry still translates
   the modified VA. The writer's ordinary per-VA (or span-wide) invalidation then also
   kills any cached group entry, since an `sfence.vma`/`sinval.vma` naming any address
-  inside a NAPOT range must invalidate a covering cached translation.
+  inside a NAPOT range must invalidate a covering cached translation. A harvest also
+  demotes before it clears a member's A bit, and invalidates nothing: a cached group entry
+  then only hides later accesses from the next harvest (§ Accessed Bits).
 
 Readers decode both shapes: `translate_user_page` reconstructs a NAPOT member's PA bits
 \[15:12\] from the VA; the fault classifier and teardown walks are N-agnostic (a NAPOT
-member carries the same V/U/R/W/X bits, and leaf-vs-table discrimination is by R/W/X).
+member carries the same V/U/R/W/X bits, and leaf-vs-table discrimination is by R/W/X), except
+that the classifier sets no A bit on a NAPOT member (§ Accessed Bits).
 
 ### Context Switch TLB Handling
 

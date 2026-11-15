@@ -194,8 +194,8 @@ Design intent; not yet implemented (#262). The mechanism uses existing kernel su
 
 svcmgr creates one event queue at startup and binds two death observers on it: one on its own main
 thread (`SYS_THREAD_BIND_NOTIFICATION`, through `ProcessInfo.self_thread_cap`), and one on its own
-address space (`SYS_ASPACE_BIND_NOTIFICATION`, through `ProcessInfo.self_aspace_cap`), which a
-terminal fault of any svcmgr thread posts to. svcmgr keeps the queue's original and delivers a
+address space (`SYS_ASPACE_BIND_NOTIFICATION`, through `ProcessInfo.self_aspace_cap`), which the
+first terminal fault of any svcmgr thread posts to. svcmgr keeps the queue's original and delivers a
 derivation carrying only the receive right to the shutdown actuator, pwrmgr, in the bootstrap round
 of each of its launches. pwrmgr waits on that queue beside its service endpoint; an entry on it is
 svcmgr's death, and pwrmgr powers the platform off.

@@ -600,11 +600,16 @@ pub const SYS_IRQ_REMAP: u64 = 64;
 /// an `EntropyControl` capability carrying [`RIGHTS_ENTROPY_CONTRIBUTE`]. See
 /// `core/kernel/docs/syscalls.md` § `SYS_ENTROPY_CONTRIBUTE` (65).
 pub const SYS_ENTROPY_CONTRIBUTE: u64 = 65;
+/// Address space: read and clear the accessed bit of each mapped page of a
+/// range, through an `AddressSpace` capability carrying [`RIGHTS_AS_MAP`], into
+/// a caller bitmap. See `core/kernel/docs/syscalls.md` § `SYS_ASPACE_HARVEST`
+/// (66).
+pub const SYS_ASPACE_HARVEST: u64 = 66;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_ENTROPY_CONTRIBUTE + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_ASPACE_HARVEST + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -1012,7 +1017,8 @@ pub const RIGHTS_MEM_MAP_RX: u64 = RIGHTS_MEM_MAP | RIGHTS_MEM_EXECUTE;
 
 // AddressSpace ──
 
-/// `AddressSpace`: may map into this address space.
+/// `AddressSpace`: may map into this address space, and read and clear its
+/// pages' accessed bits (`SYS_ASPACE_HARVEST`).
 pub const RIGHTS_AS_MAP: u64 = 1 << 0;
 
 /// `AddressSpace`: may read/inspect mappings (`SYS_ASPACE_QUERY`, which
@@ -1498,6 +1504,14 @@ pub const MAX_THREAD_MEM_COPY: usize = 4096;
 /// or without, then makes instruction fetch on every hart see the write
 /// (`docs/fault-handling.md` § Debugging).
 pub const THREAD_MEM_TEXT: u64 = 1 << 0;
+
+// ── Accessed-bit harvest (SYS_ASPACE_HARVEST) ────────────────────────────────
+
+/// Most pages one `SYS_ASPACE_HARVEST` call reads. It bounds the kernel's
+/// stack bitmap (one bit per page, 512 bytes) and the time the call holds
+/// the address space's page-table lock; a pager loops over a larger range
+/// (`docs/limits.md`).
+pub const MAX_HARVEST_PAGES: u64 = 4096;
 
 // ── System info ───────────────────────────────────────────────────────────────
 

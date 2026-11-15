@@ -177,9 +177,9 @@ is the last cap, so the creator-endpoint slot stays at cap[1], and a cap of its 
 argv/env cap is: a request needs one cap past cap[0] for each of `CREATE_DEATH_RELAY` and
 `CREATE_ARGV_ENV` it sets, and one that sets more than its caps can supply is refused with
 `INVALID_ARGUMENT`. Once the child is recorded, procmgr binds the relay as an `AddressSpace` death
-observer (correlator 0) on the child, using one of the relay queue's observer nodes, so a terminal
-fault in any of the child's threads posts the fault class to the spawner's own death queue, then
-deletes its copy; a failed creation deletes it unbound.
+observer (correlator 0) on the child, using one of the relay queue's observer nodes, so the first
+terminal fault in any of the child's threads posts the fault class to the spawner's own death queue,
+once (a later fault posts nothing), then deletes its copy; a failed creation deletes it unbound.
 
 **DMA hold flag.** The label's bit 28 (`CREATE_DMA_HOLD`, in the window shared
 with `CREATE_FROM_FILE`) holds back the child's memory reclaim. Once the child

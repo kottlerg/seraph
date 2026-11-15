@@ -2178,9 +2178,10 @@ fn finalize_creation(
     // Also bind an address-space observer with the SAME correlator, so a
     // terminal fault in a *spawned* (non-main) thread — which the main-thread
     // binding above does not cover — still routes into `dispatch_death` →
-    // `take_by_badge` → teardown. On a main-thread fault both observers fire
-    // with the same correlator and `take_by_badge` reaps exactly once (the
-    // second event is a stale-correlator no-op). Without it a worker
+    // `take_by_badge` → teardown. When the main thread's fault is its address
+    // space's first, both observers fire with the same correlator and
+    // `take_by_badge` reaps exactly once (the second event is a
+    // stale-correlator no-op). Without it a worker
     // thread's fault would never reap the process, so its failure refuses
     // the spawn; the caller's guards destroy the child, which returns the
     // main-thread observer's node.
@@ -2272,9 +2273,9 @@ fn finalize_creation(
     }
 
     // If the spawner supplied a death-relay POST cap, bind it as a second
-    // address-space observer (correlator 0) so a terminal fault in any child
-    // thread posts the fault class straight to the spawner's death queue and
-    // `Child::wait()` returns. The kernel captures the EventQueue state at
+    // address-space observer (correlator 0) so the first terminal fault in any
+    // child thread posts the fault class straight to the spawner's death
+    // queue, once, and `Child::wait()` returns. The kernel captures the EventQueue state at
     // bind time, so procmgr drops its copy afterwards (mirrors how the
     // main-thread death binding leaves no procmgr-side ownership concern).
     // Consumed only here, after the last failure return, so on every `Err`

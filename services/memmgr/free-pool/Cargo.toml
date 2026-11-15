@@ -11,6 +11,9 @@ publish.workspace = true
 # PAGE_SIZE is the single source of truth in the syscall ABI; the split-offset
 # and demand-chunk arithmetic here works in page units.
 syscall-abi = { path = "../../../abi/syscall" }
+# A committed region's page-table reservation is the bound the std runtime
+# tops its own page-table pool up by (`pool_funding::pt_pages_for`).
+pool-funding = { path = "../../../runtime/ruststd/pool-funding", package = "ruststd-pool-funding" }
 
 [lints]
 workspace = true

@@ -99,15 +99,25 @@ pub struct DeferredRun
     pub budget: NodeIdx,
 }
 
-/// One registered demand region on its process's region list: the region and
-/// the root of its chunk table ([`crate::chunk`]), [`NODE_NULL`] while no
-/// chunk of it has an entry.
+/// One registered demand region on its process's region list: the region, the
+/// root of its chunk table ([`crate::chunk`]), [`NODE_NULL`] while no chunk of
+/// it has an entry, and, for a committed region, the pages left of its
+/// page-table reservation ([`crate::commit`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RegionNode
 {
     pub region: DemandRegion,
     pub table: NodeIdx,
+    /// `Some` for a committed region, holding the pages of its page-table
+    /// reservation its faults' donations have not drawn; `None` for an
+    /// uncommitted one.
+    pub commit: Option<u64>,
 }
+
+// Hard size budget: a region node shares the arena slot with every other
+// payload, and `SLOTS_PER_PAGE` is sized for the largest of them, a
+// [`ProcessRecord`].
+const _: () = assert!(size_of::<RegionNode>() <= size_of::<ProcessRecord>());
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

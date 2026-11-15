@@ -6,8 +6,8 @@
 //! Pure bookkeeping logic for memmgr: the metadata arena, the free pool, the
 //! deferred list of reclaimed frames not yet pooled, the process index, the
 //! budget nodes processes are charged to, the chunk table of each demand
-//! region, the memory-pressure levels, and the demand-region interval
-//! arithmetic and protection check.
+//! region, the commitment bounds of a committed region, the memory-pressure
+//! levels, and the demand-region interval arithmetic and protection check.
 //!
 //! The crate performs no IPC and issues no syscalls. Storage arrives through
 //! the [`SlotStore`] and [`WordStore`] traits (mapped pool pages in memmgr, a
@@ -24,6 +24,7 @@
 pub mod arena;
 pub mod budget;
 pub mod chunk;
+pub mod commit;
 pub mod deferred;
 pub mod index;
 pub mod ledger;
@@ -38,9 +39,10 @@ pub use budget::{
     BudgetNode, ChargeError, NO_MAX, NodeError, NodeSpec, SYSTEM_RESERVE_DIVISOR, reserve_pages,
 };
 pub use chunk::{ChunkEntry, ChunkError, ChunkState};
+pub use commit::{CommitNeed, PT_RESERVE_SLACK};
 pub use deferred::{DeferredList, RecheckBudget};
 pub use index::{BUCKETS_PER_PAGE, ProcessIndex, WordStore};
-pub use ledger::{BackError, Ledger, RegionError};
+pub use ledger::{BackError, Commit, Ledger, RegionError, ResizeError};
 pub use pool::{Fit, FreePool, Grant, GrantEntry, MAX_GRANT_RUNS, SelectError};
 pub use pressure::{PRESSURE_BAND_DIVISOR, PRESSURE_LOW_DIVISOR, PressureLevel, pressure_level};
 
@@ -53,7 +55,7 @@ use syscall_abi::{FAULT_ACCESS_EXEC, FAULT_ACCESS_WRITE, MAP_EXECUTABLE, MAP_WRI
 pub const DEMAND_CHUNK_PAGES: u32 = 16;
 
 /// Bytes of one demand chunk.
-const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
+pub const CHUNK_BYTES: u64 = DEMAND_CHUNK_PAGES as u64 * PAGE_SIZE;
 
 /// One free run: a Memory cap memmgr owns, covering `page_count` pages
 /// starting at physical address `phys_base`. The page count is `u64`, so a

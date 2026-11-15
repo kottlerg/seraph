@@ -19,10 +19,11 @@
 )]
 
 use free_pool::{
-    ArenaLayout, ChargeError, DemandRegion, Fit, FrameDesc, FreeRun, Grant, Ledger, MAX_GRANT_RUNS,
-    NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError, NodeIdx, NodeSpec, PressureLevel,
-    RecheckBudget, RegionError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
-    chunk_for, fault_window, pressure_level, region_grants, reserve_pages,
+    ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Fit, FrameDesc,
+    FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
+    NodeIdx, NodeSpec, PressureLevel, RecheckBudget, RegionError, ResizeError, SelectError,
+    SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk::table_height, chunk_count,
+    chunk_for, commit::grow_need, fault_window, pressure_level, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -393,15 +394,18 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 
 /// Admit a charge of `pages` to the budget node of `rec`, beside `pending`
 /// pages that left the pool for it uncharged, against the max of the node and
-/// its ancestors and, for a node outside the reserve, against the system
-/// reserve (`free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
-/// § Distribution policy). A refusal first rechecks the deferred runs, unless
-/// this turn of the receive loop already has, and, when one moved to the pool,
-/// which releases its charge and adds free pages, admits once more. Every
-/// charge to a process is admitted here or by [`admissible`] before its run
-/// leaves the pool: a grant here, a demand fault's run by [`admissible`], and
-/// a page-table donation to its address space here, beside the demand run
-/// whose map needs it.
+/// its ancestors and against the free pages outside `promised` less, for a
+/// node outside the reserve, the system reserve
+/// (`free_pool::budget::admit`; services/memmgr/docs/memory-pool.md
+/// § Distribution policy, § Commit). A refusal first rechecks the deferred
+/// runs, unless this turn of the receive loop already has, and, when one moved
+/// to the pool, which releases its charge and adds free pages, admits once
+/// more. Every charge to a process is admitted here, by [`admissible`] or by
+/// [`admit_commit`] before its run leaves the pool: a grant here, a demand
+/// fault's run in an uncommitted region by [`admissible`], a committed region
+/// or its growth by [`admit_commit`], and a page-table donation to its address
+/// space here, beside the demand run whose map needs it, unless a committed
+/// region's reservation already carries it.
 fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<(), ChargeError>
 {
     let reserve = reserve_pages(pool_total_pages());
@@ -412,6 +416,25 @@ fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<()
         }
         coalesce(l);
         l.admit(rec, pages, pending, reserve)
+    })
+}
+
+/// Admit the commitment `need` of a committed region of `rec`, or of its
+/// growth (`free_pool::Ledger::admit_commit`): its data pages and page-table
+/// reservation against the max of the budget node and its ancestors, and
+/// those and its metadata bound against the free pages outside `promised`
+/// less, for a node outside the reserve, the system reserve. A refusal
+/// rechecks the deferred runs once, as [`admit`] does.
+fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(), ChargeError>
+{
+    let reserve = reserve_pages(pool_total_pages());
+    l.admit_commit(rec, need, reserve).or_else(|e| {
+        if recheck_deferred(l) == 0
+        {
+            return Err(e);
+        }
+        coalesce(l);
+        l.admit_commit(rec, need, reserve)
     })
 }
 
@@ -1616,7 +1639,9 @@ fn pool_run_of(slot: u64) -> Option<FreeRun>
 
 /// Reply with the all-RAM-accounted identity terms plus the current free and
 /// deferred totals and the largest free run (all in bytes): `system_ram`,
-/// `kernel_reserved`, `pool_total`, `free`, `deferred`, `largest_free`.
+/// `kernel_reserved`, `pool_total`, `free`, `deferred`, `largest_free`,
+/// then the reserve, the pressure level and `promised`
+/// (services/memmgr/docs/ipc-interface.md § Label 6).
 /// Read-only; the caller asserts `system_ram == kernel_reserved + pool_total`.
 /// `pool_total` is the monotonic owned-RAM counter scaled to bytes; `free` is
 /// the subset currently in free runs (lent to no process), which falls on
@@ -1641,6 +1666,7 @@ fn handle_query_pool_status(ipc_buf: *mut u64, boot: &InitBootstrap)
         .word(5, largest_bytes)
         .word(6, reserve_bytes)
         .word(7, pressure_wire(current_pressure()))
+        .word(8, l.promised().saturating_mul(PAGE_SIZE))
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
@@ -1672,14 +1698,19 @@ fn handle_query_memory_usage(req: &IpcMessage, ipc_buf: *mut u64)
 /// Register a demand-paged anonymous region for the calling process.
 ///
 /// Attributed by `req.badge` (the caller's per-process badge). The region is
-/// validated (page alignment, nonzero length, W^X, known prot bits) and stored
-/// against the caller's record; no mapping is installed here — backing happens
-/// lazily in [`handle_fault`].
+/// validated (page alignment, nonzero length, W^X, known prot and flag bits)
+/// and stored against the caller's record; no mapping is installed here —
+/// backing happens lazily in [`handle_fault`]. A region registered with
+/// `REGION_COMMIT` is admitted and charged whole first ([`admit_commit`];
+/// services/memmgr/docs/memory-pool.md § Commit), and a reply that does not
+/// reach the caller unregisters it again, as a grant whose reply fails is
+/// rolled back, so a caller whose call was interrupted repeats it.
 fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let va_base = req.word(0);
     let len = req.word(1);
     let prot = req.word(2);
+    let flags = req.word(3);
 
     let known_prot = MAP_READ | MAP_WRITABLE | MAP_EXECUTABLE;
     let wx = MAP_WRITABLE | MAP_EXECUTABLE;
@@ -1689,10 +1720,19 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
         || va_base.checked_add(len).is_none()
         || prot & !known_prot != 0
         || prot & wx == wx
+        || flags & !memmgr_labels::REGION_COMMIT != 0
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     }
+    let commit = if flags & memmgr_labels::REGION_COMMIT == 0
+    {
+        Commit::Uncommitted
+    }
+    else
+    {
+        Commit::Committed
+    };
 
     let l = ledger_mut();
     let Some(rec) = l.find(req.badge)
@@ -1701,21 +1741,185 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    if commit == Commit::Committed
+        && let Err(e) = admit_commit(l, rec, grow_need(0, len))
+    {
+        reply_label(ipc_buf, commit_refusal(e));
+        return;
+    }
     let region = DemandRegion { va_base, len, prot };
-    let mut result = l.add_region(rec, region);
+    let mut result = l.add_region(rec, region, commit);
     if result == Err(RegionError::NoSlot) && ensure_slots(l, 1)
     {
-        result = l.add_region(rec, region);
+        result = l.add_region(rec, region, commit);
+    }
+    let reg = match result
+    {
+        Ok(reg) => reg,
+        // `rec` came from `find` above, so `NoRecord` cannot arise; it would
+        // mean an unknown caller, which is an invalid argument too.
+        Err(RegionError::Overlap | RegionError::NoRecord) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+        Err(RegionError::NoSlot) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::QUOTA);
+            return;
+        }
+    };
+    let reply = IpcMessage::new(memmgr_errors::SUCCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err() && commit == Commit::Committed
+    {
+        // The caller did not learn of the registration, and repeats the call:
+        // undo it, or the repeat finds an overlap and the commitment stays
+        // charged. Nothing faulted in it yet, since memmgr serves one message
+        // at a time.
+        let _ = l.remove_region(rec, reg, quiescent);
+    }
+}
+
+/// The reply code of a refused commitment: `LIMIT` at a max, else
+/// `OUT_OF_MEMORY_BEST_EFFORT`, the RAM outside `promised` and the reserve
+/// being short.
+const fn commit_refusal(e: ChargeError) -> u64
+{
+    match e
+    {
+        ChargeError::Limit => memmgr_errors::LIMIT,
+        ChargeError::Reserve => memmgr_errors::OUT_OF_MEMORY_BEST_EFFORT,
+    }
+}
+
+/// The committed region of the record `rec` based at `va_base`, its slot and
+/// its length.
+fn committed_region(l: &MemLedger, rec: NodeIdx, va_base: u64) -> Option<(NodeIdx, u64)>
+{
+    l.region_based(rec, va_base)
+        .filter(|(_, node)| node.commit.is_some())
+        .map(|(reg, node)| (reg, node.region.len))
+}
+
+/// Grow a committed region of the calling process in place:
+/// `[va_base, new_len)` from `data[0]` and `data[1]`
+/// (services/memmgr/docs/ipc-interface.md § Label 12). The growth is admitted
+/// and charged as a committed registration of it ([`admit_commit`]), and
+/// the region's chunk table gains the levels the new length needs. A reply
+/// that does not reach the caller shrinks the region back, so a caller whose
+/// call was interrupted repeats it.
+fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let va_base = req.word(0);
+    let new_len = req.word(1);
+    let l = ledger_mut();
+    let Some((rec, (reg, len))) = l
+        .find(req.badge)
+        .and_then(|rec| committed_region(l, rec, va_base).map(|r| (rec, r)))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if new_len == len
+    {
+        reply_label(ipc_buf, memmgr_errors::SUCCESS);
+        return;
+    }
+    if new_len < len || !new_len.is_multiple_of(PAGE_SIZE) || va_base.checked_add(new_len).is_none()
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    if let Err(e) = admit_commit(l, rec, grow_need(len, new_len))
+    {
+        reply_label(ipc_buf, commit_refusal(e));
+        return;
+    }
+    // The directory levels the grown chunk table adds.
+    let height = |len| {
+        table_height(chunk_count(&DemandRegion {
+            va_base,
+            len,
+            prot: 0,
+        }))
+    };
+    let levels = u64::from(height(new_len).saturating_sub(height(len)));
+    let mut result = l.extend_region(rec, reg, new_len);
+    if result == Err(ResizeError::NoSlot) && ensure_slots(l, levels)
+    {
+        result = l.extend_region(rec, reg, new_len);
     }
     let code = match result
     {
         Ok(()) => memmgr_errors::SUCCESS,
-        // `rec` came from `find` above, so `NoRecord` cannot arise; it would
-        // mean an unknown caller, which is an invalid argument too.
-        Err(RegionError::Overlap | RegionError::NoRecord) => memmgr_errors::INVALID_ARGUMENT,
-        Err(RegionError::NoSlot) => memmgr_errors::QUOTA,
+        Err(ResizeError::NoSlot) => memmgr_errors::QUOTA,
+        Err(
+            ResizeError::NoRegion
+            | ResizeError::NotCommitted
+            | ResizeError::Length
+            | ResizeError::Overlap,
+        ) => memmgr_errors::INVALID_ARGUMENT,
     };
-    reply_label(ipc_buf, code);
+    let reply = IpcMessage::new(code);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err() && code == memmgr_errors::SUCCESS
+    {
+        // As in [`handle_register_region`]: undo the growth the caller did
+        // not learn of. No fault was served since, so no run lies past `len`.
+        let _ = l.shrink_region(rec, reg, len, quiescent);
+    }
+}
+
+/// Lower the top of a committed region of the calling process to `new_len`
+/// (`data[1]`), a nonzero multiple of the demand chunk
+/// (services/memmgr/docs/ipc-interface.md § Label 13): unmap the pages past
+/// it from the client address space, then cut the chunks past it from the
+/// region's chunk table, taking each run back, pooled or deferred, and
+/// releasing the commitment of the pages cut
+/// (`free_pool::Ledger::shrink_region`). A repeat finds the region at the new
+/// length and succeeds, so an interrupted call is safe to repeat.
+fn handle_shrink_region(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let va_base = req.word(0);
+    let new_len = req.word(1);
+    let l = ledger_mut();
+    let Some((rec, (reg, len))) = l
+        .find(req.badge)
+        .and_then(|rec| committed_region(l, rec, va_base).map(|r| (rec, r)))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if new_len == 0 || !new_len.is_multiple_of(CHUNK_BYTES) || new_len > len
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    if new_len < len
+    {
+        let aspace_cap = l.aspace_cap(rec);
+        // Clear the cut pages' PTEs before their runs can reach another
+        // owner, as [`handle_unregister_region`] does for a whole region.
+        // SAFETY: `aspace_cap` is a client address space procmgr delegated
+        // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
+        // memmgr runs on.
+        let _ = unsafe {
+            syscall::mem_unmap_reclaim(
+                aspace_cap,
+                va_base.saturating_add(new_len),
+                len.saturating_sub(new_len) / PAGE_SIZE,
+            )
+        };
+        recheck_deferred(l);
+        // The region is committed and the length a smaller chunk multiple, so
+        // the cut cannot be refused.
+        let _ = l.shrink_region(rec, reg, new_len, quiescent);
+        coalesce(l);
+    }
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
 }
 
 /// Unregister a demand-paged region for the calling process, reclaiming every
@@ -1879,16 +2083,29 @@ fn decline_fault(ipc_buf: *mut u64, reason: FaultDecline, detail: u64)
 
 /// Admit as much of a demand fault's span of `span_pages` as the budget node
 /// of `rec` takes ([`admissible`]): the span, clamped to the headroom under the
-/// max of the node and its ancestors and, for a node outside the reserve, to
-/// the free pages above the system reserve. Then select the run that backs
+/// max of the node and its ancestors and to the free pages outside `promised`
+/// above, for a node outside the reserve, the system reserve. A fault in a
+/// committed region is admitted whole without that: its commitment carries
+/// the span's charge and `promised` its pages. Then select the run that backs
 /// those pages: one covering them, else the largest free run. The span is a
 /// fault-around preference, so the fault is declined only when not even the
 /// faulting page is admitted: [`FaultDecline::BudgetLimit`] at a max,
 /// [`FaultDecline::NoFreePage`] at the reserve or when the selection fails.
-fn select_fault_run(l: &mut MemLedger, rec: NodeIdx, span_pages: u32)
--> Result<Grant, FaultDecline>
+fn select_fault_run(
+    l: &mut MemLedger,
+    target: &FaultTarget,
+    span_pages: u32,
+) -> Result<Grant, FaultDecline>
 {
-    match admissible(l, rec, u64::from(span_pages))
+    let admitted = if target.committed.is_some()
+    {
+        Ok(u64::from(span_pages))
+    }
+    else
+    {
+        admissible(l, target.rec, u64::from(span_pages))
+    };
+    match admitted
     {
         Ok(pages) =>
         {
@@ -2026,6 +2243,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         span: (span_start, span_end),
         page_base,
         held: need,
+        committed: l.is_committed(reg).then_some(reg),
     };
     let frame = match back_span(l, &target, span_pages)
     {
@@ -2062,6 +2280,10 @@ struct FaultTarget
     /// The arena slots recording the run takes, held through a page-table
     /// top-up.
     held: u64,
+    /// The region's slot when it is committed: its commitment carries the
+    /// run's charge, and its page-table reservation the donations the map
+    /// needs (services/memmgr/docs/memory-pool.md § Commit).
+    committed: Option<NodeIdx>,
 }
 
 /// Back the span of `target` with one run of at most `span_pages` pages
@@ -2083,7 +2305,7 @@ fn back_span(
     let mut cap = span_pages;
     loop
     {
-        let grant = select_fault_run(l, target.rec, cap).map_err(|reason| (reason, 0))?;
+        let grant = select_fault_run(l, target, cap).map_err(|reason| (reason, 0))?;
         let (outer, pages, phys) = grant.entries[0];
         // The run's mapped VA, which places it in its chunk.
         let frame = FrameDesc {
@@ -2113,14 +2335,7 @@ fn back_span(
         // Map first; the caller records the run in its chunk after, so a
         // failed map leaves the chunk's entry as it was. A page-table top-up
         // during the map holds the slots recording the run needs.
-        let Err(refusal) = map_client_chunk(
-            l,
-            target.rec,
-            target.aspace_cap,
-            &frame,
-            target.prot,
-            target.held,
-        )
+        let Err(refusal) = map_client_chunk(l, target, &frame)
         else
         {
             return Ok(frame);
@@ -2166,12 +2381,12 @@ enum FundRefusal
     Failed,
 }
 
-/// Map the demand chunk `frame` describes into the client address space
-/// `aspace_cap` at `frame.va` with `prot`. When the kernel reports the
-/// client's page-table pool exhausted, memmgr funds the pool from its own
-/// ([`fund_client_page_tables`]), holding the `held` arena slots that
-/// recording the chunk takes, and maps again, at most [`PT_FUND_ROUNDS`]
-/// times. Returns the last map error otherwise, [`MapRefusal::Limit`] when
+/// Map the demand chunk `frame` describes into the client address space of
+/// `target` at `frame.va` with the region's protection. When the kernel
+/// reports the client's page-table pool exhausted, memmgr funds the pool from
+/// its own ([`fund_client_page_tables`]), holding the `target.held` arena
+/// slots that recording the chunk takes, and maps again, at most
+/// [`PT_FUND_ROUNDS`] times. Returns the last map error otherwise, [`MapRefusal::Limit`] when
 /// the process's budget refused the funding, or [`MapRefusal::Reserve`] when
 /// the system reserve did.
 ///
@@ -2183,13 +2398,20 @@ enum FundRefusal
 /// again in place.
 fn map_client_chunk(
     l: &mut MemLedger,
-    rec: NodeIdx,
-    aspace_cap: u64,
+    target: &FaultTarget,
     frame: &FrameDesc,
-    prot: u64,
-    held: u64,
 ) -> Result<(), MapRefusal>
 {
+    let aspace_cap = target.aspace_cap;
+    // A committed region's commitment carries the run's charge already.
+    let pending = if target.committed.is_some()
+    {
+        0
+    }
+    else
+    {
+        u64::from(frame.page_count)
+    };
     let mut rounds: u32 = 0;
     loop
     {
@@ -2203,7 +2425,7 @@ fn map_client_chunk(
                 frame.va,
                 0,
                 u64::from(frame.page_count),
-                prot,
+                target.prot,
             )
         };
         let Err(e) = mapped
@@ -2215,7 +2437,7 @@ fn map_client_chunk(
         {
             return Err(MapRefusal::Map(e));
         }
-        match fund_client_page_tables(l, rec, aspace_cap, held, u64::from(frame.page_count))
+        match fund_client_page_tables(l, target, pending)
         {
             Ok(()) =>
             {}
@@ -2227,18 +2449,21 @@ fn map_client_chunk(
     }
 }
 
-/// Fund the client address space `aspace_cap`'s page-table growth pool from
-/// memmgr's free pool: donate a contiguous run of [`ASPACE_TOPUP_PAGES`] (or
-/// [`CLIENT_TOPUP_MIN_PAGES`] when no such run is free, or the process's
+/// Fund the page-table growth pool of the client address space of `target`
+/// from memmgr's free pool: donate a contiguous run of [`ASPACE_TOPUP_PAGES`]
+/// (or [`CLIENT_TOPUP_MIN_PAGES`] when no such run is free, or the process's
 /// budget admits only that) with augment-mode `cap_create_aspace`, and account
-/// the run to the client's record `rec` like a grant memmgr did not map
+/// the run to the client's record like a grant memmgr did not map
 /// ([`FRAME_VA_UNMAPPED`], no region id). The donation is admitted beside the
 /// `pending` pages of the demand run whose map needs it, which are charged
 /// only once the run is recorded, and is charged to the budget node, so only
 /// `PROCESS_DIED` reclaims it, once the address space's teardown has released
 /// the donation (services/memmgr/docs/memory-pool.md § Client page-table
-/// funding). memmgr keeps the run's cap as the reclaim anchor. A refused
-/// donation returns the run to the pool. The arena keeps `held` free slots
+/// funding). For a fault in a committed region, a donation the region's
+/// page-table reservation covers is drawn from it instead of admitted
+/// (`free_pool::Ledger::draw_pt_reserve`; § Commit), so it is charged once.
+/// memmgr keeps the run's cap as the reclaim anchor. A refused donation
+/// returns the run to the pool. The arena keeps `target.held` free slots
 /// beside the run's descriptor, for the caller's demand chunk.
 ///
 /// # Errors
@@ -2248,20 +2473,25 @@ fn map_client_chunk(
 /// the pool or the donation fails.
 fn fund_client_page_tables(
     l: &mut MemLedger,
-    rec: NodeIdx,
-    aspace_cap: u64,
-    held: u64,
+    target: &FaultTarget,
     pending: u64,
 ) -> Result<(), FundRefusal>
 {
+    let (rec, aspace_cap) = (target.rec, target.aspace_cap);
     // One slot for this run's descriptor, and those held for the chunk.
-    if !ensure_slots(l, held.saturating_add(1))
+    if !ensure_slots(l, target.held.saturating_add(1))
     {
         return Err(FundRefusal::Failed);
     }
-    let first = if admit(l, rec, u64::from(ASPACE_TOPUP_PAGES), pending).is_ok()
+    let reserved = target.committed.map_or(0, |reg| l.pt_reserve(reg));
+    let first = if reserved >= u64::from(ASPACE_TOPUP_PAGES)
+        || admit(l, rec, u64::from(ASPACE_TOPUP_PAGES), pending).is_ok()
     {
         ASPACE_TOPUP_PAGES
+    }
+    else if reserved >= u64::from(CLIENT_TOPUP_MIN_PAGES)
+    {
+        CLIENT_TOPUP_MIN_PAGES
     }
     else
     {
@@ -2303,6 +2533,13 @@ fn fund_client_page_tables(
     }
     if syscall::cap_create_aspace(outer, aspace_cap, u64::from(pages)).is_ok()
     {
+        // A donation the reservation covers was not admitted: draw it, so the
+        // charge `push_frame` made is the reservation's, not a second one.
+        if let Some(reg) = target.committed
+            && reserved >= u64::from(pages)
+        {
+            l.draw_pt_reserve(rec, reg, u64::from(pages));
+        }
         return Ok(());
     }
     let _ = l.pop_frame(rec);
@@ -2400,8 +2637,9 @@ const fn pressure_wire(level: PressureLevel) -> u64
     }
 }
 
-/// Recompute the pressure level after a turn of the receive loop and, when it
-/// changed, send every registrant its bits
+/// Recompute the pressure level from the free pages outside `promised` after a
+/// turn of the receive loop and, when it changed, send every registrant its
+/// bits
 /// (services/memmgr/docs/memory-pool.md § Memory pressure). A Notification
 /// send never blocks, so no client can hold memmgr here; a send that fails (a
 /// cap the client revoked) is dropped. The walk visits every record, which
@@ -2410,7 +2648,7 @@ fn signal_pressure()
 {
     let l = ledger_mut();
     let prev = current_pressure();
-    let level = pressure_level(prev, l.pool.free_pages(), pool_total_pages());
+    let level = pressure_level(prev, l.uncommitted_free(), pool_total_pages());
     if level == prev
     {
         return;
@@ -2724,6 +2962,14 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::REGISTER_PRESSURE =>
         {
             handle_register_pressure(req, kept, ipc_buf);
+        }
+        memmgr_labels::EXTEND_REGION =>
+        {
+            handle_extend_region(req, ipc_buf);
+        }
+        memmgr_labels::SHRINK_REGION =>
+        {
+            handle_shrink_region(req, ipc_buf);
         }
         _ =>
         {

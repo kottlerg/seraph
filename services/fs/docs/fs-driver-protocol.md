@@ -220,14 +220,12 @@ the driver's capability and frees the object once no copy is left. The
 client's own copy stays in that subtree wherever an IPC transfer or
 `SYS_CAP_MOVE` takes it, so it dies exactly when the open does. A copy derived
 from another copy, the client's or any later holder's, stays in the subtree
-while every `CSpace` holding a copy on its derivation path, between it and the
-driver's capability, lives, since deleting a capability hands its derivations
-to its parent. It leaves the subtree when one of those `CSpace`s is torn down,
-which makes each derivation held in another `CSpace` a root of its own, as
-[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#revocation-algorithm)
-§ Revocation Algorithm states. Such a copy still keeps the open alive while it
-is held, but no release reaches it: it outlives the open, keeping the
-Notification and the driver memory it occupies, until its holder deletes it.
+wherever its derivation path runs, since deleting a capability and tearing
+down the `CSpace` holding it both hand its derivations to the nearest ancestor
+outside that `CSpace`, as
+[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#teardown-drain)
+§ Teardown Drain states. A release or revoke at the driver's capability
+therefore reaches every copy, including one derived through a dead `CSpace`.
 
 A delegated open cap alone does not keep the open alive: a holder other than
 the client keeps it alive only by also holding a copy of the liveness cap,

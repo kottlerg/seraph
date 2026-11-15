@@ -2917,9 +2917,14 @@ A concurrent deriver extending the child list faster than it is moved returns
 `Interrupted`, leaving the capability live in both slots with the destination
 a derived child of the source — a `SYS_CAP_REVOKE` on the source reclaims
 it, so nothing is left outside the caller's reach even when the destination
-index was auto-allocated. A CSpace torn down while the move is in flight
-releases the children hanging under its dying slots as derivation roots, as
-for any other slot.
+index was auto-allocated. A CSpace whose teardown drain has begun is
+draining, and the move treats it as gone (see
+[capability-internals.md](capability-internals.md) § Teardown Drain). When the
+destination CSpace dies, the move fails with `InvalidState`: the source keeps
+the capability and every child, the drain re-linking the migrated children
+under the source. When the source CSpace dies, the move completes where it
+stands, and the drain re-links the destination and the source's unmigrated
+children under the source's parent.
 
 **Arguments:**
 

@@ -81,7 +81,7 @@ const HOG_MARGIN_PAGES: u64 = 1024;
 const HOG_MAX_ROUNDS: usize = 256;
 /// Grants past what is left the hog may ask before it gives up: each one
 /// memmgr admits means another process freed pages after the hog read what
-/// was left.
+/// was left, and the hog gives it back before it asks again.
 const HOG_REFUSAL_ATTEMPTS: usize = 8;
 /// Bytes of the hog's ballast: the size of the heap's floor, so the ballast
 /// holds at least what the floor has free.
@@ -100,6 +100,9 @@ const HOG_GRANT_NOT_REFUSED: i32 = 4;
 const HOG_NO_FREE_PAGES: i32 = 5;
 /// Exit code: the allocation of the ballast failed.
 const HOG_BALLAST_FAILED: i32 = 6;
+/// Exit code: memmgr refused the release of a grant it admitted past what
+/// was left, or its grant reply had no valid layout.
+const HOG_RELEASE_FAILED: i32 = 7;
 
 /// Pages of one memmgr demand chunk, the unit `SHRINK_REGION` cuts in.
 const CHUNK_PAGES: u64 = 16;
@@ -430,7 +433,8 @@ fn run_hog()
         "the heap-commit hog exited {status:?}: {HOG_STATUS_FAILED}=QUERY_POOL_STATUS failed, \
          {HOG_NOT_COMMITTED}=it did not commit down to its margin, {HOG_GRANT_NOT_REFUSED}=a grant \
          past what is left was admitted in every attempt, {HOG_NO_FREE_PAGES}=the refusal showed no free \
-         pages, {HOG_BALLAST_FAILED}=its ballast's allocation failed, a fault=a fault on a committed page was declined"
+         pages, {HOG_BALLAST_FAILED}=its ballast's allocation failed, \
+         {HOG_RELEASE_FAILED}=the release of a grant admitted past what was left failed, a fault=a fault on a committed page was declined"
     );
 }
 
@@ -490,9 +494,10 @@ fn uncommitted_available() -> u64
 /// Other processes free pages while the hog runs (a file system gives back
 /// its cache when the hog's commitment raises memmgr's pressure level), so
 /// what is left can grow between the hog's read of it and its grant. memmgr
-/// then admits the grant; the hog keeps it, which its exit returns, commits
-/// down to its margin again and asks again, up to
-/// [`HOG_REFUSAL_ATTEMPTS`] times.
+/// then admits the grant; the hog gives it back, commits down to its margin
+/// again and asks again, up to [`HOG_REFUSAL_ATTEMPTS`] times. A memmgr that
+/// admits past what is left, by any number of pages, admits every attempt,
+/// since each gives its grant back before the next read.
 ///
 /// The heap's floor is an uncommitted demand region below the committed one
 /// (docs/userspace-memory-model.md § Byte Heap), whose untouched pages memmgr
@@ -552,8 +557,8 @@ fn commit_to_margin(held: &mut Vec<Vec<u8>>, rounds: &mut usize) -> u64
 
 /// Ask memmgr for a best-effort grant of one page more than `left`. Returns
 /// `true` when memmgr refuses it with `OUT_OF_MEMORY_BEST_EFFORT` and counts
-/// more free pages than the grant asked, and `false` when it grants it (the
-/// hog keeps the grant). Exits with [`HOG_NO_FREE_PAGES`] on a refusal that
+/// more free pages than the grant asked, and `false` when it grants it, once
+/// the grant is given back ([`give_back`]). Exits with [`HOG_NO_FREE_PAGES`] on a refusal that
 /// counts no more free pages than asked, and with [`HOG_GRANT_NOT_REFUSED`] on
 /// any other reply.
 fn past_grant_refused(left: u64) -> bool
@@ -580,9 +585,55 @@ fn past_grant_refused(left: u64) -> bool
             }
             true
         }
-        Ok(r) if r.label == memmgr_errors::SUCCESS => false,
+        Ok(r) if r.label == memmgr_errors::SUCCESS =>
+        {
+            give_back(&r);
+            false
+        }
         _ => exit(HOG_GRANT_NOT_REFUSED),
     }
+}
+
+/// Give back every run of the grant `reply` transferred: delete its caps,
+/// so memmgr pools the runs at once, then release the runs by region id,
+/// `reply`'s `data[0]` being their count.
+/// Exits with [`HOG_RELEASE_FAILED`] when the reply has no valid grant layout
+/// or memmgr refuses the release.
+fn give_back(reply: &IpcMessage)
+{
+    let Some((_, ids)) = ipc::memmgr_grant_layout(reply)
+    else
+    {
+        exit(HOG_RELEASE_FAILED)
+    };
+    for &cap in reply.caps()
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    let release = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
+        .word(0, reply.word(0))
+        .words(1, ids)
+        .build();
+    if memmgr_label_or_exit(&release) != memmgr_errors::SUCCESS
+    {
+        exit(HOG_RELEASE_FAILED);
+    }
+}
+
+/// memmgr's reply label to `msg`; exits with [`HOG_RELEASE_FAILED`] when
+/// the call fails.
+fn memmgr_label_or_exit(msg: &IpcMessage) -> u64
+{
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    unsafe {
+        ipc::ipc_call(
+            startup_info().memmgr_endpoint,
+            msg,
+            std::os::seraph::current_ipc_buf(),
+        )
+    }
+    .map_or(None, |r| Some(r.label))
+    .unwrap_or_else(|| exit(HOG_RELEASE_FAILED))
 }
 
 /// Write one byte of every page of the blocks in `held`, each a committed

@@ -109,8 +109,10 @@ impl DriverWatch
     /// Create the watch for a boot that spawns at most `drivers` drivers:
     /// the death queue holds [`OBSERVERS_PER_DRIVER`] posts and
     /// death-observer nodes per driver, since devmgr spawns each at most once
-    /// and binds that many observers on each, each of which posts at most
-    /// once, so no death is dropped and every bind is funded. The queue holds at most the kernel's
+    /// and binds that many observers on each, whose posts the kernel bounds
+    /// (core/kernel/docs/syscalls.md § `SYS_THREAD_BIND_NOTIFICATION` (47)
+    /// and § `SYS_ASPACE_BIND_NOTIFICATION` (53)), so no death is dropped
+    /// and every bind is funded. The queue holds at most the kernel's
     /// `EVENT_QUEUE_MAX_CAPACITY`; past it, the bind of a driver beyond the
     /// queue's nodes fails and that driver is withdrawn, logged. The job
     /// notification is a member of the wait set from the start. Returns

@@ -212,6 +212,28 @@ pub unsafe fn unmap_user_region_pooled(
 /// (core/kernel/docs/memory-internals.md § Frame Map Table).
 pub unsafe fn for_each_user_leaf(root_virt: u64, on_leaf: &mut dyn FnMut(u64));
 
+/// Pass the VA of each present 4 KiB leaf in `[virt_base, virt_base +
+/// page_count * 4 KiB)` whose accessed bit is set to `on_accessed`, in VA
+/// order, changing nothing; the read half of `SYS_ASPACE_HARVEST`
+/// (core/kernel/docs/memory-internals.md § Accessed Bits). The caller holds
+/// the address space's `pt_lock`.
+pub unsafe fn read_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    on_accessed: &mut dyn FnMut(u64),
+);
+
+/// Clear the accessed bit of each present 4 KiB leaf in the span whose VA
+/// `reported` names, with an atomic update of the leaf word, and flush no TLB
+/// entry. RISC-V demotes a NAPOT member first. The caller holds `pt_lock`.
+pub unsafe fn clear_user_accessed(
+    root_virt: u64,
+    virt_base: u64,
+    page_count: usize,
+    reported: &dyn Fn(u64) -> bool,
+);
+
 /// Walk the user tables and return `(phys, flags_word)` mapped at `virt`, or
 /// None if unmapped. Only 4 KiB leaves translate: both architectures return
 /// None at a large leaf above the last level rather than read its frame as a
@@ -290,7 +312,10 @@ pub unsafe fn verify_paging_extensions();
 
 /// Classify a user page fault as spurious (the live PTE already permits
 /// `access`, the faulting load, store, or fetch — a stale entry the handler
-/// resolves by retrying) versus a real fault.
+/// resolves by retrying) versus a real fault. On RISC-V a permitting leaf that
+/// lacks the A bit, or the D bit on a store, is spurious too: the walk sets the
+/// bits with a compare-and-swap before the retry (Svade;
+/// core/kernel/docs/memory-internals.md § Accessed Bits).
 /// Only a user-accessible leaf can make a fault spurious, so a kernel-half `va`
 /// never is (x86-64 refuses one before walking). Called only by each
 /// architecture's own page-fault handler, for a user-mode fault and for a

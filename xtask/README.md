@@ -27,6 +27,7 @@ xtask/
 │   ├── firmware.rs             # Host-side discovery of QEMU pflash firmware
 │   ├── fs_compat.rs            # Portable file-materialisation helpers
 │   ├── gh.rs                   # GitHub CLI wrappers for the pull-request and Issue commands
+│   ├── gpt.rs                  # GPT writer: protective MBR, both headers, entry arrays
 │   ├── guest.rs                # A QEMU process a host-driven harness drives, and its serial reader
 │   ├── host_lock.rs            # Host launch rules: the lock, the load check, admission
 │   ├── qemu.rs                 # Shared QEMU argv construction
@@ -37,6 +38,7 @@ xtask/
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
 │   ├── tasklist.rs             # GitHub task-list items, as the PR and Issue checks read them
+│   ├── sys.rs                  # Hand-declared host OS bindings (signal, console control)
 │   ├── sysroot.rs              # Sysroot arch checks and the rootfs/ mirror
 │   ├── timing.rs               # ktest log timing parser, reports, and baseline format
 │   ├── util.rs                 # Step printing, command execution, tool lookup
@@ -251,7 +253,9 @@ image, `disk-data.img` beside `disk.img`, which then carries the ESP, root and s
 boot that attaches the pair (`run --second-disk disk-data.img`), and every
 other authoring removes a `disk-data.img` left beside it. vfsd auto-mounts
 the data partition at `/data`, on whichever disk holds it; the data tree
-lives only on this partition, not on root.
+lives only on this partition, not on root. Every GUID the images carry is fixed (each
+image's disk GUID and each partition's unique GUID), so two authorings of one layout write the
+same partition tables.
 (vfsd's fall-through would also serve `/data` from a root-fs directory,
 so a dedicated partition is a disk-authoring choice — the in-tree image
 uses the partition, per [docs/storage.md](../docs/storage.md) § GPT Role-GUID Discovery.)

@@ -117,6 +117,14 @@ impl<T> Served<T>
         }
     }
 
+    /// The ordinals the class has served: its served drivers, withdrawn ones
+    /// included, so the first ordinal a later driver takes.
+    #[must_use]
+    pub fn ordinals(&self) -> usize
+    {
+        self.slots.len()
+    }
+
     /// The served driver at the lowest ordinal that is not withdrawn, if
     /// any.
     #[must_use]
@@ -191,6 +199,7 @@ mod tests
         assert_eq!(s.get(1), Lookup::Live(&2));
         assert_eq!(s.get(2), Lookup::Live(&3));
         assert_eq!(s.get(3), Lookup::Absent);
+        assert_eq!(s.ordinals(), 3);
         assert_eq!(s.first_live(), Some(&2));
         assert_eq!(s.withdraw(2), Some(2));
         assert_eq!(s.withdraw(3), Some(3));

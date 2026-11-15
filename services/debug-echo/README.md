@@ -21,11 +21,11 @@ debug-echo/
 
 ## Behaviour
 
-The fixture takes the debug port from devmgr with `QUERY_DEVICE`, through its recipe's
-`devmgr.class.debug-port` seed, retrying while devmgr replies `NO_DEVICE` (the virtio-console
-driver loads with devmgr's on-disk batch), registers an RX notification on it, and logs
-`READY on the debug port`. It exits, logging why, when the seed is absent or no debug port is
-served (a boot without `--debug-port`).
+The fixture takes the debug port from devmgr, through its recipe's `devmgr.class.debug-port`
+seed, by waiting without a bound on a `WATCH_CLASS` watch until devmgr serves the class's first
+live driver (the virtio-console driver loads with devmgr's on-disk batch), registers an RX
+notification on it, and logs `READY on the debug port`. It exits, logging why, when the seed is
+absent; on a boot without `--debug-port` it waits.
 
 It then frames the bytes it reads with `shared/gdb-rsp`
 ([shared/gdb-rsp/README.md](../../shared/gdb-rsp/README.md)), acknowledging each packet with `+`

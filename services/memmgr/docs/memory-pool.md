@@ -158,15 +158,17 @@ can be fewer than the admitted `want_pages`.
 
 ## Frame contents
 
-Every page memmgr hands out reads zero: each run of a `REQUEST_MEMORY_CAPS` grant, and each run a
-demand fault maps (see [Demand faults](#demand-faults)). A pooled run can hold what its last owner
+Every page memmgr hands out reads zero, or, for a chunk restored from the compressed store, reads
+the contents it was stored with ([Eviction](#eviction); design intent, not yet implemented): each
+run of a `REQUEST_MEMORY_CAPS` grant, and each run a demand fault maps (see [Demand
+faults](#demand-faults)). A pooled run can hold what its last owner
 wrote, and what the kernel left in it: the kernel zeroes a dead object's bytes when it frees them,
 but a frame objects were retyped from keeps the retype allocator's free-list links, region offsets
 and page counts
 ([core/kernel/docs/memory-internals.md](../../../core/kernel/docs/memory-internals.md) § Kernel
 Object Memory). memmgr does not rely on any path that returns a run to the pool to clear it, so it
 clears each run once, at hand-out, after selection and before the run is accounted, derived, or
-mapped into the process.
+mapped into the process. A restore's full write of the run, below, takes the place of that clear.
 
 memmgr maps the run read-write into its own address space through a scrub window of 512 pages
 (2 MiB, the span of one leaf page table, at a base aligned to it), zeroes it, and unmaps it again,
@@ -206,7 +208,11 @@ and never reclaims them. Each entry records:
 - The head of an intrusive list of the demand-paged regions the process has
   registered (`REGISTER_REGION`), each with its chunk table, which holds the
   runs that back the region ([Chunk table](#chunk-table)).
-- The delegated child `AddressSpace` cap, when demand-paged.
+- The index of its caps node, an arena node made and freed with the record,
+  so the record stays within the arena's slot size: it holds the delegated
+  child `AddressSpace` cap, when demand-paged, and the Notification cap
+  `REGISTER_PRESSURE` gave, with the bits it is signalled with
+  ([Memory pressure](#memory-pressure)).
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
@@ -232,8 +238,8 @@ two, so the array only ever appends and lookup stays constant-time on average;
 when the window is spent, buckets stop splitting and chains lengthen, which
 costs lookup time and bounds no capacity. The window's base is fixed, not
 drawn per boot like the arena's: the array holds only arena indices. `REGISTER_PROCESS` returns
-`TOO_MANY_PROCESSES` only when the record's node or its budget node cannot be allocated: system
-RAM is exhausted.
+`TOO_MANY_PROCESSES` only when the record's node, its caps node or its budget node cannot be
+allocated: system RAM is exhausted.
 
 ---
 
@@ -262,7 +268,9 @@ span. A later fault on a page of the span the run did not cover is backed the sa
 fills in parts, each part one run and one frame record. A fault is therefore declined for want of
 RAM (code 7, [`ipc-interface.md`](ipc-interface.md) § Kernel-origin fault message) only when the
 free pool holds no page, when every free page is in the system reserve and the process's node is
-outside it, or when the split of a run larger than the pages to back fails.
+outside it, or when the split of a run larger than the pages to back fails. A restore of a
+swapped chunk (design intent; not yet implemented) has its own admission
+([Eviction](#eviction)).
 
 Each run is zeroed before it is mapped ([Frame contents](#frame-contents)), mapped with the region's
 protection, and recorded on its chunk's entry with its mapped VA and no region id, and charged to
@@ -500,18 +508,18 @@ another in three ways:
   next.
 - **Another process holds a Memory capability to it.** A capability the grantee moved to another
   process stays a derivation child of memmgr's intermediary, and one the grantee derived and handed
-  out becomes a derivation root when the grantee's `CSpace` is torn down; either way its holder can
-  map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
+  out stays under that intermediary when the grantee's `CSpace` is torn down; either way its holder
+  can map the frame after memmgr grants it again, or a driver holding it for a transfer can have its
   device still writing it.
 
 memmgr therefore checks each reclaimed frame through its retained intermediary, which shares the
 Memory object of every derivation it granted. The frame is **quiescent** when all four hold:
 
 1. The intermediary is the only reference to that Memory object (`CAP_INFO_SOLE_REFERENCE`): no
-   other capability to it in any `CSpace`, moved, derived, or orphaned into a derivation root, and
-   no kernel-internal reference such as a retype lease or a page-pool donation. memmgr reads this
-   first: once it holds it keeps holding, since no other process has a capability through which to
-   add a reference or a mapping, so the reads after it cannot be raced.
+   other capability to it in any `CSpace`, moved or derived, and no kernel-internal reference such
+   as a retype lease or a page-pool donation. memmgr reads this first: once it holds it keeps
+   holding, since no other process has a capability through which to add a reference or a mapping,
+   so the reads after it cannot be raced.
 2. The intermediary's size (`CAP_INFO_MEMORY_SIZE`) still covers every page memmgr granted. The
    kernel refuses a grantee's split or merge of its grant, since memmgr's intermediary names the
    same object ([`core/kernel/docs/syscalls.md`](../../../core/kernel/docs/syscalls.md)
@@ -548,28 +556,35 @@ whose reaching capability, object, or mapping never goes, held by a process that
 stays deferred for the rest of the boot, and `QUERY_POOL_STATUS` reports the deferred total (see
 [`ipc-interface.md`](ipc-interface.md#label-6-query_pool_status) § Label 6).
 
-memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches neither a
-derivation the grantee made and handed out, which its `CSpace`'s teardown leaves a derivation
-root, nor any mapping already made, and it would drop the reference a driver holds on a frame its
-device may still write. The frame waits instead, until its holder drops the capability.
+memmgr does not revoke its intermediary's derivations before pooling: a revoke reaches no mapping
+already made, and it would cut off every holder below the intermediary, a holder of a derivation
+the grantee made and handed out included, since the grantee's `CSpace` teardown leaves that
+derivation under the intermediary, and among them a driver whose device may still write the frame.
+The frame waits instead, until its holder drops the capability.
 
 On `PROCESS_DIED(badge)` from procmgr, which procmgr holds back for a started
 `CREATE_DMA_HOLD` process until its creator releases it, the frames staying on
 the record until then (see [`ipc-interface.md`](ipc-interface.md#label-4-process_died)
 § Label 4):
 
-1. Recheck the deferred list.
-2. Remove the per-process record from the index. If absent (untracked
-   badge), skip to step 5 — the death notification is idempotent.
-3. For each frame node in the record's frame list and on the run lists of
+1. When the badge names a record, take the record's pressure registration
+   and delete the cap it carried ([Memory pressure](#memory-pressure)). The
+   cap keeps the process's Notification, and the frame it was retyped from,
+   alive, so it goes before the reclaim: the frame then passes the quiescence
+   check of step 4 instead of waiting on the deferred list.
+2. Recheck the deferred list.
+3. Remove the per-process record from the index. If absent (untracked
+   badge), skip to step 6 — the death notification is idempotent.
+4. For each frame node in the record's frame list and on the run lists of
    its regions' chunk tables, rewrite the node into a run of the retained
    Memory cap and insert it into the free pool at its sorted position when
    the frame is quiescent, else onto the deferred list (no fresh node, so
    the step cannot fail).
-4. Return every chunk-table node, every region node, and the record's own
-   node to the arena free list, and drop the record's reference to its budget
-   node, which is freed with it unless a deferred run is still charged to it.
-5. Run coalescing across the newly-freed runs and their adjacent
+5. Return every chunk-table node, every region node, the record's own node,
+   and its caps node to the arena free list, and drop the record's reference
+   to its budget node, which is freed with it unless a deferred run is still
+   charged to it.
+6. Run coalescing across the newly-freed runs and their adjacent
    neighbours.
 
 No unmap is performed: the dead process's CSpace is torn down by procmgr
@@ -681,10 +696,10 @@ that would take a subtree over its max fails with `LIMIT`, distinct from the out
 system exhaustion. A demand fault first shortens its run to what the max allows, and is declined
 with code 10, distinct from code 7, only when the max admits not even the faulting page (and the
 least page-table donation its map needs), so a crash report tells a budget kill from an exhaustion
-kill ([Demand faults](#demand-faults)). Lowering a max reclaims nothing and kills no process: it
-refuses new charges until the subtree's usage falls below it. A node without a max is limited only
-by its ancestors and the system reserve. No recipe, and nothing else in the default image, sets a
-max, so no default per-process ceiling exists.
+kill ([Demand faults](#demand-faults)). Lowering a max reclaims
+nothing and kills no process: it refuses new charges until the subtree's usage falls below it. A
+node without a max is limited only by its ancestors and the system reserve. No recipe, and nothing
+else in the default image, sets a max, so no default per-process ceiling exists.
 
 **System reserve.** The reserve is a count of free pages that only a charge to a reserve node may
 take: a charge to any other node fails as exhaustion when it would leave fewer free pages than the
@@ -718,6 +733,40 @@ server's node and the reserve. This is a known gap; charging that state to the c
 [#1100](https://github.com/kottlerg/seraph/issues/1100).
 
 Live control of a running process's max is [#1097](https://github.com/kottlerg/seraph/issues/1097).
+
+---
+
+## Memory pressure
+
+memmgr tells processes how close the free pool is to the system reserve, so a process holding
+memory it can give back (a cache) gives it back before a grant is refused. It acts on the level in
+no other way: it only signals, and kills nothing.
+
+**Levels.** The level is computed from the free pool's pages, deferred pages excluded, against
+`pool_total`. It is `CRITICAL` at or below the system reserve (§ Distribution policy), where a grant
+to a process outside the reserve is refused; `LOW` below `pool_total / PRESSURE_LOW_DIVISOR` pages;
+and `NORMAL` otherwise. A worse level applies at once. A better one applies only once the free pool
+clears that level's threshold by a hysteresis band of `pool_total / PRESSURE_BAND_DIVISOR` pages,
+and at least one, so a pool that hovers at a threshold does not flip the level on every turn: the
+level becomes the one the free pool less the band gives, and no worse than before. The constants
+are tuning values proportional to RAM ([docs/limits.md](../../../docs/limits.md) § memmgr); the
+computation is the host-tested `free-pool` module `pressure`.
+
+**Signal.** A process registers a Notification cap and the bits to send on it with
+`REGISTER_PRESSURE` ([ipc-interface.md](ipc-interface.md) § Label 11); the std runtime registers
+every process at start. The cap sits in the record's caps node ([Per-Process
+Tracking](#per-process-tracking)), so a process holds one slot of memmgr's `CSpace`: a second
+registration replaces the first and memmgr deletes the cap the first carried. `PROCESS_DIED`
+deletes the cap before it takes the process's frames back, since the cap keeps the Notification,
+and the frame it was retyped from, alive ([Reclamation](#reclamation)).
+
+At the top of each turn of its receive loop, after the `CSpace` top-up, memmgr recomputes the
+level, and on a change it sends each registrant its bits once. The send ORs the bits into the
+Notification and never blocks, so no client can hold memmgr, and bits not yet taken coalesce: a
+registrant that wakes knows the level changed at least once, and reads the level, which
+`QUERY_POOL_STATUS` returns in `data[7]`. A send that fails, to a cap the client revoked, is
+dropped. The broadcast walks every record through the index, a cost paid only on a change of
+level.
 
 ---
 
@@ -755,7 +804,7 @@ committed fault that finds no frame compresses a victim within its turn or is de
 overrun.
 
 **Selection.** While the pool's pressure level reads `LOW` or `CRITICAL`
-([#261](https://github.com/kottlerg/seraph/issues/261)), memmgr reclaims until it reads `NORMAL`,
+([Memory pressure](#memory-pressure)), memmgr reclaims until it reads `NORMAL`,
 and stops there. Each reclaiming turn reads and clears the accessed bits of a bounded slice of the
 eligible regions through the kernel's harvest syscall and ages each chunk with its two-bit age
 ([Chunk table](#chunk-table)): a chunk with no accessed page in two sweeps is a victim. The granule
@@ -766,10 +815,22 @@ chunk is evicting while the compression worker stores its pages; a fault on an e
 remaps the same frames and cancels the job. Once stored, the chunk is swapped: its runs return to
 the free pool and its entry's link holds the store handle. An all-zero page takes no store space.
 A fault on a swapped chunk is restored in the fault arm within the turn, since the restore is
-bounded by one chunk's decompression: memmgr takes runs covering the chunk's backed pages, as a
-demand fault selects them ([Demand faults](#demand-faults)), maps them in a scratch window of its
-own, decompresses into them, maps them into the process, frees the store slot, and resumes the
-thread.
+bounded by one chunk's decompression. A restore is not admitted against the max of the node or of
+any ancestor, since the node stays charged for its evicted pages, so it is never declined with code
+10. A restore of a committed chunk is a committed fault: it draws from `promised` as any committed
+fault does ([Commit](#eviction)), and with A above 0 a restore that finds no frame compresses a
+victim within its turn or is declined as a commit overrun. A restore of an uncommitted chunk passes
+the RAM test of an uncommitted demand run, `free - promised - R + A >= want`, with want the chunk's
+backed pages and R the system reserve for a node outside it and 0 for a reserve node, after the
+deferred recheck ([Distribution policy](#distribution-policy), System reserve), and is otherwise
+declined with code 7, the chunk staying swapped and its store slot kept. The chunk is the granule,
+so a restore is never clamped to part of a chunk. memmgr takes runs covering exactly the chunk's
+backed pages (no run spans an unbacked page of a chunk backed in parts), selected as a demand fault
+selects ([Demand faults](#demand-faults), run selection only), maps them in a scratch window of its
+own, and writes every byte of every page of each run there before it maps the run into the process:
+it decompresses each stored page and zero-fills each all-zero page, which takes no store space. That
+full write replaces the hand-out clear of [Frame contents](#frame-contents), so no byte of a run's
+earlier owner reaches the process. It then frees the store slot and resumes the thread.
 
 **Compression worker.** Compression runs in one raw `no_std` thread of memmgr below the receive
 loop's priority, which touches no ledger state: it takes a job from a single-producer ring,
@@ -803,7 +864,7 @@ not present.
 | `OUT_OF_MEMORY_BEST_EFFORT` | The pool's free pages do not cover `want_pages`, or the grant would take the system reserve from a caller outside it | Reply with error label; caller treats as system-wide RAM exhaustion |
 | `LIMIT` | `want_pages` would take the subtree of the caller's budget node, or of an ancestor, over its max | Reply with error label; caller treats as its own budget refusing, not as RAM exhaustion |
 | `QUOTA` | Tracking-metadata arena could not grow, or a selected run could not be mapped to zero it ([Frame contents](#frame-contents)); either means system RAM exhausted | Reply with error label; caller treats as system-wide RAM exhaustion |
-| `TOO_MANY_PROCESSES` | A process record or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
+| `TOO_MANY_PROCESSES` | A process record, its caps node or its budget node could not be allocated (system RAM exhausted) | `REGISTER_PROCESS` from procmgr fails; procmgr handles this as a process-creation failure |
 
 memmgr never panics on allocation failure. The caller's response policy
 (panic, retry, fail the operation) is its own concern; for std-built

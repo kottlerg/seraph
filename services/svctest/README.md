@@ -71,13 +71,15 @@ services/svctest/
         ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
+        ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
+        │                      #   fall-through, remount, a mapped page across the unmount
         └── vfsd.rs            # `MOUNT` gate: deny, mounted-path and short-path rejections
 ```
 
 Each module under `phases/` covers one surface and exports its `Phase` entries;
 `phases::all()` composes them in an order that encodes their dependencies (startup first, the
-relative-open phase that installs a process-global cwd cap late, the all-RAM-accounted
-identity last).
+relative-open phase that installs a process-global cwd cap late, the unmount phases after every
+phase that uses `/data` or the cwd, the all-RAM-accounted identity last).
 
 ---
 
@@ -119,11 +121,12 @@ release phases (`caps[9]`), the
 drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to
 `caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and
 `pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
-vfsd phases (`caps[4]`, `caps[5]`), the `logd_death_forward` and `logd_concurrent` phases
-(`caps[6]`), the vfsd swap-partition phase (`caps[14]`), and the `crash_endpoint` phase
-(`caps[15]`) instead fail their assertions. The seed-only phase thus fails the run on a zero
-`caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own zero-cap skip is not
-reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap, and the run ends idle.
+vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward` and
+`logd_concurrent` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), and the
+`crash_endpoint` phase (`caps[15]`) instead fail their assertions. The seed-only phase thus fails
+the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
+zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
+and the run ends idle.
 
 The startup phases assert the recipe's launch surface: argv is exactly `svctest run`, walked from
 the front, from the back, and from both ends at once, and env carries `SERAPH_TEST=1` and
@@ -146,8 +149,8 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[1]` | `pwrmgr.shutdown` | Authority cap for the final `SHUTDOWN` |
 | `caps[2]` | `devmgr.registry` | devmgr class-deny and shutdown-deny phases |
 | `caps[3]` | `devmgr.bind`     | devmgr class-deny, bind-deny, and on-demand-bind phases: the `SEND\|GRANT` registry cap `BIND_DRIVERS` needs |
-| `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases          |
-| `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase                |
+| `caps[4]` | `vfsd.mount`      | vfsd `MOUNT` rejection phases; vfsd unmount phases: `UNMOUNT` and the remounts |
+| `caps[5]` | `vfsd.deny`       | vfsd `MOUNT` deny phase; `UNMOUNT` deny case |
 | `caps[6]` | `logd.query`      | `logd_death_forward`, `logd_concurrent` phases: read logd's slots and history |
 | `caps[7]` | `devmgr.class.serial` | drivers stray-cap phase: the `serial` class SEND |
 | `caps[8]` | `devmgr.class.input` | input-ordinal and drivers stray-cap phases: the `input` class SEND |
@@ -162,12 +165,14 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
 `REGISTRY_QUERY_AUTHORITY` alone, so it drives the devmgr deny phases, which require an
-`UNAUTHORIZED` reply to `QUERY_DEVICE` and `MINT_CLASS_SEND` (on `caps[2]` and `caps[3]`, neither of
+`UNAUTHORIZED` reply to `QUERY_DEVICE`, `WATCH_CLASS`, and `MINT_CLASS_SEND` (on `caps[2]` and
+`caps[3]`, neither of
 whose badges carries a class slot), `QUERY_SHUTDOWN_DEVICE`, and `BIND_DRIVERS`. `caps[3]` carries
 `REGISTRY_QUERY_AUTHORITY | BIND_AUTHORITY` as a `SEND|GRANT`, since `BIND_DRIVERS` moves a cap to
 devmgr; it is the one seed that arrives with GRANT, and the on-demand-bind phase sends
 `BIND_DRIVERS` on it. `caps[7]` and `caps[8]` are the `serial` and `input` class SENDs. The
-input-ordinal phase requires a cap from `QUERY_DEVICE`
+input-ordinal phase waits on a `WATCH_CLASS` watch (bounded by `DEVICE_WAIT_MS`) until devmgr
+serves an input driver, then requires a cap from `QUERY_DEVICE`
 on `caps[8]` at instance ordinal 0 (sent and absent) and `NO_DEVICE` past the one keyboard of every
 boot's device set. The drivers stray-cap phase takes granted SENDs on the serial and input drivers'
 endpoints through `caps[7]` and `caps[8]` (`QUERY_DEVICE`) and floods each driver with calls
@@ -198,7 +203,12 @@ on `caps[4]` to `MOUNT` of the root role at `/` and of the data role at `/esp`, 
 mounted, in each of six rounds (vfsd checks the mount point before it registers a partition or
 spawns a driver, so a rejection that started a spawn first would change a later reply); a
 `NOT_FOUND` reply to a `MOUNT` whose path length exceeds the path bytes it carries; and that the
-mounted filesystems still answer afterwards. `caps[14]` is a SEND on the same endpoint badged
+mounted filesystems still answer afterwards. The vfsd unmount phases require an `UNAUTHORIZED`
+reply to `UNMOUNT` on `caps[5]`, forced or not, and on `caps[4]` of `/`; `NO_MOUNT` for a path
+with no mount; `LABEL_VERSION_MISMATCH` and `NOT_FOUND` for a wrong version and a short path;
+then, on `caps[4]`, `BUSY` with svctest's open files counted, a forced unmount of `/data`, and
+the mounts and unmounts of the data partition below; services/vfsd/docs/vfs-ipc-interface.md
+§ Label 11 owns the wire shape. `caps[14]` is a SEND on the same endpoint badged
 `SWAP_AUTHORITY`; the `vfsd_swap_partition` phase, which runs after the short-path phase, requires
 `UNAUTHORIZED` to `GET_SWAP_PARTITION` on `caps[4]` and `caps[5]`, and on `caps[14]` a hand-out of
 a cap that addresses exactly the swap partition, a second hand-out revoking the first. The
@@ -240,6 +250,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `exit-code-nonzero`         | `exit_code`    | `exit_code`                                 |
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |
 | `aslr-layout-diverge-child` | `random`       | `aslr-layout` (per-process layout tuple)    |
+| `stale-map-child`           | `unmount`      | `vfsd_unmount_stale_mapping` (mapped page)  |
 
 ---
 
@@ -259,7 +270,8 @@ attached and watched, unbinds svctest's bindings and leaves no watch to bind it 
 unbind a debugger's binding from a thread of its own whose registration it refuses, svctest having
 declared itself undebuggable; then gives the endpoint back and sees a second child declined by
 procmgr). The
-devmgr on-demand-bind phase sends `BIND_DRIVERS` on `caps[3]` over `/tests/drivers/`, which no
+devmgr on-demand-bind phase registers a `WATCH_CLASS` watch on `caps[10]`, then sends
+`BIND_DRIVERS` on `caps[3]` over `/tests/drivers/`, which no
 drivers-directory pass at boot reads, so devmgr binds the
 [`test-fault`](../drivers/test-fault/README.md) driver to the QEMU `pci-testdev` functions that
 `--test-devices` attaches, one instance each. The
@@ -267,8 +279,12 @@ phase asks `caps[10]` for the fixtures: the two serving instances hold instance 
 and ordinal 2 answers `NO_DEVICE`; `FAULT_EXIT` on ordinal 0 makes the next query on it answer
 `WITHDRAWN`; the free pool then returns to its size before the bind, so the instance that never
 reports ready and the instance that fails its bootstrap's terminal round were destroyed; and a
-second `BIND_DRIVERS` over the directory binds nothing. The DMA confinement phase polls
-`QUERY_DEVICE` on `caps[9]` (10 ms apart, `INPUT_ATTEMPTS` times) until devmgr serves the
+second `BIND_DRIVERS` over the directory binds nothing. The watch, registered at ordinal count 0, is
+signalled when the bind serves the fixtures and again when `FAULT_EXIT` withdraws ordinal 0. With
+that watch held, the phase fills the class to `MAX_CLASS_WATCHERS` (8): the next registration is
+refused `WATCHERS_FULL`, and once it deletes one watch a new registration is admitted. The DMA
+confinement phase waits on a `WATCH_CLASS` watch on `caps[9]` (bounded by `DEVICE_WAIT_MS`) until
+devmgr serves the
 [`test-dma`](../drivers/test-dma/README.md) fixture, which devmgr binds to QEMU's `edu` device
 (attached by `--test-devices` on both architectures) by its declaration at `SET_DRIVERS_DIR`,
 and asserts it is served; it then asks the driver to probe: a copy through a mapped
@@ -310,6 +326,12 @@ namespace, and procmgr phases read `/data/test.txt`; the FS phases also read the
 `/data/svctest/large.bin` and write their scratch files under `/data/svctest/`; `fsbench`, spawned
 by the `fs_crossover_bench` phase, reads the build-synthesised `/data/svctest/bench.bin`, which the
 `fs_eviction_routes_release_to_its_open` phase also holds open.
+The vfsd unmount phases hold `/data/test.txt` and `/data/svctest/large.bin` open across an
+unforced and a forced unmount of `/data`, and a `stale-map-child` maps a cache page of
+`/data/test.txt`; while `/data` is unmounted they mount the data partition over
+`/config/svcmgr/tests`, the root filesystem's directory of svctest's own recipe, read
+`test.txt` there, and after unmounting it read `/config/svcmgr/tests/svctest.svc` through the
+fall-through again. They mount `/data` again and set svctest's cwd to it before they end.
 The sysroot placement of all of these is listed in [docs/testing.md § Sysroot
 layout](../../docs/testing.md#sysroot-layout).
 

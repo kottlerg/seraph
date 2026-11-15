@@ -1051,10 +1051,11 @@ const TEARDOWN_BATCH_DERIVES: u64 = 300;
 /// batches completes and leaves the survivors' forest clean.
 ///
 /// A child thread bound to its own `CSpace` derives ~300 SEND caps from
-/// its copy of the parent's endpoint (300 dying children head-popped off
-/// one dying slot) and exits; deleting the child `CSpace` then drives
-/// `drain_dying_cspace_batch` across several `MAX_DRAIN_EDITS` windows
-/// (each derive contributes an unlink edit, plus one per slot). The
+/// its copy of the parent's endpoint (300 dying children under one dying
+/// slot, each unlinked by the drain's flatten) and exits; deleting the child
+/// `CSpace` then drives `drain_dying_cspace_batch` across several
+/// `MAX_DRAIN_EDITS` windows (each derive contributes an unlink step, plus
+/// one per slot scanned). The
 /// parent's endpoint — the derivation ancestor of everything that died —
 /// must afterwards revoke cleanly (no dead-link `InvalidState`) and stay
 /// usable.
@@ -1151,6 +1152,170 @@ pub fn cspace_teardown_multibatch(ctx: &TestContext) -> TestResult
     cap_delete(ep).ok();
     cap_delete(done).ok();
     Ok(())
+}
+
+/// A `CSpace` teardown keeps the children of a dying slot inside the revoke
+/// reach of the slot's ancestors, as a delete does
+/// (core/kernel/docs/capability-internals.md § Teardown Drain).
+///
+/// A, in ktest's `CSpace`, derives B; B derives C, kept here, and C3, moved
+/// into a third `CSpace`. B is then moved into a second `CSpace`, a move that
+/// keeps its derivation position (parent A, children C and C3), so the
+/// shape is that of three processes: A's holder delegated B, and B's holder
+/// derived C and C3 for two others. Deleting the second `CSpace`'s only
+/// capability tears B down. C must stay usable until A's holder revokes; the
+/// revoke of A must then free both: a send on C fails with
+/// `InvalidCapability`, and the third `CSpace`'s `USED` count drops by one.
+pub fn cspace_teardown_keeps_children_revocable(ctx: &TestContext) -> TestResult
+{
+    let a = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "teardown_revocable: create_notification failed")?;
+    let cs2 = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "teardown_revocable: create_cspace (second) failed")?;
+    let cs3 = cap_create_cspace(ctx.memory_base, 0, 4)
+        .map_err(|_| "teardown_revocable: create_cspace (third) failed")?;
+
+    let mut c = None;
+    let mut body = || -> TestResult {
+        let b = cap_derive(a, RIGHTS_NOTIFY).map_err(|_| "teardown_revocable: derive B failed")?;
+        let c_here =
+            cap_derive(b, RIGHTS_NOTIFY).map_err(|_| "teardown_revocable: derive C failed")?;
+        c = Some(c_here);
+        let c3 =
+            cap_derive(b, RIGHTS_NOTIFY).map_err(|_| "teardown_revocable: derive C3 failed")?;
+        cap_move(c3, cs3, 0).map_err(|_| "teardown_revocable: cap_move(C3) failed")?;
+        cap_move(b, cs2, 0).map_err(|_| "teardown_revocable: cap_move(B) failed")?;
+        let used3 = cap_info(cs3, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "teardown_revocable: cap_info(third USED) failed")?;
+
+        // The second CSpace's last capability: its teardown drains B.
+        cap_delete(cs2).map_err(|_| "teardown_revocable: cap_delete(second CSpace) failed")?;
+        notification_send(c_here, 0x1)
+            .map_err(|_| "teardown_revocable: C unusable after its parent's CSpace teardown")?;
+
+        cap_revoke(a).map_err(|_| "teardown_revocable: cap_revoke(A) failed")?;
+        match notification_send(c_here, 0x1)
+        {
+            Ok(()) => return Err("teardown_revocable: C survived A's revoke after B's teardown"),
+            Err(e) if e == SyscallError::InvalidCapability as i64 =>
+            {}
+            Err(_) => return Err("teardown_revocable: send on revoked C failed, not stale"),
+        }
+        let used3_after = cap_info(cs3, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "teardown_revocable: cap_info(third USED after) failed")?;
+        if used3_after.checked_add(1) != Some(used3)
+        {
+            return Err("teardown_revocable: C3 survived A's revoke after B's teardown");
+        }
+        Ok(())
+    };
+    let result = body();
+    if result.is_err()
+    {
+        // A failed run can leave C a live root outside A's subtree; the
+        // handle's generation keeps a delete of a freed C from touching a
+        // recycled slot.
+        if let Some(c) = c
+        {
+            cap_delete(c).ok();
+        }
+        cap_revoke(a).ok();
+        cap_delete(cs2).ok();
+    }
+    cap_delete(cs3).map_err(|_| "teardown_revocable: cap_delete(third CSpace) failed")?;
+    cap_delete(a).map_err(|_| "teardown_revocable: cap_delete(A) failed")?;
+    result
+}
+
+/// Length of the [`cspace_teardown_reverse_chain_stays_revocable`] chain:
+/// with one child each, more steps than one drain batch (`MAX_DRAIN_EDITS`).
+const REVERSE_CHAIN_LEN: u32 = 300;
+
+/// Index the chain's top takes in the dying `CSpace`; each slot below it
+/// takes the next lower index, down to 11.
+const REVERSE_CHAIN_TOP_INDEX: u32 = REVERSE_CHAIN_LEN + 10;
+
+/// Slot pages for each of the test's two `CSpace`s: the six leaves 310 slots
+/// span, and headroom.
+const REVERSE_CHAIN_PAGES: u64 = 10;
+
+/// A teardown re-links the children of a long chain of dying slots under the
+/// chain's ancestor whatever the order of the chain's indices
+/// (core/kernel/docs/capability-internals.md § Teardown Drain).
+///
+/// A, in ktest's `CSpace`, heads a derive chain B1 → B2 → … → B300; each Bi
+/// derives one child Ci. Every Bi is moved into a second `CSpace` at
+/// explicit indices that descend down the chain, so each parent sits at a
+/// higher index than its child, and every Ci into a third. Deleting the
+/// second `CSpace`'s only capability tears the chain down in several drain
+/// batches; A's revoke must then free every Ci, the third `CSpace`'s `USED`
+/// count returning to zero.
+pub fn cspace_teardown_reverse_chain_stays_revocable(ctx: &TestContext) -> TestResult
+{
+    let a = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "reverse_chain: create_notification failed")?;
+    let cs2 = cap_create_cspace(ctx.memory_base, 0, REVERSE_CHAIN_PAGES)
+        .map_err(|_| "reverse_chain: create_cspace (second) failed")?;
+    let cs3 = cap_create_cspace(ctx.memory_base, 0, REVERSE_CHAIN_PAGES)
+        .map_err(|_| "reverse_chain: create_cspace (third) failed")?;
+
+    let body = || -> TestResult {
+        // Build the chain one link at a time, so ktest's own CSpace holds at
+        // most three of its slots: derive the next link and the child from
+        // the current link, then move both out.
+        let mut cur =
+            cap_derive(a, RIGHTS_NOTIFY).map_err(|_| "reverse_chain: derive B1 failed")?;
+        for i in 0..REVERSE_CHAIN_LEN
+        {
+            let child =
+                cap_derive(cur, RIGHTS_NOTIFY).map_err(|_| "reverse_chain: derive Ci failed")?;
+            cap_move(child, cs3, 0).map_err(|_| "reverse_chain: cap_move(Ci) failed")?;
+            let next = if i.saturating_add(1) < REVERSE_CHAIN_LEN
+            {
+                Some(
+                    cap_derive(cur, RIGHTS_NOTIFY)
+                        .map_err(|_| "reverse_chain: derive Bi failed")?,
+                )
+            }
+            else
+            {
+                None
+            };
+            cap_move(cur, cs2, REVERSE_CHAIN_TOP_INDEX.saturating_sub(i))
+                .map_err(|_| "reverse_chain: cap_move(Bi) failed")?;
+            match next
+            {
+                Some(n) => cur = n,
+                None => break,
+            }
+        }
+        let used3 = cap_info(cs3, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "reverse_chain: cap_info(third USED) failed")?;
+        if used3 != u64::from(REVERSE_CHAIN_LEN)
+        {
+            return Err("reverse_chain: the third CSpace does not hold every child");
+        }
+
+        // The second CSpace's last capability: its teardown drains the chain.
+        cap_delete(cs2).map_err(|_| "reverse_chain: cap_delete(second CSpace) failed")?;
+        cap_revoke(a).map_err(|_| "reverse_chain: cap_revoke(A) failed")?;
+        let used3_after = cap_info(cs3, syscall_abi::CAP_INFO_CSPACE_USED)
+            .map_err(|_| "reverse_chain: cap_info(third USED after) failed")?;
+        if used3_after != 0
+        {
+            return Err("reverse_chain: a child survived A's revoke after the chain's teardown");
+        }
+        Ok(())
+    };
+    let result = body();
+    if result.is_err()
+    {
+        cap_revoke(a).ok();
+        cap_delete(cs2).ok();
+    }
+    cap_delete(cs3).map_err(|_| "reverse_chain: cap_delete(third CSpace) failed")?;
+    cap_delete(a).map_err(|_| "reverse_chain: cap_delete(A) failed")?;
+    result
 }
 
 /// Correlators for the death observers in `cspace_delete_stops_bound_thread`.

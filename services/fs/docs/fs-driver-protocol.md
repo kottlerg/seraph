@@ -103,8 +103,11 @@ see [Bootstrap caps](#bootstrap-caps).
 
 ## Label 19: `FS_UNMOUNT`
 
-Unmount. Sent by vfsd on the un-badged service endpoint, as `FS_MOUNT` is.
-After a success reply the driver exits and serves no further request.
+Unmount. Sent by vfsd on the un-badged service endpoint, as `FS_MOUNT` is,
+when it serves an `UNMOUNT`
+([services/vfsd/docs/vfs-ipc-interface.md](../../vfsd/docs/vfs-ipc-interface.md#label-11-unmount)
+§ Label 11). After a success reply the driver exits and serves no further
+request.
 
 **Request**
 
@@ -138,8 +141,13 @@ revoke removes no mapping
 The driver serves one request at a time, so an unmount runs after the
 request in flight and before any later one. After the reply the driver
 receives nothing: a client that calls through a node cap or an open cap
-afterwards finds no receiver until the holder of the service endpoint
-tears the endpoint down.
+afterwards finds no receiver until vfsd tears the endpoint down. vfsd does
+that after any answer but `BUSY` to an unforced request, and after no
+answer in its timeout: it revokes the partition cap and the service
+endpoint, waits a bounded time for the driver's death, and destroys the
+process, so a driver that does not exit is killed
+([services/vfsd/docs/namespace-composition.md](../../vfsd/docs/namespace-composition.md#unmount)
+§ Unmount).
 
 **Reply (success)**: `label = 0`, empty body; the driver then exits.
 
@@ -220,14 +228,12 @@ the driver's capability and frees the object once no copy is left. The
 client's own copy stays in that subtree wherever an IPC transfer or
 `SYS_CAP_MOVE` takes it, so it dies exactly when the open does. A copy derived
 from another copy, the client's or any later holder's, stays in the subtree
-while every `CSpace` holding a copy on its derivation path, between it and the
-driver's capability, lives, since deleting a capability hands its derivations
-to its parent. It leaves the subtree when one of those `CSpace`s is torn down,
-which makes each derivation held in another `CSpace` a root of its own, as
-[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#revocation-algorithm)
-§ Revocation Algorithm states. Such a copy still keeps the open alive while it
-is held, but no release reaches it: it outlives the open, keeping the
-Notification and the driver memory it occupies, until its holder deletes it.
+wherever its derivation path runs, since deleting a capability and tearing
+down the `CSpace` holding it both hand its derivations to the nearest ancestor
+outside that `CSpace`, as
+[core/kernel/docs/capability-internals.md](../../../core/kernel/docs/capability-internals.md#teardown-drain)
+§ Teardown Drain states. A release or revoke at the driver's capability
+therefore reaches every copy, including one derived through a dead `CSpace`.
 
 A delegated open cap alone does not keep the open alive: a holder other than
 the client keeps it alive only by also holding a copy of the liveness cap,
@@ -916,7 +922,9 @@ that are not `fs_labels` constants:
   ([docs/ipc-design.md](../../../docs/ipc-design.md) § Receive-Failure
   Policy).
 
-Any other end of a driver is a fault or a kill.
+Any other end of a driver is a fault or a kill, such as vfsd's
+destruction of a driver that an unmount found still running
+([§ Label 19](#label-19-fs_unmount)).
 
 ---
 

@@ -43,14 +43,17 @@ use worker_pool::WorkerPool;
 /// deadlock: what a `MOUNT` handler blocks on (the worker pool, procmgr's
 /// `CREATE_FROM_FILE`, whose binary reads go to the fs driver that minted
 /// the file cap, the `NS_LOOKUP` walk the namespace thread serves, and the
-/// driver's `FS_MOUNT` probe) never calls the service endpoint. A
-/// `GET_SWAP_PARTITION` handler waits only for the swap lock, which the
-/// holder keeps across one `REGISTER_PARTITION` call to the block driver,
-/// and the block driver never calls vfsd.
+/// driver's `FS_MOUNT` probe) and what an `UNMOUNT` handler blocks on (the
+/// driver's `FS_UNMOUNT` and its death, each within a bound, procmgr's
+/// `DESTROY_PROCESS`, and the `NS_LOOKUP` walk for a fall-through cap)
+/// never calls the service endpoint. A `GET_SWAP_PARTITION` handler waits
+/// only for the swap lock, which the holder keeps across one
+/// `REGISTER_PARTITION` call to the block driver, and the block driver
+/// never calls vfsd.
 const SERVICE_THREAD_COUNT: usize = 4;
 
-/// Longest mount path a `MOUNT` request can name: the bytes the request's
-/// data words carry after the role and length words. Set by the IPC
+/// Longest mount path a `MOUNT` or `UNMOUNT` request can name: the bytes
+/// the request's data words carry after its first two words. Set by the IPC
 /// message size, not a table; vfsd's only path limit, with each component
 /// bounded by `namespace_protocol::MAX_NAME_LEN`.
 const MAX_MOUNT_PATH_LEN: usize = (syscall_abi::MSG_DATA_WORDS_MAX - 2) * 8;
@@ -194,7 +197,7 @@ fn main() -> !
 
     // Namespace endpoint: separate recv surface for the cap-native
     // protocol (`NS_LOOKUP` / `NS_STAT` / `NS_READDIR`) against vfsd's
-    // synthetic root. The service endpoint carries only `MOUNT`,
+    // synthetic root. The service endpoint carries only `MOUNT`, `UNMOUNT`,
     // `GET_SYSTEM_ROOT_CAP` and `GET_SWAP_PARTITION`; the namespace
     // endpoint is separated so
     // a single dispatcher thread can serve every walk without
@@ -350,11 +353,15 @@ pub(crate) fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 ///   `VfsdRootBackend::install` reject an already-terminal entry, so
 ///   two concurrent MOUNTs targeting the same path serialise on the
 ///   lock and the loser sees `can_install` (or, if both pass that
-///   check before either installs, `install`) reject.
+///   check before either installs, `install`) reject. `UNMOUNT`
+///   (`do_unmount`) begins a removal under the same lock, and only the
+///   request that began it ends it (`restore_mount` or `remove_mount`):
+///   meanwhile a `MOUNT` at the path is refused and a second `UNMOUNT`
+///   finds the removal under way.
 ///
-/// No `do_mount`-touched state is shared without one of these locks.
-/// `GET_SWAP_PARTITION` touches only `rt.swap`, under its own mutex, and
-/// takes no other lock while it holds it.
+/// No `do_mount`- or `do_unmount`-touched state is shared without one of
+/// these locks. `GET_SWAP_PARTITION` touches only `rt.swap`, under its own
+/// mutex, and takes no other lock while it holds it.
 fn service_loop(rt: &'static VfsdRuntime) -> !
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -378,95 +385,115 @@ fn service_loop(rt: &'static VfsdRuntime) -> !
             }
         };
         guard.on_success();
+        dispatch_service_request(&recv, ipc_buf, rt);
+    }
+}
 
-        let label = recv.label;
-        let opcode = label & 0xFFFF;
-        let badge = recv.badge;
+/// Serves one request received on the service endpoint: gates it on its
+/// badge's verb bit, then hands it to its label's handler, which replies.
+fn dispatch_service_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
+{
+    let opcode = recv.label & 0xFFFF;
+    let badge = recv.badge;
 
-        match opcode
+    match opcode
+    {
+        ipc::vfsd_labels::MOUNT =>
         {
-            ipc::vfsd_labels::MOUNT =>
+            // Verb-bit gate (docs/capability-model.md): MOUNT spawns a
+            // driver and installs a mount, so only a MOUNT_AUTHORITY
+            // badge reaches the handler.
+            if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
             {
-                // Verb-bit gate (docs/capability-model.md): MOUNT spawns a
-                // driver and installs a mount, so only a MOUNT_AUTHORITY
-                // badge reaches the handler.
-                if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(warn: "MOUNT rejected: badge lacks MOUNT_AUTHORITY");
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_mount_request(&recv, ipc_buf, rt);
-                }
-            }
-            ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
-            {
-                if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} \
-                         expected {}",
-                        recv.word(0),
-                        ipc::VFSD_LABELS_VERSION
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_get_system_root_cap(ipc_buf, rt);
-                }
-            }
-            ipc::vfsd_labels::GET_SWAP_PARTITION =>
-            {
-                // Verb-bit gate: the hand-out revokes the previous holder's
-                // cap, so only the swap service's SWAP_AUTHORITY badge
-                // reaches it.
-                if badge & ipc::vfsd_labels::SWAP_AUTHORITY == 0
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
-                {
-                    std::os::seraph::log!(
-                        warn: "GET_SWAP_PARTITION rejected: caller VFSD_LABELS_VERSION={} \
-                         expected {}",
-                        recv.word(0),
-                        ipc::VFSD_LABELS_VERSION
-                    );
-                    let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
-                    // SAFETY: ipc_buf is the thread-registered IPC buffer page.
-                    let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-                }
-                else
-                {
-                    handle_get_swap_partition(ipc_buf, rt);
-                }
-            }
-            _ =>
-            {
-                let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
+                std::os::seraph::log!(warn: "MOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
                 // SAFETY: ipc_buf is the thread-registered IPC buffer page.
                 let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
             }
+            else
+            {
+                handle_mount_request(recv, ipc_buf, rt);
+            }
+        }
+        ipc::vfsd_labels::UNMOUNT =>
+        {
+            // Who may mount may unmount: the same verb bit gates it.
+            if badge & ipc::vfsd_labels::MOUNT_AUTHORITY == 0
+            {
+                std::os::seraph::log!(warn: "UNMOUNT rejected: badge lacks MOUNT_AUTHORITY");
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else
+            {
+                handle_unmount_request(recv, ipc_buf, rt);
+            }
+        }
+        ipc::vfsd_labels::GET_SYSTEM_ROOT_CAP =>
+        {
+            if badge & ipc::vfsd_labels::SEED_AUTHORITY == 0
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SYSTEM_ROOT_CAP rejected: badge lacks SEED_AUTHORITY"
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SYSTEM_ROOT_CAP rejected: caller VFSD_LABELS_VERSION={} \
+                     expected {}",
+                    recv.word(0),
+                    ipc::VFSD_LABELS_VERSION
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else
+            {
+                handle_get_system_root_cap(ipc_buf, rt);
+            }
+        }
+        ipc::vfsd_labels::GET_SWAP_PARTITION =>
+        {
+            // Verb-bit gate: the hand-out revokes the previous holder's
+            // cap, so only the swap service's SWAP_AUTHORITY badge
+            // reaches it.
+            if badge & ipc::vfsd_labels::SWAP_AUTHORITY == 0
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SWAP_PARTITION rejected: badge lacks SWAP_AUTHORITY"
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else if recv.word(0) != u64::from(ipc::VFSD_LABELS_VERSION)
+            {
+                std::os::seraph::log!(
+                    warn: "GET_SWAP_PARTITION rejected: caller VFSD_LABELS_VERSION={} \
+                     expected {}",
+                    recv.word(0),
+                    ipc::VFSD_LABELS_VERSION
+                );
+                let err = IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH);
+                // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
+            }
+            else
+            {
+                handle_get_swap_partition(ipc_buf, rt);
+            }
+        }
+        _ =>
+        {
+            let err = IpcMessage::new(ipc::vfsd_errors::UNKNOWN_OPCODE);
+            // SAFETY: ipc_buf is the thread-registered IPC buffer page.
+            let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
         }
     }
 }
@@ -1035,9 +1062,8 @@ fn self_mount(rt: &VfsdRuntime, ipc_buf: *mut u64) -> bool
 /// data partition at `/data`.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "the role byte is the low byte of data[0] by wire contract, and the path length is \
-              checked against 1..=MAX_MOUNT_PATH_LEN right after its cast, so neither `as` loses a \
-              value the handler accepts"
+    reason = "the role byte is the low byte of data[0] by wire contract, so the `as` keeps the \
+              whole value the handler accepts"
 )]
 fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 {
@@ -1052,27 +1078,9 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
         return;
     };
 
-    let path_len = recv.word(1) as usize;
-    if path_len == 0 || path_len > MAX_MOUNT_PATH_LEN
-    {
-        std::os::seraph::log!(warn: "MOUNT: invalid path length");
-        let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
-        return;
-    }
-
-    let path_bytes = recv.data_bytes();
-    // Path bytes start at word 2 (byte offset 16) under the new wire shape.
-    let path_src_start = 2 * 8;
-    let Some(path) = path_bytes
-        .get(path_src_start..)
-        .and_then(|d| d.get(..path_len))
+    let Some(path) = request_path(recv, "MOUNT")
     else
     {
-        // The data words carry fewer path bytes than `data[1]` claims;
-        // mounting the bytes that are there would name a different path.
-        std::os::seraph::log!(warn: "MOUNT: path shorter than its stated length");
         let err = IpcMessage::new(ipc::vfsd_errors::NOT_FOUND);
         // SAFETY: ipc_buf is the registered IPC buffer.
         let _ = unsafe { ipc::ipc_reply(&err, ipc_buf) };
@@ -1100,6 +1108,272 @@ fn handle_mount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
 
     // SAFETY: ipc_buf is the registered IPC buffer.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// The path a `MOUNT` or `UNMOUNT` request names: `data[1]` bytes from
+/// `data[2]` on. `None`, logged under `what`, when the length is zero,
+/// longer than [`MAX_MOUNT_PATH_LEN`], or longer than the data words
+/// carry; the caller replies `NOT_FOUND`.
+fn request_path<'a>(recv: &'a IpcMessage, what: &str) -> Option<&'a [u8]>
+{
+    let Ok(path_len) = usize::try_from(recv.word(1))
+    else
+    {
+        std::os::seraph::log!(warn: "{what}: invalid path length");
+        return None;
+    };
+    if path_len == 0 || path_len > MAX_MOUNT_PATH_LEN
+    {
+        std::os::seraph::log!(warn: "{what}: invalid path length");
+        return None;
+    }
+    // The path bytes start at word 2 (byte offset 16).
+    let path = recv
+        .data_bytes()
+        .get(2 * 8..)
+        .and_then(|d| d.get(..path_len));
+    if path.is_none()
+    {
+        // The data words carry fewer path bytes than `data[1]` claims;
+        // acting on the bytes that are there would name a different path.
+        std::os::seraph::log!(warn: "{what}: path shorter than its stated length");
+    }
+    path
+}
+
+/// Handle an `UNMOUNT` request from an authorized client
+/// (`services/vfsd/docs/vfs-ipc-interface.md` § Label 11). The service
+/// loop admits a request here only when the caller's badge carries
+/// `vfsd_labels::MOUNT_AUTHORITY`.
+///
+/// IPC data layout:
+/// - `data[0]`: the caller's `VFSD_LABELS_VERSION`
+/// - `data[1]`: mount path length
+/// - `data[2..]`: mount path bytes (packed into u64 words)
+/// - label bit 16: `vfsd_labels::UNMOUNT_FORCE`
+fn handle_unmount_request(recv: &IpcMessage, ipc_buf: *mut u64, rt: &VfsdRuntime)
+{
+    let reply = if recv.word(0) == u64::from(ipc::VFSD_LABELS_VERSION)
+    {
+        if let Some(path) = request_path(recv, "UNMOUNT")
+        {
+            let force = if recv.label & ipc::vfsd_labels::UNMOUNT_FORCE == 0
+            {
+                Force::No
+            }
+            else
+            {
+                Force::Yes
+            };
+            do_unmount(rt, ipc_buf, path, force)
+        }
+        else
+        {
+            IpcMessage::new(ipc::vfsd_errors::NOT_FOUND)
+        }
+    }
+    else
+    {
+        std::os::seraph::log!(
+            warn: "UNMOUNT rejected: caller VFSD_LABELS_VERSION={} expected {}",
+            recv.word(0),
+            ipc::VFSD_LABELS_VERSION
+        );
+        IpcMessage::new(ipc::vfsd_errors::LABEL_VERSION_MISMATCH)
+    };
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Bound on the driver's answer to `FS_UNMOUNT`. The driver's single
+/// dispatch thread answers it after the operation in flight, whose block
+/// I/O is bounded only by the device; a driver that has not answered by
+/// then is torn down without its cooperation.
+const FS_UNMOUNT_TIMEOUT_MS: u32 = 5000;
+
+/// Bound on the wait for a torn-down driver's death to post. A driver that
+/// answered `FS_UNMOUNT` exits at once, and one whose endpoint was revoked
+/// exits on its next receive; `DESTROY_PROCESS` follows either way, so the
+/// bound limits only how long the unmount waits to log the exit reason.
+const DRIVER_DEATH_TIMEOUT_MS: u64 = 2000;
+
+/// Whether an unmount goes ahead with files open: the request's
+/// `vfsd_labels::UNMOUNT_FORCE` bit, sent on to the driver as
+/// `fs_labels::UNMOUNT_FORCE`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Force
+{
+    No,
+    Yes,
+}
+
+/// Unmount the mount at `path`, returning the reply for the caller.
+///
+/// The sequence of `docs/namespace-composition.md` § Unmount: stop
+/// lookups crossing the mount; ask the driver to unmount (`FS_UNMOUNT`,
+/// forced on [`Force::Yes`]), keeping the mount when it answers `BUSY`
+/// to an unforced request; otherwise tear the driver down
+/// ([`teardown_mount`]), whether it answered or not; remove the record,
+/// and give a node that stays an intermediate its fall-through cap.
+fn do_unmount(rt: &VfsdRuntime, ipc_buf: *mut u64, path: &[u8], force: Force) -> IpcMessage
+{
+    let begun = {
+        let mut backend = rt
+            .root_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        backend
+            .find(path)
+            .ok_or(root_backend::UnmountError::NotMounted)
+            .and_then(|idx| backend.begin_unmount(idx).map(|mount| (idx, mount)))
+    };
+    let (idx, mount) = match begun
+    {
+        Ok(begun) => begun,
+        Err(root_backend::UnmountError::Root) =>
+        {
+            std::os::seraph::log!(warn: "UNMOUNT rejected: / is never unmounted");
+            return IpcMessage::new(ipc::vfsd_errors::UNAUTHORIZED);
+        }
+        Err(root_backend::UnmountError::NotMounted | root_backend::UnmountError::InProgress) =>
+        {
+            std::os::seraph::log!(warn: "UNMOUNT: no mount at the path, or its unmount is under way");
+            return IpcMessage::new(ipc::vfsd_errors::NO_MOUNT);
+        }
+    };
+
+    match driver_unmount(mount.endpoint, force, ipc_buf)
+    {
+        DriverUnmount::Busy(open) if force == Force::No =>
+        {
+            // Only this request began the node's unmount, and only it ends
+            // the unmount, so the restore finds it under way.
+            let restored = rt
+                .root_backend
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .restore_mount(idx);
+            if !restored
+            {
+                std::os::seraph::log!(error: "UNMOUNT: the refused unmount was not under way");
+            }
+            std::os::seraph::log!("UNMOUNT: refused, {open} file(s) open");
+            return IpcMessage::builder(ipc::vfsd_errors::BUSY)
+                .word(0, open)
+                .build();
+        }
+        DriverUnmount::Done =>
+        {
+            std::os::seraph::log!(debug: "UNMOUNT: the driver released its opens");
+        }
+        DriverUnmount::Busy(_) | DriverUnmount::Failed =>
+        {
+            std::os::seraph::log!(
+                warn: "UNMOUNT: the driver did not unmount; tearing it down without it"
+            );
+        }
+    }
+
+    teardown_mount(&mount, ipc_buf);
+    let needs_fallthrough = {
+        let mut backend = rt
+            .root_backend
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if backend.remove_mount(idx).is_none()
+        {
+            std::os::seraph::log!(error: "UNMOUNT: the finished unmount was not under way");
+        }
+        backend.needs_fallthrough(idx)
+    };
+    // A node with a mount below it stays visible as an intermediate; the
+    // unmount walks for its fall-through cap, as an install walks for the
+    // intermediates it makes visible.
+    if needs_fallthrough
+    {
+        populate_fallthrough_caps(rt, ipc_buf, &[idx]);
+    }
+    std::os::seraph::log!("UNMOUNT: done");
+    IpcMessage::new(ipc::vfsd_errors::SUCCESS)
+}
+
+/// The driver's answer to `FS_UNMOUNT`.
+enum DriverUnmount
+{
+    /// It released every open and exits.
+    Done,
+    /// It kept serving: this many opens are live.
+    Busy(u64),
+    /// It answered anything else, or not at all within
+    /// [`FS_UNMOUNT_TIMEOUT_MS`].
+    Failed,
+}
+
+/// Send `FS_UNMOUNT` (with `fs_labels::UNMOUNT_FORCE` on [`Force::Yes`])
+/// to the driver behind `endpoint`, on a SEND derived for the call.
+fn driver_unmount(endpoint: u64, force: Force, ipc_buf: *mut u64) -> DriverUnmount
+{
+    let Ok(send) = syscall::cap_derive(endpoint, syscall::RIGHTS_EP_SEND)
+    else
+    {
+        std::os::seraph::log!(warn: "UNMOUNT: driver SEND derive failed");
+        return DriverUnmount::Failed;
+    };
+    let label = match force
+    {
+        Force::No => ipc::fs_labels::FS_UNMOUNT,
+        Force::Yes => ipc::fs_labels::FS_UNMOUNT | ipc::fs_labels::UNMOUNT_FORCE,
+    };
+    let msg = IpcMessage::builder(label)
+        .word(0, u64::from(ipc::FS_LABELS_VERSION))
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call_timeout(send, &msg, ipc_buf, FS_UNMOUNT_TIMEOUT_MS) };
+    log_cap_delete("FS_UNMOUNT send", send);
+    match reply
+    {
+        Ok(reply) if reply.label == ipc::fs_errors::SUCCESS => DriverUnmount::Done,
+        Ok(reply) if reply.label == ipc::fs_errors::BUSY => DriverUnmount::Busy(reply.word(0)),
+        Ok(reply) =>
+        {
+            std::os::seraph::log!(warn: "UNMOUNT: FS_UNMOUNT answered {:#x}", reply.label);
+            DriverUnmount::Failed
+        }
+        Err(code) =>
+        {
+            std::os::seraph::log!(warn: "UNMOUNT: FS_UNMOUNT call failed: code={code}");
+            DriverUnmount::Failed
+        }
+    }
+}
+
+/// Tear down the driver of a mount whose unmount began: revoke its
+/// partition cap, so it reaches the disk no more; revoke its service
+/// endpoint ([`driver::teardown_driver`]), which invalidates every cap a
+/// client holds on the mount; wait, bounded, for its death to post; then
+/// destroy its process, which a driver that did not exit needs and one
+/// that did takes as a no-op, and delete the process handle and death
+/// queue.
+fn teardown_mount(mount: &Mount, ipc_buf: *mut u64)
+{
+    revoke_partition(mount.partition);
+    driver::teardown_driver(mount.endpoint);
+    match syscall::event_recv_timeout(mount.death_queue, DRIVER_DEATH_TIMEOUT_MS)
+    {
+        Ok(reason) => std::os::seraph::log!(debug: "UNMOUNT: driver exited: reason={reason:#x}"),
+        Err(code) => std::os::seraph::log!(
+            warn: "UNMOUNT: no driver death within {DRIVER_DEATH_TIMEOUT_MS} ms (code={code}); \
+             destroying it"
+        ),
+    }
+    let destroy = IpcMessage::new(ipc::procmgr_labels::DESTROY_PROCESS);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    if let Err(code) = unsafe { ipc::ipc_call(mount.process, &destroy, ipc_buf) }
+    {
+        std::os::seraph::log!(warn: "UNMOUNT: DESTROY_PROCESS failed: code={code}");
+    }
+    log_cap_delete("driver process handle", mount.process);
+    log_cap_delete("driver death queue", mount.death_queue);
 }
 
 /// One-shot best-effort mount of the partition tagged `type_guid` at

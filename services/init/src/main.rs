@@ -875,9 +875,9 @@ fn run(info_ptr: u64) -> !
     };
 
     // Derive a badged call cap with the `SEED_AUTHORITY` bit set so vfsd's
-    // `GET_SYSTEM_ROOT_CAP` accepts the init request. MOUNT is gated on
-    // `MOUNT_AUTHORITY`, which init mints onto the SEND it endows svcmgr
-    // with in Phase 3; init issues no MOUNT itself.
+    // `GET_SYSTEM_ROOT_CAP` accepts the init request. MOUNT and UNMOUNT are
+    // gated on `MOUNT_AUTHORITY`, which init mints onto the SEND it endows
+    // svcmgr with in Phase 3; init issues neither itself.
     let Ok(vfsd_seed_cap) = syscall::cap_derive_badge(
         vfsd_service_ep,
         syscall::RIGHTS_EP_SEND,

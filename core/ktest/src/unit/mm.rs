@@ -6,7 +6,7 @@
 //! Tier 1 tests for memory management syscalls.
 //!
 //! Covers: `SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, `SYS_MEM_MAP`, `SYS_MEM_UNMAP`,
-//! `SYS_MEM_PROTECT`, `SYS_ASPACE_QUERY`.
+//! `SYS_MEM_PROTECT`, `SYS_ASPACE_QUERY`, `SYS_ASPACE_HARVEST`.
 //!
 //! Memory cap layout after `aspace_cap`: the kernel mints one segment Memory
 //! cap per init LOAD segment at Phase 9, in program-header order
@@ -823,5 +823,254 @@ pub fn init_segment_caps_aligned(ctx: &TestContext) -> TestResult
 
     // Touch the sentinel static so the optimiser keeps `.data` populated.
     let _ = crate::unit::fpu::SUB_PAGE_SENTINEL.load(core::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+// ── SYS_ASPACE_HARVEST ───────────────────────────────────────────────────────
+
+/// Scratch VA (crate docs § Scratch VAs) of the harvest tests' pages, distinct
+/// from every other test's VA.
+const HARVEST_VA: u64 = 0x1_9000_0000;
+
+/// Pages the harvest tests map from [`HARVEST_VA`]; the page after them stays
+/// unmapped.
+const HARVEST_PAGES: usize = 8;
+
+/// The pool frames mapped at the [`HARVEST_PAGES`] pages from [`HARVEST_VA`],
+/// unmapped and returned by their guards' drop.
+struct HarvestPages
+{
+    _frames: [Option<crate::frame_pool::FrameGuard>; HARVEST_PAGES],
+}
+
+impl HarvestPages
+{
+    /// Map one pool frame at each page. No code reads or writes a page here,
+    /// so no translation of one is cached before the first harvest.
+    fn map(ctx: &TestContext, case: &'static str) -> Result<Self, &'static str>
+    {
+        let mut frames: [Option<crate::frame_pool::FrameGuard>; HARVEST_PAGES] = Default::default();
+        for (i, slot) in frames.iter_mut().enumerate()
+        {
+            let mut frame = crate::frame_pool::FrameGuard::new(ctx.aspace_cap).ok_or(case)?;
+            // SAFETY: the page is a scratch VA (crate docs § Scratch VAs), off
+            // every Rust object and IPC page of ktest.
+            unsafe { frame.map(harvest_page(i)) }.map_err(|_| case)?;
+            *slot = Some(frame);
+        }
+        Ok(HarvestPages { _frames: frames })
+    }
+}
+
+/// The address of harvest page `i`; `i` is at most [`HARVEST_PAGES`], so the
+/// sum stays in the low scratch band.
+fn harvest_page(i: usize) -> u64
+{
+    (i as u64).wrapping_mul(PAGE_SIZE).wrapping_add(HARVEST_VA)
+}
+
+/// Harvest the [`HARVEST_PAGES`] pages and the unmapped page after them,
+/// returning the call's count and the bitmap (bit `i` of byte `i / 8`).
+fn harvest(ctx: &TestContext) -> Result<(u64, [u8; 2]), i64>
+{
+    const SPAN: u64 = HARVEST_PAGES as u64 + 1;
+    let mut bitmap = [0u8; 2];
+    let count = syscall::aspace_harvest(ctx.aspace_cap, HARVEST_VA, SPAN, &mut bitmap)?;
+    Ok((count, bitmap))
+}
+
+/// The bitmap that reports exactly the pages `pages`.
+fn bitmap_of(pages: &[usize]) -> [u8; 2]
+{
+    let mut bitmap = [0u8; 2];
+    for &page in pages
+    {
+        if let Some(byte) = bitmap.get_mut(page / 8)
+        {
+            *byte |= 1 << (page % 8);
+        }
+    }
+    bitmap
+}
+
+/// Store to each harvest page of `pages`, with no branch on a page's index,
+/// so no access to another page is speculated.
+fn store(pages: &[usize])
+{
+    for &page in pages
+    {
+        let ptr = harvest_page(page) as *mut u8;
+        // SAFETY: the page is mapped writable by `HarvestPages` and holds no
+        // Rust object; any byte is valid there.
+        unsafe { ptr.write_volatile(0x5A) };
+    }
+}
+
+/// Load from each harvest page of `pages`, as [`store`] does.
+fn load(pages: &[usize])
+{
+    for &page in pages
+    {
+        let ptr = harvest_page(page) as *const u8;
+        // SAFETY: as for `store`; the read is volatile through a raw pointer.
+        let _ = unsafe { ptr.read_volatile() };
+    }
+}
+
+/// `SYS_ASPACE_HARVEST` reports and clears the accessed bit of each mapped
+/// page, and reads an unmapped page as clear.
+///
+/// A leaf the kernel installs reads accessed, so the first harvest reports
+/// every mapped page and the second none. A load or store of a subset then
+/// sets exactly its bits, and so does a touch of other pages after a third
+/// harvest: on riscv64 under Svade each touch of a page whose A bit was
+/// harvested faults into the kernel, which sets A and retries (ktest's thread
+/// has no fault handler, so an emulation that failed would kill it). Each page
+/// is touched while no translation of it is cached, since the harvest flushes
+/// no TLB entry and a cached one would complete a touch without setting A.
+pub fn aspace_harvest_reports_touched_pages(ctx: &TestContext) -> TestResult
+{
+    let _pages = HarvestPages::map(ctx, "aspace_harvest_reports_touched_pages: map failed")?;
+
+    let all: [usize; HARVEST_PAGES] = core::array::from_fn(|i| i);
+    if harvest(ctx) != Ok((HARVEST_PAGES as u64, bitmap_of(&all)))
+    {
+        return Err("aspace_harvest: freshly mapped pages should all read accessed");
+    }
+    if harvest(ctx) != Ok((0, [0, 0]))
+    {
+        return Err("aspace_harvest: a second harvest should report no page");
+    }
+
+    store(&[1, 6]);
+    load(&[4]);
+    if harvest(ctx) != Ok((3, bitmap_of(&[1, 4, 6])))
+    {
+        return Err("aspace_harvest: the bitmap should report exactly the touched pages");
+    }
+
+    store(&[0]);
+    load(&[7]);
+    if harvest(ctx) != Ok((2, bitmap_of(&[0, 7])))
+    {
+        return Err("aspace_harvest: a touch after a harvest should set the page's bit again");
+    }
+    Ok(())
+}
+
+/// `SYS_ASPACE_HARVEST` refuses a bad range, a bad bitmap and a cap without
+/// the Map right, with the error `core/kernel/docs/syscalls.md` names.
+pub fn aspace_harvest_refusals(ctx: &TestContext) -> TestResult
+{
+    const ARG: Result<u64, i64> = Err(SyscallError::InvalidArgument as i64);
+    const ADDR: Result<u64, i64> = Err(SyscallError::InvalidAddress as i64);
+    let mut bitmap = [0u8; 513];
+    let aspace = ctx.aspace_cap;
+
+    if syscall::aspace_harvest(aspace, HARVEST_VA, 0, &mut bitmap) != ARG
+    {
+        return Err("aspace_harvest of zero pages should fail with InvalidArgument");
+    }
+    if syscall::aspace_harvest(
+        aspace,
+        HARVEST_VA,
+        syscall::MAX_HARVEST_PAGES + 1,
+        &mut bitmap,
+    ) != ARG
+    {
+        return Err("aspace_harvest above MAX_HARVEST_PAGES should fail with InvalidArgument");
+    }
+    if syscall::aspace_harvest(aspace, HARVEST_VA + 1, 1, &mut bitmap) != ADDR
+    {
+        return Err("aspace_harvest at an unaligned address should fail with InvalidAddress");
+    }
+    if syscall::aspace_harvest(aspace, 0xFFFF_FFFF_8000_0000, 1, &mut bitmap) != ADDR
+    {
+        return Err("aspace_harvest in the kernel half should fail with InvalidAddress");
+    }
+    if syscall::aspace_harvest(aspace, USER_VA_FLOOR - PAGE_SIZE, 1, &mut bitmap) != ADDR
+    {
+        return Err("aspace_harvest below USER_VA_FLOOR should fail with InvalidAddress");
+    }
+    // SAFETY: a null bitmap, which the kernel refuses before it changes a bit.
+    if unsafe { syscall::aspace_harvest_raw(aspace, HARVEST_VA, 1, core::ptr::null_mut()) } != ADDR
+    {
+        return Err("aspace_harvest into a null bitmap should fail with InvalidAddress");
+    }
+    let kernel_bitmap = 0xFFFF_FFFF_8000_0000u64 as *mut u8;
+    // SAFETY: a kernel-half bitmap, which the kernel refuses before it changes
+    // a bit.
+    if unsafe { syscall::aspace_harvest_raw(aspace, HARVEST_VA, 1, kernel_bitmap) } != ADDR
+    {
+        return Err("aspace_harvest into a kernel-half bitmap should fail with InvalidAddress");
+    }
+
+    // A cap without the Map right, and a cap of another type.
+    let read_only = cap_derive(aspace, syscall::RIGHTS_AS_READ)
+        .map_err(|_| "aspace_harvest_refusals: cap_derive failed")?;
+    let no_map = syscall::aspace_harvest(read_only, HARVEST_VA, 1, &mut bitmap);
+    cap_delete(read_only).ok();
+    if no_map != Err(SyscallError::InsufficientRights as i64)
+    {
+        return Err("aspace_harvest through a cap without Map should fail with InsufficientRights");
+    }
+    if syscall::aspace_harvest(ctx.memory_base, HARVEST_VA, 1, &mut bitmap)
+        != Err(SyscallError::InvalidCapability as i64)
+    {
+        return Err("aspace_harvest through a Memory cap should fail with InvalidCapability");
+    }
+    Ok(())
+}
+
+/// A harvest whose bitmap copy-out faults, with no fault handler to resolve
+/// it, fails with `InvalidAddress` before it clears any accessed bit: the
+/// next harvest reports the pages the failed one read.
+pub fn aspace_harvest_bitmap_fault_clears_nothing(ctx: &TestContext) -> TestResult
+{
+    let _pages = HarvestPages::map(
+        ctx,
+        "aspace_harvest_bitmap_fault_clears_nothing: map failed",
+    )?;
+    harvest(ctx).map_err(|_| "aspace_harvest_bitmap_fault_clears_nothing: first harvest failed")?;
+
+    store(&[2, 3]);
+    // The page after the mapped ones is never mapped.
+    let unmapped = harvest_page(HARVEST_PAGES) as *mut u8;
+    // SAFETY: the bitmap names an unmapped scratch page; the copy-out faults
+    // and, with no handler bound, the kernel refuses the call.
+    let faulted = unsafe {
+        syscall::aspace_harvest_raw(ctx.aspace_cap, HARVEST_VA, HARVEST_PAGES as u64, unmapped)
+    };
+    if faulted != Err(SyscallError::InvalidAddress as i64)
+    {
+        return Err("aspace_harvest into an unmapped bitmap should fail with InvalidAddress");
+    }
+    if harvest(ctx) != Ok((2, bitmap_of(&[2, 3])))
+    {
+        return Err("aspace_harvest: a failed copy-out should leave the accessed bits set");
+    }
+    Ok(())
+}
+
+/// A kernel copy into a page whose accessed bit a harvest cleared succeeds
+/// and sets the bit: on riscv64 under Svade the copy's fault is resolved in
+/// the kernel's copy path, never refused.
+pub fn aspace_harvest_kernel_copy_sets_accessed(ctx: &TestContext) -> TestResult
+{
+    const LEN: usize = 32;
+    let _pages = HarvestPages::map(ctx, "aspace_harvest_kernel_copy_sets_accessed: map failed")?;
+    harvest(ctx).map_err(|_| "aspace_harvest_kernel_copy_sets_accessed: harvest failed")?;
+
+    // SAFETY: the span lies on a mapped, writable scratch page that holds no
+    // Rust object.
+    let copied = unsafe { syscall::getrandom_raw(harvest_page(5) as *mut u8, LEN) };
+    if copied != Ok(LEN as u64)
+    {
+        return Err("getrandom into a page with A cleared should succeed");
+    }
+    if harvest(ctx) != Ok((1, bitmap_of(&[5])))
+    {
+        return Err("aspace_harvest: the kernel copy should set the page's accessed bit");
+    }
     Ok(())
 }

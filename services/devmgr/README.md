@@ -14,6 +14,7 @@ devmgr/
 ├── firmware/                       # `devmgr-firmware`: host-tested ACPI / DTB parsers, PCI scan,
 │                                   #   aperture / IRQ range-cap table, driver-settle roster,
 │                                   #   served-driver ordinal table (tombstones),
+│                                   #   class watcher lists,
 │                                   #   held interrupt-line table, DMA mapping table and
 │                                   #   IOVA allocator, DMA Remapping table (VT-d units,
 │                                   #   scopes, RMRRs), RISC-V IO Mapping Table (PCI
@@ -26,7 +27,7 @@ devmgr/
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,
-│   │                               #   QUERY_DEVICE handler, device catalog
+│   │                               #   QUERY_DEVICE and WATCH_CLASS handlers, device catalog
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, port carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
 │   │   ├── x86_64/mod.rs           # IoPort carves (platform records, PM1a + 8042); no ECAM default

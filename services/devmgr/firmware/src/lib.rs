@@ -20,7 +20,8 @@
 //! every device on a line gets its own derivation, tracks which spawned drivers
 //! reported their device ready, and keeps each class's served drivers, by class
 //! name (`classes`) and instance ordinal, a withdrawn one's ordinal held by a
-//! tombstone, keeps each DMA-capable device's DMA mappings (`dma`), walks the
+//! tombstone, and the watchers it signals (`watchers`), keeps each
+//! DMA-capable device's DMA mappings (`dma`), walks the
 //! DMA Remapping table for the VT-d units and the functions each translates
 //! (`dmar`), and walks the RISC-V IO Mapping Table for the RISC-V IOMMUs that
 //! are PCI functions and the functions each translates (`rimt`), walks a DSDT
@@ -54,6 +55,7 @@ pub mod rimt;
 pub mod roster;
 pub mod scan;
 pub mod served;
+pub mod watchers;
 
 /// Location of one PCI ECAM configuration-space window discovered from an
 /// MCFG entry (ACPI) or a `pci-host-ecam-generic` DTB node, or the arch

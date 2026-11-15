@@ -271,7 +271,8 @@ pub struct AddressSpace
     /// bind onto an already-faulted space delivers `terminal_fault_reason` to
     /// the new observer instead of dropping the event — the address-space
     /// analogue of retaining a thread's `exit_reason` past death. First fault
-    /// wins; subsequent faults do not overwrite. Owned by `death_lock`.
+    /// wins: a later fault neither overwrites the reason nor posts the
+    /// observers again. Owned by `death_lock`.
     terminal_faulted: bool,
     /// Retained terminal-fault reason (`EXIT_FAULT_BASE + vector`), valid when
     /// `terminal_faulted`. Owned by `death_lock`.
@@ -713,9 +714,16 @@ impl AddressSpace
         result
     }
 
-    /// Record a terminal fault (first fault wins) and return the first node of
-    /// the observer chain, read under `death_lock`. The terminal-fault post
-    /// walks the chain from it outside the lock, after the faulting thread's
+    /// Record the address space's terminal fault and return the first node of
+    /// the observer chain, read under `death_lock`, when this fault is the
+    /// space's first; return null on any later fault, which records nothing.
+    ///
+    /// The address space dies once: only the fault that sets
+    /// `terminal_faulted` returns the chain, so its observers are posted once,
+    /// with the retained reason, however many of its threads fault, and on
+    /// however many CPUs at once (each takes `death_lock`, and only the first
+    /// holder finds the flag clear). The terminal-fault post walks the chain
+    /// from the returned node outside the lock, after the faulting thread's
     /// `Exited` commit (a linked node's links never change until the teardown
     /// takes the chain); recording the reason lets `retained_terminal_fault`
     /// read it back and a later `bind_or_retained` deliver it to an observer
@@ -742,12 +750,16 @@ impl AddressSpace
         // SAFETY: this validated by caller; fields read and written under
         // death_lock.
         let first = unsafe {
-            if !(*this).terminal_faulted
+            if (*this).terminal_faulted
+            {
+                core::ptr::null_mut()
+            }
+            else
             {
                 (*this).terminal_faulted = true;
                 (*this).terminal_fault_reason = reason;
+                (*this).death_observers.first()
             }
-            (*this).death_observers.first()
         };
         // SAFETY: paired with the lock_raw above.
         unsafe { death_lock.unlock_raw(saved) };

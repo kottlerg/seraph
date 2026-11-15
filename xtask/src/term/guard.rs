@@ -45,6 +45,15 @@ use std::fs::{File, OpenOptions};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+#[cfg(unix)]
+use crate::sys::unix::{
+    TCSANOW, TIOCGWINSZ, TIOCSWINSZ, Termios, Winsize, ioctl, tcgetattr, tcsetattr,
+};
+#[cfg(windows)]
+use crate::sys::windows::{
+    GetConsoleMode, GetStdHandle, Handle, INVALID_HANDLE_VALUE, STD_INPUT_HANDLE, SetConsoleMode,
+};
+
 /// Saves terminal state on `capture()` and restores it on `drop()`.
 pub struct TerminalGuard
 {
@@ -85,8 +94,8 @@ struct Inner
 struct UnixSaved
 {
     tty: File,
-    termios: libc::termios,
-    winsize: Option<libc::winsize>,
+    termios: Termios,
+    winsize: Option<Winsize>,
 }
 
 #[cfg(unix)]
@@ -94,8 +103,13 @@ impl Inner
 {
     fn capture() -> Self
     {
+        let tty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok();
         Inner {
-            saved: capture_unix(),
+            saved: tty.and_then(capture_unix),
         }
     }
 
@@ -108,33 +122,29 @@ impl Inner
     }
 }
 
+/// Snapshot the attributes and window size of the terminal `tty` is open
+/// on, keeping `tty` open for the restore. `None` when it is no terminal.
 #[cfg(unix)]
-fn capture_unix() -> Option<UnixSaved>
+fn capture_unix(tty: File) -> Option<UnixSaved>
 {
-    let tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
     let fd = tty.as_raw_fd();
 
-    // SAFETY: termios is plain old data with no invariants; zeroing
-    // it is a valid initial state. tcgetattr fills it from the kernel.
-    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
-    // SAFETY: fd is a valid open file descriptor for the terminal;
-    // termios points at a writable termios struct.
-    let r = unsafe { libc::tcgetattr(fd, &raw mut termios) };
+    let mut termios = Termios::zeroed();
+    // SAFETY: fd is a valid open file descriptor, held by `tty`; termios
+    // points at writable storage at least as large and as aligned as the C
+    // library's `struct termios` (`Termios`).
+    let r = unsafe { tcgetattr(fd, &raw mut termios) };
     if r != 0
     {
         return None;
     }
 
-    // SAFETY: winsize is plain old data, zero-init is valid.
-    let mut winsize: libc::winsize = unsafe { std::mem::zeroed() };
-    // SAFETY: fd is valid; libc::TIOCGWINSZ matches the kernel's
-    // expected request value; winsize points at a writable struct.
-    let r = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut winsize) };
-    let winsize = if r == 0 && winsize.ws_row > 0 && winsize.ws_col > 0
+    let mut winsize = Winsize::default();
+    // SAFETY: fd is valid; TIOCGWINSZ is the host's request that writes
+    // one `struct winsize`, which `Winsize` lays out, to the pointer
+    // passed; winsize points at a writable `Winsize`.
+    let r = unsafe { ioctl(fd, TIOCGWINSZ, &raw mut winsize) };
+    let winsize = if r == 0 && winsize.row > 0 && winsize.col > 0
     {
         Some(winsize)
     }
@@ -158,12 +168,14 @@ fn restore_unix(saved: &UnixSaved)
     // SAFETY: fd is valid (held open by `saved.tty`); termios was
     // captured by tcgetattr on the same fd. Failures are ignored —
     // best-effort restore on shutdown.
-    let _ = unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const saved.termios) };
+    let _ = unsafe { tcsetattr(fd, TCSANOW, &raw const saved.termios) };
 
     if let Some(ws) = saved.winsize.as_ref()
     {
-        // SAFETY: fd is valid; winsize was captured from the same fd.
-        let _ = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, ws) };
+        // SAFETY: fd is valid; TIOCSWINSZ is the host's request that reads
+        // one `struct winsize` from the pointer passed, and ws points at a
+        // `Winsize` captured from the same fd.
+        let _ = unsafe { ioctl(fd, TIOCSWINSZ, std::ptr::from_ref(ws)) };
     }
 }
 
@@ -178,7 +190,7 @@ struct Inner
 #[cfg(windows)]
 struct WindowsSaved
 {
-    handle: windows_sys::Win32::Foundation::HANDLE,
+    handle: Handle,
     mode: u32,
 }
 
@@ -204,9 +216,6 @@ impl Inner
 #[cfg(windows)]
 fn capture_windows() -> Option<WindowsSaved>
 {
-    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
-
     // SAFETY: STD_INPUT_HANDLE is a valid constant; GetStdHandle is
     // safe to call with it and returns either a valid HANDLE or
     // INVALID_HANDLE_VALUE.
@@ -219,7 +228,7 @@ fn capture_windows() -> Option<WindowsSaved>
     let mut mode: u32 = 0;
     // SAFETY: handle is a valid console HANDLE; mode points at a
     // writable u32. Returns 0 on failure (e.g. stdin is not a console).
-    let ok = unsafe { GetConsoleMode(handle, &mut mode) };
+    let ok = unsafe { GetConsoleMode(handle, &raw mut mode) };
     if ok == 0
     {
         return None;
@@ -231,8 +240,6 @@ fn capture_windows() -> Option<WindowsSaved>
 #[cfg(windows)]
 fn restore_windows(saved: &WindowsSaved)
 {
-    use windows_sys::Win32::System::Console::SetConsoleMode;
-
     // SAFETY: handle was returned by GetStdHandle and validated;
     // mode was captured by GetConsoleMode on the same handle.
     let _ = unsafe { SetConsoleMode(saved.handle, saved.mode) };
@@ -256,5 +263,104 @@ impl Inner
         // No-op: no platform path exists. xtask is not expected to
         // run on such hosts; this branch is only here so the type
         // signature compiles everywhere.
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod tests
+{
+    use std::fs::{File, OpenOptions};
+    use std::os::unix::io::AsRawFd;
+
+    use super::{Inner, TerminalGuard, capture_unix};
+    use crate::sys::unix::{
+        TCSANOW, TIOCGWINSZ, TIOCSWINSZ, Termios, Winsize, ioctl, tcgetattr, tcsetattr,
+    };
+
+    unsafe extern "C" {
+        /// `cfmakeraw(3)`: sets `termios` to raw mode.
+        fn cfmakeraw(termios: *mut Termios);
+    }
+
+    fn attributes(tty: &File) -> Termios
+    {
+        let mut termios = Termios::zeroed();
+        // SAFETY: the descriptor is open, held by `tty`; termios is storage
+        // `tcgetattr` may fill.
+        let r = unsafe { tcgetattr(tty.as_raw_fd(), &raw mut termios) };
+        assert_eq!(r, 0);
+        termios
+    }
+
+    fn set_attributes(tty: &File, termios: &Termios)
+    {
+        // SAFETY: the descriptor is open, held by `tty`; termios holds
+        // attributes `tcgetattr` filled.
+        let r = unsafe { tcsetattr(tty.as_raw_fd(), TCSANOW, std::ptr::from_ref(termios)) };
+        assert_eq!(r, 0);
+    }
+
+    fn window_size(tty: &File) -> Winsize
+    {
+        let mut winsize = Winsize::default();
+        // SAFETY: the descriptor is open, held by `tty`; TIOCGWINSZ writes one
+        // `Winsize` to the pointer passed.
+        let r = unsafe { ioctl(tty.as_raw_fd(), TIOCGWINSZ, &raw mut winsize) };
+        assert_eq!(r, 0);
+        winsize
+    }
+
+    fn set_window_size(tty: &File, winsize: Winsize)
+    {
+        // SAFETY: the descriptor is open, held by `tty`; TIOCSWINSZ reads one
+        // `Winsize` from the pointer passed.
+        let r = unsafe { ioctl(tty.as_raw_fd(), TIOCSWINSZ, std::ptr::from_ref(&winsize)) };
+        assert_eq!(r, 0);
+    }
+
+    /// Dropping the guard puts back the attributes and the window size the
+    /// terminal had when it was captured, on a pseudo-terminal of the test's
+    /// own (its master side, whose terminal calls act on its slave).
+    #[test]
+    fn dropping_the_guard_restores_the_captured_attributes_and_window_size()
+    {
+        let pty = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/ptmx")
+            .unwrap();
+        let captured_size = Winsize {
+            row: 24,
+            col: 80,
+            ..Winsize::default()
+        };
+        set_window_size(&pty, captured_size);
+        let captured = attributes(&pty);
+
+        let guard = TerminalGuard {
+            inner: Inner {
+                saved: capture_unix(pty.try_clone().unwrap()),
+            },
+        };
+
+        let mut raw = captured;
+        // SAFETY: raw holds attributes `tcgetattr` filled.
+        unsafe { cfmakeraw(&raw mut raw) };
+        set_attributes(&pty, &raw);
+        set_window_size(
+            &pty,
+            Winsize {
+                row: 50,
+                col: 132,
+                ..Winsize::default()
+            },
+        );
+        assert_ne!(attributes(&pty), captured);
+        assert_ne!(window_size(&pty), captured_size);
+
+        drop(guard);
+        assert_eq!(attributes(&pty), captured);
+        assert_eq!(window_size(&pty), captured_size);
     }
 }

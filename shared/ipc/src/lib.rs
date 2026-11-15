@@ -181,9 +181,9 @@ pub mod procmgr_labels
     /// the message carries a trailing death-relay POST-only `EventQueue` cap
     /// (the LAST cap in the message, which then carries at least two caps).
     /// Once the child is recorded, procmgr binds it as an `AddressSpace`
-    /// death observer (correlator 0) on the child so that a terminal fault
-    /// in any of the child's threads posts the fault class straight to the
-    /// spawner's own death queue, letting `Child::wait()` return. procmgr
+    /// death observer (correlator 0) on the child so that the first terminal
+    /// fault in any of the child's threads posts the fault class straight to
+    /// the spawner's own death queue, once, letting `Child::wait()` return. procmgr
     /// `cap_delete`s its copy after the bind (the kernel captured the
     /// `EventQueue` state at bind time). Occupies bit 17 of the
     /// `[16..31]` label window.

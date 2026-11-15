@@ -369,7 +369,8 @@ funding the budget refuses is declined with code 10, and one whose funding the r
 code 9. A fault whose map still fails, because the free pool cannot fund the pool or the map fails
 for another reason, is declined with code 9 ([`ipc-interface.md`](ipc-interface.md)
 § Kernel-origin fault message). A failed map can leave the first pages of the run mapped. memmgr
-unmaps the run's span before it returns the run to the free pool, so no page of a pooled run stays
+unmaps the run's span, keeping its page tables ([Commit](#commit)), before it returns the run to the
+free pool, so no page of a pooled run stays
 mapped in the process. When that unmap fails, the run stays recorded on the process's entry until
 `PROCESS_DIED`.
 
@@ -750,11 +751,11 @@ A region registered with `REGION_COMMIT` is committed ([ipc-interface.md](ipc-in
 7). memmgr admits and charges its whole length when it registers it, and each growth by
 `EXTEND_REGION` (§ Label 12) when it accepts that growth, so a fault in a committed region is not
 declined for budget or RAM while the region's page-table reservation lasts, which only the process's
-own mappings can spend early (Faults below): a refusal reaches the process as the error reply of the
-call that asked, where it can fail an allocation, not as a fault. std's heap grows this way. It
-keeps its uncommitted floor and registers one committed growth region directly above it on its first
-grow, which each later grow extends, so a heap is two regions however large it grows and holds no
-Memory caps ([Userspace Memory Model § Byte
+own mappings and unmaps can spend early (Faults below): a refusal reaches the process as the error
+reply of the call that asked, where it can fail an allocation, not as a fault. std's heap grows this
+way. It keeps its uncommitted floor and registers one committed growth region directly above it on
+its first grow, which each later grow extends, so a heap is two regions however large it grows and
+holds no Memory caps ([Userspace Memory Model § Byte
 Heap](../../../docs/userspace-memory-model.md#byte-heap)).
 
 **Promised.** memmgr counts in `promised` what the committed regions can still take from the free
@@ -792,19 +793,21 @@ donations whatever those mappings take. The kernel keeps at most one page of a d
 bookkeeping, so each two-page donation adds at least one page, and a map that still runs out after a
 donation needs more pages than the pool held: the donations of one map take at most two pages for
 each page table it creates. The tables a committed region's maps create lie in its span and stay
-until it is unregistered (a cut, and the unmap of a run whose fault is declined, keep them), so they
-number at most `pool_funding::pt_pages_for` of its largest length, which the `commit` module's host
-tests check against a pool that every other mapping empties between two maps. Two cases, both of the
-process's own doing, spend the reservation faster: a thread of the process that maps between two
-rounds of one map can take the donated pages first, which costs that map a round and the reservation
-a donation, and a table in the region's span that a reclaiming unmap the process made or asked for
-removed (its own unmap of the region's pages, or the unregistering of a region it placed in a span a
-cut freed) is built again. A donation the reservation no longer holds is admitted as any other, so
-the process's budget and the system reserve bound what it takes, and the fault is declined with code
-10 when the max refuses even that donation, or with code 9 when the reserve does. A committed fault
-is also declined, with code 9, when its map fails as any map can: no two contiguous pages are free
-for a donation, or a thread of the process maps between the rounds of one map and takes the donated
-pages faster than four rounds fund them.
+until it is unregistered: memmgr unmaps a cut's pages, and a run whose fault it declines in any
+region, without reclaiming page tables, since the kernel reclaims a table once it is empty, whatever
+span emptied it, so only the process's own unmaps and its unregistering of a region reclaim them. So
+they number at most `pool_funding::pt_pages_for` of its largest length, which the `commit` module's
+host tests check against a pool that every other mapping empties between two maps. Two cases, both
+of the process's own doing, spend the reservation faster: a thread of the process that maps between
+two rounds of one map can take the donated pages first, which costs that map a round and the
+reservation a donation, and a table in the region's span that a reclaiming unmap the process made or
+asked for removed (its own unmap of pages in a span that shares the table, or its unregistering of a
+region that shares it) is built again. A donation the reservation no longer holds is admitted as any
+other, so the process's budget and the system reserve bound what it takes, and the fault is declined
+with code 10 when the max refuses even that donation, or with code 9 when the reserve does. A
+committed fault is also declined, with code 9, when its map fails as any map can: no two contiguous
+pages are free for a donation, or a thread of the process maps between the rounds of one map and
+takes the donated pages faster than four rounds fund them.
 
 **Shrink and release.** `SHRINK_REGION` (§ Label 13) lowers a committed region's top to a chunk
 multiple: memmgr unmaps the pages past it, cuts the chunks past it from the chunk table, which drops

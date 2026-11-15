@@ -2267,7 +2267,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // Record the run on its chunk, so it is reclaimed on death or unregister.
     if !ensure_slots(l, need) || l.back_chunk(rec, reg, frame).is_err()
     {
-        release_unmapped_chunk(l, rec, aspace_cap, frame, target.committed);
+        release_unmapped_chunk(l, rec, aspace_cap, frame);
         decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
         return;
     }
@@ -2350,7 +2350,7 @@ fn back_span(
         {
             return Ok(frame);
         };
-        release_unmapped_chunk(l, target.rec, target.aspace_cap, frame, target.committed);
+        release_unmapped_chunk(l, target.rec, target.aspace_cap, frame);
         match refusal
         {
             MapRefusal::Limit | MapRefusal::Reserve(_) if pages > 1 =>
@@ -2569,35 +2569,21 @@ fn fund_client_page_tables(
 
 /// Give back a demand chunk whose fault memmgr is declining: unmap whatever
 /// part of it a failed map left mapped in the client address space
-/// `aspace_cap`, then return it to the free pool. In a committed region
-/// (`committed` names it) the unmap keeps the page tables, which its
-/// reservation funded and which stay until the region is unregistered
-/// (services/memmgr/docs/memory-pool.md § Commit); otherwise it reclaims them.
-/// When the unmap fails, the chunk may still be mapped, so it is accounted to
+/// `aspace_cap`, then return it to the free pool. The unmap keeps the page
+/// tables, which stay until the region is unregistered: the kernel reclaims a
+/// table once it is empty, whatever span emptied it, so a reclaiming unmap here
+/// could free a table a neighbouring committed region's page-table reservation
+/// funded, and that region's next fault there would draw on it again
+/// (services/memmgr/docs/memory-pool.md § Commit). When the unmap fails, the chunk may still be mapped, so it is accounted to
 /// the record `rec` instead, for `PROCESS_DIED` to reclaim; with no slot for
 /// that either, it stays owned and counted in `pool_total` but out of
 /// circulation.
-fn release_unmapped_chunk(
-    l: &mut MemLedger,
-    rec: NodeIdx,
-    aspace_cap: u64,
-    frame: FrameDesc,
-    committed: Option<NodeIdx>,
-)
+fn release_unmapped_chunk(l: &mut MemLedger, rec: NodeIdx, aspace_cap: u64, frame: FrameDesc)
 {
-    let pages = u64::from(frame.page_count);
-    let unmapped = if committed.is_some()
-    {
-        // SAFETY: `aspace_cap` is a client address space procmgr delegated
-        // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes
-        // nothing memmgr runs on.
-        unsafe { syscall::mem_unmap(aspace_cap, frame.va, pages) }
-    }
-    else
-    {
-        // SAFETY: as above: a client address space, never memmgr's own.
-        unsafe { syscall::mem_unmap_reclaim(aspace_cap, frame.va, pages) }
-    };
+    // SAFETY: `aspace_cap` is a client address space procmgr delegated
+    // (`DELEGATE_ASPACE`), never memmgr's own, so the unmap changes nothing
+    // memmgr runs on.
+    let unmapped = unsafe { syscall::mem_unmap(aspace_cap, frame.va, u64::from(frame.page_count)) };
     if unmapped.is_ok()
     {
         insert_run(

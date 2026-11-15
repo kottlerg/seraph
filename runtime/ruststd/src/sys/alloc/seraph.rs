@@ -418,9 +418,10 @@ impl Heap {
     /// memmgr admits and charges the whole growth before it answers, so the
     /// pages are backed on first touch and no fault in them is declined for
     /// budget or RAM while the region's page-table reservation lasts, which
-    /// only this process's other mappings can spend early, by taking the
-    /// page-table pages memmgr donates for a fault in the middle of its map;
-    /// a refusal (`LIMIT` at this process's max,
+    /// only this process's own mappings and unmaps can spend early: another
+    /// thread's map that takes the page-table pages memmgr donates in the
+    /// middle of a fault's map, or an unmap that reclaims page tables in the
+    /// region's span; a refusal (`LIMIT` at this process's max,
     /// `OUT_OF_MEMORY_BEST_EFFORT` when the RAM outside memmgr's promises is
     /// short) returns `false`, so an allocation fails where it is made, and
     /// `try_reserve` returns `Err`, rather than a later touch faulting with

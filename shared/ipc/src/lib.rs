@@ -1010,12 +1010,12 @@ pub mod memmgr_labels
     /// [`REGISTER_REGION`] flag (`data[3]` bit 0): commit the region. memmgr
     /// admits and charges its whole length when it registers it, so a fault
     /// in it is not declined for budget or RAM while the region's page-table
-    /// reservation lasts, which only the process's own mappings can spend
-    /// early (`services/memmgr/docs/ipc-interface.md` § Label 7), and only a
-    /// committed region grows by [`EXTEND_REGION`] or shrinks by
-    /// [`SHRINK_REGION`]. A reply
-    /// that does not reach the caller undoes the registration, so a caller
-    /// whose call was interrupted makes it again. The std heap grows this way.
+    /// reservation lasts, which only the process's own mappings and unmaps
+    /// can spend early (`services/memmgr/docs/ipc-interface.md` § Label 7),
+    /// and only a committed region grows by [`EXTEND_REGION`] or shrinks by
+    /// [`SHRINK_REGION`]. A reply that does not reach the caller undoes the
+    /// registration, so a caller whose call was interrupted makes it again.
+    /// The std heap grows this way.
     pub const REGION_COMMIT: u64 = 1 << 0;
     /// Procmgr-only: delegate a demand-paged child's `AddressSpace` cap to
     /// memmgr so the pager can map frames into it on fault.

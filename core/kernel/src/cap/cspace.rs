@@ -48,7 +48,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::num::{NonZeroU32, NonZeroUsize};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use super::object::{CSpaceKernelObject, KernelObjectHeader, MemoryObject};
 use super::slot::{CSpaceId, CapTag, CapabilitySlot, Rights};
@@ -492,6 +492,13 @@ pub struct CSpace
     /// stub, which boxes pages instead. Set once via [`Self::set_kobj`]
     /// right after construction.
     kobj: AtomicPtr<CSpaceKernelObject>,
+    /// Set by the teardown's derivation drain in its first
+    /// `DERIVATION_LOCK` hold and never cleared; written and read only under
+    /// that lock. From then on the IPC capability transfer and the in-flight
+    /// move treat this `CSpace` as gone, so no capability enters or leaves it
+    /// while the drain runs (core/kernel/docs/capability-internals.md
+    /// § Teardown Drain).
+    draining: AtomicBool,
     /// Host-test stand-in for a finite slot-page pool: the heap pages the
     /// test stub may still allocate, or `None` for unbounded.
     #[cfg(test)]
@@ -550,6 +557,7 @@ impl CSpace
                 free_count: _,
                 lock: _,
                 kobj: _,
+                draining: _,
                 #[cfg(test)]
                     test_page_budget: _,
             } = cs;
@@ -570,6 +578,7 @@ impl CSpace
             (&raw mut (*dst).free_count).write(0);
             (&raw mut (*dst).lock).write(crate::sync::Spinlock::new());
             (&raw mut (*dst).kobj).write(AtomicPtr::new(core::ptr::null_mut()));
+            (&raw mut (*dst).draining).write(AtomicBool::new(false));
             #[cfg(test)]
             (&raw mut (*dst).test_page_budget).write(None);
         }
@@ -623,6 +632,23 @@ impl CSpace
     pub fn id(&self) -> CSpaceId
     {
         self.id
+    }
+
+    /// Mark this `CSpace` as draining: its teardown has begun the
+    /// derivation drain. Never cleared.
+    ///
+    /// The caller holds `DERIVATION_LOCK`, which orders the store against
+    /// every reader ([`Self::is_draining`]).
+    pub(crate) fn set_draining(&self)
+    {
+        self.draining.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this `CSpace`'s teardown drain has begun. Read under
+    /// `DERIVATION_LOCK`, which the drain holds when it sets the flag.
+    pub(crate) fn is_draining(&self) -> bool
+    {
+        self.draining.load(Ordering::Relaxed)
     }
 
     /// Allocate a free slot index for a general insert, growing the `CSpace`

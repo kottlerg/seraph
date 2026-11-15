@@ -99,6 +99,11 @@ impl Evaluator<'_>
             h.depth = h.depth.checked_add(1).ok_or(FaultKind::Bound)?;
             return Ok(());
         }
+        // Drop the entries of objects since removed, which no longer set
+        // the level or match any acquisition, so the list holds only live
+        // mutexes however many a loop leaves held.
+        let ns = &*self.ns;
+        self.held.retain(|h| ns.generation(h.node) == h.generation);
         let held = Held {
             node,
             generation: self.ns.generation(node),
@@ -106,7 +111,12 @@ impl Evaluator<'_>
             sync,
             depth: 1,
         };
-        crate::push(&mut self.held, held)
+        crate::push(&mut self.held, held)?;
+        #[cfg(test)]
+        {
+            self.held_peak = self.held_peak.max(self.held.len());
+        }
+        Ok(())
     }
 
     /// Release one acquisition of the mutex `node`; whether it is now free.
@@ -156,9 +166,11 @@ impl Evaluator<'_>
     /// no limit), or nest it again; whether it is held.
     ///
     /// The wait counts against [`MAX_EVAL_DELAY_MS`]: the host is asked to
-    /// wait no longer than the budget has left, and a wait that ends without
-    /// the lock counts in full. One the budget cut short (no limit, or a
-    /// timeout past what is left) fails with [`FaultKind::Bound`].
+    /// wait no longer than the budget has left; a wait that gets the lock
+    /// counts the time it took, as the host's timer measures it, and one that
+    /// ends without it counts in full. One the budget cut short (no limit, or
+    /// a timeout past what is left) that ends without the lock fails with
+    /// [`FaultKind::Bound`].
     pub(super) fn global_acquire(&mut self, timeout_ms: u16) -> Result<bool, FaultKind>
     {
         if self.global == 0
@@ -169,15 +181,18 @@ impl Evaluator<'_>
             // At most 0xFFFE, the longest finite timeout.
             let wait = if cut { left } else { asked }.min(0xFFFE);
             let wait_ms = u16::try_from(wait).unwrap_or(0xFFFE);
-            if !self
+            let full = u64::from(wait_ms).saturating_mul(1000);
+            let start = self.host.timer();
+            let got = self
                 .host
                 .acquire_global_lock(wait_ms)
-                .map_err(FaultKind::Host)?
+                .map_err(FaultKind::Host)?;
+            // The timer counts 100 ns units.
+            let took_us = self.host.timer().saturating_sub(start) / 10;
+            let spent = if got { took_us.min(full) } else { full };
+            self.budget.delay_us = self.budget.delay_us.saturating_add(spent);
+            if !got
             {
-                self.budget.delay_us = self
-                    .budget
-                    .delay_us
-                    .saturating_add(u64::from(wait_ms).saturating_mul(1000));
                 return if cut
                 {
                     Err(FaultKind::Bound)

@@ -94,6 +94,9 @@ pub(super) struct Sim
     pub gl_refuse: bool,
     /// The timeout of each request for the global lock.
     pub gl_waits: Vec<u16>,
+    /// How long a granted request waits first, in milliseconds, at most its
+    /// timeout.
+    pub gl_grant_ms: u64,
     /// The time slept and stalled.
     pub slept_ms: u64,
     pub stalled_us: u64,
@@ -448,6 +451,7 @@ impl Host for Sim
         {
             return Ok(false);
         }
+        self.timer += u64::from(timeout_ms).min(self.gl_grant_ms) * 10_000;
         self.gl_held = true;
         self.gl_acquires += 1;
         Ok(true)

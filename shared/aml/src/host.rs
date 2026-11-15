@@ -13,8 +13,9 @@
 //! region as a whole; a PCI configuration call carries the function and the
 //! offset in its configuration space. To find the bus of a `PCI_Config`
 //! region the evaluator also reads, outside any region, the header type
-//! (offset 0x0E) and the secondary bus (0x19) of each PCI-to-PCI bridge
-//! between the host bridge and the region's device. A host that refuses or
+//! (offset 0x0E) of each device with an `_ADR` between the host bridge and
+//! the region's device, and the secondary bus (0x19) of each whose header
+//! type is 1 (a PCI-to-PCI bridge) or 2 (a `CardBus` bridge). A host that refuses or
 //! fails an access returns a [`HostError`], which ends the evaluation with
 //! [`crate::FaultKind::Host`].
 
@@ -78,9 +79,9 @@ pub struct Span
 /// The PCI function whose configuration space a `PCI_Config` region is in.
 ///
 /// The segment is the host bridge's `_SEG` and the bus its `_BBN` (0 when
-/// absent), replaced at each PCI-to-PCI bridge between the host bridge and
-/// the region's device by that bridge's secondary bus number; the device and
-/// function are the region's device's `_ADR`.
+/// absent), replaced at each PCI-to-PCI or `CardBus` bridge between the host
+/// bridge and the region's device by that bridge's secondary bus number; the
+/// device and function are the region's device's `_ADR`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PciAddress
 {
@@ -153,7 +154,8 @@ pub trait Host
 
     /// Read `width` bytes at offset `offset` of the configuration space of
     /// `function`: an access of a `PCI_Config` region, or the read of a
-    /// bridge's header type or secondary bus that finds a region's bus.
+    /// device's header type or a bridge's secondary bus that finds a
+    /// region's bus.
     ///
     /// # Errors
     ///

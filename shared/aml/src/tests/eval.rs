@@ -1151,6 +1151,18 @@ fn a_mutex_a_returned_method_left_held_does_not_hold_its_successor()
         fault(&defs, &cat(&[&call(0), &call(2)])),
         FaultKind::MutexOrder
     );
+    // Fifty calls, each leaving its mutex held: the entries of the removed
+    // ones are dropped, so one is held at most.
+    let lt50 = op(&[0x95], &[&l(0), &i(50)]);
+    let body = cat(&[
+        &store(&i(0), &l(0)),
+        &while_(&lt50, &cat(&[&call(0), &[0x75], &l(0)])),
+    ]);
+    let mut ns = table_of(2, &defs, 0, &body);
+    let mut sim = Sim::new();
+    let mut ev = Evaluator::new(&mut ns, &mut sim);
+    ev.evaluate_path("\\TEST", vec![]).unwrap();
+    assert_eq!(ev.held_peak(), 1);
 }
 
 #[test]
@@ -1439,6 +1451,17 @@ fn delays_are_bounded()
         FaultKind::Bound
     );
     assert_eq!(sim.gl_waits, vec![6000]);
+    // A granted wait counts the time it took: 1000 ms per pass, and 1 ms of
+    // Sleep, end the budget in the tenth pass.
+    let mut sim = Sim::new();
+    sim.gl_grant_ms = 1000;
+    let pass = cat(&[
+        &acquire("\\_GL_", 1000),
+        &release("\\_GL_"),
+        &op(&ext(0x22), &[&i(1)]),
+    ]);
+    let (kind, passes) = count_passes_on(&[], &pass, &mut sim);
+    assert_eq!((kind, passes), (FaultKind::Bound, 10));
 }
 
 // The lowest stack address the host saw, through its callbacks.

@@ -140,6 +140,9 @@ pub struct Evaluator<'a>
     global: u32,
     gl: Option<NodeId>,
     budget: Budget,
+    /// The most entries `held` has had, for the tests.
+    #[cfg(test)]
+    held_peak: usize,
 }
 
 impl core::fmt::Debug for Evaluator<'_>
@@ -207,7 +210,16 @@ impl<'a> Evaluator<'a>
             global: 0,
             gl,
             budget: Budget::default(),
+            #[cfg(test)]
+            held_peak: 0,
         }
+    }
+
+    /// The most mutexes held at once, stale entries included.
+    #[cfg(test)]
+    pub(crate) const fn held_peak(&self) -> usize
+    {
+        self.held_peak
     }
 
     /// The namespace.

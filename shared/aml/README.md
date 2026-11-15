@@ -173,9 +173,10 @@ defines it, or at its first access when a table does, and every access lies insi
 An I/O or memory access carries the span to the host; a `PCI_Config` access carries the
 function and the offset in its configuration space. A `PCI_Config` region's function is found
 at its first access: the segment and bus are the enclosing host bridge's `_SEG` and `_BBN` (0
-when absent), replaced at each PCI-to-PCI bridge on the way down by the secondary bus number its
-header holds, which the evaluator reads from the bridge's configuration space outside any
-region, and the device and function are the region's device's `_ADR`.
+when absent), replaced at each PCI-to-PCI or CardBus bridge on the way down by the secondary bus
+number its header holds, and the device and function are the region's device's `_ADR`. To find
+the bus the evaluator reads, outside any region, the header type of each device with an `_ADR`
+on the way down and the secondary bus of each that is a bridge.
 
 The evaluator runs one thread of AML, so no other thread holds a mutex: `Acquire` succeeds unless
 it breaks the ordering rule of ACPI 6.5 § 19.6.2 (the current sync level is the highest among

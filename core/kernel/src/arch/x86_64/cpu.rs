@@ -540,6 +540,9 @@ pub unsafe fn disable_unswitched_user_state() {}
 /// interrupt at the halt boundary has been recognised (handler ran during
 /// halt).
 ///
+/// Runs `VERW` first where the transient-execution selection asks for it
+/// (`mitigation::verw_before_idle`).
+///
 /// Per Intel SDM Vol. 2B (STI): when `STI` is immediately followed by `HLT`,
 /// the processor delays interrupt recognition until after `HLT` begins
 /// execution. The pair is therefore atomic: no interrupt is lost between
@@ -551,6 +554,10 @@ pub unsafe fn disable_unswitched_user_state() {}
 /// preceding atomic loads across this call.
 pub fn halt_until_interrupt()
 {
+    // Clear the CPU's buffers before the halt where the selection asks for it
+    // (core/kernel/docs/transient-execution.md § Controls).
+    #[cfg(not(test))]
+    super::mitigation::verw_before_idle();
     // SAFETY: `sti; hlt` is atomic per Intel SDM; correct only when
     // interrupts were disabled on entry (caller contract).
     unsafe {

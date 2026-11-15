@@ -4,12 +4,16 @@
 // xtask/src/commands/test_cet.rs
 
 //! CET supervisor shadow-stack test (#1083): the `x86_64` kernel runs on
-//! shadow stacks when the CPU offers them, and a corrupted kernel return
-//! address raises a control-protection fault instead of being followed
+//! shadow stacks when the CPU offers them and its transient-execution
+//! selection rewrites no return, and a corrupted kernel return address raises
+//! a control-protection fault instead of being followed
 //! (core/kernel/docs/return-address-integrity.md).
 //!
 //! Neither the CI runners nor TCG emulate CET, so only a host whose CPU has
-//! CET shadow stacks (`CET_SS`), under KVM, can run the enabled path. The
+//! CET shadow stacks (`CET_SS`) and enhanced or Automatic IBRS, under KVM,
+//! can run the enabled path: without either IBRS the kernel takes the
+//! retpoline sequence and keeps shadow stacks off, and the command fails,
+//! naming that cause. The
 //! guest CPU is `-cpu host,cet-ss=on,enforce`: QEMU refuses to start when KVM
 //! cannot give the guest the feature, and the command then fails, naming
 //! it. It never passes on a host that did not run the shadow stacks. Every
@@ -65,6 +69,10 @@ use crate::util::{require_tool, step};
 
 /// The kernel's line once shadow stacks are on (`kernel_entry_post_rebase`).
 const ON_MARKER: &str = "shadow stacks: on";
+/// The kernel's line when the CPU reports `CET_SS` but the
+/// transient-execution selection keeps shadow stacks off
+/// (`shadow_stack::decide`).
+const OFF_MARKER: &str = "shadow stacks: off";
 
 /// The kernel's serial-only layout line.
 const KASLR_MARKER: &str = "kaslr: slide=";
@@ -478,6 +486,26 @@ fn refusal(stderr: &str) -> Option<&str>
     stderr.lines().find(|l| l.contains("cet-ss")).map(str::trim)
 }
 
+/// Why the kernel did not turn shadow stacks on, from its lines: its own
+/// `shadow stacks: off` line, which names the transient-execution selection
+/// that keeps them off on a CPU reporting `CET_SS`, or else a guest CPU that
+/// does not report `CET_SS`.
+fn not_on(lines: &[String]) -> String
+{
+    match lines.iter().find(|l| l.contains(OFF_MARKER))
+    {
+        Some(off) => format!(
+            "the kernel kept shadow stacks off: {}; the host needs enhanced or Automatic IBRS \
+             as well as CET_SS",
+            off.trim()
+        ),
+        None => format!(
+            "the kernel did not turn shadow stacks on (no `{ON_MARKER}` line): the guest CPU \
+             does not report CET_SS"
+        ),
+    }
+}
+
 /// Boot 1's verdict on its lines, the last of them the end marker.
 fn check_ktest(lines: &[String]) -> Result<()>
 {
@@ -485,10 +513,7 @@ fn check_ktest(lines: &[String]) -> Result<()>
     let last = lines.last().map_or("", String::as_str);
     if on.is_none()
     {
-        bail!(
-            "the kernel did not turn shadow stacks on (no `{ON_MARKER}` line): the guest CPU does \
-             not report CET_SS"
-        );
+        bail!("{}", not_on(lines));
     }
     if !last.contains(PASS_MARKER)
     {
@@ -503,7 +528,7 @@ fn check_started(lines: &[String]) -> Result<u64>
 {
     if !lines.iter().any(|l| l.contains(ON_MARKER))
     {
-        bail!("the kernel did not turn shadow stacks on (no `{ON_MARKER}` line)");
+        bail!("{}", not_on(lines));
     }
     if let Some(fault) = lines.iter().find(|l| l.contains(EXCEPTION_MARKER))
     {
@@ -616,6 +641,28 @@ mod tests
         );
         let err = check_ktest(&off).unwrap_err().to_string();
         assert!(err.contains("CET_SS"), "{err}");
+    }
+
+    // The defect caught: a CET host whose kernel kept shadow stacks off for the
+    // retpoline sequence (no enhanced or Automatic IBRS) reported as a host
+    // without CET_SS, which the kernel's own line contradicts.
+    #[test]
+    fn a_retpoline_selection_is_named_as_the_cause()
+    {
+        let off = lines(
+            "kernel: shadow stacks: off, CET_SS reported but the retpoline sequence is selected
+             [0.1] ktest: starting
+[ktest] ALL TESTS PASSED",
+        );
+        for err in [
+            check_ktest(&off).unwrap_err().to_string(),
+            check_started(&off).unwrap_err().to_string(),
+        ]
+        {
+            assert!(err.contains("retpoline"), "{err}");
+            assert!(err.contains("enhanced or Automatic IBRS"), "{err}");
+            assert!(!err.contains("does not report CET_SS"), "{err}");
+        }
     }
 
     #[test]

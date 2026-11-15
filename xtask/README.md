@@ -87,7 +87,10 @@ build of a commit orders its binaries' statics as CI's does (see
 CI's ([docs/testing.md](../docs/testing.md#troubleshooting) § Troubleshooting).
 
 A riscv64 kernel build runs with `RUSTFLAGS="-Zunstable-options -Zemit-stack-sizes"`, which
-reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. After the link,
+reaches the `-Z build-std` crates as well, and its Clippy pass with the same flags. An x86-64
+kernel build and its Clippy pass run with
+`RUSTFLAGS="-Zunstable-options -Zretpoline-external-thunk"`, which sends every indirect branch of
+the kernel and its `-Z build-std` crates through the kernel's retpoline thunk. After the link,
 and before the image is installed, the build reads the image's `.stack_sizes` section and fails,
 naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MAX` (2032 bytes,
 `src/stack_sizes.rs`), the kernel frame bound of
@@ -891,7 +894,10 @@ on a report line that is missing or wrong.
 Check the kernel's CET supervisor shadow stacks, x86_64 only
 ([docs/testing.md](../docs/testing.md#cet-shadow-stacks-test-cet) § CET shadow stacks). Boots the
 current sysroot headless twice under KVM with `-cpu host,cet-ss=on,enforce`: the first runs ktest
-to its pass marker and requires the kernel's `shadow stacks: on` line before it; the second, with
+to its pass marker and requires the kernel's `shadow stacks: on` line before it (a kernel that
+logs `shadow stacks: off` instead, which it does on a CPU reporting `CET_SS` without enhanced or
+Automatic IBRS, since it then takes the retpoline sequence, fails the command naming that cause);
+the second, with
 QEMU's gdbstub on a unix socket under `target/xtask/`, sets a hardware breakpoint at
 `syscall::dispatch` once ktest has started, overwrites the return address at the stopped CPU's
 stack pointer, resumes, and requires the kernel's report of `#CP` (vector 21, error code 1) at an

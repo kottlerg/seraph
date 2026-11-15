@@ -190,11 +190,16 @@ the same from any checkout.
 The riscv64 kernel build, and its Clippy pass, also run with `RUSTFLAGS` set,
 to `-Zunstable-options -Zemit-stack-sizes` (`RISCV64_KERNEL_RUSTFLAGS` in
 `xtask/src/commands/build.rs`), so that `-Z emit-stack-sizes` reaches the
-`-Z build-std` crates as well. `RUSTFLAGS` replaces the `[build] rustflags`
-of `.cargo/config.toml` there too: a flag added to that array reaches the
-riscv64 kernel only when it is added to `RISCV64_KERNEL_RUSTFLAGS` as well,
-and a `RUSTFLAGS` set in the calling environment does not reach the
-bootloader or the riscv64 kernel.
+`-Z build-std` crates as well. The x86-64 kernel build and its Clippy pass run
+with `RUSTFLAGS` set to `-Zunstable-options -Zretpoline-external-thunk`
+(`X86_64_KERNEL_RUSTFLAGS`), so that every indirect call and jump of the kernel
+and of its `-Z build-std` crates goes through the kernel's retpoline thunk
+([transient-execution.md](../core/kernel/docs/transient-execution.md)
+§ Controls). `RUSTFLAGS` replaces the `[build] rustflags` of
+`.cargo/config.toml` there too: a flag added to that array reaches a kernel
+only when it is added to `RISCV64_KERNEL_RUSTFLAGS` and
+`X86_64_KERNEL_RUSTFLAGS` as well, and a `RUSTFLAGS` set in the calling
+environment does not reach the bootloader or either kernel.
 
 Custom targets require `-Zbuild-std` (`core,alloc,compiler_builtins` for
 kernel/no_std triples; `core,alloc,std,panic_abort` for std-userspace

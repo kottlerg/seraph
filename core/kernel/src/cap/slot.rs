@@ -913,6 +913,16 @@ mod tests
         assert_eq!(CapTag::EntropyControl as u8, CapType::EntropyControl as u8);
     }
 
+    // Cross-boundary ABI contract: `cap_info(CAP_INFO_TAG_RIGHTS)` returns the
+    // `CapTag` discriminant in bits 32..40, and userspace compares it against
+    // the `CAP_TAG_*` constants of the syscall ABI, so each MUST equal its tag.
+    #[test]
+    fn cap_tag_discriminants_match_syscall_abi_constants()
+    {
+        assert_eq!(CapTag::Memory as u8, syscall::CAP_TAG_MEMORY);
+        assert_eq!(CapTag::Notification as u8, syscall::CAP_TAG_NOTIFICATION);
+    }
+
     #[test]
     fn rights_contains()
     {

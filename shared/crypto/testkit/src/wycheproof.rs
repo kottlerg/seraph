@@ -17,19 +17,18 @@
 //! compares the implementation's verdict on every case with the expected one;
 //! an `acceptable` case is judged by the caller's stated policy, never skipped.
 //!
-//! This module is the only one that parses JSON. A schema for another
-//! algorithm is one more group type here, and a vector file one more
-//! [`Source`]; the files live under `vectors/wycheproof/` (see the crate's
-//! README for their provenance).
+//! A schema for another algorithm is one more group type here, and a vector
+//! file one more [`Source`]; the files live under `vectors/wycheproof/` (see
+//! the crate's README for their provenance).
 
 use std::collections::HashSet;
 use std::fmt;
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Deserializer};
+use json::Value;
 
 use crate::differential::{self, Report};
-use crate::hex;
+use crate::vectors;
+pub use crate::vectors::LoadError;
 
 /// One vendored Wycheproof test file.
 #[derive(Debug, Clone, Copy)]
@@ -58,8 +57,7 @@ pub const CHACHA20_POLY1305: Source = Source {
 };
 
 /// A case's expected result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expected
 {
     /// The implementation must accept the input.
@@ -84,43 +82,17 @@ pub struct TestFile<G>
     pub groups: Vec<G>,
 }
 
-/// Why a test file did not load.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoadError
+impl Expected
 {
-    /// The file is not well-formed for its schema (malformed JSON, a missing
-    /// field, an unknown result, bad hex).
-    Parse(String),
-    /// The file declares another schema than its [`Source`] names.
-    Schema(String),
-    /// A group is of another type than the schema's.
-    GroupType(String),
-    /// The file holds another number of cases than it declares.
-    Count
+    /// The case's `result` member.
+    fn from_json(case: &Value) -> Result<Self, LoadError>
     {
-        /// The declared `numberOfTests`.
-        declared: usize,
-        /// The cases present.
-        found: usize,
-    },
-    /// Two cases share this `tcId`.
-    DuplicateId(u64),
-}
-
-impl fmt::Display for LoadError
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
-    {
-        match self
+        match vectors::string(case, "result")?
         {
-            Self::Parse(why) => write!(f, "malformed test file: {why}"),
-            Self::Schema(found) => write!(f, "unexpected schema {found}"),
-            Self::GroupType(found) => write!(f, "unexpected group type {found}"),
-            Self::Count { declared, found } =>
-            {
-                write!(f, "file declares {declared} cases and holds {found}")
-            }
-            Self::DuplicateId(id) => write!(f, "tcId {id} occurs twice"),
+            "valid" => Ok(Self::Valid),
+            "invalid" => Ok(Self::Invalid),
+            "acceptable" => Ok(Self::Acceptable),
+            other => Err(LoadError::Parse(format!("unknown result {other:?}"))),
         }
     }
 }
@@ -139,26 +111,24 @@ pub trait Case
 }
 
 /// A test group of one schema.
-pub trait Group: DeserializeOwned
+pub trait Group: Sized
 {
     /// The `type` every group of the schema carries.
     const TYPE: &'static str;
     /// The schema's case.
     type Case: Case;
+    /// Read a group of the schema, whatever its `type`, which [`load`]
+    /// checks.
+    ///
+    /// # Errors
+    ///
+    /// [`LoadError::Parse`] for a missing field, a field of another type, an
+    /// unknown result, or bad hex.
+    fn from_json(group: &Value) -> Result<Self, LoadError>;
     /// This group's `type`.
     fn group_type(&self) -> &str;
     /// This group's cases.
     fn cases(&self) -> &[Self::Case];
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RawFile<G>
-{
-    algorithm: String,
-    schema: String,
-    number_of_tests: usize,
-    test_groups: Vec<G>,
 }
 
 /// Load `source` as a file of `G` groups.
@@ -175,14 +145,20 @@ pub fn load<G: Group>(source: &Source) -> Result<TestFile<G>, LoadError>
 
 fn parse<G: Group>(json: &str, schema: &str) -> Result<TestFile<G>, LoadError>
 {
-    let raw: RawFile<G> =
-        serde_json::from_str(json).map_err(|e| LoadError::Parse(e.to_string()))?;
-    if raw.schema != schema
+    let document = vectors::document(json)?;
+    let algorithm = vectors::string(&document, "algorithm")?.to_owned();
+    let declared_schema = vectors::string(&document, "schema")?.to_owned();
+    let number_of_tests = vectors::count(&document, "numberOfTests")?;
+    let groups = vectors::array(&document, "testGroups")?
+        .iter()
+        .map(G::from_json)
+        .collect::<Result<Vec<G>, LoadError>>()?;
+    if declared_schema != schema
     {
-        return Err(LoadError::Schema(raw.schema));
+        return Err(LoadError::Schema(declared_schema));
     }
     let mut ids = HashSet::new();
-    for group in &raw.test_groups
+    for group in &groups
     {
         if group.group_type() != G::TYPE
         {
@@ -196,18 +172,18 @@ fn parse<G: Group>(json: &str, schema: &str) -> Result<TestFile<G>, LoadError>
             }
         }
     }
-    if ids.len() != raw.number_of_tests
+    if ids.len() != number_of_tests
     {
         return Err(LoadError::Count {
-            declared: raw.number_of_tests,
+            declared: number_of_tests,
             found: ids.len(),
         });
     }
     Ok(TestFile {
-        algorithm: raw.algorithm,
-        schema: raw.schema,
-        number_of_tests: raw.number_of_tests,
-        groups: raw.test_groups,
+        algorithm,
+        schema: declared_schema,
+        number_of_tests,
+        groups,
     })
 }
 
@@ -264,24 +240,16 @@ pub fn run<G: Group>(
     )
 }
 
-fn hex_field<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error>
-{
-    let text = String::deserialize(deserializer)?;
-    hex::decode(&text).map_err(|e| serde::de::Error::custom(format!("{e:?} in {text:?}")))
-}
-
 /// The `EddsaVerify` schema (`eddsa_verify_schema_v1.json`): a public key per
 /// group, and a message and signature per case.
 pub mod eddsa
 {
-    use super::{Case as _, Deserialize, Expected, hex_field};
+    use super::{Case as _, Expected, LoadError, Value, vectors};
 
     /// An `EddsaVerify` group.
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[derive(Debug, Clone)]
     pub struct Group
     {
-        #[serde(rename = "type")]
         kind: String,
         /// The group's public key.
         pub public_key: PublicKey,
@@ -290,32 +258,50 @@ pub mod eddsa
     }
 
     /// An `EddsaVerify` group's public key.
-    #[derive(Debug, Clone, Deserialize)]
+    #[derive(Debug, Clone)]
     pub struct PublicKey
     {
         /// The curve (`edwards25519`).
         pub curve: String,
         /// The raw public key.
-        #[serde(deserialize_with = "hex_field")]
         pub pk: Vec<u8>,
     }
 
     /// An `EddsaVerify` case.
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[derive(Debug, Clone)]
     pub struct Case
     {
         tc_id: u64,
         comment: String,
         flags: Vec<String>,
         /// The signed message.
-        #[serde(deserialize_with = "hex_field")]
         pub msg: Vec<u8>,
         /// The signature, of any length: a case may carry a truncated or
         /// extended one.
-        #[serde(deserialize_with = "hex_field")]
         pub sig: Vec<u8>,
         result: Expected,
+    }
+
+    impl Case
+    {
+        fn from_json(case: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                tc_id: vectors::integer(case, "tcId")?,
+                comment: vectors::string(case, "comment")?.to_owned(),
+                flags: vectors::strings(case, "flags")?,
+                msg: vectors::bytes(case, "msg")?,
+                sig: vectors::bytes(case, "sig")?,
+                result: Expected::from_json(case)?,
+            })
+        }
+
+        /// Whether the case carries `flag`.
+        #[must_use]
+        pub fn has_flag(&self, flag: &str) -> bool
+        {
+            self.flags().iter().any(|f| f == flag)
+        }
     }
 
     impl super::Case for Case
@@ -346,6 +332,22 @@ pub mod eddsa
         const TYPE: &'static str = "EddsaVerify";
         type Case = Case;
 
+        fn from_json(group: &Value) -> Result<Self, LoadError>
+        {
+            let key = vectors::field(group, "publicKey")?;
+            Ok(Self {
+                kind: vectors::string(group, "type")?.to_owned(),
+                public_key: PublicKey {
+                    curve: vectors::string(key, "curve")?.to_owned(),
+                    pk: vectors::bytes(key, "pk")?,
+                },
+                tests: vectors::array(group, "tests")?
+                    .iter()
+                    .map(Case::from_json)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
+
         fn group_type(&self) -> &str
         {
             &self.kind
@@ -356,16 +358,6 @@ pub mod eddsa
             &self.tests
         }
     }
-
-    impl Case
-    {
-        /// Whether the case carries `flag`.
-        #[must_use]
-        pub fn has_flag(&self, flag: &str) -> bool
-        {
-            self.flags().iter().any(|f| f == flag)
-        }
-    }
 }
 
 /// The `AeadTest` schema (`aead_test_schema_v1.json`): the key, nonce (`iv`),
@@ -374,14 +366,12 @@ pub mod eddsa
 /// another size than the algorithm's.
 pub mod aead
 {
-    use super::{Deserialize, Expected, hex_field};
+    use super::{Expected, LoadError, Value, vectors};
 
     /// An `AeadTest` group.
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[derive(Debug, Clone)]
     pub struct Group
     {
-        #[serde(rename = "type")]
         kind: String,
         /// The key size of every case, in bits.
         pub key_size: usize,
@@ -394,32 +384,44 @@ pub mod aead
     }
 
     /// An `AeadTest` case.
-    #[derive(Debug, Clone, Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[derive(Debug, Clone)]
     pub struct Case
     {
         tc_id: u64,
         comment: String,
         flags: Vec<String>,
         /// The key.
-        #[serde(deserialize_with = "hex_field")]
         pub key: Vec<u8>,
         /// The nonce, of any length: a case may carry one of another size.
-        #[serde(deserialize_with = "hex_field")]
         pub iv: Vec<u8>,
         /// The associated data.
-        #[serde(deserialize_with = "hex_field")]
         pub aad: Vec<u8>,
         /// The plaintext.
-        #[serde(deserialize_with = "hex_field")]
         pub msg: Vec<u8>,
         /// The ciphertext, as long as the plaintext.
-        #[serde(deserialize_with = "hex_field")]
         pub ct: Vec<u8>,
         /// The tag.
-        #[serde(deserialize_with = "hex_field")]
         pub tag: Vec<u8>,
         result: Expected,
+    }
+
+    impl Case
+    {
+        fn from_json(case: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                tc_id: vectors::integer(case, "tcId")?,
+                comment: vectors::string(case, "comment")?.to_owned(),
+                flags: vectors::strings(case, "flags")?,
+                key: vectors::bytes(case, "key")?,
+                iv: vectors::bytes(case, "iv")?,
+                aad: vectors::bytes(case, "aad")?,
+                msg: vectors::bytes(case, "msg")?,
+                ct: vectors::bytes(case, "ct")?,
+                tag: vectors::bytes(case, "tag")?,
+                result: Expected::from_json(case)?,
+            })
+        }
     }
 
     impl super::Case for Case
@@ -449,6 +451,20 @@ pub mod aead
     {
         const TYPE: &'static str = "AeadTest";
         type Case = Case;
+
+        fn from_json(group: &Value) -> Result<Self, LoadError>
+        {
+            Ok(Self {
+                kind: vectors::string(group, "type")?.to_owned(),
+                key_size: vectors::count(group, "keySize")?,
+                iv_size: vectors::count(group, "ivSize")?,
+                tag_size: vectors::count(group, "tagSize")?,
+                tests: vectors::array(group, "tests")?
+                    .iter()
+                    .map(Case::from_json)
+                    .collect::<Result<_, _>>()?,
+            })
+        }
 
         fn group_type(&self) -> &str
         {

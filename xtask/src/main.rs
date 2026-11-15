@@ -19,11 +19,6 @@
 //! 3. Add a match arm in `main` below.
 //! 4. Re-export the module in `commands/mod.rs`.
 
-#![expect(
-    clippy::multiple_crate_versions,
-    reason = "windows-sys resolves at two versions: 0.59, which xtask's own Windows console \
-              bindings declare, and 0.61, which clap's terminal styling (anstream) pulls in"
-)]
 // `symbolize`, the riscv64 kernel frame check and `compare-images` read ELF,
 // PE and DWARF with the `object`, `addr2line` and `rustc_demangle` crates the
 // pinned toolchain's sysroot ships for std's backtraces, so they have no Cargo

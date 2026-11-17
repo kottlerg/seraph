@@ -2234,8 +2234,8 @@ pub mod process {
         }
 
         /// The `ipc::procmgr_labels::ArgvEnvHeader` the request carries, as its
-        /// data words in wire order (from word 0 for `CREATE_PROCESS`, from
-        /// word 1 for `CREATE_FROM_FILE`).
+        /// data words in wire order, from word
+        /// `ipc::procmgr_labels::CREATE_FIRST_WORD` (1) for either create label.
         #[stable(feature = "seraph_ext", since = "1.0.0")]
         pub fn header_words(&self) -> [u64; ipc::procmgr_labels::ARGV_ENV_HEADER_WORDS] {
             self.header.to_words()

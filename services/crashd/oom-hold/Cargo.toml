@@ -2,10 +2,16 @@
 # Copyright (C) 2026 George Kottler <mail@kottlerg.com>
 
 [package]
-name = "pwrmgr-acpi"
+name = "crashd-oom-hold"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
+
+# no_std pure logic: which faults crashd holds for want of memory, until when,
+# and how each hold ends. Host-tested.
+[lib]
+test = true
+doctest = false
 
 [lints]
 workspace = true

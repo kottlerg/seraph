@@ -404,12 +404,57 @@ serial-only; `scause` and `sstatus` on the console), the riscv64 unknown-interru
 serial-only), and the riscv64 `BUG: ecall return sepc` path (`sepc`, `ra`, `sp`, and `a7`
 serial-only).
 
+## User-mode hardware controls
+
+Some of what user code can execute and read is decided not by a syscall but by control registers
+and MSRs/CSRs: a counter, a key register, an identifier the CPU returns, an instruction set that
+reaches state the kernel does not switch. The boot CPU starts from the firmware's values and each
+secondary CPU from its reset or firmware state, so a control the kernel leaves alone can grant user
+code something the kernel never decided, and differ between CPUs of one machine. The kernel
+therefore programs every control below on every CPU, the boot CPU and each secondary CPU at its
+bring-up, and denies what it does not use. A control the CPU does not implement is skipped: the
+write is gated on the feature's enumeration, or the field is read-only zero, or the bit clears to
+the value it holds. `integration::user_mode_controls`
+([core/ktest/README.md](../../ktest/README.md) Tier 2) checks every control a user-mode thread can
+observe on every checked CPU.
+
+| Control | Value the kernel programs | Where | Why |
+|---|---|---|---|
+| x86-64 `CR4.TSD` | clear | `cpu::enable_smep_smap` | Ring 3 reads the timestamp counter (`RDTSC`, `RDTSCP`), the userspace cycle counter ([docs/capability-model.md](../../../docs/capability-model.md) § Microarchitectural Isolation) |
+| x86-64 `CR4.PCE` | clear | `cpu::enable_smep_smap` | `RDPMC` raises `#GP`; counter access is capability-mediated design intent (#265) |
+| x86-64 `CR4.UMIP` | set where CPUID reports it | `cpu::enable_smep_smap` | `SGDT`, `SIDT`, `SLDT`, `SMSW`, `STR` raise `#GP` (§ Surface inventory) |
+| x86-64 `CR4.FSGSBASE` | clear | `cpu::enable_smep_smap` | Ring 3 changes its GS base only through a selector, so a user GS base is never a kernel-half address, which the paranoid entry relies on |
+| x86-64 `CR4.VME`, `CR4.PVI` | clear | `cpu::enable_smep_smap` | No virtual interrupts: a ring-3 `CLI` or `STI` under `IOPL` 0 raises `#GP` |
+| x86-64 `CR4.KL` | clear | `cpu::enable_smep_smap` | Key Locker instructions raise `#UD`; the kernel neither loads nor switches the wrapping key |
+| x86-64 `CR4.PKE` | clear | `cpu::enable_smep_smap` | `RDPKRU`, `WRPKRU` raise `#UD` and bits \[62:59\] of a user leaf are ignored; `PKRU` is not in the XCR0 set the switch saves |
+| x86-64 `CR4.PKS` | clear | `cpu::enable_smep_smap` | Supervisor keys are the kernel's to assign; the firmware's `IA32_PKRS` would govern the kernel's own key-0 pages |
+| x86-64 `CR4.UINTR` | clear | `cpu::enable_smep_smap` | User-interrupt instructions raise `#UD`; their state is not switched |
+| x86-64 `CR4.OSFXSR`, `OSXMMEXCPT`, `OSXSAVE`; `XCR0` | set; written whole with x87, SSE and AVX | `fpu::enable_xsave` | The v3 extended state, which the XSAVE switch saves and restores exactly |
+| x86-64 `CR0.MP`, `CR0.NE` | set | `fpu::enable_xsave` | `WAIT` under `CR0.TS` raises `#NM`, not running against another thread's x87 state; x87 errors arrive as `#MF` |
+| x86-64 `CR0.EM`, `CR0.AM` | clear | `fpu::enable_xsave` | x87 and SSE execute; `RFLAGS.AC` does not enable alignment checking at CPL 3 |
+| x86-64 `EFER.LMSLE`, `EFER.UAIE` | clear | `syscall::init` | No 64-bit segment-limit checks and no ignored upper address bits on ring-3 accesses |
+| x86-64 `IA32_TSC_AUX` | 0 where CPUID reports `RDTSCP` or `RDPID` | `cpu::set_user_msr_controls` | `RDTSCP` and `RDPID` return 0, the same on every CPU, and nothing the firmware stored |
+| x86-64 CPUID faulting (`MSR_MISC_FEATURES_ENABLES` bits 0 and 1; AMD `HWCR.CpuidUserDis`) | off where the CPU has it | `cpu::set_user_msr_controls` | Ring 3 executes `CPUID` (Rust's runtime feature detection does); bit 1 also denies ring-3 `MONITOR`/`MWAIT` |
+| x86-64 `IA32_U_CET` | 0 where CPUID reports CET | `cpu::set_user_msr_controls` | Ring 3 runs with no shadow stack and no indirect-branch tracking while `CR4.CET` is set for the kernel's own shadow stacks |
+| x86-64 user `RFLAGS.IOPL` | 0: a new user frame starts with it clear and a written frame has it cleared; ring 3 cannot raise it | `TrapFrame`, `TrapFrame::sanitize_for_user_resume` | Port I/O only through the I/O bitmap an `IoPort` capability fills |
+| x86-64 `CR3` linear-address masking (`LAM_U48`, `LAM_U57`) | clear: `CR3` is written whole, the root, the PCID and the no-flush bit | `paging::activate`, `paging::activate_tagged`, `context::switch_and_enter_user` | User pointers are not masked |
+| riscv64 `scounteren` | written whole with `CY` | `interrupts::set_user_counters` | U-mode reads `cycle`; `time`, `instret` and every `hpmcounter` raise an illegal-instruction exception |
+| riscv64 `senvcfg` | written whole with 0, read back, and the boot halts where it did not take | `cpu::disable_unswitched_user_state` | No U-mode cache-block operation (`CBZE`, `CBCFE`, `CBIE`; `cbo.inval` would discard dirty data and expose what memory held below it), pointer masking (`PMM`), landing pads (`LPE`), shadow stack (`SSE`, which also keeps `ssp` from U-mode) or `FIOM` |
+| riscv64 `sstateen0` | written whole with 0, read back, and the boot halts where it did not take | `cpu::disable_unswitched_user_state` | No U-mode state the switch does not save ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § riscv64 Classification) |
+| riscv64 user `sstatus` | `SPIE` alone on a first entry and on a written frame; otherwise the value the trap saved | `context::return_to_user`, `TrapFrame::sanitize_for_user_resume` | U-mode cannot choose `SPP`, `SUM`, `MXR`, `FS` or `VS` |
+
+M-mode controls are the firmware's and S-mode cannot write them: `mcounteren` and `menvcfg`
+bound what `scounteren` and `senvcfg` can grant, and `mseccfg.USEED` decides whether U-mode
+reads the Zkr `seed` CSR, which the kernel does not grant and cannot deny.
+
 ## Maintaining this inventory
 
 When a syscall, IPC field, fault message field, exit reason, or `cap_info` /
 `system_info` selector is added or changed, classify its output here in the same
 change, per the "Cross-Boundary Data Hygiene" rule in
-[docs/coding-standards.md](../../../docs/coding-standards.md). A kernel-minted
+[docs/coding-standards.md](../../../docs/coding-standards.md). When the kernel programs
+a user-mode control, or a CPU feature the kernel admits adds one, list it in § User-mode
+hardware controls in the same change. A kernel-minted
 identifier observed across the boundary is drawn from the entropy root
 (`entropy::next_u32` / `entropy::fill_bytes`); see [entropy.md](entropy.md).
 
@@ -419,6 +464,10 @@ identifier observed across the boundary is drawn from the entropy root
 
 [core/kernel/README.md](../README.md), [Capability Subsystem Internals](capability-internals.md),
 [Kernel Initialization Sequence](initialization.md),
+[Return-Address Integrity](return-address-integrity.md),
 [SMP Scheduling and Locking Invariants](scheduling-internals.md),
+[core/ktest/README.md](../../ktest/README.md),
+[Capability Model](../../../docs/capability-model.md),
 [Console Model](../../../docs/console-model.md),
-[Device Management](../../../docs/device-management.md), [Testing](../../../docs/testing.md)
+[Device Management](../../../docs/device-management.md),
+[Platform Requirements](../../../docs/platform-requirements.md), [Testing](../../../docs/testing.md)

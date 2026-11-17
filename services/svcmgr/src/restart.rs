@@ -10,8 +10,10 @@
 //! service is permanently down (continue, or graceful shutdown). On restart
 //! svcmgr re-creates the process via procmgr, replays the recipe's
 //! argv/env/cwd/seed surfaces, its scheduling fields (`priority`,
-//! `sched_max`), and its log-sink flag, binds the new instance's death
-//! observers before it starts, and serves its bootstrap.
+//! `sched_max`), its create flags (`reserve`, and the node handle an
+//! `oom_stop` service is created with), its log-sink flag and its
+//! debug- and stop-authority caps, binds the new instance's death observers
+//! before it starts, and serves its bootstrap.
 //!
 //! Bootstrap delivery re-resolves the recipe's `seed` caps (the log-sink
 //! service instead gets a round minted from the reserved log-sink sources).
@@ -52,6 +54,11 @@ pub struct CreatedProcess
     pub process_handle: u64,
     pub thread_cap: u64,
     pub child_badge: u64,
+    /// The node handle of the child's budget node, the reply's last cap, when
+    /// the create asked for it (`procmgr_labels::CREATE_NODE_HANDLE`); `0`
+    /// otherwise. The caller releases it on every path that destroys the
+    /// child.
+    pub node_handle: u64,
 }
 
 /// Allocate a fresh bootstrap badge — a random `u64` from the kernel entropy
@@ -107,6 +114,19 @@ pub(crate) fn mint_debug_authority(ctx: &RestartCtx) -> u64
     .unwrap_or(0)
 }
 
+/// Mint a `STOP_AUTHORITY` SEND on svcmgr's own service endpoint for a
+/// `stop_authority` service's bootstrap round. `0` when the derive fails,
+/// and the slot is then absent.
+pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
+{
+    syscall::cap_derive_badge(
+        ctx.service_ep,
+        syscall::RIGHTS_EP_SEND,
+        ipc::svcmgr_labels::STOP_AUTHORITY,
+    )
+    .unwrap_or(0)
+}
+
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
 /// Returns the freshly created (suspended) process, or `None` (each arm
 /// logged) when the argv/env cap cannot be built
@@ -132,11 +152,14 @@ pub(crate) fn mint_debug_authority(ctx: &RestartCtx) -> u64
 /// stored [`RestartRecipe`]. A caller with no recipe (defensive) passes
 /// [`StartupBlobs::default`] for empty surfaces.
 ///
-/// `priority` / `sched_max` are the recipe's scheduling fields (`0` =
-/// unspecified — procmgr applies its defaults against svcmgr's band).
-/// They ride the create label's `CREATE_PRIORITY` / `CREATE_BAND_MAX`
-/// fields; a value above svcmgr's own band ceiling makes procmgr reject
-/// the create with `INVALID_ARGUMENT`.
+/// `label_bits` are the create label's fields beyond the opcode and
+/// `CREATE_ARGV_ENV`, which [`create_label_bits`] builds from the recipe:
+/// its scheduling fields, whose values above svcmgr's own band ceiling make
+/// procmgr reject the create with `INVALID_ARGUMENT`, and its create flags
+/// (`svcmgr_defs::create_flags`). With `CREATE_NODE_HANDLE` among them the
+/// reply's last cap is the child's node handle, returned in
+/// [`CreatedProcess::node_handle`]; a reply without it is logged and the
+/// child runs with none.
 #[expect(
     clippy::large_stack_frames,
     reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each) and the builder's copy; on \
@@ -145,8 +168,7 @@ pub(crate) fn mint_debug_authority(ctx: &RestartCtx) -> u64
 pub fn walk_and_create_from_file(
     path: &str,
     blobs: StartupBlobs<'_>,
-    priority: u8,
-    sched_max: u8,
+    label_bits: u64,
     procmgr_ep: u64,
     bootstrap_ep: u64,
     ipc_buf: *mut u64,
@@ -199,9 +221,7 @@ pub fn walk_and_create_from_file(
     {
         0
     };
-    let label = procmgr_labels::CREATE_FROM_FILE
-        | procmgr_labels::create_sched_bits(priority, sched_max)
-        | argv_env_flag;
+    let label = procmgr_labels::CREATE_FROM_FILE | label_bits | argv_env_flag;
 
     // Caps: [file_cap, badged_creator, argv_env?]; the header rides in data
     // words 1..5, after `file_size`.
@@ -260,7 +280,45 @@ pub fn walk_and_create_from_file(
         process_handle,
         thread_cap,
         child_badge,
+        node_handle: reply_node_handle(path, label_bits, reply_caps),
     })
+}
+
+/// The node handle a create reply carries as its last cap, after the process
+/// handle and the thread, when `label_bits` asked for one
+/// (`CREATE_NODE_HANDLE`); `0` when it did not, or when the reply carries
+/// none, which is logged.
+fn reply_node_handle(path: &str, label_bits: u64, reply_caps: &[u64]) -> u64
+{
+    if label_bits & procmgr_labels::CREATE_NODE_HANDLE == 0
+    {
+        return 0;
+    }
+    let handle = reply_caps
+        .get(2..)
+        .and_then(<[u64]>::last)
+        .copied()
+        .unwrap_or(0);
+    if handle == 0
+    {
+        std::os::seraph::log!(warn: "create: {path:?} reply carries no node handle");
+    }
+    handle
+}
+
+/// The create label's fields beyond the opcode and `CREATE_ARGV_ENV` for a
+/// recipe: its scheduling fields (`priority` and `sched_max`, `0` for
+/// unspecified, when procmgr applies its defaults against svcmgr's band) and
+/// the create flags its `reserve` and `oom_stop` keys ask for
+/// (`svcmgr_defs::create_flags`). Shared by the launch and restart paths.
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`reserve` and `oom_stop` are the recipe's keys of those names"
+)]
+pub(crate) fn create_label_bits(priority: u8, sched_max: u8, reserve: bool, oom_stop: bool) -> u64
+{
+    procmgr_labels::create_sched_bits(priority, sched_max)
+        | svcmgr_defs::create_flags(reserve, oom_stop)
 }
 
 /// Send `START_PROCESS` via the badged process handle. Shared by the
@@ -283,6 +341,9 @@ pub fn start_process(process_handle: u64, ipc_buf: *mut u64) -> bool
 pub struct RestartCtx
 {
     pub procmgr_ep: u64,
+    /// svcmgr's own service endpoint, from which it mints a
+    /// `stop_authority = yes` service's `STOP_AUTHORITY` SEND.
+    pub service_ep: u64,
     pub bootstrap_ep: u64,
     pub ipc_buf: *mut u64,
     /// The death-notification queues. A restarted service's observers are
@@ -503,9 +564,14 @@ fn restart_process(
         let _ = syscall::cap_delete(svc.process_handle);
         svc.process_handle = 0;
     }
-    // Release svcmgr's references to the dead instance: its exited thread and,
-    // for an instance init created by raw syscalls, its address space.
-    for cap in [&mut svc.thread_cap, &mut svc.aspace_cap]
+    // Release svcmgr's references to the dead instance: its exited thread,
+    // for an instance init created by raw syscalls its address space, and the
+    // node handle of its budget node, which memmgr refuses once it is gone.
+    for cap in [
+        &mut svc.thread_cap,
+        &mut svc.aspace_cap,
+        &mut svc.node_handle,
+    ]
     {
         if *cap != 0
         {
@@ -514,7 +580,12 @@ fn restart_process(
         }
     }
 
-    let Some((process_handle, new_thread_cap, child_badge)) = create_process(svc, recipe, ctx)
+    let Some(CreatedProcess {
+        process_handle,
+        thread_cap: new_thread_cap,
+        child_badge,
+        node_handle,
+    }) = create_process(svc, recipe, ctx)
     else
     {
         return false;
@@ -526,17 +597,21 @@ fn restart_process(
     {
         std::os::seraph::log!(warn: "failed to bind the new instance's death observers");
         destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        delete_caps(&[node_handle]);
         return false;
     }
     svc.process_handle = process_handle;
     svc.thread_cap = new_thread_cap;
+    svc.node_handle = node_handle;
     svc.instance = instance;
     // The entry names the new instance from here; a failure below destroys it
     // and leaves the entry holding none.
     let fail = |svc: &mut ServiceEntry| {
         destroy_partial_child(process_handle, new_thread_cap, ctx.ipc_buf);
+        delete_caps(&[node_handle]);
         svc.process_handle = 0;
         svc.thread_cap = 0;
+        svc.node_handle = 0;
         false
     };
 
@@ -609,6 +684,11 @@ fn restart_boot_caps(
     {
         restart_caps.push(mint_debug_authority(ctx));
     }
+    // A stop-authority holder's cap rides the slot after those.
+    if matches!(recipe, Some(r) if r.stop_authority)
+    {
+        restart_caps.push(mint_stop_authority(ctx));
+    }
 
     let provided_recv = if svc.provided_endpoint != 0
     {
@@ -629,14 +709,15 @@ fn restart_boot_caps(
 }
 
 /// Spawn a fresh instance of `svc` via procmgr from its recorded
-/// `vfs_path` ([`walk_and_create_from_file`]). After create, applies the
-/// per-service namespace policy recorded at registration via
-/// `CONFIGURE_NAMESPACE`. Returns `(process_handle, thread, child_badge)`.
+/// `vfs_path` ([`walk_and_create_from_file`]), with the recipe's create
+/// flags. After create, applies the per-service namespace policy recorded at
+/// registration via `CONFIGURE_NAMESPACE`; on its failure the child is
+/// destroyed and its node handle released.
 fn create_process(
     svc: &ServiceEntry,
     recipe: Option<&RestartRecipe>,
     ctx: &RestartCtx,
-) -> Option<(u64, u64, u64)>
+) -> Option<CreatedProcess>
 {
     if svc.vfs_path.is_empty()
     {
@@ -655,11 +736,13 @@ fn create_process(
         env: &env_blob,
         env_count,
     };
+    let label_bits = recipe.map_or(0, |r| {
+        create_label_bits(r.priority, r.sched_max, r.reserve, r.oom_stop)
+    });
     let created = walk_and_create_from_file(
         path_str,
         blobs,
-        recipe.map_or(0, |r| r.priority),
-        recipe.map_or(0, |r| r.sched_max),
+        label_bits,
         ctx.procmgr_ep,
         ctx.bootstrap_ep,
         ctx.ipc_buf,
@@ -668,14 +751,11 @@ fn create_process(
     let cwd = recipe.and_then(|r| r.cwd.as_deref());
     if !apply_namespace_policy(svc, cwd, created.process_handle, created.thread_cap, ctx)
     {
+        delete_caps(&[created.node_handle]);
         return None;
     }
 
-    Some((
-        created.process_handle,
-        created.thread_cap,
-        created.child_badge,
-    ))
+    Some(created)
 }
 
 /// Apply the namespace policy recorded on `svc` to a freshly-created

@@ -79,6 +79,13 @@ jobs:
         with:
           shared-key: burnin-${{ matrix.arch }}-${{ matrix.profile }}
 
+      - name: Place the signing keys outside the checkout
+        # The job's first build generates a local root and a signing key in
+        # the runner's temporary directory, which the runner discards with the
+        # job (docs/signing.md § Signing). A job-level env cannot read the
+        # runner context, so the path is set for the later steps here.
+        run: echo "SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing" >> "$GITHUB_ENV"
+
       - name: Build (${{ matrix.arch }}, ${{ matrix.profile }})
         run: |
           if [ "${{ matrix.profile }}" = "release" ]; then

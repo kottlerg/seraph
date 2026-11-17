@@ -66,7 +66,9 @@ process creation to procmgr IPC.
   init-logd self-terminates (see [Handover](#handover) and the
   [logd handover protocol](../../logd/docs/handover-protocol.md)).
 - Read the log-level configuration from the `log-levels` boot module
-  (`log_levels::read`, `../src/log_levels.rs`; see [Log levels](#log-levels)).
+  (`log_levels::read`, `../src/log_levels.rs`; see [Log levels](#log-levels)), taking its body
+  through `init_log_levels::parse_module` (`objsig::split`, parse-only); a module whose trailer
+  does not parse is logged and sets no level.
 - Bootstrap memmgr via raw `cap_create_aspace` / `cap_create_cspace`
   / `cap_create_thread`, ELF-load it from the `memmgr` bundle
   entry, prepare its `ProcessInfo` page, and configure its main
@@ -99,8 +101,12 @@ process creation to procmgr IPC.
   owner; those donate to memmgr's pool on the reap-handoff route, not
   here (`../src/main.rs`).
 - Start procmgr's thread and serve procmgr's bootstrap IPC, handing
-  it the log endpoint SEND and svcmgr's service endpoint SEND
-  (`bootstrap::start_procmgr`, `../src/main.rs`).
+  it the log endpoint SEND and svcmgr's service endpoint SEND and, when init holds the
+  `trust-store` boot module, a map-only (`RIGHTS_MEM_MAP`) derivation of its cap as `caps[3]` with
+  the store's length in bytes as `data[0]`. procmgr maps it read-only, copies the store, unmaps
+  and deletes the cap, parses it once (logging the anchor count and security floor) and keeps it
+  for its life; a store absent or unparseable makes procmgr exit at startup, so it creates no
+  process (`bootstrap::start_procmgr`, `../src/main.rs`).
 - Request procmgr to create devmgr via boot-module
   `CREATE_PROCESS` (phys-class, `CREATE_PHYS_ACCESS`, so its grants keep the
   Memory `Phys` right) and serve devmgr's multi-round bootstrap
@@ -268,7 +274,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except `devmgr.bind`'s
   `SEND|GRANT`.
 
-  `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
+  `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`, and `timed` are published by
   svcmgr's provider path on each provider's launch (see
   [`provides`](../../svcmgr/docs/service-definitions.md#provides)). Name constants are
   centralised in `ipc::published_names`.
@@ -276,7 +282,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   and `pwrmgr` are svcmgr-launched providers (`timed.svc` / `pwrmgr.svc`),
   brought up post-handover; each resolves its authority from devmgr at
   startup (`QUERY_DEVICE` on the rtc class SEND for [timed](../../timed/README.md);
-  `QUERY_ACPI_TABLE` + `QUERY_SHUTDOWN_DEVICE` for
+  `QUERY_SHUTDOWN_DEVICE` on RISC-V, acpid's `SLEEP` / `RESET` on x86-64, for
   [pwrmgr](../../pwrmgr/README.md)). The RTC chip driver (cmos-rtc on
   x86-64, goldfish-rtc on RISC-V) is spawned by devmgr from
   `/services/drivers/<chip>` after svcmgr's `SET_DRIVERS_DIR` handshake
@@ -436,8 +442,8 @@ enumerates init's side of it.
 | Stage | Recipient | Authority transferred |
 |---|---|---|
 | Raw bootstrap | memmgr | RAM `Memory` cap pool (every Memory cap not consumed by init/procmgr setup) |
-| Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, boot-module `Memory` caps for downstream `CREATE_PROCESS` |
-| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; cap-less rounds with the physical extent of every Memory cap init holds but the firmware tables' (usable RAM, boot modules, reclaim ranges, init's own segment, stack, and `InitInfo` pages), the RAM memmgr pools now or at init's reap; `MODULE` rounds of up to four Memory caps, a copy of every boot module outside init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels), untagged, with each module's size in bytes: the driver images and any platform description table; a full-rights `IoPort` derivation (x86-64) or an `SbiControl` derivation narrowed to Reset and Suspend (RISC-V) via the terminal `SVCMGR_BUNDLE` round, the roots staying with init — the hardware + shutdown authority [devmgr](../../devmgr/docs/responsibilities.md#capabilities-received) brokers to drivers and to pwrmgr |
+| Raw bootstrap | procmgr | memmgr SEND cap, log endpoint SEND, svcmgr service endpoint SEND, a map-only `trust-store` boot-module cap (with the store's length), boot-module `Memory` caps for downstream `CREATE_PROCESS` |
+| Raw bootstrap | devmgr | MMIO apertures, Interrupt range, ACPI/DTB Memory caps; cap-less rounds with the physical extent of every Memory cap init holds but the firmware tables' (usable RAM, boot modules, reclaim ranges, init's own segment, stack, and `InitInfo` pages), the RAM memmgr pools now or at init's reap; `MODULE` rounds of up to four Memory caps, a copy of every boot module outside init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels, trust-store), untagged, with each module's size in bytes: the driver images and any platform description table; a full-rights `IoPort` derivation (x86-64) or an `SbiControl` derivation narrowed to Reset and Suspend (RISC-V) via the terminal `SVCMGR_BUNDLE` round, the roots staying with init — the hardware + shutdown authority [devmgr](../../devmgr/docs/responsibilities.md#capabilities-received) brokers to drivers and to pwrmgr |
 | Raw bootstrap | vfsd | Round 1: a full-rights copy of vfsd's own service endpoint and the `block` class SEND, which init requests from devmgr with `MINT_CLASS_SEND`, and on which devmgr serves the whole-disk cap (`QUERY_DEVICE`; the only other `block` class SEND is svcmgr's seed-only `devmgr.class.block` publication, which no shipped definition seeds); round 2: the fatfs module `Memory` cap. Init keeps a `SEED_AUTHORITY`-badged SEND on vfsd's endpoint for its own `GET_SYSTEM_ROOT_CAP` call. vfsd self-mounts root, so init issues no `MOUNT` and keeps no FS access of its own. |
 | Handover | svcmgr | `Universal` namespace seed (full `system_root_cap`) installed via `procmgr_labels::CONFIGURE_NAMESPACE` before `START_PROCESS`; then the handover endowment over the bootstrap protocol — the `CAPS` rounds: full-rights (`RIGHTS_ALL`, incl. RECV) caps on its own service + bootstrap endpoints, a `SEND` on vfsd's synthetic root derived from `system_root_cap` (svcmgr publishes as `rootfs.root`) and a badge-0 `SEND\|GRANT` source on `devmgr_registry_ep` (svcmgr mints the `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind` publish caps, the `MINT_CLASS_SEND` cap, and the `SET_DRIVERS_DIR` cap), and a `MOUNT_AUTHORITY`-badged, a `DENY_BADGE`-badged and a `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint (svcmgr publishes as `vfsd.mount`, `vfsd.deny` and `vfsd.swap`); then the `SUBSTRATE` rounds: one `(name, thread_cap, observer)` per substrate service for death-supervision binding (the observer a Control-only address-space cap for memmgr and procmgr, the process handle for devmgr and vfsd); terminal round (`LOGD_SOURCES`): a `RIGHTS_ALL` master-log endpoint source and a badge-0 `SEND\|GRANT` procmgr source, both reserved for the system's lifetime so svcmgr can launch and supervise real-logd, minting its master-log RECV, first-launch `HANDOVER_PULL` SEND, and `DEATH_EQ_AUTHORITY` `SEND\|GRANT` cap per launch, restart included, minting from the master-log source the `LOG_QUERY_AUTHORITY` SEND it publishes as `logd.query`, and minting from the procmgr source a `debug_authority = yes` service's `DEBUG_AUTHORITY` `SEND\|GRANT` cap per launch. svcmgr publishes all well-known names itself, configures devmgr's device classes and publishes each class SEND as `devmgr.class.<stem>`, sends `SET_DRIVERS_DIR` from these sources, and launches real-logd; init publishes nothing and does not talk to devmgr (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)). |
 | Reap | procmgr | Init's `AddressSpace`, `CSpace`, main `Thread`, init-logd `Thread`, every reclaimable Memory cap it solely owns (ELF segments, user stack, `InitInfo` pages, bootloader/bundle reclaim ranges, AP-trampoline memory cap, boot-module sources, the log-level env page) |

@@ -8,7 +8,9 @@
 //! that it reached its fault and died of it: a non-clean exit whose reason
 //! is a fault class, so the crash service's decline ended the thread as the
 //! kernel would have. It also runs `registry-declare`, which faults on
-//! nothing, and checks that it passed. The report block each
+//! nothing, and checks that it passed, and `oom-touch` beside `oom-fill`,
+//! which checks the crash service's hold of a fault memmgr declined for want
+//! of memory ([`check_oom_hold`]). The report block each
 //! death leaves in the log is checked host-side, from the boot's serial log,
 //! by `cargo xtask test-crash-report` (docs/testing.md § Crash reports).
 //!
@@ -30,8 +32,9 @@
 )]
 
 use std::collections::BTreeSet;
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 /// Base exit reason for a fault-induced death (`abi/syscall`
 /// `EXIT_FAULT_BASE`); faults occupy `[EXIT_FAULT_BASE, EXIT_KILLED)`.
@@ -322,11 +325,221 @@ fn check_declare()
     }
 }
 
+/// The stall the usertest boot's crash service holds a fault for
+/// (`CRASHD_OOM_STALL_MS` in rootfs/config/svcmgr/tests/crashd.svc).
+const STALL_MS: u64 = 3000;
+/// How long the filler keeps the pool full after `full` for the fault that
+/// resumes: well inside [`STALL_MS`].
+const RESUME_FILL_MS: u64 = 1000;
+/// How long a fault that resumes was held at least: half of
+/// [`RESUME_FILL_MS`], the rest being the filler's tick and the tester's
+/// write after `full`.
+const RESUME_HELD_MIN_MS: u128 = 500;
+/// How long the filler keeps the pool full after `full` for the fault that
+/// times out: past [`STALL_MS`], by enough for the crash service to see the
+/// deadline pass first.
+const TIMEOUT_FILL_MS: u64 = STALL_MS + 1500;
+/// How long a fault that times out was held at least, from the write.
+const TIMEOUT_HELD_MIN_MS: u128 = 1000;
+/// How long the tester waits for either fixture to exit.
+const OOM_WAIT: Duration = Duration::from_secs(30);
+/// Bytes of stack the tester touches before a window, below its frame.
+const STACK_TOUCH_BYTES: usize = 16 * 1024;
+
+/// One `oom-touch` fixture, between its `ready` and its write.
+struct Toucher
+{
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    line: String,
+}
+
+/// Start `/programs/crashme oom-touch` and wait for its `ready`.
+fn start_toucher() -> Toucher
+{
+    let mut child = Command::new("/programs/crashme")
+        .arg("oom-touch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn /programs/crashme oom-touch");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::with_capacity(256);
+    stdin.write_all(b"start\n").expect("write to oom-touch");
+    stdout.read_line(&mut line).expect("read oom-touch stdout");
+    if line.trim() != "ready"
+    {
+        fail(&format!("oom-touch: expected ready, read {line:?}"));
+    }
+    line.clear();
+    Toucher {
+        child,
+        stdin,
+        stdout,
+        line,
+    }
+}
+
+/// Start `/programs/crashme oom-fill <hold_ms>` and wait for its `full`: the
+/// pool is then full up to the reserve, and memmgr declines a demand fault of
+/// any process outside it.
+#[expect(
+    clippy::zombie_processes,
+    reason = "the child is returned at `full`, and the caller waits on it (`wait_bounded`)"
+)]
+fn start_filler(hold_ms: u64) -> Child
+{
+    let mut child = Command::new("/programs/crashme")
+        .arg("oom-fill")
+        .arg(hold_ms.to_string())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn /programs/crashme oom-fill");
+    let mut stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let mut line = String::new();
+    loop
+    {
+        line.clear();
+        if stdout.read_line(&mut line).expect("read oom-fill stdout") == 0
+        {
+            let status = wait_bounded(&mut child, "oom-fill");
+            fail(&format!("oom-fill: exited before full: {status}"));
+        }
+        if line.trim() == "full"
+        {
+            return child;
+        }
+    }
+}
+
+/// Wait for `child` up to [`OOM_WAIT`], killing it and failing past that.
+fn wait_bounded(child: &mut Child, what: &str) -> ExitStatus
+{
+    let start = Instant::now();
+    loop
+    {
+        if let Some(status) = child.try_wait().expect("try_wait")
+        {
+            return status;
+        }
+        if start.elapsed() > OOM_WAIT
+        {
+            let _ = child.kill();
+            fail(&format!("{what}: still running after {OOM_WAIT:?}"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Touch [`STACK_TOUCH_BYTES`] of the stack below this frame, so the window
+/// faults no new stack page of the tester.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the frame is the touch: its array is the stack the window may use, written once before it"
+)]
+fn touch_stack()
+{
+    let mut probe = [0u8; STACK_TOUCH_BYTES];
+    std::hint::black_box(&mut probe);
+}
+
+/// The crash service's hold of a fault memmgr declined for want of memory
+/// (services/crashd/docs/operation.md § Hold). A fixture writes a demand page
+/// while a filler keeps the pool full up to the reserve: when the filler gives
+/// it back within the stall, the write completes and the fixture prints how
+/// long it was held; when it holds the pool past the stall, the hold times
+/// out and the fixture dies of the fault, with no core written, since memory
+/// was still critical.
+///
+/// Between the filler's `full` and its exit the tester allocates nothing and
+/// touches no new stack page, since a fault of its own would be held too.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "ExitStatus::code() is i32, but exit reasons are non-negative (fault 0x1000+vector); \
+              the u64 cast preserves the value"
+)]
+fn check_oom_hold()
+{
+    // A fault the hold resumes.
+    let mut toucher = start_toucher();
+    touch_stack();
+    let mut filler = start_filler(RESUME_FILL_MS);
+    toucher
+        .stdin
+        .write_all(b"go\n")
+        .expect("write to oom-touch");
+    // The fixture prints its line when the write completes, or dies of the
+    // fault and closes its stdout when the hold times out.
+    toucher
+        .stdout
+        .read_line(&mut toucher.line)
+        .expect("read oom-touch stdout");
+    let status = wait_bounded(&mut toucher.child, "oom-touch (resume)");
+    let fill = wait_bounded(&mut filler, "oom-fill (resume)");
+    if !fill.success()
+    {
+        fail(&format!("oom-fill (resume): {fill}"));
+    }
+    let held = toucher
+        .line
+        .trim()
+        .strip_prefix("touched held_ms=")
+        .and_then(|ms| ms.parse::<u128>().ok());
+    match held
+    {
+        Some(ms) if status.success() && ms >= RESUME_HELD_MIN_MS =>
+        {}
+        _ => fail(&format!(
+            "oom-touch (resume): {status}, {:?}: the write was not held and resumed",
+            toucher.line
+        )),
+    }
+
+    // A fault the hold times out on.
+    let before = cores();
+    let mut toucher = start_toucher();
+    touch_stack();
+    let mut filler = start_filler(TIMEOUT_FILL_MS);
+    toucher
+        .stdin
+        .write_all(b"go\n")
+        .expect("write to oom-touch");
+    let start = Instant::now();
+    let status = wait_bounded(&mut toucher.child, "oom-touch (timeout)");
+    let died_after = start.elapsed().as_millis();
+    let fill = wait_bounded(&mut filler, "oom-fill (timeout)");
+    if !fill.success()
+    {
+        fail(&format!("oom-fill (timeout): {fill}"));
+    }
+    let reason = status.code().map(|code| code as u64);
+    if status.success()
+        || !reason.is_some_and(|r| (EXIT_FAULT_BASE..EXIT_KILLED).contains(&r))
+        || died_after < TIMEOUT_HELD_MIN_MS
+    {
+        fail(&format!(
+            "oom-touch (timeout): {status} after {died_after} ms: the fault was not held and \
+             declined"
+        ));
+    }
+    let new: Vec<String> = cores().difference(&before).cloned().collect();
+    if !new.is_empty()
+    {
+        fail(&format!(
+            "oom-touch (timeout): a core was written while memory was critical: {new:?}"
+        ));
+    }
+}
+
 fn main()
 {
     check("vm");
     check("exception");
     check("worker");
     check_declare();
+    check_oom_hold();
     println!("[crashme-tester] PASS");
 }

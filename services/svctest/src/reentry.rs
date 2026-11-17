@@ -16,7 +16,9 @@
 //! and of one whose open reply it cannot deliver, memmgr's hold on a dead
 //! child's frame that a live kernel object still occupies, memmgr's hold
 //! of a child to the memory max its creator set, its commitment of a heap's
-//! growth, and what a mapped cache page reads across a forced unmount.
+//! growth, and what a mapped cache page reads across a forced unmount. The
+//! `reboot` role is the one not spawned by a phase: svcmgr launches it from
+//! the `reboot` test recipe `cargo xtask test-reboot` stages.
 //! The child-mode function for each role lives in the phase module that
 //! spawns it; `dispatch` consults each module's `reentry_main(role)` so a
 //! new role is registered alongside its phase, not in a central switch.
@@ -46,4 +48,5 @@ pub fn dispatch(role: &str)
     phases::node_handle::reentry_main(role);
     phases::heap_commit::reentry_main(role);
     phases::unmount::reentry_main(role);
+    phases::pwrmgr::reentry_main(role);
 }

@@ -15,7 +15,8 @@ count as a failure.
 
 A second role, selected by argv `crasher worker-fault`, checks that svcmgr routes the fault of a
 thread other than the main thread. Its recipe, `rootfs/config/svcmgr/tests/crasher-worker.svc`
-(`restart = on_failure`, `critical = no`, `namespace = none`, `provides = crasher.worker`), is
+(`restart = on_failure`, `critical = no`, `namespace = none`, `provides = crasher.worker`,
+`oom_stop = yes`), is
 co-staged with `svctest` wherever `crasher.svc` is. The role takes the provided name's service
 endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
 `ipc::restart_probe_labels`: `PROBE_INSTANCE` replies a per-instance random nonce in word 0, and
@@ -23,7 +24,9 @@ endpoint from bootstrap slot 0, logs `worker-fault: serving`, and serves
 fault after `FAULT_DELAY_MS` (200 ms), logging `worker-fault: worker thread faulting`. procmgr
 tears the process down, and svcmgr restarts it through its address-space observer; svctest's
 `svcmgr_worker_fault_restart` phase, which runs when this recipe is staged, reads a new nonce from
-the restarted instance. A role that
+the restarted instance. `oom_stop = yes` makes it the one service of that boot a stop-authority
+holder may stop: svctest's `svcmgr_stop_service` phase lists it, has svcmgr stop it, and reads the
+restarted instance's nonce the same way. A role that
 lacks its endpoint or nonce, or cannot start the worker, logs `FATAL: worker-fault: ...`.
 
 ---

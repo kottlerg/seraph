@@ -1,0 +1,610 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// services/acpid/src/server.rs
+
+//! acpid's service once start-up is done (services/acpid/docs/startup.md
+//! § Threads): the evaluation thread's work loop, the receivers that serve
+//! the requests of `ipc::acpid_labels` on acpid's service endpoint, and the
+//! event thread that takes the SCI.
+//!
+//! The evaluation thread owns the namespace, so every evaluation runs on
+//! it, in turn: it takes [`Work`] from a channel (a power request a
+//! receiver forwards, a GPE the event thread found, or the power button to
+//! enable again once its press was delivered) and blocks on nothing else.
+//! The event thread blocks on the SCI's notification alone: on each SCI it
+//! disables what fired ([`events::scan`]), hands it on, and acknowledges
+//! the interrupt; it runs no AML and makes no IPC. Each receiver blocks in
+//! `ipc_recv`, on the evaluation thread's answer to a request it forwarded,
+//! or, for `WAIT_EVENT`, on the event mailbox. At most one `WAIT_EVENT`
+//! waits at a time, a later one taking its place, so the other receiver is
+//! free for `SLEEP` and `RESET`.
+
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+
+use acpid::events::{self, Fired, Handled, Handler, Layout, Start};
+use acpid::power::{self, Request};
+use aml::{Evaluator, Namespace};
+use ipc::{IpcMessage, acpid_errors, acpid_labels};
+
+use crate::arch::current::{Events, Ports, Power};
+use crate::platform::Platform;
+
+/// The receiver threads on acpid's endpoint (`docs/limits.md`): one can
+/// hold a `WAIT_EVENT` while the other serves `SLEEP` and `RESET`.
+const RECEIVERS: usize = 2;
+
+/// Work for the evaluation thread.
+enum Work
+{
+    /// Run the method of the GPE, which fired and is disabled.
+    Gpe(u16),
+    /// A power request a receiver forwards, and where its status goes.
+    Power(Request, SyncSender<u64>),
+    /// A power-button press was delivered: clear it and enable the button.
+    Rearm,
+}
+
+/// A thread whose end ends acpid: its drop, on return or in a panic's
+/// unwind, tells `main`, which exits so that svcmgr restarts acpid.
+pub struct Watched
+{
+    name: &'static str,
+    ended: Sender<&'static str>,
+}
+
+impl Watched
+{
+    /// The thread `name`, whose end is sent on `ended`.
+    pub const fn new(name: &'static str, ended: Sender<&'static str>) -> Self
+    {
+        Self { name, ended }
+    }
+}
+
+impl Drop for Watched
+{
+    fn drop(&mut self)
+    {
+        let _ = self.ended.send(self.name);
+    }
+}
+
+/// The event mailbox: the power button is posted to it, and `WAIT_EVENT`
+/// waits on it.
+struct Mailbox
+{
+    mail: Mutex<Mail>,
+    changed: Condvar,
+}
+
+struct Mail
+{
+    /// Whether there is an event to wait for: the SCI is taken and the
+    /// fixed power button enabled. `WAIT_EVENT` replies `NO_DEVICE`
+    /// otherwise.
+    waitable: bool,
+    /// The events not yet delivered, a mask of `acpid_labels::EVENT_*`.
+    pending: u64,
+    /// The number of the latest `WAIT_EVENT`; an earlier one sees it change
+    /// and is superseded.
+    waiter: u64,
+}
+
+impl Mailbox
+{
+    fn lock(&self) -> MutexGuard<'_, Mail>
+    {
+        self.mail.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Post `events` and wake the waiting `WAIT_EVENT`.
+    fn post(&self, events: u64)
+    {
+        self.lock().pending |= events;
+        self.changed.notify_all();
+    }
+}
+
+/// The events start-up acquired: the event blocks and the SCI, and whether
+/// the FADT declares the fixed power button.
+pub struct EventSource
+{
+    /// The event blocks and the SCI.
+    pub events: Events,
+    /// Whether the FADT declares the fixed power button
+    /// ([`events::fixed_power_button`]).
+    pub power_button: bool,
+}
+
+/// What the evaluation thread holds of the events once they are armed.
+struct Armed
+{
+    layout: Layout,
+    regs: Arc<Mutex<Ports>>,
+    handlers: Vec<Handler>,
+}
+
+/// Arm the events, start the receivers on `service`, and run the evaluation
+/// thread's work loop for acpid's lifetime: `ns` is the namespace start-up
+/// loaded, `None` when the DSDT could not be; `platform` the evaluator's
+/// host; `power` the sleep and reset registers; `events` what start-up
+/// acquired of the events; `ended` where each watched thread's end is sent.
+pub fn serve(
+    service: u64,
+    mut ns: Option<&mut Namespace>,
+    platform: &mut Platform<'_>,
+    power: &Power,
+    events: Option<EventSource>,
+    ended: &Sender<&'static str>,
+) -> !
+{
+    let (work, jobs) = mpsc::channel();
+    let mailbox = Arc::new(Mailbox {
+        mail: Mutex::new(Mail {
+            waitable: false,
+            pending: 0,
+            waiter: 0,
+        }),
+        changed: Condvar::new(),
+    });
+    let armed = events.and_then(|source| arm(source, ns.as_deref(), &mailbox, &work, ended));
+    for _ in 0..RECEIVERS
+    {
+        let (mailbox, work, ended) = (Arc::clone(&mailbox), work.clone(), ended.clone());
+        let spawned = std::thread::Builder::new()
+            .name("acpid-recv".into())
+            .spawn(move || {
+                let _watched = Watched::new("receiver", ended);
+                receive(service, &mailbox, &work);
+            });
+        if let Err(e) = spawned
+        {
+            // A request would wait unanswered behind a held `WAIT_EVENT`, as
+            // when a receiver ends: exit, and svcmgr restarts acpid.
+            std::os::seraph::log!(error: "receiver not spawned: {e}; exiting");
+            syscall::process_exit(1);
+        }
+    }
+    loop
+    {
+        // `work`, a sender, lives in this frame, so the receive does not
+        // fail.
+        let Ok(job) = jobs.recv()
+        else
+        {
+            std::os::seraph::log!(error: "the work channel closed; exiting");
+            syscall::process_exit(1);
+        };
+        match job
+        {
+            Work::Power(request, status) =>
+            {
+                let code = match request
+                {
+                    Request::Sleep(state) => sleep(state, ns.as_deref_mut(), platform, power),
+                    Request::Reset => reset(power),
+                    Request::WaitEvent => acpid_errors::INVALID_REQUEST,
+                };
+                let _ = status.send(code);
+            }
+            Work::Gpe(gpe) =>
+            {
+                if let Some(armed) = &armed
+                {
+                    dispatch(gpe, armed, ns.as_deref_mut(), platform);
+                }
+            }
+            Work::Rearm =>
+            {
+                if let Some(armed) = &armed
+                {
+                    events::rearm_power_button(&mut *lock(&armed.regs), &armed.layout);
+                }
+            }
+        }
+    }
+}
+
+/// Lock the event registers.
+fn lock(regs: &Mutex<Ports>) -> MutexGuard<'_, Ports>
+{
+    regs.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Arm the events of `source`: start the event thread, which binds the
+/// blocks to itself and registers the SCI, then set the enables
+/// ([`events::arm`]), hand on the events already pending, and let the
+/// event thread take the SCI. The GPEs handled are each `\_GPE` method of
+/// `ns`. `None`, logged, when the event thread cannot start; nothing is
+/// then enabled.
+fn arm(
+    source: EventSource,
+    ns: Option<&Namespace>,
+    mailbox: &Arc<Mailbox>,
+    work: &Sender<Work>,
+    ended: &Sender<&'static str>,
+) -> Option<Armed>
+{
+    let EventSource {
+        events,
+        power_button,
+    } = source;
+    let layout = events.layout();
+    let (handlers, ignored) = ns.map_or_else(Default::default, |ns| {
+        events::handlers(ns, layout.gpe_count())
+    });
+    for name in ignored
+    {
+        std::os::seraph::log!(
+            warn: "\\_GPE.{} not handled: its GPE is past the GPE0 block or has a method already",
+            String::from_utf8_lossy(&name)
+        );
+    }
+    let handled = Handled {
+        power_button,
+        gpes: handlers.iter().map(|h| h.gpe).collect(),
+    };
+    let (gsi, start) = (events.gsi(), events.start());
+    // SAFETY: the evaluation thread bound the blocks at acquisition, and the
+    // event thread binds them before it reads or writes a register.
+    let regs = Arc::new(Mutex::new(unsafe { events.ports() }));
+    let (ready_tx, ready) = mpsc::sync_channel(1);
+    let (go, go_rx) = mpsc::sync_channel(1);
+    let spawned = {
+        let (regs, mailbox, work, ended) = (
+            Arc::clone(&regs),
+            Arc::clone(mailbox),
+            work.clone(),
+            ended.clone(),
+        );
+        std::thread::Builder::new()
+            .name("acpid-sci".into())
+            .spawn(move || watch(&events, &regs, &mailbox, &work, &ready_tx, &go_rx, ended))
+    };
+    let taken = match spawned
+    {
+        Ok(_) => ready.recv().unwrap_or(false),
+        Err(e) =>
+        {
+            std::os::seraph::log!(error: "event thread not spawned: {e}");
+            false
+        }
+    };
+    if !taken
+    {
+        std::os::seraph::log!(warn: "the SCI is not taken; no events");
+        return None;
+    }
+    let fired = events::arm(&mut *lock(&regs), &layout, &handled);
+    mailbox.lock().waitable = power_button;
+    std::os::seraph::log!(
+        "events armed ({} start, SCI on GSI {gsi}): power button {}, GPEs {:?}",
+        match start
+        {
+            Start::First => "first",
+            Start::Restart => "restarted",
+        },
+        if power_button { "on" } else { "off" },
+        handled.gpes
+    );
+    deliver(&fired, mailbox, work);
+    let _ = go.send(());
+    Some(Armed {
+        layout,
+        regs,
+        handlers,
+    })
+}
+
+/// The event thread: bind the blocks and register the SCI, and report
+/// whether both worked on `ready`; once `go` says the enables are set, take
+/// each SCI for acpid's lifetime.
+fn watch(
+    events: &Events,
+    regs: &Mutex<Ports>,
+    mailbox: &Mailbox,
+    work: &Sender<Work>,
+    ready: &SyncSender<bool>,
+    go: &Receiver<()>,
+    ended: Sender<&'static str>,
+)
+{
+    let thread = std::os::seraph::thread::current_thread_cap();
+    let notification =
+        std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
+            syscall::cap_create_notification(slab).ok()
+        });
+    let registered = match notification
+    {
+        None =>
+        {
+            std::os::seraph::log!(warn: "no notification for the SCI");
+            None
+        }
+        Some(n) => match events
+            .bind(thread)
+            .and_then(|()| syscall::irq_register(events.sci(), n, events.mode()))
+        {
+            Ok(()) => Some(n),
+            Err(e) =>
+            {
+                std::os::seraph::log!(
+                    warn: "the SCI could not be taken (err={e}, mode {:#x})",
+                    events.mode()
+                );
+                None
+            }
+        },
+    };
+    let _ = ready.send(registered.is_some());
+    let (Some(notification), Ok(())) = (registered, go.recv())
+    else
+    {
+        return;
+    };
+    let _watched = Watched::new("event", ended);
+    let layout = events.layout();
+    loop
+    {
+        let fired = events::scan(&mut *lock(regs), &layout);
+        deliver(&fired, mailbox, work);
+        // The registration leaves the line masked until its first
+        // acknowledgement, and each later one follows a scan that disabled
+        // what fired, so a level-triggered SCI is no longer asserted.
+        let _ = syscall::irq_ack(events.sci());
+        if let Err(e) = syscall::notification_wait(notification)
+        {
+            std::os::seraph::log!(error: "waiting for the SCI failed (err={e}); exiting");
+            return;
+        }
+    }
+}
+
+/// Hand `fired` on: the power button to the mailbox, each GPE to the
+/// evaluation thread.
+fn deliver(fired: &Fired, mailbox: &Mailbox, work: &Sender<Work>)
+{
+    if fired.power_button
+    {
+        std::os::seraph::log!("power button pressed");
+        mailbox.post(acpid_labels::EVENT_POWER_BUTTON);
+    }
+    for &gpe in &fired.gpes
+    {
+        let _ = work.send(Work::Gpe(gpe));
+    }
+}
+
+/// Run GPE `gpe`'s method between [`events::gpe_begin`] and
+/// [`events::gpe_end`], which enables the GPE again.
+fn dispatch(gpe: u16, armed: &Armed, ns: Option<&mut Namespace>, platform: &mut Platform<'_>)
+{
+    let Some(handler) = armed.handlers.iter().find(|h| h.gpe == gpe)
+    else
+    {
+        return;
+    };
+    events::gpe_begin(&mut *lock(&armed.regs), &armed.layout, gpe, handler.trigger);
+    if let Some(ns) = ns
+    {
+        std::os::seraph::log!(debug: "GPE {gpe:#x}: running its method");
+        if let Err(fault) = Evaluator::new(ns, platform).evaluate(handler.method, Vec::new())
+        {
+            std::os::seraph::log!(warn: "GPE {gpe:#x}: its method faulted: {fault:?}");
+        }
+    }
+    events::gpe_end(&mut *lock(&armed.regs), &armed.layout, gpe, handler.trigger);
+}
+
+/// A receiver: serve the requests received on `service` for acpid's
+/// lifetime. A receive that keeps failing exits acpid
+/// (`ipc::recv_guard`), and svcmgr restarts it.
+fn receive(service: u64, mailbox: &Mailbox, work: &Sender<Work>) -> !
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    loop
+    {
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
+        let msg = match unsafe { ipc::ipc_recv(service, ipc_buf) }
+        {
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
+        };
+        guard.on_success();
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        match power::decode(msg.label, msg.badge, msg.word(0), msg.word(1))
+        {
+            Ok(Request::WaitEvent) => wait_event(mailbox, work, ipc_buf),
+            Ok(request) => reply(forward(request, work), ipc_buf),
+            Err(code) => reply(code, ipc_buf),
+        }
+    }
+}
+
+/// Reply `status` from this thread's IPC buffer `ipc_buf`.
+fn reply(status: u64, ipc_buf: *mut u64)
+{
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
+    let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(status), ipc_buf) };
+}
+
+/// Forward `request` to the evaluation thread and wait for its status;
+/// `NO_DEVICE` when the thread cannot take it.
+fn forward(request: Request, work: &Sender<Work>) -> u64
+{
+    let (status, answer) = mpsc::sync_channel(1);
+    if work.send(Work::Power(request, status)).is_err()
+    {
+        return acpid_errors::NO_DEVICE;
+    }
+    answer.recv().unwrap_or(acpid_errors::NO_DEVICE)
+}
+
+/// `WAIT_EVENT`: wait until an event is pending, or a later `WAIT_EVENT`
+/// supersedes this one, and reply. A delivered power-button press is
+/// cleared and the button enabled again; one whose reply fails, its caller
+/// gone, is posted again for the next `WAIT_EVENT`.
+fn wait_event(mailbox: &Mailbox, work: &Sender<Work>, ipc_buf: *mut u64)
+{
+    let mut mail = mailbox.lock();
+    if !mail.waitable
+    {
+        drop(mail);
+        return reply(acpid_errors::NO_DEVICE, ipc_buf);
+    }
+    mail.waiter = mail.waiter.wrapping_add(1);
+    let me = mail.waiter;
+    mailbox.changed.notify_all();
+    let events = loop
+    {
+        if mail.waiter != me
+        {
+            break 0;
+        }
+        if mail.pending != 0
+        {
+            break core::mem::take(&mut mail.pending);
+        }
+        mail = mailbox
+            .changed
+            .wait(mail)
+            .unwrap_or_else(PoisonError::into_inner);
+    };
+    drop(mail);
+    if events == 0
+    {
+        return reply(acpid_errors::SUPERSEDED, ipc_buf);
+    }
+    let msg = IpcMessage::builder(acpid_errors::SUCCESS)
+        .word(0, events)
+        .build();
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
+    if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_ok()
+    {
+        if events & acpid_labels::EVENT_POWER_BUTTON != 0
+        {
+            let _ = work.send(Work::Rearm);
+        }
+    }
+    else
+    {
+        mailbox.post(events);
+    }
+}
+
+/// Serve the requests received on `service` for acpid's lifetime without
+/// the means to act on any: each request that passes the checks of
+/// [`power::decode`] is answered `NO_DEVICE`. acpid's bootstrap round
+/// delivered its endpoint but no `devmgr.acpi` seed.
+pub fn refuse(service: u64) -> !
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
+    loop
+    {
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
+        let msg = match unsafe { ipc::ipc_recv(service, ipc_buf) }
+        {
+            Ok(msg) => msg,
+            Err(e) =>
+            {
+                guard.on_failure(e);
+                continue;
+            }
+        };
+        guard.on_success();
+        for &cap in msg.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        let status = power::decode(msg.label, msg.badge, msg.word(0), msg.word(1))
+            .map_or_else(|code| code, |_| acpid_errors::NO_DEVICE);
+        reply(status, ipc_buf);
+    }
+}
+
+/// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then the
+/// `PM1a_CNT` writes. The reply status when the platform keeps running.
+fn sleep(state: u8, ns: Option<&mut Namespace>, platform: &mut Platform<'_>, power: &Power) -> u64
+{
+    if !power.can_sleep()
+    {
+        std::os::seraph::log!(warn: "SLEEP({state}) refused: no PM1a control block");
+        return acpid_errors::NO_DEVICE;
+    }
+    let Some(ns) = ns
+    else
+    {
+        std::os::seraph::log!(warn: "SLEEP({state}) refused: no AML loaded");
+        return acpid_errors::NO_DEVICE;
+    };
+    let mut ev = Evaluator::new(ns, platform);
+    let slp_typ = match power::sleep_type(&mut ev, state)
+    {
+        Ok(Some(slp_typ)) => slp_typ,
+        Ok(None) =>
+        {
+            std::os::seraph::log!(warn: "SLEEP({state}) refused: no \\_S{state}_ package");
+            return acpid_errors::NO_DEVICE;
+        }
+        Err(why) =>
+        {
+            std::os::seraph::log!(warn: "SLEEP({state}) refused: \\_S{state}_ failed: {why:?}");
+            return acpid_errors::NO_DEVICE;
+        }
+    };
+    if let Some(fault) = power::prepare(&mut ev, state)
+    {
+        std::os::seraph::log!(warn: "\\_PTS({state}) faulted: {fault:?}; sleeping anyway");
+    }
+    if power.sleep(state, slp_typ)
+    {
+        acpid_errors::SUCCESS
+    }
+    else
+    {
+        acpid_errors::NO_DEVICE
+    }
+}
+
+/// Reset through `RESET_REG`. The reply status when the platform keeps
+/// running.
+fn reset(power: &Power) -> u64
+{
+    if power.reset()
+    {
+        acpid_errors::SUCCESS
+    }
+    else
+    {
+        std::os::seraph::log!(warn: "RESET refused: no RESET_REG");
+        acpid_errors::NO_DEVICE
+    }
+}
+
+/// `RecvGuard` diagnostic hook: one line at the start of a failure streak,
+/// one more before the fatal exit.
+fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
+{
+    match stage
+    {
+        ipc::recv_guard::RecvFailureStage::First =>
+        {
+            std::os::seraph::log!(warn: "ipc_recv failing (err={err}); backing off");
+        }
+        ipc::recv_guard::RecvFailureStage::Fatal =>
+        {
+            std::os::seraph::log!(error: "ipc_recv wedged (err={err}); exiting");
+        }
+    }
+}

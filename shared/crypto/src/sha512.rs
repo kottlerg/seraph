@@ -163,16 +163,27 @@ fn round(s: &mut [u64; 8], k: u64, w: u64)
         .wrapping_add(k)
         .wrapping_add(w);
     let t2 = big_sigma0(s[0]).wrapping_add(maj(s[0], s[1], s[2]));
-    // Shift every variable down one place (h is dropped), then fill in a and e.
-    s.rotate_right(1);
-    s[0] = t1.wrapping_add(t2);
-    s[4] = s[4].wrapping_add(t1);
+    // Shift every variable down one place (h is dropped) and fill in a and e.
+    // The words are named rather than rotated in place: rotating the slice ran
+    // the hash 36 to 54 times slower in the bootloader's debug-profile build,
+    // and 4 to 7 times slower in its release build.
+    *s = [
+        t1.wrapping_add(t2),
+        s[0],
+        s[1],
+        s[2],
+        s[3].wrapping_add(t1),
+        s[4],
+        s[5],
+        s[6],
+    ];
 }
 
 /// Compress one 128-byte block into the chaining state `h` (FIPS 180-4 §6.4).
 ///
-/// The message schedule is a sliding window of the last 16 words: for `t >= 16`,
-/// `W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16]` reads window slots 14, 9, 1 and 0.
+/// The message schedule is a ring of the last 16 words, `W[t]` in slot `t mod 16`: for
+/// `t >= 16`, `W[t] = σ1(W[t-2]) + W[t-7] + σ0(W[t-15]) + W[t-16]` reads the slots of those
+/// words and overwrites the slot of `W[t-16]`, so no word moves between rounds.
 fn compress(h: &mut [u64; 8], block: &[u8; BLOCK_LEN])
 {
     let mut win = [0u64; 16];
@@ -186,14 +197,18 @@ fn compress(h: &mut [u64; 8], block: &[u8; BLOCK_LEN])
     {
         round(&mut s, *k, *wt);
     }
-    for k in K.iter().skip(16)
+    for (t, k) in K.iter().enumerate().skip(16)
     {
-        let next = small_sigma1(win[14])
-            .wrapping_add(win[9])
-            .wrapping_add(small_sigma0(win[1]))
-            .wrapping_add(win[0]);
-        win.rotate_left(1);
-        win[15] = next;
+        // `& 15` keeps every index inside the 16-word ring.
+        let word = |back: usize| win.get(t.wrapping_sub(back) & 15).copied().unwrap_or(0);
+        let next = small_sigma1(word(2))
+            .wrapping_add(word(7))
+            .wrapping_add(small_sigma0(word(15)))
+            .wrapping_add(word(16));
+        if let Some(slot) = win.get_mut(t & 15)
+        {
+            *slot = next;
+        }
         round(&mut s, *k, next);
     }
 

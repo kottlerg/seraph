@@ -333,8 +333,14 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
-   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE
-2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
+   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear every CR4
+   control ring 3 reaches that the kernel does not grant (VME, PVI, TSD, PCE, FSGSBASE, KL,
+   PKE, UINTR) and PKS, so ring 3 reads the timestamp counter and no performance counter,
+   and has no virtual interrupts, Key Locker, protection keys or user interrupts (each AP
+   repeats this step in interrupts::init_ap)
+2. Enable XSAVE (x87 | SSE | AVX in XCR0), set CR0.MP and CR0.NE and clear CR0.EM and
+   CR0.AM (x87 errors as #MF, #NM for WAIT under TS, no ring-3 alignment checking), and
+   set CR0.TS for lazy FPU/SIMD save-restore
 3. Construct and install the permanent GDT and the BSP's TSS (the segment descriptors are
    loaded since Phase 1; this fills the TSS descriptor and loads the table again with it):
    - Null descriptor (index 0)
@@ -354,6 +360,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - TLB-shootdown (250) and wakeup (251) IPI vectors
    - Device IRQ vectors 33–249, one generated stub each; a vector is assigned to a GSI when
      the GSI is routed (`SYS_IRQ_ROUTE`)
+   Then set the user-visible MSR controls (`cpu::set_user_msr_controls`): IA32_TSC_AUX = 0
+   where CPUID reports RDTSCP or RDPID, CPUID faulting off where the CPU has it, and
+   IA32_U_CET = 0 where it has CET (each AP repeats this in interrupts::init_ap)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
    with every LVT masked, and mask every I/O APIC entry
 6. When Phase 4 decided the kernel runs on shadow stacks, give the handoff stack a shadow
@@ -362,8 +371,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    IA32_S_CET.SH_STK_EN, and run `setssbsy` (`shadow_stack::prepare_boot_cpu`,
    `shadow_stack::enable`; [return-address-integrity.md](return-address-integrity.md)
    § x86-64 Mechanism). Emit "shadow stacks: on"
-7. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,
-   NT and IOPL on entry)
+7. Configure SYSCALL/SYSRET: set EFER.SCE and clear EFER.LMSLE and EFER.UAIE; write LSTAR,
+   STAR, SFMASK (clears IF, TF, DF, AC, NT and IOPL on entry)
 8. Configure the preemption timer at a fixed 1 ms period (`timer::init(1_000)`):
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
 9. Enable interrupts (STI)
@@ -387,16 +396,14 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SUM (no supervisor access to user pages)
    - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
-4. Grant U-mode the cycle counter (scounteren.CY)
+4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
+   cycle counter and no other (each AP writes the same in interrupts::init_ap)
 5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
    (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
    (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least
    16 KiB; put the domain in MSI delivery mode with every source disabled and inactive,
-   enable it, and halt if it does not read back MSI delivery mode. Then initialise the
-   BSP's supervisor-level IMSIC file, the one the layout places at the BSP's hart id
-   (`BootInfo.cpu_ids[0]`, which need not be 0; halts when that id is past the APLIC
-   target's 14-bit hart index or outside the IMSIC layout): delivery off, threshold 0,
-   every identity's pending bit cleared and enable bit set, then delivery on
+   enable it, and halt if it does not read back MSI delivery mode. The BSP's IMSIC file is
+   initialised after its per-CPU install (below)
 6. Arm stimecmp (Sstc) for the initial tick, using the bootloader-discovered
    timebase; halts if Sstc or the timebase was not discovered
 7. Enable interrupts (set sstatus.SIE)
@@ -422,10 +429,26 @@ the fatal trap a hart without V takes at the read finds its per-CPU pointer inst
 Next the BSP disables, for user mode, the state the kernel does not switch
 (`cpu::disable_unswitched_user_state`), after its per-CPU install for the same reason. RISC-V
 writes `sstateen0` with no state enabled and halts the boot by name when the write traps (no
-Ssstateen, or firmware that left `mstateen0.SE0` clear) or does not read back; each AP does the
-same at bring-up (Phase 8). x86-64 has no state-enable register: the XCR0 set of step 2 is the
-extended state ring 3 reaches, and the XSAVE switch saves all of it
+Ssstateen, or firmware that left `mstateen0.SE0` clear) or does not read back, then writes
+`senvcfg` whole with 0, so user mode has no cache-block operation, pointer masking, landing
+pads or shadow stack, and halts the boot by name the same way when that write traps (firmware
+that left `mstateen0.ENVCFG` clear, or a hart without `senvcfg`) or does not read back; each AP
+does the same at bring-up (Phase 8). x86-64 has no state-enable register:
+the XCR0 set of step 2 is the extended state ring 3 reaches, and the XSAVE switch saves all of it
 ([platform-requirements.md](../../../docs/platform-requirements.md) § riscv64 Classification).
+
+Then the BSP initialises its own interrupt-controller state that needs its per-CPU pointer
+(`interrupts::init_bsp_local`; x86-64 has none). RISC-V initialises the BSP's supervisor-level
+IMSIC file, the one the layout places at the BSP's hart id (`BootInfo.cpu_ids[0]`, which need not
+be 0; halts when that id is past the APLIC target's 14-bit hart index or outside the IMSIC
+layout): its first access to the AIA CSRs (`siselect`, `sireg`, `stopei`) recovers from a trap
+and halts the boot by name when the firmware keeps them from S-mode (`mstateen0.CSRIND` or
+`mstateen0.IMSIC` clear), then delivery off, threshold 0, every identity's pending bit cleared
+and enable bit set, then delivery on. It runs after the per-CPU install because the trap entry
+reads the per-CPU stack floor and the recovery reads `current_cpu()`; nothing needs the file
+earlier, since interrupts stay disabled until the timer step and no line is routed or message
+target minted before Phase 9. Each AP initialises its file the same way in `interrupts::init_ap`
+(Phase 8).
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
 syscall entry and preemption timer are configured, the BSP checks the boot-gated paging
@@ -452,8 +475,9 @@ range). See [entropy.md](entropy.md).
 message. The x86-64 required-feature baseline is checked in Phase 1. On RISC-V, Phase 1
 gates only the SBI HSM and RFENCE extensions; the boot hart's Vector extension, the ASID-tagged
 TLB, Sstc and the timebase, and the Svpbmt/Svinval/Svnapot paging extensions are refused here,
-at their initialization sites, and Ssstateen where the BSP writes `sstateen0` (each secondary
-hart's Vector extension, `vlenb`, Ssstateen and ASID-tagged TLB in Phase 8). A boot hart
+at their initialization sites, and Ssstateen and the firmware's `senvcfg` grant where the BSP
+writes `sstateen0` and `senvcfg` (each secondary hart's Vector extension, `vlenb`, Ssstateen,
+`senvcfg` grant and ASID-tagged TLB in Phase 8). A boot hart
 without V halts through the fatal illegal-instruction trap at its `vlenb` read; the named
 message covers a `vlenb` of 0, above 8192, or not a power of two
 ([platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate).
@@ -726,11 +750,15 @@ the BSP selected halts itself the same way, before it touches the MSR ("CPU lack
 an AP that cannot be an APLIC MSI target (a
 firmware hart id past the target's hart index, or outside the reported IMSIC layout) halts
 itself the same way at its IMSIC file's initialisation, before announcing itself, as does an
+AP whose firmware keeps the AIA CSRs from S-mode ("AIA: siselect, sireg or stopei not
+accessible from S-mode …", from the same initialisation), an
 AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs from the boot
 hart's"), one without the Vector extension, which takes a fatal illegal-instruction trap at its
 `vlenb` read, one whose `sstateen0` the kernel cannot write or that does not read back
 ("Ssstateen: sstateen0 not accessible from S-mode …" or "Ssstateen: sstateen0 kept a U-mode
-state enable set", from `cpu::disable_unswitched_user_state` in `kernel_entry_ap`), or one
+state enable set", from `cpu::disable_unswitched_user_state` in `kernel_entry_ap`), one whose
+`senvcfg` the kernel cannot write or that does not read back ("senvcfg not accessible from
+S-mode …" or "senvcfg kept a U-mode environment enable set", from the same call), or one
 without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported", from
 `paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the
@@ -938,7 +966,7 @@ through its drain until a teardown commits `Exited` over it (see
 | 5 | CPU hardware (IDT/GDT/TSS/stvec); x86-64 shadow stacks where present; seed entropy pool | Halt: hardware initialisation failure |
 | 6 | Platform resource validation | Halt: null entries with non-zero count, or entries slice outside Usable/Loaded memory; malformed or RAM-intersecting entries skipped |
 | 7 | Capability system + root CSpace | Halt: OOM; boot descriptors exceed the InitInfo region ceiling; drained RAM extents or boot capabilities exceed the InitInfo descriptor capacity |
-| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; an x86-64 AP without the CET shadow stacks the BSP enabled; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, no writable `sstateen0`, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
+| 8 | Scheduler + idle threads, SMP bringup, AP trampoline reclaim, entropy self-test | Halt: rejected start_ap (riscv64); kernel root page table above 4 GiB (x86-64); zero ap_trampoline_page with more than one CPU listed; late-reclaim cap mint failure (SEED / CSpace) or boot capabilities exceeding the InitInfo descriptor capacity; a started CPU that does not announce itself within `AP_ONLINE_BUDGET_US`, including an AP that halts itself (too few TLB tags; an x86-64 AP without the CET shadow stacks the BSP enabled; a riscv64 hart id no APLIC MSI can target; a riscv64 `vlenb` other than the boot hart's, no Vector extension, no writable `sstateen0` or `senvcfg`, AIA CSRs kept from S-mode, or no ASID-tagged TLB); a mapped handoff or idle stack guard page; an entropy self-test FAIL is printed and the boot continues |
 | 9 | Init creation, reclaim-range scrub, scheduler entry (user mode) | Halt: invalid InitImage, OOM, init's kernel stack guard page not unmapped, or a reclaim_ranges count above MAX_RECLAIM_RANGES |
 
 ---

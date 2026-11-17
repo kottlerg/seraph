@@ -12,7 +12,10 @@
 //! a comment line, blank lines are skipped. It lists the devices a machine
 //! has that no firmware table describes, and whether the machine grants
 //! devmgr native control of its PCI Express hotplug slots, keyed by the
-//! XSDT's OEM table ID.
+//! XSDT's OEM table ID. It reaches devmgr as a boot module: a signed object
+//! (docs/signing.md) whose body is the table, which [`parse_module`] takes
+//! through the parse-only `objsig::split`, since the bootloader verified the
+//! module before it exposed it.
 //!
 //! ```text
 //! # <comment>
@@ -280,6 +283,32 @@ pub enum TableError
     NoMemory,
 }
 
+/// Why a platform description table's boot module did not parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleError
+{
+    /// The module's signature trailer does not parse; its body was not read.
+    Trailer(objsig::ParseError),
+    /// The module's body is not UTF-8 text.
+    NotText,
+    /// The body is not a table ([`parse_table`]).
+    Table(TableError),
+}
+
+/// Parse the boot module `module` of a platform description table: the table
+/// its body holds, after the trailer the bootloader verified, split off with
+/// the parse checks alone (docs/signing.md § Verifier Discipline).
+///
+/// # Errors
+/// A trailer that does not parse (an unsigned module among them), a body that
+/// is not UTF-8, or the [`TableError`] of a body that is not a table.
+pub fn parse_module(module: &[u8]) -> Result<PlatformTable, ModuleError>
+{
+    let signed = objsig::split(module).map_err(ModuleError::Trailer)?;
+    let text = core::str::from_utf8(signed.body()).map_err(|_| ModuleError::NotText)?;
+    parse_table(text).map_err(ModuleError::Table)
+}
+
 fn number(token: Option<&str>) -> Option<u64>
 {
     let token = token?;
@@ -521,6 +550,49 @@ mod tests
         assert_eq!(spcr(&t[..79]), None);
         t[..4].copy_from_slice(b"SPCX");
         assert_eq!(spcr(&t), None);
+    }
+
+    /// `body` with a trailer that parses: one record whose signature is not
+    /// checked, as the parse-only split does not check it.
+    fn signed(body: &[u8]) -> Vec<u8>
+    {
+        let record = objsig::RecordSpec {
+            signer_key_id: [1; objsig::KEY_ID_LEN],
+            attrs: objsig::Attributes {
+                body_len: u64::try_from(body.len()).unwrap(),
+                security_version: 1,
+                kind: objsig::Kind::BootModule,
+                arch: objsig::Arch::Riscv64,
+                body_hash: [0; 64],
+                name: b"platform-qemu-virt",
+            },
+            certificate: None,
+            signature: [0; 64],
+        };
+        let mut trailer = vec![0u8; objsig::trailer_len(&[record]).unwrap()];
+        objsig::encode_trailer(body, &[record], &mut trailer).unwrap();
+        [body, trailer.as_slice()].concat()
+    }
+
+    // Defect caught: a table module whose trailer is read as table lines (a
+    // table refused at every boot), or an unsigned module read as a table.
+    #[test]
+    fn a_table_module_s_body_is_its_table()
+    {
+        let table = parse_module(&signed(b"oem_table_id = BXPC\n")).unwrap();
+        assert!(table.is_for(b"BXPC"));
+        assert_eq!(
+            parse_module(b"oem_table_id = BXPC\n").map(|_| ()),
+            Err(ModuleError::Trailer(objsig::ParseError::Magic))
+        );
+        assert_eq!(
+            parse_module(&signed(b"\xff\xfe")).map(|_| ()),
+            Err(ModuleError::NotText)
+        );
+        assert_eq!(
+            parse_module(&signed(b"junk\n")).map(|_| ()),
+            Err(ModuleError::Table(TableError::MissingEquals(1)))
+        );
     }
 
     #[test]

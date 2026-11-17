@@ -15010,6 +15010,395 @@ ok test-vmgenid timing grant=["7"]
 ArgumentConflict
 error: the argument '--alone' cannot be used with '--timing'
 
+["test-powerbutton"]
+ok-all test-powerbutton cpus=default["4"] mem=default["512"] host_override=default alone=default timing=default
+
+["test-powerbutton","-h"]
+help xtask test-powerbutton -h
+
+["test-powerbutton","--help"]
+help xtask test-powerbutton -h
+
+["test-powerbutton","bogus"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["test-powerbutton","--bogus"]
+UnknownArgument
+error: unexpected argument '--bogus' found
+
+["test-powerbutton","--","x"]
+UnknownArgument
+error: unexpected argument 'x' found
+
+["test-powerbutton","-h","bogus"]
+help xtask test-powerbutton -h
+
+["test-powerbutton","bogus","-h"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["help","test-powerbutton"]
+help xtask test-powerbutton -h
+
+["help","test-powerbutton","-h"]
+InvalidSubcommand
+error: unrecognized subcommand '-h'
+
+["test-powerbutton","--cpus"]
+InvalidValue
+error: a value is required for '--cpus <CPUS>' but none was supplied
+
+["test-powerbutton","--cpus","7"]
+ok test-powerbutton cpus=["7"]
+
+["test-powerbutton","--cpus","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-powerbutton","--cpus=-1"]
+ValueValidation
+error: invalid value '-1' for '--cpus <CPUS>': -1 is not in 0..=4294967295
+
+["test-powerbutton","--cpus","4294967296"]
+ValueValidation
+error: invalid value '4294967296' for '--cpus <CPUS>': 4294967296 is not in 0..=4294967295
+
+["test-powerbutton","--cpus","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--cpus <CPUS>': number too large to fit in target type
+
+["test-powerbutton","--cpus","1.5"]
+ValueValidation
+error: invalid value '1.5' for '--cpus <CPUS>': invalid digit found in string
+
+["test-powerbutton","--cpus",""]
+ValueValidation
+error: invalid value '' for '--cpus <CPUS>': cannot parse integer from empty string
+
+["test-powerbutton","--cpus","--"]
+InvalidValue
+error: a value is required for '--cpus <CPUS>' but none was supplied
+
+["test-powerbutton","--cpus=--"]
+ValueValidation
+error: invalid value '--' for '--cpus <CPUS>': invalid digit found in string
+
+["test-powerbutton","--cpus","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-powerbutton","--cpus=--x"]
+ValueValidation
+error: invalid value '--x' for '--cpus <CPUS>': invalid digit found in string
+
+["test-powerbutton","--cpus","7","--cpus","7"]
+ArgumentConflict
+error: the argument '--cpus <CPUS>' cannot be used multiple times
+
+["test-powerbutton","--mem"]
+InvalidValue
+error: a value is required for '--mem <MEM>' but none was supplied
+
+["test-powerbutton","--mem","7"]
+ok test-powerbutton mem=["7"]
+
+["test-powerbutton","--mem","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-powerbutton","--mem=-1"]
+ValueValidation
+error: invalid value '-1' for '--mem <MEM>': -1 is not in 0..=4294967295
+
+["test-powerbutton","--mem","4294967296"]
+ValueValidation
+error: invalid value '4294967296' for '--mem <MEM>': 4294967296 is not in 0..=4294967295
+
+["test-powerbutton","--mem","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--mem <MEM>': number too large to fit in target type
+
+["test-powerbutton","--mem","1.5"]
+ValueValidation
+error: invalid value '1.5' for '--mem <MEM>': invalid digit found in string
+
+["test-powerbutton","--mem",""]
+ValueValidation
+error: invalid value '' for '--mem <MEM>': cannot parse integer from empty string
+
+["test-powerbutton","--mem","--"]
+InvalidValue
+error: a value is required for '--mem <MEM>' but none was supplied
+
+["test-powerbutton","--mem=--"]
+ValueValidation
+error: invalid value '--' for '--mem <MEM>': invalid digit found in string
+
+["test-powerbutton","--mem","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-powerbutton","--mem=--x"]
+ValueValidation
+error: invalid value '--x' for '--mem <MEM>': invalid digit found in string
+
+["test-powerbutton","--mem","7","--mem","7"]
+ArgumentConflict
+error: the argument '--mem <MEM>' cannot be used multiple times
+
+["test-powerbutton","--wait-host"]
+InvalidValue
+error: a value is required for '--wait-host <SECS>' but none was supplied
+
+["test-powerbutton","--wait-host","7"]
+ok test-powerbutton wait_host=["7"]
+
+["test-powerbutton","--wait-host","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-powerbutton","--wait-host=-1"]
+ValueValidation
+error: invalid value '-1' for '--wait-host <SECS>': invalid digit found in string
+
+["test-powerbutton","--wait-host","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--wait-host <SECS>': number too large to fit in target type
+
+["test-powerbutton","--wait-host",""]
+ValueValidation
+error: invalid value '' for '--wait-host <SECS>': cannot parse integer from empty string
+
+["test-powerbutton","--wait-host","--"]
+InvalidValue
+error: a value is required for '--wait-host <SECS>' but none was supplied
+
+["test-powerbutton","--wait-host=--"]
+ValueValidation
+error: invalid value '--' for '--wait-host <SECS>': invalid digit found in string
+
+["test-powerbutton","--wait-host","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-powerbutton","--wait-host=--x"]
+ValueValidation
+error: invalid value '--x' for '--wait-host <SECS>': invalid digit found in string
+
+["test-powerbutton","--wait-host","7","--wait-host","7"]
+ArgumentConflict
+error: the argument '--wait-host <SECS>' cannot be used multiple times
+
+["test-powerbutton","--host-override"]
+ok test-powerbutton host_override
+
+["test-powerbutton","--host-override","--host-override"]
+ArgumentConflict
+error: the argument '--host-override' cannot be used multiple times
+
+["test-powerbutton","--host-override","--host-override=true"]
+TooManyValues
+error: unexpected value 'true' for '--host-override' found; no more were expected
+
+["test-powerbutton","--host-override=false"]
+TooManyValues
+error: unexpected value 'false' for '--host-override' found; no more were expected
+
+["test-powerbutton","--alone"]
+ok test-powerbutton alone
+
+["test-powerbutton","--alone","--alone"]
+ArgumentConflict
+error: the argument '--alone' cannot be used multiple times
+
+["test-powerbutton","--alone","--alone=true"]
+TooManyValues
+error: unexpected value 'true' for '--alone' found; no more were expected
+
+["test-powerbutton","--alone=false"]
+TooManyValues
+error: unexpected value 'false' for '--alone' found; no more were expected
+
+["test-powerbutton","--timing"]
+ok test-powerbutton timing
+
+["test-powerbutton","--timing","--timing"]
+ArgumentConflict
+error: the argument '--timing' cannot be used multiple times
+
+["test-powerbutton","--timing","--timing=true"]
+TooManyValues
+error: unexpected value 'true' for '--timing' found; no more were expected
+
+["test-powerbutton","--timing=false"]
+TooManyValues
+error: unexpected value 'false' for '--timing' found; no more were expected
+
+["test-powerbutton","--grant"]
+InvalidValue
+error: a value is required for '--grant <HOLDER>' but none was supplied
+
+["test-powerbutton","--grant","7"]
+ok test-powerbutton grant=["7"]
+
+["test-powerbutton","--grant","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-powerbutton","--grant",""]
+ok test-powerbutton grant=[""]
+
+["test-powerbutton","--grant","--"]
+InvalidValue
+error: a value is required for '--grant <HOLDER>' but none was supplied
+
+["test-powerbutton","--grant=--"]
+ok test-powerbutton grant=["--"]
+
+["test-powerbutton","--grant","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-powerbutton","--grant=--x"]
+ok test-powerbutton grant=["--x"]
+
+["test-powerbutton","--grant","7","--grant","7"]
+ArgumentConflict
+error: the argument '--grant <HOLDER>' cannot be used multiple times
+
+["test-powerbutton","--cpus","7","--mem","7"]
+ok test-powerbutton cpus=["7"] mem=["7"]
+
+["test-powerbutton","--cpus","7","--wait-host","7"]
+ok test-powerbutton cpus=["7"] wait_host=["7"]
+
+["test-powerbutton","--cpus","7","--host-override"]
+ok test-powerbutton cpus=["7"] host_override
+
+["test-powerbutton","--cpus","7","--alone"]
+ok test-powerbutton cpus=["7"] alone
+
+["test-powerbutton","--cpus","7","--timing"]
+ok test-powerbutton cpus=["7"] timing
+
+["test-powerbutton","--cpus","7","--grant","7"]
+ok test-powerbutton cpus=["7"] grant=["7"]
+
+["test-powerbutton","--mem","7","--cpus","7"]
+ok test-powerbutton cpus=["7"] mem=["7"]
+
+["test-powerbutton","--mem","7","--wait-host","7"]
+ok test-powerbutton mem=["7"] wait_host=["7"]
+
+["test-powerbutton","--mem","7","--host-override"]
+ok test-powerbutton mem=["7"] host_override
+
+["test-powerbutton","--mem","7","--alone"]
+ok test-powerbutton mem=["7"] alone
+
+["test-powerbutton","--mem","7","--timing"]
+ok test-powerbutton mem=["7"] timing
+
+["test-powerbutton","--mem","7","--grant","7"]
+ok test-powerbutton mem=["7"] grant=["7"]
+
+["test-powerbutton","--wait-host","7","--cpus","7"]
+ok test-powerbutton cpus=["7"] wait_host=["7"]
+
+["test-powerbutton","--wait-host","7","--mem","7"]
+ok test-powerbutton mem=["7"] wait_host=["7"]
+
+["test-powerbutton","--wait-host","7","--host-override"]
+ok test-powerbutton wait_host=["7"] host_override
+
+["test-powerbutton","--wait-host","7","--alone"]
+ok test-powerbutton wait_host=["7"] alone
+
+["test-powerbutton","--wait-host","7","--timing"]
+ok test-powerbutton wait_host=["7"] timing
+
+["test-powerbutton","--wait-host","7","--grant","7"]
+ok test-powerbutton wait_host=["7"] grant=["7"]
+
+["test-powerbutton","--host-override","--cpus","7"]
+ok test-powerbutton cpus=["7"] host_override
+
+["test-powerbutton","--host-override","--mem","7"]
+ok test-powerbutton mem=["7"] host_override
+
+["test-powerbutton","--host-override","--wait-host","7"]
+ok test-powerbutton wait_host=["7"] host_override
+
+["test-powerbutton","--host-override","--alone"]
+ok test-powerbutton host_override alone
+
+["test-powerbutton","--host-override","--timing"]
+ok test-powerbutton host_override timing
+
+["test-powerbutton","--host-override","--grant","7"]
+ok test-powerbutton host_override grant=["7"]
+
+["test-powerbutton","--alone","--cpus","7"]
+ok test-powerbutton cpus=["7"] alone
+
+["test-powerbutton","--alone","--mem","7"]
+ok test-powerbutton mem=["7"] alone
+
+["test-powerbutton","--alone","--wait-host","7"]
+ok test-powerbutton wait_host=["7"] alone
+
+["test-powerbutton","--alone","--host-override"]
+ok test-powerbutton host_override alone
+
+["test-powerbutton","--alone","--timing"]
+ArgumentConflict
+error: the argument '--alone' cannot be used with '--timing'
+
+["test-powerbutton","--alone","--grant","7"]
+ok test-powerbutton alone grant=["7"]
+
+["test-powerbutton","--timing","--cpus","7"]
+ok test-powerbutton cpus=["7"] timing
+
+["test-powerbutton","--timing","--mem","7"]
+ok test-powerbutton mem=["7"] timing
+
+["test-powerbutton","--timing","--wait-host","7"]
+ok test-powerbutton wait_host=["7"] timing
+
+["test-powerbutton","--timing","--host-override"]
+ok test-powerbutton host_override timing
+
+["test-powerbutton","--timing","--alone"]
+ArgumentConflict
+error: the argument '--timing' cannot be used with '--alone'
+
+["test-powerbutton","--timing","--grant","7"]
+ok test-powerbutton timing grant=["7"]
+
+["test-powerbutton","--grant","7","--cpus","7"]
+ok test-powerbutton cpus=["7"] grant=["7"]
+
+["test-powerbutton","--grant","7","--mem","7"]
+ok test-powerbutton mem=["7"] grant=["7"]
+
+["test-powerbutton","--grant","7","--wait-host","7"]
+ok test-powerbutton wait_host=["7"] grant=["7"]
+
+["test-powerbutton","--grant","7","--host-override"]
+ok test-powerbutton host_override grant=["7"]
+
+["test-powerbutton","--grant","7","--alone"]
+ok test-powerbutton alone grant=["7"]
+
+["test-powerbutton","--grant","7","--timing"]
+ok test-powerbutton timing grant=["7"]
+
+["test-powerbutton","--cpus","7","--mem","7","--wait-host","7","--host-override","--alone","--timing","--grant","7"]
+ArgumentConflict
+error: the argument '--alone' cannot be used with '--timing'
+
 ["test-kaslr"]
 ok-all test-kaslr arch=default["x86_64"] cpus=default["4"] mem=default["512"] riscv_mmu=default["sv48"] x86_paging=default["4"] host_override=default alone=default timing=default
 
@@ -18033,6 +18422,495 @@ ok test-debug-port timing grant=["7"]
 ["test-debug-port","--arch","x86_64","--port","7","--cpus","7","--mem","7","--wait-host","7","--host-override","--alone","--timing","--grant","7"]
 ArgumentConflict
 error: the argument '--alone' cannot be used with '--timing'
+
+["test-reboot"]
+ok-all test-reboot arch=default["x86_64"] cpus=default["4"] mem=default["512"] host_override=default alone=default timing=default
+
+["test-reboot","-h"]
+help xtask test-reboot -h
+
+["test-reboot","--help"]
+help xtask test-reboot --help
+
+["test-reboot","bogus"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["test-reboot","--bogus"]
+UnknownArgument
+error: unexpected argument '--bogus' found
+
+["test-reboot","--","x"]
+UnknownArgument
+error: unexpected argument 'x' found
+
+["test-reboot","-h","bogus"]
+help xtask test-reboot -h
+
+["test-reboot","bogus","-h"]
+UnknownArgument
+error: unexpected argument 'bogus' found
+
+["help","test-reboot"]
+help xtask test-reboot --help
+
+["help","test-reboot","-h"]
+InvalidSubcommand
+error: unrecognized subcommand '-h'
+
+["test-reboot","--arch"]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch","7"]
+InvalidValue
+error: invalid value '7' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-reboot","--arch","x86_64"]
+ok test-reboot arch=["x86_64"]
+
+["test-reboot","--arch",""]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch","--"]
+InvalidValue
+error: a value is required for '--arch <ARCH>' but none was supplied
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch=--"]
+InvalidValue
+error: invalid value '--' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-reboot","--arch=--x"]
+InvalidValue
+error: invalid value '--x' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch","7","--arch","7"]
+InvalidValue
+error: invalid value '7' for '--arch <ARCH>'
+  [possible values: x86_64, riscv64]
+
+["test-reboot","--arch","x86_64","--arch","x86_64"]
+ArgumentConflict
+error: the argument '--arch <ARCH>' cannot be used multiple times
+
+["test-reboot","--port=-1"]
+UnknownArgument
+error: unexpected argument '--port' found
+
+["test-reboot","--port=--"]
+UnknownArgument
+error: unexpected argument '--port' found
+
+["test-reboot","--port=--x"]
+UnknownArgument
+error: unexpected argument '--port' found
+
+["test-reboot","--cpus"]
+InvalidValue
+error: a value is required for '--cpus <CPUS>' but none was supplied
+
+["test-reboot","--cpus","7"]
+ok test-reboot cpus=["7"]
+
+["test-reboot","--cpus","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-reboot","--cpus=-1"]
+ValueValidation
+error: invalid value '-1' for '--cpus <CPUS>': -1 is not in 0..=4294967295
+
+["test-reboot","--cpus","4294967296"]
+ValueValidation
+error: invalid value '4294967296' for '--cpus <CPUS>': 4294967296 is not in 0..=4294967295
+
+["test-reboot","--cpus","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--cpus <CPUS>': number too large to fit in target type
+
+["test-reboot","--cpus","1.5"]
+ValueValidation
+error: invalid value '1.5' for '--cpus <CPUS>': invalid digit found in string
+
+["test-reboot","--cpus",""]
+ValueValidation
+error: invalid value '' for '--cpus <CPUS>': cannot parse integer from empty string
+
+["test-reboot","--cpus","--"]
+InvalidValue
+error: a value is required for '--cpus <CPUS>' but none was supplied
+
+["test-reboot","--cpus=--"]
+ValueValidation
+error: invalid value '--' for '--cpus <CPUS>': invalid digit found in string
+
+["test-reboot","--cpus","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-reboot","--cpus=--x"]
+ValueValidation
+error: invalid value '--x' for '--cpus <CPUS>': invalid digit found in string
+
+["test-reboot","--cpus","7","--cpus","7"]
+ArgumentConflict
+error: the argument '--cpus <CPUS>' cannot be used multiple times
+
+["test-reboot","--mem"]
+InvalidValue
+error: a value is required for '--mem <MEM>' but none was supplied
+
+["test-reboot","--mem","7"]
+ok test-reboot mem=["7"]
+
+["test-reboot","--mem","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-reboot","--mem=-1"]
+ValueValidation
+error: invalid value '-1' for '--mem <MEM>': -1 is not in 0..=4294967295
+
+["test-reboot","--mem","4294967296"]
+ValueValidation
+error: invalid value '4294967296' for '--mem <MEM>': 4294967296 is not in 0..=4294967295
+
+["test-reboot","--mem","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--mem <MEM>': number too large to fit in target type
+
+["test-reboot","--mem","1.5"]
+ValueValidation
+error: invalid value '1.5' for '--mem <MEM>': invalid digit found in string
+
+["test-reboot","--mem",""]
+ValueValidation
+error: invalid value '' for '--mem <MEM>': cannot parse integer from empty string
+
+["test-reboot","--mem","--"]
+InvalidValue
+error: a value is required for '--mem <MEM>' but none was supplied
+
+["test-reboot","--mem=--"]
+ValueValidation
+error: invalid value '--' for '--mem <MEM>': invalid digit found in string
+
+["test-reboot","--mem","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-reboot","--mem=--x"]
+ValueValidation
+error: invalid value '--x' for '--mem <MEM>': invalid digit found in string
+
+["test-reboot","--mem","7","--mem","7"]
+ArgumentConflict
+error: the argument '--mem <MEM>' cannot be used multiple times
+
+["test-reboot","--wait-host"]
+InvalidValue
+error: a value is required for '--wait-host <SECS>' but none was supplied
+
+["test-reboot","--wait-host","7"]
+ok test-reboot wait_host=["7"]
+
+["test-reboot","--wait-host","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-reboot","--wait-host=-1"]
+ValueValidation
+error: invalid value '-1' for '--wait-host <SECS>': invalid digit found in string
+
+["test-reboot","--wait-host","18446744073709551616"]
+ValueValidation
+error: invalid value '18446744073709551616' for '--wait-host <SECS>': number too large to fit in target type
+
+["test-reboot","--wait-host",""]
+ValueValidation
+error: invalid value '' for '--wait-host <SECS>': cannot parse integer from empty string
+
+["test-reboot","--wait-host","--"]
+InvalidValue
+error: a value is required for '--wait-host <SECS>' but none was supplied
+
+["test-reboot","--wait-host=--"]
+ValueValidation
+error: invalid value '--' for '--wait-host <SECS>': invalid digit found in string
+
+["test-reboot","--wait-host","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-reboot","--wait-host=--x"]
+ValueValidation
+error: invalid value '--x' for '--wait-host <SECS>': invalid digit found in string
+
+["test-reboot","--wait-host","7","--wait-host","7"]
+ArgumentConflict
+error: the argument '--wait-host <SECS>' cannot be used multiple times
+
+["test-reboot","--host-override"]
+ok test-reboot host_override
+
+["test-reboot","--host-override","--host-override"]
+ArgumentConflict
+error: the argument '--host-override' cannot be used multiple times
+
+["test-reboot","--host-override","--host-override=true"]
+TooManyValues
+error: unexpected value 'true' for '--host-override' found; no more were expected
+
+["test-reboot","--host-override=false"]
+TooManyValues
+error: unexpected value 'false' for '--host-override' found; no more were expected
+
+["test-reboot","--alone"]
+ok test-reboot alone
+
+["test-reboot","--alone","--alone"]
+ArgumentConflict
+error: the argument '--alone' cannot be used multiple times
+
+["test-reboot","--alone","--alone=true"]
+TooManyValues
+error: unexpected value 'true' for '--alone' found; no more were expected
+
+["test-reboot","--alone=false"]
+TooManyValues
+error: unexpected value 'false' for '--alone' found; no more were expected
+
+["test-reboot","--timing"]
+ok test-reboot timing
+
+["test-reboot","--timing","--timing"]
+ArgumentConflict
+error: the argument '--timing' cannot be used multiple times
+
+["test-reboot","--timing","--timing=true"]
+TooManyValues
+error: unexpected value 'true' for '--timing' found; no more were expected
+
+["test-reboot","--timing=false"]
+TooManyValues
+error: unexpected value 'false' for '--timing' found; no more were expected
+
+["test-reboot","--grant"]
+InvalidValue
+error: a value is required for '--grant <HOLDER>' but none was supplied
+
+["test-reboot","--grant","7"]
+ok test-reboot grant=["7"]
+
+["test-reboot","--grant","-1"]
+UnknownArgument
+error: unexpected argument '-1' found
+
+["test-reboot","--grant",""]
+ok test-reboot grant=[""]
+
+["test-reboot","--grant","--"]
+InvalidValue
+error: a value is required for '--grant <HOLDER>' but none was supplied
+
+["test-reboot","--grant=--"]
+ok test-reboot grant=["--"]
+
+["test-reboot","--grant","--x"]
+UnknownArgument
+error: unexpected argument '--x' found
+
+["test-reboot","--grant=--x"]
+ok test-reboot grant=["--x"]
+
+["test-reboot","--grant","7","--grant","7"]
+ArgumentConflict
+error: the argument '--grant <HOLDER>' cannot be used multiple times
+
+["test-reboot","--arch","x86_64","--cpus","7"]
+ok test-reboot arch=["x86_64"] cpus=["7"]
+
+["test-reboot","--arch","x86_64","--mem","7"]
+ok test-reboot arch=["x86_64"] mem=["7"]
+
+["test-reboot","--arch","x86_64","--wait-host","7"]
+ok test-reboot arch=["x86_64"] wait_host=["7"]
+
+["test-reboot","--arch","x86_64","--host-override"]
+ok test-reboot arch=["x86_64"] host_override
+
+["test-reboot","--arch","x86_64","--alone"]
+ok test-reboot arch=["x86_64"] alone
+
+["test-reboot","--arch","x86_64","--timing"]
+ok test-reboot arch=["x86_64"] timing
+
+["test-reboot","--arch","x86_64","--grant","7"]
+ok test-reboot arch=["x86_64"] grant=["7"]
+
+["test-reboot","--cpus","7","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] cpus=["7"]
+
+["test-reboot","--cpus","7","--mem","7"]
+ok test-reboot cpus=["7"] mem=["7"]
+
+["test-reboot","--cpus","7","--wait-host","7"]
+ok test-reboot cpus=["7"] wait_host=["7"]
+
+["test-reboot","--cpus","7","--host-override"]
+ok test-reboot cpus=["7"] host_override
+
+["test-reboot","--cpus","7","--alone"]
+ok test-reboot cpus=["7"] alone
+
+["test-reboot","--cpus","7","--timing"]
+ok test-reboot cpus=["7"] timing
+
+["test-reboot","--cpus","7","--grant","7"]
+ok test-reboot cpus=["7"] grant=["7"]
+
+["test-reboot","--mem","7","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] mem=["7"]
+
+["test-reboot","--mem","7","--cpus","7"]
+ok test-reboot cpus=["7"] mem=["7"]
+
+["test-reboot","--mem","7","--wait-host","7"]
+ok test-reboot mem=["7"] wait_host=["7"]
+
+["test-reboot","--mem","7","--host-override"]
+ok test-reboot mem=["7"] host_override
+
+["test-reboot","--mem","7","--alone"]
+ok test-reboot mem=["7"] alone
+
+["test-reboot","--mem","7","--timing"]
+ok test-reboot mem=["7"] timing
+
+["test-reboot","--mem","7","--grant","7"]
+ok test-reboot mem=["7"] grant=["7"]
+
+["test-reboot","--wait-host","7","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] wait_host=["7"]
+
+["test-reboot","--wait-host","7","--cpus","7"]
+ok test-reboot cpus=["7"] wait_host=["7"]
+
+["test-reboot","--wait-host","7","--mem","7"]
+ok test-reboot mem=["7"] wait_host=["7"]
+
+["test-reboot","--wait-host","7","--host-override"]
+ok test-reboot wait_host=["7"] host_override
+
+["test-reboot","--wait-host","7","--alone"]
+ok test-reboot wait_host=["7"] alone
+
+["test-reboot","--wait-host","7","--timing"]
+ok test-reboot wait_host=["7"] timing
+
+["test-reboot","--wait-host","7","--grant","7"]
+ok test-reboot wait_host=["7"] grant=["7"]
+
+["test-reboot","--host-override","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] host_override
+
+["test-reboot","--host-override","--cpus","7"]
+ok test-reboot cpus=["7"] host_override
+
+["test-reboot","--host-override","--mem","7"]
+ok test-reboot mem=["7"] host_override
+
+["test-reboot","--host-override","--wait-host","7"]
+ok test-reboot wait_host=["7"] host_override
+
+["test-reboot","--host-override","--alone"]
+ok test-reboot host_override alone
+
+["test-reboot","--host-override","--timing"]
+ok test-reboot host_override timing
+
+["test-reboot","--host-override","--grant","7"]
+ok test-reboot host_override grant=["7"]
+
+["test-reboot","--alone","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] alone
+
+["test-reboot","--alone","--cpus","7"]
+ok test-reboot cpus=["7"] alone
+
+["test-reboot","--alone","--mem","7"]
+ok test-reboot mem=["7"] alone
+
+["test-reboot","--alone","--wait-host","7"]
+ok test-reboot wait_host=["7"] alone
+
+["test-reboot","--alone","--host-override"]
+ok test-reboot host_override alone
+
+["test-reboot","--alone","--timing"]
+ArgumentConflict
+error: the argument '--alone' cannot be used with '--timing'
+
+["test-reboot","--alone","--grant","7"]
+ok test-reboot alone grant=["7"]
+
+["test-reboot","--timing","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] timing
+
+["test-reboot","--timing","--cpus","7"]
+ok test-reboot cpus=["7"] timing
+
+["test-reboot","--timing","--mem","7"]
+ok test-reboot mem=["7"] timing
+
+["test-reboot","--timing","--wait-host","7"]
+ok test-reboot wait_host=["7"] timing
+
+["test-reboot","--timing","--host-override"]
+ok test-reboot host_override timing
+
+["test-reboot","--timing","--alone"]
+ArgumentConflict
+error: the argument '--timing' cannot be used with '--alone'
+
+["test-reboot","--timing","--grant","7"]
+ok test-reboot timing grant=["7"]
+
+["test-reboot","--grant","7","--arch","x86_64"]
+ok test-reboot arch=["x86_64"] grant=["7"]
+
+["test-reboot","--grant","7","--cpus","7"]
+ok test-reboot cpus=["7"] grant=["7"]
+
+["test-reboot","--grant","7","--mem","7"]
+ok test-reboot mem=["7"] grant=["7"]
+
+["test-reboot","--grant","7","--wait-host","7"]
+ok test-reboot wait_host=["7"] grant=["7"]
+
+["test-reboot","--grant","7","--host-override"]
+ok test-reboot host_override grant=["7"]
+
+["test-reboot","--grant","7","--alone"]
+ok test-reboot alone grant=["7"]
+
+["test-reboot","--grant","7","--timing"]
+ok test-reboot timing grant=["7"]
 
 ["test-hotplug"]
 ok-all test-hotplug arch=default["x86_64"] cpus=default["4"] mem=default["512"] host_override=default alone=default timing=default

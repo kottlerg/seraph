@@ -675,8 +675,11 @@ pub struct ThreadControlBlock
     /// for `select_target_cpu` and the load balancer). Written by `schedule()` at
     /// dispatch and requeue, and retargeted by every call that creates a run-queue
     /// link (`enqueue_and_wake`, `enqueue_ready_thread`, `relocate_ready_thread`)
-    /// so it names the surviving link's CPU (#359). Owned by
-    /// [`sched_lock`](Self::sched_lock), which each of those writers holds.
+    /// so it names the surviving link's CPU (#359). While the thread is `Running`
+    /// it names the CPU whose dispatch marked it so, which `schedule()`'s
+    /// outgoing-requeue guard reads to leave a `current` another CPU claimed.
+    /// Owned by [`sched_lock`](Self::sched_lock), which each of those writers
+    /// holds.
     pub preferred_cpu: u32,
 
     /// Intrusive run-queue link — next TCB in the same run queue.

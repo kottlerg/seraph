@@ -2,6 +2,8 @@
 
 UEFI bootloader for Seraph. Loads the kernel ELF and the
 `\EFI\seraph\bootstrap.bundle` (init plus boot modules) from hardcoded ESP paths,
+verifies the kernel and every bundle entry against the trust store built into it and hands the
+store on as a boot module ([docs/signing.md](../../docs/signing.md)),
 parses init's ELF into `InitImage`, establishes
 initial page tables with W^X enforcement, discovers firmware table addresses (ACPI
 RSDP / Device Tree blob) for passthrough to userspace, and jumps to the kernel entry
@@ -38,6 +40,7 @@ core/boot/
     ├── console.rs              # Early console: dual serial + framebuffer writer
     ├── paging.rs               # Initial page table construction (arch-neutral)
     ├── error.rs                # Bootloader error type
+    ├── signing.rs              # Embedded trust store; signature verification of loaded objects
     └── arch/
         ├── mod.rs              # Re-exports the active arch module
         ├── x86_64/
@@ -77,17 +80,16 @@ workspace member. The contract is specified in
 the re-exports in `core/boot/src/arch/mod.rs`.
 
 [`shared/elf/`](../../shared/elf/README.md) is the workspace's authoritative ELF format decoder
-(header validation, `PT_LOAD` segment enumeration, entry point, `PT_TLS` and stack-note
-extraction, load-span computation, and `RELATIVE` relocation support).
-`core/boot/src/elf.rs` is a thin UEFI-allocation layer over it: for the kernel
-image it allocates one contiguous span (at any available physical base on RISC-V,
-wholly below 4 GiB on x86-64) and places each `PT_LOAD` segment at its
-ELF-relative offset within the span, so kernel placement does not depend on a
-fixed firmware layout; for the init image it allocates at any available
-address while preserving the in-page byte offset of `p_vaddr`, then
-constructs the `BootInfo.init_image` ABI surface so the kernel never needs
-an ELF parser. Boot modules are loaded as opaque flat binaries with no
-parsing. Both loading paths are specified in [core/boot/docs/elf-loading.md](docs/elf-loading.md).
+(header validation, `PT_LOAD` segment enumeration, entry point, `PT_TLS` and stack-note extraction,
+load-span computation, and `RELATIVE` relocation support). `core/boot/src/elf.rs` is a thin
+UEFI-allocation layer over it: for the kernel image it allocates one contiguous span (at any
+available physical base on RISC-V, wholly below 4 GiB on x86-64) and places each `PT_LOAD` segment
+at its ELF-relative offset within the span, so kernel placement does not depend on a fixed firmware
+layout; for the init image it allocates at any available address while preserving the in-page byte
+offset of `p_vaddr`, then constructs the `BootInfo.init_image` ABI surface so the kernel never needs
+an ELF parser. Boot modules are loaded as opaque flat binaries with no parsing beyond their
+signature check. Both loading paths are specified in
+[core/boot/docs/elf-loading.md](docs/elf-loading.md).
 
 W^X is enforced for both images; where each segment kind is rejected is in
 [core/boot/docs/elf-loading.md](docs/elf-loading.md) § LOAD Segment Processing. ELF format

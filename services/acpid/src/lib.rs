@@ -6,13 +6,17 @@
 //! Host-testable start-up evaluation of acpid: the device initialization walk
 //! ([`walk`]) and the PCI host bridges' `_OSC`, `_CRS` windows and `_PRT`
 //! routes ([`bridge`]), run by the [`aml`] evaluator over any [`aml::Host`], and
-//! where a served table sits in its region's mapping ([`table`]).
+//! where a served table sits in its region's mapping ([`table`]); the
+//! decoding and evaluation of the power requests acpid serves ([`power`]);
+//! and the fixed and general-purpose events it dispatches ([`events`]).
 //!
 //! The binary (`main.rs`) gives the evaluator a host that reaches the
 //! hardware through the grants devmgr makes, logs the failures this library
 //! returns, and pushes its results to devmgr.
 
 pub mod bridge;
+pub mod events;
+pub mod power;
 pub mod table;
 pub mod walk;
 

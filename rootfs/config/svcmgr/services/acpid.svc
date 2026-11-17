@@ -1,21 +1,34 @@
 # /services/acpid — the ACPI service: it runs the firmware's AML.
 #
-# svcmgr launches acpid post-handover on every boot. `seed = devmgr.acpi`
-# delivers its one capability, a SEND on devmgr's registry badged
+# svcmgr launches acpid post-handover on every boot, as a provider.
+# `provides` makes svcmgr create acpid's service endpoint, serve its RECV as
+# bootstrap cap[0], and publish two SENDs on it:
+#   * acpid.power:auth — POWER_AUTHORITY-tokened (1 << 63), for the sleep,
+#     reset and power-button (WAIT_EVENT) requests; seed-only, and pwrmgr is
+#     the only recipe seeding it.
+#   * acpid.deny:deny  — a no-authority twin (sentinel token 1) that the
+#     SLEEP/RESET/WAIT_EVENT gate rejects; svctest uses it to assert the deny
+#     path.
+# `seed = devmgr.acpi` delivers cap[1], a SEND on devmgr's registry badged
 # REGISTRY_QUERY_AUTHORITY | ACPI_AUTHORITY, through which acpid acquires the
-# tables, the FADT's register blocks, each operation region devmgr grants it
-# and each configuration-space access, and pushes each PCI host bridge's
-# _OSC grant, windows and interrupt routes (services/acpid/README.md). acpid
-# is the only recipe seeding it, and it provides no endpoint yet.
+# tables, the FADT's register blocks and the SCI, each operation region
+# devmgr grants it and each configuration-space access, and pushes each PCI
+# host bridge's _OSC grant, windows and interrupt routes
+# (services/acpid/README.md). acpid is the only recipe seeding it.
 #
-# `restart = on_failure`: svcmgr re-creates acpid, which re-acquires its
-# capabilities from devmgr and runs its start-up again; devmgr keeps the
-# results of the first start (and the memory regions it granted).
+# `restart = on_failure`: svcmgr re-creates acpid and re-serves a fresh RECV
+# on the persistent endpoint, so pwrmgr's acpid.power SEND survives a
+# crash-restart; acpid re-acquires its capabilities from devmgr and runs its
+# start-up again; devmgr keeps the results of the first start (and the
+# memory regions it granted).
 # `critical = no`: devmgr never waits on acpid, so the system runs on
-# without it, without the _OSC grant and the routes it pushes.
+# without it, without the _OSC grant and the routes it pushes, and on x86-64
+# without pwrmgr's shutdown and reboot, whose requests then fail after
+# pwrmgr's 30 s bound on each acpid call, and without the power button.
 binary    = /services/acpid
 priority  = 16
 restart   = on_failure
 critical  = no
 namespace = none
+provides  = acpid.power:auth acpid.deny:deny
 seed      = devmgr.acpi

@@ -111,7 +111,9 @@ The `Loaded` allocations are:
   address (`AllocateAnyPages` on riscv64; `AllocateMaxAddress` below 4 GiB on x86-64).
 - Init image LOAD segments, placed at any free physical address.
 - Bundle blob: one allocation holding the bundle header and entry table,
-  every boot-module body, and the init ELF source.
+  every bundle module body, and the init ELF source.
+- The `trust-store` module's pages, the copy of the trust store the bootloader
+  exposes as the last boot module.
 - `BootInfo` structure page.
 - `BootInfo.modules` descriptor page.
 - `MmioAperture` array pages (`mmio_apertures.entries`).

@@ -30,6 +30,9 @@
 // builds on Windows with the GNU host toolchain (docs/build-system.md
 // § Toolchain).
 #![feature(rustc_private)]
+// The host OS random source (`std::random::SystemRng`) a local signing
+// identity's seeds are drawn from (src/signing).
+#![feature(random)]
 #[cfg(all(windows, target_env = "msvc"))]
 compile_error!(
     "xtask needs the toolchain sysroot's `object` and `addr2line`, which a *-windows-msvc host's \
@@ -64,6 +67,7 @@ mod qemu_gdb;
 mod qmp;
 mod regex;
 mod rust_src;
+mod signing;
 mod stack_sizes;
 mod symbolize;
 mod sys;
@@ -126,6 +130,8 @@ fn main()
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
+        CliCommand::TestReboot(args) => commands::test_reboot::run(&ctx, args),
+        CliCommand::TestPowerbutton(args) => commands::test_powerbutton::run(&ctx, args),
         CliCommand::TestHotplug(args) => commands::test_hotplug::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::TestWedge(args) => commands::test_wedge::run(&ctx, args),

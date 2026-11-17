@@ -221,16 +221,17 @@ fn require_hart_target(hart: u32)
     }
 }
 
-/// Bring up the APLIC domain and the boot hart's IMSIC file: check that every
-/// hart implements Ssaia and that the bootloader reported a supervisor-level
-/// APLIC domain, put the domain in MSI delivery mode with every source inactive
-/// and disabled, then initialise the file of the boot hart, hart id `bsp_hart`.
-/// Halts the boot when AIA is missing or the domain refuses MSI delivery.
+/// Bring up the APLIC domain: check that every hart implements Ssaia and that
+/// the bootloader reported a supervisor-level APLIC domain, then put the domain
+/// in MSI delivery mode with every source inactive and disabled. Halts the boot
+/// when AIA is missing or the domain refuses MSI delivery. The boot hart's IMSIC
+/// file is initialised later, by [`init_hart`] once its per-CPU pointer is
+/// installed, as every other hart's is.
 ///
 /// # Safety
 /// Once, on the BSP in supervisor mode with the direct map active and
-/// interrupts disabled, after [`init_eid_storage`].
-pub unsafe fn init_bsp(bsp_hart: u32)
+/// interrupts disabled.
+pub unsafe fn init_bsp()
 {
     let km = crate::platform::kernel_mmio();
     if km.hart_caps & boot_protocol::HART_CAP_SSAIA == 0
@@ -277,23 +278,36 @@ pub unsafe fn init_bsp(bsp_hart: u32)
     {
         crate::fatal("riscv64: the APLIC domain does not support MSI delivery mode");
     }
-    // SAFETY: caller contract (BSP, S-mode, interrupts disabled).
-    unsafe { init_hart(bsp_hart) };
 }
 
 /// Initialise the executing hart's supervisor-level IMSIC file: delivery off,
 /// threshold 0, every identity's pending bit cleared and enable bit set
 /// (module doc § Identities), then delivery on. `hart` is the executing hart's
 /// hart id, checked here to be a valid APLIC MSI target (the boot halts
-/// otherwise).
+/// otherwise). Its first access to the AIA CSRs is the recovering probe
+/// `cpu::imsic_csrs_reachable`, so a hart whose firmware keeps `siselect`,
+/// `sireg` or `stopei` from S-mode (`mstateen0.CSRIND` or `mstateen0.IMSIC`
+/// clear) halts the boot with a message naming them.
 ///
 /// # Safety
 /// On the hart `hart` names, in supervisor mode with interrupts disabled (the
 /// `siselect`/`sireg` pairs must not be split by a trap), after
-/// [`init_eid_storage`].
+/// [`init_eid_storage`], and after the hart's `stvec` is installed, `sscratch`
+/// is cleared and its per-CPU pointer is installed (the probe's recovery runs
+/// on that trap path).
 pub unsafe fn init_hart(hart: u32)
 {
     require_hart_target(hart);
+    // SAFETY: caller contract: S-mode on a hart with Ssaia (`init_bsp` checked
+    // every hart), interrupts disabled, the trap path and per-CPU pointer
+    // installed.
+    if !unsafe { super::cpu::imsic_csrs_reachable() }
+    {
+        crate::fatal(
+            "AIA: siselect, sireg or stopei not accessible from S-mode (the firmware left \
+             mstateen0.CSRIND or mstateen0.IMSIC clear) — required",
+        );
+    }
     let words = imsic_reg_words(IMSIC_IDS.load(Ordering::Relaxed)) as usize;
     // The k-th 64-bit pending and enable registers, every second select on RV64.
     let selects = (ISEL_EIP0..)

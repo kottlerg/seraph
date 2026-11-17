@@ -65,6 +65,14 @@ bound (`firmware::hotplug::hold_port`): the poller writes the port's Slot Contro
 past the configuration header, so no pass binds the port and acpid is refused every configuration
 write to it ([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Configuration access).
 
+Before the hand-over devmgr holds the BAR pages of the functions behind the slot
+(`hotplug::hold_behind`): what the apertures still hold of the page span of each MMIO BAR of each
+live record on the slot's buses (all of it for an unbound record, what its bind left for a bound
+one) moves out of the apertures into devmgr's held BAR pages (`DevmgrCaps::slot_bars`), from which
+a bind carves the function's BAR caps. Placement takes only what the apertures hold
+(§ Add Job), so no hot-added BAR lands on them. A slot whose pages cannot be held is not managed,
+logged, and the pages moved before the failure go back to the apertures.
+
 ### Poller
 
 The first managed slot starts the poller, a devmgr thread at devmgr's priority. It holds a
@@ -105,23 +113,32 @@ downstream port forwards configuration requests to device 0 only. For each funct
 
 1. a type-1 function (a hot-added switch or bridge) is logged and neither descended into nor
    recorded;
-2. its MMIO BARs are placed in the slot's windows (`firmware::hotplug::assign`): each BAR naturally
-   aligned and aligned to a page, the largest first, each at the lowest free base, clear of the BARs
-   of the live records on the slot's buses. A BAR takes at least a page, which it shares with no
-   other BAR and no live record's BAR, since devmgr carves a BAR's cap in whole pages. A 64-bit
+2. its MMIO BARs are placed in the free ranges of the slot's windows (`firmware::hotplug::assign`):
+   the part of each aperture cap devmgr still holds that lies inside a window, in whole pages
+   (`firmware::hotplug::free_ranges`). Each BAR lies inside one free range, since its cap is carved
+   from one aperture cap, naturally aligned and aligned to a page, the largest first, each at the
+   lowest free base. A BAR takes at least a page, which it shares with no other BAR, since devmgr
+   carves a BAR's cap in whole pages. A 64-bit
    prefetchable BAR goes in the prefetchable window, or in the non-prefetchable window when it does
    not fit there; every other BAR goes in the non-prefetchable window. I/O BARs are not placed;
 3. the BARs are written with the function's Memory Space decode off, and the function is read
    again; a BAR that does not read back at its placed base fails the function;
-4. its record is appended to the PCI records (`PciRecords::append`), after every earlier record.
+4. the page span of each placed BAR moves out of the apertures into devmgr's held BAR pages
+   (`DevmgrCaps::slot_bars`, `SpanTable::move_all`), all or none;
+5. its record is appended to the PCI records (`PciRecords::append`), after every earlier record.
 
 A function whose BARs do not fit (a size not a power of two, no open window the BAR may go in, or
 no room left in it), or do not read back as written, is logged and not recorded, so no driver is
-bound to it. An append the records refuse (a live record already holds the address, or no
-memory to grow them) is logged with its reason, and the records are as they were.
+bound to it, and the apertures are as they were. Pages that cannot be held, and an append the
+records refuse (a live record already holds the address, or no memory to grow them), are logged
+with the reason; the held pages go back to the apertures and the records are as they were.
 
-Free window space is computed from the live records at each placement and devmgr keeps no
-allocator state, so a removed record's BARs free their space by the record's removal.
+The aperture table is the one record of what is free. A page devmgr granted acpid
+([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Region grants), carved for itself or a driver,
+or holds for a function behind a managed slot is not in it, so no placement lands on it; a held
+page is in no aperture, so no region grant reaches it. A bind carves a hot-added function's BAR
+caps from the held pages. The removal path returns a removed function's held pages to the
+apertures.
 
 ### Binding
 

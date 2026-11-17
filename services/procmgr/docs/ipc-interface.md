@@ -263,9 +263,13 @@ un-badged creator that is not charged to a node handle is a reserve node with or
 so init's children are, and procmgr records each child's membership for the check on its own
 creates. procmgr trusts the un-badged creator as it does for `CREATE_PHYS_ACCESS`: svcmgr never
 creates on its mint source, and a create there would make a top-level reserve node with no max,
-which is what svcmgr's own node is. Only svctest's test phases set either flag; in the default
-image no process has a max of its own, no default per-process max exists, and svcmgr starts its
-services outside the reserve.
+which is what svcmgr's own node is. svctest's test phases set both flags, `CREATE_RESERVE` only to
+see procmgr refuse it; in the default image no process has a max of its own, and no default
+per-process max exists. svcmgr sets
+`CREATE_RESERVE` for a service whose recipe sets `reserve = yes`, crashd's in the default image,
+and starts every other service outside the reserve
+([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
+§ `reserve`).
 
 The label's bit 33 (`CREATE_NODE_HANDLE`) asks for a node handle to the child's budget node, the
 reply's last cap. procmgr registers the child with memmgr's `REGISTER_NODE_HANDLE` and passes on

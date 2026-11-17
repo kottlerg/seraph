@@ -5,10 +5,11 @@
 
 //! acpid's requests (services/acpid/README.md § Region grants and § Checks).
 //!
-//! `QUERY_ACPI_RESOURCES` is answered on the registry worker that receives
-//! it, from the FADT alone. Every other request runs on the control thread,
-//! which owns the device records, the apertures and the configuration
-//! space: the worker posts it as a [`Job`], signals the control thread, and
+//! `QUERY_ACPI_RESOURCES` of a register block is answered on the registry
+//! worker that receives it, from the FADT alone. Every other request, the
+//! SCI's `QUERY_ACPI_RESOURCES` among them, runs on the control thread,
+//! which owns the device records, the apertures, the interrupt lines and
+//! the configuration space: the worker posts it as a [`Job`], signals the control thread, and
 //! replies with what it hands back, so a region grant, a configuration
 //! access or a push is decided against records no bind changes meanwhile,
 //! with no lock beyond the ones devmgr already has. A request waits while the
@@ -30,7 +31,7 @@ use ipc::devmgr_errors as errors;
 use ipc::devmgr_labels as labels;
 
 use crate::caps::{DevmgrCaps, Firmware};
-use crate::{arch, bind, reply_status, tables};
+use crate::{IrqRangeAllocator, arch, bind, reply_status, tables};
 
 /// The data words of the longest reply, `QUERY_HOST_BRIDGE`'s.
 const REPLY_WORDS: usize = 9;
@@ -80,6 +81,8 @@ pub enum Request
     {
         ordinal: u64
     },
+    /// `QUERY_ACPI_RESOURCES` of `ACPI_SCI`.
+    Sci,
 }
 
 /// What the control thread hands back for a worker to reply with.
@@ -234,6 +237,7 @@ pub fn decode(msg: &IpcMessage) -> Result<Request, u64>
         labels::QUERY_HOST_BRIDGE => Request::HostBridge {
             ordinal: msg.word(1),
         },
+        labels::QUERY_ACPI_RESOURCES if msg.word(1) == labels::ACPI_SCI => Request::Sci,
         _ => return Err(errors::UNKNOWN_OPCODE),
     })
 }
@@ -364,13 +368,17 @@ pub struct AcpiService
     /// The apertures devmgr was given at boot, `(base, end)`, before any
     /// carve: the memory a bridge's BARs must lie in.
     boot_apertures: Vec<(u64, u64)>,
-    /// pwrmgr's ports, which no grant reaches.
-    pwrmgr: Vec<Range>,
     /// The interrupt controllers the MADT describes and the ports the kernel
     /// owns, which no grant reaches.
     kernel: Vec<Range>,
     /// The FACS, which no grant reaches.
     facs: Option<Range>,
+    /// The FADT's `SCI_INT`, `None` when it names no SCI
+    /// (`firmware::acpi::fadt_sci_int`).
+    sci_int: Option<u16>,
+    /// Whether devmgr has served acpid the SCI in this boot, so a later
+    /// request comes from a restarted acpid.
+    sci_served: bool,
 }
 
 impl AcpiService
@@ -391,6 +399,8 @@ impl AcpiService
         let facs_phys = tables::locate_table_by_sig(firmware, *b"FACP").and_then(|fadt| {
             tables::with_acpi_table(firmware, fadt, firmware::acpi::fadt_facs_phys)
         });
+        let sci_int = tables::locate_table_by_sig(firmware, *b"FACP")
+            .and_then(|fadt| tables::with_acpi_table(firmware, fadt, firmware::acpi::fadt_sci_int));
         let facs = facs_phys.and_then(|base| {
             firmware::acpid::grant_range(Space::Memory, base, firmware::acpi::FACS_MIN_LEN)
         });
@@ -415,9 +425,10 @@ impl AcpiService
             grants: Grants::new(),
             bridges: firmware::acpid::Bridges::new(),
             boot_apertures,
-            pwrmgr: arch::current::pwrmgr_ports(firmware),
             kernel: kernel_ranges(firmware),
             facs,
+            sci_int,
+            sci_served: false,
         }
     }
 
@@ -437,11 +448,16 @@ impl AcpiService
 
     /// Run every job posted, each to its end, handing its reply back. A
     /// reply the worker can no longer take has its cap deleted.
-    pub fn run(&mut self, records: &bind::Records, caps: &mut DevmgrCaps)
+    pub fn run(
+        &mut self,
+        records: &bind::Records,
+        caps: &mut DevmgrCaps,
+        irq_range: &mut IrqRangeAllocator,
+    )
     {
         while let Ok(job) = self.jobs.try_recv()
         {
-            let reply = self.answer(job.request, records, caps);
+            let reply = self.answer(job.request, records, caps, irq_range);
             if let Err(mpsc::SendError(reply)) = job.reply.send(reply)
                 && let Some(cap) = reply.cap
             {
@@ -450,8 +466,13 @@ impl AcpiService
         }
     }
 
-    fn answer(&mut self, request: Request, records: &bind::Records, caps: &mut DevmgrCaps)
-    -> Reply
+    fn answer(
+        &mut self,
+        request: Request,
+        records: &bind::Records,
+        caps: &mut DevmgrCaps,
+        irq_range: &mut IrqRangeAllocator,
+    ) -> Reply
     {
         match request
         {
@@ -516,6 +537,39 @@ impl AcpiService
                 self.pushed(what, segment, bus, pushed, covered)
             }
             Request::HostBridge { ordinal } => self.host_bridge(ordinal),
+            Request::Sci => self.sci(irq_range),
+        }
+    }
+
+    /// `QUERY_ACPI_RESOURCES` of `ACPI_SCI`: a derivation of the SCI's line,
+    /// held for the boot like a PCI device's (`IrqRangeAllocator::line_cap`),
+    /// so a restarted acpid gets a new one on the same line; its GSI, its
+    /// mode, and whether an earlier acpid of this boot was served it. The
+    /// `SCI_INT` maps through the MADT's overrides to its GSI.
+    fn sci(&mut self, irq_range: &mut IrqRangeAllocator) -> Reply
+    {
+        let Some(sci_int) = self.sci_int
+        else
+        {
+            return Reply::status(errors::NO_DEVICE);
+        };
+        let gsi = firmware::acpi::sci_gsi(irq_range.overrides.iter().copied(), sci_int);
+        match irq_range.line_cap(gsi)
+        {
+            Ok(cap) =>
+            {
+                let restarted = u64::from(self.sci_served);
+                self.sci_served = true;
+                let mut reply =
+                    Reply::success(&[u64::from(gsi), irq_range.line_mode(gsi), restarted]);
+                reply.cap = Some(cap);
+                reply
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "SCI (SCI_INT {sci_int}, GSI {gsi}) not served: {e:?}");
+                Reply::status(errors::NO_DEVICE)
+            }
         }
     }
 
@@ -539,7 +593,6 @@ impl AcpiService
         let refusal = firmware::acpid::region_refusal(
             &range,
             records.resource_ranges(),
-            &self.pwrmgr,
             &self.kernel,
             self.facs,
         );

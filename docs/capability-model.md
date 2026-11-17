@@ -88,16 +88,20 @@ scaling, and DRAM rows. The system draws the line as follows.
   reports the class as vulnerable, with the reason.
 - **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a
   context switch, does not schedule SMT siblings by trust, partitions no cache, and gates no
-  counter by process. On riscv64 it sets `scounteren.CY`, so U-mode reads the cycle counter, and
-  leaves every other `scounteren` bit as the firmware set it, so U-mode also reads each counter
-  whose bit the firmware set (`TM`, for the `time` counter, for example). On x86-64 it never
-  sets `CR4.TSD` or `CR4.PCE`: each AP starts with both clear, and the boot CPU keeps the
-  firmware's values, so ring 3 reads the timestamp counter unless the firmware set `CR4.TSD`, and
-  reads the performance counters only where the firmware set `CR4.PCE`. Setting these controls
-  on every CPU from the kernel alone, whatever the firmware left, is design intent, not yet
-  implemented ([#1118](https://github.com/kottlerg/seraph/issues/1118)). Capability-mediated
-  performance-counter access is design intent, not yet implemented
-  ([#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the gating of the
+  counter by process. It sets the user-mode counter controls on every CPU itself, whatever the
+  firmware left, so every CPU grants the same counters. On riscv64 it writes `scounteren` whole
+  with `CY` alone: U-mode reads the cycle counter, and a U-mode read of `time`, `instret` or
+  an `hpmcounter` raises an illegal-instruction exception. On x86-64 it clears `CR4.TSD` and
+  `CR4.PCE`: ring 3 reads the timestamp counter (`RDTSC`, `RDTSCP`), and `RDPMC` raises `#GP`
+  there. Capability-mediated performance-counter access is design intent, not yet implemented
+  ([#265](https://github.com/kottlerg/seraph/issues/265)). The kernel sets every other
+  user-mode control on every CPU the same way (§ User-mode hardware controls of
+  [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)),
+  and user code relies on what they give it: on x86-64 `RDTSCP` and `RDPID` return 0 as the
+  processor identifier on every CPU, so it names no CPU, `CPUID` executes at ring 3,
+  `RFLAGS.AC` enables no alignment checking, and protection keys, Key Locker, user interrupts
+  and a user shadow stack are absent; on riscv64 U-mode has no cache-block operation, pointer
+  masking, landing pads or shadow stack. These controls, and the gating of the
   counters, need security domains
   ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only
   policy treats every address space as its own domain, which in a microkernel puts a predictor
@@ -420,13 +424,15 @@ IoPort capabilities are not creatable at runtime. Init keeps the root and hands 
 derivation, and devmgr narrows it with `SYS_IOPORT_SPLIT` and gives each driver only its assigned
 port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
-`QUERY_SHUTDOWN_DEVICE` also serves the FADT's 2-port PM1a control window plus the 8042 reset
-port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
-`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses. The
+`QUERY_SHUTDOWN_DEVICE` serves a Reset-only `SbiControl` derivation on RISC-V (it replies
+`NO_DEVICE` on x86-64, where pwrmgr holds no port), only to a caller whose badge carries
+`SHUTDOWN_DEVICE_AUTHORITY`: the seed-only `devmgr.shutdown` cap, which pwrmgr alone seeds and
+svcmgr's `QUERY_ENDPOINT` refuses. The
 `ACPI_AUTHORITY` badge bit, carried only by the seed-only `devmgr.acpi` cap that acpid's recipe
-alone seeds, gates the labels acpid calls. acpid's `IoPort` and `Mmio` region grants are
-derivations devmgr makes of caps it holds
-([services/acpid/docs/devmgr.md](../services/acpid/docs/devmgr.md) § Region grants).
+alone seeds, gates the labels acpid calls. acpid's `IoPort` and `Mmio` region grants, and on
+x86-64 its `Interrupt` cap on the SCI's line, are derivations devmgr makes of caps it holds
+([services/acpid/docs/devmgr.md](../services/acpid/docs/devmgr.md) § Capabilities and § Region
+grants).
 
 Every IoPort capability references an object of its own, as for [Mmio](#mmio): a copy or
 derivation references a fresh object over the same range, funded the same way. Each thread

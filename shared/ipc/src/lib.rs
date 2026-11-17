@@ -70,6 +70,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
 //     LOG_LABELS_VERSION        — every log_labels::QUERY_SLOTS and QUERY_HISTORY
 //                                 request (client ↔ logd)
+//     ACPID_LABELS_VERSION      — every acpid_labels request (pwrmgr ↔ acpid)
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -1447,7 +1448,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 12;
+pub const SVCMGR_LABELS_VERSION: u32 = 13;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -1573,14 +1574,15 @@ pub mod svcmgr_labels
     /// endpoint (init, and procmgr's per-child source), which is what keeps
     /// the bit theirs: every other SEND on the endpoint is already badged (a
     /// badge is set once) without it — devmgr's with [`PUBLISH_AUTHORITY`],
-    /// the published `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each
-    /// per-process `service_registry_cap` with a process badge, which
+    /// each stop-authority holder's with [`STOP_AUTHORITY`], the published
+    /// `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each per-process
+    /// `service_registry_cap` with a process badge, which
     /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) keeps clear of verb bits.
     pub const HANDOVER_AUTHORITY: u64 = 1u64 << 62;
     /// Badge on the SEND svcmgr publishes on its own endpoint under the
     /// `svcmgr` name: a fixed value with no verb bit, so a consumer can
     /// `QUERY_ENDPOINT` through it but cannot re-badge it to mint
-    /// [`HANDOVER_AUTHORITY`] or [`PUBLISH_AUTHORITY`].
+    /// [`HANDOVER_AUTHORITY`], [`PUBLISH_AUTHORITY`] or [`STOP_AUTHORITY`].
     pub const PUBLISHED_SEND_BADGE: u64 = 1;
     const _: () = core::assert!(PUBLISHED_SEND_BADGE & crate::VERB_BIT_MASK == 0);
     /// Publish a named endpoint into the discovery registry.
@@ -1635,6 +1637,133 @@ pub mod svcmgr_labels
     /// `user.*`) is the future-work shape and the badge namespace
     /// reserves it — see GitHub issue #76.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Stop a supervised service on behalf of the out-of-memory policy: svcmgr
+    /// destroys its process through the handle it holds as its creator and
+    /// routes the death through the service's restart policy as
+    /// `EXIT_KILLED`. Served only on a badge carrying [`STOP_AUTHORITY`]
+    /// (`svcmgr_errors::UNAUTHORIZED` otherwise).
+    ///
+    /// Label bits 16..31 carry `name_len`; data words from 0 carry the
+    /// service name as for [`QUERY_ENDPOINT`] ([`pack_name`]). svcmgr stops
+    /// only a service it launched whose recipe sets `oom_stop = yes` and
+    /// meets the eligibility rule; the reply is `SUCCESS` once the process
+    /// is destroyed, `INVALID_NAME` for a malformed name,
+    /// `NOT_STOPPABLE` for a name no supervised service has or one the rule
+    /// refuses, `NOT_RUNNING` for an eligible service with no running
+    /// instance, and `UNAVAILABLE` when procmgr cannot be called or refuses
+    /// the destroy. A refusal changes nothing. Specified in
+    /// `services/svcmgr/docs/ipc-interface.md` § Label 5: `STOP_SERVICE`.
+    pub const STOP_SERVICE: u64 = 5;
+
+    /// List the services [`STOP_SERVICE`] would stop, with the memory each
+    /// uses, one page per call. Served only on a badge carrying
+    /// [`STOP_AUTHORITY`]. `data[0]` is the cursor: 0 starts the walk, and
+    /// each reply's `data[1]` is the cursor that resumes it. The reply
+    /// carries the page's count in `data[0]`, the next cursor in `data[1]`,
+    /// then per entry [`LIST_STOPPABLE_WORDS_PER_ENTRY`] words: the pages the
+    /// service's budget node and its subtree hold, its name's length, and the
+    /// name's bytes ([`pack_stoppable_entry`]); at most [`LIST_STOPPABLE_PAGE`]
+    /// entries, and a page shorter than that ends the walk. `UNAVAILABLE`
+    /// when memmgr or procmgr, through which the usage is read, cannot be
+    /// called. Specified in `services/svcmgr/docs/ipc-interface.md`
+    /// § Label 6: `LIST_STOPPABLE`.
+    pub const LIST_STOPPABLE: u64 = 6;
+
+    /// Data words one [`LIST_STOPPABLE`] entry takes: the usage in pages, the
+    /// name's length, and the name in [`NAME_MAX`] bytes.
+    pub const LIST_STOPPABLE_WORDS_PER_ENTRY: usize = 2 + NAME_WORDS;
+
+    /// Data words of a [`LIST_STOPPABLE`] reply before its first entry: the
+    /// count and the next cursor.
+    pub const LIST_STOPPABLE_HEADER_WORDS: usize = 2;
+
+    /// Entries one [`LIST_STOPPABLE`] reply carries at most: as many as fit
+    /// the data words after the header.
+    pub const LIST_STOPPABLE_PAGE: usize =
+        (super::MSG_DATA_WORDS_MAX - LIST_STOPPABLE_HEADER_WORDS) / LIST_STOPPABLE_WORDS_PER_ENTRY;
+
+    const _: () = core::assert!(LIST_STOPPABLE_PAGE >= 1);
+
+    /// Write entry `index` of a [`LIST_STOPPABLE`] reply into `words` (the
+    /// reply's data words, whose header the caller sets): the usage in pages,
+    /// the name's length, and the name's bytes as [`pack_name`] packs them,
+    /// zero-padded. Returns `false`, writing nothing, when `name` is empty or
+    /// longer than [`NAME_MAX`], or the entry does not fit `words`.
+    pub fn pack_stoppable_entry(words: &mut [u64], index: usize, pages: u64, name: &[u8]) -> bool
+    {
+        let mut packed = [0; NAME_WORDS];
+        if name.is_empty() || pack_name(name, &mut packed).is_none()
+        {
+            return false;
+        }
+        let Some([pages_word, len_word, name_words @ ..]) =
+            stoppable_entry_base(index).and_then(|base| {
+                words
+                    .get_mut(base..)?
+                    .get_mut(..LIST_STOPPABLE_WORDS_PER_ENTRY)
+            })
+        else
+        {
+            return false;
+        };
+        *pages_word = pages;
+        *len_word = name.len() as u64;
+        name_words.copy_from_slice(&packed);
+        true
+    }
+
+    /// Read entry `index` of a [`LIST_STOPPABLE`] reply's data words
+    /// `words`: the usage in pages, and the name, zero-padded to
+    /// [`NAME_MAX`], with its length. `None` when `index` is past the
+    /// reply's count or its words, or the entry's length is 0 or past
+    /// [`NAME_MAX`]; the reply is wire input, so nothing is read past either
+    /// bound.
+    #[must_use]
+    pub fn unpack_stoppable_entry(
+        words: &[u64],
+        index: usize,
+    ) -> Option<(u64, [u8; NAME_MAX], usize)>
+    {
+        let count = usize::try_from(*words.first()?).ok()?;
+        if index >= count
+        {
+            return None;
+        }
+        let [pages, len_word, name_words @ ..] = words
+            .get(stoppable_entry_base(index)?..)?
+            .get(..LIST_STOPPABLE_WORDS_PER_ENTRY)?
+        else
+        {
+            return None;
+        };
+        let len = usize::try_from(*len_word).ok()?;
+        let name = unpack_name(name_words, len)?;
+        Some((*pages, name, len))
+    }
+
+    /// The first data word of entry `index` of a [`LIST_STOPPABLE`] reply,
+    /// past the header; `None` when it does not fit a `usize`.
+    fn stoppable_entry_base(index: usize) -> Option<usize>
+    {
+        index
+            .checked_mul(LIST_STOPPABLE_WORDS_PER_ENTRY)?
+            .checked_add(LIST_STOPPABLE_HEADER_WORDS)
+    }
+
+    /// Verb-bit authorising [`STOP_SERVICE`] and [`LIST_STOPPABLE`]. svcmgr
+    /// alone mints it, on a SEND on its own service endpoint it delivers to a
+    /// service whose recipe sets `stop_authority = yes`, in the bootstrap slot
+    /// after the seeds and the debug-authority cap, fresh on every launch and
+    /// restart. The SEND carries no other verb bit, so it cannot publish or
+    /// hand over.
+    pub const STOP_AUTHORITY: u64 = 1u64 << 61;
+
+    const _: () = core::assert!(
+        STOP_AUTHORITY & crate::VERB_BIT_MASK != 0
+            && STOP_AUTHORITY != PUBLISH_AUTHORITY
+            && STOP_AUTHORITY != HANDOVER_AUTHORITY
+    );
 }
 
 /// Well-known names published into svcmgr's discovery registry.
@@ -1656,13 +1785,13 @@ pub mod svcmgr_labels
 /// four `devmgr.*` names, [`published_names::VFSD_MOUNT`],
 /// [`published_names::VFSD_SWAP`], [`published_names::LOGD_QUERY`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
-/// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
+/// `pwrmgr.shutdown` and `acpid.power`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
 /// without `GRANT`, apart from [`published_names::DEVMGR_BIND`], which its
 /// seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
 /// to devmgr; `QUERY_ENDPOINT` never yields `GRANT`.
 /// [`published_names::VFSD_DENY`] carries no authority but is seed-only
-/// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any
+/// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any
 /// name published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
@@ -1711,8 +1840,8 @@ pub mod published_names
     /// SEND on devmgr's registry endpoint badged
     /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`: the
     /// `devmgr.registry` surface plus `QUERY_SHUTDOWN_DEVICE`. Seed-only and
-    /// seeded only by pwrmgr, which acquires the platform shutdown actuators
-    /// through it.
+    /// seeded only by pwrmgr, which acquires the RISC-V SBI shutdown
+    /// authority through it.
     pub const DEVMGR_SHUTDOWN: &[u8] = b"devmgr.shutdown";
 
     /// SEND on devmgr's registry endpoint badged
@@ -1730,6 +1859,16 @@ pub mod published_names
     /// results (`devmgr_labels::ACPI_AUTHORITY`). Seed-only and seeded only
     /// by acpid.
     pub const DEVMGR_ACPI: &[u8] = b"devmgr.acpi";
+
+    /// `acpid_labels::POWER_AUTHORITY`-badged SEND on acpid's service
+    /// endpoint: `acpid_labels::SLEEP`, `acpid_labels::RESET` and
+    /// `acpid_labels::WAIT_EVENT`. Seed-only and seeded only by pwrmgr.
+    pub const ACPID_POWER: &[u8] = b"acpid.power";
+
+    /// SEND on acpid's service endpoint badged with a sentinel that carries
+    /// no verb bit, so acpid's gate refuses it: the public negative-test twin
+    /// of [`ACPID_POWER`], which svctest resolves through `QUERY_ENDPOINT`.
+    pub const ACPID_DENY: &[u8] = b"acpid.deny";
 
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
@@ -1887,14 +2026,13 @@ pub mod timed_errors
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
-/// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (the
-/// `PM1a` `IoPort` carved from the FADT/DSDT it interprets) and SBI
-/// SRST on RISC-V (the `SbiControl` cap). It acquires those caps from
-/// devmgr — the hardware/ACPI authority — at startup via
-/// [`devmgr_labels::QUERY_ACPI_TABLE`] and
-/// [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], not from init. Callers that
-/// may invoke shutdown receive a badged SEND on pwrmgr's service
-/// endpoint with the [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
+/// pwrmgr owns the platform shutdown surface: ACPI S5 and the FADT reset
+/// register on x86-64, which it reaches through acpid
+/// ([`acpid_labels::SLEEP`], [`acpid_labels::RESET`]), and SBI SRST on
+/// RISC-V, through the `SbiControl` cap it acquires from devmgr at startup
+/// via [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`]. Callers that may invoke
+/// shutdown receive a badged SEND on pwrmgr's service endpoint with the
+/// [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
 ///
 /// See `services/pwrmgr/README.md` for the authoritative description.
 pub mod pwrmgr_labels
@@ -1940,6 +2078,94 @@ pub mod pwrmgr_errors
     /// `PWRMGR_LABELS_VERSION` is marker-only.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
     /// Unknown opcode on pwrmgr endpoint.
+    pub const UNKNOWN_OPCODE: u64 = 0xFF;
+}
+
+/// Wire-protocol version of [`acpid_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
+pub const ACPID_LABELS_VERSION: u32 = 2;
+/// IPC labels for acpid's power surface, which pwrmgr calls.
+///
+/// acpid runs the firmware's AML and holds the FADT's fixed register blocks
+/// and the SCI (`services/acpid/README.md`), so the ACPI sleep and reset
+/// sequences run in it and the fixed events reach the OS through it: pwrmgr,
+/// the power policy, reaches them through a SEND badged
+/// [`acpid_labels::POWER_AUTHORITY`] (`acpid.power`). Every request carries
+/// the caller's compiled [`super::ACPID_LABELS_VERSION`] in `data[0]`.
+/// The handler checks the label first, then the badge, then the version,
+/// then the argument.
+pub mod acpid_labels
+{
+    /// Enter a sleep state: write `SLP_TYP` and then `SLP_TYP | SLP_EN` to
+    /// `PM1a_CNT`, the `SLP_TYP` read from the state's `\_Sx_` package,
+    /// after `\_PTS` of the state when the tables define it.
+    ///
+    /// Request: `data[0]` = the version; `data[1]` = the state, of which
+    /// only [`STATE_S5`] (soft-off) is served. On the success path the
+    /// platform powers off and no reply arrives; a
+    /// [`super::acpid_errors::SUCCESS`] reply means the write returned and
+    /// the platform still runs, and the caller decides how long to wait.
+    /// Replies [`super::acpid_errors::INVALID_REQUEST`] for another state and
+    /// [`super::acpid_errors::NO_DEVICE`] when the platform has no
+    /// `PM1a_CNT`, the tables no usable `\_S5_`, or no AML loaded (always
+    /// on RISC-V, whose platforms power off through SBI).
+    pub const SLEEP: u64 = 1;
+    /// Reset the platform: write the FADT's `RESET_VALUE` to its
+    /// `RESET_REG`.
+    ///
+    /// Request: `data[0]` = the version. On the success path the machine
+    /// resets and no reply arrives; a [`super::acpid_errors::SUCCESS`]
+    /// reply means the write returned and the platform still runs. Replies
+    /// [`super::acpid_errors::NO_DEVICE`] when the FADT places no
+    /// `RESET_REG` in the I/O space (always on RISC-V).
+    pub const RESET: u64 = 2;
+    /// Wait for a power event: acpid holds the call until one is pending,
+    /// with no bound, then replies with every event pending.
+    ///
+    /// Request: `data[0]` = the version. Reply
+    /// ([`super::acpid_errors::SUCCESS`]): `data[0]` = the events, a mask of
+    /// [`EVENT_POWER_BUTTON`]. An event is consumed by the reply that
+    /// delivers it; one whose reply cannot be delivered (the caller died) is
+    /// kept for the next `WAIT_EVENT`, and one acpid had not delivered when
+    /// it died stays latched in the hardware and is delivered by the restarted
+    /// acpid. One caller waits at a time: a `WAIT_EVENT` that arrives while
+    /// another waits takes its place, and the earlier one is replied
+    /// [`super::acpid_errors::SUPERSEDED`]. Replies
+    /// [`super::acpid_errors::NO_DEVICE`] when acpid has no event to wait
+    /// for: devmgr served it no SCI or no `PM1a` event block, or the FADT
+    /// declares no fixed power button (always on RISC-V).
+    pub const WAIT_EVENT: u64 = 3;
+
+    /// [`SLEEP`]'s state argument for S5, soft-off.
+    pub const STATE_S5: u64 = 5;
+
+    /// [`WAIT_EVENT`]'s event bit: the fixed power button was pressed
+    /// (`PWRBTN_STS`).
+    pub const EVENT_POWER_BUTTON: u64 = 1;
+
+    /// Authority bit in the acpid-service-endpoint badge's high u64 bit, set
+    /// on `acpid.power`. Without it [`SLEEP`], [`RESET`] and [`WAIT_EVENT`]
+    /// reply [`super::acpid_errors::UNAUTHORIZED`].
+    pub const POWER_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Error replies from acpid.
+pub mod acpid_errors
+{
+    /// The request was carried out and the platform still runs.
+    pub const SUCCESS: u64 = 0;
+    /// The caller's badge lacks [`super::acpid_labels::POWER_AUTHORITY`].
+    pub const UNAUTHORIZED: u64 = 1;
+    /// A [`super::acpid_labels::SLEEP`] state acpid does not serve.
+    pub const INVALID_REQUEST: u64 = 2;
+    /// `data[0]` is not acpid's compiled [`super::ACPID_LABELS_VERSION`].
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// The platform has no register or object the request needs.
+    pub const NO_DEVICE: u64 = 4;
+    /// A [`super::acpid_labels::WAIT_EVENT`] was superseded by a later one
+    /// before an event arrived.
+    pub const SUPERSEDED: u64 = 5;
+    /// Unknown opcode on acpid's endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
@@ -2303,7 +2529,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 20;
+pub const DEVMGR_LABELS_VERSION: u32 = 22;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2450,10 +2676,9 @@ pub mod devmgr_labels
     /// Locate an ACPI table and serve a read-only view of it.
     ///
     /// devmgr is the sole owner of ACPI data and the only service that
-    /// navigates the table tree (RSDP → XSDT). Callers that need a table
-    /// (`pwrmgr`, for the FADT + DSDT it interprets for S5 shutdown, and
-    /// acpid, for the DSDT and every SSDT it loads) request it here rather than holding ACPI Memory caps of
-    /// their own.
+    /// navigates the table tree (RSDP → XSDT). A caller that needs a table
+    /// (acpid, for the DSDT and every SSDT it loads) requests it here rather
+    /// than holding ACPI Memory caps of its own.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = 4-byte table signature packed little-endian (e.g.
@@ -2484,55 +2709,54 @@ pub mod devmgr_labels
     /// not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_ACPI_TABLE: u64 = 7;
 
-    /// Carve and serve the platform shutdown-actuator hardware caps.
+    /// Serve the platform's firmware shutdown authority (RISC-V).
     ///
-    /// devmgr is the hardware authority; it carves the ports the power
-    /// manager needs and performs no shutdown logic. The caller (`pwrmgr`)
-    /// has already parsed the ACPI tables (served via [`QUERY_ACPI_TABLE`])
-    /// and computed the `PM1a` control port it needs; devmgr serves that
-    /// port only when it is the FADT's `PM1a_CNT_BLK`.
+    /// devmgr is the hardware authority and performs no shutdown logic. On
+    /// RISC-V the power manager (`pwrmgr`) powers off and resets through
+    /// SBI SRST; on x86-64 it reaches the ACPI sleep and reset registers
+    /// through acpid ([`super::acpid_labels`]), and devmgr serves nothing
+    /// here.
     ///
-    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
-    /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`].
     /// Caller's badge MUST carry [`SHUTDOWN_DEVICE_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
-    /// Reply ([`super::devmgr_errors::SUCCESS`]):
-    /// - x86-64: `caps[0]` = a narrow `IoPort` over `[pm1a, pm1a+2)`
-    ///   carved from devmgr's full-rights `IoPort`; `caps[1]` = a narrow
-    ///   `IoPort` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
-    ///   Both are re-derived from it on every call, so a pwrmgr
-    ///   restart re-acquires them cleanly.
-    /// - RISC-V: `caps[0]` = a Reset-only derivation of devmgr's
-    ///   `SbiControl` cap (SBI SRST authority).
+    /// Reply ([`super::devmgr_errors::SUCCESS`], RISC-V): `caps[0]` = a
+    /// Reset-only derivation of devmgr's `SbiControl` cap (SBI SRST
+    /// authority), derived on every call, so a pwrmgr restart re-acquires it.
     ///
-    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails,
-    /// the FADT or its `PM1a_CNT_BLK` cannot be read (x86-64), or the
-    /// platform authority cap is absent,
-    /// [`super::devmgr_errors::INVALID_REQUEST`] when `data[1]` is not the
-    /// FADT's `PM1a_CNT_BLK` (x86-64) or the RISC-V Reset-only derivation
-    /// fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when
-    /// `data[0]` is not `DEVMGR_LABELS_VERSION`.
+    /// Replies [`super::devmgr_errors::NO_DEVICE`] on x86-64 and when the
+    /// `SbiControl` cap is absent,
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when the Reset-only
+    /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
+    /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Serve acpid the `IoPort` of one fixed ACPI register block the FADT
-    /// declares (x86-64).
+    /// declares, or the SCI's `Interrupt` (x86-64).
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = the block ([`ACPI_PM1A_EVT`], [`ACPI_PM1A_CNT`],
-    /// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], or [`ACPI_RESET`]). Caller's badge
-    /// MUST carry [`ACPI_AUTHORITY`]; the handler replies
+    /// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], [`ACPI_RESET`], or [`ACPI_SCI`]).
+    /// Caller's badge MUST carry [`ACPI_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
-    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a narrow
-    /// `IoPort` over the block, derived from devmgr's full-rights `IoPort` on
-    /// every call; `data[0]` = its first port; `data[1]` = its port count;
-    /// `data[2]` = the FADT's `ACPI_ENABLE` value for [`ACPI_SMI_CMD`], its
-    /// `RESET_VALUE` for [`ACPI_RESET`], and 0 for the others. Replies
-    /// [`super::devmgr_errors::NO_DEVICE`] when the platform has no such
-    /// block (every block on RISC-V, a zero FADT field, a `RESET_REG` outside
-    /// the I/O space), the FADT cannot be read, or the carve fails, and
-    /// [`super::devmgr_errors::INVALID_REQUEST`] for an unknown block.
+    /// Reply ([`super::devmgr_errors::SUCCESS`]) for a register block:
+    /// `caps[0]` = a narrow `IoPort` over the block, derived from devmgr's
+    /// full-rights `IoPort` on every call; `data[0]` = its first port;
+    /// `data[1]` = its port count; `data[2]` = the FADT's `ACPI_ENABLE` value
+    /// for [`ACPI_SMI_CMD`], its `RESET_VALUE` for [`ACPI_RESET`], and 0 for
+    /// the others. For [`ACPI_SCI`]: `caps[0]` = an `Interrupt` cap carrying
+    /// `RIGHTS_IRQ_NOTIFY` on the SCI's line, a derivation of the line devmgr
+    /// holds for the boot, made on every call; `data[0]` = the line's GSI;
+    /// `data[1]` = the `SYS_IRQ_REGISTER` mode it is routed in; `data[2]` =
+    /// 1 when devmgr served the SCI earlier in this boot (the caller is a
+    /// restarted acpid), else 0. Replies [`super::devmgr_errors::NO_DEVICE`]
+    /// when the platform has no such block or SCI (every one on RISC-V, a
+    /// zero FADT field, a `RESET_REG` outside the I/O space, a
+    /// hardware-reduced FADT), the FADT cannot be read, or the carve or the
+    /// derivation fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an
+    /// unknown block.
     pub const QUERY_ACPI_RESOURCES: u64 = 24;
     /// [`QUERY_ACPI_RESOURCES`] block: `PM1a_EVT_BLK`, `PM1_EVT_LEN` ports.
     pub const ACPI_PM1A_EVT: u64 = 1;
@@ -2545,10 +2769,12 @@ pub mod devmgr_labels
     /// [`QUERY_ACPI_RESOURCES`] block: the `RESET_REG` port, when the FADT
     /// places it in the I/O space.
     pub const ACPI_RESET: u64 = 5;
+    /// [`QUERY_ACPI_RESOURCES`] resource: the SCI, the FADT's `SCI_INT` line.
+    pub const ACPI_SCI: u64 = 6;
 
     /// Grant acpid part of an operation region it evaluated: a `SystemIO`
     /// range, or the `SystemMemory` page an access reaches, that no device
-    /// record, driver, pwrmgr capability or the kernel holds.
+    /// record, driver or the kernel holds.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = the space, [`ACPI_SPACE_MEMORY`] or [`ACPI_SPACE_IO`];
@@ -2558,9 +2784,9 @@ pub mod devmgr_labels
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// devmgr refuses, logged, a range that overlaps a resource of any device
-    /// record (a PCI BAR, a platform record's `Mmio` or `IoPort`), a port
-    /// pwrmgr holds, an interrupt controller the MADT describes or a legacy
-    /// port the kernel drives, the configuration-mechanism ports 0xCF8-0xCFF,
+    /// record (a PCI BAR, a platform record's `Mmio` or `IoPort`), an
+    /// interrupt controller the MADT describes or a legacy port the kernel
+    /// drives, the configuration-mechanism ports 0xCF8-0xCFF,
     /// or the FACS, and memory that no `Mmio` aperture devmgr still holds
     /// covers (RAM, ACPI NVS, and the ranges devmgr has carved for itself or a
     /// driver). A memory page granted is kept by devmgr, so it is granted
@@ -4385,6 +4611,7 @@ const _: () = core::assert!(
         && devmgr_labels::BIND_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::ACPI_AUTHORITY & VERB_BIT_MASK != 0
+        && acpid_labels::POWER_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SWAP_AUTHORITY & VERB_BIT_MASK != 0
@@ -4747,7 +4974,7 @@ pub mod devmgr_errors
     /// waits on a `WATCH_CLASS` watch and queries again when it is
     /// signalled ([`super::await_device`]), never polling `QUERY_DEVICE`.
     /// Also returned by `QUERY_ACPI_TABLE` (table not found) and
-    /// `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
+    /// `QUERY_SHUTDOWN_DEVICE` (no SBI authority to serve; always on x86-64).
     pub const NO_DEVICE: u64 = 4;
     /// The driver the query names was served and has since died, so devmgr
     /// withdrew it: its service endpoint is revoked, and callers queued on
@@ -4794,14 +5021,28 @@ pub mod svcmgr_errors
     /// a mismatch svcmgr's bootstrap fails without replying this code.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
-    /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on
-    /// a `HANDOVER_COMPLETE`, or the handover has already run.
+    /// `PUBLISH_ENDPOINT` request, [`svcmgr_labels::HANDOVER_AUTHORITY`] on
+    /// a `HANDOVER_COMPLETE`, or [`svcmgr_labels::STOP_AUTHORITY`] on a
+    /// `STOP_SERVICE` or `LIST_STOPPABLE`, or the handover has already run.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
     /// from svcmgr, transport-level failure), for a client that reports it
     /// in the svcmgr status space. Never emitted by svcmgr itself; no
     /// in-tree client synthesises it.
     pub const IPC_FAILED: u64 = 9;
+    /// `svcmgr_labels::STOP_SERVICE`: no supervised service has the name,
+    /// or the eligibility rule refuses it (not launched by svcmgr,
+    /// `restart = never`, `critical = yes`, a core role, or no
+    /// `oom_stop = yes`).
+    pub const NOT_STOPPABLE: u64 = 10;
+    /// `svcmgr_labels::STOP_SERVICE`: the service is eligible but has no
+    /// running instance (it is down, or its death had not been routed, which
+    /// svcmgr then routes).
+    pub const NOT_RUNNING: u64 = 11;
+    /// `svcmgr_labels::STOP_SERVICE` or `svcmgr_labels::LIST_STOPPABLE`:
+    /// memmgr or procmgr, which the request calls, is down, or procmgr
+    /// refused the destroy; nothing changed.
+    pub const UNAVAILABLE: u64 = 12;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }
@@ -5832,6 +6073,79 @@ mod tests
         let full =
             (0..MSG_CAP_SLOTS_MAX as u64).fold(IpcMessage::builder(1), IpcMessageBuilder::cap);
         let _ = full.cap(99);
+    }
+
+    #[test]
+    fn a_stoppable_list_page_round_trips_names_of_every_length()
+    {
+        use svcmgr_labels::{
+            LIST_STOPPABLE_PAGE, NAME_MAX, pack_stoppable_entry, unpack_stoppable_entry,
+        };
+        let long = [b'x'; NAME_MAX];
+        let names: [&[u8]; 3] = [b"memhog", &long, b"a"];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            assert!(pack_stoppable_entry(&mut words, i, 0x100 + i as u64, name));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let (pages, out, len) = unpack_stoppable_entry(&words, i).unwrap();
+            assert_eq!((pages, &out[..len]), (0x100 + i as u64, *name));
+            assert!(out[len..].iter().all(|&b| b == 0));
+        }
+        assert!(unpack_stoppable_entry(&words, names.len()).is_none());
+        // A full page fits the message, and the entry past it does not.
+        assert!(pack_stoppable_entry(
+            &mut words,
+            LIST_STOPPABLE_PAGE - 1,
+            1,
+            b"a"
+        ));
+        assert!(!pack_stoppable_entry(
+            &mut words,
+            LIST_STOPPABLE_PAGE,
+            1,
+            b"a"
+        ));
+    }
+
+    #[test]
+    fn a_stoppable_list_entry_refuses_names_outside_one_to_name_max()
+    {
+        use svcmgr_labels::{NAME_MAX, pack_stoppable_entry, unpack_stoppable_entry};
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_stoppable_entry(&mut words, 0, 7, b""));
+        assert!(!pack_stoppable_entry(
+            &mut words,
+            0,
+            7,
+            &[b'n'; NAME_MAX + 1]
+        ));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        assert!(pack_stoppable_entry(&mut words, 0, 7, b"svc"));
+        words[0] = 1;
+        // A length the reply claims past NAME_MAX, or zero, is wire input
+        // refused, not read.
+        words[3] = NAME_MAX as u64 + 1;
+        assert!(unpack_stoppable_entry(&words, 0).is_none());
+        words[3] = 0;
+        assert!(unpack_stoppable_entry(&words, 0).is_none());
+    }
+
+    #[test]
+    fn a_stoppable_list_index_whose_offset_overflows_is_refused()
+    {
+        use svcmgr_labels::{
+            LIST_STOPPABLE_WORDS_PER_ENTRY, pack_stoppable_entry, unpack_stoppable_entry,
+        };
+        let index = usize::MAX / LIST_STOPPABLE_WORDS_PER_ENTRY + 1;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_stoppable_entry(&mut words, index, 7, b"a"));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        words[0] = u64::MAX;
+        assert!(unpack_stoppable_entry(&words, index).is_none());
     }
 
     #[test]

@@ -19,8 +19,10 @@ use firmware::hotplug::{
     SLOTCTL_EVENT_ENABLES, SLOTSTA_COMMAND_COMPLETED, SLOTSTA_LATCHES, Slot, SlotState,
 };
 use firmware::pci_records::RecordState;
-use firmware::scan::{ConfigSpace, PciDevice};
+use firmware::resource::SplitError;
+use firmware::scan::{ConfigSpace, MAX_BARS, PciDevice};
 use std::os::seraph::thread::BuilderExt;
+use syscall_abi::PAGE_SIZE;
 
 use crate::bind::{self, ConfigRegs};
 use crate::{Registry, caps, settle};
@@ -253,7 +255,8 @@ impl Hotplug
     }
 
     /// Hand slot `index` to the poller, starting the poller with the first,
-    /// and hold its port's record; `by` names the grant in the log line.
+    /// and hold its port's record and the BAR pages of the functions behind
+    /// it ([`hold_behind`]); `by` names the grant in the log line.
     fn manage(
         &mut self,
         index: usize,
@@ -275,6 +278,17 @@ impl Hotplug
             );
             return Grant::Unmanaged;
         };
+        let Some(held) = hold_behind(&slot, records, caps)
+        else
+        {
+            let _ = syscall::cap_delete(page);
+            std::os::seraph::log!(
+                warn: "hotplug: slot {}:{}:{}.{}: the BAR pages of the functions behind it could \
+                       not be held; not managed",
+                s, b, d, f
+            );
+            return Grant::Unmanaged;
+        };
         if self.poller.is_none()
         {
             self.poller = start_poller(self.posted.clone(), self.job_note, self.aspace);
@@ -290,6 +304,7 @@ impl Hotplug
         if !matches!(sent, Some(Ok(())))
         {
             let _ = syscall::cap_delete(page);
+            release(caps, &held);
             std::os::seraph::log!(
                 warn: "hotplug: slot {}:{}:{}.{}: no poller; not managed",
                 s, b, d, f
@@ -668,12 +683,12 @@ impl ConfigSpace for FunctionSpace<'_>
 
 /// The add job of an arrival at `slot`: read each function of device 0 on
 /// the slot's secondary bus (a downstream port forwards configuration
-/// requests to device 0 only), place its MMIO BARs in the slot's windows
-/// clear of the live records' BARs below the slot, program them, and append
-/// its record. A type-1 function is logged and not descended into; a
-/// function whose BARs do not fit, or do not read back as programmed, is
-/// logged and not recorded, so no driver is bound to it; a refused append is
-/// logged. Returns the number of records appended.
+/// requests to device 0 only), place its MMIO BARs in the ranges of the
+/// slot's windows the apertures still hold ([`hp::free_ranges`]), program
+/// them, and admit it ([`admit`]). A type-1 function is logged and not
+/// descended into; a function whose BARs do not fit, or do not read back as
+/// programmed, is logged and not recorded, so no driver is bound to it, and
+/// the apertures are as they were. Returns the number of records appended.
 fn add(slot: &Slot, records: &mut bind::Records, caps: &mut caps::DevmgrCaps) -> usize
 {
     let (segment, bus) = (slot.port.0, slot.secondary);
@@ -682,13 +697,17 @@ fn add(slot: &Slot, records: &mut bind::Records, caps: &mut caps::DevmgrCaps) ->
     let mut func = 0u8;
     while func < functions
     {
-        let taken: Vec<(u64, u64)> = records
-            .live_pci()
-            .filter(|r| slot.holds(address(r)))
-            .flat_map(mmio_ranges)
-            .collect();
+        let mut free = Vec::new();
+        if hp::free_ranges(caps.apertures.spans(), slot, &mut free).is_err()
+        {
+            std::os::seraph::log!(
+                warn: "hotplug: bus {}:{}: no memory for the free ranges; nothing more added",
+                segment, bus
+            );
+            break;
+        }
         let found = with_function(caps, (segment, bus, 0, func), |cfg| {
-            let found = hp::place(cfg, slot, (bus, 0, func), &taken);
+            let found = hp::place(cfg, slot, (bus, 0, func), &free);
             // Bit 7 of a present function 0's Header Type marks a
             // multi-function device, whose functions 1 to 7 are read too.
             if func == 0
@@ -714,30 +733,9 @@ fn add(slot: &Slot, records: &mut bind::Records, caps: &mut caps::DevmgrCaps) ->
             }
             Some(hp::Found::Ready(device)) =>
             {
-                let (vendor, id) = at(&device);
-                match hp::admit(device, |d| records.pci.append(d))
+                if admit(device, (segment, bus, 0, func), records, caps)
                 {
-                    Admission::Appended(index) =>
-                    {
-                        appended = appended.saturating_add(1);
-                        std::os::seraph::log!(
-                            "hotplug: {}:{}:0.{} {:04x}:{:04x} recorded as PCI record {}",
-                            segment,
-                            bus,
-                            func,
-                            vendor,
-                            id,
-                            index
-                        );
-                    }
-                    Admission::Bridge => std::os::seraph::log!(
-                        warn: "hotplug: {}:{}:0.{} {:04x}:{:04x} is a bridge; not descended into",
-                        segment, bus, func, vendor, id
-                    ),
-                    Admission::Refused(e) => std::os::seraph::log!(
-                        warn: "hotplug: {}:{}:0.{} {:04x}:{:04x} not recorded: {}",
-                        segment, bus, func, vendor, id, hp::refusal(e)
-                    ),
+                    appended = appended.saturating_add(1);
                 }
             }
             Some(hp::Found::Unplaced(device, why)) =>
@@ -770,17 +768,137 @@ fn add(slot: &Slot, records: &mut bind::Records, caps: &mut caps::DevmgrCaps) ->
     appended
 }
 
-/// The `(base, end)` of each MMIO BAR of `device` that is assigned.
-fn mmio_ranges(device: &PciDevice) -> impl Iterator<Item = (u64, u64)> + '_
+/// Admit the function `device` at `at`, its BARs placed and programmed: hold
+/// its BAR pages, moving each page span ([`hp::bar_spans`]) out of the
+/// apertures into the held BAR pages ([`caps::DevmgrCaps::slot_bars`]),
+/// where a bind carves them and no region grant or later placement reaches
+/// them, then append its record ([`hp::admit`]). A type-1 function holds
+/// nothing and is not recorded. Pages that cannot be held, or whose record
+/// is refused, are returned to the apertures, logged, the function not
+/// recorded. Returns whether its record was appended.
+fn admit(
+    device: PciDevice,
+    at: Address,
+    records: &mut bind::Records,
+    caps: &mut caps::DevmgrCaps,
+) -> bool
 {
-    device
-        .bar_phys
-        .iter()
-        .zip(&device.bar_size)
-        .zip(&device.bar_is_mmio)
-        .take(device.bar_count)
-        .filter(|&((&phys, _), &mmio)| mmio && phys != 0)
-        .map(|((&phys, &size), _)| (phys, phys.saturating_add(size)))
+    let (segment, bus, _, func) = at;
+    let (vendor, id) = (device.vendor_id, device.device_id);
+    let mut spans = [(0u64, 0u64); MAX_BARS];
+    let mut count = 0usize;
+    if device.bridge_buses.is_none()
+    {
+        for (to, span) in spans.iter_mut().zip(hp::bar_spans(&device))
+        {
+            *to = span;
+            count = count.saturating_add(1);
+        }
+    }
+    let spans = spans.get(..count).unwrap_or(&[]);
+    if let Err(e) =
+        caps.apertures
+            .move_all(&mut caps.slot_bars, spans, PAGE_SIZE, crate::split_mmio)
+    {
+        std::os::seraph::log!(
+            warn: "hotplug: {}:{}:0.{} {:04x}:{:04x}: BAR pages not held ({:?}); not recorded, no \
+                   driver",
+            segment, bus, func, vendor, id, e
+        );
+        return false;
+    }
+    match hp::admit(device, |d| records.pci.append(d))
+    {
+        Admission::Appended(index) =>
+        {
+            std::os::seraph::log!(
+                "hotplug: {}:{}:0.{} {:04x}:{:04x} recorded as PCI record {}",
+                segment,
+                bus,
+                func,
+                vendor,
+                id,
+                index
+            );
+            true
+        }
+        Admission::Bridge =>
+        {
+            std::os::seraph::log!(
+                warn: "hotplug: {}:{}:0.{} {:04x}:{:04x} is a bridge; not descended into",
+                segment, bus, func, vendor, id
+            );
+            false
+        }
+        Admission::Refused(e) =>
+        {
+            release(caps, spans);
+            std::os::seraph::log!(
+                warn: "hotplug: {}:{}:0.{} {:04x}:{:04x} not recorded: {}",
+                segment, bus, func, vendor, id, hp::refusal(e)
+            );
+            false
+        }
+    }
+}
+
+/// Hold the BAR pages of the functions behind `slot` that the apertures
+/// still hold: move the part of the page span ([`hp::bar_spans`]) of each
+/// MMIO BAR of each live record behind it that each aperture cap covers out
+/// of the apertures into the held BAR pages
+/// ([`caps::DevmgrCaps::slot_bars`]), so no placement in the slot's windows,
+/// which takes only what the apertures hold, lands on them, and a bind
+/// carves them from there. A bound function's BARs were carved at its bind,
+/// whole or up to what its driver maps, so only what its bind left is moved.
+/// Returns the ranges held, or `None`, none held, when the moves fail.
+fn hold_behind(
+    slot: &Slot,
+    records: &bind::Records,
+    caps: &mut caps::DevmgrCaps,
+) -> Option<Vec<(u64, u64)>>
+{
+    let mut held: Vec<(u64, u64)> = Vec::new();
+    for device in records.live_pci().filter(|d| slot.holds(address(d)))
+    {
+        for (base, len) in hp::bar_spans(device)
+        {
+            let end = base.saturating_add(len);
+            for s in caps.apertures.spans()
+            {
+                let (from, to) = (s.base.max(base), s.end.min(end));
+                // BARs that share a page share its span, held once.
+                let taken = held
+                    .iter()
+                    .any(|&(b, l)| b < to && from < b.saturating_add(l));
+                if from < to && !taken
+                {
+                    held.try_reserve(1).ok()?;
+                    held.push((from, to.saturating_sub(from)));
+                }
+            }
+        }
+    }
+    caps.apertures
+        .move_all(&mut caps.slot_bars, &held, PAGE_SIZE, crate::split_mmio)
+        .ok()?;
+    Some(held)
+}
+
+/// Return the held BAR pages `spans`, each a span [`hold_behind`] or
+/// [`add`] moved whole, from [`caps::DevmgrCaps::slot_bars`] to the
+/// apertures. Moved back whole, a span splits nothing; when the tables
+/// cannot grow, the spans stay held, logged, where only a bind reaches them.
+fn release(caps: &mut caps::DevmgrCaps, spans: &[(u64, u64)])
+{
+    let returned = caps
+        .slot_bars
+        .move_all(&mut caps.apertures, spans, PAGE_SIZE, |_, _| {
+            Err(SplitError::Failed)
+        });
+    if returned.is_err()
+    {
+        std::os::seraph::log!(warn: "hotplug: no memory to return held BAR pages; they stay held");
+    }
 }
 
 /// Run `access` on the function at `at` (segment, bus, device, function),

@@ -644,7 +644,25 @@ fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
         flags.push("--release");
     }
 
-    let env = [("RUSTFLAGS", BOOT_RUSTFLAGS)];
+    // The trust store the bootloader is built with, at a fixed path of the
+    // build output, which `core/boot/src/signing.rs` embeds from the path
+    // `SERAPH_BOOT_TRUST_STORE` names (docs/signing.md § Signing). rustc
+    // tracks the file and the variable, so the bootloader rebuilds when the
+    // store changes, and only then: `write_boot_store` leaves an unchanged
+    // file untouched.
+    let signer = crate::signing::Signer::for_bootloader(ctx, args.arch)?;
+    let store = crate::signing::write_boot_store(ctx, &signer)?;
+    step(&format!("Trust store: {}", store.display()));
+    let store =
+        std::path::absolute(&store).with_context(|| format!("resolving {}", store.display()))?;
+    let store = store
+        .to_str()
+        .with_context(|| format!("the trust store path {} is not UTF-8", store.display()))?;
+
+    let env = [
+        ("RUSTFLAGS", BOOT_RUSTFLAGS),
+        ("SERAPH_BOOT_TRUST_STORE", store),
+    ];
     if !args.skip_lints
     {
         clippy_check_ext(ctx, &flags, &env, None)?;

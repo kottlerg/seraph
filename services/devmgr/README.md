@@ -35,7 +35,7 @@ devmgr/
 │   ├── acpi.rs                     # acpid's requests: region grants, configuration access, pushes
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, port carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
-│   │   ├── x86_64/mod.rs           # IoPort carves (platform records, PM1a + 8042); no ECAM default
+│   │   ├── x86_64/mod.rs           # IoPort carves (platform records, FADT blocks); no ECAM default
 │   │   └── riscv64/mod.rs          # QEMU virt ECAM default; SbiControl
 │   ├── bind.rs                     # Binding PCI and platform records to matching driver
 │   │                               #   declarations; withdrawal of a bound driver
@@ -66,9 +66,9 @@ devmgr/
 ## Responsibilities
 
 devmgr parses firmware tables, enumerates PCI devices, binds and spawns drivers, exposes the device
-registry, and brokers ACPI and shutdown hardware to pwrmgr, and adds the functions a card brings to
-a PCI Express hotplug slot it controls natively (hotplug removal is design intent; not yet
-implemented); it is the sole authority for spawning device drivers. Each responsibility, the
+registry, brokers ACPI tables to acpid and the RISC-V shutdown cap to pwrmgr, and adds the functions
+a card brings to a PCI Express hotplug slot it controls natively (hotplug removal is design intent;
+not yet implemented); it is the sole authority for spawning device drivers. Each responsibility, the
 capabilities devmgr receives at bootstrap, and its relationship to driver processes are specified in
 [docs/responsibilities.md](docs/responsibilities.md); the system-scope design is
 [docs/device-management.md](../../docs/device-management.md).

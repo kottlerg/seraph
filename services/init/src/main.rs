@@ -189,6 +189,28 @@ pub(crate) fn descriptors(info: &InitInfo) -> &[CapDescriptor]
     unsafe { core::slice::from_raw_parts(ptr, count) }
 }
 
+/// A map-only derivation of the `trust-store` boot module's cap and the
+/// store's length in bytes, for procmgr's bootstrap round; `None`, logged,
+/// when init holds no such module or cannot derive the cap. procmgr, which
+/// then receives none, stops (docs/signing.md § Trust Store).
+fn trust_store_for_procmgr(info: &InitInfo) -> Option<(u64, u64)>
+{
+    let Some(slot) = find_module_by_name(info, boot_protocol::TRUST_STORE_MODULE)
+    else
+    {
+        logging::log("init: no trust-store boot module; procmgr receives no trust store");
+        return None;
+    };
+    let len = bootstrap::descriptor_for(info, slot).map(|d| d.aux1)?;
+    let Ok(cap) = syscall::cap_derive(slot, syscall::RIGHTS_MEM_MAP)
+    else
+    {
+        logging::log("init: trust-store cap derive failed; procmgr receives no trust store");
+        return None;
+    };
+    Some((cap, len))
+}
+
 /// Locate a boot-module `Memory` capability by the bundle-entry name
 /// the kernel published in [`InitInfo::module_names`] (init-protocol
 /// v7+).
@@ -828,13 +850,34 @@ fn run(info_ptr: u64) -> !
     //   [2] un-badged SEND on svcmgr's service endpoint, slotted in
     //       procmgr's CSpace by `bootstrap_procmgr`. Procmgr derives a
     //       badged SEND per child for `ProcessInfo.service_registry_cap`.
+    //   [3] map-only Memory cap on the `trust-store` boot module, the
+    //       store the bootloader verified the boot against
+    //       (docs/signing.md § Trust Store); procmgr copies it, then
+    //       drops the cap. Absent when init holds no such module.
     //
-    // No data words: every per-child allocation routes through memmgr.
+    // Data: [the trust store's length in bytes], when cap [3] is present.
+    // Every per-child allocation routes through memmgr.
     let Ok(pm_service_cap_for_pm) = syscall::cap_derive(procmgr_service_ep, syscall::RIGHTS_ALL)
     else
     {
         logging::log("FATAL: cannot derive procmgr service cap for bootstrap");
         syscall::thread_exit();
+    };
+    let trust_store = trust_store_for_procmgr(info);
+    let pm_caps = [
+        pm_service_cap_for_pm,
+        pm.log_endpoint_slot,
+        pm.registry_endpoint_slot,
+        trust_store.map_or(0, |(cap, _)| cap),
+    ];
+    let pm_data = [trust_store.map_or(0, |(_, len)| len)];
+    let (round_caps, round_data): (&[u64], &[u64]) = if trust_store.is_some()
+    {
+        (&pm_caps, &pm_data)
+    }
+    else
+    {
+        (pm_caps.get(..3).unwrap_or_default(), &[])
     };
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe {
@@ -843,12 +886,8 @@ fn run(info_ptr: u64) -> !
             pm.bootstrap_badge,
             ipc_buf,
             true,
-            &[
-                pm_service_cap_for_pm,
-                pm.log_endpoint_slot,
-                pm.registry_endpoint_slot,
-            ],
-            &[],
+            round_caps,
+            round_data,
         )
     }
     .is_err()

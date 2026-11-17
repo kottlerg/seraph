@@ -458,8 +458,9 @@ fn serve_extent_rounds(
 
 /// The boot modules init uses itself or hands to the service it starts them
 /// through, never forwarded to devmgr: the bootstrap services, the root
-/// filesystem driver, and init's log-level configuration.
-const BOOTSTRAP_MODULES: [&[u8]; 7] = [
+/// filesystem driver, init's log-level configuration, and the trust store,
+/// which procmgr alone receives.
+const BOOTSTRAP_MODULES: [&[u8]; 8] = [
     b"init",
     b"procmgr",
     b"memmgr",
@@ -467,6 +468,7 @@ const BOOTSTRAP_MODULES: [&[u8]; 7] = [
     b"vfsd",
     b"fatfs",
     crate::log_levels::MODULE_NAME,
+    boot_protocol::TRUST_STORE_MODULE,
 ];
 
 /// Module caps one `kind::MODULE` round carries (`MSG_CAP_SLOTS_MAX`).
@@ -908,8 +910,8 @@ pub fn create_devmgr_with_caps(
     // `services/init/docs/bootstrap.md` § Per-stage authority transfers).
     // The arch shutdown-authority cap is a full-rights derivation of the
     // root `IoPort` on x86-64 (devmgr derives narrow per-driver IoPort caps
-    // from it for ISA peripherals like the CMOS RTC, and carves the PM1a +
-    // 8042 ports for pwrmgr) and an `SbiControl` derivation narrowed to
+    // from it for ISA peripherals like the CMOS RTC and the FADT register
+    // blocks acpid drives) and an `SbiControl` derivation narrowed to
     // Reset and Suspend on RISC-V (devmgr serves a Reset-only derivation to
     // pwrmgr for SBI SRST). devmgr is the hardware authority; pwrmgr
     // acquires its shutdown caps from devmgr, not from init.

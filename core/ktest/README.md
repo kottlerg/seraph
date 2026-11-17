@@ -45,6 +45,7 @@ core/ktest/
     ├── frame_pool.rs       # Memory capability pool for tests that map memory
     ├── init_info.rs        # The InitInfo capability-descriptor array, for initial-cap lookups
     ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes
+    ├── cpu_sample.rs       # The CPUs a per-CPU case checks past 16 CPUs
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
     ├── arch/               # Arch-dispatch surface (see Test structure)
     │   ├── mod.rs          # Selects the active arch module by target_arch
@@ -204,6 +205,7 @@ concurrent notification and queue events.
 | `irq_preserves_user_regs.rs` | A ring-3 thread's callee-saved registers survive a timer preemption through the frame-authoritative IRQ path |
 | `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry, both a user-mode store and the kernel's `SYS_GETRANDOM` copy (the copy-region retry) |
 | `write_regs_blocked_syscall.rs` | A thread stopped while blocked in `notification_wait`, `ipc_recv`, or `thread_sleep` (the frame's syscall-number register names that syscall) has its instruction pointer and second-argument register rewritten from another CPU; on restart the blocked syscall's `Interrupted` return resumes at the new instruction pointer with the edited argument intact, every round, as the raw-pointer frame model of [core/kernel/docs/arch-interface.md § `trap_frame`](../kernel/docs/arch-interface.md#trap_frame--archcurrenttrap_frame) preserves, with the redirected child's stack one call chain deep across the rounds (≥ 2 CPUs) |
+| `user_mode_controls.rs` | On every CPU up to 16, and past that on a sample of the BSP, the first APs and CPUs spread to the last (`src/cpu_sample.rs`), a user-mode thread reads the cycle counter the kernel grants (`RDTSC`, `csrr cycle`) and each instruction a control the kernel denies traps at that instruction, whatever the firmware left: on x86-64 `RDPMC` and `CLI` raise `#GP(0)` and `RDPKRU`, `TESTUI` and `ENCODEKEY128` raise `#UD`; on riscv64 reads of `time`, `instret`, `hpmcounter3` and `ssp` and the cache-block operations `cbo.zero`, `cbo.clean`, `cbo.flush` and `cbo.inval` raise an illegal-instruction exception. On x86-64 the thread also checks the state of the controls the kernel sets: `RDTSCP` and `RDPID` read 0, `CPUID` executes, `RDSSPQ` reads no shadow-stack pointer, and a misaligned load with `RFLAGS.AC` set completes. The controls are listed in [core/kernel/docs/cross-boundary-disclosure.md § User-mode hardware controls](../kernel/docs/cross-boundary-disclosure.md#user-mode-hardware-controls) |
 | `idle_past_watchdog_threshold.rs` | Every CPU idles past the all-idle softlockup threshold (ktest's only thread sleeps 4 s) and the kernel prints no `=== WATCHDOG` dump, since an idle system is not a stall ([core/kernel/docs/scheduling-internals.md § Softlockup Watchdog](../kernel/docs/scheduling-internals.md#softlockup-watchdog)); the failure is the kernel's dump, which `run-parallel` and CI count as a failed boot |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
@@ -279,9 +281,10 @@ width implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound s
 slow step from a stuck or wrong one. They are the report bound of `tally::await_report` and
 `tally::await_all`; the round bounds of `configure_start_race`, `stop_target_vanishes`,
 `thread_cap_delete_under_use`, `copy_source_delete` and `affinity_swap_handoff`, and the exit
-polls of `thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU report wait of
-`priority_dealloc_race`; the acknowledgement, result, approach, sync and entry bounds of
-`stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
+polls of `thread_cap_delete_under_use` and `copy_source_delete`; the phase bound of
+`affinity_park_handoff`; the pinned-CPU report wait of `priority_dealloc_race`; the
+acknowledgement, result, approach, sync and entry bounds of `stop_claimed_delete`,
+`stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
 acknowledgement, server-entry and exit bounds of `stop_source_delete`; the preemption budget of
 `integration::priority_preemption`; the progress budget of `integration::fair_share_progress`;
 the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the expiry and
@@ -301,7 +304,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::death_observer_outlives_queue_caps`, `integration::reply_binding_displaced`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,
-`integration::umip_descriptor_reads_fault`, `cap::cspace_self_delete_stops_caller` and
+`integration::umip_descriptor_reads_fault`, `integration::user_mode_controls`,
+`cap::cspace_self_delete_stops_caller` and
 `retype::aspace_self_delete_stops_caller`; the teardown polls of
 `mm::memory_split_after_cspace_teardown`; the probe-wait bound and the worker's readiness, call
 and exit bounds of `retype::pool_seeding_takes_interrupts`,
@@ -391,6 +395,7 @@ is not a stall to the all-idle detector.
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout (≥ 2 CPUs) | `CYCLES=400`, `WAIT_MS=1` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600` |
 | `affinity_swap_handoff.rs` | Swap the affinities of pairs of workers that each own one CPU of their pair and report their CPU and yield in a loop, so both CPUs of a pair hand their outgoing thread to the other in `schedule()`'s cross-affinity requeue at once; every round must see every worker on its new CPU (#529, the dispatch wait for an unpublished `next` closing into a cycle) (≥ 2 CPUs) | `MAX_PAIRS=8`, `ROUNDS=400` |
+| `affinity_park_handoff.rs` | A worker moves its own hard affinity between two CPUs and parks at once in a notification wait, while a waker on a third CPU sends it after a delay the rounds sweep, so the wake, routed by the new affinity, links the worker on the CPU it names while it is still `current` on the CPU it parks on; in the first phase that CPU idles, in the second a spinner below the worker yields in a loop on each of the two CPUs, so the claiming CPU dequeues the worker while the parking CPU's `schedule()` decides. Every affinity change and wait returns `Ok`, both children finish each phase within its bound, and in each phase some wait returns on the CPU its round named (#1221, `schedule()` requeueing a `current` another CPU's dispatch has claimed; the kernel's debug assertions, `commit_blocked`'s "parking while linked" and the run queue's double-link guard, are the tripwires) (≥ 3 CPUs) | `CYCLES=16_000` per phase (two phases) |
 | `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) (≥ 2 CPUs) | `CYCLES=1024` |
 | `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread (≥ 2 CPUs) | `NUM_PAIRS=16`, `ITERS=16000` |
 | `concurrent_notification.rs` | Multiple threads sending distinct bits to one notification simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |

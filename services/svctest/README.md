@@ -59,7 +59,8 @@ services/svctest/
         │                      #   driver bind; DMA confinement; MSI delivery, forge,
         │                      #   churn, and release
         ├── acpi.rs            # acpid's results read from devmgr (`acpi_host_bridges`); the
-        │                      #   `ACPI_AUTHORITY` gate (`acpi_authority_deny`)
+        │                      #   `ACPI_AUTHORITY` gate (`acpi_authority_deny`); the power
+        │                      #   deny check (`acpid_power_deny`)
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
@@ -84,7 +85,7 @@ services/svctest/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
         │   ├── pressure.rs    # Own fatfs gives idle cache pages back at memory pressure Low
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
-        ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
+        ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
@@ -135,13 +136,14 @@ bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, forge, churn, and
 release phases (`caps[9]`), the
 drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to
-`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and
-`pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
+`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`,
+`pwrmgr.deny` and `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]`
+and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`,
 `logd_concurrent`, and `logd_restart` phases (`caps[6]`), the vfsd swap-partition phase
-(`caps[14]`), and the `crash_endpoint` and `logd_restart` phases (`caps[15]`) instead fail their
-assertions. The seed-only phase thus fails
-the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
+(`caps[14]`), the `crash_endpoint` and `logd_restart` phases (`caps[15]`), and the
+`svcmgr_stop_service` phase (`caps[16]`) instead fail their assertions. The seed-only phase thus
+fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
 and the run ends idle.
 
@@ -154,9 +156,10 @@ the front, from the back, and from both ends at once, and env carries `SERAPH_TE
 ## Capabilities
 
 The bootstrap rounds from the creator endpoint deliver the recipe's seeds in this order, four slots
-to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`, and
-`caps[12]` to `caps[15]`), the last being the debug-authority cap the recipe's
-`debug_authority = yes` grants; [service-definitions.md §
+to a round (`caps[0]` to `caps[3]`, `caps[4]` to `caps[7]`, `caps[8]` to `caps[11]`,
+`caps[12]` to `caps[15]`, and `caps[16]`), the last two being the debug-authority cap the
+recipe's `debug_authority = yes` grants and the stop-authority cap its `stop_authority = yes`
+grants; [service-definitions.md §
 `seed`](../svcmgr/docs/service-definitions.md#seed) defines each name's cap shape and the zero slot
 an unresolved name leaves. With no creator endpoint, every slot stays zero.
 
@@ -178,6 +181,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
 | `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; svctest declares itself undebuggable at startup |
+| `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE` |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
@@ -249,7 +253,9 @@ restart took.
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
-reply to `SHUTDOWN`.
+reply to `SHUTDOWN`. The public `acpid.deny` is resolved the same way and drives the
+`acpid_power_deny` phase, which requires an `UNAUTHORIZED` reply to `SLEEP(5)`, to `RESET` and to
+`WAIT_EVENT`.
 
 The `svcmgr_worker_fault_restart` phase runs when the `crasher-worker.svc` recipe is staged
 beside `svctest.svc` and is skipped otherwise; staged, it fails if `crasher.worker` is not
@@ -257,6 +263,18 @@ published within 10 s. It reads the instance's
 nonce with `PROBE_INSTANCE`, sends `PROBE_FAULT_WORKER` so a worker thread of the fixture faults,
 and requires a different nonce from the instance svcmgr restarts
 ([crasher](../crasher/README.md)).
+
+The `svcmgr_stop_service` phase checks the stop authority
+([svcmgr IPC Interface](../svcmgr/docs/ipc-interface.md) § Stop authority). Through the
+per-process `service_registry_cap` both `STOP_SERVICE` and `LIST_STOPPABLE` must reply
+`UNAUTHORIZED`. Through `caps[16]`, `STOP_SERVICE` must reply `NOT_STOPPABLE` for an unknown
+name, for svctest itself (`restart = never`), vfsd (started by init), logd (`critical = yes`),
+pwrmgr (the shutdown actuator, a core role) and timed (no `oom_stop`). With `crasher-worker.svc`
+staged, whose recipe sets `oom_stop = yes`, the whole `LIST_STOPPABLE` walk must list
+`crasher-worker` alone with a non-zero usage, `STOP_SERVICE` of it must reply `SUCCESS`, and the
+fixture must then answer `PROBE_INSTANCE` with a new instance's nonce, the restart its
+`on_failure` policy makes of the `EXIT_KILLED` death. Without the fixture the walk must list
+nothing.
 
 ---
 
@@ -290,6 +308,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `node-handle-child`         | `node_handle`  | `memmgr_node_handles` (max set by handle)   |
 | `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
+| `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---
 

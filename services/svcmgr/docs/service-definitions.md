@@ -67,6 +67,9 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
 | `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth`. Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
+| `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
+| `oom_stop` | no | `yes` or `no` (default `no`). Opts the service in to being stopped by a stop-authority holder. Refused, as a parser error, on a recipe the eligibility rule refuses. See [`oom_stop`](#oom_stop). |
+| `reserve` | no | `yes` or `no` (default `no`). Creates the service inside memmgr's system reserve. A core role: the eligibility rule never stops it. See [`reserve`](#reserve). |
 | `priority` | no | Priority level (`1..=30`) the service's initial thread is created at. Unset: procmgr's default (`sched_policy::DEFAULT_SPAWN_PRIORITY`, clamped to the band). See [`priority` / `sched_max`](#priority--sched_max). |
 | `sched_max` | no | Band ceiling (`1..=30`): the service's `SchedControl` covers `[1, sched_max]`. Must be ≥ `priority` when both are set. Unset: the service inherits a copy of svcmgr's own band. |
 
@@ -136,8 +139,8 @@ every fault, but its eventual permanent death is non-fatal).
 
 **The shutdown actuator's own death** is the edge case. pwrmgr, the
 actuator, is `restart = on_failure` + `critical = no`: a crashed pwrmgr is
-recoverable (svcmgr re-creates it and it re-acquires its actuator caps from
-devmgr — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
+recoverable (svcmgr re-creates it and it re-acquires its actuator authority from
+devmgr or acpid — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
 *permanent* death is deliberately non-fatal. It is `critical = no` precisely
 because the graceful-shutdown escalation routes through the actuator — if
 the actuator is the dead service, nothing can power the system off, so
@@ -253,6 +256,8 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on vfsd's namespace endpoint at its synthetic root, with full namespace rights: the namespace root, which crosses mounts (derived from init's system-root cap) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
+| `acpid.power` | svcmgr (`acpid.svc` provider) | `POWER_AUTHORITY`-badged SEND on acpid's service endpoint, gating `SLEEP`, `RESET` and `WAIT_EVENT` (seeded by pwrmgr only) | no |
+| `acpid.deny` | svcmgr (`acpid.svc` provider) | no-authority SEND on acpid's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) | yes |
 | `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
@@ -272,8 +277,9 @@ svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
 (ahead of the `seed` caps), and publishes one SEND per entry. If the RECV
 derive fails, on first launch or on a restart, svcmgr destroys the new
 child instead of shifting the seeds down into cap[0]. Providers
-launch ahead of pure consumers during reconciliation, so a provided name
-is resolvable before any consumer queries it. The endpoint persists across
+launch ahead of pure consumers during reconciliation, and a provider after
+each provider whose name it seeds (§ Reconciliation), so a provided name
+is resolvable before any service launched in the scan queries it. The endpoint persists across
 restarts (svcmgr holds the source), so a cached client cap survives a
 crash-restart and no re-publish is needed.
 
@@ -404,6 +410,73 @@ namespace       = none
 debug_authority = yes
 ```
 
+## `stop_authority`
+
+`yes` endows the service with svcmgr's stop authority: on its first launch and on every restart,
+svcmgr mints a SEND on its own service endpoint badged `svcmgr_labels::STOP_AUTHORITY` and delivers
+it in the bootstrap slot after the `seed` caps and, for a `debug_authority = yes` service, after
+the debug-authority slot. A derive that fails leaves the slot absent. The authority serves
+svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE`
+([ipc-interface.md § Stop authority](ipc-interface.md#stop-authority)): the holder learns which
+services it may stop, with each one's memory usage, and has svcmgr stop one. svcmgr does the
+stopping, through the process handle it holds as the service's creator, so the holder never holds
+a kill authority, and stops only what the [`oom_stop`](#oom_stop) rule allows. This key is the only
+path that mints the cap.
+
+`stop_authority = yes` alongside `log_sink = yes` is a parser error, as for `debug_authority`. A
+holder has a core role, so no holder stops another or itself. A one-shot holder
+(`restart = never`) is allowed: svctest's recipe sets the key.
+
+## `oom_stop`
+
+`yes` opts the service in to being stopped by a [`stop_authority`](#stop_authority) holder, and
+makes svcmgr ask procmgr for a node handle to the service's memory budget node at each create
+(`CREATE_NODE_HANDLE`), through which `LIST_STOPPABLE` reads its usage. Opting in is not enough:
+svcmgr stops a service only when this rule, `svcmgr_defs::stop::stop_refusal`, allows it,
+refusing for the first row that applies:
+
+| Row | The service | Refused because |
+|---|---|---|
+| 1 | was started by init (memmgr, procmgr, devmgr, vfsd), so svcmgr only binds it | not launched by svcmgr |
+| 2 | has `restart = never`, so svcmgr does not supervise it | one-shot |
+| 3 | has `critical = yes` | the system is not viable without it |
+| 4 | holds a core role: `log_sink`, `debug_authority`, `stop_authority`, `reserve` or `shutdown_actuator` | the system's log, crash reporting, stopping and shutdown rest on it |
+| 5 | does not set `oom_stop = yes` | not opted in |
+
+Eligibility is read from the recipe's keys alone, never from the service's name. The parser
+applies the same rule to a recipe that sets `oom_stop = yes`, as a service svcmgr launches, and
+rejects one the rule refuses (`oom_stop = yes` with `restart = never`, `critical = yes`, or a
+core role), naming the reason, so an opt-in that could never take effect is an error where it is
+written. A recipe of a service init starts that sets the key parses, and svcmgr refuses its stop.
+
+A stop is routed as the death `EXIT_KILLED` through the service's restart policy and budget, so
+an `on_failure` or `always` service restarts while its budget lasts
+([Restart Protocol](restart-protocol.md)).
+
+```
+binary    = /tests/crasher
+argv      = crasher worker-fault
+restart   = on_failure
+critical  = no
+namespace = none
+provides  = crasher.worker
+oom_stop  = yes
+```
+
+## `reserve`
+
+`yes` creates the service inside memmgr's system reserve: svcmgr sets procmgr's
+`CREATE_RESERVE` on each create, so the service's budget node is a reserve node, which may take
+the free pages memmgr keeps in reserve
+([memmgr Memory Pool § Distribution policy](../../memmgr/docs/memory-pool.md#distribution-policy);
+[procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Messages, **Memory max and
+reserve**). procmgr honours the flag because svcmgr's own node is a reserve node. Without the key
+a service svcmgr launches is outside the reserve. The key acts on svcmgr's creates only: a service
+init starts is placed by init. A reserve service has a core role, so no stop-authority holder
+stops it. The crash service's recipe sets it, so crashd can report and dump a fault memmgr
+declined for want of memory while the free pool is spent
+([services/crashd/docs/operation.md](../../crashd/docs/operation.md) § Hold).
+
 ## Device class files
 
 devmgr's device classes are configured from class files, not from source. svcmgr reads every
@@ -451,9 +524,28 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 
 | Definition | Pending registration | Outcome |
 |---|---|---|
-| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
-| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
+| present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink, debug-authority, stop-authority, `oom_stop` and `reserve` flags, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
+| present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, the scheduling fields and the create flags `reserve` and `oom_stop` ask for, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
+
+svcmgr launches the **launching** entries in launch order, which
+`svcmgr_defs::launch_order` computes over every parsed recipe: providers (a non-empty
+`provides`) ahead of pure consumers, each group in service-name order, and among the providers
+each one after every provider whose name it seeds. svcmgr publishes a provided name only once
+its provider has launched, so this order is what lets one provider seed another's name: pwrmgr
+seeds `acpid.power`, so acpid launches first. A seed naming a name no recipe provides orders
+nothing. When providers seed each other in a cycle, the first of them in name order is placed
+first, which svcmgr logs (`<name> is in a seed cycle; launched before a provider it seeds from`),
+and its seeds of the others' names resolve to nothing at its launch.
+
+The order promises only which launch is attempted first, within the one scan:
+
+- A provider launches whether or not the launch of a provider it seeds from succeeded; the seed
+  of a provider whose launch failed is unresolved at its launch, as any unresolved seed is.
+- A **bind only** service, which init already launched, is not launched again, so its place in
+  the order does nothing.
+- A restarted service's seeds are resolved again at its restart, from what the registry then
+  holds; a provider's endpoint, and so its published names, outlive its restarts.
 
 Out of memory changes two outcomes. When the scan has no room for the list of parsed recipes, it
 launches nothing and releases every pending registration's thread cap: each endowed service runs
@@ -472,7 +564,7 @@ registration is released, and svcmgr routes vfsd's death as system death
 | Document | Content |
 |---|---|
 | [README.md](../README.md) | Component scope, responsibilities, restart policy |
-| [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT` |
+| [ipc-interface.md](ipc-interface.md) | handover endowment, `HANDOVER_COMPLETE`, `PUBLISH_ENDPOINT` / `QUERY_ENDPOINT`, `STOP_SERVICE` / `LIST_STOPPABLE` |
 | [restart-protocol.md](restart-protocol.md) | Restart sequencing, shared spawn primitives, criticality semantics |
 | [shared/ipc/src/lib.rs](../../../shared/ipc/src/lib.rs) | `published_names` constants, `svcmgr_labels::*`, `svcmgr_errors::*` |
 

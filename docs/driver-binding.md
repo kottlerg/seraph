@@ -69,22 +69,31 @@ knows its bus or firmware standard and no driver.
 | Platform description | A per-machine data table in the boot bundle, chosen by the ACPI OEM table ID | The key each entry names |
 | IOMMU | The ACPI DMAR's remapping units (x86-64) or the RIMT's IOMMUs (riscv64) | One record per IOMMU family, keyed `dmar` or `rimt`, holding every unit's register range and scope |
 
-devmgr runs no AML: the namespace enumerator reads only `Device` objects whose identifying and
-resource objects are static `Name` objects, and skips one that defines any of them as a
-`Method`. It does not evaluate `_STA`: a `Device` whose `_STA` is a `Name` with bit 0 clear is
-not reported, and one whose `_STA` is a `Method` is reported. The platform description covers a
-device the machine's tables do not describe in that form; it is data, so a new machine adds a
-table, not devmgr code.
+devmgr evaluates no AML. AML is firmware code whose methods reach I/O ports, memory and
+configuration space, so it runs in acpid, a restartable service that holds only the register
+blocks the FADT declares and the regions devmgr grants it, one at a time, against the policy of
+[services/acpid/README.md](../services/acpid/README.md) (§ Region grants). devmgr consumes
+acpid's results: the `_OSC` grant and the `_PRT` routes, and the hotplug events (design intent;
+not yet implemented, #1096). The ACPI namespace enumerator itself still reads only `Device`
+objects whose identifying and resource objects are static `Name` objects, and skips one that
+defines any of them as a `Method`. It does not evaluate `_STA`: a `Device` whose `_STA` is a
+`Name` with bit 0 clear is not reported, and one whose `_STA` is a `Method` is reported. The
+platform description covers a device the machine's tables do not describe in that form; it is
+data, so a new machine adds a table, not devmgr code.
 
-One device has one record. Records are merged by resource identity: a record whose `Mmio` base
-or `IoPort` base an earlier record already holds adds its identity keys to that record rather
-than standing alone. A record keeps the first key of each single-valued kind it is given (the
-`_HID`, the SPCR interface type, the platform key): a later description's key of a kind the
-record already carries is dropped, so a declaration matches the merged record by the first
-description's key of that kind. A later `_CID` the record lacks is added while the record holds
-fewer than four. The console UART that the namespace describes as `PNP0501` and the SPCR
-names is therefore one record carrying both keys. A PCI function the RIMT names as an IOMMU
-belongs to the IOMMU record and has no record of its own.
+One device has one record, apart from a RISC-V IOMMU (below). Records are merged by resource
+identity: a record whose `Mmio` base or `IoPort` base an earlier record already holds adds its
+identity keys to that record rather than standing alone. A record keeps the first key of each
+single-valued kind it is given (the `_HID`, the SPCR interface type, the platform key): a later
+description's key of a kind the record already carries is dropped, so a declaration matches the
+merged record by the first description's key of that kind. A later `_CID` the record lacks is added
+while the record holds fewer than four. The console UART that the namespace describes as `PNP0501`
+and the SPCR names is therefore one record carrying both keys. A PCI function the RIMT names as an
+IOMMU keeps its own PCI record beside the IOMMU record, which holds its unit. devmgr marks the PCI
+record bound once it has taken the function as a unit for the IOMMU driver, with its memory decode
+and bus mastering turned on, whether or not the driver then starts: no binding pass gives the
+function to another driver, and acpid is refused every configuration write to it. A function devmgr
+does not take keeps an unbound record, as any other function does.
 
 A record carries the device's resources, typed:
 
@@ -409,6 +418,7 @@ attaches (`cargo xtask run --test-devices`), like any driver, and a test reaches
 ## Summarized By
 
 [Architecture Overview](architecture.md), [Device Management](device-management.md),
+[services/acpid/README.md](../services/acpid/README.md),
 [PCI Enumeration](../services/devmgr/docs/pci-enumeration.md),
 [devmgr Responsibilities and Capabilities](../services/devmgr/docs/responsibilities.md),
 [services/drivers/README.md](../services/drivers/README.md),

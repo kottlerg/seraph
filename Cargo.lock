@@ -3,6 +3,17 @@
 version = 4
 
 [[package]]
+name = "acpid"
+version = "0.1.4"
+dependencies = [
+ "aml",
+ "ipc",
+ "mmio",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "aml"
 version = "0.1.4"
 
@@ -483,6 +494,14 @@ version = "0.1.4"
 dependencies = [
  "ipc",
  "syscall",
+]
+
+[[package]]
+name = "objsig"
+version = "0.1.4"
+dependencies = [
+ "crypto",
+ "crypto-testkit",
 ]
 
 [[package]]

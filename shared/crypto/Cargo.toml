@@ -6,8 +6,8 @@ publish.workspace = true
 
 # no_std: vetted hash (SHA-512), Ed25519 signature verification, Ed25519 key
 # generation and signing behind the `sign` feature, and the ChaCha20-Poly1305
-# AEAD; today only ktest's known-answer tests use it. Pure core, no external
-# deps.
+# AEAD; ktest runs its known-answer tests, and shared/objsig verifies signed
+# objects with it. Pure core, no external deps.
 [lib]
 test = true
 doctest = false

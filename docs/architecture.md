@@ -112,6 +112,11 @@ Power manager. Owns the platform shutdown surface and serves
 `SHUTDOWN` / `REBOOT` IPC. See
 [`services/pwrmgr/README.md`](../services/pwrmgr/README.md).
 
+**acpid**
+ACPI service. Runs the firmware's AML on every boot and pushes each PCI host bridge's `_OSC`
+result, windows and routes to devmgr; devmgr evaluates none. See
+[`services/acpid/README.md`](../services/acpid/README.md).
+
 **timed**
 Wall-clock service. Resolves the platform RTC through devmgr at startup and serves
 `GET_WALL_TIME` from a fixed offset against the kernel's monotonic clock. See

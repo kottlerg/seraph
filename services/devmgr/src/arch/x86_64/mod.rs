@@ -147,6 +147,97 @@ pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
     firmware::acpi::line_mode(overrides.iter().copied(), gsi)
 }
 
+/// 8042 KBC command port: the 1-byte reset register pwrmgr pulses for reboot.
+const KBC_COMMAND_PORT: u16 = 0x64;
+
+/// The ports of pwrmgr's shutdown actuators ([`reply_shutdown_device`]):
+/// the FADT's `PM1a` control pair, when it can be read, and the 8042
+/// command port. acpid is granted none of them.
+pub fn pwrmgr_ports(firmware: &Firmware) -> Vec<firmware::acpid::Range>
+{
+    let pm1a = locate_table_by_sig(firmware, *b"FACP")
+        .and_then(|fadt| with_acpi_table(firmware, fadt, firmware::acpi::fadt_pm1a_cnt_blk));
+    let io = |base: u16, count: u64| firmware::acpid::Range {
+        space: firmware::acpid::Space::Io,
+        base: u64::from(base),
+        end: u64::from(base).saturating_add(count),
+    };
+    pm1a.map(|port| io(port, 2))
+        .into_iter()
+        .chain([io(KBC_COMMAND_PORT, 1)])
+        .collect()
+}
+
+/// The legacy ports of the interrupt controllers and timers the kernel owns,
+/// `(base, count)`: the two 8259s and their edge/level control registers,
+/// the PIT and the port-0x61 gate of its channel 2, which the kernel
+/// calibrates its timer against, and COM1, the kernel console.
+const KERNEL_PORTS: [(u16, u16); 6] = [
+    (0x20, 2),
+    (0xA0, 2),
+    (0x4D0, 2),
+    (0x40, 4),
+    (0x61, 1),
+    (0x3F8, 8),
+];
+
+/// The ports the kernel owns ([`KERNEL_PORTS`]). acpid is granted none of
+/// them.
+pub fn kernel_ports() -> Vec<firmware::acpid::Range>
+{
+    KERNEL_PORTS
+        .iter()
+        .map(|&(base, count)| firmware::acpid::Range {
+            space: firmware::acpid::Space::Io,
+            base: u64::from(base),
+            end: u64::from(base).saturating_add(u64::from(count)),
+        })
+        .collect()
+}
+
+/// The FADT's fixed register `block` and a narrow `IoPort` over it, for
+/// acpid (`QUERY_ACPI_RESOURCES`). `None` when the FADT cannot be read, it
+/// places no such block in the I/O space, or the carve fails.
+pub fn acpi_io_block(
+    firmware: &Firmware,
+    block: firmware::acpi::FadtBlock,
+) -> Option<(u64, firmware::acpi::IoBlock)>
+{
+    let io = locate_table_by_sig(firmware, *b"FACP").and_then(|fadt| {
+        with_acpi_table(firmware, fadt, |bytes| {
+            firmware::acpi::fadt_io_block(bytes, block)
+        })
+    })?;
+    let cap = ioport_carve(firmware.arch.ioport_cap, io.port, io.count)?;
+    Some((cap, io))
+}
+
+/// How devmgr checks acpid's `_PRT` table of `mode`
+/// (`firmware::acpid::PrtRule`): the PIC-mode table against each
+/// function's line, which the firmware programmed in that model; the routes
+/// of the APIC model only for being routed, and only once the PIC-mode table
+/// is held. Both modes are served.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the `Option` return is the dispatch surface's shape: the riscv64 arm serves no \
+              PIC-mode table"
+)]
+pub fn prt_rule(mode: firmware::acpid::PrtMode) -> Option<firmware::acpid::PrtRule>
+{
+    use firmware::acpid::{PrtMode, PrtRule};
+    Some(match mode
+    {
+        PrtMode::PicMode => PrtRule {
+            after: None,
+            lines: true,
+        },
+        PrtMode::Routes => PrtRule {
+            after: Some(PrtMode::PicMode),
+            lines: false,
+        },
+    })
+}
+
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with
 /// pwrmgr's shutdown actuator caps: a narrow `IoPort` over the
 /// caller-supplied `PM1a` control port (`msg` word 1) plus the 8042 reset
@@ -155,9 +246,6 @@ pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
 /// either carve fails.
 pub fn reply_shutdown_device(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
 {
-    // 8042 KBC command port — the 1-byte reset register pwrmgr pulses
-    // for reboot.
-    const KBC_COMMAND_PORT: u16 = 0x64;
     // pwrmgr computes the PM1a control port from the FADT; devmgr checks
     // it against its own read of the same field so the request cannot
     // name any other port.

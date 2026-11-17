@@ -255,7 +255,8 @@ what allows userspace memory managers to manage mappings on behalf of a process.
 
 A capability to an IPC endpoint. Rights:
 - **Send** — may call this endpoint (synchronous IPC, caller blocks for reply)
-- **Receive** — may accept calls on this endpoint (held only by the server)
+- **Receive** — may accept calls on this endpoint, and read the badge of a capability on it
+  (`SYS_ENDPOINT_BADGE`, § Badges) (held only by the server)
 - **Grant** — may include capabilities in the message's capability slots
 
 A send capability without grant right cannot pass capabilities to the server.
@@ -420,7 +421,11 @@ port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
 `QUERY_SHUTDOWN_DEVICE` also serves the FADT's 2-port PM1a control window plus the 8042 reset
 port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
-`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
+`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses. The
+`ACPI_AUTHORITY` badge bit, carried only by the seed-only `devmgr.acpi` cap that acpid's recipe
+alone seeds, gates the labels acpid calls. acpid's `IoPort` and `Mmio` region grants are
+derivations devmgr makes of caps it holds
+([services/acpid/docs/devmgr.md](../services/acpid/docs/devmgr.md) § Region grants).
 
 Every IoPort capability references an object of its own, as for [Mmio](#mmio): a copy or
 derivation references a fresh object over the same range, funded the same way. Each thread
@@ -594,6 +599,16 @@ Badges are generic: any capability type may carry one. For endpoints, the kernel
 delivers the badge on `ipc_recv`. For other types, the badge is stored but not
 automatically delivered — userspace may use it for bookkeeping.
 
+A server may also read the badge of a capability on its own endpoint that a client
+hands it, with `SYS_ENDPOINT_BADGE`, which answers only a caller holding a Receive
+capability on the same endpoint object. The badges on an endpoint are minted by its
+server or by the minters it gave an un-badged source, so the badge names to the
+server what the same badge names on its receive path: a capability a client passes
+names one of the server's own objects, and the client's authority over that object
+is the capability, not a value it states. The same-object test is what keeps the read
+the server's: anyone can mint any badge on an endpoint it holds an un-badged source
+of, so a badge read from a capability on another endpoint would prove nothing
+([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_ENDPOINT_BADGE` (69)).
 ### Kernel guarantees
 
 `SYS_CAP_DERIVE_BADGE` enforces two invariants:

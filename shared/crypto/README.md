@@ -8,12 +8,13 @@ signer, Ed25519 key generation and signing.
 signature verifier, and an AEAD usable by the bootloader/loader and userspace
 services, and a signer for the build host. Does no I/O and holds no keys: an
 AEAD caller passes its key on every call, and a signer's caller its secret seed.
-Today its only dependent is ktest, which runs the known-answer tests on target.
-
-The per-binary signing chain of trust ([docs/signing.md](../../docs/signing.md))
-verifies with `ed25519_verify` in its loaders and signs with `ed25519_sign` in
-xtask; both uses are design intent, not yet implemented
-([#124](https://github.com/kottlerg/seraph/issues/124)).
+Its dependents are ktest, which runs the known-answer tests on target, and
+[`shared/objsig`](../objsig/README.md), which implements the signature trailer,
+certificate and trust-store codec and the verifier of the per-binary signing
+chain of trust ([docs/signing.md](../../docs/signing.md)) on `ed25519_verify`
+and `sha512`. The rest of that chain, the loaders' verification and xtask's key
+management and signing with `ed25519_sign`, is design intent, not yet
+implemented ([#124](https://github.com/kottlerg/seraph/issues/124)).
 
 ---
 

@@ -34,7 +34,9 @@ fn deferred_of<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<DeferredR
         | Node::ChunkDir(_)
         | Node::Chunk(_)
         | Node::Caps(_)
-        | Node::Commit(_) => None,
+        | Node::Commit(_)
+        | Node::Handle(_)
+        | Node::Limit(_) => None,
     }
 }
 

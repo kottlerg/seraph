@@ -91,7 +91,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 17;
+pub const PROCMGR_LABELS_VERSION: u32 = 18;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -102,10 +102,11 @@ pub mod procmgr_labels
     use core::prelude::rust_2024::*;
 
     /// Create a new process from a boot module Memory cap. Caps: `[module,
-    /// creator_endpoint?, argv_env?, death_relay?]`, `argv_env` present iff
-    /// [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data words
-    /// `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as for
-    /// [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
+    /// creator_endpoint?, charge_node?, argv_env?, death_relay?]`,
+    /// `charge_node` present iff [`CREATE_CHARGE_NODE`] is set, `argv_env`
+    /// iff [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data
+    /// words `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as
+    /// for [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
     /// the next data word (word 0, or word 4 after the header). Label layout
     /// and reply as for [`CREATE_FROM_FILE`].
     /// Stdio pipes (stdin/stdout/stderr) are
@@ -134,7 +135,9 @@ pub mod procmgr_labels
     /// * bit `30` — [`CREATE_PHYS_ACCESS`]
     /// * bit `31` — [`CREATE_MEMORY_MAX`]
     /// * bit `32` — [`CREATE_RESERVE`]
-    /// * bits `[33..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `33` — [`CREATE_NODE_HANDLE`]
+    /// * bit `34` — [`CREATE_CHARGE_NODE`]
+    /// * bits `[35..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
@@ -145,9 +148,12 @@ pub mod procmgr_labels
     /// Reply: `data[0]` is the max the child's memmgr budget node took after
     /// memmgr's clamp, `u64::MAX` for none.
     ///
-    /// Caps: `[file_cap, creator_endpoint?, argv_env?, death_relay?]`. The
-    /// `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`] is set, and
-    /// sits directly before the relay, or last without one. `file_cap`
+    /// Caps: `[file_cap, creator_endpoint?, charge_node?, argv_env?,
+    /// death_relay?]`. The `charge_node` handle is present iff
+    /// [`CREATE_CHARGE_NODE`] is set, and sits directly before the
+    /// `argv_env` cap, or before the relay without one, or last without
+    /// either. The `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`]
+    /// is set, and sits directly before the relay, or last without one. `file_cap`
     /// ownership transfers to procmgr: procmgr opens it (`FS_OPEN`) and
     /// `cap_delete`s it, then `FS_CLOSE`s and deletes its open after the load
     /// (success or failure); a request refused before the open deletes
@@ -268,17 +274,41 @@ pub mod procmgr_labels
     /// Label flag (bit 32) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// make the child's memmgr budget node a system-reserve node
     /// (`memmgr_labels::REGISTER_RESERVE`). Honoured only from a creator
-    /// whose own node is a reserve node; procmgr refuses it from any other
-    /// creator (`INVALID_ARGUMENT`). A child of an un-badged creator (init)
-    /// is a reserve node with or without it. Specified in
-    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
-    /// (**Memory max and reserve**).
+    /// whose own node is a reserve node, and never with [`CREATE_CHARGE_NODE`];
+    /// procmgr refuses it from any other creator, and with that flag
+    /// (`INVALID_ARGUMENT`). A child of an un-badged creator (init) not
+    /// charged to a node handle is a reserve node with or without it.
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
+    /// `CREATE_PROCESS` (**Memory max and reserve**).
     pub const CREATE_RESERVE: u64 = 1 << 32;
-    /// Still-reserved bits `[33..64]` of a create label. Procmgr rejects
+    /// Label flag (bit 33) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
+    /// create reply carries the child's node handle as its last cap, a SEND on
+    /// memmgr's endpoint naming the child's budget node
+    /// (`memmgr_labels::NODE_HANDLE_TAG`), through which the creator sets the
+    /// node's max, reads its usage, makes sub-nodes and registers its limit
+    /// event while the child runs. procmgr registers the child with
+    /// `memmgr_labels::REGISTER_NODE_HANDLE` and passes the handle on. The
+    /// handle names the child's node only, and is refused once the child is
+    /// gone. Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
+    /// `CREATE_PROCESS` (**Memory max and reserve**).
+    pub const CREATE_NODE_HANDLE: u64 = 1 << 33;
+    /// Label flag (bit 34) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
+    /// request carries a node handle (`memmgr_labels::NODE_HANDLE_TAG`) as a
+    /// tail cap, before the argv/env and death-relay caps, and the child's
+    /// budget node is made under the node it names instead of under the
+    /// creator's, so every process created on one handle shares that node's
+    /// max. procmgr passes the handle to memmgr with
+    /// `memmgr_labels::REGISTER_CHARGE_NODE`, which refuses a cap that is no
+    /// live node handle. The child's node is outside the system reserve:
+    /// procmgr refuses [`CREATE_RESERVE`] with this flag (`INVALID_ARGUMENT`).
+    /// Specified in `services/procmgr/docs/ipc-interface.md`
+    /// § Label 1: `CREATE_PROCESS` (**Memory max and reserve**).
+    pub const CREATE_CHARGE_NODE: u64 = 1 << 34;
+    /// Still-reserved bits `[35..64]` of a create label. Procmgr rejects
     /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
     /// addition is provably additive: existing senders are known to send
     /// zeros.
-    pub const CREATE_RESERVED_MASK: u64 = !((1 << 33) - 1);
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 35) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 
@@ -906,7 +936,7 @@ pub mod sched_policy
 
 /// Wire-protocol version of [`memmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const MEMMGR_LABELS_VERSION: u32 = 12;
+pub const MEMMGR_LABELS_VERSION: u32 = 13;
 /// IPC labels for the memory manager (`memmgr`).
 ///
 /// memmgr owns the userspace RAM frame pool. All std-built processes
@@ -939,7 +969,10 @@ pub mod memmgr_labels
     /// the process whose budget node is the new node's parent (0 for a
     /// top-level node), and `data[3]` the max in pages with [`REGISTER_MAX`].
     /// The reply carries the badge in `data[0]` and the max the node took, after
-    /// memmgr's clamp, in `data[1]`. Specified in
+    /// memmgr's clamp, in `data[1]`, the process's SEND in `caps[0]`, and with
+    /// [`REGISTER_NODE_HANDLE`] the new node's handle in `caps[1]`. With
+    /// [`REGISTER_CHARGE_NODE`] the request's `caps[0]` is a node handle whose
+    /// node is the parent in place of `data[2]`'s. Specified in
     /// `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
@@ -957,11 +990,34 @@ pub mod memmgr_labels
     /// budget node's max in pages, which memmgr clamps to what the parent and
     /// every ancestor have left. Without it the node has no max.
     pub const REGISTER_MAX: u64 = 1 << 2;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 3): the reply carries a node
+    /// handle ([`NODE_HANDLE_TAG`]) to the new process's budget node in
+    /// `caps[1]`.
+    pub const REGISTER_NODE_HANDLE: u64 = 1 << 3;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 4): the request's `caps[0]` is
+    /// a node handle ([`NODE_HANDLE_TAG`]), and the new budget node is made
+    /// under the node it names, `data[2]` being ignored. memmgr reads the
+    /// handle's badge with `SYS_ENDPOINT_BADGE` and refuses a cap that is not
+    /// a SEND on its endpoint carrying a live node handle's key.
+    pub const REGISTER_CHARGE_NODE: u64 = 1 << 4;
     /// The bit of a memmgr process badge that marks a phys-class process
-    /// ([`REGISTER_PHYS_CLASS`]); memmgr draws the other 63 bits at random.
-    /// init clears it in the badge it mints for procmgr on memmgr's endpoint,
-    /// so procmgr's own grants lack `RIGHTS_MEM_PHYS`.
+    /// ([`REGISTER_PHYS_CLASS`]). memmgr draws the bits outside
+    /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) at random and keeps every other
+    /// verb bit clear. init clears every verb bit in the badge it mints for
+    /// procmgr on memmgr's endpoint, so procmgr's own grants lack
+    /// `RIGHTS_MEM_PHYS` and its badge is no node handle.
     pub const PHYS_CLASS_BADGE_BIT: u64 = 1 << 63;
+    /// Badge bit of a node handle: a SEND on memmgr's endpoint badged with
+    /// this bit and a random key, which names one budget node and is the
+    /// authority to serve the node labels ([`NODE_SET_MAX`] to
+    /// [`NODE_RELEASE`]) on it. No process badge carries it, so memmgr serves
+    /// the node labels only on a badge carrying it and the other labels only
+    /// on one without it, and refuses the rest with `UNAUTHORIZED`. Specified
+    /// in `services/memmgr/docs/ipc-interface.md` § Node Handles.
+    pub const NODE_HANDLE_TAG: u64 = 1 << 62;
+    const _: () = core::assert!(
+        NODE_HANDLE_TAG & crate::VERB_BIT_MASK != 0 && NODE_HANDLE_TAG != PHYS_CLASS_BADGE_BIT
+    );
     /// Procmgr-only: notify process death. `data[0]` carries the dead process's
     /// memmgr badge (no cap is required); memmgr reclaims every Memory cap
     /// it had issued to that badge, runs coalescing, and clears the
@@ -1158,6 +1214,58 @@ pub mod memmgr_labels
     /// `SHRINK_REGION`.
     pub const SHRINK_REGION: u64 = 13;
 
+    /// Set the max of the handle's budget node, on a node handle
+    /// ([`NODE_HANDLE_TAG`]). `data[0]` is the max in pages, `u64::MAX` for
+    /// none; memmgr clamps it to the node's usage plus what its parent chain
+    /// has left. A max below the usage reclaims and kills nothing: it refuses
+    /// every later charge until the usage falls below it. Reply (`SUCCESS`):
+    /// `data[0]` the max the node took. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 14: `NODE_SET_MAX`.
+    pub const NODE_SET_MAX: u64 = 14;
+
+    /// Create a sub-node under the handle's budget node, on a node handle.
+    /// `data[0]` is its max in pages, `u64::MAX` for none, clamped as
+    /// [`NODE_SET_MAX`] clamps. Reply (`SUCCESS`): `data[0]` the max it took,
+    /// `caps[0]` its node handle. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 15: `NODE_CREATE`.
+    pub const NODE_CREATE: u64 = 15;
+
+    /// Read the usage of the handle's budget node, on a node handle. Reply
+    /// (`SUCCESS`): as [`QUERY_MEMORY_USAGE`], `data[0]` its own pages,
+    /// `data[1]` its max, `data[2]` its subtree's pages. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 16: `NODE_QUERY_USAGE`.
+    pub const NODE_QUERY_USAGE: u64 = 16;
+
+    /// Register a Notification for the limit event of the handle's budget
+    /// node, on a node handle. `data[0]` is the bits to send, nonzero;
+    /// `caps[0]` a Notification cap with Notify rights, whose ownership
+    /// transfers to memmgr; `caps[1]` the registrant's own memmgr SEND (a
+    /// copy), which names the process the registration goes with: memmgr
+    /// reads its badge with `SYS_ENDPOINT_BADGE`, deletes it, and drops the
+    /// registration when that process dies, when the handle state goes, or
+    /// when a later registration replaces it. memmgr sends the bits, without
+    /// blocking, when the node's subtree reaches its max or its max refuses a
+    /// charge. One registration per node: a second replaces the first.
+    /// Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 17:
+    /// `NODE_REGISTER_LIMIT`.
+    pub const NODE_REGISTER_LIMIT: u64 = 17;
+
+    /// Release a sub-node's handle state, on a node handle to a node made by
+    /// [`NODE_CREATE`] or [`CREATE_SUB_NODE`]: every handle to the node is
+    /// refused from then on, and the node goes once no process or charge
+    /// refers to it. Refused for a process's own node, whose handle state
+    /// goes with the process. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 18: `NODE_RELEASE`.
+    pub const NODE_RELEASE: u64 = 18;
+
+    /// Create a sub-node under the caller's own budget node, attributed by
+    /// `recv.badge`, so the caller can charge processes it creates to one
+    /// budget they share inside its own. `data[0]` and the reply as
+    /// [`NODE_CREATE`]. Specified in
+    /// `services/memmgr/docs/ipc-interface.md` § Label 19: `CREATE_SUB_NODE`.
+    pub const CREATE_SUB_NODE: u64 = 19;
+
     /// [`QUERY_POOL_STATUS`] `data[7]`: the free pages no committed region is
     /// promised are at or above the low threshold.
     pub const PRESSURE_NORMAL: u64 = 0;
@@ -1225,7 +1333,9 @@ pub mod memmgr_errors
     /// or reserved flag bits on `REQUEST_MEMORY_CAPS`, an unregistered badge,
     /// or a bad region on `REGISTER_REGION`).
     pub const INVALID_ARGUMENT: u64 = 4;
-    /// Procmgr-only label called over a non-procmgr badge.
+    /// Procmgr-only label called over a non-procmgr badge, a node label
+    /// called over a badge that is no node handle, or another label called
+    /// over a node handle.
     pub const UNAUTHORIZED: u64 = 5;
     /// `REGISTER_PROCESS` could not complete: the tracking table could not
     /// take a new entry, the badge draw failed, or the reply cap could not
@@ -2484,7 +2594,8 @@ pub mod devmgr_labels
     /// A read of any function is allowed; one of a function no device record
     /// holds reads all-ones, as an absent function does, without an access. A
     /// write is allowed only at offset 0x40 and above of a function whose
-    /// record no driver has been started for; any other write is refused,
+    /// record is unbound: no driver has been started for it, and devmgr has
+    /// not taken it as a RISC-V IOMMU unit. Any other write is refused,
     /// logged. The access runs on devmgr's control thread, so no bind of the
     /// function interleaves with it.
     ///
@@ -4257,13 +4368,15 @@ pub mod stream_labels
 }
 
 /// Badge bits that endpoints gating a label on a verb-bit use for it: each
-/// `*_AUTHORITY` constant in this crate is one of these bits. A minter whose
-/// badges carry other information onto such an endpoint keeps them clear —
-/// procmgr's random per-process badge, stamped on the child's svcmgr-registry
-/// and procmgr SENDs — so only a server's trusted minters set a verb bit
-/// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
-/// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
-/// reserve them.
+/// `*_AUTHORITY` constant in this crate is one of these bits, as are
+/// `procmgr_labels::PROCESS_HANDLE_TAG` and `memmgr_labels::NODE_HANDLE_TAG`.
+/// A minter whose badges carry other information onto such an endpoint keeps
+/// them clear — procmgr's random per-process badge, stamped on the child's
+/// svcmgr-registry and procmgr SENDs, and memmgr's per-process badges, which
+/// keep bits 58 to 62 clear and use bit 63 for the phys class — so only a
+/// server's trusted minters set a verb bit (docs/capability-model.md § Verb-bit
+/// authority pattern). Endpoints with no verb gate (bootstrap endpoints,
+/// namespace node caps) do not reserve them.
 pub const VERB_BIT_MASK: u64 =
     (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59) | (1u64 << 58);
 const _: () = core::assert!(

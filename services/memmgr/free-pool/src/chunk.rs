@@ -423,7 +423,9 @@ fn child<S: SlotStore>(arena: &Arena<S>, dir: NodeIdx, pos: usize) -> NodeIdx
         | Node::Process(_)
         | Node::Chunk(_)
         | Node::Caps(_)
-        | Node::Commit(_) => NODE_NULL,
+        | Node::Commit(_)
+        | Node::Handle(_)
+        | Node::Limit(_) => NODE_NULL,
     }
 }
 
@@ -475,7 +477,9 @@ pub fn entry<S: SlotStore>(arena: &Arena<S>, root: NodeIdx, height: u32, index: 
             | Node::Process(_)
             | Node::Caps(_)
             | Node::Commit(_)
-            | Node::ChunkDir(_),
+            | Node::ChunkDir(_)
+            | Node::Handle(_)
+            | Node::Limit(_),
         )
         | None => ChunkEntry::UNBACKED,
     }
@@ -616,7 +620,9 @@ pub fn release<S: SlotStore>(
             | Node::Frame(_)
             | Node::Process(_)
             | Node::Caps(_)
-            | Node::Commit(_) =>
+            | Node::Commit(_)
+            | Node::Handle(_)
+            | Node::Limit(_) =>
             {
                 continue;
             }

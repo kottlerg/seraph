@@ -13,8 +13,7 @@
 //! 1. [`startup`] first — argv/env/stack/TLS bring-up before anything
 //!    else touches them.
 //! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end
-//!    (but before [`pwrmgr`]), and [`layout::after_fs`] after them: it
-//!    writes a fixture under `/data/svctest`. [`fs_opens`] comes before
+//!    (but before [`pwrmgr`]). [`fs_opens`] comes before
 //!    [`fs_ipc`]: its eviction phase needs `/data`'s page cache cold (slots
 //!    not yet provisioned), and it writes the slot-reuse file that
 //!    `fs_ipc`'s slot-reuse phase reads and removes.
@@ -36,6 +35,10 @@
 //! 8. [`unmount`] after every phase that uses `/data` or the cwd: it
 //!    unmounts the data partition, killing every cap on it, before it
 //!    mounts it again and sets the cwd to it again.
+//! 9. [`logd_restart`] after every phase that reads logd's slots or
+//!    history before it ([`procmgr::logd_forward`], [`log_client`]): it
+//!    kills logd, whose next instance holds a fresh table, and runs the
+//!    [`procmgr::logd_forward`] check again against it.
 
 use crate::runner::Phase;
 
@@ -52,6 +55,7 @@ pub mod fs_std;
 pub mod heap_commit;
 pub mod layout;
 pub mod log_client;
+pub mod logd_restart;
 pub mod memmgr;
 pub mod namespace;
 pub mod node_handle;
@@ -102,7 +106,6 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_faults::phases());
-    out.extend_from_slice(layout::after_fs());
     out.extend_from_slice(namespace::late());
     out.extend_from_slice(procmgr::command_phases());
     out.extend_from_slice(startup::late());
@@ -111,6 +114,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(svcmgr::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());
+    out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(drivers::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());

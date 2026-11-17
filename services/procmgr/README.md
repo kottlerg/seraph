@@ -24,8 +24,9 @@ procmgr/
 ├── README.md
 ├── process-table/              # `procmgr-process-table` crate: pure host-tested
 │                                 table + badge logic, the create-request
-│                                 argv/env header decoder and checks and
-│                                 the create-request cap split, the
+│                                 argv/env header decoder and checks,
+│                                 the requested name and the signature
+│                                 policy, the create-request cap split, the
 │                                 fs-reply bounds, the init-reap state
 │                                 machine, the first death queue's
 │                                 size (`FIRST_POOL_OBSERVERS`), the
@@ -36,6 +37,8 @@ procmgr/
 │   ├── main.rs                 # main() (std runtime), request workers, reaper
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
 │   ├── death_queues.rs         # Death-queue ring capacity (`DEATH_EQ_CAPACITY`)
+│   ├── image.rs                # One copy of a create's object, its verification
+│   ├── trust_store.rs          # The trust store the bootloader hands forward
 │   ├── loader.rs               # ELF load pipeline
 │   ├── process.rs              # Per-process state, kernel-object allocation
 │   ├── init_reap.rs            # Init-reap: reaps init after handover
@@ -48,7 +51,14 @@ procmgr/
 
 ## Responsibilities
 
-- **ELF loading** — parse ELF images from boot modules or filesystem,
+- **Image verification** — copy each create's signed object, from a boot
+  module or a file, into frames only procmgr maps, and verify the copy
+  against the trust store the bootloader hands forward, under the name the
+  creator gives and the creator's signature policy, before any byte of it is
+  parsed; a refusal creates nothing (`SIGNATURE_REFUSED`). See
+  [docs/ipc-interface.md](docs/ipc-interface.md) § Image Verification and
+  [docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr.
+- **ELF loading** — parse the verified ELF image,
   request memory caps from memmgr, map LOAD segments with correct
   permissions. Each segment's pages are fresh pages memmgr allocates to the
   child, filled by copying the file's bytes in, so no frame of a child's image
@@ -94,7 +104,8 @@ procmgr/
   fields (parent-chosen, per-process).
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
-  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, and post
+  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap in place of
+  the one a previous logd instance registered, and post
   to it the death entry `(exit_reason, process badge)` of every process
   procmgr tears down after that (the badge is logd's per-sender slot
   key). The kernel posts nothing to logd's queue: procmgr is the source
@@ -207,11 +218,13 @@ handoff protocol is in [docs/ipc-interface.md](docs/ipc-interface.md) § `REGIST
 The full procmgr IPC specification is in
 [`docs/ipc-interface.md`](docs/ipc-interface.md). Key operations:
 
-- `CREATE_PROCESS(elf_module_cap)` → suspended process handle, child `Thread` cap
-- `CREATE_FROM_FILE(file_cap, file_size, …)` → suspended process handle,
+- `CREATE_PROCESS(module_cap, length, name, …)` → suspended process handle,
+  child `Thread` cap, from the signed object at the start of the Memory cap,
+  verified under `name`
+- `CREATE_FROM_FILE(file_cap, file_size, name, …)` → suspended process handle,
   child `Thread` cap. Caller has already walked its own namespace cap to the
-  binary; procmgr opens the supplied file cap (`FS_OPEN`) and reads the ELF
-  through its own open.
+  binary and names it by its install path; procmgr opens the supplied file cap
+  (`FS_OPEN`), copies the signed object through its own open and verifies it.
 - `START_PROCESS(process_handle)` — start a previously created process
 - `CONFIGURE_NAMESPACE(process_handle)` — install root and (optional)
   cwd caps on the child before start; the sole path that writes
@@ -331,6 +344,10 @@ The shared state is behind these locks:
   gone, so two registrations cannot both find no registrant. A registration holds it across its
   park call to the crash decliner, which answers without taking any lock.
 - The `CSpace` top-up lock (§ CSpace headroom) is only tried, never waited on.
+- The logd-queue lock guards the cap on logd's death queue (`process::LOGD_DEATH_EQ`). Its holder
+  makes one non-blocking syscall, a death forward's post or a `REGISTER_DEATH_EQ` swap, takes no
+  other lock, and makes no IPC call, so a registration that replaces the queue never deletes a cap
+  a forward is posting to. A forward's failure line is written after it is released.
 
 Under any of these locks, two IPC calls can still happen, each a departure from holding no lock
 across a call ([docs/ipc-design.md](../../docs/ipc-design.md) § Multi-threaded servers), stated

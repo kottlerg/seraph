@@ -217,14 +217,16 @@ identical across both code paths:
   bootstrap badge + badged SEND on svcmgr's `bootstrap_ep`.
 * [`walk_and_create_from_file`](../src/restart.rs) — walk svcmgr's
   universal `root_dir_cap` for the binary path, then call
-  `procmgr_labels::CREATE_FROM_FILE` with argv / env blobs in an argv/env
-  Memory cap (`std::os::seraph::process::ArgvEnvCap`). Both paths build
-  the blobs from the recipe: launch from the parsed `Definition`, restart
-  from the stored [`RestartRecipe`](../src/service.rs). Before minting any
-  cap the primitive returns `None` (logged) when it cannot build that cap:
-  blobs past the argv/env region, a backstop behind the parser's
-  `TooLarge` rejection, or a run memmgr will not fund; on restart that
-  `None` fails the attempt and is routed through `permanent_death_outcome`.
+  `procmgr_labels::CREATE_FROM_FILE`, naming the binary by that path for
+  procmgr's verification, with argv / env blobs in an argv/env Memory
+  cap (`std::os::seraph::process::ArgvEnvCap`). Both paths build the
+  blobs from the recipe: launch from the parsed `Definition`, restart
+  from the stored [`RestartRecipe`](../src/service.rs). Before minting
+  any cap the primitive returns `None` (logged) when it cannot build
+  that cap: blobs past the argv/env region, a backstop behind the
+  parser's `TooLarge` rejection, or a run memmgr will not fund; on
+  restart that `None` fails the attempt and is routed through
+  `permanent_death_outcome`.
 * [`configure_namespace_caps`](../src/restart.rs) — walk the optional
   `cwd` from svcmgr's universal root, then install the namespace cap and
   the `cwd` cap on the child via `procmgr_labels::CONFIGURE_NAMESPACE`.
@@ -363,15 +365,26 @@ RECV on the persistent service endpoint so cached client caps survive the
 restart. `logd` is the log sink: svcmgr holds the master-log endpoint
 source for the system's life and mints each (re)launched logd a fresh RECV
 on that persistent endpoint, so log senders' caps survive the restart (per
-[service-definitions.md](service-definitions.md#log_sink)). A working logd
-restart is design intent; not yet implemented (#262). procmgr's
-`REGISTER_DEATH_EQ` is first-wins, so a restarted logd's registration is
-rejected and it receives no death events for slot eviction. svcmgr's
-death handler emits `log!` calls on the master-log endpoint before it
-respawns logd; with no logd receiving, each is dropped once its bound
-expires (the first after `LOG_CALL_TIMEOUT_MS`, the rest after
-`LOG_CALL_UNANSWERED_TIMEOUT_MS`, per [shared/log](../../../shared/log/README.md)),
-so the respawn is delayed, not prevented.
+[service-definitions.md](service-definitions.md#log_sink)). The restarted
+logd skips the history pull, serves a fresh table (which holds no sender's
+display name: a sender's lines render as `[?]` until it registers its name
+again; #1213), and registers its death queue with procmgr, whose
+`REGISTER_DEATH_EQ` takes it in place of the dead instance's
+([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md)
+§ `REGISTER_DEATH_EQ`), so slot eviction resumes. svcmgr's death handler
+writes none of a logd death's lines before the respawn: with no logd
+receiving, each would wait out its bound (the first `LOG_CALL_TIMEOUT_MS`,
+the rest `LOG_CALL_UNANSWERED_TIMEOUT_MS`, per
+[shared/log](../../../shared/log/README.md)) and be dropped. It writes them
+once the new instance has started and been served its bootstrap round, and
+none when no instance follows (the policy or the budget refuses the restart,
+or the restart fails), since no receiver is left to take them. A failure
+line of the create path itself (`restart_process` and the helpers it
+calls) is written as it occurs and waits out its bound. procmgr writes a
+create's success lines after its reply, so the create of the new instance
+waits on none of them. svctest's
+`logd_restart` phase kills logd and checks both
+([services/svctest/README.md](../../svctest/README.md)).
 
 svcmgr's own death is not routed here: svcmgr is in the core set, and
 pwrmgr observing it is design intent; not yet implemented (#262)

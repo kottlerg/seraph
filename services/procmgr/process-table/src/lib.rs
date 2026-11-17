@@ -14,14 +14,15 @@
 //! ([`badge_is_acceptable`]), the argv/env header decoder and checks for
 //! create requests ([`create_blobs`]), which bound client-controlled data
 //! words and blob bytes, the create-request cap-layout split
-//! ([`split_create_caps`]), the bounds procmgr applies to fs-driver
-//! read replies, the `FS_READ_MEMORY` reply-cap split, and the record of a
-//! failed file read ([`fs_reads`]), the init-reap handoff state machine
+//! ([`split_create_caps`]), the bounds procmgr applies to an fs driver's
+//! `FS_READ_MEMORY` replies and their cap split ([`fs_reads`]), the
+//! init-reap handoff state machine
 //! ([`InitReap`]), the size of procmgr's first death queue
 //! ([`death_queues::FIRST_POOL_OBSERVERS`]), the registry of the threads a
 //! process registers with their crash badges ([`threads`]), and the
 //! registered crash service with its registration's generation
-//! ([`crash_registrant`]). None of these
+//! ([`crash_registrant`]), and the signature policy each creator's record
+//! carries ([`sign_policy`]). None of these
 //! touch a syscall, IPC, or `std::os::seraph` surface — the cap fields are
 //! slot *indices* (plain integers), never live capabilities, and the decoder
 //! reads a stack [`ipc::IpcMessage`] snapshot — so the whole crate is
@@ -44,6 +45,7 @@ pub mod fs_reads;
 pub mod init_reap;
 pub mod names;
 pub mod request_caps;
+pub mod sign_policy;
 pub mod threads;
 
 pub use create_blobs::{ArgvEnvRefusal, ArgvEnvTally, checked_total, decode_header};
@@ -186,6 +188,10 @@ pub struct ProcessEntry
     /// The child's name, the first string of its argv, which
     /// `LIST_PROCESSES` reports.
     pub name: ProcessName,
+    /// The kinds of object the child's own creates may load: its signature
+    /// policy ([`sign_policy`]), its creator's narrowed by the child's own
+    /// verified kind ([`sign_policy::child_kinds`]).
+    pub sign_kinds: objsig::KindSet,
     /// Slot in procmgr's `CSpace` of the main-thread cap of the debugger
     /// attached to the child (`ATTACH_PROCESS` `caps[0]`); `0` with none.
     /// Once that thread has exited, procmgr restores the child's crash
@@ -892,6 +898,7 @@ impl ProcessTable
             memmgr_badge: e.memmgr_badge,
             reserve: e.reserve,
             unbadged: false,
+            sign_kinds: e.sign_kinds,
         })
     }
 }
@@ -900,7 +907,8 @@ impl ProcessTable
 
 /// What a create request's child takes from its creator
 /// ([`ProcessTable::creator_of`]): its spawn ceiling, its memmgr budget
-/// node's parent, and whether it may be phys-class or a reserve node.
+/// node's parent, whether it may be phys-class or a reserve node, and the
+/// kinds of object it may be loaded from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Creator
 {
@@ -915,6 +923,9 @@ pub struct Creator
     /// Whether the creator is un-badged (badge `0`): init, or svcmgr's mint
     /// source.
     pub unbadged: bool,
+    /// The creator's signature policy: the kinds of object its creates may
+    /// load ([`sign_policy`]).
+    pub sign_kinds: objsig::KindSet,
 }
 
 impl Creator
@@ -924,12 +935,14 @@ impl Creator
     /// Its ceiling is the full baseline band, its children not charged to a
     /// node handle are top-level reserve nodes (init's own record parents no
     /// process), a charged child sits under the handle's node outside the
-    /// reserve, and it may ask for a phys-class child.
+    /// reserve, it may ask for a phys-class child, and its creates may load
+    /// every kind procmgr loads ([`sign_policy::LOADABLE`]).
     pub const UNBADGED: Creator = Creator {
         band_max: ipc::sched_policy::BASELINE_PRIORITY_MAX,
         memmgr_badge: 0,
         reserve: true,
         unbadged: true,
+        sign_kinds: sign_policy::LOADABLE,
     };
 
     /// Whether the creator may ask for a phys-class child: an un-badged one,
@@ -1064,8 +1077,8 @@ pub fn child_budget(
 }
 
 /// The memory max a create request labelled `label` carries, whose data
-/// words after the fixed ones start at `first_word` (0 for `CREATE_PROCESS`,
-/// 1 for `CREATE_FROM_FILE`): `None` without `procmgr_labels::CREATE_MEMORY_MAX`,
+/// words after the fixed ones start at `first_word` (1 for both
+/// `CREATE_PROCESS` and `CREATE_FROM_FILE`, after the object's length): `None` without `procmgr_labels::CREATE_MEMORY_MAX`,
 /// else the word after the argv/env header when `CREATE_ARGV_ENV` is set, or
 /// at `first_word` without it.
 ///
@@ -1110,8 +1123,8 @@ pub enum AttachRefusal
     /// and procmgr, which procmgr did not create, are never in the table.
     Unknown,
     /// The target declared itself undebuggable
-    /// (`procmgr_labels::DECLARE_NO_DEBUG`; `NOT_ATTACHABLE`): the log sink,
-    /// the serial and framebuffer drivers, the debug port's driver, and every
+    /// (`procmgr_labels::DECLARE_NO_DEBUG`; `NOT_ATTACHABLE`): the serial
+    /// and framebuffer drivers, the debug port's driver, and every
     /// debug-authority holder, the caller among them.
     NotAttachable,
 }
@@ -1545,6 +1558,7 @@ mod tests
             image: ImageSpan::default(),
             threads: ThreadRegistry::new(),
             name: ProcessName::EMPTY,
+            sign_kinds: objsig::KindSet::EMPTY,
             debugger: 0,
         }
     }
@@ -1655,9 +1669,9 @@ mod tests
     #[test]
     fn an_attach_to_a_process_that_declared_no_debug_is_refused()
     {
-        // The log sink, the serial and framebuffer drivers, and every
-        // debug-authority holder, the caller among them, declare themselves
-        // undebuggable.
+        // The serial and framebuffer drivers, the debug port's driver, and
+        // every debug-authority holder, the caller among them, declare
+        // themselves undebuggable.
         let mut table = ProcessTable::new();
         let mut marked = entry_with_badge(0x77);
         marked.thread_cap = 41;
@@ -2542,6 +2556,7 @@ mod tests
             memmgr_badge,
             reserve: true,
             unbadged: false,
+            sign_kinds: sign_policy::LOADABLE,
         }
     }
 
@@ -2705,16 +2720,15 @@ mod tests
             .word(1, 7)
             .build();
         assert_eq!(decode_memory_max(&plain, 1), Ok(None));
-        // CREATE_PROCESS: word 0, or word 4 after the header.
+        // Either label: word 1, or word 5 after the header.
         let module = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX)
-            .word(0, 33)
+            .words(0, &[8192, 33])
             .build();
-        assert_eq!(decode_memory_max(&module, 0), Ok(Some(33)));
+        assert_eq!(decode_memory_max(&module, 1), Ok(Some(33)));
         let module_argv = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX | CREATE_ARGV_ENV)
-            .words(0, &[1, 2, 3, 4, 44])
+            .words(0, &[8192, 1, 2, 3, 4, 44])
             .build();
-        assert_eq!(decode_memory_max(&module_argv, 0), Ok(Some(44)));
-        // CREATE_FROM_FILE: word 1, or word 5 after the header.
+        assert_eq!(decode_memory_max(&module_argv, 1), Ok(Some(44)));
         let file = IpcMessage::builder(CREATE_FROM_FILE | CREATE_MEMORY_MAX)
             .words(0, &[4096, 55])
             .build();
@@ -2731,8 +2745,10 @@ mod tests
             decode_memory_max(&missing, 1),
             Err(BudgetRefusal::MissingMax)
         );
-        let none = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX).build();
-        assert_eq!(decode_memory_max(&none, 0), Err(BudgetRefusal::MissingMax));
+        let none = IpcMessage::builder(CREATE_PROCESS | CREATE_MEMORY_MAX)
+            .word(0, 8192)
+            .build();
+        assert_eq!(decode_memory_max(&none, 1), Err(BudgetRefusal::MissingMax));
     }
 
     #[test]
@@ -2743,6 +2759,7 @@ mod tests
         entry.memmgr_badge = 0x77;
         entry.band_max = 9;
         entry.reserve = true;
+        entry.sign_kinds = objsig::KindSet::of(&[objsig::Kind::Program]);
         assert_eq!(table.insert(entry), Ok(()));
         assert_eq!(table.creator_of(0), Some(Creator::UNBADGED));
         assert_eq!(
@@ -2752,6 +2769,7 @@ mod tests
                 memmgr_badge: 0x77,
                 reserve: true,
                 unbadged: false,
+                sign_kinds: objsig::KindSet::of(&[objsig::Kind::Program]),
             })
         );
         // A reaped process's badge, and a verb-badged cap's.

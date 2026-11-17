@@ -16,6 +16,9 @@ driver-binding = { path = "../../shared/driver-binding" }
 # `slot_ceiling` and `QUARANTINE_MAX`: the fs_ipc slot-reuse phase checks
 # fatfs's cache bounds against the definitions fatfs uses.
 fat_parse = { path = "../fs/fat/fat-parse", package = "fatfs-parse" }
+# `validate_executable` and `parse_stack_note`: the layout stack-note phase
+# reads svctest's own image with the parser procmgr loads it with.
+elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
 # `write_bytes` and the log-call bounds: the log_client phase logs to an
 # endpoint of its own that never answers, through this copy of the crate, so

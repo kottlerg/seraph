@@ -314,8 +314,13 @@ fn publish_minted_send(
     }
 }
 
+/// The absolute path of the drivers directory devmgr is handed, which
+/// `SET_DRIVERS_DIR` also carries so devmgr names each driver by its install
+/// path.
+const DRIVERS_DIR_PATH: &str = "/services/drivers";
+
 /// Hand devmgr a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
-/// subtree cap via `SET_DRIVERS_DIR`, so devmgr can list the directory, read
+/// subtree cap and its path via `SET_DRIVERS_DIR`, so devmgr can list the directory, read
 /// the declaration of each driver binary in it, and spawn the drivers that
 /// match its devices (the per-arch RTC among them). svcmgr walks its universal
 /// root for the dir and mints a `DRIVERS_DIR_AUTHORITY` `SEND|GRANT` from
@@ -363,12 +368,12 @@ fn install_drivers_dir(
             | namespace_protocol::rights::READDIR,
     );
     let drivers_dir =
-        match std::os::seraph::namespace_lookup_dir(root_cap, "/services/drivers", rights)
+        match std::os::seraph::namespace_lookup_dir(root_cap, DRIVERS_DIR_PATH, rights)
         {
             Ok(c) => c,
             Err(e) =>
             {
-                std::os::seraph::log!(warn: "SET_DRIVERS_DIR: walk /services/drivers failed: {e}");
+                std::os::seraph::log!(warn: "SET_DRIVERS_DIR: walk {DRIVERS_DIR_PATH} failed: {e}");
                 return;
             }
         };
@@ -387,10 +392,23 @@ fn install_drivers_dir(
         return;
     };
 
-    let msg = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
+    let builder = IpcMessage::builder(ipc::devmgr_labels::SET_DRIVERS_DIR)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .cap(drivers_dir)
-        .build();
+        .cap(drivers_dir);
+    let Some(builder) = ipc::with_name_block(
+        builder,
+        ipc::devmgr_labels::DRIVERS_DIR_PATH_WORD,
+        DRIVERS_DIR_PATH.as_bytes(),
+        ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX,
+    )
+    else
+    {
+        std::os::seraph::log!(warn: "SET_DRIVERS_DIR: path not sendable");
+        let _ = syscall::cap_delete(bind_ep);
+        let _ = syscall::cap_delete(drivers_dir);
+        return;
+    };
+    let msg = builder.build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let result = unsafe { ipc::ipc_call(bind_ep, &msg, ipc_buf) };
     let _ = syscall::cap_delete(bind_ep);

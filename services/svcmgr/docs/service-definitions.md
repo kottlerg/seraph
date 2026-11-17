@@ -55,7 +55,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 
 | Key | Required | Value |
 |---|---|---|
-| `binary` | yes | Absolute path under svcmgr's root, at most `ipc::MAX_PATH_LEN` (4096) bytes, the one recipe path limit; a longer path is a parser error. The entry svcmgr restarts from holds it at its own length (see [Restart Protocol](restart-protocol.md#recipe-storage)). Walked from `system_root_cap` at launch / restart. |
+| `binary` | yes | Absolute path under svcmgr's root, in the canonical form of [docs/signing.md](../../../docs/signing.md) § Signed Attributes (no empty, `.` or `..` component, no trailing `/`) and at most `procmgr_labels::CREATE_NAME_MAX` (256) bytes, since svcmgr names the binary to procmgr by it and procmgr verifies the image was signed under it; any other path is a parser error. The entry svcmgr restarts from holds it at its own length (see [Restart Protocol](restart-protocol.md#recipe-storage)). Walked from `system_root_cap` at launch / restart. |
 | `argv` | no | Space-separated tokens. Becomes NUL-separated, NUL-terminated bytes on the wire. Bounded; see [`argv` / `env`](#argv--env). |
 | `env` | no | Space-separated `KEY=VAL` tokens. Same NUL packing and bounds as `argv`. |
 | `restart` | yes | One of `never`, `on_failure`, `always`. |
@@ -157,7 +157,7 @@ The primary lever for confining a service to only what it needs.
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
 | `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority. The recipes that declare it are `svctest` (the namespace tester), `usertest`, and `terminal`, which resolve and spawn programs; the recipes of the init-bootstrapped substrate services declare `none`, since init, not svcmgr, spawned them. |
-| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (4096) bytes, the same bound as `binary`; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
+| `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (4096) bytes; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
 
@@ -328,16 +328,13 @@ present, history pulled from init-logd per the
 [logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
 from the endowment or not published (slots 3 and 4 when no class file configured the class), or
 whose derive fails, is absent from the round; logd requires only `cap[0]`.
-svcmgr holds the master-log source for the system's life, so the round is designed to also
-drive every restart (`cap[1]` absent, history pull skipped), each relaunched logd
+svcmgr holds the master-log source for the system's life, so the round also
+drives every restart (`cap[1]` absent, history pull skipped), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already
-targets, with `restart` and `critical` behaving as for any other service;
-design intent; not yet implemented (#262). Today, on a logd death svcmgr's
-death handler makes `log!` calls on the master-log endpoint with no logd
-receiving; each is dropped once its bound expires
-([shared/log](../../../shared/log/README.md)), so the handler reaches the
-restart and the critical graceful-shutdown path late, not never (per
-[restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
+targets, with `restart` and `critical` behaving as for any other service. On a
+`log_sink` service's death svcmgr writes no line before the respawn, since no
+logd receives until then, and writes the death's lines once the new instance
+runs ([restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
 
 ```
 binary    = /services/logd

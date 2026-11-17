@@ -4,13 +4,11 @@ Codec and verifier of Seraph's signed objects: the signature trailer, the certif
 trust store whose formats [docs/signing.md](../../docs/signing.md) specifies byte by byte, and the
 verification policy of its § Verification.
 
-`no_std`, no allocation; its one dependency is [`shared/crypto`](../crypto/README.md) (SHA-512
-and `ed25519_verify`). xtask links it, to sign and to verify each signed object before
-writing it; the bootloader links it to verify the kernel and every bundle entry, procmgr to parse
-the trust store it receives, and init-log-levels and devmgr-firmware to take the body of a data
-module through `split`. procmgr's verification of the images it creates is design intent, not yet
-implemented ([#124](https://github.com/kottlerg/seraph/issues/124)). No stability obligation;
-internal code reuse only.
+`no_std`, no allocation; its one dependency is [`shared/crypto`](../crypto/README.md) (SHA-512 and
+`ed25519_verify`). xtask links it, to sign and to verify each signed object before writing it; the
+bootloader links it to verify the kernel and every bundle entry, procmgr to parse the trust store it
+receives and verify against it, and init-log-levels and devmgr-firmware to take the body of a data
+module through `split`. No stability obligation; internal code reuse only.
 
 ---
 

@@ -4,7 +4,9 @@
 // programs/hello/tester/src/main.rs
 
 //! Per-program tester for `/programs/hello`. Spawns it with a piped stdout,
-//! asserts the expected line appears, and asserts a clean exit. See
+//! asserts the expected line appears, and asserts a clean exit. Then, as a
+//! program, which may start programs only (docs/signing.md § Signature Policy
+//! in procmgr), asserts that starting a service is refused. See
 //! [docs/testing.md](../../../docs/testing.md) for the protocol.
 
 #![expect(
@@ -18,6 +20,10 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 
 const EXPECTED_LINE: &str = "hello from seraph userspace";
+
+/// A service-kind image a program may not start: the restart-path fixture,
+/// which only crashes if it does start.
+const SERVICE_IMAGE: &str = "/tests/crasher";
 
 fn main()
 {
@@ -46,6 +52,25 @@ fn main()
     {
         println!("[hello-tester] FAIL non-zero exit: {:?}", status.code());
         std::process::exit(2);
+    }
+
+    // Defect guarded: a program starting an image of a kind its creator's
+    // signature policy does not admit, a service here.
+    match Command::new(SERVICE_IMAGE).spawn()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {}
+        Err(e) =>
+        {
+            println!("[hello-tester] FAIL starting {SERVICE_IMAGE}: {e}, not PermissionDenied");
+            std::process::exit(3);
+        }
+        Ok(mut started) =>
+        {
+            let _ = started.kill();
+            println!("[hello-tester] FAIL a program started the service {SERVICE_IMAGE}");
+            std::process::exit(4);
+        }
     }
 
     println!("[hello-tester] PASS");

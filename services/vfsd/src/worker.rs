@@ -292,23 +292,35 @@ fn create_from_file_msg(
     // An fs driver is the blocking dependency of every vfsd read, so it
     // runs at vfsd's own level; band ceiling equals the level.
     // Caps: [file_cap, creator, argv_env?, relay]; the argv/env header rides
-    // in data words 1..5, after `file_size`, and the relay is the last cap
-    // (`services/procmgr/docs/ipc-interface.md` § Label 13).
-    let mut builder = IpcMessage::builder(
-        procmgr_labels::CREATE_FROM_FILE
-            | argv_env_flag
-            | procmgr_labels::CREATE_DEATH_RELAY
-            | procmgr_labels::create_sched_bits(
-                ipc::sched_policy::FS_DRIVER_PRIORITY,
-                ipc::sched_policy::FS_DRIVER_PRIORITY,
-            ),
-    )
-    .word(0, file_size)
-    .cap(file_cap)
-    .cap(badged_creator);
-    if let Some(env) = argv_env
-    {
-        builder = builder.words(1, &env.header_words()).cap(env.cap());
-    }
-    builder.cap(relay).build()
+    // in data words 1..5, after `file_size`, the install path, the name the
+    // file is verified under, in the name block after them, and the relay is
+    // the last cap (`services/procmgr/docs/ipc-interface.md` § Label 13).
+    let label = procmgr_labels::CREATE_FROM_FILE
+        | argv_env_flag
+        | procmgr_labels::CREATE_DEATH_RELAY
+        | procmgr_labels::create_sched_bits(
+            ipc::sched_policy::FS_DRIVER_PRIORITY,
+            ipc::sched_policy::FS_DRIVER_PRIORITY,
+        );
+    let request = || {
+        let builder = IpcMessage::builder(label)
+            .word(0, file_size)
+            .cap(file_cap)
+            .cap(badged_creator);
+        match argv_env
+        {
+            Some(env) => builder
+                .words(procmgr_labels::CREATE_FIRST_WORD, &env.header_words())
+                .cap(env.cap()),
+            None => builder,
+        }
+    };
+    // `FATFS_PATH` fits a name block (asserted at its definition); a request
+    // without one would still carry every cap, for procmgr to refuse and
+    // delete.
+    let path = crate::driver::FATFS_PATH.as_bytes();
+    procmgr_labels::with_create_name(request(), label, path)
+        .unwrap_or_else(request)
+        .cap(relay)
+        .build()
 }

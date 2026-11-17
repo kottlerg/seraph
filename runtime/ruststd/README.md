@@ -416,6 +416,14 @@ spawner's `root_dir_cap()` (parent-inherit); explicit override via
 path and delivers the resulting cap as the child's initial
 `current_dir_cap`.
 
+`Command::spawn` names the binary to procmgr by its path from the spawner's root, with `/` before
+each component, as the caller spells it: a path in another letter case than the install path
+reaches the file but is refused, since the name is compared case-exactly
+([docs/signing.md](../../docs/signing.md) § Signed Attributes). It maps `SIGNATURE_REFUSED` to
+`io::ErrorKind::PermissionDenied`; a process whose own object is signed as a program starts programs
+only ([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#image-verification)
+§ Image Verification).
+
 A cap on an unmounted filesystem is dead: vfsd's `UNMOUNT` revokes the
 driver's endpoint, which frees every cap derived from it in every
 `CSpace`
@@ -548,13 +556,13 @@ neither can deadlock, since that request does not wait on the new thread:
 - **logd's resync helper.** procmgr writes its log through logd, and logd's main thread spawns the
   helper that walks `QUERY_LIVE_PROCESSES` after its death queue may have dropped a post
   ([services/logd/docs/ipc-interface.md](../../services/logd/docs/ipc-interface.md) § Death-queue
-  resync). logd declared itself undebuggable, so once procmgr has refused one of its registrations
-  it sends no more. Its first spawned threads are its receive workers, spawned before its handover
-  pull while init-logd still serves the log endpoint, and logd waits for each to start before the
-  pull (§ Receive pool there), so procmgr serves their registrations without waiting on logd, and
-  the helper normally sends none. The helper exists to call procmgr: a registration it does send
-  waits on procmgr exactly as its query would, while logd's receive workers, which serve procmgr's
-  write, go on without it.
+  resync). The helper registers as every spawned thread does. It exists to call procmgr: its
+  registration waits on procmgr exactly as its query would, while logd's receive workers, which
+  serve procmgr's write, go on without it. Those workers, logd's first spawned threads, register
+  before logd opens its receive pool, and logd waits for each to start (§ Receive pool there).
+  procmgr writes no line serving a registration, so it serves theirs without waiting on logd; a
+  line another of its workers writes meanwhile, while no logd receives (on a restart; on the first
+  launch init-logd still serves the endpoint), waits out its bound (`LOG_CALL_TIMEOUT_MS`).
 
 Two patterns would deadlock once they hold every one of procmgr's request workers, and no in-tree
 process follows either: a spawner that waits on its new thread without bound while procmgr waits on

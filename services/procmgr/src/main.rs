@@ -6,8 +6,9 @@
 //! Seraph process manager — IPC server for process lifecycle management.
 //!
 //! Receives requests via IPC to create, configure, and start new processes.
-//! Supports both in-memory ELF loading from boot module memory caps and streaming
-//! from the VFS. See `services/procmgr/docs/ipc-interface.md`.
+//! Creates each from a signed object, a boot module's Memory cap or a file,
+//! read once into memory of its own and verified against the trust store
+//! before it is parsed ([`image`]). See `services/procmgr/docs/ipc-interface.md`.
 //!
 //! `CREATE_PROCESS` and `CREATE_FROM_FILE` accept the child's module source and
 //! the caller's bootstrap endpoint (a badged send cap); the endpoint is
@@ -24,6 +25,7 @@
 mod arch;
 mod crash;
 mod death_queues;
+mod image;
 mod init_reap;
 mod loader;
 mod process;
@@ -117,15 +119,14 @@ fn main() -> !
 
     // The trust store, copied and parsed once (docs/signing.md § Trust
     // Store); without one that parses procmgr stops, and creates no process.
-    // The copy lives in this frame, which never returns, for procmgr's life;
-    // no create verifies an image against it yet (#124).
+    // Every create verifies its object against it.
     let Some((store_cap, store_len)) = boot.trust_store
     else
     {
         std::os::seraph::log!(error: "init handed no trust store; exiting");
         syscall::thread_exit();
     };
-    let Some(_trust_store) = trust_store::receive(startup.self_aspace, store_cap, store_len)
+    let Some(trust_store) = trust_store::receive(startup.self_aspace, store_cap, store_len)
     else
     {
         syscall::thread_exit();
@@ -161,6 +162,8 @@ fn main() -> !
         deaths: Mutex::new(deaths),
         tables: process::Tables::new(),
         sched_baseline: startup.sched_control_cap,
+        trust_store,
+        cert_cache: Mutex::new(objsig::CertificateCache::new()),
     }));
 
     // procmgr's ProcessInfo names no procmgr endpoint, so its own spawned
@@ -674,7 +677,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     {
         procmgr_labels::CREATE_PROCESS =>
         {
-            handle_create(&req, ipc_buf, ctx);
+            handle_create(&req, ipc_buf, ctx, ObjectSource::Module);
         }
 
         procmgr_labels::START_PROCESS =>
@@ -749,7 +752,7 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 
         procmgr_labels::CREATE_FROM_FILE =>
         {
-            handle_create_from_file(&req, ipc_buf, ctx);
+            handle_create(&req, ipc_buf, ctx, ObjectSource::File);
         }
 
         procmgr_labels::CONFIGURE_PIPE =>
@@ -820,11 +823,15 @@ pub(crate) fn release_caps(caps: &[u64])
 ///   § `REGISTER_DEATH_EQ`).
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
-/// Reply: `procmgr_errors::SUCCESS` once stored, `UNAUTHORIZED` if the
-/// caller lacks the authority badge or a death EQ is already
-/// registered, `INVALID_ARGUMENT` if no cap (or a zero cap) arrives.
-/// Every refused request has its transferred caps deleted, and so do caps
-/// past `caps[0]`.
+/// Reply: `procmgr_errors::SUCCESS` once stored, in place of the queue a
+/// previous registration stored, whose cap is deleted
+/// (`process::install_logd_death_eq`); `UNAUTHORIZED` if the caller lacks
+/// the authority badge; `INVALID_ARGUMENT` if no cap (or a zero cap)
+/// arrives. Every refused request has its transferred caps deleted, and so do
+/// caps past `caps[0]`.
+///
+/// It writes no log line: the registering logd waits on this reply before its
+/// receive workers take the log endpoint.
 fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let caps = req.caps();
@@ -846,21 +853,14 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    // install_logd_death_eq is first-wins: it stores the cap, or returns
-    // false if a previous registration already filled the slot. Every
-    // teardown after it reads the same atomic to forward the death.
-    if process::install_logd_death_eq(logd_eq)
+    // Every teardown from here on forwards its death to the new queue. The
+    // replaced cap, the previous logd instance's, is no longer posted to.
+    let replaced = process::install_logd_death_eq(logd_eq);
+    if replaced != 0
     {
-        reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+        let _ = syscall::cap_delete(replaced);
     }
-    else
-    {
-        // Slot already filled (legitimate logd is registered).
-        // Drop the just-transferred cap so it doesn't leak in
-        // procmgr's CSpace; reject the caller.
-        let _ = syscall::cap_delete(logd_eq);
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
-    }
+    reply_empty(ipc_buf, procmgr_errors::SUCCESS);
 }
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
@@ -1612,42 +1612,73 @@ fn handle_configure_namespace(
     reply_empty(ipc_buf, code);
 }
 
+/// A create request that passed [`check_create_request`].
+struct CheckedCreate<'a>
+{
+    /// The child's placement, with its creator's signature policy.
+    sched: process::ChildSched,
+    /// The checked argv/env request; `None` without `CREATE_ARGV_ENV`.
+    argv_env: Option<process::ArgvEnvRequest>,
+    /// The name the creator expects the object to be signed under.
+    name: &'a [u8],
+}
+
 /// The checks a create request passes before procmgr acquires anything for
-/// the child: its creator, scheduling fields, memory max and class
-/// ([`resolve_create_sched`]) and, when the
-/// label sets `CREATE_ARGV_ENV`, the header of its argv and env, which starts
-/// at data word `first_word`, against the `argv_env_cap` that holds them
-/// (`process::check_argv_env`). Returns the resolved placement and the
-/// checked argv/env request (`None` without the flag); `None` in place of
-/// the pair means the request must be rejected with `INVALID_ARGUMENT`.
-fn check_create_request(
-    req: &IpcMessage,
-    first_word: usize,
+/// the child: its creator, scheduling fields, memory max, class and
+/// signature policy ([`resolve_create_sched`]), its name block, which must
+/// hold a name in the canonical form
+/// (`process_table::sign_policy::requested_name`), and, when the label sets
+/// `CREATE_ARGV_ENV`, the header of its argv and env against the
+/// `argv_env_cap` that holds them (`process::check_argv_env`). Its data
+/// word 0, the object's length, must be nonzero. `None` means the request
+/// must be rejected with `INVALID_ARGUMENT`.
+fn check_create_request<'a>(
+    req: &'a IpcMessage,
     argv_env_cap: u64,
     table: &process::ProcessTable,
-) -> Option<(process::ChildSched, Option<process::ArgvEnvRequest>)>
+) -> Option<CheckedCreate<'a>>
 {
-    let sched = resolve_create_sched(req, first_word, table)?;
-    if req.label & procmgr_labels::CREATE_ARGV_ENV == 0
+    let sched = resolve_create_sched(req, table)?;
+    let Some(name) = process_table::sign_policy::requested_name(req)
+    else
     {
-        return Some((sched, None));
+        std::os::seraph::log!(warn: "create without a name in the canonical form refused");
+        return None;
+    };
+    if req.word(0) == 0
+    {
+        std::os::seraph::log!(warn: "create of a zero-length object refused");
+        return None;
     }
-    match process::check_argv_env(req, first_word, argv_env_cap)
+    let argv_env = if req.label & procmgr_labels::CREATE_ARGV_ENV == 0
     {
-        Ok(request) => Some((sched, Some(request))),
-        Err(refusal) =>
+        None
+    }
+    else
+    {
+        match process::check_argv_env(req, procmgr_labels::CREATE_FIRST_WORD, argv_env_cap)
         {
-            std::os::seraph::log!(warn: "create argv/env refused: {refusal:?}");
-            None
+            Ok(request) => Some(request),
+            Err(refusal) =>
+            {
+                std::os::seraph::log!(warn: "create argv/env refused: {refusal:?}");
+                return None;
+            }
         }
-    }
+    };
+    Some(CheckedCreate {
+        sched,
+        argv_env,
+        name,
+    })
 }
 
 /// Resolve a create request against its creator: the scheduling fields
 /// against the creator's spawn ceiling, and the child's memmgr registration
 /// (its budget node's parent, its max, reserve membership and class) against
-/// the creator's node and class. The request's data words after the fixed
-/// ones start at `first_word`. `None` means the request must be rejected with
+/// the creator's node and class; the child's signature policy starts as the
+/// creator's (`process_table::Creator::sign_kinds`). `None` means the request
+/// must be rejected with
 /// `INVALID_ARGUMENT`: still-reserved label bits are set, the badge names no
 /// creator (`process_table::ProcessTable::creator_of`), the requested band
 /// exceeds the creator's, the requested priority falls outside the resolved
@@ -1666,7 +1697,6 @@ fn check_create_request(
 /// escape every memory max.
 fn resolve_create_sched(
     req: &IpcMessage,
-    first_word: usize,
     table: &process::ProcessTable,
 ) -> Option<process::ChildSched>
 {
@@ -1691,7 +1721,7 @@ fn resolve_create_sched(
         creator.band_max,
         ipc::sched_policy::DEFAULT_SPAWN_PRIORITY,
     )?;
-    let budget = process_table::decode_memory_max(req, first_word)
+    let budget = process_table::decode_memory_max(req, procmgr_labels::CREATE_FIRST_WORD)
         .and_then(|max| process_table::child_budget(label, max, &creator));
     let budget = match budget
     {
@@ -1706,6 +1736,7 @@ fn resolve_create_sched(
         priority,
         band_max,
         budget,
+        sign_kinds: creator.sign_kinds,
     })
 }
 
@@ -1878,50 +1909,45 @@ fn reply_create_result(
     }
 }
 
-/// Handle `CREATE_PROCESS` — create a process from a boot module memory cap.
+/// Where a create request's object comes from: the source cap, `caps[0]`, of
+/// `CREATE_PROCESS` or of `CREATE_FROM_FILE`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectSource
+{
+    /// A Memory cap holding the object from its first byte (a boot module).
+    Module,
+    /// A file node cap on the caller's fs driver.
+    File,
+}
+
+/// Handle `CREATE_PROCESS` (`source` [`ObjectSource::Module`]) and
+/// `CREATE_FROM_FILE` (`source` [`ObjectSource::File`]): create a suspended
+/// process from a signed object, verified before any of it is parsed
+/// (docs/signing.md § Verifier Discipline).
 ///
-/// Label layout:
-///   bits [0..16]  = opcode (`CREATE_PROCESS`)
-///   bit  16       = `CREATE_PINNED` (opt out of the default system pager)
-///   bit  17       = `CREATE_DEATH_RELAY` (a death-relay cap is the last cap)
-///   bits [18..23] = `CREATE_PRIORITY` (0 = default; see `resolve_create_sched`)
-///   bits [23..28] = `CREATE_BAND_MAX` (0 = copy of the creator's band)
-///   bit  28       = `CREATE_DMA_HOLD` (hold the reclaim for `RELEASE_HOLD`)
-///   bit  29       = `CREATE_ARGV_ENV` (argv and env in a Memory cap)
-///   bit  30       = `CREATE_PHYS_ACCESS` (a phys-class child)
-///   bit  31       = `CREATE_MEMORY_MAX` (a memory max follows in a data word)
-///   bit  32       = `CREATE_RESERVE` (a system-reserve child)
-///   bit  33       = `CREATE_NODE_HANDLE` (reply the child's node handle)
-///   bit  34       = `CREATE_CHARGE_NODE` (charge the child to a node handle)
-///   bits [35..64] = reserved (must be zero)
-///
-/// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
-/// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`;
-/// then the memory max in pages, only with `CREATE_MEMORY_MAX`.
-///
-/// Expects `caps = [module_memory, creator_endpoint?, charge?, argv_env?,
-/// relay?]`, `charge` only with `CREATE_CHARGE_NODE`, `argv_env` only with
-/// `CREATE_ARGV_ENV` and `relay` only with `CREATE_DEATH_RELAY`; caps between
-/// the creator endpoint and them are deleted. `charge` goes to memmgr with
-/// the registration, or is deleted on a path before it. The relay is consumed by `finalize_creation` on success and
-/// deleted here on every other outcome. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
-/// IPCs (one per piped direction) on the returned badged `process_handle`
-/// between create and `START_PROCESS`; the create path itself stays
-/// stdio-agnostic.
-fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
+/// Wire layout: see [`procmgr_labels::CREATE_PROCESS`] and
+/// [`procmgr_labels::CREATE_FROM_FILE`]; both lay out their data words alike:
+/// word 0 the object's length, then the argv/env header, the memory max and
+/// the name block, each present or not. Caps: `[source, creator_endpoint?,
+/// charge?, argv_env?, relay?]`, `charge` only with `CREATE_CHARGE_NODE`,
+/// `argv_env` only with `CREATE_ARGV_ENV` and `relay` only with
+/// `CREATE_DEATH_RELAY`; caps between the creator endpoint and them are
+/// deleted. procmgr owns every transferred cap: the source is deleted once
+/// its object is copied (a file's opened, read and closed first), the creator
+/// endpoint once the child holds its own copy, the argv/env cap once its
+/// blobs are copied, the charge node's handle goes to memmgr with the
+/// registration, and the relay is consumed by `finalize_creation` on
+/// success; every cap of a refused request is deleted here. Stdio pipe
+/// wiring is installed by separate `CONFIGURE_PIPE` IPCs on the returned
+/// `process_handle` between create and `START_PROCESS`.
+fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: ObjectSource)
 {
     let label = req.label;
     let all_caps = req.caps();
 
-    if all_caps.is_empty()
-    {
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ELF);
-        return;
-    }
-
-    // The tail caps peel off as on `CREATE_FROM_FILE`; a request that flags
-    // a tail cap its caps cannot supply apart from the module cap is
-    // malformed.
+    // A request that flags a tail cap its caps cannot supply apart from the
+    // source cap is malformed: taking that cap as a tail cap too would
+    // release one slot twice.
     let Some(caps) =
         process::split_create_caps(all_caps, process::CreateTailCaps::of_create(label))
     else
@@ -1931,19 +1957,18 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         return;
     };
     release_caps(caps.extra);
-    let module_cap = caps.source;
-    let creator_ep = caps.creator;
 
-    // Resolve the scheduling fields and check the argv/env before any
+    // Resolve the scheduling fields, the name and the argv/env before any
     // resource acquisition. The transferred caps are procmgr's to release on
-    // the reject path.
-    let checked = check_create_request(req, 0, caps.argv_env, &ctx.tables.lock().table);
-    let Some((mut sched, argv_env)) = checked
+    // the reject path; a file cap is not opened yet, so its fs driver holds
+    // no state for it.
+    let checked = check_create_request(req, caps.argv_env, &ctx.tables.lock().table);
+    let Some(mut checked) = checked
     else
     {
         release_caps(&[
-            module_cap,
-            creator_ep,
+            caps.source,
+            caps.creator,
             caps.argv_env,
             caps.relay,
             caps.charge,
@@ -1951,44 +1976,146 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    sched.budget.charge = caps.charge;
+    checked.sched.budget.charge = caps.charge;
 
-    // Register this child with memmgr. memmgr replies with a badged SEND
-    // cap on its endpoint plus the memmgr-side process badge. Procmgr:
-    //   - uses the cap for every per-child memory-cap allocation (so memmgr
-    //     accounts them to the child's record from the moment they leave
-    //     the pool); and
-    //   - copies the cap into the child's `ProcessInfo.memmgr_endpoint_cap`
-    //     so the child's std heap-bootstrap can call `REQUEST_MEMORY_CAPS`; and
-    //   - sends the badge in `PROCESS_DIED` at child teardown.
-    // The guard owns the registration until the child's table entry does:
-    // on a failed create it retires memmgr's record (PROCESS_DIED, which
-    // returns every page already billed to the child) and drops the slot,
-    // except after an argv/env copy window that would not unmap, whose
-    // record `settle_failed_argv_env` withholds.
+    let request = CreateRequest {
+        label,
+        source,
+        source_cap: process::CapGuard::new(caps.source),
+        len: req.word(0),
+        name: checked.name,
+        creator_ep: caps.creator,
+        argv_env: checked.argv_env,
+        argv_env_cap: caps.argv_env,
+        relay: caps.relay,
+    };
+    let result = create_child(ctx, request, &mut checked.sched, ipc_buf);
+
+    // The child holds its own copies of the creator endpoint and of the argv
+    // and env, or no child exists, so procmgr's slots are released on both
+    // arms before the reply. The charge node's handle went to memmgr with the
+    // registration, or is released here when the create failed before it
+    // (deleting a moved slot is harmless).
+    release_caps(&[caps.creator, caps.argv_env, caps.charge]);
+
+    match result
+    {
+        Ok(result) =>
+        {
+            arm_and_reply_create(label, &result, ipc_buf, ctx);
+            log_spawn(&result, checked.sched);
+        }
+        Err(code) =>
+        {
+            // `finalize_creation` consumes (binds and deletes) the relay
+            // only once the child's table entry exists, which every error
+            // return precedes; procmgr's copy is dropped here.
+            release_caps(&[caps.relay]);
+            reply_empty(ipc_buf, code);
+        }
+    }
+}
+
+/// What [`create_child`] takes from a checked create request.
+struct CreateRequest<'a>
+{
+    label: u64,
+    source: ObjectSource,
+    /// The source cap, deleted when the guard drops, after the object is
+    /// read or on any earlier failure.
+    source_cap: process::CapGuard,
+    /// The object's length in bytes, data word 0.
+    len: u64,
+    /// The name the object must be signed under.
+    name: &'a [u8],
+    creator_ep: u64,
+    argv_env: Option<process::ArgvEnvRequest>,
+    argv_env_cap: u64,
+    relay: u64,
+}
+
+/// Create the child of a checked request: register it with memmgr, copy its
+/// argv and env, read its object once into a buffer on its account
+/// ([`image::read_module`], [`image::read_file`]), verify the copy under the
+/// request's name and `sched`'s signature policy ([`image::verify`]), narrow
+/// the policy by the verified kind, and load the verified body
+/// (`process::create_process_from_bytes`). The buffer goes back to memmgr
+/// before the registration settles. Single exit: any failure, a refused
+/// signature among them, creates nothing and releases what it took.
+///
+/// # Errors
+/// `OUT_OF_MEMORY` when memmgr does not register the child; the argv/env
+/// copy's code ([`process::ArgvEnvCopyError::code`]); the read's code;
+/// `SIGNATURE_REFUSED` when the object does not verify; the load's code.
+fn create_child(
+    ctx: &ProcmgrCtx,
+    request: CreateRequest<'_>,
+    sched: &mut process::ChildSched,
+    ipc_buf: *mut u64,
+) -> Result<process::CreateResult, u64>
+{
+    // memmgr's badged SEND for the child: every page procmgr takes for the
+    // child, the object's buffer included, is billed to the child's record
+    // from the moment it leaves the pool. The guard owns the registration
+    // until the child's table entry does: on a failed create it retires the
+    // record (PROCESS_DIED, which returns every page already billed to the
+    // child) and drops the slot, except after an argv/env copy window that
+    // would not unmap, whose record `settle_failed_argv_env` withholds.
     let registration = register_with_memmgr(ctx.memmgr_ep, &sched.budget, ipc_buf);
     let mms = process::MemmgrSendGuard::new(registration, ctx.memmgr_ep, ipc_buf);
-
-    // The child's checked copy of the argv and env, on its account. The
-    // caller's cap is no longer needed once it is taken (or refused), so it
-    // is deleted before any reply.
-    let argv_env = match argv_env
+    if mms.cap() == 0
     {
-        Some(request) => process::copy_argv_env(ctx.self_aspace, mms.cap(), ipc_buf, &request),
+        return Err(procmgr_errors::OUT_OF_MEMORY);
+    }
+
+    // The child's checked copy of the argv and env, on its account; a
+    // malformed blob refuses the create here. The caller's cap is no longer
+    // needed once it is taken.
+    let argv_env = match &request.argv_env
+    {
+        Some(argv_env) => process::copy_argv_env(ctx.self_aspace, mms.cap(), ipc_buf, argv_env),
         None => Ok(process::ChildArgvEnv::empty()),
     };
-    release_caps(&[caps.argv_env]);
+    release_caps(&[request.argv_env_cap]);
     let argv_env = match argv_env
     {
         Ok(argv_env) => argv_env,
         Err(e) =>
         {
             process::settle_failed_argv_env(mms, e);
-            release_caps(&[module_cap, creator_ep, caps.relay]);
-            reply_empty(ipc_buf, e.code());
-            return;
+            return Err(e.code());
         }
     };
+
+    // Declared after `mms`, so on every exit the buffer drops first: its
+    // frames are unmapped, their caps deleted and their runs released before
+    // the registration's `PROCESS_DIED` or the child's entry takes over.
+    let buffer = match request.source
+    {
+        ObjectSource::Module =>
+        {
+            let buffer = image::read_module(
+                ctx.self_aspace,
+                request.source_cap.cap(),
+                request.len,
+                mms.cap(),
+                ipc_buf,
+            );
+            drop(request.source_cap);
+            buffer
+        }
+        ObjectSource::File => image::read_file(
+            ctx.self_aspace,
+            request.source_cap.disarm(),
+            request.len,
+            mms.cap(),
+            ipc_buf,
+        ),
+    }?;
+    let verified = image::verify(ctx, buffer.bytes(), request.name, sched.sign_kinds)
+        .map_err(|_| procmgr_errors::SIGNATURE_REFUSED)?;
+    sched.sign_kinds =
+        process_table::sign_policy::child_kinds(sched.sign_kinds, verified.attrs.kind);
 
     let universals = process::UniversalCaps {
         procmgr_endpoint: ctx.self_endpoint,
@@ -1998,74 +2125,45 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         memmgr_max: mms.max(),
         registry_send_source: ctx.registry_ep,
         sched_baseline: ctx.sched_baseline,
-        paging: process::Paging::of_label(label),
+        paging: process::Paging::of_label(request.label),
         self_memmgr_ep: ctx.memmgr_ep,
     };
-
-    let mut result = process::create_process(
-        module_cap,
+    let mut result = process::create_process_from_bytes(
+        verified.body,
         ctx.self_aspace,
-        ctx.memmgr_ep,
-        ipc_buf,
         &ctx.tables,
         ctx.self_endpoint,
-        creator_ep,
+        request.creator_ep,
         &universals,
         argv_env,
         &ctx.deaths,
-        caps.relay,
-        sched,
+        request.relay,
+        *sched,
+        ipc_buf,
     );
-
-    // Procmgr's parent-side copy of the badged cap stays in procmgr's
-    // CSpace as long as the child is alive: it's the channel procmgr
-    // uses to call `PROCESS_DIED` at teardown. On success the slot is
-    // recorded in ProcessEntry.memmgr_send_cap and dropped only after
-    // PROCESS_DIED. On create failure (no entry) the guard's drop sends
-    // PROCESS_DIED and deletes the slot; create_process has already
-    // released the child's kernel objects, so memmgr reclaims pages no
-    // kernel object still uses.
+    // The segments are copied into the child's own frames; the object's
+    // frames go back to memmgr before the registration settles.
+    drop(buffer);
     mms.settle(&mut result);
-
-    // Module cap disposition: the module cap is a borrowed derivation of the
-    // caller's module-source memory cap. The loader has copied the ELF contents
-    // into the child's AddressSpace and has no further use for the source, so
-    // delete it. The owner (init) retains the source memory cap and donates it to
-    // memmgr's pool at reap.
-    if module_cap != 0
-    {
-        let _ = syscall::cap_delete(module_cap);
-    }
-    if creator_ep != 0
-    {
-        let _ = syscall::cap_delete(creator_ep);
-    }
-
-    match result
-    {
-        Ok(result) =>
-        {
-            log_spawn_sched(sched);
-            arm_and_reply_create(label, &result, ipc_buf, ctx);
-        }
-        Err(cause) =>
-        {
-            // § Label 1 names `OUT_OF_MEMORY` for every creation failure past
-            // the request's own checks, whatever the cause `create_process`
-            // reports, so the cause is logged here, where it is still known.
-            // `finalize_creation` consumes the relay only on success.
-            std::os::seraph::log!(warn: "create from a module failed (procmgr_errors {cause})");
-            release_caps(&[caps.relay]);
-            reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
-        }
-    }
+    result
 }
 
-/// One line per successful spawn recording the resolved scheduling
-/// placement, so the boot log evidences every process's level and band
-/// (there is no priority-readback syscall to query after the fact).
-fn log_spawn_sched(sched: process::ChildSched)
+/// Log a created child's image bias and its scheduling placement, after the
+/// create's reply: the creator then goes on while a line waits on logd, which
+/// matters when the child is logd's next instance, created while no logd
+/// receives, whose creator, svcmgr, would otherwise wait out the line's bound
+/// (`LOG_CALL_TIMEOUT_MS`) before it can start it. The bias line is the one a
+/// debugger reads the image's placement from
+/// (`docs/userspace-memory-model.md` § Image Placement); no `ProcessInfo`
+/// field carries the bias, and an `ET_EXEC` image, at bias 0, has none. The
+/// scheduling line evidences every process's level and band in the boot log,
+/// since no syscall reads a priority back.
+fn log_spawn(result: &process::CreateResult, sched: process::ChildSched)
 {
+    if result.image_bias != 0
+    {
+        std::os::seraph::log!("spawn image bias=0x{:x}", result.image_bias);
+    }
     std::os::seraph::log!(
         debug: "spawn priority={} band=[1,{}]",
         sched.priority,
@@ -2126,99 +2224,12 @@ pub struct ProcmgrCtx
     /// Zero if init delegated none; children are then created at the floor
     /// and cannot set any priority.
     pub sched_baseline: u64,
-}
-
-/// Handle `CREATE_FROM_FILE` — create a process from a caller-supplied file cap.
-///
-/// Wire layout: see [`procmgr_labels::CREATE_FROM_FILE`]. The caller has
-/// already walked its own namespace cap to the binary node; procmgr never
-/// touches the namespace tree on this path. procmgr owns every transferred
-/// cap: the file cap is opened (`FS_OPEN`) and deleted, and procmgr's open
-/// `FS_CLOSE`d and deleted after the load, the creator
-/// endpoint is deleted once the child holds its own copy, the relay is
-/// consumed by `finalize_creation` on success, the charge node's handle goes
-/// to memmgr with the registration, and every other cap, and every cap of a
-/// rejected request, is deleted here.
-fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
-{
-    let label = req.label;
-    let all_caps = req.caps();
-
-    // The death-relay POST cap, when present, is the LAST cap in the message
-    // (see `CREATE_DEATH_RELAY`), the argv/env cap the one before it, and the
-    // charge node's handle the one before those, all peeled off the tail so
-    // the `creator_endpoint` slot stays
-    // positionally fixed at caps[1]. A request that flags a tail cap its caps
-    // cannot supply apart from the file cap is malformed: taking that cap as
-    // a tail cap too would release one slot twice.
-    let Some(caps) =
-        process::split_create_caps(all_caps, process::CreateTailCaps::of_create(label))
-    else
-    {
-        release_caps(all_caps);
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
-    };
-    release_caps(caps.extra);
-
-    // Resolve the scheduling fields and check the argv/env before any
-    // resource acquisition. The transferred caps are procmgr's to release on
-    // the reject path; the file cap is not opened yet, so the fs driver holds
-    // no state for it.
-    let checked = check_create_request(req, 1, caps.argv_env, &ctx.tables.lock().table);
-    let Some((mut sched, argv_env)) = checked
-    else
-    {
-        release_caps(&[
-            caps.source,
-            caps.creator,
-            caps.argv_env,
-            caps.relay,
-            caps.charge,
-        ]);
-        reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
-        return;
-    };
-    sched.budget.charge = caps.charge;
-
-    let file_size = req.word(0);
-
-    let result = process::create_process_from_file(
-        ctx,
-        caps.source,
-        file_size,
-        &ctx.tables,
-        ipc_buf,
-        caps.creator,
-        argv_env.as_ref(),
-        &ctx.deaths,
-        process::Paging::of_label(label),
-        caps.relay,
-        sched,
-    );
-
-    // The child holds its own copies of the creator endpoint
-    // (populate_child_info cap_copies it) and of the argv and env, or no
-    // child exists, so procmgr's slots are released on both arms, as
-    // handle_create does, before the reply. The charge node's handle went to
-    // memmgr with the registration, or is released here when the create
-    // failed before it (deleting a moved slot is harmless).
-    release_caps(&[caps.creator, caps.argv_env, caps.charge]);
-
-    match result
-    {
-        Ok(result) =>
-        {
-            log_spawn_sched(sched);
-            arm_and_reply_create(label, &result, ipc_buf, ctx);
-        }
-        Err(code) =>
-        {
-            // `finalize_creation` consumes (binds + deletes) the relay cap
-            // only once the child's table entry exists, which every error
-            // return precedes; drop procmgr's copy here.
-            release_caps(&[caps.relay]);
-            reply_empty(ipc_buf, code);
-        }
-    }
+    /// The trust store every create's object is verified against
+    /// ([`image::verify`]), parsed once from procmgr's copy, which lives for
+    /// procmgr's life.
+    pub trust_store: objsig::TrustStore<'static>,
+    /// The certificates whose signature has verified, so the certificate
+    /// every object of one signer carries is checked once; a memo, copied
+    /// out and back by each verification ([`image::verify`]).
+    pub cert_cache: Mutex<objsig::CertificateCache>,
 }

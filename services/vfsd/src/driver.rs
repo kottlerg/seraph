@@ -36,6 +36,21 @@ use ipc::{FS_LABELS_VERSION, IpcMessage, fs_labels, procmgr_labels};
 use crate::VfsdCaps;
 use crate::worker_pool::{BootstrapOrder, CreateFromFileOrder, WorkerPool, delete_bootstrap_caps};
 
+/// Where fatfs is installed, the path vfsd walks to start it from the root
+/// filesystem and the name its signed object is verified under.
+pub const FATFS_PATH: &str = "/services/fs/fatfs";
+
+/// The bundle entry name of the fatfs boot module init hands vfsd, under
+/// which procmgr verifies the module vfsd starts the root mount's fatfs from.
+pub const FATFS_MODULE_NAME: &[u8] = b"fatfs";
+
+// Both fatfs names fit a create request's name block, so a request built
+// with either carries its name.
+const _: () = assert!(
+    FATFS_PATH.len() <= procmgr_labels::CREATE_NAME_MAX
+        && FATFS_MODULE_NAME.len() <= procmgr_labels::CREATE_NAME_MAX
+);
+
 /// A started fatfs driver instance: what the mount record keeps of it
 /// (`root_backend::Mount`, `docs/namespace-composition.md` § Mount record).
 pub struct FatfsDriver
@@ -411,25 +426,37 @@ fn spawn_via_module(
     };
     // Same placement as the on-disk fs-driver spawn path (worker.rs): an
     // fs driver runs at vfsd's own level with a matching band ceiling.
-    // Caps: [module, creator, argv_env?, relay]; the argv/env header rides
-    // in data words 0..4, and the relay is the last cap
+    // Caps: [module, creator, argv_env?, relay]; the module's length rides
+    // in data word 0, the argv/env header in words 1..5, the module's bundle
+    // entry name in the name block after them, and the relay is the last cap
     // (`services/procmgr/docs/ipc-interface.md` § Label 1).
-    let mut builder = IpcMessage::builder(
-        procmgr_labels::CREATE_PROCESS
-            | argv_env_flag
-            | procmgr_labels::CREATE_DEATH_RELAY
-            | procmgr_labels::create_sched_bits(
-                ipc::sched_policy::FS_DRIVER_PRIORITY,
-                ipc::sched_policy::FS_DRIVER_PRIORITY,
-            ),
-    )
-    .cap(module_copy)
-    .cap(badged_creator);
-    if let Some(env) = &argv_env
-    {
-        builder = builder.words(0, &env.header_words()).cap(env.cap());
-    }
-    let create_msg = builder.cap(relay).build();
+    let label = procmgr_labels::CREATE_PROCESS
+        | argv_env_flag
+        | procmgr_labels::CREATE_DEATH_RELAY
+        | procmgr_labels::create_sched_bits(
+            ipc::sched_policy::FS_DRIVER_PRIORITY,
+            ipc::sched_policy::FS_DRIVER_PRIORITY,
+        );
+    let request = || {
+        let builder = IpcMessage::builder(label)
+            .word(0, caps.fatfs_module_len)
+            .cap(module_copy)
+            .cap(badged_creator);
+        match &argv_env
+        {
+            Some(env) => builder
+                .words(procmgr_labels::CREATE_FIRST_WORD, &env.header_words())
+                .cap(env.cap()),
+            None => builder,
+        }
+    };
+    // `FATFS_MODULE_NAME` fits a name block (asserted at its definition); a request
+    // without one would still carry every cap, for procmgr to refuse and
+    // delete.
+    let create_msg = procmgr_labels::with_create_name(request(), label, FATFS_MODULE_NAME)
+        .unwrap_or_else(request)
+        .cap(relay)
+        .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let create_reply = unsafe { ipc::ipc_call(caps.procmgr_ep, &create_msg, ipc_buf) };
     // procmgr has copied the env by now, or refused the request.
@@ -521,7 +548,7 @@ fn spawn_via_vfs(
 ) -> Option<u64>
 {
     let (file_cap, file_size) =
-        match std::os::seraph::namespace_lookup_file(system_root_cap, "/services/fs/fatfs")
+        match std::os::seraph::namespace_lookup_file(system_root_cap, FATFS_PATH)
         {
             Ok(p) => p,
             Err(e) =>

@@ -366,12 +366,14 @@ fn run_jobs(
     ipc_buf: *mut u64,
 )
 {
-    let (jobs, drivers_dir_cap, bind_dir_cap) = {
+    let (jobs, drivers_dir_cap, drivers_dir_path, bind_dir_cap, bind_dir_path) = {
         let mut state = registry.lock();
         (
             core::mem::take(&mut state.jobs),
             state.drivers_dir_cap,
+            state.drivers_dir_path,
             state.bind_dir_cap,
+            state.bind_dir_path,
         )
     };
     let mut tables = bind::Carve {
@@ -386,6 +388,7 @@ fn run_jobs(
             records,
             &mut tables,
             drivers_dir_cap,
+            drivers_dir_path.as_bytes(),
             watch,
             registry,
             ipc_buf,
@@ -400,12 +403,16 @@ fn run_jobs(
             records,
             &mut tables,
             bind_dir_cap,
+            bind_dir_path.as_bytes(),
             watch,
             registry,
             ipc_buf,
         );
         let _ = syscall::cap_delete(bind_dir_cap);
-        registry.finish_job(|state| state.bind_dir_cap = 0);
+        registry.finish_job(|state| {
+            state.bind_dir_cap = 0;
+            state.bind_dir_path = DirPath::EMPTY;
+        });
     }
 }
 
@@ -420,6 +427,47 @@ struct Jobs
     bind: bool,
 }
 
+/// The absolute path of a directory a request names, as a name block of the
+/// request ([`ipc::name_block`]), copied out so it can be held beside the
+/// directory's cap and read without the registry lock.
+#[derive(Clone, Copy)]
+struct DirPath
+{
+    bytes: [u8; ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX],
+    len: usize,
+}
+
+impl DirPath
+{
+    /// No path: the value before a request sets one.
+    const EMPTY: Self = Self {
+        bytes: [0; ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX],
+        len: 0,
+    };
+
+    /// The path `msg` carries from data word
+    /// [`ipc::devmgr_labels::DRIVERS_DIR_PATH_WORD`]; `None` when the
+    /// message carries none that fits.
+    fn of(msg: &IpcMessage) -> Option<Self>
+    {
+        let path = ipc::name_block(
+            msg,
+            ipc::devmgr_labels::DRIVERS_DIR_PATH_WORD,
+            ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX,
+        )?;
+        let mut out = Self::EMPTY;
+        out.bytes.get_mut(..path.len())?.copy_from_slice(path);
+        out.len = path.len();
+        Some(out)
+    }
+
+    /// The path's bytes.
+    fn as_bytes(&self) -> &[u8]
+    {
+        self.bytes.get(..self.len).unwrap_or(&[])
+    }
+}
+
 /// What the registry's workers and the control thread share, under
 /// [`Registry::state`].
 struct RegistryState
@@ -432,6 +480,9 @@ struct RegistryState
     /// The `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree
     /// cap svcmgr delivers with `SET_DRIVERS_DIR`; 0 until then.
     drivers_dir_cap: u64,
+    /// The absolute path of the directory `drivers_dir_cap` names, from the
+    /// same request; empty until then.
+    drivers_dir_path: DirPath,
     /// Whether the drivers-directory pass has been posted: at most once per
     /// boot, so a driver not served by it replies `NO_DEVICE` thereafter and
     /// timed degrades gracefully to its no-RTC path. A boot-only class mark
@@ -441,6 +492,9 @@ struct RegistryState
     /// and not yet done, which the control thread deletes once the pass
     /// ends; 0 when none is, so a request is admitted only then.
     bind_dir_cap: u64,
+    /// The absolute path of the directory `bind_dir_cap` names; empty when
+    /// `bind_dir_cap` is 0.
+    bind_dir_path: DirPath,
 }
 
 // A class name a `MINT_CLASS_SEND` request can carry is one a declaration
@@ -484,30 +538,33 @@ impl RegistryState
     }
 
     /// `SET_DRIVERS_DIR`'s state change: keep `cap` as the drivers-directory
-    /// cap and post the drivers-directory pass, when no cap is kept yet.
-    /// Returns whether it did; on `false` the caller releases `cap`.
-    fn install_drivers_dir(&mut self, cap: u64) -> bool
+    /// cap, with `path` its absolute path, and post the drivers-directory
+    /// pass, when no cap is kept yet. Returns whether it did; on `false` the
+    /// caller releases `cap`.
+    fn install_drivers_dir(&mut self, cap: u64, path: &DirPath) -> bool
     {
         if self.drivers_dir_cap != 0
         {
             return false;
         }
         self.drivers_dir_cap = cap;
+        self.drivers_dir_path = *path;
         self.pass_begun = true;
         Registry::post(self, |j| &mut j.drivers_dir)
     }
 
-    /// `BIND_DRIVERS`'s state change: keep `cap` as the directory of an
-    /// on-demand pass and post it, when the drivers directory is installed
-    /// and no earlier request's pass is posted. Returns whether it did; on
-    /// `false` the caller releases `cap`.
-    fn post_bind(&mut self, cap: u64) -> bool
+    /// `BIND_DRIVERS`'s state change: keep `cap`, with `path` its absolute
+    /// path, as the directory of an on-demand pass and post it, when the
+    /// drivers directory is installed and no earlier request's pass is posted.
+    /// Returns whether it did; on `false` the caller releases `cap`.
+    fn post_bind(&mut self, cap: u64, path: &DirPath) -> bool
     {
         if self.drivers_dir_cap == 0 || self.bind_dir_cap != 0
         {
             return false;
         }
         self.bind_dir_cap = cap;
+        self.bind_dir_path = *path;
         Registry::post(self, |j| &mut j.bind)
     }
 }
@@ -552,8 +609,10 @@ impl Registry
                 jobs: Jobs::default(),
                 unsettled: 0,
                 drivers_dir_cap: 0,
+                drivers_dir_path: DirPath::EMPTY,
                 pass_begun: false,
                 bind_dir_cap: 0,
+                bind_dir_path: DirPath::EMPTY,
             }),
             settled: Condvar::new(),
             job_note,
@@ -966,11 +1025,14 @@ impl Registry
     }
 
     /// `SET_DRIVERS_DIR`, svcmgr's handshake: keep the subtree cap it
-    /// carries, reply, and post the drivers-directory pass, which the control
-    /// thread runs, so svcmgr never waits on driver work. Every rejection
+    /// carries and the directory's absolute path (a name block from data word
+    /// `DRIVERS_DIR_PATH_WORD`), reply, and post the drivers-directory pass,
+    /// which the control thread runs, so svcmgr never waits on driver work.
+    /// Every rejection
     /// releases the cap the kernel transferred into devmgr's `CSpace` before
     /// it replies, and a re-send keeps the first cap and releases the new
-    /// one; the pass is posted at most once per boot.
+    /// one; a request with no path is refused with `INVALID_REQUEST`; the pass
+    /// is posted at most once per boot.
     fn set_drivers_dir(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let delivered_cap = msg.caps().first().copied();
@@ -1001,7 +1063,14 @@ impl Registry
             reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
             return;
         };
-        let installed = self.lock().install_drivers_dir(new_cap);
+        let Some(path) = DirPath::of(msg)
+        else
+        {
+            release();
+            reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
+            return;
+        };
+        let installed = self.lock().install_drivers_dir(new_cap, &path);
         if installed
         {
             std::os::seraph::log!("devmgr: SET_DRIVERS_DIR cap installed");
@@ -1082,12 +1151,13 @@ impl Registry
         }
     }
 
-    /// `BIND_DRIVERS`: keep the directory cap it carries, reply, and post the
-    /// on-demand pass over it, which the control thread runs and which
-    /// deletes the cap once it ends. Admitted only once `SET_DRIVERS_DIR`
+    /// `BIND_DRIVERS`: keep the directory cap it carries and the directory's
+    /// absolute path (a name block from data word `DRIVERS_DIR_PATH_WORD`),
+    /// reply, and post the on-demand pass over it, which the control thread
+    /// runs and which deletes the cap once it ends. Admitted only once `SET_DRIVERS_DIR`
     /// has delivered the drivers directory, whose pass binds first, and while
-    /// no earlier request's pass is posted; every rejection releases the cap
-    /// before it replies.
+    /// no earlier request's pass is posted; every rejection, including a request
+    /// with no path, releases the cap before it replies.
     fn bind_drivers(&self, msg: &IpcMessage, ipc_buf: *mut u64)
     {
         let delivered_cap = msg.caps().first().copied();
@@ -1114,7 +1184,13 @@ impl Registry
             refuse(ipc::devmgr_errors::INVALID_REQUEST);
             return;
         };
-        let posted = self.lock().post_bind(dir_cap);
+        let Some(path) = DirPath::of(msg)
+        else
+        {
+            refuse(ipc::devmgr_errors::INVALID_REQUEST);
+            return;
+        };
+        let posted = self.lock().post_bind(dir_cap, &path);
         if !posted
         {
             refuse(ipc::devmgr_errors::INVALID_REQUEST);
@@ -2232,7 +2308,7 @@ fn settle_batch(
 )]
 fn spawn_boot_drivers(
     records: &mut bind::Records,
-    modules: Vec<(driver_binding::decl::DriverDecl, u64)>,
+    modules: Vec<(driver_binding::decl::DriverDecl, decls::Binary)>,
     caps: &mut caps::DevmgrCaps,
     irq_range: &mut IrqRangeAllocator,
     watch: &mut settle::DriverWatch,
@@ -2248,7 +2324,7 @@ fn spawn_boot_drivers(
         // A retained module cap pins the pool run init donated it from.
         for (_, module) in modules
         {
-            drop(spawn::ModuleCapGuard::new(module));
+            module.release();
         }
         return;
     };
@@ -2294,14 +2370,21 @@ fn create_service_endpoint() -> Option<u64>
 /// over the records no earlier driver was bound to
 /// ([`bind::drivers_dir_pass`]), each binary read through `dir_cap`, the
 /// `LOOKUP | READ | READDIR`-attenuated directory cap the request delivered
-/// (namespace-protocol rights, not kernel cap rights). A driver not spawned,
+/// (namespace-protocol rights, not kernel cap rights), and named under
+/// `dir_path`, the directory's absolute path. A driver not spawned,
 /// or not ready when the batch settles, is never served, and its device's
 /// carved caps are released. `what` names the batch in a log line.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pass takes the records, the carve tables, the directory cap and its path, and \
+              the watch, registry and IPC buffer its batch settles with"
+)]
 fn spawn_dir_drivers(
     what: &str,
     records: &mut bind::Records,
     carve: &mut bind::Carve,
     dir_cap: u64,
+    dir_path: &[u8],
     watch: &mut settle::DriverWatch,
     registry: &Registry,
     ipc_buf: *mut u64,
@@ -2317,6 +2400,7 @@ fn spawn_dir_drivers(
     bind::drivers_dir_pass(
         records,
         dir_cap,
+        dir_path,
         |decl| registry.class_admits(decl),
         carve,
         &mut bind::Pass {

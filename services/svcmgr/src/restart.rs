@@ -127,6 +127,37 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
     .unwrap_or(0)
 }
 
+/// The `CREATE_FROM_FILE` request labelled `label` for `file` (its file
+/// cap, its size, and the path walked to it, the name it is verified under),
+/// with creator endpoint `badged_creator` and the argv/env cap when present.
+/// Caps: `[file_cap, badged_creator, argv_env?]`; the header rides in data
+/// words 1..5, after `file_size`, and the path in the name block after them.
+/// `None` when the path does not fit a name block.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the builder's by-value copies (568 B each) across the header and the name block, and \
+              the built `IpcMessage`; on the 32 KiB main-thread stack of svcmgr"
+)]
+fn create_msg(
+    label: u64,
+    file: (u64, u64, &str),
+    badged_creator: u64,
+    argv_env: Option<&ArgvEnvCap>,
+) -> Option<IpcMessage>
+{
+    let (file_cap, file_size, path) = file;
+    let mut builder = IpcMessage::builder(label)
+        .word(0, file_size)
+        .cap(file_cap)
+        .cap(badged_creator);
+    if let Some(cap) = argv_env
+    {
+        builder = builder
+            .words(procmgr_labels::CREATE_FIRST_WORD, &cap.header_words())
+            .cap(cap.cap());
+    }
+    Some(procmgr_labels::with_create_name(builder, label, path.as_bytes())?.build())
+}
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
 /// Returns the freshly created (suspended) process, or `None` (each arm
 /// logged) when the argv/env cap cannot be built
@@ -160,11 +191,6 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
 /// reply's last cap is the child's node handle, returned in
 /// [`CreatedProcess::node_handle`]; a reply without it is logged and the
 /// child runs with none.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each) and the builder's copy; on \
-              the 32 KiB main-thread stack of svcmgr"
-)]
 pub fn walk_and_create_from_file(
     path: &str,
     blobs: StartupBlobs<'_>,
@@ -223,17 +249,18 @@ pub fn walk_and_create_from_file(
     };
     let label = procmgr_labels::CREATE_FROM_FILE | label_bits | argv_env_flag;
 
-    // Caps: [file_cap, badged_creator, argv_env?]; the header rides in data
-    // words 1..5, after `file_size`.
-    let mut builder = IpcMessage::builder(label)
-        .word(0, file_size)
-        .cap(file_cap)
-        .cap(badged_creator);
-    if let Some(cap) = &argv_env
+    let Some(create_msg) = create_msg(
+        label,
+        (file_cap, file_size, path),
+        badged_creator,
+        argv_env.as_ref(),
+    )
+    else
     {
-        builder = builder.words(1, &cap.header_words()).cap(cap.cap());
-    }
-    let create_msg = builder.build();
+        std::os::seraph::log!(warn: "create: {path:?} too long a name to verify");
+        delete_caps(&[file_cap, badged_creator]);
+        return None;
+    };
 
     // A failed call may leave `file_cap` and `badged_creator` in svcmgr's
     // CSpace: a transport error, or a post-block refusal that delivers the
@@ -255,6 +282,13 @@ pub fn walk_and_create_from_file(
             return None;
         }
     };
+    if reply.label == ipc::procmgr_errors::SIGNATURE_REFUSED
+    {
+        std::os::seraph::log!(warn: "create: {path:?} refused: its signature did not verify");
+        delete_caps(&[file_cap, badged_creator]);
+        delete_caps(reply.caps());
+        return None;
+    }
     if reply.label != 0
     {
         std::os::seraph::log!(warn: "create: CREATE_FROM_FILE returned {:#x}", reply.label);
@@ -366,7 +400,10 @@ pub struct RestartCtx
 /// budget + restart source). When the service ends up permanently down
 /// — restart not attempted or failed — `system_critical` alone decides
 /// whether the system can continue without it. Marks the service
-/// inactive if not restarted. `tag` is the death tag the routed post
+/// inactive if not restarted. For the log-sink service (`recipe.log_sink`)
+/// the death's lines are written only once the new instance runs, and none
+/// when no instance follows (`services/svcmgr/docs/restart-protocol.md`
+/// § Supervision hierarchy). `tag` is the death tag the routed post
 /// carried: the restarted instance's observers are bound under the same slot
 /// and the next instance, so its death routes back to the same
 /// `ServiceEntry` and a late post of this instance is dropped.
@@ -388,59 +425,109 @@ pub fn handle_death(
     registry: &mut registry::Registry,
 ) -> DeathOutcome
 {
-    std::os::seraph::log!("service died: {}", svc.name_str());
-    std::os::seraph::log!("  exit_reason={exit_reason:#018x}");
-
-    if !should_restart(svc, exit_reason)
+    // The log sink's death leaves the master log endpoint with no receiver
+    // until its next instance runs, so a line svcmgr wrote before then would
+    // wait out its bound (`LOG_CALL_TIMEOUT_MS`, shared/log) and be dropped:
+    // it would delay the respawn and reach no log. For the log-sink service,
+    // svcmgr writes this death's lines once the new instance has started and
+    // been served its bootstrap round, and none when no instance follows,
+    // since then no receiver is left to take them.
+    let lines = if matches!(recipe, Some(r) if r.log_sink)
     {
-        svc.active = false;
-        return permanent_death_outcome(svc);
+        DeathLines::Held
+    }
+    else
+    {
+        DeathLines::Written
+    };
+    if lines == DeathLines::Written
+    {
+        log_death(svc, exit_reason);
     }
 
-    std::os::seraph::log!(
-        "restarting (attempt {:#018x})",
-        u64::from(svc.restart_count.saturating_add(1))
-    );
+    if !should_restart(svc, exit_reason, lines)
+    {
+        svc.active = false;
+        return permanent_death_outcome(svc, lines);
+    }
+
+    let attempt = u64::from(svc.restart_count.saturating_add(1));
+    if lines == DeathLines::Written
+    {
+        std::os::seraph::log!("restarting (attempt {attempt:#018x})");
+    }
 
     if !restart_process(svc, ctx, tag.slot, recipe, registry)
     {
         svc.active = false;
-        return permanent_death_outcome(svc);
+        return permanent_death_outcome(svc, lines);
     }
 
     // A restart count cannot meaningfully exceed its type, so it saturates.
     svc.restart_count = svc.restart_count.saturating_add(1);
+    if lines == DeathLines::Held
+    {
+        log_death(svc, exit_reason);
+        std::os::seraph::log!("restarting (attempt {attempt:#018x})");
+    }
     std::os::seraph::log!("service restarted: {}", svc.name_str());
     DeathOutcome::Restarted
+}
+
+/// Whether [`handle_death`] writes a death's lines as it goes, or holds them
+/// until the service's next instance runs: the log-sink service's lines are
+/// held, since no logd receives until then.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeathLines
+{
+    /// Written as the handler goes.
+    Written,
+    /// Held until the next instance runs; dropped when none follows.
+    Held,
+}
+
+/// Log the death of `svc` and its exit reason.
+fn log_death(svc: &ServiceEntry, exit_reason: u64)
+{
+    std::os::seraph::log!("service died: {}", svc.name_str());
+    std::os::seraph::log!("  exit_reason={exit_reason:#018x}");
 }
 
 /// Outcome when a service is permanently down (restart not attempted,
 /// budget exhausted, or restart failed). `system_critical` alone decides
 /// whether the system can continue without it: `true` → `Unrecoverable`
 /// (caller initiates graceful shutdown); `false` → `Degraded` (continue).
-fn permanent_death_outcome(svc: &ServiceEntry) -> DeathOutcome
+/// With [`DeathLines::Held`] (the log-sink service) it writes no line.
+fn permanent_death_outcome(svc: &ServiceEntry, lines: DeathLines) -> DeathOutcome
 {
     if svc.system_critical
     {
-        std::os::seraph::log!(
-            error: "critical service unrecoverable: {}; initiating graceful shutdown",
-            svc.name_str()
-        );
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(
+                error: "critical service unrecoverable: {}; initiating graceful shutdown",
+                svc.name_str()
+            );
+        }
         DeathOutcome::Unrecoverable
     }
     else
     {
-        std::os::seraph::log!(
-            warn: "service down: {}; system continues degraded",
-            svc.name_str()
-        );
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(
+                warn: "service down: {}; system continues degraded",
+                svc.name_str()
+            );
+        }
         DeathOutcome::Degraded
     }
 }
 
 /// Determine whether a service should be restarted based on its policy and
 /// its windowed restart budget, charging the budget when it is restarted.
-fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
+/// With [`DeathLines::Held`] (the log-sink service) it writes no line.
+fn should_restart(svc: &mut ServiceEntry, exit_reason: u64, lines: DeathLines) -> bool
 {
     let restart = match svc.restart_policy
     {
@@ -451,19 +538,28 @@ fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
 
     if !restart
     {
-        std::os::seraph::log!("restart policy says no restart");
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!("restart policy says no restart");
+        }
         return false;
     }
 
     if svc.vfs_path.is_empty()
     {
-        std::os::seraph::log!(warn: "no restart source (vfs_path), cannot restart");
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(warn: "no restart source (vfs_path), cannot restart");
+        }
         return false;
     }
 
     if !svc.restart_budget.try_charge(crate::now_ns())
     {
-        std::os::seraph::log!(warn: "restart budget spent for this window");
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(warn: "restart budget spent for this window");
+        }
         return false;
     }
 

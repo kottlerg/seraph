@@ -46,8 +46,8 @@ pub enum ArgvEnvRefusal
 }
 
 /// Decode the [`ArgvEnvHeader`] from `req`'s data words, starting at
-/// `first_word`: 0 for `CREATE_PROCESS`, 1 for `CREATE_FROM_FILE` (which
-/// carries `file_size` in word 0).
+/// `first_word`: `procmgr_labels::CREATE_FIRST_WORD` for either create
+/// label, after the object's length or `file_size` in word 0.
 ///
 /// # Errors
 /// [`ArgvEnvRefusal::MissingHeader`] when the request delivered fewer than
@@ -204,8 +204,7 @@ mod tests
 {
     use super::*;
 
-    const CREATE_PROCESS_FIRST_WORD: usize = 0;
-    const FROM_FILE_FIRST_WORD: usize = 1;
+    const FIRST_WORD: usize = ipc::procmgr_labels::CREATE_FIRST_WORD;
     const CAP: u64 = 4096;
     const REGION: u64 = 1 << 30;
 
@@ -240,14 +239,11 @@ mod tests
         let sent = header(9000, 3, 5000, 2);
         let msg = IpcMessage::builder(0)
             .word(0, 0x1234)
-            .words(FROM_FILE_FIRST_WORD, &sent.to_words())
+            .words(FIRST_WORD, &sent.to_words())
             .build();
-        assert_eq!(decode_header(&msg, FROM_FILE_FIRST_WORD), Ok(sent));
-
-        let msg = IpcMessage::builder(0)
-            .words(CREATE_PROCESS_FIRST_WORD, &sent.to_words())
-            .build();
-        assert_eq!(decode_header(&msg, CREATE_PROCESS_FIRST_WORD), Ok(sent));
+        assert_eq!(decode_header(&msg, FIRST_WORD), Ok(sent));
+        // At word 0 the header would be read over the object's length.
+        assert_ne!(decode_header(&msg, 0), Ok(sent));
     }
 
     // Defect guarded: a header read from the zero tail past the delivered
@@ -257,11 +253,11 @@ mod tests
     {
         let msg = IpcMessage::builder(0).word(0, 7).word(3, 1).build();
         assert_eq!(
-            decode_header(&msg, FROM_FILE_FIRST_WORD),
+            decode_header(&msg, FIRST_WORD),
             Err(ArgvEnvRefusal::MissingHeader)
         );
         assert_eq!(
-            decode_header(&IpcMessage::new(0), CREATE_PROCESS_FIRST_WORD),
+            decode_header(&IpcMessage::new(0), FIRST_WORD),
             Err(ArgvEnvRefusal::MissingHeader)
         );
     }

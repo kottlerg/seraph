@@ -13,11 +13,11 @@
 
 use crate::idle_loop;
 use crate::log_levels::{ArgvEnv, SpawnEnv};
-use crate::logging::log;
+use crate::logging::{log, log_parts};
 use crate::walk;
 use init_log_levels::Service;
 use init_protocol::{CapType, InitInfo};
-use ipc::{IpcMessage, procmgr_labels, svcmgr_labels};
+use ipc::{IpcMessage, procmgr_errors, procmgr_labels, svcmgr_labels};
 use svcmgr_endowment::{SubstrateObserver, encode_substrate};
 
 /// The cap through which svcmgr observes a substrate service's address space,
@@ -68,29 +68,97 @@ pub struct ServiceThreadCaps
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// The `CREATE_PROCESS` request for `module` with creator endpoint
-/// `creator`, its label carrying `flags`, and `argv_env` when present
-/// (`CREATE_ARGV_ENV`: the header in data words `0..4`, the cap last).
+/// Create the boot module `module` (its Memory cap, its length in bytes and
+/// its bundle entry name, the name it is signed under) with `CREATE_PROCESS`,
+/// with creator endpoint `creator`, the label carrying `flags`, and
+/// `argv_env` when present (`CREATE_ARGV_ENV`: the header in data words
+/// `1..5`, the cap after the creator), which is released once procmgr has
+/// copied it. Returns the child's process handle and thread cap; `None`,
+/// logged under the module's name, when the request cannot be built, the
+/// call fails, or procmgr refuses it.
 #[expect(
     clippy::large_stack_frames,
-    reason = "the builder and the built `IpcMessage` (568 B each); on init's 16 KiB stack"
+    reason = "the builder, the built `IpcMessage` and the reply (568 B each); on init's 16 KiB \
+              stack"
 )]
-fn create_process_msg(
+fn create_from_module(
+    procmgr_ep: u64,
     flags: u64,
-    module: u64,
+    module: (u64, u64, &[u8]),
     creator: u64,
-    argv_env: Option<&ArgvEnv>,
-) -> IpcMessage
+    argv_env: Option<ArgvEnv>,
+    ipc_buf: *mut u64,
+) -> Option<(u64, u64)>
 {
-    let argv_env_flag = argv_env.map_or(0, |_| procmgr_labels::CREATE_ARGV_ENV);
-    let mut builder = IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | argv_env_flag)
+    let (module, len, name) = module;
+    let failed = |what: &str| log_parts(&[name, b": CREATE_PROCESS ", what.as_bytes()]);
+    let label = procmgr_labels::CREATE_PROCESS
+        | flags
+        | argv_env
+            .as_ref()
+            .map_or(0, |_| procmgr_labels::CREATE_ARGV_ENV);
+    let mut builder = IpcMessage::builder(label)
+        .word(0, len)
         .cap(module)
         .cap(creator);
+    if let Some(env) = &argv_env
+    {
+        builder = builder
+            .words(procmgr_labels::CREATE_FIRST_WORD, &env.header)
+            .cap(env.cap);
+    }
+    let msg =
+        procmgr_labels::with_create_name(builder, label, name).map(ipc::IpcMessageBuilder::build);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let call = msg.map(|msg| unsafe { ipc::ipc_call(procmgr_ep, &msg, ipc_buf) });
     if let Some(env) = argv_env
     {
-        builder = builder.words(0, &env.header).cap(env.cap);
+        env.release();
     }
-    builder.build()
+    let reply = match call
+    {
+        None =>
+        {
+            failed("request not built");
+            return None;
+        }
+        Some(Err(_)) =>
+        {
+            failed("ipc_call failed");
+            return None;
+        }
+        Some(Ok(reply)) => reply,
+    };
+    match (reply.label, reply.caps())
+    {
+        (procmgr_errors::SUCCESS, &[process_handle, thread_cap, ..]) =>
+        {
+            Some((process_handle, thread_cap))
+        }
+        (procmgr_errors::SUCCESS, _) =>
+        {
+            failed("reply missing caps");
+            None
+        }
+        (procmgr_errors::SIGNATURE_REFUSED, _) =>
+        {
+            failed("refused: the signature did not verify");
+            None
+        }
+        _ =>
+        {
+            failed("failed");
+            None
+        }
+    }
+}
+
+/// The size in bytes of the boot module `module_memory_cap` (its
+/// descriptor's `aux1`): the signed object's length, which the cap,
+/// covering whole pages, does not give.
+fn module_len(info: &InitInfo, module_memory_cap: u64) -> Option<u64>
+{
+    crate::bootstrap::descriptor_for(info, module_memory_cap).map(|d| d.aux1)
 }
 
 fn derive_badged_creator(bootstrap_ep: u64) -> Option<(u64, u64)>
@@ -474,12 +542,19 @@ const BOOTSTRAP_MODULES: [&[u8]; 8] = [
 /// Module caps one `kind::MODULE` round carries (`MSG_CAP_SLOTS_MAX`).
 const MODULES_PER_ROUND: usize = 4;
 
+/// Data words one module's bundle entry name takes in a `kind::MODULE`
+/// round: its `INIT_MODULE_NAME_LEN` bytes, NUL-padded, packed
+/// little-endian. devmgr's `caps.rs` reads the same layout.
+const MODULE_NAME_WORDS: usize = init_protocol::INIT_MODULE_NAME_LEN / 8;
+
 /// Serve devmgr a copy of every boot module outside [`BOOTSTRAP_MODULES`],
 /// untagged, in `kind::MODULE` rounds of up to [`MODULES_PER_ROUND`] caps:
 /// the driver modules and the platform description tables, which devmgr
 /// tells apart by their content. Each round's data words carry each module's
 /// size in bytes, from its `CapDescriptor`: the cap covers whole pages, and
-/// the bytes past the module's end are not the module's. A module whose
+/// the bytes past the module's end are not the module's; then each module's
+/// bundle entry name, [`MODULE_NAME_WORDS`] words, under which devmgr has
+/// procmgr verify the drivers it creates from it. A module whose
 /// copy cannot be derived, or whose descriptor is missing, is skipped,
 /// logged, as `serve_region_rounds` skips a region: returning would leave
 /// devmgr blocked in `request_round` without the terminal round. Returns
@@ -502,6 +577,7 @@ fn serve_module_rounds(
     {
         let mut caps = [0u64; MODULES_PER_ROUND];
         let mut data = [0u64; 2 + MODULES_PER_ROUND];
+        let mut names = [0u64; MODULE_NAME_WORDS * MODULES_PER_ROUND];
         let [kind_word, count_word, sizes @ ..] = &mut data;
         let mut n = 0usize;
         for entry in forwarded.by_ref()
@@ -530,6 +606,15 @@ fn serve_module_rounds(
             };
             *cap_slot = copy;
             *size_word = bytes;
+            let name_words = names
+                .as_chunks_mut::<MODULE_NAME_WORDS>()
+                .0
+                .get_mut(n)
+                .map_or(&mut [][..], |words| &mut words[..]);
+            for (word, chunk) in name_words.iter_mut().zip(entry.name.as_chunks::<8>().0)
+            {
+                *word = u64::from_le_bytes(*chunk);
+            }
             // `n` indexed a slot of `caps`, so it is below `MODULES_PER_ROUND`.
             n = n.saturating_add(1);
             if n == MODULES_PER_ROUND
@@ -543,6 +628,19 @@ fn serve_module_rounds(
         }
         *kind_word = kind::MODULE;
         *count_word = n as u64;
+        // The round: the kind, the count and the `n` sizes, then the `n`
+        // names.
+        let mut round = [0u64; 2 + MODULES_PER_ROUND * (1 + MODULE_NAME_WORDS)];
+        let sizes_end = n.saturating_add(2);
+        let name_words = n.saturating_mul(MODULE_NAME_WORDS);
+        let words = data
+            .iter()
+            .take(sizes_end)
+            .chain(names.iter().take(name_words));
+        for (dst, &src) in round.iter_mut().zip(words)
+        {
+            *dst = src;
+        }
         if !serve(
             bootstrap_ep,
             child_badge,
@@ -550,7 +648,10 @@ fn serve_module_rounds(
             false,
             // `n` is at most `MODULES_PER_ROUND`, so both ranges are in bounds.
             caps.get(..n).unwrap_or_default(),
-            data.get(..n.saturating_add(2)).unwrap_or_default(),
+            // `n` is at most `MODULES_PER_ROUND`, so the range is in bounds.
+            round
+                .get(..sizes_end.saturating_add(name_words))
+                .unwrap_or_default(),
             "devmgr: bootstrap module round failed",
         )
         {
@@ -676,11 +777,6 @@ fn serve_region_rounds(
     reason = "devmgr's spawn and bootstrap round are one ordered sequence whose cap derivations \
               each later step consumes; splitting it would only thread those slots through helpers"
 )]
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each), the builder's copy and the \
-              temporaries of the bootstrap rounds' messages (568 B each); on init's 16 KiB stack"
-)]
 pub fn create_devmgr_with_caps(
     info: &InitInfo,
     procmgr_ep: u64,
@@ -692,6 +788,7 @@ pub fn create_devmgr_with_caps(
 ) -> Option<SubstrateCaps>
 {
     let devmgr_memory_cap = crate::find_module_by_name(info, b"devmgr")?;
+    let devmgr_len = module_len(info, devmgr_memory_cap)?;
     let devmgr_module_copy = module_spawn_copy(devmgr_memory_cap)?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
@@ -706,40 +803,18 @@ pub fn create_devmgr_with_caps(
     // (`CREATE_PHYS_ACCESS`): devmgr reads the physical bases of the frames
     // it maps for unconfined devices, and spawns the IOMMU driver phys-class
     // (docs/device-management.md § DMA Authorisation).
-    let create_msg = create_process_msg(
+    let (process_handle, thread_cap) = create_from_module(
+        procmgr_ep,
         procmgr_labels::CREATE_PHYS_ACCESS
             | procmgr_labels::create_sched_bits(
                 ipc::sched_policy::DEVMGR_PRIORITY,
                 ipc::sched_policy::DEVMGR_BAND_MAX,
             ),
-        devmgr_module_copy,
+        (devmgr_module_copy, devmgr_len, b"devmgr"),
         badged_creator,
-        argv_env.as_ref(),
-    );
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let call = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
-    if let Some(env) = argv_env
-    {
-        env.release();
-    }
-    let Ok(reply) = call
-    else
-    {
-        log("devmgr: CREATE_PROCESS ipc_call failed");
-        return None;
-    };
-    if reply.label != 0
-    {
-        log("devmgr: CREATE_PROCESS failed");
-        return None;
-    }
-
-    let &[process_handle, thread_cap, ..] = reply.caps()
-    else
-    {
-        log("devmgr: CREATE_PROCESS reply missing caps");
-        return None;
-    };
+        argv_env,
+        ipc_buf,
+    )?;
 
     let hw = collect_hw_caps(info);
 
@@ -1062,6 +1137,7 @@ pub fn create_vfsd_with_caps(
 ) -> Option<SubstrateCaps>
 {
     let vfsd_memory_cap = crate::find_module_by_name(info, b"vfsd")?;
+    let vfsd_len = module_len(info, vfsd_memory_cap)?;
     let vfsd_module_copy = module_spawn_copy(vfsd_memory_cap)?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
@@ -1069,39 +1145,17 @@ pub fn create_vfsd_with_caps(
     // span at TEMP_MAP_BASE is unmapped once the memmgr bootstrap is done.
     let argv_env = unsafe { spawn_env.argv_env(Service::Vfsd, info.aspace_cap) };
 
-    let create_msg = create_process_msg(
+    let (process_handle, thread_cap) = create_from_module(
+        procmgr_ep,
         procmgr_labels::create_sched_bits(
             ipc::sched_policy::VFSD_PRIORITY,
             ipc::sched_policy::VFSD_PRIORITY,
         ),
-        vfsd_module_copy,
+        (vfsd_module_copy, vfsd_len, b"vfsd"),
         badged_creator,
-        argv_env.as_ref(),
-    );
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    let call = unsafe { ipc::ipc_call(procmgr_ep, &create_msg, ipc_buf) };
-    if let Some(env) = argv_env
-    {
-        env.release();
-    }
-    let Ok(reply) = call
-    else
-    {
-        log("vfsd: CREATE_PROCESS ipc_call failed");
-        return None;
-    };
-    if reply.label != 0
-    {
-        log("vfsd: CREATE_PROCESS failed");
-        return None;
-    }
-
-    let &[process_handle, thread_cap, ..] = reply.caps()
-    else
-    {
-        log("vfsd: CREATE_PROCESS reply missing caps");
-        return None;
-    };
+        argv_env,
+        ipc_buf,
+    )?;
 
     let Ok(service_copy) = syscall::cap_derive(spawn.vfsd_service_ep, syscall::RIGHTS_ALL)
     else
@@ -1135,14 +1189,17 @@ pub fn create_vfsd_with_caps(
         return None;
     }
 
-    // Round 2: fatfs module. An absent or underived module rides as an empty
+    // Round 2: fatfs module and its size in bytes, which procmgr verifies the
+    // signed object over. An absent or underived module rides as an empty
     // cap list, not a zero handle, which the kernel would refuse along with
     // the whole round; vfsd then rejects the round (it needs the module to
     // mount root) instead of failing on a reply error.
-    let fatfs_cap = match crate::find_module_by_name(info, b"fatfs")
+    let fatfs = crate::find_module_by_name(info, b"fatfs");
+    let fatfs_len = fatfs.and_then(|slot| module_len(info, slot)).unwrap_or(0);
+    let fatfs_cap = match fatfs
     {
-        Some(slot) => syscall::cap_derive(slot, MODULE_COPY_RIGHTS).unwrap_or(0),
-        None => 0,
+        Some(slot) if fatfs_len != 0 => syscall::cap_derive(slot, MODULE_COPY_RIGHTS).unwrap_or(0),
+        _ => 0,
     };
     let fatfs_slot = [fatfs_cap];
     let fatfs_caps = if fatfs_cap == 0
@@ -1160,7 +1217,7 @@ pub fn create_vfsd_with_caps(
         ipc_buf,
         true,
         fatfs_caps,
-        &[],
+        &[fatfs_len],
         "vfsd: bootstrap round 2 failed",
     );
 
@@ -1171,6 +1228,10 @@ pub fn create_vfsd_with_caps(
 }
 
 // ── svcmgr / procmgr coordination ───────────────────────────────────────────
+
+/// Where svcmgr is installed: the path init walks to start it, and the name
+/// its signed object is verified under.
+const SVCMGR_PATH: &[u8] = b"/services/svcmgr";
 
 /// Create svcmgr from `/services/svcmgr` via `CREATE_FROM_FILE` and install
 /// init's seed system-root cap on the child via `CONFIGURE_NAMESPACE`.
@@ -1192,8 +1253,7 @@ pub fn create_svcmgr_from_file(
 {
     // SAFETY: `ipc_buf` is init's main-thread IPC buffer (`INIT_IPC_BUF_VA`,
     // registered in `run`), passed down unchanged.
-    let walked =
-        unsafe { walk::walk_to_file(system_root_cap, b"/services/svcmgr", 0xFFFF, ipc_buf) }?;
+    let walked = unsafe { walk::walk_to_file(system_root_cap, SVCMGR_PATH, 0xFFFF, ipc_buf) }?;
 
     let (badged_creator, child_badge) = derive_badged_creator(bootstrap_ep)?;
     // SAFETY: `info.aspace_cap` is init's own address space, whose scratch
@@ -1201,24 +1261,38 @@ pub fn create_svcmgr_from_file(
     let argv_env = unsafe { spawn_env.argv_env(Service::Svcmgr, info.aspace_cap) };
 
     // Caps: [file, creator, argv_env?]; the argv/env header rides in data
-    // words 1..5, after the file size.
-    let mut builder = IpcMessage::builder(
-        procmgr_labels::CREATE_FROM_FILE
-            | procmgr_labels::create_sched_bits(
-                ipc::sched_policy::SVCMGR_PRIORITY,
-                ipc::sched_policy::SVCMGR_PRIORITY,
-            )
-            | argv_env
-                .as_ref()
-                .map_or(0, |_| procmgr_labels::CREATE_ARGV_ENV),
-    )
-    .word(0, walked.size)
-    .cap(walked.file_cap)
-    .cap(badged_creator);
+    // words 1..5, after the file size, and the path, the name the file is
+    // verified under, in the name block after them.
+    let label = procmgr_labels::CREATE_FROM_FILE
+        | procmgr_labels::create_sched_bits(
+            ipc::sched_policy::SVCMGR_PRIORITY,
+            ipc::sched_policy::SVCMGR_PRIORITY,
+        )
+        | argv_env
+            .as_ref()
+            .map_or(0, |_| procmgr_labels::CREATE_ARGV_ENV);
+    let mut builder = IpcMessage::builder(label)
+        .word(0, walked.size)
+        .cap(walked.file_cap)
+        .cap(badged_creator);
     if let Some(env) = &argv_env
     {
-        builder = builder.words(1, &env.header).cap(env.cap);
+        builder = builder
+            .words(procmgr_labels::CREATE_FIRST_WORD, &env.header)
+            .cap(env.cap);
     }
+    let Some(builder) = procmgr_labels::with_create_name(builder, label, SVCMGR_PATH)
+    else
+    {
+        if let Some(env) = argv_env
+        {
+            env.release();
+        }
+        let _ = syscall::cap_delete(walked.file_cap);
+        let _ = syscall::cap_delete(badged_creator);
+        log("phase 3: svcmgr CREATE_FROM_FILE request not built");
+        return None;
+    };
     let msg = builder.build();
 
     // SAFETY: ipc_buf is the registered IPC buffer.

@@ -25,9 +25,10 @@
 //! function's configuration space, or replace what acpid pushed.
 //!
 //! The power deny phase resolves the public `acpid.deny`, a SEND on acpid's
-//! endpoint without `POWER_AUTHORITY`, and asserts that `SLEEP(5)` and
-//! `RESET` reply `UNAUTHORIZED`: no process but the holder of the seed-only
-//! `acpid.power` (pwrmgr) can power the platform off or reset it.
+//! endpoint without `POWER_AUTHORITY`, and asserts that `SLEEP(5)`, `RESET`
+//! and `WAIT_EVENT` reply `UNAUTHORIZED`: no process but the holder of the
+//! seed-only `acpid.power` (pwrmgr) can power the platform off, reset it,
+//! or take its power-button events.
 
 use std::time::{Duration, Instant};
 
@@ -216,9 +217,11 @@ fn authority_deny_phase(caps: &Caps)
     }
 }
 
-/// `SLEEP(5)` and `RESET` through the public `acpid.deny` reply
-/// `UNAUTHORIZED`. acpid serves its endpoint once its start-up is done, which
-/// the host-bridge phase before this one waits for.
+/// `SLEEP(5)`, `RESET` and `WAIT_EVENT` through the public `acpid.deny`
+/// reply `UNAUTHORIZED`. acpid serves its endpoint once its start-up is
+/// done, which the host-bridge phase before this one waits for; on x86-64
+/// pwrmgr's `WAIT_EVENT` holds one of acpid's two receivers meanwhile, so
+/// these replies come from the other.
 fn power_deny_phase(_caps: &Caps)
 {
     let deny = std::os::seraph::registry::lookup(ipc::published_names::ACPID_DENY)
@@ -231,6 +234,7 @@ fn power_deny_phase(_caps: &Caps)
             "SLEEP(5)",
         ),
         (ipc::acpid_labels::RESET, 0, "RESET"),
+        (ipc::acpid_labels::WAIT_EVENT, 0, "WAIT_EVENT"),
     ]
     {
         let req = ipc::IpcMessage::builder(label)

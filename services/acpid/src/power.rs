@@ -34,6 +34,8 @@ pub enum Request
     Sleep(u8),
     /// `RESET`.
     Reset,
+    /// `WAIT_EVENT`.
+    WaitEvent,
 }
 
 /// Decode a request of `label` sent with `badge`, whose words are
@@ -47,7 +49,9 @@ pub enum Request
 /// `INVALID_REQUEST` for a sleep state other than S5.
 pub fn decode(label: u64, badge: u64, version: u64, arg: u64) -> Result<Request, u64>
 {
-    if label != acpid_labels::SLEEP && label != acpid_labels::RESET
+    if label != acpid_labels::SLEEP
+        && label != acpid_labels::RESET
+        && label != acpid_labels::WAIT_EVENT
     {
         return Err(acpid_errors::UNKNOWN_OPCODE);
     }
@@ -62,6 +66,10 @@ pub fn decode(label: u64, badge: u64, version: u64, arg: u64) -> Result<Request,
     if label == acpid_labels::RESET
     {
         return Ok(Request::Reset);
+    }
+    if label == acpid_labels::WAIT_EVENT
+    {
+        return Ok(Request::WaitEvent);
     }
     if arg != acpid_labels::STATE_S5
     {
@@ -173,6 +181,18 @@ mod tests
             Ok(Request::Sleep(5))
         );
         assert_eq!(decode(acpid_labels::RESET, auth, v, 0), Ok(Request::Reset));
+        assert_eq!(
+            decode(acpid_labels::WAIT_EVENT, auth, v, 9),
+            Ok(Request::WaitEvent)
+        );
+        assert_eq!(
+            decode(acpid_labels::WAIT_EVENT, 1, v, 0),
+            Err(acpid_errors::UNAUTHORIZED)
+        );
+        assert_eq!(
+            decode(acpid_labels::WAIT_EVENT, auth, v + 1, 0),
+            Err(acpid_errors::LABEL_VERSION_MISMATCH)
+        );
         // The deny twin's badge, 1, carries no verb bit.
         assert_eq!(
             decode(acpid_labels::SLEEP, 1, v + 1, 3),

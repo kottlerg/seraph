@@ -10,8 +10,9 @@
 //! The architecture has no I/O-port instructions, so a `SystemIO` region's
 //! access fails, and there is one interrupt model, whose `_PRT` acpid reads
 //! once. Power is off and reset through SBI, which pwrmgr drives, so acpid
-//! holds no sleep or reset register.
+//! holds no sleep or reset register, and it has no SCI and no event block.
 
+use acpid::events::{Layout, Registers, Start};
 use aml::host::Width;
 
 use crate::devmgr::Devmgr;
@@ -67,6 +68,113 @@ impl Power
     {
         false
     }
+}
+
+/// No event blocks and no SCI: a hardware-reduced platform has neither, and
+/// devmgr serves none, so [`Events::acquire`] returns none. The methods
+/// mirror the x86-64 surface the event set-up is written against.
+pub struct Events
+{
+    layout: Layout,
+}
+
+impl Events
+{
+    /// `None`: nothing to acquire.
+    pub const fn acquire(_devmgr: &Devmgr, _thread: u64) -> Option<Self>
+    {
+        None
+    }
+
+    /// `NotSupported`: RISC-V has no I/O-port space to bind.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Events`, whose methods read its fields"
+    )]
+    pub const fn bind(&self, _thread: u64) -> Result<(), i64>
+    {
+        Err(syscall_abi::SyscallError::NotSupported as i64)
+    }
+
+    /// The layout the value was made with.
+    pub const fn layout(&self) -> Layout
+    {
+        self.layout
+    }
+
+    /// 0: no SCI.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Events`, whose methods read its fields"
+    )]
+    pub const fn sci(&self) -> u64
+    {
+        0
+    }
+
+    /// 0: no SCI.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Events`, whose methods read its fields"
+    )]
+    pub const fn mode(&self) -> u64
+    {
+        0
+    }
+
+    /// 0: no SCI.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Events`, whose methods read its fields"
+    )]
+    pub const fn gsi(&self) -> u64
+    {
+        0
+    }
+
+    /// `Start::First`: no latched status to keep.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Events`, whose methods read its fields"
+    )]
+    pub const fn start(&self) -> Start
+    {
+        Start::First
+    }
+
+    /// Registers that read all ones and ignore writes.
+    ///
+    /// # Safety
+    ///
+    /// None needed; the signature matches the x86-64 surface.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Events`, whose methods read its fields"
+    )]
+    pub const unsafe fn ports(&self) -> Ports
+    {
+        Ports
+    }
+}
+
+/// No event registers: each read is all ones and each write is dropped.
+pub struct Ports;
+
+impl Registers for Ports
+{
+    fn read8(&mut self, _port: u16) -> u8
+    {
+        u8::MAX
+    }
+
+    fn write8(&mut self, _port: u16, _value: u8) {}
+
+    fn read16(&mut self, _port: u16) -> u16
+    {
+        u16::MAX
+    }
+
+    fn write16(&mut self, _port: u16, _value: u16) {}
 }
 
 /// A no-op: a hardware-reduced platform is always in ACPI mode.

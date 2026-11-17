@@ -81,15 +81,19 @@ defines any of them as a `Method`. It does not evaluate `_STA`: a `Device` whose
 platform description covers a device the machine's tables do not describe in that form; it is
 data, so a new machine adds a table, not devmgr code.
 
-One device has one record. Records are merged by resource identity: a record whose `Mmio` base
-or `IoPort` base an earlier record already holds adds its identity keys to that record rather
-than standing alone. A record keeps the first key of each single-valued kind it is given (the
-`_HID`, the SPCR interface type, the platform key): a later description's key of a kind the
-record already carries is dropped, so a declaration matches the merged record by the first
-description's key of that kind. A later `_CID` the record lacks is added while the record holds
-fewer than four. The console UART that the namespace describes as `PNP0501` and the SPCR
-names is therefore one record carrying both keys. A PCI function the RIMT names as an IOMMU
-belongs to the IOMMU record and has no record of its own.
+One device has one record, apart from a RISC-V IOMMU (below). Records are merged by resource
+identity: a record whose `Mmio` base or `IoPort` base an earlier record already holds adds its
+identity keys to that record rather than standing alone. A record keeps the first key of each
+single-valued kind it is given (the `_HID`, the SPCR interface type, the platform key): a later
+description's key of a kind the record already carries is dropped, so a declaration matches the
+merged record by the first description's key of that kind. A later `_CID` the record lacks is added
+while the record holds fewer than four. The console UART that the namespace describes as `PNP0501`
+and the SPCR names is therefore one record carrying both keys. A PCI function the RIMT names as an
+IOMMU keeps its own PCI record beside the IOMMU record, which holds its unit. devmgr marks the PCI
+record bound once it has taken the function as a unit for the IOMMU driver, with its memory decode
+and bus mastering turned on, whether or not the driver then starts: no binding pass gives the
+function to another driver, and acpid is refused every configuration write to it. A function devmgr
+does not take keeps an unbound record, as any other function does.
 
 A record carries the device's resources, typed:
 

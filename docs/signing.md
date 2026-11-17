@@ -31,11 +31,14 @@ platform's firmware baseline in [platform-requirements.md](platform-requirements
 
 The primitives exist: [`shared/crypto`](../shared/crypto/README.md) provides `ed25519_verify` and
 `Sha512`, tested against known-answer vectors, Wycheproof, and reference vectors computed with
-OpenSSL. Everything else this document specifies is design intent, not yet implemented
-([#124](https://github.com/kottlerg/seraph/issues/124)): the formats and their codec, xtask's keys
-and signing, the bootloader's verification and hand-off of the trust store, and procmgr's
-verification and signature policy. Today no stage verifies the object it loads: every binary is
-trusted because of where it is stored.
+OpenSSL. The formats of § Signed Object Format, § Certificate Format and § Trust Store, and the
+verification of § Verification, are implemented and host-tested in
+[`shared/objsig`](../shared/objsig/README.md), which no component links yet. Everything else this
+document specifies is design intent, not yet implemented
+([#124](https://github.com/kottlerg/seraph/issues/124)): xtask's keys and signing, the bootloader's
+verification and hand-off of the trust store, and procmgr's verification and signature policy.
+Today no stage verifies the object it loads: every binary is trusted because of where it is
+stored.
 
 ---
 
@@ -106,7 +109,8 @@ name refuses.
 
 ## Signed Object Format
 
-Design intent; not yet implemented (§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
+(§ Implementation Status).
 
 A signed object is its body followed by a trailer of one or more records and a fixed footer:
 
@@ -201,7 +205,8 @@ nothing is skipped, so the canonical form needs no knowledge of the body's forma
 
 ## Certificate Format
 
-Design intent; not yet implemented (§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
+(§ Implementation Status).
 
 Seraph's certificate is a fixed 148-byte record, not X.509: no ASN.1 parser enters the bootloader,
 and Ed25519 is the only algorithm. A root (an anchor of the trust store) issues it to a signing key:
@@ -233,7 +238,8 @@ object of a later one.
 
 ## Trust Store
 
-Design intent; not yet implemented (§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
+(§ Implementation Status).
 
 The trust store is one public blob: the roots a system trusts, the key ids it refuses, and the
 lowest security version it runs.
@@ -280,7 +286,8 @@ stops procmgr, which then creates no process.
 
 ## Verification
 
-Design intent; not yet implemented (§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
+(§ Implementation Status).
 
 The verifier takes the object's bytes, the trust store, and what the caller expects: the set of
 kinds it accepts, the name it is loading, and the architecture it runs. It returns the body, with
@@ -311,8 +318,9 @@ the attributes and the anchor of the record that passed, or one refusal.
    - `signature` verifies under the signing key with
      [`ed25519_verify`](../shared/crypto/README.md).
 5. **Refusal.** When no record passes, the object is refused. The refusal says whether any record
-   chained to an anchor, so a log tells an object from an untrusted root from one whose trusted
-   record failed.
+   named an anchor (by `signer_key_id` without a certificate, by the certificate's
+   `issuer_key_id` with one) and, when one did, the check the first such record failed, so a log
+   tells an object from an untrusted root from one whose trusted record failed.
 
 A record that chains to no anchor is how one object carries the signatures of several parties:
 each system passes over the records of roots it does not trust and accepts the object on the one
@@ -459,4 +467,4 @@ is [#1072](https://github.com/kottlerg/seraph/issues/1072).
 
 ## Summarized By
 
-[System Bootstrap](bootstrap.md)
+[System Bootstrap](bootstrap.md), [shared/objsig/README.md](../shared/objsig/README.md)

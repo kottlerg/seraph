@@ -1503,10 +1503,9 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
         return;
     }
-    // The dead process is named by its memmgr badge in `data[0]`, not by a
-    // transferred cap: the kernel does not surface the badge of a transferred
-    // cap to the receiver. Any cap the caller attached was deleted by
-    // `dispatch`.
+    // The dead process is named by its memmgr badge in `data[0]`, which
+    // procmgr recorded from the `REGISTER_PROCESS` reply, not by a
+    // transferred cap. Any cap the caller attached was deleted by `dispatch`.
     let dead_badge = req.word(0);
 
     // By the time PROCESS_DIED reaches memmgr, procmgr has revoked and

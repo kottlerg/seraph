@@ -62,6 +62,7 @@ members = [
     "shared/death-set",
     "shared/driver-binding",
     "shared/elf",
+    "shared/objsig",
     "shared/font",
     "shared/mmio",
     "shared/namespace-protocol",

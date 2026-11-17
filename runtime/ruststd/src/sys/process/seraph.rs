@@ -408,6 +408,7 @@ impl Command {
             })?;
         let file_cap = walked.file_cap;
         let file_size = walked.size;
+        let name = signed_name(path_str);
 
         // Create the per-child death `EventQueue` BEFORE issuing
         // CREATE_FROM_FILE so a POST-only copy can ride along as the
@@ -458,18 +459,28 @@ impl Command {
         } else {
             0
         };
-        let builder = ipc::IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE
+        let label = procmgr_labels::CREATE_FROM_FILE
             | pinned_flag
             | procmgr_labels::CREATE_DEATH_RELAY
             | procmgr_labels::create_sched_bits(self.priority, self.sched_max)
-            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 })
-            .word(0, file_size)
-            .cap(file_cap);
+            | if argv_env.is_some() { procmgr_labels::CREATE_ARGV_ENV } else { 0 };
+        let builder = ipc::IpcMessage::builder(label).word(0, file_size).cap(file_cap);
         let builder = match &argv_env {
             Some(memory) => builder
-                .words(1, &memory.header_words())
+                .words(procmgr_labels::CREATE_FIRST_WORD, &memory.header_words())
                 .cap(memory.cap()),
             None => builder,
+        };
+        // The binary's path, the name procmgr verifies it was signed under,
+        // rides in the name block after the header.
+        let Some(builder) = procmgr_labels::with_create_name(builder, label, &name) else {
+            let _ = syscall::cap_delete(death_relay);
+            let _ = syscall::cap_delete(death_eq);
+            let _ = syscall::cap_delete(file_cap);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidFilename,
+                "Command::spawn: binary path too long to verify",
+            ));
         };
         // Death relay is the trailing cap (peeled off the tail procmgr-side).
         let msg = builder.cap(death_relay).build();
@@ -1436,6 +1447,20 @@ pub fn getpid() -> u32 {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// The name a binary walked to from the spawner's root by `path` is signed
+/// under: its path from that root, `/` before each component the walk
+/// takes (`crate::sys::fs`'s walk drops empty components and refuses `.`
+/// and `..`), the canonical form xtask signs install paths in
+/// (docs/signing.md § Signed Attributes).
+fn signed_name(path: &str) -> Vec<u8> {
+    let mut name = Vec::with_capacity(path.len().saturating_add(1));
+    for component in path.as_bytes().split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+        name.push(b'/');
+        name.extend_from_slice(component);
+    }
+    name
+}
+
 fn map_procmgr_error(code: u64) -> io::Error {
     match code {
         procmgr_errors::INVALID_ELF => io::Error::new(io::ErrorKind::InvalidData, "INVALID_ELF"),
@@ -1458,6 +1483,9 @@ fn map_procmgr_error(code: u64) -> io::Error {
         procmgr_errors::MAP_FAILED => io::Error::other("MAP_FAILED"),
         procmgr_errors::INSUFFICIENT_RIGHTS => {
             io::Error::new(io::ErrorKind::PermissionDenied, "INSUFFICIENT_RIGHTS")
+        }
+        procmgr_errors::SIGNATURE_REFUSED => {
+            io::Error::new(io::ErrorKind::PermissionDenied, "SIGNATURE_REFUSED")
         }
         procmgr_errors::ARGV_ENV_STILL_MAPPED => {
             io::Error::new(io::ErrorKind::OutOfMemory, "ARGV_ENV_STILL_MAPPED")

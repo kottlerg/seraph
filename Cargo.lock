@@ -576,6 +576,7 @@ name = "procmgr-process-table"
 version = "0.1.4"
 dependencies = [
  "ipc",
+ "objsig",
 ]
 
 [[package]]
@@ -762,6 +763,7 @@ name = "svctest"
 version = "0.1.4"
 dependencies = [
  "driver-binding",
+ "elf",
  "fatfs-parse",
  "ipc",
  "log",

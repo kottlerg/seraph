@@ -18,6 +18,51 @@ use std::os::seraph::startup_info;
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
+/// The install path of the program most create requests here name.
+pub(crate) const HELLO_PATH: &str = "/programs/hello";
+
+/// `head` followed by `rest`: the data words of a create request before its
+/// name block.
+pub(crate) fn with_head(head: u64, rest: &[u64]) -> Vec<u64>
+{
+    std::iter::once(head).chain(rest.iter().copied()).collect()
+}
+
+/// Send procmgr a create request labelled `label` carrying data words `words`
+/// (the object's length first), then the name block for `name`, and `caps`;
+/// return its reply.
+pub(crate) fn create_call(
+    target: u64,
+    label: u64,
+    words: &[u64],
+    name: &str,
+    caps: &[u64],
+) -> Result<ipc::IpcMessage, i64>
+{
+    let builder = ipc::IpcMessage::builder(label).words(0, words);
+    let builder = ipc::procmgr_labels::with_create_name(builder, label, name.as_bytes())
+        .expect("a create name is nonempty and within CREATE_NAME_MAX");
+    let msg = caps.iter().fold(builder, |b, &cap| b.cap(cap)).build();
+    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+    unsafe { ipc::ipc_call(target, &msg, std::os::seraph::current_ipc_buf()) }
+}
+
+/// [`create_call`] and assert procmgr replies `want`.
+pub(crate) fn expect_create(
+    target: u64,
+    label: u64,
+    words: &[u64],
+    name: &str,
+    caps: &[u64],
+    want: u64,
+    what: &str,
+)
+{
+    let reply = create_call(target, label, words, name, caps)
+        .unwrap_or_else(|e| panic!("{what}: ipc_call failed ({e})"));
+    assert_eq!(reply.label, want, "{what}: procmgr replied {}", reply.label);
+}
+
 /// `spawn_phase` runs before the namespace cluster.
 pub fn spawn_only() -> &'static [Phase]
 {
@@ -387,7 +432,7 @@ pub fn init_cspace_released_phase(_: &Caps)
 
 /// `command_*`, `stdio_file_unsupported`, `procmgr_refusals`, `procmgr_concurrent_spawn`,
 /// `crash_endpoint`,
-/// `procmgr_dma_hold`, `create_process_large_module`, and `death_queue_growth` run after the
+/// `procmgr_dma_hold`, `create_process_verifies_module`, and `death_queue_growth` run after the
 /// namespace cluster has established attenuation invariants.
 pub fn command_phases() -> &'static [Phase]
 {
@@ -437,8 +482,12 @@ pub fn command_phases() -> &'static [Phase]
             run: procmgr_dma_hold_phase,
         },
         Phase {
-            name: "create_process_large_module",
-            run: create_process_large_module_phase,
+            name: "create_process_verifies_module",
+            run: create_process_verifies_module_phase,
+        },
+        Phase {
+            name: "create_from_file_refuses_wrong_name",
+            run: create_from_file_refuses_wrong_name_phase,
         },
         Phase {
             name: "death_queue_growth",
@@ -1008,14 +1057,14 @@ const STALLED_FILE_SIZE: u64 = 4096;
 /// `IO_ERROR` once procmgr's bound on the call passes
 /// (`FILE_CAP_CALL_TIMEOUT_MS`, services/procmgr/docs/ipc-interface.md
 /// § Label 13). A second stalled create runs beside it: its file server
-/// answers `FS_OPEN` and every `FS_READ` through the ELF header of
-/// `/programs/hello`, then leaves the next request unanswered, and that
-/// create must also fail with `IO_ERROR` under the same bound. After the
+/// answers `FS_OPEN`, lends the first page of `/programs/hello` through
+/// `FS_READ_MEMORY`, then leaves the read of the second page unanswered, and
+/// that create must also fail with `IO_ERROR` under the same bound. After the
 /// stall a closer thread answers procmgr's `FS_CLOSE`, so the close does not
 /// wait out a second bound.
 pub fn procmgr_concurrent_spawn_phase(_: &Caps)
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
     use std::sync::mpsc;
 
     let endpoint =
@@ -1053,19 +1102,13 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
     let stalled = std::thread::Builder::new()
         .name("stalled-create".into())
         .spawn(move || {
-            let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-                .word(0, STALLED_FILE_SIZE)
-                .cap(file)
-                .build();
-            // SAFETY: `current_ipc_buf` is this thread's registered IPC
-            // buffer page.
-            unsafe {
-                ipc::ipc_call(
-                    startup_info().procmgr_endpoint,
-                    &create,
-                    std::os::seraph::current_ipc_buf(),
-                )
-            }
+            create_call(
+                startup_info().procmgr_endpoint,
+                procmgr_labels::CREATE_FROM_FILE,
+                &[STALLED_FILE_SIZE],
+                HELLO_PATH,
+                &[file],
+            )
             .expect("stalled CREATE_FROM_FILE call failed")
             .label
         })
@@ -1130,8 +1173,8 @@ pub fn procmgr_concurrent_spawn_phase(_: &Caps)
 }
 
 /// The second stalled create of [`procmgr_concurrent_spawn_phase`]: a file
-/// server that serves `/programs/hello` through its ELF header and then
-/// leaves the next request unanswered.
+/// server that lends procmgr the first page of `/programs/hello` and then
+/// leaves the read of the second unanswered.
 struct ReadStall
 {
     endpoint: u64,
@@ -1151,6 +1194,26 @@ struct ReadStallHeld
     closer: std::thread::JoinHandle<u64>,
 }
 
+/// A one-page grant holding the first page of `data`, a file longer than a
+/// page: the grant, its region id, and the bytes it holds.
+fn first_page_of(data: &[u8]) -> (u64, u64, usize)
+{
+    let first_page = usize::try_from(syscall_abi::PAGE_SIZE).expect("a page size fits a usize");
+    assert!(
+        first_page < data.len(),
+        "procmgr_concurrent_spawn: /programs/hello fits one page"
+    );
+    let (page, region) = super::memmgr::try_request_contiguous(1)
+        .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
+    edit_grant(page, 1, first_page, &|dst| {
+        dst.copy_from_slice(
+            data.get(..first_page)
+                .expect("the first page lies in the file"),
+        );
+    });
+    (page, region, first_page)
+}
+
 impl ReadStall
 {
     /// Start the file server and the create against it.
@@ -1168,7 +1231,7 @@ impl ReadStall
         let data = std::fs::read("/programs/hello")
             .expect("procmgr_concurrent_spawn: reading /programs/hello failed");
         let len = data.len() as u64;
-        let header = data.len().min(4096);
+        let (page, region, first_page) = first_page_of(&data);
 
         let endpoint =
             std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |slab| {
@@ -1201,41 +1264,37 @@ impl ReadStall
                 unsafe { ipc::ipc_reply(&opened, ipc_buf) }
                     .expect("read-stall file server: FS_OPEN reply failed");
 
-                let mut served = 0usize;
-                while served < header
-                {
-                    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-                    let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
-                        .expect("read-stall file server: FS_READ receive failed");
-                    assert_eq!(
-                        req.label,
-                        ipc::fs_labels::FS_READ,
-                        "read-stall file server received label {} before the header was served",
-                        req.label
-                    );
-                    let size = data.len();
-                    let start = usize::try_from(req.word(0)).map_or(size, |o| o.min(size));
-                    let rest = data.get(start..).expect("read offset clamped to the file");
-                    let n = usize::try_from(req.word(1))
-                        .unwrap_or(usize::MAX)
-                        .min(504)
-                        .min(rest.len());
-                    let chunk = rest.get(..n).expect("read length clamped to the file");
-                    let reply = IpcMessage::builder(0)
-                        .word(0, n as u64)
-                        .bytes(1, chunk)
-                        .build();
-                    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-                    unsafe { ipc::ipc_reply(&reply, ipc_buf) }
-                        .expect("read-stall file server: FS_READ reply failed");
-                    if n == 0
-                    {
-                        // A read at the end of the file: the header is all
-                        // procmgr reads before its next request.
-                        break;
-                    }
-                    served = served.checked_add(n).expect("served byte count overflowed");
-                }
+                // procmgr's first read: hello's first page, lent from a page
+                // of svctest's own as an fs driver lends a cache page.
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                    .expect("read-stall file server: FS_READ_MEMORY receive failed");
+                assert_eq!(
+                    (req.label, req.word(0)),
+                    (ipc::fs_labels::FS_READ_MEMORY, 0),
+                    "read-stall file server: procmgr's first read is not FS_READ_MEMORY at 0"
+                );
+                let lent = syscall::cap_derive(page, syscall::RIGHTS_MEM_MAP)
+                    .expect("read-stall file server: lending the page failed");
+                let reply = IpcMessage::builder(0)
+                    .word(0, first_page as u64)
+                    .word(2, 0)
+                    .cap(lent)
+                    .build();
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                unsafe { ipc::ipc_reply(&reply, ipc_buf) }
+                    .expect("read-stall file server: FS_READ_MEMORY reply failed");
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+                    .expect("read-stall file server: FS_RELEASE_MEMORY receive failed");
+                assert_eq!(
+                    req.label,
+                    ipc::fs_labels::FS_RELEASE_MEMORY,
+                    "read-stall file server: procmgr did not release the page it read"
+                );
+                // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
+                unsafe { ipc::ipc_reply(&IpcMessage::new(0), ipc_buf) }
+                    .expect("read-stall file server: FS_RELEASE_MEMORY reply failed");
 
                 // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
                 let req = unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
@@ -1246,25 +1305,20 @@ impl ReadStall
                 release_rx
                     .recv()
                     .expect("read-stall file server: release failed");
+                super::memmgr::release_grant(page, region);
             })
             .expect("procmgr_concurrent_spawn: read-stall server thread spawn failed");
 
         let create = std::thread::Builder::new()
             .name("read-stall-create".into())
             .spawn(move || {
-                let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-                    .word(0, len)
-                    .cap(node)
-                    .build();
-                // SAFETY: `current_ipc_buf` is this thread's registered IPC
-                // buffer page.
-                unsafe {
-                    ipc::ipc_call(
-                        startup_info().procmgr_endpoint,
-                        &create,
-                        std::os::seraph::current_ipc_buf(),
-                    )
-                }
+                create_call(
+                    startup_info().procmgr_endpoint,
+                    procmgr_labels::CREATE_FROM_FILE,
+                    &[len],
+                    HELLO_PATH,
+                    &[node],
+                )
                 .expect("read-stall CREATE_FROM_FILE call failed")
                 .label
             })
@@ -1288,9 +1342,10 @@ impl ReadStall
             .recv()
             .expect("procmgr_concurrent_spawn: the read-stall server never reported");
         assert_eq!(
-            label,
-            ipc::fs_labels::FS_READ,
-            "the read-stall file server held label {label} at offset {offset}, not FS_READ"
+            (label, offset),
+            (ipc::fs_labels::FS_READ_MEMORY, syscall_abi::PAGE_SIZE),
+            "the read-stall file server held label {label} at offset {offset}, not \
+             FS_READ_MEMORY of the second page"
         );
         let endpoint = self.endpoint;
         let closer = std::thread::Builder::new()
@@ -1333,7 +1388,7 @@ impl ReadStallHeld
         assert_eq!(
             code,
             ipc::procmgr_errors::IO_ERROR,
-            "a create whose FS_READ after the header went unanswered replied {code}, not IO_ERROR"
+            "a create whose read of its second page went unanswered replied {code}, not IO_ERROR"
         );
         let closed = self
             .closer
@@ -1377,15 +1432,15 @@ fn expect_reply(target: u64, msg: &ipc::IpcMessage, want: u64, what: &str)
 /// flag**).
 fn phys_access_refused(procmgr: u64)
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
 
     let (file, size) = hello_file();
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PHYS_ACCESS)
-            .word(0, size)
-            .cap(file)
-            .build(),
+        procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_PHYS_ACCESS,
+        &[size],
+        HELLO_PATH,
+        &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE with CREATE_PHYS_ACCESS from a creator that is not phys-class",
     );
@@ -1546,14 +1601,12 @@ pub fn procmgr_refusals_phase(_: &Caps)
             "unassigned label 4",
         );
         let (file, size) = hello_file();
-        expect_reply(
+        expect_create(
             procmgr,
-            &IpcMessage::builder(
-                procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DEATH_RELAY,
-            )
-            .word(0, size)
-            .cap(file)
-            .build(),
+            procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DEATH_RELAY,
+            &[size],
+            HELLO_PATH,
+            &[file],
             procmgr_errors::INVALID_ARGUMENT,
             "CREATE_FROM_FILE with the relay flag and only the file cap",
         );
@@ -1602,15 +1655,9 @@ pub fn procmgr_refusals_phase(_: &Caps)
 /// NUL. [`create_process_argv_env_refusals`] covers the `CREATE_PROCESS`
 /// side. A spawn afterwards in [`procmgr_refusals_phase`] shows procmgr still
 /// serves.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the 5 request `IpcMessage`s of its refused calls (568 B each), their replies, and \
-              the `cells` array of 3 entries (about 48 B each); on the 32 KiB main-thread stack of \
-              svctest"
-)]
 fn argv_env_refusals()
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
     use std::os::seraph::process::ArgvEnvCap;
 
     let procmgr = startup_info().procmgr_endpoint;
@@ -1637,40 +1684,35 @@ fn argv_env_refusals()
             .expect("building the argv/env cap failed")
             .expect("a nonempty argv builds a cap");
         let (file, size) = hello_file();
-        expect_reply(
+        expect_create(
             procmgr,
-            &IpcMessage::builder(label)
-                .word(0, size)
-                .words(1, &header)
-                .cap(file)
-                .cap(argv_env.cap())
-                .build(),
+            label,
+            &with_head(size, &header),
+            HELLO_PATH,
+            &[file, argv_env.cap()],
             procmgr_errors::INVALID_ARGUMENT,
             what,
         );
     }
 
     let (file, size) = hello_file();
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(label)
-            .word(0, size)
-            .words(1, &[len, 1, 0, 0])
-            .cap(file)
-            .build(),
+        label,
+        &[size, len, 1, 0, 0],
+        HELLO_PATH,
+        &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with only the file cap",
     );
 
     let (file, size) = hello_file();
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(label)
-            .word(0, size)
-            .words(1, &[len, 1, 0, 0])
-            .cap(file)
-            .cap(spare_cap())
-            .build(),
+        label,
+        &[size, len, 1, 0, 0],
+        HELLO_PATH,
+        &[file, spare_cap()],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with an endpoint cap as the argv/env cap",
     );
@@ -1683,26 +1725,23 @@ fn argv_env_refusals()
     let no_rights =
         syscall::cap_derive(argv_env.cap(), 0).expect("deriving a rights-free argv/env cap failed");
     let (file, size) = hello_file();
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(label)
-            .word(0, size)
-            .words(1, &[len, 1, 0, 0])
-            .cap(file)
-            .cap(no_rights)
-            .build(),
+        label,
+        &[size, len, 1, 0, 0],
+        HELLO_PATH,
+        &[file, no_rights],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_ARGV_ENV with a Memory cap that has no map right",
     );
 
     let (file, size) = hello_file();
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | (len << 32) | (1 << 48))
-            .word(0, size)
-            .bytes(1, blob)
-            .cap(file)
-            .build(),
+        procmgr_labels::CREATE_FROM_FILE | (len << 32) | (1 << 48),
+        &[size],
+        HELLO_PATH,
+        &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "a create label with the former inline argv fields",
     );
@@ -1711,13 +1750,12 @@ fn argv_env_refusals()
 }
 
 /// The `CREATE_PROCESS` side of [`argv_env_refusals`]: the same split and
-/// header checks, with the header at data word 0. Each refusal comes before
-/// procmgr maps the module, so a spare cap stands in for it; svctest holds no
-/// boot-module Memory cap, so no cell here spawns a child through
-/// `CREATE_PROCESS`.
+/// header checks, with the header at data word 1 after the object's length.
+/// Each refusal comes before procmgr maps the module, so a spare cap stands
+/// in for it, and no cell here spawns a child.
 fn create_process_argv_env_refusals()
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
     use std::os::seraph::process::ArgvEnvCap;
 
     let procmgr = startup_info().procmgr_endpoint;
@@ -1740,23 +1778,22 @@ fn create_process_argv_env_refusals()
         let argv_env = ArgvEnvCap::new(blob, 1, b"", 0)
             .expect("building the argv/env cap failed")
             .expect("a nonempty argv builds a cap");
-        expect_reply(
+        expect_create(
             procmgr,
-            &IpcMessage::builder(label)
-                .words(0, &header)
-                .cap(spare_cap())
-                .cap(argv_env.cap())
-                .build(),
+            label,
+            &with_head(len, &header),
+            HELLO_PATH,
+            &[spare_cap(), argv_env.cap()],
             procmgr_errors::INVALID_ARGUMENT,
             what,
         );
     }
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(label)
-            .words(0, &[len, 1, 0, 0])
-            .cap(spare_cap())
-            .build(),
+        label,
+        &[len, len, 1, 0, 0],
+        HELLO_PATH,
+        &[spare_cap()],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_PROCESS with CREATE_ARGV_ENV and only the module cap",
     );
@@ -1798,22 +1835,16 @@ impl HeldHello
 /// `CREATE_DMA_HOLD` and return its reply caps, the release token among them.
 fn create_held_hello() -> HeldHello
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
 
     let (file, size) = hello_file();
-    let create =
-        IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DMA_HOLD)
-            .word(0, size)
-            .cap(file)
-            .build();
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            startup_info().procmgr_endpoint,
-            &create,
-            std::os::seraph::current_ipc_buf(),
-        )
-    }
+    let reply = create_call(
+        startup_info().procmgr_endpoint,
+        procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_DMA_HOLD,
+        &[size],
+        HELLO_PATH,
+        &[file],
+    )
     .expect("CREATE_FROM_FILE with CREATE_DMA_HOLD call failed");
     assert_eq!(
         reply.label,
@@ -1976,100 +2007,13 @@ pub fn procmgr_dma_hold_phase(_: &Caps)
     std::os::seraph::log!("procmgr_dma_hold phase passed");
 }
 
-/// Pages ahead of the program-header data in the module
-/// [`create_process_large_module_phase`] builds: 512 KiB, so every segment,
-/// the relocation table and the TLS template lie past the module's first 128
-/// pages.
-const LARGE_MODULE_SHIFT_PAGES: u64 = 128;
+/// `QUERY_PROCESS` polls for the verified module's child to exit. A test wait bound.
+const VERIFIED_MODULE_EXIT_POLLS: u32 = 100_000;
 
-/// `QUERY_PROCESS` polls for the large-module child's exit. A test wait bound.
-const LARGE_MODULE_EXIT_POLLS: u32 = 100_000;
-
-/// `image`, an ELF64 little-endian image, laid out as a module whose file data
-/// lies past its first [`LARGE_MODULE_SHIFT_PAGES`] pages: the image whole at
-/// byte 0, where the loader reads its ELF header, program headers and section
-/// headers, and a second copy at the shift, to which every program header's
-/// `p_offset` is moved. Panics when `image` is too short for the headers it
-/// names.
-fn shifted_module(image: &[u8]) -> Vec<u8>
+/// Map `grant` (`pages` pages) writable, run `edit` over its first `len`
+/// bytes, and unmap it.
+fn edit_grant(grant: u64, pages: u64, len: usize, edit: &dyn Fn(&mut [u8]))
 {
-    let shift = LARGE_MODULE_SHIFT_PAGES
-        .checked_mul(syscall_abi::PAGE_SIZE)
-        .expect("the shift fits a u64");
-    let shift_bytes = usize::try_from(shift).expect("the shift fits a usize");
-    let len = shift_bytes
-        .checked_add(image.len())
-        .expect("the module length fits a usize");
-    let mut module = vec![0u8; len];
-    module
-        .get_mut(..image.len())
-        .expect("the module holds the image at byte 0")
-        .copy_from_slice(image);
-    module
-        .get_mut(shift_bytes..)
-        .expect("the module holds the image at the shift")
-        .copy_from_slice(image);
-
-    // The little-endian field of `width` bytes at `at` (at most 8).
-    let field = |at: usize, width: usize| -> u64 {
-        let mut word = [0u8; 8];
-        let end = at
-            .checked_add(width)
-            .expect("a header field's end fits a usize");
-        word.get_mut(..width)
-            .expect("a header field is at most 8 bytes")
-            .copy_from_slice(
-                image
-                    .get(at..end)
-                    .expect("hello's headers lie inside the image"),
-            );
-        u64::from_le_bytes(word)
-    };
-    let index = |n: u64| usize::try_from(n).expect("an ELF header field fits a usize");
-    // ELF64: `e_phoff` at 0x20, `e_phentsize` at 0x36, `e_phnum` at 0x38;
-    // `p_offset` at 8 within a program header.
-    let phoff = index(field(0x20, 8));
-    let phentsize = index(field(0x36, 2));
-    for i in 0..index(field(0x38, 2))
-    {
-        let at = i
-            .checked_mul(phentsize)
-            .and_then(|o| o.checked_add(phoff))
-            .and_then(|o| o.checked_add(8))
-            .expect("a program header's offset fits a usize");
-        let moved = field(at, 8)
-            .checked_add(shift)
-            .expect("a moved p_offset fits a u64");
-        let end = at.checked_add(8).expect("a p_offset's end fits a usize");
-        module
-            .get_mut(at..end)
-            .expect("hello's program headers lie inside the image")
-            .copy_from_slice(&moved.to_le_bytes());
-    }
-    module
-}
-
-/// procmgr loads a module whose file data lies past its first 128 pages:
-/// `CREATE_PROCESS` maps the module's whole Memory cap
-/// (`services/procmgr/docs/ipc-interface.md` § Label 1). svctest holds no boot
-/// module, so it builds one from `/programs/hello` ([`shifted_module`]) in a
-/// contiguous memmgr grant, creates the child from a map-only derivation of
-/// the grant, starts it, and checks that it exits cleanly.
-pub fn create_process_large_module_phase(_: &Caps)
-{
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels, procmgr_process_state};
-
-    let image = std::fs::read("/programs/hello").expect("reading /programs/hello failed");
-    let module = shifted_module(&image);
-    let pages = (module.len() as u64).div_ceil(syscall_abi::PAGE_SIZE);
-    assert!(
-        pages > LARGE_MODULE_SHIFT_PAGES,
-        "the module spans {pages} pages, not past {LARGE_MODULE_SHIFT_PAGES}"
-    );
-    let (grant, region_id) =
-        super::memmgr::try_request_contiguous(u32::try_from(pages).expect("page count fits u32"))
-            .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
-
     let aspace = startup_info().self_aspace;
     let range = std::os::seraph::reserve_pages(pages).expect("reserve_pages for the module");
     let va = range.va_start();
@@ -2078,49 +2022,73 @@ pub fn create_process_large_module_phase(_: &Caps)
     unsafe { std::os::seraph::mem_map_funded(grant, aspace, va, 0, pages, syscall::MAP_WRITABLE) }
         .expect("mapping the module grant writable failed");
     {
-        // SAFETY: the `pages` pages at `va` were just mapped writable, and the
-        // module is at most that long; the slice ends before the unmap below.
-        let dst = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, module.len()) };
-        dst.copy_from_slice(&module);
+        // SAFETY: the `pages` pages at `va` were just mapped writable, and
+        // `len` is at most their length; the slice ends before the unmap below.
+        let dst = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, len) };
+        edit(dst);
     }
     // SAFETY: the span is `range`, mapped above; the slice over it is dead.
     unsafe { syscall::mem_unmap(aspace, va, pages) }.expect("unmapping the module grant failed");
     std::os::seraph::unreserve_pages(range);
+}
 
+/// Send `CREATE_PROCESS` of a map-only derivation of `grant` with object
+/// length `len`, under `name` (no name block when `None`), and return the reply.
+fn create_process_of_grant(grant: u64, len: u64, name: Option<&str>) -> ipc::IpcMessage
+{
     let transfer = syscall::cap_derive(grant, syscall::RIGHTS_MEM_MAP)
         .expect("deriving the module's transfer cap failed");
-    let create = IpcMessage::builder(procmgr_labels::CREATE_PROCESS)
-        .cap(transfer)
-        .build();
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            startup_info().procmgr_endpoint,
-            &create,
-            std::os::seraph::current_ipc_buf(),
+    let procmgr = startup_info().procmgr_endpoint;
+    if let Some(name) = name
+    {
+        create_call(
+            procmgr,
+            ipc::procmgr_labels::CREATE_PROCESS,
+            &[len],
+            name,
+            &[transfer],
         )
     }
-    .expect("CREATE_PROCESS from the large module: ipc_call failed");
-    assert_eq!(
-        reply.label,
-        procmgr_errors::SUCCESS,
-        "CREATE_PROCESS from a {pages}-page module whose file data lies past page \
-         {LARGE_MODULE_SHIFT_PAGES} replied {}",
-        reply.label
+    else
+    {
+        let msg = ipc::IpcMessage::builder(ipc::procmgr_labels::CREATE_PROCESS)
+            .word(0, len)
+            .cap(transfer)
+            .build();
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
+        unsafe { ipc::ipc_call(procmgr, &msg, std::os::seraph::current_ipc_buf()) }
+    }
+    .expect("CREATE_PROCESS from the module grant: ipc_call failed")
+}
+
+/// Assert `reply` is the refusal `want` and carries no child.
+fn assert_refused(reply: &ipc::IpcMessage, want: u64, what: &str)
+{
+    assert_eq!(reply.label, want, "{what}: procmgr replied {}", reply.label);
+    assert!(
+        reply.caps().is_empty(),
+        "{what}: the refusal carried {} caps",
+        reply.caps().len()
     );
+}
+
+/// Start the child `reply` created, wait for its clean exit, and destroy it.
+fn run_created_child(reply: &ipc::IpcMessage)
+{
+    use ipc::{IpcMessage, procmgr_errors, procmgr_labels, procmgr_process_state};
+
     let &[handle, thread] = reply.caps()
     else
     {
         panic!("CREATE_PROCESS replied {} caps", reply.caps().len());
     };
-
     expect_reply(
         handle,
         &IpcMessage::new(procmgr_labels::START_PROCESS),
         procmgr_errors::SUCCESS,
-        "START_PROCESS of the large-module child",
+        "START_PROCESS of the verified-module child",
     );
-    let exit = (0..LARGE_MODULE_EXIT_POLLS).find_map(|_| {
+    let exit = (0..VERIFIED_MODULE_EXIT_POLLS).find_map(|_| {
         let (state, reason) = process_state_and_reason(handle);
         if state == procmgr_process_state::EXITED
         {
@@ -2129,23 +2097,131 @@ pub fn create_process_large_module_phase(_: &Caps)
         std::thread::yield_now();
         None
     });
-    let reason = exit.expect("the large-module child did not exit");
+    let reason = exit.expect("the verified-module child did not exit");
     assert_eq!(
         reason, 0,
-        "the large-module child exited with reason {reason:#x}"
+        "the verified-module child exited with reason {reason:#x}"
     );
     expect_reply(
         handle,
         &IpcMessage::new(procmgr_labels::DESTROY_PROCESS),
         procmgr_errors::SUCCESS,
-        "DESTROY_PROCESS of the exited large-module child",
+        "DESTROY_PROCESS of the exited verified-module child",
     );
     for cap in [thread, handle]
     {
         let _ = syscall::cap_delete(cap);
     }
+}
+
+/// A module procmgr creates from is verified before it is parsed, under the
+/// creator-supplied name and length (`services/procmgr/docs/ipc-interface.md`
+/// § Label 1). svctest holds no boot module, so it copies `/programs/hello`
+/// into a contiguous memmgr grant and creates from map-only derivations of it.
+pub fn create_process_verifies_module_phase(_: &Caps)
+{
+    use ipc::procmgr_errors;
+
+    let image = std::fs::read(HELLO_PATH).expect("reading /programs/hello failed");
+    let len = image.len() as u64;
+    // One byte past the image too, so the overlong request below fails on
+    // the object's trailer, not on the grant's end.
+    let pages = len.saturating_add(1).div_ceil(syscall_abi::PAGE_SIZE);
+    let (grant, region_id) =
+        super::memmgr::try_request_contiguous(u32::try_from(pages).expect("page count fits u32"))
+            .unwrap_or_else(|label| panic!("REQUEST_MEMORY_CAPS status {label:#x}"));
+    edit_grant(grant, pages, image.len(), &|dst| {
+        dst.copy_from_slice(&image);
+    });
+
+    // Defect guarded: a module under its own name and exact length is not
+    // accepted, or the child it yields does not run.
+    let reply = create_process_of_grant(grant, len, Some(HELLO_PATH));
+    assert_eq!(
+        reply.label,
+        procmgr_errors::SUCCESS,
+        "CREATE_PROCESS of the module under its own name replied {}",
+        reply.label
+    );
+    run_created_child(&reply);
+
+    // Defect guarded: a module is accepted under a name other than the one it
+    // was signed under.
+    let reply = create_process_of_grant(grant, len, Some("/programs/hellp"));
+    assert_refused(
+        &reply,
+        procmgr_errors::SIGNATURE_REFUSED,
+        "CREATE_PROCESS under a different name",
+    );
+
+    // Defect guarded: a create without a name block reaches the module.
+    let reply = create_process_of_grant(grant, len, None);
+    assert_refused(
+        &reply,
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_PROCESS without a name block",
+    );
+
+    // Defect guarded: a zero length reaches the module's bytes.
+    let reply = create_process_of_grant(grant, 0, Some(HELLO_PATH));
+    assert_refused(
+        &reply,
+        procmgr_errors::INVALID_ARGUMENT,
+        "CREATE_PROCESS with a zero length",
+    );
+
+    // Defect guarded: the creator-supplied length is not part of what is
+    // verified; an object end one byte later leaves its trailer unparsed.
+    let longer = len.checked_add(1).expect("the length plus one fits a u64");
+    let reply = create_process_of_grant(grant, longer, Some(HELLO_PATH));
+    assert_refused(
+        &reply,
+        procmgr_errors::SIGNATURE_REFUSED,
+        "CREATE_PROCESS with a length one byte too long",
+    );
+
+    // Defect guarded: a module whose body changed after signing is accepted.
+    let at = image.len() / 2;
+    let flip = |dst: &mut [u8]| {
+        let byte = dst.get_mut(at).expect("the flipped byte lies in the image");
+        *byte ^= 0xFF;
+    };
+    edit_grant(grant, pages, image.len(), &flip);
+    let reply = create_process_of_grant(grant, len, Some(HELLO_PATH));
+    assert_refused(
+        &reply,
+        procmgr_errors::SIGNATURE_REFUSED,
+        "CREATE_PROCESS of a module with one changed byte",
+    );
+    edit_grant(grant, pages, image.len(), &flip);
+
     super::memmgr::release_grant(grant, region_id);
-    std::os::seraph::log!("create_process_large_module phase passed ({pages} pages)");
+    std::os::seraph::log!("create_process_verifies_module phase passed ({pages} pages)");
+}
+
+/// procmgr refuses a `CREATE_FROM_FILE` of `/programs/hello` under another
+/// name with `SIGNATURE_REFUSED` and creates no child.
+pub fn create_from_file_refuses_wrong_name_phase(_: &Caps)
+{
+    use ipc::{procmgr_errors, procmgr_labels};
+
+    let (file, size) = hello_file();
+    // Defect guarded: a file is accepted under a name other than the one it
+    // was signed under.
+    let reply = create_call(
+        startup_info().procmgr_endpoint,
+        procmgr_labels::CREATE_FROM_FILE,
+        &[size],
+        "/programs/hellp",
+        &[file],
+    )
+    .expect("raw CREATE_FROM_FILE call failed");
+    assert_refused(
+        &reply,
+        procmgr_errors::SIGNATURE_REFUSED,
+        "CREATE_FROM_FILE under a different name",
+    );
+    std::os::seraph::log!("create_from_file_refuses_wrong_name phase passed");
 }
 
 /// `CONFIGURE_PIPE` cells on a child created (and never started) through raw
@@ -2158,18 +2234,13 @@ fn configure_pipe_refusals()
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
     let (file, size) = hello_file();
-    let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, size)
-        .cap(file)
-        .build();
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            startup_info().procmgr_endpoint,
-            &create,
-            std::os::seraph::current_ipc_buf(),
-        )
-    }
+    let reply = create_call(
+        startup_info().procmgr_endpoint,
+        procmgr_labels::CREATE_FROM_FILE,
+        &[size],
+        HELLO_PATH,
+        &[file],
+    )
     .expect("raw CREATE_FROM_FILE call failed");
     assert_eq!(
         reply.label,
@@ -2227,11 +2298,6 @@ fn configure_pipe_refusals()
 /// `INVALID_BADGE` once the child is destroyed. Each refused request carries
 /// a cap, which procmgr deletes. A fault's post through such a binding is
 /// checked end to end by the devmgr on-demand bind phase.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the 8 request `IpcMessage`s of its calls (568 B each) and their replies; on the \
-              32 KiB main-thread stack of svctest"
-)]
 fn bind_death_observer_cells()
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -2262,13 +2328,14 @@ fn bind_death_observer_cells()
     );
 
     let (file, size) = hello_file();
-    let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, size)
-        .cap(file)
-        .build();
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(procmgr, &create, std::os::seraph::current_ipc_buf()) }
-        .expect("raw CREATE_FROM_FILE call failed");
+    let reply = create_call(
+        procmgr,
+        procmgr_labels::CREATE_FROM_FILE,
+        &[size],
+        HELLO_PATH,
+        &[file],
+    )
+    .expect("raw CREATE_FROM_FILE call failed");
     assert_eq!(
         reply.label,
         procmgr_errors::SUCCESS,
@@ -2402,12 +2469,13 @@ fn undeliverable_reply_child_main() -> !
         {
             std::process::exit(UNDELIVERABLE_POOL_QUERY_FAILED);
         };
-        let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-            .word(0, size)
-            .cap(file)
-            .build();
-        // SAFETY: `ipc_buf` is the kernel-registered IPC buffer page.
-        match unsafe { ipc::ipc_call(info.procmgr_endpoint, &create, ipc_buf) }
+        match create_call(
+            info.procmgr_endpoint,
+            procmgr_labels::CREATE_FROM_FILE,
+            &[size],
+            HELLO_PATH,
+            &[file],
+        )
         {
             Ok(reply) if reply.label == syscall::IPC_REPLY_TRANSFER_FAILED =>
             {}

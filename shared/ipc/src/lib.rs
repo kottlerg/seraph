@@ -90,9 +90,51 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //                             ProcessInfo.log_send_cap (init derives its
 //                             own), not via a handshake
 
+/// Append a name block to a request whose words before `at` are already
+/// set: word `at` holds `name`'s length in bytes, and the bytes follow from
+/// word `at + 1`, packed little-endian. `None` when `name` is empty or
+/// longer than `max`, which the receiver would refuse.
+#[must_use]
+pub fn with_name_block(
+    builder: IpcMessageBuilder,
+    at: usize,
+    name: &[u8],
+    max: usize,
+) -> Option<IpcMessageBuilder>
+{
+    if name.is_empty() || name.len() > max
+    {
+        return None;
+    }
+    Some(
+        builder
+            .word(at, name.len() as u64)
+            .bytes(at.saturating_add(1), name),
+    )
+}
+
+/// The name in the name block at word `at` of `req` ([`with_name_block`]):
+/// `None` when the request delivers no length word, the length is zero or
+/// above `max`, or the words delivered do not cover the name's bytes.
+#[must_use]
+pub fn name_block(req: &IpcMessage, at: usize, max: usize) -> Option<&[u8]>
+{
+    if at >= req.word_count()
+    {
+        return None;
+    }
+    let len = usize::try_from(req.word(at)).ok()?;
+    if len == 0 || len > max
+    {
+        return None;
+    }
+    let start = at.checked_add(1)?.checked_mul(8)?;
+    req.data_bytes().get(start..start.checked_add(len)?)
+}
+
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 18;
+pub const PROCMGR_LABELS_VERSION: u32 = 19;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -102,14 +144,17 @@ pub mod procmgr_labels
     #[cfg(feature = "rustc-dep-of-std")]
     use core::prelude::rust_2024::*;
 
-    /// Create a new process from a boot module Memory cap. Caps: `[module,
-    /// creator_endpoint?, charge_node?, argv_env?, death_relay?]`,
-    /// `charge_node` present iff [`CREATE_CHARGE_NODE`] is set, `argv_env`
-    /// iff [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data
-    /// words `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as
-    /// for [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
-    /// the next data word (word 0, or word 4 after the header). Label layout
-    /// and reply as for [`CREATE_FROM_FILE`].
+    /// Create a new process from a signed object in a Memory cap, a boot
+    /// module's. Caps: `[module, creator_endpoint?, charge_node?, argv_env?,
+    /// death_relay?]`, `charge_node` present iff [`CREATE_CHARGE_NODE`] is
+    /// set, `argv_env` iff [`CREATE_ARGV_ENV`] is set, and `death_relay` iff
+    /// [`CREATE_DEATH_RELAY`] is set, as for [`CREATE_FROM_FILE`]. Data word
+    /// 0 is the object's exact length in bytes, which the cap, a whole number
+    /// of pages, must hold; the words after it are laid out as for
+    /// [`CREATE_FROM_FILE`], the name block ([`create_name_word`]) last.
+    /// procmgr copies the object, verifies it under the name the block
+    /// carries, and loads only its verified body. Label layout and reply as
+    /// for [`CREATE_FROM_FILE`].
     /// Stdio pipes (stdin/stdout/stderr) are
     /// configured through one or more [`CONFIGURE_PIPE`] calls against
     /// the returned badged `process_handle` — procmgr's CREATE path
@@ -119,12 +164,16 @@ pub mod procmgr_labels
     pub const CREATE_PROCESS: u64 = 1;
     /// Start a previously created (suspended) process.
     pub const START_PROCESS: u64 = 2;
-    /// Create a new process from a caller-supplied file cap (ELF binary).
+    /// Create a new process from a caller-supplied file cap (a signed ELF
+    /// binary).
     ///
     /// The caller already walked its own namespace cap to the binary node
     /// and attaches the resulting badged file cap. Procmgr opens it
-    /// (`FS_OPEN`) and streams the ELF with `FS_READ` / `FS_READ_MEMORY`
-    /// against its own open — it never holds a namespace cap of its own.
+    /// (`FS_OPEN`), copies the file's `file_size` bytes into memory of its
+    /// own with `FS_READ_MEMORY` against its open, closes it, verifies the
+    /// copy under the name the request's name block carries
+    /// (docs/signing.md § Signature Policy in procmgr), and loads only its
+    /// verified body. It never holds a namespace cap of its own.
     ///
     /// Label layout:
     /// * bits `[0..16]` — opcode (`CREATE_FROM_FILE`)
@@ -145,6 +194,14 @@ pub mod procmgr_labels
     /// * `words 1..5` — the [`ArgvEnvHeader`] (only when [`CREATE_ARGV_ENV`] is set)
     /// * the next word — the child's memory max in pages (only when
     ///   [`CREATE_MEMORY_MAX`] is set): word 1, or word 5 after the header
+    /// * the name block, always, at [`create_name_word`]: the name's length in
+    ///   bytes, from 1 to [`CREATE_NAME_MAX`], then its bytes packed
+    ///   little-endian from the next word ([`create_name`])
+    ///
+    /// The name is the install path the creator expects the file to have been
+    /// signed under; a create whose object does not verify under it, or
+    /// whose kind the creator's signature policy does not allow, is refused
+    /// with `procmgr_errors::SIGNATURE_REFUSED`.
     ///
     /// Reply: `data[0]` is the max the child's memmgr budget node took after
     /// memmgr's clamp, `u64::MAX` for none.
@@ -234,9 +291,9 @@ pub mod procmgr_labels
     /// Label flag (bit 29) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
     /// request carries the child's argv and env in a Memory cap the caller
     /// sizes, the argv blob at byte 0 and the env blob directly after it, and
-    /// their [`ArgvEnvHeader`] in four data words (from word 0 for
-    /// `CREATE_PROCESS`, from word 1, after `file_size`, for
-    /// `CREATE_FROM_FILE`). The cap is the last cap before the death relay,
+    /// their [`ArgvEnvHeader`] in four data words from word 1, after the
+    /// object's length (`CREATE_PROCESS`) or `file_size`
+    /// (`CREATE_FROM_FILE`). The cap is the last cap before the death relay,
     /// or the last cap without one. procmgr copies the blobs into the child's
     /// argv/env region through fixed windows and deletes its copy of the cap
     /// before it replies; the caller then returns the cap's run to memmgr,
@@ -263,8 +320,7 @@ pub mod procmgr_labels
     /// Label flag (bit 31) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
     /// request carries a memory max for the child, in pages, in one data word
     /// after the others: after the [`ArgvEnvHeader`] when [`CREATE_ARGV_ENV`]
-    /// is set, so at word 0 or 4 of `CREATE_PROCESS` and at word 1 or 5 of
-    /// `CREATE_FROM_FILE`. procmgr registers the child's memmgr budget node
+    /// is set, so at word 1 or 5 of either label. procmgr registers the child's memmgr budget node
     /// with that max (`memmgr_labels::REGISTER_MAX`), which memmgr clamps to
     /// what the creator's node and every ancestor have left; the create reply
     /// carries the max the node took in `data[0]`. A request that sets the
@@ -312,6 +368,63 @@ pub mod procmgr_labels
     pub const CREATE_RESERVED_MASK: u64 = !((1 << 35) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
+    /// The first data word of a create request after its fixed word 0, the
+    /// object's length (`CREATE_PROCESS`) or `file_size`
+    /// (`CREATE_FROM_FILE`): where the [`ArgvEnvHeader`], the memory max and
+    /// the name block start, in that order, each present or not.
+    pub const CREATE_FIRST_WORD: usize = 1;
+    /// Longest name, in bytes, a create request's name block carries: an
+    /// install path or a bundle entry name, the longest name in the canonical
+    /// form an object is signed under (`objsig::NAME_MAX`, which procmgr's
+    /// host tests pin this to; docs/signing.md § Signed Attributes). 32 data
+    /// words; with the length word and the words before it a request stays
+    /// under `MSG_DATA_WORDS_MAX`.
+    pub const CREATE_NAME_MAX: usize = 256;
+
+    /// The data word that holds the name block's length in a create request
+    /// labelled `label` ([`CREATE_PROCESS`] or [`CREATE_FROM_FILE`]): after
+    /// word 0 (the object's length or `file_size`), the [`ArgvEnvHeader`]
+    /// when [`CREATE_ARGV_ENV`] is set, and the memory max when
+    /// [`CREATE_MEMORY_MAX`] is set. The name's bytes follow from the next
+    /// word.
+    #[must_use]
+    pub const fn create_name_word(label: u64) -> usize
+    {
+        let mut word = CREATE_FIRST_WORD;
+        if label & CREATE_ARGV_ENV != 0
+        {
+            word = word.saturating_add(ARGV_ENV_HEADER_WORDS);
+        }
+        if label & CREATE_MEMORY_MAX != 0
+        {
+            word = word.saturating_add(1);
+        }
+        word
+    }
+
+    /// Append the name block for `name` to a create request labelled
+    /// `label` whose earlier words are already set
+    /// ([`create_name_word`]). `None` when `name` is empty or longer than
+    /// [`CREATE_NAME_MAX`], which procmgr would refuse.
+    #[must_use]
+    pub fn with_create_name(
+        builder: crate::IpcMessageBuilder,
+        label: u64,
+        name: &[u8],
+    ) -> Option<crate::IpcMessageBuilder>
+    {
+        crate::with_name_block(builder, create_name_word(label), name, CREATE_NAME_MAX)
+    }
+
+    /// The name a create request `req` carries in its name block
+    /// ([`create_name_word`]): `None` when the request delivers no length
+    /// word, the length is zero or above [`CREATE_NAME_MAX`], or the words
+    /// delivered do not cover the name's bytes.
+    #[must_use]
+    pub fn create_name(req: &crate::IpcMessage) -> Option<&[u8]>
+    {
+        crate::name_block(req, create_name_word(req.label), CREATE_NAME_MAX)
+    }
 
     /// The byte lengths and string counts of a create request's argv and env
     /// blobs, carried in [`ARGV_ENV_HEADER_WORDS`] data words when the label
@@ -2505,7 +2618,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 21;
+pub const DEVMGR_LABELS_VERSION: u32 = 22;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2616,12 +2729,17 @@ pub mod devmgr_labels
     /// `/services/drivers/` directory node, which svcmgr walks from its
     /// system root via `namespace_lookup_dir(root_dir_cap, …, LOOKUP |
     /// READ | READDIR)` (so the node is served by the root filesystem, and
-    /// devmgr can list it with `NS_READDIR`).
+    /// devmgr can list it with `NS_READDIR`); from word
+    /// [`DRIVERS_DIR_PATH_WORD`], the directory's absolute path
+    /// (`/services/drivers`) as a name block (`crate::with_name_block`, at
+    /// most [`DRIVERS_DIR_PATH_MAX`] bytes), under which devmgr names each
+    /// entry it starts, `<path>/<entry>`, the name procmgr verifies the entry
+    /// was signed under (docs/signing.md § Signed Attributes).
     /// Caller's badge MUST carry [`DRIVERS_DIR_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise and
-    /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` is
-    /// absent. A repeated request keeps the first cap and replies
-    /// `SUCCESS`.
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when `caps[0]` or the
+    /// path is absent. A repeated request keeps the first cap and path and
+    /// replies `SUCCESS`.
     ///
     /// Devmgr stashes the cap and replies
     /// [`super::devmgr_errors::SUCCESS`] **before** doing any spawn
@@ -2648,6 +2766,17 @@ pub mod devmgr_labels
     /// [`super::devmgr_errors::NO_DEVICE`]'s. The pass refuses a
     /// declaration of a boot-only class ([`MINT_CLASS_SEND`]), logged.
     pub const SET_DRIVERS_DIR: u64 = 6;
+
+    /// The data word of [`SET_DRIVERS_DIR`] and [`BIND_DRIVERS`] that holds
+    /// the length of the directory's path, whose bytes follow
+    /// (`crate::with_name_block`).
+    pub const DRIVERS_DIR_PATH_WORD: usize = 1;
+
+    /// Longest drivers-directory path, in bytes, [`SET_DRIVERS_DIR`] and
+    /// [`BIND_DRIVERS`] carry: the longest name procmgr verifies an object
+    /// under (`procmgr_labels::CREATE_NAME_MAX`), which a driver's name,
+    /// the path and an entry, must also fit.
+    pub const DRIVERS_DIR_PATH_MAX: usize = super::procmgr_labels::CREATE_NAME_MAX;
 
     /// Locate an ACPI table and serve a read-only view of it.
     ///
@@ -2979,7 +3108,10 @@ pub mod devmgr_labels
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `caps[0]` = a SEND on a directory node carrying
-    /// `LOOKUP | READ | READDIR`, as [`SET_DRIVERS_DIR`]'s does. Caller's
+    /// `LOOKUP | READ | READDIR`, as [`SET_DRIVERS_DIR`]'s does; from word
+    /// [`DRIVERS_DIR_PATH_WORD`], the directory's absolute path as a name
+    /// block, as [`SET_DRIVERS_DIR`]'s, under which devmgr names each entry
+    /// it starts. Caller's
     /// badge MUST carry [`BIND_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
@@ -2996,7 +3128,7 @@ pub mod devmgr_labels
     /// withdrawn) is not bound again, and a second request over the same
     /// directory binds nothing. devmgr deletes the directory cap once the
     /// pass ends. Replies `INVALID_REQUEST`, deleting the cap, when `caps[0]`
-    /// is absent, before [`SET_DRIVERS_DIR`] (whose pass binds first), and
+    /// or the path is absent, before [`SET_DRIVERS_DIR`] (whose pass binds first), and
     /// while an earlier request's pass or settle is not done.
     pub const BIND_DRIVERS: u64 = 22;
     /// The bound of a bind pass's settle, in milliseconds: how long devmgr
@@ -4814,6 +4946,12 @@ pub mod procmgr_errors
     /// already holds `procmgr_labels::REGISTERED_THREADS_MAX` registered
     /// threads that procmgr could not prune.
     pub const THREAD_LIMIT: u64 = 17;
+    /// A create refused because its object did not verify: it does not parse
+    /// as a signed object, no record chains to the trust store, or the record
+    /// that does fails a check, its name, kind (against the creator's
+    /// signature policy), architecture or body hash among them
+    /// (docs/signing.md § Signature Policy in procmgr). Nothing was created.
+    pub const SIGNATURE_REFUSED: u64 = 18;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }
@@ -5693,6 +5831,72 @@ pub unsafe fn ipc_reply(msg: &IpcMessage, ipc_buf: *mut u64) -> Result<(), i64>
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn a_create_name_block_follows_every_other_create_word()
+    {
+        use procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_FROM_FILE, CREATE_MEMORY_MAX, CREATE_PROCESS, create_name_word,
+        };
+        assert_eq!(create_name_word(CREATE_PROCESS), 1);
+        assert_eq!(create_name_word(CREATE_FROM_FILE | CREATE_MEMORY_MAX), 2);
+        assert_eq!(create_name_word(CREATE_PROCESS | CREATE_ARGV_ENV), 5);
+        assert_eq!(
+            create_name_word(CREATE_FROM_FILE | CREATE_ARGV_ENV | CREATE_MEMORY_MAX),
+            6
+        );
+    }
+
+    #[test]
+    fn a_create_name_round_trips_at_every_length()
+    {
+        use procmgr_labels::{
+            CREATE_ARGV_ENV, CREATE_FROM_FILE, CREATE_MEMORY_MAX, CREATE_NAME_MAX, create_name,
+            with_create_name,
+        };
+        let label = CREATE_FROM_FILE | CREATE_ARGV_ENV | CREATE_MEMORY_MAX;
+        let mut name = [0u8; CREATE_NAME_MAX];
+        for (i, byte) in name.iter_mut().enumerate()
+        {
+            *byte = b'a' + (i % 26) as u8;
+        }
+        for len in [1, 7, 8, 9, 16, 17, CREATE_NAME_MAX]
+        {
+            let builder = IpcMessage::builder(label).word(0, 4096).word(5, 9);
+            let msg = with_create_name(builder, label, &name[..len])
+                .unwrap()
+                .build();
+            assert_eq!(create_name(&msg), Some(&name[..len]), "length {len}");
+            // The words before the block are untouched.
+            assert_eq!((msg.word(0), msg.word(5)), (4096, 9));
+        }
+    }
+
+    #[test]
+    fn a_create_name_block_that_is_missing_empty_long_or_short_is_refused()
+    {
+        use procmgr_labels::{
+            CREATE_FROM_FILE, CREATE_NAME_MAX, CREATE_PROCESS, create_name, with_create_name,
+        };
+        let long = [b'x'; CREATE_NAME_MAX + 1];
+        let builder = || IpcMessage::builder(CREATE_PROCESS).word(0, 4096);
+        assert!(with_create_name(builder(), CREATE_PROCESS, b"").is_none());
+        assert!(with_create_name(builder(), CREATE_PROCESS, &long).is_none());
+        // No length word delivered.
+        assert_eq!(create_name(&builder().build()), None);
+        // A zero or over-long length word.
+        assert_eq!(create_name(&builder().word(1, 0).build()), None);
+        let over = builder()
+            .word(1, CREATE_NAME_MAX as u64 + 1)
+            .bytes(2, &long);
+        assert_eq!(create_name(&over.build()), None);
+        // A length the delivered words do not cover.
+        let short = IpcMessage::builder(CREATE_FROM_FILE)
+            .word(0, 1)
+            .word(1, 9)
+            .bytes(2, b"/abcdefg");
+        assert_eq!(create_name(&short.build()), None);
+    }
 
     #[test]
     fn a_class_badge_round_trips_and_carries_no_authority_bit()

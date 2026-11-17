@@ -76,6 +76,7 @@ use firmware::rimt;
 use ipc::{IpcMessage, iommu_errors, iommu_labels};
 use syscall_abi::PAGE_SIZE;
 
+use crate::decls::Binary;
 use crate::{DeviceCatalog, Registry, ServedDriver, Serves, SpawnedDriver};
 use crate::{arch, caps, pci, settle, spawn};
 
@@ -1297,7 +1298,7 @@ fn mark_units_bound(
 )]
 pub fn bring_up(
     records: &mut firmware::pci_records::PciRecords,
-    modules: &mut Vec<(DriverDecl, u64)>,
+    modules: &mut Vec<(DriverDecl, Binary)>,
     pooled: Option<Vec<(u64, u64)>>,
     caps: &mut caps::DevmgrCaps,
     watch: &mut settle::DriverWatch,
@@ -1316,7 +1317,7 @@ pub fn bring_up(
         unconfined("no IOMMU found");
         return None;
     };
-    let Some((decl, module_cap)) = take_family_driver(family, modules)
+    let Some((decl, module)) = take_family_driver(family, modules)
     else
     {
         unconfined("no IOMMU driver module");
@@ -1324,7 +1325,7 @@ pub fn bring_up(
     };
     // Released on every exit the spawn does not take it on: a retained
     // module cap pins init's donated pool run.
-    let module_guard = spawn::ModuleCapGuard::new(module_cap);
+    let module_guard = spawn::ModuleCapGuard::new(module.cap());
     let grants = firmware::binding::grants(&decl, Source::BootModule, true);
     if !decl.dma || !grants.phys_access
     {
@@ -1358,7 +1359,7 @@ pub fn bring_up(
         caps,
         &decl,
         &grants,
-        (module_cap, module_guard),
+        (&module, module_guard),
         &handed,
         &client,
         death_eq,
@@ -1411,18 +1412,18 @@ pub fn bring_up(
 /// The IOMMU pass's match: take out of `modules` every boot-module
 /// declaration that matches the family record of `family` (its IOMMU family
 /// key, docs/driver-binding.md § Matching) and choose one through a match
-/// table of its own. The chosen declaration and module cap, or `None`, logged
+/// table of its own. The chosen declaration and module, or `None`, logged
 /// when two match equally; every other taken module is released.
 fn take_family_driver(
     family: Family,
-    modules: &mut Vec<(DriverDecl, u64)>,
-) -> Option<(DriverDecl, u64)>
+    modules: &mut Vec<(DriverDecl, Binary)>,
+) -> Option<(DriverDecl, Binary)>
 {
     let record = RecordKeys {
         iommu_family: Some(family.key()),
         ..RecordKeys::default()
     };
-    let mut table: MatchTable<u64> = MatchTable::new();
+    let mut table: MatchTable<Binary> = MatchTable::new();
     let mut i = 0;
     while i < modules.len()
     {
@@ -1436,9 +1437,10 @@ fn take_family_driver(
             i = i.saturating_add(1);
             continue;
         }
-        let (decl, cap) = modules.remove(i);
+        let (decl, binary) = modules.remove(i);
+        let cap = binary.cap();
         // The IOMMU pass is the boot's first: no driver is bound yet.
-        if table.add(decl, Source::BootModule, cap, 0).is_err()
+        if table.add(decl, Source::BootModule, binary, 0).is_err()
         {
             std::os::seraph::log!(
                 warn: "{}: no memory to consider the driver; not bound",
@@ -1464,15 +1466,15 @@ fn take_family_driver(
     };
     let decl = chosen.and_then(|index| table.candidates().get(index).map(|c| c.decl));
     let mut module = None;
-    for (index, cap) in table.drain_binaries().enumerate()
+    for (index, binary) in table.drain_binaries().enumerate()
     {
         if Some(index) == chosen
         {
-            module = Some(cap);
+            module = Some(binary);
         }
         else
         {
-            let _ = syscall::cap_delete(cap);
+            binary.release();
         }
     }
     decl.zip(module)
@@ -1614,7 +1616,7 @@ fn spawn_and_settle(
     caps: &caps::DevmgrCaps,
     decl: &DriverDecl,
     grants: &firmware::binding::Grants,
-    module: (u64, spawn::ModuleCapGuard),
+    module: (&Binary, spawn::ModuleCapGuard),
     handed: &Handed,
     client: &IommuClient,
     death_eq: u64,
@@ -1634,14 +1636,20 @@ fn spawn_and_settle(
         handed.release();
         return Settled::NotStarted;
     };
-    // `spawn_bound_driver` owns the module cap's lifecycle from here
-    // (consumed by CREATE_PROCESS, or released on failure).
-    let (module_cap, mut module_guard) = module;
-    module_guard.disarm();
+    // `spawn_bound_driver` consumes a derived copy of the module cap; the
+    // guard deletes devmgr's own cap when this function returns.
+    let (binary, _module_guard) = module;
+    let Some(source) = binary.source_copy()
+    else
+    {
+        std::os::seraph::log!(warn: "IOMMU driver: module cap not derived; not spawned");
+        handed.release();
+        return Settled::NotStarted;
+    };
     let config = spawn::BoundSpawnConfig {
         procmgr_ep: caps.procmgr_ep,
         bootstrap_ep: caps.self_bootstrap_ep,
-        source: spawn::CreateSource::Module(module_cap),
+        source,
         resources: &handed.registers,
         units: &handed.units,
         dma_cap: None,

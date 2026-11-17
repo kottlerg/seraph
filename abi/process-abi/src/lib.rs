@@ -170,7 +170,7 @@ pub const fn resolve_stack_pages(note: Option<u32>) -> Option<u32>
 // same shape as `ProcessInfo` — binaries opt in via the
 // [`stack_pages!`] macro which expands to a `#[link_section]` static of
 // type [`StackNote`]. `shared/elf` consumes these constants on the
-// loader side via `parse_stack_note` / `parse_stack_note_streaming`.
+// loader side via `parse_stack_note`.
 //
 // Standard ELF note layout: a header (`namesz`, `descsz`, `ntype`)
 // followed by `name` (padded to 4-byte alignment) and `desc` (likewise).

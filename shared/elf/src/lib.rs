@@ -12,10 +12,8 @@
 //! Consumers are listed in `shared/elf/README.md`.
 //!
 //! This crate is `no_std` and performs no allocation or I/O. Functions operate
-//! on a byte slice holding the raw ELF image; the `*_metadata` variants need
-//! only the header page plus the declared file size, and `rela_table_metadata`
-//! and `parse_stack_note_streaming` fetch further bytes through a
-//! caller-supplied reader.
+//! on a byte slice holding the raw ELF image; `find_note_streaming` fetches
+//! further bytes through a caller-supplied reader.
 
 #![cfg_attr(not(test), no_std)]
 #![expect(
@@ -105,16 +103,10 @@ const DYN_ENTRY_SIZE: usize = 16;
 /// arrives from the bootloader rather than from an image the kernel holds.
 /// Unreachable by a valid init: init is an in-tree binary whose table holds
 /// a few thousand relocations, so the bound refuses only a corrupt size.
-/// The table locators here ([`rela_table`], [`rela_table_metadata`]) apply
-/// no such cap: a table must lie inside one `PT_LOAD` segment's file data
-/// and the file, so the file's size bounds it, and the streaming loaders
-/// apply it in fixed chunks.
+/// The table locator here ([`rela_table`]) applies no such cap: a table must
+/// lie inside one `PT_LOAD` segment's file data and the file, so the file's
+/// size bounds it.
 pub const MAX_RELA_TABLE_SIZE: u64 = 4 * 1024 * 1024;
-
-/// Upper bound on the `PT_DYNAMIC` segment size accepted by the streaming
-/// parser (256 entries). lld emits well under 32 entries for `-Bsymbolic`
-/// PIE with no dynamic linking; the cap keeps the on-stack buffer fixed.
-pub const MAX_STREAMING_DYNAMIC: usize = 4096;
 
 // ── e_ident index constants ──────────────────────────────────────────────────
 
@@ -155,8 +147,7 @@ pub enum ElfError
     SegmentOverflow,
     /// The `PT_DYNAMIC` segment or the relocation table it describes is
     /// malformed: bad bounds or entry size, size cap exceeded, table not
-    /// backed by a `PT_LOAD` segment's file data, or a streaming read of
-    /// either failed.
+    /// backed by a `PT_LOAD` segment's file data.
     MalformedDynamic,
     /// The image carries a relocation table format or relocation type other
     /// than the architecture's `RELATIVE` type.
@@ -538,100 +529,6 @@ pub fn load_segments<'a>(ehdr: &Elf64Ehdr, data: &'a [u8]) -> LoadSegmentIter<'a
     }
 }
 
-// ── Header-only segment metadata ────────────────────────────────────────────
-
-/// Iterator over `PT_LOAD` segments using only the ELF header page.
-///
-/// Like [`LoadSegmentIter`], but validates segment file bounds against a
-/// declared `file_size` instead of requiring the full file data in memory.
-/// This enables streaming ELF loading where only the header page is mapped.
-pub struct LoadSegmentMetaIter<'a>
-{
-    header_data: &'a [u8],
-    file_size: u64,
-    phdr_base: usize,
-    phdr_count: usize,
-    index: usize,
-}
-
-impl Iterator for LoadSegmentMetaIter<'_>
-{
-    type Item = Result<LoadSegment, ElfError>;
-
-    fn next(&mut self) -> Option<Self::Item>
-    {
-        while self.index < self.phdr_count
-        {
-            let index = self.index;
-            // `index` is below `phdr_count`, so it cannot wrap.
-            self.index = self.index.saturating_add(1);
-            let phdr = match read_phdr_at(self.header_data, self.phdr_base, index)
-            {
-                Ok(phdr) => phdr,
-                Err(e) =>
-                {
-                    self.index = self.phdr_count;
-                    return Some(Err(e));
-                }
-            };
-
-            if phdr.p_type != PT_LOAD
-            {
-                continue;
-            }
-
-            // Validate that the file data for this segment is within the file.
-            let seg_end = phdr.p_offset.checked_add(phdr.p_filesz);
-            match seg_end
-            {
-                Some(end) if end <= self.file_size =>
-                {}
-                _ => return Some(Err(ElfError::SegmentOverflow)),
-            }
-
-            return Some(Ok(LoadSegment {
-                vaddr: phdr.p_vaddr,
-                paddr: phdr.p_paddr,
-                offset: phdr.p_offset,
-                filesz: phdr.p_filesz,
-                memsz: phdr.p_memsz,
-                writable: phdr.p_flags & PF_W != 0,
-                executable: phdr.p_flags & PF_X != 0,
-            }));
-        }
-        None
-    }
-}
-
-/// Return an iterator over `PT_LOAD` segments from the ELF header page only.
-///
-/// `ehdr` must have been returned by a successful [`validate`] or
-/// [`validate_executable`] call on `header_data`. Segment file bounds are
-/// checked against `file_size` rather than the buffer length, allowing the
-/// caller to hold only the first page of the ELF file.
-///
-/// # Errors
-///
-/// Individual segments may yield `Err(`[`ElfError::SegmentOverflow`]`)` if
-/// their file data extends beyond `file_size`. The iterator yields
-/// `Err(`[`ElfError::PhdrTableOverflow`]`)` and ends if a program header lies
-/// outside `header_data`.
-#[must_use]
-pub fn load_segments_metadata<'a>(
-    ehdr: &Elf64Ehdr,
-    header_data: &'a [u8],
-    file_size: u64,
-) -> LoadSegmentMetaIter<'a>
-{
-    LoadSegmentMetaIter {
-        header_data,
-        file_size,
-        phdr_base: usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX),
-        phdr_count: ehdr.e_phnum as usize,
-        index: 0,
-    }
-}
-
 // ── PT_TLS lookup ────────────────────────────────────────────────────────────
 
 /// Return the `PT_TLS` segment from a validated ELF image, or `None` if the
@@ -879,31 +776,6 @@ pub fn parse_stack_note(ehdr: &Elf64Ehdr, data: &[u8]) -> Option<u32>
     stack_pages_of(desc)
 }
 
-/// Locate `.note.seraph.stack` when only the ELF header page is in
-/// memory ([`find_note_streaming`]). `read_at` fetches `dst.len()` bytes from
-/// `file_offset` and returns the number of bytes copied (or `None` on I/O
-/// error).
-///
-/// Used by procmgr's VFS-streaming spawn path: the section header table
-/// and the matching note section are fetched on demand via the same
-/// `vfs_read` primitive that loads `PT_LOAD` pages.
-pub fn parse_stack_note_streaming<F>(ehdr: &Elf64Ehdr, file_size: u64, read_at: F) -> Option<u32>
-where
-    F: FnMut(u64, &mut [u8]) -> Option<usize>,
-{
-    let mut buf = [0u8; MAX_STREAMING_NOTE];
-    let desc = find_note_streaming(
-        ehdr,
-        file_size,
-        process_abi::SERAPH_STACK_NOTE_SECTION,
-        process_abi::SERAPH_NOTE_OWNER,
-        process_abi::NT_SERAPH_STACK,
-        &mut buf,
-        read_at,
-    )?;
-    stack_pages_of(buf.get(desc)?)
-}
-
 /// The page count of a stack note's descriptor, `process_abi::StackNoteDesc`:
 /// eight bytes, the count in the first four.
 fn stack_pages_of(desc: &[u8]) -> Option<u32>
@@ -921,11 +793,6 @@ fn stack_pages_of(desc: &[u8]) -> Option<u32>
 /// only section names, a fixed set the linker emits, so program size does
 /// not grow it.
 pub const MAX_STREAMING_STRTAB: usize = 4096;
-
-/// Upper bound on the stack-note section size accepted by
-/// [`parse_stack_note_streaming`]. The note is 28 bytes; 64 leaves headroom
-/// for future fields.
-const MAX_STREAMING_NOTE: usize = 64;
 
 /// The byte range of the descriptor of the note of type `ntype` owned by
 /// `owner` among the note records of `notes`, each a header, its name padded
@@ -1083,56 +950,6 @@ fn section_name_eq(strtab: &[u8], offset: usize, expected: &str) -> bool
         == Some(&0)
 }
 
-/// Locate the `PT_TLS` segment using only the ELF header page, validating
-/// `p_filesz` against a declared `file_size` instead of a buffer length.
-///
-/// Mirror of [`tls_segment`] for the streaming-from-VFS loader path, which
-/// holds only the first file page in memory during ELF parsing.
-///
-/// # Errors
-///
-/// Returns [`ElfError::SegmentOverflow`] if the `PT_TLS` segment's file data
-/// extends beyond `file_size` or past its `p_memsz`, or
-/// [`ElfError::PhdrTableOverflow`] if a program header lies outside
-/// `header_data`.
-pub fn tls_segment_metadata(
-    ehdr: &Elf64Ehdr,
-    header_data: &[u8],
-    file_size: u64,
-) -> Result<Option<TlsSegment>, ElfError>
-{
-    let phdr_base = usize::try_from(ehdr.e_phoff).unwrap_or(usize::MAX);
-    let phdr_count = ehdr.e_phnum as usize;
-
-    for i in 0..phdr_count
-    {
-        let phdr = read_phdr_at(header_data, phdr_base, i)?;
-
-        if phdr.p_type != PT_TLS
-        {
-            continue;
-        }
-
-        let seg_end = phdr.p_offset.checked_add(phdr.p_filesz);
-        match seg_end
-        {
-            Some(end) if end <= file_size && phdr.p_filesz <= phdr.p_memsz =>
-            {}
-            _ => return Err(ElfError::SegmentOverflow),
-        }
-
-        return Ok(Some(TlsSegment {
-            vaddr: phdr.p_vaddr,
-            offset: phdr.p_offset,
-            filesz: phdr.p_filesz,
-            memsz: phdr.p_memsz,
-            align: phdr.p_align,
-        }));
-    }
-
-    Ok(None)
-}
-
 // ── Load span ────────────────────────────────────────────────────────────────
 
 /// Compute the link-VA span of all `PT_LOAD` segments: the pair
@@ -1209,7 +1026,7 @@ pub fn relro_span(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<(u64, u64)>, E
 
 /// Location of an image's `.rela.dyn` relocation table.
 ///
-/// Returned by [`rela_table`] / [`rela_table_metadata`]. The caller reads
+/// Returned by [`rela_table`]. The caller reads
 /// `size` bytes at `file_offset` (whole or in chunks that are multiples of
 /// [`RELA_ENTRY_SIZE`]) and feeds them to [`relative_relocs`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1432,54 +1249,6 @@ pub fn rela_table(ehdr: &Elf64Ehdr, data: &[u8]) -> Result<Option<RelaTable>, El
     resolve_rela_table(&summary, ehdr, data, data.len() as u64)
 }
 
-/// Locate the `.rela.dyn` table when only the ELF header page is in memory.
-///
-/// Mirror of [`rela_table`] for the streaming-from-VFS loader path.
-/// `read_at` fetches `dst.len()` bytes from a file offset and returns the
-/// number of bytes copied (or `None` on I/O error). The `PT_DYNAMIC`
-/// content is fetched through `read_at` into a fixed on-stack buffer;
-/// segments larger than [`MAX_STREAMING_DYNAMIC`] are rejected.
-///
-/// # Errors
-///
-/// As [`rela_table`] (with `header_data` for `data`); a failed or short `read_at`, or an oversized
-/// `PT_DYNAMIC` segment, is [`ElfError::MalformedDynamic`].
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `PT_DYNAMIC` buffer `buf` (`MAX_STREAMING_DYNAMIC`, 4 KiB); on its caller's \
-              stack, 32 KiB at the smallest (a std service's main thread)"
-)]
-pub fn rela_table_metadata<F>(
-    ehdr: &Elf64Ehdr,
-    header_data: &[u8],
-    file_size: u64,
-    mut read_at: F,
-) -> Result<Option<RelaTable>, ElfError>
-where
-    F: FnMut(u64, &mut [u8]) -> Option<usize>,
-{
-    let Some((offset, filesz)) = find_dynamic_phdr(ehdr, header_data)?
-    else
-    {
-        return Ok(None);
-    };
-    if filesz > MAX_STREAMING_DYNAMIC as u64
-        || offset.checked_add(filesz).is_none_or(|end| end > file_size)
-    {
-        return Err(ElfError::MalformedDynamic);
-    }
-    let mut buf = [0u8; MAX_STREAMING_DYNAMIC];
-    let want = filesz as usize;
-    let dyn_bytes = buf.get_mut(..want).ok_or(ElfError::MalformedDynamic)?;
-    let got = read_at(offset, dyn_bytes).ok_or(ElfError::MalformedDynamic)?;
-    if got < want
-    {
-        return Err(ElfError::MalformedDynamic);
-    }
-    let summary = parse_dynamic(dyn_bytes);
-    resolve_rela_table(&summary, ehdr, header_data, file_size)
-}
-
 /// Iterator over the `RELATIVE` relocations of a raw `.rela.dyn` table.
 ///
 /// Created by [`relative_relocs`]. Yields one [`Rela`] per record; a record
@@ -1513,9 +1282,9 @@ impl Iterator for RelativeRelocIter<'_>
 
 /// Iterate the `RELATIVE` relocations in a raw relocation table.
 ///
-/// `table` holds `.rela.dyn` bytes located by [`rela_table`] /
-/// [`rela_table_metadata`] — the whole table, or one chunk at a time as
-/// long as chunk boundaries are multiples of [`RELA_ENTRY_SIZE`].
+/// `table` holds `.rela.dyn` bytes located by [`rela_table`] — the whole
+/// table, or one chunk at a time as long as chunk boundaries are multiples of
+/// [`RELA_ENTRY_SIZE`].
 ///
 /// # Errors
 ///
@@ -1580,39 +1349,6 @@ pub fn validate_relative_relocs(
     Ok(count)
 }
 
-/// Apply one `RELATIVE` relocation to a copied span starting at link VA
-/// `span_vaddr`: writes `bias + addend` little-endian at the target if the
-/// whole 8-byte target lies inside the span. Returns the number applied
-/// (0 or 1) for the caller's applied-count invariant.
-pub fn apply_reloc_in_span(rela: &Rela, bias: u64, span_vaddr: u64, span: &mut [u8]) -> u64
-{
-    let Some(span_end) = span_vaddr.checked_add(span.len() as u64)
-    else
-    {
-        return 0;
-    };
-    let Some(target_end) = rela.offset.checked_add(8)
-    else
-    {
-        return 0;
-    };
-    if rela.offset < span_vaddr || target_end > span_end
-    {
-        return 0;
-    }
-    // `rela.offset >= span_vaddr` here, so the difference is exact, and
-    // the whole target lies in `span`, so the lookup succeeds.
-    let pos = rela.offset.saturating_sub(span_vaddr) as usize;
-    let Some(target) = span.get_mut(pos..).and_then(<[u8]>::first_chunk_mut::<8>)
-    else
-    {
-        return 0;
-    };
-    let value = bias.wrapping_add(rela.addend.cast_unsigned());
-    *target = value.to_le_bytes();
-    1
-}
-
 /// Apply every `RELATIVE` relocation in an in-memory table whose 8-byte
 /// target lies within `[span_vaddr, span_vaddr + span.len())`; records
 /// outside the span are skipped. Returns the number applied.
@@ -1633,11 +1369,35 @@ pub fn apply_relative_relocs(
     {
         return 0;
     };
+    let Some(span_end) = span_vaddr.checked_add(span.len() as u64)
+    else
+    {
+        return 0;
+    };
     let mut applied = 0u64;
     for rela in iter.flatten()
     {
+        let Some(target_end) = rela.offset.checked_add(8)
+        else
+        {
+            continue;
+        };
+        if rela.offset < span_vaddr || target_end > span_end
+        {
+            continue;
+        }
+        // `rela.offset >= span_vaddr` here, so the difference is exact, and
+        // the whole target lies in `span`, so the lookup succeeds.
+        let pos = rela.offset.saturating_sub(span_vaddr) as usize;
+        let Some(target) = span.get_mut(pos..).and_then(<[u8]>::first_chunk_mut::<8>)
+        else
+        {
+            continue;
+        };
+        let value = bias.wrapping_add(rela.addend.cast_unsigned());
+        *target = value.to_le_bytes();
         // At most one per record of `table`, so the count cannot wrap.
-        applied = applied.saturating_add(apply_reloc_in_span(&rela, bias, span_vaddr, span));
+        applied = applied.saturating_add(1);
     }
     applied
 }
@@ -2213,31 +1973,6 @@ mod tests
     }
 
     #[test]
-    fn streaming_matches_in_memory()
-    {
-        let img = build_image(ET_DYN, &std_dynamic());
-        let (ehdr, _) = valid_executable(&img);
-        let header_page = &img[..0x100];
-        let streamed = rela_table_metadata(&ehdr, header_page, img.len() as u64, |off, dst| {
-            let off = off as usize;
-            img.get(off..off + dst.len()).map(|src| {
-                dst.copy_from_slice(src);
-                dst.len()
-            })
-        });
-        assert_eq!(streamed, rela_table(&ehdr, &img));
-    }
-
-    #[test]
-    fn streaming_rejects_failed_read()
-    {
-        let img = build_image(ET_DYN, &std_dynamic());
-        let (ehdr, _) = valid_executable(&img);
-        let failed = rela_table_metadata(&ehdr, &img[..0x100], img.len() as u64, |_, _| None);
-        assert_eq!(failed, Err(ElfError::MalformedDynamic));
-    }
-
-    #[test]
     fn validates_and_applies_relocs()
     {
         let img = build_image(ET_DYN, &std_dynamic());
@@ -2266,34 +2001,6 @@ mod tests
             0
         );
         assert!(other.iter().all(|&b| b == 0));
-    }
-
-    #[test]
-    fn streaming_rejects_oversized_dynamic()
-    {
-        let mut img = build_image(ET_DYN, &std_dynamic());
-        let oversized = (MAX_STREAMING_DYNAMIC + DYN_ENTRY_SIZE) as u64;
-        put(
-            &mut img,
-            64 + 112,
-            &phdr_bytes(
-                PT_DYNAMIC,
-                PF_R | PF_W,
-                DYN_OFF,
-                DYN_OFF,
-                oversized,
-                oversized,
-            ),
-        );
-        let (ehdr, _) = valid_executable(&img);
-        let streamed = rela_table_metadata(&ehdr, &img[..0x100], 1 << 20, |off, dst| {
-            let off = off as usize;
-            img.get(off..off + dst.len()).map(|src| {
-                dst.copy_from_slice(src);
-                dst.len()
-            })
-        });
-        assert_eq!(streamed, Err(ElfError::MalformedDynamic));
     }
 
     #[test]
@@ -2345,10 +2052,6 @@ mod tests
             tls_segment(&ehdr, &img),
             Err(ElfError::SegmentOverflow)
         ));
-        assert!(matches!(
-            tls_segment_metadata(&ehdr, &img, 0x400),
-            Err(ElfError::SegmentOverflow)
-        ));
         // A template that fills its block exactly is taken.
         put(
             &mut img,
@@ -2357,14 +2060,6 @@ mod tests
         );
         assert!(matches!(
             tls_segment(&ehdr, &img),
-            Ok(Some(TlsSegment {
-                filesz: 0x20,
-                memsz: 0x20,
-                ..
-            }))
-        ));
-        assert!(matches!(
-            tls_segment_metadata(&ehdr, &img, 0x400),
             Ok(Some(TlsSegment {
                 filesz: 0x20,
                 memsz: 0x20,
@@ -2386,24 +2081,12 @@ mod tests
             Some(Err(ElfError::PhdrTableOverflow))
         ));
         assert!(matches!(
-            load_segments_metadata(&ehdr, short, FILE_SIZE as u64).next(),
-            Some(Err(ElfError::PhdrTableOverflow))
-        ));
-        assert!(matches!(
             tls_segment(&ehdr, short),
-            Err(ElfError::PhdrTableOverflow)
-        ));
-        assert!(matches!(
-            tls_segment_metadata(&ehdr, short, FILE_SIZE as u64),
             Err(ElfError::PhdrTableOverflow)
         ));
         assert_eq!(load_span(&ehdr, short), Err(ElfError::PhdrTableOverflow));
         assert_eq!(relro_span(&ehdr, short), Err(ElfError::PhdrTableOverflow));
         assert_eq!(rela_table(&ehdr, short), Err(ElfError::PhdrTableOverflow));
-        assert_eq!(
-            rela_table_metadata(&ehdr, short, FILE_SIZE as u64, |_, _| None),
-            Err(ElfError::PhdrTableOverflow)
-        );
     }
 
     // ── Note locator ────────────────────────────────────────────────────────
@@ -2682,10 +2365,6 @@ mod tests
         );
         let (ehdr, _) = valid_executable(&img);
         assert_eq!(parse_stack_note(&ehdr, &img), Some(24));
-        assert_eq!(
-            parse_stack_note_streaming(&ehdr, img.len() as u64, streamed(&img)),
-            Some(24)
-        );
     }
 
     #[test]
@@ -2697,9 +2376,5 @@ mod tests
         );
         let (ehdr, _) = valid_executable(&img);
         assert_eq!(parse_stack_note(&ehdr, &img), None);
-        assert_eq!(
-            parse_stack_note_streaming(&ehdr, img.len() as u64, streamed(&img)),
-            None
-        );
     }
 }

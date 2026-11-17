@@ -35,7 +35,7 @@ services/svctest/
         │                      # object-slab release; deferred reclaim; identity;
         │                      # physical base withheld; frames zeroed at hand-out
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,
-        │                      # spawned IPC buffers in the arena; stack note
+        │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention

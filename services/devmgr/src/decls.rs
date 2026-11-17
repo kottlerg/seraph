@@ -56,34 +56,51 @@ const MAX_ENTRY_NAME: usize = 255;
 /// driver module rather than a platform description table.
 const ELF_MAGIC: &[u8] = b"\x7fELF";
 
-/// Where devmgr starts a driver from.
-#[derive(Clone, Copy)]
+/// Where devmgr starts a driver from, with the exact size and the name
+/// procmgr verifies its signature under.
 pub enum Binary
 {
-    /// A boot module: devmgr's Memory cap on it.
-    Module(u64),
-    /// A drivers-directory entry: the file node cap the walk returned, and
-    /// its size.
+    /// A boot module: devmgr's Memory cap on it, its size in bytes, and its
+    /// bundle entry name.
+    Module
+    {
+        cap: u64,
+        size: u64,
+        name: Box<[u8]>,
+    },
+    /// A drivers-directory entry: the file node cap the walk returned, its
+    /// size, and its install path (the directory's path and the entry name).
     File
     {
-        cap: u64, size: u64
+        cap: u64,
+        size: u64,
+        name: Box<[u8]>,
     },
 }
 
 impl Binary
 {
     /// A copy of the binary for one driver's create call, which consumes
-    /// it; `None` when the copy cannot be derived.
-    pub fn source_copy(&self) -> Option<spawn::CreateSource>
+    /// the cap copy; the name is borrowed. `None` when the copy cannot be
+    /// derived.
+    pub fn source_copy(&self) -> Option<spawn::CreateSource<'_>>
     {
-        match *self
+        match self
         {
-            Self::Module(cap) => syscall::cap_derive(cap, syscall::RIGHTS_ALL)
+            Self::Module { cap, size, name } => syscall::cap_derive(*cap, syscall::RIGHTS_ALL)
                 .ok()
-                .map(spawn::CreateSource::Module),
-            Self::File { cap, size } => syscall::cap_derive(cap, syscall::RIGHTS_ALL)
+                .map(|cap| spawn::CreateSource::Module {
+                    cap,
+                    size: *size,
+                    name,
+                }),
+            Self::File { cap, size, name } => syscall::cap_derive(*cap, syscall::RIGHTS_ALL)
                 .ok()
-                .map(|file_cap| spawn::CreateSource::File { file_cap, size }),
+                .map(|file_cap| spawn::CreateSource::File {
+                    file_cap,
+                    size: *size,
+                    name,
+                }),
         }
     }
 
@@ -92,11 +109,16 @@ impl Binary
     /// once the boot pass ends.
     pub fn release(&self)
     {
-        let cap = match *self
+        let _ = syscall::cap_delete(self.cap());
+    }
+
+    /// devmgr's cap on the binary.
+    pub const fn cap(&self) -> u64
+    {
+        match self
         {
-            Self::Module(cap) | Self::File { cap, .. } => cap,
-        };
-        let _ = syscall::cap_delete(cap);
+            Self::Module { cap, .. } | Self::File { cap, .. } => *cap,
+        }
     }
 }
 
@@ -162,9 +184,10 @@ fn zeroed(name: &str, len: usize) -> Option<Vec<u8>>
 /// ([`classify_modules`]).
 pub struct BootModules
 {
-    /// Each driver module with its declaration; devmgr keeps the module cap
-    /// until a bind pass consumes or releases it.
-    pub drivers: Vec<(DriverDecl, u64)>,
+    /// Each driver module with its declaration, as a [`Binary::Module`] of
+    /// its size and bundle entry name; devmgr keeps the module cap until a
+    /// bind pass consumes or releases it.
+    pub drivers: Vec<(DriverDecl, Binary)>,
     /// Each platform description table, parsed; its module cap is released.
     pub tables: Vec<PlatformTable>,
 }
@@ -181,13 +204,21 @@ pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
         drivers: Vec::new(),
         tables: Vec::new(),
     };
-    for (module_cap, module_bytes) in core::mem::take(&mut caps.modules)
+    for module in core::mem::take(&mut caps.modules)
     {
-        match with_module(caps, module_cap, module_bytes, classify)
+        let module_cap = module.cap;
+        match with_module(caps, module_cap, module.size, classify)
         {
             Some(Classified::Driver(decl)) if out.drivers.try_reserve(1).is_ok() =>
             {
-                out.drivers.push((decl, module_cap));
+                out.drivers.push((
+                    decl,
+                    Binary::Module {
+                        cap: module_cap,
+                        size: module.size,
+                        name: module.name,
+                    },
+                ));
                 continue;
             }
             Some(Classified::Table(table)) if out.tables.try_reserve(1).is_ok() =>

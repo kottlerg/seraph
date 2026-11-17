@@ -416,6 +416,12 @@ spawner's `root_dir_cap()` (parent-inherit); explicit override via
 path and delivers the resulting cap as the child's initial
 `current_dir_cap`.
 
+`Command::spawn` names the binary to procmgr by its path from the spawner's root, with `/` before
+each component, and maps `SIGNATURE_REFUSED` to `io::ErrorKind::PermissionDenied`; a process whose
+own object is signed as a program starts programs only
+([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#image-verification)
+§ Image Verification).
+
 A cap on an unmounted filesystem is dead: vfsd's `UNMOUNT` revokes the
 driver's endpoint, which frees every cap derived from it in every
 `CSpace`

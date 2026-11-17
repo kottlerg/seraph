@@ -13,8 +13,7 @@
 //! 1. [`startup`] first — argv/env/stack/TLS bring-up before anything
 //!    else touches them.
 //! 2. [`fs_opens`], [`fs_ipc`], [`fs_std`], and [`fs_faults`] near the end
-//!    (but before [`pwrmgr`]), and [`layout::after_fs`] after them: it
-//!    writes a fixture under `/data/svctest`. [`fs_opens`] comes before
+//!    (but before [`pwrmgr`]). [`fs_opens`] comes before
 //!    [`fs_ipc`]: its eviction phase needs `/data`'s page cache cold (slots
 //!    not yet provisioned), and it writes the slot-reuse file that
 //!    `fs_ipc`'s slot-reuse phase reads and removes.
@@ -102,7 +101,6 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::phases_pre_relative());
     out.extend_from_slice(fs_std::phases());
     out.extend_from_slice(fs_faults::phases());
-    out.extend_from_slice(layout::after_fs());
     out.extend_from_slice(namespace::late());
     out.extend_from_slice(procmgr::command_phases());
     out.extend_from_slice(startup::late());

@@ -336,7 +336,10 @@ impl Hotplug
             {
                 continue;
             }
-            let dir = registry.lock().drivers_dir_cap;
+            let (dir, dir_path) = {
+                let state = registry.lock();
+                (state.drivers_dir_cap, state.drivers_dir_path)
+            };
             if dir == 0
             {
                 std::os::seraph::log!(
@@ -349,6 +352,7 @@ impl Hotplug
                 records,
                 carve,
                 dir,
+                dir_path.as_bytes(),
                 watch,
                 registry,
                 ipc_buf,

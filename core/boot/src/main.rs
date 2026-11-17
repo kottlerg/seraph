@@ -888,12 +888,20 @@ fn bundle_entry(bytes: &[u8], index: u32) -> Result<(bundle::BundleEntryHeader, 
 /// `ctx.bs` must be valid pre-`ExitBootServices`.
 unsafe fn copy_trust_store(ctx: &UefiContext, store: &[u8]) -> Result<BootModule, BootError>
 {
+    let pages = store.len().div_ceil(4096);
+    let span = pages.checked_mul(4096).ok_or(BootError::OutOfMemory)?;
     // SAFETY: bs is valid (caller contract).
-    let phys = unsafe { allocate_pages(ctx.bs, store.len().div_ceil(4096))? };
-    // SAFETY: phys is a fresh allocation of at least `store.len()` bytes,
+    let phys = unsafe { allocate_pages(ctx.bs, pages)? };
+    // SAFETY: phys is a fresh allocation of `pages` pages, `span` bytes,
     // identity-mapped by UEFI, which nothing else references.
-    let copy = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, store.len()) };
-    copy.copy_from_slice(store);
+    let copy = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, span) };
+    // Zero the slack after the store too: the module's Memory cap covers
+    // whole pages and reaches userspace, so no stale firmware bytes may.
+    copy.fill(0);
+    for (out, &byte) in copy.iter_mut().zip(store)
+    {
+        *out = byte;
+    }
     let mut name = [0u8; BOOT_MODULE_NAME_LEN];
     for (out, &byte) in name.iter_mut().zip(TRUST_STORE_MODULE)
     {

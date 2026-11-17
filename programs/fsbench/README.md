@@ -57,7 +57,10 @@ reads the full size through as many `read` calls as the path's buffer needs: 144
 memory-cap calls for 64 KiB. A memory-cap `read` that returns `Interrupted` (std discarded a copy
 whose page the driver may have released during it) is read again inside the same timed iteration, so
 such an iteration makes one more `read` call than the size needs for each retry, and its cycles
-include them. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. A timed iteration that
+include them. Cycles come from `rdtsc` on x86_64 and `csrr cycle` on riscv64. Each timed iteration
+blocks on the filesystem driver, and riscv64 keeps no two harts' `cycle` counters in step, so
+`fsbench` pins its thread to CPU 0 before it opens the fixture; the open, the fixture check and the
+warm-up iterations, which block on the driver too, leave it running there. A timed iteration that
 reads fewer bytes than the size panics.
 
 ---
@@ -76,9 +79,9 @@ arch=<arch> size=<bytes> path=<path> iters=<n> cycles_min=<n> cycles_mean=<n> cy
 Each `cycles_*` value is taken over the timed iterations, and one iteration covers all the
 `read` calls that one size needs, not a single call.
 
-A failed open, fixture check, seek, or read, or an `ITERS` that is not a positive integer, panics,
-so the process exits unsuccessfully and the `fs_crossover_bench` phase fails; a memory-cap `read`
-that returns `Interrupted` is retried, not a failure.
+A failed pin, open, fixture check, seek, or read, or an `ITERS` that is not a positive integer,
+panics, so the process exits unsuccessfully and the `fs_crossover_bench` phase fails; a memory-cap
+`read` that returns `Interrupted` is retried, not a failure.
 
 ---
 

@@ -82,9 +82,11 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   the events quiesced for 10 s (`SLEEP_GRACE`), the wait after which ACPICA takes an S5
   write as not taken; when the platform still runs then, acpid enables the GPEs again, logs
   `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and dispatches each
-  GPE latched meanwhile. The power button is left as the quiesce left it: a press taken before
-  or during the sleep is delivered once, by the `WAIT_EVENT` it is posted to, which enables
-  the button again.
+  GPE that was enabled before the sleep and latched meanwhile. A GPE that had fired before the
+  sleep is left disabled for its queued method, which enables it again, and the power button
+  is left as the quiesce left it: a press taken before or during the sleep is delivered once, by
+  the `WAIT_EVENT` it is posted to, which enables the button again. So each event is handled
+  once.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and

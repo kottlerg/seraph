@@ -311,18 +311,32 @@ pub fn clear(regs: &mut impl Registers, layout: &Layout)
 /// status of an event acpid took and has not yet handled (a press not yet
 /// delivered, a GPE whose method has not run) is cleared too: the
 /// specification leaves no status set on entry, and the event stays queued
-/// in acpid, though a restart no longer finds it latched. [`resume`]
-/// enables the GPEs again when the platform keeps running.
-pub fn quiesce(regs: &mut impl Registers, layout: &Layout)
+/// in acpid, though a restart no longer finds it latched. The GPE enables
+/// it found are returned, for [`resume`] to enable the GPEs again when the
+/// platform keeps running.
+pub fn quiesce(regs: &mut impl Registers, layout: &Layout) -> Quiesced
 {
-    disable_and_clear(regs, layout, PWRBTN);
+    Quiesced {
+        gpe_enables: disable_and_clear(regs, layout, PWRBTN),
+    }
+}
+
+/// The GPE enables [`quiesce`] found, the byte of each `GPE0` register:
+/// a handled GPE whose enable was clear had fired, and its method was still
+/// to run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use]
+pub struct Quiesced
+{
+    gpe_enables: Vec<u8>,
 }
 
 /// Disable every fixed event but those of `keep`, a mask of
 /// [`FIXED_ENABLE`] bits left as they read, and every GPE; then clear
-/// every status.
-fn disable_and_clear(regs: &mut impl Registers, layout: &Layout, keep: u16)
+/// every status. The GPE enable bytes it read, in register order.
+fn disable_and_clear(regs: &mut impl Registers, layout: &Layout, keep: u16) -> Vec<u8>
 {
+    let mut gpe_enables = Vec::new();
     let enable = regs.read16(layout.pm1_enable());
     regs.write16(layout.pm1_enable(), enable & !(FIXED_ENABLE & !keep));
     let status = regs.read16(layout.pm1_status()) & FIXED_STATUS;
@@ -337,6 +351,7 @@ fn disable_and_clear(regs: &mut impl Registers, layout: &Layout, keep: u16)
         {
             break;
         };
+        gpe_enables.push(regs.read8(en));
         regs.write8(en, 0);
         let status = regs.read8(sts);
         if status != 0
@@ -344,6 +359,7 @@ fn disable_and_clear(regs: &mut impl Registers, layout: &Layout, keep: u16)
             regs.write8(sts, status);
         }
     }
+    gpe_enables
 }
 
 /// Set up the events on acpid's start: disable every fixed event and GPE
@@ -374,19 +390,47 @@ pub fn arm(regs: &mut impl Registers, layout: &Layout, handled: &Handled) -> Fir
 }
 
 /// After a sleep whose `PM1a_CNT` writes returned, the platform still
-/// running: enable again each GPE of `handled` that [`quiesce`] disabled,
-/// except those whose status latched since, which are returned to be
-/// dispatched, still disabled; clear the status of every other fixed event
-/// and GPE. The power button is left as [`quiesce`] left it: a press taken
-/// before or during the sleep is handled, and the button enabled again, by
-/// the path that took it, so it is never returned here.
-pub fn resume(regs: &mut impl Registers, layout: &Layout, handled: &Handled) -> Fired
+/// running: enable again each GPE of `handled` that [`quiesce`] found
+/// enabled (`quiesced`), except those whose status latched since, which are
+/// returned to be dispatched, still disabled; clear the status of every
+/// other fixed event and of every GPE acpid does not handle. A handled GPE
+/// that [`quiesce`] found disabled had fired and waits for its method, which
+/// enables it again ([`gpe_end`]); it is left as it is, as is the power
+/// button: a press taken before or during the sleep is handled, and the
+/// button enabled again, by the path that took it. Neither is returned, so
+/// no event is handed on twice.
+pub fn resume(
+    regs: &mut impl Registers,
+    layout: &Layout,
+    handled: &Handled,
+    quiesced: &Quiesced,
+) -> Fired
 {
     clear_fixed_status(regs, layout, handled);
-    Fired {
-        power_button: false,
-        gpes: arm_gpes(regs, layout, &handled.gpes),
+    let mut fired = Fired::default();
+    for index in 0..layout.gpe_count() / 8
+    {
+        let Some((sts, en)) = layout.gpe_ports(index)
+        else
+        {
+            break;
+        };
+        let mask = gpe_mask(&handled.gpes, index);
+        let enabled = quiesced
+            .gpe_enables
+            .get(usize::from(index))
+            .map_or(0, |&e| e & mask);
+        let status = regs.read8(sts);
+        let clear = status & !mask;
+        if clear != 0
+        {
+            regs.write8(sts, clear);
+        }
+        let pending = status & enabled;
+        fired.gpes.extend(bits(pending, index));
+        regs.write8(en, enabled & !pending);
     }
+    fired
 }
 
 /// Clear the status of every fixed event but the power button when
@@ -689,7 +733,7 @@ mod tests
         let before = (r.word(0x602), r.get(0x628), r.get(0x629));
         assert_eq!(before, (0x4000 | PWRBTN, 0b110, 0b10));
 
-        quiesce(&mut r, &l);
+        let quiesced = quiesce(&mut r, &l);
         // No GPE is enabled when the sleep's writes are reached, and of the
         // fixed events the power button alone; every status is clear.
         for port in 0x628..0x630
@@ -704,7 +748,7 @@ mod tests
         assert_eq!(r.word(0x600), 0);
 
         // The platform keeps running: resuming restores the enables.
-        assert_eq!(resume(&mut r, &l, &armed), Fired::default());
+        assert_eq!(resume(&mut r, &l, &armed, &quiesced), Fired::default());
         assert_eq!((r.word(0x602), r.get(0x628), r.get(0x629)), before);
     }
 
@@ -715,7 +759,7 @@ mod tests
         let mut r = Regs::default();
         let armed = handled(true, &[1, 2]);
         arm(&mut r, &l, &armed);
-        quiesce(&mut r, &l);
+        let quiesced = quiesce(&mut r, &l);
         // A press during the grace: the scan takes it, and its delivery's
         // re-enable waits behind the sleep. GPE 1 latches too.
         r.raise(0x601, PWRBTN_HI);
@@ -727,7 +771,7 @@ mod tests
                 gpes: Vec::new(),
             }
         );
-        let fired = resume(&mut r, &l, &armed);
+        let fired = resume(&mut r, &l, &armed, &quiesced);
         assert_eq!(
             fired,
             Fired {
@@ -753,9 +797,33 @@ mod tests
         arm(&mut r, &l, &handled(true, &[]));
         r.raise(0x601, PWRBTN_HI);
         assert!(scan(&mut r, &l).power_button);
-        quiesce(&mut r, &l);
+        let _ = quiesce(&mut r, &l);
         assert_eq!(r.word(0x602), 0);
         assert_eq!(r.word(0x600), 0);
+    }
+
+    #[test]
+    fn resume_leaves_a_gpe_whose_method_waits_to_its_method()
+    {
+        let l = q35();
+        let mut r = Regs::default();
+        let armed = handled(false, &[1, 2]);
+        arm(&mut r, &l, &armed);
+        // GPE 1 fires before the sleep; its method is queued behind it.
+        r.raise(0x620, 0b10);
+        assert_eq!(scan(&mut r, &l).gpes, vec![1]);
+        let quiesced = quiesce(&mut r, &l);
+        // Both latch in the grace.
+        r.raise(0x620, 0b110);
+        let fired = resume(&mut r, &l, &armed, &quiesced);
+        // GPE 2 is handed on; GPE 1 is not handed on again and stays
+        // disabled, its status kept, until its queued method has run.
+        assert_eq!(fired.gpes, vec![2]);
+        assert_eq!(r.get(0x628), 0);
+        assert_eq!(r.get(0x620), 0b110);
+        gpe_begin(&mut r, &l, 1, Trigger::Edge);
+        gpe_end(&mut r, &l, 1, Trigger::Edge);
+        assert_eq!(r.get(0x628), 0b10);
     }
 
     #[test]

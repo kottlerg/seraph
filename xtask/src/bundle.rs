@@ -166,7 +166,7 @@ pub fn compose_with_levels(
 {
     let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
     let entries = entries(ctx, arch, harness, levels)?;
-    let signer = Signer::for_pack(ctx, arch)?;
+    let signer = Signer::open(ctx, arch)?;
     let bodies = bodies(&signer, &entries)?;
 
     let parent = out_path

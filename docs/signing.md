@@ -410,12 +410,17 @@ temporary directory and discards them.
 (`SERAPH_SIGNER`): it receives the encoded signed attributes on its standard input and writes the
 64-byte signature to its standard output, which is how a hardware token or a CI secret signs. The
 identity directory then holds the signing key's certificate, or its public key when it is a root,
-and the store, and no secret. xtask verifies every signed object under the build's trust store,
-with the kind, name and architecture its loader expects, before it writes it, so neither a faulty
-signer nor a store that does not trust the key can produce an image that fails to boot. A pack
-refuses to sign when the store its environment builds is not the one the installed bootloader was
-built with, which a bootloader build records only once it has installed its image, so every
-object of an image is verified under the store that image's bootloader is built with.
+and the store, and no secret. xtask verifies every signed object under the trust store it builds,
+with the kind, name and architecture its loader expects, before it writes it, so a faulty signer,
+or a store that does not trust the key, fails the pack instead of writing an object its loader
+would refuse.
+
+**Store and bootloader.** Each command derives the store from the signing identity and the
+deployer's store its environment names, and signs under it. Until the bootloader embeds the store
+(§ Implementation Status), nothing ties a pack to a bootloader, since nothing verifies: a pack whose
+environment changed since the bootloader was built signs under another store than that build
+took. Once the bootloader embeds the store, a pack reads the store out of the installed bootloader
+image itself and refuses to sign under another (design intent; not yet implemented).
 
 **Implementation.** The host signer is Seraph's own: no crate from a registry is a dependency
 ([coding-standards.md](coding-standards.md) § Dependencies). Ed25519 key generation and signing

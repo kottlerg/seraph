@@ -612,19 +612,6 @@ const BOOT_RUSTFLAGS: &str = "-Zunstable-options";
 
 fn build_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
 {
-    // The trust store the bootloader is built with, at a fixed path of the
-    // build output, recorded as the installed bootloader's only once the
-    // image is installed (docs/signing.md § Signing).
-    let signer = crate::signing::Signer::open(ctx, args.arch)?;
-    let store = crate::signing::begin_boot_build(ctx, &signer)?;
-    step(&format!("Trust store: {}", store.display()));
-    install_boot(ctx, args)?;
-    crate::signing::finish_boot_build(ctx, &signer)
-}
-
-/// Build the bootloader and install its image into the sysroot.
-fn install_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
-{
     step(&format!(
         "Building bootloader for {} ({})",
         args.arch,
@@ -646,6 +633,12 @@ fn install_boot(ctx: &BuildContext, args: &BuildArgs) -> Result<()>
     {
         flags.push("--release");
     }
+
+    // The trust store the bootloader is built with, at a fixed path of the
+    // build output (docs/signing.md § Signing).
+    let signer = crate::signing::Signer::open(ctx, args.arch)?;
+    let store = crate::signing::write_boot_store(ctx, &signer)?;
+    step(&format!("Trust store: {}", store.display()));
 
     let env = [("RUSTFLAGS", BOOT_RUSTFLAGS)];
     if !args.skip_lints

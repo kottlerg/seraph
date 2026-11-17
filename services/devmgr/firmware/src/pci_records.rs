@@ -30,9 +30,10 @@ pub enum RecordState
     /// Neither a driver devmgr started nor devmgr itself holds the
     /// function; a pass may bind it.
     Unbound,
-    /// A driver was started for the function, or devmgr took it itself as a
+    /// A driver was started for the function, or devmgr took it itself: as a
     /// RISC-V IOMMU unit for the IOMMU driver, whether or not that driver
-    /// starts; no pass binds it again.
+    /// starts, or as the port of a hotplug slot its poller manages; no pass
+    /// binds it again.
     Bound,
     /// The function is gone: no pass matches the record again, and its
     /// address is free for a function that arrives there later.
@@ -118,7 +119,8 @@ impl PciRecords
     }
 
     /// Record that the function of the record at `index` is held: a driver
-    /// was started for it, or devmgr took it as a RISC-V IOMMU unit. Returns
+    /// was started for it, or devmgr took it as a RISC-V IOMMU unit or a
+    /// managed hotplug slot's port. Returns
     /// whether it was unbound; a bound or removed record is left as it is.
     pub fn mark_bound(&mut self, index: usize) -> bool
     {

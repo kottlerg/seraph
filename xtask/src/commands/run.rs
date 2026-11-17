@@ -115,6 +115,7 @@ fn launch(
         firmware_code_path: firmware_code,
         firmware_vars_path: firmware_vars,
         cpus: args.cpus,
+        threads_per_core: args.threads_per_core,
         mem_mib: args.mem,
         display: if args.headless
         {

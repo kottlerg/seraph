@@ -45,8 +45,9 @@ Each surface is classified as one of:
 
 Every syscall returns `Result<u64, SyscallError>` marshalled into a single return
 register (`rax` on x86-64, `a0` on RISC-V) by `TrapFrame::set_return`; multi-value
-returns (IPC, the notification / event-queue / wait-set waits, and the split handlers'
-second cap handle) use the `set_ipc_*` family. No handler returns a raw pointer: the
+returns (IPC, the notification / event-queue / wait-set waits, the split handlers'
+second cap handle, and the badges `SYS_THREAD_GET_FAULT_HANDLER` and `SYS_ENDPOINT_BADGE`
+read) use the `set_ipc_*` family. No handler returns a raw pointer: the
 return type is uniformly integer, and the only address-valued returns are physical
 (class **e**). The dispatch table is `syscall::dispatch`; the full numbered table
 is in [core/kernel/docs/syscalls.md](syscalls.md).
@@ -69,6 +70,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_SYSTEM_INFO(LiveCSpaceCount)` → the number of `CSpace` registry ids in use system-wide, every process's `CSpace`s included; a count that names no id, epoch, or kernel address, readable by any process with no capability | `sysinfo::sys_system_info`, `cap::live_cspace_count` | d |
 | `SYS_SYSTEM_INFO(InstructionCacheSyncs)` → the number of instruction-fetch synchronisations since boot, counted per call, every process's executable maps, protects to executable, and thread-memory writes included; a count that names no address, readable by any process with no capability | `sysinfo::sys_system_info`, `mm::icache::sync_count` | d |
 | `SYS_SYSTEM_INFO(SpeculationControls)` → the transient-execution selection's inputs (the classes the boot CPU's vulnerability table gives kernel action, its predictor behaviours, whether SMT is on, and the control bits its CPUID and `IA32_ARCH_CAPABILITIES` enumerate), the controls selected from them, and the controls in effect on the calling CPU; facts of the CPU model, its microcode, the kernel's build and its fixed selection rule, the same for every caller, which name no address or secret, readable by any process with no capability; x86-64 only | `sysinfo::sys_system_info`, `arch::x86_64::mitigation::info` | d |
+| `SYS_SYSTEM_INFO(SmtSibling)` → the next CPU of a CPU's core in ascending index order, wrapping; a fact of the machine's topology, the same for every caller, which names no address or secret, readable by any process with no capability; on riscv64 every hart is its own core | `sysinfo::sys_system_info`, `topology::sibling_after` | d |
 | `SYS_ASPACE_QUERY` → leaf physical address of a user page, to a holder of `AsRights::READ`, which init's kernel-created address space and an address space retyped from a `PHYS` source alone carry | `sysinfo::sys_aspace_query`, `AddressSpace::query_page`, `cap::sys_cap_create_aspace` | **e** |
 | `SYS_ASPACE_HARVEST` → a bitmap of the user pages of a range whose leaf has its accessed bit set, and their count, to a holder of `AsRights::MAP`; one bit per page, no address, frame, or other page-table field | `mem::sys_aspace_harvest`, `AddressSpace::read_accessed` | d |
 | `SYS_THREAD_READ_REGS` / `WRITE_REGS` → target thread's user `TrapFrame` | `thread::sys_thread_read_regs`, `TrapFrame::sanitize_for_user_resume` | b/d |
@@ -77,6 +79,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_THREAD_READ_EXT_REGS` → bytes of the target thread's extended-state save area (the XSAVE standard-format area on x86-64, the F and V registers and their CSRs on riscv64), which thread creation zeroes and only the thread's own switch-outs write, and the area's size, to a holder of `OBSERVE` on the thread | `thread::sys_thread_read_ext_regs`, `sched::thread_slot::extended_span` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_THREAD_GET_FAULT_HANDLER` → whether a fault class of a thread the caller holds `CONTROL` on is bound (`0` or `1`), and the bound badge (a derivation badge of a cap a binder held, or its copy); no endpoint, capability, or kernel address | `thread::sys_thread_get_fault_handler` | c/d |
+| `SYS_ENDPOINT_BADGE` → the badge of an Endpoint cap the caller holds, to a caller that holds `RECEIVE` on the same endpoint (a derivation badge the endpoint's server or a minter it trusts chose); no capability or kernel address | `cap::sys_endpoint_badge` | c |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |

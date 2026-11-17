@@ -48,19 +48,19 @@ use syscall_abi::{
     SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
     SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENTROPY_CONTRIBUTE,
-    SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
-    SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC,
-    SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
-    SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP, SYS_MMIO_SPLIT,
-    SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL, SYS_SCHED_SPLIT,
-    SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT,
-    SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES,
-    SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS,
-    SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY,
-    SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP,
-    SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD,
-    SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE,
+    SYS_ENTROPY_CONTRIBUTE, SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND,
+    SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
+    SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP,
+    SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
+    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
+    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
+    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
+    SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
+    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
+    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
+    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
+    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -1452,6 +1452,30 @@ pub fn cap_derive_badge(src_slot: u64, rights_mask: u64, badge: u64) -> Result<u
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// Read the badge of `cap`, an Endpoint capability the caller holds, proving
+/// with `recv_cap`, a capability carrying `RIGHTS_EP_RECEIVE` on the same
+/// endpoint, that the caller serves it (`SYS_ENDPOINT_BADGE`). `0` for an
+/// un-badged cap.
+///
+/// A server reads this way the badge of a capability on its own endpoint that
+/// a client handed it, which names what the badge names to the server's
+/// receive path (`docs/capability-model.md` § Badges).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if either handle
+/// is null, stale, empty, or not an Endpoint cap; `InsufficientRights` if
+/// `recv_cap` lacks `RIGHTS_EP_RECEIVE`; `InvalidArgument` if the two caps
+/// name different endpoints.
+#[inline]
+pub fn endpoint_badge(recv_cap: u64, cap: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; both arguments are
+    // cap handles the kernel validates; the badge comes back in the secondary
+    // register.
+    let (ret, badge) = unsafe { syscall5_ret2(SYS_ENDPOINT_BADGE, recv_cap, cap, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(badge) }
+}
+
 /// Delete a capability slot in the caller's `CSpace` (`SYS_CAP_DELETE`).
 ///
 /// Reparents child derivations to the deleted slot's parent (in batches, the
@@ -1738,6 +1762,32 @@ pub fn speculation_controls(view: u64) -> Result<u64, i64>
             SYS_SYSTEM_INFO,
             syscall_abi::SystemInfoType::SpeculationControls as u64,
             view,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// The CPU after `cpu` among the logical CPUs of its core, ascending and
+/// wrapping (`SystemInfoType::SmtSibling`): `cpu` itself when its core runs
+/// no other CPU.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` when `cpu` is at
+/// or past `SystemInfoType::CpuCount`.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "a non-negative return is the queried value"
+)]
+#[inline]
+pub fn smt_sibling(cpu: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the SmtSibling
+    // discriminant and arg1 the CPU index, which the kernel validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::SmtSibling as u64,
+            cpu,
         )
     };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }

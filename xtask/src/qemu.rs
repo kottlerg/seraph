@@ -485,6 +485,11 @@ pub struct QemuLaunchSpec<'a>
     pub firmware_code_path: &'a Path,
     pub firmware_vars_path: Option<&'a Path>,
     pub cpus: u32,
+    /// Logical CPUs per core the guest's topology reports (QEMU
+    /// `-smp <cpus>,threads=<n>`): 1 makes each vCPU a core of its own, 2 pairs
+    /// them as SMT siblings, which the kernel's core spread reads
+    /// (core/kernel/docs/scheduler.md § SMT Awareness). Divides `cpus`.
+    pub threads_per_core: u32,
     /// Guest memory size in MiB.
     pub mem_mib: u32,
     pub display: QemuDisplay,
@@ -545,23 +550,45 @@ fn leading_devices(spec: &QemuLaunchSpec) -> Vec<String>
     }
 }
 
+/// The `-smp` value for `cpus` vCPUs of `threads_per_core` threads each:
+/// the bare count for one thread per core, else `<cpus>,threads=<n>`, from
+/// which QEMU derives the cores.
+///
+/// # Errors
+/// Fails when `cpus` is 0 or past the boot protocol's `MAX_CPUS`, or when
+/// `threads_per_core` does not divide it into whole cores.
+fn smp_arg(cpus: u32, threads_per_core: u32) -> Result<String>
+{
+    // The boot protocol caps a BootInfo's CPU count at MAX_CPUS; a guest with
+    // more vCPUs than that would boot with the surplus dropped.
+    let max_cpus = boot_protocol::MAX_CPUS;
+    if cpus == 0 || usize::try_from(cpus).map_or(true, |c| c > max_cpus)
+    {
+        bail!("--cpus {cpus} out of range: must be 1..={max_cpus} (boot-protocol MAX_CPUS)");
+    }
+    if threads_per_core == 0 || !cpus.is_multiple_of(threads_per_core)
+    {
+        bail!(
+            "--threads-per-core {threads_per_core} does not divide --cpus {cpus} into whole cores"
+        );
+    }
+    if threads_per_core == 1
+    {
+        Ok(cpus.to_string())
+    }
+    else
+    {
+        Ok(format!("{cpus},threads={threads_per_core}"))
+    }
+}
+
 /// Construct the full QEMU argv for a launch spec.
 ///
 /// Pairs with `Arch::qemu_binary()` for the binary name. The returned vector
 /// is suitable for `Command::new(binary).args(&argv)`.
 pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
 {
-    // The boot protocol caps a BootInfo's CPU count at MAX_CPUS; a guest with
-    // more vCPUs than that would boot with the surplus dropped.
-    let max_cpus = boot_protocol::MAX_CPUS;
-    if spec.cpus == 0 || usize::try_from(spec.cpus).map_or(true, |c| c > max_cpus)
-    {
-        bail!(
-            "--cpus {} out of range: must be 1..={} (boot-protocol MAX_CPUS)",
-            spec.cpus,
-            max_cpus
-        );
-    }
+    let smp = smp_arg(spec.cpus, spec.threads_per_core)?;
     if spec.mem_mib == 0
     {
         bail!("--mem 0 is not a bootable guest memory size");
@@ -572,7 +599,7 @@ pub fn build_qemu_argv(spec: &QemuLaunchSpec) -> Result<Vec<String>>
         "-m".into(),
         format!("{}M", spec.mem_mib),
         "-smp".into(),
-        spec.cpus.to_string(),
+        smp,
     ];
     args.extend(leading_devices(spec));
     args.extend([
@@ -1230,6 +1257,7 @@ mod tests
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: Some(Path::new("vars.fd")),
             cpus,
+            threads_per_core: 1,
             mem_mib,
             display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
@@ -1362,6 +1390,23 @@ mod tests
         build_qemu_argv(&riscv_spec(past, 512)).unwrap_err();
     }
 
+    // Defect caught: a threads-per-core count that does not reach QEMU's
+    // -smp (the guest's CPUID reports no SMT siblings), or one that does not
+    // divide the vCPUs passed through to a QEMU that refuses the topology.
+    #[test]
+    fn threads_per_core_reaches_smp_and_must_divide_cpus()
+    {
+        let mut spec = riscv_spec(4, 512);
+        spec.threads_per_core = 2;
+        let argv = build_qemu_argv(&spec).unwrap();
+        let smp = argv.iter().position(|a| a == "-smp").unwrap();
+        assert_eq!(argv[smp + 1], "4,threads=2");
+        spec.threads_per_core = 3;
+        build_qemu_argv(&spec).unwrap_err();
+        spec.threads_per_core = 0;
+        build_qemu_argv(&spec).unwrap_err();
+    }
+
     #[test]
     fn mem_zero_rejected()
     {
@@ -1379,6 +1424,7 @@ mod tests
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: None,
             cpus: 4,
+            threads_per_core: 1,
             mem_mib: 512,
             display: QemuDisplay::Headless,
             gdb: GdbMode::Off,
@@ -1416,6 +1462,7 @@ mod tests
             firmware_code_path: Path::new("code.fd"),
             firmware_vars_path: None,
             cpus: 4,
+            threads_per_core: 1,
             mem_mib: 512,
             display: QemuDisplay::Headless,
             gdb: GdbMode::Off,

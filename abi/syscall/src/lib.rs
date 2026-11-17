@@ -615,11 +615,16 @@ pub const SYS_THREAD_LIST_PAGES: u64 = 67;
 /// capability carrying [`RIGHTS_THREAD_OBSERVE`]. See
 /// `core/kernel/docs/syscalls.md` § `SYS_THREAD_READ_EXT_REGS` (68).
 pub const SYS_THREAD_READ_EXT_REGS: u64 = 68;
+/// Endpoint: read the badge of an Endpoint capability the caller holds, to a
+/// caller that proves it serves that endpoint by a capability carrying
+/// [`RIGHTS_EP_RECEIVE`] on the same endpoint. See
+/// `core/kernel/docs/syscalls.md` § `SYS_ENDPOINT_BADGE` (69).
+pub const SYS_ENDPOINT_BADGE: u64 = 69;
 
 /// One past the highest syscall number. Every number below it is assigned,
 /// and the kernel bounds its dispatch table by it, so a syscall numbered at or
 /// above it raises it.
-pub const SYSCALL_NR_BOUND: u64 = SYS_THREAD_READ_EXT_REGS + 1;
+pub const SYSCALL_NR_BOUND: u64 = SYS_ENDPOINT_BADGE + 1;
 
 /// [`SYS_IRQ_REMAP`] setting (arg1): compatibility formats, a message or an
 /// I/O APIC entry naming its CPU and vector.
@@ -1747,6 +1752,16 @@ pub enum SystemInfoType
     /// `NotSupported` on riscv64, which defines no enumeration of the
     /// classes; `InvalidArgument` for an unknown view.
     SpeculationControls = 13,
+    /// The CPU after the one named in arg1 among the logical CPUs of its core,
+    /// in ascending index order, wrapping: arg1 itself when its core runs no
+    /// other CPU. Following it from any CPU back to that CPU visits its SMT
+    /// siblings, the CPUs that share the core's execution resources. A fact of
+    /// the machine's topology, the same for every caller, readable by any
+    /// process with no capability; ktest reads it to check the rings against
+    /// the topology each CPU reports (core/kernel/docs/scheduler.md § SMT
+    /// Awareness). On riscv64 every hart is its own core. `InvalidArgument`
+    /// for an index at or past `CpuCount`.
+    SmtSibling = 14,
 }
 
 /// `SystemInfoType::SpeculationControls` view: the selection's inputs, a

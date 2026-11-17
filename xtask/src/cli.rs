@@ -519,6 +519,14 @@ args! {
         #[arg(long, default_value = "4")]
         pub cpus: u32,
 
+        /// Logical CPUs per core in the guest's topology (QEMU
+        /// `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT
+        /// sibling pairs, which the kernel's placement spreads threads across
+        /// (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each
+        /// hart as a core of its own whatever this says.
+        #[arg(long, default_value = "1")]
+        pub threads_per_core: u32,
+
         /// Guest memory size in MiB (QEMU -m).
         #[arg(long, default_value = "512")]
         pub mem: u32,
@@ -1139,6 +1147,14 @@ args! {
         /// Number of vCPUs to expose to each guest (QEMU -smp).
         #[arg(long, default_value = "4")]
         pub cpus: u32,
+
+        /// Logical CPUs per core in the guest's topology (QEMU
+        /// `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT
+        /// sibling pairs, which the kernel's placement spreads threads across
+        /// (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each
+        /// hart as a core of its own whatever this says.
+        #[arg(long, default_value = "1")]
+        pub threads_per_core: u32,
 
         /// Guest memory size in MiB (QEMU -m).
         #[arg(long, default_value = "512")]

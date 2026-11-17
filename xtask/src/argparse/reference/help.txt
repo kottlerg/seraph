@@ -158,6 +158,8 @@ Options:
           Show all serial output including pre-boot firmware noise (suppressed by default)
       --cpus <CPUS>
           Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
+      --threads-per-core <THREADS_PER_CORE>
+          Logical CPUs per core in the guest's topology (QEMU `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT sibling pairs, which the kernel's placement spreads threads across (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each hart as a core of its own whatever this says [default: 1]
       --mem <MEM>
           Guest memory size in MiB (QEMU -m) [default: 512]
       --riscv-mmu <RISCV_MMU>
@@ -224,6 +226,11 @@ Options:
           Number of vCPUs to expose to the guest (QEMU -smp)
           
           [default: 4]
+
+      --threads-per-core <THREADS_PER_CORE>
+          Logical CPUs per core in the guest's topology (QEMU `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT sibling pairs, which the kernel's placement spreads threads across (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each hart as a core of its own whatever this says
+          
+          [default: 1]
 
       --mem <MEM>
           Guest memory size in MiB (QEMU -m)
@@ -387,6 +394,8 @@ Options:
           Per-run timeout, in seconds. A run still alive at this point is killed and classified as HANG [default: 30]
       --cpus <CPUS>
           Number of vCPUs to expose to each guest (QEMU -smp) [default: 4]
+      --threads-per-core <THREADS_PER_CORE>
+          Logical CPUs per core in the guest's topology (QEMU `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT sibling pairs, which the kernel's placement spreads threads across (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each hart as a core of its own whatever this says [default: 1]
       --mem <MEM>
           Guest memory size in MiB (QEMU -m) [default: 512]
       --riscv-mmu <RISCV_MMU>
@@ -469,6 +478,11 @@ Options:
           Number of vCPUs to expose to each guest (QEMU -smp)
           
           [default: 4]
+
+      --threads-per-core <THREADS_PER_CORE>
+          Logical CPUs per core in the guest's topology (QEMU `-smp <cpus>,threads=<n>`); must divide `--cpus`. 2 presents SMT sibling pairs, which the kernel's placement spreads threads across (core/kernel/docs/scheduler.md "SMT Awareness"); riscv64 takes each hart as a core of its own whatever this says
+          
+          [default: 1]
 
       --mem <MEM>
           Guest memory size in MiB (QEMU -m)

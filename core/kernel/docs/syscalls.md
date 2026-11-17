@@ -218,9 +218,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  66  SYS_ASPACE_HARVEST
                                  67  SYS_THREAD_LIST_PAGES
                                  68  SYS_THREAD_READ_EXT_REGS
+                                 69  SYS_ENDPOINT_BADGE
 ```
 
-**Implementation status.** Every number 0–68 has a handler; unallocated numbers
+**Implementation status.** Every number 0–69 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -981,6 +982,39 @@ derivation: as for `SYS_CAP_DERIVE`.
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
 `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight on the source),
 `OutOfMemory` and `QuotaExceeded` (as for `SYS_CAP_DERIVE`).
+
+---
+
+### `SYS_ENDPOINT_BADGE` (69)
+
+Read the badge of an Endpoint capability the caller holds, to a caller that proves, with a
+capability carrying Receive on the same endpoint, that it serves that endpoint (see
+[capability-model.md](../../../docs/capability-model.md) § Badges).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `recv_cap` | Endpoint capability (Receive rights), the proof |
+| 1 | `cap` | Endpoint capability (any rights) whose badge is read |
+
+**Return:** `rax`/`a0`: `0` on success, or a `SyscallError`; on success `rdx`/`a1` carries the
+badge of `cap` (`0` for an un-badged cap).
+
+The call succeeds only when both capabilities name the same Endpoint object. A server mints the
+badges on its endpoint, or gives an un-badged source only to minters it trusts, so the badge of a
+capability on its own endpoint names to it what the same badge names on its receive path: a client
+can hand a server a capability, and the server reads which of its badges the capability carries.
+The same-object test keeps the read to the endpoint's server: a badge read from a capability on
+another endpoint would prove nothing, since any holder of an un-badged source mints any badge. The
+call creates no capability, changes neither slot, and returns no kernel address (see
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md)).
+
+**Capability requirement:** `recv_cap` MUST have Receive rights; `cap` needs none.
+
+**Errors:** `InvalidCapability` (either handle null, stale, empty, or not an Endpoint
+capability), `InsufficientRights` (`recv_cap` lacks Receive), `InvalidArgument` (the two
+capabilities name different endpoints).
 
 ---
 
@@ -3236,15 +3270,16 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | `class` or `view` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
+| 1 | `class`, `view` or `cpu` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). `SmtSibling`: the CPU index. Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
 **Capability requirement:** None.
 
-**Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`, or
-unknown `view` for `SpeculationControls`); `NotSupported` (`StackHighWater` handoff class, when
-the kernel could not locate the handoff stack; `SpeculationControls` on riscv64).
+**Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`,
+unknown `view` for `SpeculationControls`, or a `SmtSibling` index at or past `CpuCount`);
+`NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
+stack; `SpeculationControls` on riscv64).
 
 ### `SystemInfoType`
 
@@ -3351,6 +3386,13 @@ pub enum SystemInfoType
     /// ([transient-execution.md](transient-execution.md) § Controls).
     /// `NotSupported` on riscv64, which defines no enumeration of the classes.
     SpeculationControls = 13,
+
+    /// The next CPU of the core that the CPU index in arg1 belongs to, in
+    /// ascending index order, wrapping: arg1 itself when its core has no other
+    /// CPU. `InvalidArgument` for an index at or past `CpuCount`. A fact of the
+    /// machine's topology, the same for every caller, which names no address or
+    /// secret. On riscv64 every hart is its own core.
+    SmtSibling          = 14,
 }
 ```
 

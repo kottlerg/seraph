@@ -105,9 +105,10 @@ scaling, and DRAM rows. The system draws the line as follows.
   example) gives no guarantee that can be stated. Cross-domain isolation is design intent, not
   yet implemented ([#1086](https://github.com/kottlerg/seraph/issues/1086)).
 - **SMT** — stays on. The kernel brings up and schedules every logical CPU, SMT siblings
-  included, as an independent CPU. Siblings are not an isolation boundary: threads of different
-  processes run on the siblings of one core at once, and contention for the resources the
-  siblings share is a channel between them
+  included, as a CPU of its own, and among CPUs of equal load places work on one whose siblings
+  are idle, a preference for throughput. Siblings are not an isolation boundary: threads of
+  different processes run on the siblings of one core at once, and contention for the resources
+  the siblings share is a channel between them
   ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § SMT Awareness).
 - **Accepted and unmitigated** — cache-based side channels outside the transient-execution
   classes above, frequency-scaling (DVFS) channels of the Hertzbleed class, and Rowhammer, at
@@ -255,7 +256,8 @@ what allows userspace memory managers to manage mappings on behalf of a process.
 
 A capability to an IPC endpoint. Rights:
 - **Send** — may call this endpoint (synchronous IPC, caller blocks for reply)
-- **Receive** — may accept calls on this endpoint (held only by the server)
+- **Receive** — may accept calls on this endpoint, and read the badge of a capability on it
+  (`SYS_ENDPOINT_BADGE`, § Badges) (held only by the server)
 - **Grant** — may include capabilities in the message's capability slots
 
 A send capability without grant right cannot pass capabilities to the server.
@@ -598,6 +600,16 @@ Badges are generic: any capability type may carry one. For endpoints, the kernel
 delivers the badge on `ipc_recv`. For other types, the badge is stored but not
 automatically delivered — userspace may use it for bookkeeping.
 
+A server may also read the badge of a capability on its own endpoint that a client
+hands it, with `SYS_ENDPOINT_BADGE`, which answers only a caller holding a Receive
+capability on the same endpoint object. The badges on an endpoint are minted by its
+server or by the minters it gave an un-badged source, so the badge names to the
+server what the same badge names on its receive path: a capability a client passes
+names one of the server's own objects, and the client's authority over that object
+is the capability, not a value it states. The same-object test is what keeps the read
+the server's: anyone can mint any badge on an endpoint it holds an un-badged source
+of, so a badge read from a capability on another endpoint would prove nothing
+([syscalls.md](../core/kernel/docs/syscalls.md) § `SYS_ENDPOINT_BADGE` (69)).
 ### Kernel guarantees
 
 `SYS_CAP_DERIVE_BADGE` enforces two invariants:

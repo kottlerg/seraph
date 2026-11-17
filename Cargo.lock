@@ -506,6 +506,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "objsig"
+version = "0.1.4"
+dependencies = [
+ "crypto",
+ "crypto-testkit",
+]
+
+[[package]]
 name = "pipefault"
 version = "0.1.4"
 

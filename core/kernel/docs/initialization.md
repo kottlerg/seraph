@@ -299,7 +299,8 @@ address, the reason, and the span's end.
    supervisor-level IMSIC or a count outside 63..=2047 (`sched::init_storage`); then the entropy
    subsystem's per-CPU CSPRNGs, central pool, jitter accumulators, and self-test sample slab
    (`entropy::init_storage`); then the per-CPU syscall scratch buffers, 4 KiB each
-   (`syscall::scratch::init_storage`)
+   (`syscall::scratch::init_storage`); then the SMT topology's per-CPU core-key slots (8 B each)
+   and sibling-ring entries (4 B each) (`topology::init_storage`)
 5. Allocate the frame map table: a chunk table with one slot per GiB of the DRAM span,
    and one 1 MiB chunk of per-frame user-mapping counts for each GiB that holds RAM
    (`mm::frame_map::init`; see [memory-internals.md](memory-internals.md) § Frame Map Table)
@@ -647,6 +648,7 @@ The scratch pages and bundle layout are described in
    c. Register the idle TCB as the CPU scheduler's idle and current thread (set_idle,
       set_current)
 3. Emit: "scheduler initialised, N CPUs"
+3a. Record the boot CPU's core key (`topology::record_this_cpu(0)`) before starting the APs
 4. For each AP listed in BootInfo.cpu_ids[1..cpu_count]:
    a. Patch per-AP startup parameters into the trampoline page
    b. Send SIPI (x86-64) / SBI HSM hart_start (RISC-V)
@@ -654,7 +656,10 @@ The scratch pages and bundle layout are described in
       increments it with a Release fetch_add once online) before launching the next AP
       (the Acquire load doubles as the barrier guaranteeing the AP has
       jumped from the trampoline page to its kernel-VA entry). The spin is bounded by
-      elapsed time, AP_ONLINE_BUDGET_US per AP.
+      elapsed time, AP_ONLINE_BUDGET_US per AP. Before that increment the AP records its
+      core key (`topology::record_this_cpu(cpu_id)` in `kernel_entry_ap`).
+4a. Build the sibling rings (`topology::build_sibling_rings`): halts by name when a CPU's key
+   is missing or repeated; emits "topology: N core(s), at most M thread(s) per core"
 5. Run the entropy power-on self-test across all online CPUs: each CPU captured
    a sample from its generator during bringup, and the BSP now checks per-CPU
    independence and basic sanity, printing PASS/FAIL.

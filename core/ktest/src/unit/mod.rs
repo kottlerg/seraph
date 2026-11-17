@@ -121,6 +121,11 @@ pub fn run_all(ctx: &TestContext)
         "cap::derive_badge_on_notification",
         cap::derive_badge_on_notification(ctx)
     );
+    run_test!("cap::endpoint_badge_reads", cap::endpoint_badge_reads(ctx));
+    run_test!(
+        "cap::endpoint_badge_refusals",
+        cap::endpoint_badge_refusals(ctx)
+    );
     run_test!(
         "cap::cspace_teardown_multibatch",
         cap::cspace_teardown_multibatch(ctx)
@@ -814,6 +819,10 @@ pub fn run_all(ctx: &TestContext)
     run_test!(
         "sysinfo::speculation_controls_views",
         sysinfo::speculation_controls_views(ctx)
+    );
+    run_test!(
+        "sysinfo::smt_sibling_range",
+        sysinfo::smt_sibling_range(ctx)
     );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────

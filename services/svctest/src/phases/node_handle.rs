@@ -76,6 +76,8 @@ const CHILD_NOT_LOWERED: i32 = 6;
 /// Exit code: a grant under a max lowered below the usage was not refused
 /// with `LIMIT`.
 const CHILD_NO_LIMIT_LOWERED: i32 = 7;
+/// Exit code: the max was not raised back to the usage within [`EVENT_WAIT`].
+const CHILD_NOT_RAISED: i32 = 8;
 
 /// Pages of each grant the fill asks for while more are left under the max;
 /// halved when memmgr has no contiguous run so long.
@@ -379,7 +381,8 @@ fn child_node()
          {CHILD_NO_MAX}=started with no max, {CHILD_FILL_FAILED}=a grant under the max failed, \
          {CHILD_NO_LIMIT}=a grant past the max not refused with LIMIT, \
          {CHILD_NOT_LOWERED}=the max never fell below the usage, {CHILD_NO_LIMIT_LOWERED}=a \
-         grant under the lowered max not refused with LIMIT, a fault reason=the child was killed"
+         grant under the lowered max not refused with LIMIT, {CHILD_NOT_RAISED}=the max never \
+         rose back to the usage, a fault reason=the child was killed"
     );
     // The child's handle state, and that of the sub-node made through it, went
     // with the child.
@@ -431,7 +434,9 @@ fn arm_child_node(node: u64) -> (u64, u64, u64)
 
 /// The running child fills its node to the max `set`, which signals the
 /// limit event on `sig`, and its usage read through the handle `node` is
-/// the max; lowering the max below the usage then reclaims nothing.
+/// the max; lowering the max below the usage then reclaims nothing. The child
+/// stays alive, and its handle state with it, until the max is raised back to
+/// `set` after the last read.
 fn at_max_then_lowered(node: u64, sig: u64, set: u64)
 {
     await_limit(sig, "the child's fill to its max");
@@ -461,6 +466,13 @@ fn at_max_then_lowered(node: u64, sig: u64, set: u64)
     let (after, max, _) = node_usage(node, "NODE_QUERY_USAGE after the lowering");
     assert_eq!(max, lowered, "the lowered max did not hold");
     assert_eq!(after, own, "lowering the child's max reclaimed pages");
+    expect(
+        node,
+        memmgr_labels::NODE_SET_MAX,
+        &[set],
+        memmgr_errors::SUCCESS,
+        "NODE_SET_MAX back to the child's max",
+    );
 }
 
 /// The handle `handle` (`whose`, for the messages) is refused within
@@ -488,8 +500,9 @@ fn gone_with_child(handle: u64, whose: &str)
 
 /// Child role: fill the node whose max the phase set to that max, check that
 /// one page more is refused with `LIMIT`, wait until the phase lowers the max
-/// below the usage, and check that a page is still refused with `LIMIT`. Exits
-/// 0, or with the step's exit code.
+/// below the usage, check that a page is still refused with `LIMIT`, and wait
+/// until the phase raises the max back to the usage, which it does after its
+/// last read through the child's handle. Exits 0, or with the step's exit code.
 ///
 /// No step after the fill allocates from the heap or grows a stack, since
 /// memmgr refuses this process every further page.
@@ -521,13 +534,32 @@ fn node_child_main() -> !
                 {
                     exit(CHILD_NO_LIMIT_LOWERED);
                 }
-                exit(0);
+                await_raised(own);
             }
             Some(_) => std::thread::yield_now(),
             None => exit(CHILD_USAGE_QUERY_FAILED),
         }
     }
     exit(CHILD_NOT_LOWERED);
+}
+
+/// Wait until the child's max is back at or above its usage `own`, then exit 0;
+/// exit [`CHILD_NOT_RAISED`] after [`EVENT_WAIT`].
+fn await_raised(own: u64) -> !
+{
+    use std::process::exit;
+
+    let start = Instant::now();
+    while start.elapsed() < EVENT_WAIT
+    {
+        match budget::memory_usage()
+        {
+            Some((_, max, _)) if max >= own => exit(0),
+            Some(_) => std::thread::yield_now(),
+            None => exit(CHILD_USAGE_QUERY_FAILED),
+        }
+    }
+    exit(CHILD_NOT_RAISED);
 }
 
 /// Take contiguous grants until the child's subtree reaches `max`. Each

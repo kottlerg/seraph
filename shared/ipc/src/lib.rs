@@ -4087,13 +4087,15 @@ pub mod stream_labels
 }
 
 /// Badge bits that endpoints gating a label on a verb-bit use for it: each
-/// `*_AUTHORITY` constant in this crate is one of these bits. A minter whose
-/// badges carry other information onto such an endpoint keeps them clear —
-/// procmgr's random per-process badge, stamped on the child's svcmgr-registry
-/// and procmgr SENDs — so only a server's trusted minters set a verb bit
-/// (docs/capability-model.md § Verb-bit authority pattern). Endpoints with no
-/// verb gate (bootstrap endpoints, memmgr, namespace node caps) do not
-/// reserve them.
+/// `*_AUTHORITY` constant in this crate is one of these bits, as are
+/// `procmgr_labels::PROCESS_HANDLE_TAG` and `memmgr_labels::NODE_HANDLE_TAG`.
+/// A minter whose badges carry other information onto such an endpoint keeps
+/// them clear — procmgr's random per-process badge, stamped on the child's
+/// svcmgr-registry and procmgr SENDs, and memmgr's per-process badges, which
+/// keep bits 58 to 62 clear and use bit 63 for the phys class — so only a
+/// server's trusted minters set a verb bit (docs/capability-model.md § Verb-bit
+/// authority pattern). Endpoints with no verb gate (bootstrap endpoints,
+/// namespace node caps) do not reserve them.
 pub const VERB_BIT_MASK: u64 =
     (1u64 << 63) | (1u64 << 62) | (1u64 << 61) | (1u64 << 60) | (1u64 << 59) | (1u64 << 58);
 const _: () = core::assert!(

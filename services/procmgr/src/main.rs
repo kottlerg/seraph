@@ -1776,8 +1776,9 @@ fn arm_and_reply_create(
 /// Reply with a successful process creation result, or destroy the child
 /// when the reply cannot deliver it.
 ///
-/// Reply caps: `[process_handle, thread, release_token?]`, the token only for a
-/// `CREATE_DMA_HOLD` child; `data[0]` is the max the child's memmgr budget
+/// Reply caps: `[process_handle, thread, release_token?, node_handle?]`, the
+/// token only for a `CREATE_DMA_HOLD` child and the node handle only for a
+/// `CREATE_NODE_HANDLE` one; `data[0]` is the max the child's memmgr budget
 /// node took, `u64::MAX` for none. The reply's cap transfer is all-or-nothing: when
 /// the caller's `CSpace` cannot take every cap (or the caller is gone), the
 /// caller resumes with `IPC_REPLY_TRANSFER_FAILED` and no caps, and every cap

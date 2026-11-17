@@ -1698,7 +1698,7 @@ pub fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
 /// so each user is given a derivation and none loses the page to another.
 /// Returns `None` when no kept window decodes the function, the carve
 /// fails, or the cache cannot grow (nothing is carved then).
-fn config_page(caps: &mut caps::DevmgrCaps, address: (u16, u8, u8, u8)) -> Option<u64>
+pub fn config_page(caps: &mut caps::DevmgrCaps, address: (u16, u8, u8, u8)) -> Option<u64>
 {
     if let Some(&(_, cap)) = caps.config_pages.iter().find(|(a, _)| *a == address)
     {
@@ -2180,7 +2180,7 @@ impl DeviceReset
 /// the device (a capability pointer) reaches nothing past the page; an access
 /// that fails the check reads all ones and writes nothing, as a function that
 /// does not answer.
-struct ConfigRegs
+pub struct ConfigRegs
 {
     va: u64,
 }
@@ -2193,7 +2193,7 @@ impl ConfigRegs
     /// `va` is the base of a mapping of the whole configuration page that
     /// outlives the returned value and that nothing reaches but raw volatile
     /// accesses (`FunctionConfig::mapped`).
-    unsafe fn new(va: u64) -> Self
+    pub unsafe fn new(va: u64) -> Self
     {
         Self { va }
     }
@@ -2207,7 +2207,8 @@ impl ConfigRegs
             .then(|| self.va.wrapping_add(u64::from(offset)))
     }
 
-    fn read8(&self, offset: u16) -> u8
+    /// Read the byte at `offset`; all ones outside the page.
+    pub fn read8(&self, offset: u16) -> u8
     {
         // SAFETY: `at` checked the byte within the page `new`'s contract maps.
         self.at(offset, 1).map_or(u8::MAX, |a| unsafe {
@@ -2224,7 +2225,8 @@ impl ConfigRegs
         }
     }
 
-    fn read16(&self, offset: u16) -> u16
+    /// Read the 16-bit register at `offset`; all ones outside the page or unaligned.
+    pub fn read16(&self, offset: u16) -> u16
     {
         // SAFETY: `at` checked the register within the page `new`'s contract
         // maps and aligned to its width.
@@ -2233,7 +2235,8 @@ impl ConfigRegs
         })
     }
 
-    fn write16(&self, offset: u16, value: u16)
+    /// Write the 16-bit register at `offset`; nothing outside the page or unaligned.
+    pub fn write16(&self, offset: u16, value: u16)
     {
         if let Some(a) = self.at(offset, 2)
         {
@@ -2242,7 +2245,8 @@ impl ConfigRegs
         }
     }
 
-    fn read32(&self, offset: u16) -> u32
+    /// Read the 32-bit register at `offset`; all ones outside the page or unaligned.
+    pub fn read32(&self, offset: u16) -> u32
     {
         // SAFETY: as for `read16`, at its own width.
         self.at(offset, 4).map_or(u32::MAX, |a| unsafe {
@@ -2250,7 +2254,8 @@ impl ConfigRegs
         })
     }
 
-    fn write32(&self, offset: u16, value: u32)
+    /// Write the 32-bit register at `offset`; nothing outside the page or unaligned.
+    pub fn write32(&self, offset: u16, value: u32)
     {
         if let Some(a) = self.at(offset, 4)
         {

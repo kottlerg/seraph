@@ -215,7 +215,11 @@ Each feature is classified per architecture as one of:
   supervisor-level IMSIC file per hart at the layout the firmware tables report (both from
   `BootInfo.kernel_mmio`). The kernel halts the boot without them (see
   [initialization.md](../core/kernel/docs/initialization.md) § Phase 5: Architecture Hardware
-  Initialisation). Under emulation this needs QEMU ≥ 9.0, the first release whose `ssaia` and
+  Initialisation). Under Smstateen the M-mode firmware must also grant S-mode the AIA CSRs the
+  kernel uses: `siselect` and `sireg` through `mstateen0.CSRIND`, and `stopei` and the IMSIC file
+  behind `sireg` through `mstateen0.IMSIC`. Each hart's first access to them recovers from a trap
+  and halts the boot with a message naming both bits (`aia::init_hart`); OpenSBI grants both on a
+  hart with Smaia. Under emulation this needs QEMU ≥ 9.0, the first release whose `ssaia` and
   `smaia` CPU properties are not experimental, and `-machine virt,aia=aplic-imsic`
   ([build-system.md](build-system.md) § QEMU and Firmware).
 - **Sstc — `stimecmp`** — the supervisor timer.
@@ -235,12 +239,14 @@ Each feature is classified per architecture as one of:
   state enabled (the custom state of `C`, the Zfinx `fcsr` of `FCSR`, which is read-only zero on a
   hart with F, the Zcmt `jvt` of `JVT`, and every bit a later extension defines) and halts the
   boot when the write does not read back
-  (`core/kernel/src/arch/riscv64/cpu.rs`, `disable_unswitched_user_state`). `sstateen1` to
+  (`core/kernel/src/arch/riscv64/cpu.rs`, `disable_unswitched_user_state`), then writes `senvcfg`
+  whole with 0 and halts the boot when that write does not read back either. `sstateen1` to
   `sstateen3` are not written: no ratified extension defines state in them. The M-mode firmware
-  must grant S-mode the CSR (`mstateen0.SE0`); OpenSBI does so on a hart with Smstateen, the
-  M-mode part of the extension, which the firmware alone uses. The RVA23 floor mandates
-  Ssstateen, so requiring it excludes no in-floor hardware. Under emulation the CPU model must
-  enable Smstateen (`smstateen=on`, [build-system.md](build-system.md) § QEMU and Firmware).
+  must grant S-mode both CSRs, `sstateen0` through `mstateen0.SE0` and `senvcfg` through
+  `mstateen0.ENVCFG`, since Smstateen gates S-mode's `senvcfg` too; OpenSBI grants both on a hart
+  with Smstateen, the M-mode part of the extension, which the firmware alone uses. The RVA23 floor
+  mandates Ssstateen, so requiring it excludes no in-floor hardware. Under emulation the CPU model
+  must enable Smstateen (`smstateen=on`, [build-system.md](build-system.md) § QEMU and Firmware).
 - **`time` CSR (Zicntr)** — the timestamp source.
 - **Address translation**: one of Sv39/Sv48/Sv57, negotiated at boot (DTB
   `mmu-type` claim, confirmed by a `satp` write-probe that falls back to the next-narrower mode;
@@ -337,12 +343,13 @@ feature it halts with a message naming the specific feature, rather than failing
   hart's named message covers a malformed `vlenb`. Ssstateen is asserted by access on every hart,
   the boot hart in Phase 5 and each secondary hart at its bring-up: a hart without it, or whose
   firmware keeps `sstateen0` from S-mode, traps at the write, and the trap's fixup halts the boot
-  with a message naming Ssstateen, as does a write that does not read back. Extension requirements
-  introduced by a subsystem (the timer, the paging extensions, AIA) are asserted by that subsystem
-  during boot — the timer, for example, refuses to boot unless the bootloader confirmed Sstc (and a
-  timebase frequency) for every hart from the firmware tables (ACPI RHCT, or the DTB `/cpus`
-  nodes), and the interrupt initialisation unless it confirmed Ssaia for every hart and reported a
-  supervisor-level APLIC domain and IMSIC layout.
+  with a message naming Ssstateen, as does a write that does not read back; a hart whose firmware
+  keeps `senvcfg` from S-mode (`mstateen0.ENVCFG` clear) halts the same way, with a message naming
+  `senvcfg` and that bit. Extension requirements introduced by a subsystem (the timer, the paging
+  extensions, AIA) are asserted by that subsystem during boot — the timer, for example, refuses to
+  boot unless the bootloader confirmed Sstc (and a timebase frequency) for every hart from the
+  firmware tables (ACPI RHCT, or the DTB `/cpus` nodes), and the interrupt initialisation unless it
+  confirmed Ssaia for every hart and reported a supervisor-level APLIC domain and IMSIC layout.
 
 Platform features that are not CPU-detectable (the PIT, UEFI, ACPI/DTB, the UART) are not probed by
 the gate; their absence manifests as a boot failure on the discovery path they feed. A missing or

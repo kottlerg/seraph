@@ -572,8 +572,8 @@ unsafe fn kernel_entry_post_rebase(
 
     // Initialize the CPU-to-hardware-id mapping (wakeup and shootdown IPI
     // targets, and the riscv64 hart an APLIC route targets). Before Phase 5:
-    // riscv64 `interrupts::init` checks the BSP's hart id against the IMSIC
-    // layout.
+    // riscv64 `interrupts::init_bsp_local` checks the BSP's hart id against the
+    // IMSIC layout.
     #[cfg(not(test))]
     {
         // SAFETY: Phase 3 has completed; the ids are read through the direct
@@ -647,9 +647,10 @@ unsafe fn kernel_entry_post_rebase(
         arch::current::fpu::report_save_area();
     }
     // Disable, for user mode, the state the kernel does not switch (riscv64:
-    // `sstateen0`, whose access halts the boot by name on a hart without
-    // Ssstateen; x86-64: no-op). After `percpu::init_bsp` for the same reason
-    // as the read above: the trap a missing extension raises reads
+    // `sstateen0` and `senvcfg`, whose accesses halt the boot by name on a
+    // hart without Ssstateen or whose firmware keeps either CSR from S-mode;
+    // x86-64: no-op). After `percpu::init_bsp` for the same reason as the read
+    // above: the trap a missing extension or grant raises reads
     // `current_cpu()`.
     #[cfg(not(test))]
     // SAFETY: BSP in ring 0 / S-mode; `interrupts::init` installed the trap
@@ -657,6 +658,17 @@ unsafe fn kernel_entry_post_rebase(
     // pointer, above.
     unsafe {
         arch::current::cpu::disable_unswitched_user_state();
+    }
+    // Initialise the BSP's own interrupt-controller state that needs its
+    // per-CPU pointer (riscv64: its IMSIC file, whose first AIA CSR access
+    // halts the boot by name when the firmware keeps the CSRs from S-mode;
+    // x86-64: no-op). After `percpu::init_bsp` for the same reason as above.
+    #[cfg(not(test))]
+    // SAFETY: BSP in ring 0 / S-mode with interrupts disabled, once;
+    // `interrupts::init` and `percpu::init_bsp` ran above, and Phase 4
+    // allocated the per-CPU storage.
+    unsafe {
+        arch::current::interrupts::init_bsp_local();
     }
     // Assert the boot-gated paging extensions (riscv64: Svpbmt / Svinval /
     // Svnapot from the bootloader-confirmed hart caps; x86-64: no-op). The
@@ -1938,9 +1950,10 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     }
 
     // Disable, for user mode, the state the kernel does not switch on this
-    // CPU (riscv64: its `sstateen0`; x86-64: no-op), as the BSP did in
-    // Phase 5. A riscv64 hart without Ssstateen halts here by name, and the
-    // BSP's wait for it then halts the boot.
+    // CPU (riscv64: its `sstateen0` and `senvcfg`; x86-64: no-op), as the BSP
+    // did in Phase 5. A riscv64 hart without Ssstateen, or whose firmware keeps
+    // either CSR from S-mode, halts here by name, and the BSP's wait for it
+    // then halts the boot.
     // SAFETY: ring 0 / S-mode on this AP; `interrupts::init_ap` installed its
     // trap vector (and riscv64 sscratch) and `percpu::init_ap` its per-CPU
     // pointer, above.

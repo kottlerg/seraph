@@ -6,12 +6,11 @@ verification, and ChaCha20-Poly1305 authenticated encryption.
 `no_std`, no allocation, no external dependencies. Provides a vetted hash, a
 verify-only signature primitive, and an AEAD usable by the bootloader/loader and
 userspace services. Does no I/O and holds no keys: an AEAD caller passes its key
-on every call. Today its only dependent is ktest, which runs the known-answer
-tests on target.
-
-The per-binary signing chain of trust (#124), which will own key management, the
-signature trailer, and xtask signing, and will consume `ed25519_verify`, is design
-intent; not yet implemented.
+on every call. Its dependents are ktest, which runs the known-answer tests on
+target, and [`shared/objsig`](../objsig/README.md), which implements the signature
+trailer, certificate and trust-store codec and the verifier of the per-binary
+signing chain of trust (#124) on `ed25519_verify` and `sha512`. The rest of that
+chain (key management and xtask signing) is design intent; not yet implemented.
 
 ---
 

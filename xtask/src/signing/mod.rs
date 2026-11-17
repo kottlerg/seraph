@@ -160,14 +160,30 @@ pub struct Signer
 
 impl Signer
 {
+    /// The signer of a pack of `arch` in `ctx`: [`Self::for_bootloader`],
+    /// refused unless every bootloader image installed in the sysroot embeds
+    /// its trust store ([`check_installed_store`]), so no pack signs under a
+    /// store the bootloader it boots with does not hold.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::for_bootloader`] and [`check_installed_store`].
+    pub fn open(ctx: &BuildContext, arch: Arch) -> Result<Self>
+    {
+        let signer = Self::for_bootloader(ctx, arch)?;
+        check_installed_store(&bootloader_images(ctx, arch), signer.store())?;
+        Ok(signer)
+    }
+
     /// The signer of a build of `arch` in `ctx`, configured by the
     /// environment ([`Config::from_env`]), generating a local identity on
-    /// first use.
+    /// first use. The bootloader's build takes it unchecked, since it writes
+    /// the store the bootloader embeds; every pack takes [`Self::open`].
     ///
     /// # Errors
     ///
     /// The errors of [`Config::from_env`] and [`Self::new`].
-    pub fn open(ctx: &BuildContext, arch: Arch) -> Result<Self>
+    pub fn for_bootloader(ctx: &BuildContext, arch: Arch) -> Result<Self>
     {
         Self::new(&Config::from_env()?, &ctx.root, arch, &mut os_random)
     }
@@ -479,6 +495,53 @@ pub fn write_boot_store(ctx: &BuildContext, signer: &Signer) -> Result<PathBuf>
     Ok(path)
 }
 
+/// The bootloader images the sysroot installs for `arch`: the one
+/// `\EFI\seraph\boot.efi` names and the removable-media default the firmware
+/// boots.
+pub fn bootloader_images(ctx: &BuildContext, arch: Arch) -> [PathBuf; 2]
+{
+    [
+        ctx.sysroot_efi_seraph().join("boot.efi"),
+        ctx.sysroot_efi_boot().join(arch.boot_efi_filename()),
+    ]
+}
+
+/// Refuse unless each of `images` embeds `store`: the trust store read out of
+/// the image ([`objsig::embed::find`]) is the one the pack signs under.
+///
+/// # Errors
+///
+/// Naming the image and the rebuild that fixes it: when an image cannot be
+/// read, embeds no store or more than one, embeds one that does not parse, or
+/// embeds another store.
+pub fn check_installed_store(images: &[PathBuf], store: &[u8]) -> Result<()>
+{
+    const FIX: &str = "rebuild the bootloader with `cargo xtask build`";
+    for image in images
+    {
+        let bytes = fs::read(image).with_context(|| {
+            format!(
+                "reading the installed bootloader {}, whose trust store a pack signs under                  ({FIX})",
+                image.display()
+            )
+        })?;
+        let embedded = objsig::embed::find(&bytes).map_err(|e| {
+            err!(
+                "the installed bootloader {} holds no trust store a pack can read ({e:?}): {FIX}",
+                image.display()
+            )
+        })?;
+        if embedded != store
+        {
+            bail!(
+                "the installed bootloader {} embeds another trust store than this build signs                  under, so it would refuse what the pack signs: {FIX}",
+                image.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Fixtures of the signing tests, here and in [`crate::bundle`].
 #[cfg(test)]
 pub mod testing
@@ -765,6 +828,67 @@ mod tests
             ("SERAPH_TRUST_STORE_MODE", "merge"),
         ])
         .unwrap_err();
+    }
+
+    /// An image of `store` embedded between other bytes, as the bootloader
+    /// build lays it out.
+    fn bootloader_image(store: &[u8]) -> Vec<u8>
+    {
+        let mut image = b"MZ code".to_vec();
+        image.extend_from_slice(&objsig::embed::MARKER);
+        image.extend_from_slice(&u32::try_from(store.len()).unwrap().to_le_bytes());
+        image.extend_from_slice(store);
+        image.extend_from_slice(b"more code");
+        image
+    }
+
+    // Defect caught: a pack that signs under a store the installed bootloader
+    // does not hold (a store changed since the bootloader was built, a missing
+    // bootloader, or one built without a store), so the boot refuses every
+    // object.
+    #[test]
+    fn a_pack_signs_only_under_the_store_every_installed_bootloader_embeds()
+    {
+        let root = scratch("installed-store");
+        let ours = signer(&root.join("keys"), Arch::Riscv64);
+        let theirs = Signer::new(
+            &config(&root.join("other-keys")),
+            &work_tree(),
+            Arch::Riscv64,
+            &mut counter(50),
+        )
+        .unwrap();
+        assert_ne!(ours.store(), theirs.store());
+        let primary = root.join("boot.efi");
+        let fallback = root.join("BOOTRISCV64.EFI");
+        let images = [primary.clone(), fallback.clone()];
+
+        fs::write(&primary, bootloader_image(ours.store())).unwrap();
+        fs::write(&fallback, bootloader_image(ours.store())).unwrap();
+        check_installed_store(&images, ours.store()).unwrap();
+
+        fs::write(&fallback, bootloader_image(theirs.store())).unwrap();
+        let refusal = format!(
+            "{:#}",
+            check_installed_store(&images, ours.store()).unwrap_err()
+        );
+        assert!(refusal.contains("BOOTRISCV64.EFI"), "{refusal}");
+        assert!(refusal.contains("another trust store"), "{refusal}");
+
+        fs::write(&fallback, b"an image without a store").unwrap();
+        let refusal = format!(
+            "{:#}",
+            check_installed_store(&images, ours.store()).unwrap_err()
+        );
+        assert!(refusal.contains("NoMarker"), "{refusal}");
+
+        fs::remove_file(&fallback).unwrap();
+        let refusal = format!(
+            "{:#}",
+            check_installed_store(&images, ours.store()).unwrap_err()
+        );
+        assert!(refusal.contains("cargo xtask build"), "{refusal}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     // Defect caught: an unchanged store rewritten on every build, which makes

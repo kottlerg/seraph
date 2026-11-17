@@ -6,9 +6,11 @@ verification policy of its § Verification.
 
 `no_std`, no allocation; its one dependency is [`shared/crypto`](../crypto/README.md) (SHA-512
 and `ed25519_verify`). xtask links it, to sign and to verify each signed object before
-writing it; the bootloader and procmgr take it up in the later steps of
-[#124](https://github.com/kottlerg/seraph/issues/124). No stability obligation; internal code
-reuse only.
+writing it; the bootloader links it to verify the kernel and every bundle entry, procmgr to parse
+the trust store it receives, and init-log-levels and devmgr-firmware to take the body of a data
+module through `split`. procmgr's verification of the images it creates is design intent, not yet
+implemented ([#124](https://github.com/kottlerg/seraph/issues/124)). No stability obligation;
+internal code reuse only.
 
 ---
 
@@ -18,9 +20,11 @@ reuse only.
 |---|---|
 | `split` | Parses a signed object, `body \|\| records \|\| footer`, with every parse check of the format and no signature check; returns the body and its records. A consumer of a data module the bootloader verified takes the body through it |
 | `verify` | Verifies a signed object against a `TrustStore` and the caller's `Expectation` (the kinds it accepts, the name, the architecture); returns the body with the attributes and anchor of the record that passed, or one `Refusal` |
+| `verify_cached`, `CertificateCache` | `verify` with a cache the caller keeps across objects: a certificate whose signature verified is held with its issuer key (`CERTIFICATE_CACHE_LEN`, 4, the oldest replaced first), and the same pair is not verified again ([docs/signing.md](../../docs/signing.md) § Verification) |
 | `TrustStore::parse` | Parses and checks a whole trust store; `anchor` finds an anchor by key id and `is_revoked` a revoked key id, each by binary search |
 | `Attributes`, `Certificate` | Decode and encode the signed attributes and the certificate |
 | `encode_trailer`, `TrustStore::encode` | Write a trailer and a store into a caller's buffer, for the host signer |
+| `embed::{MARKER, Embedded, find}` | The layout that embeds a trust store in a bootloader image, `MARKER` (16 bytes) `\|\| len` (`u32` LE) `\|\| store`, and `find`, which locates the one `Embedded` store in an image's bytes |
 | `key_id` | The key id of an Ed25519 public key: the first 16 bytes of its SHA-512 |
 
 A `Refusal` is a parse error, `Untrusted` when no record names an anchor of the store (by
@@ -31,8 +35,8 @@ Every parser is a total function over an arbitrary byte slice: it reads byte-wis
 the slice, never panics, and refuses anything the format does not define, so each is a fuzz entry
 point as it stands. Every encoder refuses what the parsers refuse, so what it writes parses.
 
-`MAX_RECORDS` (8) is the crate's one bound beside the formats' field widths
-([docs/limits.md](../../docs/limits.md)); the codec holds no array sized from a count.
+`MAX_RECORDS` (8) and `CERTIFICATE_CACHE_LEN` (4) are the crate's bounds beside the formats'
+field widths ([docs/limits.md](../../docs/limits.md)); the codec holds no array sized from a count.
 
 ## Tests
 
@@ -56,6 +60,7 @@ shared/objsig/
     ├── lib.rs                  # Kinds, architectures, usage masks, key ids, errors
     ├── attrs.rs                # Signed attributes
     ├── cert.rs                 # Certificate
+    ├── embed.rs                # Trust store embedded in a bootloader image: marker, find
     ├── store.rs                # Trust store
     ├── trailer.rs              # Signed object: split, records, trailer encoder
     ├── verify.rs               # Verifier and its policy

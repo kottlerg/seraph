@@ -178,11 +178,11 @@ devmgr collects declarations from two places:
 
 - **Boot modules.** init forwards to devmgr, untagged, a copy of every boot module outside the
   bootstrap set (init, procmgr, memmgr, devmgr, vfsd, `fatfs`, which init delivers to vfsd
-  until filesystem drivers declare themselves, and `log-levels`, the log-level configuration init
-  reads itself), and devmgr tells them apart by content: an ELF
-  image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid UTF-8 text is a
-  platform description table (§ Platform Description Tables). A driver image whose note is
-  missing or does not decode, a table that is rejected, and any other module are logged and
+  until filesystem drivers declare themselves, `log-levels`, the log-level configuration init
+  reads itself, and `trust-store`, which init hands to procmgr), and devmgr tells them apart by
+  content: an ELF image is a driver, whose `.note.seraph.driver` note devmgr decodes; valid UTF-8
+  text is a platform description table (§ Platform Description Tables). A driver image whose note
+  is missing or does not decode, a table that is rejected, and any other module are logged and
   released.
 - **The drivers directory.** On `SET_DRIVERS_DIR` devmgr lists `/services/drivers/`
   (`NS_READDIR`, so svcmgr sends the subtree cap with `READDIR` beside `LOOKUP | READ`) and

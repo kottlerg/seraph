@@ -10,9 +10,10 @@
 use crypto::ed25519_verify;
 
 use crate::attrs::{Attributes, HASH_LEN};
+use crate::cert::Certificate;
 use crate::store::{Anchor, TrustStore};
 use crate::trailer::{Record, split};
-use crate::{Arch, KindSet, ParseError, key_id};
+use crate::{Arch, KindSet, ParseError, PublicKey, key_id};
 
 /// What the caller expects of the object it loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,13 +112,36 @@ pub fn verify<'a, 's>(
     expect: &Expectation<'_>,
 ) -> Result<Verified<'a, 's>, Refusal>
 {
+    verify_cached(object, store, expect, &mut CertificateCache::new())
+}
+
+/// [`verify`], taking a certificate's signature as verified when `cache`
+/// holds the certificate under the same issuer key, and adding each
+/// certificate whose signature verifies to `cache`.
+///
+/// A caller that verifies several objects keeps one cache across them, so the
+/// certificate every object of one signer carries is verified once. The
+/// result is the one [`verify`] returns: the signature check is a function
+/// of the issuer key and the certificate alone, and every other check is made
+/// for every record.
+///
+/// # Errors
+///
+/// As [`verify`].
+pub fn verify_cached<'a, 's>(
+    object: &'a [u8],
+    store: &TrustStore<'s>,
+    expect: &Expectation<'_>,
+    cache: &mut CertificateCache,
+) -> Result<Verified<'a, 's>, Refusal>
+{
     let signed = split(object).map_err(Refusal::Parse)?;
     let body = signed.body();
     let hash = crypto::sha512(body);
     let mut first_failure = None;
     for record in signed.records()
     {
-        match check(&record, body, &hash, store, expect)
+        match check(&record, body, &hash, store, expect, cache)
         {
             Ok(anchor) =>
             {
@@ -145,6 +169,7 @@ fn check<'s>(
     hash: &[u8; HASH_LEN],
     store: &TrustStore<'s>,
     expect: &Expectation<'_>,
+    cache: &mut CertificateCache,
 ) -> Result<Anchor<'s>, Miss>
 {
     let fail = Miss::Failed;
@@ -215,16 +240,80 @@ fn check<'s>(
         {
             return Err(fail(RecordFailure::SecurityRange));
         }
-        ed25519_verify(
-            &anchor.key,
-            &certificate.body.to_signed(),
-            &certificate.signature,
-        )
-        .map_err(|_| fail(RecordFailure::CertificateSignature))?;
+        if !cache.verify(&anchor.key, certificate)
+        {
+            return Err(fail(RecordFailure::CertificateSignature));
+        }
     }
     ed25519_verify(&signing_key, record.signed, &record.signature)
         .map_err(|_| fail(RecordFailure::Signature))?;
     Ok(anchor)
+}
+
+/// How many certificates a [`CertificateCache`] holds.
+pub const CERTIFICATE_CACHE_LEN: usize = 4;
+
+/// Certificates whose signature has verified, each with the issuer key it
+/// verified under ([`verify_cached`]).
+///
+/// It holds [`CERTIFICATE_CACHE_LEN`] entries, the oldest replaced first. An
+/// entry matches only the same issuer key and the same decoded certificate,
+/// whose encoding is unique, so a match stands for the same signed bytes and
+/// signature. It holds no trust decision: the anchor, `CERTIFY`, revocation,
+/// usage and range checks are made for every record.
+#[derive(Clone, Copy, Debug)]
+pub struct CertificateCache
+{
+    entries: [Option<(PublicKey, Certificate)>; CERTIFICATE_CACHE_LEN],
+    next: usize,
+}
+
+impl CertificateCache
+{
+    /// An empty cache.
+    #[must_use]
+    pub const fn new() -> Self
+    {
+        Self {
+            entries: [None; CERTIFICATE_CACHE_LEN],
+            next: 0,
+        }
+    }
+
+    /// Whether `certificate`'s signature verifies under `issuer_key`: true
+    /// at once for a pair the cache holds; otherwise verified, and held when
+    /// it verifies.
+    fn verify(&mut self, issuer_key: &PublicKey, certificate: &Certificate) -> bool
+    {
+        let entry = Some((*issuer_key, *certificate));
+        if self.entries.contains(&entry)
+        {
+            return true;
+        }
+        if ed25519_verify(
+            issuer_key,
+            &certificate.body.to_signed(),
+            &certificate.signature,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if let Some(slot) = self.entries.get_mut(self.next)
+        {
+            *slot = entry;
+        }
+        self.next = self.next.wrapping_add(1) % CERTIFICATE_CACHE_LEN;
+        true
+    }
+}
+
+impl Default for CertificateCache
+{
+    fn default() -> Self
+    {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -554,6 +643,84 @@ mod tests
             run(&root_store(), &[spec], &EXPECT),
             failed(RecordFailure::CertificateSignature)
         );
+    }
+
+    /// The certificate of a record that passes, with the root's key.
+    fn held(security_version: u32) -> (PublicKey, Certificate)
+    {
+        (
+            keys().root.public,
+            certified(security_version).certificate.unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_cache_holds_each_certificate_that_verifies_and_only_those()
+    {
+        let store_bytes = root_store();
+        let store = TrustStore::parse(&store_bytes).unwrap();
+        let mut cache = CertificateCache::new();
+        let bytes = object(BODY, &[certified(3)]);
+        verify_cached(&bytes, &store, &EXPECT, &mut cache).unwrap();
+        assert_eq!(cache.entries[0], Some(held(3)));
+        // The same certificate with another signature is no match, and is
+        // refused and not held.
+        let mut tampered = certified(3);
+        if let Some(cert) = tampered.certificate.as_mut()
+        {
+            cert.signature[0] ^= 1;
+        }
+        let bytes = object(BODY, &[tampered]);
+        assert_eq!(
+            verify_cached(&bytes, &store, &EXPECT, &mut cache).map(|_| ()),
+            failed(RecordFailure::CertificateSignature)
+        );
+        assert_eq!(cache.entries[1], None);
+        // The held certificate under another issuer key is no match.
+        let (_, cert) = held(3);
+        assert!(!cache.verify(&keys().second_root.public, &cert));
+        assert!(cache.verify(&keys().root.public, &cert));
+    }
+
+    #[test]
+    fn a_held_certificate_is_not_verified_again()
+    {
+        let store_bytes = root_store();
+        let store = TrustStore::parse(&store_bytes).unwrap();
+        let mut tampered = certified(3);
+        if let Some(cert) = tampered.certificate.as_mut()
+        {
+            cert.signature[0] ^= 1;
+        }
+        let bytes = object(BODY, &[tampered]);
+        // A cache that holds the pair answers for it without the signature
+        // check, which this signature would fail.
+        let mut cache = CertificateCache::new();
+        cache.entries[0] = Some((keys().root.public, tampered.certificate.unwrap()));
+        verify_cached(&bytes, &store, &EXPECT, &mut cache).unwrap();
+        assert_eq!(
+            verify(&bytes, &store, &EXPECT).map(|_| ()),
+            failed(RecordFailure::CertificateSignature)
+        );
+    }
+
+    #[test]
+    fn a_full_cache_replaces_its_oldest_certificate()
+    {
+        let k = keys();
+        let issued: Vec<Certificate> = (9u32..)
+            .take(CERTIFICATE_CACHE_LEN + 1)
+            .map(|max| certify(&k.root, &k.signer, KindSet::ALL, 0, max))
+            .collect();
+        let mut cache = CertificateCache::new();
+        for cert in &issued
+        {
+            assert!(cache.verify(&k.root.public, cert));
+        }
+        let held: Vec<_> = cache.entries.iter().flatten().map(|(_, c)| *c).collect();
+        assert_eq!(held.len(), CERTIFICATE_CACHE_LEN);
+        assert!(!held.contains(&issued[0]));
+        assert!(issued[1..].iter().all(|cert| held.contains(cert)));
     }
 
     #[test]

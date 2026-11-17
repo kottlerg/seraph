@@ -76,9 +76,11 @@ devmgr's responsibilities are:
   (devmgr keeps no copy). A VT-d unit's cap is carved from the
   apertures and its scope is the DMAR's, resolved against the scan's bridges;
   a RISC-V IOMMU is a PCI function the ACPI RIMT names, whose cap is the first
-  page of its BAR 0, carved once devmgr has turned on the function's memory
-  decode and bus mastering, and whose scope is the RIMT's ID mappings: each
-  bus they cover whole and each scanned function on a bus they cover in part.
+  page of its BAR 0, carved before devmgr turns on the function's memory
+  decode and bus mastering, the hand-over's last step, so an IOMMU not
+  handed over is left as the firmware left it, and whose scope is the RIMT's
+  ID mappings: each bus they cover whole and each scanned function on a bus
+  they cover in part.
   The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
   `CREATE_PHYS_ACCESS` at `BOOT_DRIVER_PRIORITY`, and its hold is never
   released: devmgr deletes the release token of its create reply at the

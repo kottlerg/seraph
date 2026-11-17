@@ -13,6 +13,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# The core file's layout, notes, policy and directory, host-tested there.
+core-file = { package = "crashd-core-file", path = "core-file" }
 # The report block's emitter and the stack walk, host-tested there.
 crash-report = { path = "../../shared/crash-report" }
 # The state that bounds one fault's handling, host-tested there.

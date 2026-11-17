@@ -100,6 +100,8 @@ jobs:
         # The svctest cell also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
         # the test devices (`--test-devices`, below) the test-only drivers bind.
+        # The usertest cell also stages crashd's test recipe over the default
+        # one: its `CORE_DUMP` names crashme, whose tester checks the cores.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
@@ -112,6 +114,7 @@ jobs:
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
+                 sysroot/config/svcmgr/tests/crashd.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only

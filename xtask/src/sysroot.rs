@@ -61,8 +61,15 @@ pub fn record_arch(ctx: &BuildContext, arch: Arch) -> Result<()>
 /// deliberately absent, so a scoping mistake cannot delete a binary.
 const ROOTFS_MANAGED_ROOTS: &[&str] = &["config", "data"];
 
-/// Mirror `rootfs/` into the sysroot (skipping README.md), then make the mirror
-/// authoritative over [`ROOTFS_MANAGED_ROOTS`].
+/// Directories the image holds empty, which `rootfs/` cannot carry since git
+/// tracks no empty directory: `crash/`, where crashd writes cores
+/// (services/crashd/docs/operation.md § Core Dump). The disk packer copies a
+/// sysroot directory, empty or not.
+const EMPTY_DIRS: &[&str] = &["crash"];
+
+/// Mirror `rootfs/` into the sysroot (skipping README.md), create
+/// [`EMPTY_DIRS`], then make the mirror authoritative over
+/// [`ROOTFS_MANAGED_ROOTS`].
 ///
 /// Each file's destination directory is created as needed. Files are processed
 /// in sorted order for deterministic output. To add a new sysroot file, place
@@ -111,6 +118,12 @@ pub fn install_rootfs(ctx: &BuildContext) -> Result<()>
 
     keep.insert(synthesise_svctest_large_bin(ctx)?);
     keep.insert(synthesise_svctest_bench_bin(ctx)?);
+    for dir in EMPTY_DIRS
+    {
+        let dst = ctx.sysroot.join(dir);
+        fs::create_dir_all(&dst).with_context(|| format!("creating {}", dst.display()))?;
+        step(&format!("Rootfs: {} (empty directory)", dst.display()));
+    }
 
     let roots: Vec<PathBuf> = ROOTFS_MANAGED_ROOTS
         .iter()
@@ -390,6 +403,10 @@ mod tests
         assert!(
             bin_dir.join("procmgr").exists(),
             "build-owned binary untouched"
+        );
+        assert!(
+            sysroot.join("crash").is_dir(),
+            "empty image directory created"
         );
 
         fs::remove_dir_all(&base).unwrap();

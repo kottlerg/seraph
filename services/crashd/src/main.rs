@@ -10,15 +10,20 @@
 //! creates has its exception class bound to and memmgr forwards its
 //! unresolvable page faults to. For each fault it attaches to the process
 //! (procmgr's `ATTACH_PROCESS`), reads what it can of the faulting thread,
-//! logs the report block (services/crashd/docs/block-format.md), and
-//! declines the fault with the report's id as the reason. The mechanism and
-//! its limits are in services/crashd/docs/operation.md.
+//! logs the report block (services/crashd/docs/block-format.md), writes a
+//! core of it to `/crash` when its `CORE_DUMP` setting names the process
+//! (services/crashd/docs/core-format.md), and declines the fault with the
+//! report's id as the reason. The mechanism and its limits are in
+//! services/crashd/docs/operation.md.
 
 mod arch;
+mod dump;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use core_file::notes::Cause;
+use core_file::policy::Policy;
 use crash_report::{Access, Fault, Image, Report, Status, Thread};
 use fault_bound::FaultBound;
 use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
@@ -31,7 +36,10 @@ use syscall_abi::{
 /// watchdog cancels the request it waits in: the attach, which can wait on a
 /// procmgr that is itself waiting on the faulting process, or a log write,
 /// which can wait on a driver logd writes through.
-const FAULT_BOUND: Duration = Duration::from_secs(2);
+const FAULT_BOUND: Duration = Duration::from_millis(FAULT_BOUND_MS);
+
+/// [`FAULT_BOUND`] in milliseconds, as the bound's generations take it.
+const FAULT_BOUND_MS: u64 = 2000;
 
 /// How often the watchdog checks the bound.
 const WATCHDOG_TICK: Duration = Duration::from_millis(100);
@@ -39,9 +47,10 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(100);
 /// Bytes of stack the walk scans, from the stack pointer up.
 const STACK_SCAN_BYTES: u64 = 8192;
 
-/// The bound of the fault being handled, shared with the watchdog: each
-/// fault takes a generation, which the watchdog cancels once it has run past
-/// [`FAULT_BOUND`].
+/// The bound of the step of a fault's handling under way, shared with the
+/// watchdog: the report takes a generation, which the watchdog cancels once
+/// it has run past [`FAULT_BOUND`], and a core dump another, under
+/// [`dump::DUMP_BOUND`].
 static BOUND: FaultBound = FaultBound::new();
 
 /// Whether the watchdog cancelled the handling of generation `generation`.
@@ -84,6 +93,7 @@ fn main() -> !
                 syscall::thread_exit();
             }
         };
+    let policy = core_policy();
     if !start_watchdog()
     {
         std::os::seraph::log!(warn: "watchdog not started; a fault's handling is unbounded");
@@ -111,7 +121,7 @@ fn main() -> !
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) };
             continue;
         }
-        handle_fault(&msg, authority, ipc_buf);
+        handle_fault(&msg, &policy, authority, ipc_buf);
     }
 }
 
@@ -158,36 +168,47 @@ fn register(authority: u64, ipc_buf: *mut u64) -> Option<u64>
     }
 }
 
+/// The `CORE_DUMP` setting of crashd's environment, logged; a value that
+/// does not parse writes no core.
+fn core_policy() -> Policy
+{
+    let value = std::env::var("CORE_DUMP").ok();
+    match Policy::parse(value.as_deref())
+    {
+        Ok(Policy::Off) =>
+        {
+            std::os::seraph::log!("core dumps off");
+            Policy::Off
+        }
+        Ok(policy) =>
+        {
+            std::os::seraph::log!("core dumps for {}", value.unwrap_or_default());
+            policy
+        }
+        Err(_) =>
+        {
+            std::os::seraph::log!(warn: "CORE_DUMP holds an empty name; core dumps off");
+            Policy::Off
+        }
+    }
+}
+
 /// Report the fault `msg` and decline it: read what the attach request
-/// reaches and log the block, under the watchdog's bound, then end the
-/// thread with the report id as the decline reason. The block is logged
-/// before the decline, so the kernel's serial diagnostic of the kill, which
-/// the decline triggers, does not land among its lines. A request the
-/// watchdog cancels ends the bound: the thread is declined at once, the
-/// watchdog's cancellation is let finish, and the block's remaining lines
-/// follow, when nothing can wait on the faulting thread any more.
-fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
+/// reaches and log the block, under the watchdog's bound, write a core of
+/// the process when `policy` may name it and the report read it whole, under
+/// the dump's own bound, and log the dump's line, then end the thread with
+/// the report id as the decline reason. The block and the dump's line are
+/// logged before the decline, so the kernel's serial diagnostic of the kill,
+/// which the decline triggers, does not land among them. A request the
+/// watchdog cancels ends the bound: the thread is declined at once, with no
+/// dump, the watchdog's cancellation is let finish, and the block's remaining
+/// lines follow, when nothing can wait on the faulting thread any more.
+fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut u64)
 {
     let id = report_id();
     let ip = msg.word(3);
-    let fault = if msg.word(0) == FAULT_KIND_VM
-    {
-        Fault::Vm {
-            access: Access::from_flags(msg.word(2)),
-            addr: msg.word(1),
-            pager_reason: (msg.word_count() > FAULT_FORWARD_REASON_WORD)
-                .then(|| msg.word(FAULT_FORWARD_REASON_WORD)),
-        }
-    }
-    else
-    {
-        Fault::Exception {
-            code: msg.word(1),
-            aux: msg.word(2),
-        }
-    };
-
-    let generation = BOUND.arm(now_ms());
+    let (fault, cause) = decode(msg);
+    let generation = BOUND.arm(now_ms(), FAULT_BOUND_MS);
     let gathered = gather(msg.badge, ip, authority, generation, ipc_buf);
     let report = Report {
         id,
@@ -217,6 +238,38 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     }
     let cancelled = BOUND.end(generation);
 
+    // A dump only after a report that ran within its bound and read the
+    // process: a step that ran out waits on something a dump would wait on
+    // too.
+    let core = match (&gathered.image, policy)
+    {
+        (_, Policy::Off) => None,
+        (Some(image), _) if !cancelled && matches!(gathered.status, Status::Complete) =>
+        {
+            Some(dump::dump(
+                policy,
+                &dump::Target {
+                    fault_badge: msg.badge,
+                    process: gathered.badge,
+                    ip,
+                    cause,
+                    load_bias: image.load_bias,
+                    no_core: gathered.no_core,
+                },
+                authority,
+                ipc_buf,
+            ))
+        }
+        _ => None,
+    };
+
+    // A dump ran only after a report within its bound, so its line, too,
+    // precedes the decline and the kernel's diagnostic.
+    if let Some(outcome) = core
+    {
+        log_core(id, &outcome);
+    }
+
     let decline = IpcMessage::builder(FAULT_REPLY_KILL).word(0, id).build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&decline, ipc_buf) };
@@ -238,6 +291,52 @@ fn handle_fault(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
     for line in lines.iter().skip(resume)
     {
         std::os::seraph::log!("{line}");
+    }
+}
+
+/// The fault `msg` reports, and the cause the core records for it.
+fn decode(msg: &IpcMessage) -> (Fault, Cause)
+{
+    if msg.word(0) == FAULT_KIND_VM
+    {
+        let fault = Fault::Vm {
+            access: Access::from_flags(msg.word(2)),
+            addr: msg.word(1),
+            pager_reason: (msg.word_count() > FAULT_FORWARD_REASON_WORD)
+                .then(|| msg.word(FAULT_FORWARD_REASON_WORD)),
+        };
+        (fault, Cause::Vm)
+    }
+    else
+    {
+        let code = msg.word(1);
+        let fault = Fault::Exception {
+            code,
+            aux: msg.word(2),
+        };
+        (fault, Cause::Exception(code))
+    }
+}
+
+/// Log how the dump for the report `id` ended, after its block; a process
+/// the policy does not name gets no line.
+fn log_core(id: u64, outcome: &dump::Outcome)
+{
+    match outcome
+    {
+        dump::Outcome::Written(name, bytes) =>
+        {
+            std::os::seraph::log!("core id={id:016x} written /crash/{name} bytes={bytes}");
+        }
+        dump::Outcome::Failed(why) =>
+        {
+            std::os::seraph::log!(warn: "core id={id:016x} not written: {why}");
+        }
+        dump::Outcome::Cancelled =>
+        {
+            std::os::seraph::log!(warn: "core id={id:016x} not written: the dump passed its bound");
+        }
+        dump::Outcome::NotNamed => (),
     }
 }
 
@@ -268,6 +367,9 @@ struct Gathered
     status: Status,
     thread: Thread,
     image: Option<Image>,
+    /// Whether the attach reply carried `ATTACH_FLAG_NO_CORE`: the process
+    /// is on the core path, and no core of it is written.
+    no_core: bool,
     regs: Vec<u64>,
     code: Vec<u8>,
     frames: Vec<u64>,
@@ -338,6 +440,7 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
         status: Status::Unattached,
         thread: Thread::Unidentified,
         image: None,
+        no_core: false,
         regs: Vec::new(),
         code: Vec::new(),
         frames: Vec::new(),
@@ -359,6 +462,8 @@ fn gather(badge: u64, ip: u64, authority: u64, generation: u64, ipc_buf: *mut u6
         text_start: reply.word(2),
         text_end: reply.word(3),
     });
+    out.no_core =
+        reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE != 0;
     let named = reply.word(procmgr_labels::ATTACH_WORD_NAMED_THREAD);
     let kind = if named == 0
     {
@@ -626,22 +731,25 @@ fn start_watchdog() -> bool
     bound
 }
 
-/// The watchdog: once a fault's handling has run past [`FAULT_BOUND`], commit
-/// to cancel its generation, post the receiving thread an upcall, which
-/// cancels the blocking request it waits in (`Interrupted`), serve the
-/// upcall when it is delivered, and settle the generation. The commit holds
-/// only while the generation is still being handled, so one whose handling
-/// ended meanwhile is not cancelled, nor the next one's handling cut short.
+/// The watchdog: once a step of a fault's handling has run past its bound
+/// ([`FAULT_BOUND`] for the report, [`dump::DUMP_BOUND`] for a core dump),
+/// commit to cancel its generation, post the receiving thread an upcall, which
+/// cancels the blocking request it waits in (`Interrupted`), and serve the
+/// upcall when it is delivered, once each tick until the receiver ends the
+/// generation, so a request a runtime call sends after the first
+/// cancellation (a file's close as it is dropped) is cancelled too; then
+/// settle the generation. The commit holds only while the generation is
+/// still being handled, so one whose handling ended meanwhile is not
+/// cancelled, nor the next one's handling cut short.
 /// An upcall never cancels a fault of the receiver's own, a page fault on its
 /// pager included, which it waits for.
 fn watchdog(receiver: u64, endpoint: u64) -> !
 {
-    let bound_ms = u64::try_from(FAULT_BOUND.as_millis()).unwrap_or(u64::MAX);
     let ipc_buf = std::os::seraph::current_ipc_buf();
     loop
     {
         std::thread::sleep(WATCHDOG_TICK);
-        let Some(generation) = BOUND.due(now_ms(), bound_ms)
+        let Some(generation) = BOUND.due(now_ms())
         else
         {
             continue;
@@ -650,30 +758,39 @@ fn watchdog(receiver: u64, endpoint: u64) -> !
         {
             continue;
         }
-        // The upcall is delivered at the receiver's next syscall return;
-        // resume it there.
-        if syscall::thread_post_upcall(receiver, generation, 0).is_ok()
+        while cancel_once(receiver, endpoint, generation, ipc_buf) && BOUND.fired(generation)
         {
-            loop
-            {
-                // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-                match unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
-                {
-                    Ok(_) =>
-                    {
-                        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
-                        let _ = unsafe {
-                            ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf)
-                        };
-                        break;
-                    }
-                    Err(e) if e == SyscallError::Interrupted as i64 =>
-                    {}
-                    Err(_) => break,
-                }
-            }
+            std::thread::sleep(WATCHDOG_TICK);
         }
         BOUND.settle(generation);
-        std::os::seraph::log!(warn: "a fault's handling passed its bound; reporting what was read");
+        std::os::seraph::log!(warn: "a step of a fault's handling passed its bound");
+    }
+}
+
+/// Post the receiving thread one upcall for `generation`, which cancels the
+/// blocking request it waits in or is delivered at its next syscall return,
+/// and serve it there; `false` when the post is refused or the upcall cannot
+/// be received.
+fn cancel_once(receiver: u64, endpoint: u64, generation: u64, ipc_buf: *mut u64) -> bool
+{
+    if syscall::thread_post_upcall(receiver, generation, 0).is_err()
+    {
+        return false;
+    }
+    loop
+    {
+        // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+        match unsafe { ipc::ipc_recv(endpoint, ipc_buf) }
+        {
+            Ok(_) =>
+            {
+                // SAFETY: ipc_buf is this thread's registered IPC buffer page.
+                let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_RESUME), ipc_buf) };
+                return true;
+            }
+            Err(e) if e == SyscallError::Interrupted as i64 =>
+            {}
+            Err(_) => return false,
+        }
     }
 }

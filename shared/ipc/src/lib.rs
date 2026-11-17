@@ -526,13 +526,14 @@ pub mod procmgr_labels
     /// the target (its main thread, then each registered one, [`REGISTER_THREAD`]),
     /// `data[1]` its load bias, `data[2]`/`data[3]` the start and end of its
     /// biased text, `data[4]` the address of its `ProcessInfo` page,
-    /// `data[`[`ATTACH_WORD_PROCESS_BADGE`]`]` the target's process badge, and
+    /// `data[`[`ATTACH_WORD_PROCESS_BADGE`]`]` the target's process badge,
     /// `data[`[`ATTACH_WORD_NAMED_THREAD`]`]` the index of the thread the
-    /// request's badge names, and with the caps of threads `data[1]..` of the
-    /// request, at most [`ATTACH_THREADS_PAGE`]; `INVALID_BADGE` when no live
-    /// process carries the badge (memmgr and procmgr, which procmgr did not
-    /// create, among them); `NOT_ATTACHABLE` when the target sent
-    /// [`DECLARE_NO_DEBUG`]. Specified in
+    /// request's badge names, and `data[`[`ATTACH_WORD_FLAGS`]`]` the
+    /// target's declarations ([`ATTACH_FLAG_NO_CORE`]), and with the caps of
+    /// threads `data[1]..` of the request, at most [`ATTACH_THREADS_PAGE`];
+    /// `INVALID_BADGE` when no live process carries the badge (memmgr and
+    /// procmgr, which procmgr did not create, among them); `NOT_ATTACHABLE`
+    /// when the target sent [`DECLARE_NO_DEBUG`]. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § `ATTACH_PROCESS`.
     pub const ATTACH_PROCESS: u64 = 20;
 
@@ -548,6 +549,24 @@ pub mod procmgr_labels
 
     /// [`ATTACH_WORD_NAMED_THREAD`] value: the named thread is not listed.
     pub const ATTACH_NO_THREAD: u64 = u64::MAX;
+
+    /// [`ATTACH_PROCESS`] reply word: the target's declarations, a set of
+    /// `ATTACH_FLAG_*` bits.
+    pub const ATTACH_WORD_FLAGS: usize = 7;
+
+    /// [`ATTACH_WORD_FLAGS`] bit: the target sent [`DECLARE_NO_CORE`].
+    pub const ATTACH_FLAG_NO_CORE: u64 = 1;
+
+    /// The caller declares itself on the path a core dump is written
+    /// through, on its own procmgr cap (its process badge names it): procmgr
+    /// marks it, and every [`ATTACH_PROCESS`] reply for it from then on
+    /// carries [`ATTACH_FLAG_NO_CORE`], so the crash service writes no core of
+    /// it, a write that would wait on the process it describes. Sent at
+    /// startup by vfsd, each filesystem driver, each block driver, devmgr and
+    /// each IOMMU driver. No data, no caps. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no
+    /// live process or carries [`PROCESS_HANDLE_TAG`]. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_CORE`.
+    pub const DECLARE_NO_CORE: u64 = 26;
 
     /// The tag of a debugger's binding: a debugger that binds a thread
     /// [`ATTACH_PROCESS`] listed, on its exception or upcall class, binds it
@@ -613,10 +632,10 @@ pub mod procmgr_labels
     /// Badge bit of a process handle, the SEND on procmgr's endpoint a
     /// create reply carries as its first cap: badged with the child's process
     /// badge and this bit. procmgr clears it before it serves any label, so
-    /// the handle names the child as before, and refuses [`DECLARE_NO_DEBUG`]
-    /// and [`REGISTER_THREAD`] on a badge carrying it, since those name the
-    /// sender itself: only the child's own procmgr cap, badged with the
-    /// process badge alone, sends them. Specified in
+    /// the handle names the child as before, and refuses [`DECLARE_NO_DEBUG`],
+    /// [`DECLARE_NO_CORE`] and [`REGISTER_THREAD`] on a badge carrying it,
+    /// since those name the sender itself: only the child's own procmgr cap,
+    /// badged with the process badge alone, sends them. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § Messages.
     pub const PROCESS_HANDLE_TAG: u64 = 1u64 << 59;
     const _: () = core::assert!(

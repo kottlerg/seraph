@@ -117,6 +117,19 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    // devmgr installs every block transfer's mapping through this driver, so
+    // a core written while it is held would wait on it: declare it on the
+    // core path before it serves (`procmgr_labels::DECLARE_NO_CORE`). A
+    // refusal leaves its core to the crash service's dump bound.
+    // SAFETY: ipc_buf is this thread's registered IPC buffer.
+    let _ = unsafe {
+        ipc::ipc_call(
+            info.procmgr_endpoint,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_CORE),
+            ipc_buf,
+        )
+    };
+
     // SAFETY: ipc_buf is this thread's registered IPC buffer.
     let list = match unsafe { driver_binding::resources::receive(info.creator_endpoint, ipc_buf) }
     {

@@ -1109,6 +1109,22 @@ fn create_notification(what: &str) -> u64
     notification
 }
 
+/// Declare this driver on the core path before it serves
+/// (`procmgr_labels::DECLARE_NO_CORE`): a core of a block driver would be
+/// written through it, so the crash service must write none. A refusal
+/// leaves its core to the crash service's dump bound.
+fn declare_no_core(procmgr: u64, ipc_buf: *mut u64)
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            procmgr,
+            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_CORE),
+            ipc_buf,
+        )
+    };
+}
+
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"virtio-blk");
@@ -1122,6 +1138,8 @@ fn main() -> !
         reason = "the IPC buffer page is 4 KiB-aligned, stricter than u64"
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
+
+    declare_no_core(info.procmgr_endpoint, ipc_buf);
 
     // Bootstrap caps from devmgr. log + procmgr + stdio are wired by
     // `std::os::seraph::_start` from `ProcessInfo`.

@@ -159,7 +159,9 @@ jobs:
         # one boot per arch and profile runs an image without it: its faults,
         # crasher's among them, must kill as with no handler and leave no crash
         # report (test-crash-report --expect none, below). The usertest cell keeps
-        # crashd and checks the crashme fixture's reports.
+        # crashd and checks the crashme fixture's reports; it stages crashd's
+        # test recipe over the default one, so crashd also writes a core of each
+        # crashme death to /crash, which the crashme tester checks.
         #
         # The svctest cell also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` (svcmgr does not scan that directory)
@@ -181,6 +183,7 @@ jobs:
               ;;
             usertest)
               cp sysroot/config/svcmgr/tests/usertest.svc \
+                 sysroot/config/svcmgr/tests/crashd.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               cargo xtask mkdisk --arch ${{ matrix.arch }} --repack-only

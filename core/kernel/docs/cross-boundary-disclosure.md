@@ -45,8 +45,9 @@ Each surface is classified as one of:
 
 Every syscall returns `Result<u64, SyscallError>` marshalled into a single return
 register (`rax` on x86-64, `a0` on RISC-V) by `TrapFrame::set_return`; multi-value
-returns (IPC, the notification / event-queue / wait-set waits, and the split handlers'
-second cap handle) use the `set_ipc_*` family. No handler returns a raw pointer: the
+returns (IPC, the notification / event-queue / wait-set waits, the split handlers'
+second cap handle, and the badges `SYS_THREAD_GET_FAULT_HANDLER` and `SYS_ENDPOINT_BADGE`
+read) use the `set_ipc_*` family. No handler returns a raw pointer: the
 return type is uniformly integer, and the only address-valued returns are physical
 (class **e**). The dispatch table is `syscall::dispatch`; the full numbered table
 is in [core/kernel/docs/syscalls.md](syscalls.md).
@@ -77,6 +78,7 @@ is in [core/kernel/docs/syscalls.md](syscalls.md).
 | `SYS_THREAD_READ_EXT_REGS` → bytes of the target thread's extended-state save area (the XSAVE standard-format area on x86-64, the F and V registers and their CSRs on riscv64), which thread creation zeroes and only the thread's own switch-outs write, and the area's size, to a holder of `OBSERVE` on the thread | `thread::sys_thread_read_ext_regs`, `sched::thread_slot::extended_span` | b/d |
 | `SYS_GETRANDOM` → random bytes into a user buffer + byte count | `entropy::sys_getrandom` | d |
 | `SYS_THREAD_GET_FAULT_HANDLER` → whether a fault class of a thread the caller holds `CONTROL` on is bound (`0` or `1`), and the bound badge (a derivation badge of a cap a binder held, or its copy); no endpoint, capability, or kernel address | `thread::sys_thread_get_fault_handler` | c/d |
+| `SYS_ENDPOINT_BADGE` → the badge of an Endpoint cap the caller holds, to a caller that holds `RECEIVE` on the same endpoint (a derivation badge the endpoint's server or a minter it trusts chose); no capability or kernel address | `cap::sys_endpoint_badge` | c |
 | `SYS_SBI_CALL` → firmware `sbiret.value` on success, `NotSupported` on any firmware error (RISC-V; args caller-supplied) | `sbi::sys_sbi_call` | d |
 | `SYS_IPC_BUFFER_SET` → status only (validates user-half, page-aligned VA) | `syscall::sys_ipc_buffer_set` | (no output) |
 | Cap split / create / derive handlers → opaque cap handles | `mem::sys_memory_split`, `hw::sys_mmio_split`, `cap::sys_cap_derive` | c |

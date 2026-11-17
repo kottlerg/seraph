@@ -179,7 +179,7 @@ pub fn logd_death_forward_phase(caps: &Caps)
     );
 
     let badge = logd_await_retired(caps.logd_query);
-    check_logd_history(&logd_history(caps.logd_query, badge));
+    check_logd_history(&logd_history(caps.logd_query, Some(badge)));
 
     let own = std::os::seraph::log::acquire();
     let denied = logd_query_call(own, &slots_request(None));
@@ -290,15 +290,15 @@ fn logd_await_retired(query: u64) -> u64
     badge
 }
 
-/// The history of `badge`, newest first, as (kind, bytes), read across every
-/// `QUERY_HISTORY` page.
-pub(crate) fn logd_history(query: u64, badge: u64) -> Vec<(u8, Vec<u8>)>
+/// The history of `badge`, or of every badge for `None`, newest first, as
+/// (kind, bytes), read across every `QUERY_HISTORY` page.
+pub(crate) fn logd_history(query: u64, badge: Option<u64>) -> Vec<(u8, Vec<u8>)>
 {
     use ipc::log_query::{HistoryEntries, HistoryRequest, QUERY_OK, reply_more, reply_status};
 
     let mut history = Vec::new();
     let mut req = HistoryRequest {
-        badge: Some(badge),
+        badge,
         before: None,
     };
     loop
@@ -313,8 +313,8 @@ pub(crate) fn logd_history(query: u64, badge: u64) -> Vec<(u8, Vec<u8>)>
         let read_before = history.len();
         for entry in HistoryEntries::new(&reply)
         {
-            assert_eq!(
-                entry.badge, badge,
+            assert!(
+                badge.is_none_or(|b| b == entry.badge),
                 "logd_death_forward: another badge's entry"
             );
             history.push((entry.kind, entry.bytes.to_vec()));

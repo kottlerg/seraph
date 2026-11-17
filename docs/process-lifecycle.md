@@ -171,8 +171,7 @@ subsequent `SUBSTRATE` round carries one `(name, thread_cap, observer)`
 triple for a substrate service init bootstrapped (`memmgr`, `procmgr`,
 `devmgr`, `vfsd`), and a terminal `LOGD_SOURCES` round carries the
 master-log endpoint source and a badge-0 `SEND|GRANT` source on procmgr's
-endpoint, from which svcmgr launches real logd (restart: design intent; not
-yet implemented (#262), per
+endpoint, from which svcmgr launches and restarts real logd (per
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
 § Supervision hierarchy). svcmgr — not init — then publishes the
 well-known names it owns into its own registry

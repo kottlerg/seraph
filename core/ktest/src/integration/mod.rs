@@ -70,7 +70,7 @@ pub mod thread_memory;
 pub mod thread_upcall;
 pub mod tlb_coherency;
 pub mod tlb_widen_retry;
-pub mod user_counter_grants;
+pub mod user_mode_controls;
 pub mod wait_concurrency;
 pub mod write_regs_blocked_syscall;
 
@@ -288,8 +288,8 @@ pub fn run_all(ctx: &TestContext)
         write_regs_blocked_syscall::run(ctx)
     );
     run_integration_test!(
-        "integration::user_counter_grants",
-        user_counter_grants::run(ctx)
+        "integration::user_mode_controls",
+        user_mode_controls::run(ctx)
     );
     run_integration_test!(
         "integration::idle_past_watchdog_threshold",

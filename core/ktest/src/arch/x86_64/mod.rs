@@ -14,8 +14,8 @@
 //! - `callee_saved.rs` — callee-saved register probe for
 //!   `integration::irq_preserves_user_regs`
 //! - `code_stub.rs` — machine-code stub encoders for `unit::retype`
-//! - `user_counters.rs` — the counter ring 3 is denied, for
-//!   `integration::user_counter_grants`
+//! - `user_controls.rs` — the instructions ring 3 is denied and the checks of
+//!   the controls it is granted, for `integration::user_mode_controls`
 //!
 //! Tier 1 tests:
 //! - `ioport_syscalls.rs` — `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT`
@@ -55,7 +55,7 @@ mod speculation_controls;
 mod syscall_rflags_hardening;
 mod trap_redelivery;
 mod umip;
-pub mod user_counters;
+pub mod user_controls;
 mod user_half_top;
 
 use init_protocol::InitInfo;

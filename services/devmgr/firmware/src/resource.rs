@@ -129,8 +129,97 @@ impl<S: Copy> SpanTable<S>
         base: u64,
         size: u64,
         granule: u64,
-        mut split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
+        split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
     ) -> Result<S, CarveError>
+    {
+        self.carve_span(base, size, granule, split)
+            .map(|span| span.slot)
+    }
+
+    /// Move `[base, base + size)`, its end rounded up to `granule` as
+    /// [`Self::carve`] rounds it, out of this table into `to`: the carved
+    /// cap is recorded in `to` over the range it covers. Returns that range,
+    /// `(base, end)`.
+    ///
+    /// # Errors
+    /// [`Self::carve`]'s, and [`CarveError::NoMemory`] when `to` cannot
+    /// grow; nothing is carved then.
+    pub fn move_to(
+        &mut self,
+        to: &mut Self,
+        base: u64,
+        size: u64,
+        granule: u64,
+        split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
+    ) -> Result<(u64, u64), CarveError>
+    {
+        // Reserved first, so the insert after the carve cannot fail.
+        to.spans.try_reserve(1).map_err(|_| CarveError::NoMemory)?;
+        let span = self.carve_span(base, size, granule, split)?;
+        let at = to.spans.partition_point(|s| s.base < span.base);
+        to.spans.insert(at, span);
+        Ok((span.base, span.end))
+    }
+
+    /// Move each range `(base, size)` of `ranges` out of this table into
+    /// `to`, as [`Self::move_to`] moves one.
+    ///
+    /// # Errors
+    /// The first failed range's [`CarveError`] ([`CarveError::NoMemory`]
+    /// when the tables cannot grow by what the moves need, none made). Each
+    /// range moved before it is moved back first, so both tables cover what
+    /// they covered before: a range moved back is recorded as a cap of its
+    /// own, since the splits that carved it are not undone.
+    pub fn move_all(
+        &mut self,
+        to: &mut Self,
+        ranges: &[(u64, u64)],
+        granule: u64,
+        mut split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
+    ) -> Result<(), CarveError>
+    {
+        // Each move adds at most one span here (a lower remainder) and one to
+        // `to`, and each move back one more here; reserved first, so neither a
+        // move nor a move back allocates.
+        let moves = ranges.len();
+        self.spans
+            .try_reserve(moves.saturating_mul(2))
+            .map_err(|_| CarveError::NoMemory)?;
+        to.spans
+            .try_reserve(moves)
+            .map_err(|_| CarveError::NoMemory)?;
+        for (done, &(base, size)) in ranges.iter().enumerate()
+        {
+            if let Err(e) = self.move_to(to, base, size, granule, &mut split)
+            {
+                for &(base, _) in ranges.get(..done).unwrap_or(&[])
+                {
+                    // A move records its range in `to` as one span from
+                    // `base`; moved back whole it splits nothing and, with the
+                    // room reserved above, cannot fail.
+                    let Some(end) = to.spans.iter().find(|s| s.base == base).map(|s| s.end)
+                    else
+                    {
+                        continue;
+                    };
+                    let _ = to.move_to(self, base, end.saturating_sub(base), 1, |_, _| {
+                        Err(SplitError::Failed)
+                    });
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::carve`], returning the carved cap with the range it covers.
+    fn carve_span(
+        &mut self,
+        base: u64,
+        size: u64,
+        granule: u64,
+        mut split: impl FnMut(&Span<S>, u64) -> Result<(S, S), SplitError>,
+    ) -> Result<Span<S>, CarveError>
     {
         let end = base.checked_add(size).ok_or(CarveError::NotCovered)?;
         if size == 0
@@ -182,7 +271,11 @@ impl<S: Copy> SpanTable<S>
                         base: cut,
                         end: span.end,
                     };
-                    return Ok(carved);
+                    return Ok(Span {
+                        slot: carved,
+                        base: span.base,
+                        end: cut,
+                    });
                 }
                 Err(SplitError::OutOfRange) =>
                 {}
@@ -190,7 +283,7 @@ impl<S: Copy> SpanTable<S>
             }
         }
         self.spans.remove(i);
-        Ok(span.slot)
+        Ok(span)
     }
 }
 
@@ -390,5 +483,101 @@ mod tests
         assert!(!t.insert((0, 0), u64::MAX, 2).unwrap());
         let bases: Vec<_> = t.spans().iter().map(|s| s.base).collect();
         assert_eq!(bases, [0x1000, 0x5000]);
+    }
+
+    #[test]
+    fn move_to_records_the_carved_range_in_the_other_table()
+    {
+        let mut apertures = table(&[(0x8000_0000, 0x8020_0000)]);
+        let mut held = SpanTable::new();
+        // A sub-page range takes its whole page, as a carve rounds it.
+        assert_eq!(
+            apertures.move_to(&mut held, 0x8000_1000, 0x100, 0x1000, split_model),
+            Ok((0x8000_1000, 0x8000_2000))
+        );
+        assert_eq!(held.spans().len(), 1);
+        assert_eq!(held.spans()[0].slot, (0x8000_1000, 0x8000_2000));
+        assert_consistent(&held);
+        assert_consistent(&apertures);
+        // The moved page is no longer the apertures' to carve.
+        assert_eq!(
+            apertures.carve(0x8000_1000, 0x1000, 0x1000, split_model),
+            Err(CarveError::NotCovered)
+        );
+        // Moved back whole, it is one more span of the apertures, with no
+        // split: the table covers what it covered before.
+        assert_eq!(
+            held.move_to(&mut apertures, 0x8000_1000, 0x1000, 0x1000, |_, _| {
+                Err(SplitError::Failed)
+            }),
+            Ok((0x8000_1000, 0x8000_2000))
+        );
+        assert_eq!(held.spans(), []);
+        let covered: Vec<(u64, u64)> = apertures.spans().iter().map(|s| (s.base, s.end)).collect();
+        assert_eq!(
+            covered,
+            [
+                (0x8000_0000, 0x8000_1000),
+                (0x8000_1000, 0x8000_2000),
+                (0x8000_2000, 0x8020_0000)
+            ]
+        );
+        assert_consistent(&apertures);
+        // A range no span covers moves nothing.
+        assert_eq!(
+            apertures.move_to(&mut held, 0x9000_0000, 0x1000, 0x1000, split_model),
+            Err(CarveError::NotCovered)
+        );
+        assert_eq!(held.spans(), []);
+    }
+
+    #[test]
+    fn move_all_moves_every_range_or_none()
+    {
+        let mut apertures = table(&[(0x8000_0000, 0x8020_0000)]);
+        let mut held = SpanTable::new();
+        assert_eq!(
+            apertures.move_all(
+                &mut held,
+                &[(0x8010_0000, 0x10_0000), (0x8000_0000, 0x100)],
+                0x1000,
+                split_model
+            ),
+            Ok(())
+        );
+        let held_ranges: Vec<(u64, u64)> = held.spans().iter().map(|s| (s.base, s.end)).collect();
+        assert_eq!(
+            held_ranges,
+            [(0x8000_0000, 0x8000_1000), (0x8010_0000, 0x8020_0000)]
+        );
+        assert_consistent(&held);
+        assert_consistent(&apertures);
+        let left: Vec<(u64, u64)> = apertures.spans().iter().map(|s| (s.base, s.end)).collect();
+        assert_eq!(left, [(0x8000_1000, 0x8010_0000)]);
+
+        // A range no span covers fails the whole move: the ranges moved
+        // before it are moved back, and both tables cover what they covered.
+        let before_held = held.spans().len();
+        assert_eq!(
+            apertures.move_all(
+                &mut held,
+                &[
+                    (0x8000_4000, 0x1000),
+                    (0x8000_2000, 0x1000),
+                    (0x9000_0000, 0x1000)
+                ],
+                0x1000,
+                split_model
+            ),
+            Err(CarveError::NotCovered)
+        );
+        assert_eq!(held.spans().len(), before_held);
+        assert_consistent(&apertures);
+        let mut covered: Vec<(u64, u64)> =
+            apertures.spans().iter().map(|s| (s.base, s.end)).collect();
+        covered.dedup();
+        assert_eq!(covered.first().map(|r| r.0), Some(0x8000_1000));
+        assert_eq!(covered.last().map(|r| r.1), Some(0x8010_0000));
+        assert!(covered.windows(2).all(|w| w[0].1 == w[1].0));
     }
 }

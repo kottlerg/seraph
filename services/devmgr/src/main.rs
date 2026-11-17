@@ -225,7 +225,7 @@ fn main() -> !
             &mut catalog,
             ipc_buf,
         );
-        acpi.run(&records, &mut caps);
+        acpi.run(&records, &mut caps, &mut irq_range);
         hotplug.grant(acpi.bridges(), &mut records, &mut caps);
         hotplug.run(
             &registry,
@@ -897,14 +897,18 @@ impl Registry
             {
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
             }
-            ipc::devmgr_labels::QUERY_ACPI_RESOURCES =>
+            ipc::devmgr_labels::QUERY_ACPI_RESOURCES
+                if msg.word(1) != ipc::devmgr_labels::ACPI_SCI =>
             {
                 if Self::admits(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf)
                 {
                     acpi::query_resources(&self.firmware, msg, ipc_buf);
                 }
             }
-            ipc::devmgr_labels::ACPI_REGION_GRANT
+            // The SCI's `QUERY_ACPI_RESOURCES` goes to the control thread,
+            // which owns the interrupt lines.
+            ipc::devmgr_labels::QUERY_ACPI_RESOURCES
+            | ipc::devmgr_labels::ACPI_REGION_GRANT
             | ipc::devmgr_labels::ACPI_PCI_CONFIG
             | ipc::devmgr_labels::OSC_RESULT
             | ipc::devmgr_labels::BRIDGE_WINDOWS
@@ -1518,15 +1522,22 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
 // ── Aperture splitting helper ───────────────────────────────────────────────
 
 /// Carve a narrow `Mmio` cap of `(phys, size)`, its end rounded up to a
-/// page, out of whichever aperture covers it. The lower remainder
-/// `[ap_base, phys)` and the upper remainder stay in the aperture table as
+/// page, out of the held BAR pages of a managed slot's function
+/// ([`caps::DevmgrCaps::slot_bars`]) that cover it, else out of whichever
+/// aperture covers it. The lower remainder
+/// `[ap_base, phys)` and the upper remainder stay in their table as
 /// caps of their own: the surrounding range may host other useful MMIO
 /// (e.g. the framebuffer lives below the ECAM in the same parent aperture on
 /// x86-64 QEMU+OVMF). Returns `None` when no aperture covers the range, the
 /// table cannot grow, or a split fails.
 pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u64>
 {
-    match carve_aperture(caps, phys, size)
+    let carved = match caps.slot_bars.carve(phys, size, PAGE_SIZE, split_mmio)
+    {
+        Err(CarveError::NotCovered) => carve_aperture(caps, phys, size),
+        carved => carved,
+    };
+    match carved
     {
         Ok(cap) => Some(cap),
         Err(CarveError::NotCovered) => None,
@@ -1550,23 +1561,31 @@ pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Opti
     }
 }
 
-/// [`carve_subrange`]'s carve, with its error: `NotCovered` when no
+/// A carve out of the apertures alone, with its error: `NotCovered` when no
 /// aperture covers the range, which a caller that refuses such a range tells
-/// apart from a failed carve.
+/// apart from a failed carve. The held BAR pages of a managed slot's
+/// functions are not among the apertures, so no such carve reaches them.
 ///
 /// # Errors
 /// The aperture table's [`CarveError`].
 pub fn carve_aperture(caps: &mut caps::DevmgrCaps, phys: u64, size: u64)
 -> Result<u64, CarveError>
 {
-    caps.apertures
-        .carve(phys, size, PAGE_SIZE, |span: &Span<u64>, at| {
-            // `mmio_split` takes the split point as an offset into the cap; the
-            // table records each aperture's exact range, so no split it asks for
-            // falls outside its cap.
-            let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
-            syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
-        })
+    caps.apertures.carve(phys, size, PAGE_SIZE, split_mmio)
+}
+
+/// Split the `Mmio` cap of `span` at the absolute address `at`
+/// (`SYS_MMIO_SPLIT`), for a carve out of an aperture table.
+///
+/// # Errors
+/// [`SplitError::Failed`] when the split fails.
+pub fn split_mmio(span: &Span<u64>, at: u64) -> Result<(u64, u64), SplitError>
+{
+    // `mmio_split` takes the split point as an offset into the cap; the
+    // tables record each cap's exact range, so no split asked for falls
+    // outside its cap.
+    let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
+    syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
 }
 
 // ── Interrupt range allocator ───────────────────────────────────────────────

@@ -7,16 +7,21 @@ What acpid does on each start, from loading the tables to the pushes, and how it
 ## Threads
 
 The main thread takes the bootstrap round (the RECV on acpid's service endpoint and the
-`devmgr.acpi` seed), spawns the evaluation thread, and waits for it. The evaluation thread runs
-the whole sequence below and then serves the power requests on the endpoint for acpid's lifetime
-([README.md](../README.md) § Power requests), so one thread owns the namespace. Its
+`devmgr.acpi` seed), spawns the evaluation thread, and waits for any of acpid's threads to end.
+The evaluation thread runs the whole sequence below and then, for acpid's lifetime, every
+evaluation the service needs, so one thread owns the namespace. It blocks only on its work
+channel, from which it takes a power request a receiver forwards, a GPE the event thread found,
+or the power button to enable again ([README.md](../README.md) § Power requests and § Events).
+Two receiver threads serve acpid's endpoint, so one can hold a `WAIT_EVENT` while the other
+serves `SLEEP` and `RESET`, and on x86-64 an event thread takes the SCI. The evaluation thread's
 stack is the larger of the evaluator's and the parser's stack bounds plus 256 KiB for acpid's
 own frames ([docs/limits.md](../../../docs/limits.md)): a spawned thread's stack is at least the
 size it asks for, while the main thread's grows past its first pages only in a demand-paged
 process. acpid stays alive after the sequence, serving, so that svcmgr does not restart it into
-the same start-up and so that it keeps the grants it holds. When the evaluation thread panics or
-cannot be spawned, the main thread exits acpid, since the power requests would wait unanswered,
-and svcmgr restarts it. A failed bootstrap round keeps acpid alive instead, since a restart would
+the same start-up and so that it keeps the grants it holds. When the evaluation thread, a
+receiver or the event thread ends, in a panic too, or the evaluation thread cannot be spawned,
+the main thread exits acpid, since a request or an event would wait unanswered, and svcmgr
+restarts it. A failed bootstrap round keeps acpid alive instead, since a restart would
 fail the same way: a round that delivered the service endpoint without the `devmgr.acpi` seed has
 the main thread answer each power request `NO_DEVICE`, and one that delivered no endpoint parks it.
 
@@ -24,14 +29,22 @@ the main thread answer each power request `NO_DEVICE`, and one that delivered no
 
 ## Sequence
 
-1. **Power registers** (x86-64). acpid acquires the `PM1a_CNT` block and `RESET_REG` from
-   devmgr (`QUERY_ACPI_RESOURCES`) and binds them to the evaluation thread; a missing one is
-   logged, and the request that needs it replies `NO_DEVICE`. RISC-V has neither.
+1. **Power registers and events** (x86-64). acpid acquires the `PM1a_CNT` block and
+   `RESET_REG`, then the PM1a event block, the GPE0 block and the SCI, from devmgr
+   (`QUERY_ACPI_RESOURCES`), binding the event blocks to the evaluation thread before it asks
+   for the SCI; a missing one is logged, and the request or the events that need it go without:
+   `NO_DEVICE` for the request, no events without the PM1a event block or the SCI, no GPEs
+   without GPE0. devmgr's answer for the SCI says whether an acpid took it earlier in the boot.
+   On any other answer, a failed one included (devmgr records the SCI as served even when its
+   reply does not reach acpid), acpid then disables every event and clears every status at
+   once, so no later acpid of the boot, which devmgr tells it is a restart, takes the press
+   that turned the machine on for a new one. It then reads the FADT (`QUERY_ACPI_TABLE`) for its
+   `PWR_BUTTON` flag. RISC-V has none of them.
 2. **Tables.** acpid asks devmgr for the DSDT (`QUERY_ACPI_TABLE` with the signature
    `DSDT`, which devmgr resolves through the FADT), then for SSDT 0, 1, ... until devmgr
    replies `NO_DEVICE`, at most 64 (`MAX_SSDTS`, [docs/limits.md](../../../docs/limits.md)).
    Each table is mapped read-only, loaded into the namespace, and unmapped. A DSDT that cannot
-   be loaded ends the sequence: no AML runs, and acpid goes on to serve (step 10). An SSDT
+   be loaded ends the sequence: no AML runs, and acpid goes on to arm and serve (step 10). An SSDT
    that cannot be loaded is logged and skipped. The method bodies are then parsed.
 3. **ACPI mode** (x86-64). acpid reads `SCI_EN` in the PM1a control block of step 1. When it
    is clear, acpid writes the FADT's `ACPI_ENABLE` value to `SMI_CMD` and waits up to 3 s for
@@ -52,7 +65,10 @@ the main thread answer each power request `NO_DEVICE`, and one that delivered no
    `PRT_ROUTES` ([devmgr.md](devmgr.md) § Pushes).
 9. acpid logs a `ready:` line with the tables loaded, the devices present, the `_INI` methods
    run and the bridges found.
-10. **Serve**: the evaluation thread serves the power requests on acpid's endpoint
+10. **Arm and serve** (§ Threads): on x86-64 the evaluation thread starts the event thread,
+    which binds the event blocks and registers the SCI, arms the events and dispatches those a
+    restart finds pending ([README.md](../README.md) § Events); without a loaded DSDT no GPE is
+    handled. It then starts the receivers, which serve acpid's endpoint
     ([README.md](../README.md) § Power requests); a request sent during the steps above waits in
     the endpoint's queue until then.
 
@@ -88,7 +104,8 @@ Every hardware access of the evaluator goes through devmgr ([devmgr.md](devmgr.m
   remembered and not asked for again. A memory write is
   followed by an MMIO ordering barrier.
 - A configuration-space access is one `ACPI_PCI_CONFIG` call.
-- `Notify` is logged and dropped: no consumer of the notifications runs.
+- `Notify` is logged and dropped: no consumer of the notifications runs. On QEMU q35, the
+  ACPI PCI hotplug GPE's method (`\_GPE._E01`) notifies the slots that changed.
 - The Global Lock is refused: devmgr refuses acpid the FACS, so a field whose access rule takes
   the lock fails.
 - `_OSI` answers false for every string.
@@ -127,7 +144,11 @@ devmgr acts on. A restarted acpid's PIC-model `_PRT` is read after the first ins
 the APIC model, and so differs from the first. devmgr keeps the memory pages it granted, so a
 restarted acpid is granted them again ([devmgr.md](devmgr.md) § Region grants). svcmgr serves
 the restarted acpid a fresh RECV on the same service endpoint, so pwrmgr's `acpid.power` SEND
-stays valid; a request sent while acpid is down waits in the endpoint's queue.
+stays valid; a request sent while acpid is down waits in the endpoint's queue. A `WAIT_EVENT`
+pending when acpid died fails in the caller, which calls again. devmgr serves the restarted
+acpid the SCI again and tells it that it is a restart, so acpid keeps the event status the
+hardware latched and dispatches each handled event still set ([README.md](../README.md)
+§ Events).
 
 ---
 

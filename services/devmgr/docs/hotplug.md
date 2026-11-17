@@ -180,7 +180,10 @@ job, logged `removing its functions` with the cause, and holds the slot removing
 completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then is acted on
 only after the completion. The slot keeps whether a card was inserted or the button pressed while it
 was removing, so that card is powered up after the completion without a further press, on a slot
-with no attention button as on one with it.
+with no attention button as on one with it. A removal posted for a card changed in the slot, or in
+the poll of a second press within the abort window, which asks to keep the card, starts asked for
+the same way; one posted in the poll of a first press does not, since that press asks for the
+removal.
 
 The control thread runs the removal job (`firmware::hotplug::remove`), in this order:
 

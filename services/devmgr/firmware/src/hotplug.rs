@@ -864,13 +864,18 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
     // A presence change on a powered slot is its card leaving, whether or not
     // a card reads present again: one pulled and inserted, or swapped, within
     // a poll is removed and then, asked for by the change, added again.
-    let gone = !present || link_down || status & SLOTSTA_PRESENCE_CHANGED != 0;
+    let changed = status & SLOTSTA_PRESENCE_CHANGED != 0;
+    let gone = !present || link_down || changed;
+    // The removal keeps as asked a card changed in the slot, and a second
+    // press in the abort window, which asks to keep the card; a first press
+    // on an occupied slot asks for its removal.
+    let kept = pressed && matches!(state, SlotState::Pressed { .. });
     match state
     {
         SlotState::Empty if present => (SlotState::Empty, Action::PowerUp),
         SlotState::Occupied | SlotState::Pressed { .. } if gone => (
             SlotState::Removing {
-                asked: asks(status),
+                asked: present && (changed || kept),
             },
             Action::Remove,
         ),
@@ -2274,6 +2279,43 @@ mod tests
         {
             assert_eq!(next(state, u16::MAX, true), (state, Action::None));
         }
+    }
+
+    #[test]
+    fn a_removal_is_asked_for_again_only_by_a_changed_card_or_a_second_press()
+    {
+        let present = SLOTSTA_PRESENT;
+        let pressed = present | SLOTSTA_BUTTON;
+        let window = SlotState::Pressed {
+            polls_left: ABORT_POLLS,
+        };
+        let removing = SlotState::Removing { asked: false };
+        for from in [SlotState::Occupied, window]
+        {
+            // A pull is not asked for, whatever else the poll reads.
+            assert_eq!(
+                next(from, SLOTSTA_PRESENCE_CHANGED | SLOTSTA_BUTTON, false),
+                (removing, Action::Remove)
+            );
+            // A card swapped in is.
+            assert_eq!(
+                next(from, present | SLOTSTA_PRESENCE_CHANGED, false),
+                (SlotState::Removing { asked: true }, Action::Remove)
+            );
+        }
+        // The link lost in the poll of a press: a first press asks for the
+        // removal, so the card stays off after it; a second press in the
+        // window asks to keep the card, so it is added again.
+        let lost = pressed | SLOTSTA_LINK_CHANGED;
+        assert_eq!(
+            next(SlotState::Occupied, lost, true),
+            (removing, Action::Remove)
+        );
+        assert_eq!(completed(removing, present), SlotState::Off);
+        assert_eq!(
+            next(window, lost, true),
+            (SlotState::Removing { asked: true }, Action::Remove)
+        );
     }
 
     /// The Q35 root port's Slot Capabilities: attention button, power

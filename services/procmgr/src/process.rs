@@ -2256,6 +2256,7 @@ fn finalize_creation(
         started: false,
         dma_hold: false,
         no_debug: false,
+        no_core: false,
         image,
         threads: process_table::ThreadRegistry::new(),
         name: info_caps.name,

@@ -31,12 +31,13 @@ with the child's process badge and `procmgr_labels::PROCESS_HANDLE_TAG` (bit 59,
 `ipc::VERB_BIT_MASK`, which no process badge carries), which tells it from the child's own procmgr
 cap (`ProcessInfo.procmgr_endpoint_cap`), badged with the process badge alone. procmgr clears the
 tag before it serves a request, so a handle names its child to every label, and refuses
-`DECLARE_NO_DEBUG` and `REGISTER_THREAD`, which name their sender, on a badge carrying it with
-`INVALID_BADGE`, deleting the caps the request carried: only the child itself sends them
-(§ Label 21, § Label 22). `BIND_DEATH_OBSERVER` is served on a process handle only (§ Label 25).
-Labels 14–18 are specified in § `REGISTER_DEATH_EQ`, § `REGISTER_INIT_TEARDOWN`,
-§ `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and § `QUERY_LIVE_PROCESSES` below, labels 19–24
-in § Crash Endpoint and Debug Authority, and label 25 in § Label 25: `BIND_DEATH_OBSERVER`.
+`DECLARE_NO_DEBUG`, `DECLARE_NO_CORE` and `REGISTER_THREAD`, which name their sender, on a badge
+carrying it with `INVALID_BADGE`, deleting the caps the request carried: only the child itself
+sends them (§ Label 21, § Label 22, § Label 26). `BIND_DEATH_OBSERVER` is served on a process
+handle only (§ Label 25). Labels 14–18 are specified in § `REGISTER_DEATH_EQ`,
+§ `REGISTER_INIT_TEARDOWN`, § `INIT_TEARDOWN_DONE`, § `QUERY_INIT_REAP`, and
+§ `QUERY_LIVE_PROCESSES` below, labels 19–24 and 26 in § Crash Endpoint and Debug Authority, and
+label 25 in § Label 25: `BIND_DEATH_OBSERVER`.
 Labels 4–7 and 10 are unassigned; procmgr replies `UNKNOWN_OPCODE` (`0xFFFF`) to them and to any
 other unknown opcode, and deletes the caps such a request carried (see § Capability Transfer).
 
@@ -792,9 +793,10 @@ has with no handler bound, and the kernel's decline line for a forwarded fault i
 pager's own decline printed. The decliner shares nothing with procmgr's request workers but a wake
 notification, so a receive on the endpoint never waits behind a request.
 
-Labels 19–21, 23, and 24 are the **debug authority**, and label 22 the **thread registry** it
-reads. `REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, and `DETACH_PROCESS` are
-served only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the
+Labels 19–21, 23, and 24 are the **debug authority**, label 22 the **thread registry** it
+reads, and label 26 the **core-path declaration** its `ATTACH_PROCESS` reply reports.
+`REGISTER_CRASH_SERVICE`, `ATTACH_PROCESS`, `LIST_PROCESSES`, and `DETACH_PROCESS` are served
+only on a badge carrying `procmgr_labels::DEBUG_AUTHORITY`, which svcmgr mints, from the
 un-badged procmgr source init endows it, for a service whose definition sets
 `debug_authority = yes` ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md));
 no other path mints it, so an image that stages no such service has no attach path. The crash
@@ -847,6 +849,7 @@ Reply `SUCCESS` with:
 | `data[4]` | The address of the target's `ProcessInfo` page |
 | `data[5]` | The target's process badge (`ATTACH_WORD_PROCESS_BADGE`) |
 | `data[6]` | The list index of the thread `data[0]` names (`ATTACH_WORD_NAMED_THREAD`): `0`, the main thread, for a process badge; the registered thread bound under a crash badge; `ATTACH_NO_THREAD` (`u64::MAX`) when that thread is no longer listed |
+| `data[7]` | The target's declarations (`ATTACH_WORD_FLAGS`): `ATTACH_FLAG_NO_CORE` (bit 0) once it sent `DECLARE_NO_CORE` (Label 26); other bits `0` |
 | caps | The Thread caps of threads `data[1]..`, each with `OBSERVE`, `CONTROL`, and `UPCALL`, at most `ATTACH_THREADS_PAGE` (`MSG_CAP_SLOTS_MAX`, 4); none past the count |
 
 The list is the main thread at index 0, then the registered threads in registration order. Before
@@ -889,7 +892,7 @@ cannot reach. The target's `DECLARE_NO_DEBUG` deletes the watch (§ Label 21). T
 undo the dead debugger's own changes to the target, a breakpoint it planted among them. procmgr
 only reads the watched thread's state, which takes no right.
 
-`data[5]`, `data[6]`, the crash-badge form of `data[0]`, and the watch extend the reply and the
+`data[5]` to `data[7]`, the crash-badge form of `data[0]`, and the watch extend the reply and the
 target's domain without changing what an earlier request means: a request that carries no cap is
 answered as before, a request naming a process badge means what it meant, and a caller that
 reads only `data[0]` to `data[4]` and pages from index 0 sees the main thread first, as before,
@@ -1138,6 +1141,37 @@ when the target declared itself undebuggable (Label 21). The refusal order is
 a process it attached to, this request's restore of a registered thread whose exception and upcall
 classes it rebound, and the same restore once an attach's watch thread exits.
 
+### Label 26: `DECLARE_NO_CORE`
+
+| Field | Meaning |
+|---|---|
+| label | `procmgr_labels::DECLARE_NO_CORE` (26) |
+| caller's cap badge | The sender's own process badge (its `ProcessInfo.procmgr_endpoint_cap`); a process handle is refused (§ Messages) |
+| caps | none; procmgr deletes any cap the message carried |
+
+The sender declares itself on the **core path**, the processes a core dump's write waits on: the
+crash service writes a core to `/crash` through vfsd, the filesystem driver of the root partition,
+the block driver beneath it, devmgr, which maps each transfer's buffer on its DMA endpoint, and the
+IOMMU driver devmgr installs those mappings through
+([crashd Operation](../../crashd/docs/operation.md) § Core Dump), so a core of one of them, written
+while its faulting thread is held, would wait on the process it describes. procmgr marks the
+sender, and every `ATTACH_PROCESS` reply for it from then on carries `ATTACH_FLAG_NO_CORE` in
+`data[7]` (Label 20); the crash service writes no core of a process whose reply carries it, and
+still reports the fault in the log. The mark changes nothing else: the process stays attachable
+and bound to the crash endpoint. It is one-way for the process's life. A repeat is answered as the
+first. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no live process or the request
+came on a process handle.
+
+The duty falls on every process a write to `/crash` can wait on: vfsd, each filesystem driver, each
+block driver, devmgr, and each IOMMU driver, which each send the declaration at startup, before they
+serve a request. A new storage or IOMMU driver sends it too, as the driver-authoring rules require
+([Driver Model](../../drivers/docs/driver-model.md) § Adding a Driver). A process that faults before
+its declaration reaches procmgr is dumped like any other, and its dump's wait on it ends at the
+crash service's dump bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds), as does
+the wait of a dump that blocks on a process that never declared. A process can declare itself only,
+so the declaration removes no core of another process. Its mark leaves out a core of the declarer
+alone, which holds nothing of another process.
+
 ---
 
 ## Relevant Design Documents
@@ -1164,6 +1198,7 @@ classes it rebound, and the same restore once an attach's watch thread exits.
 [runtime/ruststd/README.md](../../../runtime/ruststd/README.md),
 [crashd Operation](../../crashd/docs/operation.md),
 [devmgr Responsibilities and Capabilities](../../devmgr/docs/responsibilities.md),
+[Driver Model](../../drivers/docs/driver-model.md),
 [services/drivers/virtio/console/README.md](../../drivers/virtio/console/README.md),
 [services/gdbstub/README.md](../../gdbstub/README.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),

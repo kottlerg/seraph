@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// services/crashd/core-file/src/policy.rs
+
+//! Which processes crashd writes a core of: the `CORE_DUMP` entry of its
+//! environment, which its recipe's `env` key sets.
+//!
+//! `CORE_DUMP=no`, or no entry, writes none. Otherwise the value is a
+//! comma-separated list of process names, each matched against a process's
+//! name (the first string of its argv) or that name's last path component,
+//! so `crashme` names a process started as `/programs/crashme`. A process
+//! with an empty name is never named.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+/// The parsed `CORE_DUMP` setting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Policy
+{
+    /// No core is written.
+    Off,
+    /// A core is written for a process these names name.
+    Names(Vec<String>),
+}
+
+/// Why a `CORE_DUMP` value was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyError
+{
+    /// The list holds an empty name (`a,,b`, a leading or trailing comma).
+    EmptyName,
+}
+
+impl Policy
+{
+    /// Parse the `CORE_DUMP` value, `None` when the environment has no such
+    /// entry.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyError::EmptyName`] when the list holds an empty name.
+    pub fn parse(value: Option<&str>) -> Result<Self, PolicyError>
+    {
+        let Some(value) = value.filter(|v| *v != "no")
+        else
+        {
+            return Ok(Self::Off);
+        };
+        let mut names = Vec::new();
+        for name in value.split(',')
+        {
+            if name.is_empty()
+            {
+                return Err(PolicyError::EmptyName);
+            }
+            names.push(String::from(name));
+        }
+        Ok(Self::Names(names))
+    }
+
+    /// Whether a core is written for the process named `name`.
+    #[must_use]
+    pub fn dumps(&self, name: &[u8]) -> bool
+    {
+        let Self::Names(names) = self
+        else
+        {
+            return false;
+        };
+        if name.is_empty()
+        {
+            return false;
+        }
+        let base = name.rsplit(|&b| b == b'/').next().unwrap_or(name);
+        names
+            .iter()
+            .any(|n| n.as_bytes() == name || n.as_bytes() == base)
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn no_entry_and_no_write_no_core()
+    {
+        for value in [None, Some("no")]
+        {
+            let policy = Policy::parse(value).unwrap();
+            assert_eq!(policy, Policy::Off);
+            assert!(!policy.dumps(b"crashme"));
+        }
+    }
+
+    #[test]
+    fn a_list_names_processes_by_name_or_last_path_component()
+    {
+        let policy = Policy::parse(Some("crashme,svc")).unwrap();
+        assert!(policy.dumps(b"crashme"));
+        assert!(policy.dumps(b"/programs/crashme"));
+        assert!(policy.dumps(b"svc"));
+        assert!(!policy.dumps(b"crashmex"));
+        assert!(!policy.dumps(b"/programs/crash"));
+        assert!(!policy.dumps(b""));
+    }
+
+    #[test]
+    fn an_empty_name_in_the_list_is_refused()
+    {
+        for value in ["", "a,,b", ",a", "a,"]
+        {
+            assert_eq!(
+                Policy::parse(Some(value)),
+                Err(PolicyError::EmptyName),
+                "{value}"
+            );
+        }
+    }
+}

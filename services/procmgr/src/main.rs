@@ -589,10 +589,10 @@ fn dispatch_ipc(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     let label = req.label;
     // A process handle carries `PROCESS_HANDLE_TAG` beside its child's
     // badge. Every label is served under the child's badge alone, but the
-    // two that name their sender, `DECLARE_NO_DEBUG` and `REGISTER_THREAD`,
-    // are refused on a handle, so its holder can neither declare the child
-    // nor register a thread into the child's registry, and
-    // `BIND_DEATH_OBSERVER` is refused on any other cap, so only the
+    // three that name their sender, `DECLARE_NO_DEBUG`, `DECLARE_NO_CORE`
+    // and `REGISTER_THREAD`, are refused on a handle, so its holder can
+    // neither declare the child nor register a thread into the child's
+    // registry, and `BIND_DEATH_OBSERVER` is refused on any other cap, so only the
     // creator chooses who observes the child.
     if let Some(code) = process_table::sender_refusal(label & 0xFFFF, req.badge)
     {
@@ -803,8 +803,8 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
 /// `ATTACH_PROCESS`, `LIST_PROCESSES`, `DETACH_PROCESS`, `DECLARE_NO_DEBUG`,
-/// and `REGISTER_THREAD`, and answer any other opcode `UNKNOWN_OPCODE`,
-/// deleting the caps it carried. Every label but `REGISTER_CRASH_SERVICE`,
+/// `DECLARE_NO_CORE`, and `REGISTER_THREAD`, and answer any other opcode
+/// `UNKNOWN_OPCODE`, deleting the caps it carried. Every label but `REGISTER_CRASH_SERVICE`,
 /// which reads no table and calls the crash decliner, is served under the
 /// table lock: each makes syscalls, its reply among them, and a failed
 /// rebind's log line (services/procmgr/README.md § Concurrency).
@@ -843,6 +843,21 @@ fn dispatch_debug(req: &IpcMessage, ipc_buf: *mut u64, tables: &process::Tables)
         {
             release_caps(req.caps());
             handle_declare_no_debug(req.badge, ipc_buf, table);
+        }
+        procmgr_labels::DECLARE_NO_CORE =>
+        {
+            release_caps(req.caps());
+            // The mark is read by `ATTACH_PROCESS` alone
+            // (`services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_CORE`).
+            let code = if table.declare_no_core(req.badge)
+            {
+                procmgr_errors::SUCCESS
+            }
+            else
+            {
+                procmgr_errors::INVALID_BADGE
+            };
+            reply_empty(ipc_buf, code);
         }
         // `REGISTER_CRASH_SERVICE` is served above.
         _ =>
@@ -988,23 +1003,11 @@ fn handle_attach_process(
         reply_empty(ipc_buf, procmgr_errors::OUT_OF_MEMORY);
         return;
     };
-    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
-        .word(0, (entry.threads.len() as u64).saturating_add(1))
-        .word(1, entry.image.load_bias)
-        .word(2, entry.image.text_start)
-        .word(3, entry.image.text_end)
-        .word(4, entry.process_info_va)
-        .word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE, entry.badge())
-        .word(
-            procmgr_labels::ATTACH_WORD_NAMED_THREAD,
-            named.index_in(entry),
-        );
-    // `n` counts slots of `derived`, so it is within the array.
-    for &cap in derived.get(..n).unwrap_or_default()
-    {
-        reply = reply.cap(cap);
-    }
-    let reply = reply.build();
+    let reply = attach_reply(
+        entry,
+        named.index_in(entry),
+        derived.get(..n).unwrap_or_default(),
+    );
     let send = || {
         // SAFETY: ipc_buf is the registered IPC buffer page.
         unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_ok()
@@ -1015,6 +1018,29 @@ fn handle_attach_process(
         // and its watch is not kept.
         release_caps(derived.get(..n).unwrap_or_default());
     }
+}
+
+/// The `ATTACH_PROCESS` reply for `entry`: its thread count, image, badge,
+/// the named thread's index `named`, its flags, and the thread caps
+/// `caps`. Built apart from `handle_attach_process`, so the builder's
+/// by-value steps do not share that function's stack frame.
+#[inline(never)]
+fn attach_reply(entry: &process::ProcessEntry, named: u64, caps: &[u64]) -> IpcMessage
+{
+    let mut reply = IpcMessage::builder(procmgr_errors::SUCCESS)
+        .word(0, (entry.threads.len() as u64).saturating_add(1))
+        .word(1, entry.image.load_bias)
+        .word(2, entry.image.text_start)
+        .word(3, entry.image.text_end)
+        .word(4, entry.process_info_va)
+        .word(procmgr_labels::ATTACH_WORD_PROCESS_BADGE, entry.badge())
+        .word(procmgr_labels::ATTACH_WORD_NAMED_THREAD, named)
+        .word(procmgr_labels::ATTACH_WORD_FLAGS, entry.attach_flags());
+    for &cap in caps
+    {
+        reply = reply.cap(cap);
+    }
+    reply.build()
 }
 
 /// Handle `LIST_PROCESSES` — reply with one page of live processes, in

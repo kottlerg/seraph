@@ -40,6 +40,14 @@ use init_protocol::InitInfo;
 
 use crate::TestContext;
 
+/// The core key of the CPU this thread runs on, as `integration::smt_siblings`
+/// expects the kernel to have recorded it: `cpu`, since the kernel takes each
+/// hart as a core of its own (core/kernel/docs/scheduler.md § SMT Awareness).
+pub fn core_key(cpu: u32) -> u32
+{
+    cpu
+}
+
 /// A fresh range-capability lineage root for `integration::range_copy_lineage`:
 /// the low page split off a copy of a boot `Mmio` aperture cap of at least two
 /// pages (riscv64 has no I/O ports). The apertures are taken from `InitInfo`'s

@@ -6,9 +6,9 @@ lower ones fairly, by weight. Whenever a CPU schedules (block, yield, slice expi
 wake), it selects the highest-level runnable RT thread, else the next thread of its fair queue. A
 wake does not preempt a running thread, with one exception: a running fair thread is preempted at
 the next timer tick while an RT thread is queued on its CPU. Otherwise a newly runnable thread
-waits until the running thread blocks or yields or its slice expires. Using SMT topology to
-spread threads across physical cores rather than packing them onto one is design intent, not
-yet implemented ([#267](https://github.com/kottlerg/seraph/issues/267)).
+waits until the running thread blocks or yields or its slice expires. Among CPUs of equal load,
+placement prefers one whose SMT siblings are idle, so threads spread across physical cores
+before they share one (§ SMT Awareness).
 
 The scheduler interacts with two subsystems:
 
@@ -168,6 +168,10 @@ pub struct PerCpuScheduler
     /// The idle pull's confirmation sample: the CPU this CPU found backlogged at its
     /// previous idle tick (§ Load Balancing).
     idle_pull_candidate: AtomicUsize,
+
+    /// Whether the previous idle tick held the candidate one tick more, a sibling of
+    /// this CPU being busy (§ SMT Awareness).
+    idle_pull_held: AtomicBool,
 
     /// Where the idle pull's scan starts: past the last candidate on which a pull
     /// found nothing it could take (§ Load Balancing).
@@ -432,8 +436,9 @@ cache-friendly — a thread's TCB is typically hot in CPU N's caches.
 `select_target_cpu`. A hard affinity set by `SYS_THREAD_SET_AFFINITY` before the start wins
 unconditionally. Otherwise the thread stays on `preferred_cpu` if that CPU's load
 (`current_load()`) is within `LOAD_BALANCE_IMBALANCE_THRESHOLD` of the least-loaded CPU's,
-and goes to the least-loaded CPU if not. The placement is recorded in `tcb.preferred_cpu`
-and used for subsequent wakeups.
+and goes to the least-loaded CPU if not, a tie going to the CPU with the fewest busy SMT
+siblings (§ SMT Awareness). The placement is recorded in `tcb.preferred_cpu` and used for
+subsequent wakeups.
 
 ### Load Balancing
 
@@ -474,12 +479,13 @@ Victim selection is mode-dependent:
   run-queue mask above the idle queue's), is pulled once it has outlived one tick: the
   idle CPU records the first such CPU in its scan's order as its candidate
   (`PerCpuScheduler::idle_pull_candidate`) and, at its next idle tick, pulls from that CPU
-  if it still has one, else records afresh. A CPU whose queue holds only its idle thread
-  is no backlog. The candidate is cleared after every attempt, when no CPU has a backlog,
-  and on every tick the CPU runs another thread. A pull from the candidate that finds no
-  thread it can take (`sched::PullOutcome::NothingPullable`: the backlog is pinned, or
-  still mid-handoff) moves the cursor to the CPU after the candidate, so the next backlog
-  recorded is another CPU's. The scan is `sched::idle_scan`, the decision
+  if it still has one, else records afresh. An idle CPU with a busy SMT sibling holds a
+  confirmed candidate one tick more before it pulls (§ SMT Awareness). A CPU whose queue
+  holds only its idle thread is no backlog. The candidate is cleared after every attempt,
+  when no CPU has a backlog, and on every tick the CPU runs another thread. A pull from the
+  candidate that finds no thread it can take (`sched::PullOutcome::NothingPullable`: the
+  backlog is pinned, or still mid-handoff) moves the cursor to the CPU after the candidate,
+  so the next backlog recorded is another CPU's. The scan is `sched::idle_scan`, the decision
   `sched::idle_pull_step`, and the tick `sched::idle_pull_tick`.
 
 The idle CPU's pull below the threshold is what keeps a thread from starving while a CPU
@@ -489,7 +495,10 @@ strict priority) stays queued for as long as that thread runs. The threshold doe
 one queued thread as an imbalance (a load of 2 with the linked idle thread), and
 `select_target_cpu` keeps a woken thread on its preferred CPU at that load. An idle CPU
 therefore pulls it, or another queued thread, within 2 + 2k + 2d + 2r idle ticks: one tick to
-record it and one to pull it, plus what each other outcome of an idle tick costs.
+record it and one to pull it, plus what each other outcome of an idle tick costs. An idle CPU
+with a busy SMT sibling holds each confirmed candidate one tick before it pulls (§ SMT
+Awareness), so each two-tick cost below is three for it, and its bound is 3 + 3k + 3d + 3r;
+the outcomes that cost no tick still cost none, since a pull above the threshold is not held.
 
 - Recording a CPU ahead of it in the cursor's order whose queued threads no pull can take
   (pinned, or mid-handoff) costs two ticks: one to record that CPU and one to find nothing
@@ -515,9 +524,10 @@ The rule stays bounded: only an idle CPU pulls below the threshold, and a pull l
 so two busy CPUs never trade threads (the steady state the threshold protects); a busy CPU
 with nothing queued but its idle thread draws no attempt; a backlog that clears between two
 idle ticks stays with the CPU whose caches hold it; and a backlog of pinned threads, which no
-pull can take, draws at most one try-lock attempt per idle CPU every two ticks while its load
-reads at or below the threshold (above it, one per idle CPU every tick, and two in a tick
-whose pull above the threshold moves nothing while a candidate is confirmed).
+pull can take, draws at most one try-lock attempt per idle CPU every two ticks (three for an
+idle CPU with a busy SMT sibling) while its load reads at or below the threshold (above it,
+one per idle CPU every tick, and two in a tick whose pull above the threshold moves nothing
+while a candidate is confirmed).
 
 The loads that choose a pull are read without the CPUs' locks, and a CPU's `schedule()`
 raises its own load for a moment under its lock: it counts every requeue of the running
@@ -601,7 +611,9 @@ Hot-path cost per CPU per tick:
   candidate and cursor and one of the candidate's run-queue mask, and a Relaxed store of its
   own candidate (and of its cursor when a pull from the candidate found nothing pullable),
   fields only this CPU writes. A pull above the threshold that finds nothing pullable adds a
-  second scan of the same cost.
+  second scan of the same cost. Each idle tick also loads its own `idle_pull_held` (Relaxed)
+  and stores it with its candidate, and a confirmed candidate not held the tick before adds a
+  `has_no_work` read of each of the idle CPU's SMT siblings (§ SMT Awareness).
 - Busy CPU: one Relaxed load of its own candidate (a store only on the first busy tick
   after an idle one) and one of its own load, plus, with an empty queue, one Relaxed load
   per remote CPU, or, with queued threads, one Relaxed increment + one Relaxed load for the
@@ -617,51 +629,70 @@ Hot-path cost per CPU per tick:
 ## SMT Awareness
 
 On systems with Simultaneous Multi-Threading (Hyper-Threading on Intel, SMT on AMD),
-multiple logical CPUs share physical execution resources on the same core.
+multiple logical CPUs share physical execution resources on the same core. The kernel records
+which CPUs share a core and, among CPUs of equal load, places work on a CPU whose siblings are
+idle, so threads spread across cores before they share one.
 
 SMT siblings are not an isolation boundary. The scheduler places threads of different processes
 on the siblings of one core at once, and contention for the resources the siblings share is a
-channel between them; the scheduler does no core scheduling by trust. The system's posture is
-[docs/capability-model.md](../../../docs/capability-model.md) § Microarchitectural Isolation.
-
-SMT topology awareness is design intent, not yet implemented
-([#267](https://github.com/kottlerg/seraph/issues/267)). The kernel records no physical-core
-or sibling topology, and `try_pull_balance`, `try_pull_idle` and `select_target_cpu` place
-threads by per-CPU `current_load()` and, for the idle pull, the run-queue mask alone. The
-subsections below describe the intended design.
+channel between them; the scheduler does no core scheduling by trust, and core scheduling keyed
+on a security domain is not implemented ([#1086](https://github.com/kottlerg/seraph/issues/1086)).
+The system's posture is [docs/capability-model.md](../../../docs/capability-model.md)
+§ Microarchitectural Isolation.
 
 ### Topology Detection
 
-Physical core membership would be detected at boot via CPUID (x86-64 extended topology
-leaf) or the device tree (RISC-V). Each `PerCpuData` would record:
+Each CPU records its core key, a value equal for exactly the logical CPUs that share one core
+(`arch::current::cpu::core_key`, [arch-interface.md](arch-interface.md) § cpu), in its
+slot of the per-CPU `CORE_SLOTS` slab (`topology::record_this_cpu`): the boot CPU in
+Phase 8 before it starts the APs, each AP in `kernel_entry_ap` before it reports itself
+online.
 
-```rust
-struct PerCpuData
-{
-    cpu_id: u32,
-    physical_core_id: u32,
-    smt_sibling_mask: u64,  // bitmask of logical CPUs sharing this physical core
-}
-```
+- **x86-64**: the x2APIC ID with the SMT level's bits shifted out. The topology leaf is
+  `CPUID` 1FH where the CPU enumerates it, else 0BH; the shift is the `EAX[4:0]` of its SMT
+  level (level type 1). A CPU with no SMT level shifts by 0, each logical CPU a core of its own,
+  and a CPU whose leaf enumerates no level keys by its CPU index, with the same result.
+- **riscv64**: each hart is a core of its own, keyed by its CPU index. The ISA defines no
+  register that names a hart's core; the platform describes the grouping in the device tree
+  (`cpu-map`) or ACPI (PPTT), which the bootloader does not parse. That parsing waits until a
+  platform Seraph supports has multithreaded harts.
+
+Once every AP is online, the boot CPU links each core's CPUs into a ring
+(`topology::build_sibling_rings`): the per-CPU `SIBLING_RING` slab holds, for each CPU, the
+next CPU of its core in ascending index order, wrapping, and a CPU alone on its core links to
+itself. The boot CPU halts by name when a CPU recorded no key, and logs
+`topology: N core(s), at most M thread(s) per core`. It publishes the ring with a Release
+store; it is read-only from then on, and a reader before the publication sees no siblings. A
+ring holds one entry per CPU, where a CPU set per core would cost a CPU-count-wide mask per core
+([docs/coding-standards.md](../../../docs/coding-standards.md) § CPU-Count Width), and a reader
+walks only the CPUs of one core. `SYS_SYSTEM_INFO(SmtSibling)` reports it
+([syscalls.md](syscalls.md) § SYS_SYSTEM_INFO).
 
 ### Scheduling Preference
 
-The load balancer would prefer to spread threads across distinct physical cores rather
-than filling one core's SMT siblings:
+A sibling is busy when `PerCpuScheduler::has_no_work` fails for it: it runs a thread other
+than its idle thread, or queues one. The read is lockless and Relaxed, and a sibling that
+changes state under it costs one placement its tie-break, never correctness.
 
-```
-when assigning a new thread to a CPU:
-    prefer a CPU whose physical_core is not already occupied by another thread
-    over a CPU that is a SMT sibling of a running thread
-```
+- **Placement** (`select_target_cpu`, § Thread Assignment): a tie on the least load goes to
+  the CPU with the fewest busy siblings, then to the lowest index. The rings are walked only for
+  the CPUs that tie on the least load seen so far, and no more once a CPU of an idle core holds
+  it. The sticky preferred CPU is still taken first when its load is within the threshold, since
+  the caches it holds outweigh the spread, and a hard affinity still wins.
+- **Idle pull** (`try_pull_idle`, § Load Balancing): idle CPUs decide independently, each at
+  its own tick, so the preference is a delay. An idle CPU that would pull from its confirmed
+  candidate while one of its siblings is busy holds the candidate for one tick, once
+  (`sched::IdlePullStep::Hold`, recorded in `PerCpuScheduler::idle_pull_held`); an idle CPU
+  of an idle core that confirms the same backlog in that tick pulls it first. A pull above the
+  threshold is not held, since a load past it is an imbalance rather than a tie. The hold raises
+  that CPU's bound to 3 + 3k + 3d + 3r ticks (§ Load Balancing).
+- A busy CPU's pull (`try_pull_balance`) takes no account of siblings: its own core is busy
+  already.
 
-This preference would be soft — if all physical cores are occupied, threads would be
-distributed across SMT siblings. The preference would be implemented as a tie-break in the
-load metric rather than as a hard constraint.
-
-SMT awareness would have no effect on the scheduler's correctness — it is a performance
-optimisation to avoid resource sharing between threads that could otherwise run
-independently.
+The preference is soft: when every core has a busy CPU, threads go to siblings as the loads
+direct, and affinity is unchanged. On a machine without SMT every CPU is alone on its core, no
+CPU has a busy sibling, and placement and the idle pull behave as they would without the
+preference.
 
 ---
 

@@ -820,6 +820,10 @@ pub fn run_all(ctx: &TestContext)
         "sysinfo::speculation_controls_views",
         sysinfo::speculation_controls_views(ctx)
     );
+    run_test!(
+        "sysinfo::smt_sibling_range",
+        sysinfo::smt_sibling_range(ctx)
+    );
 
     // ── Entropy syscalls ──────────────────────────────────────────────────────
     run_test!(

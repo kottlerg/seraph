@@ -12,6 +12,10 @@
 //! same on every run, and the Ed25519 edge cases are built with the curve
 //! arithmetic of [`edwards`], which is independent of `shared/crypto`.
 //!
+//! The signing section holds a seed, a message, and the public key and
+//! signature OpenSSL derives from them; it fails when OpenSSL's key or
+//! signature for an RFC 8032 § 7.1 secret differs from the RFC's.
+//!
 //! An Ed25519 verdict names the first RFC 8032 check that fails, in order: S
 //! at or above the group order L, a public key that is not the canonical
 //! encoding of a point, then OpenSSL's cofactorless verification. OpenSSL
@@ -45,6 +49,10 @@ use crate::wycheproof::{self, Case as _, Expected, eddsa};
 pub const ED25519_SEED: u64 = 0x5e4a_ed25;
 /// The number of generated Ed25519 rounds.
 pub const ED25519_ROUNDS: usize = 128;
+/// The seed of the generated Ed25519 signing inputs.
+pub const ED25519_SIGNING_SEED: u64 = 0x5e4a_5164;
+/// The number of generated Ed25519 signing inputs.
+pub const ED25519_SIGNING_ROUNDS: usize = 48;
 /// The seed of the generated SHA-512 messages.
 pub const SHA512_SEED: u64 = 0x5e4a_9512;
 /// The number of long SHA-512 messages, beside every length from 0 to 300.
@@ -267,6 +275,43 @@ fn message_where(
     Err(Error(format!("no message makes the equation {equation:?}")))
 }
 
+/// RFC 8032 § 7.1 TEST 1 to 3: the secret key, the message, the public key
+/// and the signature, in hex.
+const RFC8032_SIGNING: [[&str; 4]; 3] = [
+    [
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+        "",
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
+    ],
+    [
+        "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+        "72",
+        "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+        "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+    ],
+    [
+        "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+        "af82",
+        "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+        "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a",
+    ],
+];
+
+/// The message lengths of the first generated signing inputs: the empty
+/// message, one byte, and the lengths either side of SHA-512's padding
+/// boundaries (a hashed length of 111/112 and 239/240 bytes) and of its first
+/// block boundary (128 bytes) in the challenge hash, which hashes 64 bytes of
+/// `R ‖ A` before the message, and in the nonce hash, which hashes the
+/// 32-byte prefix before it.
+const SIGNING_LENGTHS: [usize; 14] = [0, 1, 47, 48, 63, 64, 79, 80, 95, 96, 175, 176, 207, 208];
+
+/// The bytes of the hex string `text`, which the generator states.
+fn unhex(text: &str) -> Result<Vec<u8>, Error>
+{
+    hex::decode(text).map_err(|e| Error(format!("{e:?} in {text:?}")))
+}
+
 /// `R = O, S = 0`: valid under the identity key for every message.
 fn identity_signature() -> [u8; 64]
 {
@@ -396,26 +441,80 @@ impl Ed25519
         Ok((public_key, signature))
     }
 
-    /// The file: its header and its three sections.
+    /// The file: its header and its four sections.
     fn file(&self) -> Result<String, Error>
     {
         let generated = self.generated()?;
         let edge_cases = self.edge_cases()?;
         let acceptable = self.wycheproof_acceptable()?;
-        let count = generated.len() + edge_cases.len() + acceptable.len();
+        let signing = self.signing()?;
+        let count = generated.len() + edge_cases.len() + acceptable.len() + signing.len();
         Ok(vector_file(
             &[
                 ("schema", json!(ed25519::SCHEMA)),
                 ("seed", json!(ED25519_SEED)),
                 ("rounds", json!(ED25519_ROUNDS)),
+                ("signingSeed", json!(ED25519_SIGNING_SEED)),
+                ("signingRounds", json!(ED25519_SIGNING_ROUNDS)),
                 ("numberOfTests", json!(count)),
             ],
             &[
                 ("generated", generated),
                 ("edgeCases", edge_cases),
                 ("wycheproofAcceptable", acceptable),
+                ("signing", signing),
             ],
         ))
+    }
+
+    /// One signing case: the seed and the message, with the public key and
+    /// the signature OpenSSL derives from them.
+    fn signing_case(&self, label: &str, seed: &[u8; 32], message: &[u8]) -> Result<Value, Error>
+    {
+        let (public_key, signature) = self.sign(seed, message)?;
+        Ok(json!({
+            "label": label,
+            "seed": hex::encode(seed),
+            "message": hex::encode(message),
+            "publicKey": hex::encode(&public_key),
+            "signature": hex::encode(&signature),
+        }))
+    }
+
+    /// The signing inputs: the RFC 8032 § 7.1 secrets (OpenSSL must give the
+    /// RFC's key and signature), the all-zero and all-one seeds, and random
+    /// seeds over the message lengths of [`SIGNING_LENGTHS`], then random
+    /// lengths up to a few blocks of the hash.
+    fn signing(&self) -> Result<Vec<Value>, Error>
+    {
+        let mut out = Vec::new();
+        for (test, [secret, message, public_key, signature]) in RFC8032_SIGNING.iter().enumerate()
+        {
+            let label = format!("RFC 8032 TEST {}", test + 1);
+            let seed = array(&unhex(secret)?);
+            let case = self.signing_case(&label, &seed, &unhex(message)?)?;
+            if case["publicKey"] != *public_key || case["signature"] != *signature
+            {
+                return Err(Error(format!("{label}: OpenSSL differs from the RFC")));
+            }
+            out.push(case);
+        }
+        let message = b"seraph ed25519 signing".as_slice();
+        out.push(self.signing_case("seed all zero", &[0; 32], message)?);
+        out.push(self.signing_case("seed all one", &[0xff; 32], message)?);
+        let mut rng = Rng::new(ED25519_SIGNING_SEED);
+        for round in 0..ED25519_SIGNING_ROUNDS
+        {
+            let seed: [u8; 32] = rng.array();
+            let len = match SIGNING_LENGTHS.get(round)
+            {
+                Some(len) => *len,
+                None => rng.below(4096),
+            };
+            let message = rng.bytes(len);
+            out.push(self.signing_case(&format!("round {round}"), &seed, &message)?);
+        }
+        Ok(out)
     }
 
     /// The generated rounds. Each signs a random message (empty, short, or

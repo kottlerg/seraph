@@ -5,7 +5,8 @@
 
 //! The Ed25519 reference vectors: generated signatures with their one-bit
 //! corruptions, a corpus of edge cases, and the acceptable Wycheproof cases,
-//! each input with the reference's verdict.
+//! each input with the reference's verdict; and signing inputs, each a seed
+//! and a message with the public key and the signature the reference derives.
 //!
 //! The vectors are `vectors/reference/ed25519.json`, which the
 //! [`generate`](crate::generate) module writes with OpenSSL as the
@@ -36,7 +37,7 @@ use crate::vectors::{self, LoadError};
 pub const FILE: &str = "ed25519.json";
 
 /// The schema the file declares, which [`load`] checks.
-pub const SCHEMA: &str = "seraph_ed25519_reference_v1";
+pub const SCHEMA: &str = "seraph_ed25519_reference_v2";
 
 /// The file's text.
 const TEXT: &str = include_str!("../vectors/reference/ed25519.json");
@@ -132,6 +133,51 @@ impl Input
     }
 }
 
+/// One signing input: a secret seed and a message, with the reference's
+/// public key and signature (RFC 8032 § 5.1.5, § 5.1.6).
+#[derive(Clone, PartialEq, Eq)]
+pub struct SignInput
+{
+    /// What the input exercises.
+    pub label: String,
+    /// The 32-byte secret seed.
+    pub seed: [u8; 32],
+    /// The message.
+    pub message: Vec<u8>,
+    /// The reference's public key of the seed.
+    pub public_key: [u8; 32],
+    /// The reference's signature over the message.
+    pub signature: [u8; 64],
+}
+
+impl fmt::Debug for SignInput
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+    {
+        write!(
+            f,
+            "{}: seed {} msg {}",
+            self.label,
+            hex::encode(&self.seed),
+            hex::encode(&self.message)
+        )
+    }
+}
+
+impl SignInput
+{
+    fn from_json(value: &Value) -> Result<Self, LoadError>
+    {
+        Ok(Self {
+            label: vectors::string(value, "label")?.to_owned(),
+            seed: vectors::fixed(value, "seed")?,
+            message: vectors::bytes(value, "message")?,
+            public_key: vectors::fixed(value, "publicKey")?,
+            signature: vectors::fixed(value, "signature")?,
+        })
+    }
+}
+
 /// The reference vectors.
 #[derive(Debug, Clone)]
 pub struct Vectors
@@ -149,6 +195,10 @@ pub struct Vectors
     /// Every case the vendored Wycheproof file marks acceptable (a small- or
     /// mixed-order key), labelled with its `tcId`.
     pub wycheproof_acceptable: Vec<Input>,
+    /// Signing inputs: the RFC 8032 § 7.1 secrets, the all-zero and all-one
+    /// seeds, and random seeds over messages of every length either side of
+    /// the hash's block boundaries and of random lengths.
+    pub signing: Vec<SignInput>,
 }
 
 impl Vectors
@@ -199,9 +249,15 @@ fn parse(text: &str) -> Result<Vectors, LoadError>
         generated: section("generated")?,
         edge_cases: section("edgeCases")?,
         wycheproof_acceptable: section("wycheproofAcceptable")?,
+        signing: vectors::array(&document, "signing")?
+            .iter()
+            .map(SignInput::from_json)
+            .collect::<Result<_, _>>()?,
     };
-    let found =
-        loaded.generated.len() + loaded.edge_cases.len() + loaded.wycheproof_acceptable.len();
+    let found = loaded.generated.len()
+        + loaded.edge_cases.len()
+        + loaded.wycheproof_acceptable.len()
+        + loaded.signing.len();
     vectors::check_header(&document, SCHEMA, found)?;
     Ok(loaded)
 }
@@ -221,10 +277,16 @@ mod tests
 
     fn file(declared: usize, generated: &[String]) -> String
     {
+        signing_file(declared, generated, &[])
+    }
+
+    fn signing_file(declared: usize, generated: &[String], signing: &[String]) -> String
+    {
         format!(
             r#"{{"schema": "{SCHEMA}", "numberOfTests": {declared}, "generated": [{}],
-            "edgeCases": [], "wycheproofAcceptable": []}}"#,
-            generated.join(",")
+            "edgeCases": [], "wycheproofAcceptable": [], "signing": [{}]}}"#,
+            generated.join(","),
+            signing.join(",")
         )
     }
 
@@ -243,6 +305,35 @@ mod tests
             Some(Verdict::Accept)
         );
         assert_eq!(loaded.verdict(&[0x11; 32], &[0xac], &[0x22; 64]), None);
+    }
+
+    #[test]
+    fn parse_reads_a_signing_case_into_its_fields_and_counts_it()
+    {
+        let signing = format!(
+            r#"{{"label": "s", "seed": "{}", "message": "ab", "publicKey": "{}", "signature": "{}"}}"#,
+            "01".repeat(32),
+            "02".repeat(32),
+            "03".repeat(64)
+        );
+        let loaded = parse(&signing_file(1, &[], std::slice::from_ref(&signing))).unwrap();
+        assert_eq!(
+            loaded.signing,
+            [SignInput {
+                label: "s".into(),
+                seed: [1; 32],
+                message: vec![0xab],
+                public_key: [2; 32],
+                signature: [3; 64],
+            }]
+        );
+        assert!(matches!(
+            parse(&signing_file(2, &[], &[signing])),
+            Err(LoadError::Count {
+                declared: 2,
+                found: 1
+            })
+        ));
     }
 
     #[test]

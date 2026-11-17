@@ -31,6 +31,7 @@ core/kernel/
 │   ├── platform.rs             # kernel_mmio cache (Phase 4), Phase 6 MMIO-aperture validation
 │   ├── stack_depth.rs          # Kernel stack paint and deepest-use report (StackHighWater)
 │   ├── sync.rs                 # Kernel synchronisation primitives
+│   ├── topology.rs             # SMT sibling topology: per-CPU core keys and sibling rings
 │   ├── uaccess.rs              # Fault-recoverable user-memory copies
 │   ├── validate.rs             # Phase 0 boot-info validation
 │   ├── arch/                   # Architecture-specific implementations

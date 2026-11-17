@@ -189,8 +189,8 @@ impl Events
 {
     /// Acquire the `PM1a` event block and the `GPE0` block through
     /// `devmgr`, bind them to `thread`, the calling thread, then acquire the
-    /// SCI; on the first start of the boot, clear the events
-    /// ([`acpid::events::clear`]) at once. `None`, logged, when the platform
+    /// SCI; unless devmgr reports a restart, a failed answer included, clear
+    /// the events ([`acpid::events::clear`]) at once. `None`, logged, when the platform
     /// lacks the `PM1a` block or the SCI, or a block cannot be bound; a
     /// `GPE0` block that cannot be used is logged and left out.
     pub fn acquire(devmgr: &Devmgr, thread: u64) -> Option<Self>
@@ -236,10 +236,11 @@ impl Events
             release(&[Some(pm1.cap), gpe0.map(|g| g.cap)]);
             return None;
         };
-        // The blocks are bound before the SCI is asked for, so the first
-        // start's clear below cannot fail once devmgr has recorded the SCI
-        // as served, which tells every later acpid of the boot that it is a
-        // restart.
+        // The blocks are bound before the SCI is asked for, so the events
+        // can be cleared whatever devmgr answers. devmgr records the SCI as
+        // served, which tells every later acpid of the boot that it is a
+        // restart, even when its reply fails to reach acpid; so every answer
+        // but a restart's, a failed one included, clears the events here.
         let bound =
             bind(thread, pm1.cap).and_then(|()| gpe0.map_or(Ok(()), |g| bind(thread, g.cap)));
         if let Err(e) = bound
@@ -258,6 +259,7 @@ impl Events
             Err(e) =>
             {
                 std::os::seraph::log!(warn: "no SCI ({e:?}); no events");
+                acpid::events::clear(&mut Ports { layout }, &layout);
                 release(&[Some(pm1.cap), gpe0.map(|g| g.cap)]);
                 return None;
             }

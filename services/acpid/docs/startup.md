@@ -35,9 +35,10 @@ the main thread answer each power request `NO_DEVICE`, and one that delivered no
    for the SCI; a missing one is logged, and the request or the events that need it go without:
    `NO_DEVICE` for the request, no events without the PM1a event block or the SCI, no GPEs
    without GPE0. devmgr's answer for the SCI says whether an acpid took it earlier in the boot.
-   On the first start acpid then disables every event and clears every status at once, so no
-   later acpid of the boot, which devmgr tells it is a restart, takes the press that turned the
-   machine on for a new one. It then reads the FADT (`QUERY_ACPI_TABLE`) for its
+   On any other answer, a failed one included (devmgr records the SCI as served even when its
+   reply does not reach acpid), acpid then disables every event and clears every status at
+   once, so no later acpid of the boot, which devmgr tells it is a restart, takes the press
+   that turned the machine on for a new one. It then reads the FADT (`QUERY_ACPI_TABLE`) for its
    `PWR_BUTTON` flag. RISC-V has none of them.
 2. **Tables.** acpid asks devmgr for the DSDT (`QUERY_ACPI_TABLE` with the signature
    `DSDT`, which devmgr resolves through the FADT), then for SSDT 0, 1, ... until devmgr

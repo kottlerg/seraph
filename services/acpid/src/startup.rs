@@ -8,8 +8,9 @@
 //! where the platform has a legacy mode, run the module-level code and the
 //! initialization walk, then evaluate each PCI host bridge's `_PRT`, `_OSC`
 //! and `_CRS` and push the results to devmgr. The event blocks and the SCI
-//! are acquired at the start, and the first start of the boot clears the
-//! events there, before anything else can fail and restart acpid. Every failure is logged and the
+//! are acquired at the start, and a start that devmgr does not report as a
+//! restart clears the events there, before anything else can fail and
+//! restart acpid. Every failure is logged and the
 //! sequence goes on with what it has; the thread then arms the events and
 //! serves (`crate::server`).
 

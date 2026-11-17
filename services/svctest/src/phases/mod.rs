@@ -54,6 +54,7 @@ pub mod layout;
 pub mod log_client;
 pub mod memmgr;
 pub mod namespace;
+pub mod node_handle;
 pub mod pager;
 pub mod pipes;
 pub mod process_faults;
@@ -89,6 +90,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(devmgr::phases());
     out.extend_from_slice(pager::phases());
     out.extend_from_slice(budget::phases());
+    out.extend_from_slice(node_handle::phases());
     out.extend_from_slice(heap_commit::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());

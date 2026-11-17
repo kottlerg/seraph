@@ -59,9 +59,11 @@ aborts ([startup.md](startup.md) § Failures).
 A `PCI_Config` field access is one `ACPI_PCI_CONFIG` call. devmgr allows a read of any
 function: one no device record holds, or a removed one, reads all-ones without an access, as an
 absent function does. It allows a write only at offset 0x40 and above, past the header whose
-BARs, Command register and bus numbers devmgr programs, of a function whose record no driver has
-been started for. Any other write is refused and logged. The access runs on devmgr's control
-thread (§ Ordering), so no bind of the function interleaves with it.
+BARs, Command register and bus numbers devmgr programs, of a function whose record is unbound: no
+driver has been started for it, and devmgr has not taken it as a RISC-V IOMMU unit, whose memory
+decode and bus mastering it turned on for the IOMMU driver. Any other write is refused and
+logged. The access runs on devmgr's control thread (§ Ordering), so no bind of the function
+interleaves with it.
 
 ---
 

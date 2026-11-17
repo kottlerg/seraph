@@ -7,9 +7,14 @@
 //! multiplication, decompression, and encoding.
 //!
 //! A [`Point`] is `[X, Y, Z, T]` with affine `x = X/Z`, `y = Y/Z`, and
-//! `T = XY/Z` (Hisil–Wong–Carter–Dawson extended coordinates). Scalar
-//! multiplication is a constant-shape conditional-swap ladder; constant time
-//! is not required for verification, but the swap form is simple and correct.
+//! `T = XY/Z` (Hisil–Wong–Carter–Dawson extended coordinates).
+//!
+//! Scalar multiplication is a conditional-swap ladder over all 256 bits of the
+//! scalar with the complete addition formula, so its work and its memory
+//! accesses do not depend on the scalar: the signer's secret scalar and nonce
+//! pass through [`scalar_mul_base`]. A faster method that depends on the
+//! scalar is for public scalars only and is a function of its own. Point
+//! decompression is variable-time and takes public keys only.
 
 #![expect(
     clippy::many_single_char_names,
@@ -76,7 +81,8 @@ fn cswap(p: &mut Point, q: &mut Point, swap: u8)
     }
 }
 
-/// `[s] q` for a little-endian scalar `s`.
+/// `[s] q` for a little-endian scalar `s`, in constant time in `s`: every bit
+/// takes the same two additions and two swaps by mask.
 pub(crate) fn scalar_mul(q: &Point, s: &[u8; 32]) -> Point
 {
     let mut p = IDENTITY;
@@ -262,6 +268,18 @@ mod tests
     fn order_times_base_is_identity()
     {
         assert_eq!(pack(&scalar_mul_base(&L)), IDENTITY_ENCODED);
+    }
+
+    /// The ladder performs the same field multiplications and conditional
+    /// swaps for every scalar, the extreme bit patterns included.
+    #[test]
+    fn scalar_multiplication_does_the_same_field_work_for_every_scalar()
+    {
+        let mut top_bit = [0u8; 32];
+        top_bit[31] = 0x80;
+        let scalars = [[0u8; 32], scalar_one(), L, top_bit, [0xff; 32]];
+        let work = scalars.map(|s| crate::field::op_count::of(|| scalar_mul_base(&s)));
+        assert!(work.iter().all(|w| *w == work[0]), "{work:?}");
     }
 
     #[test]

@@ -62,6 +62,10 @@ services/svctest/
         │                      #   faults on a fragmented pool; a sparse large region
         ├── budget.rs          # Create-time memory max: clamp, grants to it, LIMIT, decline 10,
         │                      #   pages back after the destroy; reserve and max refusals
+        ├── node_handle.rs     # memmgr node handles: class refusals, sub-node clamp, a max set
+        │                      #   while the child runs, LIMIT, limit event, lowering reclaims
+        │                      #   nothing, released and dead handles refused; two children
+        │                      #   charged to one sub-node share its budget
         ├── heap_commit.rs     # Committed heap growth: max refusal as an allocation error, a grant
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity
@@ -267,6 +271,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `random-diverge-child`      | `random`       | `random` (per-process hash seed)            |
 | `aslr-layout-diverge-child` | `random`       | `aslr-layout` (per-process layout tuple)    |
 | `stale-map-child`           | `unmount`      | `vfsd_unmount_stale_mapping` (mapped page)  |
+| `budget-child`              | `budget`       | `procmgr_memory_max` (4096-page max)        |
+| `node-handle-child`         | `node_handle`  | `memmgr_node_handles` (max set by handle)   |
 | `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |

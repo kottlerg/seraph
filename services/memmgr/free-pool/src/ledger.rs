@@ -35,8 +35,8 @@
 //! § Commit).
 
 use crate::arena::{
-    Arena, Commitment, DeferredRun, FrameDesc, NO_REGION_ID, NODE_NULL, Node, NodeIdx, ProcessCaps,
-    ProcessRecord, RegionNode, Slot, SlotStore,
+    Arena, Commitment, DeferredRun, FrameDesc, LimitReg, NO_REGION_ID, NODE_NULL, Node, NodeHandle,
+    NodeIdx, ProcessCaps, ProcessRecord, RegionNode, Slot, SlotStore,
 };
 use crate::budget::{self, BudgetNode, ChargeError, NodeError, NodeSpec};
 use crate::chunk::{self, ChunkEntry, ChunkError};
@@ -165,11 +165,13 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         self.pool.free_pages().saturating_sub(self.promised)
     }
 
-    /// The record slot keyed by `badge`.
+    /// The record slot keyed by `badge`, the badge of a process.
     #[must_use]
     pub fn find(&self, badge: u64) -> Option<NodeIdx>
     {
-        self.index.find(&self.arena, badge)
+        self.index
+            .find(&self.arena, badge)
+            .filter(|&rec| self.record(rec).is_some())
     }
 
     /// The record in slot `rec`.
@@ -188,7 +190,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::ChunkDir(_)
             | Node::Chunk(_)
             | Node::Caps(_)
-            | Node::Commit(_) => None,
+            | Node::Commit(_)
+            | Node::Handle(_)
+            | Node::Limit(_) => None,
         }
     }
 
@@ -207,7 +211,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::ChunkDir(_)
             | Node::Chunk(_)
             | Node::Caps(_)
-            | Node::Commit(_) => None,
+            | Node::Commit(_)
+            | Node::Handle(_)
+            | Node::Limit(_) => None,
         }
     }
 
@@ -227,7 +233,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Process(_)
             | Node::ChunkDir(_)
             | Node::Chunk(_)
-            | Node::Caps(_) => None,
+            | Node::Caps(_)
+            | Node::Handle(_)
+            | Node::Limit(_) => None,
         }
     }
 
@@ -271,7 +279,9 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             | Node::Process(_)
             | Node::ChunkDir(_)
             | Node::Chunk(_)
-            | Node::Commit(_) => None,
+            | Node::Commit(_)
+            | Node::Handle(_)
+            | Node::Limit(_) => None,
         }
     }
 
@@ -308,6 +318,8 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
             aspace: 0,
             pressure: 0,
             pressure_bits: 0,
+            handles: NODE_NULL,
+            limits: NODE_NULL,
         });
         let Some(caps) = self.arena.alloc(no_caps, NODE_NULL)
         else
@@ -428,17 +440,409 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         }
     }
 
+    // ── Budget-node handles ─────────────────────────────────────────────────
+
+    /// The handle state in slot `h`.
+    #[must_use]
+    pub fn handle(&self, h: NodeIdx) -> Option<NodeHandle>
+    {
+        match self.arena.get(h).node
+        {
+            Node::Handle(s) => Some(s),
+            Node::Free
+            | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
+            | Node::Region(_)
+            | Node::Frame(_)
+            | Node::Process(_)
+            | Node::ChunkDir(_)
+            | Node::Chunk(_)
+            | Node::Caps(_)
+            | Node::Commit(_)
+            | Node::Limit(_) => None,
+        }
+    }
+
+    /// The limit-event registration in slot `reg`, or `None` when `reg`
+    /// holds none.
+    #[must_use]
+    pub fn limit_reg(&self, reg: NodeIdx) -> Option<LimitReg>
+    {
+        match self.arena.get(reg).node
+        {
+            Node::Limit(l) => Some(l),
+            Node::Free
+            | Node::Run(_)
+            | Node::Deferred(_)
+            | Node::Budget(_)
+            | Node::Region(_)
+            | Node::Frame(_)
+            | Node::Process(_)
+            | Node::ChunkDir(_)
+            | Node::Chunk(_)
+            | Node::Caps(_)
+            | Node::Commit(_)
+            | Node::Handle(_) => None,
+        }
+    }
+
+    /// The handle-state slot keyed by `badge`, the badge of a node handle.
+    #[must_use]
+    pub fn find_handle(&self, badge: u64) -> Option<NodeIdx>
+    {
+        self.index
+            .find(&self.arena, badge)
+            .filter(|&h| self.handle(h).is_some())
+    }
+
+    /// Whether `badge` keys a record or a handle state.
+    #[must_use]
+    pub fn key_in_use(&self, badge: u64) -> bool
+    {
+        self.index.find(&self.arena, badge).is_some()
+    }
+
+    /// The handle-state slot of the budget node `node`, named by the node's
+    /// slot `next` link, or `None` when it has none.
+    #[must_use]
+    pub fn node_handle(&self, node: NodeIdx) -> Option<NodeIdx>
+    {
+        budget::node(&self.arena, node)?;
+        let h = self.arena.get(node).next;
+        self.handle(h).map(|_| h)
+    }
+
+    /// Give the budget node of the record `rec` handle state keyed by
+    /// `key` (a badge no slot is keyed by), owned by `rec`, holding a
+    /// reference on the node. Returns the state's slot: the node's existing
+    /// one when it has handle state already.
+    ///
+    /// # Errors
+    /// [`NodeError::Parent`] when `rec` holds no record;
+    /// [`NodeError::NoSlot`] when the arena has no free slot outside its
+    /// reserve or the index no bucket storage.
+    pub fn attach_record_handle(&mut self, rec: NodeIdx, key: u64) -> Result<NodeIdx, NodeError>
+    {
+        let node = self.record(rec).ok_or(NodeError::Parent)?.budget;
+        if let Some(h) = self.node_handle(node)
+        {
+            return Ok(h);
+        }
+        let mut b = budget::node(&self.arena, node).ok_or(NodeError::Parent)?;
+        let h = self.attach(rec, node, key)?;
+        b.refs = b.refs.saturating_add(1);
+        self.arena.set_node(node, Node::Budget(b));
+        Ok(h)
+    }
+
+    /// Make a sub-node under the budget node `parent`, outside the reserve,
+    /// with the max `max` clamped as [`budget::create`] clamps it, and give
+    /// it handle state keyed by `key` (a badge no slot is keyed by), owned by
+    /// the record `owner`. The node's one reference is its handle state's,
+    /// so it lives until that state is dropped and then while a child node or
+    /// a charge refers to it. Returns the state's slot.
+    ///
+    /// # Errors
+    /// [`NodeError::Parent`] when `parent` is not a budget node or `owner`
+    /// holds no record; [`NodeError::NoSlot`] when the arena has fewer than
+    /// the two free slots outside its reserve the node and its state take, or
+    /// the index has no bucket storage. Nothing changes then.
+    pub fn create_sub_node(
+        &mut self,
+        owner: NodeIdx,
+        parent: NodeIdx,
+        max: u64,
+        key: u64,
+    ) -> Result<NodeIdx, NodeError>
+    {
+        if self.record(owner).is_none()
+        {
+            return Err(NodeError::Parent);
+        }
+        if self.arena.available() < 2
+        {
+            return Err(NodeError::NoSlot);
+        }
+        let node = budget::create(
+            &mut self.arena,
+            NodeSpec {
+                parent,
+                max,
+                reserve: false,
+            },
+        )?;
+        self.attach(owner, node, key).inspect_err(|_| {
+            budget::unref(&mut self.arena, node);
+        })
+    }
+
+    /// Allocate handle state for `node` keyed by `key`, index it, link it
+    /// first on the owner `rec`'s list and name it from the node's slot
+    /// `next`. The reference on the node is the caller's to account.
+    fn attach(&mut self, rec: NodeIdx, node: NodeIdx, key: u64) -> Result<NodeIdx, NodeError>
+    {
+        let r = self.record(rec).ok_or(NodeError::Parent)?;
+        let caps = self.caps(rec).ok_or(NodeError::Parent)?;
+        let state = Node::Handle(NodeHandle {
+            key,
+            node,
+            owner: r.badge,
+            limit: NODE_NULL,
+            owned_next: caps.handles,
+        });
+        let h = self
+            .arena
+            .alloc(state, NODE_NULL)
+            .ok_or(NodeError::NoSlot)?;
+        if !self.index.insert(&mut self.arena, h)
+        {
+            self.arena.free(h);
+            return Err(NodeError::NoSlot);
+        }
+        self.update_caps(rec, |c| c.handles = h);
+        self.arena.set_next(node, h);
+        Ok(h)
+    }
+
+    /// Drop the handle state in slot `h`: unindex it, so every handle
+    /// carrying its key is refused from then on, unlink it from its owner's
+    /// list, free it, and drop its reference on its node, which frees the node
+    /// when no record, child node or charge refers to it any more
+    /// ([`budget::unref`]), with its limit registration. Returns the limit
+    /// cap, `0` for none, for the caller to delete; `None` when `h` holds no
+    /// handle state.
+    pub fn drop_handle(&mut self, h: NodeIdx) -> Option<u64>
+    {
+        let s = self.handle(h)?;
+        let limit = self.clear_limit(h);
+        let _ = self.index.remove(&mut self.arena, s.key);
+        if let Some(rec) = self.find(s.owner)
+        {
+            self.unlink_owned(rec, h, s.owned_next);
+        }
+        self.arena.free(h);
+        if budget::node(&self.arena, s.node).is_some()
+        {
+            self.arena.set_next(s.node, NODE_NULL);
+            budget::unref(&mut self.arena, s.node);
+        }
+        Some(limit)
+    }
+
+    /// Unlink the handle state `h`, whose successor is `next`, from the
+    /// list of the record `rec`.
+    fn unlink_owned(&mut self, rec: NodeIdx, h: NodeIdx, next: NodeIdx)
+    {
+        let Some(caps) = self.caps(rec)
+        else
+        {
+            return;
+        };
+        if caps.handles == h
+        {
+            self.update_caps(rec, |c| c.handles = next);
+            return;
+        }
+        let mut cur = caps.handles;
+        while let Some(mut s) = self.handle(cur)
+        {
+            if s.owned_next == h
+            {
+                s.owned_next = next;
+                self.arena.set_node(cur, Node::Handle(s));
+                return;
+            }
+            cur = s.owned_next;
+        }
+    }
+
+    /// Drop every handle state the record `rec` owns ([`Ledger::drop_handle`]),
+    /// calling `release` with each nonzero limit cap.
+    pub fn drop_owned_handles(&mut self, rec: NodeIdx, mut release: impl FnMut(u64))
+    {
+        while let Some(h) = self
+            .caps(rec)
+            .map(|c| c.handles)
+            .filter(|&h| h != NODE_NULL)
+        {
+            match self.drop_handle(h)
+            {
+                Some(0) =>
+                {}
+                Some(cap) => release(cap),
+                None =>
+                {
+                    // A list entry that is no handle state cannot arise; cut
+                    // the list there rather than loop on it.
+                    self.update_caps(rec, |c| c.handles = NODE_NULL);
+                }
+            }
+        }
+    }
+
+    /// Register `cap` as the limit Notification of the handle state `h`,
+    /// signalled with `bits`, made by the record `by`, with which it goes
+    /// ([`Ledger::drop_limits`]), in place of any earlier registration on `h`.
+    /// Returns the cap it replaces, `0` for none, for the caller to delete.
+    ///
+    /// # Errors
+    /// [`NodeError::Parent`] when `h` holds no handle state or `by` no
+    /// record; [`NodeError::NoSlot`] when the arena has no free slot outside
+    /// its reserve. The earlier registration stands then.
+    pub fn set_limit(
+        &mut self,
+        h: NodeIdx,
+        by: NodeIdx,
+        cap: u64,
+        bits: u64,
+    ) -> Result<u64, NodeError>
+    {
+        let mut s = self.handle(h).ok_or(NodeError::Parent)?;
+        let caps = self.caps(by).ok_or(NodeError::Parent)?;
+        let reg = self
+            .arena
+            .alloc(
+                Node::Limit(LimitReg {
+                    cap,
+                    bits,
+                    handle: h,
+                    by,
+                    by_next: caps.limits,
+                }),
+                NODE_NULL,
+            )
+            .ok_or(NodeError::NoSlot)?;
+        self.update_caps(by, |c| c.limits = reg);
+        let prior = self.clear_limit(h);
+        s.limit = reg;
+        self.arena.set_node(h, Node::Handle(s));
+        Ok(prior)
+    }
+
+    /// Take the limit registration off the handle state `h`: unlink it from
+    /// its registrant's list and free its slot. Returns its cap, `0` when `h`
+    /// has none, for the caller to delete.
+    fn clear_limit(&mut self, h: NodeIdx) -> u64
+    {
+        let Some(mut s) = self.handle(h)
+        else
+        {
+            return 0;
+        };
+        let Some(l) = self.limit_reg(s.limit)
+        else
+        {
+            return 0;
+        };
+        let reg = s.limit;
+        s.limit = NODE_NULL;
+        self.arena.set_node(h, Node::Handle(s));
+        self.unlink_limit(l.by, reg, l.by_next);
+        self.arena.free(reg);
+        l.cap
+    }
+
+    /// Unlink the registration `reg`, whose successor is `next`, from the
+    /// list of the record `by`.
+    fn unlink_limit(&mut self, by: NodeIdx, reg: NodeIdx, next: NodeIdx)
+    {
+        let Some(caps) = self.caps(by)
+        else
+        {
+            return;
+        };
+        if caps.limits == reg
+        {
+            self.update_caps(by, |c| c.limits = next);
+            return;
+        }
+        let mut cur = caps.limits;
+        while let Some(mut l) = self.limit_reg(cur)
+        {
+            if l.by_next == reg
+            {
+                l.by_next = next;
+                self.arena.set_node(cur, Node::Limit(l));
+                return;
+            }
+            cur = l.by_next;
+        }
+    }
+
+    /// Drop every limit registration the record `rec` made, on whichever
+    /// handle state it is, calling `release` with each cap.
+    pub fn drop_limits(&mut self, rec: NodeIdx, mut release: impl FnMut(u64))
+    {
+        while let Some(reg) = self
+            .caps(rec)
+            .map(|c| c.limits)
+            .filter(|&reg| reg != NODE_NULL)
+        {
+            match self.limit_reg(reg)
+            {
+                Some(l) if self.handle(l.handle).is_some_and(|s| s.limit == reg) =>
+                {
+                    release(self.clear_limit(l.handle));
+                }
+                _ =>
+                {
+                    // A list entry that is no registration of a live handle
+                    // state cannot arise; cut the list there rather than loop
+                    // on it.
+                    self.update_caps(rec, |c| c.limits = NODE_NULL);
+                }
+            }
+        }
+    }
+
+    /// Set the max of the budget node `node` to `max`, clamped to its
+    /// usage plus its parent chain's headroom ([`budget::clamp_max`]).
+    /// Returns the max it took; `None` when `node` is not a budget node.
+    pub fn set_node_max(&mut self, node: NodeIdx, max: u64) -> Option<u64>
+    {
+        budget::node(&self.arena, node)?;
+        let max = budget::clamp_max(&self.arena, node, max);
+        budget::set_max(&mut self.arena, node, max);
+        Some(max)
+    }
+
+    /// Call `f` with the limit cap and bits of each node on the chain from
+    /// `node` up that has a limit registration and is at its limit
+    /// ([`budget::at_limit`]), `refused` being the pages of a charge just
+    /// refused at `node` (`0` after a charge that was made).
+    pub fn for_each_limit(&self, node: NodeIdx, refused: u64, mut f: impl FnMut(u64, u64))
+    {
+        let mut cur = node;
+        while let Some(b) = budget::node(&self.arena, cur)
+        {
+            if budget::at_limit(&b, refused)
+                && let Some(s) = self.node_handle(cur).and_then(|h| self.handle(h))
+                && let Some(l) = self.limit_reg(s.limit)
+            {
+                f(l.cap, l.bits);
+            }
+            cur = b.parent;
+        }
+    }
+
     /// Unindex and free the record keyed by `badge`, with its caps slot,
-    /// after taking back every frame and freeing every region
-    /// ([`Ledger::reclaim_all`]). Returns the record and its caps as they
-    /// stood, or `None` for an unknown badge. Deleting the caps is the
-    /// caller's.
+    /// after dropping every handle state it owns ([`Ledger::drop_owned_handles`])
+    /// and every limit registration it made ([`Ledger::drop_limits`]),
+    /// `release` taking each limit cap, then taking back every frame and
+    /// freeing every region ([`Ledger::reclaim_all`]). Returns the record and
+    /// its caps as they stood, or `None` for an unknown badge. Deleting the
+    /// caps is the caller's.
     pub fn remove_process(
         &mut self,
         badge: u64,
         quiescent: impl FnMut(&FreeRun) -> bool,
+        mut release: impl FnMut(u64),
     ) -> Option<(ProcessRecord, ProcessCaps)>
     {
+        let rec = self.find(badge)?;
+        self.drop_owned_handles(rec, &mut release);
+        self.drop_limits(rec, &mut release);
         let rec = self.index.remove(&mut self.arena, badge)?;
         self.reclaim_all(rec, quiescent);
         let r = self.record(rec);
@@ -1474,13 +1878,15 @@ mod tests
             .unwrap();
         l.set_aspace_cap(rec, 9);
         assert_eq!(l.set_pressure(rec, 11, 1), Some(0));
-        let (_, caps) = l.remove_process(42, pool_all).unwrap();
+        let (_, caps) = l.remove_process(42, pool_all, |_| {}).unwrap();
         assert_eq!(
             caps,
             ProcessCaps {
                 aspace: 9,
                 pressure: 11,
                 pressure_bits: 1,
+                handles: NODE_NULL,
+                limits: NODE_NULL,
             }
         );
         assert!(l.find(42).is_none());
@@ -1557,7 +1963,7 @@ mod tests
         assert!(l.release_frame_by_region(rec, id, |_| false));
         assert!(!l.release_frame_by_region(rec, id, pool_all));
         // At death, the frame the check refuses joins it there.
-        l.remove_process(7, |r| r.cap_slot != 2).unwrap();
+        l.remove_process(7, |r| r.cap_slot != 2, |_| {}).unwrap();
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (2, 1));
         assert_eq!((l.deferred.pages(), l.deferred.run_count()), (7, 2));
         // Every frame slot became a run slot, pooled or parked; the record's
@@ -1578,7 +1984,7 @@ mod tests
     fn remove_process_of_an_unknown_badge_changes_nothing()
     {
         let mut l = ledger();
-        assert!(l.remove_process(5, pool_all).is_none());
+        assert!(l.remove_process(5, pool_all, |_| {}).is_none());
         assert_eq!(l.pool.free_pages(), 0);
     }
 
@@ -1798,7 +2204,7 @@ mod tests
     fn remove_process_returns_the_runs_of_every_region_table()
     {
         let (mut l, free, _, _) = backed_ledger();
-        l.remove_process(1, pool_all).unwrap();
+        l.remove_process(1, pool_all, |_| {}).unwrap();
         // The grant's two pages, chunk 0's sixteen, and chunk 63's three.
         assert_eq!((l.pool.free_pages(), l.pool.run_count()), (21, 4));
         // Only the four run slots stay taken.
@@ -2056,7 +2462,7 @@ mod tests
         assert_eq!(usage(&l, rec), (2, 2));
         // Reclaim at death takes the rest; the node goes with the record.
         let node = l.record(rec).unwrap().budget;
-        l.remove_process(1, pool_all).unwrap();
+        l.remove_process(1, pool_all, |_| {}).unwrap();
         assert!(budget::node(&l.arena, node).is_none());
     }
 
@@ -2099,12 +2505,12 @@ mod tests
         assert_eq!(usage(&l, parent), (0, 8));
         // The parent dies first: its live child keeps its node, which still
         // counts the child's charge.
-        l.remove_process(1, pool_all).unwrap();
+        l.remove_process(1, pool_all, |_| {}).unwrap();
         let p = budget::node(&l.arena, parent_node).unwrap();
         assert_eq!((p.refs, p.own, p.subtree), (1, 0, 8));
         // The child dies with one frame still reachable: its node stays,
         // charged with the deferred run, and so does its parent's.
-        l.remove_process(2, |r| r.cap_slot != 2).unwrap();
+        l.remove_process(2, |r| r.cap_slot != 2, |_| {}).unwrap();
         let c = budget::node(&l.arena, child_node).unwrap();
         assert_eq!((c.refs, c.own), (0, 5));
         assert_eq!(c.own, held_by(&l, child_node));
@@ -2483,7 +2889,7 @@ mod tests
         promised(&l);
         // Death releases the rest.
         let node = l.record(rec).unwrap().budget;
-        l.remove_process(1, pool_all).unwrap();
+        l.remove_process(1, pool_all, |_| {}).unwrap();
         assert_eq!((l.pool.free_pages(), promised(&l)), (10_000, 0));
         assert!(budget::node(&l.arena, node).is_none());
     }
@@ -2660,5 +3066,231 @@ mod tests
         // Unregistering frees both slots.
         l.remove_region(rec, reg, pool_all).unwrap();
         assert_eq!(l.arena.available(), 2);
+    }
+
+    const KEY_A: u64 = (1 << 62) | 0xA;
+    const KEY_B: u64 = (1 << 62) | 0xB;
+    const KEY_C: u64 = (1 << 62) | 0xC;
+
+    fn spec_max(max: u64) -> NodeSpec
+    {
+        NodeSpec {
+            parent: NODE_NULL,
+            max,
+            reserve: false,
+        }
+    }
+
+    #[test]
+    fn a_handle_state_is_found_by_its_key_and_never_as_a_record()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let node = l.record(rec).unwrap().budget;
+        let refs = l.budget(rec).unwrap().refs;
+        let h = l.attach_record_handle(rec, KEY_A).unwrap();
+        assert_eq!(l.find_handle(KEY_A), Some(h));
+        assert_eq!(l.node_handle(node), Some(h));
+        assert!(l.key_in_use(KEY_A));
+        // The record lookup and the handle lookup each see only their own kind.
+        assert_eq!(l.find(KEY_A), None);
+        assert_eq!(l.find_handle(1), None);
+        // A second attach finds the state the node has and takes no reference.
+        assert_eq!(l.attach_record_handle(rec, KEY_B), Ok(h));
+        assert!(!l.key_in_use(KEY_B));
+        assert_eq!(l.budget(rec).unwrap().refs, refs + 1);
+        let s = l.handle(h).unwrap();
+        assert_eq!(
+            (s.key, s.node, s.owner, s.limit),
+            (KEY_A, node, 1, NODE_NULL)
+        );
+    }
+
+    #[test]
+    fn a_sub_node_lives_while_its_handle_state_or_a_charge_does()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let parent = l.record(rec).unwrap().budget;
+        let free = l.arena.free_count();
+        let parent_refs = l.budget(rec).unwrap().refs;
+
+        // A sub-node with no charge goes with its handle state.
+        let h = l.create_sub_node(rec, parent, 8, KEY_A).unwrap();
+        let node = l.handle(h).unwrap().node;
+        assert_eq!(budget::node(&l.arena, node).unwrap().refs, 1);
+        assert_eq!(l.budget(rec).unwrap().refs, parent_refs + 1);
+        assert_eq!(l.drop_handle(h), Some(0));
+        assert_eq!(l.find_handle(KEY_A), None);
+        assert!(budget::node(&l.arena, node).is_none());
+        assert_eq!(l.budget(rec).unwrap().refs, parent_refs);
+        assert_eq!(l.arena.free_count(), free);
+
+        // A charged one outlives it until the charge is released.
+        let h = l.create_sub_node(rec, parent, 8, KEY_B).unwrap();
+        let node = l.handle(h).unwrap().node;
+        budget::charge(&mut l.arena, node, 3);
+        assert_eq!(l.drop_handle(h), Some(0));
+        assert_eq!(l.find_handle(KEY_B), None);
+        assert_eq!(budget::node(&l.arena, node).unwrap().own, 3);
+        assert_eq!(l.arena.get(node).next, NODE_NULL);
+        budget::uncharge(&mut l.arena, node, 3);
+        assert!(budget::node(&l.arena, node).is_none());
+        assert_eq!(l.arena.free_count(), free);
+        assert_eq!(l.drop_handle(h), None);
+    }
+
+    #[test]
+    fn create_sub_node_refuses_a_bad_parent_or_owner_and_leaks_nothing()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let free = l.arena.free_count();
+        assert_eq!(
+            l.create_sub_node(rec, rec, NO_MAX, KEY_A),
+            Err(NodeError::Parent)
+        );
+        let parent = l.record(rec).unwrap().budget;
+        assert_eq!(
+            l.create_sub_node(parent, parent, NO_MAX, KEY_A),
+            Err(NodeError::Parent)
+        );
+        assert_eq!(l.arena.free_count(), free);
+        assert!(!l.key_in_use(KEY_A));
+    }
+
+    #[test]
+    fn remove_process_drops_every_handle_state_it_owns()
+    {
+        let mut l = ledger();
+        let free = l.arena.free_count();
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let other = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let other_free = l.arena.free_count();
+        let parent = l.record(rec).unwrap().budget;
+        let own = l.attach_record_handle(rec, KEY_A).unwrap();
+        let a = l.create_sub_node(rec, parent, 8, KEY_B).unwrap();
+        let b = l.create_sub_node(rec, parent, NO_MAX, KEY_C).unwrap();
+        assert_eq!(l.set_limit(own, rec, 40, 1), Ok(0));
+        assert_eq!(l.set_limit(b, rec, 42, 4), Ok(0));
+        assert_eq!(l.set_limit(b, rec, 43, 8), Ok(42));
+        // Dropping one from the middle of the owner's list keeps the rest
+        // linked.
+        assert_eq!(l.set_limit(a, rec, 41, 2), Ok(0));
+        assert_eq!(l.drop_handle(a), Some(41));
+        let mut released = Vec::new();
+        l.remove_process(1, pool_all, |c| released.push(c)).unwrap();
+        released.sort_unstable();
+        assert_eq!(released, [40, 43]);
+        for key in [KEY_A, KEY_B, KEY_C]
+        {
+            assert!(!l.key_in_use(key));
+        }
+        // Every slot of the process and its handles is free again; the other
+        // process is untouched.
+        assert_eq!(l.find(2), Some(other));
+        l.remove_process(2, pool_all, |_| {}).unwrap();
+        assert_eq!(l.arena.free_count(), free);
+        assert!(other_free < free);
+    }
+
+    #[test]
+    fn set_node_max_grows_only_into_the_parent_chains_headroom()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, spec_max(10)).unwrap();
+        let parent = l.record(rec).unwrap().budget;
+        let h = l.create_sub_node(rec, parent, NO_MAX, KEY_A).unwrap();
+        let sub = l.handle(h).unwrap().node;
+        budget::charge(&mut l.arena, sub, 2);
+        // Usage 2 plus the parent's 8 left.
+        assert_eq!(l.set_node_max(sub, 50), Some(10));
+        assert_eq!(l.set_node_max(sub, 6), Some(6));
+        // A max below the usage is kept: it reclaims nothing.
+        assert_eq!(l.set_node_max(sub, 1), Some(1));
+        assert_eq!(budget::node(&l.arena, sub).unwrap().own, 2);
+        assert_eq!(l.set_node_max(sub, NO_MAX), Some(NO_MAX));
+        // The top node has no parent to bound it.
+        assert_eq!(l.set_node_max(parent, 1 << 40), Some(1 << 40));
+        assert_eq!(l.set_node_max(rec, 5), None);
+    }
+
+    #[test]
+    fn for_each_limit_names_each_registered_node_of_the_chain_at_its_limit()
+    {
+        let mut l = ledger();
+        let rec = l.insert_process(1, spec_max(10)).unwrap();
+        let parent = l.record(rec).unwrap().budget;
+        let top = l.attach_record_handle(rec, KEY_A).unwrap();
+        let h = l.create_sub_node(rec, parent, 4, KEY_B).unwrap();
+        let sub = l.handle(h).unwrap().node;
+        assert_eq!(l.set_limit(top, rec, 41, 1), Ok(0));
+        let limits = |l: &Ledger<VecStore, VecWords>, refused| {
+            let mut seen = Vec::new();
+            l.for_each_limit(sub, refused, |cap, bits| seen.push((cap, bits)));
+            seen
+        };
+        budget::charge(&mut l.arena, sub, 3);
+        assert_eq!(limits(&l, 0), Vec::<(u64, u64)>::new());
+        // A refused charge of 2 would take the sub-node over its max; one of
+        // 8 would take both nodes over theirs. Only registered nodes count.
+        assert_eq!(limits(&l, 2), Vec::<(u64, u64)>::new());
+        assert_eq!(limits(&l, 8), [(41, 1)]);
+        assert_eq!(l.set_limit(h, rec, 42, 2), Ok(0));
+        assert_eq!(limits(&l, 2), [(42, 2)]);
+        budget::charge(&mut l.arena, sub, 1);
+        assert_eq!(limits(&l, 0), [(42, 2)]);
+        assert_eq!(limits(&l, 7), [(42, 2), (41, 1)]);
+    }
+
+    // Defect guarded: a limit registration filed under the handle state's
+    // owner outlives a registrant that is another process, so memmgr's cap
+    // keeps that process's Notification, and the memory it was made from,
+    // after its death.
+    #[test]
+    fn a_limit_registration_goes_with_its_registrant()
+    {
+        let mut l = ledger();
+        let free = l.arena.free_count();
+        let child = l.insert_process(1, spec_max(10)).unwrap();
+        let creator = l.insert_process(2, NodeSpec::TOP).unwrap();
+        let third = l.insert_process(3, NodeSpec::TOP).unwrap();
+        let h = l.attach_record_handle(child, KEY_A).unwrap();
+        let node = l.handle(h).unwrap().node;
+        let registered = |l: &Ledger<VecStore, VecWords>| {
+            let mut seen = Vec::new();
+            l.for_each_limit(node, 1 << 40, |cap, bits| seen.push((cap, bits)));
+            seen
+        };
+        // Neither refusal changes anything: no handle state, no record.
+        assert_eq!(l.set_limit(child, creator, 40, 1), Err(NodeError::Parent));
+        assert_eq!(l.set_limit(h, h, 40, 1), Err(NodeError::Parent));
+        assert_eq!(l.set_limit(h, creator, 40, 1), Ok(0));
+        assert_eq!(registered(&l), [(40, 1)]);
+        // The registrant's death drops the registration and hands back its cap;
+        // the handle state stays with its owner.
+        let mut released = Vec::new();
+        l.remove_process(2, pool_all, |c| released.push(c)).unwrap();
+        assert_eq!(released, [40]);
+        assert_eq!(registered(&l), Vec::<(u64, u64)>::new());
+        assert_eq!(l.find_handle(KEY_A), Some(h));
+        // A later registration replaces the earlier one, and moves it to the
+        // new registrant's list: the earlier registrant's death leaves it.
+        assert_eq!(l.set_limit(h, child, 41, 2), Ok(0));
+        assert_eq!(l.set_limit(h, third, 42, 4), Ok(41));
+        assert_eq!(registered(&l), [(42, 4)]);
+        assert_eq!(l.caps(child).unwrap().limits, NODE_NULL);
+        // Dropping the handle state takes its registration off the
+        // registrant's list, whose death then releases nothing.
+        assert_eq!(
+            l.remove_process(1, pool_all, |c| released.push(c))
+                .map(|_| ()),
+            Some(())
+        );
+        assert_eq!(released, [40, 42]);
+        assert_eq!(l.caps(third).unwrap().limits, NODE_NULL);
+        l.remove_process(3, pool_all, |c| released.push(c)).unwrap();
+        assert_eq!(released, [40, 42]);
+        assert_eq!(l.arena.free_count(), free);
     }
 }

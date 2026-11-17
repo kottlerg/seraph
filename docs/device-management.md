@@ -276,8 +276,9 @@ family-independent `iommu-core`
 table-page store `iommu-store`
 ([services/drivers/iommu/store/README.md](../services/drivers/iommu/store/README.md)). For each unit
 it discovers, devmgr carves an `Mmio` cap for the unit's register range through the same
-aperture-carving flow as any other device (for a RISC-V IOMMU, after turning on the function's
-memory decode and bus mastering through its configuration page) and delivers it to that family's
+aperture-carving flow as any other device (for a RISC-V IOMMU, then turning on the function's
+memory decode and bus mastering through its configuration page, the hand-over's last step, so an
+IOMMU not handed over is left as the firmware left it) and delivers it to that family's
 IOMMU driver, with the unit's PCI segment and its scope resolved against the PCI topology,
 deleting its own once the spawn returns, so it keeps no copy. devmgr keeps the DMA endpoint, its
 `devmgr_dma_labels` contract, and per-device policy, and reaches the IOMMU driver over

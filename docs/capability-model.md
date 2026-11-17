@@ -691,9 +691,13 @@ handle, is redrawn until none of them is set; the handle alone also
 carries a verb-bit procmgr sets itself,
 `procmgr_labels::PROCESS_HANDLE_TAG`, which tells it from the child's own
 procmgr SEND ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
-§ Messages). An un-badged SEND on such an endpoint stays with the server
-and its trusted minters, since its holder could badge it with any
-verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
+§ Messages). memmgr does the same on its endpoint: its per-process badges keep
+bits 58 to 62 clear, bit 63 marking a phys-class process, and its node
+handles carry `memmgr_labels::NODE_HANDLE_TAG` (bit 62), which selects the
+labels that act on a budget node ([memmgr IPC
+Interface](../services/memmgr/docs/ipc-interface.md) § Node Handles). An
+un-badged SEND on such an endpoint stays with the server and its trusted
+minters, since its holder could badge it with any verb-bit. svcmgr's `QUERY_ENDPOINT` answers every
 process, so a queryable verb-bit cap would be ambient: a verb-bit cap
 svcmgr publishes itself (its well-known names and each provider's
 `provides` names) is seed-only, reaching only the recipes that seed it,

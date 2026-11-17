@@ -20,8 +20,9 @@ use svcmgr_defs::class::class_publication;
 use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
-    CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, destroy_partial_child,
-    mint_debug_authority, start_process, walk_and_create_from_file,
+    CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, create_label_bits,
+    destroy_partial_child, mint_debug_authority, mint_stop_authority, start_process,
+    walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -35,6 +36,9 @@ pub struct Launched
     /// stored on the `ServiceEntry` so restarts re-serve a fresh RECV on
     /// the same object. Zero for pure-consumer services.
     pub provided_endpoint: u64,
+    /// The node handle of the child's budget node for an `oom_stop = yes`
+    /// service ([`CreatedProcess::node_handle`]); zero for every other.
+    pub node_handle: u64,
 }
 
 /// Delete a set of cap slots, skipping the zero sentinel. Used on the
@@ -281,11 +285,16 @@ fn assemble_provided_boot_caps(
 
     // Resolve seeds after namespace setup. Resolution cannot fail: an
     // unresolved name becomes `0` in its slot (see `resolve_seeds`). A
-    // debug-authority holder's authority cap rides the slot after them.
+    // debug-authority holder's authority cap rides the slot after them, and a
+    // stop-authority holder's the slot after that.
     let mut seed_caps = resolve_seeds(&def.seed, &def.name, registry);
     if def.debug_authority
     {
         seed_caps.push(mint_debug_authority(ctx));
+    }
+    if def.stop_authority
+    {
+        seed_caps.push(mint_stop_authority(ctx));
     }
 
     // A provider's own service-endpoint RECV is cap[0], ahead of the positional
@@ -319,7 +328,7 @@ fn assemble_provided_boot_caps(
 /// Returns `Some(Launched)` on success, with the child running and
 /// its bootstrap rounds delivered. Returns `None` if any step fails;
 /// in that case the child has been destroyed and any resolved seed caps
-/// have been released; a create whose reply caps never reach svcmgr (see
+/// and its node handle have been released; a create whose reply caps never reach svcmgr (see
 /// [`walk_and_create_from_file`]) leaves no child, since procmgr destroys
 /// a child whose create reply it cannot deliver.
 ///
@@ -355,14 +364,40 @@ pub fn launch(
     let created = walk_and_create_from_file(
         &def.binary,
         blobs,
-        def.priority.unwrap_or(0),
-        def.sched_max.unwrap_or(0),
+        create_label_bits(
+            def.priority.unwrap_or(0),
+            def.sched_max.unwrap_or(0),
+            def.reserve,
+            def.oom_stop,
+        ),
         ctx.procmgr_ep,
         ctx.bootstrap_ep,
         ctx.ipc_buf,
     )?;
 
-    if !configure_namespace(def, &created, ctx)
+    let launched = launch_created(def, &created, ctx, registry, bind_target);
+    if launched.is_none()
+    {
+        // Every failure after the create destroyed the child; its node
+        // handle, which memmgr now refuses, is released here.
+        delete_caps(&[created.node_handle]);
+    }
+    launched
+}
+
+/// The steps of [`launch`] after the create: namespace, death observers,
+/// bootstrap caps, `START_PROCESS` and the bootstrap rounds, then the
+/// publication of the provided names. `None` when a step fails, the child
+/// destroyed.
+fn launch_created(
+    def: &Definition,
+    created: &CreatedProcess,
+    ctx: &RestartCtx,
+    registry: &mut registry::Registry,
+    bind_target: Option<DeathTag>,
+) -> Option<Launched>
+{
+    if !configure_namespace(def, created, ctx)
     {
         return None;
     }
@@ -393,7 +428,7 @@ pub fn launch(
     }
     else
     {
-        assemble_provided_boot_caps(def, &created, ctx, registry)?
+        assemble_provided_boot_caps(def, created, ctx, registry)?
     };
 
     if !start_process(created.process_handle, ctx.ipc_buf)
@@ -429,6 +464,7 @@ pub fn launch(
         thread_cap: created.thread_cap,
         process_handle: created.process_handle,
         provided_endpoint,
+        node_handle: created.node_handle,
     })
 }
 

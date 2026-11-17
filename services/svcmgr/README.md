@@ -22,6 +22,14 @@ so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GR
 `SEND` except `devmgr.bind`, which is `SEND|GRANT`. The endowment and registry wire format are in
 [docs/ipc-interface.md](docs/ipc-interface.md).
 
+svcmgr is also the stop authority: a service whose recipe sets `stop_authority = yes` receives a
+`STOP_AUTHORITY` SEND on svcmgr's endpoint, through which it lists the services svcmgr would stop,
+with each one's memory usage, and has svcmgr stop one (`STOP_SERVICE`, `LIST_STOPPABLE`). svcmgr
+stops only a service it launched whose recipe opts in with `oom_stop = yes` and that is neither
+`critical`, nor `restart = never`, nor in a core role, and routes the stop through the service's
+restart policy ([docs/ipc-interface.md](docs/ipc-interface.md) § Stop authority;
+[docs/service-definitions.md](docs/service-definitions.md) § `oom_stop`).
+
 svcmgr supervises the top-level services and is itself in the core set with
 memmgr and procmgr: none of the three restarts, and the death of memmgr or
 procmgr powers the system off. Powering off on svcmgr's own death, observed by
@@ -51,6 +59,8 @@ svcmgr/
 │   │                              # configure_namespace_caps, start_process),
 │   │                              # restart's apply_namespace_policy,
 │   │                              # death handling, DeathOutcome
+│   ├── stop.rs                    # STOP_SERVICE / LIST_STOPPABLE, the stop
+│   │                              # authority's handlers
 │   ├── definitions/
 │   │   ├── mod.rs                 # On-disk definitions; re-exports svc-defs
 │   │   ├── launch.rs              # First-launch path
@@ -63,15 +73,18 @@ svcmgr/
 │                                  # `cwd_rights` / `handover_permitted`
 │                                  # decisions, the windowed
 │                                  # `RestartBudget`, the device class file
-│                                  # parser, and the death correlator and
-│                                  # cap decoding (`death_tag`, `death_caps`)
+│                                  # parser, the death correlator and
+│                                  # cap decoding (`death_tag`, `death_caps`),
+│                                  # and the stop eligibility rule
+│                                  # (`stop::stop_refusal`)
 ├── endowment/                     # `svcmgr-endowment`, its own component
 │                                  # shared with init: host-tested codec of
 │                                  # init's handover endowment (see
 │                                  # endowment/README.md)
 └── docs/
     ├── ipc-interface.md           # handover endowment, HANDOVER_COMPLETE,
-    │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT
+    │                              # PUBLISH_ENDPOINT / QUERY_ENDPOINT,
+    │                              # STOP_SERVICE / LIST_STOPPABLE
     ├── restart-protocol.md        # Death detection, restart sequencing,
     │                              # shared spawn primitives, criticality
     │                              # semantics
@@ -131,7 +144,8 @@ svcmgr/
   [`restart::handle_death`](src/restart.rs); shared spawn primitives
   re-spawn the service from the recorded recipe. The `.svc` file is the
   single source of truth for both launch and restart — fixed fields on
-  `ServiceEntry`, the argv/env/cwd/seed, log-sink flag, and scheduling
+  `ServiceEntry`, the argv/env/cwd/seed, the log-sink, debug-authority,
+  stop-authority, `oom_stop` and `reserve` flags, and the scheduling
   fields on a parallel `RestartRecipe` — so a restart reproduces the
   first-launch surfaces
   ([docs/restart-protocol.md](docs/restart-protocol.md) § Recipe storage).
@@ -196,8 +210,8 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 Recognised keys: `binary` (required), `argv`, `env`, `restart`
 (required), `critical` (required), `namespace` (required), `cwd`,
 `seed`, `provides`, `log_sink`, `shutdown_actuator`, `debug_authority`,
-`priority`, `sched_max`. Unknown keys are hard errors. Restart values:
-`never | on_failure | always`.
+`stop_authority`, `oom_stop`, `reserve`, `priority`, `sched_max`. Unknown keys are hard
+errors. Restart values: `never | on_failure | always`.
 Critical values: `yes | no`. Namespace forms:
 `none | universal | subtree:<path>:<rights>`. `priority` / `sched_max`
 are the service's scheduling placement (level and `SchedControl` band

@@ -202,6 +202,10 @@ procmgr requires a creator to give it: 1 to 256 bytes of UTF-8, and either one c
 entry name) or `/` followed by components separated by single `/` (an install path), each
 component nonempty, holding no `/` and no NUL, and neither `.` nor `..`.
 `objsig::name_is_canonical` is the one check of it, which xtask's signer and procmgr both call.
+The comparison is case-exact: the root filesystem resolves names without regard to letter case,
+so a path spelled in another case reaches the same file, but no signature names that spelling,
+and procmgr refuses the object under it. A creator names an installed file by its install path as
+xtask installs it.
 
 ### Hashed Bytes
 

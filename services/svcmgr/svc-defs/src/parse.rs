@@ -119,9 +119,8 @@ fn check_startup_blobs(argv: &[String], env: &[String], max_bytes: u64) -> Resul
     Ok(())
 }
 
-/// Bound a `binary` or `subtree:<path>` value against `ipc::MAX_PATH_LEN`,
-/// the one recipe path limit (`services/svcmgr/docs/service-definitions.md`
-/// § Keys).
+/// Bound a `subtree:<path>` value against `ipc::MAX_PATH_LEN`
+/// (`services/svcmgr/docs/service-definitions.md` § Keys).
 fn check_path_len(lineno: usize, path: &str, too_long: &'static str) -> Result<(), ParseError>
 {
     if path.len() > ipc::MAX_PATH_LEN
@@ -181,8 +180,9 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// or sits on a `restart = never` service, `oom_stop = yes` on a recipe the
 /// stop rule refuses (`super::stop::stop_refusal`), `sched_max` below
 /// `priority`), a
-/// `binary` or
-/// subtree path over `ipc::MAX_PATH_LEN` or with no path components
+/// `binary` that is not a canonical install path of at most
+/// `procmgr_labels::CREATE_NAME_MAX` bytes, a subtree path over
+/// `ipc::MAX_PATH_LEN` or with no path components
 /// ([`ParseError::InvalidValue`]), or
 /// `argv` and `env` that together would not fit the child's argv/env region
 /// ([`ParseError::TooLarge`]). Every copy it makes is fallible: a heap that
@@ -254,7 +254,18 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 {
                     return Err(ParseError::InvalidValue(lineno, "binary must be absolute"));
                 }
-                check_path_len(lineno, value, "binary path exceeds MAX_PATH_LEN bytes")?;
+                // svcmgr names the binary to procmgr by this path, which
+                // procmgr verifies the image was signed under: a path
+                // procmgr would refuse is refused here, at parse.
+                if value.len() > ipc::procmgr_labels::CREATE_NAME_MAX
+                    || !objsig::name_is_canonical(value.as_bytes())
+                {
+                    return Err(ParseError::InvalidValue(
+                        lineno,
+                        "binary path is not a canonical install path of at most CREATE_NAME_MAX \
+                         bytes",
+                    ));
+                }
                 binary = Some(owned(value)?);
             }
             "argv" =>
@@ -1302,14 +1313,38 @@ sched_max = 12\n";
     }
 
     #[test]
-    fn binary_path_is_bounded_by_max_path_len()
+    fn binary_path_is_bounded_by_create_name_max()
     {
-        let at = parse("x", &recipe_with_binary_len(ipc::MAX_PATH_LEN)).expect("at MAX_PATH_LEN");
-        assert_eq!(at.binary.len(), ipc::MAX_PATH_LEN);
+        let max = ipc::procmgr_labels::CREATE_NAME_MAX;
+        let at = parse("x", &recipe_with_binary_len(max)).expect("at CREATE_NAME_MAX");
+        assert_eq!(at.binary.len(), max);
         assert!(matches!(
-            parse("x", &recipe_with_binary_len(ipc::MAX_PATH_LEN + 1)),
+            parse("x", &recipe_with_binary_len(max + 1)),
             Err(ParseError::InvalidValue(1, why)) if why.starts_with("binary path")
         ));
+    }
+
+    #[test]
+    fn binary_path_must_be_canonical()
+    {
+        for path in [
+            "/services//timed",
+            "/services/timed/",
+            "/services/./timed",
+            "/services/../services/timed",
+        ]
+        {
+            let recipe = format!("binary = {path}\nrestart = never\ncritical = no\nnamespace = none\n");
+            assert!(
+                matches!(
+                    parse("x", &recipe),
+                    Err(ParseError::InvalidValue(1, why)) if why.starts_with("binary path")
+                ),
+                "{path}"
+            );
+        }
+        let ok = "binary = /services/timed\nrestart = never\ncritical = no\nnamespace = none\n";
+        parse("x", ok).expect("a canonical binary path parses");
     }
 
     #[test]

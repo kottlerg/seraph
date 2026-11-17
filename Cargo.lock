@@ -745,6 +745,7 @@ version = "0.1.4"
 dependencies = [
  "ipc",
  "namespace-protocol",
+ "objsig",
  "process-abi",
  "svc-grammar",
  "syscall-abi",

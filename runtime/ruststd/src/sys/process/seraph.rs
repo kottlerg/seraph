@@ -1451,7 +1451,9 @@ pub fn getpid() -> u32 {
 /// under: its path from that root, `/` before each component the walk
 /// takes (`crate::sys::fs`'s walk drops empty components and refuses `.`
 /// and `..`), the canonical form xtask signs install paths in
-/// (docs/signing.md § Signed Attributes).
+/// (docs/signing.md § Signed Attributes). The caller's letter case is kept:
+/// the name is compared case-exactly, so only the install path's own
+/// spelling verifies.
 fn signed_name(path: &str) -> Vec<u8> {
     let mut name = Vec::with_capacity(path.len().saturating_add(1));
     for component in path.as_bytes().split(|&b| b == b'/').filter(|c| !c.is_empty()) {

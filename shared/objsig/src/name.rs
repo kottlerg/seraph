@@ -16,7 +16,9 @@ pub const NAME_MAX: usize = 256;
 /// path, `/` followed by one or more components separated by single `/`.
 /// A component is nonempty, holds no `/` and no NUL, and is neither `.`
 /// nor `..`. So an install path has no empty component, no trailing `/`
-/// and nothing to resolve, and names one file one way.
+/// and nothing to resolve. Names compare byte for byte: a spelling in
+/// another letter case, which a case-insensitive filesystem resolves to the
+/// same file, is another name.
 #[must_use]
 pub fn name_is_canonical(name: &[u8]) -> bool
 {

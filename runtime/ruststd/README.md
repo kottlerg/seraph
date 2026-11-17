@@ -417,9 +417,11 @@ path and delivers the resulting cap as the child's initial
 `current_dir_cap`.
 
 `Command::spawn` names the binary to procmgr by its path from the spawner's root, with `/` before
-each component, and maps `SIGNATURE_REFUSED` to `io::ErrorKind::PermissionDenied`; a process whose
-own object is signed as a program starts programs only
-([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#image-verification)
+each component, as the caller spells it: a path in another letter case than the install path
+reaches the file but is refused, since the name is compared case-exactly
+([docs/signing.md](../../docs/signing.md) § Signed Attributes). It maps `SIGNATURE_REFUSED` to
+`io::ErrorKind::PermissionDenied`; a process whose own object is signed as a program starts programs
+only ([procmgr's IPC interface](../../services/procmgr/docs/ipc-interface.md#image-verification)
 § Image Verification).
 
 A cap on an unmounted filesystem is dead: vfsd's `UNMOUNT` revokes the

@@ -6815,6 +6815,68 @@ pub enum Requeue
     IfRunnable,
 }
 
+/// What [`schedule`]'s outgoing requeue reads of `current`, under its
+/// `sched_lock` (core/kernel/docs/scheduling-internals.md § `ThreadState`
+/// Transitions, "Hard-affinity wake in the voluntary-block window").
+#[derive(Clone, Copy, Debug)]
+struct Outgoing
+{
+    /// `current.state`.
+    state: ThreadState,
+    /// `current` is this CPU's idle thread.
+    idle: bool,
+    /// `current` is linked on a run queue (`queued_on >= 0`).
+    linked: bool,
+    /// `current.preferred_cpu`: while `current` is `Running`, the CPU whose
+    /// dispatch marked it so.
+    dispatched_on: usize,
+}
+
+impl Outgoing
+{
+    /// Whether another CPU owns `current`, so that this CPU may not requeue it:
+    /// that CPU's dispatch has taken the thread, and runs it once this CPU's
+    /// `switch()` publishes its registers.
+    ///
+    /// A `Ready`, unlinked `current` was taken by another CPU's
+    /// `dequeue_highest`, its dispatch flip pending, unless it is this CPU's
+    /// idle thread: the idle thread runs `Ready` (the idle-runs-`Ready`
+    /// invariant at [`schedule`]'s dispatch flip) and no other CPU dispatches
+    /// it. A `Running` `current` belongs to the CPU its `preferred_cpu`
+    /// names: each dispatch flip and re-mark writes it with the dispatching CPU
+    /// under the thread's `sched_lock`, init's first dispatch on CPU 0 finds it
+    /// 0, and nothing else writes it while the thread is `Running`.
+    fn owned_by_another_cpu(&self, cpu: usize) -> bool
+    {
+        match self.state
+        {
+            ThreadState::Ready => !self.linked && !self.idle,
+            ThreadState::Running => self.dispatched_on != cpu,
+            ThreadState::Created
+            | ThreadState::Blocked
+            | ThreadState::Stopped
+            | ThreadState::Exited => false,
+        }
+    }
+
+    /// Whether [`schedule`] on `cpu` links `current` back on a run queue,
+    /// for a caller whose intent is `requeue`: when the caller asks or a wake
+    /// has made `current` runnable, unless it is `Exited`, `Stopped` or
+    /// `Blocked`, already linked, or owned by another CPU (the guards are
+    /// stated where `schedule()` reads them).
+    #[inline]
+    fn requeue(&self, requeue: Requeue, cpu: usize) -> bool
+    {
+        let runnable = matches!(self.state, ThreadState::Running | ThreadState::Ready);
+        (requeue == Requeue::Always || runnable)
+            && self.state != ThreadState::Exited
+            && self.state != ThreadState::Stopped
+            && self.state != ThreadState::Blocked
+            && !self.linked
+            && !self.owned_by_another_cpu(cpu)
+    }
+}
+
 /// Select the next thread to run and switch to it.
 ///
 /// Called from `sys_yield`, timer preemption, and the idle thread. Uses
@@ -6928,12 +6990,13 @@ pub unsafe fn schedule(requeue: Requeue)
     //     it; the next-thread selection below picks it up.
     //   * Never requeue a `Blocked` `current` (core/kernel/docs/scheduling-internals.md
     //     § ThreadState Transitions, "Voluntary-block window").
-    //   * Never requeue a `current` another CPU's dispatch has claimed: one its
-    //     `dequeue_highest` unlinked (`Ready`, `queued_on == -1`) or its dispatch
-    //     flip marked `Running` (`preferred_cpu` names that CPU: each flip below
-    //     writes it, init's first dispatch on CPU 0 finds it 0, and nothing else
-    //     writes it while `Running`). A wake routed by hard affinity links a
-    //     thread parking here on the CPU its affinity names while it is still
+    //   * Never requeue a `current` another CPU owns
+    //     ([`Outgoing::owned_by_another_cpu`]): one another CPU's
+    //     `dequeue_highest` unlinked (`Ready`, `queued_on == -1`, and not this
+    //     CPU's idle thread, which runs `Ready`: the idle-runs-`Ready` invariant
+    //     at the dispatch flip below) or its dispatch flip marked `Running`
+    //     (`preferred_cpu` names that CPU). A wake routed by hard affinity links
+    //     a thread parking here on the CPU its affinity names while it is still
     //     `current` here, and that CPU dispatches it once this CPU's `switch()`
     //     publishes it; a requeue would link it there a second time, to run while
     //     linked (same section, "Hard-affinity wake in the voluntary-block window").
@@ -6950,7 +7013,6 @@ pub unsafe fn schedule(requeue: Requeue)
         // SAFETY: current is a valid TCB; its state is written under its
         // sched_lock, held here.
         let cur_state = unsafe { (*current).state };
-        let runnable = matches!(cur_state, ThreadState::Running | ThreadState::Ready);
         // SAFETY: current is a valid TCB; queued_on is atomic.
         let already_queued = unsafe {
             (*current)
@@ -6960,21 +7022,13 @@ pub unsafe fn schedule(requeue: Requeue)
         // SAFETY: current is a valid TCB; preferred_cpu is written under its
         // sched_lock, held here.
         let dispatched_on = unsafe { (*current).preferred_cpu } as usize;
-        let claimed_elsewhere = match cur_state
-        {
-            ThreadState::Ready => !already_queued,
-            ThreadState::Running => dispatched_on != cpu,
-            ThreadState::Created
-            | ThreadState::Blocked
-            | ThreadState::Stopped
-            | ThreadState::Exited => false,
+        let outgoing = Outgoing {
+            state: cur_state,
+            idle: core::ptr::eq(current, sched.idle()),
+            linked: already_queued,
+            dispatched_on,
         };
-        if (requeue == Requeue::Always || runnable)
-            && cur_state != ThreadState::Exited
-            && cur_state != ThreadState::Stopped
-            && cur_state != ThreadState::Blocked
-            && !already_queued
-            && !claimed_elsewhere
+        if outgoing.requeue(requeue, cpu)
         {
             // SAFETY: current is a valid TCB; its priority is written under its
             // sched_lock, held here.
@@ -7290,6 +7344,13 @@ pub unsafe fn schedule(requeue: Requeue)
     let outgoing_may_wait = current.is_null() || core::ptr::eq(current, sched.idle());
     #[cfg(not(test))]
     let mut iopb_loaded = false;
+    // The idle-runs-`Ready` invariant: this CPU's idle thread skips the flip
+    // below, so it runs `Ready` once its own dispatch has dequeued it (or
+    // `Running`, from its construction or a `next == current` re-mark), and no
+    // other CPU dispatches it (its hard affinity names this CPU, and no wake or
+    // pull moves it). [`Outgoing::owned_by_another_cpu`] depends on both, to
+    // read a `Ready`, unlinked idle thread as this CPU's own and requeue it; a
+    // change to either changes that predicate with it.
     if !core::ptr::eq(next, sched.idle())
     {
         // SAFETY: next is a valid TCB from the run queue.
@@ -9018,6 +9079,193 @@ mod placement_tests
     fn no_cpu_gives_none()
     {
         assert_eq!(least_loaded_cpu(0..0, |_| 0, |_| 0), None);
+    }
+}
+
+#[cfg(test)]
+mod outgoing_requeue_tests
+{
+    use super::thread::{TCB_MAGIC, ThreadControlBlock, ThreadState};
+    use super::{IDLE_PRIORITY, Outgoing, PerCpuScheduler, Requeue, least_loaded_cpu};
+
+    const CPU: usize = 1;
+    const OTHER_CPU: usize = 2;
+
+    /// An unlinked thread other than the idle thread, its `preferred_cpu`
+    /// `dispatched_on`.
+    fn thread(state: ThreadState, dispatched_on: usize) -> Outgoing
+    {
+        Outgoing {
+            state,
+            idle: false,
+            linked: false,
+            dispatched_on,
+        }
+    }
+
+    /// This CPU's idle thread, unlinked.
+    fn idle_thread(state: ThreadState) -> Outgoing
+    {
+        Outgoing {
+            idle: true,
+            ..thread(state, CPU)
+        }
+    }
+
+    /// A zeroed TCB in `state`, unlinked, its `preferred_cpu` `cpu`.
+    fn make_tcb(state: ThreadState, cpu: usize) -> Box<ThreadControlBlock>
+    {
+        // SAFETY: the run queue reads only `run_queue_next`, `queued_on`,
+        // `last_enqueue`, `preferred_cpu`, `thread_id` and `magic`, and these
+        // tests read `state` besides; every other field stays zero/null, and
+        // the debug-only `last_enqueue` zeroes to `None` through its niche.
+        let mut tcb: ThreadControlBlock = unsafe { core::mem::zeroed() };
+        tcb.magic = TCB_MAGIC;
+        tcb.state = state;
+        tcb.preferred_cpu = u32::try_from(cpu).unwrap();
+        tcb.queued_on = core::sync::atomic::AtomicI16::new(-1);
+        Box::new(tcb)
+    }
+
+    /// What `schedule()` on `sched` reads of its `current`.
+    fn read(sched: &PerCpuScheduler, current: *mut ThreadControlBlock) -> Outgoing
+    {
+        // SAFETY: current is a live boxed TCB; the test is single-threaded.
+        let tcb = unsafe { &*current };
+        Outgoing {
+            state: tcb.state,
+            idle: core::ptr::eq(current, sched.idle()),
+            linked: tcb.queued_on.load(core::sync::atomic::Ordering::Relaxed) >= 0,
+            dispatched_on: tcb.preferred_cpu as usize,
+        }
+    }
+
+    /// Run `schedule()`'s outgoing requeue and next-thread selection on a
+    /// scheduler whose lock the single-threaded test stands in for; the thread
+    /// it dispatches.
+    fn schedule(
+        sched: &PerCpuScheduler,
+        current: *mut ThreadControlBlock,
+    ) -> *mut ThreadControlBlock
+    {
+        if read(sched, current).requeue(Requeue::Always, CPU)
+        {
+            // SAFETY: current is a live boxed TCB; single-threaded test.
+            unsafe { (*current).state = ThreadState::Ready };
+            // SAFETY: as above.
+            let prio = unsafe { (*current).priority };
+            // SAFETY: current is unlinked (`requeue` read it); the test stands
+            // in for the run-queue lock.
+            assert!(unsafe { sched.enqueue(current, prio) });
+        }
+        // SAFETY: single-threaded test.
+        unsafe { sched.dequeue_highest() }
+    }
+
+    // The defect caught: this CPU's idle thread, which its own dispatch leaves
+    // `Ready` and unlinked, read as a thread another CPU's dispatch took, so it
+    // is never linked again and a CPU that runs another thread reads one less
+    // load than core/kernel/docs/scheduler.md § Load Balancing states.
+    #[test]
+    fn the_idle_thread_is_requeued_whatever_state_its_cpu_left_it_in()
+    {
+        for state in [ThreadState::Ready, ThreadState::Running]
+        {
+            for requeue in [Requeue::Always, Requeue::IfRunnable]
+            {
+                assert!(idle_thread(state).requeue(requeue, CPU), "{state:?}");
+            }
+        }
+    }
+
+    // The defect caught: a `current` another CPU's dispatch took (dequeued and
+    // `Ready`, or flipped `Running` there) requeued here, so that CPU runs it
+    // while it is linked (#1221).
+    #[test]
+    fn a_thread_another_cpu_took_is_left_to_that_cpu()
+    {
+        for requeue in [Requeue::Always, Requeue::IfRunnable]
+        {
+            assert!(!thread(ThreadState::Ready, OTHER_CPU).requeue(requeue, CPU));
+            assert!(!thread(ThreadState::Ready, CPU).requeue(requeue, CPU));
+            assert!(!thread(ThreadState::Running, OTHER_CPU).requeue(requeue, CPU));
+            assert!(thread(ThreadState::Running, CPU).requeue(requeue, CPU));
+        }
+    }
+
+    // The defect caught: a linked, parking, stopped or exited `current`
+    // requeued (a double link, a lost park, or a link over a freed TCB).
+    #[test]
+    fn a_linked_blocked_stopped_or_exited_thread_is_not_requeued()
+    {
+        for make in [|s| thread(s, CPU), idle_thread]
+        {
+            for requeue in [Requeue::Always, Requeue::IfRunnable]
+            {
+                for state in [ThreadState::Ready, ThreadState::Running]
+                {
+                    let linked = Outgoing {
+                        linked: true,
+                        ..make(state)
+                    };
+                    assert!(!linked.requeue(requeue, CPU));
+                }
+                for state in [
+                    ThreadState::Blocked,
+                    ThreadState::Stopped,
+                    ThreadState::Exited,
+                ]
+                {
+                    assert!(!make(state).requeue(requeue, CPU));
+                }
+            }
+        }
+    }
+
+    // The defect caught: a CPU that left its idle thread for another thread
+    // without linking it again, so it reads no busier than an idle CPU and the
+    // least-load placement, tied, picks it over an idle core (#1197's spread,
+    // core/kernel/docs/scheduler.md § SMT Awareness). The CPU's load is the
+    // count of its linked threads, its idle thread among them (§ Load
+    // Balancing); `current_load` is a host stub, so the test counts the links.
+    #[test]
+    fn a_cpu_that_left_its_idle_thread_reads_busier_than_an_idle_core()
+    {
+        let sched = PerCpuScheduler::new();
+        let mut idle = make_tcb(ThreadState::Running, CPU);
+        idle.priority = IDLE_PRIORITY;
+        let idle: *mut ThreadControlBlock = &raw mut *idle;
+        sched.set_idle(idle);
+        let mut worker = make_tcb(ThreadState::Ready, CPU);
+        worker.priority = 10;
+        let worker: *mut ThreadControlBlock = &raw mut *worker;
+
+        // The CPU leaves its idle thread for itself (nothing else queued), so
+        // its dispatch leaves it `Ready` and unlinked; then a wake links the
+        // worker and the idle thread leaves for it.
+        assert_eq!(schedule(&sched, idle), idle);
+        // SAFETY: idle is a live boxed TCB.
+        assert_eq!(unsafe { (*idle).state }, ThreadState::Ready);
+        // SAFETY: single-threaded test; worker is a live boxed TCB.
+        assert!(unsafe { sched.enqueue(worker, 10) });
+        assert_eq!(schedule(&sched, idle), worker);
+
+        // SAFETY: idle is a live boxed TCB.
+        let idle_linked = unsafe {
+            (*idle)
+                .queued_on
+                .load(core::sync::atomic::Ordering::Relaxed)
+        } >= 0;
+        assert!(idle_linked, "the idle thread was not linked again");
+
+        // CPU 0 is the CPU above, CPU 1 its idle SMT sibling, CPUs 2 and 3
+        // an idle core.
+        let loads = [u32::from(idle_linked), 0, 0, 0];
+        let busy_siblings = [0, 1, 0, 0];
+        assert_eq!(
+            least_loaded_cpu(0..4, |cpu| loads[cpu], |cpu| busy_siblings[cpu]),
+            Some((2, 0))
+        );
     }
 }
 

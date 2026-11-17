@@ -421,6 +421,20 @@ impl AcpiService
         }
     }
 
+    /// The host bridges acpid has reported: their bus windows, `_PRT`
+    /// entries and `_OSC` results.
+    pub const fn bridges(&self) -> &firmware::acpid::Bridges
+    {
+        &self.bridges
+    }
+
+    /// The apertures devmgr was given at boot, each `(base, end)`, before
+    /// any carve.
+    pub fn boot_apertures(&self) -> &[(u64, u64)]
+    {
+        &self.boot_apertures
+    }
+
     /// Run every job posted, each to its end, handing its reply back. A
     /// reply the worker can no longer take has its cap deleted.
     pub fn run(&mut self, records: &bind::Records, caps: &mut DevmgrCaps)

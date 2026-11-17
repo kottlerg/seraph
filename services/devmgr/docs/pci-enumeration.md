@@ -26,7 +26,9 @@ window yields a scan. After the scan devmgr unmaps the window and keeps its
 cap, with its location, in a table of its own (`DevmgrCaps.config_space`,
 apart from the apertures, so no BAR carve can reach configuration space),
 from which it carves the configuration page of each function it binds a
-driver to (step 3 of § Per-Device Capability Creation). A window that table
+driver to (step 3 of § Per-Device Capability Creation), of each function
+acpid's configuration access or a hotplug arrival reads, and of each
+hotplug port it manages ([hotplug.md](hotplug.md)). A window that table
 cannot hold is logged, and its functions get no driver.
 
 ### Address Calculation
@@ -107,6 +109,11 @@ written only when a decode bit was set. A host bridge (base class 0x06,
 subclass 0x00) is probed with decode left on, since turning it off can cut
 off resources the running system decodes through it.
 
+devmgr assigns no BAR of a function the boot scan finds: firmware placed
+them. It places and programs the MMIO BARs of a function a hotplug arrival
+adds, in its slot's memory windows
+([hotplug.md](hotplug.md#add-job) § Add Job).
+
 ---
 
 ## Driver Matching
@@ -116,10 +123,12 @@ carry, by the function's identity keys: vendor and device ID, and class code
 (class, subclass, programming interface) under a declaration's mask
 ([docs/driver-binding.md](../../../docs/driver-binding.md#matching)
 § Matching). It binds each function at most once, to its most specific
-match, in segment, bus, device, function order, in the boot pass over the
-boot modules' declarations and the drivers-directory pass at
+match, in segment, bus, device, function order, then each function a
+hotplug arrival appended in its order of arrival, in the boot pass over the
+boot modules' declarations, the drivers-directory pass at
 `SET_DRIVERS_DIR` ([responsibilities.md](responsibilities.md#responsibilities)
-§ Responsibilities). The scan names no device: the VirtIO device IDs each
+§ Responsibilities), and a hotplug batch's pass
+([hotplug.md](hotplug.md#binding) § Binding). The scan names no device: the VirtIO device IDs each
 VirtIO driver serves are in its own declaration. A function a declaration
 requires an interrupt for but that gets no IRQ cap (for instance, its line
 lies outside the Interrupt range devmgr holds) is not bound. A function on a

@@ -203,7 +203,9 @@ devmgr's responsibilities are:
   batch (the IOMMU driver alone, settled first so it is ready before any
   device is attached), the boot batch (the boot pass, over the PCI and platform records the boot
   modules' declarations match), and the on-disk batch (the drivers-directory
-  pass, which binds the RTC driver to its platform record).
+  pass, which binds the RTC driver to its platform record). Each hotplug arrival that appends a
+  record after `SET_DRIVERS_DIR` runs one more drivers-directory pass, in a batch of its own,
+  the hotplug batch ([hotplug.md](hotplug.md#binding) § Binding).
   Each driver's devmgr query cap is a
   SEND, badged with its device badge, on its batch's private endpoint; the
   IOMMU driver's badge, and those of PCI-bound drivers of functions that
@@ -602,9 +604,13 @@ devmgr's responsibilities are:
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Pushes).
   - Every acpid request but `QUERY_ACPI_RESOURCES` runs on the control thread
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Ordering).
-- **Handle hotplug** (design intent; not yet implemented) — on platforms that support it,
-  receive hotplug notifications and dynamically spawn or terminate driver processes. See
-  [`docs/hotplug.md`](hotplug.md).
+- **Handle hotplug** — devmgr finds the PCI Express hotplug slots in the boot scan and manages
+  each under a native-control grant (its host bridge's `_OSC`, or the platform description
+  table's `pcie_native_hotplug`). A poller thread reads each managed slot's Slot Status every
+  second, powers up a slot a card arrives in, and posts the arrival; the control thread places
+  and programs the new functions' BARs in the slot's windows, appends their records, and binds
+  them in a hotplug batch (above). Removal and the ACPI hotplug source are design intent; not
+  yet implemented. See [`docs/hotplug.md`](hotplug.md).
 
 ---
 

@@ -18,7 +18,8 @@ enumerates every kind of device record of § Device Records (PCI, the ACPI names
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
 path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. The hotplug event path is design intent, not yet implemented (§ Hotplug,
+§ Binding gives. PCI Express native hotplug's add path is implemented; hotplug removal and the
+ACPI hotplug source are design intent, not yet implemented (§ Hotplug,
 [#939](https://github.com/kottlerg/seraph/issues/939)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
@@ -93,7 +94,10 @@ IOMMU keeps its own PCI record beside the IOMMU record, which holds its unit. de
 record bound once it has taken the function as a unit for the IOMMU driver, with its memory decode
 and bus mastering turned on, whether or not the driver then starts: no binding pass gives the
 function to another driver, and acpid is refused every configuration write to it. A function devmgr
-does not take keeps an unbound record, as any other function does.
+does not take keeps an unbound record, as any other function does. devmgr marks the record of a PCI
+Express hotplug slot's port bound the same way once it manages the slot, since its poller writes the
+port's slot registers ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)
+§ Grant).
 
 A record carries the device's resources, typed:
 
@@ -124,7 +128,12 @@ skipped), parsed by the one grammar parser of
   space padded;
 - one `device = <key> <resource>...` line per device, `<key>` being the platform key a driver's
   declaration matches, and each resource one of `mmio <base> <size>`, `io <base> <count>`, or
-  `wired <line> <mode>`, with mode `level-high`, `level-low`, `edge-high`, or `edge-low`.
+  `wired <line> <mode>`, with mode `level-high`, `level-low`, `edge-high`, or `edge-low`;
+- `pcie_native_hotplug = yes` or `no`: at most once, `no` when absent; `yes` grants devmgr
+  native control of the machine's PCI Express hotplug slots, for a machine whose `_OSC`
+  withholds it while no other agent drives the slots
+  ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#event-sources) § Event
+  Sources).
 
 A table holds at most `MAX_TABLE_BYTES` = 8192 bytes, `MAX_PLATFORM_DEVICES` = 16 devices,
 `MAX_PLATFORM_KEY_BYTES` = 32 bytes per key, and `MAX_PLATFORM_RESOURCES` = 4 resources per
@@ -233,15 +242,17 @@ over all the record's keys, ranked from most to least specific:
 6. the `boot-framebuffer` key. It is the generic fallback for the framebuffer the firmware set
    up, so a driver that matches the display device by any other key binds in its place.
 
-Two declarations equally specific for one device are a conflict: devmgr logs it and binds
-neither.
-A driver's instance limit counts its devices in record order (the boot scan's PCI functions by
-segment, bus, device, function, then each PCI function appended later in its order of arrival;
-then the platform records in the firmware's table order). A device no declaration matches stays
-recorded and unbound, and a later declaration (a driver installed afterwards, through
-`BIND_DRIVERS`, or a hotplug pass) can still match it. A limited driver's bound devices are
-counted by driver name, within a pass and over the boot, so two declarations of one name share
-one count and a later pass binds the driver only to the devices its limit leaves.
+Two declarations equally specific for one device are a conflict: devmgr logs it and binds neither. A
+driver's instance limit counts its devices in record order (the boot scan's PCI functions by
+segment, bus, device, function, then each PCI function appended later in its order of arrival; then
+the platform records in the firmware's table order). A device no declaration matches stays recorded
+and unbound, and a later declaration (a driver installed afterwards, through `BIND_DRIVERS`, or a
+hotplug pass) can still match it. A hotplug pass is a drivers-directory pass over the directory
+`SET_DRIVERS_DIR` installed, run against the records still unbound once a hotplug arrival has
+appended one ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding)
+§ Binding). A limited driver's bound devices are counted by driver name, within a pass and over the
+boot, so two declarations of one name share one count and a later pass binds the driver only to the
+devices its limit leaves.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process
@@ -395,9 +406,11 @@ Hotplug adds no binding path: an enumerator that learns of an added device appen
 record and runs a bind pass over it; one that learns of a removed device withdraws its
 driver, which leaves a tombstone at its ordinal. Either change signals the class's watches
 (§ Device Classes), so a consumer learns of it without probing. The event sources are
-specified in
-[services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md); devmgr handles no hotplug
-event yet ([#939](https://github.com/kottlerg/seraph/issues/939)).
+specified in [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md): devmgr
+appends and binds a function added to a PCI Express slot it controls natively, under the host
+bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant. Removal and
+the ACPI hotplug source are design intent; not yet implemented
+([#939](https://github.com/kottlerg/seraph/issues/939)).
 
 ---
 

@@ -14,13 +14,13 @@ svcmgr also owns the system-wide discovery registry: it publishes the well-known
 (`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`, a `devmgr.class.<stem>` per device class file
 (`<stem>` is the file's name without `.class`), and each provider's `provides` names like
-`pwrmgr.shutdown` / `timed`) into the registry itself — from the
-source caps init endows it with at handover, and from each provider's launch. Consumers resolve
-any name through their `.svc` `seed = ...` line at launch time, and the public names
-(`svcmgr`, `pwrmgr.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority
-is seed-only, so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields
-`GRANT`; a seed is `SEND` except `devmgr.bind`, which is `SEND|GRANT`. The
-endowment and registry wire format are in [docs/ipc-interface.md](docs/ipc-interface.md).
+`pwrmgr.shutdown` / `acpid.power` / `timed`) into the registry itself — from the source caps init
+endows it with at handover, and from each provider's launch. Consumers resolve any name through
+their `.svc` `seed = ...` line at launch time, and the public names (`svcmgr`, `pwrmgr.deny`,
+`acpid.deny`, `timed`) also via `QUERY_ENDPOINT`; a name whose cap carries authority is seed-only,
+so `QUERY_ENDPOINT` answers it `UNKNOWN_NAME`. `QUERY_ENDPOINT` never yields `GRANT`; a seed is
+`SEND` except `devmgr.bind`, which is `SEND|GRANT`. The endowment and registry wire format are in
+[docs/ipc-interface.md](docs/ipc-interface.md).
 
 svcmgr supervises the top-level services and is itself in the core set with
 memmgr and procmgr: none of the three restarts, and the death of memmgr or
@@ -236,6 +236,8 @@ column). The handover endowment and
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
+| `acpid.power` | svcmgr (`acpid.svc` [provider](docs/service-definitions.md)) | `POWER_AUTHORITY`-badged SEND on acpid's service endpoint, gating `SLEEP` and `RESET` (seeded by pwrmgr only) | no |
+| `acpid.deny` | svcmgr (`acpid.svc` [provider](docs/service-definitions.md)) | no-authority SEND on acpid's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint | yes |
 
 Centralised name constants live in `ipc::published_names`.

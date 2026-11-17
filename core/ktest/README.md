@@ -45,6 +45,7 @@ core/ktest/
     ├── frame_pool.rs       # Memory capability pool for tests that map memory
     ├── init_info.rs        # The InitInfo capability-descriptor array, for initial-cap lookups
     ├── spawn.rs            # Child-thread spawn helpers, argument blocks, exit probes
+    ├── cpu_sample.rs       # The CPUs a per-CPU case checks past 16 CPUs
     ├── tally.rs            # Failure tallies and receive-guard diagnostics for stress cells
     ├── arch/               # Arch-dispatch surface (see Test structure)
     │   ├── mod.rs          # Selects the active arch module by target_arch
@@ -204,6 +205,7 @@ concurrent notification and queue events.
 | `irq_preserves_user_regs.rs` | A ring-3 thread's callee-saved registers survive a timer preemption through the frame-authoritative IRQ path |
 | `tlb_widen_retry.rs` | A permission widen that elides its TLB shootdown still lets a remote CPU's stale-TLB write complete through the spurious-fault retry, both a user-mode store and the kernel's `SYS_GETRANDOM` copy (the copy-region retry) |
 | `write_regs_blocked_syscall.rs` | A thread stopped while blocked in `notification_wait`, `ipc_recv`, or `thread_sleep` (the frame's syscall-number register names that syscall) has its instruction pointer and second-argument register rewritten from another CPU; on restart the blocked syscall's `Interrupted` return resumes at the new instruction pointer with the edited argument intact, every round, as the raw-pointer frame model of [core/kernel/docs/arch-interface.md § `trap_frame`](../kernel/docs/arch-interface.md#trap_frame--archcurrenttrap_frame) preserves, with the redirected child's stack one call chain deep across the rounds (≥ 2 CPUs) |
+| `user_mode_controls.rs` | On every CPU up to 16, and past that on a sample of the BSP, the first APs and CPUs spread to the last (`src/cpu_sample.rs`), a user-mode thread reads the cycle counter the kernel grants (`RDTSC`, `csrr cycle`) and each instruction a control the kernel denies traps at that instruction, whatever the firmware left: on x86-64 `RDPMC` and `CLI` raise `#GP(0)` and `RDPKRU`, `TESTUI` and `ENCODEKEY128` raise `#UD`; on riscv64 reads of `time`, `instret`, `hpmcounter3` and `ssp` and the cache-block operations `cbo.zero`, `cbo.clean`, `cbo.flush` and `cbo.inval` raise an illegal-instruction exception. On x86-64 the thread also checks the state of the controls the kernel sets: `RDTSCP` and `RDPID` read 0, `CPUID` executes, `RDSSPQ` reads no shadow-stack pointer, and a misaligned load with `RFLAGS.AC` set completes. The controls are listed in [core/kernel/docs/cross-boundary-disclosure.md § User-mode hardware controls](../kernel/docs/cross-boundary-disclosure.md#user-mode-hardware-controls) |
 | `idle_past_watchdog_threshold.rs` | Every CPU idles past the all-idle softlockup threshold (ktest's only thread sleeps 4 s) and the kernel prints no `=== WATCHDOG` dump, since an idle system is not a stall ([core/kernel/docs/scheduling-internals.md § Softlockup Watchdog](../kernel/docs/scheduling-internals.md#softlockup-watchdog)); the failure is the kernel's dump, which `run-parallel` and CI count as a failed boot |
 
 Architecture-only Tier 2 scenarios live under `src/arch/<arch>/` and run through
@@ -301,7 +303,8 @@ event and memory polls of `integration::fault_kills_thread`,
 `integration::death_observer_outlives_queue_caps`, `integration::reply_binding_displaced`,
 `integration::syscall_rflags_hardening`, `integration::page_fault_present_bit`,
 `integration::mmio_revoke_unmaps`, `integration::ioport_revoke`,
-`integration::umip_descriptor_reads_fault`, `cap::cspace_self_delete_stops_caller` and
+`integration::umip_descriptor_reads_fault`, `integration::user_mode_controls`,
+`cap::cspace_self_delete_stops_caller` and
 `retype::aspace_self_delete_stops_caller`; the teardown polls of
 `mm::memory_split_after_cspace_teardown`; the probe-wait bound and the worker's readiness, call
 and exit bounds of `retype::pool_seeding_takes_interrupts`,

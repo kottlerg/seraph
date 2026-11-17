@@ -64,6 +64,7 @@ use process_layout::STACK_GUARD_PAGES;
 mod arch;
 mod bench;
 mod cmdline;
+mod cpu_sample;
 mod cspace_geometry;
 mod frame_pool;
 mod framebuffer;

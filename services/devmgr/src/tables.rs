@@ -5,7 +5,7 @@
 
 //! Firmware-table access over the read-only Memory caps init delivers: PCI
 //! ECAM discovery (ACPI MCFG, the Device Tree blob, the arch default) and
-//! ACPI table lookup for the `QUERY_ACPI_TABLE` and `QUERY_SHUTDOWN_DEVICE`
+//! ACPI table lookup for the `QUERY_ACPI_TABLE` and `QUERY_ACPI_RESOURCES`
 //! brokers.
 //!
 //! Each read maps only the pages that hold the table it reads, at the

@@ -3,7 +3,7 @@
 
 // services/pwrmgr/src/caps.rs
 
-//! Bootstrap and devmgr-query acquisition for pwrmgr.
+//! Bootstrap for pwrmgr.
 //!
 //! pwrmgr is a svcmgr-launched provider. Its bootstrap round (served by
 //! svcmgr's provider path) delivers:
@@ -12,18 +12,15 @@
 //!   receive end). svcmgr holds the persistent source and publishes
 //!   `pwrmgr.shutdown` / `pwrmgr.deny` SENDs against it.
 //! * `caps[1]` = `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`-badged
-//!   SEND on devmgr's registry endpoint (from `pwrmgr.svc`
-//!   `seed = devmgr.shutdown`).
+//!   SEND on devmgr's registry endpoint (the `devmgr.shutdown` seed), through
+//!   which the RISC-V arch module acquires the SBI shutdown authority.
+//! * `caps[2]` = `POWER_AUTHORITY`-badged SEND on acpid's service endpoint
+//!   (the `acpid.power` seed), through which the x86-64 arch module reaches
+//!   the ACPI sleep and reset registers.
 //!
-//! pwrmgr owns no hardware caps directly. It acquires its shutdown
-//! actuator caps from devmgr "as if it were a device driver": the ACPI
-//! tables it interprets come from [`devmgr_labels::QUERY_ACPI_TABLE`]
-//! (devmgr is the sole ACPI owner) and the carved I/O-port / `SbiControl`
-//! caps from [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`]. The target's arch
-//! module ([`crate::arch::current`]) drives those queries and parses what it
-//! needs; devmgr runs no shutdown logic.
+//! pwrmgr owns no hardware caps directly. The target's arch module
+//! ([`crate::arch::current`]) keeps the cap it uses and deletes the other.
 
-use ipc::{IpcMessage, devmgr_errors};
 use std::os::seraph::StartupInfo;
 
 /// Caps delivered to pwrmgr by svcmgr's provider bootstrap round.
@@ -31,10 +28,10 @@ pub struct Bootstrap
 {
     /// pwrmgr's service endpoint (RECV). Zero if the round was empty.
     pub service_ep: u64,
-    /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`-badged SEND
-    /// on devmgr's registry endpoint (the `devmgr.shutdown` seed). Zero if
-    /// absent — the arch module then degrades to its no-actuator path.
-    pub devmgr_registry: u64,
+    /// The `devmgr.shutdown` seed. Zero if absent.
+    pub devmgr_shutdown: u64,
+    /// The `acpid.power` seed. Zero if absent.
+    pub acpid_power: u64,
 }
 
 /// Drain the provider bootstrap rounds from `creator_endpoint`.
@@ -48,41 +45,21 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Bootst
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
     // Only the present caps ride, named by each round's presence word; an
     // absent slot decodes as `0`.
-    let [service_ep, devmgr_registry] =
-        unsafe { ipc::bootstrap::request_slots::<2>(creator, ipc_buf) }.ok()?;
+    let [service_ep, devmgr_shutdown, acpid_power] =
+        unsafe { ipc::bootstrap::request_slots::<3>(creator, ipc_buf) }.ok()?;
     Some(Bootstrap {
         service_ep,
-        devmgr_registry,
+        devmgr_shutdown,
+        acpid_power,
     })
 }
 
-/// Issue a devmgr registry query and return the reply on a
-/// [`devmgr_errors::SUCCESS`] status. `word1` / `word2` are the
-/// label-specific request words (`data[1]` / `data[2]`); `data[0]` is
-/// always the compiled `DEVMGR_LABELS_VERSION` so devmgr can version-gate.
-/// Returns `None` on a transport error or any non-success reply.
-pub(crate) fn devmgr_call(
-    registry: u64,
-    label: u64,
-    word1: u64,
-    word2: u64,
-    ipc_buf: *mut u64,
-) -> Option<IpcMessage>
+/// Delete `cap` when it is a slot (non-zero): a seed the arch module does
+/// not use.
+pub fn drop_unused(cap: u64)
 {
-    if registry == 0
+    if cap != 0
     {
-        return None;
+        let _ = syscall::cap_delete(cap);
     }
-    let msg = IpcMessage::builder(label)
-        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .word(1, word1)
-        .word(2, word2)
-        .build();
-    // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
-    let reply = unsafe { ipc::ipc_call(registry, &msg, ipc_buf) }.ok()?;
-    if reply.label != devmgr_errors::SUCCESS
-    {
-        return None;
-    }
-    Some(reply)
 }

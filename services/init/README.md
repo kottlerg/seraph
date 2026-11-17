@@ -143,7 +143,7 @@ transfer table.
 | [services/procmgr/README.md](../procmgr/README.md) | Owns process creation post-bootstrap; runs init's reap path |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Takes over as resident supervisor after `HANDOVER_COMPLETE` |
 | [services/logd/README.md](../logd/README.md) | Master log endpoint owner; svcmgr-launched, pulls init-logd's history at handover |
-| [services/pwrmgr/README.md](../pwrmgr/README.md) | svcmgr-launched post-handover; acquires its shutdown caps from devmgr, not from init |
+| [services/pwrmgr/README.md](../pwrmgr/README.md) | svcmgr-launched post-handover; acquires its shutdown authority from devmgr (RISC-V) or acpid (x86-64), not from init |
 | [services/svcmgr/endowment/README.md](../svcmgr/endowment/README.md) | `svcmgr-endowment`: the handover-endowment wire codec init encodes with |
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
 | [docs/documentation-standards.md](../../docs/documentation-standards.md) | Document hierarchy, authority, backlinks |

@@ -182,7 +182,7 @@ well-known names it owns into its own registry
 from the endowed sources) and
 installs devmgr's `/services/drivers/` cap via
 `devmgr_labels::SET_DRIVERS_DIR`.
-The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`) are
+The provider names (`timed`, `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`) are
 published by svcmgr's provider path on each provider's launch. Recipes for
 all svcmgr-supervised services live on disk at
 `/config/svcmgr/services/<name>.svc`, not on the wire — see

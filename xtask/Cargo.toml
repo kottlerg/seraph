@@ -34,6 +34,11 @@ procmgr-process-table = { path = "../services/procmgr/process-table" }
 # vfsd's GPT parser: `check-disk` finds each image's partitions through it, and
 # the disk tooling's tests read the tables mkdisk writes back through it.
 vfsd-gpt = { path = "../services/vfsd/gpt" }
+# Signing of the objects a build packs (src/signing, docs/signing.md § Signing):
+# the Ed25519 signer, and the trailer, certificate and trust-store codec with
+# the verifier each signed object is checked against before it is written.
+crypto = { path = "../shared/crypto", features = ["sign"] }
+objsig = { path = "../shared/objsig" }
 
 [dev-dependencies]
 # The normalized exception codes test-crash-report's tests build reports with.

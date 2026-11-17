@@ -136,8 +136,8 @@ every fault, but its eventual permanent death is non-fatal).
 
 **The shutdown actuator's own death** is the edge case. pwrmgr, the
 actuator, is `restart = on_failure` + `critical = no`: a crashed pwrmgr is
-recoverable (svcmgr re-creates it and it re-acquires its actuator caps from
-devmgr — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
+recoverable (svcmgr re-creates it and it re-acquires its actuator authority from
+devmgr or acpid — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
 *permanent* death is deliberately non-fatal. It is `critical = no` precisely
 because the graceful-shutdown escalation routes through the actuator — if
 the actuator is the dead service, nothing can power the system off, so
@@ -253,6 +253,8 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on vfsd's namespace endpoint at its synthetic root, with full namespace rights: the namespace root, which crosses mounts (derived from init's system-root cap) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
+| `acpid.power` | svcmgr (`acpid.svc` provider) | `POWER_AUTHORITY`-badged SEND on acpid's service endpoint, gating `SLEEP` and `RESET` (seeded by pwrmgr only) | no |
+| `acpid.deny` | svcmgr (`acpid.svc` provider) | no-authority SEND on acpid's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) | yes |
 | `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
@@ -272,8 +274,9 @@ svcmgr creates a service endpoint, serves its RECV as bootstrap `cap[0]`
 (ahead of the `seed` caps), and publishes one SEND per entry. If the RECV
 derive fails, on first launch or on a restart, svcmgr destroys the new
 child instead of shifting the seeds down into cap[0]. Providers
-launch ahead of pure consumers during reconciliation, so a provided name
-is resolvable before any consumer queries it. The endpoint persists across
+launch ahead of pure consumers during reconciliation, and a provider after
+each provider whose name it seeds (§ Reconciliation), so a provided name
+is resolvable before any service launched in the scan queries it. The endpoint persists across
 restarts (svcmgr holds the source), so a cached client cap survives a
 crash-restart and no re-publish is needed.
 
@@ -457,6 +460,25 @@ At `HANDOVER_COMPLETE` svcmgr scans `/config/svcmgr/services/`, parses each
 | present | present | **bind only** — bind both death observers through the endowed thread cap and observer cap; record the recipe's fixed fields on a `ServiceEntry` and its argv/env/cwd/seed, log-sink flag, and scheduling fields in the parallel `RestartRecipe` table for restart use. |
 | present | absent | **launching** — svcmgr launches the service via [`definitions::launch`](../src/definitions/launch.rs): walk `binary`, `CREATE_FROM_FILE` with argv/env, `CONFIGURE_NAMESPACE` with the namespace+cwd, bind both death observers (when `restart != never`, so they are in place before the thread runs), `START_PROCESS`, serve the seed bootstrap rounds, and (when `restart != never`) record a `ServiceEntry`. |
 | absent | present | **error** — `registered without definition: <name>; refusing to bind`. svcmgr has no recipe; an endowed name without a matching `.svc` is a configuration error. |
+
+svcmgr launches the **launching** entries in launch order, which
+`svcmgr_defs::launch_order` computes over every parsed recipe: providers (a non-empty
+`provides`) ahead of pure consumers, each group in service-name order, and among the providers
+each one after every provider whose name it seeds. svcmgr publishes a provided name only once
+its provider has launched, so this order is what lets one provider seed another's name: pwrmgr
+seeds `acpid.power`, so acpid launches first. A seed naming a name no recipe provides orders
+nothing. When providers seed each other in a cycle, the first of them in name order is placed
+first, which svcmgr logs (`<name> is in a seed cycle; launched before a provider it seeds from`),
+and its seeds of the others' names resolve to nothing at its launch.
+
+The order promises only which launch is attempted first, within the one scan:
+
+- A provider launches whether or not the launch of a provider it seeds from succeeded; the seed
+  of a provider whose launch failed is unresolved at its launch, as any unresolved seed is.
+- A **bind only** service, which init already launched, is not launched again, so its place in
+  the order does nothing.
+- A restarted service's seeds are resolved again at its restart, from what the registry then
+  holds; a provider's endpoint, and so its published names, outlive its restarts.
 
 Out of memory changes two outcomes. When the scan has no room for the list of parsed recipes, it
 launches nothing and releases every pending registration's thread cap: each endowed service runs

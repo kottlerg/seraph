@@ -113,12 +113,6 @@ pub fn carve_io_ports(_caps: &mut DevmgrCaps, _base: u16, _count: u16) -> Option
     None
 }
 
-/// No shutdown actuator of pwrmgr's is a port on riscv64.
-pub fn pwrmgr_ports(_firmware: &Firmware) -> Vec<firmware::acpid::Range>
-{
-    Vec::new()
-}
-
 /// The kernel drives no port on riscv64: there is no port space.
 pub fn kernel_ports() -> Vec<firmware::acpid::Range>
 {

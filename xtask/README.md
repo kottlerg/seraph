@@ -39,6 +39,8 @@ xtask/
 │   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
 │   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── signing/                # Signing of packed images, the signing identity, the trust
+│   │                           #   store (§ Signing)
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
@@ -53,7 +55,8 @@ xtask/
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
 │   │                           #   test_debug_port, test_hotplug,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
+│   │                           #   test_reboot, test_terminal, test_vmgenid, test_wedge, lint_docs,
+│   │                           #   pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
@@ -99,6 +102,43 @@ naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MA
 `src/stack_sizes.rs`), the kernel frame bound of
 [docs/coding-standards.md](../docs/coding-standards.md) § Kernel Stack Frames. It fails as well
 when the image has no such section. No other build has the check.
+
+#### Signing
+
+Every image a build packs is signed, as [docs/signing.md](../docs/signing.md) § Signing specifies:
+each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every command that
+repacks) first signs the kernel and every ELF image under `services/`, `programs/` and `tests/`
+of the sysroot in place, and `compose-bundle` signs each executable entry of the bundle it
+composes: `init` as kind init, each module as a boot module. The bundle's data entries (the
+platform tables and `log-levels`) are packed unsigned. Every signed object is verified under the
+build's trust store, with the kind, name and architecture its loader expects, before it is
+written. Each command derives the store from the signing identity and the deployer's store its
+environment names: until the bootloader embeds the store, nothing ties a pack to the bootloader
+already built, since nothing verifies (docs/signing.md § Signing). Signing a
+pack's images takes about half a second (`src/signing/`).
+
+The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
+one, whose canonical path lies inside it, `target/` included. When the directory is absent or
+empty and no external signer is named, the first build generates a local identity in it: a root
+that certifies a signing key and is then discarded, and a store that lists the root as `LOCAL`.
+The directory holds:
+
+| File | Content |
+|---|---|
+| `signer.seed` | The signing key's 32-byte Ed25519 secret seed (mode `0600`, the directory `0700`); absent when an external signer holds the key |
+| `signer.cert` | The signing key's 148-byte certificate, or, for a key that is itself a root, `signer.pub`, its 32-byte public key |
+| `trust.store` | The trust store of the anchors the identity contributes |
+
+The build writes the trust store it signs under to `target/xtask/signing/trust-store`, before
+it builds the bootloader, and rewrites the file only when the store changes. It is the store the
+bootloader is to embed; nothing reads it yet.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERAPH_SIGNING_DIR` | `seraph/signing` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 64-byte Ed25519 signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
+| `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
+| `SERAPH_TRUST_STORE_MODE` | `merge` | `merge`: the union of both stores' anchors and revoked key ids, under the higher floor; two anchors of one key that differ are refused. `replace`: the deployer's store alone. Set without `SERAPH_TRUST_STORE`, it is refused |
 
 ---
 
@@ -244,8 +284,10 @@ synthesised `data/svctest/` fixtures are left untouched. To pack a
 hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
-re-mirror and packs the sysroot exactly as it stands (a plain repack would
-prune the hand-added recipe). The mirror rules are owned by
+re-mirror and packs the sysroot as it stands (a plain repack would
+prune the hand-added recipe). Every pack, `--repack-only` included, re-signs the kernel and the
+ELF images of the sysroot in place ([§ Signing](#signing)), so a hand-staged image is packed
+with the local identity's signature, not its own. The mirror rules are owned by
 [rootfs/README.md](../rootfs/README.md).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
@@ -276,12 +318,11 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
-`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-hotplug`, `test-kaslr`,
-`test-map-redo`, and `test-log-level` repack the images in the layout they find: `disk.img`'s
-block size, and the data partition on `disk-data.img` when that image is there. The six test
-commands boot that layout,
-attaching `disk-data.img` as the second disk when it holds the data partition; `run` and
-`run-parallel` attach a second disk only as `--second-disk` names it.
+`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-reboot`, `test-hotplug`,
+`test-kaslr`, `test-map-redo`, and `test-log-level` repack the images in the layout they find:
+`disk.img`'s block size, and the data partition on `disk-data.img` when that image is there. The
+seven test commands boot that layout, attaching `disk-data.img` as the second disk when it holds the
+data partition; `run` and `run-parallel` attach a second disk only as `--second-disk` names it.
 
 `src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
 the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
@@ -301,7 +342,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
-| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
+| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, its images re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
 | `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
@@ -355,7 +396,8 @@ Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from canonical
 binaries under `sysroot/services/` and repack `disk.img`. Symmetric
 with `mkdisk`: both end with `create_disk_image`, the difference being
 which file they author. `compose-bundle` is the bundle authoring step;
-`mkdisk` never authors the bundle.
+`mkdisk` never authors the bundle. `compose-bundle` signs the bundle's executable entries
+([§ Signing](#signing)).
 
 ```
 cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]
@@ -1090,6 +1132,36 @@ reported skipped, which passes the command.
 
 ---
 
+### `cargo xtask test-reboot`
+
+Check the reboot path, on either arch. Stages the `reboot` fixture's recipe
+(`rootfs/config/svcmgr/tests/reboot.svc`: svctest's `reboot` role, seeded with
+`pwrmgr.shutdown`) from `config/svcmgr/tests/` into `config/svcmgr/services/`, repacks the disk
+images in the layout they have, and boots the current sysroot once, headless, with a QMP socket.
+The fixture sends pwrmgr `REBOOT`. QEMU runs with `-no-reboot`, so the reset ends it, and QMP's
+`SHUTDOWN` event names the cause. It then removes the recipe and repacks the images in that
+layout again, whatever the outcome. It passes when the fixture's `reboot fixture: requesting
+REBOOT` line appears, on `x86_64` acpid's `RESET: RESET_REG` line too, the `SHUTDOWN` event's
+reason is `guest-reset` (a power-off gives `guest-shutdown`), and QEMU exits on its own with
+success within 30 seconds of the event; [docs/testing.md](../docs/testing.md) § Reboot
+(`test-reboot`) says what each architecture's path is.
+
+A pure runner; requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-reboot [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the `SHUTDOWN` event is bounded by five minutes. The QMP socket is
+`target/xtask/reboot-test-<arch>.sock`. CI runs the command in each `usertest` cell.
+
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
@@ -1669,8 +1741,9 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
-them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`,
-`test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-hotplug`, `test-gdb` and
+them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-reboot`,
+`test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-hotplug`,
+`test-gdb` and
 `capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by

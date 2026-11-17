@@ -103,6 +103,8 @@ Overall project design documents live in [`docs/`](docs/):
   declarations, matching, and the device-class registry query (design intent)
 - [Platform Requirements](docs/platform-requirements.md) — per-arch
   required/opportunistic/unsupported CPU and platform feature baseline; boot-time feature-gate
+- [Signing and Chain of Trust](docs/signing.md) — threat model, signed-object, certificate and
+  trust-store formats, which stage verifies what, verifier discipline
 - [Limits](docs/limits.md) — catalogue of every in-tree bound, classified against
   hardware-realistic ceilings and pay-as-you-go cost
 - [Console Model](docs/console-model.md) — serial/console output ownership across boot;

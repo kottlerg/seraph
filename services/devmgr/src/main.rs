@@ -16,6 +16,7 @@
 //! and driver authority, and `docs/device-management.md` for the system-scope
 //! design.
 
+mod acpi;
 mod arch;
 mod bind;
 mod caps;
@@ -87,6 +88,11 @@ fn main() -> !
         caps.firmware.dtb_memory_cap
     );
 
+    // acpid's requests, which the registry's workers post to this thread
+    // (`acpi`), checked against the apertures as init gave them.
+    let (acpi_jobs, acpi_queue) = std::sync::mpsc::channel();
+    let mut acpi = acpi::AcpiService::new(&caps, acpi_queue);
+
     let (mut records, modules) = enumerate_records(&mut caps);
 
     // IRQ allocator state: single-line caps carved out of devmgr's
@@ -106,18 +112,7 @@ fn main() -> !
     // of kind FRAMEBUFFER; every other entry carries no startup info.
     let mut catalog = DeviceCatalog::default();
 
-    // The drivers the boot's records can be given: one per device record (a
-    // record is bound at most once, by whichever pass binds it) and the IOMMU
-    // driver. The watch's first death queue is sized to both death observers
-    // of each; a driver past them, as a record appended later gets, binds on
-    // a further queue (settle::DriverWatch::new).
-    let driver_count = records.count().saturating_add(IOMMU_DRIVERS);
-    let Some(mut watch) = settle::DriverWatch::new(driver_count)
-    else
-    {
-        std::os::seraph::log!(error: "no driver death watch, halting");
-        halt_loop();
-    };
+    let mut watch = driver_watch(&records);
 
     if caps.registry_ep == 0
     {
@@ -133,6 +128,7 @@ fn main() -> !
         watch.job_note(),
         caps.registry_ep,
         Arc::clone(&caps.firmware),
+        acpi_jobs,
     ));
 
     // The DMA endpoint every DMA-capable driver maps its device's buffers
@@ -151,7 +147,7 @@ fn main() -> !
     // `None` runs every device unconfined, logged once.
     let mut boot_modules = modules.drivers;
     caps.iommu = iommu::bring_up(
-        records.pci.devices(),
+        &mut records.pci,
         &mut boot_modules,
         caps.pooled.take(),
         &mut caps,
@@ -190,9 +186,9 @@ fn main() -> !
     // The registry's workers. This thread stays the control thread: it owns
     // the device records, the carve tables, the catalog, and the death
     // watch, and runs the work a request leaves for it (the drivers-directory
-    // pass and settle after `SET_DRIVERS_DIR`, and the on-demand pass and
-    // settle after `BIND_DRIVERS`) and every withdrawal of a driver whose
-    // death the watch takes.
+    // pass and settle after `SET_DRIVERS_DIR`, the on-demand pass and settle
+    // after `BIND_DRIVERS`, and acpid's requests) and every withdrawal of a
+    // driver whose death the watch takes.
     start_registry_workers(&registry);
     std::os::seraph::log!("enumeration complete, registry open");
 
@@ -208,6 +204,7 @@ fn main() -> !
             &mut catalog,
             ipc_buf,
         );
+        acpi.run(&records, &mut caps);
         registry.withdraw_deaths(&watch, ipc_buf);
         match watch.wait()
         {
@@ -215,6 +212,24 @@ fn main() -> !
             Err(e) => guard.on_failure(e),
         }
     }
+}
+
+/// The death watch of the drivers the boot's records can be given: one per
+/// device record (a record is bound at most once, by whichever pass binds
+/// it) and the IOMMU driver. The watch's first death queue is sized to both
+/// death observers of each; a driver past them, as a record appended later
+/// gets, binds on a further queue (`settle::DriverWatch::new`). Halts,
+/// logged, when the watch cannot be made.
+fn driver_watch(records: &bind::Records) -> settle::DriverWatch
+{
+    let driver_count = records.count().saturating_add(IOMMU_DRIVERS);
+    let Some(watch) = settle::DriverWatch::new(driver_count)
+    else
+    {
+        std::os::seraph::log!(error: "no driver death watch, halting");
+        halt_loop();
+    };
+    watch
 }
 
 /// Locate and scan every PCI ECAM window, then enumerate the platform
@@ -482,14 +497,16 @@ struct Registry
     job_note: u64,
     /// RECV on the registry endpoint, from which class SENDs are derived.
     endpoint: u64,
-    /// The firmware tables and arch authority `QUERY_ACPI_TABLE` and
-    /// `QUERY_SHUTDOWN_DEVICE` serve from.
+    /// The firmware tables and arch authority `QUERY_ACPI_TABLE`,
+    /// `QUERY_SHUTDOWN_DEVICE` and `QUERY_ACPI_RESOURCES` serve from.
     firmware: Arc<caps::Firmware>,
+    /// The control thread's acpid job channel ([`acpi::run_on_control`]).
+    acpi: acpi::Jobs,
 }
 
 impl Registry
 {
-    fn new(job_note: u64, endpoint: u64, firmware: Arc<caps::Firmware>) -> Self
+    fn new(job_note: u64, endpoint: u64, firmware: Arc<caps::Firmware>, acpi: acpi::Jobs) -> Self
     {
         Self {
             state: Mutex::new(RegistryState {
@@ -504,6 +521,7 @@ impl Registry
             job_note,
             endpoint,
             firmware,
+            acpi,
         }
     }
 
@@ -841,11 +859,67 @@ impl Registry
             {
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
             }
+            ipc::devmgr_labels::QUERY_ACPI_RESOURCES =>
+            {
+                if Self::admits(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf)
+                {
+                    acpi::query_resources(&self.firmware, msg, ipc_buf);
+                }
+            }
+            ipc::devmgr_labels::ACPI_REGION_GRANT
+            | ipc::devmgr_labels::ACPI_PCI_CONFIG
+            | ipc::devmgr_labels::OSC_RESULT
+            | ipc::devmgr_labels::BRIDGE_WINDOWS
+            | ipc::devmgr_labels::PRT_TABLE =>
+            {
+                self.acpi_request(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf);
+            }
+            ipc::devmgr_labels::QUERY_HOST_BRIDGE =>
+            {
+                self.acpi_request(msg, ipc::devmgr_labels::REGISTRY_QUERY_AUTHORITY, ipc_buf);
+            }
             ipc::devmgr_labels::BIND_DRIVERS => self.bind_drivers(msg, ipc_buf),
             ipc::devmgr_labels::WATCH_CLASS => self.watch_class(msg, ipc_buf),
             // QUERY_DEVICE_INFO and DRIVER_READY included: drivers send both
             // on their settle batch's private endpoint, never here.
             _ => reply_status(ipc::devmgr_errors::UNKNOWN_OPCODE, ipc_buf),
+        }
+    }
+
+    /// Whether `msg`'s badge carries `authority` and `msg` the compiled
+    /// labels version; replies `UNAUTHORIZED` or `LABEL_VERSION_MISMATCH`
+    /// otherwise.
+    fn admits(msg: &IpcMessage, authority: u64, ipc_buf: *mut u64) -> bool
+    {
+        if msg.badge & authority == 0
+        {
+            reply_status(ipc::devmgr_errors::UNAUTHORIZED, ipc_buf);
+            return false;
+        }
+        if msg.word(0) != u64::from(ipc::DEVMGR_LABELS_VERSION)
+        {
+            reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
+            return false;
+        }
+        true
+    }
+
+    /// An acpid request the control thread runs, gated on `authority`:
+    /// decoded here, run there ([`acpi::run_on_control`]), and replied to
+    /// from here.
+    fn acpi_request(&self, msg: &IpcMessage, authority: u64, ipc_buf: *mut u64)
+    {
+        if !Self::admits(msg, authority, ipc_buf)
+        {
+            return;
+        }
+        match acpi::decode(msg)
+        {
+            Ok(request) =>
+            {
+                acpi::run_on_control(&self.acpi, || self.signal_jobs(), request, ipc_buf);
+            }
+            Err(code) => reply_status(code, ipc_buf),
         }
     }
 
@@ -1180,7 +1254,8 @@ fn handle_query_acpi_table(
         reply_status(ipc::devmgr_errors::LABEL_VERSION_MISMATCH, ipc_buf);
         return;
     }
-    let Some((region, table_phys)) = tables::locate_acpi_table(firmware, msg.word(1), msg.word(2))
+    let Some((region, table_phys)) =
+        tables::locate_acpi_table(firmware, msg.word(1), msg.word(2), msg.word(3))
     else
     {
         reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
@@ -1402,16 +1477,7 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
 /// table cannot grow, or a split fails.
 pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u64>
 {
-    let carved = caps
-        .apertures
-        .carve(phys, size, PAGE_SIZE, |span: &Span<u64>, at| {
-            // `mmio_split` takes the split point as an offset into the cap; the
-            // table records each aperture's exact range, so no split it asks for
-            // falls outside its cap.
-            let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
-            syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
-        });
-    match carved
+    match carve_aperture(caps, phys, size)
     {
         Ok(cap) => Some(cap),
         Err(CarveError::NotCovered) => None,
@@ -1433,6 +1499,25 @@ pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Opti
             None
         }
     }
+}
+
+/// [`carve_subrange`]'s carve, with its error: `NotCovered` when no
+/// aperture covers the range, which a caller that refuses such a range tells
+/// apart from a failed carve.
+///
+/// # Errors
+/// The aperture table's [`CarveError`].
+pub fn carve_aperture(caps: &mut caps::DevmgrCaps, phys: u64, size: u64)
+-> Result<u64, CarveError>
+{
+    caps.apertures
+        .carve(phys, size, PAGE_SIZE, |span: &Span<u64>, at| {
+            // `mmio_split` takes the split point as an offset into the cap; the
+            // table records each aperture's exact range, so no split it asks for
+            // falls outside its cap.
+            let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
+            syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
+        })
 }
 
 // ── Interrupt range allocator ───────────────────────────────────────────────

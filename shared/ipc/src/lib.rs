@@ -91,7 +91,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 
 /// Wire-protocol version of [`procmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const PROCMGR_LABELS_VERSION: u32 = 16;
+pub const PROCMGR_LABELS_VERSION: u32 = 17;
 /// IPC labels for the process manager (`procmgr`).
 pub mod procmgr_labels
 {
@@ -1613,6 +1613,14 @@ pub mod published_names
     /// `/tests/drivers/` through it.
     pub const DEVMGR_BIND: &[u8] = b"devmgr.bind";
 
+    /// SEND on devmgr's registry endpoint badged
+    /// `REGISTRY_QUERY_AUTHORITY | ACPI_AUTHORITY`: the `devmgr.registry`
+    /// surface plus the labels through which acpid acquires its register
+    /// blocks, regions and configuration-space accesses and pushes its
+    /// results (`devmgr_labels::ACPI_AUTHORITY`). Seed-only and seeded only
+    /// by acpid.
+    pub const DEVMGR_ACPI: &[u8] = b"devmgr.acpi";
+
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
     /// `GET_SYSTEM_ROOT_CAP`. Seed-only and seeded only by svctest, whose
@@ -2115,11 +2123,9 @@ pub mod fs_labels
     /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
     /// first, destination bytes immediately after with no padding.
     ///
-    /// Cross-directory rename is deferred to Issue #89: the
-    /// caller cannot supply a second directory cap because servers
-    /// cannot introspect the badge packed inside a cap they receive
-    /// (`cap_info` does not expose badge bits), so a cross-directory
-    /// destination cannot be resolved to a `NodeId` server-side.
+    /// Cross-directory rename is deferred to Issue #89: the request
+    /// carries one directory cap, so a destination in another directory
+    /// cannot be named.
     ///
     /// Not atomic: an interrupted rename can leave only the source, both
     /// names, or only the destination present. See
@@ -2187,7 +2193,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 19;
+pub const DEVMGR_LABELS_VERSION: u32 = 20;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2335,16 +2341,20 @@ pub mod devmgr_labels
     ///
     /// devmgr is the sole owner of ACPI data and the only service that
     /// navigates the table tree (RSDP → XSDT). Callers that need a table
-    /// (today: `pwrmgr`, for the FADT + DSDT it interprets for S5
-    /// shutdown) request it here rather than holding ACPI Memory caps of
+    /// (`pwrmgr`, for the FADT + DSDT it interprets for S5 shutdown, and
+    /// acpid, for the DSDT and every SSDT it loads) request it here rather than holding ACPI Memory caps of
     /// their own.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = 4-byte table signature packed little-endian (e.g.
     /// `FACP`), or `0` to look up by physical address; `data[2]` =
     /// table physical address (used when `data[1] == 0`, e.g. the DSDT,
-    /// whose address the caller reads from the FADT). Caller's badge MUST
-    /// carry [`REGISTRY_QUERY_AUTHORITY`]; the handler replies
+    /// whose address the caller reads from the FADT); `data[3]`, when sent,
+    /// the index of the table among those the XSDT lists with the signature,
+    /// an absent one being 0, the first (`SSDT` has one table per index). The
+    /// signature `DSDT`, which the XSDT does not list, names the DSDT the
+    /// FADT points to, at index 0 alone. Caller's badge MUST carry
+    /// [`REGISTRY_QUERY_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a derived
@@ -2355,9 +2365,10 @@ pub mod devmgr_labels
     /// table at `table_phys - region_base`. devmgr reads only the
     /// directory (RSDP/XSDT) and table headers (signatures) to locate the
     /// table — never a table body. Replies
-    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found,
-    /// both `data[1]` and `data[2]` are zero, or `data[1]` has bits above
-    /// its low 32, [`super::devmgr_errors::INVALID_REQUEST`] when deriving
+    /// [`super::devmgr_errors::NO_DEVICE`] when the table is not found
+    /// (an index past the last table of the signature included), both
+    /// `data[1]` and `data[2]` are zero, or `data[1]` has bits above its
+    /// low 32, [`super::devmgr_errors::INVALID_REQUEST`] when deriving
     /// the reply's Memory cap from the region fails, and
     /// [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when `data[0]` is
     /// not `DEVMGR_LABELS_VERSION`.
@@ -2393,6 +2404,237 @@ pub mod devmgr_labels
     /// fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when
     /// `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
+
+    /// Serve acpid the `IoPort` of one fixed ACPI register block the FADT
+    /// declares (x86-64).
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the block ([`ACPI_PM1A_EVT`], [`ACPI_PM1A_CNT`],
+    /// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], or [`ACPI_RESET`]). Caller's badge
+    /// MUST carry [`ACPI_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a narrow
+    /// `IoPort` over the block, derived from devmgr's full-rights `IoPort` on
+    /// every call; `data[0]` = its first port; `data[1]` = its port count;
+    /// `data[2]` = the FADT's `ACPI_ENABLE` value for [`ACPI_SMI_CMD`], its
+    /// `RESET_VALUE` for [`ACPI_RESET`], and 0 for the others. Replies
+    /// [`super::devmgr_errors::NO_DEVICE`] when the platform has no such
+    /// block (every block on RISC-V, a zero FADT field, a `RESET_REG` outside
+    /// the I/O space), the FADT cannot be read, or the carve fails, and
+    /// [`super::devmgr_errors::INVALID_REQUEST`] for an unknown block.
+    pub const QUERY_ACPI_RESOURCES: u64 = 24;
+    /// [`QUERY_ACPI_RESOURCES`] block: `PM1a_EVT_BLK`, `PM1_EVT_LEN` ports.
+    pub const ACPI_PM1A_EVT: u64 = 1;
+    /// [`QUERY_ACPI_RESOURCES`] block: `PM1a_CNT_BLK`, `PM1_CNT_LEN` ports.
+    pub const ACPI_PM1A_CNT: u64 = 2;
+    /// [`QUERY_ACPI_RESOURCES`] block: `GPE0_BLK`, `GPE0_BLK_LEN` ports.
+    pub const ACPI_GPE0: u64 = 3;
+    /// [`QUERY_ACPI_RESOURCES`] block: the `SMI_CMD` port.
+    pub const ACPI_SMI_CMD: u64 = 4;
+    /// [`QUERY_ACPI_RESOURCES`] block: the `RESET_REG` port, when the FADT
+    /// places it in the I/O space.
+    pub const ACPI_RESET: u64 = 5;
+
+    /// Grant acpid part of an operation region it evaluated: a `SystemIO`
+    /// range, or the `SystemMemory` page an access reaches, that no device
+    /// record, driver, pwrmgr capability or the kernel holds.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the space, [`ACPI_SPACE_MEMORY`] or [`ACPI_SPACE_IO`];
+    /// `data[2]` = the base; `data[3]` = the length. A memory request lies
+    /// within one page, and is granted that page. Caller's badge MUST carry
+    /// [`ACPI_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// devmgr refuses, logged, a range that overlaps a resource of any device
+    /// record (a PCI BAR, a platform record's `Mmio` or `IoPort`), a port
+    /// pwrmgr holds, an interrupt controller the MADT describes or a legacy
+    /// port the kernel drives, the configuration-mechanism ports 0xCF8-0xCFF,
+    /// or the FACS, and memory that no `Mmio` aperture devmgr still holds
+    /// covers (RAM, ACPI NVS, and the ranges devmgr has carved for itself or a
+    /// driver). A memory page granted is kept by devmgr, so it is granted
+    /// again to a restarted acpid. The policy is services/acpid/README.md
+    /// § Region grants.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = an `IoPort`
+    /// over exactly the range, or an `Mmio` over the page; `data[0]` = the
+    /// grant's base (the page's address for memory); `data[1]` = its length.
+    /// Replies [`super::devmgr_errors::REFUSED`] for a refused range, and
+    /// [`super::devmgr_errors::INVALID_REQUEST`] for a short request, an
+    /// unknown space, an empty or overflowing range, memory that crosses a
+    /// page boundary, a port range past 0xFFFF, or a failed carve or
+    /// derivation.
+    pub const ACPI_REGION_GRANT: u64 = 25;
+    /// [`ACPI_REGION_GRANT`] space: `SystemMemory` (ACPI address space 0).
+    pub const ACPI_SPACE_MEMORY: u64 = 0;
+    /// [`ACPI_REGION_GRANT`] space: `SystemIO` (ACPI address space 1).
+    pub const ACPI_SPACE_IO: u64 = 1;
+
+    /// Read or write one register of a PCI function's configuration space
+    /// for acpid, one access per call.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = [`ACPI_CONFIG_READ`] or [`ACPI_CONFIG_WRITE`]; `data[2]` =
+    /// the function, [`pci_function`]'s packing; `data[3]` = the offset;
+    /// `data[4]` = the width in bytes, 1, 2 or 4; `data[5]` = the value
+    /// written. Caller's badge MUST carry [`ACPI_AUTHORITY`]; the handler
+    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// A read of any function is allowed; one of a function no device record
+    /// holds reads all-ones, as an absent function does, without an access. A
+    /// write is allowed only at offset 0x40 and above of a function whose
+    /// record no driver has been started for; any other write is refused,
+    /// logged. The access runs on devmgr's control thread, so no bind of the
+    /// function interleaves with it.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `data[0]` = the value read
+    /// (0 for a write). Replies [`super::devmgr_errors::REFUSED`] for a
+    /// refused write, and [`super::devmgr_errors::INVALID_REQUEST`] for a
+    /// short request, an unknown operation, a width other than 1, 2 or 4, an
+    /// offset not aligned to the width or past the 4096-byte configuration
+    /// space, or a configuration page devmgr cannot map.
+    pub const ACPI_PCI_CONFIG: u64 = 26;
+    /// [`ACPI_PCI_CONFIG`] operation: read.
+    pub const ACPI_CONFIG_READ: u64 = 0;
+    /// [`ACPI_PCI_CONFIG`] operation: write.
+    pub const ACPI_CONFIG_WRITE: u64 = 1;
+
+    /// The word [`ACPI_PCI_CONFIG`] names a function by: the segment in bits
+    /// 16..=31, the bus in bits 8..=15, the device in bits 3..=7 and the
+    /// function in bits 0..=2.
+    #[must_use]
+    pub const fn pci_function(segment: u16, bus: u8, device: u8, function: u8) -> u64
+    {
+        ((segment as u64) << 16)
+            | ((bus as u64) << 8)
+            | (((device & 0x1F) as u64) << 3)
+            | ((function & 0x7) as u64)
+    }
+
+    /// Push the `_OSC` result of one PCI host bridge from acpid.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the bridge's segment (`_SEG`); `data[2]` = its bus
+    /// (`_BBN`); `data[3]` = 1 when `_OSC` was evaluated, 0 when the bridge
+    /// has none or its evaluation failed; `data[4]` = the status dword
+    /// `_OSC` returned; `data[5]` = the control dword it returned, the
+    /// features whose native control the firmware grants; `data[6]` = the
+    /// control dword acpid asked for. Caller's badge MUST carry
+    /// [`ACPI_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// devmgr keeps the first result of each bridge for the boot and logs a
+    /// later one that differs from it, so an acpid restart cannot change a
+    /// grant devmgr acts on. Reply: [`super::devmgr_errors::SUCCESS`];
+    /// [`super::devmgr_errors::INVALID_REQUEST`] for a short push or a
+    /// bridge devmgr cannot record.
+    pub const OSC_RESULT: u64 = 27;
+
+    /// Push the `_CRS` windows of one PCI host bridge from acpid: the buses,
+    /// I/O ports, and memory it decodes.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the bridge's segment; `data[2]` = its bus; `data[3]` = the
+    /// window count, at most [`MAX_BRIDGE_WINDOWS`]; `data[4..]` = one
+    /// `(kind, base, length)` triple per window, `kind` being
+    /// [`WINDOW_MEMORY`], [`WINDOW_IO`], or [`WINDOW_BUS`], the base and
+    /// length on the bus side of the bridge. Caller's badge MUST carry
+    /// [`ACPI_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// devmgr checks the windows against its boot records: every boot
+    /// function on a bus of the bus window, each memory BAR inside a memory
+    /// window and inside an aperture devmgr was given at boot, each I/O BAR
+    /// inside an I/O window. It keeps the first windows of each bridge that
+    /// pass, for the boot, and logs a later push that differs. Reply:
+    /// [`super::devmgr_errors::SUCCESS`] when devmgr holds the bridge's
+    /// windows; [`super::devmgr_errors::REFUSED`], logged, for windows that
+    /// fail the check, which is fail-closed: the bridge has no windows from
+    /// acpid until a push passes; [`super::devmgr_errors::INVALID_REQUEST`]
+    /// for a count past [`MAX_BRIDGE_WINDOWS`], a push shorter than its count,
+    /// an unknown kind, or a bridge devmgr cannot record.
+    pub const BRIDGE_WINDOWS: u64 = 28;
+    /// The most windows one [`BRIDGE_WINDOWS`] push carries.
+    pub const MAX_BRIDGE_WINDOWS: usize = 16;
+    /// [`BRIDGE_WINDOWS`] kind: a memory window.
+    pub const WINDOW_MEMORY: u64 = 0;
+    /// [`BRIDGE_WINDOWS`] kind: an I/O port window.
+    pub const WINDOW_IO: u64 = 1;
+    /// [`BRIDGE_WINDOWS`] kind: a bus number range.
+    pub const WINDOW_BUS: u64 = 2;
+
+    /// Push the interrupt routes of one PCI host bridge's root bus from
+    /// acpid: its `_PRT`, each entry's link device resolved to the line its
+    /// current resources name.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the bridge's segment; `data[2]` = its bus; `data[3]` =
+    /// [`PRT_ROUTES`] or [`PRT_PIC_MODE`]; `data[4..36]` = one word per
+    /// device 0 to 31, holding the line of pin `INTA` to `INTD` in its 16-bit
+    /// lanes 0 to 3 (bits `16 * pin` up), [`PRT_NO_ROUTE`] for a pin the table
+    /// does not route. Caller's badge MUST carry [`ACPI_AUTHORITY`]; the
+    /// handler replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// devmgr checks one mode's table against the boot functions with an
+    /// interrupt pin on the buses of the bridge's windows ([`BRIDGE_WINDOWS`]),
+    /// each at the root-bus device and pin its interrupt reaches: on x86-64 the
+    /// [`PRT_PIC_MODE`] table against each function's Interrupt Line
+    /// register, which the firmware programmed in that model; on RISC-V the
+    /// [`PRT_ROUTES`] table against the line devmgr gives each function. It
+    /// keeps the first table of each bridge and mode that passes, for the
+    /// boot, and logs a later push that differs; on x86-64 it keeps a
+    /// [`PRT_ROUTES`] table only once it holds the bridge's
+    /// [`PRT_PIC_MODE`] table, the same `_PRT` read in the other model,
+    /// whose routes it checks only for being routed. A refusal is fail-closed:
+    /// the bridge has no table of the mode from acpid until a push passes.
+    /// Reply: [`super::devmgr_errors::SUCCESS`] when devmgr holds the
+    /// bridge's table of the mode; [`super::devmgr_errors::REFUSED`], logged,
+    /// for a table that fails the check or comes before the bridge's windows
+    /// or the table it waits for; [`super::devmgr_errors::INVALID_REQUEST`] for an unknown mode, a
+    /// mode the architecture does not serve, a short push, or a bridge devmgr
+    /// cannot record.
+    pub const PRT_TABLE: u64 = 29;
+    /// [`PRT_TABLE`] mode: the routes of the interrupt model acpid selected
+    /// (`_PIC(1)`, the APIC model, on x86-64; the only model on RISC-V),
+    /// whose lines are GSIs.
+    pub const PRT_ROUTES: u64 = 0;
+    /// [`PRT_TABLE`] mode, x86-64: the routes evaluated before `_PIC(1)`, in
+    /// the PIC model the firmware hands over in, whose link devices read the
+    /// PIRQ routing the firmware programmed and wrote into each function's
+    /// Interrupt Line register.
+    pub const PRT_PIC_MODE: u64 = 1;
+    /// [`PRT_TABLE`] lane value: no route.
+    pub const PRT_NO_ROUTE: u64 = 0xFFFF;
+    /// The `data` words of a [`PRT_TABLE`] push: the header and one word per
+    /// device.
+    pub const PRT_TABLE_WORDS: usize = 4 + 32;
+
+    /// Read what devmgr holds for one PCI host bridge from acpid's pushes:
+    /// whether the firmware granted the OS native control of each PCI Express
+    /// feature (`_OSC`), and whether devmgr trusts the bridge's interrupt
+    /// routes and windows.
+    ///
+    /// A service that drives a PCI Express port feature (native hotplug,
+    /// AER, PME) reads here whether the OS owns that feature on its bridge;
+    /// svctest reads it to check acpid's evaluation on every boot.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = the bridge's ordinal among the bridges devmgr holds a push
+    /// for, in segment, then bus order. Caller's badge MUST carry
+    /// [`REGISTRY_QUERY_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `data[0]` = the segment;
+    /// `data[1]` = the bus; `data[2]` = 1 when devmgr holds the bridge's
+    /// [`OSC_RESULT`] and `_OSC` was evaluated; `data[3]` = its status dword;
+    /// `data[4]` = its control dword; `data[5]` = 1 when devmgr holds the
+    /// bridge's [`PRT_ROUTES`] table; `data[6]` = the boot functions the
+    /// routes check covered; `data[7]` = 1 when devmgr holds its
+    /// [`BRIDGE_WINDOWS`]; `data[8]` = the boot functions the windows check
+    /// covered. Replies [`super::devmgr_errors::NO_DEVICE`] past the last
+    /// bridge.
+    pub const QUERY_HOST_BRIDGE: u64 = 30;
 
     /// Mint a class SEND: a SEND on the registry endpoint whose badge names
     /// a device class and the verb bits its [`QUERY_DEVICE`] replies carry
@@ -2478,9 +2720,9 @@ pub mod devmgr_labels
     /// sends it.
     pub const DRIVER_READY: u64 = 13;
 
-    /// Authority bit gating [`QUERY_ACPI_TABLE`]. Set on svcmgr's
-    /// `devmgr.registry`, `devmgr.shutdown`, and `devmgr.bind`
-    /// publications; a class SEND ([`MINT_CLASS_SEND`]) and the per-device
+    /// Authority bit gating [`QUERY_ACPI_TABLE`] and [`QUERY_HOST_BRIDGE`].
+    /// Set on svcmgr's `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
+    /// and `devmgr.acpi` publications; a class SEND ([`MINT_CLASS_SEND`]) and the per-device
     /// SENDs drivers hold for [`QUERY_DEVICE_INFO`] lack it. Without it the
     /// handler replies `UNAUTHORIZED`. It admits no device query: a device
     /// is reached through its class SEND alone.
@@ -2510,6 +2752,13 @@ pub mod devmgr_labels
     /// `MINT_CLASS_SEND` on and then delete; no consumer holds it. Disjoint
     /// position from the other authority bits.
     pub const CLASS_AUTHORITY: u64 = 1u64 << 59;
+    /// Authority bit gating the labels acpid alone calls:
+    /// [`QUERY_ACPI_RESOURCES`], [`ACPI_REGION_GRANT`], [`ACPI_PCI_CONFIG`],
+    /// [`OSC_RESULT`], [`BRIDGE_WINDOWS`], and [`PRT_TABLE`]. svcmgr mints
+    /// it, beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it
+    /// publishes seed-only as [`crate::published_names::DEVMGR_ACPI`], which
+    /// acpid alone seeds. Disjoint position from the other authority bits.
+    pub const ACPI_AUTHORITY: u64 = 1u64 << 58;
 
     /// The badge of a class SEND ([`MINT_CLASS_SEND`]): the class's slot in
     /// devmgr's class table plus one in bits 0..=15, and the verb bits its
@@ -4021,6 +4270,7 @@ const _: () = core::assert!(
     devmgr_labels::SHUTDOWN_DEVICE_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::BIND_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
+        && devmgr_labels::ACPI_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SWAP_AUTHORITY & VERB_BIT_MASK != 0
@@ -4396,6 +4646,11 @@ pub mod devmgr_errors
     /// The class holds `devmgr_labels::MAX_CLASS_WATCHERS` watches and
     /// none of them is gone (`WATCH_CLASS`).
     pub const WATCHERS_FULL: u64 = 6;
+    /// A well-formed request devmgr's policy refuses: an
+    /// `ACPI_REGION_GRANT` range, an `ACPI_PCI_CONFIG` write, or a
+    /// `PRT_TABLE` or `BRIDGE_WINDOWS` push that fails devmgr's check. The
+    /// refusal is logged.
+    pub const REFUSED: u64 = 7;
     /// Unknown opcode on devmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }

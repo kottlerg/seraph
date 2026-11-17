@@ -218,9 +218,10 @@ reclaimed for a new one, but a number in active use is never reassigned.
                                  66  SYS_ASPACE_HARVEST
                                  67  SYS_THREAD_LIST_PAGES
                                  68  SYS_THREAD_READ_EXT_REGS
+                                 69  SYS_ENDPOINT_BADGE
 ```
 
-**Implementation status.** Every number 0–68 has a handler; unallocated numbers
+**Implementation status.** Every number 0–69 has a handler; unallocated numbers
 return `UnknownSyscall`.
 
 ---
@@ -981,6 +982,39 @@ derivation: as for `SYS_CAP_DERIVE`.
 `InvalidCapability` (source invalid, null, or freed meanwhile), `InvalidState` (a
 `SYS_CAP_REVOKE`, a `SYS_CAP_MOVE`, or an IPC capability transfer is in flight on the source),
 `OutOfMemory` and `QuotaExceeded` (as for `SYS_CAP_DERIVE`).
+
+---
+
+### `SYS_ENDPOINT_BADGE` (69)
+
+Read the badge of an Endpoint capability the caller holds, to a caller that proves, with a
+capability carrying Receive on the same endpoint, that it serves that endpoint (see
+[capability-model.md](../../../docs/capability-model.md) § Badges).
+
+**Arguments:**
+
+| # | Name | Description |
+|---|---|---|
+| 0 | `recv_cap` | Endpoint capability (Receive rights), the proof |
+| 1 | `cap` | Endpoint capability (any rights) whose badge is read |
+
+**Return:** `rax`/`a0`: `0` on success, or a `SyscallError`; on success `rdx`/`a1` carries the
+badge of `cap` (`0` for an un-badged cap).
+
+The call succeeds only when both capabilities name the same Endpoint object. A server mints the
+badges on its endpoint, or gives an un-badged source only to minters it trusts, so the badge of a
+capability on its own endpoint names to it what the same badge names on its receive path: a client
+can hand a server a capability, and the server reads which of its badges the capability carries.
+The same-object test keeps the read to the endpoint's server: a badge read from a capability on
+another endpoint would prove nothing, since any holder of an un-badged source mints any badge. The
+call creates no capability, changes neither slot, and returns no kernel address (see
+[cross-boundary-disclosure.md](cross-boundary-disclosure.md)).
+
+**Capability requirement:** `recv_cap` MUST have Receive rights; `cap` needs none.
+
+**Errors:** `InvalidCapability` (either handle null, stale, empty, or not an Endpoint
+capability), `InsufficientRights` (`recv_cap` lacks Receive), `InvalidArgument` (the two
+capabilities name different endpoints).
 
 ---
 

@@ -3,11 +3,11 @@
 
 // programs/fsbench/src/main.rs
 
-//! `FS_READ` vs `FS_READ_FRAME` crossover benchmark.
+//! `FS_READ` vs `FS_READ_MEMORY` crossover benchmark.
 //!
 //! Measures wall-clock cycle cost of reading `bench.bin` via the inline
-//! `FS_READ` path and the zero-copy `FS_READ_FRAME` path across the size
-//! grid called out in issue #10: 16 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB.
+//! `FS_READ` path and the zero-copy `FS_READ_MEMORY` path across the size
+//! grid 16 B, 1 KiB, 4 KiB, 16 KiB, 64 KiB.
 //!
 //! Path forcing is by buffer chunking, since `read()`'s policy at
 //! `runtime/ruststd/src/sys/fs/seraph.rs` is `want <= 504 AND
@@ -18,6 +18,11 @@
 //! * Memory-cap measurement: always pass a `PAGE_SIZE` buffer (so `want` is
 //!   4096 which exceeds 504). Each `read` returns up to one page. For
 //!   `size < 4096` the call still pays the full single-page frame cost.
+//!
+//! The thread is pinned to CPU 0 before it reads anything: each timed read
+//! blocks on the filesystem driver, and a thread woken on another CPU would
+//! subtract one CPU's cycle counter from another's, which riscv64 does not
+//! keep in step.
 //!
 //! Output is line-oriented and machine-parseable so the host can scrape
 //! it from the serial log:
@@ -46,7 +51,12 @@ const WARMUP_ITERS: u32 = 8;
 /// line: the full benchmark.
 const MEASURE_ITERS: u32 = 256;
 const FIXTURE_PATH: &str = "/data/svctest/bench.bin";
+/// The CPU the benchmark thread is pinned to: CPU 0 is online on every boot.
+const BENCH_CPU: u32 = 0;
 
+/// The calling CPU's cycle counter. Units differ by architecture, and only
+/// two reads on one CPU compare: riscv64 keeps no two harts' counters in
+/// step.
 fn cycles_now() -> u64
 {
     #[cfg(target_arch = "x86_64")]
@@ -163,7 +173,7 @@ enum ReadPath
 {
     /// `FS_READ`, through [`read_inline`].
     Inline,
-    /// `FS_READ_FRAME`, through [`read_frame`].
+    /// `FS_READ_MEMORY`, through [`read_frame`].
     Frame,
 }
 
@@ -286,10 +296,23 @@ fn measure_iters() -> u32
     }
 }
 
+/// Pin the calling thread to [`BENCH_CPU`], so that every timed sample
+/// subtracts two reads of one CPU's cycle counter. A thread running on
+/// another CPU moves at its next entry to the scheduler; the open, the fixture
+/// check and the warm-up reads all block on the filesystem driver, so the
+/// thread runs on `BENCH_CPU` by the first timed sample.
+fn pin_to_bench_cpu()
+{
+    let thread = std::os::seraph::thread::current_thread_cap();
+    syscall::thread_set_affinity(thread, BENCH_CPU)
+        .unwrap_or_else(|e| panic!("fsbench: pin to CPU {BENCH_CPU} failed: error {e}"));
+}
+
 fn main()
 {
     std::os::seraph::log::register_name(b"fsbench");
     let iters = measure_iters();
+    pin_to_bench_cpu();
     std::os::seraph::log!("starting, fixture={FIXTURE_PATH} iters={iters}");
 
     let mut f =

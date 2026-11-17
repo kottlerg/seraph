@@ -21,7 +21,7 @@ devmgr's responsibilities are:
   (RSDP → XSDT → MCFG; preferred on either architecture whenever an RSDP is
   present and it yields a window) or, failing that, every
   `pci-host-ecam-generic` node of the Device Tree blob; and serve ACPI tables
-  to pwrmgr (below). When neither yields an ECAM, devmgr on RISC-V falls back to
+  to pwrmgr and acpid (below). When neither yields an ECAM, devmgr on RISC-V falls back to
   the QEMU `virt` platform-default ECAM window (`platform_default_ecam`:
   `0x3000_0000`, 256 MiB, buses 0..=255); on x86-64 the boot halts. devmgr
   derives per-device interrupt lines from PCI configuration space; resolving
@@ -587,6 +587,19 @@ devmgr's responsibilities are:
   `SHUTDOWN_DEVICE_AUTHORITY`, which only the `devmgr.shutdown` cap carries:
   a seed-only name pwrmgr alone seeds, which svcmgr's `QUERY_ENDPOINT`
   refuses.
+- **Serve acpid** — acpid, the service that evaluates AML, calls devmgr and devmgr never calls
+  acpid. Labels 24 to 29 (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`,
+  `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`) are gated on `ACPI_AUTHORITY`, which only the
+  seed-only `devmgr.acpi` cap carries, seeded by acpid's recipe alone
+  ([acpid and devmgr](../../acpid/docs/devmgr.md) § Capabilities).
+  - devmgr grants each operation region acpid's AML reaches against its policy, and makes
+    each configuration-space access for it
+    ([acpid and devmgr](../../acpid/docs/devmgr.md) § Region grants and § Configuration access).
+  - devmgr keeps acpid's first `_OSC` result for the boot, and the windows and routes that agree
+    with its boot records, and serves them per bridge with `QUERY_HOST_BRIDGE`
+    ([acpid and devmgr](../../acpid/docs/devmgr.md) § Pushes).
+  - Every acpid request but `QUERY_ACPI_RESOURCES` runs on the control thread
+    ([acpid and devmgr](../../acpid/docs/devmgr.md) § Ordering).
 - **Handle hotplug** (design intent; not yet implemented) — on platforms that support it,
   receive hotplug notifications and dynamically spawn or terminate driver processes. See
   [`docs/hotplug.md`](hotplug.md).
@@ -621,7 +634,7 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 
 | Capability | Rights | Purpose |
 |---|---|---|
-| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
+| Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping no copy; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps, each routed with `SYS_IRQ_ROUTE` when carved and kept for the boot, whose derivations are delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and pwrmgr's PM1a + 8042 reset ports |

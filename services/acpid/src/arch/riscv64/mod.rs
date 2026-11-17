@@ -10,8 +10,9 @@
 //! The architecture has no I/O-port instructions, so a `SystemIO` region's
 //! access fails, and there is one interrupt model, whose `_PRT` acpid reads
 //! once. Power is off and reset through SBI, which pwrmgr drives, so acpid
-//! holds no sleep or reset register.
+//! holds no sleep or reset register, and it has no SCI and no event block.
 
+use acpid::events::{Layout, Registers, Start};
 use aml::host::Width;
 
 use crate::devmgr::Devmgr;
@@ -66,6 +67,91 @@ impl Power
     pub const fn reset(&self) -> bool
     {
         false
+    }
+}
+
+/// No event blocks and no SCI: a hardware-reduced platform has neither, and
+/// devmgr serves none. The type has no value.
+pub enum Events {}
+
+impl Events
+{
+    /// `None`: nothing to acquire.
+    pub const fn acquire(_devmgr: &Devmgr, _thread: u64) -> Option<Self>
+    {
+        None
+    }
+
+    /// Unreachable: no `Events` exists.
+    pub const fn bind(&self, _thread: u64) -> bool
+    {
+        match *self {}
+    }
+
+    /// Unreachable: no `Events` exists.
+    pub const fn layout(&self) -> Layout
+    {
+        match *self {}
+    }
+
+    /// Unreachable: no `Events` exists.
+    pub const fn sci(&self) -> u64
+    {
+        match *self {}
+    }
+
+    /// Unreachable: no `Events` exists.
+    pub const fn mode(&self) -> u64
+    {
+        match *self {}
+    }
+
+    /// Unreachable: no `Events` exists.
+    pub const fn gsi(&self) -> u64
+    {
+        match *self {}
+    }
+
+    /// Unreachable: no `Events` exists.
+    pub const fn start(&self) -> Start
+    {
+        match *self {}
+    }
+
+    /// Unreachable: no `Events` exists.
+    ///
+    /// # Safety
+    ///
+    /// None needed; the signature matches the x86-64 surface.
+    pub const unsafe fn ports(&self) -> Ports
+    {
+        match *self {}
+    }
+}
+
+/// No event registers. The type has no value.
+pub enum Ports {}
+
+impl Registers for Ports
+{
+    fn read8(&mut self, _port: u16) -> u8
+    {
+        match *self {}
+    }
+
+    fn write8(&mut self, _port: u16, _value: u8)
+    {
+        match *self {}
+    }
+
+    fn read16(&mut self, _port: u16) -> u16
+    {
+        match *self {}
+    }
+
+    fn write16(&mut self, _port: u16, _value: u16)
+    {
+        match *self {}
     }
 }
 

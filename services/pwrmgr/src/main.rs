@@ -14,7 +14,8 @@
 //! publishes a `SHUTDOWN_AUTHORITY`-badged SEND (`pwrmgr.shutdown`) and its
 //! no-auth twin (`pwrmgr.deny`) on pwrmgr's service endpoint; the recipes
 //! that seed `pwrmgr.shutdown` hold the authority, and svcmgr calls it as
-//! the shutdown actuator.
+//! the shutdown actuator. On x86-64 a second thread waits on acpid for the
+//! power button and powers the platform off when it is pressed.
 //!
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
@@ -60,8 +61,9 @@ fn main() -> !
     // could not be resolved; pwrmgr still serves so callers get a clean
     // error rather than a hung ipc_call.
     let actuator = arch::current::resolve(&bootstrap, ipc_buf);
-    if actuator.is_some()
+    if let Some(act) = &actuator
     {
+        arch::current::watch_events(act);
         std::os::seraph::log!("ready");
     }
     else

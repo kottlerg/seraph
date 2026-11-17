@@ -10,8 +10,9 @@
 //! [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], then forwards an SBI
 //! `system_reset` call through the kernel to M-mode firmware. The
 //! `SbiControl` cap gates kernel-side acceptance; pwrmgr's cap-gating
-//! gates the userspace IPC. acpid serves no power request on RISC-V, so
-//! the `acpid.power` seed is deleted.
+//! gates the userspace IPC. acpid serves no power request on RISC-V and
+//! the platform has no ACPI power button, so the `acpid.power` seed is
+//! deleted.
 
 use crate::caps::{Bootstrap, drop_unused};
 use ipc::{IpcMessage, devmgr_errors, devmgr_labels};
@@ -55,6 +56,10 @@ pub fn resolve(bootstrap: &Bootstrap, ipc_buf: *mut u64) -> Option<Actuator>
     let sbi_control_cap = *reply.caps().first()?;
     Some(Actuator { sbi_control_cap })
 }
+
+/// A no-op: QEMU `virt`'s ACPI is hardware-reduced, with no fixed power
+/// button for acpid to report.
+pub const fn watch_events(_act: &Actuator) {}
 
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
 pub fn shutdown(act: &Actuator, _ipc_buf: *mut u64)

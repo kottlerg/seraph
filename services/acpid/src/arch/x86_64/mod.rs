@@ -4,13 +4,15 @@
 // services/acpid/src/arch/x86_64/mod.rs
 
 //! x86-64: the legacy-to-ACPI mode switch, the I/O-port accesses, the
-//! interrupt model acpid selects, and the sleep and reset registers.
+//! interrupt model acpid selects, the sleep and reset registers, and the
+//! event blocks and the SCI.
 //!
 //! The firmware hands over in the PIC model, with `SCI_EN` possibly clear.
 //! acpid reads each host bridge's `_PRT` in that model first, whose link
 //! devices report the PIRQ routing the firmware programmed, then selects the
 //! APIC model with `_PIC(1)` and reads the routes again.
 
+use acpid::events::{Layout, Registers, Start};
 use aml::host::Width;
 use ipc::devmgr_labels;
 use std::time::Duration;
@@ -166,6 +168,225 @@ impl Power
         // ACPI specification defines.
         unsafe { outb(reset.port, value) };
         true
+    }
+}
+
+/// The event blocks and the SCI, acquired from devmgr: the `PM1a` event
+/// block, the `GPE0` block when the platform has one, and a derivation of
+/// the SCI's line.
+pub struct Events
+{
+    layout: Layout,
+    pm1: u64,
+    gpe0: Option<u64>,
+    sci: u64,
+    mode: u64,
+    gsi: u64,
+    start: Start,
+}
+
+impl Events
+{
+    /// Acquire the `PM1a` event block, the `GPE0` block and the SCI through
+    /// `devmgr` and bind the blocks to `thread`, the calling thread. `None`,
+    /// logged, when the platform lacks the `PM1a` block or the SCI, or a
+    /// block cannot be bound; a `GPE0` block that cannot be used is logged
+    /// and left out.
+    pub fn acquire(devmgr: &Devmgr, thread: u64) -> Option<Self>
+    {
+        let pm1 = match block(devmgr, devmgr_labels::ACPI_PM1A_EVT)
+        {
+            Ok(pm1) => pm1,
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "no PM1a event block ({e:?}); no events");
+                return None;
+            }
+        };
+        let gpe0 = match block(devmgr, devmgr_labels::ACPI_GPE0)
+        {
+            Ok(gpe0) if Layout::new(pm1.port, pm1.count, Some((gpe0.port, gpe0.count))).is_some() =>
+            {
+                Some(gpe0)
+            }
+            Ok(gpe0) =>
+            {
+                std::os::seraph::log!(warn: "GPE0 block not usable; no GPEs");
+                let _ = syscall::cap_delete(gpe0.cap);
+                None
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!("no GPE0 block ({e:?})");
+                None
+            }
+        };
+        let layout = Layout::new(pm1.port, pm1.count, gpe0.map(|g| (g.port, g.count)));
+        let sci = devmgr.call(
+            devmgr_labels::QUERY_ACPI_RESOURCES,
+            &[devmgr_labels::ACPI_SCI],
+        );
+        let (layout, sci) = match (layout, sci)
+        {
+            (Some(layout), Ok(sci)) => (layout, sci),
+            (layout, sci) =>
+            {
+                match &sci
+                {
+                    Ok(sci) => sci.caps().iter().for_each(|&c| {
+                        let _ = syscall::cap_delete(c);
+                    }),
+                    Err(e) => std::os::seraph::log!(warn: "no SCI ({e:?}); no events"),
+                }
+                if layout.is_none()
+                {
+                    std::os::seraph::log!(warn: "PM1a event block not usable; no events");
+                }
+                let _ = syscall::cap_delete(pm1.cap);
+                if let Some(g) = gpe0
+                {
+                    let _ = syscall::cap_delete(g.cap);
+                }
+                return None;
+            }
+        };
+        let Some(&cap) = sci.caps().first()
+        else
+        {
+            std::os::seraph::log!(warn: "devmgr served the SCI without its cap; no events");
+            let _ = syscall::cap_delete(pm1.cap);
+            if let Some(g) = gpe0
+            {
+                let _ = syscall::cap_delete(g.cap);
+            }
+            return None;
+        };
+        let events = Self {
+            layout,
+            pm1: pm1.cap,
+            gpe0: gpe0.map(|g| g.cap),
+            sci: cap,
+            gsi: sci.word(0),
+            mode: sci.word(1),
+            start: if sci.word(2) == 0
+            {
+                Start::First
+            }
+            else
+            {
+                Start::Restart
+            },
+        };
+        if !events.bind(thread)
+        {
+            std::os::seraph::log!(warn: "event blocks not bound; no events");
+            for c in [Some(events.pm1), events.gpe0, Some(events.sci)].into_iter().flatten()
+            {
+                let _ = syscall::cap_delete(c);
+            }
+            return None;
+        }
+        Some(events)
+    }
+
+    /// Bind the event blocks to `thread`; whether the kernel accepted both.
+    pub fn bind(&self, thread: u64) -> bool
+    {
+        bind_ports(thread, self.pm1) && self.gpe0.is_none_or(|g| bind_ports(thread, g))
+    }
+
+    /// Where the event registers lie.
+    pub const fn layout(&self) -> Layout
+    {
+        self.layout
+    }
+
+    /// The SCI's `Interrupt` cap.
+    pub const fn sci(&self) -> u64
+    {
+        self.sci
+    }
+
+    /// The `SYS_IRQ_REGISTER` mode devmgr routes the SCI's line in.
+    pub const fn mode(&self) -> u64
+    {
+        self.mode
+    }
+
+    /// The SCI's GSI.
+    pub const fn gsi(&self) -> u64
+    {
+        self.gsi
+    }
+
+    /// Whether this is the first acpid devmgr served the SCI in this boot.
+    pub const fn start(&self) -> Start
+    {
+        self.start
+    }
+
+    /// The registers of the blocks, reached by port I/O.
+    ///
+    /// # Safety
+    ///
+    /// Every thread that uses the returned [`Ports`] has bound the blocks
+    /// ([`Events::bind`]).
+    pub const unsafe fn ports(&self) -> Ports
+    {
+        Ports {
+            layout: self.layout,
+        }
+    }
+}
+
+/// The event registers, reached by port I/O from a thread the blocks are
+/// bound to ([`Events::ports`]). A port outside the blocks reads as all
+/// ones and is not written.
+pub struct Ports
+{
+    layout: Layout,
+}
+
+impl Registers for Ports
+{
+    fn read8(&mut self, port: u16) -> u8
+    {
+        if !self.layout.holds(port)
+        {
+            return u8::MAX;
+        }
+        // SAFETY: `port` is in a block bound to this thread
+        // (`Events::ports`); a status or enable read has no side effect.
+        unsafe { inb(port) }
+    }
+
+    fn write8(&mut self, port: u16, value: u8)
+    {
+        if self.layout.holds(port)
+        {
+            // SAFETY: as `read8`; the write clears status bits or sets the
+            // enable bits acpid handles.
+            unsafe { outb(port, value) };
+        }
+    }
+
+    fn read16(&mut self, port: u16) -> u16
+    {
+        if !self.layout.holds(port) || !port.checked_add(1).is_some_and(|p| self.layout.holds(p))
+        {
+            return u16::MAX;
+        }
+        // SAFETY: as `read8`, both ports of the word.
+        unsafe { inw(port) }
+    }
+
+    fn write16(&mut self, port: u16, value: u16)
+    {
+        if self.layout.holds(port) && port.checked_add(1).is_some_and(|p| self.layout.holds(p))
+        {
+            // SAFETY: as `write8`, both ports of the word.
+            unsafe { outw(port, value) };
+        }
     }
 }
 

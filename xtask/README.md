@@ -1162,6 +1162,34 @@ cargo xtask test-reboot [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
 The boot to the `SHUTDOWN` event is bounded by five minutes. The QMP socket is
 `target/xtask/reboot-test-<arch>.sock`. CI runs the command in each `usertest` cell.
 
+### `cargo xtask test-powerbutton`
+
+Check the power button, on `x86_64` only (QEMU's riscv64 `virt` machine has no fixed power
+button). Boots the current sysroot once, headless, with a QMP socket, and waits up to five
+minutes for acpid's `events armed` line and the terminal's READY line. It then presses the ACPI
+power button with QMP `system_powerdown` and waits on the same connection for QMP's `SHUTDOWN`
+event. It passes when acpid's `power button pressed` line, pwrmgr's `power button: shutting down`
+line and acpid's `SLEEP(5): PM1a_CNT` line appear within a minute of the press, the `SHUTDOWN`
+event's reason is `guest-shutdown`, and QEMU exits on its own within 30 seconds;
+[docs/testing.md](../docs/testing.md) § Power button (`test-powerbutton`) says what the press runs
+through.
+
+A pure runner like `test-terminal`; requires a populated `x86_64` sysroot with the default boot
+set (terminal + shell):
+
+```sh
+cargo xtask build
+cargo xtask test-powerbutton [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The QMP socket is `target/xtask/powerbutton-test.sock`. CI runs the command in each `x86_64`
+`usertest` cell.
+
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
@@ -1742,9 +1770,8 @@ The worktrees of one checkout share one host. The commands that load it apply it
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
 them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-reboot`,
-`test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-hotplug`,
-`test-gdb` and
-`capture-acpi` as boots.
+`test-powerbutton`, `test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`,
+`test-debug-port`, `test-hotplug`, `test-gdb` and `capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

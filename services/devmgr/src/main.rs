@@ -225,7 +225,7 @@ fn main() -> !
             &mut catalog,
             ipc_buf,
         );
-        acpi.run(&records, &mut caps);
+        acpi.run(&records, &mut caps, &mut irq_range);
         hotplug.grant(acpi.bridges(), &mut records, &mut caps);
         hotplug.run(
             &registry,
@@ -896,6 +896,13 @@ impl Registry
             ipc::devmgr_labels::QUERY_SHUTDOWN_DEVICE =>
             {
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
+            }
+            ipc::devmgr_labels::QUERY_ACPI_RESOURCES
+                if msg.word(1) == ipc::devmgr_labels::ACPI_SCI =>
+            {
+                // The SCI's line is the control thread's, which owns the
+                // interrupt lines.
+                self.acpi_request(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf);
             }
             ipc::devmgr_labels::QUERY_ACPI_RESOURCES =>
             {

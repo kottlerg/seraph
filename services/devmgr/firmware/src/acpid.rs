@@ -195,8 +195,6 @@ pub enum Holder
     /// A resource of a device record: a PCI BAR or a platform record's
     /// `Mmio` or `IoPort`, whether or not a driver holds it yet.
     Device,
-    /// A port of pwrmgr's shutdown actuators.
-    Pwrmgr,
     /// The configuration-mechanism ports ([`CONFIG_PORTS`]).
     ConfigMechanism,
     /// The FACS, whose global lock and waking vector acpid does not own.
@@ -217,14 +215,13 @@ pub struct Refusal
 
 /// Whether devmgr refuses acpid the region `want` ([`grant_range`]'s
 /// range): the first range of `devices` (each record's resources), then of
-/// `pwrmgr` (its ports), then `kernel` (the kernel's interrupt controllers
-/// and ports), then [`CONFIG_PORTS`], then `facs` that `want` overlaps.
+/// `kernel` (the kernel's interrupt controllers and ports), then
+/// [`CONFIG_PORTS`], then `facs` that `want` overlaps.
 /// `None` lets the request go on to the carve, which refuses memory no
 /// aperture devmgr still holds covers.
 pub fn region_refusal(
     want: &Range,
     devices: impl IntoIterator<Item = Range>,
-    pwrmgr: &[Range],
     kernel: &[Range],
     facs: Option<Range>,
 ) -> Option<Refusal>
@@ -235,7 +232,6 @@ pub fn region_refusal(
     devices
         .into_iter()
         .find_map(refused(Holder::Device))
-        .or_else(|| pwrmgr.iter().copied().find_map(refused(Holder::Pwrmgr)))
         .or_else(|| kernel.iter().copied().find_map(refused(Holder::Kernel)))
         .or_else(|| refused(Holder::ConfigMechanism)(CONFIG_PORTS))
         .or_else(|| facs.and_then(refused(Holder::Facs)))
@@ -1043,20 +1039,16 @@ mod tests
             count: 8,
         });
         let devices = || pci_ranges(&nic).chain(serial);
-        let pwrmgr = [io(0x604, 0x606), io(0x64, 0x65)];
         let kernel = [memory(0xFEE0_0000, 0xFEE0_1000), io(0x40, 0x44)];
         let facs = Some(memory(0x7FEB_1000, 0x7FEB_1040));
-        let refused = |want: Range| {
-            region_refusal(&want, devices(), &pwrmgr, &kernel, facs).map(|r| r.holder)
-        };
+        let refused =
+            |want: Range| region_refusal(&want, devices(), &kernel, facs).map(|r| r.holder);
 
         // A byte in the BAR's page, and a port of each I/O resource.
         let page = grant_range(Space::Memory, 0x8100_0FF0, 4).unwrap_or(memory(0, 0));
         assert_eq!(refused(page), Some(Holder::Device));
         assert_eq!(refused(io(0x601F, 0x6020)), Some(Holder::Device));
         assert_eq!(refused(io(0x3FD, 0x3FE)), Some(Holder::Device));
-        assert_eq!(refused(io(0x605, 0x606)), Some(Holder::Pwrmgr));
-        assert_eq!(refused(io(0x60, 0x68)), Some(Holder::Pwrmgr));
         assert_eq!(refused(io(0xCFC, 0xD00)), Some(Holder::ConfigMechanism));
         assert_eq!(
             refused(memory(0xFEE0_0000, 0xFEE0_2000)),
@@ -1070,9 +1062,14 @@ mod tests
         // The space is part of the range: port 0xCF8 is not memory 0xCF8.
         assert_eq!(refused(memory(0, 0x1000)), None);
         assert_eq!(refused(io(0x600, 0x604)), None);
+        // The PM1a control pair and the 8042 ports: no service but acpid
+        // drives the ACPI sleep and reset registers, and nothing holds the
+        // 8042.
+        assert_eq!(refused(io(0x604, 0x606)), None);
+        assert_eq!(refused(io(0x60, 0x68)), None);
         assert_eq!(refused(io(0xB2, 0xB3)), None);
         assert_eq!(refused(memory(0xFED0_0000, 0xFED0_1000)), None);
-        let refusal = region_refusal(&io(0x6000, 0x6001), devices(), &pwrmgr, &kernel, facs);
+        let refusal = region_refusal(&io(0x6000, 0x6001), devices(), &kernel, facs);
         assert_eq!(refusal.map(|r| r.range), Some(io(0x6000, 0x6020)));
     }
 

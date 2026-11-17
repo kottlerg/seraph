@@ -364,8 +364,6 @@ pub struct AcpiService
     /// The apertures devmgr was given at boot, `(base, end)`, before any
     /// carve: the memory a bridge's BARs must lie in.
     boot_apertures: Vec<(u64, u64)>,
-    /// pwrmgr's ports, which no grant reaches.
-    pwrmgr: Vec<Range>,
     /// The interrupt controllers the MADT describes and the ports the kernel
     /// owns, which no grant reaches.
     kernel: Vec<Range>,
@@ -415,7 +413,6 @@ impl AcpiService
             grants: Grants::new(),
             bridges: firmware::acpid::Bridges::new(),
             boot_apertures,
-            pwrmgr: arch::current::pwrmgr_ports(firmware),
             kernel: kernel_ranges(firmware),
             facs,
         }
@@ -539,7 +536,6 @@ impl AcpiService
         let refusal = firmware::acpid::region_refusal(
             &range,
             records.resource_ranges(),
-            &self.pwrmgr,
             &self.kernel,
             self.facs,
         );

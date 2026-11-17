@@ -293,12 +293,18 @@ jobs:
             # own NMI frame; host-side over the gdbstub, so it cannot ride
             # run-parallel. Reuses the default interactive boot.
             cargo xtask test-wedge --arch ${{ matrix.arch }}
+            # Fifth boot: the reboot test. Stages the reboot fixture, whose
+            # pwrmgr REBOOT must reset the machine (through acpid's
+            # RESET_REG write on x86_64, SBI on riscv64), read from QMP's
+            # SHUTDOWN event; host-side over QMP, so it cannot ride
+            # run-parallel. Restores the default interactive boot after.
+            cargo xtask test-reboot --arch ${{ matrix.arch }}
             if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              # Fifth boot pair: the VMGENID snapshot-resume test (#395).
+              # Sixth boot pair: the VMGENID snapshot-resume test (#395).
               # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
               # host-side QMP migrate/restore, so it cannot ride
               # run-parallel. Reuses the default interactive boot the
-              # test-terminal repack just restored.
+              # test-reboot restore left.
               cargo xtask test-vmgenid
             fi
           fi

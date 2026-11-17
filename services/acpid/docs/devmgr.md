@@ -6,7 +6,7 @@ What devmgr gives acpid, what it refuses, and what it keeps of acpid's results.
 
 ## Capabilities
 
-svcmgr mints acpid's one capability, the `devmgr.acpi` seed: a SEND on devmgr's registry
+svcmgr mints acpid's one capability on devmgr, the `devmgr.acpi` seed: a SEND on devmgr's registry
 endpoint badged `REGISTRY_QUERY_AUTHORITY | ACPI_AUTHORITY`, published seed-only, and seeded
 by acpid's recipe alone. `ACPI_AUTHORITY` gates every label acpid alone calls; devmgr replies
 `UNAUTHORIZED` to them on any other badge. Through the seed acpid acquires:
@@ -32,7 +32,6 @@ page. devmgr refuses, and logs the refusal with the range it collides with:
 
 - a range overlapping a resource of any device record (a PCI BAR, a platform record's `Mmio` or
   `IoPort`), whether or not a driver has been started for it;
-- a port of pwrmgr's shutdown actuators;
 - the register window of each interrupt controller the MADT describes, which the kernel
   programs (the local APIC, each I/O APIC, the APLIC, each hart's IMSIC interrupt file), and
   on x86-64 the legacy ports the kernel owns: the two 8259s and their edge/level control

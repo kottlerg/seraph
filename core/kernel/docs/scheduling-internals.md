@@ -551,6 +551,25 @@ panics under `scheduler.lock`, wedging that CPU. `cur_state` is read under `curr
 `state` read a `timer_tick`-side guard would require. The parked thread is redispatched by its
 deposited wake (the resume-DEPOSIT model, Wake Protocol Invariants).
 
+**Hard-affinity wake in the voluntary-block window — `schedule()` never requeues a claimed
+`current` (issue #1221).** The save-window pin (§ Wake Protocol Invariants, Target CPU selection)
+links a thread woken inside its window on the CPU it is parking on, which alone dequeues it. Hard
+affinity overrides the pin: `sys_thread_set_affinity` on a `Running` thread only flags its CPU A
+for a reschedule, so a thread that names CPU B and parks before A's next `schedule()` is linked on
+B by its wake while it is still `current` on A. B's `schedule()` then claims it: its
+`dequeue_highest` unlinks it (`Ready`, `queued_on == -1`), and its dispatch flip marks it `Running`
+and waits for A's register save, or its deferred dispatch links it back on B (step 3.5 of
+§ Cross-CPU TCB Ownership). A's outgoing-requeue guard skips a `current` so claimed: one that is
+`Ready` and unlinked, or `Running` with a `preferred_cpu` naming another CPU (each `Ready →
+Running` flip of `schedule()` writes `preferred_cpu` with the dispatching CPU under the thread's
+`sched_lock`, init's first dispatch by `sched::enter` on CPU 0 finds it 0 from construction, and
+nothing else writes it while the thread is `Running`). Both reads are under `current.sched_lock`,
+which the flip also holds, so the claim is authoritative. A requeue of the claimed thread would
+link it on B a second time: B then runs it while it is linked, its next park trips the
+`commit_blocked` tripwire ("parking while linked"), and in a release build B dispatches it again
+while it runs. A then switches away from the thread, publishing the save B waits for. The
+`affinity_park_handoff` stress cell drives this window.
+
 **Sleep-list coordination (issue #117).** When a wake source (`notification_send`,
 `event_queue_post`, `cancel_ipc_block`, a source's dealloc wake, or any other claimer of a timed
 endpoint or wait-set park) claims a waiter that was registered with a timeout, it MUST drop the
@@ -889,7 +908,8 @@ and linked on a run queue while it is *still `current`/live* on a CPU: the **wak
 transient**. A thread that commits `Blocked` (e.g. an `ipc_call` that registers a reply binding)
 clears `context_saved = 0` and then, before it reaches its own `schedule()` to switch away, a fast
 waker (e.g. the server's `ipc_reply`) runs `enqueue_and_wake`, observes `Blocked`, and links it
-`Ready` on its `preferred_cpu` (the CPU it is still running on, pinned because `cs == 0`). The
+`Ready` on its `preferred_cpu` (the CPU it is still running on, pinned because `cs == 0`; a
+hard affinity naming another CPU links it there instead, § ThreadState Transitions). The
 thread is now `Ready` + linked + `cs == 0` while `sched.current` on that CPU still names it. This is
 harmless on its own — the owning CPU's `schedule()` re-dispatches it (the `next == current` re-mark)
 or deschedules it. But a **cross-CPU relocator must NOT touch it**: `pull_unpinned_ready` (load
@@ -1057,7 +1077,12 @@ selection policy is, in priority order: (1) hard affinity
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
 of the global `min_load`, and (4) the least-loaded CPU, a tie going to
 the CPU with the fewest busy SMT siblings, then the lowest index
-(`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). The
+(`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). Hard
+affinity overrides the pin, so an in-window wake of a thread whose affinity
+names another CPU links it there while it is still `current` on the CPU it
+parks on; that CPU's `schedule()` leaves it to the CPU that claims it
+(§ ThreadState Transitions, "Hard-affinity wake in the voluntary-block
+window"). The
 `LOAD_BALANCE_IMBALANCE_THRESHOLD` knob is shared with `try_pull_balance`,
 a busy CPU's pull ([scheduler.md](scheduler.md) § Load Balancing),
 so the wake-side stickiness and the busy-CPU pull's imbalance test

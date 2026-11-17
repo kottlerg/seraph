@@ -281,9 +281,10 @@ width implies (CPUs / 16), by which each cross-CPU handoff slows, so the bound s
 slow step from a stuck or wrong one. They are the report bound of `tally::await_report` and
 `tally::await_all`; the round bounds of `configure_start_race`, `stop_target_vanishes`,
 `thread_cap_delete_under_use`, `copy_source_delete` and `affinity_swap_handoff`, and the exit
-polls of `thread_cap_delete_under_use` and `copy_source_delete`; the pinned-CPU report wait of
-`priority_dealloc_race`; the acknowledgement, result, approach, sync and entry bounds of
-`stop_claimed_delete`, `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
+polls of `thread_cap_delete_under_use` and `copy_source_delete`; the phase bound of
+`affinity_park_handoff`; the pinned-CPU report wait of `priority_dealloc_race`; the
+acknowledgement, result, approach, sync and entry bounds of `stop_claimed_delete`,
+`stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
 acknowledgement, server-entry and exit bounds of `stop_source_delete`; the preemption budget of
 `integration::priority_preemption`; the progress budget of `integration::fair_share_progress`;
 the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the expiry and
@@ -394,6 +395,7 @@ is not a stall to the all-idle detector.
 | `timed_wait_reuse.rs` | A timed wait claimed by a delivery at its deadline, followed by an untimed wait on the same source: the untimed wait never returns a timeout (≥ 2 CPUs) | `CYCLES=400`, `WAIT_MS=1` |
 | `double_enqueue_storm.rs` | Run-queue double-link guard regression (#244): wake + priority + affinity churn, then wake racing `cap_delete(Thread)` | `NUM_WORKERS=32`, `CYCLES=600` |
 | `affinity_swap_handoff.rs` | Swap the affinities of pairs of workers that each own one CPU of their pair and report their CPU and yield in a loop, so both CPUs of a pair hand their outgoing thread to the other in `schedule()`'s cross-affinity requeue at once; every round must see every worker on its new CPU (#529, the dispatch wait for an unpublished `next` closing into a cycle) (≥ 2 CPUs) | `MAX_PAIRS=8`, `ROUNDS=400` |
+| `affinity_park_handoff.rs` | A worker moves its own hard affinity between two CPUs and parks at once in a notification wait, while a waker on a third CPU sends it after a delay the rounds sweep, so the wake, routed by the new affinity, links the worker on the CPU it names while it is still `current` on the CPU it parks on; in the first phase that CPU idles, in the second a spinner below the worker yields in a loop on each of the two CPUs, so the claiming CPU dequeues the worker while the parking CPU's `schedule()` decides. Every affinity change and wait returns `Ok`, both children finish each phase within its bound, and in each phase some wait returns on the CPU its round named (#1221, `schedule()` requeueing a `current` another CPU's dispatch has claimed; the kernel's debug assertions, `commit_blocked`'s "parking while linked" and the run queue's double-link guard, are the tripwires) (≥ 3 CPUs) | `CYCLES=16_000` per phase (two phases) |
 | `event_try_recv_post_race.rs` | A non-blocking `SYS_EVENT_RECV` try-once racing a concurrent `event_post` must never leave the poller wakeable (#352) (≥ 2 CPUs) | `CYCLES=1024` |
 | `load_balance_handoff_steal.rs` | Arm the load-balancer mid-handoff steal (#314/#293): unpinned IPC clients vs round-robin-pinned servers expose `pull_unpinned_ready` stealing a `context_saved == 0` thread (≥ 2 CPUs) | `NUM_PAIRS=16`, `ITERS=16000` |
 | `concurrent_notification.rs` | Multiple threads sending distinct bits to one notification simultaneously | `NUM_SENDERS=64`, `SEND_ITERATIONS=5000` |

@@ -111,17 +111,12 @@ impl Config
         let mode = match var(ENV_TRUST_STORE_MODE)
         {
             None => None,
-            Some(value) => Some(
-                value
-                    .to_str()
-                    .and_then(StoreMode::parse)
-                    .with_context(|| {
-                        format!(
-                            "{ENV_TRUST_STORE_MODE}={} names no mode: merge or replace",
-                            value.to_string_lossy()
-                        )
-                    })?,
-            ),
+            Some(value) => Some(value.to_str().and_then(StoreMode::parse).with_context(|| {
+                format!(
+                    "{ENV_TRUST_STORE_MODE}={} names no mode: merge or replace",
+                    value.to_string_lossy()
+                )
+            })?),
         };
         let deployer_store = match (var(ENV_TRUST_STORE), mode)
         {
@@ -142,7 +137,11 @@ impl Config
 /// `HOME`, or in `LOCALAPPDATA`, the first of them set to an absolute path.
 fn default_dir(var: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf>
 {
-    let absolute = |name: &str| var(name).map(PathBuf::from).filter(|path| path.is_absolute());
+    let absolute = |name: &str| {
+        var(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
     absolute("XDG_DATA_HOME")
         .or_else(|| absolute("HOME").map(|home| home.join(".local").join("share")))
         .or_else(|| absolute("LOCALAPPDATA"))
@@ -200,7 +199,9 @@ impl Signer
             .transpose()?;
         let store = store::build(
             identity.store(),
-            deployer.as_ref().map(|(bytes, mode)| (bytes.as_slice(), *mode)),
+            deployer
+                .as_ref()
+                .map(|(bytes, mode)| (bytes.as_slice(), *mode)),
             SECURITY_VERSION,
         )?;
         Ok(Self {
@@ -252,7 +253,9 @@ impl Signer
         let trailer = objsig::trailer_len(&[record]).map_err(refused)?;
         let mut out = body.to_vec();
         out.resize(
-            body.len().checked_add(trailer).context("a signed object longer than usize")?,
+            body.len()
+                .checked_add(trailer)
+                .context("a signed object longer than usize")?,
             0,
         );
         let (_, tail) = out.split_at_mut(body.len());
@@ -587,8 +590,13 @@ mod tests
     {
         let root = scratch("again");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
-        let once = signer.sign(b"\x7fELF image", Kind::Service, "/services/x").unwrap();
-        assert_eq!(signer.sign(&once, Kind::Service, "/services/x").unwrap(), once);
+        let once = signer
+            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .unwrap();
+        assert_eq!(
+            signer.sign(&once, Kind::Service, "/services/x").unwrap(),
+            once
+        );
         let renamed = signer.sign(&once, Kind::BootModule, "x").unwrap();
         assert_eq!(objsig::split(&renamed).unwrap().body(), b"\x7fELF image");
         assert!(verifies(&signer, &renamed, Kind::BootModule, "x"));
@@ -602,12 +610,16 @@ mod tests
     {
         let root = scratch("malformed");
         let signer = signer(&root.join("keys"), Arch::Riscv64);
-        let mut object = signer.sign(b"\x7fELF image", Kind::Service, "/services/x").unwrap();
+        let mut object = signer
+            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .unwrap();
         // The footer's version field: 8 bytes of magic end the footer, after
         // the 2-byte version.
         let version = object.len() - 10;
         object[version] = 2;
-        signer.sign(&object, Kind::Service, "/services/x").unwrap_err();
+        signer
+            .sign(&object, Kind::Service, "/services/x")
+            .unwrap_err();
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -643,10 +655,18 @@ mod tests
             ("esp/EFI/seraph/kernel", Kind::Kernel, "kernel"),
             ("services/svcmgr", Kind::Service, "/services/svcmgr"),
             ("services/fs/fatfs", Kind::Service, "/services/fs/fatfs"),
-            ("services/drivers/virtio-blk", Kind::Driver, "/services/drivers/virtio-blk"),
+            (
+                "services/drivers/virtio-blk",
+                Kind::Driver,
+                "/services/drivers/virtio-blk",
+            ),
             ("programs/hello", Kind::Program, "/programs/hello"),
             ("tests/ktest", Kind::Service, "/tests/ktest"),
-            ("tests/programs/fixture", Kind::Program, "/tests/programs/fixture"),
+            (
+                "tests/programs/fixture",
+                Kind::Program,
+                "/tests/programs/fixture",
+            ),
         ];
         // ELF files outside the signed trees, and a text file inside one.
         let outside = ["config/x", "esp/EFI/seraph/boot.efi"];
@@ -654,7 +674,11 @@ mod tests
         let files = images
             .iter()
             .map(|(path, _, _)| (*path, b"\x7fELF image".as_slice()))
-            .chain(outside.iter().map(|path| (*path, b"\x7fELF outside".as_slice())))
+            .chain(
+                outside
+                    .iter()
+                    .map(|path| (*path, b"\x7fELF outside".as_slice())),
+            )
             .chain([(text, b"vfsd = debug\n".as_slice())]);
         for (path, bytes) in files
         {
@@ -664,7 +688,10 @@ mod tests
         }
         let signer = signer(&root.join("keys"), Arch::Riscv64);
 
-        assert_eq!(sign_sysroot(&ctx, &signer).unwrap(), (images.len(), images.len()));
+        assert_eq!(
+            sign_sysroot(&ctx, &signer).unwrap(),
+            (images.len(), images.len())
+        );
         for (path, kind, name) in images
         {
             let object = fs::read(ctx.sysroot.join(path)).unwrap();
@@ -673,7 +700,10 @@ mod tests
         assert_eq!(fs::read(ctx.sysroot.join(text)).unwrap(), b"vfsd = debug\n");
         for path in outside
         {
-            assert_eq!(fs::read(ctx.sysroot.join(path)).unwrap(), b"\x7fELF outside");
+            assert_eq!(
+                fs::read(ctx.sysroot.join(path)).unwrap(),
+                b"\x7fELF outside"
+            );
         }
         // A second pack of an unchanged sysroot changes no file.
         assert_eq!(sign_sysroot(&ctx, &signer).unwrap(), (images.len(), 0));
@@ -698,7 +728,10 @@ mod tests
     {
         let home = config_of(&[("HOME", "/home/u"), ("SERAPH_TRUST_STORE", "/s")]).unwrap();
         assert_eq!(home.dir, Path::new("/home/u/.local/share/seraph/signing"));
-        assert_eq!(home.deployer_store, Some((PathBuf::from("/s"), StoreMode::Merge)));
+        assert_eq!(
+            home.deployer_store,
+            Some((PathBuf::from("/s"), StoreMode::Merge))
+        );
         let xdg = config_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/x")]).unwrap();
         assert_eq!(xdg.dir, Path::new("/x/seraph/signing"));
         let named = config_of(&[("HOME", "/home/u"), ("SERAPH_SIGNING_DIR", "/k")]).unwrap();
@@ -712,14 +745,26 @@ mod tests
     #[test]
     fn a_store_mode_naming_no_mode_or_without_a_store_is_refused()
     {
-        let replace = [("SERAPH_SIGNING_DIR", "/k"), ("SERAPH_TRUST_STORE", "/s"), ("SERAPH_TRUST_STORE_MODE", "replace")];
+        let replace = [
+            ("SERAPH_SIGNING_DIR", "/k"),
+            ("SERAPH_TRUST_STORE", "/s"),
+            ("SERAPH_TRUST_STORE_MODE", "replace"),
+        ];
         assert_eq!(
             config_of(&replace).unwrap().deployer_store,
             Some((PathBuf::from("/s"), StoreMode::Replace))
         );
-        config_of(&[("SERAPH_SIGNING_DIR", "/k"), ("SERAPH_TRUST_STORE", "/s"), ("SERAPH_TRUST_STORE_MODE", "Replace")])
-            .unwrap_err();
-        config_of(&[("SERAPH_SIGNING_DIR", "/k"), ("SERAPH_TRUST_STORE_MODE", "merge")]).unwrap_err();
+        config_of(&[
+            ("SERAPH_SIGNING_DIR", "/k"),
+            ("SERAPH_TRUST_STORE", "/s"),
+            ("SERAPH_TRUST_STORE_MODE", "Replace"),
+        ])
+        .unwrap_err();
+        config_of(&[
+            ("SERAPH_SIGNING_DIR", "/k"),
+            ("SERAPH_TRUST_STORE_MODE", "merge"),
+        ])
+        .unwrap_err();
     }
 
     // Defect caught: an unchanged store rewritten on every build, which makes

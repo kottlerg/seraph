@@ -48,7 +48,10 @@ pub const STORE_FILE: &str = "trust.store";
 /// The label of a generated local root's anchor.
 const LOCAL_LABEL: &str = "local build root";
 
-const _: () = assert!(LOCAL_LABEL.len() <= LABEL_LEN, "an anchor label fits its field");
+const _: () = assert!(
+    LOCAL_LABEL.len() <= LABEL_LEN,
+    "an anchor label fits its field"
+);
 
 /// A 32-byte Ed25519 secret seed, overwritten when dropped.
 pub struct Seed([u8; 32]);
@@ -170,8 +173,12 @@ impl Identity
         };
         let store = fs::read(dir.join(STORE_FILE))
             .with_context(|| format!("reading {}", dir.join(STORE_FILE).display()))?;
-        TrustStore::parse(&store)
-            .map_err(|e| err!("{}: not a trust store ({e:?})", dir.join(STORE_FILE).display()))?;
+        TrustStore::parse(&store).map_err(|e| {
+            err!(
+                "{}: not a trust store ({e:?})",
+                dir.join(STORE_FILE).display()
+            )
+        })?;
         let key = match signer
         {
             Some(program) => KeySource::External(program.to_path_buf()),
@@ -301,15 +308,18 @@ pub fn refuse_inside(path: &Path, work_tree: &Path) -> Result<()>
 /// symbolic links of the directories above it.
 fn canonical_prefix(path: &Path) -> Result<PathBuf>
 {
-    let absolute = std::path::absolute(path)
-        .with_context(|| format!("resolving {}", path.display()))?;
+    let absolute =
+        std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
     let mut rest = Vec::new();
     let mut existing = absolute.as_path();
     loop
     {
         if let Ok(canonical) = fs::canonicalize(existing)
         {
-            return Ok(rest.iter().rev().fold(canonical, |dir, part| dir.join(part)));
+            return Ok(rest
+                .iter()
+                .rev()
+                .fold(canonical, |dir, part| dir.join(part)));
         }
         let (Some(parent), Some(name)) = (existing.parent(), existing.file_name())
         else
@@ -495,13 +505,8 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>>
 fn read_exact<const N: usize>(path: &Path) -> Result<[u8; N]>
 {
     let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| {
-        err!(
-            "{} holds {} bytes, not {N}",
-            path.display(),
-            bytes.len()
-        )
-    })
+    <[u8; N]>::try_from(bytes.as_slice())
+        .map_err(|_| err!("{} holds {} bytes, not {N}", path.display(), bytes.len()))
 }
 
 /// Decode a certificate file, which holds exactly one certificate.
@@ -559,8 +564,12 @@ mod tests
         let anchor = anchors[0];
         assert!(anchor.local && anchor.usage.certify);
         assert_eq!(anchor.key_id, cert.body.issuer_key_id);
-        crypto::ed25519_verify(&anchor.key, &cert.body.signed_bytes().unwrap(), &cert.signature)
-            .unwrap();
+        crypto::ed25519_verify(
+            &anchor.key,
+            &cert.body.signed_bytes().unwrap(),
+            &cert.signature,
+        )
+        .unwrap();
         let signature = first.sign(b"message").unwrap();
         crypto::ed25519_verify(first.public_key(), b"message", &signature).unwrap();
 

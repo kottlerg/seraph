@@ -47,11 +47,7 @@ impl StoreMode
 ///
 /// When a store does not parse; when the stores hold one key as anchors
 /// that differ in usage, flag or label; when the result does not encode.
-pub fn build(
-    identity: &[u8],
-    deployer: Option<(&[u8], StoreMode)>,
-    floor: u32,
-) -> Result<Vec<u8>>
+pub fn build(identity: &[u8], deployer: Option<(&[u8], StoreMode)>, floor: u32) -> Result<Vec<u8>>
 {
     let parse = |bytes, whose| {
         TrustStore::parse(bytes).map_err(|e| err!("the {whose} trust store does not parse ({e:?})"))
@@ -106,10 +102,12 @@ pub fn build(
 /// # Errors
 ///
 /// When `TrustStore::encode` refuses them.
-pub fn encode(security_floor: u32, anchors: &[AnchorSpec<'_>], revoked: &[KeyId]) -> Result<Vec<u8>>
+pub fn encode(security_floor: u32, anchors: &[AnchorSpec<'_>], revoked: &[KeyId])
+-> Result<Vec<u8>>
 {
     let refused = |e| err!("encoding the trust store ({e:?})");
-    let mut out = vec![0u8; TrustStore::encoded_len(anchors.len(), revoked.len()).map_err(refused)?];
+    let mut out =
+        vec![0u8; TrustStore::encoded_len(anchors.len(), revoked.len()).map_err(refused)?];
     TrustStore::encode(security_floor, anchors, revoked, &mut out).map_err(refused)?;
     Ok(out)
 }
@@ -177,7 +175,11 @@ mod tests
     {
         let own = store_of(1, vec![anchor([1; 32], "own")], vec![[9; 16]]);
         let shared = anchor([2; 32], "shared");
-        let deployer = store_of(5, vec![shared, anchor([3; 32], "deployer")], vec![[8; 16], [9; 16]]);
+        let deployer = store_of(
+            5,
+            vec![shared, anchor([3; 32], "deployer")],
+            vec![[8; 16], [9; 16]],
+        );
         let merged = build(&own, Some((&deployer, StoreMode::Merge)), 1).unwrap();
         let ids = sorted(vec![key_id(&[1; 32]), key_id(&[2; 32]), key_id(&[3; 32])]);
         assert_eq!(contents(&merged), (ids, vec![[8; 16], [9; 16]], 5));
@@ -198,7 +200,10 @@ mod tests
         let own = store_of(1, vec![anchor([1; 32], "own")], Vec::new());
         let deployer = store_of(0, vec![anchor([3; 32], "deployer")], vec![[8; 16]]);
         let replaced = build(&own, Some((&deployer, StoreMode::Replace)), 1).unwrap();
-        assert_eq!(contents(&replaced), (vec![key_id(&[3; 32])], vec![[8; 16]], 1));
+        assert_eq!(
+            contents(&replaced),
+            (vec![key_id(&[3; 32])], vec![[8; 16]], 1)
+        );
     }
 
     // Defect caught: one of two conflicting anchors of a key kept silently,

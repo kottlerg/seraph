@@ -2594,7 +2594,8 @@ pub mod devmgr_labels
     /// A read of any function is allowed; one of a function no device record
     /// holds reads all-ones, as an absent function does, without an access. A
     /// write is allowed only at offset 0x40 and above of a function whose
-    /// record no driver has been started for; any other write is refused,
+    /// record is unbound: no driver has been started for it, and devmgr has
+    /// not taken it as a RISC-V IOMMU unit. Any other write is refused,
     /// logged. The access runs on devmgr's control thread, so no bind of the
     /// function interleaves with it.
     ///

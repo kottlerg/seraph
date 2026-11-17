@@ -250,6 +250,7 @@ Firmware tables captured from real hardware are not tracked
 | Consumer | Uses |
 |---|---|
 | [`services/devmgr/firmware`](../../services/devmgr/README.md) | `encoding` for the static walk of the namespace, `resource` for the `_CRS` adapter |
+| [`services/acpid`](../../services/acpid/README.md) | Evaluates with it at run time, over a `Host` that reaches hardware through devmgr's grants |
 
 ---
 

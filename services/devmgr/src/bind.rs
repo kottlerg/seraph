@@ -90,6 +90,46 @@ impl Records
             .saturating_add(self.platform_states.len())
     }
 
+    /// The PCI functions of every record not removed, in record order.
+    pub fn live_pci(&self) -> impl Iterator<Item = &pci::PciDevice> + Clone
+    {
+        let pci = &self.pci;
+        pci.devices()
+            .iter()
+            .enumerate()
+            .filter(move |&(index, _)| pci.state(index) != Some(RecordState::Removed))
+            .map(|(_, device)| device)
+    }
+
+    /// The state of the record not removed that holds the PCI function at
+    /// `address` (segment, bus, device, function); `None` when none does.
+    pub fn pci_state_at(&self, address: (u16, u8, u8, u8)) -> Option<RecordState>
+    {
+        self.pci
+            .devices()
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| firmware::acpid::address(d) == address)
+            .filter_map(|(index, _)| self.pci.state(index))
+            .find(|&state| state != RecordState::Removed)
+    }
+
+    /// Every memory and I/O range a record not removed holds, bound or not:
+    /// each PCI BAR, and each platform record's `Mmio` and `IoPort`.
+    pub fn resource_ranges(&self) -> impl Iterator<Item = firmware::acpid::Range> + '_
+    {
+        let pci = self.live_pci().flat_map(firmware::acpid::pci_ranges);
+        let platform = self
+            .platform
+            .records()
+            .iter()
+            .zip(&self.platform_states)
+            .filter(|(_, state)| **state != RecordState::Removed)
+            .flat_map(|(record, _)| record.resources())
+            .filter_map(firmware::acpid::platform_range);
+        pci.chain(platform)
+    }
+
     /// The platform records a pass may bind, with their indices.
     fn unbound_platform(&self) -> impl Iterator<Item = (usize, &PlatformRecord)>
     {
@@ -1641,7 +1681,7 @@ fn acquire_single_irq_cap(
 /// when one is set, else the arch `INTx` routing fallback
 /// ([`arch::current::intx_fallback_gsi`]) of the pin and device number its
 /// interrupt reaches its root bus with (`PciDevice::host_intx`).
-fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
+pub fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
 {
     if pci_dev.irq_line != 0 && pci_dev.irq_line != 0xFF
     {
@@ -1651,35 +1691,51 @@ fn device_gsi(pci_dev: &pci::PciDevice) -> Option<u32>
     arch::current::intx_fallback_gsi(pin, dev)
 }
 
-/// Carve the `Mmio` cap of `pci_dev`'s configuration page out of the kept
-/// ECAM windows. Returns `None`, logged under `name`, when no kept window
-/// decodes the function or the carve fails.
+/// The `Mmio` cap of the configuration page of the function at `address`
+/// (segment, bus, device, function), which devmgr keeps for the boot in
+/// `caps.config_pages`: carved out of the kept ECAM windows the first time
+/// a bind or an acpid access asks for it, and found there every later time,
+/// so each user is given a derivation and none loses the page to another.
+/// Returns `None` when no kept window decodes the function, the carve
+/// fails, or the cache cannot grow (nothing is carved then).
+fn config_page(caps: &mut caps::DevmgrCaps, address: (u16, u8, u8, u8)) -> Option<u64>
+{
+    if let Some(&(_, cap)) = caps.config_pages.iter().find(|(a, _)| *a == address)
+    {
+        return Some(cap);
+    }
+    let (segment, bus, dev, func) = address;
+    let phys = firmware::pci::function_config_phys(&caps.ecam_windows, segment, bus, dev, func)?;
+    caps.config_pages.try_reserve(1).ok()?;
+    let cap = caps
+        .config_space
+        .carve(
+            phys,
+            firmware::pci::FUNCTION_CONFIG_BYTES,
+            PAGE_SIZE,
+            |span: &Span<u64>, at| {
+                let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
+                syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
+            },
+        )
+        .ok()?;
+    caps.config_pages.push((address, cap));
+    Some(cap)
+}
+
+/// A derivation of the `Mmio` cap of `pci_dev`'s configuration page
+/// ([`config_page`]), which its holder deletes when done. Returns `None`,
+/// logged under `name`, when no kept window decodes the function, the carve
+/// fails, or the derivation does.
 pub fn carve_function_config(
     name: &str,
     pci_dev: &pci::PciDevice,
     caps: &mut caps::DevmgrCaps,
 ) -> Option<FunctionConfig>
 {
-    let carved = firmware::pci::function_config_phys(
-        &caps.ecam_windows,
-        pci_dev.segment,
-        pci_dev.bus,
-        pci_dev.dev,
-        pci_dev.func,
-    )
-    .and_then(|phys| {
-        caps.config_space
-            .carve(
-                phys,
-                firmware::pci::FUNCTION_CONFIG_BYTES,
-                PAGE_SIZE,
-                |span: &Span<u64>, at| {
-                    let offset = at.checked_sub(span.base).ok_or(SplitError::Failed)?;
-                    syscall::mmio_split(span.slot, offset).map_err(|_| SplitError::Failed)
-                },
-            )
-            .ok()
-    });
+    let address = (pci_dev.segment, pci_dev.bus, pci_dev.dev, pci_dev.func);
+    let carved = config_page(caps, address)
+        .and_then(|page| syscall::cap_derive(page, syscall::RIGHTS_ALL).ok());
     let Some(cap) = carved
     else
     {
@@ -1693,6 +1749,55 @@ pub fn carve_function_config(
         cap,
         aspace: caps.self_aspace,
     })
+}
+
+/// Make acpid's `width`-byte configuration access (1, 2 or 4) at `offset` of
+/// the function at `address`: a read when `write` is `None`, else a write
+/// of its low `width` bytes. The caller has checked the access
+/// (`firmware::acpid::config_access`). Returns the value read (0 for a
+/// write), or `None` when the function's configuration page cannot be
+/// carved or mapped, or the width is not 1, 2 or 4.
+pub fn acpi_config_access(
+    caps: &mut caps::DevmgrCaps,
+    address: (u16, u8, u8, u8),
+    offset: u16,
+    width: u16,
+    write: Option<u64>,
+) -> Option<u64>
+{
+    let page = config_page(caps, address)?;
+    crate::with_mmio_mapped(
+        caps.self_aspace,
+        page,
+        1,
+        "acpid configuration access",
+        |va| {
+            // SAFETY: `with_mmio_mapped` maps the whole configuration page at
+            // `va` for this closure, which reaches it only through `regs`'s raw
+            // volatile accesses.
+            let regs = unsafe { ConfigRegs::new(va) };
+            match (width, write)
+            {
+                (1, None) => Some(u64::from(regs.read8(offset))),
+                (2, None) => Some(u64::from(regs.read16(offset))),
+                (4, None) => Some(u64::from(regs.read32(offset))),
+                (1, Some(value)) => u8::try_from(value & 0xFF).ok().map(|v| {
+                    regs.write8(offset, v);
+                    0
+                }),
+                (2, Some(value)) => u16::try_from(value & 0xFFFF).ok().map(|v| {
+                    regs.write16(offset, v);
+                    0
+                }),
+                (4, Some(value)) => u32::try_from(value & 0xFFFF_FFFF).ok().map(|v| {
+                    regs.write32(offset, v);
+                    0
+                }),
+                _ => None,
+            }
+        },
+    )
+    .flatten()
 }
 
 // ── The bound device ────────────────────────────────────────────────────────
@@ -2108,6 +2213,15 @@ impl ConfigRegs
         self.at(offset, 1).map_or(u8::MAX, |a| unsafe {
             core::ptr::read_volatile(a as *const u8)
         })
+    }
+
+    fn write8(&self, offset: u16, value: u8)
+    {
+        if let Some(a) = self.at(offset, 1)
+        {
+            // SAFETY: as for `read8`.
+            unsafe { core::ptr::write_volatile(a as *mut u8, value) };
+        }
     }
 
     fn read16(&self, offset: u16) -> u16

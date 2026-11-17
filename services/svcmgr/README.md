@@ -11,7 +11,7 @@ endowment to either supervise the running instance or launch a fresh
 one ([docs/service-definitions.md](docs/service-definitions.md) § Reconciliation).
 
 svcmgr also owns the system-wide discovery registry: it publishes the well-known names it owns
-(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`,
+(`rootfs.root`, `svcmgr`, `devmgr.registry`, `devmgr.shutdown`, `devmgr.bind`, `devmgr.acpi`,
 `vfsd.mount`, `vfsd.deny`, `vfsd.swap`, `logd.query`, a `devmgr.class.<stem>` per device class file
 (`<stem>` is the file's name without `.class`), and each provider's `provides` names like
 `pwrmgr.shutdown` / `timed`) into the registry itself — from the
@@ -228,6 +228,7 @@ column). The handover endowment and
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |
 | `devmgr.shutdown` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| SHUTDOWN_DEVICE_AUTHORITY`-badged SEND on devmgr's registry endpoint (seeded by pwrmgr only) | no |
 | `devmgr.bind` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| BIND_AUTHORITY`-badged `SEND\|GRANT` on devmgr's registry endpoint, gating `BIND_DRIVERS`, which moves a directory cap (seeded by svctest only) | no |
+| `devmgr.acpi` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY \| ACPI_AUTHORITY`-badged SEND on devmgr's registry endpoint, gating the labels acpid calls (seeded by acpid only) | no |
 | `devmgr.class.<stem>` | svcmgr (a `MINT_CLASS_SEND` reply, one per class file) | class SEND on devmgr's registry endpoint: the badge names the class's slot and the class file's verbs ([Device class files](docs/service-definitions.md#device-class-files)) | no |
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest only) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |

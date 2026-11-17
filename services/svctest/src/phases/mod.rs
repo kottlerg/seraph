@@ -39,6 +39,7 @@
 
 use crate::runner::Phase;
 
+pub mod acpi;
 pub mod budget;
 pub mod crash;
 pub mod devmgr;
@@ -109,6 +110,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(drivers::phases());
+    out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());
     out.extend_from_slice(procmgr::init_reap());

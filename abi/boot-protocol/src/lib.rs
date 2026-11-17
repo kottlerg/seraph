@@ -1109,7 +1109,8 @@ pub struct BootInfo
     /// unrecognized SSDT layout).
     ///
     /// Discovered by the bootloader from the QEMU VMGENID SSDT without AML
-    /// evaluation: the `VGIA` named DWORD holds the guest-allocated
+    /// evaluation, which acpid, a userspace service, makes only after boot
+    /// (services/acpid/README.md): the `VGIA` named DWORD holds the guest-allocated
     /// `etc/vmgenid_guid` blob base, and the GUID sits 40 bytes into the
     /// blob; this field already includes that offset. The hypervisor
     /// rewrites the GUID in place on snapshot resume / migration, so the

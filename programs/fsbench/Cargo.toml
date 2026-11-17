@@ -9,5 +9,8 @@ name = "fsbench"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+syscall = { path = "../../shared/syscall" }
+
 [lints]
 workspace = true

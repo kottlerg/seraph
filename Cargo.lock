@@ -250,6 +250,9 @@ dependencies = [
 [[package]]
 name = "fsbench"
 version = "0.1.4"
+dependencies = [
+ "syscall",
+]
 
 [[package]]
 name = "gdb-rsp"

@@ -236,74 +236,122 @@ pub unsafe fn probe_asid_bits() -> u32
     implemented.count_ones()
 }
 
-// ── U-mode state enables (Ssstateen) ──────────────────────────────────────────
+// ── Firmware-granted CSR accesses (Smstateen) ─────────────────────────────────
 
-// `__sstateen0_write` writes `sstateen0` (CSR 0x10C, written by number) from
-// `a0` and reads it back into `a0`; `a1` returns 0. Apart from those two
-// registers it touches no register, memory or stack. If either access raises
-// an illegal-instruction trap (the hart has no Ssstateen, or M-mode firmware
-// left `mstateen0.SE0` clear), execution resumes at `__sstateen0_fault_fixup`,
-// which returns `a0` = 0 and `a1` = 1. See [`sstateen0_fault_fixup`] for the
-// hook.
+// Under Smstateen, M-mode firmware grants S-mode each CSR the kernel touches
+// that `mstateen0` gates, by a bit of that register: `sstateen0` (CSR 0x10C)
+// by `SE0` (bit 63), `senvcfg` (CSR 0x10A) by `ENVCFG` (bit 62), `siselect`
+// (0x150) and `sireg` (0x151) by `CSRIND` (bit 60), and `stopei` (0x15C) and
+// the IMSIC interrupt file behind `sireg` by `IMSIC` (bit 58). A clear bit, or
+// a hart without the CSR, makes the access raise an illegal-instruction
+// exception. Each hart's first access to each of these CSRs is made through
+// the routines below, which recover from that trap so the boot halts naming
+// the CSR and its bit; later accesses go direct, since the grants do not
+// change after boot.
+//
+// `__sstateen0_write` and `__senvcfg_write` each write their CSR (by number)
+// from `a0` and read it back into `a0`; `__imsic_csr_probe` selects
+// `eidelivery` (0x70) in `siselect` and reads it through `sireg`, then reads
+// `stopei`, which claims nothing (only a write claims), returning `a0` = 0.
+// Each returns `a1` = 0 and, apart from `a0` and `a1`, touches no register,
+// memory or stack. The faultable range
+// `__csr_grant_fault_start`..`__csr_grant_fault_end` spans the three
+// routines, whose CSR accesses are the only instructions in it that can raise
+// an illegal-instruction exception. A trap there resumes at
+// `__csr_grant_fault_fixup`, which returns `a0` = 0 and `a1` = 1 to the caller
+// of whichever routine trapped: each is a leaf, so `ra` still holds that
+// caller's return address. See [`csr_grant_fault_fixup`] for the hook.
 #[cfg(not(test))]
 core::arch::global_asm!(
-    ".section .text.sstateen0_write, \"ax\"",
+    ".section .text.csr_grant, \"ax\"",
     ".global __sstateen0_write",
-    ".global __sstateen0_fault_start",
-    ".global __sstateen0_fault_end",
-    ".global __sstateen0_fault_fixup",
+    ".global __senvcfg_write",
+    ".global __imsic_csr_probe",
+    ".global __csr_grant_fault_start",
+    ".global __csr_grant_fault_end",
+    ".global __csr_grant_fault_fixup",
+    "__csr_grant_fault_start:",
     // fn __sstateen0_write(value: a0) -> (a0: the read back, a1: 1 if trapped)
     "__sstateen0_write:",
     "    li    a1, 0",
-    "__sstateen0_fault_start:",
     "    csrw  0x10C, a0",
     "    csrr  a0, 0x10C",
-    "__sstateen0_fault_end:",
     "    ret",
-    "__sstateen0_fault_fixup:",
+    // fn __senvcfg_write(value: a0) -> (a0: the read back, a1: 1 if trapped)
+    "__senvcfg_write:",
+    "    li    a1, 0",
+    "    csrw  0x10A, a0",
+    "    csrr  a0, 0x10A",
+    "    ret",
+    // fn __imsic_csr_probe() -> (a0: 0, a1: 1 if trapped)
+    "__imsic_csr_probe:",
+    "    li    a1, 0",
+    "    li    a0, 0x70",
+    "    csrw  0x150, a0",
+    "    csrr  a0, 0x151",
+    "    csrr  a0, 0x15C",
+    "    li    a0, 0",
+    "    ret",
+    "__csr_grant_fault_end:",
+    "__csr_grant_fault_fixup:",
     "    li    a0, 0",
     "    li    a1, 1",
     "    ret",
 );
 
-/// What `__sstateen0_write` returns in `a0` and `a1`: the RISC-V calling
-/// convention returns a two-word aggregate in those registers.
+/// What the firmware-granted CSR routines return in `a0` and `a1`: the RISC-V
+/// calling convention returns a two-word aggregate in those registers.
 #[cfg(not(test))]
 #[repr(C)]
-struct SstateenAccess
+struct GrantedAccess
 {
-    /// `sstateen0` read back after the write; 0 when an access trapped.
+    /// The CSR read back after the write (0 from `__imsic_csr_probe`, and when
+    /// an access trapped).
     read_back: u64,
     /// 1 when an access trapped, else 0.
     trapped: u64,
 }
 
 #[cfg(not(test))]
-unsafe extern "C" {
-    /// Write `value` to `sstateen0` and read the CSR back.
-    fn __sstateen0_write(value: u64) -> SstateenAccess;
-    /// The `sstateen0` write, the first faultable instruction of
-    /// `__sstateen0_write`.
-    static __sstateen0_fault_start: u8;
-    /// First byte past the `sstateen0` read back.
-    static __sstateen0_fault_end: u8;
-    /// Recovery landing pad: reports the trap.
-    static __sstateen0_fault_fixup: u8;
+impl GrantedAccess
+{
+    /// The read back, or `None` when an access trapped.
+    fn read_back(&self) -> Option<u64>
+    {
+        (self.trapped == 0).then_some(self.read_back)
+    }
 }
 
-/// If `pc` is one of the `sstateen0` accesses, return the address of their
-/// recovery fixup; otherwise `None`. Consulted by `interrupts::kernel_exception`
-/// on an S-mode illegal-instruction trap, which redirects `sepc` to the fixup so
-/// [`disable_unswitched_user_state`] halts the boot by name instead of through
-/// the unhandled-exception report.
 #[cfg(not(test))]
-pub(super) fn sstateen0_fault_fixup(pc: u64) -> Option<u64>
+unsafe extern "C" {
+    /// Write `value` to `sstateen0` and read the CSR back.
+    fn __sstateen0_write(value: u64) -> GrantedAccess;
+    /// Write `value` to `senvcfg` and read the CSR back.
+    fn __senvcfg_write(value: u64) -> GrantedAccess;
+    /// Access `siselect`, `sireg` (at `eidelivery`) and `stopei`.
+    fn __imsic_csr_probe() -> GrantedAccess;
+    /// The first instruction of the firmware-granted CSR routines.
+    static __csr_grant_fault_start: u8;
+    /// First byte past the last of them.
+    static __csr_grant_fault_end: u8;
+    /// Recovery landing pad: reports the trap.
+    static __csr_grant_fault_fixup: u8;
+}
+
+/// If `pc` is one of the firmware-granted CSR accesses, return the address of
+/// their recovery fixup; otherwise `None`. Consulted by
+/// `interrupts::kernel_exception` on an S-mode illegal-instruction trap, which
+/// redirects `sepc` to the fixup so the caller ([`disable_unswitched_user_state`]
+/// or `aia::init_hart`) halts the boot by name instead of through the
+/// unhandled-exception report.
+#[cfg(not(test))]
+pub(super) fn csr_grant_fault_fixup(pc: u64) -> Option<u64>
 {
-    let lo = core::ptr::addr_of!(__sstateen0_fault_start) as u64;
-    let hi = core::ptr::addr_of!(__sstateen0_fault_end) as u64;
+    let lo = core::ptr::addr_of!(__csr_grant_fault_start) as u64;
+    let hi = core::ptr::addr_of!(__csr_grant_fault_end) as u64;
     if pc >= lo && pc < hi
     {
-        Some(core::ptr::addr_of!(__sstateen0_fault_fixup) as u64)
+        Some(core::ptr::addr_of!(__csr_grant_fault_fixup) as u64)
     }
     else
     {
@@ -311,37 +359,48 @@ pub(super) fn sstateen0_fault_fixup(pc: u64) -> Option<u64>
     }
 }
 
-/// The U-mode environment controls, as the `senvcfg` value: none granted.
-/// `CBZE`, `CBCFE` and `CBIE` clear make every U-mode cache-block operation
-/// (`cbo.zero`, `cbo.clean`, `cbo.flush`, `cbo.inval`) raise an
-/// illegal-instruction exception; `cbo.inval` would otherwise discard a
-/// block's dirty data and expose what memory held below it. `PMM` clear turns
-/// pointer masking off, `LPE` and `SSE` clear keep the landing-pad and
-/// shadow-stack enforcement and the `ssp` CSR from U-mode, and `FIOM` clear
-/// keeps fences on I/O and memory separate. A field whose extension the hart
-/// lacks is read-only zero, so the value is the same on every hart.
+/// Whether S-mode reaches the AIA CSRs the kernel uses: `siselect` and `sireg`
+/// (`mstateen0.CSRIND`) and `stopei` and the IMSIC interrupt file
+/// (`mstateen0.IMSIC`). Accesses each once through `__imsic_csr_probe`, which
+/// reads `eidelivery` and `stopei` and writes only `siselect`; false when an
+/// access trapped.
+///
+/// # Safety
+/// Supervisor mode on a hart with Ssaia, with interrupts disabled (no trap may
+/// change `siselect` before the caller's next select), after the hart's
+/// `stvec` is installed, `sscratch` is cleared and its per-CPU pointer is
+/// installed: a trapped access is recovered through `kernel_exception`, whose
+/// trap entry reads the per-CPU stack floor and which reads `current_cpu()`.
 #[cfg(not(test))]
-const SENVCFG_USER_ENABLES: u64 = 0;
+pub(super) unsafe fn imsic_csrs_reachable() -> bool
+{
+    // SAFETY: `__imsic_csr_probe` is a routine above, a C-ABI leaf that writes
+    // `a0`, `a1` and `siselect` alone and touches no memory. Its three
+    // instructions that can trap are the CSR accesses, whose
+    // illegal-instruction trap `kernel_exception` resumes at the fixup through
+    // `csr_grant_fault_fixup`; the caller's contract installs the trap path that
+    // recovery runs on.
+    let access = unsafe { __imsic_csr_probe() };
+    access.trapped == 0
+}
 
 /// Disable, for U-mode, every state the kernel does not switch: write
-/// `sstateen0` with no state enabled ([`super::encoding::SSTATEEN0_USER_ENABLES`])
-/// and halt the boot unless it reads back so. Then write `senvcfg` whole with
-/// [`SENVCFG_USER_ENABLES`], replacing what the firmware or reset left, so no
-/// hart grants U-mode a cache-block operation, pointer masking, landing pads or
-/// a shadow stack.
+/// `sstateen0` with no state enabled ([`super::encoding::SSTATEEN0_USER_ENABLES`]),
+/// then `senvcfg` whole with no environment control granted
+/// ([`super::encoding::SENVCFG_USER_ENABLES`]), replacing what the firmware or
+/// reset left, and halt the boot unless each reads back so. No hart then grants
+/// U-mode a cache-block operation, pointer masking, landing pads or a shadow
+/// stack.
 ///
-/// `senvcfg` exists on every hart the RVA23 floor admits (Privileged
-/// Architecture 1.13, `Ss1p13`); a hart without it takes the kernel's fatal
-/// illegal-instruction trap at the write, which finds its per-CPU pointer
-/// installed (the caller's contract), as a hart without V does at its `vlenb`
-/// read.
-///
-/// Ssstateen is required (docs/platform-requirements.md § riscv64
-/// Classification). A hart without it, or whose firmware keeps `sstateen0` from
-/// S-mode (`mstateen0.SE0` clear), traps at the access, and the fixup turns the
-/// trap into a halt that names the extension. The CSR is per hart: the BSP calls
-/// this in Phase 5 and each AP in `kernel_entry_ap`. `sstateen1` to
-/// `sstateen3` are not written: no ratified extension defines state in them.
+/// Ssstateen is required, and the M-mode firmware must grant S-mode both CSRs
+/// (`mstateen0.SE0` and `mstateen0.ENVCFG`; docs/platform-requirements.md
+/// § riscv64 Classification). A hart without Ssstateen, or whose firmware keeps
+/// either CSR from S-mode, traps at the access, and the fixup turns the trap into
+/// a halt that names the CSR and its `mstateen0` bit; a hart without `senvcfg`
+/// (outside the RVA23 floor, which carries Privileged Architecture 1.13) halts
+/// the same way. The CSRs are per hart: the BSP calls this in Phase 5 and each AP
+/// in `kernel_entry_ap`. `sstateen1` to `sstateen3` are not written: no
+/// ratified extension defines state in them.
 ///
 /// # Safety
 /// Must execute in S-mode on the hart being initialised, after its `stvec` is
@@ -351,25 +410,26 @@ const SENVCFG_USER_ENABLES: u64 = 0;
 #[cfg(not(test))]
 pub unsafe fn disable_unswitched_user_state()
 {
-    use super::encoding::{SSTATEEN0_USER_ENABLES, SstateenError, check_sstateen0};
+    use super::encoding::{
+        SENVCFG_USER_ENABLES, SSTATEEN0_USER_ENABLES, StateEnableError, check_state_enable,
+    };
 
-    // SAFETY: `__sstateen0_write` is the routine above, a C-ABI leaf that
-    // writes `a0` and `a1` alone and touches no memory. Its two instructions
-    // that can trap are the `sstateen0` accesses, whose illegal-instruction
-    // trap `kernel_exception` resumes at the fixup through
-    // `sstateen0_fault_fixup`; the caller's contract installs the trap path
+    // SAFETY: `__sstateen0_write` is a routine above, a C-ABI leaf that writes
+    // `a0` and `a1` alone and touches no memory. Its two instructions that can
+    // trap are the `sstateen0` accesses, whose illegal-instruction trap
+    // `kernel_exception` resumes at the fixup through
+    // `csr_grant_fault_fixup`; the caller's contract installs the trap path
     // that recovery runs on.
     let access = unsafe { __sstateen0_write(SSTATEEN0_USER_ENABLES) };
-    let read_back = (access.trapped == 0).then_some(access.read_back);
-    match check_sstateen0(read_back)
+    match check_state_enable(SSTATEEN0_USER_ENABLES, access.read_back())
     {
         Ok(()) =>
         {}
-        Err(SstateenError::Inaccessible) => crate::fatal(
+        Err(StateEnableError::Inaccessible) => crate::fatal(
             "Ssstateen: sstateen0 not accessible from S-mode (no Ssstateen, or the firmware \
              left mstateen0.SE0 clear) — required (RVA23)",
         ),
-        Err(SstateenError::Kept(value)) =>
+        Err(StateEnableError::Kept(value)) =>
         {
             crate::kprintln!(
                 "sstateen0 read back {:#x}, not the {:#x} written",
@@ -380,16 +440,28 @@ pub unsafe fn disable_unswitched_user_state()
         }
     }
 
-    // SAFETY: `csrw senvcfg` (CSR 0x10A, written by number) is a privileged
-    // S-mode instruction on a per-hart register that gates U-mode environment
-    // features only; the caller's contract is S-mode on this hart with its
-    // trap path and per-CPU pointer installed.
-    unsafe {
-        core::arch::asm!(
-            "csrw 0x10A, {envcfg}",
-            envcfg = in(reg) SENVCFG_USER_ENABLES,
-            options(nostack, nomem),
-        );
+    // SAFETY: as for `__sstateen0_write`: `__senvcfg_write` is the other leaf
+    // above, its two instructions that can trap are the `senvcfg` accesses, and
+    // their trap resumes at the same fixup. `senvcfg` gates U-mode environment
+    // features only.
+    let access = unsafe { __senvcfg_write(SENVCFG_USER_ENABLES) };
+    match check_state_enable(SENVCFG_USER_ENABLES, access.read_back())
+    {
+        Ok(()) =>
+        {}
+        Err(StateEnableError::Inaccessible) => crate::fatal(
+            "senvcfg not accessible from S-mode (the firmware left mstateen0.ENVCFG clear, \
+             or the hart has no senvcfg) — required (RVA23)",
+        ),
+        Err(StateEnableError::Kept(value)) =>
+        {
+            crate::kprintln!(
+                "senvcfg read back {:#x}, not the {:#x} written",
+                value,
+                SENVCFG_USER_ENABLES
+            );
+            crate::fatal("senvcfg kept a U-mode environment enable set");
+        }
     }
 }
 

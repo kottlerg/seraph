@@ -23,8 +23,8 @@
 //! - Other U-mode exceptions → spurious-TLB retry, the bound fault handler, or thread
 //!   termination
 //! - Other S-mode exceptions → the kernel spurious-TLB retry (load/store), the
-//!   `copy_user` fixup, the Zkr `seed` probe's fixup (illegal instruction), else
-//!   diagnostics + `fatal()`
+//!   `copy_user` fixup, the Zkr `seed` probe's fixup and the firmware-granted CSR
+//!   accesses' fixup (illegal instruction), else diagnostics + `fatal()`
 //!
 //! # Device interrupts
 //! The controller is AIA, whose mechanism [`super::aia`] holds: each routed APLIC
@@ -809,9 +809,9 @@ unsafe fn terminate_faulted_thread(
 }
 
 /// An S-mode exception: retry a stale TLB entry, redirect a faulting user
-/// copy, a trapped `seed` CSR read or a trapped `sstateen0` access to its
-/// fixup, and otherwise report the
-/// exception and halt the hart.
+/// copy, a trapped `seed` CSR read or a trapped firmware-granted CSR access
+/// (`sstateen0`, `senvcfg`, the AIA CSRs) to its fixup, and otherwise report
+/// the exception and halt the hart.
 /// `sstatus_val` and `satp_val` are the CSRs read at the trap.
 ///
 /// # Safety
@@ -893,12 +893,14 @@ unsafe fn kernel_exception(
         return;
     }
 
-    // Ssstateen probe: an illegal-instruction trap at an `sstateen0` access is
-    // a hart without Ssstateen, or one whose firmware left `mstateen0.SE0`
-    // clear. Resume at the accesses' fixup, which reports the trap so
-    // `cpu::disable_unswitched_user_state` halts the boot by name.
+    // Firmware-granted CSR accesses: an illegal-instruction trap at a first
+    // access to `sstateen0`, `senvcfg` or the AIA CSRs is a hart without the
+    // CSR, or one whose firmware left its `mstateen0` grant (`SE0`, `ENVCFG`,
+    // `CSRIND` or `IMSIC`) clear. Resume at the accesses' fixup, which reports
+    // the trap so `cpu::disable_unswitched_user_state` or `aia::init_hart`
+    // halts the boot by name.
     if cause_code == 2
-        && let Some(fixup) = super::cpu::sstateen0_fault_fixup(live.sepc)
+        && let Some(fixup) = super::cpu::csr_grant_fault_fixup(live.sepc)
     {
         live.sepc = fixup;
         return;
@@ -1299,13 +1301,13 @@ unsafe fn set_user_counters()
     }
 }
 
-/// Initialise supervisor trap infrastructure for the BSP.
+/// Initialise supervisor trap infrastructure for the BSP, and the APLIC
+/// domain. The BSP's IMSIC file is initialised by [`init_bsp_local`], once its
+/// per-CPU pointer is installed.
 ///
 /// # Safety
 /// Must execute in supervisor mode with the direct physical map active, once,
-/// on the BSP, after `percpu::init_apic_ids` (the BSP's IMSIC file is that of its
-/// hart id, `percpu::apic_id_for(0)`) and after Phase 4's per-CPU storage (the EID
-/// rows, `aia::init_eid_storage`).
+/// on the BSP.
 #[cfg(not(test))]
 pub unsafe fn init()
 {
@@ -1373,19 +1375,41 @@ pub unsafe fn init()
     // SAFETY: caller ensures S-mode on the BSP.
     unsafe { set_user_counters() };
 
-    // Bring up AIA: the APLIC domain (every source inactive and disabled,
-    // whatever firmware left enabled) and the BSP's IMSIC file. The BSP's
-    // file is that of its hart id, which the boot protocol does not fix at 0
-    // (`BootInfo.cpu_ids[0]`, copied into the per-CPU id slab before Phase 5).
-    // `current_cpu()` is not yet usable here (`tp` is installed after this
-    // function), so the id is read for logical CPU 0 directly.
-    // SAFETY: logical CPU 0 (the BSP) is below CPU_COUNT, and the caller ran
-    // percpu::init_apic_ids first.
-    let bsp_hart = unsafe { crate::percpu::apic_id_for(0) };
+    // Bring up the APLIC domain (every source inactive and disabled, whatever
+    // firmware left enabled), whose source count sizes the IRQ routing table.
     // SAFETY: the BSP in S-mode, once, with the direct map active and SIE clear
-    // (above); Phase 4's init_ap_percpu_storage allocated the EID rows.
-    unsafe { super::aia::init_bsp(bsp_hart) };
+    // (above).
+    unsafe { super::aia::init_bsp() };
 }
+
+/// Initialise the BSP's own interrupt-controller state that needs its per-CPU
+/// pointer: its IMSIC file, whose first access to the AIA CSRs recovers from
+/// a trap and so runs on the trap entry's per-CPU stack floor and reads
+/// `current_cpu()` (`aia::init_hart`). Each AP does the same in [`init_ap`].
+///
+/// # Safety
+/// Must execute in supervisor mode on the BSP, once, with interrupts disabled,
+/// after [`init`] and `percpu::init_bsp`, and after Phase 4's per-CPU storage
+/// (the EID rows, `aia::init_eid_storage`).
+#[cfg(not(test))]
+pub unsafe fn init_bsp_local()
+{
+    // The BSP's file is that of its hart id, which the boot protocol does not
+    // fix at 0 (`BootInfo.cpu_ids[0]`, copied into the per-CPU id slab before
+    // Phase 5). Firmware may have left identities pending; the init clears them
+    // before enabling delivery.
+    // SAFETY: the BSP in S-mode with SIE clear and its trap path (`init`) and
+    // per-CPU pointer (`percpu::init_bsp`) installed (caller contract); Phase
+    // 4 allocated the EID rows.
+    unsafe { super::aia::init_hart(current_hart()) };
+}
+
+/// No-op stub for host tests.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the non-test item.
+#[cfg(test)]
+pub unsafe fn init_bsp_local() {}
 
 /// Initialise supervisor trap infrastructure for an AP hart.
 ///

@@ -30,7 +30,9 @@
 use super::thread::ThreadControlBlock;
 use super::{IDLE_PRIORITY, NUM_PRIORITY_LEVELS, RT_PRIORITY_MIN};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 // ── Queue map ─────────────────────────────────────────────────────────────────
 
@@ -454,6 +456,14 @@ pub struct PerCpuScheduler
     /// atomic only so a shared reference can reach it.
     idle_pull_candidate: AtomicUsize,
 
+    /// Whether this CPU's previous idle balance tick held `idle_pull_candidate`
+    /// confirmed for one more tick, because a sibling of this CPU had work
+    /// (core/kernel/docs/scheduler.md § SMT Awareness), so the next
+    /// confirmation pulls it. Set only while a candidate is. Written and read
+    /// only by this CPU's `timer_tick`, so Relaxed suffices; atomic only so a
+    /// shared reference can reach it.
+    idle_pull_held: AtomicBool,
+
     /// Where this CPU's idle pull starts its scan of the other CPUs: the CPU
     /// after the last one whose confirmed backlog its pull found nothing it
     /// could take on (pinned threads only, or none fully saved), so the next
@@ -514,6 +524,7 @@ impl PerCpuScheduler
             lock: crate::sync::Spinlock::new(),
             load: AtomicU32::new(0),
             idle_pull_candidate: AtomicUsize::new(NO_IDLE_PULL_CANDIDATE),
+            idle_pull_held: AtomicBool::new(false),
             idle_pull_cursor: AtomicUsize::new(0),
             saved_lock_flags: AtomicU64::new(0),
             deferred_reclaim_head: AtomicPtr::new(core::ptr::null_mut()),
@@ -917,10 +928,13 @@ impl PerCpuScheduler
     /// other than [`IDLE_QUEUE`] links a thread. Lockless and Relaxed, and
     /// dereferences no TCB: a snapshot for the softlockup watchdog's per-tick
     /// idle sample (`sched::system_has_no_work`), which re-decides it on every
-    /// BSP tick. A thread between two of its loads (mid-dispatch, mid-link, or
+    /// BSP tick, and for the SMT core spread, which counts a sibling for which
+    /// it fails as busy (core/kernel/docs/scheduler.md § SMT Awareness). A
+    /// thread between two of its loads (mid-dispatch, mid-link, or
     /// mid-migration) can be missed by one sample;
     /// core/kernel/docs/scheduling-internals.md § Softlockup Watchdog states
-    /// what that costs.
+    /// what that costs the watchdog, and core/kernel/docs/scheduler.md § SMT
+    /// Awareness what it costs placement.
     pub fn has_no_work(&self) -> bool
     {
         core::ptr::eq(self.current(), self.idle()) && !self.has_queued_thread()
@@ -1047,17 +1061,36 @@ impl PerCpuScheduler
         (cpu != NO_IDLE_PULL_CANDIDATE).then_some(cpu)
     }
 
-    /// Record `cpu` as this CPU's idle-pull candidate, or clear it (`None`).
-    /// Called only by this CPU's `timer_tick`.
+    /// Whether this CPU's previous idle balance tick held its candidate (see
+    /// the `idle_pull_held` field).
+    #[cfg(not(test))]
+    pub fn idle_pull_held(&self) -> bool
+    {
+        self.idle_pull_held.load(Ordering::Relaxed)
+    }
+
+    /// Record `cpu` as this CPU's idle-pull candidate, not held, or clear it
+    /// (`None`). Called only by this CPU's `timer_tick`.
     #[cfg(not(test))]
     pub fn set_idle_pull_candidate(&self, cpu: Option<usize>)
     {
         self.idle_pull_candidate
             .store(cpu.unwrap_or(NO_IDLE_PULL_CANDIDATE), Ordering::Relaxed);
+        self.idle_pull_held.store(false, Ordering::Relaxed);
     }
 
-    /// Clear this CPU's idle-pull candidate, storing only when one is set, so
-    /// the busy tick that calls it writes nothing in the steady state.
+    /// Mark the candidate [`set_idle_pull_candidate`](Self::set_idle_pull_candidate)
+    /// just recorded as held for one tick (see the `idle_pull_held` field).
+    /// Called only by this CPU's `timer_tick`, after it recorded a candidate.
+    #[cfg(not(test))]
+    pub fn hold_idle_pull_candidate(&self)
+    {
+        self.idle_pull_held.store(true, Ordering::Relaxed);
+    }
+
+    /// Clear this CPU's idle-pull candidate and its hold, storing only when a
+    /// candidate is set, so the busy tick that calls it writes nothing in the
+    /// steady state.
     #[cfg(not(test))]
     pub fn forget_idle_pull_candidate(&self)
     {
@@ -1065,6 +1098,7 @@ impl PerCpuScheduler
         {
             self.idle_pull_candidate
                 .store(NO_IDLE_PULL_CANDIDATE, Ordering::Relaxed);
+            self.idle_pull_held.store(false, Ordering::Relaxed);
         }
     }
 

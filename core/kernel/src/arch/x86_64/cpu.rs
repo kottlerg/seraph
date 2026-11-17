@@ -3,18 +3,19 @@
 
 // core/kernel/src/arch/x86_64/cpu.rs
 
-//! x86-64 CPU control primitives: CPUID, CR4 and MSR access, the fault-recoverable
-//! user-copy routine, SMEP/SMAP and PCID enablement, the boot-time baseline feature
-//! gate, per-CPU GS-base install and lookup, the kernel trap stack, interrupt
-//! control and halt, the fence ahead of an x2APIC MSR write, and the debug-build
-//! kernel-entry RFLAGS check.
+//! x86-64 CPU control primitives: CPUID and the core key it gives, CR4 and MSR
+//! access, the fault-recoverable user-copy routine, SMEP/SMAP and PCID
+//! enablement, the boot-time baseline feature gate, per-CPU GS-base install and
+//! lookup, the kernel trap stack, interrupt control and halt, the fence ahead of
+//! an x2APIC MSR write, and the debug-build kernel-entry RFLAGS check.
 //!
 //! `current_stack_pointer`, `load_word_racy`, the CR4/MSR accessors, `x2apic_wrmsr_fence`,
 //! `copy_user`, `in_user_copy`, the enable routines, `verify_baseline`, `install_percpu`, the
 //! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
 //! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
-//! host stubs). `cpuid`, `cpuid_subleaf`, `current_cpu` (which returns 0 under test),
-//! `halt_until_interrupt`, `disable_interrupts`, `halt_loop`, and the no-op
+//! host stubs). `cpuid`, `cpuid_subleaf`, `smt_core_key`, `core_key`,
+//! `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
+//! `disable_interrupts`, `halt_loop`, and the no-op
 //! `disable_unswitched_user_state` are also built for host tests.
 
 // ── CPUID ─────────────────────────────────────────────────────────────────────
@@ -37,6 +38,77 @@ pub fn cpuid_subleaf(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32)
 {
     let r = core::arch::x86_64::__cpuid_count(leaf, subleaf);
     (r.eax, r.ebx, r.ecx, r.edx)
+}
+
+// ── Core topology ─────────────────────────────────────────────────────────────
+
+/// `CPUID` level type of the SMT level in leaves 0BH and 1FH (`ECX[15:8]`).
+const TOPOLOGY_LEVEL_SMT: u32 = 1;
+
+/// Sub-leaves of leaf 0BH or 1FH read before the walk gives up on a terminating
+/// (type 0) level. Leaf 1FH defines six level types (SMT, core, module, tile,
+/// die, die group), so a CPU that reports more is defective; the bound keeps
+/// such a CPU from looping the walk.
+const TOPOLOGY_MAX_SUBLEAVES: u32 = 16;
+
+/// The core key of the CPU whose `CPUID` reads through `cpuid` (leaf, sub-leaf
+/// to EAX, EBX, ECX, EDX): its x2APIC ID shifted right past the SMT level's
+/// bits, so the logical CPUs of one core, and only they, share it.
+///
+/// The topology leaf is 1FH where the CPU enumerates it (a highest basic leaf
+/// of at least 1FH and a sub-leaf 0 whose `EBX` is not zero), else 0BH, as the
+/// Intel SDM Vol. 2A `CPUID` leaf 1FH directs; AMD reports 0BH. The walk reads
+/// sub-leaves up to the first of level type 0 and takes the shift (`EAX[4:0]`)
+/// of the SMT level (type 1). A CPU with no SMT level shifts by 0: each of its
+/// logical CPUs is a core. `None` when the leaf enumerates no level at all
+/// (sub-leaf 0's `EBX` is zero), where `EDX` is not an x2APIC ID.
+pub fn smt_core_key(cpuid: impl Fn(u32, u32) -> [u32; 4]) -> Option<u32>
+{
+    let max_basic = cpuid(0, 0)[0];
+    let leaf = if max_basic >= 0x1F && cpuid(0x1F, 0)[1] != 0
+    {
+        0x1F
+    }
+    else
+    {
+        0x0B
+    };
+    let [_, ebx, _, x2apic_id] = cpuid(leaf, 0);
+    if ebx == 0
+    {
+        return None;
+    }
+    let mut shift = 0;
+    for subleaf in 0..TOPOLOGY_MAX_SUBLEAVES
+    {
+        let [eax, _, ecx, _] = cpuid(leaf, subleaf);
+        let level_type = (ecx >> 8) & 0xFF;
+        if level_type == 0
+        {
+            break;
+        }
+        if level_type == TOPOLOGY_LEVEL_SMT
+        {
+            shift = eax & 0x1F;
+            break;
+        }
+    }
+    Some(x2apic_id >> shift)
+}
+
+/// The key of the core logical CPU `cpu` runs on: equal for exactly the CPUs
+/// that share one core. Called on CPU `cpu` itself (`topology::record_this_cpu`),
+/// since it reads that CPU's `CPUID` ([`smt_core_key`]). A CPU whose topology
+/// leaf enumerates no level keys by `cpu` and counts as a core of its own;
+/// every CPU of one machine reports the same leaves, so its keys do not mix
+/// with x2APIC-derived ones.
+pub fn core_key(cpu: u32) -> u32
+{
+    smt_core_key(|leaf, subleaf| {
+        let (eax, ebx, ecx, edx) = cpuid_subleaf(leaf, subleaf);
+        [eax, ebx, ecx, edx]
+    })
+    .unwrap_or(cpu)
 }
 
 // ── Stack pointer ───────────────────────────────────────────────────────────────
@@ -804,5 +876,100 @@ pub fn halt_loop() -> !
         unsafe {
             core::arch::asm!("hlt", options(nomem, nostack, preserves_flags));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::smt_core_key;
+
+    /// A CPUID stub over `leaves` ((leaf, sub-leaf), [EAX, EBX, ECX, EDX]);
+    /// an absent pair reads as zero, as a terminating topology level does.
+    fn stub(leaves: &[((u32, u32), [u32; 4])]) -> impl Fn(u32, u32) -> [u32; 4] + '_
+    {
+        move |leaf, subleaf| {
+            leaves
+                .iter()
+                .find(|(key, _)| *key == (leaf, subleaf))
+                .map_or([0; 4], |(_, regs)| *regs)
+        }
+    }
+
+    /// A topology level: shift `shift`, `count` logical CPUs, level `level`
+    /// of type `kind`, on the CPU with x2APIC ID `id`.
+    const fn level(shift: u32, count: u32, level: u32, kind: u32, id: u32) -> [u32; 4]
+    {
+        [shift, count, (kind << 8) | level, id]
+    }
+
+    // Defect guarded: the two threads of one core keyed apart (no SMT tie-break
+    // anywhere) or two cores keyed together (a busy core read as a sibling).
+    #[test]
+    fn leaf_0b_smt_level_shifts_the_thread_bits_out()
+    {
+        for (id, key) in [(0, 0), (1, 0), (2, 1), (3, 1), (9, 4)]
+        {
+            let leaves = [
+                ((0, 0), [0x16, 0, 0, 0]),
+                ((0xB, 0), level(1, 2, 0, 1, id)),
+                ((0xB, 1), level(4, 8, 1, 2, id)),
+            ];
+            assert_eq!(smt_core_key(stub(&leaves)), Some(key), "x2APIC ID {id}");
+        }
+    }
+
+    // Defect guarded: leaf 0BH read where the CPU enumerates 1FH, whose SMT
+    // level can differ (a hybrid part's module level sits between them).
+    #[test]
+    fn leaf_1f_is_preferred_when_enumerated()
+    {
+        let leaves = [
+            ((0, 0), [0x20, 0, 0, 0]),
+            ((0x1F, 0), level(2, 4, 0, 1, 0x17)),
+            ((0x1F, 1), level(6, 16, 1, 2, 0x17)),
+            ((0xB, 0), level(1, 2, 0, 1, 0x17)),
+        ];
+        assert_eq!(smt_core_key(stub(&leaves)), Some(0x17 >> 2));
+    }
+
+    // Defect guarded: a highest leaf of 1FH whose sub-leaf 0 is empty (the leaf
+    // not enumerated) taken over 0BH.
+    #[test]
+    fn empty_leaf_1f_falls_back_to_0b()
+    {
+        let leaves = [((0, 0), [0x20, 0, 0, 0]), ((0xB, 0), level(1, 2, 0, 1, 5))];
+        assert_eq!(smt_core_key(stub(&leaves)), Some(2));
+    }
+
+    // Defect guarded: a CPU without SMT whose first level is the core level
+    // read as an SMT level, merging cores.
+    #[test]
+    fn no_smt_level_keys_by_the_whole_id()
+    {
+        let leaves = [((0, 0), [0x16, 0, 0, 0]), ((0xB, 0), level(3, 8, 0, 2, 6))];
+        assert_eq!(smt_core_key(stub(&leaves)), Some(6));
+    }
+
+    // Defect guarded: an unenumerated leaf's EDX (not an x2APIC ID, often 0
+    // on every CPU) used as the key, merging every CPU into one core.
+    #[test]
+    fn unenumerated_leaf_gives_no_key()
+    {
+        let leaves = [((0, 0), [0x16, 0, 0, 0])];
+        assert_eq!(smt_core_key(stub(&leaves)), None);
+    }
+
+    // Defect guarded: a CPU that never reports a terminating level looping the
+    // walk.
+    #[test]
+    fn walk_is_bounded_without_a_terminating_level()
+    {
+        let cpuid = |leaf: u32, _subleaf: u32| match leaf
+        {
+            0 => [0x16, 0, 0, 0],
+            _ => level(4, 8, 0, 2, 0x30),
+        };
+        assert_eq!(smt_core_key(cpuid), Some(0x30));
     }
 }

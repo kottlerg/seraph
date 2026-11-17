@@ -338,6 +338,7 @@ fn cet_spec<'a>(
         firmware_code_path: firmware_code,
         firmware_vars_path: None,
         cpus: args.cpus,
+        threads_per_core: 1,
         mem_mib: args.mem,
         display: QemuDisplay::Headless,
         gdb,

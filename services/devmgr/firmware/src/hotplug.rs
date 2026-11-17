@@ -429,8 +429,10 @@ pub enum Unplaced
 /// Place every request of `requests` in a slot's windows: `memory`, the
 /// non-prefetchable window, and `prefetchable`, clear of `taken` (each
 /// `(base, end)`: the BARs of the live records on the slot's buses) and of
-/// each other. Each BAR is aligned to its size, as a BAR's base must be; the
-/// largest is placed first, each at the lowest free base. A 64-bit
+/// each other. Each BAR is aligned to its size, as a BAR's base must be, and
+/// to a page, and takes at least a page, which it shares with no other BAR
+/// (devmgr carves a BAR's cap in whole pages); the largest is placed first,
+/// each at the lowest free base. A 64-bit
 /// prefetchable BAR goes in the prefetchable window, or in the
 /// non-prefetchable window when it does not fit there (prefetchable memory
 /// may be mapped as non-prefetchable); every other BAR goes in the
@@ -494,8 +496,21 @@ pub fn assign(
     Ok(placed)
 }
 
-/// The lowest base in `window`, aligned to `size`, whose `size` bytes overlap
-/// neither `taken` nor a BAR of `placed`.
+/// The page devmgr carves a BAR's `Mmio` cap at: a carve covers whole pages
+/// (`SYS_MMIO_SPLIT` splits at a page-aligned offset), so no two BARs it
+/// places share a page.
+const PAGE: u64 = 0x1000;
+
+/// The span a BAR of `size` bytes takes in a window: its size, and at least
+/// one page.
+const fn span(size: u64) -> u64
+{
+    if size < PAGE { PAGE } else { size }
+}
+
+/// The lowest base in `window`, aligned to the BAR's span ([`span`] of
+/// `size`), whose span overlaps neither the pages of `taken` nor the span
+/// of a BAR of `placed`.
 fn lowest_free(
     window: Window,
     size: u64,
@@ -503,10 +518,17 @@ fn lowest_free(
     placed: &[Option<Placed>],
 ) -> Option<u64>
 {
+    let size = span(size);
+    let taken = taken.iter().map(|&(b, e)| {
+        (
+            b & !(PAGE - 1),
+            e.checked_next_multiple_of(PAGE).unwrap_or(u64::MAX),
+        )
+    });
     let placed = placed
         .iter()
         .flatten()
-        .map(|p| (p.base, p.base.saturating_add(p.size)));
+        .map(|p| (p.base, p.base.saturating_add(span(p.size))));
     let mut base = window.base.checked_next_multiple_of(size)?;
     loop
     {
@@ -516,8 +538,7 @@ fn lowest_free(
             return None;
         }
         let clash = taken
-            .iter()
-            .copied()
+            .clone()
             .chain(placed.clone())
             .filter(|&(b, e)| b < end && base < e)
             .map(|(_, e)| e)
@@ -688,6 +709,10 @@ pub enum SlotState
     /// An arrival failed to bring the slot's link up; the slot waits for the
     /// card's removal before it is tried again.
     Failed,
+    /// The card of an occupied slot is gone, or its attention button was
+    /// pressed, and the removal was reported once; the slot is occupied
+    /// again once its card is present with the button not pressed.
+    Departed,
 }
 
 /// What the poller does after reading a slot's Slot Status.
@@ -722,10 +747,17 @@ pub const fn next(state: SlotState, status: u16) -> (SlotState, Action)
         SlotState::Empty if present => (SlotState::Empty, Action::PowerUp),
         SlotState::Occupied if !present || status & SLOTSTA_BUTTON != 0 =>
         {
-            (SlotState::Occupied, Action::Removal)
+            (SlotState::Departed, Action::Removal)
         }
         SlotState::Failed if !present => (SlotState::Empty, Action::None),
-        SlotState::Empty | SlotState::Occupied | SlotState::Failed => (state, Action::None),
+        SlotState::Departed if present && status & SLOTSTA_BUTTON == 0 =>
+        {
+            (SlotState::Occupied, Action::None)
+        }
+        SlotState::Empty | SlotState::Occupied | SlotState::Failed | SlotState::Departed =>
+        {
+            (state, Action::None)
+        }
     }
 }
 
@@ -1297,6 +1329,32 @@ mod tests
     }
 
     #[test]
+    fn bars_smaller_than_a_page_take_a_page_of_their_own()
+    {
+        // Two 256-byte BARs: each on its own page, never packed into one.
+        let mut requests = [None; MAX_BARS];
+        requests[0] = Some(request(0, 0x100));
+        requests[1] = Some(request(1, 0x100));
+        assert_eq!(
+            bases(&assign(&requests, MEMORY, None, &[]).unwrap()),
+            [(0, 0x8000_0000), (1, 0x8000_1000)]
+        );
+        // A live record's sub-page BAR keeps its whole page from a placement.
+        requests[1] = None;
+        assert_eq!(
+            bases(&assign(&requests, MEMORY, None, &[(0x8000_0100, 0x8000_0200)]).unwrap()),
+            [(0, 0x8000_1000)]
+        );
+        // A window of one page holds one sub-page BAR, not two.
+        requests[1] = Some(request(1, 0x100));
+        let page = Some(Window {
+            base: 0x8000_0000,
+            end: 0x8000_1000,
+        });
+        assert_eq!(assign(&requests, page, None, &[]), Err(Unplaced::NoRoom(1)));
+    }
+
+    #[test]
     fn bars_that_do_not_fit_are_refused_whole()
     {
         let mut requests = [None; MAX_BARS];
@@ -1492,18 +1550,36 @@ mod tests
         );
         assert_eq!(
             next(SlotState::Occupied, SLOTSTA_PRESENCE_CHANGED),
-            (SlotState::Occupied, Action::Removal)
+            (SlotState::Departed, Action::Removal)
         );
         assert_eq!(
             next(SlotState::Occupied, present | SLOTSTA_BUTTON),
-            (SlotState::Occupied, Action::Removal)
+            (SlotState::Departed, Action::Removal)
         );
         assert_eq!(
             next(SlotState::Failed, present),
             (SlotState::Failed, Action::None)
         );
         assert_eq!(next(SlotState::Failed, 0), (SlotState::Empty, Action::None));
-        for state in [SlotState::Empty, SlotState::Occupied, SlotState::Failed]
+        // A removal is reported once: presence stays clear on the polls after.
+        assert_eq!(
+            next(SlotState::Departed, 0),
+            (SlotState::Departed, Action::None)
+        );
+        assert_eq!(
+            next(SlotState::Departed, present | SLOTSTA_BUTTON),
+            (SlotState::Departed, Action::None)
+        );
+        assert_eq!(
+            next(SlotState::Departed, present),
+            (SlotState::Occupied, Action::None)
+        );
+        for state in [
+            SlotState::Empty,
+            SlotState::Occupied,
+            SlotState::Failed,
+            SlotState::Departed,
+        ]
         {
             assert_eq!(next(state, u16::MAX), (state, Action::None));
         }

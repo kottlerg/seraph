@@ -79,7 +79,8 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 | Slot | Slot Status | Action |
 |---|---|---|
 | empty | Presence Detect State set | power up, then post the arrival; the slot is occupied, or failed when the link does not come up |
-| occupied | presence lost, or Attention Button Pressed | the removal path (§ Removal) |
+| occupied | presence lost, or Attention Button Pressed | the removal path (§ Removal); the slot is departed |
+| departed | presence, and Attention Button Pressed clear | the slot is occupied again |
 | failed | presence lost | the slot is empty again |
 
 Power-up writes Slot Control with the slot's power on where it has a Power Controller and its
@@ -101,11 +102,12 @@ downstream port forwards configuration requests to device 0 only. For each funct
 
 1. a type-1 function (a hot-added switch or bridge) is logged and neither descended into nor
    recorded;
-2. its MMIO BARs are placed in the slot's windows (`firmware::hotplug::assign`): each BAR
-   naturally aligned, the largest first, each at the lowest free base, clear of the BARs of the
-   live records on the slot's buses. A 64-bit prefetchable BAR goes in the prefetchable window,
-   or in the non-prefetchable window when it does not fit there; every other BAR goes in the
-   non-prefetchable window. I/O BARs are not placed;
+2. its MMIO BARs are placed in the slot's windows (`firmware::hotplug::assign`): each BAR naturally
+   aligned and aligned to a page, the largest first, each at the lowest free base, clear of the BARs
+   of the live records on the slot's buses. A BAR takes at least a page, which it shares with no
+   other BAR and no live record's BAR, since devmgr carves a BAR's cap in whole pages. A 64-bit
+   prefetchable BAR goes in the prefetchable window, or in the non-prefetchable window when it does
+   not fit there; every other BAR goes in the non-prefetchable window. I/O BARs are not placed;
 3. the BARs are written with the function's Memory Space decode off, and the function is read
    again; a BAR that does not read back at its placed base fails the function;
 4. its record is appended to the PCI records (`PciRecords::append`), after every earlier record.
@@ -137,14 +139,12 @@ route).
 
 ### Removal
 
-Design intent; not yet implemented
-([#939](https://github.com/kottlerg/seraph/issues/939)). The poller logs a removal or an
-attention-button press on an occupied slot, and devmgr does nothing else: the records and
-drivers behind the slot stay. The removal path withdraws every live record on the slot's buses
-through the withdrawal order of
-[responsibilities.md](responsibilities.md#withdrawing-a-driver) § Withdrawing a Driver, honours
-the attention button's 5 s abort window, and powers the slot off only after the withdrawal
-returns.
+Design intent; not yet implemented ([#939](https://github.com/kottlerg/seraph/issues/939)). The
+poller logs a removal or an attention-button press on an occupied slot once, and devmgr does nothing
+else: the records and drivers behind the slot stay. The removal path withdraws every live record on
+the slot's buses through the withdrawal order of
+[responsibilities.md](responsibilities.md#withdrawing-a-driver) § Withdrawing a Driver, honours the
+attention button's 5 s abort window, and powers the slot off only after the withdrawal returns.
 
 ---
 

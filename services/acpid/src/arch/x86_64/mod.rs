@@ -187,11 +187,12 @@ pub struct Events
 
 impl Events
 {
-    /// Acquire the `PM1a` event block, the `GPE0` block and the SCI through
-    /// `devmgr` and bind the blocks to `thread`, the calling thread. `None`,
-    /// logged, when the platform lacks the `PM1a` block or the SCI, or a
-    /// block cannot be bound; a `GPE0` block that cannot be used is logged
-    /// and left out.
+    /// Acquire the `PM1a` event block and the `GPE0` block through
+    /// `devmgr`, bind them to `thread`, the calling thread, then acquire the
+    /// SCI; on the first start of the boot, clear the events
+    /// ([`acpid::events::clear`]) at once. `None`, logged, when the platform
+    /// lacks the `PM1a` block or the SCI, or a block cannot be bound; a
+    /// `GPE0` block that cannot be used is logged and left out.
     pub fn acquire(devmgr: &Devmgr, thread: u64) -> Option<Self>
     {
         let pm1 = match block(devmgr, devmgr_labels::ACPI_PM1A_EVT)
@@ -222,44 +223,60 @@ impl Events
                 None
             }
         };
-        let layout = Layout::new(pm1.port, pm1.count, gpe0.map(|g| (g.port, g.count)));
+        let release = |caps: &[Option<u64>]| {
+            for &c in caps.iter().flatten()
+            {
+                let _ = syscall::cap_delete(c);
+            }
+        };
+        let Some(layout) = Layout::new(pm1.port, pm1.count, gpe0.map(|g| (g.port, g.count)))
+        else
+        {
+            std::os::seraph::log!(warn: "PM1a event block not usable; no events");
+            release(&[Some(pm1.cap), gpe0.map(|g| g.cap)]);
+            return None;
+        };
+        // The blocks are bound before the SCI is asked for, so the first
+        // start's clear below cannot fail once devmgr has recorded the SCI
+        // as served, which tells every later acpid of the boot that it is a
+        // restart.
+        let bound =
+            bind(thread, pm1.cap).and_then(|()| gpe0.map_or(Ok(()), |g| bind(thread, g.cap)));
+        if let Err(e) = bound
+        {
+            std::os::seraph::log!(warn: "event blocks not bound (err={e}); no events");
+            release(&[Some(pm1.cap), gpe0.map(|g| g.cap)]);
+            return None;
+        }
         let sci = devmgr.call(
             devmgr_labels::QUERY_ACPI_RESOURCES,
             &[devmgr_labels::ACPI_SCI],
         );
-        let (layout, sci) = match (layout, sci)
+        let sci = match sci
         {
-            (Some(layout), Ok(sci)) => (layout, sci),
-            (layout, sci) =>
+            Ok(sci) => sci,
+            Err(e) =>
             {
-                match &sci
-                {
-                    Ok(sci) => sci.caps().iter().for_each(|&c| {
-                        let _ = syscall::cap_delete(c);
-                    }),
-                    Err(e) => std::os::seraph::log!(warn: "no SCI ({e:?}); no events"),
-                }
-                if layout.is_none()
-                {
-                    std::os::seraph::log!(warn: "PM1a event block not usable; no events");
-                }
-                let _ = syscall::cap_delete(pm1.cap);
-                if let Some(g) = gpe0
-                {
-                    let _ = syscall::cap_delete(g.cap);
-                }
+                std::os::seraph::log!(warn: "no SCI ({e:?}); no events");
+                release(&[Some(pm1.cap), gpe0.map(|g| g.cap)]);
                 return None;
             }
+        };
+        let start = if sci.word(2) == 0
+        {
+            // The blocks are bound to this thread above.
+            acpid::events::clear(&mut Ports { layout }, &layout);
+            Start::First
+        }
+        else
+        {
+            Start::Restart
         };
         let Some(&cap) = sci.caps().first()
         else
         {
             std::os::seraph::log!(warn: "devmgr served the SCI without its cap; no events");
-            let _ = syscall::cap_delete(pm1.cap);
-            if let Some(g) = gpe0
-            {
-                let _ = syscall::cap_delete(g.cap);
-            }
+            release(&[Some(pm1.cap), gpe0.map(|g| g.cap)]);
             return None;
         };
         let events = Self {
@@ -269,26 +286,8 @@ impl Events
             sci: cap,
             gsi: sci.word(0),
             mode: sci.word(1),
-            start: if sci.word(2) == 0
-            {
-                Start::First
-            }
-            else
-            {
-                Start::Restart
-            },
+            start,
         };
-        if let Err(e) = events.bind(thread)
-        {
-            std::os::seraph::log!(warn: "event blocks not bound (err={e}); no events");
-            for c in [Some(events.pm1), events.gpe0, Some(events.sci)]
-                .into_iter()
-                .flatten()
-            {
-                let _ = syscall::cap_delete(c);
-            }
-            return None;
-        }
         Some(events)
     }
 

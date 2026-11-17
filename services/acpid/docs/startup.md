@@ -31,11 +31,13 @@ the main thread answer each power request `NO_DEVICE`, and one that delivered no
 
 1. **Power registers and events** (x86-64). acpid acquires the `PM1a_CNT` block and
    `RESET_REG`, then the PM1a event block, the GPE0 block and the SCI, from devmgr
-   (`QUERY_ACPI_RESOURCES`), and binds the blocks to the evaluation thread; a missing one is
-   logged, and the request or the events that need it go without: `NO_DEVICE` for the request,
-   no events without the PM1a event block or the SCI, no GPEs without GPE0. devmgr's answer for
-   the SCI says whether an acpid took it earlier in the boot, so acpid asks for it before
-   anything else can fail and restart it. It then reads the FADT (`QUERY_ACPI_TABLE`) for its
+   (`QUERY_ACPI_RESOURCES`), binding the event blocks to the evaluation thread before it asks
+   for the SCI; a missing one is logged, and the request or the events that need it go without:
+   `NO_DEVICE` for the request, no events without the PM1a event block or the SCI, no GPEs
+   without GPE0. devmgr's answer for the SCI says whether an acpid took it earlier in the boot.
+   On the first start acpid then disables every event and clears every status at once, so no
+   later acpid of the boot, which devmgr tells it is a restart, takes the press that turned the
+   machine on for a new one. It then reads the FADT (`QUERY_ACPI_TABLE`) for its
    `PWR_BUTTON` flag. RISC-V has none of them.
 2. **Tables.** acpid asks devmgr for the DSDT (`QUERY_ACPI_TABLE` with the signature
    `DSDT`, which devmgr resolves through the FADT), then for SSDT 0, 1, ... until devmgr

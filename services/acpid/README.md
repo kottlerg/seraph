@@ -114,9 +114,12 @@ Once the start-up ends, acpid arms the events:
   block that has a `\_GPE._Lxx` or `_Exx` method. Every other fixed event and GPE is disabled.
   A `_Lxx` or `_Exx` past the GPE0 block, or a second method for the same GPE, is logged and
   not handled.
-- On the first start every status bit is cleared before the enables are set. On a restart a
-  handled event whose status is still set is dispatched: the status bits are latched and
-  cleared only once an event is handled, so an event a dead acpid had not handled is not lost.
+- On the first start acpid disables every event and clears every status bit as soon as devmgr
+  serves the SCI, before anything else can fail, so the press that turned the machine on is
+  gone before devmgr would tell a later acpid that it is a restart. When the events are armed,
+  a handled event whose status is set is dispatched: it was latched after that clear, or by a
+  dead acpid of the boot that had not handled it, since a status bit is cleared only once its
+  event is handled.
 - acpid logs `events armed (...)` with the start, the SCI's GSI, whether the power button is
   on, and the GPEs handled.
 

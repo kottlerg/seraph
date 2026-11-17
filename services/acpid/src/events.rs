@@ -280,7 +280,8 @@ pub struct Handled
     pub gpes: Vec<u16>,
 }
 
-/// Which start of acpid in the boot [`arm`] runs on.
+/// Which start of acpid in the boot this is: on the first, acquisition
+/// [`clear`]s the events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Start
 {
@@ -290,26 +291,53 @@ pub enum Start
     Restart,
 }
 
+/// The first start of the boot, before anything else touches the events:
+/// disable every fixed event and GPE and clear every status, the
+/// power-button press that turned the machine on among them. An event
+/// latched after it is a real one, which [`arm`] keeps.
+pub fn clear(regs: &mut impl Registers, layout: &Layout)
+{
+    let enable = regs.read16(layout.pm1_enable());
+    regs.write16(layout.pm1_enable(), enable & !FIXED_ENABLE);
+    let status = regs.read16(layout.pm1_status()) & FIXED_STATUS;
+    if status != 0
+    {
+        regs.write16(layout.pm1_status(), status);
+    }
+    for index in 0..layout.gpe_count() / 8
+    {
+        let Some((sts, en)) = layout.gpe_ports(index)
+        else
+        {
+            break;
+        };
+        regs.write8(en, 0);
+        let status = regs.read8(sts);
+        if status != 0
+        {
+            regs.write8(sts, status);
+        }
+    }
+}
+
 /// Set up the events on acpid's start: disable every fixed event and GPE
 /// acpid does not handle and clear its status; enable each event of
 /// `handled`, except those whose status is already set, which are
-/// returned to be dispatched, still disabled. On the first start of the
-/// boot, every status is cleared first, the power-button press that turned
-/// the machine on among them; on a restart, an event the earlier acpid did
-/// not handle is kept and returned.
-pub fn arm(regs: &mut impl Registers, layout: &Layout, handled: &Handled, start: Start) -> Fired
+/// returned to be dispatched, still disabled. Such an event latched after
+/// the first start's [`clear`], or was left by an acpid of this boot that
+/// died before it handled it.
+pub fn arm(regs: &mut impl Registers, layout: &Layout, handled: &Handled) -> Fired
 {
     let mut fired = Fired::default();
-    let first = start == Start::First;
     let power_button = handled.power_button;
 
-    let clear = if first || !power_button
+    let clear = if power_button
     {
-        FIXED_STATUS
+        FIXED_STATUS & !PWRBTN
     }
     else
     {
-        FIXED_STATUS & !PWRBTN
+        FIXED_STATUS
     };
     let status = regs.read16(layout.pm1_status());
     if status & clear != 0
@@ -340,7 +368,7 @@ pub fn arm(regs: &mut impl Registers, layout: &Layout, handled: &Handled, start:
         let mask = gpe_mask(&handled.gpes, index);
         regs.write8(en, 0);
         let status = regs.read8(sts);
-        let clear = if first { status } else { status & !mask };
+        let clear = status & !mask;
         if clear != 0
         {
             regs.write8(sts, clear);
@@ -561,7 +589,7 @@ mod tests
     }
 
     #[test]
-    fn first_start_clears_every_status_and_enables_only_what_acpid_handles()
+    fn first_start_clears_every_status_then_enables_only_what_acpid_handles()
     {
         let l = q35();
         let mut r = Regs::default();
@@ -573,7 +601,10 @@ mod tests
         r.raise(0x620, 0b10);
         r.raise(0x621, 0b10);
         r.bytes.insert(0x621 + 8, 0xFF);
-        let fired = arm(&mut r, &l, &handled(true, &[1, 2]), Start::First);
+        clear(&mut r, &l);
+        assert_eq!(r.word(0x602), 0x4000);
+        assert_eq!(r.get(0x629), 0);
+        let fired = arm(&mut r, &l, &handled(true, &[1, 2]));
         assert_eq!(fired, Fired::default());
         assert_eq!(r.word(0x600), 0);
         // PWRBTN_EN alone of the fixed enables, bit 14 kept.
@@ -593,7 +624,7 @@ mod tests
         r.raise(0x600, 0x01);
         r.raise(0x620, 0b110);
         r.raise(0x622, 0x80);
-        let fired = arm(&mut r, &l, &handled(true, &[1, 2]), Start::Restart);
+        let fired = arm(&mut r, &l, &handled(true, &[1, 2]));
         assert_eq!(
             fired,
             Fired {
@@ -622,7 +653,7 @@ mod tests
         let l = q35();
         let mut r = Regs::default();
         r.raise(0x601, PWRBTN_HI);
-        let fired = arm(&mut r, &l, &handled(false, &[]), Start::Restart);
+        let fired = arm(&mut r, &l, &handled(false, &[]));
         assert_eq!(fired, Fired::default());
         assert_eq!(r.word(0x600), 0);
         assert_eq!(r.word(0x602), 0);
@@ -633,7 +664,8 @@ mod tests
     {
         let l = q35();
         let mut r = Regs::default();
-        arm(&mut r, &l, &handled(true, &[1, 9]), Start::First);
+        clear(&mut r, &l);
+        arm(&mut r, &l, &handled(true, &[1, 9]));
         // A press, GPE 1, and GPE 3, which is disabled.
         r.raise(0x601, PWRBTN_HI);
         r.raise(0x620, 0b1010);

@@ -16,7 +16,7 @@
 //!   which the RISC-V arch module acquires the SBI shutdown authority.
 //! * `caps[2]` = `POWER_AUTHORITY`-badged SEND on acpid's service endpoint
 //!   (the `acpid.power` seed), through which the x86-64 arch module reaches
-//!   the ACPI sleep and reset registers.
+//!   the ACPI sleep and reset registers and waits for the power button.
 //!
 //! pwrmgr owns no hardware caps directly. The target's arch module
 //! ([`crate::arch::current`]) keeps the cap it uses and deletes the other.

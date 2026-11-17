@@ -161,7 +161,10 @@ pub fn serve(
             });
         if let Err(e) = spawned
         {
-            std::os::seraph::log!(error: "receiver not spawned: {e}");
+            // A request would wait unanswered behind a held `WAIT_EVENT`, as
+            // when a receiver ends: exit, and svcmgr restarts acpid.
+            std::os::seraph::log!(error: "receiver not spawned: {e}; exiting");
+            syscall::process_exit(1);
         }
     }
     loop
@@ -274,7 +277,7 @@ fn arm(
         std::os::seraph::log!(warn: "the SCI is not taken; no events");
         return None;
     }
-    let fired = events::arm(&mut *lock(&regs), &layout, &handled, start);
+    let fired = events::arm(&mut *lock(&regs), &layout, &handled);
     mailbox.lock().waitable = power_button;
     std::os::seraph::log!(
         "events armed ({} start, SCI on GSI {gsi}): power button {}, GPEs {:?}",

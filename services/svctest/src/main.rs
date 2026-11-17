@@ -37,6 +37,7 @@
               every phase relies on it, so the suppression is crate-wide"
 )]
 
+mod arch;
 mod bootstrap;
 mod ipc_util;
 mod phases;

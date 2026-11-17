@@ -216,69 +216,64 @@ fn choose_image_bias_or_default() -> u64
     process_layout::IMAGE_WINDOW.base
 }
 
-/// Logd's death-notification `EventQueue` cap, registered via
-/// `procmgr_labels::REGISTER_DEATH_EQ` once real-logd is up. Zero
-/// until then. Every teardown after the registration posts the dead
-/// process's death entry to it ([`forward_death_to_logd`]), so the queue
-/// carries no death-observer nodes and no pool of its own bounds the
-/// processes logd hears of.
+/// The `POST` cap on the death queue of the logd instance that registered
+/// last (`procmgr_labels::REGISTER_DEATH_EQ`); zero before the first
+/// registration. Every teardown after a registration posts the dead process's
+/// death entry to it ([`forward_death_to_logd`]), so the queue carries no
+/// death-observer nodes and no pool of its own bounds the processes logd
+/// hears of.
 ///
-/// Written once, by the compare-exchange of [`install_logd_death_eq`],
-/// whichever request worker serves the first `REGISTER_DEATH_EQ`; readers
-/// race only with that write, and the Acquire load pairs with the Release
-/// half of the exchange.
-pub static LOGD_DEATH_EQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A leaf lock: its holder makes one non-blocking syscall, the post of a
+/// death or the swap of a registration, takes no other lock and makes no IPC
+/// call (`services/procmgr/README.md` § Concurrency). A forward holds it
+/// across its post, so the cap a registration replaces, which the
+/// registration's handler deletes once the swap is made, is never posted to
+/// after its deletion, and its slot is never reused under a post.
+static LOGD_DEATH_EQ: Mutex<u64> = Mutex::new(0);
 
-/// Install logd's death-notification EQ cap. Called by
-/// `REGISTER_DEATH_EQ`'s handler.
+/// Install `logd_eq`, the `POST` cap on a registering logd instance's death
+/// queue, in place of the cap a previous registration installed, which this
+/// returns (zero for none) for the caller to delete. Called by
+/// `REGISTER_DEATH_EQ`'s handler, which serves only a `DEATH_EQ_AUTHORITY`
+/// caller.
 ///
-/// First-wins semantics: returns `false` (and changes nothing) if a
-/// previous registration already filled the slot. This mitigates the
-/// pre-existing `sys_cap_derive_badge` weakness in which any holder of
-/// a `SEND_GRANT` cap on procmgr's endpoint can mint
-/// `DEATH_EQ_AUTHORITY` and hijack logd's death stream — since logd
-/// registers at startup before any other user process is spawned, a
-/// later attacker's registration is always second and is rejected
-/// here. The caller (`handle_register_death_eq`) is responsible for
-/// `cap_delete`ing the just-transferred slot when this returns false.
-pub fn install_logd_death_eq(logd_eq: u64) -> bool
+/// Each registration replaces the last, so a restarted logd's queue takes
+/// every death after its registration. A badge is set once, so only a holder
+/// of an un-badged source on procmgr's endpoint can mint the authority
+/// (`docs/capability-model.md` § Kernel guarantees): svcmgr, which mints it
+/// for each logd launch alone, and init until its reap. The queue a
+/// registration replaces is the one of the instance svcmgr destroyed before
+/// it created the registering one.
+pub fn install_logd_death_eq(logd_eq: u64) -> u64
 {
-    if logd_eq == 0
-    {
-        return false;
-    }
-    // First-wins: refuse to overwrite. Real logd registers exactly
-    // once at startup, so the slot transitions 0 → logd_eq and stays.
-    LOGD_DEATH_EQ
-        .compare_exchange(
-            0,
-            logd_eq,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
+    let mut current = LOGD_DEATH_EQ.lock().unwrap_or_else(PoisonError::into_inner);
+    core::mem::replace(&mut *current, logd_eq)
 }
 
 /// `SYS_EVENT_POST`'s refusal of a post to a full queue.
 const QUEUE_FULL: i64 = SyscallError::QueueFull as i64;
 
 /// Post the death entry `(exit_reason, badge)` of a process procmgr tears
-/// down to logd's registered death queue, so logd evicts the process's slot.
-/// A no-op before logd registers. A post the full queue refuses is dropped,
-/// as the kernel drops a post to a full observer queue: logd's drain of the
-/// full queue starts its resync, which evicts the slot.
+/// down to the death queue logd registered last, so logd evicts the process's
+/// slot. A no-op before logd registers. A post the full queue refuses is
+/// dropped, as the kernel drops a post to a full observer queue: logd's drain
+/// of the full queue starts its resync, which evicts the slot. The post is
+/// made under [`LOGD_DEATH_EQ`]'s lock, and a failure's log line after it.
 fn forward_death_to_logd(badge: u64, exit_reason: u64)
 {
-    let logd_eq = LOGD_DEATH_EQ.load(std::sync::atomic::Ordering::Acquire);
-    if logd_eq == 0
-    {
-        return;
-    }
     let entry = syscall::EventEntry {
         payload: exit_reason,
         tag: badge,
     };
-    match syscall::event_post_entry(logd_eq, entry)
+    let posted = {
+        let logd_eq = LOGD_DEATH_EQ.lock().unwrap_or_else(PoisonError::into_inner);
+        if *logd_eq == 0
+        {
+            return;
+        }
+        syscall::event_post_entry(*logd_eq, entry)
+    };
+    match posted
     {
         Ok(()) | Err(QUEUE_FULL) => (),
         Err(e) =>
@@ -564,6 +559,10 @@ pub struct CreateResult
     /// asked for. The reply moves it to the creator; every path that does not
     /// reply it deletes it.
     pub node_handle: u64,
+    /// The load bias the child's image took (`0` for an `ET_EXEC` image),
+    /// which the request's handler logs once it has replied (`log_spawn` in
+    /// `main.rs`).
+    pub image_bias: u64,
 }
 
 /// Resolved placement for a child, produced by `crate::resolve_create_sched`
@@ -2167,6 +2166,7 @@ fn finalize_creation(
 ) -> Result<CreateResult, u64>
 {
     let badge = process_badge;
+    let image_bias = image.load_bias;
     let pi_memory_cap = info_caps.pi_memory.cap();
     // The node handle stays with the caller's `MemmgrSendGuard`, which hands
     // it to the result once the creation is complete.
@@ -2313,6 +2313,7 @@ fn finalize_creation(
         badge,
         memory_max,
         node_handle: 0,
+        image_bias,
     })
 }
 
@@ -2836,16 +2837,9 @@ fn create_process_from_bytes(
     };
     let (span_min, span_end) =
         elf::load_span(ehdr, module_bytes).map_err(|_| procmgr_errors::INVALID_ELF)?;
-    if kind == elf::ElfKind::Dyn
+    if kind == elf::ElfKind::Dyn && !child_image_fits(bias, span_min, span_end)
     {
-        if !child_image_fits(bias, span_min, span_end)
-        {
-            return Err(procmgr_errors::INVALID_ELF);
-        }
-        // Load-bias observability: no ProcessInfo field carries the bias;
-        // debugging correlates through this line (in-process code uses
-        // __ehdr_start).
-        std::os::seraph::log!("spawn image bias=0x{bias:x}");
+        return Err(procmgr_errors::INVALID_ELF);
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)
@@ -3939,16 +3933,9 @@ pub fn create_process_from_file(
     };
     let (span_min, span_end) =
         elf::load_span(ehdr, header_data).map_err(|_| procmgr_errors::INVALID_ELF)?;
-    if kind == elf::ElfKind::Dyn
+    if kind == elf::ElfKind::Dyn && !child_image_fits(bias, span_min, span_end)
     {
-        if !child_image_fits(bias, span_min, span_end)
-        {
-            return Err(procmgr_errors::INVALID_ELF);
-        }
-        // Load-bias observability: no ProcessInfo field carries the bias;
-        // debugging correlates through this line (in-process code uses
-        // __ehdr_start).
-        std::os::seraph::log!("spawn image bias=0x{bias:x}");
+        return Err(procmgr_errors::INVALID_ELF);
     }
     let entry = elf::entry_point(ehdr)
         .checked_add(bias)

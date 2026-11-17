@@ -275,9 +275,10 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    // logd mirrors every log line through this driver, so a debug-authority
-    // holder that stopped it would wait on its own log output: declare this
-    // process undebuggable before it spawns a thread
+    // logd mirrors every log line through this driver, with calls that have
+    // no bound, so a debug-authority holder that stopped it would hold every
+    // process's log output, its own included: declare this process
+    // undebuggable before it spawns a thread
     // (`procmgr_labels::DECLARE_NO_DEBUG`). A refusal leaves it debuggable.
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe {

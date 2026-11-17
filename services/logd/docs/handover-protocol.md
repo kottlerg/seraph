@@ -35,12 +35,9 @@ name lost there would leave the sender's lines rendering as `[?]` for the
 rest of the boot. Init-logd therefore sends such a slot again (see
 [Name changes during the drain](#name-changes-during-the-drain)).
 
-A working logd **restart** is design intent; not yet implemented (#262):
-procmgr's first-wins `REGISTER_DEATH_EQ` rejects a restarted logd's
-registration, and svcmgr's death handler waits out the bound of its `log!`
-calls to the unread master-log endpoint before it respawns logd (per
-[Restart Protocol](../../svcmgr/docs/restart-protocol.md)). In the restart
-code path, svcmgr mints `cap[1] = 0`: init-logd exited after
+On a logd **restart** (per
+[Restart Protocol](../../svcmgr/docs/restart-protocol.md#supervision-hierarchy)),
+svcmgr mints `cap[1] = 0`: init-logd exited after
 the first launch, so there is no handover source. The restarted logd skips
 the pull entirely (guarded on a non-zero `cap[1]`) and serves a fresh
 table on the same endpoint object — svcmgr holds the master-log source

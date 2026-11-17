@@ -637,7 +637,8 @@ Wire format:
 | `caps[0]` | `EventQueue` cap with `POST` right; it needs no death-observer nodes, since nothing binds it |
 
 Procmgr stores the cap in
-[`process::LOGD_DEATH_EQ`](../src/process.rs). From that moment onward,
+[`process::LOGD_DEATH_EQ`](../src/process.rs), in place of the cap an earlier registration
+stored, which it deletes. From that moment onward,
 every teardown procmgr runs (`teardown_entry`: the reap of a death event, the
 death resync, and `DESTROY_PROCESS`) posts the two-word death entry
 `(exit_reason, process badge)` to it with `SYS_EVENT_POST`, the full `u64`
@@ -651,11 +652,19 @@ before the registration posts nothing. A post the full queue refuses
 full-drain resync recovers it.
 
 Reply: `procmgr_errors::SUCCESS` once stored, `UNAUTHORIZED` if the
-caller lacks `DEATH_EQ_AUTHORITY` or a death EQ is already registered,
-`INVALID_ARGUMENT` if no cap was transferred. Registration is first-wins:
-procmgr deletes the cap a second registration transfers and keeps the first,
-so a restarted logd receives no death events. procmgr deletes every cap a
-refused request carried, and any cap past `caps[0]`.
+caller lacks `DEATH_EQ_AUTHORITY`, `INVALID_ARGUMENT` if no cap was
+transferred. Each registration replaces the last, so a restarted logd's queue
+takes every death after its registration, and the dead instance's queue no
+more. The authority admits no other registrant: a badge is set once, so only
+a holder of an un-badged source on procmgr's endpoint can mint it
+([docs/capability-model.md](../../../docs/capability-model.md) § Kernel
+guarantees), and svcmgr mints it for each logd launch alone. A forward holds
+the queue's lock across its post, and a registration swaps the cap under the
+same lock, so no post reaches a cap the registration then deletes
+([README](../README.md) § Concurrency). procmgr writes no log line serving the
+request: logd waits on the reply before its receive workers take the log
+endpoint. procmgr deletes every cap a refused request carried, and any cap
+past `caps[0]`.
 
 logd derives a `POST`-only copy from its `RECV+POST` event queue
 before sending — the kernel's cap-transfer moves the sent cap into
@@ -960,10 +969,12 @@ procmgr after the declaration is unbound then (Label 22). One procmgr does not h
 declaration, its runtime having sent no registration, or its registration having been refused at
 the registry's bound or for procmgr's heap, keeps a binding: the one it copied, or procmgr's under
 the process badge when that was a debugger's (Label 22).
-The senders are the processes a stop of which would deadlock a debug-authority holder, which waits
-on them for its log output or its own progress: logd, the serial and framebuffer drivers, the debug
-port's virtio-console driver, through which the GDB stub reaches its host for every packet, and
-every debug-authority holder, so none attaches to itself. Replies `SUCCESS`, or `INVALID_BADGE` when
+The senders are the processes a stop of which would hold a debug-authority holder, which waits on
+them for its log output or its own progress: the serial and framebuffer drivers, which logd calls
+with no bound for every line, the debug port's virtio-console driver, through which the GDB stub
+reaches its host for every packet, and every debug-authority holder, so none attaches to itself.
+logd does not declare: every log call to it is bounded, so a holder that stops it waits on its own
+log output for at most that bound. Replies `SUCCESS`, or `INVALID_BADGE` when
 the badge names no live process or the request came on a process handle.
 
 Any process may declare itself, on its own cap alone: the badge names the sender, and the process

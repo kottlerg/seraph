@@ -163,8 +163,8 @@ core of crashme's `worker` mode took 8 s to 12 s on debug builds of both archite
   spawner was a registered thread that has since exited and been dropped from the registry, the
   spawner's crash badge names no thread any more: the attach is refused, and the block is
   `status=unattached`, with the fault message's fields alone.
-- **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. logd, the serial
-  driver, and the framebuffer driver, through which logd writes every line, the debug port's
+- **Uncovered processes.** init, memmgr, and procmgr are not created by procmgr. The serial
+  driver and the framebuffer driver, through which logd writes every line, the debug port's
   virtio-console driver, which the GDB stub waits on, and crashd declare themselves undebuggable at
   startup, as svctest and the GDB stub, debug-authority holders, do in a boot that stages them;
   before the declaration, a fault of one of them reaches crashd and is declined once the bound
@@ -195,5 +195,4 @@ stopped for a debugger, are design intent; not yet implemented
 [services/crashd/README.md](../README.md),
 [services/drivers/framebuffer/README.md](../../drivers/framebuffer/README.md),
 [services/drivers/serial/README.md](../../drivers/serial/README.md),
-[services/logd/README.md](../../logd/README.md),
 [procmgr IPC Interface](../../procmgr/docs/ipc-interface.md)

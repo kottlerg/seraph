@@ -833,16 +833,20 @@ format, the contract the host-side symbolizer reads, in
   handler bound. A crash service registers with procmgr's debug authority and receives on the
   endpoint until it dies, when procmgr's thread receives again
   ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)).
-- **Uncovered processes.** A process whose stop would deadlock the crash service, since the service
-  waits on it, declares itself undebuggable, which unbinds its exception class: logd and the serial
-  and framebuffer drivers, which carry the service's log output, the debug port's virtio-console
-  driver, which the GDB stub waits on, and the crash service itself; in a boot that stages them,
-  svctest and the GDB stub, debug-authority holders, declare too. init,
-  memmgr, and procmgr are not created by procmgr and are never bound. A fault of any of these
-  takes the outcome it has with no handler bound, and the kernel's `fault unhandled` and
+- **Uncovered processes.** A process whose stop would hold the crash service, since the service
+  waits on it, declares itself undebuggable, which unbinds its exception class: the serial and
+  framebuffer drivers, through which logd writes the service's log output with calls that have no
+  bound, the debug port's virtio-console driver, which the GDB stub waits on, and the crash service
+  itself; in a boot that stages them, svctest and the GDB stub, debug-authority holders, declare
+  too. init, memmgr, and procmgr are not created by procmgr and are never bound. A fault of any of
+  these takes the outcome it has with no handler bound, and the kernel's `fault unhandled` and
   `USERSPACE FAULT` lines are its only report. Any process may declare itself so; the declaration
-  affects the declarer alone and is one-way. Before logd or either driver declares, at its startup,
-  a fault of it reaches the crash service, which declines it once its bound passes. A process
+  affects the declarer alone and is one-way. Before either driver declares, at its startup, a fault
+  of it reaches the crash service, which declines it once its bound passes. logd does not declare:
+  the service's log calls to it are bounded ([Console Model](console-model.md)), so a fault of logd
+  reaches the crash service, whose report the receive workers logd has left serve, and logd's
+  supervisor restarts it once the service declines the fault
+  ([Supervision](supervision.md)). A process
   created `CREATE_PINNED`, or whose pager binding failed, has no virtual-memory handler: its page
   faults, which no pager forwards, kill it unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint

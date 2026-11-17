@@ -94,7 +94,8 @@ procmgr/
   fields (parent-chosen, per-process).
 - **Death-notification fan-out to logd** — accept
   `REGISTER_DEATH_EQ` from real-logd (gated by the
-  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap, and post
+  `DEATH_EQ_AUTHORITY` badge), store logd's `EventQueue` cap in place of
+  the one a previous logd instance registered, and post
   to it the death entry `(exit_reason, process badge)` of every process
   procmgr tears down after that (the badge is logd's per-sender slot
   key). The kernel posts nothing to logd's queue: procmgr is the source
@@ -331,6 +332,10 @@ The shared state is behind these locks:
   gone, so two registrations cannot both find no registrant. A registration holds it across its
   park call to the crash decliner, which answers without taking any lock.
 - The `CSpace` top-up lock (§ CSpace headroom) is only tried, never waited on.
+- The logd-queue lock guards the cap on logd's death queue (`process::LOGD_DEATH_EQ`). Its holder
+  makes one non-blocking syscall, a death forward's post or a `REGISTER_DEATH_EQ` swap, takes no
+  other lock, and makes no IPC call, so a registration that replaces the queue never deletes a cap
+  a forward is posting to. A forward's failure line is written after it is released.
 
 Under any of these locks, two IPC calls can still happen, each a departure from holding no lock
 across a call ([docs/ipc-design.md](../../docs/ipc-design.md) § Multi-threaded servers), stated

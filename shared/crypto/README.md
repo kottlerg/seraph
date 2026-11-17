@@ -1,17 +1,20 @@
 # shared/crypto
 
 In-OS cryptographic primitives for Seraph: SHA-512 hashing, Ed25519 signature
-verification, and ChaCha20-Poly1305 authenticated encryption.
+verification, and ChaCha20-Poly1305 authenticated encryption; and, for the host
+signer, Ed25519 key generation and signing.
 
 `no_std`, no allocation, no external dependencies. Provides a vetted hash, a
-verify-only signature primitive, and an AEAD usable by the bootloader/loader and
-userspace services. Does no I/O and holds no keys: an AEAD caller passes its key
-on every call. Today its only dependent is ktest, which runs the known-answer
-tests on target.
+signature verifier, and an AEAD usable by the bootloader/loader and userspace
+services, and the signer that xtask runs on the build host. Does no I/O and holds
+no keys: an AEAD caller passes its key on every call, and a signer's caller its
+secret seed. Today its only dependent is ktest, which runs the known-answer tests
+on target.
 
-The per-binary signing chain of trust (#124), which will own key management, the
-signature trailer, and xtask signing, and will consume `ed25519_verify`, is design
-intent; not yet implemented.
+The per-binary signing chain of trust ([docs/signing.md](../../docs/signing.md))
+verifies with `ed25519_verify` in its loaders and signs with `ed25519_sign` in
+xtask; both uses are design intent, not yet implemented
+([#124](https://github.com/kottlerg/seraph/issues/124)).
 
 ---
 
@@ -21,7 +24,9 @@ intent; not yet implemented.
 |---|---|
 | `sha512(&[u8]) -> [u8; 64]` | One-shot SHA-512 (FIPS 180-4). |
 | `Sha512` (`new`/`update`/`finalize`) | Incremental SHA-512, so large inputs (e.g. module bodies) hash without being buffered whole. |
-| `ed25519_verify(&[u8;32], &[u8], &[u8;64]) -> Result<(), VerifyError>` | Ed25519 verification per RFC 8032, public-key decoding included: non-canonical encodings (a y coordinate ≥ p, or x = 0 with the sign bit set) are refused. Verify-only; no signing or key generation. |
+| `ed25519_verify(&[u8;32], &[u8], &[u8;64]) -> Result<(), VerifyError>` | Ed25519 verification per RFC 8032, public-key decoding included: non-canonical encodings (a y coordinate ≥ p, or x = 0 with the sign bit set) are refused. |
+| `ed25519_public_key(&[u8;32]) -> [u8;32]` | The public key of a 32-byte secret seed (RFC 8032 § 5.1.5). `sign` feature only. |
+| `ed25519_sign(&[u8;32], &[u8]) -> [u8;64]` | The deterministic signature R ‖ S of a message under a secret seed (RFC 8032 § 5.1.6), with S below L. `sign` feature only. |
 | `VerifyError` | `BadPublicKey`, `NonCanonicalS`, `Mismatch`. |
 | `chacha20poly1305::seal(&[u8;32], &[u8;12], &[u8], &mut [u8]) -> Result<[u8;16], SealError>` | `AEAD_CHACHA20_POLY1305` (RFC 8439 § 2.8): encrypts the buffer in place under the key and nonce, and returns the tag over the ciphertext and the AAD. |
 | `chacha20poly1305::open(&[u8;32], &[u8;12], &[u8], &mut [u8], &[u8;16]) -> Result<(), OpenError>` | Checks the tag over the ciphertext and the AAD, and only on a match decrypts the buffer in place; on any error the buffer is unchanged. |
@@ -35,11 +40,44 @@ intent; not yet implemented.
 - **SHA-512 only.** Ed25519 mandates SHA-512 internally (RFC 8032 §5.1); one
   core serves both the public hash and the signature's internal hashing.
   SHA-256/BLAKE-family hashes are not provided (no consumer).
-- **Verify-only, variable-time.** Verification touches only public data
-  (public key, signature, message), so the field arithmetic is variable-time
-  by design and carries no side-channel obligation. The mandatory `S < L`
-  range check (RFC 8032 §5.1.7) runs first; every failure path is a single
-  terminal `Err` with no fallback.
+- **Verification, variable-time.** Verification touches only public data
+  (public key, signature, message), so its S range check, point decompression
+  and field equality are variable-time by design and carry no side-channel
+  obligation. The mandatory `S < L` range check (RFC 8032 §5.1.7) runs first;
+  every failure path is a single terminal `Err` with no fallback.
+- **Signing behind a feature.** The signer compiles only with the crate's
+  `sign` feature, and in the crate's own tests. xtask, the host signer, enables
+  it; a loader (the bootloader, procmgr) depends on the crate without it, so its
+  build compiles no signing code. Cargo unifies features within one build only,
+  and xtask builds each component in a Cargo invocation of its own.
+- **Key generation from the caller's seed.** A key is a 32-byte secret seed and
+  the public key `ed25519_public_key` derives from it; the crate draws no
+  randomness. The caller draws the seed from its platform's random source
+  (xtask: the host operating system's,
+  [docs/signing.md](../../docs/signing.md) § Signing) and passes it on every
+  call, so the crate keeps no key between calls.
+- **Signing in constant time.** No branch and no memory index depends on a
+  secret value (the seed, the secret scalar, the nonce prefix, the nonce), only
+  on the message length and on public values. The signer's path is SHA-512
+  (additions, rotations and logic operations, branching on lengths only); the
+  reduction mod L and `mul_add`, which forms S (signed-limb arithmetic in loops
+  of fixed bounds, arithmetic shifts); scalar multiplication by the base point,
+  a ladder over all 256 bits of the scalar with the complete twisted Edwards
+  addition formula, two additions and two conditional swaps per bit; and point
+  encoding (inversion by a fixed exponent, then the canonical reduction). Every
+  select, the ladder's swaps and the canonical reduction's, is a mask that
+  passes through `core::hint::black_box`, so the optimiser cannot rewrite it
+  into a branch. The verifier's variable-time steps take no secret. Tests count
+  the field multiplications and conditional swaps that the ladder makes for
+  extreme scalars, and that a signature makes for different seeds and for
+  nonces with a zero and a full top byte, and require the counts equal: a
+  ladder that skips bits, or a branch on a secret that chooses field work,
+  fails them. A branch inside one field operation, or one the compiler
+  introduces, changes no count; the review of a change to this path checks
+  for one. The signer runs on the build host, whose processor fixes the
+  latency of the 64-bit multiply: the platform-floor argument of the AEAD note
+  below (Zkt, DOITM) is the target's and does not reach the host. No secret is
+  wiped after use, as for the AEAD: the caller holds the seed.
 - **Field representation.** Field elements are 16 signed limbs of radix 2^16
   (the `TweetNaCl` `gf` model) — the most conservative basis for a
   from-scratch verifier, keeping every intermediate product inside `i64`.
@@ -110,6 +148,15 @@ only dev-dependency:
   keys, small-order and non-canonical R), comparing which check fails, not only
   acceptance; `sha512` and `Sha512` against OpenSSL's digests over every
   length to 300 bytes and longer messages, fed whole and in pieces.
+- **Signing.** `ed25519_public_key` and `ed25519_sign` against the reference
+  vectors' signing inputs, byte for byte: the RFC 8032 § 7.1 secrets, the
+  all-zero and all-one seeds, and generated seeds over messages either side of
+  the hash's padding and block boundaries and of random lengths. Every
+  signature over generated seeds and messages verifies under
+  `ed25519_verify`; `mul_add` agrees with the testkit's independent 256-bit
+  arithmetic at the largest inputs the signer forms; and the constant-time
+  counts of § Design notes hold. The signer is not compiled into ktest, so it
+  runs in the host tests only.
 
 Any disagreement fails the test. The loader, the harness and the references are
 reusable by any crate that tests a primitive: it takes `crypto-testkit` as a
@@ -133,9 +180,10 @@ shared/crypto/
     ├── chacha20.rs             # ChaCha20 block function and keystream
     ├── poly1305.rs             # Poly1305 authenticator
     ├── ed25519.rs              # ed25519_verify, VerifyError + KATs
+    ├── ed25519_sign.rs         # ed25519_public_key, ed25519_sign (sign feature)
     ├── field.rs                # GF(2^255-19) field arithmetic
     ├── edwards.rs              # edwards25519 group: points, scalar mul, decompression
-    └── scalar.rs               # arithmetic mod L: S<L check, 64-byte reduction
+    └── scalar.rs               # arithmetic mod L: S<L check, 64-byte reduction, S = r + k·a
 ```
 
 ---
@@ -145,6 +193,7 @@ shared/crypto/
 | Document | Content |
 |---|---|
 | [docs/coding-standards.md](../../docs/coding-standards.md) | Formatting, naming, safety rules |
+| [docs/signing.md](../../docs/signing.md) | The chain of trust the crate's verifier and signer serve; what the signer guarantees (§ Signing) |
 | [docs/platform-requirements.md](../../docs/platform-requirements.md) | The riscv64 floor (RVA23) whose Zkt the AEAD's constant time rests on |
 | [testkit/README.md](testkit/README.md) | The test infrastructure the host tests run |
 

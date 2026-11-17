@@ -40,10 +40,10 @@ part under the Issue that builds it:
 | procmgr's parent link, re-parenting, containment, subtree destroy, child list and destroy, end post (§ procmgr Mechanism) | #1233 |
 | svcmgr's `stop_source` key and stop-source list, the shared stop labels, oomd's program class (§ Stop Sources) | #1233; oomd itself #1098 |
 | sessiond in operator mode, session nodes, the terminal opening its session through sessiond (§ sessiond, § Attribution) | #1233 |
-| Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #TBD-PTY |
-| Remote login through sessiond (§ Session Kinds) | #TBD-RSHD |
-| Per-user sessions: usermgr's token, per-account nodes (§ sessiond and usermgr) | #TBD-USER |
-| Graphical sessions (§ Session Kinds) | #TBD-GUI |
+| Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #1235 |
+| Remote login through sessiond (§ Session Kinds) | #1236 |
+| Per-user sessions: usermgr's token, per-account nodes (§ sessiond and usermgr) | #1238 |
+| Graphical sessions (§ Session Kinds) | #1239 |
 
 ---
 
@@ -243,25 +243,25 @@ the one class, and sessiond its one source.
 | Kind | Interface | Leader | Authority at the open | Issue |
 |---|---|---|---|---|
 | Terminal | terminal | shell | operator | #1233 |
-| Several terminals, over a PTY | one terminal instance per TTY | shell | operator; a usermgr token with #TBD-USER | #TBD-PTY |
-| Remote login | rshd | shell | operator where the image seeds it; a usermgr token with #TBD-USER | #TBD-RSHD |
-| Per-user | terminal, rshd or greeter | shell or desktop shell | a usermgr token | #TBD-USER |
-| Graphical | greeter | desktop shell | a usermgr token, or operator in a userless image | #TBD-GUI |
+| Several terminals, over a PTY | one terminal instance per TTY | shell | operator; a usermgr token with #1238 | #1235 |
+| Remote login | rshd | shell | operator where the image seeds it; a usermgr token with #1238 | #1236 |
+| Per-user | terminal, rshd or greeter | shell or desktop shell | a usermgr token | #1238 |
+| Graphical | greeter | desktop shell | a usermgr token, or operator in a userless image | #1239 |
 
 - **Terminal.** Design intent (#1233): the terminal opens an operator session through sessiond
   with its pipe caps, and the session's programs are stoppable before any service. The terminal
   holds no process handle, and needs no namespace of its own to start the shell.
-- **Several terminals, over a PTY.** Design intent (#TBD-PTY): the standard streams are a PTY's
+- **Several terminals, over a PTY.** Design intent (#1235): the standard streams are a PTY's
   subordinate end; each terminal instance opens its own session (D21 of #152); the hangup policy,
   which ends a session when its PTY's controlling end closes, is sessiond's.
-- **Remote login.** Design intent (#TBD-RSHD): rshd is a client only. It holds no process handle
+- **Remote login.** Design intent (#1236): rshd is a client only. It holds no process handle
   and no derivation path, and its death ends only its own sessions. Whether a remote peer may open
   an operator session in the userless mode is the image's choice, made by seeding rshd with the
   operator name or not.
-- **Per-user.** Design intent (#TBD-USER): every interface authenticates through usermgr and opens
+- **Per-user.** Design intent (#1238): every interface authenticates through usermgr and opens
   the session with the token, as § sessiond and usermgr says; an account's sessions share its
   budget node.
-- **Graphical.** Design intent (#TBD-GUI): the greeter is the interface. It authenticates through
+- **Graphical.** Design intent (#1239): the greeter is the interface. It authenticates through
   usermgr and opens a session whose leader is the desktop shell, handing over the compositor's
   client caps for that session; the programs the desktop shell starts are the session's jobs. The
   compositor is a display broker and holds no process handle.

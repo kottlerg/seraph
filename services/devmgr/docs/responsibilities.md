@@ -467,19 +467,18 @@ devmgr's responsibilities are:
 
   Driver binaries are sourced from one of two places:
 
-  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and
-    the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, and
-    any platform description table) arrive untagged as
-    `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE
-    bootstrap rounds. devmgr tells a module by its content: an ELF image is a
-    driver, read for its declaration (one without a declaration is logged and
-    released); valid UTF-8 text is a platform description table, parsed (one
-    rejected is logged and released); anything else is logged and released.
-    devmgr spawns the drivers during initial enumeration, before the registry
-    loop opens: the IOMMU driver, matched against the IOMMU family record in a
-    pass of its own, and every other module by the declaration it carries,
-    read from the module mapped read-only and bound in the boot pass (above).
-    Every module cap is released once its pass ends.
+  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and the IOMMU driver,
+    `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, and any platform description table) arrive
+    untagged as `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE bootstrap
+    rounds. devmgr tells a module by its content, after taking the body of each through the
+    parse-only `objsig::split` (`decls::classify`; a module whose trailer does not parse is logged
+    and released): an ELF image is a driver, read for its declaration (one without a declaration is
+    logged and released); valid UTF-8 text is a platform description table, parsed by
+    `firmware::platform::parse_module` (one rejected is logged and released); anything else is
+    logged and released. devmgr spawns the drivers during initial enumeration, before the registry
+    loop opens: the IOMMU driver, matched against the IOMMU family record in a pass of its own, and
+    every other module by the declaration it carries, read from the module mapped read-only and
+    bound in the boot pass (above). Every module cap is released once its pass ends.
   - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
     them the per-arch RTC, virtio-input, virtio-console, test-dma, and a copy
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
@@ -628,8 +627,8 @@ for a device
 § IOMMU Discovery and Programming); `MODULE` rounds of up to four Memory caps (round data
 `[MODULE, n, size_0, ..., size_n-1]`, each module's size in bytes, since a module's cap covers
 whole pages and devmgr reads no byte past the module's end) carry every boot module outside
-init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels), untagged: the
-driver images and any platform description table; a cap-less
+init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels, trust-store),
+untagged: the driver images and any platform description table; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and
 the terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch shutdown-authority
 cap (a full-rights derivation of init's root `IoPort` on x86-64, a Reset + Suspend `SbiControl`

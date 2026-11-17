@@ -10,6 +10,8 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+# `TRUST_STORE_MODULE`: the boot module init hands procmgr.
+boot-protocol = { path = "../../abi/boot-protocol" }
 init-protocol = { path = "../../abi/init-protocol" }
 # init-logd's per-sender slot table, kept host-testable outside this no_std bin.
 init-sender-table = { path = "sender-table" }

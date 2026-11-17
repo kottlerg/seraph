@@ -22,7 +22,7 @@
 
 use driver_binding::DRIVER_NOTE_SECTION;
 use driver_binding::decl::DriverDecl;
-use firmware::platform::PlatformTable;
+use firmware::platform::{ModuleError, PlatformTable};
 use ipc::IpcMessage;
 use process_abi::{NT_SERAPH_DRIVER, SERAPH_NOTE_OWNER};
 use std::os::seraph::reserve_pages;
@@ -171,8 +171,8 @@ pub struct BootModules
 
 /// Take every boot module of `caps` and tell each by its content: an ELF
 /// executable is a driver module, kept with its declaration; any other
-/// module is a platform description table, parsed
-/// ([`firmware::platform::parse_table`]) and released. A driver module with
+/// module is a platform description table, parsed from its body
+/// ([`firmware::platform::parse_module`]) and released. A driver module with
 /// no declaration, and a module that is neither, are logged and released, as
 /// is every module when the lists cannot grow.
 pub fn classify_modules(caps: &mut caps::DevmgrCaps) -> BootModules
@@ -222,7 +222,7 @@ enum Classified
 
 /// Tell a boot module by its bytes: an ELF executable by its magic, its
 /// declaration read within § Declaration Bounds; anything else as a
-/// platform description table.
+/// platform description table, the body of a signed object.
 fn classify(bytes: &[u8]) -> Classified
 {
     if bytes.starts_with(ELF_MAGIC)
@@ -241,18 +241,25 @@ fn classify(bytes: &[u8]) -> Classified
         std::os::seraph::log!(warn: "boot module: an executable with no declaration; released");
         return Classified::Neither;
     }
-    let Ok(text) = core::str::from_utf8(bytes)
-    else
-    {
-        std::os::seraph::log!(
-            warn: "boot module: neither an executable nor a text table; released"
-        );
-        return Classified::Neither;
-    };
-    match firmware::platform::parse_table(text)
+    match firmware::platform::parse_module(bytes)
     {
         Ok(table) => Classified::Table(table),
-        Err(e) =>
+        Err(ModuleError::Trailer(e)) =>
+        {
+            std::os::seraph::log!(
+                warn: "boot module: neither an executable nor a signed table ({:?}); released",
+                e
+            );
+            Classified::Neither
+        }
+        Err(ModuleError::NotText) =>
+        {
+            std::os::seraph::log!(
+                warn: "boot module: neither an executable nor a text table; released"
+            );
+            Classified::Neither
+        }
+        Err(ModuleError::Table(e)) =>
         {
             std::os::seraph::log!(warn: "boot module: platform table rejected ({:?}); released", e);
             Classified::Neither

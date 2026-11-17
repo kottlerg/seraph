@@ -26,10 +26,10 @@
 //!   `step4_parse_bundle` treats this as a monolithic ktest boot per
 //!   `boot_protocol::bundle::INIT_ENTRY_NAME` semantics.
 //!
-//! Every ELF entry is signed as it is packed ([`crate::signing`]): `init` as
-//! kind init, each module as a boot module, each under its entry name. The
-//! platform tables and the log-level configuration carry no trailer, since
-//! their readers do not yet split one off (docs/signing.md § Signing).
+//! Every entry is signed as it is packed ([`crate::signing`]): `init` as kind
+//! init, every other entry (a module, a platform table, the log-level
+//! configuration) as a boot module, each under its entry name
+//! (docs/signing.md § Signing).
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -195,15 +195,12 @@ struct Entry
 {
     name: String,
     source: PathBuf,
-    /// `None` for a data entry (a platform table, the log-level
-    /// configuration), which carries no trailer until its reader splits one
-    /// off (docs/signing.md § Signing).
-    kind: Option<Kind>,
+    kind: Kind,
 }
 
 impl Entry
 {
-    fn new(name: &str, source: PathBuf, kind: Option<Kind>) -> Self
+    fn new(name: &str, source: PathBuf, kind: Kind) -> Self
     {
         Self {
             name: name.to_owned(),
@@ -230,7 +227,7 @@ fn entries(ctx: &BuildContext, arch: Arch, harness: Harness, levels: &Path) -> R
 
     let mut entries: Vec<Entry> = Vec::new();
     // Bundle entry named "init" sources from the chosen harness binary.
-    entries.push(Entry::new("init", init_src, Some(Kind::Init)));
+    entries.push(Entry::new("init", init_src, Kind::Init));
     if harness == Harness::Init
     {
         let arch_modules = ARCH_MODULES
@@ -247,7 +244,7 @@ fn entries(ctx: &BuildContext, arch: Arch, harness: Harness, levels: &Path) -> R
                     p.display()
                 );
             }
-            entries.push(Entry::new(name, p, Some(Kind::BootModule)));
+            entries.push(Entry::new(name, p, Kind::BootModule));
         }
         for (_, name, source) in ARCH_TABLES.iter().filter(|(a, _, _)| *a == arch)
         {
@@ -256,7 +253,7 @@ fn entries(ctx: &BuildContext, arch: Arch, harness: Harness, levels: &Path) -> R
             {
                 crate::error::bail!("compose-bundle: platform table missing at {}", p.display());
             }
-            entries.push(Entry::new(name, p, None));
+            entries.push(Entry::new(name, p, Kind::BootModule));
         }
         if !levels.exists()
         {
@@ -265,13 +262,17 @@ fn entries(ctx: &BuildContext, arch: Arch, harness: Harness, levels: &Path) -> R
                 levels.display()
             );
         }
-        entries.push(Entry::new(LOG_LEVELS_ENTRY, levels.to_path_buf(), None));
+        entries.push(Entry::new(
+            LOG_LEVELS_ENTRY,
+            levels.to_path_buf(),
+            Kind::BootModule,
+        ));
     }
     Ok(entries)
 }
 
 /// The `(name, body)` of each of `entries`: its source's bytes, signed by
-/// `signer` as its kind under its name when it has one. A source that
+/// `signer` as its kind under its name. A source that
 /// already carries a trailer (an image the sysroot holds signed as a
 /// service) is signed from its body.
 fn bodies(signer: &Signer, entries: &[Entry]) -> Result<Vec<(String, Vec<u8>)>>
@@ -281,13 +282,9 @@ fn bodies(signer: &Signer, entries: &[Entry]) -> Result<Vec<(String, Vec<u8>)>>
         .map(|entry| {
             let bytes = fs::read(&entry.source)
                 .with_context(|| format!("compose-bundle: read {}", entry.source.display()))?;
-            let body = match entry.kind
-            {
-                Some(kind) => signer
-                    .sign(&bytes, kind, &entry.name)
-                    .with_context(|| format!("compose-bundle: sign {}", entry.source.display()))?,
-                None => bytes,
-            };
+            let body = signer
+                .sign(&bytes, entry.kind, &entry.name)
+                .with_context(|| format!("compose-bundle: sign {}", entry.source.display()))?;
             Ok((entry.name.clone(), body))
         })
         .collect()
@@ -475,7 +472,7 @@ mod tests
         fs::create_dir_all(ktest_src.parent().unwrap()).unwrap();
         fs::write(&ktest_src, b"elf").unwrap();
         let ktest = entries(&ctx, arch, Harness::Ktest, &levels).expect("ktest entries");
-        assert_eq!(ktest, [Entry::new("init", ktest_src, Some(Kind::Init))]);
+        assert_eq!(ktest, [Entry::new("init", ktest_src, Kind::Init)]);
 
         // A missing configuration is an error, as a missing module is.
         entries(&ctx, arch, Harness::Init, &root.join("absent.conf")).unwrap_err();
@@ -483,11 +480,11 @@ mod tests
         let _ = fs::remove_dir_all(&root);
     }
 
-    // Defect caught: an executable entry packed unsigned, or signed as the
-    // wrong kind (a module as init, which the bootloader would refuse), or a
-    // data entry given a trailer its reader cannot split off.
+    // Defect caught: an entry packed unsigned, data entries included, or
+    // signed as the wrong kind (a module as init, which the bootloader would
+    // refuse).
     #[test]
-    fn executable_entries_are_signed_by_role_and_data_entries_are_not()
+    fn every_entry_is_signed_by_role()
     {
         let root = scratch("kinds");
         let arch = Arch::Riscv64;
@@ -496,39 +493,37 @@ mod tests
         let init = entries(&ctx, arch, Harness::Init, &levels).expect("init entries");
         for entry in &init
         {
-            let data = entry.name == LOG_LEVELS_ENTRY
-                || ARCH_TABLES.iter().any(|(_, name, _)| entry.name == *name);
-            let expected = match entry.name.as_str()
+            let expected = if entry.name == "init"
             {
-                "init" => Some(Kind::Init),
-                _ if data => None,
-                _ => Some(Kind::BootModule),
+                Kind::Init
+            }
+            else
+            {
+                Kind::BootModule
             };
             assert_eq!(entry.kind, expected, "entry {}", entry.name);
         }
+        assert!(init.iter().any(|entry| entry.name == LOG_LEVELS_ENTRY));
+        assert!(
+            init.iter()
+                .any(|entry| ARCH_TABLES.iter().any(|(_, name, _)| entry.name == *name))
+        );
 
-        // The bodies: the executable entries verify as their kind under their
-        // name; the data entries are their sources' bytes.
+        // The bodies: every entry verifies as its kind under its name, with
+        // its source's bytes as its body.
         let signer = crate::signing::testing::signer(&root.join("keys"), arch);
         let store = signer.store().to_vec();
         let store = objsig::TrustStore::parse(&store).unwrap();
         for ((name, body), entry) in bodies(&signer, &init).unwrap().iter().zip(&init)
         {
             let source = fs::read(&entry.source).unwrap();
-            match entry.kind
-            {
-                None => assert_eq!(body, &source, "entry {name}"),
-                Some(kind) =>
-                {
-                    let expect = objsig::Expectation {
-                        kinds: objsig::KindSet::of(&[kind]),
-                        name: name.as_bytes(),
-                        arch: objsig::Arch::Riscv64,
-                    };
-                    objsig::verify(body, &store, &expect).expect(name);
-                    assert_eq!(objsig::split(body).unwrap().body(), source.as_slice());
-                }
-            }
+            let expect = objsig::Expectation {
+                kinds: objsig::KindSet::of(&[entry.kind]),
+                name: name.as_bytes(),
+                arch: objsig::Arch::Riscv64,
+            };
+            objsig::verify(body, &store, &expect).expect(name);
+            assert_eq!(objsig::split(body).unwrap().body(), source.as_slice());
         }
 
         let _ = fs::remove_dir_all(&root);

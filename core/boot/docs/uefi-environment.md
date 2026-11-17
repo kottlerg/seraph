@@ -251,19 +251,19 @@ configuration.
 
 ### BootError Type
 
-Every fatal error returned through `Result` is a `BootError` (`Result<T, BootError>`),
-defined in [`core/boot/src/error.rs`](../src/error.rs). The variant set covers
-protocol-location failure, UEFI status-code propagation, ESP file-not-found,
-ELF validation failure, W^X violation, allocation failure, `ExitBootServices`
-failure after the bounded retry loop, bundle parse/validation failure (`InvalidBundle`),
-on RISC-V no supported paging mode passing the satp probe (`PagingModeUnsupported`),
-a firmware memory map that violates the UEFI contract (`InvalidMemoryMap`), a memory map
-that outgrows its entry array on every run of steps 6 and 7 (`MemoryMapKeptGrowing`,
-[memory-map.md](memory-map.md) § Sizing the Entry Array), in step 6 a range to map that
-runs past the end of the address space (`MapAddressRange`), and, in step 9, a
-`reclaim_ranges` overflow
-(`ReclaimRangesOverflow`, unreachable while the compile-time entry count holds); the
-source is the authority on the variant list and payloads.
+Every fatal error returned through `Result` is a `BootError` (`Result<T, BootError>`), defined in
+[`core/boot/src/error.rs`](../src/error.rs). The variant set covers protocol-location failure, UEFI
+status-code propagation, ESP file-not-found, ELF validation failure, W^X violation, allocation
+failure, `ExitBootServices` failure after the bounded retry loop, bundle parse/validation failure
+(`InvalidBundle`), an embedded trust store that does not parse (`TrustStore`), the verifier's
+refusal of the kernel or a bundle entry (`SignatureRefused`, naming the object;
+[docs/signing.md](../../../docs/signing.md) § Verifier Discipline), on RISC-V no supported paging
+mode passing the satp probe (`PagingModeUnsupported`), a firmware memory map that violates the UEFI
+contract (`InvalidMemoryMap`), a memory map that outgrows its entry array on every run of steps 6
+and 7 (`MemoryMapKeptGrowing`, [memory-map.md](memory-map.md) § Sizing the Entry Array), in step 6 a
+range to map that runs past the end of the address space (`MapAddressRange`), and, in step 9, a
+`reclaim_ranges` overflow (`ReclaimRangesOverflow`, unreachable while the compile-time entry count
+holds); the source is the authority on the variant list and payloads.
 
 The top-level `efi_main` propagates every `BootError` to a single fatal handler
 (`error::fatal_error`) that reports the error and halts; it needs no boot service, so

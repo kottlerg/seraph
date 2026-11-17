@@ -381,9 +381,9 @@ The `esp/` and root-partition trees are populated from two sources:
 
 Each packing of a disk image signs the kernel and the ELF images under `services/`,
 `programs/` and `tests/` in place, so each ends in a signature trailer
-([signing.md § Signed Object Format](signing.md#signed-object-format)); the loaders ignore the
-trailer today. In `bootstrap.bundle` the executable entries (`init` and each module) are the
-image's body plus a trailer, and the data entries are their source bytes, unsigned
+([signing.md § Signed Object Format](signing.md#signed-object-format)); the bootloader verifies
+the kernel and each bundle entry, and procmgr's loader ignores the trailer. In
+`bootstrap.bundle` every entry is its body plus a trailer, the data entries included
 ([xtask/README.md § Signing](../xtask/README.md#signing)).
 
 The disk image is assembled by xtask after the sysroot is populated. Cargo's

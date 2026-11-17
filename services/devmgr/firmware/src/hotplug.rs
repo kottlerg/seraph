@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use crate::acpid::{Address, Bridge, Bridges, Osc, address};
 use crate::pci::{CAP_ID_PCI_EXPRESS, COMMAND, COMMAND_MEMORY, STATUS, find_capability};
 use crate::pci_records::{AppendError, PciRecords, RecordState};
+use crate::resource::Span;
 use crate::scan::{ConfigSpace, MAX_BARS, PciDevice};
 
 /// Offset of the PCI Express Capabilities register in the capability: bits
@@ -427,13 +428,13 @@ pub enum Unplaced
 }
 
 /// Place every request of `requests` in a slot's windows: `memory`, the
-/// non-prefetchable window, and `prefetchable`, clear of `taken` (each
-/// `(base, end)`: the BARs of the live records on the slot's buses) and of
-/// each other. Each BAR is aligned to its size, as a BAR's base must be, and
-/// to a page, and takes at least a page, which it shares with no other BAR
-/// (devmgr carves a BAR's cap in whole pages); the largest is placed first,
-/// each at the lowest free base. A 64-bit
-/// prefetchable BAR goes in the prefetchable window, or in the
+/// non-prefetchable window, and `prefetchable`, each BAR inside one range of
+/// `free` (each `(base, end)`: the ranges of the windows devmgr's apertures
+/// still hold, [`free_ranges`]) and clear of the others. Each BAR is aligned
+/// to its size, as a BAR's base must be, and to a page, and takes at least a
+/// page, which it shares with no other BAR (devmgr carves a BAR's cap in whole
+/// pages); the largest is placed first, each at the lowest free base. A
+/// 64-bit prefetchable BAR goes in the prefetchable window, or in the
 /// non-prefetchable window when it does not fit there (prefetchable memory
 /// may be mapped as non-prefetchable); every other BAR goes in the
 /// non-prefetchable window, which lies below 4 GiB.
@@ -445,7 +446,7 @@ pub fn assign(
     requests: &[Option<BarRequest>; MAX_BARS],
     memory: Option<Window>,
     prefetchable: Option<Window>,
-    taken: &[(u64, u64)],
+    free: &[(u64, u64)],
 ) -> Result<[Option<Placed>; MAX_BARS], Unplaced>
 {
     let mut order: [Option<BarRequest>; MAX_BARS] = *requests;
@@ -481,7 +482,7 @@ pub fn assign(
         let base = windows
             .iter()
             .flatten()
-            .find_map(|w| lowest_free(*w, request.size, taken, earlier))
+            .find_map(|w| lowest_free(*w, request.size, free, earlier))
             .ok_or(Unplaced::NoRoom(request.register))?;
         if let Some(out) = placed.get_mut(at)
         {
@@ -509,46 +510,99 @@ const fn span(size: u64) -> u64
 }
 
 /// The lowest base in `window`, aligned to the BAR's span ([`span`] of
-/// `size`), whose span overlaps neither the pages of `taken` nor the span
-/// of a BAR of `placed`.
+/// `size`), whose span lies inside one range of `free` and overlaps the
+/// span of no BAR of `placed`.
 fn lowest_free(
     window: Window,
     size: u64,
-    taken: &[(u64, u64)],
+    free: &[(u64, u64)],
     placed: &[Option<Placed>],
 ) -> Option<u64>
 {
     let size = span(size);
-    let taken = taken.iter().map(|&(b, e)| {
-        (
-            b & !(PAGE - 1),
-            e.checked_next_multiple_of(PAGE).unwrap_or(u64::MAX),
-        )
-    });
     let placed = placed
         .iter()
         .flatten()
         .map(|p| (p.base, p.base.saturating_add(span(p.size))));
-    let mut base = window.base.checked_next_multiple_of(size)?;
-    loop
+    free.iter()
+        .filter_map(|&(b, e)| {
+            let end_of_range = e.min(window.end);
+            let mut base = b.max(window.base).checked_next_multiple_of(size)?;
+            loop
+            {
+                let end = base.checked_add(size)?;
+                if end > end_of_range
+                {
+                    return None;
+                }
+                let clash = placed
+                    .clone()
+                    .filter(|&(pb, pe)| pb < end && base < pe)
+                    .map(|(_, pe)| pe)
+                    .max();
+                match clash
+                {
+                    None => return Some(base),
+                    Some(clash_end) => base = clash_end.checked_next_multiple_of(size)?,
+                }
+            }
+        })
+        .min()
+}
+
+/// The ranges of `slot`'s windows that devmgr still holds: the part of each
+/// span of `spans` (its aperture table's caps) inside each open window, its
+/// ends rounded inward to pages. A span is not merged with its neighbours, so
+/// each range lies inside one cap and a BAR placed in it ([`assign`]) is
+/// carved from that cap. Appended to `out`.
+///
+/// # Errors
+/// The allocation error when `out` cannot grow.
+pub fn free_ranges<S>(
+    spans: &[Span<S>],
+    slot: &Slot,
+    out: &mut Vec<(u64, u64)>,
+) -> Result<(), TryReserveError>
+{
+    for window in [slot.memory, slot.prefetchable].into_iter().flatten()
     {
-        let end = base.checked_add(size)?;
-        if end > window.end
+        for s in spans
         {
-            return None;
-        }
-        let clash = taken
-            .clone()
-            .chain(placed.clone())
-            .filter(|&(b, e)| b < end && base < e)
-            .map(|(_, e)| e)
-            .max();
-        match clash
-        {
-            None => return Some(base),
-            Some(clash_end) => base = clash_end.checked_next_multiple_of(size)?,
+            let Some(base) = s.base.max(window.base).checked_next_multiple_of(PAGE)
+            else
+            {
+                continue;
+            };
+            let end = s.end.min(window.end) & !(PAGE - 1);
+            if base < end
+            {
+                out.try_reserve(1)?;
+                out.push((base, end));
+            }
         }
     }
+    Ok(())
+}
+
+/// The page span `(base, len)` of each assigned MMIO BAR of `device`: the
+/// range devmgr holds for it in a slot's windows, at least a page.
+pub fn bar_spans(device: &PciDevice) -> impl Iterator<Item = (u64, u64)> + '_
+{
+    device
+        .bar_phys
+        .iter()
+        .zip(&device.bar_size)
+        .zip(&device.bar_is_mmio)
+        .take(device.bar_count)
+        .filter(|&((&phys, _), &mmio)| mmio && phys != 0)
+        .map(|((&phys, &size), _)| {
+            let base = phys & !(PAGE - 1);
+            let end = phys
+                .saturating_add(size)
+                .checked_next_multiple_of(PAGE)
+                .unwrap_or(u64::MAX);
+            (base, end.saturating_sub(base))
+        })
 }
 
 /// Write the BARs of `placed` into the function at `bus:dev.func`, its
@@ -620,14 +674,15 @@ pub enum Found
 }
 
 /// Read the function at `bus:dev.func` of the slot `slot` through `cfg`,
-/// place its MMIO BARs in the slot's windows clear of `taken` ([`assign`]),
+/// place its MMIO BARs in the ranges of the slot's windows devmgr still
+/// holds, `free` ([`free_ranges`], [`assign`]),
 /// program them ([`program_bars`]), and read it again for its record. A
 /// type-1 function is returned as read, for [`admit`] to refuse.
 pub fn place(
     cfg: &impl ConfigSpace,
     slot: &Slot,
     (bus, dev, func): (u8, u8, u8),
-    taken: &[(u64, u64)],
+    free: &[(u64, u64)],
 ) -> Found
 {
     let segment = slot.port.0;
@@ -641,7 +696,7 @@ pub fn place(
         return Found::Ready(device);
     }
     let requests = bar_requests(&device, |at| cfg.read32(bus, dev, func, at));
-    let placed = match assign(&requests, slot.memory, slot.prefetchable, taken)
+    let placed = match assign(&requests, slot.memory, slot.prefetchable, free)
     {
         Ok(placed) => placed,
         Err(why) => return Found::Unplaced(device, why),
@@ -835,6 +890,7 @@ mod tests
 {
     use super::*;
     use crate::acpid::Bridges;
+    use crate::resource::{CarveError, SpanTable, SplitError};
     use crate::scan::scan;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -1341,26 +1397,41 @@ mod tests
         end: 0x8020_0000,
     });
 
+    /// Every range free: the windows alone bound a placement.
+    const FREE: &[(u64, u64)] = &[(0, u64::MAX)];
+
     #[test]
-    fn bars_are_placed_aligned_largest_first_clear_of_taken_ranges()
+    fn bars_are_placed_aligned_largest_first_in_the_free_ranges()
     {
         let mut requests = [None; MAX_BARS];
         requests[0] = Some(request(0, 0x10_0000));
         assert_eq!(
-            bases(&assign(&requests, MEMORY, None, &[]).unwrap()),
+            bases(&assign(&requests, MEMORY, None, FREE).unwrap()),
             [(0, 0x8000_0000)]
         );
-        // A live record's BAR takes the first MiB.
+        // The first page is not free: the BAR goes at the next MiB.
         assert_eq!(
-            bases(&assign(&requests, MEMORY, None, &[(0x8000_0000, 0x8000_1000)]).unwrap()),
+            bases(&assign(&requests, MEMORY, None, &[(0x8000_1000, 0x8020_0000)]).unwrap()),
             [(0, 0x8010_0000)]
+        );
+        // Two free ranges side by side are two caps: a BAR spanning both is
+        // not placed across them.
+        let halves = [(0x8000_0000, 0x8008_0000), (0x8008_0000, 0x8010_0000)];
+        assert_eq!(
+            assign(&requests, MEMORY, None, &halves),
+            Err(Unplaced::NoRoom(0))
+        );
+        // Nothing free, nothing placed.
+        assert_eq!(
+            assign(&requests, MEMORY, None, &[]),
+            Err(Unplaced::NoRoom(0))
         );
         // The largest goes first, at the window's base; the smaller after it.
         requests[1] = Some(request(1, 0x1000));
         requests[2] = Some(request(2, 0x10_0000));
         requests[0] = Some(request(0, 0x1000));
         assert_eq!(
-            bases(&assign(&requests, MEMORY, None, &[]).unwrap()),
+            bases(&assign(&requests, MEMORY, None, FREE).unwrap()),
             [(0, 0x8010_0000), (1, 0x8010_1000), (2, 0x8000_0000)]
         );
         // Each base is aligned to its size.
@@ -1371,7 +1442,7 @@ mod tests
             end: 0x8060_0000,
         });
         assert_eq!(
-            bases(&assign(&one, shifted, None, &[]).unwrap()),
+            bases(&assign(&one, shifted, None, FREE).unwrap()),
             [(0, 0x8020_0000)]
         );
     }
@@ -1384,14 +1455,8 @@ mod tests
         requests[0] = Some(request(0, 0x100));
         requests[1] = Some(request(1, 0x100));
         assert_eq!(
-            bases(&assign(&requests, MEMORY, None, &[]).unwrap()),
+            bases(&assign(&requests, MEMORY, None, FREE).unwrap()),
             [(0, 0x8000_0000), (1, 0x8000_1000)]
-        );
-        // A live record's sub-page BAR keeps its whole page from a placement.
-        requests[1] = None;
-        assert_eq!(
-            bases(&assign(&requests, MEMORY, None, &[(0x8000_0100, 0x8000_0200)]).unwrap()),
-            [(0, 0x8000_1000)]
         );
         // A window of one page holds one sub-page BAR, not two.
         requests[1] = Some(request(1, 0x100));
@@ -1399,7 +1464,10 @@ mod tests
             base: 0x8000_0000,
             end: 0x8000_1000,
         });
-        assert_eq!(assign(&requests, page, None, &[]), Err(Unplaced::NoRoom(1)));
+        assert_eq!(
+            assign(&requests, page, None, FREE),
+            Err(Unplaced::NoRoom(1))
+        );
     }
 
     #[test]
@@ -1408,23 +1476,23 @@ mod tests
         let mut requests = [None; MAX_BARS];
         requests[0] = Some(request(0, 0x40_0000));
         assert_eq!(
-            assign(&requests, MEMORY, None, &[]),
+            assign(&requests, MEMORY, None, FREE),
             Err(Unplaced::NoRoom(0))
         );
         requests[0] = Some(request(0, 0x10_0000));
         requests[1] = Some(request(1, 0x10_0000));
         requests[2] = Some(request(2, 0x10_0000));
         assert_eq!(
-            assign(&requests, MEMORY, None, &[]),
+            assign(&requests, MEMORY, None, FREE),
             Err(Unplaced::NoRoom(2))
         );
         assert_eq!(
-            assign(&requests, None, None, &[]),
+            assign(&requests, None, None, FREE),
             Err(Unplaced::NoWindow(0))
         );
         requests[1] = Some(request(1, 0x3000));
         assert_eq!(
-            assign(&requests, MEMORY, None, &[]),
+            assign(&requests, MEMORY, None, FREE),
             Err(Unplaced::BadSize(1))
         );
     }
@@ -1445,15 +1513,15 @@ mod tests
             prefetchable: true,
         });
         assert_eq!(
-            bases(&assign(&requests, MEMORY, prefetchable, &[]).unwrap()),
+            bases(&assign(&requests, MEMORY, prefetchable, FREE).unwrap()),
             [(0, 0x8000_0000), (2, 0x8_0000_0000)]
         );
         // With the prefetchable window off, or full, it goes in the other.
         assert_eq!(
-            bases(&assign(&requests, MEMORY, None, &[]).unwrap()),
+            bases(&assign(&requests, MEMORY, None, FREE).unwrap()),
             [(0, 0x8010_0000), (2, 0x8000_0000)]
         );
-        let full = [(0x8_0000_0000, 0x8_0040_0000)];
+        let full = [(0x8000_0000, 0x8020_0000)];
         assert_eq!(
             bases(&assign(&requests, MEMORY, prefetchable, &full).unwrap()),
             [(0, 0x8010_0000), (2, 0x8000_0000)]
@@ -1467,7 +1535,7 @@ mod tests
             prefetchable: true,
         });
         assert_eq!(
-            assign(&narrow, None, prefetchable, &[]),
+            assign(&narrow, None, prefetchable, FREE),
             Err(Unplaced::NoWindow(0))
         );
     }
@@ -1486,7 +1554,7 @@ mod tests
         );
         let requests = bar_requests(&edu, |at| space.read32(1, 0, 0, at));
         assert_eq!(requests[0], Some(request(0, 0x10_0000)));
-        let placed = assign(&requests, slot.memory, slot.prefetchable, &[]).unwrap();
+        let placed = assign(&requests, slot.memory, slot.prefetchable, FREE).unwrap();
         // The function decodes memory while the BAR changes; the write turns
         // decode off and back on.
         space.write16(1, 0, 0, COMMAND, COMMAND_MEMORY);
@@ -1507,10 +1575,9 @@ mod tests
         add_edu(&space, (1, 0, 0));
         let slot = found(&space)[0];
         let window = slot.memory.unwrap();
-        // The whole window is taken: the 1 MiB BAR has no room, and nothing
-        // is written.
-        let Found::Unplaced(device, why) =
-            place(&space, &slot, (1, 0, 0), &[(window.base, window.end)])
+        // devmgr holds none of the window: the 1 MiB BAR has no room, and
+        // nothing is written.
+        let Found::Unplaced(device, why) = place(&space, &slot, (1, 0, 0), &[])
         else
         {
             panic!("a BAR with no room was placed");
@@ -1519,20 +1586,20 @@ mod tests
         assert_eq!(device.bar_phys[0], 0);
         assert_eq!(space.read32(1, 0, 0, BAR0), 0);
         // With the window free it is placed at the window's base.
-        let Found::Ready(device) = place(&space, &slot, (1, 0, 0), &[])
+        let Found::Ready(device) = place(&space, &slot, (1, 0, 0), &[(window.base, window.end)])
         else
         {
             panic!("a BAR that fits was not placed");
         };
         assert_eq!(device.bar_phys[0], window.base);
         assert!(matches!(
-            place(&space, &slot, (1, 0, 1), &[]),
+            place(&space, &slot, (1, 0, 1), FREE),
             Found::Absent
         ));
         // A port's own window is beside the point: a type-1 function is
         // returned as read, its windows unprogrammed.
         space.add((1, 0, 2), Q35_ROOT_PORT);
-        let Found::Ready(bridge) = place(&space, &slot, (1, 0, 2), &[])
+        let Found::Ready(bridge) = place(&space, &slot, (1, 0, 2), FREE)
         else
         {
             panic!("a bridge was not returned as read");
@@ -1542,6 +1609,153 @@ mod tests
             admit(bridge, |_| panic!("a bridge is not appended")),
             Admission::Bridge
         );
+    }
+
+    /// The two halves `(base, at)` and `(at, end)` of a split range.
+    type SplitHalves = ((u64, u64), (u64, u64));
+
+    /// A model of `SYS_MMIO_SPLIT`: a cap is its `(base, end)`.
+    fn split_model(span: &Span<(u64, u64)>, at: u64) -> Result<SplitHalves, SplitError>
+    {
+        let (b, e) = span.slot;
+        if at <= b || at >= e
+        {
+            return Err(SplitError::OutOfRange);
+        }
+        Ok(((b, at), (at, e)))
+    }
+
+    fn covered(table: &SpanTable<(u64, u64)>) -> Vec<(u64, u64)>
+    {
+        table.spans().iter().map(|s| (s.base, s.end)).collect()
+    }
+
+    #[test]
+    fn free_ranges_are_the_held_spans_inside_the_windows_in_whole_pages()
+    {
+        let space = Space::default();
+        space.add((0, 3, 0), Q35_ROOT_PORT);
+        let mut slot = found(&space)[0];
+        slot.memory = Some(Window {
+            base: 0x8000_0000,
+            end: 0x8020_0000,
+        });
+        slot.prefetchable = Some(Window {
+            base: 0x8_0000_0000,
+            end: 0x8_0010_0000,
+        });
+        let mut table = SpanTable::new();
+        for (base, end) in [
+            // Below the window, and across its base.
+            (0x7000_0000, 0x7000_1000),
+            (0x7FFF_F000, 0x8000_0800),
+            // Two neighbours inside it, kept apart.
+            (0x8000_2000, 0x8001_0000),
+            (0x8001_0000, 0x8002_0000),
+            // Across the window's end, its first page partly held.
+            (0x801F_F800, 0x8030_0000),
+            // The prefetchable window, whole.
+            (0x8_0000_0000, 0x8_0010_0000),
+        ]
+        {
+            assert!(table.insert((base, end), base, end - base).unwrap());
+        }
+        let mut free = Vec::new();
+        free_ranges(table.spans(), &slot, &mut free).unwrap();
+        assert_eq!(
+            free,
+            [
+                (0x8000_2000, 0x8001_0000),
+                (0x8001_0000, 0x8002_0000),
+                (0x8_0000_0000, 0x8_0010_0000)
+            ]
+        );
+        // A closed window frees nothing.
+        slot.memory = None;
+        slot.prefetchable = None;
+        free.clear();
+        free_ranges(table.spans(), &slot, &mut free).unwrap();
+        assert_eq!(free, []);
+    }
+
+    #[test]
+    fn a_placed_bar_is_held_whole_pages_and_no_longer_free()
+    {
+        let space = Space::default();
+        add_edu(&space, (1, 0, 0));
+        let mut edu = crate::scan::function(&space, 0, 1, 0, 0).unwrap();
+        edu.bar_phys[0] = 0x8010_0000;
+        assert_eq!(
+            bar_spans(&edu).collect::<Vec<_>>(),
+            [(0x8010_0000, 0x10_0000)]
+        );
+        // A sub-page BAR is held as its whole page; an unassigned BAR not at all.
+        edu.bar_size[0] = 0x100;
+        edu.bar_phys[0] = 0x8000_0100;
+        assert_eq!(bar_spans(&edu).collect::<Vec<_>>(), [(0x8000_0000, 0x1000)]);
+        edu.bar_phys[0] = 0;
+        assert_eq!(bar_spans(&edu).count(), 0);
+    }
+
+    #[test]
+    fn placement_takes_only_what_the_apertures_hold_and_a_failure_changes_nothing()
+    {
+        let space = Space::default();
+        space.add((0, 3, 0), Q35_ROOT_PORT);
+        add_edu(&space, (1, 0, 0));
+        let slot = found(&space)[0];
+        let window = slot.memory.unwrap();
+        let mut apertures = SpanTable::new();
+        assert!(
+            apertures
+                .insert(
+                    (window.base, window.end),
+                    window.base,
+                    window.end - window.base
+                )
+                .unwrap()
+        );
+        let mut held = SpanTable::new();
+        // acpid was granted the window's first page, carved out of the
+        // apertures: the BAR is placed past it.
+        let granted = apertures
+            .carve(window.base, PAGE, PAGE, split_model)
+            .unwrap();
+        assert_eq!(granted, (window.base, window.base + PAGE));
+        let mut free = Vec::new();
+        free_ranges(apertures.spans(), &slot, &mut free).unwrap();
+        let Found::Ready(device) = place(&space, &slot, (1, 0, 0), &free)
+        else
+        {
+            panic!("a BAR that fits was not placed");
+        };
+        let bar = device.bar_phys[0];
+        assert_eq!(bar, window.base + 0x10_0000);
+        // Held at placement: the BAR's pages move out of the apertures.
+        let spans: Vec<(u64, u64)> = bar_spans(&device).collect();
+        apertures
+            .move_all(&mut held, &spans, PAGE, split_model)
+            .unwrap();
+        assert_eq!(covered(&held), [(bar, bar + 0x10_0000)]);
+        // The mirror: a region grant of a page under the BAR finds no
+        // aperture to carve it from.
+        assert_eq!(
+            apertures.carve(bar + 0x1000, PAGE, PAGE, split_model),
+            Err(CarveError::NotCovered)
+        );
+        // A second function finds no room: the window's other free ranges are
+        // a page short of a MiB below the BAR, and nothing above it. It is
+        // left unwritten, and the tables as they were.
+        add_edu(&space, (1, 0, 1));
+        let before = (covered(&apertures), covered(&held));
+        free.clear();
+        free_ranges(apertures.spans(), &slot, &mut free).unwrap();
+        assert!(matches!(
+            place(&space, &slot, (1, 0, 1), &free),
+            Found::Unplaced(_, Unplaced::NoRoom(0))
+        ));
+        assert_eq!(space.read32(1, 0, 1, BAR0), 0);
+        assert_eq!((covered(&apertures), covered(&held)), before);
     }
 
     #[test]

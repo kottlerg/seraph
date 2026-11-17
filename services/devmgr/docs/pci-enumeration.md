@@ -163,7 +163,9 @@ For each matched device, devmgr:
    its driver declares the VirtIO status reset, and bound as any other
    function otherwise.
 2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided
-   MMIO aperture that covers it, spanning the BAR's first pages up to that
+   MMIO aperture that covers it, or, for a function behind a managed hotplug
+   slot, out of the BAR pages devmgr holds for it
+   ([hotplug.md](hotplug.md#add-job) § Add Job), spanning the BAR's first pages up to that
    reach at most. The driver maps each BAR into that many pages of its
    register window, and `SYS_MMIO_MAP` maps a cap's whole region, so a
    larger cap would map past the BAR's share of the window. For any other

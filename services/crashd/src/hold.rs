@@ -12,10 +12,15 @@
 //! memmgr declined with code 6, 7 or 8 while the level is `CRITICAL` is
 //! redirected (`FAULT_REPLY_REDIRECT`) to one of [`SLOTS`] endpoints crashd
 //! made at start, where it waits queued, its thread fault-blocked, and no
-//! thread of crashd's waits on it. When the level falls below `CRITICAL`,
-//! crashd receives each held fault from its endpoint and resumes it; when a
-//! hold's deadline passes first, it receives that fault and reports and
-//! declines it as any other. The decisions are [`oom_hold`]'s, host-tested.
+//! thread of crashd's waits on it. The fault reaches that endpoint only when
+//! its thread next runs, so the endpoint is in the wait set from the redirect
+//! until the fault arrives, and out of it while the fault waits there. When
+//! the level falls below `CRITICAL`, crashd receives each held fault that
+//! has arrived from its endpoint and resumes it; when a hold's deadline
+//! passes first, it receives that fault and reports and declines it as any
+//! other, or, when it has not arrived, replaces the slot's endpoint, so a
+//! slot's endpoint only ever queues the one fault crashd holds there. The
+//! decisions are [`oom_hold`]'s, host-tested.
 
 use core_file::policy::Policy;
 use ipc::IpcMessage;
@@ -32,6 +37,17 @@ const WAKE_FAULT: u64 = 0;
 
 /// The wait-set badge of the memory-pressure Notification.
 const WAKE_PRESSURE: u64 = 1;
+
+/// The wait-set badge of slot 0's endpoint; slot `n`'s is this plus `n`.
+const WAKE_SLOT: u64 = 2;
+
+/// Members of the wait set: the crash endpoint, the Notification, and each
+/// slot's endpoint.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "SLOTS is 16; the sum fits a u32 at compile time"
+)]
+const WAIT_SET_MEMBERS: u32 = 2 + SLOTS as u32;
 
 /// How long crashd waits before it waits on its wait set again after the
 /// wait failed with an error a retry does not clear at once.
@@ -151,7 +167,7 @@ impl Hold
             };
             *slot = cap;
         }
-        let capacity = 2;
+        let capacity = WAIT_SET_MEMBERS;
         let wait_set = std::os::seraph::object_slab_retype(
             std::os::seraph::wait_set_retype_bytes(u64::from(capacity)),
             |s| syscall::wait_set_create(s, capacity).ok(),
@@ -211,6 +227,13 @@ impl Hold
                     {
                         self.dispatch(&msg, policy, authority, ipc_buf);
                     }
+                }
+                // A held fault reached its slot's endpoint; a fall of the
+                // level is acted on at the loop's top.
+                Ok(badge) if (WAKE_SLOT..WAKE_SLOT + SLOTS as u64).contains(&badge) =>
+                {
+                    let slot = usize::try_from(badge - WAKE_SLOT).unwrap_or(usize::MAX);
+                    self.arrived(slot);
                 }
                 // A change of the level, read at the loop's top; then a
                 // deadline, or a late upcall of the watchdog's.
@@ -327,7 +350,7 @@ impl Hold
         if let Err(e) = unsafe { ipc::ipc_reply(&redirect, ipc_buf) }
         {
             // The reply claimed the fault: it is unhandled, its thread killed.
-            let _ = self.holds.end(slot, Why::Due, Found::Nothing);
+            let _ = self.holds.cancel(slot);
             bounded(|| {
                 std::os::seraph::log!(
                     warn: "fault badge={} addr={:#x} not held: redirect failed (err={e})",
@@ -341,6 +364,16 @@ impl Hold
         {
             *cell = Some(fault);
         }
+        // Until the fault arrives, a fall of the level does not end the hold;
+        // without the membership its arrival goes unseen, and the hold ends
+        // at its deadline.
+        let badge = WAKE_SLOT + u64::try_from(slot).unwrap_or(u64::MAX);
+        if let Err(e) = syscall::wait_set_add(self.wait_set, target, badge)
+        {
+            bounded(|| {
+                std::os::seraph::log!(warn: "hold slot {slot} not watched (err={e})");
+            });
+        }
         bounded(|| {
             std::os::seraph::log!(
                 "fault badge={} addr={:#x} held: memory critical (reason={}), up to {stall_ms} ms",
@@ -351,7 +384,8 @@ impl Hold
         });
     }
 
-    /// End every hold: the level fell below `CRITICAL`.
+    /// End every hold whose fault has arrived: the level fell below
+    /// `CRITICAL`.
     fn end_all(&mut self, policy: &Policy, authority: u64, ipc_buf: *mut u64)
     {
         for slot in 0..SLOTS
@@ -362,7 +396,9 @@ impl Hold
 
     /// End the hold in `slot` because `why`: receive its fault from the slot's
     /// endpoint, and resume it, or report and decline it, or, when it is no
-    /// longer queued there, free the slot.
+    /// longer queued there, free the slot, or, when it has not arrived by its
+    /// deadline, replace the slot's endpoint. A fall of the level before the
+    /// fault arrived leaves the hold as it is.
     fn end(&mut self, slot: usize, why: Why, policy: &Policy, authority: u64, ipc_buf: *mut u64)
     {
         let Some(&target) = self.endpoints.get(slot)
@@ -390,6 +426,8 @@ impl Hold
         {
             *cell = None;
         }
+        // Not a member once its fault arrived; the error is then ignored.
+        let _ = syscall::wait_set_remove(self.wait_set, target);
         match ended
         {
             Ended::Resume(held) =>
@@ -428,6 +466,61 @@ impl Hold
                     );
                 });
             }
+            Ended::Undelivered(held) =>
+            {
+                bounded(|| {
+                    std::os::seraph::log!(
+                        warn: "fault badge={} addr={:#x} not delivered to its hold in {} ms; \
+                               slot {slot} endpoint replaced",
+                        fault.badge,
+                        fault.addr(),
+                        held_ms(&held)
+                    );
+                });
+                self.replace(slot);
+            }
+        }
+    }
+
+    /// Record that `slot`'s fault reached its endpoint, and take the endpoint
+    /// out of the wait set, which would otherwise return it on every wait
+    /// while the fault waits there.
+    fn arrived(&mut self, slot: usize)
+    {
+        let Some(&target) = self.endpoints.get(slot)
+        else
+        {
+            return;
+        };
+        let _ = syscall::wait_set_remove(self.wait_set, target);
+        self.holds.arrived(slot);
+    }
+
+    /// Give `slot` a new endpoint in place of the one its undelivered fault
+    /// was redirected to. crashd's cap and the wait set's membership go, so
+    /// a late delivery's own reference is that endpoint's last, and the fault
+    /// is released unhandled when it parks there
+    /// (docs/fault-handling.md § Liveness, rule 1). With no new endpoint the
+    /// slot is retired.
+    fn replace(&mut self, slot: usize)
+    {
+        let Some(cell) = self.endpoints.get_mut(slot)
+        else
+        {
+            return;
+        };
+        let _ = syscall::wait_set_remove(self.wait_set, *cell);
+        delete_caps(&[*cell]);
+        *cell = std::os::seraph::object_slab_retype(std::os::seraph::ENDPOINT_RETYPE_BYTES, |s| {
+            syscall::cap_create_endpoint(s).ok()
+        })
+        .unwrap_or(0);
+        if *cell == 0
+        {
+            self.holds.retire(slot);
+            bounded(|| {
+                std::os::seraph::log!(warn: "hold slot {slot} retired: no endpoint made");
+            });
         }
     }
 }

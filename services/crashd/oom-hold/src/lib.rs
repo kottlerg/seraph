@@ -14,9 +14,13 @@
 //! repeat: held again only until its first hold's deadline while the level is
 //! `CRITICAL`, and declined at once otherwise, so no fault loops and the holds
 //! of one fault total at most the stall
-//! (`services/crashd/docs/operation.md` § Hold). A held fault the kernel
-//! withdraws from its slot (a stop, a destroy, a rebind) ends with nothing
-//! to answer and is not remembered. The state takes the time as an argument
+//! (`services/crashd/docs/operation.md` § Hold). A redirected fault reaches
+//! its slot's endpoint only when its thread next runs, so a hold ends on a
+//! fall of the level only once its fault has arrived ([`Holds::arrived`]). A
+//! held fault the kernel withdraws from its slot after it arrived (a stop, a
+//! destroy, a rebind) ends with nothing to answer and is not remembered; one
+//! that has not arrived when its stall passes is undelivered, and its slot's
+//! endpoint is replaced before the slot is used again. The state takes the time as an argument
 //! and holds no capability, so it is host-tested; crashd keeps each held
 //! fault's message and endpoint beside its slot.
 
@@ -146,6 +150,8 @@ pub struct Held
     /// When the stall passes: the hold's own, or for a repeat its first
     /// hold's.
     pub deadline: u64,
+    /// Whether the fault has been seen queued on the slot's endpoint.
+    pub arrived: bool,
 }
 
 /// Why crashd ends a hold ([`Holds::end`]).
@@ -164,7 +170,8 @@ pub enum Found
 {
     /// The held fault, whose reply crashd now holds.
     Fault,
-    /// Nothing: the fault was withdrawn while held.
+    /// Nothing: the fault has not arrived yet, or was withdrawn after it
+    /// arrived.
     Nothing,
 }
 
@@ -176,9 +183,13 @@ pub enum Ended
     Resume(Held),
     /// Report and decline the fault: its stall passed.
     Decline(Held),
-    /// The fault was no longer queued on the slot's endpoint; nothing to
-    /// answer.
+    /// The fault arrived and was no longer queued on the slot's endpoint;
+    /// nothing to answer.
     Withdrawn(Held),
+    /// The stall passed before the fault arrived: it may still reach the
+    /// slot's endpoint, which crashd replaces before the slot holds another
+    /// fault.
+    Undelivered(Held),
 }
 
 /// A fault crashd resumed, remembered until its hold's deadline.
@@ -196,6 +207,8 @@ pub struct Holds
 {
     stall_ms: u64,
     held: [Option<Held>; SLOTS],
+    /// Slots crashd took out of use, their endpoints gone ([`Holds::retire`]).
+    retired: [bool; SLOTS],
     resumed: [Option<Resumed>; SLOTS],
 }
 
@@ -208,6 +221,7 @@ impl Holds
         Self {
             stall_ms,
             held: [None; SLOTS],
+            retired: [false; SLOTS],
             resumed: [None; SLOTS],
         }
     }
@@ -244,8 +258,10 @@ impl Holds
         let Some((slot, free)) = self
             .held
             .iter_mut()
+            .zip(self.retired)
             .enumerate()
-            .find(|(_, held)| held.is_none())
+            .find(|(_, (held, retired))| held.is_none() && !retired)
+            .map(|(slot, (free, _))| (slot, free))
         else
         {
             return Admit::Decline(Refusal::SlotsFull);
@@ -254,24 +270,63 @@ impl Holds
             key,
             since: now,
             deadline,
+            arrived: false,
         });
         Admit::Hold { slot, deadline }
     }
 
+    /// Record that the fault held in `slot` was seen queued on the slot's
+    /// endpoint.
+    pub fn arrived(&mut self, slot: usize)
+    {
+        if let Some(Some(held)) = self.held.get_mut(slot)
+        {
+            held.arrived = true;
+        }
+    }
+
+    /// Free `slot` with nothing to end: the redirect that would have queued
+    /// its fault failed.
+    pub fn cancel(&mut self, slot: usize) -> Option<Held>
+    {
+        self.held.get_mut(slot).and_then(Option::take)
+    }
+
+    /// Take `slot` out of use: crashd could not replace its endpoint after an
+    /// undelivered fault.
+    pub fn retire(&mut self, slot: usize)
+    {
+        if let Some(retired) = self.retired.get_mut(slot)
+        {
+            *retired = true;
+        }
+    }
+
     /// End the hold in `slot` because `why`, with what crashd's receive
-    /// `found` on the slot's endpoint, and free the slot; `None` when it
-    /// held no fault. A fault not found was withdrawn from the endpoint while
-    /// held: its thread was stopped (a debugger's attach), destroyed with its
-    /// process, or its exception class rebound, and the kernel ended or
-    /// redelivered it, so crashd neither replies to it nor remembers it. A
-    /// fault resumed when the level fell is remembered for the repeat rule
-    /// until its deadline.
+    /// `found` on the slot's endpoint, and free the slot; `None` when it held
+    /// no fault, or when the level fell before the fault arrived, which keeps
+    /// the hold until the fault arrives or its deadline passes.
+    ///
+    /// A fault found is resumed when the level fell, and remembered for the
+    /// repeat rule until its deadline, or declined when its deadline passed.
+    /// Nothing found after the fault arrived means it was withdrawn: its
+    /// thread was stopped (a debugger's attach), destroyed with its process,
+    /// or its exception class rebound, and the kernel ended or redelivered
+    /// it, so crashd neither replies to it nor remembers it. Nothing found
+    /// at the deadline before the fault arrived leaves it undelivered.
     pub fn end(&mut self, slot: usize, why: Why, found: Found) -> Option<Ended>
     {
-        let held = self.held.get_mut(slot).and_then(Option::take)?;
+        let cell = self.held.get_mut(slot)?;
+        let held = (*cell)?;
+        if let (Found::Nothing, false, Why::LevelFell) = (found, held.arrived, why)
+        {
+            return None;
+        }
+        *cell = None;
         Some(match (found, why)
         {
-            (Found::Nothing, _) => Ended::Withdrawn(held),
+            (Found::Nothing, _) if held.arrived => Ended::Withdrawn(held),
+            (Found::Nothing, _) => Ended::Undelivered(held),
             (Found::Fault, Why::LevelFell) =>
             {
                 self.remember(held.key, held.deadline);
@@ -616,6 +671,7 @@ mod tests
             {
                 panic!("not held");
             };
+            holds.arrived(slot);
             let Some(Ended::Withdrawn(held)) = holds.end(slot, why, Found::Nothing)
             else
             {
@@ -634,10 +690,105 @@ mod tests
                 deadline: 100 + STALL
             }
         );
+        holds.arrived(0);
         let _ = holds.end(0, Why::Due, Found::Nothing);
         assert_eq!(
             holds.admit(200, key(1), Level::BelowCritical),
             Admit::Resume
+        );
+    }
+
+    #[test]
+    fn a_fall_of_the_level_before_the_fault_arrives_keeps_the_hold()
+    {
+        // crashd's redirect reply returned, but the faulting thread has not
+        // run since: its fault is not queued on the slot's endpoint yet.
+        let mut holds = Holds::new(STALL);
+        let Admit::Hold { slot, deadline } = holds.admit(0, key(1), Level::Critical)
+        else
+        {
+            panic!("not held");
+        };
+        assert_eq!(holds.end(slot, Why::LevelFell, Found::Nothing), None);
+        assert_eq!(holds.held_slots().collect::<Vec<_>>(), [slot]);
+        assert_eq!(holds.next_deadline(), Some(deadline));
+        // The fault arrives and is resumed.
+        holds.arrived(slot);
+        assert!(matches!(
+            holds.end(slot, Why::LevelFell, Found::Fault),
+            Some(Ended::Resume(_))
+        ));
+        // A receive that finds the fault before its arrival was seen resumes
+        // it too.
+        let Admit::Hold { slot, .. } = holds.admit(10, key(2), Level::Critical)
+        else
+        {
+            panic!("not held");
+        };
+        assert!(matches!(
+            holds.end(slot, Why::LevelFell, Found::Fault),
+            Some(Ended::Resume(_))
+        ));
+    }
+
+    #[test]
+    fn a_fault_not_arrived_at_its_deadline_is_undelivered_and_not_remembered()
+    {
+        let mut holds = Holds::new(STALL);
+        let Admit::Hold { slot, .. } = holds.admit(0, key(1), Level::Critical)
+        else
+        {
+            panic!("not held");
+        };
+        assert_eq!(holds.due(STALL), Some(slot));
+        let Some(Ended::Undelivered(held)) = holds.end(slot, Why::Due, Found::Nothing)
+        else
+        {
+            panic!("not undelivered");
+        };
+        assert_eq!(held.key, key(1));
+        assert_eq!(holds.next_deadline(), None);
+        // The slot is free again, its endpoint replaced by crashd; the same
+        // thread faulting afresh is a first fault.
+        assert_eq!(
+            holds.admit(STALL + 1, key(1), Level::Critical),
+            Admit::Hold {
+                slot,
+                deadline: 2 * STALL + 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_retired_slot_holds_no_fault_and_a_cancelled_one_is_reused()
+    {
+        let mut holds = Holds::new(STALL);
+        holds.retire(0);
+        let Admit::Hold { slot, .. } = holds.admit(0, key(1), Level::Critical)
+        else
+        {
+            panic!("not held");
+        };
+        assert_eq!(slot, 1);
+        assert_eq!(holds.cancel(slot).map(|h| h.key), Some(key(1)));
+        assert_eq!(holds.held_slots().count(), 0);
+        assert_eq!(
+            holds.admit(1, key(2), Level::Critical),
+            Admit::Hold {
+                slot: 1,
+                deadline: 1 + STALL
+            }
+        );
+        for badge in 3..=(SLOTS as u64)
+        {
+            assert!(matches!(
+                holds.admit(2, key(badge), Level::Critical),
+                Admit::Hold { .. }
+            ));
+        }
+        assert_eq!(
+            holds.admit(3, key(99), Level::Critical),
+            Admit::Decline(Refusal::SlotsFull)
         );
     }
 }

@@ -100,23 +100,32 @@ exception class; crashd handles each such fault at once. A holdable fault that a
   [docs/fault-handling.md](../../../docs/fault-handling.md) § Reply) to that slot's endpoint, with
   the slot as its reason word. crashd keeps the fault's message as it arrived and logs
   `fault badge=<badge> addr=<addr> held: memory critical (reason=<code>), up to <stall> ms`. The
-  thread stays fault-blocked, queued on that endpoint; no thread of crashd waits on it, so crashd
-  goes on receiving and reporting other faults;
+  thread stays fault-blocked, and its fault reaches that endpoint when the thread next runs, to
+  wait there queued; no thread of crashd waits on it, so crashd goes on receiving and reporting
+  other faults. The endpoint is in crashd's wait set from the redirect until the fault arrives;
 - at `CRITICAL` with every slot taken is logged `not held: no free hold slot` as a warning, then
   reported and declined;
 - below `CRITICAL`, the level having fallen between memmgr's decline and crashd's receive, is
   resumed at once (`FAULT_REPLY_RESUME`), logged `resumed at once: memory no longer critical`.
 
-When the level falls below `CRITICAL`, crashd receives each held fault from its endpoint without
-blocking and resumes it, logging `resumed after <ms> ms: memory no longer critical`; the thread
-retries its access, which faults into memmgr again. When a hold's deadline passes first, crashd
-receives that fault, logs `hold timed out after <ms> ms` as a warning, and reports and declines it
-as [Per Fault](#per-fault) does, from the message it kept. A receive that finds nothing frees the
-slot with no answer, logged `withdrawn after <ms> ms held`: the fault left the endpoint while
-held, when a debugger's attach stopped the thread, which cancels its fault, the process was
-destroyed, or the thread's exception class was rebound, which delivers the fault again under the
-new binding ([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and
-Kill).
+When the level falls below `CRITICAL`, crashd receives each held fault that has arrived from its
+endpoint without blocking and resumes it, logging `resumed after <ms> ms: memory no longer
+critical`; the thread retries its access, which faults into memmgr again. A fault that has not
+arrived yet stays held, and is resumed when it arrives. When a hold's deadline passes first,
+crashd receives that fault, logs `hold timed out after <ms> ms` as a warning, and reports and
+declines it as [Per Fault](#per-fault) does, from the message it kept. A receive that finds
+nothing after the fault arrived frees the slot with no answer, logged `withdrawn after <ms> ms
+held`: the fault left the endpoint while held, when a debugger's attach stopped the thread, which
+cancels its fault, the process was destroyed, or the thread's exception class was rebound, which
+delivers the fault again under the new binding
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). A
+fault that has not arrived when its deadline passes (its thread was stopped or destroyed before
+it ran) is logged `not delivered to its hold in <ms> ms` as a warning, and crashd replaces the
+slot's endpoint with a new one, so a slot's endpoint only ever queues the fault crashd holds
+there. Should that fault reach the old endpoint later, its delivery holds the endpoint's last
+reference, and the fault is released unhandled, its thread killed with no report
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Liveness, rule 1). A slot whose new
+endpoint cannot be made is retired, logged, and holds no fault again until crashd restarts.
 
 crashd remembers each fault it resumed, by its badge and faulting page, until that fault's hold
 deadline, in 16 entries, the one that expires first replaced when they are full. A fault of the

@@ -25,6 +25,11 @@
 //!   `sysroot/tests/ktest`. Zero module entries. The bootloader's
 //!   `step4_parse_bundle` treats this as a monolithic ktest boot per
 //!   `boot_protocol::bundle::INIT_ENTRY_NAME` semantics.
+//!
+//! Every ELF entry is signed as it is packed ([`crate::signing`]): `init` as
+//! kind init, each module as a boot module, each under its entry name. The
+//! platform tables and the log-level configuration carry no trailer, since
+//! their readers do not yet split one off (docs/signing.md § Signing).
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
@@ -32,9 +37,11 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Context, Result};
 use boot_protocol::bundle as fmt;
+use objsig::Kind;
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;
+use crate::signing::Signer;
 use crate::util::step;
 
 crate::argparse::value_enum! {
@@ -159,6 +166,8 @@ pub fn compose_with_levels(
 {
     let out_path = ctx.sysroot_efi_seraph().join("bootstrap.bundle");
     let entries = entries(ctx, arch, harness, levels)?;
+    let signer = Signer::open(ctx, arch)?;
+    let bodies = bodies(&signer, &entries)?;
 
     let parent = out_path
         .parent()
@@ -168,7 +177,7 @@ pub fn compose_with_levels(
 
     let entry_count =
         u32::try_from(entries.len()).context("compose-bundle: too many entries for u32")?;
-    write_bundle(&out_path, entry_count, &entries)?;
+    write_bundle(&out_path, entry_count, &bodies)?;
 
     step(&format!(
         "Bundle: {} ({} entries, harness={:?})",
@@ -179,16 +188,36 @@ pub fn compose_with_levels(
     Ok(())
 }
 
-/// The `(bundle_entry_name, source_path)` entries of `harness`'s bundle for
-/// `arch`, in bundle order, with `levels` as the source of the
-/// [`LOG_LEVELS_ENTRY`] entry of a `Harness::Init` bundle. Fails naming the
-/// first source that does not exist.
-fn entries(
-    ctx: &BuildContext,
-    arch: Arch,
-    harness: Harness,
-    levels: &Path,
-) -> Result<Vec<(String, PathBuf)>>
+/// One entry of a bundle: its name, the file its body is read from, and the
+/// kind it is signed as.
+#[derive(Debug, PartialEq, Eq)]
+struct Entry
+{
+    name: String,
+    source: PathBuf,
+    /// `None` for a data entry (a platform table, the log-level
+    /// configuration), which carries no trailer until its reader splits one
+    /// off (docs/signing.md § Signing).
+    kind: Option<Kind>,
+}
+
+impl Entry
+{
+    fn new(name: &str, source: PathBuf, kind: Option<Kind>) -> Self
+    {
+        Self {
+            name: name.to_owned(),
+            source,
+            kind,
+        }
+    }
+}
+
+/// The entries of `harness`'s bundle for `arch`, in bundle order, with
+/// `levels` as the source of the [`LOG_LEVELS_ENTRY`] entry of a
+/// `Harness::Init` bundle. Fails naming the first source that does not
+/// exist.
+fn entries(ctx: &BuildContext, arch: Arch, harness: Harness, levels: &Path) -> Result<Vec<Entry>>
 {
     let init_src = ctx.sysroot.join(harness.init_source());
     if !init_src.exists()
@@ -199,9 +228,9 @@ fn entries(
         );
     }
 
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    let mut entries: Vec<Entry> = Vec::new();
     // Bundle entry named "init" sources from the chosen harness binary.
-    entries.push(("init".to_owned(), init_src));
+    entries.push(Entry::new("init", init_src, Some(Kind::Init)));
     if harness == Harness::Init
     {
         let arch_modules = ARCH_MODULES
@@ -218,7 +247,7 @@ fn entries(
                     p.display()
                 );
             }
-            entries.push(((*name).to_owned(), p));
+            entries.push(Entry::new(name, p, Some(Kind::BootModule)));
         }
         for (_, name, source) in ARCH_TABLES.iter().filter(|(a, _, _)| *a == arch)
         {
@@ -227,7 +256,7 @@ fn entries(
             {
                 crate::error::bail!("compose-bundle: platform table missing at {}", p.display());
             }
-            entries.push(((*name).to_owned(), p));
+            entries.push(Entry::new(name, p, None));
         }
         if !levels.exists()
         {
@@ -236,14 +265,37 @@ fn entries(
                 levels.display()
             );
         }
-        entries.push((LOG_LEVELS_ENTRY.to_owned(), levels.to_path_buf()));
+        entries.push(Entry::new(LOG_LEVELS_ENTRY, levels.to_path_buf(), None));
     }
     Ok(entries)
 }
 
-/// Write the bundle file: header, per-entry headers, then bodies aligned
-/// to [`fmt::BODY_ALIGNMENT`].
-fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> Result<()>
+/// The `(name, body)` of each of `entries`: its source's bytes, signed by
+/// `signer` as its kind under its name when it has one. A source that
+/// already carries a trailer (an image the sysroot holds signed as a
+/// service) is signed from its body.
+fn bodies(signer: &Signer, entries: &[Entry]) -> Result<Vec<(String, Vec<u8>)>>
+{
+    entries
+        .iter()
+        .map(|entry| {
+            let bytes = fs::read(&entry.source)
+                .with_context(|| format!("compose-bundle: read {}", entry.source.display()))?;
+            let body = match entry.kind
+            {
+                Some(kind) => signer
+                    .sign(&bytes, kind, &entry.name)
+                    .with_context(|| format!("compose-bundle: sign {}", entry.source.display()))?,
+                None => bytes,
+            };
+            Ok((entry.name.clone(), body))
+        })
+        .collect()
+}
+
+/// Write the bundle file of `(name, body)` entries: header, per-entry
+/// headers, then bodies aligned to [`fmt::BODY_ALIGNMENT`].
+fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, Vec<u8>)]) -> Result<()>
 {
     let mut out_file = fs::File::create(out)
         .with_context(|| format!("compose-bundle: create {}", out.display()))?;
@@ -270,11 +322,9 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> 
         .checked_add(header_table_len)
         .context("compose-bundle: bundle size overflows")?;
     let mut sizes: Vec<u64> = Vec::with_capacity(entries.len());
-    for (_, path) in entries
+    for (_, body) in entries
     {
-        let size = fs::metadata(path)
-            .with_context(|| format!("compose-bundle: stat {}", path.display()))?
-            .len();
+        let size = u64::try_from(body.len()).context("compose-bundle: bundle size overflows")?;
         cursor = align_up(cursor, fmt::BODY_ALIGNMENT)
             .context("compose-bundle: bundle size overflows")?;
         offsets.push(cursor);
@@ -310,16 +360,14 @@ fn write_bundle(out: &Path, entry_count: u32, entries: &[(String, PathBuf)]) -> 
     }
 
     // Bodies (aligned).
-    for ((_, path), &offset) in entries.iter().zip(offsets.iter())
+    for ((name, body), &offset) in entries.iter().zip(offsets.iter())
     {
         out_file
             .seek(SeekFrom::Start(offset))
             .context("compose-bundle: seek to body offset")?;
-        let bytes =
-            fs::read(path).with_context(|| format!("compose-bundle: read {}", path.display()))?;
         out_file
-            .write_all(&bytes)
-            .with_context(|| format!("compose-bundle: write body for {}", path.display()))?;
+            .write_all(body)
+            .with_context(|| format!("compose-bundle: write body for {name}"))?;
     }
 
     out_file
@@ -369,19 +417,16 @@ mod tests
         dir
     }
 
-    // Defect caught: a default-init bundle without the log-level
-    // configuration, or with the committed file where a harness asked for its
-    // own, so init boots every service at info whatever was configured.
-    #[test]
-    fn an_init_bundle_carries_the_log_level_configuration_it_is_given()
+    /// A build context in `root` whose sysroot holds every source of
+    /// `arch`'s default-init bundle, and a log-level configuration; returns
+    /// the context and the configuration's path.
+    fn init_fixture(root: &Path, arch: Arch) -> (BuildContext, PathBuf)
     {
-        let root = scratch("levels");
         let ctx = BuildContext {
-            root: root.clone(),
+            root: root.to_path_buf(),
             sysroot: root.join("sysroot"),
             target_dir: root.join("target"),
         };
-        let arch = Arch::Riscv64;
         let sources = std::iter::once("services/init")
             .chain(MODULES.iter().map(|(_, s)| *s))
             .chain(
@@ -404,12 +449,24 @@ mod tests
         }
         let levels = root.join("levels.conf");
         fs::write(&levels, b"vfsd = debug\n").unwrap();
+        (ctx, levels)
+    }
+
+    // Defect caught: a default-init bundle without the log-level
+    // configuration, or with the committed file where a harness asked for its
+    // own, so init boots every service at info whatever was configured.
+    #[test]
+    fn an_init_bundle_carries_the_log_level_configuration_it_is_given()
+    {
+        let root = scratch("levels");
+        let arch = Arch::Riscv64;
+        let (ctx, levels) = init_fixture(&root, arch);
 
         let init = entries(&ctx, arch, Harness::Init, &levels).expect("init entries");
         let found: Vec<&PathBuf> = init
             .iter()
-            .filter(|(name, _)| name == LOG_LEVELS_ENTRY)
-            .map(|(_, path)| path)
+            .filter(|entry| entry.name == LOG_LEVELS_ENTRY)
+            .map(|entry| &entry.source)
             .collect();
         assert_eq!(found, [&levels]);
 
@@ -418,7 +475,7 @@ mod tests
         fs::create_dir_all(ktest_src.parent().unwrap()).unwrap();
         fs::write(&ktest_src, b"elf").unwrap();
         let ktest = entries(&ctx, arch, Harness::Ktest, &levels).expect("ktest entries");
-        assert_eq!(ktest, [("init".to_owned(), ktest_src)]);
+        assert_eq!(ktest, [Entry::new("init", ktest_src, Some(Kind::Init))]);
 
         // A missing configuration is an error, as a missing module is.
         entries(&ctx, arch, Harness::Init, &root.join("absent.conf")).unwrap_err();
@@ -426,7 +483,58 @@ mod tests
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Two-file round trip: write a bundle from two tiny "binary" files,
+    // Defect caught: an executable entry packed unsigned, or signed as the
+    // wrong kind (a module as init, which the bootloader would refuse), or a
+    // data entry given a trailer its reader cannot split off.
+    #[test]
+    fn executable_entries_are_signed_by_role_and_data_entries_are_not()
+    {
+        let root = scratch("kinds");
+        let arch = Arch::Riscv64;
+        let (ctx, levels) = init_fixture(&root, arch);
+
+        let init = entries(&ctx, arch, Harness::Init, &levels).expect("init entries");
+        for entry in &init
+        {
+            let data = entry.name == LOG_LEVELS_ENTRY
+                || ARCH_TABLES.iter().any(|(_, name, _)| entry.name == *name);
+            let expected = match entry.name.as_str()
+            {
+                "init" => Some(Kind::Init),
+                _ if data => None,
+                _ => Some(Kind::BootModule),
+            };
+            assert_eq!(entry.kind, expected, "entry {}", entry.name);
+        }
+
+        // The bodies: the executable entries verify as their kind under their
+        // name; the data entries are their sources' bytes.
+        let signer = crate::signing::testing::signer(&root.join("keys"), arch);
+        let store = signer.store().to_vec();
+        let store = objsig::TrustStore::parse(&store).unwrap();
+        for ((name, body), entry) in bodies(&signer, &init).unwrap().iter().zip(&init)
+        {
+            let source = fs::read(&entry.source).unwrap();
+            match entry.kind
+            {
+                None => assert_eq!(body, &source, "entry {name}"),
+                Some(kind) =>
+                {
+                    let expect = objsig::Expectation {
+                        kinds: objsig::KindSet::of(&[kind]),
+                        name: name.as_bytes(),
+                        arch: objsig::Arch::Riscv64,
+                    };
+                    objsig::verify(body, &store, &expect).expect(name);
+                    assert_eq!(objsig::split(body).unwrap().body(), source.as_slice());
+                }
+            }
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Two-entry round trip: write a bundle of two tiny bodies,
     /// parse it back via the shared format reader, and verify each
     /// entry's name, offset alignment, and body bytes.
     #[test]
@@ -442,13 +550,11 @@ mod tests
         ));
         fs::create_dir_all(&tmp).unwrap();
 
-        let a_path = tmp.join("a");
-        let b_path = tmp.join("b");
-        fs::write(&a_path, b"alpha").unwrap();
-        fs::write(&b_path, b"beta--").unwrap();
-
         let out = tmp.join("bundle.bin");
-        let entries = vec![("init".to_owned(), a_path), ("svc".to_owned(), b_path)];
+        let entries = vec![
+            ("init".to_owned(), b"alpha".to_vec()),
+            ("svc".to_owned(), b"beta--".to_vec()),
+        ];
         write_bundle(&out, 2, &entries).expect("write_bundle");
 
         // Read back and parse.

@@ -85,6 +85,67 @@ pub enum BootError
     /// space, or an address selects no slot of a translation table
     /// (`paging::MapError::AddressRange`).
     MapAddressRange,
+
+    /// The trust store built into the bootloader does not parse
+    /// (docs/signing.md § Trust Store).
+    TrustStore(objsig::StoreError),
+
+    /// The verifier refused the kernel or a bundle entry
+    /// (docs/signing.md § Verifier Discipline): `object` is the name it was
+    /// verified under, `refusal` why.
+    SignatureRefused
+    {
+        /// The kernel's or the bundle entry's name.
+        object: ObjectName,
+        /// The verifier's refusal.
+        refusal: objsig::Refusal,
+    },
+}
+
+/// The name of an object the verifier refused, copied, so a [`BootError`]
+/// does not borrow the buffer the object was read into. A name longer than
+/// [`ObjectName::CAPACITY`] is cut at it.
+#[derive(Clone, Copy, Debug)]
+pub struct ObjectName
+{
+    bytes: [u8; Self::CAPACITY],
+    len: usize,
+}
+
+impl ObjectName
+{
+    /// The longest name kept: a bundle entry name's width.
+    pub const CAPACITY: usize = boot_protocol::BOOT_MODULE_NAME_LEN;
+
+    /// A copy of `name`, cut at [`Self::CAPACITY`] bytes.
+    pub fn new(name: &[u8]) -> Self
+    {
+        let mut bytes = [0u8; Self::CAPACITY];
+        let len = name.len().min(Self::CAPACITY);
+        for (out, &byte) in bytes.iter_mut().zip(name)
+        {
+            *out = byte;
+        }
+        Self { bytes, len }
+    }
+
+    /// The name's bytes.
+    pub fn as_bytes(&self) -> &[u8]
+    {
+        self.bytes.get(..self.len).unwrap_or_default()
+    }
+}
+
+impl core::fmt::Display for ObjectName
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+    {
+        match core::str::from_utf8(self.as_bytes())
+        {
+            Ok(name) => f.write_str(name),
+            Err(_) => f.write_str("<a name that is not UTF-8>"),
+        }
+    }
 }
 
 impl From<elf::ElfError> for BootError
@@ -134,7 +195,9 @@ impl BootError
             | BootError::PagingModeUnsupported
             | BootError::MemoryMapKeptGrowing(_)
             | BootError::ReclaimRangesOverflow
-            | BootError::MapAddressRange => None,
+            | BootError::MapAddressRange
+            | BootError::TrustStore(_)
+            | BootError::SignatureRefused { .. } => None,
         }
     }
 
@@ -165,6 +228,8 @@ impl BootError
             BootError::InvalidMemoryMap(_) => "UEFI memory map violates the UEFI contract",
             BootError::ReclaimRangesOverflow => "reclaim_ranges overflow (MAX_RECLAIM_ENTRIES)",
             BootError::MapAddressRange => "a range to map runs past the end of the address space",
+            BootError::TrustStore(_) => "the trust store built into the bootloader does not parse",
+            BootError::SignatureRefused { .. } => "signature verification refused",
         }
     }
 }
@@ -185,6 +250,14 @@ impl core::fmt::Display for BootError
         if let BootError::MemoryMapKeptGrowing(reach) = self
         {
             write!(f, ": a buffer of {reach} descriptors on the last attempt")?;
+        }
+        if let BootError::TrustStore(err) = self
+        {
+            write!(f, ": {err:?}")?;
+        }
+        if let BootError::SignatureRefused { object, refusal } = self
+        {
+            write!(f, ": {object}: {refusal:?}")?;
         }
         Ok(())
     }
@@ -229,6 +302,11 @@ mod tests
             BootError::InvalidMemoryMap("m"),
             BootError::ReclaimRangesOverflow,
             BootError::MapAddressRange,
+            BootError::TrustStore(objsig::StoreError::Magic),
+            BootError::SignatureRefused {
+                object: ObjectName::new(b"kernel"),
+                refusal: objsig::Refusal::Untrusted,
+            },
         ];
         for v in variants
         {
@@ -282,6 +360,24 @@ mod tests
         );
     }
 
+    // Defect caught: a refusal whose fatal line does not name the object and
+    // the check it failed, which a boot log reader needs to tell a tampered
+    // image from an untrusted one.
+    #[test]
+    fn a_signature_refusal_names_the_object_and_the_refusal()
+    {
+        let err = BootError::SignatureRefused {
+            object: ObjectName::new(b"platform-qemu-virt"),
+            refusal: objsig::Refusal::Failed(objsig::RecordFailure::BodyHash),
+        };
+        assert_eq!(
+            std::format!("{err}"),
+            "signature verification refused: platform-qemu-virt: Failed(BodyHash)"
+        );
+        let long = ObjectName::new(&[b'a'; 40]);
+        assert_eq!(long.as_bytes().len(), ObjectName::CAPACITY);
+    }
+
     // ── detail() — variants without string payloads return None ──────────────
 
     #[test]
@@ -294,6 +390,7 @@ mod tests
             BootError::ExitBootServicesFailed,
             BootError::PagingModeUnsupported,
             BootError::MapAddressRange,
+            BootError::TrustStore(objsig::StoreError::Magic),
         ];
         for v in no_detail
         {

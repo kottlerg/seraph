@@ -26,8 +26,10 @@ name = "boot"
 version = "0.1.4"
 dependencies = [
  "boot-protocol",
+ "crypto",
  "elf",
  "font",
+ "objsig",
  "text",
 ]
 
@@ -200,6 +202,7 @@ dependencies = [
  "aml",
  "driver-binding",
  "ipc",
+ "objsig",
  "svc-grammar",
  "syscall-abi",
  "virtio-core",
@@ -311,6 +314,7 @@ dependencies = [
 name = "init"
 version = "0.1.4"
 dependencies = [
+ "boot-protocol",
  "elf",
  "init-log-levels",
  "init-protocol",
@@ -332,6 +336,7 @@ name = "init-log-levels"
 version = "0.1.4"
 dependencies = [
  "log",
+ "objsig",
 ]
 
 [[package]]
@@ -552,6 +557,7 @@ dependencies = [
  "elf",
  "ipc",
  "namespace-protocol",
+ "objsig",
  "process-abi",
  "process-layout",
  "procmgr-process-table",

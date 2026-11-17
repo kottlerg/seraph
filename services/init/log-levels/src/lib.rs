@@ -12,7 +12,12 @@
 //! comment that runs to the end of its line; blank lines and the ASCII
 //! whitespace around each field are ignored. A line that is not a setting is
 //! reported and ignored, and a later setting of a service replaces an earlier
-//! one. The crate performs no IPC and issues no syscalls, so it stays
+//! one.
+//!
+//! The module is a signed object (docs/signing.md): the configuration is its
+//! body, which [`parse_module`] takes through the parse-only
+//! `objsig::split`, since the bootloader verified the module before it
+//! exposed it. The crate performs no IPC and issues no syscalls, so it stays
 //! host-testable
 //! ([coding-standards.md](../../../../docs/coding-standards.md#d-testing-invariants)).
 
@@ -150,6 +155,23 @@ pub fn parse(text: &[u8], mut on_error: impl FnMut(&[u8], LineError)) -> Levels
     levels
 }
 
+/// Parse the `log-levels` boot module `module`: the configuration its body
+/// holds, as [`parse`] reads it. The bootloader verified the module, so its
+/// trailer is split off with the parse checks alone (docs/signing.md
+/// § Verifier Discipline).
+///
+/// # Errors
+/// The `objsig::ParseError` of a module whose trailer does not parse, an
+/// unsigned module among them; its body is not read.
+pub fn parse_module(
+    module: &[u8],
+    on_error: impl FnMut(&[u8], LineError),
+) -> Result<Levels, objsig::ParseError>
+{
+    let signed = objsig::split(module)?;
+    Ok(parse(signed.body(), on_error))
+}
+
 /// The setting `line` (non-empty, comment removed, trimmed) makes.
 fn parse_setting(line: &[u8]) -> Result<(Service, u64), LineError>
 {
@@ -201,6 +223,49 @@ mod tests
             errs.push((String::from_utf8_lossy(line).into_owned(), e));
         });
         (levels, errs)
+    }
+
+    /// `body` with a trailer that parses: one record whose signature is not
+    /// checked, as the parse-only split does not check it.
+    fn signed(body: &[u8]) -> Vec<u8>
+    {
+        let record = objsig::RecordSpec {
+            signer_key_id: [1; objsig::KEY_ID_LEN],
+            attrs: objsig::Attributes {
+                body_len: u64::try_from(body.len()).unwrap(),
+                security_version: 1,
+                kind: objsig::Kind::BootModule,
+                arch: objsig::Arch::X86_64,
+                body_hash: [0; 64],
+                name: b"log-levels",
+            },
+            certificate: None,
+            signature: [0; 64],
+        };
+        let mut trailer = vec![0u8; objsig::trailer_len(&[record]).unwrap()];
+        objsig::encode_trailer(body, &[record], &mut trailer).unwrap();
+        [body, trailer.as_slice()].concat()
+    }
+
+    // Defect caught: a module whose trailer is read as configuration lines,
+    // or an unsigned or malformed module read as configuration.
+    #[test]
+    fn a_module_s_body_is_its_configuration()
+    {
+        let module = signed(b"vfsd = debug\n");
+        let levels = parse_module(&module, |line, e| {
+            panic!("unexpected error {e:?} on {line:?}")
+        })
+        .unwrap();
+        assert_eq!(levels.get(Service::Vfsd), Some(debug()));
+        assert_eq!(
+            parse_module(b"vfsd = debug # an unsigned module\n", |_, _| {}),
+            Err(objsig::ParseError::Magic)
+        );
+        let mut broken = module.clone();
+        let last = broken.len() - 1;
+        broken[last] ^= 1;
+        parse_module(&broken, |_, _| {}).unwrap_err();
     }
 
     // Defect caught: a default configuration that changes some service's

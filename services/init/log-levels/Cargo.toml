@@ -10,6 +10,8 @@ publish.workspace = true
 [dependencies]
 # `parse_level`: the level names a `SERAPH_LOG` entry takes.
 log = { path = "../../../shared/log" }
+# `split`: the module is a signed object, whose body is the configuration.
+objsig = { path = "../../../shared/objsig" }
 
 [lints]
 workspace = true

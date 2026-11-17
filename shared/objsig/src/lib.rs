@@ -20,12 +20,14 @@
 //! - [`attrs`]: the signed attributes a record's signature covers.
 //! - [`cert`]: the fixed-layout certificate a root issues to a signing key.
 //! - [`store`]: the trust store: anchors, revoked key ids, security floor.
+//! - [`embed`]: the trust store as the bootloader image embeds it.
 //! - [`verify()`]: the verifier and its policy.
 
 #![no_std]
 
 pub mod attrs;
 pub mod cert;
+pub mod embed;
 pub mod store;
 pub mod trailer;
 pub mod verify;

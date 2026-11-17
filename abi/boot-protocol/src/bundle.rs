@@ -7,9 +7,11 @@
 //!
 //! The bundle is a single ESP file that packs the userspace init binary and
 //! every boot module into one contiguous container. The bootloader reads the
-//! file, parses this header layout, ELF-loads the entry named [`INIT_ENTRY_NAME`]
-//! into [`crate::BootInfo::init_image`], and exposes the remaining entries
-//! verbatim through [`crate::BootInfo::modules`] using the same name strings.
+//! file, parses this header layout, verifies every entry as a signed object
+//! (docs/signing.md), ELF-loads the body of the entry named
+//! [`INIT_ENTRY_NAME`] into [`crate::BootInfo::init_image`], and exposes the
+//! remaining entries verbatim, trailers included, through
+//! [`crate::BootInfo::modules`] using the same name strings.
 //!
 //! Layout (little-endian, packed by [`BundleHeader`] field order):
 //!
@@ -51,7 +53,9 @@ pub const BODY_ALIGNMENT: u64 = 4096;
 /// The bootloader ELF-parses the entry whose name matches this constant
 /// (after NUL trimming) and places the result in
 /// [`crate::BootInfo::init_image`]. Exactly one entry MUST carry this
-/// name; absence is a hard boot failure.
+/// name; absence is a hard boot failure. No entry may carry the name
+/// [`crate::TRUST_STORE_MODULE`], which the bootloader reserves for the
+/// module it adds.
 pub const INIT_ENTRY_NAME: &[u8] = b"init";
 
 /// On-disk size of [`BundleHeader`] in bytes.

@@ -28,7 +28,8 @@ pwrmgr/
 pwrmgr owns the shutdown *interpretation* and *actuation* but holds no
 hardware caps of its own. devmgr is the hardware and ACPI authority, and AML is evaluated by
 acpid ([services/acpid/README.md](../acpid/README.md)), not by pwrmgr or devmgr; pwrmgr reads the
-FADT and the `\_S5_` package itself, and devmgr refuses acpid pwrmgr's ports;
+FADT and the `\_S5_` package itself. devmgr's region grants refuse acpid pwrmgr's ports,
+though it serves acpid the FADT's PM1a control block, whose `SCI_EN` bit acpid reads;
 pwrmgr acquires only what it needs from devmgr at startup, "as if it were
 a device driver":
 

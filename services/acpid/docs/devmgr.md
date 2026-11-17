@@ -26,12 +26,18 @@ Every capability is a derivation of one devmgr holds. The wire contract of each 
 
 ## Region grants
 
-acpid asks for a `SystemMemory` or `SystemIO` region's span (`ACPI_REGION_GRANT`) on its first
-field access. devmgr refuses, and logs the refusal with the range it collides with:
+acpid asks devmgr (`ACPI_REGION_GRANT`) for a `SystemIO` region's span on its first field
+access, and for a `SystemMemory` region the page an access reaches, on the first access to that
+page. devmgr refuses, and logs the refusal with the range it collides with:
 
 - a range overlapping a resource of any device record (a PCI BAR, a platform record's `Mmio` or
   `IoPort`), whether or not a driver has been started for it;
 - a port of pwrmgr's shutdown actuators;
+- the register window of each interrupt controller the MADT describes, which the kernel
+  programs (the local APIC, each I/O APIC, the APLIC, each hart's IMSIC interrupt file), and
+  on x86-64 the legacy ports the kernel owns: the two 8259s and their edge/level control
+  registers (0x20-0x21, 0xA0-0xA1, 0x4D0-0x4D1), the PIT (0x40-0x43) and its gate port 0x61,
+  and the COM1 console (0x3F8-0x3FF);
 - the configuration-mechanism ports 0xCF8-0xCFF, through which every function's configuration
   space is reachable;
 - the FACS, whose Global Lock and waking vector acpid does not own;
@@ -40,11 +46,12 @@ field access. devmgr refuses, and logs the refusal with the range it collides wi
   first three ([core/boot/docs/firmware-parsing.md](../../../core/boot/docs/firmware-parsing.md)
   § Firmware exclusion).
 
-Memory is checked rounded out to pages. A port grant is an `IoPort` over exactly the range; a
-memory grant is an `Mmio` over its pages, carved from an aperture. devmgr keeps the carved
-memory capability and hands acpid a derivation, so a restarted acpid is granted the same range
-again, as is a request inside a range already granted. A refused region fails the field access,
-and the method that made it aborts ([startup.md](startup.md) § Failures).
+A port grant is an `IoPort` over exactly the range. A memory grant is an `Mmio` over one page,
+carved from an aperture; a memory request that crosses a page boundary is invalid. devmgr keeps
+each carved page's capability and hands acpid a derivation, so a page is granted again to a
+restarted acpid, and whether a page is granted does not depend on which of two overlapping
+regions reached it first. A refused range fails the field access, and the method that made it
+aborts ([startup.md](startup.md) § Failures).
 
 ---
 
@@ -71,7 +78,8 @@ acpid pushes three results per PCI host bridge, named by its segment and bus:
   (read before `_PIC(1)`).
 
 devmgr keeps windows and routes only once they agree with its boot records, checked against
-each boot function on the bridge's buses:
+each boot function on the bridge's buses, those of its windows; a `PRT_TABLE` that comes before
+the bridge's windows are held is refused, as acpid pushes the windows first:
 
 - **Windows.** The windows hold exactly one bus window, which holds the bridge's bus and ends at
   or below bus 255. Each

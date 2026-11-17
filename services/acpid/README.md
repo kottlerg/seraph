@@ -58,12 +58,14 @@ acpid serves no requests yet: it provides no endpoint, and it idles once its sta
 acpid holds no hardware capability of its own. Its one capability, the `devmgr.acpi` seed,
 carries `ACPI_AUTHORITY`, under which devmgr serves it the FADT's register blocks and grants it,
 on first use, each `SystemIO` or `SystemMemory` operation region its AML reaches. devmgr
-refuses, logged, a range that a device record, a driver or pwrmgr holds, the
-configuration-mechanism ports 0xCF8-0xCFF, the FACS, and memory outside the `Mmio` apertures it
-still holds, which leaves out RAM and ACPI NVS. A field access in a refused region fails and its
-method aborts. `PCI_Config` regions are reached one access at a time through devmgr, which
-allows reads, and writes only at offset 0x40 and above of a function with no bound driver. The
-policy is [docs/devmgr.md](docs/devmgr.md) § Region grants and § Configuration access.
+refuses, logged, a range that a device record, a driver, pwrmgr or the kernel holds (the
+interrupt controllers and, on x86-64, the legacy ports it drives), the configuration-mechanism
+ports 0xCF8-0xCFF, the FACS, and memory outside the `Mmio` apertures it still holds, which
+leaves out RAM and ACPI NVS. Memory is granted a page at a time. A field access in a refused
+region fails and its method aborts. `PCI_Config` regions are reached one access at a time
+through devmgr, which allows reads, and writes only at offset 0x40 and above of a function with
+no bound driver. The policy is [docs/devmgr.md](docs/devmgr.md) § Region grants and
+§ Configuration access.
 
 ---
 

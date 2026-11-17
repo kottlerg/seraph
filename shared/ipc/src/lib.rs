@@ -2419,32 +2419,35 @@ pub mod devmgr_labels
     /// places it in the I/O space.
     pub const ACPI_RESET: u64 = 5;
 
-    /// Grant acpid an operation region it evaluated: a `SystemIO` or
-    /// `SystemMemory` range no device record, driver, or pwrmgr capability
-    /// holds.
+    /// Grant acpid part of an operation region it evaluated: a `SystemIO`
+    /// range, or the `SystemMemory` page an access reaches, that no device
+    /// record, driver, pwrmgr capability or the kernel holds.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
-    /// `data[1]` = the region space, [`ACPI_SPACE_MEMORY`] or
-    /// [`ACPI_SPACE_IO`]; `data[2]` = the region's base; `data[3]` = its
-    /// length. Caller's badge MUST carry [`ACPI_AUTHORITY`]; the handler
-    /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    /// `data[1]` = the space, [`ACPI_SPACE_MEMORY`] or [`ACPI_SPACE_IO`];
+    /// `data[2]` = the base; `data[3]` = the length. A memory request lies
+    /// within one page, and is granted that page. Caller's badge MUST carry
+    /// [`ACPI_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// devmgr refuses, logged, a range that overlaps a resource of any device
     /// record (a PCI BAR, a platform record's `Mmio` or `IoPort`), a port
-    /// pwrmgr holds, the configuration-mechanism ports 0xCF8-0xCFF, or the
-    /// FACS, and memory that no `Mmio` aperture devmgr still holds covers
-    /// (RAM, ACPI NVS, and the ranges devmgr has carved for itself or a
-    /// driver); memory is checked page-rounded. A memory grant is kept by
-    /// devmgr, so a range granted once is granted again to a restarted acpid.
-    /// The policy is services/acpid/README.md § Region grants.
+    /// pwrmgr holds, an interrupt controller the MADT describes or a legacy
+    /// port the kernel drives, the configuration-mechanism ports 0xCF8-0xCFF,
+    /// or the FACS, and memory that no `Mmio` aperture devmgr still holds
+    /// covers (RAM, ACPI NVS, and the ranges devmgr has carved for itself or a
+    /// driver). A memory page granted is kept by devmgr, so it is granted
+    /// again to a restarted acpid. The policy is services/acpid/README.md
+    /// § Region grants.
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = an `IoPort`
-    /// over exactly the range, or an `Mmio` over its pages; `data[0]` = the
-    /// grant's base (the first page's address for memory); `data[1]` = its
-    /// length. Replies [`super::devmgr_errors::REFUSED`] for a refused range,
-    /// and [`super::devmgr_errors::INVALID_REQUEST`] for an unknown space, an
-    /// empty or overflowing range, a port range past 0xFFFF, or a failed carve
-    /// or derivation.
+    /// over exactly the range, or an `Mmio` over the page; `data[0]` = the
+    /// grant's base (the page's address for memory); `data[1]` = its length.
+    /// Replies [`super::devmgr_errors::REFUSED`] for a refused range, and
+    /// [`super::devmgr_errors::INVALID_REQUEST`] for a short request, an
+    /// unknown space, an empty or overflowing range, memory that crosses a
+    /// page boundary, a port range past 0xFFFF, or a failed carve or
+    /// derivation.
     pub const ACPI_REGION_GRANT: u64 = 25;
     /// [`ACPI_REGION_GRANT`] space: `SystemMemory` (ACPI address space 0).
     pub const ACPI_SPACE_MEMORY: u64 = 0;
@@ -2470,10 +2473,10 @@ pub mod devmgr_labels
     ///
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `data[0]` = the value read
     /// (0 for a write). Replies [`super::devmgr_errors::REFUSED`] for a
-    /// refused write, and [`super::devmgr_errors::INVALID_REQUEST`] for an
-    /// unknown operation, a width other than 1, 2 or 4, an offset not
-    /// aligned to the width or past the 4096-byte configuration space, or a
-    /// configuration page devmgr cannot map.
+    /// refused write, and [`super::devmgr_errors::INVALID_REQUEST`] for a
+    /// short request, an unknown operation, a width other than 1, 2 or 4, an
+    /// offset not aligned to the width or past the 4096-byte configuration
+    /// space, or a configuration page devmgr cannot map.
     pub const ACPI_PCI_CONFIG: u64 = 26;
     /// [`ACPI_PCI_CONFIG`] operation: read.
     pub const ACPI_CONFIG_READ: u64 = 0;
@@ -2507,8 +2510,8 @@ pub mod devmgr_labels
     /// devmgr keeps the first result of each bridge for the boot and logs a
     /// later one that differs from it, so an acpid restart cannot change a
     /// grant devmgr acts on. Reply: [`super::devmgr_errors::SUCCESS`];
-    /// [`super::devmgr_errors::INVALID_REQUEST`] for a bridge devmgr cannot
-    /// record.
+    /// [`super::devmgr_errors::INVALID_REQUEST`] for a short push or a
+    /// bridge devmgr cannot record.
     pub const OSC_RESULT: u64 = 27;
 
     /// Push the `_CRS` windows of one PCI host bridge from acpid: the buses,
@@ -2532,8 +2535,8 @@ pub mod devmgr_labels
     /// windows; [`super::devmgr_errors::REFUSED`], logged, for windows that
     /// fail the check, which is fail-closed: the bridge has no windows from
     /// acpid until a push passes; [`super::devmgr_errors::INVALID_REQUEST`]
-    /// for a count past [`MAX_BRIDGE_WINDOWS`], an unknown kind, or a bridge
-    /// devmgr cannot record.
+    /// for a count past [`MAX_BRIDGE_WINDOWS`], a push shorter than its count,
+    /// an unknown kind, or a bridge devmgr cannot record.
     pub const BRIDGE_WINDOWS: u64 = 28;
     /// The most windows one [`BRIDGE_WINDOWS`] push carries.
     pub const MAX_BRIDGE_WINDOWS: usize = 16;
@@ -2557,7 +2560,8 @@ pub mod devmgr_labels
     /// handler replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// devmgr checks one mode's table against the boot functions with an
-    /// interrupt pin on the bridge's root bus: on x86-64 the
+    /// interrupt pin on the buses of the bridge's windows ([`BRIDGE_WINDOWS`]),
+    /// each at the root-bus device and pin its interrupt reaches: on x86-64 the
     /// [`PRT_PIC_MODE`] table against each function's Interrupt Line
     /// register, which the firmware programmed in that model; on RISC-V the
     /// [`PRT_ROUTES`] table against the line devmgr gives each function. It
@@ -2569,8 +2573,8 @@ pub mod devmgr_labels
     /// the bridge has no table of the mode from acpid until a push passes.
     /// Reply: [`super::devmgr_errors::SUCCESS`] when devmgr holds the
     /// bridge's table of the mode; [`super::devmgr_errors::REFUSED`], logged,
-    /// for a table that fails the check or comes before the table it waits
-    /// for; [`super::devmgr_errors::INVALID_REQUEST`] for an unknown mode, a
+    /// for a table that fails the check or comes before the bridge's windows
+    /// or the table it waits for; [`super::devmgr_errors::INVALID_REQUEST`] for an unknown mode, a
     /// mode the architecture does not serve, a short push, or a bridge devmgr
     /// cannot record.
     pub const PRT_TABLE: u64 = 29;

@@ -51,6 +51,12 @@ pub fn run(devmgr: &Devmgr, aspace: u64)
     log_failures(&ev, &walk.failures);
     let (bridges, failures) = bridge::host_bridges(&mut ev, &walk.present);
     log_failures(&ev, &failures);
+    // devmgr checks a `_PRT` against the functions on the buses of the
+    // bridge's windows, so the windows go first.
+    for b in &bridges
+    {
+        push_windows(&mut ev, devmgr, *b);
+    }
     if let Some(model) = arch::current::APIC_MODEL
     {
         for b in &bridges
@@ -62,7 +68,6 @@ pub fn run(devmgr: &Devmgr, aspace: u64)
     for b in &bridges
     {
         push_osc(&mut ev, devmgr, *b);
-        push_windows(&mut ev, devmgr, *b);
         push_routes(&mut ev, devmgr, *b, devmgr_labels::PRT_ROUTES);
     }
     std::os::seraph::log!(

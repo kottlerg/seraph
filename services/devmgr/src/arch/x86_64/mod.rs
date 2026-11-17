@@ -168,6 +168,33 @@ pub fn pwrmgr_ports(firmware: &Firmware) -> Vec<firmware::acpid::Range>
         .collect()
 }
 
+/// The legacy ports of the interrupt controllers and timers the kernel owns,
+/// `(base, count)`: the two 8259s and their edge/level control registers,
+/// the PIT and the port-0x61 gate of its channel 2, which the kernel
+/// calibrates its timer against, and COM1, the kernel console.
+const KERNEL_PORTS: [(u16, u16); 6] = [
+    (0x20, 2),
+    (0xA0, 2),
+    (0x4D0, 2),
+    (0x40, 4),
+    (0x61, 1),
+    (0x3F8, 8),
+];
+
+/// The ports the kernel owns ([`KERNEL_PORTS`]). acpid is granted none of
+/// them.
+pub fn kernel_ports() -> Vec<firmware::acpid::Range>
+{
+    KERNEL_PORTS
+        .iter()
+        .map(|&(base, count)| firmware::acpid::Range {
+            space: firmware::acpid::Space::Io,
+            base: u64::from(base),
+            end: u64::from(base).saturating_add(u64::from(count)),
+        })
+        .collect()
+}
+
 /// The FADT's fixed register `block` and a narrow `IoPort` over it, for
 /// acpid (`QUERY_ACPI_RESOURCES`). `None` when the FADT cannot be read, it
 /// places no such block in the I/O space, or the carve fails.

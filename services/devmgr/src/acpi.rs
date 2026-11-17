@@ -150,6 +150,10 @@ pub fn decode(msg: &IpcMessage) -> Result<Request, u64>
         ))
     };
     let dword = |word: u64| u32::try_from(word).map_err(|_| invalid);
+    if firmware::acpid::request_words(msg.label, msg.word(3)).is_some_and(|n| msg.word_count() < n)
+    {
+        return Err(invalid);
+    }
     Ok(match msg.label
     {
         labels::ACPI_REGION_GRANT => Request::Region {
@@ -331,6 +335,25 @@ pub fn query_resources(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
     }
 }
 
+/// The ranges the kernel owns: the register window of each interrupt
+/// controller the MADT describes, rounded out to pages, and the ports of
+/// [`arch::current::kernel_ports`].
+fn kernel_ranges(firmware: &Firmware) -> Vec<Range>
+{
+    let windows = tables::locate_table_by_sig(firmware, *b"APIC")
+        .and_then(|madt| {
+            tables::with_acpi_table(firmware, madt, |bytes| {
+                firmware::acpi::madt_interrupt_controllers(bytes).map(Iterator::collect::<Vec<_>>)
+            })
+        })
+        .unwrap_or_default();
+    windows
+        .into_iter()
+        .filter_map(|(base, len)| firmware::acpid::grant_range(Space::Memory, base, len))
+        .chain(arch::current::kernel_ports())
+        .collect()
+}
+
 /// The control thread's side of acpid: the job channel's receiving end and
 /// the state its requests are decided against.
 pub struct AcpiService
@@ -343,6 +366,9 @@ pub struct AcpiService
     boot_apertures: Vec<(u64, u64)>,
     /// pwrmgr's ports, which no grant reaches.
     pwrmgr: Vec<Range>,
+    /// The interrupt controllers the MADT describes and the ports the kernel
+    /// owns, which no grant reaches.
+    kernel: Vec<Range>,
     /// The FACS, which no grant reaches.
     facs: Option<Range>,
 }
@@ -390,6 +416,7 @@ impl AcpiService
             bridges: firmware::acpid::Bridges::new(),
             boot_apertures,
             pwrmgr: arch::current::pwrmgr_ports(firmware),
+            kernel: kernel_ranges(firmware),
             facs,
         }
     }
@@ -479,8 +506,8 @@ impl AcpiService
     }
 
     /// `ACPI_REGION_GRANT`: refuse a range a holder overlaps; grant ports
-    /// from devmgr's `IoPort`; grant memory from a kept grant that holds it,
-    /// else carve it from the apertures and keep it.
+    /// from devmgr's `IoPort`; grant a memory page from the kept grant of
+    /// it, else carve it from the apertures and keep it.
     fn region(
         &mut self,
         space: Space,
@@ -490,7 +517,7 @@ impl AcpiService
         caps: &mut DevmgrCaps,
     ) -> Reply
     {
-        let Some(range) = firmware::acpid::grant_range(space, base, len)
+        let Some(range) = firmware::acpid::request_range(space, base, len)
         else
         {
             return Reply::status(errors::INVALID_REQUEST);
@@ -499,6 +526,7 @@ impl AcpiService
             &range,
             records.resource_ranges(),
             &self.pwrmgr,
+            &self.kernel,
             self.facs,
         );
         if let Some(refusal) = refusal
@@ -531,8 +559,9 @@ impl AcpiService
         }
     }
 
-    /// A memory grant of `range` (page-rounded): a derivation of the kept
-    /// grant that holds it, or of the cap newly carved and kept for it.
+    /// A memory grant of `range`, one page: a derivation of the kept grant
+    /// of it, or of the cap newly carved and kept for it. Grants are kept a
+    /// page at a time, so a page is either kept whole or not carved at all.
     fn memory(&mut self, range: &Range, caps: &mut DevmgrCaps) -> Reply
     {
         let derive = |kept: &Range, cap: u64| {

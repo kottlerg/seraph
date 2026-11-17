@@ -96,6 +96,32 @@ impl Range
     }
 }
 
+/// The `data` words an acpid request of `label` carries, the version word
+/// included, `count` being its word 3 (a `BRIDGE_WINDOWS` window count,
+/// taken at most [`ipc::devmgr_labels::MAX_BRIDGE_WINDOWS`]). A request
+/// shorter than this is malformed: a word it does not carry would read as 0.
+/// `None` for a label without a fixed layout here.
+#[must_use]
+pub fn request_words(label: u64, count: u64) -> Option<usize>
+{
+    use ipc::devmgr_labels as labels;
+    match label
+    {
+        labels::ACPI_REGION_GRANT => Some(4),
+        labels::ACPI_PCI_CONFIG => Some(6),
+        labels::OSC_RESULT => Some(7),
+        labels::BRIDGE_WINDOWS =>
+        {
+            let windows = usize::try_from(count)
+                .unwrap_or(usize::MAX)
+                .min(labels::MAX_BRIDGE_WINDOWS);
+            windows.checked_mul(3)?.checked_add(4)
+        }
+        labels::PRT_TABLE => Some(labels::PRT_TABLE_WORDS),
+        _ => None,
+    }
+}
+
 /// The range a grant of `len` bytes or ports at `base` of `space` covers:
 /// memory widened to whole pages, ports exactly. `None` for an empty or
 /// overflowing range and for ports past 0xFFFF.
@@ -117,6 +143,18 @@ pub fn grant_range(space: Space, base: u64, len: u64) -> Option<Range>
             })
         }
     }
+}
+
+/// The range an `ACPI_REGION_GRANT` of `len` bytes or ports at `base` of
+/// `space` is granted: the ports exactly, a region at a time; for memory,
+/// the one page that holds the access, since memory is carved and kept a page
+/// at a time, so whether a page is granted does not depend on which
+/// overlapping region asked first. `None` where [`grant_range`] gives none,
+/// and for memory that spans more than one page.
+#[must_use]
+pub fn request_range(space: Space, base: u64, len: u64) -> Option<Range>
+{
+    grant_range(space, base, len).filter(|r| r.space == Space::Io || r.len() == PAGE_SIZE)
 }
 
 /// Every BAR of `device` the scan sized, as a range.
@@ -163,6 +201,10 @@ pub enum Holder
     ConfigMechanism,
     /// The FACS, whose global lock and waking vector acpid does not own.
     Facs,
+    /// An interrupt controller the kernel programs (the local APIC, an I/O
+    /// APIC, the APLIC, an IMSIC interrupt file) or a legacy port the kernel
+    /// drives.
+    Kernel,
 }
 
 /// Why a region is refused: the holder and the range of its it overlaps.
@@ -175,13 +217,15 @@ pub struct Refusal
 
 /// Whether devmgr refuses acpid the region `want` ([`grant_range`]'s
 /// range): the first range of `devices` (each record's resources), then of
-/// `pwrmgr` (its ports), then [`CONFIG_PORTS`], then `facs` that `want`
-/// overlaps. `None` lets the request go on to the carve, which refuses
-/// memory no aperture devmgr still holds covers.
+/// `pwrmgr` (its ports), then `kernel` (the kernel's interrupt controllers
+/// and ports), then [`CONFIG_PORTS`], then `facs` that `want` overlaps.
+/// `None` lets the request go on to the carve, which refuses memory no
+/// aperture devmgr still holds covers.
 pub fn region_refusal(
     want: &Range,
     devices: impl IntoIterator<Item = Range>,
     pwrmgr: &[Range],
+    kernel: &[Range],
     facs: Option<Range>,
 ) -> Option<Refusal>
 {
@@ -192,6 +236,7 @@ pub fn region_refusal(
         .into_iter()
         .find_map(refused(Holder::Device))
         .or_else(|| pwrmgr.iter().copied().find_map(refused(Holder::Pwrmgr)))
+        .or_else(|| kernel.iter().copied().find_map(refused(Holder::Kernel)))
         .or_else(|| refused(Holder::ConfigMechanism)(CONFIG_PORTS))
         .or_else(|| facs.and_then(refused(Holder::Facs)))
 }
@@ -487,8 +532,9 @@ pub enum Disagreement
         line: u16,
         expected: u32,
     },
-    /// The table is of a mode devmgr keeps only after it holds the bridge's
-    /// table of the [`PrtRule::after`] mode, which it does not.
+    /// devmgr does not yet hold what it checks the table against: the
+    /// bridge's windows, whose bus range names the functions checked, or its
+    /// table of the [`PrtRule::after`] mode.
     Order,
 }
 
@@ -515,15 +561,14 @@ pub struct Bridge
 
 impl Bridge
 {
-    /// The bridge's buses: those of the windows devmgr holds, else its own
-    /// bus alone.
+    /// The bridge's buses, those of the windows devmgr holds; `None` until
+    /// it holds them.
     #[must_use]
-    pub fn buses(&self) -> (u8, u8)
+    pub fn buses(&self) -> Option<(u8, u8)>
     {
         self.windows
             .as_ref()
             .and_then(|held| bus_range(self.bus, &held.value))
-            .unwrap_or((self.bus, self.bus))
     }
 }
 
@@ -657,7 +702,9 @@ impl Bridges
     /// Take the bridge's `_PRT` of `mode`, checked by `rule` against the
     /// functions on its buses ([`Bridge::buses`]), `expected` giving the
     /// line devmgr gives a function: the first that passes is kept for the
-    /// boot ([`check_prt`]).
+    /// boot ([`check_prt`]). A table that comes before the bridge's windows,
+    /// or before its table of `rule`'s earlier mode, is refused
+    /// ([`Disagreement::Order`]).
     ///
     /// `None` when a new bridge cannot be recorded; nothing is held then.
     #[expect(
@@ -701,11 +748,11 @@ impl Bridges
             Some(PrtMode::PicMode) => bridge.pic.is_none(),
             None => false,
         };
-        if waiting
+        let Some((first, last)) = bridge.buses().filter(|_| !waiting)
+        else
         {
             return Some(Push::Refused(Disagreement::Order));
-        }
-        let (first, last) = bridge.buses();
+        };
         let on_bridge =
             functions.filter(|f| f.segment == segment && (first..=last).contains(&f.bus));
         let expected = |f: &PciDevice| if rule.lines { expected(f) } else { None };
@@ -989,9 +1036,11 @@ mod tests
         });
         let devices = || pci_ranges(&nic).chain(serial);
         let pwrmgr = [io(0x604, 0x606), io(0x64, 0x65)];
+        let kernel = [memory(0xFEE0_0000, 0xFEE0_1000), io(0x40, 0x44)];
         let facs = Some(memory(0x7FEB_1000, 0x7FEB_1040));
-        let refused =
-            |want: Range| region_refusal(&want, devices(), &pwrmgr, facs).map(|r| r.holder);
+        let refused = |want: Range| {
+            region_refusal(&want, devices(), &pwrmgr, &kernel, facs).map(|r| r.holder)
+        };
 
         // A byte in the BAR's page, and a port of each I/O resource.
         let page = grant_range(Space::Memory, 0x8100_0FF0, 4).unwrap_or(memory(0, 0));
@@ -1002,6 +1051,11 @@ mod tests
         assert_eq!(refused(io(0x60, 0x68)), Some(Holder::Pwrmgr));
         assert_eq!(refused(io(0xCFC, 0xD00)), Some(Holder::ConfigMechanism));
         assert_eq!(
+            refused(memory(0xFEE0_0000, 0xFEE0_2000)),
+            Some(Holder::Kernel)
+        );
+        assert_eq!(refused(io(0x43, 0x44)), Some(Holder::Kernel));
+        assert_eq!(
             refused(memory(0x7FEB_0000, 0x7FEB_2000)),
             Some(Holder::Facs)
         );
@@ -1010,8 +1064,24 @@ mod tests
         assert_eq!(refused(io(0x600, 0x604)), None);
         assert_eq!(refused(io(0xB2, 0xB3)), None);
         assert_eq!(refused(memory(0xFED0_0000, 0xFED0_1000)), None);
-        let refusal = region_refusal(&io(0x6000, 0x6001), devices(), &pwrmgr, facs);
+        let refusal = region_refusal(&io(0x6000, 0x6001), devices(), &pwrmgr, &kernel, facs);
         assert_eq!(refusal.map(|r| r.range), Some(io(0x6000, 0x6020)));
+    }
+
+    #[test]
+    fn a_memory_request_is_one_page_and_a_port_request_its_whole_region()
+    {
+        assert_eq!(
+            request_range(Space::Memory, 0xFED0_1FFC, 4),
+            Some(memory(0xFED0_1000, 0xFED0_2000))
+        );
+        assert_eq!(request_range(Space::Memory, 0xFED0_1FFE, 4), None);
+        assert_eq!(request_range(Space::Memory, 0xFED0_0000, 0x2000), None);
+        assert_eq!(
+            request_range(Space::Io, 0x600, 0x40),
+            Some(io(0x600, 0x640))
+        );
+        assert_eq!(request_range(Space::Memory, 0x1000, 0), None);
     }
 
     #[test]
@@ -1056,6 +1126,23 @@ mod tests
             (all_ones(1), all_ones(2), all_ones(4)),
             (0xFF, 0xFFFF, 0xFFFF_FFFF)
         );
+    }
+
+    #[test]
+    fn each_request_carries_every_word_of_its_layout()
+    {
+        use ipc::devmgr_labels as labels;
+        assert_eq!(request_words(labels::ACPI_REGION_GRANT, 0), Some(4));
+        assert_eq!(request_words(labels::ACPI_PCI_CONFIG, 0), Some(6));
+        assert_eq!(request_words(labels::OSC_RESULT, 1), Some(7));
+        assert_eq!(request_words(labels::BRIDGE_WINDOWS, 0), Some(4));
+        assert_eq!(request_words(labels::BRIDGE_WINDOWS, 3), Some(13));
+        assert_eq!(
+            request_words(labels::BRIDGE_WINDOWS, u64::MAX),
+            Some(4 + 3 * labels::MAX_BRIDGE_WINDOWS)
+        );
+        assert_eq!(request_words(labels::PRT_TABLE, 0), Some(36));
+        assert_eq!(request_words(labels::QUERY_HOST_BRIDGE, 0), None);
     }
 
     #[test]
@@ -1203,6 +1290,16 @@ mod tests
         let pic = table(&[(2, 1, 10), (3, 2, 11)]);
         let apic = table(&[(2, 1, 16), (3, 2, 21)]);
         let mut bridges = Bridges::new();
+        // Before the windows, no table is taken.
+        assert_eq!(
+            bridges.push_prt(0, 0, PrtMode::PicMode, &pic, PIC, functions.iter(), line),
+            Some(Push::Refused(Disagreement::Order))
+        );
+        let windows = vec![window(WindowKind::Bus, 0, 0x100)];
+        assert_eq!(
+            bridges.push_windows(0, 0, windows, functions.iter(), &APERTURES),
+            Some(Push::Kept)
+        );
         let mut push = |mode, table: &PrtTable, rule| {
             bridges.push_prt(0, 0, mode, table, rule, functions.iter(), line)
         };
@@ -1274,7 +1371,8 @@ mod tests
         };
         let routes = table(&[(4, 1, 32)]);
         let mut bridges = Bridges::new();
-        // With no windows held, the bridge's buses are its own alone.
+        // With no windows held, devmgr does not know the bridge's buses, and
+        // takes no table.
         assert_eq!(
             bridges.push_prt(
                 0,
@@ -1285,17 +1383,9 @@ mod tests
                 functions.iter(),
                 swizzle
             ),
-            Some(Push::Kept)
-        );
-        assert_eq!(
-            bridges
-                .get(0)
-                .and_then(|b| b.routes.as_ref())
-                .map(|h| h.covered),
-            Some(0)
+            Some(Push::Refused(Disagreement::Order))
         );
 
-        let mut bridges = Bridges::new();
         let windows = vec![window(WindowKind::Bus, 0, 0x100)];
         assert_eq!(
             bridges.push_windows(0, 0, windows, functions.iter(), &APERTURES),
@@ -1391,7 +1481,7 @@ mod tests
         assert!(
             bridges
                 .get(1)
-                .is_some_and(|b| b.windows.is_none() && b.buses() == (0x80, 0x80))
+                .is_some_and(|b| b.windows.is_none() && b.buses().is_none())
         );
     }
 }

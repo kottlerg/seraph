@@ -6,10 +6,11 @@
 //! The [`Host`] acpid gives the evaluator: every hardware access goes
 //! through a grant devmgr made.
 //!
-//! An I/O or memory access asks devmgr for its operation region's whole span
-//! (`ACPI_REGION_GRANT`) on first use, binds the `IoPort` to the evaluation
-//! thread or maps the `Mmio`, and keeps the grant; a refused span is kept
-//! too, so it is asked for once. A configuration-space access is one
+//! An I/O access asks devmgr for its operation region's whole span, a
+//! memory access for the page that holds it (`ACPI_REGION_GRANT`), on first
+//! use; acpid binds the `IoPort` to the evaluation thread or maps the
+//! `Mmio`, and keeps the grant. A refused span is kept too, so it is asked
+//! for once. A configuration-space access is one
 //! `ACPI_PCI_CONFIG` call. `Notify` is logged and dropped: no consumer of
 //! the notifications runs yet. acpid holds no Global Lock, since devmgr
 //! refuses the FACS, so the evaluator's acquisition fails.
@@ -68,7 +69,9 @@ impl<'a> Platform<'a>
     }
 
     /// The held grant of `space` that covers `[addr, addr + width)`,
-    /// asking devmgr for `region` first when none does.
+    /// asking devmgr first when none does: for `region` of ports, for the
+    /// page that holds `addr` of memory, which devmgr grants a page at a
+    /// time.
     fn covering(
         &mut self,
         space: u64,
@@ -81,7 +84,18 @@ impl<'a> Platform<'a>
         let covers = |h: &Held| h.space == space && h.base <= addr && end <= h.end;
         if !self.held.iter().any(covers)
         {
-            self.acquire(space, region)?;
+            let ask = if space == devmgr_labels::ACPI_SPACE_MEMORY
+            {
+                Span {
+                    base: addr & !(PAGE_SIZE - 1),
+                    len: PAGE_SIZE,
+                }
+            }
+            else
+            {
+                region
+            };
+            self.acquire(space, ask)?;
         }
         self.held
             .iter()

@@ -1009,6 +1009,10 @@ struct Handed
 {
     registers: Vec<Resource>,
     units: Vec<(usize, IommuUnit)>,
+    /// The PCI function (segment, bus, device, function) of each unit that
+    /// is one, the RISC-V IOMMUs: devmgr has enabled it for the driver, so
+    /// its record is bound ([`bring_up`]).
+    functions: Vec<(u16, u8, u8, u8)>,
 }
 
 impl Handed
@@ -1016,7 +1020,9 @@ impl Handed
     /// Room for one more unit; false when none can be allocated.
     fn reserve(&mut self) -> bool
     {
-        self.registers.try_reserve(1).is_ok() && self.units.try_reserve(1).is_ok()
+        self.registers.try_reserve(1).is_ok()
+            && self.units.try_reserve(1).is_ok()
+            && self.functions.try_reserve(1).is_ok()
     }
 
     /// Whether a unit whose register range spans `pages` pages and whose
@@ -1147,6 +1153,10 @@ fn riscv_units(
         if let Some((registers, unit)) = riscv_unit(caps, &handed, &rimt_bytes, iommu, devices)
         {
             unit_index.push((iommu.node, Some(handed.push(registers, unit))));
+            let f = iommu.function;
+            handed
+                .functions
+                .push((iommu.segment, f.bus, f.device, f.function));
         }
         else
         {
@@ -1235,11 +1245,36 @@ fn riscv_unit(
     Some((registers, unit))
 }
 
+/// Mark bound the record of each unit that is a PCI function, at
+/// `functions`. Such a unit is devmgr's from its discovery, whether or not
+/// the driver starts: it has its memory decoding and bus mastering enabled
+/// for the driver. Marked bound, no pass binds it and acpid is refused every
+/// configuration write to it (`firmware::acpid::config_access`).
+fn mark_units_bound(
+    records: &mut firmware::pci_records::PciRecords,
+    functions: &[firmware::acpid::Address],
+)
+{
+    for &address in functions
+    {
+        let index = records
+            .devices()
+            .iter()
+            .position(|d| firmware::acpid::address(d) == address);
+        if let Some(index) = index
+        {
+            records.mark_bound(index);
+        }
+    }
+}
+
 /// Discover the remapping units, spawn the IOMMU driver over them, and
 /// settle it; the [`Iommu`] once the driver reports ready, else `None`,
 /// logged once, and every device then runs unconfined, except, when the
 /// driver was started but did not report ready, those behind a unit it
 /// turned translation on for before it failed, which that unit blocks.
+/// The units are placed among the PCI `records`, and the record of each
+/// unit that is a PCI function is marked bound.
 /// `pooled` holds the `(base, size)` of every extent of memory memmgr
 /// pools, from init's bootstrap, against which each device's reserved regions
 /// are checked; `None` when the set is not known in full, which refuses every
@@ -1250,7 +1285,7 @@ fn riscv_unit(
               batch records into"
 )]
 pub fn bring_up(
-    devices: &[pci::PciDevice],
+    records: &mut firmware::pci_records::PciRecords,
     modules: &mut Vec<(DriverDecl, u64)>,
     pooled: Option<Vec<(u64, u64)>>,
     caps: &mut caps::DevmgrCaps,
@@ -1292,9 +1327,10 @@ pub fn bring_up(
     }
     let (handed, topology) = match family
     {
-        Family::Vtd => vtd_units(caps, table, devices),
-        Family::Riscv => riscv_units(caps, table, devices),
+        Family::Vtd => vtd_units(caps, table, records.devices()),
+        Family::Riscv => riscv_units(caps, table, records.devices()),
     };
+    mark_units_bound(records, &handed.functions);
     if handed.units.is_empty()
     {
         unconfined("no IOMMU unit can be programmed");

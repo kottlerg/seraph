@@ -15,7 +15,8 @@
 # 8042 ports / SbiControl). pwrmgr is the only recipe seeding it.
 # pwrmgr owns no hardware caps directly — devmgr is the hardware authority.
 # AML is evaluated by acpid (services/acpid/README.md); pwrmgr reads the FADT and
-# the `_S5_` package itself, and devmgr refuses acpid pwrmgr's ports.
+# the `_S5_` package itself. devmgr's region grants refuse acpid pwrmgr's
+# ports, though it serves acpid the FADT's PM1a control block.
 #
 # `restart = on_failure`: svcmgr re-creates pwrmgr from /services/pwrmgr and
 # re-serves a fresh RECV on the persistent endpoint, so a SHUTDOWN_AUTHORITY

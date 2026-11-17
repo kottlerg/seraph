@@ -90,6 +90,22 @@ const MADT_TYPE_IO_APIC: u8 = 1;
 /// Length of an I/O APIC structure: type, length, I/O APIC ID, reserved (u8
 /// each), address (u32), GSI base (u32).
 const MADT_IO_APIC_LEN: usize = 12;
+/// MADT structure type of a Local APIC Address Override (section 5.2.12.8):
+/// the local APIC's 64-bit address at offset 4, in place of the header's.
+const MADT_TYPE_LAPIC_OVERRIDE: u8 = 5;
+/// Length of a Local APIC Address Override.
+const MADT_LAPIC_OVERRIDE_LEN: usize = 12;
+/// MADT structure type of a RISC-V hart's interrupt controller (RINTC,
+/// section 5.2.12.20): flags (u32, bit 0 enabled) at offset 4, its IMSIC
+/// interrupt file's address (u64) at 24 and size (u32) at 32.
+const MADT_TYPE_RINTC: u8 = 0x18;
+/// MADT structure type of a RISC-V APLIC (section 5.2.12.22): its address
+/// (u64) at offset 24 and size (u32) at 32.
+const MADT_TYPE_APLIC: u8 = 0x1A;
+/// Length of a RINTC or APLIC structure that carries its address and size.
+const MADT_RISCV_WINDOW_LEN: usize = 36;
+/// The bytes devmgr takes a local APIC or I/O APIC register window to span.
+const APIC_WINDOW_BYTES: u64 = 0x1000;
 /// MADT structure type of an Interrupt Source Override (section 5.2.12.5).
 const MADT_TYPE_SOURCE_OVERRIDE: u8 = 2;
 /// Length of an Interrupt Source Override: type, length, bus, source (u8
@@ -531,6 +547,53 @@ pub fn madt_io_apics(madt_bytes: &[u8]) -> Option<impl Iterator<Item = IoApic> +
                 id: read_u8(madt_bytes, at.saturating_add(2)),
                 gsi_base: read_u32(madt_bytes, at.saturating_add(8)),
             }),
+    )
+}
+
+/// The register windows, `(base, length)`, of the interrupt controllers the
+/// MADT describes, which the kernel programs: the local APIC (the header's
+/// address, and an override's), each I/O APIC, each enabled hart's IMSIC
+/// interrupt file, and each APLIC. Zero addresses and lengths are left out.
+///
+/// Returns `None` for a table that is not a MADT, and ends at a malformed
+/// structure, as `madt_structures` does.
+#[must_use]
+pub fn madt_interrupt_controllers(
+    madt_bytes: &[u8],
+) -> Option<impl Iterator<Item = (u64, u64)> + '_>
+{
+    let header = u64::from(read_u32(madt_bytes, SDT_HDR_LEN));
+    let windows = madt_structures(madt_bytes)?.filter_map(|(kind, at, len)| {
+        let field = |off: usize| at.saturating_add(off);
+        match kind
+        {
+            MADT_TYPE_IO_APIC if len >= MADT_IO_APIC_LEN =>
+            {
+                Some((u64::from(read_u32(madt_bytes, field(4))), APIC_WINDOW_BYTES))
+            }
+            MADT_TYPE_LAPIC_OVERRIDE if len >= MADT_LAPIC_OVERRIDE_LEN =>
+            {
+                Some((read_u64(madt_bytes, field(4)), APIC_WINDOW_BYTES))
+            }
+            MADT_TYPE_RINTC
+                if len >= MADT_RISCV_WINDOW_LEN && read_u32(madt_bytes, field(4)) & 1 != 0 =>
+            {
+                Some((
+                    read_u64(madt_bytes, field(24)),
+                    u64::from(read_u32(madt_bytes, field(32))),
+                ))
+            }
+            MADT_TYPE_APLIC if len >= MADT_RISCV_WINDOW_LEN => Some((
+                read_u64(madt_bytes, field(24)),
+                u64::from(read_u32(madt_bytes, field(32))),
+            )),
+            _ => None,
+        }
+    });
+    Some(
+        core::iter::once((header, APIC_WINDOW_BYTES))
+            .chain(windows)
+            .filter(|&(base, len)| base != 0 && len != 0),
     )
 }
 
@@ -1075,6 +1138,45 @@ mod tests
 
     /// A local APIC structure (type 0, 8 bytes): not an override.
     const LOCAL_APIC: [u8; 8] = [0, 8, 0, 0, 1, 0, 0, 0];
+
+    #[test]
+    fn madt_interrupt_controllers_name_every_apic_and_aia_window()
+    {
+        let mut io_apic = [0u8; MADT_IO_APIC_LEN];
+        io_apic[0] = MADT_TYPE_IO_APIC;
+        io_apic[1] = 12;
+        io_apic[4..8].copy_from_slice(&0xFEC0_0000u32.to_le_bytes());
+        let mut over = [0u8; MADT_LAPIC_OVERRIDE_LEN];
+        over[0] = MADT_TYPE_LAPIC_OVERRIDE;
+        over[1] = 12;
+        over[4..12].copy_from_slice(&0x1_FEE0_0000u64.to_le_bytes());
+        let riscv = |kind: u8, flags: u32, base: u64, size: u32| {
+            let mut s = [0u8; MADT_RISCV_WINDOW_LEN];
+            s[0] = kind;
+            s[1] = 36;
+            s[4..8].copy_from_slice(&flags.to_le_bytes());
+            s[24..32].copy_from_slice(&base.to_le_bytes());
+            s[32..36].copy_from_slice(&size.to_le_bytes());
+            s
+        };
+        let hart = riscv(MADT_TYPE_RINTC, 1, 0x2800_0000, 0x1000);
+        let off = riscv(MADT_TYPE_RINTC, 0, 0x2800_1000, 0x1000);
+        let aplic = riscv(MADT_TYPE_APLIC, 0, 0xD00_0000, 0x8000);
+        let mut table = madt(&[&LOCAL_APIC, &io_apic, &over, &hart, &off, &aplic]);
+        table[SDT_HDR_LEN..SDT_HDR_LEN + 4].copy_from_slice(&0xFEE0_0000u32.to_le_bytes());
+        let windows: Vec<_> = madt_interrupt_controllers(&table).unwrap().collect();
+        assert_eq!(
+            windows,
+            [
+                (0xFEE0_0000, 0x1000),
+                (0xFEC0_0000, 0x1000),
+                (0x1_FEE0_0000, 0x1000),
+                (0x2800_0000, 0x1000),
+                (0xD00_0000, 0x8000),
+            ]
+        );
+        assert!(madt_interrupt_controllers(&sdt(*b"FACP", 64)).is_none());
+    }
 
     #[test]
     fn madt_overrides_are_read_past_other_structures()

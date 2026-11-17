@@ -119,6 +119,12 @@ pub fn pwrmgr_ports(_firmware: &Firmware) -> Vec<firmware::acpid::Range>
     Vec::new()
 }
 
+/// The kernel drives no port on riscv64: there is no port space.
+pub fn kernel_ports() -> Vec<firmware::acpid::Range>
+{
+    Vec::new()
+}
+
 /// No fixed ACPI register block is a port on riscv64: `QUERY_ACPI_RESOURCES`
 /// serves none.
 pub fn acpi_io_block(

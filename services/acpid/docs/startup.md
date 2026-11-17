@@ -35,12 +35,13 @@ start-up and so that it keeps the grants it holds.
    children. A `_STA` that faults or returns no integer counts as absent and not functioning.
 4. **Host bridges**: each present device whose `_HID` or `_CID` is `PNP0A03` or
    `PNP0A08`, with its `_SEG` and `_BBN` (0 when absent).
-5. **PIC-model routes** (x86-64). acpid evaluates each bridge's `_PRT` and pushes it as
+5. **Windows**: each bridge's `_CRS` windows, pushed as `BRIDGE_WINDOWS`. devmgr checks a
+   `_PRT` against the functions on the buses of the windows it holds, so they go first.
+6. **PIC-model routes** (x86-64). acpid evaluates each bridge's `_PRT` and pushes it as
    `PRT_PIC_MODE`, then selects the APIC model with `\_PIC(1)` (§ Interrupt model).
-6. **Per bridge**: `_OSC`, pushed as `OSC_RESULT`; the `_CRS` windows, pushed as
-   `BRIDGE_WINDOWS`; the `_PRT`, pushed as `PRT_TABLE` mode `PRT_ROUTES`
-   ([devmgr.md](devmgr.md) § Pushes).
-7. acpid logs a `ready:` line with the tables loaded, the devices present, the `_INI` methods
+7. **Per bridge**: `_OSC`, pushed as `OSC_RESULT`; the `_PRT`, pushed as `PRT_TABLE` mode
+   `PRT_ROUTES` ([devmgr.md](devmgr.md) § Pushes).
+8. acpid logs a `ready:` line with the tables loaded, the devices present, the `_INI` methods
    run and the bridges found.
 
 `_OSC` asks, with the PCI Host Bridge UUID and revision 1, for every support feature (0x1F)
@@ -69,9 +70,10 @@ calls no `_PIC` there.
 
 Every hardware access of the evaluator goes through devmgr ([devmgr.md](devmgr.md)):
 
-- An I/O or memory field access asks devmgr for its operation region's whole span on first
-  use, binds the `IoPort` to the evaluation thread or maps the `Mmio`, and keeps the grant for
-  acpid's lifetime. A refused span is remembered and not asked for again. A memory write is
+- An I/O field access asks devmgr for its operation region's whole span on first use, a
+  memory field access for the page that holds it. acpid binds the `IoPort` to the evaluation
+  thread or maps the `Mmio`, and keeps the grant for acpid's lifetime. A refused span is
+  remembered and not asked for again. A memory write is
   followed by an MMIO ordering barrier.
 - A configuration-space access is one `ACPI_PCI_CONFIG` call.
 - `Notify` is logged and dropped: no consumer of the notifications runs.
@@ -110,7 +112,7 @@ acpid is `restart = on_failure`: svcmgr re-creates it, and it re-acquires its ca
 from devmgr and runs the sequence again, `_INI` methods included. devmgr keeps the first result
 of each push for the boot and logs a later one that differs, so a restart cannot change what
 devmgr acts on. A restarted acpid's PIC-model `_PRT` is read after the first instance selected
-the APIC model, and so differs from the first. devmgr keeps the memory regions it granted, so a
+the APIC model, and so differs from the first. devmgr keeps the memory pages it granted, so a
 restarted acpid is granted them again ([devmgr.md](devmgr.md) § Region grants).
 
 ---

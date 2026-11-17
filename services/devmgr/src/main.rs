@@ -130,7 +130,7 @@ fn main() -> !
     // `None` runs every device unconfined, logged once.
     let mut boot_modules = modules.drivers;
     caps.iommu = iommu::bring_up(
-        records.pci.devices(),
+        &mut records.pci,
         &mut boot_modules,
         caps.pooled.take(),
         &mut caps,

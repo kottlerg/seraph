@@ -288,8 +288,9 @@ Each feature is classified per architecture as one of:
 - **Zicfilp landing pads** — not used: forward-edge control-flow integrity is not pursued
   ([core/kernel/docs/return-address-integrity.md](../core/kernel/docs/return-address-integrity.md)).
 - **Cache-block-management instructions (Zicbom/Zicboz/Zicbop)** — not used; the kernel assumes
-  cache-coherent DMA. (Distinct from Svpbmt: the PBMT memory type governs how a hart's own
-  accesses to a mapping behave, not DMA cache coherence.)
+  cache-coherent DMA, and denies U-mode `cbo.zero`, `cbo.clean`, `cbo.flush` and `cbo.inval`
+  (`senvcfg` written whole with 0). (Distinct from Svpbmt: the PBMT memory type governs how a
+  hart's own accesses to a mapping behave, not DMA cache coherence.)
 - **Secure Boot, TPM, RTC** — not boot dependencies.
 - **Sdtrig debug triggers (SBI Debug Triggers, DBTR)** — not used: the kernel programs no trigger.
   The reference platform (QEMU `-cpu max` under OpenSBI) offers two triggers through DBTR, of the

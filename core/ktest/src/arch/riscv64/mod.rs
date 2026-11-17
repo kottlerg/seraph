@@ -12,6 +12,8 @@
 //! - `callee_saved.rs` — callee-saved register probe for
 //!   `integration::irq_preserves_user_regs`
 //! - `code_stub.rs` — machine-code stub encoders for `unit::retype`
+//! - `user_controls.rs` — the instructions U-mode is denied, for
+//!   `integration::user_mode_controls`
 //!
 //! Tier 1 tests:
 //! - `ioport_syscalls.rs` — `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT` return
@@ -35,6 +37,7 @@ mod sbi_gating;
 mod sbi_shutdown;
 pub mod serial;
 mod single_step;
+pub mod user_controls;
 
 use init_protocol::InitInfo;
 
@@ -260,7 +263,7 @@ pub fn cycles_now() -> u64
 {
     let c: u64;
     // SAFETY: cycle CSR is accessible from U-mode when scounteren.CY = 1,
-    // which the kernel sets during Phase 5 init.
+    // which the kernel sets on every hart.
     unsafe {
         core::arch::asm!(
             "csrr {}, cycle",

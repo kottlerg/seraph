@@ -5,20 +5,23 @@
 
 //! acpid, the ACPI service: it runs the firmware's AML.
 //!
-//! acpid is a svcmgr-launched service seeded with `devmgr.acpi`, a SEND on
+//! acpid is a svcmgr-launched provider seeded with `devmgr.acpi`, a SEND on
 //! devmgr's registry that carries `ACPI_AUTHORITY`. Through it acpid acquires
 //! everything it touches: the tables (`QUERY_ACPI_TABLE`), the FADT's fixed
 //! register blocks (`QUERY_ACPI_RESOURCES`), each operation region the AML
 //! reaches (`ACPI_REGION_GRANT`), and each configuration-space access
 //! (`ACPI_PCI_CONFIG`). On every start it loads the DSDT and the SSDTs,
 //! runs the start-up sequence of `services/acpid/README.md` on an
-//! evaluation thread, pushes each PCI host bridge's `_OSC` grant, windows
-//! and interrupt routes to devmgr, and then idles.
+//! evaluation thread, and pushes each PCI host bridge's `_OSC` grant,
+//! windows and interrupt routes to devmgr. The same thread then serves
+//! pwrmgr's power requests (`ipc::acpid_labels`) on acpid's service
+//! endpoint.
 
 mod arch;
 mod caps;
 mod devmgr;
 mod platform;
+mod server;
 mod startup;
 
 /// The evaluation thread's stack: the evaluator's and the parser's own
@@ -44,29 +47,37 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    match caps::request_bootstrap(info, ipc_buf)
+    let Some(caps) = caps::request_bootstrap(info, ipc_buf).filter(|c| c.service != 0)
+    else
     {
-        Some(registry) =>
+        std::os::seraph::log!(error: "bootstrap failed: no service endpoint");
+        // Staying alive keeps svcmgr from restarting acpid into the same
+        // failed round. acpid holds no endpoint to answer on, so a power
+        // request waits out its caller's bound.
+        loop
         {
-            let aspace = info.self_aspace;
-            let spawned = std::thread::Builder::new()
-                .name("acpid-eval".into())
-                .stack_size(EVAL_THREAD_STACK)
-                .spawn(move || startup::run(&devmgr::Devmgr::new(registry), aspace));
-            match spawned.map(std::thread::JoinHandle::join)
-            {
-                Ok(Ok(())) =>
-                {}
-                Ok(Err(_)) => std::os::seraph::log!(error: "the evaluation thread panicked"),
-                Err(e) => std::os::seraph::log!(error: "evaluation thread not spawned: {e}"),
-            }
+            std::thread::park();
         }
-        None => std::os::seraph::log!(error: "bootstrap failed: no devmgr.acpi seed"),
-    }
-    // acpid serves no requests yet. It stays alive, so that svcmgr does not
-    // restart it into the same start-up, and keeps the grants it holds.
-    loop
+    };
+    if caps.registry == 0
     {
-        std::thread::park();
+        std::os::seraph::log!(error: "bootstrap failed: no devmgr.acpi seed; refusing power requests");
+        // As above, alive rather than restarted into the same round, and
+        // answering every request instead of leaving it queued.
+        server::refuse(caps.service);
     }
+    let aspace = info.self_aspace;
+    let spawned = std::thread::Builder::new()
+        .name("acpid-eval".into())
+        .stack_size(EVAL_THREAD_STACK)
+        .spawn(move || startup::run(&devmgr::Devmgr::new(caps.registry), aspace, caps.service));
+    match spawned.map(std::thread::JoinHandle::join)
+    {
+        Ok(Err(_)) => std::os::seraph::log!(error: "the evaluation thread panicked; exiting"),
+        Err(e) => std::os::seraph::log!(error: "evaluation thread not spawned: {e}; exiting"),
+    }
+    // The evaluation thread serves acpid's endpoint for acpid's lifetime;
+    // without it the power requests would wait unanswered, so acpid exits
+    // and svcmgr restarts it.
+    syscall::process_exit(1)
 }

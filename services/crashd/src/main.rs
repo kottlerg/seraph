@@ -13,11 +13,18 @@
 //! logs the report block (services/crashd/docs/block-format.md), writes a
 //! core of it to `/crash` when its `CORE_DUMP` setting names the process
 //! (services/crashd/docs/core-format.md), and declines the fault with the
-//! report's id as the reason. The mechanism and its limits are in
-//! services/crashd/docs/operation.md.
+//! report's id as the reason.
+//!
+//! When its `CRASHD_OOM_STALL_MS` setting gives a stall, crashd holds a page
+//! fault memmgr declined for want of memory instead (the `hold` module): it
+//! redirects the fault to one of its hold endpoints, where it waits with its
+//! thread fault-blocked, resumes it when memmgr's pressure level falls below
+//! `CRITICAL`, and reports and declines it when the stall passes first. The
+//! mechanism and its limits are in services/crashd/docs/operation.md.
 
 mod arch;
 mod dump;
+mod hold;
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -46,6 +53,16 @@ const WATCHDOG_TICK: Duration = Duration::from_millis(100);
 
 /// Bytes of stack the walk scans, from the stack pointer up.
 const STACK_SCAN_BYTES: u64 = 8192;
+
+/// Bytes of heap crashd touches at start when it holds faults, so a report
+/// made while memory is critical finds its heap pages backed: several times
+/// a report's peak, the stack scan's buffer and the block's lines.
+const HEAP_TOUCH_BYTES: usize = 64 * 1024;
+
+/// Bytes of stack each of crashd's threads touches at start when it holds
+/// faults, below the frame that starts the thread's work, for the same
+/// reason: more than a report or the watchdog's tick goes down.
+const STACK_TOUCH_BYTES: usize = 32 * 1024;
 
 /// The bound of the step of a fault's handling under way, shared with the
 /// watchdog: the report takes a generation, which the watchdog cancels once
@@ -94,7 +111,9 @@ fn main() -> !
             }
         };
     let policy = core_policy();
-    if !start_watchdog()
+    let stall_ms = stall_ms();
+    let first: fn() = if stall_ms == 0 { || {} } else { touch_stack };
+    if !start_watchdog(first)
     {
         std::os::seraph::log!(warn: "watchdog not started; a fault's handling is unbounded");
     }
@@ -103,6 +122,10 @@ fn main() -> !
     {
         syscall::thread_exit();
     };
+    if stall_ms != 0
+    {
+        hold::serve(stall_ms, endpoint, &policy, authority, ipc_buf);
+    }
     std::os::seraph::log!("reporting crashes");
 
     loop
@@ -121,7 +144,7 @@ fn main() -> !
             let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(FAULT_REPLY_KILL), ipc_buf) };
             continue;
         }
-        handle_fault(&msg, &policy, authority, ipc_buf);
+        handle_fault(&msg, &policy, authority, ipc_buf, Dump::Allowed);
     }
 }
 
@@ -193,17 +216,74 @@ fn core_policy() -> Policy
     }
 }
 
+/// The stall of crashd's `CRASHD_OOM_STALL_MS` setting, in milliseconds,
+/// logged when it is clamped or does not parse; 0, which holds no fault, when
+/// it is absent or does not parse.
+fn stall_ms() -> u64
+{
+    let value = std::env::var("CRASHD_OOM_STALL_MS").ok();
+    let Ok(stall) = oom_hold::parse_stall(value.as_deref())
+    else
+    {
+        std::os::seraph::log!(
+            warn: "CRASHD_OOM_STALL_MS is not a number of milliseconds; no fault held"
+        );
+        return 0;
+    };
+    if stall.clamped
+    {
+        std::os::seraph::log!(
+            warn: "CRASHD_OOM_STALL_MS clamped to {} ms",
+            oom_hold::STALL_MAX_MS
+        );
+    }
+    stall.ms
+}
+
+/// Touch [`STACK_TOUCH_BYTES`] of the calling thread's stack below this
+/// frame, so its pages are backed before memory can run out.
+#[inline(never)]
+#[expect(
+    clippy::large_stack_arrays,
+    clippy::large_stack_frames,
+    reason = "the probe exists to occupy and touch this much of the stack"
+)]
+fn touch_stack()
+{
+    let mut probe = [0u8; STACK_TOUCH_BYTES];
+    std::hint::black_box(&mut probe);
+}
+
+/// Touch [`HEAP_TOUCH_BYTES`] of heap and free them: the allocator keeps
+/// the pages, and places later requests first fit from the heap's bottom.
+fn touch_heap()
+{
+    drop(std::hint::black_box(vec![1u8; HEAP_TOUCH_BYTES]));
+}
+
+/// Whether a report may write a core of its process.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dump
+{
+    /// As the policy says.
+    Allowed,
+    /// None: memory is critical while crashd holds faults, and a dump's
+    /// buffers and file writes would need pages a report's do not.
+    MemoryCritical,
+}
+
 /// Report the fault `msg` and decline it: read what the attach request
 /// reaches and log the block, under the watchdog's bound, write a core of
-/// the process when `policy` may name it and the report read it whole, under
-/// the dump's own bound, and log the dump's line, then end the thread with
-/// the report id as the decline reason. The block and the dump's line are
-/// logged before the decline, so the kernel's serial diagnostic of the kill,
-/// which the decline triggers, does not land among them. A request the
-/// watchdog cancels ends the bound: the thread is declined at once, with no
-/// dump, the watchdog's cancellation is let finish, and the block's remaining
-/// lines follow, when nothing can wait on the faulting thread any more.
-fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut u64)
+/// the process when `policy` may name it, `dump` allows one, and the report
+/// read it whole, under the dump's own bound, and log the dump's line, then
+/// end the thread with the report id as the decline reason. The block and the
+/// dump's line are logged before the decline, so the kernel's serial
+/// diagnostic of the kill, which the decline triggers, does not land among
+/// them. A request the watchdog cancels ends the bound: the thread is declined
+/// at once, with no dump, the watchdog's cancellation is let finish, and the
+/// block's remaining lines follow, when nothing can wait on the faulting
+/// thread any more.
+fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut u64, dump: Dump)
 {
     let id = report_id();
     let ip = msg.word(3);
@@ -255,6 +335,7 @@ fn handle_fault(msg: &IpcMessage, policy: &Policy, authority: u64, ipc_buf: *mut
                     cause,
                     load_bias: image.load_bias,
                     no_core: gathered.no_core,
+                    dump,
                 },
                 authority,
                 ipc_buf,
@@ -691,13 +772,14 @@ fn now_ms() -> u64
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Start the watchdog thread, then bind the calling thread's upcall class to
-/// an endpoint the watchdog receives on. The thread is spawned first, so it
-/// does not copy that binding to an endpoint only it receives on
+/// Start the watchdog thread, which runs `first` before anything else, then
+/// bind the calling thread's upcall class to an endpoint the watchdog
+/// receives on. The thread is spawned first, so it does not copy that
+/// binding to an endpoint only it receives on
 /// (docs/fault-handling.md § Asynchronous Upcalls, Nesting), and serves only
 /// once the binding is made. `false`, with nothing bound and the watchdog
 /// gone, when the endpoint, the thread, or the binding cannot be had.
-fn start_watchdog() -> bool
+fn start_watchdog(first: fn()) -> bool
 {
     let receiver = std::os::seraph::thread::current_thread_cap();
     let Some(endpoint) =
@@ -712,6 +794,7 @@ fn start_watchdog() -> bool
     if std::thread::Builder::new()
         .name("watchdog".into())
         .spawn(move || {
+            first();
             if go.recv() == Ok(true)
             {
                 watchdog(receiver, endpoint);

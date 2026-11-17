@@ -13,8 +13,10 @@
 //! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the windowed restart
 //! budget ([`RestartBudget`]), the death-observer correlator and the rule
-//! that routes a death post by it ([`death_tag`]), and the reading of a
-//! service's death from the caps svcmgr holds on it ([`death_caps`]). Nothing here touches a syscall, IPC, or
+//! that routes a death post by it ([`death_tag`]), the reading of a
+//! service's death from the caps svcmgr holds on it ([`death_caps`]), the
+//! eligibility rule of a stop ([`stop`]), and the create flags a recipe
+//! asks procmgr for ([`create_flags`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
 //! host-tested — the `.svc` and class files are external input and their
 //! parsers carry unit tests per
@@ -27,6 +29,7 @@ pub mod death_caps;
 pub mod death_tag;
 pub mod parse;
 pub mod restart_budget;
+pub mod stop;
 
 pub use death_tag::DeathTag;
 pub use restart_budget::RestartBudget;
@@ -59,6 +62,34 @@ pub fn cwd_rights(subtree_rights: Option<u32>) -> u32
 pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 {
     badge & ipc::svcmgr_labels::HANDOVER_AUTHORITY != 0 && !handover_done
+}
+
+/// The procmgr create flags svcmgr adds to a service's `CREATE_FROM_FILE`
+/// label, on its launch and on every restart:
+/// [`CREATE_RESERVE`](ipc::procmgr_labels::CREATE_RESERVE) for a recipe that
+/// sets `reserve = yes` ([`Definition::reserve`]), so the service's budget
+/// node is in the system reserve, which procmgr grants svcmgr since svcmgr's
+/// own node is a reserve node; and
+/// [`CREATE_NODE_HANDLE`](ipc::procmgr_labels::CREATE_NODE_HANDLE) for one
+/// that sets `oom_stop = yes` ([`Definition::oom_stop`]), whose usage svcmgr
+/// reads through the handle for `svcmgr_labels::LIST_STOPPABLE`.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "each argument is the recipe key that asks for one flag"
+)]
+pub const fn create_flags(reserve: bool, oom_stop: bool) -> u64
+{
+    let mut flags = 0;
+    if reserve
+    {
+        flags |= ipc::procmgr_labels::CREATE_RESERVE;
+    }
+    if oom_stop
+    {
+        flags |= ipc::procmgr_labels::CREATE_NODE_HANDLE;
+    }
+    flags
 }
 
 /// The byte length of the blob [`build_blob`] packs from `tokens`: each token
@@ -97,6 +128,78 @@ pub fn build_blob(tokens: &[String]) -> (Vec<u8>, u64)
 pub fn shutdown_actuator(defs: &[Definition]) -> Option<usize>
 {
     defs.iter().position(|d| d.shutdown_actuator.is_some())
+}
+
+/// Put `defs` in launch order: providers (a non-empty
+/// [`Definition::provides`]) ahead of pure consumers, so a provided name is
+/// published before any consumer launched in the same scan resolves it; each
+/// group in service-name order; and, among the providers, a provider whose
+/// [`Definition::seed`] names a name another provider provides after that
+/// provider. svcmgr publishes a provided name only once its provider has
+/// launched, so this is what lets one provider seed another's name.
+///
+/// The order is a stable topological order: each place takes the first
+/// provider, in name order, that seeds no name of a provider not yet placed
+/// (its own names aside). When none can (a seed cycle), the first in name
+/// order takes the place, `on_cycle` is called with it, and its seeds from
+/// the providers still unplaced resolve to nothing at its launch. A seed
+/// naming a name no recipe provides orders nothing.
+///
+/// The order says only which launch is attempted first. A provider launches
+/// whether or not the launch of a provider it seeds from succeeded; a seed of
+/// a provider whose launch failed is unresolved, as any unresolved seed is.
+/// A service init already runs (bind only) is not launched, so its place
+/// does nothing. A restarted service's seeds are resolved again at its
+/// restart, from what the registry then holds.
+pub fn launch_order(defs: &mut [Definition], mut on_cycle: impl FnMut(&Definition))
+{
+    // Service names are unique (one `.svc` suffix stripped from unique file
+    // names), so the allocation-free unstable sort gives the order a stable
+    // one would.
+    defs.sort_unstable_by(|a, b| {
+        (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
+    });
+    let providers = defs.iter().take_while(|d| !d.provides.is_empty()).count();
+    let mut rest: &mut [Definition] = defs.get_mut(..providers).unwrap_or_default();
+    while !rest.is_empty()
+    {
+        // The first provider, in name order, seeding no name of another
+        // unplaced provider, takes the place at the head of `rest`.
+        let ready = (0..rest.len()).find(|&j| {
+            rest.get(j).is_some_and(|c| {
+                !rest
+                    .iter()
+                    .enumerate()
+                    .any(|(k, p)| k != j && seeds_from(c, p))
+            })
+        });
+        match ready.and_then(|j| rest.get_mut(..=j))
+        {
+            Some(head) => head.rotate_right(1),
+            None =>
+            {
+                if let Some(first) = rest.first()
+                {
+                    on_cycle(first);
+                }
+            }
+        }
+        let Some((_, tail)) = core::mem::take(&mut rest).split_first_mut()
+        else
+        {
+            break;
+        };
+        rest = tail;
+    }
+}
+
+/// Whether `consumer` seeds a name `provider` provides.
+fn seeds_from(consumer: &Definition, provider: &Definition) -> bool
+{
+    consumer
+        .seed
+        .iter()
+        .any(|s| provider.provides.iter().any(|p| p.name == *s))
 }
 
 /// Restart-policy values parsed from the `restart = ...` line.
@@ -142,6 +245,11 @@ pub enum NamespaceShape
 /// either consumes the definition into a fixed-size `ServiceEntry`
 /// (for supervision) or hands it straight to svcmgr's launch path for
 /// one-shot spawn.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent `yes | no` recipe key: `critical`, `log_sink`, \
+              `debug_authority`, `oom_stop`, `stop_authority` and `reserve`"
+)]
 pub struct Definition
 {
     pub name: String,
@@ -182,9 +290,9 @@ pub struct Definition
     /// registry. The endpoint persists across restarts (svcmgr holds the
     /// source), so cached client caps survive a crash-restart cycle and no
     /// re-publish is needed. Empty for pure-consumer services that only
-    /// receive `seed` caps. A provider also launches ahead of pure
-    /// consumers during reconciliation so its names resolve before any
-    /// consumer queries them.
+    /// receive `seed` caps. Reconciliation launches a provider ahead of pure
+    /// consumers, and after each provider whose name it seeds
+    /// ([`launch_order`]), so its names resolve before they are queried.
     pub provides: Vec<ProvidedName>,
     /// `log_sink = yes` marks the service as the system log sink (real-logd).
     /// svcmgr mints its bootstrap round — master-log RECV, the first-launch
@@ -210,6 +318,23 @@ pub struct Definition
     /// for every other service; [`shutdown_actuator`] picks one actuator from
     /// a scan.
     pub shutdown_actuator: Option<ProvidedName>,
+    /// `oom_stop = yes` lets svcmgr stop the service when a stop-authority
+    /// holder asks (`svcmgr_labels::STOP_SERVICE`), routing the death
+    /// through [`Definition::restart`]; svcmgr asks procmgr for a handle to
+    /// its budget node, through which it reads the usage
+    /// `svcmgr_labels::LIST_STOPPABLE` reports. The parser rejects it on a
+    /// recipe [`stop::stop_refusal`] would refuse: `critical = yes`,
+    /// `restart = never`, or a core role ([`stop::core_role`]).
+    pub oom_stop: bool,
+    /// `stop_authority = yes` endows the service with svcmgr's stop
+    /// authority: svcmgr mints a `STOP_AUTHORITY`-badged SEND on its own
+    /// service endpoint and delivers it in the bootstrap slot after the
+    /// `seed` caps and the debug-authority cap. Exclusive of `log_sink`.
+    pub stop_authority: bool,
+    /// `reserve = yes` creates the service in the system reserve
+    /// (`procmgr_labels::CREATE_RESERVE`, [`create_flags`]), on its launch
+    /// and on every restart, so it may take the pages memmgr keeps in reserve.
+    pub reserve: bool,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr
     /// applies its default (`sched_policy::DEFAULT_SPAWN_PRIORITY` clamped
@@ -292,6 +417,86 @@ mod tests
         assert_eq!(shutdown_actuator(&[]), None);
     }
 
+    /// A recipe named `name` providing the names `provides` (a consumer when
+    /// empty) and seeding `seed`.
+    fn ordered(name: &str, provides: &str, seed: &str) -> Definition
+    {
+        let line = |key: &str, value: &str| {
+            if value.is_empty()
+            {
+                String::new()
+            }
+            else
+            {
+                format!("{key} = {value}\n")
+            }
+        };
+        let contents = format!(
+            "binary = /services/x\nrestart = on_failure\ncritical = no\nnamespace = none\n{}{}",
+            line("provides", provides),
+            line("seed", seed)
+        );
+        parse::parse(name, &contents).expect("valid recipe")
+    }
+
+    fn order(mut defs: Vec<Definition>) -> (Vec<String>, Vec<String>)
+    {
+        let mut cycles = Vec::new();
+        launch_order(&mut defs, |d| cycles.push(d.name.clone()));
+        (defs.into_iter().map(|d| d.name).collect(), cycles)
+    }
+
+    #[test]
+    fn providers_launch_first_in_name_order_and_after_the_providers_they_seed_from()
+    {
+        // pwrmgr seeds acpid's name; zz's provider sorts last, so the order
+        // follows the seed, not the name.
+        let (names, cycles) = order(vec![
+            ordered("cons", "", "a.x zz.x"),
+            ordered(
+                "pwrmgr",
+                "pwrmgr.shutdown:auth",
+                "devmgr.shutdown acpid.power",
+            ),
+            ordered("acpid", "acpid.power:auth acpid.deny:deny", "devmgr.acpi"),
+            ordered("a", "a.x", "zz.x"),
+            ordered("m", "m.x", ""),
+            ordered("zz", "zz.x", ""),
+        ]);
+        assert_eq!(names, ["acpid", "m", "pwrmgr", "zz", "a", "cons"]);
+        assert_eq!(cycles, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_seed_no_recipe_provides_and_a_seed_of_its_own_name_order_nothing()
+    {
+        // b seeds a name nobody provides (as a provider whose launch fails
+        // provides none): it keeps its name-order place and launches with
+        // that seed unresolved. c seeds its own name.
+        let (names, cycles) = order(vec![
+            ordered("c", "c.x", "c.x"),
+            ordered("b", "b.x", "gone.x"),
+            ordered("a", "a.x", ""),
+        ]);
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(cycles, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_seed_cycle_launches_its_first_member_in_name_order_and_is_reported()
+    {
+        // b and c seed each other, d seeds c, a is free.
+        let (names, cycles) = order(vec![
+            ordered("d", "d.x", "c.x"),
+            ordered("c", "c.x", "b.x"),
+            ordered("b", "b.x", "c.x"),
+            ordered("a", "a.x", ""),
+            ordered("cons", "", "b.x"),
+        ]);
+        assert_eq!(names, ["a", "b", "c", "d", "cons"]);
+        assert_eq!(cycles, ["b"]);
+    }
+
     #[test]
     fn cwd_rights_never_exceed_the_subtree_mask()
     {
@@ -315,6 +520,25 @@ mod tests
             ipc::svcmgr_labels::PUBLISH_AUTHORITY,
             false
         ));
+    }
+
+    #[test]
+    fn each_recipe_key_asks_for_its_own_create_flag()
+    {
+        use ipc::procmgr_labels::{CREATE_NODE_HANDLE, CREATE_RESERVE};
+        assert_eq!(create_flags(false, false), 0);
+        assert_eq!(create_flags(true, false), CREATE_RESERVE);
+        assert_eq!(create_flags(false, true), CREATE_NODE_HANDLE);
+        assert_eq!(
+            create_flags(true, true),
+            CREATE_RESERVE | CREATE_NODE_HANDLE
+        );
+        // Never a flag procmgr refuses from svcmgr: the charge-node flag, with
+        // which procmgr refuses CREATE_RESERVE.
+        assert_eq!(
+            create_flags(true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
+            0
+        );
     }
 
     #[test]

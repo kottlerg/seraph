@@ -175,29 +175,6 @@ pub fn iter_xsdt_entries(xsdt_bytes: &[u8]) -> impl Iterator<Item = u64> + '_
         .map(move |i| read_u64(xsdt_bytes, entries_off.saturating_add(i.saturating_mul(8))))
 }
 
-// ── FADT → PM1a ────────────────────────────────────────────────────────
-
-/// Read the FADT's `PM1a_CNT_BLK` I/O port.
-///
-/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
-/// reported length and the slice) does not reach the field, or the port is
-/// zero or wider than 16 bits.
-#[must_use]
-pub fn fadt_pm1a_cnt_blk(fadt_bytes: &[u8]) -> Option<u16>
-{
-    if sdt_signature(fadt_bytes) != *b"FACP"
-    {
-        return None;
-    }
-    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
-    if total_len < FADT_OFF_PM1A_CNT_BLK + 4
-    {
-        return None;
-    }
-    let port = u16::try_from(read_u32(fadt_bytes, FADT_OFF_PM1A_CNT_BLK)).ok()?;
-    if port == 0 { None } else { Some(port) }
-}
-
 // ── FADT → CENTURY ─────────────────────────────────────────────────────
 
 /// Read the FADT's `CENTURY` field: the CMOS RAM index of the RTC's
@@ -1021,33 +998,6 @@ mod tests
         let mut other = fadt_with_century(244, 0x32);
         other[0..4].copy_from_slice(b"APIC");
         assert_eq!(fadt_century_index(&other), None);
-    }
-
-    #[test]
-    fn fadt_yields_its_pm1a_control_port()
-    {
-        assert_eq!(fadt_pm1a_cnt_blk(&fadt(244, 0x604)), Some(0x604));
-    }
-
-    #[test]
-    fn non_fadt_table_yields_no_pm1a_port()
-    {
-        let mut b = fadt(244, 0x604);
-        b[..4].copy_from_slice(b"APIC");
-        assert_eq!(fadt_pm1a_cnt_blk(&b), None);
-    }
-
-    #[test]
-    fn fadt_too_short_for_the_field_yields_no_pm1a_port()
-    {
-        assert_eq!(fadt_pm1a_cnt_blk(&fadt(67, 0)), None);
-    }
-
-    #[test]
-    fn fadt_with_zero_or_wide_pm1a_port_yields_none()
-    {
-        assert_eq!(fadt_pm1a_cnt_blk(&fadt(244, 0)), None);
-        assert_eq!(fadt_pm1a_cnt_blk(&fadt(244, 0x1_0000)), None);
     }
 
     #[test]

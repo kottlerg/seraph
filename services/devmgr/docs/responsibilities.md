@@ -21,7 +21,7 @@ devmgr's responsibilities are:
   (RSDP → XSDT → MCFG; preferred on either architecture whenever an RSDP is
   present and it yields a window) or, failing that, every
   `pci-host-ecam-generic` node of the Device Tree blob; and serve ACPI tables
-  to pwrmgr and acpid (below). When neither yields an ECAM, devmgr on RISC-V falls back to
+  to acpid (below). When neither yields an ECAM, devmgr on RISC-V falls back to
   the QEMU `virt` platform-default ECAM window (`platform_default_ecam`:
   `0x3000_0000`, 256 MiB, buses 0..=255); on x86-64 the boot halts. devmgr
   derives per-device interrupt lines from PCI configuration space; resolving
@@ -467,19 +467,18 @@ devmgr's responsibilities are:
 
   Driver binaries are sourced from one of two places:
 
-  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and
-    the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, and
-    any platform description table) arrive untagged as
-    `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE
-    bootstrap rounds. devmgr tells a module by its content: an ELF image is a
-    driver, read for its declaration (one without a declaration is logged and
-    released); valid UTF-8 text is a platform description table, parsed (one
-    rejected is logged and released); anything else is logged and released.
-    devmgr spawns the drivers during initial enumeration, before the registry
-    loop opens: the IOMMU driver, matched against the IOMMU family record in a
-    pass of its own, and every other module by the declaration it carries,
-    read from the module mapped read-only and bound in the boot pass (above).
-    Every module cap is released once its pass ends.
+  - **Boot bundle** — bootstrap-essentials (virtio-blk, serial, framebuffer, and the IOMMU driver,
+    `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64, and any platform description table) arrive
+    untagged as `procmgr_labels::CREATE_PROCESS`-ready Memory caps in devmgr's MODULE bootstrap
+    rounds. devmgr tells a module by its content, after taking the body of each through the
+    parse-only `objsig::split` (`decls::classify`; a module whose trailer does not parse is logged
+    and released): an ELF image is a driver, read for its declaration (one without a declaration is
+    logged and released); valid UTF-8 text is a platform description table, parsed by
+    `firmware::platform::parse_module` (one rejected is logged and released); anything else is
+    logged and released. devmgr spawns the drivers during initial enumeration, before the registry
+    loop opens: the IOMMU driver, matched against the IOMMU family record in a pass of its own, and
+    every other module by the declaration it carries, read from the module mapped read-only and
+    bound in the boot pass (above). Every module cap is released once its pass ends.
   - **On-disk rootfs** — the drivers at `/services/drivers/<driver>` (among
     them the per-arch RTC, virtio-input, virtio-console, test-dma, and a copy
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
@@ -571,23 +570,18 @@ devmgr's responsibilities are:
   unbound, and a boot with none has no debug port. Each query looks its class
   up by slot in the class table devmgr interns the class names into
   (`devmgr_firmware::classes::Classes`).
-- **Broker ACPI and shutdown hardware to pwrmgr** — devmgr is the sole
-  owner of the ACPI Memory caps and the only service that walks the ACPI
+- **Broker ACPI tables to acpid and the shutdown cap to pwrmgr** — devmgr is the
+  sole owner of the ACPI Memory caps and the only service that walks the ACPI
   table tree (RSDP → XSDT). `QUERY_ACPI_TABLE` locates a table by
   signature or physical address and serves a read-only view of it (devmgr
   reads only the directory and table headers to locate it).
-  `QUERY_SHUTDOWN_DEVICE` carves the shutdown-actuator caps pwrmgr
-  needs — two narrow `IoPort` caps on x86-64, one over the PM1a control port
-  and one over the 8042 reset port, or a Reset-only `SbiControl` derivation
-  on RISC-V. pwrmgr names the PM1a port it computed from the FADT, and devmgr
-  serves it only when it equals the FADT's `PM1a_CNT_BLK`, which devmgr reads
-  itself (with the FADT's `CENTURY` field, the only table-body fields it reads
-  beside the MCFG allocation entries it locates the ECAM windows from). On every
-  call the caps are re-derived from the
-  `IoPort` / `SbiControl` caps devmgr holds, so nothing is consumed and a
-  restarted pwrmgr re-acquires them cleanly. devmgr runs no shutdown logic;
-  it brokers the hardware, pwrmgr interprets and actuates. `QUERY_ACPI_TABLE`
-  is gated on `REGISTRY_QUERY_AUTHORITY`; `QUERY_SHUTDOWN_DEVICE` on
+  `QUERY_SHUTDOWN_DEVICE` serves the shutdown-actuator cap pwrmgr needs on
+  RISC-V, a Reset-only `SbiControl` derivation; on x86-64 it replies
+  `NO_DEVICE`, since pwrmgr powers off and resets through acpid and holds no
+  port. On every call the cap is re-derived from the `SbiControl` cap devmgr
+  holds, so nothing is consumed and a restarted pwrmgr re-acquires it cleanly.
+  devmgr runs no shutdown logic; it brokers the cap, pwrmgr actuates.
+  `QUERY_ACPI_TABLE` is gated on `REGISTRY_QUERY_AUTHORITY`; `QUERY_SHUTDOWN_DEVICE` on
   `SHUTDOWN_DEVICE_AUTHORITY`, which only the `devmgr.shutdown` cap carries:
   a seed-only name pwrmgr alone seeds, which svcmgr's `QUERY_ENDPOINT`
   refuses.
@@ -630,8 +624,8 @@ for a device
 § IOMMU Discovery and Programming); `MODULE` rounds of up to four Memory caps (round data
 `[MODULE, n, size_0, ..., size_n-1]`, each module's size in bytes, since a module's cap covers
 whole pages and devmgr reads no byte past the module's end) carry every boot module outside
-init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels), untagged: the
-driver images and any platform description table; a cap-less
+init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels, trust-store),
+untagged: the driver images and any platform description table; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and
 the terminal `SVCMGR_BUNDLE` round carries the svcmgr publish cap and the arch shutdown-authority
 cap (a full-rights derivation of init's root `IoPort` on x86-64, a Reset + Suspend `SbiControl`
@@ -645,9 +639,9 @@ derivation on RISC-V). Init's side of the transfer is summarized in [services/in
 | Endpoint (devmgr registry, round 1 `caps[0]`) | `RIGHTS_ALL` (incl. Recv, Send, Grant) | Service endpoint for the device-registry IPC: devmgr serves the client queries (`QUERY_DEVICE`, `MINT_CLASS_SEND`, `QUERY_ACPI_TABLE`, `QUERY_SHUTDOWN_DEVICE`, `QUERY_HOST_BRIDGE`), acpid's labels (`QUERY_ACPI_RESOURCES`, `ACPI_REGION_GRANT`, `ACPI_PCI_CONFIG`, `OSC_RESULT`, `BRIDGE_WINDOWS`, `PRT_TABLE`), `SET_DRIVERS_DIR`, and `BIND_DRIVERS` on it; every driver's query cap, for `QUERY_DEVICE_INFO` and `DRIVER_READY`, is on its settle batch's private endpoint instead (above). `BIND_DRIVERS` is gated on `BIND_AUTHORITY`, which only the `devmgr.bind` cap carries: a seed-only name svctest alone seeds. |
 | Mmio (one per boot-provided aperture) | Map, Write | Split per device into BAR / register sub-caps for drivers, and into each IOMMU unit's register cap (a VT-d unit's register page, a RISC-V IOMMU's BAR 0 page), which devmgr delivers to the IOMMU driver, keeping no copy; the ECAM windows carved from them stay devmgr's, split into the configuration page of each function devmgr binds a driver to, which devmgr keeps to write its Command register (above) |
 | Interrupt (full-rights derivation of init's root IRQ range) | Notify, Mint | Split with `SYS_IRQ_SPLIT` into per-line Interrupt caps, each routed with `SYS_IRQ_ROUTE` when carved and kept for the boot, whose derivations are delegated to drivers; mint message-signaled targets with `SYS_IRQ_MSG_ALLOC` through a copy carrying `RIGHTS_IRQ_MINT` alone, derived at startup ([docs/device-management.md](../../../docs/device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
-| IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and pwrmgr's PM1a + 8042 reset ports |
+| IoPort (x86-64, full-rights derivation of init's root) | Use / carve | Carve narrow per-driver port caps (a platform record's `IoPort` resource, such as CMOS or COM1) and acpid's FADT register-block ports |
 | SbiControl (RISC-V, Reset + Suspend) | Reset / Suspend | Steady-state holder of the platform power-state SBI authority (init is reaped); broker a Reset-only derivation to pwrmgr for SBI SRST shutdown / reboot. Suspend held for a future power path |
-| Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables to pwrmgr via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
+| Memory (firmware tables) | Map (read-only) | Parse ACPI RSDP / Device Tree blob; broker read-only ACPI tables via `QUERY_ACPI_TABLE`; read the DMAR's VT-d units, scopes, and RMRRs on x86-64, and the RIMT's PCI IOMMUs and ID mappings on riscv64 |
 | Memory (boot modules, MODULE rounds) | As held by init | Boot-bundle driver images (virtio-blk, serial, framebuffer, and the IOMMU driver, `iommu-vtd` on x86-64 and `iommu-riscv` on riscv64) and any platform description table, untagged and held in `DevmgrCaps.modules`; a driver is spawned via `procmgr_labels::CREATE_PROCESS` by the declaration devmgr reads from it (above), a table is parsed; a module that is neither, or that fails to read, is logged and released |
 | svcmgr publish authority (Endpoint, SVCMGR_BUNDLE round) | Send, Grant (`PUBLISH_AUTHORITY` badge) | Register service caps in svcmgr's registry; held but unused today, reserved for future devmgr publications |
 | SchedControl (baseline, via `ProcessInfo`) | band `[1, 26]` (`sched_policy::DEVMGR_BAND_MAX`) | Place spawned drivers at their assigned levels (each driver of the boot tier from a boot module, the serial and IOMMU drivers and each PCI-bound one, at 26; every other driver, the framebuffer and RTC drivers included, at 25 — the `CREATE_PRIORITY` field of each driver spawn) and set devmgr's own threads' priorities (the DMA thread at 26, the IOMMU fault-log thread at 24, through `std::os::seraph::thread::BuilderExt::spawn_at_priority`). Like every process, devmgr receives this from procmgr (`ProcessInfo.sched_control_cap`); init requests the deliberately-elevated ceiling (above devmgr's own level 24) via the create label's `CREATE_BAND_MAX` field |

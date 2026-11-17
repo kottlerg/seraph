@@ -19,9 +19,11 @@ use crate::{MemoryAlloc, TEMP_MAP_BASE};
 /// Name of the boot module that holds the configuration.
 pub(crate) const MODULE_NAME: &[u8] = b"log-levels";
 
-/// Read the levels the `log-levels` boot module sets. A missing or
-/// unreadable module sets none, so every service logs at its default; a line
-/// that is not a setting is logged and ignored.
+/// Read the levels the `log-levels` boot module sets: the configuration its
+/// body holds, after the trailer the bootloader verified
+/// (`init_log_levels::parse_module`). A missing or unreadable module, or one
+/// whose trailer does not parse, sets none, so every service logs at its
+/// default; a line that is not a setting is logged and ignored.
 ///
 /// # Safety
 /// The scratch span at `TEMP_MAP_BASE` must be unmapped, with no Rust object
@@ -76,16 +78,20 @@ pub(crate) unsafe fn read(info: &InitInfo) -> Levels
     }
     // SAFETY: the module is mapped read-only at TEMP_MAP_BASE, `size` bytes
     // within its `pages` pages.
-    let text = unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, size as usize) };
-    let levels = init_log_levels::parse(text, |line, e| {
+    let module = unsafe { core::slice::from_raw_parts(TEMP_MAP_BASE as *const u8, size as usize) };
+    let levels = init_log_levels::parse_module(module, |line, e| {
         log_parts(&[
             b"init: log-levels: line ignored (",
             e.describe().as_bytes(),
             b"): ",
             line,
         ]);
+    })
+    .unwrap_or_else(|_| {
+        log("init: log-levels module's signature trailer does not parse; no level set");
+        Levels::default()
     });
-    // SAFETY: the module's scratch mapping; `text` is not used past the parse.
+    // SAFETY: the module's scratch mapping; `module` is not used past the parse.
     let _ = unsafe { syscall::mem_unmap(info.aspace_cap, TEMP_MAP_BASE, pages) };
     let _ = syscall::cap_delete(module_ro);
     levels

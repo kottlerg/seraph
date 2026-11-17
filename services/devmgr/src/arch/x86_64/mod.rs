@@ -20,8 +20,8 @@ pub struct ArchCaps
     // Full-rights derivation of init's root `IoPort` cap, delivered as the
     // `SVCMGR_BUNDLE` round's shutdown-authority cap. devmgr derives
     // the narrow copy of each `IoPort` resource of a platform record it
-    // binds and, on
-    // `QUERY_SHUTDOWN_DEVICE`, the PM1a + 8042-reset ports for pwrmgr.
+    // binds and of each FADT register block it serves acpid
+    // (`QUERY_ACPI_RESOURCES`).
     ioport_cap: u64,
 }
 
@@ -147,27 +147,6 @@ pub fn pci_line_mode(overrides: &[SourceOverride], gsi: u32) -> u64
     firmware::acpi::line_mode(overrides.iter().copied(), gsi)
 }
 
-/// 8042 KBC command port: the 1-byte reset register pwrmgr pulses for reboot.
-const KBC_COMMAND_PORT: u16 = 0x64;
-
-/// The ports of pwrmgr's shutdown actuators ([`reply_shutdown_device`]):
-/// the FADT's `PM1a` control pair, when it can be read, and the 8042
-/// command port. acpid is granted none of them.
-pub fn pwrmgr_ports(firmware: &Firmware) -> Vec<firmware::acpid::Range>
-{
-    let pm1a = locate_table_by_sig(firmware, *b"FACP")
-        .and_then(|fadt| with_acpi_table(firmware, fadt, firmware::acpi::fadt_pm1a_cnt_blk));
-    let io = |base: u16, count: u64| firmware::acpid::Range {
-        space: firmware::acpid::Space::Io,
-        base: u64::from(base),
-        end: u64::from(base).saturating_add(count),
-    };
-    pm1a.map(|port| io(port, 2))
-        .into_iter()
-        .chain([io(KBC_COMMAND_PORT, 1)])
-        .collect()
-}
-
 /// The legacy ports of the interrupt controllers and timers the kernel owns,
 /// `(base, count)`: the two 8259s and their edge/level control registers,
 /// the PIT and the port-0x61 gate of its channel 2, which the kernel
@@ -239,51 +218,11 @@ pub fn prt_rule(mode: firmware::acpid::PrtMode) -> Option<firmware::acpid::PrtRu
 }
 
 /// Reply to an authorised, version-checked `QUERY_SHUTDOWN_DEVICE` with
-/// pwrmgr's shutdown actuator caps: a narrow `IoPort` over the
-/// caller-supplied `PM1a` control port (`msg` word 1) plus the 8042 reset
-/// port. Replies `INVALID_REQUEST` when word 1 is not the FADT's
-/// `PM1a_CNT_BLK`, and `NO_DEVICE` when the FADT field cannot be read or
-/// either carve fails.
-pub fn reply_shutdown_device(firmware: &Firmware, msg: &IpcMessage, ipc_buf: *mut u64)
+/// `NO_DEVICE`: on x86-64 pwrmgr reaches the ACPI sleep and reset
+/// registers through acpid, which holds them, and devmgr serves it nothing.
+pub fn reply_shutdown_device(_firmware: &Firmware, _msg: &IpcMessage, ipc_buf: *mut u64)
 {
-    // pwrmgr computes the PM1a control port from the FADT; devmgr checks
-    // it against its own read of the same field so the request cannot
-    // name any other port.
-    let Some(pm1a) = locate_table_by_sig(firmware, *b"FACP")
-        .and_then(|fadt| with_acpi_table(firmware, fadt, firmware::acpi::fadt_pm1a_cnt_blk))
-    else
-    {
-        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-        return;
-    };
-    if msg.word(1) != u64::from(pm1a)
-    {
-        reply_status(ipc::devmgr_errors::INVALID_REQUEST, ipc_buf);
-        return;
-    }
-    let Some(pm1a_cap) = ioport_carve(firmware.arch.ioport_cap, pm1a, 2)
-    else
-    {
-        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-        return;
-    };
-    let Some(kbc_cap) = ioport_carve(firmware.arch.ioport_cap, KBC_COMMAND_PORT, 1)
-    else
-    {
-        let _ = syscall::cap_delete(pm1a_cap);
-        reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
-        return;
-    };
-    let reply = IpcMessage::builder(ipc::devmgr_errors::SUCCESS)
-        .cap(pm1a_cap)
-        .cap(kbc_cap)
-        .build();
-    // SAFETY: ipc_buf is the registered IPC buffer.
-    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
-    {
-        let _ = syscall::cap_delete(pm1a_cap);
-        let _ = syscall::cap_delete(kbc_cap);
-    }
+    reply_status(ipc::devmgr_errors::NO_DEVICE, ipc_buf);
 }
 
 /// Carve a narrow `IoPort` of `count` ports starting at `base` out of

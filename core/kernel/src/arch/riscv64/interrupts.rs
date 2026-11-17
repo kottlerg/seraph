@@ -1266,6 +1266,39 @@ pub unsafe fn install_trap_vector()
 #[cfg(test)]
 pub unsafe fn install_trap_vector() {}
 
+/// `scounteren.CY` (bit 0): U-mode reads of the `cycle` counter.
+#[cfg(not(test))]
+const SCOUNTEREN_CY: u64 = 1 << 0;
+
+/// The counters U-mode reads, as `scounteren` bits: `cycle` alone, which
+/// userspace cycle measurements read (the counterpart of the timestamp counter
+/// x86-64 grants). `time`, `instret` and every `hpmcounter` stay denied, so
+/// a U-mode read of one raises an illegal-instruction exception, which the
+/// kernel delivers as the thread's fault
+/// ([docs/capability-model.md](../../../../../docs/capability-model.md)
+/// § Microarchitectural Isolation).
+#[cfg(not(test))]
+const USER_COUNTERS: u64 = SCOUNTEREN_CY;
+
+/// Write this hart's `scounteren` whole with [`USER_COUNTERS`], replacing
+/// every bit the firmware left, so each hart grants U-mode the same counters.
+///
+/// # Safety
+/// Must execute in supervisor mode on the hart being initialised.
+#[cfg(not(test))]
+unsafe fn set_user_counters()
+{
+    // SAFETY: csrw scounteren is a privileged S-mode instruction on a per-hart
+    // register that gates U-mode counter reads only; caller ensures S-mode.
+    unsafe {
+        core::arch::asm!(
+            "csrw scounteren, {grant}",
+            grant = in(reg) USER_COUNTERS,
+            options(nostack, nomem),
+        );
+    }
+}
+
 /// Initialise supervisor trap infrastructure for the BSP.
 ///
 /// # Safety
@@ -1336,18 +1369,9 @@ pub unsafe fn init()
         );
     }
 
-    // Allow U-mode to read the hardware cycle performance counter
-    // (scounteren.CY = bit 0). Required for userspace cycle-count benchmarks
-    // (equivalent to rdtsc on x86-64). The SBI firmware is responsible for
-    // granting S-mode access via mcounteren.CY; this propagates it to U-mode.
-    // SAFETY: csrs scounteren is a privileged S-mode instruction; caller ensures S-mode.
-    unsafe {
-        core::arch::asm!(
-            "csrs scounteren, {cy}",
-            cy = in(reg) 1u64,
-            options(nostack, nomem),
-        );
-    }
+    // Grant U-mode the counters of USER_COUNTERS, and only them.
+    // SAFETY: caller ensures S-mode on the BSP.
+    unsafe { set_user_counters() };
 
     // Bring up AIA: the APLIC domain (every source inactive and disabled,
     // whatever firmware left enabled) and the BSP's IMSIC file. The BSP's
@@ -1428,15 +1452,9 @@ pub unsafe fn init_ap()
         );
     }
 
-    // Allow U-mode performance-counter reads (per-hart; same as BSP init).
-    // SAFETY: S-mode on this AP (caller contract); scounteren is per-hart.
-    unsafe {
-        core::arch::asm!(
-            "csrs scounteren, {cy}",
-            cy = in(reg) 1u64,
-            options(nostack, nomem),
-        );
-    }
+    // Grant U-mode the same counters as the BSP; scounteren is per-hart.
+    // SAFETY: S-mode on this AP (caller contract).
+    unsafe { set_user_counters() };
 
     // Initialise this hart's IMSIC file (by hart id; percpu::init_ap installed
     // `tp` before this call, so current_cpu() is valid). Firmware may have left

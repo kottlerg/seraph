@@ -99,7 +99,8 @@ subcommands! {
         /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
         /// and regenerate `disk.img` without invoking cargo. The mirror is
         /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
-        /// pruned); use `--repack-only` to pack a hand-staged sysroot verbatim.
+        /// pruned); use `--repack-only` to pack a hand-staged sysroot as it
+        /// stands. Every pack re-signs the kernel and the ELF images in place.
         /// Requires an arch-tagged sysroot from a prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
@@ -162,6 +163,12 @@ subcommands! {
         /// unstage the fixture again (see xtask/README.md).
         TestDebugPort(TestDebugPortArgs),
 
+        /// Check the reboot path: stage the `reboot` fixture, boot the current
+        /// sysroot once with a QMP socket, and pass when the fixture's REBOOT
+        /// resets the machine (QMP's SHUTDOWN event with reason `guest-reset`)
+        /// and QEMU exits on its own, through acpid's `RESET_REG` write on
+        /// `x86_64`; unstage the fixture again (see xtask/README.md).
+        TestReboot(TestRebootArgs),
         /// Check PCI Express native hotplug: stage the `hotplug-check` fixture
         /// and the `test-dma` class, boot the current sysroot with an empty root
         /// port (on `x86_64` once under the machine's default, where devmgr must
@@ -301,6 +308,7 @@ impl CliCommand
             | Self::TestMapRedo(_)
             | Self::TestLogLevel(_)
             | Self::TestDebugPort(_)
+            | Self::TestReboot(_)
             | Self::TestHotplug(_)
             | Self::TestGdb(_)
             | Self::TestWedge(_)
@@ -641,11 +649,13 @@ args! {
         #[arg(long, default_value = "x86_64")]
         pub arch: Arch,
 
-        /// Repack `disk.img` from the sysroot exactly as it is, skipping the
-        /// `rootfs/` re-mirror. Use after editing the staged sysroot directly
-        /// (e.g. adding a test recipe or removing a default one): a normal
-        /// re-mirror is authoritative and would restore `rootfs/`-present recipes
-        /// and prune `rootfs/`-absent ones, undoing the manual staging.
+        /// Repack `disk.img` from the sysroot as it stands, skipping the
+        /// `rootfs/` re-mirror; the kernel and the ELF images are still
+        /// re-signed in place, as every pack signs them. Use after editing the
+        /// staged sysroot directly (e.g. adding a test recipe or removing a
+        /// default one): a normal re-mirror is authoritative and would restore
+        /// `rootfs/`-present recipes and prune `rootfs/`-absent ones, undoing
+        /// the manual staging.
         #[arg(long)]
         pub repack_only: bool,
 
@@ -909,6 +919,30 @@ args! {
         /// free on `127.0.0.1` when the boot starts.
         #[arg(long)]
         pub port: Option<u16>,
+
+        /// Number of vCPUs to expose to the guest (QEMU -smp).
+        #[arg(long, default_value = "4")]
+        pub cpus: u32,
+
+        /// Guest memory size in MiB (QEMU -m).
+        #[arg(long, default_value = "512")]
+        pub mem: u32,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── TestReboot ───────────────────────────────────────────────────────────────
+
+args! {
+    pub struct TestRebootArgs
+    {
+        /// Target architecture.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
 
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]

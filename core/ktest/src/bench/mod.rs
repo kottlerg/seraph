@@ -12,10 +12,10 @@
 //! Benchmarks read the hardware cycle counter directly — no syscall overhead
 //! on the measurement path:
 //!
-//! - **x86-64**: `rdtsc` (accessible from U-mode by default; CR4.TSD is not
-//!   set by the kernel).
-//! - **RISC-V**: `csrr cycle` (accessible from U-mode after the kernel sets
-//!   `scounteren.CY = 1` during Phase 5 init).
+//! - **x86-64**: `rdtsc` (accessible from U-mode: the kernel clears `CR4.TSD`
+//!   on every CPU).
+//! - **RISC-V**: `csrr cycle` (accessible from U-mode: the kernel grants
+//!   `scounteren.CY` on every hart).
 //!
 //! # Adding a new benchmark
 //!

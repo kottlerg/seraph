@@ -236,21 +236,17 @@ pub fn reconcile_and_launch(
         // Within the slot reserved above, so the push cannot grow.
         entries.push(name);
     }
-    // Deterministic launch order — purely for grep-ability of the
-    // boot log; svcmgr makes no policy claim about start sequencing
-    // across /config/svcmgr/services/ (services that depend on each other use
-    // discovery-registry lookups, not file-system ordering). File names in
-    // one directory are unique, so the unstable sort, which needs no scratch
-    // allocation, gives the same order a stable one would.
+    // A deterministic scan order, so the parse diagnostics repeat from boot
+    // to boot; the launch order is `svcmgr_defs::launch_order`'s, below.
+    // File names in one directory are unique, so the unstable sort, which
+    // needs no scratch allocation, gives the same order a stable one would.
     entries.sort_unstable();
 
-    // Parse every recipe first, then order providers (services that
-    // publish their own endpoint via `provides = ...`) ahead of pure
-    // consumers, so a provided name is in the discovery registry before
-    // any consumer launched here resolves it. Service names are unique (one
-    // `.svc` suffix stripped from unique file names), so ordering by
-    // (consumer, service name) with the allocation-free unstable sort keeps
-    // each group in service-name order.
+    // Parse every recipe first, then put them in launch order: providers
+    // (services that publish their own endpoint via `provides = ...`) ahead
+    // of pure consumers, and a provider after each provider whose name it
+    // seeds, so a provided name is in the discovery registry before any
+    // service launched here resolves it (`svcmgr_defs::launch_order`).
     let Some(mut defs) = parse_recipes(&entries, pending, ctx.ipc_buf)?
     else
     {
@@ -258,8 +254,11 @@ pub fn reconcile_and_launch(
         release_unsupervised(pending, "no memory for the recipes");
         return Ok(());
     };
-    defs.sort_unstable_by(|a, b| {
-        (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
+    svcmgr_defs::launch_order(&mut defs, |def| {
+        log!(
+            warn: "svcmgr: {} is in a seed cycle; launched before a provider it seeds from",
+            def.name
+        );
     });
 
     // One actuator, the first declaration in launch order; any later one is
@@ -413,9 +412,12 @@ fn handle_definition(
         log!("svcmgr: launched ephemeral: {}", def.name);
         let _ = syscall::cap_delete(launched.thread_cap);
         let _ = syscall::cap_delete(launched.process_handle);
-        if launched.provided_endpoint != 0
+        for cap in [launched.provided_endpoint, launched.node_handle]
         {
-            let _ = syscall::cap_delete(launched.provided_endpoint);
+            if cap != 0
+            {
+                let _ = syscall::cap_delete(cap);
+            }
         }
         return None;
     }
@@ -466,6 +468,8 @@ fn handle_definition(
     entry.thread_cap = launched.thread_cap;
     entry.process_handle = launched.process_handle;
     entry.provided_endpoint = launched.provided_endpoint;
+    entry.node_handle = launched.node_handle;
+    entry.launched = true;
     table.install(idx, entry, recipe)?;
     Some(idx)
 }
@@ -580,7 +584,8 @@ fn release_registration(pending: &PendingRegistration)
 }
 
 /// Clone the launch surfaces the restart path replays from a parsed
-/// definition: argv/env/cwd/seed byte-for-byte, the log-sink flag, and the
+/// definition: argv/env/cwd/seed byte-for-byte, the log-sink,
+/// debug-authority, `oom_stop`, stop-authority and reserve flags, and the
 /// scheduling fields. The name, binary, policy and namespace live on the
 /// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
 /// the copies.
@@ -598,6 +603,9 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         seed: try_strings(&def.seed)?,
         log_sink: def.log_sink,
         debug_authority: def.debug_authority,
+        oom_stop: def.oom_stop,
+        stop_authority: def.stop_authority,
+        reserve: def.reserve,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
     })

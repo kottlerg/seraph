@@ -3,8 +3,8 @@
 
 // services/acpid/src/arch/x86_64/mod.rs
 
-//! x86-64: the legacy-to-ACPI mode switch, the I/O-port accesses, and the
-//! interrupt model acpid selects.
+//! x86-64: the legacy-to-ACPI mode switch, the I/O-port accesses, the
+//! interrupt model acpid selects, and the sleep and reset registers.
 //!
 //! The firmware hands over in the PIC model, with `SCI_EN` possibly clear.
 //! acpid reads each host bridge's `_PRT` in that model first, whose link
@@ -63,6 +63,112 @@ fn block(devmgr: &Devmgr, block: u64) -> Result<Block, CallError>
     })
 }
 
+/// The fixed register blocks of the power requests, acquired once from
+/// devmgr and bound to the evaluation thread, which serves the requests:
+/// `PM1a_CNT` for `SLEEP` (and the ACPI-mode check) and `RESET_REG` for
+/// `RESET`.
+pub struct Power
+{
+    pm1a: Option<Block>,
+    reset: Option<Block>,
+}
+
+impl Power
+{
+    /// Acquire `PM1a_CNT` and `RESET_REG` through `devmgr` and bind them to
+    /// `thread`, the calling thread. A block the platform lacks, or that
+    /// cannot be bound, is logged and left absent.
+    pub fn acquire(devmgr: &Devmgr, thread: u64) -> Self
+    {
+        let pm1a = match block(devmgr, devmgr_labels::ACPI_PM1A_CNT)
+        {
+            Ok(pm1a) if pm1a.count >= 2 && bind_ports(thread, pm1a.cap) => Some(pm1a),
+            Ok(_) =>
+            {
+                std::os::seraph::log!(warn: "PM1a control block not usable");
+                None
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "no PM1a control block ({e:?})");
+                None
+            }
+        };
+        let reset = match block(devmgr, devmgr_labels::ACPI_RESET)
+        {
+            Ok(reset) if reset.count >= 1 && bind_ports(thread, reset.cap) => Some(reset),
+            Ok(_) =>
+            {
+                std::os::seraph::log!(warn: "RESET_REG not usable");
+                None
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "no RESET_REG ({e:?})");
+                None
+            }
+        };
+        Self { pm1a, reset }
+    }
+
+    /// Whether `PM1a_CNT` is held, so a sleep state can be entered.
+    pub const fn can_sleep(&self) -> bool
+    {
+        self.pm1a.is_some()
+    }
+
+    /// Enter the sleep state of `SLP_TYPa` `slp_typ`: write
+    /// [`acpid::power::pm1_control_writes`]'s two values to `PM1a_CNT`.
+    /// Returns, true, only when the platform keeps running; false without a
+    /// write when `PM1a_CNT` is not held.
+    pub fn sleep(&self, state: u8, slp_typ: u16) -> bool
+    {
+        let Some(pm1a) = self.pm1a
+        else
+        {
+            return false;
+        };
+        // SAFETY: `pm1a.port` starts the two-port control block bound to
+        // this thread at acquisition; the read has no side effect.
+        let current = unsafe { inw(pm1a.port) };
+        let [typed, enter] = acpid::power::pm1_control_writes(current, slp_typ);
+        std::os::seraph::log!(
+            "SLEEP({state}): PM1a_CNT {:#x} <- {typed:#x}, then {enter:#x}",
+            pm1a.port
+        );
+        // SAFETY: as the read; writing `SLP_TYP` with `SLP_EN` clear to
+        // `PM1a_CNT` is the first step of the ACPI sleep sequence.
+        unsafe { outw(pm1a.port, typed) };
+        // SAFETY: as the read; writing `SLP_TYP | SLP_EN` next enters the
+        // sleep state, the ACPI specification's second step.
+        unsafe { outw(pm1a.port, enter) };
+        true
+    }
+
+    /// Reset the platform: write `RESET_VALUE` to `RESET_REG`. Returns,
+    /// true, only when the platform keeps running; false without a write
+    /// when `RESET_REG` is not held.
+    pub fn reset(&self) -> bool
+    {
+        let Some(reset) = self.reset
+        else
+        {
+            return false;
+        };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "RESET_VALUE is the FADT's one-byte field"
+        )]
+        let value = reset.value as u8;
+        std::os::seraph::log!("RESET: RESET_REG {:#x} <- {value:#x}", reset.port);
+        // SAFETY: `reset.port` is the FADT's `RESET_REG`, bound to this
+        // thread at acquisition; writing `RESET_VALUE` to it is the reset the
+        // ACPI specification defines.
+        unsafe { outb(reset.port, value) };
+        true
+    }
+}
+
 /// Bind the `IoPort` capability `cap` to the thread `thread`; whether
 /// the kernel accepted it.
 pub fn bind_ports(thread: u64, cap: u64) -> bool
@@ -71,22 +177,16 @@ pub fn bind_ports(thread: u64, cap: u64) -> bool
 }
 
 /// Switch the platform into ACPI mode when `SCI_EN` is clear: write the
-/// FADT's `ACPI_ENABLE` value to `SMI_CMD` and wait for `SCI_EN`. Binds
-/// the `PM1a` control block and `SMI_CMD` to `thread`, the calling thread.
-/// Each outcome is logged; a platform without the blocks is left as it is.
-pub fn enable_acpi(devmgr: &Devmgr, thread: u64)
+/// FADT's `ACPI_ENABLE` value to `SMI_CMD` and wait for `SCI_EN`, read
+/// from the `PM1a` control block `power` holds. Binds `SMI_CMD` to
+/// `thread`, the calling thread. Each outcome is logged; a platform without
+/// the blocks is left as it is.
+pub fn enable_acpi(devmgr: &Devmgr, thread: u64, power: &Power)
 {
-    let pm1 = match block(devmgr, devmgr_labels::ACPI_PM1A_CNT)
+    let Some(pm1) = power.pm1a
+    else
     {
-        Ok(pm1) if pm1.count >= 2 && bind_ports(thread, pm1.cap) => pm1,
-        Ok(_) =>
-        {
-            return std::os::seraph::log!(warn: "PM1a control block not usable; ACPI mode not checked");
-        }
-        Err(e) =>
-        {
-            return std::os::seraph::log!(warn: "no PM1a control block ({e:?}); ACPI mode not checked");
-        }
+        return std::os::seraph::log!(warn: "no PM1a control block; ACPI mode not checked");
     };
     // SAFETY: `pm1.port` starts the two-port control block bound above; the
     // read has no side effect.

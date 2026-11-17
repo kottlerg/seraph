@@ -81,6 +81,8 @@ pub struct Target
     /// Whether the process declared itself on the core path: no core of it
     /// is written, since the write would wait on it.
     pub no_core: bool,
+    /// Whether a core may be written at all.
+    pub dump: crate::Dump,
 }
 
 /// How a dump ended, for its log line.
@@ -154,6 +156,10 @@ fn capture(
     if target.no_core
     {
         return Outcome::Failed("the process is on the core path");
+    }
+    if target.dump == crate::Dump::MemoryCritical
+    {
+        return Outcome::Failed("memory is critical");
     }
     match hold_threads(target, authority, generation, ipc_buf, held)
     {

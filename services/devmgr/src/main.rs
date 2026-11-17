@@ -1318,13 +1318,12 @@ fn handle_query_acpi_table(
     }
 }
 
-/// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform shutdown
-/// actuator caps, gated on `SHUTDOWN_DEVICE_AUTHORITY`. devmgr runs no
-/// shutdown logic. x86-64: a narrow `IoPort` over the caller-supplied
-/// `PM1a` control port, served only when it is the FADT's `PM1a_CNT_BLK`,
-/// plus the 8042 reset port. RISC-V: a Reset-only `SbiControl` derivation.
-/// The caps are re-derived from devmgr's held caps on every call, so a
-/// pwrmgr restart re-acquires them cleanly.
+/// `QUERY_SHUTDOWN_DEVICE` handler: serve pwrmgr the platform's firmware
+/// shutdown authority, gated on `SHUTDOWN_DEVICE_AUTHORITY`. devmgr runs no
+/// shutdown logic. RISC-V: a Reset-only `SbiControl` derivation, re-derived
+/// from devmgr's held cap on every call, so a pwrmgr restart re-acquires it.
+/// x86-64: `NO_DEVICE`, since pwrmgr reaches the ACPI sleep and reset
+/// registers through acpid.
 fn handle_query_shutdown_device(
     firmware: &caps::Firmware,
     msg: &IpcMessage,

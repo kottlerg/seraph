@@ -15,6 +15,7 @@
 
 use namespace_protocol::rights as ns_rights;
 
+use super::stop::{StopFacts, StopRefusal, core_role, stop_refusal};
 use super::{Definition, NamespaceShape, ProvidedName, RestartPolicy, blob_len};
 
 /// Badge stamped on an `:auth` provider SEND — the first verb bit
@@ -175,9 +176,11 @@ fn parse_priority_value(lineno: usize, value: &str, key: &'static str) -> Result
 /// inconsistent combination (`cwd` with `namespace = none`, a `cwd` of the
 /// root under `namespace = universal`, a `cwd` outside a
 /// `namespace = subtree:` path or under one whose rights lack `LOOKUP`,
-/// `log_sink` with `seed`/`provides` or with `debug_authority`,
+/// `log_sink` with `seed`/`provides`, `debug_authority` or `stop_authority`,
 /// a `shutdown_actuator` that names no `:auth` `provides` entry of the recipe
-/// or sits on a `restart = never` service, `sched_max` below `priority`), a
+/// or sits on a `restart = never` service, `oom_stop = yes` on a recipe the
+/// stop rule refuses (`super::stop::stop_refusal`), `sched_max` below
+/// `priority`), a
 /// `binary` or
 /// subtree path over `ipc::MAX_PATH_LEN` or with no path components
 /// ([`ParseError::InvalidValue`]), or
@@ -218,6 +221,9 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
     let mut provides: Vec<ProvidedName> = Vec::new();
     let mut log_sink: Option<bool> = None;
     let mut debug_authority: Option<bool> = None;
+    let mut oom_stop: Option<bool> = None;
+    let mut stop_authority: Option<bool> = None;
+    let mut reserve: Option<bool> = None;
     let mut shutdown_name: Option<String> = None;
     let mut priority: Option<u8> = None;
     let mut sched_max: Option<u8> = None;
@@ -436,6 +442,36 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                     }
                 });
             }
+            "oom_stop" =>
+            {
+                set_yes_no(
+                    &mut oom_stop,
+                    lineno,
+                    value,
+                    "oom_stop",
+                    "oom_stop must be yes or no",
+                )?;
+            }
+            "stop_authority" =>
+            {
+                set_yes_no(
+                    &mut stop_authority,
+                    lineno,
+                    value,
+                    "stop_authority",
+                    "stop_authority must be yes or no",
+                )?;
+            }
+            "reserve" =>
+            {
+                set_yes_no(
+                    &mut reserve,
+                    lineno,
+                    value,
+                    "reserve",
+                    "reserve must be yes or no",
+                )?;
+            }
             "shutdown_actuator" =>
             {
                 if shutdown_name.is_some()
@@ -545,11 +581,46 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         ));
     }
 
+    let stop_authority = stop_authority.unwrap_or(false);
+    if log_sink && stop_authority
+    {
+        // As for debug_authority: the log sink's round has no slot for it.
+        return Err(ParseError::InvalidValue(
+            0,
+            "log_sink is exclusive of stop_authority",
+        ));
+    }
+
     let shutdown_actuator = match &shutdown_name
     {
         Some(name) => Some(check_shutdown_actuator(name, restart, &provides)?),
         None => None,
     };
+
+    let reserve = reserve.unwrap_or(false);
+    let oom_stop = oom_stop.unwrap_or(false);
+    if oom_stop
+    {
+        // The rule svcmgr applies to each stop request, on what the recipe
+        // alone shows: a recipe it would always refuse is a contradiction.
+        let facts = StopFacts {
+            launched: true,
+            restart_never: matches!(restart, RestartPolicy::Never),
+            critical: system_critical,
+            core_role: core_role(
+                log_sink,
+                debug_authority,
+                stop_authority,
+                reserve,
+                shutdown_actuator.is_some(),
+            ),
+            oom_stop,
+        };
+        if let Some(refusal) = stop_refusal(&facts)
+        {
+            return Err(ParseError::InvalidValue(0, oom_stop_refusal(refusal)));
+        }
+    }
 
     // The service's own band must cover its starting level, so it can
     // always restore its initial priority. procmgr enforces the same
@@ -577,9 +648,58 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
         log_sink,
         debug_authority,
         shutdown_actuator,
+        oom_stop,
+        stop_authority,
+        reserve,
         priority,
         sched_max,
     })
+}
+
+/// Set a `yes | no` key's value `slot` from `value` on line `lineno`, or
+/// the [`ParseError`] for a repeat of `key`, or for a value other than `yes`
+/// or `no`, which reports `invalid`.
+fn set_yes_no(
+    slot: &mut Option<bool>,
+    lineno: usize,
+    value: &str,
+    key: &'static str,
+    invalid: &'static str,
+) -> Result<(), ParseError>
+{
+    if slot.is_some()
+    {
+        return Err(ParseError::DuplicateKey(lineno, key));
+    }
+    *slot = Some(match value
+    {
+        "yes" => true,
+        "no" => false,
+        _ => return Err(ParseError::InvalidValue(lineno, invalid)),
+    });
+    Ok(())
+}
+
+/// The parse error for an `oom_stop = yes` recipe the eligibility rule
+/// refuses for `refusal`. A recipe is launched by svcmgr when it is read, so
+/// [`StopRefusal::NotLaunched`] and [`StopRefusal::NotOptedIn`] cannot
+/// arise; they map to the general message.
+const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
+{
+    match refusal
+    {
+        StopRefusal::RestartNever =>
+        {
+            "oom_stop needs a supervised service (restart other than never)"
+        }
+        StopRefusal::Critical => "oom_stop needs critical = no",
+        StopRefusal::CoreRole =>
+        {
+            "oom_stop is exclusive of log_sink, debug_authority, stop_authority, reserve and \
+             shutdown_actuator"
+        }
+        StopRefusal::NotLaunched | StopRefusal::NotOptedIn => "oom_stop refused by the stop rule",
+    }
 }
 
 /// Check a `shutdown_actuator = <name>` declaration against the rest of its
@@ -871,6 +991,109 @@ sched_max = 12\n";
             parse_with("sched_max = 5\nsched_max = 6\n"),
             Err(ParseError::DuplicateKey(_, "sched_max"))
         ));
+    }
+
+    /// A supervised (`restart = on_failure`), non-critical recipe with
+    /// `extra` appended: the shape `oom_stop = yes` needs.
+    fn supervised_with(extra: &str) -> Result<Definition, ParseError>
+    {
+        let contents = format!(
+            "binary = /services/x\nrestart = on_failure\ncritical = no\nnamespace = none\n{extra}"
+        );
+        parse("x", &contents)
+    }
+
+    #[test]
+    fn the_stop_and_reserve_keys_are_off_unless_the_recipe_sets_them()
+    {
+        let def = parse_with("").expect("default");
+        assert!(!def.oom_stop && !def.stop_authority && !def.reserve);
+        for key in ["oom_stop", "stop_authority", "reserve"]
+        {
+            let set = supervised_with(&format!("{key} = yes\n")).expect("set");
+            assert_eq!(
+                (set.oom_stop, set.stop_authority, set.reserve),
+                (key == "oom_stop", key == "stop_authority", key == "reserve"),
+                "{key}"
+            );
+            let cleared = supervised_with(&format!("{key} = no\n")).expect("cleared");
+            assert!(!cleared.oom_stop && !cleared.stop_authority && !cleared.reserve);
+            assert!(
+                matches!(
+                    supervised_with(&format!("{key} = maybe\n")),
+                    Err(ParseError::InvalidValue(_, _))
+                ),
+                "{key}"
+            );
+            assert!(
+                matches!(
+                    supervised_with(&format!("{key} = no\n{key} = no\n")),
+                    Err(ParseError::DuplicateKey(_, k)) if k == key
+                ),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn oom_stop_is_refused_on_a_recipe_the_stop_rule_refuses()
+    {
+        // Each line, with oom_stop = yes on a supervised, non-critical,
+        // core-role-free recipe, makes a recipe the rule always refuses.
+        for extra in [
+            "critical = yes\n",
+            "log_sink = yes\n",
+            "debug_authority = yes\n",
+            "stop_authority = yes\n",
+            "reserve = yes\n",
+            "provides = p:auth\nshutdown_actuator = p\n",
+        ]
+        {
+            let contents = format!(
+                "binary = /services/x\nrestart = on_failure\nnamespace = none\noom_stop = yes\n{}{extra}",
+                if extra.starts_with("critical")
+                {
+                    ""
+                }
+                else
+                {
+                    "critical = no\n"
+                }
+            );
+            assert!(
+                matches!(parse("x", &contents), Err(ParseError::InvalidValue(0, _))),
+                "{extra:?}"
+            );
+        }
+        // restart = never: BASE is one-shot.
+        assert!(matches!(
+            parse_with("oom_stop = yes\n"),
+            Err(ParseError::InvalidValue(0, _))
+        ));
+        // The eligible shape parses, with restart = always as well.
+        assert!(
+            supervised_with("oom_stop = yes\n")
+                .expect("eligible")
+                .oom_stop
+        );
+        let always = "binary = /services/x\nrestart = always\ncritical = no\nnamespace = none\n\
+                      oom_stop = yes\n";
+        assert!(parse("x", always).expect("eligible, always").oom_stop);
+    }
+
+    #[test]
+    fn the_log_sink_cannot_hold_the_stop_authority()
+    {
+        assert!(matches!(
+            parse_with("log_sink = yes\nstop_authority = yes\n"),
+            Err(ParseError::InvalidValue(0, _))
+        ));
+        // A one-shot recipe may hold it.
+        assert!(
+            parse_with("stop_authority = yes\n")
+                .expect("one-shot holder")
+                .stop_authority
+        );
     }
 
     #[test]

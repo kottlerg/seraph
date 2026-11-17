@@ -157,7 +157,8 @@ static TSC_PER_US: AtomicU64 = AtomicU64::new(0);
 
 /// Read the Time Stamp Counter.
 ///
-/// `rdtsc` is accessible from U-mode (CR4.TSD is not set) and from ring 0.
+/// `rdtsc` is accessible from ring 0 and from U-mode, the kernel clearing
+/// `CR4.TSD` on every CPU (`cpu::enable_smep_smap`).
 /// Returns a 64-bit cycle count. Use deltas; the absolute value is arbitrary.
 #[cfg(not(test))]
 #[inline(always)]

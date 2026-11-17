@@ -66,6 +66,10 @@ pub struct Caps
     /// `DEBUG_AUTHORITY`-badged `SEND|GRANT` on procmgr, which the recipe's
     /// `debug_authority = yes` delivers in slot 15, after the seeds.
     pub debug_authority: u64,
+    /// `STOP_AUTHORITY`-badged SEND on svcmgr's service endpoint, which the
+    /// recipe's `stop_authority = yes` delivers in slot 16, after the
+    /// debug-authority slot.
+    pub stop_authority: u64,
 }
 
 /// Drain the bootstrap rounds from `creator_endpoint` and pull caps out,
@@ -93,8 +97,8 @@ fn request_round() -> Caps
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: IPC buffer is registered by `_start` and page-aligned by
     // the boot protocol.
-    // Fifteen seeds and the debug-authority slot take four rounds; an absent slot decodes as
-    // `0`, and a round that does not decode leaves every slot `0`.
+    // Fifteen seeds, the debug-authority slot and the stop-authority slot take five rounds; an
+    // absent slot decodes as `0`, and a round that does not decode leaves every slot `0`.
     let Ok(
         [
             root_fs,
@@ -113,8 +117,9 @@ fn request_round() -> Caps
             framebuffer_deny_class,
             vfsd_swap,
             debug_authority,
+            stop_authority,
         ],
-    ) = (unsafe { ipc::bootstrap::request_slots::<16>(info.creator_endpoint, ipc_buf) })
+    ) = (unsafe { ipc::bootstrap::request_slots::<17>(info.creator_endpoint, ipc_buf) })
     else
     {
         return caps;
@@ -135,6 +140,7 @@ fn request_round() -> Caps
     caps.framebuffer_deny_class = framebuffer_deny_class;
     caps.vfsd_swap = vfsd_swap;
     caps.debug_authority = debug_authority;
+    caps.stop_authority = stop_authority;
 
     caps
 }

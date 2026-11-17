@@ -8,7 +8,15 @@ publish.workspace = true
 boot-protocol = { workspace = true }
 elf = { path = "../../shared/elf" }
 font = { workspace = true }
+# The signed-object verifier and the trust store's embedded layout
+# (docs/signing.md); verify-only, no `sign` feature.
+objsig = { path = "../../shared/objsig" }
 text = { workspace = true }
+
+[dev-dependencies]
+# Host tests only: Ed25519 signing, to sign the objects they verify. The
+# bootloader's own build never enables `sign` (shared/crypto/README.md).
+crypto = { path = "../../shared/crypto", features = ["sign"] }
 
 [lints]
 workspace = true

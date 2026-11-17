@@ -896,7 +896,7 @@ production value is raised.
 | `UNSCALED_CPUS`, `scaled_polls` | `core/ktest/src/main.rs` | 16, `u32` saturating | test fixture | none | correct as is | None |
 | `REPORT_SLICES`, `REPORT_SLICE_MS` | `core/ktest/src/tally.rs` | 1000 x 5 ms | test fixture | none | correct as is | None |
 | `await_all` mask | `core/ktest/src/tally.rs` | 64 children | ABI width (notification word) | none | correct as is | None |
-| `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
+| `MAX_POLLS` (16 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
 | `CSPACE_RELEASE_POLLS` | `core/ktest/src/unit/mm.rs` | 2000 x 1 ms, scaled | test fixture (the wait for a dead `CSpace`'s deferred teardown, as long as `MAX_POLLS`) | none | correct as is | None |
 | `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 4097 | test fixture (one past the former 4096-entry registry; funded at the ABI's `CSPACE_SLOTS_PER_PAGE` slots a page) | about 16 KiB BSS | correct as is | None |
 | `HOLDERS`, `WAKERS` | `core/ktest/src/stress/sleep_list_wide.rs` | 192 / 64 | test fixture (past the former 128-entry sleep list) | 5 MiB BSS (256 4 KiB stacks, each above its 16 KiB guard) | correct as is | None |
@@ -909,7 +909,7 @@ production value is raised.
 | `SEED_ATTEMPTS` | `core/ktest/src/unit/retype.rs` (`pool_seeding_takes_interrupts`) | 4 | test fixture (conclusive repeats of a millisecond seeding call, so host scheduling delay alone cannot keep every probe outside the calls) | none | correct as is | None |
 | `SEED_ATTEMPT_LIMIT` | `core/ktest/src/unit/retype.rs` (`pool_seeding_takes_interrupts`) | 16 | test fixture (every seeding call of one kind, conclusive or not, so a host or kernel that leaves every call inconclusive still fails the case) | none | correct as is | None |
 | `BARRIER_POLLS` | `core/ktest/src/integration/multi_caller_ipc_fifo.rs` | 10000 x 1 ms, scaled | test fixture (the wait for the barrier thread that runs once every caller is queued) | none | correct as is | None |
-| `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |
+| `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/cpu_sample.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |
 | `ROUNDS`, `PULL_BUDGET_US`, `LOW_EXIT_POLLS`, `SPINNER_START_MS`, `SPINNER_DRAIN_WINDOWS` | `core/ktest/src/integration/idle_pull_starved_ready.rs` | 8 / 50 ms, scaled / 1000 x 1 ms, scaled / 5 s / 4 x 5 s | test fixture (rounds enough that a pull by the threshold rule's transient alone passes them all rarely; budgets far past the idle pull's few ms) | none | correct as is | None |
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |

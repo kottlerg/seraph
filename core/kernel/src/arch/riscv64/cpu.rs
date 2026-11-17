@@ -311,9 +311,30 @@ pub(super) fn sstateen0_fault_fixup(pc: u64) -> Option<u64>
     }
 }
 
+/// The U-mode environment controls, as the `senvcfg` value: none granted.
+/// `CBZE`, `CBCFE` and `CBIE` clear make every U-mode cache-block operation
+/// (`cbo.zero`, `cbo.clean`, `cbo.flush`, `cbo.inval`) raise an
+/// illegal-instruction exception; `cbo.inval` would otherwise discard a
+/// block's dirty data and expose what memory held below it. `PMM` clear turns
+/// pointer masking off, `LPE` and `SSE` clear keep the landing-pad and
+/// shadow-stack enforcement and the `ssp` CSR from U-mode, and `FIOM` clear
+/// keeps fences on I/O and memory separate. A field whose extension the hart
+/// lacks is read-only zero, so the value is the same on every hart.
+#[cfg(not(test))]
+const SENVCFG_USER_ENABLES: u64 = 0;
+
 /// Disable, for U-mode, every state the kernel does not switch: write
 /// `sstateen0` with no state enabled ([`super::encoding::SSTATEEN0_USER_ENABLES`])
-/// and halt the boot unless it reads back so.
+/// and halt the boot unless it reads back so. Then write `senvcfg` whole with
+/// [`SENVCFG_USER_ENABLES`], replacing what the firmware or reset left, so no
+/// hart grants U-mode a cache-block operation, pointer masking, landing pads or
+/// a shadow stack.
+///
+/// `senvcfg` exists on every hart the RVA23 floor admits (Privileged
+/// Architecture 1.13, `Ss1p13`); a hart without it takes the kernel's fatal
+/// illegal-instruction trap at the write, which finds its per-CPU pointer
+/// installed (the caller's contract), as a hart without V does at its `vlenb`
+/// read.
 ///
 /// Ssstateen is required (docs/platform-requirements.md § riscv64
 /// Classification). A hart without it, or whose firmware keeps `sstateen0` from
@@ -358,9 +379,22 @@ pub unsafe fn disable_unswitched_user_state()
             crate::fatal("Ssstateen: sstateen0 kept a U-mode state enable set");
         }
     }
+
+    // SAFETY: `csrw senvcfg` (CSR 0x10A, written by number) is a privileged
+    // S-mode instruction on a per-hart register that gates U-mode environment
+    // features only; the caller's contract is S-mode on this hart with its
+    // trap path and per-CPU pointer installed.
+    unsafe {
+        core::arch::asm!(
+            "csrw 0x10A, {envcfg}",
+            envcfg = in(reg) SENVCFG_USER_ENABLES,
+            options(nostack, nomem),
+        );
+    }
 }
 
-/// Test-build stub: the `sstateen0` write is a privileged CSR access.
+/// Test-build stub: the `sstateen0` and `senvcfg` writes are privileged CSR
+/// accesses.
 ///
 /// # Safety
 /// No preconditions; `unsafe` only for signature parity with the non-test item.

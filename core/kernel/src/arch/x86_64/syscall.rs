@@ -9,7 +9,8 @@
 //!
 //! Configures the MSRs required by the SYSCALL instruction:
 //!
-//! - `IA32_EFER.SCE` — enables SYSCALL/SYSRET.
+//! - `IA32_EFER.SCE` — enables SYSCALL/SYSRET; the same write clears the
+//!   user-visible `EFER.LMSLE` and `EFER.UAIE` (AMD).
 //! - `IA32_STAR` — segment selectors:
 //!     - bits [47:32] = 0x0008: SYSCALL sets CS=0x08 (kernel), SS=0x10.
 //!     - bits [63:48] = 0x0010: SYSRET64 gives CS=(0x10+16)|3=0x23 (user),
@@ -61,6 +62,19 @@ const IA32_LSTAR: u32 = 0xC000_0082;
 const IA32_SFMASK: u32 = 0xC000_0084;
 
 const EFER_SCE: u64 = 1 << 0;
+
+/// `EFER.LMSLE` (bit 13, AMD): enforces data-segment limits in 64-bit mode at
+/// CPL > 0.
+const EFER_LMSLE: u64 = 1 << 13;
+
+/// `EFER.UAIE` (bit 20, AMD): Upper Address Ignore, which makes the CPU ignore
+/// bits \[63:57\] of a CPL-3 data address.
+const EFER_UAIE: u64 = 1 << 20;
+
+/// The `EFER` controls ring 3 reaches that the kernel does not grant, cleared
+/// on every CPU by [`init`]. A CPU without one implements its bit as reserved,
+/// which reads 0, so the clear writes the value it holds.
+const EFER_USER_CONTROLS_DENIED: u64 = EFER_LMSLE | EFER_UAIE;
 
 /// The trap flag, the bit a fault handler sets through the register file to
 /// single-step a thread: one definition, the ABI's.
@@ -269,7 +283,8 @@ unsafe extern "custom" fn syscall_entry()
 
 /// Configure the SYSCALL/SYSRET mechanism.
 ///
-/// Enables SYSCALL in EFER, programs STAR/LSTAR/SFMASK.
+/// Enables SYSCALL in EFER and clears its user-visible controls
+/// ([`EFER_USER_CONTROLS_DENIED`]), programs STAR/LSTAR/SFMASK.
 ///
 /// # Safety
 /// Ring 0. GDT must have the Seraph layout before this call.
@@ -283,7 +298,7 @@ pub unsafe fn init()
     // SAFETY: ring 0; MSR writes.
     unsafe {
         let efer = cpu::read_msr(IA32_EFER);
-        cpu::write_msr(IA32_EFER, efer | EFER_SCE);
+        cpu::write_msr(IA32_EFER, (efer & !EFER_USER_CONTROLS_DENIED) | EFER_SCE);
         cpu::write_msr(IA32_STAR, STAR_VALUE);
         cpu::write_msr(IA32_LSTAR, syscall_entry as *const () as u64);
         cpu::write_msr(IA32_SFMASK, SFMASK_VALUE);

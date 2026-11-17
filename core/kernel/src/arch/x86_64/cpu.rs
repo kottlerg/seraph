@@ -4,16 +4,18 @@
 // core/kernel/src/arch/x86_64/cpu.rs
 
 //! x86-64 CPU control primitives: CPUID and the core key it gives, CR4 and MSR
-//! access, the fault-recoverable user-copy routine, SMEP/SMAP and PCID
-//! enablement, the boot-time baseline feature gate, per-CPU GS-base install and
-//! lookup, the kernel trap stack, interrupt control and halt, the fence ahead of
-//! an x2APIC MSR write, and the debug-build kernel-entry RFLAGS check.
+//! access, the fault-recoverable user-copy routine, SMEP/SMAP enablement and
+//! the other ring-3 controls of CR4, the ring-3 controls held in MSRs
+//! (`set_user_msr_controls`), PCID enablement, the boot-time baseline feature
+//! gate, per-CPU GS-base install and lookup, the kernel trap stack, interrupt
+//! control and halt, the fence ahead of an x2APIC MSR write, and the
+//! debug-build kernel-entry RFLAGS check.
 //!
 //! `current_stack_pointer`, `load_word_racy`, the CR4/MSR accessors, `x2apic_wrmsr_fence`,
-//! `copy_user`, `in_user_copy`, the enable routines, `verify_baseline`, `install_percpu`, the
-//! trap-stack and interrupt save/restore primitives, and the kernel-entry flags check
-//! are built only under `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have
-//! host stubs). `cpuid`, `cpuid_subleaf`, `smt_core_key`, `core_key`,
+//! `copy_user`, `in_user_copy`, the enable routines, `set_user_msr_controls`,
+//! `verify_baseline`, `install_percpu`, the trap-stack and interrupt save/restore
+//! primitives, and the kernel-entry flags check are built only under
+//! `#[cfg(not(test))]` (`copy_user` and `verify_baseline` have host stubs). `cpuid`, `cpuid_subleaf`, `smt_core_key`, `core_key`,
 //! `current_cpu` (which returns 0 under test), `halt_until_interrupt`,
 //! `disable_interrupts`, `halt_loop`, and the no-op
 //! `disable_unswitched_user_state` are also built for host tests.
@@ -360,10 +362,69 @@ const CR4_FSGSBASE: u64 = 1 << 16;
 /// `SLDT`, `SMSW`, and `STR` at CPL > 0 with `#GP`.
 const CR4_UMIP: u64 = 1 << 11;
 
+/// `CR4.VME` (bit 0): virtual-8086 mode extensions. No effect in 64-bit mode;
+/// cleared so no CPU keeps a firmware value.
+const CR4_VME: u64 = 1 << 0;
+
+/// `CR4.PVI` (bit 1): protected-mode virtual interrupts. Turns a ring-3 `CLI`
+/// or `STI` under `IOPL` 0, which otherwise raises `#GP`, into a write of
+/// `RFLAGS.VIF`.
+const CR4_PVI: u64 = 1 << 1;
+
+/// `CR4.TSD` (bit 2): faults `RDTSC` and `RDTSCP` at CPL > 0 with `#GP`.
+const CR4_TSD: u64 = 1 << 2;
+
+/// `CR4.PCE` (bit 8): lets `RDPMC` execute at CPL > 0.
+const CR4_PCE: u64 = 1 << 8;
+
+/// `CR4.KL` (bit 19): enables the Key Locker instructions, which run at
+/// CPL 3 and use the per-CPU wrapping key (`IWKey`), which the kernel neither
+/// loads nor switches.
+const CR4_KL: u64 = 1 << 19;
+
+/// `CR4.PKE` (bit 22): user-mode protection keys. Makes bits \[62:59\] of a
+/// user leaf its key and `RDPKRU`/`WRPKRU` executable at CPL 3; `PKRU` is not
+/// an XCR0 component the kernel enables, so it would not be switched.
+const CR4_PKE: u64 = 1 << 22;
+
+/// `CR4.PKS` (bit 24): supervisor protection keys. Makes bits \[62:59\] of a
+/// supervisor leaf its key, checked against `IA32_PKRS`.
+const CR4_PKS: u64 = 1 << 24;
+
+/// `CR4.UINTR` (bit 25): user interrupts. Enables `CLUI`, `STUI`, `TESTUI`,
+/// `UIRET` and `SENDUIPI` at CPL 3, whose state the kernel does not switch.
+const CR4_UINTR: u64 = 1 << 25;
+
+/// The CR4 controls ring 3 reaches that the kernel does not grant, cleared on
+/// every CPU by [`enable_smep_smap`]. `FSGSBASE`, `TSD` and `PCE` are
+/// documented there; `PKS` is the supervisor half of `PKE` and is cleared
+/// with it.
+const CR4_USER_CONTROLS_DENIED: u64 =
+    CR4_VME | CR4_PVI | CR4_TSD | CR4_PCE | CR4_FSGSBASE | CR4_KL | CR4_PKE | CR4_PKS | CR4_UINTR;
+
 /// Enable Supervisor Mode Execution Prevention (SMEP) and Supervisor Mode
 /// Access Prevention (SMAP) by setting CR4 bits 20 and 21, set `CR4.UMIP`
-/// where the CPU has it, and clear `CR4.FSGSBASE`, which firmware may have left
-/// set.
+/// where the CPU has it, and clear every CR4 control ring 3 reaches that the
+/// kernel does not grant ([`CR4_USER_CONTROLS_DENIED`]), which firmware may
+/// have left set.
+///
+/// The BSP runs on the CR4 the firmware left and each AP on the trampoline's,
+/// so this step sets or clears each of these bits explicitly, and every CPU
+/// ends with the same ones. With TSD and PCE clear, ring 3 reads the timestamp
+/// counter (`RDTSC`, `RDTSCP`) and no performance counter (`RDPMC` raises
+/// `#GP`), the counter set
+/// [capability-model.md](../../../../../docs/capability-model.md)
+/// § Microarchitectural Isolation states. With PVI, KL, PKE and UINTR clear, a
+/// ring-3 `CLI` or `STI` raises `#GP`, and the Key Locker, protection-key and
+/// user-interrupt instructions raise `#UD`: each reaches per-CPU state the
+/// kernel does not switch between threads.
+///
+/// `PKS` is cleared because a supervisor key is the kernel's to assign: with
+/// it set, the firmware's `IA32_PKRS` would govern the kernel's own accesses to
+/// its key-0 pages. Supervisor keys could serve the kernel later, to fence
+/// regions such as the page tables from its own stray writes. Adopting them
+/// means programming `IA32_PKRS` on every CPU and setting `PKS` here, not
+/// keeping the firmware's.
 ///
 /// With FSGSBASE off, ring 3 can change its GS base only by loading a GDT
 /// selector, whose base is 0, so a user GS base is never a kernel-half address;
@@ -384,8 +445,8 @@ const CR4_UMIP: u64 = 1 << 11;
 ///
 /// # Safety
 /// Must execute at ring 0. The IDT need not be loaded: CPUID gates every bit
-/// this sets and `CR4.FSGSBASE` is only cleared, so the CR4 write cannot fault,
-/// and the BSP calls this before `idt::init`.
+/// this sets and the [`CR4_USER_CONTROLS_DENIED`] bits are only cleared, so
+/// the CR4 write cannot fault, and the BSP calls this before `idt::init`.
 #[cfg(not(test))]
 #[expect(
     clippy::similar_names,
@@ -407,7 +468,7 @@ pub unsafe fn enable_smep_smap()
         crate::fatal("SMAP not supported by CPU — required");
     }
     // Bit 20 = SMEP, bit 21 = SMAP.
-    let mut cr4 = (read_cr4() & !CR4_FSGSBASE) | (1 << 20) | (1 << 21);
+    let mut cr4 = (read_cr4() & !CR4_USER_CONTROLS_DENIED) | (1 << 20) | (1 << 21);
     if umip_present
     {
         cr4 |= CR4_UMIP;
@@ -416,6 +477,112 @@ pub unsafe fn enable_smep_smap()
     // the new CR4 value is valid.
     unsafe {
         write_cr4(cr4);
+    }
+}
+
+// ── User-mode MSR controls ────────────────────────────────────────────────────
+
+/// `IA32_TSC_AUX`: the value `RDTSCP` returns in ECX and `RDPID` returns.
+const IA32_TSC_AUX: u32 = 0xC000_0103;
+
+/// `MSR_MISC_FEATURES_ENABLES` (Intel): bit 0 turns ring-3 `CPUID` into `#GP`
+/// (CPUID faulting); bit 1 lets ring 3 execute `MONITOR`/`MWAIT` (Xeon Phi).
+const MSR_MISC_FEATURES_ENABLES: u32 = 0x140;
+
+/// The [`MSR_MISC_FEATURES_ENABLES`] bits cleared: CPUID faulting and ring-3
+/// `MONITOR`/`MWAIT`.
+const MISC_FEATURES_USER_DENIED: u64 = (1 << 0) | (1 << 1);
+
+/// `IA32_U_CET`: ring 3's CET controls (shadow stack, indirect-branch
+/// tracking), in effect while `CR4.CET` is set.
+const IA32_U_CET: u32 = 0x6A0;
+
+/// `HWCR` (AMD).
+const AMD_HWCR: u32 = 0xC001_0015;
+
+/// `HWCR.CpuidUserDis` (bit 35): turns ring-3 `CPUID` into `#GP`.
+const AMD_HWCR_CPUID_USER_DIS: u64 = 1 << 35;
+
+/// Set this CPU's user-visible MSR controls to the kernel's values, replacing
+/// what the firmware or reset left, as `enable_smep_smap` does for CR4:
+///
+/// - `IA32_TSC_AUX` = 0, where the CPU has `RDTSCP` (`CPUID.80000001H:EDX[27]`)
+///   or `RDPID` (`CPUID.(EAX=07H,ECX=0):ECX[22]`), the instructions that read it
+///   at CPL 3: ring 3 reads 0 as the processor identifier on every CPU, and
+///   learns nothing the firmware stored there. A CPU with neither has no
+///   instruction that reads it.
+/// - CPUID faulting off: Intel's `MSR_MISC_FEATURES_ENABLES` bits 0 and 1
+///   (with ring-3 `MONITOR`/`MWAIT`) cleared where the MSR exists, which the
+///   write learns from a recovering read ([`super::idt::msr_recovering`]: the
+///   MSR has no CPUID enumeration); AMD's `HWCR.CpuidUserDis` cleared where
+///   `CPUID.80000021H:EAX[17]` enumerates it. Ring 3 executes `CPUID`, which
+///   Rust's runtime feature detection does. A CPU without either control
+///   cannot fault ring-3 `CPUID`.
+/// - `IA32_U_CET` = 0, where the CPU has CET shadow stacks
+///   (`CPUID.(EAX=07H,ECX=0):ECX[7]`) or indirect-branch tracking (`EDX[20]`):
+///   ring 3 runs with neither, whatever the firmware left, once the kernel sets
+///   `CR4.CET` for its own shadow stacks (`shadow_stack::enable`). A CPU with
+///   neither has no user CET control.
+///
+/// `EFER`'s user-visible bits are set by `syscall::init`, which writes the
+/// register. § User-mode hardware controls of
+/// [core/kernel/docs/cross-boundary-disclosure.md](../../../docs/cross-boundary-disclosure.md)
+/// lists every control.
+///
+/// # Safety
+/// Ring 0 on the kernel's GDT, interrupts off, and no supervisor shadow stack
+/// on this CPU ([`super::idt::msr_recovering`]'s contract): `interrupts::init`
+/// on the BSP after `idt::init`, and `interrupts::init_ap` on each AP, both
+/// before `shadow_stack::enable`.
+#[cfg(not(test))]
+pub unsafe fn set_user_msr_controls()
+{
+    let max_extended = cpuid(0x8000_0000).0;
+    let rdtscp = max_extended >= 0x8000_0001 && (cpuid(0x8000_0001).3 >> 27) & 1 != 0;
+    // Leaf 7 sub-leaf 0: ECX (.2) and EDX (.3) feature flags.
+    let leaf7 = cpuid_subleaf(7, 0);
+    let rdpid = (leaf7.2 >> 22) & 1 != 0;
+    if rdtscp || rdpid
+    {
+        // SAFETY: ring 0; CPUID enumerates RDTSCP or RDPID, so IA32_TSC_AUX
+        // exists, and every value is valid in its low 32 bits.
+        unsafe { write_msr(IA32_TSC_AUX, 0) };
+    }
+
+    // SAFETY: the caller's contract is `msr_recovering`'s; a read of an MSR
+    // the CPU lacks faults and is recovered as `None`.
+    let misc = unsafe { super::idt::msr_recovering(MSR_MISC_FEATURES_ENABLES, None) };
+    if let Some(misc) = misc.filter(|misc| misc & MISC_FEATURES_USER_DENIED != 0)
+    {
+        // SAFETY: as for the read. The MSR exists, and clearing its bits
+        // writes zero to a bit the CPU does not implement, which it accepts.
+        // A refused write is recovered and leaves the MSR as it was.
+        unsafe {
+            super::idt::msr_recovering(
+                MSR_MISC_FEATURES_ENABLES,
+                Some(misc & !MISC_FEATURES_USER_DENIED),
+            )
+        };
+    }
+
+    let cet = (leaf7.2 >> 7) & 1 != 0 || (leaf7.3 >> 20) & 1 != 0;
+    if cet
+    {
+        // SAFETY: ring 0; CPUID enumerates a CET feature, so IA32_U_CET exists,
+        // and 0 (every control off) is valid.
+        unsafe { write_msr(IA32_U_CET, 0) };
+    }
+
+    if max_extended >= 0x8000_0021 && (cpuid(0x8000_0021).0 >> 17) & 1 != 0
+    {
+        // SAFETY: ring 0; CPUID enumerates CpuidUserDis, so HWCR exists.
+        let hwcr = unsafe { read_msr(AMD_HWCR) };
+        if hwcr & AMD_HWCR_CPUID_USER_DIS != 0
+        {
+            // SAFETY: as for the read; the bit is writable, and only it
+            // changes.
+            unsafe { write_msr(AMD_HWCR, hwcr & !AMD_HWCR_CPUID_USER_DIS) };
+        }
     }
 }
 

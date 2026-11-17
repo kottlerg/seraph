@@ -595,7 +595,7 @@ init
  ├── ...
  └── svcmgr
       ├── logd     (serial, framebuffer endpoints via QUERY_DEVICE on class SENDs)
-      ├── pwrmgr   (ACPI tables + shutdown hw via QUERY_ACPI_TABLE / QUERY_SHUTDOWN_DEVICE)
+      ├── pwrmgr   (acpid SLEEP / RESET on x86-64; SbiControl via QUERY_SHUTDOWN_DEVICE on RISC-V)
       ├── timed    (RTC endpoint via QUERY_DEVICE on the rtc class SEND)
       └── terminal (input, framebuffer, serial endpoints via QUERY_DEVICE on class SENDs)
 ```

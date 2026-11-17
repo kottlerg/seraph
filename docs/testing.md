@@ -174,6 +174,7 @@ rootfs/config/svcmgr/
 │   ├── crashd.svc            # crashd naming crashme for cores; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   ├── hotplug-check.svc     # hotplug fixture; staged by test-hotplug
+│   ├── reboot.svc            # reboot fixture; staged by test-reboot
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
     └── gdbstub.svc           # GDB stub template; staged, naming its target,
@@ -311,8 +312,8 @@ for the snapshot-detection design.
 
 Same boot requirements as `test-terminal` (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI it runs as
-an additional boot inside the x86_64 `usertest` cell, after `test-terminal` and
-`test-wedge`.
+an additional boot inside the x86_64 `usertest` cell, after `test-terminal`,
+`test-wedge` and `test-reboot`.
 
 ### KASLR randomization (`test-kaslr`)
 
@@ -419,6 +420,27 @@ command.
 
 In CI it runs as an extra boot inside each `usertest` cell (both arches, both profiles), after
 `test-crash-report`, on the cell's usertest staging and under the cell's `run-parallel` budget.
+
+### Reboot (`test-reboot`)
+
+A reboot ends the boot that makes it, so no in-guest harness can check it, and every harness boot
+ends in a power-off instead. `cargo xtask test-reboot [--arch]` (both arches) checks it host-side:
+
+1. Stage the `reboot` fixture's recipe (svctest's `reboot` role, seeded with
+   `pwrmgr.shutdown`) from `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and repack the
+   disk images in the layout they have.
+2. Boot the current sysroot once with a QMP socket. The fixture logs
+   `reboot fixture: requesting REBOOT` and sends pwrmgr `REBOOT`. On x86_64 pwrmgr has acpid write
+   the FADT's `RESET_VALUE` to its `RESET_REG` (acpid logs `RESET: RESET_REG`); on riscv64 it
+   makes the SBI system reset call (cold reboot).
+3. QEMU runs with `-no-reboot`, so the reset ends it. The test passes on the fixture's line, on
+   x86_64 acpid's line, a QMP `SHUTDOWN` event whose reason is `guest-reset` (a power-off gives
+   `guest-shutdown`), and QEMU's own exit.
+4. Remove the recipe and repack the images in that layout again, whatever the outcome.
+
+See [xtask/README.md § test-reboot](../xtask/README.md#cargo-xtask-test-reboot) for the command.
+In CI it runs as a further boot inside each `usertest` cell (both arches, both profiles), after
+`test-wedge`, on the default boot `test-terminal` restored.
 
 ### Debug port (`test-debug-port`)
 
@@ -614,9 +636,11 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
-then the `test-wedge` boot pair, then on x86_64 the `test-vmgenid` save/restore boot pair.
-The terminal and wedge test boots have *no* shutdown-invoking harness: `test-terminal` and
-`test-wedge` compute the verdict host-side and kill QEMU themselves.
+then the `test-wedge` boot pair, then the `test-reboot` boot, then on x86_64 the `test-vmgenid`
+save/restore boot pair. The terminal and wedge test boots have *no* shutdown-invoking harness:
+`test-terminal` and `test-wedge` compute the verdict host-side and kill QEMU themselves. The
+`test-reboot` boot's fixture invokes `REBOOT`, the host reads the reset over QMP, and QEMU exits on
+its own.
 
 ---
 

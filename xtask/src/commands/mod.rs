@@ -34,6 +34,7 @@ pub mod test_hotplug;
 pub mod test_kaslr;
 pub mod test_log_level;
 pub mod test_map_redo;
+pub mod test_reboot;
 pub mod test_terminal;
 pub mod test_vmgenid;
 pub mod test_wedge;

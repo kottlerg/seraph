@@ -114,7 +114,8 @@ Power manager. Owns the platform shutdown surface and serves
 
 **acpid**
 ACPI service. Runs the firmware's AML on every boot and pushes each PCI host bridge's `_OSC`
-result, windows and routes to devmgr; devmgr evaluates none. See
+result, windows and routes to devmgr; devmgr evaluates none. It also serves pwrmgr's S5 power-off
+and reset. See
 [`services/acpid/README.md`](../services/acpid/README.md).
 
 **timed**

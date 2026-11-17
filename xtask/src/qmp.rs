@@ -8,7 +8,8 @@
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test), `stop` + `pmemsave` (the ACPI table
-//! capture), and `device_add` (the hotplug test).
+//! capture), and `device_add` (the hotplug test); and waits for the
+//! `SHUTDOWN` event (the reboot test).
 //!
 //! Hand-rolled (no JSON dependency): the messages are fixed strings or
 //! `format!` templates, the free-form values (the migrate URI, the memory
@@ -208,6 +209,51 @@ fn pmemsave_command(base: u64, size: u64, path: &Path) -> Result<String>
     ))
 }
 
+/// Connect, then wait up to `timeout` for QEMU's `SHUTDOWN` event and
+/// return its `reason` (`guest-reset` for a guest reset under
+/// `-no-reboot`, `guest-shutdown` for a guest power-off). Connect before
+/// the guest can shut down: an event QEMU emits with no client connected is
+/// lost.
+pub fn wait_shutdown(socket: &Path, timeout: Duration) -> Result<String>
+{
+    let mut client = Client::connect(socket)?;
+    let start = Instant::now();
+    loop
+    {
+        let left = timeout
+            .checked_sub(start.elapsed())
+            .filter(|left| !left.is_zero())
+            .with_context(|| format!("no SHUTDOWN event within {}s", timeout.as_secs()))?;
+        client
+            .reader
+            .get_ref()
+            .set_read_timeout(Some(left))
+            .context("setting QMP read timeout")?;
+        let line = read_line(&mut client.reader).context("waiting for the SHUTDOWN event")?;
+        if let Some(reason) = shutdown_reason(&line)
+        {
+            return Ok(reason.to_owned());
+        }
+    }
+}
+
+/// The `reason` of the QMP line `line` when it is the `SHUTDOWN` event;
+/// `"unknown"` for a `SHUTDOWN` event without one; `None` for any other
+/// line.
+fn shutdown_reason(line: &str) -> Option<&str>
+{
+    let value = |key: &str| {
+        let (_, rest) = line.split_once(&format!("\"{key}\""))?;
+        let rest = rest
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start()
+            .strip_prefix('"')?;
+        rest.split_once('"').map(|(v, _)| v)
+    };
+    (value("event")? == "SHUTDOWN").then(|| value("reason").unwrap_or("unknown"))
+}
+
 /// Hot-add the device `driver`, its id `id`, on the bus `bus` (a port's id),
 /// with the further properties `properties`, each a name and a JSON number.
 pub fn device_add(
@@ -391,6 +437,26 @@ mod tests
             cmd,
             r#"{"execute":"pmemsave","arguments":{"val":2147483648,"size":536870912,"filename":"/w/\"m\".bin"}}"#
         );
+    }
+
+    #[test]
+    fn shutdown_reason_reads_the_shutdown_event_only()
+    {
+        let reset = r#"{"timestamp": {"seconds": 1, "microseconds": 2}, "event": "SHUTDOWN", "data": {"guest": true, "reason": "guest-reset"}}"#;
+        assert_eq!(shutdown_reason(reset), Some("guest-reset"));
+        let off = r#"{"event":"SHUTDOWN","data":{"guest":true,"reason":"guest-shutdown"}}"#;
+        assert_eq!(shutdown_reason(off), Some("guest-shutdown"));
+        assert_eq!(
+            shutdown_reason(r#"{"event": "SHUTDOWN", "data": {"guest": true}}"#),
+            Some("unknown")
+        );
+        assert_eq!(
+            shutdown_reason(
+                r#"{"event": "RESET", "data": {"guest": true, "reason": "guest-reset"}}"#
+            ),
+            None
+        );
+        assert_eq!(shutdown_reason(r#"{"return": {}}"#), None);
     }
 
     #[test]

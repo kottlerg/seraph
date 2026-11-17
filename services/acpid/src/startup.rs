@@ -3,11 +3,13 @@
 
 // services/acpid/src/startup.rs
 
-//! acpid's start-up sequence, run on the evaluation thread: load the DSDT
-//! and the SSDTs, enable ACPI mode where the platform has a legacy mode, run
-//! the module-level code and the initialization walk, then evaluate each PCI
-//! host bridge's `_PRT`, `_OSC` and `_CRS` and push the results to devmgr.
-//! Every failure is logged and the sequence goes on with what it has.
+//! acpid's start-up sequence, run on the evaluation thread: acquire the
+//! sleep and reset registers, load the DSDT and the SSDTs, enable ACPI mode
+//! where the platform has a legacy mode, run the module-level code and the
+//! initialization walk, then evaluate each PCI host bridge's `_PRT`, `_OSC`
+//! and `_CRS` and push the results to devmgr. Every failure is logged and
+//! the sequence goes on with what it has; the thread then serves the power
+//! requests (`crate::server`).
 
 use acpid::bridge::{self, Bridge, Osc};
 use acpid::{Failure, Why, walk};
@@ -19,24 +21,40 @@ use std::os::seraph::{mem_map_funded, reserve_pages, unreserve_pages};
 use crate::arch;
 use crate::devmgr::{CallError, Devmgr, TableView};
 use crate::platform::Platform;
+use crate::server;
 
 /// The most SSDTs acpid asks devmgr for (`docs/limits.md`); the XSDT of a
 /// QEMU machine lists one.
 const MAX_SSDTS: u64 = 64;
 
 /// Run the start-up sequence, reaching devmgr through `devmgr` and mapping
-/// into the address space `aspace`.
-pub fn run(devmgr: &Devmgr, aspace: u64)
+/// into the address space `aspace`, then serve the requests received on
+/// `service`, acpid's service endpoint, for acpid's lifetime.
+pub fn run(devmgr: &Devmgr, aspace: u64, service: u64) -> !
 {
-    let Some((mut ns, tables)) = load(devmgr, aspace)
-    else
-    {
-        return;
-    };
     let thread = std::os::seraph::thread::current_thread_cap();
-    arch::current::enable_acpi(devmgr, thread);
+    let power = arch::current::Power::acquire(devmgr, thread);
     let mut platform = Platform::new(devmgr, aspace, thread);
-    let mut ev = Evaluator::new(&mut ns, &mut platform);
+    let mut ns = load(devmgr, aspace);
+    if let Some((ns, tables)) = &mut ns
+    {
+        arch::current::enable_acpi(devmgr, thread, &power);
+        start(ns, *tables, devmgr, &mut platform);
+    }
+    server::serve(
+        service,
+        ns.as_mut().map(|(ns, _)| ns),
+        &mut platform,
+        &power,
+    );
+}
+
+/// Evaluate the loaded namespace `ns` of `tables` tables: the module-level
+/// code, the initialization walk, and each PCI host bridge's results, pushed
+/// to devmgr.
+fn start(ns: &mut Namespace, tables: usize, devmgr: &Devmgr, platform: &mut Platform<'_>)
+{
+    let mut ev = Evaluator::new(ns, platform);
     let module = ev.run_module_code();
     if module.faults > 0
     {

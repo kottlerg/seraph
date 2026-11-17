@@ -269,7 +269,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   `QUERY_ENDPOINT` never yields `GRANT` for any name; a seed is `SEND` except `devmgr.bind`'s
   `SEND|GRANT`.
 
-  `pwrmgr.shutdown`, `pwrmgr.deny`, and `timed` are published by
+  `pwrmgr.shutdown`, `pwrmgr.deny`, `acpid.power`, `acpid.deny`, and `timed` are published by
   svcmgr's provider path on each provider's launch (see
   [`provides`](../../svcmgr/docs/service-definitions.md#provides)). Name constants are
   centralised in `ipc::published_names`.
@@ -277,7 +277,7 @@ endowment (see the [svcmgr IPC interface](../../svcmgr/docs/ipc-interface.md)).
   and `pwrmgr` are svcmgr-launched providers (`timed.svc` / `pwrmgr.svc`),
   brought up post-handover; each resolves its authority from devmgr at
   startup (`QUERY_DEVICE` on the rtc class SEND for [timed](../../timed/README.md);
-  `QUERY_ACPI_TABLE` + `QUERY_SHUTDOWN_DEVICE` for
+  `QUERY_SHUTDOWN_DEVICE` on RISC-V, acpid's `SLEEP` / `RESET` on x86-64, for
   [pwrmgr](../../pwrmgr/README.md)). The RTC chip driver (cmos-rtc on
   x86-64, goldfish-rtc on RISC-V) is spawned by devmgr from
   `/services/drivers/<chip>` after svcmgr's `SET_DRIVERS_DIR` handshake

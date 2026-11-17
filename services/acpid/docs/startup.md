@@ -6,43 +6,55 @@ What acpid does on each start, from loading the tables to the pushes, and how it
 
 ## Threads
 
-The main thread takes the bootstrap round (the `devmgr.acpi` seed), spawns the evaluation
-thread, waits for it, and then parks. The evaluation thread runs the whole sequence below. Its
+The main thread takes the bootstrap round (the RECV on acpid's service endpoint and the
+`devmgr.acpi` seed), spawns the evaluation thread, and waits for it. The evaluation thread runs
+the whole sequence below and then serves the power requests on the endpoint for acpid's lifetime
+([README.md](../README.md) § Power requests), so one thread owns the namespace. Its
 stack is the larger of the evaluator's and the parser's stack bounds plus 256 KiB for acpid's
 own frames ([docs/limits.md](../../../docs/limits.md)): a spawned thread's stack is at least the
 size it asks for, while the main thread's grows past its first pages only in a demand-paged
-process. acpid stays alive after the sequence, so that svcmgr does not restart it into the same
-start-up and so that it keeps the grants it holds.
+process. acpid stays alive after the sequence, serving, so that svcmgr does not restart it into
+the same start-up and so that it keeps the grants it holds. When the evaluation thread panics or
+cannot be spawned, the main thread exits acpid, since the power requests would wait unanswered,
+and svcmgr restarts it. A failed bootstrap round keeps acpid alive instead, since a restart would
+fail the same way: a round that delivered the service endpoint without the `devmgr.acpi` seed has
+the main thread answer each power request `NO_DEVICE`, and one that delivered no endpoint parks it.
 
 ---
 
 ## Sequence
 
-1. **Tables.** acpid asks devmgr for the DSDT (`QUERY_ACPI_TABLE` with the signature
+1. **Power registers** (x86-64). acpid acquires the `PM1a_CNT` block and `RESET_REG` from
+   devmgr (`QUERY_ACPI_RESOURCES`) and binds them to the evaluation thread; a missing one is
+   logged, and the request that needs it replies `NO_DEVICE`. RISC-V has neither.
+2. **Tables.** acpid asks devmgr for the DSDT (`QUERY_ACPI_TABLE` with the signature
    `DSDT`, which devmgr resolves through the FADT), then for SSDT 0, 1, ... until devmgr
    replies `NO_DEVICE`, at most 64 (`MAX_SSDTS`, [docs/limits.md](../../../docs/limits.md)).
    Each table is mapped read-only, loaded into the namespace, and unmapped. A DSDT that cannot
-   be loaded ends the sequence: no AML runs. An SSDT that cannot be loaded is logged and
-   skipped. The method bodies are then parsed.
-2. **ACPI mode** (x86-64). acpid reads `SCI_EN` in the PM1a control block. When it is clear,
-   acpid writes the FADT's `ACPI_ENABLE` value to `SMI_CMD` and waits up to 3 s for
-   `SCI_EN`. Both blocks come from devmgr (`QUERY_ACPI_RESOURCES`). RISC-V has no legacy
+   be loaded ends the sequence: no AML runs, and acpid goes on to serve (step 10). An SSDT
+   that cannot be loaded is logged and skipped. The method bodies are then parsed.
+3. **ACPI mode** (x86-64). acpid reads `SCI_EN` in the PM1a control block of step 1. When it
+   is clear, acpid writes the FADT's `ACPI_ENABLE` value to `SMI_CMD` and waits up to 3 s for
+   `SCI_EN`. `SMI_CMD` comes from devmgr too (`QUERY_ACPI_RESOURCES`). RISC-V has no legacy
    mode.
-3. **Module-level code**, then the **initialization walk**: `\_SB._INI`, then depth-first
+4. **Module-level code**, then the **initialization walk**: `\_SB._INI`, then depth-first
    from the root in the order the tables define the objects, each `Device`, `Processor` and
    `ThermalZone`'s `_STA` and, for a present one, its `_INI`. A device absent but
    functioning has its children walked; one absent and not functioning is skipped with its
    children. A `_STA` that faults or returns no integer counts as absent and not functioning.
-4. **Host bridges**: each present device whose `_HID` or `_CID` is `PNP0A03` or
+5. **Host bridges**: each present device whose `_HID` or `_CID` is `PNP0A03` or
    `PNP0A08`, with its `_SEG` and `_BBN` (0 when absent).
-5. **Windows**: each bridge's `_CRS` windows, pushed as `BRIDGE_WINDOWS`. devmgr checks a
+6. **Windows**: each bridge's `_CRS` windows, pushed as `BRIDGE_WINDOWS`. devmgr checks a
    `_PRT` against the functions on the buses of the windows it holds, so they go first.
-6. **PIC-model routes** (x86-64). acpid evaluates each bridge's `_PRT` and pushes it as
+7. **PIC-model routes** (x86-64). acpid evaluates each bridge's `_PRT` and pushes it as
    `PRT_PIC_MODE`, then selects the APIC model with `\_PIC(1)` (§ Interrupt model).
-7. **Per bridge**: `_OSC`, pushed as `OSC_RESULT`; the `_PRT`, pushed as `PRT_TABLE` mode
+8. **Per bridge**: `_OSC`, pushed as `OSC_RESULT`; the `_PRT`, pushed as `PRT_TABLE` mode
    `PRT_ROUTES` ([devmgr.md](devmgr.md) § Pushes).
-8. acpid logs a `ready:` line with the tables loaded, the devices present, the `_INI` methods
+9. acpid logs a `ready:` line with the tables loaded, the devices present, the `_INI` methods
    run and the bridges found.
+10. **Serve**: the evaluation thread serves the power requests on acpid's endpoint
+    ([README.md](../README.md) § Power requests); a request sent during the steps above waits in
+    the endpoint's queue until then.
 
 `_OSC` asks, with the PCI Host Bridge UUID and revision 1, for every support feature (0x1F)
 and for native control of every PCI Express feature (0x1F); the control dword the firmware
@@ -113,7 +125,9 @@ from devmgr and runs the sequence again, `_INI` methods included. devmgr keeps t
 of each push for the boot and logs a later one that differs, so a restart cannot change what
 devmgr acts on. A restarted acpid's PIC-model `_PRT` is read after the first instance selected
 the APIC model, and so differs from the first. devmgr keeps the memory pages it granted, so a
-restarted acpid is granted them again ([devmgr.md](devmgr.md) § Region grants).
+restarted acpid is granted them again ([devmgr.md](devmgr.md) § Region grants). svcmgr serves
+the restarted acpid a fresh RECV on the same service endpoint, so pwrmgr's `acpid.power` SEND
+stays valid; a request sent while acpid is down waits in the endpoint's queue.
 
 ---
 

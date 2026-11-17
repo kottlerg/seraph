@@ -162,6 +162,14 @@ subcommands! {
         /// unstage the fixture again (see xtask/README.md).
         TestDebugPort(TestDebugPortArgs),
 
+        /// Check PCI Express native hotplug: stage the `hotplug-check` fixture
+        /// and the `test-dma` class, boot the current sysroot with an empty root
+        /// port (on `x86_64` once under the machine's default, where devmgr must
+        /// leave the slot alone, then with native control), hot-add QEMU's `edu`
+        /// device behind it over QMP, check the fixture's verdict, and unstage
+        /// both again (see xtask/README.md).
+        TestHotplug(TestHotplugArgs),
+
         /// Check the GDB stub: stage it and its `gdb-target` process, boot the
         /// current sysroot once with `--debug-port`, run the host's GDB in batch
         /// mode against the port, check what it reports, and unstage both
@@ -293,6 +301,7 @@ impl CliCommand
             | Self::TestMapRedo(_)
             | Self::TestLogLevel(_)
             | Self::TestDebugPort(_)
+            | Self::TestHotplug(_)
             | Self::TestGdb(_)
             | Self::TestWedge(_)
             | Self::TestCet(_)
@@ -900,6 +909,30 @@ args! {
         /// free on `127.0.0.1` when the boot starts.
         #[arg(long)]
         pub port: Option<u16>,
+
+        /// Number of vCPUs to expose to the guest (QEMU -smp).
+        #[arg(long, default_value = "4")]
+        pub cpus: u32,
+
+        /// Guest memory size in MiB (QEMU -m).
+        #[arg(long, default_value = "512")]
+        pub mem: u32,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── TestHotplug ──────────────────────────────────────────────────────────────
+
+args! {
+    pub struct TestHotplugArgs
+    {
+        /// Target architecture.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
 
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]

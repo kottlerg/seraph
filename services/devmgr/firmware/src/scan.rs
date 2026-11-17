@@ -171,6 +171,21 @@ pub fn scan(
     Ok(())
 }
 
+/// The function at `bus:dev.func` of `segment`, read as [`scan`] reads each
+/// present function; `None` when no function answers there.
+#[must_use]
+pub fn function(
+    cfg: &impl ConfigSpace,
+    segment: u16,
+    bus: u8,
+    dev: u8,
+    func: u8,
+) -> Option<PciDevice>
+{
+    let vendor_id = cfg.read16(bus, dev, func, 0x00);
+    (vendor_id != 0xFFFF).then(|| read_function(cfg, segment, bus, dev, func, vendor_id))
+}
+
 /// Read one present function's identity, interrupt registers, BARs,
 /// subsystem IDs, and MSI and MSI-X capabilities (type-0 headers only), and
 /// `VirtIO` capabilities.

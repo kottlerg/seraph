@@ -83,7 +83,7 @@ impl Events
     }
 
     /// Unreachable: no `Events` exists.
-    pub const fn bind(&self, _thread: u64) -> bool
+    pub const fn bind(&self, _thread: u64) -> Result<(), i64>
     {
         match *self {}
     }

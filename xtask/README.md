@@ -112,9 +112,11 @@ composes: `init` as kind init, each module as a boot module. The bundle's data e
 platform tables and `log-levels`) are packed unsigned. Every signed object is verified under the
 build's trust store, with the kind, name and architecture its loader expects, before it is
 written. A pack (`mkdisk`, `compose-bundle`, a repack) refuses to sign when the trust store its
-environment builds differs from `target/xtask/signing/trust-store`, the one the bootloader was
-built with, naming `cargo xtask build` as the remedy. Signing a pack's images takes about half a
-second (`src/signing/`).
+environment builds differs from the one the installed bootloader was built with, naming
+`cargo xtask build` as the remedy. A bootloader build records that store in
+`target/xtask/signing/trust-store.installed` once it has installed its image, and removes the
+record when it begins, so a pack after a bootloader build that failed is refused too. Signing a
+pack's images takes about half a second (`src/signing/`).
 
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or

@@ -450,7 +450,9 @@ which its interrupt initialisation halts the boot, and Ssstateen, whose `sstatee
 writes on every hart and without which it halts the boot (see
 [platform-requirements.md](platform-requirements.md)). QEMU's `rv64` model leaves Smstateen off,
 so `smstateen=on` gives the hart the state-enable CSRs, and the bundled OpenSBI grants S-mode
-`sstateen0` (`mstateen0.SE0`) on a hart that has them; the property is present from QEMU 9.0.
+`sstateen0` and `senvcfg` (`mstateen0.SE0` and `mstateen0.ENVCFG`) on a hart that has them, and
+the AIA CSRs (`mstateen0.CSRIND` and `mstateen0.IMSIC`) on a hart with Smaia; the property is
+present from QEMU 9.0.
 The `rv64` model enables Svadu and leaves Svade off, which with the bundled OpenSBI turns on
 hardware A/D updating (`menvcfg.ADUE`). `svadu=off,svade=on` boots the Svade baseline instead, so
 an access that finds A clear faults and the kernel's fault path sets the bit

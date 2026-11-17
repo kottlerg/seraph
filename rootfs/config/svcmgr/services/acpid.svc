@@ -21,7 +21,8 @@
 # memory regions it granted).
 # `critical = no`: devmgr never waits on acpid, so the system runs on
 # without it, without the _OSC grant and the routes it pushes, and on x86-64
-# without pwrmgr's shutdown and reboot.
+# without pwrmgr's shutdown and reboot, whose requests then fail after
+# pwrmgr's 30 s bound on each acpid call.
 binary    = /services/acpid
 priority  = 16
 restart   = on_failure

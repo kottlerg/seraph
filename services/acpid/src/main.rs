@@ -47,17 +47,25 @@ fn main() -> !
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
-    let Some(caps) = caps::request_bootstrap(info, ipc_buf)
+    let Some(caps) = caps::request_bootstrap(info, ipc_buf).filter(|c| c.service != 0)
     else
     {
-        std::os::seraph::log!(error: "bootstrap failed: no service endpoint or devmgr.acpi seed");
+        std::os::seraph::log!(error: "bootstrap failed: no service endpoint");
         // Staying alive keeps svcmgr from restarting acpid into the same
-        // failed round.
+        // failed round. acpid holds no endpoint to answer on, so a power
+        // request waits out its caller's bound.
         loop
         {
             std::thread::park();
         }
     };
+    if caps.registry == 0
+    {
+        std::os::seraph::log!(error: "bootstrap failed: no devmgr.acpi seed; refusing power requests");
+        // As above, alive rather than restarted into the same round, and
+        // answering every request instead of leaving it queued.
+        server::refuse(caps.service);
+    }
     let aspace = info.self_aspace;
     let spawned = std::thread::Builder::new()
         .name("acpid-eval".into())

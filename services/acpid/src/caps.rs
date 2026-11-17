@@ -16,14 +16,14 @@ use std::os::seraph::StartupInfo;
 /// The capabilities of acpid's bootstrap round.
 pub struct Caps
 {
-    /// acpid's service endpoint (RECV).
+    /// acpid's service endpoint (RECV), `0` when not delivered.
     pub service: u64,
-    /// The `devmgr.acpi` SEND.
+    /// The `devmgr.acpi` SEND, `0` when not delivered.
     pub registry: u64,
 }
 
 /// Drain the bootstrap rounds from the creator; `None` when the round
-/// fails or lacks either capability.
+/// fails. A capability the round did not deliver is `0`.
 pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Caps>
 {
     let creator = info.creator_endpoint;
@@ -36,5 +36,5 @@ pub fn request_bootstrap(info: &StartupInfo, ipc_buf: *mut u64) -> Option<Caps>
     // absent slot decodes as `0`.
     let [service, registry] =
         unsafe { ipc::bootstrap::request_slots::<2>(creator, ipc_buf) }.ok()?;
-    (service != 0 && registry != 0).then_some(Caps { service, registry })
+    Some(Caps { service, registry })
 }

@@ -50,7 +50,9 @@ It exposes a small IPC surface (`shared/ipc/src/lib.rs::pwrmgr_labels`):
 For both labels, on the success path the platform powers off or resets and
 no reply is delivered. A reply only arrives when the request is rejected (see
 the authority gate below), when pwrmgr cannot act on it (no actuator was
-resolved at startup, so it serves degraded), when acpid refuses it, or when the platform
+resolved at startup, so it serves degraded), when acpid refuses it or does not answer it within
+30 s (`ACPID_CALL_TIMEOUT_MS`, so an acpid that is down or blocked fails the request instead of
+holding pwrmgr and svcmgr's graceful shutdown), or when the platform
 fails to act. Both failures reply `pwrmgr_errors::INVALID_REQUEST`, the latter
 including a request the platform has not acted on one second after it was
 issued.

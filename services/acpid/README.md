@@ -80,8 +80,12 @@ means the writes returned and the platform still runs; the caller decides how lo
 loaded AML for `SLEEP`, an I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
 platforms power off and reset through SBI. acpid acquires `PM1a_CNT` and `RESET_REG` from
 devmgr (`QUERY_ACPI_RESOURCES`) at the start of its start-up and binds them to the evaluation
-thread. The endpoint is served even when the DSDT did not load. A receive that keeps failing exits
-acpid (`ipc::recv_guard`), and svcmgr restarts it on the same endpoint.
+thread. The endpoint is served even when the DSDT did not load, and, with every request that passes
+the checks answered `NO_DEVICE`, when the bootstrap round delivered the endpoint without the
+`devmgr.acpi` seed. A receive that keeps failing exits acpid (`ipc::recv_guard`), and svcmgr
+restarts it on the same endpoint. pwrmgr bounds each call at 30 s
+([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked, does
+not answer fails rather than holding the shutdown.
 
 ---
 

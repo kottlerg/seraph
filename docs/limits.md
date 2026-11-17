@@ -707,6 +707,7 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `RESET_GRACE` | `services/pwrmgr/src/main.rs` | 1 s | tuning (platform reset latency) | none | correct as is | None |
+| `ACPID_CALL_TIMEOUT_MS` | `services/pwrmgr/src/arch/x86_64/mod.rs` | 30 s per acpid `SLEEP` or `RESET` call (`SYS_IPC_CALL` timeout) | tuning (a time bound, bounds no capacity: far above acpid's start-up, which a request sent during it waits behind, and its `\_PTS` evaluation) | none | correct as is | None; an acpid that is down or blocked fails `SHUTDOWN` or `REBOOT` with `INVALID_REQUEST` after 30 s instead of holding pwrmgr and its caller |
 | wall time | `services/timed/src/main.rs` | `u64` microseconds | ABI width (about 584 000 years) | none | correct as is | None |
 | `forward_lines` buffer | `services/usertest/src/main.rs` | 512 B read chunk | batch size (lines accumulate unbounded) | 512 B stack | correct as is | None |
 | crasher settle sleep | `services/crasher/src/main.rs` | 500 ms | tuning (lets the surface assertions land before the fault report) | none | correct as is | None |

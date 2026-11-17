@@ -27,6 +27,26 @@ pub fn serve(
     power: &Power,
 ) -> !
 {
+    run(service, |request| match request
+    {
+        Request::Sleep(state) => sleep(state, ns.as_deref_mut(), platform, power),
+        Request::Reset => reset(power),
+    })
+}
+
+/// Serve the requests received on `service` for acpid's lifetime without
+/// the means to act on any: each request that passes the checks of
+/// [`power::decode`] is answered `NO_DEVICE`. acpid's bootstrap round
+/// delivered its endpoint but no `devmgr.acpi` seed.
+pub fn refuse(service: u64) -> !
+{
+    run(service, |_| acpid_errors::NO_DEVICE)
+}
+
+/// The receive loop: decode each request, answer a refused one with
+/// [`power::decode`]'s code and a served one with `handle`'s status.
+fn run(service: u64, mut handle: impl FnMut(Request) -> u64) -> !
+{
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
@@ -48,8 +68,7 @@ pub fn serve(
         }
         let status = match power::decode(msg.label, msg.badge, msg.word(0), msg.word(1))
         {
-            Ok(Request::Sleep(state)) => sleep(state, ns.as_deref_mut(), platform, power),
-            Ok(Request::Reset) => reset(power),
+            Ok(request) => handle(request),
             Err(code) => code,
         };
         // SAFETY: `ipc_buf` is this thread's registered IPC buffer.

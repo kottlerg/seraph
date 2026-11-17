@@ -12,13 +12,22 @@
 //! reboot, through the `acpid.power` seed. It holds no port of its own and
 //! reads no table.
 //!
-//! On any failure, including a request acpid carried out without the
-//! platform acting within [`crate::await_reset`]'s grace, a routine logs
-//! and returns, and the caller (`main`) replies
-//! `pwrmgr_errors::INVALID_REQUEST`.
+//! Each call is bounded by [`ACPID_CALL_TIMEOUT_MS`], so an acpid that is
+//! down, or blocked, fails the request instead of holding pwrmgr and its
+//! caller, svcmgr's graceful shutdown among them. On any failure, including
+//! a request acpid carried out without the platform acting within
+//! [`crate::await_reset`]'s grace, a routine logs and returns, and the
+//! caller (`main`) replies `pwrmgr_errors::INVALID_REQUEST`.
 
 use crate::caps::{Bootstrap, drop_unused};
 use ipc::{IpcMessage, acpid_errors, acpid_labels};
+
+/// The bound on one acpid call, from the send to the reply, in
+/// milliseconds. A time bound that bounds no capacity: far above acpid's
+/// start-up, which a request sent during it waits behind, and its `\_PTS`
+/// evaluation, so a live acpid answers within it; an acpid that is down or
+/// blocked (on a dead devmgr, say) fails the request after it.
+const ACPID_CALL_TIMEOUT_MS: u32 = 30_000;
 
 /// Resolved actuation state: the `acpid.power` SEND.
 pub struct Actuator
@@ -63,10 +72,11 @@ pub fn reboot(act: &Actuator, ipc_buf: *mut u64)
     call(act, acpid_labels::RESET, 0, "reboot", ipc_buf);
 }
 
-/// Call acpid's `label` with `arg` in `data[1]`. A `SUCCESS` reply means
-/// acpid wrote the register and the platform still runs, so pwrmgr waits out
-/// [`crate::await_reset`]'s grace; any other reply or a failed call is
-/// logged.
+/// Call acpid's `label` with `arg` in `data[1]`, bounded by
+/// [`ACPID_CALL_TIMEOUT_MS`]. A `SUCCESS` reply means acpid wrote the
+/// register and the platform still runs, so pwrmgr waits out
+/// [`crate::await_reset`]'s grace; any other reply, a failed call, or no
+/// answer within the bound is logged.
 fn call(act: &Actuator, label: u64, arg: u64, op: &str, ipc_buf: *mut u64)
 {
     let msg = IpcMessage::builder(label)
@@ -74,12 +84,18 @@ fn call(act: &Actuator, label: u64, arg: u64, op: &str, ipc_buf: *mut u64)
         .word(1, arg)
         .build();
     // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
-    match unsafe { ipc::ipc_call(act.acpid, &msg, ipc_buf) }
+    match unsafe { ipc::ipc_call_timeout(act.acpid, &msg, ipc_buf, ACPID_CALL_TIMEOUT_MS) }
     {
         Ok(reply) if reply.label == acpid_errors::SUCCESS => crate::await_reset(op),
         Ok(reply) =>
         {
             std::os::seraph::log!(error: "{op} failed (acpid replied {:#x})", reply.label);
+        }
+        Err(e) if e == syscall_abi::SyscallError::WouldBlock as i64 =>
+        {
+            std::os::seraph::log!(
+                error: "{op} failed (acpid did not answer within {ACPID_CALL_TIMEOUT_MS} ms)"
+            );
         }
         Err(e) => std::os::seraph::log!(error: "{op} failed (acpid call err={e})"),
     }

@@ -16,8 +16,9 @@ size it asks for, while the main thread's grows past its first pages only in a d
 process. acpid stays alive after the sequence, serving, so that svcmgr does not restart it into
 the same start-up and so that it keeps the grants it holds. When the evaluation thread panics or
 cannot be spawned, the main thread exits acpid, since the power requests would wait unanswered,
-and svcmgr restarts it; a failed bootstrap round parks the main thread instead, since a restart
-would fail the same way.
+and svcmgr restarts it. A failed bootstrap round keeps acpid alive instead, since a restart would
+fail the same way: a round that delivered the service endpoint without the `devmgr.acpi` seed has
+the main thread answer each power request `NO_DEVICE`, and one that delivered no endpoint parks it.
 
 ---
 

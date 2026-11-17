@@ -1853,7 +1853,8 @@ pub const ACPID_LABELS_VERSION: u32 = 1;
 /// in it: pwrmgr, the power policy, reaches them through a SEND badged
 /// [`acpid_labels::POWER_AUTHORITY`] (`acpid.power`). Every request carries
 /// the caller's compiled [`super::ACPID_LABELS_VERSION`] in `data[0]`.
-/// The handler checks the badge first, then the version, then the request.
+/// The handler checks the label first, then the badge, then the version,
+/// then the argument.
 pub mod acpid_labels
 {
     /// Enter a sleep state: write `SLP_TYP` and then `SLP_TYP | SLP_EN` to

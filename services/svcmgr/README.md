@@ -250,7 +250,7 @@ column). The handover endowment and
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` [provider](docs/service-definitions.md)) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
-| `acpid.power` | svcmgr (`acpid.svc` [provider](docs/service-definitions.md)) | `POWER_AUTHORITY`-badged SEND on acpid's service endpoint, gating `SLEEP` and `RESET` (seeded by pwrmgr only) | no |
+| `acpid.power` | svcmgr (`acpid.svc` [provider](docs/service-definitions.md)) | `POWER_AUTHORITY`-badged SEND on acpid's service endpoint, gating `SLEEP`, `RESET` and `WAIT_EVENT` (seeded by pwrmgr only) | no |
 | `acpid.deny` | svcmgr (`acpid.svc` [provider](docs/service-definitions.md)) | no-authority SEND on acpid's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` [provider](docs/service-definitions.md)) | SEND on timed's service endpoint | yes |
 

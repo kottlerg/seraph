@@ -13,9 +13,11 @@
 //! (`ACPI_PCI_CONFIG`). On every start it loads the DSDT and the SSDTs,
 //! runs the start-up sequence of `services/acpid/README.md` on an
 //! evaluation thread, and pushes each PCI host bridge's `_OSC` grant,
-//! windows and interrupt routes to devmgr. The same thread then serves
-//! pwrmgr's power requests (`ipc::acpid_labels`) on acpid's service
-//! endpoint.
+//! windows and interrupt routes to devmgr. On x86-64 it then arms the
+//! fixed power button and the GPEs on the SCI devmgr serves. The same thread
+//! then runs every evaluation the service needs, while two receiver threads
+//! serve pwrmgr's requests (`ipc::acpid_labels`) on acpid's service
+//! endpoint and an event thread takes the SCI (`server`).
 
 mod arch;
 mod caps;
@@ -67,17 +69,31 @@ fn main() -> !
         server::refuse(caps.service);
     }
     let aspace = info.self_aspace;
+    // Each thread acpid runs reports its end here, in a panic too.
+    let (ended, end) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("acpid-eval".into())
         .stack_size(EVAL_THREAD_STACK)
-        .spawn(move || startup::run(&devmgr::Devmgr::new(caps.registry), aspace, caps.service));
-    match spawned.map(std::thread::JoinHandle::join)
+        .spawn(move || {
+            let _watched = server::Watched::new("evaluation", ended.clone());
+            startup::run(
+                &devmgr::Devmgr::new(caps.registry),
+                aspace,
+                caps.service,
+                &ended,
+            )
+        });
+    match spawned
     {
-        Ok(Err(_)) => std::os::seraph::log!(error: "the evaluation thread panicked; exiting"),
+        Ok(_) => match end.recv()
+        {
+            Ok(thread) => std::os::seraph::log!(error: "the {thread} thread ended; exiting"),
+            Err(_) => std::os::seraph::log!(error: "every thread ended; exiting"),
+        },
         Err(e) => std::os::seraph::log!(error: "evaluation thread not spawned: {e}; exiting"),
     }
-    // The evaluation thread serves acpid's endpoint for acpid's lifetime;
-    // without it the power requests would wait unanswered, so acpid exits
-    // and svcmgr restarts it.
+    // acpid's threads serve its endpoint and its events for acpid's
+    // lifetime; without one of them a request or an event would wait
+    // unanswered, so acpid exits and svcmgr restarts it.
     syscall::process_exit(1)
 }

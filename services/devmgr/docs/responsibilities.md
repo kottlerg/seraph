@@ -596,8 +596,11 @@ devmgr's responsibilities are:
   - devmgr keeps acpid's first `_OSC` result for the boot, and the windows and routes that agree
     with its boot records, and serves them per bridge with `QUERY_HOST_BRIDGE`
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Pushes).
-  - Every acpid request but `QUERY_ACPI_RESOURCES` runs on the control thread
-    ([acpid and devmgr](../../acpid/docs/devmgr.md) § Ordering).
+  - devmgr serves acpid the FADT's register blocks and, on x86-64, the SCI's `Interrupt`, a
+    derivation of the line it holds for the boot
+    ([acpid and devmgr](../../acpid/docs/devmgr.md) § Capabilities).
+  - Every acpid request but `QUERY_ACPI_RESOURCES` for a register block runs on the control
+    thread ([acpid and devmgr](../../acpid/docs/devmgr.md) § Ordering).
 - **Handle hotplug** — devmgr finds the PCI Express hotplug slots in the boot scan and manages
   each under a native-control grant (its host bridge's `_OSC`, or the platform description
   table's `pcie_native_hotplug`). A poller thread reads each managed slot's Slot Status every

@@ -120,10 +120,10 @@ registers again (#1213).
   log calls would deadlock against it (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   § Death-queue resync).
 
-* **Debuggable.** logd does not declare itself undebuggable to procmgr
-  (`procmgr_labels::DECLARE_NO_DEBUG`): every process's log output, a
-  debug-authority holder's own included, waits on logd, but every log call
-  is bounded (`LOG_CALL_TIMEOUT_MS`, then `LOG_CALL_UNANSWERED_TIMEOUT_MS`,
+* **Debuggable.** The maintainer decided that logd does not declare itself
+  undebuggable to procmgr (`procmgr_labels::DECLARE_NO_DEBUG`): every
+  process's log output, a debug-authority holder's own included, waits on
+  logd, but every log call is bounded (`LOG_CALL_TIMEOUT_MS`, then `LOG_CALL_UNANSWERED_TIMEOUT_MS`,
   [shared/log](../../shared/log/README.md)), so a holder that stops logd
   waits on its own lines for at most that bound and drops them. A fault of
   logd therefore reaches the crash service, whose report the receive workers

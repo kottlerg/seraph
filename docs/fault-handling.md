@@ -844,11 +844,11 @@ format, the contract the host-side symbolizer reads, in
   these takes the outcome it has with no handler bound, and the kernel's `fault unhandled` and
   `USERSPACE FAULT` lines are its only report. Any process may declare itself so; the declaration
   affects the declarer alone and is one-way. Before either driver declares, at its startup, a fault
-  of it reaches the crash service, which declines it once its bound passes. logd does not declare:
-  the service's log calls to it are bounded ([Console Model](console-model.md)), so a fault of logd
-  reaches the crash service, whose report the receive workers logd has left serve, and logd's
-  supervisor restarts it once the service declines the fault
-  ([Supervision](supervision.md)). A process
+  of it reaches the crash service, which declines it once its bound passes. The maintainer decided
+  that logd does not declare: the service's log calls to it are bounded
+  ([Console Model](console-model.md)), so a fault of logd reaches the crash service, whose report
+  the receive workers logd has left serve, and logd's supervisor restarts it once the service
+  declines the fault ([Supervision](supervision.md)). A process
   created `CREATE_PINNED`, or whose pager binding failed, has no virtual-memory handler: its page
   faults, which no pager forwards, kill it unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint

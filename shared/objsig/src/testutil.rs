@@ -128,7 +128,13 @@ pub(crate) fn store(floor: u32, anchors: &[(&Key, Usage)], revoked: &[KeyId]) ->
 }
 
 /// A certificate `issuer` issues to `subject`.
-pub(crate) fn certify(issuer: &Key, subject: &Key, kinds: KindSet, min: u32, max: u32) -> Certificate
+pub(crate) fn certify(
+    issuer: &Key,
+    subject: &Key,
+    kinds: KindSet,
+    min: u32,
+    max: u32,
+) -> Certificate
 {
     let body = CertificateBody {
         subject_key: subject.public,
@@ -148,7 +154,12 @@ pub(crate) fn certify(issuer: &Key, subject: &Key, kinds: KindSet, min: u32, max
 }
 
 /// The attributes of `body` as a `kind` named `name` for x86-64.
-pub(crate) fn attrs<'n>(body: &[u8], kind: Kind, name: &'n [u8], security_version: u32) -> Attributes<'n>
+pub(crate) fn attrs<'n>(
+    body: &[u8],
+    kind: Kind,
+    name: &'n [u8],
+    security_version: u32,
+) -> Attributes<'n>
 {
     Attributes {
         body_len: u64::try_from(body.len()).unwrap(),
@@ -161,7 +172,11 @@ pub(crate) fn attrs<'n>(body: &[u8], kind: Kind, name: &'n [u8], security_versio
 }
 
 /// A record of `attrs` signed by `key`, with `certificate`.
-pub(crate) fn record<'n>(key: &Key, certificate: Option<Certificate>, attrs: Attributes<'n>) -> RecordSpec<'n>
+pub(crate) fn record<'n>(
+    key: &Key,
+    certificate: Option<Certificate>,
+    attrs: Attributes<'n>,
+) -> RecordSpec<'n>
 {
     let mut signed = vec![0u8; attrs.encoded_len().unwrap()];
     attrs.encode(&mut signed).unwrap();
@@ -193,9 +208,10 @@ mod tests
     fn signer_matches_rfc_8032()
     {
         let hex = |text: &str| crypto_testkit::hex::decode(text).unwrap();
-        let seed: [u8; 32] = hex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
-            .try_into()
-            .unwrap();
+        let seed: [u8; 32] =
+            hex("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb")
+                .try_into()
+                .unwrap();
         let key = Key::from_seed(&seed);
         assert_eq!(
             key.public.to_vec(),
@@ -208,6 +224,9 @@ mod tests
                 "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
             ))
         );
-        assert_eq!(crypto::ed25519_verify(&key.public, b"m", &key.sign(b"m")), Ok(()));
+        assert_eq!(
+            crypto::ed25519_verify(&key.public, b"m", &key.sign(b"m")),
+            Ok(())
+        );
     }
 }

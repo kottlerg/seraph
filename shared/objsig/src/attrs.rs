@@ -240,6 +240,9 @@ mod tests
         let long = vec![b'n'; MAX_LEN - FIXED_LEN + 1];
         assert_eq!(sample(&long).encoded_len(), Err(EncodeError::TooLong));
         let mut short = [0u8; FIXED_LEN];
-        assert_eq!(sample(b"x").encode(&mut short), Err(EncodeError::BufferTooSmall));
+        assert_eq!(
+            sample(b"x").encode(&mut short),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 }

@@ -114,7 +114,9 @@ impl<'a> Writer<'a>
 pub(crate) fn concat<const N: usize>(parts: &[&[u8]]) -> [u8; N]
 {
     let mut out = [0u8; N];
-    for (slot, byte) in out.iter_mut().zip(parts.iter().flat_map(|part| part.iter()))
+    for (slot, byte) in out
+        .iter_mut()
+        .zip(parts.iter().flat_map(|part| part.iter()))
     {
         *slot = *byte;
     }

@@ -121,7 +121,9 @@ impl<'a> TrustStore<'a>
             }
             previous = Some(anchor.key_id);
         }
-        if revoked.windows(2).any(|pair| matches!(pair, [a, b] if a >= b))
+        if revoked
+            .windows(2)
+            .any(|pair| matches!(pair, [a, b] if a >= b))
         {
             return Err(StoreError::RevokedOrder);
         }
@@ -214,7 +216,9 @@ impl<'a> TrustStore<'a>
             || anchors
                 .windows(2)
                 .any(|pair| matches!(pair, [a, b] if key_id(&a.key) >= key_id(&b.key)))
-            || revoked.windows(2).any(|pair| matches!(pair, [a, b] if a >= b))
+            || revoked
+                .windows(2)
+                .any(|pair| matches!(pair, [a, b] if a >= b))
         {
             return Err(EncodeError::Store);
         }
@@ -268,7 +272,10 @@ fn decode_anchor(raw: &[u8; ANCHOR_LEN]) -> Result<Anchor<'_>, StoreError>
     {
         return Err(StoreError::AnchorFlags);
     }
-    let end = label.iter().position(|&byte| byte == 0).unwrap_or(label.len());
+    let end = label
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(label.len());
     let (text, padding) = label.split_at_checked(end).ok_or(StoreError::Label)?;
     if text.is_empty() || padding.iter().any(|&byte| byte != 0)
     {
@@ -346,7 +353,10 @@ mod tests
     {
         let len = TrustStore::encoded_len(anchors.len(), revoked.len()).unwrap();
         let mut out = vec![0u8; len];
-        assert_eq!(TrustStore::encode(floor, anchors, revoked, &mut out), Ok(len));
+        assert_eq!(
+            TrustStore::encode(floor, anchors, revoked, &mut out),
+            Ok(len)
+        );
         out
     }
 
@@ -473,7 +483,10 @@ mod tests
         let mut out = vec![0u8; 4096];
         let refuse = |anchors: &[AnchorSpec<'_>], revoked: &[KeyId], error| {
             let mut out = vec![0u8; 4096];
-            assert_eq!(TrustStore::encode(0, anchors, revoked, &mut out), Err(error));
+            assert_eq!(
+                TrustStore::encode(0, anchors, revoked, &mut out),
+                Err(error)
+            );
         };
         refuse(&[], &[], EncodeError::Store);
         for label in ["", "abcdefghijklmnopqrstuvwxyz0123456", "a\0b"]
@@ -490,8 +503,14 @@ mod tests
             TrustStore::encode(0, &specs, &[], &mut out[..18 + 72 * 3 - 1]),
             Err(EncodeError::BufferTooSmall)
         );
-        assert_eq!(TrustStore::encoded_len(65_536, 0), Err(EncodeError::TooLong));
-        assert_eq!(TrustStore::encoded_len(1, 65_536), Err(EncodeError::TooLong));
+        assert_eq!(
+            TrustStore::encoded_len(65_536, 0),
+            Err(EncodeError::TooLong)
+        );
+        assert_eq!(
+            TrustStore::encoded_len(1, 65_536),
+            Err(EncodeError::TooLong)
+        );
         assert_eq!(
             TrustStore::encoded_len(65_535, 65_535),
             Ok(18 + 72 * 65_535 + 16 * 65_535)

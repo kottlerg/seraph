@@ -94,7 +94,14 @@ impl RecordSpec<'_>
     /// The record's encoded length, 88 + `attrs_len` + 148 × `cert_count`.
     fn encoded_len(&self) -> Result<usize, EncodeError>
     {
-        let fixed = if self.certificate.is_some() { RECORD_CERT_LEN } else { RECORD_FIXED_LEN };
+        let fixed = if self.certificate.is_some()
+        {
+            RECORD_CERT_LEN
+        }
+        else
+        {
+            RECORD_FIXED_LEN
+        };
         self.attrs
             .encoded_len()?
             .checked_add(fixed)
@@ -105,8 +112,13 @@ impl RecordSpec<'_>
     fn write(&self, writer: &mut Writer<'_>) -> Result<(), EncodeError>
     {
         let record_len = u32::try_from(self.encoded_len()?).map_err(|_| EncodeError::TooLong)?;
-        let attrs_len = u16::try_from(self.attrs.encoded_len()?).map_err(|_| EncodeError::TooLong)?;
-        let certificate = self.certificate.as_ref().map(Certificate::encode).transpose()?;
+        let attrs_len =
+            u16::try_from(self.attrs.encoded_len()?).map_err(|_| EncodeError::TooLong)?;
+        let certificate = self
+            .certificate
+            .as_ref()
+            .map(Certificate::encode)
+            .transpose()?;
         writer.put(&record_len.to_le_bytes())?;
         writer.put(&[ALGORITHM_ED25519, u8::from(certificate.is_some())])?;
         writer.put(&attrs_len.to_le_bytes())?;
@@ -326,7 +338,8 @@ pub fn encode_trailer(
         return Err(EncodeError::NestedTrailer);
     }
     let len = trailer_len(records)?;
-    let records_len = u32::try_from(len.saturating_sub(FOOTER_LEN)).map_err(|_| EncodeError::TooLong)?;
+    let records_len =
+        u32::try_from(len.saturating_sub(FOOTER_LEN)).map_err(|_| EncodeError::TooLong)?;
     let count = u16::try_from(records.len()).map_err(|_| EncodeError::RecordCount)?;
     let mut writer = Writer::new(out);
     for record in records
@@ -399,7 +412,10 @@ mod tests
         let mut out = BODY.to_vec();
         let len = trailer_len(records).unwrap();
         out.resize(BODY.len() + len, 0);
-        assert_eq!(encode_trailer(BODY, records, &mut out[BODY.len()..]), Ok(len));
+        assert_eq!(
+            encode_trailer(BODY, records, &mut out[BODY.len()..]),
+            Ok(len)
+        );
         out
     }
 
@@ -420,7 +436,10 @@ mod tests
         assert_eq!(&r[126..274], &certificate().encode().unwrap());
         assert_eq!(&r[274..338], &[0x99; 64]);
         let footer = &r[338..];
-        assert_eq!(&footer[0..4], &u32::try_from(record_len).unwrap().to_le_bytes());
+        assert_eq!(
+            &footer[0..4],
+            &u32::try_from(record_len).unwrap().to_le_bytes()
+        );
         assert_eq!(&footer[4..6], &1u16.to_le_bytes());
         assert_eq!(&footer[6..8], &1u16.to_le_bytes());
         assert_eq!(&footer[8..16], b"SERAPHSG");
@@ -429,7 +448,9 @@ mod tests
     #[test]
     fn round_trips()
     {
-        let names: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'a' + i; usize::from(i) + 1]).collect();
+        let names: Vec<Vec<u8>> = (0..8u8)
+            .map(|i| vec![b'a' + i; usize::from(i) + 1])
+            .collect();
         let specs: Vec<RecordSpec<'_>> = names
             .iter()
             .enumerate()
@@ -469,8 +490,14 @@ mod tests
         assert_eq!(split(&[]), Err(ParseError::TooShort));
         refuse(&|b| b[end - 1] = b'g', ParseError::Magic);
         refuse(&|b| b[end - 10] = 2, ParseError::Version);
-        refuse(&|b| b[end - 12..end - 10].copy_from_slice(&0u16.to_le_bytes()), ParseError::RecordCount);
-        refuse(&|b| b[end - 12..end - 10].copy_from_slice(&9u16.to_le_bytes()), ParseError::RecordCount);
+        refuse(
+            &|b| b[end - 12..end - 10].copy_from_slice(&0u16.to_le_bytes()),
+            ParseError::RecordCount,
+        );
+        refuse(
+            &|b| b[end - 12..end - 10].copy_from_slice(&9u16.to_le_bytes()),
+            ParseError::RecordCount,
+        );
         refuse(
             &|b| b[end - 16..end - 12].copy_from_slice(&u32::MAX.to_le_bytes()),
             ParseError::RecordsLength,
@@ -553,7 +580,10 @@ mod tests
         let records = [record(b"init", None)];
         let len = trailer_len(&records).unwrap();
         let mut out = vec![0u8; len];
-        assert_eq!(encode_trailer(&inner, &records, &mut out), Err(EncodeError::NestedTrailer));
+        assert_eq!(
+            encode_trailer(&inner, &records, &mut out),
+            Err(EncodeError::NestedTrailer)
+        );
         let mut nested = inner.clone();
         nested.extend_from_slice(&inner[BODY.len()..]);
         assert_eq!(split(&nested), Err(ParseError::NestedTrailer));
@@ -565,7 +595,10 @@ mod tests
         let one = [record(b"kernel", None)];
         assert_eq!(trailer_len(&[]), Err(EncodeError::RecordCount));
         assert_eq!(trailer_len(&[one[0]; 9]), Err(EncodeError::RecordCount));
-        assert_eq!(trailer_len(&[record(b"", None)]), Err(EncodeError::EmptyName));
+        assert_eq!(
+            trailer_len(&[record(b"", None)]),
+            Err(EncodeError::EmptyName)
+        );
         let mut certify = certificate();
         certify.body.usage.certify = true;
         let mut out = vec![0u8; 4096];
@@ -574,6 +607,9 @@ mod tests
             Err(EncodeError::Certificate)
         );
         let len = trailer_len(&one).unwrap();
-        assert_eq!(encode_trailer(BODY, &one, &mut out[..len - 1]), Err(EncodeError::BufferTooSmall));
+        assert_eq!(
+            encode_trailer(BODY, &one, &mut out[..len - 1]),
+            Err(EncodeError::BufferTooSmall)
+        );
     }
 }

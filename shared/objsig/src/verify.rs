@@ -257,7 +257,11 @@ mod tests
     /// A service record signed by the root directly.
     fn direct(security_version: u32) -> RecordSpec<'static>
     {
-        record(&keys().root, None, attrs(BODY, Kind::Service, NAME, security_version))
+        record(
+            &keys().root,
+            None,
+            attrs(BODY, Kind::Service, NAME, security_version),
+        )
     }
 
     /// A service record signed by the signing key, certified by the root
@@ -265,8 +269,18 @@ mod tests
     fn certified(security_version: u32) -> RecordSpec<'static>
     {
         let k = keys();
-        let cert = certify(&k.root, &k.signer, KindSet::of(&[Kind::Service, Kind::Driver]), 2, 5);
-        record(&k.signer, Some(cert), attrs(BODY, Kind::Service, NAME, security_version))
+        let cert = certify(
+            &k.root,
+            &k.signer,
+            KindSet::of(&[Kind::Service, Kind::Driver]),
+            2,
+            5,
+        );
+        record(
+            &k.signer,
+            Some(cert),
+            attrs(BODY, Kind::Service, NAME, security_version),
+        )
     }
 
     /// A service record signed by a root no store trusts.
@@ -275,7 +289,11 @@ mod tests
         record(&keys().stranger, None, attrs(BODY, Kind::Service, NAME, 3))
     }
 
-    fn run(store_bytes: &[u8], records: &[RecordSpec<'_>], expect: &Expectation<'_>) -> Result<(), Refusal>
+    fn run(
+        store_bytes: &[u8],
+        records: &[RecordSpec<'_>],
+        expect: &Expectation<'_>,
+    ) -> Result<(), Refusal>
     {
         let store = TrustStore::parse(store_bytes).unwrap();
         let bytes = object(BODY, records);
@@ -315,10 +333,17 @@ mod tests
         let root = root_store();
         assert_eq!(run(&root, &[stranger(), direct(3)], &EXPECT), Ok(()));
         let wrong_name = record(&keys().root, None, attrs(BODY, Kind::Service, b"/x", 3));
-        assert_eq!(run(&root, &[wrong_name, stranger(), certified(3)], &EXPECT), Ok(()));
+        assert_eq!(
+            run(&root, &[wrong_name, stranger(), certified(3)], &EXPECT),
+            Ok(())
+        );
         // A second trusted root: either record passes alone.
         let both = store(0, &[(&keys().root, ROOT), (&keys().second_root, ROOT)], &[]);
-        let second = record(&keys().second_root, None, attrs(BODY, Kind::Service, NAME, 3));
+        let second = record(
+            &keys().second_root,
+            None,
+            attrs(BODY, Kind::Service, NAME, 3),
+        );
         let store_view = TrustStore::parse(&both).unwrap();
         let bytes = object(BODY, &[second]);
         let verified = verify(&bytes, &store_view, &EXPECT).unwrap();
@@ -328,7 +353,10 @@ mod tests
     #[test]
     fn refuses_records_of_untrusted_roots()
     {
-        assert_eq!(run(&root_store(), &[stranger()], &EXPECT), Err(Refusal::Untrusted));
+        assert_eq!(
+            run(&root_store(), &[stranger()], &EXPECT),
+            Err(Refusal::Untrusted)
+        );
         let k = keys();
         let cert = certify(&k.stranger, &k.signer, KindSet::ALL, 0, 9);
         let by_stranger = record(&k.signer, Some(cert), attrs(BODY, Kind::Service, NAME, 3));
@@ -363,7 +391,10 @@ mod tests
         };
         let store_bytes = store(0, &[(&keys().root, usage)], &[]);
         assert_eq!(run(&store_bytes, &[direct(3)], &EXPECT), Ok(()));
-        assert_eq!(run(&store_bytes, &[certified(3)], &EXPECT), failed(RecordFailure::IssuerCannotCertify));
+        assert_eq!(
+            run(&store_bytes, &[certified(3)], &EXPECT),
+            failed(RecordFailure::IssuerCannotCertify)
+        );
     }
 
     #[test]
@@ -371,7 +402,10 @@ mod tests
     {
         let mut spec = certified(3);
         spec.signer_key_id = keys().root.id();
-        assert_eq!(run(&root_store(), &[spec], &EXPECT), failed(RecordFailure::SignerMismatch));
+        assert_eq!(
+            run(&root_store(), &[spec], &EXPECT),
+            failed(RecordFailure::SignerMismatch)
+        );
     }
 
     #[test]
@@ -379,11 +413,20 @@ mod tests
     {
         let k = keys();
         let revoked_root = store(0, &[(&k.root, ROOT)], &[k.root.id()]);
-        assert_eq!(run(&revoked_root, &[direct(3)], &EXPECT), failed(RecordFailure::Revoked));
-        assert_eq!(run(&revoked_root, &[certified(3)], &EXPECT), failed(RecordFailure::Revoked));
+        assert_eq!(
+            run(&revoked_root, &[direct(3)], &EXPECT),
+            failed(RecordFailure::Revoked)
+        );
+        assert_eq!(
+            run(&revoked_root, &[certified(3)], &EXPECT),
+            failed(RecordFailure::Revoked)
+        );
         let revoked_signer = store(0, &[(&k.root, ROOT)], &[k.signer.id(), [0xff; 16]]);
         assert_eq!(run(&revoked_signer, &[direct(3)], &EXPECT), Ok(()));
-        assert_eq!(run(&revoked_signer, &[certified(3)], &EXPECT), failed(RecordFailure::Revoked));
+        assert_eq!(
+            run(&revoked_signer, &[certified(3)], &EXPECT),
+            failed(RecordFailure::Revoked)
+        );
     }
 
     #[test]
@@ -395,13 +438,26 @@ mod tests
             certify: true,
         };
         let narrow = store(0, &[(&k.root, programs_only)], &[]);
-        assert_eq!(run(&narrow, &[direct(3)], &EXPECT), failed(RecordFailure::KeyUsage));
+        assert_eq!(
+            run(&narrow, &[direct(3)], &EXPECT),
+            failed(RecordFailure::KeyUsage)
+        );
         // The certificate allows services, but its issuer does not.
-        assert_eq!(run(&narrow, &[certified(3)], &EXPECT), failed(RecordFailure::KeyUsage));
+        assert_eq!(
+            run(&narrow, &[certified(3)], &EXPECT),
+            failed(RecordFailure::KeyUsage)
+        );
         // The issuer allows services, but the certificate does not.
         let drivers = certify(&k.root, &k.signer, KindSet::of(&[Kind::Driver]), 0, 9);
-        let spec = record(&k.signer, Some(drivers), attrs(BODY, Kind::Service, NAME, 3));
-        assert_eq!(run(&root_store(), &[spec], &EXPECT), failed(RecordFailure::KeyUsage));
+        let spec = record(
+            &k.signer,
+            Some(drivers),
+            attrs(BODY, Kind::Service, NAME, 3),
+        );
+        assert_eq!(
+            run(&root_store(), &[spec], &EXPECT),
+            failed(RecordFailure::KeyUsage)
+        );
     }
 
     #[test]
@@ -412,17 +468,26 @@ mod tests
             kinds: KindSet::of(&[Kind::Driver, Kind::Program]),
             ..EXPECT
         };
-        assert_eq!(run(&store, &[direct(3)], &drivers), failed(RecordFailure::Kind));
+        assert_eq!(
+            run(&store, &[direct(3)], &drivers),
+            failed(RecordFailure::Kind)
+        );
         let other_name = Expectation {
             name: b"/services/svcmgr2",
             ..EXPECT
         };
-        assert_eq!(run(&store, &[direct(3)], &other_name), failed(RecordFailure::Name));
+        assert_eq!(
+            run(&store, &[direct(3)], &other_name),
+            failed(RecordFailure::Name)
+        );
         let riscv = Expectation {
             arch: Arch::Riscv64,
             ..EXPECT
         };
-        assert_eq!(run(&store, &[direct(3)], &riscv), failed(RecordFailure::Arch));
+        assert_eq!(
+            run(&store, &[direct(3)], &riscv),
+            failed(RecordFailure::Arch)
+        );
     }
 
     #[test]
@@ -438,7 +503,10 @@ mod tests
         let mut other = BODY.to_vec();
         other[0] ^= 1;
         let spec = record(&k.root, None, attrs(&other, Kind::Service, NAME, 3));
-        assert_eq!(run(&root_store(), &[spec], &EXPECT), failed(RecordFailure::BodyHash));
+        assert_eq!(
+            run(&root_store(), &[spec], &EXPECT),
+            failed(RecordFailure::BodyHash)
+        );
     }
 
     #[test]
@@ -446,11 +514,23 @@ mod tests
     {
         let k = keys();
         let floor_4 = store(4, &[(&k.root, ROOT)], &[]);
-        assert_eq!(run(&floor_4, &[direct(3)], &EXPECT), failed(RecordFailure::SecurityFloor));
+        assert_eq!(
+            run(&floor_4, &[direct(3)], &EXPECT),
+            failed(RecordFailure::SecurityFloor)
+        );
         assert_eq!(run(&floor_4, &[direct(4)], &EXPECT), Ok(()));
-        assert_eq!(run(&floor_4, &[certified(3)], &EXPECT), failed(RecordFailure::SecurityFloor));
-        assert_eq!(run(&root_store(), &[certified(1)], &EXPECT), failed(RecordFailure::SecurityRange));
-        assert_eq!(run(&root_store(), &[certified(6)], &EXPECT), failed(RecordFailure::SecurityRange));
+        assert_eq!(
+            run(&floor_4, &[certified(3)], &EXPECT),
+            failed(RecordFailure::SecurityFloor)
+        );
+        assert_eq!(
+            run(&root_store(), &[certified(1)], &EXPECT),
+            failed(RecordFailure::SecurityRange)
+        );
+        assert_eq!(
+            run(&root_store(), &[certified(6)], &EXPECT),
+            failed(RecordFailure::SecurityRange)
+        );
     }
 
     #[test]
@@ -462,12 +542,18 @@ mod tests
         {
             cert.signature[0] ^= 1;
         }
-        assert_eq!(run(&root_store(), &[tampered], &EXPECT), failed(RecordFailure::CertificateSignature));
+        assert_eq!(
+            run(&root_store(), &[tampered], &EXPECT),
+            failed(RecordFailure::CertificateSignature)
+        );
         // A certificate the stranger signed that names the root as issuer.
         let mut forged = certify(&k.stranger, &k.signer, KindSet::ALL, 0, 9);
         forged.body.issuer_key_id = k.root.id();
         let spec = record(&k.signer, Some(forged), attrs(BODY, Kind::Service, NAME, 3));
-        assert_eq!(run(&root_store(), &[spec], &EXPECT), failed(RecordFailure::CertificateSignature));
+        assert_eq!(
+            run(&root_store(), &[spec], &EXPECT),
+            failed(RecordFailure::CertificateSignature)
+        );
     }
 
     #[test]
@@ -476,15 +562,24 @@ mod tests
         let k = keys();
         let mut tampered = direct(3);
         tampered.signature[63] ^= 0x10;
-        assert_eq!(run(&root_store(), &[tampered], &EXPECT), failed(RecordFailure::Signature));
+        assert_eq!(
+            run(&root_store(), &[tampered], &EXPECT),
+            failed(RecordFailure::Signature)
+        );
         // The stranger's signature under the root's key id.
         let mut forged = stranger();
         forged.signer_key_id = k.root.id();
-        assert_eq!(run(&root_store(), &[forged], &EXPECT), failed(RecordFailure::Signature));
+        assert_eq!(
+            run(&root_store(), &[forged], &EXPECT),
+            failed(RecordFailure::Signature)
+        );
         // A record whose signature covers other attributes.
         let mut swapped = direct(3);
         swapped.signature = direct(4).signature;
-        assert_eq!(run(&root_store(), &[swapped], &EXPECT), failed(RecordFailure::Signature));
+        assert_eq!(
+            run(&root_store(), &[swapped], &EXPECT),
+            failed(RecordFailure::Signature)
+        );
     }
 
     #[test]
@@ -494,14 +589,27 @@ mod tests
         let store = TrustStore::parse(&store_bytes).unwrap();
         let mut bytes = object(BODY, &[direct(3), stranger()]);
         // The second record's algorithm byte.
-        let second = BODY.len() + usize::try_from(u32::from_le_bytes(bytes[BODY.len()..BODY.len() + 4].try_into().unwrap())).unwrap();
+        let second = BODY.len()
+            + usize::try_from(u32::from_le_bytes(
+                bytes[BODY.len()..BODY.len() + 4].try_into().unwrap(),
+            ))
+            .unwrap();
         bytes[second + 4] = 2;
-        assert_eq!(verify(&bytes, &store, &EXPECT), Err(Refusal::Parse(ParseError::Algorithm)));
+        assert_eq!(
+            verify(&bytes, &store, &EXPECT),
+            Err(Refusal::Parse(ParseError::Algorithm))
+        );
         let mut bytes = object(BODY, &[direct(3)]);
         let end = bytes.len();
         bytes[end - 10] = 2;
-        assert_eq!(verify(&bytes, &store, &EXPECT), Err(Refusal::Parse(ParseError::Version)));
-        assert_eq!(verify(BODY, &store, &EXPECT), Err(Refusal::Parse(ParseError::Magic)));
+        assert_eq!(
+            verify(&bytes, &store, &EXPECT),
+            Err(Refusal::Parse(ParseError::Version))
+        );
+        assert_eq!(
+            verify(BODY, &store, &EXPECT),
+            Err(Refusal::Parse(ParseError::Magic))
+        );
     }
 
     /// Every bit of a signed object is bound: a flip anywhere refuses it.
@@ -550,7 +658,8 @@ mod tests
                         let index = rng.below(bytes.len());
                         bytes[index] = rng.array::<1>()[0];
                     }
-                    _ => {}
+                    _ =>
+                    {}
                 }
             }
             let verdict = verify(&bytes, &store, &EXPECT);

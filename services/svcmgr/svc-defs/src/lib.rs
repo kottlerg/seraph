@@ -99,6 +99,78 @@ pub fn shutdown_actuator(defs: &[Definition]) -> Option<usize>
     defs.iter().position(|d| d.shutdown_actuator.is_some())
 }
 
+/// Put `defs` in launch order: providers (a non-empty
+/// [`Definition::provides`]) ahead of pure consumers, so a provided name is
+/// published before any consumer launched in the same scan resolves it; each
+/// group in service-name order; and, among the providers, a provider whose
+/// [`Definition::seed`] names a name another provider provides after that
+/// provider. svcmgr publishes a provided name only once its provider has
+/// launched, so this is what lets one provider seed another's name.
+///
+/// The order is a stable topological order: each place takes the first
+/// provider, in name order, that seeds no name of a provider not yet placed
+/// (its own names aside). When none can (a seed cycle), the first in name
+/// order takes the place, `on_cycle` is called with it, and its seeds from
+/// the providers still unplaced resolve to nothing at its launch. A seed
+/// naming a name no recipe provides orders nothing.
+///
+/// The order says only which launch is attempted first. A provider launches
+/// whether or not the launch of a provider it seeds from succeeded; a seed of
+/// a provider whose launch failed is unresolved, as any unresolved seed is.
+/// A service init already runs (bind only) is not launched, so its place
+/// does nothing. A restarted service's seeds are resolved again at its
+/// restart, from what the registry then holds.
+pub fn launch_order(defs: &mut [Definition], mut on_cycle: impl FnMut(&Definition))
+{
+    // Service names are unique (one `.svc` suffix stripped from unique file
+    // names), so the allocation-free unstable sort gives the order a stable
+    // one would.
+    defs.sort_unstable_by(|a, b| {
+        (a.provides.is_empty(), &a.name).cmp(&(b.provides.is_empty(), &b.name))
+    });
+    let providers = defs.iter().take_while(|d| !d.provides.is_empty()).count();
+    let mut rest: &mut [Definition] = defs.get_mut(..providers).unwrap_or_default();
+    while !rest.is_empty()
+    {
+        // The first provider, in name order, seeding no name of another
+        // unplaced provider, takes the place at the head of `rest`.
+        let ready = (0..rest.len()).find(|&j| {
+            rest.get(j).is_some_and(|c| {
+                !rest
+                    .iter()
+                    .enumerate()
+                    .any(|(k, p)| k != j && seeds_from(c, p))
+            })
+        });
+        match ready.and_then(|j| rest.get_mut(..=j))
+        {
+            Some(head) => head.rotate_right(1),
+            None =>
+            {
+                if let Some(first) = rest.first()
+                {
+                    on_cycle(first);
+                }
+            }
+        }
+        let Some((_, tail)) = core::mem::take(&mut rest).split_first_mut()
+        else
+        {
+            break;
+        };
+        rest = tail;
+    }
+}
+
+/// Whether `consumer` seeds a name `provider` provides.
+fn seeds_from(consumer: &Definition, provider: &Definition) -> bool
+{
+    consumer
+        .seed
+        .iter()
+        .any(|s| provider.provides.iter().any(|p| p.name == *s))
+}
+
 /// Restart-policy values parsed from the `restart = ...` line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RestartPolicy
@@ -182,9 +254,9 @@ pub struct Definition
     /// registry. The endpoint persists across restarts (svcmgr holds the
     /// source), so cached client caps survive a crash-restart cycle and no
     /// re-publish is needed. Empty for pure-consumer services that only
-    /// receive `seed` caps. A provider also launches ahead of pure
-    /// consumers during reconciliation so its names resolve before any
-    /// consumer queries them.
+    /// receive `seed` caps. Reconciliation launches a provider ahead of pure
+    /// consumers, and after each provider whose name it seeds
+    /// ([`launch_order`]), so its names resolve before they are queried.
     pub provides: Vec<ProvidedName>,
     /// `log_sink = yes` marks the service as the system log sink (real-logd).
     /// svcmgr mints its bootstrap round — master-log RECV, the first-launch
@@ -290,6 +362,86 @@ mod tests
         assert_eq!(shutdown_actuator(&defs), Some(1));
         assert_eq!(shutdown_actuator(&[recipe("a", false)]), None);
         assert_eq!(shutdown_actuator(&[]), None);
+    }
+
+    /// A recipe named `name` providing the names `provides` (a consumer when
+    /// empty) and seeding `seed`.
+    fn ordered(name: &str, provides: &str, seed: &str) -> Definition
+    {
+        let line = |key: &str, value: &str| {
+            if value.is_empty()
+            {
+                String::new()
+            }
+            else
+            {
+                format!("{key} = {value}\n")
+            }
+        };
+        let contents = format!(
+            "binary = /services/x\nrestart = on_failure\ncritical = no\nnamespace = none\n{}{}",
+            line("provides", provides),
+            line("seed", seed)
+        );
+        parse::parse(name, &contents).expect("valid recipe")
+    }
+
+    fn order(mut defs: Vec<Definition>) -> (Vec<String>, Vec<String>)
+    {
+        let mut cycles = Vec::new();
+        launch_order(&mut defs, |d| cycles.push(d.name.clone()));
+        (defs.into_iter().map(|d| d.name).collect(), cycles)
+    }
+
+    #[test]
+    fn providers_launch_first_in_name_order_and_after_the_providers_they_seed_from()
+    {
+        // pwrmgr seeds acpid's name; zz's provider sorts last, so the order
+        // follows the seed, not the name.
+        let (names, cycles) = order(vec![
+            ordered("cons", "", "a.x zz.x"),
+            ordered(
+                "pwrmgr",
+                "pwrmgr.shutdown:auth",
+                "devmgr.shutdown acpid.power",
+            ),
+            ordered("acpid", "acpid.power:auth acpid.deny:deny", "devmgr.acpi"),
+            ordered("a", "a.x", "zz.x"),
+            ordered("m", "m.x", ""),
+            ordered("zz", "zz.x", ""),
+        ]);
+        assert_eq!(names, ["acpid", "m", "pwrmgr", "zz", "a", "cons"]);
+        assert_eq!(cycles, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_seed_no_recipe_provides_and_a_seed_of_its_own_name_order_nothing()
+    {
+        // b seeds a name nobody provides (as a provider whose launch fails
+        // provides none): it keeps its name-order place and launches with
+        // that seed unresolved. c seeds its own name.
+        let (names, cycles) = order(vec![
+            ordered("c", "c.x", "c.x"),
+            ordered("b", "b.x", "gone.x"),
+            ordered("a", "a.x", ""),
+        ]);
+        assert_eq!(names, ["a", "b", "c"]);
+        assert_eq!(cycles, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_seed_cycle_launches_its_first_member_in_name_order_and_is_reported()
+    {
+        // b and c seed each other, d seeds c, a is free.
+        let (names, cycles) = order(vec![
+            ordered("d", "d.x", "c.x"),
+            ordered("c", "c.x", "b.x"),
+            ordered("b", "b.x", "c.x"),
+            ordered("a", "a.x", ""),
+            ordered("cons", "", "b.x"),
+        ]);
+        assert_eq!(names, ["a", "b", "c", "d", "cons"]);
+        assert_eq!(cycles, ["b"]);
     }
 
     #[test]

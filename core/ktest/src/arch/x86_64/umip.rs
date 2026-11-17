@@ -17,13 +17,9 @@
 //! delivered as a `FAULT_EXC_PROTECTION` exception, so a CPU that missed the CR4
 //! bit fails the case.
 //!
-//! **Checked CPUs.** Every CPU up to [`EVERY_CPU_MAX`]; past it, the first
-//! [`LOW_CPUS`] (the BSP and the first APs) and [`SAMPLED_CPUS`] spread evenly
-//! over the rest, the last CPU among them. Every AP sets the bit through the
-//! same call in `arch::x86_64::interrupts::init_ap`, so a per-CPU miss is a
-//! bring-up-path defect the BSP/AP split and the two ends of the index range
-//! expose; checking every CPU at the `MAX_CPUS` boundary costs minutes of
-//! oversubscribed scheduling for no path the sample misses.
+//! **Checked CPUs.** The sample of [`crate::cpu_sample`]: every AP sets the bit
+//! through the same call in `arch::x86_64::interrupts::init_ap`, and the BSP
+//! through `interrupts::init`.
 //!
 //! **What counts as the fault.** A `FAULT_EXC_PROTECTION` message whose error
 //! code is 0 and whose faulting IP is the read itself: the child records the
@@ -54,18 +50,6 @@ use syscall_abi::{
 };
 
 use crate::{ChildStack, TestContext, TestResult};
-
-/// Up to this many CPUs, every CPU is checked. Like [`LOW_CPUS`], a test
-/// fixture: it bounds only how many CPUs the check visits on a wide boot.
-const EVERY_CPU_MAX: u32 = 16;
-
-/// Past [`EVERY_CPU_MAX`], the lowest CPUs checked: CPU 0 (the BSP) and the
-/// first APs.
-const LOW_CPUS: u32 = 8;
-
-/// Past [`EVERY_CPU_MAX`], the CPUs checked above [`LOW_CPUS`], spread evenly
-/// from CPU `LOW_CPUS` to the last CPU.
-const SAMPLED_CPUS: u32 = EVERY_CPU_MAX - LOW_CPUS;
 
 /// Badge bound with the handler and delivered in each fault message.
 const FAULT_BADGE: u64 = 0x0D17_0001;
@@ -103,43 +87,13 @@ pub fn run(ctx: &TestContext) -> TestResult
         .ok_or("integration::umip_descriptor_reads_fault: system_info(CpuCount) failed")?;
     let ep = cap_create_endpoint(ctx.memory_base)
         .map_err(|_| "integration::umip_descriptor_reads_fault: cap_create_endpoint failed")?;
-    let result = (0..cpus.min(EVERY_CPU_MAX)).try_for_each(|k| {
-        let cpu = checked_cpu(k, cpus)?;
+    let result = (0..crate::cpu_sample::count(cpus)).try_for_each(|k| {
+        let cpu = crate::cpu_sample::checked_cpu(k, cpus)?;
         expect_gp(ctx, ep, READ_IDTR, cpu)?;
         expect_gp(ctx, ep, READ_GDTR, cpu)
     });
     cap_delete(ep).ok();
     result
-}
-
-/// The `k`th CPU checked of `cpus` (`k < cpus.min(EVERY_CPU_MAX)`): `k` itself
-/// up to [`EVERY_CPU_MAX`] CPUs; past it, CPU `k` for the first [`LOW_CPUS`],
-/// then [`SAMPLED_CPUS`] CPUs evenly spaced from `LOW_CPUS` to `cpus - 1`.
-fn checked_cpu(k: u32, cpus: u32) -> Result<u32, &'static str>
-{
-    if cpus <= EVERY_CPU_MAX || k < LOW_CPUS
-    {
-        return Ok(k);
-    }
-    // `cpus - 1 - LOW_CPUS` >= SAMPLED_CPUS - 1 here, so the samples are
-    // distinct; the last is `cpus - 1`.
-    let j = u64::from(
-        k.checked_sub(LOW_CPUS)
-            .ok_or("integration::umip_descriptor_reads_fault: sampled CPU index out of range")?,
-    );
-    let span = u64::from(
-        cpus.checked_sub(1)
-            .and_then(|last| last.checked_sub(LOW_CPUS))
-            .ok_or("integration::umip_descriptor_reads_fault: CPU span out of range")?,
-    );
-    let offset = j
-        .checked_mul(span)
-        .and_then(|spaced| spaced.checked_div(u64::from(SAMPLED_CPUS - 1)))
-        .ok_or("integration::umip_descriptor_reads_fault: CPU offset overflows")?;
-    u32::try_from(offset)
-        .ok()
-        .and_then(|o| LOW_CPUS.checked_add(o))
-        .ok_or("integration::umip_descriptor_reads_fault: sampled CPU out of range")
 }
 
 /// Run one child, pinned to `cpu` with this thread as its fault handler on

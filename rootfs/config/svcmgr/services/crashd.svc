@@ -19,6 +19,10 @@
 # § Core Dump). The namespace grants /crash alone, with the rights the core
 # store uses (create, write, list, size, delete, rename) and not READ: a
 # core holds the process's memory, so reading one needs a cap to /crash.
+#
+# `CRASHD_OOM_STALL_MS` is unset, so crashd holds no fault memmgr declined for
+# want of memory and reports each such fault as it does any other
+# (services/crashd/docs/operation.md § Hold).
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure

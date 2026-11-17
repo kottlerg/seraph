@@ -340,8 +340,8 @@ authority init created them with, so it could not respawn any of the four
 `timed` and `pwrmgr` hold no
 unique source cap — each re-acquires its authority on (re)start by
 querying devmgr (`QUERY_DEVICE` on the rtc class SEND for timed, per
-[timed/README.md](../../timed/README.md); `QUERY_ACPI_TABLE` +
-`QUERY_SHUTDOWN_DEVICE` for pwrmgr, per
+[timed/README.md](../../timed/README.md); `QUERY_SHUTDOWN_DEVICE` on RISC-V for
+pwrmgr, per
 [pwrmgr/README.md](../../pwrmgr/README.md)), and svcmgr re-serves a fresh
 RECV on the persistent service endpoint so cached client caps survive the
 restart. `logd` is the log sink: svcmgr holds the master-log endpoint

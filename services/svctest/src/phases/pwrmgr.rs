@@ -3,7 +3,8 @@
 
 // services/svctest/src/phases/pwrmgr.rs
 
-//! pwrmgr service surface: cap-deny enforcement + terminal shutdown.
+//! pwrmgr service surface: cap-deny enforcement, terminal shutdown, and the
+//! `reboot` re-entry role `cargo xtask test-reboot` stages.
 
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
@@ -41,6 +42,49 @@ pub fn pwrmgr_cap_deny_phase(caps: &Caps)
         reply.label
     );
     std::os::seraph::log!("pwrmgr cap-deny phase passed (UNAUTHORIZED reply)");
+}
+
+/// The `reboot` role, run by the `reboot` test recipe
+/// (`rootfs/config/svcmgr/tests/reboot.svc`, which `cargo xtask
+/// test-reboot` stages): drain the one-seed bootstrap round
+/// (`pwrmgr.shutdown`) and send `REBOOT` through it. On the success path
+/// the machine resets, which ends QEMU under `-no-reboot`; a reply, or no
+/// cap, is logged and the role exits 1. Returns on any other role.
+pub fn reentry_main(role: &str)
+{
+    if role != "reboot"
+    {
+        return;
+    }
+    let info = std::os::seraph::startup_info();
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let cap = if info.creator_endpoint == 0
+    {
+        0
+    }
+    else
+    {
+        // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
+        unsafe { ipc::bootstrap::request_slots::<1>(info.creator_endpoint, ipc_buf) }
+            .map_or(0, |[cap]| cap)
+    };
+    if cap == 0
+    {
+        std::os::seraph::log!("reboot fixture: no pwrmgr.shutdown seed");
+        std::process::exit(1);
+    }
+    std::os::seraph::log!("reboot fixture: requesting REBOOT");
+    let msg = ipc::IpcMessage::new(ipc::pwrmgr_labels::REBOOT);
+    // SAFETY: `ipc_buf` is this thread's registered IPC buffer.
+    match unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
+    {
+        Ok(r) => std::os::seraph::log!(
+            "reboot fixture: pwrmgr REBOOT returned (label={:#x})",
+            r.label
+        ),
+        Err(e) => std::os::seraph::log!("reboot fixture: pwrmgr REBOOT ipc_call failed ({e})"),
+    }
+    std::process::exit(1);
 }
 
 /// Terminal-only. On the success path the platform powers off and

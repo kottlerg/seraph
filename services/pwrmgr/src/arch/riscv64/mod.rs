@@ -10,10 +10,11 @@
 //! [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], then forwards an SBI
 //! `system_reset` call through the kernel to M-mode firmware. The
 //! `SbiControl` cap gates kernel-side acceptance; pwrmgr's cap-gating
-//! gates the userspace IPC.
+//! gates the userspace IPC. acpid serves no power request on RISC-V, so
+//! the `acpid.power` seed is deleted.
 
-use crate::caps::devmgr_call;
-use ipc::devmgr_labels;
+use crate::caps::{Bootstrap, drop_unused};
+use ipc::{IpcMessage, devmgr_errors, devmgr_labels};
 
 const SBI_EXT_SRST: u64 = 0x5352_5354; // "SRST" in ASCII.
 const SBI_SRST_RESET: u64 = 0; // function 0: system_reset
@@ -29,29 +30,40 @@ pub struct Actuator
     sbi_control_cap: u64,
 }
 
-/// Resolve the SBI SRST authority from devmgr. Returns `None` if the query
-/// fails or devmgr served no cap.
-pub fn resolve(devmgr_registry: u64, _self_aspace: u64, ipc_buf: *mut u64) -> Option<Actuator>
+/// Resolve the SBI SRST authority from devmgr through the
+/// `devmgr.shutdown` seed, which is then deleted. Returns `None` if the seed
+/// is absent, the query fails, or devmgr served no cap.
+pub fn resolve(bootstrap: &Bootstrap, ipc_buf: *mut u64) -> Option<Actuator>
 {
-    let reply = devmgr_call(
-        devmgr_registry,
-        devmgr_labels::QUERY_SHUTDOWN_DEVICE,
-        0,
-        0,
-        ipc_buf,
-    )?;
+    drop_unused(bootstrap.acpid_power);
+    let registry = bootstrap.devmgr_shutdown;
+    if registry == 0
+    {
+        return None;
+    }
+    let msg = IpcMessage::builder(devmgr_labels::QUERY_SHUTDOWN_DEVICE)
+        .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
+        .build();
+    // SAFETY: `ipc_buf` is the kernel-registered per-thread IPC buffer.
+    let reply = unsafe { ipc::ipc_call(registry, &msg, ipc_buf) };
+    let _ = syscall::cap_delete(registry);
+    let reply = reply.ok()?;
+    if reply.label != devmgr_errors::SUCCESS
+    {
+        return None;
+    }
     let sbi_control_cap = *reply.caps().first()?;
     Some(Actuator { sbi_control_cap })
 }
 
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
-pub fn shutdown(_self_thread: u64, act: &Actuator)
+pub fn shutdown(act: &Actuator, _ipc_buf: *mut u64)
 {
     sbi_reset(act, SRST_TYPE_SHUTDOWN, "shutdown");
 }
 
 /// Attempt SBI SRST cold reboot. Logs and returns on failure.
-pub fn reboot(_self_thread: u64, act: &Actuator)
+pub fn reboot(act: &Actuator, _ipc_buf: *mut u64)
 {
     sbi_reset(act, SRST_TYPE_COLD_REBOOT, "reboot");
 }

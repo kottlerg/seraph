@@ -46,7 +46,7 @@ Handshake-checked namespaces carry the version in their first-contact handshake,
 rejects a mismatch; `devmgr_labels` and `devmgr_dma_labels` instead carry it in `data[0]` of every
 request, which devmgr checks each time, and `iommu_labels` does the same, checked by the IOMMU
 driver, as does `log_labels` for its two query labels, `QUERY_SLOTS` and `QUERY_HISTORY`, checked by
-logd. Only `ns_labels` is implicitly covered: its caps descend
+logd, and `acpid_labels`, checked by acpid. Only `ns_labels` is implicitly covered: its caps descend
 from the `vfsd_labels::GET_SYSTEM_ROOT_CAP` and `fs_labels::FS_MOUNT` handshakes, so the parent
 channel stands in for the version check. The remaining constants are markers that exist for the bump
 discipline. `STREAM_LABELS_VERSION` is in practice marker-only: every process that holds a stream

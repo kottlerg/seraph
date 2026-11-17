@@ -70,6 +70,7 @@ dependencies = [
  "crash-report",
  "crashd-core-file",
  "crashd-fault-bound",
+ "crashd-oom-hold",
  "ipc",
  "syscall",
  "syscall-abi",
@@ -84,6 +85,10 @@ dependencies = [
 
 [[package]]
 name = "crashd-fault-bound"
+version = "0.1.4"
+
+[[package]]
+name = "crashd-oom-hold"
 version = "0.1.4"
 
 [[package]]
@@ -578,14 +583,9 @@ name = "pwrmgr"
 version = "0.1.4"
 dependencies = [
  "ipc",
- "pwrmgr-acpi",
  "syscall",
  "syscall-abi",
 ]
-
-[[package]]
-name = "pwrmgr-acpi"
-version = "0.1.4"
 
 [[package]]
 name = "recv-pool"

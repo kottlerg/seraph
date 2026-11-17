@@ -709,8 +709,7 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `RESET_GRACE` | `services/pwrmgr/src/main.rs` | 1 s | tuning (platform reset latency) | none | correct as is | None |
-| `SLP_TYP_MAX` | `services/pwrmgr/acpi/src/lib.rs` | 7 | hardware spec (ACPI 3-bit `SLP_TYPx`) | none | correct as is | None |
-| SDT length | `services/pwrmgr/acpi/src/lib.rs` | `u32` | hardware spec (ACPI SDT header) | none | correct as is | None |
+| `ACPID_CALL_TIMEOUT_MS` | `services/pwrmgr/src/arch/x86_64/mod.rs` | 30 s per acpid `SLEEP` or `RESET` call (`SYS_IPC_CALL` timeout) | tuning (a time bound, bounds no capacity: far above acpid's start-up, which a request sent during it waits behind, and its `\_PTS` evaluation) | none | correct as is | None; an acpid that is down or blocked fails `SHUTDOWN` or `REBOOT` with `INVALID_REQUEST` after 30 s instead of holding pwrmgr and its caller |
 | wall time | `services/timed/src/main.rs` | `u64` microseconds | ABI width (about 584 000 years) | none | correct as is | None |
 | `forward_lines` buffer | `services/usertest/src/main.rs` | 512 B read chunk | batch size (lines accumulate unbounded) | 512 B stack | correct as is | None |
 | crasher settle sleep | `services/crasher/src/main.rs` | 500 ms | tuning (lets the surface assertions land before the fault report) | none | correct as is | None |
@@ -732,6 +731,9 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 | `MAX_LOADS` | `services/crashd/core-file/src/layout.rs` | 65 533 `PT_LOAD`s per core | format spec (`e_phnum` is 16 bits and `PN_XNUM` (`0xffff`) is not written, so the loads and the `PT_NOTE` number at most `0xfffe`; a run past it is not recorded) | none | correct as is | None |
 | `LABEL_MAX` | `services/crashd/core-file/src/store.rs` | 48 bytes of a core name's process label | tuning (the name's sequence number makes it unique; a label is cut, never refused) | none | correct as is | None |
 | `NAMED_PAGE_TRIES` | `services/crashd/src/main.rs` | 3 attaches to reach the page holding the faulting thread's cap | tuning (the faulting thread's index moves only when threads listed before it exit between two attaches; past it the block is `unidentified`; bounds no capacity) | none | correct as is | None |
+| `SLOTS` | `services/crashd/oom-hold/src/lib.rs` | 16 faults declined for want of memory held at once, and 16 resumed faults remembered for the repeat rule | tuning (each slot is one endpoint made at start; a fault past them is reported and declined at once, as with no hold) | 16 endpoints and 16 wait-set members, while a stall is set | correct as is | None |
+| `STALL_MAX_MS` | `services/crashd/oom-hold/src/lib.rs` | 600 000 ms (10 min) held per fault | tuning (a longer `CRASHD_OOM_STALL_MS` is clamped to it, logged; bounds how long a held thread waits, no capacity) | none | correct as is | None |
+| `HEAP_TOUCH_BYTES`, `STACK_TOUCH_BYTES` | `services/crashd/src/main.rs` | 64 KiB of heap, and 32 KiB of each of the main and watchdog threads' stacks, touched at start while a stall is set | tuning (what a report uses while memory is critical: its lines, the `STACK_SCAN_BYTES` scan, its registers and frames; a page past them is declined then and ends crashd) | 128 KiB of pages, backed at start | correct as is | None |
 
 ### devmgr
 
@@ -797,6 +799,7 @@ Every entry here is `correct as is`; none is tracked.
 | `MAX_SSDTS` | `services/acpid/src/startup.rs` | 64 SSDTs acpid asks devmgr for | tuning (the XSDT of a QEMU machine lists one) | none | correct as is | None; SSDTs past the 64th are not requested |
 | `EVAL_THREAD_STACK` | `services/acpid/src/main.rs` | the larger of `aml::EVAL_STACK_BYTES` and `aml::PARSE_STACK_BYTES`, plus 256 KiB for acpid's own frames | current peak plus headroom (the evaluator's and the parser's stack bounds, whichever is larger, and acpid's frames below them) | one thread stack of that size | correct as is | None; the thread that evaluates AML is given this much stack |
 | `MAX_BRIDGE_WINDOWS` | `shared/ipc/src/lib.rs` | 16 windows in one `BRIDGE_WINDOWS` push | tuning | none | correct as is | None; acpid refuses a `_CRS` with more windows, and devmgr answers a push with more `INVALID_REQUEST` |
+| `SLP_TYP_MAX` | `services/acpid/src/power.rs` | 7 | hardware spec (ACPI 3-bit `SLP_TYPx`) | none | correct as is | None; a `\_S5_` whose `SLP_TYPa` exceeds it makes `SLEEP(5)` reply `NO_DEVICE` |
 | `ACPI_ENABLE_WAIT_MS` | `services/acpid/src/arch/x86_64/mod.rs` | 3000 ms, polled each millisecond | tuning (the firmware's SMI handler makes the switch) | none | correct as is | None; acpid logs that `SCI_EN` is still clear and goes on |
 | Platform records (`MAX_PLATFORM_RECORDS`, `MAX_RECORD_RESOURCES`, `MAX_INFO_BYTES`) | `services/devmgr/firmware/src/records.rs` | 64 records; 8 resources per record; 32 B of device info | tuning (QEMU describes four platform devices; the bound keeps a malformed table from growing devmgr's record set) | about 330 B per record | correct as is | None; a device past the set's bound is dropped, logged, and a description's further resources are dropped |
 | Platform description table (`MAX_TABLE_BYTES`, `MAX_PLATFORM_DEVICES`, `MAX_PLATFORM_KEY_BYTES`, `MAX_PLATFORM_RESOURCES`) | `services/devmgr/firmware/src/platform.rs` | 8192 B; 16 devices; 32 B key; 4 resources per device | encoding artefact for the key (the declaration's `MAX_PLATFORM_KEY_BYTES`), tuning for the rest (the one table in tree lists one device in under 1 KiB) | the parsed table for the boot | correct as is | None; a table past any bound is rejected whole, logged, and its module released |
@@ -896,7 +899,7 @@ production value is raised.
 | `UNSCALED_CPUS`, `scaled_polls` | `core/ktest/src/main.rs` | 16, `u32` saturating | test fixture | none | correct as is | None |
 | `REPORT_SLICES`, `REPORT_SLICE_MS` | `core/ktest/src/tally.rs` | 1000 x 5 ms | test fixture | none | correct as is | None |
 | `await_all` mask | `core/ktest/src/tally.rs` | 64 children | ABI width (notification word) | none | correct as is | None |
-| `MAX_POLLS` (14 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
+| `MAX_POLLS` (16 copies) | `core/ktest/src/` | 2000 x 1 ms, scaled | test fixture | none | correct as is | Hoist to one constant |
 | `CSPACE_RELEASE_POLLS` | `core/ktest/src/unit/mm.rs` | 2000 x 1 ms, scaled | test fixture (the wait for a dead `CSpace`'s deferred teardown, as long as `MAX_POLLS`) | none | correct as is | None |
 | `LIVE` (`HANDLES`) | `core/ktest/src/stress/cspace_registry_arena.rs` | 4097 | test fixture (one past the former 4096-entry registry; funded at the ABI's `CSPACE_SLOTS_PER_PAGE` slots a page) | about 16 KiB BSS | correct as is | None |
 | `HOLDERS`, `WAKERS` | `core/ktest/src/stress/sleep_list_wide.rs` | 192 / 64 | test fixture (past the former 128-entry sleep list) | 5 MiB BSS (256 4 KiB stacks, each above its 16 KiB guard) | correct as is | None |
@@ -909,7 +912,7 @@ production value is raised.
 | `SEED_ATTEMPTS` | `core/ktest/src/unit/retype.rs` (`pool_seeding_takes_interrupts`) | 4 | test fixture (conclusive repeats of a millisecond seeding call, so host scheduling delay alone cannot keep every probe outside the calls) | none | correct as is | None |
 | `SEED_ATTEMPT_LIMIT` | `core/ktest/src/unit/retype.rs` (`pool_seeding_takes_interrupts`) | 16 | test fixture (every seeding call of one kind, conclusive or not, so a host or kernel that leaves every call inconclusive still fails the case) | none | correct as is | None |
 | `BARRIER_POLLS` | `core/ktest/src/integration/multi_caller_ipc_fifo.rs` | 10000 x 1 ms, scaled | test fixture (the wait for the barrier thread that runs once every caller is queued) | none | correct as is | None |
-| `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/arch/x86_64/umip.rs` | 16 / 8 | test fixture | none | correct as is | None |
+| `EVERY_CPU_MAX`, `LOW_CPUS` | `core/ktest/src/cpu_sample.rs` | 16 / 8 | test fixture | none | correct as is | None |
 | `MIGRATION_GUARD_MAX_CPUS` | `core/ktest/src/stress/load_balance_handoff_steal.rs` | 32 | ABI width (one-hot `u32` witness) | none | correct as is | None |
 | `ROUNDS`, `PULL_BUDGET_US`, `LOW_EXIT_POLLS`, `SPINNER_START_MS`, `SPINNER_DRAIN_WINDOWS` | `core/ktest/src/integration/idle_pull_starved_ready.rs` | 8 / 50 ms, scaled / 1000 x 1 ms, scaled / 5 s / 4 x 5 s | test fixture (rounds enough that a pull by the threshold rule's transient alone passes them all rarely; budgets far past the idle pull's few ms) | none | correct as is | None |
 | `fund_boot_aspace_pt` budgets | `core/ktest/src/main.rs` | 256 KiB / 64 / 16 pages | test fixture | none | correct as is | None |

@@ -8,20 +8,22 @@
 #     recipes that seed it hold it.
 #   * pwrmgr.deny:deny    — a no-authority twin (sentinel token 1) that the
 #     SHUTDOWN/REBOOT gate rejects; svctest uses it to assert the deny path.
-# `seed = devmgr.shutdown` delivers the REGISTRY_QUERY_AUTHORITY |
-# SHUTDOWN_DEVICE_AUTHORITY-tokened SEND on devmgr's registry that pwrmgr
-# uses to acquire its shutdown actuator caps (QUERY_ACPI_TABLE for the
-# FADT/DSDT it parses, and QUERY_SHUTDOWN_DEVICE for the carved PM1a +
-# 8042 ports / SbiControl). pwrmgr is the only recipe seeding it.
-# pwrmgr owns no hardware caps directly — devmgr is the hardware authority.
-# AML is evaluated by acpid (services/acpid/README.md); pwrmgr reads the FADT and
-# the `_S5_` package itself. devmgr's region grants refuse acpid pwrmgr's
-# ports, though it serves acpid the FADT's PM1a control block.
+# `seed = devmgr.shutdown acpid.power` delivers cap[1] and cap[2]:
+#   * devmgr.shutdown — the REGISTRY_QUERY_AUTHORITY |
+#     SHUTDOWN_DEVICE_AUTHORITY-tokened SEND on devmgr's registry; on
+#     RISC-V pwrmgr acquires its SbiControl through QUERY_SHUTDOWN_DEVICE.
+#     pwrmgr is the only recipe seeding it.
+#   * acpid.power — the POWER_AUTHORITY-tokened SEND on acpid's endpoint; on
+#     x86-64 pwrmgr powers off and resets through acpid's SLEEP(5) and RESET
+#     (services/acpid/README.md § Power requests). svcmgr launches acpid
+#     before pwrmgr because of this seed.
+# Each architecture deletes the seed it does not use. pwrmgr owns no hardware
+# caps: devmgr is the hardware authority, and acpid holds the ACPI registers.
 #
 # `restart = on_failure`: svcmgr re-creates pwrmgr from /services/pwrmgr and
 # re-serves a fresh RECV on the persistent endpoint, so a SHUTDOWN_AUTHORITY
 # cap cached against `pwrmgr.shutdown` survives a crash-restart. pwrmgr
-# re-acquires its actuator caps from devmgr on each (re)start.
+# re-acquires its RISC-V SbiControl from devmgr on each (re)start.
 # `shutdown_actuator = pwrmgr.shutdown` declares pwrmgr the system's
 # shutdown actuator: when a `critical = yes` service is permanently down,
 # svcmgr calls SHUTDOWN through a SEND it derives from pwrmgr's endpoint
@@ -35,5 +37,5 @@ restart           = on_failure
 critical          = no
 namespace         = none
 provides          = pwrmgr.shutdown:auth pwrmgr.deny:deny
-seed              = devmgr.shutdown
+seed              = devmgr.shutdown acpid.power
 shutdown_actuator = pwrmgr.shutdown

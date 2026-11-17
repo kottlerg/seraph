@@ -1,7 +1,8 @@
 # crashd Operation
 
-How crashd registers as the crash service, handles each fault, writes a core of a process its
-policy names, bounds that handling, and what it cannot report.
+How crashd registers as the crash service, handles each fault, holds a fault declined for want of
+memory, writes a core of a process its policy names, bounds that handling, and what it cannot
+report.
 
 ---
 
@@ -13,7 +14,7 @@ policy names, bounds that handling, and what it cannot report.
    its recipe's `debug_authority = yes` has svcmgr mint
    ([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `debug_authority`).
 3. It reads its core-dump policy from the `CORE_DUMP` entry of its environment and logs it
-   ([Core Dump](#core-dump)).
+   ([Core Dump](#core-dump)), and its stall from `CRASHD_OOM_STALL_MS` ([Hold](#hold)).
 4. It starts its watchdog thread, then binds its main thread's upcall class to an endpoint the
    watchdog receives on, so the watchdog does not copy that binding onto itself
    ([Bounds](#bounds)).
@@ -21,6 +22,9 @@ policy names, bounds that handling, and what it cannot report.
    on procmgr's crash endpoint, which every process procmgr creates has its exception class bound
    to ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Crash Endpoint and Debug
    Authority).
+6. With a stall set, it makes its hold endpoints and wait set and touches its stack and heap
+   ([Hold](#hold)), and logs `holding faults declined for want of memory up to <stall> ms`. It
+   logs `reporting crashes` and receives faults.
 
 When crashd dies, procmgr declines the faults on the endpoint until a respawned crashd registers.
 
@@ -63,6 +67,89 @@ A fault of a restartable syscall's user copy never reaches crashd: its pager's f
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Reply), so the syscall fails and the
 process, which lives on, leaves no report.
 
+A page fault memmgr declined for want of memory is first held, when crashd's stall is set
+([Hold](#hold)).
+
+---
+
+## Hold
+
+`CRASHD_OOM_STALL_MS` in crashd's environment, a decimal number of milliseconds, sets the stall:
+how long crashd holds a page fault memmgr declined for want of memory before it reports and
+declines it. No entry, or `0`, holds none, and crashd handles every fault as
+[Per Fault](#per-fault) says. A value that is not decimal digits is logged as a warning and holds
+none; one past 600 000 ms (`STALL_MAX_MS`, ten minutes) is clamped to it, logged. The shipped
+recipe sets no stall; the usertest boot's sets 3000 ms
+([docs/testing.md](../../../docs/testing.md) § Crash reports).
+
+With a stall set, crashd makes 16 hold endpoints at start (`SLOTS`), each the queue of one held
+fault, and a wait set of procmgr's crash endpoint and the Notification on which the runtime
+receives memmgr's pressure-level changes. It waits on the wait set with a timeout of the earliest
+hold's deadline, and receives from the crash endpoint without blocking when the wait set names it.
+When the endpoints or the wait set cannot be made, or the process has no pressure registration, it
+logs a warning and runs with no hold. It reads memmgr's level when the Notification has signalled
+a change since its last read, and takes the level as `CRITICAL` while memmgr does not answer.
+
+A fault is holdable when it is a VM fault memmgr forwarded with decline code 7 (no free page can
+back it), 6 (the metadata arena cannot grow) or 8 (the region's chunk table cannot record the run)
+([memmgr IPC Interface](../../memmgr/docs/ipc-interface.md) § Kernel-origin fault message). Code
+10, a budget node's max, is the process's own limit, and a holdable fault is never one of an
+exception class; crashd handles each such fault at once. A holdable fault that arrives:
+
+- at `CRITICAL` with a slot free is redirected (`FAULT_REPLY_REDIRECT`,
+  [docs/fault-handling.md](../../../docs/fault-handling.md) § Reply) to that slot's endpoint, with
+  the slot as its reason word. crashd keeps the fault's message as it arrived and logs
+  `fault badge=<badge> addr=<addr> held: memory critical (reason=<code>), up to <stall> ms`. The
+  thread stays fault-blocked, and its fault reaches that endpoint when the thread next runs, to
+  wait there queued; no thread of crashd waits on it, so crashd goes on receiving and reporting
+  other faults. The endpoint is in crashd's wait set from the redirect until the fault arrives;
+- at `CRITICAL` with every slot taken is logged `not held: no free hold slot` as a warning, then
+  reported and declined;
+- below `CRITICAL`, the level having fallen between memmgr's decline and crashd's receive, is
+  resumed at once (`FAULT_REPLY_RESUME`), logged `resumed at once: memory no longer critical`.
+
+When the level falls below `CRITICAL`, crashd receives each held fault that has arrived from its
+endpoint without blocking and resumes it, logging `resumed after <ms> ms: memory no longer
+critical`; the thread retries its access, which faults into memmgr again. A fault that has not
+arrived yet stays held, and is resumed when it arrives. When a hold's deadline passes first,
+crashd receives that fault, logs `hold timed out after <ms> ms` as a warning, and reports and
+declines it as [Per Fault](#per-fault) does, from the message it kept. A receive that finds
+nothing after the fault arrived frees the slot with no answer, logged `withdrawn after <ms> ms
+held`: the fault left the endpoint while held, when a debugger's attach stopped the thread, which
+cancels its fault, the process was destroyed, or the thread's exception class was rebound, which
+delivers the fault again under the new binding
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Delivery, Resume, and Kill). A
+fault that has not arrived when its deadline passes (its thread was stopped or destroyed before
+it ran) is logged `not delivered to its hold in <ms> ms` as a warning, and crashd replaces the
+slot's endpoint with a new one, so a slot's endpoint only ever queues the fault crashd holds
+there. Should that fault reach the old endpoint later, its delivery holds the endpoint's last
+reference, and the fault is released unhandled, its thread killed with no report
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Liveness, rule 1). A slot whose new
+endpoint cannot be made is retired, logged, and holds no fault again until crashd restarts.
+
+crashd remembers each fault it resumed, by its badge and faulting page, until that fault's hold
+deadline, in 16 entries, the one that expires first replaced when they are full. A fault of the
+same badge and page before then repeats it: at `CRITICAL` it is held only until that deadline;
+below `CRITICAL` it is logged `not held: repeats a resumed fault` as a warning, then reported and
+declined. So an access memmgr cannot back once memory is freed is not resumed into a loop, and the
+holds of one fault total at most the stall.
+
+**While memory is critical.** crashd runs outside memmgr's system reserve: a page it touches for
+the first time while the level reads `CRITICAL` is declined as any such process's is, and crashd,
+undebuggable and with no handler of its own faults, dies of it. Its held faults are then released
+unhandled, as a decline would end them, with no report
+([docs/fault-handling.md](../../../docs/fault-handling.md) § Liveness, rule 3), and procmgr
+declines new faults until the respawned crashd registers. So, with a stall set, crashd touches
+64 KiB of its heap at start (`HEAP_TOUCH_BYTES`), which the allocator reuses for a report's
+buffers, and 32 KiB of the stacks of its main and watchdog threads (`STACK_TOUCH_BYTES`); its log
+writes format on the stack. A report allocates its block's lines, its stack scan (at most 8 KiB),
+its registers, the bytes at the instruction pointer and its frames, all within that heap. While the
+level reads `CRITICAL` it writes no core, since a core's buffers and the file system's writes need
+pages a report does not: the dump's line is `not written: memory is critical`
+([Core Dump](#core-dump)). A report that needs a page past those still ends crashd so. crashd
+running inside the reserve, which removes that, is design intent; not yet implemented
+([#1098](https://github.com/kottlerg/seraph/issues/1098)).
+
 ---
 
 ## Core Dump
@@ -82,21 +169,23 @@ A dump follows the block when the report attached and read the process within it
 
 1. It reads the process's name from `LIST_PROCESSES`, and ends, with no line, when the policy
    does not name it.
-2. It writes no core of a process that declared itself on the core path (`DECLARE_NO_CORE`, which
+2. It writes no core while memory is critical, when crashd holds faults and memmgr's level reads
+   `CRITICAL` ([Hold](#hold)).
+3. It writes no core of a process that declared itself on the core path (`DECLARE_NO_CORE`, which
    the attach reply's flags word reports): vfsd, the FAT driver, the block driver, devmgr and the
    IOMMU driver, through which the core would be written, so the dump never waits on the process
    that died
    ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 26: `DECLARE_NO_CORE`).
-3. It attaches the process again, page by page, and stops each listed thread but the faulting one
+4. It attaches the process again, page by page, and stops each listed thread but the faulting one
    (`SYS_THREAD_STOP`): the fault holds that one already, and a stop would cancel its fault. It
    reads the registers and extended state of each, the faulting thread first, at most 256 threads
    (`CORE_THREADS_MAX`); a thread past them is stopped and not recorded. When the faulting thread
    is not listed (one that never registered), it writes no core.
-4. It lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at
+5. It lists the address space's pages (`SYS_THREAD_LIST_PAGES`), reads the image's ELF header at
    the load bias for the core's `NT_AUXV`, and lays the core out within the per-core budget.
-5. It deletes the `.part` files earlier dumps left, and the oldest cores until the new one fits
+6. It deletes the `.part` files earlier dumps left, and the oldest cores until the new one fits
    the directory budget.
-6. It writes the core under its `.part` name, reading the pages through the faulting thread's
+7. It writes the core under its `.part` name, reading the pages through the faulting thread's
    cap, and renames it.
 
 The threads it stopped stay stopped: the decline that follows ends the process, whose teardown ends

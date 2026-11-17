@@ -53,7 +53,8 @@ services/svctest/
         │                      #   driver bind; DMA confinement; MSI delivery, forge,
         │                      #   churn, and release
         ├── acpi.rs            # acpid's results read from devmgr (`acpi_host_bridges`); the
-        │                      #   `ACPI_AUTHORITY` gate (`acpi_authority_deny`)
+        │                      #   `ACPI_AUTHORITY` gate (`acpi_authority_deny`); the power
+        │                      #   deny check (`acpid_power_deny`)
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;
@@ -78,7 +79,7 @@ services/svctest/
         │   ├── mod.rs         # Own fatfs under block faults: failed writes, removes, renames
         │   ├── pressure.rs    # Own fatfs gives idle cache pages back at memory pressure Low
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
-        ├── pwrmgr.rs          # Shutdown cap-deny check and terminal shutdown
+        ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
@@ -129,8 +130,9 @@ bind-deny phase (`caps[2]`), the input-ordinal phase (`caps[8]`), the on-demand-
 (`caps[3]`, `caps[8]`, and `caps[10]`), the DMA confinement and MSI delivery, forge, churn, and
 release phases (`caps[9]`), the
 drivers stray-cap phases (`caps[7]` and `caps[8]`), the drivers deny phase (`caps[11]` to
-`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr` and
-`pwrmgr.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]` and `caps[5]`), the
+`caps[13]`), the svcmgr seed-only phase (every seed-only seed, plus the public `svcmgr`,
+`pwrmgr.deny` and `acpid.deny` names it resolves), the svcmgr second-seed-round phase (`caps[4]`
+and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward` and
 `logd_concurrent` phases (`caps[6]`), the vfsd swap-partition phase (`caps[14]`), and the
 `crash_endpoint` phase (`caps[15]`) instead fail their assertions. The seed-only phase thus fails
@@ -231,7 +233,8 @@ child's retired slot and history through it, and requires `QUERY_DENIED` for a q
 own log cap. Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
-reply to `SHUTDOWN`.
+reply to `SHUTDOWN`. The public `acpid.deny` is resolved the same way and drives the
+`acpid_power_deny` phase, which requires an `UNAUTHORIZED` reply to `SLEEP(5)` and to `RESET`.
 
 The `svcmgr_worker_fault_restart` phase runs when the `crasher-worker.svc` recipe is staged
 beside `svctest.svc` and is skipped otherwise; staged, it fails if `crasher.worker` is not
@@ -272,6 +275,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `node-handle-child`         | `node_handle`  | `memmgr_node_handles` (max set by handle)   |
 | `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
+| `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---
 

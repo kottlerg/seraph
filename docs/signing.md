@@ -41,18 +41,18 @@ Format and § Trust Store, and the verification of § Verification, are implemen
 signing of § Signing are implemented: every build signs the kernel, every bundle entry and every ELF
 image of the root filesystem, builds the trust store at the path § Signing names, and embeds it in
 the bootloader. The bootloader verifies the kernel and every bundle entry against that store and
-hands the store to procmgr (§ Trust Store), which parses it and keeps it. procmgr's verification and
-its signature policy are design intent, not yet implemented
-([#124](https://github.com/kottlerg/seraph/issues/124)): today every image procmgr creates is
-trusted because of where it is stored, and its trailer is bytes after the image that procmgr's
-loader ignores.
+hands the store to procmgr (§ Trust Store), which parses it and keeps it. procmgr verifies every
+image it creates against that store before it parses it (§ Verifier Discipline), under its
+creator's signature policy and the name the creator gives (§ Signature Policy in procmgr). The
+override that § Signature Policy in procmgr describes is design intent, not yet implemented: no
+creator can hold it, so procmgr creates no process from an image that does not verify.
 
 ---
 
 ## Principles
 
-Implemented at the bootloader; procmgr's part is design intent, not yet implemented
-(§ Implementation Status).
+Implemented, apart from the override of the third principle, which is design intent, not yet
+implemented (§ Signature Policy in procmgr).
 
 - **Verify at the loader.** An object is verified by the stage that turns its bytes into running
   code or into input that code trusts: the bootloader for what it loads, procmgr for every image it
@@ -70,9 +70,6 @@ Implemented at the bootloader; procmgr's part is design intent, not yet implemen
 ---
 
 ## Threat Model
-
-Implemented for the objects the bootloader loads; for the images procmgr creates, design intent,
-not yet implemented (§ Implementation Status).
 
 The attacker can write the storage the system boots and runs from: the EFI System Partition (ESP),
 the bootstrap bundle on it, and the root filesystem. The attacker does not hold a private key the
@@ -95,9 +92,6 @@ trusted to execute as built.
 ---
 
 ## Which Stage Verifies What
-
-Implemented apart from procmgr's row, which is design intent, not yet implemented
-(§ Implementation Status).
 
 | Object | Verified by | Against | Expected kind and name |
 |---|---|---|---|
@@ -203,7 +197,15 @@ read as a certificate signature, whose signed bytes begin with another tag.
 
 The `name` is the bundle entry name for the kernel (`kernel`), `init` and a boot module, and the
 install path from the root of the root filesystem (`/services/svcmgr`) for every other object.
-Names are compared byte for byte.
+Names are compared byte for byte, so each has one canonical form, in which the signer signs it and
+procmgr requires a creator to give it: 1 to 256 bytes of UTF-8, and either one component (an
+entry name) or `/` followed by components separated by single `/` (an install path), each
+component nonempty, holding no `/` and no NUL, and neither `.` nor `..`.
+`objsig::name_is_canonical` is the one check of it, which xtask's signer and procmgr both call.
+The comparison is case-exact: the root filesystem resolves names without regard to letter case,
+so a path spelled in another case reaches the same file, but no signature names that spelling,
+and procmgr refuses the object under it. A creator names an installed file by its install path as
+xtask installs it.
 
 ### Hashed Bytes
 
@@ -348,8 +350,7 @@ it does.
 
 ## Verifier Discipline
 
-The bootloader follows it; procmgr's part is design intent, not yet implemented
-(§ Implementation Status).
+The bootloader and procmgr follow it.
 
 - **Verify before parse.** No stage parses an object's body (its ELF headers, its table text)
   before the verifier has accepted it.
@@ -370,10 +371,13 @@ the object, which halts the boot.
 procmgr copies every image into frames it allocates on the child's account before it verifies it,
 from a file and from a Memory cap alike: a boot module's Memory cap carries full rights
 ([capability-model.md](capability-model.md) § Memory), so its holder can still write the frames,
-and a file server can still write a cache page it maps for procmgr. procmgr then parses and loads
-only from that copy. Its file path today streams the image in several reads and maps the file
-server's cache pages ([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md)
-§ Label 13: `CREATE_FROM_FILE`); it changes to one copy.
+and a file server can still write a cache page it lends procmgr. It reads the object once, the
+length the creator gives, page by page from the file server's cache or whole from the Memory cap,
+into frames only procmgr maps; verifies the copy; parses and loads only the body the verifier
+returned; and returns the frames to memmgr once the segments are copied into the child
+([procmgr IPC Interface](../services/procmgr/docs/ipc-interface.md) § Image Verification). Any
+refusal is one reply, `SIGNATURE_REFUSED`, logged with the name and the verifier's reason, and
+creates nothing.
 
 A boot module keeps its trailer: `BootModule.size` is the length of the signed object, so procmgr
 verifies an image created from a boot module as it does one read from a file. A consumer of a data
@@ -385,22 +389,30 @@ no signature check; no loader uses it.
 
 ## Signature Policy in procmgr
 
-Design intent; not yet implemented (§ Implementation Status).
+procmgr requires a verified signature for every image it creates. procmgr's record of each creator
+carries its signature policy, the set of kinds its creates may load, and a create's object is
+verified with that set as the kinds it accepts. The un-badged creator (init, and svcmgr's mint
+source) loads boot modules, services, drivers and programs; the kernel and `init` are loaded by the
+bootloader alone, and a data object is never code. A child takes its creator's set, narrowed to
+programs when it is itself a program: a program starts programs and nothing else, and no child holds
+more than its creator.
 
-procmgr requires a verified signature for every image it creates, unless the creator holds the
-override. procmgr's record of each creator carries its signature policy: the set of kinds its
-creates may load, and whether it holds the override that lets it create from an image no record
-verifies. Both creation labels carry the name the creator
-expects: `CREATE_FROM_FILE` the install path of the file, `CREATE_PROCESS` the name the image was
-signed under (a boot module's bundle entry name). procmgr grants a child, at its creation, at most
-the policy of its creator.
+Both creation labels carry the name the creator expects, in the canonical form of § Signed
+Attributes, which procmgr checks before it reads the object: `CREATE_FROM_FILE` the install path of
+the file, `CREATE_PROCESS` the name the image was signed under (a boot module's bundle entry name).
+The creator chooses the name, so the check binds the object to what the creator asked for: a
+creator can load only an object signed under the name it gives, of a kind its own policy admits. It
+cannot pass one object off as another, or start a kind its policy does not hold, whatever name it
+gives.
 
-init, svcmgr and devmgr never hold the override: every service or driver they start is verified.
-In the default image no process holds it. The boundary between system software, which is always
-verified, and user programs, which a deployer may let run unverified, is therefore which creators
-hold the override: a capability, not a mode or a mount. How a deployer grants the override, and
-changes the grant on a running system, is decided with the authority work of
-[#152](https://github.com/kottlerg/seraph/issues/152) and the package manager.
+The override, a mark on a creator's record that would let it create from an image no record
+verifies, is design intent, not yet implemented (§ Implementation Status). init, svcmgr and devmgr
+never hold it: every service or driver they start is verified. In the default image no process
+holds it. The boundary between system software, which is always verified, and user programs, which
+a deployer may let run unverified, is therefore which creators hold the override: a capability, not
+a mode or a mount. How a deployer grants the override, and changes the grant on a running system,
+is decided with the authority work of [#152](https://github.com/kottlerg/seraph/issues/152) and the
+package manager, and the record carries it from then.
 
 ---
 

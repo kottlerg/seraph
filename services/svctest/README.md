@@ -39,7 +39,7 @@ services/svctest/
         │                      # object-slab release; deferred reclaim; identity;
         │                      # physical base withheld; frames zeroed at hand-out
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,
-        │                      # spawned IPC buffers in the arena; stack note
+        │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
         ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines
         │                      #   and a death forward on the new instance

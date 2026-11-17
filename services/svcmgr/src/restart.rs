@@ -127,6 +127,37 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
     .unwrap_or(0)
 }
 
+/// The `CREATE_FROM_FILE` request labelled `label` for `file` (its file
+/// cap, its size, and the path walked to it, the name it is verified under),
+/// with creator endpoint `badged_creator` and the argv/env cap when present.
+/// Caps: `[file_cap, badged_creator, argv_env?]`; the header rides in data
+/// words 1..5, after `file_size`, and the path in the name block after them.
+/// `None` when the path does not fit a name block.
+#[expect(
+    clippy::large_stack_frames,
+    reason = "the builder's by-value copies (568 B each) across the header and the name block, and \
+              the built `IpcMessage`; on the 32 KiB main-thread stack of svcmgr"
+)]
+fn create_msg(
+    label: u64,
+    file: (u64, u64, &str),
+    badged_creator: u64,
+    argv_env: Option<&ArgvEnvCap>,
+) -> Option<IpcMessage>
+{
+    let (file_cap, file_size, path) = file;
+    let mut builder = IpcMessage::builder(label)
+        .word(0, file_size)
+        .cap(file_cap)
+        .cap(badged_creator);
+    if let Some(cap) = argv_env
+    {
+        builder = builder
+            .words(procmgr_labels::CREATE_FIRST_WORD, &cap.header_words())
+            .cap(cap.cap());
+    }
+    Some(procmgr_labels::with_create_name(builder, label, path.as_bytes())?.build())
+}
 /// Walk svcmgr's root for `path`, then call procmgr `CREATE_FROM_FILE`.
 /// Returns the freshly created (suspended) process, or `None` (each arm
 /// logged) when the argv/env cap cannot be built
@@ -160,11 +191,6 @@ pub(crate) fn mint_stop_authority(ctx: &RestartCtx) -> u64
 /// reply's last cap is the child's node handle, returned in
 /// [`CreatedProcess::node_handle`]; a reply without it is logged and the
 /// child runs with none.
-#[expect(
-    clippy::large_stack_frames,
-    reason = "the `create_msg` and `reply` `IpcMessage`s (568 B each) and the builder's copy; on \
-              the 32 KiB main-thread stack of svcmgr"
-)]
 pub fn walk_and_create_from_file(
     path: &str,
     blobs: StartupBlobs<'_>,
@@ -223,17 +249,18 @@ pub fn walk_and_create_from_file(
     };
     let label = procmgr_labels::CREATE_FROM_FILE | label_bits | argv_env_flag;
 
-    // Caps: [file_cap, badged_creator, argv_env?]; the header rides in data
-    // words 1..5, after `file_size`.
-    let mut builder = IpcMessage::builder(label)
-        .word(0, file_size)
-        .cap(file_cap)
-        .cap(badged_creator);
-    if let Some(cap) = &argv_env
+    let Some(create_msg) = create_msg(
+        label,
+        (file_cap, file_size, path),
+        badged_creator,
+        argv_env.as_ref(),
+    )
+    else
     {
-        builder = builder.words(1, &cap.header_words()).cap(cap.cap());
-    }
-    let create_msg = builder.build();
+        std::os::seraph::log!(warn: "create: {path:?} too long a name to verify");
+        delete_caps(&[file_cap, badged_creator]);
+        return None;
+    };
 
     // A failed call may leave `file_cap` and `badged_creator` in svcmgr's
     // CSpace: a transport error, or a post-block refusal that delivers the
@@ -255,6 +282,13 @@ pub fn walk_and_create_from_file(
             return None;
         }
     };
+    if reply.label == ipc::procmgr_errors::SIGNATURE_REFUSED
+    {
+        std::os::seraph::log!(warn: "create: {path:?} refused: its signature did not verify");
+        delete_caps(&[file_cap, badged_creator]);
+        delete_caps(reply.caps());
+        return None;
+    }
     if reply.label != 0
     {
         std::os::seraph::log!(warn: "create: CREATE_FROM_FILE returned {:#x}", reply.label);

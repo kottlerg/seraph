@@ -380,8 +380,13 @@ After bootstrap, every process is created by procmgr. The flow:
 2. **Procmgr → memmgr.** Procmgr calls `memmgr.REGISTER_PROCESS` and
    receives a badged SEND cap identifying the new process; every later
    allocation for the child uses it.
-3. **Procmgr ELF parse.** Procmgr maps the ELF source, validates its
-   headers, draws the image load bias, and computes the segment layout
+3. **Procmgr verify and parse.** Procmgr copies the signed object into
+   frames only it maps and verifies it against the trust store under the
+   name the caller gave
+   ([procmgr IPC interface](../services/procmgr/docs/ipc-interface.md#image-verification)
+   § Image Verification); a refusal replies `SIGNATURE_REFUSED` and
+   creates nothing. It then validates the verified ELF's headers, draws
+   the image load bias, and computes the segment layout
    and relocation plan (PIE; see
    [userspace-memory-model.md](userspace-memory-model.md) "Image
    Placement").

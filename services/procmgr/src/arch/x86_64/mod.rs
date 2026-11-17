@@ -7,3 +7,7 @@
 
 /// ELF machine type procmgr will accept when loading user binaries.
 pub const EXPECTED_ELF_MACHINE: u16 = elf::EM_X86_64;
+
+/// Architecture a signed image procmgr loads must be signed for
+/// (docs/signing.md § Signed Attributes).
+pub const SIGNED_ARCH: objsig::Arch = objsig::Arch::X86_64;

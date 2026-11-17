@@ -459,9 +459,9 @@ fn starts_with_elf_magic(path: &Path) -> Result<bool>
 }
 
 /// Write the build's trust store to `target/xtask/signing/trust-store`,
-/// leaving the file untouched when it already holds it, so the bootloader's
-/// build, which tracks the file, rebuilds only when the store changes;
-/// returns its path.
+/// the store the bootloader is to embed, leaving the file untouched when it
+/// already holds it, so a build that tracks the file will rebuild only when
+/// the store changes; returns its path.
 ///
 /// # Errors
 ///

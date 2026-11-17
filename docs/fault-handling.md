@@ -851,10 +851,18 @@ format, the contract the host-side symbolizer reads, in
   debugger's `DETACH_PROCESS`, and when the debugger dies attached.
 
 Writing reports to disk is not the crash service's: the report persists through logd's disk and
-network sinks, so the filesystem stays off the crash path (design intent; not yet implemented). A
-core dump of the dead process, after the log report and skipped for a process on the storage path,
-and a policy that holds a crashed process stopped for a debugger to rebind, are design intent; not
-yet implemented.
+network sinks, so the report does not wait on the filesystem (design intent; not yet implemented).
+A core of the dead process is the crash service's: after the log report and before the decline,
+when the `CORE_DUMP` entry of its recipe's environment names the process (`no`, the default,
+names none), it stops the process's other threads, reads their registers and extended state and
+the mapped pages, and writes an ELF core that host `gdb` reads to `/crash` on the root
+filesystem, under a bound of its own and within a per-core and a directory byte budget, the oldest
+core deleted first ([crashd Operation § Core Dump](../services/crashd/docs/operation.md#core-dump),
+[Core Format](../services/crashd/docs/core-format.md)). A process on the path a core is written
+through, vfsd, the FAT driver, the block driver, devmgr and the IOMMU driver, declares itself so to
+procmgr at startup (`DECLARE_NO_CORE`), and the crash service writes no core of it, so a dump
+never waits on the process that died. A policy that holds a crashed process stopped for a
+debugger to rebind is design intent; not yet implemented.
 
 ---
 

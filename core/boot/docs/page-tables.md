@@ -212,7 +212,7 @@ trampoline in its page below 4 GiB, which is identity-mapped read-execute in the
 6. loads the stack pointer and the `BootInfo` argument and jumps to the kernel entry.
 
 Turning paging off flushes every TLB entry, global ones included. The kernel is then entered
-with `GDTR` naming the trampoline page's GDT, which it replaces in Phase 5
+with `GDTR` naming the trampoline page's GDT, which it replaces in Phase 1
 ([kernel-handoff.md](kernel-handoff.md)). Interrupts are disabled at activation on either
 path, and the required mappings are all present before `CR3` is written. See
 [`core/boot/src/arch/x86_64/handoff.rs`](../src/arch/x86_64/handoff.rs)

@@ -174,6 +174,26 @@ pub unsafe fn write_msr(msr: u32, val: u64)
     }
 }
 
+/// This CPU's shadow-stack pointer, or zero where supervisor shadow stacks are
+/// off on it: `rdsspq` is a no-op then (it is encoded in the reserved-NOP
+/// space, and runs as one without CET), and leaves the zeroed register.
+#[cfg(not(test))]
+pub fn shadow_stack_pointer() -> u64
+{
+    let ssp: u64;
+    // SAFETY: `rdsspq` reads the shadow-stack pointer into a register, or does
+    // nothing; the `xor` clobbers the flags.
+    unsafe {
+        core::arch::asm!(
+            "xor {0:e}, {0:e}",
+            "rdsspq {0}",
+            out(reg) ssp,
+            options(nomem, nostack),
+        );
+    }
+    ssp
+}
+
 // ── User-copy primitive (fault-recoverable) ───────────────────────────────────
 
 // `copy_user` is the sole sanctioned path for kernel access to user memory. It

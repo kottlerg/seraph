@@ -9,16 +9,18 @@ use std::path::PathBuf;
 
 use crate::error::{Context as _, Result};
 
-/// A Cargo build profile: the debug build or the `--release` build.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum Profile
-{
-    /// The unoptimised build (Cargo's `dev` profile).
-    #[value(name = "debug")]
-    Debug,
-    /// The `--release` build.
-    #[value(name = "release")]
-    Release,
+crate::argparse::value_enum! {
+    /// A Cargo build profile: the debug build or the `--release` build.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Profile
+    {
+        /// The unoptimised build (Cargo's `dev` profile).
+        #[value(name = "debug")]
+        Debug,
+        /// The `--release` build.
+        #[value(name = "release")]
+        Release,
+    }
 }
 
 impl Profile

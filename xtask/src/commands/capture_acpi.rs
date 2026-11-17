@@ -626,7 +626,7 @@ fn le_u64(bytes: &[u8], at: usize) -> Option<u64>
 #[cfg(test)]
 mod tests
 {
-    use clap::ValueEnum as _;
+    use crate::argparse::ValueEnum as _;
 
     use super::*;
 
@@ -779,10 +779,9 @@ mod tests
     #[test]
     fn config_names_are_their_cli_values()
     {
-        for c in AcpiConfig::value_variants()
+        for c in AcpiConfig::VARIANTS
         {
-            let value = c.to_possible_value().unwrap();
-            assert_eq!(value.get_name(), config_name(*c));
+            assert_eq!(c.name(), config_name(*c));
         }
     }
 

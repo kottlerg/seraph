@@ -18,6 +18,7 @@ members = [
     "services/usertest",
     "services/crasher",
     "services/crashd",
+    "services/crashd/core-file",
     "services/crashd/fault-bound",
     "services/devmgr",
     "services/devmgr/firmware",

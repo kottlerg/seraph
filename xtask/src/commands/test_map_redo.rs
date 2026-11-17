@@ -213,7 +213,7 @@ mod tests
     #[test]
     fn the_test_devices_reach_the_boot_only_when_asked()
     {
-        use clap::Parser as _;
+        use crate::argparse::Args as _;
 
         let dir = Path::new("target/xtask/test-map-redo");
         let plain = TestMapRedoArgs::try_parse_from(["test-map-redo"]).unwrap();
@@ -227,7 +227,7 @@ mod tests
     #[test]
     fn a_split_layout_s_data_image_reaches_the_boot()
     {
-        use clap::Parser as _;
+        use crate::argparse::Args as _;
 
         use crate::disk::{BlockSize, DataPlacement, DiskLayout};
 

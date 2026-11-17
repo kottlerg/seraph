@@ -32,7 +32,15 @@ register with procmgr ([runtime/ruststd/README.md](../../runtime/ruststd/README.
 registration), so the crash service reads a spawned thread's fault as it reads the main thread's.
 
 The tester passes when, for each faulting mode it runs, the fixture printed its line and died of a
-fault: a non-clean exit whose reason is in the fault range, and when `registry-declare` passed.
+fault: a non-clean exit whose reason is in the fault range, and left one new core in `/crash`, and
+when `registry-declare` passed. The usertest boot stages a crash service whose `CORE_DUMP` names
+`crashme` ([docs/testing.md](../../docs/testing.md) § Gating), so each faulting death leaves an ELF
+core ([services/crashd/docs/core-format.md](../../services/crashd/docs/core-format.md)). The tester
+reads it with a reader of its own, not crashd's code, and checks that it is an `ET_CORE` of the
+machine, that its first `NT_PRSTATUS` carries the fault's signal (`SIGSEGV` for `vm`, `SIGILL`
+for the others) and an instruction pointer and a stack pointer inside `PT_LOAD`s whose bytes the
+core holds, that the bytes at the instruction pointer are the illegal instruction in the
+`exception` and `worker` modes, and that the `worker` core records more than one thread.
 That the crash service declined the fault, and the thread still died with a fault reason, is what
 it shows; the report blocks themselves are checked host-side, in the boot's serial log, by
 `cargo xtask test-crash-report` ([docs/testing.md](../../docs/testing.md) § Crash reports), which
@@ -57,7 +65,7 @@ crashme/
 └── tester/
     ├── Cargo.toml
     └── src/
-        └── main.rs        # Runs four modes; checks each death and the declaration
+        └── main.rs        # Runs four modes; checks each death, its core, and the declaration
 ```
 
 ---
@@ -67,6 +75,7 @@ crashme/
 | Document | Covers |
 |---|---|
 | [services/crashd/README.md](../../services/crashd/README.md) | The crash service the fixture's deaths are reported by |
+| [services/crashd/docs/core-format.md](../../services/crashd/docs/core-format.md) | The core the tester checks |
 | [docs/fault-handling.md](../../docs/fault-handling.md) | § Crash Reports, § Reply |
 | [docs/testing.md](../../docs/testing.md) | § Per-program tester protocol, § Crash reports |
 

@@ -222,6 +222,7 @@ mod tests
             started,
             dma_hold,
             no_debug: false,
+            no_core: false,
             image: crate::ImageSpan::default(),
             threads: crate::ThreadRegistry::new(),
             name: crate::ProcessName::EMPTY,

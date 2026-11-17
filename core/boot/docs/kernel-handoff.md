@@ -67,7 +67,7 @@ rather than proceed with a mismatched structure (see
 | Stack | Valid; at least `HANDOFF_STACK_BYTES` (64 KiB, `boot_protocol::layout`) available |
 | `rdi` | Physical address of `BootInfo` structure |
 | Floating point | Not initialised; kernel must not use SSE/AVX before enabling |
-| GDT | UEFI firmware's, or, when the handoff changed the paging depth, the LA57 toggle trampoline's (in a page the boot tables identity-map; CS is its 64-bit code selector); kernel replaces it in Phase 5 |
+| GDT | UEFI firmware's, or, when the handoff changed the paging depth, the LA57 toggle trampoline's (in a page the boot tables identity-map; CS is its 64-bit code selector); kernel replaces it in Phase 1 |
 | IDT | Firmware's IDTR; not to be relied on; interrupts stay disabled until the kernel installs its own |
 
 ### RISC-V (RV64IMAC, soft-float)
@@ -125,11 +125,13 @@ The kernel otherwise runs as the contract states.
 
 On x86-64 the GDT active at entry is the UEFI firmware's, which the bootloader leaves loaded,
 or, when the handoff changed the paging depth, the one the LA57 toggle trampoline loads to pass
-through compatibility mode ([page-tables.md](page-tables.md) § x86-64: Negotiated Paging Depth);
-the kernel replaces either in Phase 5 (see
-[initialization.md](../../kernel/docs/initialization.md) § Phase 5). IDTR likewise still references
-the firmware's IDT, which the kernel must not rely on; interrupts stay disabled until the kernel
-installs its own. The kernel replaces the bootloader's root page table in Phase 3
+through compatibility mode ([page-tables.md](page-tables.md) § x86-64: Negotiated Paging Depth).
+The firmware's GDT lies in memory the boot tables do not map, so the delivery of an exception
+while it is loaded faults reading its code-segment descriptor. The kernel replaces either with its
+own segment descriptors in Phase 1 and adds its TSS in Phase 5 (see
+[initialization.md](../../kernel/docs/initialization.md) § Phase 1 and § Phase 5). IDTR likewise
+still references the firmware's IDT, which the kernel must not rely on; interrupts stay disabled
+until the kernel installs its own. The kernel replaces the bootloader's root page table in Phase 3
 ([initialization.md](../../kernel/docs/initialization.md) § Phase 3); for ASID use after handoff see
 [page-tables.md](page-tables.md) § Activation and
 [memory-internals.md](../../kernel/docs/memory-internals.md) § Context Switch TLB Handling.

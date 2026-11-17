@@ -1,0 +1,16 @@
+# /config/svcmgr/tests/crashd.svc — crashd with core dumps on for crashme.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan. The
+# usertest boot stages it over /config/svcmgr/services/crashd.svc, so the
+# crashme tester finds a core of each faulting mode in /crash
+# (programs/crashme/README.md). See docs/testing.md.
+#
+# The same recipe as services/crashd.svc but for `CORE_DUMP`, which names
+# crashme.
+binary          = /services/crashd
+priority        = 20
+restart         = on_failure
+critical        = no
+env             = CORE_DUMP=crashme
+namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
+debug_authority = yes

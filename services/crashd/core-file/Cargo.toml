@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "crashd-core-file"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std pure logic: the ELF core crashd writes, the dump policy, the
+# per-core budget's choice of page runs, and the core directory's names and
+# eviction. Host-tested.
+[lib]
+test = true
+doctest = false
+
+[dependencies]
+syscall-abi = { path = "../../../abi/syscall" }
+
+[lints]
+workspace = true

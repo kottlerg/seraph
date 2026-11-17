@@ -15,11 +15,14 @@
 //! and which keeps running, and a `heap-commit-hog` ([`hog_main`]), which
 //! commits all but [`HOG_MARGIN_PAGES`] of what memmgr can still promise,
 //! sees a grant past that refused although free pages exist, and touches every
-//! page it committed with no fault declined. memmgr's free and promised totals
-//! then return to their levels, and the all-RAM-accounted identity holds.
+//! page it committed with no fault declined. Each child's charge leaves
+//! svctest's budget subtree before the phase goes on, memmgr's free and
+//! promised totals then return to their levels, and the all-RAM-accounted
+//! identity holds.
 
 use std::os::seraph::startup_info;
 use std::process::exit;
+use std::time::{Duration, Instant};
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use syscall_abi::PAGE_SIZE;
@@ -114,17 +117,26 @@ const REGION_PAGES: u64 = 2 * CHUNK_PAGES;
 const POOL_WINDOWS: u32 = 8;
 /// Status queries per window after the children's destroy. A test wait bound.
 const POOL_POLLS: u32 = 256;
+/// How long the phase waits for memmgr to reclaim a child that has exited. A
+/// test wait bound: procmgr's teardown of the hog and memmgr's reclaim of
+/// what it committed, most of RAM.
+const RECLAIM_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The phase: the labels on a region of svctest's own, then the two children
 /// in windows until memmgr's totals return to their levels around them, then
-/// the identity.
+/// the identity. Each child's exit is followed by memmgr's reclaim of it
+/// ([`children_reclaimed`]), so no window starts, and no child is created,
+/// while an earlier child's charge and commitment are still held.
 fn heap_commit_phase(caps: &Caps)
 {
     region_resize();
     let settled = (0..POOL_WINDOWS).any(|_| {
+        let children = children_charge();
         let before = settled_totals();
         run_limited_child();
+        children_reclaimed(children, "the heap-commit limited child");
         run_hog();
+        children_reclaimed(children, "the heap-commit hog");
         totals_settle_to(before)
     });
     assert!(
@@ -184,6 +196,42 @@ fn totals_settle_to(level: (u64, u64)) -> bool
         std::thread::yield_now();
     }
     false
+}
+
+/// What memmgr charges svctest's descendants, in pages: the subtree count of
+/// svctest's budget node less its own (`QUERY_MEMORY_USAGE`).
+fn children_charge() -> u64
+{
+    let (own, _, subtree) = budget::memory_usage().expect("QUERY_MEMORY_USAGE failed");
+    subtree.saturating_sub(own)
+}
+
+/// Wait until what memmgr charges svctest's descendants reads at most
+/// `level`, the charge before `what` was created, each poll after a recheck
+/// of memmgr's deferred list, on which runs the kernel still held at the
+/// child's teardown wait charged. Neither the child's exit as std's
+/// `status()` sees it nor procmgr's `DESTROY_PROCESS` reply waits for
+/// memmgr's `PROCESS_DIED`, which frees the child's budget node, its regions
+/// and its commitment. Panics when the charge is still held after
+/// [`RECLAIM_TIMEOUT`].
+fn children_reclaimed(level: u64, what: &str)
+{
+    let start = Instant::now();
+    loop
+    {
+        crate::phases::memmgr::recheck_deferred();
+        let charge = children_charge();
+        if charge <= level
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < RECLAIM_TIMEOUT,
+            "memmgr still charged svctest's descendants {charge} pages, from {level} before \
+             {what}, {RECLAIM_TIMEOUT:?} after its exit"
+        );
+        std::thread::yield_now();
+    }
 }
 
 /// memmgr's reply label to `msg`.

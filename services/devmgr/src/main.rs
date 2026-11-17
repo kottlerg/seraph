@@ -43,6 +43,22 @@ use ipc::IpcMessage;
 use std::os::seraph::{reserve_pages, startup_info, unreserve_pages};
 use syscall_abi::PAGE_SIZE;
 
+/// Declare devmgr on the core path before it serves
+/// (`procmgr_labels::DECLARE_NO_CORE`): it maps every block transfer's
+/// buffer on its DMA endpoint, so a core written while it is held would wait
+/// on it. A refusal leaves its core to the crash service's dump bound.
+fn declare_no_core(procmgr: u64, ipc_buf: *mut u64)
+{
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe {
+        ipc::ipc_call(
+            procmgr,
+            &IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_CORE),
+            ipc_buf,
+        )
+    };
+}
+
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"devmgr");
@@ -54,6 +70,7 @@ fn main() -> !
     #[expect(clippy::cast_ptr_alignment, reason = "the IPC buffer is page-aligned")]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
 
+    declare_no_core(info.procmgr_endpoint, ipc_buf);
     refuse_translatable_aspace(info.self_aspace);
 
     let Some(mut caps) = caps::bootstrap_caps(info, ipc_buf)

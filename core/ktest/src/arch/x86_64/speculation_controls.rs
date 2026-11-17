@@ -10,7 +10,8 @@
 //!
 //! `SYS_SYSTEM_INFO(SpeculationControls)` reports three words: the inputs
 //! (the classes the boot CPU's vulnerability table gives kernel action, its
-//! two predictor behaviours, and the control bits it enumerates), the controls
+//! three predictor behaviours, the control bits it enumerates, and whether its
+//! cores run more than one thread), the controls
 //! selected from them at boot, and the controls in effect on the calling CPU,
 //! read from that CPU's MSRs and from the flags the entry and exit code test.
 //! The case restates the selection rule over the inputs ([`expected`]) and
@@ -25,22 +26,25 @@
 //! TCG the retpoline sequence, and on the development host under KVM
 //! enhanced IBRS, `BHI_DIS_S` and `VERW` on exit, or IBRS on entry in place
 //! of enhanced IBRS in a kernel built with
-//! `SERAPH_FORCE_RETURN_MITIGATION=intel`. IBRS on entry is read in effect from
-//! `IA32_SPEC_CTRL` inside the call, after the entry that set it.
+//! `SERAPH_FORCE_RETURN_MITIGATION=intel`, or with the IBPB on entry and STIBP
+//! added in one built with `SERAPH_FORCE_RETURN_MITIGATION=amd`. IBRS on entry
+//! and STIBP are read in effect from `IA32_SPEC_CTRL` inside the call, after
+//! the entry that set them.
 
 use syscall::{speculation_controls, system_info, thread_set_affinity, thread_yield};
 use syscall_abi::{
     SPECULATION_CONTROL_AUTO_IBRS, SPECULATION_CONTROL_BHB_CLEAR, SPECULATION_CONTROL_BHI_DIS_S,
-    SPECULATION_CONTROL_DOITM, SPECULATION_CONTROL_EIBRS, SPECULATION_CONTROL_IBRS_ENTRY,
-    SPECULATION_CONTROL_RETPOLINE, SPECULATION_CONTROL_RSB_FILL_IBPB,
-    SPECULATION_CONTROL_RSB_FILL_SWITCH, SPECULATION_CONTROL_VERW_EXIT,
-    SPECULATION_CONTROL_VERW_IDLE, SPECULATION_INPUT_AUTO_IBRS, SPECULATION_INPUT_BHI,
-    SPECULATION_INPUT_BHI_CTRL, SPECULATION_INPUT_DOITM, SPECULATION_INPUT_IBPB_LEAVES_RSB,
-    SPECULATION_INPUT_IBRS, SPECULATION_INPUT_IBRS_ALL, SPECULATION_INPUT_MDS,
-    SPECULATION_INPUT_MMIO, SPECULATION_INPUT_RETBLEED, SPECULATION_INPUT_RFDS,
-    SPECULATION_INPUT_RSB_ALTERNATE, SPECULATION_INPUT_SPECTRE_V2, SPECULATION_INPUT_TAA,
-    SPECULATION_INPUT_TSA, SPECULATION_VIEW_IN_EFFECT, SPECULATION_VIEW_INPUTS,
-    SPECULATION_VIEW_SELECTED, SystemInfoType,
+    SPECULATION_CONTROL_DOITM, SPECULATION_CONTROL_EIBRS, SPECULATION_CONTROL_IBPB_ENTRY,
+    SPECULATION_CONTROL_IBRS_ENTRY, SPECULATION_CONTROL_RETPOLINE,
+    SPECULATION_CONTROL_RSB_FILL_IBPB, SPECULATION_CONTROL_RSB_FILL_SWITCH,
+    SPECULATION_CONTROL_STIBP, SPECULATION_CONTROL_VERW_EXIT, SPECULATION_CONTROL_VERW_IDLE,
+    SPECULATION_INPUT_AUTO_IBRS, SPECULATION_INPUT_BHI, SPECULATION_INPUT_BHI_CTRL,
+    SPECULATION_INPUT_DOITM, SPECULATION_INPUT_IBPB, SPECULATION_INPUT_IBPB_LEAVES_BRTYPE,
+    SPECULATION_INPUT_IBPB_LEAVES_RSB, SPECULATION_INPUT_IBRS, SPECULATION_INPUT_IBRS_ALL,
+    SPECULATION_INPUT_MDS, SPECULATION_INPUT_MMIO, SPECULATION_INPUT_RETBLEED,
+    SPECULATION_INPUT_RFDS, SPECULATION_INPUT_RSB_ALTERNATE, SPECULATION_INPUT_SPECTRE_V2,
+    SPECULATION_INPUT_SRSO, SPECULATION_INPUT_STIBP, SPECULATION_INPUT_TAA, SPECULATION_INPUT_TSA,
+    SPECULATION_VIEW_IN_EFFECT, SPECULATION_VIEW_INPUTS, SPECULATION_VIEW_SELECTED, SystemInfoType,
 };
 
 use crate::{TestContext, TestResult};
@@ -112,6 +116,18 @@ fn expected(inputs: u64) -> u64
     if any(SPECULATION_INPUT_DOITM)
     {
         controls |= SPECULATION_CONTROL_DOITM;
+    }
+    let branch_type_confusion =
+        any(SPECULATION_INPUT_RETBLEED) && !any(SPECULATION_INPUT_RSB_ALTERNATE);
+    if any(SPECULATION_INPUT_IBPB)
+        && !any(SPECULATION_INPUT_IBPB_LEAVES_BRTYPE)
+        && (branch_type_confusion || any(SPECULATION_INPUT_SRSO))
+    {
+        controls |= SPECULATION_CONTROL_IBPB_ENTRY;
+        if any(SPECULATION_INPUT_STIBP)
+        {
+            controls |= SPECULATION_CONTROL_STIBP;
+        }
     }
     controls
 }

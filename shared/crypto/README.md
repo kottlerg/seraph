@@ -6,10 +6,9 @@ signer, Ed25519 key generation and signing.
 
 `no_std`, no allocation, no external dependencies. Provides a vetted hash, a
 signature verifier, and an AEAD usable by the bootloader/loader and userspace
-services, and the signer that xtask runs on the build host. Does no I/O and holds
-no keys: an AEAD caller passes its key on every call, and a signer's caller its
-secret seed. Today its only dependent is ktest, which runs the known-answer tests
-on target.
+services, and a signer for the build host. Does no I/O and holds no keys: an
+AEAD caller passes its key on every call, and a signer's caller its secret seed.
+Today its only dependent is ktest, which runs the known-answer tests on target.
 
 The per-binary signing chain of trust ([docs/signing.md](../../docs/signing.md))
 verifies with `ed25519_verify` in its loaders and signs with `ed25519_sign` in
@@ -45,17 +44,22 @@ xtask; both uses are design intent, not yet implemented
   and field equality are variable-time by design and carry no side-channel
   obligation. The mandatory `S < L` range check (RFC 8032 §5.1.7) runs first;
   every failure path is a single terminal `Err` with no fallback.
-- **Signing behind a feature.** The signer compiles only with the crate's
-  `sign` feature, and in the crate's own tests. xtask, the host signer, enables
-  it; a loader (the bootloader, procmgr) depends on the crate without it, so its
-  build compiles no signing code. Cargo unifies features within one build only,
-  and xtask builds each component in a Cargo invocation of its own.
+- **Signing behind a feature.** The signer compiles only with the crate's `sign`
+  feature, and in the crate's own tests. Only a host tool may enable it: the
+  host signer in xtask is to (design intent,
+  [#124](https://github.com/kottlerg/seraph/issues/124)), and nothing enables it
+  today. A component built for the target MUST NOT enable it, so that a loader
+  (the bootloader, procmgr) compiles no signing code: `cargo xtask build` builds
+  the components of one build profile in a single Cargo invocation, which
+  resolves one feature set for all of them, so a feature one component enables
+  reaches every loader built beside it. xtask is a host binary, built in an
+  invocation of its own outside every component group.
 - **Key generation from the caller's seed.** A key is a 32-byte secret seed and
   the public key `ed25519_public_key` derives from it; the crate draws no
-  randomness. The caller draws the seed from its platform's random source
-  (xtask: the host operating system's,
-  [docs/signing.md](../../docs/signing.md) § Signing) and passes it on every
-  call, so the crate keeps no key between calls.
+  randomness. The caller draws the seed from its platform's random source (for
+  xtask, the host operating system's, as
+  [docs/signing.md](../../docs/signing.md) § Signing specifies; design intent)
+  and passes it on every call, so the crate keeps no key between calls.
 - **Signing in constant time.** No branch and no memory index depends on a
   secret value (the seed, the secret scalar, the nonce prefix, the nonce), only
   on the message length and on public values. The signer's path is SHA-512

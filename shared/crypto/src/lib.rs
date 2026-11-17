@@ -18,9 +18,9 @@
 //!   terminal: a single `Err` exit, no fallback, no warn-and-continue.
 //! - `ed25519_public_key` and `ed25519_sign` — RFC 8032 Ed25519 key
 //!   derivation from a secret seed the caller passes, and deterministic
-//!   signing, compiled only with the `sign` feature, which the host signer
-//!   enables and a loader does not. No branch and no memory index depends on
-//!   a secret value.
+//!   signing, compiled only with the `sign` feature, which only a host tool
+//!   may enable and no component built for the target may (the crate's README,
+//!   § Design notes). No branch and no memory index depends on a secret value.
 //! - [`chacha20poly1305`] — the RFC 8439 AEAD, sealing and opening a buffer
 //!   in place with a detached tag. It handles secret data, so no branch and
 //!   no memory index depends on the key, the plaintext or a tag, and a tag is

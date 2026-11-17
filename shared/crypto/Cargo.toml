@@ -13,9 +13,9 @@ test = true
 doctest = false
 
 [features]
-# Ed25519 key generation and signing, for the host signer. A loader (the
-# bootloader, procmgr) depends on the crate without it, so its build compiles
-# no signing code. The crate's own tests compile the signer without it.
+# Ed25519 key generation and signing, for a host tool. No component built for
+# the target may enable it, so that no loader compiles signing code (README,
+# § Design notes). The crate's own tests compile the signer without it.
 sign = []
 
 [dependencies]

@@ -609,6 +609,12 @@ impl Bridges
         self.list.get(ordinal)
     }
 
+    /// Every bridge, in segment, then bus order.
+    pub fn iter(&self) -> impl Iterator<Item = &Bridge> + Clone
+    {
+        self.list.iter()
+    }
+
     /// The bridge at `(segment, bus)`, if devmgr holds a push for it.
     #[must_use]
     pub fn find(&self, segment: u16, bus: u8) -> Option<&Bridge>

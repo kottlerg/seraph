@@ -164,8 +164,9 @@ fn round(s: &mut [u64; 8], k: u64, w: u64)
         .wrapping_add(w);
     let t2 = big_sigma0(s[0]).wrapping_add(maj(s[0], s[1], s[2]));
     // Shift every variable down one place (h is dropped) and fill in a and e.
-    // The words are named rather than rotated in place: the bootloader's
-    // debug-profile build ran the slice-rotation form about 40 times slower.
+    // The words are named rather than rotated in place: rotating the slice ran
+    // the hash 36 to 54 times slower in the bootloader's debug-profile build,
+    // and 4 to 7 times slower in its release build.
     *s = [t1.wrapping_add(t2), s[0], s[1], s[2], s[3].wrapping_add(t1), s[4], s[5], s[6]];
 }
 

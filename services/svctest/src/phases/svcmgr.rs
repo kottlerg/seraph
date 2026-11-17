@@ -477,6 +477,40 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
     std::os::seraph::log!("svcmgr published-send phase passed (badged, no PUBLISH_AUTHORITY)");
 }
 
+/// The names `svcmgr_seed_only_names_refused_phase` checks `QUERY_ENDPOINT`
+/// refuses: every seed-only name.
+const SEED_ONLY_NAMES: &[&[u8]] = &[
+    ipc::published_names::ROOTFS_ROOT,
+    ipc::published_names::PWRMGR_SHUTDOWN,
+    ipc::published_names::ACPID_POWER,
+    ipc::published_names::DEVMGR_REGISTRY,
+    ipc::published_names::DEVMGR_SHUTDOWN,
+    ipc::published_names::DEVMGR_BIND,
+    ipc::published_names::VFSD_MOUNT,
+    ipc::published_names::VFSD_DENY,
+    ipc::published_names::VFSD_SWAP,
+    ipc::published_names::LOGD_QUERY,
+    b"devmgr.class.block",
+    b"devmgr.class.serial",
+    b"devmgr.class.framebuffer",
+    b"devmgr.class.rtc",
+    b"devmgr.class.input",
+    b"devmgr.class.debug-port",
+    b"devmgr.class.test-dma",
+    b"devmgr.class.test-fault",
+    b"devmgr.class.serial-deny",
+    b"devmgr.class.input-deny",
+    b"devmgr.class.framebuffer-deny",
+];
+
+/// The public names `svcmgr_seed_only_names_refused_phase` checks
+/// `QUERY_ENDPOINT` resolves.
+const PUBLIC_NAMES: &[&[u8]] = &[
+    ipc::published_names::SVCMGR,
+    ipc::published_names::PWRMGR_DENY,
+    ipc::published_names::ACPID_DENY,
+];
+
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
 /// cap. svctest's own non-zero seeds show fifteen of the refused names are
@@ -519,29 +553,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
         unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
             .expect("svcmgr QUERY_ENDPOINT ipc_call must return a reply")
     };
-    for name in [
-        ipc::published_names::ROOTFS_ROOT,
-        ipc::published_names::PWRMGR_SHUTDOWN,
-        ipc::published_names::ACPID_POWER,
-        ipc::published_names::DEVMGR_REGISTRY,
-        ipc::published_names::DEVMGR_SHUTDOWN,
-        ipc::published_names::DEVMGR_BIND,
-        ipc::published_names::VFSD_MOUNT,
-        ipc::published_names::VFSD_DENY,
-        ipc::published_names::VFSD_SWAP,
-        ipc::published_names::LOGD_QUERY,
-        b"devmgr.class.block",
-        b"devmgr.class.serial",
-        b"devmgr.class.framebuffer",
-        b"devmgr.class.rtc",
-        b"devmgr.class.input",
-        b"devmgr.class.debug-port",
-        b"devmgr.class.test-dma",
-        b"devmgr.class.test-fault",
-        b"devmgr.class.serial-deny",
-        b"devmgr.class.input-deny",
-        b"devmgr.class.framebuffer-deny",
-    ]
+    for &name in SEED_ONLY_NAMES
     {
         let reply = query(name);
         let shown = core::str::from_utf8(name).unwrap_or("?");
@@ -556,11 +568,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
             "svcmgr QUERY_ENDPOINT({shown}) refusal must carry no cap"
         );
     }
-    for name in [
-        ipc::published_names::SVCMGR,
-        ipc::published_names::PWRMGR_DENY,
-        ipc::published_names::ACPID_DENY,
-    ]
+    for &name in PUBLIC_NAMES
     {
         let reply = query(name);
         let shown = core::str::from_utf8(name).unwrap_or("?");
@@ -580,5 +588,9 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
             let _ = syscall::cap_delete(cap);
         }
     }
-    std::os::seraph::log!("svcmgr seed-only phase passed (20 refused, 3 public resolved)");
+    std::os::seraph::log!(
+        "svcmgr seed-only phase passed ({} refused, {} public resolved)",
+        SEED_ONLY_NAMES.len(),
+        PUBLIC_NAMES.len()
+    );
 }

@@ -65,13 +65,13 @@ pub const fn watch_events(_act: Actuator) {}
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
 pub fn shutdown(act: &Actuator, _ipc_buf: *mut u64)
 {
-    sbi_reset(act, SRST_TYPE_SHUTDOWN, "shutdown");
+    sbi_reset(*act, SRST_TYPE_SHUTDOWN, "shutdown");
 }
 
 /// Attempt SBI SRST cold reboot. Logs and returns on failure.
 pub fn reboot(act: &Actuator, _ipc_buf: *mut u64)
 {
-    sbi_reset(act, SRST_TYPE_COLD_REBOOT, "reboot");
+    sbi_reset(*act, SRST_TYPE_COLD_REBOOT, "reboot");
 }
 
 /// Issue SBI `system_reset` of `reset_type` through the kernel. Does not
@@ -79,7 +79,7 @@ pub fn reboot(act: &Actuator, _ipc_buf: *mut u64)
 /// firmware rejects the call, and, after [`crate::await_reset`]'s grace,
 /// when the call returned success but the platform kept running (SRST does
 /// not return on success, so that is a firmware failure too).
-fn sbi_reset(act: &Actuator, reset_type: u64, op: &str)
+fn sbi_reset(act: Actuator, reset_type: u64, op: &str)
 {
     let result = syscall::sbi_call(
         act.sbi_control_cap,

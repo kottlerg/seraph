@@ -119,6 +119,7 @@ sysroot/
     ├── usertest              # programs-surface orchestrator
     ├── crasher               # svcmgr restart-path fixture
     ├── debug-echo            # debug-port fixture (test-debug-port)
+    ├── hotplug-check         # PCI Express hotplug fixture (test-hotplug)
     ├── drivers/              # test-only drivers bound only on demand
     │   └── test-fault        # fault-injection driver, bound by BIND_DRIVERS
     └── programs/
@@ -172,6 +173,7 @@ rootfs/config/svcmgr/
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
 │   ├── crashd.svc            # crashd naming crashme for cores; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
+│   ├── hotplug-check.svc     # hotplug fixture; staged by test-hotplug
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
     └── gdbstub.svc           # GDB stub template; staged, naming its target,
@@ -551,6 +553,36 @@ time (§ Verification Record there). On such a host, by the CPUID hypervisor bit
 inconclusive: the command boots again, up to four runs of each boot, and the boot passes only on
 a run without it; four such runs fail the command as inconclusive. On a host that is not a guest
 the same report fails the command, as does every other fault.
+
+### PCI Express hotplug (`test-hotplug`)
+
+devmgr's PCI Express native hotplug
+([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)) runs only when a device
+arrives in a slot devmgr manages, which no boot of a fixed device set makes.
+`cargo xtask test-hotplug [--arch]` (both arches) makes one arrive:
+
+1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
+   `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
+   `/config/devmgr/tests/` into `/config/devmgr/classes/`, and repack the disk images in the
+   layout they have.
+2. On x86_64, boot the current sysroot with an empty `pcie-root-port` under the machine's default,
+   whose `_OSC` withholds native hotplug control, and require devmgr's `not managed: _OSC control`
+   line for the slot, then kill QEMU.
+3. Boot it with the port under native control (on x86_64, QEMU's ACPI PCI hotplug off, so `_OSC`
+   grants it; on riscv64, the `qemu-virt.platform` key grants it) and a QMP control socket, and
+   wait for devmgr's `managed (native control by` line and the fixture's
+   `READY for the hot-added device` line.
+4. Hot-add QEMU's `edu` device behind the port (QMP `device_add`), and wait for the fixture's
+   verdict: it waits on the `test-dma` class's watch for the `test-dma` driver devmgr binds to the
+   added function, then requires the driver's DMA probe to pass and its interrupt probe to report an
+   MSI vector delivered.
+5. Kill QEMU, remove the staged files, and repack the images in that layout again, whatever the
+   outcome.
+
+The host computes the verdict and kills QEMU, as for `test-terminal`; the fixture invokes no
+shutdown. See [xtask/README.md § test-hotplug](../xtask/README.md#cargo-xtask-test-hotplug) for the
+command. No canonical CI cell attaches a hotplug port, so the boots are the `hotplug` device cell
+of the local and release host runs (Coverage tiers below).
 
 ### One shutdown-invoking harness per boot
 
@@ -1020,31 +1052,30 @@ git diff -W "$B" <head> -- . ':(exclude)*.md' | grep -E "^\+\+\+ |\b($M)\b"
 cargo xtask run-parallel --arch <arch> --cpus 4 --mem 1024 --parallel 1 --runs 1 --timeout 300
 ```
 
-**Device surfaces.** The device cells, the boots of the system's devices that the canonical cells
-do not make, are owed when, and only when, the PR's own diff makes a non-inert change to a device
+**Device surfaces.** The device cells, the boots of the system's devices that the canonical cells do
+not make, are owed when, and only when, the PR's own diff makes a non-inert change to a device
 surface that owes them. They are the storage cells of Disk variations below, each on each
-architecture (4kn, the 4Kn disk; second-disk, the data partition on a second disk; shared-line,
-that disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second
-disk), no-iommu, the no-IOMMU variant of Release host runs below, framebuffer, the boot of
-Framebuffer cell below, and debug-port, the boot of Debug-port cell below, each on each
-architecture, and cet, the boot pair of CET cell below, on x86_64 alone. A
-driver's device surface is that driver's code, with the harness check that drives that driver
-alone where its row names one; the storage-wide surface is the code every storage cell runs beside
-its drivers; and the shared surface is what every driver shares, the launchers' attachment of the
-IOMMU in front of every device included. Each surface is
-the files and directories its row lists, as a whole, and, in any other file, a changed line that
-names one of its listed items as a whole identifier or lies within one's definition; a protocol
-module of `shared/ipc`, and an item the row lists by its definition alone, is on a surface only by
-a changed line within that definition. In a file outside a surface's files and directories, a
-changed line that names a listed type only in an import or re-export, or in a signature or type
-annotation, is not on that surface by that name; it stays on one when it names another listed item
-or lies within a listed item's definition. A line that reads or writes one of the type's fields,
-calls one of its methods, or constructs or matches its value names it in another use and stays on
-the surface. The exemption reaches no listed function, constant, or protocol module: each stays on
-a surface as the sentences above define. The listed types are `InterruptObject`,
-`Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`, `InitFramebufferInfo`,
-`QemuDisplay`, `BatchDisplay`, and `BootEntropy`. A PR owes the cells of every surface a non-inert
-line of its own diff is on.
+architecture (4kn, the 4Kn disk; second-disk, the data partition on a second disk; shared-line, that
+disk on the first disk's interrupt line; and oversize-block, the refused 8192-byte second disk),
+no-iommu, the no-IOMMU variant of Release host runs below, framebuffer, the boot of Framebuffer cell
+below, debug-port, the boot of Debug-port cell below, and hotplug, the boots of Hotplug cell below,
+each on each architecture, and cet, the boot pair of CET cell below, on x86_64 alone. A driver's
+device surface is that driver's code, with the harness check that drives that driver alone where its
+row names one; the storage-wide surface is the code every storage cell runs beside its drivers; and
+the shared surface is what every driver shares, the launchers' attachment of the IOMMU in front of
+every device included. Each surface is the files and directories its row lists, as a whole, and, in
+any other file, a changed line that names one of its listed items as a whole identifier or lies
+within one's definition; a protocol module of `shared/ipc`, and an item the row lists by its
+definition alone, is on a surface only by a changed line within that definition. In a file outside a
+surface's files and directories, a changed line that names a listed type only in an import or
+re-export, or in a signature or type annotation, is not on that surface by that name; it stays on
+one when it names another listed item or lies within a listed item's definition. A line that reads
+or writes one of the type's fields, calls one of its methods, or constructs or matches its value
+names it in another use and stays on the surface. The exemption reaches no listed function,
+constant, or protocol module: each stays on a surface as the sentences above define. The listed
+types are `InterruptObject`, `Iommu`, `SecondDisk`, `DiskLine`, `BlockSize`, `FramebufferInfo`,
+`InitFramebufferInfo`, `QemuDisplay`, `BatchDisplay`, `HotplugControl`, and `BootEntropy`. A PR owes
+the cells of every surface a non-inert line of its own diff is on.
 
 | Surface | Files, directories, and items | Cells it owes |
 |---|---|---|
@@ -1054,7 +1085,8 @@ line of its own diff is on.
 | fatfs | `services/fs/fat/` | 4kn |
 | virtio-input | `services/drivers/virtio/input/` | no-iommu |
 | virtio-console, the debug port, and the GDB stub | `services/drivers/virtio/console/`, the fixture and the host test that drive it (`services/debug-echo/` and `xtask/src/commands/test_debug_port.rs`), the protocol crate both ends of that test frame with (`shared/gdb-rsp/`), and the launchers' debug-port attachment (`debug_port_args` and `DEBUG_PORT_CHARDEV`); the GDB stub, its target, and the host test that drives them (`services/gdbstub/`, `xtask/src/debug_stub.rs`, and `xtask/src/commands/test_gdb.rs`; by definition alone: the `debugger` fixture's `gdb_target`, `gdb_target_tick`, and `gdb_target_worker_step`); and procmgr's side of a debugger's attach that only that test drives (by definition alone: `handle_list_processes`, `handle_detach_process`, `restore_crash_bindings`, `watch_debugger`, and `check_debuggers`) | debug-port |
-| test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, and `call_test_dma`) | no-iommu |
+| test-dma | `services/drivers/test-dma/`, its protocol module (`test_dma_labels`), the launchers' `edu` attachment (`EDU_DEVICE`), and svctest's DMA confinement, MSI delivery, MSI forge, MSI churn and MSI release checks, which drive it (by definition alone: `dma_confinement_phase`, `msi_delivery_phase`, `msi_forge_phase`, `msi_churn_phase`, `msi_release_phase`, and `call_test_dma`) | no-iommu, and hotplug |
+| PCI Express hotplug | the fixture and the host test that drive it (`services/hotplug-check/` and `xtask/src/commands/test_hotplug.rs`), and the launchers' hotplug port (`hotplug_port_args`, `HOTPLUG_PORT_DEVICE`, `HOTPLUG_PORT_ID`, `X86_NATIVE_HOTPLUG_GLOBAL`, `HotplugControl`, and `EDU_DMA_MASK`) and QMP's `device_add` (`device_add` and `device_add_message`) | hotplug |
 | framebuffer, and the GOP framebuffer's path to it | `services/drivers/framebuffer/`, `core/boot/src/framebuffer.rs`, and `core/kernel/src/framebuffer.rs`, and the glyph chain every framebuffer renderer resolves through, `shared/text/` and `shared/font/`; the bootloader's GOP query and boot console (`query_gop` and `init_framebuffer`), the boot-protocol and init-protocol framebuffer records (`FramebufferInfo` and `InitFramebufferInfo`), and the kernel's console rebase and direct-map placement of the framebuffer (`rebase_framebuffer` and `framebuffer_above`), whose present-framebuffer paths only a boot with a GOP takes; and the launchers' display attachment (`QemuDisplay`, `BatchDisplay`, and `display_args`) | framebuffer |
 | serial, the RTC drivers, the IOMMU drivers, and the other test-only drivers | `services/drivers/serial/`, `services/drivers/cmos/`, `services/drivers/goldfish-rtc/`, `services/drivers/iommu/`, and `services/drivers/test-fault/` | none: the canonical cells boot their devices (Driver coverage above), and the no-iommu cell runs no IOMMU driver |
 | The boot-entropy path of `virtio-rng-pci` | the bootloader's draw (`step5c_fetch_boot_entropy`, `BootEntropy`, and `parse_rng_seed`) | none: the canonical cells boot it (Driver coverage above) |
@@ -1089,6 +1121,7 @@ git diff --stat "$B" <head> -- services/devmgr/ services/drivers/virtio/core/ \
     services/drivers/virtio/blk/ services/fs/fat/ \
     services/drivers/virtio/input/ services/drivers/test-dma/ services/drivers/framebuffer/ \
     services/drivers/virtio/console/ services/debug-echo/ xtask/src/commands/test_debug_port.rs \
+    services/hotplug-check/ xtask/src/commands/test_hotplug.rs \
     shared/gdb-rsp/ services/gdbstub/ xtask/src/debug_stub.rs xtask/src/commands/test_gdb.rs \
     core/boot/src/framebuffer.rs core/kernel/src/framebuffer.rs shared/text/ shared/font/ \
     core/kernel/src/arch/x86_64/shadow_stack.rs xtask/src/commands/test_cet.rs xtask/src/qemu_gdb.rs
@@ -1103,6 +1136,8 @@ D="$D|X86_IOMMU_DEVICE|X86_MACHINE_SPLIT_IRQCHIP|EDU_DEVICE"
 D="$D|test_dma_labels|dma_confinement_phase|msi_(delivery|forge|churn|release)_phase|call_test_dma"
 D="$D|QemuDisplay|BatchDisplay|display_args|query_gop|init_framebuffer|(Init)?FramebufferInfo"
 D="$D|rebase_framebuffer|framebuffer_above|debug_port_args|DEBUG_PORT_CHARDEV"
+D="$D|hotplug_port_args|HOTPLUG_PORT_(DEVICE|ID)|X86_NATIVE_HOTPLUG_GLOBAL|HotplugControl"
+D="$D|EDU_DMA_MASK|device_add(_message)?"
 D="$D|gdb_target(_tick|_worker_step)?|handle_list_processes|handle_detach_process"
 D="$D|restore_crash_bindings|watch_debugger|check_debuggers"
 D="$D|blk_device|check_block_size|SecondDisk|disk_block_size|BlockSize|split_data"
@@ -1249,6 +1284,20 @@ cargo xtask test-debug-port --arch <arch>
 cargo xtask test-gdb --arch <arch>
 ```
 
+**Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug
+(`test-hotplug`) above) on each architecture, two on x86_64 and one on riscv64, at 4 vCPUs, in
+which devmgr manages an empty root port and binds the `test-dma` fixture to the `edu` device the
+host hot-adds behind it. The command stages and unstages its own files on the current sysroot, a
+debug-profile build. It bounds each boot to its markers by five minutes and the fixture's verdict
+by three minutes after the hot-add; it has no `run-parallel` budget. The boots are the hotplug
+device cell (Device surfaces above).
+
+```sh
+# Hotplug cell, per architecture (clean between architectures):
+cargo xtask build --arch <arch>
+cargo xtask test-hotplug --arch <arch>
+```
+
 **CET cell.** One boot pair on x86_64, `cargo xtask test-cet` (CET shadow stacks (`test-cet`)
 above), whose first boot runs ktest with the kernel on CET shadow stacks and whose second checks
 that a corrupted kernel return address raises `#CP`, on a sysroot holding the composed ktest
@@ -1267,26 +1316,23 @@ cargo xtask compose-bundle --harness ktest
 cargo xtask test-cet
 ```
 
-**Release host runs.** Before each tag
-([conventions.md](conventions.md#release-production) § Release Production, step
-4), these MUST be run on the commit to be tagged, or on an earlier commit that contains the
-version bump when the change from it to the commit to be tagged is documentation or comments
-only as this section defines that: the whole boundary set
-(riscv64 16 and 128 harts, x86_64 16 and 128 vCPUs) once each (`--runs 1`)
-in the debug profile and once each in the release profile
-(`cargo xtask build --release`, then the same `run-parallel` command, per
-the boundary commands above), and the memory variation and every device cell (the
-disk variations, the no-IOMMU variant, the framebuffer cell, the debug-port cell, and the CET
-cell) once each, so every tag boots at each boundary CPU count in both profiles (CI boots release
-builds only at 4 CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a
-debug port, and on CET shadow stacks, and runs the timing report on the boundary
-logs, which is reported and blocks nothing. A tag's repeated-run check is the burn-in tier,
-which the tag push starts.
-The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture
-with the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest
-staged as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a
-pass, as When the runs are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and
-is bisected over the release's PRs.
+**Release host runs.** Before each tag ([conventions.md](conventions.md#release-production)
+§ Release Production, step 4), these MUST be run on the commit to be tagged, or on an earlier commit
+that contains the version bump when the change from it to the commit to be tagged is documentation
+or comments only as this section defines that: the whole boundary set (riscv64 16 and 128 harts,
+x86_64 16 and 128 vCPUs) once each (`--runs 1`) in the debug profile and once each in the release
+profile (`cargo xtask build --release`, then the same `run-parallel` command, per the boundary
+commands above), and the memory variation and every device cell (the disk variations, the no-IOMMU
+variant, the framebuffer cell, the debug-port cell, the hotplug cell, and the CET cell) once each,
+so every tag boots at each boundary CPU count in both profiles (CI boots release builds only at 4
+CPUs), from a 4Kn disk, from two disks, with no IOMMU, with a framebuffer, with a debug port, with a
+hot-added device, and on CET shadow stacks, and runs the timing report on the boundary logs, which
+is reported and blocks nothing. A tag's repeated-run check is the burn-in tier, which the tag push
+starts. The no-IOMMU variant, the no-iommu device cell, boots svctest once on each architecture with
+the machine's IOMMU detached, so devmgr's unconfined path still serves every driver (svctest staged
+as `build-test.yml` stages it, on a debug-profile sysroot). A run whose outcome is not a pass, as
+When the runs are owed classifies outcomes, blocks the tag, MUST be filed as an Issue, and is
+bisected over the release's PRs.
 
 ```sh
 # No-IOMMU variant, each architecture (svctest staged, debug profile):
@@ -1564,6 +1610,7 @@ note in full.
 [services/debug-echo/README.md](../services/debug-echo/README.md),
 [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md),
 [services/gdbstub/README.md](../services/gdbstub/README.md),
+[services/hotplug-check/README.md](../services/hotplug-check/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),
 [Restart Protocol](../services/svcmgr/docs/restart-protocol.md),

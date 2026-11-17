@@ -103,6 +103,10 @@ check counts the boot functions it covered.
 devmgr keeps the first windows and the first table of each mode that pass, and the first
 `_OSC` result, for the boot. A later push equal to the held one is accepted; one that differs
 is logged and the held one stays, so a restarted acpid cannot change what devmgr acts on.
+devmgr acts on the held `_OSC` result for PCI Express native hotplug alone: it manages a slot
+below the bridge only when the control dword grants native hotplug control, or the platform
+description table does
+([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#event-sources) § Event Sources).
 
 `QUERY_HOST_BRIDGE(ordinal)`, under `REGISTRY_QUERY_AUTHORITY`, serves what devmgr holds per
 bridge, in segment then bus order: the `_OSC` status and control, whether the routes and the

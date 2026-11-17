@@ -51,7 +51,7 @@ xtask/
 │   │                           #   ktest_timing, symbolize, mkdisk, check_disk, compose_bundle,
 │   │                           #   clean,
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
-│   │                           #   test_debug_port,
+│   │                           #   test_debug_port, test_hotplug,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
 │   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
@@ -274,9 +274,10 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
-`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, `test-map-redo`, and
-`test-log-level` repack the images in the layout they find: `disk.img`'s block size, and the data
-partition on `disk-data.img` when that image is there. The five test commands boot that layout,
+`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-hotplug`, `test-kaslr`,
+`test-map-redo`, and `test-log-level` repack the images in the layout they find: `disk.img`'s
+block size, and the data partition on `disk-data.img` when that image is there. The six test
+commands boot that layout,
 attaching `disk-data.img` as the second disk when it holds the data partition; `run` and
 `run-parallel` attach a second disk only as `--second-disk` names it.
 
@@ -1121,6 +1122,47 @@ seconds. The boot is one of the two of the debug-port device cell of the local a
 
 ---
 
+### `cargo xtask test-hotplug`
+
+Check devmgr's PCI Express native hotplug add path, on either arch. Stages the `hotplug-check`
+fixture's recipe ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
+`config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
+`config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout
+they have. It boots the current sysroot headless, with an empty `pcie-root-port` (`-device
+pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
+
+1. on x86_64 only, under the machine's default, whose `_OSC` withholds native hotplug control:
+   it passes when devmgr logs the slot `not managed: _OSC control`;
+2. under native control (on x86_64 with
+   `-global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off`, so `_OSC` grants it; on riscv64
+   the `qemu-virt.platform` key grants it): once devmgr logs the slot `managed (native control
+   by` and the fixture logs `[hotplug-check] READY for the hot-added device`, it hot-adds QEMU's
+   `edu` device behind the port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
+   `edu` has), and passes on the fixture's `[hotplug-check] PASS` line.
+
+It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
+again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug
+(`test-hotplug`) lists what the fixture checks.
+
+A pure runner; requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-hotplug [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+Each boot to its markers is bounded by five minutes and the fixture's verdict by three minutes
+after the hot-add. The boots are the hotplug device cell of the local and release host runs
+([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers).
+
+---
+
 ### `cargo xtask test-gdb`
 
 Check the GDB stub ([services/gdbstub/README.md](../services/gdbstub/README.md)) from a host GDB,
@@ -1624,8 +1666,8 @@ The worktrees of one checkout share one host. The commands that load it apply it
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
 them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`,
-`test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi`
-as boots.
+`test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-hotplug`, `test-gdb` and
+`capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host
@@ -1779,6 +1821,7 @@ test`, which rewrites every screen and outcome from the current table; the diff 
 | [docs/testing.md](../docs/testing.md) | Harnesses, markers, and the host-driven boot tests the test commands run; the Coverage tiers surface list `lint-docs` checks; the Troubleshooting guide `symbolize` serves |
 | [services/drivers/virtio/console/README.md](../services/drivers/virtio/console/README.md) | The debug port `--debug-port` attaches and `test-debug-port` drives |
 | [services/gdbstub/README.md](../services/gdbstub/README.md) | The GDB stub `--debug-target` stages and `test-gdb` drives |
+| [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md) | The PCI Express native hotplug `test-hotplug` drives |
 | [docs/coding-standards.md](../docs/coding-standards.md) | Lints `build` and `test` enforce; the Markdown and file-header rules `lint-docs` checks |
 | [docs/documentation-standards.md](../docs/documentation-standards.md) | Document hierarchy and backlink rules `lint-docs` checks |
 | [targets/README.md](targets/README.md) | Custom target specs |

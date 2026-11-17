@@ -113,6 +113,39 @@ pub fn carve_io_ports(_caps: &mut DevmgrCaps, _base: u16, _count: u16) -> Option
     None
 }
 
+/// No shutdown actuator of pwrmgr's is a port on riscv64.
+pub fn pwrmgr_ports(_firmware: &Firmware) -> Vec<firmware::acpid::Range>
+{
+    Vec::new()
+}
+
+/// No fixed ACPI register block is a port on riscv64: `QUERY_ACPI_RESOURCES`
+/// serves none.
+pub fn acpi_io_block(
+    _firmware: &Firmware,
+    _block: firmware::acpi::FadtBlock,
+) -> Option<(u64, firmware::acpi::IoBlock)>
+{
+    None
+}
+
+/// How devmgr checks acpid's `_PRT` table of `mode`
+/// (`firmware::acpid::PrtRule`): riscv64 has one interrupt model, whose
+/// routes are checked against the line devmgr gives each function, the
+/// `virt` host's swizzle ([`intx_fallback_gsi`]). A PIC-mode table is not
+/// served.
+pub fn prt_rule(mode: firmware::acpid::PrtMode) -> Option<firmware::acpid::PrtRule>
+{
+    match mode
+    {
+        firmware::acpid::PrtMode::Routes => Some(firmware::acpid::PrtRule {
+            after: None,
+            lines: true,
+        }),
+        firmware::acpid::PrtMode::PicMode => None,
+    }
+}
+
 /// The line and `SYS_IRQ_REGISTER` mode of a platform record's interrupt
 /// `line`: the APLIC source and the mode its description gives; no
 /// ISA routing exists on riscv64.

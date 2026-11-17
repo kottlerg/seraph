@@ -989,10 +989,10 @@ unless that registry's process registered it as its own, as procmgr can take it 
 process that holds a cap of a declared process's thread, as its creator holds the main thread's, can
 still register that thread in its own registry (Label 22), and so list it to a debugger attached to
 that process, which gains on it the `CONTROL` the cap's holder already has.
-Until it declares, a process is bound and attachable like any other: a fault of logd or one of
-those drivers between its creation and its declaration, which each sends before its bootstrap,
-reaches the crash service, whose log output then waits on the faulting process until the crash
-service's watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines
+Until it declares, a process is bound and attachable like any other: a fault of one of those
+drivers between its creation and its declaration, which each sends before its bootstrap, reaches
+the crash service, whose log output then waits on the faulting process until the crash service's
+watchdog bound ([crashd Operation](../../crashd/docs/operation.md) § Bounds) declines
 the fault.
 
 ### Label 22: `REGISTER_THREAD`

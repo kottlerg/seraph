@@ -24,7 +24,12 @@
 //! one the earlier run of the check left a retired slot in.
 //!
 //! The phase writes no log line between the kill and the new instance's
-//! service: a line written while no logd receives waits out its bound.
+//! service: a line written while no logd receives waits out its bound. The
+//! new instance's table holds no sender's name, and svctest registered its
+//! own once, at startup, so the phase registers it again before its next
+//! line; otherwise every later svctest line, the terminal marker included,
+//! would carry `[?]` (`services/logd/docs/handover-protocol.md`, the
+//! restart paragraph).
 
 use std::time::{Duration, Instant};
 
@@ -74,6 +79,7 @@ pub fn logd_restart_phase(caps: &Caps)
     kill(authority, killed);
     await_restart(caps.logd_query, authority, killed);
     let took = start.elapsed().as_millis();
+    std::os::seraph::log::register_name(b"svctest");
     super::procmgr::logd_death_forward_phase(caps);
     std::os::seraph::log!("logd_restart: logd restarted in {took} ms");
 }

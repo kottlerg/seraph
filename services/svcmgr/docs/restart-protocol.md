@@ -348,9 +348,11 @@ restart. `logd` is the log sink: svcmgr holds the master-log endpoint
 source for the system's life and mints each (re)launched logd a fresh RECV
 on that persistent endpoint, so log senders' caps survive the restart (per
 [service-definitions.md](service-definitions.md#log_sink)). The restarted
-logd skips the history pull, serves a fresh table, and registers its death
-queue with procmgr, whose `REGISTER_DEATH_EQ` takes it in place of the dead
-instance's ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md)
+logd skips the history pull, serves a fresh table (which holds no sender's
+display name: a sender's lines render as `[?]` until it registers its name
+again; #1213), and registers its death queue with procmgr, whose
+`REGISTER_DEATH_EQ` takes it in place of the dead instance's
+([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md)
 § `REGISTER_DEATH_EQ`), so slot eviction resumes. svcmgr's death handler
 writes none of a logd death's lines before the respawn: with no logd
 receiving, each would wait out its bound (the first `LOG_CALL_TIMEOUT_MS`,

@@ -46,7 +46,7 @@ object every sender already targets (see
 [`service-definitions.md` § `log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)).
 In-flight history from the prior instance is not recoverable, and neither
 are the senders' display names: each sender registers its name once, at
-startup, so its lines render as `[?]` once logd has restarted.
+startup, so its lines render as `[?]` once logd has restarted (#1213).
 
 ## Startup ordering
 

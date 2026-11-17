@@ -242,9 +242,10 @@ The `logd_restart` phase kills logd through `caps[15]`: it finds logd by name
 crashd when the boot stages it, else to procmgr's decliner, and svcmgr restarts logd. It writes no
 log line until it finds, through `caps[6]`, svcmgr's `service died: logd` and
 `service restarted: logd` lines in the new instance's history, which holds only lines written
-after the respawn, and fails when they do not arrive within 30 s. It then runs the
-`logd_death_forward` check again, against the new instance's fresh table and the death queue it
-registered, and logs how long the restart took.
+after the respawn, and fails when they do not arrive within 30 s. It then registers svctest's name
+again, which the new instance's table lacks (#1213), and runs the `logd_death_forward` check again,
+against the new instance's fresh table and the death queue it registered, and logs how long the
+restart took.
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`

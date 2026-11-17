@@ -2123,11 +2123,9 @@ pub mod fs_labels
     /// `IpcMessageBuilder::bytes(2, &concat(src, dst))` — source bytes
     /// first, destination bytes immediately after with no padding.
     ///
-    /// Cross-directory rename is deferred to Issue #89: the
-    /// caller cannot supply a second directory cap because servers
-    /// cannot introspect the badge packed inside a cap they receive
-    /// (`cap_info` does not expose badge bits), so a cross-directory
-    /// destination cannot be resolved to a `NodeId` server-side.
+    /// Cross-directory rename is deferred to Issue #89: the request
+    /// carries one directory cap, so a destination in another directory
+    /// cannot be named.
     ///
     /// Not atomic: an interrupted rename can leave only the source, both
     /// names, or only the destination present. See

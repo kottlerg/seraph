@@ -7,7 +7,7 @@
 //!
 //! Covers: `SYS_CAP_CREATE_*`, `SYS_CAP_COPY` (both auto-allocate and
 //! explicit-slot paths), `SYS_CAP_MOVE`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
-//! `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, `CSpace` teardown (batched drain,
+//! `SYS_ENDPOINT_BADGE`, `SYS_CAP_REVOKE`, `SYS_CAP_DELETE`, `CSpace` teardown (batched drain,
 //! bound-thread stop), and the bounds of handle resolution itself.
 //!
 //! Each function tests one syscall or one distinct behaviour. Tests clean up
@@ -17,7 +17,7 @@
 use syscall::{
     cap_copy, cap_create_aspace, cap_create_cspace, cap_create_endpoint, cap_create_notification,
     cap_delete, cap_derive, cap_derive_badge, cap_info, cap_insert, cap_move, cap_revoke,
-    event_queue_create, event_try_recv, notification_send, notification_wait,
+    endpoint_badge, event_queue_create, event_try_recv, notification_send, notification_wait,
     thread_bind_notification,
 };
 use syscall_abi::SyscallError;
@@ -1002,8 +1002,9 @@ pub fn derive_badge_rebadge_err(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// `cap_derive` from a badged cap succeeds. Badge inheritance
-/// (core/kernel/docs/syscalls.md § `SYS_CAP_DERIVE_BADGE`) is not observed here.
+/// `cap_derive` from a badged cap carries the badge
+/// (core/kernel/docs/syscalls.md § `SYS_CAP_DERIVE_BADGE`), read back through
+/// the endpoint's Receive cap (`SYS_ENDPOINT_BADGE`).
 pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
 {
     let ep = cap_create_endpoint(ctx.memory_base)
@@ -1016,8 +1017,11 @@ pub fn derive_inherits_badge(ctx: &TestContext) -> TestResult
     let derived =
         cap_derive(badged, syscall::RIGHTS_ALL).map_err(|_| "cap_derive from badged failed")?;
 
-    // The badge is not observable without IPC; deleting the derived cap
-    // confirms only that the derive produced a valid slot.
+    if endpoint_badge(ep, derived) != Ok(77)
+    {
+        return Err("derived cap does not carry its source's badge");
+    }
+
     cap_delete(derived).map_err(|_| "cap_delete derived failed")?;
     cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
     cap_delete(ep).map_err(|_| "cap_delete ep after inherit test failed")?;
@@ -1039,6 +1043,86 @@ pub fn derive_badge_on_notification(ctx: &TestContext) -> TestResult
 
     cap_delete(badged).map_err(|_| "cap_delete badged notification failed")?;
     cap_delete(sig).map_err(|_| "cap_delete sig after derive_badge_on_notification failed")?;
+    Ok(())
+}
+
+// ── SYS_ENDPOINT_BADGE ──────────────────────────────────────────────────────
+
+/// `endpoint_badge` returns the badge of a cap on the endpoint whose Receive
+/// cap the caller presents: the minted value, a value with bit 63 set (which
+/// the secondary return register carries whole), and 0 for an un-badged cap.
+pub fn endpoint_badge_reads(ctx: &TestContext) -> TestResult
+{
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for endpoint_badge_reads failed")?;
+    let badged = cap_derive_badge(ep, syscall_abi::RIGHTS_EP_SEND, 42)
+        .map_err(|_| "cap_derive_badge(42) failed")?;
+    let high = (1u64 << 63) | 5;
+    let high_badged = cap_derive_badge(ep, syscall_abi::RIGHTS_EP_SEND, high)
+        .map_err(|_| "cap_derive_badge(bit 63) failed")?;
+
+    if endpoint_badge(ep, badged) != Ok(42)
+    {
+        return Err("endpoint_badge did not return the minted badge");
+    }
+    if endpoint_badge(ep, high_badged) != Ok(high)
+    {
+        return Err("endpoint_badge did not return a badge with bit 63 set whole");
+    }
+    if endpoint_badge(ep, ep) != Ok(0)
+    {
+        return Err("endpoint_badge of an un-badged cap is not 0");
+    }
+
+    cap_delete(high_badged).map_err(|_| "cap_delete high_badged failed")?;
+    cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after endpoint_badge_reads failed")?;
+    Ok(())
+}
+
+/// `endpoint_badge` refuses a proof cap without Receive (`InsufficientRights`),
+/// a cap on another endpoint (`InvalidArgument`), a non-endpoint cap in
+/// either position, and a deleted handle (`InvalidCapability`).
+pub fn endpoint_badge_refusals(ctx: &TestContext) -> TestResult
+{
+    let invalid_cap = Err(SyscallError::InvalidCapability as i64);
+    let ep = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "create_endpoint for endpoint_badge_refusals failed")?;
+    let other = cap_create_endpoint(ctx.memory_base)
+        .map_err(|_| "second create_endpoint for endpoint_badge_refusals failed")?;
+    let sig = cap_create_notification(ctx.memory_base)
+        .map_err(|_| "create_notification for endpoint_badge_refusals failed")?;
+    let badged = cap_derive_badge(ep, syscall_abi::RIGHTS_EP_SEND, 7)
+        .map_err(|_| "cap_derive_badge for endpoint_badge_refusals failed")?;
+    let send_only = cap_derive(ep, syscall_abi::RIGHTS_EP_SEND)
+        .map_err(|_| "cap_derive(SEND) for endpoint_badge_refusals failed")?;
+
+    if endpoint_badge(send_only, badged) != Err(SyscallError::InsufficientRights as i64)
+    {
+        return Err("endpoint_badge accepted a proof cap without Receive");
+    }
+    if endpoint_badge(other, badged) != Err(SyscallError::InvalidArgument as i64)
+    {
+        return Err("endpoint_badge accepted a cap on another endpoint");
+    }
+    if endpoint_badge(sig, badged) != invalid_cap
+    {
+        return Err("endpoint_badge accepted a Notification as the proof cap");
+    }
+    if endpoint_badge(ep, sig) != invalid_cap
+    {
+        return Err("endpoint_badge read the badge of a Notification cap");
+    }
+    cap_delete(badged).map_err(|_| "cap_delete badged failed")?;
+    if endpoint_badge(ep, badged) != invalid_cap
+    {
+        return Err("endpoint_badge accepted a deleted handle");
+    }
+
+    cap_delete(send_only).map_err(|_| "cap_delete send_only failed")?;
+    cap_delete(sig).map_err(|_| "cap_delete sig failed")?;
+    cap_delete(other).map_err(|_| "cap_delete other failed")?;
+    cap_delete(ep).map_err(|_| "cap_delete ep after endpoint_badge_refusals failed")?;
     Ok(())
 }
 

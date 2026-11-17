@@ -549,7 +549,8 @@ fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<Job>, job_note: u6
             Action::Blink =>
             {
                 std::os::seraph::log!(
-                    "hotplug: slot {}:{}:{}.{}: attention button pressed; removal in {} ms                      unless pressed again",
+                    "hotplug: slot {}:{}:{}.{}: attention button pressed; removal in {} ms \
+                     unless pressed again",
                     seg,
                     b,
                     d,

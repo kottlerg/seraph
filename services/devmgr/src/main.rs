@@ -2269,7 +2269,8 @@ impl ServedDrivers
 /// the held BAR pages `held`.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the settle takes the batch, its roster, the death watch, the catalog, the registry,               the held BAR pages its withdrawals give back to, and its bound"
+    reason = "the settle takes the batch, its roster, the death watch, the catalog, the registry, \
+              the held BAR pages its withdrawals give back to, and its bound"
 )]
 fn settle_batch(
     batch: settle::SettleBatch,

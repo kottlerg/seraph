@@ -58,7 +58,7 @@ devmgr/
 └── docs/
     ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO
-    └── hotplug.md                  # Hotplug event sources, native slots, the add path
+    └── hotplug.md                  # Hotplug event sources, native slots, add and removal
 ```
 
 ---
@@ -81,7 +81,7 @@ capabilities devmgr receives at bootstrap, and its relationship to driver proces
 |---|---|
 | [docs/responsibilities.md](docs/responsibilities.md) | Responsibilities, bootstrap capabilities, authority over drivers |
 | [docs/pci-enumeration.md](docs/pci-enumeration.md) | PCI enumeration via ECAM MMIO |
-| [docs/hotplug.md](docs/hotplug.md) | Hotplug event sources, native slots, the add path |
+| [docs/hotplug.md](docs/hotplug.md) | Hotplug event sources, native slots, the add and removal paths |
 | [docs/device-management.md](../../docs/device-management.md) | Full device management design, DMA safety, security boundary |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation, revocation |
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, service roles |

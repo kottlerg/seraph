@@ -1325,15 +1325,14 @@ cargo xtask test-debug-port --arch <arch>
 cargo xtask test-gdb --arch <arch>
 ```
 
-**Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug
-(`test-hotplug`) above) on each architecture, two on x86_64 and one on riscv64, at 4 vCPUs, in
-which devmgr manages an empty root port, binds the `test-dma` fixture to the `edu` device the
-host hot-adds behind it, withdraws it when the host removes the device, and binds it again when
-the host adds it again. The command stages and unstages its own files on the current sysroot, a
-debug-profile build. It bounds each boot to its markers by five minutes, the fixture's probes by
-three minutes after each hot-add, and the removal by one minute from `device_del`; it has no
-`run-parallel` budget. The boots are the hotplug
-device cell (Device surfaces above).
+**Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug (`test-hotplug`)
+above) on each architecture, two on x86_64 and one on riscv64, at 4 vCPUs, in which devmgr manages
+an empty root port, binds the `test-dma` fixture to the `edu` device the host hot-adds behind it,
+withdraws it when the host removes the device, and binds it again when the host adds it again. The
+command stages and unstages its own files on the current sysroot, a debug-profile build. It bounds
+each boot to its markers by five minutes, the fixture's probes by three minutes after each hot-add,
+and the removal by one minute from `device_del`; it has no `run-parallel` budget. The boots are the
+hotplug device cell (Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):

@@ -155,7 +155,13 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 /// v21: The riscv64 [`KernelMmio`] lost `plic_base`, `plic_size` and
 ///     `plic_ndev`: the kernel drives AIA only, so `aplic` and `imsic` are
 ///     its interrupt controllers, and `uart_base` is now its first field.
-pub const BOOT_PROTOCOL_VERSION: u32 = 21;
+/// v22: The last entry of `modules` is the trust store the bootloader
+///     verified the kernel and the bundle against, named
+///     [`TRUST_STORE_MODULE`] in pages of its own, so `modules` is never
+///     empty and the bundle supplies at most `MAX_BOOT_MODULES - 1` modules.
+///     A module's `size` is its whole signed object, signature trailer
+///     included. No layout change.
+pub const BOOT_PROTOCOL_VERSION: u32 = 22;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 

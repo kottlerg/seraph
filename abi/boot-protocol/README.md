@@ -13,8 +13,10 @@ halts at entry if the bootloader's version does not match (see
 § Phase 0: Entry Validation).
 
 **Constraints:** `no_std`, `#[repr(C)]` for every struct and `#[repr(u32)]` for every
-enum `BootInfo` carries, no dependencies outside `core`. Changes that alter `BootInfo`
-layout or the CPU entry contract MUST increment `BOOT_PROTOCOL_VERSION`.
+enum `BootInfo` carries, no dependencies outside `core`. Every breaking change to the protocol
+(the `BootInfo` layout, what a field holds, a requirement on a compliant bootloader, or the CPU
+entry contract) MUST increment `BOOT_PROTOCOL_VERSION`
+([docs/conventions.md](../../docs/conventions.md) § ABI / wire-protocol versions).
 
 The crate source under `src/` is the authoritative specification — `lib.rs` for
 the `BootInfo` layout and the sibling modules for the bundle, layout-arithmetic, paging, and

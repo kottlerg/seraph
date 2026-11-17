@@ -40,6 +40,10 @@ pub fn phases() -> &'static [Phase]
             name: "svcmgr_worker_fault_restart",
             run: svcmgr_worker_fault_restart_phase,
         },
+        Phase {
+            name: "svcmgr_stop_service",
+            run: svcmgr_stop_service_phase,
+        },
     ]
 }
 
@@ -72,61 +76,17 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 {
     use ipc::restart_probe_labels as probe;
 
-    match std::fs::metadata(WORKER_FAULT_RECIPE)
+    let phase = "svcmgr_worker_fault_restart";
+    if !worker_fixture_staged(phase)
     {
-        Ok(_) =>
-        {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
-        {
-            std::os::seraph::log!(
-                "svcmgr_worker_fault_restart phase skipped: crasher-worker.svc not staged"
-            );
-            return;
-        }
-        Err(e) => panic!("svcmgr_worker_fault_restart: stat {WORKER_FAULT_RECIPE}: {e:?}"),
+        std::os::seraph::log!(
+            "svcmgr_worker_fault_restart phase skipped: crasher-worker.svc not staged"
+        );
+        return;
     }
-
-    let (registry_cap, ipc_buf) = registry_cap_and_buf("svcmgr_worker_fault_restart");
-    let name = probe::NAME;
-    let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
-    let mut waited_ms = 0;
-    let fixture = loop
-    {
-        let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
-            .expect("svcmgr QUERY_ENDPOINT ipc_call must return a reply");
-        if reply.label == ipc::svcmgr_errors::SUCCESS
-        {
-            break reply.caps().first().copied().unwrap_or(0);
-        }
-        assert!(
-            waited_ms < WORKER_FAULT_PUBLISH_WAIT_MS,
-            "svcmgr_worker_fault_restart: {} not published within {WORKER_FAULT_PUBLISH_WAIT_MS} ms, last reply {:#x}",
-            String::from_utf8_lossy(name),
-            reply.label
-        );
-        let _ = syscall::thread_sleep(50);
-        waited_ms = waited_ms.saturating_add(50);
-    };
-    assert_ne!(
-        fixture, 0,
-        "svcmgr_worker_fault_restart: QUERY_ENDPOINT returned no cap"
-    );
-
-    let nonce = |what: &str| -> u64 {
-        let msg = ipc::IpcMessage::new(probe::PROBE_INSTANCE);
-        // SAFETY: ipc_buf is the registered IPC buffer.
-        let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
-            .unwrap_or_else(|e| panic!("svcmgr_worker_fault_restart: {what} call failed: {e:?}"));
-        assert_eq!(
-            reply.label,
-            probe::SUCCESS,
-            "svcmgr_worker_fault_restart: {what} reply {:#x}",
-            reply.label
-        );
-        reply.word(0)
-    };
+    let (_, ipc_buf) = registry_cap_and_buf(phase);
+    let fixture = worker_fixture(phase);
+    let nonce = |what: &str| probe_nonce(fixture, phase, what);
 
     let before = nonce("first PROBE_INSTANCE");
     let msg = ipc::IpcMessage::new(probe::PROBE_FAULT_WORKER);
@@ -146,6 +106,230 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
     );
     let _ = syscall::cap_delete(fixture);
     std::os::seraph::log!("svcmgr worker-fault-restart phase passed (restarted instance answered)");
+}
+
+/// Whether the worker-fault fixture's recipe is staged in
+/// `/config/svcmgr/services/`; a stat error other than "not found" fails
+/// `phase`.
+fn worker_fixture_staged(phase: &str) -> bool
+{
+    match std::fs::metadata(WORKER_FAULT_RECIPE)
+    {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => panic!("{phase}: stat {WORKER_FAULT_RECIPE}: {e:?}"),
+    }
+}
+
+/// A SEND on the endpoint the worker-fault fixture provides
+/// (`ipc::restart_probe_labels::NAME`), resolved through `QUERY_ENDPOINT`
+/// once it is published, within [`WORKER_FAULT_PUBLISH_WAIT_MS`]. The
+/// endpoint outlives each instance, so the SEND reaches every restart.
+fn worker_fixture(phase: &str) -> u64
+{
+    let (registry_cap, ipc_buf) = registry_cap_and_buf(phase);
+    let name = ipc::restart_probe_labels::NAME;
+    let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
+    let mut waited_ms = 0;
+    let fixture = loop
+    {
+        let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
+            .expect("svcmgr QUERY_ENDPOINT ipc_call must return a reply");
+        if reply.label == ipc::svcmgr_errors::SUCCESS
+        {
+            break reply.caps().first().copied().unwrap_or(0);
+        }
+        assert!(
+            waited_ms < WORKER_FAULT_PUBLISH_WAIT_MS,
+            "{phase}: {} not published within {WORKER_FAULT_PUBLISH_WAIT_MS} ms, last reply {:#x}",
+            String::from_utf8_lossy(name),
+            reply.label
+        );
+        let _ = syscall::thread_sleep(50);
+        waited_ms = waited_ms.saturating_add(50);
+    };
+    assert_ne!(fixture, 0, "{phase}: QUERY_ENDPOINT returned no cap");
+    fixture
+}
+
+/// The nonce of the worker-fault fixture's running instance, read through
+/// `fixture` with `PROBE_INSTANCE`; `what` names the read in a failure.
+fn probe_nonce(fixture: u64, phase: &str, what: &str) -> u64
+{
+    use ipc::restart_probe_labels as probe;
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = ipc::IpcMessage::new(probe::PROBE_INSTANCE);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let reply = unsafe { ipc::ipc_call(fixture, &msg, ipc_buf) }
+        .unwrap_or_else(|e| panic!("{phase}: {what} call failed: {e:?}"));
+    assert_eq!(
+        reply.label,
+        probe::SUCCESS,
+        "{phase}: {what} reply {:#x}",
+        reply.label
+    );
+    reply.word(0)
+}
+
+/// `STOP_SERVICE` of `name` through `cap`: the reply label.
+fn stop_service(cap: u64, name: &[u8]) -> u64
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let label = ipc::svcmgr_labels::STOP_SERVICE | ((name.len() as u64) << 16);
+    let msg = ipc::IpcMessage::builder(label).bytes(0, name).build();
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
+        .expect("svcmgr STOP_SERVICE ipc_call must return a reply")
+        .label
+}
+
+/// The whole `LIST_STOPPABLE` walk through `cap`, page by page until a short
+/// page: each listed service's name and usage in pages. Fails `phase` on a
+/// reply other than `SUCCESS` or a page that does not decode.
+fn list_stoppable(cap: u64, phase: &str) -> Vec<(String, u64)>
+{
+    use ipc::svcmgr_labels::{LIST_STOPPABLE, LIST_STOPPABLE_PAGE, unpack_stoppable_entry};
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let mut listed = Vec::new();
+    let mut cursor = 0;
+    loop
+    {
+        let msg = ipc::IpcMessage::builder(LIST_STOPPABLE)
+            .word(0, cursor)
+            .build();
+        // SAFETY: ipc_buf is the registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(cap, &msg, ipc_buf) }
+            .expect("svcmgr LIST_STOPPABLE ipc_call must return a reply");
+        assert_eq!(
+            reply.label,
+            ipc::svcmgr_errors::SUCCESS,
+            "{phase}: LIST_STOPPABLE reply {:#x}",
+            reply.label
+        );
+        let count = usize::try_from(reply.word(0)).unwrap_or(usize::MAX);
+        assert!(
+            count <= LIST_STOPPABLE_PAGE,
+            "{phase}: LIST_STOPPABLE page of {count} entries"
+        );
+        for index in 0..count
+        {
+            let (pages, name, len) = unpack_stoppable_entry(reply.words(), index)
+                .unwrap_or_else(|| panic!("{phase}: LIST_STOPPABLE entry {index} does not decode"));
+            let name = name.get(..len).unwrap_or_default();
+            listed.push((String::from_utf8_lossy(name).into_owned(), pages));
+        }
+        if count < LIST_STOPPABLE_PAGE
+        {
+            return listed;
+        }
+        assert!(
+            reply.word(1) > cursor,
+            "{phase}: LIST_STOPPABLE cursor did not advance"
+        );
+        cursor = reply.word(1);
+    }
+}
+
+/// End to end: the stop authority. `STOP_SERVICE` and `LIST_STOPPABLE`
+/// through the per-process SEND, which carries no verb bit, reply
+/// `UNAUTHORIZED`. Through the `STOP_AUTHORITY` SEND svctest's recipe
+/// (`stop_authority = yes`) delivers after the debug-authority slot, svcmgr
+/// refuses, with `NOT_STOPPABLE`, an unknown name, a `restart = never`
+/// service (svctest itself), one init started (vfsd), a critical one (logd),
+/// one with a core role (pwrmgr, the shutdown actuator) and one whose recipe
+/// does not set `oom_stop` (timed); the eligibility rule's every row is
+/// host-tested in `svcmgr-defs` (`svcmgr_defs::stop`).
+///
+/// With the `crasher-worker` fixture staged, whose recipe sets
+/// `oom_stop = yes`, it is the one service listed, with a non-zero usage;
+/// `STOP_SERVICE` of it replies `SUCCESS`, and the restart probe then
+/// answers with a new instance's nonce: svcmgr destroyed the instance and its
+/// `restart = on_failure` policy restarted it after the `EXIT_KILLED`
+/// death. Without the fixture no service is listed, since no other recipe of
+/// the boot sets `oom_stop`.
+fn svcmgr_stop_service_phase(caps: &Caps)
+{
+    let phase = "svcmgr_stop_service";
+    let (registry_cap, _) = registry_cap_and_buf(phase);
+    let stop_cap = caps.stop_authority;
+    assert_ne!(
+        stop_cap, 0,
+        "{phase}: no stop-authority cap in slot 16 (stop_authority = yes)"
+    );
+
+    let label = stop_service(registry_cap, b"crasher-worker");
+    assert_eq!(
+        label,
+        ipc::svcmgr_errors::UNAUTHORIZED,
+        "{phase}: STOP_SERVICE through the per-process SEND replied {label:#x}"
+    );
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    let msg = ipc::IpcMessage::new(ipc::svcmgr_labels::LIST_STOPPABLE);
+    // SAFETY: ipc_buf is the registered IPC buffer.
+    let label = unsafe { ipc::ipc_call(registry_cap, &msg, ipc_buf) }
+        .expect("svcmgr LIST_STOPPABLE ipc_call must return a reply")
+        .label;
+    assert_eq!(
+        label,
+        ipc::svcmgr_errors::UNAUTHORIZED,
+        "{phase}: LIST_STOPPABLE through the per-process SEND replied {label:#x}"
+    );
+
+    for (name, why) in [
+        (&b"svctest.no-such-service"[..], "unknown"),
+        (b"svctest", "restart = never"),
+        (b"vfsd", "not launched by svcmgr"),
+        (b"logd", "critical"),
+        (b"pwrmgr", "shutdown actuator"),
+        (b"timed", "no oom_stop"),
+    ]
+    {
+        let label = stop_service(stop_cap, name);
+        assert_eq!(
+            label,
+            ipc::svcmgr_errors::NOT_STOPPABLE,
+            "{phase}: STOP_SERVICE({}) ({why}) replied {label:#x}",
+            String::from_utf8_lossy(name)
+        );
+    }
+
+    let staged = worker_fixture_staged(phase);
+    let listed = list_stoppable(stop_cap, phase);
+    if !staged
+    {
+        assert!(
+            listed.is_empty(),
+            "{phase}: no recipe sets oom_stop, yet LIST_STOPPABLE listed {listed:?}"
+        );
+        std::os::seraph::log!(
+            "svcmgr stop-service phase passed (gates and refusals; crasher-worker.svc not staged)"
+        );
+        return;
+    }
+    assert!(
+        matches!(listed.as_slice(), [(name, pages)] if name == "crasher-worker" && *pages > 0),
+        "{phase}: LIST_STOPPABLE must list crasher-worker alone, with its usage: {listed:?}"
+    );
+
+    let fixture = worker_fixture(phase);
+    let before = probe_nonce(fixture, phase, "PROBE_INSTANCE before the stop");
+    let label = stop_service(stop_cap, b"crasher-worker");
+    assert_eq!(
+        label,
+        ipc::svcmgr_errors::SUCCESS,
+        "{phase}: STOP_SERVICE(crasher-worker) replied {label:#x}"
+    );
+    let after = probe_nonce(fixture, phase, "PROBE_INSTANCE after the stop");
+    assert_ne!(
+        before, after,
+        "{phase}: the stopped instance still answered"
+    );
+    let _ = syscall::cap_delete(fixture);
+    std::os::seraph::log!(
+        "svcmgr stop-service phase passed (gates, refusals, crasher-worker stopped and restarted)"
+    );
 }
 
 /// The recipe's fifth and sixth seeds (`vfsd.mount`, `vfsd.deny`) fill

@@ -31,7 +31,8 @@ declare themselves so to procmgr, and its recipe grants it `/crash` alone, witho
 read a core back.
 
 svcmgr starts crashd from `rootfs/config/svcmgr/services/crashd.svc`, which sets
-`debug_authority = yes` ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)).
+`debug_authority = yes`, and `reserve = yes`, which creates it inside memmgr's system reserve
+([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md)).
 Whether a system reports crashes is a staging decision: an image without the recipe has no crash
 service, and a faulting process dies as it does with no handler bound.
 

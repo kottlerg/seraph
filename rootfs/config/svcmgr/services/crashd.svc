@@ -13,6 +13,12 @@
 # is down, and hands the endpoint to the respawned crashd when it registers.
 # `critical = no`: without crashd the system runs, unreported.
 #
+# `reserve = yes` makes crashd's budget node a system-reserve node, which
+# may take the free pages memmgr keeps in reserve, so crashd can report and
+# dump a fault memmgr declined for want of memory while the free pool is
+# spent. A reserve holder has a core role: no stop-authority holder may stop
+# crashd.
+#
 # `CORE_DUMP` names the processes whose faults leave an ELF core in /crash:
 # `no` (the default) writes none, a comma-separated list of process names
 # writes one for each process named (services/crashd/docs/operation.md
@@ -30,3 +36,4 @@ critical        = no
 env             = CORE_DUMP=no
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes
+reserve         = yes

@@ -134,21 +134,25 @@ below `CRITICAL` it is logged `not held: repeats a resumed fault` as a warning, 
 declined. So an access memmgr cannot back once memory is freed is not resumed into a loop, and the
 holds of one fault total at most the stall.
 
-**While memory is critical.** crashd runs outside memmgr's system reserve: a page it touches for
-the first time while the level reads `CRITICAL` is declined as any such process's is, and crashd,
-undebuggable and with no handler of its own faults, dies of it. Its held faults are then released
-unhandled, as a decline would end them, with no report
+**While memory is critical.** crashd runs inside memmgr's system reserve: its recipe's
+`reserve = yes` has svcmgr create it with a reserve budget node
+([`.svc` Service Definitions](../../svcmgr/docs/service-definitions.md) § `reserve`), so a page
+it touches for the first time while the level reads `CRITICAL` is backed from the reserve, which
+the processes outside it cannot take
+([services/memmgr/docs/memory-pool.md](../../memmgr/docs/memory-pool.md) § Distribution policy).
+Only a reserve that is itself spent declines such a page, and crashd, undebuggable and with no
+handler of its own faults, then dies of it. Its held faults are then released unhandled, as a
+decline would end them, with no report
 ([docs/fault-handling.md](../../../docs/fault-handling.md) § Liveness, rule 3), and procmgr
-declines new faults until the respawned crashd registers. So, with a stall set, crashd touches
+declines new faults until the respawned crashd registers. The reserve is shared with the core
+services, so crashd draws on it as little as it can: with a stall set, crashd touches
 64 KiB of its heap at start (`HEAP_TOUCH_BYTES`), which the allocator reuses for a report's
 buffers, and 32 KiB of the stacks of its main and watchdog threads (`STACK_TOUCH_BYTES`); its log
 writes format on the stack. A report allocates its block's lines, its stack scan (at most 8 KiB),
 its registers, the bytes at the instruction pointer and its frames, all within that heap. While the
 level reads `CRITICAL` it writes no core, since a core's buffers and the file system's writes need
 pages a report does not: the dump's line is `not written: memory is critical`
-([Core Dump](#core-dump)). A report that needs a page past those still ends crashd so. crashd
-running inside the reserve, which removes that, is design intent; not yet implemented
-([#1098](https://github.com/kottlerg/seraph/issues/1098)).
+([Core Dump](#core-dump)). A report that needs a page past those takes it from the reserve.
 
 ---
 

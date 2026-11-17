@@ -728,9 +728,10 @@ inherit. The nodes of memmgr's boot records
 reserve nodes, and so is the node of a process created with procmgr's reserve creation flag
 (`CREATE_RESERVE`), which procmgr honours only from a reserve creator, as it does
 `CREATE_PHYS_ACCESS`. A process a reserve
-creator creates without the flag is outside the reserve, so svcmgr's services, crashd among them,
-are outside it until svcmgr passes the flag for them; a recipe key that asks for it is
-[#1098](https://github.com/kottlerg/seraph/issues/1098). The reserve is `pool_total / 64`
+creator creates without the flag is outside the reserve, so svcmgr's services are outside it
+unless the recipe's `reserve = yes` has svcmgr pass the flag, as crashd's does
+([services/svcmgr/docs/service-definitions.md](../../svcmgr/docs/service-definitions.md)
+§ `reserve`). The reserve is `pool_total / 64`
 ([docs/limits.md](../../../docs/limits.md) § memmgr).
 
 **Create-time ceiling.** procmgr registers each process with its creator's node as the parent (a

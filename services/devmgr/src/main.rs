@@ -226,7 +226,7 @@ fn main() -> !
             ipc_buf,
         );
         acpi.run(&records, &mut caps);
-        hotplug.grant(acpi.bridges(), &records, &mut caps);
+        hotplug.grant(acpi.bridges(), &mut records, &mut caps);
         hotplug.run(
             &registry,
             &mut records,

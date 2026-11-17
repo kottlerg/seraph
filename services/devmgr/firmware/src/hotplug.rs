@@ -19,9 +19,9 @@ extern crate alloc;
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
-use crate::acpid::{Address, Bridge, Bridges, Osc};
+use crate::acpid::{Address, Bridge, Bridges, Osc, address};
 use crate::pci::{CAP_ID_PCI_EXPRESS, COMMAND, COMMAND_MEMORY, STATUS, find_capability};
-use crate::pci_records::AppendError;
+use crate::pci_records::{AppendError, PciRecords, RecordState};
 use crate::scan::{ConfigSpace, MAX_BARS, PciDevice};
 
 /// Offset of the PCI Express Capabilities register in the capability: bits
@@ -667,6 +667,21 @@ pub enum Admission
     Refused(AppendError),
 }
 
+/// Hold the live record of a managed slot's port, `port`, as devmgr's own:
+/// the poller writes the port's Slot Control and Slot Status, which lie past
+/// the configuration header, so no pass binds the port and acpid is refused
+/// every configuration write to it ([`crate::acpid::config_access`]).
+/// Returns whether an unbound record was marked; a port a driver holds stays
+/// as it is.
+pub fn hold_port(records: &mut PciRecords, port: Address) -> bool
+{
+    let index =
+        records.devices().iter().enumerate().position(|(i, d)| {
+            address(d) == port && records.state(i) != Some(RecordState::Removed)
+        });
+    index.is_some_and(|i| records.mark_bound(i))
+}
+
 /// Admit the function `device`, its BARs programmed: a type-1 function is not
 /// recorded; any other is appended through `append` (the records'
 /// `PciRecords::append`).
@@ -1055,6 +1070,39 @@ mod tests
         let mut out = Vec::new();
         slots(space, &functions, &mut out).unwrap();
         out
+    }
+
+    #[test]
+    fn a_managed_port_is_held_from_acpid_writes()
+    {
+        use crate::acpid::{ConfigAccess, ConfigError, ConfigOp, config_access};
+        let space = Space::default();
+        space.add((0, 0, 0), HOST_BRIDGE);
+        space.add((0, 3, 0), Q35_ROOT_PORT);
+        let mut functions = Vec::new();
+        scan(&space, 0, 0, 3, &mut functions).unwrap();
+        let mut records = PciRecords::new(functions).unwrap();
+        let port = (0, 0, 3, 0);
+        let index = records
+            .devices()
+            .iter()
+            .position(|d| address(d) == port)
+            .unwrap();
+        let slot_control = 0x6C;
+        let write = |records: &PciRecords| {
+            config_access(ConfigOp::Write, slot_control, 2, records.state(index))
+        };
+        assert_eq!(write(&records), Ok(ConfigAccess::Access));
+        assert!(hold_port(&mut records, port));
+        assert_eq!(write(&records), Err(ConfigError::Refused));
+        assert_eq!(
+            config_access(ConfigOp::Read, slot_control, 2, records.state(index)),
+            Ok(ConfigAccess::Access)
+        );
+        // Held once; no record at another address.
+        assert!(!hold_port(&mut records, port));
+        assert!(!hold_port(&mut records, (0, 0, 4, 0)));
+        assert!(records.unbound_at(index).is_none());
     }
 
     #[test]

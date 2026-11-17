@@ -17,7 +17,8 @@
 //! declaration the table chooses ([`bind_pci`]). A record is bound at most
 //! once a boot: once a driver was started for it, or, for a RISC-V IOMMU's
 //! function, once devmgr took it as a unit for the IOMMU driver
-//! ([`crate::iommu`]).
+//! ([`crate::iommu`]), and, for a hotplug slot's port, once devmgr
+//! managed the slot ([`crate::hotplug`]).
 //!
 //! No step names a driver. What a bound driver is given follows from its
 //! declaration (its interrupt need, whether it performs DMA, its reset, its

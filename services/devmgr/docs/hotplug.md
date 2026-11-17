@@ -60,7 +60,10 @@ or `by the platform table`; when the host bridge's `_OSC` result has arrived and
 control or reports a failed evaluation, with no platform grant, the slot is never managed, logged
 `not managed`. A slot whose `_OSC` result has not arrived waits. The slot's host bridge is the one
 whose `_CRS` bus window holds the port's bus, else the one whose root bus it is
-(`firmware::hotplug::host_bridge`).
+(`firmware::hotplug::host_bridge`). Once the slot is handed over, devmgr marks the port's record
+bound (`firmware::hotplug::hold_port`): the poller writes the port's Slot Control and Slot Status,
+past the configuration header, so no pass binds the port and acpid is refused every configuration
+write to it ([acpid's devmgr.md](../../acpid/docs/devmgr.md) § Configuration access).
 
 ### Poller
 

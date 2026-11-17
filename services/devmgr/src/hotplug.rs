@@ -179,8 +179,14 @@ impl Hotplug
     /// bridge among `bridges` grants native hotplug control, or the platform
     /// table does ([`hp::native_control`]). A slot whose host bridge's `_OSC`
     /// result withholds it, with no platform grant, is never managed,
-    /// logged. A slot neither grants nor withholds waits.
-    pub fn grant(&mut self, bridges: &Bridges, records: &bind::Records, caps: &mut caps::DevmgrCaps)
+    /// logged. A slot neither grants nor withholds waits. The record of each
+    /// managed slot's port is held in `records` ([`hp::hold_port`]).
+    pub fn grant(
+        &mut self,
+        bridges: &Bridges,
+        records: &mut bind::Records,
+        caps: &mut caps::DevmgrCaps,
+    )
     {
         for index in 0..self.candidates.len()
         {
@@ -246,13 +252,13 @@ impl Hotplug
         }
     }
 
-    /// Hand slot `index` to the poller, starting the poller with the first;
-    /// `by` names the grant in the log line.
+    /// Hand slot `index` to the poller, starting the poller with the first,
+    /// and hold its port's record; `by` names the grant in the log line.
     fn manage(
         &mut self,
         index: usize,
         slot: Slot,
-        records: &bind::Records,
+        records: &mut bind::Records,
         caps: &mut caps::DevmgrCaps,
         by: &str,
     ) -> Grant
@@ -290,6 +296,10 @@ impl Hotplug
             );
             return Grant::Unmanaged;
         }
+        // The poller now writes the port's Slot Control and Slot Status. The
+        // control thread, which runs this, also serves acpid's configuration
+        // accesses, so none is made between the hand-over and the hold.
+        hp::hold_port(&mut records.pci, slot.port);
         std::os::seraph::log!(
             "hotplug: slot {}:{}:{}.{} managed (native control by {})",
             s,

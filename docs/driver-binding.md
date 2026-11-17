@@ -94,7 +94,10 @@ IOMMU keeps its own PCI record beside the IOMMU record, which holds its unit. de
 record bound once it has taken the function as a unit for the IOMMU driver, with its memory decode
 and bus mastering turned on, whether or not the driver then starts: no binding pass gives the
 function to another driver, and acpid is refused every configuration write to it. A function devmgr
-does not take keeps an unbound record, as any other function does.
+does not take keeps an unbound record, as any other function does. devmgr marks the record of a PCI
+Express hotplug slot's port bound the same way once it manages the slot, since its poller writes the
+port's slot registers ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md)
+§ Grant).
 
 A record carries the device's resources, typed:
 

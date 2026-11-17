@@ -62,7 +62,8 @@ function: one no device record holds, or a removed one, reads all-ones without a
 absent function does. It allows a write only at offset 0x40 and above, past the header whose
 BARs, Command register and bus numbers devmgr programs, of a function whose record is unbound: no
 driver has been started for it, and devmgr has not taken it as a RISC-V IOMMU unit, whose memory
-decode and bus mastering it turned on for the IOMMU driver. Any other write is refused and
+decode and bus mastering it turned on for the IOMMU driver, or as the port of a hotplug slot it
+manages, whose Slot Control and Slot Status its poller writes. Any other write is refused and
 logged. The access runs on devmgr's control thread (§ Ordering), so no bind of the function
 interleaves with it.
 

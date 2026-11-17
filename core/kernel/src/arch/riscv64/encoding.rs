@@ -7,8 +7,9 @@
 //! window, page rounding, the timer's tick and microsecond conversions, the
 //! F/D/V opcode decode the lazy extended-state trap uses, the Zkr `seed` CSR's
 //! status decode and the word the hardware RNG builds from its samples, the
-//! `sstateen0` value and the check of its read back, the PTE permission bits and their test in the kernel's spurious-fault retry,
-//! and the user leaf's grant bits and the permission change they bound.
+//! `sstateen0` and `senvcfg` values and the check of their read back, the PTE
+//! permission bits and their test in the kernel's spurious-fault retry, and the
+//! user leaf's grant bits and the permission change they bound.
 //!
 //! Pure functions of their arguments with no dependency on the rest of the
 //! arch module.
@@ -209,7 +210,7 @@ pub(super) fn seed_word(
     Ok(word)
 }
 
-// ── The Ssstateen `sstateen0` CSR ─────────────────────────────────────────────
+// ── The U-mode state-enable CSRs (`sstateen0`, `senvcfg`) ───────────────────
 
 /// The value every hart writes to `sstateen0`: no state enabled for U-mode.
 ///
@@ -223,32 +224,47 @@ pub(super) fn seed_word(
 /// here. See docs/platform-requirements.md § riscv64 Classification.
 pub(super) const SSTATEEN0_USER_ENABLES: u64 = 0;
 
-/// Why the write of [`SSTATEEN0_USER_ENABLES`] to `sstateen0` did not take.
+/// The U-mode environment controls, as the `senvcfg` value: none granted.
+/// `CBZE`, `CBCFE` and `CBIE` clear make every U-mode cache-block operation
+/// (`cbo.zero`, `cbo.clean`, `cbo.flush`, `cbo.inval`) raise an
+/// illegal-instruction exception; `cbo.inval` would otherwise discard a
+/// block's dirty data and expose what memory held below it. `PMM` clear turns
+/// pointer masking off, `LPE` and `SSE` clear keep the landing-pad and
+/// shadow-stack enforcement and the `ssp` CSR from U-mode, and `FIOM` clear
+/// keeps fences on I/O and memory separate. A field whose extension the hart
+/// lacks is read-only zero, so the value is the same on every hart, and 0 is a
+/// legal value of every field.
+pub(super) const SENVCFG_USER_ENABLES: u64 = 0;
+
+/// Why the write of a U-mode state-enable CSR did not take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SstateenError
+pub(super) enum StateEnableError
 {
-    /// The write or the read back trapped: the hart has no Ssstateen, or its
-    /// M-mode firmware left `mstateen0.SE0` clear, which keeps `sstateen0`
-    /// from S-mode.
+    /// The write or the read back trapped: M-mode firmware keeps the CSR from
+    /// S-mode (`mstateen0.SE0` clear for `sstateen0`, `mstateen0.ENVCFG`
+    /// clear for `senvcfg`), or the hart lacks the CSR.
     Inaccessible,
     /// The CSR read back this value, not the one written.
     Kept(u64),
 }
 
-/// Judge the write of [`SSTATEEN0_USER_ENABLES`] to `sstateen0` by its read
-/// back: `None` when an access trapped, else the value the CSR held after the
-/// write.
+/// Judge the write of `written` to a U-mode state-enable CSR (`sstateen0` or
+/// `senvcfg`) by its read back: `None` when an access trapped, else the value
+/// the CSR held after the write.
 ///
 /// # Errors
-/// [`SstateenError::Inaccessible`] when an access trapped;
-/// [`SstateenError::Kept`] when the CSR holds another value.
-pub(super) fn check_sstateen0(read_back: Option<u64>) -> Result<(), SstateenError>
+/// [`StateEnableError::Inaccessible`] when an access trapped;
+/// [`StateEnableError::Kept`] when the CSR holds another value.
+pub(super) fn check_state_enable(
+    written: u64,
+    read_back: Option<u64>,
+) -> Result<(), StateEnableError>
 {
     match read_back
     {
-        None => Err(SstateenError::Inaccessible),
-        Some(value) if value == SSTATEEN0_USER_ENABLES => Ok(()),
-        Some(value) => Err(SstateenError::Kept(value)),
+        None => Err(StateEnableError::Inaccessible),
+        Some(value) if value == written => Ok(()),
+        Some(value) => Err(StateEnableError::Kept(value)),
     }
 }
 
@@ -740,20 +756,26 @@ mod tests
         assert_eq!(reads, 3);
     }
 
-    // ── The Ssstateen `sstateen0` CSR ──
+    // ── The U-mode state-enable CSRs ──
 
     #[test]
     fn an_sstateen0_that_reads_back_the_value_written_is_accepted()
     {
-        assert_eq!(check_sstateen0(Some(SSTATEEN0_USER_ENABLES)), Ok(()));
+        assert_eq!(
+            check_state_enable(SSTATEEN0_USER_ENABLES, Some(SSTATEEN0_USER_ENABLES)),
+            Ok(())
+        );
     }
 
     #[test]
     fn a_trapped_sstateen0_access_is_inaccessible()
     {
-        // The probe's fixup reports a trap as `None`; accepting it would let
+        // The access's fixup reports a trap as `None`; accepting it would let
         // U-mode keep whatever state enables the firmware left.
-        assert_eq!(check_sstateen0(None), Err(SstateenError::Inaccessible));
+        assert_eq!(
+            check_state_enable(SSTATEEN0_USER_ENABLES, None),
+            Err(StateEnableError::Inaccessible)
+        );
     }
 
     #[test]
@@ -762,8 +784,42 @@ mod tests
         // The `JVT` bit kept set: U-mode would reach `jvt`, which no switch saves.
         let jvt_kept = SSTATEEN0_USER_ENABLES | (1 << 2);
         assert_eq!(
-            check_sstateen0(Some(jvt_kept)),
-            Err(SstateenError::Kept(jvt_kept))
+            check_state_enable(SSTATEEN0_USER_ENABLES, Some(jvt_kept)),
+            Err(StateEnableError::Kept(jvt_kept))
+        );
+    }
+
+    #[test]
+    fn a_senvcfg_that_reads_back_the_value_written_is_accepted()
+    {
+        assert_eq!(
+            check_state_enable(SENVCFG_USER_ENABLES, Some(SENVCFG_USER_ENABLES)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_trapped_senvcfg_access_is_inaccessible()
+    {
+        // Firmware that grants `sstateen0` (`mstateen0.SE0`) but leaves
+        // `mstateen0.ENVCFG` clear traps the `senvcfg` write; the fixup
+        // reports it as `None`, and accepting it would let U-mode keep the
+        // environment enables the firmware or reset left.
+        assert_eq!(
+            check_state_enable(SENVCFG_USER_ENABLES, None),
+            Err(StateEnableError::Inaccessible)
+        );
+    }
+
+    #[test]
+    fn a_senvcfg_enable_left_set_is_reported_with_the_value_read()
+    {
+        // `CBIE` (bits 5:4) kept at 0b01: U-mode `cbo.inval` would flush, and
+        // at 0b11 discard dirty data.
+        let cbie_kept = SENVCFG_USER_ENABLES | (0b01 << 4);
+        assert_eq!(
+            check_state_enable(SENVCFG_USER_ENABLES, Some(cbie_kept)),
+            Err(StateEnableError::Kept(cbie_kept))
         );
     }
 }

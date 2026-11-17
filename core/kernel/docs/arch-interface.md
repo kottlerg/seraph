@@ -583,6 +583,11 @@ pub fn are_enabled() -> bool;
 /// (IDT on x86-64; `stvec` on RISC-V). `init_ap` does the per-AP equivalent.
 pub unsafe fn init();
 pub unsafe fn init_ap();
+/// Initialise the BSP's own interrupt-controller state that needs its per-CPU
+/// pointer, once, after `init` and `percpu::init_bsp`: RISC-V's BSP IMSIC file,
+/// whose first AIA CSR access recovers from a trap (`init_ap` does the same for
+/// each AP); nothing on x86-64.
+pub unsafe fn init_bsp_local();
 
 /// Acknowledge / mask / unmask an external interrupt line. On x86-64, `mask` and
 /// `unmask` take a GSI at the I/O APIC, and `acknowledge` writes the local-APIC
@@ -828,7 +833,9 @@ pub fn sync_instruction_fetch();
 /// with no state enabled and halts the boot, naming Ssstateen, when the access
 /// traps (no Ssstateen, or the firmware left `mstateen0.SE0` clear) or the value
 /// does not read back, then writes `senvcfg` whole with 0 (no U-mode cache-block
-/// operation, pointer masking, landing pads or shadow stack); x86-64 does
+/// operation, pointer masking, landing pads or shadow stack) and halts the boot,
+/// naming `senvcfg`, when that access traps (the firmware left
+/// `mstateen0.ENVCFG` clear) or the value does not read back; x86-64 does
 /// nothing, since the extended state ring 3 reaches is the XCR0 set the XSAVE
 /// switch saves.
 pub unsafe fn disable_unswitched_user_state();

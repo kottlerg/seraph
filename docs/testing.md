@@ -170,7 +170,7 @@ rootfs/config/svcmgr/
 │   ├── usertest.svc
 │   ├── crasher.svc           # restart-path fixture; co-staged with svctest
 │   ├── crasher-worker.svc    # worker-fault restart fixture; co-staged with svctest
-│   ├── crashd.svc            # crashd naming crashme for cores; co-staged with usertest
+│   ├── crashd.svc            # crashd naming crashme, holding 3 s; co-staged with usertest
 │   ├── debug-echo.svc        # debug-port fixture; staged by test-debug-port
 │   └── gdb-target.svc        # GDB stub's target; staged by test-gdb
 └── debug/                    # NOT loaded by svcmgr
@@ -208,9 +208,10 @@ The svctest recipe also stages the test class files of `sysroot/config/devmgr/te
 attaches and no production driver binds. svctest fails, naming the flag, when they are missing.
 
 The usertest recipe also stages crashd's test recipe, `tests/crashd.svc`, over the default one:
-the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death,
-which the fixture's tester checks ([Crash reports](#crash-reports-test-crash-report)). A usertest
-boot without it fails the crashme tester:
+the same service with `CORE_DUMP=crashme`, so crashd writes a core of each `crashme` death, and
+`CRASHD_OOM_STALL_MS=3000`, so crashd holds a fault declined for want of memory for up to 3 s,
+both of which the fixture's tester checks ([Crash reports](#crash-reports-test-crash-report)). A
+usertest boot without it fails the crashme tester:
 
 ```sh
 cargo xtask build
@@ -387,6 +388,12 @@ against the page runs it holds, the illegal instruction's bytes, and the `worker
 ([programs/crashme/README.md](../programs/crashme/README.md)). A core is checked in the boot, not
 in the log; `gdb` reading one is checked by hand
 ([services/crashd/docs/core-format.md](../services/crashd/docs/core-format.md) § Reading a Core).
+
+The usertest boot's crashd also holds a page fault memmgr declined for want of memory, for up to
+3000 ms ([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The crashme
+tester fills memory up to the system reserve and has the fixture write a page it has not touched:
+once the filler gives the memory back within the stall, and the write completes after the hold;
+once the filler keeps it past the stall, and the fixture dies of the fault with no core written.
 
 In CI the usertest cell keeps crashd and runs the first after its `run-parallel` boot; the svctest
 cell drops `crashd.svc` with `terminal.svc` and runs the second, while crasher's faults go

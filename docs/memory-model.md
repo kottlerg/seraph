@@ -376,9 +376,10 @@ thread's exception handler, which may hold it for a bounded time. The same fault
 restartable syscall's copy of a user buffer has the syscall as its caller: no exception
 handler sees it, and the syscall fails with `InvalidAddress`
 ([fault-handling.md § Kernel Copies](fault-handling.md#kernel-copies)). Policy beyond that
-is a userspace service holding only the capabilities its supervisor endows it. The hold and
-the policy service are design intent; not yet implemented
-([fault-handling.md § Crash Reports](fault-handling.md#crash-reports)).
+is a userspace service holding only the capabilities its supervisor endows it. The crash
+service holds such a fault when its recipe sets a stall
+([fault-handling.md § Crash Reports](fault-handling.md#crash-reports)); the policy service is
+design intent; not yet implemented.
 
 ---
 

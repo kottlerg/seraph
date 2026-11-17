@@ -460,7 +460,8 @@ A process dies when:
   registered, it receives the fault first, through the exception class procmgr binds, logs a
   report of the faulting process, and declines the fault, so the thread terminates with the same
   exit reason and the death flow below runs unchanged (see
-  [Fault Handling § Crash Reports](fault-handling.md#crash-reports)).
+  [Fault Handling § Crash Reports](fault-handling.md#crash-reports)). A page fault the pager
+  declined for want of memory it may hold first, and resume when memory is freed, with no death.
 
 Under the kill-process pattern and the `CSpace`/`AddressSpace` teardown, an object a concurrent
 syscall is still using is freed only once that syscall is done with it, and a stopped thread's

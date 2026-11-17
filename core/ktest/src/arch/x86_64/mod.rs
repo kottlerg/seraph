@@ -59,6 +59,38 @@ use init_protocol::InitInfo;
 
 use crate::TestContext;
 
+/// The core key of the CPU this thread runs on, as `integration::smt_siblings`
+/// expects the kernel to have recorded it: the x2APIC ID with the SMT level's
+/// bits shifted out, read from `CPUID` leaf 1FH where the CPU enumerates it,
+/// else leaf 0BH (Intel SDM Vol. 2A, `CPUID` leaves 0BH and 1FH), or `cpu`
+/// when the leaf enumerates no level. Restated here from the SDM rather than
+/// shared with the kernel's `cpu::smt_core_key`. `CPUID` runs in ring 3.
+pub fn core_key(cpu: u32) -> u32
+{
+    let cpuid = |leaf, subleaf| core::arch::x86_64::__cpuid_count(leaf, subleaf);
+    let leaf = if cpuid(0, 0).eax >= 0x1F && cpuid(0x1F, 0).ebx != 0
+    {
+        0x1F
+    }
+    else
+    {
+        0x0B
+    };
+    let first = cpuid(leaf, 0);
+    if first.ebx == 0
+    {
+        return cpu;
+    }
+    // The SMT level is type 1 (ECX[15:8]); the walk ends at a type-0 level,
+    // and leaf 1FH defines six types, so sixteen sub-leaves bound it.
+    let shift = (0..16)
+        .map(|subleaf| cpuid(leaf, subleaf))
+        .take_while(|level| (level.ecx >> 8) & 0xFF != 0)
+        .find(|level| (level.ecx >> 8) & 0xFF == 1)
+        .map_or(0, |smt| smt.eax & 0x1F);
+    first.edx.wrapping_shr(shift)
+}
+
 /// Whether the architecture has an I/O port space, so `IoPort` capabilities
 /// bind to threads (the kernel's `HAS_IO_PORTS`): arch-neutral cells that
 /// exercise a port binding run only where it is true.

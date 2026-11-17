@@ -421,6 +421,19 @@ pub fn current_cpu() -> u32
     }
 }
 
+// ── Core topology ─────────────────────────────────────────────────────────────
+
+/// The key of the core logical CPU `cpu` runs on: equal for exactly the CPUs
+/// that share one core. Each hart is taken as a core of its own, so the key is
+/// `cpu`: RISC-V has no instruction that reports harts sharing a core, the
+/// platform describes it only through the device tree's `cpu-map` or the ACPI
+/// PPTT, and the bootloader parses neither (core/kernel/docs/scheduler.md
+/// § SMT Awareness records the deferral and when it ends).
+pub fn core_key(cpu: u32) -> u32
+{
+    cpu
+}
+
 // ── Kernel trap stack ─────────────────────────────────────────────────────────
 
 /// Set the kernel stack pointer used when a trap fires from U-mode.

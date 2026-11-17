@@ -177,6 +177,7 @@ fn run_args(args: &TestLogLevelArgs, dir: &Path, data_image: Option<PathBuf>) ->
         runs: 1,
         timeout: args.timeout,
         cpus: args.cpus,
+        threads_per_core: 1,
         mem: args.mem,
         riscv_mmu: crate::qemu::RiscvMmu::Sv48,
         riscv_zkr: crate::qemu::RiscvZkr::On,

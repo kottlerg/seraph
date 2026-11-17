@@ -61,6 +61,7 @@ pub mod reply_binding_displaced;
 pub mod retype_over_mapped_refused;
 pub mod retype_reclaim;
 pub mod shared_memory_two_aspaces;
+pub mod smt_siblings;
 pub mod stop_read_regs_remote;
 pub mod thread_ext_regs;
 pub mod thread_lifecycle;
@@ -197,6 +198,7 @@ pub fn run_all(ctx: &TestContext)
         "integration::idle_pull_starved_ready",
         idle_pull_starved_ready::run(ctx)
     );
+    run_integration_test!("integration::smt_siblings", smt_siblings::run(ctx));
     run_integration_test!(
         "integration::shared_memory_two_aspaces",
         shared_memory_two_aspaces::run(ctx)

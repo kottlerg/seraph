@@ -160,6 +160,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         firmware_code_path: &code,
         firmware_vars_path: vars.as_deref(),
         cpus: CPUS,
+        threads_per_core: 1,
         mem_mib: MEM_MIB,
         display: QemuDisplay::Headless,
         gdb: GdbMode::Off,

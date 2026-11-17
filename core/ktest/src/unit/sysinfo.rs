@@ -10,11 +10,13 @@
 //! refusals; x86-64's `integration::speculation_controls` checks the words
 //! against each other on every CPU. `InstructionCacheSyncs` is read here for the boot's sync of
 //! ktest's own image; its rise across each runtime call site is checked by
-//! `integration::thread_memory` and `unit::retype`'s code stub.
+//! `integration::thread_memory` and `unit::retype`'s code stub. `SmtSibling` is
+//! read here for its range; `integration::smt_siblings` checks each ring against
+//! the core each CPU reports.
 
 use syscall::{
     MAP_WRITABLE, cap_create_cspace, cap_create_thread, cap_delete, cap_info, mem_map, mem_unmap,
-    memory_merge, memory_split, speculation_controls, system_info,
+    memory_merge, memory_split, smt_sibling, speculation_controls, system_info,
 };
 use syscall_abi::{
     CAP_INFO_MEMORY_AVAILABLE, CAP_INFO_MEMORY_SIZE, KERNEL_VERSION, PAGE_SIZE,
@@ -405,6 +407,31 @@ pub fn speculation_controls_views(_ctx: &TestContext) -> TestResult
         return Err(
             "system_info(SpeculationControls, unknown view) did not return InvalidArgument",
         );
+    }
+    Ok(())
+}
+
+/// `system_info(SmtSibling)` names a CPU below `CpuCount` for each CPU, and
+/// returns `InvalidArgument` for an index at or past it; that each ring is
+/// its core's CPUs is `integration::smt_siblings`'s.
+pub fn smt_sibling_range(_ctx: &TestContext) -> TestResult
+{
+    let cpus =
+        system_info(SystemInfoType::CpuCount as u64).map_err(|_| "system_info(CpuCount) failed")?;
+    for cpu in 0..cpus
+    {
+        let next = smt_sibling(cpu).map_err(|_| "system_info(SmtSibling) failed")?;
+        if next >= cpus
+        {
+            return Err("system_info(SmtSibling) returned an out-of-range CPU id");
+        }
+    }
+    for past in [cpus, u64::MAX]
+    {
+        if smt_sibling(past) != Err(SyscallError::InvalidArgument as i64)
+        {
+            return Err("system_info(SmtSibling, past CpuCount) did not return InvalidArgument");
+        }
     }
     Ok(())
 }

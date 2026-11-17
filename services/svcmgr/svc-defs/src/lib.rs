@@ -13,8 +13,10 @@
 //! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the windowed restart
 //! budget ([`RestartBudget`]), the death-observer correlator and the rule
-//! that routes a death post by it ([`death_tag`]), and the reading of a
-//! service's death from the caps svcmgr holds on it ([`death_caps`]). Nothing here touches a syscall, IPC, or
+//! that routes a death post by it ([`death_tag`]), the reading of a
+//! service's death from the caps svcmgr holds on it ([`death_caps`]), the
+//! eligibility rule of a stop ([`stop`]), and the create flags a recipe
+//! asks procmgr for ([`create_flags`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
 //! host-tested — the `.svc` and class files are external input and their
 //! parsers carry unit tests per
@@ -27,6 +29,7 @@ pub mod death_caps;
 pub mod death_tag;
 pub mod parse;
 pub mod restart_budget;
+pub mod stop;
 
 pub use death_tag::DeathTag;
 pub use restart_budget::RestartBudget;
@@ -59,6 +62,34 @@ pub fn cwd_rights(subtree_rights: Option<u32>) -> u32
 pub fn handover_permitted(badge: u64, handover_done: bool) -> bool
 {
     badge & ipc::svcmgr_labels::HANDOVER_AUTHORITY != 0 && !handover_done
+}
+
+/// The procmgr create flags svcmgr adds to a service's `CREATE_FROM_FILE`
+/// label, on its launch and on every restart:
+/// [`CREATE_RESERVE`](ipc::procmgr_labels::CREATE_RESERVE) for a recipe that
+/// sets `reserve = yes` ([`Definition::reserve`]), so the service's budget
+/// node is in the system reserve, which procmgr grants svcmgr since svcmgr's
+/// own node is a reserve node; and
+/// [`CREATE_NODE_HANDLE`](ipc::procmgr_labels::CREATE_NODE_HANDLE) for one
+/// that sets `oom_stop = yes` ([`Definition::oom_stop`]), whose usage svcmgr
+/// reads through the handle for `svcmgr_labels::LIST_STOPPABLE`.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "each argument is the recipe key that asks for one flag"
+)]
+pub const fn create_flags(reserve: bool, oom_stop: bool) -> u64
+{
+    let mut flags = 0;
+    if reserve
+    {
+        flags |= ipc::procmgr_labels::CREATE_RESERVE;
+    }
+    if oom_stop
+    {
+        flags |= ipc::procmgr_labels::CREATE_NODE_HANDLE;
+    }
+    flags
 }
 
 /// The byte length of the blob [`build_blob`] packs from `tokens`: each token
@@ -214,6 +245,11 @@ pub enum NamespaceShape
 /// either consumes the definition into a fixed-size `ServiceEntry`
 /// (for supervision) or hands it straight to svcmgr's launch path for
 /// one-shot spawn.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent `yes | no` recipe key: `critical`, `log_sink`, \
+              `debug_authority`, `oom_stop`, `stop_authority` and `reserve`"
+)]
 pub struct Definition
 {
     pub name: String,
@@ -282,6 +318,23 @@ pub struct Definition
     /// for every other service; [`shutdown_actuator`] picks one actuator from
     /// a scan.
     pub shutdown_actuator: Option<ProvidedName>,
+    /// `oom_stop = yes` lets svcmgr stop the service when a stop-authority
+    /// holder asks (`svcmgr_labels::STOP_SERVICE`), routing the death
+    /// through [`Definition::restart`]; svcmgr asks procmgr for a handle to
+    /// its budget node, through which it reads the usage
+    /// `svcmgr_labels::LIST_STOPPABLE` reports. The parser rejects it on a
+    /// recipe [`stop::stop_refusal`] would refuse: `critical = yes`,
+    /// `restart = never`, or a core role ([`stop::core_role`]).
+    pub oom_stop: bool,
+    /// `stop_authority = yes` endows the service with svcmgr's stop
+    /// authority: svcmgr mints a `STOP_AUTHORITY`-badged SEND on its own
+    /// service endpoint and delivers it in the bootstrap slot after the
+    /// `seed` caps and the debug-authority cap. Exclusive of `log_sink`.
+    pub stop_authority: bool,
+    /// `reserve = yes` creates the service in the system reserve
+    /// (`procmgr_labels::CREATE_RESERVE`, [`create_flags`]), on its launch
+    /// and on every restart, so it may take the pages memmgr keeps in reserve.
+    pub reserve: bool,
     /// Priority level the service's initial thread is created at
     /// (`priority = ...`, range `1..=30`). `None` = unspecified: procmgr
     /// applies its default (`sched_policy::DEFAULT_SPAWN_PRIORITY` clamped
@@ -467,6 +520,25 @@ mod tests
             ipc::svcmgr_labels::PUBLISH_AUTHORITY,
             false
         ));
+    }
+
+    #[test]
+    fn each_recipe_key_asks_for_its_own_create_flag()
+    {
+        use ipc::procmgr_labels::{CREATE_NODE_HANDLE, CREATE_RESERVE};
+        assert_eq!(create_flags(false, false), 0);
+        assert_eq!(create_flags(true, false), CREATE_RESERVE);
+        assert_eq!(create_flags(false, true), CREATE_NODE_HANDLE);
+        assert_eq!(
+            create_flags(true, true),
+            CREATE_RESERVE | CREATE_NODE_HANDLE
+        );
+        // Never a flag procmgr refuses from svcmgr: the charge-node flag, with
+        // which procmgr refuses CREATE_RESERVE.
+        assert_eq!(
+            create_flags(true, true) & ipc::procmgr_labels::CREATE_CHARGE_NODE,
+            0
+        );
     }
 
     #[test]

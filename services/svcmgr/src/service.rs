@@ -76,6 +76,18 @@ pub struct ServiceEntry
     pub restart_budget: RestartBudget,
     /// Whether this service is currently active.
     pub active: bool,
+    /// Whether svcmgr launched the service from its recipe, as against
+    /// binding one init started (memmgr, procmgr, devmgr, vfsd). Only a
+    /// service svcmgr launched may be stopped
+    /// (`svcmgr_defs::stop::StopFacts::launched`).
+    pub launched: bool,
+    /// The node handle of the current instance's memmgr budget node, which
+    /// svcmgr asks procmgr for when the recipe sets `oom_stop = yes`
+    /// (`procmgr_labels::CREATE_NODE_HANDLE`) and reads the instance's usage
+    /// through for `svcmgr_labels::LIST_STOPPABLE`; memmgr refuses it once the
+    /// instance is gone. Released with the instance on restart. Zero for every
+    /// other service.
+    pub node_handle: u64,
     /// Per-child badge used on the svcmgr bootstrap endpoint for restart
     /// bootstrap (`cap_derive_badge(svcmgr_bootstrap_ep, SEND, badge)`).
     pub bootstrap_badge: u64,
@@ -125,6 +137,8 @@ impl ServiceEntry
             restart_count: 0,
             restart_budget: RestartBudget::new(),
             active: false,
+            launched: false,
+            node_handle: 0,
             bootstrap_badge: 0,
             process_handle: 0,
             // Fail-safe default: an empty slot has no installed
@@ -152,6 +166,11 @@ impl ServiceEntry
 /// flag, and scheduling fields it got on first launch. Held in a table on
 /// `SvcmgrState` index-aligned with `services[]` via the death correlator
 /// (which is the table index).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one independent `yes | no` recipe key: `log_sink`, \
+              `debug_authority`, `oom_stop`, `stop_authority` and `reserve`"
+)]
 pub struct RestartRecipe
 {
     pub argv: Vec<String>,
@@ -166,6 +185,18 @@ pub struct RestartRecipe
     /// `DEBUG_AUTHORITY` cap rides the slot after its seeds on every launch.
     /// See `restart::mint_debug_authority`.
     pub debug_authority: bool,
+    /// The `oom_stop = yes` service: each instance is created with a node
+    /// handle (`svcmgr_defs::create_flags`), and a stop-authority holder may
+    /// stop it (`svcmgr_defs::stop`).
+    pub oom_stop: bool,
+    /// The `stop_authority = yes` service: a freshly minted
+    /// `STOP_AUTHORITY` SEND on svcmgr's service endpoint rides the slot after
+    /// its seeds and debug-authority cap on every launch. See
+    /// `restart::mint_stop_authority`.
+    pub stop_authority: bool,
+    /// The `reserve = yes` service: each instance is created in the system
+    /// reserve (`svcmgr_defs::create_flags`).
+    pub reserve: bool,
     /// Recipe `priority = ...` value; `0` = unspecified (procmgr default).
     /// Replayed on every restart so a respawned child lands at the same
     /// level it got on first launch.

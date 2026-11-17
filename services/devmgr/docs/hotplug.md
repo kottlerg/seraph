@@ -91,10 +91,10 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 | Slot | Slot Status | Action |
 |---|---|---|
 | empty | Presence Detect State set | power up, then post the add job; the slot is occupied, or failed when the link does not come up |
-| occupied | presence lost, or the link lost | post the removal job; the slot is removing |
+| occupied | presence lost or changed, or the link lost | post the removal job; the slot is removing |
 | occupied | Attention Button Pressed | blink the power indicator; the slot is pressed, for the abort window |
 | pressed | Attention Button Pressed again | the power indicator on; the removal is cancelled, and the slot is occupied |
-| pressed | presence lost, or the link lost | post the removal job; the slot is removing |
+| pressed | presence lost or changed, or the link lost | post the removal job; the slot is removing |
 | pressed | the abort window ended | post the removal job; the slot is removing |
 | removing | Attention Button Pressed, or Presence Detect Changed, with a card present | nothing until the removal job completes; the slot is powered up after it (§ Removal) |
 | removing | anything else | nothing, until the removal job completes (§ Removal) |
@@ -172,14 +172,15 @@ route).
 
 ### Removal
 
-A removal is a slot's card leaving: pulled (presence or the link lost), or asked for with the
-attention button, whose press blinks the power indicator for the abort window; a second press
-within it cancels the removal, and the indicator is on again. The poller posts the slot's
-removal job, logged `removing its functions` with the cause, and holds the slot removing until
-the job completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then
-is acted on only after the completion. The slot keeps whether a card was inserted or the button
-pressed while it was removing, so that card is powered up after the completion without a further
-press, on a slot with no attention button as on one with it.
+A removal is a slot's card leaving: pulled (presence lost or changed, so a card pulled and inserted,
+or swapped, within one poll is removed and then added again, or the link lost), or asked for with
+the attention button, whose press blinks the power indicator for the abort window; a second press
+within it cancels the removal, and the indicator is on again. The poller posts the slot's removal
+job, logged `removing its functions` with the cause, and holds the slot removing until the job
+completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then is acted on
+only after the completion. The slot keeps whether a card was inserted or the button pressed while it
+was removing, so that card is powered up after the completion without a further press, on a slot
+with no attention button as on one with it.
 
 The control thread runs the removal job (`firmware::hotplug::remove`), in this order:
 

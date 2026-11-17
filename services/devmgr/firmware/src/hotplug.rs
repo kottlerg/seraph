@@ -861,14 +861,19 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
     }
     let present = status & SLOTSTA_PRESENT != 0;
     let pressed = status & SLOTSTA_BUTTON != 0;
-    let gone = !present || link_down;
+    // A presence change on a powered slot is its card leaving, whether or not
+    // a card reads present again: one pulled and inserted, or swapped, within
+    // a poll is removed and then, asked for by the change, added again.
+    let gone = !present || link_down || status & SLOTSTA_PRESENCE_CHANGED != 0;
     match state
     {
         SlotState::Empty if present => (SlotState::Empty, Action::PowerUp),
-        SlotState::Occupied | SlotState::Pressed { .. } if gone =>
-        {
-            (SlotState::Removing { asked: false }, Action::Remove)
-        }
+        SlotState::Occupied | SlotState::Pressed { .. } if gone => (
+            SlotState::Removing {
+                asked: asks(status),
+            },
+            Action::Remove,
+        ),
         SlotState::Occupied if pressed => (
             SlotState::Pressed {
                 polls_left: ABORT_POLLS,
@@ -898,6 +903,28 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
         {
             (state, Action::None)
         }
+    }
+}
+
+/// Why [`next`] posted the removal of a slot it held in `state` on reading
+/// `status` and `link_down`, as devmgr logs it.
+#[must_use]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`link_down` is the one link reading the poller makes beside Slot Status"
+)]
+pub const fn removal_cause(state: SlotState, status: u16, link_down: bool) -> &'static str
+{
+    if matches!(state, SlotState::Pressed { .. })
+        && status & SLOTSTA_PRESENT != 0
+        && status & SLOTSTA_PRESENCE_CHANGED == 0
+        && !link_down
+    {
+        "its attention button's abort window elapsed"
+    }
+    else
+    {
+        "card removed or replaced, or its link lost"
     }
 }
 
@@ -2153,15 +2180,28 @@ mod tests
         assert_eq!(state, SlotState::Pressed { polls_left: 1 });
         let removing = SlotState::Removing { asked: false };
         assert_eq!(next(state, present, false), (removing, Action::Remove));
+        assert_eq!(
+            removal_cause(state, present, false),
+            "its attention button's abort window elapsed"
+        );
         // A second press within the window cancels the removal.
         assert_eq!(
             next(full, pressed, false),
             (SlotState::Occupied, Action::Cancel)
         );
         // Surprise: the card leaves, or its link goes down, occupied or in
-        // the window.
+        // the window; a card that reads present with its presence changed was
+        // replaced within the poll, and is asked for after the removal.
         for from in [SlotState::Occupied, full]
         {
+            assert_eq!(
+                next(from, present | SLOTSTA_PRESENCE_CHANGED, false),
+                (SlotState::Removing { asked: true }, Action::Remove)
+            );
+            assert_eq!(
+                removal_cause(from, present | SLOTSTA_PRESENCE_CHANGED, false),
+                "card removed or replaced, or its link lost"
+            );
             assert_eq!(
                 next(from, SLOTSTA_PRESENCE_CHANGED, false),
                 (removing, Action::Remove)
@@ -2549,6 +2589,14 @@ mod tests
         assert_eq!(m.poll(), Action::PowerUp);
         m.control();
         assert_eq!((m.live, m.withdrawn, m.state), (1, 1, SlotState::Occupied));
+        // A card swapped within one poll is removed, then added.
+        m.slot.status |= SLOTSTA_PRESENT | SLOTSTA_PRESENCE_CHANGED;
+        assert_eq!(m.poll(), Action::Remove);
+        assert_eq!(m.state, SlotState::Removing { asked: true });
+        m.control();
+        assert_eq!(m.poll(), Action::PowerUp);
+        m.control();
+        assert_eq!((m.live, m.withdrawn, m.state), (1, 2, SlotState::Occupied));
         // A card inserted between the last poll and the power-off is kept the
         // same way.
         m.slot.pull();
@@ -2558,7 +2606,7 @@ mod tests
         m.slot.status |= SLOTSTA_PRESENT | SLOTSTA_PRESENCE_CHANGED;
         assert_eq!(m.poll(), Action::PowerUp);
         m.control();
-        assert_eq!((m.live, m.withdrawn), (1, 2));
+        assert_eq!((m.live, m.withdrawn), (1, 3));
         // Pulled while off: empty.
         let mut off = Model::new(Unplug::Never);
         off.state = SlotState::Off;

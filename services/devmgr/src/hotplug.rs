@@ -579,21 +579,13 @@ fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<Job>, job_note: u6
             }
             Action::Remove =>
             {
-                let why = if current != SlotState::Occupied && hp::present(status) && !link_down
-                {
-                    "its attention button's abort window elapsed"
-                }
-                else
-                {
-                    "card removed or its link lost"
-                };
                 std::os::seraph::log!(
                     "hotplug: slot {}:{}:{}.{}: removing its functions ({})",
                     seg,
                     b,
                     d,
                     f,
-                    why
+                    hp::removal_cause(current, status, link_down)
                 );
                 post(Job::Removed(slot.index));
                 state

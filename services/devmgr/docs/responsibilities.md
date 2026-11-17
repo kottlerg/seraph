@@ -45,7 +45,9 @@ devmgr's responsibilities are:
   the devices of the platform description table whose `oem_table_id` equals
   the XSDT's OEM table ID (§ Platform Description Tables there). devmgr merges
   the records by resource identity and delivers each driver the record's
-  resource list: each `Mmio` carved from the apertures, each `IoPort` from its
+  resource list: each `Mmio` carved as
+  [docs/driver-binding.md](../../../docs/driver-binding.md#binding) § Binding
+  step 1 says, each `IoPort` from its
   port capability, and the wired line carved exclusive, shared with no other
   device (the serial driver acknowledges a delivery only when its client reads
   ([services/drivers/serial/README.md](../../drivers/serial/README.md#interrupts)

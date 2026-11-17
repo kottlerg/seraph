@@ -823,11 +823,15 @@ pub(crate) fn release_caps(caps: &[u64])
 ///   § `REGISTER_DEATH_EQ`).
 /// * `caps[0]` = `EventQueue` cap with POST right.
 ///
-/// Reply: `procmgr_errors::SUCCESS` once stored, `UNAUTHORIZED` if the
-/// caller lacks the authority badge or a death EQ is already
-/// registered, `INVALID_ARGUMENT` if no cap (or a zero cap) arrives.
-/// Every refused request has its transferred caps deleted, and so do caps
-/// past `caps[0]`.
+/// Reply: `procmgr_errors::SUCCESS` once stored, in place of the queue a
+/// previous registration stored, whose cap is deleted
+/// (`process::install_logd_death_eq`); `UNAUTHORIZED` if the caller lacks
+/// the authority badge; `INVALID_ARGUMENT` if no cap (or a zero cap)
+/// arrives. Every refused request has its transferred caps deleted, and so do
+/// caps past `caps[0]`.
+///
+/// It writes no log line: the registering logd waits on this reply before its
+/// receive workers take the log endpoint.
 fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
 {
     let caps = req.caps();
@@ -849,21 +853,14 @@ fn handle_register_death_eq(req: &IpcMessage, ipc_buf: *mut u64)
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     }
-    // install_logd_death_eq is first-wins: it stores the cap, or returns
-    // false if a previous registration already filled the slot. Every
-    // teardown after it reads the same atomic to forward the death.
-    if process::install_logd_death_eq(logd_eq)
+    // Every teardown from here on forwards its death to the new queue. The
+    // replaced cap, the previous logd instance's, is no longer posted to.
+    let replaced = process::install_logd_death_eq(logd_eq);
+    if replaced != 0
     {
-        reply_empty(ipc_buf, procmgr_errors::SUCCESS);
+        let _ = syscall::cap_delete(replaced);
     }
-    else
-    {
-        // Slot already filled (legitimate logd is registered).
-        // Drop the just-transferred cap so it doesn't leak in
-        // procmgr's CSpace; reject the caller.
-        let _ = syscall::cap_delete(logd_eq);
-        reply_empty(ipc_buf, procmgr_errors::UNAUTHORIZED);
-    }
+    reply_empty(ipc_buf, procmgr_errors::SUCCESS);
 }
 
 /// Dispatch the debug-authority labels, `REGISTER_CRASH_SERVICE`,
@@ -2005,8 +2002,8 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx, source: 
     {
         Ok(result) =>
         {
-            log_spawn_sched(checked.sched);
             arm_and_reply_create(label, &result, ipc_buf, ctx);
+            log_spawn(&result, checked.sched);
         }
         Err(code) =>
         {
@@ -2151,11 +2148,22 @@ fn create_child(
     result
 }
 
-/// One line per successful spawn recording the resolved scheduling
-/// placement, so the boot log evidences every process's level and band
-/// (there is no priority-readback syscall to query after the fact).
-fn log_spawn_sched(sched: process::ChildSched)
+/// Log a created child's image bias and its scheduling placement, after the
+/// create's reply: the creator then goes on while a line waits on logd, which
+/// matters when the child is logd's next instance, created while no logd
+/// receives, whose creator, svcmgr, would otherwise wait out the line's bound
+/// (`LOG_CALL_TIMEOUT_MS`) before it can start it. The bias line is the one a
+/// debugger reads the image's placement from
+/// (`docs/userspace-memory-model.md` § Image Placement); no `ProcessInfo`
+/// field carries the bias, and an `ET_EXEC` image, at bias 0, has none. The
+/// scheduling line evidences every process's level and band in the boot log,
+/// since no syscall reads a priority back.
+fn log_spawn(result: &process::CreateResult, sched: process::ChildSched)
 {
+    if result.image_bias != 0
+    {
+        std::os::seraph::log!("spawn image bias=0x{:x}", result.image_bias);
+    }
     std::os::seraph::log!(
         debug: "spawn priority={} band=[1,{}]",
         sched.priority,

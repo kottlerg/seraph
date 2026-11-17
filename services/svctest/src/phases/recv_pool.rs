@@ -417,7 +417,7 @@ fn logd_concurrent_phase(caps: &Caps)
     let mut records = None;
     for badge in own_live_badges(caps.logd_query)
     {
-        let found: Vec<Vec<u8>> = logd_history(caps.logd_query, badge)
+        let found: Vec<Vec<u8>> = logd_history(caps.logd_query, Some(badge))
             .into_iter()
             .filter(|(kind, bytes)| {
                 *kind == ENTRY_RECORD

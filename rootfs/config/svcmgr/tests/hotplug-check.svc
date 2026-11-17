@@ -1,0 +1,16 @@
+# /tests/hotplug-check — the PCI Express hotplug add path's fixture.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# `cargo xtask test-hotplug` stages it into /config/svcmgr/services/, with
+# /config/devmgr/tests/test-dma.class into /config/devmgr/classes/, for its
+# boots, which attach a pcie-root-port the host hot-adds an edu device
+# behind. See services/hotplug-check/README.md.
+#
+# seed = devmgr.class.test-dma is the test-dma class SEND it waits on and
+# queries. It invokes no shutdown: the host test kills QEMU.
+binary    = /tests/hotplug-check
+argv      = hotplug-check
+restart   = never
+critical  = no
+namespace = none
+seed      = devmgr.class.test-dma

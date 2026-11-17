@@ -340,6 +340,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     iommu,
                     debug_port,
                     test_devices,
+                    hotplug_port: None,
                 };
                 let qemu_args = build_qemu_argv(&spec)?;
 

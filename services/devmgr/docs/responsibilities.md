@@ -116,7 +116,7 @@ devmgr's responsibilities are:
   holds, and the
   drivers-directory pass at `SET_DRIVERS_DIR`, over the declarations of the
   `/services/drivers/` entries (below). Each pass gathers the declarations
-  that match a device no driver is bound to, walks the unbound devices in PCI
+  that match an unbound device, walks the unbound devices in PCI
   segment, bus, device, function order, and binds each to its most specific
   match: an exact vendor and device key outranks a class key, two equally
   specific matches are a conflict that devmgr logs and binds neither of, and a

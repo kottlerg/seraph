@@ -12,10 +12,12 @@
 //! devmgr holds, in the boot settle batch; and the drivers-directory pass,
 //! over the declarations of the `/services/drivers/` entries, once svcmgr
 //! hands devmgr that directory. Each pass collects the declarations that
-//! match a record no driver is bound to ([`crate::decls`]) into a
+//! match an unbound record ([`crate::decls`]) into a
 //! [`MatchTable`], walks the records in record order, and binds each to the
 //! declaration the table chooses ([`bind_pci`]). A record is bound at most
-//! once a boot: once a driver was started for it.
+//! once a boot: once a driver was started for it, or, for a RISC-V IOMMU's
+//! function, once devmgr took it as a unit for the IOMMU driver
+//! ([`crate::iommu`]).
 //!
 //! No step names a driver. What a bound driver is given follows from its
 //! declaration (its interrupt need, whether it performs DMA, its reset, its
@@ -316,7 +318,7 @@ fn collect(
     }
 }
 
-/// Bind each record no driver is bound to, in record order, to the
+/// Bind each unbound record, in record order, to the
 /// declaration `table` chooses for it.
 fn bind_records(
     records: &mut Records,

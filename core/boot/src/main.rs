@@ -150,7 +150,7 @@ const MEM_MAP_ATTEMPTS: usize = 3;
 /// Covers kernel segments, all fixed allocations, and the framebuffer.
 ///
 /// Provably sufficient: `collect_identity_regions` pushes a fixed set of at
-/// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 10` = 26 regions.
+/// most `MAX_LOAD_SEGMENTS + INIT_MAX_SEGMENTS + 11` = 27 regions.
 const MAX_IDENTITY_REGIONS: usize = 64;
 
 /// Most entries step 9 records in `BootInfo.reclaim_ranges`: the `BootInfo`,
@@ -461,7 +461,7 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     let (allocs, mut page_table, mut uefi_map) = unsafe {
         steps6_and_7_sized_to_the_map(
             &ctx,
-            &bundle_load,
+            &module_regions(&bundle_load, &mods),
             &kernel,
             &init,
             &cpus,
@@ -1379,13 +1379,13 @@ unsafe fn knob_present(ctx: &UefiContext, path: &[u16], name: &'static str) -> b
 /// come from their respective `step3`/`step4*` outputs.
 #[expect(
     clippy::too_many_arguments,
-    reason = "step 6 sizes its allocations from every earlier step's output (the bundle, kernel \
-              and init loads, the CPU topology, the firmware tables for the seed counts), plus the \
+    reason = "step 6 sizes its allocations from every earlier step's output (the boot modules' \
+              regions, the kernel and init loads, the CPU topology, the firmware tables for the seed counts), plus the \
               retry's slack"
 )]
 unsafe fn step6_allocate_and_build_page_tables(
     ctx: &UefiContext,
-    bundle: &BundleLoad,
+    module_regions: &[(u64, u64); 2],
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
@@ -1496,7 +1496,7 @@ unsafe fn step6_allocate_and_build_page_tables(
         [(0u64, 0u64); MAX_IDENTITY_REGIONS];
     let region_count = collect_identity_regions(
         &allocs,
-        bundle,
+        module_regions,
         kernel,
         init,
         &ctx.framebuffer,
@@ -1534,12 +1534,12 @@ fn handoff_stack_span(alloc_phys: u64) -> (u64, u64)
 /// Fill `out` with all physical regions that must be identity-mapped so the
 /// kernel can access them before establishing its own page tables. Returns
 /// the number of filled entries; silently caps at [`MAX_IDENTITY_REGIONS`].
-/// Module bodies lie inside the bundle mapping, so modules need no region of
-/// their own. The handoff stack's region starts at `allocs.stack_phys`, above
-/// its guard page, which no region covers.
+/// The boot modules' bodies are the two `module_regions` ([`module_regions`]).
+/// The handoff stack's region starts at `allocs.stack_phys`, above its guard
+/// page, which no region covers.
 fn collect_identity_regions(
     allocs: &BootAllocations,
-    bundle: &BundleLoad,
+    module_regions: &[(u64, u64); 2],
     kernel: &KernelLoad,
     init: &InitLoad,
     framebuffer: &FramebufferInfo,
@@ -1580,9 +1580,13 @@ fn collect_identity_regions(
     {
         push(seg.phys_addr, seg.size);
     }
-    // Bundle blob: one allocation covers every module body and the init
-    // ELF source bytes. Map once.
-    push(bundle.phys, (bundle.pages as u64).saturating_mul(4096));
+    // Boot modules: the bundle blob, one allocation that covers every bundle
+    // module body and the init ELF source bytes, and the trust-store module's
+    // pages outside it.
+    for &(phys, size) in module_regions
+    {
+        push(phys, size);
+    }
     // Framebuffer (if present).
     if framebuffer.physical_base != 0
     {
@@ -1599,6 +1603,22 @@ fn collect_identity_regions(
         push(uart_base, 4096);
     }
     n
+}
+
+/// The identity-map regions of every boot module's body
+/// (abi/boot-protocol/README.md: every `BootInfo` reference is mapped at
+/// kernel entry): the bundle allocation, which holds every bundle module, and
+/// the trust-store module's own pages.
+fn module_regions(bundle: &BundleLoad, mods: &ModulesLoad) -> [(u64, u64); 2]
+{
+    [
+        (bundle.phys, pages_to_bytes(bundle.pages)),
+        (
+            mods.trust_store.physical_base,
+            // A size too large to round up saturates, which the page builder refuses.
+            mods.trust_store.size.saturating_add(4095) & !4095,
+        ),
+    ]
 }
 
 /// Bytes in `pages` 4 KiB pages; a count too large to size saturates, which the
@@ -1758,7 +1778,7 @@ fn map_buffer_fits(buffer_bytes: usize, pages: usize) -> bool
 /// `ExitBootServices` may allocate.
 unsafe fn steps6_and_7_sized_to_the_map(
     ctx: &UefiContext,
-    bundle: &BundleLoad,
+    module_regions: &[(u64, u64); 2],
     kernel: &KernelLoad,
     init: &InitLoad,
     cpus: &CpuTopology,
@@ -1793,7 +1813,7 @@ unsafe fn steps6_and_7_sized_to_the_map(
         let (allocs, page_table) = unsafe {
             step6_allocate_and_build_page_tables(
                 ctx,
-                bundle,
+                module_regions,
                 kernel,
                 init,
                 cpus,
@@ -2480,12 +2500,13 @@ unsafe fn step10_handoff(
 mod tests
 {
     use super::{
-        BootAllocations, BootEntropy, BootError, ElfKind, HANDOFF_STACK_ALLOC_PAGES,
-        KERNEL_STACK_PAGES, KaslrOverride, MEM_MAP_ATTEMPTS, MapRedo, ReclaimRange,
-        allocation_regions, aperture_array_capacity, attempt_stands, bundle_body,
-        choose_kaslr_layout, entry_array_pages, framebuffer_aperture, handoff_stack_span,
-        knob_redoes, map_buffer_fits, memory_map, push_reclaim_range, scrub, step6_and_7_spans,
-        uefi, verify_bundle,
+        BOOT_MODULE_NAME_LEN, BootAllocations, BootEntropy, BootError, BootModule, BundleLoad,
+        ElfKind, HANDOFF_STACK_ALLOC_PAGES, KERNEL_STACK_PAGES, KaslrOverride, MAX_BUNDLE_MODULES,
+        MEM_MAP_ATTEMPTS, MapRedo, ModulesLoad, ReclaimRange, allocation_regions,
+        aperture_array_capacity, attempt_stands, bundle_body, choose_kaslr_layout,
+        entry_array_pages, framebuffer_aperture, handoff_stack_span, knob_redoes, map_buffer_fits,
+        memory_map, module_regions, push_reclaim_range, scrub, step6_and_7_spans, uefi,
+        verify_bundle,
     };
     use crate::signing::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of};
     use boot_protocol::{
@@ -2529,6 +2550,37 @@ mod tests
         let bytes = bundle_of(entries);
         let header = bundle::parse_header(&bytes).unwrap();
         verify_bundle(&bytes, header.entry_count, &store).map(<[u8]>::to_vec)
+    }
+
+    // Defect caught: a boot module body outside the bundle allocation (the
+    // trust-store module) left out of the identity map, which must cover every
+    // `BootInfo` reference at kernel entry.
+    #[test]
+    fn every_boot_module_body_is_an_identity_region()
+    {
+        let bundle = BundleLoad {
+            phys: 0x10_0000,
+            pages: 3,
+            len: 3 * 4096 - 5,
+        };
+        let module = BootModule {
+            name: [0; BOOT_MODULE_NAME_LEN],
+            physical_base: 0,
+            size: 0,
+        };
+        let mods = ModulesLoad {
+            modules: [module; MAX_BUNDLE_MODULES],
+            count: 0,
+            trust_store: BootModule {
+                physical_base: 0x40_0000,
+                size: 4096 + 300,
+                ..module
+            },
+        };
+        assert_eq!(
+            module_regions(&bundle, &mods),
+            [(0x10_0000, 3 * 4096), (0x40_0000, 2 * 4096)]
+        );
     }
 
     // Defect caught: a bundle entry parsed or exposed without passing the

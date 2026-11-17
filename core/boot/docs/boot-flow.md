@@ -122,8 +122,8 @@ Last, the bootloader copies the trust store into a page allocation of its own, t
 after it zeroed, and describes it as the boot module `trust-store` (`TRUST_STORE_MODULE`),
 which step 9 lists after the bundle's modules (docs/signing.md § Trust Store).
 
-Only the whole bundle allocation is identity-mapped; module bodies are
-slices of it (see step 6).
+Step 6 identity-maps the whole bundle allocation, of which the bundle's module bodies are
+slices, and the `trust-store` module's own pages.
 
 Detail: [elf-loading.md](elf-loading.md)
 

@@ -45,8 +45,9 @@ pub struct BudgetNode
     pub own: u64,
     /// Pages charged to this node and to every node below it.
     pub subtree: u64,
-    /// Process records and child nodes that point at this node. Each holds an
-    /// arena slot, and a [`NodeIdx`] is a `u64`, so the count cannot pass
+    /// Process records, child nodes and the node's handle state
+    /// ([`crate::NodeHandle`]) that point at this node. Each holds an arena
+    /// slot, and a [`NodeIdx`] is a `u64`, so the count cannot pass
     /// `u64::MAX`.
     pub refs: u64,
     /// [`FLAG_RESERVE`].
@@ -141,7 +142,8 @@ pub fn node<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> Option<BudgetNode>
         | Node::ChunkDir(_)
         | Node::Chunk(_)
         | Node::Caps(_)
-        | Node::Commit(_) => None,
+        | Node::Commit(_)
+        | Node::Handle(_) => None,
     }
 }
 
@@ -164,8 +166,8 @@ pub fn headroom<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx) -> u64
     left
 }
 
-/// Make a node for `spec`, with one reference (the record that will point at
-/// it), counted as a reference of its parent. A max is clamped to the
+/// Make a node for `spec`, with one reference (the record or handle state
+/// that will point at it), counted as a reference of its parent. A max is clamped to the
 /// parent chain's [`headroom`]; [`NO_MAX`] stays unbounded, limited by the
 /// chain at each charge.
 ///
@@ -340,6 +342,31 @@ pub fn unref<S: SlotStore>(arena: &mut Arena<S>, idx: NodeIdx)
         arena.set_node(idx, Node::Budget(b));
         release_unused(arena, idx);
     }
+}
+
+/// The max the node `idx` takes when `max` is asked of it while it lives:
+/// `max` clamped to its subtree's usage plus what its parent chain has left
+/// ([`headroom`] of the parent), so a node grows only into room its
+/// ancestors still have, as [`create`] clamps a new node's; [`NO_MAX`] stays
+/// unbounded, limited by the chain at each charge. A max below the usage is
+/// kept: it reclaims nothing ([`set_max`]).
+#[must_use]
+pub fn clamp_max<S: SlotStore>(arena: &Arena<S>, idx: NodeIdx, max: u64) -> u64
+{
+    match node(arena, idx)
+    {
+        Some(b) if max != NO_MAX => max.min(b.subtree.saturating_add(headroom(arena, b.parent))),
+        Some(_) | None => max,
+    }
+}
+
+/// Whether the node `b` is at its limit: its subtree holds its max or more,
+/// or a charge of `refused` pages it was just asked for would take the
+/// subtree over the max. A node with no max never is.
+#[must_use]
+pub const fn at_limit(b: &BudgetNode, refused: u64) -> bool
+{
+    b.max != NO_MAX && (b.subtree >= b.max || b.subtree.saturating_add(refused) > b.max)
 }
 
 /// Set the max of the node `idx`. A max below the subtree's usage reclaims

@@ -301,9 +301,10 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 /// Register a new child with memmgr as `budget` says
 /// (`memmgr_labels::REGISTER_PROCESS`: its class and reserve membership in
 /// the flags, its budget node's parent in `data[2]`, and its max in
-/// `data[3]` with `REGISTER_MAX`). On success returns the registration: the
-/// SEND cap slot, the child's memmgr badge, and the max the node took after
-/// memmgr's clamp. On any failure (memmgr unwired, IPC error, a refused
+/// `data[3]` with `REGISTER_MAX`, and `REGISTER_NODE_HANDLE` for a creator that
+/// asked for the child's node handle). On success returns the registration:
+/// the SEND cap slot, the child's memmgr badge, the max the node took after
+/// memmgr's clamp, and the node handle when asked for. On any failure (memmgr unwired, IPC error, a refused
 /// parent, OOM) returns [`process::MemmgrRegistration::NONE`].
 ///
 /// The cap slot lands in procmgr's `CSpace`; procmgr both:
@@ -348,10 +349,26 @@ pub fn register_with_memmgr(
         std::os::seraph::log!(warn: "memmgr refused the child's registration ({})", reply.label);
         return process::MemmgrRegistration::NONE;
     }
+    // With `REGISTER_NODE_HANDLE` the node handle is the second cap; a cap
+    // past what was asked for is deleted.
+    let node_handle = reply.caps().get(1).copied().unwrap_or(0);
+    let node_handle = if budget.node_handle
+    {
+        node_handle
+    }
+    else
+    {
+        if node_handle != 0
+        {
+            let _ = syscall::cap_delete(node_handle);
+        }
+        0
+    };
     process::MemmgrRegistration {
         cap: reply.caps().first().copied().unwrap_or(0),
         badge: reply.word(0),
         max: reply.word(1),
+        node_handle,
     }
 }
 
@@ -1713,6 +1730,10 @@ fn refuse_unarmed_create(
     }
     let _ = syscall::cap_delete(result.thread_for_caller);
     let _ = syscall::cap_delete(result.process_handle);
+    if result.node_handle != 0
+    {
+        let _ = syscall::cap_delete(result.node_handle);
+    }
     let _ = process::destroy_process(
         result.badge,
         ctx.memmgr_ep,
@@ -1779,6 +1800,10 @@ fn reply_create_result(
     {
         msg = msg.cap(token);
     }
+    if result.node_handle != 0
+    {
+        msg = msg.cap(result.node_handle);
+    }
     let msg = msg.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&msg, ipc_buf) }.is_err()
@@ -1789,6 +1814,10 @@ fn reply_create_result(
         if let Some(token) = release_token
         {
             let _ = syscall::cap_delete(token);
+        }
+        if result.node_handle != 0
+        {
+            let _ = syscall::cap_delete(result.node_handle);
         }
         // No handle to this child survives, so nothing can query its exit.
         let _ = process::destroy_process(
@@ -1814,7 +1843,8 @@ fn reply_create_result(
 ///   bit  30       = `CREATE_PHYS_ACCESS` (a phys-class child)
 ///   bit  31       = `CREATE_MEMORY_MAX` (a memory max follows in a data word)
 ///   bit  32       = `CREATE_RESERVE` (a system-reserve child)
-///   bits [33..64] = reserved (must be zero)
+///   bit  33       = `CREATE_NODE_HANDLE` (reply the child's node handle)
+///   bits [34..64] = reserved (must be zero)
 ///
 /// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
 /// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`;
@@ -1915,7 +1945,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
         self_memmgr_ep: ctx.memmgr_ep,
     };
 
-    let result = process::create_process(
+    let mut result = process::create_process(
         module_cap,
         ctx.self_aspace,
         ctx.memmgr_ep,
@@ -1938,14 +1968,7 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     // PROCESS_DIED and deletes the slot; create_process has already
     // released the child's kernel objects, so memmgr reclaims pages no
     // kernel object still uses.
-    if result.is_ok()
-    {
-        let _ = mms.disarm();
-    }
-    else
-    {
-        drop(mms);
-    }
+    mms.settle(&mut result);
 
     // Module cap disposition: the module cap is a borrowed derivation of the
     // caller's module-source memory cap. The loader has copied the ELF contents

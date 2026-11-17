@@ -956,6 +956,9 @@ pub struct ChildBudget
     /// The max in pages the creator asked for (`REGISTER_MAX`, `data[3]`);
     /// `None` for no max.
     pub max: Option<u64>,
+    /// The creator asked for the child's node handle
+    /// (`procmgr_labels::CREATE_NODE_HANDLE`, `REGISTER_NODE_HANDLE`).
+    pub node_handle: bool,
 }
 
 impl ChildBudget
@@ -964,7 +967,9 @@ impl ChildBudget
     #[must_use]
     pub fn register_flags(&self) -> u64
     {
-        use ipc::memmgr_labels::{REGISTER_MAX, REGISTER_PHYS_CLASS, REGISTER_RESERVE};
+        use ipc::memmgr_labels::{
+            REGISTER_MAX, REGISTER_NODE_HANDLE, REGISTER_PHYS_CLASS, REGISTER_RESERVE,
+        };
         let mut flags = 0;
         if self.phys
         {
@@ -977,6 +982,10 @@ impl ChildBudget
         if self.max.is_some()
         {
             flags |= REGISTER_MAX;
+        }
+        if self.node_handle
+        {
+            flags |= REGISTER_NODE_HANDLE;
         }
         flags
     }
@@ -1015,7 +1024,7 @@ pub fn child_budget(
     creator: &Creator,
 ) -> Result<ChildBudget, BudgetRefusal>
 {
-    use ipc::procmgr_labels::{CREATE_PHYS_ACCESS, CREATE_RESERVE};
+    use ipc::procmgr_labels::{CREATE_NODE_HANDLE, CREATE_PHYS_ACCESS, CREATE_RESERVE};
     let phys = label & CREATE_PHYS_ACCESS != 0;
     if phys && !creator.phys_class()
     {
@@ -1031,6 +1040,7 @@ pub fn child_budget(
         reserve: asks_reserve || creator.unbadged,
         parent: creator.memmgr_badge,
         max,
+        node_handle: label & CREATE_NODE_HANDLE != 0,
     })
 }
 
@@ -2556,6 +2566,7 @@ mod tests
                     reserve: true,
                     parent: 0,
                     max: None,
+                    node_handle: false,
                 })
             );
         }
@@ -2585,19 +2596,29 @@ mod tests
                 reserve: false,
                 parent: 0x52,
                 max: Some(9),
+                node_handle: false,
             })
+        );
+        // Any creator may ask for its child's node handle.
+        assert_eq!(
+            child_budget(ipc::procmgr_labels::CREATE_NODE_HANDLE, None, &client)
+                .map(|b| b.node_handle),
+            Ok(true)
         );
     }
 
     #[test]
-    fn register_flags_name_the_class_the_reserve_and_the_max()
+    fn register_flags_name_the_class_the_reserve_the_max_and_the_handle()
     {
-        use ipc::memmgr_labels::{REGISTER_MAX, REGISTER_PHYS_CLASS, REGISTER_RESERVE};
+        use ipc::memmgr_labels::{
+            REGISTER_MAX, REGISTER_NODE_HANDLE, REGISTER_PHYS_CLASS, REGISTER_RESERVE,
+        };
         let budget = ChildBudget {
             phys: false,
             reserve: false,
             parent: 0,
             max: None,
+            node_handle: false,
         };
         assert_eq!(budget.register_flags(), 0);
         let full = ChildBudget {
@@ -2605,10 +2626,11 @@ mod tests
             reserve: true,
             parent: 7,
             max: Some(0),
+            node_handle: true,
         };
         assert_eq!(
             full.register_flags(),
-            REGISTER_PHYS_CLASS | REGISTER_RESERVE | REGISTER_MAX
+            REGISTER_PHYS_CLASS | REGISTER_RESERVE | REGISTER_MAX | REGISTER_NODE_HANDLE
         );
     }
 

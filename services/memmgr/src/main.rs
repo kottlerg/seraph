@@ -21,10 +21,10 @@
 use free_pool::{
     ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Fit, FrameDesc,
     FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
-    NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError, ResizeError,
-    SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState, chunk::table_height,
-    chunk_count, chunk_for, commit::grow_need, commit::regrow_need, fault_window, pressure_level,
-    region_grants, reserve_pages,
+    NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
+    ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
+    chunk::table_height, chunk_count, chunk_for, commit::grow_need, commit::regrow_need,
+    fault_window, pressure_level, region_grants, reserve_pages,
 };
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels};
 use process_abi::{PROCESS_ABI_VERSION, ProcessInfo, StartupInfo, process_info_ref};
@@ -410,14 +410,27 @@ fn select_pooled(l: &mut MemLedger, want: u32, fit: Fit) -> Result<Grant, u64>
 fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<(), ChargeError>
 {
     let reserve = reserve_pages(pool_total_pages());
-    l.admit(rec, pages, pending, reserve).or_else(|e| {
+    let r = l.admit(rec, pages, pending, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
             return Err(e);
         }
         coalesce(l);
         l.admit(rec, pages, pending, reserve)
-    })
+    });
+    note_admission(
+        l,
+        rec,
+        if r.is_ok()
+        {
+            0
+        }
+        else
+        {
+            pages.saturating_add(pending)
+        },
+    );
+    r
 }
 
 /// Admit the commitment `need` of a committed region of `rec`, or of its
@@ -429,14 +442,16 @@ fn admit(l: &mut MemLedger, rec: NodeIdx, pages: u64, pending: u64) -> Result<()
 fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(), ChargeError>
 {
     let reserve = reserve_pages(pool_total_pages());
-    l.admit_commit(rec, need, reserve).or_else(|e| {
+    let r = l.admit_commit(rec, need, reserve).or_else(|e| {
         if recheck_deferred(l) == 0
         {
             return Err(e);
         }
         coalesce(l);
         l.admit_commit(rec, need, reserve)
-    })
+    });
+    note_admission(l, rec, if r.is_ok() { 0 } else { need.charged() });
+    r
 }
 
 /// The most pages, up to `want`, that may be charged to the budget node of
@@ -447,13 +462,71 @@ fn admit_commit(l: &mut MemLedger, rec: NodeIdx, need: CommitNeed) -> Result<(),
 fn admissible(l: &mut MemLedger, rec: NodeIdx, want: u64) -> Result<u64, ChargeError>
 {
     let reserve = reserve_pages(pool_total_pages());
-    let first = l.admissible(rec, want, reserve);
-    if first == Ok(want) || recheck_deferred(l) == 0
+    let mut r = l.admissible(rec, want, reserve);
+    if r != Ok(want) && recheck_deferred(l) != 0
     {
-        return first;
+        coalesce(l);
+        r = l.admissible(rec, want, reserve);
     }
-    coalesce(l);
-    l.admissible(rec, want, reserve)
+    note_admission(l, rec, want.saturating_sub(r.unwrap_or(0)));
+    r
+}
+
+/// The budget node whose chain the limit events of this turn are checked
+/// on, and the most pages a charge to it was refused this turn
+/// ([`signal_limits`]); `None` while the turn has admitted nothing.
+static mut LIMIT_CHECK: Option<(NodeIdx, u64)> = None;
+
+/// Note an admission for the budget node of `rec`, of which `refused`
+/// pages were refused (`0` for an admission that passed), so the turn's
+/// end checks its chain for limit events. A refusal for want of free RAM
+/// rather than of a max signals no node: each node is checked against its
+/// own max ([`free_pool::budget::at_limit`]).
+fn note_admission(l: &MemLedger, rec: NodeIdx, refused: u64)
+{
+    let Some(node) = l.record(rec).map(|r| r.budget)
+    else
+    {
+        return;
+    };
+    note_limit_check(node, refused);
+}
+
+/// Mark the chain of the budget node `node` for this turn's limit check, with
+/// `refused` pages refused at it.
+fn note_limit_check(node: NodeIdx, refused: u64)
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    let prior = unsafe { LIMIT_CHECK };
+    let refused = match prior
+    {
+        Some((n, r)) if n == node => r.max(refused),
+        _ => refused,
+    };
+    // SAFETY: as above.
+    unsafe { LIMIT_CHECK = Some((node, refused)) };
+}
+
+/// Send the limit event of each node on the chain this turn marked
+/// ([`note_limit_check`]) that is at its max or whose max refused the
+/// turn's charge, to its registered Notification
+/// (services/memmgr/docs/memory-pool.md § Distribution policy). Run after every
+/// request, so a charge that brings a subtree to its max, a refused charge,
+/// and a max set at or below the usage each signal once. A send never
+/// blocks; one that fails (a cap the holder revoked) is dropped.
+fn signal_limits()
+{
+    // SAFETY: memmgr is single-threaded; no concurrent access.
+    let Some((node, refused)) = (unsafe { LIMIT_CHECK })
+    else
+    {
+        return;
+    };
+    // SAFETY: as above.
+    unsafe { LIMIT_CHECK = None };
+    ledger_mut().for_each_limit(node, refused, |cap, bits| {
+        let _ = syscall::notification_send(cap, bits);
+    });
 }
 
 // ── Deferred reclamation ─────────────────────────────────────────────────────
@@ -890,25 +963,45 @@ fn insert_run(l: &mut MemLedger, run: FreeRun)
     }
 }
 
-/// Mint a fresh memmgr-minted process-identity badge: 63 random bits from the
-/// kernel entropy pool, with `PHYS_CLASS_BADGE_BIT` as `class_bit` gives it
-/// (set for a phys-class process, clear for every other), redrawn off the reserved values a live
+/// Mint a fresh memmgr-minted process-identity badge: the 58 bits outside
+/// `ipc::VERB_BIT_MASK` drawn from the kernel entropy pool, the other verb
+/// bits clear (so no process badge is a node handle,
+/// `memmgr_labels::NODE_HANDLE_TAG`) but `PHYS_CLASS_BADGE_BIT` as
+/// `class_bit` gives it (set for a phys-class process, clear for every
+/// other), redrawn off every key in use and the reserved values a live
 /// record must never alias — the well-known reserved records
 /// `MEMMGR_SELF_BADGE` / `INIT_SELF_BADGE` — and off `0`, which no badged cap
 /// carries. Random rather than monotonic so the process-registration count it
 /// would otherwise leak across the `REGISTER_PROCESS` boundary stays
 /// unguessable. Returns `None` if the entropy draw fails (a kernel-contract
 /// violation). The `u64` width is the kernel badge word `cap_derive_badge`
-/// stamps, so 63 bits per class never run out; a draw that aliases a live
+/// stamps, so 58 bits per class never run out; a draw that aliases a live
 /// badge is redrawn.
 fn mint_process_badge(l: &MemLedger, class_bit: u64) -> Option<u64>
 {
     loop
     {
-        let b = (syscall::random_u64().ok()? & !PHYS_CLASS_BADGE_BIT) | class_bit;
-        if b != 0 && b != MEMMGR_SELF_BADGE && b != INIT_SELF_BADGE && l.find(b).is_none()
+        let b = (syscall::random_u64().ok()? & !ipc::VERB_BIT_MASK) | class_bit;
+        if b != 0 && b != MEMMGR_SELF_BADGE && b != INIT_SELF_BADGE && !l.key_in_use(b)
         {
             return Some(b);
+        }
+    }
+}
+
+/// Draw the badge of a new node handle: [`memmgr_labels::NODE_HANDLE_TAG`]
+/// and random bits outside `VERB_BIT_MASK`, redrawn until no record or handle
+/// state is keyed by it. Random, as a process badge is, so a key reveals
+/// nothing of how many nodes exist. `None` if the entropy draw fails.
+fn mint_node_key(l: &MemLedger) -> Option<u64>
+{
+    loop
+    {
+        let k =
+            (syscall::random_u64().ok()? & !ipc::VERB_BIT_MASK) | memmgr_labels::NODE_HANDLE_TAG;
+        if !l.key_in_use(k)
+        {
+            return Some(k);
         }
     }
 }
@@ -1077,11 +1170,12 @@ fn bootstrap_from_init(
     let _ = unsafe { syscall::mem_unmap(self_aspace_cap, phys_table_va, 1) };
     let _ = syscall::cap_delete(phys_table_cap);
 
-    // procmgr is not phys-class: a badge carrying the class bit would keep
-    // `RIGHTS_MEM_PHYS` on procmgr's own grants (`grant_rights`), so init
-    // mints it clear (`memmgr_labels::PHYS_CLASS_BADGE_BIT`) and memmgr
-    // refuses the bootstrap otherwise.
-    if round.data[2] & PHYS_CLASS_BADGE_BIT != 0
+    // procmgr's badge is a process badge and carries no verb bit: the class
+    // bit would keep `RIGHTS_MEM_PHYS` on procmgr's own grants
+    // (`grant_rights`), and the node-handle tag would make it a node handle
+    // the procmgr-only labels are refused on, so init mints it clear of
+    // `VERB_BIT_MASK` and memmgr refuses the bootstrap otherwise.
+    if round.data[2] & ipc::VERB_BIT_MASK != 0
     {
         return None;
     }
@@ -1397,7 +1491,8 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
     let flags = req.word(1);
     let known = memmgr_labels::REGISTER_PHYS_CLASS
         | memmgr_labels::REGISTER_RESERVE
-        | memmgr_labels::REGISTER_MAX;
+        | memmgr_labels::REGISTER_MAX
+        | memmgr_labels::REGISTER_NODE_HANDLE;
     if flags & !known != 0
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -1444,11 +1539,13 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
         return;
     };
 
-    // The record, its caps and its budget node are arena nodes and the index
-    // grows with them, so the table refuses for want of room only when the
-    // arena cannot grow: system RAM is exhausted.
+    // The record, its caps, its budget node and, with `REGISTER_NODE_HANDLE`,
+    // the node's handle state are arena nodes and the index grows with them,
+    // so the table refuses for want of room only when the arena cannot grow:
+    // system RAM is exhausted.
+    let want_handle = flags & memmgr_labels::REGISTER_NODE_HANDLE != 0;
     ensure_index(l);
-    if !ensure_slots(l, 3)
+    if !ensure_slots(l, if want_handle { 4 } else { 3 })
     {
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
@@ -1470,30 +1567,92 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
     // The max the node took, after the clamp to its parent chain's headroom.
     let max = l.budget(rec).map_or(NO_MAX, |b| b.max);
 
+    reply_registration(l, rec, new_badge, max, flags, service_ep, ipc_buf);
+}
+
+/// Reply a registration of the record `rec`: its badge, its node's `max`,
+/// the SEND badged with it and, with `REGISTER_NODE_HANDLE` in `flags`, a
+/// node handle to its node (services/memmgr/docs/ipc-interface.md § Label 3). A cap that cannot
+/// be derived, or a reply that does not reach procmgr, removes the record.
+fn reply_registration(
+    l: &mut MemLedger,
+    rec: NodeIdx,
+    new_badge: u64,
+    max: u64,
+    flags: u64,
+    service_ep: u64,
+    ipc_buf: *mut u64,
+)
+{
     let Ok(send_cap) =
         syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, new_badge)
     else
     {
-        let _ = l.remove_process(new_badge, quiescent);
+        let _ = l.remove_process(new_badge, quiescent, delete_cap);
         reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
         return;
     };
+    // The node's handle, owned by the new record, so it goes with it.
+    let handle_cap = if flags & memmgr_labels::REGISTER_NODE_HANDLE != 0
+    {
+        let Some(cap) = record_handle(l, rec, service_ep)
+        else
+        {
+            let _ = syscall::cap_delete(send_cap);
+            let _ = l.remove_process(new_badge, quiescent, delete_cap);
+            reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
+            return;
+        };
+        Some(cap)
+    }
+    else
+    {
+        None
+    };
 
-    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+    let mut reply = IpcMessage::builder(memmgr_errors::SUCCESS)
         .word(0, new_badge)
         .word(1, max)
-        .cap(send_cap)
-        .build();
+        .cap(send_cap);
+    if let Some(cap) = handle_cap
+    {
+        reply = reply.cap(cap);
+    }
+    let reply = reply.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
     {
         // The reply did not reach procmgr (it is gone, or its CSpace could not
-        // take the cap), so the cap was not moved and no process will ever
-        // carry this badge: drop both, or the cap stays in memmgr's CSpace and
-        // the record holds a node no `PROCESS_DIED` will free.
+        // take the caps), so no cap was moved and no process will ever carry
+        // this badge: drop them all, or a cap stays in memmgr's CSpace and the
+        // record holds a node no `PROCESS_DIED` will free.
         let _ = syscall::cap_delete(send_cap);
-        let _ = l.remove_process(new_badge, quiescent);
+        if let Some(cap) = handle_cap
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        let _ = l.remove_process(new_badge, quiescent, delete_cap);
     }
+}
+
+/// Delete one cap memmgr holds, ignoring a stale handle: the release callback
+/// of [`free_pool::Ledger::remove_process`], which hands it each limit
+/// Notification of the handle states it drops.
+fn delete_cap(cap: u64)
+{
+    let _ = syscall::cap_delete(cap);
+}
+
+/// Give the budget node of the record `rec` handle state and derive a node
+/// handle to it on `service_ep` (services/memmgr/docs/ipc-interface.md § Node
+/// Handles). `None`, with nothing left behind but the state, which goes with
+/// the record, when the key draw, the arena or the derivation fails.
+fn record_handle(l: &mut MemLedger, rec: NodeIdx, service_ep: u64) -> Option<u64>
+{
+    let key = mint_node_key(l)?;
+    let h = l.attach_record_handle(rec, key).ok()?;
+    let key = l.handle(h)?.key;
+    syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, key).ok()
 }
 
 fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
@@ -1536,7 +1695,10 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
     // deleted before the reclaim, so the frame the Notification was retyped
     // from passes the quiescence check instead of waiting on the deferred
     // list. Its handle carries the slot's generation, so a cap the client
-    // revoked meanwhile is refused rather than freeing a reused slot.
+    // revoked meanwhile is refused rather than freeing a reused slot. The
+    // limit Notification of each node handle state the process owns goes the
+    // same way: `remove_process` drops those states, and hands `delete_cap`
+    // each limit cap, before it reclaims a frame.
     let l = ledger_mut();
     if let Some(rec) = l.find(dead_badge)
     {
@@ -1547,7 +1709,9 @@ fn handle_process_died(req: &IpcMessage, ipc_buf: *mut u64, procmgr_badge: u64)
         }
     }
     let rechecked = recheck_deferred(l);
-    if l.remove_process(dead_badge, quiescent).is_some() || rechecked != 0
+    if l.remove_process(dead_badge, quiescent, delete_cap)
+        .is_some()
+        || rechecked != 0
     {
         // Restore contiguity across all reclaimed runs in one pass, so every
         // spawn-and-die cycle does not leave the pool more fragmented than it
@@ -2708,12 +2872,8 @@ fn handle_register_pressure(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
     let bits = req.word(0);
     let l = ledger_mut();
     let rec = l.find(req.badge);
-    let notify = syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok_and(|packed| {
-        packed >> 32 == u64::from(syscall::CAP_TAG_NOTIFICATION)
-            && packed & syscall::RIGHTS_NTF_NOTIFY != 0
-    });
     let Some(prior) = rec
-        .filter(|_| notify && bits != 0)
+        .filter(|_| bits != 0 && is_notify_cap(cap))
         .and_then(|rec| l.set_pressure(rec, cap, bits))
     else
     {
@@ -2726,6 +2886,218 @@ fn handle_register_pressure(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
         let _ = syscall::cap_delete(prior);
     }
     reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
+// ── Node handles ─────────────────────────────────────────────────────────────
+
+/// The handle state a node handle's badge names. `None` for a key no state
+/// carries any more (released, or its owner gone): every handle to it is
+/// refused from then on.
+fn handle_of(l: &MemLedger, badge: u64) -> Option<(NodeIdx, NodeHandle)>
+{
+    let h = l.find_handle(badge)?;
+    Some((h, l.handle(h)?))
+}
+
+/// `NODE_SET_MAX`: set the max of the handle's node to `data[0]`, clamped to
+/// its usage plus its parent chain's headroom, and reply the max it took
+/// (services/memmgr/docs/ipc-interface.md § Label 14). Lowering it reclaims
+/// and kills nothing; a max at or below the usage signals the node's limit
+/// event ([`signal_limits`]).
+fn handle_node_set_max(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let l = ledger_mut();
+    let Some((_, s)) = handle_of(l, req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let Some(max) = l.set_node_max(s.node, req.word(0))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    note_limit_check(s.node, 0);
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, max)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `NODE_CREATE` on a node handle and `CREATE_SUB_NODE` on a process badge:
+/// make a sub-node, with the max `data[0]` clamped to the parent chain's
+/// headroom, under the handle's node or the caller's own, and reply its max
+/// and a handle to it (services/memmgr/docs/ipc-interface.md § Label 15,
+/// § Label 19). The sub-node's handle state is owned by the owner of the
+/// handle's state, or by the caller, and goes when that process does or on
+/// `NODE_RELEASE`. A reply that does not reach the caller releases it.
+fn handle_create_sub_node(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64)
+{
+    let l = ledger_mut();
+    let (owner, parent) = if req.label & 0xFFFF == memmgr_labels::NODE_CREATE
+    {
+        match handle_of(l, req.badge)
+        {
+            Some((_, s)) => (l.find(s.owner), s.node),
+            None => (None, NODE_NULL),
+        }
+    }
+    else
+    {
+        let rec = l.find(req.badge);
+        (
+            rec,
+            rec.and_then(|r| l.record(r))
+                .map_or(NODE_NULL, |r| r.budget),
+        )
+    };
+    let Some(owner) = owner
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let Some(key) = mint_node_key(l)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    };
+    ensure_index(l);
+    if !ensure_slots(l, 2)
+    {
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    }
+    let h = match l.create_sub_node(owner, parent, req.word(0), key)
+    {
+        Ok(h) => h,
+        Err(NodeError::Parent) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+            return;
+        }
+        Err(NodeError::NoSlot) =>
+        {
+            reply_label(ipc_buf, memmgr_errors::QUOTA);
+            return;
+        }
+    };
+    let max = l
+        .handle(h)
+        .and_then(|s| free_pool::budget::node(&l.arena, s.node))
+        .map_or(NO_MAX, |b| b.max);
+    let Ok(cap) = syscall::cap_derive_badge(service_ep, syscall::RIGHTS_EP_SEND_GRANT, key)
+    else
+    {
+        let _ = l.drop_handle(h);
+        reply_label(ipc_buf, memmgr_errors::QUOTA);
+        return;
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, max)
+        .cap(cap)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if unsafe { ipc::ipc_reply(&reply, ipc_buf) }.is_err()
+    {
+        // No handle reached the caller, so nothing can name the node: drop it.
+        let _ = syscall::cap_delete(cap);
+        let _ = l.drop_handle(h);
+    }
+}
+
+/// `NODE_QUERY_USAGE`: reply the own pages, max and subtree pages of the
+/// handle's node (services/memmgr/docs/ipc-interface.md § Label 16).
+fn handle_node_query_usage(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let l = ledger_mut();
+    let Some(node) =
+        handle_of(l, req.badge).and_then(|(_, s)| free_pool::budget::node(&l.arena, s.node))
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let reply = IpcMessage::builder(memmgr_errors::SUCCESS)
+        .word(0, node.own)
+        .word(1, node.max)
+        .word(2, node.subtree)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// `NODE_REGISTER_LIMIT`: register `caps[0]`, a Notification with Notify,
+/// to receive the bits `data[0]` on the limit event of the handle's node,
+/// replacing the earlier registration, whose cap is deleted
+/// (services/memmgr/docs/ipc-interface.md § Label 17). A refused cap is
+/// deleted.
+fn handle_node_register_limit(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
+{
+    let Some(&cap) = caps.first()
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let bits = req.word(0);
+    let l = ledger_mut();
+    let Some(prior) = handle_of(l, req.badge)
+        .filter(|_| bits != 0 && is_notify_cap(cap))
+        .and_then(|(h, _)| l.set_limit(h, cap, bits))
+    else
+    {
+        let _ = syscall::cap_delete(cap);
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    if prior != 0
+    {
+        let _ = syscall::cap_delete(prior);
+    }
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
+/// `NODE_RELEASE`: drop the handle state of a sub-node, so every handle to it
+/// is refused from then on, and delete its limit cap
+/// (services/memmgr/docs/ipc-interface.md § Label 18). Refused for a
+/// process's own node, whose state goes with the process.
+fn handle_node_release(req: &IpcMessage, ipc_buf: *mut u64)
+{
+    let l = ledger_mut();
+    let Some((h, s)) = handle_of(l, req.badge)
+    else
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    };
+    let process_node = l
+        .find(s.owner)
+        .and_then(|rec| l.record(rec))
+        .is_some_and(|r| r.budget == s.node);
+    if process_node
+    {
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
+    }
+    if let Some(cap) = l.drop_handle(h).filter(|&cap| cap != 0)
+    {
+        let _ = syscall::cap_delete(cap);
+    }
+    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+}
+
+/// Whether `cap` is a Notification cap with Notify rights.
+fn is_notify_cap(cap: u64) -> bool
+{
+    syscall::cap_info(cap, syscall::CAP_INFO_TAG_RIGHTS).is_ok_and(|packed| {
+        packed >> 32 == u64::from(syscall::CAP_TAG_NOTIFICATION)
+            && packed & syscall::RIGHTS_NTF_NOTIFY != 0
+    })
 }
 
 // ── Reply helpers ────────────────────────────────────────────────────────────
@@ -2913,14 +3285,17 @@ fn delete_caps(caps: &[u64])
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
 /// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first for
-/// `DELEGATE_ASPACE` and `REGISTER_PRESSURE`, none for any other label.
+/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE` and `NODE_REGISTER_LIMIT`, none for
+/// any other label.
 /// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
     match opcode
     {
         memmgr_labels::DONATE_MEMORY_CAPS => attached,
-        memmgr_labels::DELEGATE_ASPACE | memmgr_labels::REGISTER_PRESSURE => attached.min(1),
+        memmgr_labels::DELEGATE_ASPACE
+        | memmgr_labels::REGISTER_PRESSURE
+        | memmgr_labels::NODE_REGISTER_LIMIT => attached.min(1),
         _ => 0,
     }
 }
@@ -2948,6 +3323,16 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
     let opcode = req.label & 0xFFFF;
     let (kept, stray) = attached.split_at(contract_cap_count(opcode, attached.len()));
     delete_caps(stray);
+    // A node handle is served the node labels and nothing else, and every
+    // other badge everything else (services/memmgr/docs/ipc-interface.md
+    // § Node Handles).
+    let node_label = (memmgr_labels::NODE_SET_MAX..=memmgr_labels::NODE_RELEASE).contains(&opcode);
+    if node_label != (req.badge & memmgr_labels::NODE_HANDLE_TAG != 0)
+    {
+        delete_caps(kept);
+        reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
+        return;
+    }
     match opcode
     {
         memmgr_labels::REQUEST_MEMORY_CAPS =>
@@ -3001,6 +3386,26 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         memmgr_labels::SHRINK_REGION =>
         {
             handle_shrink_region(req, ipc_buf);
+        }
+        memmgr_labels::NODE_SET_MAX =>
+        {
+            handle_node_set_max(req, ipc_buf);
+        }
+        memmgr_labels::NODE_CREATE | memmgr_labels::CREATE_SUB_NODE =>
+        {
+            handle_create_sub_node(req, ipc_buf, boot.service_ep);
+        }
+        memmgr_labels::NODE_QUERY_USAGE =>
+        {
+            handle_node_query_usage(req, ipc_buf);
+        }
+        memmgr_labels::NODE_REGISTER_LIMIT =>
+        {
+            handle_node_register_limit(req, kept, ipc_buf);
+        }
+        memmgr_labels::NODE_RELEASE =>
+        {
+            handle_node_release(req, ipc_buf);
         }
         _ =>
         {
@@ -3077,5 +3482,6 @@ fn main(startup: &StartupInfo) -> !
         guard.on_success();
         begin_turn();
         dispatch(&req, ipc_buf, &boot);
+        signal_limits();
     }
 }

@@ -87,6 +87,36 @@ pub struct ProcessCaps
     pub pressure: u64,
     /// The bits a change of pressure level sends on [`ProcessCaps::pressure`].
     pub pressure_bits: u64,
+    /// The first [`Node::Handle`] slot the process owns, chained through
+    /// [`NodeHandle::owned_next`]; [`NODE_NULL`] for none. Each goes with the
+    /// record ([`crate::Ledger::remove_process`]).
+    pub handles: NodeIdx,
+}
+
+/// The handle state of one budget node: the badge its node handles carry,
+/// the node it names, the process that owns it, and the limit-event
+/// registration. A slot of its own, named by the budget node's slot `next`
+/// link and chained in its [`crate::ProcessIndex`] bucket by its own; it
+/// holds one reference on its node, so a node with handle state is freed only
+/// once that state is dropped ([`crate::Ledger::drop_handle`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeHandle
+{
+    /// The badge every handle to the node carries, the key the index finds
+    /// the state by.
+    pub key: u64,
+    /// The [`BudgetNode`] slot the handles name.
+    pub node: NodeIdx,
+    /// The badge of the process whose record owns the state: the process of
+    /// the node itself, or for a sub-node the owner of the node it was made
+    /// under. The state goes when that record does.
+    pub owner: u64,
+    /// The Notification cap a limit event is sent on, or `0` for none.
+    pub limit: u64,
+    /// The bits a limit event sends on [`NodeHandle::limit`].
+    pub limit_bits: u64,
+    /// The next handle slot of the owner's list ([`ProcessCaps::handles`]).
+    pub owned_next: NodeIdx,
 }
 
 /// A run taken back from a process and parked on the
@@ -136,6 +166,7 @@ pub struct Commitment
 // a [`ProcessRecord`].
 const _: () = assert!(size_of::<RegionNode>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,6 +183,8 @@ pub enum Node
     Caps(ProcessCaps),
     /// The commitment of the committed region whose node names this slot.
     Commit(Commitment),
+    /// The handle state of the budget node whose slot names this slot.
+    Handle(NodeHandle),
     /// A directory node of a chunk table: its children, [`NODE_NULL`] where
     /// no chunk below the child has an entry.
     ChunkDir([NodeIdx; DIR_FANOUT]),
@@ -491,6 +524,7 @@ mod tests
         assert!(size_of::<FrameDesc>() <= size_of::<ProcessRecord>());
         assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
         assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
         assert_eq!(SLOT_SIZE, 64);
         assert_eq!(SLOTS_PER_PAGE, 64);
     }

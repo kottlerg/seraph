@@ -827,8 +827,10 @@ pub fn sync_instruction_fetch();
 /// in `kernel_entry_ap` after `interrupts::init_ap`. RISC-V writes `sstateen0`
 /// with no state enabled and halts the boot, naming Ssstateen, when the access
 /// traps (no Ssstateen, or the firmware left `mstateen0.SE0` clear) or the value
-/// does not read back; x86-64 does nothing, since the extended state ring 3
-/// reaches is the XCR0 set the XSAVE switch saves.
+/// does not read back, then writes `senvcfg` whole with 0 (no U-mode cache-block
+/// operation, pointer masking, landing pads or shadow stack); x86-64 does
+/// nothing, since the extended state ring 3 reaches is the XCR0 set the XSAVE
+/// switch saves.
 pub unsafe fn disable_unswitched_user_state();
 
 /// Install the current CPU's per-CPU data block at `addr`. Call once per CPU

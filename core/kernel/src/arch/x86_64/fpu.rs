@@ -7,8 +7,9 @@
 //!
 //! Concentrates the unsafe surface for FPU/SIMD state management:
 //! CR0.TS (lazy-trap discipline gate), XSETBV/XCR0 setup, per-CPU XSAVE
-//! enablement performed at boot, and the save/restore primitives consumed by
-//! the `#NM` handler and the context-switch path. The per-thread XSAVE area is
+//! enablement and CR0's user-visible x87 and alignment controls, set at boot,
+//! and the save/restore primitives consumed by the `#NM` handler and the
+//! context-switch path. The per-thread XSAVE area is
 //! the last page of the thread's slab, carved by the thread-create path
 //! (`syscall::cap::sys_cap_create_thread`) and, for init's thread, by boot code
 //! (`kernel_entry_post_rebase`).
@@ -62,6 +63,22 @@
 /// uses this for the lazy-restore discipline: TS=1 on context-switch-in,
 /// the first user FP/SIMD use traps and the handler restores extended state.
 const CR0_TS: u64 = 1 << 3;
+
+/// CR0.MP (bit 1): `WAIT`/`FWAIT` honour CR0.TS and raise `#NM`, so they do
+/// not run against another thread's live x87 state.
+const CR0_MP: u64 = 1 << 1;
+
+/// CR0.EM (bit 2): x87 emulation; makes every x87 instruction raise `#NM` and
+/// every SSE instruction `#UD`.
+const CR0_EM: u64 = 1 << 2;
+
+/// CR0.NE (bit 5): x87 errors are reported through `#MF`, not the legacy
+/// external `FERR#` signal.
+const CR0_NE: u64 = 1 << 5;
+
+/// CR0.AM (bit 18): with `RFLAGS.AC` set, a misaligned CPL-3 access raises
+/// `#AC`.
+const CR0_AM: u64 = 1 << 18;
 
 /// Read the current value of CR0.
 #[cfg(not(test))]
@@ -172,6 +189,9 @@ unsafe fn xsetbv(xcr: u32, val: u64)
 
 /// Enable XSAVE and the x87+SSE+AVX component set in XCR0.
 ///
+/// Also sets CR0's user-visible x87 and alignment controls (`MP`, `NE` set;
+/// `EM`, `AM` clear).
+///
 /// Must be called once per CPU during early init. On the BSP it runs from
 /// `interrupts::init` before the IDT is loaded (a CR4/XCR0 fault there is not
 /// catchable); on each AP (`interrupts::init_ap`) the IDT is already loaded.
@@ -212,6 +232,18 @@ pub unsafe fn enable_xsave()
     // SAFETY: OSXSAVE just set; XCR0 components are v3-mandatory.
     unsafe {
         xsetbv(0, XCR0_V3);
+    }
+
+    // CR0's user-visible x87 and alignment controls. The BSP runs on the CR0
+    // the firmware left and each AP on the one INIT leaves (NE, MP and AM
+    // clear), so set each explicitly: MP and NE set, EM and AM clear. Ring 3
+    // then gets x87 errors as `#MF`, `#NM` for `WAIT` under TS, and no
+    // alignment checking, on every CPU.
+    // SAFETY: ring 0; MP and NE are architectural on every x86-64 CPU, and
+    // clearing EM and AM changes no translation or protection the kernel
+    // relies on (the kernel runs soft-float and never sets RFLAGS.AC at CPL 3).
+    unsafe {
+        write_cr0((read_cr0() & !(CR0_EM | CR0_AM)) | CR0_MP | CR0_NE);
     }
 }
 

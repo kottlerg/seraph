@@ -295,7 +295,15 @@ pub unsafe fn init()
         idt::init();
     }
 
-    // 4a. Switch into x2APIC mode when the CPU advertises it, before any APIC
+    // 4a. Set the user-visible MSR controls (TSC_AUX, CPUID faulting, U_CET), with
+    //     the IDT loaded so the probe table copies its NMI and #MC gates.
+    // SAFETY: ring 0 on the kernel's GDT, interrupts off, before
+    //     `shadow_stack::enable` (`msr_recovering`'s contract).
+    unsafe {
+        cpu::set_user_msr_controls();
+    }
+
+    // 4b. Switch into x2APIC mode when the CPU advertises it, before any APIC
     //     register access below: once EXTD is set the xAPIC MMIO window is
     //     gone, so the SVR/LVT writes must route through the x2APIC MSRs.
     // SAFETY: ring-0 boot; the MSR write is gated on CPUID advertisement.
@@ -767,6 +775,11 @@ pub unsafe fn init_ap()
     // SAFETY: ring 0; no thread's state is live in this CPU's FP registers yet.
     unsafe {
         fpu::cr0_set_ts();
+    }
+    // SAFETY: ring 0 on the AP's GDT, IDT loaded, interrupts off, before
+    // `shadow_stack::enable` (`msr_recovering`'s contract).
+    unsafe {
+        cpu::set_user_msr_controls();
     }
 
     // Mirror the BSP's APIC mode: EXTD is per-CPU MSR state that must be set on

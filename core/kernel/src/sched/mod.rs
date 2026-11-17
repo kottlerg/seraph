@@ -6826,13 +6826,15 @@ pub enum Requeue
 /// Blocked/Stopped/Exited, which must not be re-enqueued unless a wake made it
 /// runnable meanwhile.
 ///
-/// **Why a parameter instead of checking `state == Running`:** after a
-/// voluntary block (`notification_wait`, IPC), the thread's state is `Blocked`.
-/// But between the IPC lock release and this function acquiring the
-/// scheduler lock, another CPU can wake the thread, enqueue it on a
-/// different CPU, dequeue it, and set its state back to `Running`. If
-/// we checked state here we would re-enqueue it, creating a double-schedule
-/// where two CPUs run the same thread on the same kernel stack.
+/// **The parameter and the state both decide the requeue:** after a voluntary
+/// block (`notification_wait`, IPC), the thread's state is `Blocked`, but a
+/// waker can make it runnable before this function takes its `sched_lock`, and
+/// a runnable `current` is requeued whatever the caller passed, so its wake is
+/// not lost. When that wake linked it on another CPU (its hard affinity names
+/// one), that CPU may already have dequeued it or marked it `Running`; the
+/// requeue leaves such a claimed thread to that CPU, since requeueing it would
+/// have two CPUs run it on one kernel stack
+/// (core/kernel/docs/scheduling-internals.md § ThreadState Transitions).
 ///
 /// After updating architecture-specific kernel-stack pointers the scheduler
 /// lock is released, then `arch::current::context::switch` performs the actual
@@ -6912,7 +6914,7 @@ pub unsafe fn schedule(requeue: Requeue)
     // when the caller asks OR when `current` is already runnable (`Running` /
     // `Ready`), and only ever park a `current` that is genuinely still `Blocked`.
     //
-    // Three guards keep this sound:
+    // Four guards keep this sound:
     //   * Never requeue a thread a concurrent path has committed to `Exited`
     //     (dealloc) or `Stopped` under all-CPU locks — re-marking it `Ready` and
     //     linking it would leave a dangling run-queue entry over a TCB that
@@ -6926,6 +6928,15 @@ pub unsafe fn schedule(requeue: Requeue)
     //     it; the next-thread selection below picks it up.
     //   * Never requeue a `Blocked` `current` (core/kernel/docs/scheduling-internals.md
     //     § ThreadState Transitions, "Voluntary-block window").
+    //   * Never requeue a `current` another CPU's dispatch has claimed: one its
+    //     `dequeue_highest` unlinked (`Ready`, `queued_on == -1`) or its dispatch
+    //     flip marked `Running` (`preferred_cpu` names that CPU: each flip below
+    //     writes it, init's first dispatch on CPU 0 finds it 0, and nothing else
+    //     writes it while `Running`). A wake routed by hard affinity links a
+    //     thread parking here on the CPU its affinity names while it is still
+    //     `current` here, and that CPU dispatches it once this CPU's `switch()`
+    //     publishes it; a requeue would link it there a second time, to run while
+    //     linked (same section, "Hard-affinity wake in the voluntary-block window").
     if !current.is_null()
     {
         // SAFETY: current is a valid TCB set by enter() or a previous schedule();
@@ -6946,11 +6957,24 @@ pub unsafe fn schedule(requeue: Requeue)
                 .queued_on
                 .load(core::sync::atomic::Ordering::Relaxed)
         } >= 0;
+        // SAFETY: current is a valid TCB; preferred_cpu is written under its
+        // sched_lock, held here.
+        let dispatched_on = unsafe { (*current).preferred_cpu } as usize;
+        let claimed_elsewhere = match cur_state
+        {
+            ThreadState::Ready => !already_queued,
+            ThreadState::Running => dispatched_on != cpu,
+            ThreadState::Created
+            | ThreadState::Blocked
+            | ThreadState::Stopped
+            | ThreadState::Exited => false,
+        };
         if (requeue == Requeue::Always || runnable)
             && cur_state != ThreadState::Exited
             && cur_state != ThreadState::Stopped
             && cur_state != ThreadState::Blocked
             && !already_queued
+            && !claimed_elsewhere
         {
             // SAFETY: current is a valid TCB; its priority is written under its
             // sched_lock, held here.

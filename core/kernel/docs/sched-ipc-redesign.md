@@ -305,7 +305,9 @@ each change; the binding statement of the resulting invariants is
   at once.
   - Top: read `current` (CPU-local). Acquire `current.sched_lock` (if `current`
     non-null), then the CPU lock.
-  - **Outgoing requeue** under both: flip `current` Running→Ready + enqueue. The
+  - **Outgoing requeue** under both: flip `current` Running→Ready + enqueue,
+    unless another CPU's dispatch has claimed it ([scheduling-internals.md](scheduling-internals.md)
+    § ThreadState Transitions, "Hard-affinity wake in the voluntary-block window"). The
     local arm calls `sched.enqueue` under the CPU lock. The cross-affinity arm
     flips under `current.sched_lock`, drops the LOCAL CPU lock (keeping
     `preempt_disable`), enqueues **directly** on the target under

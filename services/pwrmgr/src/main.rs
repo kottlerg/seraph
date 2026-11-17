@@ -63,7 +63,7 @@ fn main() -> !
     let actuator = arch::current::resolve(&bootstrap, ipc_buf);
     if let Some(act) = &actuator
     {
-        arch::current::watch_events(act);
+        arch::current::watch_events(*act);
         std::os::seraph::log!("ready");
     }
     else

@@ -898,20 +898,17 @@ impl Registry
                 handle_query_shutdown_device(&self.firmware, msg, badge, ipc_buf);
             }
             ipc::devmgr_labels::QUERY_ACPI_RESOURCES
-                if msg.word(1) == ipc::devmgr_labels::ACPI_SCI =>
-            {
-                // The SCI's line is the control thread's, which owns the
-                // interrupt lines.
-                self.acpi_request(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf);
-            }
-            ipc::devmgr_labels::QUERY_ACPI_RESOURCES =>
+                if msg.word(1) != ipc::devmgr_labels::ACPI_SCI =>
             {
                 if Self::admits(msg, ipc::devmgr_labels::ACPI_AUTHORITY, ipc_buf)
                 {
                     acpi::query_resources(&self.firmware, msg, ipc_buf);
                 }
             }
-            ipc::devmgr_labels::ACPI_REGION_GRANT
+            // The SCI's `QUERY_ACPI_RESOURCES` goes to the control thread,
+            // which owns the interrupt lines.
+            ipc::devmgr_labels::QUERY_ACPI_RESOURCES
+            | ipc::devmgr_labels::ACPI_REGION_GRANT
             | ipc::devmgr_labels::ACPI_PCI_CONFIG
             | ipc::devmgr_labels::OSC_RESULT
             | ipc::devmgr_labels::BRIDGE_WINDOWS

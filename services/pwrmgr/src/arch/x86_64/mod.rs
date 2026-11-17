@@ -87,9 +87,8 @@ pub fn reboot(act: &Actuator, ipc_buf: *mut u64)
 /// Watch the power button: spawn the event thread, which waits in acpid's
 /// `WAIT_EVENT` for pwrmgr's lifetime and powers off on a press. A thread
 /// that cannot be spawned is logged, and pwrmgr serves without it.
-pub fn watch_events(act: &Actuator)
+pub fn watch_events(act: Actuator)
 {
-    let act = *act;
     let spawned = std::thread::Builder::new()
         .name("pwrmgr-events".into())
         .spawn(move || events(&act));
@@ -124,7 +123,8 @@ fn events(act: &Actuator)
                     shutdown(act, ipc_buf);
                 }
             }
-            Ok(reply) if reply.label == acpid_errors::SUPERSEDED => {}
+            Ok(reply) if reply.label == acpid_errors::SUPERSEDED =>
+            {}
             Ok(reply) =>
             {
                 std::os::seraph::log!(

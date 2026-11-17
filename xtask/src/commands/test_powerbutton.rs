@@ -112,8 +112,12 @@ pub fn run(ctx: &Context, args: &TestPowerbuttonArgs) -> Result<()>
 }
 
 /// Launch QEMU for the boot, with its QMP socket at `sock`.
-fn launch(qemu_binary: &Path, ctx: &Context, args: &TestPowerbuttonArgs, sock: &Path)
--> Result<Guest>
+fn launch(
+    qemu_binary: &Path,
+    ctx: &Context,
+    args: &TestPowerbuttonArgs,
+    sock: &Path,
+) -> Result<Guest>
 {
     let disk_path = ctx.disk_image();
     let firmware_code = find_ovmf_code()?;

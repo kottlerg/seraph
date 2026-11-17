@@ -229,8 +229,9 @@ fn arm(
         power_button,
     } = source;
     let layout = events.layout();
-    let (handlers, ignored) =
-        ns.map_or_else(Default::default, |ns| events::handlers(ns, layout.gpe_count()));
+    let (handlers, ignored) = ns.map_or_else(Default::default, |ns| {
+        events::handlers(ns, layout.gpe_count())
+    });
     for name in ignored
     {
         std::os::seraph::log!(
@@ -249,8 +250,12 @@ fn arm(
     let (ready_tx, ready) = mpsc::sync_channel(1);
     let (go, go_rx) = mpsc::sync_channel(1);
     let spawned = {
-        let (regs, mailbox, work, ended) =
-            (Arc::clone(&regs), Arc::clone(mailbox), work.clone(), ended.clone());
+        let (regs, mailbox, work, ended) = (
+            Arc::clone(&regs),
+            Arc::clone(mailbox),
+            work.clone(),
+            ended.clone(),
+        );
         std::thread::Builder::new()
             .name("acpid-sci".into())
             .spawn(move || watch(&events, &regs, &mailbox, &work, &ready_tx, &go_rx, ended))
@@ -308,9 +313,28 @@ fn watch(
         std::os::seraph::object_slab_retype(std::os::seraph::NOTIFICATION_RETYPE_BYTES, |slab| {
             syscall::cap_create_notification(slab).ok()
         });
-    let registered = notification.filter(|&n| {
-        events.bind(thread) && syscall::irq_register(events.sci(), n, events.mode()).is_ok()
-    });
+    let registered = match notification
+    {
+        None =>
+        {
+            std::os::seraph::log!(warn: "no notification for the SCI");
+            None
+        }
+        Some(n) => match events
+            .bind(thread)
+            .and_then(|()| syscall::irq_register(events.sci(), n, events.mode()))
+        {
+            Ok(()) => Some(n),
+            Err(e) =>
+            {
+                std::os::seraph::log!(
+                    warn: "the SCI could not be taken (err={e}, mode {:#x})",
+                    events.mode()
+                );
+                None
+            }
+        },
+    };
     let _ = ready.send(registered.is_some());
     let (Some(notification), Ok(())) = (registered, go.recv())
     else

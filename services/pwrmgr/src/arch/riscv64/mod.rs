@@ -26,6 +26,7 @@ const SRST_REASON_NONE: u64 = 0;
 /// Resolved shutdown actuation state: a Reset-only derivation of devmgr's
 /// `SbiControl` cap, acquired once at startup and held for pwrmgr's
 /// lifetime.
+#[derive(Clone, Copy)]
 pub struct Actuator
 {
     sbi_control_cap: u64,
@@ -59,7 +60,7 @@ pub fn resolve(bootstrap: &Bootstrap, ipc_buf: *mut u64) -> Option<Actuator>
 
 /// A no-op: QEMU `virt`'s ACPI is hardware-reduced, with no fixed power
 /// button for acpid to report.
-pub const fn watch_events(_act: &Actuator) {}
+pub const fn watch_events(_act: Actuator) {}
 
 /// Attempt SBI SRST shutdown. Logs and returns on failure.
 pub fn shutdown(act: &Actuator, _ipc_buf: *mut u64)

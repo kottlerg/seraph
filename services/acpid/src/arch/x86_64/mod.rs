@@ -205,7 +205,8 @@ impl Events
         };
         let gpe0 = match block(devmgr, devmgr_labels::ACPI_GPE0)
         {
-            Ok(gpe0) if Layout::new(pm1.port, pm1.count, Some((gpe0.port, gpe0.count))).is_some() =>
+            Ok(gpe0)
+                if Layout::new(pm1.port, pm1.count, Some((gpe0.port, gpe0.count))).is_some() =>
             {
                 Some(gpe0)
             }
@@ -277,10 +278,12 @@ impl Events
                 Start::Restart
             },
         };
-        if !events.bind(thread)
+        if let Err(e) = events.bind(thread)
         {
-            std::os::seraph::log!(warn: "event blocks not bound; no events");
-            for c in [Some(events.pm1), events.gpe0, Some(events.sci)].into_iter().flatten()
+            std::os::seraph::log!(warn: "event blocks not bound (err={e}); no events");
+            for c in [Some(events.pm1), events.gpe0, Some(events.sci)]
+                .into_iter()
+                .flatten()
             {
                 let _ = syscall::cap_delete(c);
             }
@@ -289,10 +292,12 @@ impl Events
         Some(events)
     }
 
-    /// Bind the event blocks to `thread`; whether the kernel accepted both.
-    pub fn bind(&self, thread: u64) -> bool
+    /// Bind the event blocks to `thread`; the kernel's error for the first
+    /// block it refused.
+    pub fn bind(&self, thread: u64) -> Result<(), i64>
     {
-        bind_ports(thread, self.pm1) && self.gpe0.is_none_or(|g| bind_ports(thread, g))
+        bind(thread, self.pm1)?;
+        self.gpe0.map_or(Ok(()), |g| bind(thread, g))
     }
 
     /// Where the event registers lie.
@@ -394,7 +399,38 @@ impl Registers for Ports
 /// the kernel accepted it.
 pub fn bind_ports(thread: u64, cap: u64) -> bool
 {
-    syscall::ioport_bind(thread, cap).is_ok()
+    bind(thread, cap).is_ok()
+}
+
+/// Bind `cap` to `thread`; the kernel's error when it refuses. A thread's
+/// first bind takes its port-binding table from acpid's `CSpace` budget
+/// (`syscall_abi::IOPORT_BINDING_TABLE_PAGES` pages), so a bind refused
+/// with `OutOfMemory` is made again once after [`fund_binding_table`].
+fn bind(thread: u64, cap: u64) -> Result<(), i64>
+{
+    match syscall::ioport_bind(thread, cap)
+    {
+        Err(e) if e == syscall_abi::SyscallError::OutOfMemory as i64 && fund_binding_table() =>
+        {
+            syscall::ioport_bind(thread, cap)
+        }
+        result => result,
+    }
+}
+
+/// Donate one port-binding table's pages, and one more, to acpid's own
+/// `CSpace` (augment-mode `cap_create_cspace`), from memmgr through the
+/// object slab. The page beyond the table covers the bookkeeping a
+/// donation keeps in its own pages, as docs/capability-model.md describes
+/// for growth budgets. Whether the donation was made.
+fn fund_binding_table() -> bool
+{
+    let cspace = std::os::seraph::startup_info().self_cspace;
+    let pages = syscall_abi::IOPORT_BINDING_TABLE_PAGES + 1;
+    std::os::seraph::object_slab_retype(pages * syscall_abi::PAGE_SIZE, |frame| {
+        syscall::cap_create_cspace(frame, cspace, pages).ok()
+    })
+    .is_some()
 }
 
 /// Switch the platform into ACPI mode when `SCI_EN` is clear: write the

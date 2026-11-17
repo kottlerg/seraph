@@ -224,7 +224,11 @@ fn gpe_method_name(name: Seg) -> Option<(Trigger, u16)>
         [b'_', b'E', ..] => Trigger::Edge,
         _ => return None,
     };
-    let digit = |c: u8| char::from(c).to_digit(16).filter(|_| !c.is_ascii_lowercase());
+    let digit = |c: u8| {
+        char::from(c)
+            .to_digit(16)
+            .filter(|_| !c.is_ascii_lowercase())
+    };
     let [_, _, high, low] = name;
     let gpe = (digit(high)? << 4) | digit(low)?;
     Some((trigger, u16::try_from(gpe).ok()?))
@@ -473,7 +477,14 @@ mod tests
 
         fn put(&mut self, port: u16, value: u8)
         {
-            let value = if Self::w1c(port) { self.get(port) & !value } else { value };
+            let value = if Self::w1c(port)
+            {
+                self.get(port) & !value
+            }
+            else
+            {
+                value
+            };
             self.bytes.insert(port, value);
         }
 
@@ -692,7 +703,10 @@ mod tests
             let (handled, ignored) = handlers(&ns, 64);
             let gpes: Vec<u16> = handled.iter().map(|h| h.gpe).collect();
             assert_eq!(gpes, expected, "{config}");
-            assert!(handled.iter().all(|h| h.trigger == Trigger::Edge), "{config}");
+            assert!(
+                handled.iter().all(|h| h.trigger == Trigger::Edge),
+                "{config}"
+            );
             assert!(ignored.is_empty(), "{config}");
         }
         let ns = sim::fixture("riscv64-rootport");

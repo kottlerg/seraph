@@ -158,7 +158,7 @@ capabilities name, or its recipe states why its loss is critical.
 | memmgr, procmgr, svcmgr | none restarts them | no restart: core set |
 | devmgr, vfsd | svcmgr | no restart: `critical = yes`, outside the core set |
 | timed, pwrmgr | svcmgr | persistent endpoint, held by svcmgr |
-| logd | svcmgr | persistent endpoint (the master log endpoint), held by svcmgr; a working restart is design intent; not yet implemented (#262) |
+| logd | svcmgr | persistent endpoint (the master log endpoint), held by svcmgr ([Restart Protocol § Supervision hierarchy](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)) |
 | crashd | svcmgr | persistent endpoint (procmgr's crash endpoint), held by procmgr, which declines faults while no crash service is registered and hands the endpoint to the restarted crashd when it registers ([crashd Operation § Startup](../services/crashd/docs/operation.md#startup)) |
 | drivers | devmgr | none today; the shape is chosen per driver (design intent; not yet implemented, #1077); the IOMMU driver (#1079) |
 | fs drivers | vfsd | none today; revoke and re-resolve (design intent; not yet implemented, #1078) |
@@ -231,10 +231,6 @@ Each item below is specified above or in the document it names, and is not yet i
 - pwrmgr observes svcmgr and powers off on its death (§ Observing svcmgr): #262.
 - A test of each core and critical death, on a power-off path that does not depend on the dying
   service (§ Core Set and System Death): #262.
-- logd restarts cleanly on its persistent endpoint
-  ([Restart Protocol](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)
-  § Supervision hierarchy):
-  #262.
 - devmgr restarts drivers: #1077. The IOMMU driver survives and restarts: #1079.
 - vfsd restarts fs drivers by revoke and re-resolve: #1078.
 - procmgr tears down the processes a dead pager other than memmgr served: #226.

@@ -16,7 +16,8 @@
 # every svctest boot exercises a seed list longer than one round; the
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
 # logd.query is the LOG_QUERY_AUTHORITY SEND on the master log endpoint the
-# logd_death_forward phase reads its dead child's retired slot through.
+# logd_death_forward phase reads its dead child's retired slot through, and
+# the logd_restart phase reads the restarted logd's history through.
 # devmgr.class.serial and devmgr.class.input are the class SENDs the
 # drivers stray-cap phase and the devmgr ordinal phase query devices on.
 # devmgr.class.test-dma and devmgr.class.test-fault reach the test-only
@@ -36,7 +37,8 @@
 # as every holder, declares itself undebuggable at startup; the
 # crash_endpoint phase registers with it as the crash service, which the
 # svctest boot, staging no crashd, leaves free (burn-in's svctest cell
-# stages crashd, and the phase then checks only the refusal).
+# stages crashd, and the phase then checks only the refusal); the
+# logd_restart phase kills logd through an attach with it.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
 # after that, which the svcmgr_stop_service phase stops and lists services
 # through.

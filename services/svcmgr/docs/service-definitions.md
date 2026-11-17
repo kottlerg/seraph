@@ -328,16 +328,13 @@ present, history pulled from init-logd per the
 [logd handover protocol](../../logd/docs/handover-protocol.md)). A slot whose source is absent
 from the endowment or not published (slots 3 and 4 when no class file configured the class), or
 whose derive fails, is absent from the round; logd requires only `cap[0]`.
-svcmgr holds the master-log source for the system's life, so the round is designed to also
-drive every restart (`cap[1]` absent, history pull skipped), each relaunched logd
+svcmgr holds the master-log source for the system's life, so the round also
+drives every restart (`cap[1]` absent, history pull skipped), each relaunched logd
 re-attaching a fresh RECV to the same endpoint object every sender already
-targets, with `restart` and `critical` behaving as for any other service;
-design intent; not yet implemented (#262). Today, on a logd death svcmgr's
-death handler makes `log!` calls on the master-log endpoint with no logd
-receiving; each is dropped once its bound expires
-([shared/log](../../../shared/log/README.md)), so the handler reaches the
-restart and the critical graceful-shutdown path late, not never (per
-[restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
+targets, with `restart` and `critical` behaving as for any other service. On a
+`log_sink` service's death svcmgr writes no line before the respawn, since no
+logd receives until then, and writes the death's lines once the new instance
+runs ([restart-protocol.md](restart-protocol.md#supervision-hierarchy)).
 
 ```
 binary    = /services/logd

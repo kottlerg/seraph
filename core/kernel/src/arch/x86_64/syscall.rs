@@ -120,9 +120,10 @@ pub unsafe fn set_kernel_rsp(rsp: u64)
 /// 3. Switches to `gs:[8]` (`PerCpuData::kernel_rsp`), and with shadow stacks
 ///    on (`shadow_stack::enabled`) to the thread's shadow stack (`setssbsy`).
 /// 4. Allocates a 168-byte [`TrapFrame`] on the kernel stack.
-/// 5. Saves all GPRs and CPU-state fields into the frame, then sets `IBRS`
-///    and clears the branch history where the transient-execution selection
-///    asks for them (`mitigation::seraph_enter_from_user`).
+/// 5. Saves all GPRs and CPU-state fields into the frame, then sets `IBRS`,
+///    issues the IBPB and the fill after it, and clears the branch history
+///    where the transient-execution selection asks for them
+///    (`mitigation::seraph_enter_from_user`).
 /// 6. Calls `crate::syscall::dispatch`.
 /// 7. Disables interrupts, releases the shadow stack's token (`clrssbsy`)
 ///    with shadow stacks on, writes the user-mode `IA32_SPEC_CTRL` value
@@ -188,8 +189,9 @@ unsafe extern "custom" fn syscall_entry()
         "mov qword ptr [rsp + 144], 0x23", // cs = USER_CS
         "mov qword ptr [rsp + 152], 0x1b", // ss = USER_DS
         "mov qword ptr [rsp + 160], 0",    // fs_base: unused (TLS base is SavedState.fs_base)
-        // Set IBRS and clear the branch history before any indirect branch,
-        // where the selection asks for them (core/kernel/docs/transient-execution.md
+        // Set IBRS, issue the IBPB and the fill after it, and clear the
+        // branch history before any `ret` or indirect branch, where the
+        // selection asks for them (core/kernel/docs/transient-execution.md
         // § Controls). Clobbers eax, ecx, edx and the flags, all saved above.
         "call seraph_enter_from_user",
 

@@ -18,13 +18,15 @@
 //! and selects and installs the user-to-kernel controls it calls for, through
 //! `super::mitigation`; [`apply_mitigations_this_cpu`] sets the per-CPU ones.
 
-/// Read the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`, derive its
-/// vulnerability table, select the user-to-kernel controls the table calls
+/// Read the boot CPU's CPUID and `IA32_ARCH_CAPABILITIES`, and probe `SBPB`
+/// where its CPUID leaves the SRSO microcode unknown, derive its vulnerability
+/// table, select the user-to-kernel controls the table calls
 /// for (from the inputs a `SERAPH_FORCE_RETURN_MITIGATION` build forces, where
 /// one does), publish the selection, and log the inputs, the table and the controls
 /// on the serial console. Called once on the BSP in Phase 1, after
-/// `cpu::verify_baseline`, before any AP starts or any thread enters user
-/// mode.
+/// `cpu::verify_baseline` and `gdt::load_boot_segments` (the `SBPB` probe
+/// takes its `#GP` through the kernel's code segment), before any AP starts or
+/// any thread enters user mode.
 #[cfg(not(test))]
 pub fn select_mitigations()
 {
@@ -44,17 +46,18 @@ pub fn select_mitigations()
 pub fn select_mitigations() {}
 
 /// Set the calling CPU's per-CPU controls of the selection (enhanced IBRS, or
-/// the kernel's `IA32_SPEC_CTRL` value of IBRS on entry, `BHI_DIS_S`,
-/// Automatic IBRS, `DOITM`), through
-/// `super::mitigation::apply_this_cpu`.
+/// the kernel's `IA32_SPEC_CTRL` value of IBRS on entry, `BHI_DIS_S`, STIBP,
+/// Automatic IBRS, `DOITM`), and AMD's `DE_CFG[1]` where the CPU takes it,
+/// through `super::mitigation::apply_this_cpu`.
 ///
 /// # Panics
 /// Halts, naming the control, when this CPU does not enumerate an MSR control
 /// the boot CPU selected (`super::mitigation::missing_msr_control`).
 ///
 /// # Safety
-/// Ring 0, after [`select_mitigations`], on the CPU being brought up: the BSP
-/// in Phase 1, each AP in `kernel_entry_ap`.
+/// Ring 0, after [`select_mitigations`], on the CPU being brought up and on
+/// the kernel's GDT, with interrupts off and before its shadow stack is
+/// enabled: the BSP in Phase 1, each AP in `kernel_entry_ap`.
 #[cfg(not(test))]
 pub unsafe fn apply_mitigations_this_cpu()
 {

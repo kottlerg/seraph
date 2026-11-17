@@ -71,7 +71,12 @@ again.
    (arch::current::cpu::verify_baseline): refuse hardware missing a required
    baseline feature with a diagnostic, before any subsystem that assumes the
    baseline runs
-4. Enumerate the CPU's transient-execution vulnerabilities, log the table, select and
+4. Load the kernel's segment descriptors (arch::current::gdt::load_boot_segments): on
+   x86-64, the BSP's GDT without its TSS, which Phase 5 adds, and the segment registers
+   reloaded from it, so a #GP the step below recovers from is delivered through a
+   descriptor the kernel's page tables map, which the firmware's GDT is not (nothing on
+   RISC-V)
+5. Enumerate the CPU's transient-execution vulnerabilities, log the table, select and
    publish the user-to-kernel controls it calls for and log them
    (arch::current::speculation::select_mitigations), then set the boot CPU's per-CPU
    controls (arch::current::speculation::apply_mitigations_this_cpu) (x86-64; nothing on
@@ -80,7 +85,7 @@ again.
 
 The step-3 gate and the baseline it enforces are defined in
 [platform-requirements.md](../../../docs/platform-requirements.md) § Boot-Time Feature Gate. The
-step-4 table and controls are defined in [transient-execution.md](transient-execution.md); each AP
+step-5 table and controls are defined in [transient-execution.md](transient-execution.md); each AP
 sets its own per-CPU controls in `kernel_entry_ap`, before it enters user mode.
 
 The early console is allocation-free and output-only.
@@ -276,7 +281,7 @@ address, the reason, and the span's end.
    per 2 MiB chunk of RAM, from which the kernel-stack guard pages split the direct map
    (`mm::stack_guard::seed`; [memory-internals.md](memory-internals.md) § Kernel Stack
    Guards). Decide whether the kernel runs on shadow stacks: on x86-64 when the BSP
-   reports CET shadow stacks and the step-4 selection of Phase 1 rewrites no return, never
+   reports CET shadow stacks and the step-5 selection of Phase 1 rewrites no return, never
    on riscv64 (`shadow_stack::decide`;
    [return-address-integrity.md](return-address-integrity.md)); with them on, every
    Thread slot ends in a shadow-stack page (`thread_slot::set_shadow_stack_pages`)
@@ -329,7 +334,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
    already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE
 2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
-3. Construct and install the permanent GDT and the BSP's TSS:
+3. Construct and install the permanent GDT and the BSP's TSS (the segment descriptors are
+   loaded since Phase 1; this fills the TSS descriptor and loads the table again with it):
    - Null descriptor (index 0)
    - Kernel code segment (64-bit, DPL 0)
    - Kernel data segment (DPL 0)

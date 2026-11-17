@@ -32,25 +32,30 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ::syscall::{
     SPECULATION_CONTROL_AUTO_IBRS, SPECULATION_CONTROL_BHB_CLEAR, SPECULATION_CONTROL_BHI_DIS_S,
-    SPECULATION_CONTROL_DOITM, SPECULATION_CONTROL_EIBRS, SPECULATION_CONTROL_IBRS_ENTRY,
-    SPECULATION_CONTROL_RETPOLINE, SPECULATION_CONTROL_RSB_FILL_IBPB,
-    SPECULATION_CONTROL_RSB_FILL_SWITCH, SPECULATION_CONTROL_VERW_EXIT,
-    SPECULATION_CONTROL_VERW_IDLE, SPECULATION_INPUT_AUTO_IBRS, SPECULATION_INPUT_BHI,
-    SPECULATION_INPUT_BHI_CTRL, SPECULATION_INPUT_DOITM, SPECULATION_INPUT_IBPB_LEAVES_RSB,
-    SPECULATION_INPUT_IBRS, SPECULATION_INPUT_IBRS_ALL, SPECULATION_INPUT_MDS,
-    SPECULATION_INPUT_MMIO, SPECULATION_INPUT_RETBLEED, SPECULATION_INPUT_RFDS,
-    SPECULATION_INPUT_RSB_ALTERNATE, SPECULATION_INPUT_SPECTRE_V2, SPECULATION_INPUT_SRSO,
+    SPECULATION_CONTROL_DOITM, SPECULATION_CONTROL_EIBRS, SPECULATION_CONTROL_IBPB_ENTRY,
+    SPECULATION_CONTROL_IBRS_ENTRY, SPECULATION_CONTROL_RETPOLINE,
+    SPECULATION_CONTROL_RSB_FILL_IBPB, SPECULATION_CONTROL_RSB_FILL_SWITCH,
+    SPECULATION_CONTROL_STIBP, SPECULATION_CONTROL_VERW_EXIT, SPECULATION_CONTROL_VERW_IDLE,
+    SPECULATION_INPUT_AUTO_IBRS, SPECULATION_INPUT_BHI, SPECULATION_INPUT_BHI_CTRL,
+    SPECULATION_INPUT_DOITM, SPECULATION_INPUT_IBPB, SPECULATION_INPUT_IBPB_LEAVES_BRTYPE,
+    SPECULATION_INPUT_IBPB_LEAVES_RSB, SPECULATION_INPUT_IBRS, SPECULATION_INPUT_IBRS_ALL,
+    SPECULATION_INPUT_MDS, SPECULATION_INPUT_MMIO, SPECULATION_INPUT_RETBLEED,
+    SPECULATION_INPUT_RFDS, SPECULATION_INPUT_RSB_ALTERNATE, SPECULATION_INPUT_SMT,
+    SPECULATION_INPUT_SPECTRE_V2, SPECULATION_INPUT_SRSO, SPECULATION_INPUT_STIBP,
     SPECULATION_INPUT_TAA, SPECULATION_INPUT_TSA,
 };
 
-use super::vulnerability::{Behaviour, Class, CpuEnumeration, Exposure, VulnerabilityTable};
+use super::vulnerability::{
+    Behaviour, Class, CpuEnumeration, Exposure, Vendor, VulnerabilityTable,
+};
 
 // ── Selection ─────────────────────────────────────────────────────────────────
 
-/// The facts the selection reads, as a `SPECULATION_INPUT_*` set: the classes
-/// the table gives kernel action that a control answers, the two predictor
-/// behaviours, and the enumerated bits that choose between the controls that
-/// answer one class.
+/// The facts the selection and the report read, as a `SPECULATION_INPUT_*`
+/// set: the classes the table gives kernel action that a control answers, the
+/// three predictor behaviours, the enumerated bits that choose between the
+/// controls that answer one class or that a control needs, and whether SMT is
+/// on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Inputs(u64);
 
@@ -73,6 +78,10 @@ impl Inputs
         let behaviours = [
             (Behaviour::RsbAlternate, SPECULATION_INPUT_RSB_ALTERNATE),
             (Behaviour::IbpbLeavesRsb, SPECULATION_INPUT_IBPB_LEAVES_RSB),
+            (
+                Behaviour::IbpbLeavesBranchType,
+                SPECULATION_INPUT_IBPB_LEAVES_BRTYPE,
+            ),
         ];
         let enumerated = [
             (cpu.ibrs_all(), SPECULATION_INPUT_IBRS_ALL),
@@ -80,6 +89,9 @@ impl Inputs
             (cpu.bhi_ctrl(), SPECULATION_INPUT_BHI_CTRL),
             (cpu.doitm(), SPECULATION_INPUT_DOITM),
             (cpu.ibrs(), SPECULATION_INPUT_IBRS),
+            (cpu.ibpb(), SPECULATION_INPUT_IBPB),
+            (cpu.stibp(), SPECULATION_INPUT_STIBP),
+            (cpu.smt, SPECULATION_INPUT_SMT),
         ];
         let mut bits = 0;
         for (class, bit) in classes
@@ -115,8 +127,11 @@ impl Inputs
     /// These inputs with the override `force` applied: [`ForcedReturn::Intel`]
     /// adds `retbleed` and `rsb_alternate` and removes `IBRS_ALL`, the inputs
     /// of an Intel part whose returns fall back to the branch target buffer and
-    /// that has no enhanced IBRS. It adds no enumerated bit, so a CPU without
-    /// IBRS still selects no control it cannot run.
+    /// that has no enhanced IBRS; [`ForcedReturn::Amd`] adds `retbleed` and
+    /// `spec_rstack_overflow` and removes `rsb_alternate`, the inputs of an AMD
+    /// part affected by branch type confusion and speculative return stack
+    /// overflow. Neither adds an enumerated bit, so a CPU without IBRS or IBPB
+    /// still selects no control it cannot run.
     pub fn forced(self, force: ForcedReturn) -> Self
     {
         match force
@@ -125,6 +140,10 @@ impl Inputs
             ForcedReturn::Intel => Self(
                 (self.0 | SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_RSB_ALTERNATE)
                     & !SPECULATION_INPUT_IBRS_ALL,
+            ),
+            ForcedReturn::Amd => Self(
+                (self.0 | SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_SRSO)
+                    & !SPECULATION_INPUT_RSB_ALTERNATE,
             ),
         }
     }
@@ -154,11 +173,16 @@ pub enum ForcedReturn
     /// The inputs of an Intel part that the table gives `retbleed` kernel
     /// action, without enhanced IBRS.
     Intel,
+    /// The inputs of an AMD part that the table gives `retbleed` (branch type
+    /// confusion) and `spec_rstack_overflow` kernel action; the boot also
+    /// makes the `SBPB` probe and every CPU the `DE_CFG` step, whatever its
+    /// vendor, so that a host refusing them runs their recovery.
+    Amd,
 }
 
 /// The override named by `value`, the build's
 /// `SERAPH_FORCE_RETURN_MITIGATION`: unset or empty for none, `intel` for
-/// [`ForcedReturn::Intel`].
+/// [`ForcedReturn::Intel`], `amd` for [`ForcedReturn::Amd`].
 ///
 /// # Panics
 /// On any other value; evaluated for [`FORCED_RETURN`], the panic fails the
@@ -179,7 +203,8 @@ pub const fn forced_return(value: Option<&str>) -> ForcedReturn
     {
         b"" => ForcedReturn::None,
         b"intel" => ForcedReturn::Intel,
-        _ => panic!("SERAPH_FORCE_RETURN_MITIGATION is neither unset, empty nor `intel`"),
+        b"amd" => ForcedReturn::Amd,
+        _ => panic!("SERAPH_FORCE_RETURN_MITIGATION is neither unset, empty, `intel` nor `amd`"),
     }
 }
 
@@ -239,6 +264,11 @@ impl Controls
 ///   sequence is selected and returns fall back to an alternate predictor,
 ///   and after an IBPB where an IBPB leaves the buffer usable.
 /// - `DOITM` where the CPU implements it.
+/// - An IBPB on every entry from user mode where the CPU implements an IBPB
+///   that flushes branch types and the table gives kernel action to
+///   `retbleed` whose returns do not fall back to an alternate predictor
+///   (AMD's branch type confusion) or to speculative return stack overflow;
+///   with it, STIBP where the CPU implements it.
 pub fn select(inputs: Inputs) -> Controls
 {
     let mut bits = 0;
@@ -304,18 +334,32 @@ pub fn select(inputs: Inputs) -> Controls
     {
         bits |= SPECULATION_CONTROL_DOITM;
     }
+    let branch_type_confusion =
+        inputs.any(SPECULATION_INPUT_RETBLEED) && !inputs.any(SPECULATION_INPUT_RSB_ALTERNATE);
+    let ibpb_flushes_branch_types =
+        inputs.any(SPECULATION_INPUT_IBPB) && !inputs.any(SPECULATION_INPUT_IBPB_LEAVES_BRTYPE);
+    if ibpb_flushes_branch_types && (branch_type_confusion || inputs.any(SPECULATION_INPUT_SRSO))
+    {
+        bits |= SPECULATION_CONTROL_IBPB_ENTRY;
+        if inputs.any(SPECULATION_INPUT_STIBP)
+        {
+            bits |= SPECULATION_CONTROL_STIBP;
+        }
+    }
     Controls(bits)
 }
 
 /// The controls whose code returns to an address the shadow stack does not
 /// hold: the retpoline sequence's `ret` goes to the branch target, not to the
 /// caller, which raises `#CP` under CET shadow stacks. Every such control
-/// excludes shadow stacks ([`Controls::rewrites_returns`]).
+/// excludes shadow stacks ([`Controls::rewrites_returns`]). The IBPB on entry
+/// and the fill after it rewrite none: the fill's calls and returns are dropped
+/// from both stacks together.
 const RETURN_REWRITING: u64 = SPECULATION_CONTROL_RETPOLINE;
 
 /// Every control, with its name in the serial log, in `SPECULATION_CONTROL_*`
 /// bit order.
-const CONTROL_NAMES: [(u64, &str); 11] = [
+const CONTROL_NAMES: [(u64, &str); 13] = [
     (SPECULATION_CONTROL_EIBRS, "eibrs"),
     (SPECULATION_CONTROL_AUTO_IBRS, "auto_ibrs"),
     (SPECULATION_CONTROL_RETPOLINE, "retpoline"),
@@ -327,26 +371,101 @@ const CONTROL_NAMES: [(u64, &str); 11] = [
     (SPECULATION_CONTROL_RSB_FILL_IBPB, "rsb_fill_ibpb"),
     (SPECULATION_CONTROL_DOITM, "doitm"),
     (SPECULATION_CONTROL_IBRS_ENTRY, "ibrs_entry"),
+    (SPECULATION_CONTROL_IBPB_ENTRY, "ibpb_entry"),
+    (SPECULATION_CONTROL_STIBP, "stibp"),
 ];
 
-/// The classes the table gives kernel action that no selected control
-/// answers, by their log names: `retbleed` unless it is the form IBRS
-/// answers, returns that fall back to the branch target buffer on an Intel
-/// part (`rsb_alternate` with the IBRS input, which is read on Intel parts
-/// only), and enhanced IBRS or IBRS on entry is selected; so an AMD part's
-/// branch type confusion, a part of another vendor's `retbleed` of either
-/// form, and a part left on the retpoline sequence are named; and
-/// `spec_rstack_overflow`, which no control answers.
-fn unanswered(inputs: Inputs, controls: Controls) -> [Option<&'static str>; 2]
+/// Why a class the table gives kernel action stays open: the report's
+/// reason for each (core/kernel/docs/transient-execution.md § Report).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Open
 {
-    let ibrs = controls.bits() & (SPECULATION_CONTROL_EIBRS | SPECULATION_CONTROL_IBRS_ENTRY) != 0;
-    let intel_form = inputs.has(SPECULATION_INPUT_RSB_ALTERNATE | SPECULATION_INPUT_IBRS);
-    let retbleed = inputs.any(SPECULATION_INPUT_RETBLEED) && !(ibrs && intel_form);
+    /// No control the kernel has answers the class on this part.
+    NoControl,
+    /// The class's control is the IBPB, which the CPU does not implement.
+    NoIbpb,
+    /// The IBPB does not flush the branch type predictions the class uses: on
+    /// AMD Family 19h, the SRSO microcode of AMD-SB-7005 is not loaded.
+    IbpbLeavesBranchType,
+    /// The IBPB answers the class for this thread, but SMT is on and the CPU
+    /// has no STIBP to keep the sibling thread's training out (Zen, Zen+).
+    SmtWithoutStibp,
+}
+
+impl Open
+{
+    /// The reason's text in the serial log.
+    pub fn text(self) -> &'static str
+    {
+        match self
+        {
+            Open::NoControl => "no control answers it",
+            Open::NoIbpb => "no IBPB",
+            Open::IbpbLeavesBranchType => "IBPB does not flush branch types",
+            Open::SmtWithoutStibp => "SMT on without STIBP",
+        }
+    }
+}
+
+/// The classes the table gives kernel action that the selected controls leave
+/// vulnerable, by their log names, each with its reason:
+///
+/// - `retbleed` where its returns fall back to the branch target buffer on an
+///   Intel part (`rsb_alternate` with the IBRS input, which is read on Intel
+///   parts only) is answered by enhanced IBRS or IBRS on entry; another
+///   vendor's `retbleed` of that form, and an Intel part left on the retpoline
+///   sequence, have no control.
+/// - `retbleed` where they do not (AMD's branch type confusion) and
+///   `spec_rstack_overflow` are answered by the IBPB on entry, which needs an
+///   IBPB that flushes branch types, and STIBP where SMT is on to keep the
+///   sibling thread's training out.
+pub fn vulnerable(inputs: Inputs, controls: Controls) -> [Option<(&'static str, Open)>; 2]
+{
+    let ibpb_open = if !inputs.any(SPECULATION_INPUT_IBPB)
+    {
+        Some(Open::NoIbpb)
+    }
+    else if inputs.any(SPECULATION_INPUT_IBPB_LEAVES_BRTYPE)
+    {
+        Some(Open::IbpbLeavesBranchType)
+    }
+    else if !controls.has(SPECULATION_CONTROL_IBPB_ENTRY)
+    {
+        Some(Open::NoControl)
+    }
+    else if inputs.any(SPECULATION_INPUT_SMT) && !controls.has(SPECULATION_CONTROL_STIBP)
+    {
+        Some(Open::SmtWithoutStibp)
+    }
+    else
+    {
+        None
+    };
+    let retbleed = if !inputs.any(SPECULATION_INPUT_RETBLEED)
+    {
+        None
+    }
+    else if inputs.any(SPECULATION_INPUT_RSB_ALTERNATE)
+    {
+        let ibrs =
+            controls.bits() & (SPECULATION_CONTROL_EIBRS | SPECULATION_CONTROL_IBRS_ENTRY) != 0;
+        (!(ibrs && inputs.any(SPECULATION_INPUT_IBRS))).then_some(Open::NoControl)
+    }
+    else
+    {
+        ibpb_open
+    };
+    let srso = if inputs.any(SPECULATION_INPUT_SRSO)
+    {
+        ibpb_open
+    }
+    else
+    {
+        None
+    };
     [
-        retbleed.then_some("retbleed"),
-        inputs
-            .any(SPECULATION_INPUT_SRSO)
-            .then_some("spec_rstack_overflow"),
+        retbleed.map(|open| ("retbleed", open)),
+        srso.map(|open| ("spec_rstack_overflow", open)),
     ]
 }
 
@@ -422,6 +541,17 @@ static SERAPH_SPEC_CTRL_KERNEL: AtomicU64 = AtomicU64::new(0);
 #[unsafe(no_mangle)]
 static SERAPH_SPEC_CTRL_USER: AtomicU64 = AtomicU64::new(0);
 
+/// Set when [`SPECULATION_CONTROL_IBPB_ENTRY`] is selected: every entry from
+/// user mode issues an IBPB. A byte [`ibpb_asm`] reads by its link name.
+#[unsafe(no_mangle)]
+static SERAPH_IBPB_ENTRY: AtomicBool = AtomicBool::new(false);
+
+/// Set when [`SPECULATION_CONTROL_RSB_FILL_IBPB`] is selected: every IBPB the
+/// kernel issues is followed by the return stack buffer fill. A byte
+/// [`ibpb_asm`] reads by its link name.
+#[unsafe(no_mangle)]
+static SERAPH_RSB_FILL_IBPB: AtomicBool = AtomicBool::new(false);
+
 /// Set when [`SPECULATION_CONTROL_VERW_EXIT`] is selected: every return to user
 /// mode runs `VERW`. A byte [`verw_asm`] reads by its link name.
 #[unsafe(no_mangle)]
@@ -476,6 +606,14 @@ pub fn install(inputs: Inputs, controls: Controls)
         controls.has(SPECULATION_CONTROL_IBRS_ENTRY),
         Ordering::Relaxed,
     );
+    SERAPH_IBPB_ENTRY.store(
+        controls.has(SPECULATION_CONTROL_IBPB_ENTRY),
+        Ordering::Relaxed,
+    );
+    SERAPH_RSB_FILL_IBPB.store(
+        controls.has(SPECULATION_CONTROL_RSB_FILL_IBPB),
+        Ordering::Relaxed,
+    );
 }
 
 /// The `IA32_SPEC_CTRL` values of the kernel and of user mode under
@@ -492,24 +630,39 @@ fn spec_ctrl_values(controls: Controls) -> (u64, u64)
     (kernel, kernel & !SPEC_CTRL_IBRS)
 }
 
-/// Log the inputs override the kernel was built with, if any, the selected
-/// controls, a warning when `VERW` is selected on a CPU that does not
-/// enumerate that it clears the buffers, and one for each class the table
-/// gives kernel action that no selected control answers ([`unanswered`]).
+/// Log the inputs override the kernel was built with, if any (with the outcome
+/// of the `SBPB` probe an `amd` override makes whatever the vendor), the
+/// selected controls, a warning when `VERW` is selected on a CPU that does not
+/// enumerate that it clears the buffers, and one line for each class the table
+/// gives kernel action that the selection leaves vulnerable ([`vulnerable`]).
 #[cfg(not(test))]
 pub fn report(cpu: &CpuEnumeration, inputs: Inputs, controls: Controls)
 {
-    if FORCED_RETURN == ForcedReturn::Intel
+    match FORCED_RETURN
     {
-        crate::kprintln!(
+        ForcedReturn::None =>
+        {}
+        ForcedReturn::Intel => crate::kprintln!(
             "x86 mitigations: inputs forced (SERAPH_FORCE_RETURN_MITIGATION=intel): \
              retbleed, rsb_alternate, no IBRS_ALL"
-        );
+        ),
+        ForcedReturn::Amd => crate::kprintln!(
+            "x86 mitigations: inputs forced (SERAPH_FORCE_RETURN_MITIGATION=amd): \
+             retbleed, spec_rstack_overflow, no rsb_alternate; SBPB probe {}",
+            if super::vulnerability::sbpb_probe()
+            {
+                "accepted"
+            }
+            else
+            {
+                "faulted"
+            }
+        ),
     }
     crate::kprintln!("x86 mitigations: {}", ControlList(controls));
-    for class in unanswered(inputs, controls).into_iter().flatten()
+    for (class, open) in vulnerable(inputs, controls).into_iter().flatten()
     {
-        crate::kprintln!("x86 mitigations: {class} has kernel action, but no control answers it");
+        crate::kprintln!("x86 mitigations: vulnerable: {class} ({})", open.text());
     }
     if controls.has(SPECULATION_CONTROL_VERW_EXIT) && !cpu.verw_clears()
     {
@@ -526,6 +679,8 @@ pub fn report(cpu: &CpuEnumeration, inputs: Inputs, controls: Controls)
 const IA32_SPEC_CTRL: u32 = 0x48;
 /// `IA32_SPEC_CTRL.IBRS`.
 const SPEC_CTRL_IBRS: u64 = 1 << 0;
+/// `IA32_SPEC_CTRL.STIBP`.
+const SPEC_CTRL_STIBP: u64 = 1 << 1;
 /// `IA32_SPEC_CTRL.BHI_DIS_S`.
 const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
 /// `IA32_EFER`.
@@ -536,6 +691,10 @@ const EFER_AIBRSE: u64 = 1 << 21;
 const IA32_UARCH_MISC_CTL: u32 = 0x1B01;
 /// `IA32_UARCH_MISC_CTL.DOITM`.
 const UARCH_MISC_CTL_DOITM: u64 = 1 << 0;
+/// AMD's `DE_CFG` (`MSR C001_1029`).
+const AMD_DE_CFG: u32 = 0xC001_1029;
+/// `DE_CFG[1]`: `LFENCE` is dispatch-serializing.
+const DE_CFG_LFENCE_SERIALIZE: u64 = 1 << 1;
 
 /// The MSR bits the selected `controls` set: one entry per MSR, with the bits
 /// in it, empty bits for an MSR no control writes.
@@ -547,7 +706,8 @@ fn msr_bits(controls: Controls) -> [(u32, u64); 3]
             IA32_SPEC_CTRL,
             pick(SPECULATION_CONTROL_EIBRS, SPEC_CTRL_IBRS)
                 | pick(SPECULATION_CONTROL_IBRS_ENTRY, SPEC_CTRL_IBRS)
-                | pick(SPECULATION_CONTROL_BHI_DIS_S, SPEC_CTRL_BHI_DIS_S),
+                | pick(SPECULATION_CONTROL_BHI_DIS_S, SPEC_CTRL_BHI_DIS_S)
+                | pick(SPECULATION_CONTROL_STIBP, SPEC_CTRL_STIBP),
         ),
         (IA32_EFER, pick(SPECULATION_CONTROL_AUTO_IBRS, EFER_AIBRSE)),
         (
@@ -557,9 +717,9 @@ fn msr_bits(controls: Controls) -> [(u32, u64); 3]
     ]
 }
 
-/// Each control set in an MSR, with the input that enumerates its MSR bit and
-/// the message a CPU that does not enumerate it halts with.
-const MSR_CONTROLS: [(u64, u64, &str); 5] = [
+/// Each control that sets or writes an MSR, with the input that enumerates its
+/// MSR bit and the message a CPU that does not enumerate it halts with.
+const MSR_CONTROLS: [(u64, u64, &str); 7] = [
     (
         SPECULATION_CONTROL_EIBRS,
         SPECULATION_INPUT_IBRS_ALL,
@@ -585,6 +745,16 @@ const MSR_CONTROLS: [(u64, u64, &str); 5] = [
         SPECULATION_INPUT_DOITM,
         "CPU lacks the DOITM control the boot CPU selected",
     ),
+    (
+        SPECULATION_CONTROL_IBPB_ENTRY,
+        SPECULATION_INPUT_IBPB,
+        "CPU lacks the IBPB on entry the boot CPU selected",
+    ),
+    (
+        SPECULATION_CONTROL_STIBP,
+        SPECULATION_INPUT_STIBP,
+        "CPU lacks the STIBP the boot CPU selected",
+    ),
 ];
 
 /// The halt message for the first MSR control of `controls` that a CPU with
@@ -600,13 +770,118 @@ pub fn missing_msr_control(controls: Controls, inputs: Inputs) -> Option<&'stati
         .map(|&(_, _, message)| message)
 }
 
-/// Set this CPU's MSR controls of the installed selection: enhanced IBRS and
-/// `BHI_DIS_S` in `IA32_SPEC_CTRL`, Automatic IBRS in `EFER`, and `DOITM` in
-/// `IA32_UARCH_MISC_CTL`, each by a read-modify-write that keeps the MSR's
-/// other bits. With IBRS on entry selected, `IA32_SPEC_CTRL` is instead
-/// written whole with the kernel's value ([`spec_ctrl_values`]), the value
-/// every entry from user mode writes. Each is per logical processor, so every
-/// CPU sets its own.
+/// Whether a CPU `cpu` sets `DE_CFG[1]`, which makes `LFENCE`
+/// dispatch-serializing (AMD's "Software Techniques for Managing Speculation
+/// on AMD Processors", mitigation G-2): an AMD part of Family 10h or later
+/// other than 11h that does not enumerate `LfenceAlwaysSerializing`
+/// (`CPUID Fn8000_0021 EAX[2]`), or any CPU under [`ForcedReturn::Amd`]. Not
+/// on Intel, whose `LFENCE` is serializing by its architecture; not on Family
+/// 0Fh or 11h, where it already is; not where the CPU enumerates that it
+/// always is; not on another vendor, whose `DE_CFG` the kernel does not read.
+pub fn de_cfg_wanted(cpu: &CpuEnumeration, force: ForcedReturn) -> bool
+{
+    let family = cpu.family();
+    force == ForcedReturn::Amd
+        || (cpu.vendor == Vendor::Amd
+            && family >= 0x10
+            && family != 0x11
+            && !cpu.lfence_always_serializing())
+}
+
+/// What the `DE_CFG[1]` step left on one CPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeCfg
+{
+    /// The bit reads back set.
+    Set,
+    /// The read or the write raised `#GP`: a hypervisor that does not give
+    /// the guest the MSR.
+    Refused,
+    /// The write completed but the bit reads back clear: a hypervisor that
+    /// ignores the write.
+    DidNotStick,
+}
+
+impl DeCfg
+{
+    /// The outcome's text in the serial log.
+    pub fn text(self) -> &'static str
+    {
+        match self
+        {
+            DeCfg::Set => "set",
+            DeCfg::Refused => "not set: the MSR access raised #GP",
+            DeCfg::DidNotStick => "not set: the write did not hold",
+        }
+    }
+}
+
+/// The outcome of the `DE_CFG[1]` step from what its accesses returned: the
+/// first read, the write where one was made (`None` for none), and the read
+/// back.
+fn de_cfg_outcome(read: Option<u64>, wrote: Option<bool>, read_back: Option<u64>) -> DeCfg
+{
+    match (read, wrote, read_back)
+    {
+        (None, _, _) | (_, Some(false), _) | (_, _, None) => DeCfg::Refused,
+        (_, _, Some(value)) if value & DE_CFG_LFENCE_SERIALIZE != 0 => DeCfg::Set,
+        _ => DeCfg::DidNotStick,
+    }
+}
+
+/// Set `DE_CFG[1]` on this CPU by a fault-tolerant read-modify-write, and read
+/// it back.
+///
+/// # Safety
+/// As [`super::idt::msr_recovering`]: ring 0 on the kernel's GDT, interrupts
+/// off, no shadow stack. The write sets one bit the vendor defines and keeps
+/// the others.
+#[cfg(not(test))]
+unsafe fn set_de_cfg() -> DeCfg
+{
+    use super::idt::msr_recovering;
+    // SAFETY: the caller's contract.
+    let read = unsafe { msr_recovering(AMD_DE_CFG, None) };
+    let wrote = match read
+    {
+        Some(value) if value & DE_CFG_LFENCE_SERIALIZE == 0 =>
+        {
+            // SAFETY: the caller's contract; the value is the one read, with
+            // the one bit set.
+            Some(
+                unsafe { msr_recovering(AMD_DE_CFG, Some(value | DE_CFG_LFENCE_SERIALIZE)) }
+                    .is_some(),
+            )
+        }
+        _ => None,
+    };
+    let read_back = if read.is_some()
+    {
+        // SAFETY: the caller's contract.
+        unsafe { msr_recovering(AMD_DE_CFG, None) }
+    }
+    else
+    {
+        None
+    };
+    de_cfg_outcome(read, wrote, read_back)
+}
+
+/// Whether a CPU has logged its `DE_CFG[1]` outcome: the first CPU to take the
+/// step, the boot CPU, logs it whatever it is, and every later CPU only one
+/// that is not [`DeCfg::Set`].
+#[cfg(not(test))]
+static DE_CFG_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Set this CPU's MSR controls of the installed selection: enhanced IBRS,
+/// `BHI_DIS_S` and STIBP in `IA32_SPEC_CTRL`, Automatic IBRS in `EFER`, and
+/// `DOITM` in `IA32_UARCH_MISC_CTL`, each by a read-modify-write that keeps
+/// the MSR's other bits. With IBRS on entry selected, `IA32_SPEC_CTRL` is
+/// instead written whole with the kernel's value ([`spec_ctrl_values`]), the
+/// value every entry from user mode writes. Each is per logical processor, so
+/// every CPU sets its own. Then, where [`de_cfg_wanted`] holds, set
+/// `DE_CFG[1]` ([`set_de_cfg`]) and log the outcome as [`DE_CFG_LOGGED`]
+/// says, naming the CPU by its initial APIC ID (`CPUID.01H:EBX[31:24]`).
 ///
 /// # Panics
 /// Halts via `crate::fatal`, naming the control, when this CPU does not
@@ -614,7 +889,10 @@ pub fn missing_msr_control(controls: Controls, inputs: Inputs) -> Option<&'stati
 /// before any access to its MSR.
 ///
 /// # Safety
-/// Ring 0, on the CPU being brought up, after [`install`].
+/// Ring 0, on the CPU being brought up and on the kernel's GDT
+/// (`gdt::load_boot_segments` on the boot CPU, `gdt::init_ap` on an AP),
+/// after [`install`], with interrupts off and before `shadow_stack::enable`
+/// on it.
 #[cfg(not(test))]
 pub unsafe fn apply_this_cpu()
 {
@@ -649,6 +927,20 @@ pub unsafe fn apply_this_cpu()
         // the implemented MSR defines, and keeps every other bit.
         unsafe { super::cpu::write_msr(msr, value | bits) };
     }
+    if de_cfg_wanted(&cpu, FORCED_RETURN)
+    {
+        // SAFETY: the caller's contract.
+        let outcome = unsafe { set_de_cfg() };
+        let first = !DE_CFG_LOGGED.swap(true, Ordering::Relaxed);
+        if first || outcome != DeCfg::Set
+        {
+            crate::kprintln!(
+                "x86 mitigations: cpu {}: DE_CFG[1] (LFENCE dispatch-serializing) {}",
+                super::cpu::cpuid(1).1 >> 24,
+                outcome.text()
+            );
+        }
+    }
 }
 
 /// The controls in effect on the calling CPU, a `SPECULATION_CONTROL_*` set:
@@ -656,8 +948,7 @@ pub unsafe fn apply_this_cpu()
 /// selected control lives in it, and the others as the flags the entry and
 /// exit code test hold them. `IA32_SPEC_CTRL.IBRS` reads as IBRS on entry
 /// when that is selected, and as enhanced IBRS otherwise; the call runs in the
-/// kernel, after the entry that set it. The fill after an IBPB is reported as
-/// selected: the kernel issues no IBPB, so no IBPB is left without it.
+/// kernel, after the entry that set it.
 #[cfg(not(test))]
 pub fn in_effect() -> u64
 {
@@ -679,7 +970,8 @@ pub fn in_effect() -> u64
     if selected.bits()
         & (SPECULATION_CONTROL_EIBRS
             | SPECULATION_CONTROL_IBRS_ENTRY
-            | SPECULATION_CONTROL_BHI_DIS_S)
+            | SPECULATION_CONTROL_BHI_DIS_S
+            | SPECULATION_CONTROL_STIBP)
         != 0
     {
         let ibrs = if selected.has(SPECULATION_CONTROL_IBRS_ENTRY)
@@ -695,6 +987,7 @@ pub fn in_effect() -> u64
             &[
                 (ibrs, SPEC_CTRL_IBRS),
                 (SPECULATION_CONTROL_BHI_DIS_S, SPEC_CTRL_BHI_DIS_S),
+                (SPECULATION_CONTROL_STIBP, SPEC_CTRL_STIBP),
             ],
         );
     }
@@ -712,6 +1005,8 @@ pub fn in_effect() -> u64
         (&SERAPH_VERW_ON_EXIT, SPECULATION_CONTROL_VERW_EXIT),
         (&VERW_BEFORE_IDLE, SPECULATION_CONTROL_VERW_IDLE),
         (&RSB_FILL_ON_SWITCH, SPECULATION_CONTROL_RSB_FILL_SWITCH),
+        (&SERAPH_IBPB_ENTRY, SPECULATION_CONTROL_IBPB_ENTRY),
+        (&SERAPH_RSB_FILL_IBPB, SPECULATION_CONTROL_RSB_FILL_IBPB),
     ];
     for (flag, control) in flags
     {
@@ -720,7 +1015,7 @@ pub fn in_effect() -> u64
             bits |= control;
         }
     }
-    bits | (selected.bits() & SPECULATION_CONTROL_RSB_FILL_IBPB)
+    bits
 }
 
 /// One word of the mitigation state for `SYS_SYSTEM_INFO`
@@ -868,6 +1163,57 @@ macro_rules! ibrs_paranoid_exit_asm {
 #[cfg(not(test))]
 pub(super) use ibrs_paranoid_exit_asm;
 
+/// Asm fragment: the IBPB on entry, when [`SPECULATION_CONTROL_IBPB_ENTRY`] is
+/// selected, and after it, when [`SPECULATION_CONTROL_RSB_FILL_IBPB`] is, the
+/// return stack buffer fill: 32 entries that trap speculation (`int3`), two
+/// calls per iteration whose return addresses are dropped from the stack.
+/// Where a supervisor shadow stack is on, on this CPU at this moment
+/// (`rdsspq` leaves the zeroed register where it is not), `incsspq` drops
+/// the 32 entries the calls pushed there too, so the shadow stack again
+/// matches the stack and no return is rewritten.
+///
+/// Placed on every entry from user mode before the first `ret` and indirect
+/// branch that the entry's own `call`s do not pair (`seraph_enter_from_user`),
+/// and in the paranoid stubs; the fragment's own calls make no `ret`.
+/// Clobbers EAX, ECX, EDX and RFLAGS; uses 16 bytes of stack below RSP. Its
+/// caller ends the sequence in `lfence`, so a mispredicted test of a flag
+/// runs no later instruction. Labels 70 to 79.
+#[cfg(not(test))]
+macro_rules! ibpb_asm {
+    () => {
+        concat!(
+            "cmp byte ptr [rip + SERAPH_IBPB_ENTRY], 0\n",
+            "je 79f\n",
+            "mov ecx, 0x49\n",
+            "mov eax, 1\n",
+            "xor edx, edx\n",
+            "wrmsr\n",
+            "cmp byte ptr [rip + SERAPH_RSB_FILL_IBPB], 0\n",
+            "je 79f\n",
+            "mov ecx, 16\n",
+            "70:\n",
+            "call 71f\n",
+            "int3\n",
+            "71:\n",
+            "call 72f\n",
+            "int3\n",
+            "72:\n",
+            "add rsp, 16\n",
+            "dec ecx\n",
+            "jnz 70b\n",
+            "xor eax, eax\n",
+            "rdsspq rax\n",
+            "test rax, rax\n",
+            "jz 79f\n",
+            "mov eax, 32\n",
+            "incsspq rax\n",
+            "79:\n",
+        )
+    };
+}
+#[cfg(not(test))]
+pub(super) use ibpb_asm;
+
 // The retpoline thunk and the entry routine.
 //
 // `__x86_indirect_thunk_r11` is the target of every indirect call and jump the
@@ -883,13 +1229,17 @@ pub(super) use ibrs_paranoid_exit_asm;
 // indirect branch and any `ret` that its own `call` did not pair. With IBRS on
 // entry selected it first writes the kernel's `IA32_SPEC_CTRL` value, `IBRS`
 // set, so the predictions user mode trained steer no later indirect branch or
-// `ret` (Intel's RSBU guidance). Then, with the clearing selected, it runs
-// Intel's branch history clearing sequence (the long form, 12 outer and 7 inner
-// iterations, which covers the short form's parts as well), and returns. Its
-// calls and returns pair up, so it runs on a supervisor shadow stack too. It
-// clobbers EAX, ECX, EDX and RFLAGS and needs a stack; both of its paths end in
-// `lfence`, so no later instruction runs before the `IA32_SPEC_CTRL` write
-// completes and the flags' tests resolve.
+// `ret` (Intel's RSBU guidance). With the IBPB on entry selected it then
+// issues the IBPB, and the fill after it where that is selected (`ibpb_asm`),
+// before its own `ret`, the first of the entry (AMD's branch type confusion and
+// speculative return stack overflow guidance). Then, with the clearing
+// selected, it runs Intel's branch history clearing sequence (the long form,
+// 12 outer and 7 inner iterations, which covers the short form's parts as
+// well), and returns. Its calls and returns pair up, or are dropped from both
+// stacks together, so it runs on a supervisor shadow stack too. It clobbers
+// EAX, ECX, EDX and RFLAGS and needs a stack; both of its paths end in
+// `lfence`, so no later instruction runs before the MSR writes complete and
+// the flags' tests resolve.
 #[cfg(not(test))]
 core::arch::global_asm!(
     ".pushsection .text.seraph_mitigation, \"ax\"",
@@ -919,6 +1269,7 @@ core::arch::global_asm!(
     "    mov edx, dword ptr [rip + {spec_ctrl_kernel} + 4]",
     "    wrmsr",
     "5:",
+    ibpb_asm!(),
     "    cmp byte ptr [rip + {bhb_clear}], 0",
     "    je 6f",
     "    mov ecx, 12",
@@ -972,6 +1323,8 @@ mod tests
             ext21_eax: 0,
             ext21_ecx: 0,
             arch_capabilities: 0,
+            smt: false,
+            sbpb_accepted: false,
         }
     }
 
@@ -1065,6 +1418,186 @@ mod tests
         );
     }
 
+    // Defect caught: a Zen or Zen+ part, which AMD's branch type confusion
+    // guidance ("Technical Guidance for Mitigating Branch Type Confusion",
+    // Rev 3.0) names affected and whose IBPB flushes every branch type, left
+    // without the IBPB on entry, or reported mitigated while SMT is on and the
+    // CPU has no STIBP to keep the sibling thread's training out. EPYC 7001
+    // (family 17h model 01H) with IBPB and without `IBPB_RET` or STIBP.
+    #[test]
+    fn zen1_selects_ibpb_on_entry_and_reports_smt_without_stibp()
+    {
+        let mut zen1 = cpu(Vendor::Amd, 0x0080_0F12);
+        zen1.ext8_ebx = 1 << 12;
+        zen1.smt = true;
+        let inputs = Inputs::of(&zen1, &derive(&zen1));
+        let controls = select(inputs);
+        assert_eq!(
+            controls.bits(),
+            SPECULATION_CONTROL_RETPOLINE
+                | SPECULATION_CONTROL_RSB_FILL_IBPB
+                | SPECULATION_CONTROL_IBPB_ENTRY
+        );
+        assert_eq!(
+            vulnerable(inputs, controls),
+            [
+                Some(("retbleed", Open::SmtWithoutStibp)),
+                Some(("spec_rstack_overflow", Open::SmtWithoutStibp))
+            ]
+        );
+        zen1.smt = false;
+        let inputs = Inputs::of(&zen1, &derive(&zen1));
+        assert_eq!(vulnerable(inputs, select(inputs)), [None, None]);
+    }
+
+    // Defect caught: Zen 2 with the IBPB and STIBP of its microcode left
+    // without the IBPB on entry for branch type confusion and speculative
+    // return stack overflow, without the fill after it (no `IBPB_RET`), or
+    // without STIBP while SMT is on ("Technical Guidance for Mitigating Branch
+    // Type Confusion", Rev 3.0; "Technical Update Regarding Speculative Return
+    // Stack Overflow", Rev 2.0: family 17h treats its IBPB as `IBPB_BRTYPE`).
+    // The `vulnerability::tests::amd_zen2` part, family 17h model 31H.
+    #[test]
+    fn zen2_with_ibpb_selects_ibpb_on_entry_fill_and_stibp()
+    {
+        let mut zen2 = cpu(Vendor::Amd, 0x0083_0F10);
+        zen2.ext8_ebx = (1 << 12) | (1 << 15);
+        zen2.smt = true;
+        let inputs = Inputs::of(&zen2, &derive(&zen2));
+        let controls = select(inputs);
+        assert_eq!(
+            controls.bits(),
+            SPECULATION_CONTROL_RETPOLINE
+                | SPECULATION_CONTROL_RSB_FILL_IBPB
+                | SPECULATION_CONTROL_IBPB_ENTRY
+                | SPECULATION_CONTROL_STIBP
+        );
+        assert_eq!(vulnerable(inputs, controls), [None, None]);
+    }
+
+    // Defect caught: Zen 3 whose IBPB leaves branch types (no SRSO microcode,
+    // AMD-SB-7005) given the IBPB on entry, which would not answer speculative
+    // return stack overflow, or reported mitigated; or Zen 3 with that
+    // microcode, which the `SBPB` probe detects or `Fn8000_0021 EAX` reports
+    // as `SBPB` or `IBPB_BRTYPE` ("Technical Update Regarding Speculative
+    // Return Stack Overflow", Rev 2.0), left without it. Family 19h model 21H
+    // with IBPB and STIBP, SMT on.
+    #[test]
+    fn zen3_takes_ibpb_on_entry_only_with_the_srso_microcode()
+    {
+        let mut zen3 = cpu(Vendor::Amd, 0x00A2_0F10);
+        zen3.ext8_ebx = (1 << 12) | (1 << 15);
+        zen3.smt = true;
+        let base = SPECULATION_CONTROL_RETPOLINE
+            | SPECULATION_CONTROL_VERW_EXIT
+            | SPECULATION_CONTROL_VERW_IDLE
+            | SPECULATION_CONTROL_RSB_FILL_IBPB;
+        let inputs = Inputs::of(&zen3, &derive(&zen3));
+        assert_eq!(select(inputs).bits(), base);
+        assert_eq!(
+            vulnerable(inputs, select(inputs)),
+            [
+                None,
+                Some(("spec_rstack_overflow", Open::IbpbLeavesBranchType))
+            ]
+        );
+        let mut accepted = zen3;
+        accepted.sbpb_accepted = true;
+        let mut sbpb = zen3;
+        sbpb.ext21_eax = 1 << 27;
+        let mut brtype = zen3;
+        brtype.ext21_eax = 1 << 28;
+        for (name, part) in [("probe", accepted), ("SBPB", sbpb), ("IBPB_BRTYPE", brtype)]
+        {
+            let inputs = Inputs::of(&part, &derive(&part));
+            assert_eq!(
+                select(inputs).bits(),
+                base | SPECULATION_CONTROL_IBPB_ENTRY | SPECULATION_CONTROL_STIBP,
+                "{name}"
+            );
+            assert_eq!(vulnerable(inputs, select(inputs)), [None, None], "{name}");
+        }
+    }
+
+    // Defect caught: Zen 4 with `IBPB_BRTYPE` left without the IBPB on entry
+    // for speculative return stack overflow, given the fill its `IBPB_RET`
+    // makes unneeded, or kept off shadow stacks, which the IBPB on entry does
+    // not require ("Technical Update Regarding Speculative Return Stack
+    // Overflow", Rev 2.0). Family 19h model 61H with Automatic IBRS,
+    // `VERW_CLEAR`, IBPB, STIBP and `IBPB_RET`, SMT on.
+    #[test]
+    fn zen4_with_ibpb_brtype_selects_ibpb_on_entry_and_keeps_shadow_stacks()
+    {
+        let mut zen4 = cpu(Vendor::Amd, 0x00A6_0F12);
+        zen4.ext8_ebx = (1 << 12) | (1 << 15) | (1 << 30);
+        zen4.ext21_eax = (1 << 28) | (1 << 8) | (1 << 5);
+        zen4.smt = true;
+        let inputs = Inputs::of(&zen4, &derive(&zen4));
+        let controls = select(inputs);
+        assert_eq!(
+            controls.bits(),
+            SPECULATION_CONTROL_AUTO_IBRS
+                | SPECULATION_CONTROL_VERW_EXIT
+                | SPECULATION_CONTROL_VERW_IDLE
+                | SPECULATION_CONTROL_IBPB_ENTRY
+                | SPECULATION_CONTROL_STIBP
+        );
+        assert!(!controls.rewrites_returns());
+        assert_eq!(vulnerable(inputs, controls), [None, None]);
+    }
+
+    // Defect caught: `DE_CFG[1]` written where it is not defined or not
+    // needed, or left unwritten where an `lfence` needs it to serialize (AMD
+    // STMS mitigation G-2): every AMD family from 10h but 11h, unless
+    // `Fn8000_0021 EAX[2]` reports `lfence` always serializing; never on
+    // Intel or another vendor, unless the `amd` override forces the step.
+    #[test]
+    fn de_cfg_is_wanted_on_amd_parts_whose_lfence_may_not_serialize()
+    {
+        let mut zen4 = cpu(Vendor::Amd, 0x00A6_0F12);
+        for (name, part, wanted) in [
+            ("Zen 2", cpu(Vendor::Amd, 0x0083_0F10), true),
+            ("Zen 4", zen4, true),
+            ("family 10h", cpu(Vendor::Amd, 0x0010_0F42), true),
+            ("family 11h", cpu(Vendor::Amd, 0x0020_0F31), false),
+            ("family 0Fh", cpu(Vendor::Amd, 0x0002_0F12), false),
+            ("TCG", cpu(Vendor::Amd, 0x0000_0663), false),
+            ("Intel", cpu(Vendor::Intel, 0x0009_0672), false),
+            ("other vendor", cpu(Vendor::Other, 0x0083_0F10), false),
+        ]
+        {
+            assert_eq!(de_cfg_wanted(&part, ForcedReturn::None), wanted, "{name}");
+            assert_eq!(de_cfg_wanted(&part, ForcedReturn::Intel), wanted, "{name}");
+            assert!(de_cfg_wanted(&part, ForcedReturn::Amd), "{name}");
+        }
+        zen4.ext21_eax = 1 << 2;
+        assert!(!de_cfg_wanted(&zen4, ForcedReturn::None));
+    }
+
+    // Defect caught: a `DE_CFG` step reported set when an access faulted or
+    // the bit did not hold, or reported failed when it reads back set.
+    #[test]
+    fn de_cfg_outcome_follows_each_access()
+    {
+        for (read, wrote, read_back, outcome) in [
+            (Some(0), Some(true), Some(2), DeCfg::Set),
+            (Some(2), None, Some(2), DeCfg::Set),
+            (Some(0x10), Some(true), Some(0x12), DeCfg::Set),
+            (None, None, None, DeCfg::Refused),
+            (Some(0), Some(false), Some(0), DeCfg::Refused),
+            (Some(0), Some(true), None, DeCfg::Refused),
+            (Some(0), Some(true), Some(0), DeCfg::DidNotStick),
+        ]
+        {
+            assert_eq!(
+                de_cfg_outcome(read, wrote, read_back),
+                outcome,
+                "{read:?} {wrote:?} {read_back:?}"
+            );
+        }
+        assert_eq!(DeCfg::Set.text(), "set");
+    }
+
     // Defect caught: a part whose returns fall back to the branch target buffer
     // left without the switch fill in the retpoline build, or given the
     // clearing sequence or VERW its table does not ask for. Ice Lake U/Y
@@ -1152,18 +1685,16 @@ mod tests
         other.ext8_ebx = 1 << 14;
         assert_eq!(controls_of(&other), software);
         let inputs = Inputs::of(&other, &derive(&other));
-        assert_eq!(
-            unanswered(inputs, select(inputs)),
-            [Some("retbleed"), Some("spec_rstack_overflow")]
-        );
+        let open = [
+            Some(("retbleed", Open::NoControl)),
+            Some(("spec_rstack_overflow", Open::IbpbLeavesBranchType)),
+        ];
+        assert_eq!(vulnerable(inputs, select(inputs)), open);
         other.leaf7_edx |= 1 << 29;
         other.arch_capabilities = 1 << 1;
         let inputs = Inputs::of(&other, &derive(&other));
         assert!(select(inputs).bits() & SPECULATION_CONTROL_EIBRS != 0);
-        assert_eq!(
-            unanswered(inputs, select(inputs)),
-            [Some("retbleed"), Some("spec_rstack_overflow")]
-        );
+        assert_eq!(vulnerable(inputs, select(inputs)), open);
     }
 
     // Defect caught: a part whose table gives every class kernel action and both
@@ -1246,7 +1777,7 @@ mod tests
                     | SPECULATION_CONTROL_VERW_IDLE,
                 "signature {signature:#x}"
             );
-            assert_eq!(unanswered(inputs, controls), [None, None]);
+            assert_eq!(vulnerable(inputs, controls), [None, None]);
         }
     }
 
@@ -1290,48 +1821,139 @@ mod tests
         );
     }
 
+    // Defect caught: the `amd` override read wrongly, or one that adds an
+    // enumerated bit (so a CPU without IBPB would select the IBPB on entry and
+    // fault at its first entry) or keeps `rsb_alternate`, which would read
+    // `retbleed` as an Intel part's. The development host's inputs, with IBPB
+    // and STIBP enumerated as KVM passes them, forced, keep enhanced IBRS for
+    // branch target injection and add the IBPB on entry and STIBP; inputs
+    // without IBPB select neither and leave both classes vulnerable.
+    #[test]
+    fn forced_amd_inputs_select_ibpb_on_entry()
+    {
+        assert_eq!(forced_return(Some("amd")), ForcedReturn::Amd);
+        let mut host = cpu(Vendor::Intel, 0x0009_0672);
+        host.leaf7_edx = (1 << 29) | (1 << 27) | (1 << 26);
+        host.leaf7_2_edx = 0x17;
+        host.arch_capabilities = 0x4000_0000_1400_E06B;
+        host.smt = true;
+        let inputs = Inputs::of(&host, &derive(&host));
+        let forced = inputs.forced(ForcedReturn::Amd);
+        assert_eq!(
+            forced.bits(),
+            inputs.bits() | SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_SRSO
+        );
+        let controls = select(forced);
+        assert_eq!(
+            controls.bits(),
+            SPECULATION_CONTROL_EIBRS
+                | SPECULATION_CONTROL_BHI_DIS_S
+                | SPECULATION_CONTROL_VERW_EXIT
+                | SPECULATION_CONTROL_RSB_FILL_IBPB
+                | SPECULATION_CONTROL_IBPB_ENTRY
+                | SPECULATION_CONTROL_STIBP
+        );
+        assert!(!controls.rewrites_returns());
+        assert_eq!(missing_msr_control(controls, inputs), None);
+        assert_eq!(vulnerable(forced, controls), [None, None]);
+        let without_ibpb = Inputs(SPECULATION_INPUT_SPECTRE_V2).forced(ForcedReturn::Amd);
+        assert_eq!(select(without_ibpb).bits(), SPECULATION_CONTROL_RETPOLINE);
+        assert_eq!(
+            vulnerable(without_ibpb, select(without_ibpb)),
+            [
+                Some(("retbleed", Open::NoIbpb)),
+                Some(("spec_rstack_overflow", Open::NoIbpb))
+            ]
+        );
+    }
+
     // Defect caught: a build with an unknown override value that builds,
     // running the CPU's own inputs while its builder expects forced ones.
     #[test]
     #[should_panic(expected = "SERAPH_FORCE_RETURN_MITIGATION")]
     fn an_unknown_forced_value_is_refused()
     {
-        let _ = forced_return(Some("amd"));
+        let _ = forced_return(Some("zen"));
     }
 
-    // Defect caught: a class with kernel action that no selected control
-    // answers left out of the log, or a warning for one a control answers.
-    // Zen 2 leaves `retbleed` and `spec_rstack_overflow` open; enhanced IBRS
+    // Defect caught: a class with kernel action that the selection leaves open
+    // left out of the log or reported as mitigated, given the wrong reason, or
+    // a class a control answers reported. Zen 2 without IBPB leaves `retbleed`
+    // and `spec_rstack_overflow` open for want of the barrier; enhanced IBRS
     // and IBRS on entry each answer `retbleed` whose returns fall back to the
-    // branch target buffer on an Intel part, and neither answers it otherwise
-    // (branch type confusion, or another vendor's `retbleed` of either form).
+    // branch target buffer on an Intel part, and neither answers it otherwise;
+    // the IBPB on entry answers branch type confusion and speculative return
+    // stack overflow unless the IBPB leaves branch types or SMT is on without
+    // STIBP.
     #[test]
-    fn unanswered_names_each_open_class()
+    fn vulnerable_names_each_open_class_and_its_reason()
     {
         let zen2 = cpu(Vendor::Amd, 0x0083_0F10);
         let inputs = Inputs::of(&zen2, &derive(&zen2));
         assert_eq!(
-            unanswered(inputs, select(inputs)),
-            [Some("retbleed"), Some("spec_rstack_overflow")]
+            vulnerable(inputs, select(inputs)),
+            [
+                Some(("retbleed", Open::NoIbpb)),
+                Some(("spec_rstack_overflow", Open::NoIbpb))
+            ]
         );
         let retbleed = Inputs(
             SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_RSB_ALTERNATE | SPECULATION_INPUT_IBRS,
         );
-        let confusion = Inputs(SPECULATION_INPUT_RETBLEED);
         let other_vendor = Inputs(SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_RSB_ALTERNATE);
         for answer in [SPECULATION_CONTROL_EIBRS, SPECULATION_CONTROL_IBRS_ENTRY]
         {
-            assert_eq!(unanswered(retbleed, Controls(answer)), [None, None]);
-            for open in [confusion, other_vendor]
-            {
-                assert_eq!(unanswered(open, Controls(answer)), [Some("retbleed"), None]);
-            }
+            assert_eq!(vulnerable(retbleed, Controls(answer)), [None, None]);
+            assert_eq!(
+                vulnerable(other_vendor, Controls(answer)),
+                [Some(("retbleed", Open::NoControl)), None]
+            );
         }
         assert_eq!(
-            unanswered(retbleed, Controls(SPECULATION_CONTROL_RETPOLINE)),
-            [Some("retbleed"), None]
+            vulnerable(retbleed, Controls(SPECULATION_CONTROL_RETPOLINE)),
+            [Some(("retbleed", Open::NoControl)), None]
         );
-        assert_eq!(unanswered(Inputs(0), Controls(0)), [None, None]);
+        let ibpb = SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_SRSO | SPECULATION_INPUT_IBPB;
+        let entry = Controls(SPECULATION_CONTROL_IBPB_ENTRY);
+        let both = |open| {
+            [
+                Some(("retbleed", open)),
+                Some(("spec_rstack_overflow", open)),
+            ]
+        };
+        assert_eq!(vulnerable(Inputs(ibpb), entry), [None, None]);
+        assert_eq!(vulnerable(Inputs(ibpb), Controls(0)), both(Open::NoControl));
+        assert_eq!(
+            vulnerable(
+                Inputs(ibpb | SPECULATION_INPUT_IBPB_LEAVES_BRTYPE),
+                Controls(0)
+            ),
+            both(Open::IbpbLeavesBranchType)
+        );
+        assert_eq!(
+            vulnerable(Inputs(ibpb | SPECULATION_INPUT_SMT), entry),
+            both(Open::SmtWithoutStibp)
+        );
+        assert_eq!(
+            vulnerable(
+                Inputs(ibpb | SPECULATION_INPUT_SMT | SPECULATION_INPUT_STIBP),
+                Controls(SPECULATION_CONTROL_IBPB_ENTRY | SPECULATION_CONTROL_STIBP)
+            ),
+            [None, None]
+        );
+        assert_eq!(vulnerable(Inputs(0), Controls(0)), [None, None]);
+        for (open, text) in [
+            (Open::NoControl, "no control answers it"),
+            (Open::NoIbpb, "no IBPB"),
+            (
+                Open::IbpbLeavesBranchType,
+                "IBPB does not flush branch types",
+            ),
+            (Open::SmtWithoutStibp, "SMT on without STIBP"),
+        ]
+        {
+            assert_eq!(open.text(), text);
+        }
     }
 
     // Defect caught: a rule that selects a control without its class, picks the
@@ -1436,6 +2058,55 @@ mod tests
         }
     }
 
+    // Defect caught: the IBPB on entry selected without the class it answers,
+    // without an IBPB, or with one that leaves branch types; for `retbleed`
+    // whose returns fall back to an alternate predictor, which it does not
+    // answer; or STIBP selected without it.
+    #[test]
+    fn each_ibpb_rule_selects_its_control()
+    {
+        let cases: [(u64, u64); 6] = [
+            (
+                SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_IBPB,
+                SPECULATION_CONTROL_IBPB_ENTRY,
+            ),
+            (
+                SPECULATION_INPUT_SRSO | SPECULATION_INPUT_IBPB | SPECULATION_INPUT_STIBP,
+                SPECULATION_CONTROL_IBPB_ENTRY | SPECULATION_CONTROL_STIBP,
+            ),
+            (
+                SPECULATION_INPUT_RETBLEED
+                    | SPECULATION_INPUT_SRSO
+                    | SPECULATION_INPUT_IBPB
+                    | SPECULATION_INPUT_STIBP
+                    | SPECULATION_INPUT_IBPB_LEAVES_BRTYPE,
+                0,
+            ),
+            (
+                SPECULATION_INPUT_RETBLEED
+                    | SPECULATION_INPUT_RSB_ALTERNATE
+                    | SPECULATION_INPUT_IBPB,
+                0,
+            ),
+            (
+                SPECULATION_INPUT_RETBLEED | SPECULATION_INPUT_SRSO | SPECULATION_INPUT_STIBP,
+                0,
+            ),
+            (
+                SPECULATION_INPUT_IBPB | SPECULATION_INPUT_STIBP | SPECULATION_INPUT_SMT,
+                0,
+            ),
+        ];
+        for (inputs, controls) in cases
+        {
+            assert_eq!(
+                select(Inputs(inputs)).bits(),
+                controls,
+                "inputs {inputs:#x}"
+            );
+        }
+    }
+
     // Defect caught: a per-CPU write of the wrong MSR or bit, or a write for a
     // control that is not selected.
     #[test]
@@ -1459,6 +2130,12 @@ mod tests
             msr_bits(Controls(SPECULATION_CONTROL_IBRS_ENTRY)),
             [(0x48, 1), (0xC000_0080, 0), (0x1B01, 0)]
         );
+        assert_eq!(
+            msr_bits(Controls(
+                SPECULATION_CONTROL_STIBP | SPECULATION_CONTROL_IBPB_ENTRY
+            )),
+            [(0x48, 2), (0xC000_0080, 0), (0x1B01, 0)]
+        );
     }
 
     // Defect caught: IBRS on entry that leaves `IBRS` set in user mode, writes a
@@ -1475,6 +2152,12 @@ mod tests
         assert_eq!(
             spec_ctrl_values(Controls(SPECULATION_CONTROL_IBRS_ENTRY)),
             (1, 0)
+        );
+        assert_eq!(
+            spec_ctrl_values(Controls(
+                SPECULATION_CONTROL_IBRS_ENTRY | SPECULATION_CONTROL_STIBP
+            )),
+            (3, 2)
         );
     }
 
@@ -1522,6 +2205,19 @@ mod tests
         assert!(!RETPOLINE.load(Ordering::Relaxed));
         assert_eq!(SERAPH_SPEC_CTRL_KERNEL.load(Ordering::Relaxed), 1);
         assert_eq!(SERAPH_SPEC_CTRL_USER.load(Ordering::Relaxed), 0);
+        assert!(!SERAPH_IBPB_ENTRY.load(Ordering::Relaxed));
+        assert!(!SERAPH_RSB_FILL_IBPB.load(Ordering::Relaxed));
+        let ibpb = Controls(
+            SPECULATION_CONTROL_IBPB_ENTRY
+                | SPECULATION_CONTROL_STIBP
+                | SPECULATION_CONTROL_RSB_FILL_IBPB,
+        );
+        install(Inputs(SPECULATION_INPUT_SRSO), ibpb);
+        assert!(SERAPH_IBPB_ENTRY.load(Ordering::Relaxed));
+        assert!(SERAPH_RSB_FILL_IBPB.load(Ordering::Relaxed));
+        assert!(!SERAPH_IBRS_ENTRY.load(Ordering::Relaxed));
+        assert_eq!(SERAPH_SPEC_CTRL_KERNEL.load(Ordering::Relaxed), 2);
+        assert_eq!(SERAPH_SPEC_CTRL_USER.load(Ordering::Relaxed), 2);
     }
 
     // Defect caught: shadow stacks turned on beside the retpoline sequence,

@@ -34,6 +34,15 @@ pub fn bsp_tss_ptr() -> u64
     0
 }
 
+/// Boot-CPU segment load stub for RISC-V, which has no segments.
+///
+/// A no-op, so Phase 1 calls it on both architectures.
+///
+/// # Safety
+/// No preconditions — the body is empty. The `unsafe` qualifier exists only to
+/// match the x86-64 surface signature.
+pub unsafe fn load_boot_segments() {}
+
 /// Per-AP GDT/TSS init stub for RISC-V.
 ///
 /// RISC-V has no GDT or TSS. This no-op exists so that `kernel_entry_ap`

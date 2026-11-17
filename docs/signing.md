@@ -393,10 +393,11 @@ before it writes the record, so a faulty signer cannot produce an image that fai
 
 **Implementation.** The host signer is Seraph's own: no crate from a registry is a dependency
 ([coding-standards.md](coding-standards.md) § Dependencies). Ed25519 key generation and signing
-join verification in [`shared/crypto`](../shared/crypto/README.md), which guarantees:
+join verification in [`shared/crypto`](../shared/crypto/README.md). xtask, the host caller, draws
+each key's 32-byte secret seed from the host's operating-system random source and passes it in;
+`shared/crypto`, which does no I/O, guarantees:
 
-- a key is generated from a 32-byte secret seed drawn from the host's operating-system random
-  source, and its public key is derived from the seed as RFC 8032 § 5.1.5 specifies;
+- a public key is derived from its seed as RFC 8032 § 5.1.5 specifies;
 - a signature is deterministic, as RFC 8032 § 5.1.6 specifies: one key and one message give one
   signature, whose S is below the group order L;
 - no branch and no memory index depends on a secret value (the seed, the secret scalar, the nonce
@@ -409,9 +410,15 @@ join verification in [`shared/crypto`](../shared/crypto/README.md), which guaran
 A deterministic signature keeps a build reproducible under one key: two builds of the same sources
 with the same key produce the same image.
 
-**What is signed.** xtask signs every object it installs into the sysroot and every bundle entry,
-after the build installs them and before it composes the bundle and the disk image, with the kind
-and name of § Signed Attributes. The security version is one integer in the tree, raised by a
+**What is signed.** xtask signs the kernel, every bundle entry, and every ELF image it installs
+under `services/`, `programs/` and `tests/` in the sysroot
+([build-system.md](build-system.md) § Build Output: the Sysroot), after the build installs them and
+before it composes the bundle and the disk image, with the kind and name of § Signed Attributes:
+an image under a `drivers/` directory is a driver, one under a `programs/` directory a program,
+and every other a service. The files under `config/` and `data/` carry no trailer, since their
+readers take each file whole and configuration is not signed (§ Threat Model), and neither does
+the bootloader, which Secure Boot covers (§ Secure Boot). Kind 7 is reserved for a data file whose
+reader verifies it. The security version is one integer in the tree, raised by a
 security fix that MUST make older images unbootable; the store's floor is that integer.
 
 **The trust store** is built from public key files: by default the builder's local root. A build

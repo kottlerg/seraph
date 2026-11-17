@@ -389,7 +389,8 @@ Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from canonical
 binaries under `sysroot/services/` and repack `disk.img`. Symmetric
 with `mkdisk`: both end with `create_disk_image`, the difference being
 which file they author. `compose-bundle` is the bundle authoring step;
-`mkdisk` never authors the bundle.
+`mkdisk` never authors the bundle. `compose-bundle` signs the bundle's executable entries
+([§ Signing](#signing)).
 
 ```
 cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]

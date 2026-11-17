@@ -116,8 +116,8 @@ name refuses.
 
 ## Signed Object Format
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 A signed object is its body followed by a trailer of one or more records and a fixed footer:
 
@@ -212,8 +212,8 @@ nothing is skipped, so the canonical form needs no knowledge of the body's forma
 
 ## Certificate Format
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 Seraph's certificate is a fixed 148-byte record, not X.509: no ASN.1 parser enters the bootloader,
 and Ed25519 is the only algorithm. A root (an anchor of the trust store) issues it to a signing key:
@@ -245,8 +245,8 @@ object of a later one.
 
 ## Trust Store
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 The trust store is one public blob: the roots a system trusts, the key ids it refuses, and the
 lowest security version it runs.
@@ -293,8 +293,8 @@ stops procmgr, which then creates no process.
 
 ## Verification
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 The verifier takes the object's bytes, the trust store, and what the caller expects: the set of
 kinds it accepts, the name it is loading, and the architecture it runs. It returns the body, with

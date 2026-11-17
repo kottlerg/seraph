@@ -419,7 +419,11 @@ port range (see
 [services/devmgr/docs/responsibilities.md](../services/devmgr/docs/responsibilities.md)). devmgr's
 `QUERY_SHUTDOWN_DEVICE` also serves the FADT's 2-port PM1a control window plus the 8042 reset
 port, only to a caller whose badge carries `SHUTDOWN_DEVICE_AUTHORITY`: the seed-only
-`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses.
+`devmgr.shutdown` cap, which pwrmgr alone seeds and svcmgr's `QUERY_ENDPOINT` refuses. The
+`ACPI_AUTHORITY` badge bit, carried only by the seed-only `devmgr.acpi` cap that acpid's recipe
+alone seeds, gates the labels acpid calls. acpid's `IoPort` and `Mmio` region grants are
+derivations devmgr makes of caps it holds
+([services/acpid/docs/devmgr.md](../services/acpid/docs/devmgr.md) § Region grants).
 
 Every IoPort capability references an object of its own, as for [Mmio](#mmio): a copy or
 derivation references a fresh object over the same range, funded the same way. Each thread

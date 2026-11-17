@@ -17,6 +17,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`gdbstub/`](gdbstub/README.md) | GDB stub — debugs one process from a host GDB over the debug port (staged per boot, opt-in) |
 | [`netd/`](netd/README.md) | Network stack daemon (design intent; not yet implemented) |
 | [`pwrmgr/`](pwrmgr/README.md) | Power manager — platform shutdown and reboot |
+| [`acpid/`](acpid/README.md) | ACPI service — runs the firmware's AML and pushes each PCI host bridge's `_OSC`, windows and routes to devmgr |
 | [`timed/`](timed/README.md) | Wall-clock service over the devmgr-resolved RTC |
 | [`usertest/`](usertest/README.md) | Programs-surface test orchestrator |
 | [`svctest/`](svctest/README.md) | Services-surface test harness |

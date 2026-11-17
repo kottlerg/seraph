@@ -26,7 +26,9 @@ pwrmgr/
 ## Responsibilities
 
 pwrmgr owns the shutdown *interpretation* and *actuation* but holds no
-hardware caps of its own. devmgr is the hardware and ACPI authority;
+hardware caps of its own. devmgr is the hardware and ACPI authority, and AML is evaluated by
+acpid ([services/acpid/README.md](../acpid/README.md)), not by pwrmgr or devmgr; pwrmgr reads the
+FADT and the `\_S5_` package itself, and devmgr refuses acpid pwrmgr's ports;
 pwrmgr acquires only what it needs from devmgr at startup, "as if it were
 a device driver":
 
@@ -171,6 +173,7 @@ between the two trees.
 | [docs/supervision.md](../../docs/supervision.md) | Supervision hierarchy; pwrmgr as svcmgr's observer |
 | [docs/testing.md](../../docs/testing.md) | Cross-harness completion convention; harnesses request pwrmgr shutdown when they finish |
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | Authoritative IPC label and error definitions (`pwrmgr_labels`, `pwrmgr_errors`, `devmgr_labels`) |
+| [services/acpid/README.md](../acpid/README.md) | Evaluates the firmware's AML; devmgr evaluates none |
 | [services/devmgr/README.md](../devmgr/README.md) | Hardware + ACPI authority; the `QUERY_ACPI_TABLE` / `QUERY_SHUTDOWN_DEVICE` brokers pwrmgr acquires its caps through |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher + supervisor; the provider path that publishes `pwrmgr.shutdown` / `pwrmgr.deny` |
 | [services/svctest/README.md](../svctest/README.md) | Services-tier harness; seeds `pwrmgr.shutdown`, resolves the public `pwrmgr.deny` through `QUERY_ENDPOINT`, asserts the deny path, and requests the terminal shutdown |

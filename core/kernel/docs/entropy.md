@@ -212,7 +212,9 @@ execution history forks.
 
 - **Discovery** is bootloader-side and QEMU-specific: the VMGENID SSDT's
   `VGIA` named DWORD holds the linker-patched `etc/vmgenid_guid` blob base;
-  the GUID sits 40 bytes in. The bootloader evaluates no AML, so it does not
+  the GUID sits 40 bytes in. The kernel needs the address before acpid, the
+  userspace service that evaluates AML, runs (see
+  [`services/acpid/README.md`](../../../services/acpid/README.md)), so the bootloader does not
   take the generic (AML `ADDR`-evaluating) discovery path. The
   address reaches the kernel as
   [`BootInfo.vmgenid_paddr`](../../../abi/boot-protocol/src/lib.rs) (boot

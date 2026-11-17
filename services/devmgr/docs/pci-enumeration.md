@@ -182,9 +182,9 @@ For each matched device, devmgr:
    delivered (docs/device-management.md § Message-Signaled Interrupts), and
    carves the rest as up to three sub-caps (`firmware::pci::delivered_ranges`),
    each recording its offset in its BAR; a BAR those pages cover whole is
-   not delivered. A VirtIO function whose register regions (those of its
-   driver's layout) share a page with them may not be given MSI-X, and its
-   BARs are carved without the cut. A BAR the layout names that is
+   not delivered. A function whose driver's VirtIO register layout has a
+   region on a page with them may not be given MSI-X, and its BARs are
+   carved without the cut. A BAR the layout names that is
    not an MMIO BAR, or a range no aperture covers, refuses the device, logged,
    with the caps already carved released. The aperture's lower and upper
    remainders stay in devmgr's growable aperture table

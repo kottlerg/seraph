@@ -23,8 +23,9 @@
 //! No step names a driver. What a bound driver is given follows from its
 //! declaration (its interrupt need, whether it performs DMA, its reset, its
 //! tier, within the bounds of its source) and from the record (its BARs, its
-//! wired line, and, for a function that presents the `VirtIO` register
-//! layout, that layout).
+//! wired line, and, for a driver that declares the `VirtIO` status reset,
+//! the function's `VirtIO` register layout for the device configuration the
+//! declaration states).
 
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset};
 use driver_binding::resources::{InterruptKind, Resource};

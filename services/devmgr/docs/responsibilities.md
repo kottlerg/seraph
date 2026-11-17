@@ -209,8 +209,9 @@ devmgr's responsibilities are:
   the hotplug batch ([hotplug.md](hotplug.md#binding) § Binding).
   Each driver's devmgr query cap is a
   SEND, badged with its device badge, on its batch's private endpoint; the
-  IOMMU driver's badge, and those of PCI-bound drivers of functions that
-  present no VirtIO layout, name catalog entries that carry no startup info;
+  IOMMU driver's badge, and those of PCI-bound drivers given no VirtIO
+  register layout (any that declares no VirtIO status reset), name catalog
+  entries that carry no startup info;
   a platform record's badge names an entry too, the framebuffer's carrying its
   geometry and the CMOS RTC's its century index. Once a driver's bootstrap is
   served,

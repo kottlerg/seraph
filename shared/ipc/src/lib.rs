@@ -2613,8 +2613,9 @@ pub mod devmgr_labels
     /// `DeviceCatalog` (badge == entry index + 1); a badge that indexes no
     /// entry, or an entry that carries no startup info (the serial driver's,
     /// the goldfish RTC driver's, a CMOS RTC driver's when the FADT names no
-    /// century register, and that of a PCI function presenting no `VirtIO`
-    /// register layout), gets `INVALID_REQUEST`. A CMOS RTC driver's entry
+    /// century register, and that of a PCI function whose driver declares no
+    /// `VirtIO` status reset, and so is given no `VirtIO` register layout),
+    /// gets `INVALID_REQUEST`. A CMOS RTC driver's entry
     /// otherwise carries [`super::device_info_kind::RTC_CENTURY`]. The
     /// catalog only grows (the entry of a driver that failed to spawn or was
     /// withdrawn stays), so a badge is never recycled and its `u64` width

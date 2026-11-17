@@ -116,9 +116,10 @@ fn main() -> !
 
     // Generic device-info catalog: each entry carries a kind discriminant +
     // version + opaque payload bytes, and its index + 1 is the device badge
-    // of the driver spawned for it. A PCI function that presents the VirtIO
-    // register layout gets an entry of kind VIRTIO_PCI, the framebuffer one
-    // of kind FRAMEBUFFER; every other entry carries no startup info.
+    // of the driver spawned for it. A PCI function whose driver declares the
+    // VirtIO status reset, and so is given the VirtIO register layout, gets an
+    // entry of kind VIRTIO_PCI, the framebuffer one of kind FRAMEBUFFER;
+    // every other entry carries no startup info.
     let mut catalog = DeviceCatalog::default();
 
     let mut watch = driver_watch(&records);
@@ -1906,9 +1907,10 @@ impl DeviceCatalog
 
     /// Append an entry that carries no startup info and return its badge,
     /// or `None` when the catalog cannot grow: the device badge of a driver
-    /// that fetches no runtime metadata (serial, RTC, and a driver bound to
-    /// a PCI function presenting no `VirtIO` register layout), so its ready
-    /// report and death post name it like every other driver's.
+    /// that fetches no runtime metadata (serial, RTC, and a PCI-bound driver
+    /// that declares no `VirtIO` status reset, and so is given no `VirtIO`
+    /// register layout), so its ready report and death post name it like
+    /// every other driver's.
     pub fn add_without_info(&mut self) -> Option<u64>
     {
         self.add(NO_INFO_KIND, 0, &[])

@@ -33,10 +33,13 @@
 //! entry-side swap decision is followed by `lfence`. The spurious-interrupt stub
 //! (vector 255) runs only `iretq`: it executes no kernel code, touches no GS
 //! state, and loads nothing but the frame the CPU pushed, so it needs no
-//! transient-execution control. Every other stub, from ring 3, clears the
-//! branch history before its handler and runs `VERW` before its `iretq` where
-//! the selection asks for them (`tf_build_asm`, `exit_swapgs_asm`,
-//! `paranoid_exit_asm`; core/kernel/docs/transient-execution.md § Controls).
+//! transient-execution control. Every other stub, from ring 3, runs the entry
+//! routine (`IBRS`, the IBPB and the fill after it, and the branch history
+//! clearing) before its handler, the paranoid ones the IBPB from ring 0 as well, and
+//! the `IA32_SPEC_CTRL` write and `VERW` before its `iretq`, where the
+//! selection asks for them (`tf_build_asm`, `tf_resume_asm`, `exit_swapgs_asm`,
+//! `paranoid_entry_asm`, `paranoid_exit_asm`;
+//! core/kernel/docs/transient-execution.md § Controls).
 //!
 //! # Exception vector groups
 //! Vectors with a hardware-pushed error code: 8, 10, 11, 12, 13, 14, 17, 21, 29, 30.
@@ -63,7 +66,9 @@
     expect(
         clippy::cast_possible_truncation,
         reason = "every narrowing cast here is bounded — the IDTR limit (256 * 16 - 1 fits u16), \
-                  the masked/shifted handler-offset splits in `IdtEntry::new`, and the \
+                  the masked/shifted handler-offset splits in `IdtEntry::new`, the \
+                  probe table's limit and the masked/shifted MSR value halves in \
+                  `msr_recovering`, and the \
                   device-range vector-to-u8 cast in `irq_dispatch`; the code it covers is compiled \
                   out of the host test build, so the lint fires outside it alone"
     )
@@ -192,11 +197,12 @@ struct Idtr
 /// rsp+216]`.
 ///
 /// Last, from ring 3 (the saved CS has a non-zero RPL), it calls
-/// `mitigation::seraph_clear_branch_history`, which clears the branch history
-/// where the transient-execution selection asks for it, before the trampoline
-/// reaches any indirect branch (core/kernel/docs/transient-execution.md
-/// § Controls). The call clobbers `rax`, `rcx` and the flags, all saved or
-/// dead by then.
+/// `mitigation::seraph_enter_from_user`, which sets `IBRS`, issues the IBPB
+/// and the fill after it, and clears the branch history where the
+/// transient-execution selection asks for them, before the trampoline reaches
+/// any `ret` or indirect branch
+/// (core/kernel/docs/transient-execution.md § Controls). The call clobbers
+/// `rax`, `rcx`, `rdx` and the flags, all saved or dead by then.
 #[cfg(not(test))]
 macro_rules! tf_build_asm {
     () => {
@@ -230,7 +236,7 @@ macro_rules! tf_build_asm {
             "mov qword ptr [rsp + 160], 0\n",   // fs_base
             "test byte ptr [rsp + 144], 0x3\n", // saved CS RPL; 0 => ring 0
             "jz 85f\n",
-            "call seraph_clear_branch_history\n",
+            "call seraph_enter_from_user\n",
             "85:\n",
         )
     };
@@ -275,14 +281,26 @@ macro_rules! tf_restore_asm {
     };
 }
 
-/// Naked-asm fragment: [`tf_restore_asm`], then the ring-3 GS exit
-/// ([`exit_swapgs_asm`], keyed on the iret frame's CS at `[rsp + 8]`), then
-/// `iretq`. The return tail of every trampoline that entered through
-/// [`entry_swapgs_asm`].
+/// Naked-asm fragment: disable interrupts and, on a return to ring 3 (the
+/// frame's CS at `[rsp + 144]` has a non-zero RPL), write the user-mode
+/// `IA32_SPEC_CTRL` value where the selection asks for it
+/// (`mitigation::ibrs_exit_asm`, which clobbers registers the frame restores);
+/// then [`tf_restore_asm`], the ring-3 GS exit ([`exit_swapgs_asm`], keyed on
+/// the iret frame's CS at `[rsp + 8]`), and `iretq`. The return tail of every
+/// trampoline that entered through [`entry_swapgs_asm`].
 #[cfg(not(test))]
 macro_rules! tf_resume_asm {
     () => {
-        concat!(tf_restore_asm!(), exit_swapgs_asm!("8"), "iretq\n")
+        concat!(
+            "cli\n",
+            "test byte ptr [rsp + 144], 0x3\n",
+            "jz 86f\n",
+            super::mitigation::ibrs_exit_asm!(),
+            "86:\n",
+            tf_restore_asm!(),
+            exit_swapgs_asm!("8"),
+            "iretq\n",
+        )
     };
 }
 
@@ -359,7 +377,17 @@ macro_rules! exit_swapgs_asm {
 /// and is never a kernel-half address (`cpu::enable_smep_smap` keeps
 /// `CR4.FSGSBASE` clear on every CPU, so ring 3 has no `wrgsbase`), so a clear
 /// sign bit in `IA32_GS_BASE` means the user base is active. Swaps if so and records it in `r12`
-/// (callee-saved across the handler call) for [`paranoid_exit_asm`].
+/// (callee-saved across the handler call) for [`paranoid_exit_asm`]. Then,
+/// where the selection asks for IBRS on entry, it saves the interrupted
+/// `IA32_SPEC_CTRL` in `r13` and writes the kernel's value
+/// (`mitigation::ibrs_paranoid_entry_asm`): the stub may have interrupted a
+/// return after its user-mode write, or an entry before its kernel one. Last,
+/// when the stub interrupted ring 0, it issues the IBPB on entry and the fill
+/// after it where the selection asks for them (`mitigation::ibpb_asm`): the
+/// stub may have interrupted an entry from user mode before its IBPB, and its
+/// handler's returns would otherwise take the predictions user mode trained.
+/// From ring 3, [`tf_build_asm`] has issued them already. The `lfence` after
+/// it keeps a mispredicted test of the saved CS or a flag from running on.
 #[cfg(not(test))]
 macro_rules! paranoid_entry_asm {
     () => {
@@ -375,12 +403,20 @@ macro_rules! paranoid_entry_asm {
             "mov r12d, 1\n",
             "83:\n",
             "lfence\n", // see `entry_swapgs_asm`
+            super::mitigation::ibrs_paranoid_entry_asm!(),
+            "test byte ptr [rsp + 144], 0x3\n", // saved CS RPL; 0 => ring 0
+            "jnz 78f\n",
+            super::mitigation::ibpb_asm!(),
+            "78:\n",
+            "lfence\n",
         )
     };
 }
 
-/// Naked-asm fragment: undo [`paranoid_entry_asm`]'s swap (if it swapped), then
-/// restore the frame, run `mitigation::verw_asm`, and `iretq`.
+/// Naked-asm fragment: undo [`paranoid_entry_asm`]'s `IA32_SPEC_CTRL` write
+/// (`mitigation::ibrs_paranoid_exit_asm`: the user-mode value on a return to
+/// ring 3, the saved one otherwise) and its swap (if it swapped), then restore
+/// the frame, run `mitigation::verw_asm`, and `iretq`.
 ///
 /// The `VERW` runs on a return to ring 0 as well: a paranoid stub can
 /// interrupt a return to user mode after its own `VERW` (an NMI or `#MC`
@@ -392,6 +428,7 @@ macro_rules! paranoid_exit_asm {
     () => {
         concat!(
             "cli\n",
+            super::mitigation::ibrs_paranoid_exit_asm!("144"),
             "test r12, r12\n",
             "jz 84f\n",
             "swapgs\n",
@@ -1165,13 +1202,22 @@ unsafe extern "custom" fn isr_nm()
         "push r9",
         "push r10",
         "push r11",
-        // From ring 3, clear the branch history where the selection asks for
-        // it, before the handler (see `tf_build_asm`); CS is at [rsp + 80].
+        // From ring 3, set IBRS, issue the IBPB and the fill after it, and
+        // clear the branch history where the selection asks for them, before
+        // the handler (see `tf_build_asm`); CS is at [rsp + 80].
         "test byte ptr [rsp + 80], 0x3",
         "jz 87f",
-        "call seraph_clear_branch_history",
+        "call seraph_enter_from_user",
         "87:",
         "call {handler}",
+        // To ring 3, the user-mode IA32_SPEC_CTRL value where the selection
+        // asks for it, with interrupts off and before the registers it
+        // clobbers are restored (see `tf_resume_asm`).
+        "cli",
+        "test byte ptr [rsp + 80], 0x3",
+        "jz 88f",
+        super::mitigation::ibrs_exit_asm!(),
+        "88:",
         "pop r11",
         "pop r10",
         "pop r9",
@@ -1985,6 +2031,167 @@ pub unsafe fn load()
             in(reg) core::ptr::addr_of!(idtr),
             options(readonly, nostack, preserves_flags),
         );
+    }
+}
+
+// ── Fault-tolerant MSR access ─────────────────────────────────────────────────
+
+/// Gates of the probe table: every architectural exception vector through
+/// `#MC` (18), so that an NMI, `#DF` or `#MC` arriving during a probe on a
+/// CPU that has loaded [`IDT`] still reaches its handler.
+#[cfg(not(test))]
+const PROBE_GATES: usize = 19;
+
+/// `#GP`.
+#[cfg(not(test))]
+const GP_VECTOR: usize = 13;
+
+// The probe table's `#GP` handler. Same CPL, IST 0: the CPU pushed SS, RSP,
+// RFLAGS, CS, RIP and the error code on the probing code's stack. It drops the
+// error code, replaces the saved RIP with R11, which the probe set to its
+// recovery label, and returns there.
+#[cfg(not(test))]
+core::arch::global_asm!(
+    ".pushsection .text.seraph_msr_probe, \"ax\"",
+    ".global seraph_msr_probe_gp",
+    ".p2align 4",
+    "seraph_msr_probe_gp:",
+    "    add rsp, 8",
+    "    mov [rsp], r11",
+    "    iretq",
+    ".popsection",
+);
+
+#[cfg(not(test))]
+unsafe extern "C" {
+    /// The probe table's `#GP` handler (the `global_asm!` above). Not
+    /// callable: only its address is taken, for the gate.
+    fn seraph_msr_probe_gp();
+}
+
+/// An `rdmsr` (`value` `None`) or a `wrmsr` of `value` to `msr` that
+/// recovers from the `#GP` the CPU, or a hypervisor, raises for an MSR or a
+/// value it does not implement: `Some` with the value read (the value
+/// written, for a write) when the access completed, `None` when it faulted.
+///
+/// For the one instruction, the CPU runs on a probe table built on the stack:
+/// its `#GP` gate resumes at the probe's recovery label (`seraph_msr_probe_gp`),
+/// on [`KERNEL_CS`], and its other gates are copied from
+/// [`IDT`] where that is the table loaded, and absent otherwise. The table
+/// loaded before is loaded again after. In Phase 1 on the boot CPU, before
+/// [`init`], no kernel handler exists to copy, so an NMI or `#MC` during the
+/// probe ends the boot as it would anywhere else in that phase.
+///
+/// # Safety
+/// Ring 0, on the kernel's GDT (`gdt::load_boot_segments` on the boot CPU,
+/// `gdt::init_ap` on an AP), whose code-segment descriptor the gate's delivery
+/// reads; interrupts off; and no supervisor shadow stack on this CPU: the
+/// handler's `iretq` returns to an address other than the one the CPU saved,
+/// which a shadow stack would refuse with `#CP`. Callers run in Phase 1 and in
+/// an AP's bring-up, before `shadow_stack::enable`. A write that completes has
+/// its architectural effect, so `value` must be one the caller means to write.
+#[cfg(not(test))]
+pub unsafe fn msr_recovering(msr: u32, value: Option<u64>) -> Option<u64>
+{
+    debug_assert!(
+        !super::interrupts::are_enabled(),
+        "MSR probe with interrupts on"
+    );
+    debug_assert!(
+        super::cpu::shadow_stack_pointer() == 0,
+        "MSR probe on a shadow stack"
+    );
+    let mut saved = Idtr { limit: 0, base: 0 };
+    // SAFETY: `sidt` stores the 10-byte IDTR into `saved`, a live local.
+    unsafe {
+        core::arch::asm!(
+            "sidt [{0}]",
+            in(reg) core::ptr::addr_of_mut!(saved),
+            options(nostack, preserves_flags),
+        );
+    }
+    let mut gates = [IdtEntry::default(); PROBE_GATES];
+    // SAFETY: [`IDT`] is written only during single-threaded boot init, by
+    // [`init`] on the boot CPU before any AP runs, and read here after it.
+    let kernel = unsafe { &*core::ptr::addr_of!(IDT) };
+    let saved_base = saved.base;
+    if saved_base == kernel.as_ptr() as u64
+    {
+        gates.copy_from_slice(&kernel[..PROBE_GATES]);
+    }
+    #[cfg(debug_assertions)]
+    {
+        let cs: u16;
+        // SAFETY: reads the CS selector into a register.
+        unsafe {
+            core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags));
+        }
+        debug_assert_eq!(cs, KERNEL_CS, "MSR probe off the kernel's GDT");
+    }
+    gates[GP_VECTOR] = IdtEntry::new(seraph_msr_probe_gp as *const () as u64, 0, 0);
+    let probe = Idtr {
+        // 19 gates of 16 bytes: the limit fits u16 and does not saturate.
+        limit: core::mem::size_of_val(&gates).saturating_sub(1) as u16,
+        base: gates.as_ptr() as u64,
+    };
+    let faulted: u32;
+    if let Some(value) = value
+    {
+        // SAFETY: the caller's contract: ring 0, interrupts off, no shadow
+        // stack. `probe` and `gates` are live locals for the whole block,
+        // and `saved` is the table loaded before it, loaded again on both
+        // paths. A `#GP` from the `wrmsr` enters `seraph_msr_probe_gp` on
+        // this stack (`nostack` is absent: the CPU pushes its frame below
+        // RSP), which resumes at label 2 with RSP and RFLAGS restored.
+        unsafe {
+            core::arch::asm!(
+                "lea r11, [rip + 2f]",
+                "lidt [{probe}]",
+                "xor {faulted:e}, {faulted:e}",
+                "wrmsr",
+                "jmp 3f",
+                "2:",
+                "mov {faulted:e}, 1",
+                "3:",
+                "lidt [{saved}]",
+                probe = in(reg) core::ptr::addr_of!(probe),
+                saved = in(reg) core::ptr::addr_of!(saved),
+                faulted = out(reg) faulted,
+                in("ecx") msr,
+                in("eax") (value & 0xFFFF_FFFF) as u32,
+                in("edx") (value >> 32) as u32,
+                out("r11") _,
+            );
+        }
+        (faulted == 0).then_some(value)
+    }
+    else
+    {
+        let lo: u32;
+        let hi: u32;
+        // SAFETY: as for the write; the `rdmsr` writes EAX and EDX only
+        // when it completes, and they are ignored when it faulted.
+        unsafe {
+            core::arch::asm!(
+                "lea r11, [rip + 2f]",
+                "lidt [{probe}]",
+                "xor {faulted:e}, {faulted:e}",
+                "rdmsr",
+                "jmp 3f",
+                "2:",
+                "mov {faulted:e}, 1",
+                "3:",
+                "lidt [{saved}]",
+                probe = in(reg) core::ptr::addr_of!(probe),
+                saved = in(reg) core::ptr::addr_of!(saved),
+                faulted = out(reg) faulted,
+                in("ecx") msr,
+                out("eax") lo,
+                out("edx") hi,
+                out("r11") _,
+            );
+        }
+        (faulted == 0).then_some((u64::from(hi) << 32) | u64::from(lo))
     }
 }
 

@@ -75,12 +75,14 @@ fn run_log(ctx: &Context, log: &Path) -> Result<()>
     Ok(())
 }
 
-/// The image the addresses fall in: `--binary`, else the sysroot's kernel.
+/// The image the addresses fall in: `--binary`, or the sysroot's kernel for
+/// `--kernel`. Without `--log`, which [`run`] takes first, the parser admits
+/// exactly one of the two.
 fn image_path(ctx: &Context, args: &SymbolizeArgs) -> PathBuf
 {
-    match &args.binary
+    match (&args.binary, args.kernel)
     {
-        Some(path) => path.clone(),
-        None => ctx.sysroot_efi_seraph().join("kernel"),
+        (Some(path), false) => path.clone(),
+        _ => ctx.sysroot_efi_seraph().join("kernel"),
     }
 }

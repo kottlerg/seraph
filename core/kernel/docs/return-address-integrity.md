@@ -115,7 +115,10 @@ Downsides of the direction:
   guest whose hypervisor passes `CET_SS` but hides enhanced IBRS or Automatic IBRS. Intel's
   parts with `CET_SS` (Tiger Lake and later) enumerate enhanced IBRS, and AMD's from Zen 4
   Automatic IBRS, so they keep shadow stacks
-  ([transient-execution.md](transient-execution.md) § Branch target injection).
+  ([transient-execution.md](transient-execution.md) § Branch target injection). IBRS on entry,
+  which an Intel part whose returns fall back to the branch target buffer takes in place of
+  enhanced IBRS, and the IBPB on entry, which an AMD part takes for branch type confusion and
+  speculative return stack overflow, rewrite no return and keep them.
 - The x86-64 enabled path lies outside the CI gate.
 - The riscv64 path depends on an unstable rustc flag and on target features LLVM still names
   experimental (`experimental-zicfiss`).
@@ -210,7 +213,11 @@ shadow stacks on or off.
   an address the shadow stack does not hold would raise `#CP`, and the rule names such
   controls as a class, not one by one. The retpoline sequence is one: its `ret` goes to the
   branch target
-  ([transient-execution.md](transient-execution.md) § Branch target injection). Where the CPU
+  ([transient-execution.md](transient-execution.md) § Branch target injection). IBRS on entry
+  is not: it writes `IA32_SPEC_CTRL` on entry and exit, and the entry routine's calls and
+  returns pair up (transient-execution.md § Return predictions). The IBPB on entry is not
+  either: the fill after it drops its calls' entries from both stacks together
+  (transient-execution.md § IBPB on entry). Where the CPU
   reports `CET_SS` and the selection keeps shadow stacks off, `decide` logs it. They are on
   for every CPU or for none, since a thread migrates between CPUs with a
   live call chain: an AP that lacks `CET_SS` when the boot CPU has it halts the boot

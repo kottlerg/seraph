@@ -10,8 +10,6 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-# Declarative CLI with auto-generated help text.
-clap = { version = "4", features = ["derive"] }
 # Seraph-minted GPT partition type GUIDs are defined here so xtask
 # (producer) and vfsd (consumer) reference the same byte arrays.
 boot-protocol = { path = "../abi/boot-protocol" }
@@ -21,8 +19,6 @@ gdb-rsp = { path = "../shared/gdb-rsp" }
 # The FAT encodings mkdisk's volume writer shares with the fatfs service: FAT
 # entries, long-name slots and their checksum, and short names' numeric tails.
 fat_parse = { path = "../services/fs/fat/fat-parse", package = "fatfs-parse" }
-# Regex matching for run-parallel pass/fail classification.
-regex = "1"
 # `pr-check`, `review-check`, `review-ledger`, `issue-edit`, `issue-file`: the
 # GitHub CLI answers in JSON, and the review's run records are JSON files.
 json = { path = "../shared/json" }

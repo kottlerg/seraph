@@ -15,7 +15,9 @@ xtask/
 │   └── ktest-timing/           # Checked-in ktest timing baselines (see ktest-timing)
 ├── src/
 │   ├── main.rs                 # Entry point; dispatches CliCommand
-│   ├── cli.rs                  # Clap derive structs for every subcommand
+│   ├── cli.rs                  # The command table: every command's arguments
+│   ├── argparse/               # Command-line parser of the table; its reference corpus
+│   │                           #   (§ Command-line parsing)
 │   ├── context.rs              # Resolved workspace and build-output paths
 │   ├── crash_log.rs            # Symbolized crash reports from a serial log (symbolize --log)
 │   ├── debug_stub.rs           # GDB stub staging (--debug-target, test-gdb)
@@ -35,6 +37,7 @@ xtask/
 │   ├── qemu.rs                 # Shared QEMU argv construction
 │   ├── qmp.rs                  # Minimal QMP client for the QMP-driven tests and capture-acpi
 │   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
+│   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
@@ -550,7 +553,8 @@ each build and clean it runs, which are admitted on their own.
 ### `cargo xtask run-parallel`
 
 Launch N QEMU instances in parallel against an already-built sysroot,
-classifying each run's outcome via user-supplied pass/fail regexes.
+classifying each run's outcome via user-supplied pass/fail patterns, in the syntax of
+§ Pattern syntax.
 Intended for shaking out timing-dependent bugs (races, lost wakeups,
 scheduling order) that single-shot `cargo xtask run` cannot reliably
 expose. Requires a populated sysroot — run `cargo xtask build` first.
@@ -1670,6 +1674,92 @@ printed line: each CI job is its own host.
 
 ---
 
+## Pattern syntax
+
+Every regular expression xtask matches, those `run-parallel` takes (`--pass`, `--fail`,
+`--fail-also`) and those its checks compile (`commit-check`, `pr-check`, `lint-docs`,
+`ktest-timing`, `test-log-level`, `test-map-redo`), runs on xtask's own engine in `src/regex/`: a
+Pike VM over the syntax below. The match reported is the leftmost-first one: the earliest start,
+and at that start the alternative and the repetition count a backtracking engine would try
+first. A search does at most a constant amount of work per instruction of the compiled pattern
+per character of the text, whatever the two hold, so no text makes a match run long; a pattern
+compiles to at most 10000 instructions (`MAX_INSTS`).
+
+| Construct | Matches |
+|---|---|
+| `x` | The character, for any character but `\ . + * ? ( ) \| [ { ^ $` |
+| `\x` | `x`, for any ASCII punctuation character `x` but `<` and `>` |
+| `\n`, `\r`, `\t` | Newline, carriage return, tab |
+| `.` | Any character but newline |
+| `[...]`, `[^...]` | One character of the set, or one outside it with `^`: characters, ranges (`a-z`), escapes, and the classes below; `]` first and `-` first or last are members |
+| `\d`, `\w`, `\s` | An ASCII digit; an ASCII letter, digit or `_`; a Unicode `White_Space` character |
+| `\D`, `\W`, `\S` | Any character the lower-case class does not match |
+| `^`, `$` | The start, the end of the text (not of a line) |
+| `\b`, `\B` | A position with a `\w` character on exactly one side; any other position |
+| `a\|b` | `a`, or else `b` |
+| `(...)` | A capture group, numbered from 1 by its `(` |
+| `(?:...)` | A group that captures nothing |
+| `(?i)`, `(?-i)` | From here to the end of the enclosing group, ASCII letters match either case, or only their own |
+| `(?i:...)`, `(?-i:...)` | The same, within the group |
+| `*`, `+`, `?` | 0 or more, 1 or more, 0 or 1 of the preceding item, as many as lead to a match |
+| `{n}`, `{n,}`, `{n,m}` | n, at least n, n to m of the preceding item (n and m at most 1000), as many as lead to a match |
+| `*?`, `+?`, `??`, `{n,}?`, `{n,m}?` | The same, as few as lead to a match |
+
+Anything else is refused with its reason and its byte offset in the pattern: a back-reference, a
+look-around, a named group, a Unicode class (`\p{..}`), the word-start and word-end assertions
+(`\<`, `\>`), a nested class, a class set operation (a doubled `&`, `-` or `~` in a class), a
+flag other than `i`, a repetition of a repetition (`a**`), and groups nested more than 64 deep.
+Where the syntax overlaps that of the Rust `regex` crate it means the same, except that `\d`,
+`\w` and `\b` are ASCII only and `(?i)` folds ASCII letters only.
+
+---
+
+## Command-line parsing
+
+xtask parses its command line with its own parser in `src/argparse/`. The command table is
+`src/cli.rs`: each command's arguments are a struct declared with `args!`, each command with
+subcommands an enum declared with `subcommands!`, and each closed set of values an enum declared
+with `value_enum!`. A field's name, type, `#[arg(..)]` options and doc comment state the
+argument once: the macro builds the struct, its argument specifications, and the code that types
+the parsed values into it.
+
+| Field | Argument |
+|---|---|
+| `bool` | A flag |
+| `T` | One value; required unless it has a default |
+| `Option<T>` | One value, optional |
+| `Vec<T>` | Any number of values, each occurrence adding to them |
+| `#[command(flatten)] S` | The arguments of the `args!` struct `S` |
+| `#[command(subcommand)] E` | One of the commands of the `subcommands!` enum `E` |
+
+A field without `long` is a positional. The options are `long`, `value_name`, `default_value`,
+`default_value_t`, `value_delimiter`, `value_parser` (a `fn(&str) -> Result<T, String>`),
+`required`, `requires`, `conflicts_with`, `conflicts_with_all`, `required_unless_present`,
+`required_unless_present_any`, `trailing_var_arg`, `allow_hyphen_values` and `hide`, with the
+meaning clap 4's derive gives them; a `value_enum!` variant takes `#[value(name = ..)]`. A
+command's name is its variant's name in kebab case, and the first paragraph of a doc comment is
+the short help, the whole comment the long help (`--help`).
+
+The parser reads a command line as clap 4.6 read it, and prints its help and its errors as clap
+printed them without styling: the same subcommands, arguments, values, defaults, conflicts and
+requirements; the same help screens, byte for byte; the same error kinds, with the same message
+up to its first blank line; and exit status 0 for help and 2 for an error. An error's `Usage:`
+line is the command's own usage line, without the arguments given or a suggested one, and an
+error prints no `tip:` lines. An argument that is not valid UTF-8 is refused with clap's
+`InvalidUtf8` error wherever it stands, a path value among them, which clap passed on as its
+bytes.
+
+`src/argparse/reference/` holds the evidence: every help screen of the table, and 9193 command
+lines with their outcome (the command and the values parsed, or the error's kind and message),
+recorded from clap 4.6 before the parser replaced it. `cargo xtask test` parses each command
+line and prints each screen through the table, and fails on any difference. A change to the
+table that changes a recorded outcome on purpose, a new command or argument among them, adds the
+command lines that exercise it to `cases.txt` and runs `XTASK_BLESS_REFERENCE=1 cargo xtask
+test`, which rewrites every screen and outcome from the current table; the diff of
+`reference/` is the change to the command line, for the review to read.
+
+---
+
 ## Sub-crates
 
 | Sub-crate | Purpose |
@@ -1697,9 +1787,9 @@ printed line: each CI job is its own host.
 
 ## Adding a new command
 
-1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `Args` struct, and name it
-   in `CliCommand::build_host`: a command that compiles takes `HostArgs` and is admitted there as
-   a build.
+1. Add a variant to `CliCommand` in `src/cli.rs` with a corresponding `args!` struct, and name
+   it in `CliCommand::build_host`: a command that compiles takes `HostArgs` and is admitted there
+   as a build. Add its command lines to the reference corpus (§ Command-line parsing).
 2. Create `src/commands/<name>.rs` with `pub fn run(ctx: &Context, args: &NameArgs) -> Result<()>`,
    or add a `pub fn run_<name>` to the module that holds its sibling commands (`pr_check`,
    `review`, and `issue` each hold two).

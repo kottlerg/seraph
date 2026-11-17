@@ -14,6 +14,10 @@
 //! - Descriptor 0x28: TSS low 64 bits  (first half of 128-bit system descriptor)
 //! - Descriptor 0x30: TSS high 64 bits (second half)
 //!
+//! The BSP loads the segment descriptors in Phase 1 (`load_boot_segments`) and
+//! the TSS with them in Phase 5 (`init`); each AP loads its own table whole
+//! (`init_ap`).
+//!
 //! User DS appears before user CS because SYSRET loads:
 //!   CS = STAR[63:48]+16, SS = STAR[63:48]+8
 //! so the layout `user_ds(0x18), user_cs(0x20)` is required for SYSRET.
@@ -326,57 +330,37 @@ pub fn tss_desc(tss_addr: u64) -> (u64, u64)
     (low, high)
 }
 
-// ── Public interface ──────────────────────────────────────────────────────────
-
-/// Populate and load the GDT and TSS, then reload all segment registers.
-///
-/// Called once during boot. Parameters:
-/// - `kernel_stack_top`: initial RSP0 (ring-0 stack top for TSS).
-/// - `ist1_top`: top of the IST stack shared by the double-fault and
-///   machine-check gates.
-/// - `ist2_top`: top of the NMI IST stack.
-///
-/// # Safety
-/// Must execute at ring 0 from a single-threaded context. The `GDT` and `TSS`
-/// statics must not be accessed concurrently.
-#[cfg(not(test))]
-pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
+/// Fill the segment slots of `gdt`, in the layout the module documentation
+/// lists: the null descriptor, then the kernel code and data and the user data
+/// and code segments, each at the index of its selector constant. The TSS
+/// slots are left as they are.
+fn fill_segments(gdt: &mut [u64; 7])
 {
-    // SAFETY: single-threaded boot phase; no concurrent access to static mut GDT.
-    let gdt = unsafe { &mut *core::ptr::addr_of_mut!(GDT) };
-    // SAFETY: single-threaded boot phase; no concurrent access to static mut TSS.
-    let tss_with_iopb = unsafe { &mut *core::ptr::addr_of_mut!(TSS) };
-    let tss = &mut tss_with_iopb.tss;
-
-    // Configure TSS fields.
-    tss.rsp0 = kernel_stack_top;
-    tss.ist1 = ist1_top;
-    tss.ist2 = ist2_top;
-    // iopb_offset = 104 = offsetof(TssWithIopb, iopb) = size_of::<Tss>():
-    // every TssWithIopb field has alignment 1 and Tss is exactly 104 bytes, so
-    // iopb follows immediately.
-    tss.iopb_offset = IOPB_OFFSET_VALID;
-
-    // Fill GDT slots.
     gdt[0] = 0; // null
     gdt[1] = code_desc_64(0); // 0x08 kernel CS
     gdt[2] = data_desc_64(0); // 0x10 kernel DS
     gdt[3] = data_desc_64(3); // 0x18 user DS (RPL=3 via selector constant)
     gdt[4] = code_desc_64(3); // 0x20 user CS (RPL=3 via selector constant)
-    // TSS descriptor limit must cover the full TssWithIopb struct.
-    let tss_addr = core::ptr::addr_of!(*tss_with_iopb) as u64;
-    let (tss_lo, tss_hi) = tss_desc(tss_addr);
-    gdt[5] = tss_lo; // 0x28 TSS low
-    gdt[6] = tss_hi; // 0x30 TSS high
+}
 
-    // Load GDTR.
+/// Load `gdt` into GDTR and reload the segment registers from it: CS with
+/// [`KERNEL_CS`] by a far return, DS, ES and SS with [`KERNEL_DS`], and FS
+/// and GS with the null selector (the GS base the kernel uses is set through
+/// its MSR afterwards).
+///
+/// # Safety
+/// Ring 0. `gdt` holds the segments [`fill_segments`] writes and stays live
+/// while it is loaded.
+#[cfg(not(test))]
+unsafe fn load_segments(gdt: *const [u64; 7])
+{
     let gdtr = Gdtr {
-        // The table is not empty, so the limit does not saturate.
-        limit: core::mem::size_of_val(gdt).saturating_sub(1) as u16,
-        base: gdt.as_ptr() as u64,
+        limit: (7 * 8 - 1) as u16,
+        base: gdt as u64,
     };
     // SAFETY: lgdt is a privileged x86 instruction; GDT pointer is valid and
-    // GDT table is static and properly aligned; executed at ring 0.
+    // references a live, properly aligned GDT (caller contract); executed at
+    // ring 0.
     unsafe {
         core::arch::asm!(
             "lgdt [{0}]",
@@ -424,6 +408,79 @@ pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
             options(nostack, nomem),
         );
     }
+}
+
+// ── Public interface ──────────────────────────────────────────────────────────
+
+/// Load the BSP's GDT with its segment descriptors, its TSS slots still empty,
+/// and reload the segment registers from it ([`load_segments`]).
+///
+/// Called in Phase 1, so the boot CPU runs on the kernel's own descriptors from
+/// then on. The firmware's GDT lies in memory the kernel's page tables do not
+/// map, and an exception delivered while it is loaded (the `#GP` that a
+/// fault-tolerant MSR access, `idt::msr_recovering`, recovers from) would
+/// read its code-segment descriptor there and fault in the delivery. TR keeps
+/// the firmware's TSS until [`init`] loads the kernel's in Phase 5; nothing
+/// reads it before then, since no ring change or IST stack switch happens in
+/// between. [`init`] fills the TSS slots and loads the table again.
+///
+/// # Safety
+/// Ring 0, on the BSP, once, from the single boot thread before [`init`]; the
+/// `GDT` static is not accessed concurrently.
+#[cfg(not(test))]
+pub unsafe fn load_boot_segments()
+{
+    // SAFETY: single-threaded boot (caller contract); no other reference to
+    // the GDT static exists.
+    fill_segments(unsafe { &mut *core::ptr::addr_of_mut!(GDT) });
+    // SAFETY: ring 0; GDT is a static, live for the kernel's lifetime, and
+    // holds the segments just written.
+    unsafe { load_segments(core::ptr::addr_of!(GDT)) };
+}
+
+/// Test-build stub: the load is privileged and a no-op in host unit tests.
+#[cfg(test)]
+pub unsafe fn load_boot_segments() {}
+
+/// Populate and load the GDT and TSS, then reload all segment registers.
+///
+/// Called once during boot. Parameters:
+/// - `kernel_stack_top`: initial RSP0 (ring-0 stack top for TSS).
+/// - `ist1_top`: top of the IST stack shared by the double-fault and
+///   machine-check gates.
+/// - `ist2_top`: top of the NMI IST stack.
+///
+/// # Safety
+/// Must execute at ring 0 from a single-threaded context. The `GDT` and `TSS`
+/// statics must not be accessed concurrently.
+#[cfg(not(test))]
+pub unsafe fn init(kernel_stack_top: u64, ist1_top: u64, ist2_top: u64)
+{
+    // SAFETY: single-threaded boot phase; no concurrent access to static mut GDT.
+    let gdt = unsafe { &mut *core::ptr::addr_of_mut!(GDT) };
+    // SAFETY: single-threaded boot phase; no concurrent access to static mut TSS.
+    let tss_with_iopb = unsafe { &mut *core::ptr::addr_of_mut!(TSS) };
+    let tss = &mut tss_with_iopb.tss;
+
+    // Configure TSS fields.
+    tss.rsp0 = kernel_stack_top;
+    tss.ist1 = ist1_top;
+    tss.ist2 = ist2_top;
+    // iopb_offset = 104 = offsetof(TssWithIopb, iopb) = size_of::<Tss>():
+    // every TssWithIopb field has alignment 1 and Tss is exactly 104 bytes, so
+    // iopb follows immediately.
+    tss.iopb_offset = IOPB_OFFSET_VALID;
+
+    fill_segments(gdt);
+    // TSS descriptor limit must cover the full TssWithIopb struct.
+    let tss_addr = core::ptr::addr_of!(*tss_with_iopb) as u64;
+    let (tss_lo, tss_hi) = tss_desc(tss_addr);
+    gdt[5] = tss_lo; // 0x28 TSS low
+    gdt[6] = tss_hi; // 0x30 TSS high
+
+    // SAFETY: ring 0; GDT is a static, live for the kernel's lifetime, and
+    // holds the segments `fill_segments` wrote.
+    unsafe { load_segments(core::ptr::addr_of!(GDT)) };
 
     // Load the TSS selector.
     // SAFETY: ltr is a privileged x86 instruction; TSS_SEL references a valid
@@ -567,64 +624,14 @@ pub unsafe fn init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64)
     // SAFETY: gdt_ptr_mut is this AP's slot, unaliased during bringup; the
     // reference ends before the slot is loaded below.
     let gdt = unsafe { &mut *gdt_ptr_mut };
-    gdt[0] = 0; // null
-    gdt[1] = code_desc_64(0); // 0x08 kernel CS
-    gdt[2] = data_desc_64(0); // 0x10 kernel DS
-    gdt[3] = data_desc_64(3); // 0x18 user DS
-    gdt[4] = code_desc_64(3); // 0x20 user CS
+    fill_segments(gdt);
     let (tss_lo, tss_hi) = tss_desc(tss_addr);
     gdt[5] = tss_lo; // 0x28 TSS low
     gdt[6] = tss_hi; // 0x30 TSS high
 
-    let gdt_ptr: *const [u64; 7] = gdt_ptr_mut.cast_const();
-
-    // Load GDTR.
-    let gdtr = Gdtr {
-        limit: (7 * 8 - 1) as u16,
-        base: gdt_ptr as u64,
-    };
-    // SAFETY: lgdt is a privileged x86 instruction; GDT pointer is valid and
-    // references a live, properly aligned GDT; executed at ring 0.
-    unsafe {
-        core::arch::asm!(
-            "lgdt [{0}]",
-            in(reg) core::ptr::addr_of!(gdtr),
-            options(readonly, nostack, preserves_flags),
-        );
-    }
-
-    // Reload CS via a far return into the kernel code segment.
-    // SAFETY: KERNEL_CS references a valid GDT entry just loaded; far return
-    // executed at ring 0 with valid stack and return address.
-    // See `init` for why `nostack` is intentionally absent.
-    unsafe {
-        core::arch::asm!(
-            "push {cs}",
-            "lea {tmp}, [rip + 2f]",
-            "push {tmp}",
-            "retfq",
-            "2:",
-            cs  = in(reg) KERNEL_CS as u64,
-            tmp = lateout(reg) _,
-        );
-    }
-
-    // Reload data/stack segment registers and zero FS/GS (GS-base is in MSR).
-    // SAFETY: KERNEL_DS references a valid GDT entry; segment selector loads
-    // executed at ring 0; zeroing FS/GS is safe (GS-base is in MSR).
-    unsafe {
-        core::arch::asm!(
-            "mov ds, {ds:x}",
-            "mov es, {ds:x}",
-            "mov ss, {ds:x}",
-            "xor {z:e}, {z:e}",
-            "mov fs, {z:x}",
-            "mov gs, {z:x}",
-            ds = in(reg) KERNEL_DS,
-            z  = lateout(reg) _,
-            options(nostack, nomem),
-        );
-    }
+    // SAFETY: ring 0; the slot is this AP's for the kernel's lifetime and holds
+    // the segments `fill_segments` wrote.
+    unsafe { load_segments(gdt_ptr_mut.cast_const()) };
 
     // Load the TSS selector.
     // SAFETY: ltr is a privileged x86 instruction; TSS_SEL references a valid
@@ -993,6 +1000,23 @@ mod tests
         permit_port_range(&mut iopb, 0, 0, 4); // ports 0-3
         permit_port_range(&mut iopb, 0, 4, 4); // ports 4-7
         assert_eq!(iopb[0], 0x00, "all 8 ports in byte 0 should be permitted");
+    }
+
+    // Defect caught: a segment written at an index other than its selector's,
+    // which the far return and the segment loads of `load_segments` would
+    // then load as the wrong descriptor.
+    #[test]
+    fn fill_segments_places_each_segment_at_its_selector()
+    {
+        let mut gdt = [u64::MAX; 7];
+        fill_segments(&mut gdt);
+        let at = |selector: u16| gdt[usize::from(selector >> 3)];
+        assert_eq!(gdt[0], 0, "null descriptor");
+        assert_eq!(at(KERNEL_CS), code_desc_64(0));
+        assert_eq!(at(KERNEL_DS), data_desc_64(0));
+        assert_eq!(at(USER_DS), data_desc_64(3));
+        assert_eq!(at(USER_CS), code_desc_64(3));
+        assert_eq!(&gdt[5..], &[u64::MAX; 2], "TSS slots left as they were");
     }
 
     #[test]

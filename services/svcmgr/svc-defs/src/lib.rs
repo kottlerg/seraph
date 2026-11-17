@@ -12,8 +12,9 @@
 //! bounds by the child's argv/env region, and the policies svcmgr applies at
 //! runtime: the rights of a recipe's `cwd` cap ([`cwd_rights`]), the
 //! `HANDOVER_COMPLETE` gate ([`handover_permitted`]), the windowed restart
-//! budget ([`RestartBudget`]), and the death-observer correlator and the rule
-//! that routes a death post by it ([`death_tag`]). Nothing here touches a syscall, IPC, or
+//! budget ([`RestartBudget`]), the death-observer correlator and the rule
+//! that routes a death post by it ([`death_tag`]), and the reading of a
+//! service's death from the caps svcmgr holds on it ([`death_caps`]). Nothing here touches a syscall, IPC, or
 //! `std::os::seraph` surface, so the whole crate is host-reachable and
 //! host-tested — the `.svc` and class files are external input and their
 //! parsers carry unit tests per
@@ -22,6 +23,7 @@
 //! stays in `svcmgr` (`definitions::launch` / `definitions::reconcile`).
 
 pub mod class;
+pub mod death_caps;
 pub mod death_tag;
 pub mod parse;
 pub mod restart_budget;

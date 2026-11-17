@@ -68,9 +68,12 @@ scaling, and DRAM rows. The system draws the line as follows.
   - on x86-64, an `lfence` after every entry-side `swapgs` decision (`entry_swapgs_asm`,
     `paranoid_entry_asm`), the mitigations the floor silicon applies in silicon, and the
     entry and exit controls the kernel selects by enumerating the boot CPU: enhanced or
-    automatic IBRS or the retpoline build against branch target injection, the `BHI_DIS_S`
-    control or a branch-history clear on entry, a `VERW` buffer clear on return to user, the
-    return-stack fill the selection calls for, and `DOITM` where the CPU enumerates it
+    automatic IBRS or the retpoline build against branch target injection, IBRS on entry from
+    user mode on an Intel part whose returns fall back to the branch target buffer, the
+    `BHI_DIS_S` control or a branch-history clear on entry, a `VERW` buffer clear on return to
+    user, an IBPB on entry from user mode with STIBP on an AMD part affected by branch type
+    confusion or speculative return stack overflow, the return-stack fill the selection calls
+    for, and `DOITM` where the CPU enumerates it
     ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)
     § Controls);
   - on riscv64, the data bounds alone: the RVA23 floor defines no speculation barrier and no
@@ -80,10 +83,9 @@ scaling, and DRAM rows. The system draws the line as follows.
   the user-to-kernel boundary (`IA32_ARCH_CAPABILITIES`, CPUID, and the vendors' published
   guidance), logs it, and selects the controls above from it
   ([core/kernel/docs/transient-execution.md](../core/kernel/docs/transient-execution.md)).
-  The return mitigations for `retbleed` and `spec_rstack_overflow` (a return thunk or an
-  IBPB on entry) are design intent, not yet implemented
-  ([#1085](https://github.com/kottlerg/seraph/issues/1085)); until then a CPU the table gives
-  kernel action for either class is not defended against it.
+  A CPU that leaves `retbleed` or `spec_rstack_overflow` open (no IBPB, an IBPB that does not
+  flush branch types, or SMT on without STIBP) is not defended against it, and the boot log
+  reports the class as vulnerable, with the reason.
 - **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a
   context switch, does not schedule SMT siblings by trust, partitions no cache, and gates no
   counter by process. On riscv64 it sets `scounteren.CY`, so U-mode reads the cycle counter, and

@@ -18,9 +18,10 @@ pub const DEATHS_EQ_CAPACITY: u32 = 64;
 
 /// Observer nodes in svcmgr's first death queue; each further queue has
 /// twice the last one's, up to `EVENT_QUEUE_MAX_CAPACITY`. Each supervised
-/// service's main thread takes one, and a restarted service binds its new
-/// thread before the old one's node returns. Sized below a boot's seven
-/// supervised and adopted services, so every boot grows the set, and its
-/// wait set, and runs the growth path; the pool is paid for as services
-/// arrive.
+/// service takes two, one for the observer of its main thread and one for
+/// that of its address space, and a restarted service binds its new
+/// instance's two before the old instance's return. Sized below the fourteen
+/// nodes a boot's seven supervised and adopted services take, so every boot grows
+/// the set, and its wait set, and runs the growth path; the pool is paid for
+/// as services arrive.
 pub const FIRST_POOL_OBSERVERS: u32 = 4;

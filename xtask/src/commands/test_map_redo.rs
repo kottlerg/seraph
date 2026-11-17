@@ -28,7 +28,6 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Context as _, Result, bail};
-use regex::Regex;
 
 use crate::cli::{
     DEFAULT_FAIL_GRACE_SECS, DEFAULT_FAIL_REGEX, DEFAULT_PASS_REGEX, RunParallelArgs,
@@ -37,6 +36,7 @@ use crate::cli::{
 use crate::commands::mkdisk::{Knob, remove_knob, stage_knob};
 use crate::commands::run_parallel::{QEMU_CRASH_LABEL, saved_log_file, saved_log_outcome};
 use crate::context::Context;
+use crate::regex::Regex;
 use crate::util::step;
 
 /// The bootloader's line for an attempt the knob redoes
@@ -213,7 +213,7 @@ mod tests
     #[test]
     fn the_test_devices_reach_the_boot_only_when_asked()
     {
-        use clap::Parser as _;
+        use crate::argparse::Args as _;
 
         let dir = Path::new("target/xtask/test-map-redo");
         let plain = TestMapRedoArgs::try_parse_from(["test-map-redo"]).unwrap();
@@ -227,7 +227,7 @@ mod tests
     #[test]
     fn a_split_layout_s_data_image_reaches_the_boot()
     {
-        use clap::Parser as _;
+        use crate::argparse::Args as _;
 
         use crate::disk::{BlockSize, DataPlacement, DiskLayout};
 

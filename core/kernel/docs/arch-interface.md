@@ -959,17 +959,26 @@ pub fn hide(value: usize) -> usize;
 /// Derive the boot CPU's transient-execution vulnerability table, select the
 /// user-to-kernel controls it calls for, publish the selection, and log the
 /// table and the controls. Called once on the BSP in Phase 1, after the
-/// baseline check, before any AP starts. x86-64 reads CPUID and
-/// `IA32_ARCH_CAPABILITIES` (transient-execution.md § Controls); RISC-V does
-/// nothing, since the RVA23 floor defines no such enumeration or control.
+/// baseline check and `gdt::load_boot_segments`, before any AP starts. x86-64 reads CPUID and
+/// `IA32_ARCH_CAPABILITIES`, probes `SBPB` on an AMD Family 19h part whose
+/// CPUID does not settle what its IBPB flushes, and selects from the inputs a
+/// `SERAPH_FORCE_RETURN_MITIGATION` build forces where one does
+/// (transient-execution.md § Controls); RISC-V does nothing, since the RVA23
+/// floor defines no such enumeration or control.
 pub fn select_mitigations();
 
 /// Set the calling CPU's per-CPU controls of the selection (x86-64:
-/// `IA32_SPEC_CTRL`, `EFER`, `IA32_UARCH_MISC_CTL`; RISC-V: none). Called on
-/// the BSP in Phase 1 and on each AP in `kernel_entry_ap`.
+/// `IA32_SPEC_CTRL`, `EFER`, `IA32_UARCH_MISC_CTL`, and AMD's `DE_CFG`;
+/// RISC-V: none). Called on the BSP in Phase 1 and on each AP in
+/// `kernel_entry_ap`.
 ///
 /// # Safety
-/// Ring 0 / S-mode on the CPU being brought up, after `select_mitigations`.
+/// Ring 0 / S-mode on the CPU being brought up, after `select_mitigations`,
+/// with interrupts disabled and before its shadow stack is enabled (x86-64:
+/// the `DE_CFG` access recovers from `#GP` through a handler that resumes
+/// at another address than the one the CPU saved), and on x86-64 on the
+/// kernel's GDT (`gdt::load_boot_segments` on the BSP, `gdt::init_ap` on an
+/// AP), through whose code segment that `#GP` is delivered.
 pub unsafe fn apply_mitigations_this_cpu();
 
 /// One word of the mitigation state for `SYS_SYSTEM_INFO(SpeculationControls)`:
@@ -1182,7 +1191,8 @@ The `SYS_SBI_CALL` handler's rights check and `HAS_SBI` gate are specified in
 
 These items in otherwise arch-private submodules are also contract surface, because
 architecture-neutral code calls them:
-`gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, init_ap, bsp_tss_ptr}`,
+`gdt::{load_iopb, permit_port_range, invalidate_all_iopbs, load_boot_segments, init_ap,
+bsp_tss_ptr}`,
 `platform::{console_mmio, uart_base_for_boot_info, collect_mmio_direct_map_regions,
 MMIO_DIRECT_MAP_REGIONS}`,
 `fpu::{switch_out_save, switch_in_restore, report_save_area}`, `idt::load`, and
@@ -1201,6 +1211,11 @@ pub fn gdt::permit_port_range(part: &mut [u8], first_port: u32, base: u32, count
 /// binding withdrawn, or a bind of a thread other than the caller) (x86-64);
 /// no-op on RISC-V.
 pub fn gdt::invalidate_all_iopbs();
+/// Load the BSP's GDT without its TSS and reload the segment registers from it,
+/// in Phase 1, so the boot CPU runs on the kernel's own descriptors before an
+/// exception can be delivered through them (x86-64; the firmware's GDT lies in
+/// memory the kernel's page tables do not map); no-op on RISC-V.
+pub unsafe fn gdt::load_boot_segments();
 /// Load a per-CPU GDT and TSS on an AP (x86-64); no-op on RISC-V.
 pub unsafe fn gdt::init_ap(cpu_id: u32, rsp0: u64, ist1_top: u64, ist2_top: u64);
 /// Virtual address of the BSP's static TSS (x86-64); 0 on RISC-V.

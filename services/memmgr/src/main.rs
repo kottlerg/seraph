@@ -765,17 +765,21 @@ fn arena_grow(l: &mut MemLedger) -> bool
 }
 
 /// Grow the arena until `n` slots outside its reserve are free. `false` when
-/// it cannot (RAM exhausted or the arena's zones spent).
+/// it cannot (RAM exhausted or the arena's zones spent). A growth for a fault
+/// in a committed region goes through [`ensure_committed_slots`] instead.
 fn ensure_slots(l: &mut MemLedger, n: u64) -> bool
 {
-    while l.arena.available() < n
-    {
-        if !arena_grow(l)
-        {
-            return false;
-        }
-    }
-    true
+    l.ensure_slots(n, None, arena_grow)
+}
+
+/// [`ensure_slots`] for the metadata of the region `committed`, when it is a
+/// committed region: the pool pages the growth takes are drawn from the
+/// region's metadata bound, which `promised` already counts
+/// (`free_pool::Ledger::ensure_slots`; services/memmgr/docs/memory-pool.md
+/// § Commit).
+fn ensure_committed_slots(l: &mut MemLedger, n: u64, committed: Option<NodeIdx>) -> bool
+{
+    l.ensure_slots(n, committed, arena_grow)
 }
 
 /// Give the process index another page of buckets when it wants one. A
@@ -1753,7 +1757,9 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
     }
     let region = DemandRegion { va_base, len, prot };
     let mut result = l.add_region(rec, region, commit);
-    if result == Err(RegionError::NoSlot) && ensure_slots(l, 1)
+    // A committed region's commitment takes a slot beside the region's.
+    let slots = if commit == Commit::Committed { 2 } else { 1 };
+    if result == Err(RegionError::NoSlot) && ensure_slots(l, slots)
     {
         result = l.add_region(rec, region, commit);
     }
@@ -1802,8 +1808,7 @@ const fn commit_refusal(e: ChargeError) -> u64
 fn committed_region(l: &MemLedger, rec: NodeIdx, va_base: u64) -> Option<(NodeIdx, u64, u64)>
 {
     l.region_based(rec, va_base).and_then(|(reg, node)| {
-        node.commit
-            .get()
+        l.commitment(reg)
             .map(|c| (reg, node.region.len, c.high_len))
     })
 }
@@ -1854,7 +1859,7 @@ fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
     };
     let levels = u64::from(height(new_len).saturating_sub(height(len)));
     let mut result = l.extend_region(rec, reg, new_len);
-    if result == Err(ResizeError::NoSlot) && ensure_slots(l, levels)
+    if result == Err(ResizeError::NoSlot) && ensure_committed_slots(l, levels, Some(reg))
     {
         result = l.extend_region(rec, reg, new_len);
     }
@@ -2241,7 +2246,8 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
     // mapped over the part of the span around the faulting page
     // (services/memmgr/docs/memory-pool.md § Demand faults).
     let need = l.back_slots(reg, page_base);
-    if !ensure_slots(l, need)
+    let committed = l.is_committed(reg).then_some(reg);
+    if !ensure_committed_slots(l, need, committed)
     {
         decline_fault(ipc_buf, FaultDecline::NoArenaSlot, 0);
         return;
@@ -2253,7 +2259,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         span: (span_start, span_end),
         page_base,
         held: need,
-        committed: l.is_committed(reg).then_some(reg),
+        committed,
     };
     let frame = match back_span(l, &target, span_pages)
     {
@@ -2265,7 +2271,7 @@ fn handle_fault(req: &IpcMessage, ipc_buf: *mut u64)
         }
     };
     // Record the run on its chunk, so it is reclaimed on death or unregister.
-    if !ensure_slots(l, need) || l.back_chunk(rec, reg, frame).is_err()
+    if !ensure_committed_slots(l, need, committed) || l.back_chunk(rec, reg, frame).is_err()
     {
         release_unmapped_chunk(l, rec, aspace_cap, frame);
         decline_fault(ipc_buf, FaultDecline::FrameRecord, 0);
@@ -2291,8 +2297,9 @@ struct FaultTarget
     /// top-up.
     held: u64,
     /// The region's slot when it is committed: its commitment carries the
-    /// run's charge, and its page-table reservation the donations the map
-    /// needs (services/memmgr/docs/memory-pool.md § Commit).
+    /// run's charge, its page-table reservation the donations the map needs,
+    /// and its metadata bound the arena's growth for the fault
+    /// (services/memmgr/docs/memory-pool.md § Commit).
     committed: Option<NodeIdx>,
 }
 
@@ -2492,7 +2499,7 @@ fn fund_client_page_tables(
 {
     let (rec, aspace_cap) = (target.rec, target.aspace_cap);
     // One slot for this run's descriptor, and those held for the chunk.
-    if !ensure_slots(l, target.held.saturating_add(1))
+    if !ensure_committed_slots(l, target.held.saturating_add(1), target.committed)
     {
         return Err(FundRefusal::Failed);
     }

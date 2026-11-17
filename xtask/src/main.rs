@@ -10,9 +10,11 @@
 //!
 //! # Adding a new command
 //!
-//! 1. Add a variant to `cli::CliCommand` and a corresponding `Args` struct in
-//!    `cli.rs`, and name it in `CliCommand::build_host`: a command that
-//!    compiles takes `HostArgs` and is admitted there as a build.
+//! 1. Add a variant to `cli::CliCommand` and a corresponding `args!` struct
+//!    in `cli.rs`, and name it in `CliCommand::build_host`: a command that
+//!    compiles takes `HostArgs` and is admitted there as a build. Add its
+//!    command lines to the reference corpus (xtask/README.md § Command-line
+//!    parsing).
 //! 2. Create `commands/<name>.rs` with a `pub fn run(ctx, args) -> Result<()>`,
 //!    or add a `pub fn run_<name>` to the module that holds its sibling commands.
 //!    (`hook::run` returns nothing: a hook answers every event and never fails.)
@@ -38,10 +40,9 @@ extern crate addr2line;
 extern crate object;
 extern crate rustc_demangle;
 
-use clap::Parser;
-
 mod accel;
 mod arch;
+mod argparse;
 mod bundle;
 mod cli;
 mod commands;
@@ -61,6 +62,7 @@ mod host_lock;
 mod qemu;
 mod qemu_gdb;
 mod qmp;
+mod regex;
 mod rust_src;
 mod stack_sizes;
 mod symbolize;

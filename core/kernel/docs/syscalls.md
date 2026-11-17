@@ -3343,8 +3343,9 @@ pub enum SystemInfoType
     /// One word of the x86-64 transient-execution mitigation state, the view in
     /// arg1: the inputs the kernel selected the user-to-kernel controls from
     /// (`SPECULATION_INPUT_*`: the classes the boot CPU's vulnerability table
-    /// gives kernel action, its predictor behaviours and the control bits it
-    /// enumerates), the controls it selected at boot (`SPECULATION_CONTROL_*`),
+    /// gives kernel action, its predictor behaviours, the control bits it
+    /// enumerates and whether SMT is on, with those a kernel built to force
+    /// its return mitigations forces), the controls it selected at boot (`SPECULATION_CONTROL_*`),
     /// or the controls in effect on the calling CPU (`SPECULATION_CONTROL_*`),
     /// read from its MSRs and from the flags the entry and exit code test
     /// ([transient-execution.md](transient-execution.md) § Controls).

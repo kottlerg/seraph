@@ -20,6 +20,8 @@ process-abi = { path = "../../abi/process-abi" }
 process-layout = { path = "../../shared/process-layout" }
 elf = { path = "../../shared/elf" }
 ipc = { path = "../../shared/ipc" }
+# `TrustStore::parse`: the trust store init hands procmgr (docs/signing.md).
+objsig = { path = "../../shared/objsig" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
 syscall = { path = "../../shared/syscall" }
 syscall-abi = { path = "../../abi/syscall" }

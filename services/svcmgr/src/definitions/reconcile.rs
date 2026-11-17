@@ -412,9 +412,12 @@ fn handle_definition(
         log!("svcmgr: launched ephemeral: {}", def.name);
         let _ = syscall::cap_delete(launched.thread_cap);
         let _ = syscall::cap_delete(launched.process_handle);
-        if launched.provided_endpoint != 0
+        for cap in [launched.provided_endpoint, launched.node_handle]
         {
-            let _ = syscall::cap_delete(launched.provided_endpoint);
+            if cap != 0
+            {
+                let _ = syscall::cap_delete(cap);
+            }
         }
         return None;
     }
@@ -465,6 +468,8 @@ fn handle_definition(
     entry.thread_cap = launched.thread_cap;
     entry.process_handle = launched.process_handle;
     entry.provided_endpoint = launched.provided_endpoint;
+    entry.node_handle = launched.node_handle;
+    entry.launched = true;
     table.install(idx, entry, recipe)?;
     Some(idx)
 }
@@ -579,7 +584,8 @@ fn release_registration(pending: &PendingRegistration)
 }
 
 /// Clone the launch surfaces the restart path replays from a parsed
-/// definition: argv/env/cwd/seed byte-for-byte, the log-sink flag, and the
+/// definition: argv/env/cwd/seed byte-for-byte, the log-sink,
+/// debug-authority, `oom_stop`, stop-authority and reserve flags, and the
 /// scheduling fields. The name, binary, policy and namespace live on the
 /// `ServiceEntry` instead ([`build_entry`]). `None` when the heap cannot hold
 /// the copies.
@@ -597,6 +603,9 @@ fn recipe_from(def: &Definition) -> Option<RestartRecipe>
         seed: try_strings(&def.seed)?,
         log_sink: def.log_sink,
         debug_authority: def.debug_authority,
+        oom_stop: def.oom_stop,
+        stop_authority: def.stop_authority,
+        reserve: def.reserve,
         priority: def.priority.unwrap_or(0),
         sched_max: def.sched_max.unwrap_or(0),
     })

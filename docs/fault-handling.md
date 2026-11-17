@@ -805,9 +805,11 @@ fault to the system log, then ends the faulting thread as the kernel would have,
 fault the pager declined for want of memory, which it may hold until memory is freed or a bounded
 time passes, then resume or decline. It ends the thread by declining the fault
 (`FAULT_REPLY_KILL`), so the thread dies with the same exit reason and the same death flow
-([Process Lifecycle § Process Death](process-lifecycle.md#process-death)). The hold is design
-intent; not yet implemented: the crash service reports and declines a fault declined for want of
-memory as it does any other. The service, its report,
+([Process Lifecycle § Process Death](process-lifecycle.md#process-death)). It holds such a fault
+only when its recipe sets a stall, which the shipped recipe does not; a held fault waits queued on
+one of a fixed number of the service's endpoints ([`FAULT_REPLY_REDIRECT`](#reply)), so no thread
+of the service blocks on it and the service goes on reporting other faults
+([crashd Operation § Hold](../services/crashd/docs/operation.md#hold)). The service, its report,
 and its limits are in [services/crashd/README.md](../services/crashd/README.md) and
 [crashd Operation](../services/crashd/docs/operation.md); the report's
 format, the contract the host-side symbolizer reads, in

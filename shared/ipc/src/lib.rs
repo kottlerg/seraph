@@ -1448,7 +1448,7 @@ pub mod procmgr_process_state
 
 /// Wire-protocol version of [`svcmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const SVCMGR_LABELS_VERSION: u32 = 12;
+pub const SVCMGR_LABELS_VERSION: u32 = 13;
 /// IPC labels for the service manager (`svcmgr`).
 pub mod svcmgr_labels
 {
@@ -1574,14 +1574,15 @@ pub mod svcmgr_labels
     /// endpoint (init, and procmgr's per-child source), which is what keeps
     /// the bit theirs: every other SEND on the endpoint is already badged (a
     /// badge is set once) without it — devmgr's with [`PUBLISH_AUTHORITY`],
-    /// the published `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each
-    /// per-process `service_registry_cap` with a process badge, which
+    /// each stop-authority holder's with [`STOP_AUTHORITY`], the published
+    /// `svcmgr` name's with [`PUBLISHED_SEND_BADGE`], and each per-process
+    /// `service_registry_cap` with a process badge, which
     /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) keeps clear of verb bits.
     pub const HANDOVER_AUTHORITY: u64 = 1u64 << 62;
     /// Badge on the SEND svcmgr publishes on its own endpoint under the
     /// `svcmgr` name: a fixed value with no verb bit, so a consumer can
     /// `QUERY_ENDPOINT` through it but cannot re-badge it to mint
-    /// [`HANDOVER_AUTHORITY`] or [`PUBLISH_AUTHORITY`].
+    /// [`HANDOVER_AUTHORITY`], [`PUBLISH_AUTHORITY`] or [`STOP_AUTHORITY`].
     pub const PUBLISHED_SEND_BADGE: u64 = 1;
     const _: () = core::assert!(PUBLISHED_SEND_BADGE & crate::VERB_BIT_MASK == 0);
     /// Publish a named endpoint into the discovery registry.
@@ -1636,6 +1637,133 @@ pub mod svcmgr_labels
     /// `user.*`) is the future-work shape and the badge namespace
     /// reserves it — see GitHub issue #76.
     pub const PUBLISH_AUTHORITY: u64 = 1u64 << 63;
+
+    /// Stop a supervised service on behalf of the out-of-memory policy: svcmgr
+    /// destroys its process through the handle it holds as its creator and
+    /// routes the death through the service's restart policy as
+    /// `EXIT_KILLED`. Served only on a badge carrying [`STOP_AUTHORITY`]
+    /// (`svcmgr_errors::UNAUTHORIZED` otherwise).
+    ///
+    /// Label bits 16..31 carry `name_len`; data words from 0 carry the
+    /// service name as for [`QUERY_ENDPOINT`] ([`pack_name`]). svcmgr stops
+    /// only a service it launched whose recipe sets `oom_stop = yes` and
+    /// meets the eligibility rule; the reply is `SUCCESS` once the process
+    /// is destroyed, `INVALID_NAME` for a malformed name,
+    /// `NOT_STOPPABLE` for a name no supervised service has or one the rule
+    /// refuses, `NOT_RUNNING` for an eligible service with no running
+    /// instance, and `UNAVAILABLE` when procmgr cannot be called or refuses
+    /// the destroy. A refusal changes nothing. Specified in
+    /// `services/svcmgr/docs/ipc-interface.md` § Label 5: `STOP_SERVICE`.
+    pub const STOP_SERVICE: u64 = 5;
+
+    /// List the services [`STOP_SERVICE`] would stop, with the memory each
+    /// uses, one page per call. Served only on a badge carrying
+    /// [`STOP_AUTHORITY`]. `data[0]` is the cursor: 0 starts the walk, and
+    /// each reply's `data[1]` is the cursor that resumes it. The reply
+    /// carries the page's count in `data[0]`, the next cursor in `data[1]`,
+    /// then per entry [`LIST_STOPPABLE_WORDS_PER_ENTRY`] words: the pages the
+    /// service's budget node and its subtree hold, its name's length, and the
+    /// name's bytes ([`pack_stoppable_entry`]); at most [`LIST_STOPPABLE_PAGE`]
+    /// entries, and a page shorter than that ends the walk. `UNAVAILABLE`
+    /// when memmgr or procmgr, through which the usage is read, cannot be
+    /// called. Specified in `services/svcmgr/docs/ipc-interface.md`
+    /// § Label 6: `LIST_STOPPABLE`.
+    pub const LIST_STOPPABLE: u64 = 6;
+
+    /// Data words one [`LIST_STOPPABLE`] entry takes: the usage in pages, the
+    /// name's length, and the name in [`NAME_MAX`] bytes.
+    pub const LIST_STOPPABLE_WORDS_PER_ENTRY: usize = 2 + NAME_WORDS;
+
+    /// Data words of a [`LIST_STOPPABLE`] reply before its first entry: the
+    /// count and the next cursor.
+    pub const LIST_STOPPABLE_HEADER_WORDS: usize = 2;
+
+    /// Entries one [`LIST_STOPPABLE`] reply carries at most: as many as fit
+    /// the data words after the header.
+    pub const LIST_STOPPABLE_PAGE: usize =
+        (super::MSG_DATA_WORDS_MAX - LIST_STOPPABLE_HEADER_WORDS) / LIST_STOPPABLE_WORDS_PER_ENTRY;
+
+    const _: () = core::assert!(LIST_STOPPABLE_PAGE >= 1);
+
+    /// Write entry `index` of a [`LIST_STOPPABLE`] reply into `words` (the
+    /// reply's data words, whose header the caller sets): the usage in pages,
+    /// the name's length, and the name's bytes as [`pack_name`] packs them,
+    /// zero-padded. Returns `false`, writing nothing, when `name` is empty or
+    /// longer than [`NAME_MAX`], or the entry does not fit `words`.
+    pub fn pack_stoppable_entry(words: &mut [u64], index: usize, pages: u64, name: &[u8]) -> bool
+    {
+        let mut packed = [0; NAME_WORDS];
+        if name.is_empty() || pack_name(name, &mut packed).is_none()
+        {
+            return false;
+        }
+        let Some([pages_word, len_word, name_words @ ..]) =
+            stoppable_entry_base(index).and_then(|base| {
+                words
+                    .get_mut(base..)?
+                    .get_mut(..LIST_STOPPABLE_WORDS_PER_ENTRY)
+            })
+        else
+        {
+            return false;
+        };
+        *pages_word = pages;
+        *len_word = name.len() as u64;
+        name_words.copy_from_slice(&packed);
+        true
+    }
+
+    /// Read entry `index` of a [`LIST_STOPPABLE`] reply's data words
+    /// `words`: the usage in pages, and the name, zero-padded to
+    /// [`NAME_MAX`], with its length. `None` when `index` is past the
+    /// reply's count or its words, or the entry's length is 0 or past
+    /// [`NAME_MAX`]; the reply is wire input, so nothing is read past either
+    /// bound.
+    #[must_use]
+    pub fn unpack_stoppable_entry(
+        words: &[u64],
+        index: usize,
+    ) -> Option<(u64, [u8; NAME_MAX], usize)>
+    {
+        let count = usize::try_from(*words.first()?).ok()?;
+        if index >= count
+        {
+            return None;
+        }
+        let [pages, len_word, name_words @ ..] = words
+            .get(stoppable_entry_base(index)?..)?
+            .get(..LIST_STOPPABLE_WORDS_PER_ENTRY)?
+        else
+        {
+            return None;
+        };
+        let len = usize::try_from(*len_word).ok()?;
+        let name = unpack_name(name_words, len)?;
+        Some((*pages, name, len))
+    }
+
+    /// The first data word of entry `index` of a [`LIST_STOPPABLE`] reply,
+    /// past the header; `None` when it does not fit a `usize`.
+    fn stoppable_entry_base(index: usize) -> Option<usize>
+    {
+        index
+            .checked_mul(LIST_STOPPABLE_WORDS_PER_ENTRY)?
+            .checked_add(LIST_STOPPABLE_HEADER_WORDS)
+    }
+
+    /// Verb-bit authorising [`STOP_SERVICE`] and [`LIST_STOPPABLE`]. svcmgr
+    /// alone mints it, on a SEND on its own service endpoint it delivers to a
+    /// service whose recipe sets `stop_authority = yes`, in the bootstrap slot
+    /// after the seeds and the debug-authority cap, fresh on every launch and
+    /// restart. The SEND carries no other verb bit, so it cannot publish or
+    /// hand over.
+    pub const STOP_AUTHORITY: u64 = 1u64 << 61;
+
+    const _: () = core::assert!(
+        STOP_AUTHORITY & crate::VERB_BIT_MASK != 0
+            && STOP_AUTHORITY != PUBLISH_AUTHORITY
+            && STOP_AUTHORITY != HANDOVER_AUTHORITY
+    );
 }
 
 /// Well-known names published into svcmgr's discovery registry.
@@ -4860,14 +4988,28 @@ pub mod svcmgr_errors
     /// a mismatch svcmgr's bootstrap fails without replying this code.
     pub const LABEL_VERSION_MISMATCH: u64 = 7;
     /// Caller's badge lacks [`svcmgr_labels::PUBLISH_AUTHORITY`] on a
-    /// `PUBLISH_ENDPOINT` request or [`svcmgr_labels::HANDOVER_AUTHORITY`] on
-    /// a `HANDOVER_COMPLETE`, or the handover has already run.
+    /// `PUBLISH_ENDPOINT` request, [`svcmgr_labels::HANDOVER_AUTHORITY`] on
+    /// a `HANDOVER_COMPLETE`, or [`svcmgr_labels::STOP_AUTHORITY`] on a
+    /// `STOP_SERVICE` or `LIST_STOPPABLE`, or the handover has already run.
     pub const UNAUTHORIZED: u64 = 8;
     /// Client-side: the underlying `ipc_call` returned `Err` (no reply
     /// from svcmgr, transport-level failure), for a client that reports it
     /// in the svcmgr status space. Never emitted by svcmgr itself; no
     /// in-tree client synthesises it.
     pub const IPC_FAILED: u64 = 9;
+    /// `svcmgr_labels::STOP_SERVICE`: no supervised service has the name,
+    /// or the eligibility rule refuses it (not launched by svcmgr,
+    /// `restart = never`, `critical = yes`, a core role, or no
+    /// `oom_stop = yes`).
+    pub const NOT_STOPPABLE: u64 = 10;
+    /// `svcmgr_labels::STOP_SERVICE`: the service is eligible but has no
+    /// running instance (it is down, or its death had not been routed, which
+    /// svcmgr then routes).
+    pub const NOT_RUNNING: u64 = 11;
+    /// `svcmgr_labels::STOP_SERVICE` or `svcmgr_labels::LIST_STOPPABLE`:
+    /// memmgr or procmgr, which the request calls, is down, or procmgr
+    /// refused the destroy; nothing changed.
+    pub const UNAVAILABLE: u64 = 12;
     /// Unknown opcode on svcmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }
@@ -5898,6 +6040,79 @@ mod tests
         let full =
             (0..MSG_CAP_SLOTS_MAX as u64).fold(IpcMessage::builder(1), IpcMessageBuilder::cap);
         let _ = full.cap(99);
+    }
+
+    #[test]
+    fn a_stoppable_list_page_round_trips_names_of_every_length()
+    {
+        use svcmgr_labels::{
+            LIST_STOPPABLE_PAGE, NAME_MAX, pack_stoppable_entry, unpack_stoppable_entry,
+        };
+        let long = [b'x'; NAME_MAX];
+        let names: [&[u8]; 3] = [b"memhog", &long, b"a"];
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        for (i, name) in names.iter().enumerate()
+        {
+            assert!(pack_stoppable_entry(&mut words, i, 0x100 + i as u64, name));
+        }
+        words[0] = names.len() as u64;
+        for (i, name) in names.iter().enumerate()
+        {
+            let (pages, out, len) = unpack_stoppable_entry(&words, i).unwrap();
+            assert_eq!((pages, &out[..len]), (0x100 + i as u64, *name));
+            assert!(out[len..].iter().all(|&b| b == 0));
+        }
+        assert!(unpack_stoppable_entry(&words, names.len()).is_none());
+        // A full page fits the message, and the entry past it does not.
+        assert!(pack_stoppable_entry(
+            &mut words,
+            LIST_STOPPABLE_PAGE - 1,
+            1,
+            b"a"
+        ));
+        assert!(!pack_stoppable_entry(
+            &mut words,
+            LIST_STOPPABLE_PAGE,
+            1,
+            b"a"
+        ));
+    }
+
+    #[test]
+    fn a_stoppable_list_entry_refuses_names_outside_one_to_name_max()
+    {
+        use svcmgr_labels::{NAME_MAX, pack_stoppable_entry, unpack_stoppable_entry};
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_stoppable_entry(&mut words, 0, 7, b""));
+        assert!(!pack_stoppable_entry(
+            &mut words,
+            0,
+            7,
+            &[b'n'; NAME_MAX + 1]
+        ));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        assert!(pack_stoppable_entry(&mut words, 0, 7, b"svc"));
+        words[0] = 1;
+        // A length the reply claims past NAME_MAX, or zero, is wire input
+        // refused, not read.
+        words[3] = NAME_MAX as u64 + 1;
+        assert!(unpack_stoppable_entry(&words, 0).is_none());
+        words[3] = 0;
+        assert!(unpack_stoppable_entry(&words, 0).is_none());
+    }
+
+    #[test]
+    fn a_stoppable_list_index_whose_offset_overflows_is_refused()
+    {
+        use svcmgr_labels::{
+            LIST_STOPPABLE_WORDS_PER_ENTRY, pack_stoppable_entry, unpack_stoppable_entry,
+        };
+        let index = usize::MAX / LIST_STOPPABLE_WORDS_PER_ENTRY + 1;
+        let mut words = [0u64; MSG_DATA_WORDS_MAX];
+        assert!(!pack_stoppable_entry(&mut words, index, 7, b"a"));
+        assert_eq!(words, [0; MSG_DATA_WORDS_MAX]);
+        words[0] = u64::MAX;
+        assert!(unpack_stoppable_entry(&words, index).is_none());
     }
 
     #[test]

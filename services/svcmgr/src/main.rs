@@ -33,6 +33,7 @@ mod definitions;
 mod endowed_servers;
 mod restart;
 mod service;
+mod stop;
 
 use definitions::reconcile::{PendingRegistration, ServiceTable};
 use ipc::{IpcMessage, svcmgr_labels};
@@ -53,7 +54,10 @@ pub(crate) fn now_ns() -> u64
 /// Read a name of `name_len` bytes packed into IPC data words from word 0,
 /// as `svcmgr_labels::pack_name` packs it. `None` when the length is 0 or
 /// past `svcmgr_labels::NAME_MAX`, or the message carries too few words.
-fn read_name_from_msg(msg: &IpcMessage, name_len: usize) -> Option<[u8; svcmgr_labels::NAME_MAX]>
+pub(crate) fn read_name_from_msg(
+    msg: &IpcMessage,
+    name_len: usize,
+) -> Option<[u8; svcmgr_labels::NAME_MAX]>
 {
     svcmgr_labels::unpack_name(msg.words(), name_len)
 }
@@ -450,6 +454,7 @@ fn event_loop(
 {
     let restart_ctx = restart::RestartCtx {
         procmgr_ep: info.procmgr_endpoint,
+        service_ep: caps.service_ep,
         bootstrap_ep: caps.bootstrap_ep,
         ipc_buf,
         deaths,
@@ -502,7 +507,8 @@ fn recv_diag(stage: ipc::recv_guard::RecvFailureStage, err: i64)
 }
 
 /// Handle an IPC message on the service endpoint (registration, handover,
-/// or discovery-registry publish/query). `ctx` carries the procmgr /
+/// discovery-registry publish/query, or a stop-authority holder's stop or
+/// list of stoppable services). `ctx` carries the procmgr /
 /// bootstrap / death-queue state the `HANDOVER_COMPLETE` →
 /// `reconcile_and_launch` path needs to spawn `.svc`-defined services.
 fn dispatch_ipc(
@@ -575,6 +581,8 @@ fn dispatch_ipc(
         {
             handle_query_endpoint(&msg, &mut state.registry, ipc_buf);
         }
+        svcmgr_labels::STOP_SERVICE => stop::handle_stop_service(&msg, state, ctx),
+        svcmgr_labels::LIST_STOPPABLE => stop::handle_list_stoppable(&msg, state, ctx),
         _ =>
         {
             let reply = IpcMessage::new(ipc::svcmgr_errors::UNKNOWN_OPCODE);
@@ -749,7 +757,12 @@ fn dispatch_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 /// post under its own instance, so a post of an instance already routed (the
 /// second of the two posts a main-thread fault that is the address space's
 /// first terminal fault makes, or a post a resync overtook) is dropped.
-fn route_death(tag: DeathTag, exit_reason: u64, state: &mut SvcmgrState, ctx: &restart::RestartCtx)
+pub(crate) fn route_death(
+    tag: DeathTag,
+    exit_reason: u64,
+    state: &mut SvcmgrState,
+    ctx: &restart::RestartCtx,
+)
 {
     let idx = tag.index();
     let Some(svc) = state.table.services.get(idx)
@@ -820,7 +833,7 @@ fn route_namespace_server_death(
 /// terminal-fault reason when one of its threads has faulted. A fault of a
 /// worker thread of a procmgr-created service shows here only once procmgr
 /// has torn the service down.
-fn observed_death(entry: &service::ServiceEntry) -> Option<u64>
+pub(crate) fn observed_death(entry: &service::ServiceEntry) -> Option<u64>
 {
     restart::caps_death(entry.thread_cap, entry.aspace_cap)
 }
@@ -905,7 +918,7 @@ fn resync_deaths(state: &mut SvcmgrState, ctx: &restart::RestartCtx)
 /// Whether every service whose address space svcmgr holds (memmgr and
 /// procmgr, which init created by raw syscalls) is active and shown alive by
 /// the kernel, so a call into procmgr is answered.
-fn substrate_alive(state: &SvcmgrState) -> bool
+pub(crate) fn substrate_alive(state: &SvcmgrState) -> bool
 {
     state
         .table
@@ -999,7 +1012,7 @@ fn initiate_graceful_shutdown(state: &mut SvcmgrState, ctx: &restart::RestartCtx
 /// Whether `entry`'s service is running: the entry is active, holds an
 /// instance, and the kernel does not show that instance dead
 /// ([`observed_death`]).
-fn service_running(entry: &service::ServiceEntry) -> bool
+pub(crate) fn service_running(entry: &service::ServiceEntry) -> bool
 {
     entry.active && entry.thread_cap != 0 && observed_death(entry).is_none()
 }

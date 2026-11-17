@@ -29,8 +29,10 @@ pub mod x86_paging;
 
 pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_address};
 
-/// Current boot protocol version. Increment when `BootInfo` layout or the
-/// CPU entry contract changes in a non-backwards-compatible way.
+/// Current boot protocol version. Increment on every breaking change to the
+/// protocol: the `BootInfo` layout, what a field holds, a requirement on a
+/// compliant bootloader, or the CPU entry contract
+/// (docs/conventions.md § ABI / wire-protocol versions).
 ///
 /// The kernel enforces **strict equality** against this constant at entry:
 /// any mismatch — including a bootloader that is layout-compatible but
@@ -155,7 +157,14 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 /// v21: The riscv64 [`KernelMmio`] lost `plic_base`, `plic_size` and
 ///     `plic_ndev`: the kernel drives AIA only, so `aplic` and `imsic` are
 ///     its interrupt controllers, and `uart_base` is now its first field.
-pub const BOOT_PROTOCOL_VERSION: u32 = 21;
+/// v22: The last entry of `modules` is the trust store the bootloader
+///     verified the kernel and the bundle against, named
+///     [`TRUST_STORE_MODULE`] in pages of its own, so `modules` is never
+///     empty and the bundle supplies at most `MAX_BOOT_MODULES - 1` modules.
+///     A bundle module's `size` is its whole signed object, signature
+///     trailer included; the trust store's is the store's own length. No
+///     layout change.
+pub const BOOT_PROTOCOL_VERSION: u32 = 22;
 
 // ── Memory map ───────────────────────────────────────────────────────────────
 
@@ -248,37 +257,49 @@ pub const BOOT_MODULE_NAME_LEN: usize = 32;
 
 /// Maximum number of boot modules a `BootInfo` lists (`modules.count`): the
 /// [`BootModule`] entries the one page the bootloader allocates for the array
-/// holds. A bundle with more is refused by name, by the bootloader and the
-/// kernel alike.
+/// holds. The bundle's modules number one fewer, since the
+/// [`TRUST_STORE_MODULE`] takes a slot. A bundle with more is refused by
+/// name, by the bootloader and the kernel alike.
 pub const MAX_BOOT_MODULES: usize = 4096 / core::mem::size_of::<BootModule>();
 
-/// A boot module loaded by the bootloader (raw ELF image for early services).
+/// Name of the boot module that holds the trust store the bootloader verified
+/// the kernel and the bundle against (docs/signing.md § Trust Store). The
+/// bootloader copies the store into a page allocation of its own and lists it
+/// after the bundle's modules; a bundle entry of this name is refused.
+pub const TRUST_STORE_MODULE: &[u8] = b"trust-store";
+
+/// A boot module loaded by the bootloader.
 ///
-/// The module set is sourced from the `\EFI\seraph\bootstrap.bundle` file
-/// on the ESP (see [`bundle`]). Each module is an ELF executable for an
-/// early userspace service (procmgr, devmgr, drivers, etc.). `name`
-/// carries the bundle entry's identifier so init can match modules by
-/// identity instead of position in the array.
+/// Every module but one is a `\EFI\seraph\bootstrap.bundle` entry (see
+/// [`bundle`]): an ELF executable for an early userspace service (procmgr,
+/// devmgr, drivers, etc.) or a data entry (a platform description table, the
+/// log-level configuration), each a signed object the bootloader verified
+/// (docs/signing.md). The one other is the [`TRUST_STORE_MODULE`]. `name`
+/// carries the module's identifier so init can match modules by identity
+/// instead of position in the array.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct BootModule
 {
     /// Identifier copied verbatim from the bundle entry header, NUL-padded
-    /// to [`BOOT_MODULE_NAME_LEN`] bytes. The bundle's entry named `"init"`
-    /// is consumed by the bootloader as the userspace init image and does
-    /// not appear here; every other entry is exposed as a `BootModule`.
+    /// to [`BOOT_MODULE_NAME_LEN`] bytes, or [`TRUST_STORE_MODULE`]. The
+    /// bundle's entry named `"init"` is consumed by the bootloader as the
+    /// userspace init image and does not appear here; every other entry is
+    /// exposed as a `BootModule`.
     pub name: [u8; BOOT_MODULE_NAME_LEN],
     /// Physical base address of the module data.
     pub physical_base: u64,
-    /// Size of the module data in bytes (file size, not page-rounded size).
+    /// Size of the module data in bytes (file size, not page-rounded size):
+    /// for a bundle entry the whole signed object, its signature trailer
+    /// included.
     pub size: u64,
 }
 
 /// A slice of [`BootModule`] values, passed by physical address.
 ///
-/// Contains raw ELF images for early services. The module set is determined
-/// by the contents of `\EFI\seraph\bootstrap.bundle` minus the special
-/// `"init"` entry the bootloader consumes for [`BootInfo::init_image`].
+/// The module set is the entries of `\EFI\seraph\bootstrap.bundle` minus
+/// the special `"init"` entry the bootloader consumes for
+/// [`BootInfo::init_image`], then the [`TRUST_STORE_MODULE`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ModuleSlice
@@ -982,10 +1003,9 @@ pub struct BootInfo
     /// segment array so the kernel can map init without an ELF parser.
     pub init_image: InitImage,
 
-    /// Additional boot modules (raw ELF images for early services).
-    ///
-    /// The set of modules is sourced from the bootloader's
-    /// `bootstrap.bundle`; see the [`bundle`] module for the wire
+    /// Additional boot modules: the bundle's entries other than `init`
+    /// (ELF images for early services, and data entries), then the
+    /// [`TRUST_STORE_MODULE`]; see the [`bundle`] module for the wire
     /// format and the `init` entry name special-cased by the bootloader.
     pub modules: ModuleSlice,
 

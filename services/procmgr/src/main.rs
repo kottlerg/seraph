@@ -27,6 +27,7 @@ mod death_queues;
 mod init_reap;
 mod loader;
 mod process;
+mod trust_store;
 
 use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors, procmgr_labels};
 // Brings `configure_pipe` / `configure_namespace` into method-call scope; their
@@ -49,16 +50,16 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 ///            per child for `ProcessInfo.service_registry_cap`; the
 ///            child can `QUERY_ENDPOINT` but not `PUBLISH_ENDPOINT`.
 ///            Zero means no registry is available yet.
-#[expect(
-    clippy::struct_field_names,
-    reason = "the shared `_ep` suffix says each field is an endpoint cap; dropping it would leave \
-              names that hide the cap kind"
-)]
+///   caps[3]: map-only Memory cap on the `trust-store` boot module, with
+///            data[0] the store's length in bytes ([`trust_store`]).
+///            Absent when init holds no store; procmgr then stops.
 struct InitBootstrap
 {
     service_ep: u64,
     log_ep: u64,
     registry_ep: u64,
+    /// The trust store's Memory cap and length in bytes.
+    trust_store: Option<(u64, u64)>,
 }
 
 fn bootstrap_from_init(creator_ep: u64, ipc_buf: *mut u64) -> Option<InitBootstrap>
@@ -91,6 +92,8 @@ fn bootstrap_from_init(creator_ep: u64, ipc_buf: *mut u64) -> Option<InitBootstr
         {
             0
         },
+        trust_store: (round.cap_count >= 4 && round.data_words >= 1)
+            .then(|| (round.caps[3], round.data[0])),
     })
 }
 
@@ -107,6 +110,22 @@ fn main() -> !
 
     // Bootstrap service endpoint + log endpoint from init.
     let Some(boot) = bootstrap_from_init(startup.creator_endpoint, ipc_buf)
+    else
+    {
+        syscall::thread_exit();
+    };
+
+    // The trust store, copied and parsed once (docs/signing.md § Trust
+    // Store); without one that parses procmgr stops, and creates no process.
+    // The copy lives in this frame, which never returns, for procmgr's life;
+    // no create verifies an image against it yet (#124).
+    let Some((store_cap, store_len)) = boot.trust_store
+    else
+    {
+        std::os::seraph::log!(error: "init handed no trust store; exiting");
+        syscall::thread_exit();
+    };
+    let Some(_trust_store) = trust_store::receive(startup.self_aspace, store_cap, store_len)
     else
     {
         syscall::thread_exit();

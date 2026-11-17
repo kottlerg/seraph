@@ -118,6 +118,12 @@ how the `on_failure` policy classes each range:
 | `0x1000 ..= 0x1FFF` (`EXIT_FAULT_BASE + vector`) | Fault | failure |
 | `0x2000` (`EXIT_KILLED`) | Killed | failure |
 
+A stop svcmgr makes for a stop-authority holder
+([ipc-interface.md § Label 5](ipc-interface.md#label-5-stop_service)) is not posted by the kernel:
+svcmgr destroys the instance through procmgr, then routes the death itself as `EXIT_KILLED`
+under the instance's tag, so it takes this decision tree as a crash does. A post of the destroyed
+instance that arrives after it names the old instance and is dropped.
+
 ---
 
 ## Decision tree
@@ -236,7 +242,8 @@ The launch path is documented in
 [service-definitions.md](service-definitions.md#reconciliation). The
 `.svc` recipe is the single source of truth for both paths: the fixed
 fields are recorded on `ServiceEntry` and the argv / env / cwd / seed,
-log-sink flag, and scheduling fields on the parallel `RestartRecipe`, so
+the log-sink, debug-authority, stop-authority, `oom_stop` and `reserve`
+flags, and the scheduling fields on the parallel `RestartRecipe`, so
 a restart reproduces the first-launch spawn shape byte-for-byte, except the
 log-sink round, whose history-pull SEND is absent on a restart (per
 [service-definitions.md](service-definitions.md#log_sink)). The binary path
@@ -264,9 +271,12 @@ string at its own length:
 | `process_handle` | `Launched.process_handle` for svcmgr-launched; the endowed process handle for devmgr and vfsd; `0` for memmgr and procmgr (see DESTROY_PROCESS above) |
 | `aspace_cap` | the endowed Control-only address-space cap for memmgr and procmgr; `0` otherwise |
 | `instance` | the death-tag instance: `0` for the first, one more per restart |
+| `launched` | `true` when svcmgr launched the service from its recipe, `false` for a service init started; read by the stop eligibility rule ([service-definitions.md § `oom_stop`](service-definitions.md#oom_stop)) |
+| `node_handle` | for an `oom_stop = yes` service, the node handle to the running instance's budget node, the create reply's last cap (`CREATE_NODE_HANDLE`); `0` otherwise. Released with the instance's other caps when it dies, and replaced at each restart |
 
 The launch surfaces svcmgr replays beyond that record (the
-argv / env / cwd / seed, plus the log-sink flag and
+argv / env / cwd / seed, plus the log-sink, debug-authority,
+stop-authority, `oom_stop` and `reserve` flags and the
 scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
 (`ServiceTable.recipes`), index-aligned with `services` by slot:
@@ -278,12 +288,18 @@ scheduling fields) are held in a parallel
 | `cwd` | `cwd = ...` |
 | `seed` | `seed = ...` |
 | `log_sink` | `log_sink = ...` |
+| `debug_authority` | `debug_authority = ...` |
+| `stop_authority` | `stop_authority = ...` |
+| `oom_stop` | `oom_stop = ...` |
+| `reserve` | `reserve = ...` |
 | `priority` | `priority = ...` (`0` = unset) |
 | `sched_max` | `sched_max = ...` (`0` = unset) |
 
-`restart_process` replays every field on every respawn — argv/env and the
-scheduling fields into `CREATE_FROM_FILE`, cwd through
-`apply_namespace_policy`, seeds re-resolved from the discovery registry,
+`restart_process` replays every field on every respawn — argv/env, the
+scheduling fields and the create flags `reserve` and `oom_stop` ask for
+(`CREATE_RESERVE`, `CREATE_NODE_HANDLE`) into `CREATE_FROM_FILE`, cwd
+through `apply_namespace_policy`, seeds re-resolved from the discovery
+registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap after them,
 and `log_sink` selecting the log-sink round — so a restarted child comes
 back with the same surfaces first launch gave it, the log-sink round's
 history-pull SEND aside.

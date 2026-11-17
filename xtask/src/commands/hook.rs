@@ -1487,7 +1487,7 @@ mod tests
             .expect("the reminder names the command that prints the orchestrator's id");
         let words = command.split_whitespace().skip(1).collect::<Vec<_>>();
         assert_eq!(words, ["xtask", "orch", "orchestrator"]);
-        let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(&words)
+        let cli = <crate::cli::Cli as crate::argparse::Args>::try_parse_from(&words)
             .unwrap_or_else(|err| panic!("`{command}` is not a command of this binary: {err}"));
         assert!(matches!(
             cli.command,

@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Context as _, Result, bail};
-use clap::ValueEnum;
 
 use crate::accel::{self, Accel};
 use crate::arch::Arch;
@@ -47,22 +46,24 @@ pub enum GdbMode<'a>
     Unix(&'a Path),
 }
 
-/// Guest RISC-V paging mode ceiling for a QEMU launch.
-///
-/// Selects which `svNN` satp modes the guest CPU advertises (DTB `mmu-type`
-/// plus the satp write-probe both follow it); the kernel negotiates the
-/// highest advertised mode it supports at boot. QEMU >= 8.0 defaults the
-/// rv64 CPU to sv57, so the sv48 default here pins the guest to the
-/// project's standing Sv48 baseline rather than QEMU's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum RiscvMmu
-{
-    /// Cap the guest at Sv39 (`sv57=off,sv48=off`).
-    Sv39,
-    /// Cap the guest at Sv48 (`sv57=off`) — the default.
-    Sv48,
-    /// Enable Sv57 (`sv57=on`, explicit against QEMU default drift).
-    Sv57,
+crate::argparse::value_enum! {
+    /// Guest RISC-V paging mode ceiling for a QEMU launch.
+    ///
+    /// Selects which `svNN` satp modes the guest CPU advertises (DTB `mmu-type`
+    /// plus the satp write-probe both follow it); the kernel negotiates the
+    /// highest advertised mode it supports at boot. QEMU >= 8.0 defaults the
+    /// rv64 CPU to sv57, so the sv48 default here pins the guest to the
+    /// project's standing Sv48 baseline rather than QEMU's.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RiscvMmu
+    {
+        /// Cap the guest at Sv39 (`sv57=off,sv48=off`).
+        Sv39,
+        /// Cap the guest at Sv48 (`sv57=off`) — the default.
+        Sv48,
+        /// Enable Sv57 (`sv57=on`, explicit against QEMU default drift).
+        Sv57,
+    }
 }
 
 impl RiscvMmu
@@ -79,19 +80,21 @@ impl RiscvMmu
     }
 }
 
-/// Whether the guest RISC-V CPU implements the `Zkr` entropy source.
-///
-/// With it, the firmware grants S-mode the `seed` CSR and the kernel's
-/// hardware RNG draws from it; without it, the kernel's probe of the CSR traps
-/// and the source is absent (core/kernel/docs/entropy.md § Sources and
-/// graceful degradation). Explicit both ways, against QEMU default drift.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum RiscvZkr
-{
-    /// Implement `Zkr` (`zkr=on`) — the default.
-    On,
-    /// Leave `Zkr` out (`zkr=off`).
-    Off,
+crate::argparse::value_enum! {
+    /// Whether the guest RISC-V CPU implements the `Zkr` entropy source.
+    ///
+    /// With it, the firmware grants S-mode the `seed` CSR and the kernel's
+    /// hardware RNG draws from it; without it, the kernel's probe of the CSR traps
+    /// and the source is absent (core/kernel/docs/entropy.md § Sources and
+    /// graceful degradation). Explicit both ways, against QEMU default drift.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RiscvZkr
+    {
+        /// Implement `Zkr` (`zkr=on`) — the default.
+        On,
+        /// Leave `Zkr` out (`zkr=off`).
+        Off,
+    }
 }
 
 impl RiscvZkr
@@ -107,21 +110,23 @@ impl RiscvZkr
     }
 }
 
-/// Guest x86-64 paging depth for a QEMU launch.
-///
-/// Pins the guest CPU's `la57` property on every accelerator, so the CPUID
-/// LA57 bit the bootloader reads (and with it the depth the kernel recovers
-/// from `CR4.LA57`) is the one the run asks for. The 4-level default keeps a
-/// TCG `-cpu max` guest, which otherwise advertises LA57, on 4-level paging.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum X86Paging
-{
-    /// 4-level paging (`la57=off`) — the default.
-    #[value(name = "4")]
-    Four,
-    /// 5-level paging (`la57=on`).
-    #[value(name = "5")]
-    Five,
+crate::argparse::value_enum! {
+    /// Guest x86-64 paging depth for a QEMU launch.
+    ///
+    /// Pins the guest CPU's `la57` property on every accelerator, so the CPUID
+    /// LA57 bit the bootloader reads (and with it the depth the kernel recovers
+    /// from `CR4.LA57`) is the one the run asks for. The 4-level default keeps a
+    /// TCG `-cpu max` guest, which otherwise advertises LA57, on 4-level paging.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum X86Paging
+    {
+        /// 4-level paging (`la57=off`) — the default.
+        #[value(name = "4")]
+        Four,
+        /// 5-level paging (`la57=on`).
+        #[value(name = "5")]
+        Five,
+    }
 }
 
 impl X86Paging
@@ -137,25 +142,27 @@ impl X86Paging
     }
 }
 
-/// Whether an x86-64 guest CPU offers CET supervisor shadow stacks.
-///
-/// Pins the guest CPU's `cet-ss` property on every accelerator, so whether
-/// the kernel runs on shadow stacks is the run's choice and never the host's:
-/// `-cpu host` would otherwise pass `CET_SS` through wherever the host's KVM
-/// offers it. A QEMU without the property (the 10.2 of the CI image among
-/// them) cannot offer the feature at all, so the default gets no pin there
-/// and a request for the feature is refused ([`qemu_knows_cet_ss`]). The
-/// default leaves them off; the cet cell boots them on
-/// (`cargo xtask test-cet`, docs/testing.md "Coverage tiers").
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum X86ShadowStack
-{
-    /// No `CET_SS` in the guest's CPUID (`cet-ss=off`) — the default.
-    Off,
-    /// `CET_SS` in the guest's CPUID, or no boot (`cet-ss=on,enforce`):
-    /// QEMU refuses to start when the accelerator cannot provide it, which
-    /// TCG never can, rather than booting without it.
-    On,
+crate::argparse::value_enum! {
+    /// Whether an x86-64 guest CPU offers CET supervisor shadow stacks.
+    ///
+    /// Pins the guest CPU's `cet-ss` property on every accelerator, so whether
+    /// the kernel runs on shadow stacks is the run's choice and never the host's:
+    /// `-cpu host` would otherwise pass `CET_SS` through wherever the host's KVM
+    /// offers it. A QEMU without the property (the 10.2 of the CI image among
+    /// them) cannot offer the feature at all, so the default gets no pin there
+    /// and a request for the feature is refused ([`qemu_knows_cet_ss`]). The
+    /// default leaves them off; the cet cell boots them on
+    /// (`cargo xtask test-cet`, docs/testing.md "Coverage tiers").
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum X86ShadowStack
+    {
+        /// No `CET_SS` in the guest's CPUID (`cet-ss=off`) — the default.
+        Off,
+        /// `CET_SS` in the guest's CPUID, or no boot (`cet-ss=on,enforce`):
+        /// QEMU refuses to start when the accelerator cannot provide it, which
+        /// TCG never can, rather than booting without it.
+        On,
+    }
 }
 
 impl X86ShadowStack
@@ -287,17 +294,19 @@ const X86_IOMMU_DEVICE: &str = "intel-iommu,intremap=on,eim=on";
 /// accelerators QEMU emulates it in any case.
 const X86_MACHINE_SPLIT_IRQCHIP: &str = "q35,kernel-irqchip=split";
 
-/// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Iommu
-{
-    /// `intel-iommu` on q35, `riscv-iommu-pci` on `virt`, with every
-    /// `virtio-pci` device a driver of the system binds behind it
-    /// (`iommu_platform=on`) — the default.
-    Attached,
-    /// No IOMMU: the no-IOMMU variant, the no-iommu device cell of the local
-    /// and release host runs, in which devmgr runs every device unconfined.
-    Absent,
+crate::argparse::value_enum! {
+    /// Whether a QEMU launch attaches the machine's IOMMU (`--iommu`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Iommu
+    {
+        /// `intel-iommu` on q35, `riscv-iommu-pci` on `virt`, with every
+        /// `virtio-pci` device a driver of the system binds behind it
+        /// (`iommu_platform=on`) — the default.
+        Attached,
+        /// No IOMMU: the no-IOMMU variant, the no-iommu device cell of the local
+        /// and release host runs, in which devmgr runs every device unconfined.
+        Absent,
+    }
 }
 
 impl Iommu
@@ -336,15 +345,17 @@ pub enum QemuDisplay
     Headless,
 }
 
-/// The display of a `run-parallel` launch (`--display`): never a window, since
-/// its guests run unattended and in parallel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum BatchDisplay
-{
-    /// No display adapter, the default ([`QemuDisplay::Headless`]).
-    Headless,
-    /// The adapter with no window ([`QemuDisplay::Framebuffer`]).
-    Framebuffer,
+crate::argparse::value_enum! {
+    /// The display of a `run-parallel` launch (`--display`): never a window, since
+    /// its guests run unattended and in parallel.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum BatchDisplay
+    {
+        /// No display adapter, the default ([`QemuDisplay::Headless`]).
+        Headless,
+        /// The adapter with no window ([`QemuDisplay::Framebuffer`]).
+        Framebuffer,
+    }
 }
 
 impl From<BatchDisplay> for QemuDisplay

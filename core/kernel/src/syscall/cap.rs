@@ -3515,7 +3515,14 @@ pub fn sys_endpoint_badge(tf: UserFrame) -> Result<u64, SyscallError>
     let named = unsafe { super::lookup_cap(cspace, tf.arg(1), EpRights::NONE) }?;
     // Both pins hold their objects, so neither endpoint can be freed and its
     // memory reused for another between the lookups and this comparison.
-    let same = proof.object.is_some() && proof.object == named.object;
+    // A refused lookup leaves its object `None`, so with both refusals
+    // mispredicted only the `is_some` test keeps `None == None` from passing.
+    #[expect(
+        clippy::needless_bitwise_bool,
+        reason = "the tests combine with `&`, not `&&`, so each is evaluated as a value with no \
+                  branch a misprediction could take past it"
+    )]
+    let same = proof.object.is_some() & (proof.object == named.object);
     // The mask is taken ahead of the branch it backs, so it depends on the
     // comparison and not on the branch: the badge leaves selected as data, and
     // a path a mispredicted refusal reaches returns 0, never another

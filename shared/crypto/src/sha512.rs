@@ -167,7 +167,16 @@ fn round(s: &mut [u64; 8], k: u64, w: u64)
     // The words are named rather than rotated in place: rotating the slice ran
     // the hash 36 to 54 times slower in the bootloader's debug-profile build,
     // and 4 to 7 times slower in its release build.
-    *s = [t1.wrapping_add(t2), s[0], s[1], s[2], s[3].wrapping_add(t1), s[4], s[5], s[6]];
+    *s = [
+        t1.wrapping_add(t2),
+        s[0],
+        s[1],
+        s[2],
+        s[3].wrapping_add(t1),
+        s[4],
+        s[5],
+        s[6],
+    ];
 }
 
 /// Compress one 128-byte block into the chaining state `h` (FIPS 180-4 §6.4).

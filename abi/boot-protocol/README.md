@@ -55,6 +55,9 @@ A compliant bootloader MUST, before jumping to the kernel entry point:
   establishing initial page table entries; never map any region as both
   writable and executable (W^X; see
   [docs/memory-model.md](../../docs/memory-model.md) § W^X Enforcement).
+- Expose, as the last entry of `BootInfo.modules`, the trust store named `TRUST_STORE_MODULE`
+  (`trust-store`), which procmgr requires before it creates any process
+  ([docs/signing.md](../../docs/signing.md) § Trust Store).
 - Obtain the final UEFI memory map after all allocations are complete.
 - Call `ExitBootServices` successfully before jumping to the kernel.
 - Populate every field of `BootInfo` per the per-field semantics in

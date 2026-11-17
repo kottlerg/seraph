@@ -13,8 +13,9 @@ Partition: kernel ELF, init ELF, and boot modules.
 - **Init ELF** — fully validated and ELF-parsed; segments allocated at any available
   physical address. Result is an `InitImage` passed to the kernel in `BootInfo.init_image`.
 - **Boot modules** — opaque flat binaries loaded verbatim into physical memory and
-  passed to the kernel via `BootInfo.modules`. The bootloader does not inspect or
-  interpret their content; what they are is init's concern.
+  passed to the kernel via `BootInfo.modules`. The bootloader verifies each one's signature
+  ([boot-flow.md](boot-flow.md) § Step 4) and does not otherwise inspect or interpret its
+  content; what they are is init's concern.
 
 All loading occurs before `ExitBootServices`. W^X is enforced for the kernel and
 init ELFs before handoff: any `PT_LOAD` segment with both write and execute permissions
@@ -80,10 +81,10 @@ are placed inside the image's read-only region by the kernel linker scripts, so 
 the single-linear-offset invariant above and Phase 3 maps them read-only
 ([initialization.md](../../kernel/docs/initialization.md#phase-3-kernel-page-tables)).
 
-The shared-crate format validation applies to both the kernel ELF and the init
-ELF; the placement ruleset above is kernel-only. Boot modules (the
-`BootInfo.modules` slice) are not ELF-validated by the bootloader — they are loaded
-as opaque flat binaries. Their validation and execution is init's responsibility.
+The shared-crate format validation applies to both the kernel ELF and the init ELF; the placement
+ruleset above is kernel-only. Boot modules (the `BootInfo.modules` slice) are not ELF-validated by
+the bootloader — they are loaded as opaque flat binaries once their signatures verify. Their
+validation and execution is init's responsibility.
 
 ---
 
@@ -208,8 +209,8 @@ module, the bootloader's bundle walker:
    ELF source, parsed separately).
 3. For every other entry, record a `BootModule { name, physical_base,
    size }` where `physical_base = bundle_phys + entry.offset` and
-   `size = entry.size` (the file-byte size, not the body's rounded
-   allocation).
+   `size = entry.size` (the file-byte size, trailer included, not
+   the body's rounded allocation).
 ```
 
 Bundle bodies are 4 KiB-aligned per `BODY_ALIGNMENT`, so

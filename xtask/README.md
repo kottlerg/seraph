@@ -105,16 +105,21 @@ when the image has no such section. No other build has the check.
 #### Signing
 
 Every image a build packs is signed, as [docs/signing.md](../docs/signing.md) § Signing specifies:
-each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every command that
-repacks) first signs the kernel and every ELF image under `services/`, `programs/` and `tests/`
-of the sysroot in place, and `compose-bundle` signs each executable entry of the bundle it
-composes: `init` as kind init, each module as a boot module. The bundle's data entries (the
-platform tables and `log-levels`) are packed unsigned. Every signed object is verified under the
-build's trust store, with the kind, name and architecture its loader expects, before it is
-written. Each command derives the store from the signing identity and the deployer's store its
-environment names: until the bootloader embeds the store, nothing ties a pack to the bootloader
-already built, since nothing verifies (docs/signing.md § Signing). Signing a
-pack's images takes about half a second (`src/signing/`).
+each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every command that repacks)
+first signs the kernel and every ELF image under `services/`, `programs/` and `tests/` of the
+sysroot in place, and `compose-bundle` signs each executable entry of the bundle it composes: `init`
+as kind init, each module as a boot module. The bundle's data entries (the platform tables and
+`log-levels`) are signed as boot modules too. Every signed object is verified under the build's
+trust store, with the kind, name and architecture its loader expects, before it is written. Each
+command derives the store from the signing identity and the deployer's store its environment names.
+`cargo xtask build` passes the store's path to the bootloader's build in `SERAPH_BOOT_TRUST_STORE`
+(set by xtask, not by a user), and the bootloader embeds it. Every pack after that (the build's own,
+`compose-bundle`, `mkdisk` including `--repack-only`, and the harness commands that repack) reads
+the store out of both installed bootloader images (`esp/EFI/seraph/boot.efi` and
+`esp/EFI/BOOT/BOOTX64.EFI` or `BOOTRISCV64.EFI`) and refuses to sign when an image is missing, holds
+no marker or two, or embeds another store; the error names the image and tells to run
+`cargo xtask build` (docs/signing.md § Signing). Signing a pack's images takes about half a second
+(`src/signing/`).
 
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
@@ -130,7 +135,7 @@ The directory holds:
 
 The build writes the trust store it signs under to `target/xtask/signing/trust-store`, before
 it builds the bootloader, and rewrites the file only when the store changes. It is the store the
-bootloader is to embed; nothing reads it yet.
+bootloader embeds.
 
 | Variable | Default | Description |
 |---|---|---|

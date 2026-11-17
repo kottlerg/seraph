@@ -6,9 +6,11 @@ verification policy of its § Verification.
 
 `no_std`, no allocation; its one dependency is [`shared/crypto`](../crypto/README.md) (SHA-512
 and `ed25519_verify`). xtask links it, to sign and to verify each signed object before
-writing it; the bootloader and procmgr take it up in the later steps of
-[#124](https://github.com/kottlerg/seraph/issues/124). No stability obligation; internal code
-reuse only.
+writing it; the bootloader links it to verify the kernel and every bundle entry, procmgr to parse
+the trust store it receives, and init-log-levels and devmgr-firmware to take the body of a data
+module through `split`. procmgr's verification of the images it creates is design intent, not yet
+implemented ([#124](https://github.com/kottlerg/seraph/issues/124)). No stability obligation;
+internal code reuse only.
 
 ---
 
@@ -21,6 +23,7 @@ reuse only.
 | `TrustStore::parse` | Parses and checks a whole trust store; `anchor` finds an anchor by key id and `is_revoked` a revoked key id, each by binary search |
 | `Attributes`, `Certificate` | Decode and encode the signed attributes and the certificate |
 | `encode_trailer`, `TrustStore::encode` | Write a trailer and a store into a caller's buffer, for the host signer |
+| `embed::{MARKER, Embedded, find}` | The layout that embeds a trust store in a bootloader image, `MARKER` (16 bytes) `\|\| len` (`u32` LE) `\|\| store`, and `find`, which locates the one `Embedded` store in an image's bytes |
 | `key_id` | The key id of an Ed25519 public key: the first 16 bytes of its SHA-512 |
 
 A `Refusal` is a parse error, `Untrusted` when no record names an anchor of the store (by
@@ -56,6 +59,7 @@ shared/objsig/
     ├── lib.rs                  # Kinds, architectures, usage masks, key ids, errors
     ├── attrs.rs                # Signed attributes
     ├── cert.rs                 # Certificate
+    ├── embed.rs                # Trust store embedded in a bootloader image: marker, find
     ├── store.rs                # Trust store
     ├── trailer.rs              # Signed object: split, records, trailer encoder
     ├── verify.rs               # Verifier and its policy

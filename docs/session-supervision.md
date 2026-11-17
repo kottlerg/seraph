@@ -37,7 +37,7 @@ part under the Issue that builds it:
 
 | Part | Issue |
 |---|---|
-| procmgr's parent link, re-parenting, containment, subtree destroy, child list and destroy, end post (§ procmgr Mechanism) | #1233 |
+| procmgr's parent link, re-parenting, containment, subtree destroy, child list and destroy, end post, end queue (§ procmgr Mechanism) | #1233 |
 | svcmgr's `stop_source` key and stop-source list, the shared stop labels, oomd's program class (§ Stop Sources) | #1233; oomd itself #1098 |
 | sessiond in operator mode, session nodes, the terminal opening its session through sessiond (§ sessiond, § Attribution) | #1233 |
 | Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #1235 |
@@ -116,12 +116,15 @@ out of every interface.
   The interface learns of the end from the leader's death relay, which the leader's end reaches
   once (§ procmgr Mechanism), and opens a new session if it wants one. The terminal does, as it
   starts its shell again today.
-- **Interface death.** An interface binds death observers on its own main thread and address space
-  to an event queue and hands sessiond only that queue's receive right, the pattern by which pwrmgr
-  is to observe svcmgr ([Supervision § Observing svcmgr](supervision.md#observing-svcmgr)).
-  sessiond stops that interface's sessions when an entry arrives, so no session outlives its
-  interface, and an interface can be a supervised, restartable service: the terminal's recipe
-  becomes `restart = on_failure`.
+- **Interface death.** An interface registers an end queue on itself with procmgr (§ procmgr
+  Mechanism) and hands sessiond only that queue's receive right. procmgr posts the interface's end
+  to it whatever ends it: an exit, a fault, or a destroy, svcmgr's stop of an opted-in service
+  included, which a death observer bound on the interface's own threads would not see, since a
+  teardown posts no death event
+  ([Process Lifecycle § Exit reason](process-lifecycle.md#exit-reason)). sessiond stops that
+  interface's sessions when the entry arrives, so no session outlives its interface, and an
+  interface can be a supervised, restartable service: the terminal's recipe becomes
+  `restart = on_failure`.
 - **sessiond's death.** procmgr destroys every session with it. Each interface receives its
   leader's end through the relay and opens a new session once svcmgr has restarted sessiond. Every
   session is lost; that is the cost of keeping no process past the supervisor that can stop it.
@@ -176,7 +179,12 @@ What procmgr records and guarantees. The labels and their wire format are
   learns of a destroy it did not make (the shell, waiting on a job sessiond stopped), and an
   interface whose queue is a leader's relay learns that its session ended. procmgr deletes its
   copy of the relay once it has posted, and when the child is re-parented.
-
+- **End queue.** A process may register one end queue on itself, through the procmgr SEND it
+  holds, which names it. procmgr posts the process's end to it once, as to a death relay: the
+  fault class, the exit reason at the reap, or `EXIT_KILLED` after a destroy. procmgr learns of
+  every end, since it reaps each process through its own observer and makes each destroy, so the
+  holder of the queue's receive right learns of the end whoever caused it. Telling another holder
+  of one's own end confers no authority over anything.
 ---
 
 ## Attribution

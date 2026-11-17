@@ -403,7 +403,12 @@ fn call_fixture(cap: u64, label: u64) -> Result<ipc::IpcMessage, i64>
     unsafe { ipc::ipc_call(cap, &ipc::IpcMessage::new(label), ipc_buf) }
 }
 
-/// Send `BIND_DRIVERS` on `devmgr.bind` with a cap on `/tests/drivers/`;
+/// The absolute path of the directory the on-demand bind walks and names to
+/// devmgr.
+const TEST_DRIVERS_PATH: &str = "/tests/drivers";
+
+/// Send `BIND_DRIVERS` on `devmgr.bind` with a cap on `/tests/drivers/` and
+/// its path;
 /// asserts devmgr accepts it.
 fn bind_test_drivers(devmgr_bind: u64)
 {
@@ -414,12 +419,23 @@ fn bind_test_drivers(devmgr_bind: u64)
     );
     let root = std::os::seraph::root_dir_cap();
     assert!(root != 0, "devmgr_on_demand_bind: no root directory cap");
-    let dir = std::os::seraph::namespace_lookup_dir(root, "/tests/drivers", rights)
-        .unwrap_or_else(|e| panic!("devmgr_on_demand_bind: walk /tests/drivers failed: {e}"));
-    let msg = ipc::IpcMessage::builder(ipc::devmgr_labels::BIND_DRIVERS)
+    let dir = std::os::seraph::namespace_lookup_dir(root, TEST_DRIVERS_PATH, rights)
+        .unwrap_or_else(|e| panic!("devmgr_on_demand_bind: walk {TEST_DRIVERS_PATH} failed: {e}"));
+    let builder = ipc::IpcMessage::builder(ipc::devmgr_labels::BIND_DRIVERS)
         .word(0, u64::from(ipc::DEVMGR_LABELS_VERSION))
-        .cap(dir)
-        .build();
+        .cap(dir);
+    let Some(builder) = ipc::with_name_block(
+        builder,
+        ipc::devmgr_labels::DRIVERS_DIR_PATH_WORD,
+        TEST_DRIVERS_PATH.as_bytes(),
+        ipc::devmgr_labels::DRIVERS_DIR_PATH_MAX,
+    )
+    else
+    {
+        let _ = syscall::cap_delete(dir);
+        panic!("devmgr_on_demand_bind: path not sendable");
+    };
+    let msg = builder.build();
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
     let Ok(reply) = (unsafe { ipc::ipc_call(devmgr_bind, &msg, ipc_buf) })

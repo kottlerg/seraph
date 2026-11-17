@@ -8,11 +8,14 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
-# `ipc::MAX_PATH_LEN` bounds the `binary` and `subtree:<path>` values, and
+# `ipc::MAX_PATH_LEN` bounds the `subtree:<path>` value, and
 # `ipc::svcmgr_labels::NAME_MAX` the service and `provides` names;
 # `ipc::svcmgr_labels::HANDOVER_AUTHORITY` is the bit `handover_permitted` tests.
 ipc = { path = "../../../shared/ipc" }
 namespace-protocol = { path = "../../../shared/namespace-protocol" }
+# `objsig::name_is_canonical` and `ipc::procmgr_labels::CREATE_NAME_MAX` bound
+# the `binary` value: svcmgr names the binary to procmgr by it.
+objsig = { path = "../../../shared/objsig" }
 # `process_abi::ARGV_ENV_MAX_BYTES` bounds a recipe's argv and env together.
 process-abi = { path = "../../../abi/process-abi" }
 # The line grammar (`key = value`, `#` comments) both parsers read through,

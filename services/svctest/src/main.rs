@@ -45,13 +45,13 @@ mod runner;
 
 /// svctest's main-thread stack, declared in its `.note.seraph.stack` note
 /// rather than left to the loader's default, so the stack-note phase
-/// (`phases::layout`) finds a note to patch in a copy of this image.
+/// (`phases::layout`) finds a note to parse in this image.
 pub(crate) const SVCTEST_STACK_PAGES: u32 = process_abi::DEFAULT_PROCESS_STACK_PAGES;
 
 // Declared through std's macro, not `process_abi::stack_pages!`, so every
 // build compiles the std surface a std-built binary declares its stack with,
-// and the layout phase's `stack_note_refused` has the loader parse the note
-// std's `StackNote` emits: std's copy of the ABI layout is tested there.
+// and the layout phase's `stack_note_parsed` has the loader's parser read the
+// note std's `StackNote` emits: std's copy of the ABI layout is tested there.
 std::os::seraph::stack_pages!(SVCTEST_STACK_PAGES);
 
 fn main()

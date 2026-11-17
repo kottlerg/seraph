@@ -243,11 +243,18 @@ impl Signer
     /// # Errors
     ///
     /// When `object` ends in a malformed trailer or its body in the trailer
-    /// magic; when `name` is empty or too long for the attributes; when the
-    /// signature cannot be made; when the signed object does not verify
+    /// magic; when `name` is not in the canonical form of docs/signing.md
+    /// § Signed Attributes (`objsig::name_is_canonical`), which a loader
+    /// checks the name it is given against; when the signature cannot be made; when the signed object does not verify
     /// (a faulty external signer, or a store that does not trust the key).
     pub fn sign(&self, object: &[u8], kind: Kind, name: &str) -> Result<Vec<u8>>
     {
+        if !objsig::name_is_canonical(name.as_bytes())
+        {
+            bail!(
+                "signing {name}: the name is not in the canonical form of docs/signing.md § Signed Attributes"
+            );
+        }
         let body = body_of(object)?;
         let refused = |e| err!("signing {name}: {e:?}");
         let attrs = Attributes {
@@ -663,6 +670,30 @@ mod tests
         let renamed = signer.sign(&once, Kind::BootModule, "x").unwrap();
         assert_eq!(objsig::split(&renamed).unwrap().body(), b"\x7fELF image");
         assert!(verifies(&signer, &renamed, Kind::BootModule, "x"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an object signed under a name no loader can be given,
+    // since a loader refuses a non-canonical name before it verifies, or a
+    // name that names its file one of several ways.
+    #[test]
+    fn a_name_not_in_the_canonical_form_is_refused()
+    {
+        let root = scratch("names");
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        for name in [
+            "",
+            "/services//x",
+            "/services/x/",
+            "services/x",
+            "/services/./x",
+            "x\0",
+        ]
+        {
+            signer
+                .sign(b"\x7fELF image", Kind::Service, name)
+                .expect_err(name);
+        }
         let _ = fs::remove_dir_all(&root);
     }
 

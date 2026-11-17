@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 use crate::bootstrap::Caps;
 use crate::runner::Phase;
 
+use super::procmgr::{HELLO_PATH, create_call, expect_create, with_head};
+
 pub fn phases() -> &'static [Phase]
 {
     &[Phase {
@@ -185,26 +187,27 @@ fn expect_reply(target: u64, msg: &ipc::IpcMessage, want: u64, what: &str)
 /// `CREATE_PROCESS`'s module.
 fn create_reserve_refused()
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
 
     let procmgr = startup_info().procmgr_endpoint;
     let (file, size) = file_at(b"programs", b"hello");
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_RESERVE)
-            .word(0, size)
-            .cap(file)
-            .build(),
+        procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_RESERVE,
+        &[size],
+        HELLO_PATH,
+        &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE with CREATE_RESERVE from a creator outside the reserve",
     );
     let spare = syscall::cap_derive(procmgr, syscall::RIGHTS_EP_SEND)
         .expect("deriving a spare cap to attach failed");
-    expect_reply(
+    expect_create(
         procmgr,
-        &IpcMessage::builder(procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_RESERVE)
-            .cap(spare)
-            .build(),
+        procmgr_labels::CREATE_PROCESS | procmgr_labels::CREATE_RESERVE,
+        &[size],
+        HELLO_PATH,
+        &[spare],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_PROCESS with CREATE_RESERVE from a creator outside the reserve",
     );
@@ -255,16 +258,15 @@ fn memory_max_word_refused()
 /// pages with `LIMIT`.
 fn max_below_image_refused()
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
 
     let (file, size) = file_at(b"programs", b"hello");
-    expect_reply(
+    expect_create(
         startup_info().procmgr_endpoint,
-        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX)
-            .word(0, size)
-            .word(1, 1)
-            .cap(file)
-            .build(),
+        procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX,
+        &[size, 1],
+        HELLO_PATH,
+        &[file],
         procmgr_errors::OUT_OF_MEMORY,
         "CREATE_FROM_FILE with a one-page max",
     );
@@ -275,17 +277,17 @@ fn max_below_image_refused()
 /// create on its handle.
 fn run_budget_child()
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
 
     let (handle, thread) = create_with_max(BUDGET_CHILD_ROLE, CHILD_MAX_PAGES, "the budget child");
     let reason = run_to_exit(handle, "the budget child");
     let (file, size) = file_at(b"programs", b"hello");
-    expect_reply(
+    expect_create(
         handle,
-        &IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-            .word(0, size)
-            .cap(file)
-            .build(),
+        procmgr_labels::CREATE_FROM_FILE,
+        &[size],
+        HELLO_PATH,
+        &[file],
         procmgr_errors::INVALID_ARGUMENT,
         "CREATE_FROM_FILE on a destroyed child's process handle",
     );
@@ -389,7 +391,7 @@ pub(crate) fn create_role(
     what: &str,
 ) -> ipc::IpcMessage
 {
-    use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
+    use ipc::{procmgr_errors, procmgr_labels};
     use std::os::seraph::process::ArgvEnvCap;
 
     let args = format!("/tests/svctest\0{role}\0");
@@ -413,31 +415,26 @@ pub(crate) fn create_role(
     {
         0
     };
-    let create = IpcMessage::builder(
-        procmgr_labels::CREATE_FROM_FILE
-            | procmgr_labels::CREATE_ARGV_ENV
-            | max_flag
-            | charge_flag
-            | flags,
-    )
-    .word(0, size)
-    .words(1, &argv_env.header_words())
-    .words(1 + procmgr_labels::ARGV_ENV_HEADER_WORDS, max.as_slice());
+    let label = procmgr_labels::CREATE_FROM_FILE
+        | procmgr_labels::CREATE_ARGV_ENV
+        | max_flag
+        | charge_flag
+        | flags;
+    let mut words = with_head(size, &argv_env.header_words());
+    words.extend(max);
     // The tail caps in the order procmgr reads them: the file, the charge
     // node's handle, the argv/env cap.
-    let create = [Some(file), charge, Some(argv_env.cap())]
+    let caps: Vec<u64> = [Some(file), charge, Some(argv_env.cap())]
         .into_iter()
         .flatten()
-        .fold(create, ipc::IpcMessageBuilder::cap)
-        .build();
-    // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe {
-        ipc::ipc_call(
-            startup_info().procmgr_endpoint,
-            &create,
-            std::os::seraph::current_ipc_buf(),
-        )
-    };
+        .collect();
+    let reply = create_call(
+        startup_info().procmgr_endpoint,
+        label,
+        &words,
+        "/tests/svctest",
+        &caps,
+    );
     argv_env.settle(reply.as_ref().map_or(0, |r| r.label));
     let reply = reply.unwrap_or_else(|e| panic!("CREATE_FROM_FILE of {what} failed ({e})"));
     assert_eq!(
@@ -599,15 +596,14 @@ fn grandchild_clamped()
     {
         exit(CHILD_USAGE_QUERY_FAILED)
     };
-    let create =
-        IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX)
-            .word(0, size)
-            .word(1, CHILD_MAX_PAGES * 4)
-            .cap(file)
-            .build();
-    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(startup_info().procmgr_endpoint, &create, ipc_buf) }
-        .unwrap_or_else(|_| exit(CHILD_GRANDCHILD_REFUSED));
+    let reply = create_call(
+        startup_info().procmgr_endpoint,
+        procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_MEMORY_MAX,
+        &[size, CHILD_MAX_PAGES * 4],
+        HELLO_PATH,
+        &[file],
+    )
+    .unwrap_or_else(|_| exit(CHILD_GRANDCHILD_REFUSED));
     let (procmgr_errors::SUCCESS, &[handle, thread]) = (reply.label, reply.caps())
     else
     {

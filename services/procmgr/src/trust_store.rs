@@ -12,14 +12,16 @@ use syscall_abi::PAGE_SIZE;
 
 /// Copy the store `len` bytes long that the Memory cap `cap` holds into
 /// procmgr's own memory, delete the cap, and parse the copy once. Returns the
-/// copy when it parses; `None`, logged, when it cannot be read or does not
-/// parse, which stops procmgr: it creates no process without a store.
-pub fn receive(self_aspace: u64, cap: u64, len: u64) -> Option<Vec<u8>>
+/// parsed store, over the copy, which is leaked: procmgr verifies every create
+/// against it for its whole life, which never ends. `None`, logged, when it
+/// cannot be read or does not parse, which stops procmgr: it creates no
+/// process without a store.
+pub fn receive(self_aspace: u64, cap: u64, len: u64) -> Option<objsig::TrustStore<'static>>
 {
     let copy = copy_out(self_aspace, cap, len);
     let _ = syscall::cap_delete(cap);
-    let copy = copy?;
-    match objsig::TrustStore::parse(&copy)
+    let copy: &'static [u8] = copy?.leak();
+    match objsig::TrustStore::parse(copy)
     {
         Ok(store) =>
         {
@@ -28,7 +30,7 @@ pub fn receive(self_aspace: u64, cap: u64, len: u64) -> Option<Vec<u8>>
                 store.anchors().count(),
                 store.security_floor()
             );
-            Some(copy)
+            Some(store)
         }
         Err(e) =>
         {

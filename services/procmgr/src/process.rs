@@ -559,6 +559,11 @@ pub struct CreateResult
     /// The max in pages the child's memmgr budget node took after memmgr's
     /// clamp, `u64::MAX` for none: the create reply's `data[0]`.
     pub memory_max: u64,
+    /// Slot in procmgr's `CSpace` of the child's node handle, the create
+    /// reply's last cap (`procmgr_labels::CREATE_NODE_HANDLE`); `0` when not
+    /// asked for. The reply moves it to the creator; every path that does not
+    /// reply it deletes it.
+    pub node_handle: u64,
 }
 
 /// Resolved placement for a child, produced by `crate::resolve_create_sched`
@@ -594,6 +599,10 @@ pub struct MemmgrRegistration
     /// The max in pages the child's node took after memmgr's clamp
     /// (`data[1]` of the reply), `u64::MAX` for none.
     pub max: u64,
+    /// Slot in procmgr's `CSpace` of the node handle to the child's budget
+    /// node (`caps[1]` of the reply, with `REGISTER_NODE_HANDLE`); `0` for
+    /// none.
+    pub node_handle: u64,
 }
 
 impl MemmgrRegistration
@@ -603,6 +612,7 @@ impl MemmgrRegistration
         cap: 0,
         badge: 0,
         max: u64::MAX,
+        node_handle: 0,
     };
 }
 
@@ -2158,10 +2168,13 @@ fn finalize_creation(
 {
     let badge = process_badge;
     let pi_memory_cap = info_caps.pi_memory.cap();
+    // The node handle stays with the caller's `MemmgrSendGuard`, which hands
+    // it to the result once the creation is complete.
     let MemmgrRegistration {
         cap: memmgr_send_cap,
         badge: memmgr_badge,
         max: memory_max,
+        ..
     } = memmgr;
 
     // Bind a death observer from procmgr's death queues on the child's main
@@ -2299,6 +2312,7 @@ fn finalize_creation(
         thread_for_caller,
         badge,
         memory_max,
+        node_handle: 0,
     })
 }
 
@@ -3085,6 +3099,7 @@ fn create_process_from_bytes(
             cap: child_memmgr_send,
             badge: universals.memmgr_badge,
             max: universals.memmgr_max,
+            node_handle: 0,
         },
         process_badge,
         universals.paging,
@@ -3343,6 +3358,7 @@ pub(crate) struct MemmgrSendGuard
     cap: u64,
     badge: u64,
     max: u64,
+    node_handle: u64,
     memmgr_ep: u64,
     ipc_buf: *mut u64,
 }
@@ -3358,6 +3374,7 @@ impl MemmgrSendGuard
             cap: registration.cap,
             badge: registration.badge,
             max: registration.max,
+            node_handle: registration.node_handle,
             memmgr_ep,
             ipc_buf,
         }
@@ -3386,9 +3403,42 @@ impl MemmgrSendGuard
             cap: self.cap,
             badge: self.badge,
             max: self.max,
+            node_handle: self.node_handle,
         }
     }
 
+    /// Take the node handle out of the guard, for the create reply: the
+    /// guard no longer deletes it. `0` when there is none.
+    pub(crate) fn take_node_handle(&mut self) -> u64
+    {
+        core::mem::take(&mut self.node_handle)
+    }
+
+    /// Delete the node handle, if the guard still holds one.
+    fn delete_node_handle(&mut self)
+    {
+        let cap = self.take_node_handle();
+        if cap != 0
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+    }
+
+    /// Settle the guard on a create's outcome: on success the node handle
+    /// goes to the result and the SEND slot and the badge to the child's
+    /// table entry; on failure the guard drops, retiring the registration.
+    pub(crate) fn settle(mut self, result: &mut Result<CreateResult, u64>)
+    {
+        if let Ok(created) = result
+        {
+            created.node_handle = self.take_node_handle();
+            let _ = self.disarm();
+        }
+    }
+
+    /// Give up the SEND slot and the badge to the caller, who now owns
+    /// them. A node handle still in the guard is deleted: take it first with
+    /// [`MemmgrSendGuard::take_node_handle`] to keep it.
     pub(crate) fn disarm(mut self) -> (u64, u64)
     {
         let p = (self.cap, self.badge);
@@ -3407,6 +3457,7 @@ impl Drop for MemmgrSendGuard
         {
             let _ = syscall::cap_delete(self.cap);
         }
+        self.delete_node_handle();
     }
 }
 
@@ -3819,7 +3870,7 @@ pub fn create_process_from_file(
     // subsequent allocations route through this cap so memmgr accounts
     // them to the child's record from the moment they leave the pool.
     let registration = crate::register_with_memmgr(ctx.memmgr_ep, &sched.budget, ipc_buf);
-    let mms = MemmgrSendGuard::new(registration, ctx.memmgr_ep, ipc_buf);
+    let mut mms = MemmgrSendGuard::new(registration, ctx.memmgr_ep, ipc_buf);
     if mms.cap() == 0
     {
         return Err(procmgr_errors::OUT_OF_MEMORY);
@@ -4225,7 +4276,7 @@ pub fn create_process_from_file(
         memory_cap: main_tls_memory_guard.cap(),
         base_va: main_tls.base_va,
     };
-    let result = finalize_creation(
+    let mut result = finalize_creation(
         child_objs.aspace(),
         child_objs.cspace(),
         child_objs.thread(),
@@ -4246,8 +4297,9 @@ pub fn create_process_from_file(
         &layout,
         self_aspace,
     );
-    if result.is_ok()
+    if let Ok(created) = &mut result
     {
+        created.node_handle = mms.take_node_handle();
         let _ = child_objs.disarm();
         let _ = mms.disarm();
         info_caps.disarm();

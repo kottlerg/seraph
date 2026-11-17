@@ -766,12 +766,11 @@ length words.
 
 **Reply (success)**: `label = 0`, empty body.
 
-Cross-directory rename is deferred: servers cannot introspect the
-badge packed in a received cap, so a second-directory cap cannot
-resolve to a `NodeId`. Supporting it needs either a kernel-level
-`cap_info` selector that reports a cap's badge or a wire shape that
-conveys the destination directory's `NodeId` out-of-band (design
-intent; not yet implemented). Tracked as
+Cross-directory rename is deferred: the request carries one directory
+cap, so a destination in another directory cannot be named. A server
+can resolve a second directory cap on its own endpoint to a `NodeId`
+by reading its badge with `SYS_ENDPOINT_BADGE`, which needs Receive on
+that endpoint; no driver does so yet. Tracked as
 [Issue #89](https://github.com/kottlerg/seraph/issues/89).
 
 `FS_RENAME` is not atomic — see

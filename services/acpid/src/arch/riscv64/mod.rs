@@ -39,18 +39,30 @@ impl Power
     }
 
     /// False: no `PM1a_CNT`.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
+    )]
     pub const fn can_sleep(&self) -> bool
     {
         false
     }
 
     /// False, with no write: no `PM1a_CNT`.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
+    )]
     pub const fn sleep(&self, _state: u8, _slp_typ: u16) -> bool
     {
         false
     }
 
     /// False, with no write: no `RESET_REG`.
+    #[expect(
+        clippy::unused_self,
+        reason = "mirrors the x86-64 `Power`, whose methods read its blocks"
+    )]
     pub const fn reset(&self) -> bool
     {
         false

@@ -1334,7 +1334,8 @@ sched_max = 12\n";
             "/services/../services/timed",
         ]
         {
-            let recipe = format!("binary = {path}\nrestart = never\ncritical = no\nnamespace = none\n");
+            let recipe =
+                format!("binary = {path}\nrestart = never\ncritical = no\nnamespace = none\n");
             assert!(
                 matches!(
                     parse("x", &recipe),

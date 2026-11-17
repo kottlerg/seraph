@@ -6834,7 +6834,7 @@ pub enum Requeue
 /// one), that CPU may already have dequeued it or marked it `Running`; the
 /// requeue leaves such a claimed thread to that CPU, since requeueing it would
 /// have two CPUs run it on one kernel stack
-/// (core/kernel/docs/scheduling-internals.md § ThreadState Transitions).
+/// (core/kernel/docs/scheduling-internals.md § `ThreadState` Transitions).
 ///
 /// After updating architecture-specific kernel-stack pointers the scheduler
 /// lock is released, then `arch::current::context::switch` performs the actual

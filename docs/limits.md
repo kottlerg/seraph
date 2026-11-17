@@ -537,6 +537,8 @@ Tracked by [#645](https://github.com/kottlerg/seraph/issues/645) (log).
 | `ANSI_RGB` | `shared/ansi/src/lib.rs` | 16 colours | feature scope (16-colour SGR baseline; bounds no capacity) | 48 B rodata | correct as is | 256-colour and RGB SGR are feature work, not a limit |
 | `AnsiParser.acc` | `shared/ansi/src/lib.rs` | `u16`, saturating | provably unreachable (SGR codes below 256) | 2 B | correct as is | None |
 | `PACKET_SIZE` | `shared/gdb-rsp/src/lib.rs` | 4096 B of packet body | tuning (holds a `G` packet of either architecture's register block, 1073 B, with room for memory transfers; GDB sends no longer body once it is advertised) | 4 KiB per reader buffer | correct as is | None |
+| `trailer::MAX_RECORDS` | `shared/objsig/src/trailer.rs` | 8 records per signed object | tuning (bounds a verifier's work per object: each record that names a trusted root costs up to two signature verifications; an object carries one record per party that signs it, one or two in the design) | none | correct as is | None |
+| Trust-store and signed-attribute counts (`anchor_count`, `revoked_count`, `name_len`, `attrs_len`) | `shared/objsig/src/store.rs`, `shared/objsig/src/attrs.rs` | `u16` each: 65535 anchors, 65535 revoked key ids, a name of up to 65439 bytes | ABI width (the format fields of [signing.md](signing.md)) | none | correct as is | None; the codec holds no array sized from a count |
 
 ### memmgr
 

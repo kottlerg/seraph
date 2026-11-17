@@ -1871,16 +1871,18 @@ fn reply_create_result(
 ///   bit  31       = `CREATE_MEMORY_MAX` (a memory max follows in a data word)
 ///   bit  32       = `CREATE_RESERVE` (a system-reserve child)
 ///   bit  33       = `CREATE_NODE_HANDLE` (reply the child's node handle)
-///   bits [34..64] = reserved (must be zero)
+///   bit  34       = `CREATE_CHARGE_NODE` (charge the child to a node handle)
+///   bits [35..64] = reserved (must be zero)
 ///
 /// IPC data words: words `0..4` = the `ArgvEnvHeader` (`args_bytes`,
 /// `args_count`, `env_bytes`, `env_count`), only with `CREATE_ARGV_ENV`;
 /// then the memory max in pages, only with `CREATE_MEMORY_MAX`.
 ///
-/// Expects `caps = [module_memory, creator_endpoint?, argv_env?, relay?]`,
-/// `argv_env` only with `CREATE_ARGV_ENV` and `relay` only with
-/// `CREATE_DEATH_RELAY`; caps between the creator endpoint and them are
-/// deleted. The relay is consumed by `finalize_creation` on success and
+/// Expects `caps = [module_memory, creator_endpoint?, charge?, argv_env?,
+/// relay?]`, `charge` only with `CREATE_CHARGE_NODE`, `argv_env` only with
+/// `CREATE_ARGV_ENV` and `relay` only with `CREATE_DEATH_RELAY`; caps between
+/// the creator endpoint and them are deleted. `charge` goes to memmgr with
+/// the registration, or is deleted on a path before it. The relay is consumed by `finalize_creation` on success and
 /// deleted here on every other outcome. Stdio pipe wiring is installed via separate `CONFIGURE_PIPE`
 /// IPCs (one per piped direction) on the returned badged `process_handle`
 /// between create and `START_PROCESS`; the create path itself stays
@@ -2113,16 +2115,18 @@ pub struct ProcmgrCtx
 /// cap: the file cap is opened (`FS_OPEN`) and deleted, and procmgr's open
 /// `FS_CLOSE`d and deleted after the load, the creator
 /// endpoint is deleted once the child holds its own copy, the relay is
-/// consumed by `finalize_creation` on success, and every other cap, and every
-/// cap of a rejected request, is deleted here.
+/// consumed by `finalize_creation` on success, the charge node's handle goes
+/// to memmgr with the registration, and every other cap, and every cap of a
+/// rejected request, is deleted here.
 fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
 {
     let label = req.label;
     let all_caps = req.caps();
 
     // The death-relay POST cap, when present, is the LAST cap in the message
-    // (see `CREATE_DEATH_RELAY`), and the argv/env cap the one before it,
-    // both peeled off the tail so the `creator_endpoint` slot stays
+    // (see `CREATE_DEATH_RELAY`), the argv/env cap the one before it, and the
+    // charge node's handle the one before those, all peeled off the tail so
+    // the `creator_endpoint` slot stays
     // positionally fixed at caps[1]. A request that flags a tail cap its caps
     // cannot supply apart from the file cap is malformed: taking that cap as
     // a tail cap too would release one slot twice.

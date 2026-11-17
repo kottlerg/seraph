@@ -102,10 +102,11 @@ pub mod procmgr_labels
     use core::prelude::rust_2024::*;
 
     /// Create a new process from a boot module Memory cap. Caps: `[module,
-    /// creator_endpoint?, argv_env?, death_relay?]`, `argv_env` present iff
-    /// [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data words
-    /// `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as for
-    /// [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
+    /// creator_endpoint?, charge_node?, argv_env?, death_relay?]`,
+    /// `charge_node` present iff [`CREATE_CHARGE_NODE`] is set, `argv_env`
+    /// iff [`CREATE_ARGV_ENV`] is set, with its [`ArgvEnvHeader`] in data
+    /// words `0..4`, and `death_relay` iff [`CREATE_DEATH_RELAY`] is set, as
+    /// for [`CREATE_FROM_FILE`]. With [`CREATE_MEMORY_MAX`] the max follows in
     /// the next data word (word 0, or word 4 after the header). Label layout
     /// and reply as for [`CREATE_FROM_FILE`].
     /// Stdio pipes (stdin/stdout/stderr) are
@@ -147,9 +148,12 @@ pub mod procmgr_labels
     /// Reply: `data[0]` is the max the child's memmgr budget node took after
     /// memmgr's clamp, `u64::MAX` for none.
     ///
-    /// Caps: `[file_cap, creator_endpoint?, argv_env?, death_relay?]`. The
-    /// `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`] is set, and
-    /// sits directly before the relay, or last without one. `file_cap`
+    /// Caps: `[file_cap, creator_endpoint?, charge_node?, argv_env?,
+    /// death_relay?]`. The `charge_node` handle is present iff
+    /// [`CREATE_CHARGE_NODE`] is set, and sits directly before the
+    /// `argv_env` cap, or before the relay without one, or last without
+    /// either. The `argv_env` Memory cap is present iff [`CREATE_ARGV_ENV`]
+    /// is set, and sits directly before the relay, or last without one. `file_cap`
     /// ownership transfers to procmgr: procmgr opens it (`FS_OPEN`) and
     /// `cap_delete`s it, then `FS_CLOSE`s and deletes its open after the load
     /// (success or failure); a request refused before the open deletes

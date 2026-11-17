@@ -279,7 +279,7 @@ vfsd holds two un-badged endpoints:
   waits on a fatfs spawn. The count is a concurrency knob, not a
   correctness bound: no service-endpoint request waits on another's
   IPC, since what a `MOUNT` handler blocks on (the worker pool,
-  procmgr's `CREATE_FROM_FILE`, whose `FS_READ`s go to the fs driver
+  procmgr's `CREATE_FROM_FILE`, whose `FS_READ_MEMORY`s go to the fs driver
   that minted the file cap, the `/services/fs/fatfs` walk the namespace
   dispatcher serves, and the `FS_MOUNT` probe) and what an `UNMOUNT`
   handler blocks on (the driver's `FS_UNMOUNT` and its death, each
@@ -309,11 +309,12 @@ reply contract, including `NO_MOUNT` when the root self-mount failed,
 is specified in [`vfs-ipc-interface.md`](vfs-ipc-interface.md).
 
 vfsd is also the owner of fs-process lifecycle: `MOUNT` spawns the
-fatfs driver via `worker_pool` (or, on the very first mount, from
-the boot module). The first-mount `CREATE_PROCESS` is permanent and
-structural — `/services/fs/fatfs` is unreachable until root mounts, so
-moving spawn responsibility elsewhere is a chicken-and-egg
-inversion.
+fatfs driver via `worker_pool` (or, on the very first mount, from the
+boot module). Each create names its binary for procmgr's verification:
+`fatfs` for the boot module, `/services/fs/fatfs` for the on-disk
+file. The first-mount `CREATE_PROCESS` is permanent and structural —
+`/services/fs/fatfs` is unreachable until root mounts, so moving spawn
+responsibility elsewhere is a chicken-and-egg inversion.
 
 Wire-label numbers for both surfaces live in `ipc::vfsd_labels` and
 `ipc::ns_labels`.

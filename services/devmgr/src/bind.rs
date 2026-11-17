@@ -42,6 +42,8 @@ use firmware::resource::{CarveError, Span, SplitError};
 use firmware::roster::Roster;
 use syscall_abi::PAGE_SIZE;
 
+use ipc::procmgr_labels;
+
 use crate::decls::{self, Binary};
 use crate::spawn::{self, MAX_BOUND_RESOURCES};
 use crate::{
@@ -206,7 +208,7 @@ pub struct Carve<'a>
 /// donated it from.
 pub fn boot_pass(
     records: &mut Records,
-    modules: Vec<(DriverDecl, u64)>,
+    modules: Vec<(DriverDecl, Binary)>,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -215,13 +217,7 @@ pub fn boot_pass(
     let mut table = MatchTable::new();
     for (decl, module) in modules
     {
-        collect(
-            &mut table,
-            records,
-            Some(&decl),
-            Source::BootModule,
-            Binary::Module(module),
-        );
+        collect(&mut table, records, Some(&decl), Source::BootModule, module);
     }
     bind_records(records, &mut table, carve, pass, ipc_buf);
     for binary in table.drain_binaries()
@@ -235,10 +231,15 @@ pub fn boot_pass(
 /// bind the records still unbound to them. A declaration `admits` refuses
 /// (one of a class a class request marked boot-only,
 /// [`firmware::binding::class_admits`]) is not considered, logged. Every file
-/// cap is released once the pass ends.
+/// cap is released once the pass ends. `dir_path` is the absolute path of the
+/// directory `dir_cap` names; each entry is named `dir_path/entry`, its install
+/// path, which procmgr verifies the driver's signature under. An entry whose
+/// name exceeds [`procmgr_labels::CREATE_NAME_MAX`] or cannot be allocated is
+/// logged and skipped, its file cap released.
 pub fn drivers_dir_pass(
     records: &mut Records,
     dir_cap: u64,
+    dir_path: &[u8],
     admits: impl Fn(&DriverDecl) -> bool,
     carve: &mut Carve,
     pass: &mut Pass,
@@ -260,6 +261,14 @@ pub fn drivers_dir_pass(
             return;
         };
         let label = core::str::from_utf8(name).unwrap_or("drivers-directory entry");
+        let install = install_path(dir_path, name);
+        let Some(install) = install
+        else
+        {
+            std::os::seraph::log!(warn: "{}: install path too long or no memory; skipped", label);
+            let _ = syscall::cap_delete(walked.file_cap);
+            return;
+        };
         let mut decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
         if let Some(d) = decl.filter(|d| !admits(d))
         {
@@ -273,6 +282,7 @@ pub fn drivers_dir_pass(
         let binary = Binary::File {
             cap: walked.file_cap,
             size: walked.size,
+            name: install,
         };
         collect(
             &mut table,
@@ -287,6 +297,24 @@ pub fn drivers_dir_pass(
     {
         binary.release();
     }
+}
+
+/// The install path of the drivers-directory entry `entry`: `dir_path`, `/`
+/// and `entry`. `None` when it is longer than
+/// [`procmgr_labels::CREATE_NAME_MAX`] or cannot be allocated.
+fn install_path(dir_path: &[u8], entry: &[u8]) -> Option<Box<[u8]>>
+{
+    let len = dir_path.len().checked_add(1)?.checked_add(entry.len())?;
+    if len > procmgr_labels::CREATE_NAME_MAX
+    {
+        return None;
+    }
+    let mut path = Vec::new();
+    path.try_reserve_exact(len).ok()?;
+    path.extend_from_slice(dir_path);
+    path.push(b'/');
+    path.extend_from_slice(entry);
+    Some(path.into_boxed_slice())
 }
 
 /// Add `decl`, read from `binary`, to `table` when it matches a record no
@@ -306,6 +334,7 @@ fn collect(
         return;
     };
     let name = decl.name;
+    let cap = binary.cap();
     let added = records
         .bound_counts
         .track(&decl)
@@ -316,7 +345,7 @@ fn collect(
             warn: "{}: no memory to consider the driver; not bound",
             name.as_str()
         );
-        binary.release();
+        let _ = syscall::cap_delete(cap);
     }
 }
 

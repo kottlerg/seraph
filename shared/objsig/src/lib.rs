@@ -21,6 +21,7 @@
 //! - [`cert`]: the fixed-layout certificate a root issues to a signing key.
 //! - [`store`]: the trust store: anchors, revoked key ids, security floor.
 //! - [`embed`]: the trust store as the bootloader image embeds it.
+//! - [`name`]: the canonical form of the name an object is signed under.
 //! - [`verify()`]: the verifier and its policy.
 
 #![no_std]
@@ -28,6 +29,7 @@
 pub mod attrs;
 pub mod cert;
 pub mod embed;
+pub mod name;
 pub mod store;
 pub mod trailer;
 pub mod verify;
@@ -39,6 +41,7 @@ mod testutil;
 
 pub use attrs::Attributes;
 pub use cert::{Certificate, CertificateBody};
+pub use name::{NAME_MAX, name_is_canonical};
 pub use store::{Anchor, AnchorSpec, TrustStore};
 pub use trailer::{Record, RecordSpec, Records, Signed, encode_trailer, split, trailer_len};
 pub use verify::{

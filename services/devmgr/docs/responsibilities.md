@@ -386,18 +386,19 @@ devmgr's responsibilities are:
   `BIND_AUTHORITY`, which only svctest's seed-only `devmgr.bind` cap carries
   (the one published name a seed receives as `SEND|GRANT`, since the request
   moves a directory cap to devmgr). devmgr replies `SUCCESS` at once; its
-  control thread then runs a drivers-directory pass over the directory cap
-  under the same declaration bounds as the `SET_DRIVERS_DIR` pass (auxiliary
-  tier, no physical access, no IOMMU family key, no boot-only class) against
-  the device records still unbound, starts the drivers it binds in a settle
-  batch of its own, and serves them once it settles, within `SETTLE_TIMEOUT`.
-  A record is bound at most once a boot, so a second request over the same
-  directory binds nothing; a limited driver's bound devices are counted over
-  the boot by driver name (`BoundCounts`), so each pass binds it only to the
-  devices its limit leaves. A request with no directory cap, before
-  `SET_DRIVERS_DIR`, or while an earlier one is not done gets
-  `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no driver waits
-  until the pass and its settle end.
+  control thread then runs a drivers-directory pass over the directory cap,
+  named by the directory's absolute path the request carries as a name block
+  from data word `DRIVERS_DIR_PATH_WORD`, under the same declaration bounds as
+  the `SET_DRIVERS_DIR` pass (auxiliary tier, no physical access, no IOMMU
+  family key, no boot-only class) against the device records still unbound,
+  starts the drivers it binds in a settle batch of its own, and serves them once
+  it settles, within `SETTLE_TIMEOUT`. A record is bound at most once a boot, so
+  a second request over the same directory binds nothing; a limited driver's
+  bound devices are counted over the boot by driver name (`BoundCounts`), so
+  each pass binds it only to the devices its limit leaves. A request with no
+  directory cap or no path, before `SET_DRIVERS_DIR`, or while an earlier one is
+  not done gets `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no
+  driver waits until the pass and its settle end.
 
   The [`test-dma`](../../drivers/test-dma/README.md) fixture is bound like any
   driver: its declaration matches QEMU's `edu` device (PCI `1234:11e8`, which
@@ -486,7 +487,9 @@ devmgr's responsibilities are:
     of virtio-blk), loaded via `procmgr_labels::CREATE_FROM_FILE`. svcmgr
     delivers a `LOOKUP | READ | READDIR`-attenuated `/services/drivers/`
     subtree cap via `devmgr_labels::SET_DRIVERS_DIR` after handover (gated by
-    `DRIVERS_DIR_AUTHORITY`); devmgr replies SUCCESS immediately (so svcmgr
+    `DRIVERS_DIR_AUTHORITY`), with the directory's absolute path as a name block from data word
+    `DRIVERS_DIR_PATH_WORD`, so devmgr names each driver `<path>/<entry>` to procmgr (a request
+    with no path is refused `INVALID_REQUEST`); devmgr replies SUCCESS immediately (so svcmgr
     never blocks on driver work), and its control thread runs the
     drivers-directory pass, settling the on-disk batch (above). The pass
     lists the directory (`NS_READDIR`, at most 4096 entries) and reads each
@@ -627,8 +630,10 @@ extent of RAM memmgr pools, against which devmgr checks the regions firmware res
 for a device
 ([docs/device-management.md](../../../docs/device-management.md#iommu-discovery-and-programming)
 § IOMMU Discovery and Programming); `MODULE` rounds of up to four Memory caps (round data
-`[MODULE, n, size_0, ..., size_n-1]`, each module's size in bytes, since a module's cap covers
-whole pages and devmgr reads no byte past the module's end) carry every boot module outside
+`[MODULE, n, size_0, ..., size_n-1, name_0 (4 words), ..., name_n-1 (4 words)]`, each module's
+size in bytes, since a module's cap covers whole pages and devmgr reads no byte past the
+module's end, then each module's bundle entry name: 32 bytes, little-endian, NUL-padded, which
+devmgr gives procmgr to verify the module's signature under) carry every boot module outside
 init's bootstrap set (init, procmgr, memmgr, devmgr, vfsd, fatfs, log-levels, trust-store),
 untagged: the driver images and any platform description table; a cap-less
 `FRAMEBUFFER_INFO` round carries the framebuffer geometry (a zero base means no framebuffer); and

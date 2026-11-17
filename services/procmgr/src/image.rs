@@ -1,0 +1,532 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+// services/procmgr/src/image.rs
+
+//! The object a create loads: read once, whole, into memory only procmgr
+//! maps, and verified there before any byte of it is parsed
+//! (docs/signing.md § Verifier Discipline).
+//!
+//! Both create labels read their object into an [`ImageBuffer`]: a boot
+//! module's Memory cap is copied out ([`read_module`]), a file is copied
+//! out of its fs driver's cache pages ([`read_file`]). Neither source is
+//! verified in place, because each can still be written after the check:
+//! a module cap's holder (devmgr holds its modules with write rights) can
+//! write it, and an fs driver can rewrite a cache page it lent. The buffer's
+//! frames are granted on the child's memmgr account, so a large object is
+//! bounded by the child's budget, never procmgr's, and they go back to
+//! memmgr when the buffer drops, once the load has copied the segments out.
+//! [`verify`] checks the copy against the trust store; the loader then
+//! sees only the verified body.
+
+use crate::loader::{ScratchMapping, map_module};
+use ipc::{IpcMessage, memmgr_errors, memmgr_labels, procmgr_errors};
+use std::os::seraph::{ReservedRange, reserve_pages, unreserve_pages};
+use syscall_abi::{MSG_DATA_WORDS_MAX, PAGE_SIZE};
+
+/// How long procmgr waits, at most, on each call it makes on a
+/// caller-supplied file cap (`FS_OPEN`, `FS_READ_MEMORY`,
+/// `FS_RELEASE_MEMORY`, `FS_CLOSE`): 10 s. The cap's server is untrusted,
+/// so a server that never answers fails the create with `IO_ERROR` once the
+/// bound passes instead of holding the request worker for good
+/// (services/procmgr/README.md § Concurrency).
+const FILE_CAP_CALL_TIMEOUT_MS: u32 = 10_000;
+
+/// Region ids one `RELEASE_MEMORY_CAPS` names: every data word after the
+/// count.
+const RELEASE_IDS_PER_CALL: usize = MSG_DATA_WORDS_MAX - 1;
+
+/// The bytes of one object, in frames granted on a child's memmgr account and
+/// mapped writable in procmgr alone, at one contiguous range of procmgr's
+/// address space.
+///
+/// Invariant: the first `mapped` pages of the reservation are mapped; every
+/// cap of a grant taken for the buffer is in `caps`, and its region id in
+/// `regions`, from the moment the grant is received, so [`Drop`] returns
+/// each grant whatever step failed.
+pub struct ImageBuffer
+{
+    range: Option<ReservedRange>,
+    self_aspace: u64,
+    /// Pages of the reservation.
+    pages: u64,
+    /// Pages mapped from the reservation's start.
+    mapped: u64,
+    /// The object's length in bytes, at most `pages` pages.
+    len: usize,
+    caps: Vec<u64>,
+    regions: Vec<u64>,
+    /// The child's memmgr SEND the frames were granted on.
+    memmgr: u64,
+    ipc_buf: *mut u64,
+}
+
+impl ImageBuffer
+{
+    /// A buffer of `len` bytes, from frames requested on `memmgr` (the
+    /// child's account) until they cover it, each grant mapped writable at
+    /// the next pages of one reservation.
+    ///
+    /// # Errors
+    /// `OUT_OF_MEMORY` when `len` is zero or past the address space, no
+    /// reservation of its pages is free, memmgr refuses a request or answers
+    /// one with a malformed grant; `MAP_FAILED` when a grant cannot be
+    /// mapped. Every grant taken is returned.
+    fn new(self_aspace: u64, memmgr: u64, len: u64, ipc_buf: *mut u64) -> Result<Self, u64>
+    {
+        let pages = len.div_ceil(PAGE_SIZE);
+        let byte_len = usize::try_from(len).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        if pages == 0 || memmgr == 0
+        {
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        }
+        let range = reserve_pages(pages).map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        let mut buffer = Self {
+            range: Some(range),
+            self_aspace,
+            pages,
+            mapped: 0,
+            len: byte_len,
+            caps: Vec::new(),
+            regions: Vec::new(),
+            memmgr,
+            ipc_buf,
+        };
+        while buffer.mapped < pages
+        {
+            buffer.grant(pages.saturating_sub(buffer.mapped))?;
+        }
+        Ok(buffer)
+    }
+
+    /// Request up to `want` pages on the child's account and map each cap
+    /// of the grant at the next unmapped pages; a best-effort grant may cover
+    /// fewer, and the caller asks again for the rest.
+    fn grant(&mut self, want: u64) -> Result<(), u64>
+    {
+        let want = want.min(u64::from(u32::MAX));
+        let msg = IpcMessage::builder(memmgr_labels::REQUEST_MEMORY_CAPS)
+            .word(0, want)
+            .build();
+        // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+        let reply = unsafe { ipc::ipc_call(self.memmgr, &msg, self.ipc_buf) }
+            .map_err(|_| procmgr_errors::OUT_OF_MEMORY)?;
+        let Some((counts, regions)) = ipc::memmgr_grant_layout(&reply)
+        else
+        {
+            crate::release_caps(reply.caps());
+            if reply.label == memmgr_errors::SUCCESS
+            {
+                std::os::seraph::log!(warn: "image buffer: malformed memmgr grant");
+            }
+            return Err(procmgr_errors::OUT_OF_MEMORY);
+        };
+        // Every cap and region of the grant is the buffer's to return before
+        // any of it is checked or mapped.
+        self.caps.extend_from_slice(reply.caps());
+        self.regions.extend_from_slice(regions);
+        for (&cap, &count) in reply.caps().iter().zip(counts)
+        {
+            let left = self.pages.saturating_sub(self.mapped);
+            let whole = syscall::cap_info(cap, syscall_abi::CAP_INFO_MEMORY_SIZE)
+                .is_ok_and(|size| count.checked_mul(PAGE_SIZE) == Some(size));
+            if count == 0 || count > left || !whole
+            {
+                std::os::seraph::log!(warn: "image buffer: memmgr grant of {count} pages refused");
+                return Err(procmgr_errors::OUT_OF_MEMORY);
+            }
+            // `mapped` is below `pages`, so the offset is inside the
+            // reservation.
+            let va = self
+                .va()
+                .saturating_add(self.mapped.saturating_mul(PAGE_SIZE));
+            // SAFETY: the `count` pages from `va` are unmapped pages of this
+            // buffer's reservation (`count` is at most the pages left), VA
+            // no Rust object or IPC page occupies.
+            let mapped = unsafe {
+                std::os::seraph::mem_map_funded(
+                    cap,
+                    self.self_aspace,
+                    va,
+                    0,
+                    count,
+                    syscall::MAP_WRITABLE,
+                )
+            };
+            if mapped.is_err()
+            {
+                // A map that stops partway is undone by `Drop`, which unmaps
+                // the whole reservation.
+                return Err(procmgr_errors::MAP_FAILED);
+            }
+            self.mapped = self.mapped.saturating_add(count);
+        }
+        Ok(())
+    }
+
+    /// Base address of the buffer in procmgr's address space.
+    fn va(&self) -> u64
+    {
+        self.range.as_ref().map_or(0, ReservedRange::va_start)
+    }
+
+    /// The object's bytes.
+    pub fn bytes(&self) -> &[u8]
+    {
+        // SAFETY: the reservation's first `pages` pages are mapped writable
+        // (the constructor maps every page before it returns the buffer), and
+        // `len` is at most `pages * PAGE_SIZE`; the frames are granted on
+        // the child's account to procmgr alone, so no other process writes
+        // them, and the slice borrows `self`, so it ends before `Drop`
+        // unmaps them.
+        unsafe { core::slice::from_raw_parts(self.va() as *const u8, self.len) }
+    }
+
+    /// The object's bytes, to fill.
+    fn bytes_mut(&mut self) -> &mut [u8]
+    {
+        // SAFETY: as [`Self::bytes`]; the exclusive borrow of `self` makes the
+        // slice the only reference into the buffer.
+        unsafe { core::slice::from_raw_parts_mut(self.va() as *mut u8, self.len) }
+    }
+}
+
+impl Drop for ImageBuffer
+{
+    fn drop(&mut self)
+    {
+        if let Some(range) = self.range.take()
+        {
+            // SAFETY: the span is this buffer's own reservation, and every
+            // slice over it borrows the buffer, so none is live here.
+            // Unmapping a page that was never mapped is harmless; a span that
+            // will not unmap stays reserved, so no later reservation lands on
+            // a mapped page.
+            if unsafe { syscall::mem_unmap(self.self_aspace, range.va_start(), self.pages) }.is_ok()
+            {
+                unreserve_pages(range);
+            }
+        }
+        crate::release_caps(&self.caps);
+        // memmgr takes a region back only once no cap to it is held and it
+        // is mapped nowhere, which the two steps above made so.
+        for ids in self.regions.chunks(RELEASE_IDS_PER_CALL)
+        {
+            let msg = IpcMessage::builder(memmgr_labels::RELEASE_MEMORY_CAPS)
+                .word(0, ids.len() as u64)
+                .words(1, ids)
+                .build();
+            // SAFETY: `ipc_buf` is the calling thread's registered IPC buffer.
+            let _ = unsafe { ipc::ipc_call(self.memmgr, &msg, self.ipc_buf) };
+        }
+    }
+}
+
+/// Copy the object `len` bytes long at the start of the Memory cap
+/// `module_cap` into a buffer granted on `memmgr`. The cap stays the
+/// caller's.
+///
+/// # Errors
+/// `INVALID_ARGUMENT` when `len` is zero or past the cap's pages;
+/// [`map_module`]'s code when the cap cannot be mapped; [`ImageBuffer`]'s
+/// when the buffer cannot be had.
+pub fn read_module(
+    self_aspace: u64,
+    module_cap: u64,
+    len: u64,
+    memmgr: u64,
+    ipc_buf: *mut u64,
+) -> Result<ImageBuffer, u64>
+{
+    let (module, module_pages) = map_module(module_cap, self_aspace)?;
+    if len == 0 || len > module_pages.saturating_mul(PAGE_SIZE)
+    {
+        return Err(procmgr_errors::INVALID_ARGUMENT);
+    }
+    let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf)?;
+    let dst = buffer.bytes_mut();
+    // SAFETY: `module` maps the cap's `module_pages` pages read-only from
+    // `va()` and `dst.len()` (`len`) is within them; the cap's holder may
+    // write the pages while procmgr reads them, so no Rust reference is
+    // formed over them: the bytes are copied by raw pointer into the buffer,
+    // which does not overlap them, and `module` drops after the copy.
+    unsafe {
+        core::ptr::copy_nonoverlapping(module.va() as *const u8, dst.as_mut_ptr(), dst.len());
+    }
+    drop(module);
+    Ok(buffer)
+}
+
+/// Copy the `len`-byte file the caller-transferred node cap `node_cap`
+/// names into a buffer granted on `memmgr`: open it (`FS_OPEN`), copy each
+/// cache page `FS_READ_MEMORY` lends (`FS_RELEASE_MEMORY` right after), and
+/// close the open (`FS_CLOSE`). The node cap is deleted, and the open closed
+/// and its caps deleted, on every outcome.
+///
+/// # Errors
+/// `IO_ERROR` when the open fails, a read fails, is unanswered, or returns
+/// no bytes, ends before `len` bytes, or names a range past the page it
+/// lends; [`ImageBuffer`]'s code when the buffer cannot be had.
+pub fn read_file(
+    self_aspace: u64,
+    node_cap: u64,
+    len: u64,
+    memmgr: u64,
+    ipc_buf: *mut u64,
+) -> Result<ImageBuffer, u64>
+{
+    let file = vfs_open(node_cap, ipc_buf).ok_or(procmgr_errors::IO_ERROR)?;
+    let file = std::mem::DropGuard::new(file, move |file| vfs_close(file, ipc_buf));
+    let mut buffer = ImageBuffer::new(self_aspace, memmgr, len, ipc_buf)?;
+    let dst = buffer.bytes_mut();
+    let mut copied = 0usize;
+    while copied < dst.len()
+    {
+        let chunk = copy_cache_page(self_aspace, file.cap, ipc_buf, copied as u64, |page| {
+            // `copied` is below `dst.len()`.
+            let to = dst.get_mut(copied..)?;
+            let n = page.len().min(to.len());
+            Some((to.as_mut_ptr(), n))
+        })?;
+        // `chunk` is at most `dst.len() - copied`.
+        copied = copied.saturating_add(chunk);
+    }
+    drop(file);
+    Ok(buffer)
+}
+
+/// Read the cache page `FS_READ_MEMORY` lends for the file's byte `offset`
+/// on the open `file_cap`, and copy its valid bytes to where `target` says:
+/// `target` receives the valid range and returns the destination and how
+/// many bytes to copy (at most the range's length). Returns the bytes copied,
+/// which are never zero.
+///
+/// # Errors
+/// `IO_ERROR` when the read fails or lends no bytes, the page cannot be
+/// mapped, the reply's range runs past the page, or `target` has no room.
+fn copy_cache_page(
+    self_aspace: u64,
+    file_cap: u64,
+    ipc_buf: *mut u64,
+    offset: u64,
+    target: impl FnOnce(core::ops::Range<usize>) -> Option<(*mut u8, usize)>,
+) -> Result<usize, u64>
+{
+    let (memory_cap, bytes_valid, data_offset, cookie) =
+        vfs_read_memory(file_cap, ipc_buf, offset).ok_or(procmgr_errors::IO_ERROR)?;
+    let copied = (|| {
+        let mut page = ScratchMapping::map(self_aspace, memory_cap, 1, syscall::MAP_FROM_CAP)
+            .map_err(|_| {
+                let _ = syscall::cap_delete(memory_cap);
+                procmgr_errors::IO_ERROR
+            })?;
+        page.set_owns_cap(memory_cap);
+        // The offset and count come from the fs driver: a range that leaves
+        // the one page mapped is refused before any byte is read.
+        let range =
+            process_table::fs_reads::cache_page_range(data_offset, bytes_valid, PAGE_SIZE as usize)
+                .ok_or(procmgr_errors::IO_ERROR)?;
+        let start = range.start;
+        let (dst, n) = target(range).ok_or(procmgr_errors::IO_ERROR)?;
+        if n == 0
+        {
+            return Err(procmgr_errors::IO_ERROR);
+        }
+        // `start` is below the one page mapped (`cache_page_range`).
+        let src = page.va().saturating_add(start as u64) as *const u8;
+        // SAFETY: `page` maps one page read-only from `va()`, and
+        // `[start, start + n)` is within it (`n` is at most the checked
+        // range's length); `dst` has room for `n` bytes (`target`'s
+        // contract). The page is the fs driver's cache page, which the driver
+        // may write while procmgr reads it, so no Rust reference is formed
+        // over it: the bytes are copied by raw pointer into procmgr's own
+        // buffer, which does not overlap it, and `page` drops after the copy.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src, dst, n);
+        }
+        Ok(n)
+    })();
+    vfs_release_memory(file_cap, ipc_buf, cookie);
+    copied
+}
+
+/// Verify `object` against procmgr's trust store as the image a creator
+/// expects: signed under `name`, as a kind in `kinds` (the creator's
+/// signature policy), for this architecture. The certificate cache is copied
+/// out under its lock and written back after, so creates verify at once; the
+/// cache is a memo of certificate checks, so an update one create's
+/// write-back loses costs a later create one signature check and changes no
+/// result. A refusal is logged with the name.
+///
+/// # Errors
+/// The [`objsig::Refusal`] of the object.
+pub fn verify<'a>(
+    ctx: &crate::ProcmgrCtx,
+    object: &'a [u8],
+    name: &[u8],
+    kinds: objsig::KindSet,
+) -> Result<objsig::Verified<'a, 'static>, objsig::Refusal>
+{
+    let expect = objsig::Expectation {
+        kinds,
+        name,
+        arch: crate::arch::current::SIGNED_ARCH,
+    };
+    let mut cache = *ctx
+        .cert_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let verified = objsig::verify_cached(object, &ctx.trust_store, &expect, &mut cache);
+    *ctx.cert_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = cache;
+    verified.inspect_err(|refusal| {
+        std::os::seraph::log!(
+            warn: "signature verification refused: {}: {:?}",
+            name.escape_ascii(),
+            refusal
+        );
+    })
+}
+
+// ── File-cap calls ──────────────────────────────────────────────────────────
+
+/// Call the server of a caller-supplied file cap, bounded by
+/// [`FILE_CAP_CALL_TIMEOUT_MS`].
+///
+/// # Safety
+/// `ipc_buf` is the calling thread's registered IPC buffer page.
+unsafe fn file_call(cap: u64, msg: &IpcMessage, ipc_buf: *mut u64) -> Result<IpcMessage, i64>
+{
+    // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
+    unsafe { ipc::ipc_call_timeout(cap, msg, ipc_buf, FILE_CAP_CALL_TIMEOUT_MS) }
+}
+
+/// Per-request correlation cookie for `FS_READ_MEMORY`: a random `u64` from
+/// the kernel entropy pool, redrawn off the reserved `0` value (fatfs rejects
+/// cookie 0 as the `OutstandingPage::None` sentinel). Random rather than
+/// monotonic so the read-memory request count/rate it would otherwise leak to
+/// the fs stays unguessable; the cookie is opaque and never indexes a table.
+/// Its `u64` is the one request word that carries it, so the space never
+/// runs out. Returns `None` if the entropy draw fails (a kernel-contract violation).
+fn next_memory_cookie() -> Option<u64>
+{
+    loop
+    {
+        let c = syscall::random_u64().ok()?;
+        if c != 0
+        {
+            return Some(c);
+        }
+    }
+}
+
+/// Issue `FS_READ_MEMORY` at byte `offset`.
+///
+/// On success returns `(memory_cap, bytes_valid, memory_data_offset, cookie)`
+/// per `fs/docs/fs-driver-protocol.md`: the file's byte at `offset + i` for
+/// `i ∈ [0, bytes_valid)` lives in the returned memory cap at byte offset
+/// `memory_data_offset + i`, and `cookie` names the request for the
+/// `FS_RELEASE_MEMORY` that drops the fs-side cache refcount once the caller
+/// has copied the bytes ([`copy_cache_page`] issues it; `FS_CLOSE` drops
+/// any the caller missed). The memory cap is a per-call grandchild of the fs
+/// cache slot and is owned by the caller; `cap_delete` releases the caller's
+/// reference. `bytes_valid` is bounded by file end, cluster boundary, and
+/// memory-cap tail — callers must iterate from `offset + bytes_valid` to read
+/// past the boundary.
+///
+/// The file cap is client-supplied, so its server is untrusted: every reply
+/// cap other than the returned one is deleted, and on a failed or empty reply
+/// every reply cap ([`process_table::fs_reads::read_memory_reply_caps`]).
+fn vfs_read_memory(
+    file_cap: u64,
+    ipc_buf: *mut u64,
+    offset: u64,
+) -> Option<(u64, usize, usize, u64)>
+{
+    let cookie = next_memory_cookie()?;
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_READ_MEMORY)
+        .word(0, offset)
+        .word(1, cookie)
+        .build();
+
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { file_call(file_cap, &msg, ipc_buf) }.ok()?;
+    let bytes_valid = reply.word(0) as usize;
+    let (kept, surplus) =
+        process_table::fs_reads::read_memory_reply_caps(reply.label, bytes_valid, reply.caps());
+    crate::release_caps(surplus);
+    let memory_data_offset = reply.word(2) as usize;
+    Some((kept?, bytes_valid, memory_data_offset, cookie))
+}
+
+/// Open the file a caller-transferred file node cap names (`FS_OPEN`, with
+/// no release SEND: procmgr releases each page itself right after its copy,
+/// so it opts out of cooperative release), and delete the node cap. Returns
+/// the open cap every later read and the closing `FS_CLOSE` go to, so
+/// procmgr's pages and close touch no other opener's state, and the open's
+/// liveness cap, which keeps the driver from releasing the open until
+/// [`vfs_close`] deletes it (`fs/docs/fs-driver-protocol.md` § Label 18).
+/// `None` when the call fails or the reply carries no open cap and liveness
+/// cap; every other reply cap is deleted.
+fn vfs_open(node_cap: u64, ipc_buf: *mut u64) -> Option<OpenedFile>
+{
+    let msg = IpcMessage::new(ipc::fs_labels::FS_OPEN);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    let reply = unsafe { file_call(node_cap, &msg, ipc_buf) };
+    let _ = syscall::cap_delete(node_cap);
+    let reply = reply.ok()?;
+    let (opened, surplus) = match *reply.caps()
+    {
+        [cap, liveness, ref rest @ ..] if reply.label == 0 =>
+        {
+            (Some(OpenedFile { cap, liveness }), rest)
+        }
+        _ => (None, reply.caps()),
+    };
+    // The file cap is client-supplied, so its server is untrusted.
+    crate::release_caps(surplus);
+    opened
+}
+
+/// An open [`vfs_open`] made: its open cap and its liveness cap.
+#[derive(Clone, Copy)]
+struct OpenedFile
+{
+    cap: u64,
+    liveness: u64,
+}
+
+/// Close an open file via its open cap, then delete the open cap and the
+/// liveness cap.
+fn vfs_close(file: OpenedFile, ipc_buf: *mut u64)
+{
+    let file_cap = file.cap;
+    let msg = IpcMessage::new(ipc::fs_labels::FS_CLOSE);
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
+    {
+        // FS_CLOSE replies carry no caps; the untrusted server's are deleted.
+        crate::release_caps(reply.caps());
+    }
+    let _ = syscall::cap_delete(file_cap);
+    let _ = syscall::cap_delete(file.liveness);
+}
+
+/// Issue `FS_RELEASE_MEMORY` on the file-cap to drop the fs-side cache
+/// refcount and clear the outstanding-page tracking entry for `cookie`.
+/// Failure is non-fatal — the slot will be reclaimed at `FS_CLOSE` time
+/// even if the proactive release is lost.
+fn vfs_release_memory(file_cap: u64, ipc_buf: *mut u64, cookie: u64)
+{
+    let msg = IpcMessage::builder(ipc::fs_labels::FS_RELEASE_MEMORY)
+        .word(0, cookie)
+        .build();
+    // SAFETY: ipc_buf is the registered IPC buffer page.
+    if let Ok(reply) = unsafe { file_call(file_cap, &msg, ipc_buf) }
+    {
+        // FS_RELEASE_MEMORY replies carry no caps; the untrusted server's
+        // are deleted.
+        crate::release_caps(reply.caps());
+    }
+}

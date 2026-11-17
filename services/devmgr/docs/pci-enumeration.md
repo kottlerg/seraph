@@ -270,7 +270,12 @@ For each matched device, devmgr:
    the priority of its declared tier as its source allows. A devmgr logging
    at any level but info passes its own level as the driver's one env entry
    (`SERAPH_LOG`, with `CREATE_ARGV_ENV`), so a driver logs at devmgr's level
-   ([init bootstrap](../../init/docs/bootstrap.md) § Log levels).
+   ([init bootstrap](../../init/docs/bootstrap.md) § Log levels). Both
+   creates carry the binary's exact size in data word 0 and its name after
+   the argv/env header (`procmgr_labels::with_create_name`), the name procmgr
+   verifies the signature under: the bundle entry name for a boot module, the
+   install path (`<drivers directory path>/<entry>`) for a drivers-directory
+   file. A reply of `SIGNATURE_REFUSED` is logged and the driver not started.
 6. Starts the driver (`START_PROCESS`). A driver whose bootstrap fails after
    this step is withdrawn from its device as a live driver.
 7. Serves the driver's bootstrap as the resource list of

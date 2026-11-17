@@ -297,8 +297,27 @@ pub enum Start
 /// latched after it is a real one, which [`arm`] keeps.
 pub fn clear(regs: &mut impl Registers, layout: &Layout)
 {
+    disable_and_clear(regs, layout, 0);
+}
+
+/// Before the `PM1a_CNT` writes that enter a sleep state (ACPI 6.5
+/// § 16.1.6): disable every GPE and every fixed event but the power button,
+/// S5's wake event, whose enable is left as it reads, then clear every
+/// status, `WAK_STS` among them, so that no event acpid armed stays a wake
+/// source. acpid enables no GPE for wake: it evaluates no `_PRW`. [`arm`]
+/// enables the events again when the platform keeps running.
+pub fn quiesce(regs: &mut impl Registers, layout: &Layout)
+{
+    disable_and_clear(regs, layout, PWRBTN);
+}
+
+/// Disable every fixed event but those of `keep`, a mask of
+/// [`FIXED_ENABLE`] bits left as they read, and every GPE; then clear
+/// every status.
+fn disable_and_clear(regs: &mut impl Registers, layout: &Layout, keep: u16)
+{
     let enable = regs.read16(layout.pm1_enable());
-    regs.write16(layout.pm1_enable(), enable & !FIXED_ENABLE);
+    regs.write16(layout.pm1_enable(), enable & !(FIXED_ENABLE & !keep));
     let status = regs.read16(layout.pm1_status()) & FIXED_STATUS;
     if status != 0
     {
@@ -613,6 +632,56 @@ mod tests
         assert_eq!(r.get(0x621), 0);
         assert_eq!(r.get(0x628), 0b110);
         assert_eq!(r.get(0x629), 0);
+    }
+
+    #[test]
+    fn quiesce_leaves_only_the_power_button_enabled_and_no_status_and_arm_restores()
+    {
+        let l = q35();
+        let mut r = Regs::default();
+        clear(&mut r, &l);
+        let armed = handled(true, &[1, 2, 9]);
+        arm(&mut r, &l, &armed);
+        // A non-event enable bit (14), and what latched since: a press,
+        // WAK_STS, an RTC alarm, the handled GPEs 1 and 9, unhandled GPE 23.
+        r.bytes.insert(0x603, r.get(0x603) | 0x40);
+        r.raise(0x601, PWRBTN_HI | 0x80 | 0x04);
+        r.raise(0x620, 0b10);
+        r.raise(0x621, 0b10);
+        r.raise(0x622, 0x80);
+        let before = (r.word(0x602), r.get(0x628), r.get(0x629));
+        assert_eq!(before, (0x4000 | PWRBTN, 0b110, 0b10));
+
+        quiesce(&mut r, &l);
+        // No GPE is enabled when the sleep's writes are reached, and of the
+        // fixed events the power button alone; every status is clear.
+        for port in 0x628..0x630
+        {
+            assert_eq!(r.get(port), 0, "GPE enable {port:#x}");
+        }
+        for port in 0x620..0x628
+        {
+            assert_eq!(r.get(port), 0, "GPE status {port:#x}");
+        }
+        assert_eq!(r.word(0x602), 0x4000 | PWRBTN);
+        assert_eq!(r.word(0x600), 0);
+
+        // The platform keeps running: arming again restores the enables.
+        assert_eq!(arm(&mut r, &l, &armed), Fired::default());
+        assert_eq!((r.word(0x602), r.get(0x628), r.get(0x629)), before);
+    }
+
+    #[test]
+    fn quiesce_keeps_a_press_pending_delivery_disabled()
+    {
+        let l = q35();
+        let mut r = Regs::default();
+        arm(&mut r, &l, &handled(true, &[]));
+        r.raise(0x601, PWRBTN_HI);
+        assert!(scan(&mut r, &l).power_button);
+        quiesce(&mut r, &l);
+        assert_eq!(r.word(0x602), 0);
+        assert_eq!(r.word(0x600), 0);
     }
 
     #[test]

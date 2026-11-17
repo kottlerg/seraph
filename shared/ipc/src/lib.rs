@@ -2098,7 +2098,9 @@ pub mod acpid_labels
 {
     /// Enter a sleep state: write `SLP_TYP` and then `SLP_TYP | SLP_EN` to
     /// `PM1a_CNT`, the `SLP_TYP` read from the state's `\_Sx_` package,
-    /// after `\_PTS` of the state when the tables define it.
+    /// after `\_PTS` of the state when the tables define it and after
+    /// acpid disables the events it armed but the power button and clears
+    /// their status.
     ///
     /// Request: `data[0]` = the version; `data[1]` = the state, of which
     /// only [`STATE_S5`] (soft-off) is served. On the success path the

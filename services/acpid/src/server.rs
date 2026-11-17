@@ -124,6 +124,9 @@ struct Armed
     layout: Layout,
     regs: Arc<Mutex<Ports>>,
     handlers: Vec<Handler>,
+    /// The events [`events::arm`] enables, which a sleep that returns
+    /// enables again.
+    handled: Handled,
 }
 
 /// Arm the events, start the receivers on `service`, and run the evaluation
@@ -183,7 +186,11 @@ pub fn serve(
             {
                 let code = match request
                 {
-                    Request::Sleep(state) => sleep(state, ns.as_deref_mut(), platform, power),
+                    Request::Sleep(state) =>
+                    {
+                        let events = armed.as_ref().map(|armed| (armed, &*mailbox, &work));
+                        sleep(state, ns.as_deref_mut(), platform, power, events)
+                    }
                     Request::Reset => reset(power),
                     Request::WaitEvent => acpid_errors::INVALID_REQUEST,
                 };
@@ -217,8 +224,10 @@ fn lock(regs: &Mutex<Ports>) -> MutexGuard<'_, Ports>
 /// blocks to itself and registers the SCI, then set the enables
 /// ([`events::arm`]), hand on the events already pending, and let the
 /// event thread take the SCI. The GPEs handled are each `\_GPE` method of
-/// `ns`. `None`, logged, when the event thread cannot start; nothing is
-/// then enabled.
+/// `ns`. `None`, logged, when the event thread cannot start or take the
+/// SCI; every event is then disabled and its status cleared
+/// ([`events::clear`]), those a dead acpid of the boot left enabled among
+/// them.
 fn arm(
     source: EventSource,
     ns: Option<&Namespace>,
@@ -275,6 +284,7 @@ fn arm(
     if !taken
     {
         std::os::seraph::log!(warn: "the SCI is not taken; no events");
+        events::clear(&mut *lock(&regs), &layout);
         return None;
     }
     let fired = events::arm(&mut *lock(&regs), &layout, &handled);
@@ -295,6 +305,7 @@ fn arm(
         layout,
         regs,
         handlers,
+        handled,
     })
 }
 
@@ -533,9 +544,22 @@ pub fn refuse(service: u64) -> !
     }
 }
 
-/// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then the
-/// `PM1a_CNT` writes. The reply status when the platform keeps running.
-fn sleep(state: u8, ns: Option<&mut Namespace>, platform: &mut Platform<'_>, power: &Power) -> u64
+/// What a sleep needs of the armed events: the events, the mailbox and the
+/// work channel that what fired is handed on to.
+type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
+
+/// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
+/// events `armed`, [`events::quiesce`], then the `PM1a_CNT` writes. When
+/// the writes return, the platform still running, the events are armed
+/// again and what latched is handed on. The reply status when the platform
+/// keeps running.
+fn sleep(
+    state: u8,
+    ns: Option<&mut Namespace>,
+    platform: &mut Platform<'_>,
+    power: &Power,
+    armed: Option<SleepEvents<'_>>,
+) -> u64
 {
     if !power.can_sleep()
     {
@@ -567,7 +591,18 @@ fn sleep(state: u8, ns: Option<&mut Namespace>, platform: &mut Platform<'_>, pow
     {
         std::os::seraph::log!(warn: "\\_PTS({state}) faulted: {fault:?}; sleeping anyway");
     }
-    if power.sleep(state, slp_typ)
+    if let Some((armed, ..)) = armed
+    {
+        events::quiesce(&mut *lock(&armed.regs), &armed.layout);
+    }
+    let entered = power.sleep(state, slp_typ);
+    if let Some((armed, mailbox, work)) = armed
+    {
+        let fired = events::arm(&mut *lock(&armed.regs), &armed.layout, &armed.handled);
+        std::os::seraph::log!(warn: "SLEEP({state}) returned; events armed again");
+        deliver(&fired, mailbox, work);
+    }
+    if entered
     {
         acpid_errors::SUCCESS
     }

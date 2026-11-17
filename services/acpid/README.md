@@ -74,8 +74,13 @@ turn on the one thread that owns the namespace. A request is checked in order: t
 - `SLEEP`, with the state in `data[1]`, of which only S5 (soft-off) is served
   (`INVALID_REQUEST` for another): acpid evaluates `\_S5_` for `SLP_TYPa` (its first element,
   at most 7), runs `\_PTS(5)` when the tables define it (a fault is logged and the sleep goes
-  on), then writes `PM1a_CNT` twice, keeping its other bits: `SLP_TYPa` with `SLP_EN` clear,
-  then with `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes.
+  on), then, with the events armed (§ Events), disables every GPE and every fixed event but the
+  power button, S5's wake event, and clears every PM1 and GPE0 status, `WAK_STS` among them, as
+  ACPI 6.5 § 16.1.6 requires before `SLP_EN` is written. It then writes `PM1a_CNT` twice,
+  keeping its other bits: `SLP_TYPa` with `SLP_EN` clear, then with `SLP_EN` (bit 13) set,
+  and logs `SLEEP(5): PM1a_CNT ...` before the writes. When the writes return, the platform
+  still running, acpid arms the events again, logs `SLEEP(5) returned; events armed again`,
+  and hands on what latched meanwhile.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and
@@ -123,7 +128,8 @@ Once the start-up ends, acpid arms the events:
   dead acpid of the boot that had not handled it, since a status bit is cleared only once its
   event is handled.
 - acpid logs `events armed (...)` with the start, the SCI's GSI, whether the power button is
-  on, and the GPEs handled.
+  on, and the GPEs handled. When the SCI cannot be taken, acpid disables every event and clears
+  every status, those a dead acpid of the boot left enabled among them, and handles none.
 
 The event thread blocks on the SCI's notification alone. On each SCI it reads the PM1 and GPE
 status and enable registers, disables each event whose status and enable are both set, leaving

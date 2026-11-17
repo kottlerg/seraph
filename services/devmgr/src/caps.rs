@@ -125,9 +125,9 @@ pub struct DevmgrCaps
     /// The held BAR pages: pages of PCI functions' BARs that no bind holds,
     /// moved out of [`Self::apertures`] or given back to them. A hot-added
     /// function's are moved here when its BARs are placed, a boot-scanned
-    /// one's behind a managed hotplug slot when its slot is managed, and a
-    /// withdrawn driver's device's BAR caps are given back here
-    /// (`bind::PciDeviceCaps::release`). A bind carves a function's BAR caps
+    /// one's behind a managed hotplug slot when its slot is managed, and the
+    /// BAR caps of a withdrawn driver's device, or of a bind that failed, are
+    /// given back here (`bind::PciDeviceCaps::release`). A bind carves a function's BAR caps
     /// from here first ([`crate::carve_bar`]); a region grant, which carves
     /// from the apertures alone, never reaches them, and no placement in a
     /// slot's windows, which takes only what the apertures hold, lands on

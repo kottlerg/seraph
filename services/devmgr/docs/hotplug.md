@@ -96,7 +96,8 @@ Changed, Data Link Layer State Changed; all RW1C, so a poll loses no event), and
 | pressed | Attention Button Pressed again | the power indicator on; the removal is cancelled, and the slot is occupied |
 | pressed | presence lost, or the link lost | post the removal job; the slot is removing |
 | pressed | the abort window ended | post the removal job; the slot is removing |
-| removing | anything | nothing, until the removal job completes (§ Removal) |
+| removing | Attention Button Pressed, or Presence Detect Changed, with a card present | nothing until the removal job completes; the slot is powered up after it (§ Removal) |
+| removing | anything else | nothing, until the removal job completes (§ Removal) |
 | off | Attention Button Pressed, or Presence Detect Changed, with a card present | power up, as for an empty slot |
 | off, failed | presence lost | the slot is empty |
 
@@ -176,7 +177,9 @@ attention button, whose press blinks the power indicator for the abort window; a
 within it cancels the removal, and the indicator is on again. The poller posts the slot's
 removal job, logged `removing its functions` with the cause, and holds the slot removing until
 the job completes, whatever Slot Status reads meanwhile: a card inserted, pressed or pulled then
-is acted on only after the completion.
+is acted on only after the completion. The slot keeps whether a card was inserted or the button
+pressed while it was removing, so that card is powered up after the completion without a further
+press, on a slot with no attention button as on one with it.
 
 The control thread runs the removal job (`firmware::hotplug::remove`), in this order:
 
@@ -203,13 +206,16 @@ The control thread runs the removal job (`firmware::hotplug::remove`), in this o
    above and stays.
 
 It logs `functions removed` with the number of records removed, drivers withdrawn and held spans
-returned, and posts the slot back to the poller, which powers it off in two Slot Control writes:
-the power controller off, then the power indicator off, logged `powered off`. QEMU unplugs the
-card on the write that leaves both off. The slot is then off while a card is still present, else
-empty (`firmware::hotplug::completed`). A slot is powered up again only from empty or off, so no
-add job for it runs before its previous occupant's DMA, IOMMU mappings and interrupt routes are
-gone. A removal job posted while the slot's add job waits runs after it, and withdraws what the
-add bound; a second removal job of a slot finds no live record and returns nothing.
+returned, and posts the slot back to the poller, which powers it off in two Slot Control writes: the
+power controller off, then the power indicator off, logged `powered off`. QEMU unplugs the card on
+the write that leaves both off. The slot is then off while the card the removal removed is still
+present, until a press or a new insertion asks for it; it is empty when no card is present, or when
+a card was inserted or the button pressed while it was removing or by the power-off, so the next
+poll powers that card up (`firmware::hotplug::completed`). A slot is powered up again only from
+empty or off, so no add job for it runs before its previous occupant's DMA, IOMMU mappings and
+interrupt routes are gone. A removal job posted while the slot's add job waits runs after it, and
+withdraws what the add bound; a second removal job of a slot finds no live record and returns
+nothing.
 
 An IOMMU fault is counted for a requester ID only while a DMA grant of a live record tracks it
 (`firmware::dma::FaultCounts`): the grant tracks it from zero, the withdrawal stops counting it

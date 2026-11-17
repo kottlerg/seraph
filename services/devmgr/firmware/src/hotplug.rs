@@ -795,12 +795,17 @@ pub enum SlotState
         polls_left: u64
     },
     /// The removal job is posted: the slot waits for the control thread's
-    /// completion ([`completed`]), whatever its status reads meanwhile, and
-    /// is powered off only then.
-    Removing,
-    /// The removal completed with the card still present: the slot is
-    /// powered off until its attention button is pressed or a card is
-    /// inserted again.
+    /// completion ([`completed`]) and is powered off only then. Nothing it
+    /// reads meanwhile is acted on, but `asked` keeps whether a card was
+    /// inserted or the attention button pressed, so the slot is powered up
+    /// for it after the completion.
+    Removing
+    {
+        asked: bool
+    },
+    /// The removal completed with the card it removed still present: the
+    /// slot is powered off until its attention button is pressed or a card
+    /// is inserted again.
     Off,
 }
 
@@ -862,7 +867,7 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
         SlotState::Empty if present => (SlotState::Empty, Action::PowerUp),
         SlotState::Occupied | SlotState::Pressed { .. } if gone =>
         {
-            (SlotState::Removing, Action::Remove)
+            (SlotState::Removing { asked: false }, Action::Remove)
         }
         SlotState::Occupied if pressed => (
             SlotState::Pressed {
@@ -873,41 +878,54 @@ pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState,
         SlotState::Pressed { .. } if pressed => (SlotState::Occupied, Action::Cancel),
         SlotState::Pressed { polls_left } if polls_left <= 1 =>
         {
-            (SlotState::Removing, Action::Remove)
+            (SlotState::Removing { asked: false }, Action::Remove)
         }
+        SlotState::Removing { asked } => (
+            SlotState::Removing {
+                asked: asked || asks(status),
+            },
+            Action::None,
+        ),
         SlotState::Pressed { polls_left } => (
             SlotState::Pressed {
                 polls_left: polls_left.saturating_sub(1),
             },
             Action::None,
         ),
-        SlotState::Off if present && (pressed || status & SLOTSTA_PRESENCE_CHANGED != 0) =>
-        {
-            (SlotState::Off, Action::PowerUp)
-        }
+        SlotState::Off if asks(status) => (SlotState::Off, Action::PowerUp),
         SlotState::Failed | SlotState::Off if !present => (SlotState::Empty, Action::None),
-        SlotState::Empty
-        | SlotState::Occupied
-        | SlotState::Failed
-        | SlotState::Removing
-        | SlotState::Off => (state, Action::None),
+        SlotState::Empty | SlotState::Occupied | SlotState::Failed | SlotState::Off =>
+        {
+            (state, Action::None)
+        }
     }
 }
 
+/// Whether Slot Status `status` asks for a card present to be powered up:
+/// the card was inserted (Presence Detect Changed) or the attention button
+/// pressed. `status` is not all ones.
+const fn asks(status: u16) -> bool
+{
+    status & SLOTSTA_PRESENT != 0 && status & (SLOTSTA_BUTTON | SLOTSTA_PRESENCE_CHANGED) != 0
+}
+
 /// The state of a slot whose removal job completed and which the poller has
-/// powered off, its Slot Status then reading `status`: off while a card is
-/// still present, else empty. A slot that is not being removed is left as it
-/// is.
+/// powered off, its Slot Status then reading `status`: empty when no card is
+/// present, so a card present is powered up on the next poll when it was
+/// inserted, or the attention button pressed, while the slot was removing
+/// or since its last poll; else off, the card the removal removed still in
+/// the slot. A slot that is not being removed is left as it is.
 #[must_use]
 pub const fn completed(state: SlotState, status: u16) -> SlotState
 {
     match state
     {
-        SlotState::Removing if status != u16::MAX && status & SLOTSTA_PRESENT != 0 =>
+        SlotState::Removing { asked }
+            if status != u16::MAX && status & SLOTSTA_PRESENT != 0 && !asked && !asks(status) =>
         {
             SlotState::Off
         }
-        SlotState::Removing => SlotState::Empty,
+        SlotState::Removing { .. } => SlotState::Empty,
         SlotState::Empty
         | SlotState::Occupied
         | SlotState::Failed
@@ -2133,10 +2151,8 @@ mod tests
             state = to;
         }
         assert_eq!(state, SlotState::Pressed { polls_left: 1 });
-        assert_eq!(
-            next(state, present, false),
-            (SlotState::Removing, Action::Remove)
-        );
+        let removing = SlotState::Removing { asked: false };
+        assert_eq!(next(state, present, false), (removing, Action::Remove));
         // A second press within the window cancels the removal.
         assert_eq!(
             next(full, pressed, false),
@@ -2148,27 +2164,41 @@ mod tests
         {
             assert_eq!(
                 next(from, SLOTSTA_PRESENCE_CHANGED, false),
-                (SlotState::Removing, Action::Remove)
+                (removing, Action::Remove)
             );
             assert_eq!(
                 next(from, present | SLOTSTA_LINK_CHANGED, true),
-                (SlotState::Removing, Action::Remove)
+                (removing, Action::Remove)
             );
         }
-        // Removing ignores every reading until the job completes: a card
-        // pressed, inserted or pulled meanwhile is not acted on.
-        for status in [0, present, pressed, present | SLOTSTA_PRESENCE_CHANGED]
+        // Removing acts on no reading until the job completes, but keeps a
+        // card inserted or a press, and keeps it whatever it reads after.
+        let inserted = present | SLOTSTA_PRESENCE_CHANGED;
+        let asked = SlotState::Removing { asked: true };
+        for status in [0, present, SLOTSTA_PRESENCE_CHANGED, SLOTSTA_BUTTON]
         {
-            assert_eq!(
-                next(SlotState::Removing, status, false),
-                (SlotState::Removing, Action::None)
-            );
+            assert_eq!(next(removing, status, false), (removing, Action::None));
+            assert_eq!(next(asked, status, false), (asked, Action::None));
         }
-        // Completed: off while the card is present, else empty; any other
-        // state is left as it is.
-        assert_eq!(completed(SlotState::Removing, present), SlotState::Off);
-        assert_eq!(completed(SlotState::Removing, 0), SlotState::Empty);
-        assert_eq!(completed(SlotState::Removing, u16::MAX), SlotState::Empty);
+        for status in [pressed, inserted]
+        {
+            assert_eq!(next(removing, status, false), (asked, Action::None));
+        }
+        // Completed: empty when no card is present, or when one was inserted
+        // or the button pressed while removing or at the completion, so the
+        // next poll powers the card up; else off, with the card the removal
+        // removed. Any other state is left as it is.
+        assert_eq!(completed(removing, present), SlotState::Off);
+        assert_eq!(completed(asked, present), SlotState::Empty);
+        assert_eq!(completed(removing, inserted), SlotState::Empty);
+        assert_eq!(completed(removing, pressed), SlotState::Empty);
+        assert_eq!(next(SlotState::Empty, present, false).1, Action::PowerUp);
+        for from in [removing, asked]
+        {
+            assert_eq!(completed(from, 0), SlotState::Empty);
+            assert_eq!(completed(from, SLOTSTA_PRESENCE_CHANGED), SlotState::Empty);
+            assert_eq!(completed(from, u16::MAX), SlotState::Empty);
+        }
         for other in [SlotState::Empty, SlotState::Occupied, SlotState::Off, full]
         {
             assert_eq!(completed(other, present), other);
@@ -2197,7 +2227,8 @@ mod tests
             SlotState::Occupied,
             SlotState::Failed,
             full,
-            SlotState::Removing,
+            removing,
+            asked,
             SlotState::Off,
         ]
         {
@@ -2505,20 +2536,29 @@ mod tests
         m.control();
         m.slot.pull();
         assert_eq!(m.poll(), Action::Remove);
-        // A card inserted before the job ran is not brought up.
-        m.slot.plug();
+        // A card inserted before the job ran is not brought up then, but
+        // kept: no press is needed, so a slot with no attention button
+        // brings it up too.
+        m.slot.card = true;
+        m.slot.status |= SLOTSTA_PRESENT | SLOTSTA_PRESENCE_CHANGED;
         assert_eq!(m.poll(), Action::None);
-        assert_eq!(m.state, SlotState::Removing);
+        assert_eq!(m.state, SlotState::Removing { asked: true });
         m.control();
         assert_eq!(m.withdrawn, 1);
-        // Powered off with the new card in: off until it is asked for.
-        assert_eq!(m.poll(), Action::None);
-        assert_eq!(m.state, SlotState::Off);
-        assert_eq!(m.poll(), Action::None);
-        m.slot.press();
+        // Powered off, then the new card is powered up.
         assert_eq!(m.poll(), Action::PowerUp);
         m.control();
-        assert_eq!((m.live, m.state), (1, SlotState::Occupied));
+        assert_eq!((m.live, m.withdrawn, m.state), (1, 1, SlotState::Occupied));
+        // A card inserted between the last poll and the power-off is kept the
+        // same way.
+        m.slot.pull();
+        assert_eq!(m.poll(), Action::Remove);
+        m.control();
+        m.slot.card = true;
+        m.slot.status |= SLOTSTA_PRESENT | SLOTSTA_PRESENCE_CHANGED;
+        assert_eq!(m.poll(), Action::PowerUp);
+        m.control();
+        assert_eq!((m.live, m.withdrawn), (1, 2));
         // Pulled while off: empty.
         let mut off = Model::new(Unplug::Never);
         off.state = SlotState::Off;
@@ -2526,6 +2566,30 @@ mod tests
         off.slot.pull();
         assert_eq!(off.poll(), Action::None);
         assert_eq!(off.state, SlotState::Empty);
+    }
+
+    #[test]
+    fn a_button_removal_of_a_card_that_stays_leaves_the_slot_off_until_asked()
+    {
+        let mut m = Model::new(Unplug::Never);
+        m.slot.plug();
+        m.poll();
+        m.control();
+        m.slot.press();
+        assert_eq!(m.poll(), Action::Blink);
+        assert_eq!(m.wait_window(), Action::Remove);
+        m.control();
+        // The card the removal removed is still in: powered off, and not
+        // brought up again by its presence alone.
+        assert_eq!(m.poll(), Action::None);
+        assert_eq!((m.state, m.withdrawn), (SlotState::Off, 1));
+        assert!(m.slot.card && ModelSlot::powered_off(m.slot.control));
+        assert_eq!(m.poll(), Action::None);
+        // A press asks for it again.
+        m.slot.press();
+        assert_eq!(m.poll(), Action::PowerUp);
+        m.control();
+        assert_eq!((m.live, m.state), (1, SlotState::Occupied));
     }
 
     #[test]

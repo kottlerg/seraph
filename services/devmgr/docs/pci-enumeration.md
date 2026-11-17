@@ -162,27 +162,27 @@ For each matched device, devmgr:
    block or input device) presents no layout; it is refused, logged, when
    its driver declares the VirtIO status reset, and bound as any other
    function otherwise.
-2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided
-   MMIO aperture that covers it, or, for a function behind a managed hotplug
-   slot, out of the BAR pages devmgr holds for it
-   ([hotplug.md](hotplug.md#add-job) § Add Job), spanning the BAR's first pages up to that
-   reach at most. The driver maps each BAR into that many pages of its
-   register window, and `SYS_MMIO_MAP` maps a cap's whole region, so a
-   larger cap would map past the BAR's share of the window. For any other
-   function it carves a sub-cap for every MMIO BAR, whole; I/O BARs are not
-   delivered. For a function devmgr may give MSI-X
-   (`firmware::pci::deliverable_messages`) it leaves out of each BAR the
-   pages holding the MSI-X table and Pending Bit Array, which no driver is
+2. Carves an `Mmio` sub-cap for each of those BARs out of the BAR pages devmgr
+   holds where they cover it (those of the functions behind a managed hotplug
+   slot, [hotplug.md](hotplug.md#add-job) § Add Job, and every BAR cap a
+   withdrawal or a failed bind gave back), else out of the boot-provided MMIO
+   aperture that covers it, spanning the BAR's first pages up to that reach at
+   most. The driver maps each BAR into that many pages of its register window,
+   and `SYS_MMIO_MAP` maps a cap's whole region, so a larger cap would map past
+   the BAR's share of the window. For any other function it carves a sub-cap for
+   every MMIO BAR, whole; I/O BARs are not delivered. For a function devmgr may
+   give MSI-X (`firmware::pci::deliverable_messages`) it leaves out of each BAR
+   the pages holding the MSI-X table and Pending Bit Array, which no driver is
    delivered (docs/device-management.md § Message-Signaled Interrupts), and
    carves the rest as up to three sub-caps (`firmware::pci::delivered_ranges`),
-   each recording its offset in its BAR; a BAR those pages cover whole is
-   not delivered. A VirtIO function whose register regions share a page with
-   them may not be given MSI-X, and its BARs are carved without the cut. A
-   BAR the layout names that is
-   not an MMIO BAR, or a range no aperture covers, refuses the device, logged,
-   with the caps already carved released. The aperture's lower and upper
-   remainders stay in devmgr's growable aperture table
-   (`firmware::resource::SpanTable`) as caps of their own.
+   each recording its offset in its BAR; a BAR those pages cover whole is not
+   delivered. A VirtIO function whose register regions share a page with them
+   may not be given MSI-X, and its BARs are carved without the cut. A BAR the
+   layout names that is not an MMIO BAR, or a range neither the held BAR pages
+   nor an aperture covers, refuses the device, logged, with the caps already
+   carved released. The aperture's lower and upper remainders stay in devmgr's
+   growable aperture table (`firmware::resource::SpanTable`) as caps of their
+   own.
 3. Carves the `Mmio` cap of the function's configuration page (4 KiB at
    `firmware::pci::function_config_phys`) out of the kept ECAM window that
    decodes its segment and bus. devmgr keeps the cap and delegates it to no

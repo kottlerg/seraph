@@ -626,8 +626,9 @@ fn poll(slot: &mut Polled, aspace: u64, posted: &mpsc::Sender<Job>, job_note: u6
 /// Power off a slot whose removal job completed: the power controller off,
 /// then the power indicator off, two Slot Control writes, so a slot that
 /// acts on the write leaving both off (QEMU's) does so once the controller
-/// is off. The slot is then off while a card is present, else empty
-/// ([`hp::completed`]), its latches cleared.
+/// is off. The slot is then off while the card the removal removed is
+/// present, else empty, a card inserted or asked for meanwhile powered up
+/// on the next poll ([`hp::completed`]), its latches cleared.
 fn power_off(slot: &mut Polled, aspace: u64)
 {
     let s = slot.slot;
@@ -640,9 +641,9 @@ fn power_off(slot: &mut Polled, aspace: u64)
         set_control(regs, &s, off, hp::indicator_off(off, s.capabilities));
         let status = regs.read16(s.register(SLOT_STATUS));
         clear_latches(regs, &s, status);
-        hp::completed(current, status)
+        (hp::completed(current, status), hp::present(status))
     });
-    let state = state.unwrap_or_else(|| hp::completed(current, u16::MAX));
+    let (state, present) = state.unwrap_or_else(|| (hp::completed(current, u16::MAX), false));
     std::os::seraph::log!(
         "hotplug: slot {}:{}:{}.{}: powered off ({})",
         seg,
@@ -652,6 +653,10 @@ fn power_off(slot: &mut Polled, aspace: u64)
         if state == SlotState::Off
         {
             "card still present"
+        }
+        else if present
+        {
+            "a card inserted or asked for meanwhile; powering it up"
         }
         else
         {

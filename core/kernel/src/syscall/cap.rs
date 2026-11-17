@@ -3516,13 +3516,15 @@ pub fn sys_endpoint_badge(tf: UserFrame) -> Result<u64, SyscallError>
     // Both pins hold their objects, so neither endpoint can be freed and its
     // memory reused for another between the lookups and this comparison.
     let same = proof.object.is_some() && proof.object == named.object;
+    // The mask is taken ahead of the branch it backs, so it depends on the
+    // comparison and not on the branch: the badge leaves selected as data, and
+    // a path a mispredicted refusal reaches returns 0, never another
+    // endpoint's badge.
+    let mask = crate::arch::nospec::mask_if(same) as u64;
     if !same
     {
         return Err(SyscallError::InvalidArgument);
     }
-    // The badge leaves selected as data by the comparison, so a path a
-    // mispredicted refusal reaches returns 0, never another endpoint's badge.
-    let mask = crate::arch::nospec::mask_if(same) as u64;
     tf.set_ipc_return(0, named.badge & mask);
     Ok(0)
 }

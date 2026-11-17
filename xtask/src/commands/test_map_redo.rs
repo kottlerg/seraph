@@ -145,6 +145,7 @@ fn run_args(args: &TestMapRedoArgs, dir: &Path, data_image: Option<PathBuf>) -> 
         runs: 1,
         timeout: args.timeout,
         cpus: args.cpus,
+        threads_per_core: 1,
         mem: args.mem,
         riscv_mmu: args.riscv_mmu,
         riscv_zkr: crate::qemu::RiscvZkr::On,

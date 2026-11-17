@@ -240,6 +240,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
             let firmware_vars_template = firmware.vars_template.clone();
             let arch = args.arch;
             let cpus = args.cpus;
+            let threads_per_core = args.threads_per_core;
             let mem_mib = args.mem;
             let riscv_mmu = args.riscv_mmu;
             let riscv_zkr = args.riscv_zkr;
@@ -318,6 +319,7 @@ fn run_waves(ctx: &BuildContext, args: &RunParallelArgs) -> Result<()>
                     firmware_code_path: &firmware_code,
                     firmware_vars_path: vars_path_for_qemu.as_deref(),
                     cpus,
+                    threads_per_core,
                     mem_mib,
                     display,
                     gdb: if debug_listen

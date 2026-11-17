@@ -639,7 +639,7 @@ ok build wait_host=["7"] host_override
 ok build arch=["x86_64"] release component=["kernel"] debug=["kernel"] skip_lints wait_host=["7"] host_override
 
 ["run"]
-ok-all run arch=default["x86_64"] gdb=default headless=default verbose=default cpus=default["4"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default host_override=default alone=default timing=default
+ok-all run arch=default["x86_64"] gdb=default headless=default verbose=default cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] second_disk_shared_line=default test_devices=default host_override=default alone=default timing=default
 
 ["run","-h"]
 help xtask run -h
@@ -3121,7 +3121,7 @@ error: the following required arguments were not provided:
   --runs <RUNS>
 
 ["run-parallel","--parallel","1","--runs","1"]
-ok-all run-parallel arch=default["x86_64"] parallel=["1"] runs=["1"] timeout=default["30"] cpus=default["4"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] display=default["headless"] pass=default["ALL TESTS PASSED"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] debug_listen=default hold_on_hang=default fail_grace_secs=default["10"] second_disk_shared_line=default test_devices=default host_override=default alone=default timing=default
+ok-all run-parallel arch=default["x86_64"] parallel=["1"] runs=["1"] timeout=default["30"] cpus=default["4"] threads_per_core=default["1"] mem=default["512"] riscv_mmu=default["sv48"] riscv_zkr=default["on"] x86_paging=default["4"] x86_shadow_stack=default["off"] iommu=default["attached"] display=default["headless"] pass=default["ALL TESTS PASSED"] fail=default["SOME TESTS FAILED|KERNEL EXCEPTION|FATAL:|PANIC( at |: )|=== WATCHDOG|entropy: SELFTEST FAIL"] debug_listen=default hold_on_hang=default fail_grace_secs=default["10"] second_disk_shared_line=default test_devices=default host_override=default alone=default timing=default
 
 ["run-parallel","-h"]
 help xtask run-parallel -h

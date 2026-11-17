@@ -110,8 +110,9 @@ or stamped for a different architecture.
 
 ```
 cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
-    [--cpus N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] [--riscv-zkr on|off] \
-    [--x86-paging 4|5] [--x86-shadow-stack off|on] [--iommu attached|absent] \
+    [--cpus N] [--threads-per-core N] [--mem MIB] [--riscv-mmu sv39|sv48|sv57] \
+    [--riscv-zkr on|off] [--x86-paging 4|5] [--x86-shadow-stack off|on] \
+    [--iommu attached|absent] \
     [--second-disk PATH [--second-disk-block-size BYTES] [--second-disk-shared-line]] \
     [--debug-port PORT [--debug-target NAME]] [--test-devices]
 ```
@@ -123,6 +124,7 @@ cargo xtask run [--arch x86_64|riscv64] [--gdb] [--headless] [--verbose] \
 | `--headless` | Run without a display window (`-display none`) |
 | `--verbose` | Show all serial output; by default output is filtered until `[--------] boot:` appears |
 | `--cpus` | Number of vCPUs to expose to the guest (default: `4`; bounded by `1..=8192`, `boot_protocol::MAX_CPUS`, the boot protocol's CPU ceiling) |
+| `--threads-per-core` | Logical CPUs per core in the guest's topology (default: `1`; must divide `--cpus`). Above 1 the launch passes `-smp <cpus>,threads=<n>`, and QEMU derives the cores from it. On x86_64 the guest's `CPUID` leaf 0BH reports the SMT level under TCG and KVM alike, so `2` boots SMT sibling pairs, which the kernel's placement spreads threads across ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § SMT Awareness); ktest's `integration::smt_siblings` logs the cores it finds. On riscv64 the kernel takes each hart as a core of its own whatever the topology says |
 | `--mem` | Guest memory size in MiB (default: `512`) |
 | `--riscv-mmu` | Guest RISC-V paging-mode ceiling (default: `sv48`; riscv64 only, ignored on x86_64). Sets the QEMU `svNN` CPU properties, which cap the `satp` modes the CPU implements (and the DTB `mmu-type` QEMU authors); the bootloader takes the DTB `mmu-type` as the candidate (Sv57 when the firmware publishes no DTB, as under EDK2) and confirms it with a `satp` write-probe that falls back to the next-narrower mode ([core/boot/docs/page-tables.md](../core/boot/docs/page-tables.md) § Mode negotiation), and the kernel recovers the active mode from `satp`, per [docs/memory-model.md](../docs/memory-model.md) § RISC-V (Sv39 / Sv48 / Sv57). The default pins `sv48` because QEMU ≥ 8.0 otherwise defaults the rv64 CPU to `sv57` |
 | `--riscv-zkr` | Whether the guest RISC-V CPU implements the Zkr entropy source (default: `on`; riscv64 only, ignored on x86_64). Appends `zkr=on` or `zkr=off` to the QEMU `-cpu` model. With it, OpenSBI grants S-mode the `seed` CSR and the kernel's pool seeds from it beside the firmware boot seed (`entropy: seeded from hardware RNG`); `off` boots the path without the source, where the kernel's probe of the CSR traps and the pool seeds from the boot seed and jitter ([core/kernel/docs/entropy.md](../core/kernel/docs/entropy.md) § Sources and graceful degradation). Runs with `off` are manual ([docs/testing.md](../docs/testing.md#coverage-tiers) § Coverage tiers) |
@@ -566,6 +568,7 @@ cargo xtask run-parallel \
     --runs M \
     [--timeout SECONDS] \
     [--cpus N] \
+    [--threads-per-core N] \
     [--mem MIB] \
     [--riscv-mmu sv39|sv48|sv57] \
     [--riscv-zkr on|off] \
@@ -592,6 +595,7 @@ cargo xtask run-parallel \
 | `--runs` | (required) | Total runs, dispatched in waves of `--parallel` |
 | `--timeout` | `30` | Per-run timeout in seconds; expired runs are SIGKILLed and classified `HANG` (unless a pass marker matched first) |
 | `--cpus` | `4` | vCPUs per guest (bounded by `1..=8192`, `boot_protocol::MAX_CPUS`) |
+| `--threads-per-core` | `1` | Logical CPUs per core in each guest's topology; must divide `--cpus`; same semantics as `cargo xtask run --threads-per-core` |
 | `--mem` | `512` | Guest memory size in MiB |
 | `--riscv-mmu` | `sv48` | Guest RISC-V paging-mode ceiling (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-mmu` |
 | `--riscv-zkr` | `on` | Whether the guest RISC-V CPU implements the Zkr entropy source (riscv64 only, ignored on x86_64); same semantics as `cargo xtask run --riscv-zkr` |

@@ -22,6 +22,10 @@ times, when the final map's buffer outgrows the array sized for it), calls
 `ExitBootServices`, populates `BootInfo`, and jumps to the kernel entry point.
 The sequence is specified in ten bootloader steps in
 [`core/boot/docs/boot-flow.md`](../core/boot/docs/boot-flow.md).
+The bootloader verifies the signature of the kernel, `init` and every other bundle entry against
+a trust store built into it, before it parses any of them, and hands the store forward to
+procmgr, which verifies every image it creates (design intent; not yet implemented,
+[signing.md](signing.md)).
 
 Boot-time configuration on disk consists of only the two ESP files
 named above, the optional presence-only `\EFI\seraph\nokaslr` KASLR

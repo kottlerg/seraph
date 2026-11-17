@@ -559,11 +559,18 @@ for a reschedule, so a thread that names CPU B and parks before A's next `schedu
 B by its wake while it is still `current` on A. B's `schedule()` then claims it: its
 `dequeue_highest` unlinks it (`Ready`, `queued_on == -1`), and its dispatch flip marks it `Running`
 and waits for A's register save, or its deferred dispatch links it back on B (step 3.5 of
-§ Cross-CPU TCB Ownership). A's outgoing-requeue guard skips a `current` so claimed: one that is
-`Ready` and unlinked, or `Running` with a `preferred_cpu` naming another CPU (each `Ready →
-Running` flip of `schedule()` writes `preferred_cpu` with the dispatching CPU under the thread's
+§ Cross-CPU TCB Ownership). A's outgoing-requeue guard skips a `current` another CPU owns
+(`Outgoing::owned_by_another_cpu`): one that is `Ready` and unlinked, or `Running` with a
+`preferred_cpu` naming another CPU (each `Ready → Running` flip of `schedule()` and each
+`next == current` re-mark writes `preferred_cpu` with the dispatching CPU under the thread's
 `sched_lock`, init's first dispatch by `sched::enter` on CPU 0 finds it 0 from construction, and
-nothing else writes it while the thread is `Running`). Both reads are under `current.sched_lock`,
+nothing else writes it while the thread is `Running`). A's own idle thread is the exception to the
+first: by the idle-runs-`Ready` invariant, its CPU's dispatch skips the flip, so it runs `Ready`
+and unlinked once that dispatch has dequeued it, and no other CPU dispatches it (its hard affinity
+names its CPU, and no wake or pull moves it). The guard therefore reads A's idle thread as A's own
+and requeues it, so a CPU that left its idle thread for another thread keeps it linked and counted
+in its load (scheduler.md § Load Balancing); the invariant is stated at the dispatch flip and at the
+guard, which change together. Both reads are under `current.sched_lock`,
 which the flip also holds, so the claim is authoritative. A requeue of the claimed thread would
 link it on B a second time: B then runs it while it is linked, its next park trips the
 `commit_blocked` tripwire ("parking while linked"), and in a release build B dispatches it again
@@ -647,7 +654,12 @@ Scheduling-group fields under the *client's* own `sched_lock` and aborts
 the link if a concurrent `dealloc(client)` already marked it `Exited` —
 so no `Ready`-with-no-link window is published for that path.)
 
-In each window the TCB is observably `Ready` with no queue link. A
+A running idle thread is outside the invariant altogether: it runs `Ready` and unlinked (the
+idle-runs-`Ready` invariant, "Hard-affinity wake in the voluntary-block window" under
+§ `ThreadState` Transitions), and after boot no path but its own CPU's `schedule()` writes its
+state or links it.
+
+In each window above, the TCB is observably `Ready` with no queue link. A
 racing `sys_thread_set_priority` (holding `(*tcb).sched_lock`) finds no scheduler
 claims the TCB: `relocate_ready_priority` misses on the `preferred_cpu` hint and
 the all-CPU walk fallback finds it nowhere, so it writes the new priority and

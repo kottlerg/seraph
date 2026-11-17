@@ -27,9 +27,12 @@ use crate::scan::PciDevice;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordState
 {
-    /// No driver has been started for the function; a pass may bind it.
+    /// Neither a driver devmgr started nor devmgr itself holds the
+    /// function; a pass may bind it.
     Unbound,
-    /// A driver was started for the function, which no pass binds again.
+    /// A driver was started for the function, or devmgr took it itself as a
+    /// RISC-V IOMMU unit for the IOMMU driver, whether or not that driver
+    /// starts; no pass binds it again.
     Bound,
     /// The function is gone: no pass matches the record again, and its
     /// address is free for a function that arrives there later.
@@ -114,7 +117,8 @@ impl PciRecords
             .map(|(index, (device, _))| (index, device))
     }
 
-    /// Record that a driver was started for the record at `index`. Returns
+    /// Record that the function of the record at `index` is held: a driver
+    /// was started for it, or devmgr took it as a RISC-V IOMMU unit. Returns
     /// whether it was unbound; a bound or removed record is left as it is.
     pub fn mark_bound(&mut self, index: usize) -> bool
     {

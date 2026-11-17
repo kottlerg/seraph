@@ -166,10 +166,10 @@ extension, as § Verification Record cites them.
     ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § riscv64
     Classification states both conditions).
 
-  The kernel writes `senvcfg` whole with 0 on every hart (`interrupts::set_user_controls`), so
-  `senvcfg.SSE` is clear: U-mode cannot access `ssp` and runs Zicfiss instructions as no-ops.
-  `SYS_SBI_CALL` keeps refusing the FWFT extension (`syscall/sbi.rs`), since a forwarded FWFT
-  call would reach this setting.
+  The kernel writes `senvcfg` whole with 0 on every hart
+  (`cpu::disable_unswitched_user_state`), so `senvcfg.SSE` is clear: U-mode cannot access
+  `ssp` and runs Zicfiss instructions as no-ops. `SYS_SBI_CALL` keeps refusing the FWFT
+  extension (`syscall/sbi.rs`), since a forwarded FWFT call would reach this setting.
 - **Shadow-stack memory.** Each kernel stack gets a shadow stack: one 4 KiB page per Thread,
   carved from the Thread retype slot (`sched/thread_slot.rs`), and one per idle stack and for the
   handoff stack. Its direct-map leaf becomes an SS page (`R=0`, `W=1`, `X=0`), so no ordinary

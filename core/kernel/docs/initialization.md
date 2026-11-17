@@ -396,10 +396,8 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SUM (no supervisor access to user pages)
    - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
-4. Write scounteren whole with CY alone and senvcfg whole with 0, whatever the firmware
-   left, so U-mode reads the cycle counter and no other, and has no cache-block operation,
-   pointer masking, landing pads or shadow stack (each AP writes the same in
-   interrupts::init_ap)
+4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
+   cycle counter and no other (each AP writes the same in interrupts::init_ap)
 5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
    (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
    (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least
@@ -434,9 +432,11 @@ the fatal trap a hart without V takes at the read finds its per-CPU pointer inst
 Next the BSP disables, for user mode, the state the kernel does not switch
 (`cpu::disable_unswitched_user_state`), after its per-CPU install for the same reason. RISC-V
 writes `sstateen0` with no state enabled and halts the boot by name when the write traps (no
-Ssstateen, or firmware that left `mstateen0.SE0` clear) or does not read back; each AP does the
-same at bring-up (Phase 8). x86-64 has no state-enable register: the XCR0 set of step 2 is the
-extended state ring 3 reaches, and the XSAVE switch saves all of it
+Ssstateen, or firmware that left `mstateen0.SE0` clear) or does not read back, then writes
+`senvcfg` whole with 0, so user mode has no cache-block operation, pointer masking, landing
+pads or shadow stack (a hart without `senvcfg` takes a fatal illegal-instruction trap at the
+write); each AP does the same at bring-up (Phase 8). x86-64 has no state-enable register:
+the XCR0 set of step 2 is the extended state ring 3 reaches, and the XSAVE switch saves all of it
 ([platform-requirements.md](../../../docs/platform-requirements.md) § riscv64 Classification).
 
 Within the architecture hardware path, after interrupt and per-CPU setup and before the
@@ -742,7 +742,8 @@ AP whose `vlenb` differs from the boot hart's ("a secondary hart's vlenb differs
 hart's"), one without the Vector extension, which takes a fatal illegal-instruction trap at its
 `vlenb` read, one whose `sstateen0` the kernel cannot write or that does not read back
 ("Ssstateen: sstateen0 not accessible from S-mode …" or "Ssstateen: sstateen0 kept a U-mode
-state enable set", from `cpu::disable_unswitched_user_state` in `kernel_entry_ap`), or one
+state enable set", from `cpu::disable_unswitched_user_state` in `kernel_entry_ap`), one without
+`senvcfg`, which takes a fatal illegal-instruction trap at its write there, or one
 without an ASID-tagged TLB ("RISC-V ASID-tagged TLB unsupported", from
 `paging::enable_tagged_tlb` in `kernel_entry_ap`).
 An entropy self-test FAIL (step 5) is printed and the boot continues; the

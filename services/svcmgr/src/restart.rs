@@ -400,7 +400,10 @@ pub struct RestartCtx
 /// budget + restart source). When the service ends up permanently down
 /// — restart not attempted or failed — `system_critical` alone decides
 /// whether the system can continue without it. Marks the service
-/// inactive if not restarted. `tag` is the death tag the routed post
+/// inactive if not restarted. For the log-sink service (`recipe.log_sink`)
+/// the death's lines are written only once the new instance runs, and none
+/// when no instance follows (`services/svcmgr/docs/restart-protocol.md`
+/// § Supervision hierarchy). `tag` is the death tag the routed post
 /// carried: the restarted instance's observers are bound under the same slot
 /// and the next instance, so its death routes back to the same
 /// `ServiceEntry` and a late post of this instance is dropped.
@@ -422,59 +425,109 @@ pub fn handle_death(
     registry: &mut registry::Registry,
 ) -> DeathOutcome
 {
-    std::os::seraph::log!("service died: {}", svc.name_str());
-    std::os::seraph::log!("  exit_reason={exit_reason:#018x}");
-
-    if !should_restart(svc, exit_reason)
+    // The log sink's death leaves the master log endpoint with no receiver
+    // until its next instance runs, so a line svcmgr wrote before then would
+    // wait out its bound (`LOG_CALL_TIMEOUT_MS`, shared/log) and be dropped:
+    // it would delay the respawn and reach no log. For the log-sink service,
+    // svcmgr writes this death's lines once the new instance has started and
+    // been served its bootstrap round, and none when no instance follows,
+    // since then no receiver is left to take them.
+    let lines = if matches!(recipe, Some(r) if r.log_sink)
     {
-        svc.active = false;
-        return permanent_death_outcome(svc);
+        DeathLines::Held
+    }
+    else
+    {
+        DeathLines::Written
+    };
+    if lines == DeathLines::Written
+    {
+        log_death(svc, exit_reason);
     }
 
-    std::os::seraph::log!(
-        "restarting (attempt {:#018x})",
-        u64::from(svc.restart_count.saturating_add(1))
-    );
+    if !should_restart(svc, exit_reason, lines)
+    {
+        svc.active = false;
+        return permanent_death_outcome(svc, lines);
+    }
+
+    let attempt = u64::from(svc.restart_count.saturating_add(1));
+    if lines == DeathLines::Written
+    {
+        std::os::seraph::log!("restarting (attempt {attempt:#018x})");
+    }
 
     if !restart_process(svc, ctx, tag.slot, recipe, registry)
     {
         svc.active = false;
-        return permanent_death_outcome(svc);
+        return permanent_death_outcome(svc, lines);
     }
 
     // A restart count cannot meaningfully exceed its type, so it saturates.
     svc.restart_count = svc.restart_count.saturating_add(1);
+    if lines == DeathLines::Held
+    {
+        log_death(svc, exit_reason);
+        std::os::seraph::log!("restarting (attempt {attempt:#018x})");
+    }
     std::os::seraph::log!("service restarted: {}", svc.name_str());
     DeathOutcome::Restarted
+}
+
+/// Whether [`handle_death`] writes a death's lines as it goes, or holds them
+/// until the service's next instance runs: the log-sink service's lines are
+/// held, since no logd receives until then.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeathLines
+{
+    /// Written as the handler goes.
+    Written,
+    /// Held until the next instance runs; dropped when none follows.
+    Held,
+}
+
+/// Log the death of `svc` and its exit reason.
+fn log_death(svc: &ServiceEntry, exit_reason: u64)
+{
+    std::os::seraph::log!("service died: {}", svc.name_str());
+    std::os::seraph::log!("  exit_reason={exit_reason:#018x}");
 }
 
 /// Outcome when a service is permanently down (restart not attempted,
 /// budget exhausted, or restart failed). `system_critical` alone decides
 /// whether the system can continue without it: `true` → `Unrecoverable`
 /// (caller initiates graceful shutdown); `false` → `Degraded` (continue).
-fn permanent_death_outcome(svc: &ServiceEntry) -> DeathOutcome
+/// With [`DeathLines::Held`] (the log-sink service) it writes no line.
+fn permanent_death_outcome(svc: &ServiceEntry, lines: DeathLines) -> DeathOutcome
 {
     if svc.system_critical
     {
-        std::os::seraph::log!(
-            error: "critical service unrecoverable: {}; initiating graceful shutdown",
-            svc.name_str()
-        );
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(
+                error: "critical service unrecoverable: {}; initiating graceful shutdown",
+                svc.name_str()
+            );
+        }
         DeathOutcome::Unrecoverable
     }
     else
     {
-        std::os::seraph::log!(
-            warn: "service down: {}; system continues degraded",
-            svc.name_str()
-        );
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(
+                warn: "service down: {}; system continues degraded",
+                svc.name_str()
+            );
+        }
         DeathOutcome::Degraded
     }
 }
 
 /// Determine whether a service should be restarted based on its policy and
 /// its windowed restart budget, charging the budget when it is restarted.
-fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
+/// With [`DeathLines::Held`] (the log-sink service) it writes no line.
+fn should_restart(svc: &mut ServiceEntry, exit_reason: u64, lines: DeathLines) -> bool
 {
     let restart = match svc.restart_policy
     {
@@ -485,19 +538,28 @@ fn should_restart(svc: &mut ServiceEntry, exit_reason: u64) -> bool
 
     if !restart
     {
-        std::os::seraph::log!("restart policy says no restart");
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!("restart policy says no restart");
+        }
         return false;
     }
 
     if svc.vfs_path.is_empty()
     {
-        std::os::seraph::log!(warn: "no restart source (vfs_path), cannot restart");
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(warn: "no restart source (vfs_path), cannot restart");
+        }
         return false;
     }
 
     if !svc.restart_budget.try_charge(crate::now_ns())
     {
-        std::os::seraph::log!(warn: "restart budget spent for this window");
+        if lines == DeathLines::Written
+        {
+            std::os::seraph::log!(warn: "restart budget spent for this window");
+        }
         return false;
     }
 

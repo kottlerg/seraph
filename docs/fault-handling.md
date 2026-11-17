@@ -845,12 +845,12 @@ format, the contract the host-side symbolizer reads, in
   `USERSPACE FAULT` lines are its only report. Any process may declare itself so; the declaration
   affects the declarer alone and is one-way. Before either driver declares, at its startup, a fault
   of it reaches the crash service, which declines it once its bound passes. The maintainer decided
-  that logd does not declare: the service's log calls to it are bounded
+  that logd does not declare itself undebuggable: the service's log calls to it are bounded
   ([Console Model](console-model.md)), so a fault of logd reaches the crash service, whose report
-  the receive workers logd has left serve, and logd's supervisor restarts it once the service
-  declines the fault ([Supervision](supervision.md)). A process
-  created `CREATE_PINNED`, or whose pager binding failed, has no virtual-memory handler: its page
-  faults, which no pager forwards, kill it unreported.
+  the receive workers logd has left serve, and which writes no core of logd (below), and logd's
+  supervisor restarts it once the service declines the fault ([Supervision](supervision.md)). A
+  process created `CREATE_PINNED`, or whose pager binding failed, has no virtual-memory handler: its
+  page faults, which no pager forwards, kill it unreported.
 - **Debuggers.** A debugger binds a thread's exception class over the crash endpoint
   ([Debugging](#debugging)); the crash service then sees none of that thread's faults. An unbind
   leaves the class unbound, not bound to the crash endpoint again; procmgr binds it back on the
@@ -864,8 +864,9 @@ names none), it stops the process's other threads, reads their registers and ext
 the mapped pages, and writes an ELF core that host `gdb` reads to `/crash` on the root
 filesystem, under a bound of its own and within a per-core and a directory byte budget, the oldest
 core deleted first ([crashd Operation § Core Dump](../services/crashd/docs/operation.md#core-dump),
-[Core Format](../services/crashd/docs/core-format.md)). A process on the path a core is written
-through, vfsd, the FAT driver, the block driver, devmgr and the IOMMU driver, declares itself so to
+[Core Format](../services/crashd/docs/core-format.md)). A process a dump waits on, vfsd, the FAT
+driver, the block driver, devmgr and the IOMMU driver, through which the core is written, and logd,
+which the dump's outcome line and every process's log output wait on, declares itself so to
 procmgr at startup (`DECLARE_NO_CORE`), and the crash service writes no core of it, so a dump
 never waits on the process that died. A policy that holds a crashed process stopped for a
 debugger to rebind is design intent; not yet implemented.

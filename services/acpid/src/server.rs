@@ -22,6 +22,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use acpid::events::{self, Fired, Handled, Handler, Layout, Start};
 use acpid::power::{self, Request};
@@ -30,6 +31,13 @@ use ipc::{IpcMessage, acpid_errors, acpid_labels};
 
 use crate::arch::current::{Events, Ports, Power};
 use crate::platform::Platform;
+
+/// How long a sleep keeps the events quiesced after its `PM1a_CNT` writes
+/// return before it takes the platform to be still running and arms them
+/// again: ACPICA's wait before it takes an S4 or S5 write as not taken. A
+/// platform entering the state stops well within it, with only its wake
+/// events enabled.
+const SLEEP_GRACE: Duration = Duration::from_secs(10);
 
 /// The receiver threads on acpid's endpoint (`docs/limits.md`): one can
 /// hold a `WAIT_EVENT` while the other serves `SLEEP` and `RESET`.
@@ -550,9 +558,9 @@ type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
 
 /// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
 /// events `armed`, [`events::quiesce`], then the `PM1a_CNT` writes. When
-/// the writes return, the platform still running, the events are armed
-/// again and what latched is handed on. The reply status when the platform
-/// keeps running.
+/// the writes return, the events stay quiesced for [`SLEEP_GRACE`]; when the
+/// platform still runs then, they are armed again and what latched is handed
+/// on. The reply status when the platform keeps running.
 fn sleep(
     state: u8,
     ns: Option<&mut Namespace>,
@@ -598,8 +606,15 @@ fn sleep(
     let entered = power.sleep(state, slp_typ);
     if let Some((armed, mailbox, work)) = armed
     {
+        if entered
+        {
+            std::thread::sleep(SLEEP_GRACE);
+            std::os::seraph::log!(
+                warn: "SLEEP({state}): still running {} s after the writes; events armed again",
+                SLEEP_GRACE.as_secs()
+            );
+        }
         let fired = events::arm(&mut *lock(&armed.regs), &armed.layout, &armed.handled);
-        std::os::seraph::log!(warn: "SLEEP({state}) returned; events armed again");
         deliver(&fired, mailbox, work);
     }
     if entered

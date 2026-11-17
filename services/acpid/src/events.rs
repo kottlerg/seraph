@@ -17,6 +17,9 @@
 //! ([`rearm_power_button`]). Because a status bit is cleared only once
 //! its event is handled, an event that a dead acpid had not handled is
 //! still set when the restarted acpid runs [`arm`], which dispatches it.
+//! A sleep ([`quiesce`]) and an acpid that cannot take the SCI ([`clear`])
+//! are the exceptions: they clear every status, so an event taken but not
+//! yet handled before either is handled only by the acpid that took it.
 //!
 //! The registers are reached through [`Registers`], which the binary
 //! implements with port I/O and the tests with a simulated register file.
@@ -304,8 +307,12 @@ pub fn clear(regs: &mut impl Registers, layout: &Layout)
 /// § 16.1.6): disable every GPE and every fixed event but the power button,
 /// S5's wake event, whose enable is left as it reads, then clear every
 /// status, `WAK_STS` among them, so that no event acpid armed stays a wake
-/// source. acpid enables no GPE for wake: it evaluates no `_PRW`. [`arm`]
-/// enables the events again when the platform keeps running.
+/// source. acpid enables no GPE for wake: it evaluates no `_PRW`. The
+/// status of an event acpid took and has not yet handled (a press not yet
+/// delivered, a GPE whose method has not run) is cleared too: the
+/// specification leaves no status set on entry, and the event stays queued
+/// in acpid, though a restart no longer finds it latched. [`arm`] enables
+/// the events again when the platform keeps running.
 pub fn quiesce(regs: &mut impl Registers, layout: &Layout)
 {
     disable_and_clear(regs, layout, PWRBTN);

@@ -333,7 +333,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
-   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE
+   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE,
+   CR4.TSD and CR4.PCE, so ring 3 reads the timestamp counter and no performance counter
+   (each AP repeats this step in interrupts::init_ap)
 2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
 3. Construct and install the permanent GDT and the BSP's TSS (the segment descriptors are
    loaded since Phase 1; this fills the TSS descriptor and loads the table again with it):
@@ -387,7 +389,8 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SUM (no supervisor access to user pages)
    - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
-4. Grant U-mode the cycle counter (scounteren.CY)
+4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
+   cycle counter and no other (each AP writes the same in interrupts::init_ap)
 5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
    (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
    (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least

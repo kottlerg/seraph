@@ -4,8 +4,8 @@
 // core/kernel/src/arch/x86_64/cpu.rs
 
 //! x86-64 CPU control primitives: CPUID and the core key it gives, CR4 and MSR
-//! access, the fault-recoverable user-copy routine, SMEP/SMAP and PCID
-//! enablement, the boot-time baseline feature gate, per-CPU GS-base install and
+//! access, the fault-recoverable user-copy routine, SMEP/SMAP enablement and
+//! the other ring-3 controls of CR4, PCID enablement, the boot-time baseline feature gate, per-CPU GS-base install and
 //! lookup, the kernel trap stack, interrupt control and halt, the fence ahead of
 //! an x2APIC MSR write, and the debug-build kernel-entry RFLAGS check.
 //!
@@ -360,10 +360,24 @@ const CR4_FSGSBASE: u64 = 1 << 16;
 /// `SLDT`, `SMSW`, and `STR` at CPL > 0 with `#GP`.
 const CR4_UMIP: u64 = 1 << 11;
 
+/// `CR4.TSD` (bit 2): faults `RDTSC` and `RDTSCP` at CPL > 0 with `#GP`.
+const CR4_TSD: u64 = 1 << 2;
+
+/// `CR4.PCE` (bit 8): lets `RDPMC` execute at CPL > 0.
+const CR4_PCE: u64 = 1 << 8;
+
 /// Enable Supervisor Mode Execution Prevention (SMEP) and Supervisor Mode
 /// Access Prevention (SMAP) by setting CR4 bits 20 and 21, set `CR4.UMIP`
-/// where the CPU has it, and clear `CR4.FSGSBASE`, which firmware may have left
-/// set.
+/// where the CPU has it, and clear `CR4.FSGSBASE`, `CR4.TSD` and `CR4.PCE`,
+/// which firmware may have left set.
+///
+/// The BSP runs on the CR4 the firmware left and each AP on the trampoline's,
+/// so this step sets or clears each of these bits explicitly, and every CPU
+/// ends with the same ones. With TSD and PCE clear, ring 3 reads the timestamp
+/// counter (`RDTSC`, `RDTSCP`) and no performance counter (`RDPMC` raises
+/// `#GP`), the counter set
+/// [capability-model.md](../../../../../docs/capability-model.md)
+/// § Microarchitectural Isolation states.
 ///
 /// With FSGSBASE off, ring 3 can change its GS base only by loading a GDT
 /// selector, whose base is 0, so a user GS base is never a kernel-half address;
@@ -384,8 +398,8 @@ const CR4_UMIP: u64 = 1 << 11;
 ///
 /// # Safety
 /// Must execute at ring 0. The IDT need not be loaded: CPUID gates every bit
-/// this sets and `CR4.FSGSBASE` is only cleared, so the CR4 write cannot fault,
-/// and the BSP calls this before `idt::init`.
+/// this sets and `CR4.FSGSBASE`, `CR4.TSD` and `CR4.PCE` are only cleared, so
+/// the CR4 write cannot fault, and the BSP calls this before `idt::init`.
 #[cfg(not(test))]
 #[expect(
     clippy::similar_names,
@@ -407,7 +421,7 @@ pub unsafe fn enable_smep_smap()
         crate::fatal("SMAP not supported by CPU — required");
     }
     // Bit 20 = SMEP, bit 21 = SMAP.
-    let mut cr4 = (read_cr4() & !CR4_FSGSBASE) | (1 << 20) | (1 << 21);
+    let mut cr4 = (read_cr4() & !(CR4_FSGSBASE | CR4_TSD | CR4_PCE)) | (1 << 20) | (1 << 21);
     if umip_present
     {
         cr4 |= CR4_UMIP;

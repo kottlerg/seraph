@@ -88,15 +88,12 @@ scaling, and DRAM rows. The system draws the line as follows.
   reports the class as vulnerable, with the reason.
 - **User-to-user isolation** — not provided. The kernel issues no branch-predictor barrier on a
   context switch, does not schedule SMT siblings by trust, partitions no cache, and gates no
-  counter by process. On riscv64 it sets `scounteren.CY`, so U-mode reads the cycle counter, and
-  leaves every other `scounteren` bit as the firmware set it, so U-mode also reads each counter
-  whose bit the firmware set (`TM`, for the `time` counter, for example). On x86-64 it never
-  sets `CR4.TSD` or `CR4.PCE`: each AP starts with both clear, and the boot CPU keeps the
-  firmware's values, so ring 3 reads the timestamp counter unless the firmware set `CR4.TSD`, and
-  reads the performance counters only where the firmware set `CR4.PCE`. Setting these controls
-  on every CPU from the kernel alone, whatever the firmware left, is design intent, not yet
-  implemented ([#1118](https://github.com/kottlerg/seraph/issues/1118)). Capability-mediated
-  performance-counter access is design intent, not yet implemented
+  counter by process. It sets the user-mode counter controls on every CPU itself, whatever the
+  firmware left, so every CPU grants the same counters. On riscv64 it writes `scounteren` whole
+  with `CY` alone: U-mode reads the cycle counter, and a U-mode read of `time`, `instret` or
+  an `hpmcounter` raises an illegal-instruction exception. On x86-64 it clears `CR4.TSD` and
+  `CR4.PCE`: ring 3 reads the timestamp counter (`RDTSC`, `RDTSCP`), and `RDPMC` raises `#GP`
+  there. Capability-mediated performance-counter access is design intent, not yet implemented
   ([#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the gating of the
   counters, need security domains
   ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only

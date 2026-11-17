@@ -458,8 +458,9 @@ fn serve_extent_rounds(
 
 /// The boot modules init uses itself or hands to the service it starts them
 /// through, never forwarded to devmgr: the bootstrap services, the root
-/// filesystem driver, and init's log-level configuration.
-const BOOTSTRAP_MODULES: [&[u8]; 7] = [
+/// filesystem driver, init's log-level configuration, and the trust store,
+/// which procmgr alone receives.
+const BOOTSTRAP_MODULES: [&[u8]; 8] = [
     b"init",
     b"procmgr",
     b"memmgr",
@@ -467,6 +468,7 @@ const BOOTSTRAP_MODULES: [&[u8]; 7] = [
     b"vfsd",
     b"fatfs",
     crate::log_levels::MODULE_NAME,
+    boot_protocol::TRUST_STORE_MODULE,
 ];
 
 /// Module caps one `kind::MODULE` round carries (`MSG_CAP_SLOTS_MAX`).

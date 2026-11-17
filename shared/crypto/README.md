@@ -13,9 +13,10 @@ Its dependents are ktest, which runs the known-answer tests on target, and
 certificate and trust-store codec and the verifier of the per-binary signing
 chain of trust ([docs/signing.md](../../docs/signing.md)) on `ed25519_verify`
 and `sha512`. xtask uses `ed25519_sign` for its key management and signing
-([xtask/README.md](../../xtask/README.md) § Signing). The rest of that chain, the loaders'
-verification, is design intent, not yet implemented
-([#124](https://github.com/kottlerg/seraph/issues/124)).
+([xtask/README.md](../../xtask/README.md) § Signing), and enables the `sign` feature; core/boot
+enables it as a dev-dependency only, since its host tests sign fixtures. The bootloader verifies the
+kernel and every bundle entry through `objsig`; procmgr's verification of the images it creates is
+design intent, not yet implemented ([#124](https://github.com/kottlerg/seraph/issues/124)).
 
 ---
 

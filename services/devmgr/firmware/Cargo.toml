@@ -18,6 +18,9 @@ virtio-core = { path = "../../drivers/virtio/core" }
 driver-binding = { path = "../../../shared/driver-binding" }
 # The `DMA_MAP` access bits the DMA table checks.
 ipc = { path = "../../../shared/ipc" }
+# `split`: a platform description table's boot module is a signed object,
+# whose body is the table.
+objsig = { path = "../../../shared/objsig" }
 # The line grammar of the platform description table, shared with svcmgr's
 # `.svc` and class file parsers.
 svc-grammar = { path = "../../../shared/svc-grammar" }

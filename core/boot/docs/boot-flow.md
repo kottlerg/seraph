@@ -33,6 +33,15 @@ handle, and GOP handles are enumerated with `BootServices->LocateHandleBuffer` a
 with `HandleProtocol`. Failure to locate either of the first two is fatal; an absent GOP
 is not.
 
+After step 1 the bootloader parses the trust store its build embedded
+([docs/signing.md](../../../docs/signing.md) § Trust Store), against which steps 3 and 4
+verify every object they load, and logs each anchor's label and key id, an anchor marked
+`LOCAL` as locally generated, and the store's security floor. The verifier holds each
+certificate whose signature verifies for the rest of the boot, so the certificate every object
+of one signing key carries is verified once ([docs/signing.md](../../../docs/signing.md)
+§ Verification). A store that does not parse
+is fatal (`BootError::TrustStore`).
+
 Detail: [uefi-environment.md](uefi-environment.md)
 
 ### Step 2: Load Bootstrap Bundle
@@ -58,8 +67,11 @@ Detail: [uefi-environment.md](uefi-environment.md)
 
 ### Step 3: Load Kernel ELF
 
-The kernel ELF is loaded from the hardcoded path `\EFI\seraph\kernel`.
-The ELF header is validated, the LOAD segments are placed in a single
+The kernel is read whole from the hardcoded path `\EFI\seraph\kernel` into one
+allocation and verified against the trust store as the kernel named `kernel`
+([docs/signing.md](../../../docs/signing.md) § Verifier Discipline); a refusal is fatal
+(`BootError::SignatureRefused`, naming the object). Only the body the verifier returns is
+parsed: its ELF header is validated, the LOAD segments are placed in a single
 contiguous span allocated at a firmware-chosen physical base (any free base on
 RISC-V; wholly below 4 GiB on x86-64, where the AP trampoline loads the kernel's
 root page table, which sits in the image's BSS, with a 32-bit move), and the
@@ -79,13 +91,17 @@ Detail: [elf-loading.md](elf-loading.md)
 
 ### Step 4: Parse Bundle (Init ELF + Boot Modules)
 
-The bootloader walks the bundle header from step 2 and produces both
-[`InitImage`](../../../abi/boot-protocol/src/lib.rs) and the
-`BootModule[]` array in one pass.
+The bootloader walks the bundle header from step 2 twice. The first walk verifies every
+entry against the trust store under its entry name, `init` as init and every other entry
+as a boot module ([docs/signing.md](../../../docs/signing.md) § Which Stage Verifies What),
+before any entry is parsed or exposed; a refusal is fatal (`BootError::SignatureRefused`,
+naming the entry), and so is an entry named `trust-store` (`BootError::InvalidBundle`), a
+name the bootloader reserves. The second walk produces both
+[`InitImage`](../../../abi/boot-protocol/src/lib.rs) and the `BootModule[]` array.
 
 **Init** is the bundle entry whose name (NUL-trimmed) equals
-`bundle::INIT_ENTRY_NAME` (`"init"`). Its body bytes — a slice of the
-bundle allocation — receive full ELF treatment: header validation, W^X
+`bundle::INIT_ENTRY_NAME` (`"init"`). The body the verifier returned — a slice of the
+bundle allocation, its trailer excluded — receives full ELF treatment: header validation, W^X
 check, and per-segment loading. Each `PT_LOAD` segment is allocated at
 any available physical address via `AllocateAnyPages`, zeroed whole (the
 segment's Memory cap reaches userspace at init's reap, slack pages included),
@@ -93,21 +109,24 @@ and file data copied in. The resulting `InitImage` is stored in
 `BootInfo.init_image`. Exactly one bundle entry MUST carry this name;
 zero or two is `BootError::InvalidBundle`.
 
-**Boot modules** are every *other* bundle entry. For each one the
-bootloader synthesises a
-`BootModule { name, physical_base: bundle_phys + entry.offset, size }`
-record directly — there is no per-module allocation or copy because the
-bundle bodies are already 4096-byte aligned within the bundle allocation.
-The bootloader does not inspect module content; what each module does
-and in what order init spawns them is init's concern
-([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)). Typical
-modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer,
-fatfs, and iommu-vtd on x86-64 or iommu-riscv on riscv64, and the text platform description
-tables of the architecture's machines (`platform-qemu-virt` on riscv64) that devmgr reads (the
-authoritative lists are `xtask/src/bundle.rs::MODULES`, `ARCH_MODULES` and `ARCH_TABLES`).
+**Boot modules** are every *other* bundle entry. For each one the bootloader synthesises a
+`BootModule { name, physical_base: bundle_phys + entry.offset, size }` record directly, `size` being
+the whole signed object, its trailer included — there is no per-module allocation or copy because
+the bundle bodies are already 4096-byte aligned within the bundle allocation. At most
+`MAX_BOOT_MODULES - 1` entries are modules; a larger bundle fails here by name. Past its signature,
+the bootloader does not inspect module content; what each module does and in what order init spawns
+them is init's concern ([elf-loading.md § Boot Module Loading](elf-loading.md#boot-module-loading)).
+Typical modules: procmgr, memmgr, devmgr, vfsd, virtio-blk, serial, framebuffer, fatfs, and
+iommu-vtd on x86-64 or iommu-riscv on riscv64, and the text platform description tables of the
+architecture's machines (`platform-qemu-virt` on riscv64) that devmgr reads (the authoritative lists
+are `xtask/src/bundle.rs::MODULES`, `ARCH_MODULES` and `ARCH_TABLES`).
 
-Only the whole bundle allocation is identity-mapped; module bodies are
-slices of it (see step 6).
+Last, the bootloader copies the trust store into a page allocation of its own, the slack
+after it zeroed, and describes it as the boot module `trust-store` (`TRUST_STORE_MODULE`),
+which step 9 lists after the bundle's modules (docs/signing.md § Trust Store).
+
+Step 6 identity-maps the whole bundle allocation, of which the bundle's module bodies are
+slices, and the `trust-store` module's own pages.
 
 Detail: [elf-loading.md](elf-loading.md)
 
@@ -277,7 +296,7 @@ Pointer and resource-address fields hold physical addresses; `init_image` carrie
 unbiased link virtual addresses, and the only kernel virtual addresses are the
 KASLR-biased `kernel_virtual_base` and `direct_map_base`, which the kernel scrubs from
 this donated page after consuming them. The `version` field is set to
-`BOOT_PROTOCOL_VERSION` (currently `21`). Fields are populated as follows:
+`BOOT_PROTOCOL_VERSION` (currently `22`). Fields are populated as follows:
 
 | Field | Source |
 |---|---|
@@ -287,7 +306,7 @@ this donated page after consuming them. The `version` field is set to
 | `kernel_virtual_base` | KASLR-biased kernel image virtual base (link base + slide from step 5d) |
 | `kernel_size` | Total span of kernel ELF LOAD segments from step 3 |
 | `init_image` | Pre-parsed init ELF segments and entry point from step 4 |
-| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4, at most `MAX_BOOT_MODULES` (85, the entries one page holds; a larger bundle fails step 4 by name); empty (null `entries`, zero `count`) if none |
+| `modules` | Name, physical base, and size of each non-`init` bundle entry from step 4, at most `MAX_BOOT_MODULES - 1` (`MAX_BOOT_MODULES` is 85, the entries one page holds; a larger bundle fails step 4 by name), then the `trust-store` module step 4 allocated; never empty |
 | `framebuffer` | GOP framebuffer from step 1 (zeroed if GOP is absent) |
 | `acpi_rsdp` | Physical address of ACPI RSDP from step 5; zero if GUID absent |
 | `device_tree` | Physical address of DTB from step 5; zero if GUID absent |
@@ -297,7 +316,7 @@ this donated page after consuming them. The `version` field is set to
 | `bsp_id` | APIC ID of the BSP (x86-64) or boot hart ID from `EFI_RISCV_BOOT_PROTOCOL` (RISC-V) |
 | `cpu_ids` | Physical address of the per-CPU hardware identifiers, `cpu_count` `u32`s in pages of their own allocated in step 5; `cpu_ids[0] == bsp_id` |
 | `ap_trampoline_page` | 4 KiB physical frame for AP startup code. x86-64: below 1 MiB (SIPI vector constraint). RISC-V: any 4 KiB page (SBI HSM has no placement constraint). Zero if allocation failed; the kernel then halts at Phase 8 when more than one CPU is listed ([initialization.md § Phase 8](../../kernel/docs/initialization.md)). |
-| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the named and heuristic aperture-seed buffers, the reclaim-array page itself, the AP trampoline page), the CPU-id pages from step 5, the raw UEFI memory-map buffer from step 7 (zeroed after its last read here), `page_table.reclaim_spans()` (the bootloader's page-table frame pool as one range, and on x86-64 the LA57 toggle page when one is installed), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps`, which `cap::init_capability_system` calls in Phase 7 after `populate_cspace` returns ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)). |
+| `reclaim_ranges` | `ReclaimSlice` over a dedicated 4 KiB scratch page recording bootloader pages the kernel reclaims into the cap surface. Populated from `BootAllocations` (`BootInfo` page, module descriptor array, memory-map entry array, MMIO aperture array, the named and heuristic aperture-seed buffers, the reclaim-array page itself, the AP trampoline page), the CPU-id pages from step 5, the raw UEFI memory-map buffer from step 7 (zeroed after its last read here), `page_table.reclaim_spans()` (the bootloader's page-table frame pool as one range, and on x86-64 the LA57 toggle page when one is installed), and per-gap carve-outs over the bundle allocation — the header + entry table + leading pad, the init ELF source body (no longer needed after `load_init` copied segments out), and any inter-module or trailing slack pages. Module bodies, and the `trust-store` module's pages outside the bundle, are skipped here because `cap::mint_module_memory_caps` already mints Memory caps over them; pushing them again would double-register pages in the buddy ledger. Each `ReclaimRange` carries a `flags: u32`; bit 0 (`RECLAIM_FLAG_LATE`) marks the AP trampoline entry so the kernel defers minting it until the post-SMP-bringup late-reclaim pass. All other entries are minted by `cap::mint_reclaim_memory_caps`, which `cap::init_capability_system` calls in Phase 7 after `populate_cspace` returns ([initialization.md § Phase 7](../../kernel/docs/initialization.md#phase-7-capability-system)). |
 | `boot_entropy_seed` | Conditioned entropy seed for the pool, drawn from `EFI_RNG_PROTOCOL` (or a DTB `/chosen/rng-seed` fallback) in step 5c; valid for `boot_entropy_len` bytes, remainder zero. Absorbed into the kernel entropy pool at Phase 5 ([entropy.md](../../kernel/docs/entropy.md)). The separate KASLR entropy words never appear in `BootInfo`. |
 | `boot_entropy_len` | Valid leading byte count of `boot_entropy_seed`; zero when neither source yields a seed, in which case the kernel seeds from its remaining sources. |
 | `vmgenid_paddr` | Physical address of the 16-byte ACPI VMGENID GUID (QEMU VMGENID SSDT scan in step 9, run wherever an RSDP is present; only x86-64 QEMU wires the device today; see [firmware-parsing.md](firmware-parsing.md)); zero when absent. |

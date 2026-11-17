@@ -255,7 +255,8 @@ pub(crate) unsafe fn find_acpi_table<'a>(rsdp_addr: u64, sig: [u8; 4]) -> Option
 // `ADDR` method adds the offset at evaluation time, so a no-AML consumer must
 // add it itself. Discovery here is QEMU-specific by design: the
 // Microsoft-spec generic path requires evaluating `ADDR`, and the bootloader
-// has no AML interpreter (see the `_CRS` note in `parse_aperture_seed`).
+// needs the value before acpid, the userspace service that evaluates AML,
+// runs (services/acpid/README.md; see the `_CRS` note in `parse_aperture_seed`).
 
 /// AML byte pattern for QEMU's VGIA named object: `NameOp`, bare `NameSeg`
 /// `"VGIA"`, `DWordPrefix`. The patched u32 (little-endian) follows.
@@ -1003,7 +1004,8 @@ unsafe fn walk_aperture_seed(
                     push!(ecam_base, ecam_size);
                     // PCI BAR windows. Real hardware advertises these
                     // through the host bridge's `_CRS`, which the
-                    // bootloader does not evaluate (no AML interpreter).
+                    // bootloader does not evaluate (it runs before acpid,
+                    // the AML-evaluating service; services/acpid/README.md).
                     // We seed via an ECAM-base heuristic:
                     //   ECAM < 2 GiB ⇒ QEMU virt (RISC-V): 32-bit window
                     //     `[1 GiB, 2 GiB)`, fixed by QEMU; 64-bit window

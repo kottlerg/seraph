@@ -166,7 +166,8 @@ RAM-class memory-map region
 
 The bootloader's firmware parsing is deliberately narrow. It does not:
 
-- Evaluate ACPI AML bytecode (DSDT, SSDT method evaluation).
+- Evaluate ACPI AML bytecode (DSDT, SSDT method evaluation); acpid, a userspace service, does
+  ([services/acpid/README.md](../../../services/acpid/README.md)).
 - Walk the ACPI namespace to resolve `_CRS`, `_HID`, or device
   dependencies.
 - Parse DTB `interrupt-map` properties or complex `ranges` translations
@@ -178,7 +179,7 @@ The bootloader's firmware parsing is deliberately narrow. It does not:
   programming are devmgr's.
 - Produce per-device capabilities of any kind.
 
-All of these are `devmgr`'s responsibility. The bootloader produces the
+All of these but AML evaluation are `devmgr`'s responsibility. The bootloader produces the
 minimum set of coarse descriptors the kernel needs to mint initial
 capabilities; per-device assignment is a userspace concern re-derived
 from the ACPI/DTB passthrough addresses in `BootInfo` (see

@@ -25,6 +25,7 @@ members = [
     "services/logd",
     "services/logd/codec",
     "services/pwrmgr",
+    "services/acpid",
     "services/pwrmgr/acpi",
     "services/timed",
     "services/vfsd",

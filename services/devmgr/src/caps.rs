@@ -124,10 +124,17 @@ pub struct DevmgrCaps
 
     /// The `Mmio` cap of every scanned ECAM window, kept apart from the
     /// apertures so no BAR carve can reach configuration space: devmgr
-    /// carves from it the configuration page of each `VirtIO` function it
-    /// spawns a driver for, through which it clears the function's Bus
-    /// Master Enable when it withdraws the driver.
+    /// carves from it the configuration page of each function it binds,
+    /// through which it clears the function's Bus Master Enable when it
+    /// withdraws the driver, and of each function acpid accesses
+    /// ([`Self::config_pages`]).
     pub config_space: SpanTable<u64>,
+
+    /// The configuration page of each function devmgr has carved one for,
+    /// by its address (segment, bus, device, function), kept for the boot:
+    /// a bind and acpid's accesses are each given a derivation
+    /// (`crate::bind::carve_function_config`).
+    pub config_pages: Vec<((u16, u8, u8, u8), u64)>,
 
     /// The ECAM windows `config_space` holds, to locate a function's
     /// configuration page (`firmware::pci::function_config_phys`).
@@ -184,6 +191,7 @@ impl DevmgrCaps
             firmware: std::sync::Arc::new(Firmware::new(info.self_aspace)),
             apertures: SpanTable::new(),
             config_space: SpanTable::new(),
+            config_pages: Vec::new(),
             ecam_windows: Vec::new(),
             pooled: Some(Vec::new()),
             procmgr_ep: info.procmgr_endpoint,

@@ -33,7 +33,9 @@ discovery.
 The bootloader does **not** evaluate AML. It reads static table fields
 only; ACPI namespace evaluation, `_CRS`/`_HID`/`_PRT` resolution, device
 binding, and IOMMU-topology discovery are userspace concerns; see
-[firmware-parsing.md](firmware-parsing.md) §"Parsing Depth".
+[firmware-parsing.md](firmware-parsing.md) §"Parsing Depth". AML runs in acpid, a userspace
+service that starts after the kernel has taken what it needs from the tables
+([services/acpid/README.md](../../../services/acpid/README.md)).
 
 ---
 

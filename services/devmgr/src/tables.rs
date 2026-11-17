@@ -176,11 +176,25 @@ fn read_xsdt_entries(firmware: &Firmware, xsdt_phys: u64) -> Option<Vec<u64>>
 /// ECAM discovery, so there is one XSDT walk in the whole system.
 pub fn locate_table_by_sig(firmware: &Firmware, sig: [u8; 4]) -> Option<u64>
 {
+    locate_nth_table_by_sig(firmware, sig, 0)
+}
+
+/// Locate the `index`th ACPI table (from 0) the XSDT lists with signature
+/// `sig`, in XSDT order. Returns the table's physical address.
+fn locate_nth_table_by_sig(firmware: &Firmware, sig: [u8; 4], index: usize) -> Option<u64>
+{
     let xsdt_phys = read_xsdt_phys(firmware)?;
     let entries = read_xsdt_entries(firmware, xsdt_phys)?;
     entries
         .into_iter()
-        .find(|&tbl_phys| read_table_sig(firmware, tbl_phys) == Some(sig))
+        .filter(|&tbl_phys| read_table_sig(firmware, tbl_phys) == Some(sig))
+        .nth(index)
+}
+
+/// Whether one of the ACPI regions devmgr holds covers `phys`.
+pub fn acpi_region_holds(firmware: &Firmware, phys: u64) -> bool
+{
+    find_region_for(firmware, phys).is_some()
 }
 
 /// The ACPI tables the platform enumerators read
@@ -255,12 +269,17 @@ pub fn platform_tables(firmware: &Firmware) -> PlatformTables
 
 /// Resolve an ACPI-table request to `(region, table_phys)`, per the
 /// `QUERY_ACPI_TABLE` contract: a zero `sig_word` looks `phys` up directly
-/// (e.g. the DSDT, whose address the caller read from the FADT); otherwise
-/// `sig_word` is a 4-byte signature found via the XSDT. Returns `None` when
-/// both are zero, `sig_word` has bits above its low 32, or the table is not
-/// found.
-pub fn locate_acpi_table(firmware: &Firmware, sig_word: u64, phys: u64)
--> Option<(AcpiRegion, u64)>
+/// (e.g. the DSDT, whose address the caller read from the FADT); `DSDT`
+/// names the DSDT the FADT points to, at `index` 0 alone; any other
+/// `sig_word` is a 4-byte signature whose `index`th table is found via the
+/// XSDT. Returns `None` when both are zero, `sig_word` has bits above its
+/// low 32, or the table is not found.
+pub fn locate_acpi_table(
+    firmware: &Firmware,
+    sig_word: u64,
+    phys: u64,
+    index: u64,
+) -> Option<(AcpiRegion, u64)>
 {
     let table_phys = if sig_word == 0
     {
@@ -273,7 +292,20 @@ pub fn locate_acpi_table(firmware: &Firmware, sig_word: u64, phys: u64)
     else
     {
         let sig = u32::try_from(sig_word).ok()?.to_le_bytes();
-        locate_table_by_sig(firmware, sig)?
+        let index = usize::try_from(index).ok()?;
+        if sig == *b"DSDT"
+        {
+            if index != 0
+            {
+                return None;
+            }
+            let fadt = locate_table_by_sig(firmware, *b"FACP")?;
+            with_acpi_table(firmware, fadt, firmware::acpi::fadt_dsdt_phys)?
+        }
+        else
+        {
+            locate_nth_table_by_sig(firmware, sig, index)?
+        }
     };
     let region = find_region_for(firmware, table_phys)?;
     Some((region, table_phys))

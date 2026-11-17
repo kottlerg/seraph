@@ -29,7 +29,9 @@
 //! their resource templates (`aml`), parses the SPCR and the platform
 //! description table of devices no firmware table lists (`platform`), and
 //! keeps the PCI device records, each one's state and the `INTx` pin and
-//! device number its interrupt reaches the root bus with (`pci_records`). The
+//! device number its interrupt reaches the root bus with (`pci_records`), and
+//! holds devmgr's side of acpid: the operation-region policy, the
+//! configuration-access rules and the per-bridge results it keeps (`acpid`). The
 //! functions read caller-mapped byte slices or values, or reach the platform
 //! only through a caller-supplied accessor or split operation, and touch no
 //! syscall, IPC, or `std::os::seraph` surface, so the crate is host-reachable
@@ -40,6 +42,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod acpi;
+pub mod acpid;
 pub mod aml;
 pub mod binding;
 mod bytes;

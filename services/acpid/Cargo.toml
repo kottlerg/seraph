@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "acpid"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# Host-testable start-up evaluation: the initialization walk and the host
+# bridges' _OSC, _CRS and _PRT (bins are test = false).
+[lib]
+name = "acpid"
+path = "src/lib.rs"
+
+[[bin]]
+name = "acpid"
+path = "src/main.rs"
+test = false
+
+[dependencies]
+# The AML interpreter acpid runs the firmware's tables on.
+aml = { path = "../../shared/aml" }
+# devmgr's labels and the window and route encodings the pushes carry.
+ipc = { path = "../../shared/ipc" }
+
+# The binary alone uses these, and it builds for the Seraph targets only, so the
+# host-tested library does not pull them into a host build.
+[target.'cfg(target_os = "seraph")'.dependencies]
+# The barrier that orders the firmware's register writes to mapped memory.
+mmio = { path = "../../shared/mmio" }
+syscall = { path = "../../shared/syscall" }
+syscall-abi = { path = "../../abi/syscall" }
+
+[lints]
+workspace = true

@@ -278,10 +278,11 @@ own grants lack the right.
 | data[1] | The max the budget node took, in pages, after the clamp; `u64::MAX` for none |
 | cap[0] | Badged SEND cap on memmgr's endpoint, identifying the new process |
 
-The badge is also encoded in the returned cap, but userspace currently
-has no syscall to read a cap's badge, so memmgr returns it explicitly
-in `data[0]` for procmgr to record alongside the cap and forward in
-the eventual `PROCESS_DIED`.
+The badge is also encoded in the returned cap, but only memmgr, which
+holds Receive on its endpoint, can read the badge of a cap on it
+(`SYS_ENDPOINT_BADGE`), so memmgr returns it explicitly in `data[0]`
+for procmgr to record alongside the cap and forward in the eventual
+`PROCESS_DIED`.
 
 **Reply (error):**
 

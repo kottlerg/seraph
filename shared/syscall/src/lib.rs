@@ -48,7 +48,8 @@ use syscall_abi::{
     SYS_ASPACE_QUERY, SYS_CAP_COPY, SYS_CAP_CREATE_ASPACE, SYS_CAP_CREATE_CSPACE,
     SYS_CAP_CREATE_ENDPOINT, SYS_CAP_CREATE_EVENT_Q, SYS_CAP_CREATE_NOTIFICATION,
     SYS_CAP_CREATE_THREAD, SYS_CAP_CREATE_WAIT_SET, SYS_CAP_DELETE, SYS_CAP_DERIVE,
-    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENTROPY_CONTRIBUTE,
+    SYS_CAP_DERIVE_BADGE, SYS_CAP_INFO, SYS_CAP_MOVE, SYS_CAP_REVOKE, SYS_ENDPOINT_BADGE,
+    SYS_ENTROPY_CONTRIBUTE,
     SYS_EVENT_POST, SYS_EVENT_RECV, SYS_GETRANDOM, SYS_IOPORT_BIND, SYS_IOPORT_SPLIT,
     SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK, SYS_IRQ_MSG_ALLOC,
     SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP, SYS_MEM_PROTECT,
@@ -1450,6 +1451,30 @@ pub fn cap_derive_badge(src_slot: u64, rights_mask: u64, badge: u64) -> Result<u
     // is bitmask, badge is the badge value; kernel validates and creates badged derivative.
     let ret = unsafe { syscall3(SYS_CAP_DERIVE_BADGE, src_slot, rights_mask, badge) };
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
+/// Read the badge of `cap`, an Endpoint capability the caller holds, proving
+/// with `recv_cap`, a capability carrying `RIGHTS_EP_RECEIVE` on the same
+/// endpoint, that the caller serves it (`SYS_ENDPOINT_BADGE`). `0` for an
+/// un-badged cap.
+///
+/// A server reads this way the badge of a capability on its own endpoint that
+/// a client handed it, which names what the badge names to the server's
+/// receive path (`docs/capability-model.md` § Badges).
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidCapability` if either handle
+/// is null, stale, empty, or not an Endpoint cap; `InsufficientRights` if
+/// `recv_cap` lacks `RIGHTS_EP_RECEIVE`; `InvalidArgument` if the two caps
+/// name different endpoints.
+#[inline]
+pub fn endpoint_badge(recv_cap: u64, cap: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall5_ret2 issues raw syscall instruction; both arguments are
+    // cap handles the kernel validates; the badge comes back in the secondary
+    // register.
+    let (ret, badge) = unsafe { syscall5_ret2(SYS_ENDPOINT_BADGE, recv_cap, cap, 0, 0, 0) };
+    if ret < 0 { Err(ret) } else { Ok(badge) }
 }
 
 /// Delete a capability slot in the caller's `CSpace` (`SYS_CAP_DELETE`).

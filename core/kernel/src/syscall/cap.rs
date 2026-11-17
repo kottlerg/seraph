@@ -3475,6 +3475,58 @@ pub fn sys_cap_info(tf: UserFrame) -> Result<u64, SyscallError>
     }
 }
 
+/// `SYS_ENDPOINT_BADGE` (69): read the badge of an Endpoint capability the
+/// caller holds, proving with a Receive capability on the same endpoint that
+/// it serves that endpoint.
+///
+/// arg0 = Endpoint cap handle carrying `RECEIVE` (the proof).
+/// arg1 = Endpoint cap handle whose badge is read (any rights).
+///
+/// Returns `0`, with the badge of arg1's slot in the secondary return
+/// register (`0` for an un-badged cap). A server mints every badge on its
+/// endpoint, or trusts the minters it gave an un-badged source, so the read
+/// discloses nothing its receive path would not; the same-object test is what
+/// makes the badge a server's to read rather than any holder's
+/// (`docs/capability-model.md` § Badges). No capability is created and no
+/// kernel address crosses: the badge is the derivation badge of a cap the
+/// caller holds (`core/kernel/docs/cross-boundary-disclosure.md`).
+///
+/// # Errors
+/// `InvalidCapability` for either handle when it is null, stale, empty, or
+/// not an Endpoint; `InsufficientRights` when arg0 lacks `RECEIVE`;
+/// `InvalidArgument` when the two caps name different endpoints.
+#[cfg(not(test))]
+pub fn sys_endpoint_badge(tf: UserFrame) -> Result<u64, SyscallError>
+{
+    use crate::cap::slot::EpRights;
+
+    // SAFETY: syscall entry ensures current_tcb() returns active thread's TCB.
+    let tcb = unsafe { current_tcb() };
+    if tcb.is_null()
+    {
+        return Err(SyscallError::InvalidCapability);
+    }
+    // SAFETY: tcb validated non-null above; cspace field set at thread creation.
+    let cspace = unsafe { (*tcb).cspace };
+    // SAFETY: cspace is the running thread's bound CSpace (or null, refused
+    // there); no lock is held.
+    let proof = unsafe { super::lookup_cap(cspace, tf.arg(0), EpRights::RECEIVE) }?;
+    // SAFETY: as above.
+    let named = unsafe { super::lookup_cap(cspace, tf.arg(1), EpRights::NONE) }?;
+    // Both pins hold their objects, so neither endpoint can be freed and its
+    // memory reused for another between the lookups and this comparison.
+    let same = proof.object.is_some() && proof.object == named.object;
+    if !same
+    {
+        return Err(SyscallError::InvalidArgument);
+    }
+    // The badge leaves selected as data by the comparison, so a path a
+    // mispredicted refusal reaches returns 0, never another endpoint's badge.
+    let mask = crate::arch::nospec::mask_if(same) as u64;
+    tf.set_ipc_return(0, named.badge & mask);
+    Ok(0)
+}
+
 // ── Test stubs ─────────────────────────────────────────────────────────────────
 // These stubs satisfy the type checker for host test builds. Syscall handlers
 // are never called in host tests; the stubs exist only so the module compiles.

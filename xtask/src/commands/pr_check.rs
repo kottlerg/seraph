@@ -60,6 +60,7 @@ pub struct Patterns
     planning_label: Regex,
     subject_form: Regex,
     hex: Regex,
+    compare_images: Regex,
     delta_statement: Regex,
     negation: Regex,
     placeholder: Regex,
@@ -101,6 +102,13 @@ impl Patterns
             planning_label: Regex::new(r"(?i)\b(step|phase|tier|stage|round)\s+\d+\b")?,
             subject_form: Regex::new(r"^[^\s:][^:]*: \S")?,
             hex: Regex::new(r"\b[0-9a-f]{7,40}\b")?,
+            // What a body quotes of `cargo xtask compare-images`
+            // (docs/conventions.md § PR-body checklist discipline): its
+            // verdict line and its report's path, each naming the base
+            // commit before the head, over line breaks when wrapped.
+            compare_images: Regex::new(
+                r"compare-images:\s+(?:IDENTICAL|DIFFERENT\s+\(\d+\))\s+base\s+[0-9a-f]+\s+head\s+[0-9a-f]+|compare-images/report-[0-9a-f]+-[0-9a-f]+\.txt",
+            )?,
             // `comment-only`, `documentation and comments only`, `Markdown
             // only`, `only in comments`, `only a rustdoc comment`.
             delta_statement: Regex::new(&format!(
@@ -512,12 +520,17 @@ pub fn section<'a>(body: &'a str, heading: &str) -> Option<Vec<&'a str>>
 /// The words of the `## Validation` section that could be the validated
 /// head: every hexadecimal word of commit-hash length, in order. A run id or
 /// a count can be one too, so the caller takes the first that names a commit.
+/// The words of a quoted `compare-images` verdict line or report path are
+/// not offered: they name the base commit before the head the command ran
+/// at, and the body states the validated head on its own.
 pub fn validated_head_candidates(pat: &Patterns, body: &str) -> Vec<String>
 {
-    section(body, "## Validation")
+    let text = section(body, "## Validation")
         .unwrap_or_default()
-        .iter()
-        .flat_map(|line| pat.hex.find_iter(line))
+        .join("\n");
+    let text = pat.compare_images.replace_all(&text, " ");
+    pat.hex
+        .find_iter(&text)
         .map(|found| found.as_str().to_owned())
         .collect()
 }
@@ -970,7 +983,8 @@ fn embed_lines(root: &Path, head: &str) -> Result<String>
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ValidatedHead
 {
-    /// The `## Validation` section holds no hash-like word.
+    /// The `## Validation` section holds no hash-like word outside a quoted
+    /// `compare-images` verdict line or report path.
     Unstated,
     /// None of its hash-like words names a commit in the clone.
     Unknown,
@@ -2246,6 +2260,61 @@ mod tests
             validated_head_candidates(&p, "## Summary\nabcdef12\n"),
             [] as [String; 0]
         );
+    }
+
+    /// A verdict line of `cargo xtask compare-images`, with full hashes.
+    const VERDICT: &str = "compare-images: IDENTICAL base 1111111111111111111111111111111111111111 \
+                           head 2222222222222222222222222222222222222222 cells \
+                           x86_64-debug,x86_64-release,riscv64-debug,riscv64-release";
+
+    #[test]
+    fn a_quoted_compare_images_citation_offers_no_candidate()
+    {
+        let p = pat();
+        let candidates = |section: &str| {
+            validated_head_candidates(&p, &format!("## Validation\n{section}\n## Notes\n"))
+        };
+        // The quote first, then the head: the head is the first candidate.
+        assert_eq!(
+            candidates(&format!("`{VERDICT}`\nValidated head 0a82b0aa.")),
+            ["0a82b0aa"]
+        );
+        // A verdict wrapped over two lines, and a `DIFFERENT` one.
+        let wrapped = VERDICT.replace(" head ", "\n  head ");
+        assert_eq!(candidates(&format!("{wrapped}\nat 0a82b0aa")), ["0a82b0aa"]);
+        let different = VERDICT.replace("IDENTICAL", "DIFFERENT (3)");
+        assert_eq!(
+            candidates(&format!("{different}; at 0a82b0aa")),
+            ["0a82b0aa"]
+        );
+        // The report's path names both commits by their first 12 digits.
+        assert_eq!(
+            candidates(
+                "Report `target/xtask/compare-images/report-111111111111-222222222222.txt`, \
+                 head 0a82b0aa."
+            ),
+            ["0a82b0aa"]
+        );
+        // A hash before the quote on its line is kept.
+        assert_eq!(
+            candidates(&format!("Head 0a82b0aa: `{VERDICT}`")),
+            ["0a82b0aa"]
+        );
+        // A hash `base` and `head` name outside a verdict line is offered.
+        assert_eq!(
+            candidates("merge base 1111111 head 0a82b0aa"),
+            ["1111111", "0a82b0aa"]
+        );
+    }
+
+    #[test]
+    fn a_section_whose_only_hashes_are_a_compare_images_quote_names_no_head()
+    {
+        let body = BODY.replace(
+            "Run 41635544986 at head 0a82b0aa; later commits are comment-only.",
+            VERDICT,
+        );
+        assert_eq!(rules(&check_body(&pat(), &body)), ["pr-validation"]);
     }
 
     #[test]

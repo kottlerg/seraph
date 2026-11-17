@@ -1,0 +1,21 @@
+# /services/acpid — the ACPI service: it runs the firmware's AML.
+#
+# svcmgr launches acpid post-handover on every boot. `seed = devmgr.acpi`
+# delivers its one capability, a SEND on devmgr's registry badged
+# REGISTRY_QUERY_AUTHORITY | ACPI_AUTHORITY, through which acpid acquires the
+# tables, the FADT's register blocks, each operation region devmgr grants it
+# and each configuration-space access, and pushes each PCI host bridge's
+# _OSC grant, windows and interrupt routes (services/acpid/README.md). acpid
+# is the only recipe seeding it, and it provides no endpoint yet.
+#
+# `restart = on_failure`: svcmgr re-creates acpid, which re-acquires its
+# capabilities from devmgr and runs its start-up again; devmgr keeps the
+# results of the first start (and the memory regions it granted).
+# `critical = no`: devmgr never waits on acpid, so the system runs on
+# without it, without the _OSC grant and the routes it pushes.
+binary    = /services/acpid
+priority  = 16
+restart   = on_failure
+critical  = no
+namespace = none
+seed      = devmgr.acpi

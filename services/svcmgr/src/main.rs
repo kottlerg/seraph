@@ -196,7 +196,7 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
         Err(_) => std::os::seraph::log!(warn: "derive svcmgr SEND failed"),
     }
 
-    // devmgr.registry / devmgr.shutdown / devmgr.bind — badged SENDs minted
+    // devmgr.registry / devmgr.shutdown / devmgr.bind / devmgr.acpi — badged SENDs minted
     // from the endowed badge-0 `SEND|GRANT` source. The badge bits ride
     // through `registry_lookup_derived`'s plain `cap_derive` to consumers.
     // Each carries verb-bit authority, so each is seed-only: `QUERY_ENDPOINT`
@@ -219,6 +219,11 @@ fn publish_well_known(registry: &mut registry::Registry, caps: &service::SvcmgrC
             ipc::published_names::DEVMGR_BIND,
             query | ipc::devmgr_labels::BIND_AUTHORITY,
             Visibility::SeedOnlyGrant,
+        ),
+        (
+            ipc::published_names::DEVMGR_ACPI,
+            query | ipc::devmgr_labels::ACPI_AUTHORITY,
+            Visibility::SeedOnly,
         ),
     ]
     {

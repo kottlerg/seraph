@@ -2166,7 +2166,8 @@ unsafe fn step9_populate_boot_info(
     push_reclaim(allocs.reclaim_array_phys, 1, 0)?;
     bprintln!("[--------] boot: reclaim_ranges: {reclaim_len} entries recorded");
 
-    // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation).
+    // VMGENID GUID address: QEMU-specific SSDT scan (no AML evaluation: the
+    // bootloader runs before acpid, the userspace service that evaluates AML).
     // Zero when absent; the kernel then has no snapshot-detection channel.
     // SAFETY: acpi_rsdp is zero or identity-mapped; the parser validates.
     let vmgenid_paddr = unsafe { acpi::parse_vmgenid_paddr(firm.acpi_rsdp) };

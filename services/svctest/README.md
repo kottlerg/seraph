@@ -52,6 +52,8 @@ services/svctest/
         ├── devmgr.rs          # Block, shutdown, bind deny; input ordinal; on-demand
         │                      #   driver bind; DMA confinement; MSI delivery, forge,
         │                      #   churn, and release
+        ├── acpi.rs            # acpid's results read from devmgr (`acpi_host_bridges`); the
+        │                      #   `ACPI_AUTHORITY` gate (`acpi_authority_deny`)
         ├── drivers.rs         # Serial, input, and framebuffer verb-bit deny; serial and input
         │                      #   stray caps
         ├── pager.rs           # Demand paging: backed, declined, pinned; forged-badge bind;

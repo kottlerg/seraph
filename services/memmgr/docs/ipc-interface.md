@@ -329,10 +329,11 @@ procmgr's own grants lack the right and its badge is no node handle.
 | cap[0] | Badged SEND cap on memmgr's endpoint, identifying the new process |
 | cap[1] | With `REGISTER_NODE_HANDLE`: a node handle to the new process's budget node (§ Node Handles), owned by the new process's record; absent otherwise |
 
-The badge is also encoded in the returned cap, but userspace currently
-has no syscall to read a cap's badge, so memmgr returns it explicitly
-in `data[0]` for procmgr to record alongside the cap and forward in
-the eventual `PROCESS_DIED`.
+The badge is also encoded in the returned cap, but only memmgr, which
+holds Receive on its endpoint, can read the badge of a cap on it
+(`SYS_ENDPOINT_BADGE`), so memmgr returns it explicitly in `data[0]`
+for procmgr to record alongside the cap and forward in the eventual
+`PROCESS_DIED`.
 
 **Reply (error):**
 

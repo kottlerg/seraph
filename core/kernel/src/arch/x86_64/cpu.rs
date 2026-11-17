@@ -539,8 +539,9 @@ pub unsafe fn set_user_msr_controls()
 {
     let max_extended = cpuid(0x8000_0000).0;
     let rdtscp = max_extended >= 0x8000_0001 && (cpuid(0x8000_0001).3 >> 27) & 1 != 0;
-    let (_, _, leaf7_ecx, leaf7_edx) = cpuid_subleaf(7, 0);
-    let rdpid = (leaf7_ecx >> 22) & 1 != 0;
+    // Leaf 7 sub-leaf 0: ECX (.2) and EDX (.3) feature flags.
+    let leaf7 = cpuid_subleaf(7, 0);
+    let rdpid = (leaf7.2 >> 22) & 1 != 0;
     if rdtscp || rdpid
     {
         // SAFETY: ring 0; CPUID enumerates RDTSCP or RDPID, so IA32_TSC_AUX
@@ -564,7 +565,7 @@ pub unsafe fn set_user_msr_controls()
         };
     }
 
-    let cet = (leaf7_ecx >> 7) & 1 != 0 || (leaf7_edx >> 20) & 1 != 0;
+    let cet = (leaf7.2 >> 7) & 1 != 0 || (leaf7.3 >> 20) & 1 != 0;
     if cet
     {
         // SAFETY: ring 0; CPUID enumerates a CET feature, so IA32_U_CET exists,

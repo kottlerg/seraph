@@ -7,8 +7,9 @@
 //! Connects to QEMU's `-qmp unix:...` socket, completes the capabilities
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
-//! and `quit` (snapshot-resume test), and `stop` + `pmemsave` (the ACPI table
-//! capture); and waits for the `SHUTDOWN` event (the reboot test).
+//! and `quit` (snapshot-resume test), `stop` + `pmemsave` (the ACPI table
+//! capture), and `device_add` (the hotplug test); and waits for the
+//! `SHUTDOWN` event (the reboot test).
 //!
 //! Hand-rolled (no JSON dependency): the messages are fixed strings or
 //! `format!` templates, the free-form values (the migrate URI, the memory
@@ -253,6 +254,41 @@ fn shutdown_reason(line: &str) -> Option<&str>
     (value("event")? == "SHUTDOWN").then(|| value("reason").unwrap_or("unknown"))
 }
 
+/// Hot-add the device `driver`, its id `id`, on the bus `bus` (a port's id),
+/// with the further properties `properties`, each a name and a JSON number.
+pub fn device_add(
+    socket: &Path,
+    driver: &str,
+    id: &str,
+    bus: &str,
+    properties: &[(&str, u64)],
+) -> Result<()>
+{
+    let mut client = Client::connect(socket)?;
+    client.send(&device_add_message(driver, id, bus, properties))?;
+    client
+        .read_result()
+        .with_context(|| format!("device_add {driver} on {bus}"))?;
+    Ok(())
+}
+
+/// The `device_add` command of [`device_add`].
+fn device_add_message(driver: &str, id: &str, bus: &str, properties: &[(&str, u64)]) -> String
+{
+    let mut arguments = format!(
+        r#""driver":{},"id":{},"bus":{}"#,
+        json_string(driver),
+        json_string(id),
+        json_string(bus)
+    );
+    for (name, value) in properties
+    {
+        // Writing to a `String` cannot fail.
+        let _ = write!(arguments, ",{}:{value}", json_string(name));
+    }
+    format!(r#"{{"execute":"device_add","arguments":{{{arguments}}}}}"#)
+}
+
 /// Ask QEMU to exit. The response read is best-effort: QEMU may close the
 /// socket before or instead of acknowledging.
 pub fn quit(socket: &Path) -> Result<()>
@@ -364,6 +400,19 @@ mod tests
         assert_eq!(
             exec_restore_uri(path).unwrap(),
             r"exec:cat '/w s/it'\''s;$x'"
+        );
+    }
+
+    #[test]
+    fn device_add_names_the_driver_id_bus_and_numeric_properties()
+    {
+        assert_eq!(
+            device_add_message("edu", "hp\"0", "port", &[("dma_mask", 0xFFFF_FFFF)]),
+            r#"{"execute":"device_add","arguments":{"driver":"edu","id":"hp\"0","bus":"port","dma_mask":4294967295}}"#
+        );
+        assert_eq!(
+            device_add_message("edu", "a", "b", &[]),
+            r#"{"execute":"device_add","arguments":{"driver":"edu","id":"a","bus":"b"}}"#
         );
     }
 

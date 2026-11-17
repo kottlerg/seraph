@@ -27,9 +27,12 @@ const CMOS_RTC_IDS: [&[u8]; 3] = [b"PNP0B00", b"PNP0B01", b"PNP0B02"];
 
 /// Enumerate the platform device records. `tables_found` are the platform
 /// description tables among the boot modules; the one whose OEM table ID is
-/// the XSDT's describes the devices the machine's tables do not. Every
+/// the XSDT's describes the devices the machine's tables do not, and whether
+/// the machine grants devmgr native control of its PCI Express hotplug slots
+/// (`pcie_native_hotplug`), which is returned beside the records. Every
 /// record is logged.
-pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> PlatformRecords
+pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable])
+-> (PlatformRecords, bool)
 {
     let mut records = PlatformRecords::new();
     boot_framebuffer(caps, &mut records);
@@ -77,12 +80,12 @@ pub fn enumerate(caps: &caps::DevmgrCaps, tables_found: &[PlatformTable]) -> Pla
             core::iter::once(base).chain(interrupt),
         );
     }
-    platform_table(acpi.oem_table_id, tables_found, &mut records);
+    let native_hotplug = platform_table(acpi.oem_table_id, tables_found, &mut records);
     for (index, record) in records.records().iter().enumerate()
     {
         log_record(index, record);
     }
-    records
+    (records, native_hotplug)
 }
 
 /// The boot framebuffer's record: its linear framebuffer's pages, keyed
@@ -199,13 +202,14 @@ fn attach_century(caps: &caps::DevmgrCaps, records: &mut PlatformRecords)
 }
 
 /// Add the devices of the platform description table among `tables_found`
-/// whose OEM table ID is `oem_table_id`. With no such table no device is
-/// added, logged once.
+/// whose OEM table ID is `oem_table_id`, and return whether it grants
+/// native PCI Express hotplug control. With no such table no device is
+/// added, logged once, and nothing is granted.
 fn platform_table(
     oem_table_id: Option<[u8; 8]>,
     tables_found: &[PlatformTable],
     records: &mut PlatformRecords,
-)
+) -> bool
 {
     let table = oem_table_id.and_then(|id| tables_found.iter().find(|t| t.is_for(&id)));
     let Some(table) = table
@@ -214,7 +218,7 @@ fn platform_table(
         std::os::seraph::log!(
             warn: "no platform description table for this machine; no platform-table records"
         );
-        return;
+        return false;
     };
     for device in table.devices()
     {
@@ -240,6 +244,7 @@ fn platform_table(
         });
         add(records, identity, resources);
     }
+    table.pcie_native_hotplug()
 }
 
 /// Add a device to `records` ([`PlatformRecords::add`]), logging one the

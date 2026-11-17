@@ -24,11 +24,15 @@ devmgr/
 │                                   #   the AML `Device` walker (on `shared/aml`'s encodings
 │                                   #   and resource-template decoder), platform device
 │                                   #   records, the platform description table parser,
-│                                   #   PCI device records (states, appends, INTx routes)
+│                                   #   PCI device records (states, appends, INTx routes),
+│                                   #   acpid's side (region policy, configuration access,
+│                                   #   per-bridge results), PCI Express hotplug (slots,
+│                                   #   control grant, poller decisions, BAR placement)
 ├── platform/                       # Platform description tables, one `<machine>.platform` each
 ├── src/
 │   ├── main.rs                     # Bootstrap, the registry's workers and control thread,
 │   │                               #   QUERY_DEVICE and WATCH_CLASS handlers, device catalog
+│   ├── acpi.rs                     # acpid's requests: region grants, configuration access, pushes
 │   ├── arch/                       # Arch dispatch: ECAM/INTx defaults, port carves, shutdown
 │   │   ├── mod.rs                  # `arch::current` re-export (the only cfg(target_arch) site)
 │   │   ├── x86_64/mod.rs           # IoPort carves (platform records, FADT blocks); no ECAM default
@@ -40,6 +44,8 @@ devmgr/
 │   ├── decls.rs                    # Driver declarations read from boot modules and the drivers
 │   │                               #   directory
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
+│   ├── hotplug.rs                  # PCI Express native hotplug: managed slots, poller, add job
+│   ├── intremap.rs                 # VT-d interrupt remapping: enable, per-source remapping entries
 │   ├── iommu.rs                    # IOMMU units, driver spawn, device attach, fail-closed client
 │   ├── pci.rs                      # ECAM configuration-space accessor for the PCI scan
 │   ├── phys.rs                     # Physical-address credential (a memmgr page with `Phys`)
@@ -52,7 +58,7 @@ devmgr/
 └── docs/
     ├── responsibilities.md         # Responsibilities, bootstrap capabilities, driver authority
     ├── pci-enumeration.md          # PCI enumeration via ECAM MMIO
-    └── hotplug.md                  # Hotplug event handling
+    └── hotplug.md                  # Hotplug event sources, native slots, the add path
 ```
 
 ---
@@ -60,11 +66,12 @@ devmgr/
 ## Responsibilities
 
 devmgr parses firmware tables, enumerates PCI devices, binds and spawns drivers, exposes the device
-registry, and brokers ACPI tables to acpid and the RISC-V shutdown cap to pwrmgr (hotplug handling
-is design intent; not yet implemented); it is the sole authority for spawning device drivers. Each
-responsibility, the capabilities devmgr receives at bootstrap, and its relationship to driver
-processes are specified in [docs/responsibilities.md](docs/responsibilities.md); the system-scope
-design is [docs/device-management.md](../../docs/device-management.md).
+registry, brokers ACPI tables to acpid and the RISC-V shutdown cap to pwrmgr, and adds the functions
+a card brings to a PCI Express hotplug slot it controls natively (hotplug removal is design intent;
+not yet implemented); it is the sole authority for spawning device drivers. Each responsibility, the
+capabilities devmgr receives at bootstrap, and its relationship to driver processes are specified in
+[docs/responsibilities.md](docs/responsibilities.md); the system-scope design is
+[docs/device-management.md](../../docs/device-management.md).
 
 ---
 
@@ -74,7 +81,7 @@ design is [docs/device-management.md](../../docs/device-management.md).
 |---|---|
 | [docs/responsibilities.md](docs/responsibilities.md) | Responsibilities, bootstrap capabilities, authority over drivers |
 | [docs/pci-enumeration.md](docs/pci-enumeration.md) | PCI enumeration via ECAM MMIO |
-| [docs/hotplug.md](docs/hotplug.md) | Hotplug event handling |
+| [docs/hotplug.md](docs/hotplug.md) | Hotplug event sources, native slots, the add path |
 | [docs/device-management.md](../../docs/device-management.md) | Full device management design, DMA safety, security boundary |
 | [docs/capability-model.md](../../docs/capability-model.md) | Capability types, rights, delegation, revocation |
 | [docs/architecture.md](../../docs/architecture.md) | Bootstrap sequence, service roles |

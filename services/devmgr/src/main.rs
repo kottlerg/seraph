@@ -22,6 +22,7 @@ mod bind;
 mod caps;
 mod decls;
 mod dma;
+mod hotplug;
 mod intremap;
 mod iommu;
 mod pci;
@@ -35,6 +36,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use driver_binding::decl::{ClassName, DriverName};
 use firmware::classes::{Classes, MAX_CLASSES, Mismatch};
+use firmware::hotplug::Slot;
 use firmware::lines::{HeldLines, LineError};
 use firmware::resource::{CarveError, Span, SpanTable, SplitError};
 use firmware::roster::{DeathPost, DriverState, Roster};
@@ -59,6 +61,13 @@ fn declare_no_core(procmgr: u64, ipc_buf: *mut u64)
     };
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "devmgr's boot sequence in order (caps, enumeration, IOMMU, hotplug slots, boot \
+              batch, registry) and its control loop; each step is one call holding state the \
+              later steps and the loop consume, so a split threads that state through helpers \
+              of seven or more arguments"
+)]
 fn main() -> !
 {
     std::os::seraph::log::register_name(b"devmgr");
@@ -93,7 +102,7 @@ fn main() -> !
     let (acpi_jobs, acpi_queue) = std::sync::mpsc::channel();
     let mut acpi = acpi::AcpiService::new(&caps, acpi_queue);
 
-    let (mut records, modules) = enumerate_records(&mut caps);
+    let (mut records, modules, slots, platform_grant) = enumerate_records(&mut caps);
 
     // IRQ allocator state: single-line caps carved out of devmgr's
     // Interrupt range cap, every remainder kept; each PCI device's line held
@@ -162,6 +171,18 @@ fn main() -> !
         d.set_iommu(Arc::clone(i));
     }
 
+    // The PCI Express hotplug slots the scan found, taken while the IOMMU
+    // pass's records are the only ones bound, none managed until its grant
+    // comes (`hotplug::Hotplug::grant`).
+    let mut hotplug = hotplug::Hotplug::new(
+        slots,
+        &records,
+        platform_grant,
+        acpi.boot_apertures(),
+        watch.job_note(),
+        caps.self_aspace,
+    );
+
     // VT-d interrupt remapping, turned on before any line is routed or any
     // message target minted, which the kernel's switch requires; each
     // source's entry is written as the source is given to a device.
@@ -205,6 +226,18 @@ fn main() -> !
             ipc_buf,
         );
         acpi.run(&records, &mut caps);
+        hotplug.grant(acpi.bridges(), &mut records, &mut caps);
+        hotplug.run(
+            &registry,
+            &mut records,
+            &mut bind::Carve {
+                caps: &mut caps,
+                irq_range: &mut irq_range,
+                catalog: &mut catalog,
+            },
+            &mut watch,
+            ipc_buf,
+        );
         registry.withdraw_deaths(&watch, ipc_buf);
         match watch.wait()
         {
@@ -233,19 +266,24 @@ fn driver_watch(records: &bind::Records) -> settle::DriverWatch
 }
 
 /// Locate and scan every PCI ECAM window, then enumerate the platform
-/// records, returning the device records and the classified boot modules.
-/// Halts, logged, when no window is scanned or the records cannot be held.
-fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::BootModules)
+/// records, returning the device records, the classified boot modules, the
+/// PCI Express hotplug slots the scan found, and whether the platform
+/// description table grants native control of them. Halts, logged, when no
+/// window is scanned or the records cannot be held.
+fn enumerate_records(
+    caps: &mut caps::DevmgrCaps,
+) -> (bind::Records, decls::BootModules, Vec<Slot>, bool)
 {
     // Parse firmware to locate every PCI ECAM window. ACPI wins when RSDP is
     // present; DTB is the fallback; the arch platform default (QEMU virt
     // on riscv64, none on x86-64) is the last resort.
     let ecams = tables::discover_ecams(&caps.firmware);
     let mut devices: Vec<pci::PciDevice> = Vec::new();
+    let mut slots: Vec<Slot> = Vec::new();
     let mut windows_scanned = 0usize;
     for loc in &ecams
     {
-        if enumerate_ecam(caps, loc, &mut devices)
+        if enumerate_ecam(caps, loc, &mut devices, &mut slots)
         {
             windows_scanned = windows_scanned.saturating_add(1);
         }
@@ -267,7 +305,7 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
     // device, function order, then the platform records in firmware table
     // order.
     let modules = decls::classify_modules(caps);
-    let platform_records = platform::enumerate(caps, &modules.tables);
+    let (platform_records, platform_grant) = platform::enumerate(caps, &modules.tables);
     let records = firmware::pci_records::PciRecords::new(devices)
         .and_then(|pci| bind::Records::new(pci, platform_records));
     let Some(records) = records
@@ -276,7 +314,7 @@ fn enumerate_records(caps: &mut caps::DevmgrCaps) -> (bind::Records, decls::Boot
         std::os::seraph::log!(error: "no memory for the device records, halting");
         halt_loop();
     };
-    (records, modules)
+    (records, modules, slots, platform_grant)
 }
 
 /// Start the registry's workers and let them receive: the
@@ -1310,7 +1348,8 @@ fn handle_query_shutdown_device(
 // ── ECAM enumeration ────────────────────────────────────────────────────────
 
 /// Carve, map, and scan one ECAM window, appending its functions to
-/// `devices`. Returns `false`, logging why, when no aperture covers the
+/// `devices` and the PCI Express hotplug slot each of them leads to to
+/// `slots` (`firmware::hotplug::slots`). Returns `false`, logging why, when no aperture covers the
 /// window, the VA reservation or the funded mapping fails, or the
 /// scan stops for lack of memory before recording any function; a scan that
 /// stops after recording some keeps them and counts as scanned.
@@ -1318,6 +1357,7 @@ fn enumerate_ecam(
     caps: &mut caps::DevmgrCaps,
     loc: &firmware::EcamLocation,
     devices: &mut Vec<pci::PciDevice>,
+    slots: &mut Vec<Slot>,
 ) -> bool
 {
     std::os::seraph::log!(
@@ -1352,7 +1392,17 @@ fn enumerate_ecam(
             // closure returns, and the scan reaches it only through `pci::Ecam`'s
             // raw volatile accessors ([`with_mmio_mapped`]).
             let ecam = unsafe { pci::Ecam::new(va, loc.start_bus, loc.end_bus) };
-            firmware::scan::scan(&ecam, loc.segment, loc.start_bus, loc.end_bus, devices)
+            let scanned =
+                firmware::scan::scan(&ecam, loc.segment, loc.start_bus, loc.end_bus, devices);
+            let found = devices.get(found_before..).unwrap_or_default();
+            if firmware::hotplug::slots(&ecam, found, slots).is_err()
+            {
+                std::os::seraph::log!(
+                    warn: "ECAM segment {}: no memory to hold its hotplug slots; some not managed",
+                    loc.segment
+                );
+            }
+            scanned
         },
     );
     let Some(scanned) = scanned
@@ -2220,7 +2270,8 @@ fn create_service_endpoint() -> Option<u64>
 }
 
 /// Spawn and settle the batch of a drivers-directory pass, on the control
-/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts: the pass
+/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts or a hotplug
+/// arrival runs: the pass
 /// over the records no earlier driver was bound to
 /// ([`bind::drivers_dir_pass`]), each binary read through `dir_cap`, the
 /// `LOOKUP | READ | READDIR`-attenuated directory cap the request delivered

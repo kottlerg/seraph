@@ -46,6 +46,7 @@ members = [
     "services/drivers/virtio/input",
     "services/drivers/virtio/console",
     "services/debug-echo",
+    "services/hotplug-check",
     "services/gdbstub",
     "services/fs/fat",
     "services/fs/fat/fat-parse",

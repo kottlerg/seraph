@@ -68,8 +68,8 @@ cargo xtask clean [--all]                    # remove sysroot/ and disk images (
 Testing spans host-side `cargo xtask test`, in-tree QEMU harnesses
 (`ktest`, `svctest`, `usertest`), host-driven boot tests (`test-kaslr`,
 `test-map-redo`, `test-vmgenid`, `test-terminal`, `test-wedge`, `test-reboot`, `test-cet`,
-`test-debug-port`, `test-gdb`), and `test-crash-report`, a host-side check of a boot's serial log;
-the default boot is interactive and runs no harness.
+`test-debug-port`, `test-hotplug`, `test-gdb`), and `test-crash-report`, a host-side check of a
+boot's serial log; the default boot is interactive and runs no harness.
 See [docs/testing.md](docs/testing.md) for the full model.
 
 ---

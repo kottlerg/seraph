@@ -10,11 +10,14 @@
 //! interrupt. The platform description table is a text file in the `.svc`
 //! grammar of the device class files: line-oriented `key = value`, `#` starts
 //! a comment line, blank lines are skipped. It lists the devices a machine
-//! has that no firmware table describes, keyed by the XSDT's OEM table ID.
+//! has that no firmware table describes, and whether the machine grants
+//! devmgr native control of its PCI Express hotplug slots, keyed by the
+//! XSDT's OEM table ID.
 //!
 //! ```text
 //! # <comment>
 //! oem_table_id = BXPC
+//! pcie_native_hotplug = yes
 //! device = google,goldfish-rtc mmio 0x101000 0x1000 wired 11 level-high
 //! ```
 
@@ -211,6 +214,9 @@ pub struct PlatformTable
     oem_table_id: [u8; OEM_ID_BYTES],
     id_len: u8,
     devices: Vec<PlatformDevice>,
+    /// `pcie_native_hotplug = yes`: the machine grants devmgr native
+    /// control of its PCI Express hotplug slots.
+    native_hotplug: bool,
 }
 
 /// Drop trailing spaces and NULs.
@@ -243,6 +249,14 @@ impl PlatformTable
     pub fn devices(&self) -> &[PlatformDevice]
     {
         &self.devices
+    }
+
+    /// Whether the table grants devmgr native control of the machine's PCI
+    /// Express hotplug slots (`pcie_native_hotplug = yes`; absent, no).
+    #[must_use]
+    pub const fn pcie_native_hotplug(&self) -> bool
+    {
+        self.native_hotplug
     }
 }
 
@@ -379,6 +393,7 @@ pub fn parse_table(contents: &str) -> Result<PlatformTable, TableError>
     }
     let mut oem: Option<([u8; OEM_ID_BYTES], u8)> = None;
     let mut devices: Vec<PlatformDevice> = Vec::new();
+    let mut native_hotplug: Option<bool> = None;
     for entry in svc_grammar::entries(contents)
     {
         let svc_grammar::Entry { line, key, value } =
@@ -413,6 +428,19 @@ pub fn parse_table(contents: &str) -> Result<PlatformTable, TableError>
                 devices.try_reserve(1).map_err(|_| TableError::NoMemory)?;
                 devices.push(dev);
             }
+            "pcie_native_hotplug" =>
+            {
+                if native_hotplug.is_some()
+                {
+                    return Err(TableError::DuplicateKey(line));
+                }
+                native_hotplug = Some(match value
+                {
+                    "yes" => true,
+                    "no" => false,
+                    _ => return Err(TableError::InvalidValue(line, "bad pcie_native_hotplug")),
+                });
+            }
             _ => return Err(TableError::UnknownKey(line)),
         }
     }
@@ -421,6 +449,7 @@ pub fn parse_table(contents: &str) -> Result<PlatformTable, TableError>
         oem_table_id,
         id_len,
         devices,
+        native_hotplug: native_hotplug.unwrap_or(false),
     })
 }
 
@@ -528,6 +557,23 @@ mod tests
                 base: 0x3F8,
                 count: 8
             })
+        );
+    }
+
+    #[test]
+    fn the_native_hotplug_key_grants_only_when_yes()
+    {
+        let table = |key: &str| parse_table(&format!("oem_table_id = BXPC\n{key}")).unwrap();
+        assert!(table("pcie_native_hotplug = yes\n").pcie_native_hotplug());
+        assert!(!table("pcie_native_hotplug = no\n").pcie_native_hotplug());
+        assert!(!table("").pcie_native_hotplug());
+        assert_eq!(
+            parse_table("oem_table_id = A\npcie_native_hotplug = on\n"),
+            Err(TableError::InvalidValue(2, "bad pcie_native_hotplug"))
+        );
+        assert_eq!(
+            parse_table("oem_table_id = A\npcie_native_hotplug = yes\npcie_native_hotplug = no\n"),
+            Err(TableError::DuplicateKey(3))
         );
     }
 

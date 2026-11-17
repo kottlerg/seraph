@@ -114,6 +114,7 @@ impl Guest
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
+            hotplug_port: None,
         };
         let qemu_args = build_qemu_argv(&spec)?;
 

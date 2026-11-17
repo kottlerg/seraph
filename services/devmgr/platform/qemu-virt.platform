@@ -9,6 +9,11 @@
 
 oem_table_id = BXPC
 
+# Native control of the PCI Express hotplug slots: the machine's _OSC
+# withholds it and the machine offers no ACPI PCI hotplug, so no other agent
+# drives a slot (docs/driver-binding.md § Platform Description Tables).
+pcie_native_hotplug = yes
+
 # The goldfish RTC: its register page, and its interrupt source on the
 # APLIC (QEMU hw/riscv/virt.c, VIRT_RTC, RTC_IRQ).
 device = google,goldfish-rtc mmio 0x101000 0x1000 wired 11 level-high

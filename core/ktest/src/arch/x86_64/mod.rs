@@ -14,6 +14,8 @@
 //! - `callee_saved.rs` — callee-saved register probe for
 //!   `integration::irq_preserves_user_regs`
 //! - `code_stub.rs` — machine-code stub encoders for `unit::retype`
+//! - `user_counters.rs` — the counter ring 3 is denied, for
+//!   `integration::user_counter_grants`
 //!
 //! Tier 1 tests:
 //! - `ioport_syscalls.rs` — `SYS_IOPORT_BIND` and `SYS_IOPORT_SPLIT`
@@ -53,6 +55,7 @@ mod speculation_controls;
 mod syscall_rflags_hardening;
 mod trap_redelivery;
 mod umip;
+pub mod user_counters;
 mod user_half_top;
 
 use init_protocol::InitInfo;
@@ -309,8 +312,8 @@ pub fn cycles_now() -> u64
 {
     let lo: u32;
     let hi: u32;
-    // SAFETY: rdtsc is a user-mode instruction when CR4.TSD = 0 (the
-    // kernel does not set TSD). preserves_flags: rdtsc does not modify
+    // SAFETY: rdtsc is a user-mode instruction when CR4.TSD = 0, which the
+    // kernel clears on every CPU. preserves_flags: rdtsc does not modify
     // RFLAGS, only EAX/EDX.
     unsafe {
         core::arch::asm!(

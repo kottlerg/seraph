@@ -10,8 +10,9 @@
 //! entry points, constants, and modules; all architecture-specific ktest code
 //! lives behind them, and no `#[cfg(target_arch)]` appears elsewhere in ktest.
 //!
-//! - `fpu`, `callee_saved`, `code_stub`: the per-architecture halves of
-//!   arch-neutral tests (register-file probes, machine-code stubs).
+//! - `fpu`, `callee_saved`, `code_stub`, `user_counters`: the per-architecture
+//!   halves of arch-neutral tests (register-file probes, machine-code stubs,
+//!   the denied user-mode counters).
 //! - `serial`: the UART behind `crate::serial`.
 //! - `init_io_ports`, `shutdown`, `cycles_now`: harness services.
 //! - `core_key`: the core the running CPU reports, for `integration::smt_siblings`.
@@ -32,5 +33,5 @@ pub use current::{
     ROUTABLE_HIGH_IRQ_IDS, SP_OFFSET, SYSCALL_NR_OFFSET, TRAP_FRAME_BYTES, UNROUTABLE_IRQ_IDS,
     breakpoint_reported_ip, callee_saved, code_stub, core_key, cycles_now, entry_stack_pointer,
     fpu, fresh_range_root, illegal_instruction, init_io_ports, msi_message_plausible,
-    run_integration, run_unit, serial, shutdown, software_breakpoint,
+    run_integration, run_unit, serial, shutdown, software_breakpoint, user_counters,
 };

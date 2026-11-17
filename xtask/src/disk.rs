@@ -225,8 +225,8 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> 
     // Every pack signs what it packs, so no path writes an unsigned image:
     // `build`, `mkdisk`, `compose-bundle` and every harness that repacks.
     let signer = Signer::open(ctx, arch)?;
-    let (signed, changed) = sign_sysroot(ctx, &signer)?;
-    step(&format!("Signed {signed} images ({changed} changed)"));
+    let (images, changed) = sign_sysroot(ctx, &signer)?;
+    step(&format!("Signed {images} images ({changed} changed)"));
 
     let sources = Sources {
         esp: ctx.sysroot_esp(),

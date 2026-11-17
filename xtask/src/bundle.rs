@@ -423,7 +423,7 @@ mod tests
     fn init_fixture(root: &Path, arch: Arch) -> (BuildContext, PathBuf)
     {
         let ctx = BuildContext {
-            root: root.clone(),
+            root: root.to_path_buf(),
             sysroot: root.join("sysroot"),
             target_dir: root.join("target"),
         };

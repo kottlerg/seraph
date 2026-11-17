@@ -335,8 +335,12 @@ fn objsig_arch(arch: Arch) -> objsig::Arch
 /// § Signing).
 fn image_kind(path: &Path) -> Kind
 {
-    let mut directories = path.parent().into_iter().flat_map(Path::components);
-    let names: Vec<_> = directories.by_ref().map(|c| c.as_os_str()).collect();
+    let names: Vec<&std::ffi::OsStr> = path
+        .parent()
+        .into_iter()
+        .flat_map(Path::components)
+        .map(std::path::Component::as_os_str)
+        .collect();
     if names.iter().any(|name| *name == "drivers")
     {
         Kind::Driver
@@ -378,10 +382,10 @@ fn install_name(path: &Path) -> Result<String>
 /// On an I/O failure and the errors of [`Signer::sign_file`].
 pub fn sign_sysroot(ctx: &BuildContext, signer: &Signer) -> Result<(usize, usize)>
 {
-    let mut signed = 0usize;
+    let mut total = 0usize;
     let mut changed = 0usize;
     let mut count = |was_changed: bool| {
-        signed = signed.saturating_add(1);
+        total = total.saturating_add(1);
         changed = changed.saturating_add(usize::from(was_changed));
     };
     let kernel = ctx.sysroot_efi_seraph().join("kernel");
@@ -397,7 +401,7 @@ pub fn sign_sysroot(ctx: &BuildContext, signer: &Signer) -> Result<(usize, usize
             count(signer.sign_file(&ctx.sysroot.join(&relative), image_kind(&relative), &name)?);
         }
     }
-    Ok((signed, changed))
+    Ok((total, changed))
 }
 
 /// The regular files under `root/dir` whose bytes begin with the ELF
@@ -470,4 +474,277 @@ pub fn write_boot_store(ctx: &BuildContext, signer: &Signer) -> Result<PathBuf>
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     fs::write(&path, signer.store()).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// Fixtures of the signing tests, here and in [`crate::bundle`].
+#[cfg(test)]
+pub mod testing
+{
+    use std::path::{Path, PathBuf};
+
+    use super::{Config, Signer};
+    use crate::arch::Arch;
+
+    /// The work tree the tests' identities lie outside of: the repository.
+    pub fn work_tree() -> PathBuf
+    {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf()
+    }
+
+    /// A new directory outside the work tree, unique to this process and
+    /// call.
+    pub fn scratch(tag: &str) -> PathBuf
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "seraph-signing-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A seed source that fills each seed with one byte value, `first` and
+    /// then each next one, so a test's keys are fixed.
+    pub fn counter(first: u8) -> impl FnMut(&mut [u8; 32])
+    {
+        let mut next = first;
+        move |seed| {
+            seed.fill(next);
+            next = next.wrapping_add(1);
+        }
+    }
+
+    /// The configuration of an identity in `dir`, with no external signer
+    /// and no deployer's store.
+    pub fn config(dir: &Path) -> Config
+    {
+        Config {
+            dir: dir.to_path_buf(),
+            signer: None,
+            deployer_store: None,
+        }
+    }
+
+    /// A signer for `arch` whose local identity is generated in `dir`.
+    pub fn signer(dir: &Path, arch: Arch) -> Signer
+    {
+        Signer::new(&config(dir), &work_tree(), arch, &mut counter(1)).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use std::collections::BTreeMap;
+
+    use objsig::Arch as SigArch;
+
+    use super::testing::{config, counter, scratch, signer, work_tree};
+    use super::*;
+
+    /// `object` verified under `signer`'s store as `kind` named `name` for
+    /// riscv64.
+    fn verifies(signer: &Signer, object: &[u8], kind: Kind, name: &str) -> bool
+    {
+        let store = TrustStore::parse(signer.store()).unwrap();
+        let expect = Expectation {
+            kinds: KindSet::of(&[kind]),
+            name: name.as_bytes(),
+            arch: SigArch::Riscv64,
+        };
+        objsig::verify(object, &store, &expect).is_ok()
+    }
+
+    // Defect caught: a record whose attributes or signature the loader of its
+    // kind would refuse (a wrong body hash, kind, name or architecture), or a
+    // signed object whose body is not the image it was given.
+    #[test]
+    fn a_signed_object_verifies_as_its_kind_and_name_with_the_image_as_its_body()
+    {
+        let root = scratch("kinds");
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        for kind in Kind::ALL
+        {
+            let object = signer.sign(b"\x7fELF image", kind, "/services/x").unwrap();
+            assert!(verifies(&signer, &object, kind, "/services/x"), "{kind:?}");
+            assert_eq!(objsig::split(&object).unwrap().body(), b"\x7fELF image");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a second pack stacking a trailer on the first, which the
+    // verifier refuses as a nested trailer, or re-signing an unchanged image
+    // to new bytes.
+    #[test]
+    fn signing_a_signed_object_again_signs_its_body()
+    {
+        let root = scratch("again");
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        let once = signer.sign(b"\x7fELF image", Kind::Service, "/services/x").unwrap();
+        assert_eq!(signer.sign(&once, Kind::Service, "/services/x").unwrap(), once);
+        let renamed = signer.sign(&once, Kind::BootModule, "x").unwrap();
+        assert_eq!(objsig::split(&renamed).unwrap().body(), b"\x7fELF image");
+        assert!(verifies(&signer, &renamed, Kind::BootModule, "x"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an image ending in a damaged trailer signed whole, so
+    // the damaged trailer becomes part of the signed body.
+    #[test]
+    fn an_object_ending_in_a_malformed_trailer_is_refused()
+    {
+        let root = scratch("malformed");
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        let mut object = signer.sign(b"\x7fELF image", Kind::Service, "/services/x").unwrap();
+        // The footer's version field: 8 bytes of magic end the footer, after
+        // the 2-byte version.
+        let version = object.len() - 10;
+        object[version] = 2;
+        signer.sign(&object, Kind::Service, "/services/x").unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an image written although its record does not verify
+    // under the store the build embeds, so the image would not boot.
+    #[test]
+    fn a_signature_the_trust_store_does_not_accept_is_refused()
+    {
+        let root = scratch("untrusted");
+        let other = root.join("other");
+        identity::generate(&other, &mut counter(40)).unwrap();
+        let mut replaced = config(&root.join("keys"));
+        replaced.deployer_store = Some((other.join("trust.store"), StoreMode::Replace));
+        let signer = Signer::new(&replaced, &work_tree(), Arch::Riscv64, &mut counter(1)).unwrap();
+        signer
+            .sign(b"\x7fELF image", Kind::Service, "/services/x")
+            .unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an image left unsigned, signed under a name or kind its
+    // loader does not expect, or a non-ELF file given a trailer.
+    #[test]
+    fn the_sysroot_images_are_signed_under_their_install_path_and_kind()
+    {
+        let root = scratch("sysroot");
+        let ctx = BuildContext {
+            root: root.clone(),
+            sysroot: root.join("sysroot"),
+            target_dir: root.join("target"),
+        };
+        let images = [
+            ("esp/EFI/seraph/kernel", Kind::Kernel, "kernel"),
+            ("services/svcmgr", Kind::Service, "/services/svcmgr"),
+            ("services/fs/fatfs", Kind::Service, "/services/fs/fatfs"),
+            ("services/drivers/virtio-blk", Kind::Driver, "/services/drivers/virtio-blk"),
+            ("programs/hello", Kind::Program, "/programs/hello"),
+            ("tests/ktest", Kind::Service, "/tests/ktest"),
+            ("tests/programs/fixture", Kind::Program, "/tests/programs/fixture"),
+        ];
+        // ELF files outside the signed trees, and a text file inside one.
+        let outside = ["config/x", "esp/EFI/seraph/boot.efi"];
+        let text = "services/init/log-levels.conf";
+        let files = images
+            .iter()
+            .map(|(path, _, _)| (*path, b"\x7fELF image".as_slice()))
+            .chain(outside.iter().map(|path| (*path, b"\x7fELF outside".as_slice())))
+            .chain([(text, b"vfsd = debug\n".as_slice())]);
+        for (path, bytes) in files
+        {
+            let full = ctx.sysroot.join(path);
+            fs::create_dir_all(full.parent().unwrap()).unwrap();
+            fs::write(&full, bytes).unwrap();
+        }
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+
+        assert_eq!(sign_sysroot(&ctx, &signer).unwrap(), (images.len(), images.len()));
+        for (path, kind, name) in images
+        {
+            let object = fs::read(ctx.sysroot.join(path)).unwrap();
+            assert!(verifies(&signer, &object, kind, name), "{path}");
+        }
+        assert_eq!(fs::read(ctx.sysroot.join(text)).unwrap(), b"vfsd = debug\n");
+        for path in outside
+        {
+            assert_eq!(fs::read(ctx.sysroot.join(path)).unwrap(), b"\x7fELF outside");
+        }
+        // A second pack of an unchanged sysroot changes no file.
+        assert_eq!(sign_sysroot(&ctx, &signer).unwrap(), (images.len(), 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The configuration of the variables `vars` sets.
+    fn config_of(vars: &[(&str, &str)]) -> Result<Config>
+    {
+        let vars: BTreeMap<String, OsString> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+            .collect();
+        Config::from_vars(&|name| vars.get(name).cloned())
+    }
+
+    // Defect caught: an identity looked for anywhere but the user's data
+    // directory when no directory is named, or a deployer's store that
+    // replaces the builder's root when no mode asked for it.
+    #[test]
+    fn the_configuration_defaults_to_the_user_data_directory_and_a_merged_store()
+    {
+        let home = config_of(&[("HOME", "/home/u"), ("SERAPH_TRUST_STORE", "/s")]).unwrap();
+        assert_eq!(home.dir, Path::new("/home/u/.local/share/seraph/signing"));
+        assert_eq!(home.deployer_store, Some((PathBuf::from("/s"), StoreMode::Merge)));
+        let xdg = config_of(&[("HOME", "/home/u"), ("XDG_DATA_HOME", "/x")]).unwrap();
+        assert_eq!(xdg.dir, Path::new("/x/seraph/signing"));
+        let named = config_of(&[("HOME", "/home/u"), ("SERAPH_SIGNING_DIR", "/k")]).unwrap();
+        assert_eq!(named.dir, Path::new("/k"));
+        assert_eq!(named.deployer_store, None);
+        config_of(&[("HOME", "relative")]).unwrap_err();
+    }
+
+    // Defect caught: a mistyped or orphaned store mode ignored, so the image
+    // trusts other roots than the deployer asked for.
+    #[test]
+    fn a_store_mode_naming_no_mode_or_without_a_store_is_refused()
+    {
+        let replace = [("SERAPH_SIGNING_DIR", "/k"), ("SERAPH_TRUST_STORE", "/s"), ("SERAPH_TRUST_STORE_MODE", "replace")];
+        assert_eq!(
+            config_of(&replace).unwrap().deployer_store,
+            Some((PathBuf::from("/s"), StoreMode::Replace))
+        );
+        config_of(&[("SERAPH_SIGNING_DIR", "/k"), ("SERAPH_TRUST_STORE", "/s"), ("SERAPH_TRUST_STORE_MODE", "Replace")])
+            .unwrap_err();
+        config_of(&[("SERAPH_SIGNING_DIR", "/k"), ("SERAPH_TRUST_STORE_MODE", "merge")]).unwrap_err();
+    }
+
+    // Defect caught: an unchanged store rewritten on every build, which makes
+    // a build that tracks the file rebuild the bootloader each time.
+    #[test]
+    fn writing_an_unchanged_boot_store_leaves_the_file_untouched()
+    {
+        let root = scratch("boot-store");
+        let ctx = BuildContext {
+            root: root.clone(),
+            sysroot: root.join("sysroot"),
+            target_dir: root.join("target"),
+        };
+        let signer = signer(&root.join("keys"), Arch::Riscv64);
+        let path = write_boot_store(&ctx, &signer).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), signer.store());
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        write_boot_store(&ctx, &signer).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), old);
+        let _ = fs::remove_dir_all(&root);
+    }
 }

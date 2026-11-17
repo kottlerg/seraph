@@ -106,6 +106,24 @@ pub struct Identity
     store: Vec<u8>,
 }
 
+impl std::fmt::Debug for Identity
+{
+    /// The signing key's public key and where its signatures come from; never
+    /// the seed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result
+    {
+        let source = match &self.key
+        {
+            KeySource::Seed(_) => "seed".to_owned(),
+            KeySource::External(program) => program.display().to_string(),
+        };
+        f.debug_struct("Identity")
+            .field("key_id", &super::store::hex(&objsig::key_id(&self.public)))
+            .field("signer", &source)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Identity
 {
     /// Load the identity in `dir`, generating a local one with seeds from
@@ -157,18 +175,7 @@ impl Identity
         let key = match signer
         {
             Some(program) => KeySource::External(program.to_path_buf()),
-            None =>
-            {
-                let path = dir.join(SEED_FILE);
-                refuse_inside(&path, work_tree)?;
-                let seed = Seed(read_exact::<32>(&path)?);
-                ensure!(
-                    seed.public_key() == public,
-                    "{} is not the secret key of the signing key {CERT_FILE} or {PUB_FILE} names",
-                    path.display()
-                );
-                KeySource::Seed(seed)
-            }
+            None => KeySource::Seed(load_seed(dir, work_tree, &public)?),
         };
         Ok(Self {
             key,
@@ -210,6 +217,25 @@ impl Identity
             KeySource::External(program) => sign_external(program, message),
         }
     }
+}
+
+/// The seed in `dir`, which is the secret key of `public`.
+///
+/// # Errors
+///
+/// When the seed file lies inside `work_tree`, cannot be read, does not hold
+/// 32 bytes, or is not the secret key of `public`.
+fn load_seed(dir: &Path, work_tree: &Path, public: &PublicKey) -> Result<Seed>
+{
+    let path = dir.join(SEED_FILE);
+    refuse_inside(&path, work_tree)?;
+    let seed = Seed(read_exact::<32>(&path)?);
+    ensure!(
+        seed.public_key() == *public,
+        "{} is not the secret key of the signing key {CERT_FILE} or {PUB_FILE} names",
+        path.display()
+    );
+    Ok(seed)
 }
 
 /// Run the external signer `program` on `message`.
@@ -489,4 +515,185 @@ fn parse_certificate(bytes: &[u8]) -> Result<Certificate>
         )
     })?;
     Certificate::parse(raw).map_err(|e| err!("not a certificate ({e:?})"))
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+    use crate::signing::testing::{counter, scratch, work_tree};
+
+    /// A seed source an existing identity never calls.
+    fn no_draw(_: &mut [u8; 32])
+    {
+        panic!("an existing identity draws no seed");
+    }
+
+    /// The names of the entries of `dir`, sorted.
+    fn names(dir: &Path) -> Vec<String>
+    {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    // Defect caught: a signing key no anchor of the store certifies, a root
+    // not marked local, a root seed written to disk, or an identity
+    // regenerated on every build, which changes the store each time.
+    #[test]
+    fn a_generated_identity_is_certified_by_a_local_root_and_reloads_unchanged()
+    {
+        let root = scratch("generate");
+        let dir = root.join("keys");
+        let first = Identity::load(&dir, None, &work_tree(), &mut counter(1)).unwrap();
+        assert_eq!(names(&dir), [CERT_FILE, SEED_FILE, STORE_FILE]);
+
+        let cert = first.certificate().unwrap();
+        assert_eq!(cert.body.subject_key, *first.public_key());
+        let store = TrustStore::parse(first.store()).unwrap();
+        let anchors: Vec<_> = store.anchors().collect();
+        assert_eq!(anchors.len(), 1);
+        let anchor = anchors[0];
+        assert!(anchor.local && anchor.usage.certify);
+        assert_eq!(anchor.key_id, cert.body.issuer_key_id);
+        crypto::ed25519_verify(&anchor.key, &cert.body.signed_bytes().unwrap(), &cert.signature)
+            .unwrap();
+        let signature = first.sign(b"message").unwrap();
+        crypto::ed25519_verify(first.public_key(), b"message", &signature).unwrap();
+
+        let again = Identity::load(&dir, None, &work_tree(), &mut no_draw).unwrap();
+        assert_eq!(again.public_key(), first.public_key());
+        assert_eq!(again.store(), first.store());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a secret seed, or its directory, readable by other users
+    // of the build machine.
+    #[cfg(unix)]
+    #[test]
+    fn a_generated_seed_is_readable_by_its_owner_alone()
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("modes");
+        let dir = root.join("keys");
+        generate(&dir, &mut counter(1)).unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join(SEED_FILE)), 0o600);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: two builds that start at once each writing an identity,
+    // so one build's images are signed by a key the other's store lacks, or
+    // a losing build leaving its files behind.
+    #[test]
+    fn a_generation_that_finds_the_directory_filled_keeps_the_identity_there()
+    {
+        let root = scratch("race");
+        let dir = root.join("keys");
+        generate(&dir, &mut counter(1)).unwrap();
+        let first = Identity::load(&dir, None, &work_tree(), &mut no_draw).unwrap();
+        generate(&dir, &mut counter(50)).unwrap();
+        let kept = Identity::load(&dir, None, &work_tree(), &mut no_draw).unwrap();
+        assert_eq!(kept.public_key(), first.public_key());
+        assert_eq!(names(&root), ["keys"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a key written into, or read from, the work tree, where a
+    // commit or an archive of the tree would carry it.
+    #[test]
+    fn a_key_inside_the_work_tree_is_refused()
+    {
+        let root = scratch("inside");
+        let tree = root.join("tree");
+        fs::create_dir_all(tree.join("target")).unwrap();
+        let inside = tree.join("target").join("keys");
+        Identity::load(&inside, None, &tree, &mut no_draw).unwrap_err();
+        assert!(!inside.exists());
+
+        #[cfg(unix)]
+        {
+            // A directory reached through a link into the tree, and a seed
+            // file that is a link into it.
+            std::os::unix::fs::symlink(&tree, root.join("link")).unwrap();
+            let linked = root.join("link").join("keys");
+            Identity::load(&linked, None, &tree, &mut no_draw).unwrap_err();
+            assert!(!tree.join("keys").exists());
+
+            let dir = root.join("keys");
+            generate(&dir, &mut counter(1)).unwrap();
+            fs::rename(dir.join(SEED_FILE), tree.join("seed")).unwrap();
+            std::os::unix::fs::symlink(tree.join("seed"), dir.join(SEED_FILE)).unwrap();
+            Identity::load(&dir, None, &tree, &mut no_draw).unwrap_err();
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a build signing with a key the certificate does not
+    // name, whose images no store accepts, or one that proceeds on a partial
+    // identity.
+    #[test]
+    fn a_mismatched_or_incomplete_identity_is_refused()
+    {
+        let root = scratch("mismatch");
+        let (one, two) = (root.join("one"), root.join("two"));
+        generate(&one, &mut counter(1)).unwrap();
+        generate(&two, &mut counter(10)).unwrap();
+        fs::copy(two.join(SEED_FILE), one.join(SEED_FILE)).unwrap();
+        Identity::load(&one, None, &work_tree(), &mut no_draw).unwrap_err();
+
+        fs::remove_file(two.join(CERT_FILE)).unwrap();
+        Identity::load(&two, None, &work_tree(), &mut no_draw).unwrap_err();
+        fs::write(two.join(CERT_FILE), [0u8; 12]).unwrap();
+        Identity::load(&two, None, &work_tree(), &mut no_draw).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: an external signer whose input is not the message, or
+    // whose output is taken for a signature when it is not one.
+    #[cfg(unix)]
+    #[test]
+    fn an_external_signer_signs_its_standard_input_and_its_failures_are_refused()
+    {
+        let root = scratch("external");
+        let dir = root.join("keys");
+        generate(&dir, &mut counter(1)).unwrap();
+        // The external signer holds the key: no seed is read.
+        fs::remove_file(dir.join(SEED_FILE)).unwrap();
+        // `cat` writes back what it reads: a 64-byte message comes back as
+        // its signature.
+        let cat = Identity::load(&dir, Some(Path::new("cat")), &work_tree(), &mut no_draw).unwrap();
+        let message = [7u8; 64];
+        assert_eq!(cat.sign(&message).unwrap(), message);
+        cat.sign(b"short").unwrap_err();
+
+        let fails =
+            Identity::load(&dir, Some(Path::new("false")), &work_tree(), &mut no_draw).unwrap();
+        fails.sign(&message).unwrap_err();
+        let absent = Identity::load(
+            &dir,
+            Some(&root.join("no-such-signer")),
+            &work_tree(),
+            &mut no_draw,
+        )
+        .unwrap();
+        absent.sign(&message).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // Defect caught: a local identity generated beside an external signer,
+    // whose seed would then sign in its place.
+    #[test]
+    fn an_external_signer_without_an_identity_is_refused()
+    {
+        let root = scratch("external-empty");
+        let dir = root.join("keys");
+        Identity::load(&dir, Some(Path::new("cat")), &work_tree(), &mut no_draw).unwrap_err();
+        assert!(!dir.exists());
+        let _ = fs::remove_dir_all(&root);
+    }
 }

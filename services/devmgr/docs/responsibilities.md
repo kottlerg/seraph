@@ -76,9 +76,11 @@ devmgr's responsibilities are:
   (devmgr keeps no copy). A VT-d unit's cap is carved from the
   apertures and its scope is the DMAR's, resolved against the scan's bridges;
   a RISC-V IOMMU is a PCI function the ACPI RIMT names, whose cap is the first
-  page of its BAR 0, carved once devmgr has turned on the function's memory
-  decode and bus mastering, and whose scope is the RIMT's ID mappings: each
-  bus they cover whole and each scanned function on a bus they cover in part.
+  page of its BAR 0, carved before devmgr turns on the function's memory
+  decode and bus mastering, the hand-over's last step, so an IOMMU not
+  handed over is left as the firmware left it, and whose scope is the RIMT's
+  ID mappings: each bus they cover whole and each scanned function on a bus
+  they cover in part.
   The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
   `CREATE_PHYS_ACCESS` at `BOOT_DRIVER_PRIORITY`, and its hold is never
   released: devmgr deletes the release token of its create reply at the
@@ -114,7 +116,7 @@ devmgr's responsibilities are:
   holds, and the
   drivers-directory pass at `SET_DRIVERS_DIR`, over the declarations of the
   `/services/drivers/` entries (below). Each pass gathers the declarations
-  that match a device no driver is bound to, walks the unbound devices in PCI
+  that match an unbound device, walks the unbound devices in PCI
   segment, bus, device, function order, and binds each to its most specific
   match: an exact vendor and device key outranks a class key, two equally
   specific matches are a conflict that devmgr logs and binds neither of, and a

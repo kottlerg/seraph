@@ -45,7 +45,7 @@ on every input with the file's.
 
 | File | Inputs | Reference outcome |
 |---|---|---|
-| `ed25519.json` | `generated`: 128 rounds from seed `0x5e4a_ed25`, each a valid signature over a random message under a random key, with one-bit flips of the signature, message and key, a random key and a random signature. `edgeCases`: S + kL and the S range boundary, non-canonical and small-order R, every non-canonical public-key encoding, the torsion points as keys, and mixed-order keys with signatures crafted to satisfy or fail the cofactorless equation. `wycheproofAcceptable`: every case the vendored Wycheproof file marks acceptable | The first RFC 8032 check that fails, in order: S below L, then the public key the canonical encoding of a point (OpenSSL decodes such keys leniently, so the generator checks the encoding itself), then OpenSSL's cofactorless verification |
+| `ed25519.json` | `generated`: 128 rounds from seed `0x5e4a_ed25`, each a valid signature over a random message under a random key, with one-bit flips of the signature, message and key, a random key and a random signature. `edgeCases`: S + kL and the S range boundary, non-canonical and small-order R, every non-canonical public-key encoding, the torsion points as keys, and mixed-order keys with signatures crafted to satisfy or fail the cofactorless equation. `wycheproofAcceptable`: every case the vendored Wycheproof file marks acceptable. `signing`: seeds and messages, the RFC 8032 § 7.1 secrets, the all-zero and all-one seeds, and 48 inputs from seed `0x5e4a_5164` over messages either side of SHA-512's padding and block boundaries in the signer's two hashes, then of random lengths | For the verification sections, the first RFC 8032 check that fails, in order: S below L, then the public key the canonical encoding of a point (OpenSSL decodes such keys leniently, so the generator checks the encoding itself), then OpenSSL's cofactorless verification. For `signing`, the public key and the signature OpenSSL derives |
 | `sha512.json` | Every length from 0 to 300 bytes and 64 longer messages, from seed `0x5e4a_9512`, each with the split points of an incremental hash | OpenSSL's digest |
 
 The `generate` module writes both files, and the `crypto-reference-vectors` binary runs it:
@@ -55,8 +55,9 @@ builds the inputs (the generated ones from `rng::Rng`, the edge cases with the e
 arithmetic of `generate::edwards` and `generate::nat`, which are independent of
 `shared/crypto`) and gives each to the `openssl` command, which signs, verifies and hashes. The
 generator fails when OpenSSL accepts an S at or above L, when a crafted case does not reach the
-verdict it is built for, and when the public key OpenSSL derives from a secret differs from the
-one the edwards25519 arithmetic derives. The files in the tree were produced with OpenSSL 4.1.0;
+verdict it is built for, when the public key OpenSSL derives from a secret differs from the one
+the edwards25519 arithmetic derives, and when OpenSSL's key or signature for an RFC 8032 § 7.1
+secret differs from the RFC's. The files in the tree were produced with OpenSSL 4.1.0;
 the outcomes are fixed by RFC 8032 and FIPS 180-4, so another conforming OpenSSL writes the same
 bytes.
 
@@ -85,7 +86,7 @@ shared/crypto/testkit/
 │   ├── lib.rs                  # Crate root
 │   ├── wycheproof.rs           # Wycheproof loader and runner; EddsaVerify, AeadTest schemas
 │   ├── differential.rs         # Differential driver and report
-│   ├── ed25519.rs              # Ed25519 reference vectors: Verdict, Input, load
+│   ├── ed25519.rs              # Ed25519 reference vectors: Verdict, Input, SignInput, load
 │   ├── sha512.rs               # SHA-512 reference vectors: Input, load
 │   ├── vectors.rs              # LoadError; JSON field readers the loaders share
 │   ├── rng.rs                  # Seeded input generator (SplitMix64)
@@ -99,7 +100,7 @@ shared/crypto/testkit/
 │       └── crypto-reference-vectors.rs  # Writes or checks vectors/reference/
 └── vectors/
     ├── reference/
-    │   ├── ed25519.json        # Ed25519 inputs with OpenSSL's verdicts
+    │   ├── ed25519.json        # Ed25519 inputs with OpenSSL's verdicts, keys and signatures
     │   └── sha512.json         # SHA-512 inputs with OpenSSL's digests
     └── wycheproof/
         ├── LICENSE             # Upstream's Apache-2.0 license

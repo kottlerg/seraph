@@ -19,8 +19,9 @@ This document is authoritative for:
 - The verifier discipline every verifying stage follows.
 - Where keys live, how objects are signed, and what the trust store holds.
 
-The cryptographic primitives (SHA-512, Ed25519 verification) are specified in
-[shared/crypto/README.md](../shared/crypto/README.md). The bootloader's boot steps are specified in
+The cryptographic primitives (SHA-512, Ed25519 verification, key generation and signing) are
+specified in [shared/crypto/README.md](../shared/crypto/README.md). The bootloader's boot steps are
+specified in
 [core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md), procmgr's creation interface in
 [services/procmgr/docs/ipc-interface.md](../services/procmgr/docs/ipc-interface.md), and the
 platform's firmware baseline in [platform-requirements.md](platform-requirements.md).
@@ -31,14 +32,15 @@ platform's firmware baseline in [platform-requirements.md](platform-requirements
 
 The primitives exist: [`shared/crypto`](../shared/crypto/README.md) provides `ed25519_verify` and
 `Sha512`, tested against known-answer vectors, Wycheproof, and reference vectors computed with
-OpenSSL. The formats of § Signed Object Format, § Certificate Format and § Trust Store, and the
-verification of § Verification, are implemented and host-tested in
-[`shared/objsig`](../shared/objsig/README.md), which no component links yet. Everything else this
-document specifies is design intent, not yet implemented
+OpenSSL, and, behind its `sign` feature, the key generation and signing that § Signing requires of
+it (`ed25519_public_key`, `ed25519_sign`), tested against the same reference vectors and the
+verifier; no component enables the feature yet. The formats of § Signed Object Format,
+§ Certificate Format and § Trust Store, and the verification of § Verification, are implemented and
+host-tested in [`shared/objsig`](../shared/objsig/README.md), which no component links yet.
+Everything else this document specifies is design intent, not yet implemented
 ([#124](https://github.com/kottlerg/seraph/issues/124)): xtask's keys and signing, the bootloader's
 verification and hand-off of the trust store, and procmgr's verification and signature policy.
-Today no stage verifies the object it loads: every binary is trusted because of where it is
-stored.
+Today no stage verifies the object it loads: every binary is trusted because of where it is stored.
 
 ---
 

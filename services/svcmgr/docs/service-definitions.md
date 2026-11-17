@@ -577,6 +577,7 @@ registration is released, and svcmgr routes vfsd's death as system death
 
 [Fault Handling](../../../docs/fault-handling.md),
 [Process Lifecycle](../../../docs/process-lifecycle.md),
+[Session Supervision](../../../docs/session-supervision.md),
 [services/crashd/README.md](../../crashd/README.md),
 [crashd Operation](../../crashd/docs/operation.md),
 [init Bootstrap Stages](../../init/docs/bootstrap.md),

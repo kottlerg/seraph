@@ -238,7 +238,7 @@ fn main() -> !
             &mut watch,
             ipc_buf,
         );
-        registry.withdraw_deaths(&watch, ipc_buf);
+        registry.withdraw_deaths(&watch, &mut caps.slot_bars, ipc_buf);
         match watch.wait()
         {
             Ok(_) => guard.on_success(),
@@ -661,7 +661,7 @@ impl Registry
     /// reported ready or died). Each driver is appended in a hold of its own;
     /// a query meanwhile sees the batch's drivers appended so far, and one
     /// that finds none waits for the batch's job to be done.
-    fn serve(&self, roster: Roster<SpawnedDriver>, ipc_buf: *mut u64)
+    fn serve(&self, roster: Roster<SpawnedDriver>, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
         for (state, spawned) in roster.into_outcomes()
         {
@@ -687,7 +687,7 @@ impl Registry
                 ),
             };
             std::os::seraph::log!(warn: "{}: {}", name.as_str(), why);
-            driver.withdraw(ipc_buf);
+            driver.withdraw(held, ipc_buf);
         }
     }
 
@@ -695,7 +695,7 @@ impl Registry
     /// served that has since died. A post for a driver no class serves (one
     /// already withdrawn, or one destroyed when its batch timed out) changes
     /// nothing.
-    fn withdraw_dead(&self, post: DeathPost, ipc_buf: *mut u64)
+    fn withdraw_dead(&self, post: DeathPost, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
         let taken = self.lock().served.take_dead(post.badge);
         match taken
@@ -708,7 +708,7 @@ impl Registry
                     post.badge,
                     post.reason
                 );
-                self.fail_iommu(ipc_buf);
+                self.fail_iommu(held, ipc_buf);
             }
             Some((Some(class), driver)) =>
             {
@@ -718,7 +718,7 @@ impl Registry
                     post.badge,
                     post.reason
                 );
-                driver.withdraw(ipc_buf);
+                driver.withdraw(held, ipc_buf);
             }
             None =>
             {}
@@ -730,7 +730,7 @@ impl Registry
     /// already) and, once, withdraw every served driver of a device it
     /// confines, whose mappings can no longer change, one per hold of the
     /// lock.
-    fn fail_iommu(&self, ipc_buf: *mut u64)
+    fn fail_iommu(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
         let failed = self.lock().served.note_iommu_failed();
         let Some((client, first)) = failed
@@ -756,16 +756,53 @@ impl Registry
                 warn: "{}: its device's IOMMU is gone; withdrawn",
                 class.as_str()
             );
-            driver.withdraw(ipc_buf);
+            driver.withdraw(held, ipc_buf);
         }
     }
 
+    /// Withdraw the served driver of the PCI function at `address`, if a
+    /// class serves one: its device is being removed from a hotplug slot.
+    /// Taken out of its class in one hold of the lock, leaving its tombstone,
+    /// and withdrawn ([`ServedDriver::withdraw`]) once the lock is released,
+    /// the caps on its device's BARs given back to the held BAR pages
+    /// `held`. Returns whether a driver was withdrawn.
+    fn withdraw_at(
+        &self,
+        address: (u16, u8, u8, u8),
+        held: &mut SpanTable<u64>,
+        ipc_buf: *mut u64,
+    ) -> bool
+    {
+        let taken = self.lock().served.take_at(address);
+        let Some((class, driver)) = taken
+        else
+        {
+            return false;
+        };
+        let (segment, bus, dev, func) = address;
+        std::os::seraph::log!(
+            "{}: its device {}:{}:{}.{} is removed; withdrawn",
+            class.as_str(),
+            segment,
+            bus,
+            dev,
+            func
+        );
+        driver.withdraw(held, ipc_buf);
+        true
+    }
+
     /// Withdraw every served driver whose death the watch's queue holds.
-    fn withdraw_deaths(&self, watch: &settle::DriverWatch, ipc_buf: *mut u64)
+    fn withdraw_deaths(
+        &self,
+        watch: &settle::DriverWatch,
+        held: &mut SpanTable<u64>,
+        ipc_buf: *mut u64,
+    )
     {
         while let Some(post) = watch.take_death()
         {
-            self.withdraw_dead(post, ipc_buf);
+            self.withdraw_dead(post, held, ipc_buf);
         }
     }
 
@@ -1518,9 +1555,8 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
 // ── Aperture splitting helper ───────────────────────────────────────────────
 
 /// Carve a narrow `Mmio` cap of `(phys, size)`, its end rounded up to a
-/// page, out of the held BAR pages of a managed slot's function
-/// ([`caps::DevmgrCaps::slot_bars`]) that cover it, else out of whichever
-/// aperture covers it. The lower remainder
+/// page, out of the held BAR pages ([`caps::DevmgrCaps::slot_bars`]) that
+/// cover it, else out of whichever aperture covers it. The lower remainder
 /// `[ap_base, phys)` and the upper remainder stay in their table as
 /// caps of their own: the surrounding range may host other useful MMIO
 /// (e.g. the framebuffer lives below the ECAM in the same parent aperture on
@@ -1528,14 +1564,22 @@ fn keep_ecam(caps: &mut caps::DevmgrCaps, loc: &firmware::EcamLocation, ecam_cap
 /// table cannot grow, or a split fails.
 pub fn carve_subrange(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<u64>
 {
-    let carved = match caps.slot_bars.carve(phys, size, PAGE_SIZE, split_mmio)
+    carve_bar(caps, phys, size).map(|span| span.slot)
+}
+
+/// [`carve_subrange`], returning the carved cap with the range it covers,
+/// under which a withdrawal gives a BAR's cap back to the held BAR pages
+/// (`bind::PciDeviceCaps::release`).
+pub fn carve_bar(caps: &mut caps::DevmgrCaps, phys: u64, size: u64) -> Option<Span<u64>>
+{
+    let carved = match caps.slot_bars.carve_span(phys, size, PAGE_SIZE, split_mmio)
     {
-        Err(CarveError::NotCovered) => carve_aperture(caps, phys, size),
+        Err(CarveError::NotCovered) => caps.apertures.carve_span(phys, size, PAGE_SIZE, split_mmio),
         carved => carved,
     };
     match carved
     {
-        Ok(cap) => Some(cap),
+        Ok(span) => Some(span),
         Err(CarveError::NotCovered) => None,
         Err(e) =>
         {
@@ -1959,8 +2003,9 @@ impl ServedDriver
     /// Withdraw the driver, live or dead: take its PCI device from it and
     /// destroy it ([`bind::withdraw_device`]), or destroy a driver with no
     /// such device through its process handle when devmgr still keeps one (a
-    /// no-op for one procmgr has reaped); then [`Self::release`].
-    fn withdraw(&self, ipc_buf: *mut u64)
+    /// no-op for one procmgr has reaped); then [`Self::release`], the caps on
+    /// its device's BARs given back to the held BAR pages `held`.
+    fn withdraw(&self, held: &mut SpanTable<u64>, ipc_buf: *mut u64)
     {
         if let Some(dev_caps) = &self.dev_caps
         {
@@ -1984,15 +2029,16 @@ impl ServedDriver
                 spawn::destroy_child(self.process_handle, ipc_buf);
             }
         }
-        self.release();
+        self.release(held);
     }
 
     /// Release what the registry holds for the driver: revoke its service
     /// endpoint, when it holds one (every copy derived from it: the driver's
     /// receive copy and every client SEND), and delete it, so callers queued
-    /// on it return, and release the device's caps. The device's catalog
-    /// entry stays, so its badge is never recycled.
-    fn release(&self)
+    /// on it return, and release the device's caps, those on a PCI device's
+    /// BARs given back to `held` (`bind::PciDeviceCaps::release`). The
+    /// device's catalog entry stays, so its badge is never recycled.
+    fn release(&self, held: &mut SpanTable<u64>)
     {
         if self.ep != 0
         {
@@ -2001,7 +2047,7 @@ impl ServedDriver
         }
         if let Some(dev_caps) = &self.dev_caps
         {
-            dev_caps.release();
+            dev_caps.release(held);
         }
         if let Some(platform) = &self.platform_caps
         {
@@ -2025,7 +2071,12 @@ struct SpawnedDriver
 /// ([`ServedDriver::withdraw`]) when the roster cannot hold it (its room is
 /// reserved before each spawn, so only a repeated device badge, which the
 /// catalog never issues, reaches that).
-fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ipc_buf: *mut u64)
+fn record_spawned(
+    roster: &mut Roster<SpawnedDriver>,
+    spawned: SpawnedDriver,
+    held: &mut SpanTable<u64>,
+    ipc_buf: *mut u64,
+)
 {
     if let Err(spawned) = roster.add(spawned.badge, spawned)
     {
@@ -2033,7 +2084,7 @@ fn record_spawned(roster: &mut Roster<SpawnedDriver>, spawned: SpawnedDriver, ip
             warn: "{}: driver not recorded; device not served",
             spawned.name.as_str()
         );
-        spawned.driver.withdraw(ipc_buf);
+        spawned.driver.withdraw(held, ipc_buf);
     }
 }
 
@@ -2181,23 +2232,57 @@ impl ServedDrivers
         self.classes.signal(&class, signal_watcher);
         Some((class, driver))
     }
+
+    /// Take out the served driver of the PCI function at `address`, leaving
+    /// its tombstone, for the caller to withdraw, its class's watchers
+    /// signalled; `None` when no class serves one. A record is bound at most
+    /// once, so at most one driver is served for an address's live record.
+    fn take_at(&mut self, address: (u16, u8, u8, u8)) -> Option<(ClassName, ServedDriver)>
+    {
+        let at = |d: &ServedDriver| d.dev_caps.as_ref().is_some_and(|c| c.address == address);
+        let mut taken = None;
+        for (class, served) in self.classes.iter_mut()
+        {
+            let found = core::cell::Cell::new(false);
+            served.withdraw_matching(
+                |d| !found.get() && at(d),
+                |d| {
+                    found.set(true);
+                    taken = Some((*class, d));
+                },
+            );
+            if taken.is_some()
+            {
+                break;
+            }
+        }
+        let (class, driver) = taken?;
+        self.classes.signal(&class, signal_watcher);
+        Some((class, driver))
+    }
 }
 
 /// Settle `batch` against `watch` and serve its drivers: withdraw, in the
 /// served classes, every driver whose death the settle takes outside the
 /// batch, then revoke the batch's private endpoint and serve the batch
-/// ([`Registry::serve`]).
+/// ([`Registry::serve`]). A withdrawal gives its device's BAR caps back to
+/// the held BAR pages `held`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the settle takes the batch, its roster, the death watch, the catalog, the registry,               the held BAR pages its withdrawals give back to, and its bound"
+)]
 fn settle_batch(
     batch: settle::SettleBatch,
     mut roster: Roster<SpawnedDriver>,
     watch: &mut settle::DriverWatch,
     catalog: &DeviceCatalog,
     registry: &Registry,
+    held: &mut SpanTable<u64>,
     bound: core::time::Duration,
     ipc_buf: *mut u64,
 )
 {
-    let mut on_other_death = |post| registry.withdraw_dead(post, ipc_buf);
+    let mut on_other_death = |post| registry.withdraw_dead(post, held, ipc_buf);
     let end = batch.settle(
         watch,
         &mut roster,
@@ -2214,7 +2299,7 @@ fn settle_batch(
         );
     }
     drop(batch);
-    registry.serve(roster, ipc_buf);
+    registry.serve(roster, held, ipc_buf);
 }
 
 /// Spawn and settle the boot batch: the boot pass over every record
@@ -2270,6 +2355,7 @@ fn spawn_boot_drivers(
         watch,
         catalog,
         registry,
+        &mut caps.slot_bars,
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
@@ -2328,6 +2414,7 @@ fn spawn_dir_drivers(
         watch,
         carve.catalog,
         registry,
+        &mut carve.caps.slot_bars,
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );

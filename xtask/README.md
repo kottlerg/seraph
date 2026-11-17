@@ -1205,11 +1205,12 @@ seconds. The boot is one of the two of the debug-port device cell of the local a
 
 ### `cargo xtask test-hotplug`
 
-Check devmgr's PCI Express native hotplug add path, on either arch. Stages the `hotplug-check`
-fixture's recipe ([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
+Check devmgr's PCI Express native hotplug add and removal paths, on either arch. Stages the
+`hotplug-check` fixture's recipe
+([services/hotplug-check/README.md](../services/hotplug-check/README.md)) from
 `config/svcmgr/tests/` into `config/svcmgr/services/` and the `test-dma` class file from
-`config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout
-they have. It boots the current sysroot headless, with an empty `pcie-root-port` (`-device
+`config/devmgr/tests/` into `config/devmgr/classes/`, and repacks the disk images in the layout they
+have. It boots the current sysroot headless, with an empty `pcie-root-port` (`-device
 pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
 
 1. on x86_64 only, under the machine's default, whose `_OSC` withholds native hotplug control:
@@ -1219,7 +1220,10 @@ pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c`) and a QMP socket:
    the `qemu-virt.platform` key grants it): once devmgr logs the slot `managed (native control
    by` and the fixture logs `[hotplug-check] READY for the hot-added device`, it hot-adds QEMU's
    `edu` device behind the port (QMP `device_add`, `dma_mask=0xffffffff` as the test devices'
-   `edu` has), and passes on the fixture's `[hotplug-check] PASS` line.
+   `edu` has). Once the fixture logs `[hotplug-check] READY for the removal`, it removes the
+   device (QMP `device_del`) and waits up to a minute for QEMU's `DEVICE_DELETED` event, then
+   for devmgr's removal lines in their order and the fixture's `WITHDRAWN at ordinal 0` line; it
+   then hot-adds the device again, and passes on the fixture's `[hotplug-check] PASS` line.
 
 It kills QEMU after each boot, then removes the staged files and repacks the images in that layout
 again, whatever the outcome. [docs/testing.md](../docs/testing.md) § PCI Express hotplug

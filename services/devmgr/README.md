@@ -67,8 +67,8 @@ devmgr/
 
 devmgr parses firmware tables, enumerates PCI devices, binds and spawns drivers, exposes the device
 registry, brokers ACPI tables to acpid and the RISC-V shutdown cap to pwrmgr, and adds the functions
-a card brings to a PCI Express hotplug slot it controls natively (hotplug removal is design intent;
-not yet implemented); it is the sole authority for spawning device drivers. Each responsibility, the
+a card brings to a PCI Express hotplug slot it controls natively, and withdraws and removes them
+when the card leaves; it is the sole authority for spawning device drivers. Each responsibility, the
 capabilities devmgr receives at bootstrap, and its relationship to driver processes are specified in
 [docs/responsibilities.md](docs/responsibilities.md); the system-scope design is
 [docs/device-management.md](../../docs/device-management.md).

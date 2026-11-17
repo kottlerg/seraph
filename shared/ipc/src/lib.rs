@@ -3683,7 +3683,7 @@ pub mod devmgr_dma_labels
     /// Request: no field past `data[0]`. Reply: label `SUCCESS` with
     /// `data[0]` = [`DMA_CONFINED`] when an IOMMU confines the device and 0
     /// when none does; `data[1]` = the faults devmgr has taken for the device
-    /// over the boot, 0 for an unconfined device; `data[2]` = the IOVA of the
+    /// since its DMA grant, 0 for an unconfined device; `data[2]` = the IOVA of the
     /// latest, page aligned, 0 with none. Or `devmgr_dma_errors::UNAUTHORIZED`
     /// (the device is withdrawn or was never given DMA), or
     /// `devmgr_dma_errors::LABEL_VERSION_MISMATCH`.
@@ -3827,7 +3827,7 @@ pub struct DmaFaults
 {
     /// An IOMMU confines the device.
     pub confined: bool,
-    /// The faults devmgr has taken for the device over the boot.
+    /// The faults devmgr has taken for the device since its DMA grant.
     pub count: u64,
     /// The IOVA of the latest, page aligned; 0 with none.
     pub last_iova: u64,

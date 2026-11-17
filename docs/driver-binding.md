@@ -18,9 +18,9 @@ enumerates every kind of device record of § Device Records (PCI, the ACPI names
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
 path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. PCI Express native hotplug's add path is implemented; hotplug removal and the
-ACPI hotplug source are design intent, not yet implemented (§ Hotplug,
-[#939](https://github.com/kottlerg/seraph/issues/939)).
+§ Binding gives. PCI Express native hotplug's add and removal paths are implemented; the ACPI
+hotplug source is design intent, not yet implemented (§ Hotplug,
+[#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.
@@ -411,9 +411,9 @@ driver, which leaves a tombstone at its ordinal. Either change signals the class
 (§ Device Classes), so a consumer learns of it without probing. The event sources are
 specified in [services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md): devmgr
 appends and binds a function added to a PCI Express slot it controls natively, under the host
-bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant. Removal and
-the ACPI hotplug source are design intent; not yet implemented
-([#939](https://github.com/kottlerg/seraph/issues/939)).
+bridge's `_OSC` or the platform description table's `pcie_native_hotplug` grant, and withdraws
+the driver of a function removed from one before it powers the slot off. The ACPI hotplug source
+is design intent; not yet implemented ([#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 ---
 

@@ -41,8 +41,8 @@ page. devmgr refuses, and logs the refusal with the range it collides with:
   space is reachable;
 - the FACS, whose Global Lock and waking vector acpid does not own;
 - memory that no `Mmio` aperture devmgr still holds covers: RAM, runtime-services memory, ACPI
-  NVS, the ranges devmgr has carved for itself or a driver, and the BAR pages it holds for the
-  functions behind a managed hotplug slot
+  NVS, the ranges devmgr has carved for itself or a driver, and the BAR pages it holds: those of
+  the functions behind a managed hotplug slot, and the BAR caps a withdrawal gave back
   ([devmgr's hotplug.md](../../devmgr/docs/hotplug.md#add-job) § Add Job). The apertures never
   cover the first three
   ([core/boot/docs/firmware-parsing.md](../../../core/boot/docs/firmware-parsing.md) § Firmware

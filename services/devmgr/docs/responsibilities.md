@@ -319,7 +319,12 @@ devmgr's responsibilities are:
   devmgr's release. devmgr binds no driver to a PCI device whose
   configuration page it cannot carve or map, since it could not clear that
   function's Bus Master Enable. Then the driver's service endpoint is revoked
-  and deleted and its BAR, DMA, configuration-page, and IRQ caps released. A
+  and deleted and its BAR, DMA, configuration-page, and IRQ caps released: each
+  BAR cap (an `Mmio` resource's, and the MSI-X table's) goes back to devmgr's
+  held BAR pages over the range it covers, from which a later bind carves it
+  again, and is deleted, logged, only when a copy of it cannot be revoked or
+  the table cannot record it ([`docs/hotplug.md`](hotplug.md#removal)
+  § Removal). A
   withdrawn driver of a platform record has its copies of the record's caps
   revoked, the `Mmio`, `IoPort`, and wired-line caps devmgr carved and keeps,
   and is destroyed through its process handle while devmgr still keeps it (until
@@ -405,7 +410,7 @@ devmgr's responsibilities are:
   device's own caller: devmgr takes and logs the IOMMU driver's recorded faults
   (`iommu_labels::TAKE_FAULTS`), and replies `data[0]` = `DMA_CONFINED` (1)
   when an IOMMU confines the device, else 0, `data[1]` = DMA translation
-  faults taken for the device over the boot, `data[2]` = the latest's IOVA,
+  faults taken for the device since its DMA grant, `data[2]` = the latest's IOVA,
   page aligned, 0 with none (a VT-d interrupt-remapping fault, whose
   recorded address is a remapping table handle, is logged only);
   `UNAUTHORIZED` when the device is withdrawn or was never given DMA.
@@ -603,8 +608,11 @@ devmgr's responsibilities are:
   table's `pcie_native_hotplug`). A poller thread reads each managed slot's Slot Status every
   second, powers up a slot a card arrives in, and posts the arrival; the control thread places
   and programs the new functions' BARs in the slot's windows, appends their records, and binds
-  them in a hotplug batch (above). Removal and the ACPI hotplug source are design intent; not
-  yet implemented. See [`docs/hotplug.md`](hotplug.md).
+  them in a hotplug batch (above). When a card leaves, or its removal is asked for with the
+  attention button, the poller posts the removal; the control thread withdraws each driver behind
+  the slot as below, quiesces the functions, returns their BAR pages to the apertures and removes
+  their records, and the poller then powers the slot off. The ACPI hotplug source is design
+  intent; not yet implemented. See [`docs/hotplug.md`](hotplug.md).
 
 ---
 

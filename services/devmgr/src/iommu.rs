@@ -483,28 +483,6 @@ fn drain(ep: u64)
     }
 }
 
-/// The DMA translation faults devmgr has taken for each device, by requester
-/// ID: the count and the latest's IOVA. An interrupt-remapping fault is
-/// logged only ([`take_and_log`]).
-#[derive(Default)]
-struct FaultCounts(Vec<(u64, u64, u64)>);
-
-impl FaultCounts
-{
-    fn record(&mut self, rid: u64, iova: u64)
-    {
-        if let Some(e) = self.0.iter_mut().find(|e| e.0 == rid)
-        {
-            e.1 = e.1.saturating_add(1);
-            e.2 = iova;
-        }
-        else if self.0.try_reserve(1).is_ok()
-        {
-            self.0.push((rid, 1, iova));
-        }
-    }
-}
-
 /// The firmware's description of the units devmgr discovered, against which
 /// it places each device.
 enum Topology
@@ -622,7 +600,7 @@ pub struct Iommu
 {
     client: Arc<IommuClient>,
     topology: Topology,
-    faults: Arc<Mutex<FaultCounts>>,
+    faults: Arc<Mutex<firmware::dma::FaultCounts>>,
     /// The `(base, size)` of every extent of memory memmgr pools, as init
     /// reports it; `None` when the set is not known in full.
     pooled: Option<Vec<(u64, u64)>>,
@@ -901,35 +879,71 @@ impl Iommu
     }
 
     /// Take the driver's recorded faults and log each against its device;
-    /// returns the faults taken for the function `rid` over the boot and the
-    /// IOVA of the latest.
+    /// returns the faults taken for the device given DMA under requester ID
+    /// `rid` since its grant ([`Self::track_faults`]) and the IOVA of the
+    /// latest.
     pub fn log_faults(&self, rid: u64) -> (u64, u64)
     {
         take_and_log(&self.client, &self.faults);
-        let counts = self.faults.lock().unwrap_or_else(PoisonError::into_inner);
-        counts
-            .0
-            .iter()
-            .find(|e| e.0 == rid)
-            .map_or((0, 0), |e| (e.1, e.2))
+        self.faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .count(rid)
+    }
+
+    /// Count the faults of requester ID `rid` from zero, a device having been
+    /// given DMA under it: first take the faults the driver recorded, so one
+    /// raised by an earlier device at the same address, whose slot is powered
+    /// off before the new device can arrive, is logged and not counted
+    /// (`firmware::dma::FaultCounts`). Logged when the table cannot grow; the
+    /// device's faults are then logged only.
+    pub fn track_faults(&self, rid: u64)
+    {
+        take_and_log(&self.client, &self.faults);
+        let tracked = self
+            .faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .track(rid);
+        if tracked.is_err()
+        {
+            std::os::seraph::log!(
+                warn: "IOMMU: no memory to count the faults of requester {:#x}; logged only",
+                rid
+            );
+        }
+    }
+
+    /// Stop counting the faults of requester ID `rid`: its device's DMA was
+    /// withdrawn, and a fault it raises from now on is logged only.
+    pub fn untrack_faults(&self, rid: u64)
+    {
+        self.faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .untrack(rid);
     }
 }
 
-/// Take `client`'s recorded faults and log each, recording a DMA translation
-/// fault in `counts`; a VT-d interrupt-remapping fault names a remapping
-/// table handle, not an IOVA ([`Family::fault_site`]), and is logged only.
+/// Take `client`'s recorded faults and log each, counting a DMA translation
+/// fault in `counts` when a live device's grant tracks its requester ID
+/// (`firmware::dma::FaultCounts`); a VT-d interrupt-remapping fault names a
+/// remapping table handle, not an IOVA ([`Family::fault_site`]), and is
+/// logged only.
 ///
 /// `counts` stays locked from before the take until every fault taken is
 /// recorded, so a caller that reads `counts` after its own take sees every
 /// fault another thread's take has handed devmgr (the DMA thread's
-/// `DMA_FAULTS` reads it beside the fault-log thread). The lock is held
-/// across the `TAKE_FAULTS` IPC, which `docs/coding-standards.md`
-/// § Concurrency advises against: only the fault-log thread and the DMA
-/// thread, serving `DMA_FAULTS`, take it, so a waiter waits no longer than
-/// the holders' calls to the driver, each no longer than its own would, and
-/// a dead driver's calls are answered (`IommuClient::fail`), so the holder
-/// does not block for good.
-fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
+/// `DMA_FAULTS` reads it beside the fault-log thread), and a requester ID
+/// tracked after a take ([`Iommu::track_faults`]) is charged no fault taken
+/// before. The lock is held across the `TAKE_FAULTS` IPC, which
+/// `docs/coding-standards.md` § Concurrency advises against: only the
+/// fault-log thread, the DMA thread serving `DMA_FAULTS`, and the control
+/// thread at a confined device's grant take it, so a waiter waits no longer
+/// than the holders' calls to the driver, each no longer than its own would,
+/// and a dead driver's calls are answered (`IommuClient::fail`), so the
+/// holder does not block for good.
+fn take_and_log(client: &IommuClient, counts: &Mutex<firmware::dma::FaultCounts>)
 {
     let mut counts = counts.lock().unwrap_or_else(PoisonError::into_inner);
     let mut taken = Vec::new();
@@ -940,30 +954,46 @@ fn take_and_log(client: &IommuClient, counts: &Mutex<FaultCounts>)
         }
     });
     let family = arch::current::IOMMU_FAMILY;
+    let mut counted = Vec::new();
+    let _ = counted.try_reserve_exact(taken.len());
     for &(rid, reason, address) in &taken
     {
-        if let dmar::FaultSite::Iova(iova) = family.fault_site(reason, address)
+        let charged = match family.fault_site(reason, address)
         {
-            counts.record(rid, iova);
+            dmar::FaultSite::Iova(iova) => counts.record(rid, iova),
+            dmar::FaultSite::InterruptHandle(_) => true,
+        };
+        if counted.len() < counted.capacity()
+        {
+            counted.push(charged);
         }
     }
     drop(counts);
-    for (rid, reason, address) in taken
+    for (i, (rid, reason, address)) in taken.into_iter().enumerate()
     {
         let (what, value) = match family.fault_site(reason, address)
         {
             dmar::FaultSite::Iova(iova) => ("IOVA", iova),
             dmar::FaultSite::InterruptHandle(handle) => ("interrupt remapping handle", handle),
         };
+        let uncounted = if counted.get(i).copied().unwrap_or(true)
+        {
+            ""
+        }
+        else
+        {
+            "; no live DMA grant, not counted"
+        };
         std::os::seraph::log!(
-            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} {} {:#x}",
+            warn: "IOMMU fault: device {}:{}:{}.{} reason {:#x} {} {:#x}{}",
             rid >> 16,
             (rid >> 8) & 0xff,
             (rid >> 3) & 0x1f,
             rid & 7,
             reason,
             what,
-            value
+            value,
+            uncounted
         );
     }
 }
@@ -1397,7 +1427,7 @@ pub fn bring_up(
     let handed = handed.units.len();
     let _ = client.widths.set(query_widths(&client, handed));
     registry.set_iommu(Arc::clone(&client));
-    let faults = Arc::new(Mutex::new(FaultCounts::default()));
+    let faults = Arc::new(Mutex::new(firmware::dma::FaultCounts::new()));
     start_fault_log(&client, &faults);
     std::os::seraph::log!("IOMMU: {} {} translating", handed as u64, family.units());
     Some(Iommu {
@@ -1611,7 +1641,7 @@ enum Settled
               batch's death queue, the catalog, and the registry"
 )]
 fn spawn_and_settle(
-    caps: &caps::DevmgrCaps,
+    caps: &mut caps::DevmgrCaps,
     decl: &DriverDecl,
     grants: &firmware::binding::Grants,
     module: (u64, spawn::ModuleCapGuard),
@@ -1690,13 +1720,14 @@ fn spawn_and_settle(
             process_handle,
         },
     };
-    crate::record_spawned(&mut roster, spawned, ipc_buf);
+    crate::record_spawned(&mut roster, spawned, &mut caps.slot_bars, ipc_buf);
     crate::settle_batch(
         batch,
         roster,
         watch,
         catalog,
         registry,
+        &mut caps.slot_bars,
         settle::SETTLE_TIMEOUT,
         ipc_buf,
     );
@@ -1712,7 +1743,7 @@ fn spawn_and_settle(
 
 /// Start devmgr's fault-log thread: every [`FAULT_LOG_MS`] it takes the
 /// driver's recorded faults and logs each against its device.
-fn start_fault_log(client: &Arc<IommuClient>, faults: &Arc<Mutex<FaultCounts>>)
+fn start_fault_log(client: &Arc<IommuClient>, faults: &Arc<Mutex<firmware::dma::FaultCounts>>)
 {
     let client = Arc::clone(client);
     let faults = Arc::clone(faults);

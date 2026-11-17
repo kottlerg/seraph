@@ -20,9 +20,12 @@ use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
 
 use crate::acpid::{Address, Bridge, Bridges, Osc, address};
-use crate::pci::{CAP_ID_PCI_EXPRESS, COMMAND, COMMAND_MEMORY, STATUS, find_capability};
+use crate::pci::{
+    CAP_ID_PCI_EXPRESS, COMMAND, COMMAND_BUS_MASTER, COMMAND_INTERRUPT_DISABLE, COMMAND_MEMORY,
+    STATUS, find_capability,
+};
 use crate::pci_records::{AppendError, PciRecords, RecordState};
-use crate::resource::Span;
+use crate::resource::{CarveError, Span, SpanTable, SplitError};
 use crate::scan::{ConfigSpace, MAX_BARS, PciDevice};
 
 /// Offset of the PCI Express Capabilities register in the capability: bits
@@ -65,6 +68,10 @@ pub const SLOTCTL_EVENT_ENABLES: u16 = 0x3F | (1 << 12);
 const SLOTCTL_POWER_INDICATOR: u16 = 0x3 << 8;
 /// Power Indicator Control: on.
 const SLOTCTL_POWER_INDICATOR_ON: u16 = 0x1 << 8;
+/// Power Indicator Control: blinking.
+const SLOTCTL_POWER_INDICATOR_BLINK: u16 = 0x2 << 8;
+/// Power Indicator Control: off.
+const SLOTCTL_POWER_INDICATOR_OFF: u16 = 0x3 << 8;
 /// Slot Control: Power Controller Control; set, the slot's power is off.
 const SLOTCTL_POWER_OFF: u16 = 1 << 10;
 /// Offset of Slot Status.
@@ -767,7 +774,8 @@ pub const fn refusal(error: AppendError) -> &'static str
     }
 }
 
-/// Where the poller holds a managed slot.
+/// Where the poller holds a managed slot
+/// ([hotplug.md](../../docs/hotplug.md) § Poller).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotState
 {
@@ -779,56 +787,148 @@ pub enum SlotState
     /// An arrival failed to bring the slot's link up; the slot waits for the
     /// card's removal before it is tried again.
     Failed,
-    /// The card of an occupied slot is gone, or its attention button was
-    /// pressed, and the removal was reported once; the slot is occupied
-    /// again once its card is present with the button not pressed.
-    Departed,
+    /// The attention button of an occupied slot was pressed: the power
+    /// indicator blinks, and the removal starts once `polls_left` more polls
+    /// pass with the button not pressed again and the card present.
+    Pressed
+    {
+        polls_left: u64
+    },
+    /// The removal job is posted: the slot waits for the control thread's
+    /// completion ([`completed`]), whatever its status reads meanwhile, and
+    /// is powered off only then.
+    Removing,
+    /// The removal completed with the card still present: the slot is
+    /// powered off until its attention button is pressed or a card is
+    /// inserted again.
+    Off,
 }
+
+/// The attention button's abort window, in milliseconds: a second press
+/// within it cancels the removal (PCI Express Base Specification r4.0
+/// § 6.7.1.5).
+const ABORT_WINDOW_MS: u64 = 5000;
+
+/// The polls of [`HOTPLUG_POLL_MS`] the abort window lasts.
+pub const ABORT_POLLS: u64 = ABORT_WINDOW_MS / HOTPLUG_POLL_MS;
+
+// The window is a whole number of polls, at least one.
+const _: () = assert!(ABORT_WINDOW_MS.is_multiple_of(HOTPLUG_POLL_MS) && ABORT_POLLS >= 1);
 
 /// What the poller does after reading a slot's Slot Status.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action
 {
     None,
-    /// A card is present in an empty slot: power the slot on, wait for its
-    /// link, and post its add job. The slot is then occupied, or failed when
-    /// the link does not come up.
+    /// A card is present in an empty slot, or one powered off since its
+    /// removal is asked for again: power the slot on, wait for its link, and
+    /// post its add job. The slot is then occupied, or failed when the link
+    /// does not come up.
     PowerUp,
-    /// The card of an occupied slot is gone, or its attention button was
-    /// pressed: the removal path, which devmgr does not run; the event is
-    /// logged.
-    Removal,
+    /// The attention button was pressed: blink the power indicator for the
+    /// abort window.
+    Blink,
+    /// The button was pressed again within the abort window: the removal is
+    /// cancelled, and the power indicator turns on again.
+    Cancel,
+    /// Post the slot's removal job. The slot is powered off once the job
+    /// completes ([`completed`]).
+    Remove,
 }
 
 /// The poller's decision for a slot in `state` whose Slot Status reads
 /// `status`, with the state it holds the slot in after any action but
-/// [`Action::PowerUp`]. A status of all ones, from a port that does not
-/// answer, changes nothing.
+/// [`Action::PowerUp`]. `link_down` is whether the slot reports its link
+/// (Data Link Layer Link Active Reporting) and the link went down since the
+/// last poll: Data Link Layer State Changed is latched and Link Active reads
+/// clear. A status of all ones, from a port that does not answer, changes
+/// nothing.
 #[must_use]
-pub const fn next(state: SlotState, status: u16) -> (SlotState, Action)
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "`link_down` is the one link reading the poller makes beside Slot Status"
+)]
+pub const fn next(state: SlotState, status: u16, link_down: bool) -> (SlotState, Action)
 {
     if status == u16::MAX
     {
         return (state, Action::None);
     }
     let present = status & SLOTSTA_PRESENT != 0;
+    let pressed = status & SLOTSTA_BUTTON != 0;
+    let gone = !present || link_down;
     match state
     {
         SlotState::Empty if present => (SlotState::Empty, Action::PowerUp),
-        SlotState::Occupied if !present || status & SLOTSTA_BUTTON != 0 =>
+        SlotState::Occupied | SlotState::Pressed { .. } if gone =>
         {
-            (SlotState::Departed, Action::Removal)
+            (SlotState::Removing, Action::Remove)
         }
-        SlotState::Failed if !present => (SlotState::Empty, Action::None),
-        SlotState::Departed if present && status & SLOTSTA_BUTTON == 0 =>
+        SlotState::Occupied if pressed => (
+            SlotState::Pressed {
+                polls_left: ABORT_POLLS,
+            },
+            Action::Blink,
+        ),
+        SlotState::Pressed { .. } if pressed => (SlotState::Occupied, Action::Cancel),
+        SlotState::Pressed { polls_left } if polls_left <= 1 =>
         {
-            (SlotState::Occupied, Action::None)
+            (SlotState::Removing, Action::Remove)
         }
-        SlotState::Empty | SlotState::Occupied | SlotState::Failed | SlotState::Departed =>
+        SlotState::Pressed { polls_left } => (
+            SlotState::Pressed {
+                polls_left: polls_left.saturating_sub(1),
+            },
+            Action::None,
+        ),
+        SlotState::Off if present && (pressed || status & SLOTSTA_PRESENCE_CHANGED != 0) =>
         {
-            (state, Action::None)
+            (SlotState::Off, Action::PowerUp)
         }
+        SlotState::Failed | SlotState::Off if !present => (SlotState::Empty, Action::None),
+        SlotState::Empty
+        | SlotState::Occupied
+        | SlotState::Failed
+        | SlotState::Removing
+        | SlotState::Off => (state, Action::None),
     }
+}
+
+/// The state of a slot whose removal job completed and which the poller has
+/// powered off, its Slot Status then reading `status`: off while a card is
+/// still present, else empty. A slot that is not being removed is left as it
+/// is.
+#[must_use]
+pub const fn completed(state: SlotState, status: u16) -> SlotState
+{
+    match state
+    {
+        SlotState::Removing if status != u16::MAX && status & SLOTSTA_PRESENT != 0 =>
+        {
+            SlotState::Off
+        }
+        SlotState::Removing => SlotState::Empty,
+        SlotState::Empty
+        | SlotState::Occupied
+        | SlotState::Failed
+        | SlotState::Pressed { .. }
+        | SlotState::Off => state,
+    }
+}
+
+/// Whether Slot Status `status` reads a card present.
+#[must_use]
+pub const fn present(status: u16) -> bool
+{
+    status != u16::MAX && status & SLOTSTA_PRESENT != 0
+}
+
+/// Whether Slot Status `status` latched Data Link Layer State Changed, so
+/// the poller reads Link Status to learn whether the link went down.
+#[must_use]
+pub const fn link_changed(status: u16) -> bool
+{
+    status != u16::MAX && status & SLOTSTA_LINK_CHANGED != 0
 }
 
 /// The state a slot is taken over in: occupied when a card is present and a
@@ -861,11 +961,7 @@ pub const fn power_on(control: u16, capabilities: u32) -> u16
     {
         value &= !SLOTCTL_POWER_OFF;
     }
-    if capabilities & SLOTCAP_POWER_INDICATOR != 0
-    {
-        value = (value & !SLOTCTL_POWER_INDICATOR) | SLOTCTL_POWER_INDICATOR_ON;
-    }
-    value
+    indicator(value, capabilities, SLOTCTL_POWER_INDICATOR_ON)
 }
 
 /// The Slot Control value `control` with the slot's power off where the slot
@@ -873,16 +969,195 @@ pub const fn power_on(control: u16, capabilities: u32) -> u16
 #[must_use]
 pub const fn power_off(control: u16, capabilities: u32) -> u16
 {
-    let mut value = control;
+    indicator(
+        power_controller_off(control, capabilities),
+        capabilities,
+        SLOTCTL_POWER_INDICATOR_OFF,
+    )
+}
+
+/// The Slot Control value `control` with the slot's power off where the slot
+/// has a power controller, its power indicator as it was: the first of the
+/// removal's two writes, the indicator turned off by the second
+/// ([`indicator_off`]).
+#[must_use]
+pub const fn power_controller_off(control: u16, capabilities: u32) -> u16
+{
     if capabilities & SLOTCAP_POWER_CONTROLLER != 0
     {
-        value |= SLOTCTL_POWER_OFF;
+        control | SLOTCTL_POWER_OFF
     }
+    else
+    {
+        control
+    }
+}
+
+/// The Slot Control value `control` with the power indicator blinking,
+/// where the slot has one: the abort window of an attention-button press.
+#[must_use]
+pub const fn blink(control: u16, capabilities: u32) -> u16
+{
+    indicator(control, capabilities, SLOTCTL_POWER_INDICATOR_BLINK)
+}
+
+/// The Slot Control value `control` with the power indicator on, where the
+/// slot has one: a removal cancelled in its abort window.
+#[must_use]
+pub const fn indicator_on(control: u16, capabilities: u32) -> u16
+{
+    indicator(control, capabilities, SLOTCTL_POWER_INDICATOR_ON)
+}
+
+/// The Slot Control value `control` with the power indicator off, where the
+/// slot has one.
+#[must_use]
+pub const fn indicator_off(control: u16, capabilities: u32) -> u16
+{
+    indicator(control, capabilities, SLOTCTL_POWER_INDICATOR_OFF)
+}
+
+/// `control` with Power Indicator Control set to `value` where the slot has
+/// a power indicator.
+const fn indicator(control: u16, capabilities: u32, value: u16) -> u16
+{
     if capabilities & SLOTCAP_POWER_INDICATOR != 0
     {
-        value |= SLOTCTL_POWER_INDICATOR;
+        (control & !SLOTCTL_POWER_INDICATOR) | value
     }
-    value
+    else
+    {
+        control
+    }
+}
+
+/// Return held BAR pages: move each span of `held` (the held BAR pages)
+/// that `inside` holds for, given its `(base, end)`, to `free` (the
+/// apertures), whole, one at a time. A span is moved as the cap it is, so
+/// nothing is split, and only from `held`, so a page is returned once: a
+/// span returned already, or carved by a bind and not given back, is not
+/// there. Returns the number of spans moved.
+///
+/// # Errors
+/// [`CarveError::NoMemory`], with the spans moved before, when `free`
+/// cannot grow; the spans not moved stay in `held`.
+pub fn return_bars<S: Copy>(
+    held: &mut SpanTable<S>,
+    free: &mut SpanTable<S>,
+    inside: impl Fn(u64, u64) -> bool,
+) -> Result<usize, (usize, CarveError)>
+{
+    let mut moved = 0usize;
+    while let Some((base, end)) = held
+        .spans()
+        .iter()
+        .map(|s| (s.base, s.end))
+        .find(|&(base, end)| inside(base, end))
+    {
+        // Moved whole, the span splits nothing.
+        held.move_to(free, base, end.saturating_sub(base), 1, |_, _| {
+            Err(SplitError::Failed)
+        })
+        .map_err(|e| (moved, e))?;
+        moved = moved.saturating_add(1);
+    }
+    Ok(moved)
+}
+
+/// Quiesce the function at `at` (bus, device, function) of `cfg` before its
+/// removal: memory decode and Bus Master Enable off and Interrupt Disable
+/// set, so it answers at none of its BARs, masters nothing and asserts no
+/// line while the slot is powered off, whether a driver was bound to it or
+/// not. A function that does not answer is left as it is. Returns whether the
+/// Command register was written.
+pub fn quiesce(cfg: &impl ConfigSpace, at: (u8, u8, u8)) -> bool
+{
+    let (bus, dev, func) = at;
+    let command = cfg.read16(bus, dev, func, COMMAND);
+    if command == u16::MAX
+    {
+        return false;
+    }
+    let quiet = (command & !(COMMAND_MEMORY | COMMAND_BUS_MASTER)) | COMMAND_INTERRUPT_DISABLE;
+    if quiet != command
+    {
+        cfg.write16(bus, dev, func, COMMAND, quiet);
+    }
+    true
+}
+
+/// What a removal job did ([`remove`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Removal
+{
+    /// The records marked removed.
+    pub functions: usize,
+    /// The held BAR spans returned to the apertures, or, with the spans
+    /// returned before it, why the rest stay held.
+    pub returned: Result<usize, (usize, CarveError)>,
+}
+
+/// The removal job of `slot`, in its order: withdraw the driver of each
+/// live record behind the slot (`withdraw`, given the function's address and
+/// the held BAR pages, into which the withdrawal returns the BAR caps of its
+/// driver's device); then turn off each one's memory decode (`quiesce`), so
+/// it no longer answers at its BARs; then move every span of the held BAR
+/// pages inside a BAR span of one of them ([`bar_spans`]) to the apertures
+/// `free` ([`return_bars`]); then mark each record removed. The slot's
+/// port is on the bus above it and is not one of them. The caller powers the
+/// slot off once this returns.
+pub fn remove<S: Copy>(
+    slot: &Slot,
+    records: &mut PciRecords,
+    held: &mut SpanTable<S>,
+    free: &mut SpanTable<S>,
+    mut withdraw: impl FnMut(Address, &mut SpanTable<S>),
+    mut quiesce: impl FnMut(Address),
+) -> Removal
+{
+    let behind = |records: &PciRecords, index: usize| {
+        records
+            .devices()
+            .get(index)
+            .filter(|d| {
+                records.state(index) != Some(RecordState::Removed) && slot.holds(address(d))
+            })
+            .copied()
+    };
+    let count = records.devices().len();
+    for index in 0..count
+    {
+        if let Some(device) = behind(records, index)
+        {
+            withdraw(address(&device), held);
+        }
+    }
+    for index in 0..count
+    {
+        if let Some(device) = behind(records, index)
+        {
+            quiesce(address(&device));
+        }
+    }
+    let returned = return_bars(held, free, |base, end| {
+        (0..count).any(|index| {
+            behind(records, index).is_some_and(|d| {
+                bar_spans(&d).any(|(b, len)| b <= base && end <= b.saturating_add(len))
+            })
+        })
+    });
+    let mut functions = 0usize;
+    for index in 0..count
+    {
+        if behind(records, index).is_some() && records.remove(index)
+        {
+            functions = functions.saturating_add(1);
+        }
+    }
+    Removal {
+        functions,
+        returned,
+    }
 }
 
 #[cfg(test)]
@@ -1793,62 +2068,750 @@ mod tests
         // QEMU's plug latches Presence Detect Changed and Attention Button
         // Pressed with Presence Detect State.
         let plugged = present | SLOTSTA_PRESENCE_CHANGED | SLOTSTA_BUTTON;
-        assert_eq!(next(SlotState::Empty, 0), (SlotState::Empty, Action::None));
         assert_eq!(
-            next(SlotState::Empty, plugged),
+            next(SlotState::Empty, 0, false),
+            (SlotState::Empty, Action::None)
+        );
+        assert_eq!(
+            next(SlotState::Empty, plugged, false),
             (SlotState::Empty, Action::PowerUp)
         );
         assert_eq!(
-            next(SlotState::Empty, present),
+            next(SlotState::Empty, present, false),
             (SlotState::Empty, Action::PowerUp)
         );
         assert_eq!(
-            next(SlotState::Occupied, present),
+            next(SlotState::Occupied, present, false),
+            (SlotState::Occupied, Action::None)
+        );
+        // A link change with the link still up is no removal.
+        assert_eq!(
+            next(SlotState::Occupied, present | SLOTSTA_LINK_CHANGED, false),
             (SlotState::Occupied, Action::None)
         );
         assert_eq!(
-            next(SlotState::Occupied, present | SLOTSTA_LINK_CHANGED),
-            (SlotState::Occupied, Action::None)
-        );
-        assert_eq!(
-            next(SlotState::Occupied, SLOTSTA_PRESENCE_CHANGED),
-            (SlotState::Departed, Action::Removal)
-        );
-        assert_eq!(
-            next(SlotState::Occupied, present | SLOTSTA_BUTTON),
-            (SlotState::Departed, Action::Removal)
-        );
-        assert_eq!(
-            next(SlotState::Failed, present),
+            next(SlotState::Failed, present, false),
             (SlotState::Failed, Action::None)
         );
-        assert_eq!(next(SlotState::Failed, 0), (SlotState::Empty, Action::None));
-        // A removal is reported once: presence stays clear on the polls after.
         assert_eq!(
-            next(SlotState::Departed, 0),
-            (SlotState::Departed, Action::None)
+            next(SlotState::Failed, 0, false),
+            (SlotState::Empty, Action::None)
         );
-        assert_eq!(
-            next(SlotState::Departed, present | SLOTSTA_BUTTON),
-            (SlotState::Departed, Action::None)
-        );
-        assert_eq!(
-            next(SlotState::Departed, present),
-            (SlotState::Occupied, Action::None)
-        );
-        for state in [
-            SlotState::Empty,
-            SlotState::Occupied,
-            SlotState::Failed,
-            SlotState::Departed,
-        ]
-        {
-            assert_eq!(next(state, u16::MAX), (state, Action::None));
-        }
         assert_eq!(initial(present, true), SlotState::Occupied);
         assert_eq!(initial(present, false), SlotState::Empty);
         assert_eq!(initial(0, true), SlotState::Empty);
         assert_eq!(initial(u16::MAX, true), SlotState::Empty);
+        assert!(present_reads(present) && !present_reads(0) && !present_reads(u16::MAX));
+        assert!(link_changed(SLOTSTA_LINK_CHANGED) && !link_changed(u16::MAX));
+    }
+
+    fn present_reads(status: u16) -> bool
+    {
+        super::present(status)
+    }
+
+    #[test]
+    fn the_removal_states_follow_the_button_its_abort_window_and_the_card()
+    {
+        let present = SLOTSTA_PRESENT;
+        let pressed = present | SLOTSTA_BUTTON;
+        let full = SlotState::Pressed {
+            polls_left: ABORT_POLLS,
+        };
+        // A press blinks the indicator for the abort window.
+        assert_eq!(
+            next(SlotState::Occupied, pressed, false),
+            (full, Action::Blink)
+        );
+        // The window counts down while the card stays and the button is not
+        // pressed again, and the removal starts as it ends.
+        let mut state = full;
+        for _ in 1..ABORT_POLLS
+        {
+            let (to, action) = next(state, present, false);
+            assert_eq!(action, Action::None);
+            state = to;
+        }
+        assert_eq!(state, SlotState::Pressed { polls_left: 1 });
+        assert_eq!(
+            next(state, present, false),
+            (SlotState::Removing, Action::Remove)
+        );
+        // A second press within the window cancels the removal.
+        assert_eq!(
+            next(full, pressed, false),
+            (SlotState::Occupied, Action::Cancel)
+        );
+        // Surprise: the card leaves, or its link goes down, occupied or in
+        // the window.
+        for from in [SlotState::Occupied, full]
+        {
+            assert_eq!(
+                next(from, SLOTSTA_PRESENCE_CHANGED, false),
+                (SlotState::Removing, Action::Remove)
+            );
+            assert_eq!(
+                next(from, present | SLOTSTA_LINK_CHANGED, true),
+                (SlotState::Removing, Action::Remove)
+            );
+        }
+        // Removing ignores every reading until the job completes: a card
+        // pressed, inserted or pulled meanwhile is not acted on.
+        for status in [0, present, pressed, present | SLOTSTA_PRESENCE_CHANGED]
+        {
+            assert_eq!(
+                next(SlotState::Removing, status, false),
+                (SlotState::Removing, Action::None)
+            );
+        }
+        // Completed: off while the card is present, else empty; any other
+        // state is left as it is.
+        assert_eq!(completed(SlotState::Removing, present), SlotState::Off);
+        assert_eq!(completed(SlotState::Removing, 0), SlotState::Empty);
+        assert_eq!(completed(SlotState::Removing, u16::MAX), SlotState::Empty);
+        for other in [SlotState::Empty, SlotState::Occupied, SlotState::Off, full]
+        {
+            assert_eq!(completed(other, present), other);
+        }
+        // Off: powered up again by a press or a new insertion, empty once the
+        // card is gone, else left off.
+        assert_eq!(
+            next(SlotState::Off, pressed, false),
+            (SlotState::Off, Action::PowerUp)
+        );
+        assert_eq!(
+            next(SlotState::Off, present | SLOTSTA_PRESENCE_CHANGED, false),
+            (SlotState::Off, Action::PowerUp)
+        );
+        assert_eq!(
+            next(SlotState::Off, present, false),
+            (SlotState::Off, Action::None)
+        );
+        assert_eq!(
+            next(SlotState::Off, 0, false),
+            (SlotState::Empty, Action::None)
+        );
+        // A port that does not answer changes nothing.
+        for state in [
+            SlotState::Empty,
+            SlotState::Occupied,
+            SlotState::Failed,
+            full,
+            SlotState::Removing,
+            SlotState::Off,
+        ]
+        {
+            assert_eq!(next(state, u16::MAX, true), (state, Action::None));
+        }
+    }
+
+    /// The Q35 root port's Slot Capabilities: attention button, power
+    /// controller, attention and power indicators, hot-plug surprise and
+    /// capable.
+    const CAPS: u32 = 0x000a_007b;
+
+    /// What a slot does with a present card when it is powered off.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Unplug
+    {
+        /// QEMU's: the card is unplugged (`DEVICE_DELETED`).
+        OnPowerOff,
+        /// The card stays in.
+        Never,
+    }
+
+    /// A native hotplug slot as QEMU models it (hw/pci/pcie.c), or one whose
+    /// card stays in when it is powered off.
+    struct ModelSlot
+    {
+        unplug: Unplug,
+        control: u16,
+        status: u16,
+        card: bool,
+        /// Cards QEMU unplugged (`DEVICE_DELETED`).
+        deleted: usize,
+    }
+
+    impl ModelSlot
+    {
+        fn new(unplug: Unplug) -> Self
+        {
+            // Powered off, both indicators off, as the firmware leaves it.
+            Self {
+                unplug,
+                control: 0x07C0,
+                status: 0,
+                card: false,
+                deleted: 0,
+            }
+        }
+
+        fn powered_off(control: u16) -> bool
+        {
+            control & SLOTCTL_POWER_OFF != 0
+                && control & SLOTCTL_POWER_INDICATOR == SLOTCTL_POWER_INDICATOR_OFF
+        }
+
+        /// `device_add`: present, with the presence change and a button
+        /// press latched.
+        fn plug(&mut self)
+        {
+            self.card = true;
+            self.status |= SLOTSTA_PRESENT | SLOTSTA_PRESENCE_CHANGED | SLOTSTA_BUTTON;
+        }
+
+        /// `device_del`: refused while the indicator blinks or the slot is
+        /// powered off; else the button is pressed.
+        fn device_del(&mut self) -> bool
+        {
+            let indicator = self.control & SLOTCTL_POWER_INDICATOR;
+            if indicator == SLOTCTL_POWER_INDICATOR_BLINK
+                || indicator == SLOTCTL_POWER_INDICATOR_OFF
+                || !self.card
+            {
+                return false;
+            }
+            self.status |= SLOTSTA_BUTTON;
+            true
+        }
+
+        fn press(&mut self)
+        {
+            self.status |= SLOTSTA_BUTTON;
+        }
+
+        /// A surprise removal: the card is pulled.
+        fn pull(&mut self)
+        {
+            self.card = false;
+            self.status = (self.status & !SLOTSTA_PRESENT) | SLOTSTA_PRESENCE_CHANGED;
+        }
+
+        /// A Slot Control write: QEMU unplugs a present card on the write
+        /// that leaves the slot powered off from a state that was not.
+        fn write(&mut self, value: u16)
+        {
+            let old = self.control;
+            self.control = value;
+            if self.unplug == Unplug::OnPowerOff
+                && self.card
+                && Self::powered_off(value)
+                && !Self::powered_off(old)
+            {
+                self.card = false;
+                self.deleted += 1;
+                self.status = (self.status & !SLOTSTA_PRESENT) | SLOTSTA_PRESENCE_CHANGED;
+            }
+        }
+
+        fn indicator(&self) -> u16
+        {
+            self.control & SLOTCTL_POWER_INDICATOR
+        }
+
+        /// Read Slot Status and clear its latches, as a poll does.
+        fn read_and_clear(&mut self) -> u16
+        {
+            let status = self.status;
+            self.status &= !SLOTSTA_LATCHES;
+            status
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ModelJob
+    {
+        Added,
+        Removed,
+    }
+
+    /// The poller and the control thread of devmgr over one model slot: the
+    /// jobs posted, in order, the completions, and the functions recorded.
+    struct Model
+    {
+        slot: ModelSlot,
+        state: SlotState,
+        jobs: std::collections::VecDeque<ModelJob>,
+        completions: usize,
+        /// The live records behind the slot, each with its driver.
+        live: usize,
+        /// Functions withdrawn, each counted once.
+        withdrawn: usize,
+    }
+
+    impl Model
+    {
+        fn new(unplug: Unplug) -> Self
+        {
+            Self {
+                slot: ModelSlot::new(unplug),
+                state: SlotState::Empty,
+                jobs: std::collections::VecDeque::new(),
+                completions: 0,
+                live: 0,
+                withdrawn: 0,
+            }
+        }
+
+        /// One poller pass: power off each slot whose removal completed,
+        /// then read, clear and act on Slot Status, as src/hotplug.rs does.
+        fn poll(&mut self) -> Action
+        {
+            while self.completions > 0
+            {
+                self.completions -= 1;
+                // Every function behind the slot is withdrawn before its power
+                // goes off, and no job of it is left.
+                assert_eq!(self.live, 0);
+                let off = power_controller_off(self.slot.control, CAPS);
+                self.slot.write(off);
+                self.slot.write(indicator_off(off, CAPS));
+                let status = self.slot.read_and_clear();
+                self.state = completed(self.state, status);
+            }
+            let status = self.slot.read_and_clear();
+            let (state, action) = next(self.state, status, false);
+            self.state = match action
+            {
+                Action::None => state,
+                Action::Blink =>
+                {
+                    self.slot.write(blink(self.slot.control, CAPS));
+                    state
+                }
+                Action::Cancel =>
+                {
+                    self.slot.write(indicator_on(self.slot.control, CAPS));
+                    state
+                }
+                Action::Remove =>
+                {
+                    self.jobs.push_back(ModelJob::Removed);
+                    state
+                }
+                Action::PowerUp =>
+                {
+                    // The slot is reusable only once its previous occupant is
+                    // withdrawn: no add follows a removal still pending.
+                    assert!(!self.jobs.contains(&ModelJob::Removed));
+                    assert_eq!(self.live, 0);
+                    self.slot.write(power_on(self.slot.control, CAPS));
+                    self.jobs.push_back(ModelJob::Added);
+                    SlotState::Occupied
+                }
+            };
+            action
+        }
+
+        /// The control thread: run every posted job, in order, each to its
+        /// end. An add records the card's function if it is still there; a
+        /// removal withdraws every live one and completes.
+        fn control(&mut self)
+        {
+            while let Some(job) = self.jobs.pop_front()
+            {
+                match job
+                {
+                    ModelJob::Added =>
+                    {
+                        if self.slot.card
+                        {
+                            self.live += 1;
+                        }
+                    }
+                    ModelJob::Removed =>
+                    {
+                        self.withdrawn += self.live;
+                        self.live = 0;
+                        self.completions += 1;
+                    }
+                }
+            }
+        }
+
+        /// Poll until the abort window of a press ends; the action of the
+        /// last poll.
+        fn wait_window(&mut self) -> Action
+        {
+            let mut action = Action::None;
+            for _ in 0..ABORT_POLLS
+            {
+                action = self.poll();
+            }
+            action
+        }
+    }
+
+    #[test]
+    fn a_button_removal_withdraws_then_powers_off_and_the_slot_takes_a_new_card()
+    {
+        let mut m = Model::new(Unplug::OnPowerOff);
+        m.slot.plug();
+        assert_eq!(m.poll(), Action::PowerUp);
+        m.control();
+        assert_eq!(
+            (m.live, m.slot.indicator()),
+            (1, SLOTCTL_POWER_INDICATOR_ON)
+        );
+        assert!(m.slot.device_del());
+        assert_eq!(m.poll(), Action::Blink);
+        assert_eq!(m.slot.indicator(), SLOTCTL_POWER_INDICATOR_BLINK);
+        // QEMU refuses a second `device_del` while the indicator blinks.
+        assert!(!m.slot.device_del());
+        assert_eq!(m.wait_window(), Action::Remove);
+        // Nothing is powered off before the control thread runs the job.
+        assert_eq!(m.poll(), Action::None);
+        assert!(m.slot.card);
+        m.control();
+        assert_eq!(m.withdrawn, 1);
+        assert_eq!(m.poll(), Action::None);
+        assert_eq!((m.slot.deleted, m.state), (1, SlotState::Empty));
+        assert!(ModelSlot::powered_off(m.slot.control));
+        // A card plugged again is brought up from empty.
+        m.slot.plug();
+        assert_eq!(m.poll(), Action::PowerUp);
+        m.control();
+        assert_eq!((m.live, m.withdrawn), (1, 1));
+    }
+
+    #[test]
+    fn a_second_press_in_the_abort_window_keeps_the_card()
+    {
+        let mut m = Model::new(Unplug::OnPowerOff);
+        m.slot.plug();
+        m.poll();
+        m.control();
+        m.slot.press();
+        assert_eq!(m.poll(), Action::Blink);
+        assert_eq!(m.poll(), Action::None);
+        m.slot.press();
+        assert_eq!(m.poll(), Action::Cancel);
+        assert_eq!(m.state, SlotState::Occupied);
+        assert_eq!(m.slot.indicator(), SLOTCTL_POWER_INDICATOR_ON);
+        for _ in 0..ABORT_POLLS
+        {
+            assert_eq!(m.poll(), Action::None);
+        }
+        assert!(m.jobs.is_empty());
+        assert_eq!((m.live, m.slot.deleted), (1, 0));
+    }
+
+    #[test]
+    fn a_surprise_removal_waits_for_its_job_before_a_new_card_is_taken()
+    {
+        let mut m = Model::new(Unplug::Never);
+        m.slot.plug();
+        m.poll();
+        m.control();
+        m.slot.pull();
+        assert_eq!(m.poll(), Action::Remove);
+        // A card inserted before the job ran is not brought up.
+        m.slot.plug();
+        assert_eq!(m.poll(), Action::None);
+        assert_eq!(m.state, SlotState::Removing);
+        m.control();
+        assert_eq!(m.withdrawn, 1);
+        // Powered off with the new card in: off until it is asked for.
+        assert_eq!(m.poll(), Action::None);
+        assert_eq!(m.state, SlotState::Off);
+        assert_eq!(m.poll(), Action::None);
+        m.slot.press();
+        assert_eq!(m.poll(), Action::PowerUp);
+        m.control();
+        assert_eq!((m.live, m.state), (1, SlotState::Occupied));
+        // Pulled while off: empty.
+        let mut off = Model::new(Unplug::Never);
+        off.state = SlotState::Off;
+        off.slot.card = true;
+        off.slot.pull();
+        assert_eq!(off.poll(), Action::None);
+        assert_eq!(off.state, SlotState::Empty);
+    }
+
+    #[test]
+    fn a_removal_racing_an_add_runs_after_it_and_withdraws_what_it_recorded()
+    {
+        // The removal is asked for before the control thread ran the add.
+        let mut m = Model::new(Unplug::OnPowerOff);
+        m.slot.plug();
+        assert_eq!(m.poll(), Action::PowerUp);
+        assert!(m.slot.device_del());
+        m.poll();
+        assert_eq!(m.wait_window(), Action::Remove);
+        assert_eq!(
+            m.jobs.iter().copied().collect::<Vec<_>>(),
+            [ModelJob::Added, ModelJob::Removed]
+        );
+        m.control();
+        assert_eq!((m.live, m.withdrawn), (0, 1));
+        m.poll();
+        assert_eq!((m.slot.deleted, m.state), (1, SlotState::Empty));
+        // The card is pulled before the add reads it: the add records
+        // nothing, the removal withdraws nothing, and the slot is still
+        // powered off.
+        let mut m = Model::new(Unplug::OnPowerOff);
+        m.slot.plug();
+        m.poll();
+        m.slot.pull();
+        assert_eq!(m.poll(), Action::Remove);
+        m.control();
+        assert_eq!((m.live, m.withdrawn), (0, 0));
+        m.poll();
+        assert_eq!(m.state, SlotState::Empty);
+        assert!(ModelSlot::powered_off(m.slot.control));
+    }
+
+    /// The configuration space, the slot, the records, the held BAR pages and
+    /// the apertures.
+    type Fixture = (
+        Space,
+        Slot,
+        PciRecords,
+        SpanTable<(u64, u64)>,
+        SpanTable<(u64, u64)>,
+    );
+
+    /// The removal fixture: the Q35 root port at 00:03.0 with an `edu` behind
+    /// it, its 1 MiB BAR placed at the window's base and held, as an add job
+    /// leaves it, and the window's rest in the apertures.
+    fn removal_fixture() -> Fixture
+    {
+        let space = Space::default();
+        space.add((0, 3, 0), Q35_ROOT_PORT);
+        add_edu(&space, (1, 0, 0));
+        let slot = found(&space)[0];
+        let window = slot.memory.unwrap();
+        let mut free = SpanTable::new();
+        free.insert(
+            (window.base, window.end),
+            window.base,
+            window.end - window.base,
+        )
+        .unwrap();
+        let mut ranges = Vec::new();
+        free_ranges(free.spans(), &slot, &mut ranges).unwrap();
+        let Found::Ready(edu) = place(&space, &slot, (1, 0, 0), &ranges)
+        else
+        {
+            panic!("the edu was not placed");
+        };
+        space.write16(1, 0, 0, COMMAND, COMMAND_MEMORY | COMMAND_BUS_MASTER);
+        let mut held = SpanTable::new();
+        let spans: Vec<(u64, u64)> = bar_spans(&edu).collect();
+        free.move_all(&mut held, &spans, PAGE, split_model).unwrap();
+        let mut functions = Vec::new();
+        scan(&space, 0, 0, 3, &mut functions).unwrap();
+        let mut records = PciRecords::new(functions).unwrap();
+        assert!(hold_port(&mut records, slot.port));
+        assert_eq!(live(&records), 2);
+        (space, slot, records, held, free)
+    }
+
+    fn live(records: &PciRecords) -> usize
+    {
+        (0..records.devices().len())
+            .filter(|&i| records.state(i) != Some(RecordState::Removed))
+            .count()
+    }
+
+    /// Every page of `window` is in exactly one of `tables`' spans, or in
+    /// `out`; returns the bytes `tables` cover.
+    fn each_page_once(window: Window, tables: &[&SpanTable<(u64, u64)>], out: &[(u64, u64)])
+    -> u64
+    {
+        let mut pages = std::collections::BTreeMap::new();
+        let mut add = |base: u64, end: u64| {
+            let mut at = base;
+            while at < end
+            {
+                *pages.entry(at).or_insert(0u32) += 1;
+                at += PAGE;
+            }
+        };
+        let mut covered = 0;
+        for table in tables
+        {
+            for s in table.spans()
+            {
+                assert_eq!(s.slot, (s.base, s.end), "a span is the cap it records");
+                add(s.base, s.end);
+                covered += s.end - s.base;
+            }
+        }
+        for &(base, end) in out
+        {
+            add(base, end);
+        }
+        let mut at = window.base;
+        while at < window.end
+        {
+            assert_eq!(pages.get(&at), Some(&1), "page {at:#x}");
+            at += PAGE;
+        }
+        covered
+    }
+
+    #[test]
+    fn a_removal_withdraws_quiesces_and_returns_each_bar_page_once()
+    {
+        let (space, slot, mut records, mut held, mut free) = removal_fixture();
+        let window = slot.memory.unwrap();
+        let bar = (window.base, window.base + 0x10_0000);
+        // The bind carved the driver's cap on the BAR's first half; the rest
+        // stays held.
+        let cap = held.carve_span(bar.0, 0x8_0000, PAGE, split_model).unwrap();
+        each_page_once(window, &[&held, &free], &[(cap.base, cap.end)]);
+        let events = RefCell::new(Vec::new());
+        let removal = remove(
+            &slot,
+            &mut records,
+            &mut held,
+            &mut free,
+            |at, held| {
+                events.borrow_mut().push(("withdraw", at));
+                // The withdrawal gives the driver's cap back to the held pages.
+                held.insert(cap.slot, cap.base, cap.end - cap.base).unwrap();
+            },
+            |at| {
+                events.borrow_mut().push(("quiesce", at));
+                assert!(quiesce(&space, (at.1, at.2, at.3)));
+            },
+        );
+        // The port is not behind its own slot; the edu is, withdrawn before it
+        // is quiesced.
+        assert_eq!(
+            events.into_inner(),
+            [("withdraw", (0, 1, 0, 0)), ("quiesce", (0, 1, 0, 0))]
+        );
+        assert_eq!(
+            removal,
+            Removal {
+                functions: 1,
+                returned: Ok(2),
+            }
+        );
+        assert_eq!(covered(&held), []);
+        assert_eq!(
+            each_page_once(window, &[&free], &[]),
+            window.end - window.base
+        );
+        let command = space.read16(1, 0, 0, COMMAND);
+        assert_eq!(command & (COMMAND_MEMORY | COMMAND_BUS_MASTER), 0);
+        assert_ne!(command & COMMAND_INTERRUPT_DISABLE, 0);
+        assert_eq!(live(&records), 1);
+        // A second removal of the slot finds nothing: no withdrawal, and no
+        // page returned twice.
+        let before = covered(&free);
+        let again = remove(
+            &slot,
+            &mut records,
+            &mut held,
+            &mut free,
+            |_, _| panic!("a removed function is withdrawn again"),
+            |_| panic!("a removed function is quiesced again"),
+        );
+        assert_eq!(
+            again,
+            Removal {
+                functions: 0,
+                returned: Ok(0),
+            }
+        );
+        assert_eq!(covered(&free), before);
+    }
+
+    #[test]
+    fn a_driver_cap_not_given_back_is_lost_and_never_returned()
+    {
+        // The withdrawal could not revoke the driver's copies: the cap is
+        // deleted, not given back, and the removal neither waits for it nor
+        // returns its pages.
+        let (space, slot, mut records, mut held, mut free) = removal_fixture();
+        let window = slot.memory.unwrap();
+        let cap = held
+            .carve_span(window.base, 0x8_0000, PAGE, split_model)
+            .unwrap();
+        let mut asked = 0;
+        let removal = remove(
+            &slot,
+            &mut records,
+            &mut held,
+            &mut free,
+            |_, _| asked += 1,
+            |at| {
+                quiesce(&space, (at.1, at.2, at.3));
+            },
+        );
+        assert_eq!(asked, 1);
+        assert_eq!(removal.functions, 1);
+        assert_eq!(removal.returned, Ok(1));
+        each_page_once(window, &[&held, &free], &[(cap.base, cap.end)]);
+        assert_eq!(covered(&held), []);
+    }
+
+    #[test]
+    fn a_removal_during_a_drivers_dma_setup_leaves_its_mapping_refused()
+    {
+        use crate::dma::{Confinement, DmaTable};
+        use ipc::devmgr_dma_labels::{ACCESS_DEVICE_READ, ACCESS_DEVICE_WRITE};
+        let (space, slot, mut records, mut held, mut free) = removal_fixture();
+        let badge = 7;
+        let mut table = DmaTable::new();
+        let confinement = Confinement::Domain {
+            handle: 3,
+            limit: u64::MAX,
+            interrupt_range: false,
+        };
+        table.register(badge, confinement, &[]).unwrap();
+        // The driver is mid-way through a mapping when the removal runs.
+        let pending = table
+            .reserve(
+                badge,
+                1,
+                PAGE,
+                ACCESS_DEVICE_READ | ACCESS_DEVICE_WRITE,
+                None,
+            )
+            .unwrap();
+        let mut faults = crate::dma::FaultCounts::new();
+        let rid = 0x0100;
+        faults.track(rid).unwrap();
+        let removal = remove(
+            &slot,
+            &mut records,
+            &mut held,
+            &mut free,
+            |_, _| {
+                assert!(table.withdraw(badge).is_some());
+                faults.untrack(rid);
+            },
+            |at| {
+                quiesce(&space, (at.1, at.2, at.3));
+            },
+        );
+        assert_eq!(removal.functions, 1);
+        // The mapping's commit is refused, and the device, gone, has none.
+        assert!(!table.commit(badge, pending.device_addr));
+        assert!(table.withdraw(badge).is_none());
+        // A fault the removed device still raises is not charged, and a card
+        // added at its address starts at zero.
+        assert!(!faults.record(rid, 0x1000));
+        faults.track(rid).unwrap();
+        assert_eq!(faults.count(rid), (0, 0));
+    }
+
+    #[test]
+    fn quiesce_turns_off_decode_and_mastering_and_leaves_an_absent_function()
+    {
+        let space = Space::default();
+        add_edu(&space, (1, 0, 0));
+        space.write16(1, 0, 0, COMMAND, COMMAND_MEMORY | COMMAND_BUS_MASTER | 1);
+        assert!(quiesce(&space, (1, 0, 0)));
+        assert_eq!(
+            space.read16(1, 0, 0, COMMAND),
+            COMMAND_INTERRUPT_DISABLE | 1
+        );
+        assert!(!quiesce(&space, (2, 0, 0)));
     }
 
     #[test]

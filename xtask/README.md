@@ -39,6 +39,8 @@ xtask/
 │   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
 │   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── signing/                # Signing of packed images, the signing identity, the trust
+│   │                           #   store (§ Signing)
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
@@ -99,6 +101,39 @@ naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MA
 `src/stack_sizes.rs`), the kernel frame bound of
 [docs/coding-standards.md](../docs/coding-standards.md) § Kernel Stack Frames. It fails as well
 when the image has no such section. No other build has the check.
+
+#### Signing
+
+Every image a build packs is signed, as [docs/signing.md](../docs/signing.md) § Signing specifies:
+each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every command that
+repacks) first signs the kernel and every ELF image under `services/`, `programs/` and `tests/`
+of the sysroot in place, and `compose-bundle` signs each executable entry of the bundle it
+composes: `init` as kind init, each module as a boot module. The bundle's data entries (the
+platform tables and `log-levels`) are packed unsigned. Every signed object is verified under the
+build's trust store, with the kind, name and architecture its loader expects, before it is
+written. Signing a pack's images takes about half a second (`src/signing/`).
+
+The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
+one, whose canonical path lies inside it, `target/` included. When the directory is absent or
+empty and no external signer is named, the first build generates a local identity in it: a root
+that certifies a signing key and is then discarded, and a store that lists the root as `LOCAL`.
+The directory holds:
+
+| File | Content |
+|---|---|
+| `signer.seed` | The signing key's 32-byte Ed25519 secret seed (mode `0600`, the directory `0700`); absent when an external signer holds the key |
+| `signer.cert` | The signing key's 148-byte certificate, or, for a key that is itself a root, `signer.pub`, its 32-byte public key |
+| `trust.store` | The trust store of the anchors the identity contributes |
+
+The build writes the trust store it signs under to `target/xtask/signing/trust-store`, before
+it builds the bootloader, and rewrites the file only when the store changes.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERAPH_SIGNING_DIR` | `seraph/signing` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 64-byte Ed25519 signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
+| `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
+| `SERAPH_TRUST_STORE_MODE` | `merge` | `merge`: the union of both stores' anchors and revoked key ids, under the higher floor; two anchors of one key that differ are refused. `replace`: the deployer's store alone. Set without `SERAPH_TRUST_STORE`, it is refused |
 
 ---
 

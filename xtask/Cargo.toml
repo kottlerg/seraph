@@ -10,8 +10,6 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-# Declarative CLI with auto-generated help text.
-clap = { version = "4", features = ["derive"] }
 # Seraph-minted GPT partition type GUIDs are defined here so xtask
 # (producer) and vfsd (consumer) reference the same byte arrays.
 boot-protocol = { path = "../abi/boot-protocol" }

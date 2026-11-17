@@ -37,18 +37,20 @@ use crate::arch::Arch;
 use crate::context::Context as BuildContext;
 use crate::util::step;
 
-/// Which harness binary to bundle as the `"init"` entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum Harness
-{
-    /// Regular userspace init at `sysroot/services/init`. Bundle includes
-    /// every service module the system needs to bootstrap userspace.
-    #[value(name = "init")]
-    Init,
-    /// `sysroot/tests/ktest` as the `"init"` entry. Bundle is a single
-    /// entry; ktest is monolithic and does not spawn userspace modules.
-    #[value(name = "ktest")]
-    Ktest,
+crate::argparse::value_enum! {
+    /// Which harness binary to bundle as the `"init"` entry.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Harness
+    {
+        /// Regular userspace init at `sysroot/services/init`. Bundle includes
+        /// every service module the system needs to bootstrap userspace.
+        #[value(name = "init")]
+        Init,
+        /// `sysroot/tests/ktest` as the `"init"` entry. Bundle is a single
+        /// entry; ktest is monolithic and does not spawn userspace modules.
+        #[value(name = "ktest")]
+        Ktest,
+    }
 }
 
 impl Harness

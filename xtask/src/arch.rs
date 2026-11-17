@@ -8,21 +8,21 @@
 
 use std::fmt;
 
-use clap::ValueEnum;
+crate::argparse::value_enum! {
+    /// Supported build/run target architectures.
+    ///
+    /// Add a new variant here (and fill in each `match`) to support a new arch.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Arch
+    {
+        /// x86-64 (Intel/AMD 64-bit)
+        #[value(name = "x86_64")]
+        X86_64,
 
-/// Supported build/run target architectures.
-///
-/// Add a new variant here (and fill in each `match`) to support a new arch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Arch
-{
-    /// x86-64 (Intel/AMD 64-bit)
-    #[value(name = "x86_64")]
-    X86_64,
-
-    /// RISC-V 64-bit
-    #[value(name = "riscv64")]
-    Riscv64,
+        /// RISC-V 64-bit
+        #[value(name = "riscv64")]
+        Riscv64,
+    }
 }
 
 impl Arch

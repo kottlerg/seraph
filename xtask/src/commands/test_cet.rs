@@ -611,7 +611,7 @@ mod tests
     #[test]
     fn both_boots_ask_for_shadow_stacks()
     {
-        use clap::Parser as _;
+        use crate::argparse::Args as _;
 
         let args = TestCetArgs::try_parse_from(["test-cet"]).unwrap();
         let spec = cet_spec(

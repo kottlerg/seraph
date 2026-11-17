@@ -32,7 +32,7 @@ use objsig::{Expectation, Kind, KindSet, ParseError, RecordSpec, TrustStore};
 
 use crate::arch::Arch;
 use crate::context::Context as BuildContext;
-use crate::error::{Context, Result, bail, err};
+use crate::error::{Context, Result, bail, ensure, err};
 
 pub use identity::{Identity, os_random};
 pub use store::StoreMode;
@@ -170,6 +170,21 @@ impl Signer
     pub fn open(ctx: &BuildContext, arch: Arch) -> Result<Self>
     {
         Self::new(&Config::from_env()?, &ctx.root, arch, &mut os_random)
+    }
+
+    /// The signer of a pack of `arch` in `ctx`: [`Self::open`], refusing
+    /// a store other than the one the build wrote for the bootloader
+    /// ([`check_boot_store`]), so a pack signs only under the store the image's
+    /// bootloader is built with.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Self::open`] and [`check_boot_store`].
+    pub fn for_pack(ctx: &BuildContext, arch: Arch) -> Result<Self>
+    {
+        let signer = Self::open(ctx, arch)?;
+        check_boot_store(signer.store(), &boot_store_path(ctx))?;
+        Ok(signer)
     }
 
     /// The signer `config` describes, refusing a key inside `work_tree`,
@@ -458,6 +473,50 @@ fn starts_with_elf_magic(path: &Path) -> Result<bool>
     }
 }
 
+/// The path of the trust store the bootloader is built with:
+/// `target/xtask/signing/trust-store`.
+pub fn boot_store_path(ctx: &BuildContext) -> PathBuf
+{
+    ctx.target_dir
+        .join("xtask")
+        .join("signing")
+        .join("trust-store")
+}
+
+/// Fail unless the file at `path` holds `store`: a pack whose environment
+/// builds another store than the bootloader's build wrote (a changed
+/// `SERAPH_SIGNING_DIR`, deployer's store or mode, or a regenerated
+/// identity) would sign images that bootloader does not trust.
+///
+/// # Errors
+///
+/// When the file is absent or cannot be read, or holds another store; each
+/// names `cargo xtask build` as the remedy.
+pub fn check_boot_store(store: &[u8], path: &Path) -> Result<()>
+{
+    let held = match fs::read(path)
+    {
+        Ok(held) => held,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+        {
+            bail!(
+                "no trust store at {}: run `cargo xtask build`, which writes it before it \
+                 builds the bootloader",
+                path.display()
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    ensure!(
+        held == store,
+        "the trust store this environment builds differs from {}, the one the bootloader was \
+         built with ({ENV_SIGNING_DIR}, {ENV_TRUST_STORE} or {ENV_TRUST_STORE_MODE} changed, or \
+         the identity was regenerated): run `cargo xtask build` to rebuild under it",
+        path.display()
+    );
+    Ok(())
+}
+
 /// Write the build's trust store to `target/xtask/signing/trust-store`,
 /// leaving the file untouched when it already holds it, so the bootloader's
 /// build, which tracks the file, rebuilds only when the store changes;
@@ -468,13 +527,15 @@ fn starts_with_elf_magic(path: &Path) -> Result<bool>
 /// On an I/O failure.
 pub fn write_boot_store(ctx: &BuildContext, signer: &Signer) -> Result<PathBuf>
 {
-    let dir = ctx.target_dir.join("xtask").join("signing");
-    let path = dir.join("trust-store");
+    let path = boot_store_path(ctx);
     if fs::read(&path).is_ok_and(|held| held == signer.store())
     {
         return Ok(path);
     }
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let dir = path
+        .parent()
+        .with_context(|| format!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     fs::write(&path, signer.store()).with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }
@@ -765,6 +826,20 @@ mod tests
             ("SERAPH_TRUST_STORE_MODE", "merge"),
         ])
         .unwrap_err();
+    }
+
+    // Defect caught: a pack that signs under another store than the one the
+    // bootloader was built with, so the image it writes would not boot.
+    #[test]
+    fn a_pack_under_another_store_than_the_bootloaders_is_refused()
+    {
+        let root = scratch("pack-store");
+        let path = root.join("trust-store");
+        check_boot_store(b"store", &path).unwrap_err();
+        fs::write(&path, b"store").unwrap();
+        check_boot_store(b"store", &path).unwrap();
+        check_boot_store(b"other", &path).unwrap_err();
+        let _ = fs::remove_dir_all(&root);
     }
 
     // Defect caught: an unchanged store rewritten on every build, which makes

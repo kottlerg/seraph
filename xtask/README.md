@@ -111,7 +111,10 @@ of the sysroot in place, and `compose-bundle` signs each executable entry of the
 composes: `init` as kind init, each module as a boot module. The bundle's data entries (the
 platform tables and `log-levels`) are packed unsigned. Every signed object is verified under the
 build's trust store, with the kind, name and architecture its loader expects, before it is
-written. Signing a pack's images takes about half a second (`src/signing/`).
+written. A pack (`mkdisk`, `compose-bundle`, a repack) refuses to sign when the trust store its
+environment builds differs from `target/xtask/signing/trust-store`, the one the bootloader was
+built with, naming `cargo xtask build` as the remedy. Signing a pack's images takes about half a
+second (`src/signing/`).
 
 The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
 one, whose canonical path lies inside it, `target/` included. When the directory is absent or
@@ -279,8 +282,10 @@ synthesised `data/svctest/` fixtures are left untouched. To pack a
 hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
-re-mirror and packs the sysroot exactly as it stands (a plain repack would
-prune the hand-added recipe). The mirror rules are owned by
+re-mirror and packs the sysroot as it stands (a plain repack would
+prune the hand-added recipe). Every pack, `--repack-only` included, re-signs the kernel and the
+ELF images of the sysroot in place ([§ Signing](#signing)), so a hand-staged image is packed
+with the local identity's signature, not its own. The mirror rules are owned by
 [rootfs/README.md](../rootfs/README.md).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
@@ -335,7 +340,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
-| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
+| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, its images re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
 | `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |

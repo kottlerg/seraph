@@ -99,7 +99,8 @@ subcommands! {
         /// Mirror `rootfs/` into the sysroot, re-synthesise test fixtures,
         /// and regenerate `disk.img` without invoking cargo. The mirror is
         /// authoritative over `config/`+`data/` (deletions in `rootfs/` are
-        /// pruned); use `--repack-only` to pack a hand-staged sysroot verbatim.
+        /// pruned); use `--repack-only` to pack a hand-staged sysroot as it
+        /// stands. Every pack re-signs the kernel and the ELF images in place.
         /// Requires an arch-tagged sysroot from a prior `cargo xtask build`.
         Mkdisk(MkdiskArgs),
 
@@ -632,11 +633,13 @@ args! {
         #[arg(long, default_value = "x86_64")]
         pub arch: Arch,
 
-        /// Repack `disk.img` from the sysroot exactly as it is, skipping the
-        /// `rootfs/` re-mirror. Use after editing the staged sysroot directly
-        /// (e.g. adding a test recipe or removing a default one): a normal
-        /// re-mirror is authoritative and would restore `rootfs/`-present recipes
-        /// and prune `rootfs/`-absent ones, undoing the manual staging.
+        /// Repack `disk.img` from the sysroot as it stands, skipping the
+        /// `rootfs/` re-mirror; the kernel and the ELF images are still
+        /// re-signed in place, as every pack signs them. Use after editing the
+        /// staged sysroot directly (e.g. adding a test recipe or removing a
+        /// default one): a normal re-mirror is authoritative and would restore
+        /// `rootfs/`-present recipes and prune `rootfs/`-absent ones, undoing
+        /// the manual staging.
         #[arg(long)]
         pub repack_only: bool,
 

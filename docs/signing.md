@@ -412,7 +412,10 @@ temporary directory and discards them.
 identity directory then holds the signing key's certificate, or its public key when it is a root,
 and the store, and no secret. xtask verifies every signed object under the build's trust store,
 with the kind, name and architecture its loader expects, before it writes it, so neither a faulty
-signer nor a store that does not trust the key can produce an image that fails to boot.
+signer nor a store that does not trust the key can produce an image that fails to boot. A pack
+refuses to sign when the store its environment builds is not the one written for the bootloader's
+build, so every object of an image is verified under the store that image's bootloader is built
+with.
 
 **Implementation.** The host signer is Seraph's own: no crate from a registry is a dependency
 ([coding-standards.md](coding-standards.md) § Dependencies). Ed25519 key generation and signing

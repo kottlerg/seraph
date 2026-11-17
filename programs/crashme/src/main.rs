@@ -20,10 +20,13 @@
 //! binding as well as the main thread's, and exits 0 when it does.
 //! `crashme debugger-tag` does not fault either: svctest, a debugger, sets
 //! each of its steps up and lets it go on with a line on stdin, and it checks
-//! what procmgr does with a debugger's binding. See
-//! programs/crashme/README.md.
+//! what procmgr does with a debugger's binding. `crashme oom-fill` and
+//! `crashme oom-touch` drive the crash service's hold of a fault memmgr
+//! declined for want of memory, under the log name `crashme-oom` (the `oom`
+//! module). See programs/crashme/README.md.
 
 mod arch;
+mod oom;
 
 use std::sync::mpsc;
 use std::thread::JoinHandle;
@@ -56,8 +59,17 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn main()
 {
-    std::os::seraph::log::register_name(b"crashme");
     let arg = std::env::args().nth(1).unwrap_or_default();
+    if arg.starts_with("oom-")
+    {
+        // Not `crashme`: the crash-report check ties the faulting modes'
+        // blocks to that name.
+        std::os::seraph::log::register_name(b"crashme-oom");
+    }
+    else
+    {
+        std::os::seraph::log::register_name(b"crashme");
+    }
     match arg.as_str()
     {
         "vm" => fault_here(&arg, Mode::Vm),
@@ -67,11 +79,13 @@ fn main()
         "registry-worker" => registry_worker(&arg),
         "registry-declare" => registry_declare(),
         "debugger-tag" => debugger_tag(),
+        "oom-fill" => oom::fill(std::env::args().nth(2).as_deref()),
+        "oom-touch" => oom::touch(),
         _ =>
         {
             println!(
                 "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare\
-                 |debugger-tag"
+                 |debugger-tag|oom-fill <ms>|oom-touch"
             );
             std::process::exit(2);
         }

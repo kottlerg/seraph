@@ -20,6 +20,7 @@ members = [
     "services/crashd",
     "services/crashd/core-file",
     "services/crashd/fault-bound",
+    "services/crashd/oom-hold",
     "services/devmgr",
     "services/devmgr/firmware",
     "services/logd",

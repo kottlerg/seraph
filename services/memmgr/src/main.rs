@@ -1475,8 +1475,17 @@ fn budget_parent(l: &MemLedger, badge: u64) -> Option<NodeIdx>
         .map(|r| r.budget)
 }
 
-fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64, procmgr_badge: u64)
+fn handle_register_process(
+    req: &IpcMessage,
+    caps: &[u64],
+    ipc_buf: *mut u64,
+    service_ep: u64,
+    procmgr_badge: u64,
+)
 {
+    // The charge node's handle, read and deleted before any refusal, so no
+    // path leaves it in memmgr's CSpace.
+    let charge_key = caps.first().and_then(|&cap| cap_badge(service_ep, cap));
     if req.badge != procmgr_badge
     {
         reply_label(ipc_buf, memmgr_errors::UNAUTHORIZED);
@@ -1492,7 +1501,8 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
     let known = memmgr_labels::REGISTER_PHYS_CLASS
         | memmgr_labels::REGISTER_RESERVE
         | memmgr_labels::REGISTER_MAX
-        | memmgr_labels::REGISTER_NODE_HANDLE;
+        | memmgr_labels::REGISTER_NODE_HANDLE
+        | memmgr_labels::REGISTER_CHARGE_NODE;
     if flags & !known != 0
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -1501,10 +1511,23 @@ fn handle_register_process(req: &IpcMessage, ipc_buf: *mut u64, service_ep: u64,
 
     let l = ledger_mut();
     // The new process's budget node: under the node of the process whose
-    // memmgr badge `data[2]` names, or top-level for 0, with the max in
-    // `data[3]` when `REGISTER_MAX` is set (services/memmgr/docs/
-    // ipc-interface.md § Label 3). The reserved boot records are no parent.
-    let Some(parent) = budget_parent(l, req.word(2))
+    // memmgr badge `data[2]` names, or top-level for 0, or with
+    // `REGISTER_CHARGE_NODE` under the node the handle in `caps[0]` names,
+    // with the max in `data[3]` when `REGISTER_MAX` is set
+    // (services/memmgr/docs/ipc-interface.md § Label 3). The reserved boot
+    // records are no parent.
+    let parent = if flags & memmgr_labels::REGISTER_CHARGE_NODE == 0
+    {
+        budget_parent(l, req.word(2))
+    }
+    else
+    {
+        charge_key
+            .filter(|k| k & memmgr_labels::NODE_HANDLE_TAG != 0)
+            .and_then(|k| handle_of(l, k))
+            .map(|(_, s)| s.node)
+    };
+    let Some(parent) = parent
     else
     {
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
@@ -3032,33 +3055,75 @@ fn handle_node_query_usage(req: &IpcMessage, ipc_buf: *mut u64)
 
 /// `NODE_REGISTER_LIMIT`: register `caps[0]`, a Notification with Notify,
 /// to receive the bits `data[0]` on the limit event of the handle's node,
-/// replacing the earlier registration, whose cap is deleted
-/// (services/memmgr/docs/ipc-interface.md § Label 17). A refused cap is
-/// deleted.
-fn handle_node_register_limit(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64)
+/// for the process whose memmgr SEND `caps[1]` is, with which the
+/// registration goes; it replaces the earlier registration, whose cap is
+/// deleted (services/memmgr/docs/ipc-interface.md § Label 17). A refused cap
+/// is deleted.
+fn handle_node_register_limit(req: &IpcMessage, caps: &[u64], ipc_buf: *mut u64, service_ep: u64)
 {
-    let Some(&cap) = caps.first()
+    let &[cap, by_cap] = caps
     else
     {
+        delete_caps(caps);
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    let by_badge =
+        cap_badge(service_ep, by_cap).filter(|b| b & memmgr_labels::NODE_HANDLE_TAG == 0);
     let bits = req.word(0);
     let l = ledger_mut();
-    let Some(prior) = handle_of(l, req.badge)
-        .filter(|_| bits != 0 && is_notify_cap(cap))
-        .and_then(|(h, _)| l.set_limit(h, cap, bits))
+    let by = by_badge.and_then(|b| l.find(b));
+    let target = handle_of(l, req.badge).map(|(h, _)| h);
+    let (Some(h), Some(by)) = (target, by)
     else
     {
         let _ = syscall::cap_delete(cap);
         reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
         return;
     };
-    if prior != 0
+    if bits == 0 || !is_notify_cap(cap)
     {
-        let _ = syscall::cap_delete(prior);
+        let _ = syscall::cap_delete(cap);
+        reply_label(ipc_buf, memmgr_errors::INVALID_ARGUMENT);
+        return;
     }
-    reply_label(ipc_buf, memmgr_errors::SUCCESS);
+    if !ensure_slots(l, 1)
+    {
+        let _ = syscall::cap_delete(cap);
+        reply_label(ipc_buf, memmgr_errors::TOO_MANY_PROCESSES);
+        return;
+    }
+    match l.set_limit(h, by, cap, bits)
+    {
+        Ok(prior) =>
+        {
+            if prior != 0
+            {
+                let _ = syscall::cap_delete(prior);
+            }
+            reply_label(ipc_buf, memmgr_errors::SUCCESS);
+        }
+        Err(e) =>
+        {
+            let _ = syscall::cap_delete(cap);
+            let label = match e
+            {
+                NodeError::NoSlot => memmgr_errors::TOO_MANY_PROCESSES,
+                NodeError::Parent => memmgr_errors::INVALID_ARGUMENT,
+            };
+            reply_label(ipc_buf, label);
+        }
+    }
+}
+
+/// The badge of `cap`, a SEND on memmgr's endpoint `service_ep` a client
+/// handed over (`SYS_ENDPOINT_BADGE`), deleting `cap` either way; `None`
+/// when it is no cap on that endpoint.
+fn cap_badge(service_ep: u64, cap: u64) -> Option<u64>
+{
+    let badge = syscall::endpoint_badge(service_ep, cap).ok();
+    let _ = syscall::cap_delete(cap);
+    badge
 }
 
 /// `NODE_RELEASE`: drop the handle state of a sub-node, so every handle to it
@@ -3283,9 +3348,9 @@ fn delete_caps(caps: &[u64])
 
 /// Number of attached caps, counted from `caps[0]`, that the contract of the
 /// label `opcode` hands to its handler (`services/memmgr/docs/ipc-interface.md`
-/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first for
-/// `DELEGATE_ASPACE`, `REGISTER_PRESSURE` and `NODE_REGISTER_LIMIT`, none for
-/// any other label.
+/// § Capability Transfer): every cap for `DONATE_MEMORY_CAPS`, the first two
+/// for `NODE_REGISTER_LIMIT`, the first for `DELEGATE_ASPACE`,
+/// `REGISTER_PRESSURE` and `REGISTER_PROCESS`, none for any other label.
 /// [`dispatch`] deletes the rest.
 fn contract_cap_count(opcode: u64, attached: usize) -> usize
 {
@@ -3294,7 +3359,8 @@ fn contract_cap_count(opcode: u64, attached: usize) -> usize
         memmgr_labels::DONATE_MEMORY_CAPS => attached,
         memmgr_labels::DELEGATE_ASPACE
         | memmgr_labels::REGISTER_PRESSURE
-        | memmgr_labels::NODE_REGISTER_LIMIT => attached.min(1),
+        | memmgr_labels::REGISTER_PROCESS => attached.min(1),
+        memmgr_labels::NODE_REGISTER_LIMIT => attached.min(2),
         _ => 0,
     }
 }
@@ -3344,7 +3410,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         }
         memmgr_labels::REGISTER_PROCESS =>
         {
-            handle_register_process(req, ipc_buf, boot.service_ep, boot.procmgr_badge);
+            handle_register_process(req, kept, ipc_buf, boot.service_ep, boot.procmgr_badge);
         }
         memmgr_labels::PROCESS_DIED =>
         {
@@ -3400,7 +3466,7 @@ fn dispatch(req: &IpcMessage, ipc_buf: *mut u64, boot: &InitBootstrap)
         }
         memmgr_labels::NODE_REGISTER_LIMIT =>
         {
-            handle_node_register_limit(req, kept, ipc_buf);
+            handle_node_register_limit(req, kept, ipc_buf, boot.service_ep);
         }
         memmgr_labels::NODE_RELEASE =>
         {

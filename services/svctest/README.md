@@ -63,7 +63,8 @@ services/svctest/
         │                      #   pages back after the destroy; reserve and max refusals
         ├── node_handle.rs     # memmgr node handles: class refusals, sub-node clamp, a max set
         │                      #   while the child runs, LIMIT, limit event, lowering reclaims
-        │                      #   nothing, released and dead handles refused
+        │                      #   nothing, released and dead handles refused; two children
+        │                      #   charged to one sub-node share its budget
         ├── heap_commit.rs     # Committed heap growth: max refusal as an allocation error, a grant
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity

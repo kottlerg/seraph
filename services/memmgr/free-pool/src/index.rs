@@ -71,7 +71,8 @@ pub const fn key_of(node: &Node) -> Option<u64>
         | Node::ChunkDir(_)
         | Node::Chunk(_)
         | Node::Caps(_)
-        | Node::Commit(_) => None,
+        | Node::Commit(_)
+        | Node::Limit(_) => None,
     }
 }
 

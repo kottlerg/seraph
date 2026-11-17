@@ -68,8 +68,9 @@ procmgr/
   initial caps to newly created processes via `ProcessInfo`.
 - **memmgr coordination** — call `memmgr.REGISTER_PROCESS` before
   spawning a child to obtain the child's `memmgr_endpoint_cap`, registering
-  its budget node under its creator's with the max, the reserve membership and
-  the node handle the create asks for (see [docs/ipc-interface.md](docs/ipc-interface.md)
+  its budget node under its creator's, or under the node of the handle the
+  create charges it to, with the max, the reserve membership and the node
+  handle the create asks for (see [docs/ipc-interface.md](docs/ipc-interface.md)
   § Label 1, **Memory max and reserve**); call
   `memmgr.PROCESS_DIED` after a child exits so memmgr can reclaim, or, for a
   started child created with `CREATE_DMA_HOLD`, only once its creator sends

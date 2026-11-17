@@ -53,9 +53,9 @@ Each label's wire shape and error set are specified in
 | `FS_RENAME` | no | rename within a single directory |
 | `FS_TRUNCATE` | no | shrink a file to zero (v1: `new_len == 0` only) |
 
-`FS_RENAME` is single-directory only because servers cannot introspect
-the badge packed in a received cap, so a second directory cap cannot
-resolve to a `NodeId`. Cross-directory rename is deferred; see
+`FS_RENAME` is single-directory only: the request carries one directory
+cap, so a destination in another directory cannot be named.
+Cross-directory rename is deferred; see
 [`../docs/fs-driver-protocol.md`](../docs/fs-driver-protocol.md) § Label 16: `FS_RENAME`.
 
 Per-label rights gating (`WRITE` for the write / truncate labels,

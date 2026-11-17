@@ -135,7 +135,8 @@ pub mod procmgr_labels
     /// * bit `31` — [`CREATE_MEMORY_MAX`]
     /// * bit `32` — [`CREATE_RESERVE`]
     /// * bit `33` — [`CREATE_NODE_HANDLE`]
-    /// * bits `[34..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `34` — [`CREATE_CHARGE_NODE`]
+    /// * bits `[35..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
@@ -286,11 +287,21 @@ pub mod procmgr_labels
     /// gone. Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
     /// `CREATE_PROCESS` (**Memory max and reserve**).
     pub const CREATE_NODE_HANDLE: u64 = 1 << 33;
-    /// Still-reserved bits `[34..64]` of a create label. Procmgr rejects
+    /// Label flag (bit 34) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
+    /// request carries a node handle (`memmgr_labels::NODE_HANDLE_TAG`) as a
+    /// tail cap, before the argv/env and death-relay caps, and the child's
+    /// budget node is made under the node it names instead of under the
+    /// creator's, so every process created on one handle shares that node's
+    /// max. procmgr passes the handle to memmgr with
+    /// `memmgr_labels::REGISTER_CHARGE_NODE`, which refuses a cap that is no
+    /// live node handle. Specified in `services/procmgr/docs/ipc-interface.md`
+    /// § Label 1: `CREATE_PROCESS` (**Memory max and reserve**).
+    pub const CREATE_CHARGE_NODE: u64 = 1 << 34;
+    /// Still-reserved bits `[35..64]` of a create label. Procmgr rejects
     /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
     /// addition is provably additive: existing senders are known to send
     /// zeros.
-    pub const CREATE_RESERVED_MASK: u64 = !((1 << 34) - 1);
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 35) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
 
@@ -952,7 +963,9 @@ pub mod memmgr_labels
     /// top-level node), and `data[3]` the max in pages with [`REGISTER_MAX`].
     /// The reply carries the badge in `data[0]` and the max the node took, after
     /// memmgr's clamp, in `data[1]`, the process's SEND in `caps[0]`, and with
-    /// [`REGISTER_NODE_HANDLE`] the new node's handle in `caps[1]`. Specified in
+    /// [`REGISTER_NODE_HANDLE`] the new node's handle in `caps[1]`. With
+    /// [`REGISTER_CHARGE_NODE`] the request's `caps[0]` is a node handle whose
+    /// node is the parent in place of `data[2]`'s. Specified in
     /// `services/memmgr/docs/ipc-interface.md` § Label 3:
     /// `REGISTER_PROCESS`.
     pub const REGISTER_PROCESS: u64 = 3;
@@ -974,6 +987,12 @@ pub mod memmgr_labels
     /// handle ([`NODE_HANDLE_TAG`]) to the new process's budget node in
     /// `caps[1]`.
     pub const REGISTER_NODE_HANDLE: u64 = 1 << 3;
+    /// [`REGISTER_PROCESS`] flag (`data[1]` bit 4): the request's `caps[0]` is
+    /// a node handle ([`NODE_HANDLE_TAG`]), and the new budget node is made
+    /// under the node it names, `data[2]` being ignored. memmgr reads the
+    /// handle's badge with `SYS_ENDPOINT_BADGE` and refuses a cap that is not
+    /// a SEND on its endpoint carrying a live node handle's key.
+    pub const REGISTER_CHARGE_NODE: u64 = 1 << 4;
     /// The bit of a memmgr process badge that marks a phys-class process
     /// ([`REGISTER_PHYS_CLASS`]). memmgr draws the bits outside
     /// [`VERB_BIT_MASK`](crate::VERB_BIT_MASK) at random and keeps every other
@@ -1213,9 +1232,14 @@ pub mod memmgr_labels
     /// Register a Notification for the limit event of the handle's budget
     /// node, on a node handle. `data[0]` is the bits to send, nonzero;
     /// `caps[0]` a Notification cap with Notify rights, whose ownership
-    /// transfers to memmgr. memmgr sends the bits, without blocking, when the
-    /// node's subtree reaches its max or its max refuses a charge. One
-    /// registration per node: a second replaces the first. Specified in
+    /// transfers to memmgr; `caps[1]` the registrant's own memmgr SEND (a
+    /// copy), which names the process the registration goes with: memmgr
+    /// reads its badge with `SYS_ENDPOINT_BADGE`, deletes it, and drops the
+    /// registration when that process dies, when the handle state goes, or
+    /// when a later registration replaces it. memmgr sends the bits, without
+    /// blocking, when the node's subtree reaches its max or its max refuses a
+    /// charge. One registration per node: a second replaces the first.
+    /// Specified in
     /// `services/memmgr/docs/ipc-interface.md` § Label 17:
     /// `NODE_REGISTER_LIMIT`.
     pub const NODE_REGISTER_LIMIT: u64 = 17;

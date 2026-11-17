@@ -301,8 +301,10 @@ pub(crate) const CSPACE_RETYPE_PAGES: u64 = 7;
 /// Register a new child with memmgr as `budget` says
 /// (`memmgr_labels::REGISTER_PROCESS`: its class and reserve membership in
 /// the flags, its budget node's parent in `data[2]`, and its max in
-/// `data[3]` with `REGISTER_MAX`, and `REGISTER_NODE_HANDLE` for a creator that
-/// asked for the child's node handle). On success returns the registration:
+/// `data[3]` with `REGISTER_MAX`, `REGISTER_NODE_HANDLE` for a creator that
+/// asked for the child's node handle, and `REGISTER_CHARGE_NODE` with the
+/// handle in `caps[0]` for one that charges the child to a node handle, which
+/// the call moves to memmgr or this function deletes). On success returns the registration:
 /// the SEND cap slot, the child's memmgr badge, the max the node took after
 /// memmgr's clamp, and the node handle when asked for. On any failure (memmgr unwired, IPC error, a refused
 /// parent, OOM) returns [`process::MemmgrRegistration::NONE`].
@@ -330,25 +332,49 @@ pub fn register_with_memmgr(
 {
     if memmgr_ep == 0
     {
+        if budget.charge != 0
+        {
+            let _ = syscall::cap_delete(budget.charge);
+        }
         return process::MemmgrRegistration::NONE;
     }
-    let msg = IpcMessage::builder(memmgr_labels::REGISTER_PROCESS)
+    let mut msg = IpcMessage::builder(memmgr_labels::REGISTER_PROCESS)
         .word(0, u64::from(ipc::MEMMGR_LABELS_VERSION))
         .word(1, budget.register_flags())
         .word(2, budget.parent)
-        .word(3, budget.max.unwrap_or(0))
-        .build();
+        .word(3, budget.max.unwrap_or(0));
+    if budget.charge != 0
+    {
+        msg = msg.cap(budget.charge);
+    }
+    let msg = msg.build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
-    let Ok(reply) = (unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) })
+    let reply = unsafe { ipc::ipc_call(memmgr_ep, &msg, ipc_buf) };
+    let refusal = match &reply
+    {
+        Ok(reply) if reply.label == memmgr_errors::SUCCESS => None,
+        Ok(reply) => Some(reply.label),
+        Err(_) => Some(0),
+    };
+    if let Some(label) = refusal
+    {
+        // The charge node's handle is still procmgr's when the call did not
+        // transfer it; deleting a moved slot is harmless.
+        if budget.charge != 0
+        {
+            let _ = syscall::cap_delete(budget.charge);
+        }
+        if label != 0
+        {
+            std::os::seraph::log!(warn: "memmgr refused the child's registration ({label})");
+        }
+        return process::MemmgrRegistration::NONE;
+    }
+    let Ok(reply) = reply
     else
     {
         return process::MemmgrRegistration::NONE;
     };
-    if reply.label != memmgr_errors::SUCCESS
-    {
-        std::os::seraph::log!(warn: "memmgr refused the child's registration ({})", reply.label);
-        return process::MemmgrRegistration::NONE;
-    }
     // With `REGISTER_NODE_HANDLE` the node handle is the second cap; a cap
     // past what was asked for is deleted.
     let node_handle = reply.caps().get(1).copied().unwrap_or(0);
@@ -1889,13 +1915,20 @@ fn handle_create(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx)
     // resource acquisition. The transferred caps are procmgr's to release on
     // the reject path.
     let checked = check_create_request(req, 0, caps.argv_env, &ctx.tables.lock().table);
-    let Some((sched, argv_env)) = checked
+    let Some((mut sched, argv_env)) = checked
     else
     {
-        release_caps(&[module_cap, creator_ep, caps.argv_env, caps.relay]);
+        release_caps(&[
+            module_cap,
+            creator_ep,
+            caps.argv_env,
+            caps.relay,
+            caps.charge,
+        ]);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    sched.budget.charge = caps.charge;
 
     // Register this child with memmgr. memmgr replies with a badged SEND
     // cap on its endpoint plus the memmgr-side process badge. Procmgr:
@@ -2108,13 +2141,20 @@ fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx
     // the reject path; the file cap is not opened yet, so the fs driver holds
     // no state for it.
     let checked = check_create_request(req, 1, caps.argv_env, &ctx.tables.lock().table);
-    let Some((sched, argv_env)) = checked
+    let Some((mut sched, argv_env)) = checked
     else
     {
-        release_caps(&[caps.source, caps.creator, caps.argv_env, caps.relay]);
+        release_caps(&[
+            caps.source,
+            caps.creator,
+            caps.argv_env,
+            caps.relay,
+            caps.charge,
+        ]);
         reply_empty(ipc_buf, procmgr_errors::INVALID_ARGUMENT);
         return;
     };
+    sched.budget.charge = caps.charge;
 
     let file_size = req.word(0);
 
@@ -2135,8 +2175,10 @@ fn handle_create_from_file(req: &IpcMessage, ipc_buf: *mut u64, ctx: &ProcmgrCtx
     // The child holds its own copies of the creator endpoint
     // (populate_child_info cap_copies it) and of the argv and env, or no
     // child exists, so procmgr's slots are released on both arms, as
-    // handle_create does, before the reply.
-    release_caps(&[caps.creator, caps.argv_env]);
+    // handle_create does, before the reply. The charge node's handle went to
+    // memmgr with the registration, or is released here when the create
+    // failed before it (deleting a moved slot is harmless).
+    release_caps(&[caps.creator, caps.argv_env, caps.charge]);
 
     match result
     {

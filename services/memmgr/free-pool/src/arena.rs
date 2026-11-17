@@ -91,6 +91,11 @@ pub struct ProcessCaps
     /// [`NodeHandle::owned_next`]; [`NODE_NULL`] for none. Each goes with the
     /// record ([`crate::Ledger::remove_process`]).
     pub handles: NodeIdx,
+    /// The first [`Node::Handle`] slot whose limit registration the process
+    /// made, chained through [`NodeHandle::limit_next`]; [`NODE_NULL`] for
+    /// none. Each registration goes with the record
+    /// ([`crate::Ledger::remove_process`]).
+    pub limits: NodeIdx,
 }
 
 /// The handle state of one budget node: the badge its node handles carry,
@@ -111,12 +116,30 @@ pub struct NodeHandle
     /// the node itself, or for a sub-node the owner of the node it was made
     /// under. The state goes when that record does.
     pub owner: u64,
-    /// The Notification cap a limit event is sent on, or `0` for none.
-    pub limit: u64,
-    /// The bits a limit event sends on [`NodeHandle::limit`].
-    pub limit_bits: u64,
+    /// The [`Node::Limit`] slot of the limit-event registration, or
+    /// [`NODE_NULL`] for none.
+    pub limit: NodeIdx,
     /// The next handle slot of the owner's list ([`ProcessCaps::handles`]).
     pub owned_next: NodeIdx,
+}
+
+/// A limit-event registration on one handle state: the Notification and bits
+/// a limit event is sent with, and the process that made it, with which it
+/// goes. A slot of its own, named by [`NodeHandle::limit`] and chained on its
+/// registrant's [`ProcessCaps::limits`] list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LimitReg
+{
+    /// The Notification cap a limit event is sent on.
+    pub cap: u64,
+    /// The bits a limit event sends on [`LimitReg::cap`].
+    pub bits: u64,
+    /// The [`Node::Handle`] slot the registration is on.
+    pub handle: NodeIdx,
+    /// The record slot of the process that made the registration.
+    pub by: NodeIdx,
+    /// The next registration of the same process ([`ProcessCaps::limits`]).
+    pub by_next: NodeIdx,
 }
 
 /// A run taken back from a process and parked on the
@@ -167,6 +190,7 @@ pub struct Commitment
 const _: () = assert!(size_of::<RegionNode>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
 const _: () = assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
+const _: () = assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
 
 /// The payload of one arena slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -185,6 +209,9 @@ pub enum Node
     Commit(Commitment),
     /// The handle state of the budget node whose slot names this slot.
     Handle(NodeHandle),
+    /// The limit-event registration the handle state that names this slot
+    /// carries.
+    Limit(LimitReg),
     /// A directory node of a chunk table: its children, [`NODE_NULL`] where
     /// no chunk below the child has an entry.
     ChunkDir([NodeIdx; DIR_FANOUT]),
@@ -525,6 +552,7 @@ mod tests
         assert!(size_of::<ProcessCaps>() <= size_of::<ProcessRecord>());
         assert!(size_of::<Commitment>() <= size_of::<ProcessRecord>());
         assert!(size_of::<NodeHandle>() <= size_of::<ProcessRecord>());
+        assert!(size_of::<LimitReg>() <= size_of::<ProcessRecord>());
         assert_eq!(SLOT_SIZE, 64);
         assert_eq!(SLOTS_PER_PAGE, 64);
     }

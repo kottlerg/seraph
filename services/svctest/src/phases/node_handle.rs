@@ -95,6 +95,7 @@ fn node_handles_phase(_: &Caps)
 {
     own_sub_node();
     child_node();
+    shared_sub_node();
     std::os::seraph::log!("memmgr_node_handles phase passed");
 }
 
@@ -154,8 +155,20 @@ fn notification() -> (u64, u64)
     (sig, notify)
 }
 
+/// A copy of svctest's own memmgr SEND, which names svctest as the registrant
+/// of a limit registration.
+fn own_memmgr_send() -> u64
+{
+    syscall::cap_copy(
+        startup_info().memmgr_endpoint,
+        startup_info().self_cspace,
+        syscall::RIGHTS_EP_SEND,
+    )
+    .expect("copying svctest's memmgr SEND")
+}
+
 /// Register `notify` for the limit event of `handle`'s node with
-/// [`LIMIT_BIT`].
+/// [`LIMIT_BIT`], svctest the registrant.
 fn register_limit(handle: u64, notify: u64, what: &str)
 {
     let reply = call(
@@ -163,6 +176,7 @@ fn register_limit(handle: u64, notify: u64, what: &str)
         &IpcMessage::builder(memmgr_labels::NODE_REGISTER_LIMIT)
             .word(0, LIMIT_BIT)
             .cap(notify)
+            .cap(own_memmgr_send())
             .build(),
         what,
     );
@@ -277,25 +291,39 @@ fn sub_node_clamped(node: u64) -> u64
     handle_of(&reply, "NODE_CREATE")
 }
 
-/// Zero bits are refused; a max set at the usage of the unused node `node`
-/// signals its limit event.
+/// Zero bits, a missing registrant and a node handle as the registrant are
+/// refused; a max set at the usage of the unused node `node` signals its limit
+/// event.
 fn limit_on_set_max(node: u64)
 {
     let (sig, notify) = notification();
-    let spare = syscall::cap_derive(notify, syscall::RIGHTS_NTF_NOTIFY).expect("cap_derive");
-    let refused = call(
-        node,
-        &IpcMessage::builder(memmgr_labels::NODE_REGISTER_LIMIT)
-            .word(0, 0)
-            .cap(spare)
-            .build(),
-        "NODE_REGISTER_LIMIT with zero bits",
-    );
-    assert_eq!(
-        refused.label,
-        memmgr_errors::INVALID_ARGUMENT,
-        "NODE_REGISTER_LIMIT with zero bits"
-    );
+    let node_copy = syscall::cap_copy(node, startup_info().self_cspace, syscall::RIGHTS_EP_SEND)
+        .expect("copying the sub-node's handle");
+    for (bits, registrant, what) in [
+        (
+            0,
+            Some(own_memmgr_send()),
+            "NODE_REGISTER_LIMIT with zero bits",
+        ),
+        (LIMIT_BIT, None, "NODE_REGISTER_LIMIT without a registrant"),
+        (
+            LIMIT_BIT,
+            Some(node_copy),
+            "NODE_REGISTER_LIMIT naming a node handle as the registrant",
+        ),
+    ]
+    {
+        let spare = syscall::cap_derive(notify, syscall::RIGHTS_NTF_NOTIFY).expect("cap_derive");
+        let mut msg = IpcMessage::builder(memmgr_labels::NODE_REGISTER_LIMIT)
+            .word(0, bits)
+            .cap(spare);
+        if let Some(cap) = registrant
+        {
+            msg = msg.cap(cap);
+        }
+        let refused = call(node, &msg.build(), what);
+        assert_eq!(refused.label, memmgr_errors::INVALID_ARGUMENT, "{what}");
+    }
     register_limit(node, notify, "NODE_REGISTER_LIMIT of the sub-node");
     let reply = expect(
         node,
@@ -347,10 +375,135 @@ fn release_refused(handle: u64, what: &str)
 fn child_node()
 {
     let what = "the node-handle child";
+    let (process, thread, node) = spawn_node_child(None, what);
+    expect(
+        node,
+        memmgr_labels::NODE_RELEASE,
+        &[],
+        memmgr_errors::INVALID_ARGUMENT,
+        "NODE_RELEASE of a process's own node",
+    );
+    let (sig, set, inner) = arm_child_node(node);
+    budget::start(process, what);
+    let own = at_max(node, sig, set);
+    lowered_reclaims_nothing(node, sig, own, set);
+    finish_node_child(process, thread, what);
+    // The child's handle state, and that of the sub-node made through it, went
+    // with the child.
+    gone_with_child(node, "the child's node");
+    gone_with_child(inner, "the child's sub-node");
+    let _ = syscall::cap_delete(sig);
+}
+
+/// Two children charged to one sub-node of svctest share its budget: the
+/// sub-node holds both children's charges, a max set at their usage signals
+/// its limit event, and one child's max cannot then grow past what the other
+/// left.
+fn shared_sub_node()
+{
+    let reply = expect(
+        startup_info().memmgr_endpoint,
+        memmgr_labels::CREATE_SUB_NODE,
+        &[NO_MAX],
+        memmgr_errors::SUCCESS,
+        "CREATE_SUB_NODE for the shared children",
+    );
+    let shared = handle_of(&reply, "CREATE_SUB_NODE for the shared children");
+    let a = spawn_node_child(Some(handle_copy(shared)), "shared child A");
+    let b = spawn_node_child(Some(handle_copy(shared)), "shared child B");
+    let (own, _, subtree) = node_usage(shared, "NODE_QUERY_USAGE of the shared sub-node");
+    let (_, _, sub_a) = node_usage(a.2, "NODE_QUERY_USAGE of shared child A");
+    let (_, _, sub_b) = node_usage(b.2, "NODE_QUERY_USAGE of shared child B");
+    assert_eq!(own, 0, "the shared sub-node was charged directly");
+    assert_eq!(
+        Some(subtree),
+        sub_a.checked_add(sub_b),
+        "the shared sub-node does not hold both children's charges"
+    );
+    let (sig_a, set_a, inner_a) = arm_child_node(a.2);
+    let (sig_b, set_b, inner_b) = arm_child_node(b.2);
+    budget::start(a.0, "shared child A");
+    budget::start(b.0, "shared child B");
+    let own_a = at_max(a.2, sig_a, set_a);
+    let own_b = at_max(b.2, sig_b, set_b);
+    shared_at_max(shared, a.2, set_a, set_b);
+    lowered_reclaims_nothing(a.2, sig_a, own_a, set_a);
+    lowered_reclaims_nothing(b.2, sig_b, own_b, set_b);
+    finish_node_child(a.0, a.1, "shared child A");
+    finish_node_child(b.0, b.1, "shared child B");
+    for (handle, whose) in [
+        (a.2, "shared child A's node"),
+        (inner_a, "shared child A's sub-node"),
+        (b.2, "shared child B's node"),
+        (inner_b, "shared child B's sub-node"),
+    ]
+    {
+        gone_with_child(handle, whose);
+    }
+    release_refused(shared, "the shared sub-node");
+    let _ = syscall::cap_delete(sig_a);
+    let _ = syscall::cap_delete(sig_b);
+}
+
+/// Both children under the shared sub-node `shared` are at their maxes
+/// `set_a` and `set_b`: the sub-node's subtree is their sum, a max set there
+/// signals its limit event, and child A's max, through its handle `node_a`,
+/// cannot then grow past its usage, the headroom child B took.
+fn shared_at_max(shared: u64, node_a: u64, set_a: u64, set_b: u64)
+{
+    let (_, _, subtree) = node_usage(shared, "NODE_QUERY_USAGE of the full shared sub-node");
+    assert_eq!(
+        Some(subtree),
+        set_a.checked_add(set_b),
+        "the shared sub-node's subtree is not both children's usage"
+    );
+    let (sig, notify) = notification();
+    register_limit(shared, notify, "NODE_REGISTER_LIMIT of the shared sub-node");
+    let reply = expect(
+        shared,
+        memmgr_labels::NODE_SET_MAX,
+        &[subtree],
+        memmgr_errors::SUCCESS,
+        "NODE_SET_MAX of the shared sub-node at its usage",
+    );
+    assert_eq!(
+        reply.word(0),
+        subtree,
+        "the shared sub-node took another max"
+    );
+    await_limit(sig, "NODE_SET_MAX of the shared sub-node at its usage");
+    let reply = expect(
+        node_a,
+        memmgr_labels::NODE_SET_MAX,
+        &[set_a.saturating_add(1)],
+        memmgr_errors::SUCCESS,
+        "NODE_SET_MAX of shared child A above its usage",
+    );
+    assert_eq!(
+        reply.word(0),
+        set_a,
+        "shared child A's max grew past what the shared sub-node had left"
+    );
+    let _ = syscall::cap_delete(sig);
+}
+
+/// A copy of the node handle `handle`, for a create to carry.
+fn handle_copy(handle: u64) -> u64
+{
+    syscall::cap_copy(handle, startup_info().self_cspace, syscall::RIGHTS_EP_SEND)
+        .expect("copying a node handle")
+}
+
+/// Create a [`NODE_CHILD_ROLE`] child (`what`, for the messages) with
+/// `CREATE_NODE_HANDLE`, charged to the node handle `charge` when given;
+/// its process handle, thread and node handle.
+fn spawn_node_child(charge: Option<u64>, what: &str) -> (u64, u64, u64)
+{
     let reply = budget::create_role(
         NODE_CHILD_ROLE,
         ipc::procmgr_labels::CREATE_NODE_HANDLE,
         None,
+        charge,
         what,
     );
     assert_eq!(reply.word(0), NO_MAX, "the node of {what} took a max");
@@ -362,16 +515,13 @@ fn child_node()
             reply.caps().len()
         )
     };
-    expect(
-        node,
-        memmgr_labels::NODE_RELEASE,
-        &[],
-        memmgr_errors::INVALID_ARGUMENT,
-        "NODE_RELEASE of a process's own node",
-    );
-    let (sig, set, inner) = arm_child_node(node);
-    budget::start(process, what);
-    at_max_then_lowered(node, sig, set);
+    (process, thread, node)
+}
+
+/// Wait for the [`NODE_CHILD_ROLE`] child `process` (`what`, for the
+/// messages) to exit 0, destroy it, and delete its caps.
+fn finish_node_child(process: u64, thread: u64, what: &str)
+{
     let reason = budget::finish(process, what);
     let _ = syscall::cap_delete(thread);
     let _ = syscall::cap_delete(process);
@@ -384,11 +534,6 @@ fn child_node()
          grant under the lowered max not refused with LIMIT, {CHILD_NOT_RAISED}=the max never \
          rose back to the usage, a fault reason=the child was killed"
     );
-    // The child's handle state, and that of the sub-node made through it, went
-    // with the child.
-    gone_with_child(node, "the child's node");
-    gone_with_child(inner, "the child's sub-node");
-    let _ = syscall::cap_delete(sig);
 }
 
 /// Before the child under the node handle `node` starts: register for its
@@ -434,10 +579,8 @@ fn arm_child_node(node: u64) -> (u64, u64, u64)
 
 /// The running child fills its node to the max `set`, which signals the
 /// limit event on `sig`, and its usage read through the handle `node` is
-/// the max; lowering the max below the usage then reclaims nothing. The child
-/// stays alive, and its handle state with it, until the max is raised back to
-/// `set` after the last read.
-fn at_max_then_lowered(node: u64, sig: u64, set: u64)
+/// the max; its own usage.
+fn at_max(node: u64, sig: u64, set: u64) -> u64
 {
     await_limit(sig, "the child's fill to its max");
     let (own, max, subtree) = node_usage(node, "NODE_QUERY_USAGE at the child's max");
@@ -450,6 +593,24 @@ fn at_max_then_lowered(node: u64, sig: u64, set: u64)
         subtree, set,
         "the child's subtree is not at its max after the fill"
     );
+    own
+}
+
+/// Lowering the max of the child at its max `set`, its usage `own`, through
+/// its handle `node` below the usage reclaims nothing, and signals the limit
+/// event on `sig`. The child stays alive, and its handle state with it, until
+/// the max is raised back to `set`; the phase raises it after its last read
+/// and once a grant the child asked for under the lowered max was refused,
+/// which signals the limit event again, so the child cannot miss the lowering.
+fn lowered_reclaims_nothing(node: u64, sig: u64, own: u64, set: u64)
+{
+    // Bits of an event not taken yet (a max set at the usage) may not stand in
+    // for the lowering's own. memmgr signals after its reply, and before it
+    // takes the next request, so the read below orders every earlier signal
+    // ahead of the drain.
+    let (_, max, _) = node_usage(node, "NODE_QUERY_USAGE before the lowering");
+    assert_eq!(max, set, "the child's max moved before the lowering");
+    let _ = syscall::notification_try_wait(sig);
     let lowered = own / 2;
     let reply = expect(
         node,
@@ -463,9 +624,14 @@ fn at_max_then_lowered(node: u64, sig: u64, set: u64)
         lowered,
         "NODE_SET_MAX below the usage took another max"
     );
+    await_limit(sig, "NODE_SET_MAX below the child's usage");
     let (after, max, _) = node_usage(node, "NODE_QUERY_USAGE after the lowering");
     assert_eq!(max, lowered, "the lowered max did not hold");
     assert_eq!(after, own, "lowering the child's max reclaimed pages");
+    // The child refuses itself a page under the lowered max until the max is
+    // raised, so a later event is one of its refused grants: it has seen the
+    // lowering.
+    await_limit(sig, "the child's grant under the lowered max");
     expect(
         node,
         memmgr_labels::NODE_SET_MAX,
@@ -498,17 +664,19 @@ fn gone_with_child(handle: u64, whose: &str)
 
 // ── The node-handle child ────────────────────────────────────────────────────
 
-/// Child role: fill the node whose max the phase set to that max, check that
-/// one page more is refused with `LIMIT`, wait until the phase lowers the max
-/// below the usage, check that a page is still refused with `LIMIT`, and wait
-/// until the phase raises the max back to the usage, which it does after its
-/// last read through the child's handle. Exits 0, or with the step's exit code.
+/// Child role: fill the node whose max the phase set to that max, wait until
+/// the phase lowers the max below the usage, and, until the phase raises the
+/// max back to the usage, ask for a page and check that it is refused with
+/// `LIMIT`; each refusal signals the node's limit event, which tells the
+/// phase the child saw the lowering. At the max again, check that one page
+/// more is refused with `LIMIT`. Exits 0, or with the step's exit code.
+/// Between the fill and the lowering the child charges nothing, so the only
+/// limit events of that span are the phase's own.
 ///
 /// No step after the fill allocates from the heap or grows a stack, since
 /// memmgr refuses this process every further page.
 fn node_child_main() -> !
 {
-    use crate::phases::memmgr::try_request_contiguous;
     use std::process::exit;
 
     touch_stack();
@@ -519,23 +687,12 @@ fn node_child_main() -> !
         None => exit(CHILD_USAGE_QUERY_FAILED),
     };
     fill_to(max);
-    if try_request_contiguous(1) != Err(memmgr_errors::LIMIT)
-    {
-        exit(CHILD_NO_LIMIT);
-    }
     let start = Instant::now();
     while start.elapsed() < EVENT_WAIT
     {
         match budget::memory_usage()
         {
-            Some((own, max, _)) if max < own =>
-            {
-                if try_request_contiguous(1) != Err(memmgr_errors::LIMIT)
-                {
-                    exit(CHILD_NO_LIMIT_LOWERED);
-                }
-                await_raised(own);
-            }
+            Some((own, max, _)) if max < own => await_raised(own),
             Some(_) => std::thread::yield_now(),
             None => exit(CHILD_USAGE_QUERY_FAILED),
         }
@@ -543,10 +700,14 @@ fn node_child_main() -> !
     exit(CHILD_NOT_LOWERED);
 }
 
-/// Wait until the child's max is back at or above its usage `own`, then exit 0;
-/// exit [`CHILD_NOT_RAISED`] after [`EVENT_WAIT`].
+/// Until the child's max is back at or above its usage `own`, ask for a page
+/// and exit [`CHILD_NO_LIMIT_LOWERED`] unless it is refused with `LIMIT`.
+/// Then, at the max, ask for one more and exit 0 if it is refused with
+/// `LIMIT`, [`CHILD_NO_LIMIT`] otherwise. Exit [`CHILD_NOT_RAISED`] after
+/// [`EVENT_WAIT`].
 fn await_raised(own: u64) -> !
 {
+    use crate::phases::memmgr::try_request_contiguous;
     use std::process::exit;
 
     let start = Instant::now();
@@ -554,7 +715,20 @@ fn await_raised(own: u64) -> !
     {
         match budget::memory_usage()
         {
-            Some((_, max, _)) if max >= own => exit(0),
+            Some((_, max, _)) if max >= own => exit(
+                if try_request_contiguous(1) == Err(memmgr_errors::LIMIT)
+                {
+                    0
+                }
+                else
+                {
+                    CHILD_NO_LIMIT
+                },
+            ),
+            Some(_) if try_request_contiguous(1) != Err(memmgr_errors::LIMIT) =>
+            {
+                exit(CHILD_NO_LIMIT_LOWERED)
+            }
             Some(_) => std::thread::yield_now(),
             None => exit(CHILD_USAGE_QUERY_FAILED),
         }

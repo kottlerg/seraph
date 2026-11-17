@@ -212,9 +212,10 @@ and never reclaims them. Each entry records:
   so the record stays within the arena's slot size: it holds the delegated
   child `AddressSpace` cap, when demand-paged, the Notification cap
   `REGISTER_PRESSURE` gave, with the bits it is signalled with
-  ([Memory pressure](#memory-pressure)), and the head of the list of node
-  handle states the process owns ([Distribution policy](#distribution-policy)),
-  which go with the record.
+  ([Memory pressure](#memory-pressure)), the head of the list of node
+  handle states the process owns, and the head of the list of the limit
+  registrations it made ([Distribution policy](#distribution-policy)), all
+  of which go with the record.
 - The next region id: a sequence from 1 that numbers the process's grants.
   Each grant's frame node keeps its id, which no later grant of the process
   reuses; bootstrap arenas and demand-fault runs carry none.
@@ -380,7 +381,7 @@ mapped in the process. When that unmap fails, the run stays recorded on the proc
 ## Metadata Arena
 
 All of memmgr's bookkeeping — free runs, deferred runs, process records and
-their budget nodes and node handle states, per-process frame and region
+their budget nodes, node handle states and limit registrations, per-process frame and region
 descriptors, and the regions' chunk tables — is
 nodes drawn from a self-hosted arena rather than fixed `.bss` arrays. memmgr
 is `no_std` and cannot bootstrap
@@ -388,8 +389,8 @@ a general heap against itself, but it *can* host fixed-size nodes in pages
 carved from its own pool:
 
 - Nodes are fixed-size `Slot`s (a tagged run, deferred run, budget, process,
-  process caps, node handle, region, commitment, frame, chunk-directory, chunk,
-  or free payload plus a `next` index)
+  process caps, node handle, limit registration, region, commitment, frame,
+  chunk-directory, chunk, or free payload plus a `next` index)
   reached by a
   `u64` index, so the index never bounds the
   arena before the address space does.
@@ -755,14 +756,19 @@ the process runs never exceeds what its ancestors allow and lowering it reclaims
 above; makes sub-nodes under it (`NODE_CREATE`), so siblings charged to one sub-node share its
 budget; reads its usage (`NODE_QUERY_USAGE`); and registers a Notification for its limit event
 (`NODE_REGISTER_LIMIT`). procmgr hands a creator its child's handle on request
-(`CREATE_NODE_HANDLE`), and a process makes sub-nodes of its own node with `CREATE_SUB_NODE`;
-no process holds a handle to its own node, so none can raise the max its creator set. A node's
-handle state, the key its handles carry and its limit registration, is an arena node named by the
-budget node's slot link and found through the record index by its key; it holds a reference on
-its node. It belongs to a process: the node's own process, or for a sub-node the owner of the node
-it was made under, or the process that called `CREATE_SUB_NODE`. It goes when that process dies
-or, for a sub-node, on `NODE_RELEASE`; every handle carrying its key is refused from then on, and
-the node itself lives on while a process, a node below it or a charge refers to it.
+(`CREATE_NODE_HANDLE`), and charges a new child to the node of a handle the creator passes
+(`CREATE_CHARGE_NODE`); a process makes sub-nodes of its own node with `CREATE_SUB_NODE`; no
+process holds a handle to its own node, so none can raise the max its creator set. A node's
+handle state, the key its handles carry and the index of its limit registration, is an arena node
+named by the budget node's slot link and found through the record index by its key; it holds a
+reference on its node. It belongs to a process: the node's own process, or for a sub-node the owner
+of the node it was made under, or the process that called `CREATE_SUB_NODE`. It goes when that
+process dies or, for a sub-node, on `NODE_RELEASE`; every handle carrying its key is refused from
+then on, and the node itself lives on while a process, a node below it or a charge refers to it.
+The limit registration, the Notification cap and its bits, is an arena node of its own on the list
+of its registrant, the process whose memmgr SEND the request carried: it goes when the registrant
+dies, when a later registration replaces it, or with the handle state, so no holder leaves a cap in
+memmgr past its own life.
 
 **Limit event.** After each request memmgr walks the chain from the node the request charged, or
 whose max it set, to the top, and sends each node's registered bits on its Notification when the

@@ -366,7 +366,7 @@ pub(crate) fn finish(handle: u64, what: &str) -> u64
 /// `(process handle, thread)`.
 pub(crate) fn create_with_max(role: &str, max: u64, what: &str) -> (u64, u64)
 {
-    let reply = create_role(role, 0, Some(max), what);
+    let reply = create_role(role, 0, Some(max), None, what);
     assert_eq!(reply.word(0), max, "the node of {what} took another max");
     match reply.caps()
     {
@@ -378,8 +378,16 @@ pub(crate) fn create_with_max(role: &str, max: u64, what: &str) -> (u64, u64)
 /// Create `/tests/svctest <role>` (`what`, for the messages) through a raw
 /// `CREATE_FROM_FILE` with the create flags `flags`, and with
 /// `CREATE_MEMORY_MAX` of `max` pages after the argv/env header when `max`
-/// is given; assert procmgr accepts it, and return its reply.
-pub(crate) fn create_role(role: &str, flags: u64, max: Option<u64>, what: &str) -> ipc::IpcMessage
+/// is given, and with `CREATE_CHARGE_NODE` of the node handle `charge` (moved
+/// to procmgr) when it is given; assert procmgr accepts it, and return its
+/// reply.
+pub(crate) fn create_role(
+    role: &str,
+    flags: u64,
+    max: Option<u64>,
+    charge: Option<u64>,
+    what: &str,
+) -> ipc::IpcMessage
 {
     use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
     use std::os::seraph::process::ArgvEnvCap;
@@ -397,15 +405,31 @@ pub(crate) fn create_role(role: &str, flags: u64, max: Option<u64>, what: &str) 
     {
         0
     };
+    let charge_flag = if charge.is_some()
+    {
+        procmgr_labels::CREATE_CHARGE_NODE
+    }
+    else
+    {
+        0
+    };
     let create = IpcMessage::builder(
-        procmgr_labels::CREATE_FROM_FILE | procmgr_labels::CREATE_ARGV_ENV | max_flag | flags,
+        procmgr_labels::CREATE_FROM_FILE
+            | procmgr_labels::CREATE_ARGV_ENV
+            | max_flag
+            | charge_flag
+            | flags,
     )
     .word(0, size)
     .words(1, &argv_env.header_words())
-    .words(1 + procmgr_labels::ARGV_ENV_HEADER_WORDS, max.as_slice())
-    .cap(file)
-    .cap(argv_env.cap())
-    .build();
+    .words(1 + procmgr_labels::ARGV_ENV_HEADER_WORDS, max.as_slice());
+    // The tail caps in the order procmgr reads them: the file, the charge
+    // node's handle, the argv/env cap.
+    let create = [Some(file), charge, Some(argv_env.cap())]
+        .into_iter()
+        .flatten()
+        .fold(create, ipc::IpcMessageBuilder::cap)
+        .build();
     // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer page.
     let reply = unsafe {
         ipc::ipc_call(

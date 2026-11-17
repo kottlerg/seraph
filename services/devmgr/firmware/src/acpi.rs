@@ -3,8 +3,9 @@
 
 // services/devmgr/firmware/src/acpi.rs
 
-//! Narrow ACPI walk: RSDP → XSDT → MCFG, FADT (`PM1a_CNT_BLK`, `CENTURY`),
-//! and MADT (its Interrupt Source Overrides and I/O APICs).
+//! Narrow ACPI walk: RSDP → XSDT → MCFG, FADT (`PM1a_CNT_BLK`, `CENTURY`,
+//! the DSDT, the fixed register blocks acpid is served, and the FACS), and
+//! MADT (its Interrupt Source Overrides and I/O APICs).
 //!
 //! Operates on byte-slice views of ACPI tables — the caller is responsible
 //! for mapping the tables into its address space first, and
@@ -44,6 +45,39 @@ const FADT_OFF_DSDT: usize = 40;
 /// FADT `X_DSDT`: the DSDT's 64-bit physical address, which a non-zero value
 /// gives in place of `DSDT`.
 const FADT_OFF_X_DSDT: usize = 140;
+/// FADT `FIRMWARE_CTRL`: the FACS's 32-bit physical address.
+const FADT_OFF_FIRMWARE_CTRL: usize = 36;
+/// FADT `SMI_CMD`: the 32-bit port of the SMI command register.
+const FADT_OFF_SMI_CMD: usize = 48;
+/// FADT `ACPI_ENABLE`: the byte written to `SMI_CMD` to enter ACPI mode.
+const FADT_OFF_ACPI_ENABLE: usize = 52;
+/// FADT `PM1a_EVT_BLK`: the 32-bit port of the `PM1a` event block.
+const FADT_OFF_PM1A_EVT_BLK: usize = 56;
+/// FADT `GPE0_BLK`: the 32-bit port of the GPE0 block.
+const FADT_OFF_GPE0_BLK: usize = 80;
+/// FADT `PM1_EVT_LEN`: the PM1 event block's length in bytes.
+const FADT_OFF_PM1_EVT_LEN: usize = 88;
+/// FADT `PM1_CNT_LEN`: the PM1 control block's length in bytes.
+const FADT_OFF_PM1_CNT_LEN: usize = 89;
+/// FADT `GPE0_BLK_LEN`: the GPE0 block's length in bytes.
+const FADT_OFF_GPE0_BLK_LEN: usize = 92;
+/// FADT `Flags`: a 32-bit field.
+const FADT_OFF_FLAGS: usize = 112;
+/// FADT `Flags` bit `RESET_REG_SUP`: `RESET_REG` is supported.
+const FADT_FLAG_RESET_REG_SUP: u32 = 1 << 10;
+/// FADT `RESET_REG`: a 12-byte Generic Address Structure (space ID, bit
+/// width, bit offset, access size, then the 64-bit address).
+const FADT_OFF_RESET_REG: usize = 116;
+/// FADT `RESET_VALUE`: the byte written to `RESET_REG`.
+const FADT_OFF_RESET_VALUE: usize = 128;
+/// FADT `X_FIRMWARE_CTRL`: the FACS's 64-bit physical address, which a
+/// non-zero value gives in place of `FIRMWARE_CTRL`.
+const FADT_OFF_X_FIRMWARE_CTRL: usize = 132;
+/// Generic Address Structure space ID of the I/O space.
+const GAS_SPACE_IO: u8 = 1;
+/// The bytes of the FACS that hold its fields up to the reserved tail: the
+/// length ACPI 6.5 § 5.2.10 requires at least.
+pub const FACS_MIN_LEN: u64 = 64;
 /// SDT header `OEM Table ID`: 8 bytes, space-padded.
 const SDT_OFF_OEM_TABLE_ID: usize = 16;
 
@@ -199,6 +233,134 @@ pub fn fadt_dsdt_phys(fadt_bytes: &[u8]) -> Option<u64>
     }
     let dsdt = u64::from(read_u32(fadt_bytes, FADT_OFF_DSDT));
     if dsdt == 0 { None } else { Some(dsdt) }
+}
+
+// ── FADT → fixed register blocks, FACS ─────────────────────────────────
+
+/// One of the FADT's fixed register blocks in the I/O space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FadtBlock
+{
+    /// `PM1a_EVT_BLK`, `PM1_EVT_LEN` ports.
+    Pm1aEvt,
+    /// `PM1a_CNT_BLK`, `PM1_CNT_LEN` ports.
+    Pm1aCnt,
+    /// `GPE0_BLK`, `GPE0_BLK_LEN` ports.
+    Gpe0,
+    /// `SMI_CMD`, one port, with `ACPI_ENABLE`.
+    SmiCmd,
+    /// `RESET_REG`, when `RESET_REG_SUP` is set and it lies in the I/O
+    /// space, with `RESET_VALUE`.
+    Reset,
+}
+
+/// Where a [`FadtBlock`] lies: its first port, its port count, and the value
+/// the FADT gives with it (`ACPI_ENABLE` for [`FadtBlock::SmiCmd`],
+/// `RESET_VALUE` for [`FadtBlock::Reset`], else 0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IoBlock
+{
+    pub port: u16,
+    pub count: u16,
+    pub value: u8,
+}
+
+/// Read where the FADT places `block` (ACPI 6.5 § 5.2.9).
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) does not reach the fields, the port is
+/// zero or past 0xFFFF, the block's length is zero or runs past 0xFFFF, or,
+/// for [`FadtBlock::Reset`], `RESET_REG_SUP` is clear or the register is
+/// not in the I/O space.
+#[must_use]
+pub fn fadt_io_block(fadt_bytes: &[u8], block: FadtBlock) -> Option<IoBlock>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    let table = fadt_bytes.get(..total_len)?;
+    let byte = |off: usize| table.get(off).copied();
+    let dword = |off: usize| {
+        table
+            .get(off..off.checked_add(4)?)
+            .map(|_| read_u32(table, off))
+    };
+    let (port, count, value) = match block
+    {
+        FadtBlock::Pm1aEvt => (
+            u64::from(dword(FADT_OFF_PM1A_EVT_BLK)?),
+            byte(FADT_OFF_PM1_EVT_LEN)?,
+            0,
+        ),
+        FadtBlock::Pm1aCnt => (
+            u64::from(dword(FADT_OFF_PM1A_CNT_BLK)?),
+            byte(FADT_OFF_PM1_CNT_LEN)?,
+            0,
+        ),
+        FadtBlock::Gpe0 => (
+            u64::from(dword(FADT_OFF_GPE0_BLK)?),
+            byte(FADT_OFF_GPE0_BLK_LEN)?,
+            0,
+        ),
+        FadtBlock::SmiCmd => (
+            u64::from(dword(FADT_OFF_SMI_CMD)?),
+            1,
+            byte(FADT_OFF_ACPI_ENABLE)?,
+        ),
+        FadtBlock::Reset =>
+        {
+            let value = byte(FADT_OFF_RESET_VALUE)?;
+            if dword(FADT_OFF_FLAGS)? & FADT_FLAG_RESET_REG_SUP == 0
+                || byte(FADT_OFF_RESET_REG)? != GAS_SPACE_IO
+            {
+                return None;
+            }
+            let width = byte(FADT_OFF_RESET_REG + 1)?;
+            let address = table
+                .get(FADT_OFF_RESET_REG + 4..FADT_OFF_RESET_REG + 12)
+                .map(|_| read_u64(table, FADT_OFF_RESET_REG + 4))?;
+            (address, (width / 8).max(1), value)
+        }
+    };
+    let port = u16::try_from(port).ok().filter(|&p| p != 0)?;
+    let count = u16::from(count);
+    // A zero count has no last port; a block whose last port is past 0xFFFF
+    // is not one the I/O space holds.
+    count
+        .checked_sub(1)
+        .and_then(|last| port.checked_add(last))?;
+    Some(IoBlock { port, count, value })
+}
+
+/// Read the physical address of the FACS from the FADT: `X_FIRMWARE_CTRL`
+/// when the table reaches it and it is non-zero, else `FIRMWARE_CTRL`.
+///
+/// Returns `None` if the signature isn't `FACP`, the table reaches neither
+/// field, or both are zero (a hardware-reduced platform has no FACS).
+#[must_use]
+pub fn fadt_facs_phys(fadt_bytes: &[u8]) -> Option<u64>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    if total_len >= FADT_OFF_X_FIRMWARE_CTRL + 8
+    {
+        let x = read_u64(fadt_bytes, FADT_OFF_X_FIRMWARE_CTRL);
+        if x != 0
+        {
+            return Some(x);
+        }
+    }
+    if total_len < FADT_OFF_FIRMWARE_CTRL + 4
+    {
+        return None;
+    }
+    let facs = u64::from(read_u32(fadt_bytes, FADT_OFF_FIRMWARE_CTRL));
+    if facs == 0 { None } else { Some(facs) }
 }
 
 /// The OEM table ID field of an SDT header (8 bytes, space-padded), or
@@ -1175,6 +1337,81 @@ mod tests
         let mut t = fadt_with_dsdt(276, 0x7FE0_0000, 0);
         t[..4].copy_from_slice(b"APIC");
         assert_eq!(fadt_dsdt_phys(&t), None);
+    }
+
+    /// A FADT of 276 bytes with QEMU q35's fixed blocks: `PM1a` event 0x600
+    /// (4), `PM1a` control 0x604 (2), `GPE0` 0x620 (16), `SMI_CMD` 0xB2 with
+    /// `ACPI_ENABLE` 0xF1, `RESET_REG` port 0xCF9 with value 6, FACS at
+    /// `facs` in `X_FIRMWARE_CTRL`.
+    fn q35_fadt(facs: u64) -> Vec<u8>
+    {
+        let mut b = fadt(276, 0x604);
+        let mut put32 = |off: usize, v: u32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        put32(FADT_OFF_PM1A_EVT_BLK, 0x600);
+        put32(FADT_OFF_GPE0_BLK, 0x620);
+        put32(FADT_OFF_SMI_CMD, 0xB2);
+        put32(FADT_OFF_FLAGS, FADT_FLAG_RESET_REG_SUP);
+        b[FADT_OFF_ACPI_ENABLE] = 0xF1;
+        b[FADT_OFF_PM1_EVT_LEN] = 4;
+        b[FADT_OFF_PM1_CNT_LEN] = 2;
+        b[FADT_OFF_GPE0_BLK_LEN] = 16;
+        b[FADT_OFF_RESET_REG] = GAS_SPACE_IO;
+        b[FADT_OFF_RESET_REG + 1] = 8;
+        b[FADT_OFF_RESET_REG + 4..FADT_OFF_RESET_REG + 12].copy_from_slice(&0xCF9u64.to_le_bytes());
+        b[FADT_OFF_RESET_VALUE] = 6;
+        b[FADT_OFF_X_FIRMWARE_CTRL..FADT_OFF_X_FIRMWARE_CTRL + 8]
+            .copy_from_slice(&facs.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn fadt_gives_each_fixed_io_block()
+    {
+        let t = q35_fadt(0x7FEB_1000);
+        let block = |port, count, value| Some(IoBlock { port, count, value });
+        assert_eq!(fadt_io_block(&t, FadtBlock::Pm1aEvt), block(0x600, 4, 0));
+        assert_eq!(fadt_io_block(&t, FadtBlock::Pm1aCnt), block(0x604, 2, 0));
+        assert_eq!(fadt_io_block(&t, FadtBlock::Gpe0), block(0x620, 16, 0));
+        assert_eq!(fadt_io_block(&t, FadtBlock::SmiCmd), block(0xB2, 1, 0xF1));
+        assert_eq!(fadt_io_block(&t, FadtBlock::Reset), block(0xCF9, 1, 6));
+        assert_eq!(fadt_facs_phys(&t), Some(0x7FEB_1000));
+    }
+
+    #[test]
+    fn fadt_withholds_an_absent_short_or_unsupported_block()
+    {
+        let mut t = q35_fadt(0);
+        // A zero length, a zero port.
+        t[FADT_OFF_GPE0_BLK_LEN] = 0;
+        assert_eq!(fadt_io_block(&t, FadtBlock::Gpe0), None);
+        t[FADT_OFF_SMI_CMD..FADT_OFF_SMI_CMD + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(fadt_io_block(&t, FadtBlock::SmiCmd), None);
+        // A block that runs past the last port.
+        t[FADT_OFF_PM1A_EVT_BLK..FADT_OFF_PM1A_EVT_BLK + 4]
+            .copy_from_slice(&0xFFFEu32.to_le_bytes());
+        assert_eq!(fadt_io_block(&t, FadtBlock::Pm1aEvt), None);
+        // RESET_REG in memory, then unsupported.
+        t[FADT_OFF_RESET_REG] = 0;
+        assert_eq!(fadt_io_block(&t, FadtBlock::Reset), None);
+        t[FADT_OFF_RESET_REG] = GAS_SPACE_IO;
+        t[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(fadt_io_block(&t, FadtBlock::Reset), None);
+        // Both FACS fields zero: no FACS.
+        assert_eq!(fadt_facs_phys(&t), None);
+        // An ACPI 1.0 FADT: no RESET_REG, the 32-bit FACS field.
+        let mut old = q35_fadt(0);
+        old[FADT_OFF_FIRMWARE_CTRL..FADT_OFF_FIRMWARE_CTRL + 4]
+            .copy_from_slice(&0x7FEB_1000u32.to_le_bytes());
+        old[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&116u32.to_le_bytes());
+        assert_eq!(fadt_io_block(&old, FadtBlock::Reset), None);
+        assert_eq!(
+            fadt_io_block(&old, FadtBlock::Pm1aCnt).map(|b| b.port),
+            Some(0x604)
+        );
+        assert_eq!(fadt_facs_phys(&old), Some(0x7FEB_1000));
+        old[..4].copy_from_slice(b"APIC");
+        assert_eq!(fadt_io_block(&old, FadtBlock::Pm1aCnt), None);
+        assert_eq!(fadt_facs_phys(&old), None);
     }
 
     #[test]

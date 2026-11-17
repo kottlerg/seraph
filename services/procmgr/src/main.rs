@@ -1632,15 +1632,17 @@ fn check_create_request(
 /// `INVALID_ARGUMENT`: still-reserved label bits are set, the badge names no
 /// creator (`process_table::ProcessTable::creator_of`), the requested band
 /// exceeds the creator's, the requested priority falls outside the resolved
-/// band, `CREATE_MEMORY_MAX` comes without its word, or `CREATE_PHYS_ACCESS`
-/// or `CREATE_RESERVE` comes from a creator that may not ask for it
+/// band, `CREATE_MEMORY_MAX` comes without its word, `CREATE_PHYS_ACCESS`
+/// or `CREATE_RESERVE` comes from a creator that may not ask for it, or
+/// `CREATE_RESERVE` comes with `CREATE_CHARGE_NODE`
 /// (`process_table::child_budget`).
 ///
 /// Creator: badge `0` is init (the unbadged service-endpoint holder), or
 /// svcmgr's un-badged mint source, with the full baseline ceiling, and its
-/// children are top-level reserve nodes. A nonzero badge is a live
-/// procmgr-spawned process, whose ceiling is its own minted band and under
-/// whose node the child's sits. Any other badge (a reaped process's own cap or
+/// children not charged to a node handle are top-level reserve nodes; a
+/// charged child sits under the handle's node outside the reserve. A nonzero
+/// badge is a live procmgr-spawned process, whose ceiling is its own minted
+/// band and under whose node the child's sits. Any other badge (a reaped process's own cap or
 /// handle, a verb-badged cap, a release token) is refused: its child would
 /// escape every memory max.
 fn resolve_create_sched(

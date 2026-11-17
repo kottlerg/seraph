@@ -921,9 +921,10 @@ impl Creator
 {
     /// The un-badged creator (badge `0`): init, which creates devmgr, vfsd
     /// and svcmgr, or a create svcmgr sends on its un-badged mint source.
-    /// Its ceiling is the full baseline band, its children are top-level
-    /// reserve nodes (init's own record parents no process), and it may ask
-    /// for a phys-class child.
+    /// Its ceiling is the full baseline band, its children not charged to a
+    /// node handle are top-level reserve nodes (init's own record parents no
+    /// process), a charged child sits under the handle's node outside the
+    /// reserve, and it may ask for a phys-class child.
     pub const UNBADGED: Creator = Creator {
         band_max: ipc::sched_policy::BASELINE_PRIORITY_MAX,
         memmgr_badge: 0,
@@ -2639,7 +2640,11 @@ mod tests
             Err(BudgetRefusal::Reserve)
         );
         assert_eq!(
-            child_budget(CREATE_RESERVE | CREATE_CHARGE_NODE, None, &Creator::UNBADGED),
+            child_budget(
+                CREATE_RESERVE | CREATE_CHARGE_NODE,
+                None,
+                &Creator::UNBADGED
+            ),
             Err(BudgetRefusal::Reserve)
         );
         // A charged child of the un-badged creator is not a reserve node.

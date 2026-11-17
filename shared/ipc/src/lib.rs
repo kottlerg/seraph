@@ -2219,7 +2219,7 @@ pub mod acpid_labels
     /// only [`STATE_S5`] (soft-off) is served. On the success path the
     /// platform powers off and no reply arrives; a
     /// [`super::acpid_errors::SUCCESS`] reply means the platform still runs
-    /// 10 s after the writes, when acpid has armed its events again, and the
+    /// 10 s after the writes, when acpid has enabled its GPEs again, and the
     /// caller decides how long to wait.
     /// Replies [`super::acpid_errors::INVALID_REQUEST`] for another state and
     /// [`super::acpid_errors::NO_DEVICE`] when the platform has no

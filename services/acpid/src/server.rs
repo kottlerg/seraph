@@ -33,8 +33,8 @@ use crate::arch::current::{Events, Ports, Power};
 use crate::platform::Platform;
 
 /// How long a sleep keeps the events quiesced after its `PM1a_CNT` writes
-/// return before it takes the platform to be still running and arms them
-/// again: ACPICA's wait before it takes an S4 or S5 write as not taken. A
+/// return before it takes the platform to be still running and enables
+/// the GPEs again ([`events::resume`]): ACPICA's wait before it takes an S4 or S5 write as not taken. A
 /// platform entering the state stops well within it, with only its wake
 /// events enabled.
 const SLEEP_GRACE: Duration = Duration::from_secs(10);
@@ -132,8 +132,8 @@ struct Armed
     layout: Layout,
     regs: Arc<Mutex<Ports>>,
     handlers: Vec<Handler>,
-    /// The events [`events::arm`] enables, which a sleep that returns
-    /// enables again.
+    /// The events [`events::arm`] enables, whose GPEs a sleep that returns
+    /// enables again ([`events::resume`]).
     handled: Handled,
 }
 
@@ -559,8 +559,8 @@ type SleepEvents<'a> = (&'a Armed, &'a Mailbox, &'a Sender<Work>);
 /// Enter sleep state `state`: its `SLP_TYPa`, then `\_PTS`, then, with the
 /// events `armed`, [`events::quiesce`], then the `PM1a_CNT` writes. When
 /// the writes return, the events stay quiesced for [`SLEEP_GRACE`]; when the
-/// platform still runs then, they are armed again and what latched is handed
-/// on. The reply status when the platform keeps running.
+/// platform still runs then, the GPEs are enabled again
+/// ([`events::resume`]) and what latched is handed on. The reply status when the platform keeps running.
 fn sleep(
     state: u8,
     ns: Option<&mut Namespace>,
@@ -610,11 +610,11 @@ fn sleep(
         {
             std::thread::sleep(SLEEP_GRACE);
             std::os::seraph::log!(
-                warn: "SLEEP({state}): still running {} s after the writes; events armed again",
+                warn: "SLEEP({state}): still running {} s after the writes; GPEs enabled again",
                 SLEEP_GRACE.as_secs()
             );
         }
-        let fired = events::arm(&mut *lock(&armed.regs), &armed.layout, &armed.handled);
+        let fired = events::resume(&mut *lock(&armed.regs), &armed.layout, &armed.handled);
         deliver(&fired, mailbox, work);
     }
     if entered

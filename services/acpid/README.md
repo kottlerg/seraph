@@ -80,9 +80,11 @@ turn on the one thread that owns the namespace. A request is checked in order: t
   keeping its other bits: `SLP_TYPa` with `SLP_EN` clear, then with `SLP_EN` (bit 13) set,
   and logs `SLEEP(5): PM1a_CNT ...` before the writes. When the writes return, acpid keeps
   the events quiesced for 10 s (`SLEEP_GRACE`), the wait after which ACPICA takes an S5
-  write as not taken; when the platform still runs then, acpid arms the events again, logs
-  `SLEEP(5): still running 10 s after the writes; events armed again`, and hands on what
-  latched meanwhile.
+  write as not taken; when the platform still runs then, acpid enables the GPEs again, logs
+  `SLEEP(5): still running 10 s after the writes; GPEs enabled again`, and dispatches each
+  GPE latched meanwhile. The power button is left as the quiesce left it: a press taken before
+  or during the sleep is delivered once, by the `WAIT_EVENT` it is posted to, which enables
+  the button again.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
 - `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and

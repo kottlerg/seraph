@@ -407,18 +407,44 @@ const RELEASE_CHURN: u32 = 64;
 /// retype class in a five-page grant, well past the sub-page classes.
 const RELEASE_WS_MEMBERS: u32 = 512;
 
-/// The memmgr free-pool drop [`object_slab_release_phase`] tolerates, for
-/// other processes' allocations meanwhile: 32 pages, a tenth of the 320 the
-/// churn strands without the release.
-const RELEASE_POOL_SLACK_BYTES: u64 = 32 * syscall_abi::PAGE_SIZE;
+/// One step of [`object_slab_release_phase`]'s churn: retype a
+/// [`RELEASE_WS_MEMBERS`]-member wait set from its dedicated grant, delete
+/// it, and release the grant. Returns the pages `QUERY_MEMORY_USAGE` charges
+/// svctest while the set is live; `step` names the step in a failure.
+fn release_churn_step(step: u32) -> u64
+{
+    let (ws, grant) = std::os::seraph::object_slab_retype_reclaimable(
+        std::os::seraph::wait_set_retype_bytes(u64::from(RELEASE_WS_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, RELEASE_WS_MEMBERS).ok(),
+    )
+    .unwrap_or_else(|| panic!("object_slab_release: wait set {step} not created"));
+    let grant =
+        grant.unwrap_or_else(|| panic!("object_slab_release: wait set {step} returned no grant"));
+    let (held, _, _) = memory_usage();
+    syscall::cap_delete(ws)
+        .unwrap_or_else(|e| panic!("object_slab_release: delete {step} failed ({e})"));
+    std::os::seraph::object_slab_release(grant);
+    held
+}
 
 /// `std::os::seraph::object_slab_retype_reclaimable` returns the dedicated
 /// grant of a page-sized retype and none for a sub-page one, and
-/// `object_slab_release` returns that grant's run to memmgr's pool:
-/// [`RELEASE_CHURN`] page-sized wait sets, each deleted and its grant
-/// released, leave memmgr's free pool within [`RELEASE_POOL_SLACK_BYTES`] of
-/// where it started. Without the release the churn would strand about
-/// 320 pages until svctest exits.
+/// `object_slab_release` returns that grant's run to memmgr's free pool.
+///
+/// The measure is svctest's own budget charge (`QUERY_MEMORY_USAGE`
+/// `data[0]`), which no other process moves: memmgr charges a grant to
+/// svctest when it grants it and uncharges the run only when the run rejoins
+/// the free pool, a released run held on the deferred list staying charged
+/// (services/memmgr/docs/ipc-interface.md § Label 10). Each of
+/// [`RELEASE_CHURN`] page-sized wait sets raises the charge by at least its
+/// retype class while it is live, and its delete and release bring the charge
+/// back to the baseline exactly. Without the release the churn would strand
+/// about 320 pages until svctest exits.
+///
+/// A first step runs before the baseline is read: it touches the stack and
+/// the `CSpace` slots the measured steps use, so no demand fault and no
+/// slot-page funding charges svctest during them, and each step frees the
+/// slots it takes.
 pub fn object_slab_release_phase(_: &Caps)
 {
     let small = std::os::seraph::object_slab_retype_reclaimable(
@@ -432,31 +458,30 @@ pub fn object_slab_release_phase(_: &Caps)
     );
     let _ = syscall::cap_delete(small.0);
 
-    let before =
-        std::os::seraph::memmgr_pool_free_bytes().expect("object_slab_release: memmgr pool query");
+    let _ = release_churn_step(RELEASE_CHURN);
+    let (base, _, _) = memory_usage();
+    let class_pages = std::os::seraph::wait_set_retype_bytes(u64::from(RELEASE_WS_MEMBERS))
+        .div_ceil(syscall_abi::PAGE_SIZE);
+    let floor = base
+        .checked_add(class_pages)
+        .expect("object_slab_release: charge overflowed");
     for i in 0..RELEASE_CHURN
     {
-        let (ws, grant) = std::os::seraph::object_slab_retype_reclaimable(
-            std::os::seraph::wait_set_retype_bytes(u64::from(RELEASE_WS_MEMBERS)),
-            |slab| syscall::wait_set_create(slab, RELEASE_WS_MEMBERS).ok(),
-        )
-        .unwrap_or_else(|| panic!("object_slab_release: wait set {i} not created"));
-        let grant =
-            grant.unwrap_or_else(|| panic!("object_slab_release: wait set {i} returned no grant"));
-        syscall::cap_delete(ws)
-            .unwrap_or_else(|e| panic!("object_slab_release: delete {i} failed ({e})"));
-        std::os::seraph::object_slab_release(grant);
+        let held = release_churn_step(i);
+        let (released, _, _) = memory_usage();
+        assert!(
+            held >= floor,
+            "object_slab_release: wait set {i} live, charge {held} pages, \
+             below baseline {base} + {class_pages}"
+        );
+        assert_eq!(
+            released, base,
+            "object_slab_release: charge after releasing wait set {i} (live {held})"
+        );
     }
-    let after =
-        std::os::seraph::memmgr_pool_free_bytes().expect("object_slab_release: memmgr pool query");
-    let drop = before.saturating_sub(after);
-    assert!(
-        drop <= RELEASE_POOL_SLACK_BYTES,
-        "object_slab_release: pool dropped {drop} bytes over {RELEASE_CHURN} released wait sets \
-         (before {before}, after {after})"
-    );
     std::os::seraph::log!(
-        "object_slab_release: {RELEASE_CHURN} page-sized wait sets released, pool drop {drop}"
+        "object_slab_release: {RELEASE_CHURN} page-sized wait sets released, \
+         charge back to {base} pages after each"
     );
 }
 

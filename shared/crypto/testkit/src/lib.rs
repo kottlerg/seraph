@@ -16,7 +16,8 @@
 //! - [`differential`] runs inputs through an implementation and a reference
 //!   and reports every disagreement.
 //! - [`ed25519`] and [`sha512`] load the reference vectors: generated and
-//!   edge-case inputs for each primitive, each with OpenSSL's outcome.
+//!   edge-case inputs for each primitive, each with OpenSSL's outcome, and
+//!   Ed25519 signing inputs with OpenSSL's key and signature.
 //! - [`generate`] writes those vectors, driving the `openssl` command; the
 //!   `crypto-reference-vectors` binary runs it.
 //! - [`rng`] is the seeded generator the generated inputs come from, so every

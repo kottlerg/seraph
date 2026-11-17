@@ -4,18 +4,23 @@
 // shared/crypto/src/lib.rs
 
 //! In-OS cryptographic primitives: SHA-512 hashing, Ed25519 signature
-//! verification, and ChaCha20-Poly1305 authenticated encryption.
+//! verification and, for the host signer, key generation and signing, and
+//! ChaCha20-Poly1305 authenticated encryption.
 //!
-//! `no_std`, no allocation, no external dependencies. Three primitives:
+//! `no_std`, no allocation, no external dependencies. Four primitives:
 //!
 //! - [`sha512`] / [`Sha512`] — FIPS 180-4 SHA-512, one-shot and incremental.
 //!   The incremental form hashes large inputs (e.g. boot-module bodies)
 //!   without buffering them.
-//! - [`ed25519_verify`] — RFC 8032 Ed25519 signature *verification*. There is
-//!   no signing or key generation here; verification operates only on public
-//!   data (public key, signature, message), so the field arithmetic is
-//!   variable-time by design and carries no side-channel obligation. Failure
-//!   is terminal: a single `Err` exit, no fallback, no warn-and-continue.
+//! - [`ed25519_verify`] — RFC 8032 Ed25519 signature verification. It
+//!   operates only on public data (public key, signature, message), so its
+//!   range check and point decompression are variable-time. Failure is
+//!   terminal: a single `Err` exit, no fallback, no warn-and-continue.
+//! - `ed25519_public_key` and `ed25519_sign` — RFC 8032 Ed25519 key
+//!   derivation from a secret seed the caller passes, and deterministic
+//!   signing, compiled only with the `sign` feature, which only a host tool
+//!   may enable and no component built for the target may (the crate's README,
+//!   § Design notes). No branch and no memory index depends on a secret value.
 //! - [`chacha20poly1305`] — the RFC 8439 AEAD, sealing and opening a buffer
 //!   in place with a detached tag. It handles secret data, so no branch and
 //!   no memory index depends on the key, the plaintext or a tag, and a tag is
@@ -32,11 +37,16 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
 pub mod chacha20poly1305;
 pub mod sha512;
 
 mod chacha20;
 mod ed25519;
+#[cfg(any(test, feature = "sign"))]
+mod ed25519_sign;
 mod edwards;
 mod field;
 mod poly1305;
@@ -44,4 +54,6 @@ mod scalar;
 
 pub use chacha20poly1305::run_chacha20_poly1305_kats;
 pub use ed25519::{VerifyError, ed25519_verify, run_ed25519_kats};
+#[cfg(any(test, feature = "sign"))]
+pub use ed25519_sign::{ed25519_public_key, ed25519_sign};
 pub use sha512::{Sha512, run_sha512_kats, sha512};

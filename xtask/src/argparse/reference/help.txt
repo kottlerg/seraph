@@ -29,6 +29,7 @@ Commands:
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
   test-log-level     Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
+  test-hotplug       Check PCI Express native hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with an empty root port (on `x86_64` once under the machine's default, where devmgr must leave the slot alone, then with native control), hot-add QEMU's `edu` device behind it over QMP, check the fixture's verdict, and unstage both again (see xtask/README.md)
   test-gdb           Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
   test-wedge         Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
   test-cet           Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
@@ -73,6 +74,7 @@ Commands:
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
   test-log-level     Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
+  test-hotplug       Check PCI Express native hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with an empty root port (on `x86_64` once under the machine's default, where devmgr must leave the slot alone, then with native control), hot-add QEMU's `edu` device behind it over QMP, check the fixture's verdict, and unstage both again (see xtask/README.md)
   test-gdb           Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
   test-wedge         Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
   test-cet           Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)
@@ -1156,6 +1158,63 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+=== xtask test-hotplug -h
+Check PCI Express native hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with an empty root port (on `x86_64` once under the machine's default, where devmgr must leave the slot alone, then with native control), hot-add QEMU's `edu` device behind it over QMP, check the fixture's verdict, and unstage both again (see xtask/README.md)
+
+Usage: xtask test-hotplug [OPTIONS]
+
+Options:
+      --arch <ARCH>       Target architecture [default: x86_64] [possible values: x86_64, riscv64]
+      --cpus <CPUS>       Number of vCPUs to expose to the guest (QEMU -smp) [default: 4]
+      --mem <MEM>         Guest memory size in MiB (QEMU -m) [default: 512]
+      --wait-host <SECS>  When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+      --host-override     Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+      --alone             Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+      --timing            A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+      --grant <HOLDER>    Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+  -h, --help              Print help (see more with '--help')
+=== xtask test-hotplug --help
+Check PCI Express native hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with an empty root port (on `x86_64` once under the machine's default, where devmgr must leave the slot alone, then with native control), hot-add QEMU's `edu` device behind it over QMP, check the fixture's verdict, and unstage both again (see xtask/README.md)
+
+Usage: xtask test-hotplug [OPTIONS]
+
+Options:
+      --arch <ARCH>
+          Target architecture
+
+          Possible values:
+          - x86_64:  x86-64 (Intel/AMD 64-bit)
+          - riscv64: RISC-V 64-bit
+          
+          [default: x86_64]
+
+      --cpus <CPUS>
+          Number of vCPUs to expose to the guest (QEMU -smp)
+          
+          [default: 4]
+
+      --mem <MEM>
+          Guest memory size in MiB (QEMU -m)
+          
+          [default: 512]
+
+      --wait-host <SECS>
+          When the host refuses this command, wait up to SECS for it to admit it, asking again every 10 s, instead of failing at once; at the bound the command fails with the last refusal
+
+      --host-override
+          Start even when the host's rules refuse, printing the refusal: for the maintainer's interactive use. A boot still registers, so other commands see it
+
+      --alone
+          Run beside no other QEMU, and keep every other boot off the host while it runs: the re-run of a boot whose timeout or timing failure came beside another QEMU, before that failure counts
+
+      --timing
+          A timing-sensitive measurement: run beside no other QEMU, under the large-boot load limit, and refuse builds while it runs
+
+      --grant <HOLDER>
+          Boot under the exclusive grant `cargo xtask orch grant set` gave HOLDER. While a grant is outstanding, a boot that does not name its holder is refused
+
+  -h, --help
+          Print help (see a summary with '-h')
 === xtask test-gdb -h
 Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
 
@@ -2174,6 +2233,7 @@ Commands:
   test-map-redo      Check that a boot whose bootloader redoes its steps 6 and 7 completes: stage the `\EFI\seraph\mapredo` test knob, boot the current sysroot once through `run-parallel`, assert the bootloader's knob line and the pass marker, and remove the knob again (see xtask/README.md)
   test-log-level     Check that the log-level configuration reaches the services init spawns: compose the bundle with vfsd set to debug, boot the current sysroot once through `run-parallel`, assert that vfsd's and fatfs's debug lines appear and devmgr's and procmgr's do not, and compose the bundle back (see xtask/README.md)
   test-debug-port    Check the debug port's transport: stage the `debug-echo` fixture, boot the current sysroot once with `--debug-port`, exchange GDB remote serial protocol packets with the fixture over the port's TCP end, and unstage the fixture again (see xtask/README.md)
+  test-hotplug       Check PCI Express native hotplug: stage the `hotplug-check` fixture and the `test-dma` class, boot the current sysroot with an empty root port (on `x86_64` once under the machine's default, where devmgr must leave the slot alone, then with native control), hot-add QEMU's `edu` device behind it over QMP, check the fixture's verdict, and unstage both again (see xtask/README.md)
   test-gdb           Check the GDB stub: stage it and its `gdb-target` process, boot the current sysroot once with `--debug-port`, run the host's GDB in batch mode against the port, check what it reports, and unstage both again (see xtask/README.md)
   test-wedge         Check the softlockup watchdog's report of a CPU wedged with interrupts off: boot the default boot set twice with QEMU's gdbstub on a unix socket, move an idle AP (then the BSP) to the kernel's `halt_loop` over the GDB remote serial protocol, and check the watchdog's report, with the wedged CPU's own NMI frame on `x86_64` (see xtask/README.md)
   test-cet           Check the x86-64 kernel's CET supervisor shadow stacks on a host whose CPU has them, under KVM, failing on any other: boot the current sysroot's ktest bundle on shadow stacks to its pass marker, then boot it again with QEMU's gdbstub, corrupt a `syscall::dispatch` return address, and check the `#CP` it raises (see xtask/README.md)

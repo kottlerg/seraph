@@ -351,6 +351,7 @@ fn cet_spec<'a>(
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: false,
+        hotplug_port: None,
     }
 }
 

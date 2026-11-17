@@ -245,6 +245,10 @@ impl X86Host
 /// them.
 const EDU_DEVICE: &str = "edu,dma_mask=0xffffffff";
 
+/// The DMA mask of [`EDU_DEVICE`], which a hot-added `edu` is given too
+/// (`test-hotplug`).
+pub const EDU_DMA_MASK: u64 = 0xFFFF_FFFF;
+
 /// The QEMU `pci-testdev` functions (PCI `1b36:0005`) a test launch attaches
 /// (`--test-devices`) for the test-only `test-fault` fixture, which takes its
 /// role from the function's BAR 2 (`ipc::test_fault_labels`): two with no
@@ -270,6 +274,54 @@ fn test_device_args() -> Vec<String>
         .chain(TEST_FAULT_DEVICES)
         .flat_map(|d| ["-device".to_string(), d.to_string()])
         .collect()
+}
+
+/// The id of the PCI Express root port a hotplug launch attaches
+/// ([`QemuLaunchSpec::hotplug_port`]), which `device_add` names as the bus of
+/// the device it hot-adds.
+pub const HOTPLUG_PORT_ID: &str = "hotplug-port";
+
+/// The PCI Express root port a hotplug launch attaches, empty at boot: its
+/// own chassis and slot number, pinned at slot `0x1c`, clear of every device
+/// a launch places.
+const HOTPLUG_PORT_DEVICE: &str = "pcie-root-port,id=hotplug-port,chassis=1,slot=1,addr=0x1c";
+
+/// The q35 property that turns QEMU's ACPI PCI hotplug off, so the
+/// firmware's `_OSC` grants the operating system native hotplug control.
+const X86_NATIVE_HOTPLUG_GLOBAL: &str = "ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off";
+
+/// Who controls the hotplug of the root port a launch attaches
+/// ([`QemuLaunchSpec::hotplug_port`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotplugControl
+{
+    /// The machine's default. On q35 QEMU's ACPI PCI hotplug drives the
+    /// port, and `_OSC` withholds native control; riscv64 `virt` offers no
+    /// ACPI hotplug, and its platform description table grants native
+    /// control.
+    Firmware,
+    /// Native control: on q35 QEMU's ACPI PCI hotplug is turned off
+    /// ([`X86_NATIVE_HOTPLUG_GLOBAL`]), so `_OSC` grants it; on riscv64 as
+    /// [`HotplugControl::Firmware`].
+    Native,
+}
+
+/// The arguments that attach the hotplug root port of `spec`, none when it
+/// asks for none: the port, and on q35 under native control the property
+/// that turns ACPI PCI hotplug off.
+fn hotplug_port_args(spec: &QemuLaunchSpec) -> Vec<String>
+{
+    let Some(control) = spec.hotplug_port
+    else
+    {
+        return Vec::new();
+    };
+    let mut args = vec!["-device".to_string(), HOTPLUG_PORT_DEVICE.to_string()];
+    if spec.arch == Arch::X86_64 && control == HotplugControl::Native
+    {
+        args.extend(["-global".to_string(), X86_NATIVE_HOTPLUG_GLOBAL.to_string()]);
+    }
+    args
 }
 
 /// The RISC-V IOMMU as a PCI function, pinned at 00:01.0, the lowest slot
@@ -471,6 +523,10 @@ pub struct QemuLaunchSpec<'a>
     /// the `pci-testdev` functions svctest's devmgr phases drive through the
     /// test-only drivers ([`test_device_args`]).
     pub test_devices: bool,
+    /// When set, attach an empty PCI Express root port a device can be
+    /// hot-added behind (`test-hotplug`), its hotplug under this control
+    /// ([`hotplug_port_args`]).
+    pub hotplug_port: Option<HotplugControl>,
 }
 
 /// The device arguments a launch passes before every other device: the
@@ -793,6 +849,7 @@ fn extend_x86(
     {
         args.extend(test_device_args());
     }
+    args.extend(hotplug_port_args(spec));
 
     if let Some(guid) = spec.vmgenid_guid
     {
@@ -935,6 +992,7 @@ fn extend_riscv(args: &mut Vec<String>, spec: &QemuLaunchSpec) -> Result<()>
     {
         args.extend(test_device_args());
     }
+    args.extend(hotplug_port_args(spec));
 
     // After the test devices, so the adapter's auto-placed PCI slot follows
     // the devices above.
@@ -1185,6 +1243,7 @@ mod tests
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
+            hotplug_port: None,
         }
     }
 
@@ -1333,6 +1392,7 @@ mod tests
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
+            hotplug_port: None,
         };
         let argv = build_qemu_argv(&spec).unwrap();
         assert!(argv.iter().any(|a| a == "vmgenid,guid=auto"));
@@ -1369,6 +1429,7 @@ mod tests
             iommu: Iommu::Attached,
             debug_port: None,
             test_devices: false,
+            hotplug_port: None,
         }
     }
 
@@ -1780,6 +1841,34 @@ mod tests
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_hotplug_port_is_attached_only_when_asked_and_native_turns_acpi_hotplug_off()
+    {
+        let global = |argv: &[String]| {
+            argv.windows(2)
+                .any(|w| w[0] == "-global" && w[1] == X86_NATIVE_HOTPLUG_GLOBAL)
+        };
+        for mut spec in [riscv_spec(4, 512), x86_spec(X86Paging::Four)]
+        {
+            spec.hotplug_port = None;
+            let argv = build_qemu_argv(&spec).unwrap();
+            assert!(!devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(!global(&argv));
+
+            spec.hotplug_port = Some(HotplugControl::Firmware);
+            let argv = build_qemu_argv(&spec).unwrap();
+            assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert!(!global(&argv));
+
+            spec.hotplug_port = Some(HotplugControl::Native);
+            let argv = build_qemu_argv(&spec).unwrap();
+            assert!(devices(&argv).contains(&HOTPLUG_PORT_DEVICE));
+            assert_eq!(global(&argv), spec.arch == Arch::X86_64);
+        }
+        assert!(HOTPLUG_PORT_DEVICE.contains(&format!("id={HOTPLUG_PORT_ID},")));
+        assert!(EDU_DEVICE.ends_with(&format!("dma_mask={EDU_DMA_MASK:#x}")));
     }
 
     #[test]

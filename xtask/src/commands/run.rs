@@ -142,6 +142,7 @@ fn launch(
         iommu: args.iommu,
         debug_port: args.debug_port,
         test_devices: args.test_devices,
+        hotplug_port: None,
     };
     let qemu_args = build_qemu_argv(&spec)?;
 

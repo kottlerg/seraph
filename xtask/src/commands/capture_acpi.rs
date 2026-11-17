@@ -177,6 +177,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: true,
+        hotplug_port: None,
     };
     let mut qemu_args = build_qemu_argv(&spec)?;
     qemu_args.extend(config_args(args.config).iter().map(|a| (*a).to_owned()));

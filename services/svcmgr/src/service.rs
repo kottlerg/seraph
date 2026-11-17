@@ -58,7 +58,8 @@ pub struct ServiceEntry
     /// VFS path used to respawn this service via svcmgr-side walk +
     /// `CREATE_FROM_FILE`. The sole restart source: every restartable
     /// service is reloaded from the filesystem.
-    /// At most `ipc::MAX_PATH_LEN` bytes. Empty only for an empty slot:
+    /// At most `ipc::procmgr_labels::CREATE_NAME_MAX` bytes, in the canonical
+    /// form procmgr verifies it under. Empty only for an empty slot:
     /// every reconciled entry carries its recipe's `binary` path.
     pub vfs_path: String,
     /// Restart policy (`POLICY_ALWAYS`, `POLICY_ON_FAILURE`, etc.).

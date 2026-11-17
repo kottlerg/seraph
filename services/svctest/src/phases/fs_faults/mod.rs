@@ -1173,15 +1173,15 @@ fn spawn_fatfs(creator: u64, deaths: u64) -> u64
         "/services/fs/fatfs",
     )
     .expect("fs_block_faults: lookup of /services/fs/fatfs failed");
-    let create = IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE)
-        .word(0, size)
-        .cap(file)
-        .cap(creator)
-        .build();
     let procmgr = std::os::seraph::startup_info().procmgr_endpoint;
-    // SAFETY: `ipc_buf` is this thread's registered IPC buffer page.
-    let reply = unsafe { ipc::ipc_call(procmgr, &create, ipc_buf) }
-        .expect("fs_block_faults: CREATE_FROM_FILE ipc_call failed");
+    let reply = super::procmgr::create_call(
+        procmgr,
+        procmgr_labels::CREATE_FROM_FILE,
+        &[size],
+        "/services/fs/fatfs",
+        &[file, creator],
+    )
+    .expect("fs_block_faults: CREATE_FROM_FILE ipc_call failed");
     assert_eq!(
         reply.label,
         procmgr_errors::SUCCESS,

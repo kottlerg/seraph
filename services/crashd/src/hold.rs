@@ -41,6 +41,9 @@ const WAKE_PRESSURE: u64 = 1;
 /// The wait-set badge of slot 0's endpoint; slot `n`'s is this plus `n`.
 const WAKE_SLOT: u64 = 2;
 
+/// One past the wait-set badge of the last slot's endpoint.
+const WAKE_SLOT_END: u64 = WAKE_SLOT + SLOTS as u64;
+
 /// Members of the wait set: the crash endpoint, the Notification, and each
 /// slot's endpoint.
 #[expect(
@@ -230,9 +233,10 @@ impl Hold
                 }
                 // A held fault reached its slot's endpoint; a fall of the
                 // level is acted on at the loop's top.
-                Ok(badge) if (WAKE_SLOT..WAKE_SLOT + SLOTS as u64).contains(&badge) =>
+                Ok(badge) if (WAKE_SLOT..WAKE_SLOT_END).contains(&badge) =>
                 {
-                    let slot = usize::try_from(badge - WAKE_SLOT).unwrap_or(usize::MAX);
+                    let slot =
+                        usize::try_from(badge.saturating_sub(WAKE_SLOT)).unwrap_or(usize::MAX);
                     self.arrived(slot);
                 }
                 // A change of the level, read at the loop's top; then a
@@ -367,7 +371,7 @@ impl Hold
         // Until the fault arrives, a fall of the level does not end the hold;
         // without the membership its arrival goes unseen, and the hold ends
         // at its deadline.
-        let badge = WAKE_SLOT + u64::try_from(slot).unwrap_or(u64::MAX);
+        let badge = WAKE_SLOT.saturating_add(u64::try_from(slot).unwrap_or(u64::MAX));
         if let Err(e) = syscall::wait_set_add(self.wait_set, target, badge)
         {
             bounded(|| {

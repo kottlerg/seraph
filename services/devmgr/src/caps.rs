@@ -35,6 +35,21 @@ pub struct FbInfoRaw
     pub pixel_format: u8,
 }
 
+/// One boot module init forwards: its cap, its exact size in bytes, and its
+/// bundle entry name, the name procmgr verifies its signature under when a
+/// process is created from the module.
+pub struct BootModule
+{
+    pub cap: u64,
+    pub size: u64,
+    pub name: Box<[u8]>,
+}
+
+/// Data words one module's bundle entry name takes in a MODULE round: 32 bytes,
+/// packed little-endian, NUL-padded. Matches init's MODULE round
+/// (`services/init/src/service.rs`).
+const MODULE_NAME_WORDS: usize = 4;
+
 /// Round kind discriminator on post-R1 bootstrap rounds. Mirrors
 /// `init/src/service.rs::kind`.
 pub mod kind
@@ -169,9 +184,9 @@ pub struct DevmgrCaps
     /// module of the boot bundle outside init's bootstrap set, the driver
     /// modules and the platform description tables.
     /// [`crate::decls::classify_modules`] takes them and tells each by its
-    /// content. Each is the module cap and the module's size in bytes, which
-    /// the cap, covering whole pages, does not give.
-    pub modules: Vec<(u64, u64)>,
+    /// content. Each is the module cap, the module's size in bytes (which the
+    /// cap, covering whole pages, does not give) and its bundle entry name.
+    pub modules: Vec<BootModule>,
 
     // SEND cap on svcmgr's service endpoint with `PUBLISH_AUTHORITY`
     // badged on. Reserved for devmgr-initiated publications (who
@@ -239,8 +254,9 @@ impl DevmgrCaps
 //     data[1] = count of caps in this round
 //     data[2..] = kind-specific payload:
 //       APERTURE / ACPI_REGION → (base, size) pairs per cap
-//       MODULE → one word per cap, the module's size in bytes; each cap
-//         is one boot module, untagged
+//       MODULE → n = data[1] size words (the module's size in bytes), then
+//         MODULE_NAME_WORDS words per module, the module's bundle entry name
+//         (little-endian, NUL-padded); each cap is one boot module, untagged
 //       SVCMGR_BUNDLE → no payload; one or two caps (publish, optional
 //         arch shutdown); the terminal round
 //   RAM_EXTENT: zero caps; data[1] = count of (base, size) pairs,
@@ -394,10 +410,13 @@ fn absorb_ram_extent_round(
 }
 
 /// Unpack one module-cap round: each cap is one boot module, untagged, and
-/// `data[2 + i]` is the size in bytes of the module of cap `i`. The `.min(4)`
-/// is `MSG_CAP_SLOTS_MAX`, the caps one round carries. A module whose size
-/// the round does not carry, or that the list cannot grow to hold, is logged
-/// and its cap released: a retained module cap pins init's donated pool run.
+/// `data[2 + i]` is the size in bytes of the module of cap `i`, and with
+/// `n = data[1]` modules, words `2 + n + MODULE_NAME_WORDS * i` onward are its
+/// bundle entry name, the bytes up to the first NUL. The `.min(4)` is
+/// `MSG_CAP_SLOTS_MAX`, the caps one round carries. A module whose size or name
+/// the round does not carry, whose name is empty, or that the list cannot grow
+/// to hold, is logged and its cap released: a retained module cap pins init's
+/// donated pool run.
 fn absorb_module_round(
     round_caps: &[u64],
     round_cap_count: usize,
@@ -408,6 +427,7 @@ fn absorb_module_round(
 {
     let n = round_cap_count.min(4);
     let sizes = round_data.get(..round_data_words).unwrap_or(round_data);
+    let declared = usize::try_from(round_data[1]).unwrap_or(usize::MAX).min(4);
     for (i, &slot) in round_caps.iter().take(n).enumerate()
     {
         if slot == 0
@@ -421,13 +441,44 @@ fn absorb_module_round(
             let _ = syscall::cap_delete(slot);
             continue;
         };
-        if caps.modules.try_reserve(1).is_err()
+        let first = declared
+            .saturating_add(2)
+            .saturating_add(MODULE_NAME_WORDS.saturating_mul(i));
+        let words = first
+            .checked_add(MODULE_NAME_WORDS)
+            .and_then(|end| sizes.get(first..end));
+        let Some(words) = words
+        else
+        {
+            std::os::seraph::log!(warn: "boot module without its name; released");
+            let _ = syscall::cap_delete(slot);
+            continue;
+        };
+        let mut raw = [0u8; MODULE_NAME_WORDS * 8];
+        for (chunk, word) in raw.as_chunks_mut::<8>().0.iter_mut().zip(words)
+        {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        let len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        if len == 0
+        {
+            std::os::seraph::log!(warn: "boot module with an empty name; released");
+            let _ = syscall::cap_delete(slot);
+            continue;
+        }
+        let mut name = Vec::new();
+        if name.try_reserve_exact(len).is_err() || caps.modules.try_reserve(1).is_err()
         {
             std::os::seraph::log!(warn: "boot module not recorded (no memory); released");
             let _ = syscall::cap_delete(slot);
             continue;
         }
-        caps.modules.push((slot, bytes));
+        name.extend_from_slice(raw.get(..len).unwrap_or(&[]));
+        caps.modules.push(BootModule {
+            cap: slot,
+            size: bytes,
+            name: name.into_boxed_slice(),
+        });
     }
 }
 

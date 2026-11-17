@@ -18,7 +18,8 @@ programs/hello/
 └── tester/
     ├── Cargo.toml         # Crate hello-tester
     └── src/
-        └── main.rs        # Spawns /programs/hello, checks its stdout line and exit
+        └── main.rs        # Spawns /programs/hello, checks its stdout line and exit,
+                           # and that a program may not start a service
 ```
 
 ---
@@ -37,14 +38,18 @@ hello from seraph userspace
 
 The `hello-tester` crate installs at `/tests/programs/hello`, per the
 [per-program tester protocol](../../docs/testing.md#per-program-tester-protocol). It spawns
-`/programs/hello` with a piped stdout, reads the stream to EOF, and waits for the child.
+`/programs/hello` with a piped stdout, reads the stream to EOF, and waits for the child. Then,
+being a program itself, it spawns the service-kind `/tests/crasher`, which procmgr refuses, since
+a program may start programs only
+([docs/signing.md](../../docs/signing.md) § Signature Policy in procmgr).
 
 | Check | On failure |
 |---|---|
 | A stdout line contains `hello from seraph userspace` | Prints `[hello-tester] FAIL expected line missing: …` and the captured stdout; exits `1` |
 | The child exited successfully | Prints `[hello-tester] FAIL non-zero exit: …`; exits `2` |
+| Spawning `/tests/crasher` fails with `PermissionDenied` | Prints `[hello-tester] FAIL starting /tests/crasher: …` and exits `3` on another error; kills it, prints `[hello-tester] FAIL a program started the service …` and exits `4` when it starts |
 
-When both checks pass it prints `[hello-tester] PASS` and exits `0`.
+When every check passes it prints `[hello-tester] PASS` and exits `0`.
 
 ---
 
@@ -69,9 +74,11 @@ spawn target:
   destroys one child before its start and starts another to its exit, and checks that procmgr
   holds the started child's pages until `RELEASE_HOLD` on the child's release token, which its
   process handle cannot send.
-- `create_process_large_module_phase` reads it, lays it out in a memory grant with its program
-  headers' file data moved past the grant's first 128 pages, creates it from that grant through
-  raw `CREATE_PROCESS`, and expects a clean exit.
+- `create_process_verifies_module_phase` reads it into a memory grant and creates it from that
+  grant through raw `CREATE_PROCESS` under its name and length, which runs to a clean exit, and
+  under a wrong name, a wrong length, no name, and with one byte changed, which procmgr refuses.
+- `create_from_file_refuses_wrong_name_phase` passes it as the file cap of a raw
+  `CREATE_FROM_FILE` under a wrong name, which procmgr refuses with `SIGNATURE_REFUSED`.
 - `memory_max_phase` (`services/svctest/src/phases/budget.rs`) passes it as the file cap of
   refused raw `CREATE_FROM_FILE` requests (one with a one-page memory max, which procmgr cannot
   load it under), and its `budget-child` creates it with a memory max above the child's own and

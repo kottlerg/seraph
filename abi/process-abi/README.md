@@ -243,9 +243,9 @@ and `std::os::seraph::StackNote`, std's own copy of its layout, for the
 std macro, since an item std reaches through this sysroot-private crate is
 `rustc_private`-unstable to std's users. Both macro paths emit the same
 bytes: svctest declares its stack through the std macro, and its
-`stack_note_refused` phase has the loader refuse that note patched past
-`MAX_PROCESS_STACK_PAGES` and accept it restored, so a std copy that parts
-from this crate's layout or values fails the harness. The std macro lets
+`stack_note_parsed` phase reads that note out of its installed image with
+the loader's parser, so a std copy that parts from this crate's layout or
+values fails the harness. The std macro lets
 std-using binaries declare a stack size without an extra Cargo dep on
 `process-abi`.
 
@@ -268,9 +268,7 @@ policy).
 `PROCESS_MAIN_TLS_MAX_PAGES` (2^18 pages) bounds the main-thread TLS block the same way: loaders
 map the pages the binary's `PT_TLS` memsz needs (`tls_block_layout`) and refuse a larger block.
 
-The on-disk shape is read by `elf::parse_stack_note` (full-bytes path,
-used by init) and `elf::parse_stack_note_streaming` (header-page +
-on-demand reads, used by procmgr's VFS-streaming spawn path).
+The on-disk shape is read by `elf::parse_stack_note`, which parses an image held in memory.
 
 ---
 

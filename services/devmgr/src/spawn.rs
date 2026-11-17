@@ -16,19 +16,21 @@ use std::os::seraph::process::ArgvEnvCap;
 use driver_binding::resources::{
     END_SLOTS, Endpoints, IommuUnit, MAX_IOMMU_UNITS, Resource, Round,
 };
-use ipc::{IpcMessage, procmgr_labels};
+use ipc::{IpcMessage, procmgr_errors, procmgr_labels};
 
 /// Source the child's ELF binary is loaded from: a boot module devmgr holds
 /// (the drivers the boot bundle carries) carries a procmgr Memory cap and
 /// uses [`CreateSource::Module`]; a driver loaded from the rootfs (walked by
 /// devmgr through the directory cap of `SET_DRIVERS_DIR` or `BIND_DRIVERS`)
-/// carries a vfsd file SEND cap plus a size hint and uses
-/// [`CreateSource::File`]. The variant decides the procmgr request label and
-/// payload shape; the rest of [`spawn_bound_driver`] — service-endpoint
+/// carries a vfsd file SEND cap and uses [`CreateSource::File`]. Each carries
+/// the object's exact size in bytes and the name procmgr verifies its
+/// signature under: a module's bundle entry name, a file's install path. The
+/// variant decides the procmgr request label; the rest of
+/// [`spawn_bound_driver`] — the request's words, service-endpoint
 /// derivation, `START_PROCESS`, bootstrap rounds — is identical across both
 /// sources.
 #[derive(Clone, Copy)]
-pub enum CreateSource
+pub enum CreateSource<'a>
 {
     /// Memory cap to an in-memory ELF image (`procmgr_labels::CREATE_PROCESS`).
     /// A `CREATE_PROCESS` `ipc_call` transfers the cap to procmgr (which deletes
@@ -36,15 +38,20 @@ pub enum CreateSource
     /// [`spawn_bound_driver`] deletes the cap on the caller's behalf — a
     /// retained boot-module cap is a live derivation child of init's donated
     /// pool-run source and pins that run unsplittable.
-    Module(u64),
+    Module
+    {
+        cap: u64, size: u64, name: &'a [u8]
+    },
     /// vfsd file SEND cap (`procmgr_labels::CREATE_FROM_FILE`). `size` is
-    /// the file size hint reported by the resolving `NS_LOOKUP`. On any
+    /// the file size reported by the resolving `NS_LOOKUP`. On any
     /// pre-`ipc_call` failure inside [`spawn_bound_driver`], the function
     /// deletes the file cap on the caller's behalf — the cap was just
     /// derived by the namespace walk and has no retry value.
     File
     {
-        file_cap: u64, size: u64
+        file_cap: u64,
+        size: u64,
+        name: &'a [u8],
     },
 }
 
@@ -338,7 +345,7 @@ pub struct BoundSpawnConfig<'a>
     /// ELF source for the child: a copy of a boot module
     /// ([`CreateSource::Module`]) or of a drivers-directory file node cap
     /// ([`CreateSource::File`]), consumed by the spawn.
-    pub source: CreateSource,
+    pub source: CreateSource<'a>,
     /// The device's resources, each with the cap devmgr keeps for it, from
     /// which the driver's copy is derived; at most [`MAX_BOUND_RESOURCES`].
     pub resources: &'a [Resource],
@@ -516,7 +523,7 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     // cap to procmgr.
     let source_cap = match config.source
     {
-        CreateSource::Module(m) => m,
+        CreateSource::Module { cap, .. } => cap,
         CreateSource::File { file_cap, .. } => file_cap,
     };
     let mut source_guard = ModuleCapGuard::new(source_cap);
@@ -572,33 +579,42 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     {
         flags |= procmgr_labels::CREATE_ARGV_ENV;
     }
-    // Caps: [source, creator, argv_env?]; the argv/env header rides in data
-    // words 0..4 of `CREATE_PROCESS` and 1..5 of `CREATE_FROM_FILE`, after the
-    // file size.
-    let (builder, header_word) = match config.source
+    // Caps: [source, creator, argv_env?]. Data word 0 is the object's size,
+    // the argv/env header (when present) follows at
+    // `procmgr_labels::CREATE_FIRST_WORD`, and the name block follows the
+    // header (`procmgr_labels::with_create_name`); both labels are built alike.
+    let (base_label, size, source_cap, name) = match config.source
     {
-        CreateSource::Module(module_cap) => (
-            IpcMessage::builder(procmgr_labels::CREATE_PROCESS | flags | sched_bits)
-                .cap(module_cap)
-                .cap(badged_creator),
-            0,
-        ),
-        CreateSource::File { file_cap, size } => (
-            IpcMessage::builder(procmgr_labels::CREATE_FROM_FILE | flags | sched_bits)
-                .word(0, size)
-                .cap(file_cap)
-                .cap(badged_creator),
-            1,
-        ),
+        CreateSource::Module { cap, size, name } =>
+        {
+            (procmgr_labels::CREATE_PROCESS, size, cap, name)
+        }
+        CreateSource::File {
+            file_cap,
+            size,
+            name,
+        } => (procmgr_labels::CREATE_FROM_FILE, size, file_cap, name),
     };
-    let create_msg = match &argv_env
+    let label = base_label | flags | sched_bits;
+    let builder = IpcMessage::builder(label)
+        .word(0, size)
+        .cap(source_cap)
+        .cap(badged_creator);
+    let builder = match &argv_env
     {
         Some(env) => builder
-            .words(header_word, &env.header_words())
-            .cap(env.cap())
-            .build(),
-        None => builder.build(),
+            .words(procmgr_labels::CREATE_FIRST_WORD, &env.header_words())
+            .cap(env.cap()),
+        None => builder,
     };
+    let Some(builder) = procmgr_labels::with_create_name(builder, label, name)
+    else
+    {
+        std::os::seraph::log!(warn: "driver spawn: name not sendable");
+        let _ = syscall::cap_delete(badged_creator);
+        return DriverSpawn::Failed;
+    };
+    let create_msg = builder.build();
     // SAFETY: ipc_buf is the registered IPC buffer.
     let reply = unsafe { ipc::ipc_call(config.procmgr_ep, &create_msg, ipc_buf) };
     // procmgr has copied the env by now, or refused the request.
@@ -615,9 +631,17 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
     // ipc_call returned: the source cap was transferred to procmgr whatever
     // the reply label.
     source_guard.disarm();
+    if reply.label == procmgr_errors::SIGNATURE_REFUSED
+    {
+        std::os::seraph::log!(
+            warn: "{}: signature refused; not started",
+            core::str::from_utf8(name).unwrap_or("driver")
+        );
+        return DriverSpawn::Failed;
+    }
     if reply.label != 0
     {
-        std::os::seraph::log!(warn: "driver create failed");
+        std::os::seraph::log!(warn: "driver create failed ({:#x})", reply.label);
         return DriverSpawn::Failed;
     }
 

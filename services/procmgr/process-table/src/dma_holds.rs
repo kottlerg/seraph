@@ -226,6 +226,7 @@ mod tests
             image: crate::ImageSpan::default(),
             threads: crate::ThreadRegistry::new(),
             name: crate::ProcessName::EMPTY,
+            sign_kinds: objsig::KindSet::EMPTY,
             debugger: 0,
         }
     }

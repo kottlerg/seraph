@@ -179,6 +179,7 @@ concurrent notification and queue events.
 | `fair_share_progress.rs` | A thread at the lowest fair level runs beside a CPU-bound one at the highest fair level on its CPU within a wall-clock budget, which strict priority across the fair levels would not let it ([core/kernel/docs/scheduler.md § Scheduling Classes](../kernel/docs/scheduler.md#scheduling-classes)) |
 | `idle_pull_starved_ready.rs` | An unpinned RT thread queued behind a higher-level thread spinning on the last CPU with no syscall runs within a wall-clock budget while the other CPUs idle, over 8 rounds of a fresh thread each: an idle CPU pulls it, though one queued thread is below the balancer's imbalance threshold ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)) (≥ 2 CPUs) |
 | `smt_siblings.rs` | Pinned to each CPU in turn, the test reads the core key the CPU reports in user mode (`crate::arch::core_key`: on x86-64 from CPUID leaf 1FH or 0BH, on riscv64 the CPU index), and requires each `SmtSibling` ring to be exactly its key group in ascending index order, wrapping; logs `ktest: smt cores=.. threads_per_core=.. on .. CPUs` |
+| `busy_cpu_placement.rs` | A worker on the last CPU, whose load floor-level spinners pinned there keep past the imbalance threshold, parks and is woken 32 times, each wake placed by least load, while a yielding spinner keeps CPU 0 busy with nothing queued: no wake lands on CPU 0, whose linked idle thread counts in its load ([core/kernel/docs/scheduler.md § Load Balancing](../kernel/docs/scheduler.md#load-balancing)), and, when a core holds neither CPU 0 nor the last CPU, none lands beside them (§ SMT Awareness); logs `ktest: busy_cpu_placement placed=..` (≥ 3 CPUs) |
 | `shared_memory_two_aspaces.rs` | One Memory cap mapped into two `AddressSpace` caps; `aspace_query` returns identical phys backing in both |
 | `cap_move_into_fresh_cspace_then_ipc.rs` | `cap_move` an endpoint into a child cspace; the child IPC-calls through its local slot; parent receives via a sibling cap |
 | `cross_cspace_revoke_no_alias.rs` | A cross-`CSpace` `cap_revoke` does not let a recipient's stale handle alias a recycled slot (#349) |
@@ -287,8 +288,9 @@ acknowledgement, result, approach, sync and entry bounds of `stop_claimed_delete
 `stop_park_race`, `stop_fault_sender` and `timed_wait_reuse`; the
 acknowledgement, server-entry and exit bounds of `stop_source_delete`; the preemption budget of
 `integration::priority_preemption`; the progress budget of `integration::fair_share_progress`;
-the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the expiry and
-report bounds of `integration::queued_waiters_fifo`; the observation window and finish wait of
+the pull budget and the exit polls of `integration::idle_pull_starved_ready`; the park and
+report polls of `integration::busy_cpu_placement`; the expiry and report bounds of
+`integration::queued_waiters_fifo`; the observation window and finish wait of
 `integration::irq_preserves_user_regs`; the delivery waits of `integration::irq_shared_line`; the
 child waits of `integration::stop_read_regs_remote`; the barrier wait of
 `integration::multi_caller_ipc_fifo`; the probe and redirect polls of

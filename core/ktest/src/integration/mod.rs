@@ -15,6 +15,7 @@ pub mod arena_reclaim;
 pub mod aspace_fault_notification_late_bind;
 pub mod aspace_fault_notification_once;
 pub mod aspace_harvest_no_fault;
+pub mod busy_cpu_placement;
 pub mod cap_delegation_chain;
 pub mod cap_generation_stale_handle;
 pub mod cap_generation_wide;
@@ -200,6 +201,10 @@ pub fn run_all(ctx: &TestContext)
         idle_pull_starved_ready::run(ctx)
     );
     run_integration_test!("integration::smt_siblings", smt_siblings::run(ctx));
+    run_integration_test!(
+        "integration::busy_cpu_placement",
+        busy_cpu_placement::run(ctx)
+    );
     run_integration_test!(
         "integration::shared_memory_two_aspaces",
         shared_memory_two_aspaces::run(ctx)

@@ -69,6 +69,10 @@ pub struct VfsdCaps
     pub block_class: u64,
     pub service_ep: u64,
     pub fatfs_module_cap: u64,
+    /// The fatfs module's size in bytes, which its cap, covering whole
+    /// pages, does not give: the length of the signed object procmgr
+    /// verifies.
+    pub fatfs_module_len: u64,
     pub self_aspace: u64,
     /// Worker-owned bootstrap endpoint. Populated after the bootstrap worker
     /// thread is spawned. Main derives badged SEND caps on this slot to hand
@@ -82,8 +86,9 @@ pub struct VfsdCaps
 //   Round 1 (2 caps, 0 data words):
 //     caps[0]: service endpoint (vfsd receives on this)
 //     caps[1]: the `block` class SEND on devmgr's registry endpoint
-//   Round 2 (1 cap, 0 data words):
+//   Round 2 (1 cap, 1 data word):
 //     caps[0]: fatfs module memory cap
+//     data[0]: the module's size in bytes, the signed object's length
 //
 // log_ep and procmgr_ep arrive via `ProcessInfo`/`StartupInfo`, not through
 // this protocol.
@@ -102,7 +107,7 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
     }
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let round2 = unsafe { ipc::bootstrap::request_round(info.creator_endpoint, ipc_buf) }.ok()?;
-    if round2.cap_count < 1 || !round2.done
+    if round2.cap_count < 1 || !round2.done || round2.data_words < 1 || round2.data[0] == 0
     {
         return None;
     }
@@ -113,6 +118,7 @@ fn bootstrap_caps(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Opt
         procmgr_ep: info.procmgr_endpoint,
         memmgr_ep: info.memmgr_endpoint,
         fatfs_module_cap: round2.caps[0],
+        fatfs_module_len: round2.data[0],
         self_aspace: info.self_aspace,
         bootstrap_ep: 0,
     })

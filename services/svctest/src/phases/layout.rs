@@ -7,12 +7,10 @@
 //! the zones sized to the user half, one allocation far past the free heap
 //! tail, freed reservation VA reused past any fixed run-table size, a
 //! main-thread TLS block wider than a page, spawned threads' IPC buffers in the
-//! arena, and the loader's refusal of a stack note above
-//! `MAX_PROCESS_STACK_PAGES`.
+//! arena, and the loader's parse of the stack note std emits.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::io::{Seek, SeekFrom, Write};
 use std::os::seraph::{ReservedRange, reserve_pages, startup_info, unreserve_pages};
 
 use crate::bootstrap::Caps;
@@ -52,17 +50,11 @@ pub fn phases() -> &'static [Phase]
             name: "spawned_ipc_buffer_in_arena",
             run: spawned_ipc_buffer_in_arena_phase,
         },
+        Phase {
+            name: "stack_note_parsed",
+            run: stack_note_parsed_phase,
+        },
     ]
-}
-
-/// Phases that write a fixture under `/data/svctest`, so they run once the
-/// filesystem phases have passed.
-pub fn after_fs() -> &'static [Phase]
-{
-    &[Phase {
-        name: "stack_note_refused",
-        run: stack_note_refused_phase,
-    }]
 }
 
 /// The heap and the reservation arena lie in the zones `process-layout`
@@ -273,74 +265,28 @@ pub fn wide_main_tls_phase(_: &Caps)
     std::os::seraph::log!("wide main TLS passed ({} bytes)", info.tls_template_memsz);
 }
 
-/// Where svctest's own stack note's page count lies in its image: the one
-/// `.note.seraph.stack` record (header, name, and its declared count).
-fn stack_note_pages_offset(image: &[u8]) -> usize
+/// The loader's parser reads the stack note std's `stack_pages!` emits:
+/// `elf::parse_stack_note`, which procmgr runs on every image it creates,
+/// finds svctest's own declared page count in its installed image. The
+/// loader's refusal of a note outside `1..=MAX_PROCESS_STACK_PAGES` is
+/// `process_abi::resolve_stack_pages`, host-tested; no image with such a
+/// note is signed, so none reaches the loader in a boot.
+pub fn stack_note_parsed_phase(_: &Caps)
 {
-    let mut needle: Vec<u8> = Vec::with_capacity(28);
-    needle.extend_from_slice(&7u32.to_le_bytes());
-    needle.extend_from_slice(&8u32.to_le_bytes());
-    needle.extend_from_slice(&process_abi::NT_SERAPH_STACK.to_le_bytes());
-    needle.extend_from_slice(&process_abi::SERAPH_NOTE_NAME);
-    // Opaque to the optimiser, so no folded copy of the whole record can sit
-    // in svctest's read-only data beside the real note.
-    let pages = std::hint::black_box(crate::SVCTEST_STACK_PAGES);
-    needle.extend_from_slice(&pages.to_le_bytes());
-    needle.extend_from_slice(&0u32.to_le_bytes());
-    let hits: Vec<usize> = image
-        .windows(needle.len())
-        .enumerate()
-        .filter_map(|(i, w)| (w == needle.as_slice()).then_some(i))
-        .collect();
+    #[cfg(target_arch = "x86_64")]
+    const MACHINE: u16 = elf::EM_X86_64;
+    #[cfg(target_arch = "riscv64")]
+    const MACHINE: u16 = elf::EM_RISCV;
+
+    let image = std::fs::read("/tests/svctest").expect("read /tests/svctest");
+    let (ehdr, _) =
+        elf::validate_executable(&image, MACHINE).expect("svctest's image is a valid executable");
+    // Defect guarded: std's copy of the note layout drifts from the one the
+    // loader parses, so a std binary's declared stack is silently ignored.
     assert_eq!(
-        hits.len(),
-        1,
-        "svctest's stack note found {} times",
-        hits.len()
+        elf::parse_stack_note(&ehdr, &image),
+        Some(crate::SVCTEST_STACK_PAGES),
+        "the loader's parser did not read svctest's declared stack pages"
     );
-    hits.first()
-        .and_then(|hit| hit.checked_add(20))
-        .expect("stack note offset overflowed")
-}
-
-/// A binary whose stack note declares more than `MAX_PROCESS_STACK_PAGES` is
-/// refused at spawn, where the loader once clamped it silently; the same
-/// image with its note restored spawns and exits cleanly.
-pub fn stack_note_refused_phase(_: &Caps)
-{
-    use std::process::Command;
-
-    let path = "/data/svctest/stacknote";
-    let mut image = std::fs::read("/tests/svctest").expect("read /tests/svctest");
-    let at = stack_note_pages_offset(&image);
-    let oversize = process_abi::MAX_PROCESS_STACK_PAGES + 1;
-    image
-        .get_mut(at..at.checked_add(4).expect("stack note offset overflowed"))
-        .expect("stack note lies inside the image")
-        .copy_from_slice(&oversize.to_le_bytes());
-    std::fs::write(path, &image).expect("write the patched image");
-
-    let refused = Command::new(path).arg("exit-code-zero").spawn();
-    assert!(
-        refused.is_err(),
-        "a stack note of {oversize} pages was accepted"
-    );
-
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("reopen the patched image");
-    file.seek(SeekFrom::Start(at as u64))
-        .expect("seek to the note");
-    file.write_all(&crate::SVCTEST_STACK_PAGES.to_le_bytes())
-        .expect("restore the note");
-    drop(file);
-    let status = Command::new(path)
-        .arg("exit-code-zero")
-        .status()
-        .expect("the restored image did not spawn");
-    assert!(status.success(), "the restored image exited {status}");
-
-    std::fs::remove_file(path).expect("remove the patched image");
-    std::os::seraph::log!("stack note of {oversize} pages refused");
+    std::os::seraph::log!("stack note parsed ({} pages)", crate::SVCTEST_STACK_PAGES);
 }

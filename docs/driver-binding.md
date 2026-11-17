@@ -315,10 +315,10 @@ at `BIND_DRIVERS`, and for a hot-added device:
    ([responsibilities.md](../services/devmgr/docs/responsibilities.md#responsibilities)
    § Responsibilities).
 
-`BIND_DRIVERS` (gated on `BIND_AUTHORITY`) carries a directory cap; devmgr replies at once and
-its control thread runs a drivers-directory pass over it against the records still unbound,
-under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers it binds
-within the production settle bound. A record is bound at most once a boot.
+`BIND_DRIVERS` (gated on `BIND_AUTHORITY`) carries a directory cap and its absolute path; devmgr
+replies at once and its control thread runs a drivers-directory pass over it against the records
+still unbound, under the declaration bounds of the `SET_DRIVERS_DIR` pass, and settles the drivers
+it binds within the production settle bound. A record is bound at most once a boot.
 
 Each bind pass is one settle batch: the IOMMU pass, the boot pass over boot-module drivers,
 the pass at `SET_DRIVERS_DIR`, one pass per `BIND_DRIVERS`, and a hotplug pass. Withdrawing a

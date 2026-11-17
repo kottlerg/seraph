@@ -732,6 +732,9 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 | `MAX_LOADS` | `services/crashd/core-file/src/layout.rs` | 65 533 `PT_LOAD`s per core | format spec (`e_phnum` is 16 bits and `PN_XNUM` (`0xffff`) is not written, so the loads and the `PT_NOTE` number at most `0xfffe`; a run past it is not recorded) | none | correct as is | None |
 | `LABEL_MAX` | `services/crashd/core-file/src/store.rs` | 48 bytes of a core name's process label | tuning (the name's sequence number makes it unique; a label is cut, never refused) | none | correct as is | None |
 | `NAMED_PAGE_TRIES` | `services/crashd/src/main.rs` | 3 attaches to reach the page holding the faulting thread's cap | tuning (the faulting thread's index moves only when threads listed before it exit between two attaches; past it the block is `unidentified`; bounds no capacity) | none | correct as is | None |
+| `SLOTS` | `services/crashd/oom-hold/src/lib.rs` | 16 faults declined for want of memory held at once, and 16 resumed faults remembered for the repeat rule | tuning (each slot is one endpoint made at start; a fault past them is reported and declined at once, as with no hold) | 16 endpoints and 16 wait-set members, while a stall is set | correct as is | None |
+| `STALL_MAX_MS` | `services/crashd/oom-hold/src/lib.rs` | 600 000 ms (10 min) held per fault | tuning (a longer `CRASHD_OOM_STALL_MS` is clamped to it, logged; bounds how long a held thread waits, no capacity) | none | correct as is | None |
+| `HEAP_TOUCH_BYTES`, `STACK_TOUCH_BYTES` | `services/crashd/src/main.rs` | 64 KiB of heap, and 32 KiB of each of the main and watchdog threads' stacks, touched at start while a stall is set | tuning (what a report uses while memory is critical: its lines, the `STACK_SCAN_BYTES` scan, its registers and frames; a page past them is declined then and ends crashd) | 128 KiB of pages, backed at start | correct as is | None |
 
 ### devmgr
 

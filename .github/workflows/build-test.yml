@@ -306,6 +306,13 @@ jobs:
               # run-parallel. Reuses the default interactive boot the
               # test-reboot restore left.
               cargo xtask test-vmgenid
+              # Seventh boot: the power-button test. x86_64 only (QEMU's
+              # riscv64 virt machine has no fixed power button); presses the
+              # ACPI power button over QMP once acpid has armed its events,
+              # and pwrmgr must power off through acpid. Host-side over QMP,
+              # so it cannot ride run-parallel. Reuses the default
+              # interactive boot.
+              cargo xtask test-powerbutton
             fi
           fi
 

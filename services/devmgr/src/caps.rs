@@ -137,6 +137,15 @@ pub struct DevmgrCaps
     // out of them, keeping every remainder.
     pub apertures: SpanTable<u64>,
 
+    /// The pages of the BARs of the functions behind managed hotplug slots
+    /// that no bind has carved, moved out of [`Self::apertures`]: a
+    /// hot-added function's when its BARs are placed, a boot-scanned one's
+    /// when its slot is managed. A bind carves the function's BAR caps from here
+    /// ([`crate::carve_subrange`]); a region grant, which carves from the
+    /// apertures alone, never reaches them, and no placement in a slot's
+    /// windows, which takes only what the apertures hold, lands on them.
+    pub slot_bars: SpanTable<u64>,
+
     /// The `Mmio` cap of every scanned ECAM window, kept apart from the
     /// apertures so no BAR carve can reach configuration space: devmgr
     /// carves from it the configuration page of each function it binds,
@@ -205,6 +214,7 @@ impl DevmgrCaps
             irq_range_cap: 0,
             firmware: std::sync::Arc::new(Firmware::new(info.self_aspace)),
             apertures: SpanTable::new(),
+            slot_bars: SpanTable::new(),
             config_space: SpanTable::new(),
             config_pages: Vec::new(),
             ecam_windows: Vec::new(),

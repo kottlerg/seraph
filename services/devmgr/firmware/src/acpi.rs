@@ -73,6 +73,12 @@ const FADT_OFF_RESET_VALUE: usize = 128;
 /// FADT `X_FIRMWARE_CTRL`: the FACS's 64-bit physical address, which a
 /// non-zero value gives in place of `FIRMWARE_CTRL`.
 const FADT_OFF_X_FIRMWARE_CTRL: usize = 132;
+/// FADT `SCI_INT`: the 16-bit system vector the SCI is wired to, an ISA
+/// IRQ on a PC.
+const FADT_OFF_SCI_INT: usize = 46;
+/// FADT `Flags` bit `HW_REDUCED_ACPI`: the platform implements no fixed
+/// hardware, the SCI among it.
+const FADT_FLAG_HW_REDUCED_ACPI: u32 = 1 << 20;
 /// Generic Address Structure space ID of the I/O space.
 const GAS_SPACE_IO: u8 = 1;
 /// The bytes of the FACS that hold its fields up to the reserved tail: the
@@ -354,6 +360,53 @@ pub fn fadt_facs_phys(fadt_bytes: &[u8]) -> Option<u64>
     }
     let facs = u64::from(read_u32(fadt_bytes, FADT_OFF_FIRMWARE_CTRL));
     if facs == 0 { None } else { Some(facs) }
+}
+
+/// Read the FADT's `SCI_INT`, the interrupt the SCI is wired to (ACPI 6.5
+/// § 5.2.9): an ISA IRQ, which the MADT's overrides map to its GSI
+/// ([`sci_gsi`]).
+///
+/// Returns `None` if the signature isn't `FACP`, the table (bounded by its
+/// reported length and the slice) does not reach `Flags`, `HW_REDUCED_ACPI`
+/// is set (such a platform signals its events through other interrupts and
+/// leaves `SCI_INT` unused), or `SCI_INT` is 0, the PIT's line on a PC,
+/// which no SCI is wired to.
+#[must_use]
+pub fn fadt_sci_int(fadt_bytes: &[u8]) -> Option<u16>
+{
+    if sdt_signature(fadt_bytes) != *b"FACP"
+    {
+        return None;
+    }
+    let total_len = (sdt_length(fadt_bytes)? as usize).min(fadt_bytes.len());
+    let table = fadt_bytes.get(..total_len)?;
+    let flags = table
+        .get(FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4)
+        .map(|_| read_u32(table, FADT_OFF_FLAGS))?;
+    if flags & FADT_FLAG_HW_REDUCED_ACPI != 0
+    {
+        return None;
+    }
+    let sci = table
+        .get(FADT_OFF_SCI_INT..FADT_OFF_SCI_INT + 2)
+        .map(|_| read_u16(table, FADT_OFF_SCI_INT))?;
+    if sci == 0 { None } else { Some(sci) }
+}
+
+/// The GSI the SCI wired to `SCI_INT` `sci_int` is delivered on: the GSI of
+/// the first override in `overrides` whose source is `sci_int`, else
+/// `sci_int` itself, as an ISA IRQ no override names is identity-mapped
+/// (ACPI 6.5 § 5.2.12.5). The line's mode is its GSI's
+/// ([`line_mode`]): an override's trigger and polarity, else level and
+/// active-low, which is also the SCI's own default (ACPI 6.5 § 5.2.9, a
+/// sharable, level, active-low interrupt).
+#[must_use]
+pub fn sci_gsi(overrides: impl IntoIterator<Item = SourceOverride>, sci_int: u16) -> u32
+{
+    overrides
+        .into_iter()
+        .find(|o| u16::from(o.source) == sci_int)
+        .map_or(u32::from(sci_int), |o| o.gsi)
 }
 
 /// The OEM table ID field of an SDT header (8 bytes, space-padded), or
@@ -1427,6 +1480,48 @@ mod tests
         assert_eq!(fadt_io_block(&t, FadtBlock::SmiCmd), block(0xB2, 1, 0xF1));
         assert_eq!(fadt_io_block(&t, FadtBlock::Reset), block(0xCF9, 1, 6));
         assert_eq!(fadt_facs_phys(&t), Some(0x7FEB_1000));
+    }
+
+    #[test]
+    fn fadt_gives_its_sci_unless_hardware_reduced_zero_or_short()
+    {
+        let mut t = q35_fadt(0);
+        t[FADT_OFF_SCI_INT..FADT_OFF_SCI_INT + 2].copy_from_slice(&9u16.to_le_bytes());
+        assert_eq!(fadt_sci_int(&t), Some(9));
+        // A vector past the ISA range is read whole.
+        t[FADT_OFF_SCI_INT..FADT_OFF_SCI_INT + 2].copy_from_slice(&0x114u16.to_le_bytes());
+        assert_eq!(fadt_sci_int(&t), Some(0x114));
+        let mut reduced = t.clone();
+        let flags = read_u32(&reduced, FADT_OFF_FLAGS) | FADT_FLAG_HW_REDUCED_ACPI;
+        reduced[FADT_OFF_FLAGS..FADT_OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(fadt_sci_int(&reduced), None);
+        // The reported length stops before Flags.
+        let mut short = t.clone();
+        short[SDT_OFF_LENGTH..SDT_OFF_LENGTH + 4].copy_from_slice(&112u32.to_le_bytes());
+        assert_eq!(fadt_sci_int(&short), None);
+        t[FADT_OFF_SCI_INT..FADT_OFF_SCI_INT + 2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(fadt_sci_int(&t), None);
+        t[..4].copy_from_slice(b"APIC");
+        assert_eq!(fadt_sci_int(&t), None);
+    }
+
+    #[test]
+    fn sci_gsi_follows_the_override_of_its_source_else_is_identity()
+    {
+        let over = |source, gsi, flags| SourceOverride { source, gsi, flags };
+        // QEMU q35: IRQ 0 -> GSI 2, and SCI_INT 9 overridden onto itself,
+        // level and active-high.
+        let q35 = [over(0, 2, 0), over(9, 9, 0xD)];
+        assert_eq!(sci_gsi(q35, 9), 9);
+        assert_eq!(line_mode(q35, 9), IRQ_MODE_LEVEL);
+        // An override moving the SCI elsewhere; one only targeting its line
+        // does not move it.
+        assert_eq!(sci_gsi([over(9, 20, 0)], 9), 20);
+        assert_eq!(sci_gsi([over(5, 9, 0)], 9), 9);
+        // No override: identity, and the SCI's default mode.
+        assert_eq!(sci_gsi([], 9), 9);
+        assert_eq!(line_mode([], 9), PCI_INTX_MODE);
+        assert_eq!(sci_gsi([over(9, 20, 0)], 0x109), 0x109);
     }
 
     #[test]

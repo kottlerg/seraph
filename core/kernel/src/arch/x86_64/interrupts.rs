@@ -358,6 +358,13 @@ pub unsafe fn init()
 #[cfg(test)]
 pub unsafe fn init() {}
 
+/// Initialise the BSP's own interrupt-controller state that needs its per-CPU
+/// pointer: nothing on x86-64, where [`init`] brings up the BSP's local APIC.
+///
+/// # Safety
+/// No preconditions; `unsafe` only for signature parity with the riscv64 item.
+pub unsafe fn init_bsp_local() {}
+
 // ── APIC ID and ICR ───────────────────────────────────────────────────────────
 
 /// Interrupt Command Register low word (bits 31:0).

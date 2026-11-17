@@ -1974,8 +1974,8 @@ pub mod published_names
     pub const DEVMGR_ACPI: &[u8] = b"devmgr.acpi";
 
     /// `acpid_labels::POWER_AUTHORITY`-badged SEND on acpid's service
-    /// endpoint: `acpid_labels::SLEEP` and `acpid_labels::RESET`. Seed-only
-    /// and seeded only by pwrmgr.
+    /// endpoint: `acpid_labels::SLEEP`, `acpid_labels::RESET` and
+    /// `acpid_labels::WAIT_EVENT`. Seed-only and seeded only by pwrmgr.
     pub const ACPID_POWER: &[u8] = b"acpid.power";
 
     /// SEND on acpid's service endpoint badged with a sentinel that carries
@@ -2196,12 +2196,13 @@ pub mod pwrmgr_errors
 
 /// Wire-protocol version of [`acpid_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const ACPID_LABELS_VERSION: u32 = 1;
+pub const ACPID_LABELS_VERSION: u32 = 2;
 /// IPC labels for acpid's power surface, which pwrmgr calls.
 ///
 /// acpid runs the firmware's AML and holds the FADT's fixed register blocks
-/// (`services/acpid/README.md`), so the ACPI sleep and reset sequences run
-/// in it: pwrmgr, the power policy, reaches them through a SEND badged
+/// and the SCI (`services/acpid/README.md`), so the ACPI sleep and reset
+/// sequences run in it and the fixed events reach the OS through it: pwrmgr,
+/// the power policy, reaches them through a SEND badged
 /// [`acpid_labels::POWER_AUTHORITY`] (`acpid.power`). Every request carries
 /// the caller's compiled [`super::ACPID_LABELS_VERSION`] in `data[0]`.
 /// The handler checks the label first, then the badge, then the version,
@@ -2231,13 +2232,33 @@ pub mod acpid_labels
     /// [`super::acpid_errors::NO_DEVICE`] when the FADT places no
     /// `RESET_REG` in the I/O space (always on RISC-V).
     pub const RESET: u64 = 2;
+    /// Wait for a power event: acpid holds the call until one is pending,
+    /// with no bound, then replies with every event pending.
+    ///
+    /// Request: `data[0]` = the version. Reply
+    /// ([`super::acpid_errors::SUCCESS`]): `data[0]` = the events, a mask of
+    /// [`EVENT_POWER_BUTTON`]. An event is consumed by the reply that
+    /// delivers it; one whose reply cannot be delivered (the caller died) is
+    /// kept for the next `WAIT_EVENT`, and one acpid had not delivered when
+    /// it died stays latched in the hardware and is delivered by the restarted
+    /// acpid. One caller waits at a time: a `WAIT_EVENT` that arrives while
+    /// another waits takes its place, and the earlier one is replied
+    /// [`super::acpid_errors::SUPERSEDED`]. Replies
+    /// [`super::acpid_errors::NO_DEVICE`] when acpid has no event to wait
+    /// for: devmgr served it no SCI or no `PM1a` event block, or the FADT
+    /// declares no fixed power button (always on RISC-V).
+    pub const WAIT_EVENT: u64 = 3;
 
     /// [`SLEEP`]'s state argument for S5, soft-off.
     pub const STATE_S5: u64 = 5;
 
+    /// [`WAIT_EVENT`]'s event bit: the fixed power button was pressed
+    /// (`PWRBTN_STS`).
+    pub const EVENT_POWER_BUTTON: u64 = 1;
+
     /// Authority bit in the acpid-service-endpoint badge's high u64 bit, set
-    /// on `acpid.power`. Without it [`SLEEP`] and [`RESET`] reply
-    /// [`super::acpid_errors::UNAUTHORIZED`].
+    /// on `acpid.power`. Without it [`SLEEP`], [`RESET`] and [`WAIT_EVENT`]
+    /// reply [`super::acpid_errors::UNAUTHORIZED`].
     pub const POWER_AUTHORITY: u64 = 1u64 << 63;
 }
 
@@ -2254,6 +2275,9 @@ pub mod acpid_errors
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
     /// The platform has no register or object the request needs.
     pub const NO_DEVICE: u64 = 4;
+    /// A [`super::acpid_labels::WAIT_EVENT`] was superseded by a later one
+    /// before an event arrived.
+    pub const SUPERSEDED: u64 = 5;
     /// Unknown opcode on acpid's endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
@@ -2838,23 +2862,30 @@ pub mod devmgr_labels
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Serve acpid the `IoPort` of one fixed ACPI register block the FADT
-    /// declares (x86-64).
+    /// declares, or the SCI's `Interrupt` (x86-64).
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = the block ([`ACPI_PM1A_EVT`], [`ACPI_PM1A_CNT`],
-    /// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], or [`ACPI_RESET`]). Caller's badge
-    /// MUST carry [`ACPI_AUTHORITY`]; the handler replies
+    /// [`ACPI_GPE0`], [`ACPI_SMI_CMD`], [`ACPI_RESET`], or [`ACPI_SCI`]).
+    /// Caller's badge MUST carry [`ACPI_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
-    /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = a narrow
-    /// `IoPort` over the block, derived from devmgr's full-rights `IoPort` on
-    /// every call; `data[0]` = its first port; `data[1]` = its port count;
-    /// `data[2]` = the FADT's `ACPI_ENABLE` value for [`ACPI_SMI_CMD`], its
-    /// `RESET_VALUE` for [`ACPI_RESET`], and 0 for the others. Replies
-    /// [`super::devmgr_errors::NO_DEVICE`] when the platform has no such
-    /// block (every block on RISC-V, a zero FADT field, a `RESET_REG` outside
-    /// the I/O space), the FADT cannot be read, or the carve fails, and
-    /// [`super::devmgr_errors::INVALID_REQUEST`] for an unknown block.
+    /// Reply ([`super::devmgr_errors::SUCCESS`]) for a register block:
+    /// `caps[0]` = a narrow `IoPort` over the block, derived from devmgr's
+    /// full-rights `IoPort` on every call; `data[0]` = its first port;
+    /// `data[1]` = its port count; `data[2]` = the FADT's `ACPI_ENABLE` value
+    /// for [`ACPI_SMI_CMD`], its `RESET_VALUE` for [`ACPI_RESET`], and 0 for
+    /// the others. For [`ACPI_SCI`]: `caps[0]` = an `Interrupt` cap carrying
+    /// `RIGHTS_IRQ_NOTIFY` on the SCI's line, a derivation of the line devmgr
+    /// holds for the boot, made on every call; `data[0]` = the line's GSI;
+    /// `data[1]` = the `SYS_IRQ_REGISTER` mode it is routed in; `data[2]` =
+    /// 1 when devmgr served the SCI earlier in this boot (the caller is a
+    /// restarted acpid), else 0. Replies [`super::devmgr_errors::NO_DEVICE`]
+    /// when the platform has no such block or SCI (every one on RISC-V, a
+    /// zero FADT field, a `RESET_REG` outside the I/O space, a
+    /// hardware-reduced FADT), the FADT cannot be read, or the carve or the
+    /// derivation fails, and [`super::devmgr_errors::INVALID_REQUEST`] for an
+    /// unknown block.
     pub const QUERY_ACPI_RESOURCES: u64 = 24;
     /// [`QUERY_ACPI_RESOURCES`] block: `PM1a_EVT_BLK`, `PM1_EVT_LEN` ports.
     pub const ACPI_PM1A_EVT: u64 = 1;
@@ -2867,6 +2898,8 @@ pub mod devmgr_labels
     /// [`QUERY_ACPI_RESOURCES`] block: the `RESET_REG` port, when the FADT
     /// places it in the I/O space.
     pub const ACPI_RESET: u64 = 5;
+    /// [`QUERY_ACPI_RESOURCES`] resource: the SCI, the FADT's `SCI_INT` line.
+    pub const ACPI_SCI: u64 = 6;
 
     /// Grant acpid part of an operation region it evaluated: a `SystemIO`
     /// range, or the `SystemMemory` page an access reaches, that no device

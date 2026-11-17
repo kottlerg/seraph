@@ -17,25 +17,27 @@ acpid/
 └── src/
     ├── lib.rs            # Host-tested library: `Failure`, `Why`
     ├── power.rs          # Power requests: decode, `\_S5_`, `\_PTS`, the `PM1a_CNT` values
+    ├── events.rs         # The fixed power button and the GPEs: arm, scan, dispatch, re-enable
     ├── walk.rs           # The `_STA` / `_INI` initialization walk
     ├── bridge.rs         # Host bridges: `_HID`/`_CID`, `_SEG`, `_BBN`, `_OSC`, `_CRS`, `_PRT`
     ├── table.rs          # Where a served table sits in its region's mapping
     ├── sim.rs            # Test host over the captured QEMU tables (tests only)
-    ├── main.rs           # Entry, bootstrap, the evaluation thread
+    ├── main.rs           # Entry, bootstrap, the evaluation thread, the watch on acpid's threads
     ├── caps.rs           # svcmgr bootstrap: the service endpoint, the `devmgr.acpi` seed
     ├── devmgr.rs         # The calls acpid makes on devmgr
     ├── platform.rs       # The evaluator's `Host`: region grants, configuration access
     ├── startup.rs        # The start-up sequence and the pushes
-    ├── server.rs         # The power requests' service loop
+    ├── server.rs         # The work loop, the receivers, the event thread, `WAIT_EVENT`
     └── arch/
         ├── mod.rs            # Arch dispatch: `arch::current`
-        ├── x86_64/mod.rs     # ACPI mode, port I/O, the APIC model, PM1a_CNT, RESET_REG
-        └── riscv64/mod.rs    # No I/O space, one interrupt model, no power registers
+        ├── x86_64/mod.rs     # ACPI mode, port I/O, the APIC model, PM1a_CNT, RESET_REG,
+        │                     # the event blocks and the SCI
+        └── riscv64/mod.rs    # No I/O space, one interrupt model, no power registers or events
 ```
 
-The library (`lib.rs`, `walk.rs`, `bridge.rs`, `table.rs`, `power.rs`) holds the evaluation
-logic and is host-tested over the QEMU tables `shared/aml/fixtures/` holds; the binary gives it a
-`Host` that reaches hardware only through devmgr.
+The library (`lib.rs`, `walk.rs`, `bridge.rs`, `table.rs`, `power.rs`, `events.rs`) holds the
+evaluation logic and is host-tested over the QEMU tables `shared/aml/fixtures/` holds; the binary
+gives it a `Host` that reaches hardware only through devmgr.
 
 ---
 
@@ -49,20 +51,23 @@ and the SSDTs devmgr serves, switches an x86-64 platform into ACPI mode, runs th
 initialization walk, and evaluates each PCI host bridge's `_OSC`, `_CRS` and `_PRT`
 ([docs/startup.md](docs/startup.md)). It pushes the results to devmgr, which keeps those that
 agree with its boot records and serves them per bridge with `QUERY_HOST_BRIDGE`
-([docs/devmgr.md](docs/devmgr.md) § Pushes).
+([docs/devmgr.md](docs/devmgr.md) § Pushes). On x86-64 it then takes the SCI and handles the
+ACPI events: the fixed power button, which it reports to pwrmgr, and the general-purpose events
+(GPEs), whose `\_GPE` methods it runs (§ Events).
 
 acpid is a provider: its recipe's `provides = acpid.power:auth acpid.deny:deny` makes svcmgr
 create its service endpoint and publish two SENDs on it, the seed-only `acpid.power`, carrying
 `POWER_AUTHORITY`, which only pwrmgr seeds, and the public `acpid.deny` without it. Once its
-start-up ends, the evaluation thread serves the power requests on that endpoint (§ Power
+start-up ends, two receiver threads serve the power requests on that endpoint (§ Power
 requests); a request sent during start-up waits in the endpoint's queue.
 
 ---
 
 ## Power requests
 
-acpid serves `ipc::acpid_labels` on its endpoint, from the evaluation thread, so every evaluation
-runs in turn on the one thread that owns the namespace. A request is checked in order: the label
+acpid serves `ipc::acpid_labels` on its endpoint from two receiver threads, which hand each
+`SLEEP` and `RESET` to the evaluation thread and wait for its answer, so every evaluation runs in
+turn on the one thread that owns the namespace. A request is checked in order: the label
 (`UNKNOWN_OPCODE`), the badge's `POWER_AUTHORITY` (`UNAUTHORIZED`), `ACPID_LABELS_VERSION` in
 `data[0]` (`LABEL_VERSION_MISMATCH`), then the argument.
 
@@ -73,9 +78,16 @@ runs in turn on the one thread that owns the namespace. A request is checked in 
   then with `SLP_EN` (bit 13) set, and logs `SLEEP(5): PM1a_CNT ...` before the writes.
 - `RESET`: acpid writes the FADT's `RESET_VALUE` to its `RESET_REG` port and logs
   `RESET: RESET_REG ...` before the write.
+- `WAIT_EVENT`: the receiver holds the call, with no bound, until an event is pending, and
+  replies `SUCCESS` with the pending events in `data[0]` (`EVENT_POWER_BUTTON`) (§ Events). One
+  call waits at a time: a later `WAIT_EVENT` takes its place and the earlier one is replied
+  `SUPERSEDED`, so the other receiver stays free for `SLEEP` and `RESET`. `NO_DEVICE` when
+  acpid has no event to wait for: no SCI, no PM1a event block, or a FADT that declares no fixed
+  power button, and always on RISC-V.
 
-On the success path the platform powers off or resets and no reply arrives. A `SUCCESS` reply
-means the writes returned and the platform still runs; the caller decides how long to wait.
+On the success path of `SLEEP` and `RESET` the platform powers off or resets and no reply
+arrives. A `SUCCESS` reply means the writes returned and the platform still runs; the caller
+decides how long to wait.
 `NO_DEVICE` means the platform lacks what the request needs: `PM1a_CNT`, a usable `\_S5_` or
 loaded AML for `SLEEP`, an I/O-space `RESET_REG` for `RESET`, and always on RISC-V, whose
 platforms power off and reset through SBI. acpid acquires `PM1a_CNT` and `RESET_REG` from
@@ -86,6 +98,44 @@ the checks answered `NO_DEVICE`, when the bootstrap round delivered the endpoint
 restarts it on the same endpoint. pwrmgr bounds each call at 30 s
 ([pwrmgr](../pwrmgr/README.md#responsibilities)), so a request that acpid, down or blocked, does
 not answer fails rather than holding the shutdown.
+
+---
+
+## Events
+
+On x86-64, acpid acquires the PM1a event block, the GPE0 block and the SCI from devmgr
+(`QUERY_ACPI_RESOURCES`) at the start of its start-up. devmgr serves the SCI, the FADT's
+`SCI_INT` routed through the MADT's interrupt source overrides, as an `Interrupt` capability
+derived from the line it holds, and says whether it served the SCI before in the boot, which
+tells a restarted acpid from the first one ([docs/devmgr.md](docs/devmgr.md) § Capabilities).
+Once the start-up ends, acpid arms the events:
+
+- The fixed power button, when the FADT's `PWR_BUTTON` flag is clear, and each GPE of the GPE0
+  block that has a `\_GPE._Lxx` or `_Exx` method. Every other fixed event and GPE is disabled.
+  A `_Lxx` or `_Exx` past the GPE0 block, or a second method for the same GPE, is logged and
+  not handled.
+- acpid binds the event blocks before it asks for the SCI. Unless devmgr's answer says the
+  SCI was served before, a failed answer included (devmgr records the SCI as served even when
+  its reply does not reach acpid), acpid disables every event and clears every status bit at
+  once, before anything else can fail, so the press that turned the machine on is gone before
+  devmgr would tell a later acpid that it is a restart. When the events are armed,
+  a handled event whose status is set is dispatched: it was latched after that clear, or by a
+  dead acpid of the boot that had not handled it, since a status bit is cleared only once its
+  event is handled.
+- acpid logs `events armed (...)` with the start, the SCI's GSI, whether the power button is
+  on, and the GPEs handled.
+
+The event thread blocks on the SCI's notification alone. On each SCI it reads the PM1 and GPE
+status and enable registers, disables each event whose status and enable are both set, leaving
+its status set, hands it on and acknowledges the interrupt; it runs no AML and makes no IPC. The
+evaluation thread runs each GPE's method: for `_Exx` it clears the status first, for `_Lxx`
+after the method, and then enables the GPE again. A `Notify` the method makes is logged and
+dropped ([docs/startup.md](docs/startup.md) § The host). A power-button press is logged as
+`power button pressed` and posted for `WAIT_EVENT`; its status is cleared and the button
+enabled again once a `WAIT_EVENT` reply that carries it is delivered. pwrmgr waits in
+`WAIT_EVENT` and powers the platform off on a press
+([pwrmgr](../pwrmgr/README.md#responsibilities)). RISC-V platforms have no fixed events: QEMU
+`virt`'s FADT is hardware-reduced.
 
 ---
 
@@ -126,7 +176,7 @@ boot. The checks are [docs/devmgr.md](docs/devmgr.md) § Pushes.
 | [docs/limits.md](../../docs/limits.md) | The evaluator's bounds and acpid's own |
 | [shared/aml/README.md](../../shared/aml/README.md) | The parser, namespace and evaluator acpid runs |
 | [shared/ipc/src/lib.rs](../../shared/ipc/src/lib.rs) | The `devmgr_labels` acpid calls, the `acpid_labels` it serves, and their wire contract |
-| [services/pwrmgr/README.md](../pwrmgr/README.md) | The holder of `acpid.power`; powers off and resets x86-64 through acpid |
+| [services/pwrmgr/README.md](../pwrmgr/README.md) | The holder of `acpid.power`; powers off and resets x86-64 through acpid, and waits for its power button |
 | [services/devmgr/README.md](../devmgr/README.md) | The hardware authority that grants acpid's regions and keeps its results |
 | [services/svcmgr/README.md](../svcmgr/README.md) | Launcher and supervisor; mints the `devmgr.acpi` seed and publishes `acpid.power` and `acpid.deny` |
 | [services/svctest/README.md](../svctest/README.md) | Services harness; checks what devmgr holds from acpid, the `ACPI_AUTHORITY` gate, and the `POWER_AUTHORITY` gate through `acpid.deny` |

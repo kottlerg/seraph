@@ -16,6 +16,12 @@ by acpid's recipe alone. `ACPI_AUTHORITY` gates every label acpid alone calls; d
 - on x86-64, an `IoPort` over each FADT register block it names: the PM1a event and control
   blocks, GPE0, `SMI_CMD` with the `ACPI_ENABLE` value, and `RESET_REG` when it is in
   `SystemIO` (`QUERY_ACPI_RESOURCES`). RISC-V platforms have none;
+- on x86-64, the SCI (`QUERY_ACPI_RESOURCES` with `ACPI_SCI`): an `Interrupt` capability on the
+  FADT's `SCI_INT` line, routed through the MADT's interrupt source overrides, with the line's
+  GSI and the mode it is routed in. devmgr holds the line for the boot, as it holds a shared
+  device line, and derives a capability from it on every call, so a restarted acpid takes it
+  again; the reply says whether devmgr served the SCI earlier in the boot, which tells acpid it
+  is a restart. A hardware-reduced FADT, every RISC-V platform's, has no SCI;
 - each operation region devmgr grants it (§ Region grants);
 - each configuration-space access devmgr makes for it (§ Configuration access).
 
@@ -41,9 +47,13 @@ page. devmgr refuses, and logs the refusal with the range it collides with:
   space is reachable;
 - the FACS, whose Global Lock and waking vector acpid does not own;
 - memory that no `Mmio` aperture devmgr still holds covers: RAM, runtime-services memory, ACPI
-  NVS, and the ranges devmgr has carved for itself or a driver. The apertures never cover the
-  first three ([core/boot/docs/firmware-parsing.md](../../../core/boot/docs/firmware-parsing.md)
-  § Firmware exclusion).
+  NVS, the ranges devmgr has carved for itself or a driver, and the BAR pages it holds for the
+  functions behind a managed hotplug slot
+  ([devmgr's hotplug.md](../../devmgr/docs/hotplug.md#add-job) § Add Job). The apertures never
+  cover the first three
+  ([core/boot/docs/firmware-parsing.md](../../../core/boot/docs/firmware-parsing.md) § Firmware
+  exclusion). A hot-added BAR is placed only in what the apertures hold, so it never lands on a
+  page granted here.
 
 A port grant is an `IoPort` over exactly the range. A memory grant is an `Mmio` over one page,
 carved from an aperture; a memory request that crosses a page boundary is invalid. devmgr keeps
@@ -120,8 +130,9 @@ svctest reads it on every boot.
 
 ## Ordering
 
-`QUERY_ACPI_RESOURCES` is answered on the registry worker that receives it, from the FADT
-alone. Every other acpid request runs on devmgr's control thread, which owns the device records,
+`QUERY_ACPI_RESOURCES` for a register block is answered on the registry worker that receives
+it, from the FADT alone. The SCI and every other acpid request run on devmgr's control thread,
+which owns the interrupt lines, which owns the device records,
 the apertures and the configuration space: a region check and its carve, a configuration access
 and a push are decided against records no bind changes meanwhile. A request waits while the
 control thread runs a bind pass and its settle. devmgr never calls acpid, so a dead or stalled

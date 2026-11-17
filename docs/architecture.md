@@ -109,13 +109,13 @@ and delegates per-device capabilities. See
 
 **pwrmgr**
 Power manager. Owns the platform shutdown surface and serves
-`SHUTDOWN` / `REBOOT` IPC. See
+`SHUTDOWN` / `REBOOT` IPC; on x86-64 it powers off on the power button. See
 [`services/pwrmgr/README.md`](../services/pwrmgr/README.md).
 
 **acpid**
 ACPI service. Runs the firmware's AML on every boot and pushes each PCI host bridge's `_OSC`
 result, windows and routes to devmgr; devmgr evaluates none. It also serves pwrmgr's S5 power-off
-and reset. See
+and reset, and on x86-64 takes the SCI and reports the power button to pwrmgr. See
 [`services/acpid/README.md`](../services/acpid/README.md).
 
 **timed**

@@ -18,6 +18,12 @@
 //! a request acpid carried out without the platform acting within
 //! [`crate::await_reset`]'s grace, a routine logs and returns, and the
 //! caller (`main`) replies `pwrmgr_errors::INVALID_REQUEST`.
+//!
+//! The power button reaches pwrmgr through acpid too: a thread of its own
+//! ([`watch_events`]) waits in [`acpid_labels::WAIT_EVENT`] and powers
+//! off on a press, as `SHUTDOWN` does.
+
+use std::time::Duration;
 
 use crate::caps::{Bootstrap, drop_unused};
 use ipc::{IpcMessage, acpid_errors, acpid_labels};
@@ -29,7 +35,13 @@ use ipc::{IpcMessage, acpid_errors, acpid_labels};
 /// blocked (on a dead devmgr, say) fails the request after it.
 const ACPID_CALL_TIMEOUT_MS: u32 = 30_000;
 
+/// How long the event thread waits before it calls `WAIT_EVENT` again
+/// after a call that failed in transit: acpid died holding it, and svcmgr
+/// restarts acpid on the same endpoint.
+const WAIT_EVENT_RETRY: Duration = Duration::from_secs(1);
+
 /// Resolved actuation state: the `acpid.power` SEND.
+#[derive(Clone, Copy)]
 pub struct Actuator
 {
     acpid: u64,
@@ -70,6 +82,64 @@ pub fn shutdown(act: &Actuator, ipc_buf: *mut u64)
 pub fn reboot(act: &Actuator, ipc_buf: *mut u64)
 {
     call(act, acpid_labels::RESET, 0, "reboot", ipc_buf);
+}
+
+/// Watch the power button: spawn the event thread, which waits in acpid's
+/// `WAIT_EVENT` for pwrmgr's lifetime and powers off on a press. A thread
+/// that cannot be spawned is logged, and pwrmgr serves without it.
+pub fn watch_events(act: Actuator)
+{
+    let spawned = std::thread::Builder::new()
+        .name("pwrmgr-events".into())
+        .spawn(move || events(&act));
+    if let Err(e) = spawned
+    {
+        std::os::seraph::log!(error: "power-button thread not spawned: {e}");
+    }
+}
+
+/// The event thread: call `WAIT_EVENT` with no bound, and on the power
+/// button power off as `SHUTDOWN` does. A call that fails in transit is
+/// made again after [`WAIT_EVENT_RETRY`], and a superseded one at once; any
+/// other reply (acpid has no event to wait for, or refuses the call) ends
+/// the thread, logged.
+fn events(act: &Actuator)
+{
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    std::os::seraph::log!("watching the power button");
+    let msg = IpcMessage::builder(acpid_labels::WAIT_EVENT)
+        .word(0, u64::from(ipc::ACPID_LABELS_VERSION))
+        .build();
+    loop
+    {
+        // SAFETY: `current_ipc_buf` is this thread's registered IPC buffer.
+        match unsafe { ipc::ipc_call(act.acpid, &msg, ipc_buf) }
+        {
+            Ok(reply) if reply.label == acpid_errors::SUCCESS =>
+            {
+                if reply.word(0) & acpid_labels::EVENT_POWER_BUTTON != 0
+                {
+                    std::os::seraph::log!("power button: shutting down");
+                    shutdown(act, ipc_buf);
+                }
+            }
+            Ok(reply) if reply.label == acpid_errors::SUPERSEDED =>
+            {}
+            Ok(reply) =>
+            {
+                std::os::seraph::log!(
+                    "not watching the power button (acpid replied {:#x})",
+                    reply.label
+                );
+                return;
+            }
+            Err(e) =>
+            {
+                std::os::seraph::log!(warn: "WAIT_EVENT failed (err={e}); calling again");
+                std::thread::sleep(WAIT_EVENT_RETRY);
+            }
+        }
+    }
 }
 
 /// Call acpid's `label` with `arg` in `data[1]`, bounded by

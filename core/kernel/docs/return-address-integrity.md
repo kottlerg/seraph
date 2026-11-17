@@ -166,9 +166,10 @@ extension, as § Verification Record cites them.
     ([docs/platform-requirements.md](../../../docs/platform-requirements.md) § riscv64
     Classification states both conditions).
 
-  The kernel keeps `senvcfg.SSE` clear, so U-mode cannot access `ssp` and runs Zicfiss
-  instructions as no-ops. `SYS_SBI_CALL` keeps refusing the FWFT extension (`syscall/sbi.rs`),
-  since a forwarded FWFT call would reach this setting.
+  The kernel writes `senvcfg` whole with 0 on every hart (`interrupts::set_user_controls`), so
+  `senvcfg.SSE` is clear: U-mode cannot access `ssp` and runs Zicfiss instructions as no-ops.
+  `SYS_SBI_CALL` keeps refusing the FWFT extension (`syscall/sbi.rs`), since a forwarded FWFT
+  call would reach this setting.
 - **Shadow-stack memory.** Each kernel stack gets a shadow stack: one 4 KiB page per Thread,
   carved from the Thread retype slot (`sched/thread_slot.rs`), and one per idle stack and for the
   handoff stack. Its direct-map leaf becomes an SS page (`R=0`, `W=1`, `X=0`), so no ordinary
@@ -294,8 +295,9 @@ shadow stacks on or off.
   stack, and `IRET` checks them, so no handler may resume a ring-0 frame at a different address:
   a fault inside `copy_user` ends the copy in place (`rcx` 0, `rax` the bytes left) instead of
   moving `rip` to a fixup. `#DF`, `#MC` (IST1), and NMI (IST2) switch to the per-CPU IST shadow
-  stack the interrupt SSP table names. User mode runs without shadow stacks: `IA32_U_CET` stays
-  0.
+  stack the interrupt SSP table names. User mode runs without shadow stacks: the kernel writes
+  `IA32_U_CET` 0 on every CPU that has CET (`cpu::set_user_msr_controls`;
+  [cross-boundary-disclosure.md](cross-boundary-disclosure.md) § User-mode hardware controls).
 - **Faults.** A mismatch raises the control-protection fault (`#CP`, vector 21): error code 1
   for `RET`, 2 for `IRET`, 4 for `RSTORSSP`, 5 for `SETSSBSY`. It is a kernel fault and halts
   with the kernel exception report. Whenever `CR4.CET` is set, that report ends with the CPU's

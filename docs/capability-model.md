@@ -94,7 +94,14 @@ scaling, and DRAM rows. The system draws the line as follows.
   an `hpmcounter` raises an illegal-instruction exception. On x86-64 it clears `CR4.TSD` and
   `CR4.PCE`: ring 3 reads the timestamp counter (`RDTSC`, `RDTSCP`), and `RDPMC` raises `#GP`
   there. Capability-mediated performance-counter access is design intent, not yet implemented
-  ([#265](https://github.com/kottlerg/seraph/issues/265)). These controls, and the gating of the
+  ([#265](https://github.com/kottlerg/seraph/issues/265)). The kernel sets every other
+  user-mode control on every CPU the same way (§ User-mode hardware controls of
+  [core/kernel/docs/cross-boundary-disclosure.md](../core/kernel/docs/cross-boundary-disclosure.md)),
+  and user code relies on what they give it: on x86-64 `RDTSCP` and `RDPID` return 0 as the
+  processor identifier on every CPU, so it names no CPU, `CPUID` executes at ring 3,
+  `RFLAGS.AC` enables no alignment checking, and protection keys, Key Locker, user interrupts
+  and a user shadow stack are absent; on riscv64 U-mode has no cache-block operation, pointer
+  masking, landing pads or shadow stack. These controls, and the gating of the
   counters, need security domains
   ([#152](https://github.com/kottlerg/seraph/issues/152)): without a notion of domain the only
   policy treats every address space as its own domain, which in a microkernel puts a predictor

@@ -8,7 +8,8 @@
 //! Sets up the supervisor-mode trap infrastructure:
 //! 1. Installs `trap_entry` in `stvec` (direct mode).
 //! 2. Clears `sstatus.SIE`, `sstatus.SPP`, `sstatus.SUM` for a clean initial state.
-//! 3. Enables `sie.SSIP` (IPIs), `sie.STIP` (timer), and `sie.SEIP` (external) bits.
+//! 3. Enables `sie.SSIP` (IPIs), `sie.STIP` (timer), and `sie.SEIP` (external) bits,
+//!    and writes the U-mode controls `scounteren` and `senvcfg` whole.
 //! 4. Brings up AIA ([`super::aia`]): the APLIC domain in MSI delivery mode and
 //!    each hart's IMSIC interrupt file.
 //!
@@ -1280,20 +1281,42 @@ const SCOUNTEREN_CY: u64 = 1 << 0;
 #[cfg(not(test))]
 const USER_COUNTERS: u64 = SCOUNTEREN_CY;
 
-/// Write this hart's `scounteren` whole with [`USER_COUNTERS`], replacing
-/// every bit the firmware left, so each hart grants U-mode the same counters.
+/// The U-mode environment controls, as the `senvcfg` value: none granted.
+/// `CBZE`, `CBCFE` and `CBIE` clear make every U-mode cache-block operation
+/// (`cbo.zero`, `cbo.clean`, `cbo.flush`, `cbo.inval`) raise an
+/// illegal-instruction exception; `cbo.inval` would otherwise discard a
+/// block's dirty data and expose what memory held below it. `PMM` clear turns
+/// pointer masking off, `LPE` and `SSE` clear keep the landing-pad and
+/// shadow-stack enforcement and the `ssp` CSR from U-mode, and `FIOM` clear
+/// keeps fences on I/O and memory separate. A field whose extension the hart
+/// lacks is read-only zero, so the value is the same on every hart.
+#[cfg(not(test))]
+const USER_ENVCFG: u64 = 0;
+
+/// Write this hart's `scounteren` whole with [`USER_COUNTERS`] and its
+/// `senvcfg` whole with [`USER_ENVCFG`], replacing every bit the firmware or
+/// reset left, so each hart grants U-mode the same counters and environment
+/// controls.
+///
+/// Both CSRs exist on every hart the RVA23 floor admits (Privileged
+/// Architecture 1.13, `Ss1p13`); a hart without `senvcfg` stops at the
+/// kernel's fatal illegal-instruction trap at the write.
 ///
 /// # Safety
 /// Must execute in supervisor mode on the hart being initialised.
 #[cfg(not(test))]
-unsafe fn set_user_counters()
+unsafe fn set_user_controls()
 {
-    // SAFETY: csrw scounteren is a privileged S-mode instruction on a per-hart
-    // register that gates U-mode counter reads only; caller ensures S-mode.
+    // SAFETY: csrw scounteren and csrw senvcfg (CSR 0x10A, written by number)
+    // are privileged S-mode instructions on per-hart registers that gate
+    // U-mode counter reads and U-mode environment features only; caller
+    // ensures S-mode.
     unsafe {
         core::arch::asm!(
             "csrw scounteren, {grant}",
+            "csrw 0x10A, {envcfg}",
             grant = in(reg) USER_COUNTERS,
+            envcfg = in(reg) USER_ENVCFG,
             options(nostack, nomem),
         );
     }
@@ -1369,9 +1392,10 @@ pub unsafe fn init()
         );
     }
 
-    // Grant U-mode the counters of USER_COUNTERS, and only them.
+    // Grant U-mode the counters of USER_COUNTERS, and only them, and none of
+    // the environment controls of senvcfg.
     // SAFETY: caller ensures S-mode on the BSP.
-    unsafe { set_user_counters() };
+    unsafe { set_user_controls() };
 
     // Bring up AIA: the APLIC domain (every source inactive and disabled,
     // whatever firmware left enabled) and the BSP's IMSIC file. The BSP's
@@ -1397,7 +1421,7 @@ pub unsafe fn init()
 #[cfg(not(test))]
 pub unsafe fn init_ap()
 {
-    // The CSR operations below on stvec, sscratch, sstatus, sie and scounteren
+    // The CSR operations below on stvec, sscratch, sstatus, sie, scounteren and senvcfg
     // are S-mode privileged instructions on per-hart registers; the caller
     // (kernel_entry_ap) ensures execution in S-mode on the AP hart.
 
@@ -1452,9 +1476,10 @@ pub unsafe fn init_ap()
         );
     }
 
-    // Grant U-mode the same counters as the BSP; scounteren is per-hart.
+    // Grant U-mode the same counters and environment controls as the BSP;
+    // scounteren and senvcfg are per-hart.
     // SAFETY: S-mode on this AP (caller contract).
-    unsafe { set_user_counters() };
+    unsafe { set_user_controls() };
 
     // Initialise this hart's IMSIC file (by hart id; percpu::init_ap installed
     // `tp` before this call, so current_cpu() is valid). Firmware may have left

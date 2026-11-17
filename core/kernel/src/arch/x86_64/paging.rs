@@ -76,8 +76,8 @@ const NO_EXECUTE: u64 = 1 << 63;
 const POOLED_TABLE: u64 = 1 << 9;
 /// Software bit of a user 4 KiB leaf: its [`LeafGrant`] holds write. Bits
 /// \[58:52\] of a PTE are ignored by the processor, and \[62:59\] too while
-/// `CR4.PKE` is clear, which the kernel never sets; the user mapping path
-/// installs no large leaf. See
+/// `CR4.PKE` is clear, which the kernel ensures on every CPU
+/// (`cpu::enable_smep_smap`); the user mapping path installs no large leaf. See
 /// [memory-internals.md](../../../docs/memory-internals.md) § Leaf Grant.
 const GRANT_WRITE: u64 = 1 << 52;
 /// Software bit of a user 4 KiB leaf: its [`LeafGrant`] holds execute

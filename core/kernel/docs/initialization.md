@@ -333,10 +333,14 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
 
 ```
 1. Enable SMEP and SMAP in CR4 (fatal if CPUID lacks either; both are required and
-   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear CR4.FSGSBASE,
-   CR4.TSD and CR4.PCE, so ring 3 reads the timestamp counter and no performance counter
-   (each AP repeats this step in interrupts::init_ap)
-2. Enable XSAVE (x87 | SSE | AVX in XCR0) and set CR0.TS for lazy FPU/SIMD save-restore
+   already gated in Phase 1), set CR4.UMIP where CPUID reports it, and clear every CR4
+   control ring 3 reaches that the kernel does not grant (VME, PVI, TSD, PCE, FSGSBASE, KL,
+   PKE, UINTR) and PKS, so ring 3 reads the timestamp counter and no performance counter,
+   and has no virtual interrupts, Key Locker, protection keys or user interrupts (each AP
+   repeats this step in interrupts::init_ap)
+2. Enable XSAVE (x87 | SSE | AVX in XCR0), set CR0.MP and CR0.NE and clear CR0.EM and
+   CR0.AM (x87 errors as #MF, #NM for WAIT under TS, no ring-3 alignment checking), and
+   set CR0.TS for lazy FPU/SIMD save-restore
 3. Construct and install the permanent GDT and the BSP's TSS (the segment descriptors are
    loaded since Phase 1; this fills the TSS descriptor and loads the table again with it):
    - Null descriptor (index 0)
@@ -356,6 +360,9 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    - TLB-shootdown (250) and wakeup (251) IPI vectors
    - Device IRQ vectors 33–249, one generated stub each; a vector is assigned to a GSI when
      the GSI is routed (`SYS_IRQ_ROUTE`)
+   Then set the user-visible MSR controls (`cpu::set_user_msr_controls`): IA32_TSC_AUX = 0
+   where CPUID reports RDTSCP or RDPID, CPUID faulting off where the CPU has it, and
+   IA32_U_CET = 0 where it has CET (each AP repeats this in interrupts::init_ap)
 5. Switch to x2APIC mode where CPUID advertises it, software-enable the BSP local APIC
    with every LVT masked, and mask every I/O APIC entry
 6. When Phase 4 decided the kernel runs on shadow stacks, give the handoff stack a shadow
@@ -364,8 +371,8 @@ Architecture-specific hardware initialization; x86-64 and RISC-V diverge here.
    IA32_S_CET.SH_STK_EN, and run `setssbsy` (`shadow_stack::prepare_boot_cpu`,
    `shadow_stack::enable`; [return-address-integrity.md](return-address-integrity.md)
    § x86-64 Mechanism). Emit "shadow stacks: on"
-7. Configure SYSCALL/SYSRET: set EFER.SCE; write LSTAR, STAR, SFMASK (clears IF, TF, DF, AC,
-   NT and IOPL on entry)
+7. Configure SYSCALL/SYSRET: set EFER.SCE and clear EFER.LMSLE and EFER.UAIE; write LSTAR,
+   STAR, SFMASK (clears IF, TF, DF, AC, NT and IOPL on entry)
 8. Configure the preemption timer at a fixed 1 ms period (`timer::init(1_000)`):
    TSC-deadline mode where CPUID advertises it, periodic APIC timer otherwise
 9. Enable interrupts (STI)
@@ -389,8 +396,10 @@ kernel code, per [arch-interface.md](arch-interface.md) § `cpu`.
    - Clear SUM (no supervisor access to user pages)
    - Set FS and VS Off for lazy FPU/vector save-restore
 3. Enable SSIP, STIP, SEIP in sie (software-IPI, timer, and external interrupt enables)
-4. Write scounteren whole with CY alone, whatever the firmware left, so U-mode reads the
-   cycle counter and no other (each AP writes the same in interrupts::init_ap)
+4. Write scounteren whole with CY alone and senvcfg whole with 0, whatever the firmware
+   left, so U-mode reads the cycle counter and no other, and has no cache-block operation,
+   pointer masking, landing pads or shadow stack (each AP writes the same in
+   interrupts::init_ap)
 5. Initialise AIA (`aia::init_bsp`): halt unless every hart advertises Ssaia
    (`HART_CAP_SSAIA`) and the bootloader reported a supervisor-level APLIC domain
    (`BootInfo.kernel_mmio.aplic`) of 1..=1023 sources with a register window of at least

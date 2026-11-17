@@ -44,7 +44,9 @@ table on the same endpoint object — svcmgr holds the master-log source
 for the system's life, so the restarted logd's RECV re-attaches to the
 object every sender already targets (see
 [`service-definitions.md` § `log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)).
-In-flight history from the prior instance is not recoverable.
+In-flight history from the prior instance is not recoverable, and neither
+are the senders' display names: each sender registers its name once, at
+startup, so its lines render as `[?]` once logd has restarted.
 
 ## Startup ordering
 

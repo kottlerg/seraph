@@ -29,8 +29,10 @@ pub mod x86_paging;
 
 pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_address};
 
-/// Current boot protocol version. Increment when `BootInfo` layout or the
-/// CPU entry contract changes in a non-backwards-compatible way.
+/// Current boot protocol version. Increment on every breaking change to the
+/// protocol: the `BootInfo` layout, what a field holds, a requirement on a
+/// compliant bootloader, or the CPU entry contract
+/// (docs/conventions.md § ABI / wire-protocol versions).
 ///
 /// The kernel enforces **strict equality** against this constant at entry:
 /// any mismatch — including a bootloader that is layout-compatible but
@@ -159,8 +161,9 @@ pub use layout::{collect_mmio_direct_map_regions, direct_map_ceiling, max_ram_ad
 ///     verified the kernel and the bundle against, named
 ///     [`TRUST_STORE_MODULE`] in pages of its own, so `modules` is never
 ///     empty and the bundle supplies at most `MAX_BOOT_MODULES - 1` modules.
-///     A module's `size` is its whole signed object, signature trailer
-///     included. No layout change.
+///     A bundle module's `size` is its whole signed object, signature
+///     trailer included; the trust store's is the store's own length. No
+///     layout change.
 pub const BOOT_PROTOCOL_VERSION: u32 = 22;
 
 // ── Memory map ───────────────────────────────────────────────────────────────

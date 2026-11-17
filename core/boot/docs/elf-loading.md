@@ -198,7 +198,7 @@ Boot modules are flat binary images for early userspace services (e.g.
 procmgr, devmgr), and the text platform description tables devmgr reads
 ([driver-binding.md](../../../docs/driver-binding.md#platform-description-tables)
 § Platform Description Tables). The bootloader does not open per-module files —
-every module body is already inside the bundle that
+every bundle module body is already inside the bundle that
 [Boot Flow § Step 2](boot-flow.md#step-2-load-bootstrap-bundle) loads. Per
 module, the bootloader's bundle walker:
 
@@ -230,9 +230,10 @@ and is responsible for validating and starting each service.
 The bundle is the single boot-module container. Adding a new boot
 module is a bundle-composer change in
 [`xtask/src/bundle.rs`](../../../xtask/src/bundle.rs); the bootloader
-binary needs no change. `BootInfo.modules.count` accurately reflects
-the bundle's non-`init` entry count; the kernel and init iterate it
-without assuming a fixed count or fixed ordering, and init looks
+binary needs no change. `BootInfo.modules.count` is the bundle's
+non-`init` entry count plus one, the `trust-store` module, which is
+always last; the kernel iterates the modules without assuming a fixed
+count or ordering, and init looks
 modules up by name via `InitInfo::module_names` rather than by
 ordinal ([init bootstrap.md](../../../services/init/docs/bootstrap.md#initial-cspace-at-_start)).
 

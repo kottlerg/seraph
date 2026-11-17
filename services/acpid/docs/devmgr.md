@@ -60,9 +60,12 @@ aborts ([startup.md](startup.md) § Failures).
 A `PCI_Config` field access is one `ACPI_PCI_CONFIG` call. devmgr allows a read of any
 function: one no device record holds, or a removed one, reads all-ones without an access, as an
 absent function does. It allows a write only at offset 0x40 and above, past the header whose
-BARs, Command register and bus numbers devmgr programs, of a function whose record no driver has
-been started for. Any other write is refused and logged. The access runs on devmgr's control
-thread (§ Ordering), so no bind of the function interleaves with it.
+BARs, Command register and bus numbers devmgr programs, of a function whose record is unbound: no
+driver has been started for it, and devmgr has not taken it as a RISC-V IOMMU unit, whose memory
+decode and bus mastering it turned on for the IOMMU driver, or as the port of a hotplug slot it
+manages, whose Slot Control and Slot Status its poller writes. Any other write is refused and
+logged. The access runs on devmgr's control thread (§ Ordering), so no bind of the function
+interleaves with it.
 
 ---
 
@@ -103,6 +106,10 @@ check counts the boot functions it covered.
 devmgr keeps the first windows and the first table of each mode that pass, and the first
 `_OSC` result, for the boot. A later push equal to the held one is accepted; one that differs
 is logged and the held one stays, so a restarted acpid cannot change what devmgr acts on.
+devmgr acts on the held `_OSC` result for PCI Express native hotplug alone: it manages a slot
+below the bridge only when the control dword grants native hotplug control, or the platform
+description table does
+([services/devmgr/docs/hotplug.md](../../devmgr/docs/hotplug.md#event-sources) § Event Sources).
 
 `QUERY_HOST_BRIDGE(ordinal)`, under `REGISTRY_QUERY_AUTHORITY`, serves what devmgr holds per
 bridge, in segment then bus order: the `_OSC` status and control, whether the routes and the

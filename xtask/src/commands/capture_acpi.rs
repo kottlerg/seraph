@@ -118,6 +118,17 @@ const fn ram_base(arch: Arch) -> u64
     }
 }
 
+/// The VM Generation ID device a capture boots with: q35's, which adds its
+/// SSDT; `virt` has none.
+fn vmgenid_guid(arch: Arch) -> Option<&'static str>
+{
+    match arch
+    {
+        Arch::X86_64 => Some("auto"),
+        Arch::Riscv64 => None,
+    }
+}
+
 pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
 {
     let name = config_name(args.config);
@@ -165,11 +176,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         display: QemuDisplay::Headless,
         gdb: GdbMode::Off,
         qmp_socket: Some(&sock),
-        vmgenid_guid: match arch
-        {
-            Arch::X86_64 => Some("auto"),
-            Arch::Riscv64 => None,
-        },
+        vmgenid_guid: vmgenid_guid(arch),
         incoming: None,
         riscv_mmu: RiscvMmu::Sv48,
         riscv_zkr: RiscvZkr::On,
@@ -178,6 +185,7 @@ pub fn run(ctx: &Context, args: &CaptureAcpiArgs) -> Result<()>
         iommu: Iommu::Attached,
         debug_port: None,
         test_devices: true,
+        hotplug_port: None,
     };
     let mut qemu_args = build_qemu_argv(&spec)?;
     qemu_args.extend(config_args(args.config).iter().map(|a| (*a).to_owned()));

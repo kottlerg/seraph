@@ -921,9 +921,10 @@ impl Creator
 {
     /// The un-badged creator (badge `0`): init, which creates devmgr, vfsd
     /// and svcmgr, or a create svcmgr sends on its un-badged mint source.
-    /// Its ceiling is the full baseline band, its children are top-level
-    /// reserve nodes (init's own record parents no process), and it may ask
-    /// for a phys-class child.
+    /// Its ceiling is the full baseline band, its children not charged to a
+    /// node handle are top-level reserve nodes (init's own record parents no
+    /// process), a charged child sits under the handle's node outside the
+    /// reserve, and it may ask for a phys-class child.
     pub const UNBADGED: Creator = Creator {
         band_max: ipc::sched_policy::BASELINE_PRIORITY_MAX,
         memmgr_badge: 0,
@@ -956,6 +957,15 @@ pub struct ChildBudget
     /// The max in pages the creator asked for (`REGISTER_MAX`, `data[3]`);
     /// `None` for no max.
     pub max: Option<u64>,
+    /// The creator asked for the child's node handle
+    /// (`procmgr_labels::CREATE_NODE_HANDLE`, `REGISTER_NODE_HANDLE`).
+    pub node_handle: bool,
+    /// Slot in procmgr's `CSpace` of the node handle a
+    /// `procmgr_labels::CREATE_CHARGE_NODE` request carries, under whose node
+    /// the child's node goes in place of [`ChildBudget::parent`]'s
+    /// (`REGISTER_CHARGE_NODE`); `0` for none. [`child_budget`] leaves it
+    /// `0`, and the create handler sets it from the request's caps.
+    pub charge: u64,
 }
 
 impl ChildBudget
@@ -964,7 +974,10 @@ impl ChildBudget
     #[must_use]
     pub fn register_flags(&self) -> u64
     {
-        use ipc::memmgr_labels::{REGISTER_MAX, REGISTER_PHYS_CLASS, REGISTER_RESERVE};
+        use ipc::memmgr_labels::{
+            REGISTER_CHARGE_NODE, REGISTER_MAX, REGISTER_NODE_HANDLE, REGISTER_PHYS_CLASS,
+            REGISTER_RESERVE,
+        };
         let mut flags = 0;
         if self.phys
         {
@@ -978,6 +991,14 @@ impl ChildBudget
         {
             flags |= REGISTER_MAX;
         }
+        if self.node_handle
+        {
+            flags |= REGISTER_NODE_HANDLE;
+        }
+        if self.charge != 0
+        {
+            flags |= REGISTER_CHARGE_NODE;
+        }
         flags
     }
 }
@@ -989,7 +1010,8 @@ pub enum BudgetRefusal
 {
     /// `CREATE_PHYS_ACCESS` from a creator that is not phys-class.
     PhysAccess,
-    /// `CREATE_RESERVE` from a creator whose node is outside the reserve.
+    /// `CREATE_RESERVE` from a creator whose node is outside the reserve, or
+    /// with `CREATE_CHARGE_NODE`.
     Reserve,
     /// `CREATE_MEMORY_MAX` without its data word delivered.
     MissingMax,
@@ -1003,8 +1025,10 @@ pub enum BudgetRefusal
 /// creator). `procmgr_labels::CREATE_PHYS_ACCESS` asks for a phys-class
 /// child, honoured only from a phys-class creator ([`Creator::phys_class`]).
 /// `procmgr_labels::CREATE_RESERVE` asks for a reserve node, honoured only
-/// from a creator whose own node is a reserve node; a child of the un-badged
-/// creator is a reserve node with or without it.
+/// from a creator whose own node is a reserve node and never with
+/// `procmgr_labels::CREATE_CHARGE_NODE`, whose node may be a sub-node, which
+/// is never in the reserve; a child of the un-badged creator not charged to a
+/// node handle is a reserve node with or without it.
 ///
 /// # Errors
 /// [`BudgetRefusal::PhysAccess`] or [`BudgetRefusal::Reserve`] when the
@@ -1015,22 +1039,27 @@ pub fn child_budget(
     creator: &Creator,
 ) -> Result<ChildBudget, BudgetRefusal>
 {
-    use ipc::procmgr_labels::{CREATE_PHYS_ACCESS, CREATE_RESERVE};
+    use ipc::procmgr_labels::{
+        CREATE_CHARGE_NODE, CREATE_NODE_HANDLE, CREATE_PHYS_ACCESS, CREATE_RESERVE,
+    };
     let phys = label & CREATE_PHYS_ACCESS != 0;
     if phys && !creator.phys_class()
     {
         return Err(BudgetRefusal::PhysAccess);
     }
     let asks_reserve = label & CREATE_RESERVE != 0;
-    if asks_reserve && !creator.reserve
+    let charged = label & CREATE_CHARGE_NODE != 0;
+    if asks_reserve && (!creator.reserve || charged)
     {
         return Err(BudgetRefusal::Reserve);
     }
     Ok(ChildBudget {
         phys,
-        reserve: asks_reserve || creator.unbadged,
+        reserve: asks_reserve || (creator.unbadged && !charged),
         parent: creator.memmgr_badge,
         max,
+        node_handle: label & CREATE_NODE_HANDLE != 0,
+        charge: 0,
     })
 }
 
@@ -2556,6 +2585,8 @@ mod tests
                     reserve: true,
                     parent: 0,
                     max: None,
+                    node_handle: false,
+                    charge: 0,
                 })
             );
         }
@@ -2585,19 +2616,62 @@ mod tests
                 reserve: false,
                 parent: 0x52,
                 max: Some(9),
+                node_handle: false,
+                charge: 0,
             })
+        );
+        // Any creator may ask for its child's node handle.
+        assert_eq!(
+            child_budget(ipc::procmgr_labels::CREATE_NODE_HANDLE, None, &client)
+                .map(|b| (b.node_handle, b.charge)),
+            Ok((true, 0))
         );
     }
 
     #[test]
-    fn register_flags_name_the_class_the_reserve_and_the_max()
+    fn a_child_charged_to_a_node_handle_is_outside_the_reserve()
     {
-        use ipc::memmgr_labels::{REGISTER_MAX, REGISTER_PHYS_CLASS, REGISTER_RESERVE};
+        use ipc::procmgr_labels::{CREATE_CHARGE_NODE, CREATE_RESERVE};
+        // Not even a reserve creator may ask for a reserve child charged to
+        // a handle: the handle's node may be a sub-node, never in the reserve.
+        let svcmgr = entry_creator(0x51);
+        assert_eq!(
+            child_budget(CREATE_RESERVE | CREATE_CHARGE_NODE, None, &svcmgr),
+            Err(BudgetRefusal::Reserve)
+        );
+        assert_eq!(
+            child_budget(
+                CREATE_RESERVE | CREATE_CHARGE_NODE,
+                None,
+                &Creator::UNBADGED
+            ),
+            Err(BudgetRefusal::Reserve)
+        );
+        // A charged child of the un-badged creator is not a reserve node.
+        assert_eq!(
+            child_budget(CREATE_CHARGE_NODE, None, &Creator::UNBADGED).map(|b| b.reserve),
+            Ok(false)
+        );
+        assert_eq!(
+            child_budget(CREATE_CHARGE_NODE, None, &svcmgr).map(|b| b.reserve),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn register_flags_name_the_class_the_reserve_the_max_and_the_handle()
+    {
+        use ipc::memmgr_labels::{
+            REGISTER_CHARGE_NODE, REGISTER_MAX, REGISTER_NODE_HANDLE, REGISTER_PHYS_CLASS,
+            REGISTER_RESERVE,
+        };
         let budget = ChildBudget {
             phys: false,
             reserve: false,
             parent: 0,
             max: None,
+            node_handle: false,
+            charge: 0,
         };
         assert_eq!(budget.register_flags(), 0);
         let full = ChildBudget {
@@ -2605,10 +2679,16 @@ mod tests
             reserve: true,
             parent: 7,
             max: Some(0),
+            node_handle: true,
+            charge: 5,
         };
         assert_eq!(
             full.register_flags(),
-            REGISTER_PHYS_CLASS | REGISTER_RESERVE | REGISTER_MAX
+            REGISTER_PHYS_CLASS
+                | REGISTER_RESERVE
+                | REGISTER_MAX
+                | REGISTER_NODE_HANDLE
+                | REGISTER_CHARGE_NODE
         );
     }
 

@@ -3,10 +3,13 @@
 
 // services/memmgr/free-pool/src/index.rs
 
-//! Badge-keyed process index: a linear hash over arena-resident records.
+//! Badge-keyed process index: a linear hash over arena-resident records and
+//! budget-node handle states.
 //!
-//! Records are [`Node::Process`] slots in the [`Arena`], chained per bucket
-//! through their slot `next` link. The bucket array is a [`WordStore`] of
+//! Records are [`Node::Process`] slots in the [`Arena`], keyed by their
+//! badge, and handle states [`Node::Handle`] slots, keyed by the badge their
+//! node handles carry ([`key_of`]); each is chained per bucket through its
+//! slot `next` link. The bucket array is a [`WordStore`] of
 //! bucket heads that only grows, one page of buckets at a time; linear
 //! hashing splits one bucket per step, so growth never rehashes the whole
 //! table and the array stays append-only. When the owner cannot add bucket
@@ -49,6 +52,30 @@ const fn hash(badge: u64) -> u64
     badge.wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(32)
 }
 
+/// The key the index files a slot under: a record's badge, or the badge a
+/// handle state's node handles carry; `None` for any other payload. One key
+/// names one slot: the owner draws each new key off every key in use.
+#[must_use]
+pub const fn key_of(node: &Node) -> Option<u64>
+{
+    match node
+    {
+        Node::Process(rec) => Some(rec.badge),
+        Node::Handle(h) => Some(h.key),
+        Node::Free
+        | Node::Run(_)
+        | Node::Deferred(_)
+        | Node::Budget(_)
+        | Node::Region(_)
+        | Node::Frame(_)
+        | Node::ChunkDir(_)
+        | Node::Chunk(_)
+        | Node::Caps(_)
+        | Node::Commit(_)
+        | Node::Limit(_) => None,
+    }
+}
+
 /// The index state: bucket storage plus the linear-hash split state.
 pub struct ProcessIndex<W>
 {
@@ -77,14 +104,14 @@ impl<W: WordStore> ProcessIndex<W>
         }
     }
 
-    /// Records indexed.
+    /// Slots indexed: records and handle states.
     #[must_use]
     pub const fn len(&self) -> u64
     {
         self.count
     }
 
-    /// Whether no record is indexed.
+    /// Whether no slot is indexed.
     #[must_use]
     pub const fn is_empty(&self) -> bool
     {
@@ -169,7 +196,7 @@ impl<W: WordStore> ProcessIndex<W>
         }
     }
 
-    /// The record slot keyed by `badge`.
+    /// The slot keyed by `badge`: a record or a handle state ([`key_of`]).
     #[must_use]
     pub fn find<S: SlotStore>(&self, arena: &Arena<S>, badge: u64) -> Option<NodeIdx>
     {
@@ -181,26 +208,18 @@ impl<W: WordStore> ProcessIndex<W>
         while cur != NODE_NULL
         {
             let slot = arena.get(cur);
-            match slot.node
+            match key_of(&slot.node)
             {
-                Node::Process(rec) if rec.badge == badge => return Some(cur),
-                Node::Process(_) => cur = slot.next,
-                Node::Free
-                | Node::Run(_)
-                | Node::Deferred(_)
-                | Node::Budget(_)
-                | Node::Region(_)
-                | Node::Frame(_)
-                | Node::ChunkDir(_)
-                | Node::Chunk(_)
-                | Node::Caps(_)
-                | Node::Commit(_) => return None,
+                Some(key) if key == badge => return Some(cur),
+                Some(_) => cur = slot.next,
+                None => return None,
             }
         }
         None
     }
 
-    /// Call `f` with the slot of every indexed record, bucket by bucket.
+    /// Call `f` with every indexed slot (record or handle state), bucket by
+    /// bucket.
     pub fn for_each<S: SlotStore>(&self, arena: &Arena<S>, mut f: impl FnMut(NodeIdx))
     {
         for bucket in 0..self.buckets().min(self.capacity)
@@ -214,12 +233,12 @@ impl<W: WordStore> ProcessIndex<W>
         }
     }
 
-    /// Index the record slot `idx` (which holds a [`Node::Process`] whose
-    /// badge no indexed record shares). Returns `false`, indexing nothing,
-    /// when the index has no bucket storage or the slot holds no record.
+    /// Index the keyed slot `idx` (a record or a handle state, [`key_of`],
+    /// whose key no indexed slot shares). Returns `false`, indexing nothing,
+    /// when the index has no bucket storage or the slot holds no key.
     pub fn insert<S: SlotStore>(&mut self, arena: &mut Arena<S>, idx: NodeIdx) -> bool
     {
-        let Node::Process(rec) = arena.get(idx).node
+        let Some(key) = key_of(&arena.get(idx).node)
         else
         {
             return false;
@@ -228,17 +247,17 @@ impl<W: WordStore> ProcessIndex<W>
         {
             return false;
         }
-        let b = self.bucket_of(rec.badge);
+        let b = self.bucket_of(key);
         arena.set_next(idx, self.head(b));
         self.set_head(b, idx);
-        // Each indexed record holds its own slot, so the count stays below the slot count.
+        // Each indexed slot is its own, so the count stays below the slot count.
         self.count = self.count.saturating_add(1);
         self.grow(arena);
         true
     }
 
-    /// Unindex the record keyed by `badge`, returning its slot (still holding
-    /// the record; the caller frees it).
+    /// Unindex the slot keyed by `badge`, returning it (still holding its
+    /// record or handle state; the caller frees it).
     pub fn remove<S: SlotStore>(&mut self, arena: &mut Arena<S>, badge: u64) -> Option<NodeIdx>
     {
         if self.capacity == 0
@@ -251,12 +270,8 @@ impl<W: WordStore> ProcessIndex<W>
         while cur != NODE_NULL
         {
             let slot = arena.get(cur);
-            let Node::Process(rec) = slot.node
-            else
-            {
-                return None;
-            };
-            if rec.badge == badge
+            let key = key_of(&slot.node)?;
+            if key == badge
             {
                 if prev == NODE_NULL
                 {
@@ -267,7 +282,7 @@ impl<W: WordStore> ProcessIndex<W>
                     arena.set_next(prev, slot.next);
                 }
                 arena.set_next(cur, NODE_NULL);
-                // The record being unlinked was counted, so `count` is above zero.
+                // The slot being unlinked was counted, so `count` is above zero.
                 self.count = self.count.saturating_sub(1);
                 return Some(cur);
             }
@@ -299,12 +314,12 @@ impl<W: WordStore> ProcessIndex<W>
         while cur != NODE_NULL
         {
             let slot = arena.get(cur);
-            let Node::Process(rec) = slot.node
+            let Some(key) = key_of(&slot.node)
             else
             {
                 break;
             };
-            if hash(rec.badge) & mask == new
+            if hash(key) & mask == new
             {
                 arena.set_next(cur, moved);
                 moved = cur;

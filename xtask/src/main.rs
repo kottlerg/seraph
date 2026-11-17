@@ -130,6 +130,7 @@ fn main()
         CliCommand::TestMapRedo(args) => commands::test_map_redo::run(&ctx, args),
         CliCommand::TestLogLevel(args) => commands::test_log_level::run(&ctx, args),
         CliCommand::TestDebugPort(args) => commands::test_debug_port::run(&ctx, args),
+        CliCommand::TestHotplug(args) => commands::test_hotplug::run(&ctx, args),
         CliCommand::TestGdb(args) => commands::test_gdb::run(&ctx, args),
         CliCommand::TestWedge(args) => commands::test_wedge::run(&ctx, args),
         CliCommand::TestCet(args) => commands::test_cet::run(&ctx, args),

@@ -23,6 +23,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`svctest/`](svctest/README.md) | Services-surface test harness |
 | [`crasher/`](crasher/README.md) | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
 | [`debug-echo/`](debug-echo/README.md) | Test-tier fixture: answers fixed GDB remote serial protocol packets on the debug port (gated, opt-in) |
+| [`hotplug-check/`](hotplug-check/README.md) | Test-tier fixture: checks that devmgr binds a driver to a device hot-added behind a PCI Express root port, and that its DMA and MSI work (gated, opt-in) |
 
 ---
 

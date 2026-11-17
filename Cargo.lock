@@ -299,6 +299,15 @@ name = "hello-tester"
 version = "0.1.4"
 
 [[package]]
+name = "hotplug-check"
+version = "0.1.4"
+dependencies = [
+ "driver-binding",
+ "ipc",
+ "syscall",
+]
+
+[[package]]
 name = "init"
 version = "0.1.4"
 dependencies = [

@@ -11,8 +11,10 @@
 //! the architecture's IOMMU family (`arch::current::IOMMU_FAMILY`): on
 //! x86-64 the ACPI DMAR, whose VT-d units' register `Mmio` caps it carves
 //! from the apertures; on riscv64 the ACPI RIMT, whose RISC-V IOMMUs are PCI
-//! functions, each unit's register cap being its BAR 0, carved after devmgr
-//! turns on the function's memory decode and bus mastering. It spawns, in a
+//! functions, each unit's register cap being its BAR 0, carved before devmgr
+//! turns on the function's memory decode and bus mastering, the last step of
+//! the unit's hand-over, so a unit not handed over is left as the firmware
+//! left it and one turned on is always handed over. It spawns, in a
 //! settle batch of its own, the boot-module driver whose declaration matches
 //! the family's record key ([`Family::key`]: `dmar` binds `iommu-vtd`,
 //! `rimt` binds `iommu-riscv`), and delivers it every unit in its resource
@@ -1132,10 +1134,10 @@ fn vtd_units(
 /// Resolve each RIMT PCI IOMMU's scope and carve its register cap: the
 /// units handed over, and the RIMT topology devmgr places devices against.
 /// An IOMMU the PCI scan did not find, without a memory BAR 0 of at least a
-/// page, whose scope exceeds what its unit's group carries, whose memory
-/// decode and bus mastering devmgr cannot turn on, whose BAR no aperture
-/// covers, or past the driver's unit bound is not handed over and its
-/// functions are refused.
+/// page, whose scope exceeds what its unit's group carries, whose BAR no
+/// aperture covers, whose memory decode and bus mastering devmgr cannot turn
+/// on, or past the driver's unit bound is not handed over, left as the
+/// firmware left it, and its functions are refused.
 fn riscv_units(
     caps: &mut caps::DevmgrCaps,
     rimt_bytes: Vec<u8>,
@@ -1180,10 +1182,13 @@ fn riscv_units(
 
 /// The PCI IOMMU `iommu` as a unit `handed` can take: its scope resolved
 /// against the scanned `devices`, and its BAR 0's first page, which holds
-/// every register, carved once devmgr has turned on the function's memory
+/// every register, carved before devmgr turns on the function's memory
 /// decode (for the registers) and bus mastering (the IOMMU reads its tables
 /// and queues by DMA); `None`, logged where the step logs, when any step
-/// fails or the unit does not fit.
+/// fails or the unit does not fit. Turning the function on is the last step,
+/// taken only once every other has succeeded, so a function devmgr turns on
+/// is always handed over and its record marked bound ([`mark_units_bound`]),
+/// and one that is not handed over is left as the firmware left it.
 fn riscv_unit(
     caps: &mut caps::DevmgrCaps,
     handed: &Handed,
@@ -1220,16 +1225,22 @@ fn riscv_unit(
     {
         return None;
     }
-    let config = crate::bind::carve_function_config("RISC-V IOMMU", dev, caps)?;
-    let enabled = config.enable_memory_and_bus_master();
-    // devmgr needs the function's configuration no further.
-    let _ = syscall::cap_delete(config.cap);
-    if !enabled
-    {
-        return None;
-    }
     let phys = *dev.bar_phys.get(bar)?;
     let cap = crate::carve_subrange(caps, phys, PAGE_SIZE)?;
+    let enabled =
+        crate::bind::carve_function_config("RISC-V IOMMU", dev, caps).is_some_and(|config| {
+            let enabled = config.enable_memory_and_bus_master();
+            // devmgr needs the function's configuration no further.
+            let _ = syscall::cap_delete(config.cap);
+            enabled
+        });
+    if !enabled
+    {
+        // Deleted, the page leaves the apertures for the boot: it holds
+        // only the unit's registers, which nothing but its driver maps.
+        let _ = syscall::cap_delete(cap);
+        return None;
+    }
     let registers = Resource::Mmio {
         cap,
         bar: Some(0),

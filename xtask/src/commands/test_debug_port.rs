@@ -131,6 +131,7 @@ fn boot(ctx: &Context, args: &TestDebugPortArgs, layout: DiskLayout) -> Result<(
         iommu: Iommu::Attached,
         debug_port: Some(port),
         test_devices: false,
+        hotplug_port: None,
     };
     let qemu_args = build_qemu_argv(&spec)?;
     let qemu_binary = require_tool(args.arch.qemu_binary())?;

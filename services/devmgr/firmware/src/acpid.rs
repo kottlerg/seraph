@@ -318,8 +318,10 @@ pub enum ConfigError
     /// register past the configuration space.
     Invalid,
     /// A write below [`CONFIG_WRITE_FLOOR`], or to a function with no
-    /// unbound record: one a driver was started for, a removed one, or one
-    /// devmgr has no record of.
+    /// unbound record: a bound one (a driver was started for it, or devmgr
+    /// took it as a RISC-V IOMMU unit or a managed hotplug slot's port), a
+    /// removed one, or one devmgr has no
+    /// record of.
     Refused,
 }
 
@@ -607,6 +609,12 @@ impl Bridges
     pub fn get(&self, ordinal: usize) -> Option<&Bridge>
     {
         self.list.get(ordinal)
+    }
+
+    /// Every bridge, in segment, then bus order.
+    pub fn iter(&self) -> impl Iterator<Item = &Bridge> + Clone
+    {
+        self.list.iter()
     }
 
     /// The bridge at `(segment, bus)`, if devmgr holds a push for it.

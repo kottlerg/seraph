@@ -76,9 +76,11 @@ devmgr's responsibilities are:
   (devmgr keeps no copy). A VT-d unit's cap is carved from the
   apertures and its scope is the DMAR's, resolved against the scan's bridges;
   a RISC-V IOMMU is a PCI function the ACPI RIMT names, whose cap is the first
-  page of its BAR 0, carved once devmgr has turned on the function's memory
-  decode and bus mastering, and whose scope is the RIMT's ID mappings: each
-  bus they cover whole and each scanned function on a bus they cover in part.
+  page of its BAR 0, carved before devmgr turns on the function's memory
+  decode and bus mastering, the hand-over's last step, so an IOMMU not
+  handed over is left as the firmware left it, and whose scope is the RIMT's
+  ID mappings: each bus they cover whole and each scanned function on a bus
+  they cover in part.
   The driver is created `CREATE_PINNED`, `CREATE_DMA_HOLD`, and
   `CREATE_PHYS_ACCESS` at `BOOT_DRIVER_PRIORITY`, and its hold is never
   released: devmgr deletes the release token of its create reply at the
@@ -114,7 +116,7 @@ devmgr's responsibilities are:
   holds, and the
   drivers-directory pass at `SET_DRIVERS_DIR`, over the declarations of the
   `/services/drivers/` entries (below). Each pass gathers the declarations
-  that match a device no driver is bound to, walks the unbound devices in PCI
+  that match an unbound device, walks the unbound devices in PCI
   segment, bus, device, function order, and binds each to its most specific
   match: an exact vendor and device key outranks a class key, two equally
   specific matches are a conflict that devmgr logs and binds neither of, and a
@@ -201,7 +203,9 @@ devmgr's responsibilities are:
   batch (the IOMMU driver alone, settled first so it is ready before any
   device is attached), the boot batch (the boot pass, over the PCI and platform records the boot
   modules' declarations match), and the on-disk batch (the drivers-directory
-  pass, which binds the RTC driver to its platform record).
+  pass, which binds the RTC driver to its platform record). Each hotplug arrival that appends a
+  record after `SET_DRIVERS_DIR` runs one more drivers-directory pass, in a batch of its own,
+  the hotplug batch ([hotplug.md](hotplug.md#binding) § Binding).
   Each driver's devmgr query cap is a
   SEND, badged with its device badge, on its batch's private endpoint; the
   IOMMU driver's badge, and those of PCI-bound drivers of functions that
@@ -600,9 +604,13 @@ devmgr's responsibilities are:
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Pushes).
   - Every acpid request but `QUERY_ACPI_RESOURCES` runs on the control thread
     ([acpid and devmgr](../../acpid/docs/devmgr.md) § Ordering).
-- **Handle hotplug** (design intent; not yet implemented) — on platforms that support it,
-  receive hotplug notifications and dynamically spawn or terminate driver processes. See
-  [`docs/hotplug.md`](hotplug.md).
+- **Handle hotplug** — devmgr finds the PCI Express hotplug slots in the boot scan and manages
+  each under a native-control grant (its host bridge's `_OSC`, or the platform description
+  table's `pcie_native_hotplug`). A poller thread reads each managed slot's Slot Status every
+  second, powers up a slot a card arrives in, and posts the arrival; the control thread places
+  and programs the new functions' BARs in the slot's windows, appends their records, and binds
+  them in a hotplug batch (above). Removal and the ACPI hotplug source are design intent; not
+  yet implemented. See [`docs/hotplug.md`](hotplug.md).
 
 ---
 

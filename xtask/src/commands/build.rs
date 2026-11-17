@@ -78,7 +78,8 @@ enum InstallDest
     /// Installed under `sysroot/tests/<install_name>` — the test
     /// harnesses (kernel-surface `ktest`, service-surface `svctest`,
     /// programs-surface orchestrator `usertest`), the `crasher`
-    /// restart-path fixture, and the `debug-echo` debug-port fixture.
+    /// restart-path fixture, the `debug-echo` debug-port fixture, and the
+    /// `hotplug-check` hotplug fixture.
     /// svcmgr does not scan this path; harness recipes live in
     /// `rootfs/config/svcmgr/tests/`. See
     /// docs/testing.md § Sysroot layout.
@@ -292,6 +293,15 @@ const SPECS: &[Spec] = &[
     // remote serial protocol packets on the debug port.
     Spec {
         name: "debug-echo",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Tests,
+        arch_only: None,
+    },
+    // The hotplug fixture `test-hotplug` stages: it waits for the `test-dma`
+    // fixture on a hot-added `edu` device and checks its DMA and MSI.
+    Spec {
+        name: "hotplug-check",
         install_name: None,
         profile: BuildProfile::StdUser,
         dest: InstallDest::Tests,

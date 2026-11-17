@@ -281,7 +281,10 @@ devmgr is its only consumer, over `ipc::iommu_labels`; it serves no device class
 at `BIND_DRIVERS`, and for a hot-added device:
 
 1. Carve one capability per resource of the record the declaration needs: each `Mmio` from
-   the apertures and each `IoPort` from devmgr's port capability, and keep the `Config` page.
+   the apertures, or, for a BAR of a function behind a managed hotplug slot, from the BAR pages
+   devmgr holds for it
+   ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#add-job) § Add Job), and
+   each `IoPort` from devmgr's port capability, and keep the `Config` page.
    The BARs of a PCI function devmgr may give MSI-X are carved less the pages holding its MSI-X
    table and Pending Bit Array, which devmgr keeps and delivers to no driver, so one BAR may be
    up to three `Mmio` capabilities, each naming its BAR and its offset in it

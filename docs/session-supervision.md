@@ -185,6 +185,7 @@ What procmgr records and guarantees. The labels and their wire format are
   every end, since it reaps each process through its own observer and makes each destroy, so the
   holder of the queue's receive right learns of the end whoever caused it. Telling another holder
   of one's own end confers no authority over anything.
+
 ---
 
 ## Attribution

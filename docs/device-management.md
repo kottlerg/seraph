@@ -554,10 +554,10 @@ each BAR as up to three `Mmio` ranges, each naming its offset in its BAR
 ([driver-binding.md](driver-binding.md#binding) § Binding). A driver therefore neither retargets
 nor masks a vector: it names its vectors in its device's own registers and suppresses its device's
 interrupts at the device (VirtIO's `NO_VECTOR` and event suppression; NVMe's and a NIC's per-queue
-interrupt enables). A VirtIO function is given MSI-X only when every one of its register regions
-lies clear of those pages, since its driver needs them; otherwise devmgr delivers them and the
-function falls back to its wired line. A VirtIO function is given no MSI, since VirtIO over PCI
-signals by MSI-X vectors or its wired line alone (VirtIO 1.2 § 4.1.4.5, § 4.1.5.1.2;
+interrupt enables). A VirtIO function is given MSI-X only when every register region of its
+driver's layout lies clear of those pages, since its driver needs them; otherwise devmgr delivers
+them and the function falls back to its wired line. A VirtIO function is given no MSI, since
+VirtIO over PCI signals by MSI-X vectors or its wired line alone (VirtIO 1.2 § 4.1.4.5, § 4.1.5.1.2;
 `firmware::pci::deliverable_messages`). The RISC-V IOMMU driver is delivered the first page of its
 unit's BAR 0, the unit's registers (§ IOMMU Discovery and Programming), which hold the unit's MSI
 configuration table (`msi_cfg_tbl`, RISC-V IOMMU specification); devmgr gives the unit no vectors,

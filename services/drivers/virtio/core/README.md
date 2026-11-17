@@ -4,10 +4,12 @@ Shared VirtIO library crate (`virtio-core`, `no_std`) used by the VirtIO drivers
 modern PCI transport register access, split-virtqueue management, device-status negotiation, and the
 `VirtioPciStartupInfo` payload (versioned by `VIRTIO_PCI_INFO_VERSION`) that carries PCI capability
 locations, which devmgr serialises into its `QUERY_DEVICE_INFO` reply to a VirtIO driver, and the
-register layout derived from it (the distinct BARs the four register regions name, up to
-`MAX_VIRTIO_BARS`, each region's place in the driver's register window, and the place there of
-each BAR range devmgr delivers, `RegisterLayout::place`), and where a reset
-writes the device's `device_status` byte (`VirtioPciStartupInfo::status_register`), which devmgr
+register layout derived from it for the device-configuration requirement its driver declares
+(`VirtioDeviceConfig`: the distinct BARs the common, notification, and ISR regions and, when
+required, the device-configuration region name, up to `MAX_VIRTIO_BARS`, each region's place in
+the driver's register window, and the place there of each BAR range devmgr delivers,
+`RegisterLayout::place`), and where a reset writes the device's `device_status` byte
+(`RegisterLayout::status_register`), which devmgr
 uses when it withdraws a driver ([driver-model.md](../../docs/driver-model.md#withdrawal) §
 Withdrawal). It also reads, on the driver side, the resource list devmgr delivers a VirtIO PCI
 driver (`bootstrap::DeliveredDevice`, over `driver_binding::resources`), maps a driver's buffers

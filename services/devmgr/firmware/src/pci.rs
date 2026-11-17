@@ -562,23 +562,17 @@ pub fn delivered_ranges(
     (ranges, count)
 }
 
-/// Whether every `VirtIO` register region of `info` lies clear of every span
-/// of `withheld`: a function whose MSI-X structures share a page with a
-/// region its driver needs breaks the PCI rule that keeps them apart
-/// ([`MSIX_PAGE_BYTES`]), so devmgr cannot withhold those pages from the
-/// driver; it delivers them and gives the function no MSI-X.
+/// Whether every register region of the `VirtIO` register layout `layout`
+/// lies clear of every span of `withheld`: a function whose MSI-X structures
+/// share a page with a region its driver needs breaks the PCI rule that keeps
+/// them apart ([`MSIX_PAGE_BYTES`]), so devmgr cannot withhold those pages
+/// from the driver; it delivers them and gives the function no MSI-X. A
+/// region the layout leaves out (the device region of a device type without
+/// one) is not the driver's, and is not compared.
 #[must_use]
-pub fn virtio_regions_clear(info: &virtio_core::VirtioPciStartupInfo, withheld: &[BarSpan])
--> bool
+pub fn virtio_regions_clear(layout: &virtio_core::RegisterLayout, withheld: &[BarSpan]) -> bool
 {
-    [
-        info.common_cfg,
-        info.notify_cfg,
-        info.isr_cfg,
-        info.device_cfg,
-    ]
-    .iter()
-    .all(|r| {
+    layout.regions().iter().all(|r| {
         !withheld
             .iter()
             .any(|s| s.overlaps(r.bar, u64::from(r.offset), u64::from(r.length)))
@@ -587,10 +581,10 @@ pub fn virtio_regions_clear(info: &virtio_core::VirtioPciStartupInfo, withheld: 
 
 /// The message-signaled capabilities devmgr may give the driver of a
 /// function with the MSI capability `msi`, the MSI-X capability `msix`, and
-/// the `VirtIO` register regions `info` (all absent for a function that
-/// presents no `VirtIO` register layout), as `(msi, msix)`: the MSI-X
-/// capability is also the one whose table and Pending Bit Array pages devmgr
-/// withholds from the driver ([`Msix::withheld`]).
+/// the `VirtIO` register layout `virtio` its driver is given (`None` for a
+/// driver that is given none), as `(msi, msix)`: the MSI-X capability is
+/// also the one whose table and Pending Bit Array pages devmgr withholds from
+/// the driver ([`Msix::withheld`]).
 ///
 /// A function with no `VirtIO` layout keeps both. A `VirtIO` function keeps no
 /// MSI, since `VirtIO` over PCI signals by MSI-X vectors or the wired line
@@ -602,16 +596,17 @@ pub fn virtio_regions_clear(info: &virtio_core::VirtioPciStartupInfo, withheld: 
 pub fn deliverable_messages(
     msi: Option<Msi>,
     msix: Option<Msix>,
-    info: &virtio_core::VirtioPciStartupInfo,
+    virtio: Option<&virtio_core::RegisterLayout>,
 ) -> (Option<Msi>, Option<Msix>)
 {
-    if info.register_layout().is_none()
+    let Some(layout) = virtio
+    else
     {
         return (msi, msix);
-    }
+    };
     (
         None,
-        msix.filter(|m| virtio_regions_clear(info, &m.withheld())),
+        msix.filter(|m| virtio_regions_clear(layout, &m.withheld())),
     )
 }
 
@@ -998,35 +993,41 @@ mod tests
         }
     }
 
-    #[test]
-    fn virtio_regions_clear_refuses_a_region_on_a_withheld_page()
+    /// QEMU's register regions: all four in BAR 4, the device region at
+    /// 0x2000, for a device type with device-specific configuration or
+    /// without it.
+    fn qemu(device_config: virtio_core::VirtioDeviceConfig) -> virtio_core::RegisterLayout
     {
-        // QEMU's layout: registers in BAR 4, MSI-X in BAR 1.
-        let qemu = info([
+        info([
             (4, 0, 0x1000),
             (4, 0x3000, 0x1000),
             (4, 0x1000, 0x1000),
             (4, 0x2000, 0x1000),
-        ]);
+        ])
+        .register_layout(device_config)
+        .expect("QEMU's regions are usable")
+    }
+
+    #[test]
+    fn virtio_regions_clear_refuses_a_region_on_a_withheld_page()
+    {
+        use virtio_core::VirtioDeviceConfig::{Absent, Required};
+        // QEMU's layout: registers in BAR 4, MSI-X in BAR 1.
         let msix_bar1 = msix(1, 0, 3, 1, 0x800).withheld();
-        assert!(virtio_regions_clear(&qemu, &msix_bar1));
+        assert!(virtio_regions_clear(&qemu(Required), &msix_bar1));
         // The table on the page of the ISR region.
         let shared = msix(4, 0x1800, 3, 4, 0x1C00).withheld();
-        assert!(!virtio_regions_clear(&qemu, &shared));
-        // The PBA on the page past the device region's end touches nothing.
+        assert!(!virtio_regions_clear(&qemu(Required), &shared));
+        assert!(!virtio_regions_clear(&qemu(Absent), &shared));
+        // The PBA on the page past the notification region's end touches
+        // nothing.
         let after = msix(1, 0, 3, 4, 0x4000).withheld();
-        assert!(virtio_regions_clear(&qemu, &after));
-        // A zero-length region reaches no page.
-        let empty = info([
-            (4, 0, 0x1000),
-            (4, 0x3000, 0x1000),
-            (4, 0x1000, 0x1000),
-            (4, 0x5000, 0),
-        ]);
-        assert!(virtio_regions_clear(
-            &empty,
-            &msix(4, 0x5000, 1, 4, 0x5800).withheld()
-        ));
+        assert!(virtio_regions_clear(&qemu(Required), &after));
+        // The table on the device region's page: refused for a driver that
+        // reads the region, clear for one whose layout leaves it out.
+        let on_device = msix(4, 0x2000, 3, 1, 0x800).withheld();
+        assert!(!virtio_regions_clear(&qemu(Required), &on_device));
+        assert!(virtio_regions_clear(&qemu(Absent), &on_device));
     }
 
     #[test]
@@ -1035,27 +1036,40 @@ mod tests
         let msi = Some(Msi::decode(0x50, 0));
         let msix = Some(msix(0, 0, 4, 0, 0x800));
         // The table on the registers' page means nothing without a layout.
-        assert_eq!(
-            deliverable_messages(msi, msix, &virtio_core::VirtioPciStartupInfo::default()),
-            (msi, msix)
-        );
+        assert_eq!(deliverable_messages(msi, msix, None), (msi, msix));
     }
 
     #[test]
     fn deliverable_messages_give_a_virtio_function_msix_alone_and_only_clear_of_its_regions()
     {
-        let qemu = info([
-            (4, 0, 0x1000),
-            (4, 0x3000, 0x1000),
-            (4, 0x1000, 0x1000),
-            (4, 0x2000, 0x1000),
-        ]);
+        use virtio_core::VirtioDeviceConfig::{Absent, Required};
         let msi = Some(Msi::decode(0x50, 0));
         let clear = Some(msix(1, 0, 3, 1, 0x800));
-        assert_eq!(deliverable_messages(msi, clear, &qemu), (None, clear));
+        let required = qemu(Required);
+        assert_eq!(
+            deliverable_messages(msi, clear, Some(&required)),
+            (None, clear)
+        );
         let shared = Some(msix(4, 0x1800, 3, 1, 0x800));
-        assert_eq!(deliverable_messages(msi, shared, &qemu), (None, None));
-        assert_eq!(deliverable_messages(msi, None, &qemu), (None, None));
+        assert_eq!(
+            deliverable_messages(msi, shared, Some(&required)),
+            (None, None)
+        );
+        assert_eq!(
+            deliverable_messages(msi, None, Some(&required)),
+            (None, None)
+        );
+        // The table on the device region's page keeps MSI-X only for a
+        // driver whose layout leaves the region out.
+        let on_device = Some(msix(4, 0x2000, 3, 1, 0x800));
+        assert_eq!(
+            deliverable_messages(msi, on_device, Some(&required)),
+            (None, None)
+        );
+        assert_eq!(
+            deliverable_messages(msi, on_device, Some(&qemu(Absent))),
+            (None, on_device)
+        );
     }
 
     #[test]

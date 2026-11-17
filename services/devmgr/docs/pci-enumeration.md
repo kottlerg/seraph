@@ -142,11 +142,15 @@ not yet implemented ([#165](https://github.com/kottlerg/seraph/issues/165)).
 
 For each matched device, devmgr:
 
-1. For a function that presents the VirtIO register layout, locates its
-   VirtIO register regions
-   (`VirtioPciStartupInfo::register_layout`): the distinct BARs the common,
-   notification, ISR, and device-configuration regions name, at most four,
-   in ascending BAR index, each sized to the pages the regions in it reach.
+1. For a driver that declares the VirtIO status reset, the declaration
+   devmgr gives the VirtIO register layout, locates the function's VirtIO
+   register regions (`VirtioPciStartupInfo::register_layout`): the
+   distinct BARs the common, notification, and ISR regions name, and the
+   device-configuration region when the declaration requires it (a device
+   type with device-specific configuration; one with none, such as the
+   entropy device of VirtIO 1.2 § 5.4.4, declares it absent, and a region
+   such a device presents anyway is ignored), at most four, in ascending
+   BAR index, each sized to the pages the regions in it reach.
    The scan (`firmware::scan`) takes, for each type, the first structure in
    the capability list that lies wholly inside one of the device's MMIO BARs
    and that the transport can use (`virtio_core::structure_usable`; VirtIO
@@ -158,27 +162,29 @@ For each matched device, devmgr:
    `notify_off_multiplier` is not 2-aligned (§ 4.1.4.4.1), and a
    device-configuration structure at an offset not 4-aligned (§ 4.1.4.6),
    since each would make a register access misaligned. A function left with no region
-   of one of the four types (VirtIO 1.2 § 4.1.4 requires all four of a
-   block or input device) presents no layout; it is refused, logged, when
-   its driver declares the VirtIO status reset, and bound as any other
-   function otherwise.
+   of one of the types its driver's layout takes (VirtIO 1.2 § 4.1.4
+   requires the common, notification, and ISR regions of every device, and
+   the device-configuration region of a block, console, or input device)
+   presents no layout and is refused, logged. A driver that declares
+   another reset is given no layout, and its function is bound as any
+   other, whatever it presents.
 2. Carves an `Mmio` sub-cap for each of those BARs out of the boot-provided
    MMIO aperture that covers it, or, for a function behind a managed hotplug
    slot, out of the BAR pages devmgr holds for it
    ([hotplug.md](hotplug.md#add-job) § Add Job), spanning the BAR's first pages up to that
    reach at most. The driver maps each BAR into that many pages of its
    register window, and `SYS_MMIO_MAP` maps a cap's whole region, so a
-   larger cap would map past the BAR's share of the window. For any other
-   function it carves a sub-cap for every MMIO BAR, whole; I/O BARs are not
-   delivered. For a function devmgr may give MSI-X
+   larger cap would map past the BAR's share of the window. For a function
+   whose driver is given no layout it carves a sub-cap for every MMIO BAR,
+   whole; I/O BARs are not delivered. For a function devmgr may give MSI-X
    (`firmware::pci::deliverable_messages`) it leaves out of each BAR the
    pages holding the MSI-X table and Pending Bit Array, which no driver is
    delivered (docs/device-management.md § Message-Signaled Interrupts), and
    carves the rest as up to three sub-caps (`firmware::pci::delivered_ranges`),
    each recording its offset in its BAR; a BAR those pages cover whole is
-   not delivered. A VirtIO function whose register regions share a page with
-   them may not be given MSI-X, and its BARs are carved without the cut. A
-   BAR the layout names that is
+   not delivered. A VirtIO function whose register regions (those of its
+   driver's layout) share a page with them may not be given MSI-X, and its
+   BARs are carved without the cut. A BAR the layout names that is
    not an MMIO BAR, or a range no aperture covers, refuses the device, logged,
    with the caps already carved released. The aperture's lower and upper
    remainders stay in devmgr's growable aperture table

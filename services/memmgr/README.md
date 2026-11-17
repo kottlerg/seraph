@@ -129,8 +129,9 @@ The full memmgr IPC specification is in
   address; `RIGHTS_MEM_PHYS` only for a phys-class caller)
 - `RELEASE_MEMORY_CAPS(region_id[..])` — return granted regions mid-life, named by the
   opaque region ids the grant returned
-- `REGISTER_PROCESS(flags, parent_badge, max) → badge, max, badged_endpoint_cap`
-  (procmgr-only); creates the process's budget node
+- `REGISTER_PROCESS(flags, parent_badge, max[, charge_node_handle])
+  → badge, max, badged_endpoint_cap[, node_handle]` (procmgr-only); creates the process's
+  budget node, under a given node handle's node on request, and on request a node handle to it
 - `PROCESS_DIED(badge)` (procmgr-only)
 - `DONATE_MEMORY_CAPS(memory_caps[..])` — hand init's reaped RAM to the pool
   (procmgr-only)
@@ -147,15 +148,20 @@ The full memmgr IPC specification is in
   registers every process at start
 - `DELEGATE_ASPACE(child_badge, aspace_cap)` — delegate a demand-paged child's
   address space (procmgr-only)
+- `CREATE_SUB_NODE(max) → max, node_handle` — make a sub-node of the caller's own budget node
+- Over a node handle only: `NODE_SET_MAX(max) → max`, `NODE_CREATE(max) → max, node_handle`,
+  `NODE_QUERY_USAGE`, `NODE_REGISTER_LIMIT(bits, notification_cap, registrant_send)` and
+  `NODE_RELEASE` — set, divide, read and watch the budget node the handle names, and drop a
+  sub-node's handle state
 
 ---
 
 ## Sizing constants
 
 memmgr's bookkeeping is RAM-bound, not capped by a constant: free runs,
-process records and their budget nodes, per-process region, commitment and
-frame descriptors, and the regions' chunk-table nodes are nodes in a self-hosted
-metadata arena carved from memmgr's own pool, indexed by `u64` (see
+process records, their budget nodes, node handle states and limit registrations,
+per-process region, commitment and frame descriptors, and the regions' chunk-table nodes
+are nodes in a self-hosted metadata arena carved from memmgr's own pool, indexed by `u64` (see
 [`docs/memory-pool.md`](docs/memory-pool.md) §"Metadata Arena"). Records are
 found through a linear-hash index that grows with them. The arena grows until
 RAM is exhausted or its address-space zones are spent; the high zone,

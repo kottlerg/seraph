@@ -42,10 +42,24 @@ Two privilege classes:
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
-  `SHRINK_REGION`) are callable over any badged cap, including those memmgr
-  returned from `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
-  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION` and
-  `SHRINK_REGION` are attributed to the caller by its own badge.
+  `SHRINK_REGION`, `CREATE_SUB_NODE`) are callable over any badged cap but a
+  node handle, including those memmgr returned from `REGISTER_PROCESS`.
+  `REGISTER_REGION`, `UNREGISTER_REGION`, `QUERY_MEMORY_USAGE`,
+  `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION` and
+  `CREATE_SUB_NODE` are attributed to the caller by its own badge.
+- **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
+  `NODE_REGISTER_LIMIT`, `NODE_RELEASE`) are callable only over a node
+  handle, and act on the budget node it names (§ Node Handles).
+
+memmgr tells the classes apart by the node-handle verb bit,
+`NODE_HANDLE_TAG` (bit 62), the pattern of
+[docs/capability-model.md](../../../docs/capability-model.md) § Verb-bit
+authority pattern: it serves the node labels only on a badge that carries the
+bit and every other label only on one that does not, and replies
+`UNAUTHORIZED` otherwise, deleting any cap the message carries. No process
+badge carries it: memmgr draws a process badge with every verb bit of
+`ipc::VERB_BIT_MASK` (bits 58 to 63) clear but the phys-class bit 63, and
+init mints procmgr's badge on memmgr's endpoint with all six clear.
 
 The badge on an ordinary IPC message is the badge of the sender's cap,
 and it cannot be forged: badges are minted by `cap_derive_badge` only
@@ -75,13 +89,54 @@ derivation-locked badge, not on badge secrecy.
 
 ---
 
+## Node Handles
+
+A node handle is the authority to control one budget node
+([`memory-pool.md`](memory-pool.md) § Distribution policy): a SEND+GRANT cap
+on memmgr's endpoint whose badge is `NODE_HANDLE_TAG` and a key of 58 random
+bits outside `VERB_BIT_MASK`, drawn until no process badge or other key in
+use matches it. memmgr derives it, and only memmgr, from its own endpoint, so
+the set-once badge rule makes the key unforgeable by any holder; the key is a
+name, and the cap is the authority. memmgr derives a handle in three places:
+
+- `REGISTER_PROCESS` with `REGISTER_NODE_HANDLE` (§ Label 3): the new
+  process's node, which procmgr passes to the creator that asked for it
+  with `CREATE_NODE_HANDLE`;
+- `NODE_CREATE` (§ Label 15): a sub-node under the handle's node;
+- `CREATE_SUB_NODE` (§ Label 19): a sub-node under the caller's own node.
+
+A holder can derive copies of a handle, which carry the same badge. Every
+handle to a node names its handle state, which belongs to one process: the
+node's own process, or for a sub-node the owner of the state of the node it
+was made under (`NODE_CREATE`), or the caller (`CREATE_SUB_NODE`). The state
+goes when that process's `PROCESS_DIED` arrives, or, for a sub-node, on
+`NODE_RELEASE`, and memmgr deletes its limit Notification then; the
+Notification goes earlier when its registrant dies (§ Label 17). From then on
+memmgr refuses every handle carrying its key with `INVALID_ARGUMENT`. A node
+outlives its handle state while a process, a node below it or a charge refers
+to it, so a process charged to a released sub-node keeps its budget.
+
+A creator that holds a handle can charge a new child to the handle's node by
+passing a copy with `CREATE_CHARGE_NODE`
+([procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)),
+which procmgr hands to memmgr with `REGISTER_CHARGE_NODE` (§ Label 3).
+
+No process receives a handle to its own node through these paths, so none can
+raise the max its creator set; the handles it holds name its children's nodes
+and the sub-nodes it made. Nothing is reclaimed or killed through a handle.
+
+---
+
 ## Messages
 
 All requests use `SYS_IPC_CALL` (synchronous call/reply). The message
 label field identifies the operation. Data words and capability slots
 carry arguments; the reply carries results. Error codes below are the
 `memmgr_errors` constants in `shared/ipc`. A label memmgr does not define
-replies `INVALID_ARGUMENT`.
+replies `INVALID_ARGUMENT`, or `UNAUTHORIZED` over a node handle. Every
+label but the node labels also replies `UNAUTHORIZED` over a node handle
+(§ Badge Discipline); the node labels' tables list the refusal over any other
+badge.
 
 ### Label 1: `REQUEST_MEMORY_CAPS`
 
@@ -241,12 +296,18 @@ on memmgr's endpoint that procmgr will install in the new process's
 |---|---|
 | label | 3 |
 | data[0] | Caller's `MEMMGR_LABELS_VERSION` |
-| data[1] | Flags: bit 0 `REGISTER_PHYS_CLASS` registers the process phys-class; bit 1 `REGISTER_RESERVE` makes its budget node a reserve node; bit 2 `REGISTER_MAX` gives the node the max in `data[3]`; other bits reserved, zero |
-| data[2] | Memmgr-side badge of the process whose budget node is the new node's parent, or 0 for a top-level node |
+| data[1] | Flags: bit 0 `REGISTER_PHYS_CLASS` registers the process phys-class; bit 1 `REGISTER_RESERVE` makes its budget node a reserve node; bit 2 `REGISTER_MAX` gives the node the max in `data[3]`; bit 3 `REGISTER_NODE_HANDLE` returns a handle to the node in `cap[1]`; bit 4 `REGISTER_CHARGE_NODE` puts the node under the node of the handle in `cap[0]`; other bits reserved, zero |
+| data[2] | Memmgr-side badge of the process whose budget node is the new node's parent, or 0 for a top-level node; ignored with `REGISTER_CHARGE_NODE` |
 | data[3] | With `REGISTER_MAX`: the node's max in pages, `u64::MAX` for none; ignored otherwise |
+| cap[0] | With `REGISTER_CHARGE_NODE`: a node handle (§ Node Handles), which procmgr took from the creator's `CREATE_CHARGE_NODE` request; ownership transfers to memmgr, which deletes it on every path. Absent otherwise; a cap sent without the flag is deleted |
 
 The budget node ([`memory-pool.md`](memory-pool.md) § Distribution policy)
-is created under the node of the process `data[2]` names. memmgr clamps a
+is created under the node of the process `data[2]` names, or with
+`REGISTER_CHARGE_NODE` under the node of the handle in `cap[0]`, so a
+creator that holds a handle charges its child to that node: two children
+charged to one sub-node share its budget. memmgr reads the handle's key with
+`SYS_ENDPOINT_BADGE`, which only the holder of Receive on its endpoint can
+call, so the cap, not a key a caller names, is the authority. memmgr clamps a
 max to what the parent and every ancestor have left, so a node never asks
 for more than its chain can grant, and replies with the max the node took.
 Without `REGISTER_MAX` the node has no max, and only its ancestors and the
@@ -256,18 +317,19 @@ asks, is procmgr's to check before it registers.
 
 The badge of the requesting endpoint identifies procmgr; memmgr verifies
 this and rejects the call otherwise. memmgr mints a fresh badge for the
-new process internally — procmgr does not supply it: 63 random bits, and bit
-63 (`PHYS_CLASS_BADGE_BIT`) set for a phys-class process and clear for every
-other. A phys-class process's grants keep `RIGHTS_MEM_PHYS`
+new process internally — procmgr does not supply it: the 58 bits outside
+`ipc::VERB_BIT_MASK` drawn at random, the verb bits 58 to 62 clear, and bit 63
+(`PHYS_CLASS_BADGE_BIT`) set for a phys-class process and clear for every
+other (§ Badge Discipline). A phys-class process's grants keep `RIGHTS_MEM_PHYS`
 ([Label 1](#label-1-request_memory_caps)); the kernel stamps the badge on the
 process's SEND cap, so no process can claim the class. procmgr sets the flag
 only for a child created with `CREATE_PHYS_ACCESS`, which it accepts only from
 an un-badged or phys-class creator: init creates devmgr with it and devmgr the
 IOMMU driver (see the
 [procmgr IPC interface](../../procmgr/docs/ipc-interface.md#label-1-create_process)).
-init clears the bit in the badge it mints for procmgr on memmgr's endpoint,
-and memmgr refuses a bootstrap whose procmgr badge carries it, so procmgr's
-own grants lack the right.
+init clears every verb bit in the badge it mints for procmgr on memmgr's
+endpoint, and memmgr refuses a bootstrap whose procmgr badge carries one, so
+procmgr's own grants lack the right and its badge is no node handle.
 
 **Reply (success):**
 
@@ -277,12 +339,12 @@ own grants lack the right.
 | data[0] | Memmgr-side process badge (procmgr forwards this in `PROCESS_DIED`) |
 | data[1] | The max the budget node took, in pages, after the clamp; `u64::MAX` for none |
 | cap[0] | Badged SEND cap on memmgr's endpoint, identifying the new process |
+| cap[1] | With `REGISTER_NODE_HANDLE`: a node handle to the new process's budget node (§ Node Handles), owned by the new process's record; absent otherwise |
 
-The badge is also encoded in the returned cap, but only memmgr, which
-holds Receive on its endpoint, can read the badge of a cap on it
-(`SYS_ENDPOINT_BADGE`), so memmgr returns it explicitly in `data[0]`
-for procmgr to record alongside the cap and forward in the eventual
-`PROCESS_DIED`.
+The badge is also encoded in the returned cap, but `SYS_ENDPOINT_BADGE`
+reads a cap's badge only for the holder of Receive on its endpoint, which
+procmgr is not, so memmgr returns it explicitly in `data[0]` for procmgr
+to record alongside the cap and forward in the eventual `PROCESS_DIED`.
 
 **Reply (error):**
 
@@ -294,9 +356,9 @@ for procmgr to record alongside the cap and forward in the eventual
 
 | Code | Name | Meaning |
 |---|---|---|
-| 4 | `INVALID_ARGUMENT` | Reserved `data[1]` flag bits set; `data[2]` names no process, or memmgr's or init's own boot record; or `REGISTER_RESERVE` under a parent outside the reserve |
+| 4 | `INVALID_ARGUMENT` | Reserved `data[1]` flag bits set; `data[2]` names no process, or memmgr's or init's own boot record; with `REGISTER_CHARGE_NODE`, `cap[0]` missing, or no node handle whose key names a handle state; or `REGISTER_RESERVE` under a parent outside the reserve |
 | 5 | `UNAUTHORIZED` | Caller is not procmgr |
-| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry (its record node or its budget node could not be allocated: system RAM exhausted), the badge draw failed, or the reply cap could not be derived |
+| 6 | `TOO_MANY_PROCESSES` | The tracking table could not take a new entry (its record node, its budget node or, with `REGISTER_NODE_HANDLE`, its handle state could not be allocated: system RAM exhausted), the badge or key draw failed, or a reply cap could not be derived |
 | 7 | `LABEL_VERSION_MISMATCH` | `data[0]` is not memmgr's `MEMMGR_LABELS_VERSION` |
 
 ### Label 4: `PROCESS_DIED`
@@ -730,6 +792,183 @@ length.
 |---|---|---|
 | 4 | `INVALID_ARGUMENT` | Unknown badge, no committed region based at `va_base`, or a length that is zero, not a chunk multiple, or larger than the length |
 
+### Label 14: `NODE_SET_MAX`
+
+Set the max of the handle's budget node while its processes run
+([`memory-pool.md`](memory-pool.md) § Distribution policy). Privilege: node,
+over a node handle (§ Node Handles).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 14 |
+| data[0] | `max_pages` — the max asked for, `u64::MAX` for none |
+
+memmgr clamps the max to the node's subtree usage plus what its parent chain
+has left, as `REGISTER_PROCESS` clamps a new node's, so a node grows only into
+room its ancestors still have; `u64::MAX` stays unbounded, limited by the chain
+at each charge. A max below the usage is kept: it reclaims and kills nothing,
+and refuses new charges until the usage falls below it. A max at or below the
+usage signals the node's limit event (§ Label 17).
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | the max the node took, `u64::MAX` for none |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state (released, or its owner gone) |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+
+### Label 15: `NODE_CREATE`
+
+Make a sub-node under the handle's node and return a handle to it. Privilege:
+node, over a node handle (§ Node Handles). Processes charged to one sub-node
+share its budget; procmgr's charge to a sub-node at process creation is the
+next phase of [#1097](https://github.com/kottlerg/seraph/issues/1097).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 15 |
+| data[0] | `max_pages` — the sub-node's max, `u64::MAX` for none |
+
+The sub-node is outside the reserve, and its max is clamped to what the
+handle's node and its ancestors have left. Its handle state belongs to the
+owner of the handle's state, and goes when that process dies or on
+`NODE_RELEASE` (§ Label 18). A reply that does not reach the caller drops the
+state, so no unnamed sub-node is left behind.
+
+**Reply (success):**
+
+| Field | Value |
+|---|---|
+| label | 0 (success) |
+| data[0] | the max the sub-node took, `u64::MAX` for none |
+| cap[0] | a node handle to the sub-node |
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 3 | `QUOTA` | The node, its handle state or its index entry could not be allocated (system RAM exhausted), the key draw failed, or the handle could not be derived |
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or its owner holds no record |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+
+### Label 16: `NODE_QUERY_USAGE`
+
+Read-only query of the handle's node. Privilege: node, over a node handle
+(§ Node Handles); it changes no state.
+
+**Request:** label 16, no words, no caps.
+
+**Reply (success):** as `QUERY_MEMORY_USAGE` (§ Label 10), for the handle's
+node: `data[0]` `own_pages`, `data[1]` `max_pages` (`u64::MAX` for none),
+`data[2]` `subtree_pages`.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+
+### Label 17: `NODE_REGISTER_LIMIT`
+
+Register the Notification memmgr signals on the limit event of the handle's
+node ([`memory-pool.md`](memory-pool.md) § Distribution policy). Privilege:
+node, over a node handle (§ Node Handles).
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 17 |
+| data[0] | `bits` — the bits to send on the limit event; nonzero |
+| cap[0] | a Notification cap with Notify rights; ownership transfers to memmgr |
+| cap[1] | a copy of the registrant's own SEND on memmgr's endpoint, the cap `ProcessInfo.memmgr_endpoint_cap` names; memmgr reads its badge with `SYS_ENDPOINT_BADGE` and deletes it |
+
+memmgr keeps one registration per handle state, and it belongs to its
+registrant, the process `cap[1]` names: a second registration replaces the
+first, and memmgr deletes the cap the first carried. The registrant's
+`PROCESS_DIED` deletes the cap, so a holder of a node handle that is not the
+state's owner cannot leave a Notification in memmgr past its own life, and
+the state's end (its owner's `PROCESS_DIED`, or `NODE_RELEASE`) deletes it
+too. After each request,
+memmgr checks the chain from the node the request charged, or whose max it
+set, to the top, and sends `bits` once, without blocking, to each node on it
+whose subtree holds its max or more, or whose own max refused the request's
+charge. A charge that brings the subtree to its max, each refused charge, and
+a max set at or below the usage each send once; bits not yet taken coalesce,
+and a send that fails, for a cap the holder revoked, is dropped. A refusal for
+want of free RAM, not of a max, signals no node.
+
+**Reply (success):** label 0, no words, no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, zero `bits`, `cap[0]` missing or not a Notification with Notify rights, or `cap[1]` missing, not a cap on memmgr's endpoint, or a node handle, or its badge names no process; memmgr deletes both caps, and any earlier registration stays |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle; memmgr deletes the caps |
+| 6 | `TOO_MANY_PROCESSES` | The registration's arena slot could not be allocated: system RAM exhausted; memmgr deletes both caps, and any earlier registration stays |
+
+### Label 18: `NODE_RELEASE`
+
+Drop the handle state of a sub-node. Privilege: node, over a node handle
+(§ Node Handles).
+
+**Request:** label 18, no words, no caps.
+
+memmgr drops the state and deletes its limit cap; every handle carrying its key
+is refused from then on. The sub-node itself lives on while a process, a node
+below it or a charge refers to it, so a process charged to it keeps its
+budget. A process's own node is refused: its handle state goes with the
+process.
+
+**Reply (success):** label 0, no words, no caps.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | The handle's key names no handle state, or it names a process's own node |
+| 5 | `UNAUTHORIZED` | The badge is not a node handle |
+
+### Label 19: `CREATE_SUB_NODE`
+
+Make a sub-node under the caller's own budget node and return a handle to it.
+Privilege: universal — attributed to the caller by `recv.badge`. A process
+divides its own budget this way; it holds no handle to its own node.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 19 |
+| data[0] | `max_pages` — the sub-node's max, `u64::MAX` for none |
+
+As `NODE_CREATE` (§ Label 15), with the caller's node as the parent and the
+caller as the owner of the sub-node's handle state.
+
+**Reply (success):** as `NODE_CREATE`: `data[0]` the max the sub-node took,
+`cap[0]` a node handle to it.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 3 | `QUOTA` | As `NODE_CREATE` |
+| 4 | `INVALID_ARGUMENT` | Unknown badge |
+| 5 | `UNAUTHORIZED` | The badge is a node handle |
+
 ### Kernel-origin fault message (`FAULT_LABEL`)
 
 Not a callable label. When a demand-paged process's thread takes a page fault the kernel cannot
@@ -812,18 +1051,22 @@ reclaims. `RELEASE_MEMORY_CAPS` names each region by its region id, and
 retained intermediary to the free pool; memmgr does not derive from the
 caller's cap.
 
-Only three labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
-attached cap), `DELEGATE_ASPACE` (`cap[0]`) and `REGISTER_PRESSURE`
-(`cap[0]`). memmgr deletes every other cap a message carries before it
+Only five labels carry caps in their contract: `DONATE_MEMORY_CAPS` (every
+attached cap), `DELEGATE_ASPACE` (`cap[0]`), `REGISTER_PRESSURE` (`cap[0]`),
+`REGISTER_PROCESS` (`cap[0]`) and `NODE_REGISTER_LIMIT` (`cap[0]` and
+`cap[1]`). memmgr deletes every other cap a message carries before it
 handles the message, whatever the label, the caller, or the reply: the caps
 attached to any other label (a `FAULT_LABEL` message and an unknown label
-included) and the caps after `cap[0]` on `DELEGATE_ASPACE` and
-`REGISTER_PRESSURE`. It deletes the contract caps as well when a procmgr-only
-label's caller is not procmgr, and in the error cases the three labels'
-sections state. An attached cap therefore never outlives the call that carried it
-unless memmgr takes ownership of it, so no client can fill memmgr's `CSpace`
-by attaching caps until its receive loop fails and memmgr exits with
-`EXIT_RECV_WEDGE` (see
+included), the caps after `cap[0]` on `DELEGATE_ASPACE`, `REGISTER_PRESSURE`
+and `REGISTER_PROCESS`, and the caps after `cap[1]` on
+`NODE_REGISTER_LIMIT`. It deletes the contract caps as well when a
+procmgr-only label's caller is not procmgr, when a label's class does not
+match the badge (§ Badge Discipline), and in the error cases the five labels'
+sections state. `REGISTER_PROCESS` reads the badge of its `cap[0]` and
+deletes it on every path, and `NODE_REGISTER_LIMIT` its `cap[1]`. An attached cap therefore
+never outlives the call that carried it unless memmgr takes ownership of it,
+so no client can fill memmgr's `CSpace` by attaching caps until its receive
+loop fails and memmgr exits with `EXIT_RECV_WEDGE` (see
 [docs/ipc-design.md](../../../docs/ipc-design.md#receive-failure-policy)
 §"Receive-Failure Policy").
 

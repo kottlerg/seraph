@@ -43,6 +43,7 @@ pub fn dispatch(role: &str)
     phases::random::reentry_main(role);
     phases::memmgr::reentry_main(role);
     phases::budget::reentry_main(role);
+    phases::node_handle::reentry_main(role);
     phases::heap_commit::reentry_main(role);
     phases::unmount::reentry_main(role);
 }

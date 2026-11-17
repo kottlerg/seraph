@@ -91,9 +91,9 @@ pub struct ProcessCaps
     /// [`NodeHandle::owned_next`]; [`NODE_NULL`] for none. Each goes with the
     /// record ([`crate::Ledger::remove_process`]).
     pub handles: NodeIdx,
-    /// The first [`Node::Handle`] slot whose limit registration the process
-    /// made, chained through [`NodeHandle::limit_next`]; [`NODE_NULL`] for
-    /// none. Each registration goes with the record
+    /// The first [`Node::Limit`] slot of the limit registrations the process
+    /// made, chained through [`LimitReg::by_next`]; [`NODE_NULL`] for none.
+    /// Each registration goes with the record
     /// ([`crate::Ledger::remove_process`]).
     pub limits: NodeIdx,
 }

@@ -1009,7 +1009,8 @@ pub enum BudgetRefusal
 {
     /// `CREATE_PHYS_ACCESS` from a creator that is not phys-class.
     PhysAccess,
-    /// `CREATE_RESERVE` from a creator whose node is outside the reserve.
+    /// `CREATE_RESERVE` from a creator whose node is outside the reserve, or
+    /// with `CREATE_CHARGE_NODE`.
     Reserve,
     /// `CREATE_MEMORY_MAX` without its data word delivered.
     MissingMax,
@@ -1023,8 +1024,10 @@ pub enum BudgetRefusal
 /// creator). `procmgr_labels::CREATE_PHYS_ACCESS` asks for a phys-class
 /// child, honoured only from a phys-class creator ([`Creator::phys_class`]).
 /// `procmgr_labels::CREATE_RESERVE` asks for a reserve node, honoured only
-/// from a creator whose own node is a reserve node; a child of the un-badged
-/// creator is a reserve node with or without it.
+/// from a creator whose own node is a reserve node and never with
+/// `procmgr_labels::CREATE_CHARGE_NODE`, whose node may be a sub-node, which
+/// is never in the reserve; a child of the un-badged creator not charged to a
+/// node handle is a reserve node with or without it.
 ///
 /// # Errors
 /// [`BudgetRefusal::PhysAccess`] or [`BudgetRefusal::Reserve`] when the
@@ -1035,20 +1038,23 @@ pub fn child_budget(
     creator: &Creator,
 ) -> Result<ChildBudget, BudgetRefusal>
 {
-    use ipc::procmgr_labels::{CREATE_NODE_HANDLE, CREATE_PHYS_ACCESS, CREATE_RESERVE};
+    use ipc::procmgr_labels::{
+        CREATE_CHARGE_NODE, CREATE_NODE_HANDLE, CREATE_PHYS_ACCESS, CREATE_RESERVE,
+    };
     let phys = label & CREATE_PHYS_ACCESS != 0;
     if phys && !creator.phys_class()
     {
         return Err(BudgetRefusal::PhysAccess);
     }
     let asks_reserve = label & CREATE_RESERVE != 0;
-    if asks_reserve && !creator.reserve
+    let charged = label & CREATE_CHARGE_NODE != 0;
+    if asks_reserve && (!creator.reserve || charged)
     {
         return Err(BudgetRefusal::Reserve);
     }
     Ok(ChildBudget {
         phys,
-        reserve: asks_reserve || creator.unbadged,
+        reserve: asks_reserve || (creator.unbadged && !charged),
         parent: creator.memmgr_badge,
         max,
         node_handle: label & CREATE_NODE_HANDLE != 0,
@@ -2618,6 +2624,32 @@ mod tests
             child_budget(ipc::procmgr_labels::CREATE_NODE_HANDLE, None, &client)
                 .map(|b| (b.node_handle, b.charge)),
             Ok((true, 0))
+        );
+    }
+
+    #[test]
+    fn a_child_charged_to_a_node_handle_is_outside_the_reserve()
+    {
+        use ipc::procmgr_labels::{CREATE_CHARGE_NODE, CREATE_RESERVE};
+        // Not even a reserve creator may ask for a reserve child charged to
+        // a handle: the handle's node may be a sub-node, never in the reserve.
+        let svcmgr = entry_creator(0x51);
+        assert_eq!(
+            child_budget(CREATE_RESERVE | CREATE_CHARGE_NODE, None, &svcmgr),
+            Err(BudgetRefusal::Reserve)
+        );
+        assert_eq!(
+            child_budget(CREATE_RESERVE | CREATE_CHARGE_NODE, None, &Creator::UNBADGED),
+            Err(BudgetRefusal::Reserve)
+        );
+        // A charged child of the un-badged creator is not a reserve node.
+        assert_eq!(
+            child_budget(CREATE_CHARGE_NODE, None, &Creator::UNBADGED).map(|b| b.reserve),
+            Ok(false)
+        );
+        assert_eq!(
+            child_budget(CREATE_CHARGE_NODE, None, &svcmgr).map(|b| b.reserve),
+            Ok(false)
         );
     }
 

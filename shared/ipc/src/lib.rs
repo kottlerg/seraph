@@ -274,11 +274,12 @@ pub mod procmgr_labels
     /// Label flag (bit 32) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// make the child's memmgr budget node a system-reserve node
     /// (`memmgr_labels::REGISTER_RESERVE`). Honoured only from a creator
-    /// whose own node is a reserve node; procmgr refuses it from any other
-    /// creator (`INVALID_ARGUMENT`). A child of an un-badged creator (init)
-    /// is a reserve node with or without it. Specified in
-    /// `services/procmgr/docs/ipc-interface.md` § Label 1: `CREATE_PROCESS`
-    /// (**Memory max and reserve**).
+    /// whose own node is a reserve node, and never with [`CREATE_CHARGE_NODE`];
+    /// procmgr refuses it from any other creator, and with that flag
+    /// (`INVALID_ARGUMENT`). A child of an un-badged creator (init) not
+    /// charged to a node handle is a reserve node with or without it.
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 1:
+    /// `CREATE_PROCESS` (**Memory max and reserve**).
     pub const CREATE_RESERVE: u64 = 1 << 32;
     /// Label flag (bit 33) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]: the
     /// create reply carries the child's node handle as its last cap, a SEND on
@@ -298,7 +299,9 @@ pub mod procmgr_labels
     /// creator's, so every process created on one handle shares that node's
     /// max. procmgr passes the handle to memmgr with
     /// `memmgr_labels::REGISTER_CHARGE_NODE`, which refuses a cap that is no
-    /// live node handle. Specified in `services/procmgr/docs/ipc-interface.md`
+    /// live node handle. The child's node is outside the system reserve:
+    /// procmgr refuses [`CREATE_RESERVE`] with this flag (`INVALID_ARGUMENT`).
+    /// Specified in `services/procmgr/docs/ipc-interface.md`
     /// § Label 1: `CREATE_PROCESS` (**Memory max and reserve**).
     pub const CREATE_CHARGE_NODE: u64 = 1 << 34;
     /// Still-reserved bits `[35..64]` of a create label. Procmgr rejects

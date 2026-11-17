@@ -257,8 +257,9 @@ An anchor is 72 bytes:
 | 36 | 4 | `flags`: bit 0, `LOCAL`, marks a root generated on the build machine; every other bit is zero |
 | 40 | 32 | `label`: a nonempty UTF-8 name, padded with NUL bytes |
 
-The blob's length is exactly the sum of its parts, and no two anchors share a key id. A store that
-breaks any rule of this section is refused whole.
+The anchors are sorted by key id, strictly ascending, so no two share one and a lookup is a binary
+search; the revoked key ids are sorted the same way. The blob's length is exactly the sum of its
+parts. A store that breaks any rule of this section is refused whole.
 
 **Where it lives.** The store is built into the bootloader, which firmware Secure Boot covers on a
 platform that enables it. There is one copy: no Seraph variable in firmware storage, and no copy
@@ -392,10 +393,21 @@ before it writes the record, so a faulty signer cannot produce an image that fai
 
 **Implementation.** The host signer is Seraph's own: no crate from a registry is a dependency
 ([coding-standards.md](coding-standards.md) § Dependencies). Ed25519 key generation and signing
-join verification in [`shared/crypto`](../shared/crypto/README.md), constant-time in every secret
-value, deterministic as RFC 8032 § 5.1.6 specifies, and tested against reference vectors computed
-with OpenSSL. A deterministic signature keeps a build reproducible under one key: two builds of the
-same sources with the same key produce the same image.
+join verification in [`shared/crypto`](../shared/crypto/README.md), which guarantees:
+
+- a key is generated from a 32-byte secret seed drawn from the host's operating-system random
+  source, and its public key is derived from the seed as RFC 8032 § 5.1.5 specifies;
+- a signature is deterministic, as RFC 8032 § 5.1.6 specifies: one key and one message give one
+  signature, whose S is below the group order L;
+- no branch and no memory index depends on a secret value (the seed, the secret scalar, the nonce
+  prefix, or the nonce), only on the message length and on public values;
+- the primitive holds no key between calls: its caller passes the seed on every call;
+- tests show that a key and a signature equal, byte for byte, the ones the testkit's OpenSSL
+  reference vectors give for the same seed and message, and that every signature it makes verifies
+  under `ed25519_verify`.
+
+A deterministic signature keeps a build reproducible under one key: two builds of the same sources
+with the same key produce the same image.
 
 **What is signed.** xtask signs every object it installs into the sysroot and every bundle entry,
 after the build installs them and before it composes the bundle and the disk image, with the kind

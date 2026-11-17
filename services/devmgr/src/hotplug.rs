@@ -1057,8 +1057,10 @@ fn release(caps: &mut caps::DevmgrCaps, spans: &[(u64, u64)])
 /// live record behind it ([`Registry::withdraw_at`]), its device's BAR caps
 /// given back to the held BAR pages; quiesce each function
 /// ([`hp::quiesce`]); return the held BAR pages inside their BARs to the
-/// apertures, whole; and mark the records removed. A driver that does not
-/// answer cannot delay it: a withdrawal asks the driver nothing.
+/// apertures, whole; mark the records removed; and return each removed
+/// record's instance to its driver's instance limit
+/// ([`bind::Records::release_removed`]). A driver that does not answer
+/// cannot delay it: a withdrawal asks the driver nothing.
 fn remove(
     slot: &Slot,
     registry: &Registry,
@@ -1089,6 +1091,7 @@ fn remove(
     );
     caps.slot_bars = held;
     caps.apertures = free;
+    records.release_removed();
     let returned = match removal.returned
     {
         Ok(returned) => returned,

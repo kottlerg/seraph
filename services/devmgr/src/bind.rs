@@ -53,7 +53,7 @@ use crate::{
 /// Every device record a bind pass walks, in record order: the PCI records
 /// ([`PciRecords`]), then the platform records ([`crate::platform`]), each
 /// with its state, and how many devices each driver with an instance limit
-/// has been started for over the boot.
+/// has been started for over the boot, less the removed ones.
 pub struct Records
 {
     pub pci: PciRecords,
@@ -91,6 +91,17 @@ impl Records
             .devices()
             .len()
             .saturating_add(self.platform_states.len())
+    }
+
+    /// Return to its driver's instance limit each limited driver's PCI
+    /// record now removed ([`BoundCounts::release_removed`]), so a later
+    /// pass may bind the driver to the device that replaces it; returns how
+    /// many were returned.
+    pub fn release_removed(&mut self) -> usize
+    {
+        let pci = &self.pci;
+        self.bound_counts
+            .release_removed(|index| pci.state(index) == Some(RecordState::Removed))
     }
 
     /// The PCI functions of every record not removed, in record order.
@@ -439,8 +450,13 @@ fn bind_pci_records(
                     records.mark_bound(at);
                     table.note_bound(index);
                     if let Some(candidate) = table.candidates().get(index)
+                        && bound_counts.note_pci(&candidate.decl.name, at).is_err()
                     {
-                        bound_counts.note(&candidate.decl.name);
+                        std::os::seraph::log!(
+                            warn: "{}: no memory to keep its instance; its device's removal \
+                                   does not return it",
+                            candidate.decl.name.as_str()
+                        );
                     }
                 }
             }

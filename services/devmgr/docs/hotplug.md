@@ -207,7 +207,12 @@ The control thread runs the removal job (`firmware::hotplug::remove`), in this o
    apertures, whole (`firmware::hotplug::return_bars`): a span moves as the cap it is, so nothing
    is split, and only out of the held BAR pages, so a page is returned once;
 4. it marks their records removed (`PciRecords::remove`); the port's own record is on the bus
-   above and stays.
+   above and stays;
+5. it returns the instance of each removed record bound to a driver with an instance limit
+   (`BoundCounts::release_removed`), so a later pass can bind that driver to the device that
+   replaces it ([docs/driver-binding.md](../../../docs/driver-binding.md#matching) § Matching).
+   The instance returns only here, once the driver is withdrawn and the record removed, so a
+   driver never serves more devices than its limit.
 
 It logs `functions removed` with the number of records removed, drivers withdrawn and held spans
 returned, and posts the slot back to the poller, which powers it off in two Slot Control writes: the
@@ -226,7 +231,8 @@ An IOMMU fault is counted for a requester ID only while a DMA grant of a live re
 once the device is blocked, and a fault of an untracked requester ID is logged, not counted. A
 function added at a removed one's address starts with no faults.
 
-Returned BAR caps stay split: no syscall merges two adjacent `Mmio` caps, so a window's free
+Returned BAR caps stay split: no syscall merges two adjacent `Mmio` caps
+([#1230](https://github.com/kottlerg/seraph/issues/1230) adds one), so a window's free
 range comes back as the spans it was carved into, each placeable on its own. A card added again
 with the same BARs is placed in the same spans; a BAR larger than the largest span left, or whose
 aligned base falls across two spans, no longer fits, logged as `the slot's windows have no room

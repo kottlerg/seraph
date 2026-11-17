@@ -374,7 +374,7 @@ pub struct Declaration<'a>
     pub class: Option<&'a str>,
     /// One to [`MAX_MATCHES`] keys of the devices the driver serves.
     pub matches: &'a [Match<'a>],
-    /// The most devices of its match the driver is bound to; `None` for
+    /// The most devices of its match the driver serves at once; `None` for
     /// every one.
     pub instance_limit: Option<u16>,
     pub interrupt: Interrupt,

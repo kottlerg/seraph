@@ -397,9 +397,10 @@ devmgr's responsibilities are:
   the device records still unbound, starts the drivers it binds in a settle
   batch of its own, and serves them once it settles, within `SETTLE_TIMEOUT`.
   A record is bound at most once a boot, so a second request over the same
-  directory binds nothing; a limited driver's bound devices are counted over
-  the boot by driver name (`BoundCounts`), so each pass binds it only to the
-  devices its limit leaves. A request with no directory cap, before
+  directory binds nothing; a limited driver's bound devices are counted across
+  passes by driver name (`BoundCounts`), so each pass binds it only to the
+  devices its limit leaves, and a device's hotplug removal returns its
+  instance. A request with no directory cap, before
   `SET_DRIVERS_DIR`, or while an earlier one is not done gets
   `INVALID_REQUEST`. A `QUERY_DEVICE` whose answer would name no driver waits
   until the pass and its settle end.

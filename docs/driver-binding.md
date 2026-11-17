@@ -163,7 +163,7 @@ describes, and a signature over the binary would cover its declaration with it.
 | Name | The driver's name in log lines |
 | Match entries | One or more keys of § Device Records: a PCI vendor and device, or a PCI class, subclass, and programming interface under a mask; an ACPI `_HID` or `_CID`; an SPCR interface type; a platform key; an IOMMU family key; the `boot-framebuffer` key |
 | Class | The name of the device class the driver serves (§ Device Classes) |
-| Instance limit | The most devices of its match the driver is bound to; absent means every one |
+| Instance limit | The most devices of its match the driver serves at once; absent means every one |
 | Interrupt need | None, optional, or required, and for a message-signaled capable driver the vector count it requests, given only beside DMA ([device-management.md](device-management.md#message-signaled-interrupts) § Message-Signaled Interrupts) |
 | DMA | Whether the device performs DMA: the driver is then created `CREATE_PINNED` and `CREATE_DMA_HOLD` and given a DMA capability ([device-management.md](device-management.md#dma-authorisation) § DMA Authorisation) |
 | DMA address width | Optional, valid only beside DMA: the address bits the device's DMA reaches, 12 to 64; absent means the device has no limit of its own. devmgr limits the device's IOVA space to the smaller of this and its unit's width (§ Declaration Bounds) |
@@ -250,9 +250,13 @@ and unbound, and a later declaration (a driver installed afterwards, through `BI
 hotplug pass) can still match it. A hotplug pass is a drivers-directory pass over the directory
 `SET_DRIVERS_DIR` installed, run against the records still unbound once a hotplug arrival has
 appended one ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding)
-§ Binding). A limited driver's bound devices are counted by driver name, within a pass and over the
-boot, so two declarations of one name share one count and a later pass binds the driver only to the
-devices its limit leaves.
+§ Binding). A limited driver's bound devices are counted by driver name, within a pass and across
+passes, so two declarations of one name share one count and a later pass binds the driver only to
+the devices its limit leaves. A PCI device's hotplug removal returns its instance once the removal
+has withdrawn the driver and removed the record, so the limit bounds the devices the driver serves
+at once, and a later pass can bind the driver to the device that replaces it. A withdrawal for any
+other cause, the driver's death among them, returns nothing: the record stays, and a record is
+bound at most once a boot.
 
 The IOMMU driver is matched by its family key against the IOMMU record (the declaration's
 `IommuFamily` match against `dmar` on x86-64 or `rimt` on riscv64), so one driver process

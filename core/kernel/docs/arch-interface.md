@@ -789,6 +789,13 @@ CS-keyed stubs do not depend on it. `FSGSBASE` is classified unsupported in
 /// The 0-based logical CPU index used by arch-neutral code (`PerCpuData::cpu_id`).
 pub fn current_cpu() -> u32;
 
+/// The core key of logical CPU `cpu`, called on that CPU: equal for exactly the logical CPUs
+/// that share one core. x86-64 shifts the x2APIC ID right by the SMT level's shift from CPUID
+/// leaf 1FH when it enumerates one, else 0BH (`smt_core_key`), and returns the CPU index when
+/// the leaf enumerates no level; riscv64 returns `cpu`, each hart being its own core.
+/// `topology::record_this_cpu` stores it.
+pub fn core_key(cpu: u32) -> u32;
+
 /// Read the current stack pointer (`rsp` / `sp`). Used by the panic-path
 /// backtrace scanner to bound the kernel-stack walk, and at `kernel_entry`'s
 /// first statement to locate the handoff stack (`stack_depth`).

@@ -405,11 +405,12 @@ re-mark under the running thread's, the idle level when it switches to idle, and
 boot dispatch of init), and read by its `timer_tick`, which may not read the running thread's
 `priority` without that thread's `sched_lock`. `saved_lock_flags` is the interrupt word
 an all-CPU-locks holder parks while it holds that CPU's lock (`lock_saving_flags`,
-`unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample, and
-`idle_pull_cursor`, where its scan starts ([scheduler.md](scheduler.md) § Load Balancing), are
-written and read only by their own CPU's `timer_tick`. `non_empty`, `load`, `idle_pull_candidate`,
-`idle_pull_cursor` and the deferred-reclaim head are atomics with their own orderings
-(§ Atomic Ordering Invariants).
+`unlock_saved_flags`). `idle_pull_candidate`, the idle pull's confirmation sample,
+`idle_pull_held`, whether the previous idle tick held it for a busy SMT sibling, and
+`idle_pull_cursor`, where its scan starts ([scheduler.md](scheduler.md) § Load Balancing, § SMT
+Awareness), are written and read only by their own CPU's `timer_tick`. `non_empty`, `load`,
+`idle_pull_candidate`, `idle_pull_held`, `idle_pull_cursor` and the deferred-reclaim head are
+atomics with their own orderings (§ Atomic Ordering Invariants).
 
 **Lock primitive.** All locks above except the derivation tree lock are `crate::sync::Spinlock`
 (IRQ-disabling); the derivation tree lock is a bare spin lock (below). Hold-time MUST be bounded
@@ -1054,7 +1055,9 @@ selection policy is, in priority order: (1) hard affinity
 `preferred_cpu` while `context_saved == 0` (closes the cross-CPU
 `schedule()` spin against the source CPU's in-flight save), (3) sticky
 `preferred_cpu` when its load is within `LOAD_BALANCE_IMBALANCE_THRESHOLD`
-of the global `min_load`, and (4) the least-loaded CPU. The
+of the global `min_load`, and (4) the least-loaded CPU, a tie going to
+the CPU with the fewest busy SMT siblings, then the lowest index
+(`least_loaded_cpu`; [scheduler.md](scheduler.md) § SMT Awareness). The
 `LOAD_BALANCE_IMBALANCE_THRESHOLD` knob is shared with `try_pull_balance`,
 a busy CPU's pull ([scheduler.md](scheduler.md) § Load Balancing),
 so the wake-side stickiness and the busy-CPU pull's imbalance test
@@ -1336,6 +1339,7 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `BOOT_TRANSIENT_ACTIVE` | `core/kernel/src/sched/mod.rs` (decl) | Release on `init_storage` (set true) and `sched::enter` (set false) | Acquire on every `timer_tick` entry | Single-writer (BSP). The Release/Acquire pair gates `timer_tick` against firing during Phase 4–9 when the run queue and scheduler state have not yet stabilised. |
 | `load` (per `PerCpuScheduler`, `AtomicU32`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `increment_load` / `decrement_load` / `current_load`) | Relaxed `fetch_add` / `fetch_sub` in `increment_load` / `decrement_load` | Relaxed on `current_load` | Advisory: `select_target_cpu` and the periodic load balancer consult this; transient inconsistency does not violate correctness. A lock-free read can see `schedule()`'s momentary count of a requeue of the running thread before its dequeue, so the balancer's pull re-decides its rule on both CPUs' loads under their two run-queue locks, where every change has completed ([scheduler.md § Load Balancing](scheduler.md#load-balancing)). The counter MUST track queue occupancy: every `enqueue` increments, every `dequeue_highest` / `remove_from_queue` decrements, the idle thread's link on the idle queue (by the idle loop's `schedule(Requeue::Always)`) and its dequeue included, so a CPU that left its idle thread for another counts it until it next runs it. |
 | `idle_pull_candidate` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_candidate` / `set_idle_pull_candidate` / `forget_idle_pull_candidate`, called from `try_pull_idle` and `try_pull_balance`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; the candidate CPU's run-queue mask is re-read (`has_queued_thread`) and the pull revalidates under the run-queue locks, so a stale candidate costs at most one futile try-lock attempt. |
+| `idle_pull_held` (per `PerCpuScheduler`, `AtomicBool`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_held` / `set_idle_pull_candidate`, which clears it / `hold_idle_pull_candidate` / `forget_idle_pull_candidate`, called from `try_pull_idle` and `try_pull_balance`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only delays a pull by one tick ([scheduler.md](scheduler.md) § SMT Awareness). |
 | `idle_pull_cursor` (per `PerCpuScheduler`, `AtomicUsize`) | `core/kernel/src/sched/run_queue.rs` (decl in `PerCpuScheduler`; ops `idle_pull_cursor` / `set_idle_pull_cursor`, called from `try_pull_idle`) | Relaxed `store`, by the owning CPU's `timer_tick` only | Relaxed `load`, by the owning CPU's `timer_tick` only | Single-CPU state: one CPU writes and reads it, so no ordering edge is needed; it only orders the idle scan, which every pull revalidates under the run-queue locks. |
 | `park_disposition` (per TCB, `AtomicU8`) | `core/kernel/src/sched/thread.rs` (decl; ops `open_park_episode`, `stamp_park_deposit`, `consume_park_interrupted`, `consume_park_cancel`; `consume_call_disposition` in `core/kernel/src/syscall/ipc.rs`) | Release `store` of `NONE` by `open_park_episode` (directly or via `open_call_episode`) before the thread becomes claimable; Release `store` of the disposition by the wake-claim winner in `stamp_park_deposit` (directly or via `stamp_cancelled_deposit`) | Acquire `load` on resume in `consume_park_interrupted` / `consume_park_cancel` / `consume_call_disposition` | The claim winner's Release orders its deposit (`ipc_msg`, `wakeup_value`) before the stamp, so a resuming thread whose Acquire load observes the stamp also observes the deposit; see [ipc-internals.md § Park Dispositions and Episodes](ipc-internals.md#park-dispositions-and-episodes) for the episode protocol. |
 | `deferred_reclaim_head` (per `PerCpuScheduler`, `AtomicPtr<u8>`) | `core/kernel/src/sched/run_queue.rs` (decl); push in `push_deferred_reclaim` and drain in `drain_deferred_reclaim` (`core/kernel/src/cap/object.rs`) | AcqRel `compare_exchange` push (Acquire on failure and on the head load) | Acquire `load` fast-path empty check, then AcqRel `swap(null)` drain | Lock-free Treiber stack: the push's Release publishes the node's intrusive link written before the CAS, and the drain's Acquire swap observes it, so the draining CPU walks fully linked nodes. |
@@ -1351,6 +1355,7 @@ the ordering choice is required for correctness; relaxations would introduce a r
 | `LOAD_BALANCE_TICK` | `core/kernel/src/sched/mod.rs` (decl, balancer) | Relaxed on `fetch_add` (sole writer is the loaded-path victim selection in `try_pull_balance`) | Relaxed on the same `fetch_add` (consumes the previous value) | Advisory random-victim seed; correctness does not depend on ordering — a stale value just biases victim selection slightly. |
 | `CPU_COUNT` | `core/kernel/src/sched/mod.rs` (decl) | Relaxed on store (`init_storage`) | Relaxed on every read | Single-writer at boot; the SCHEDULERS_PTR Release publishes the storage; readers establish happens-before via the pointer load, not via CPU_COUNT itself. |
 | `SCHEDULERS_PTR`, `IDLE_TCBS_PTR`, `IDLE_STACK_TOPS_PTR`, `LAST_NON_IDLE_TICK_PTR`, `AP_TSS_PTR`, `AP_GDT_PTR`, `AP_IST_STACKS_PTR`, `PER_CPU_PTR`, `CPU_APIC_IDS_PTR` | per-`AtomicPtr` declaration sites | Release on `store` in `init_storage` (including `percpu::init_storage`) and per-arch initialisers | Acquire on `load` in `scheduler_ptr`, `idle_tcb_ptr`, `running_tcb_raw`, `per_cpu_ptr`, `apic_id_for`, AP startup helpers | Publishes the zeroed and constructed slab to every CPU; the Acquire establishes happens-before with the storage construction. |
+| `CORE_SLOTS_PTR`, `SIBLING_RING_PTR` | `core/kernel/src/topology.rs` (decl) | Release `store` in `topology::init_storage` (`CORE_SLOTS_PTR`) and in `topology::build_sibling_rings` (`SIBLING_RING_PTR`, Phase 8, once every AP is online) | Acquire `load` in `record_this_cpu`, `build_sibling_rings`, `sibling_after`, `busy_siblings` | Publishes the slab; for `SIBLING_RING_PTR`, every link written before the publication. A null `SIBLING_RING_PTR` reads as no siblings. |
 
 **Rules:**
 - The per-TCB `sched_lock` (a `crate::sync::Spinlock`, not an atomic; see § Cross-CPU TCB Ownership)

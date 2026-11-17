@@ -105,9 +105,10 @@ scaling, and DRAM rows. The system draws the line as follows.
   example) gives no guarantee that can be stated. Cross-domain isolation is design intent, not
   yet implemented ([#1086](https://github.com/kottlerg/seraph/issues/1086)).
 - **SMT** — stays on. The kernel brings up and schedules every logical CPU, SMT siblings
-  included, as an independent CPU. Siblings are not an isolation boundary: threads of different
-  processes run on the siblings of one core at once, and contention for the resources the
-  siblings share is a channel between them
+  included, as a CPU of its own, and among CPUs of equal load places work on one whose siblings
+  are idle, a preference for throughput. Siblings are not an isolation boundary: threads of
+  different processes run on the siblings of one core at once, and contention for the resources
+  the siblings share is a channel between them
   ([core/kernel/docs/scheduler.md](../core/kernel/docs/scheduler.md) § SMT Awareness).
 - **Accepted and unmitigated** — cache-based side channels outside the transient-execution
   classes above, frequency-scaling (DVFS) channels of the Hertzbleed class, and Rowhammer, at

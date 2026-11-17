@@ -82,6 +82,7 @@ mod sched;
 mod stack_depth;
 mod sync;
 mod syscall;
+mod topology;
 mod uaccess;
 mod validate;
 
@@ -547,6 +548,11 @@ unsafe fn kernel_entry_post_rebase(
     #[cfg(not(test))]
     syscall::scratch::init_storage(boot_cpu_count, allocator);
 
+    // Allocate the core-key and sibling-ring slabs (core/kernel/docs/scheduler.md
+    // § SMT Awareness), for the same reason.
+    #[cfg(not(test))]
+    topology::init_storage(boot_cpu_count, allocator);
+
     // Allocate the frame map table (per-frame user-mapping counts,
     // core/kernel/docs/memory-internals.md § Frame Map Table) before the
     // Phase-7 drain, while the buddy still holds 1 MiB blocks, and before
@@ -798,6 +804,15 @@ unsafe fn kernel_entry_post_rebase(
         if cpu_count == 1 { "" } else { "s" }
     );
 
+    // Record the boot CPU's core key before any AP records its own; the boot
+    // CPU links the rings from them once every AP is online (below).
+    // SAFETY: on CPU 0, below CPU_COUNT, once, after Phase 4's
+    // topology::init_storage and before build_sibling_rings.
+    #[cfg(not(test))]
+    unsafe {
+        topology::record_this_cpu(0);
+    }
+
     // SMP startup brings every AP online on the idle threads `sched::init` just
     // initialised, through `ap_trampoline::setup_trampoline` / `start_ap` behind
     // the `arch::current` facade; the APS_READY dependency and barrier rules are
@@ -898,6 +913,18 @@ unsafe fn kernel_entry_post_rebase(
 
             kprintln!("smp: all {} AP(s) online", ap_count);
         }
+
+        // Every CPU has recorded its core key: each AP before the APS_READY
+        // increment the wait above observed with Acquire. Link and publish
+        // the sibling rings the scheduler's placement reads.
+        // SAFETY: the boot CPU, once, with the count init_storage sized the
+        // slabs for; every AP's record is ordered before this by the wait.
+        let rings = unsafe { topology::build_sibling_rings(boot_cpu_count as usize) };
+        kprintln!(
+            "topology: {} core(s), at most {} thread(s) per core",
+            rings.cores,
+            rings.max_threads
+        );
     }
 
     // Validate the entropy subsystem now that every CPU's generator is live:
@@ -1988,6 +2015,15 @@ pub extern "C" fn kernel_entry_ap(cpu_id: u32, ist1_top: u64, ist2_top: u64) -> 
     // Capture this AP's entropy self-test sample. The AP's generator seeds
     // lazily from the pool (already seeded in Phase 5) on this first draw.
     entropy::init_ap();
+
+    // Record this AP's core key for the sibling rings the BSP links once every
+    // AP is online.
+    // SAFETY: on this AP, cpu_id below CPU_COUNT, once, after Phase 4's
+    // topology::init_storage and before the APS_READY increment below, which
+    // the BSP's Acquire wait pairs with before it links the rings.
+    unsafe {
+        topology::record_this_cpu(cpu_id);
+    }
 
     // 7. Notify the BSP that this AP is ready.
     APS_READY.fetch_add(1, Ordering::Release);

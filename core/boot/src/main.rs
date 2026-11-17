@@ -30,7 +30,7 @@ use crate::elf::{ElfKind, KernelInfo, load_init, load_kernel};
 use crate::error::BootError;
 use crate::firmware::{FirmwareInfo, discover_firmware};
 use crate::paging::{PageTableBuilder, build_initial_tables};
-use crate::signing::{parse_store, verify_object};
+use crate::signing::{Verifier, parse_store};
 use crate::uefi::{
     EFI_RNG_PROTOCOL_GUID, EFI_SUCCESS, EfiBootServices, EfiFileProtocol, EfiGuid, EfiHandle,
     EfiRngProtocol, EfiSystemTable, allocate_pages, connect_all_controllers, exit_boot_services,
@@ -43,7 +43,7 @@ use boot_protocol::{
     MmioApertureSlice, ModuleSlice, RECLAIM_FLAG_LATE, ReclaimRange, ReclaimSlice,
     TRUST_STORE_MODULE, bundle,
 };
-use objsig::{Kind, TrustStore};
+use objsig::Kind;
 
 /// Maximum boot modules carried in [`BootInfo::modules`]: the ABI bound, the
 /// `BootModule` entries the one-page module array holds.
@@ -423,13 +423,14 @@ unsafe fn boot_sequence(image: EfiHandle, st: *mut EfiSystemTable) -> Result<!, 
     // The trust store every object is verified against (docs/signing.md
     // § Trust Store); one that does not parse halts the boot here.
     let store_bytes = signing::embedded_store();
-    let store = parse_store(store_bytes)?;
+    let mut verifier = Verifier::new(parse_store(store_bytes)?);
     // SAFETY: ctx.esp_root is a valid FAT directory handle.
     let bundle_load = unsafe { step2_load_bundle(&ctx)? };
     // SAFETY: ctx.bs / esp_root are valid until ExitBootServices.
-    let mut kernel = unsafe { step3_load_kernel(&ctx, &store)? };
+    let mut kernel = unsafe { step3_load_kernel(&ctx, &mut verifier)? };
     // SAFETY: bundle_load.phys/len name a valid identity-mapped UEFI allocation.
-    let (init, mods) = unsafe { step4_parse_bundle(&ctx, &bundle_load, &store, store_bytes)? };
+    let (init, mods) =
+        unsafe { step4_parse_bundle(&ctx, &bundle_load, &mut verifier, store_bytes)? };
     // SAFETY: ctx.st is a valid UEFI system table.
     let firm = unsafe { step5_discover_firmware(&ctx) };
     // SAFETY: ctx.st is valid; firmware addresses are identity-mapped by UEFI.
@@ -638,7 +639,7 @@ unsafe fn step2_load_bundle(ctx: &UefiContext) -> Result<BundleLoad, BootError>
 
 // ── Step 3: Load kernel ELF ──────────────────────────────────────────────────
 
-/// Read the kernel whole, verify it against `store` as the kernel named
+/// Read the kernel whole, verify it through `verifier` as the kernel named
 /// `kernel`, then parse and load its body into UEFI-allocated physical memory.
 ///
 /// # Safety
@@ -646,7 +647,7 @@ unsafe fn step2_load_bundle(ctx: &UefiContext) -> Result<BundleLoad, BootError>
 /// handle respectively.
 unsafe fn step3_load_kernel(
     ctx: &UefiContext,
-    store: &TrustStore<'_>,
+    verifier: &mut Verifier<'_>,
 ) -> Result<KernelLoad, BootError>
 {
     bprintln!("[--------] boot: step 3/10: load kernel ELF");
@@ -670,7 +671,7 @@ unsafe fn step3_load_kernel(
     // SAFETY: kernel_file is open and at position 0; kernel_buf is the correct size.
     unsafe { file_read(kernel_file, kernel_buf)? };
     // Verify before the ELF header is read: only the verified body is parsed.
-    let body = verify_object(kernel_buf, store, Kind::Kernel, b"kernel")?;
+    let body = verifier.object(kernel_buf, Kind::Kernel, b"kernel")?;
     // SAFETY: bs is valid; body is the complete ELF image.
     let info = unsafe { load_kernel(ctx.bs, body, arch::current::EXPECTED_ELF_MACHINE)? };
     // The read buffer is dead: load_kernel copied every segment and the
@@ -707,8 +708,8 @@ fn bundle_body(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]>
     bytes.get(start..start.checked_add(len)?)
 }
 
-/// Walk the bundle header twice. The first walk verifies every entry against
-/// `store` under its entry name (`init` as init, every other entry as a boot
+/// Walk the bundle header twice. The first walk verifies every entry through
+/// `verifier` under its entry name (`init` as init, every other entry as a boot
 /// module) and refuses an entry named [`TRUST_STORE_MODULE`]; the second, once
 /// every entry has passed, ELF-loads the body of the entry named
 /// [`bundle::INIT_ENTRY_NAME`] into a fresh set of segment pages and exposes
@@ -723,7 +724,7 @@ fn bundle_body(bytes: &[u8], start: u64, len: u64) -> Option<&[u8]>
 unsafe fn step4_parse_bundle(
     ctx: &UefiContext,
     bundle_load: &BundleLoad,
-    store: &TrustStore<'_>,
+    verifier: &mut Verifier<'_>,
     store_bytes: &[u8],
 ) -> Result<(InitLoad, ModulesLoad), BootError>
 {
@@ -742,7 +743,7 @@ unsafe fn step4_parse_bundle(
     let header = parse_bundle_header(bytes)?;
     // First walk: verify every entry before any is parsed or exposed, and
     // keep init's verified body.
-    let init_body = verify_bundle(bytes, header.entry_count, store)?;
+    let init_body = verify_bundle(bytes, header.entry_count, verifier)?;
     bprintln!(
         "[--------] boot: bundle: {} entries verified",
         header.entry_count
@@ -824,7 +825,7 @@ fn parse_bundle_header(bytes: &[u8]) -> Result<bundle::BundleHeader, BootError>
 }
 
 /// The first walk of [`step4_parse_bundle`]: verify each of the bundle's
-/// `entry_count` entries against `store` under its entry name, `init` as init
+/// `entry_count` entries through `verifier` under its entry name, `init` as init
 /// and every other entry as a boot module, before any is parsed or exposed
 /// (docs/signing.md § Verifier Discipline). Returns init's verified body.
 ///
@@ -835,7 +836,7 @@ fn parse_bundle_header(bytes: &[u8]) -> Result<bundle::BundleHeader, BootError>
 fn verify_bundle<'a>(
     bytes: &'a [u8],
     entry_count: u32,
-    store: &TrustStore<'_>,
+    verifier: &mut Verifier<'_>,
 ) -> Result<&'a [u8], BootError>
 {
     let mut init_body: Option<&[u8]> = None;
@@ -857,11 +858,11 @@ fn verify_bundle<'a>(
                     "bundle has multiple `init` entries",
                 ));
             }
-            init_body = Some(verify_object(object, store, Kind::Init, name)?);
+            init_body = Some(verifier.object(object, Kind::Init, name)?);
         }
         else
         {
-            verify_object(object, store, Kind::BootModule, name)?;
+            verifier.object(object, Kind::BootModule, name)?;
         }
     }
     init_body.ok_or(BootError::InvalidBundle("bundle missing `init` entry"))
@@ -2508,6 +2509,7 @@ mod tests
         memory_map, module_regions, push_reclaim_range, scrub, step6_and_7_spans, uefi,
         verify_bundle,
     };
+    use crate::signing::Verifier;
     use crate::signing::testing::{ROOT_SEED, STRANGER_SEED, signed, store_of};
     use boot_protocol::{
         KASLR_DISABLED_BY_KNOB, KASLR_ENTROPY_FW_RNG, KASLR_IMAGE_RANDOMIZED, bundle,
@@ -2546,10 +2548,10 @@ mod tests
     fn verified(entries: &[(&str, Vec<u8>)]) -> Result<Vec<u8>, BootError>
     {
         let store = store_of(&ROOT_SEED);
-        let store = TrustStore::parse(&store).unwrap();
+        let mut verifier = Verifier::new(TrustStore::parse(&store).unwrap());
         let bytes = bundle_of(entries);
         let header = bundle::parse_header(&bytes).unwrap();
-        verify_bundle(&bytes, header.entry_count, &store).map(<[u8]>::to_vec)
+        verify_bundle(&bytes, header.entry_count, &mut verifier).map(<[u8]>::to_vec)
     }
 
     // Defect caught: a boot module body outside the bundle allocation (the

@@ -11,11 +11,11 @@
 //! The store is embedded at build time from the file xtask names in
 //! `SERAPH_BOOT_TRUST_STORE` (xtask/README.md § Signing), in the layout of
 //! `objsig::embed`, through which a pack reads it back out of the installed
-//! image. Every object is verified through [`verify_object`], which returns
+//! image. Every object is verified through [`Verifier::object`], which returns
 //! the body the caller then parses and loads, or the one [`BootError`] that
 //! halts the boot.
 
-use objsig::{Arch, Expectation, Kind, KindSet, TrustStore, verify};
+use objsig::{Arch, CertificateCache, Expectation, Kind, KindSet, TrustStore, verify_cached};
 
 use crate::bprintln;
 use crate::error::{BootError, ObjectName};
@@ -87,31 +87,52 @@ pub fn parse_store(bytes: &[u8]) -> Result<TrustStore<'_>, BootError>
     Ok(store)
 }
 
-/// Verify `object` as a `kind` named `name` for this architecture, and
-/// return its body, the only bytes the caller may parse or load.
-///
-/// # Errors
-/// [`BootError::SignatureRefused`], naming the object and the verifier's
-/// refusal.
-pub fn verify_object<'a>(
-    object: &'a [u8],
-    store: &TrustStore<'_>,
-    kind: Kind,
-    name: &[u8],
-) -> Result<&'a [u8], BootError>
+/// The bootloader's verifier: the trust store, and the certificates whose
+/// signature has verified during this boot (`objsig::CertificateCache`), so the
+/// certificate every object of one signer carries is verified once.
+pub struct Verifier<'s>
 {
-    let expect = Expectation {
-        kinds: KindSet::of(&[kind]),
-        name,
-        arch: ARCH,
-    };
-    match verify(object, store, &expect)
+    store: TrustStore<'s>,
+    certificates: CertificateCache,
+}
+
+impl<'s> Verifier<'s>
+{
+    /// A verifier for `store` that has verified no certificate yet.
+    pub const fn new(store: TrustStore<'s>) -> Self
     {
-        Ok(verified) => Ok(verified.body),
-        Err(refusal) => Err(BootError::SignatureRefused {
-            object: ObjectName::new(name),
-            refusal,
-        }),
+        Self {
+            store,
+            certificates: CertificateCache::new(),
+        }
+    }
+
+    /// Verify `object` as a `kind` named `name` for this architecture, and
+    /// return its body, the only bytes the caller may parse or load.
+    ///
+    /// # Errors
+    /// [`BootError::SignatureRefused`], naming the object and the verifier's
+    /// refusal.
+    pub fn object<'a>(
+        &mut self,
+        object: &'a [u8],
+        kind: Kind,
+        name: &[u8],
+    ) -> Result<&'a [u8], BootError>
+    {
+        let expect = Expectation {
+            kinds: KindSet::of(&[kind]),
+            name,
+            arch: ARCH,
+        };
+        match verify_cached(object, &self.store, &expect, &mut self.certificates)
+        {
+            Ok(verified) => Ok(verified.body),
+            Err(refusal) => Err(BootError::SignatureRefused {
+                object: ObjectName::new(name),
+                refusal,
+            }),
+        }
     }
 }
 
@@ -203,10 +224,10 @@ mod tests
     fn an_accepted_object_yields_its_body()
     {
         let bytes = store_of(&ROOT_SEED);
-        let store = parse_store(&bytes).unwrap();
+        let mut verifier = Verifier::new(parse_store(&bytes).unwrap());
         let object = signed(&ROOT_SEED, b"\x7fELF kernel", Kind::Kernel, b"kernel");
         assert_eq!(
-            verify_object(&object, &store, Kind::Kernel, b"kernel").unwrap(),
+            verifier.object(&object, Kind::Kernel, b"kernel").unwrap(),
             b"\x7fELF kernel"
         );
     }
@@ -218,13 +239,12 @@ mod tests
     fn every_refusal_names_the_object()
     {
         let bytes = store_of(&ROOT_SEED);
-        let store = parse_store(&bytes).unwrap();
+        let mut verifier = Verifier::new(parse_store(&bytes).unwrap());
         let object = signed(&ROOT_SEED, b"devmgr image", Kind::BootModule, b"devmgr");
         let mut tampered = object.clone();
         tampered[0] ^= 1;
-        let refused = |object: &[u8], kind: Kind, name: &[u8]| match verify_object(
-            object, &store, kind, name,
-        )
+        let mut refused = |object: &[u8], kind: Kind, name: &[u8]| match verifier
+            .object(object, kind, name)
         {
             Err(BootError::SignatureRefused { object, refusal }) =>
             {
@@ -256,7 +276,9 @@ mod tests
         );
         let message = format!(
             "{}",
-            verify_object(&tampered, &store, Kind::BootModule, b"devmgr").unwrap_err()
+            Verifier::new(parse_store(&bytes).unwrap())
+                .object(&tampered, Kind::BootModule, b"devmgr")
+                .unwrap_err()
         );
         assert!(
             message.contains("devmgr") && message.contains("BodyHash"),

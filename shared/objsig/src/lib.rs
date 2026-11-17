@@ -41,7 +41,10 @@ pub use attrs::Attributes;
 pub use cert::{Certificate, CertificateBody};
 pub use store::{Anchor, AnchorSpec, TrustStore};
 pub use trailer::{Record, RecordSpec, Records, Signed, encode_trailer, split, trailer_len};
-pub use verify::{Expectation, RecordFailure, Refusal, Verified, verify};
+pub use verify::{
+    CERTIFICATE_CACHE_LEN, CertificateCache, Expectation, RecordFailure, Refusal, Verified, verify,
+    verify_cached,
+};
 
 /// Length in bytes of a key id: the first 16 bytes of the SHA-512 of a key.
 pub const KEY_ID_LEN: usize = 16;

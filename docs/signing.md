@@ -333,6 +333,13 @@ the attributes and the anchor of the record that passed, or one refusal.
    `issuer_key_id` with one) and, when one did, the check the first such record failed, so a log
    tells an object from an untrusted root from one whose trusted record failed.
 
+A verifier that checks several objects MAY hold each certificate whose signature has verified,
+with the anchor key it verified under, and take the signature check of a record whose
+certificate and anchor key equal a held pair as passed. The check is a function of those bytes
+alone, so the result is the one a fresh verification gives, and every other check of step 4 is
+made for every record. The bootloader holds the certificates for the whole boot, so the
+certificate every object of one signing key carries is verified once.
+
 A record that chains to no anchor is how one object carries the signatures of several parties:
 each system passes over the records of roots it does not trust and accepts the object on the one
 it does.

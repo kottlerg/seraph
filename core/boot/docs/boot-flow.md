@@ -36,7 +36,10 @@ is not.
 After step 1 the bootloader parses the trust store its build embedded
 ([docs/signing.md](../../../docs/signing.md) § Trust Store), against which steps 3 and 4
 verify every object they load, and logs each anchor's label and key id, an anchor marked
-`LOCAL` as locally generated, and the store's security floor. A store that does not parse
+`LOCAL` as locally generated, and the store's security floor. The verifier holds each
+certificate whose signature verifies for the rest of the boot, so the certificate every object
+of one signing key carries is verified once ([docs/signing.md](../../../docs/signing.md)
+§ Verification). A store that does not parse
 is fatal (`BootError::TrustStore`).
 
 Detail: [uefi-environment.md](uefi-environment.md)

@@ -6,11 +6,13 @@
 # (programs/crashme/README.md). See docs/testing.md.
 #
 # The same recipe as services/crashd.svc but for `CORE_DUMP`, which names
-# crashme.
+# crashme, and `CRASHD_OOM_STALL_MS`, which holds a fault memmgr declined for
+# want of memory for up to 3000 ms: the crashme tester's `oom-touch` case
+# (programs/crashme/README.md) reads that stall.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
-env             = CORE_DUMP=crashme
+env             = CORE_DUMP=crashme CRASHD_OOM_STALL_MS=3000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes

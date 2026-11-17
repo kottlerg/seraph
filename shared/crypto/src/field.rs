@@ -8,8 +8,12 @@
 //! Elements are 16 signed limbs of radix 2^16 ([`Fe`]). This compact
 //! representation (the `TweetNaCl` `gf` model) keeps every intermediate product
 //! comfortably inside `i64` and makes carry handling uniform, which is the
-//! safest basis for a from-scratch verifier. Verification touches only public
-//! data, so the arithmetic is variable-time by design.
+//! safest basis for a from-scratch implementation.
+//!
+//! The signer passes secret values through this arithmetic, so every operation
+//! but [`eq`] branches and indexes on loop counters only, and selects by mask:
+//! [`cswap`], which [`pack`] also uses. [`eq`] compares encodings with an early
+//! exit and takes public values only (point decompression).
 //!
 //! Limbs are kept loosely bounded between explicit carry passes; multiply and
 //! pack run enough carry rounds to renormalise. All public-facing encodings
@@ -63,6 +67,38 @@ pub(crate) const SQRTM1: Fe = [
     0xdf0b, 0x4fc1, 0x2480, 0x2b83,
 ];
 
+/// Test-only counts of the field multiplications and conditional swaps a
+/// thread performs, which the constant-time tests compare across secrets.
+#[cfg(test)]
+pub(crate) mod op_count
+{
+    use core::cell::Cell;
+
+    std::thread_local! {
+        static MULS: Cell<u64> = const { Cell::new(0) };
+        static SWAPS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn mul()
+    {
+        MULS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn swap()
+    {
+        SWAPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// The multiplications and the conditional swaps `f` performs.
+    pub(crate) fn of<T>(f: impl FnOnce() -> T) -> (u64, u64)
+    {
+        MULS.with(|c| c.set(0));
+        SWAPS.with(|c| c.set(0));
+        f();
+        (MULS.with(Cell::get), SWAPS.with(Cell::get))
+    }
+}
+
 /// One carry/reduce pass (radix-2^16 with the 2^256 ≡ 38 (mod p) fold).
 pub(crate) fn carry(o: &mut Fe)
 {
@@ -104,6 +140,8 @@ pub(crate) fn sub(o: &mut Fe, a: &Fe, b: &Fe)
 /// canonicalises).
 pub(crate) fn mul(o: &mut Fe, a: &Fe, b: &Fe)
 {
+    #[cfg(test)]
+    op_count::mul();
     let mut t = [0i64; 31];
     for (i, ai) in a.iter().enumerate()
     {
@@ -161,10 +199,16 @@ pub(crate) fn pow2523(o: &mut Fe, a: &Fe)
     *o = c;
 }
 
-/// Constant-shape conditional swap of `p` and `q` when `swap == 1`.
+/// Conditional swap of `p` and `q` when `swap == 1`, by mask: no branch
+/// depends on `swap`, a secret bit when the signer's ladder or [`pack`] of a
+/// secret value calls it.
 pub(crate) fn cswap(p: &mut Fe, q: &mut Fe, swap: u8)
 {
-    let mask = !(i64::from(swap).wrapping_sub(1));
+    #[cfg(test)]
+    op_count::swap();
+    // `black_box` keeps the optimiser from turning the masked select into a
+    // branch on `swap`.
+    let mask = core::hint::black_box(!(i64::from(swap).wrapping_sub(1)));
     for (p, q) in p.iter_mut().zip(q.iter_mut())
     {
         let t = mask & (*p ^ *q);
@@ -222,7 +266,7 @@ pub(crate) fn parity(a: &Fe) -> u8
     d[0] & 1
 }
 
-/// Equality after canonical reduction.
+/// Equality after canonical reduction. Variable-time: for public values only.
 pub(crate) fn eq(a: &Fe, b: &Fe) -> bool
 {
     let mut da = [0u8; 32];

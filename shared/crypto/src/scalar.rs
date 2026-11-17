@@ -6,9 +6,15 @@
 //! Arithmetic modulo the Ed25519 group order
 //! L = 2^252 + 27742317777372353535851937790883648493.
 //!
-//! Two operations suffice for verification: the canonical range check on the
-//! signature scalar S (RFC 8032 §5.1.7) and reduction of the 64-byte hash
-//! `SHA512(R‖A‖M)` to a scalar mod L. Both treat scalars as little-endian.
+//! Verification takes the canonical range check on the signature scalar S
+//! (RFC 8032 §5.1.7) and the reduction of a 64-byte hash to a scalar mod L;
+//! signing takes the reduction and [`mul_add`], which forms S. Scalars are
+//! little-endian.
+//!
+//! The reduction and `mul_add` take secret values when signing (the nonce
+//! hash, the secret scalar), and their branches and indices depend on loop
+//! counters only. The range check returns at the first byte that differs from
+//! L and takes the public S of a signature only.
 
 #![expect(
     clippy::cast_sign_loss,
@@ -25,7 +31,7 @@ pub(crate) const L: [u8; 32] = [
 ///
 /// Mandatory before verification (RFC 8032 §5.1.7): S must lie in `{0, …,
 /// L-1}`. `s == L` and anything larger is rejected, blocking signature
-/// malleability.
+/// malleability. Variable-time: for a public S only.
 pub(crate) fn is_canonical(s: &[u8; 32]) -> bool
 {
     for (sb, lb) in s.iter().zip(L.iter()).rev()
@@ -54,6 +60,33 @@ pub(crate) fn reduce_512(h: &[u8; 64]) -> [u8; 32]
     let mut r = [0u8; 32];
     mod_l(&mut r, &mut x);
     r
+}
+
+/// `(nonce + challenge · secret) mod L`: the signature scalar S of RFC 8032
+/// § 5.1.6 step 5, with `challenge` and `nonce` below L and `secret` the
+/// clamped secret scalar, below 2^255.
+///
+/// The product is formed in 64 signed limbs of radix 2^8, each below
+/// 32 · 255 · 255 + 255 < 2^21, the input bound of the `TweetNaCl` signer's
+/// `modL`, which [`mod_l`] follows.
+#[cfg(any(test, feature = "sign"))]
+pub(crate) fn mul_add(challenge: &[u8; 32], secret: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32]
+{
+    let mut limbs = [0i64; 64];
+    for (limb, byte) in limbs.iter_mut().zip(nonce)
+    {
+        *limb = i64::from(*byte);
+    }
+    for (i, factor) in challenge.iter().enumerate()
+    {
+        for (limb, byte) in limbs.iter_mut().skip(i).zip(secret)
+        {
+            *limb = limb.wrapping_add(i64::from(*factor).wrapping_mul(i64::from(*byte)));
+        }
+    }
+    let mut out = [0u8; 32];
+    mod_l(&mut out, &mut limbs);
+    out
 }
 
 /// Reduce mod L the `TweetNaCl` `modL` way: fold each high byte down by
@@ -144,6 +177,60 @@ mod tests
         let mut h = [0u8; 64];
         h[..32].copy_from_slice(&v);
         assert_eq!(reduce_512(&h), v);
+    }
+
+    /// `mul_add` equals `(r + k·a) mod L` (nonce r, challenge k, secret a) computed by the testkit's
+    /// independent 256-bit arithmetic, at the largest inputs the signer forms
+    /// and on generated ones.
+    #[test]
+    fn mul_add_equals_an_independent_reduction_mod_l()
+    {
+        use crypto_testkit::generate::edwards::scalars;
+        use crypto_testkit::generate::nat::U256;
+        use crypto_testkit::rng::Rng;
+
+        let order = scalars();
+        let mut l_minus_1 = L;
+        l_minus_1[0] -= 1;
+        let mut max_clamped = [0xff; 32];
+        max_clamped[0] = 0xf8;
+        max_clamped[31] = 0x7f;
+        let mut min_clamped = [0; 32];
+        min_clamped[31] = 0x40;
+        let mut one = [0; 32];
+        one[0] = 1;
+        let mut rng = Rng::new(0x5e4a_5ca1);
+        let generated = core::iter::repeat_with(|| {
+            let mut a: [u8; 32] = rng.array();
+            a[0] &= 0xf8;
+            a[31] = (a[31] & 0x7f) | 0x40;
+            (
+                order.reduce_le_bytes(&rng.array()).to_le_bytes(),
+                a,
+                order.reduce_le_bytes(&rng.array()).to_le_bytes(),
+            )
+        })
+        .take(256);
+        for (k, a, r) in [
+            ([0; 32], [0; 32], [0; 32]),
+            (l_minus_1, max_clamped, l_minus_1),
+            (l_minus_1, max_clamped, [0; 32]),
+            (one, max_clamped, l_minus_1),
+            (l_minus_1, min_clamped, l_minus_1),
+        ]
+        .into_iter()
+        .chain(generated)
+        {
+            let want = order.add(
+                U256::from_le_bytes(&r),
+                order.mul(U256::from_le_bytes(&k), U256::from_le_bytes(&a)),
+            );
+            assert_eq!(
+                mul_add(&k, &a, &r),
+                want.to_le_bytes(),
+                "k {k:?} a {a:?} r {r:?}"
+            );
+        }
     }
 
     #[test]

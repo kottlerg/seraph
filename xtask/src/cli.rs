@@ -162,6 +162,13 @@ subcommands! {
         /// unstage the fixture again (see xtask/README.md).
         TestDebugPort(TestDebugPortArgs),
 
+        /// Check the reboot path: stage the `reboot` fixture, boot the current
+        /// sysroot once with a QMP socket, and pass when the fixture's REBOOT
+        /// resets the machine (QMP's SHUTDOWN event with reason `guest-reset`)
+        /// and QEMU exits on its own, through acpid's `RESET_REG` write on
+        /// `x86_64`; unstage the fixture again (see xtask/README.md).
+        TestReboot(TestRebootArgs),
+
         /// Check the GDB stub: stage it and its `gdb-target` process, boot the
         /// current sysroot once with `--debug-port`, run the host's GDB in batch
         /// mode against the port, check what it reports, and unstage both
@@ -293,6 +300,7 @@ impl CliCommand
             | Self::TestMapRedo(_)
             | Self::TestLogLevel(_)
             | Self::TestDebugPort(_)
+            | Self::TestReboot(_)
             | Self::TestGdb(_)
             | Self::TestWedge(_)
             | Self::TestCet(_)
@@ -900,6 +908,30 @@ args! {
         /// free on `127.0.0.1` when the boot starts.
         #[arg(long)]
         pub port: Option<u16>,
+
+        /// Number of vCPUs to expose to the guest (QEMU -smp).
+        #[arg(long, default_value = "4")]
+        pub cpus: u32,
+
+        /// Guest memory size in MiB (QEMU -m).
+        #[arg(long, default_value = "512")]
+        pub mem: u32,
+
+        /// The shared host's launch rules (see xtask/README.md "Host launch
+        /// rules").
+        #[command(flatten)]
+        pub host: BootHostArgs,
+    }
+}
+
+// ── TestReboot ───────────────────────────────────────────────────────────────
+
+args! {
+    pub struct TestRebootArgs
+    {
+        /// Target architecture.
+        #[arg(long, default_value = "x86_64")]
+        pub arch: Arch,
 
         /// Number of vCPUs to expose to the guest (QEMU -smp).
         #[arg(long, default_value = "4")]

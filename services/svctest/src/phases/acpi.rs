@@ -23,6 +23,11 @@
 //! `devmgr.registry`, whose badge lacks it, and asserts `UNAUTHORIZED`: no
 //! holder of the registry cap can take an operation region, reach a PCI
 //! function's configuration space, or replace what acpid pushed.
+//!
+//! The power deny phase resolves the public `acpid.deny`, a SEND on acpid's
+//! endpoint without `POWER_AUTHORITY`, and asserts that `SLEEP(5)` and
+//! `RESET` reply `UNAUTHORIZED`: no process but the holder of the seed-only
+//! `acpid.power` (pwrmgr) can power the platform off or reset it.
 
 use std::time::{Duration, Instant};
 
@@ -52,6 +57,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "acpi_authority_deny",
             run: authority_deny_phase,
+        },
+        Phase {
+            name: "acpid_power_deny",
+            run: power_deny_phase,
         },
     ]
 }
@@ -205,4 +214,39 @@ fn authority_deny_phase(caps: &Caps)
         );
         assert!(reply.caps().is_empty(), "{name} deny must carry no cap");
     }
+}
+
+/// `SLEEP(5)` and `RESET` through the public `acpid.deny` reply
+/// `UNAUTHORIZED`. acpid serves its endpoint once its start-up is done, which
+/// the host-bridge phase before this one waits for.
+fn power_deny_phase(_caps: &Caps)
+{
+    let deny = std::os::seraph::registry::lookup(ipc::published_names::ACPID_DENY)
+        .expect("acpid power deny: acpid.deny must resolve");
+    let ipc_buf = std::os::seraph::current_ipc_buf();
+    for (label, arg, name) in [
+        (
+            ipc::acpid_labels::SLEEP,
+            ipc::acpid_labels::STATE_S5,
+            "SLEEP(5)",
+        ),
+        (ipc::acpid_labels::RESET, 0, "RESET"),
+    ]
+    {
+        let req = ipc::IpcMessage::builder(label)
+            .word(0, u64::from(ipc::ACPID_LABELS_VERSION))
+            .word(1, arg)
+            .build();
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(deny, &req, ipc_buf) }
+            .unwrap_or_else(|_| panic!("acpid {name} ipc_call failed"));
+        assert_eq!(
+            reply.label,
+            ipc::acpid_errors::UNAUTHORIZED,
+            "acpid {name} through acpid.deny must reply UNAUTHORIZED (got {:#x})",
+            reply.label
+        );
+    }
+    let _ = syscall::cap_delete(deny);
+    std::os::seraph::log!("acpid power-deny phase passed (UNAUTHORIZED replies)");
 }

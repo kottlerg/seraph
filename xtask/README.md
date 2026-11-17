@@ -53,7 +53,8 @@ xtask/
 │   │                           #   test, crypto_vectors, compare_images, test_crash_report,
 │   │                           #   test_debug_port,
 │   │                           #   test_cet, test_gdb, test_kaslr, test_log_level, test_map_redo,
-│   │                           #   test_terminal, test_vmgenid, test_wedge, lint_docs, pr_check,
+│   │                           #   test_reboot, test_terminal, test_vmgenid, test_wedge, lint_docs,
+│   │                           #   pr_check,
 │   │                           #   review, release_scope, issue, orch, hook, host)
 │   └── term/                   # Host-terminal adapters for the QEMU launch pipeline
 ├── targets/                    # Custom target JSON specs (see targets/README.md)
@@ -276,11 +277,11 @@ size of their FAT volumes, is 512 bytes, or 4096 bytes (4Kn) from
 `mkdisk --block-size 4096`. `build`, `mkdisk`, and `compose-bundle` all
 author the partitions above; `build` and `compose-bundle` author them at 512 bytes on a single
 image, so a 4Kn or split boot runs `mkdisk` after them. `run --debug-target`,
-`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-kaslr`, `test-map-redo`, and
-`test-log-level` repack the images in the layout they find: `disk.img`'s block size, and the data
-partition on `disk-data.img` when that image is there. The five test commands boot that layout,
-attaching `disk-data.img` as the second disk when it holds the data partition; `run` and
-`run-parallel` attach a second disk only as `--second-disk` names it.
+`run-parallel --debug-target`, `test-gdb`, `test-debug-port`, `test-reboot`, `test-kaslr`,
+`test-map-redo`, and `test-log-level` repack the images in the layout they find: `disk.img`'s block
+size, and the data partition on `disk-data.img` when that image is there. The six test commands
+boot that layout, attaching `disk-data.img` as the second disk when it holds the data partition;
+`run` and `run-parallel` attach a second disk only as `--second-disk` names it.
 
 `src/fat.rs` writes each FAT volume in one pass, with its variant chosen by its cluster count as
 the FAT specification's type rule chooses it: at 4 KiB clusters the ESP (64 MiB), root
@@ -1089,6 +1090,36 @@ reported skipped, which passes the command.
 
 ---
 
+### `cargo xtask test-reboot`
+
+Check the reboot path, on either arch. Stages the `reboot` fixture's recipe
+(`rootfs/config/svcmgr/tests/reboot.svc`: svctest's `reboot` role, seeded with
+`pwrmgr.shutdown`) from `config/svcmgr/tests/` into `config/svcmgr/services/`, repacks the disk
+images in the layout they have, and boots the current sysroot once, headless, with a QMP socket.
+The fixture sends pwrmgr `REBOOT`. QEMU runs with `-no-reboot`, so the reset ends it, and QMP's
+`SHUTDOWN` event names the cause. It then removes the recipe and repacks the images in that
+layout again, whatever the outcome. It passes when the fixture's `reboot fixture: requesting
+REBOOT` line appears, on `x86_64` acpid's `RESET: RESET_REG` line too, the `SHUTDOWN` event's
+reason is `guest-reset` (a power-off gives `guest-shutdown`), and QEMU exits on its own with
+success within 30 seconds of the event; [docs/testing.md](../docs/testing.md) § Reboot
+(`test-reboot`) says what each architecture's path is.
+
+A pure runner; requires a populated sysroot:
+
+```sh
+cargo xtask build [--arch x86_64|riscv64]
+cargo xtask test-reboot [--arch x86_64|riscv64] [--cpus N] [--mem MIB]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--arch` | `x86_64` | Target architecture |
+| `--cpus` | `4` | vCPUs of the guest |
+| `--mem` | `512` | Guest memory size in MiB |
+
+The boot to the `SHUTDOWN` event is bounded by five minutes. The QMP socket is
+`target/xtask/reboot-test-<arch>.sock`. CI runs the command in each `usertest` cell.
+
 ### `cargo xtask test-debug-port`
 
 Check the debug port's transport, on either arch. Stages the `debug-echo` fixture's recipe
@@ -1627,9 +1658,9 @@ the boot-option wait, 120 s for `pmemsave`, and 30 s for QEMU to quit.
 The worktrees of one checkout share one host. The commands that load it apply its launch rules
 themselves, from `src/host_lock.rs`, before they start: `build`, `clean`, `test`,
 `crypto-vectors` and `compare-images` as builds (`CliCommand::build_host` in `src/cli.rs` names
-them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-cet`,
-`test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and `capture-acpi`
-as boots.
+them); `run`, `run-parallel`, `test-terminal`, `test-vmgenid`, `test-wedge`, `test-reboot`,
+`test-cet`, `test-kaslr`, `test-map-redo`, `test-log-level`, `test-debug-port`, `test-gdb` and
+`capture-acpi` as boots.
 
 A boot is small when each QEMU it starts has at most 4 vCPUs and it starts at most 3 side by
 side (`run-parallel` starts `min(--parallel, --runs)` per wave). Any other boot needs the host

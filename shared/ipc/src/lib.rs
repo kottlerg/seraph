@@ -70,6 +70,7 @@ use syscall_abi::{MSG_CAP_HANDLES_WORD, MSG_CAP_SLOTS_MAX, MSG_DATA_WORDS_MAX};
 //     IOMMU_LABELS_VERSION      — every iommu_labels request (devmgr ↔ IOMMU driver)
 //     LOG_LABELS_VERSION        — every log_labels::QUERY_SLOTS and QUERY_HISTORY
 //                                 request (client ↔ logd)
+//     ACPID_LABELS_VERSION      — every acpid_labels request (pwrmgr ↔ acpid)
 //
 //   Implicitly covered by a parent-channel handshake:
 //     NS_LABELS_VERSION     — caps from vfsd_labels / fs_labels handshakes
@@ -1546,13 +1547,13 @@ pub mod svcmgr_labels
 /// four `devmgr.*` names, [`published_names::VFSD_MOUNT`],
 /// [`published_names::VFSD_SWAP`], [`published_names::LOGD_QUERY`], and each provider
 /// name whose badge carries a verb bit ([`crate::VERB_BIT_MASK`]; today
-/// `pwrmgr.shutdown`) resolve only through a recipe's `seed = ...` line, and
+/// `pwrmgr.shutdown` and `acpid.power`) resolve only through a recipe's `seed = ...` line, and
 /// `QUERY_ENDPOINT` answers them `UNKNOWN_NAME`. A name resolves to a SEND
 /// without `GRANT`, apart from [`published_names::DEVMGR_BIND`], which its
 /// seeds receive with `GRANT`, since `devmgr_labels::BIND_DRIVERS` moves a cap
 /// to devmgr; `QUERY_ENDPOINT` never yields `GRANT`.
 /// [`published_names::VFSD_DENY`] carries no authority but is seed-only
-/// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `timed`, and any
+/// too, as svctest's test twin. `svcmgr`, `pwrmgr.deny`, `acpid.deny`, `timed`, and any
 /// name published through [`svcmgr_labels::PUBLISH_ENDPOINT`] are public
 /// (services/svcmgr/docs/ipc-interface.md § Label 4).
 pub mod published_names
@@ -1601,8 +1602,8 @@ pub mod published_names
     /// SEND on devmgr's registry endpoint badged
     /// `REGISTRY_QUERY_AUTHORITY | SHUTDOWN_DEVICE_AUTHORITY`: the
     /// `devmgr.registry` surface plus `QUERY_SHUTDOWN_DEVICE`. Seed-only and
-    /// seeded only by pwrmgr, which acquires the platform shutdown actuators
-    /// through it.
+    /// seeded only by pwrmgr, which acquires the RISC-V SBI shutdown
+    /// authority through it.
     pub const DEVMGR_SHUTDOWN: &[u8] = b"devmgr.shutdown";
 
     /// SEND on devmgr's registry endpoint badged
@@ -1620,6 +1621,16 @@ pub mod published_names
     /// results (`devmgr_labels::ACPI_AUTHORITY`). Seed-only and seeded only
     /// by acpid.
     pub const DEVMGR_ACPI: &[u8] = b"devmgr.acpi";
+
+    /// `acpid_labels::POWER_AUTHORITY`-badged SEND on acpid's service
+    /// endpoint: `acpid_labels::SLEEP` and `acpid_labels::RESET`. Seed-only
+    /// and seeded only by pwrmgr.
+    pub const ACPID_POWER: &[u8] = b"acpid.power";
+
+    /// SEND on acpid's service endpoint badged with a sentinel that carries
+    /// no verb bit, so acpid's gate refuses it: the public negative-test twin
+    /// of [`ACPID_POWER`], which svctest resolves through `QUERY_ENDPOINT`.
+    pub const ACPID_DENY: &[u8] = b"acpid.deny";
 
     /// SEND on vfsd's service endpoint badged
     /// `vfsd_labels::MOUNT_AUTHORITY` alone: the `MOUNT` surface, without
@@ -1777,14 +1788,13 @@ pub mod timed_errors
 pub const PWRMGR_LABELS_VERSION: u32 = 1;
 /// IPC labels for the power manager (`pwrmgr`).
 ///
-/// pwrmgr owns the platform shutdown surface: ACPI S5 on x86-64 (the
-/// `PM1a` `IoPort` carved from the FADT/DSDT it interprets) and SBI
-/// SRST on RISC-V (the `SbiControl` cap). It acquires those caps from
-/// devmgr — the hardware/ACPI authority — at startup via
-/// [`devmgr_labels::QUERY_ACPI_TABLE`] and
-/// [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`], not from init. Callers that
-/// may invoke shutdown receive a badged SEND on pwrmgr's service
-/// endpoint with the [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
+/// pwrmgr owns the platform shutdown surface: ACPI S5 and the FADT reset
+/// register on x86-64, which it reaches through acpid
+/// ([`acpid_labels::SLEEP`], [`acpid_labels::RESET`]), and SBI SRST on
+/// RISC-V, through the `SbiControl` cap it acquires from devmgr at startup
+/// via [`devmgr_labels::QUERY_SHUTDOWN_DEVICE`]. Callers that may invoke
+/// shutdown receive a badged SEND on pwrmgr's service endpoint with the
+/// [`pwrmgr_labels::SHUTDOWN_AUTHORITY`] verb bit set.
 ///
 /// See `services/pwrmgr/README.md` for the authoritative description.
 pub mod pwrmgr_labels
@@ -1830,6 +1840,69 @@ pub mod pwrmgr_errors
     /// `PWRMGR_LABELS_VERSION` is marker-only.
     pub const LABEL_VERSION_MISMATCH: u64 = 3;
     /// Unknown opcode on pwrmgr endpoint.
+    pub const UNKNOWN_OPCODE: u64 = 0xFF;
+}
+
+/// Wire-protocol version of [`acpid_labels`]; bumped as the block comment above
+/// the label modules describes, which also lists its runtime check, if any.
+pub const ACPID_LABELS_VERSION: u32 = 1;
+/// IPC labels for acpid's power surface, which pwrmgr calls.
+///
+/// acpid runs the firmware's AML and holds the FADT's fixed register blocks
+/// (`services/acpid/README.md`), so the ACPI sleep and reset sequences run
+/// in it: pwrmgr, the power policy, reaches them through a SEND badged
+/// [`acpid_labels::POWER_AUTHORITY`] (`acpid.power`). Every request carries
+/// the caller's compiled [`super::ACPID_LABELS_VERSION`] in `data[0]`.
+/// The handler checks the badge first, then the version, then the request.
+pub mod acpid_labels
+{
+    /// Enter a sleep state: write `SLP_TYP` and then `SLP_TYP | SLP_EN` to
+    /// `PM1a_CNT`, the `SLP_TYP` read from the state's `\_Sx_` package,
+    /// after `\_PTS` of the state when the tables define it.
+    ///
+    /// Request: `data[0]` = the version; `data[1]` = the state, of which
+    /// only [`STATE_S5`] (soft-off) is served. On the success path the
+    /// platform powers off and no reply arrives; a
+    /// [`super::acpid_errors::SUCCESS`] reply means the write returned and
+    /// the platform still runs, and the caller decides how long to wait.
+    /// Replies [`super::acpid_errors::INVALID_REQUEST`] for another state and
+    /// [`super::acpid_errors::NO_DEVICE`] when the platform has no
+    /// `PM1a_CNT`, the tables no usable `\_S5_`, or no AML loaded (always
+    /// on RISC-V, whose platforms power off through SBI).
+    pub const SLEEP: u64 = 1;
+    /// Reset the platform: write the FADT's `RESET_VALUE` to its
+    /// `RESET_REG`.
+    ///
+    /// Request: `data[0]` = the version. On the success path the machine
+    /// resets and no reply arrives; a [`super::acpid_errors::SUCCESS`]
+    /// reply means the write returned and the platform still runs. Replies
+    /// [`super::acpid_errors::NO_DEVICE`] when the FADT places no
+    /// `RESET_REG` in the I/O space (always on RISC-V).
+    pub const RESET: u64 = 2;
+
+    /// [`SLEEP`]'s state argument for S5, soft-off.
+    pub const STATE_S5: u64 = 5;
+
+    /// Authority bit in the acpid-service-endpoint badge's high u64 bit, set
+    /// on `acpid.power`. Without it [`SLEEP`] and [`RESET`] reply
+    /// [`super::acpid_errors::UNAUTHORIZED`].
+    pub const POWER_AUTHORITY: u64 = 1u64 << 63;
+}
+
+/// Error replies from acpid.
+pub mod acpid_errors
+{
+    /// The request was carried out and the platform still runs.
+    pub const SUCCESS: u64 = 0;
+    /// The caller's badge lacks [`super::acpid_labels::POWER_AUTHORITY`].
+    pub const UNAUTHORIZED: u64 = 1;
+    /// A [`super::acpid_labels::SLEEP`] state acpid does not serve.
+    pub const INVALID_REQUEST: u64 = 2;
+    /// `data[0]` is not acpid's compiled [`super::ACPID_LABELS_VERSION`].
+    pub const LABEL_VERSION_MISMATCH: u64 = 3;
+    /// The platform has no register or object the request needs.
+    pub const NO_DEVICE: u64 = 4;
+    /// Unknown opcode on acpid's endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFF;
 }
 
@@ -2193,7 +2266,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 20;
+pub const DEVMGR_LABELS_VERSION: u32 = 21;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2340,10 +2413,9 @@ pub mod devmgr_labels
     /// Locate an ACPI table and serve a read-only view of it.
     ///
     /// devmgr is the sole owner of ACPI data and the only service that
-    /// navigates the table tree (RSDP → XSDT). Callers that need a table
-    /// (`pwrmgr`, for the FADT + DSDT it interprets for S5 shutdown, and
-    /// acpid, for the DSDT and every SSDT it loads) request it here rather than holding ACPI Memory caps of
-    /// their own.
+    /// navigates the table tree (RSDP → XSDT). A caller that needs a table
+    /// (acpid, for the DSDT and every SSDT it loads) requests it here rather
+    /// than holding ACPI Memory caps of its own.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = 4-byte table signature packed little-endian (e.g.
@@ -2374,35 +2446,27 @@ pub mod devmgr_labels
     /// not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_ACPI_TABLE: u64 = 7;
 
-    /// Carve and serve the platform shutdown-actuator hardware caps.
+    /// Serve the platform's firmware shutdown authority (RISC-V).
     ///
-    /// devmgr is the hardware authority; it carves the ports the power
-    /// manager needs and performs no shutdown logic. The caller (`pwrmgr`)
-    /// has already parsed the ACPI tables (served via [`QUERY_ACPI_TABLE`])
-    /// and computed the `PM1a` control port it needs; devmgr serves that
-    /// port only when it is the FADT's `PM1a_CNT_BLK`.
+    /// devmgr is the hardware authority and performs no shutdown logic. On
+    /// RISC-V the power manager (`pwrmgr`) powers off and resets through
+    /// SBI SRST; on x86-64 it reaches the ACPI sleep and reset registers
+    /// through acpid ([`super::acpid_labels`]), and devmgr serves nothing
+    /// here.
     ///
-    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
-    /// `data[1]` = the `PM1a` control port (x86-64; ignored on RISC-V).
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`].
     /// Caller's badge MUST carry [`SHUTDOWN_DEVICE_AUTHORITY`]; the handler
     /// replies [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
-    /// Reply ([`super::devmgr_errors::SUCCESS`]):
-    /// - x86-64: `caps[0]` = a narrow `IoPort` over `[pm1a, pm1a+2)`
-    ///   carved from devmgr's full-rights `IoPort`; `caps[1]` = a narrow
-    ///   `IoPort` over `[0x64, 0x65)` (8042 KBC reset, for reboot).
-    ///   Both are re-derived from it on every call, so a pwrmgr
-    ///   restart re-acquires them cleanly.
-    /// - RISC-V: `caps[0]` = a Reset-only derivation of devmgr's
-    ///   `SbiControl` cap (SBI SRST authority).
+    /// Reply ([`super::devmgr_errors::SUCCESS`], RISC-V): `caps[0]` = a
+    /// Reset-only derivation of devmgr's `SbiControl` cap (SBI SRST
+    /// authority), derived on every call, so a pwrmgr restart re-acquires it.
     ///
-    /// Replies [`super::devmgr_errors::NO_DEVICE`] when the carve fails,
-    /// the FADT or its `PM1a_CNT_BLK` cannot be read (x86-64), or the
-    /// platform authority cap is absent,
-    /// [`super::devmgr_errors::INVALID_REQUEST`] when `data[1]` is not the
-    /// FADT's `PM1a_CNT_BLK` (x86-64) or the RISC-V Reset-only derivation
-    /// fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`] when
-    /// `data[0]` is not `DEVMGR_LABELS_VERSION`.
+    /// Replies [`super::devmgr_errors::NO_DEVICE`] on x86-64 and when the
+    /// `SbiControl` cap is absent,
+    /// [`super::devmgr_errors::INVALID_REQUEST`] when the Reset-only
+    /// derivation fails, and [`super::devmgr_errors::LABEL_VERSION_MISMATCH`]
+    /// when `data[0]` is not `DEVMGR_LABELS_VERSION`.
     pub const QUERY_SHUTDOWN_DEVICE: u64 = 8;
 
     /// Serve acpid the `IoPort` of one fixed ACPI register block the FADT
@@ -2438,7 +2502,7 @@ pub mod devmgr_labels
 
     /// Grant acpid part of an operation region it evaluated: a `SystemIO`
     /// range, or the `SystemMemory` page an access reaches, that no device
-    /// record, driver, pwrmgr capability or the kernel holds.
+    /// record, driver or the kernel holds.
     ///
     /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
     /// `data[1]` = the space, [`ACPI_SPACE_MEMORY`] or [`ACPI_SPACE_IO`];
@@ -2448,9 +2512,9 @@ pub mod devmgr_labels
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
     /// devmgr refuses, logged, a range that overlaps a resource of any device
-    /// record (a PCI BAR, a platform record's `Mmio` or `IoPort`), a port
-    /// pwrmgr holds, an interrupt controller the MADT describes or a legacy
-    /// port the kernel drives, the configuration-mechanism ports 0xCF8-0xCFF,
+    /// record (a PCI BAR, a platform record's `Mmio` or `IoPort`), an
+    /// interrupt controller the MADT describes or a legacy port the kernel
+    /// drives, the configuration-mechanism ports 0xCF8-0xCFF,
     /// or the FACS, and memory that no `Mmio` aperture devmgr still holds
     /// covers (RAM, ACPI NVS, and the ranges devmgr has carved for itself or a
     /// driver). A memory page granted is kept by devmgr, so it is granted
@@ -4271,6 +4335,7 @@ const _: () = core::assert!(
         && devmgr_labels::BIND_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::CLASS_AUTHORITY & VERB_BIT_MASK != 0
         && devmgr_labels::ACPI_AUTHORITY & VERB_BIT_MASK != 0
+        && acpid_labels::POWER_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::MOUNT_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SEED_AUTHORITY & VERB_BIT_MASK != 0
         && vfsd_labels::SWAP_AUTHORITY & VERB_BIT_MASK != 0
@@ -4633,7 +4698,7 @@ pub mod devmgr_errors
     /// waits on a `WATCH_CLASS` watch and queries again when it is
     /// signalled ([`super::await_device`]), never polling `QUERY_DEVICE`.
     /// Also returned by `QUERY_ACPI_TABLE` (table not found) and
-    /// `QUERY_SHUTDOWN_DEVICE` (actuator caps unavailable).
+    /// `QUERY_SHUTDOWN_DEVICE` (no SBI authority to serve; always on x86-64).
     pub const NO_DEVICE: u64 = 4;
     /// The driver the query names was served and has since died, so devmgr
     /// withdrew it: its service endpoint is revoked, and callers queued on

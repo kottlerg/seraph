@@ -297,7 +297,9 @@ fn svcmgr_published_send_badged_phase(_caps: &Caps)
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
 /// cap. svctest's own non-zero seeds show fifteen of the refused names are
 /// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
-/// the same loop as `devmgr.registry` and `devmgr.bind`, and the other
+/// the same loop as `devmgr.registry` and `devmgr.bind`, `acpid.power`,
+/// which only pwrmgr seeds, by the same `provides` loop as `acpid.deny`,
+/// which resolves, and the other
 /// `devmgr.class.*` names by the same class loop as `devmgr.class.serial` and
 /// `devmgr.class.input`, among them `devmgr.class.debug-port`, which only the
 /// `debug-echo` fixture and `gdbstub` seed. A queryable seed-only name would
@@ -336,6 +338,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
     for name in [
         ipc::published_names::ROOTFS_ROOT,
         ipc::published_names::PWRMGR_SHUTDOWN,
+        ipc::published_names::ACPID_POWER,
         ipc::published_names::DEVMGR_REGISTRY,
         ipc::published_names::DEVMGR_SHUTDOWN,
         ipc::published_names::DEVMGR_BIND,
@@ -372,6 +375,7 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
     for name in [
         ipc::published_names::SVCMGR,
         ipc::published_names::PWRMGR_DENY,
+        ipc::published_names::ACPID_DENY,
     ]
     {
         let reply = query(name);
@@ -392,5 +396,5 @@ fn svcmgr_seed_only_names_refused_phase(caps: &Caps)
             let _ = syscall::cap_delete(cap);
         }
     }
-    std::os::seraph::log!("svcmgr seed-only phase passed (19 refused, 2 public resolved)");
+    std::os::seraph::log!("svcmgr seed-only phase passed (20 refused, 3 public resolved)");
 }

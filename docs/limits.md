@@ -707,8 +707,6 @@ Every entry here is `correct as is`; none is tracked. services/netd has no code.
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `RESET_GRACE` | `services/pwrmgr/src/main.rs` | 1 s | tuning (platform reset latency) | none | correct as is | None |
-| `SLP_TYP_MAX` | `services/pwrmgr/acpi/src/lib.rs` | 7 | hardware spec (ACPI 3-bit `SLP_TYPx`) | none | correct as is | None |
-| SDT length | `services/pwrmgr/acpi/src/lib.rs` | `u32` | hardware spec (ACPI SDT header) | none | correct as is | None |
 | wall time | `services/timed/src/main.rs` | `u64` microseconds | ABI width (about 584 000 years) | none | correct as is | None |
 | `forward_lines` buffer | `services/usertest/src/main.rs` | 512 B read chunk | batch size (lines accumulate unbounded) | 512 B stack | correct as is | None |
 | crasher settle sleep | `services/crasher/src/main.rs` | 500 ms | tuning (lets the surface assertions land before the fault report) | none | correct as is | None |
@@ -790,6 +788,7 @@ Every entry here is `correct as is`; none is tracked.
 | `MAX_SSDTS` | `services/acpid/src/startup.rs` | 64 SSDTs acpid asks devmgr for | tuning (the XSDT of a QEMU machine lists one) | none | correct as is | None; SSDTs past the 64th are not requested |
 | `EVAL_THREAD_STACK` | `services/acpid/src/main.rs` | the larger of `aml::EVAL_STACK_BYTES` and `aml::PARSE_STACK_BYTES`, plus 256 KiB for acpid's own frames | current peak plus headroom (the evaluator's and the parser's stack bounds, whichever is larger, and acpid's frames below them) | one thread stack of that size | correct as is | None; the thread that evaluates AML is given this much stack |
 | `MAX_BRIDGE_WINDOWS` | `shared/ipc/src/lib.rs` | 16 windows in one `BRIDGE_WINDOWS` push | tuning | none | correct as is | None; acpid refuses a `_CRS` with more windows, and devmgr answers a push with more `INVALID_REQUEST` |
+| `SLP_TYP_MAX` | `services/acpid/src/power.rs` | 7 | hardware spec (ACPI 3-bit `SLP_TYPx`) | none | correct as is | None; a `\_S5_` whose `SLP_TYPa` exceeds it makes `SLEEP(5)` reply `NO_DEVICE` |
 | `ACPI_ENABLE_WAIT_MS` | `services/acpid/src/arch/x86_64/mod.rs` | 3000 ms, polled each millisecond | tuning (the firmware's SMI handler makes the switch) | none | correct as is | None; acpid logs that `SCI_EN` is still clear and goes on |
 | Platform records (`MAX_PLATFORM_RECORDS`, `MAX_RECORD_RESOURCES`, `MAX_INFO_BYTES`) | `services/devmgr/firmware/src/records.rs` | 64 records; 8 resources per record; 32 B of device info | tuning (QEMU describes four platform devices; the bound keeps a malformed table from growing devmgr's record set) | about 330 B per record | correct as is | None; a device past the set's bound is dropped, logged, and a description's further resources are dropped |
 | Platform description table (`MAX_TABLE_BYTES`, `MAX_PLATFORM_DEVICES`, `MAX_PLATFORM_KEY_BYTES`, `MAX_PLATFORM_RESOURCES`) | `services/devmgr/firmware/src/platform.rs` | 8192 B; 16 devices; 32 B key; 4 resources per device | encoding artefact for the key (the declaration's `MAX_PLATFORM_KEY_BYTES`), tuning for the rest (the one table in tree lists one device in under 1 KiB) | the parsed table for the boot | correct as is | None; a table past any bound is rejected whole, logged, and its module released |

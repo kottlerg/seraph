@@ -136,8 +136,8 @@ every fault, but its eventual permanent death is non-fatal).
 
 **The shutdown actuator's own death** is the edge case. pwrmgr, the
 actuator, is `restart = on_failure` + `critical = no`: a crashed pwrmgr is
-recoverable (svcmgr re-creates it and it re-acquires its actuator caps from
-devmgr — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
+recoverable (svcmgr re-creates it and it re-acquires its actuator authority from
+devmgr or acpid — see [services/pwrmgr/README.md](../../pwrmgr/README.md)), and its
 *permanent* death is deliberately non-fatal. It is `critical = no` precisely
 because the graceful-shutdown escalation routes through the actuator — if
 the actuator is the dead service, nothing can power the system off, so
@@ -253,6 +253,8 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `rootfs.root` | svcmgr (endowed `rootfs.root` SEND) | badged SEND on vfsd's namespace endpoint at its synthetic root, with full namespace rights: the namespace root, which crosses mounts (derived from init's system-root cap) | no |
 | `pwrmgr.shutdown` | svcmgr (`pwrmgr.svc` provider) | `SHUTDOWN_AUTHORITY`-badged SEND on pwrmgr's service endpoint | no |
 | `pwrmgr.deny` | svcmgr (`pwrmgr.svc` provider) | no-authority SEND on pwrmgr's service endpoint (negative-test twin) | yes |
+| `acpid.power` | svcmgr (`acpid.svc` provider) | `POWER_AUTHORITY`-badged SEND on acpid's service endpoint, gating `SLEEP` and `RESET` (seeded by pwrmgr only) | no |
+| `acpid.deny` | svcmgr (`acpid.svc` provider) | no-authority SEND on acpid's service endpoint (negative-test twin) | yes |
 | `timed` | svcmgr (`timed.svc` provider) | un-badged SEND on timed's service endpoint (wall-clock) | yes |
 | `svcmgr` | svcmgr (its own service endpoint) | `PUBLISHED_SEND_BADGE`-badged SEND on svcmgr's own service endpoint (no verb-bit) | yes |
 | `devmgr.registry` | svcmgr (minted from the endowed devmgr-registry source) | `REGISTRY_QUERY_AUTHORITY`-badged SEND on devmgr's registry endpoint | no |

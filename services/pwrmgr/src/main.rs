@@ -6,14 +6,15 @@
 //! Seraph power manager — userspace authority for platform shutdown and
 //! reboot.
 //!
-//! pwrmgr is a svcmgr-launched provider. It owns the shutdown
-//! *interpretation* and *actuation* but holds no hardware caps of its own:
-//! it acquires the ACPI tables it parses and the carved I/O-port /
-//! `SbiControl` caps it drives from devmgr (the hardware + ACPI authority)
-//! at startup, "as if it were a device driver". svcmgr publishes a
-//! `SHUTDOWN_AUTHORITY`-badged SEND (`pwrmgr.shutdown`) and its no-auth
-//! twin (`pwrmgr.deny`) on pwrmgr's service endpoint to the consumers it
-//! seeds (today: svctest).
+//! pwrmgr is a svcmgr-launched provider. It owns the shutdown policy and
+//! holds no hardware caps of its own: on x86-64 it reaches the ACPI sleep
+//! and reset registers through acpid, which runs the AML and holds the
+//! FADT's register blocks, and on RISC-V it drives SBI SRST through a
+//! `SbiControl` derivation it acquires from devmgr at startup. svcmgr
+//! publishes a `SHUTDOWN_AUTHORITY`-badged SEND (`pwrmgr.shutdown`) and its
+//! no-auth twin (`pwrmgr.deny`) on pwrmgr's service endpoint; the recipes
+//! that seed `pwrmgr.shutdown` hold the authority, and svcmgr calls it as
+//! the shutdown actuator.
 //!
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
@@ -55,10 +56,10 @@ fn main() -> !
         syscall::thread_exit();
     }
 
-    // Acquire the actuation state from devmgr. `None` means the platform
-    // caps could not be resolved; pwrmgr still serves so callers get a
-    // clean error rather than a hung ipc_call.
-    let actuator = arch::current::resolve(bootstrap.devmgr_registry, info.self_aspace, ipc_buf);
+    // Resolve the actuation state. `None` means the platform authority
+    // could not be resolved; pwrmgr still serves so callers get a clean
+    // error rather than a hung ipc_call.
+    let actuator = arch::current::resolve(&bootstrap, ipc_buf);
     if actuator.is_some()
     {
         std::os::seraph::log!("ready");
@@ -67,8 +68,6 @@ fn main() -> !
     {
         std::os::seraph::log!(warn: "ready (degraded: no shutdown actuator)");
     }
-
-    let self_thread = info.self_thread;
 
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
@@ -98,7 +97,7 @@ fn main() -> !
                 std::os::seraph::log!("SHUTDOWN requested");
                 if let Some(act) = &actuator
                 {
-                    arch::current::shutdown(self_thread, act);
+                    arch::current::shutdown(act, ipc_buf);
                 }
                 // Reached here → no actuator or shutdown failed. Reply so
                 // the caller does not hang on its ipc_call.
@@ -114,7 +113,7 @@ fn main() -> !
                 std::os::seraph::log!("REBOOT requested");
                 if let Some(act) = &actuator
                 {
-                    arch::current::reboot(self_thread, act);
+                    arch::current::reboot(act, ipc_buf);
                 }
                 reject(pwrmgr_errors::INVALID_REQUEST, ipc_buf);
             }

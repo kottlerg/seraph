@@ -8,8 +8,9 @@
 //! handshake, and issues the handful of commands the harnesses need:
 //! `input-send-event` (interactive-input test), `migrate` + `query-migrate`
 //! and `quit` (snapshot-resume test), `stop` + `pmemsave` (the ACPI table
-//! capture), and `device_add` (the hotplug test); and waits for the
-//! `SHUTDOWN` event (the reboot test).
+//! capture), `device_add` (the hotplug test), and `system_powerdown` (the
+//! power-button test); and waits for the `SHUTDOWN` event (the reboot and
+//! power-button tests).
 //!
 //! Hand-rolled (no JSON dependency): the messages are fixed strings or
 //! `format!` templates, the free-form values (the migrate URI, the memory
@@ -84,6 +85,29 @@ impl Client
             // Otherwise an asynchronous event; keep reading.
         }
         bail!("QMP: no command result after 64 lines")
+    }
+
+    /// Wait up to `timeout` for QEMU's `SHUTDOWN` event and return its
+    /// `reason`.
+    fn wait_shutdown(&mut self, timeout: Duration) -> Result<String>
+    {
+        let start = Instant::now();
+        loop
+        {
+            let left = timeout
+                .checked_sub(start.elapsed())
+                .filter(|left| !left.is_zero())
+                .with_context(|| format!("no SHUTDOWN event within {}s", timeout.as_secs()))?;
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(left))
+                .context("setting QMP read timeout")?;
+            let line = read_line(&mut self.reader).context("waiting for the SHUTDOWN event")?;
+            if let Some(reason) = shutdown_reason(&line)
+            {
+                return Ok(reason.to_owned());
+            }
+        }
     }
 }
 
@@ -216,25 +240,19 @@ fn pmemsave_command(base: u64, size: u64, path: &Path) -> Result<String>
 /// lost.
 pub fn wait_shutdown(socket: &Path, timeout: Duration) -> Result<String>
 {
+    Client::connect(socket)?.wait_shutdown(timeout)
+}
+
+/// Press the guest's power button (`system_powerdown`, the ACPI fixed
+/// power-button event on q35), then wait up to `timeout` for QEMU's
+/// `SHUTDOWN` event on the same connection and return its `reason`, as
+/// [`wait_shutdown`] does.
+pub fn powerdown(socket: &Path, timeout: Duration) -> Result<String>
+{
     let mut client = Client::connect(socket)?;
-    let start = Instant::now();
-    loop
-    {
-        let left = timeout
-            .checked_sub(start.elapsed())
-            .filter(|left| !left.is_zero())
-            .with_context(|| format!("no SHUTDOWN event within {}s", timeout.as_secs()))?;
-        client
-            .reader
-            .get_ref()
-            .set_read_timeout(Some(left))
-            .context("setting QMP read timeout")?;
-        let line = read_line(&mut client.reader).context("waiting for the SHUTDOWN event")?;
-        if let Some(reason) = shutdown_reason(&line)
-        {
-            return Ok(reason.to_owned());
-        }
-    }
+    client.send(r#"{"execute":"system_powerdown"}"#)?;
+    client.read_result().context("system_powerdown")?;
+    client.wait_shutdown(timeout)
 }
 
 /// The `reason` of the QMP line `line` when it is the `SHUTDOWN` event;

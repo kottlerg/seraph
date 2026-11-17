@@ -14,7 +14,8 @@
 #     RISC-V pwrmgr acquires its SbiControl through QUERY_SHUTDOWN_DEVICE.
 #     pwrmgr is the only recipe seeding it.
 #   * acpid.power — the POWER_AUTHORITY-tokened SEND on acpid's endpoint; on
-#     x86-64 pwrmgr powers off and resets through acpid's SLEEP(5) and RESET
+#     x86-64 pwrmgr powers off and resets through acpid's SLEEP(5) and RESET,
+#     and waits in its WAIT_EVENT for the power button
 #     (services/acpid/README.md § Power requests). svcmgr launches acpid
 #     before pwrmgr because of this seed.
 # Each architecture deletes the seed it does not use. pwrmgr owns no hardware

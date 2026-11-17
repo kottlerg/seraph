@@ -449,6 +449,27 @@ See [xtask/README.md § test-reboot](../xtask/README.md#cargo-xtask-test-reboot)
 In CI it runs as a further boot inside each `usertest` cell (both arches, both profiles), after
 `test-wedge`, on the default boot `test-terminal` restored.
 
+### Power button (`test-powerbutton`)
+
+A press of the power button comes from outside the guest, so no in-guest harness can make one.
+`cargo xtask test-powerbutton` (x86_64 only: QEMU's riscv64 `virt` machine has a
+hardware-reduced ACPI with no fixed power button) checks it host-side:
+
+1. Boot the current sysroot once with a QMP socket, and wait for acpid's `events armed` line,
+   which it logs once it has taken the SCI and enabled the fixed power-button event, and the
+   terminal's READY line.
+2. Send QMP `system_powerdown`, which on q35 sets `PWRBTN_STS` in the PM1 event block and
+   raises the SCI. acpid's event thread finds the press and logs `power button pressed`; pwrmgr,
+   waiting in acpid's `WAIT_EVENT`, logs `power button: shutting down` and powers off through
+   acpid's `SLEEP(5)` (acpid logs `SLEEP(5): PM1a_CNT`).
+3. The test passes on the three lines, a QMP `SHUTDOWN` event whose reason is `guest-shutdown`, and
+   QEMU's own exit.
+
+See [xtask/README.md § test-powerbutton](../xtask/README.md#cargo-xtask-test-powerbutton) for the
+command and [services/acpid/README.md](../services/acpid/README.md) § Events for the event path.
+Same boot requirements as `test-terminal` (default boot set, terminal autostarted). In CI it runs
+as a further boot inside the x86_64 `usertest` cells, after `test-vmgenid`.
+
 ### Debug port (`test-debug-port`)
 
 The debug port, the byte transport a debugger stub speaks to a host debugger over, is a
@@ -645,10 +666,11 @@ boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
 then the `test-wedge` boot pair, then the `test-reboot` boot, then on x86_64 the `test-vmgenid`
-save/restore boot pair. The terminal and wedge test boots have *no* shutdown-invoking harness:
-`test-terminal` and `test-wedge` compute the verdict host-side and kill QEMU themselves. The
-`test-reboot` boot's fixture invokes `REBOOT`, the host reads the reset over QMP, and QEMU exits on
-its own.
+save/restore boot pair and the `test-powerbutton` boot. The terminal and wedge test boots have
+*no* shutdown-invoking harness: `test-terminal` and `test-wedge` compute the verdict host-side and
+kill QEMU themselves. The `test-reboot` boot's fixture invokes `REBOOT`, the host reads the reset
+over QMP, and QEMU exits on its own. The `test-powerbutton` boot is powered off by its press:
+the host presses the button over QMP, reads the power-off there, and QEMU exits on its own.
 
 ---
 

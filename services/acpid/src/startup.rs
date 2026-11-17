@@ -7,9 +7,12 @@
 //! sleep and reset registers, load the DSDT and the SSDTs, enable ACPI mode
 //! where the platform has a legacy mode, run the module-level code and the
 //! initialization walk, then evaluate each PCI host bridge's `_PRT`, `_OSC`
-//! and `_CRS` and push the results to devmgr. Every failure is logged and
-//! the sequence goes on with what it has; the thread then serves the power
-//! requests (`crate::server`).
+//! and `_CRS` and push the results to devmgr. The event blocks and the SCI
+//! are acquired at the start, and a start that devmgr does not report as a
+//! restart clears the events there, before anything else can fail and
+//! restart acpid. Every failure is logged and the
+//! sequence goes on with what it has; the thread then arms the events and
+//! serves (`crate::server`).
 
 use acpid::bridge::{self, Bridge, Osc};
 use acpid::{Failure, Why, walk};
@@ -17,6 +20,7 @@ use aml::namespace::NodeId;
 use aml::{Data, Evaluator, Namespace};
 use ipc::{devmgr_errors, devmgr_labels};
 use std::os::seraph::{mem_map_funded, reserve_pages, unreserve_pages};
+use std::sync::mpsc::Sender;
 
 use crate::arch;
 use crate::devmgr::{CallError, Devmgr, TableView};
@@ -29,11 +33,16 @@ const MAX_SSDTS: u64 = 64;
 
 /// Run the start-up sequence, reaching devmgr through `devmgr` and mapping
 /// into the address space `aspace`, then serve the requests received on
-/// `service`, acpid's service endpoint, for acpid's lifetime.
-pub fn run(devmgr: &Devmgr, aspace: u64, service: u64) -> !
+/// `service`, acpid's service endpoint, for acpid's lifetime; `ended` is
+/// where each thread acpid watches reports its end.
+pub fn run(devmgr: &Devmgr, aspace: u64, service: u64, ended: &Sender<&'static str>) -> !
 {
     let thread = std::os::seraph::thread::current_thread_cap();
     let power = arch::current::Power::acquire(devmgr, thread);
+    let events = arch::current::Events::acquire(devmgr, thread).map(|events| server::EventSource {
+        events,
+        power_button: fixed_power_button(devmgr, aspace),
+    });
     let mut platform = Platform::new(devmgr, aspace, thread);
     let mut ns = load(devmgr, aspace);
     if let Some((ns, tables)) = &mut ns
@@ -46,7 +55,25 @@ pub fn run(devmgr: &Devmgr, aspace: u64, service: u64) -> !
         ns.as_mut().map(|(ns, _)| ns),
         &mut platform,
         &power,
+        events,
+        ended,
     );
+}
+
+/// Whether the FADT declares the fixed power button
+/// ([`acpid::events::fixed_power_button`]); false, logged, when the FADT
+/// cannot be read.
+fn fixed_power_button(devmgr: &Devmgr, aspace: u64) -> bool
+{
+    let fixed = devmgr
+        .table(*b"FACP", 0)
+        .ok()
+        .and_then(|view| with_table(aspace, &view, acpid::events::fixed_power_button))
+        .flatten();
+    fixed.unwrap_or_else(|| {
+        std::os::seraph::log!(warn: "the FADT could not be read; no fixed power button");
+        false
+    })
 }
 
 /// Evaluate the loaded namespace `ns` of `tables` tables: the module-level

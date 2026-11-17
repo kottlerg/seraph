@@ -8,7 +8,7 @@
 //! This is the only file in pwrmgr permitted to contain `#[cfg(target_arch)]`
 //! guards. All other modules reach the platform actuator through the
 //! `arch::current` re-export, whose dispatch surface every architecture
-//! defines: `Actuator`, `resolve`, `shutdown`, and `reboot`.
+//! defines: `Actuator`, `resolve`, `watch_events`, `shutdown`, and `reboot`.
 
 #[cfg(target_arch = "x86_64")]
 #[path = "x86_64/mod.rs"]

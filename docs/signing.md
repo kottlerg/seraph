@@ -34,13 +34,18 @@ The primitives exist: [`shared/crypto`](../shared/crypto/README.md) provides `ed
 `Sha512`, tested against known-answer vectors, Wycheproof, and reference vectors computed with
 OpenSSL, and, behind its `sign` feature, the key generation and signing that § Signing requires of
 it (`ed25519_public_key`, `ed25519_sign`), tested against the same reference vectors and the
-verifier; no component enables the feature yet. The formats of § Signed Object Format,
-§ Certificate Format and § Trust Store, and the verification of § Verification, are implemented and
-host-tested in [`shared/objsig`](../shared/objsig/README.md), which no component links yet.
-Everything else this document specifies is design intent, not yet implemented
-([#124](https://github.com/kottlerg/seraph/issues/124)): xtask's keys and signing, the bootloader's
-verification and hand-off of the trust store, and procmgr's verification and signature policy.
-Today no stage verifies the object it loads: every binary is trusted because of where it is stored.
+verifier; xtask, the host signer, is the one component that enables the feature. The formats of
+§ Signed Object Format, § Certificate Format and § Trust Store, and the verification of
+§ Verification, are implemented and host-tested in [`shared/objsig`](../shared/objsig/README.md),
+which xtask links. xtask's keys and signing of § Signing are implemented: every build signs the
+kernel, every executable bundle entry and every ELF image of the root filesystem, and builds the
+trust store at the path § Signing names. Two parts of § Signing are not yet in place: the bundle's
+data entries carry no trailer, and no build embeds the store in the bootloader. Everything else
+this document specifies is design intent, not yet implemented
+([#124](https://github.com/kottlerg/seraph/issues/124)): the bootloader's verification and
+hand-off of the trust store, and procmgr's verification and signature policy. Today no stage
+verifies the object it loads: every binary is trusted because of where it is stored, and a
+trailer is bytes after the image that every loader ignores.
 
 ---
 
@@ -111,8 +116,8 @@ name refuses.
 
 ## Signed Object Format
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 A signed object is its body followed by a trailer of one or more records and a fixed footer:
 
@@ -207,8 +212,8 @@ nothing is skipped, so the canonical form needs no knowledge of the body's forma
 
 ## Certificate Format
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 Seraph's certificate is a fixed 148-byte record, not X.509: no ASN.1 parser enters the bootloader,
 and Ed25519 is the only algorithm. A root (an anchor of the trust store) issues it to a signing key:
@@ -240,8 +245,8 @@ object of a later one.
 
 ## Trust Store
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 The trust store is one public blob: the roots a system trusts, the key ids it refuses, and the
 lowest security version it runs.
@@ -288,8 +293,8 @@ stops procmgr, which then creates no process.
 
 ## Verification
 
-Implemented by [`shared/objsig`](../shared/objsig/README.md); no component links it yet
-(§ Implementation Status).
+Implemented by [`shared/objsig`](../shared/objsig/README.md), which xtask links to sign; no loader
+verifies yet (§ Implementation Status).
 
 The verifier takes the object's bytes, the trust store, and what the caller expects: the set of
 kinds it accepts, the name it is loading, and the architecture it runs. It returns the body, with
@@ -389,17 +394,33 @@ changes the grant on a running system, is decided with the authority work of
 
 ## Signing
 
-Design intent; not yet implemented (§ Implementation Status).
+Implemented in xtask, apart from the two parts § Implementation Status names; the options are in
+[xtask/README.md](../xtask/README.md#signing) § Signing.
 
 **Keys.** Every builder generates a local root and a signing key on its first build, in a per-user
-directory outside the work tree; the root certifies the signing key, and the store lists the root
-with `LOCAL`. xtask refuses a key file whose canonical path lies inside the work tree, `target/`
-included. CI generates its keys per run in the runner's temporary directory and discards them.
+directory outside the work tree (`seraph/signing` in the user's data directory, or the directory
+`SERAPH_SIGNING_DIR` names); the root certifies the signing key, and the store lists the root
+with `LOCAL`. The root's secret key certifies the signing key once and is never written: the
+directory holds the signing key's secret seed, readable by its owner alone, its certificate, and
+the store of the anchors it contributes. xtask refuses a directory or a key file whose canonical
+path lies inside the work tree, `target/` included. CI generates its keys per job in the runner's
+temporary directory and discards them.
 
-**External signer.** In place of a key file, xtask runs a configured signer command: it receives
-the encoded signed attributes on its standard input and writes the 64-byte signature to its
-standard output, which is how a hardware token or a CI secret signs. xtask verifies every signature
-before it writes the record, so a faulty signer cannot produce an image that fails to boot.
+**External signer.** In place of a key file, xtask runs a configured signer command
+(`SERAPH_SIGNER`): it receives the encoded signed attributes on its standard input and writes the
+64-byte signature to its standard output, which is how a hardware token or a CI secret signs. The
+identity directory then holds the signing key's certificate, or its public key when it is a root,
+and the store, and no secret. xtask verifies every signed object under the trust store it builds,
+with the kind, name and architecture its loader expects, before it writes it, so a faulty signer,
+or a store that does not trust the key, fails the pack instead of writing an object its loader
+would refuse.
+
+**Store and bootloader.** Each command derives the store from the signing identity and the
+deployer's store its environment names, and signs under it. Until the bootloader embeds the store
+(§ Implementation Status), nothing ties a pack to a bootloader, since nothing verifies: a pack whose
+environment changed since the bootloader was built signs under another store than that build
+took. Once the bootloader embeds the store, a pack reads the store out of the installed bootloader
+image itself and refuses to sign under another (design intent; not yet implemented).
 
 **Implementation.** The host signer is Seraph's own: no crate from a registry is a dependency
 ([coding-standards.md](coding-standards.md) § Dependencies). Ed25519 key generation and signing
@@ -422,17 +443,27 @@ with the same key produce the same image.
 
 **What is signed.** xtask signs the kernel, every bundle entry, and every ELF image it installs
 under `services/`, `programs/` and `tests/` in the sysroot
-([build-system.md](build-system.md) § Build Output: the Sysroot), after the build installs them and
-before it composes the bundle and the disk image, with the kind and name of § Signed Attributes:
-an image under a `drivers/` directory is a driver, one under a `programs/` directory a program,
-and every other a service. The files under `config/` and `data/` carry no trailer, since their
-readers take each file whole and configuration is not signed (§ Threat Model), and neither does
-the bootloader, which Secure Boot covers (§ Secure Boot). Kind 7 is reserved for a data file whose
-reader verifies it. The security version is one integer in the tree, raised by a
-security fix that MUST make older images unbootable; the store's floor is that integer.
+([build-system.md](build-system.md) § Build Output: the Sysroot), with the kind and name of
+§ Signed Attributes: an image under a `drivers/` directory is a driver, one under a `programs/`
+directory a program, and every other a service. The kernel and the sysroot's images are signed in
+place each time a disk image is packed, and each bundle entry as the bundle is composed, from the
+body of its source, so an image the sysroot holds signed as a service enters the bundle signed as
+a boot module. Signing replaces a trailer the object already carries, and is deterministic, so
+re-signing an unchanged image writes the same bytes. The bundle's data entries (the platform
+tables and the log-level configuration) carry no trailer yet: their readers take the entry whole,
+and a trailer is signed onto them once the readers split it off. The files under `config/` and
+`data/` carry no trailer, since their readers take each file whole and configuration is not
+signed (§ Threat Model), and neither does the bootloader, which Secure Boot covers
+(§ Secure Boot). Kind 7 is reserved for a data file whose reader verifies it. The security version
+is one integer in the tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a
+security fix that MUST make older images unbootable; every record carries it, and the store's
+floor is at least it.
 
 **The trust store** is built from public key files: by default the builder's local root. A build
-option names a deployer's store, which replaces the default or is merged with it.
+option (`SERAPH_TRUST_STORE`) names a deployer's store, which is merged with the default or, as
+`SERAPH_TRUST_STORE_MODE` chooses, replaces it; its floor is the higher of the stores' floors and
+the tree's security version. xtask writes the store to `target/xtask/signing/trust-store` before
+it builds the bootloader, which is to embed it (§ Implementation Status).
 
 ---
 
@@ -453,8 +484,9 @@ path is a bootloader Authenticode-signed with a key the deployer enrols in the f
 The project holds no trust root until a central repository exists. Every builder, the project's own
 release build included, signs with a locally generated root, and an image is verified against the
 root of the build that made it; the bootloader labels that root as locally generated on every boot
-(design intent; not yet implemented: today no object is signed). A release image therefore carries
-no provenance a user can check beyond the release's `SHA256SUMS`.
+(design intent; not yet implemented: every executable object is signed, but no stage verifies one
+yet). A release image therefore carries no provenance a user can check beyond the release's
+`SHA256SUMS`.
 
 The project root and release signing are [#1073](https://github.com/kottlerg/seraph/issues/1073).
 When the root is created, its key is held offline by the maintainer and certifies one release

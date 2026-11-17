@@ -12,9 +12,10 @@ Its dependents are ktest, which runs the known-answer tests on target, and
 [`shared/objsig`](../objsig/README.md), which implements the signature trailer,
 certificate and trust-store codec and the verifier of the per-binary signing
 chain of trust ([docs/signing.md](../../docs/signing.md)) on `ed25519_verify`
-and `sha512`. The rest of that chain, the loaders' verification and xtask's key
-management and signing with `ed25519_sign`, is design intent, not yet
-implemented ([#124](https://github.com/kottlerg/seraph/issues/124)).
+and `sha512`. xtask uses `ed25519_sign` for its key management and signing
+([xtask/README.md](../../xtask/README.md) § Signing). The rest of that chain, the loaders'
+verification, is design intent, not yet implemented
+([#124](https://github.com/kottlerg/seraph/issues/124)).
 
 ---
 
@@ -46,10 +47,9 @@ implemented ([#124](https://github.com/kottlerg/seraph/issues/124)).
   obligation. The mandatory `S < L` range check (RFC 8032 §5.1.7) runs first;
   every failure path is a single terminal `Err` with no fallback.
 - **Signing behind a feature.** The signer compiles only with the crate's `sign`
-  feature, and in the crate's own tests. Only a host tool may enable it: the
-  host signer in xtask is to (design intent,
-  [#124](https://github.com/kottlerg/seraph/issues/124)), and nothing enables it
-  today. A component built for the target MUST NOT enable it, so that a loader
+  feature, and in the crate's own tests. Only a host tool may enable it: xtask,
+  the host signer, enables it, and no component built for the target does. A
+  component built for the target MUST NOT enable it, so that a loader
   (the bootloader, procmgr) compiles no signing code: `cargo xtask build` builds
   the components of one build profile in a single Cargo invocation, which
   resolves one feature set for all of them, so a feature one component enables
@@ -59,7 +59,7 @@ implemented ([#124](https://github.com/kottlerg/seraph/issues/124)).
   the public key `ed25519_public_key` derives from it; the crate draws no
   randomness. The caller draws the seed from its platform's random source (for
   xtask, the host operating system's, as
-  [docs/signing.md](../../docs/signing.md) § Signing specifies; design intent)
+  [docs/signing.md](../../docs/signing.md) § Signing specifies)
   and passes it on every call, so the crate keeps no key between calls.
 - **Signing in constant time.** No branch and no memory index depends on a
   secret value (the seed, the secret scalar, the nonce prefix, the nonce), only

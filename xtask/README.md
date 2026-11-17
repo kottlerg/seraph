@@ -39,6 +39,8 @@ xtask/
 │   ├── qemu_gdb.rs             # Client of QEMU's gdbstub for test-wedge and test-cet
 │   ├── regex/                  # Pattern matching: Pike VM over the syntax of § Pattern syntax
 │   ├── rust_src.rs             # In-project toolchain sysroot with the ruststd overlay
+│   ├── signing/                # Signing of packed images, the signing identity, the trust
+│   │                           #   store (§ Signing)
 │   ├── stack_sizes.rs          # The riscv64 kernel frame check over `.stack_sizes`
 │   ├── symbolize/              # ELF address resolution: DWARF, symbol-table fallback; the
 │   │                           #   tests' ELF and DWARF fixture writer (fixture.rs)
@@ -99,6 +101,43 @@ naming each function and its frame, when a frame passes `RISCV64_KERNEL_FRAME_MA
 `src/stack_sizes.rs`), the kernel frame bound of
 [docs/coding-standards.md](../docs/coding-standards.md) § Kernel Stack Frames. It fails as well
 when the image has no such section. No other build has the check.
+
+#### Signing
+
+Every image a build packs is signed, as [docs/signing.md](../docs/signing.md) § Signing specifies:
+each packing of a disk image (`build`, `mkdisk`, `compose-bundle` and every command that
+repacks) first signs the kernel and every ELF image under `services/`, `programs/` and `tests/`
+of the sysroot in place, and `compose-bundle` signs each executable entry of the bundle it
+composes: `init` as kind init, each module as a boot module. The bundle's data entries (the
+platform tables and `log-levels`) are packed unsigned. Every signed object is verified under the
+build's trust store, with the kind, name and architecture its loader expects, before it is
+written. Each command derives the store from the signing identity and the deployer's store its
+environment names: until the bootloader embeds the store, nothing ties a pack to the bootloader
+already built, since nothing verifies (docs/signing.md § Signing). Signing a
+pack's images takes about half a second (`src/signing/`).
+
+The signing identity is a directory outside the work tree; xtask refuses one, or a key file in
+one, whose canonical path lies inside it, `target/` included. When the directory is absent or
+empty and no external signer is named, the first build generates a local identity in it: a root
+that certifies a signing key and is then discarded, and a store that lists the root as `LOCAL`.
+The directory holds:
+
+| File | Content |
+|---|---|
+| `signer.seed` | The signing key's 32-byte Ed25519 secret seed (mode `0600`, the directory `0700`); absent when an external signer holds the key |
+| `signer.cert` | The signing key's 148-byte certificate, or, for a key that is itself a root, `signer.pub`, its 32-byte public key |
+| `trust.store` | The trust store of the anchors the identity contributes |
+
+The build writes the trust store it signs under to `target/xtask/signing/trust-store`, before
+it builds the bootloader, and rewrites the file only when the store changes. It is the store the
+bootloader is to embed; nothing reads it yet.
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERAPH_SIGNING_DIR` | `seraph/signing` in `XDG_DATA_HOME`, else in `$HOME/.local/share`, else in `LOCALAPPDATA` | The signing identity's directory. CI sets it to `$RUNNER_TEMP/seraph-signing`, so each job signs with keys it generates and discards |
+| `SERAPH_SIGNER` | (none) | An external signer program, which signs in place of `signer.seed`: it reads the encoded signed attributes on its standard input and writes the 64-byte Ed25519 signature to its standard output. The identity directory MUST already hold the certificate (or public key) and store |
+| `SERAPH_TRUST_STORE` | (none) | A deployer's trust store file, combined with the identity's |
+| `SERAPH_TRUST_STORE_MODE` | `merge` | `merge`: the union of both stores' anchors and revoked key ids, under the higher floor; two anchors of one key that differ are refused. `replace`: the deployer's store alone. Set without `SERAPH_TRUST_STORE`, it is refused |
 
 ---
 
@@ -244,8 +283,10 @@ synthesised `data/svctest/` fixtures are left untouched. To pack a
 hand-staged sysroot that diverges from `rootfs/` — e.g. a test recipe
 copied from `sysroot/config/svcmgr/tests/` into
 `sysroot/config/svcmgr/services/` — use `--repack-only`, which skips the
-re-mirror and packs the sysroot exactly as it stands (a plain repack would
-prune the hand-added recipe). The mirror rules are owned by
+re-mirror and packs the sysroot as it stands (a plain repack would
+prune the hand-added recipe). Every pack, `--repack-only` included, re-signs the kernel and the
+ELF images of the sysroot in place ([§ Signing](#signing)), so a hand-staged image is packed
+with the local identity's signature, not its own. The mirror rules are owned by
 [rootfs/README.md](../rootfs/README.md).
 
 `mkdisk` does **not** author `sysroot/EFI/seraph/bootstrap.bundle` — it
@@ -301,7 +342,7 @@ cargo xtask mkdisk [--arch x86_64|riscv64] [--repack-only] [--no-kaslr] \
 | Option | Default | Description |
 |---|---|---|
 | `--arch` | `x86_64` | Target architecture — must match the existing sysroot's arch tag |
-| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
+| `--repack-only` | `false` | Skip the `rootfs/` re-mirror and pack the sysroot as it stands, its images re-signed as every pack signs them — preserves a hand-staged service set the authoritative mirror would otherwise reconcile |
 | `--no-kaslr` | `false` | Stage the `\EFI\seraph\nokaslr` override knob so the bootloader boots the kernel at its deterministic (un-randomized) layout ([core/boot/docs/boot-flow.md](../core/boot/docs/boot-flow.md) § Step 5d: Apply the KASLR Slide), for GDB / symbolization; omit to remove the knob and re-enable KASLR |
 | `--block-size` | `512` | Logical block size of the authored images: `4096` writes the GPT at 4096-byte LBAs and formats every FAT volume with 4096-byte sectors (a 4Kn disk) |
 | `--split-data` | `false` | Author the data partition alone on `disk-data.img` and the ESP, root and swap on `disk.img`, both at `--block-size`; omit to author all four on `disk.img` and remove a stale `disk-data.img` |
@@ -355,7 +396,8 @@ Compose `sysroot/esp/EFI/seraph/bootstrap.bundle` from canonical
 binaries under `sysroot/services/` and repack `disk.img`. Symmetric
 with `mkdisk`: both end with `create_disk_image`, the difference being
 which file they author. `compose-bundle` is the bundle authoring step;
-`mkdisk` never authors the bundle.
+`mkdisk` never authors the bundle. `compose-bundle` signs the bundle's executable entries
+([§ Signing](#signing)).
 
 ```
 cargo xtask compose-bundle [--arch x86_64|riscv64] [--harness init|ktest]

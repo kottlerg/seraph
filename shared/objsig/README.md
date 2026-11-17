@@ -5,9 +5,10 @@ trust store whose formats [docs/signing.md](../../docs/signing.md) specifies byt
 verification policy of its § Verification.
 
 `no_std`, no allocation; its one dependency is [`shared/crypto`](../crypto/README.md) (SHA-512
-and `ed25519_verify`). No component links it yet: the bootloader, procmgr and xtask take it up in
-the later steps of [#124](https://github.com/kottlerg/seraph/issues/124). No stability obligation;
-internal code reuse only.
+and `ed25519_verify`). xtask links it, to sign and to verify each signed object before
+writing it; the bootloader and procmgr take it up in the later steps of
+[#124](https://github.com/kottlerg/seraph/issues/124). No stability obligation; internal code
+reuse only.
 
 ---
 

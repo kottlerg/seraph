@@ -8,7 +8,7 @@ edition.workspace = true
 publish.workspace = true
 
 # no_std, no allocation: the codec and verifier of Seraph's signed objects,
-# certificates and trust store (docs/signing.md). No caller links it yet.
+# certificates and trust store (docs/signing.md). xtask links it, to sign and verify.
 [lib]
 doctest = false
 

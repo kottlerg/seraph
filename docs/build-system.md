@@ -379,6 +379,13 @@ The `esp/` and root-partition trees are populated from two sources:
   synthesised `data/svctest/` fixtures are left untouched (see
   [`rootfs/README.md`](../rootfs/README.md)).
 
+Each packing of a disk image signs the kernel and the ELF images under `services/`,
+`programs/` and `tests/` in place, so each ends in a signature trailer
+([signing.md § Signed Object Format](signing.md#signed-object-format)); the loaders ignore the
+trailer today. In `bootstrap.bundle` the executable entries (`init` and each module) are the
+image's body plus a trailer, and the data entries are their source bytes, unsigned
+([xtask/README.md § Signing](../xtask/README.md#signing)).
+
 The disk image is assembled by xtask after the sysroot is populated. Cargo's
 own `target/` directory contains intermediate compilation artifacts and is
 not part of the sysroot.
@@ -545,6 +552,11 @@ fails, the booting cells are skipped and the run fails. An entry saved on
 runs share one entry per key. The pin, the install list and the cache key
 move together: the key derives from the image version and the action, so a
 change to the list, the flags or the pinned image yields a new entry.
+
+The `validate`, `burnin` and `build-image` jobs each have a step that sets
+`SERAPH_SIGNING_DIR=$RUNNER_TEMP/seraph-signing`, so each job generates its signing keys outside
+the checkout on its first build and discards them
+([signing.md § Signing](signing.md#signing)).
 
 The `build-image` job of `release.yml` boots nothing (its one `cargo xtask`
 command is `build`), so it installs no QEMU and runs on `ubuntu-latest`.

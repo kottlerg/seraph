@@ -929,6 +929,7 @@ version = "0.1.4"
 dependencies = [
  "boot-protocol",
  "crash-report",
+ "crypto",
  "fatfs-parse",
  "gdb-rsp",
  "init-log-levels",
@@ -936,6 +937,7 @@ dependencies = [
  "json",
  "log",
  "logd-codec",
+ "objsig",
  "procmgr-process-table",
  "syscall-abi",
  "vfsd-gpt",

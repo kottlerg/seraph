@@ -30,6 +30,9 @@
 // builds on Windows with the GNU host toolchain (docs/build-system.md
 // § Toolchain).
 #![feature(rustc_private)]
+// The host OS random source (`std::random::SystemRng`) a local signing
+// identity's seeds are drawn from (src/signing).
+#![feature(random)]
 #[cfg(all(windows, target_env = "msvc"))]
 compile_error!(
     "xtask needs the toolchain sysroot's `object` and `addr2line`, which a *-windows-msvc host's \
@@ -66,6 +69,7 @@ mod regex;
 mod rust_src;
 mod stack_sizes;
 mod symbolize;
+mod signing;
 mod sys;
 mod sysroot;
 mod tasklist;

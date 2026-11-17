@@ -9,7 +9,8 @@
 //! sysroot/data/) that vfsd auto-mounts at /data, and a raw Seraph swap
 //! partition. `disk.img` carries all four, or all but the data partition,
 //! which then sits alone on a second image; the logical block size, 512 or
-//! 4096 bytes, is chosen per authoring.
+//! 4096 bytes, is chosen per authoring. The kernel and every ELF image the
+//! partitions carry are signed first ([`crate::signing::sign_sysroot`]).
 
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,6 +23,7 @@ use crate::arch::Arch;
 use crate::context::Context as BuildContext;
 use crate::fat;
 use crate::gpt::{self, Guid, guid};
+use crate::signing::{Signer, sign_sysroot};
 use crate::util::step;
 
 /// ESP partition size. Holds the kernel, the boot bundle (init + modules),
@@ -219,6 +221,12 @@ pub fn create_disk_image(ctx: &BuildContext, arch: Arch, layout: DiskLayout) -> 
             bundle_path.display()
         );
     }
+
+    // Every pack signs what it packs, so no path writes an unsigned image:
+    // `build`, `mkdisk`, `compose-bundle` and every harness that repacks.
+    let signer = Signer::open(ctx, arch)?;
+    let (signed, changed) = sign_sysroot(ctx, &signer)?;
+    step(&format!("Signed {signed} images ({changed} changed)"));
 
     let sources = Sources {
         esp: ctx.sysroot_esp(),

@@ -486,6 +486,7 @@ const SEED_ONLY_NAMES: &[&[u8]] = &[
     ipc::published_names::DEVMGR_REGISTRY,
     ipc::published_names::DEVMGR_SHUTDOWN,
     ipc::published_names::DEVMGR_BIND,
+    ipc::published_names::DEVMGR_ACPI,
     ipc::published_names::VFSD_MOUNT,
     ipc::published_names::VFSD_DENY,
     ipc::published_names::VFSD_SWAP,
@@ -514,8 +515,9 @@ const PUBLIC_NAMES: &[&[u8]] = &[
 /// `QUERY_ENDPOINT` through the per-process SEND refuses every seed-only
 /// name with `UNKNOWN_NAME` and no cap, and resolves the public ones with a
 /// cap. svctest's own non-zero seeds show fifteen of the refused names are
-/// published; `devmgr.shutdown`, which only pwrmgr seeds, is published by
-/// the same loop as `devmgr.registry` and `devmgr.bind`, `acpid.power`,
+/// published; `devmgr.shutdown`, which only pwrmgr seeds, and `devmgr.acpi`,
+/// which only acpid seeds, are published by the same loop as
+/// `devmgr.registry` and `devmgr.bind`, `acpid.power`,
 /// which only pwrmgr seeds, by the same `provides` loop as `acpid.deny`,
 /// which resolves, and the other
 /// `devmgr.class.*` names by the same class loop as `devmgr.class.serial` and

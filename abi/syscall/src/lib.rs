@@ -1747,6 +1747,16 @@ pub enum SystemInfoType
     /// `NotSupported` on riscv64, which defines no enumeration of the
     /// classes; `InvalidArgument` for an unknown view.
     SpeculationControls = 13,
+    /// The CPU after the one named in arg1 among the logical CPUs of its core,
+    /// in ascending index order, wrapping: arg1 itself when its core runs no
+    /// other CPU. Following it from any CPU back to that CPU visits its SMT
+    /// siblings, the CPUs that share the core's execution resources. A fact of
+    /// the machine's topology, the same for every caller, readable by any
+    /// process with no capability; ktest reads it to check the rings against
+    /// the topology each CPU reports (core/kernel/docs/scheduler.md § SMT
+    /// Awareness). On riscv64 every hart is its own core. `InvalidArgument`
+    /// for an index at or past `CpuCount`.
+    SmtSibling = 14,
 }
 
 /// `SystemInfoType::SpeculationControls` view: the selection's inputs, a

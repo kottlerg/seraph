@@ -17,18 +17,19 @@ use syscall::SyscallError;
 
 /// One past the highest `SystemInfoType` discriminant `sys_system_info`
 /// answers. A discriminant at or past it is refused before the match.
-const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::SpeculationControls as u64 + 1;
+const SYSTEM_INFO_BOUND: u64 = syscall::SystemInfoType::SmtSibling as u64 + 1;
 
 /// `SYS_SYSTEM_INFO` (43): query kernel/system information.
 ///
 /// arg0 = `SystemInfoType` discriminant (u64).
-/// arg1 = the stack class for `StackHighWater` (`syscall::STACK_CLASS_*`), or
-/// the view for `SpeculationControls` (`syscall::SPECULATION_VIEW_*`);
-/// ignored by every other discriminant.
+/// arg1 = the stack class for `StackHighWater` (`syscall::STACK_CLASS_*`), the
+/// view for `SpeculationControls` (`syscall::SPECULATION_VIEW_*`), or the CPU
+/// index for `SmtSibling`; ignored by every other discriminant.
 ///
 /// Returns the queried value as a scalar `u64`. No buffer is required.
 /// Returns `InvalidArgument` for an unknown discriminant, an unknown
-/// `StackHighWater` class or an unknown `SpeculationControls` view, and
+/// `StackHighWater` class, an unknown `SpeculationControls` view or an
+/// `SmtSibling` CPU index at or past the CPU count, and
 /// `NotSupported` for the handoff class when the kernel could not locate the
 /// handoff stack and for `SpeculationControls` on riscv64.
 ///
@@ -128,6 +129,24 @@ pub fn sys_system_info(tf: UserFrame) -> Result<u64, SyscallError>
         {
             crate::arch::current::speculation::mitigation_info(tf.arg(1))
         }
+        14 =>
+        // SmtSibling — the next CPU of arg1's core, a fact of the machine's
+        // topology, the same for every caller
+        // (core/kernel/docs/cross-boundary-disclosure.md).
+        // The index is read clamped as data past the bound check, so a
+        // mispredicted refusal reads CPU 0's ring entry, never past the slab.
+        {
+            let count =
+                u64::from(crate::sched::CPU_COUNT.load(core::sync::atomic::Ordering::Relaxed));
+            let cpu = tf.arg(1);
+            if cpu >= count
+            {
+                return Err(SyscallError::InvalidArgument);
+            }
+            let cpu = usize::try_from(crate::arch::nospec::mask_index_u64(cpu, count))
+                .map_err(|_| SyscallError::InvalidArgument)?;
+            Ok(crate::topology::sibling_after(cpu) as u64)
+        }
         _ => Err(SyscallError::InvalidArgument),
     }
 }
@@ -224,6 +243,7 @@ mod tests
             SystemInfoType::LiveCSpaceCount,
             SystemInfoType::InstructionCacheSyncs,
             SystemInfoType::SpeculationControls,
+            SystemInfoType::SmtSibling,
         ];
         let max = kinds.iter().map(|&k| k as u64).max();
         assert!(kinds.iter().all(|&k| (k as u64) < SYSTEM_INFO_BOUND));

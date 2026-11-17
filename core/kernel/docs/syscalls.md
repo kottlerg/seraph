@@ -3236,15 +3236,16 @@ Query a scalar system value. Returns a single `u64` in `rax`/`a0` — no buffer 
 | # | Name | Description |
 |---|---|---|
 | 0 | `info_type` | Which value to query (see `SystemInfoType` below) |
-| 1 | `class` or `view` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
+| 1 | `class`, `view` or `cpu` | `StackHighWater`: the stack class (`STACK_CLASS_IDLE` 0, `STACK_CLASS_THREAD` 1, `STACK_CLASS_HANDOFF` 2). `SpeculationControls`: the view (`SPECULATION_VIEW_INPUTS` 0, `SPECULATION_VIEW_SELECTED` 1, `SPECULATION_VIEW_IN_EFFECT` 2). `SmtSibling`: the CPU index. Ignored by every other `info_type`, for which the `shared/syscall` wrapper passes 0 |
 
 **Return:** `rax`/`a0`: the queried value on success; negative `SyscallError` on failure.
 
 **Capability requirement:** None.
 
-**Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`, or
-unknown `view` for `SpeculationControls`); `NotSupported` (`StackHighWater` handoff class, when
-the kernel could not locate the handoff stack; `SpeculationControls` on riscv64).
+**Errors:** `InvalidArgument` (unknown `info_type`, unknown `class` for `StackHighWater`,
+unknown `view` for `SpeculationControls`, or a `SmtSibling` index at or past `CpuCount`);
+`NotSupported` (`StackHighWater` handoff class, when the kernel could not locate the handoff
+stack; `SpeculationControls` on riscv64).
 
 ### `SystemInfoType`
 
@@ -3351,6 +3352,13 @@ pub enum SystemInfoType
     /// ([transient-execution.md](transient-execution.md) § Controls).
     /// `NotSupported` on riscv64, which defines no enumeration of the classes.
     SpeculationControls = 13,
+
+    /// The next CPU of the core that the CPU index in arg1 belongs to, in
+    /// ascending index order, wrapping: arg1 itself when its core has no other
+    /// CPU. `InvalidArgument` for an index at or past `CpuCount`. A fact of the
+    /// machine's topology, the same for every caller, which names no address or
+    /// secret. On riscv64 every hart is its own core.
+    SmtSibling          = 14,
 }
 ```
 

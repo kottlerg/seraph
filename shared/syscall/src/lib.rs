@@ -1743,6 +1743,32 @@ pub fn speculation_controls(view: u64) -> Result<u64, i64>
     if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
+/// The CPU after `cpu` among the logical CPUs of its core, ascending and
+/// wrapping (`SystemInfoType::SmtSibling`): `cpu` itself when its core runs
+/// no other CPU.
+///
+/// # Errors
+/// Returns a negative `i64` error code: `InvalidArgument` when `cpu` is at
+/// or past `SystemInfoType::CpuCount`.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "a non-negative return is the queried value"
+)]
+#[inline]
+pub fn smt_sibling(cpu: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall2 issues raw syscall instruction; arg0 is the SmtSibling
+    // discriminant and arg1 the CPU index, which the kernel validates.
+    let ret = unsafe {
+        syscall2(
+            SYS_SYSTEM_INFO,
+            syscall_abi::SystemInfoType::SmtSibling as u64,
+            cpu,
+        )
+    };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
+}
+
 /// Exclusive top of the user half of the caller's address space
 /// (`SystemInfoType::UserVaTop`): the first virtual address a mapping syscall
 /// refuses, fixed per architecture and boot paging mode.

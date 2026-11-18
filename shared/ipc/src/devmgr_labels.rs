@@ -412,7 +412,10 @@ pub const WINDOW_BUS: u64 = 2;
 /// boot, and logs a later push that differs; on x86-64 it keeps a
 /// [`PRT_ROUTES`] table only once it holds the bridge's
 /// [`PRT_PIC_MODE`] table, the same `_PRT` read in the other model,
-/// whose routes it checks only for being routed. A refusal is fail-closed:
+/// whose routes it checks only for being routed and reads for nothing else.
+/// On x86-64 it also routes a function whose Interrupt Line is unset (one
+/// hot-added) by the [`PRT_PIC_MODE`] table, at the pin and root-bus device
+/// its interrupt reaches. A refusal is fail-closed:
 /// the bridge has no table of the mode from acpid until a push passes.
 /// Reply: [`super::devmgr_errors::SUCCESS`] when devmgr holds the
 /// bridge's table of the mode; [`super::devmgr_errors::REFUSED`], logged,

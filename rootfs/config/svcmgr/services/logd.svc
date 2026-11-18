@@ -19,7 +19,18 @@
 # is the terminal escape once the restart budget is spent.
 #
 # `argv = logd` names the process for procmgr's LIST_PROCESSES, through
-# which a debugger, and svctest's logd_restart phase, find it.
+# which a debugger, and svctest's logd_reserve and logd_restart phases, find
+# it.
+#
+# `reserve = yes` makes logd's budget node a system-reserve node, which may
+# take the free pages memmgr keeps in reserve. oomd, crashd and sessiond, the
+# reserve services that end a memory-pressure episode, write their lines
+# through logd with a synchronous call, so a service they call on that path
+# is a reserve service too (services/svcmgr/docs/service-definitions.md
+# § `reserve`): outside the reserve, a first touch of logd's heap while the
+# free pool is at the reserve is declined and kills it, and svcmgr cannot
+# create its next instance until memory is freed. A reserve holder has a core
+# role, which `log_sink` gives logd already.
 binary    = /services/logd
 argv      = logd
 priority  = 18
@@ -27,3 +38,4 @@ restart   = on_failure
 critical  = yes
 namespace = none
 log_sink  = yes
+reserve   = yes

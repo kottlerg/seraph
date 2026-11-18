@@ -1242,6 +1242,74 @@ pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     pal_alloc::fund_cspace_slot_budget(self_cspace, slots)
 }
 
+/// A `CSpace` held above a low-water mark of general slots by every thread of
+/// a process that serves a load whose capabilities grow with it: a service
+/// holding a few capabilities per client, device or child it serves.
+///
+/// A `CSpace` its creator seeded holds a fixed count of slots, and its growth
+/// pool grows only by donation ([`fund_cspace_slot_budget`]). A service that
+/// holds one of these as a `static` and calls [`hold`](Self::hold) before
+/// each operation that allocates slots keeps its headroom
+/// ([`cspace_slot_headroom`]) at or above `low_water`, with a page of growth
+/// budget beyond it for the body arena (`syscall_abi::cspace_topup_pages`):
+/// below either, the hold funds the pool for `topup_slots` from memmgr. The
+/// mark is sized to cover every allocation the process's threads can make
+/// while one of them tops up, since:
+///
+/// - one thread at a time reads and funds the pool; a thread that finds
+///   another doing so goes on at once, without waiting;
+/// - a refused top-up is retried at the next hold, and
+///   [`failure_to_report`](Self::failure_to_report) answers `true` once per
+///   run of refused top-ups, so the caller that may log does so once,
+///   whichever thread's top-up was refused.
+///
+/// Nothing is logged here: a thread that serves logd (or a driver logd
+/// writes through) must not log while logd waits on its reply, so the caller
+/// chooses which of its threads reports.
+#[stable(feature = "seraph_ext", since = "1.0.0")]
+pub struct CSpaceHeadroom {
+    low_water: u64,
+    topup_slots: u64,
+    state: pool_funding::LowWaterHold,
+}
+
+impl CSpaceHeadroom {
+    /// A hold of `low_water` general slots, funding `topup_slots` when the
+    /// headroom falls below it. `topup_slots` above `low_water` spaces the
+    /// top-ups apart; at or below it, every hold short of the mark tops up.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[rustc_const_stable(feature = "seraph_ext", since = "1.0.0")]
+    // The state's constructor is `ruststd-pool-funding`'s, a crate std
+    // depends on as `rustc_private`; it is a plain `const fn` of two atomics.
+    #[rustc_allow_const_fn_unstable(rustc_private)]
+    #[must_use]
+    pub const fn new(low_water: u64, topup_slots: u64) -> Self {
+        Self { low_water, topup_slots, state: pool_funding::LowWaterHold::new() }
+    }
+
+    /// Hold `self_cspace`, the calling process's own `CSpace`, above the
+    /// mark: unless another thread is holding it, top it up for
+    /// `topup_slots` when its headroom or its growth budget is short of the
+    /// mark. A refused top-up is recorded for
+    /// [`failure_to_report`](Self::failure_to_report).
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    pub fn hold(&self, self_cspace: u64) {
+        let _ = self.state.hold(
+            || pal_alloc::cspace_below_low_water(self_cspace, self.low_water),
+            || pal_alloc::fund_cspace_slot_budget(self_cspace, self.topup_slots),
+        );
+    }
+
+    /// Whether a run of refused top-ups is under way that no caller has
+    /// reported: `true` at most once per run, to the first caller that asks.
+    /// A hold that finds the pool covered or tops it up ends the run.
+    #[stable(feature = "seraph_ext", since = "1.0.0")]
+    #[must_use]
+    pub fn failure_to_report(&self) -> bool {
+        self.state.take_report()
+    }
+}
+
 // ── Page-reservation allocator ──────────────────────────────────────────────
 //
 // Re-exports from `crate::sys::reserve`. See that module for the per-process

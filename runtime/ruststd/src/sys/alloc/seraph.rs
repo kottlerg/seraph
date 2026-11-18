@@ -1491,6 +1491,15 @@ pub fn fund_cspace_slot_budget(self_cspace: u64, slots: u64) -> bool {
     pool_funding::top_up(short, donate)
 }
 
+/// Whether `self_cspace`'s general headroom is below `low_water` slots plus a
+/// page's slots, or its growth budget below a page
+/// (`syscall_abi::cspace_topup_pages`): the test a low-water hold makes
+/// before it funds.
+pub fn cspace_below_low_water(self_cspace: u64, low_water: u64) -> bool {
+    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
+    syscall_abi::cspace_topup_pages(cspace_general_headroom(self_cspace), budget, low_water) != 0
+}
+
 /// Abort the calling thread via `SYS_THREAD_EXIT`. Used as the allocation-
 /// failure and panic terminator.
 pub fn abort_thread() -> ! {

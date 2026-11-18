@@ -31,8 +31,10 @@ procmgr/
 │                                 machine, the first death queue's
 │                                 size (`FIRST_POOL_OBSERVERS`), the
 │                                 attach and detach refusals and image
-│                                 span, the process names, and the
-│                                 thread registry and crash badges
+│                                 span, the process names, the
+│                                 thread registry and crash badges,
+│                                 and the process tree (parent links,
+│                                 destroy marks, re-parenting)
 ├── src/
 │   ├── main.rs                 # main() (std runtime), request workers, reaper
 │   ├── crash.rs                # Crash endpoint, its decliner, the handover
@@ -88,10 +90,20 @@ procmgr/
   [docs/ipc-interface.md](docs/ipc-interface.md) § Label 3: `RELEASE_HOLD`). See
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Steady-State
   Process Creation and § Process Death.
-- **Process teardown** — on exit or crash, revoke the process's
-  `AddressSpace` capability (which stops all threads bound to it) and
-  notify memmgr. See
+- **Process teardown** — on exit, crash or destroy, revoke the process's
+  `AddressSpace` capability (which stops all threads bound to it), notify
+  memmgr, and post the process's end once to its death relay and its end
+  queue. See
   [docs/process-lifecycle.md](../../docs/process-lifecycle.md) § Process Death.
+- **Process tree** — record each process's parent, the process that created
+  it; destroy a process together with every process below it, refusing
+  creates from that subtree once the destroy begins; re-parent the children
+  of a process that ends to its nearest live ancestor, or destroy them when
+  it was created contained (`CREATE_CONTAIN`); list a process's children,
+  with their subtrees' pages, and destroy one of them (`LIST_CHILDREN`,
+  `DESTROY_CHILD`); and keep the end queue a process registers on itself
+  (`REGISTER_END_QUEUE`). See [docs/ipc-interface.md](docs/ipc-interface.md)
+  § Process Tree.
 - **Process registry** — maintain a table of running processes; answer
   queries from svcmgr and other services.
 - **Per-child log cap seeding** — derive a badged SEND cap on the
@@ -331,9 +343,10 @@ so its threads send no `REGISTER_THREAD` and start without waiting on one
 The shared state is behind these locks:
 
 - The table lock guards the process table and the recent-exits ring (`process::Tables`). Its holder
-  makes syscalls that do not block on another process, and no IPC call but the two below; every
-  other call, to memmgr for a child, to a file server, or to the crash decliner, is made after it
-  is released.
+  makes syscalls that do not block on another process, the create reply among them (an
+  `ipc_reply`, made under the lock so a destroy marks the child either before the reply or after
+  it), and no IPC call but the two below; every other call, to memmgr for a child, to a file
+  server, or to the crash decliner, is made after it is released.
 - The death-set lock guards the death queues and their wait set. A bind that grows the set funds
   the new queue or wait set from memmgr while it holds the lock; memmgr calls no procmgr label, so
   that call cannot wait on a lock procmgr holds.
@@ -365,13 +378,20 @@ table lock is never held with the death-set lock: the reaper copies each pass's 
 under the death-set lock and handles them after releasing it, and a create binds its child's death
 observers before it takes the table lock to insert the entry.
 
-A create reserves its badge under the table lock, which keeps a concurrent create from drawing it,
-and builds the child (its kernel objects, its image, its death observers, its pager and crash
-bindings) with no lock held. It inserts the complete entry last, so no other worker sees a
-half-built child. A teardown, by the reaper or by `DESTROY_PROCESS`, takes the entry, records the
-exit, releases the child's kernel objects, and parks a held reclaim in one hold of the table lock,
-and sends `PROCESS_DIED` to memmgr after releasing it. So a `DESTROY_PROCESS` that finds no entry
-finds the child torn down, and a `RELEASE_HOLD` after it finds the reclaim parked.
+A create reserves its badge under the table lock, with its creator beside it, which keeps a
+concurrent create from drawing it, and builds the child (its kernel objects, its image, its death
+observers, its pager and crash bindings) with no lock held. It inserts the complete entry last,
+taking the parent from the reservation, so no other worker sees a half-built child, and an insert
+whose creator a destroy has marked meanwhile is refused. The entry stays the create's until the
+create reply delivers the child: a destroy that marks it first leaves it, and the create refuses
+itself and destroys the child without posting to its relay. A destroy (`DESTROY_PROCESS`,
+`DESTROY_CHILD`) marks its whole subtree in one hold of the table lock, then tears the marked
+entries down one per hold; in that hold, a process that has already ended and is not reaped yet is
+reaped instead, as the reaper would. A teardown, by the reaper or by a destroy, takes the entry,
+re-parents or marks its children, records the exit, releases the child's kernel objects, and parks a
+held reclaim in one hold of the table lock, and sends `PROCESS_DIED` to memmgr and posts the end to
+the child's death relay and end queue after releasing it. So a destroy that finds no entry finds the
+child's kernel objects released, and a `RELEASE_HOLD` after it finds the reclaim parked.
 
 The reaper checks, after each pass, for a gone crash service and for gone debuggers, whose deaths
 woke it. A registered crash service or a debugger's watch that is a thread other than its

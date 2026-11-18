@@ -187,7 +187,8 @@ pub mod procmgr_labels
     /// * bit `32` — [`CREATE_RESERVE`]
     /// * bit `33` — [`CREATE_NODE_HANDLE`]
     /// * bit `34` — [`CREATE_CHARGE_NODE`]
-    /// * bits `[35..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
+    /// * bit `35` — [`CREATE_CONTAIN`]
+    /// * bits `[36..64]` — reserved (zero; see [`CREATE_RESERVED_MASK`])
     ///
     /// IPC data words:
     /// * `word 0` — `file_size` (u64), as reported by the caller's `NS_LOOKUP` size hint
@@ -244,13 +245,14 @@ pub mod procmgr_labels
     /// Label flag (bit 17) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
     /// the message carries a trailing death-relay POST-only `EventQueue` cap
     /// (the LAST cap in the message, which then carries at least two caps).
-    /// Once the child is recorded, procmgr binds it as an `AddressSpace`
-    /// death observer (correlator 0) on the child so that the first terminal
-    /// fault in any of the child's threads posts the fault class straight to
-    /// the spawner's own death queue, once, letting `Child::wait()` return. procmgr
-    /// `cap_delete`s its copy after the bind (the kernel captured the
-    /// `EventQueue` state at bind time). Occupies bit 17 of the
-    /// `[16..31]` label window.
+    /// procmgr keeps the relay for the child's life and posts the child's end
+    /// to it once, as the entry `(reason, 0)`: the fault class at the reap of
+    /// a terminal fault in any of the child's threads, the exit reason at the
+    /// reap of its main thread's exit, or the reason a destroy tore it down
+    /// with (`EXIT_KILLED` for a running child), so `Child::wait()` returns
+    /// whoever ended the child. procmgr deletes its copy once it has posted,
+    /// and when the child is re-parented, its creator having ended
+    /// ([`CREATE_CONTAIN`]). Occupies bit 17 of the `[16..31]` label window.
     pub const CREATE_DEATH_RELAY: u64 = 1 << 17;
     /// Bit offset of the `CREATE_PRIORITY` field (bits `[18..23]`) in a
     /// [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] label: the priority level
@@ -361,11 +363,19 @@ pub mod procmgr_labels
     /// Specified in `services/procmgr/docs/ipc-interface.md`
     /// § Label 1: `CREATE_PROCESS` (**Memory max and reserve**).
     pub const CREATE_CHARGE_NODE: u64 = 1 << 34;
-    /// Still-reserved bits `[35..64]` of a create label. Procmgr rejects
+    /// Label flag (bit 35) for [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`]:
+    /// create the child contained. When a contained process ends, by an
+    /// exit, a fault or a destroy, procmgr destroys what is left of its
+    /// subtree instead of re-parenting its children to its parent, so no
+    /// process it started outlives it. Without the flag, the children of a
+    /// process that ends take its nearest live ancestor as their parent.
+    /// Specified in `services/procmgr/docs/ipc-interface.md` § Process Tree.
+    pub const CREATE_CONTAIN: u64 = 1 << 35;
+    /// Still-reserved bits `[36..64]` of a create label. Procmgr rejects
     /// labels with any of these set (`INVALID_ARGUMENT`), so a future field
     /// addition is provably additive: existing senders are known to send
     /// zeros.
-    pub const CREATE_RESERVED_MASK: u64 = !((1 << 35) - 1);
+    pub const CREATE_RESERVED_MASK: u64 = !((1 << 36) - 1);
     /// Data words an [`ArgvEnvHeader`] takes in a create request.
     pub const ARGV_ENV_HEADER_WORDS: usize = 4;
     /// The first data word of a create request after its fixed word 0, the
@@ -517,9 +527,17 @@ pub mod procmgr_labels
             && HOLD_RELEASE_AUTHORITY != DEATH_EQ_AUTHORITY
     );
 
-    /// Destroy a process, sent on its badged `process_handle`; procmgr
-    /// deletes its kernel objects and sends memmgr `PROCESS_DIED` for it,
-    /// unless [`CREATE_DMA_HOLD`] holds the reclaim back.
+    /// Destroy a process together with every process below it, sent on its
+    /// badged `process_handle`: once the destroy begins, procmgr refuses a
+    /// create from any process of that subtree, then deletes each one's
+    /// kernel objects, sends memmgr `PROCESS_DIED` for it unless
+    /// [`CREATE_DMA_HOLD`] holds the reclaim back, and posts its end to its
+    /// death relay and end queue. A process that has already ended and that
+    /// procmgr has not reaped yet is reaped instead, its children re-parented
+    /// as at its reap. Replies `SUCCESS` once the subtree is torn down, also
+    /// when the process was gone already; a child whose create procmgr has
+    /// not answered yet is left to that create, which is refused and tears
+    /// the child down.
     /// Specified in `services/procmgr/docs/ipc-interface.md` § Label 8:
     /// `DESTROY_PROCESS`.
     pub const DESTROY_PROCESS: u64 = 8;
@@ -546,6 +564,53 @@ pub mod procmgr_labels
     /// in `services/procmgr/docs/ipc-interface.md` § Label 25:
     /// `BIND_DEATH_OBSERVER`.
     pub const BIND_DEATH_OBSERVER: u64 = 25;
+    /// List the children of a process, sent on its badged `process_handle`
+    /// only (`UNAUTHORIZED` on any other cap), one page per call: the
+    /// processes whose parent it is, by creation or by re-parenting, without
+    /// those a destroy has begun on. `data[0]` is 0 to start the walk or 1 to
+    /// resume after the badge in `data[1]`, as for [`LIST_PROCESSES`]. The
+    /// reply carries the page's count in `data[0]`, then per child, in
+    /// ascending badge order, [`LIST_CHILDREN_WORDS_PER_ENTRY`] words: its
+    /// badge, its name as [`LIST_PROCESSES`] lists it, and the pages charged
+    /// to its memmgr budget node and every node below it
+    /// ([`pack_child_entry`]), `0` for a child memmgr no longer knows; at most
+    /// [`LIST_CHILDREN_PAGE`] entries, and a page shorter than that ends the
+    /// walk. `INVALID_BADGE` when the handle names no live process;
+    /// `INVALID_ARGUMENT` for a `data[0]` other than 0 or 1. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 27: `LIST_CHILDREN`.
+    pub const LIST_CHILDREN: u64 = 27;
+    /// Data words one [`LIST_CHILDREN`] entry takes: a [`LIST_PROCESSES`]
+    /// entry, then the subtree's pages.
+    pub const LIST_CHILDREN_WORDS_PER_ENTRY: usize = LIST_PROCESSES_WORDS_PER_ENTRY + 1;
+    /// Entries one [`LIST_CHILDREN`] reply carries at most: as many as fit the
+    /// data words after the count.
+    pub const LIST_CHILDREN_PAGE: usize =
+        (super::MSG_DATA_WORDS_MAX - 1) / LIST_CHILDREN_WORDS_PER_ENTRY;
+    /// Destroy one child of a process, named by its badge in `data[0]`,
+    /// together with every process below it, as [`DESTROY_PROCESS`] destroys
+    /// a process; sent on the parent's badged `process_handle` only
+    /// (`UNAUTHORIZED` on any other cap). The handle is the authority: its
+    /// holder may destroy the parent with everything below it, and the badge
+    /// only names one of its children. Replies `SUCCESS` once the subtree is
+    /// torn down, as [`DESTROY_PROCESS`] does; `INVALID_BADGE` when `data[0]` names no live child of the
+    /// process, or one a destroy has marked. Specified in `services/procmgr/docs/ipc-interface.md`
+    /// § Label 28: `DESTROY_CHILD`.
+    pub const DESTROY_CHILD: u64 = 28;
+    /// Register an end queue on the sender itself, sent on its own procmgr
+    /// cap (its process badge names it; `INVALID_BADGE` on a
+    /// [`PROCESS_HANDLE_TAG`] badge): `caps[0]` a `POST` cap on an
+    /// `EventQueue` (not checked: a post to any other cap fails), `data[0]`
+    /// the correlator. procmgr posts the process's end to the queue once, as the entry `(reason, correlator)` a death
+    /// observer receives: the fault class, the exit reason, or the reason a
+    /// destroy tore it down with, whoever ended it. Replies `SUCCESS`;
+    /// `INVALID_ARGUMENT` without a queue cap; `INVALID_BADGE` when the badge
+    /// names no live process; `END_QUEUE_PRESENT` when the
+    /// process registered one before, so no process replaces the queue another
+    /// holder watches its end through. Caps past `caps[0]`, and the queue of a
+    /// refused request, are deleted. Specified in
+    /// `services/procmgr/docs/ipc-interface.md` § Label 29:
+    /// `REGISTER_END_QUEUE`.
+    pub const REGISTER_END_QUEUE: u64 = 29;
     /// Install one direction's shmem-backed stdio pipe on a child
     /// created via [`CREATE_PROCESS`] / [`CREATE_FROM_FILE`] but not yet
     /// started.
@@ -829,12 +894,78 @@ pub mod procmgr_labels
     /// fit `words`.
     pub fn pack_list_entry(words: &mut [u64], index: usize, badge: u64, name: &[u8]) -> bool
     {
+        entry_words_mut(words, index, LIST_PROCESSES_WORDS_PER_ENTRY)
+            .is_some_and(|entry| pack_named(entry, badge, name))
+    }
+
+    /// Read entry `index` of a [`LIST_PROCESSES`] reply's data words
+    /// `words`: its badge, and its name, written to the front of `name`,
+    /// whose length it returns. `None` when `index` is past the reply's
+    /// count or its words, or the entry's length is past
+    /// [`super::svcmgr_labels::NAME_MAX`].
+    #[must_use]
+    pub fn unpack_list_entry(
+        words: &[u64],
+        index: usize,
+        name: &mut [u8; super::svcmgr_labels::NAME_MAX],
+    ) -> Option<(u64, usize)>
+    {
+        unpack_named(
+            entry_words(words, index, LIST_PROCESSES_WORDS_PER_ENTRY)?,
+            name,
+        )
+    }
+
+    /// Write entry `index` of a [`LIST_CHILDREN`] reply into `words` (the
+    /// reply's data words, the count in word 0, which the caller sets): the
+    /// child's badge, its name as [`pack_list_entry`] writes it, and the pages
+    /// of its subtree. Returns `false`, writing nothing, when the entry does
+    /// not fit `words`.
+    pub fn pack_child_entry(
+        words: &mut [u64],
+        index: usize,
+        badge: u64,
+        name: &[u8],
+        subtree_pages: u64,
+    ) -> bool
+    {
+        let Some((pages_word, named)) =
+            entry_words_mut(words, index, LIST_CHILDREN_WORDS_PER_ENTRY)
+                .and_then(|entry| entry.split_last_mut())
+        else
+        {
+            return false;
+        };
+        *pages_word = subtree_pages;
+        pack_named(named, badge, name)
+    }
+
+    /// Read entry `index` of a [`LIST_CHILDREN`] reply's data words
+    /// `words`: the child's badge, its name, written to the front of `name`,
+    /// the name's length, and the pages of its subtree. `None` as for
+    /// [`unpack_list_entry`].
+    #[must_use]
+    pub fn unpack_child_entry(
+        words: &[u64],
+        index: usize,
+        name: &mut [u8; super::svcmgr_labels::NAME_MAX],
+    ) -> Option<(u64, usize, u64)>
+    {
+        let (pages, named) =
+            entry_words(words, index, LIST_CHILDREN_WORDS_PER_ENTRY)?.split_last()?;
+        let (badge, len) = unpack_named(named, name)?;
+        Some((badge, len, *pages))
+    }
+
+    /// Write a badge and a name into `entry`, the
+    /// [`LIST_PROCESSES_WORDS_PER_ENTRY`] words of one list entry: the badge,
+    /// the name's length, and the name's bytes little-endian, zero-padded, a
+    /// name past [`super::svcmgr_labels::NAME_MAX`] bytes truncated. Returns
+    /// `false`, writing nothing, when `entry` is shorter.
+    fn pack_named(entry: &mut [u64], badge: u64, name: &[u8]) -> bool
+    {
         let Some([badge_word, len_word, name_words @ ..]) =
-            list_entry_base(index).and_then(|base| {
-                words
-                    .get_mut(base..)?
-                    .get_mut(..LIST_PROCESSES_WORDS_PER_ENTRY)
-            })
+            entry.get_mut(..LIST_PROCESSES_WORDS_PER_ENTRY)
         else
         {
             return false;
@@ -850,26 +981,14 @@ pub mod procmgr_labels
         true
     }
 
-    /// Read entry `index` of a [`LIST_PROCESSES`] reply's data words
-    /// `words`: its badge, and its name, written to the front of `name`,
-    /// whose length it returns. `None` when `index` is past the reply's
-    /// count or its words, or the entry's length is past
-    /// [`super::svcmgr_labels::NAME_MAX`].
-    #[must_use]
-    pub fn unpack_list_entry(
-        words: &[u64],
-        index: usize,
+    /// Read the badge and the name [`pack_named`] wrote into `entry`, the name
+    /// to the front of `name`; returns the badge and the name's length.
+    fn unpack_named(
+        entry: &[u64],
         name: &mut [u8; super::svcmgr_labels::NAME_MAX],
     ) -> Option<(u64, usize)>
     {
-        let count = usize::try_from(*words.first()?).ok()?;
-        if index >= count
-        {
-            return None;
-        }
-        let [badge, len_word, name_words @ ..] = words
-            .get(list_entry_base(index)?..)?
-            .get(..LIST_PROCESSES_WORDS_PER_ENTRY)?
+        let [badge, len_word, name_words @ ..] = entry.get(..LIST_PROCESSES_WORDS_PER_ENTRY)?
         else
         {
             return None;
@@ -887,13 +1006,34 @@ pub mod procmgr_labels
         Some((*badge, len))
     }
 
-    /// The first data word of entry `index` of a [`LIST_PROCESSES`] reply,
-    /// past the count in word 0; `None` when it does not fit a `usize`.
-    fn list_entry_base(index: usize) -> Option<usize>
+    /// The `stride` words of entry `index` of a list reply's data words
+    /// `words`, past the count in word 0; `None` when `index` is past the
+    /// count or the words.
+    fn entry_words(words: &[u64], index: usize, stride: usize) -> Option<&[u64]>
     {
-        index
-            .checked_mul(LIST_PROCESSES_WORDS_PER_ENTRY)?
-            .checked_add(1)
+        let count = usize::try_from(*words.first()?).ok()?;
+        if index >= count
+        {
+            return None;
+        }
+        words.get(entry_base(index, stride)?..)?.get(..stride)
+    }
+
+    /// The `stride` words of entry `index` of a list reply's data words
+    /// `words`, for writing; `None` when they do not fit.
+    fn entry_words_mut(words: &mut [u64], index: usize, stride: usize) -> Option<&mut [u64]>
+    {
+        words
+            .get_mut(entry_base(index, stride)?..)?
+            .get_mut(..stride)
+    }
+
+    /// The first data word of entry `index` of a list reply whose entries take
+    /// `stride` words each, past the count in word 0; `None` when it does not
+    /// fit a `usize`.
+    fn entry_base(index: usize, stride: usize) -> Option<usize>
+    {
+        index.checked_mul(stride)?.checked_add(1)
     }
 
     /// Hand a process's crash bindings back after a debugger's attach:
@@ -5086,6 +5226,9 @@ pub mod procmgr_errors
     /// signature policy), architecture or body hash among them
     /// (docs/signing.md § Signature Policy in procmgr). Nothing was created.
     pub const SIGNATURE_REFUSED: u64 = 18;
+    /// `procmgr_labels::REGISTER_END_QUEUE` refused: the sender registered
+    /// an end queue before.
+    pub const END_QUEUE_PRESENT: u64 = 19;
     /// Unknown opcode on procmgr endpoint.
     pub const UNKNOWN_OPCODE: u64 = 0xFFFF;
 }

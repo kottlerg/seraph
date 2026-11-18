@@ -598,9 +598,9 @@ pub const RANGE_COPY_LIMIT: u32 = ROOT_SHARE - 1;
 
 /// The lineage an `Mmio`, `IoPort`, or `Interrupt` object belongs to.
 ///
-/// A boot mint or a range split produces a lineage *root*; copying a
-/// capability of any of these types produces a fresh object whose lineage
-/// names that root, so each capability slot owns its own object and the
+/// A boot mint, a range split, or an `Mmio` merge produces a lineage *root*;
+/// copying a capability of any of these types produces a fresh object whose
+/// lineage names that root, so each capability slot owns its own object and the
 /// mappings, port bindings, or interrupt binding made through it are withdrawn
 /// when that object is freed (docs/capability-model.md § Interrupt, § Mmio,
 /// § `IoPort`). The root's `live` holds
@@ -3445,8 +3445,8 @@ unsafe fn release_range_object<T>(
 /// over the same range, in `src`'s lineage, funded by the arena of `dest`, the
 /// `CSpace` that receives the new slot, so mappings, port bindings, and the
 /// interrupt binding made through the new capability are withdrawn when it is
-/// deleted, consumed by a split, or revoked through an ancestor, whatever other
-/// capabilities to the range survive
+/// deleted, consumed by a split (an `Mmio` also by a merge), or revoked through
+/// an ancestor, whatever other capabilities to the range survive
 /// (docs/capability-model.md § Interrupt, § Mmio, § `IoPort`); an `Interrupt`
 /// copy starts unbound. Every other type shares `src`, whose reference count is
 /// incremented.

@@ -317,7 +317,7 @@ for the snapshot-detection design.
 Same boot requirements as `test-terminal` (default boot set, terminal
 autostarted); the host computes the verdict and kills QEMU. In CI it runs as
 an additional boot inside the x86_64 `usertest` cell, after `test-terminal`,
-`test-wedge`, `test-reboot` and `test-signing`.
+`test-wedge`, `test-reboot`, `test-core-death` and `test-signing`.
 
 ### KASLR randomization (`test-kaslr`)
 
@@ -471,6 +471,47 @@ See [xtask/README.md § test-powerbutton](../xtask/README.md#cargo-xtask-test-po
 command and [services/acpid/README.md](../services/acpid/README.md) § Events for the event path.
 Same boot requirements as `test-terminal` (default boot set, terminal autostarted). In CI it runs
 as a further boot inside the x86_64 `usertest` cells, after `test-vmgenid`.
+
+### Core death (`test-core-death`)
+
+The death of a core service, or the permanent death of a critical one, powers the system off
+([supervision.md § Core Set and System Death](supervision.md#core-set-and-system-death)). No
+service carries a hook that could make it die, so `cargo xtask test-core-death [--arch]` (both
+arches) kills each one from outside the guest, one boot per target, by moving one of its threads to
+program counter 0, which no process maps; the thread's instruction fetch faults, and the fault is
+terminal. Two routes reach the thread:
+
+- **The GDB stub service**, for the services procmgr creates: svcmgr, devmgr, vfsd and logd. The
+  command stages the stub naming the target, as `run --debug-target` stages it, and boots with the
+  debug port. Once the stub logs its attach, the host connects over the port, moves the target's
+  main thread and detaches, which gives the target its crash bindings back, and the thread runs
+  into the fault. svcmgr is killed at the attach, while the boot waits on it. devmgr and vfsd are
+  released at the attach and held again once the terminal's READY line and svcmgr's
+  reconciliation line have appeared: svcmgr's launches still call them, and a call to one that
+  died after svcmgr's check of it waits for good (#1185). logd restarts, so it is killed at the
+  same point, then again after each `service restarted: logd` line, through the stub's attach to
+  the new instance, four times in all: the fourth death finds svcmgr's restart budget (three per
+  60 s window) spent and is permanent.
+- **QEMU's own gdbstub**, for memmgr and procmgr, which init creates with raw syscalls, so no
+  debugger can attach to them. Once the terminal's READY line has appeared, the host sets a
+  hardware breakpoint on a function of the target's binary, at the image bias init logs for it
+  plus the function's address in the binary's symbol table, and types `hello` at the shell over
+  the serial line, whose spawn and reap run it: `memmgr::select` (memmgr's one thread, in an
+  allocation), `procmgr::handle_create` (a procmgr request worker, in the create), and
+  `procmgr::process::reap_dead` (procmgr's reaper, a thread other than its main thread, in the
+  reap). On each stop it checks that the program counter is the function's and the code there is
+  the binary's, since another process can run code at the same address, moves that CPU's program
+  counter, removes the breakpoint, and resumes the VM.
+
+A boot passes when, after the kill, QMP's `SHUTDOWN` event gives reason `guest-shutdown` and QEMU
+exits on its own within two minutes. The paths it covers are svcmgr's `critical service
+unrecoverable` shutdown through the actuator for memmgr, procmgr, devmgr, vfsd and logd, the
+address-space observer for a procmgr thread other than the main one, and pwrmgr's observer of
+svcmgr ([supervision.md § Observing svcmgr](supervision.md#observing-svcmgr)). See
+[xtask/README.md § test-core-death](../xtask/README.md#cargo-xtask-test-core-death) for the command.
+Same boot requirements as `test-terminal` (default boot set, terminal autostarted). In CI it runs
+as a further boot set inside each `usertest` cell (both arches, both profiles), after
+`test-reboot`.
 
 ### Debug port (`test-debug-port`)
 
@@ -752,13 +793,14 @@ CI matrix cells follow these rules per boot. The `usertest` cell runs its
 boots in sequence — `usertest` (via `run-parallel`, terminal dropped), then
 the terminal interactive test (via `test-terminal`) after dropping
 `usertest.svc` and repacking to restore the default boot (terminal present),
-then the `test-wedge` boot pair, then the `test-reboot` boot, then the four `test-signing` boots,
-then on x86_64 the `test-vmgenid` save/restore boot pair and the `test-powerbutton` boot. The
-terminal and wedge test boots have *no* shutdown-invoking harness: `test-terminal` and
-`test-wedge` compute the verdict host-side and kill QEMU themselves. The `test-reboot` boot's
-fixture invokes `REBOOT`, the host reads the reset over QMP, and QEMU exits on its own. The
-`test-powerbutton` boot is powered off by its press: the host presses the button over QMP, reads
-the power-off there, and QEMU exits on its own.
+then the `test-wedge` boot pair, then the `test-reboot` boot, then the seven `test-core-death`
+boots, then the four `test-signing` boots, then on x86_64 the `test-vmgenid` save/restore boot
+pair and the `test-powerbutton` boot. The terminal and wedge test boots have *no*
+shutdown-invoking harness: `test-terminal` and `test-wedge` compute the verdict host-side and kill
+QEMU themselves. The `test-reboot` boot's fixture invokes `REBOOT`, the host reads the reset over
+QMP, and QEMU exits on its own. Each `test-core-death` boot is powered off by the death it makes,
+read over QMP, and QEMU exits on its own. The `test-powerbutton` boot is powered off by its press:
+the host presses the button over QMP, reads the power-off there, and QEMU exits on its own.
 
 ---
 
@@ -1711,8 +1753,9 @@ gdb -batch -ex 'target remote :1234' -ex 'hbreak kernel::panic' -ex continue \
 while the rest of the system runs on: breakpoints, single-step, registers and memory of each of
 its threads, then a detach that hands it back to the crash service. `cargo xtask run --debug-port
 <PORT> --debug-target <NAME>` stages the stub for the boot, naming the process by its `argv[0]`
-(for a service, the first word of its recipe's `argv`; for a driver devmgr binds, its bundle
-entry name or install path), and prints the GDB command line, which
+(for a service, the first word of its recipe's `argv`; for devmgr, vfsd and svcmgr, which init
+creates, the service's name; for a driver devmgr binds, its bundle entry name or install path), and
+prints the GDB command line, which
 loads the process's sysroot binary for symbols; the stub reports the image's load bias
 (`qOffsets`), so GDB relocates them itself
 ([xtask/README.md](../xtask/README.md#cargo-xtask-run)). A process that declared itself

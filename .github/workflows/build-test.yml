@@ -305,7 +305,17 @@ jobs:
             # SHUTDOWN event; host-side over QMP, so it cannot ride
             # run-parallel. Restores the default interactive boot after.
             cargo xtask test-reboot --arch ${{ matrix.arch }}
-            # Sixth boot set: the signature refusal test (#124). Builds a
+            # Sixth boot set: the core-death test (#262). One boot per core or
+            # critical service (memmgr, procmgr and its reaper thread, svcmgr,
+            # devmgr, vfsd, logd until its restart budget is spent), each
+            # killed by a terminal fault made from outside the guest (the GDB
+            # stub service, or QEMU's gdbstub for the init-created memmgr and
+            # procmgr), and each must power the system off, read from QMP's
+            # SHUTDOWN event; host-side, so it cannot ride run-parallel.
+            # Reuses the default interactive boot, and repacks it as it was
+            # after each stub boot.
+            cargo xtask test-core-death --arch ${{ matrix.arch }}
+            # Seventh boot set: the signature refusal test (#124). Builds a
             # bootloader under a store revoking the signing key in the cell's
             # profile, then boots four images carrying a tampered kernel, a
             # tampered bundle entry, that bootloader, and tampered,
@@ -318,13 +328,13 @@ jobs:
               cargo xtask test-signing --arch ${{ matrix.arch }}
             fi
             if [ "${{ matrix.arch }}" = "x86_64" ]; then
-              # Seventh boot pair: the VMGENID snapshot-resume test (#395).
+              # Eighth boot pair: the VMGENID snapshot-resume test (#395).
               # x86_64 only (QEMU's riscv64 virt machine has no VMGENID);
               # host-side QMP migrate/restore, so it cannot ride
               # run-parallel. Reuses the default interactive boot the
               # test-reboot restore left.
               cargo xtask test-vmgenid
-              # Eighth boot: the power-button test. x86_64 only (QEMU's
+              # Ninth boot: the power-button test. x86_64 only (QEMU's
               # riscv64 virt machine has no fixed power button); presses the
               # ACPI power button over QMP once acpid has armed its events,
               # and pwrmgr must power off through acpid. Host-side over QMP,

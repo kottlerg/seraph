@@ -175,6 +175,24 @@ impl Guest
         Ok(line)
     }
 
+    /// Echo serial lines until the stream ends, as QEMU's exit ends it, or
+    /// `timeout` passes; whether it ended.
+    pub fn echo_until_end(&mut self, timeout: Duration) -> bool
+    {
+        let start = Instant::now();
+        loop
+        {
+            match self
+                .lines
+                .recv_timeout(timeout.saturating_sub(start.elapsed()))
+            {
+                Ok(line) => println!("{line}"),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return true,
+                Err(mpsc::RecvTimeoutError::Timeout) => return false,
+            }
+        }
+    }
+
     /// Kill QEMU and reap it now rather than at the end of scope (the
     /// teardown is [`Guest::teardown`], which `Drop` runs).
     pub fn shutdown(self)

@@ -1019,6 +1019,7 @@ dependencies = [
  "logd-codec",
  "objsig",
  "procmgr-process-table",
+ "svcmgr-defs",
  "syscall-abi",
  "vfsd-gpt",
 ]

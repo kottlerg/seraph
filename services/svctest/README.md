@@ -51,6 +51,9 @@ services/svctest/
         │                      # large-module create; death queues; logd death
         │                      # forward; init reap
         ├── process_faults.rs  # Stack-guard and RELRO-seal faults
+        ├── process_tree.rs    # procmgr's process tree: subtree destroy, re-parenting,
+        │                      #   destroy after an end, containment, child list and
+        │                      #   destroy, end post, end queue
         ├── crash.rs           # procmgr's crash endpoint: registration, handover, take-back
         ├── exit_code.rs       # Child exit-code propagation to `ExitStatus`
         ├── random.rs          # `SYS_GETRANDOM`, hash seeding, ASLR layout divergence
@@ -320,6 +323,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
+| `end-queue-child`           | `process_tree` | `process_tree_end_queue` (end queue)       |
+| `exit-fault-child`          | `process_tree` | `process_tree_end_posted_once` (one post)  |
 | `logd-name-probe-child`     | `logd_restart` | `logd_restart` (named-sender refusals)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |

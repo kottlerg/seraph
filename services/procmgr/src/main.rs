@@ -574,45 +574,22 @@ const CSPACE_LOW_WATER: u64 = 256;
 /// Headroom a top-up funds: about 18 slot pages.
 const CSPACE_TOPUP_SLOTS: u64 = 1024;
 
-/// Whether the last top-up failed, so a streak of failures logs once; held
-/// by the one worker topping up, and passed over by any other meanwhile.
-static HEADROOM_WARNED: Mutex<bool> = Mutex::new(false);
+/// procmgr's own `CSpace` held above [`CSPACE_LOW_WATER`] general slots
+/// (services/procmgr/README.md § `CSpace` headroom).
+static HEADROOM: std::os::seraph::CSpaceHeadroom =
+    std::os::seraph::CSpaceHeadroom::new(CSPACE_LOW_WATER, CSPACE_TOPUP_SLOTS);
 
-/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, with
-/// a page of growth budget beyond them for its body arena, so
+/// Keep procmgr's own `CSpace` above [`CSPACE_LOW_WATER`] general slots, so
 /// its allocations never meet an exhausted `CSpace` and its receives keep the
-/// IPC receive reserve (services/procmgr/README.md § `CSpace` headroom). Each
-/// request runs it before it is served; a worker that finds another topping
-/// up goes on, since the low-water mark leaves room for every worker's
-/// request. A failed top-up is retried on the next request, and the log
-/// names only the first failure of a streak.
+/// IPC receive reserve. Each request runs it before it is served; a worker
+/// that finds another topping up goes on, since the low-water mark leaves
+/// room for every worker's request. A failed top-up is retried on the next
+/// request, and the log names only the first failure of a streak.
 fn hold_cspace_headroom(self_cspace: u64)
 {
-    // The top-up (a call to memmgr) and the failure's log line (a call to
-    // logd) are IPC calls made under this lock, which no other lock nests
-    // and no thread waits on (`try_lock`).
-    let Ok(mut warned) = HEADROOM_WARNED.try_lock()
-    else
+    HEADROOM.hold(self_cspace);
+    if HEADROOM.failure_to_report()
     {
-        return;
-    };
-    // The growth budget also funds the body arena (the bodies of procmgr's
-    // splits), so a page of it is held beyond the slots
-    // (`syscall_abi::cspace_topup_pages`).
-    let budget = syscall::cap_info(self_cspace, syscall_abi::CAP_INFO_CSPACE_BUDGET).unwrap_or(0);
-    let headroom = std::os::seraph::cspace_slot_headroom(self_cspace);
-    if syscall_abi::cspace_topup_pages(headroom, budget, CSPACE_LOW_WATER) == 0
-    {
-        *warned = false;
-        return;
-    }
-    if std::os::seraph::fund_cspace_slot_budget(self_cspace, CSPACE_TOPUP_SLOTS)
-    {
-        *warned = false;
-    }
-    else if !*warned
-    {
-        *warned = true;
         std::os::seraph::log!(warn: "CSpace headroom top-up failed; retrying each pass");
     }
 }

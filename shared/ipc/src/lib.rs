@@ -1971,9 +1971,10 @@ pub mod published_names
     /// SEND on devmgr's registry endpoint badged
     /// `REGISTRY_QUERY_AUTHORITY | ACPI_AUTHORITY`: the `devmgr.registry`
     /// surface plus the labels through which acpid acquires its register
-    /// blocks, regions and configuration-space accesses and pushes its
-    /// results (`devmgr_labels::ACPI_AUTHORITY`). Seed-only and seeded only
-    /// by acpid.
+    /// blocks, regions and configuration-space accesses, pushes its results,
+    /// and posts the firmware's hotplug events, each of which has devmgr run
+    /// a slot's add or removal job (`devmgr_labels::ACPI_AUTHORITY`).
+    /// Seed-only and seeded only by acpid.
     pub const DEVMGR_ACPI: &[u8] = b"devmgr.acpi";
 
     /// `acpid_labels::POWER_AUTHORITY`-badged SEND on acpid's service
@@ -3259,10 +3260,12 @@ pub mod devmgr_labels
     pub const CLASS_AUTHORITY: u64 = 1u64 << 59;
     /// Authority bit gating the labels acpid alone calls:
     /// [`QUERY_ACPI_RESOURCES`], [`ACPI_REGION_GRANT`], [`ACPI_PCI_CONFIG`],
-    /// [`OSC_RESULT`], [`BRIDGE_WINDOWS`], and [`PRT_TABLE`]. svcmgr mints
-    /// it, beside [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it
-    /// publishes seed-only as [`crate::published_names::DEVMGR_ACPI`], which
-    /// acpid alone seeds. Disjoint position from the other authority bits.
+    /// [`OSC_RESULT`], [`BRIDGE_WINDOWS`], [`PRT_TABLE`], and [`ACPI_HOTPLUG`],
+    /// which has devmgr add or remove a firmware-driven slot's devices and
+    /// withdraw their drivers. svcmgr mints it, beside
+    /// [`REGISTRY_QUERY_AUTHORITY`], only onto the SEND it publishes
+    /// seed-only as [`crate::published_names::DEVMGR_ACPI`], which acpid
+    /// alone seeds. Disjoint position from the other authority bits.
     pub const ACPI_AUTHORITY: u64 = 1u64 << 58;
 
     /// The badge of a class SEND ([`MINT_CLASS_SEND`]): the class's slot in

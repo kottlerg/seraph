@@ -278,8 +278,8 @@ string at its own length:
 
 The launch surfaces svcmgr replays beyond that record (the
 argv / env / cwd / seed, plus the log-sink, debug-authority,
-stop-authority, `oom_stop` and `reserve` flags and the
-scheduling fields) are held in a parallel
+stop-authority, `oom_stop` and `reserve` flags, the `stop_source`
+class and the scheduling fields) are held in a parallel
 [`RestartRecipe`](../src/service.rs) table
 (`ServiceTable.recipes`), index-aligned with `services` by slot:
 
@@ -294,12 +294,14 @@ scheduling fields) are held in a parallel
 | `stop_authority` | `stop_authority = ...` |
 | `oom_stop` | `oom_stop = ...` |
 | `reserve` | `reserve = ...` |
+| `stop_source` | `stop_source = ...` (`None` = unset); svcmgr lists a running source by it (`LIST_STOP_SOURCES`) |
 | `priority` | `priority = ...` (`0` = unset) |
 | `sched_max` | `sched_max = ...` (`0` = unset) |
 
 `restart_process` replays every field on every respawn — argv/env, the
-scheduling fields and the create flags `reserve` and `oom_stop` ask for
-(`CREATE_RESERVE`, `CREATE_NODE_HANDLE`) into `CREATE_FROM_FILE`, cwd
+scheduling fields and the create flags `reserve`, `oom_stop` and `stop_source`
+ask for (`CREATE_RESERVE`, `CREATE_NODE_HANDLE`, `CREATE_CONTAIN`) into
+`CREATE_FROM_FILE`, cwd
 through `apply_namespace_policy`, seeds re-resolved from the discovery
 registry, a fresh `DEBUG_AUTHORITY` and `STOP_AUTHORITY` cap after them,
 and `log_sink` selecting the log-sink round — so a restarted child comes

@@ -10,8 +10,9 @@
 //! service is permanently down (continue, or graceful shutdown). On restart
 //! svcmgr re-creates the process via procmgr, replays the recipe's
 //! argv/env/cwd/seed surfaces, its scheduling fields (`priority`,
-//! `sched_max`), its create flags (`reserve`, and the node handle an
-//! `oom_stop` service is created with), its log-sink flag and its
+//! `sched_max`), its create flags (`reserve`, the node handle an
+//! `oom_stop` service is created with, and the containment of a
+//! `stop_source` service), its log-sink flag and its
 //! debug- and stop-authority caps, binds the new instance's death observers
 //! before it starts, and serves its bootstrap.
 //!

@@ -39,8 +39,8 @@ override knob
 the optional presence-only `\EFI\seraph\mapredo` test knob, which makes the
 first memory-map attempt redo
 ([memory-map.md § Sizing the Entry Array](../core/boot/docs/memory-map.md#sizing-the-entry-array)),
-and the bootloader binary itself, installed both at `\EFI\seraph\boot.efi`
-and at the EFI fallback path
+and the bootloader binary itself, a copy of its installed file `/boot/boot.efi`
+both at `\EFI\seraph\boot.efi` and at the EFI fallback path
 ([build-system.md § Build Output: the Sysroot](build-system.md#build-output-the-sysroot)).
 `BootInfo` carries no kernel command
 line; root-partition identity comes from GPT type-GUID role discovery,

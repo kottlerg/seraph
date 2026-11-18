@@ -12,7 +12,10 @@
 //! ([`FreeRunScan`]), bounds cluster numbers to the data region
 //! ([`is_data_cluster`]), locates, reads and writes FAT entries
 //! ([`fat_entry_location`], [`read_fat_entry`], [`write_fat_entry`]),
-//! places a file offset in its cluster chain ([`file_position`]), encodes
+//! places a file offset in its cluster chain ([`file_position`]), resumes a
+//! sequential reader's chain walk ([`walk_start`]) and sizes its cache fills
+//! ([`run_cluster_bound`], [`contiguous_clusters`], [`file_end_sector`],
+//! [`run_pages`]), encodes
 //! long names ([`encode_lfn`]) and packs their slots ([`pack_lfn_slot`]), picks
 //! short-name numeric tails ([`TailSet`]), and keeps the node table's
 //! recycling identifiers ([`node_slab::NodeSlab`]) and the open-instance
@@ -615,6 +618,144 @@ pub fn file_position(
         offset_in_sector: usize::try_from(offset_in_sector).ok()?,
         left_in_sector: usize::try_from(bps.get().checked_sub(offset_in_sector)?).ok()?,
     })
+}
+
+// ── Sequential reads ───────────────────────────────────────────────────────
+
+/// Most pages one `fatfs` cache fill reads from the block device, in one
+/// `BLK_READ_INTO_MEMORY`, when a memory-cap read misses on a sequential scan
+/// of a file ([`run_pages`]). Each block request pays a fixed cost (the
+/// device's DMA mapping and unmapping through devmgr, the interrupt, and the
+/// IPC round trips) that a run pays once for all its pages; the pages past the
+/// first are copied out of a transfer buffer of this many pages, which each
+/// mount holds for its lifetime. A tuning bound: a longer scan takes more
+/// fills.
+pub const RUN_PAGES: u64 = 16;
+
+/// Where one open of a file last stood in its cluster chain: the cluster at
+/// `cluster_index` of the chain whose first cluster is `first_cluster`, as
+/// read while the volume's chain epoch was `epoch`. A sequential reader's
+/// next walk resumes here instead of at the chain's head ([`walk_start`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainCursor
+{
+    /// The volume's chain epoch when the cursor was taken: it moves whenever
+    /// a chain is freed, after which a cluster the cursor names may belong to
+    /// another chain or none.
+    pub epoch: u64,
+    /// The first cluster of the chain the cursor walked.
+    pub first_cluster: u32,
+    /// Clusters of the chain before [`Self::cluster`].
+    pub cluster_index: u64,
+    /// The cluster at [`Self::cluster_index`].
+    pub cluster: u32,
+}
+
+/// Where a walk to cluster `target_index` of the chain starting at
+/// `first_cluster` begins, as `(cluster_index, cluster)`: at `cursor` when
+/// it was taken on that chain in the current `epoch` at or before the target,
+/// else at the chain's head. A chain only grows at its end while its epoch
+/// holds, so the links up to a cursor stay as the cursor read them.
+#[must_use]
+pub fn walk_start(
+    cursor: Option<ChainCursor>,
+    epoch: u64,
+    first_cluster: u32,
+    target_index: u64,
+) -> (u64, u32)
+{
+    match cursor
+    {
+        Some(c)
+            if c.epoch == epoch
+                && c.first_cluster == first_cluster
+                && c.cluster_index <= target_index =>
+        {
+            (c.cluster_index, c.cluster)
+        }
+        _ => (0, first_cluster),
+    }
+}
+
+/// How many clusters of a chain, from `first` on, lie at consecutive cluster
+/// numbers, so one device read covers them: at least 1 (`first` itself) and
+/// at most `max` (1 when `max` is 0). `next` gives a cluster's successor in
+/// the chain, `None` at its end or where it cannot be read, which ends the
+/// run there.
+#[must_use]
+pub fn contiguous_clusters(first: u32, max: u32, mut next: impl FnMut(u32) -> Option<u32>) -> u32
+{
+    let mut count = 1;
+    let mut cluster = first;
+    while count < max
+    {
+        let Some(following) = cluster.checked_add(1)
+        else
+        {
+            break;
+        };
+        if next(cluster) != Some(following)
+        {
+            break;
+        }
+        cluster = following;
+        count = count.saturating_add(1);
+    }
+    count
+}
+
+/// Pages one cache fill reads for a run of sectors from `page_base` (a page's
+/// first sector) to `run_end` (the sector past the run): the pages that cover
+/// it, at least 1 and at most `max_pages` (1 when `max_pages` is 0), of
+/// `sectors_per_page` sectors each.
+#[must_use]
+pub fn run_pages(page_base: u64, run_end: u64, sectors_per_page: NonZeroU64, max_pages: u64)
+-> u64
+{
+    run_end
+        .saturating_sub(page_base)
+        .div_ceil(sectors_per_page.get())
+        .clamp(1, max_pages.max(1))
+}
+
+/// The most clusters a run fill from a sector `sector_in_cluster` sectors
+/// into its cluster can reach, for `sectors_per_cluster` sectors per
+/// cluster: `max_pages` pages of `sectors_per_page` sectors past that sector
+/// (a run starts at the sector's page, at or before it), counted from the
+/// cluster's first sector. At least 1, and `u32::MAX` past that.
+#[must_use]
+pub fn run_cluster_bound(
+    max_pages: u64,
+    sectors_per_page: NonZeroU64,
+    sector_in_cluster: u32,
+    sectors_per_cluster: NonZeroU64,
+) -> u32
+{
+    let sectors = max_pages
+        .saturating_mul(sectors_per_page.get())
+        .saturating_add(u64::from(sector_in_cluster));
+    u32::try_from(sectors.div_ceil(sectors_per_cluster.get()))
+        .unwrap_or(u32::MAX)
+        .max(1)
+}
+
+/// The sector past a file's last byte, for a read at byte `offset_in_sector`
+/// of `sector` with `left_in_file` bytes of the file from there, were the
+/// rest of the file to follow `sector` on the device: the bound a run fill
+/// takes beside the chain's contiguous span ([`contiguous_clusters`]).
+#[must_use]
+pub fn file_end_sector(
+    sector: u64,
+    offset_in_sector: u64,
+    left_in_file: u64,
+    bytes_per_sector: NonZeroU64,
+) -> u64
+{
+    sector.saturating_add(
+        offset_in_sector
+            .saturating_add(left_in_file)
+            .div_ceil(bytes_per_sector.get()),
+    )
 }
 
 /// One sector's share of a file write ([`sector_write`]), which writes the
@@ -1690,6 +1831,99 @@ mod tests
         let mut kept = [false; 5];
         keep_most_recent(&slots, 4, &mut kept);
         assert_eq!(kept, [false, false, false, true, true]);
+    }
+
+    #[test]
+    fn walk_start_resumes_at_a_cursor_on_the_same_chain_and_epoch_at_or_before_the_target()
+    {
+        let cursor = ChainCursor {
+            epoch: 3,
+            first_cluster: 10,
+            cluster_index: 5,
+            cluster: 42,
+        };
+        assert_eq!(walk_start(Some(cursor), 3, 10, 5), (5, 42));
+        assert_eq!(walk_start(Some(cursor), 3, 10, 9), (5, 42));
+    }
+
+    #[test]
+    fn walk_start_begins_at_the_head_when_the_cursor_cannot_serve()
+    {
+        let cursor = ChainCursor {
+            epoch: 3,
+            first_cluster: 10,
+            cluster_index: 5,
+            cluster: 42,
+        };
+        // A target behind the cursor, a chain freed since, another chain,
+        // and no cursor.
+        assert_eq!(walk_start(Some(cursor), 3, 10, 4), (0, 10));
+        assert_eq!(walk_start(Some(cursor), 4, 10, 9), (0, 10));
+        assert_eq!(walk_start(Some(cursor), 3, 11, 9), (0, 11));
+        assert_eq!(walk_start(None, 3, 10, 9), (0, 10));
+    }
+
+    #[test]
+    fn contiguous_clusters_counts_consecutive_links_up_to_the_bound()
+    {
+        // 7 -> 8 -> 9 -> 12 -> end.
+        let next = |c: u32| match c
+        {
+            7 => Some(8),
+            8 => Some(9),
+            9 => Some(12),
+            _ => None,
+        };
+        assert_eq!(contiguous_clusters(7, 16, next), 3);
+        assert_eq!(contiguous_clusters(7, 2, next), 2);
+        assert_eq!(contiguous_clusters(12, 16, next), 1);
+        assert_eq!(contiguous_clusters(7, 0, next), 1);
+    }
+
+    #[test]
+    fn contiguous_clusters_stops_at_the_last_cluster_number()
+    {
+        assert_eq!(contiguous_clusters(u32::MAX, 4, |_| Some(0)), 1);
+    }
+
+    #[test]
+    fn run_pages_covers_the_run_in_whole_pages_within_the_bound()
+    {
+        let spp = NonZeroU64::new(8).unwrap();
+        // A run ending inside its third page takes three pages.
+        assert_eq!(run_pages(16, 16 + 17, spp, 16), 3);
+        assert_eq!(run_pages(16, 16 + 24, spp, 16), 3);
+        // Capped at the bound, and never below one page.
+        assert_eq!(run_pages(0, 8 * 100, spp, 16), 16);
+        assert_eq!(run_pages(16, 16, spp, 16), 1);
+        assert_eq!(run_pages(16, 3, spp, 16), 1);
+        assert_eq!(run_pages(0, 8 * 100, spp, 0), 1);
+    }
+
+    #[test]
+    fn run_cluster_bound_covers_the_run_from_the_cluster_start()
+    {
+        let spp = NonZeroU64::new(8).unwrap();
+        let spc = NonZeroU64::new(8).unwrap();
+        // 16 pages of 8 sectors, 3 sectors into the cluster: 131 sectors.
+        assert_eq!(run_cluster_bound(16, spp, 3, spc), 17);
+        assert_eq!(run_cluster_bound(16, spp, 0, spc), 16);
+        assert_eq!(run_cluster_bound(1, NonZeroU64::MIN, 0, spc), 1);
+        assert_eq!(run_cluster_bound(0, spp, 0, spc), 1);
+        assert_eq!(
+            run_cluster_bound(u64::MAX, spp, 0, NonZeroU64::MIN),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn file_end_sector_rounds_the_file_tail_up_to_whole_sectors()
+    {
+        let bps = NonZeroU64::new(512).unwrap();
+        assert_eq!(file_end_sector(100, 0, 512, bps), 101);
+        assert_eq!(file_end_sector(100, 10, 503, bps), 102);
+        assert_eq!(file_end_sector(100, 10, 502, bps), 101);
+        assert_eq!(file_end_sector(u64::MAX, 0, 1, bps), u64::MAX);
     }
 
     #[test]

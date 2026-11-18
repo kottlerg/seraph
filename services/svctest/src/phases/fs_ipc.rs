@@ -1170,7 +1170,7 @@ pub fn fs_carried_caps_dropped_phase(_: &Caps)
     let ipc_buf = std::os::seraph::current_ipc_buf();
     // More caps than fatfs's `CSpace` has free slots for. The `CSpace` grows
     // only when fatfs funds it: at cache init, to a page cap and a per-read
-    // cap for every slot, the quarantine's replacements, the scratch page and
+    // cap for every slot, the quarantine's replacements, the transfer buffer and
     // 64 more, and before each `FS_OPEN`, to the same funding less the pages
     // the cache already holds. This phase opens nothing before its requests,
     // so the slots free when they start are at most that funding (about twice

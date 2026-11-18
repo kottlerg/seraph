@@ -126,7 +126,9 @@ pub fn read_fat_entry(
 /// copy in `0..num_fats`. The driver's private `cached_fat_sector` is
 /// invalidated when it covers the modified sector — the cluster
 /// allocator and chain walker rely on this so a stale read does not
-/// resurrect freed clusters or skip newly-allocated ones.
+/// resurrect freed clusters or skip newly-allocated ones. The volume's
+/// chain epoch (`FatState::chain_epoch`) moves first, which retires every
+/// open's chain cursor.
 pub fn update_fat_entry(
     state: &mut FatState,
     cluster: u32,
@@ -141,6 +143,9 @@ pub fn update_fat_entry(
         return Err(FatError::Corrupt);
     }
     let (first_fat_sector, ent_off) = state.fat_entry_location(cluster).ok_or(FatError::Corrupt)?;
+    // Before any copy changes: every open's chain cursor walked links this
+    // write may change. One move per FAT entry write, so it never wraps.
+    state.chain_epoch = state.chain_epoch.wrapping_add(1);
 
     let mut sector_buf = sector_buffer()?;
 

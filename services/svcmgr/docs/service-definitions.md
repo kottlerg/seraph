@@ -65,7 +65,7 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). Any number of names; slots past one bootstrap round's `MSG_CAP_SLOTS_MAX` (4) caps ride in further rounds; see [`seed`](#seed). |
 | `provides` | no | Space-separated `name[:auth\|:grant\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
-| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth` (not `:grant`). Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
+| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth` (not `:grant`). Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down, and serves it a receive-only derivation of svcmgr's own death queue in the bootstrap slot after its `seed` caps and its authority slots. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
@@ -384,6 +384,14 @@ under its own `restart` policy or ends down, and then checks again. When no actu
 or the recorded one is down (its own permanent death included), svcmgr logs `graceful shutdown
 impossible` and the system continues degraded. An actuator that dies during the call still leaves
 svcmgr blocked.
+
+svcmgr also serves the recognised actuator the means to observe svcmgr's own death
+([Supervision § Observing svcmgr](../../../docs/supervision.md#observing-svcmgr)): on its first
+launch and on every restart, a derivation carrying only the receive right of the event queue
+svcmgr's own main thread and address space post their death to, in the bootstrap slot after the
+`seed` caps and after any debug-authority and stop-authority slots (`cap[3]` for pwrmgr). A derive
+that fails, or a queue svcmgr could not make, leaves the slot absent. A recipe that declares the
+key but is not recognised gets no such slot.
 
 ```
 binary            = /services/pwrmgr

@@ -21,8 +21,8 @@ use super::{Definition, NamespaceShape, ProvidedName, build_blob, cwd_rights};
 use crate::registry_lookup_derived;
 use crate::restart::{
     CreatedProcess, RestartCtx, StartupBlobs, bind_instance_observers, create_label_bits,
-    destroy_partial_child, mint_debug_authority, mint_stop_authority, start_process,
-    walk_and_create_from_file,
+    destroy_partial_child, mint_debug_authority, mint_self_death_recv, mint_stop_authority,
+    start_process, walk_and_create_from_file,
 };
 
 /// Outcome of a successful launch — the bits svcmgr records on the
@@ -39,6 +39,18 @@ pub struct Launched
     /// The node handle of the child's budget node for an `oom_stop = yes`
     /// service ([`CreatedProcess::node_handle`]); zero for every other.
     pub node_handle: u64,
+}
+
+/// Whether a launch is of the recognised shutdown actuator, which observes
+/// svcmgr: its bootstrap round carries a receive-only derivation of svcmgr's
+/// own death queue (docs/supervision.md § Observing svcmgr).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role
+{
+    /// The shutdown actuator `reconcile_and_launch` recognised.
+    ShutdownActuator,
+    /// Every other service.
+    Ordinary,
 }
 
 /// Delete a set of cap slots, skipping the zero sentinel. Used on the
@@ -271,12 +283,16 @@ fn publish_provided(
 /// RECV as cap[0] ahead of the positional seeds. Returns
 /// `(provided_endpoint, boot_caps)`; `provided_endpoint` is `0` for a pure
 /// consumer. Runs after namespace + death bind and before `START_PROCESS`, so
-/// any failure destroys the partial child and returns `None`.
+/// any failure destroys the partial child and returns `None`. The recognised
+/// shutdown actuator ([`Role::ShutdownActuator`]) also receives a receive-only
+/// derivation of svcmgr's own death queue, in the slot after its seeds and
+/// authority caps.
 fn assemble_provided_boot_caps(
     def: &Definition,
     created: &CreatedProcess,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
+    role: Role,
 ) -> Option<(u64, Vec<u64>)>
 {
     let provided_endpoint = if def.provides.is_empty()
@@ -310,6 +326,10 @@ fn assemble_provided_boot_caps(
     if def.stop_authority
     {
         seed_caps.push(mint_stop_authority(ctx));
+    }
+    if role == Role::ShutdownActuator
+    {
+        seed_caps.push(mint_self_death_recv(ctx));
     }
 
     // A provider's own service-endpoint RECV is cap[0], ahead of the positional
@@ -360,11 +380,16 @@ fn assemble_provided_boot_caps(
 /// the instant it runs, reaches svcmgr. For one-shot launches
 /// (`restart = never`, e.g. `svctest`) the caller passes `None` and forgoes
 /// supervision binding.
+///
+/// `role` marks the recognised shutdown actuator, whose round carries a
+/// receive-only derivation of svcmgr's own death queue (docs/supervision.md
+/// § Observing svcmgr).
 pub fn launch(
     def: &Definition,
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
     bind_target: Option<DeathTag>,
+    role: Role,
 ) -> Option<Launched>
 {
     let (argv_blob, argv_count) = build_blob(&def.argv);
@@ -391,7 +416,7 @@ pub fn launch(
         ctx.ipc_buf,
     )?;
 
-    let launched = launch_created(def, &created, ctx, registry, bind_target);
+    let launched = launch_created(def, &created, ctx, registry, bind_target, role);
     if launched.is_none()
     {
         // Every failure after the create destroyed the child; its node
@@ -411,6 +436,7 @@ fn launch_created(
     ctx: &RestartCtx,
     registry: &mut registry::Registry,
     bind_target: Option<DeathTag>,
+    role: Role,
 ) -> Option<Launched>
 {
     if !configure_namespace(def, created, ctx)
@@ -444,7 +470,7 @@ fn launch_created(
     }
     else
     {
-        assemble_provided_boot_caps(def, created, ctx, registry)?
+        assemble_provided_boot_caps(def, created, ctx, registry, role)?
     };
 
     if !start_process(created.process_handle, ctx.ipc_buf)

@@ -17,6 +17,12 @@
 //! the shutdown actuator. On x86-64 a second thread waits on acpid for the
 //! power button and powers the platform off when it is pressed.
 //!
+//! As the shutdown actuator pwrmgr also observes svcmgr: svcmgr serves it a
+//! receive-only derivation of the event queue svcmgr's own main thread and
+//! address space post their death to, and pwrmgr waits on that queue beside
+//! its service endpoint. An entry is svcmgr's death, and pwrmgr powers the
+//! platform off (docs/supervision.md § Observing svcmgr).
+//!
 //! See `services/pwrmgr/README.md` for the design and future-scope
 //! sketch.
 
@@ -71,9 +77,29 @@ fn main() -> !
         std::os::seraph::log!(warn: "ready (degraded: no shutdown actuator)");
     }
 
+    let wait_set = observe_svcmgr(bootstrap.service_ep, bootstrap.svcmgr_death);
+
     let mut guard = ipc::recv_guard::RecvGuard::new(recv_diag);
     loop
     {
+        if wait_set != 0
+        {
+            match syscall::wait_set_wait(wait_set)
+            {
+                Ok(WAKE_SVCMGR_DEATH) =>
+                {
+                    svcmgr_died(bootstrap.svcmgr_death, actuator.as_ref(), ipc_buf);
+                    continue;
+                }
+                Ok(_) =>
+                {}
+                Err(e) =>
+                {
+                    guard.on_failure(e);
+                    continue;
+                }
+            }
+        }
         // SAFETY: ipc_buf is the registered IPC buffer.
         let msg = match unsafe { ipc::ipc_recv(bootstrap.service_ep, ipc_buf) }
         {
@@ -121,6 +147,70 @@ fn main() -> !
             }
             _ => reject(pwrmgr_errors::UNKNOWN_OPCODE, ipc_buf),
         }
+    }
+}
+
+/// Wait-set badge of pwrmgr's service endpoint.
+const WAKE_REQUEST: u64 = 0;
+/// Wait-set badge of the queue svcmgr's death posts to.
+const WAKE_SVCMGR_DEATH: u64 = 1;
+/// Members of the wait set: the service endpoint and svcmgr's death queue.
+const WAIT_SET_MEMBERS: u32 = 2;
+
+/// Make the wait set over pwrmgr's service endpoint and `svcmgr_death`, the
+/// receive-only derivation of svcmgr's own death queue. `0`, logged, when the
+/// queue is absent or the set cannot be made: pwrmgr then receives on its
+/// endpoint alone, and svcmgr's death goes unobserved.
+fn observe_svcmgr(service_ep: u64, svcmgr_death: u64) -> u64
+{
+    if svcmgr_death == 0
+    {
+        std::os::seraph::log!(error: "no svcmgr death queue; svcmgr's death is unobserved");
+        return 0;
+    }
+    let wait_set = std::os::seraph::object_slab_retype(
+        std::os::seraph::wait_set_retype_bytes(u64::from(WAIT_SET_MEMBERS)),
+        |slab| syscall::wait_set_create(slab, WAIT_SET_MEMBERS).ok(),
+    )
+    .unwrap_or(0);
+    let joined = wait_set != 0
+        && syscall::wait_set_add(wait_set, service_ep, WAKE_REQUEST).is_ok()
+        && syscall::wait_set_add(wait_set, svcmgr_death, WAKE_SVCMGR_DEATH).is_ok();
+    if !joined
+    {
+        if wait_set != 0
+        {
+            // Deleting the set removes the members it took.
+            let _ = syscall::cap_delete(wait_set);
+        }
+        std::os::seraph::log!(error: "svcmgr death wait set not made; svcmgr's death is unobserved");
+        return 0;
+    }
+    wait_set
+}
+
+/// svcmgr has died: drain the entries its observers posted to
+/// `svcmgr_death` and power the platform off through `actuator`, the path a
+/// `SHUTDOWN` request takes. With no actuator, or a power-off that does not
+/// take effect, pwrmgr logs it and serves on.
+fn svcmgr_died(svcmgr_death: u64, actuator: Option<&arch::current::Actuator>, ipc_buf: *mut u64)
+{
+    // svcmgr's main thread and its address space each post one entry; the
+    // first names the exit reason, and the rest are the same death.
+    let mut reason = None;
+    while let Ok(death) = syscall::event_try_recv_death(svcmgr_death)
+    {
+        reason.get_or_insert(death.exit_reason);
+    }
+    match reason
+    {
+        Some(r) => std::os::seraph::log!(error: "svcmgr died (exit reason {r:#x}); powering off"),
+        None => std::os::seraph::log!(error: "svcmgr died; powering off"),
+    }
+    match actuator
+    {
+        Some(act) => arch::current::shutdown(act, ipc_buf),
+        None => std::os::seraph::log!(error: "svcmgr died; no shutdown actuator to power off"),
     }
 }
 

@@ -746,8 +746,9 @@ fn fault_now()
 
 /// Serve [`end_queue_child_main`] on `ep`: answer each fetch with a `POST`
 /// cap on `queue`, refuse anything else, and return once the child reports
-/// ready.
-fn serve_end_queue_child(ep: u64, queue: u64)
+/// ready. `ready` is set before the reply to the ready call, so it is set
+/// before anything the child does after its registrations, its end included.
+fn serve_end_queue_child(ep: u64, queue: u64, ready: &AtomicBool)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     loop
@@ -762,7 +763,11 @@ fn serve_end_queue_child(ep: u64, queue: u64)
         let reply = match msg.label
         {
             FETCH_QUEUE_LABEL => IpcMessage::builder(0).cap(post_cap(queue)).build(),
-            READY_LABEL => IpcMessage::new(0),
+            READY_LABEL =>
+            {
+                ready.store(true, Ordering::Release);
+                IpcMessage::new(0)
+            }
             _ => IpcMessage::new(u64::MAX),
         };
         // SAFETY: as above.
@@ -786,9 +791,11 @@ fn spawn_end_queue_child(mode: &str, queue: u64) -> std::process::Child
     .expect("process_tree: endpoint creation failed");
     let send = syscall::cap_derive(ep, syscall::RIGHTS_EP_SEND_GRANT)
         .expect("process_tree: deriving the child's SEND failed");
+    let ready = std::sync::Arc::new(AtomicBool::new(false));
+    let server_ready = std::sync::Arc::clone(&ready);
     let server = std::thread::Builder::new()
         .name("end_queue_server".into())
-        .spawn(move || serve_end_queue_child(ep, queue))
+        .spawn(move || serve_end_queue_child(ep, queue, &server_ready))
         .expect("process_tree: end-queue server spawn failed");
     let mut child = std::process::Command::new("/tests/svctest")
         .arg(END_QUEUE_ROLE)
@@ -796,12 +803,19 @@ fn spawn_end_queue_child(mode: &str, queue: u64) -> std::process::Child
         .namespace_cap(send)
         .spawn()
         .unwrap_or_else(|e| panic!("process_tree: spawning the {mode} end-queue child: {e}"));
-    while !server.is_finished()
+    // The child can end as soon as the server answers its ready call, before
+    // the server thread has returned, so an end is early only when the ready
+    // flag, set before that answer, is still clear after the end is seen.
+    while !ready.load(Ordering::Acquire)
     {
         if let Some(status) = child
             .try_wait()
             .expect("process_tree: try_wait of the end-queue child failed")
         {
+            if ready.load(Ordering::Acquire)
+            {
+                break;
+            }
             panic!(
                 "process_tree: the {mode} end-queue child exited {status} before it was ready \
                  ({END_CHILD_FETCH_FAILED} = fetch, {END_CHILD_NO_CAP_ACCEPTED} = a register \

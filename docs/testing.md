@@ -492,10 +492,11 @@ terminal. Two routes reach the thread:
   same point, then again after each `service restarted: logd` line, through the stub's attach to
   the new instance, four times in all: the fourth death finds svcmgr's restart budget (three per
   60 s window) spent and is permanent. It is released at the attach too: a logd that dies before
-  it asks svcmgr for its bootstrap round leaves svcmgr waiting for the request. The stub's lines
-  reach the serial line through logd once logd has taken the log over from init, so a stub holding
-  logd cannot log its attach: for logd the host connects once svcmgr's `svcmgr: launching: logd`
-  line has appeared, and the stub answers its first request once it holds logd.
+  it asks svcmgr for its bootstrap round leaves svcmgr waiting for the request (#1297). The stub's
+  lines reach the serial line through logd once logd has taken the log over from init, so a stub
+  holding logd cannot log its attach: for logd the host connects once svcmgr's
+  `svcmgr: launching: logd` line has appeared, and the stub answers its first request once it
+  holds logd.
 - **QEMU's own gdbstub**, for memmgr and procmgr, which init creates with raw syscalls, so no
   debugger can attach to them. Once the terminal's READY line has appeared, the host sets a
   hardware breakpoint on a function of the target's binary, at the image bias init logs for it

@@ -127,7 +127,8 @@ enum KillPoint
     /// As [`KillPoint::SystemUp`], then again after each restart svcmgr
     /// makes, until its restart budget is spent and the death is permanent.
     /// Not at the stub's first attach: a service that dies before it asks
-    /// svcmgr for its bootstrap round leaves svcmgr waiting for the request.
+    /// svcmgr for its bootstrap round leaves svcmgr waiting for the request
+    /// (#1297).
     RestartsSpent,
 }
 
@@ -492,7 +493,8 @@ fn kill_through_stub(
     if matches!(point, KillPoint::SystemUp | KillPoint::RestartsSpent)
     {
         // The attach holds every thread of the target, and the boot waits on
-        // devmgr, vfsd and logd (svcmgr waits for logd's bootstrap request):
+        // devmgr, vfsd and logd (svcmgr waits for logd's bootstrap request,
+        // and a logd killed before it sends one leaves svcmgr waiting, #1297):
         // released until the system is up, the target is held again by the
         // next `qSupported`, which finds the stub detached.
         stub.expect_ok(b"D")?;

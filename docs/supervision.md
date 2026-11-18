@@ -143,8 +143,10 @@ The path from a core or critical death to power-off MUST NOT depend on the servi
 svcmgr, devmgr, vfsd and logd (until svcmgr's restart budget for it is spent), one boot each, by a
 terminal fault made from outside the guest, and checks that the system powers off, on both
 architectures ([Testing § Core death](testing.md#core-death-test-core-death)). It kills devmgr and
-vfsd once svcmgr has reconciled its recipes, after the window that #1185 leaves open above. The
-path does not yet hold the requirement by construction: svcmgr, pwrmgr and, on x86-64, acpid are
+vfsd once svcmgr has reconciled its recipes, after the window that #1185 leaves open above, and
+logd once the boot is up: a service that dies after its start and before it asks svcmgr for its
+bootstrap round leaves svcmgr waiting for the request for good (#1297). The path does not yet
+hold the requirement by construction: svcmgr, pwrmgr and, on x86-64, acpid are
 demand-paged on memmgr and grow their heaps through it (memmgr and procmgr are pinned by
 construction, per [Fault Handling § Default System Pager](fault-handling.md#default-system-pager)),
 so a fault on a page not yet resident, or a call to memmgr, on the path after memmgr's death waits

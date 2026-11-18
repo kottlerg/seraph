@@ -67,14 +67,16 @@ one object carries one signature.
 
 ## Principles
 
-Implemented, apart from the override of the third principle, which is design intent, not yet
-implemented (§ Signature Policy in procmgr).
+Implemented, apart from the override of the third principle and procmgr's verification of a data
+file for its reader, which are design intent, not yet implemented (§ Signature Policy in procmgr;
+[#1267](https://github.com/kottlerg/seraph/issues/1267)).
 
 - **Verify at the loader.** An object is verified by the stage that turns its bytes into running
   code or into input that code trusts: the bootloader for what it loads, procmgr for every image it
   creates. procmgr is the only runtime loader
-  ([process-lifecycle.md](process-lifecycle.md) § Steady-State Process Creation), so it is the only
-  runtime verifier.
+  ([process-lifecycle.md](process-lifecycle.md) § Steady-State Process Creation) and the only
+  holder of the trust store at run time, so it is the only runtime verifier: a process that reads a
+  data file as trusted input has procmgr verify it and parses only the body procmgr returns.
 - **The kernel verifies nothing.** The kernel provides mechanism only; it parses no signature and
   holds no key.
 - **The right to run an unverified image is a capability**, held on procmgr's record of the
@@ -118,6 +120,7 @@ trusted to execute as built.
 | (nothing) | Kernel | Not applicable | Not applicable |
 | memmgr, procmgr | init loads them from boot modules the bootloader verified | Nothing further | Not applicable |
 | Every image procmgr creates, from a file or a Memory cap | procmgr | The store the bootloader hands forward | The roles the creator's policy allows; the name the creator gives, an install path |
+| A data file a process reads from the root filesystem as trusted input (a platform description table devmgr reads) | procmgr, at the reader's request (design intent, not yet implemented, [#1267](https://github.com/kottlerg/seraph/issues/1267)) | The same store | data, its install path |
 
 The bundle container itself is not signed: the bootloader parses its header with the bounds-checking
 parser of [`abi/boot-protocol::bundle`](../abi/boot-protocol/src/bundle.rs) and verifies each entry
@@ -378,7 +381,10 @@ it does.
 
 ## Verifier Discipline
 
-The bootloader and procmgr follow it.
+The bootloader and procmgr follow it. procmgr follows it for a data file it verifies at its reader's
+request too: it copies the file into frames it allocates, verifies that copy, and gives the reader
+the body read-only, so the reader parses only bytes no other process can write (design intent, not
+yet implemented, [#1267](https://github.com/kottlerg/seraph/issues/1267)).
 
 - **Verify before parse.** No stage parses an object's body (its ELF headers, its table text)
   before the verifier has accepted it.
@@ -508,20 +514,22 @@ image as the service its location makes it, so an image that does not boot the h
 second object that boots as init. The bundle's data entries (the platform tables and the log-level
 configuration) are installed files signed with the boot-module role, and their readers take the body
 through the parse-only split (§ Verifier Discipline). A platform table devmgr reads from the root
-filesystem is signed with the data role, and devmgr verifies it before it parses it (design intent,
-not yet implemented: [#1267](https://github.com/kottlerg/seraph/issues/1267) builds that
-verification, and [#1071](https://github.com/kottlerg/seraph/issues/1071) reuses it for the other
-policy-bearing files). The bundle is composed by copying installed files and signs nothing, so each
-entry is its installed file byte for byte ([boot-media.md](boot-media.md) § The ESP). The sysroot's
-objects are signed in place each time a disk image is packed. The refusal test's pack alone writes
-objects as it is given them, in place of the sysroot's files in the images and never in the sysroot,
-so no later pack signs a tampered body. Signing replaces a trailer the object already carries, and
-is deterministic, so re-signing an unchanged image writes the same bytes. The files under `config/`
-and `data/` carry no trailer, since their readers take each file whole and configuration is not
-signed (§ Threat Model), and neither does the bootloader, which Secure Boot covers (§ Secure Boot).
-Role 7 is reserved for a data file whose reader verifies it. The security version is one integer in
-the tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a security fix that MUST make
-older images unbootable; every record carries it, and the store's floor is at least it.
+filesystem is signed with the data role, and procmgr verifies it for devmgr before devmgr parses it
+(§ Which Stage Verifies What; design intent, not yet implemented:
+[#1267](https://github.com/kottlerg/seraph/issues/1267) builds that verification, and
+[#1071](https://github.com/kottlerg/seraph/issues/1071) reuses it for the other policy-bearing
+files). The bundle is composed by copying installed files and signs nothing, so each entry is its
+installed file byte for byte ([boot-media.md](boot-media.md) § The ESP). The sysroot's objects are
+signed in place each time a disk image is packed. The refusal test's pack alone writes objects as it
+is given them, in place of the sysroot's files in the images and never in the sysroot, so no later
+pack signs a tampered body. Signing replaces a trailer the object already carries, and is
+deterministic, so re-signing an unchanged image writes the same bytes. The files under `config/` and
+`data/` carry no trailer, since their readers take each file whole and configuration is not signed
+(§ Threat Model), and neither does the bootloader, which Secure Boot covers (§ Secure Boot). Role 7
+is reserved for a data file verified before its reader parses it. The security version is one
+integer in the tree (`SECURITY_VERSION` in `xtask/src/signing/mod.rs`), raised by a security fix
+that MUST make older images unbootable; every record carries it, and the store's floor is at least
+it.
 
 **The trust store** is built from public key files: by default the builder's local root. A build
 option (`SERAPH_TRUST_STORE`) names a deployer's store, which is merged with the default or, as

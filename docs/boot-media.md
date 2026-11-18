@@ -50,7 +50,7 @@ Design intent, not yet implemented:
 - The bundle carries more than the bootstrap closure: the serial and framebuffer drivers and,
   on riscv64, the platform description table, none of which the root mount needs
   ([#1267](https://github.com/kottlerg/seraph/issues/1267)). A table leaves the bundle only once
-  devmgr verifies the tables it reads from the root filesystem, which #1267 builds.
+  the tables devmgr reads from the root filesystem are verified, which #1267 builds.
 
 ---
 
@@ -110,12 +110,12 @@ loading from it, and nothing else. On the default boot that is:
 A test harness in the `init` slot (ktest) is its own closure. Anything else is loaded from the root
 filesystem once vfsd has mounted it: by svcmgr from its recipes, by devmgr from
 `/services/drivers/`, by vfsd from `/services/fs/`. Each is verified before it is used: an image by
-procmgr as it creates the process, and a data file by its reader, as devmgr verifies a platform
-description table ([driver-binding.md](driver-binding.md) § Platform Description Tables; design
-intent: [#1267](https://github.com/kottlerg/seraph/issues/1267) for the tables,
-[#1071](https://github.com/kottlerg/seraph/issues/1071) for the other policy-bearing files). An
-object outside the closure costs memory on every boot and is a second path by which the same object
-starts.
+procmgr as it creates the process, and a data file by procmgr at its reader's request, a platform
+description table devmgr reads among them ([driver-binding.md](driver-binding.md) § Platform
+Description Tables; design intent: [#1267](https://github.com/kottlerg/seraph/issues/1267) for the
+tables, [#1071](https://github.com/kottlerg/seraph/issues/1071) for the other policy-bearing files).
+An object outside the closure costs memory on every boot and is a second path by which the same
+object starts.
 
 ---
 

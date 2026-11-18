@@ -79,7 +79,7 @@ pub struct Target
     /// The image's load bias.
     pub load_bias: u64,
     /// Whether the process declared itself on the core path: no core of it
-    /// is written, since the write would wait on it.
+    /// is written, since the dump would wait on it.
     pub no_core: bool,
     /// Whether a core may be written at all.
     pub dump: crate::Dump,

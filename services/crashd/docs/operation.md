@@ -177,8 +177,9 @@ A dump follows the block when the report attached and read the process within it
    `CRITICAL` ([Hold](#hold)).
 3. It writes no core of a process that declared itself on the core path (`DECLARE_NO_CORE`, which
    the attach reply's flags word reports): vfsd, the FAT driver, the block driver, devmgr and the
-   IOMMU driver, through which the core would be written, so the dump never waits on the process
-   that died
+   IOMMU driver, through which the core would be written, and logd, which the outcome line below
+   and every process's log output wait on while step 4 holds its threads, so the dump never waits
+   on the process that died
    ([procmgr IPC Interface](../../procmgr/docs/ipc-interface.md) § Label 26: `DECLARE_NO_CORE`).
 4. It attaches the process again, page by page, and stops each listed thread but the faulting one
    (`SYS_THREAD_STOP`): the fault holds that one already, and a stop would cancel its fault. It

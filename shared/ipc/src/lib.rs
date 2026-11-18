@@ -701,14 +701,17 @@ pub mod procmgr_labels
     /// [`ATTACH_WORD_FLAGS`] bit: the target sent [`DECLARE_NO_CORE`].
     pub const ATTACH_FLAG_NO_CORE: u64 = 1;
 
-    /// The caller declares itself on the path a core dump is written
-    /// through, on its own procmgr cap (its process badge names it): procmgr
+    /// The caller declares itself on the core path, the processes a core dump
+    /// waits on, on its own procmgr cap (its process badge names it): procmgr
     /// marks it, and every [`ATTACH_PROCESS`] reply for it from then on
     /// carries [`ATTACH_FLAG_NO_CORE`], so the crash service writes no core of
-    /// it, a write that would wait on the process it describes. Sent at
-    /// startup by vfsd, each filesystem driver, each block driver, devmgr and
-    /// each IOMMU driver. No data, no caps. Replies `SUCCESS`, or `INVALID_BADGE` when the badge names no
-    /// live process or carries [`PROCESS_HANDLE_TAG`]. Specified in
+    /// it, a dump that would wait on the process it describes. Sent at startup
+    /// by vfsd, each filesystem driver, each block driver, devmgr and each
+    /// IOMMU driver, through which a core is written, and by the log sink,
+    /// which the dump's outcome line and every process's log output wait on
+    /// while the dump holds its threads. No data, no caps. Replies `SUCCESS`,
+    /// or `INVALID_BADGE` when the badge names no live process or carries
+    /// [`PROCESS_HANDLE_TAG`]. Specified in
     /// `services/procmgr/docs/ipc-interface.md` § `DECLARE_NO_CORE`.
     pub const DECLARE_NO_CORE: u64 = 26;
 
@@ -765,8 +768,8 @@ pub mod procmgr_labels
     /// [`ATTACH_PROCESS`] and [`REGISTER_THREAD`] on it from then on, so no
     /// [`DEBUG_AUTHORITY`] holder stops it. Sent, before
     /// it spawns a thread, by each process a stop of which would deadlock a
-    /// debug-authority holder: the log sink, the serial and framebuffer
-    /// drivers, the debug port's driver, and every debug-authority holder. No
+    /// debug-authority holder: the serial and framebuffer drivers, the debug
+    /// port's driver, and every debug-authority holder. No
     /// data, no caps. Replies `SUCCESS`, or
     /// `INVALID_BADGE` when the badge names no live process or carries
     /// [`PROCESS_HANDLE_TAG`]. Specified in

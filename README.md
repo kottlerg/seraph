@@ -88,6 +88,8 @@ Overall project design documents live in [`docs/`](docs/):
   ProcessInfo/InitInfo handover, process-death flow
 - [Supervision](docs/supervision.md) — supervision hierarchy, core set and system death,
   restart shapes, late-launch rule
+- [Session Supervision](docs/session-supervision.md) — sessions as supervision units, sessiond
+  and its interfaces, stop sources and the order oomd stops in (design intent)
 - [IPC Design](docs/ipc-design.md) — message passing, endpoints, synchronous vs async
 - [Capability Model](docs/capability-model.md) — permissions, delegation, revocation
 - [Fault Handling](docs/fault-handling.md) — userspace fault-handler protocol (pager):

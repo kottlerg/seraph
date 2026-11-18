@@ -16,10 +16,12 @@ This document is authoritative for:
 - The restart shapes, and which service uses which.
 - The authority a supervisor holds to restart what it supervises.
 
-Each supervisor's own mechanism (svcmgr's death detection, decision tree, spawn primitives and
-recipe storage; devmgr's driver withdrawal; procmgr's reaping) is specified in that component's
-documents, linked below. The recipe keys (`restart`, `critical`, `shutdown_actuator`) are specified
-in [`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md).
+The supervision of sessions, the processes a user starts through an interface, is specified in
+[Session Supervision](session-supervision.md). Each supervisor's own mechanism (svcmgr's death
+detection, decision tree, spawn primitives and recipe storage; devmgr's driver withdrawal;
+procmgr's reaping) is specified in that component's documents, linked below. The recipe keys
+(`restart`, `critical`, `shutdown_actuator`) are specified in
+[`.svc` Service Definitions](../services/svcmgr/docs/service-definitions.md).
 
 ---
 
@@ -36,7 +38,8 @@ init            launches the bootstrap substrate, endows svcmgr, exits; supervis
 svcmgr          supervises the substrate (memmgr, procmgr, devmgr, vfsd) and every service it
    │            launches from a recipe (logd, timed, pwrmgr, crashd, ...)
    ├── devmgr   observes each driver's death and withdraws a dead driver; restarts none
-   └── vfsd     observes no fs driver's death; restarts none
+   ├── vfsd     observes no fs driver's death; restarts none
+   └── sessiond supervises each session's leader (design intent; not yet implemented, #1233)
 pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
 ```
 
@@ -46,6 +49,7 @@ pwrmgr          observes svcmgr (design intent; not yet implemented, #262)
 | svcmgr | each service it launches with a `restart` other than `never` | two death observers, bound before `START_PROCESS`: one on the main thread, through the thread cap procmgr's create reply returns, and one on the address space, which procmgr binds on the process handle (`BIND_DEATH_OBSERVER`) with a `POST` copy of a svcmgr death queue | the recipe's `restart` policy and budget, then `critical` ([Restart Protocol § Decision tree](../services/svcmgr/docs/restart-protocol.md#decision-tree)) |
 | devmgr | drivers it spawns | a death observer bound on each driver's main thread, and one procmgr binds on its address space (`BIND_DEATH_OBSERVER`), which the first terminal fault of any of its threads posts | the driver is withdrawn and its DMA hold released once its device is quiesced; no restart (design intent; not yet implemented, #1077; the IOMMU driver, #1079) ([devmgr responsibilities](../services/devmgr/docs/responsibilities.md#relationship-to-drivers)) |
 | vfsd | fs drivers it spawns | nothing | the mount stays installed against the dead endpoint; no restart (design intent; not yet implemented, #1078) ([Storage § Failure and Revocation Invariants](storage.md#failure-and-revocation-invariants)) |
+| sessiond | each session's leader and, through containment, every process the leader starts | a death observer on the leader's main thread, and one procmgr binds on its address space | the session ends: procmgr destroys what is left of the leader's subtree ([Session Supervision](session-supervision.md#sessiond)) (design intent; not yet implemented, #1233) |
 | pwrmgr | svcmgr | an event queue svcmgr binds to its own death (§ Observing svcmgr) | power-off (design intent; not yet implemented, #262) |
 
 A `restart = never` service that svcmgr launches, rather than binds, is launched one-shot: svcmgr
@@ -234,12 +238,15 @@ Each item below is specified above or in the document it names, and is not yet i
 - devmgr restarts drivers: #1077. The IOMMU driver survives and restarts: #1079.
 - vfsd restarts fs drivers by revoke and re-resolve: #1078.
 - procmgr tears down the processes a dead pager other than memmgr served: #226.
+- sessiond supervises every session, and oomd stops a session's programs before any service
+  ([Session Supervision](session-supervision.md)): #1233.
 
 ---
 
 ## Summarized By
 
 [Architecture Overview](architecture.md), [Process Lifecycle](process-lifecycle.md),
+[Session Supervision](session-supervision.md),
 [services/procmgr/README.md](../services/procmgr/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),
 [services/svcmgr/README.md](../services/svcmgr/README.md),

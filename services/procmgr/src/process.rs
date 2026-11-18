@@ -3294,7 +3294,10 @@ impl Drop for CapGuard
 /// from any of its processes, and the insert of a child one of them was
 /// creating, so none escapes the destroy by starting a child during the
 /// teardown. Then it tears the doomed entries down one by one
-/// ([`drain_doomed`]), each in its own hold, and returns once none is left.
+/// ([`drain_doomed`]), each in its own hold, and returns once none is left
+/// but the children whose create procmgr has not answered yet
+/// (`ProcessEntry::unanswered`): each stays for its create, which is refused
+/// and takes it, so the destroy can return before that child is torn down.
 /// A doomed process that dies meanwhile is reaped as any other
 /// ([`reap_dead`]), and a destroy on another worker may take some of the
 /// doomed entries; each entry is torn down once, by whichever takes it.
@@ -3391,7 +3394,8 @@ pub fn destroy_child(
     true
 }
 
-/// Tear down every doomed entry (`ProcessTable::take_doomed`), one per hold
+/// Tear down every doomed entry (`ProcessTable::take_doomed`) but those whose
+/// create is unanswered, which their create's refusal takes, one per hold
 /// of the table lock, each with the reason [`destroyed_exit_reason`] gives,
 /// recorded in the recent-exits ring under the same hold, so a
 /// `QUERY_PROCESS` served on another worker finds the process either live

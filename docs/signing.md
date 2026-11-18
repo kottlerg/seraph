@@ -382,9 +382,10 @@ it does.
 ## Verifier Discipline
 
 The bootloader and procmgr follow it. procmgr follows it for a data file it verifies at its reader's
-request too: it copies the file into frames it allocates, verifies that copy, and gives the reader
-the body read-only, so the reader parses only bytes no other process can write (design intent, not
-yet implemented, [#1267](https://github.com/kottlerg/seraph/issues/1267)).
+request too: it copies the file, refusing one past the request's size bound, into frames it
+allocates on the reader's account, verifies that copy, and gives the reader the body read-only, so
+the reader parses only bytes no other process can write (design intent, not yet implemented,
+[#1267](https://github.com/kottlerg/seraph/issues/1267)).
 
 - **Verify before parse.** No stage parses an object's body (its ELF headers, its table text)
   before the verifier has accepted it.

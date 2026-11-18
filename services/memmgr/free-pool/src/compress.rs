@@ -182,7 +182,10 @@ fn read_u32(page: &[u8], at: usize) -> Option<u32>
 /// [`HASH_LOG`] bits.
 fn hash(word: u32) -> usize
 {
-    let h = word.wrapping_mul(2_654_435_761).checked_shr(32 - HASH_LOG).unwrap_or(0);
+    let h = word
+        .wrapping_mul(2_654_435_761)
+        .checked_shr(32 - HASH_LOG)
+        .unwrap_or(0);
     // At most `HASH_LOG` bits, so it fits a `usize`.
     usize::try_from(h).unwrap_or(0)
 }
@@ -300,7 +303,10 @@ impl Reader<'_>
         loop
         {
             let b = usize::from(self.byte()?);
-            len = len.checked_add(b).filter(|&l| l <= PAGE_BYTES).ok_or(CodecError::Malformed)?;
+            len = len
+                .checked_add(b)
+                .filter(|&l| l <= PAGE_BYTES)
+                .ok_or(CodecError::Malformed)?;
             if b != LENGTH_MORE
             {
                 return Ok(len);
@@ -459,21 +465,34 @@ mod tests
             // A match reaching before the page.
             &[0x10, 1, 2, 0],
             // A literal length past the page.
-            &[0xF0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            &[
+                0xF0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF, 0xFF, 0xFF,
+            ],
             // A literal run longer than its bytes.
             &[0x50, 1, 2],
         ];
         for case in cases
         {
-            assert_eq!(decompress(case, &mut page), Err(CodecError::Malformed), "{case:?}");
+            assert_eq!(
+                decompress(case, &mut page),
+                Err(CodecError::Malformed),
+                "{case:?}"
+            );
         }
         // Bytes after the sequence that completes the page.
         let mut out = vec![0u8; PAGE_BYTES];
         let len = compress(&[3u8; PAGE_BYTES], &mut out, &mut table()).unwrap();
         out[len] = 0;
-        assert_eq!(decompress(&out[..=len], &mut page), Err(CodecError::Malformed));
+        assert_eq!(
+            decompress(&out[..=len], &mut page),
+            Err(CodecError::Malformed)
+        );
         // The same stream cut short.
-        assert_eq!(decompress(&out[..len - 1], &mut page), Err(CodecError::Malformed));
+        assert_eq!(
+            decompress(&out[..len - 1], &mut page),
+            Err(CodecError::Malformed)
+        );
     }
 
     #[test]

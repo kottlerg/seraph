@@ -12,7 +12,7 @@
 //! more; a header from 1 to `PAGE_BYTES - 1`, the length of the page's
 //! compressed stream ([`crate::compress`]), which follows; or [`RAW_PAGE`]
 //! for a page that does not compress below a page, whose bytes follow as
-//! they are. The stream lies in whole store pages from their start, so an
+//! they are. The stream lies in whole store pages from their start, so a
 //! chunk whose every backed page is zero is the empty stream and takes none.
 //! A page is decoded by reading the stream in the same order, so the stream
 //! needs no index and no length.
@@ -59,7 +59,8 @@ pub fn encode_chunk<'a>(
         else
         {
             let room = out.len().saturating_sub(body);
-            let window = out.get_mut(body..body.checked_add(room.min(PAGE_BYTES.saturating_sub(1)))?)?;
+            let window =
+                out.get_mut(body..body.checked_add(room.min(PAGE_BYTES.saturating_sub(1)))?)?;
             if let Some(n) = compress::compress(bytes, window, table)
             {
                 u16::try_from(n).ok()?
@@ -72,8 +73,16 @@ pub fn encode_chunk<'a>(
             }
         };
         nonzero |= header != ZERO_PAGE;
-        out.get_mut(len..body)?.copy_from_slice(&header.to_le_bytes());
-        let taken = if header == RAW_PAGE { PAGE_BYTES } else { usize::from(header) };
+        out.get_mut(len..body)?
+            .copy_from_slice(&header.to_le_bytes());
+        let taken = if header == RAW_PAGE
+        {
+            PAGE_BYTES
+        }
+        else
+        {
+            usize::from(header)
+        };
         len = body.checked_add(taken)?;
     }
     Some(if nonzero { len } else { 0 })
@@ -119,7 +128,10 @@ impl<'a> Decoder<'a>
             page.fill(0);
             return Ok(());
         }
-        let body = self.pos.checked_add(HEADER_BYTES).ok_or(CodecError::Malformed)?;
+        let body = self
+            .pos
+            .checked_add(HEADER_BYTES)
+            .ok_or(CodecError::Malformed)?;
         let header = self
             .stream
             .get(self.pos..body)
@@ -246,7 +258,10 @@ mod tests
         let mut table = Box::new([0u16; HASH_ENTRIES]);
         // The random page alone needs a page and its header.
         let mut out = vec![0u8; PAGE_BYTES];
-        assert_eq!(encode_chunk(0b10, |i| &pages[i as usize], &mut out, &mut table), None);
+        assert_eq!(
+            encode_chunk(0b10, |i| &pages[i as usize], &mut out, &mut table),
+            None
+        );
         let mut out = vec![0u8; PAGE_BYTES + 2];
         assert_eq!(
             encode_chunk(0b10, |i| &pages[i as usize], &mut out, &mut table),
@@ -258,8 +273,17 @@ mod tests
     fn a_truncated_or_corrupt_stream_is_refused()
     {
         let mut p = [0u8; PAGE_BYTES];
-        assert_eq!(Decoder::new(&[0x01, 0x10]).next_page(&mut p), Err(CodecError::Malformed));
-        assert_eq!(Decoder::new(&[0x00, 0x10, 1]).next_page(&mut p), Err(CodecError::Malformed));
-        assert_eq!(Decoder::new(&[3, 0, 0x10, 1, 0]).next_page(&mut p), Err(CodecError::Malformed));
+        assert_eq!(
+            Decoder::new(&[0x01, 0x10]).next_page(&mut p),
+            Err(CodecError::Malformed)
+        );
+        assert_eq!(
+            Decoder::new(&[0x00, 0x10, 1]).next_page(&mut p),
+            Err(CodecError::Malformed)
+        );
+        assert_eq!(
+            Decoder::new(&[3, 0, 0x10, 1, 0]).next_page(&mut p),
+            Err(CodecError::Malformed)
+        );
     }
 }

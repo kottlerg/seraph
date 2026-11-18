@@ -8,9 +8,11 @@
 //! the chunk's index in the region, `(va - va_base) / chunk bytes`.
 //!
 //! An entry records which pages of its chunk hold data (the backed mask), the
-//! chunk's [`ChunkState`], a pin flag, a two-bit age, and a link: the head of
-//! the list of runs that back the chunk while it is resident or evicting, or
-//! the store handle of its compressed pages while it is swapped. The tree's
+//! chunk's [`ChunkState`], a pin flag, a two-bit age, the job slot of an
+//! eviction in flight, and a link: the head of the list of runs that back the
+//! chunk while it is resident or evicting, or the store handle of its
+//! compressed pages while it is swapped, the head of the list of store runs
+//! that hold its stream ([`crate::store`]). The tree's
 //! leaves are [`Node::Chunk`] slots and its directory nodes [`Node::ChunkDir`]
 //! slots of [`DIR_FANOUT`] children; the table's height is fixed by the
 //! region's chunk count ([`table_height`]), and a node exists only on the path
@@ -20,8 +22,8 @@
 //! one slots, whatever runs the region or its process hold. See
 //! `services/memmgr/docs/memory-pool.md` § Chunk table.
 
-use crate::DEMAND_CHUNK_PAGES;
 use crate::arena::{Arena, FrameDesc, NODE_NULL, Node, NodeIdx, ProcessRecord, SlotStore};
+use crate::{DEMAND_CHUNK_PAGES, FreeRun};
 
 /// Children of a directory node: as many slot indices as fill the largest
 /// other payload, a [`ProcessRecord`], so a directory node does not grow the
@@ -86,6 +88,9 @@ pub struct ChunkEntry
     pinned: bool,
     /// Sweeps since the chunk was last seen accessed, at most [`AGE_MAX`].
     age: u8,
+    /// The job slot of the eviction in flight while evicting
+    /// ([`Self::begin_evict`]), 0 otherwise.
+    job: u8,
     /// The head of the run list while resident or evicting, the store handle
     /// while swapped, [`NODE_NULL`] while unbacked.
     link: u64,
@@ -100,6 +105,7 @@ impl ChunkEntry
         state: ChunkState::Unbacked,
         pinned: false,
         age: 0,
+        job: 0,
         link: NODE_NULL,
     };
 
@@ -137,7 +143,19 @@ impl ChunkEntry
         }
     }
 
-    /// The store handle of the chunk's compressed pages, while it is swapped.
+    /// The job slot of the chunk's eviction, while it is evicting.
+    #[must_use]
+    pub const fn job(&self) -> Option<u8>
+    {
+        match self.state
+        {
+            ChunkState::Evicting => Some(self.job),
+            ChunkState::Unbacked | ChunkState::Resident | ChunkState::Swapped => None,
+        }
+    }
+
+    /// The store handle of the chunk's compressed pages, while it is swapped:
+    /// the head of its store-run list, [`NODE_NULL`] for the empty stream.
     #[must_use]
     pub const fn store(&self) -> Option<u64>
     {
@@ -232,19 +250,22 @@ impl ChunkEntry
         })
     }
 
-    /// Start evicting a resident chunk: its runs stay on the entry, unmapped,
-    /// until the eviction finishes or a fault cancels it.
+    /// Start evicting a resident chunk under the job slot `job`: its runs stay
+    /// on the entry, unmapped, until the eviction finishes or a fault cancels
+    /// it. A job slot holds one eviction at a time, so the slot names the
+    /// eviction its completion belongs to ([`Self::job`]).
     ///
     /// # Errors
     /// [`ChunkError::Pinned`] for a pinned chunk, and [`ChunkError::State`]
     /// for a chunk that is not resident.
-    pub fn begin_evict(self) -> Result<Self, ChunkError>
+    pub fn begin_evict(self, job: u8) -> Result<Self, ChunkError>
     {
         match self.state
         {
             ChunkState::Resident if self.pinned => Err(ChunkError::Pinned),
             ChunkState::Resident => Ok(Self {
                 state: ChunkState::Evicting,
+                job,
                 ..self
             }),
             ChunkState::Unbacked | ChunkState::Evicting | ChunkState::Swapped =>
@@ -266,6 +287,7 @@ impl ChunkEntry
             ChunkState::Evicting => Ok(Self {
                 state: ChunkState::Resident,
                 age: 0,
+                job: 0,
                 ..self
             }),
             ChunkState::Unbacked | ChunkState::Resident | ChunkState::Swapped =>
@@ -287,6 +309,7 @@ impl ChunkEntry
         {
             ChunkState::Evicting => Ok(Self {
                 state: ChunkState::Swapped,
+                job: 0,
                 link: store,
                 ..self
             }),
@@ -569,15 +592,16 @@ pub fn set_entry<S: SlotStore>(
     }
 }
 
-/// Free every node of the table at `root`, handing each run on the run list of
-/// a resident or evicting chunk to `retire` with its slot, which `retire`
-/// takes over. The walk keeps its pending nodes on a stack threaded through
+/// Free every node of the table at `root`, handing the entry of each leaf to
+/// `retire` before its slot is freed: `retire` takes over the slots of its
+/// lists, the runs of a resident or evicting chunk ([`take_runs`]) or the
+/// store runs of a swapped one ([`take_store`]). The walk keeps its pending nodes on a stack threaded through
 /// their slot `next` links, which no table node uses otherwise, so it needs
 /// neither memory nor recursion.
 pub fn release<S: SlotStore>(
     arena: &mut Arena<S>,
     root: NodeIdx,
-    mut retire: impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+    mut retire: impl FnMut(&mut Arena<S>, ChunkEntry),
 )
 {
     if root == NODE_NULL
@@ -601,7 +625,7 @@ pub fn release<S: SlotStore>(
                     stack = c;
                 }
             }
-            Node::Chunk(entry) => retire_runs(arena, entry, &mut retire),
+            Node::Chunk(entry) => retire(arena, entry),
             // Not a table node: no table links to one, so leave it alone.
             Node::Free
             | Node::Run(_)
@@ -622,21 +646,88 @@ pub fn release<S: SlotStore>(
     }
 }
 
-/// Hand each run on the run list of `entry`, a resident or evicting chunk's,
-/// to `retire` with its slot, which `retire` takes over.
-fn retire_runs<S: SlotStore>(
+/// Hand each run on the run list of `entry` (a resident or evicting chunk's;
+/// none for another) to `take` with its slot, which `take` takes over.
+pub fn take_runs<S: SlotStore>(
     arena: &mut Arena<S>,
     entry: ChunkEntry,
-    retire: &mut impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+    mut take: impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
 )
 {
     let mut run = entry.runs();
     while let Node::Frame(frame) = arena.get(run).node
     {
         let next = arena.get(run).next;
-        retire(arena, run, frame);
+        take(arena, run, frame);
         run = next;
     }
+}
+
+/// Hand each store run on the store-run list of `entry` (a swapped chunk's;
+/// none for another) to `take` with its slot, which `take` takes over.
+pub fn take_store<S: SlotStore>(
+    arena: &mut Arena<S>,
+    entry: ChunkEntry,
+    mut take: impl FnMut(&mut Arena<S>, NodeIdx, FreeRun),
+)
+{
+    let mut run = entry.store().unwrap_or(NODE_NULL);
+    while let Node::Run(r) = arena.get(run).node
+    {
+        let next = arena.get(run).next;
+        take(arena, run, r);
+        run = next;
+    }
+}
+
+/// The first chunk at or past `from` in the table at `root` of `height`
+/// directory levels that has a leaf, with its entry, or `None` when no chunk
+/// past `from` has one. The walk descends from the root for each chunk it
+/// visits and skips the whole subtree below an absent child, as [`clear`]
+/// does.
+#[must_use]
+pub fn next_entry<S: SlotStore>(
+    arena: &Arena<S>,
+    root: NodeIdx,
+    height: u32,
+    from: u64,
+) -> Option<(u64, ChunkEntry)>
+{
+    let end = capacity(height);
+    let mut index = from;
+    while index < end && root != NODE_NULL
+    {
+        let mut cur = root;
+        let mut level = height;
+        while level > 0
+        {
+            let below = child(arena, cur, digit(index, level));
+            if below == NODE_NULL
+            {
+                break;
+            }
+            cur = below;
+            level = level.saturating_sub(1);
+        }
+        if level > 0
+        {
+            // No chunk of the subtree the absent child stands for has a leaf:
+            // go on at the first chunk past it.
+            let span = RADIX.saturating_pow(level.saturating_sub(1));
+            index = index
+                .checked_div(span)
+                .unwrap_or(0)
+                .checked_add(1)?
+                .checked_mul(span)?;
+            continue;
+        }
+        if let Node::Chunk(entry) = arena.get(cur).node
+        {
+            return Some((index, entry));
+        }
+        index = index.checked_add(1)?;
+    }
+    None
 }
 
 /// The most directory levels a table has: the height of a table with a leaf
@@ -645,7 +736,7 @@ const MAX_HEIGHT: u32 = table_height(u64::MAX);
 
 /// Clear the chunks `first` to `end` (exclusive) of the table at `root` of
 /// `height` directory levels, for a range whose pages were discarded: free
-/// the leaf of each that has one, handing each run of it to `retire` as
+/// the leaf of each that has one, handing its entry to `retire` as
 /// [`release`] does, and each directory node the clearing leaves with no
 /// child, setting `root` to [`NODE_NULL`] when the table empties. A cleared
 /// chunk reads [`ChunkEntry::UNBACKED`]. The walk descends from the root for
@@ -658,7 +749,7 @@ pub fn clear<S: SlotStore>(
     height: u32,
     first: u64,
     end: u64,
-    mut retire: impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+    mut retire: impl FnMut(&mut Arena<S>, ChunkEntry),
 ) -> u64
 {
     let end = end.min(capacity(height));
@@ -702,7 +793,7 @@ pub fn clear<S: SlotStore>(
         }
         if let Node::Chunk(entry) = arena.get(cur).node
         {
-            retire_runs(arena, entry, &mut retire);
+            retire(arena, entry);
         }
         arena.free(cur);
         cleared = cleared.saturating_add(1);
@@ -773,8 +864,8 @@ pub fn raise<S: SlotStore>(
 
 /// Cut the table at `root` of `height` directory levels down to its first
 /// `keep` chunks, for a region that shrank to `keep` chunks: free every node
-/// below which only chunks at or past `keep` lie, handing each run of theirs
-/// to `retire` as [`release`] does, free each directory node left with no
+/// below which only chunks at or past `keep` lie, handing the entry of each
+/// of their leaves to `retire` as [`release`] does, free each directory node left with no
 /// child, then lower the table to [`table_height`] of `keep` by making the
 /// root's child 0 the root. Needs no slot, so it cannot fail.
 pub fn truncate<S: SlotStore>(
@@ -782,7 +873,7 @@ pub fn truncate<S: SlotStore>(
     root: &mut NodeIdx,
     height: u32,
     keep: u64,
-    mut retire: impl FnMut(&mut Arena<S>, NodeIdx, FrameDesc),
+    mut retire: impl FnMut(&mut Arena<S>, ChunkEntry),
 )
 {
     if keep >= capacity(height)
@@ -917,7 +1008,7 @@ mod tests
     #[test]
     fn an_evicted_chunk_is_swapped_and_restored_resident_with_its_mask()
     {
-        let evicting = resident(0, 16).begin_evict().unwrap();
+        let evicting = resident(0, 16).begin_evict(1).unwrap();
         assert_eq!(
             (evicting.state(), evicting.runs()),
             (ChunkState::Evicting, 7)
@@ -938,7 +1029,7 @@ mod tests
     fn a_fault_during_eviction_cancels_it_keeping_the_runs()
     {
         let aged = resident(0, 2).sweep(0).sweep(0);
-        let back = aged.begin_evict().unwrap().cancel_evict().unwrap();
+        let back = aged.begin_evict(1).unwrap().cancel_evict().unwrap();
         assert_eq!(
             (back.state(), back.backed(), back.runs()),
             (ChunkState::Resident, 0x0003, 7)
@@ -951,11 +1042,11 @@ mod tests
     {
         let unbacked = ChunkEntry::UNBACKED;
         let resident = resident(0, 1);
-        let evicting = resident.begin_evict().unwrap();
+        let evicting = resident.begin_evict(1).unwrap();
         let swapped = evicting.finish_evict(1).unwrap();
         for e in [unbacked, evicting, swapped]
         {
-            assert_eq!(e.begin_evict(), Err(ChunkError::State), "{e:?}");
+            assert_eq!(e.begin_evict(1), Err(ChunkError::State), "{e:?}");
         }
         for e in [unbacked, resident, swapped]
         {
@@ -977,12 +1068,12 @@ mod tests
     {
         let pinned = resident(0, 4).pin().sweep(0).sweep(0).sweep(0);
         assert!(pinned.pinned());
-        assert_eq!(pinned.begin_evict(), Err(ChunkError::Pinned));
+        assert_eq!(pinned.begin_evict(1), Err(ChunkError::Pinned));
         assert!(!pinned.is_cold());
         let unpinned = pinned.unpin();
         assert!(unpinned.is_cold());
         assert_eq!(
-            unpinned.begin_evict().map(|e| e.state()),
+            unpinned.begin_evict(1).map(|e| e.state()),
             Ok(ChunkState::Evicting)
         );
     }
@@ -1141,9 +1232,11 @@ mod tests
             runs += 2;
         }
         let mut seen = Vec::new();
-        release(&mut a, root, |a, idx, f| {
-            seen.push(f.cap_slot);
-            a.free(idx);
+        release(&mut a, root, |a, e| {
+            take_runs(a, e, |a, idx, f| {
+                seen.push(f.cap_slot);
+                a.free(idx);
+            });
         });
         seen.sort_unstable();
         seen.dedup();
@@ -1229,9 +1322,11 @@ mod tests
             let free = a.free_count();
             let mut root = table_with(&mut a, 200, &backed);
             let mut dropped = Vec::new();
-            truncate(&mut a, &mut root, table_height(200), keep, |a, idx, f| {
-                dropped.push(f.cap_slot);
-                a.free(idx);
+            truncate(&mut a, &mut root, table_height(200), keep, |a, e| {
+                take_runs(a, e, |a, idx, f| {
+                    dropped.push(f.cap_slot);
+                    a.free(idx);
+                });
             });
             let kept: Vec<u64> = backed.iter().copied().filter(|&i| i < keep).collect();
             let gone: Vec<u64> = backed.iter().copied().filter(|&i| i >= keep).collect();
@@ -1284,9 +1379,11 @@ mod tests
             let height = table_height(200);
             let mut root = table_with(&mut a, 200, &backed);
             let mut dropped = Vec::new();
-            let cleared = clear(&mut a, &mut root, height, first, end, |a, idx, f| {
-                dropped.push(f.cap_slot);
-                a.free(idx);
+            let cleared = clear(&mut a, &mut root, height, first, end, |a, e| {
+                take_runs(a, e, |a, idx, f| {
+                    dropped.push(f.cap_slot);
+                    a.free(idx);
+                });
             });
             let in_range = |i: &u64| (first..end).contains(i);
             let kept: Vec<u64> = backed.iter().copied().filter(|i| !in_range(i)).collect();
@@ -1319,7 +1416,11 @@ mod tests
         let free = a.free_count();
         let mut root = table_with(&mut a, 1, &[0]);
         assert_eq!(
-            clear(&mut a, &mut root, 0, 0, 1, |a, idx, _| a.free(idx)),
+            clear(&mut a, &mut root, 0, 0, 1, |a, e| take_runs(
+                a,
+                e,
+                |a, idx, _| a.free(idx)
+            )),
             1
         );
         assert_eq!(root, NODE_NULL);
@@ -1356,13 +1457,90 @@ mod tests
             assert!(set_entry(&mut a, &mut root, height, i, e));
         }
         let mut dropped = Vec::new();
-        let cleared = clear(&mut a, &mut root, height, 1, u64::MAX, |a, idx, f| {
-            dropped.push(f.cap_slot);
-            a.free(idx);
+        let cleared = clear(&mut a, &mut root, height, 1, u64::MAX, |a, e| {
+            take_runs(a, e, |a, idx, f| {
+                dropped.push(f.cap_slot);
+                a.free(idx);
+            });
         });
         assert_eq!(cleared, 3);
         assert_eq!(dropped, backed);
         assert_eq!(root, NODE_NULL);
         assert_eq!(a.free_count(), free);
+    }
+    #[test]
+    fn an_eviction_carries_its_job_slot_until_it_ends()
+    {
+        let evicting = resident(0, 4).begin_evict(5).unwrap();
+        assert_eq!(evicting.job(), Some(5));
+        assert_eq!(evicting.cancel_evict().unwrap().job(), None);
+        let swapped = evicting.finish_evict(NODE_NULL).unwrap();
+        assert_eq!((swapped.job(), swapped.store()), (None, Some(NODE_NULL)));
+        // A later eviction of the restored chunk takes its own slot.
+        let again = swapped.restore(3).unwrap().begin_evict(0).unwrap();
+        assert_eq!(again.job(), Some(0));
+    }
+
+    #[test]
+    fn take_store_hands_over_each_store_run_of_a_swapped_chunk_and_nothing_else()
+    {
+        let mut a = arena();
+        let free = a.free_count();
+        let run = |cap_slot| {
+            Node::Run(FreeRun {
+                cap_slot,
+                page_count: 1,
+                phys_base: cap_slot * 0x1000,
+            })
+        };
+        let second = a.alloc(run(2), NODE_NULL).unwrap();
+        let first = a.alloc(run(1), second).unwrap();
+        let swapped = resident(0, 16)
+            .begin_evict(0)
+            .unwrap()
+            .finish_evict(first)
+            .unwrap();
+        let mut seen = Vec::new();
+        // A resident chunk's link is no store-run list.
+        take_store(&mut a, resident(0, 16), |_, _, r| seen.push(r.cap_slot));
+        assert_eq!(seen, [0u64; 0]);
+        take_store(&mut a, swapped, |a, idx, r| {
+            seen.push(r.cap_slot);
+            a.free(idx);
+        });
+        assert_eq!(seen, [1, 2]);
+        assert_eq!(a.free_count(), free);
+        // And a swapped chunk's store is no run list.
+        let mut runs = 0;
+        take_runs(&mut a, swapped, |_, _, _| runs += 1);
+        assert_eq!(runs, 0);
+    }
+
+    #[test]
+    fn next_entry_visits_each_leaf_in_order_and_skips_absent_subtrees()
+    {
+        let mut a = arena();
+        let height = table_height(6u64.pow(20));
+        let backed = [3u64, 4, 6u64.pow(12), 6u64.pow(19) + 5];
+        let mut root = NODE_NULL;
+        for &i in &backed
+        {
+            assert!(set_entry(&mut a, &mut root, height, i, resident(0, 1)));
+        }
+        let mut seen = Vec::new();
+        let mut from = 0;
+        while let Some((i, e)) = next_entry(&a, root, height, from)
+        {
+            assert_eq!(e, resident(0, 1));
+            seen.push(i);
+            from = i + 1;
+        }
+        assert_eq!(seen, backed);
+        assert_eq!(next_entry(&a, NODE_NULL, height, 0), None);
+        // A one-chunk table is its leaf.
+        let mut one = NODE_NULL;
+        assert!(set_entry(&mut a, &mut one, 0, 0, resident(0, 1)));
+        assert_eq!(next_entry(&a, one, 0, 0).map(|(i, _)| i), Some(0));
+        assert_eq!(next_entry(&a, one, 0, 1), None);
     }
 }

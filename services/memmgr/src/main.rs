@@ -19,7 +19,7 @@
 )]
 
 use free_pool::{
-    ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Fit, FrameDesc,
+    ArenaLayout, CHUNK_BYTES, ChargeError, Commit, CommitNeed, DemandRegion, Evict, Fit, FrameDesc,
     FreeRun, Grant, Ledger, MAX_GRANT_RUNS, NO_MAX, NO_REGION_ID, NODE_NULL, Node, NodeError,
     NodeHandle, NodeIdx, NodeSpec, PT_DONATION_PAGES, PressureLevel, RecheckBudget, RegionError,
     ResizeError, SelectError, SlotStore, WordStore, arena::Slot, chunk::ChunkState,
@@ -1945,7 +1945,12 @@ fn handle_register_region(req: &IpcMessage, ipc_buf: *mut u64)
         reply_label(ipc_buf, commit_refusal(e));
         return;
     }
-    let region = DemandRegion { va_base, len, prot };
+    let region = DemandRegion {
+        va_base,
+        len,
+        prot,
+        evict: Evict::Allowed,
+    };
     let mut result = l.add_region(rec, region, commit);
     // A committed region's commitment takes a slot beside the region's.
     let slots = if commit == Commit::Committed { 2 } else { 1 };
@@ -2045,6 +2050,7 @@ fn handle_extend_region(req: &IpcMessage, ipc_buf: *mut u64)
             va_base,
             len,
             prot: 0,
+            evict: Evict::Allowed,
         }))
     };
     let levels = u64::from(height(new_len).saturating_sub(height(len)));

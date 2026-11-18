@@ -293,8 +293,10 @@ entry records:
 - The chunk's state: unbacked; resident, its pages backed by the runs on the entry's run list and
   mapped in the process; evicting; or swapped.
 - A pin flag and a two-bit age.
-- A link: the head of the chunk's run list while it is resident or evicting, the handle of its
-  stored pages while it is swapped.
+- The job slot of its eviction while it is evicting, so a completion is applied only to the
+  eviction it was posted for.
+- A link: the head of the chunk's run list while it is resident or evicting, the head of the list
+  of store runs its pages are stored in while it is swapped.
 
 The evicting and swapped states, the pin flag, and the age are the swap path's: memmgr reclaiming
 a cold chunk's runs under memory pressure and storing its pages, a fault restoring them. That path
@@ -324,7 +326,8 @@ leaves the entry as it was.
 nodes on a stack threaded through their own `next` links, which no table node uses otherwise. The
 walk needs no memory and no recursion. It rewrites each run's descriptor into a run node in place,
 which joins the free pool or the deferred list as any reclaimed frame does (see
-[Reclamation](#reclamation)), and returns every directory and leaf node to the arena's free list.
+[Reclamation](#reclamation)), returns each store run of a swapped chunk, which no process ever
+mapped, to the free pool, and returns every directory and leaf node to the arena's free list.
 
 ---
 
@@ -926,6 +929,14 @@ This section is design intent; not yet implemented
 every demand fault from RAM, and exhaustion surfaces as the out-of-memory errors and fault declines
 of [Failure Modes](#failure-modes) and [Demand faults](#demand-faults), and as refused commitments
 ([Commit](#commit)).
+
+The ledger's side of eviction is in place in the `memmgr-free-pool` crate, and no memmgr path
+calls it yet: the page codec (`compress.rs`); the stream a chunk's pages are stored as
+(`store.rs`), which holds each backed page as a two-byte header and the page compressed, raw, or
+as nothing for an all-zero page, so a chunk whose every page is zero takes no store page; the
+chunk transitions and their accounting below; the teardown of a swapped chunk, whose store runs
+return to the free pool and whose pages' charge is released; and the clock's sweep, which ages the
+chunks of eligible regions from a harvest of their accessed bits and reports the cold ones.
 
 **Eligible pages.** memmgr evicts only pages it mapped as pager: the runs it backs on a demand
 fault. It never evicts a granted frame, since a client holding a Memory cap to it may have retyped,

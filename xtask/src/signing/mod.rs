@@ -1115,7 +1115,10 @@ mod tests
                 .map(|path| (*path, b"\x7fELF outside".as_slice())),
         );
         files.push((text, b"vfsd = debug\n"));
-        files.extend(data.iter().map(|path| (&path[1..], b"data = 1\n".as_slice())));
+        files.extend(
+            data.iter()
+                .map(|path| (&path[1..], b"data = 1\n".as_slice())),
+        );
         let (root, ctx) = sysroot_of("sysroot", &files);
         testing::install_lists(&ctx);
         let signer = signer(&root.join("keys"), arch);

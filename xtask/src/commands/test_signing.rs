@@ -217,12 +217,8 @@ fn prepare(ctx: &Context, args: &TestSigningArgs, dir: &Path) -> Result<Vec<Case
 
 /// The `revoked` case: a bootloader built under the build's store with
 /// `signer`'s key revoked, in place of both ESP copies of the installed one.
-fn revoked_case(
-    ctx: &Context,
-    args: &TestSigningArgs,
-    dir: &Path,
-    signer: &Signer,
-) -> Result<Case>
+fn revoked_case(ctx: &Context, args: &TestSigningArgs, dir: &Path, signer: &Signer)
+-> Result<Case>
 {
     let revoking = stage(
         dir,

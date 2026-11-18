@@ -181,7 +181,11 @@ mod tests
 
         // A kernel signed under another name is refused.
         signer
-            .sign_file(&ctx.installed_kernel(), RoleSet::of(&[Role::Kernel]), "/boot/kernel")
+            .sign_file(
+                &ctx.installed_kernel(),
+                RoleSet::of(&[Role::Kernel]),
+                "/boot/kernel",
+            )
             .unwrap();
         compose(&ctx, arch, Harness::Init).unwrap_err();
         let _ = fs::remove_dir_all(&root);

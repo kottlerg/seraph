@@ -337,6 +337,13 @@ const SPECS: &[Spec] = &[
         arch_only: None,
     },
     Spec {
+        name: "sessiond",
+        install_name: None,
+        profile: BuildProfile::StdUser,
+        dest: InstallDest::Services,
+        arch_only: None,
+    },
+    Spec {
         name: "svcmgr",
         install_name: None,
         profile: BuildProfile::StdUser,

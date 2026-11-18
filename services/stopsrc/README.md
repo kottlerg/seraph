@@ -2,7 +2,8 @@
 
 Test-tier fixture for stop sources: a supervised stop source of the program class that, on
 request, starts one job, a child process holding memory, lists it to a stop-authority holder, and
-destroys it on a stop. It is gated and opt-in: its recipe, `rootfs/config/svcmgr/tests/stopsrc.svc`,
+destroys it on a stop. It is a second source of the program class beside sessiond, the default
+image's. It is gated and opt-in: its recipe, `rootfs/config/svcmgr/tests/stopsrc.svc`,
 lives in `/config/svcmgr/tests/`, is co-staged with `svctest` in CI, and is never launched on a
 normal boot.
 

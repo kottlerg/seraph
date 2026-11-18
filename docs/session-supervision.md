@@ -32,13 +32,12 @@ cap-native coordination of a session's members (signals, a foreground job, suspe
 
 ## Implementation Status
 
-§ procmgr Mechanism, § Today, and § Stop Sources but for sessiond's candidates, state the system as
-built. Every other section below states design intent, not yet implemented, each part under the
-Issue that builds it:
+§ Today, § Sessions, § sessiond, § procmgr Mechanism, § Attribution, § Stop Sources, and the
+Terminal kind of § Session Kinds state the system as built, but for the parts below, which state
+design intent, not yet implemented, each under the Issue that builds it:
 
 | Part | Issue |
 |---|---|
-| sessiond in operator mode, session nodes, the terminal opening its session through sessiond (§ sessiond, § Attribution) | #1233 |
 | Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #1235 |
 | Remote login through sessiond (§ Session Kinds) | #1236 |
 | Per-user sessions: usermgr's token, per-account nodes (§ sessiond and usermgr) | #1238 |
@@ -51,26 +50,19 @@ Issue that builds it:
 The system runs userless, and the terminal is the only interface through which a user starts a
 program:
 
-- svcmgr launches the terminal one-shot (`restart = never`), so no supervisor observes its death
-  ([Supervision § Supervision Hierarchy](supervision.md#supervision-hierarchy)). The terminal
-  starts the shell with std `Command`, holds its process handle, and starts it again when it
-  exits ([programs/terminal/README.md](../programs/terminal/README.md)).
-- The shell starts each external command the same way and is the only holder of that program's
-  process handle ([programs/shell/README.md](../programs/shell/README.md)).
-- procmgr records each process's parent, destroys a process together with every process below
-  it, and re-parents the children of a process that ends (§ procmgr Mechanism). No session
-  supervisor uses it yet: a program's only supervisor is still the shell that started it.
-- memmgr charges each process under its creator's budget node, so a program's pages count in the
-  shell's subtree and in the terminal's, as **Memory max and reserve** of
-  [procmgr IPC Interface § Label 1](../services/procmgr/docs/ipc-interface.md#label-1-create_process)
-  says.
-- svcmgr's stop authority reaches only services whose recipe opts in, as
-  [`.svc` Service Definitions § `oom_stop`](../services/svcmgr/docs/service-definitions.md#oom_stop)
-  says, and lists the other stop sources (§ Stop Sources). No recipe of the default image sets
-  `stop_source`, so no program is a candidate: the `stopsrc` test fixture is the one source
-  ([services/stopsrc/README.md](../services/stopsrc/README.md)). oomd, its holder, stops a
-  candidate a source lists, a program before any service, when memory stays critical
-  ([services/oomd/README.md](../services/oomd/README.md)).
+- sessiond runs in operator mode ([services/sessiond/README.md](../services/sessiond/README.md)).
+  The terminal opens an operator session through its `sessiond.operator` seed, and sessiond
+  creates the leader, the shell its recipe names, contained and charged to the session's node.
+  The terminal holds no process handle and no namespace; svcmgr supervises it
+  (`restart = on_failure`), and when the leader ends it opens a new session
+  ([programs/terminal/README.md](../programs/terminal/README.md)).
+- The shell starts each external command with std `Command`: a job of the session, whose process
+  handle the shell holds as its creator ([programs/shell/README.md](../programs/shell/README.md)).
+- sessiond is the one stop source of the program class in the default image. oomd, the holder of
+  svcmgr's stop authority, stops a session's job, then a whole session, before any service that
+  opted in, when memory stays critical ([services/oomd/README.md](../services/oomd/README.md)).
+  The `stopsrc` test fixture is a second source of the class, staged in the svctest boot
+  ([services/stopsrc/README.md](../services/stopsrc/README.md)).
 
 ---
 
@@ -100,17 +92,22 @@ over a session's programs, and the path from a user's authority to processes, st
 out of every interface.
 
 - **Recipe.** `restart = on_failure`, `critical = no`, `reserve = yes` and
-  `stop_source = program` (§ Stop Sources). The last two are core roles, so svcmgr never offers
-  sessiond to oomd. A reserve service, it touches what it uses at start and allocates nothing on
-  its list and stop paths, so it answers oomd while the free pool is spent. svcmgr creates every
-  `stop_source` service contained (§ Stop Sources): sessiond's death ends every session, and
-  no session outlives its supervisor.
+  `stop_source = program` (§ Stop Sources;
+  [`.svc` Service Definitions § `stop_source`](../services/svcmgr/docs/service-definitions.md#stop_source)).
+  The last two are core roles, so svcmgr never offers sessiond to oomd. A reserve service, it
+  touches what it uses at start and allocates nothing on its list and stop paths, so it answers
+  oomd while the free pool is spent. svcmgr creates every `stop_source` service contained
+  (§ Stop Sources): sessiond's death ends every session, and no session outlives its supervisor.
 - **Opening a session.** An interface asks sessiond to open a session and hands it the caps the
   leader's standard streams take (the terminal's pipe caps; later a PTY's subordinate end, or a
   compositor's client caps), a POST cap on an event queue of the interface's own, and the session's
   authority (§ sessiond and usermgr). sessiond makes the session's budget node (§ Attribution),
   creates the leader contained, charged to that node, with the interface's queue as its death
-  relay, and starts it. The exchange and its wire format are sessiond's IPC interface's.
+  relay, and starts it. The exchange and its wire format are
+  [sessiond IPC Interface](../services/sessiond/docs/ipc-interface.md)'s. sessiond opens no session
+  while memmgr's pressure level reads `CRITICAL`: a session opened then is a fresh candidate oomd
+  stops before any service, so an interface that reopened its stopped session would undo the
+  stop. The interface waits for the level to change and asks again.
 - **Who may open.** Opening an operator session is itself an authority: a seed-only name sessiond
   provides, which svcmgr seeds only to the interfaces whose recipes name it, the terminal in the
   default image. A user session needs no authority beyond the usermgr token the open carries.
@@ -118,8 +115,7 @@ out of every interface.
   interface dies, or when sessiond is told to stop it. The leader is contained, so procmgr
   destroys what is left of its subtree; sessiond drops its record and releases the session's node.
   The interface learns of the end from the leader's death relay, which the leader's end reaches
-  once (§ procmgr Mechanism), and opens a new session if it wants one. The terminal does, as it
-  starts its shell again today.
+  once (§ procmgr Mechanism), and opens a new session if it wants one. The terminal does.
 - **Interface death.** An interface registers an end queue on itself with procmgr (§ procmgr
   Mechanism) and hands sessiond only that queue's receive right. procmgr posts the interface's end
   to it whatever ends it: an exit, a fault, or a destroy, svcmgr's stop of an opted-in service
@@ -127,7 +123,7 @@ out of every interface.
   teardown posts no death event
   ([Process Lifecycle § Exit reason](process-lifecycle.md#exit-reason)). sessiond stops that
   interface's sessions when the entry arrives, so no session outlives its interface, and an
-  interface can be a supervised, restartable service: the terminal's recipe becomes
+  interface can be a supervised, restartable service: the terminal's recipe sets
   `restart = on_failure`.
 - **sessiond's death.** procmgr destroys every session with it. Each interface receives its
   leader's end through the relay and opens a new session once svcmgr has restarted sessiond. Every
@@ -272,9 +268,9 @@ the one class, and sessiond its one source.
 | Per-user | terminal, rshd or greeter | shell or desktop shell | a usermgr token | #1238 |
 | Graphical | greeter | desktop shell | a usermgr token, or operator in a userless image | #1239 |
 
-- **Terminal.** Design intent (#1233): the terminal opens an operator session through sessiond
-  with its pipe caps, and the session's programs are stoppable before any service. The terminal
-  holds no process handle, and needs no namespace of its own to start the shell.
+- **Terminal.** Built: the terminal opens an operator session through sessiond with its pipe
+  caps, and the session's programs are stoppable before any service. The terminal holds no
+  process handle, and needs no namespace of its own to start the shell.
 - **Several terminals, over a PTY.** Design intent (#1235): the standard streams are a PTY's
   subordinate end; each terminal instance opens its own session (D21 of #152); the hangup policy,
   which ends a session when its PTY's controlling end closes, is sessiond's.
@@ -314,9 +310,10 @@ the one class, and sessiond its one source.
 
 ## Open Questions
 
-- ruststd's piped standard streams return a ring page to memmgr once the spawner's end is dropped
-  and its own destroy of the child has returned. How an interface returns a ring page whose peer
-  it did not create is settled where the terminal moves onto sessiond (#1233).
+None. An interface returns a ring page whose peer it did not create once the leader's death relay
+has been read, since procmgr posts the relay only after it has torn the leader down, or at once
+when sessiond refused the open, as ruststd's `std::os::seraph::process::SessionStdio` does
+([runtime/ruststd/README.md](../runtime/ruststd/README.md)).
 
 ---
 

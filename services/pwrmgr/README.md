@@ -64,8 +64,11 @@ resolved at startup, so it serves degraded), when acpid refuses it or does not a
 30 s (`ACPID_CALL_TIMEOUT_MS`, so an acpid that is down or blocked fails the request instead of
 holding pwrmgr and svcmgr's graceful shutdown), or when the platform
 fails to act. Both failures reply `pwrmgr_errors::INVALID_REQUEST`, the latter
-including a request the platform has not acted on one second after it was
-issued.
+including a request the platform has not acted on one second (`RESET_GRACE`)
+after its actuator returned. On x86-64 acpid answers a power-off only 10 s
+after its writes ([acpid § Power requests](../acpid/README.md#power-requests)),
+so a power-off the platform does not act on fails about 11 s after it was
+issued, and a reboot about one second after.
 
 Both labels are gated by `pwrmgr_labels::SHUTDOWN_AUTHORITY` (badge bit
 `1<<63`). Calls without the bit reply `pwrmgr_errors::UNAUTHORIZED`.

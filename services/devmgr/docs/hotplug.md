@@ -5,8 +5,7 @@ device's record and driver follow.
 
 Implementation status: implemented
 ([#939](https://github.com/kottlerg/seraph/issues/939),
-[#1096](https://github.com/kottlerg/seraph/issues/1096)), apart from the wired interrupt of a
-hot-added function on x86-64 (§ Binding).
+[#1096](https://github.com/kottlerg/seraph/issues/1096)).
 
 ---
 

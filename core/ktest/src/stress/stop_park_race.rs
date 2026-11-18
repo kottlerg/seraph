@@ -35,9 +35,27 @@
 //! - IPC call: `Ok` with the server's reply label, or `Interrupted`;
 //! - sleep: `Ok` or `Interrupted`.
 //!
+//! A stop lands on a committed park only when the peer's CPU runs from its
+//! announcement into its park within the controller's varying spin, and, for
+//! the IPC call, before the server's CPU answers the call, which a host that
+//! runs the guest's CPUs late may do in few rounds or none. So after a
+//! kind's [`CYCLES`] fixed rounds, while no stop has cancelled one of its
+//! parks, held rounds run, up to [`super::MAX_EXTRA_ROUNDS`] ([`HELD`] set):
+//! the controller sleeps [`HOLD_MS`] after the announcement before its stop,
+//! a sleep peer sleeps [`HELD_SLEEP_MS`] instead, so the hold ends inside
+//! its sleep, and the IPC server holds its reply to each call it receives
+//! until the controller has stopped and restarted the caller, which it does
+//! once the server has published that it received the round's call
+//! ([`RECEIVED`], bounded by [`APPROACH_WAIT_US`]), so the stop lands on a
+//! caller waiting for its reply. The host must run the peer from its
+//! announcement into its park within the hold in one held round (for the
+//! call, run the server through one receive), not run CPUs at once
+//! throughout. Each kind's log counts the held rounds run.
+//!
 //! Anything else fails the test, as does a kind for which no stop cancelled a
-//! park (the race never armed for it), a peer that never approaches its park
-//! within [`APPROACH_WAIT_US`] (one that exited, such as a call peer whose IPC
+//! park (the race never armed for it, in the held rounds too), a peer that
+//! never approaches its park within [`APPROACH_WAIT_US`] (one that exited,
+//! such as a call peer whose IPC
 //! buffer registration failed), and a peer that reports no result within
 //! [`RESULT_WAIT_US`] (a call whose server has exited blocks for good). The
 //! kernel's debug assertions (the spurious-resume tripwire, the pop-time
@@ -58,7 +76,7 @@ use syscall_abi::{SyscallError, SystemInfoType};
 
 use crate::{ChildStack, TestContext, TestResult, spawn};
 
-/// Stop/start races per wait kind.
+/// Fixed stop/start races per wait kind.
 const CYCLES: u32 = 150;
 
 /// Bits the controller's rescue send delivers to a notification peer.
@@ -69,6 +87,15 @@ const REPLY_LABEL: u64 = 0x5EED;
 
 /// A sleep peer's sleep: long enough to be parked when the stop lands.
 const SLEEP_MS: u64 = 2;
+
+/// A sleep peer's sleep in a held round: longer than the controller's hold
+/// ([`HOLD_MS`]), so a hold that the controller's own CPU stretches still
+/// ends inside it.
+const HELD_SLEEP_MS: u64 = 50;
+
+/// The controller's hold, in a held round, between the peer's announcement
+/// and its stop, in milliseconds (one `thread_sleep`).
+const HOLD_MS: u64 = 1;
 
 /// Controller spins this many rounds for a peer's result before yielding
 /// (and, for a notification peer, rescuing it).
@@ -111,6 +138,20 @@ static RESULT: AtomicU32 = AtomicU32::new(0);
 /// peer starts cycle `n + 1` only after `ACKED == n`, and exits only after
 /// `ACKED == CYCLES`, so it never runs ahead of the race it is part of.
 static ACKED: AtomicU32 = AtomicU32::new(0);
+/// Controller → peer: the phase's last cycle, stored before that cycle's
+/// [`ACKED`]; `u32::MAX` while the phase runs on. The peer exits once the
+/// controller has consumed it.
+static END: AtomicU32 = AtomicU32::new(u32::MAX);
+/// Controller → peer and server: set before the [`ACKED`] that starts the
+/// first held round, so every held round's park, and only a held round's,
+/// sees it.
+static HELD: AtomicU32 = AtomicU32::new(0);
+/// Server → controller: the cycle of the call the IPC server last received
+/// (the call's label).
+static RECEIVED: AtomicU32 = AtomicU32::new(0);
+/// Controller → server: in a held round, the server replies to the call of
+/// cycle `n` only once this is at least `n`.
+static REPLY_GATE: AtomicU32 = AtomicU32::new(0);
 
 /// IPC buffers for the call peer and the server (one live user each).
 #[repr(C, align(4096))]
@@ -152,35 +193,75 @@ pub fn run(ctx: &TestContext) -> TestResult
     restore
 }
 
+/// One kind's log labels and its never-armed failure.
+struct KindLabels
+{
+    interrupted: &'static str,
+    extra_rounds: &'static str,
+    never_armed: &'static str,
+}
+
 /// Run one phase per kind; each must see at least one cancelled park.
 fn all_phases(ctx: &TestContext, server_cpu: u32) -> TestResult
 {
-    for (kind, label, never_armed) in [
+    for (kind, labels) in [
         (
             Kind::Notification,
-            "ktest: stress::stop_park_race notification interrupted=",
-            "stress::stop_park_race: no stop cancelled a notification wait (never armed)",
+            KindLabels {
+                interrupted: "ktest: stress::stop_park_race notification interrupted=",
+                extra_rounds: "ktest: stress::stop_park_race notification extra_rounds=",
+                never_armed: "stress::stop_park_race: no stop cancelled a notification wait \
+                              (never armed)",
+            },
         ),
         (
             Kind::Call,
-            "ktest: stress::stop_park_race call interrupted=",
-            "stress::stop_park_race: no stop cancelled an IPC call (never armed)",
+            KindLabels {
+                interrupted: "ktest: stress::stop_park_race call interrupted=",
+                extra_rounds: "ktest: stress::stop_park_race call extra_rounds=",
+                never_armed: "stress::stop_park_race: no stop cancelled an IPC call (never armed)",
+            },
         ),
         (
             Kind::Sleep,
-            "ktest: stress::stop_park_race sleep interrupted=",
-            "stress::stop_park_race: no stop cancelled a sleep (never armed)",
+            KindLabels {
+                interrupted: "ktest: stress::stop_park_race sleep interrupted=",
+                extra_rounds: "ktest: stress::stop_park_race sleep extra_rounds=",
+                never_armed: "stress::stop_park_race: no stop cancelled a sleep (never armed)",
+            },
         ),
     ]
     {
-        let interrupted = phase(ctx, kind, server_cpu)?;
-        crate::log_u64(label, interrupted);
-        if interrupted == 0
+        let seen = phase(ctx, kind, server_cpu)?;
+        crate::log_u64(labels.interrupted, seen.interrupted);
+        crate::log_u64(labels.extra_rounds, u64::from(seen.extra_rounds));
+        if seen.interrupted == 0
         {
-            return Err(never_armed);
+            return Err(labels.never_armed);
         }
     }
     Ok(())
+}
+
+/// What a phase's rounds saw.
+struct Seen
+{
+    /// Parks that ended `Interrupted`.
+    interrupted: u64,
+    /// Held rounds run after the fixed rounds.
+    extra_rounds: u32,
+}
+
+/// When a round's controller stops the peer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// After a varying spin of its own once the peer has announced its park.
+    Raced,
+    /// Once the peer has been given time to park: [`HOLD_MS`] after its
+    /// announcement, or, for the IPC call, once the server has received the
+    /// call and holds its reply.
+    Held,
 }
 
 /// The peer's source and, for the IPC kind, the server answering it.
@@ -190,14 +271,16 @@ struct PhaseObjects
     server: Option<spawn::SpawnedChild>,
 }
 
-/// Run [`CYCLES`] stop/start races against one peer of `kind`; returns how
-/// many ended `Interrupted`. Everything the phase created is deleted on
-/// every path, the race's own error taking precedence.
-fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static str>
+/// Run [`CYCLES`] stop/start races against one peer of `kind`, then held
+/// rounds ([`rounds`]); returns what they saw. Everything the phase created
+/// is deleted on every path, the race's own error taking precedence.
+fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<Seen, &'static str>
 {
-    PARKING.store(0, Ordering::Release);
-    FINISHED.store(0, Ordering::Release);
-    ACKED.store(0, Ordering::Release);
+    for counter in [&PARKING, &FINISHED, &ACKED, &HELD, &RECEIVED, &REPLY_GATE]
+    {
+        counter.store(0, Ordering::Release);
+    }
+    END.store(u32::MAX, Ordering::Release);
 
     let mut objects = PhaseObjects {
         source: None,
@@ -206,19 +289,57 @@ fn phase(ctx: &TestContext, kind: Kind, server_cpu: u32) -> Result<u64, &'static
     let mut peer = None;
     let result = setup(ctx, kind, server_cpu, &mut objects, &mut peer).and_then(|()| {
         let peer_th = peer.as_ref().map_or(0, |p: &spawn::SpawnedChild| p.th);
-        let mut interrupted = 0u64;
-        for cycle in 1..=CYCLES
-        {
-            if race_once(kind, peer_th, objects.source, cycle)?
-            {
-                interrupted = interrupted.saturating_add(1);
-            }
-        }
-        Ok(interrupted)
+        rounds(kind, peer_th, objects.source)
     });
     let torn_down = teardown(peer.as_mut(), &mut objects);
-    let interrupted = result?;
-    torn_down.map(|()| interrupted)
+    let seen = result?;
+    torn_down.map(|()| seen)
+}
+
+/// Run the [`CYCLES`] fixed rounds and then, while no stop has cancelled a
+/// park, held rounds until one has or [`super::MAX_EXTRA_ROUNDS`] have run,
+/// stopping at the first round that fails. Each round's result is consumed
+/// ([`ACKED`]) only after the next round's kind is published: [`HELD`]
+/// before the first held round, [`END`] after the last round.
+fn rounds(kind: Kind, peer: u64, source: Option<u64>) -> Result<Seen, &'static str>
+{
+    let mut seen = Seen {
+        interrupted: 0,
+        extra_rounds: 0,
+    };
+    let mut cycle = 0u32;
+    loop
+    {
+        cycle = cycle.saturating_add(1);
+        let timing = if cycle > CYCLES
+        {
+            seen.extra_rounds = seen.extra_rounds.saturating_add(1);
+            Timing::Held
+        }
+        else
+        {
+            Timing::Raced
+        };
+        if race_once(kind, peer, source, cycle, timing)?
+        {
+            seen.interrupted = seen.interrupted.saturating_add(1);
+        }
+        let more = cycle < CYCLES
+            || (seen.interrupted == 0 && seen.extra_rounds < super::MAX_EXTRA_ROUNDS);
+        if !more
+        {
+            END.store(cycle, Ordering::Release);
+        }
+        else if cycle == CYCLES
+        {
+            HELD.store(1, Ordering::Release);
+        }
+        ACKED.store(cycle, Ordering::Release);
+        if !more
+        {
+            return Ok(seen);
+        }
+    }
 }
 
 /// Create the phase's source (and server), then start the peer pinned to
@@ -305,23 +426,38 @@ fn teardown(peer: Option<&mut spawn::SpawnedChild>, objects: &mut PhaseObjects) 
     }
 }
 
-/// One race: wait for the peer to approach its park, stop and restart it,
-/// release it if the stop missed, and check its result. Returns whether the
-/// park ended `Interrupted`.
-fn race_once(kind: Kind, peer: u64, source: Option<u64>, cycle: u32) -> Result<bool, &'static str>
+/// One race: wait for the peer to approach its park, stop and restart it
+/// (`timing` says when), release it if the stop missed, and check its
+/// result. Returns whether the park ended `Interrupted`; the caller consumes
+/// the result ([`ACKED`]).
+fn race_once(
+    kind: Kind,
+    peer: u64,
+    source: Option<u64>,
+    cycle: u32,
+    timing: Timing,
+) -> Result<bool, &'static str>
 {
     await_parking(peer, cycle)?;
-    // Vary the stop's phase against the park: 0 to 4095 spins (a
-    // multiplicative hash of the cycle).
-    for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+    match timing
     {
-        core::hint::spin_loop();
+        Timing::Raced =>
+        {
+            // Vary the stop's phase against the park: 0 to 4095 spins (a
+            // multiplicative hash of the cycle).
+            for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 20)
+            {
+                core::hint::spin_loop();
+            }
+        }
+        Timing::Held => hold(kind, cycle)?,
     }
     thread_stop(peer).map_err(|_| "stress::stop_park_race: thread_stop failed")?;
     thread_start(peer).map_err(|_| "stress::stop_park_race: thread_start failed")?;
+    // A held call's server replies only now, to a caller the stop cancelled.
+    REPLY_GATE.store(cycle, Ordering::Release);
     await_result(kind, source, cycle)?;
     let result = RESULT.load(Ordering::Acquire);
-    ACKED.store(cycle, Ordering::Release);
     match result
     {
         RESULT_GENUINE => Ok(false),
@@ -330,6 +466,26 @@ fn race_once(kind: Kind, peer: u64, source: Option<u64>, cycle: u32) -> Result<b
             "stress::stop_park_race: a stopped park returned neither its genuine result \
                   nor Interrupted",
         ),
+    }
+}
+
+/// A held round's wait before its stop: for the IPC call, until the server
+/// has received the call of `cycle` ([`RECEIVED`]), bounded by
+/// [`APPROACH_WAIT_US`]; it then holds its reply until the controller's
+/// [`REPLY_GATE`]. For the other kinds, a [`HOLD_MS`] sleep.
+fn hold(kind: Kind, cycle: u32) -> TestResult
+{
+    match kind
+    {
+        Kind::Call => super::require_within(
+            crate::scaled_bound(APPROACH_WAIT_US),
+            "stress::stop_park_race: the server did not receive a held round's call",
+            || RECEIVED.load(Ordering::Acquire) == cycle,
+        ),
+        Kind::Notification | Kind::Sleep =>
+        {
+            thread_sleep(HOLD_MS).map_err(|_| "stress::stop_park_race: hold sleep failed")
+        }
     }
 }
 
@@ -399,28 +555,31 @@ fn elapsed_us() -> Result<u64, &'static str>
         .map_err(|_| "stress::stop_park_race: system_info(ElapsedUs) failed")
 }
 
-/// Peer loop: announce each cycle's park, run it, classify and publish.
-fn peer_loop(mut park: impl FnMut() -> u32) -> !
+/// Peer loop: announce each cycle's park, run it, classify and publish,
+/// until the controller has consumed the phase's last cycle ([`END`]). The
+/// peer exits only then: a park that returned at once (a rescue left
+/// pending by an earlier cycle) must not let the thread exit before the
+/// controller's stop lands.
+fn peer_loop(mut park: impl FnMut(u32) -> u32) -> !
 {
-    for cycle in 1..=CYCLES
+    let mut cycle = 1u32;
+    loop
     {
-        while ACKED.load(Ordering::Acquire) != cycle.saturating_sub(1)
+        let consumed = cycle.saturating_sub(1);
+        while ACKED.load(Ordering::Acquire) != consumed
         {
             core::hint::spin_loop();
         }
+        if END.load(Ordering::Acquire) == consumed
+        {
+            thread_exit()
+        }
         PARKING.store(cycle, Ordering::Release);
-        let result = park();
+        let result = park(cycle);
         RESULT.store(result, Ordering::Release);
         FINISHED.store(cycle, Ordering::Release);
+        cycle = cycle.saturating_add(1);
     }
-    // Exit only once the last race is over: a park that returned at once (a
-    // rescue left pending by an earlier cycle) must not let the thread exit
-    // before the controller's stop lands.
-    while ACKED.load(Ordering::Acquire) != CYCLES
-    {
-        core::hint::spin_loop();
-    }
-    thread_exit()
 }
 
 fn is_interrupted(e: i64) -> bool
@@ -431,7 +590,7 @@ fn is_interrupted(e: i64) -> bool
 extern "C" fn notif_peer(arg: u64) -> !
 {
     let sig = arg;
-    peer_loop(|| match notification_wait(sig)
+    peer_loop(|_| match notification_wait(sig)
     {
         Ok(bits) if bits == RESCUE_BITS => RESULT_GENUINE,
         Err(e) if is_interrupted(e) => RESULT_INTERRUPTED,
@@ -451,9 +610,10 @@ extern "C" fn call_peer(arg: u64) -> !
     {
         thread_exit()
     }
-    peer_loop(|| {
+    peer_loop(|cycle| {
+        // The label names the cycle, which the server publishes.
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
-        match unsafe { ipc::ipc_call(ep, &IpcMessage::new(1), buf) }
+        match unsafe { ipc::ipc_call(ep, &IpcMessage::new(u64::from(cycle)), buf) }
         {
             Ok(reply) if reply.label == REPLY_LABEL => RESULT_GENUINE,
             Err(e) if is_interrupted(e) => RESULT_INTERRUPTED,
@@ -464,15 +624,27 @@ extern "C" fn call_peer(arg: u64) -> !
 
 extern "C" fn sleep_peer(_arg: u64) -> !
 {
-    peer_loop(|| match thread_sleep(SLEEP_MS)
-    {
-        Ok(()) => RESULT_GENUINE,
-        Err(e) if is_interrupted(e) => RESULT_INTERRUPTED,
-        Err(_) => RESULT_BAD,
+    peer_loop(|_| {
+        let ms = if HELD.load(Ordering::Acquire) == 0
+        {
+            SLEEP_MS
+        }
+        else
+        {
+            HELD_SLEEP_MS
+        };
+        match thread_sleep(ms)
+        {
+            Ok(()) => RESULT_GENUINE,
+            Err(e) if is_interrupted(e) => RESULT_INTERRUPTED,
+            Err(_) => RESULT_BAD,
+        }
     })
 }
 
-/// IPC server: answer every call with [`REPLY_LABEL`]; a reply whose caller
+/// IPC server: answer every call with [`REPLY_LABEL`], publishing each
+/// call's cycle (its label) in [`RECEIVED`] and, in a held round ([`HELD`]),
+/// holding the reply until the controller's [`REPLY_GATE`] reaches it; a reply whose caller
 /// was cancelled meanwhile fails and is ignored. Runs until deleted (or
 /// until its endpoint goes first); a `RecvGuard` bounds the retries of a
 /// failed receive (docs/ipc-design.md § Receive-Failure Policy).
@@ -494,9 +666,19 @@ extern "C" fn server_entry(arg: u64) -> !
         // SAFETY: `buf` was registered as this thread's IPC buffer above.
         match unsafe { ipc::ipc_recv(ep, buf) }
         {
-            Ok(_) =>
+            Ok(call) =>
             {
                 guard.on_success();
+                // Every call carries its cycle, a `u32`.
+                let received = u32::try_from(call.label).unwrap_or(0);
+                RECEIVED.store(received, Ordering::Release);
+                // Sleeps, so a server sharing the controller's CPU leaves it
+                // to the controller's stop.
+                while HELD.load(Ordering::Acquire) != 0
+                    && REPLY_GATE.load(Ordering::Acquire) < received
+                {
+                    let _ = thread_sleep(1);
+                }
                 // SAFETY: as above.
                 let _ = unsafe { ipc::ipc_reply(&IpcMessage::new(REPLY_LABEL), buf) };
             }

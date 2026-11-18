@@ -33,7 +33,20 @@
 //! the waiter does not report ready, or its verdict, within a bounded wait.
 //! A bad result is logged with its result word (a value, or an error word).
 //!
+//! A destroy lands on a parked waiter only when the waiter's CPU has run it
+//! into a wait by then, which a host that runs the guest's CPUs late may do
+//! in few cycles or none. So after the [`CYCLES`] fixed cycles, while no
+//! destroy has landed on a parked waiter, held cycles run, up to
+//! [`super::MAX_EXTRA_ROUNDS`]: the controller waits until the waiter has
+//! published that it is entering another timed wait ([`WAITS_ENTERED`],
+//! bounded by [`HELD_ENTRY_WAIT_US`]) and then destroys the source at once,
+//! with no sleep and no spin, so the destroy lands within that wait's
+//! 1 ms span while the waiter is known to be running. The log counts the
+//! held cycles run.
+//!
 //! Needs **≥ 2 CPUs** (the destroy must run concurrently with CPU 0's timer).
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use syscall::{
     RIGHTS_ALL, cap_copy, cap_create_notification, cap_delete, cap_revoke, event_queue_create,
@@ -48,7 +61,7 @@ use crate::{ChildStack, TestContext, TestResult, spawn};
 /// This cell's log name.
 const CELL: &str = "stress::timed_wait_source_delete";
 
-/// Source-destroy cycles (half notification, half event queue).
+/// Fixed source-destroy cycles (half notification, half event queue).
 const CYCLES: u32 = 200;
 
 /// Notification NOTIFY right — what a child needs to `notification_send`.
@@ -66,6 +79,23 @@ const VERDICT: u64 = BIT_INTERRUPTED | BIT_GONE | BIT_BAD;
 
 /// Waiter wait-loop timeout: short, so deadlines expire throughout a cycle.
 const WAIT_MS: u64 = 1;
+
+/// Bound on a held cycle's wait for the waiter to enter another timed wait,
+/// in microseconds, through [`crate::scaled_bound`].
+const HELD_ENTRY_WAIT_US: u64 = 1_000_000;
+
+/// Timed waits the waiter has entered, counted just before each.
+static WAITS_ENTERED: AtomicU32 = AtomicU32::new(0);
+
+/// How a cycle places its destroy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Timing
+{
+    /// A fixed cycle: the destroy follows a 1 ms sleep and a varying spin.
+    Raced,
+    /// A held cycle: the destroy follows the waiter's entry into a wait.
+    Held,
+}
 
 /// Wait results outside the accepted set, with one of their result words.
 static BAD_WAITS: BadTally = BadTally::new();
@@ -100,12 +130,16 @@ pub fn run(ctx: &TestContext) -> TestResult
     let result = cycles(ctx, u32::try_from(cpus).unwrap_or(2));
     let restore = thread_set_affinity(ctx.thread_cap, u32::MAX)
         .map_err(|_| "stress::timed_wait_source_delete: restore controller affinity failed");
-    let interrupted = result?;
+    let (interrupted, extra_rounds) = result?;
     restore?;
 
     crate::log_u64(
         "ktest: stress::timed_wait_source_delete interrupted=",
         interrupted,
+    );
+    crate::log_u64(
+        "ktest: stress::timed_wait_source_delete extra_rounds=",
+        u64::from(extra_rounds),
     );
     if interrupted == 0
     {
@@ -114,37 +148,59 @@ pub fn run(ctx: &TestContext) -> TestResult
     Ok(())
 }
 
-/// Run every cycle; returns how many ended with the waiter interrupted.
-fn cycles(ctx: &TestContext, cpus: u32) -> Result<u64, &'static str>
+/// Run the [`CYCLES`] fixed cycles, then held cycles while none has ended
+/// with the waiter interrupted, up to [`super::MAX_EXTRA_ROUNDS`]. Returns
+/// how many cycles ended with the waiter interrupted, and the held cycles
+/// run.
+fn cycles(ctx: &TestContext, cpus: u32) -> Result<(u64, u32), &'static str>
 {
     let done = cap_create_notification(ctx.memory_base)
         .map_err(|_| "stress::timed_wait_source_delete: create done failed")?;
     let mut interrupted = 0u64;
+    let mut extra = 0u32;
     let mut result = Ok(());
-    for cycle in 0..CYCLES
+    let mut cycle = 0u32;
+    loop
     {
-        match one_cycle(ctx, done, cycle, cpus)
+        let timing = if cycle < CYCLES
         {
-            Ok(true) => interrupted = interrupted.saturating_add(1),
-            Ok(false) =>
-            {}
+            Timing::Raced
+        }
+        else if interrupted == 0 && extra < super::MAX_EXTRA_ROUNDS
+        {
+            extra = extra.saturating_add(1);
+            Timing::Held
+        }
+        else
+        {
+            break;
+        };
+        match one_cycle(ctx, done, (cycle, timing), cpus)
+        {
+            Ok(hit) => interrupted = interrupted.saturating_add(u64::from(hit)),
             Err(e) =>
             {
                 result = Err(e);
                 break;
             }
         }
+        cycle = cycle.saturating_add(1);
     }
     let deleted = cap_delete(done);
     result?;
     deleted.map_err(|_| "stress::timed_wait_source_delete: del done failed")?;
-    Ok(interrupted)
+    Ok((interrupted, extra))
 }
 
 /// One cycle: park a waiter on a fresh source, destroy the source around its
-/// deadlines, and take its verdict. Returns whether the waiter was
-/// interrupted.
-fn one_cycle(ctx: &TestContext, done: u64, cycle: u32, cpus: u32) -> Result<bool, &'static str>
+/// deadlines (as `timing` says), and take its verdict. Returns whether the
+/// waiter was interrupted.
+fn one_cycle(
+    ctx: &TestContext,
+    done: u64,
+    (cycle, timing): (u32, Timing),
+    cpus: u32,
+) -> Result<bool, &'static str>
 {
     let (source, entry): (_, extern "C" fn(u64) -> !) = if cycle & 1 == 1
     {
@@ -161,7 +217,7 @@ fn one_cycle(ctx: &TestContext, done: u64, cycle: u32, cpus: u32) -> Result<bool
         let _ = cap_delete(source);
         return Err("stress::timed_wait_source_delete: spawn waiter failed");
     };
-    let verdict = race(&child, entry, source, done, cycle, cpus);
+    let verdict = race(&child, entry, source, done, (cycle, timing), cpus);
     // Deleting the thread stops it wherever it is, so the next cycle's
     // waiter can reuse the stack even when this one failed.
     let reaped = [child.delete_thread(), child.delete_cspace()]
@@ -197,7 +253,7 @@ fn race(
     entry: extern "C" fn(u64) -> !,
     source: u64,
     done: u64,
-    cycle: u32,
+    (cycle, timing): (u32, Timing),
     cpus: u32,
 ) -> Result<u64, &'static str>
 {
@@ -243,13 +299,7 @@ fn race(
         BIT_READY,
         "stress::timed_wait_source_delete: the waiter never reported ready",
     )?;
-    // Any outcome serves: the sleep only staggers the destroy around the
-    // waiter's deadlines, and the spin below varies it further.
-    let _ = thread_sleep(WAIT_MS);
-    for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 18)
-    {
-        core::hint::spin_loop();
-    }
+    lead_in(cycle, timing)?;
     cap_revoke(source).map_err(|_| "stress::timed_wait_source_delete: revoke failed")?;
     cap_delete(source).map_err(|_| "stress::timed_wait_source_delete: delete failed")?;
 
@@ -260,6 +310,36 @@ fn race(
         "stress::timed_wait_source_delete: the waiter never reported its verdict",
     )?;
     Ok(acc)
+}
+
+/// The controller's delay before a cycle's destroy: in a fixed cycle, a 1 ms
+/// sleep and a varying spin; in a held cycle, a wait, bounded by
+/// [`HELD_ENTRY_WAIT_US`], until the waiter has entered another timed wait.
+fn lead_in(cycle: u32, timing: Timing) -> TestResult
+{
+    match timing
+    {
+        Timing::Raced =>
+        {
+            // Any outcome serves: the sleep only staggers the destroy around
+            // the waiter's deadlines, and the spin below varies it further.
+            let _ = thread_sleep(WAIT_MS);
+            for _ in 0..(cycle.wrapping_mul(2_654_435_761) >> 18)
+            {
+                core::hint::spin_loop();
+            }
+            Ok(())
+        }
+        Timing::Held =>
+        {
+            let entered = WAITS_ENTERED.load(Ordering::Acquire);
+            super::require_within(
+                crate::scaled_bound(HELD_ENTRY_WAIT_US),
+                "stress::timed_wait_source_delete: the waiter entered no wait in a held cycle",
+                || WAITS_ENTERED.load(Ordering::Acquire) != entered,
+            )
+        }
+    }
 }
 
 /// Read the waiter's `(source, done)` handles from the entry at `arg`.
@@ -284,6 +364,8 @@ fn wait_loop(
     notification_send(done, BIT_READY).ok();
     let bit = loop
     {
+        // A held cycle's controller destroys the source only after this.
+        WAITS_ENTERED.fetch_add(1, Ordering::AcqRel);
         let r = wait();
         if timed_out(r)
         {

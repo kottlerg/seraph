@@ -125,6 +125,21 @@ with no override the full `alloc` / `std` collections surface (`Box`, `Vec`, `St
   ([memmgr Memory Pool § Commit](../services/memmgr/docs/memory-pool.md#commit)).
   A process with no pager keeps requesting Memory caps with
   `REQUEST_MEMORY_CAPS` and mapping them.
+- **Giving memory back.** `dealloc` gives memmgr back the committed growth
+  region's pages that a free leaves unused, in 64 KiB chunks
+  (`memmgr_labels::DEMAND_CHUNK_BYTES`), as the host-tested
+  `ruststd-heap-fit` crate plans it. When the freed block's free block is the
+  heap's top, it cuts the region (`SHRINK_REGION`) to the chunk holding that
+  block's list node and `TRIM_PAD` (two chunks) above it, once that cuts at
+  least `TRIM_MIN` (four chunks): memmgr uncharges the pages cut. Otherwise,
+  for a free of at least `DISCARD_MIN` (four chunks), it discards
+  (`DISCARD_RANGE`) each whole chunk of the free block past its node that the
+  free made free: memmgr takes back their frames and keeps the region's
+  commitment, so a later touch of a discarded page is backed zero-filled and is
+  not declined for budget or RAM. The floor, an uncommitted region, is never
+  given back, since a later touch of one of its pages could be declined. The
+  heap lock is held across the call, so no thread allocates from the pages
+  memmgr clears.
 - **Bootstrap.** Before `fn main()` runs, `std::os::seraph::_start`
   installs the heap floor at the process's heap base, drawn per process
   from the heap zone's window via one raw non-allocating `SYS_GETRANDOM`

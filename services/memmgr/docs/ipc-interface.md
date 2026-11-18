@@ -42,11 +42,12 @@ Two privilege classes:
 - **Universal** labels (`REQUEST_MEMORY_CAPS`, `RELEASE_MEMORY_CAPS`,
   `QUERY_POOL_STATUS`, `REGISTER_REGION`, `UNREGISTER_REGION`,
   `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
-  `SHRINK_REGION`, `CREATE_SUB_NODE`) are callable over any badged cap but a
-  node handle, including those memmgr returned from `REGISTER_PROCESS`.
-  `REGISTER_REGION`, `UNREGISTER_REGION`, `QUERY_MEMORY_USAGE`,
-  `REGISTER_PRESSURE`, `EXTEND_REGION`, `SHRINK_REGION` and
-  `CREATE_SUB_NODE` are attributed to the caller by its own badge.
+  `SHRINK_REGION`, `CREATE_SUB_NODE`, `DISCARD_RANGE`) are callable over any
+  badged cap but a node handle, including those memmgr returned from
+  `REGISTER_PROCESS`. `REGISTER_REGION`, `UNREGISTER_REGION`,
+  `QUERY_MEMORY_USAGE`, `REGISTER_PRESSURE`, `EXTEND_REGION`,
+  `SHRINK_REGION`, `CREATE_SUB_NODE` and `DISCARD_RANGE` are attributed to
+  the caller by its own badge.
 - **Node** labels (`NODE_SET_MAX`, `NODE_CREATE`, `NODE_QUERY_USAGE`,
   `NODE_REGISTER_LIMIT`, `NODE_RELEASE`) are callable only over a node
   handle, and act on the budget node it names (§ Node Handles).
@@ -516,8 +517,9 @@ is either fixed kernel reserve or in memmgr's pool. `pool_total` counts owned
 RAM and is invariant across a process's lifetime, so it cannot witness
 reclamation. `free_bytes` (`data[3]`) is the byte count currently in free
 runs: it falls as `REQUEST_MEMORY_CAPS` lends pages and rises as
-`PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, and `UNREGISTER_REGION` return them.
-`deferred_bytes` (`data[4]`) is the byte count those three took back but
+`PROCESS_DIED`, `RELEASE_MEMORY_CAPS`, `UNREGISTER_REGION`, `SHRINK_REGION`
+and `DISCARD_RANGE` return them. `deferred_bytes` (`data[4]`) is the byte
+count those took back but
 hold on the deferred list, because another process can still reach the
 frames (see [`memory-pool.md`](memory-pool.md) §"Reclamation"); it falls as
 a later recheck moves them to the free runs. A caller asserting that a dead
@@ -571,7 +573,9 @@ of the process that maps while a committed fault's map is funded, or a
 reclaiming unmap of page tables in the region's span the process made or asked
 for, can spend it, and a donation past it is admitted as any other, so the
 fault can then be declined with code 10 or 9. Only a committed region grows by
-`EXTEND_REGION` (§ Label 12) or shrinks by `SHRINK_REGION` (§ Label 13). A
+`EXTEND_REGION` (§ Label 12) or shrinks by `SHRINK_REGION` (§ Label 13); a
+discard by `DISCARD_RANGE` (§ Label 20) keeps its commitment, so a refault of
+a discarded page is admitted as its first touch was. A
 refused commitment registers nothing. A reply that does not reach the caller
 unregisters the region again, as a grant whose reply fails is rolled back, so a
 caller whose call was interrupted makes it again
@@ -967,6 +971,42 @@ caller as the owner of the sub-node's handle state.
 |---|---|---|
 | 3 | `QUOTA` | As `NODE_CREATE` |
 | 4 | `INVALID_ARGUMENT` | Unknown badge |
+| 5 | `UNAUTHORIZED` | The badge is a node handle |
+
+### Label 20: `DISCARD_RANGE`
+
+Discard pages of a demand region of the caller, committed or not: memmgr takes
+back the frames that back them, and the next touch of each faults in a
+zero-filled page. Privilege: universal — attributed to the caller by
+`recv.badge`.
+
+**Request:**
+
+| Field | Value |
+|---|---|
+| label | 20 |
+| data[0] | `va` (a whole number of 64 KiB demand chunks above the base of the region that holds it) |
+| data[1] | `len_bytes` (nonzero; a whole number of chunks, or reaching the region's end) |
+
+memmgr unmaps the pages from the caller's delegated `AddressSpace` without
+reclaiming page tables, then clears the range's chunks from the region's chunk
+table, returning each run on them to the free pool or the deferred list as
+`UNREGISTER_REGION` does (§ Label 9). The region keeps its length and its
+page tables. In an uncommitted region each run is uncharged from the caller's
+budget node as it rejoins the pool. A committed region (§ Label 7) keeps its
+commitment: its charge stays, and the pages taken back, with the metadata their
+chunks gave back, return to `promised`, so a refault of a discarded page is
+not declined for budget or RAM, as its first touch was not
+([`memory-pool.md`](memory-pool.md#commit) § Commit). A range that holds no
+run changes nothing, so an interrupted call is safe to repeat.
+
+**Reply (success):** `label` 0, also for a range already discarded.
+
+**Error codes:**
+
+| Code | Name | Meaning |
+|---|---|---|
+| 4 | `INVALID_ARGUMENT` | Unknown badge, no region holds `va`, or a range that breaks the rule above or leaves the region |
 | 5 | `UNAUTHORIZED` | The badge is a node handle |
 
 ### Kernel-origin fault message (`FAULT_LABEL`)

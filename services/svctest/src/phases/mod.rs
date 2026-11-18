@@ -48,6 +48,7 @@ pub mod acpi;
 pub mod budget;
 pub mod crash;
 pub mod devmgr;
+pub mod discard;
 pub mod drivers;
 pub mod exit_code;
 pub mod fs_faults;
@@ -101,6 +102,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(budget::phases());
     out.extend_from_slice(node_handle::phases());
     out.extend_from_slice(heap_commit::phases());
+    out.extend_from_slice(discard::phases());
     out.extend_from_slice(shmem::phases());
     out.extend_from_slice(pipes::phases());
     out.extend_from_slice(namespace::early());

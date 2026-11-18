@@ -81,6 +81,9 @@ services/svctest/
         ├── heap_commit.rs     # Committed heap growth: max refusal as an allocation error, a grant
         │                      #   past the promised bound, no fault declined, committed region
         │                      #   register, extend, shrink; all-RAM-accounted identity
+        ├── discard.rs         # DISCARD_RANGE and SHRINK_REGION return frames; discarded pages
+        │                      #   refault zero-filled and, committed, cannot be declined;
+        │                      #   the std heap's discard and trim; all-RAM-accounted identity
         ├── shmem.rs           # Kernel shared-memory objects
         ├── pipes.rs           # Kernel pipes: piped stdio, death-bridge EOF
         ├── namespace.rs       # vfsd namespace protocol, sandboxing, startup cwd
@@ -356,6 +359,8 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `node-handle-child`         | `node_handle`  | `memmgr_node_handles` (max set by handle)   |
 | `heap-commit-limited`       | `heap_commit`  | `memmgr_heap_commit` (4096-page max)        |
 | `heap-commit-hog`           | `heap_commit`  | `memmgr_heap_commit` (commits to the bound) |
+| `discard-hog`               | `discard`      | `memmgr_discard_range` (refault at the bound) |
+| `heap-release`              | `discard`      | `memmgr_discard_range` (heap discard, trim) |
 | `reboot`                    | `pwrmgr`       | the `reboot.svc` test recipe (`test-reboot`) |
 
 ---

@@ -366,13 +366,14 @@ and the generation) was decided on [#637](https://github.com/kottlerg/seraph/iss
 
 ### Bootloader and boot ABIs
 
-Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
+Tracked by [#640](https://github.com/kottlerg/seraph/issues/640); the module-name widths by
+[#1263](https://github.com/kottlerg/seraph/issues/1263).
 
 | Item | Location | Value | Set by | Up-front cost | Class | Recommendation |
 |---|---|---|---|---|---|---|
 | `MAX_CPUS` (`BootInfo.cpu_count`) | `abi/boot-protocol/src/lib.rs` | 8192 | current peak plus headroom, a sanity ceiling: above any shipping part (two-socket SMT 768, eight-socket 192-core SMT 3072) with headroom; no structure is sized from it, since the kernel sizes its per-CPU structures and CPU sets from `cpu_count` and `cpu_ids` is an array of `cpu_count` ids in its own pages | none | correct as is | None; a producer caps `cpu_count` at it and diagnoses the surplus |
 | `INIT_MAX_SEGMENTS` (`InitImage.segments`) | `abi/boot-protocol/src/lib.rs` | 8 | provably unreachable (the in-tree init has 4 LOAD segments on x86_64; overflow is an error) | 256 B in `BootInfo` | correct as is | None |
-| `BOOT_MODULE_NAME_LEN`, `ENTRY_NAME_LEN` | `abi/boot-protocol/src/lib.rs`, `bundle.rs` | 32 | ABI width (bundle wire format) | per module | correct as is | None: tied by a const assert in `core/boot/src/main.rs` |
+| `BOOT_MODULE_NAME_LEN`, `ENTRY_NAME_LEN` | `abi/boot-protocol/src/lib.rs`, `bundle.rs` | 32 | ABI width (bundle wire format) | per module | raise | Widen to `objsig::NAME_MAX` (256), the longest name an object is signed under, since an entry is named by its install path ([signing.md](signing.md) § Signed Attributes); the composer refuses a longer one ([#1263](https://github.com/kottlerg/seraph/issues/1263)). Tied by a const assert in `core/boot/src/main.rs` |
 | `BundleHeader.entry_count` | `abi/boot-protocol/src/bundle.rs` | `u32` | ABI width | none | correct as is | The binding cap is `MAX_BOOT_MODULES` |
 | `MAX_IOAPICS` (`KernelMmio.ioapics`) | `abi/boot-protocol/src/lib.rs` | 128 | provably unreachable on real hardware (one or a few I/O APICs per PCI Express root complex, a few dozen on the largest servers); a larger MADT is truncated with a diagnostic | 3 KiB in `BootInfo` | correct as is | None |
 | `MAX_MMIO_DIRECT_MAP_REGIONS` | `abi/boot-protocol/src/layout.rs` | `1 + MAX_IOAPICS` (129) on x86_64, 0 on riscv64 | ABI width (derived from `MAX_IOAPICS`) | about 2 KiB stack on x86_64, none on riscv64 | correct as is | None |
@@ -382,7 +383,7 @@ Tracked by [#640](https://github.com/kottlerg/seraph/issues/640).
 | `BootInfo.boot_entropy_seed` | `abi/boot-protocol/src/lib.rs` | 32 B | hardware spec (256-bit seed) | 32 B | correct as is | None |
 | `IMAGE_WINDOW_SIZE` | `abi/boot-protocol/src/layout.rs` | 2 GiB | hardware spec (small and medany code-model reach) | none | correct as is | None |
 | `INIT_MAX_NAMED_MODULES` (`InitInfo.module_names`) | `abi/init-protocol/src/lib.rs` | 85 | ABI width (equals `MAX_BOOT_MODULES`, const-asserted in the kernel) | 3400 B of the `InitInfo` header | correct as is | None |
-| `INIT_MODULE_NAME_LEN` | `abi/init-protocol/src/lib.rs` | 32 | ABI width (equals `BOOT_MODULE_NAME_LEN`) | per name | correct as is | None: tied by a const assert in `core/kernel/src/cap/mod.rs` |
+| `INIT_MODULE_NAME_LEN` | `abi/init-protocol/src/lib.rs` | 32 | ABI width (equals `BOOT_MODULE_NAME_LEN`) | per name | raise | Widen with `BOOT_MODULE_NAME_LEN` ([#1263](https://github.com/kottlerg/seraph/issues/1263)). Tied by a const assert in `core/kernel/src/cap/mod.rs` |
 | `INIT_INFO_MAX_PAGES` | `abi/init-protocol/src/lib.rs` | 64 (8,079 descriptors past the header) | ABI width (the virtual-address room the kernel leaves for the `InitInfo` region, and init's orphan-cap table, both fixed before init can allocate); no platform reaches it, since each count the region is sized from is the platform's own and bounded: coalesced RAM extents and ACPI regions by the firmware memory map, apertures by the map and firmware tables, modules by `MAX_BOOT_MODULES` (85), reclaim ranges by `MAX_RECLAIM_RANGES` (256), and real maps give tens | none (the region is allocated at the boot's size, two pages on the QEMU boots) | correct as is | None; Phase 7 halts by name past it |
 | `INIT_STACK_PAGES` | `abi/init-protocol/src/lib.rs` | 4 | provably unreachable (init's own stack, whose depth the in-tree init fixes) | 16 KiB | correct as is | None |
 | `InitInfo` count and slot fields | `abi/init-protocol/src/lib.rs` | `u64` slot handles, bases and slot counts; `u32` descriptor and module-name counts | ABI width (cap handle) | embedded | correct as is | None |

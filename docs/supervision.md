@@ -80,7 +80,10 @@ teardown, still reaches devmgr, which withdraws the driver.
 init launches only the bootstrap substrate, the services that must run before svcmgr can read a
 recipe: memmgr and procmgr, by raw syscalls; devmgr and vfsd, from boot modules through procmgr; and
 svcmgr, from the root filesystem through procmgr. devmgr and vfsd start the drivers carried as boot
-modules, which the console and the root mount need. Every other top-level service MUST be
+modules: those the root mount needs, which are part of the bootstrap closure ([Boot
+Media](boot-media.md) § The Bootstrap Closure), and the console's `serial` and `framebuffer`
+drivers, which leave the bundle for the root filesystem (design intent; not yet implemented,
+[#1267](https://github.com/kottlerg/seraph/issues/1267)). Every other top-level service MUST be
 first-launched by svcmgr from its recipe, never by init, so that one recipe defines its first launch
 and its restart, and the authority it receives is what that recipe grants. A new service adds a
 recipe under `/config/svcmgr/services/`, not an init stage. The stage-by-stage bring-up is specified
@@ -130,6 +133,13 @@ which with no actuator is the logged degraded state
 A server that dies after the check, while svcmgr's next call to it waits unreceived, leaves svcmgr
 blocked: a call on an endpoint none of whose receivers is left never returns (#1185).
 
+The root filesystem's driver and the driver of the disk under it never restart, and the root is not
+remounted in a running system ([Boot Media](boot-media.md) § Bootstrap-Only Boot Copies). The loss
+of either is system death through vfsd: the death of the root mount's driver, or the loss of its
+disk (devmgr withdraws the disk when its driver dies or the device is removed), ends vfsd, whose
+death svcmgr routes to the graceful shutdown above ([Storage § Failure and Revocation
+Invariants](storage.md#failure-and-revocation-invariants)).
+
 The path from a core or critical death to power-off MUST NOT depend on the service that died. svcmgr
 and pwrmgr are demand-paged on memmgr (memmgr and procmgr are pinned by construction, per
 [Fault Handling § Default System Pager](fault-handling.md#default-system-pager)), so whether a
@@ -164,8 +174,8 @@ capabilities name, or its recipe states why its loss is critical.
 | timed, pwrmgr | svcmgr | persistent endpoint, held by svcmgr |
 | logd | svcmgr | persistent endpoint (the master log endpoint), held by svcmgr ([Restart Protocol § Supervision hierarchy](../services/svcmgr/docs/restart-protocol.md#supervision-hierarchy)) |
 | crashd | svcmgr | persistent endpoint (procmgr's crash endpoint), held by procmgr, which declines faults while no crash service is registered and hands the endpoint to the restarted crashd when it registers ([crashd Operation § Startup](../services/crashd/docs/operation.md#startup)) |
-| drivers | devmgr | none today; the shape is chosen per driver (design intent; not yet implemented, #1077); the IOMMU driver (#1079) |
-| fs drivers | vfsd | none today; revoke and re-resolve (design intent; not yet implemented, #1078) |
+| drivers | devmgr | none today; the shape is chosen per driver (design intent; not yet implemented, #1077); the IOMMU driver (#1079); the driver of the root filesystem's disk never restarts (§ Core Set and System Death) |
+| fs drivers | vfsd | none today; revoke and re-resolve (design intent; not yet implemented, #1078); the root filesystem's driver never restarts (§ Core Set and System Death) |
 
 ---
 
@@ -235,8 +245,9 @@ Each item below is specified above or in the document it names, and is not yet i
 - pwrmgr observes svcmgr and powers off on its death (§ Observing svcmgr): #262.
 - A test of each core and critical death, on a power-off path that does not depend on the dying
   service (§ Core Set and System Death): #262.
-- devmgr restarts drivers: #1077. The IOMMU driver survives and restarts: #1079.
-- vfsd restarts fs drivers by revoke and re-resolve: #1078.
+- devmgr restarts drivers, the driver of the root filesystem's disk apart: #1077. The IOMMU driver
+  survives and restarts: #1079.
+- vfsd restarts fs drivers by revoke and re-resolve, the root filesystem's driver apart: #1078.
 - procmgr tears down the processes a dead pager other than memmgr served: #226.
 - sessiond supervises every session, and oomd stops a session's programs before any service
   ([Session Supervision](session-supervision.md)): #1233.
@@ -245,7 +256,8 @@ Each item below is specified above or in the document it names, and is not yet i
 
 ## Summarized By
 
-[Architecture Overview](architecture.md), [Process Lifecycle](process-lifecycle.md),
+[Architecture Overview](architecture.md), [Boot Media](boot-media.md),
+[Process Lifecycle](process-lifecycle.md),
 [Session Supervision](session-supervision.md),
 [services/procmgr/README.md](../services/procmgr/README.md),
 [services/pwrmgr/README.md](../services/pwrmgr/README.md),

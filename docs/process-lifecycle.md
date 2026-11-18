@@ -187,6 +187,12 @@ all svcmgr-supervised services live on disk at
 `/config/svcmgr/services/<name>.svc`, not on the wire — see
 [`services/svcmgr/docs/service-definitions.md`](../services/svcmgr/docs/service-definitions.md).
 
+A boot module runs only during bootstrap: devmgr starts its driver modules in its IOMMU and boot
+passes and vfsd its `fatfs` module for the root mount, each deletes its copy of a module once it
+has started the process, and init donates the modules' sources at its reap (below). Every later
+start of a process, a further instance of one that booted included, is from its installed path on
+the root filesystem ([boot-media.md](boot-media.md) § Bootstrap-Only Boot Copies).
+
 ### Init reap
 
 Before signalling `svcmgr_labels::HANDOVER_COMPLETE`, init moves its own
@@ -620,8 +626,9 @@ Handling](fault-handling.md#delivery-resume-and-kill)).
 [Scheduler Internals](../core/kernel/docs/scheduler.md),
 [SMP Scheduling and Locking Invariants](../core/kernel/docs/scheduling-internals.md),
 [Syscall Interface Specification](../core/kernel/docs/syscalls.md),
-[Architecture Overview](architecture.md), [System Bootstrap](bootstrap.md),
-[Capability Model](capability-model.md), [Fault Handling](fault-handling.md),
+[Architecture Overview](architecture.md), [Boot Media](boot-media.md),
+[System Bootstrap](bootstrap.md), [Capability Model](capability-model.md),
+[Fault Handling](fault-handling.md),
 [Session Supervision](session-supervision.md), [Supervision](supervision.md), [Testing](testing.md),
 [Userspace Memory Model](userspace-memory-model.md),
 [programs/pipefault/README.md](../programs/pipefault/README.md),

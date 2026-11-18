@@ -545,7 +545,8 @@ auto-reap path). logd's death `EventQueue` has no death-observer nodes and
 nothing binds it: once logd's
 [`REGISTER_DEATH_EQ`](../../procmgr/docs/ipc-interface.md) has stored it in
 procmgr's `LOGD_DEATH_EQ` static, every teardown procmgr runs (the reap of
-a death event, its death resync, and `DESTROY_PROCESS`) posts the death
+a death event, its death resync, and a destroy, `DESTROY_PROCESS` or
+`DESTROY_CHILD`, for each process of the subtree it destroys) posts the death
 entry `(exit_reason, process badge)` to it. A process torn down before the
 registration posts nothing. A restarted logd's registration replaces the dead
 instance's queue, so its fresh table hears every death after it.

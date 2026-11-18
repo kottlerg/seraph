@@ -106,8 +106,8 @@ Every hardware access of the evaluator goes through devmgr ([devmgr.md](devmgr.m
   remembered and not asked for again. A memory write is
   followed by an MMIO ordering barrier.
 - A configuration-space access is one `ACPI_PCI_CONFIG` call.
-- `Notify` is kept, at most `MAX_NOTES` (32) per evaluation, a later one logged and dropped, and
-  acted on once the evaluation ends: a hotplug event of a slot below a PCI-to-PCI bridge is posted
+- A `Notify` of a hotplug event is kept, once per object and event, and acted on once the
+  evaluation ends: a hotplug event of a slot below a PCI-to-PCI bridge is posted
   to devmgr ([README.md](../README.md) § Hotplug), any other `Notify` logged and dropped. On QEMU
   q35 the ACPI PCI hotplug GPE's method (`\_GPE._E01`) notifies the slots that changed.
 - The Global Lock is refused: devmgr refuses acpid the FACS, so a field whose access rule takes

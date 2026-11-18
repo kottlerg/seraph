@@ -60,6 +60,53 @@ impl Event
     }
 }
 
+/// A `Notify` the evaluated code made: the object's absolute path, root
+/// first, and the value.
+pub type Note = (Vec<Seg>, u64);
+
+/// What [`keep`] did with a `Notify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept
+{
+    /// Kept for the evaluation thread.
+    Kept,
+    /// Not kept: the notes hold the same event of the same object already.
+    Repeat,
+    /// Not kept: its value is no hotplug event ([`Event::of`]).
+    NotHotplug,
+    /// Not kept: no memory was left to keep it.
+    NoMemory,
+}
+
+/// Keep the `Notify` of `path` with `value` in `notes`, for the evaluation
+/// thread to act on once the evaluation ends: a hotplug event ([`Event::of`])
+/// that `notes` does not hold for the same object already. `notes` thus
+/// holds at most one note per object and event, a bound the namespace's
+/// objects set, and no event the firmware reports once (a device check,
+/// whose QEMU register clears as the method reads it) is lost to a bound.
+pub fn keep(notes: &mut Vec<Note>, path: &[Seg], value: u64) -> Kept
+{
+    let Some(event) = Event::of(value)
+    else
+    {
+        return Kept::NotHotplug;
+    };
+    if notes
+        .iter()
+        .any(|(at, held)| at.as_slice() == path && Event::of(*held) == Some(event))
+    {
+        return Kept::Repeat;
+    }
+    let mut copy = Vec::new();
+    if notes.try_reserve(1).is_err() || copy.try_reserve_exact(path.len()).is_err()
+    {
+        return Kept::NoMemory;
+    }
+    copy.extend_from_slice(path);
+    notes.push((copy, value));
+    Kept::Kept
+}
+
 /// The node of the absolute path `path`, root first, as the evaluator hands
 /// a `Notify` target to its host.
 #[must_use]
@@ -459,5 +506,39 @@ mod tests
             OST_EJECT_NOT_SUPPORTED
         );
         assert_eq!(ost_status(Event::Eject, Outcome::Failed), OST_FAILURE);
+    }
+
+    #[test]
+    fn a_note_is_kept_once_per_object_and_hotplug_event()
+    {
+        let slot: [Seg; 4] = [*b"_SB_", *b"PCI0", *b"SE0_", *b"S00_"];
+        let other: [Seg; 4] = [*b"_SB_", *b"PCI0", *b"SE0_", *b"S08_"];
+        let mut notes = Vec::new();
+        assert_eq!(keep(&mut notes, &slot, DEVICE_CHECK), Kept::Kept);
+        // A Bus Check is the same event as a Device Check.
+        assert_eq!(keep(&mut notes, &slot, BUS_CHECK), Kept::Repeat);
+        assert_eq!(keep(&mut notes, &slot, EJECT_REQUEST), Kept::Kept);
+        assert_eq!(keep(&mut notes, &slot, EJECT_REQUEST), Kept::Repeat);
+        assert_eq!(keep(&mut notes, &other, DEVICE_CHECK), Kept::Kept);
+        // Device Wake, and a value past the hotplug ones, are not kept.
+        assert_eq!(keep(&mut notes, &slot, 2), Kept::NotHotplug);
+        assert_eq!(keep(&mut notes, &slot, 0x80), Kept::NotHotplug);
+        assert_eq!(
+            notes,
+            vec![
+                (slot.to_vec(), DEVICE_CHECK),
+                (slot.to_vec(), EJECT_REQUEST),
+                (other.to_vec(), DEVICE_CHECK)
+            ]
+        );
+        // Many slots, each notified once, are all kept: no fixed bound
+        // drops a device check.
+        let mut many = Vec::new();
+        for device in 0..=255u8
+        {
+            let path = [*b"_SB_", *b"PCI0", [b'S', b'0', b'0', device]];
+            assert_eq!(keep(&mut many, &path, DEVICE_CHECK), Kept::Kept);
+        }
+        assert_eq!(many.len(), 256);
     }
 }

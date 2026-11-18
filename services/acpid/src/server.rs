@@ -342,10 +342,10 @@ fn notes(
     for (target, value) in platform.take_notes()
     {
         let at = path_text(&target);
+        // The host keeps only hotplug events (`hotplug::keep`).
         let Some(event) = Event::of(value)
         else
         {
-            std::os::seraph::log!(debug: "Notify({at}, {value:#x}) dropped: not a hotplug event");
             continue;
         };
         let Some(slot) = hotplug::target(ns, &target)

@@ -18,9 +18,8 @@ enumerates every kind of device record of § Device Records (PCI, the ACPI names
 the boot framebuffer, a platform description table, the IOMMU family), matches the declarations
 against the records (§ Matching), binds each matched PCI, platform, and IOMMU record through one
 path that delivers the resource list (§ Binding), and withdraws a bound driver in the order
-§ Binding gives. PCI Express native hotplug's add and removal paths are implemented; the ACPI
-hotplug source is design intent, not yet implemented (§ Hotplug,
-[#1096](https://github.com/kottlerg/seraph/issues/1096)).
+§ Binding gives. Both hotplug sources are implemented: PCI Express native hotplug, and the
+firmware's ACPI PCI hotplug, whose events acpid posts to devmgr (§ Hotplug).
 
 Device classes (§ Device Classes) are implemented: class SENDs, `QUERY_DEVICE`,
 `MINT_CLASS_SEND`, the class files, and the boot-only mark.

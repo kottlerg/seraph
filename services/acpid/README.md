@@ -163,7 +163,7 @@ On x86-64 q35 with QEMU's ACPI PCI hotplug on, its default, the firmware drives 
 behind its root ports: `_OSC` withholds native hotplug control, and devmgr leaves each such slot to
 it ([devmgr's hotplug.md](../devmgr/docs/hotplug.md#acpi-hotplug) § ACPI Hotplug). The firmware's
 GPE method (`\_GPE._E01`) notifies the device of each slot that changed. acpid keeps the
-`Notify` calls a method makes, at most `MAX_NOTES` (32) per method
+`Notify` calls of hotplug events a method makes, once per object and event
 ([docs/limits.md](../../docs/limits.md)), and after the method acts on each:
 
 - a Bus Check (0) or a Device Check (1) is a device check, an Eject Request (3) an eject request;

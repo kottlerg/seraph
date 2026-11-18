@@ -11,9 +11,9 @@
 //! use; acpid binds the `IoPort` to the evaluation thread or maps the
 //! `Mmio`, and keeps the grant. A refused span is kept too, so it is asked
 //! for once. A configuration-space access is one
-//! `ACPI_PCI_CONFIG` call. Each `Notify` is kept, up to [`MAX_NOTES`], for
-//! the evaluation thread to act on once the evaluation ends
-//! ([`Platform::take_notes`]). acpid holds no Global Lock, since devmgr
+//! `ACPI_PCI_CONFIG` call. Each `Notify` of a hotplug event is kept, once
+//! per object and event ([`hotplug::keep`]), for the evaluation thread to
+//! act on once the evaluation ends ([`Platform::take_notes`]). acpid holds no Global Lock, since devmgr
 //! refuses the FACS, so the evaluator's acquisition fails.
 
 use std::time::{Duration, Instant};
@@ -23,21 +23,13 @@ use aml::host::{Host, HostError, PciAddress, Span, Width};
 use ipc::devmgr_labels;
 use std::os::seraph::reserve_pages;
 
+use acpid::hotplug::{self, Kept, Note};
+
 use crate::arch;
 use crate::devmgr::{CallError, Devmgr};
 
 /// The page size of an `Mmio` grant.
 const PAGE_SIZE: u64 = 0x1000;
-
-/// The most `Notify` calls kept between two takes
-/// ([`Platform::take_notes`]); a later one is logged and dropped
-/// (`docs/limits.md`). A QEMU GPE method notifies one device per slot with a
-/// pending event, at most 32 per bus.
-pub const MAX_NOTES: usize = 32;
-
-/// A `Notify` the evaluated code made: the object's absolute path, root
-/// first, and the value.
-pub type Note = (Vec<Seg>, u64);
 
 /// A region devmgr granted, held for acpid's lifetime.
 struct Held
@@ -364,16 +356,19 @@ impl Host for Platform<'_>
 
     fn notify(&mut self, path: &[Seg], value: u64) -> Result<(), HostError>
     {
-        if self.notes.len() >= MAX_NOTES || self.notes.try_reserve(1).is_err()
+        match hotplug::keep(&mut self.notes, path, value)
         {
-            std::os::seraph::log!(
-                warn: "Notify({}, {value:#x}) dropped: {} wait already",
-                path_text(path),
-                self.notes.len()
-            );
-            return Ok(());
+            Kept::Kept | Kept::Repeat =>
+            {}
+            Kept::NotHotplug => std::os::seraph::log!(
+                debug: "Notify({}, {value:#x}) dropped: not a hotplug event",
+                path_text(path)
+            ),
+            Kept::NoMemory => std::os::seraph::log!(
+                warn: "Notify({}, {value:#x}) dropped: no memory to keep it",
+                path_text(path)
+            ),
         }
-        self.notes.push((path.to_vec(), value));
         Ok(())
     }
 

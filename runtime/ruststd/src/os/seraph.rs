@@ -2356,15 +2356,13 @@ pub mod process {
                 ended: None,
             };
             for (index, role) in [Role::Writer, Role::Reader, Role::Reader].into_iter().enumerate() {
-                // An error drops `this`, whose ends then return their rings:
-                // no leader has them.
+                // An error drops `this` while no release is armed, so each
+                // end made before it returns its ring when dropped: no
+                // leader has them.
                 let (mut pipe, caps) = Pipe::create_for_child(role)?;
                 pipe.set_peer_dead(this.peer_dead.clone());
                 if let Some(wake) = this.wakes.get_mut(index) {
                     *wake = (pipe.data_notification_cap(), pipe.space_notification_cap());
-                }
-                if let Some(release) = this.releases.get_mut(index) {
-                    *release = pipe.arm_ring_release();
                 }
                 if let Some(slot) = this.handoff.get_mut(index) {
                     *slot = Some(caps);
@@ -2375,6 +2373,13 @@ pub mod process {
                     1 => this.stdout = pipe,
                     _ => this.stderr = pipe,
                 }
+            }
+            // From here a leader may map the rings, so each ring returns only
+            // once its end is dropped and the peer is reported gone
+            // (`Self::wait` or `Self::refused`).
+            let ends = [&this.stdin, &this.stdout, &this.stderr];
+            for (release, end) in this.releases.iter_mut().zip(ends) {
+                *release = end.as_ref().and_then(|pipe| pipe.arm_ring_release());
             }
             Ok(this)
         }

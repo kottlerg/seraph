@@ -282,7 +282,7 @@ fn boot(
     let qemu_binary = require_tool(args.arch.qemu_binary())?;
 
     step(&format!(
-        "hotplug test: booting with an empty root port, hotplug control {control:?}"
+        "hotplug test: booting with two empty root ports, hotplug control {control:?}"
     ));
     let mut child = Command::new(&qemu_binary)
         .args(&qemu_args)

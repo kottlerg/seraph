@@ -1134,12 +1134,14 @@ declaration, its runtime having sent no registration, or its registration having
 the registry's bound or for procmgr's heap, keeps a binding: the one it copied, or procmgr's under
 the process badge when that was a debugger's (Label 22).
 The senders are the processes a stop of which would hold a debug-authority holder, which waits on
-them for its log output or its own progress: the serial and framebuffer drivers, which logd calls
-with no bound for every line, the debug port's virtio-console driver, through which the GDB stub
+them for its own progress: the debug port's virtio-console driver, through which the GDB stub
 reaches its host for every packet, and every debug-authority holder, so none attaches to itself.
 logd does not declare: every log call to it is bounded, so a holder that stops it waits on its own
-log output for at most that bound. Replies `SUCCESS`, or `INVALID_BADGE` when
-the badge names no live process or the request came on a process handle.
+log output for at most that bound. Nor do the serial and framebuffer drivers: no thread of logd's
+but a sink's own writer waits on either for longer than `SINK_STALL_MS`
+([logd IPC interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks). Replies
+`SUCCESS`, or `INVALID_BADGE` when the badge names no live process or the request came on a
+process handle.
 
 Any process may declare itself, on its own cap alone: the badge names the sender, and the process
 handle its creator holds carries `procmgr_labels::PROCESS_HANDLE_TAG`, on which procmgr refuses the

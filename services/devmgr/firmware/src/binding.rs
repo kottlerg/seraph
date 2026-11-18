@@ -65,6 +65,30 @@ pub struct RecordKeys<'a>
     pub boot_framebuffer: bool,
 }
 
+/// The ACPI IDs that reserve resources for the firmware and the chipset
+/// rather than name a device a driver drives: `PNP0A05` and `PNP0A06`, the
+/// generic container devices, `PNP0C02`, motherboard resources, and
+/// `ACPI0004`, the module device.
+pub const CONTAINER_IDS: [&[u8]; 4] = [b"PNP0A05", b"PNP0A06", b"PNP0C02", b"ACPI0004"];
+
+/// Whether `record` is a resource container: its ACPI `_HID` and each
+/// `_CID` are [`CONTAINER_IDS`], and it has no other key. Its resources are
+/// the firmware's own registers (on QEMU, the PCI and CPU hotplug blocks the
+/// AML reads): no pass binds it, and devmgr grants acpid its ranges
+/// (docs/driver-binding.md § Device Records).
+#[must_use]
+pub fn container(record: &RecordKeys<'_>) -> bool
+{
+    let is = |id: &[u8]| CONTAINER_IDS.contains(&id);
+    record.acpi_hid.is_some_and(is)
+        && record.acpi_cids.iter().all(|id| is(id))
+        && record.pci.is_none()
+        && record.spcr.is_none()
+        && record.platform.is_none()
+        && record.iommu_family.is_none()
+        && !record.boot_framebuffer
+}
+
 /// How specific a match is: 1 is the most specific, 6 the least
 /// (docs/driver-binding.md § Matching).
 pub type Rank = u8;
@@ -502,6 +526,35 @@ mod tests
             }),
             ..RecordKeys::default()
         }
+    }
+
+    #[test]
+    fn only_a_record_of_container_ids_alone_is_a_container()
+    {
+        let keys = |hid: Option<&'static [u8]>, cids: &'static [&'static [u8]]| RecordKeys {
+            pci: None,
+            acpi_hid: hid,
+            acpi_cids: cids,
+            spcr: None,
+            platform: None,
+            iommu_family: None,
+            boot_framebuffer: false,
+        };
+        // QEMU's PCI and CPU hotplug blocks: PNP0A06.
+        assert!(container(&keys(Some(b"PNP0A06"), &[])));
+        assert!(container(&keys(Some(b"PNP0C02"), &[b"PNP0A05"])));
+        assert!(container(&keys(Some(b"ACPI0004"), &[])));
+        // A device's ID, as HID or beside a container CID, is not one.
+        assert!(!container(&keys(Some(b"PNP0501"), &[])));
+        assert!(!container(&keys(Some(b"PNP0C02"), &[b"PNP0501"])));
+        assert!(!container(&keys(None, &[b"PNP0C02"])));
+        // Any other key makes it a device a driver may match.
+        let mut spcr = keys(Some(b"PNP0A06"), &[]);
+        spcr.spcr = Some(3);
+        assert!(!container(&spcr));
+        let mut platform = keys(Some(b"PNP0A06"), &[]);
+        platform.platform = Some(b"virt-rtc");
+        assert!(!container(&platform));
     }
 
     #[test]

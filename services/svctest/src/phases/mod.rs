@@ -39,6 +39,8 @@
 //!    history before it ([`procmgr::logd_forward`], [`log_client`]): it
 //!    kills logd, whose next instance holds a fresh table, and runs the
 //!    [`procmgr::logd_forward`] check again against it.
+//! 10. [`logd_sinks`] after [`drivers`] and every phase that uses the
+//!     framebuffer driver: it kills that driver, which nothing restarts.
 
 use crate::runner::Phase;
 
@@ -56,6 +58,7 @@ pub mod heap_commit;
 pub mod layout;
 pub mod log_client;
 pub mod logd_restart;
+pub mod logd_sinks;
 pub mod memmgr;
 pub mod namespace;
 pub mod node_handle;
@@ -120,6 +123,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());
     out.extend_from_slice(drivers::phases());
+    out.extend_from_slice(logd_sinks::phases());
     out.extend_from_slice(acpi::phases());
     out.extend_from_slice(vfsd::phases());
     out.extend_from_slice(unmount::phases());

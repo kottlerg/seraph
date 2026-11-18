@@ -58,7 +58,9 @@ pub struct Grant
     pub len: u64,
 }
 
-/// acpid's SEND on devmgr's registry endpoint.
+/// acpid's SEND on devmgr's registry endpoint; each thread that calls
+/// through it calls from its own IPC buffer.
+#[derive(Clone)]
 pub struct Devmgr
 {
     registry: u64,
@@ -145,6 +147,16 @@ impl Devmgr
             &[op, function, offset, width, value],
         )
         .map(|reply| reply.word(0))
+    }
+
+    /// Ask devmgr to run the hotplug job of the slot below the port
+    /// `port` (`devmgr_labels::pci_function`) for `event`
+    /// (`devmgr_labels::HOTPLUG_ADDED` or `HOTPLUG_REMOVED`). Returns once
+    /// the job ended, with the functions it recorded or removed.
+    pub fn hotplug(&self, event: u64, port: u64) -> Result<u64, CallError>
+    {
+        self.call(devmgr_labels::ACPI_HOTPLUG, &[event, port])
+            .map(|reply| reply.word(0))
     }
 
     /// Push one bridge's results with `label`: `words` follow its segment

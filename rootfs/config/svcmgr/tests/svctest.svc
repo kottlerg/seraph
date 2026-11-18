@@ -17,13 +17,15 @@
 # svcmgr_second_seed_round phase fails the run if they do not arrive.
 # logd.query is the LOG_QUERY_AUTHORITY SEND on the master log endpoint the
 # logd_death_forward phase reads its dead child's retired slot through, and
-# the logd_restart phase reads the restarted logd's history through.
+# the logd_restart and logd_sinks phases read logd's history through.
 # devmgr.class.serial and devmgr.class.input are the class SENDs the
 # drivers stray-cap phase and the devmgr ordinal phase query devices on.
 # devmgr.class.test-dma and devmgr.class.test-fault reach the test-only
 # fixtures, and devmgr.class.{serial,input,framebuffer}-deny are SENDs on
 # those classes whose only verb bit (58) no such driver checks, which the
-# drivers deny phase sends the gated labels on. Their class files live in
+# drivers deny phase sends the gated labels on, and the logd_sinks phase
+# waits on framebuffer-deny for the killed framebuffer driver's
+# withdrawal. Their class files live in
 # /config/devmgr/tests/, which svcmgr does not scan, and are copied into
 # /config/devmgr/classes/ with this recipe; the fixtures' devices are
 # attached by `cargo xtask run --test-devices`.
@@ -38,7 +40,9 @@
 # crash_endpoint phase registers with it as the crash service, which the
 # svctest boot, staging no crashd, leaves free (burn-in's svctest cell
 # stages crashd, and the phase then checks only the refusal); the
-# logd_restart phase kills logd through an attach with it.
+# logd_restart phase kills logd through an attach with it, and the
+# logd_sinks phase stops the serial and framebuffer drivers and kills the
+# framebuffer driver the same way.
 # stop_authority = yes delivers svcmgr's STOP_AUTHORITY SEND in the slot
 # after that, which the svcmgr_stop_service phase stops and lists services
 # through.

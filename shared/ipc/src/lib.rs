@@ -2788,7 +2788,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 23;
+pub const DEVMGR_LABELS_VERSION: u32 = 24;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -3249,6 +3249,34 @@ pub mod devmgr_labels
     /// covered. Replies [`super::devmgr_errors::NO_DEVICE`] past the last
     /// bridge.
     pub const QUERY_HOST_BRIDGE: u64 = 30;
+
+    /// A hotplug event of a slot whose firmware drives hotplug, from acpid:
+    /// the `Notify` of a device below a PCI Express port, which acpid
+    /// resolved to the port (services/acpid/README.md § Hotplug). devmgr runs
+    /// the slot's add or removal job (services/devmgr/docs/hotplug.md) and
+    /// replies once it is done, so a removal's reply tells acpid it may run
+    /// `_EJ0`.
+    ///
+    /// Request: `data[0]` = caller's compiled [`super::DEVMGR_LABELS_VERSION`];
+    /// `data[1]` = [`HOTPLUG_ADDED`] or [`HOTPLUG_REMOVED`]; `data[2]` = the
+    /// port's address, packed as [`pci_function`] packs it. Caller's badge
+    /// MUST carry [`ACPI_AUTHORITY`]; the handler replies
+    /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
+    ///
+    /// Reply ([`super::devmgr_errors::SUCCESS`]): `data[0]` = the functions
+    /// the job recorded or removed; an add on a slot whose functions are
+    /// recorded already records none. [`super::devmgr_errors::NO_DEVICE`],
+    /// logged, when the port is not a hotplug slot devmgr's boot scan found;
+    /// [`super::devmgr_errors::REFUSED`], logged, when the slot's hotplug is
+    /// not the firmware's (devmgr manages it natively, has no grant for it
+    /// yet, or could not hold it); [`super::devmgr_errors::INVALID_REQUEST`]
+    /// for an unknown event, a short request, or a malformed address.
+    pub const ACPI_HOTPLUG: u64 = 31;
+    /// [`ACPI_HOTPLUG`] event: a card is present in the slot (a device check).
+    pub const HOTPLUG_ADDED: u64 = 0;
+    /// [`ACPI_HOTPLUG`] event: the slot's card is to be ejected (an eject
+    /// request).
+    pub const HOTPLUG_REMOVED: u64 = 1;
 
     /// Mint a class SEND: a SEND on the registry endpoint whose badge names
     /// a device class and the verb bits its [`QUERY_DEVICE`] replies carry

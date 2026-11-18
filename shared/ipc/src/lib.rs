@@ -833,8 +833,8 @@ pub mod procmgr_labels
     /// [`ATTACH_PROCESS`] and [`REGISTER_THREAD`] on it from then on, so no
     /// [`DEBUG_AUTHORITY`] holder stops it. Sent, before
     /// it spawns a thread, by each process a stop of which would deadlock a
-    /// debug-authority holder: the serial and framebuffer drivers, the debug
-    /// port's driver, and every debug-authority holder. No
+    /// debug-authority holder: the debug port's driver and every
+    /// debug-authority holder. No
     /// data, no caps. Replies `SUCCESS`, or
     /// `INVALID_BADGE` when the badge names no live process or carries
     /// [`PROCESS_HANDLE_TAG`]. Specified in

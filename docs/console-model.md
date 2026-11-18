@@ -80,7 +80,9 @@ direct console paths remain as fallbacks for the life of the system.
    bounded queue drained by one writer thread, the only logd thread that waits on the driver. A
    line's producer waits for its write for at most `SINK_STALL_MS`, so a driver that is stopped
    or dead holds the log stream for that bound once and then costs it nothing until it writes
-   again; the panic sink's direct calls are bounded the same way
+   again. A sink whose writer logd could not spawn is written by each line's producer instead, and
+   a stopped driver then costs every line up to that bound. The panic sink's direct calls are
+   bounded the same way
    ([services/logd/docs/ipc-interface.md](../services/logd/docs/ipc-interface.md#output-sinks)
    § Output sinks). Outside the serial driver, UART hardware authority is held only
    by init, whose init-logd thread uses it (on riscv64 until init-logd exits after the handover and

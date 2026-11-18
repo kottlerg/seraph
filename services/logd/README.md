@@ -53,19 +53,18 @@ after the restart included (see [`docs/ipc-interface.md`](docs/ipc-interface.md)
   output routes to the serial driver through a
   `std::os::seraph::set_panic_sink` sink rather than the log endpoint,
   and logd deletes its procmgr-seeded `ProcessInfo.log_send_cap` at
-  startup so no path can self-IPC. Each line reaches the driver through the serial sink, a
-  bounded queue drained by one writer thread, the only logd thread that waits on the driver: a
-  line's producer waits for its write for at most `SINK_STALL_MS`, and past that the sink is
-  stalled and its lines queued, then dropped and counted, until the driver writes again, so a
-  driver that is stopped by a debugger or dead does not hold the log stream (see
-  [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls the
-  driver directly, each call bounded by the same bound. The emit path never calls devmgr: while
-  no driver is resolved, serial output is dropped while history still accrues; early-boot
-  output is covered by init-logd's direct-UART fallback. logd holds its
-  own diagnostics until init-logd, which writes the UART directly, has
-  acknowledged the handover release, so the two never write a line at
-  once (see [`docs/handover-protocol.md`](docs/handover-protocol.md)
-  § Startup ordering). See
+  startup so no path can self-IPC. Each line reaches the driver through the serial sink, a bounded
+  queue drained by one writer thread, the only logd thread that waits on the driver: a line's
+  producer waits for its write for at most `SINK_STALL_MS`, and past that the sink is stalled and
+  its lines queued, then dropped and counted, until the driver writes again, so a driver that is
+  stopped by a debugger or dead does not hold the log stream; a sink whose writer could not be
+  spawned is written by each line's producer, and a stopped driver then costs every line up to that
+  bound (see [`docs/ipc-interface.md`](docs/ipc-interface.md) § Output sinks). The panic sink calls
+  the driver directly, each call bounded by the same bound. The emit path never calls devmgr: while
+  no driver is resolved, serial output is dropped while history still accrues; early-boot output is
+  covered by init-logd's direct-UART fallback. logd holds its own diagnostics until init-logd, which
+  writes the UART directly, has acknowledged the handover release, so the two never write a line at
+  once (see [`docs/handover-protocol.md`](docs/handover-protocol.md) § Startup ordering). See
   [docs/console-model.md](../../docs/console-model.md).
 
 * **Driver-mediated framebuffer mirror.** logd also mirrors each line

@@ -23,8 +23,9 @@
 //! No step names a driver. What a bound driver is given follows from its
 //! declaration (its interrupt need, whether it performs DMA, its reset, its
 //! tier, within the bounds of its source) and from the record (its BARs, its
-//! wired line, and, for a function that presents the `VirtIO` register
-//! layout, that layout).
+//! wired line, and, for a driver that declares the `VirtIO` status reset,
+//! the function's `VirtIO` register layout for the device configuration the
+//! declaration states).
 
 use driver_binding::decl::{DriverDecl, InterruptNeed, Reset};
 use driver_binding::resources::{InterruptKind, Resource};
@@ -953,9 +954,9 @@ fn bind_pci(
 }
 
 /// Carve what the driver `decl` declares of the PCI function `pci_dev`, and
-/// turn the function on for it: caps on its MMIO BARs (for a function that
-/// presents the `VirtIO` register layout, the BARs the layout names, each
-/// clipped to the pages its regions reach; otherwise every MMIO BAR, whole),
+/// turn the function on for it: caps on its MMIO BARs (for a driver of the
+/// `VirtIO` register layout, the BARs the layout names, each clipped to the
+/// pages its regions reach; otherwise every MMIO BAR, whole),
 /// less the pages holding the function's MSI-X table and Pending Bit Array
 /// where it may be given MSI-X ([`firmware::pci::deliverable_messages`]),
 /// which no driver is delivered ([`carve_bars`]); its configuration page, its
@@ -973,21 +974,13 @@ fn carve_pci_device(
     carve: &mut Carve,
 ) -> Option<PciDeviceCaps>
 {
-    // A driver that declares the VirtIO status reset drives the VirtIO
-    // register layout; a function that presents no complete layout (one of
-    // the four regions missing, VirtIO 1.2 § 4.1.4, or a common region too
-    // short for the registers the transport addresses) could neither be set
-    // up by it nor reset when it is withdrawn.
-    if decl.reset == Reset::VirtioStatus && pci_dev.virtio_info.register_layout().is_none()
+    let Ok(virtio) = virtio_layout(name, pci_dev, decl)
+    else
     {
-        std::os::seraph::log!(
-            warn: "{}: the device presents no complete VirtIO register layout; not bound",
-            name
-        );
         return None;
-    }
+    };
     let (msi, msix) =
-        firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, &pci_dev.virtio_info);
+        firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, virtio.as_ref());
     let spans = msix.map(|m| m.withheld());
     let withheld = spans.as_ref().map_or(&[][..], |w| w.as_slice());
     let Some(mut dev) = PciDeviceCaps::empty(carve.caps.self_aspace)
@@ -996,7 +989,15 @@ fn carve_pci_device(
         std::os::seraph::log!(warn: "{}: no memory for the device's resources; not bound", name);
         return None;
     };
-    if carve_bars(name, pci_dev, withheld, carve.caps, &mut dev).is_none()
+    if carve_bars(
+        name,
+        pci_dev,
+        virtio.as_ref(),
+        withheld,
+        carve.caps,
+        &mut dev,
+    )
+    .is_none()
     {
         dev.release();
         return None;
@@ -1008,7 +1009,7 @@ fn carve_pci_device(
         return None;
     };
     dev.config = config;
-    let Some(badge) = catalog_entry(pci_dev, carve.catalog)
+    let Some(badge) = catalog_entry(pci_dev, virtio.as_ref(), carve.catalog)
     else
     {
         std::os::seraph::log!(warn: "{}: catalog entry not added; not bound", name);
@@ -1051,10 +1052,13 @@ fn carve_pci_device(
     {
         Reset::None => StopReset::None,
         Reset::PcieFlr => StopReset::Flr,
-        Reset::VirtioStatus =>
+        Reset::VirtioStatus { .. } =>
         {
-            let reset =
-                DeviceReset::for_device(&pci_dev.virtio_info, dev.resources(), dev.config.aspace);
+            // The layout is `Some`: a VirtIO status reset without one was
+            // refused above.
+            let reset = virtio
+                .as_ref()
+                .and_then(|l| DeviceReset::for_device(l, dev.resources(), dev.config.aspace));
             if reset.is_none()
             {
                 std::os::seraph::log!(
@@ -1076,12 +1080,49 @@ fn carve_pci_device(
     Some(dev)
 }
 
-/// Add `pci_dev`'s catalog entry and return its device badge: the `VirtIO`
-/// startup info for a function that presents the `VirtIO` register layout,
-/// no startup info otherwise. `None` when the catalog cannot hold it.
-fn catalog_entry(pci_dev: &pci::PciDevice, catalog: &mut DeviceCatalog) -> Option<u64>
+/// The `VirtIO` register layout the driver `decl` is given of the PCI
+/// function `pci_dev`: `Ok(None)` for a driver that declares no `VirtIO`
+/// status reset, which is given none, whatever the function presents. A
+/// driver that declares it drives the layout, with the device-specific
+/// configuration region its declaration requires or without it; a function
+/// that presents no complete layout of those regions (one missing, `VirtIO`
+/// 1.2 § 4.1.4, or a common region too short for the registers the transport
+/// addresses) could neither be set up by it nor reset when it is withdrawn,
+/// and is refused: `Err`, logged under `name`.
+fn virtio_layout(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    decl: &DriverDecl,
+) -> Result<Option<virtio_core::RegisterLayout>, ()>
 {
-    if pci_dev.virtio_info.register_layout().is_none()
+    let Some(device_config) = decl.reset.virtio_device_config()
+    else
+    {
+        return Ok(None);
+    };
+    let layout = pci_dev.virtio_info.register_layout(device_config);
+    if layout.is_none()
+    {
+        std::os::seraph::log!(
+            warn: "{}: the device presents no complete VirtIO register layout; not bound",
+            name
+        );
+        return Err(());
+    }
+    Ok(layout)
+}
+
+/// Add `pci_dev`'s catalog entry and return its device badge: the `VirtIO`
+/// startup info for a function whose driver is given the `VirtIO` register
+/// layout `virtio`, no startup info otherwise. `None` when the catalog
+/// cannot hold it.
+fn catalog_entry(
+    pci_dev: &pci::PciDevice,
+    virtio: Option<&virtio_core::RegisterLayout>,
+    catalog: &mut DeviceCatalog,
+) -> Option<u64>
+{
+    if virtio.is_none()
     {
         return catalog.add_without_info();
     }
@@ -1098,8 +1139,10 @@ fn catalog_entry(pci_dev: &pci::PciDevice, catalog: &mut DeviceCatalog) -> Optio
 }
 
 /// Carve caps on the MMIO BARs of `pci_dev` the bind delivers into `dev`
-/// ([`carve_pci_device`]), each BAR's first `bytes` less the pages of
-/// `withheld` in it: one `Mmio` resource per range left
+/// ([`carve_pci_device`]): for a driver given the `VirtIO` register layout
+/// `virtio`, each BAR it names, clipped to the pages its regions reach, and
+/// otherwise every MMIO BAR, whole; each BAR's first `bytes` less the pages
+/// of `withheld` in it: one `Mmio` resource per range left
 /// ([`firmware::pci::delivered_ranges`]), at most three for a BAR and two
 /// more than the BARs in all, each naming its offset in its BAR. A BAR the
 /// withheld pages cover whole is not delivered. `None`, logged, when a BAR
@@ -1108,6 +1151,7 @@ fn catalog_entry(pci_dev: &pci::PciDevice, catalog: &mut DeviceCatalog) -> Optio
 fn carve_bars(
     name: &str,
     pci_dev: &pci::PciDevice,
+    virtio: Option<&virtio_core::RegisterLayout>,
     withheld: &[BarSpan],
     caps: &mut caps::DevmgrCaps,
     dev: &mut PciDeviceCaps,
@@ -1152,7 +1196,7 @@ fn carve_bars(
         Some(())
     };
     let mmio = |b: &usize| pci_dev.bar_is_mmio.get(*b).copied().unwrap_or(false);
-    if let Some(layout) = pci_dev.virtio_info.register_layout()
+    if let Some(layout) = virtio
     {
         for aperture in layout.bars()
         {
@@ -2122,17 +2166,17 @@ struct DeviceReset
 
 impl DeviceReset
 {
-    /// The reset of the device `info` describes, through the cap in
-    /// `resources` of the BAR range holding its `device_status` byte; `None`
-    /// when the layout gives no such byte or no delivered range of its BAR
-    /// holds it (a device whose common region reaches past its BAR).
+    /// The reset of the device whose register layout is `layout`, through
+    /// the cap in `resources` of the BAR range holding its `device_status`
+    /// byte; `None` when no delivered range of its BAR holds it (a device
+    /// whose common region reaches past its BAR).
     fn for_device(
-        info: &virtio_core::VirtioPciStartupInfo,
+        layout: &virtio_core::RegisterLayout,
         resources: &[Resource],
         aspace: u64,
     ) -> Option<Self>
     {
-        let status = info.status_register()?;
+        let status = layout.status_register();
         resources.iter().find_map(|r| {
             let Resource::Mmio {
                 cap,

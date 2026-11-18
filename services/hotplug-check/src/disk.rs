@@ -20,8 +20,13 @@
 //! entry), and that the open file fails with `StaleNetworkFileHandle`; logs
 //! [`READD_MARKER`]; and, once the host has added the disk again, mounts it
 //! through a fresh `MOUNT`, which vfsd answers `NO_MOUNT` until devmgr
-//! serves the disk and then finds it by querying devmgr again, and reads its
-//! file back.
+//! serves the disk and then finds it by querying devmgr first, and reads its
+//! file back. It logs [`TIE_MARKER`], the host adds a copy of the disk
+//! behind its second port, and the fixture checks that vfsd resolves the
+//! data role across every disk devmgr serves: `MOUNT` at `/data` answers
+//! `TABLE_FULL` (the path taken) while the data disk alone holds the
+//! partition, and `NO_MOUNT` (a tie at the highest priority) once devmgr
+//! serves the copy, and `/data` still reads.
 //!
 //! It then stops every thread of the root mount's driver through an attach
 //! with the debug authority it holds: a lookup at `/` that falls through
@@ -49,6 +54,11 @@ const REMOVE_MARKER: &str = "HOLDING a file open on /data; READY for the removal
 /// `xtask/src/commands/test_hotplug.rs`.
 const READD_MARKER: &str = "TORN DOWN /data, its disk removed; READY for the re-added disk";
 
+/// Logged once the fixture mounted `/data` on the re-added disk: the host
+/// adds a copy of the disk on seeing it. Kept in sync with
+/// `xtask/src/commands/test_hotplug.rs`.
+const TIE_MARKER: &str = "MOUNTED /data on the re-added disk; READY for a copy of the disk";
+
 /// The process name vfsd gives the root mount's driver: `fatfs:` and the
 /// mount path.
 const ROOT_DRIVER_NAME: &[u8] = b"fatfs:/";
@@ -69,9 +79,9 @@ const FILE_BYTES: &[u8] = b"hotplug-check: written before the removal\n";
 /// root filesystem's driver.
 const FALLTHROUGH_PATH: &str = "/hotplug-check-absent";
 
-/// How long the fixture waits for vfsd to mount the re-added disk: past the
-/// host's hot-add, devmgr's poller period, the link wait, and the driver's
-/// settle.
+/// How long the fixture waits for vfsd to mount the re-added disk, or to
+/// see its copy: past the host's hot-add, devmgr's poller period, the link
+/// wait, and the driver's settle.
 const DISK_WAIT: Duration = Duration::from_mins(2);
 
 /// How long the fixture waits for vfsd to mark the removed disk removed and
@@ -102,9 +112,9 @@ pub fn run(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64)
             std::os::seraph::log!(
                 "{PASS_MARKER}: /data torn down at its disk's removal with its driver idle and \
                  its disk marked removed, its open file stale; mounted again on the re-added \
-                 disk through MOUNT; with the root driver stopped a \
-                 lookup at / ended in {:?} after {} ms and /data answered; killing the root \
-                 driver",
+                 disk through MOUNT; the data role a tie once a copy of the disk was served; \
+                 with the root driver stopped a lookup at / ended in {:?} after {} ms and /data \
+                 answered; killing the root driver",
                 stopped.fallthrough,
                 stopped.took.as_millis()
             );
@@ -166,6 +176,9 @@ fn check(info: &std::os::seraph::StartupInfo, ipc_buf: *mut u64) -> Result<Stopp
 
     mount_when_served(mount, ipc_buf, "the re-added disk")?;
     read_back("after the re-add")?;
+    std::os::seraph::log!("{TIE_MARKER}");
+    await_tie(mount, ipc_buf)?;
+    read_back("beside the copy of its disk")?;
     let _ = syscall::cap_delete(mount);
 
     let threads = attach(authority, root, ipc_buf)?;
@@ -282,8 +295,8 @@ fn mount_data(mount: u64, ipc_buf: *mut u64) -> Result<u64, String>
 
 /// Mount the data partition at `/data` once devmgr serves the disk that
 /// holds it, `what`: `NO_MOUNT` until then, within [`DISK_WAIT`]. Each
-/// `NO_MOUNT` has vfsd query devmgr for the disks served since its last
-/// query.
+/// `MOUNT` has vfsd query devmgr for the disks served since its last query
+/// before it looks the role up.
 fn mount_when_served(mount: u64, ipc_buf: *mut u64, what: &str) -> Result<(), String>
 {
     let start = Instant::now();
@@ -353,6 +366,39 @@ fn await_removed(mount: u64, ipc_buf: *mut u64) -> Result<(), String>
         {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             _ => in_time().map_err(|e| format!("{e}: /data still resolves"))?,
+        }
+    }
+}
+
+/// Wait for vfsd to resolve the data role across the copy of the data disk
+/// the host adds: `MOUNT` at `/data` answers `TABLE_FULL` while the
+/// mounted data disk alone holds the partition (the role resolves, the path
+/// is taken), and `NO_MOUNT` once devmgr serves the copy, whose partition
+/// ties the data disk's at the highest priority, within [`DISK_WAIT`]. A
+/// role lookup that saw only the disks it held answers `TABLE_FULL` on.
+fn await_tie(mount: u64, ipc_buf: *mut u64) -> Result<(), String>
+{
+    let start = Instant::now();
+    loop
+    {
+        match mount_data(mount, ipc_buf)?
+        {
+            vfsd_errors::NO_MOUNT => return Ok(()),
+            vfsd_errors::TABLE_FULL if start.elapsed() < DISK_WAIT => std::thread::sleep(POLL),
+            vfsd_errors::TABLE_FULL =>
+            {
+                return Err(format!(
+                    "MOUNT at /data still answers TABLE_FULL {DISK_WAIT:?} after the copy of \
+                     its disk was asked for: the data role did not resolve across it"
+                ));
+            }
+            label =>
+            {
+                return Err(format!(
+                    "MOUNT at /data beside the copy of its disk answered {label:#x}, not \
+                     TABLE_FULL or NO_MOUNT"
+                ));
+            }
         }
     }
 }

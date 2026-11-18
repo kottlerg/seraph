@@ -642,7 +642,7 @@ a fixed device set makes, and vfsd's handling of a disk's loss and of its root f
 namespace composition](../services/vfsd/docs/namespace-composition.md#driver-death-and-device-loss)
 § Driver death and device loss) runs only when a disk leaves. `cargo xtask test-hotplug [--arch]`
 (both arches) makes a device arrive, leave, and arrive again, then makes a disk arrive, in one boot
-per hotplug control, and then makes a disk leave and arrive again:
+per hotplug control, and then makes a disk leave and arrive again and a second disk arrive:
 
 1. Stage the [`hotplug-check`](../services/hotplug-check/README.md) fixture's recipe from
    `/config/svcmgr/tests/` into `/config/svcmgr/services/`, and the `test-dma` class file from
@@ -693,7 +693,13 @@ per hotplug control, and then makes a disk leave and arrive again:
 9. Remove the disk with its driver idle, and require devmgr's removal lines, vfsd's
    `disk N: removed; tearing down its mounts` line, and the fixture's `TORN DOWN /data` line: the
    mount is gone, the disk marked removed, the open file stale. Add the disk again on the same
-   block node and wait for the fixture's verdict: a fresh `MOUNT` mounts `/data` on it, and with
+   block node and wait for the fixture's `MOUNTED /data on the re-added disk` line: a fresh
+   `MOUNT` mounts `/data` on it. Then hot-add a copy of `disk-data.img`, taken before the
+   boot, behind the second port, and wait for the fixture's verdict: its `MOUNT` of the data
+   role, `TABLE_FULL` while `/data` stands, answers `NO_MOUNT` once devmgr serves the copy,
+   whose data partition ties the data disk's, so vfsd resolves a role across every disk devmgr
+   serves, a disk added after start among them
+   ([docs/storage.md](storage.md#gpt-role-guid-discovery) § GPT Role-GUID Discovery); and with
    the root mount's driver stopped a lookup at `/` ends in an error within vfsd's bound while
    `/data` still reads. The fixture then kills the root mount's driver; require vfsd's
    `FATAL: root filesystem lost` line, svcmgr's `critical service unrecoverable: vfsd` line,
@@ -1447,18 +1453,19 @@ cargo xtask test-gdb --arch <arch>
 ```
 
 **Hotplug cell.** The boots of `cargo xtask test-hotplug` (PCI Express hotplug (`test-hotplug`)
-above) on each architecture, four on x86_64 and three on riscv64, at 4 vCPUs. In the device
-boots, two on x86_64 (the firmware's ACPI PCI hotplug, then native control) and one on riscv64,
-devmgr takes two empty root ports' events, binds the `test-dma` fixture to the `edu` device the
-host hot-adds behind one, withdraws it when the host removes the device, binds it again when the
-host adds it again, and binds the drivers directory's virtio-blk to the disk the host then
-hot-adds behind the other, with no MSI-X vectors, on its wired interrupt line. In the two storage
-boots, vfsd tears down the mount of a disk removed behind a port and mounts it again when it is
-added again, and ends at the loss of its root filesystem's driver and of the boot disk. The
-command stages and unstages its own files on the current sysroot, a debug-profile build. It
-bounds each boot to its markers by five minutes, the fixture's probes and the disk's bind by
-three minutes after each hot-add, and the removal by one minute from `device_del`; it has no
-`run-parallel` budget. The boots are the hotplug device cell (Device surfaces above).
+above) on each architecture, four on x86_64 and three on riscv64, at 4 vCPUs. In the device boots,
+two on x86_64 (the firmware's ACPI PCI hotplug, then native control) and one on riscv64, devmgr
+takes two empty root ports' events, binds the `test-dma` fixture to the `edu` device the host
+hot-adds behind one, withdraws it when the host removes the device, binds it again when the host
+adds it again, and binds the drivers directory's virtio-blk to the disk the host then hot-adds
+behind the other, with no MSI-X vectors, on its wired interrupt line. In the two storage boots, vfsd
+tears down the mount of a disk removed behind a port and mounts it again when it is added again,
+resolves the data role across a copy of the disk added beside it, and ends at the loss of its root
+filesystem's driver and of the boot disk. The command stages and unstages its own files on the
+current sysroot, a debug-profile build. It bounds each boot to its markers by five minutes, the
+fixture's probes and the disk's bind by three minutes after each hot-add, and the removal by one
+minute from `device_del`; it has no `run-parallel` budget. The boots are the hotplug device cell
+(Device surfaces above).
 
 ```sh
 # Hotplug cell, per architecture (clean between architectures):

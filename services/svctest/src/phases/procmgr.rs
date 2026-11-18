@@ -307,6 +307,17 @@ fn logd_await_retired(query: u64) -> u64
 /// (kind, bytes), read across every `QUERY_HISTORY` page.
 pub(crate) fn logd_history(query: u64, badge: Option<u64>) -> Vec<(u8, Vec<u8>)>
 {
+    logd_history_with(query, badge, |entry| (entry.kind, entry.bytes.to_vec()))
+}
+
+/// The history of `badge`, or of every badge for `None`, newest first, each
+/// entry as `map` gives it, read across every `QUERY_HISTORY` page.
+pub(crate) fn logd_history_with<T>(
+    query: u64,
+    badge: Option<u64>,
+    map: impl Fn(&ipc::log_query::HistoryEntryView<'_>) -> T,
+) -> Vec<T>
+{
     use ipc::log_query::{HistoryEntries, HistoryRequest, QUERY_OK, reply_more, reply_status};
 
     let mut history = Vec::new();
@@ -330,7 +341,7 @@ pub(crate) fn logd_history(query: u64, badge: Option<u64>) -> Vec<(u8, Vec<u8>)>
                 badge.is_none_or(|b| b == entry.badge),
                 "logd_death_forward: another badge's entry"
             );
-            history.push((entry.kind, entry.bytes.to_vec()));
+            history.push(map(&entry));
             req.before = Some(entry.seq);
         }
         if !reply_more(reply.label)

@@ -32,9 +32,11 @@
 //! the decoder.
 //!
 //! Like the serial driver, this driver MUST NOT call `std::os::seraph::log!`;
-//! the rule and its deadlock chain are in `docs/console-model.md` § Logging
+//! the rule and its ground are in `docs/console-model.md` § Logging
 //! constraint on the serial and framebuffer drivers. Diagnostics are dropped;
-//! fatal bootstrap failures `thread_exit` silently.
+//! fatal bootstrap failures `thread_exit` silently. The driver is
+//! debuggable: logd's framebuffer writer is the only logd thread that waits
+//! on it (`services/logd/docs/ipc-interface.md` § Output sinks).
 
 mod arch;
 
@@ -241,10 +243,9 @@ unsafe fn render_at(writer: &mut render::FramebufferWriter, cp: u32)
 fn service_loop(service_ep: u64, mut writer: render::FramebufferWriter, ipc_buf: *mut u64) -> !
 {
     let mut decoder = Utf8Decoder::new();
-    // No diagnostic hook: a `log!` here is a blocking call into logd, which
-    // may itself be blocked mirroring a line to this driver (see the module
-    // doc). The kernel's rate-limited recv-failure line and the guard's exit
-    // remain the signal.
+    // No diagnostic hook: a line logged here would be mirrored back through
+    // this loop (see the module doc). The kernel's rate-limited recv-failure
+    // line and the guard's exit remain the signal.
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
@@ -274,20 +275,6 @@ fn main() -> !
         reason = "the IPC buffer page is 4 KiB-aligned"
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
-
-    // logd mirrors every log line through this driver, with calls that have
-    // no bound, so a debug-authority holder that stopped it would hold every
-    // process's log output, its own included: declare this process
-    // undebuggable before it spawns a thread
-    // (`procmgr_labels::DECLARE_NO_DEBUG`). A refusal leaves it debuggable.
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe {
-        ipc::ipc_call(
-            info.procmgr_endpoint,
-            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_DEBUG),
-            ipc_buf,
-        )
-    };
 
     let Some(device) = bootstrap(info.creator_endpoint, ipc_buf)
     else

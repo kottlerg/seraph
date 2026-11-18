@@ -300,19 +300,27 @@ fn mint_bootstrap_badge() -> Option<u64>
     }
 }
 
-/// The env a driver is created with: devmgr's own level, which every driver
-/// inherits (`std::os::seraph::log::inherited_level_entry`), as its one
-/// entry. `None` while devmgr logs at info, and, after a warning, when the
-/// cap cannot be built; the driver then logs at info.
-fn inherited_level_env() -> Option<ArgvEnvCap>
+/// The argv and env a driver is created with: its create `name` (its bundle
+/// entry name or install path) as its one argument, under which procmgr lists
+/// it to a debugger (`procmgr_labels::LIST_PROCESSES`); and devmgr's own
+/// level, which every driver inherits
+/// (`std::os::seraph::log::inherited_level_entry`), as its one env entry,
+/// none while devmgr logs at info. `None`, after a warning, when the cap
+/// cannot be built; the driver then is listed with no name and logs at info.
+fn driver_argv_env(name: &[u8]) -> Option<ArgvEnvCap>
 {
-    let entry = std::os::seraph::log::inherited_level_entry()?;
-    match ArgvEnvCap::new(&[], 0, &entry, 1)
+    let mut args = name.to_vec();
+    args.push(0);
+    let entry = std::os::seraph::log::inherited_level_entry();
+    let (env, env_count) = entry.as_deref().map_or((&[][..], 0), |entry| (entry, 1));
+    match ArgvEnvCap::new(&args, 1, env, env_count)
     {
-        Ok(env) => env,
+        Ok(argv_env) => argv_env,
         Err(e) =>
         {
-            std::os::seraph::log!(warn: "driver spawn: level env not built ({e}); driver logs at info");
+            std::os::seraph::log!(
+                warn: "driver spawn: argv and env not built ({e}); driver unnamed, logs at info"
+            );
             None
         }
     }
@@ -574,11 +582,6 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
         flags |= procmgr_labels::CREATE_PHYS_ACCESS;
     }
     let sched_bits = procmgr_labels::create_sched_bits(config.priority, config.priority);
-    let argv_env = inherited_level_env();
-    if argv_env.is_some()
-    {
-        flags |= procmgr_labels::CREATE_ARGV_ENV;
-    }
     // Caps: [source, creator, argv_env?]. Data word 0 is the object's size,
     // the argv/env header (when present) follows at
     // `procmgr_labels::CREATE_FIRST_WORD`, and the name block follows the
@@ -595,6 +598,11 @@ pub fn spawn_bound_driver(config: &BoundSpawnConfig, ipc_buf: *mut u64) -> Drive
             name,
         } => (procmgr_labels::CREATE_FROM_FILE, size, file_cap, name),
     };
+    let argv_env = driver_argv_env(name);
+    if argv_env.is_some()
+    {
+        flags |= procmgr_labels::CREATE_ARGV_ENV;
+    }
     let label = base_label | flags | sched_bits;
     let builder = IpcMessage::builder(label)
         .word(0, size)

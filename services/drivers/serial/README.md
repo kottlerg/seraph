@@ -43,11 +43,15 @@ from), per [console-model.md](../../../docs/console-model.md#ownership-across-th
 The interrupt cap is optional: without it the driver still answers reads (RX then relies on
 the client's bounded poll) but `SERIAL_REGISTER_RX_NOTIFY` reports `REGISTER_FAILED`.
 
-Before its bootstrap the driver declares itself undebuggable to procmgr
-(`procmgr_labels::DECLARE_NO_DEBUG`): logd writes every log line through it, with calls that have
-no bound, so a debug-authority holder that stopped it would hold every process's log output, its
-own included, for as long as the driver stayed stopped
-([crashd Operation](../../crashd/docs/operation.md) § Limits).
+The driver is debuggable, and a fault of it reaches the crash service like any driver's. logd
+writes every log line to it from its serial sink's writer thread, the only logd thread that waits
+on the driver; a debug-authority holder that stops it holds the log stream for at most logd's
+`SINK_STALL_MS` once, after which logd queues and then drops and counts the lines meant for
+serial until the driver writes again, and keeps writing them to the framebuffer and retaining
+them in its history
+([logd IPC Interface](../../logd/docs/ipc-interface.md#output-sinks) § Output sinks).
+devmgr creates it with its bundle entry name, `serial`, as its `argv[0]`, under which procmgr's
+`LIST_PROCESSES` names it to a debugger.
 
 The bootstrap is the resource list (`driver_binding::resources`), decoded with
 `PlatformDelivery`: the register resource, the wired line when present, and in the end round the

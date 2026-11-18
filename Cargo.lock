@@ -802,6 +802,7 @@ dependencies = [
  "fatfs-parse",
  "ipc",
  "log",
+ "logd-codec",
  "namespace-protocol",
  "oomd-policy",
  "process-abi",

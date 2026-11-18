@@ -11,10 +11,12 @@
 //! outside the system reserve until its pressure level reads `CRITICAL`,
 //! prints `full`, keeps it there for `<ms>` milliseconds, taking back what
 //! other processes free meanwhile, and exits, which gives it all back.
-//! `crashme oom-touch` registers a demand page before that, and on its second
-//! line of stdin writes the page: memmgr declines the fault, the crash service
-//! holds it, and the write either completes once the filler exits, printing
-//! how long it took, or the hold times out and the process dies of the fault.
+//! `crashme oom-touch <pages>` registers a demand region of `<pages>` pages
+//! before that, and on its second line of stdin writes each page in turn:
+//! memmgr declines the first write past the free pages above the reserve, the
+//! crash service holds it, and the write either completes once the filler
+//! exits, the process printing how long its longest write took, or the hold
+//! times out and the process dies of the fault.
 //! Neither allocates while the level is `CRITICAL`. The fill is
 //! `mem_fill`'s, shared with the `memhog` fixture.
 //!
@@ -38,12 +40,15 @@ const FILL_NOT_CRITICAL: i32 = 3;
 const FILL_BALLAST_FAILED: i32 = 4;
 /// Exit code: the mode's argument is not a number of milliseconds.
 const FILL_USAGE: i32 = 5;
-/// Exit code: `oom-touch` could not register its page or read its stdin.
+/// Exit code: `oom-touch` could not register its region or read its stdin.
 const TOUCH_SETUP_FAILED: i32 = 6;
 /// Exit code: `oom-hold`'s argument is not a number of pages.
 const HOLD_USAGE: i32 = 7;
+/// Exit code: `oom-touch`'s argument is not a non-zero number of pages.
+const TOUCH_USAGE: i32 = 8;
 
-/// The page size `oom-hold` touches its heap at.
+/// The page size `oom-hold` touches its heap at, and `oom-touch` writes its
+/// region at.
 const PAGE_BYTES: usize = 4096;
 
 /// Bytes of stack each mode touches before the window, below its frame.
@@ -86,12 +91,33 @@ pub fn fill(arg: Option<&str>) -> !
     exit(0);
 }
 
-/// `crashme oom-touch`: register one demand page, read a first line of stdin
-/// and print `ready`, then, on the second line, write the page and print how
-/// long the write took.
-pub fn touch() -> !
+/// `crashme oom-touch <pages>`: register a demand region of `<pages>` pages,
+/// read a first line of stdin and print `ready`, then, on the second line,
+/// write each page of the region in turn and print how long the longest write
+/// took.
+///
+/// The writes after the first spend whatever free pages lie above the system
+/// reserve when the window opens (a stop's frees, until the filler's next
+/// top-up takes them back), so a region larger than those makes the write
+/// that memmgr declines, and the crash service holds, certain.
+pub fn touch(arg: Option<&str>) -> !
 {
-    let Ok(page) = std::os::seraph::register_demand_paged(1)
+    let Some(pages) = arg
+        .and_then(|p| p.parse::<usize>().ok())
+        .filter(|&p| p != 0)
+    else
+    {
+        println!("usage: crashme oom-touch <pages>");
+        exit(TOUCH_USAGE);
+    };
+    let Some(region) = u64::try_from(pages)
+        .ok()
+        .and_then(|count| std::os::seraph::register_demand_paged(count).ok())
+    else
+    {
+        exit(TOUCH_SETUP_FAILED);
+    };
+    let Ok(base) = usize::try_from(region.va_start())
     else
     {
         exit(TOUCH_SETUP_FAILED);
@@ -111,12 +137,16 @@ pub fn touch() -> !
     {
         exit(TOUCH_SETUP_FAILED);
     }
-    let start = Instant::now();
-    // SAFETY: `page` is a page this process registered as a demand region
-    // and nothing else uses; the write is volatile so that it is made, and
-    // faults, here.
-    unsafe { std::ptr::write_volatile(page.va_start() as *mut u8, 1) };
-    let held = start.elapsed().as_millis();
+    let mut held = 0;
+    for addr in (base..).step_by(PAGE_BYTES).take(pages)
+    {
+        let start = Instant::now();
+        // SAFETY: `addr` is the start of one of the `pages` pages of this
+        // process's demand region, which nothing else uses; the write is
+        // volatile so that it is made, and faults, here.
+        unsafe { std::ptr::write_volatile(addr as *mut u8, 1) };
+        held = held.max(start.elapsed().as_millis());
+    }
     println!("touched held_ms={held}");
     exit(0);
 }

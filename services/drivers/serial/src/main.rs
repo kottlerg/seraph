@@ -23,10 +23,12 @@
 //! starves writers.
 //!
 //! Unlike the sibling RTC drivers, this driver MUST NOT call
-//! `std::os::seraph::log!`; the rule and its deadlock chain are in
+//! `std::os::seraph::log!`; the rule and its ground are in
 //! `docs/console-model.md` § Logging constraint on the serial and framebuffer
 //! drivers. Diagnostics are dropped; fatal bootstrap failures `thread_exit`
-//! silently.
+//! silently. The driver is debuggable: logd's serial writer is the only logd
+//! thread that waits on it (`services/logd/docs/ipc-interface.md` § Output
+//! sinks).
 
 mod arch;
 
@@ -212,10 +214,9 @@ fn register_rx_notify(irq: Irq, notification: u64, rx_notify: &mut u64) -> IpcMe
 fn service_loop(service_ep: u64, irq: Irq, ipc_buf: *mut u64) -> !
 {
     let mut rx_notify = 0;
-    // No diagnostic hook: a `log!` here is a blocking call into logd, which
-    // may itself be blocked calling this driver (see the module doc). The
-    // kernel's rate-limited recv-failure line and the guard's exit remain
-    // the signal.
+    // No diagnostic hook: a line logged here would be written back through
+    // this loop (see the module doc). The kernel's rate-limited recv-failure
+    // line and the guard's exit remain the signal.
     let mut guard = ipc::recv_guard::RecvGuard::new(|_, _| {});
     loop
     {
@@ -245,20 +246,6 @@ fn main() -> !
         reason = "the IPC buffer page is 4 KiB-aligned"
     )]
     let ipc_buf = info.ipc_buffer.cast::<u64>();
-
-    // logd writes every log line through this driver, with calls that have no
-    // bound, so a debug-authority holder that stopped it would hold every
-    // process's log output, its own included: declare this process
-    // undebuggable before it spawns a thread
-    // (`procmgr_labels::DECLARE_NO_DEBUG`). A refusal leaves it debuggable.
-    // SAFETY: ipc_buf is the registered IPC buffer page.
-    let _ = unsafe {
-        ipc::ipc_call(
-            info.procmgr_endpoint,
-            &ipc::IpcMessage::new(ipc::procmgr_labels::DECLARE_NO_DEBUG),
-            ipc_buf,
-        )
-    };
 
     let Some(device) = bootstrap(info.creator_endpoint, ipc_buf)
     else

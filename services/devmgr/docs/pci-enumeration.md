@@ -268,15 +268,19 @@ For each matched device, devmgr:
    pass, once `SET_DRIVERS_DIR` delivers the drivers directory), a DMA
    declaration's with `CREATE_PINNED` and `CREATE_DMA_HOLD`, so procmgr
    holds the driver's memory after its death until devmgr releases it, at
-   the priority of its declared tier as its source allows. A devmgr logging
-   at any level but info passes its own level as the driver's one env entry
-   (`SERAPH_LOG`, with `CREATE_ARGV_ENV`), so a driver logs at devmgr's level
-   ([init bootstrap](../../init/docs/bootstrap.md) § Log levels). Both
+   the priority of its declared tier as its source allows. Both
    creates carry the binary's exact size in data word 0 and its name after
    the argv/env header (`procmgr_labels::with_create_name`), the name procmgr
    verifies the signature under: the bundle entry name for a boot module, the
    install path (`<drivers directory path>/<entry>`) for a drivers-directory
-   file. A reply of `SIGNATURE_REFUSED` is logged and the driver not started.
+   file. Both carry an argv/env (`CREATE_ARGV_ENV`): that name as the
+   driver's one argument, under which procmgr lists it to a debugger
+   (`procmgr_labels::LIST_PROCESSES`), and, from a devmgr logging at any
+   level but info, devmgr's own level as the driver's one env entry
+   (`SERAPH_LOG`), so a driver logs at devmgr's level
+   ([init bootstrap](../../init/docs/bootstrap.md) § Log levels). No driver
+   reads its argument or its argument count. A reply of
+   `SIGNATURE_REFUSED` is logged and the driver not started.
 6. Starts the driver (`START_PROCESS`). A driver whose bootstrap fails after
    this step is withdrawn from its device as a live driver.
 7. Serves the driver's bootstrap as the resource list of

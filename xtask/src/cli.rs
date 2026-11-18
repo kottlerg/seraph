@@ -192,8 +192,8 @@ subcommands! {
         /// hotplug through acpid, then with native control), hot-add, remove and
         /// hot-add again QEMU's `edu` device behind one over QMP, check the
         /// fixture's verdict, then hot-add a `virtio-blk-pci` disk behind the
-        /// other and check that devmgr binds it from the boot bundle's driver, and
-        /// unstage both again (see xtask/README.md).
+        /// other and check that devmgr binds it from the drivers directory's
+        /// driver, and unstage both again (see xtask/README.md).
         TestHotplug(TestHotplugArgs),
 
         /// Check the GDB stub: stage it and its `gdb-target` process, boot the

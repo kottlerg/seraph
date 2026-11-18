@@ -28,8 +28,6 @@ use alloc::vec::Vec;
 
 use driver_binding::decl::{DriverDecl, DriverName, MatchKey, Tier};
 
-use crate::classes::Classes;
-
 /// Where a declaration came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source
@@ -138,33 +136,6 @@ pub fn decl_rank(decl: &DriverDecl, source: Source, record: &RecordKeys<'_>) -> 
         .filter(|key| source == Source::BootModule || !matches!(key, MatchKey::IommuFamily(_)))
         .filter_map(|key| rank(key, record))
         .min()
-}
-
-/// Whether `decl`, from `source`, may be considered at all: a declaration of
-/// a class a class request marked boot-only is accepted only from a boot
-/// module (docs/driver-binding.md § Declaration Bounds), so a
-/// drivers-directory binary cannot claim a boot-only class's devices.
-#[must_use]
-pub fn class_admits<T>(classes: &Classes<T>, decl: &DriverDecl, source: Source) -> bool
-{
-    source == Source::BootModule
-        || decl
-            .class
-            .is_none_or(|class| !classes.is_boot_only(class.as_str()))
-}
-
-/// Whether `decl` carries a PCI key (an exact vendor and device, or a class
-/// under its mask), and so can match a PCI function's record: the only
-/// records a hotplug arrival appends. devmgr keeps a copy of each boot
-/// module whose declaration carries one, so a hot-added function is bound
-/// from the boot bundle's declarations as it would have been at boot
-/// (docs/driver-binding.md § Hotplug).
-#[must_use]
-pub fn pci_keyed(decl: &DriverDecl) -> bool
-{
-    decl.matches()
-        .iter()
-        .any(|key| matches!(key, MatchKey::PciId { .. } | MatchKey::PciClass { .. }))
 }
 
 /// What a declaration from `source` is given, within the source bounds, and
@@ -1005,81 +976,27 @@ mod tests
     }
 
     #[test]
-    fn a_boot_only_class_admits_a_boot_module_declaration_alone()
+    fn a_device_unbound_after_the_boot_pass_binds_the_directory_driver_at_auxiliary()
     {
+        // virtio-blk's declaration: class `c` (`decl_with`), the boot tier.
         let m = [Match::PciId {
-            vendor: 1,
-            device: 2,
-        }];
-        // `decl_with` declares class `c`.
-        let declared = decl_with("d", &m, None, Tier::Auxiliary, false);
-        let mut classless = declared;
-        classless.class = None;
-        let mut classes = Classes::<()>::new();
-        assert!(class_admits(&classes, &declared, Source::DriversDir));
-        let c = driver_binding::decl::ClassName::class(b"c").unwrap();
-        classes.configure(&c, false, false).unwrap();
-        assert!(class_admits(&classes, &declared, Source::DriversDir));
-        classes.configure(&c, true, false).unwrap();
-        assert!(!class_admits(&classes, &declared, Source::DriversDir));
-        assert!(class_admits(&classes, &declared, Source::BootModule));
-        assert!(class_admits(&classes, &classless, Source::DriversDir));
-    }
-
-    #[test]
-    fn only_a_declaration_with_a_pci_key_is_pci_keyed()
-    {
-        let id = Match::PciId {
-            vendor: 0x1AF4,
-            device: 0x1042,
-        };
-        let class = Match::PciClass {
-            code: 0x01_0000,
-            mask: 0xFF_0000,
-        };
-        let hid = Match::AcpiHid("PNP0501");
-        assert!(pci_keyed(&decl(&[id], None)));
-        assert!(pci_keyed(&decl(&[class], None)));
-        assert!(pci_keyed(&decl(&[hid, id], None)));
-        for other in [
-            hid,
-            Match::AcpiCid("PNP0501"),
-            Match::Spcr(3),
-            Match::Platform("virt-rtc"),
-            Match::IommuFamily("vtd"),
-            Match::BootFramebuffer,
-        ]
-        {
-            assert!(!pci_keyed(&decl(&[other], None)), "{other:?}");
-        }
-    }
-
-    /// A hot-added function of a boot-only class: the hotplug batch's first
-    /// pass, over the kept boot images, binds it at the boot tier, while the
-    /// drivers directory's copy of the same driver is still refused.
-    #[test]
-    fn a_hot_added_function_of_a_boot_only_class_binds_the_boot_copy_alone()
-    {
-        let m = [Match::PciId {
-            vendor: 0x1AF4,
+            vendor: 0x1af4,
             device: 0x1042,
         }];
-        // `decl_with` declares class `c`, here boot-only.
-        let driver = decl_with("virtio-blk", &m, None, Tier::Boot, false);
-        let mut classes = Classes::<()>::new();
-        let c = driver_binding::decl::ClassName::class(b"c").unwrap();
-        classes.configure(&c, true, false).unwrap();
-        let added = pci(0x1AF4, 0x1042, 0x01_0000);
-
-        assert!(pci_keyed(&driver));
-        assert!(class_admits(&classes, &driver, Source::BootModule));
-        let mut images = MatchTable::new();
-        images.add(driver, Source::BootModule, (), 0).unwrap();
-        assert_eq!(images.choose(&added), Choice::Bind(0));
-        let given = grants(&driver, Source::BootModule, false);
-        assert_eq!(given.tier, Tier::Boot);
-        assert!(!given.tier_ignored);
-
-        assert!(!class_admits(&classes, &driver, Source::DriversDir));
+        let blk = decl_with("virtio-blk", &m, None, Tier::Boot, false);
+        // The boot pass bound one disk from the bundle's copy; a disk
+        // hot-added later meets the drivers directory's copy alone.
+        let mut table = MatchTable::new();
+        let only = table.add(blk, Source::DriversDir, (), 1).unwrap();
+        assert_eq!(table.choose(&pci(0x1af4, 0x1042, 0)), Choice::Bind(only));
+        assert_eq!(
+            grants(&blk, Source::DriversDir, false),
+            Grants {
+                tier: Tier::Auxiliary,
+                phys_access: false,
+                tier_ignored: true,
+                phys_access_ignored: false,
+            }
+        );
     }
 }

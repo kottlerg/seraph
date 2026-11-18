@@ -2648,7 +2648,7 @@ pub mod fs_labels
 
 /// Wire-protocol version of [`devmgr_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const DEVMGR_LABELS_VERSION: u32 = 24;
+pub const DEVMGR_LABELS_VERSION: u32 = 25;
 /// IPC labels for the device manager (`devmgr`).
 ///
 /// Every request carries the caller's compiled [`DEVMGR_LABELS_VERSION`] in
@@ -2794,8 +2794,7 @@ pub mod devmgr_labels
     /// devmgr marks the driver permanently unavailable for this boot
     /// and replies [`super::devmgr_errors::NO_DEVICE`] to a subsequent
     /// [`QUERY_DEVICE`] for it; the retry rule is
-    /// [`super::devmgr_errors::NO_DEVICE`]'s. The pass refuses a
-    /// declaration of a boot-only class ([`MINT_CLASS_SEND`]), logged.
+    /// [`super::devmgr_errors::NO_DEVICE`]'s.
     pub const SET_DRIVERS_DIR: u64 = 6;
 
     /// The data word of [`SET_DRIVERS_DIR`] and [`BIND_DRIVERS`] that holds
@@ -3147,25 +3146,19 @@ pub mod devmgr_labels
     /// `data[1]` = the verb mask, a non-empty subset of
     /// [`super::VERB_BIT_MASK`] (an empty one would yield a SEND whose
     /// queries return un-badged caps, which their holder could badge at
-    /// will); `data[2]` = flags ([`CLASS_BOOT_ONLY`]); `data[3]` = the class
-    /// name's length, 1 to [`MAX_CLASS_NAME_BYTES`]; `data[4..]` = the name's
+    /// will); `data[2]` = the class name's length, 1 to
+    /// [`MAX_CLASS_NAME_BYTES`]; `data[3..]` = the name's
     /// bytes, packed little-endian, lowercase ASCII letters, digits, `-`, and
     /// `_` (docs/driver-binding.md § Device Classes). Caller's badge MUST
     /// carry [`CLASS_AUTHORITY`]; the handler replies
     /// [`super::devmgr_errors::UNAUTHORIZED`] otherwise.
     ///
-    /// devmgr interns the name in its class table, which only grows, marks
-    /// the class configured, and boot-only when the flag is set (sticky).
+    /// devmgr interns the name in its class table, which only grows, and
+    /// marks the class configured.
     /// Reply ([`super::devmgr_errors::SUCCESS`]): `caps[0]` = the class SEND.
-    /// `INVALID_REQUEST` for an empty or out-of-mask verb mask, an unknown
-    /// flag, a bad name, a boot-only mark once the drivers-directory pass
-    /// has begun ([`SET_DRIVERS_DIR`]), a full class table, or a failed
-    /// derivation. The handler logs nothing, as [`QUERY_DEVICE`]'s does not.
+    /// `INVALID_REQUEST` for an empty or out-of-mask verb mask, a bad name,
+    /// a full class table, or a failed derivation. The handler logs nothing, as [`QUERY_DEVICE`]'s does not.
     pub const MINT_CLASS_SEND: u64 = 21;
-    /// [`MINT_CLASS_SEND`] flag: the class's drivers come from the boot
-    /// bundle only. devmgr refuses a drivers-directory declaration of the
-    /// class, logged.
-    pub const CLASS_BOOT_ONLY: u64 = 1;
     /// Longest class name [`MINT_CLASS_SEND`] carries: the declaration
     /// format's class-name bound.
     pub const MAX_CLASS_NAME_BYTES: usize = 32;
@@ -3187,7 +3180,7 @@ pub mod devmgr_labels
     /// as for [`SET_DRIVERS_DIR`]; its control thread then runs a
     /// drivers-directory pass over the directory, under that pass's
     /// declaration bounds (the auxiliary tier, no physical access, no IOMMU
-    /// family key, no boot-only class), against the device records still
+    /// family key), against the device records still
     /// unbound, starts each driver it binds in a settle batch of its own, and
     /// serves the batch once it settles, within [`SETTLE_TIMEOUT_MS`]. A
     /// [`QUERY_DEVICE`] whose answer would name no driver waits until that
@@ -3780,7 +3773,7 @@ pub unsafe fn await_device(
 
 /// Send [`devmgr_labels::MINT_CLASS_SEND`] on `registry`, a registry SEND
 /// carrying [`devmgr_labels::CLASS_AUTHORITY`], for the class named `class`
-/// with verb mask `verbs` and flags `flags`, and return the class SEND.
+/// with verb mask `verbs`, and return the class SEND.
 ///
 /// # Safety
 /// `ipc_buf` must point to the calling thread's registered IPC buffer page.
@@ -3798,7 +3791,6 @@ pub unsafe fn mint_class_send(
     registry: u64,
     class: &[u8],
     verbs: u64,
-    flags: u64,
     ipc_buf: *mut u64,
 ) -> Result<u64, ClassCallError>
 {
@@ -3809,9 +3801,8 @@ pub unsafe fn mint_class_send(
     let request = IpcMessage::builder(devmgr_labels::MINT_CLASS_SEND)
         .word(0, u64::from(DEVMGR_LABELS_VERSION))
         .word(1, verbs)
-        .word(2, flags)
-        .word(3, u64::try_from(class.len()).unwrap_or(u64::MAX))
-        .bytes(4, class)
+        .word(2, u64::try_from(class.len()).unwrap_or(u64::MAX))
+        .bytes(3, class)
         .build();
     // SAFETY: the caller guarantees `ipc_buf` is the registered IPC buffer.
     let reply = unsafe { ipc_call(registry, &request, ipc_buf) }.map_err(ClassCallError::Call)?;
@@ -6079,11 +6070,10 @@ mod tests
         let msg = IpcMessage::builder(devmgr_labels::MINT_CLASS_SEND)
             .word(0, 17)
             .word(1, 1 << 63)
-            .word(2, 0)
-            .word(3, 11)
-            .bytes(4, b"debug-port!")
+            .word(2, 11)
+            .bytes(3, b"debug-port!")
             .build();
-        assert_eq!(class_name_of(&msg, 3), Some(&b"debug-port!"[..]));
+        assert_eq!(class_name_of(&msg, 2), Some(&b"debug-port!"[..]));
         let short = IpcMessage::builder(0).word(1, 4).bytes(2, b"rtc").build();
         assert_eq!(class_name_of(&short, 1), Some(&b"rtc\0"[..]));
         let long = IpcMessage::builder(0).word(1, 9).bytes(2, b"rtc").build();

@@ -11,11 +11,9 @@
 //! Two passes bind: the boot pass, over the declarations of the boot modules
 //! devmgr holds, in the boot settle batch; and the drivers-directory pass,
 //! over the declarations of the `/services/drivers/` entries, once svcmgr
-//! hands devmgr that directory. A hotplug arrival's batch runs both, the boot
-//! pass over the boot images devmgr keeps ([`decls::BootImage`]) and then the
-//! drivers-directory pass ([`crate::spawn_hotplug_drivers`]). Each pass
-//! collects the declarations that match an unbound record ([`crate::decls`])
-//! into a [`MatchTable`], walks the records in record order, and binds each to the
+//! hands devmgr that directory. Each pass collects the declarations that
+//! match an unbound record ([`crate::decls`]) into a
+//! [`MatchTable`], walks the records in record order, and binds each to the
 //! declaration the table chooses ([`bind_pci`]). A record is bound at most
 //! once a boot: once a driver was started for it, or, for a RISC-V IOMMU's
 //! function, once devmgr took it as a unit for the IOMMU driver
@@ -230,11 +228,9 @@ pub struct Carve<'a>
 }
 
 /// The boot pass: bind the unbound records to the declarations of `modules`,
-/// as boot modules, and release every module cap. At boot `modules` are the
-/// declared boot modules the IOMMU pass left ([`decls::BootModules`]), whose
-/// caps would otherwise pin the pool run init donated them from; in a hotplug
-/// batch they are derivations of the boot images devmgr keeps
-/// ([`decls::BootImage::module`]).
+/// the declared boot modules the IOMMU pass left ([`decls::BootModules`]),
+/// and release every module cap, which would otherwise pin the pool run init
+/// donated it from.
 pub fn boot_pass(
     records: &mut Records,
     modules: Vec<(DriverDecl, Binary)>,
@@ -257,10 +253,8 @@ pub fn boot_pass(
 
 /// The drivers-directory pass: list `dir_cap`, the `/services/drivers/`
 /// directory svcmgr handed devmgr, read the declaration of each entry, and
-/// bind the records still unbound to them. A declaration `admits` refuses
-/// (one of a class a class request marked boot-only,
-/// [`firmware::binding::class_admits`]) is not considered, logged. Every file
-/// cap is released once the pass ends. `dir_path` is the absolute path of the
+/// bind the records still unbound to them. Every file cap is released once
+/// the pass ends. `dir_path` is the absolute path of the
 /// directory `dir_cap` names; each entry is named `dir_path/entry`, its install
 /// path, which procmgr verifies the driver's signature under. An entry whose
 /// name exceeds [`procmgr_labels::CREATE_NAME_MAX`] or cannot be allocated is
@@ -269,7 +263,6 @@ pub fn drivers_dir_pass(
     records: &mut Records,
     dir_cap: u64,
     dir_path: &[u8],
-    admits: impl Fn(&DriverDecl) -> bool,
     carve: &mut Carve,
     pass: &mut Pass,
     ipc_buf: *mut u64,
@@ -298,16 +291,7 @@ pub fn drivers_dir_pass(
             let _ = syscall::cap_delete(walked.file_cap);
             return;
         };
-        let mut decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
-        if let Some(d) = decl.filter(|d| !admits(d))
-        {
-            std::os::seraph::log!(
-                warn: "{}: declares boot-only class {}; not considered",
-                d.name.as_str(),
-                d.class.as_ref().map_or("", |c| c.as_str())
-            );
-            decl = None;
-        }
+        let decl = decls::file_decl(label, walked.file_cap, walked.size, ipc_buf);
         let binary = Binary::File {
             cap: walked.file_cap,
             size: walked.size,

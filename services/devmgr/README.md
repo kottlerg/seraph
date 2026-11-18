@@ -42,7 +42,7 @@ devmgr/
 │   ├── caps.rs                     # Bootstrap-round capability absorbers, DevmgrCaps, and the
 │   │                               #   firmware-table caps the registry's workers share
 │   ├── decls.rs                    # Driver declarations read from boot modules and the drivers
-│   │                               #   directory; the boot images kept for hotplug
+│   │                               #   directory
 │   ├── dma.rs                      # DMA endpoint and its thread: per-device DMA caps, map/unmap
 │   ├── hotplug.rs                  # PCI Express hotplug: managed slots, poller, acpid's jobs,
 │   │                               #   add and removal jobs

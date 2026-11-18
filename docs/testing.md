@@ -668,11 +668,10 @@ leave, and arrive again, then makes a disk arrive, in one boot per hotplug contr
    carried across the removal.
 7. Hot-add a `virtio-blk-pci` disk over a zero-filled 1 MiB raw image behind the second port (QMP
    `blockdev-add`, then `device_add` with `disable-legacy=on` and `iommu_platform=on`, behind the
-   IOMMU as a boot disk is), a device of the boot-only class `block`, and require, in
-   any order, devmgr's `virtio-blk: binds PCI` line, the hotplug batch's refusal of the drivers
-   directory's virtio-blk (`declares boot-only class block; not considered`), and the driver's
-   `ready, entering service loop` line, with no `boot tier not granted from the drivers
-   directory` line: the disk is bound from the copy devmgr keeps of the boot bundle's virtio-blk
+   IOMMU as a boot disk is), and require, in any order, devmgr's `virtio-blk: binds PCI` line,
+   its `virtio-blk: boot tier not granted from the drivers directory` line, and the driver's
+   `ready, entering service loop` line: the disk is bound from the drivers directory's
+   virtio-blk at the auxiliary tier, as every device unbound after the boot pass is
    ([services/devmgr/docs/hotplug.md](../services/devmgr/docs/hotplug.md#binding) § Binding).
 8. Kill QEMU, remove the staged files, and repack the images in that layout again, whatever the
    outcome.
@@ -1400,7 +1399,7 @@ cargo xtask test-gdb --arch <arch>
 above) on each architecture, two on x86_64 (the firmware's ACPI PCI hotplug, then native control)
 and one on riscv64, at 4 vCPUs, in which devmgr takes two empty root ports' events, binds the
 `test-dma` fixture to the `edu` device the host hot-adds behind one, withdraws it when the host
-removes the device, binds it again when the host adds it again, and binds the boot bundle's
+removes the device, binds it again when the host adds it again, and binds the drivers directory's
 virtio-blk to the disk the host then hot-adds behind the other. The command stages and unstages its
 own files on the current sysroot, a debug-profile build. It bounds each boot to its markers by five
 minutes, the fixture's probes and the disk's bind by three minutes after each hot-add, and the

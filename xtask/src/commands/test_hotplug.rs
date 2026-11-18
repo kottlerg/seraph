@@ -18,10 +18,10 @@
 //! removal lines must come in their order. Once the fixture logs
 //! [`READD_MARKER`], the host adds the device again and waits for the
 //! fixture's verdict. Once the fixture passes, the host hot-adds a
-//! `virtio-blk-pci` disk behind the second port, a class the boot only binds
-//! from the boot bundle: devmgr must bind it from the copy it keeps of the
-//! boot bundle's virtio-blk, refuse the drivers directory's copy, and the
-//! driver must come up ([`disk_bound`]).
+//! `virtio-blk-pci` disk behind the second port: devmgr must bind it from
+//! the drivers directory's virtio-blk, at the auxiliary tier, as it binds
+//! every device unbound after the boot pass, and the driver must come up
+//! ([`disk_bound`]).
 //!
 //! Each boot runs that cycle under one hotplug control. Under native control
 //! devmgr manages the slot ([`MANAGED_MARKER`]): `device_del` presses the
@@ -146,19 +146,15 @@ const DISK_BYTES: u64 = 1 << 20;
 /// hot-add, the disk's. Kept in sync with `services/devmgr/src/bind.rs`.
 const DISK_BIND_MARKER: &str = "[devmgr] virtio-blk: binds PCI";
 
+/// devmgr's line when it binds virtio-blk from the drivers directory, whose
+/// declaration asks for the boot tier: the driver runs at the auxiliary
+/// tier. After the disk's hot-add, it shows the disk bound from the drivers
+/// directory. Kept in sync with `services/devmgr/src/bind.rs`.
+const DISK_DIRECTORY_MARKER: &str = "virtio-blk: boot tier not granted from the drivers directory";
+
 /// The virtio-blk driver's line once it serves its disk. Kept in sync with
 /// `services/drivers/virtio/blk/src/main.rs`.
 const DISK_READY_MARKER: &str = "[virtio-blk] ready, entering service loop";
-
-/// devmgr's line when a drivers-directory pass refuses virtio-blk's
-/// directory copy, of the boot-only class `block`. Kept in sync with
-/// `services/devmgr/src/bind.rs`.
-const DISK_REFUSED_MARKER: &str = "virtio-blk: declares boot-only class block; not considered";
-
-/// devmgr's line for a driver started from the drivers directory that
-/// declares the boot tier, which virtio-blk does: the disk bound from the
-/// directory's copy. Kept in sync with `services/devmgr/src/bind.rs`.
-const DIRECTORY_TIER_MARKER: &str = "boot tier not granted from the drivers directory";
 
 /// Budget for a boot to reach its markers.
 const BOOT_TIMEOUT: Duration = Duration::from_mins(5);
@@ -203,7 +199,7 @@ pub fn run(ctx: &Context, args: &TestHotplugArgs) -> Result<()>
     step(
         "hotplug test: PASS (the hot-added device was bound and works, its removal withdrew its \
          driver and powered the slot off or ejected it, and it was bound again; a hot-added \
-         disk was bound from the boot bundle's driver)",
+         disk was bound from the drivers directory)",
     );
     Ok(())
 }
@@ -447,25 +443,18 @@ fn add_disk(socket: &Path, disk: &Path) -> Result<()>
 }
 
 /// Read the lines of the hot-added disk's bind, in any order: devmgr binds
-/// virtio-blk to it ([`DISK_BIND_MARKER`]), the hotplug batch's
-/// drivers-directory pass refuses the directory's copy of virtio-blk
-/// ([`DISK_REFUSED_MARKER`]), and the driver serves the disk
-/// ([`DISK_READY_MARKER`]). A driver started from the directory's copy
-/// ([`DIRECTORY_TIER_MARKER`]) fails the check: the disk was bound from the
-/// copy devmgr keeps of the boot bundle's virtio-blk.
+/// virtio-blk to it ([`DISK_BIND_MARKER`]), from the drivers directory, at the
+/// auxiliary tier ([`DISK_DIRECTORY_MARKER`]), and the driver serves the disk
+/// ([`DISK_READY_MARKER`]).
 fn disk_bound(lines: &Lines) -> Result<()>
 {
-    let markers = [DISK_BIND_MARKER, DISK_REFUSED_MARKER, DISK_READY_MARKER];
+    let markers = [DISK_BIND_MARKER, DISK_DIRECTORY_MARKER, DISK_READY_MARKER];
     let mut seen = [false; 3];
     while !seen.iter().all(|&s| s)
     {
         let line = lines.until(VERDICT_TIMEOUT, "the hot-added disk's bind", |l| {
-            l.contains(DIRECTORY_TIER_MARKER) || markers.iter().any(|m| l.contains(m))
+            markers.iter().any(|m| l.contains(m))
         })?;
-        if line.contains(DIRECTORY_TIER_MARKER)
-        {
-            bail!("a driver was started from the drivers directory at the hot-add: {line}");
-        }
         for (s, m) in seen.iter_mut().zip(markers)
         {
             *s |= line.contains(m);

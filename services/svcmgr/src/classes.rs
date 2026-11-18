@@ -24,9 +24,8 @@ use crate::endowed_servers;
 
 /// Configure devmgr's classes from [`CLASSES_DIR`] through `devmgr_registry`,
 /// the endowed badge-0 devmgr-registry source, and publish each class SEND.
-/// Runs before svcmgr hands devmgr its drivers directory, so a boot-only
-/// mark is in place before the drivers-directory pass. A file that cannot be
-/// read or parsed, or whose class devmgr refuses, is logged and skipped.
+/// A file that cannot be read or parsed, or whose class devmgr refuses, is
+/// logged and skipped.
 ///
 /// The files are read through vfsd and each class is minted by devmgr, so the
 /// liveness of both is read from their registrations in `pending` before the
@@ -159,26 +158,17 @@ fn configure_one(
             return ControlFlow::Continue(());
         }
     };
-    let flags = if def.boot_only
-    {
-        ipc::devmgr_labels::CLASS_BOOT_ONLY
-    }
-    else
-    {
-        0
-    };
     // SAFETY: `ipc_buf` is svcmgr's registered IPC buffer.
-    let send = match unsafe {
-        ipc::mint_class_send(minter, def.name.as_bytes(), def.verbs, flags, ipc_buf)
-    }
-    {
-        Ok(send) => send,
-        Err(e) =>
+    let send =
+        match unsafe { ipc::mint_class_send(minter, def.name.as_bytes(), def.verbs, ipc_buf) }
         {
-            log!(warn: "class {class}: devmgr refused it ({e:?}); not configured");
-            return server_dead(pending, endowed_servers::DEVMGR, ipc_buf);
-        }
-    };
+            Ok(send) => send,
+            Err(e) =>
+            {
+                log!(warn: "class {class}: devmgr refused it ({e:?}); not configured");
+                return server_dead(pending, endowed_servers::DEVMGR, ipc_buf);
+            }
+        };
     let Some(name) = class_publication(def.stem.as_bytes())
     else
     {

@@ -127,7 +127,7 @@ match, in segment, bus, device, function order, then each function a
 hotplug arrival appended in its order of arrival, in the boot pass over the
 boot modules' declarations, the drivers-directory pass at
 `SET_DRIVERS_DIR` ([responsibilities.md](responsibilities.md#responsibilities)
-§ Responsibilities), and a hotplug batch's passes
+§ Responsibilities), and a hotplug batch's pass
 ([hotplug.md](hotplug.md#binding) § Binding). The scan names no device: the VirtIO device IDs each
 VirtIO driver serves are in its own declaration. A function a declaration
 requires an interrupt for but that gets no IRQ cap (for instance, its line

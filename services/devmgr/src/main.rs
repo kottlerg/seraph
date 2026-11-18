@@ -183,11 +183,6 @@ fn main() -> !
         watch.job_note(),
         caps.self_aspace,
     );
-    // A copy of each boot driver module a hot-added function could match,
-    // taken before the boot pass releases the module caps, so the hotplug
-    // batch binds such a function from the boot bundle as the boot pass
-    // would have.
-    hotplug.keep_images(&boot_modules, &caps, ipc_buf);
 
     // VT-d interrupt remapping, turned on before any line is routed or any
     // message target minted, which the kernel's switch requires; each
@@ -484,16 +479,14 @@ struct RegistryState
     /// answer a job could still change waits for it ([`Registry::lock_settled`]).
     unsettled: usize,
     /// The `LOOKUP | READ | READDIR`-attenuated `/services/drivers/` subtree
-    /// cap svcmgr delivers with `SET_DRIVERS_DIR`; 0 until then.
+    /// cap svcmgr delivers with `SET_DRIVERS_DIR`; 0 until then. Kept once,
+    /// so the drivers-directory pass it posts runs at most once per boot, and
+    /// a driver not served by it replies `NO_DEVICE` thereafter (timed so
+    /// degrades to its no-RTC path).
     drivers_dir_cap: u64,
     /// The absolute path of the directory `drivers_dir_cap` names, from the
     /// same request; empty until then.
     drivers_dir_path: DirPath,
-    /// Whether the drivers-directory pass has been posted: at most once per
-    /// boot, so a driver not served by it replies `NO_DEVICE` thereafter and
-    /// timed degrades gracefully to its no-RTC path. A boot-only class mark
-    /// is refused once it is set.
-    pass_begun: bool,
     /// The directory cap of the `BIND_DRIVERS` request whose pass is posted
     /// and not yet done, which the control thread deletes once the pass
     /// ends; 0 when none is, so a request is admitted only then.
@@ -511,34 +504,24 @@ const _: () =
 impl RegistryState
 {
     /// `MINT_CLASS_SEND` handler, past its gate and version check: intern the
-    /// class `msg` names and mark it configured, and boot-only when asked and
-    /// the drivers-directory pass has not begun ([`Self::pass_begun`]); then
-    /// derive from `registry_ep` the SEND badged with the class's slot and the
-    /// request's verb bits. `Err` with the reply label otherwise:
-    /// `INVALID_REQUEST` for a bad verb mask, flag, or name, a late boot-only
-    /// mark, a full class table, or a failed derivation.
+    /// class `msg` names and mark it configured; then derive from
+    /// `registry_ep` the SEND badged with the class's slot and the request's
+    /// verb bits. `Err` with the reply label otherwise: `INVALID_REQUEST` for
+    /// a bad verb mask or name, a full class table, or a failed derivation.
     fn mint_class_send(&mut self, registry_ep: u64, msg: &IpcMessage) -> Result<u64, u64>
     {
         let invalid = ipc::devmgr_errors::INVALID_REQUEST;
         let verbs = msg.word(1);
-        let flags = msg.word(2);
         // Checked before the class is interned, so a refused request leaves the
         // table as it was.
-        if verbs == 0
-            || verbs & !ipc::VERB_BIT_MASK != 0
-            || flags & !ipc::devmgr_labels::CLASS_BOOT_ONLY != 0
+        if verbs == 0 || verbs & !ipc::VERB_BIT_MASK != 0
         {
             return Err(invalid);
         }
-        let name = ipc::class_name_of(msg, 3)
+        let name = ipc::class_name_of(msg, 2)
             .and_then(ClassName::class)
             .ok_or(invalid)?;
-        let boot_only = flags & ipc::devmgr_labels::CLASS_BOOT_ONLY != 0;
-        let slot = self
-            .served
-            .classes
-            .configure(&name, boot_only, self.pass_begun)
-            .map_err(|_| invalid)?;
+        let slot = self.served.classes.configure(&name).map_err(|_| invalid)?;
         let badge = ipc::devmgr_labels::class_badge::encode(slot, verbs).ok_or(invalid)?;
         syscall::cap_derive_badge(registry_ep, syscall::RIGHTS_EP_SEND, badge).map_err(|_| invalid)
     }
@@ -555,7 +538,6 @@ impl RegistryState
         }
         self.drivers_dir_cap = cap;
         self.drivers_dir_path = *path;
-        self.pass_begun = true;
         Registry::post(self, |j| &mut j.drivers_dir)
     }
 
@@ -616,7 +598,6 @@ impl Registry
                 unsettled: 0,
                 drivers_dir_cap: 0,
                 drivers_dir_path: DirPath::EMPTY,
-                pass_begun: false,
                 bind_dir_cap: 0,
                 bind_dir_path: DirPath::EMPTY,
             }),
@@ -689,20 +670,6 @@ impl Registry
         state.unsettled = state.unsettled.saturating_sub(1);
         drop(state);
         self.settled.notify_all();
-    }
-
-    /// Whether `decl` may be considered by a drivers-directory pass (the
-    /// one `SET_DRIVERS_DIR` posts, or an on-demand one): a declaration of a
-    /// class a class request marked boot-only is not
-    /// ([`firmware::binding::class_admits`]). The boot-only marks are fixed
-    /// once the first pass is posted.
-    fn class_admits(&self, decl: &driver_binding::decl::DriverDecl) -> bool
-    {
-        firmware::binding::class_admits(
-            &self.lock().served.classes,
-            decl,
-            firmware::binding::Source::DriversDir,
-        )
     }
 
     /// Record the client the ready IOMMU driver is called through, so its
@@ -2460,7 +2427,8 @@ fn create_service_endpoint() -> Option<u64>
 }
 
 /// Spawn and settle the batch of a drivers-directory pass, on the control
-/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts: the pass
+/// thread, as the job `SET_DRIVERS_DIR` or `BIND_DRIVERS` posts or a hotplug
+/// arrival runs: the pass
 /// over the records no earlier driver was bound to
 /// ([`bind::drivers_dir_pass`]), each binary read through `dir_cap`, the
 /// `LOOKUP | READ | READDIR`-attenuated directory cap the request delivered
@@ -2495,7 +2463,6 @@ fn spawn_dir_drivers(
         records,
         dir_cap,
         dir_path,
-        |decl| registry.class_admits(decl),
         carve,
         &mut bind::Pass {
             batch: &batch,
@@ -2504,89 +2471,6 @@ fn spawn_dir_drivers(
         },
         ipc_buf,
     );
-    settle_batch(
-        batch,
-        roster,
-        watch,
-        carve.catalog,
-        registry,
-        &mut carve.caps.slot_bars,
-        settle::SETTLE_TIMEOUT,
-        ipc_buf,
-    );
-}
-
-/// Spawn and settle the hotplug batch, on the control thread, as a hotplug
-/// arrival's add job runs it, its two passes in one settle batch: the boot
-/// pass ([`bind::boot_pass`]) over a derivation of each kept boot image of
-/// `images` ([`decls::BootImage`]), under the bounds of a boot module; then,
-/// once `SET_DRIVERS_DIR` installed the drivers directory (`dir_cap` not 0,
-/// named `dir_path`), the drivers-directory pass over the records still
-/// unbound ([`bind::drivers_dir_pass`]), whose declarations of a boot-only
-/// class are refused as in every such pass. A hot-added function is so bound
-/// as it would have been at boot: from the boot bundle's declarations first,
-/// then from the drivers directory. Before `SET_DRIVERS_DIR` a function no
-/// boot image binds waits for that directory's pass.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the batch takes the records, the carve tables, the boot images, the directory cap \
-              and its path, and the watch, registry and IPC buffer it settles with"
-)]
-fn spawn_hotplug_drivers(
-    records: &mut bind::Records,
-    carve: &mut bind::Carve,
-    images: &[decls::BootImage],
-    dir_cap: u64,
-    dir_path: &[u8],
-    watch: &mut settle::DriverWatch,
-    registry: &Registry,
-    ipc_buf: *mut u64,
-)
-{
-    let Some(batch) = settle::SettleBatch::new()
-    else
-    {
-        std::os::seraph::log!(warn: "hotplug batch: no settle batch; no driver spawned");
-        return;
-    };
-    let mut roster = Roster::new();
-    let mut modules = Vec::new();
-    if modules.try_reserve_exact(images.len()).is_ok()
-    {
-        modules.extend(images.iter().filter_map(decls::BootImage::module));
-    }
-    else
-    {
-        std::os::seraph::log!(warn: "hotplug batch: no memory to consider the boot images");
-    }
-    let mut pass = bind::Pass {
-        batch: &batch,
-        watch,
-        roster: &mut roster,
-    };
-    if !modules.is_empty()
-    {
-        bind::boot_pass(records, modules, carve, &mut pass, ipc_buf);
-    }
-    if dir_cap == 0
-    {
-        std::os::seraph::log!(
-            "hotplug: drivers directory not installed; its pass binds the functions added that \
-             no boot image bound"
-        );
-    }
-    else
-    {
-        bind::drivers_dir_pass(
-            records,
-            dir_cap,
-            dir_path,
-            |decl| registry.class_admits(decl),
-            carve,
-            &mut pass,
-            ipc_buf,
-        );
-    }
     settle_batch(
         batch,
         roster,

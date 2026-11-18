@@ -28,7 +28,6 @@ use syscall_abi::PAGE_SIZE;
 
 use crate::acpi::Reply;
 use crate::bind::{self, ConfigRegs};
-use crate::decls::{self, Binary, BootImage};
 use crate::{Registry, caps, settle};
 use ipc::devmgr_errors as errors;
 
@@ -144,10 +143,6 @@ pub struct Hotplug
     /// on.
     posted: mpsc::Sender<Job>,
     jobs: mpsc::Receiver<Job>,
-    /// The boot driver modules a hot-added function can be bound from, kept
-    /// for devmgr's life when the boot scan found a slot
-    /// ([`Self::keep_images`]); empty when it found none.
-    images: Vec<BootImage>,
 }
 
 /// The control thread's ends of the poller's channels.
@@ -249,25 +244,6 @@ impl Hotplug
             poller: None,
             posted,
             jobs,
-            images: Vec::new(),
-        }
-    }
-
-    /// Keep a copy of each boot driver module of `modules` that a hot-added
-    /// function could match ([`decls::keep_images`]), when the boot scan
-    /// found a slot devmgr may manage; called before the boot pass releases
-    /// the module caps. With no slot nothing is kept, since no function can
-    /// be added.
-    pub fn keep_images(
-        &mut self,
-        modules: &[(driver_binding::decl::DriverDecl, Binary)],
-        caps: &caps::DevmgrCaps,
-        ipc_buf: *mut u64,
-    )
-    {
-        if !self.candidates.is_empty()
-        {
-            self.images = decls::keep_images(caps, modules, ipc_buf);
         }
     }
 
@@ -429,13 +405,11 @@ impl Hotplug
     /// posted, each to its end before the next: one slot's removal job posted
     /// while its add job waits runs after it, and withdraws what it bound.
     ///
-    /// An add job records the functions behind the slot ([`add`]), then
-    /// binds them in a settle batch of their own, the hotplug batch
-    /// ([`crate::spawn_hotplug_drivers`]): first from the kept boot images
-    /// ([`Self::keep_images`]), under the bounds of a boot module, then, once
-    /// the drivers directory is installed, from it. Before `SET_DRIVERS_DIR`
-    /// a function no boot image binds is only recorded, and that directory's
-    /// pass binds it. A removal job withdraws and removes them ([`remove`]),
+    /// An add job records the functions behind the slot ([`add`]), then,
+    /// once the drivers directory is installed, binds them in a
+    /// drivers-directory pass of their own settle batch, the hotplug batch.
+    /// Before `SET_DRIVERS_DIR` the functions are only recorded, and its pass
+    /// binds them. A removal job withdraws and removes them ([`remove`]),
     /// then posts the slot to the poller, which powers it off.
     ///
     /// acpid's job runs only on a slot the firmware drives, and is refused,
@@ -547,20 +521,17 @@ impl Hotplug
             let added = add(&slot, records, carve.caps);
             if added > 0
             {
-                bind_added(&self.images, registry, records, carve, watch, ipc_buf);
+                bind_added(registry, records, carve, watch, ipc_buf);
             }
             owner.reply(Reply::success(&[u64::try_from(added).unwrap_or(u64::MAX)]));
         }
     }
 }
 
-/// Bind the functions an add job recorded in a settle batch of their own,
-/// the hotplug batch ([`crate::spawn_hotplug_drivers`]): from the kept boot
-/// images `images` first, then, once the drivers directory is installed,
-/// from it; before `SET_DRIVERS_DIR` that directory's pass binds what no
-/// boot image bound.
+/// Bind the functions an add job recorded, in a drivers-directory pass of
+/// their own settle batch, the hotplug batch, once the drivers directory is
+/// installed; before `SET_DRIVERS_DIR` its pass binds them.
 fn bind_added(
-    images: &[BootImage],
     registry: &Registry,
     records: &mut bind::Records,
     carve: &mut bind::Carve,
@@ -572,10 +543,17 @@ fn bind_added(
         let state = registry.lock();
         (state.drivers_dir_cap, state.drivers_dir_path)
     };
-    crate::spawn_hotplug_drivers(
+    if dir == 0
+    {
+        std::os::seraph::log!(
+            "hotplug: drivers directory not installed; its pass binds the functions added"
+        );
+        return;
+    }
+    crate::spawn_dir_drivers(
+        "hotplug batch",
         records,
         carve,
-        images,
         dir,
         dir_path.as_bytes(),
         watch,

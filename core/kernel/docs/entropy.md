@@ -304,8 +304,9 @@ since its capture.
 The riscv64 *runtime* hardware-RNG path is a virtio-rng/hwrng device owned by a
 userspace driver, the mechanism the RISC-V design intends for lower privilege
 levels to obtain entropy. Its kernel side is the contributed source class
-(§ Sources); the driver, and the service that holds the `EntropyControl`
-capability and contributes the driver's bytes, are future work
+(§ Sources); the driver is `virtio-rng` (`services/drivers/virtio/rng`), which devmgr binds to the
+device as the `hwrng` class. Nothing feeds its bytes into the pool yet: the service that holds the
+`EntropyControl` capability and contributes them is future work
 ([#396](https://github.com/kottlerg/seraph/issues/396)).
 
 TODO: persist a saved seed across boots (read at `init_storage`, rewritten at

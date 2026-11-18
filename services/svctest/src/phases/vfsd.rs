@@ -11,7 +11,8 @@
 //! `vfsd.mount`, badged `MOUNT_AUTHORITY`, `vfsd.deny`, badged with no
 //! verb bit, and `vfsd.swap`, badged `SWAP_AUTHORITY`. Every `MOUNT` case
 //! leaves the mount table as it found it: the deny case and the rejection
-//! cases install nothing and spawn no driver, which each checks through the
+//! cases (a mounted path, a mounted partition at a fresh path, a short
+//! path) install nothing and spawn no driver, which each checks through the
 //! replies and the mounted filesystems afterwards.
 
 use std::os::seraph::startup_info;
@@ -29,6 +30,10 @@ pub fn phases() -> &'static [Phase]
         Phase {
             name: "vfsd_mount_rejects_mounted_paths",
             run: mount_rejects_mounted_paths_phase,
+        },
+        Phase {
+            name: "vfsd_mount_rejects_mounted_partition",
+            run: mount_rejects_mounted_partition_phase,
         },
         Phase {
             name: "vfsd_mount_short_path",
@@ -140,6 +145,40 @@ fn mount_rejects_mounted_paths_phase(caps: &Caps)
     assert_mounts_answer("vfsd_mount_rejects");
     std::os::seraph::log!(
         "vfsd mounted-path phase passed ({REJECT_ROUNDS} rounds of TABLE_FULL, mounts answer)"
+    );
+}
+
+/// `MOUNT` of the data role at a fresh path, while the data partition is
+/// mounted at `/data`, replies `TABLE_FULL` in every one of
+/// `REJECT_ROUNDS` rounds and installs nothing: one driver serves a
+/// partition (vfs-ipc-interface.md § Label 10). A second driver over the
+/// partition would show as `SUCCESS` and a path that resolves.
+fn mount_rejects_mounted_partition_phase(caps: &Caps)
+{
+    const FRESH: &str = "/svctest-data-again";
+    assert_ne!(
+        caps.vfsd_mount, 0,
+        "vfsd_mount_rejects_partition: no vfsd.mount seed"
+    );
+    for round in 0..REJECT_ROUNDS
+    {
+        let msg = mount_request(ROLE_DATA, FRESH.as_bytes(), FRESH.len() as u64);
+        let label = mount_reply(caps.vfsd_mount, &msg, "vfsd_mount_rejects_partition");
+        assert_eq!(
+            label,
+            ipc::vfsd_errors::TABLE_FULL,
+            "MOUNT of the mounted data partition at {FRESH} (round {round}) must reply \
+             TABLE_FULL (got {label:#x})"
+        );
+    }
+    assert!(
+        std::fs::metadata(FRESH).is_err(),
+        "vfsd_mount_rejects_partition: {FRESH} exists after a refused MOUNT"
+    );
+    assert_mounts_answer("vfsd_mount_rejects_partition");
+    std::os::seraph::log!(
+        "vfsd mounted-partition phase passed ({REJECT_ROUNDS} rounds of TABLE_FULL, \
+         nothing mounted)"
     );
 }
 

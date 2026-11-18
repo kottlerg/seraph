@@ -391,6 +391,115 @@ fn probe(fixture: u64, phase: &str, what: &str) -> (u64, u64)
     (reply.word(0), reply.word(1))
 }
 
+/// Hold the level at `CRITICAL` for `phase`, through the `memhog` fixture,
+/// which must be staged ([`MEMHOG_RECIPE`]): wait for `NORMAL`, have the
+/// fixture fill the pool up to the reserve, run `during` once the level reads
+/// `CRITICAL`, and wait for the level to fall back to `NORMAL`. oomd's stop of
+/// the fixture ends the window when oomd's recipe is staged in its stop mode,
+/// at least its grace after the fill; otherwise svctest stops the fixture
+/// itself, through its stop authority, `hold` after the fill. The fixture's
+/// next instance must then answer with a new nonce and no pages.
+///
+/// Returns the last `ElapsedUs` reading taken before a read of the level that
+/// gave `CRITICAL`. From the fill to that reading the fixture holds the pool
+/// at the reserve, so a process outside the system reserve takes no free page,
+/// except the pages another process frees in the window, which the fixture
+/// takes back only at its next tick (`mem_fill::TICK_MS`). `during` and the
+/// wait must allocate nothing and write no log line; the stack they use is
+/// touched before the fill.
+pub(super) fn critical_window(
+    caps: &Caps,
+    phase: &str,
+    hold: Duration,
+    during: impl FnOnce(),
+) -> u64
+{
+    let stops = oomd_config(phase).is_some_and(|config| config.mode == oomd_policy::Mode::Stop);
+    await_level(MemoryPressure::Normal, phase, "before the fill");
+    let fixture = super::svcmgr::provided_endpoint(hog::NAME, phase);
+    let (first, idle) = probe(fixture, phase, "PROBE before the fill");
+    assert_eq!(
+        idle, 0,
+        "{phase}: memhog holds {idle} pages before the fill"
+    );
+    let own_stop = (!stops).then(|| {
+        let cap = caps.stop_authority;
+        assert_ne!(
+            cap, 0,
+            "{phase}: no stop-authority cap (stop_authority = yes)"
+        );
+        let key = super::svcmgr::list_candidates(cap, phase)
+            .iter()
+            .find(|c| c.name == "memhog")
+            .map_or_else(
+                || panic!("{phase}: svcmgr lists no memhog candidate"),
+                |c| c.key,
+            );
+        (cap, key)
+    });
+    touch_stack();
+    let _ = hog_call(fixture, phase);
+    during();
+    if let Some((cap, key)) = own_stop
+    {
+        let _ = syscall::thread_sleep(u64::try_from(hold.as_millis()).unwrap_or(u64::MAX));
+        let label = super::svcmgr::stop_candidate(cap, key);
+        assert_eq!(
+            label,
+            ipc::stop_labels::SUCCESS,
+            "{phase}: STOP_CANDIDATE(memhog) replied {label:#x}"
+        );
+    }
+    let critical_until = await_fall(phase);
+    let (next, pages) = probe(fixture, phase, "PROBE after the window");
+    assert_ne!(next, first, "{phase}: the hogging instance still answered");
+    assert_eq!(
+        pages, 0,
+        "{phase}: memhog's next instance holds {pages} pages"
+    );
+    let _ = syscall::cap_delete(fixture);
+    critical_until
+}
+
+/// Wait up to [`NORMAL_WAIT`] for the level to read `NORMAL`: the last
+/// `ElapsedUs` reading taken before a read of the level that gave
+/// `CRITICAL`. Fails `phase` when no read before the fall gave `CRITICAL`.
+/// Allocates nothing until it fails.
+fn await_fall(phase: &str) -> u64
+{
+    let start = Instant::now();
+    let mut critical_until = None;
+    loop
+    {
+        let now = elapsed_us();
+        match std::os::seraph::memory_pressure()
+        {
+            Some(MemoryPressure::Critical) => critical_until = Some(now),
+            Some(MemoryPressure::Normal) =>
+            {
+                return critical_until.unwrap_or_else(|| {
+                    panic!("{phase}: the level never read CRITICAL after the fill")
+                });
+            }
+            _ =>
+            {}
+        }
+        assert!(
+            start.elapsed() < NORMAL_WAIT,
+            "{phase}: the level did not read NORMAL {NORMAL_WAIT:?} after the fill"
+        );
+        std::thread::sleep(LEVEL_POLL);
+    }
+}
+
+/// Microseconds since boot, the clock logd stamps each history entry with
+/// (`ElapsedUs`).
+pub(super) fn elapsed_us() -> u64
+{
+    syscall::system_info(syscall_abi::SystemInfoType::ElapsedUs as u64)
+        .unwrap_or_else(|e| panic!("system_info(ElapsedUs) failed ({e})"))
+}
+
 /// Have the fixture fill the pool up to the reserve: the pages it holds once
 /// the level has settled at `CRITICAL`. Allocates nothing.
 fn hog_call(fixture: u64, phase: &str) -> u64

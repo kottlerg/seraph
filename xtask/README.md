@@ -212,16 +212,19 @@ is a superset that `xtask` does not expose (see
 
 Every `run` attaches, on both architectures, the disk image as `virtio-blk-pci` (drive `hd0`), a
 `virtio-keyboard-pci` keyboard (`id=kbd0`, the device `test-terminal` injects keys into over QMP), a
-`virtio-rng-pci` boot-entropy source, the guest UART on `-serial stdio`, and, unless `--iommu
-absent`, the machine's IOMMU: `intel-iommu,intremap=on,eim=on` on x86-64, whose interrupt remapping
-makes a KVM launch's machine `q35,kernel-irqchip=split`, and `riscv-iommu-pci` in Bare mode on
-riscv64, with the disks and the keyboard behind it (`iommu_platform=on`); the RNG, which only the
-firmware drives, stays outside it. The riscv64 IOMMU is the first device of the command line, pinned
-at 00:01.0, so every auto-placed device takes a slot above it: QEMU's ACPI RIMT describes the IOMMU
-as translating only the requester IDs above its own. `--test-devices` adds, on both architectures,
-`-device edu,dma_mask=0xffffffff`, QEMU's DMA test device (PCI `1234:11e8`) with a 32-bit DMA mask
-so its engine reaches the interrupt addresses the forged-message phase writes, behind the IOMMU
-when one is attached, which only svctest's DMA confinement and MSI phases drive
+modern-only `virtio-rng-pci,disable-legacy=on` entropy source, the guest UART on `-serial stdio`,
+and, unless `--iommu absent`, the machine's IOMMU: `intel-iommu,intremap=on,eim=on` on x86-64, whose
+interrupt remapping makes a KVM launch's machine `q35,kernel-irqchip=split`, and `riscv-iommu-pci`
+in Bare mode on riscv64, with the disks, the keyboard, and the RNG behind it (`iommu_platform=on`).
+The firmware drives the RNG first (EDK2's `VirtioRngDxe` serves the bootloader's `EFI_RNG_PROTOCOL`
+draw on riscv64; OVMF binds it on x86-64, where its RDRAND driver answers the draw), and at run time
+devmgr binds the `virtio-rng` driver of the `hwrng` class to it. The riscv64 IOMMU is the first
+device of the command line, pinned at 00:01.0, so every auto-placed device takes a slot above it:
+QEMU's ACPI RIMT describes the IOMMU as translating only the requester IDs above its own.
+`--test-devices` adds, on both architectures, `-device edu,dma_mask=0xffffffff`, QEMU's DMA test
+device (PCI `1234:11e8`) with a 32-bit DMA mask so its engine reaches the interrupt addresses the
+forged-message phase writes, behind the IOMMU when one is attached, which only svctest's DMA
+confinement and MSI phases drive
 ([services/drivers/test-dma/README.md](../services/drivers/test-dma/README.md)), and four QEMU
 `pci-testdev` functions (PCI `1b36:0005`) at pinned slots 0x15, 0x16, 0x17 (`membar=4K`) and 0x18
 (`membar=8K`), which the test-only `test-fault` driver binds
@@ -1354,9 +1357,12 @@ Then two storage boots on the split-data layout, under native control, with the 
 
 3. the data disk (`disk-data.img`) behind the first port from boot: the host removes it (QMP
    `device_del`), requires devmgr's removal lines and vfsd's `disk N: removed; tearing down its
-   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node), then
-   requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`, svcmgr's `critical service
-   unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
+   mounts`, adds it again (`device_add` of a `virtio-blk-pci` on the kept block node); once the
+   fixture logs `MOUNTED /data on the re-added disk`, it adds a raw block node over a copy of
+   `disk-data.img` taken before the boot (`target/xtask/hotplug-tie-disk.img`, removed after
+   the boot) and a `virtio-blk-pci` on it behind the second port, with the data disk's
+   properties; it then requires the fixture's `PASS`, vfsd's `FATAL: root filesystem lost`,
+   svcmgr's `critical service unrecoverable: vfsd; initiating graceful shutdown`, and QEMU's exit;
 4. the boot disk behind the first port and the data disk on a slot of its own: the host removes
    the boot disk and requires the same last three.
 

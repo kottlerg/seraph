@@ -197,7 +197,9 @@ pub(crate) fn mint_logd_boot_caps(
 /// [`ProvidedName::badge`] (`cap_derive_badge` when non-zero, plain
 /// `cap_derive` for a bare entry); the badge rides through to a
 /// consumer unchanged. A name whose badge carries a verb bit is published
-/// seed-only, so `QUERY_ENDPOINT` refuses it. The endpoint persists on
+/// seed-only, so `QUERY_ENDPOINT` refuses it; a `:grant` name
+/// ([`ProvidedName::grant`]) is published `SEND|GRANT` and
+/// [`Visibility::SeedOnlyGrant`], so its seeds can move caps to the provider. The endpoint persists on
 /// the `ServiceEntry`, so the SENDs stay valid across restarts. No-op for
 /// a pure consumer (`provided_endpoint == 0`) or an empty list.
 fn publish_provided(
@@ -213,13 +215,21 @@ fn publish_provided(
     }
     for p in provides
     {
-        let derived = if p.badge == 0
+        let rights = if p.grant
         {
-            syscall::cap_derive(provided_endpoint, syscall::RIGHTS_EP_SEND)
+            syscall::RIGHTS_EP_SEND_GRANT
         }
         else
         {
-            syscall::cap_derive_badge(provided_endpoint, syscall::RIGHTS_EP_SEND, p.badge)
+            syscall::RIGHTS_EP_SEND
+        };
+        let derived = if p.badge == 0
+        {
+            syscall::cap_derive(provided_endpoint, rights)
+        }
+        else
+        {
+            syscall::cap_derive_badge(provided_endpoint, rights, p.badge)
         };
         let Ok(send) = derived
         else
@@ -230,9 +240,14 @@ fn publish_provided(
             );
             continue;
         };
-        // An entry whose badge carries a verb bit (`:auth`) is authority;
-        // only the recipes seeding it may hold it.
-        let visibility = if p.badge & ipc::VERB_BIT_MASK == 0
+        // An entry whose badge carries a verb bit (`:auth`, `:grant`) is
+        // authority; only the recipes seeding it may hold it. A `:grant`
+        // entry always carries the verb bit (the parser stamps it).
+        let visibility = if p.grant
+        {
+            Visibility::SeedOnlyGrant
+        }
+        else if p.badge & ipc::VERB_BIT_MASK == 0
         {
             Visibility::Public
         }

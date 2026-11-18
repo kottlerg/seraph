@@ -23,8 +23,9 @@ programs it holds kill authority over, and oomd stops them before any service.
 
 A service is stoppable only when its recipe sets `oom_stop = yes` and svcmgr's eligibility rule
 admits it ([`.svc` Service Definitions](../svcmgr/docs/service-definitions.md) § `oom_stop`). No
-recipe of the default image sets `oom_stop` or `stop_source`, so by default oomd finds nothing to
-stop and only logs the episode. With `OOMD_STOP=no` it names the service it would stop and stops
+recipe of the default image sets `oom_stop`, and only sessiond's sets `stop_source`, so by default
+oomd stops a program or session sessiond lists, and no service, and only logs the episode when
+sessiond lists none. With `OOMD_STOP=no` it names the service it would stop and stops
 none.
 
 oomd acts only through the capabilities its recipe endows: the stop authority svcmgr mints for
@@ -74,12 +75,16 @@ a fall below `CRITICAL`, an unreadable level, `OOMD_STOP=no`), the class codes a
 The svctest `oom_policy` phase drives oomd end to end with the `memhog` fixture
 ([services/memhog/README.md](../memhog/README.md)) and the `stopsrc` fixture
 ([services/stopsrc/README.md](../stopsrc/README.md)), which the svctest boot stages: stopsrc
-restarts, so the source oomd finds started after oomd, and starts a job; memhog fills the pool up to
-the reserve; oomd stops the job after the grace and memhog a cooldown later, the level falls to
-`NORMAL`, memhog's next instance is idle, and oomd has logged one stop of each. In a boot that
-stages crashd with a stall, a child of svctest writes a page while the pool is full, and crashd
-resumes it once the stop frees memory. With `OOMD_STOP=no`, or without oomd's recipe, the phase
-checks that nothing stops memhog ([services/svctest/README.md](../svctest/README.md)).
+restarts, so the source oomd finds started after oomd, and starts a job. With sessiond staged,
+svctest also opens an operator session whose shell runs `crashme oom-hold 512`, a job larger than
+stopsrc's 64-page one. memhog fills the pool up to the reserve; oomd stops the crashme job after the
+grace, then stopsrc's job, then the session or sessions, then memhog, a cooldown apart; the
+session's relay gives the leader's end. The level falls to `NORMAL`, memhog's next instance is idle,
+and oomd has logged one stop of each. In a boot that stages crashd with a stall, a child of svctest
+writes a page while the pool is full, its start deferred until sessiond lists no candidate, so
+crashd's hold covers only memhog's stop, and crashd resumes it once the stop frees memory. With
+`OOMD_STOP=no`, or without oomd's recipe, the phase checks that nothing stops memhog
+([services/svctest/README.md](../svctest/README.md)).
 
 ---
 

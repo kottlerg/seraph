@@ -1,6 +1,7 @@
 # shell
 
-Minimal interactive shell: the child of [`programs/terminal`](../terminal/README.md).
+Minimal interactive shell: the leader of an operator session that sessiond opens for
+[`programs/terminal`](../terminal/README.md).
 It reads `\n`-terminated lines from stdin, runs a small set of built-ins, and
 otherwise spawns `/programs/<name>` as an external command. Pure `std` — no
 Seraph cap awareness; stdin/stdout/stderr are the terminal's stdio pipes and
@@ -31,7 +32,7 @@ shell/
 - **Prompt**: `$ ` written (and flushed) before each line is read.
 - **Built-ins**:
   - `help` — list the built-ins.
-  - `exit` — exit the shell (the [terminal](../terminal/README.md) respawns it).
+  - `exit` — exit the shell (the [terminal](../terminal/README.md) opens a new session).
   - `echo <args...>` — print the arguments separated by single spaces.
   - `pwd` — print the working directory.
   - `cd <path>` — change directory.
@@ -63,10 +64,10 @@ blocked stdin read cannot be cancelled, so a child that never reads stdin (e.g.
 
 ### Placement relative to a real shell
 
-The shell occupies bash's *role* — the interactive REPL child of the terminal that spawns and reaps
-its own children — but over a different I/O substrate. A Unix shell does **not** relay stdin: the
-shell and its children share one kernel TTY, and the kernel routes input to the foreground process
-group (job control). Seraph has no shared tty and no job control yet ([#29]); the
+The shell occupies bash's *role* — the interactive REPL, the leader of the terminal's session, that
+spawns and reaps its own children — but over a different I/O substrate. A Unix shell does **not**
+relay stdin: the shell and its children share one kernel TTY, and the kernel routes input to the
+foreground process group (job control). Seraph has no shared tty and no job control yet ([#29]); the
 [terminal](../terminal/README.md) relays to exactly one pipe (the shell's stdin) and is oblivious to
 grandchildren. So the shell forwarding stdin to its child is the *interim* substitute for the
 shared-tty / foreground-group model — not a bash-faithful mechanism. The Unix-faithful design (the

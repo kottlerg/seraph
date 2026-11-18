@@ -8,7 +8,10 @@
 //! stops it once the level has read `CRITICAL` for its grace, or, with
 //! `OOMD_STOP=no` or no oomd, nothing stops it. With the `stopsrc` fixture
 //! staged, oomd first stops the job that stop source lists, since the program
-//! class is stopped before the service class.
+//! class is stopped before the service class. With sessiond staged, svctest
+//! opens an operator session whose shell runs a job larger than `stopsrc`'s,
+//! and oomd stops that job first, then `stopsrc`'s, then the sessions, then
+//! the fixture (docs/session-supervision.md).
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -64,6 +67,16 @@ const JOB_STOP_LINE: &[u8] = b"stopped stopsrc-job: ";
 /// The pages of the job the stop case has `stopsrc` start: few, so its stop
 /// leaves the level `CRITICAL` while memhog tops its fill up.
 const JOB_PAGES: u64 = 64;
+
+/// The prefix of oomd's line for a stop of the session's job.
+const HOLD_STOP_LINE: &[u8] = b"stopped /programs/crashme: ";
+
+/// The prefix of oomd's line for a stop of a session.
+const SESSION_STOP_LINE: &[u8] = b"stopped session ";
+
+/// The pages of the job the stop case has its session's shell start: more
+/// than [`JOB_PAGES`] by far, so oomd stops it before `stopsrc`'s.
+const HOLD_PAGES: u64 = 512;
 
 /// The prefix of oomd's line for a stop of the fixture it advises.
 const ADVICE_LINE: &[u8] = b"would stop memhog: ";
@@ -140,10 +153,14 @@ fn env_value<'a>(recipe: &'a str, key: &str) -> Option<&'a str>
 /// staged, the phase first has that stop source exit, so the instance svcmgr
 /// restarts started after oomd, and start a job of [`JOB_PAGES`]: oomd stops
 /// the job at its first act, before memhog at a later one, and the fixture
-/// reports the job stopped. With crashd holding
+/// reports the job stopped. With sessiond staged, the phase opens an
+/// operator session whose shell runs `crashme oom-hold` [`HOLD_PAGES`]:
+/// oomd stops that job first, as the largest of the program class, then
+/// `stopsrc`'s, then the sessions, then the fixture, and the session's relay
+/// gives its leader's end. With crashd holding
 /// faults, a child (`/programs/crashme oom-touch`) writes a demand page
-/// while the pool is full: crashd holds the fault, and resumes it once the
-/// stop frees memory, so the child exits 0 and crashd logs one more resumed
+/// while the pool is full, once sessiond lists no candidate when it is
+/// staged: crashd holds the fault, and resumes it once the stop frees memory, so the child exits 0 and crashd logs one more resumed
 /// fault.
 ///
 /// With `OOMD_STOP=no`, or no oomd (the no-stop case): the level stays
@@ -177,7 +194,7 @@ fn oom_policy_phase(caps: &Caps)
     {
         Some(config) if config.mode == oomd_policy::Mode::Stop =>
         {
-            stop_case(fixture, config, before, phase);
+            stop_case(caps, fixture, config, before, phase);
         }
         _ => no_stop_case(caps, fixture, config, first, before, phase),
     }
@@ -192,13 +209,21 @@ fn oom_policy_phase(caps: &Caps)
 }
 
 /// The stop case of [`oom_policy_phase`].
-fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &str)
+fn stop_case(caps: &Caps, fixture: u64, config: oomd_policy::Config, before: Lines, phase: &str)
 {
     let job = super::svcmgr::recipe_staged(super::svcmgr::STOPSRC_RECIPE, phase)
         .then(|| Job::start(phase));
+    let session = super::sessiond::staged(caps, phase).then(|| Held::start(caps, phase));
     let mut toucher = crashd_holds(phase).then(|| Toucher::start(phase));
     touch_stack();
     let pages = hog_call(fixture, phase);
+    if let Some(session) = &session
+    {
+        // crashd holds the toucher's fault for its stall alone, so the write
+        // waits for oomd to have stopped every program, which leaves only
+        // the fixture's stop before memory is freed.
+        session.await_no_candidate(phase);
+    }
     if let Some(toucher) = &mut toucher
     {
         toucher
@@ -215,11 +240,13 @@ fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &s
         now.stops > before.stops
             && (held_ms.is_none() || now.resumed > before.resumed)
             && (job.is_none() || now.job_stops > before.job_stops)
+            && (session.is_none() || now.hold_stops > before.hold_stops)
     });
     if let Some(job) = &job
     {
         job.finish(&before, &after, phase);
     }
+    let sessions = session.map(|session| session.finish(&before, &after, job.as_ref(), phase));
     let stops = after.stops.saturating_sub(before.stops);
     assert_eq!(
         stops, 1,
@@ -231,13 +258,20 @@ fn stop_case(fixture: u64, config: oomd_policy::Config, before: Lines, phase: &s
         "{phase}: oomd advised in its stop mode"
     );
     let critical_ms = after.last_stop_critical_ms.unwrap_or(0);
-    let job_line = if job.is_some()
+    let job_line = match (sessions, job.is_some())
     {
-        "; stopsrc's job stopped first"
-    }
-    else
-    {
-        ""
+        (Some(sessions), true) => format!(
+            "; the session's job, stopsrc's job and the sessions ({sessions}) stopped first, in that \
+             order"
+        ),
+        (Some(sessions), false) =>
+        {
+            format!(
+                "; the session's job and the sessions ({sessions}) stopped first, in that order"
+            )
+        }
+        (None, true) => String::from("; stopsrc's job stopped first"),
+        (None, false) => String::new(),
     };
     assert!(
         critical_ms >= config.grace_ms,
@@ -407,6 +441,14 @@ struct Lines
     /// Whether the newest stop of the job was logged before the newest stop
     /// of the fixture.
     job_first: bool,
+    /// oomd's stops of the session's job.
+    hold_stops: usize,
+    /// oomd's stops of sessions.
+    session_stops: usize,
+    /// Where in the history, newest first, the newest stop of the session's
+    /// job, of `stopsrc`'s job and of the fixture, and the newest and the
+    /// oldest stop of a session, sit.
+    at: Positions,
     /// oomd's advice to stop the fixture.
     advice: usize,
     /// crashd's resumed held faults.
@@ -454,6 +496,11 @@ impl Lines
             .find(|(_, bytes)| contains(bytes, STOP_LINE))
             .and_then(|(_, bytes)| critical_ms(bytes));
         // Newest first: the line logged first sits further down.
+        let oldest = |needle: &[u8]| {
+            history
+                .iter()
+                .rposition(|(_, bytes)| contains(bytes, needle))
+        };
         let job_first = matches!(
             (newest(JOB_STOP_LINE), newest(STOP_LINE)),
             (Some(job), Some(hog)) if job > hog
@@ -463,11 +510,32 @@ impl Lines
             stops: count(STOP_LINE),
             job_stops: count(JOB_STOP_LINE),
             job_first,
+            hold_stops: count(HOLD_STOP_LINE),
+            session_stops: count(SESSION_STOP_LINE),
+            at: Positions {
+                hold: newest(HOLD_STOP_LINE),
+                job: newest(JOB_STOP_LINE),
+                hog: newest(STOP_LINE),
+                session_newest: newest(SESSION_STOP_LINE),
+                session_oldest: oldest(SESSION_STOP_LINE),
+            },
             advice: count(ADVICE_LINE),
             resumed: count(RESUMED_LINE),
             last_stop_critical_ms,
         }
     }
+}
+
+/// Positions in logd's history, newest first, of oomd's stop lines; see
+/// [`Lines::at`].
+#[derive(Clone, Copy)]
+struct Positions
+{
+    hold: Option<usize>,
+    job: Option<usize>,
+    hog: Option<usize>,
+    session_newest: Option<usize>,
+    session_oldest: Option<usize>,
 }
 
 /// The milliseconds an oomd stop line gives the level as critical for:
@@ -561,6 +629,95 @@ pub(super) fn src_call(
         reply.label
     );
     (reply.word(0), reply.word(1), reply.word(2))
+}
+
+/// The operator session the stop case opens, whose shell runs
+/// `crashme oom-hold` [`HOLD_PAGES`]: a job of the program class larger
+/// than `stopsrc`'s.
+struct Held
+{
+    session: super::sessiond::Session,
+    /// sessiond's stop SEND, read before the fill so the poll of its
+    /// candidates allocates nothing.
+    send: u64,
+}
+
+impl Held
+{
+    /// Open the session and start its job; return once the job holds its
+    /// pages.
+    fn start(caps: &Caps, phase: &str) -> Self
+    {
+        let send = super::sessiond::stop_send(caps, phase);
+        let mut session = super::sessiond::Session::open(caps.sessiond_operator, phase);
+        session.send(&format!("crashme oom-hold {HOLD_PAGES}"), phase);
+        session.expect(&format!("holding {HOLD_PAGES}"), phase);
+        Self { session, send }
+    }
+
+    /// Wait, up to [`NORMAL_WAIT`], for sessiond to list no candidate: oomd
+    /// has stopped every session and job, or the level has fallen first,
+    /// which the checks after report. Allocates nothing until it fails.
+    fn await_no_candidate(&self, phase: &str)
+    {
+        let start = Instant::now();
+        while super::sessiond::candidate_count(self.send, phase) != 0
+            && std::os::seraph::memory_pressure() == Some(MemoryPressure::Critical)
+        {
+            assert!(
+                start.elapsed() < NORMAL_WAIT,
+                "{phase}: sessiond still lists candidates {NORMAL_WAIT:?} after the fill"
+            );
+            std::thread::sleep(LEVEL_POLL);
+        }
+    }
+
+    /// Check that oomd stopped the session's job once, first, before
+    /// `stopsrc`'s job when that ran (`job`), every session after the
+    /// jobs and before the fixture, and that the session ended: the number
+    /// of sessions oomd stopped.
+    fn finish(self, before: &Lines, after: &Lines, job: Option<&Job>, phase: &str) -> usize
+    {
+        let hold_stops = after.hold_stops.saturating_sub(before.hold_stops);
+        assert_eq!(
+            hold_stops, 1,
+            "{phase}: oomd logged {hold_stops} stops of the session's job"
+        );
+        let at = after.at;
+        let before_hog = |pos: Option<usize>| matches!((pos, at.hog), (Some(p), Some(h)) if p > h);
+        assert!(
+            before_hog(at.hold),
+            "{phase}: oomd stopped the session's job after memhog"
+        );
+        let last_job = if job.is_some()
+        {
+            assert!(
+                matches!((at.hold, at.job), (Some(h), Some(j)) if h > j),
+                "{phase}: oomd stopped stopsrc's smaller job before the session's"
+            );
+            at.job
+        }
+        else
+        {
+            at.hold
+        };
+        let sessions = after.session_stops.saturating_sub(before.session_stops);
+        if sessions > 0
+        {
+            assert!(
+                matches!((last_job, at.session_oldest), (Some(j), Some(s)) if j > s)
+                    && before_hog(at.session_newest),
+                "{phase}: oomd stopped a session before a job, or after memhog"
+            );
+        }
+        let status = self.session.wait(phase);
+        assert!(
+            !status.success(),
+            "{phase}: the session's leader exited cleanly while oomd stopped programs"
+        );
+        let _ = syscall::cap_delete(self.send);
+        sessions
+    }
 }
 
 /// A `/programs/crashme oom-touch` child, between its `ready` and its

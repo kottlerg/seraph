@@ -382,18 +382,19 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                 seen_provides = true;
                 for tok in value.split_whitespace()
                 {
-                    let (name, badge) = match tok.split_once(':')
+                    let (name, badge, grant) = match tok.split_once(':')
                     {
-                        Some((n, "auth")) => (n, PROVIDES_AUTH_BADGE),
-                        Some((n, "deny")) => (n, PROVIDES_DENY_BADGE),
+                        Some((n, "auth")) => (n, PROVIDES_AUTH_BADGE, false),
+                        Some((n, "grant")) => (n, PROVIDES_AUTH_BADGE, true),
+                        Some((n, "deny")) => (n, PROVIDES_DENY_BADGE, false),
                         Some((_, _)) =>
                         {
                             return Err(ParseError::InvalidValue(
                                 lineno,
-                                "provides suffix must be :auth or :deny",
+                                "provides suffix must be :auth, :grant or :deny",
                             ));
                         }
-                        None => (tok, 0),
+                        None => (tok, 0, false),
                     };
                     if name.is_empty() || name.len() > ipc::svcmgr_labels::NAME_MAX
                     {
@@ -407,6 +408,7 @@ pub fn parse(name: &str, contents: &str) -> Result<Definition, ParseError>
                         ProvidedName {
                             name: owned(name)?,
                             badge,
+                            grant,
                         },
                     )?;
                 }
@@ -767,7 +769,9 @@ const fn oom_stop_refusal(refusal: StopRefusal) -> &'static str
 /// recipe and return a copy of the `provides` entry it names: `name` is one
 /// of the recipe's own `provides` entries and carries `:auth`, since svcmgr
 /// stamps that entry's badge on the SEND it calls the shutdown request
-/// through and the actuator's gate tests the authority bit; and the service
+/// through and the actuator's gate tests the authority bit (a `:grant`
+/// entry is refused: the shutdown request moves no cap, so the actuator's
+/// name gives its seeders no `GRANT`); and the service
 /// is supervised (`restart` other than `never`), since svcmgr reads the
 /// liveness of the actuator's supervised entry, and derives the SEND from
 /// the endpoint that entry holds, before it calls.
@@ -779,7 +783,7 @@ fn check_shutdown_actuator(
 {
     let Some(entry) = provides
         .iter()
-        .find(|p| p.name == name && p.badge == PROVIDES_AUTH_BADGE)
+        .find(|p| p.name == name && p.badge == PROVIDES_AUTH_BADGE && !p.grant)
     else
     {
         return Err(ParseError::InvalidValue(
@@ -797,6 +801,7 @@ fn check_shutdown_actuator(
     Ok(ProvidedName {
         name: owned(&entry.name)?,
         badge: entry.badge,
+        grant: entry.grant,
     })
 }
 
@@ -1167,6 +1172,34 @@ sched_max = 12\n";
         ));
     }
 
+    // Defect guarded: a `:grant` entry published without the verb bit
+    // (reachable through QUERY_ENDPOINT with GRANT), or GRANT leaking onto
+    // the `:auth` and `:deny` entries beside it.
+    #[test]
+    fn a_grant_entry_carries_the_auth_badge_and_alone_takes_grant()
+    {
+        let def = parse_with("provides = s.op:grant s.ctl:auth s.pub:deny s.raw\n")
+            .expect("every suffix");
+        let got: Vec<(&str, u64, bool)> = def
+            .provides
+            .iter()
+            .map(|p| (p.name.as_str(), p.badge, p.grant))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("s.op", PROVIDES_AUTH_BADGE, true),
+                ("s.ctl", PROVIDES_AUTH_BADGE, false),
+                ("s.pub", PROVIDES_DENY_BADGE, false),
+                ("s.raw", 0, false),
+            ]
+        );
+        assert!(matches!(
+            parse_with("provides = s.op:grants\n"),
+            Err(ParseError::InvalidValue(_, why)) if why.starts_with("provides suffix")
+        ));
+    }
+
     #[test]
     fn a_stop_source_needs_badged_provides_and_supervision()
     {
@@ -1190,6 +1223,12 @@ sched_max = 12\n";
         assert_eq!(
             supervised_with("provides = s.ctl:auth s.pub:deny\nstop_source = program\n")
                 .expect("every entry badged")
+                .stop_source,
+            Some(StopClass::Program)
+        );
+        assert_eq!(
+            supervised_with("provides = s.op:grant\nstop_source = program\n")
+                .expect("a :grant entry is badged")
                 .stop_source,
             Some(StopClass::Program)
         );
@@ -1302,6 +1341,7 @@ sched_max = 12\n";
             ("x.off:auth", "y.off"),
             ("x.off:deny x.on:auth", "x.off"),
             ("x.off", "x.off"),
+            ("x.off:grant", "x.off"),
         ]
         {
             assert!(matches!(

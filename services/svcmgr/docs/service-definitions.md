@@ -63,9 +63,9 @@ seed      = rootfs.root pwrmgr.shutdown devmgr.registry devmgr.bind vfsd.mount v
 | `namespace` | yes | One of `none`, `universal`, `subtree:<path>:<rights>`. |
 | `cwd` | no | Path interpreted relative to svcmgr's universal root; must lie inside the namespace (see [`cwd`](#cwd)). Forbidden when `namespace = none`. |
 | `seed` | no | Space-separated discovery-registry names, resolved positionally (cap[i] = i-th name; cap[i+1] for a `provides` service). Any number of names; slots past one bootstrap round's `MSG_CAP_SLOTS_MAX` (4) caps ride in further rounds; see [`seed`](#seed). |
-| `provides` | no | Space-separated `name[:auth\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
+| `provides` | no | Space-separated `name[:auth\|:grant\|:deny]` entries. svcmgr creates this service's endpoint, serves its RECV as bootstrap `cap[0]`, and publishes one badged SEND per entry into the discovery registry. See [`provides`](#provides). |
 | `log_sink` | no | `yes` or `no` (default `no`). Marks the service as the system log sink (real-logd); svcmgr mints its bootstrap round from the reserved log-sink sources init endows. Mutually exclusive with `seed` and `provides`. See [`log_sink`](#log_sink). |
-| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth`. Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
+| `shutdown_actuator` | no | One name of this recipe's `provides` list, carrying `:auth` (not `:grant`). Declares the service the system's shutdown actuator: svcmgr calls the shutdown request through that name when a `critical = yes` service is permanently down. Needs `restart` other than `never`. See [`shutdown_actuator`](#shutdown_actuator). |
 | `debug_authority` | no | `yes` or `no` (default `no`). Endows the service with procmgr's debug authority, a `DEBUG_AUTHORITY` `SEND\|GRANT` on procmgr, in the bootstrap slot after its `seed` caps. Mutually exclusive with `log_sink`. See [`debug_authority`](#debug_authority). |
 | `stop_authority` | no | `yes` or `no` (default `no`). Endows the service with svcmgr's stop authority, a `STOP_AUTHORITY` SEND on svcmgr's service endpoint, in the bootstrap slot after its `seed` caps and its debug-authority slot. Mutually exclusive with `log_sink`. See [`stop_authority`](#stop_authority). |
 | `stop_source` | no | `program`. Makes the service a stop source of that class: svcmgr creates it contained and lists it, with a stop-badged SEND on its endpoint, to a stop-authority holder. A core role. Needs `provides` with every entry badged, and `restart` other than `never`. See [`stop_source`](#stop_source). |
@@ -157,7 +157,7 @@ The primary lever for confining a service to only what it needs.
 | Form | Effect |
 |---|---|
 | `none` | No namespace cap delivered. The child's `ProcessInfo.system_root_cap` stays zero; std-side absolute-path filesystem operations return `Unsupported` (see [Namespace Model](../../../docs/namespace-model.md#initial-capability-delivery)). Default tight choice for services with no filesystem dependency. |
-| `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority. The recipes that declare it are `svctest` (the namespace tester), `usertest`, `terminal`, and the `stopsrc` test fixture, which resolve and spawn programs; the recipes of the init-bootstrapped substrate services declare `none`, since init, not svcmgr, spawned them. |
+| `universal` | `cap_copy` of svcmgr's own root (the system universal root). Reserved for services that need genuine root authority. The recipes that declare it are `svctest` (the namespace tester), `usertest`, `sessiond`, and the `stopsrc` test fixture, which resolve and spawn programs; the recipes of the init-bootstrapped substrate services declare `none`, since init, not svcmgr, spawned them. |
 | `subtree:<path>:<rights>` | Walk `<path>` from svcmgr's root requesting `<rights>` per hop, hand the resulting directory cap to the child. `<path>` is absolute, names a directory below the root, and is at most `ipc::MAX_PATH_LEN` (4096) bytes; longer is a parser error, and so is a path with no components (`subtree:/`, which no namespace server would attenuate; use `universal`). `<rights>` is a `+`-joined list of rights names (`LOOKUP`, `READDIR`, `STAT`, `READ`, `WRITE`, `EXEC`, `MUTATE_DIR`, `ADMIN` — see [`shared/namespace-protocol/src/rights.rs`](../../../shared/namespace-protocol/src/rights.rs)). Unknown rights names are parser errors. Empty rights list is a parser error. |
 
 Example subtree clause:
@@ -217,10 +217,10 @@ svcmgr-launched services.
 
 ## `seed`
 
-Space-separated discovery-registry names. svcmgr resolves each name
-to a freshly-derived `RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for
-`devmgr.bind` alone, whose `BIND_DRIVERS` moves a directory cap and so needs `GRANT`) and
-injects them positionally into the child's bootstrap rounds:
+Space-separated discovery-registry names. svcmgr resolves each name to a freshly-derived
+`RIGHTS_EP_SEND` cap on the published endpoint (`RIGHTS_EP_SEND_GRANT` for `devmgr.bind`, whose
+`BIND_DRIVERS` moves a directory cap and so needs `GRANT`, and for each [`:grant`](#provides) name)
+and injects them positionally into the child's bootstrap rounds:
 
 ```
 seed = rootfs.root pwrmgr.shutdown pwrmgr.deny
@@ -269,6 +269,7 @@ through `QUERY_ENDPOINT`, which refuses a seed-only name and never yields `GRANT
 | `vfsd.mount` | svcmgr (endowed `MOUNT_AUTHORITY` SEND) | `MOUNT_AUTHORITY`-badged SEND on vfsd's service endpoint (seeded by svctest and the hotplug-check disk mode) | no |
 | `vfsd.deny` | svcmgr (endowed `DENY_BADGE` SEND) | no-authority (`DENY_BADGE`) SEND on vfsd's service endpoint, the negative-test twin (seeded by svctest only) | no |
 | `vfsd.swap` | svcmgr (endowed `SWAP_AUTHORITY` SEND) | `SWAP_AUTHORITY`-badged SEND on vfsd's service endpoint, the `GET_SWAP_PARTITION` surface (seeded by the swap service's recipe; by svctest while no swap service exists) | no |
+| `sessiond.operator` | svcmgr (`sessiond.svc` provider) | `:grant`-badged `SEND\|GRANT` on sessiond's service endpoint, the operator authority, which carries no stop bit (seeded by terminal and svctest) | no |
 | `logd.query` | svcmgr (minted from the reserved master-log source) | `LOG_QUERY_AUTHORITY`-badged SEND on the master log endpoint: logd's `QUERY_SLOTS` and `QUERY_HISTORY` ([logd IPC interface](../../logd/docs/ipc-interface.md) § Queries; seeded by svctest only) | no |
 
 ## `provides`
@@ -284,7 +285,7 @@ is resolvable before any service launched in the scan queries it. The endpoint p
 restarts (svcmgr holds the source), so a cached client cap survives a
 crash-restart and no re-publish is needed.
 
-Each space-separated entry is `name[:auth|:deny]`; the suffix selects the
+Each space-separated entry is `name[:auth|:grant|:deny]`; the suffix selects the
 badge svcmgr stamps on that name's SEND (the badge rides through to a
 consumer unchanged), and a badge carrying a verb bit makes the name
 seed-only ([ipc-interface.md § Label 4](ipc-interface.md#label-4-query_endpoint)):
@@ -293,11 +294,20 @@ seed-only ([ipc-interface.md § Label 4](ipc-interface.md#label-4-query_endpoint
 |---|---|---|
 | *(none)* | `0` (unbadged) | Plain SEND, for an endpoint whose server gates no label on a verb-bit: a consumer can badge an unbadged SEND itself ([Capability Model](../../../docs/capability-model.md#verb-bit-authority-pattern)). e.g. `timed`. |
 | `:auth` | `1 << 63` | The first verb bit, the one a server's primary `*_AUTHORITY` gate tests — the server's `badge & (1 << 63)` gate passes. Seed-only: `QUERY_ENDPOINT` refuses the name. e.g. `pwrmgr.shutdown:auth`. |
+| `:grant` | `1 << 63` | As `:auth`, and svcmgr publishes the SEND with `GRANT`, so each recipe seeding the name receives `SEND\|GRANT` and can move caps to the provider in its calls. Seed-only, as `:auth`, so `QUERY_ENDPOINT` never yields `GRANT`. e.g. `sessiond.operator:grant`. |
 | `:deny` | `1` | Present so the cap resolves, but the authority gate fails. The negative-test twin. e.g. `pwrmgr.deny:deny`. |
 
 ```
 provides = pwrmgr.shutdown:auth pwrmgr.deny:deny
 ```
+
+A `:grant` name is for a server whose clients hand it capabilities: sessiond's interfaces hand it
+each session's end queue, death relay and stdio rings. A seeder of the name can send the provider
+any cap it holds, of any type and with any rights, so the provider treats each received cap as
+untrusted input: it checks the cap's type and rights (`cap_info`) before it keeps the cap or
+forwards it, and deletes a cap it does not keep. The parser refuses a `:grant` entry as the
+[`shutdown_actuator`](#shutdown_actuator) name, since the shutdown request moves no cap; a
+[`stop_source`](#stop_source) may provide one, since the entry is badged.
 
 ## `log_sink`
 
@@ -359,12 +369,12 @@ when the recipe also lists `<name>:deny` first, the no-authority SEND. svcmgr kn
 only by this key; its code names no service.
 
 The actuator is supervised: the parser rejects the key on a `restart = never` recipe, a name that
-is not one of the recipe's `provides` entries, an entry without `:auth`, a value of more than one
-name, and a repeated key. Only the first recipe that declares the key, in reconciliation's launch
-order, is the actuator; svcmgr logs each later one (`<service> also declares shutdown_actuator; not
-recognised`) and launches it as an ordinary service. An actuator whose entry holds no service
-endpoint (one init spawned, which svcmgr only binds) is not recorded, and svcmgr logs that
-graceful shutdown is unavailable.
+is not one of the recipe's `provides` entries, an entry without `:auth` (a `:grant` entry among
+them), a value of more than one name, and a repeated key. Only the first recipe that declares the
+key, in reconciliation's launch order, is the actuator; svcmgr logs each later one (`<service> also
+declares shutdown_actuator; not recognised`) and launches it as an ordinary service. An actuator
+whose entry holds no service endpoint (one init spawned, which svcmgr only binds) is not recorded,
+and svcmgr logs that graceful shutdown is unavailable.
 
 svcmgr calls the actuator only while it runs: its entry is active and the kernel reports its
 thread not exited. The actuator's service endpoint outlives it, so a call to a dead actuator would
@@ -439,16 +449,17 @@ badge carrying `stop_labels::STOP_AUTHORITY`. While an instance runs, svcmgr lis
 `LIST_STOP_SOURCES` ([ipc-interface.md § Label 7](ipc-interface.md#label-7-list_stop_sources))
 with the class this key names and a SEND on that endpoint badged with the stop bit. The class is
 read from the recipe, never from the source, so a source cannot claim the service class to delay
-its own stop. `program` is the one value; any other is a parser error. No recipe of the default
-image sets the key; the `stopsrc` test fixture's does
-([services/stopsrc/README.md](../../stopsrc/README.md)).
+its own stop. `program` is the one value; any other is a parser error. sessiond's recipe sets it,
+the default image's program-class source
+([services/sessiond/README.md](../../sessiond/README.md)); the `stopsrc` test fixture's does
+too ([services/stopsrc/README.md](../../stopsrc/README.md)).
 
 The key is a core role, so the [`oom_stop`](#oom_stop) rule never stops a source and
 `LIST_CANDIDATES` never lists one. The parser rejects it on a recipe without `provides`, since a
 source is reached on its service endpoint; on one with a bare `provides` entry, since a bare entry
 publishes an unbadged SEND, from which any holder could derive a SEND badged with the stop bit, so
-every entry carries `:auth` or `:deny`; and with `restart = never`, since svcmgr lists only a
-source it supervises.
+every entry carries `:auth`, `:grant` or `:deny`; and with `restart = never`, since svcmgr lists
+only a source it supervises.
 
 svcmgr creates each instance of a source contained, on its launch and on every restart
 (`procmgr_labels::CREATE_CONTAIN`,

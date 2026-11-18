@@ -23,7 +23,8 @@
 //! what procmgr does with a debugger's binding. `crashme oom-fill` and
 //! `crashme oom-touch` drive the crash service's hold of a fault memmgr
 //! declined for want of memory, under the log name `crashme-oom` (the `oom`
-//! module). See programs/crashme/README.md.
+//! module), and `crashme oom-hold` holds memory as a job of an operator
+//! session for oomd to stop. See programs/crashme/README.md.
 
 mod arch;
 mod oom;
@@ -81,11 +82,12 @@ fn main()
         "debugger-tag" => debugger_tag(),
         "oom-fill" => oom::fill(std::env::args().nth(2).as_deref()),
         "oom-touch" => oom::touch(),
+        "oom-hold" => oom::hold(std::env::args().nth(2).as_deref()),
         _ =>
         {
             println!(
                 "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare\
-                 |debugger-tag|oom-fill <ms>|oom-touch"
+                 |debugger-tag|oom-fill <ms>|oom-touch|oom-hold <pages>"
             );
             std::process::exit(2);
         }

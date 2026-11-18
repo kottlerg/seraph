@@ -282,7 +282,7 @@ cargo xtask test-terminal
 
 This is the reusable foundation for interactive tests of the terminal, the
 shell (#112), and future consumers — they reuse the runner by swapping the
-terminal's child and the expected strings. It subsumes the keysym-decode
+terminal's session leader and the expected strings. It subsumes the keysym-decode
 coverage of the former standalone input smoke test: the echoed `help` proves
 lowercase keysym decode, and Return/Backspace prove the named-key decodes. In
 CI it runs as a further boot inside the `usertest` cell (after usertest's own
@@ -737,9 +737,12 @@ oomd stops it, and passes otherwise. The CI svctest cell drops crashd, so the he
 that phase (a child's page fault crashd holds until oomd's stop frees memory) runs in the burn-in
 svctest cell, which keeps crashd. The `stopsrc` fixture (`stopsrc.svc`, `restart = always`,
 `stop_source = program`) is co-staged beside `memhog` in both cells: svctest's
-`svcmgr_stop_service` phase reads that svcmgr lists it as the one stop source and that a job it
-started ends with it, and its `oom_policy`
-phase has it start a job that oomd stops before memhog; both phases pass without it.
+`svcmgr_stop_service` phase reads that svcmgr lists it, beside sessiond when that recipe is staged,
+as a stop source of the program class and that a job it started ends with it, and its `oom_policy`
+phase has it start a job that oomd stops before memhog; both phases pass without it. With
+`sessiond.svc` staged, the `oom_policy` phase also opens an operator session whose shell runs
+`crashme oom-hold 512`, a job oomd stops before `stopsrc`'s, and svctest's `sessiond_operator` phase
+checks sessiond's operator interface; both pass without it.
 
 **Test isolation.** The functional harness boots run a controlled substrate:
 they drop the autostarted `terminal` (a user-facing program, not part of the

@@ -1,0 +1,36 @@
+# sessiond — the supervisor of operator sessions (services/sessiond/README.md).
+#
+# An interface holding the sessiond.operator SEND (the terminal) opens its
+# sessions through it. sessiond creates each session's leader, the binary
+# argv[1] names, charged to a budget node of the session's own and contained,
+# so the leader's end destroys every process it started
+# (docs/session-supervision.md). The leader runs at priority 5 with a band
+# ceiling of 5, below its interface.
+#
+# `stop_source = program` makes svcmgr create sessiond contained and list it
+# to a stop-authority holder (oomd) with a stop-badged SEND on its endpoint:
+# sessiond lists each started session and the jobs of its leader, and stops
+# one by its key. The one provided name is `:grant`, the operator authority,
+# which carries no stop bit: its seeders hold it with GRANT, since an
+# interface hands sessiond the caps of each session (its end queue, the
+# relay, the stdio rings), which sessiond checks before it keeps any.
+#
+# `reserve = yes` makes sessiond's own node a system-reserve node, so it lists
+# and stops while the free pool outside the reserve is spent; each session's
+# node is made under it, outside the reserve. sessiond opens no session
+# while memory is critical.
+#
+# `namespace = universal`: sessiond resolves the leader's binary and hands
+# each leader a copy of its root. `restart = on_failure`, `critical = no`:
+# without sessiond the system runs with no operator session, and a restart
+# ends every session, which its interface opens again.
+binary      = /services/sessiond
+priority    = 10
+sched_max   = 10
+argv        = sessiond /programs/shell
+restart     = on_failure
+critical    = no
+namespace   = universal
+provides    = sessiond.operator:grant
+stop_source = program
+reserve     = yes

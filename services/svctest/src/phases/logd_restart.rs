@@ -85,7 +85,7 @@ pub fn logd_restart_phase(caps: &Caps)
     let killed = super::crash::badge_named(authority, LOGD_NAME)
         .expect("logd_restart: LIST_PROCESSES lists no logd");
     let start = Instant::now();
-    kill(authority, killed);
+    kill(authority, killed, "logd_restart: logd");
     await_restart(caps.logd_query, authority, killed);
     let took = start.elapsed().as_millis();
     std::os::seraph::log!("logd_restart: logd restarted in {took} ms");
@@ -255,10 +255,12 @@ pub fn reentry_main(role: &str)
     }
 }
 
-/// Kill the process `process` (logd) through an attach, which must report it
-/// on the core path: stop its main thread, set its instruction pointer to [`UNMAPPED_IP`], and start it, so
-/// it takes a fault no handler resolves (see the module documentation).
-fn kill(authority: u64, process: u64)
+/// Kill the process `process` through an attach, which must report it on the
+/// core path: stop its main thread, set its instruction pointer to
+/// [`UNMAPPED_IP`], and start it, so it takes a fault no handler resolves
+/// (see the module documentation). `what` names the phase and the process in
+/// a failure.
+pub(crate) fn kill(authority: u64, process: u64, what: &str)
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let attach = IpcMessage::builder(procmgr_labels::ATTACH_PROCESS)
@@ -267,35 +269,39 @@ fn kill(authority: u64, process: u64)
         .build();
     // SAFETY: ipc_buf is this thread's registered IPC buffer page.
     let reply = unsafe { ipc::ipc_call(authority, &attach, ipc_buf) }
-        .unwrap_or_else(|e| panic!("logd_restart: ATTACH_PROCESS ipc_call failed ({e})"));
+        .unwrap_or_else(|e| panic!("{what}: ATTACH_PROCESS ipc_call failed ({e})"));
     assert_eq!(
         reply.label,
         procmgr_errors::SUCCESS,
-        "logd_restart: ATTACH_PROCESS of logd refused ({:#x})",
+        "{what}: ATTACH_PROCESS refused ({:#x})",
         reply.label
     );
     assert_ne!(
         reply.word(procmgr_labels::ATTACH_WORD_FLAGS) & procmgr_labels::ATTACH_FLAG_NO_CORE,
         0,
-        "logd_restart: logd is not on the core path (no DECLARE_NO_CORE)"
+        "{what}: the process is not on the core path (no DECLARE_NO_CORE)"
     );
     let threads = reply.caps().to_vec();
-    let main = *threads
-        .first()
-        .expect("logd_restart: the attach returned no main thread");
+    let Some(&main) = threads.first()
+    else
+    {
+        panic!("{what}: the attach returned no main thread");
+    };
 
-    syscall::thread_stop(main).expect("logd_restart: stopping logd's main thread");
+    syscall::thread_stop(main).unwrap_or_else(|e| panic!("{what}: stopping the main thread ({e})"));
     let mut regs = [0u8; REGS_SIZE];
-    syscall::thread_read_regs(main, &mut regs).expect("logd_restart: reading its registers");
+    syscall::thread_read_regs(main, &mut regs)
+        .unwrap_or_else(|e| panic!("{what}: reading its registers ({e})"));
     regs.get_mut(IP_OFFSET..IP_OFFSET + 8)
-        .expect("logd_restart: the instruction pointer within the register file")
+        .unwrap_or_else(|| panic!("{what}: the instruction pointer within the register file"))
         .copy_from_slice(&UNMAPPED_IP.to_ne_bytes());
-    // SAFETY: the thread is logd's, bound to logd's address space, so the
-    // frame it resumes on touches none of svctest's memory; the write only
-    // makes it fault.
+    // SAFETY: the thread is the attached process's, bound to its address
+    // space, so the frame it resumes on touches none of svctest's memory; the
+    // write only makes it fault.
     unsafe { syscall::thread_write_regs(main, &regs) }
-        .expect("logd_restart: writing its instruction pointer");
-    syscall::thread_start(main).expect("logd_restart: starting logd's main thread");
+        .unwrap_or_else(|e| panic!("{what}: writing its instruction pointer ({e})"));
+    syscall::thread_start(main)
+        .unwrap_or_else(|e| panic!("{what}: starting the main thread ({e})"));
 
     for cap in threads
     {

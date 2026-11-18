@@ -7,7 +7,10 @@
 //! the data partition: its refusals, `BUSY` with a file open and success with
 //! `FORCE`, the `StaleNetworkFileHandle` std reports on every cap the unmount
 //! killed, the fall-through to the root filesystem while unmounted, a remount,
-//! and what a client that mapped a cache page reads across a forced unmount.
+//! and what a client that mapped a cache page reads across a forced unmount;
+//! then the teardown vfsd makes of the mount when its fs driver dies
+//! (services/vfsd/docs/namespace-composition.md § Driver death and device
+//! loss).
 //!
 //! The phases run in order and leave `/data` mounted again, with svctest's
 //! cwd set to it, as the phases before them found it.
@@ -15,6 +18,7 @@
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::os::seraph::{current_ipc_buf, startup_info};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use crate::bootstrap::Caps;
 use crate::ipc_util::fs::{fs_open, fs_read_memory};
@@ -44,8 +48,23 @@ pub fn phases() -> &'static [Phase]
             name: "vfsd_unmount_stale_mapping",
             run: unmount_stale_mapping_phase,
         },
+        Phase {
+            name: "vfsd_driver_death",
+            run: driver_death_phase,
+        },
     ]
 }
+
+/// The process name vfsd gives the fs driver it starts for a mount at
+/// `/data`: `fatfs:` and the mount path.
+const DATA_DRIVER_NAME: &[u8] = b"fatfs:/data";
+
+/// How long [`driver_death_phase`] waits, at most, for vfsd to tear down the
+/// mount of the driver it killed.
+const DEATH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The interval at which [`driver_death_phase`] looks for the teardown.
+const DEATH_POLL: Duration = Duration::from_millis(10);
 
 /// `MountRole::Data` (vfs-ipc-interface.md § Label 10).
 const ROLE_DATA: u64 = 1;
@@ -443,6 +462,112 @@ fn unmount_stale_mapping_phase(caps: &Caps)
     mount_data(caps, "/data");
     std::env::set_current_dir("/data").expect("set_current_dir(/data) after the remount");
     std::os::seraph::log!("vfsd unmount stale-mapping passed ({outcome})");
+}
+
+/// vfsd tears down the mount of an fs driver that dies, and keeps its disk.
+///
+/// `/data` is mounted again, and its new driver found by name
+/// (`LIST_PROCESSES`): the one process named `fatfs:/data` not listed
+/// before the `MOUNT`. With a file open on the mount, svctest kills the driver through
+/// an attach (`logd_restart::kill`). vfsd observes the death and tears the
+/// mount down without the driver: `/data` falls through to the root
+/// filesystem and is not found, and a `MOUNT` at `/data`, which vfsd
+/// refuses until the teardown ends, then succeeds on the same disk, which
+/// vfsd still holds; the open file fails with `StaleNetworkFileHandle`.
+/// svctest's cwd is set to `/data` again.
+fn driver_death_phase(caps: &Caps)
+{
+    let authority = caps.debug_authority;
+    assert_ne!(authority, 0, "vfsd_driver_death: no debug authority");
+    force_unmount_data(caps);
+    let before = core::cell::RefCell::new(Vec::new());
+    let _ = super::crash::find_listed(authority, |badge, name| {
+        if name == DATA_DRIVER_NAME
+        {
+            before.borrow_mut().push(badge);
+        }
+        false
+    });
+    let before = before.into_inner();
+    mount_data(caps, "/data");
+    let (driver, _) = super::crash::find_listed(authority, |badge, name| {
+        name == DATA_DRIVER_NAME && !before.contains(&badge)
+    })
+    .expect("vfsd_driver_death: LIST_PROCESSES lists no new fatfs after the MOUNT");
+    let mut open = std::fs::File::open("/data/test.txt").expect("open /data/test.txt");
+
+    super::logd_restart::kill(authority, driver, "vfsd_driver_death: the /data fatfs");
+
+    let start = Instant::now();
+    while !matches!(
+        std::fs::metadata("/data").map_err(|e| e.kind()),
+        Err(std::io::ErrorKind::NotFound)
+    )
+    {
+        assert!(
+            start.elapsed() < DEATH_TIMEOUT,
+            "vfsd_driver_death: /data still resolves {DEATH_TIMEOUT:?} after its driver died"
+        );
+        std::thread::sleep(DEATH_POLL);
+    }
+    let fell_through = start.elapsed().as_millis();
+    remount_data_after_teardown(caps);
+    let mut bytes = [0u8; 8];
+    assert_stale(
+        open.read(&mut bytes),
+        "a read of a file open on the dead driver's mount",
+    );
+    drop(open);
+    let text = std::fs::read("/data/test.txt").expect("read /data/test.txt after the remount");
+    assert!(
+        !text.is_empty(),
+        "/data/test.txt is empty after the remount"
+    );
+    std::env::set_current_dir("/data").expect("set_current_dir(/data) after the remount");
+    std::os::seraph::log!(
+        "vfsd driver death passed (/data fell through in {fell_through} ms, the disk held, \
+         mounted again)"
+    );
+}
+
+/// Mount the data partition at `/data` once vfsd has ended the teardown of
+/// the mount there: `TABLE_FULL` while the removal is under way, then
+/// `SUCCESS`, within [`DEATH_TIMEOUT`].
+fn remount_data_after_teardown(caps: &Caps)
+{
+    let msg = ipc::IpcMessage::builder(ipc::vfsd_labels::MOUNT)
+        .word(0, ROLE_DATA)
+        .word(1, 5)
+        .bytes(2, b"/data")
+        .build();
+    let ipc_buf = current_ipc_buf();
+    let start = Instant::now();
+    loop
+    {
+        // SAFETY: ipc_buf is the kernel-registered IPC buffer page.
+        let reply = unsafe { ipc::ipc_call(caps.vfsd_mount, &msg, ipc_buf) }
+            .unwrap_or_else(|_| panic!("vfsd_driver_death: MOUNT ipc_call failed"));
+        for &cap in reply.caps()
+        {
+            let _ = syscall::cap_delete(cap);
+        }
+        if reply.label == ipc::vfsd_errors::SUCCESS
+        {
+            return;
+        }
+        assert_eq!(
+            reply.label,
+            ipc::vfsd_errors::TABLE_FULL,
+            "vfsd_driver_death: MOUNT at /data after the death must succeed once the teardown \
+             ends (got {:#x}; NO_MOUNT: the disk was taken as removed)",
+            reply.label
+        );
+        assert!(
+            start.elapsed() < DEATH_TIMEOUT,
+            "vfsd_driver_death: the teardown of /data did not end within {DEATH_TIMEOUT:?}"
+        );
+        std::thread::sleep(DEATH_POLL);
+    }
 }
 
 /// Run the child mode for `role` if this module owns it.

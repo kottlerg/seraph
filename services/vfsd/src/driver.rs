@@ -25,9 +25,10 @@
 //! fatfs is never handed the whole-disk cap and cannot escape the partition
 //! regardless of what sector number it computes.
 //!
-//! Each driver gets a death queue its main thread and its address space are
-//! bound to before it starts (`docs/namespace-composition.md` § Mount
-//! record); both spawn paths return the driver's process handle.
+//! Each driver gets a death queue its main thread is bound to before it
+//! starts and to whose relay procmgr posts the driver's end
+//! (`docs/namespace-composition.md` § Mount record); both spawn paths
+//! return the driver's process handle.
 
 use std::os::seraph::process::ArgvEnvCap;
 
@@ -84,7 +85,8 @@ const DEATH_QUEUE_CAPACITY: u32 = 2;
 /// procmgr's post to the relay is a post, not a binding, and takes none.
 const DEATH_QUEUE_OBSERVERS: u32 = 1;
 
-/// Spawn a fatfs driver instance for a partition and return it.
+/// Spawn a fatfs driver instance for a partition, to be mounted at
+/// `mount_path`, which names it ([`driver_argv`]), and return it.
 /// `module_cap` is non-zero only for the root mount; pass zero to use the
 /// post-boot path that resolves `/services/fs/fatfs` via vfsd's own held
 /// namespace cap (`system_root_cap`) and submits `CREATE_FROM_FILE` to
@@ -98,6 +100,7 @@ const DEATH_QUEUE_OBSERVERS: u32 = 1;
 pub fn spawn_fatfs_driver(
     caps: &VfsdCaps,
     pool: &WorkerPool,
+    mount_path: &[u8],
     partition_ep: u64,
     module_cap: u64,
     system_root_cap: u64,
@@ -138,6 +141,7 @@ pub fn spawn_fatfs_driver(
             endpoint,
             death_queue,
             partition_ep,
+            mount_path,
         },
         module_cap,
         system_root_cap,
@@ -160,8 +164,9 @@ pub fn spawn_fatfs_driver(
     }
 }
 
-/// The caps vfsd made or received for one driver before its spawn.
-struct DriverCaps
+/// The caps vfsd made or received for one driver before its spawn, and the
+/// path it is mounted at.
+struct DriverCaps<'a>
 {
     /// The driver's service endpoint, as created.
     endpoint: u64,
@@ -169,6 +174,9 @@ struct DriverCaps
     death_queue: u64,
     /// The driver's partition cap, owned by the spawn.
     partition_ep: u64,
+    /// The path the driver is mounted at, which names it
+    /// ([`driver_argv`]).
+    mount_path: &'a [u8],
 }
 
 /// Revoke and delete a driver's service endpoint: every cap derived from
@@ -219,7 +227,7 @@ fn start_driver(
             bootstrap,
             module_cap,
             badged_creator,
-            driver.death_queue,
+            driver,
             ipc_buf,
         )
     }
@@ -230,7 +238,7 @@ fn start_driver(
             pool,
             bootstrap,
             badged_creator,
-            driver.death_queue,
+            driver,
             system_root_cap,
         )
     }?;
@@ -378,19 +386,19 @@ pub fn start_child(reply_caps: &[u64], death_queue: u64, ipc_buf: *mut u64) -> O
 ///
 /// Returns the child's process handle once the child holds its bootstrap
 /// caps. On `None` no cap of `bootstrap`, no `badged_creator` and no cap
-/// derived from `death_queue` is left in vfsd's `CSpace`.
+/// derived from `driver`'s death queue is left in vfsd's `CSpace`.
 fn spawn_via_module(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
     module_cap: u64,
     badged_creator: u64,
-    death_queue: u64,
+    driver: &DriverCaps,
     ipc_buf: *mut u64,
 ) -> Option<u64>
 {
     let module_copy = syscall::cap_derive(module_cap, syscall::RIGHTS_ALL).ok();
-    let relay = derive_death_relay(death_queue);
+    let relay = derive_death_relay(driver.death_queue);
     let (Some(module_copy), Some(relay)) = (module_copy, relay)
     else
     {
@@ -414,7 +422,7 @@ fn spawn_via_module(
         return None;
     };
 
-    let argv_env = inherited_level_env();
+    let argv_env = driver_argv_env(driver.mount_path);
     let argv_env_flag = if argv_env.is_some()
     {
         procmgr_labels::CREATE_ARGV_ENV
@@ -490,7 +498,7 @@ fn spawn_via_module(
         return None;
     }
 
-    let Some(process) = start_child(create_reply.caps(), death_queue, ipc_buf)
+    let Some(process) = start_child(create_reply.caps(), driver.death_queue, ipc_buf)
     else
     {
         std::os::seraph::log!(warn: "fatfs START_PROCESS failed");
@@ -508,19 +516,39 @@ fn spawn_via_module(
     Some(process)
 }
 
-/// The env an fs driver is created with: vfsd's own level, which every fs
-/// driver inherits (`std::os::seraph::log::inherited_level_entry`), as its
-/// one entry. `None` while vfsd logs at info, and, after a warning, when the
-/// cap cannot be built; the driver then logs at info. Both spawn paths use it.
-pub fn inherited_level_env() -> Option<ArgvEnvCap>
+/// The prefix of every fs driver's name: the driver's own name and a colon,
+/// before the path it is mounted at ([`driver_argv`]).
+const DRIVER_NAME_PREFIX: &[u8] = b"fatfs:";
+
+/// The argv an fs driver mounted at `mount_path` is created with: one
+/// string, its name, `fatfs:` and the mount path (`fatfs:/` for the root,
+/// `fatfs:/data`), with its terminating NUL. procmgr lists the driver under
+/// it, truncated to `svcmgr_labels::NAME_MAX` bytes
+/// (`procmgr_labels::LIST_PROCESSES`), so a debugger tells the drivers of
+/// the mounts apart.
+fn driver_argv(mount_path: &[u8]) -> Vec<u8>
 {
-    let entry = std::os::seraph::log::inherited_level_entry()?;
-    match ArgvEnvCap::new(&[], 0, &entry, 1)
+    [DRIVER_NAME_PREFIX, mount_path, b"\0"].concat()
+}
+
+/// The argv and env an fs driver mounted at `mount_path` is created with:
+/// its name ([`driver_argv`]), and vfsd's own level, which every fs driver
+/// inherits (`std::os::seraph::log::inherited_level_entry`), as its one env
+/// entry while vfsd logs at another level than info. `None`, after a
+/// warning, when the cap cannot be built; the driver then has no name and
+/// logs at info. Both spawn paths use it.
+fn driver_argv_env(mount_path: &[u8]) -> Option<ArgvEnvCap>
+{
+    let entry = std::os::seraph::log::inherited_level_entry();
+    let (env, env_count) = entry.as_deref().map_or((&[][..], 0), |e| (e, 1));
+    match ArgvEnvCap::new(&driver_argv(mount_path), 1, env, env_count)
     {
-        Ok(env) => env,
+        Ok(argv_env) => argv_env,
         Err(e) =>
         {
-            std::os::seraph::log!(warn: "fatfs spawn: level env not built ({e}); driver logs at info");
+            std::os::seraph::log!(
+                warn: "fatfs spawn: argv/env not built ({e}); driver unnamed, logs at info"
+            );
             None
         }
     }
@@ -536,13 +564,13 @@ pub fn inherited_level_env() -> Option<ArgvEnvCap>
 ///
 /// Returns the child's process handle once the child holds its bootstrap
 /// caps. On `None` no cap of `bootstrap`, no `badged_creator` and no cap
-/// derived from `death_queue` is left in vfsd's `CSpace`.
+/// derived from `driver`'s death queue is left in vfsd's `CSpace`.
 fn spawn_via_vfs(
     caps: &VfsdCaps,
     pool: &WorkerPool,
     bootstrap: BootstrapOrder,
     badged_creator: u64,
-    death_queue: u64,
+    driver: &DriverCaps,
     system_root_cap: u64,
 ) -> Option<u64>
 {
@@ -568,7 +596,8 @@ fn spawn_via_vfs(
         file_cap,
         file_size,
         badged_creator,
-        death_queue,
+        death_queue: driver.death_queue,
+        argv_env: driver_argv_env(driver.mount_path),
         bootstrap,
     })?;
 

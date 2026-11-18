@@ -25,7 +25,7 @@ Userspace OS processes — managers, the crate-collections they bind, and freest
 | [`crasher/`](crasher/README.md) | Test-tier fixture: deliberate-crash canary for svcmgr's restart path (gated, opt-in) |
 | [`memhog/`](memhog/README.md) | Test-tier fixture: fills memory until the pressure level reads `CRITICAL`, for oomd to stop (gated, opt-in) |
 | [`debug-echo/`](debug-echo/README.md) | Test-tier fixture: answers fixed GDB remote serial protocol packets on the debug port (gated, opt-in) |
-| [`hotplug-check/`](hotplug-check/README.md) | Test-tier fixture: checks that devmgr binds a driver to a device hot-added behind a PCI Express root port, and that its DMA and MSI work (gated, opt-in) |
+| [`hotplug-check/`](hotplug-check/README.md) | Test-tier fixture: checks that devmgr binds a driver to a device hot-added behind a PCI Express root port, and that its DMA and MSI work; its disk mode checks vfsd's handling of a disk removed and added again, and of its root driver's loss (gated, opt-in) |
 
 ---
 

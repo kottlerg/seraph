@@ -26,6 +26,7 @@ vfsd/
 │   ├── driver.rs            # Spawning fatfs driver instances
 │   ├── partition.rs         # Disk and partition discovery: block I/O over the gpt crate
 │   ├── role_guids.rs        # Compile-time arch-conditional root, ESP, data and swap GUIDs
+│   ├── watch.rs             # The watch thread: fs-driver deaths and disk removals
 │   ├── worker.rs            # Worker thread implementation
 │   └── worker_pool.rs       # Bootstrap-endpoint pool for spawned drivers
 └── docs/
@@ -63,7 +64,8 @@ vfsd/
   is a concurrency knob, not a correctness bound. `MOUNT` is the runtime explicit-mount surface
   (foreign-GUID disks, user-invoked mounts), gated on the
   `MOUNT_AUTHORITY` badge bit; root, `/esp`, and `/data` are
-  self-mounted, and svctest is its only in-tree caller. `UNMOUNT`, on
+  self-mounted, and svctest and the hotplug-check fixture
+  (disk mode) are its only in-tree callers. `UNMOUNT`, on
   the same badge bit, removes a mount below `/`: it asks the driver to
   unmount (refused `BUSY` while a file is open, unless forced), tears the
   driver down, and leaves the path falling through to the root
@@ -106,7 +108,17 @@ vfsd/
   process handle, a death queue the driver's exit or fault posts to,
   and the partition cap (see
   [`docs/namespace-composition.md`](docs/namespace-composition.md#mount-record)),
-  from which an unmount tears the driver down.
+  from which an unmount tears the driver down. Each driver's `argv[0]`
+  is `fatfs:` and its mount path (`fatfs:/`, `fatfs:/data`).
+- **Driver death and device loss** — vfsd's main thread, once the
+  service threads run, waits on the death queue of every mount and on a
+  watch of devmgr's `block` class. A driver's death tears its mount
+  down and the path falls through to the root filesystem (no restart,
+  #1078); a disk devmgr withdrew is marked removed and each mount on it
+  torn down as a forced unmount; the loss of the root mount's driver or
+  disk ends vfsd, and svcmgr shuts the system down. Fall-through calls
+  to the root filesystem are bounded (10 s, answered `IoError`). See
+  [`docs/namespace-composition.md`](docs/namespace-composition.md#driver-death-and-device-loss).
   On both paths a vfsd logging at any level but info creates the
   driver with its own level as the driver's `SERAPH_LOG` env entry, so
   a driver logs at vfsd's level
@@ -116,8 +128,9 @@ vfsd/
 - **GPT enumeration + mount discovery** — at startup, queries devmgr
   for every block device (`QUERY_DEVICE` on the `block` class SEND at instance ordinals 0,
   1, …, passing a `WITHDRAWN` one, until another reply is not
-  `SUCCESS`) and parses each disk's GPT partition table through one
-  scratch memory cap reused across the reads (replaced from memmgr
+  `SUCCESS`), and again from the first ordinal not yet queried for a
+  `MOUNT` whose role no held disk carries, and parses each disk's GPT
+  partition table through one scratch memory cap reused across the reads (replaced from memmgr
   before the next disk when a failed read left it lost), keeping every
   used entry of each header's `num_parts`-entry array (a disk whose GPT
   cannot be read or validated contributes none). It then resolves the

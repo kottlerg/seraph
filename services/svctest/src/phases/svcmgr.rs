@@ -47,10 +47,9 @@ pub fn phases() -> &'static [Phase]
     ]
 }
 
-/// How long [`svcmgr_worker_fault_restart_phase`] waits for the fixture's
-/// name to be published, in milliseconds: svcmgr may launch the fixture after
-/// svctest.
-const WORKER_FAULT_PUBLISH_WAIT_MS: u64 = 10_000;
+/// How long a phase waits for a fixture's provided name to be published, in
+/// milliseconds: svcmgr may launch the fixture after svctest.
+const FIXTURE_PUBLISH_WAIT_MS: u64 = 10_000;
 
 /// The recipe that starts the fixture [`svcmgr_worker_fault_restart_phase`]
 /// drives, when it is staged for this boot.
@@ -71,7 +70,7 @@ const WORKER_FAULT_RECIPE: &str = "/config/svcmgr/services/crasher-worker.svc";
 ///
 /// The phase runs when the fixture's recipe is staged in
 /// `/config/svcmgr/services/` and is skipped otherwise; once staged, the name
-/// must be published within [`WORKER_FAULT_PUBLISH_WAIT_MS`].
+/// must be published within [`FIXTURE_PUBLISH_WAIT_MS`].
 fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 {
     use ipc::restart_probe_labels as probe;
@@ -113,22 +112,35 @@ fn svcmgr_worker_fault_restart_phase(_caps: &Caps)
 /// `phase`.
 fn worker_fixture_staged(phase: &str) -> bool
 {
-    match std::fs::metadata(WORKER_FAULT_RECIPE)
+    recipe_staged(WORKER_FAULT_RECIPE, phase)
+}
+
+/// Whether the recipe at `path` is staged; a stat error other than "not
+/// found" fails `phase`.
+pub(super) fn recipe_staged(path: &str, phase: &str) -> bool
+{
+    match std::fs::metadata(path)
     {
         Ok(_) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-        Err(e) => panic!("{phase}: stat {WORKER_FAULT_RECIPE}: {e:?}"),
+        Err(e) => panic!("{phase}: stat {path}: {e:?}"),
     }
 }
 
 /// A SEND on the endpoint the worker-fault fixture provides
-/// (`ipc::restart_probe_labels::NAME`), resolved through `QUERY_ENDPOINT`
-/// once it is published, within [`WORKER_FAULT_PUBLISH_WAIT_MS`]. The
-/// endpoint outlives each instance, so the SEND reaches every restart.
+/// (`ipc::restart_probe_labels::NAME`), as [`provided_endpoint`] resolves it.
 fn worker_fixture(phase: &str) -> u64
 {
+    provided_endpoint(ipc::restart_probe_labels::NAME, phase)
+}
+
+/// A SEND on the endpoint a fixture provides under `name`, resolved through
+/// `QUERY_ENDPOINT` once it is published, within
+/// [`FIXTURE_PUBLISH_WAIT_MS`]. The endpoint outlives each instance, so
+/// the SEND reaches every restart.
+pub(super) fn provided_endpoint(name: &[u8], phase: &str) -> u64
+{
     let (registry_cap, ipc_buf) = registry_cap_and_buf(phase);
-    let name = ipc::restart_probe_labels::NAME;
     let label = ipc::svcmgr_labels::QUERY_ENDPOINT | ((name.len() as u64) << 16);
     let mut waited_ms = 0;
     let fixture = loop
@@ -142,8 +154,8 @@ fn worker_fixture(phase: &str) -> u64
             break reply.caps().first().copied().unwrap_or(0);
         }
         assert!(
-            waited_ms < WORKER_FAULT_PUBLISH_WAIT_MS,
-            "{phase}: {} not published within {WORKER_FAULT_PUBLISH_WAIT_MS} ms, last reply {:#x}",
+            waited_ms < FIXTURE_PUBLISH_WAIT_MS,
+            "{phase}: {} not published within {FIXTURE_PUBLISH_WAIT_MS} ms, last reply {:#x}",
             String::from_utf8_lossy(name),
             reply.label
         );
@@ -174,7 +186,7 @@ fn probe_nonce(fixture: u64, phase: &str, what: &str) -> u64
 }
 
 /// `STOP_SERVICE` of `name` through `cap`: the reply label.
-fn stop_service(cap: u64, name: &[u8]) -> u64
+pub(super) fn stop_service(cap: u64, name: &[u8]) -> u64
 {
     let ipc_buf = std::os::seraph::current_ipc_buf();
     let label = ipc::svcmgr_labels::STOP_SERVICE | ((name.len() as u64) << 16);
@@ -188,7 +200,7 @@ fn stop_service(cap: u64, name: &[u8]) -> u64
 /// The whole `LIST_STOPPABLE` walk through `cap`, page by page until a short
 /// page: each listed service's name and usage in pages. Fails `phase` on a
 /// reply other than `SUCCESS` or a page that does not decode.
-fn list_stoppable(cap: u64, phase: &str) -> Vec<(String, u64)>
+pub(super) fn list_stoppable(cap: u64, phase: &str) -> Vec<(String, u64)>
 {
     use ipc::svcmgr_labels::{LIST_STOPPABLE, LIST_STOPPABLE_PAGE, unpack_stoppable_entry};
     let ipc_buf = std::os::seraph::current_ipc_buf();
@@ -242,13 +254,14 @@ fn list_stoppable(cap: u64, phase: &str) -> Vec<(String, u64)>
 /// does not set `oom_stop` (timed); the eligibility rule's every row is
 /// host-tested in `svcmgr-defs` (`svcmgr_defs::stop`).
 ///
-/// With the `crasher-worker` fixture staged, whose recipe sets
-/// `oom_stop = yes`, it is the one service listed, with a non-zero usage;
+/// `LIST_STOPPABLE` lists the staged fixtures whose recipes set
+/// `oom_stop = yes` (`crasher-worker`, and `memhog`, which the `oom` phase
+/// drives), each with a non-zero usage, and no other service, since no other
+/// recipe of the boot sets the key. With `crasher-worker` staged,
 /// `STOP_SERVICE` of it replies `SUCCESS`, and the restart probe then
 /// answers with a new instance's nonce: svcmgr destroyed the instance and its
 /// `restart = on_failure` policy restarted it after the `EXIT_KILLED`
-/// death. Without the fixture no service is listed, since no other recipe of
-/// the boot sets `oom_stop`.
+/// death.
 fn svcmgr_stop_service_phase(caps: &Caps)
 {
     let phase = "svcmgr_stop_service";
@@ -296,22 +309,31 @@ fn svcmgr_stop_service_phase(caps: &Caps)
     }
 
     let staged = worker_fixture_staged(phase);
+    let mut expected: Vec<&str> = Vec::new();
+    if staged
+    {
+        expected.push("crasher-worker");
+    }
+    if recipe_staged(super::oom::MEMHOG_RECIPE, phase)
+    {
+        expected.push("memhog");
+    }
+    expected.sort_unstable();
     let listed = list_stoppable(stop_cap, phase);
+    let mut names: Vec<&str> = listed.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    assert!(
+        names == expected && listed.iter().all(|&(_, pages)| pages > 0),
+        "{phase}: LIST_STOPPABLE must list the staged oom_stop fixtures {expected:?} alone, each \
+         with its usage: {listed:?}"
+    );
     if !staged
     {
-        assert!(
-            listed.is_empty(),
-            "{phase}: no recipe sets oom_stop, yet LIST_STOPPABLE listed {listed:?}"
-        );
         std::os::seraph::log!(
             "svcmgr stop-service phase passed (gates and refusals; crasher-worker.svc not staged)"
         );
         return;
     }
-    assert!(
-        matches!(listed.as_slice(), [(name, pages)] if name == "crasher-worker" && *pages > 0),
-        "{phase}: LIST_STOPPABLE must list crasher-worker alone, with its usage: {listed:?}"
-    );
 
     let fixture = worker_fixture(phase);
     let before = probe_nonce(fixture, phase, "PROBE_INSTANCE before the stop");

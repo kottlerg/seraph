@@ -53,14 +53,15 @@ use syscall_abi::{
     SYS_IOPORT_SPLIT, SYS_IPC_BUFFER_SET, SYS_IPC_CALL, SYS_IPC_RECV, SYS_IPC_REPLY, SYS_IRQ_ACK,
     SYS_IRQ_MSG_ALLOC, SYS_IRQ_REGISTER, SYS_IRQ_REMAP, SYS_IRQ_ROUTE, SYS_IRQ_SPLIT, SYS_MEM_MAP,
     SYS_MEM_PROTECT, SYS_MEM_UNMAP, SYS_MEMORY_MERGE, SYS_MEMORY_SPLIT, SYS_MMIO_MAP,
-    SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT, SYS_SBI_CALL,
-    SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION, SYS_THREAD_CONFIGURE,
-    SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER, SYS_THREAD_INHERIT_FAULT_HANDLER,
-    SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL, SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM,
-    SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY, SYS_THREAD_SET_FAULT_HANDLER,
-    SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK, SYS_THREAD_SLEEP, SYS_THREAD_START,
-    SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM, SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD,
-    SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE, SYS_WAIT_SET_WAIT, SyscallError,
+    SYS_MMIO_MERGE, SYS_MMIO_SPLIT, SYS_NOTIFICATION_SEND, SYS_NOTIFICATION_WAIT, SYS_PROCESS_EXIT,
+    SYS_SBI_CALL, SYS_SCHED_SPLIT, SYS_SYSTEM_INFO, SYS_THREAD_BIND_NOTIFICATION,
+    SYS_THREAD_CONFIGURE, SYS_THREAD_EXIT, SYS_THREAD_GET_FAULT_HANDLER,
+    SYS_THREAD_INHERIT_FAULT_HANDLER, SYS_THREAD_LIST_PAGES, SYS_THREAD_POST_UPCALL,
+    SYS_THREAD_READ_EXT_REGS, SYS_THREAD_READ_MEM, SYS_THREAD_READ_REGS, SYS_THREAD_SET_AFFINITY,
+    SYS_THREAD_SET_FAULT_HANDLER, SYS_THREAD_SET_PRIORITY, SYS_THREAD_SET_UPCALL_MASK,
+    SYS_THREAD_SLEEP, SYS_THREAD_START, SYS_THREAD_STOP, SYS_THREAD_WRITE_MEM,
+    SYS_THREAD_WRITE_REGS, SYS_THREAD_YIELD, SYS_WAIT_SET_ADD, SYS_WAIT_SET_REMOVE,
+    SYS_WAIT_SET_WAIT, SyscallError,
 };
 
 pub use syscall_abi::{
@@ -1047,6 +1048,48 @@ pub fn mmio_split(mmio_cap: u64, split_offset: u64) -> Result<(u64, u64), i64>
     {
         Ok((ret as u64, handle2))
     }
+}
+
+/// Merge `lower_cap` and `upper_cap`, two sibling `Mmio` caps over adjacent
+/// ranges, into one `Mmio` cap over the joined range; the inverse of
+/// [`mmio_split`]. Both caps are consumed. Returns the handle of the joined
+/// cap, which carries their rights and takes their place in the derivation
+/// tree.
+///
+/// `lower_cap` must end where `upper_cap` starts, both must carry Map and
+/// identical rights, share their derivation parent (or both have none), and
+/// have no derivation child (`core/kernel/docs/syscalls.md`
+/// § `SYS_MMIO_MERGE`). Consuming both frees their objects, which unmaps
+/// every [`mmio_map`] mapping made through either, with TLB shootdown, before
+/// the call returns (or, when a concurrent syscall still pins an object, when
+/// that syscall releases it); a caller that needs the region mapped maps it
+/// again through the joined cap. The withdrawal reaches no Rust object,
+/// because [`mmio_map`]'s `# Safety` contract keeps Rust references out of
+/// every MMIO mapping, so this wrapper is safe.
+///
+/// # Errors
+/// Returns a negative `i64` error code, with neither cap changed:
+/// `InvalidCapability` (either cap invalid or not `Mmio`),
+/// `InsufficientRights` (either lacks Map), `InvalidArgument` (the same cap
+/// twice, rights or flags differ, the ranges are not adjacent in argument
+/// order, or the caps are not derivation siblings), `InvalidState` (either
+/// cap has a derivation child, or a `SYS_CAP_REVOKE`, `SYS_CAP_MOVE`, or IPC
+/// capability transfer in flight),
+/// `OutOfMemory` (the caller's `CSpace` pool cannot back the joined cap's
+/// slot or body; `syscall_abi::cspace_topup_pages`), or `QuotaExceeded`
+/// (the `CSpace` directory is structurally full).
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the returned handle is non-negative; the kernel keeps bit 63 of every handle clear \
+              (syscall_abi::CAP_GEN_BITS)"
+)]
+#[inline]
+pub fn mmio_merge(lower_cap: u64, upper_cap: u64) -> Result<u64, i64>
+{
+    // SAFETY: syscall3 issues the raw syscall instruction; both arguments are
+    // cap handles the kernel validates, and the call reaches no caller memory.
+    let ret = unsafe { syscall3(SYS_MMIO_MERGE, lower_cap, upper_cap, 0) };
+    if ret < 0 { Err(ret) } else { Ok(ret as u64) }
 }
 
 /// Split an `Interrupt` range cap into two non-overlapping children.
@@ -2477,20 +2520,20 @@ pub fn irq_remap(authority: u64, setting: u64) -> Result<(), i64>
 /// - All pages are mapped uncacheable (PCD|PWT on `x86_64`, Svpbmt
 ///   PBMT=IO on `riscv64`).
 /// - The mapping lasts while `mmio_cap` does: deleting it, consuming it with a
-///   split, or revoking an ancestor of it unmaps the mapping
+///   split or a merge, or revoking an ancestor of it unmaps the mapping
 ///   (`core/kernel/docs/syscalls.md` § `SYS_MMIO_MAP`).
 ///
 /// # Safety
 /// The contract of [`mem_map`], for the span the MMIO region covers at
 /// `virt`. Besides, the mapping can be withdrawn at any time: by this
-/// program deleting or splitting the capability or revoking an ancestor of
-/// it, or by any holder of an ancestor capability, in any process, revoking
-/// it. When `aspace_cap` names the calling program's own address space, the
+/// program deleting, splitting or merging the capability or revoking an
+/// ancestor of it, or by any holder of an ancestor capability, in any process,
+/// revoking it. When `aspace_cap` names the calling program's own address space, the
 /// program therefore reaches the span only through raw-pointer accesses,
 /// never through a Rust reference, and puts the span's virtual addresses to no
 /// other use while such an access can still run. A withdrawn mapping then
-/// reaches no Rust object, which is why [`cap_delete`], [`cap_revoke`], and
-/// [`mmio_split`] stay safe functions.
+/// reaches no Rust object, which is why [`cap_delete`], [`cap_revoke`],
+/// [`mmio_split`], and [`mmio_merge`] stay safe functions.
 ///
 /// # Errors
 /// Returns a negative `i64` error code: `InvalidAddress` (`virt` unaligned,

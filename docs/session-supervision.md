@@ -38,7 +38,7 @@ part under the Issue that builds it:
 | Part | Issue |
 |---|---|
 | procmgr's parent link, re-parenting, containment, subtree destroy, child list and destroy, end post, end queue (§ procmgr Mechanism) | #1233 |
-| svcmgr's `stop_source` key and stop-source list, the shared stop labels, oomd's program class (§ Stop Sources) | #1233; oomd itself #1098 |
+| svcmgr's `stop_source` key and stop-source list, the shared stop labels, oomd's program class (§ Stop Sources) | #1233 |
 | sessiond in operator mode, session nodes, the terminal opening its session through sessiond (§ sessiond, § Attribution) | #1233 |
 | Sessions over a PTY, several terminals, hangup (§ Session Kinds) | #1235 |
 | Remote login through sessiond (§ Session Kinds) | #1236 |
@@ -66,7 +66,8 @@ program:
   says.
 - svcmgr's stop authority reaches only services whose recipe opts in, as
   [`.svc` Service Definitions § `oom_stop`](../services/svcmgr/docs/service-definitions.md#oom_stop)
-  says. oomd, its holder, is not built (#1098).
+  says. oomd, its holder, stops such a service when memory stays critical
+  ([services/oomd/README.md](../services/oomd/README.md)).
 
 ---
 

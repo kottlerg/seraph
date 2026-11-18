@@ -123,7 +123,8 @@ live for as long as the handler uses it, whatever releases the slot's own refere
 sibling's delete of the last capability, or another holder's revoke of an ancestor. A split child (a
 `SYS_MEMORY_SPLIT` tail, or a range-split MMIO, IoPort, IRQ, or SchedControl child) is a distinct
 object linked under the original's derivation parent, and so is every copy or derivation of an Mmio,
-IoPort, or Interrupt capability ([§ Range Capability Objects](#range-capability-objects)), so
+IoPort, or Interrupt capability ([§ Range Capability Objects](#range-capability-objects)) and the
+joined capability of a `SYS_MMIO_MERGE`, so
 another holder's revoke of that ancestor can release it directly; for a same-object derivation, as
 in the kill-process pattern, it is the delete following the revoke that releases it. Either way the
 object is freed only when its count reaches zero, which a held pin defers until the syscall drops
@@ -448,8 +449,9 @@ process's count is of the order of its page-table page count, one per 2 MiB of m
 
 Some kernel objects a syscall creates have no Memory capability in the call to be retyped from:
 the bodies of a range split (`SYS_MEMORY_SPLIT`'s tail, the two children of `SYS_MMIO_SPLIT`,
-`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`, and `SYS_SCHED_SPLIT`), the fresh object of an `Mmio`,
-`IoPort`, or `Interrupt` copy ([§ Copies and Lineages](#copies-and-lineages)), the mapping records
+`SYS_IRQ_SPLIT`, `SYS_IOPORT_SPLIT`, and `SYS_SCHED_SPLIT`), the joined object of
+`SYS_MMIO_MERGE`, the fresh object of an `Mmio`, `IoPort`, or `Interrupt` copy
+([§ Copies and Lineages](#copies-and-lineages)), the mapping records
 past an `Mmio` object's inline ones ([§ Mmio Mappings](#mmio-mappings)), and a thread's
 port-binding table ([§ IoPort Bindings](#ioport-bindings)). A `CSpace` the call names funds them
 from its pool, as it funds the slot:
@@ -707,12 +709,12 @@ pub struct KernelObjectHeader
 When a slot is cleared (for example by deletion, revocation, or the teardown of the CSpace holding
 it) or a kernel-internal owner releases its reference, the reference count is decremented. When it
 reaches zero, the object's bytes are returned to the Memory object it was retyped from
-(`retype_free`). Apart from a never-published body that a failed split or a failed
-`SYS_CAP_CREATE_*` insert rolls back at its initial count, this is the only mechanism by which
-kernel objects are freed — there is no explicit "destroy" syscall (see
+(`retype_free`). Apart from a never-published body that a failed split, a failed `SYS_MMIO_MERGE`,
+or a failed `SYS_CAP_CREATE_*` insert rolls back at its initial count, this is the only mechanism by
+which kernel objects are freed — there is no explicit "destroy" syscall (see
 [docs/capability-model.md](../../../docs/capability-model.md) § Auto-reclaim). A holder reads
-whether the count holds anything beyond its own slot with `SYS_CAP_INFO`'s
-`CAP_INFO_SOLE_REFERENCE` ([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO`).
+whether the count holds anything beyond its own slot with `SYS_CAP_INFO`'s `CAP_INFO_SOLE_REFERENCE`
+([syscalls.md](syscalls.md#sys_cap_info-36) § `SYS_CAP_INFO`).
 
 A Memory object also counts, apart from its reference count, the capability slots that name it
 (`MemoryObject::slot_count`): `CSpace::fill_slot`, the one fill every insert goes through, raises
@@ -833,16 +835,16 @@ The principal kernel-internal owners:
   § Wait Set Add/Remove.
 
 **Pin invariant.** A syscall pin may be taken only on an object whose count is not zero, so
-`pin_slot` takes it under the CSpace lock while the slot it reads is still occupied, and every
-path that frees an occupied slot clears the slot under that CSpace's lock before it releases the
+`pin_slot` takes it under the CSpace lock while the slot it reads is still occupied, and every path
+that frees an occupied slot clears the slot under that CSpace's lock before it releases the
 reference the slot held: `SYS_CAP_DELETE`, the revoke batch's `unlink_free_collect`, the range
 splits' consume of the original (`install_split_children`) and their rollback of a child, the
-`SYS_MEMORY_MERGE` tail, and a move's freed source (`free_source`, released through
-`release_moved_object`). A slot observed occupied under the lock therefore still holds its
-reference, and the increment lands before any release can reach zero. The one release that
-clears no slot, the dying CSpace's `for_each_object` drop in its `dealloc_object` arm, runs only
-after every thread bound to the CSpace is stopped and off every CPU and the CSpace is unregistered,
-so no `pin_slot` can be reading it.
+`SYS_MEMORY_MERGE` tail, both caps a `SYS_MMIO_MERGE` consumes (`commit_mmio_merge`), and a move's
+freed source (`free_source`, released through `release_moved_object`). A slot observed occupied
+under the lock therefore still holds its reference, and the increment lands before any release can
+reach zero. The one release that clears no slot, the dying CSpace's `for_each_object` drop in its
+`dealloc_object` arm, runs only after every thread bound to the CSpace is stopped and off every CPU
+and the CSpace is unregistered, so no `pin_slot` can be reading it.
 
 ---
 
@@ -859,17 +861,18 @@ withdraws it when that object is freed.
 
 `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, and `SYS_CAP_DERIVE_BADGE` of an Mmio, IoPort, or Interrupt
 capability do not share the source's object: `object_for_new_slot` places a fresh object over the
-same range in the arena of the `CSpace` that receives the new slot ([§ Body Arena](#body-arena)),
-so every slot owns its object, and deleting the slot, consuming it with a split, or revoking an
-ancestor of it frees it (a syscall pin defers the free to the pinning syscall's end, as for any
-object). A boot mint or a range split produces a lineage *root*; a copy records its root
-(`RangeLineage`), and the root's lineage count holds a root share while the root has references plus
-one per live copy. A copy past `RANGE_COPY_LIMIT` live copies of one root returns `QuotaExceeded`,
-counting the copies alone whether or not the root is still referenced. The limit is the count's
-encoding bound below the root share (2^31 - 1), not a capacity: each copy costs its funder a slot
-and a chunk, so the limit's copies would hold more than 400 GiB of pools. A split of a copy produces
-two fresh roots, each with a lineage of its own. A copy's body is freed with its last reference;
-the root's body is freed when its last share goes, so a copy's root pointer never dangles.
+same range in the arena of the `CSpace` that receives the new slot ([§ Body Arena](#body-arena)), so
+every slot owns its object, and deleting the slot, consuming it with a split (or, for an Mmio, a
+merge), or revoking an ancestor of it frees it (a syscall pin defers the free to the pinning
+syscall's end, as for any object). A boot mint, a range split, or an Mmio merge produces a lineage
+*root*; a copy records its root (`RangeLineage`), and the root's lineage count holds a root share
+while the root has references plus one per live copy. A copy past `RANGE_COPY_LIMIT` live copies of
+one root returns `QuotaExceeded`, counting the copies alone whether or not the root is still
+referenced. The limit is the count's encoding bound below the root share (2^31 - 1), not a capacity:
+each copy costs its funder a slot and a chunk, so the limit's copies would hold more than 400 GiB of
+pools. A split of a copy produces two fresh roots, each with a lineage of its own. A copy's body is
+freed with its last reference; the root's body is freed when its last share goes, so a copy's root
+pointer never dangles.
 
 ### Mmio Mappings
 
@@ -999,14 +1002,14 @@ semantics and [Move](#move) for how a large child list is migrated).
 
 A single global reader-writer lock protects the derivation tree. Every path that
 links, moves, or frees an occupied slot holds it for writing: copy, derive, the
-splits, the memory merge, move and IPC transfer, delete, revoke, and object
+splits, the memory merge, the Mmio merge, move and IPC transfer, delete, revoke, and object
 teardown. Inserts that create a derivation root (`SYS_CAP_CREATE_*`, the boot
 population) take only the CSpace spinlock — a root has no linkage to edit.
 Lock-free readers never traverse the tree; they resolve one slot by handle and
 rely on the tag and generation checks described above.
 
 The source of a copy or derive, the parent of a memory split, and both caps of
-a memory merge are looked up unlocked, so each of those paths revalidates them
+a memory merge or an Mmio merge are looked up unlocked, so each of those paths revalidates them
 under the write lock — same tag-bearing occupancy, same generation, same
 object, not pinned by an in-flight revoke, move, or IPC capability transfer — before touching
 the object or editing the tree. Every occupied→free transition holds the lock, so a slot that
@@ -1119,7 +1122,7 @@ pre-checks of [§ Storage: Hybrid Radix Directory](#storage-hybrid-radix-directo
 without that lock, and their locked path re-decides; a move pins its source and destination
 the same way — see [Move](#move)). `SYS_CAP_DELETE`,
 `SYS_CAP_MOVE`, `SYS_CAP_COPY`, `SYS_CAP_DERIVE`, `SYS_CAP_DERIVE_BADGE`,
-`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, and a further
+`SYS_MEMORY_SPLIT`, `SYS_MEMORY_MERGE`, the range splits, `SYS_MMIO_MERGE`, and a further
 `SYS_CAP_REVOKE` refuse a pinned slot with `InvalidState`; IPC capability
 transfer refuses to move one — the reply direction surfaces `InvalidState` to
 the server (the caller resumes with `IPC_REPLY_TRANSFER_FAILED`), the call

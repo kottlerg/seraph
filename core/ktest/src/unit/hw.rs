@@ -5,7 +5,7 @@
 
 //! Tier 1 tests for hardware access syscalls.
 //!
-//! Covers: `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_IRQ_REGISTER`,
+//! Covers: `SYS_MMIO_MAP`, `SYS_MMIO_SPLIT`, `SYS_MMIO_MERGE`, `SYS_IRQ_REGISTER`,
 //! `SYS_IRQ_ACK`, `SYS_IRQ_SPLIT`, `SYS_IRQ_MSG_ALLOC`, `SYS_IRQ_ROUTE`,
 //! `SYS_IRQ_REMAP`, and the message and remapping selectors of
 //! `SYS_CAP_INFO`. The per-architecture `SYS_IOPORT_BIND`,
@@ -18,7 +18,7 @@
 
 use syscall::{
     aspace_query, cap_create_notification, irq_ack, irq_msg_alloc, irq_register, irq_remap,
-    irq_route, irq_split, mem_unmap, mmio_split,
+    irq_route, irq_split, mem_unmap, mmio_merge, mmio_split,
 };
 use syscall_abi::{CAP_INFO_IRQ_MSG_ADDRESS, CAP_INFO_IRQ_MSG_DATA, SyscallError};
 
@@ -424,6 +424,238 @@ pub fn mmio_split_wrong_tag_err(ctx: &TestContext) -> TestResult
     {
         return Err("hw::mmio_split_wrong_tag_err: did not return InvalidCapability");
     }
+    Ok(())
+}
+
+// ── SYS_MMIO_MERGE ────────────────────────────────────────────────────────────
+
+/// One page, the granule of `SYS_MMIO_SPLIT` and `SYS_MMIO_MERGE`.
+const PAGE: u64 = 0x1000;
+
+/// Four sibling `Mmio` caps over adjacent ranges, `a`, `b` and `c` one page
+/// each from the base and `d` the rest, split from a derived copy of `boot`,
+/// a boot `Mmio` cap, so the boot cap stays whole and every piece is a child
+/// of it.
+#[derive(Clone, Copy)]
+struct Pieces
+{
+    boot: u64,
+    a: u64,
+    b: u64,
+    c: u64,
+    d: u64,
+}
+
+impl Pieces
+{
+    /// Split a copy of the first boot `Mmio` cap of at least four pages;
+    /// `None` when the boot configuration has none.
+    fn split(ctx: &TestContext) -> Option<Self>
+    {
+        // SAFETY: the kernel maps the read-only InitInfo page at init_info_va for
+        // ktest's lifetime.
+        let info = unsafe { &*(ctx.init_info_va as *const init_protocol::InitInfo) };
+        crate::init_info::descriptors(info)
+            .iter()
+            .filter(|d| d.cap_type == init_protocol::CapType::Mmio && d.aux1 >= 4 * PAGE)
+            .find_map(|d| Self::split_copy(d.slot))
+    }
+
+    /// Split a copy of `boot` page by page into the pieces; `None`, with
+    /// every cap made deleted, when a step fails.
+    fn split_copy(boot: u64) -> Option<Self>
+    {
+        let copy = syscall::cap_derive(boot, syscall::RIGHTS_ALL).ok()?;
+        let mut made = [0u64; 3];
+        let mut rest = copy;
+        for piece in &mut made
+        {
+            let Ok((page, upper)) = mmio_split(rest, PAGE)
+            else
+            {
+                delete_all(&made);
+                syscall::cap_delete(rest).ok();
+                return None;
+            };
+            *piece = page;
+            rest = upper;
+        }
+        let [a, b, c] = made;
+        Some(Self {
+            boot,
+            a,
+            b,
+            c,
+            d: rest,
+        })
+    }
+
+    fn all(self) -> [u64; 4]
+    {
+        [self.a, self.b, self.c, self.d]
+    }
+}
+
+/// Delete every cap of `caps`; a handle a merge consumed, or a 0, no longer
+/// resolves, and its delete fails harmlessly.
+fn delete_all(caps: &[u64])
+{
+    for &cap in caps
+    {
+        syscall::cap_delete(cap).ok();
+    }
+}
+
+/// `mmio_merge` joins two adjacent sibling caps: both handles stop
+/// resolving, a mapping made through either is withdrawn, the joined cap maps
+/// both pages contiguously from the lower base, and it merges again with the
+/// next sibling (a chain).
+pub fn mmio_merge_joins(ctx: &TestContext) -> TestResult
+{
+    let Some(p) = Pieces::split(ctx)
+    else
+    {
+        crate::log("ktest: hw::mmio_merge_joins SKIP (no Mmio >= 4 pages in initial cap set)");
+        return Ok(());
+    };
+    let mut joined = [0u64; 2];
+    let result = merge_joins(ctx, p, &mut joined);
+    // SAFETY: `MMIO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest.
+    let _ = unsafe { mem_unmap(ctx.aspace_cap, MMIO_TEST_VA, 3) };
+    delete_all(&p.all());
+    delete_all(&joined);
+    result
+}
+
+/// The checks of [`mmio_merge_joins`], recording each joined cap in `joined`
+/// for the caller's cleanup.
+fn merge_joins(ctx: &TestContext, p: Pieces, joined: &mut [u64; 2]) -> TestResult
+{
+    // SAFETY: `MMIO_TEST_VA` is a scratch VA (crate docs § Scratch VAs), so the
+    // span holds no Rust object or IPC page of ktest. The test only queries
+    // the mappings, never accesses them, and the caller unmaps the span before
+    // the VA's next use (`mmio_map` § Safety).
+    unsafe { syscall::mmio_map(ctx.aspace_cap, p.a, MMIO_TEST_VA, 0) }
+        .map_err(|_| "hw::mmio_merge_joins: mmio_map of the lower piece failed")?;
+    let base = aspace_query(ctx.aspace_cap, MMIO_TEST_VA)
+        .map_err(|_| "hw::mmio_merge_joins: aspace_query of the lower piece failed")?;
+
+    let ab = mmio_merge(p.a, p.b).map_err(|_| "hw::mmio_merge_joins: mmio_merge(a, b) failed")?;
+    joined[0] = ab;
+    if aspace_query(ctx.aspace_cap, MMIO_TEST_VA).is_ok()
+    {
+        return Err("hw::mmio_merge_joins: the lower piece's mapping survived the merge");
+    }
+    let gone = Err(SyscallError::InvalidCapability as i64);
+    if syscall::cap_info(p.a, syscall_abi::CAP_INFO_TAG_RIGHTS).map(|_| ()) != gone
+        || syscall::cap_info(p.b, syscall_abi::CAP_INFO_TAG_RIGHTS).map(|_| ()) != gone
+    {
+        return Err("hw::mmio_merge_joins: a merged cap still resolves");
+    }
+
+    // SAFETY: as for the first map; the lower piece's mapping is gone.
+    unsafe { syscall::mmio_map(ctx.aspace_cap, ab, MMIO_TEST_VA, 0) }
+        .map_err(|_| "hw::mmio_merge_joins: mmio_map of the joined cap failed")?;
+    if aspace_query(ctx.aspace_cap, MMIO_TEST_VA + PAGE) != Ok(base.wrapping_add(PAGE))
+    {
+        return Err(
+            "hw::mmio_merge_joins: the joined cap does not map the upper page after the base",
+        );
+    }
+
+    let abc = mmio_merge(ab, p.c).map_err(|_| "hw::mmio_merge_joins: mmio_merge(ab, c) failed")?;
+    joined[0] = abc;
+    if aspace_query(ctx.aspace_cap, MMIO_TEST_VA).is_ok()
+    {
+        return Err("hw::mmio_merge_joins: the joined cap's mapping survived the second merge");
+    }
+    // SAFETY: as for the first map; nothing is mapped in the span.
+    unsafe { syscall::mmio_map(ctx.aspace_cap, abc, MMIO_TEST_VA, 0) }
+        .map_err(|_| "hw::mmio_merge_joins: mmio_map of the chain failed")?;
+    if aspace_query(ctx.aspace_cap, MMIO_TEST_VA + 2 * PAGE) != Ok(base.wrapping_add(2 * PAGE))
+    {
+        return Err("hw::mmio_merge_joins: the chain does not map its third page after the base");
+    }
+    // The chain joins the rest of the copy, its one remaining neighbour.
+    let all =
+        mmio_merge(abc, p.d).map_err(|_| "hw::mmio_merge_joins: mmio_merge(abc, d) failed")?;
+    joined[0] = all;
+    Ok(())
+}
+
+/// `mmio_merge` refuses, changing neither cap: ranges with a gap between
+/// them, ranges in the wrong order, the same cap twice, a non-`Mmio` cap,
+/// caps whose rights differ, caps that are not derivation siblings, and a
+/// cap with a derivation child, which merges once the child is gone.
+pub fn mmio_merge_refusals(ctx: &TestContext) -> TestResult
+{
+    let Some(p) = Pieces::split(ctx)
+    else
+    {
+        crate::log("ktest: hw::mmio_merge_refusals SKIP (no Mmio >= 4 pages in initial cap set)");
+        return Ok(());
+    };
+    let mut made = [0u64; 4];
+    let result = merge_refusals(ctx, p, &mut made);
+    delete_all(&made);
+    delete_all(&p.all());
+    result
+}
+
+/// The checks of [`mmio_merge_refusals`], recording each cap it makes in
+/// `made` for the caller's cleanup.
+fn merge_refusals(ctx: &TestContext, p: Pieces, made: &mut [u64; 4]) -> TestResult
+{
+    let invalid = Err(SyscallError::InvalidArgument as i64);
+    if mmio_merge(p.a, p.c) != invalid
+    {
+        return Err("hw::mmio_merge_refusals: caps with a gap between them merged");
+    }
+    if mmio_merge(p.b, p.a) != invalid
+    {
+        return Err("hw::mmio_merge_refusals: caps in the wrong order merged");
+    }
+    if mmio_merge(p.a, p.a) != invalid
+    {
+        return Err("hw::mmio_merge_refusals: a cap merged with itself");
+    }
+    if mmio_merge(ctx.memory_base, p.a) != Err(SyscallError::InvalidCapability as i64)
+    {
+        return Err("hw::mmio_merge_refusals: a Memory cap was not refused as a capability");
+    }
+
+    // A Map-only sibling copy of the boot cap, split: its upper piece starts
+    // where `a` ends, under the same parent, with fewer rights.
+    let narrow = syscall::cap_derive(p.boot, syscall_abi::RIGHTS_MMIO_MAP)
+        .map_err(|_| "hw::mmio_merge_refusals: cap_derive of a Map-only copy failed")?;
+    made[0] = narrow;
+    let (narrow_lo, narrow_hi) = mmio_split(narrow, PAGE)
+        .map_err(|_| "hw::mmio_merge_refusals: mmio_split of the Map-only copy failed")?;
+    made[0] = narrow_lo;
+    made[1] = narrow_hi;
+    if mmio_merge(p.a, narrow_hi) != invalid
+    {
+        return Err("hw::mmio_merge_refusals: caps with different rights merged");
+    }
+
+    // `child` covers `a`'s range and ends where `b` starts, but its parent
+    // is `a`, not the boot cap.
+    let child = syscall::cap_derive(p.a, syscall::RIGHTS_ALL)
+        .map_err(|_| "hw::mmio_merge_refusals: cap_derive of a child failed")?;
+    made[2] = child;
+    if mmio_merge(child, p.b) != invalid
+    {
+        return Err("hw::mmio_merge_refusals: caps that are not siblings merged");
+    }
+    if mmio_merge(p.a, p.b) != Err(SyscallError::InvalidState as i64)
+    {
+        return Err("hw::mmio_merge_refusals: a cap with a derivation child merged");
+    }
+    syscall::cap_delete(child)
+        .map_err(|_| "hw::mmio_merge_refusals: cap_delete of the child failed")?;
+    made[3] = mmio_merge(p.a, p.b)
+        .map_err(|_| "hw::mmio_merge_refusals: the refused caps did not merge once childless")?;
     Ok(())
 }
 

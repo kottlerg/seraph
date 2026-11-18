@@ -26,14 +26,15 @@
 # store uses (create, write, list, size, delete, rename) and not READ: a
 # core holds the process's memory, so reading one needs a cap to /crash.
 #
-# `CRASHD_OOM_STALL_MS` is unset, so crashd holds no fault memmgr declined for
-# want of memory and reports each such fault as it does any other
-# (services/crashd/docs/operation.md § Hold).
+# `CRASHD_OOM_STALL_MS` holds a fault memmgr declined for want of memory for up
+# to 10000 ms (services/crashd/docs/operation.md § Hold): longer than oomd's
+# grace and cooldown together (services/oomd.svc), so a fault held while oomd
+# stops a service to free memory resumes rather than kills.
 binary          = /services/crashd
 priority        = 20
 restart         = on_failure
 critical        = no
-env             = CORE_DUMP=no
+env             = CORE_DUMP=no CRASHD_OOM_STALL_MS=10000
 namespace       = subtree:/crash:LOOKUP+READDIR+STAT+WRITE+MUTATE_DIR
 debug_authority = yes
 reserve         = yes

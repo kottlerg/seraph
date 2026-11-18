@@ -30,9 +30,11 @@ chunk costs at most some unrecovered history.
 
 Init-logd keeps serving every other sender while the drain runs, so a
 sender can register or change its display name after init-logd has sent
-that sender's slot. Each sender registers its name once, at startup, so a
-name lost there would leave the sender's lines rendering as `[?]` for the
-rest of the boot. Init-logd therefore sends such a slot again (see
+that sender's slot. Each sender registers its name once, at startup; a name
+lost there would reach real-logd only when real-logd refuses the sender's next
+line for it and the sender registers again
+([`ipc-interface.md`](ipc-interface.md) § `stream_labels::STREAM_REGISTER_NAME`),
+which costs that sender two calls. Init-logd therefore sends such a slot again (see
 [Name changes during the drain](#name-changes-during-the-drain)).
 
 On a logd **restart** (per
@@ -44,9 +46,13 @@ table on the same endpoint object — svcmgr holds the master-log source
 for the system's life, so the restarted logd's RECV re-attaches to the
 object every sender already targets (see
 [`service-definitions.md` § `log_sink`](../../svcmgr/docs/service-definitions.md#log_sink)).
-In-flight history from the prior instance is not recoverable, and neither
-are the senders' display names: each sender registers its name once, at
-startup, so its lines render as `[?]` once logd has restarted (#1213).
+In-flight history from the prior instance is not recoverable. The senders'
+display names are not carried over either, but each sender keeps its own: the
+restarted logd refuses a sender's first message that says the sender has a name
+(`SENDER_NAMED`) with `NAME_UNKNOWN`, the sender registers the name again and
+resends the message, so every line, the first after the restart included, renders
+under the sender's name ([`ipc-interface.md`](ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`).
 
 ## Startup ordering
 
@@ -227,10 +233,10 @@ loop.
 
 | Symptom | Cause | Recovery |
 |---|---|---|
-| `HANDOVER_PULL` IPC returns error mid-drain | A kernel IPC rendezvous race on the shared endpoint, or an invalid `log_ep_handover_send` | The drain returns; logd still issues `HANDOVER_RELEASE`, so init-logd is released. At most some pre-handover history, and the names of slots not yet sent, are lost. |
+| `HANDOVER_PULL` IPC returns error mid-drain | A kernel IPC rendezvous race on the shared endpoint, or an invalid `log_ep_handover_send` | The drain returns; logd still issues `HANDOVER_RELEASE`, so init-logd is released. At most some pre-handover history is lost. The names of slots not yet sent reach real-logd when each sender's next message is refused for its name and the sender registers again ([`ipc-interface.md`](ipc-interface.md) § `stream_labels::STREAM_REGISTER_NAME`). |
 | `HANDOVER_RELEASE` never delivered (cap is `0`, e.g. a logd restart; or logd never launches) | No init-logd→logd channel exists | init-logd keeps serving and procmgr never reaps init; init's memory caps stay held until shutdown — a benign hold, not a wedge. procmgr does not force-stop init-logd (see [procmgr IPC interface](../../procmgr/docs/ipc-interface.md) § `INIT_TEARDOWN_DONE`). |
 | `HANDOVER_RELEASE` retries exhausted (`send_release` retries for `RELEASE_RETRY_BUDGET_US` (1 s), no attempt delivered) | init-logd unreachable on the handover SEND for every attempt | `send_release` returns without an ack and logd deletes `cap[1]` regardless; init-logd keeps serving and procmgr never reaps init, so init's memory caps stay held until shutdown (the same benign hold as the row above). |
-| `HANDOVER_RELEASE` deferred `MAX_RELEASE_DEFERRALS` (8) times | Senders kept registering or changing names through every round | Init-logd acknowledges the next release whatever is pending and exits; a name changed in that last window reaches real-logd only if its sender registers again. |
+| `HANDOVER_RELEASE` deferred `MAX_RELEASE_DEFERRALS` (8) times | Senders kept registering or changing names through every round | Init-logd acknowledges the next release whatever is pending and exits; a name first registered in that last window reaches real-logd when the sender's next message is refused for it and the sender registers again, and a name changed there reaches it only if its sender registers again. |
 | Reply with unknown `word(0)` kind | Wire-format drift; one side built against an out-of-sync `logd-codec` or `shared/ipc` revision | Real-logd skips the chunk and continues. A bounded iteration cap (`MAX_ITERS`) in `pull_all` guarantees termination on a malformed reply stream. |
 | `SLOT`, `LINE`, or `RECORD` length word larger than the carried payload | A malformed or hostile reply | Real-logd takes the bytes the message carries and ignores the excess; the declared length cannot overflow its bounds arithmetic. |
 | `RECORD` payload that does not decode as a record | A malformed or hostile reply | Real-logd skips the chunk and continues. |

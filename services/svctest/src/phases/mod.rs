@@ -59,6 +59,7 @@ pub mod logd_restart;
 pub mod memmgr;
 pub mod namespace;
 pub mod node_handle;
+pub mod oom;
 pub mod pager;
 pub mod pipes;
 pub mod process_faults;
@@ -112,6 +113,7 @@ pub fn all() -> Vec<Phase>
     out.extend_from_slice(fs_ipc::relative_only());
     out.extend_from_slice(pwrmgr::deny_only());
     out.extend_from_slice(svcmgr::phases());
+    out.extend_from_slice(oom::phases());
     out.extend_from_slice(timed::phases());
     out.extend_from_slice(log_client::phases());
     out.extend_from_slice(logd_restart::phases());

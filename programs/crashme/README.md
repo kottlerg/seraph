@@ -11,7 +11,8 @@ The fixture's per-program tester, `crashme-tester`, runs it once in each of the 
 `worker`, and `registry-declare` modes, then twice in the `oom-touch` mode beside the `oom-fill`
 mode, and the `usertest` orchestrator discovers and runs that
 tester. svctest's `crash_endpoint` phase also spawns it, in the `vm`, `exception`,
-`registry-main`, `registry-worker`, and `debugger-tag` modes
+`registry-main`, `registry-worker`, and `debugger-tag` modes, and its `oom_policy` phase in the
+`oom-touch` mode
 ([services/svctest/README.md § Fixtures](../../services/svctest/README.md#fixtures)). The fixture
 installs at `/programs/crashme` and the tester at `/tests/programs/crashme`, per [docs/testing.md §
 Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
@@ -25,7 +26,7 @@ Per-program tester protocol](../../docs/testing.md#per-program-tester-protocol).
 | `registry-worker` | The illegal instruction on a spawned thread, after its registered sibling was joined |
 | `debugger-tag` | None: in steps svctest sets up as its debugger, each let go by a line on stdin, it checks that a thread it spawns while its main thread carries a debugger's binding, with no debugger watched, is bound back to the crash endpoint under a crash badge and its upcall class unbound at its registration, then that its `DECLARE_NO_DEBUG`, with a debugger attached and watched, unbinds the debugger's exception and upcall bindings of its main thread; it prints one line per step and exits 0 when both hold |
 | `oom-touch` | A write to a demand page it registered before, made on its second line of stdin while the `oom-fill` mode keeps memory critical: memmgr declines the fault for want of memory, and the crash service holds it. It prints `ready` after the first line, and `touched held_ms=<ms>` and exits 0 when the write completes; it dies of the fault when the hold times out |
-| `oom-fill <ms>` | None: it commits what memmgr can still promise a process outside the system reserve, through its heap and then by one-page grants, until nothing is left and the pressure level has read `CRITICAL` for 500 ms, prints `full`, keeps taking what other processes free for `<ms>` milliseconds, and exits 0, which gives it all back |
+| `oom-fill <ms>` | None: through [`mem-fill`](../../shared/mem-fill/README.md), shared with the `memhog` fixture, it commits what memmgr can still promise a process outside the system reserve, through its heap and then by one-page grants, until nothing is left and the pressure level has read `CRITICAL` for 500 ms, prints `full`, keeps taking what other processes free for `<ms>` milliseconds, and exits 0, which gives it all back |
 | `registry-declare` | None: with a registered thread parked, it sends `DECLARE_NO_DEBUG` and checks that the thread's crash binding, under a badge other than the main thread's, is unbound with the main thread's; it prints `registry-declare: PASS` and exits 0 when so |
 
 In each faulting mode the fixture registers the log name `crashme` and logs a line first, so logd's

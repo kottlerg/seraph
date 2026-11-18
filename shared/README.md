@@ -17,6 +17,7 @@ Utility crates shared across components, none of them a kernel/userspace ABI;
 | [`ipc/`](ipc/README.md) | IPC helpers — `IpcMessage` snapshot type, `ipc_call`/`recv`/`reply` wrappers, bootstrap protocol, and the `RecvGuard` receive-failure policy for blocking recv loops |
 | [`json/`](json/README.md) | Strict JSON value (RFC 8259): a bounded parser of untrusted text and compact and indented printers, for host tools |
 | [`log/`](log/README.md) | System log primitives — wire-format helpers and process-global cache for the badged log cap |
+| [`mem-fill/`](mem-fill/README.md) | Fills memmgr's pool up to the system reserve, for the out-of-memory test fixtures |
 | [`mmio/`](mmio/README.md) | Architecture-specific MMIO ordering barriers for device drivers |
 | [`namespace-protocol/`](namespace-protocol/README.md) | Cap-native namespace wire format, name validation, rights composition, and per-request `NamespaceBackend` dispatch used by every namespace server |
 | [`ns-client/`](ns-client/README.md) | `no_std` namespace walk helpers for holders of a vfsd namespace cap |

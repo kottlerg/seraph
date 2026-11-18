@@ -273,14 +273,14 @@ An IOMMU fault is counted for a requester ID only while a DMA grant of a live re
 once the device is blocked, and a fault of an untracked requester ID is logged, not counted. A
 function added at a removed one's address starts with no faults.
 
-Returned BAR caps stay split: no syscall merges two adjacent `Mmio` caps
-([#1230](https://github.com/kottlerg/seraph/issues/1230) adds one), so a window's free
-range comes back as the spans it was carved into, each placeable on its own. A card added again
-with the same BARs is placed in the same spans; a BAR larger than the largest span left, or whose
-aligned base falls across two spans, no longer fits, logged as `the slot's windows have no room
-for it`, although the window is free. Each add at a new place splits a free span into at most
-three, so the apertures table grows by at most two spans per BAR placed, and never past one span
-per page of the windows.
+Returned BAR caps stay split: devmgr does not merge two adjacent `Mmio` caps, although
+`SYS_MMIO_MERGE` can ([#1230](https://github.com/kottlerg/seraph/issues/1230) has devmgr use it), so
+a window's free range comes back as the spans it was carved into, each placeable on its own. A card
+added again with the same BARs is placed in the same spans; a BAR larger than the largest span left,
+or whose aligned base falls across two spans, no longer fits, logged as `the slot's windows have no
+room for it`, although the window is free. Each add at a new place splits a free span into at most
+three, so the apertures table grows by at most two spans per BAR placed, and never past one span per
+page of the windows.
 
 ---
 

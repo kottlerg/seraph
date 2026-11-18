@@ -3393,6 +3393,41 @@ pub mod restart_probe_labels
     pub const UNKNOWN_OPCODE: u64 = 1;
 }
 
+/// The `memhog` fixture's service labels (services/memhog/README.md): a
+/// supervised service that fills memmgr's pool up to the system reserve on
+/// request and holds it until it is stopped, which svctest's `oom` phase
+/// drives the out-of-memory policy service with.
+///
+/// The fixture serves them on the endpoint of the name its recipe provides,
+/// [`NAME`]. No badge bit is checked.
+pub mod memhog_labels
+{
+    /// The name the fixture's recipe provides
+    /// (`rootfs/config/svcmgr/tests/memhog.svc`).
+    pub const NAME: &[u8] = b"memhog.ctl";
+    /// Reply [`SUCCESS`] with data word 0 the instance's nonce, a random
+    /// value the process draws once at startup, so a caller tells two
+    /// instances apart, and data word 1 the pages the instance has taken by
+    /// [`HOG`]: 0 for an idle instance.
+    pub const PROBE: u64 = 1;
+    /// Take what memmgr can still promise a process outside the system
+    /// reserve, through the heap and then by one-page grants, until nothing
+    /// is left and the pressure level has read `CRITICAL` for 500 ms; then
+    /// reply [`SUCCESS`] with data word 0 the pages taken, and keep taking
+    /// back what other processes free, every 10 ms, until the process dies.
+    /// [`NOT_CRITICAL`] when the level does not settle within 30 s; what was
+    /// taken is kept. A repeat fills again from what is held and replies the
+    /// same way. The fill and its times are `shared/mem-fill`'s.
+    pub const HOG: u64 = 2;
+    /// The reply label of a handled request.
+    pub const SUCCESS: u64 = 0;
+    /// The reply label of a request with an unknown label.
+    pub const UNKNOWN_OPCODE: u64 = 1;
+    /// The reply label of a [`HOG`] whose level did not settle at
+    /// `CRITICAL`, or that could not read the level.
+    pub const NOT_CRITICAL: u64 = 2;
+}
+
 /// The `test-dma` fixture driver's service label
 /// (services/drivers/test-dma/README.md).
 ///
@@ -4673,7 +4708,7 @@ pub mod keysym
 
 /// Wire-protocol version of [`stream_labels`]; bumped as the block comment above
 /// the label modules describes, which also lists its runtime check, if any.
-pub const STREAM_LABELS_VERSION: u32 = 3;
+pub const STREAM_LABELS_VERSION: u32 = 4;
 /// IPC labels for the system log stream: the badged SEND cap on the master
 /// log endpoint each process holds (`ProcessInfo.log_send_cap`).
 ///
@@ -4681,7 +4716,9 @@ pub const STREAM_LABELS_VERSION: u32 = 3;
 /// `ipc_call(cap, label=STREAM_BYTES | (byte_len << 16) | (level << 32), …)`
 /// per write (chunked at `MSG_DATA_WORDS_MAX * 8` per call). The receiver
 /// reads `byte_len.div_ceil(8)` data words from its IPC buffer and unpacks
-/// `byte_len` bytes. The receiver replies empty to unblock the writer.
+/// `byte_len` bytes. The receiver replies with label 0 and no payload to
+/// unblock the writer, or with [`stream_labels::NAME_UNKNOWN`] to a message
+/// it did not consume (bit 35 below).
 /// No multi-chunk reassembly framing on the wire — line buffering
 /// (e.g. logd's `[name]` per-newline prefix) lives in the receiver.
 ///
@@ -4696,6 +4733,9 @@ pub const STREAM_LABELS_VERSION: u32 = 3;
 ///   `LEVEL_*` code. A text line takes the level of the message that
 ///   carries its first byte (`services/logd/docs/ipc-interface.md`
 ///   § `stream_labels::STREAM_BYTES`); a record carries its own.
+/// - Bit 35 ([`SENDER_NAMED`]): the sender has registered a display name
+///   ([`STREAM_REGISTER_NAME`]), so a receiver that holds none for its badge
+///   answers [`NAME_UNKNOWN`] and consumes nothing.
 pub mod stream_labels
 {
     /// Base label ID for stream-bytes messages (bits 0-15).
@@ -4730,6 +4770,29 @@ pub mod stream_labels
             _ => LEVEL_INFO,
         }
     }
+
+    /// [`STREAM_BYTES`] and [`STREAM_RECORD`] label bit: the sender has
+    /// registered a display name ([`STREAM_REGISTER_NAME`]) on the cap it
+    /// sends on. logd answers a message carrying it, from a badge whose slot
+    /// holds no name, with [`NAME_UNKNOWN`] and consumes nothing: its table
+    /// lost the name, as a restarted logd's fresh table has
+    /// (`services/logd/docs/ipc-interface.md`
+    /// § `stream_labels::STREAM_REGISTER_NAME`). init-logd ignores it.
+    pub const SENDER_NAMED: u64 = 1 << 35;
+
+    /// Whether a [`STREAM_BYTES`] or [`STREAM_RECORD`] label carries
+    /// [`SENDER_NAMED`].
+    #[must_use]
+    pub const fn sender_named(label: u64) -> bool
+    {
+        label & SENDER_NAMED != 0
+    }
+
+    /// [`STREAM_BYTES`] and [`STREAM_RECORD`] reply label: the message
+    /// carries [`SENDER_NAMED`] and the receiver holds no name for the
+    /// sender's badge, so it consumed nothing. The sender registers its name
+    /// again and sends the message once more without the bit.
+    pub const NAME_UNKNOWN: u64 = 2;
     /// Register (or update) the display name for the sender's log stream.
     ///
     /// Payload: name bytes via `.bytes(0, name)` with byte length in bits
@@ -6070,6 +6133,26 @@ mod tests
         // The level field leaves the id and the length intact.
         assert_eq!(label(LEVEL_TRACE) & 0xFFFF, STREAM_BYTES);
         assert_eq!((label(LEVEL_TRACE) >> 16) & 0xFFFF, 40);
+    }
+
+    // Defect caught: a named-sender bit inside the id, length, or level field,
+    // which would change a line's label, length, or level, or a full field
+    // that reads as the bit.
+    #[test]
+    fn the_named_sender_bit_lies_outside_every_other_label_field()
+    {
+        use stream_labels::{
+            LEVEL_MASK, LEVEL_SHIFT, LEVEL_WARN, SENDER_NAMED, STREAM_RECORD, level_of,
+            sender_named,
+        };
+        let full = 0xFFFF | (0xFFFF << 16) | (LEVEL_MASK << LEVEL_SHIFT);
+        assert!(!sender_named(full));
+        assert_eq!(full & SENDER_NAMED, 0);
+        let label = STREAM_RECORD | (37 << 16) | (LEVEL_WARN << LEVEL_SHIFT) | SENDER_NAMED;
+        assert!(sender_named(label));
+        assert_eq!(label & 0xFFFF, STREAM_RECORD);
+        assert_eq!((label >> 16) & 0xFFFF, 37);
+        assert_eq!(level_of(label), LEVEL_WARN);
     }
 
     #[test]

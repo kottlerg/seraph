@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Copyright (C) 2026 George Kottler <mail@kottlerg.com>
+
+[package]
+name = "oomd-policy"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+# no_std pure logic: oomd's configuration, its ladder over memmgr's pressure
+# level, and the order it stops candidates in. Host-tested.
+[lib]
+test = true
+doctest = false
+
+[lints]
+workspace = true

@@ -153,7 +153,9 @@ jobs:
         # crasher is non-shutdown, so it shares the boot with
         # svctest without racing pwrmgr shutdown; its bounded faults
         # finish long before svctest's terminal marker. This is the only
-        # automated boot crasher runs in.
+        # automated boot crasher runs in. It also co-stages memhog
+        # (memhog.svc), the out-of-memory policy service's fixture, which
+        # svctest's oom_policy phase has fill memory until oomd stops it.
         #
         # The functional harness boots also drop the autostarted `terminal`
         # (a user-facing program, not part of the services/programs substrate
@@ -183,6 +185,7 @@ jobs:
                  sysroot/config/devmgr/classes/
               cp sysroot/config/svcmgr/tests/crasher.svc \
                  sysroot/config/svcmgr/tests/crasher-worker.svc \
+                 sysroot/config/svcmgr/tests/memhog.svc \
                  sysroot/config/svcmgr/services/
               rm -f sysroot/config/svcmgr/services/terminal.svc
               rm -f sysroot/config/svcmgr/services/crashd.svc

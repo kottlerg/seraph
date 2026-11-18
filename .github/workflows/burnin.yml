@@ -107,12 +107,17 @@ jobs:
         # The svctest cell also stages the test-only device class files of
         # `sysroot/config/devmgr/tests/` into `classes/`, and its boots attach
         # the test devices (`--test-devices`, below) the test-only drivers bind.
+        # The svctest cell also co-stages memhog (memhog.svc), which svctest's
+        # oom_policy phase has fill memory until oomd stops it; the cell keeps
+        # crashd, so the phase's child writes a page while memory is critical
+        # and crashd resumes it once the stop frees memory.
         # The usertest cell also stages crashd's test recipe over the default
         # one: its `CORE_DUMP` names crashme, whose tester checks the cores.
         run: |
           case "${{ matrix.tester }}" in
             svctest)
               cp sysroot/config/svcmgr/tests/svctest.svc \
+                 sysroot/config/svcmgr/tests/memhog.svc \
                  sysroot/config/svcmgr/services/
               cp sysroot/config/devmgr/tests/*.class \
                  sysroot/config/devmgr/classes/

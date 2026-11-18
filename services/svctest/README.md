@@ -41,8 +41,8 @@ services/svctest/
         ├── layout.rs          # Growth zones, one large alloc, reserve holes, wide TLS,
         │                      # spawned IPC buffers in the arena; stack note parse
         ├── log_client.rs      # Log-call bounds against a log receiver that never answers
-        ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines
-        │                      #   and a death forward on the new instance
+        ├── logd_restart.rs    # logd killed through an attach and restarted: svcmgr's lines,
+        │                      #   names restored by refusal, a death forward on the new instance
         ├── threading.rs       # Threads, per-thread stdio/alloc, TLS, identity, sync primitives;
         │                      # spawn priority; heap lock under cross-class contention
         ├── procmgr.rs         # `Command` spawn, cwd, errors; refusals; DMA hold;
@@ -87,6 +87,8 @@ services/svctest/
         │   └── ramdisk.rs     # RAM FAT16 volume and block server with armed faults, read log
         ├── pwrmgr.rs          # Shutdown cap-deny check, terminal shutdown, `reboot` role
         ├── svcmgr.rs          # Handover refused; publish gate; badged SEND; seed-only; round 2
+        ├── oom.rs             # Out-of-memory policy: memhog filled until oomd stops it, a held
+        │                      #   write resumed
         ├── timed.rs           # `SystemTime::now()` through svcmgr and timed
         ├── unmount.rs         # vfsd `UNMOUNT`: refusals, busy then forced, stale handles,
         │                      #   fall-through, remount, a mapped page across the unmount
@@ -142,7 +144,8 @@ and `caps[5]`), the
 vfsd and vfsd unmount phases (`caps[4]`, `caps[5]`), the `logd_death_forward`,
 `logd_concurrent`, and `logd_restart` phases (`caps[6]`), the vfsd swap-partition phase
 (`caps[14]`), the `crash_endpoint` and `logd_restart` phases (`caps[15]`), and the
-`svcmgr_stop_service` phase (`caps[16]`) instead fail their assertions. The seed-only phase thus
+`svcmgr_stop_service` phase (`caps[16]`), and the `oom_policy` phase's no-stop case
+(`caps[16]`), instead fail their assertions. The seed-only phase thus
 fails the run on a zero `caps[1]` before the terminal pwrmgr shutdown phase, so that phase's own
 zero-cap skip is not reached; the panic hook's `SHUTDOWN` is then skipped for the same zero cap,
 and the run ends idle.
@@ -181,7 +184,7 @@ an unresolved name leaves. With no creator endpoint, every slot stays zero.
 | `caps[13]` | `devmgr.class.framebuffer-deny` | drivers deny phase: a `framebuffer` class SEND without the driver's verb bits |
 | `caps[14]` | `vfsd.swap`      | vfsd `GET_SWAP_PARTITION` phase        |
 | `caps[15]` | (`debug_authority`) | `crash_endpoint` phase; `logd_restart` phase: finds and attaches to logd; svctest declares itself undebuggable at startup |
-| `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE` |
+| `caps[16]` | (`stop_authority`) | `svcmgr_stop_service` phase: svcmgr's `STOP_SERVICE` and `LIST_STOPPABLE`; `oom_policy` phase, no-stop case: `STOP_SERVICE` of memhog |
 
 The svcmgr seed-only phase also reads every seed-only slot and fails when any is zero, as evidence
 that its name is published, the seven `devmgr.class.*` names among them. `caps[2]` carries
@@ -247,10 +250,17 @@ The `logd_restart` phase kills logd through `caps[15]`: it finds logd by name
 crashd when the boot stages it, else to procmgr's decliner, and svcmgr restarts logd. It writes no
 log line until it finds, through `caps[6]`, svcmgr's `service died: logd` and
 `service restarted: logd` lines in the new instance's history, which holds only lines written
-after the respawn, and fails when they do not arrive within 30 s. It then registers svctest's name
-again, which the new instance's table lacks (#1213), and runs the `logd_death_forward` check again,
-against the new instance's fresh table and the death queue it registered, and logs how long the
-restart took.
+after the respawn, and fails when they do not arrive within 30 s. It then logs how long the restart
+took, as svctest's first line to the new instance, whose table holds no name for svctest, and
+requires that line retained once, in a live slot named `svctest`: the line carried
+`SENDER_NAMED`, so the new instance refused it until svctest's log client registered the name
+again ([logd IPC interface](../logd/docs/ipc-interface.md)
+§ `stream_labels::STREAM_REGISTER_NAME`). A `logd-name-probe-child` then sends the new
+instance raw stream messages: it registers an empty name, so its live slot holds none, and requires
+a line without `SENDER_NAMED` accepted, a line and a record with it refused `NAME_UNKNOWN`, and,
+once it has registered a name, a line with it accepted; the phase requires logd's history of the
+child to hold the two accepted lines alone. Last, it runs the `logd_death_forward` check again,
+against the new instance's fresh table and the death queue it registered.
 Every seed is seed-only in svcmgr's registry. The no-authority `pwrmgr.deny` cap is
 public, so svctest resolves it through `QUERY_ENDPOINT` on its per-process `service_registry_cap`
 and spends no seed slot on it; it drives the pwrmgr cap-deny phase, which requires an `UNAUTHORIZED`
@@ -270,12 +280,26 @@ The `svcmgr_stop_service` phase checks the stop authority
 per-process `service_registry_cap` both `STOP_SERVICE` and `LIST_STOPPABLE` must reply
 `UNAUTHORIZED`. Through `caps[16]`, `STOP_SERVICE` must reply `NOT_STOPPABLE` for an unknown
 name, for svctest itself (`restart = never`), vfsd (started by init), logd (`critical = yes`),
-pwrmgr (the shutdown actuator, a core role) and timed (no `oom_stop`). With `crasher-worker.svc`
-staged, whose recipe sets `oom_stop = yes`, the whole `LIST_STOPPABLE` walk must list
-`crasher-worker` alone with a non-zero usage, `STOP_SERVICE` of it must reply `SUCCESS`, and the
-fixture must then answer `PROBE_INSTANCE` with a new instance's nonce, the restart its
-`on_failure` policy makes of the `EXIT_KILLED` death. Without the fixture the walk must list
-nothing.
+pwrmgr (the shutdown actuator, a core role) and timed (no `oom_stop`). The whole
+`LIST_STOPPABLE` walk must list exactly the staged fixtures whose recipes set `oom_stop = yes`
+(`crasher-worker` and `memhog`), each with a non-zero usage, and nothing when neither is staged.
+With `crasher-worker.svc` staged, `STOP_SERVICE` of it must reply `SUCCESS`, and the fixture must
+then answer `PROBE_INSTANCE` with a new instance's nonce, the restart its `on_failure` policy makes
+of the `EXIT_KILLED` death.
+
+The `oom_policy` phase (`phases/oom.rs`, registered after the svcmgr phases) runs when the
+`memhog.svc` recipe is staged beside `svctest.svc` and passes otherwise, logging that `memhog.svc`
+is not staged. It waits for the pressure level to read `NORMAL`, sends `PROBE` to
+[memhog](../memhog/README.md) (a nonce, 0 pages) and then `HOG`, which fills memory until the level
+reads `CRITICAL`. With oomd staged and `OOMD_STOP=yes`, it waits for the level to fall to
+`NORMAL` and checks that oomd logged exactly one `stopped memhog: ` line after at least its grace
+critical, and no advice line. When crashd is staged with a stall, a child (`/programs/crashme
+oom-touch`) writes a page during the fill and crashd logs it resumed. With `OOMD_STOP=no`, or
+without `oomd.svc` staged, it checks that memhog stays running and the level stays `CRITICAL` past
+the grace, the cooldown and 2000 ms, that oomd, if staged, logged at least one `would stop memhog: `
+line and no stop, and then stops memhog itself through `caps[16]`. In every case memhog's next
+instance answers `PROBE` with a new nonce and 0 pages
+([oomd](../oomd/README.md)).
 
 ---
 
@@ -295,6 +319,7 @@ spawner tears them down), and an unmatched token falls through to the normal run
 | `park-child`                | `procmgr`      | `command_from_spawned_thread` (kill, drop)  |
 | `undeliverable-reply-child` | `procmgr`      | `procmgr_refusals` (failed create reply)    |
 | `logd-reclaim-child`        | `procmgr`      | `logd_death_forward` (named logd slot)      |
+| `logd-name-probe-child`     | `logd_restart` | `logd_restart` (named-sender refusals)      |
 | `release-child`             | `fs_std`       | `std_release_matched_by_open` (fake fs)     |
 | `open-reclaim-child`        | `fs_opens`     | `fs_reclaims_dead_opens` (killed client)    |
 | `open-undeliverable-child`  | `fs_opens`     | `fs_reclaims_dead_opens` (failed reply)     |
@@ -328,7 +353,8 @@ gone debugger's binding is bound back to the crash endpoint and whose declaratio
 attached and watched, unbinds svctest's bindings and leaves no watch to bind it back; has procmgr
 unbind a debugger's binding from a thread of its own whose registration it refuses, svctest having
 declared itself undebuggable; then gives the endpoint back and sees a second child declined by
-procmgr). The
+procmgr; and, for the `oom_policy` phase, an `oom-touch` child whose write crashd holds while
+memory is critical). The
 devmgr on-demand-bind phase registers a `WATCH_CLASS` watch on `caps[10]`, then sends
 `BIND_DRIVERS` on `caps[3]` over `/tests/drivers/`, which no
 drivers-directory pass at boot reads, so devmgr binds the

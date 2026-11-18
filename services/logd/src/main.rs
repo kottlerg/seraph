@@ -21,13 +21,7 @@
 //! pull, the release of the self-log lines held until init-logd stops writing
 //! the UART ([`SELF_LOG_HOLD`]), then the gate's opening and the control loop.
 
-#![expect(
-    clippy::cast_possible_truncation,
-    reason = "targets 64-bit only; u64/usize conversions lossless"
-)]
-
 mod handover;
-mod slot;
 
 use core::fmt::Write;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -50,7 +44,7 @@ use recv_pool::{IpcBuf, RecvPool, SpawnError};
 use std::os::seraph::startup_info;
 use syscall::RIGHTS_EQ_POST;
 
-use crate::slot::{Eviction, LINE_BUF_SIZE, MAX_NAME_LEN, Slot, SlotTable};
+use logd_slot_table::{Eviction, History, LINE_BUF_SIZE, MAX_NAME_LEN, Slot, SlotTable};
 
 /// `WaitSet` badge for the death-notification event queue.
 const WS_BADGE_DEATH: u64 = 1;
@@ -271,7 +265,7 @@ fn main() -> !
             buf,
             "handover complete: {} slots, {} history entries",
             table.slots.len(),
-            table.slots.values().map(|s| s.history.len()).sum::<usize>(),
+            table.history().len(),
         );
         self_log(buf.as_str());
     }
@@ -867,9 +861,9 @@ fn reply_ack(ipc_buf: *mut u64)
 
 /// Append `byte_len` bytes from the IPC payload onto the slot for
 /// `badge`, flushing complete lines (`\n`-terminated) to the serial
-/// port AND recording them into the per-slot history ring. A line takes
+/// port AND retaining them in logd's history. A line takes
 /// the level of the message carrying its first byte
-/// ([`crate::slot::Slot::begin_byte`]).
+/// ([`Slot::begin_byte`]).
 ///
 /// Accepts up to `STREAM_CHUNK_SIZE = MSG_DATA_WORDS_MAX * 8` bytes
 /// per call (the maximum a single `STREAM_BYTES` IPC can carry); the
@@ -888,8 +882,8 @@ fn reply_ack(ipc_buf: *mut u64)
 /// (`services/logd/docs/ipc-interface.md` § `stream_labels::STREAM_REGISTER_NAME`).
 #[expect(
     clippy::significant_drop_tightening,
-    reason = "the sender's `slot` and `seq` borrow through the guard to the end of the byte loop: \
-              the hold serialises the slot's partial line, its history and the sequence counter"
+    reason = "the sender's `slot` and the `history` borrow through the guard to the end of the \
+              byte loop: the hold serialises the slot's partial line and the history"
 )]
 fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
 {
@@ -908,7 +902,7 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> 
         let mut out = LineBuf::new();
         let line_done = {
             let mut state = logd.lock();
-            let Some((slot, seq)) = state.table.sender_slot(badge)
+            let Some((slot, history)) = state.table.sender_slot(badge)
             else
             {
                 // An evicted sender's message (`SlotTable::sender_slot`):
@@ -922,7 +916,7 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> 
                 slot.begin_byte(level);
                 if b == b'\n'
                 {
-                    flush_partial(slot, seq, &mut out);
+                    flush_partial(slot, history, badge, &mut out);
                     done = true;
                     break;
                 }
@@ -931,7 +925,7 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> 
                     slot.partial.push(b);
                     if slot.partial.len() == LINE_BUF_SIZE
                     {
-                        flush_partial(slot, seq, &mut out);
+                        flush_partial(slot, history, badge, &mut out);
                         done = true;
                         break;
                     }
@@ -957,8 +951,8 @@ fn consume_bytes(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> 
 /// neither rendered nor retained either, as [`consume_bytes`] answers.
 #[expect(
     clippy::significant_drop_tightening,
-    reason = "the sender's `slot` and `seq` borrow through the guard to the record's retention: \
-              the hold serialises the slot's name, its history and the sequence counter"
+    reason = "the sender's `slot` and the `history` borrow through the guard to the record's \
+              retention: the hold serialises the slot's name and the history"
 )]
 fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) -> u64
 {
@@ -980,7 +974,7 @@ fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) ->
         {
             return NAME_UNKNOWN;
         }
-        let Some((slot, seq)) = state.table.sender_slot(badge)
+        let Some((slot, history)) = state.table.sender_slot(badge)
         else
         {
             // An evicted sender's record (`SlotTable::sender_slot`): dropped,
@@ -992,21 +986,21 @@ fn consume_record(logd: &Logd, badge: u64, msg: &IpcMessage, byte_len: usize) ->
         logd_codec::record::render(&record, |b| out.push(b));
         out.push(b'\r');
         out.push(b'\n');
-        slot.push_record(SlotTable::next_seq(seq), us, level, &record);
+        history.push_record(slot, badge, us, level, &record);
     }
     out.flush();
     RECORD_ACCEPTED
 }
 
-/// Render the slot's in-progress line into `out`, append it to the history
-/// ring as the next entry of `seq`, and clear the partial buffer.
-fn flush_partial(slot: &mut Slot, seq: &mut u64, out: &mut LineBuf)
+/// Render the in-progress line of `slot`, the slot of sender `badge`, into
+/// `out`, retain it in `history`, and clear the partial buffer.
+fn flush_partial(slot: &mut Slot, history: &mut History, badge: u64, out: &mut LineBuf)
 {
     let line = std::mem::take(&mut slot.partial);
     let level = slot.partial_level;
     let us = elapsed_us();
     out.push_text_line(&slot.name, level, us, &line);
-    slot.push_history(SlotTable::next_seq(seq), us, level, &line);
+    history.push_text(slot, badge, us, level, &line);
 }
 
 /// Record / update the display name for `badge`. History entries carry

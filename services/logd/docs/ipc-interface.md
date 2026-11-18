@@ -66,16 +66,16 @@ arrive in the IPC message's data words, packed at word 0. logd
 appends the bytes to the slot keyed by the kernel-delivered
 `msg.badge`; every `\n` flushes the slot's partial buffer as one
 line: under the state lock the line is rendered as
-`[sec.usfrac] [name] <line>\r\n` and appended to the slot's history
-ring with its level, and once the lock is released the rendered line
+`[sec.usfrac] [name] <line>\r\n` and retained in logd's history as
+the slot's entry with its level, and once the lock is released the rendered line
 is written to the serial driver
 (`SERIAL_WRITE_BYTES`) and mirrored to the framebuffer driver
 (`FB_WRITE_BYTES`) when one is present, each through its sink
 (§ Output sinks).
 
-The history ring holds `PER_SLOT_HISTORY` (16) completed entries per slot, text lines and
-records (§ History; [`slot.rs`](../src/slot.rs)); appending to a full ring drops its oldest
-entry (FIFO). `log_labels::QUERY_HISTORY` reads it (§ Queries).
+logd's history holds the completed entries of every slot, text lines and records, within
+`HISTORY_BYTES` (256 KiB) together, and at most `PER_SLOT_HISTORY` (16) of one slot
+(§ History; [`lib.rs`](../slot-table/src/lib.rs)). `log_labels::QUERY_HISTORY` reads it (§ Queries).
 
 Lines exceeding `LINE_BUF_SIZE` (256 bytes) flush without a
 trailing `\n` to keep the per-line attribution visible. Senders
@@ -296,12 +296,13 @@ logd.
 
 ## History
 
-The stored form `log_labels::QUERY_HISTORY` reads (§ Queries). Each of logd's
-per-slot entries ([`slot.rs`](../src/slot.rs) `HistoryEntry`) holds:
+The stored form `log_labels::QUERY_HISTORY` reads (§ Queries). Each entry of logd's history
+([`lib.rs`](../slot-table/src/lib.rs) `HistoryEntry`, kept by its `seq` in `History`) holds:
 
 | Field | Content |
 |---|---|
 | `seq` | logd-wide arrival sequence: one counter across every slot, taken when the entry is retained, so a larger `seq` is a later entry whatever its sender; entries installed from the handover take theirs in install order, oldest first |
+| `badge` | the sender's badge |
 | `us` | receipt time, microseconds since boot |
 | `level` | an `ipc::stream_labels::LEVEL_*` code (§ Levels) |
 | `kind` | `Text`, a `STREAM_BYTES` line, or `Record`, a `STREAM_RECORD` record with its field table |
@@ -315,14 +316,23 @@ with the sender's badge, and the handover carries each entry in a `LINE` or
 `RECORD` chunk ([`handover-protocol.md`](handover-protocol.md)); logd builds
 a record's field table again when it installs the chunk.
 
+The history holds every live and retired slot's entries within `HISTORY_BYTES` (256 KiB), each
+entry charged its bytes, its field table, and its key and value in the history map. Retaining an
+entry past it drops the oldest entries logd-wide until the new one fits, and a slot keeps at most
+its last `PER_SLOT_HISTORY` (16) entries, a further entry dropping its own oldest, so one sender
+logging without pause does not push a quieter or a dead sender's last lines out alone. The bound
+holds whatever the number of senders, so a logd restarted while memory is critical, to which every
+live sender is new, holds no more history than any other
+([README](../README.md) § Role, Reserve service).
+
 ### Retired slots
 
 An evicted slot (§ Death-notification cascade, § Death-queue resync) leaves the
 badge table and joins logd's retired slots, a FIFO of at most `RETIRED_SLOTS`
-(64) entries ([`slot.rs`](../src/slot.rs)); retiring one into a full FIFO drops
-its oldest. A retired slot keeps its badge, its display name, its history ring,
+(64) entries ([`lib.rs`](../slot-table/src/lib.rs)); retiring one into a full FIFO drops
+its oldest, with its entries. A retired slot keeps its badge, its display name, its entries,
 and how it was evicted: by a death, with the death entry's exit reason, or by a
-resync. A badge retired again replaces its older retired slot, so a badge
+resync. A badge retired again replaces its older retired slot and its entries, so a badge
 appears at most once among them. procmgr may hand a dead process's badge to a
 new one, so a live slot and a retired slot can share a badge, unless the badge
 is among logd's most recent evictions (§ Wait-set).
@@ -341,7 +351,7 @@ bit: procmgr redraws a process badge that does
 `LOG_BADGE_PROCMGR` carry none. A query on any other badge is refused with
 `QUERY_DENIED`.
 
-A receive worker answers a query from the table and the rings logd owns, as it
+A receive worker answers a query from the table and the history logd owns, as it
 serves the stream labels (§ Receive pool), and calls no other service to answer
 it, so a query never waits on another service (§ Death-queue resync gives the
 deadlock a call to procmgr would risk). The wire format is defined in
@@ -376,7 +386,7 @@ this across its pages:
 - `QUERY_HISTORY` reads each entry at most once, since `seq` is unique and the
   walk moves to older `seq` only; a retire keeps an entry's `seq`. An entry
   retained after the walk began is newer than every entry it read and is
-  missed, as is one a full ring drops before the walk reaches it.
+  missed, as is one the history drops before the walk reaches it.
 
 A client that needs one consistent view walks again once the state it waits
 for is reached.
@@ -452,7 +462,7 @@ again.
   after the pull, every worker could be waiting on procmgr while procmgr waits on the unread log
   endpoint to log its reap of init.
 - **State.** The badge table, the retired slots, the recently evicted badges (§ Wait-set), the
-  history rings, and the death drain's count are under one lock. A worker takes it to complete,
+  history, and the death drain's count are under one lock. A worker takes it to complete,
   render, and retain a line or a record, to record a name, or to answer a query, and releases it
   before it hands the line to the sinks. No thread holds it across an IPC call.
 - **Output.** A worker hands a rendered line whole to each sink's queue and waits for the sink's
@@ -530,10 +540,10 @@ A worker can still serve a request after its sender's eviction: the request was 
 the sender's death, and the death was taken, by this worker or another thread, before the worker
 took the state lock; a resync's eviction can fall in the same place. logd keeps the badges of its
 last `EVICTED_BADGES` (128) evictions, by a death or a resync, whether or not the badge had a slot
-([`slot.rs`](../src/slot.rs)). A `STREAM_BYTES`, `STREAM_RECORD` or `STREAM_REGISTER_NAME` whose
-badge has no live slot and is among them is the evicted sender's, and logd drops it and replies as
-for one it consumed, rather than give the badge a live slot again. procmgr draws process badges at
-random, so a new process takes one of those badges only by chance.
+([`lib.rs`](../slot-table/src/lib.rs)). A `STREAM_BYTES`, `STREAM_RECORD` or
+`STREAM_REGISTER_NAME` whose badge has no live slot and is among them is the evicted sender's, and
+logd drops it and replies as for one it consumed, rather than give the badge a live slot again.
+procmgr draws process badges at random, so a new process takes one of those badges only by chance.
 
 ## Death-notification cascade
 

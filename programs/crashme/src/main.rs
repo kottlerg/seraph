@@ -81,13 +81,13 @@ fn main()
         "registry-declare" => registry_declare(),
         "debugger-tag" => debugger_tag(),
         "oom-fill" => oom::fill(std::env::args().nth(2).as_deref()),
-        "oom-touch" => oom::touch(),
+        "oom-touch" => oom::touch(std::env::args().nth(2).as_deref()),
         "oom-hold" => oom::hold(std::env::args().nth(2).as_deref()),
         _ =>
         {
             println!(
                 "usage: crashme vm|exception|worker|registry-main|registry-worker|registry-declare\
-                 |debugger-tag|oom-fill <ms>|oom-touch|oom-hold <pages>"
+                 |debugger-tag|oom-fill <ms>|oom-touch <pages>|oom-hold <pages>"
             );
             std::process::exit(2);
         }

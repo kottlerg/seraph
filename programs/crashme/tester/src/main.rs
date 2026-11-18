@@ -345,6 +345,10 @@ const TIMEOUT_HELD_MIN_MS: u128 = 1000;
 const OOM_WAIT: Duration = Duration::from_secs(30);
 /// Bytes of stack the tester touches before a window, below its frame.
 const STACK_TOUCH_BYTES: usize = 16 * 1024;
+/// The pages `oom-touch` writes: one, since no process the tester ends frees
+/// memory between the filler's `full` and the write, so the first write is
+/// declined.
+const TOUCH_PAGES: &str = "1";
 
 /// One `oom-touch` fixture, between its `ready` and its write.
 struct Toucher
@@ -355,11 +359,13 @@ struct Toucher
     line: String,
 }
 
-/// Start `/programs/crashme oom-touch` and wait for its `ready`.
+/// Start `/programs/crashme oom-touch` [`TOUCH_PAGES`] and wait for its
+/// `ready`.
 fn start_toucher() -> Toucher
 {
     let mut child = Command::new("/programs/crashme")
         .arg("oom-touch")
+        .arg(TOUCH_PAGES)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

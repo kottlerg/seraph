@@ -1,0 +1,21 @@
+# /tests/memhog — the out-of-memory policy service's test fixture.
+#
+# Recipe lives under /config/svcmgr/tests/, which svcmgr does NOT scan.
+# Co-staged with svctest (services-surface harness) in CI and stageable
+# by hand: copy this file into /config/svcmgr/services/ between
+# `cargo xtask build` and `cargo xtask run`. See docs/testing.md.
+#
+# memhog serves `ipc::memhog_labels` on the endpoint of the name it provides:
+# on request it takes what memmgr can still promise until the pressure level
+# reads CRITICAL, and holds it until it is stopped. svctest's oom phase has it
+# hog and reads that oomd stopped it and svcmgr restarted it idle
+# (services/memhog/README.md). `oom_stop = yes`, with no reserve: it is the
+# service oomd stops. `restart = on_failure`, `critical = no`: the stop's
+# EXIT_KILLED death restarts it, and the system continues if the restart
+# budget is spent.
+binary    = /tests/memhog
+restart   = on_failure
+critical  = no
+namespace = none
+provides  = memhog.ctl
+oom_stop  = yes

@@ -104,6 +104,7 @@ name = "crashme"
 version = "0.1.4"
 dependencies = [
  "ipc",
+ "mem-fill",
  "syscall",
  "syscall-abi",
 ]
@@ -475,6 +476,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mem-fill"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "syscall-abi",
+]
+
+[[package]]
+name = "memhog"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "mem-fill",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
 name = "memmgr"
 version = "0.1.4"
 dependencies = [
@@ -523,6 +542,20 @@ dependencies = [
  "crypto",
  "crypto-testkit",
 ]
+
+[[package]]
+name = "oomd"
+version = "0.1.4"
+dependencies = [
+ "ipc",
+ "oomd-policy",
+ "syscall",
+ "syscall-abi",
+]
+
+[[package]]
+name = "oomd-policy"
+version = "0.1.4"
 
 [[package]]
 name = "pipefault"
@@ -770,6 +803,7 @@ dependencies = [
  "ipc",
  "log",
  "namespace-protocol",
+ "oomd-policy",
  "process-abi",
  "process-layout",
  "procmgr-process-table",

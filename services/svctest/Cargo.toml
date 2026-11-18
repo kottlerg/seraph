@@ -25,6 +25,8 @@ ipc = { path = "../../shared/ipc" }
 # std's copy and svctest's real log stream are untouched.
 log = { path = "../../shared/log" }
 namespace-protocol = { path = "../../shared/namespace-protocol" }
+# `Config` and its parsers: the oom phase reads oomd's recipe as oomd does.
+oomd-policy = { path = "../oomd/policy" }
 process-abi = { workspace = true }
 process-layout = { path = "../../shared/process-layout" }
 # `FIRST_POOL_OBSERVERS`: the death_queue_growth phase sizes its children

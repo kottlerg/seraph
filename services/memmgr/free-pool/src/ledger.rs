@@ -73,7 +73,8 @@ pub enum Commit
     Committed,
 }
 
-/// Why [`Ledger::extend_region`] or [`Ledger::shrink_region`] changed nothing.
+/// Why [`Ledger::extend_region`], [`Ledger::shrink_region`] or
+/// [`Ledger::discard_range`] changed nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResizeError
 {
@@ -83,7 +84,9 @@ pub enum ResizeError
     NotCommitted,
     /// The new length is not page-aligned, or is zero, leaves the address
     /// space, lies on the wrong side of the current length, or, for a shrink,
-    /// ends inside a chunk that holds a page past it.
+    /// ends inside a chunk that holds a page past it; or a discard's range is
+    /// empty, leaves its region, or starts or ends off a chunk boundary other
+    /// than the region's end.
     Length,
     /// The grown region would overlap another region of the record.
     Overlap,
@@ -1301,6 +1304,119 @@ impl<S: SlotStore, W: WordStore> Ledger<S, W>
         budget::uncharge(&mut self.arena, charged, added);
         self.promised = self.promised.saturating_sub(added);
         Ok(())
+    }
+
+    /// The region of `rec` that holds the range `[va, va + len)` a
+    /// [`Ledger::discard_range`] may clear, with its slot: the range lies in
+    /// the region and starts at a whole number of chunks from its base, and its
+    /// length is nonzero and a whole number of chunks, or reaches the region's
+    /// end.
+    ///
+    /// # Errors
+    /// [`ResizeError::NoRegion`] when `rec` holds no record or no region
+    /// holds `va`, and [`ResizeError::Length`] for a range that breaks the
+    /// rule above.
+    pub fn discard_region(
+        &self,
+        rec: NodeIdx,
+        va: u64,
+        len: u64,
+    ) -> Result<(NodeIdx, DemandRegion), ResizeError>
+    {
+        let (reg, region) = self.region_for(rec, va).ok_or(ResizeError::NoRegion)?;
+        let offset = va.saturating_sub(region.va_base);
+        let end = offset.checked_add(len).ok_or(ResizeError::Length)?;
+        if len == 0
+            || !offset.is_multiple_of(crate::CHUNK_BYTES)
+            || end > region.len
+            || (!len.is_multiple_of(crate::CHUNK_BYTES) && end != region.len)
+        {
+            return Err(ResizeError::Length);
+        }
+        Ok((reg, region))
+    }
+
+    /// Discard the pages `[va, va + len)` of a demand region of `rec`: clear
+    /// their chunks from the region's chunk table ([`chunk::clear`]), taking
+    /// each run of theirs back, pooled or deferred as `quiescent` decides, so
+    /// the next fault on a page of them backs it afresh. memmgr unmaps the
+    /// pages first without reclaiming page tables, so the pages' own mappings
+    /// do not keep a run deferred and their page tables stay.
+    ///
+    /// In an uncommitted region each run retires charged to the budget node of
+    /// `rec`, as [`Ledger::remove_region`] retires it. A committed region keeps
+    /// its commitment: the region's charge carries the pages whether or not
+    /// they hold frames, so its runs retire charged to no node, and `promised`
+    /// rises by their pages, which hold no frame again, and by the metadata the
+    /// cleared chunks gave back ([`commit::meta_of_chunks`], what is left of
+    /// the region's bound rising by it, at most to [`commit::meta_bound`] of
+    /// its length). A refault of a discarded page is then admitted from
+    /// `promised` as its first touch was, so it is declined for neither budget
+    /// nor RAM. A range that holds no run changes nothing, so a repeat is safe.
+    /// Returns the pages of the runs taken back.
+    ///
+    /// # Errors
+    /// As [`Ledger::discard_region`]. Nothing changes then.
+    pub fn discard_range(
+        &mut self,
+        rec: NodeIdx,
+        va: u64,
+        len: u64,
+        mut quiescent: impl FnMut(&FreeRun) -> bool,
+    ) -> Result<u64, ResizeError>
+    {
+        let budget = self.record(rec).ok_or(ResizeError::NoRegion)?.budget;
+        let (reg, region) = self.discard_region(rec, va, len)?;
+        let mut node = self.region_node(reg).ok_or(ResizeError::NoRegion)?;
+        let offset = va.saturating_sub(region.va_base);
+        let end = offset.saturating_add(len);
+        let committed = self.commit_at(node.commit);
+        // A committed region's charge carries its pages, so its runs retire
+        // charged to no node.
+        let charged = if committed.is_some()
+        {
+            NODE_NULL
+        }
+        else
+        {
+            budget
+        };
+        let height = chunk::table_height(chunk_count(&region));
+        let mut run_pages: u64 = 0;
+        let cleared = {
+            let Self {
+                arena,
+                pool,
+                deferred,
+                ..
+            } = self;
+            chunk::clear(
+                arena,
+                &mut node.table,
+                height,
+                offset / crate::CHUNK_BYTES,
+                end.div_ceil(crate::CHUNK_BYTES),
+                |arena, idx, frame| {
+                    run_pages = run_pages.saturating_add(u64::from(frame.page_count));
+                    retire(arena, pool, deferred, idx, &frame, charged, &mut quiescent);
+                },
+            )
+        };
+        self.arena.set_node(reg, Node::Region(node));
+        if let Some(c) = committed
+        {
+            let meta_left = c
+                .meta_left
+                .saturating_add(commit::meta_of_chunks(cleared))
+                .min(commit::meta_bound(region.len))
+                .max(c.meta_left);
+            self.set_commitment(reg, Commitment { meta_left, ..c });
+            self.promised = self
+                .promised
+                .saturating_add(run_pages)
+                .saturating_add(meta_left.saturating_sub(c.meta_left));
+        }
+        Ok(run_pages)
     }
 
     /// Whether the region in slot `reg` is committed.
@@ -2913,6 +3029,136 @@ mod tests
         assert_eq!(promised(&l), two.pages + four.pt + two.meta);
         l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
         assert_eq!(usage(&l, rec).0, two.pages + four.pt);
+    }
+
+    #[test]
+    fn a_committed_discard_keeps_the_charge_and_promises_its_pages_again()
+    {
+        let mut l = roomy_ledger(10_000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let len = 8 * CHUNK;
+        let reg = l
+            .add_region(rec, region(BASE, len), Commit::Committed)
+            .unwrap();
+        let need = commit::grow_need(0, len);
+        for c in 0..8
+        {
+            back_whole(&mut l, rec, reg, c);
+        }
+        // The arena's growth for the faults spent the whole metadata bound.
+        l.draw_meta(reg, need.meta);
+        assert_eq!(promised(&l), need.pt);
+        let free = l.pool.free_pages();
+        // Chunks 2 to 4: their runs return to the pool, the charge stands, and
+        // `promised` takes their pages and their metadata back.
+        assert_eq!(
+            l.discard_range(rec, BASE + 2 * CHUNK, 3 * CHUNK, pool_all),
+            Ok(48)
+        );
+        assert_eq!(l.pool.free_pages(), free + 48);
+        assert_eq!(usage(&l, rec).0, need.charged());
+        assert_eq!(promised(&l), need.pt + 48 + commit::meta_of_chunks(3));
+        for c in 0..8
+        {
+            let backed = l.chunk_at(reg, BASE + c * CHUNK).backed();
+            assert_eq!(backed == 0, (2..5).contains(&c), "chunk {c}");
+        }
+        // A repeat finds nothing to take and changes nothing.
+        let before = (usage(&l, rec), promised(&l), l.pool.free_pages());
+        assert_eq!(
+            l.discard_range(rec, BASE + 2 * CHUNK, 3 * CHUNK, pool_all),
+            Ok(0)
+        );
+        assert_eq!((usage(&l, rec), promised(&l), l.pool.free_pages()), before);
+        // A refault draws on `promised` as the first touch did: the free pages
+        // outside it do not move, and the charge stands.
+        let outside = l.uncommitted_free();
+        back_whole(&mut l, rec, reg, 3);
+        assert_eq!(l.uncommitted_free(), outside);
+        assert_eq!(usage(&l, rec).0, need.charged());
+        // The metadata bound rises at most to the bound of the region's length.
+        assert_eq!(l.discard_range(rec, BASE, len, pool_all), Ok(6 * 16));
+        assert_eq!(l.commitment(reg).unwrap().meta_left, need.meta);
+        assert_eq!(promised(&l), need.promised());
+        // Death releases the rest.
+        l.remove_process(1, pool_all, |_| {}).unwrap();
+        assert_eq!((l.pool.free_pages(), promised(&l)), (10_000, 0));
+    }
+
+    #[test]
+    fn a_discarded_run_the_check_refuses_waits_charged_to_no_node_in_a_committed_region()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        let reg = l
+            .add_region(rec, region(BASE, 4 * CHUNK), Commit::Committed)
+            .unwrap();
+        let need = commit::grow_need(0, 4 * CHUNK);
+        back_whole(&mut l, rec, reg, 1);
+        assert_eq!(l.discard_range(rec, BASE + CHUNK, CHUNK, |_| false), Ok(16));
+        assert_eq!(l.deferred.pages(), 16);
+        // The commitment alone carries the pages' charge.
+        assert_eq!(usage(&l, rec).0, need.charged());
+        assert_eq!(promised(&l), need.promised());
+        l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
+        assert_eq!(l.deferred.pages(), 0);
+        assert_eq!(l.pool.free_pages(), 1000);
+        assert_eq!(usage(&l, rec).0, need.charged());
+    }
+
+    #[test]
+    fn an_uncommitted_discard_uncharges_its_runs_as_they_rejoin_the_pool()
+    {
+        let mut l = roomy_ledger(1000);
+        let rec = l.insert_process(1, NodeSpec::TOP).unwrap();
+        // Two chunks and three pages.
+        let len = 2 * CHUNK + 3 * PAGE_SIZE;
+        let reg = l
+            .add_region(rec, region(BASE, len), Commit::Uncommitted)
+            .unwrap();
+        back_whole(&mut l, rec, reg, 0);
+        back_whole(&mut l, rec, reg, 1);
+        let (cap, pages, phys) = take(&mut l, 3, crate::Fit::Contiguous);
+        l.back_chunk(rec, reg, frame(cap, pages, phys, BASE + 2 * CHUNK))
+            .unwrap();
+        assert_eq!(usage(&l, rec).0, 35);
+        // Refusals change nothing: an empty range, one off a chunk boundary,
+        // one ending off a chunk boundary short of the region's end, one past
+        // the end, and an address no region holds.
+        let invalid = [
+            (BASE, 0),
+            (BASE + PAGE_SIZE, CHUNK),
+            (BASE, CHUNK + PAGE_SIZE),
+            (BASE + 2 * CHUNK, CHUNK),
+            (BASE + CHUNK, u64::MAX),
+        ];
+        for (va, n) in invalid
+        {
+            assert_eq!(
+                l.discard_range(rec, va, n, pool_all),
+                Err(ResizeError::Length),
+                "{va:#x}+{n:#x}"
+            );
+        }
+        assert_eq!(
+            l.discard_range(rec, BASE + len, CHUNK, pool_all),
+            Err(ResizeError::NoRegion)
+        );
+        assert_eq!(usage(&l, rec).0, 35);
+        // A range reaching the region's end may end inside a chunk; a run the
+        // check refuses stays charged until a recheck pools it.
+        assert_eq!(
+            l.discard_range(rec, BASE + CHUNK, CHUNK + 3 * PAGE_SIZE, |r| r.page_count
+                != 3),
+            Ok(19)
+        );
+        assert_eq!(usage(&l, rec).0, 16 + 3);
+        assert_eq!(promised(&l), 0);
+        l.recheck_deferred(RecheckBudget::UNBOUNDED, |_| 1, pool_all);
+        assert_eq!(usage(&l, rec).0, 16);
+        assert_eq!(l.chunk_at(reg, BASE).backed(), 0xFFFF);
+        assert_eq!(l.chunk_at(reg, BASE + CHUNK).backed(), 0);
+        assert_eq!(l.pool.free_pages(), 1000 - 16);
     }
 
     #[test]

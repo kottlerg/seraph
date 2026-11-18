@@ -995,10 +995,6 @@ fn carve_pci_device(
     {
         return None;
     };
-    let (msi, msix) =
-        firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, virtio.as_ref());
-    let spans = msix.map(|m| m.withheld());
-    let withheld = spans.as_ref().map_or(&[][..], |w| w.as_slice());
     let address = (pci_dev.segment, pci_dev.bus, pci_dev.dev, pci_dev.func);
     let Some(mut dev) = PciDeviceCaps::empty(carve.caps.self_aspace, address)
     else
@@ -1006,54 +1002,52 @@ fn carve_pci_device(
         std::os::seraph::log!(warn: "{}: no memory for the device's resources; not bound", name);
         return None;
     };
-    if carve_bars(
-        name,
-        pci_dev,
-        virtio.as_ref(),
-        withheld,
-        carve.caps,
-        &mut dev,
-    )
-    .is_none()
+    if fill_pci_device(name, pci_dev, decl, virtio.as_ref(), carve, &mut dev).is_none()
     {
         dev.release(&mut carve.caps.slot_bars);
         return None;
     }
-    let Some(config) = carve_function_config(name, pci_dev, carve.caps)
-    else
-    {
-        dev.release(&mut carve.caps.slot_bars);
-        return None;
-    };
-    dev.config = config;
-    let Some(badge) = catalog_entry(pci_dev, virtio.as_ref(), carve.catalog)
+    Some(dev)
+}
+
+/// The carving of [`carve_pci_device`] into `dev`, from the BARs to the
+/// Command register, with the `VirtIO` register layout `virtio` the driver
+/// is given; `None`, logged under `name`, on any failure, leaving to the
+/// caller the release of what `dev` holds.
+fn fill_pci_device(
+    name: &str,
+    pci_dev: &pci::PciDevice,
+    decl: &DriverDecl,
+    virtio: Option<&virtio_core::RegisterLayout>,
+    carve: &mut Carve,
+    dev: &mut PciDeviceCaps,
+) -> Option<()>
+{
+    let (msi, msix) = firmware::pci::deliverable_messages(pci_dev.msi, pci_dev.msix, virtio);
+    let spans = msix.map(|m| m.withheld());
+    let withheld = spans.as_ref().map_or(&[][..], |w| w.as_slice());
+    carve_bars(name, pci_dev, virtio, withheld, carve.caps, dev)?;
+    dev.config = carve_function_config(name, pci_dev, carve.caps)?;
+    let Some(badge) = catalog_entry(pci_dev, virtio, carve.catalog)
     else
     {
         std::os::seraph::log!(warn: "{}: catalog entry not added; not bound", name);
-        dev.release(&mut carve.caps.slot_bars);
         return None;
     };
     dev.device_badge = badge;
     if decl.dma
     {
-        let Some(grant) = grant_dma(name, pci_dev, decl.dma_width, carve.caps, badge)
-        else
-        {
-            dev.release(&mut carve.caps.slot_bars);
-            return None;
-        };
-        dev.dma = Some(grant);
+        dev.dma = Some(grant_dma(name, pci_dev, decl.dma_width, carve.caps, badge)?);
     }
     // After the DMA grant: on riscv64 a message-signaled target's interrupt
     // file enters the device's IOMMU domain before its vectors are enabled.
-    let Ok(given) = give_interrupt(name, pci_dev, (msi, msix), decl, carve, &mut dev)
+    let Ok(given) = give_interrupt(name, pci_dev, (msi, msix), decl, carve, dev)
     else
     {
         std::os::seraph::log!(
             warn: "{}: interrupt files mapped for vectors not given; not bound",
             name
         );
-        dev.release(&mut carve.caps.slot_bars);
         return None;
     };
     if given.is_none() && decl.interrupt.need == InterruptNeed::Required
@@ -1062,7 +1056,6 @@ fn carve_pci_device(
             warn: "{}: no interrupt for the device, which the driver requires; not bound",
             name
         );
-        dev.release(&mut carve.caps.slot_bars);
         return None;
     }
     dev.reset = match decl.reset
@@ -1072,10 +1065,9 @@ fn carve_pci_device(
         Reset::VirtioStatus { .. } =>
         {
             // The layout is `Some`: a VirtIO status reset without one was
-            // refused above.
-            let reset = virtio
-                .as_ref()
-                .and_then(|l| DeviceReset::for_device(l, dev.resources(), dev.config.aspace));
+            // refused before the carve ([`virtio_layout`]).
+            let reset =
+                virtio.and_then(|l| DeviceReset::for_device(l, dev.resources(), dev.config.aspace));
             if reset.is_none()
             {
                 std::os::seraph::log!(
@@ -1091,10 +1083,9 @@ fn carve_pci_device(
         .prepare_for_bind(decl.dma, given == Some(InterruptKind::Wired))
     {
         std::os::seraph::log!(warn: "{}: configuration page not mapped; not bound", name);
-        dev.release(&mut carve.caps.slot_bars);
         return None;
     }
-    Some(dev)
+    Some(())
 }
 
 /// The `VirtIO` register layout the driver `decl` is given of the PCI

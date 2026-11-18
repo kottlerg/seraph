@@ -291,7 +291,8 @@ fn page_base(lba: usize) -> usize
 }
 
 /// The cache pages a read log shows fatfs filling: its page-sized reads.
-/// A single-sector read goes to fatfs's scratch page, not to a slot.
+/// A single-sector read goes to fatfs's scratch page, not to a slot, and
+/// this phase makes no sequential `FS_READ_MEMORY` scan, so no run fill.
 fn cache_fills(reads: &[(usize, usize)]) -> BTreeSet<usize>
 {
     reads

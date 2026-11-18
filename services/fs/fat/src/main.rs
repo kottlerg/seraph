@@ -58,6 +58,7 @@ mod eviction;
 mod fat;
 mod file;
 
+use core::num::NonZeroU64;
 use std::os::seraph::{MemoryPressure, StartupInfo, startup_info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -891,11 +892,17 @@ fn read_memory_for_open(
         reply_err(ipc::fs_errors::IO_ERROR, ipc_buf);
         return;
     };
-    // Walk the cluster chain to find the sector at `offset`.
-    let mut cluster = node.cluster;
+    // Walk the cluster chain to find the sector at `offset`, from the open's
+    // cursor when it still serves (storage-layout.md, Open table).
+    let (walked, mut cluster) = fat_parse::walk_start(
+        files.get(open_id).and_then(|f| f.cursor),
+        state.chain_epoch,
+        node.cluster,
+        pos.cluster_index,
+    );
     // `offset` is below the `u32` file size, so the walk ends within
     // `u32::MAX / cluster_size` steps even on a cyclic chain.
-    for _ in 0..pos.cluster_index
+    for _ in walked..pos.cluster_index
     {
         if let Some(c) = next_cluster(state, cluster, cache, block_dev, ipc_buf)
         {
@@ -909,6 +916,15 @@ fn read_memory_for_open(
             return;
         }
     }
+    let sequential = files.get_mut(open_id).is_some_and(|f| {
+        f.cursor = Some(fat_parse::ChainCursor {
+            epoch: state.chain_epoch,
+            first_cluster: node.cluster,
+            cluster_index: pos.cluster_index,
+            cluster,
+        });
+        f.next_read == offset
+    });
     let sector = u64::from(
         state
             .cluster_to_sector(cluster)
@@ -932,7 +948,30 @@ fn read_memory_for_open(
         return;
     };
 
-    let Some(slot_idx) = cache.acquire_page(page_base, block_dev, ipc_buf)
+    // A sequential scan that misses fills a run of the pages it reads next
+    // (storage-layout.md, Page cache); sizing the run walks the chain, so
+    // only a miss pays for it.
+    let run = if sequential && !cache.contains_page(page_base)
+    {
+        read_run_pages(
+            &ReadRun {
+                cluster,
+                pos: &pos,
+                sector,
+                page_base,
+                left_in_file,
+            },
+            state,
+            cache,
+            block_dev,
+            ipc_buf,
+        )
+    }
+    else
+    {
+        1
+    };
+    let Some(slot_idx) = cache.acquire_page_run(page_base, run, block_dev, ipc_buf)
     else
     {
         // Cache pressure, when every slot is held by an outstanding page:
@@ -983,10 +1022,25 @@ fn read_memory_for_open(
         ancestor_cap: ancestor,
         eviction_queued: false,
     };
+    // bytes_valid is bounded by:
+    //   - file end:    file_size - offset
+    //   - one cluster: cluster_size - offset_in_cluster
+    //                  (we only read sectors from one cluster per call)
+    //   - memory-cap tail:  PAGE_SIZE - memory_data_offset
+    //                  (bytes before memory_data_offset belong to other files
+    //                   or the previous cluster's leftover sectors)
+    // None bounds a file: the client reads on with further calls.
+    let bytes_valid = left_in_file.min(pos.left_in_cluster).min(page_left);
     let ceiling = cache.slot_ceiling();
-    if !files
-        .get_mut(open_id)
-        .is_some_and(|f| f.track_outstanding(entry, ceiling))
+    if !files.get_mut(open_id).is_some_and(|f| {
+        let tracked = f.track_outstanding(entry, ceiling);
+        if tracked
+        {
+            // Below the `u32` file size, so it never saturates.
+            f.next_read = offset.saturating_add(bytes_valid);
+        }
+        tracked
+    })
     {
         let _ = syscall::cap_delete(child);
         let _ = syscall::cap_delete(ancestor);
@@ -997,15 +1051,6 @@ fn read_memory_for_open(
         return;
     }
 
-    // bytes_valid is bounded by:
-    //   - file end:    file_size - offset
-    //   - one cluster: cluster_size - offset_in_cluster
-    //                  (we only read sectors from one cluster per call)
-    //   - memory-cap tail:  PAGE_SIZE - memory_data_offset
-    //                  (bytes before memory_data_offset belong to other files
-    //                   or the previous cluster's leftover sectors)
-    // None bounds a file: the client reads on with further calls.
-    let bytes_valid = left_in_file.min(pos.left_in_cluster).min(page_left);
     let reply = IpcMessage::builder(ipc::fs_errors::SUCCESS)
         .word(0, bytes_valid)
         .word(1, cookie)
@@ -1014,6 +1059,59 @@ fn read_memory_for_open(
         .build();
     // SAFETY: ipc_buf is the registered IPC buffer page.
     let _ = unsafe { ipc::ipc_reply(&reply, ipc_buf) };
+}
+
+/// Where a memory-cap read's sector lies, for sizing its run fill
+/// ([`read_run_pages`]).
+struct ReadRun<'a>
+{
+    /// The cluster holding the sector.
+    cluster: u32,
+    /// The read's place in the file.
+    pos: &'a fat_parse::FilePosition,
+    /// The sector holding the read's first byte.
+    sector: u64,
+    /// The first sector of that sector's cache page.
+    page_base: u64,
+    /// Bytes of the file from the read's first byte.
+    left_in_file: u64,
+}
+
+/// Pages a memory-cap read's miss fills on a sequential scan
+/// (storage-layout.md, Page cache): from the read's page through the
+/// sectors the chain holds contiguously from the read's cluster on, up to
+/// the file's end and the cache's run capacity; at least 1. A FAT read that
+/// fails ends the contiguous span there.
+fn read_run_pages(
+    read: &ReadRun<'_>,
+    state: &mut FatState,
+    cache: &PageCache,
+    block_dev: u64,
+    ipc_buf: *mut u64,
+) -> u64
+{
+    let max_pages = PageCache::run_capacity();
+    if max_pages <= 1
+    {
+        return 1;
+    }
+    // Mount refuses a zero sector size or cluster size.
+    let spc = NonZeroU64::new(u64::from(state.sectors_per_cluster)).unwrap_or(NonZeroU64::MIN);
+    let bps = NonZeroU64::new(u64::from(state.bytes_per_sector)).unwrap_or(NonZeroU64::MIN);
+    let spp = cache.sectors_per_page();
+    let bound = fat_parse::run_cluster_bound(max_pages, spp, read.pos.sector_in_cluster, spc);
+    let clusters = fat_parse::contiguous_clusters(read.cluster, bound, |c| {
+        next_cluster(state, c, cache, block_dev, ipc_buf)
+    });
+    let chain_end = u64::from(state.cluster_to_sector(read.cluster))
+        .saturating_add(u64::from(clusters).saturating_mul(spc.get()));
+    let file_end = fat_parse::file_end_sector(
+        read.sector,
+        read.pos.offset_in_sector as u64,
+        read.left_in_file,
+        bps,
+    );
+    fat_parse::run_pages(read.page_base, chain_end.min(file_end), spp, max_pages)
 }
 
 /// When a page acquisition found every cache slot held since the last check
